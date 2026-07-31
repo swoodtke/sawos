@@ -197,14 +197,15 @@ names provisional):
 
 ## 5. Open questions (need decisions before the kernel brief)
 
-1. ~~Channel semantics~~ RESOLVED §2.1: bounded messages (max body +
-   max handles), rendezvous handle transfer, built-in request/reply
-   via ReplyHandle/RequestHandle. Remaining sub-questions: the
-   concrete size/count limits; and whether the base send is
-   rendezvous (sender blocks for a receiver) or the reply-object model
-   makes it naturally call-style (sender blocks on the reply, so the
-   send itself can deposit-and-return once staged) — lean call-style,
-   confirm.
+1. ~~Channel semantics~~ RESOLVED §2.1 + **base-send DECIDED (user,
+   Jul 31): STRICT RENDEZVOUS.** Every send blocks until a receiver
+   takes the message — the kernel holds NO message buffers (bounded
+   only by waiting senders; zero-copy handoff at the rendezvous).
+   Async notification is the Event object's job (§2.4). Request/reply:
+   `call` = rendezvous handoff + block on the ReplyHandle. Message
+   limits (max body + max handles) still apply per message; concrete
+   numbers are a kernel-brief constant (orchestrator pin, veto-able:
+   64-byte body, 4 handles).
 2. ~~DUPLICATE right~~ RESOLVED §3: no duplication; unique handles;
    creator re-mints when a second is needed. (Mirrors NoCopy exactly.)
 3. ~~Process/Job hierarchy~~ RESOLVED §2 table: flat Process, kernel
@@ -236,14 +237,23 @@ names provisional):
    Device regions that are never freed (their count is effectively
    pinned / ignored for reclamation). Implementation detail for the
    memory brief.
-6. **Boot protocol**: kernel hands the root server a boot channel +
-   root MemoryObjects (RAM, device ranges) + root IRQ table handle.
-   Everything else derives. Shape of the boot image (kernel + root
-   server linked together vs loaded) — with Blade as the build tool.
-7. **Syscall ABI details**: register convention, error model
-   (Result-shaped: negative errno vs (status, value) pair), and the
-   Saw syscall-wrapper layer (a `sos` userspace crate/module — the
-   typed Handle wrappers live there, not in the kernel).
+6. ~~Boot protocol~~ **DECIDED (user, Jul 31): KERNEL LOADS the root
+   server** from a separate flash partition — real separation from
+   day one; independent updates. To keep the loader microkernel-sized
+   the image format is NOT ELF but a minimal flat **sosimg** header
+   (orchestrator pin, veto-able: magic, version, entry offset,
+   segment table of {flash_off, load_addr, len, flags}) that Blade
+   emits as a build target. Kernel: parse header → map/copy segments
+   (PMP/APM per §5.5) → mint root handles (boot channel, root
+   MemoryObjects for RAM + device ranges, root IRQ table) → enter
+   U-mode at the entry. Everything else derives from those handles.
+7. ~~Syscall ABI~~ **DECIDED (user, Jul 31): (status, value) PAIR.**
+   RISC-V standard convention: syscall number in a7, args a0-a5,
+   `ecall`; returns a0 = status word (0 = ok, else a small SysError
+   enum tag), a1 = value/handle. Maps 1:1 onto the userspace `sos`
+   module's typed wrappers (`-> Result<T, SysError>` — auto-wrap does
+   the rest). The typed Handle wrappers live in the userspace `sos`
+   module, not the kernel (already ratified).
 
 ## 6. Explicitly NOT in the kernel
 
