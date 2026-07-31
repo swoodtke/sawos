@@ -255,6 +255,32 @@ names provisional):
    the rest). The typed Handle wrappers live in the userspace `sos`
    module, not the kernel (already ratified).
 
+## 5b. Two machine profiles, two architectures (DECIDED, user, Jul 31)
+
+SOS targets TWO first-class profiles from the beginning, both
+QEMU-runnable for a fast dev loop:
+- **Profile A — MPU**: riscv32, QEMU `virt` first, ESP32-P4 hardware
+  later (the P4 IS this profile: M+U modes, PMP/APM, no per-process
+  paging). Single multitask image, physical addresses, coarse
+  protection, small-N domains. 32-bit.
+- **Profile B — MMU**: arm64 (aarch64), QEMU `virt`. Kernel at EL1,
+  processes at EL0, real per-process page-table AddressSpaces. 64-bit.
+  (arm64 moots the RISC-V S-mode/SBI question: QEMU enters EL1
+  directly; no firmware protocol needed for M1-class work.)
+
+Rationale: multi-arch + 32/64-bit awareness from day one; the
+object/handle/channel/syscall model is IDENTICAL across profiles —
+divergence is confined to a small per-arch HAL (boot, trap entry,
+context switch, Mapping/AddressSpace implementation), selected at
+build time via the module-path mechanism (`--module-path
+hal=sos/hal/<target>` — Blade/B0 machinery). All wire/boot formats
+(sosimg, message headers) use FIXED-WIDTH fields (the design-47
+discipline) so 32/64-bit profiles interoperate. AddressSpace on A =
+PMP region set (+APM on P4); on B = page-table root. Roadmap: M1 =
+riscv32 boot-to-root-server (design 78); M1b = arm64 EL1 boot parity
++ HAL extraction (design 79) BEFORE object-model work; then the
+object model lands once, two-profile-tested.
+
 ## 6. Explicitly NOT in the kernel
 
 Drivers (userspace via Interrupt + MMIO MemoryObjects), filesystems,
