@@ -288,3 +288,198 @@ network stacks, POSIX personality, dynamic linking/loading, package/
 process management policy, time-of-day (a userspace service over the
 Timer primitive). The kernel knows objects, handles, rights, threads,
 memory words, and nothing else.
+
+## 7. Scheduling (ratified Aug 3)
+
+- **Fixed-priority preemptive, 8 system levels (0–7).** Ready queue =
+  per-level FIFO + a one-BYTE ready bitmap; pick-next = find-first-set
+  + pop, O(1), a handful of instructions on both profiles. Idle is NOT
+  a level — a per-profile WFI loop runs when the bitmap is empty.
+- **Round-robin within a level**, fixed timeslice (pin, veto-able:
+  10 ms), tick from the per-profile timer (CLINT mtimer / ARM generic
+  timer — the same source the Timer object needs). Preemption is
+  immediate: readying a higher-priority thread switches on the way out
+  of the kernel; same-priority never preempts mid-slice.
+- **Priority bands, not raw levels.** Processes NEVER see or name
+  system levels. The only priority surface is
+  `enum Priority { Background, Low, Normal, High }` in the userspace
+  `sos` module, with FIXED ABI tags 0–3 (the wire representation never
+  changes). The thread-spawn syscall carries the band TAG; no syscall
+  accepts a raw system level.
+- **Per-process band→level map, kernel-side.** Each Process object
+  holds a 4-slot map resolving band → system level; the kernel
+  resolves at thread-spawn — the map is the ENFORCEMENT point (a
+  process cannot escape its band with raw syscalls). A thread's
+  system priority is resolved ONCE at spawn and stored plain — the
+  scheduler hot path is numeric-only. Initial default map:
+  `Background→0, Low/Normal/High→1` (apps cluster at 0–1; levels 2–7
+  are headroom for drivers/services). Low/Normal/High are declarative
+  until a deployment differentiates them — intended.
+- **The map comes from build-time metadata + launcher policy.** The
+  process image declares its requested map in `sosimg` metadata (a
+  4-byte header field; Blade emits it from the package manifest, e.g.
+  `[sos] priorities = { background = 0, low = 1, normal = 1,
+  high = 1 }` in Saw.toml). Metadata is a REQUEST, not authority: the
+  launcher reads it and may honor, clamp, or override; the kernel
+  stores whatever map the launcher passes to `create_process` and
+  never parses metadata for policy. The root server's own map is
+  applied verbatim from its image at boot (the kernel parses that
+  image anyway; root is trusted by construction).
+- **Launching is a capability.** `create_process` requires a
+  specialized LAUNCH capability, minted at boot to the root server.
+  Ordinary processes cannot create processes in v1 — they ask the
+  launcher service over a channel.
+- **The map is immutable after creation.** No remap syscall, no
+  self-modification, no visibility into the map from inside the
+  process (each process sees only its 4 named bands). Changing a
+  running process's priority = restart it. (A future dynamic
+  re-prioritization design could add a LAUNCH-gated syscall without
+  disturbing anything here.)
+- **No priority inheritance.** Inheritance chains through transferable
+  ReplyHandles are ill-defined (the reply obligation migrates). The
+  mitigations: (a) the CONVENTION that servers run at ≥ the max
+  priority of their clients (the launcher assigns both, so this is
+  enforceable policy); (b) the **direct-switch fastpath** — on a
+  rendezvous handoff, switch straight to the receiver when runnable,
+  which removes most incidental inversion with no donation semantics.
+  MCS-style budgets/inheritance remain possible later designs.
+- **Uniprocessor kernel in v1**, both profiles (P4 is dual-core and
+  QEMU can do SMP; SMP is its own future design — locking model,
+  per-core queues — and nothing above precludes it).
+
+## 8. Thread & process lifecycle (ratified Aug 3)
+
+- **A thread fault kills its process.** The process exits with a
+  fault status; there is no per-thread fault recovery (a faulted
+  thread shares mutable state with its process — "keep running minus
+  one thread" is silent corruption). Kernel teardown-on-exit/fault
+  (§2 table) reclaims everything unconditionally.
+- **No join syscall; no thread kill.** Threads are expected to be
+  POOL WORKERS: created at startup, draining task queues, dying at
+  process exit. Work completion is a task-level concept (channels/
+  Events), not a thread concept. A wedged/hostile thread is a
+  process-level problem by the fault rule.
+- **Thread handles are waitables** (level-triggered ready when the
+  thread has FULLY exited) — the observability that join traditionally
+  provides, needed only for safe stack reclamation when a dynamic pool
+  scales down (thread stacks are userspace memory passed to
+  `thread_create`; reuse before real exit is a use-after-free). v1
+  fixed pools never use it.
+- **Process handles are waitables** (ready on exit, any cause) — the
+  primitive userspace supervision parks a Waiter on.
+- **`process.get_status()`**, gated on the WAIT right: ONE fixed-width
+  status word — kind in the high bits (`Exited | Faulted | Killed`),
+  code in the low bits (exit code, or a fault-cause tag). Detailed
+  fault forensics (faulting PC/address) is a later design.
+- **`process.kill()`**, gated on a KILL right. Cooperative-first
+  teardown stays the norm; kill is the capability-gated escape hatch
+  that makes userspace supervision real against wedged/hostile
+  processes. (This resolves §4's kill-tree question: kill exists,
+  process-granular only, no kernel trees — supervision topology is
+  userspace's.)
+
+## 9. Interrupt delivery (ratified Aug 3)
+
+- **Mask-on-fire, ack-to-rearm.** IRQ fires → kernel masks the line +
+  marks the Interrupt object ready (wakes per Waiter rules). At most
+  one UNACKED fire exists per Interrupt, ever. `irq.ack()` unmasks;
+  a still/again-asserting device re-fires — correct level semantics.
+  Level-triggered Waiter readiness means NO interleaving loses a
+  fire (readiness persists until consumed).
+- **Ack is a RELEASE.** The discipline: everything that touches device
+  registers happens BEFORE ack; post-ack code runs only on data
+  already extracted. Under it, a second worker entering the pre-ack
+  section while the first runs its post-ack tail is PIPELINING (a
+  throughput feature), not a race. Drivers that need post-ack register
+  work serialize with a Mutex — their choice; the kernel does not
+  enforce single-servicing.
+- **v1 canonical driver shape: ONE task owns one Interrupt.** A single
+  cooperative servicer can never race itself — the ack-position
+  question evaporates. Multi-threads-on-one-Waiter is for servers
+  multiplexing independent streams, not for a device IRQ.
+- **The serve idiom needs no kernel support**: a `sos`-module closure
+  wrapper that acks ON HANDLER EXIT gets non-reentrancy directly from
+  mask-until-ack (the line is masked for the whole handler body — the
+  "mask while handler runs" mechanism IS the interrupt mask). An
+  explicit mid-handler ack is the deliberate opt-in to pipelining.
+- **Combined form (pin): `waiter.wait(ack: irq_handle)`** — atomically
+  ack, then block. Pure syscall-halving for the hot loop (one syscall
+  per interrupt); not needed for correctness (level-triggering already
+  covers the gap). One optional arg on wait.
+
+## 10. Userspace runtime: HandlerGroup + the wake bridge (ratified Aug 3)
+
+Saw's sequential surface is UNCHANGED: `channel.call()`, `receive()`,
+`read()` suspend in place on plain tasks — colorless straight-line
+code stays the substrate, and TaskGroup remains exactly what it is
+today (a lifetime/join scope for tasks on a thread pool). The
+event-driven EDGE of a process gets a second, distinct construct:
+
+- **`HandlerGroup`** — a group of waiting HANDLES running on a task
+  pool; the userspace face of the kernel Waiter, one-to-one (TaskGroup
+  ↔ threads/tasks; HandlerGroup ↔ Waiter/handles). Deliberately NOT
+  bolted onto TaskGroup: attachments are persistent subscriptions
+  (removed, never "joined"), and K workers service M handles (no
+  frame-per-handle).
+  ```saw
+  var dispatch = HandlerGroup(workers: 2)
+  let id  = dispatch.add(move timer)  { t, fired -> ... }
+  let cid = dispatch.add(move server) { ch, msg, req -> ... }
+  let timer = dispatch.remove(id)     // coat check: ownership back
+  // Deinit: detach all, close unclaimed handles, cancel workers
+  ```
+- **Ownership: move-in, forced by the language.** Handles are NoCopy
+  and references are non-escaping — a HandlerGroup CANNOT store
+  `&Timer`, so group-owns-while-attached is the only representable
+  design, exactly mirroring unique kernel handles. `add` returns a
+  distinct-typed `AttachmentId` (NOT authority — meaningless without
+  the group). `remove(id) -> Box<any Waitable>?` returns ownership
+  (recover the concrete type with `take<T>()`; typed sugar can come
+  later); None = stale id.
+- **Per-attachment NON-REENTRANCY, guaranteed**: one handle's handler
+  never runs concurrently with itself (in-service flag; readiness
+  arriving mid-handler is deferred and re-dispatched on completion).
+  Generalizes the one-task-per-Interrupt decision to every handle
+  kind as a stated guarantee.
+- **The handler BORROWS the source per invocation** (`&Source`, a
+  scoped non-escaping lend — the `with_ref` shape), which is sound
+  precisely BECAUSE of non-reentrancy: at most one borrow live per
+  attachment. Per-kind signatures: Timer → `(&Timer, fired)`;
+  Channel → `(&Channel, msg, RequestHandle)` — the RequestHandle is
+  fresh PER MESSAGE and moves in (forwardable, per §2.1 delegation);
+  Interrupt → `(&Interrupt)` with ack-on-exit default (§9).
+- **Cross-handle parallelism up to `workers`.** Parallelism WITHIN one
+  source stays explicit user code (spawn from the handler body into a
+  TaskGroup) — the concurrency decision is visible, never implicit in
+  a dispatch engine. Handler bodies are ordinary task code and may
+  suspend; a suspended handler parks its worker, others keep
+  dispatching. Backpressure is free: all workers busy → readiness sits
+  (level-triggered) and rendezvous senders block; nothing buffers,
+  nothing drops.
+- **The wake bridge is ONE mechanism**: a parked task's wake-word is
+  the Waiter KEY supplied at attach; kernel readiness returns the key;
+  the executor marks that task runnable. Handlers, blocking-shaped
+  calls, and raw waits all ride the same path (this is what §2.2's
+  word-sized key was designed for). Implementation freedom (runtime
+  brief, not spec): whether a HandlerGroup owns its own kernel Waiter
+  or registers through the process runtime's reactor Waiter — the
+  kernel permits both (one Waiter per handle; many Waiters per
+  process).
+
+## 11. Remaining before the kernel briefs
+
+- **Design (with user):** root server responsibilities + the v1
+  userspace protocol conventions (loader-above-boot for second
+  processes, pool brokering, name/discovery service — the division of
+  labor shapes the boot handle set).
+- **Orchestrator pins (veto-able), kernel-brief material:** rights-word
+  bit assignments + per-object op tables (the syscall number space);
+  kernel memory layout per profile (link scripts, static slab sizes,
+  QEMU `virt` boot maps); where the physical-region refcount lives
+  (§5.9); message limits (pinned 64-byte body / 4 handles) + concrete
+  `sosimg` header incl. the §7 priority-map field; root server's
+  bootstrap band map.
+- **Roadmap (unchanged from §5b, brief numbers assigned at dispatch —
+  the design-78/79 references there are stale):** M1 riscv32 QEMU
+  boot-to-root-server → M1b arm64 EL1 parity + HAL extraction → the
+  object model, landed once, two-profile-tested.
