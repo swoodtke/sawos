@@ -1,0 +1,62 @@
+// SOS M0 kernel entry (design 112) — Profile A: riscv32, QEMU `virt`.
+//
+// The freestanding Saw kernel: an NS16550A UART driver built entirely on
+// `UnsafeMemory<_, Device>` (design 46 — the first real bare-metal use of the
+// volatile, access-mode-checked MMIO machinery), a boot banner, and a clean
+// exit through the SiFive test finisher. `boot.S` sets up the stack, zeroes
+// .bss, and calls `kmain`; `rt.c` supplies the runtime seams; `virt.ld` links
+// it all at RAM base 0x8000_0000. See sos/spec.md §5b.
+
+// NS16550A register block. The registers are byte-spaced; the struct's natural
+// declaration-order layout (design 58) places each at its hardware offset. A
+// `ReadOnly<T>` field exposes only `.read()`; a plain field is read-write.
+struct Uart {
+    thr: UInt8,             // +0  transmit holding / receive buffer
+    ier: UInt8,             // +1  interrupt enable
+    iir: UInt8,             // +2  interrupt id / FIFO control
+    lcr: UInt8,             // +3  line control
+    mcr: UInt8,             // +4  modem control
+    lsr: ReadOnly<UInt8>,   // +5  line status
+    msr: ReadOnly<UInt8>,   // +6  modem status
+    scr: UInt8,             // +7  scratch
+}
+
+// SiFive test finisher (QEMU `virt`): writing FINISHER_PASS exits the emulator
+// with status 0; FINISHER_FAIL carries an exit code in its upper half.
+struct SifiveTest {
+    finisher: UInt32,
+}
+
+static UART_BASE: Int = 0x10000000
+static TEST_BASE: Int = 0x00100000
+static LSR_TX_EMPTY: UInt8 = 0x20u8       // LSR bit 5 — TX holding register empty
+static FINISHER_PASS: UInt32 = 0x5555u32
+
+// Poll the line-status TX-empty bit, then write one byte to the holding
+// register — no interrupts in M0. Every access is a volatile Device load/store.
+func uart_put_byte(b: UInt8) {
+    let uart = UnsafeMemory<Uart, Device>(UART_BASE)
+    while (uart.lsr.read() & LSR_TX_EMPTY) == 0u8 { }
+    uart.thr.write(b)
+}
+
+// Write an ASCII string over the UART, byte by byte.
+func uart_puts(msg: String) {
+    for scalar in msg.chars() {
+        uart_put_byte(scalar as UInt8)
+    }
+}
+
+// Terminate the emulator by writing the SiFive finisher. Never returns; if the
+// write is somehow ignored, spin rather than fall back into the boot shim.
+func exit_qemu(code: UInt32) {
+    let test = UnsafeMemory<SifiveTest, Device>(TEST_BASE)
+    test.finisher.write(code)
+    while true { }
+}
+
+@export("kmain")
+func kmain() {
+    uart_puts("SOS M0: hello from Saw on riscv32 (QEMU virt)\n")
+    exit_qemu(FINISHER_PASS)
+}
