@@ -1,15 +1,18 @@
 // SOS M0 runtime seams (design 112) — riscv32, QEMU `virt`.
 //
-// sawc's freestanding profile emits the runtime seams (saw_alloc / saw_dealloc /
-// saw_write / saw_panic) as DECLARATIONS; the environment supplies the bodies.
-// On the QEMU `virt` board that environment is this file plus boot.S. `saw_write`
-// and `saw_panic` drive the same NS16550A UART the Saw driver uses (0x1000_0000);
-// `saw_panic` additionally FAILS the run through the SiFive test finisher. A
-// bump allocator over a fixed .bss arena backs `saw_alloc` (enough for panic
-// message assembly), and the mem* helpers cover the compiler's implicit calls.
+// sawc's freestanding profile emits the runtime-ABI seams (__saw_rt_alloc /
+// __saw_rt_dealloc / __saw_rt_write / __saw_rt_panic — the design-113 frozen
+// contract, sawc/rt/ABI.md) as DECLARATIONS; the environment supplies the
+// bodies. On the QEMU `virt` board that environment is this file plus boot.S.
+// `__saw_rt_write` and `__saw_rt_panic` drive the same NS16550A UART the Saw
+// driver uses (0x1000_0000); `__saw_rt_panic` additionally FAILS the run
+// through the SiFive test finisher. A bump allocator over a fixed .bss arena
+// backs `__saw_rt_alloc` (enough for panic message assembly), and the mem*
+// helpers cover the compiler's implicit calls.
 //
-// The `saw_*` symbols are RESERVED (sawc rejects `@export("saw_*")`), so these
-// seams live in C, not Saw — the freestanding runtime boundary by design.
+// The reserved runtime symbols cannot be exported from Saw YET — design 113b's
+// runtime-build mode lifts that, at which point these bodies can graduate to
+// Saw (rider on the next SOS brief).
 
 typedef unsigned int   u32;
 typedef unsigned char  u8;
@@ -35,12 +38,12 @@ static void uart_write(const char *p, usize len) {
 
 // ---- runtime seams --------------------------------------------------------
 
-void saw_write(const char *ptr, usize len) {
+void __saw_rt_write(const char *ptr, usize len) {
     uart_write(ptr, len);
 }
 
 __attribute__((noreturn))
-void saw_panic(const char *msg, usize len) {
+void __saw_rt_panic(const char *msg, usize len) {
     uart_write(msg, len);
     // FINISHER_FAIL with code 1 in the upper half → non-zero emulator exit.
     volatile u32 *test = (volatile u32 *)SIFIVE_TEST;
@@ -55,17 +58,17 @@ void saw_panic(const char *msg, usize len) {
 static u8    arena[ARENA_BYTES];
 static usize arena_next = 0;
 
-void *saw_alloc(usize size, usize align) {
+void *__saw_rt_alloc(usize size, usize align) {
     if (align < 1) align = 1;
     usize p = (arena_next + (align - 1)) & ~(align - 1);
     if (p + size > ARENA_BYTES) {
-        saw_panic("sos: out of arena memory\n", 25);
+        __saw_rt_panic("sos: out of arena memory\n", 25);
     }
     arena_next = p + size;
     return &arena[p];
 }
 
-void saw_dealloc(void *ptr, usize size, usize align) {
+void __saw_rt_dealloc(void *ptr, usize size, usize align) {
     (void)ptr; (void)size; (void)align;
 }
 
