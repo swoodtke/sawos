@@ -480,6 +480,20 @@ event-driven EDGE of a process gets a second, distinct construct:
   `sosimg` header incl. the §7 priority-map field; root server's
   bootstrap band map.
 - **Roadmap (unchanged from §5b, brief numbers assigned at dispatch —
-  the design-78/79 references there are stale):** M1 riscv32 QEMU
-  boot-to-root-server → M1b arm64 EL1 parity + HAL extraction → the
-  object model, landed once, two-profile-tested.
+  the design-78/79 references there are stale):** M0 riscv32 QEMU
+  target (design 112) → M1 riscv32 QEMU boot-to-root-server → M1b arm64
+  EL1 parity + HAL extraction → the object model, landed once,
+  two-profile-tested.
+  - **M0 DONE (design 112):** Profile A substrate is live —
+    `sos/kernel/` (boot.S + virt.ld + rt.c runtime seams + a Saw `main.saw`
+    whose NS16550A UART driver is built on `UnsafeMemory<_, Device>`),
+    booting under `qemu-system-riscv32 -M virt -bios none` at RAM base
+    0x8000_0000, printing a banner and exiting cleanly via `sifive_test`
+    (0x5555 = exit 0). A boot trap stub FAILs the run (never hangs) on a
+    fault, and the freestanding panic seam writes to the UART then FAILs.
+    `make sos-test` (tools/sos_runner.py) is the mechanical loop the kernel
+    briefs build on. sawc's freestanding profile gained the enabling
+    dead-code-strip (internalize non-exports + per-symbol sections) so a
+    kernel links only what it reaches; the Saw object is `rv32i`/ilp32
+    soft-float (llvmlite's default for the triple), boot.S/rt.c assembled
+    `rv32imac_zicsr`.
