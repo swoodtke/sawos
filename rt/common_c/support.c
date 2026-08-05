@@ -114,10 +114,13 @@ void *memmove(void *dst, const void *src, usize n) {
 
 // ---- atomic libcalls, by width -------------------------------------------
 //
-// The Saw object is built for a base ISA without atomics (bare `rv32i` — the
-// default for the triple), so String's refcount traffic lowers to `__atomic_*`
-// libcalls rather than instructions. The kernel prints, therefore the kernel
-// needs them.
+// CURRENTLY UNREFERENCED, and kept deliberately. Both builds now pass
+// `--target-features +m,+a,+c`, so String's refcount traffic lowers to real
+// `amoadd.w` instructions and `--gc-sections` drops everything below. They stay
+// because a build that does NOT name the A extension — a smaller part, a
+// different profile — lowers the same traffic to these libcalls instead, and
+// the alternative to keeping them is an unresolved-symbol link failure with no
+// hint as to what to write.
 //
 // THE UNIPROCESSOR CAVEAT, STATED ONCE FOR THE WHOLE FAMILY: plain
 // read-modify-write is correct here and nowhere else. SOS v1 is a uniprocessor

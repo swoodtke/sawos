@@ -73,7 +73,15 @@ SECTIONS {
      * accessors. Unit A's U-mode payloads ride the same slot as raw code, which
      * is why this section is executable. Empty (start == end) in an image built
      * without a payload. A real flash partition table is P4-hardware material. */
-    .payload : ALIGN(16) {
+    /* PAGE-aligned, not merely word-aligned. Two reasons, one of them found the
+     * hard way: an image blob is a page-granular thing everywhere else it will
+     * ever live (a flash partition, a mapped MemoryObject), and a payload that
+     * STRADDLES a page boundary is a genuinely awkward object — with the C
+     * extension enabled a 4-byte instruction can begin at a 2-mod-4 address and
+     * span two pages, which QEMU 11.0.3 does not merely fault on but asserts
+     * inside its own translator. Starting the section on a page keeps a small
+     * payload entirely within one. */
+    .payload : ALIGN(4096) {
         _payload_start = .;
         KEEP(*(.payload))
         _payload_end = .;
