@@ -39,8 +39,14 @@ u32 sos_syscall1(u32 handle, u32 op, u32 arg0) {
 // authority, because a process that was never given the handle has nothing to
 // remember and its panics are simply silent.
 
-#define OP_DEBUG_PRINT  0u
-#define OP_SHUTDOWN     1u
+// These are the kernel package's `@export`ed C-ABI surface (the `sos` module,
+// sos/kernel/sysapi/) — the SUPPORTED interface for non-Saw callers. The sinks
+// below go through them rather than through `sos_syscall1` directly, which is
+// the point: no op number appears in this file, or anywhere outside the kernel
+// package. It also means the C altitude is exercised on every boot rather than
+// only by a test.
+u32 sos_system_debug_print(u32 handle, u32 byte);
+u32 sos_system_shutdown(u32 handle, u32 status);
 
 typedef unsigned long usize;
 
@@ -55,13 +61,13 @@ void sos_rt_write(const char *ptr, usize len) {
         return;
     }
     for (usize i = 0; i < len; i++) {
-        sos_syscall1(system_handle, OP_DEBUG_PRINT, (u32)(unsigned char)ptr[i]);
+        sos_system_debug_print(system_handle, (u32)(unsigned char)ptr[i]);
     }
 }
 
 __attribute__((noreturn))
 void sos_rt_abort(u32 code) {
-    sos_syscall1(system_handle, OP_SHUTDOWN, code);
+    sos_system_shutdown(system_handle, code);
     // `shutdown` does not return. If the handle was never set, or the right
     // was stripped, there is nothing left to try — do not run off the end of
     // the granted region.

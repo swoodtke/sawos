@@ -1,0 +1,86 @@
+//! The SOS call numbers — KERNEL-INTERNAL (design 140; sos/spec.md §5.7).
+//!
+//! Every op number, rights bit and status tag in the system, in one place.
+//! Exactly two things import this: the kernel's dispatch tables
+//! (`sos/kernel/core/`) and the `sos` wrapper module the kernel package exports
+//! to userspace (`sos/kernel/sysapi/`). Nothing else, ever.
+//!
+//! WHY IT IS SHARED RATHER THAN DUPLICATED: the dispatch and the wrappers are
+//! the two halves of one contract. Held apart, they skew — and a syscall-number
+//! skew is not a compile error anywhere, it is a working call that does the
+//! wrong thing. Held together, renumbering is a one-line edit that either
+//! rebuilds both halves or fails.
+//!
+//! WHY IT IS KERNEL-INTERNAL: the Zircon-vDSO discipline (ratified Aug 5).
+//! NUMBERS ARE NOT ABI. Userspace links the exported `sos` module and calls
+//! methods; it never writes `7` for an op, so the kernel may renumber freely
+//! between builds. The one thing a process must agree with the kernel about is
+//! the CALLING CONVENTION (§5.7: handle in a0, op in a7), and that lives in the
+//! per-arch HAL stub, not here.
+//!
+//! Delivery in v1 is static linking through the manifest/module-path
+//! mechanism. A genuinely mapped vDSO is an object-model-era upgrade that
+//! changes none of the above.
+
+// =============================================================================
+// Object types
+// =============================================================================
+
+/// A handle that names nothing. Handle 0 is reserved so a zeroed register can
+/// never be mistaken for authority.
+public static OBJ_NONE: UInt = 0
+public static OBJ_SYSTEM: UInt = 1
+
+// =============================================================================
+// Rights (spec §3)
+// =============================================================================
+//
+// A bitmask, and attenuation is MONOTONIC — a derivation may only ever strip
+// bits. Rights are checked per-OP, not per-object: holding a handle is not the
+// same as being allowed to use every part of what it names.
+
+public static RIGHT_DEBUG: UInt = 1
+public static RIGHT_SHUTDOWN: UInt = 2
+
+/// What the kernel mints for root's System handle at boot (§12).
+public static ROOT_SYSTEM_RIGHTS: UInt = 3      // RIGHT_DEBUG | RIGHT_SHUTDOWN
+
+// =============================================================================
+// The System object's op table (spec §2)
+// =============================================================================
+//
+// These are METHOD IDS on the System object, not global syscall numbers.
+// Another object type numbers its own ops from zero, and the pair (handle, op)
+// is what selects an implementation.
+
+public static OP_SYSTEM_DEBUG_PRINT: UInt = 0
+public static OP_SYSTEM_SHUTDOWN: UInt = 1
+public static OP_SYSTEM_MAX: UInt = 1
+
+// =============================================================================
+// Status words (spec §5.7)
+// =============================================================================
+//
+// Returned in a0. A failing op RETURNS one of these and the process keeps
+// running — a caller's mistake is an error, not a fault. These tags ARE part of
+// the contract in a way the op numbers are not, because a process branches on
+// them; the `sos` module maps them to a typed `SysError` so userspace branches
+// on names.
+
+public static SYS_OK: UInt = 0
+public static SYS_ERR_BAD_HANDLE: UInt = 1
+public static SYS_ERR_BAD_OP: UInt = 2
+public static SYS_ERR_ACCESS_DENIED: UInt = 3
+
+// =============================================================================
+// The boot handle set (spec §12)
+// =============================================================================
+
+/// The handle the kernel gives root for the System object. Root receives it in
+/// the first argument register at entry rather than assuming it, so this
+/// constant is the KERNEL's choice of what to mint — not a number userspace is
+/// expected to know.
+public static ROOT_SYSTEM_HANDLE: UInt = 1
+
+/// The `stack_top` handed to a user entry that was granted no stack region.
+public static NO_USER_STACK: UInt = 0

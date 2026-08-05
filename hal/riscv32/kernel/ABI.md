@@ -26,6 +26,18 @@ it does not change.
   the frame; a returning syscall advances the saved PC past the trapping
   instruction itself.
 
+## Which altitude is supported for whom
+
+Nothing in this directory is an application interface. It is the kernel's own
+platform layer: the kernel calls it, and a process never can (every symbol here
+lives in M-mode code a process holds no grant for). The three-altitude question
+belongs to the USER seam — see `sos/hal/riscv32/user/ABI.md`.
+
+The one thing worth stating in both places: the op NUMBERS the trap handler
+dispatches on come from `sos/kernel/abi/`, which the exported `sos` module
+imports too. The dispatch and the wrappers are the two halves of one contract,
+and they are compiled from one definition so they cannot skew.
+
 ## What is riscv32-specific here, and why
 
 - **`mscratch` as the mode witness** (0 in the kernel, `&_trapframe` in user

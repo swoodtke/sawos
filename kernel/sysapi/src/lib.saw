@@ -1,0 +1,161 @@
+//! `sos` — the SOS userspace API (design 140; sos/spec.md §2, §5.7, §12).
+//!
+//! U-MODE LIBRARY CODE, OWNED AND EXPORTED BY THE KERNEL PACKAGE. Nothing here
+//! runs in kernel mode; all of it lives in the kernel's tree. That is the
+//! Zircon-vDSO discipline (ratified Aug 5) and it buys one specific thing:
+//! SYSCALL NUMBERS ARE NOT ABI. The op numbers come from `sosabi`, which the
+//! kernel's dispatch tables import too, so the two halves of the contract
+//! cannot skew — and because a process links this module instead of writing
+//! numbers, the kernel may renumber between builds without breaking anything
+//! that was compiled against it.
+//!
+//! THREE ENTRY ALTITUDES, ONE IMPLEMENTATION CHAIN. There is exactly one place
+//! in the system that issues a trap, and everything above it is a wrapper:
+//!
+//!   typed Saw   `system.shutdown(0)`                 <- prefer this
+//!   typed C     `sos_system_shutdown(h, 0)`          <- for non-Saw languages
+//!   raw         `sos_syscall1(h, op, arg)`           <- the HAL stub
+//!
+//! The Saw methods below call the `@export`ed C functions, which call the raw
+//! form, which is the per-arch `ecall`/`svc` stub in `sos/hal/<arch>/user/`.
+//! No altitude reimplements the one below it, so there is no second trap path
+//! to keep in step.
+//!
+//! WHAT A PROCESS MUST STILL AGREE WITH THE KERNEL ABOUT: the calling
+//! convention (§5.7 — handle in a0, op in a7, status back in a0) and the status
+//! tags it branches on. The first lives in the HAL stub; the second is `SysError`
+//! below. Neither is a number this file's callers ever write.
+
+import sosabi.{OP_SYSTEM_DEBUG_PRINT, OP_SYSTEM_SHUTDOWN, SYS_OK, SYS_ERR_BAD_HANDLE, SYS_ERR_BAD_OP, SYS_ERR_ACCESS_DENIED}
+
+// The scalar-to-console-byte rule, shared with the kernel's own console so the
+// two cannot disagree about what a non-ASCII scalar becomes.
+import sosrt.{ascii_byte}
+
+// The per-arch HAL: the one instruction in the system that crosses the trap
+// boundary, plus the hook that lets the runtime's own panic path print. FIXED
+// ARITY on purpose — a varargs call across a trap boundary has no portable
+// register story, so a wider op gets `sos_syscall2` beside this, not an
+// ellipsis.
+extern "C" {
+    func sos_syscall1(handle: UInt, op: UInt, arg0: UInt) -> UInt
+    func sos_set_system_handle(handle: UInt)
+}
+
+// =============================================================================
+// Errors
+// =============================================================================
+
+/// What a syscall can go wrong with (spec §5.7). The kernel returns a small
+/// integer tag; this is that tag with a name on it, so userspace branches on
+/// meaning rather than on a number.
+public enum SysError {
+    case BadHandle,
+    case BadOp,
+    case AccessDenied,
+    case Unknown(status: UInt)
+}
+
+/// Interpret a raw status word. `SYS_OK` is not an error and has no case here —
+/// a caller holding one of these already knows the call failed.
+///
+/// A FREE FUNCTION, not a `SysError` method, because an enum cannot carry
+/// methods at all today: only empty derivable-trait conformances may extend one
+/// (DF-140i). The same limit is why `SysError` cannot conform to `Error` or
+/// `Printable`, so it cannot be interpolated — callers `match` it.
+public func sys_error(status: UInt) -> SysError {
+    if status == SYS_ERR_BAD_HANDLE {
+        SysError.BadHandle
+    } else if status == SYS_ERR_BAD_OP {
+        SysError.BadOp
+    } else if status == SYS_ERR_ACCESS_DENIED {
+        SysError.AccessDenied
+    } else {
+        SysError.Unknown(status: status)
+    }
+}
+
+/// Turn a raw status into a Result. The one place a number becomes a type.
+func checked(status: UInt) -> Result<Void, SysError> {
+    if status == SYS_OK {
+        return
+    }
+    sys_error(status)
+}
+
+// =============================================================================
+// The C-ABI surface (spec §5.7) — for non-Saw languages
+// =============================================================================
+//
+// PER-OP functions are the supported C interface: one function per operation,
+// named for it, with the arguments the operation actually takes. A C caller
+// gets the same contract a Saw caller does minus the type wrapper, and still
+// never writes an op number.
+//
+// `sos_syscall1` underneath is the raw form and is reachable, but it is the
+// escape hatch, not the interface: it takes an op number, which is the thing
+// this whole arrangement exists to keep out of callers.
+//
+// Whitelist-clean by construction — handles, ops and statuses are all
+// integers, so nothing here needs a type the C ABI cannot carry.
+
+/// Write one byte to the debug console. Requires the DEBUG right.
+/// Returns a status word: 0 on success.
+@export("sos_system_debug_print")
+public func sos_system_debug_print(handle: UInt, byte: UInt) -> UInt {
+    sos_syscall1(handle, OP_SYSTEM_DEBUG_PRINT, byte)
+}
+
+/// Stop the machine with `status`. Requires the SHUTDOWN right. Does not
+/// return on success; returns a status word if the call was refused.
+@export("sos_system_shutdown")
+public func sos_system_shutdown(handle: UInt, status: UInt) -> UInt {
+    sos_syscall1(handle, OP_SYSTEM_SHUTDOWN, status)
+}
+
+// =============================================================================
+// The typed Saw surface
+// =============================================================================
+
+/// A handle to the kernel's System object — in M1 the whole of a process's
+/// authority (§12's boot handle set, one handle wide today).
+///
+/// Real handles will be `NoCopy` with a `Deinit` that closes them (§4); this
+/// one is a plain value because M1 has no close op and root holds its handle
+/// for the life of the machine. The typed-wrapper SHAPE is what matters now: a
+/// handle is never a bare integer at a call site, so handle-kind confusion
+/// cannot be written down.
+public struct System {
+    handle: UInt,
+}
+
+public extension System {
+    /// Adopt the boot handle the kernel passed in the first argument register.
+    public init(boot_handle: UInt) -> System {
+        // The runtime's panic path prints through this same handle, so it has
+        // to be reachable from C before any Saw code can fail.
+        sos_set_system_handle(boot_handle)
+        System(handle: boot_handle)
+    }
+
+    /// Write one byte to the debug console.
+    public func debug_print_byte(&self, byte: UInt8) -> Result<Void, SysError> {
+        checked(sos_system_debug_print(self.handle, byte as UInt))
+    }
+
+    /// Write an ASCII string. Stops at the FIRST failure and reports it — a
+    /// partial write is surfaced, never swallowed.
+    public func debug_print(&self, msg: String) -> Result<Void, SysError> {
+        for scalar in msg.chars() {
+            try self.debug_print_byte(ascii_byte(scalar))
+        }
+        return
+    }
+
+    /// Stop the machine with `status`. Does not return when it succeeds; a
+    /// refusal (no SHUTDOWN right, say) comes back as an error.
+    public func shutdown(&self, status: UInt) -> Result<Void, SysError> {
+        checked(sos_system_shutdown(self.handle, status))
+    }
+}
+

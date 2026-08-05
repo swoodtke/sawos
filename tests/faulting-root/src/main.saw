@@ -10,15 +10,12 @@
 // exits FAIL on. What must NOT happen: the write landing, or the machine
 // hanging. The unit-A payloads make the same point from hand-written assembly;
 // this makes it from ordinary Saw, through the real build pipeline.
+//
+// The one architecture-specific thing here is the ADDRESS it reaches for, which
+// is the point of the test. Everything else goes through the kernel's exported
+// `sos` module like any process.
 
-import sosrt.{ascii_byte}
-
-extern "C" {
-    func sos_syscall1(handle: UInt, op: UInt, arg0: UInt) -> UInt
-    func sos_set_system_handle(handle: UInt)
-}
-
-static OP_DEBUG_PRINT: UInt = 0
+import sos.{System}
 
 /// The kernel's text base — inside the kernel image, outside every grant root
 /// holds.
@@ -28,21 +25,15 @@ struct Word {
     value: UInt32,
 }
 
-func debug_print(handle: UInt, msg: String) {
-    for scalar in msg.chars() {
-        let _ = sos_syscall1(handle, OP_DEBUG_PRINT, ascii_byte(scalar) as UInt)
-    }
-}
-
 @export("_start")
 func _start(boot_handle: UInt) unsafe {
-    sos_set_system_handle(boot_handle)
-    debug_print(boot_handle, "SOS root: reaching for the kernel\n")
+    let system = System(boot_handle: boot_handle)
+    let _ = system.debug_print("SOS root: reaching for the kernel\n")
 
     let kernel = UnsafeMemory<Word, Normal>(KERNEL_TEXT_BASE)
     kernel.value.write(0u32)
 
     // Unreachable: the store above traps into the kernel, which never returns
     // control to a process that faulted (spec §8).
-    debug_print(boot_handle, "SOS root: THE GRANT DID NOT HOLD\n")
+    let _ = system.debug_print("SOS root: THE GRANT DID NOT HOLD\n")
 }

@@ -617,7 +617,14 @@ event-driven EDGE of a process gets a second, distinct construct:
     register at entry (§12's boot handle set, one handle wide today). A bad
     handle, a bad op or a missing right returns a `SysError` status and the
     process runs on; a FAULT is fatal and prints a cause tag (M0's never-hang
-    discipline, kept). The §6 boot protocol is
+    discipline, kept). API ownership follows the vDSO discipline: the typed
+    wrappers are a public `sos` module OWNED AND EXPORTED BY THE KERNEL PACKAGE
+    (`sos/kernel/sysapi/`), every number lives in one kernel-internal package
+    (`sos/kernel/abi/`) shared by the dispatch tables and those wrappers, and a
+    process links `sos` and never writes a number. A per-op C-ABI surface
+    (`sos_system_debug_print`, `sos_system_shutdown`) sits beside the Saw one
+    over a fixed-arity raw `sos_syscall1` over the per-arch stub — one chain,
+    three altitudes. The §6 boot protocol is
     concrete: a flat **sosimg** (16-byte header + 20-byte segment records, all
     fixed-width little-endian per design 47, carrying the §7 priority map),
     emitted by a Blade `emit = "sosimg"` build target reading the package's

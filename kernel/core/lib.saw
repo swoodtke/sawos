@@ -19,6 +19,10 @@ import imgformat.{SosimgHeader, SosimgSeg}
 // Arch-free, role-free formatting, shared with every SOS process build.
 import sosrt.{ascii_byte, hex_digit_of, HEX_DIGITS_PER_WORD}
 
+// The call numbers. Kernel-internal and shared with the `sos` module the kernel
+// exports (sos/kernel/sysapi/) — one definition, two halves of one contract.
+import sosabi.{OBJ_NONE, OBJ_SYSTEM, RIGHT_DEBUG, RIGHT_SHUTDOWN, OP_SYSTEM_DEBUG_PRINT, OP_SYSTEM_SHUTDOWN, OP_SYSTEM_MAX, SYS_OK, SYS_ERR_BAD_HANDLE, SYS_ERR_BAD_OP, SYS_ERR_ACCESS_DENIED, ROOT_SYSTEM_HANDLE, ROOT_SYSTEM_RIGHTS, NO_USER_STACK}
+
 // =============================================================================
 // NS16550A UART (design 112's blessed MMIO idiom: register block + driver)
 // =============================================================================
@@ -200,35 +204,12 @@ static CAUSE_ECALL_FROM_U: UInt = 8
 // M1 implements one object, the System singleton, so the table is one entry
 // wide. That is deliberately not the interesting part: the SHAPE is, because
 // it is what every later object plugs into unchanged.
-
-/// Kernel object types.
-static OBJ_NONE: UInt = 0
-static OBJ_SYSTEM: UInt = 1
-
-/// Rights are a bitmask (§3) and attenuation is monotonic — a derivation may
-/// only ever strip bits. A process without DEBUG cannot print, even holding
-/// the System handle.
-public static RIGHT_DEBUG: UInt = 1
-public static RIGHT_SHUTDOWN: UInt = 2
-
-/// The System object's op table (§2). These numbers are meaningful only
-/// against an OBJ_SYSTEM handle; another object type numbers its own ops from
-/// zero.
-static OP_SYSTEM_DEBUG_PRINT: UInt = 0
-static OP_SYSTEM_SHUTDOWN: UInt = 1
-static OP_SYSTEM_MAX: UInt = 1
-
-/// The handle root is given for the System object at boot (§12). Handle 0 is
-/// reserved as "no handle", so a zeroed register never names anything.
-public static HANDLE_NONE: UInt = 0
-public static ROOT_SYSTEM_HANDLE: UInt = 1
-
-/// Status words returned in a0 (§5.7). A failed op RETURNS one of these and
-/// the process keeps running — a bad call is an error, not a fault.
-static SYS_OK: UInt = 0
-static SYS_ERR_BAD_HANDLE: UInt = 1
-static SYS_ERR_BAD_OP: UInt = 2
-static SYS_ERR_ACCESS_DENIED: UInt = 3
+//
+// The NUMBERS are not here. They are `sosabi`, imported at the top of this
+// file, and the `sos` module the kernel exports to userspace imports the same
+// ones — so the dispatch below and the wrappers a process calls cannot skew.
+// A syscall-number skew would not be a compile error anywhere; it would be a
+// working call that did the wrong thing.
 
 /// One handle-table entry: the object a handle names and the rights its holder
 /// has on it (§3). The kernel validates both on every op.
@@ -267,9 +248,6 @@ public static PERM_X: UInt = 4
 
 /// PMP's address granularity: bounds are stored shifted right by two.
 public static PMP_GRAIN: UInt = 4
-
-/// The `stack_top` to hand a user entry that was granted no stack region.
-public static NO_USER_STACK: UInt = 0
 
 /// Round `v` up to the next multiple of `align` (a power of two).
 public func align_up(v: UInt, align: UInt) -> UInt {
@@ -387,7 +365,7 @@ public func fatal(tag: String, cause: UInt, epc: UInt, tval: UInt, code: UInt) {
 /// stale-handle detection — §3) lands with the object model.
 func lookup_handle(handle: UInt) -> HandleEntry {
     if handle == ROOT_SYSTEM_HANDLE {
-        HandleEntry(obj_type: OBJ_SYSTEM, rights: RIGHT_DEBUG | RIGHT_SHUTDOWN)
+        HandleEntry(obj_type: OBJ_SYSTEM, rights: ROOT_SYSTEM_RIGHTS)
     } else {
         HandleEntry(obj_type: OBJ_NONE, rights: 0)
     }

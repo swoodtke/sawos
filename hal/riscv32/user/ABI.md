@@ -5,6 +5,23 @@ these four symbols and nothing else about its machine, which is what should let
 `sos/root/src/` build for arm64 (design 79) with only the manifest's
 `[sos] native` line changing.
 
+## Which altitude is supported for whom
+
+There are three ways to reach the kernel and they are ONE implementation chain,
+not three (sos/spec.md §5.7):
+
+| Altitude | Spelling | For |
+|---|---|---|
+| typed Saw | `system.shutdown(0)` | **Saw processes. Use this.** Handles are typed, statuses are a `SysError`, no number appears. |
+| typed C | `sos_system_shutdown(h, 0)` | **Non-Saw languages.** One `@export`ed function per op, named for the op; still no number. |
+| raw | `sos_syscall1(h, op, a)` | **The HAL and the kernel package only.** It takes an op NUMBER, which is the thing the arrangement above exists to keep out of callers. Not a supported application interface. |
+
+The first two are the kernel package's (`sos/kernel/sysapi/`), not this
+directory's. This directory supplies only the bottom of the chain — the one
+instruction that crosses the trap boundary — plus the two runtime sinks, which
+themselves call the typed C surface rather than the raw form, so no op number
+appears in this HAL either.
+
 ## Provided to a process
 
 | Symbol | Contract |
