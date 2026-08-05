@@ -82,15 +82,53 @@ extension SifiveTest {
     }
 }
 
+// A mapped region, as the kernel would describe one in a log line. `format`
+// is written out of `append` calls rather than `"{...}"` interpolation: an
+// interpolated string is a heap String by construction, and this kernel has no
+// heap at all (design 137).
+// Addresses are UInt: on riscv32 the platform Int is 32-bit SIGNED, so a RAM
+// base of 0x80000000 renders as -2147483648 through the signed overload. An
+// address is not a negative number.
+struct Region { base: UInt, size: UInt }
+extension Region: Printable {
+    func format(&self, into: &var StringBuilder) {
+        into.append("[")
+        into.append(self.base)
+        into.append(" +")
+        into.append(self.size)
+        into.append("]")
+    }
+}
+
 static UART_BASE: Int = 0x10000000
 static TEST_BASE: Int = 0x00100000
 static LSR_TX_EMPTY: UInt8 = 0x20u8       // LSR bit 5 — TX holding register empty
 static FINISHER_PASS: UInt32 = 0x5555u32
+static RAM_BASE: UInt = 0x80000000
+static RAM_SIZE: UInt = 0x800000
 
 @export("kmain")
 func kmain() {
+    // The banner goes out through the driver, which is the design-112 MMIO
+    // idiom this kernel exists to demonstrate: a typed register block behind
+    // `UnsafeMemory<_, Device>`, reached only through driver methods.
     let uart = Uart16550(at: UART_BASE)
     uart.write_str("SOS M0: hello from Saw on riscv32 (QEMU virt)\n")
+
+    // Everything after it is ordinary `print`, which reaches the SAME UART
+    // through the `__saw_rt_write` seam and allocates NOTHING (design 137).
+    // There is no allocator in this profile to allocate from — the format
+    // arguments render into stack scratch and go straight out the seam, so a
+    // kernel gets the same logging a hosted program has.
+    print("uart at {} lsr-mask {}", UART_BASE, LSR_TX_EMPTY)
+    print("ram {}", Region(base: RAM_BASE, size: RAM_SIZE))
+
+    var i = 0
+    while i < 3 {
+        print("stage {} ok", i)
+        i = i + 1
+    }
+
     let test = SifiveTest(at: TEST_BASE)
     test.exit_pass()
 }
