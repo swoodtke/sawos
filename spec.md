@@ -263,10 +263,25 @@ names provisional):
    is a Process-object op when Process objects land (ratified Aug 5); in
    M1's one-process world, root's `system.shutdown(status)` ends the run
    (QEMU: the sifive_test write). Maps 1:1 onto the
-   userspace `sos` module's typed wrappers (`system.debug_print(...)`,
-   `-> Result<T, SysError>` — auto-wrap does the rest). The typed Handle
-   wrappers live in the userspace `sos` module, not the kernel (already
-   ratified).
+   `sos` module's typed wrappers (`system.debug_print(...)`,
+   `-> Result<T, SysError>` — auto-wrap does the rest).
+   **API ownership (ratified Aug 5, revising the Jul-31 line):** the `sos`
+   module is U-MODE LIBRARY CODE (never kernel-mode — that half of the
+   Jul-31 decision stands) but it is OWNED AND EXPORTED BY THE KERNEL
+   PACKAGE — the Zircon-vDSO discipline: syscall/method NUMBERS ARE NOT
+   ABI. They live in one kernel-internal constants file shared by the
+   dispatch tables and the wrappers, so the two can never skew and the
+   kernel may renumber freely; userspace links the exported module and
+   never sees a raw number. Delivery is static linking in v1 (the
+   manifest/module-path mechanism); a true mapped-vDSO is an
+   object-model-era upgrade that changes nothing about the shape. The
+   kernel package ALSO exports a C-ABI surface for non-Saw languages
+   (`@export`, whitelist-clean — handles/statuses/ops are integers):
+   per-op functions (`sos_system_shutdown(handle, status)`) as the
+   supported C interface, over fixed-arity raw forms
+   (`sos_syscall1(h, op, a)` — no varargs across the trap boundary),
+   over the per-arch HAL `ecall`/`svc` stub. One implementation chain,
+   three entry altitudes: typed Saw, typed C, raw.
 
 ## 5b. Two machine profiles, two architectures (DECIDED, user, Jul 31)
 
