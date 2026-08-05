@@ -597,6 +597,34 @@ event-driven EDGE of a process gets a second, distinct construct:
     kernel links only what it reaches; the Saw object is `rv32i`/ilp32
     soft-float (llvmlite's default for the triple), boot.S/rt.c assembled
     `rv32imac_zicsr`.
+    M1 changed two things in this description: the M0 trap stub is now the
+    KERNEL-mode half of a two-way trap entry (`kernel_fault`, byte-identical
+    behaviour), and `sos/kernel/main.saw` no longer prints-and-exits — it loads
+    root. The M0 banner/panic/trap cases are still green as
+    `no_root_image` / `panic_seam` / `trap_fault`.
+  - **M1 DONE (design 140), branch PARKED for user review:** riscv32
+    boot-to-root-server. A real `mtvec` handler with `mscratch` as the mode
+    witness (0 in the kernel, `&_trapframe` in U-mode) splits a syscall from a
+    kernel bug in one branch; a U-mode trap saves 31 GPRs + `mepc` into a
+    32-word frame, runs the Saw handler `ktrap`, and resumes. M-mode kernel /
+    U-mode root, isolated by PMP TOR regions — U-mode default-deny does the
+    work, so the kernel, the UART and the finisher are protected by never being
+    granted. Syscall ABI per §5.7 with the v1 table `0 debug_putc`,
+    `1 exit`; any fault, bad number, or malformed image prints a cause tag and
+    exits FAIL (M0's never-hang discipline, kept). The §6 boot protocol is
+    concrete: a flat **sosimg** (16-byte header + 20-byte segment records, all
+    fixed-width little-endian per design 47, carrying the §7 priority map),
+    emitted by a Blade `emit = "sosimg"` build target reading the package's
+    `[sos]` manifest section, appended to the kernel image as a `.payload` blob
+    with linker-symbol bounds. `sos/root/` is a real separate Saw package built
+    by Blade; it prints its banner THROUGH `debug_putc` — it holds no device
+    grant and could not print any other way — and exits 0. The kernel validates
+    an image in full before placing a byte of it, so a segment aimed at the
+    kernel is refused rather than obeyed. `make sos-test` is 11 cases including
+    the two-image boot and a root that oversteps its grant. Kernel-side
+    `sos/kernel/core/lib.saw` is shared by every test image, which is what keeps
+    them all on the same trap path; it and `boot.S` + rt.c's CSR/PMP helpers are
+    the riscv32 HAL that M1b extracts.
 
 ## 12. The root server (ratified Aug 5, user)
 

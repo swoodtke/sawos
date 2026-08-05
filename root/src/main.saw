@@ -1,0 +1,43 @@
+// SOS root server (design 140 unit C; sos/spec.md §12) — riscv32, U-mode.
+//
+// Root is the first and only process the kernel loads. Everything else — the
+// launcher, the name service, every later process — is root's job, not the
+// kernel's (§12: splitting them out later must require zero kernel changes).
+//
+// v1 proves the boundary and nothing more: print a banner and exit 0. What
+// makes that worth booting is HOW it prints. Root holds no PMP grant for the
+// UART; the only reason a character reaches the console is that the kernel put
+// it there on root's behalf, through `debug_putc`. Take the syscall away and
+// root is mute — which is exactly the property the M/U split is supposed to
+// have.
+//
+// Built by Blade from this package's own Saw.toml (`[sos] emit = "sosimg"`),
+// linked at 0x8020_0000 by root.ld, and appended to the kernel image as the
+// one blob the kernel's loader knows how to read.
+
+// The syscall stubs live in src/rt.c: an `ecall` is not expressible in Saw, so
+// this is the whole of root's native surface (see that file's header).
+extern "C" {
+    func sos_debug_putc(c: UInt) -> UInt
+    func sos_exit(status: UInt)
+}
+
+/// Root's exit status when it finishes its work.
+static EXIT_OK: UInt = 0
+
+/// Write an ASCII string to the console, one `debug_putc` per byte.
+///
+/// `chars()` yields Unicode scalars and the v1 syscall carries one byte, so a
+/// non-ASCII scalar would truncate. Root's own text is ASCII; a real console
+/// service with a byte-oriented API is userspace work for a later milestone.
+func put_str(msg: String) {
+    for scalar in msg.chars() {
+        let _ = sos_debug_putc(scalar as UInt)
+    }
+}
+
+@export("_start")
+func _start() {
+    put_str("SOS root: hello from U-mode via ecall\n")
+    sos_exit(EXIT_OK)
+}

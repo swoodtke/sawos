@@ -1,0 +1,41 @@
+// A root server that oversteps its grant (design 140 unit C).
+//
+// The kernel's promise is that root runs in U-mode holding PMP grants for its
+// own segments and its stack, and NOTHING else. This program tests the promise
+// the only way that counts: it prints a line through the syscall (proving it is
+// alive and really in U-mode), then writes to the kernel's text base.
+//
+// The expected outcome is a store/AMO access fault the kernel diagnoses and
+// exits FAIL on. What must NOT happen: the write landing, or the machine
+// hanging. Unit A makes the same point from hand-written assembly; this makes
+// it from ordinary Saw, through the real build pipeline.
+
+extern "C" {
+    func sos_debug_putc(c: UInt) -> UInt
+}
+
+/// The kernel's text base — inside the kernel image, outside every grant root
+/// holds.
+static KERNEL_TEXT_BASE: UInt = 0x80000000
+
+struct Word {
+    value: UInt32,
+}
+
+func put_str(msg: String) {
+    for scalar in msg.chars() {
+        let _ = sos_debug_putc(scalar as UInt)
+    }
+}
+
+@export("_start")
+func _start() unsafe {
+    put_str("SOS root: reaching for the kernel\n")
+
+    let kernel = UnsafeMemory<Word, Normal>(KERNEL_TEXT_BASE)
+    kernel.value.write(0u32)
+
+    // Unreachable: the store above traps into the kernel, which never returns
+    // control to a process that faulted (spec §8).
+    put_str("SOS root: THE GRANT DID NOT HOLD\n")
+}

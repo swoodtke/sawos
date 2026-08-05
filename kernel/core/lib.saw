@@ -522,6 +522,17 @@ func check_segment(base: UInt, img_len: UInt, rec: UInt) unsafe {
     if mem_len > limit - load_addr {
         fatal_image("segment overruns the root region", mem_len)
     }
+
+    // RISC-V reserves the PMP encoding W-without-R, so a segment asking for it
+    // would program a configuration the hardware does not define. Reject it
+    // here rather than hand it to the CSR.
+    let flags = read_u8(rec + SEG_FLAGS)
+    if (flags & PERM_W) != 0 && (flags & PERM_R) == 0 {
+        fatal_image("segment is write-without-read", flags)
+    }
+    if (flags & PERM_R) == 0 && (flags & PERM_X) == 0 {
+        fatal_image("segment grants no access", flags)
+    }
 }
 
 /// Parse the appended root image, place its segments, grant root exactly the
@@ -597,6 +608,10 @@ public func load_root_and_enter() unsafe {
         copy_bytes(load_addr, base + file_off, file_len)
         zero_bytes(load_addr + file_len, mem_len - file_len)
 
+        // The sosimg flag bits are R=1, W=2, X=4 — deliberately the same order
+        // as a PMP config's low three bits, so a segment's permissions become
+        // its region's with no translation. (ELF spells them the other way
+        // round; Blade's emitter does that conversion at build time.)
         pmp_region(s, load_addr, align_up(load_addr + mem_len, PMP_GRAIN), flags)
         s = s + 1
     }
