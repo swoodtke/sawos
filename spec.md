@@ -40,6 +40,7 @@ names provisional):
 | `MemoryObject` | Physical memory (RAM or device MMIO). Ownership/authority over the pages; mappable, sendable — see §2.3 (ratified Jul 29). |
 | `Mapping` | An installed virtual placement of a MemoryObject; distinct object, own handle; only it can unmap — see §2.3. |
 | `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. |
+| `System` | Kernel singleton (ratified Aug 5): the object behind process-ambient primitives so that EVERY syscall is an object op (§5.7) — v1 ops `debug_print`, `exit`, rights-gated (DEBUG/EXIT). Root receives its handle at boot (§12); later candidates: info queries, shutdown. |
 
 ### 2.1 Channels: bounded messages + built-in request/reply (ratified Jul 29)
 
@@ -247,13 +248,23 @@ names provisional):
    (PMP/APM per §5.5) → mint root handles (boot channel, root
    MemoryObjects for RAM + device ranges, root IRQ table) → enter
    U-mode at the entry. Everything else derives from those handles.
-7. ~~Syscall ABI~~ **DECIDED (user, Jul 31): (status, value) PAIR.**
-   RISC-V standard convention: syscall number in a7, args a0-a5,
-   `ecall`; returns a0 = status word (0 = ok, else a small SysError
-   enum tag), a1 = value/handle. Maps 1:1 onto the userspace `sos`
-   module's typed wrappers (`-> Result<T, SysError>` — auto-wrap does
-   the rest). The typed Handle wrappers live in the userspace `sos`
-   module, not the kernel (already ratified).
+7. ~~Syscall ABI~~ **DECIDED (user, Jul 31; object-uniform Aug 5): (status,
+   value) PAIR, every call an OBJECT OP.** Conceptually every syscall is
+   `object.method(args)` — there are NO bare numbered syscalls `[user,
+   Aug 5]`. RISC-V registers: a0 = HANDLE, a7 = op (method id on that
+   object's op table), args a1-a5, `ecall`; returns a0 = status word
+   (0 = ok, else a small SysError enum tag), a1 = value/handle. Kernel
+   dispatch is §3's shape verbatim: handle-table lookup → object type →
+   op table → rights check → op. Even the M1 primitives conform: a
+   **System object** (kernel singleton; see §2 table) is minted to root
+   at boot, and `debug_print` / `exit` are its first ops, rights-gated
+   (DEBUG, EXIT bits) — a process without the System handle cannot even
+   print. Whether `exit` later migrates to the Process handle is an
+   object-model-brief question; v1 keeps it on System. Maps 1:1 onto the
+   userspace `sos` module's typed wrappers (`system.debug_print(...)`,
+   `-> Result<T, SysError>` — auto-wrap does the rest). The typed Handle
+   wrappers live in the userspace `sos` module, not the kernel (already
+   ratified).
 
 ## 5b. Two machine profiles, two architectures (DECIDED, user, Jul 31)
 
@@ -505,8 +516,9 @@ event-driven EDGE of a process gets a second, distinct construct:
   service into its own process later must require zero kernel changes —
   if the boot handle set can't support that split, the set is wrong.
 - **Boot handle set** (minted by the kernel to root, everything else
-  derives): the LAUNCH capability (§7); root MemoryObjects — the RAM
-  pool root and the device-range roots (§2.5); the root IRQ table
+  derives): the **System handle** (§2/§5.7 — debug_print/exit ops;
+  ratified Aug 5); the LAUNCH capability (§7); root MemoryObjects — the
+  RAM pool root and the device-range roots (§2.5); the root IRQ table
   (§2 Interrupt). Root's band map applies verbatim from its image (§7).
   NOTE (object-model brief material): the creation-authority model for
   plain objects (Channel/Event/Waiter/Timer) — quota-gated free
