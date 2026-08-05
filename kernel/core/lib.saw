@@ -1,0 +1,397 @@
+//! SOS kernel core (designs 112, 140) — Profile A: riscv32, QEMU `virt`.
+//!
+//! Everything a SOS kernel image shares: the two board drivers, the trap frame,
+//! the trap handler `ktrap`, the syscall table, and the PMP/privilege helpers.
+//! An image is `boot.S` + `rt.c` + this module + one entry `.saw` defining
+//! `kmain` — `sos/kernel/main.saw` for the real kernel, `sos/tests/*.saw` for
+//! the harness cases. Sharing the module is what keeps every test image on the
+//! SAME trap path instead of a copy of it.
+//!
+//! Addresses and machine words are `UInt` throughout, never `Int`. On this
+//! target `Int` is 32-bit SIGNED, so a RAM address like 0x8020_0000 lands in
+//! its negative half and silently means a different number on the 64-bit
+//! Profile B (spec §5b) — see DF-140a in designs/todo.md.
+
+// =============================================================================
+// NS16550A UART (design 112's blessed MMIO idiom: register block + driver)
+// =============================================================================
+
+/// The NS16550A register block. Registers are byte-spaced; the struct's natural
+/// declaration-order layout places each at its hardware offset. A `ReadOnly<T>`
+/// field exposes only `.read()`; a plain field is read-write.
+public struct UartRegs {
+    thr: UInt8,             // +0  transmit holding / receive buffer
+    ier: UInt8,             // +1  interrupt enable
+    iir: UInt8,             // +2  interrupt id / FIFO control
+    lcr: UInt8,             // +3  line control
+    mcr: UInt8,             // +4  modem control
+    lsr: ReadOnly<UInt8>,   // +5  line status
+    msr: ReadOnly<UInt8>,   // +6  modem status
+    scr: UInt8,             // +7  scratch
+}
+
+/// The console driver. A SAFE type (unsafety is not transitive — design 130):
+/// only the methods reaching through `regs` carry the `unsafe` effect.
+public struct Uart16550 {
+    regs: UnsafeMemory<UartRegs, Device>,
+}
+
+public extension Uart16550 {
+    public init(at: UInt) unsafe -> Uart16550 {
+        Uart16550(regs: UnsafeMemory<UartRegs, Device>(at))
+    }
+
+    /// Poll the line-status TX-empty bit, then write one byte to the holding
+    /// register — no interrupts in M1. Every access is a volatile Device
+    /// load/store.
+    public func write_byte(&self, b: UInt8) unsafe {
+        while (self.regs.lsr.read() & LSR_TX_EMPTY) == 0u8 { }
+        self.regs.thr.write(b)
+    }
+
+    /// Write an ASCII string, byte by byte. (`chars()` yields Unicode scalars;
+    /// the kernel console is ASCII-only — a non-ASCII scalar truncates.)
+    public func write_str(&self, msg: String) {
+        for scalar in msg.chars() {
+            self.write_byte(scalar as UInt8)
+        }
+    }
+
+    /// Write a machine word as `0x` + eight hex digits. Fixed width, no
+    /// allocation, no formatting machinery — the kernel has neither an
+    /// allocator worth spending nor (until design 135) a non-allocating
+    /// interpolation.
+    public func write_hex(&self, v: UInt) {
+        self.write_str("0x")
+        var n = 0
+        while n < HEX_DIGITS {
+            let shift = (HEX_DIGITS - 1 - n) * BITS_PER_HEX_DIGIT
+            self.write_byte(hex_digit((v >> shift) & HEX_NIBBLE_MASK))
+            n = n + 1
+        }
+    }
+}
+
+func hex_digit(nib: UInt) -> UInt8 {
+    if nib < HEX_DECIMAL_LIMIT {
+        (ASCII_ZERO + nib) as UInt8
+    } else {
+        (ASCII_LOWER_A_MINUS_TEN + nib) as UInt8
+    }
+}
+
+// =============================================================================
+// SiFive test finisher (QEMU `virt`)
+// =============================================================================
+
+public struct SifiveTestRegs {
+    finisher: UInt32,
+}
+
+/// Writing FINISHER_PASS exits the emulator with status 0; FINISHER_FAIL
+/// carries an exit code in its upper half. (boot.S's `kernel_fault` and rt.c's
+/// `__saw_rt_panic` drive the same device from asm/C.)
+public struct SifiveTest {
+    regs: UnsafeMemory<SifiveTestRegs, Device>,
+}
+
+public extension SifiveTest {
+    public init(at: UInt) unsafe -> SifiveTest {
+        SifiveTest(regs: UnsafeMemory<SifiveTestRegs, Device>(at))
+    }
+
+    /// Terminate the emulator with status 0. Never returns; if the write is
+    /// somehow ignored, spin rather than fall back into the boot shim.
+    public func exit_pass(&self) unsafe {
+        self.regs.finisher.write(FINISHER_PASS)
+        while true { }
+    }
+
+    /// Terminate the emulator with a NON-ZERO status. A zero code would make
+    /// the finisher report success, so it is promoted to `FAIL_CODE_MIN` —
+    /// a failing exit never reads as a passing one.
+    public func exit_fail(&self, code: UInt) unsafe {
+        var status = code & FAIL_CODE_MASK
+        if status == 0 {
+            status = FAIL_CODE_MIN
+        }
+        self.regs.finisher.write((FINISHER_FAIL | (status << FAIL_CODE_SHIFT)) as UInt32)
+        while true { }
+    }
+}
+
+// =============================================================================
+// The trap frame
+// =============================================================================
+
+/// The context boot.S saves on a trap from U-mode: 32 words, where word `i`
+/// holds register `x<i>` and word 0 — the slot `x0` would occupy — holds
+/// `mepc`. Declaration order IS the layout (design 58), so the field offsets
+/// here and the `sw x<i>, i*4(sp)` stores in boot.S are one description.
+public struct TrapFrame {
+    mepc: UInt,             // word 0  (x0 never needs saving)
+    ra: UInt,               // x1
+    sp: UInt,               // x2
+    gp: UInt,               // x3
+    tp: UInt,               // x4
+    t0: UInt,               // x5
+    t1: UInt,               // x6
+    t2: UInt,               // x7
+    s0: UInt,               // x8
+    s1: UInt,               // x9
+    a0: UInt,               // x10  syscall arg 0 / status out
+    a1: UInt,               // x11  syscall arg 1 / value out
+    a2: UInt,               // x12
+    a3: UInt,               // x13
+    a4: UInt,               // x14
+    a5: UInt,               // x15  syscall arg 5 (the last, per §5.7)
+    a6: UInt,               // x16
+    a7: UInt,               // x17  syscall NUMBER
+    s2: UInt,               // x18
+    s3: UInt,               // x19
+    s4: UInt,               // x20
+    s5: UInt,               // x21
+    s6: UInt,               // x22
+    s7: UInt,               // x23
+    s8: UInt,               // x24
+    s9: UInt,               // x25
+    s10: UInt,              // x26
+    s11: UInt,              // x27
+    t3: UInt,               // x28
+    t4: UInt,               // x29
+    t5: UInt,               // x30
+    t6: UInt,               // x31
+}
+
+// =============================================================================
+// Board / ABI constants
+// =============================================================================
+
+static UART_BASE: UInt = 0x10000000
+static TEST_BASE: UInt = 0x00100000
+static LSR_TX_EMPTY: UInt8 = 0x20u8       // LSR bit 5 — TX holding register empty
+static FINISHER_PASS: UInt32 = 0x5555u32
+static FINISHER_FAIL: UInt = 0x3333
+static FAIL_CODE_SHIFT: Int = 16
+static FAIL_CODE_MASK: UInt = 0xFF
+static FAIL_CODE_MIN: UInt = 1
+
+static HEX_DIGITS: Int = 8
+static BITS_PER_HEX_DIGIT: Int = 4
+static HEX_NIBBLE_MASK: UInt = 0xF
+static HEX_DECIMAL_LIMIT: UInt = 10
+static ASCII_ZERO: UInt = 48
+static ASCII_LOWER_A_MINUS_TEN: UInt = 87
+
+/// `mcause` codes for the M-mode exceptions M1 can take (interrupt bit clear).
+static CAUSE_INSN_MISALIGNED: UInt = 0
+static CAUSE_INSN_ACCESS_FAULT: UInt = 1
+static CAUSE_ILLEGAL_INSN: UInt = 2
+static CAUSE_BREAKPOINT: UInt = 3
+static CAUSE_LOAD_MISALIGNED: UInt = 4
+static CAUSE_LOAD_ACCESS_FAULT: UInt = 5
+static CAUSE_STORE_MISALIGNED: UInt = 6
+static CAUSE_STORE_ACCESS_FAULT: UInt = 7
+static CAUSE_ECALL_FROM_U: UInt = 8
+
+/// The v1 syscall table (spec §5.7; design 140 unit A). Number in `a7`, args in
+/// `a0`-`a5`, returns `a0` = status (0 = ok) and `a1` = value.
+static SYS_DEBUG_PUTC: UInt = 0
+static SYS_EXIT: UInt = 1
+static SYS_MAX: UInt = 1
+
+/// Syscall status words. The full `SysError` enum arrives with the object
+/// model; v1 needs only "ok".
+static SYS_OK: UInt = 0
+
+/// `ecall` is a 4-byte instruction — `mepc` points AT it, so a returning
+/// syscall must step past it or the trap repeats forever.
+static ECALL_INSN_LEN: UInt = 4
+
+/// Exit codes the kernel reports through the finisher, distinct from any status
+/// root chooses for itself.
+static EXIT_CODE_UMODE_FAULT: UInt = 2
+static EXIT_CODE_BAD_SYSCALL: UInt = 3
+static EXIT_CODE_BAD_IMAGE: UInt = 4
+
+// =============================================================================
+// Privilege + PMP seams (boot.S / rt.c — the riscv32 HAL M1b extracts)
+// =============================================================================
+
+extern "C" {
+    func sos_enter_user(entry: UInt, stack_top: UInt)
+    func sos_pmp_reset()
+    func sos_pmp_region(idx: UInt, base: UInt, top: UInt, perm: UInt)
+    func sos_pmp_commit()
+    func sos_payload_start() -> UInt
+    func sos_payload_end() -> UInt
+}
+
+/// PMP permission bits, as the region flags carry them.
+public static PERM_R: UInt = 1
+public static PERM_W: UInt = 2
+public static PERM_X: UInt = 4
+
+/// PMP's address granularity: bounds are stored shifted right by two.
+public static PMP_GRAIN: UInt = 4
+
+/// The `stack_top` to hand a user entry that was granted no stack region.
+public static NO_USER_STACK: UInt = 0
+
+/// Round `v` up to the next multiple of `align` (a power of two).
+public func align_up(v: UInt, align: UInt) -> UInt {
+    let rem = v & (align - 1)
+    if rem == 0 {
+        v
+    } else {
+        v + (align - rem)
+    }
+}
+
+/// Clear every PMP region. U-mode then reaches nothing at all — the
+/// default-deny the grants below carve out of.
+public func pmp_reset() {
+    sos_pmp_reset()
+}
+
+/// Stage region `idx` as [base, top) with `perm`.
+public func pmp_region(idx: UInt, base: UInt, top: UInt, perm: UInt) {
+    sos_pmp_region(idx, base, top, perm)
+}
+
+/// Publish the staged region set.
+public func pmp_commit() {
+    sos_pmp_commit()
+}
+
+/// Drop to U-mode at `entry` with `stack_top` as the stack pointer. Never
+/// returns — the next kernel code to run is `ktrap`.
+public func enter_user(entry: UInt, stack_top: UInt) {
+    sos_enter_user(entry, stack_top)
+}
+
+/// First byte of the appended payload — the `.payload` section virt.ld bounds.
+public func payload_start() -> UInt {
+    sos_payload_start()
+}
+
+/// One past the last byte of the appended payload. Equal to `payload_start()`
+/// in an image built without one.
+public func payload_end() -> UInt {
+    sos_payload_end()
+}
+
+// =============================================================================
+// Console + fault reporting
+// =============================================================================
+
+/// A console for this board. The driver is a plain value over a fixed address,
+/// so constructing one per use costs nothing; a true `static` singleton waits
+/// on Once/Lazy (tracker F5).
+public func console() unsafe -> Uart16550 {
+    Uart16550(at: UART_BASE)
+}
+
+/// The board's test finisher.
+public func finisher() unsafe -> SifiveTest {
+    SifiveTest(at: TEST_BASE)
+}
+
+/// A short symbolic name for an `mcause` value.
+public func cause_tag(cause: UInt) -> String {
+    if cause == CAUSE_INSN_MISALIGNED {
+        "instruction-address-misaligned"
+    } else if cause == CAUSE_INSN_ACCESS_FAULT {
+        "instruction-access-fault"
+    } else if cause == CAUSE_ILLEGAL_INSN {
+        "illegal-instruction"
+    } else if cause == CAUSE_BREAKPOINT {
+        "breakpoint"
+    } else if cause == CAUSE_LOAD_MISALIGNED {
+        "load-address-misaligned"
+    } else if cause == CAUSE_LOAD_ACCESS_FAULT {
+        "load-access-fault"
+    } else if cause == CAUSE_STORE_MISALIGNED {
+        "store-address-misaligned"
+    } else if cause == CAUSE_STORE_ACCESS_FAULT {
+        "store-access-fault"
+    } else if cause == CAUSE_ECALL_FROM_U {
+        "ecall-from-u-mode"
+    } else {
+        "unexpected-trap"
+    }
+}
+
+/// Report a fatal condition on the console and FAIL the run. Never returns —
+/// M0's discipline, carried into the M/U split: a fault is diagnosed and the
+/// emulator exits non-zero, never a hang.
+public func fatal(tag: String, cause: UInt, epc: UInt, tval: UInt, code: UInt) {
+    let uart = console()
+    uart.write_str("SOS: fault ")
+    uart.write_str(tag)
+    uart.write_str(" cause=")
+    uart.write_hex(cause)
+    uart.write_str(" epc=")
+    uart.write_hex(epc)
+    uart.write_str(" tval=")
+    uart.write_hex(tval)
+    uart.write_str("\n")
+    finisher().exit_fail(code)
+}
+
+/// Report a well-formed `ecall` the kernel has no entry for. Reported against
+/// `a7` rather than an `mcause` — the trap itself was legal, the number was
+/// not — so the diagnostic names the register that carried the mistake.
+public func fatal_bad_syscall(number: UInt, epc: UInt) {
+    let uart = console()
+    uart.write_str("SOS: fault bad-syscall-number a7=")
+    uart.write_hex(number)
+    uart.write_str(" epc=")
+    uart.write_hex(epc)
+    uart.write_str("\n")
+    finisher().exit_fail(EXIT_CODE_BAD_SYSCALL)
+}
+
+// =============================================================================
+// The trap handler
+// =============================================================================
+
+/// boot.S's landing point for every trap taken from U-mode. `frame` addresses
+/// the saved context, which this handler may rewrite: a returning syscall steps
+/// `mepc` past the `ecall` and leaves its (status, value) pair in `a0`/`a1`.
+///
+/// Anything that is not a well-formed syscall is fatal. There is no fault
+/// recovery to have yet — spec §8 makes a thread fault kill its process, and in
+/// M1 root IS the system.
+@export("ktrap")
+public func ktrap(frame_addr: UInt, cause: UInt, tval: UInt) unsafe {
+    let frame = UnsafeMemory<TrapFrame, Normal>(frame_addr)
+    let epc = frame.mepc.read()
+
+    if cause != CAUSE_ECALL_FROM_U {
+        fatal(cause_tag(cause), cause, epc, tval, EXIT_CODE_UMODE_FAULT)
+    }
+
+    let number = frame.a7.read()
+    if number > SYS_MAX {
+        fatal_bad_syscall(number, epc)
+    }
+
+    if number == SYS_DEBUG_PUTC {
+        console().write_byte((frame.a0.read() & BYTE_MASK) as UInt8)
+        frame.a0.write(SYS_OK)
+        frame.a1.write(0)
+    } else {
+        // SYS_EXIT: the process is the system in M1, so its status is the run's.
+        let status = frame.a0.read()
+        if status == 0 {
+            finisher().exit_pass()
+        } else {
+            finisher().exit_fail(status)
+        }
+    }
+
+    frame.mepc.write(epc + ECALL_INSN_LEN)
+}
+
+static BYTE_MASK: UInt = 0xFF

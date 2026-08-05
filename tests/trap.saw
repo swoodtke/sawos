@@ -1,9 +1,16 @@
-// SOS M0 trap test (design 112): a CPU fault must FAIL the run, never hang it.
+// SOS trap test (designs 112, 140): a CPU fault must FAIL the run, never hang.
 //
-// Reading an unmapped low address raises a load access fault; QEMU vectors to
-// the boot shim's `trap_entry`, which writes the SiFive finisher with
-// FINISHER_FAIL + mcause, exiting the emulator with a non-zero status. The
-// harness asserts that non-zero exit (and that no banner was printed).
+// Reading an unmapped low address raises a load access fault. The fault is
+// taken in M-MODE, so boot.S's `trap_entry` sees a clear mode witness and
+// branches to `kernel_fault`, which writes the SiFive finisher with
+// FINISHER_FAIL + mcause and exits the emulator non-zero. This is the kernel-bug
+// path — distinct from the U-mode path `ktrap` handles (see umode.saw). The
+// harness asserts the non-zero exit (and that no banner was printed).
+//
+// The kernel core is imported for its `ktrap`, which boot.S calls: every SOS
+// image links the same trap handler even when this one never reaches it.
+
+import kcore
 
 struct Word { v: UInt32 }
 

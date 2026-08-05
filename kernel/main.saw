@@ -1,137 +1,14 @@
-// SOS M0 kernel entry (design 112) — Profile A: riscv32, QEMU `virt`.
+// SOS kernel entry (designs 112, 140) — Profile A: riscv32, QEMU `virt`.
 //
-// The freestanding Saw kernel: an NS16550A UART driver built on
-// `UnsafeMemory<_, Device>` (design 46 — the first real bare-metal use of the
-// volatile, access-mode-checked MMIO machinery), a boot banner, and a clean
-// exit through the SiFive test finisher. `boot.S` sets up the stack, zeroes
-// .bss, and calls `kmain`; `rt.c` supplies the runtime seams; `virt.ld` links
-// it all at RAM base 0x8000_0000. See sos/spec.md §5b.
-//
-// MMIO driver idiom (design 112 review): each device is TWO structs — a
-// register-block struct giving the hardware layout (declaration-order natural
-// ABI, design 58), and a driver struct owning the mapped `UnsafeMemory` with
-// extension methods as the device API. The raw block never escapes the driver
-// (design-80 field privacy), and driver methods sit in the design-81 marked
-// domain, so call sites stay clean: `uart.write_byte(b)`. A true singleton
-// `static` driver awaits Once/Lazy (tracker F5); until then the owner
-// constructs the driver and lends it (`&uart`) — which mirrors the SOS model
-// of a driver process owning its mapped MMIO.
+// `boot.S` sets up the stack, zeroes .bss, and calls `kmain`; `rt.c` supplies
+// the runtime seams and the PMP/CSR helpers; `core/lib.saw` is the shared
+// kernel (drivers, trap frame, `ktrap`, syscall table); `virt.ld` links it all
+// at RAM base 0x8000_0000. See sos/spec.md §5b and §12.
 
-// NS16550A register block. The registers are byte-spaced; the struct's natural
-// declaration-order layout places each at its hardware offset. A `ReadOnly<T>`
-// field exposes only `.read()`; a plain field is read-write.
-struct UartRegs {
-    thr: UInt8,             // +0  transmit holding / receive buffer
-    ier: UInt8,             // +1  interrupt enable
-    iir: UInt8,             // +2  interrupt id / FIFO control
-    lcr: UInt8,             // +3  line control
-    mcr: UInt8,             // +4  modem control
-    lsr: ReadOnly<UInt8>,   // +5  line status
-    msr: ReadOnly<UInt8>,   // +6  modem status
-    scr: UInt8,             // +7  scratch
-}
-
-struct Uart16550 {
-    regs: UnsafeMemory<UartRegs, Device>,
-}
-
-extension Uart16550 {
-    init(at: Int) unsafe -> Uart16550 {
-        Uart16550(regs: UnsafeMemory<UartRegs, Device>(at))
-    }
-
-    // Poll the line-status TX-empty bit, then write one byte to the holding
-    // register — no interrupts in M0. Every access is a volatile Device
-    // load/store.
-    func write_byte(&self, b: UInt8) unsafe {
-        while (self.regs.lsr.read() & LSR_TX_EMPTY) == 0u8 { }
-        self.regs.thr.write(b)
-    }
-
-    // Write an ASCII string, byte by byte. (`chars()` yields Unicode scalars;
-    // M0 is ASCII-only — a non-ASCII scalar truncates. A bytes-level console
-    // API is an M1 design question.)
-    func write_str(&self, msg: String) {
-        for scalar in msg.chars() {
-            self.write_byte(scalar as UInt8)
-        }
-    }
-}
-
-// SiFive test finisher (QEMU `virt`): writing FINISHER_PASS exits the emulator
-// with status 0; FINISHER_FAIL carries an exit code in its upper half (used by
-// boot.S trap_entry and rt.c __saw_rt_panic — asm/C paths, same device).
-struct SifiveTestRegs {
-    finisher: UInt32,
-}
-
-struct SifiveTest {
-    regs: UnsafeMemory<SifiveTestRegs, Device>,
-}
-
-extension SifiveTest {
-    init(at: Int) unsafe -> SifiveTest {
-        SifiveTest(regs: UnsafeMemory<SifiveTestRegs, Device>(at))
-    }
-
-    // Terminate the emulator with status 0. Never returns; if the write is
-    // somehow ignored, spin rather than fall back into the boot shim.
-    func exit_pass(&self) unsafe {
-        self.regs.finisher.write(FINISHER_PASS)
-        while true { }
-    }
-}
-
-// A mapped region, as the kernel would describe one in a log line. `format`
-// is written out of `append` calls rather than `"{...}"` interpolation: an
-// interpolated string is a heap String by construction, and this kernel has no
-// heap at all (design 137). Design 135 made that a build rule rather than a
-// convention — the sos gate compiles every source here under
-// `--no-hidden-alloc`, so an interpolated log line added later fails to build.
-// Addresses are UInt: on riscv32 the platform Int is 32-bit SIGNED, so a RAM
-// base of 0x80000000 renders as -2147483648 through the signed overload. An
-// address is not a negative number.
-struct Region { base: UInt, size: UInt }
-extension Region: Printable {
-    func format(&self, into: &var StringBuilder) {
-        into.append("[")
-        into.append(self.base)
-        into.append(" +")
-        into.append(self.size)
-        into.append("]")
-    }
-}
-
-static UART_BASE: Int = 0x10000000
-static TEST_BASE: Int = 0x00100000
-static LSR_TX_EMPTY: UInt8 = 0x20u8       // LSR bit 5 — TX holding register empty
-static FINISHER_PASS: UInt32 = 0x5555u32
-static RAM_BASE: UInt = 0x80000000
-static RAM_SIZE: UInt = 0x800000
+import kcore.{console, finisher}
 
 @export("kmain")
 func kmain() {
-    // The banner goes out through the driver, which is the design-112 MMIO
-    // idiom this kernel exists to demonstrate: a typed register block behind
-    // `UnsafeMemory<_, Device>`, reached only through driver methods.
-    let uart = Uart16550(at: UART_BASE)
-    uart.write_str("SOS M0: hello from Saw on riscv32 (QEMU virt)\n")
-
-    // Everything after it is ordinary `print`, which reaches the SAME UART
-    // through the `__saw_rt_write` seam and allocates NOTHING (design 137).
-    // There is no allocator in this profile to allocate from — the format
-    // arguments render into stack scratch and go straight out the seam, so a
-    // kernel gets the same logging a hosted program has — and under
-    // `--no-hidden-alloc` it is the only logging that compiles.
-    print("uart at {} lsr-mask {}", UART_BASE, LSR_TX_EMPTY)
-    print("ram {}", Region(base: RAM_BASE, size: RAM_SIZE))
-
-    var i = 0
-    while i < 3 {
-        print("stage {} ok", i)
-        i = i + 1
-    }
-
-    let test = SifiveTest(at: TEST_BASE)
-    test.exit_pass()
+    console().write_str("SOS M0: hello from Saw on riscv32 (QEMU virt)\n")
+    finisher().exit_pass()
 }

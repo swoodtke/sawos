@@ -1,0 +1,31 @@
+// SOS M1 U-mode trap test (design 140 unit A) — the M/U split on its own.
+//
+// Grants ONE PMP region — the appended payload's own bytes, read+execute — and
+// drops to U-mode at its first instruction. Everything else, the kernel image
+// and both MMIO devices included, is denied by RISC-V's U-mode default-deny.
+// The payload is linked in from one of `sos/tests/payload_*.S`, so this single
+// kernel covers the happy path, an illegal access, and a bad syscall number.
+//
+// No loader, no image format: this test isolates trap entry, the privilege
+// transition, PMP, and syscall dispatch from the sosimg machinery that unit B
+// layers on top.
+
+import kcore.{console, pmp_reset, pmp_region, pmp_commit, enter_user, align_up, payload_start, payload_end, PERM_R, PERM_X, PMP_GRAIN, NO_USER_STACK}
+
+// The payload never touches memory, so it needs no stack region — one grant is
+// the whole address space it is allowed to see.
+static PAYLOAD_REGION: UInt = 0
+
+@export("kmain")
+func kmain() {
+    console().write_str("SOS M1: entering U-mode\n")
+
+    let base = payload_start()
+    let top = align_up(payload_end(), PMP_GRAIN)
+
+    pmp_reset()
+    pmp_region(PAYLOAD_REGION, base, top, PERM_R | PERM_X)
+    pmp_commit()
+
+    enter_user(base, NO_USER_STACK)
+}
