@@ -183,13 +183,20 @@ kernel_fault:
 
 /* ---- M -> U transition --------------------------------------------------- */
 
-/* void sos_enter_user(u32 entry, u32 stack_top) — never returns.
+/* void sos_enter_user(u32 entry, u32 stack_top, u32 boot_handle) — never returns.
  *
  * Arms the mode witness, points mepc at the user entry, selects U-mode as the
  * `mret` target (MPP = 0) with interrupts left off (MPIE = 0 — M1 has no
  * interrupt sources), and hands the user a zeroed register file so nothing of
  * the kernel's leaks across the privilege boundary. RISC-V has ONE `sp` across
- * modes, so setting it here is what gives root its stack. */
+ * modes, so setting it here is what gives root its stack.
+ *
+ * The one register that is NOT zeroed is a0, which carries the boot handle set
+ * (spec §12). In M1 that is a single handle — root's System handle — so it fits
+ * in a register; when the set grows it becomes a structure the kernel places in
+ * root's memory and a0 points at. Either way this is the handoff: root's entry
+ * takes it as its first C-ABI argument, so a Saw `_start(system: UInt)` just
+ * receives it. */
     .section .text.enter, "ax", @progbits
     .globl sos_enter_user
 sos_enter_user:
@@ -201,13 +208,14 @@ sos_enter_user:
     li      t1, MSTATUS_MPIE
     csrc    mstatus, t1
     mv      sp, a1
+    /* Park the boot handle where the zeroing loop will not reach it. */
+    mv      t2, a2
 
     li      x1, 0
     li      x3, 0
     li      x4, 0
     li      x5, 0
     li      x6, 0
-    li      x7, 0
     li      x8, 0
     li      x9, 0
     li      x10, 0
@@ -232,6 +240,9 @@ sos_enter_user:
     li      x29, 0
     li      x30, 0
     li      x31, 0
+    /* a0 = the boot handle set; t2 (x7) is scratch and clears itself. */
+    mv      a0, t2
+    li      x7, 0
     mret
 
 /* ---- reservations -------------------------------------------------------- */

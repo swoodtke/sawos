@@ -1,0 +1,57 @@
+//! SOS common runtime helpers (design 140) — arch-free, role-free Saw.
+//!
+//! The kernel and every SOS process end up doing the same two small things:
+//! turning a machine word into hex for a diagnostic, and pushing an ASCII
+//! string out one byte at a time. What DIFFERS is only where the byte goes —
+//! the kernel stores it to a UART register, a process passes it to a System op
+//! — so the byte-producing half belongs here and the sink stays with the side
+//! that owns the device.
+//!
+//! Nothing here allocates, suspends, or names a target: no arena, no format
+//! machinery, no `String` building. That is what lets one module serve an
+//! M-mode kernel and a U-mode process on two architectures.
+
+/// Hex digits in a 32-bit word.
+public static HEX_DIGITS_PER_WORD: Int = 8
+
+static BITS_PER_HEX_DIGIT: Int = 4
+static HEX_NIBBLE_MASK: UInt = 0xF
+static HEX_DECIMAL_LIMIT: UInt = 10
+static ASCII_ZERO: UInt = 48
+static ASCII_LOWER_A_MINUS_TEN: UInt = 87
+static ASCII_MAX: Int = 0x7F
+static ASCII_SUBSTITUTE: UInt8 = 0x3Fu8      // '?'
+
+/// One hex digit, lowercase.
+public func hex_digit(nibble: UInt) -> UInt8 {
+    let nib = nibble & HEX_NIBBLE_MASK
+    if nib < HEX_DECIMAL_LIMIT {
+        (ASCII_ZERO + nib) as UInt8
+    } else {
+        (ASCII_LOWER_A_MINUS_TEN + nib) as UInt8
+    }
+}
+
+/// The `index`-th hex digit of `value`, MOST SIGNIFICANT FIRST — so a caller
+/// prints `0..HEX_DIGITS_PER_WORD` in order and gets a fixed-width word with
+/// no reversal buffer and no allocation.
+public func hex_digit_of(value: UInt, index: Int) -> UInt8 {
+    let shift = (HEX_DIGITS_PER_WORD - 1 - index) * BITS_PER_HEX_DIGIT
+    hex_digit(value >> shift)
+}
+
+/// A Unicode scalar as a console byte.
+///
+/// `String.chars()` yields scalars and the console surfaces on both sides are
+/// byte-oriented, so a non-ASCII scalar has to become SOMETHING. It becomes
+/// `'?'` rather than a silent truncation to a plausible-looking wrong
+/// character — the rule is stated once, here, instead of being re-decided by
+/// each caller. A byte-oriented console service is userspace work for a later
+/// milestone.
+public func ascii_byte(scalar: Int) -> UInt8 {
+    if scalar < 0 || scalar > ASCII_MAX {
+        ASCII_SUBSTITUTE
+    } else {
+        scalar as UInt8
+    }
+}

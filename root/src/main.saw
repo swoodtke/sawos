@@ -1,43 +1,92 @@
-// SOS root server (design 140 unit C; sos/spec.md §12) — riscv32, U-mode.
+// SOS root server (design 140; sos/spec.md §12) — riscv32, U-mode.
 //
 // Root is the first and only process the kernel loads. Everything else — the
 // launcher, the name service, every later process — is root's job, not the
 // kernel's (§12: splitting them out later must require zero kernel changes).
 //
-// v1 proves the boundary and nothing more: print a banner and exit 0. What
-// makes that worth booting is HOW it prints. Root holds no PMP grant for the
-// UART; the only reason a character reaches the console is that the kernel put
-// it there on root's behalf, through `debug_putc`. Take the syscall away and
-// root is mute — which is exactly the property the M/U split is supposed to
-// have.
+// v1 proves the boundary and nothing more: print a banner and stop the machine.
+// What makes that worth booting is HOW it prints. Root holds no PMP grant for
+// the UART; a character reaches the console only because root asked the System
+// object to put it there, holding a handle carrying the DEBUG right. Take the
+// handle away and root is mute — which is exactly the property the M/U split is
+// supposed to have.
 //
 // Built by Blade from this package's own Saw.toml (`[sos] emit = "sosimg"`),
-// linked at 0x8020_0000 by root.ld, and appended to the kernel image as the
-// one blob the kernel's loader knows how to read.
+// linked at 0x8020_0000 by root.ld, and appended to the kernel image as the one
+// blob the kernel's loader knows how to read.
 
-// The syscall stubs live in src/rt.c: an `ecall` is not expressible in Saw, so
-// this is the whole of root's native surface (see that file's header).
+import sosrt.{ascii_byte}
+
+// The riscv32 user HAL (sos/hal/riscv32/user/): the `ecall` instruction and the
+// two runtime sinks. This is the ONLY architecture-dependent thing root names,
+// which is what should let these sources build for M1b's arm64 unchanged.
 extern "C" {
-    func sos_debug_putc(c: UInt) -> UInt
-    func sos_exit(status: UInt)
+    func sos_syscall1(handle: UInt, op: UInt, arg0: UInt) -> UInt
+    func sos_set_system_handle(handle: UInt)
 }
 
-/// Root's exit status when it finishes its work.
+/// The System object's op table (spec §2, §5.7). Op numbers are method ids on
+/// THIS object, not global syscall numbers.
+static OP_DEBUG_PRINT: UInt = 0
+static OP_SHUTDOWN: UInt = 1
+
+/// Status words the kernel returns in a0 (§5.7).
+static SYS_OK: UInt = 0
+
+/// Root's exit status when its work is done.
 static EXIT_OK: UInt = 0
 
-/// Write an ASCII string to the console, one `debug_putc` per byte.
+/// A handle to the kernel's System object — root's entire authority in M1
+/// (§12's boot handle set, which is one handle wide today).
 ///
-/// `chars()` yields Unicode scalars and the v1 syscall carries one byte, so a
-/// non-ASCII scalar would truncate. Root's own text is ASCII; a real console
-/// service with a byte-oriented API is userspace work for a later milestone.
-func put_str(msg: String) {
-    for scalar in msg.chars() {
-        let _ = sos_debug_putc(scalar as UInt)
+/// Real handles are `NoCopy` with a `Deinit` that closes them (§4); this one is
+/// a plain value because M1 has no close op and root holds its handle for the
+/// life of the machine. The typed-wrapper SHAPE is the point: a handle is never
+/// a bare integer at a call site, so handle-kind confusion cannot be written.
+struct System {
+    handle: UInt,
+}
+
+extension System {
+    /// Adopt the boot handle the kernel passed in a0.
+    init(boot_handle: UInt) -> System {
+        // The runtime's panic path prints through this same handle, so it has
+        // to be reachable from C before any Saw code can fail.
+        sos_set_system_handle(boot_handle)
+        System(handle: boot_handle)
+    }
+
+    /// Write one byte to the debug console. Requires the DEBUG right.
+    func debug_print_byte(&self, byte: UInt8) -> UInt {
+        sos_syscall1(self.handle, OP_DEBUG_PRINT, byte as UInt)
+    }
+
+    /// Write an ASCII string. Returns the FIRST non-OK status, or SYS_OK — a
+    /// partial write is reported rather than swallowed.
+    func debug_print(&self, msg: String) -> UInt {
+        var status = SYS_OK
+        for scalar in msg.chars() {
+            let one = self.debug_print_byte(ascii_byte(scalar))
+            if one != SYS_OK && status == SYS_OK {
+                status = one
+            }
+        }
+        status
+    }
+
+    /// Stop the machine with `status`. Requires the SHUTDOWN right.
+    ///
+    /// NOT process exit: that is a Process-object op when Process objects
+    /// exist (ratified Aug 5). In M1's one-process world the two look the same
+    /// from outside, which is exactly why the distinction is worth keeping now.
+    func shutdown(&self, status: UInt) {
+        let _ = sos_syscall1(self.handle, OP_SHUTDOWN, status)
     }
 }
 
 @export("_start")
-func _start() {
-    put_str("SOS root: hello from U-mode via ecall\n")
-    sos_exit(EXIT_OK)
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let _ = system.debug_print("SOS root: hello from U-mode via a System op\n")
+    system.shutdown(EXIT_OK)
 }

@@ -609,22 +609,36 @@ event-driven EDGE of a process gets a second, distinct construct:
     32-word frame, runs the Saw handler `ktrap`, and resumes. M-mode kernel /
     U-mode root, isolated by PMP TOR regions — U-mode default-deny does the
     work, so the kernel, the UART and the finisher are protected by never being
-    granted. Syscall ABI per §5.7 with the v1 table `0 debug_putc`,
-    `1 exit`; any fault, bad number, or malformed image prints a cause tag and
-    exits FAIL (M0's never-hang discipline, kept). The §6 boot protocol is
+    granted. EVERY syscall is an object op per §5.7: a0 = handle, a7 = op,
+    args a1-a5, and dispatch is §3's shape verbatim — handle-table lookup ->
+    object type -> op table -> rights check -> op. The v1 object is the
+    **System** singleton (§2) with `debug_print` and `shutdown(status)`, gated
+    on DEBUG / SHUTDOWN rights; root receives its handle in the first argument
+    register at entry (§12's boot handle set, one handle wide today). A bad
+    handle, a bad op or a missing right returns a `SysError` status and the
+    process runs on; a FAULT is fatal and prints a cause tag (M0's never-hang
+    discipline, kept). The §6 boot protocol is
     concrete: a flat **sosimg** (16-byte header + 20-byte segment records, all
     fixed-width little-endian per design 47, carrying the §7 priority map),
     emitted by a Blade `emit = "sosimg"` build target reading the package's
     `[sos]` manifest section, appended to the kernel image as a `.payload` blob
-    with linker-symbol bounds. `sos/root/` is a real separate Saw package built
-    by Blade; it prints its banner THROUGH `debug_putc` — it holds no device
-    grant and could not print any other way — and exits 0. The kernel validates
-    an image in full before placing a byte of it, so a segment aimed at the
-    kernel is refused rather than obeyed. `make sos-test` is 11 cases including
-    the two-image boot and a root that oversteps its grant. Kernel-side
-    `sos/kernel/core/lib.saw` is shared by every test image, which is what keeps
-    them all on the same trap path; it and `boot.S` + rt.c's CSR/PMP helpers are
-    the riscv32 HAL that M1b extracts.
+    with linker-symbol bounds. The layout lives ONCE, in the shared
+    `sos/imgformat/` package: Blade consumes it as a path dependency and emits
+    bytes through it, the kernel consumes it through `--module-path` and reads
+    images by overlaying the same structs as `UnsafeMemory` typed views, with
+    `static_assert` pinning the sizes on both sides. `sos/root/` is a real
+    separate Saw package built by Blade; it prints its banner THROUGH a System
+    op — it holds no device grant and could not print any other way — and calls
+    `shutdown(0)`. The kernel validates an image in full before placing a byte
+    of it, so a segment aimed at the kernel is refused rather than obeyed.
+    `make sos-test` is 11 cases including the two-image boot, a root that
+    oversteps its grant, and one that makes bad calls and checks the statuses.
+    Structure: `sos/kernel/core/lib.saw` is shared by every kernel image, which
+    keeps them all on the same trap path; `sos/rt/common/` (Saw) and
+    `sos/rt/common_c/support.c` (the C that must stay C) are shared by the
+    kernel and every process; and the architecture lives in
+    `sos/hal/riscv32/{kernel,user}/`, each with an ABI.md, so M1b (design 79)
+    ADDS `sos/hal/arm64/...` without moving any of it.
 
 ## 12. The root server (ratified Aug 5, user)
 

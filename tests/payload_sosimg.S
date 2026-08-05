@@ -18,8 +18,10 @@
     .equ SEG_FLAG_R,      1
     .equ SEG_FLAG_X,      4
 
-    .equ SYS_DEBUG_PUTC,  0
-    .equ SYS_EXIT,        1
+    /* Syscall ABI (spec 5.7): a0 = handle, a7 = op, args a1-a5. */
+    .equ SYSTEM_HANDLE,   1
+    .equ OP_DEBUG_PRINT,  0
+    .equ OP_SHUTDOWN,     1
 
     .section .payload, "a", @progbits
     .balign 16
@@ -43,25 +45,32 @@ _img_start:
     /* --- segment 0: the U-mode program --- */
     .balign 4
 _seg0:
-    li      a7, SYS_DEBUG_PUTC
-    li      a0, 'S'
+    li      a7, OP_DEBUG_PRINT
+    li      a0, SYSTEM_HANDLE
+    li      a1, 'S'
     ecall
-    li      a0, 'O'
+    li      a0, SYSTEM_HANDLE
+    li      a1, 'O'
     ecall
-    li      a0, 'S'
+    li      a0, SYSTEM_HANDLE
+    li      a1, 'S'
     ecall
-    li      a0, '-'
+    li      a0, SYSTEM_HANDLE
+    li      a1, '-'
     ecall
-    li      a0, 'R'
+    li      a0, SYSTEM_HANDLE
+    li      a1, 'R'
     ecall
-    li      a0, '\n'
+    li      a0, SYSTEM_HANDLE
+    li      a1, '\n'
     ecall
 
-    li      a7, SYS_EXIT
-    li      a0, 0
+    li      a7, OP_SHUTDOWN
+    li      a0, SYSTEM_HANDLE
+    li      a1, 0
     ecall
 
-    /* `exit` does not return; spin inside the granted region if it ever did.
+    /* `shutdown` does not return; spin inside the granted region if it ever did.
      * The branch is PC-relative, so it is correct at the load address too. */
 1:
     j       1b
