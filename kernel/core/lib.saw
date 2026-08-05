@@ -395,3 +395,221 @@ public func ktrap(frame_addr: UInt, cause: UInt, tval: UInt) unsafe {
 }
 
 static BYTE_MASK: UInt = 0xFF
+
+// =============================================================================
+// The sosimg loader (design 140 unit B; spec §6, §7, §12)
+// =============================================================================
+//
+// The kernel loads exactly ONE image, ever: the root server (spec §12). Every
+// later process is loaded BY ROOT, so there is deliberately no second code path
+// here. The image is not ELF — a microkernel-sized loader gets a flat header:
+//
+//   HEADER (SOSIMG_HEADER_LEN bytes)
+//     0   4  magic      'S' 'O' 'S' 'I'
+//     4   2  version    = SOSIMG_VERSION
+//     6   1  seg_count
+//     7   1  reserved   (0)
+//     8   4  entry      ABSOLUTE load address of the first instruction
+//     12  4  prio_map   spec §7 band -> level, one byte per band, low byte
+//                       first: background, low, normal, high
+//   SEGMENT TABLE (seg_count records of SOSIMG_SEG_LEN bytes, from offset 16)
+//     0   4  file_off   offset from the IMAGE BASE to the segment's bytes
+//     4   4  load_addr
+//     8   4  file_len
+//     12  4  mem_len    >= file_len; the tail is zero-filled (.bss)
+//     16  1  flags      bit 0 R, bit 1 W, bit 2 X
+//     17  3  reserved   (0)
+//
+// Every field is fixed-width little-endian — the design-47 discipline — so the
+// 32-bit and 64-bit profiles (spec §5b) read the same bytes. Fields are laid
+// out so each u32 is 4-byte aligned, which is what lets the loader below use
+// aligned word loads instead of byte assembly. A big-endian port would have to
+// reassemble from bytes; riscv32 and arm64 are both little-endian.
+//
+// EVERY malformed shape is a diagnosed FAIL, never a hang and never a partial
+// load: the image is validated in full before a single byte is placed.
+
+static SOSIMG_MAGIC: UInt = 0x49534F53          // 'S','O','S','I' little-endian
+static SOSIMG_VERSION: UInt = 1
+static SOSIMG_HEADER_LEN: UInt = 16
+static SOSIMG_SEG_LEN: UInt = 20
+
+static IMG_VERSION_OFF: UInt = 4
+static IMG_SEG_COUNT_OFF: UInt = 6
+static IMG_ENTRY_OFF: UInt = 8
+static IMG_PRIO_MAP_OFF: UInt = 12
+
+static SEG_FILE_OFF: UInt = 0
+static SEG_LOAD_ADDR: UInt = 4
+static SEG_FILE_LEN: UInt = 8
+static SEG_MEM_LEN: UInt = 12
+static SEG_FLAGS: UInt = 16
+
+/// Root's region (design 140 pin; mirrored by sos/root/root.ld and recorded in
+/// virt.ld's memory map). Segments load from the base; the stack occupies the
+/// top ROOT_STACK_LEN bytes and is granted as its own RW region.
+static ROOT_LOAD_BASE: UInt = 0x80200000
+static ROOT_REGION_TOP: UInt = 0x80240000
+static ROOT_STACK_LEN: UInt = 0x4000
+
+/// One PMP region per segment, plus one for the stack.
+static MAX_SEGMENTS: UInt = 3
+
+func read_u8(addr: UInt) unsafe -> UInt {
+    UnsafeMemory<UInt8, Normal>(addr).read() as UInt
+}
+
+func read_u16(addr: UInt) unsafe -> UInt {
+    UnsafeMemory<UInt16, Normal>(addr).read() as UInt
+}
+
+func read_u32(addr: UInt) unsafe -> UInt {
+    UnsafeMemory<UInt32, Normal>(addr).read() as UInt
+}
+
+func copy_bytes(dst: UInt, src: UInt, len: UInt) unsafe {
+    var i: UInt = 0
+    while i < len {
+        UnsafeMemory<UInt8, Normal>(dst + i).write(UnsafeMemory<UInt8, Normal>(src + i).read())
+        i = i + 1
+    }
+}
+
+func zero_bytes(dst: UInt, len: UInt) unsafe {
+    var i: UInt = 0
+    while i < len {
+        UnsafeMemory<UInt8, Normal>(dst + i).write(0u8)
+        i = i + 1
+    }
+}
+
+/// Reject the root image. Never returns.
+public func fatal_image(reason: String, detail: UInt) {
+    let uart = console()
+    uart.write_str("SOS: bad root image: ")
+    uart.write_str(reason)
+    uart.write_str(" (")
+    uart.write_hex(detail)
+    uart.write_str(")\n")
+    finisher().exit_fail(EXIT_CODE_BAD_IMAGE)
+}
+
+/// Validate one segment record against the image bounds and the root region.
+/// Checks are ordered so no bound is computed by an addition that could
+/// overflow — a hostile length must produce a diagnostic, not a panic.
+func check_segment(base: UInt, img_len: UInt, rec: UInt) unsafe {
+    let file_off = read_u32(rec + SEG_FILE_OFF)
+    let file_len = read_u32(rec + SEG_FILE_LEN)
+    let mem_len = read_u32(rec + SEG_MEM_LEN)
+    let load_addr = read_u32(rec + SEG_LOAD_ADDR)
+
+    if file_off > img_len {
+        fatal_image("segment starts past the image", file_off)
+    }
+    if file_len > img_len - file_off {
+        fatal_image("segment runs past the image", file_len)
+    }
+    if mem_len < file_len {
+        fatal_image("segment mem_len below file_len", mem_len)
+    }
+    if load_addr < ROOT_LOAD_BASE {
+        fatal_image("segment loads below the root region", load_addr)
+    }
+    let limit = ROOT_REGION_TOP - ROOT_STACK_LEN
+    if load_addr > limit {
+        fatal_image("segment loads above the root region", load_addr)
+    }
+    if mem_len > limit - load_addr {
+        fatal_image("segment overruns the root region", mem_len)
+    }
+}
+
+/// Parse the appended root image, place its segments, grant root exactly the
+/// PMP regions the image asks for plus a stack, and drop to U-mode at its
+/// entry. Never returns.
+public func load_root_and_enter() unsafe {
+    let base = payload_start()
+    let end = payload_end()
+    if end < base {
+        fatal_image("payload bounds inverted", base)
+    }
+    let img_len = end - base
+    if img_len < SOSIMG_HEADER_LEN {
+        fatal_image("no root image appended", img_len)
+    }
+
+    let magic = read_u32(base)
+    if magic != SOSIMG_MAGIC {
+        fatal_image("bad magic", magic)
+    }
+    let version = read_u16(base + IMG_VERSION_OFF)
+    if version != SOSIMG_VERSION {
+        fatal_image("unsupported version", version)
+    }
+
+    let seg_count = read_u8(base + IMG_SEG_COUNT_OFF)
+    if seg_count == 0 {
+        fatal_image("image has no segments", 0)
+    }
+    if seg_count > MAX_SEGMENTS {
+        fatal_image("more segments than PMP regions", seg_count)
+    }
+    let table_len = seg_count * SOSIMG_SEG_LEN
+    if table_len > img_len - SOSIMG_HEADER_LEN {
+        fatal_image("segment table runs past the image", table_len)
+    }
+
+    let entry = read_u32(base + IMG_ENTRY_OFF)
+    let prio_map = read_u32(base + IMG_PRIO_MAP_OFF)
+
+    // Validate EVERY segment before placing any of them: a rejected image must
+    // leave the root region untouched.
+    var i: UInt = 0
+    while i < seg_count {
+        check_segment(base, img_len, base + SOSIMG_HEADER_LEN + i * SOSIMG_SEG_LEN)
+        i = i + 1
+    }
+
+    if entry < ROOT_LOAD_BASE || entry >= ROOT_REGION_TOP - ROOT_STACK_LEN {
+        fatal_image("entry outside the root region", entry)
+    }
+
+    let uart = console()
+    uart.write_str("SOS: root image ok segments=")
+    uart.write_hex(seg_count)
+    uart.write_str(" entry=")
+    uart.write_hex(entry)
+    uart.write_str(" prio=")
+    uart.write_hex(prio_map)
+    uart.write_str("\n")
+
+    pmp_reset()
+
+    var s: UInt = 0
+    while s < seg_count {
+        let rec = base + SOSIMG_HEADER_LEN + s * SOSIMG_SEG_LEN
+        let file_off = read_u32(rec + SEG_FILE_OFF)
+        let load_addr = read_u32(rec + SEG_LOAD_ADDR)
+        let file_len = read_u32(rec + SEG_FILE_LEN)
+        let mem_len = read_u32(rec + SEG_MEM_LEN)
+        let flags = read_u8(rec + SEG_FLAGS)
+
+        copy_bytes(load_addr, base + file_off, file_len)
+        zero_bytes(load_addr + file_len, mem_len - file_len)
+
+        pmp_region(s, load_addr, align_up(load_addr + mem_len, PMP_GRAIN), flags)
+        s = s + 1
+    }
+
+    // The stack is the kernel's grant, not the image's: root asks for code and
+    // data, the kernel decides where it runs.
+    pmp_region(seg_count, ROOT_REGION_TOP - ROOT_STACK_LEN, ROOT_REGION_TOP,
+               PERM_R | PERM_W)
+    pmp_commit()
+
+    // spec §7: root's band map applies verbatim from its image. There is no
+    // Process object to store it in until the object-model brief, so M1 parses
+    // and reports it — which is what proves the Blade-emitted field arrives
+    // intact.
+    enter_user(entry, ROOT_REGION_TOP)
+}
