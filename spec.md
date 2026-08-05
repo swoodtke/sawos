@@ -468,10 +468,8 @@ event-driven EDGE of a process gets a second, distinct construct:
 
 ## 11. Remaining before the kernel briefs
 
-- **Design (with user):** root server responsibilities + the v1
-  userspace protocol conventions (loader-above-boot for second
-  processes, pool brokering, name/discovery service — the division of
-  labor shapes the boot handle set).
+- ~~Design (with user): root server responsibilities~~ RESOLVED §12
+  (ratified Aug 5).
 - **Orchestrator pins (veto-able), kernel-brief material:** rights-word
   bit assignments + per-object op tables (the syscall number space);
   kernel memory layout per profile (link scripts, static slab sizes,
@@ -497,3 +495,30 @@ event-driven EDGE of a process gets a second, distinct construct:
     kernel links only what it reaches; the Saw object is `rv32i`/ilp32
     soft-float (llvmlite's default for the triple), boot.S/rt.c assembled
     `rv32imac_zicsr`.
+
+## 12. The root server (ratified Aug 5, user)
+
+- **Root = init + launcher + name service in ONE process, v1.** The
+  decided model already pushes supervision, discovery, and policy to
+  userspace; v1 collapses them into root rather than booting a service
+  constellation. The DESIGN TEST: splitting the launcher or the name
+  service into its own process later must require zero kernel changes —
+  if the boot handle set can't support that split, the set is wrong.
+- **Boot handle set** (minted by the kernel to root, everything else
+  derives): the LAUNCH capability (§7); root MemoryObjects — the RAM
+  pool root and the device-range roots (§2.5); the root IRQ table
+  (§2 Interrupt). Root's band map applies verbatim from its image (§7).
+  NOTE (object-model brief material): the creation-authority model for
+  plain objects (Channel/Event/Waiter/Timer) — quota-gated free
+  creation vs a factory capability — is an open pin; M1 does not need
+  it (root spawns nothing).
+- **Loader-above-boot.** The kernel loads exactly ONE image ever: root
+  (sosimg, §6). Every later process is loaded BY ROOT from images root
+  obtains itself (e.g. a flash MemoryObject it holds), via LAUNCH +
+  `create_process`. The kernel has no second code path for process two.
+- **v1 protocol conventions** (userspace convention section, not kernel
+  surface): a launched process receives ONE bootstrap channel handle at
+  launch; its first messages request its initial handle set from the
+  launcher (name-service discovery = ask by string name over that
+  channel). Conventions are versioned in the `sos` userspace module,
+  not in the kernel.
