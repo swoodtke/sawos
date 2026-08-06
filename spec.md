@@ -435,6 +435,29 @@ memory words, and nothing else.
   per interrupt); not needed for correctness (level-triggering already
   covers the gap). One optional arg on wait.
 
+## 9b. Kernel sync primitives: IntrSpinLock (ratified Aug 6)
+
+- **std owns `SpinLock<T>`** (design 149): safe cross-context lock, any
+  environment with real atomics, userspace included. **The KERNEL owns
+  `IntrSpinLock<T>`** — SpinLock composed with interrupt masking, which
+  is privileged (mstatus.MIE / DAIF) and therefore cannot exist in
+  userspace even in principle.
+- Semantics (the spin_lock_irqsave discipline): `lock` SAVES current
+  interrupt state and disables BEFORE spinning (an ISR must not arrive
+  mid-spin and deadlock on the same core); the epilogue RESTORES, never
+  blindly re-enables — nesting works, irqs-off callers stay irqs-off.
+  Saved flags are per-acquisition, carried by the closure scope. The
+  body inherits `sync` and carries the latency contract: irqs-off time
+  IS interrupt latency — short sections only.
+- Mechanism: two per-arch HAL one-liners, `hal_irq_save() -> Flags` /
+  `hal_irq_restore(Flags)`, under `sos/hal/<arch>/kernel/`. The CAS
+  stays even on uniprocessor (SMP-future correctness; under `+a` it is
+  cheap; a FAILED acquire on uniprocessor signals reentrancy — panic,
+  never spin forever).
+- Timing: DESIGN ratified now; IMPLEMENTATION lands with the M2-era
+  interrupt work — M1 never sets MIE, so the type would be untestable
+  dead code before then.
+
 ## 10. Userspace runtime: HandlerGroup + the wake bridge (ratified Aug 3)
 
 Saw's sequential surface is UNCHANGED: `channel.call()`, `receive()`,
