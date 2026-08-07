@@ -1,19 +1,19 @@
-// SOS M1 U-mode trap test (design 140 unit A) — the M/U split on its own.
+// SOS M1 user-mode trap test (design 140 unit A) — the privilege split alone.
 //
-// Grants ONE PMP region — the appended payload's own bytes, read+execute — and
-// drops to U-mode at its first instruction. Everything else, the kernel image
-// and both MMIO devices included, is denied by RISC-V's U-mode default-deny.
-// The payload is linked in from one of `sos/tests/payload_*.S`, so this single
-// kernel covers the happy path, an illegal access, and a bad syscall number.
+// Grants ONE region — the appended payload's own bytes, read+execute — and
+// enters user mode at its first instruction. Everything else, the kernel image
+// and every device included, is denied by the target's default-deny. The
+// payload is linked in from one of `sos/tests/<arch>/payload_*.S`, so this
+// single kernel covers the happy path, an illegal access, and a bad syscall.
 //
 // No loader, no image format: this test isolates trap entry, the privilege
-// transition, PMP, and syscall dispatch from the sosimg machinery that unit B
-// layers on top.
+// transition, memory protection and syscall dispatch from the sosimg machinery
+// that unit B layers on top. It names no architecture — the payload it runs
+// does, and that is the only per-arch half of the case.
 
-import kcore.{
-    console, pmp_reset, pmp_region, pmp_commit, enter_user, align_up,
-    payload_start, payload_end, PmpPerm, PMP_GRAIN,
-}
+import kcore.{console, align_up}
+import hal
+import imgformat.{SegFlag}
 import sosabi.{NO_USER_STACK, ROOT_SYSTEM_HANDLE}
 
 // The payload never touches memory, so it needs no stack region — one grant is
@@ -24,13 +24,13 @@ static PAYLOAD_REGION: UInt = 0
 func kmain() {
     console().write_str("SOS M1: entering U-mode\n")
 
-    let base = payload_start()
-    let top = align_up(payload_end(), PMP_GRAIN)
+    let base = hal.payload_start()
+    let top = align_up(hal.payload_end(), hal.PROT_GRAIN)
 
-    pmp_reset()
-    pmp_region(PAYLOAD_REGION, base, top,
-               (PmpPerm.Read as UInt) | (PmpPerm.Execute as UInt))
-    pmp_commit()
+    hal.prot_reset()
+    hal.prot_region(PAYLOAD_REGION, base, top,
+                    (SegFlag.Read as UInt8) | (SegFlag.Execute as UInt8))
+    hal.prot_commit()
 
-    enter_user(base, NO_USER_STACK, ROOT_SYSTEM_HANDLE)
+    hal.enter_user(base, NO_USER_STACK, ROOT_SYSTEM_HANDLE)
 }

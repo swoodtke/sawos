@@ -1,0 +1,351 @@
+//! The riscv32 kernel HAL, Saw half (designs 112, 140, 162) — QEMU `virt`, M-mode.
+//!
+//! Everything the SOS kernel needs from THIS machine, and nothing more. The
+//! kernel core above it (`sos/kernel/core/`) names no architecture at all: it
+//! reaches the board, the privilege transition and the memory-protection
+//! hardware only through the surface below, which `sos/hal/arm64/kernel/`
+//! implements the same way for Profile B. `ABI.md` beside this file is the
+//! contract; `boot.S` and `sink.c` are the parts of it that cannot be Saw.
+//!
+//! Addresses and machine words are `UInt` throughout, never `Int`. On this
+//! target `Int` is 32-bit SIGNED, so a RAM address like 0x8020_0000 lands in
+//! its negative half — and would mean a different number again on the 64-bit
+//! profile. See DF-140a in designs/todo.md.
+
+// =============================================================================
+// NS16550A UART (design 112's blessed MMIO idiom: register block + driver)
+// =============================================================================
+
+/// The NS16550A register block. Registers are byte-spaced; the struct's natural
+/// declaration-order layout places each at its hardware offset. A `ReadOnly<T>`
+/// field exposes only `.read()`; a plain field is read-write.
+struct UartRegs {
+    thr: UInt8,             // +0  transmit holding / receive buffer
+    ier: UInt8,             // +1  interrupt enable
+    iir: UInt8,             // +2  interrupt id / FIFO control
+    lcr: UInt8,             // +3  line control
+    mcr: UInt8,             // +4  modem control
+    lsr: ReadOnly<UInt8>,   // +5  line status
+    msr: ReadOnly<UInt8>,   // +6  modem status
+    scr: UInt8,             // +7  scratch
+}
+
+/// The console driver. A SAFE type (unsafety is not transitive — design 130):
+/// only the methods reaching through `regs` carry the `unsafe` effect.
+struct Uart16550 {
+    regs: UnsafeMemory<UartRegs, Device>,
+}
+
+extension Uart16550 {
+    init(at: UInt) unsafe -> Uart16550 {
+        Uart16550(regs: UnsafeMemory<UartRegs, Device>(at))
+    }
+
+    /// Poll the line-status TX-empty bit, then write one byte to the holding
+    /// register — no interrupts in M1. Every access is a volatile Device
+    /// load/store.
+    func write_byte(&self, b: UInt8) unsafe {
+        while (self.regs.lsr.read() & LSR_TX_EMPTY) == 0u8 { }
+        self.regs.thr.write(b)
+    }
+}
+
+// =============================================================================
+// SiFive test finisher (QEMU `virt`)
+// =============================================================================
+
+struct SifiveTestRegs {
+    finisher: UInt32,
+}
+
+/// Writing FINISHER_PASS exits the emulator with status 0; FINISHER_FAIL
+/// carries an exit code in its upper half. (`boot.S`'s `kernel_fault` and
+/// `sink.c`'s `sos_rt_abort`, which `__saw_rt_panic` calls, drive the same
+/// device from asm and C.)
+struct SifiveTest {
+    regs: UnsafeMemory<SifiveTestRegs, Device>,
+}
+
+extension SifiveTest {
+    init(at: UInt) unsafe -> SifiveTest {
+        SifiveTest(regs: UnsafeMemory<SifiveTestRegs, Device>(at))
+    }
+}
+
+// =============================================================================
+// The trap frame
+// =============================================================================
+
+/// The context `boot.S` saves on a trap from U-mode: 32 words, where word `i`
+/// holds register `x<i>` and word 0 — the slot `x0` would occupy — holds
+/// `mepc`. Declaration order IS the layout (design 58), so the field offsets
+/// here and the `sw x<i>, i*4(sp)` stores in boot.S are one description.
+struct TrapFrame {
+    mepc: UInt,             // word 0  (x0 never needs saving)
+    ra: UInt,               // x1
+    sp: UInt,               // x2
+    gp: UInt,               // x3
+    tp: UInt,               // x4
+    t0: UInt,               // x5
+    t1: UInt,               // x6
+    t2: UInt,               // x7
+    s0: UInt,               // x8
+    s1: UInt,               // x9
+    a0: UInt,               // x10  syscall arg 0 / status out
+    a1: UInt,               // x11  syscall arg 1 / value out
+    a2: UInt,               // x12
+    a3: UInt,               // x13
+    a4: UInt,               // x14
+    a5: UInt,               // x15  syscall arg 5 (the last, per §5.7)
+    a6: UInt,               // x16
+    a7: UInt,               // x17  syscall op
+    s2: UInt,               // x18
+    s3: UInt,               // x19
+    s4: UInt,               // x20
+    s5: UInt,               // x21
+    s6: UInt,               // x22
+    s7: UInt,               // x23
+    s8: UInt,               // x24
+    s9: UInt,               // x25
+    s10: UInt,              // x26
+    s11: UInt,              // x27
+    t3: UInt,               // x28
+    t4: UInt,               // x29
+    t5: UInt,               // x30
+    t6: UInt,               // x31
+}
+
+// =============================================================================
+// Board constants
+// =============================================================================
+
+static UART_BASE: UInt = 0x10000000
+static TEST_BASE: UInt = 0x00100000
+static LSR_TX_EMPTY: UInt8 = 0x20u8       // LSR bit 5 — TX holding register empty
+static FINISHER_PASS: UInt32 = 0x5555u32
+static FINISHER_FAIL: UInt = 0x3333
+static FAIL_CODE_SHIFT: Int = 16
+static FAIL_CODE_MASK: UInt = 0xFF
+static FAIL_CODE_MIN: UInt = 1
+
+// =============================================================================
+// Identity (design 162)
+// =============================================================================
+
+/// What this kernel says it is booting on, for the banner.
+public func arch_name() -> String {
+    "riscv32 (QEMU virt)"
+}
+
+/// This architecture's `sosimg` arch tag. A process image built for the other
+/// profile is refused by the loader rather than jumped into.
+public static ARCH_TAG: UInt8 = 1u8
+
+// =============================================================================
+// Console
+// =============================================================================
+
+/// Write one byte to the kernel's console.
+///
+/// The kernel owns the machine, so this is the UART directly. Byte-at-a-time is
+/// what the seam needs: the arch-free half above formats, this half places.
+public func console_byte(b: UInt8) unsafe {
+    Uart16550(at: UART_BASE).write_byte(b)
+}
+
+// =============================================================================
+// Stopping the machine
+// =============================================================================
+
+/// Terminate the emulator with status 0. Never returns; if the write is somehow
+/// ignored, spin rather than fall back into the caller.
+public func exit_pass() unsafe {
+    SifiveTest(at: TEST_BASE).regs.finisher.write(FINISHER_PASS)
+    while true { }
+}
+
+/// Terminate the emulator with a NON-ZERO status. A zero code would make the
+/// finisher report success, so it is promoted to `FAIL_CODE_MIN` — a failing
+/// exit never reads as a passing one.
+public func exit_fail(code: UInt) unsafe {
+    var status = code & FAIL_CODE_MASK
+    if status == 0 {
+        status = FAIL_CODE_MIN
+    }
+    SifiveTest(at: TEST_BASE).regs.finisher.write(
+        (FINISHER_FAIL | (status << FAIL_CODE_SHIFT)) as UInt32)
+    while true { }
+}
+
+// =============================================================================
+// Privilege, protection and payload seams (boot.S / sink.c)
+// =============================================================================
+
+// The C half of this HAL. The names stay the hardware's — PMP is what these
+// program — because this file is where the arch-free `prot_*` vocabulary above
+// meets the machine.
+extern "C" {
+    func sos_enter_user(entry: UInt, stack_top: UInt, boot_handle: UInt)
+    func sos_pmp_reset()
+    func sos_pmp_region(idx: UInt, base: UInt, top: UInt, perm: UInt)
+    func sos_pmp_commit()
+    func sos_payload_start() -> UInt
+    func sos_payload_end() -> UInt
+}
+
+/// This target's protection granularity. PMP stores its bounds shifted right by
+/// two, so a region bound is rounded to four bytes.
+public static PROT_GRAIN: UInt = 4
+
+/// How many segments a root image may ask for. One PMP region per segment plus
+/// one for the stack, out of the four the board budget programs (see
+/// `sink.c`'s `PMP_REGIONS`).
+public static MAX_ROOT_SEGMENTS: UInt = 3
+
+/// Root's region on this board (design 140 pin; mirrored by the root linker
+/// script and recorded in `virt.ld`'s memory map). Segments load from the base;
+/// the stack occupies the top `ROOT_STACK_LEN` bytes.
+public static ROOT_LOAD_BASE: UInt = 0x80200000
+public static ROOT_REGION_TOP: UInt = 0x80240000
+public static ROOT_STACK_LEN: UInt = 0x4000
+
+/// An address the KERNEL itself cannot reach on this target — nothing is there
+/// and nothing maps it. The harness's kernel-fault case reads it to prove a
+/// fault taken in kernel mode is diagnosed rather than hung on (M0's
+/// discipline), and it is per-target because "unmapped" is: on a profile whose
+/// kernel runs with an MMU on, low addresses are the DEVICE window and reading
+/// one succeeds.
+public static UNMAPPED_PROBE: UInt = 0x00000000
+
+/// Revoke every grant. User mode then reaches nothing at all — the default-deny
+/// the grants below carve out of.
+public func prot_reset() {
+    sos_pmp_reset()
+}
+
+/// Stage grant `idx` as [base, top) with `perms`, a mask in the `SegFlag`
+/// vocabulary. On this target the bits ARE a PMP config's low three bits, so
+/// the mask installs untranslated.
+public func prot_region(idx: UInt, base: UInt, top: UInt, perms: UInt8) {
+    sos_pmp_region(idx, base, top, perms as UInt)
+}
+
+/// Publish the staged grant set. Separate from `prot_region` so a partially
+/// programmed set is never live.
+public func prot_commit() {
+    sos_pmp_commit()
+}
+
+/// Drop to user mode at `entry` with `stack_top` as the stack pointer, handing
+/// over `boot_handle` in the first argument register — the boot handle set of
+/// spec §12. Never returns; the next kernel code to run is `ktrap`.
+public func enter_user(entry: UInt, stack_top: UInt, boot_handle: UInt) {
+    sos_enter_user(entry, stack_top, boot_handle)
+}
+
+/// First byte of the appended payload — the `.payload` section `virt.ld`
+/// bounds. Saw cannot name a linker symbol, so the bounds arrive through C.
+public func payload_start() -> UInt {
+    sos_payload_start()
+}
+
+/// One past the last byte of the appended payload. Equal to `payload_start()`
+/// in an image built without one.
+public func payload_end() -> UInt {
+    sos_payload_end()
+}
+
+// =============================================================================
+// Traps
+// =============================================================================
+
+/// The `mcause` exception codes M1 can take (interrupt bit clear).
+///
+/// Backed by `UInt` — the width of the CSR the value arrives in. The numbers are
+/// RISC-V's, not ours, which is exactly why they are pinned per case: a reorder
+/// here must never renumber them.
+enum TrapCause: UInt {
+    case InsnMisaligned = 0,
+    case InsnAccessFault = 1,
+    case IllegalInsn = 2,
+    case Breakpoint = 3,
+    case LoadMisaligned = 4,
+    case LoadAccessFault = 5,
+    case StoreMisaligned = 6,
+    case StoreAccessFault = 7,
+    case EcallFromU = 8,
+}
+
+extension TrapCause {
+    /// The short symbolic name a fault line reports.
+    func describe(&self) -> String {
+        match self {
+            case InsnMisaligned -> "instruction-address-misaligned",
+            case InsnAccessFault -> "instruction-access-fault",
+            case IllegalInsn -> "illegal-instruction",
+            case Breakpoint -> "breakpoint",
+            case LoadMisaligned -> "load-address-misaligned",
+            case LoadAccessFault -> "load-access-fault",
+            case StoreMisaligned -> "store-address-misaligned",
+            case StoreAccessFault -> "store-access-fault",
+            case EcallFromU -> "ecall-from-u-mode",
+        }
+    }
+}
+
+/// `ecall` is a 4-byte instruction — `mepc` points AT it, so a returning
+/// syscall must step past it or the trap repeats forever. (Profile B's `svc`
+/// leaves `ELR` already past, which is why advancing belongs to the HAL.)
+static SYSCALL_INSN_LEN: UInt = 4
+
+/// Did this trap come from a syscall instruction, or is it a fault?
+public func is_syscall(cause: UInt) -> Bool {
+    cause == (TrapCause.EcallFromU as UInt)
+}
+
+/// A short symbolic name for a raw trap cause.
+///
+/// The decode is where an unknown code stops being a number: `from(raw:)` is
+/// total, and the hardware may raise a cause this kernel does not model, so the
+/// miss has its own name rather than an arm. Everything it DOES model is an
+/// exhaustive `match` in `describe`, so a cause added to the enum fails to
+/// compile until it is given a name.
+public func cause_tag(cause: UInt) -> String {
+    guard let decoded = TrapCause.from(raw: cause) else {
+        return "unexpected-trap"
+    }
+    decoded.describe()
+}
+
+/// Overlay the saved context. One view construction, then ordinary field names.
+func frame_at(frame_addr: UInt) unsafe -> UnsafeMemory<TrapFrame, Normal> {
+    UnsafeMemory<TrapFrame, Normal>(frame_addr)
+}
+
+/// Where the trapped instruction was — for a fault line.
+public func fault_pc(frame_addr: UInt) unsafe -> UInt {
+    frame_at(frame_addr).mepc.read()
+}
+
+/// §5.7: a0 = handle, a7 = op, args a1-a5.
+public func syscall_handle(frame_addr: UInt) unsafe -> UInt {
+    frame_at(frame_addr).a0.read()
+}
+
+public func syscall_op(frame_addr: UInt) unsafe -> UInt {
+    frame_at(frame_addr).a7.read()
+}
+
+public func syscall_arg0(frame_addr: UInt) unsafe -> UInt {
+    frame_at(frame_addr).a1.read()
+}
+
+/// Place a syscall's (status, value) pair where the caller will find it and
+/// step the saved PC past the trapping instruction. Resuming is the assembly's
+/// job; deciding what "past" means is this file's.
+public func syscall_return(frame_addr: UInt, status: UInt, value: UInt) unsafe {
+    let frame = frame_at(frame_addr)
+    frame.a0.write(status)
+    frame.a1.write(value)
+    frame.mepc.write(frame.mepc.read() + SYSCALL_INSN_LEN)
+}

@@ -1,25 +1,31 @@
-// SOS trap test (designs 112, 140): a CPU fault must FAIL the run, never hang.
+// SOS trap test (designs 112, 140, 162): a CPU fault must FAIL the run, never
+// hang.
 //
-// Reading an unmapped low address raises a load access fault. The fault is
-// taken in M-MODE, so boot.S's `trap_entry` sees a clear mode witness and
-// branches to `kernel_fault`, which writes the SiFive finisher with
-// FINISHER_FAIL + mcause and exits the emulator non-zero. This is the kernel-bug
-// path — distinct from the U-mode path `ktrap` handles (see umode.saw). The
-// harness asserts the non-zero exit (and that no banner was printed).
+// Reading an address the kernel cannot reach raises a fault IN KERNEL MODE, so
+// the HAL's trap entry takes the kernel-bug path — no context worth saving —
+// and stops the machine non-zero carrying the cause. This is distinct from the
+// user-mode path `ktrap` handles (see umode.saw). The harness asserts the
+// non-zero exit (and that no banner was printed).
 //
-// The kernel core is imported for its `ktrap`, which boot.S calls: every SOS
-// image links the same trap handler even when this one never reaches it.
+// WHICH address is unreachable is the one per-target fact here, so it comes
+// from the HAL: with an MMU on, a kernel's low addresses are the device window
+// and reading one would simply succeed.
+//
+// The kernel core is imported for its `ktrap`, which the HAL's trap entry
+// calls: every SOS image links the same trap handler even when this one never
+// reaches it.
 
-import kcore
+import kcore.{console}
+import hal
 
 struct Word { v: UInt32 }
 
 @export("kmain")
 func kmain() unsafe {
-    let bad = UnsafeMemory<Word, Device>(0x00000000)
+    let bad = UnsafeMemory<Word, Device>(hal.UNMAPPED_PROBE)
     let x = bad.v.read()
-    // Consume the load so it cannot be optimized away before the fault.
-    let sink = UnsafeMemory<Word, Device>(0x10000000)
-    sink.v.write(x)
+    // Consume the load so it cannot be optimized away before the fault. If the
+    // read somehow succeeds the harness sees a hang, which is also a failure.
+    console().write_hex(x as UInt)
     while true { }
 }

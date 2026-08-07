@@ -1,21 +1,30 @@
-//! SOS kernel core (designs 112, 140) — Profile A: riscv32, QEMU `virt`.
+//! SOS kernel core (designs 112, 140, 162) — the arch-free kernel.
 //!
-//! Everything a SOS kernel image shares: the two board drivers, the trap frame,
-//! the trap handler `ktrap`, the syscall table, and the PMP/privilege helpers.
-//! An image is the riscv32 kernel HAL (`boot.S` + `sink.c`) + the shared runtime
-//! seams (`sos/rt/common_c/support.c`) + this module + one entry `.saw` defining
+//! Everything a SOS kernel image shares: the console, the trap handler `ktrap`,
+//! the object-op dispatch, and the sosimg loader. An image is one per-arch
+//! kernel HAL (`sos/hal/<arch>/kernel/`) + the shared runtime seams
+//! (`sos/rt/common_c/support.c`) + this module + one entry `.saw` defining
 //! `kmain` — `sos/kernel/main.saw` for the real kernel, `sos/tests/*.saw` for
 //! the harness cases. Sharing the module is what keeps every test image on the
 //! SAME trap path instead of a copy of it.
 //!
-//! Addresses and machine words are `UInt` throughout, never `Int`. On this
-//! target `Int` is 32-bit SIGNED, so a RAM address like 0x8020_0000 lands in
-//! its negative half and silently means a different number on the 64-bit
-//! Profile B (spec §5b) — see DF-140a in designs/todo.md.
+//! NO ARCHITECTURE APPEARS IN THIS FILE (design 162 unit 1). Registers, trap
+//! causes, protection hardware, the board's console and the way the machine
+//! stops are all reached through `hal`, and the harness enforces it: a scan
+//! rejects an arch name anywhere in this directory, so the seam cannot erode by
+//! one convenient constant at a time. Adding an architecture is writing a HAL.
+//!
+//! Addresses and machine words are `UInt` throughout, never `Int` — `Int` is
+//! platform-width and SIGNED, so a RAM address lands in its negative half on a
+//! 32-bit profile and means a different number on a 64-bit one (DF-140a).
+
+// The per-arch kernel HAL. One import, one module name, two implementations
+// selected at build time by `--module-path hal=sos/hal/<arch>/kernel`.
+import hal
 
 // The image layout itself lives in the shared `imgformat` package, so the
 // loader below and the Blade target that writes the images read one definition.
-import imgformat.{SosimgHeader, SosimgSeg}
+import imgformat.{SosimgHeader, SosimgSeg, SegFlag}
 
 // Arch-free, role-free formatting, shared with every SOS process build.
 import sosrt.{ascii_byte, hex_digit_of, HEX_DIGITS_PER_WORD}
@@ -24,44 +33,31 @@ import sosrt.{ascii_byte, hex_digit_of, HEX_DIGITS_PER_WORD}
 // exports (sos/kernel/sysapi/) — one definition, two halves of one contract.
 import sosabi.{
     ObjType, SystemHandle, SystemRight, SysOp, SosStatus,
-    root_system_rights, ROOT_SYSTEM_HANDLE, NO_USER_STACK,
+    root_system_rights, ROOT_SYSTEM_HANDLE,
 }
 
 // =============================================================================
-// NS16550A UART (design 112's blessed MMIO idiom: register block + driver)
+// The console
 // =============================================================================
 
-/// The NS16550A register block. Registers are byte-spaced; the struct's natural
-/// declaration-order layout places each at its hardware offset. A `ReadOnly<T>`
-/// field exposes only `.read()`; a plain field is read-write.
-public struct UartRegs {
-    thr: UInt8,             // +0  transmit holding / receive buffer
-    ier: UInt8,             // +1  interrupt enable
-    iir: UInt8,             // +2  interrupt id / FIFO control
-    lcr: UInt8,             // +3  line control
-    mcr: UInt8,             // +4  modem control
-    lsr: ReadOnly<UInt8>,   // +5  line status
-    msr: ReadOnly<UInt8>,   // +6  modem status
-    scr: UInt8,             // +7  scratch
+/// The kernel's console: the arch-free half of writing a diagnostic.
+///
+/// It formats — a string one scalar at a time, a machine word as fixed-width
+/// hex — and hands each byte to the HAL, which knows what device it is. The
+/// split is deliberate: `write_hex` is the same code on every target, and the
+/// only thing that ever differs is where the byte lands.
+public struct Console {
+    /// A console is a capability to write, not a device handle: the HAL owns
+    /// the device. The field exists because a zero-field struct has no reason
+    /// to exist either — it records which sink the writes go to, and today
+    /// there is one.
+    sink: UInt8,
 }
 
-/// The console driver. A SAFE type (unsafety is not transitive — design 130):
-/// only the methods reaching through `regs` carry the `unsafe` effect.
-public struct Uart16550 {
-    regs: UnsafeMemory<UartRegs, Device>,
-}
-
-public extension Uart16550 {
-    public init(at: UInt) unsafe -> Uart16550 {
-        Uart16550(regs: UnsafeMemory<UartRegs, Device>(at))
-    }
-
-    /// Poll the line-status TX-empty bit, then write one byte to the holding
-    /// register — no interrupts in M1. Every access is a volatile Device
-    /// load/store.
-    public func write_byte(&self, b: UInt8) unsafe {
-        while (self.regs.lsr.read() & LSR_TX_EMPTY) == 0u8 { }
-        self.regs.thr.write(b)
+public extension Console {
+    /// Write one byte.
+    public func write_byte(&self, b: UInt8) {
+        hal.console_byte(b)
     }
 
     /// Write an ASCII string, byte by byte. The scalar-to-byte rule is
@@ -69,154 +65,27 @@ public extension Uart16550 {
     /// non-ASCII scalar becomes.
     public func write_str(&self, msg: String) {
         for scalar in msg.chars() {
-            self.write_byte(ascii_byte(scalar))
+            hal.console_byte(ascii_byte(scalar))
         }
     }
 
-    /// Write a machine word as `0x` + eight hex digits. Fixed width, no
+    /// Write a machine word as `0x` + one hex digit per nibble. Fixed width, no
     /// allocation, no formatting machinery — the kernel has neither an
-    /// allocator worth spending nor (until design 135) a non-allocating
-    /// interpolation.
+    /// allocator worth spending nor a reason to build a string.
     public func write_hex(&self, v: UInt) {
         self.write_str("0x")
         var n = 0
         while n < HEX_DIGITS_PER_WORD {
-            self.write_byte(hex_digit_of(v, n))
+            hal.console_byte(hex_digit_of(v, n))
             n = n + 1
         }
     }
 }
 
-// =============================================================================
-// SiFive test finisher (QEMU `virt`)
-// =============================================================================
-
-public struct SifiveTestRegs {
-    finisher: UInt32,
-}
-
-/// Writing FINISHER_PASS exits the emulator with status 0; FINISHER_FAIL
-/// carries an exit code in its upper half. (boot.S's `kernel_fault` and the
-/// HAL's `sos_rt_abort`, which `__saw_rt_panic` calls, drive the same device
-/// from asm/C.)
-public struct SifiveTest {
-    regs: UnsafeMemory<SifiveTestRegs, Device>,
-}
-
-public extension SifiveTest {
-    public init(at: UInt) unsafe -> SifiveTest {
-        SifiveTest(regs: UnsafeMemory<SifiveTestRegs, Device>(at))
-    }
-
-    /// Terminate the emulator with status 0. Never returns; if the write is
-    /// somehow ignored, spin rather than fall back into the boot shim.
-    public func exit_pass(&self) unsafe {
-        self.regs.finisher.write(FINISHER_PASS)
-        while true { }
-    }
-
-    /// Terminate the emulator with a NON-ZERO status. A zero code would make
-    /// the finisher report success, so it is promoted to `FAIL_CODE_MIN` —
-    /// a failing exit never reads as a passing one.
-    public func exit_fail(&self, code: UInt) unsafe {
-        var status = code & FAIL_CODE_MASK
-        if status == 0 {
-            status = FAIL_CODE_MIN
-        }
-        self.regs.finisher.write((FINISHER_FAIL | (status << FAIL_CODE_SHIFT)) as UInt32)
-        while true { }
-    }
-}
-
-// =============================================================================
-// The trap frame
-// =============================================================================
-
-/// The context boot.S saves on a trap from U-mode: 32 words, where word `i`
-/// holds register `x<i>` and word 0 — the slot `x0` would occupy — holds
-/// `mepc`. Declaration order IS the layout (design 58), so the field offsets
-/// here and the `sw x<i>, i*4(sp)` stores in boot.S are one description.
-public struct TrapFrame {
-    mepc: UInt,             // word 0  (x0 never needs saving)
-    ra: UInt,               // x1
-    sp: UInt,               // x2
-    gp: UInt,               // x3
-    tp: UInt,               // x4
-    t0: UInt,               // x5
-    t1: UInt,               // x6
-    t2: UInt,               // x7
-    s0: UInt,               // x8
-    s1: UInt,               // x9
-    a0: UInt,               // x10  syscall arg 0 / status out
-    a1: UInt,               // x11  syscall arg 1 / value out
-    a2: UInt,               // x12
-    a3: UInt,               // x13
-    a4: UInt,               // x14
-    a5: UInt,               // x15  syscall arg 5 (the last, per §5.7)
-    a6: UInt,               // x16
-    a7: UInt,               // x17  syscall NUMBER
-    s2: UInt,               // x18
-    s3: UInt,               // x19
-    s4: UInt,               // x20
-    s5: UInt,               // x21
-    s6: UInt,               // x22
-    s7: UInt,               // x23
-    s8: UInt,               // x24
-    s9: UInt,               // x25
-    s10: UInt,              // x26
-    s11: UInt,              // x27
-    t3: UInt,               // x28
-    t4: UInt,               // x29
-    t5: UInt,               // x30
-    t6: UInt,               // x31
-}
-
-// =============================================================================
-// Board / ABI constants
-// =============================================================================
-
-static UART_BASE: UInt = 0x10000000
-static TEST_BASE: UInt = 0x00100000
-static LSR_TX_EMPTY: UInt8 = 0x20u8       // LSR bit 5 — TX holding register empty
-static FINISHER_PASS: UInt32 = 0x5555u32
-static FINISHER_FAIL: UInt = 0x3333
-static FAIL_CODE_SHIFT: Int = 16
-static FAIL_CODE_MASK: UInt = 0xFF
-static FAIL_CODE_MIN: UInt = 1
-
-
-/// The `mcause` exception codes M1 can take (interrupt bit clear).
-///
-/// Backed by `UInt` — the width of the CSR the value arrives in. The numbers are
-/// RISC-V's, not ours, which is exactly why they are pinned per case: a reorder
-/// here must never renumber them.
-public enum TrapCause: UInt {
-    case InsnMisaligned = 0,
-    case InsnAccessFault = 1,
-    case IllegalInsn = 2,
-    case Breakpoint = 3,
-    case LoadMisaligned = 4,
-    case LoadAccessFault = 5,
-    case StoreMisaligned = 6,
-    case StoreAccessFault = 7,
-    case EcallFromU = 8,
-}
-
-public extension TrapCause {
-    /// The short symbolic name a fault line reports.
-    public func describe(&self) -> String {
-        match self {
-            case InsnMisaligned -> "instruction-address-misaligned",
-            case InsnAccessFault -> "instruction-access-fault",
-            case IllegalInsn -> "illegal-instruction",
-            case Breakpoint -> "breakpoint",
-            case LoadMisaligned -> "load-address-misaligned",
-            case LoadAccessFault -> "load-access-fault",
-            case StoreMisaligned -> "store-address-misaligned",
-            case StoreAccessFault -> "store-access-fault",
-            case EcallFromU -> "ecall-from-u-mode",
-        }
-    }
+/// A console for this board. Constructing one costs nothing; a true `static`
+/// singleton waits on Once/Lazy (tracker F5).
+public func console() -> Console {
+    Console(sink: 0u8)
 }
 
 // =============================================================================
@@ -224,10 +93,11 @@ public extension TrapCause {
 // =============================================================================
 //
 // EVERY syscall is an object op (ratified Aug 5). There are no bare numbered
-// syscalls: a call names a HANDLE in a0 and an OP in a7 — a method id on that
-// object's table, not a global number — with arguments in a1-a5, and returns
-// a0 = status / a1 = value. Dispatch is §3's shape verbatim: handle-table
-// lookup -> object type -> op table -> rights check -> op.
+// syscalls: a call names a HANDLE and an OP — a method id on that object's
+// table, not a global number — with arguments beside them, and returns a status
+// and a value. WHICH REGISTERS those are is the HAL's business (spec §5.7 gives
+// the per-arch table); dispatch is §3's shape verbatim: handle-table lookup ->
+// object type -> op table -> rights check -> op.
 //
 // M1 implements one object, the System singleton, so the table is one entry
 // wide. That is deliberately not the interesting part: the SHAPE is, because
@@ -284,12 +154,8 @@ extension SystemObject {
     }
 }
 
-/// `ecall` is a 4-byte instruction — `mepc` points AT it, so a returning
-/// syscall must step past it or the trap repeats forever.
-static ECALL_INSN_LEN: UInt = 4
-
-/// Exit codes the kernel reports through the finisher, distinct from any status
-/// root chooses for itself.
+/// Exit codes the kernel reports through the platform's failure channel,
+/// distinct from any status root chooses for itself.
 ///
 /// A type rather than three `UInt`s so `fatal` cannot be handed an arbitrary
 /// number: the kernel's own failure vocabulary is closed, and the harness
@@ -305,32 +171,8 @@ public enum ExitCode: UInt {
 }
 
 // =============================================================================
-// Privilege + PMP seams (the riscv32 kernel HAL: boot.S / sink.c)
+// Arithmetic the loader needs
 // =============================================================================
-
-extern "C" {
-    func sos_enter_user(entry: UInt, stack_top: UInt, boot_handle: UInt)
-    func sos_pmp_reset()
-    func sos_pmp_region(idx: UInt, base: UInt, top: UInt, perm: UInt)
-    func sos_pmp_commit()
-    func sos_payload_start() -> UInt
-    func sos_payload_end() -> UInt
-}
-
-/// One PMP permission, as the BIT a region's flags carry it in.
-///
-/// Same shape as `imgformat`'s `SegFlag` and `sosabi`'s `SystemRight`: the enum
-/// names the bits, a MASK stays a plain int, since no case names `R|X`. The two
-/// orderings agree on purpose — a sosimg's flags install as PMP permissions
-/// without translation.
-public enum PmpPerm: UInt {
-    case Read = 1,
-    case Write = 2,
-    case Execute = 4,
-}
-
-/// PMP's address granularity: bounds are stored shifted right by two.
-public static PMP_GRAIN: UInt = 4
 
 /// Round `v` up to the next multiple of `align` (a power of two).
 public func align_up(v: UInt, align: UInt) -> UInt {
@@ -342,73 +184,13 @@ public func align_up(v: UInt, align: UInt) -> UInt {
     }
 }
 
-/// Clear every PMP region. U-mode then reaches nothing at all — the
-/// default-deny the grants below carve out of.
-public func pmp_reset() {
-    sos_pmp_reset()
-}
-
-/// Stage region `idx` as [base, top) with `perm`.
-public func pmp_region(idx: UInt, base: UInt, top: UInt, perm: UInt) {
-    sos_pmp_region(idx, base, top, perm)
-}
-
-/// Publish the staged region set.
-public func pmp_commit() {
-    sos_pmp_commit()
-}
-
-/// Drop to U-mode at `entry` with `stack_top` as the stack pointer, handing
-/// over `boot_handle` — the boot handle set of spec §12, which in M1 is root's
-/// System handle. Never returns; the next kernel code to run is `ktrap`.
-public func enter_user(entry: UInt, stack_top: UInt, boot_handle: UInt) {
-    sos_enter_user(entry, stack_top, boot_handle)
-}
-
-/// First byte of the appended payload — the `.payload` section virt.ld bounds.
-public func payload_start() -> UInt {
-    sos_payload_start()
-}
-
-/// One past the last byte of the appended payload. Equal to `payload_start()`
-/// in an image built without one.
-public func payload_end() -> UInt {
-    sos_payload_end()
-}
-
 // =============================================================================
-// Console + fault reporting
+// Fault reporting
 // =============================================================================
-
-/// A console for this board. The driver is a plain value over a fixed address,
-/// so constructing one per use costs nothing; a true `static` singleton waits
-/// on Once/Lazy (tracker F5).
-public func console() unsafe -> Uart16550 {
-    Uart16550(at: UART_BASE)
-}
-
-/// The board's test finisher.
-public func finisher() unsafe -> SifiveTest {
-    SifiveTest(at: TEST_BASE)
-}
-
-/// A short symbolic name for a raw `mcause` value.
-///
-/// The decode is where an unknown code stops being a number: `from(raw:)` is
-/// total, and the hardware may raise a cause this kernel does not model (an
-/// interrupt, a Profile B code), so the miss has its own name rather than an
-/// arm. Everything it DOES model is an exhaustive `match` in `describe`, so a
-/// cause added to the enum fails to compile until it is given a name.
-public func cause_tag(raw: UInt) -> String {
-    guard let cause = TrapCause.from(raw: raw) else {
-        return "unexpected-trap"
-    }
-    cause.describe()
-}
 
 /// Report a fatal condition on the console and FAIL the run. Never returns —
-/// M0's discipline, carried into the M/U split: a fault is diagnosed and the
-/// emulator exits non-zero, never a hang.
+/// M0's discipline, carried into the user-mode split: a fault is diagnosed and
+/// the machine stops non-zero, never a hang.
 public func fatal(tag: String, cause: UInt, epc: UInt, tval: UInt, code: ExitCode) {
     let uart = console()
     uart.write_str("SOS: fault ")
@@ -420,7 +202,7 @@ public func fatal(tag: String, cause: UInt, epc: UInt, tval: UInt, code: ExitCod
     uart.write_str(" tval=")
     uart.write_hex(tval)
     uart.write_str("\n")
-    finisher().exit_fail(code as UInt)
+    hal.exit_fail(code as UInt)
 }
 
 // =============================================================================
@@ -446,13 +228,13 @@ func lookup_handle(handle: UInt) -> HandleEntry {
 /// The System object's ops (§2). Returns a status; `shutdown` does not return
 /// at all.
 ///
-/// `op` arrives as the raw a7 word, which a process chooses, so it is DECODED
-/// rather than compared: `SysOp.from(raw:)` accepts exactly the numbers that
-/// are ops and hands back `None` for every other, which is both the range check
-/// and the dispatch in one step. The `match` is then exhaustive, so adding an
-/// op to `sosabi` makes this function fail to compile until it is handled —
+/// `op` arrives as the raw register word, which a process chooses, so it is
+/// DECODED rather than compared: `SysOp.from(raw:)` accepts exactly the numbers
+/// that are ops and hands back `None` for every other, which is both the range
+/// check and the dispatch in one step. The `match` is then exhaustive, so adding
+/// an op to `sosabi` makes this function fail to compile until it is handled —
 /// which is what the old `op > OP_SYSTEM_MAX` test could never do.
-func system_op(raw_op: UInt, obj: &SystemObject, arg0: UInt) unsafe -> SosStatus {
+func system_op(raw_op: UInt, obj: &SystemObject, arg0: UInt) -> SosStatus {
     guard let op = SysOp.from(raw: raw_op) else {
         return SosStatus.BadOp
     }
@@ -464,7 +246,7 @@ func system_op(raw_op: UInt, obj: &SystemObject, arg0: UInt) unsafe -> SosStatus
             if not obj.allows(SystemRight.Debug) {
                 return SosStatus.AccessDenied
             }
-            console().write_byte((arg0 & BYTE_MASK) as UInt8)
+            hal.console_byte((arg0 & BYTE_MASK) as UInt8)
             SosStatus.Ok
         },
         // Stop the machine with `arg0` as the status. NOT process exit: that is
@@ -476,9 +258,9 @@ func system_op(raw_op: UInt, obj: &SystemObject, arg0: UInt) unsafe -> SosStatus
                 return SosStatus.AccessDenied
             }
             if arg0 == 0 {
-                finisher().exit_pass()
+                hal.exit_pass()
             } else {
-                finisher().exit_fail(arg0)
+                hal.exit_fail(arg0)
             }
             SosStatus.Ok
         },
@@ -492,7 +274,7 @@ func system_op(raw_op: UInt, obj: &SystemObject, arg0: UInt) unsafe -> SosStatus
 /// only then is a `SystemHandle` constructed. Below this line the kernel is no
 /// longer handling an integer a process chose — it is handling an object it
 /// resolved, paired with the rights that came with it.
-func dispatch(handle: UInt, op: UInt, arg0: UInt) unsafe -> SosStatus {
+func dispatch(handle: UInt, op: UInt, arg0: UInt) -> SosStatus {
     let entry = lookup_handle(handle)
     match entry.obj_type {
         case Unbound -> SosStatus.BadHandle,
@@ -508,32 +290,31 @@ func dispatch(handle: UInt, op: UInt, arg0: UInt) unsafe -> SosStatus {
 // The trap handler
 // =============================================================================
 
-/// boot.S's landing point for every trap taken from U-mode. `frame` addresses
-/// the saved context, which this handler may rewrite: a returning syscall steps
-/// `mepc` past the `ecall` and leaves its (status, value) pair in `a0`/`a1`.
+/// The HAL's landing point for every trap taken from user mode. `frame_addr`
+/// addresses the saved context, which this handler may rewrite: a returning
+/// syscall leaves its (status, value) pair where the caller reads them and
+/// resumes past the trapping instruction — both through the HAL, because both
+/// are register conventions.
 ///
 /// A FAULT is fatal — spec §8 makes a thread fault kill its process, and in M1
 /// root IS the system. A bad SYSCALL is not: an unknown handle, an unknown op
 /// or a missing right come back as a status word and the process runs on.
 /// Confusing the two is how a kernel turns a caller's mistake into its own.
 @export("ktrap")
-public func ktrap(frame_addr: UInt, cause: UInt, tval: UInt) unsafe {
-    let frame = UnsafeMemory<TrapFrame, Normal>(frame_addr)
-    let epc = frame.mepc.read()
-
-    if cause != (TrapCause.EcallFromU as UInt) {
-        fatal(cause_tag(cause), cause, epc, tval, ExitCode.UmodeFault)
+public func ktrap(frame_addr: UInt, cause: UInt, tval: UInt) {
+    if not hal.is_syscall(cause) {
+        fatal(hal.cause_tag(cause), cause, hal.fault_pc(frame_addr), tval,
+              ExitCode.UmodeFault)
     }
 
-    // §5.7: a0 = handle, a7 = op, args a1-a5.
-    let status = dispatch(frame.a0.read(), frame.a7.read(), frame.a1.read())
+    let status = dispatch(hal.syscall_handle(frame_addr),
+                          hal.syscall_op(frame_addr),
+                          hal.syscall_arg0(frame_addr))
 
     // THE SYSCALL BOUNDARY: the one place the typed status becomes the number
     // the ABI specifies. `as` on a backed enum is total — the enum IS its tag —
     // so there is nothing here that can fail or disagree with `sosabi`'s table.
-    frame.a0.write(status as UInt8 as UInt)
-    frame.a1.write(0)
-    frame.mepc.write(epc + ECALL_INSN_LEN)
+    hal.syscall_return(frame_addr, status as UInt8 as UInt, 0)
 }
 
 static BYTE_MASK: UInt = 0xFF
@@ -554,23 +335,12 @@ static BYTE_MASK: UInt = 0xFF
 // `static_assert`) is what makes the overlay exact, and it is what turns a
 // layout edit into a compile error instead of a silent misparse at boot.
 //
-// What stays HERE is everything that depends on this target: where root's
-// region is, how many PMP regions there are to spend, and the memory map the
-// segments are checked against. `imgformat` carries only the rules that hold
-// wherever the format is read.
-//
-// EVERY malformed shape is a diagnosed FAIL, never a hang and never a partial
-// load: the image is validated in full before a single byte is placed.
-
-/// Root's region (design 140 pin; mirrored by sos/root/root.ld and recorded in
-/// virt.ld's memory map). Segments load from the base; the stack occupies the
-/// top ROOT_STACK_LEN bytes and is granted as its own RW region.
-static ROOT_LOAD_BASE: UInt = 0x80200000
-static ROOT_REGION_TOP: UInt = 0x80240000
-static ROOT_STACK_LEN: UInt = 0x4000
-
-/// One PMP region per segment, plus one for the stack.
-static MAX_SEGMENTS: UInt = 3
+// What stays HERE is everything that holds on EVERY target: the order the
+// checks run in, that nothing is placed before everything validates, and that a
+// malformed shape is a diagnosed FAIL rather than a hang or a partial load.
+// Where root's region is, how many grants there are to spend and what a
+// permission bit does to the hardware are the HAL's — which is why the numbers
+// below are read from it rather than written here.
 
 /// Overlay the header on the image's first bytes. One view construction, then
 /// an ordinary safe struct — the unsafety is confined to this line.
@@ -607,7 +377,7 @@ public func fatal_image(reason: String, detail: UInt) {
     uart.write_str(" (")
     uart.write_hex(detail)
     uart.write_str(")\n")
-    finisher().exit_fail(ExitCode.BadImage as UInt)
+    hal.exit_fail(ExitCode.BadImage as UInt)
 }
 
 /// Validate one segment record against the image bounds and the root region.
@@ -628,10 +398,10 @@ func check_segment(seg: &SosimgSeg, img_len: UInt) {
     if not seg.mem_covers_file() {
         fatal_image("segment mem_len below file_len", mem_len)
     }
-    if load_addr < ROOT_LOAD_BASE {
+    if load_addr < hal.ROOT_LOAD_BASE {
         fatal_image("segment loads below the root region", load_addr)
     }
-    let limit = ROOT_REGION_TOP - ROOT_STACK_LEN
+    let limit = hal.ROOT_REGION_TOP - hal.ROOT_STACK_LEN
     if load_addr > limit {
         fatal_image("segment loads above the root region", load_addr)
     }
@@ -639,20 +409,20 @@ func check_segment(seg: &SosimgSeg, img_len: UInt) {
         fatal_image("segment overruns the root region", mem_len)
     }
 
-    // Write-without-read is a PMP encoding RISC-V reserves, so a segment
-    // asking for it would program a configuration the hardware does not
-    // define. `imgformat` states the rule; the consequence is local.
+    // Write-without-read is not a grant any target should install, and one
+    // profile's hardware RESERVES the encoding outright. `imgformat` states the
+    // rule; refusing the image is the consequence.
     if not seg.has_sane_perms() {
         fatal_image("segment permissions are not a valid grant", seg.flags as UInt)
     }
 }
 
 /// Parse the appended root image, place its segments, grant root exactly the
-/// PMP regions the image asks for plus a stack, and drop to U-mode at its
-/// entry. Never returns.
+/// regions the image asks for plus a stack, and drop to user mode at its entry.
+/// Never returns.
 public func load_root_and_enter() unsafe {
-    let base = payload_start()
-    let end = payload_end()
+    let base = hal.payload_start()
+    let end = hal.payload_end()
     if end < base {
         fatal_image("payload bounds inverted", base)
     }
@@ -679,8 +449,8 @@ public func load_root_and_enter() unsafe {
     if seg_count == 0 {
         fatal_image("image has no segments", 0)
     }
-    if seg_count > MAX_SEGMENTS {
-        fatal_image("more segments than PMP regions", seg_count)
+    if seg_count > hal.MAX_ROOT_SEGMENTS {
+        fatal_image("more segments than the grant budget", seg_count)
     }
     let table_len = seg_count * seg_len
     if table_len > img_len - header_len {
@@ -699,7 +469,7 @@ public func load_root_and_enter() unsafe {
         i = i + 1
     }
 
-    if entry < ROOT_LOAD_BASE || entry >= ROOT_REGION_TOP - ROOT_STACK_LEN {
+    if entry < hal.ROOT_LOAD_BASE || entry >= hal.ROOT_REGION_TOP - hal.ROOT_STACK_LEN {
         fatal_image("entry outside the root region", entry)
     }
 
@@ -712,7 +482,7 @@ public func load_root_and_enter() unsafe {
     uart.write_hex(prio_map)
     uart.write_str("\n")
 
-    pmp_reset()
+    hal.prot_reset()
 
     var s: UInt = 0
     while s < seg_count {
@@ -724,20 +494,20 @@ public func load_root_and_enter() unsafe {
         copy_bytes(load_addr, base + (seg.file_off as UInt), file_len)
         zero_bytes(load_addr + file_len, mem_len - file_len)
 
-        // The sosimg flag bits are R=1, W=2, X=4 — deliberately the same order
-        // as a PMP config's low three bits, so a segment's permissions become
-        // its region's with no translation. (ELF spells them the other way
-        // round; Blade's emitter does that conversion at build time.)
-        pmp_region(s, load_addr, align_up(load_addr + mem_len, PMP_GRAIN),
-                   seg.flags as UInt)
+        // The sosimg flag bits ARE the protection vocabulary (imgformat states
+        // the encoding; each HAL translates it into its own hardware's bits),
+        // so a segment's permissions become its grant with nothing in between.
+        hal.prot_region(s, load_addr,
+                        align_up(load_addr + mem_len, hal.PROT_GRAIN), seg.flags)
         s = s + 1
     }
 
     // The stack is the kernel's grant, not the image's: root asks for code and
     // data, the kernel decides where it runs.
-    pmp_region(seg_count, ROOT_REGION_TOP - ROOT_STACK_LEN, ROOT_REGION_TOP,
-               (PmpPerm.Read as UInt) | (PmpPerm.Write as UInt))
-    pmp_commit()
+    hal.prot_region(seg_count, hal.ROOT_REGION_TOP - hal.ROOT_STACK_LEN,
+                    hal.ROOT_REGION_TOP,
+                    (SegFlag.Read as UInt8) | (SegFlag.Write as UInt8))
+    hal.prot_commit()
 
     // spec §7: root's band map applies verbatim from its image. There is no
     // Process object to store it in until the object-model brief, so M1 parses
@@ -746,5 +516,5 @@ public func load_root_and_enter() unsafe {
     //
     // §12: root's boot handle set. In M1 that is exactly one handle — System —
     // and every authority root has flows through it.
-    enter_user(entry, ROOT_REGION_TOP, ROOT_SYSTEM_HANDLE)
+    hal.enter_user(entry, hal.ROOT_REGION_TOP, ROOT_SYSTEM_HANDLE)
 }

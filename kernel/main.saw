@@ -1,20 +1,28 @@
-// SOS kernel entry (designs 112, 140) — Profile A: riscv32, QEMU `virt`.
+// SOS kernel entry (designs 112, 140, 162).
 //
-// The riscv32 kernel HAL (`sos/hal/riscv32/kernel/`) supplies `boot.S`, which
-// sets up the stack, zeroes .bss and calls `kmain`, and `sink.c`, which supplies
-// the board hooks and the PMP/CSR helpers; `sos/rt/common_c/support.c` supplies
-// the runtime seams over those hooks; `core/lib.saw` is the shared kernel
-// (drivers, trap frame, `ktrap`, syscall table, sosimg loader); `virt.ld` links
-// it all at RAM base 0x8000_0000. See sos/spec.md §5b and §12.
+// The per-arch kernel HAL (`sos/hal/<arch>/kernel/`) supplies the boot shim
+// that sets up the stack, zeroes .bss and calls `kmain`, the board hooks and
+// the memory-protection primitive, and the linker script that places the whole
+// image; `sos/rt/common_c/support.c` supplies the runtime seams over those
+// hooks; `core/lib.saw` is the arch-free kernel (console, `ktrap`, the
+// object-op dispatch, the sosimg loader). See sos/spec.md §5b and §12.
+//
+// This file names no architecture either — which is the point of the seam: the
+// same kernel entry boots Profile A and Profile B, and the only thing that
+// changes is which HAL the build maps `hal` to.
 //
 // The kernel's whole job at boot is to hand control to the root server: load
-// the one appended image, grant it its regions, drop to U-mode. A kernel with
-// no root image has nothing to run and says so — it does not exit quietly.
+// the one appended image, grant it its regions, drop to user mode. A kernel
+// with no root image has nothing to run and says so — it does not exit quietly.
 
 import kcore.{console, load_root_and_enter}
+import hal
 
 @export("kmain")
 func kmain() {
-    console().write_str("SOS M1: kernel up on riscv32 (QEMU virt)\n")
+    let uart = console()
+    uart.write_str("SOS M1: kernel up on ")
+    uart.write_str(hal.arch_name())
+    uart.write_str("\n")
     load_root_and_enter()
 }

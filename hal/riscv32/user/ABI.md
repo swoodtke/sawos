@@ -26,8 +26,7 @@ appears in this HAL either.
 
 | Symbol | Contract |
 |---|---|
-| `sos_syscall1(handle, op, arg0) -> status` | Perform one object op. Returns the status word; the value half is discarded. |
-| `sos_syscall1_value(handle, op, arg0, &value) -> status` | The same, keeping the value. No M1 op returns one; it exists so the seam is complete. |
+| `sos_syscall1(handle, op, arg0) -> status` | Perform one object op. Returns the status word; no M1 op returns a value, so the value half is not read. A `sos_syscall1_value` twin belongs beside this the day one does — the same way a wider op gets `sos_syscall2` rather than an ellipsis. |
 | `sos_set_system_handle(handle)` | Remember the boot handle so the runtime's own sinks can use it. Must be called before anything can print or panic. |
 | `sos_rt_write(ptr, len)` | Write bytes to the debug console, via the System object. Called by `sos/rt/common_c/support.c`. |
 | `sos_rt_abort(code)` | Stop the machine, via the System object. Never returns. |
