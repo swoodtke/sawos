@@ -411,6 +411,55 @@ cost, and what it proved:
   were byte-compatible wrappers around incompatible instructions and the
   only thing stopping one booting on the other was that nobody had tried.
 
+## 5c. The native floor (design 172, Aug 7)
+
+SOS is written in Saw, and the exceptions are ENUMERATED rather than tolerated.
+Every surviving line of C states, in the file that holds it, why it is not Saw —
+and there are only three reasons in the whole system:
+
+1. **An INSTRUCTION with no Saw spelling.** `ecall` / `svc`, `mret` / `eret`,
+   the vector tables, `csrw` / `msr` / `mrs`, `dsb` / `isb` / `tlbi`, the
+   semihosting `hlt`, and the register pinning each of them needs. Inline asm in
+   Saw is a separate design conversation and deliberately not one this milestone
+   opened.
+2. **`memcpy` / `memset` / `memmove`.** A byte-copy loop written in Saw is
+   exactly the pattern LLVM's loop-idiom recognizer rewrites INTO a call to
+   `memcpy` — which, in a freestanding build where this IS `memcpy`, is a call
+   to itself. C compiled with `-fno-builtin` is the supported way to say "do not
+   do that", and it is why every libc writes these in assembly or with the same
+   flag. PERMANENT. (The `__atomic_*` libcalls beside them are the same shape:
+   the caller is codegen, not source.)
+3. **A LINKER SYMBOL's ADDRESS.** Saw cannot name one — `extern` declares only
+   functions, an extern function is not usable as a value, and `@export` on a
+   static emits a definition rather than a reference. Four accessor bodies, two
+   per profile. Filed as DF-172a.
+
+What that cost, measured: the C went from 383 code lines to 207, a 46%
+reduction, and the two kernel HALs took nearly all of it — `sink.c` is 170 code
+lines to 47 on arm64 and 75 to 22 on riscv32. What moved: both board consoles
+and both machine-stops, the arm64 static identity map and its grant editing, the
+riscv32 PMP region staging, and the kernel-fault report with its hex formatting.
+
+**The panic path is the interesting one.** The console writer the runtime seams
+call is now Saw, and it is CHECK-FREE BY CONSTRUCTION rather than by
+inspection: raw pointer reads, wrapping arithmetic, no indexing, no allocation.
+That is what makes a panic raised inside the panic reporter unreachable instead
+of merely unlikely, and it was verified from emitted IR before the code shipped
+— the whole call cone contains no bounds check, no overflow trap and no call
+back into `__saw_rt_panic`. A harness case pins it on both machines by taking a
+compiler-raised bounds check and asserting the message arrives in three
+independent pieces.
+
+**One thing is blocked on the LANGUAGE, not on effort** (DF-172e): the bump
+arena and the `__saw_rt_*` seams in `sos/rt/common_c/support.c`. Every part of
+that move was probed and works — the arena is expressible, `--runtime-provider`
+permits and checks the exports, and `sosrt` is already a dependency of both the
+kernel and every process — except one signature. `rt/ABI.md` freezes
+`__saw_rt_panic` as `noreturn`, and Saw cannot type a diverging loop as `Never`.
+The two things that produce `Never` are `panic()`, which is what the seam IS,
+and an `extern` already declared noreturn, which Profile A no longer has now
+that its finisher write is Saw.
+
 ## 6. Explicitly NOT in the kernel
 
 Drivers (userspace via Interrupt + MMIO MemoryObjects), filesystems,

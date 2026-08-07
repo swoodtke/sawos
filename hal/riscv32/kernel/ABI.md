@@ -11,6 +11,11 @@ above meets this machine's. The NATIVE half (`boot.S`, `sink.c`) is what Saw
 cannot express: a trap vector, a privilege transition, a CSR write whose
 operand must be an assembly-time immediate, and a linker symbol.
 
+Design 172 moved the line between them. `sink.c` was 135 lines and is 65: the
+NS16550A write loop, the finisher write that stops the machine, and all of the
+PMP region arithmetic are Saw now. What is left is four functions, and each
+states its own reason at the top of its section.
+
 ## The Saw surface (`lib.saw`) — what `kcore` may use
 
 | Name | Contract |
@@ -36,17 +41,23 @@ operand must be an assembly-time immediate, and a linker symbol.
 
 ## The native half (`boot.S`, `sink.c`)
 
-| Symbol | Contract |
-|---|---|
-| `_start` | Reset entry. Sets up the stack, clears the mode witness, installs the trap vector, zeroes `.bss`, calls `kmain`. Never returns. |
-| `trap_entry` | Machine trap vector. Saves the U-mode context into a 32-word frame, calls `ktrap(frame, cause, tval)` on the kernel stack, restores, `mret`. A trap taken in kernel mode goes to `kernel_fault` instead. |
-| `kernel_fault` | A trap the kernel itself took, i.e. a kernel bug. Reports the cause through the platform's failure channel and stops the machine. Never returns, never hangs. |
-| `sos_enter_user(entry, stack_top, boot_handle)` | The privilege transition behind `enter_user`. |
-| `sos_rt_write(ptr, len)` | Write bytes to the kernel's console. Called by `sos/rt/common_c/support.c`. |
-| `sos_rt_abort(code)` | Stop the machine with a non-zero status. Never returns. |
-| `sos_pmp_reset/region/commit` | The PMP programming behind `prot_*`. |
-| `sos_payload_start()` / `sos_payload_end()` | The linker symbols Saw cannot name. |
-| `virt.ld` | Places the image at this board's RAM base, first section first, and bounds the appended payload. |
+| Symbol | Where | Contract | Why not Saw |
+|---|---|---|---|
+| `_start` | boot.S | Reset entry. Sets up the stack, clears the mode witness, installs the trap vector, zeroes `.bss`, calls `kmain`. Never returns. | `csrw`, and a stack pointer before any compiled code can run. |
+| `trap_entry` | boot.S | Machine trap vector. Saves the U-mode context into a 32-word frame, calls `ktrap(frame, cause, tval)` on the kernel stack, restores, `mret`. A trap taken in kernel mode goes to `kernel_fault` instead. | `csrrw` on `mscratch` as the mode witness, register saves, `mret`. |
+| `kernel_fault` | boot.S | A trap the kernel itself took. Writes the finisher with `mcause` in the code bits and stops the machine. Never returns, never hangs. | `csrr mcause` plus the finisher store, in the one path that must work with no assumptions about kernel state. |
+| `sos_enter_user(entry, stack_top, boot_handle)` | boot.S | The privilege transition behind `enter_user`. | `csrw` to `mepc`/`mstatus`/`mscratch`, `mret`, and a register file the caller must not be able to leave anything in. |
+| `sos_pmpaddr_write(index, value)` | sink.c | Place a word in `pmpaddr<index>`. | The CSR NUMBER is an assembly-time immediate, so an indexed write is a switch. What a region MEANS is Saw (design 172 unit 1). |
+| `sos_pmpcfg_write(lo, hi)` | sink.c | Publish both config registers together. | Same: `csrw pmpcfg0` names its register. The config words are STAGED in Saw. |
+| `sos_payload_start()` / `sos_payload_end()` | sink.c | Bounds of the appended payload. | A linker symbol's ADDRESS, which Saw cannot name — DF-172a. |
+| `virt.ld` | — | Places the image at this board's RAM base, first section first, and bounds the appended payload. | Not a program. |
+
+Moved to `lib.saw` by design 172, and no longer C: `sos_rt_write` (unit 4, and
+now check-free by construction so the panic path cannot re-enter it),
+`sos_rt_abort` (unit 4 — it is `exit_fail` under the seam's name), and
+`sos_pmp_reset` / `sos_pmp_region` / `sos_pmp_commit`, whose arithmetic became
+`prot_reset` / `prot_region` / `prot_commit` over the two register writers above
+(unit 1).
 
 ## Required of the kernel
 
@@ -79,9 +90,14 @@ and they are compiled from one definition so they cannot skew.
   the saved PC. Profile B's `ELR` already points past the `svc`.
 - **PMP as TOR pairs.** Region granularity, the reserved write-without-read
   encoding, and the "no match means deny for user mode" default are all
-  RISC-V's. Profile B replaces this whole mechanism with page tables.
+  RISC-V's. Profile B replaces this whole mechanism with page tables. The
+  STAGING is Saw on both profiles since design 172 unit 1 — descriptors and
+  config words are data, and only publishing them is an instruction.
 - **The SiFive test finisher** as the failure channel — QEMU `virt`, not real
-  hardware. A P4 build replaces `sos_rt_abort` with a reset.
+  hardware. It is an ordinary MMIO store, so `exit_pass`/`exit_fail` are Saw
+  through the design-112 driver idiom; a P4 build replaces them with a reset.
+  One consequence worth knowing: this profile has no `noreturn` C leaf left,
+  which is what makes DF-172e bite here and not on Profile B.
 - **`UNMAPPED_PROBE` is address 0.** The kernel runs with no translation, so
   nothing is there. On a profile whose kernel runs with an MMU on, address 0 is
   the device window and reading it succeeds.

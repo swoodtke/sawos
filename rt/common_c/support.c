@@ -12,7 +12,7 @@
 // HAL writes through a System op and stops via another. Everything else is
 // here, once.
 //
-// WHY THIS IS C AND NOT SAW:
+// WHY EACH THING HERE IS C AND NOT SAW (design 172's reason sweep):
 //
 //  - mem* : a byte-copy loop written in Saw is exactly the pattern LLVM's
 //    loop-idiom recognizer rewrites into a call to `memcpy` — which, in a
@@ -21,27 +21,29 @@
 //    supported way to say "do not do that". (Same reason libcs write them in
 //    assembly or with the same flag.) This reason is PERMANENT.
 //
-// The other two reasons this file used to give are NO LONGER TRUE. Design 149
-// landed (Aug 6) and closed DF-140g, the gap they described:
+//  - the __atomic_* family : a compiler-generated LIBCALL, so it must exist
+//    under the name and signature the backend emits, for a build that does not
+//    name an atomics extension. There is nothing for Saw to express — the
+//    caller is codegen, not source. See the uniprocessor caveat below.
 //
-//  - the arena needed mutable module state and a way to reserve `.bss`.
-//    `unsafe static var` now provides the first, and a zero-initialized static
-//    is zerofill in both profiles — `static ARENA: [UInt8; N] = [0; N]` costs
-//    no image bytes — so a bump allocator IS expressible in Saw.
-//  - the seams needed an `@export` of reserved `__saw_rt_*` names, which only
-//    `--runtime-build` allowed and which is scoped to authoring `sawc/rt/`.
-//    `sawc --runtime-provider` (Blade spells it `[package] runtime = true`) now
-//    lets an ordinary freestanding build implement them, with each signature
-//    checked against `sawc/rt/ABI.md`.
+//  - the arena and the four seams : BLOCKED ON A LANGUAGE FEATURE, not on
+//    effort. Design 172 unit 2 probed the whole move and it works but for one
+//    signature: `sawc/rt/ABI.md` freezes `__saw_rt_panic` as `noreturn`, and
+//    Saw cannot type a diverging loop as `Never` — `func f() -> Never { while
+//    true { } }` is "body has no value". The only `Never` producers are
+//    `panic()`, which is what this seam IS, and an `extern` already declared
+//    noreturn, which Profile A no longer has since its finisher write became
+//    Saw. Splitting the family — three seams in Saw, one in C — was declined:
+//    it would leave this file with a story harder to state than the one it has.
+//    Filed as DF-172e. Everything ELSE about the move is measured and working:
+//    the bump arena is expressible (design 149's `unsafe static var` over a
+//    zero static), `--runtime-provider` permits the exports and checks them,
+//    and `sosrt` is already a dependency of both the kernel and every process.
 //
-// So the arena and the four seams below COULD be Saw today. They are not yet:
-// moving them changes the allocation and panic paths of both the kernel and
-// every process image at once, which is a decision worth taking deliberately
-// rather than as part of an adoption sweep. Recorded in designs/todo.md under
-// the SOS M1 section; SOS is the case design 149 was built for, so this is the
-// obvious next step rather than an open question.
-//
-// The arch-free, role-free logic that is already Saw: sos/rt/common/.
+// What design 172 DID move out of this layer: the board consoles, the machine
+// stops, the arm64 page tables, the PMP region staging and the kernel-fault
+// report are all Saw now, in sos/hal/<arch>/kernel/lib.saw. The arch-free,
+// role-free logic that was already Saw: sos/rt/common/.
 
 typedef unsigned int   u32;
 typedef unsigned char  u8;

@@ -1,9 +1,24 @@
-// SOS riscv32 user-side HAL: the syscall instruction (design 140).
+// SOS riscv32 user-side HAL: the syscall instruction (designs 140, 172).
 //
 // This is the ENTIRE architecture-dependent surface of an SOS process. An
 // `ecall` is not expressible in Saw, and neither is naming the registers the
 // ABI puts arguments in, so this one file exists — and nothing else in a
 // process needs to know it is riscv32.
+//
+// WHY EACH THING HERE IS C (design 172's reason sweep). The kernel side of
+// this HAL went almost entirely to Saw; the process side did not, and the
+// reasons are different for the two halves of the file:
+//
+//   - `sos_syscall1` : the `ecall` INSTRUCTION plus the register pinning the
+//     ABI requires. Neither has a Saw spelling and neither will without inline
+//     asm, which design 172 explicitly does not open. PERMANENT as written.
+//   - the two hooks + the parked handle : these ARE expressible. They name no
+//     architecture — a byte reaches the console through a System op, which is
+//     the same op on both profiles — so they belong in ONE arch-free Saw
+//     module, not in two per-arch C files. What stops it today is the same
+//     thing that stopped design 172 unit 2 (DF-172e): the runtime seams they
+//     serve include a `noreturn` panic sink Saw cannot type. When that lands,
+//     this file should be `sos_syscall1` and nothing else.
 //
 // `sos/hal/riscv32/kernel/` is the kernel's counterpart. M1b (design 79) adds
 // `sos/hal/arm64/...` beside these without moving either.

@@ -12,6 +12,12 @@ imports as `hal`. The NATIVE half (`boot.S`, `sink.c`) is what Saw cannot
 express: a vector table, an `eret`, a system-register write, a semihosting
 call, and a linker symbol.
 
+Design 172 moved the line between them. `sink.c` was 304 lines and is 130:
+the PL011 write loop, the page-table construction, the grant editing, the
+kernel-fault report and its hex formatting are all Saw now. What is left is
+four functions, and each states its own reason at the top of its section — an
+instruction with no Saw spelling, or a linker symbol's address (DF-172a).
+
 ## The Saw surface (`lib.saw`)
 
 Identical in name and meaning to the riscv32 HAL's — that table is not repeated
@@ -19,19 +25,24 @@ here. What follows is only what this profile does differently, and why.
 
 ## The native half
 
-| Symbol | Contract |
-|---|---|
-| `_start` | Reset entry. Stack, `VBAR_EL1`, `CPACR_EL1.FPEN`, `.bss` zerofill, `sos_mmu_init`, `kmain`. Never returns. |
-| `_vectors` | The 16-entry EL1 vector table. Only "lower EL, AArch64, synchronous" is a user trap; every other entry is a kernel bug or an interrupt M1 never enables, and all of them land on `kernel_fault_entry`. |
-| `user_trap_entry` | Builds the 34-doubleword frame on the kernel stack, calls `ktrap(frame, ESR, FAR)`, restores, `eret`. |
-| `kernel_fault_entry` / `sos_kernel_fault` | A trap the kernel itself took. Reports the exception class and stops the machine with it as the status. Never returns, never hangs; a fault while reporting exits immediately rather than looping. |
-| `sos_enter_user(entry, stack_top, boot_handle)` | `ELR_EL1` / `SP_EL0` / `SPSR_EL1` = EL0t with interrupts masked, every register but x0 zeroed, `eret`. |
-| `sos_rt_write(ptr, len)` | PL011 output. Called by `sos/rt/common_c/support.c`. |
-| `sos_platform_exit(code)` / `sos_rt_abort(code)` | Stop the machine through semihosting `SYS_EXIT`. |
-| `sos_mmu_init()` | Build the static identity map and turn the MMU on. Called by `_start` after `.bss` is zeroed, because the tables live there. |
-| `sos_prot_reset/region/commit` | The page-attribute editing behind `prot_*`. |
-| `sos_payload_start()` / `sos_payload_end()` | The linker symbols Saw cannot name. |
-| `virt.ld` | Places the image at RAM base 0x4000_0000 and bounds the appended payload on PAGE boundaries — protection granularity here is the page. |
+| Symbol | Where | Contract | Why not Saw |
+|---|---|---|---|
+| `_start` | boot.S | Reset entry. Stack, `VBAR_EL1`, `CPACR_EL1.FPEN`, `.bss` zerofill, `sos_mmu_init`, `kmain`. Never returns. | Instructions: `msr`, and a stack pointer before any compiled code can run. |
+| `_vectors` | boot.S | The 16-entry EL1 vector table. Only "lower EL, AArch64, synchronous" is a user trap; every other entry is a kernel bug or an interrupt M1 never enables, and all land on `kernel_fault_entry`. | A vector table is placement + branches at fixed 0x80 strides. |
+| `user_trap_entry` | boot.S | Builds the 34-doubleword frame on the kernel stack, calls `ktrap(frame, ESR, FAR)`, restores, `eret`. | Register saves and `eret`. |
+| `kernel_fault_entry` | boot.S | Reads `ESR`/`ELR`/`FAR` and calls the SAW `sos_kernel_fault` with them. | `mrs` names a register at assembly time. The REPORT is Saw (design 172 unit 3). |
+| `sos_enter_user(entry, stack_top, boot_handle)` | boot.S | `ELR_EL1` / `SP_EL0` / `SPSR_EL1` = EL0t with interrupts masked, every register but x0 zeroed, `eret`. | `msr` + `eret` + a register file the caller must not be able to leave anything in. |
+| `sos_platform_exit(code)` | sink.c | Stop the machine through semihosting `SYS_EXIT`. | `hlt #0xf000` with the call number and parameter block pinned in x0/x1. |
+| `sos_mmu_init()` | sink.c | Ask `lib.saw` for a finished identity map, then turn the MMU on. Called by `_start` after `.bss` is zeroed, because the tables live there. | `msr`/`mrs` to four system registers plus `dsb`/`isb`. The MAP is Saw (design 172 unit 1). |
+| `sos_prot_commit()` | sink.c | Publish the staged grant set. | `dsb`/`isb` barriers and a `tlbi`. The DESCRIPTORS are Saw. |
+| `sos_payload_start()` / `sos_payload_end()` | sink.c | Bounds of the appended payload. | A linker symbol's ADDRESS, which Saw cannot name — DF-172a. |
+| `virt.ld` | — | Places the image at RAM base 0x4000_0000 and bounds the appended payload on PAGE boundaries — protection granularity here is the page. | Not a program. |
+
+Moved to `lib.saw` by design 172, and no longer C: `sos_rt_write` (unit 4, and
+now check-free by construction so the panic path cannot re-enter it),
+`sos_rt_abort` (unit 4), `sos_kernel_fault` with its `put_str`/`put_hex` (unit
+3), `sos_prot_reset` / `sos_prot_region` and the whole page-table build (unit
+1), which reaches C only as `sos_page_tables_build` and `sos_mair_value`.
 
 ## Required of the kernel
 
@@ -50,13 +61,20 @@ here. What follows is only what this profile does differently, and why.
   `syscall_return` advances nothing. Doing what Profile A does here would skip
   the instruction AFTER a syscall — which is exactly why "how far to resume" is
   a HAL decision rather than a kernel one.
-- **FP/SIMD must be enabled before any compiled code runs.** `CPACR_EL1.FPEN`
-  traps Advanced SIMD at EL1 out of reset, and LLVM vectorizes ordinary loops in
-  both the C and the Saw halves, so the first table-filling loop faulted before
-  this line existed. FP state is NOT saved across a trap (the frame holds
-  x0-x30 and three system registers); with one user thread and no preemption
-  nothing can observe that, and M2's context switch is where it stops being
-  true.
+- **FP/SIMD must be enabled before any compiled code runs, and the reason is
+  now ONLY the C.** `CPACR_EL1.FPEN` traps Advanced SIMD at EL1 out of reset,
+  and LLVM reaches for `q` registers to move a struct, so the first
+  table-filling loop faulted before this line existed. Design 172 unit 7 made
+  the freestanding profile imply `-neon,-fp-armv8` on aarch64, which took the
+  Saw half from five SIMD instructions to zero — so the boot line is no longer
+  there for Saw's sake. It stays because `sos/rt/common_c/support.c` is
+  PERMANENTLY C (its `memcpy` is the loop-idiom self-recursion case) and
+  compiles to 16 SIMD references at `-O2`. Removing it needs
+  `-mgeneral-regs-only` on every aarch64 C compile, which means a Blade manifest
+  key for per-target C flags — see DF-172c. FP state is NOT saved across a trap
+  (the frame holds x0-x30 and three system registers); with one user thread and
+  no preemption nothing can observe that, and M2's context switch is where it
+  stops being true.
 - **Semihosting, not PSCI, for shutdown.** PSCI `SYSTEM_OFF` over the HVC
   conduit works on `-M virt` but always exits the emulator with status 0, and
   this harness asserts on exit STATUS — one case encodes its entire verdict in

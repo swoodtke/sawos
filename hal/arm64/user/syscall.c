@@ -1,9 +1,24 @@
-// SOS arm64 user-side HAL: the syscall instruction (design 162).
+// SOS arm64 user-side HAL: the syscall instruction (designs 162, 172).
 //
 // This is the ENTIRE architecture-dependent surface of an SOS process. An `svc`
 // is not expressible in Saw, and neither is naming the registers the ABI puts
 // arguments in, so this one file exists — and nothing else in a process needs
 // to know it is arm64.
+//
+// WHY EACH THING HERE IS C (design 172's reason sweep). The kernel side of
+// this HAL went almost entirely to Saw; the process side did not, and the
+// reasons are different for the two halves of the file:
+//
+//   - `sos_syscall1` : the `svc` INSTRUCTION plus the register pinning the ABI
+//     requires. Neither has a Saw spelling and neither will without inline asm,
+//     which design 172 explicitly does not open. PERMANENT as written.
+//   - the two hooks + the parked handle : these ARE expressible. They name no
+//     architecture — a byte reaches the console through a System op, which is
+//     the same op on both profiles — so they belong in ONE arch-free Saw
+//     module, not in two per-arch C files. What stops it today is the same
+//     thing that stopped design 172 unit 2 (DF-172e): the runtime seams they
+//     serve include a `noreturn` panic sink Saw cannot type. When that lands,
+//     this file should be `sos_syscall1` and nothing else.
 //
 // `sos/hal/arm64/kernel/` is the kernel's counterpart.
 //
