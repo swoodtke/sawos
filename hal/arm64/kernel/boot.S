@@ -170,10 +170,16 @@ user_trap_entry:
 
 /* A trap the KERNEL took, i.e. a kernel bug. There is no context worth saving:
  * report the cause and stop the machine non-zero. (M0's discipline, unchanged:
- * a kernel fault never hangs.) */
+ * a kernel fault never hangs.)
+ *
+ * The three system registers are read HERE because `mrs` names a register at
+ * assembly time; `sos_kernel_fault` is Saw since design 172 unit 3 and takes
+ * them as ordinary arguments. */
     .globl kernel_fault_entry
 kernel_fault_entry:
     mrs     x0, esr_el1
+    mrs     x1, elr_el1
+    mrs     x2, far_el1
     bl      sos_kernel_fault
 4:  wfi
     b       4b

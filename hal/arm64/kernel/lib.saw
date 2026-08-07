@@ -15,7 +15,14 @@
 // The image-format registry, for this profile's arch tag. The format is shared
 // with everyone who touches an image; the tag a HAL claims comes out of it
 // rather than being spelled again here.
-import imgformat.{SosimgArch}
+import imgformat.{SosimgArch, SegFlag}
+
+// Arch-free, role-free formatting, shared with the kernel core and every SOS
+// process build. This HAL formats its OWN diagnostics — the kernel core is
+// ABOVE it and cannot be imported from here — so it reaches for the same
+// helpers the kernel console does, and the two agree on what a non-ASCII scalar
+// becomes and on how wide a machine word is.
+import sosrt.{ascii_byte, hex_digit_of, hex_digits_per_word}
 
 // =============================================================================
 // PL011 UART (design 112's blessed MMIO idiom: register block + driver)
@@ -183,10 +190,13 @@ static FAIL_CODE_MIN: UInt = 1
 // Privilege, protection and payload seams (boot.S / sink.c)
 // =============================================================================
 
+// The native half of this HAL, and now the whole of it: an `eret`, a barrier
+// pair with a TLB flush, and two linker symbols. The protection primitive's
+// DESCRIPTORS are built below in Saw (design 172 unit 1) — only publishing them
+// needs instructions. See `sink.c`'s header for the reason each survivor
+// carries.
 extern "C" {
     func sos_enter_user(entry: UInt, stack_top: UInt, boot_handle: UInt)
-    func sos_prot_reset()
-    func sos_prot_region(idx: UInt, base: UInt, top: UInt, perm: UInt)
     func sos_prot_commit()
     func sos_payload_start() -> UInt
     func sos_payload_end() -> UInt
@@ -216,20 +226,10 @@ public static ROOT_STACK_LEN: UInt = 0x4000
 /// reading one would simply succeed.
 public static UNMAPPED_PROBE: UInt = 0x80000000
 
-/// Revoke every grant. User mode then reaches nothing at all — the default-deny
-/// the grants below carve out of.
-public func prot_reset() {
-    sos_prot_reset()
-}
-
-/// Stage grant `idx` as [base, top) with `perms`, a mask in the `SegFlag`
-/// vocabulary. Translated into page attributes by the C half.
-public func prot_region(idx: UInt, base: UInt, top: UInt, perms: UInt8) {
-    sos_prot_region(idx, base, top, perms as UInt)
-}
-
 /// Publish the staged grant set: order the descriptor writes and flush the TLB.
 /// Separate from `prot_region` so a partially programmed set is never live.
+///
+/// The barriers are the only part of this that is not Saw — see `sink.c`.
 public func prot_commit() {
     sos_prot_commit()
 }
@@ -371,4 +371,351 @@ public func syscall_return(frame_addr: UInt, status: UInt, value: UInt) unsafe {
     let frame = frame_at(frame_addr)
     frame.x0.write(status)
     frame.x1.write(value)
+}
+
+// =============================================================================
+// Diagnostics (design 172 unit 3)
+// =============================================================================
+//
+// The kernel-bug path formats its own report. It used to be C — a `put_str` and
+// a `put_hex` beside the fault handler — which was a second copy of what
+// `sos/rt/common/` already does in Saw, and which printed a fixed sixteen hex
+// digits whether or not that was the word width.
+//
+// This is NOT the panic seam. `__saw_rt_write` below has a stricter contract
+// and shares none of this: these two use `String` and the ordinary runtime,
+// which is fine on a path the kernel reaches having already decided to stop.
+
+/// Write an ASCII string to the console, byte by byte.
+func report_str(msg: String) {
+    for scalar in msg.chars() {
+        console_byte(ascii_byte(scalar))
+    }
+}
+
+/// Write a machine word as `0x` + one hex digit per nibble, at THIS target's
+/// width — sixteen here, eight on Profile A.
+func report_hex(v: UInt) {
+    report_str("0x")
+    let digits = hex_digits_per_word()
+    var n = 0
+    while n < digits {
+        console_byte(hex_digit_of(v, n))
+        n = n + 1
+    }
+}
+
+// =============================================================================
+// The kernel-bug path (design 172 unit 3)
+// =============================================================================
+
+/// Set once a kernel fault is being reported, so a SECOND fault taken while
+/// reporting exits immediately instead of looping on the console.
+///
+/// Compound global state resting on a serialization argument the compiler
+/// cannot see, which is design 149's `unsafe static var` rather than an
+/// `Atomic`: SOS v1 is a uniprocessor kernel that enables no interrupt sources
+/// (spec §7), and this flag is only ever touched with the machine already
+/// failing.
+unsafe static var IN_KERNEL_FAULT: UInt8 = 0u8
+
+/// A trap the KERNEL itself took, i.e. a kernel bug. Reports the exception
+/// class and stops the machine with it as the status — the arm64 spelling of
+/// Profile A's "cause in the finisher's code bits". Never returns, and never
+/// hangs (M0's discipline, kept).
+///
+/// `boot.S` reads the three system registers, because `mrs` names a register at
+/// assembly time and Saw cannot spell one. Everything after that is formatting.
+@export("sos_kernel_fault")
+public func kernel_fault(esr: UInt, elr: UInt, far: UInt) unsafe {
+    let ec = (esr >> ESR_EC_SHIFT) & ESR_EC_MASK
+    if IN_KERNEL_FAULT != 0u8 {
+        exit_fail(ec)
+    }
+    IN_KERNEL_FAULT = 1u8
+    report_str("SOS: kernel fault ec=")
+    report_hex(ec)
+    report_str(" elr=")
+    report_hex(elr)
+    report_str(" far=")
+    report_hex(far)
+    report_str("\n")
+    exit_fail(ec)
+}
+
+// =============================================================================
+// The static identity map: this profile's isolation primitive
+// =============================================================================
+//
+// Spec §5b: on Profile B an AddressSpace is a page-table root. M1b implements
+// the STATIC parity of Profile A's PMP and nothing more (design 162 decision
+// 2): one identity map, built once at boot, whose only mutable part is the EL0
+// permission bits of the pages a root image was granted. No dynamic mapping, no
+// ASIDs, no address-space switch — Mapping objects are M2.
+//
+// The shape:
+//
+//   level 1 (1 GiB entries, 39-bit VA out of the low translation base)
+//     [0]  0x0000_0000  device block, EL1 RW, never executable
+//     [1]  0x4000_0000  -> level 2
+//     rest             INVALID, which is what makes UNMAPPED_PROBE fault
+//   level 2 (2 MiB entries over RAM)
+//     [0], [1]         -> level 3 tables: the GRANT WINDOW, page-granular
+//     rest             2 MiB blocks, EL1 RW, no EL0
+//   level 3 (4 KiB pages over the first 4 MiB of RAM)
+//     reset state      EL1 read/write/EXECUTE, no EL0 access at all
+//     granted pages    EL0 RO or RW, never EL0-writable-and-executable
+//
+// The grant window covers the kernel image AND the root region, because BOTH
+// need page granularity: the root region obviously, and the kernel image
+// because the harness's unit-A cases grant a payload that executes in place
+// inside it. Everything outside the window is EL1-only, so EL0 default-deny is
+// the same property PMP gives Profile A for free — a page EL0 was never granted
+// is a translation fault, not a permitted access.
+//
+// The kernel's own pages stay EL1-RWX: that is the arm64 spelling of "M-mode is
+// unconstrained", not a claim about kernel W^X, which neither profile has yet.
+//
+// DESIGN 172 UNIT 1: all of the above is arithmetic and 64-bit stores, so it is
+// Saw. What stays native is the ACTIVATION — four `msr`s, a barrier pair and a
+// TLB flush — because a system register is named at assembly time. `sink.c` is
+// that leaf and nothing else: it asks this file for a finished table and turns
+// the MMU on.
+
+/// The three translation tables, back to back: 512 level-1 descriptors, 512
+/// level-2, then 1024 level-3 covering the grant window.
+///
+/// ONE region with a page of slack rather than three arrays, because the
+/// hardware requires each table to be page-aligned and Saw has no alignment
+/// attribute on a static. Rounding the base up at run time costs three
+/// instructions at boot and asks nothing of the linker script — which matters,
+/// because the linker script is per-profile and the shape of this is not.
+///
+/// All-zero, so it costs no image bytes (design 149). An unwritten descriptor
+/// is INVALID, which is the state a default-deny map wants anyway.
+unsafe static var PAGE_TABLES: [UInt64; 512 + 512 + 1024 + 512] = [0u64; 512 + 512 + 1024 + 512]
+
+/// Descriptors per table at the 4 KiB granule: a table is one page of 8-byte
+/// entries.
+static PT_ENTRIES: UInt = 512
+/// Pages the level-3 tables cover — 4 MiB reachable at page granularity.
+static GRANT_PAGES: UInt = 1024
+static PAGE_SIZE: UInt = 4096
+static DESC_BYTES: UInt = 8
+/// Byte offsets of the second and third tables within `PAGE_TABLES`.
+static LEVEL2_OFFSET: UInt = 4096
+static LEVEL3_OFFSET: UInt = 8192
+
+static RAM_BASE: UInt = 0x40000000
+static PAGE_SHIFT: Int = 12
+static BLOCK_SHIFT: Int = 21              // a level-2 block is 2 MiB
+static MAIR_INDEX_SHIFT: Int = 2          // descriptor bits 4:2
+
+// Descriptor bits (ARMv8-A VMSA, 4 KiB granule). Each is a lone architectural
+// bit position — a standalone quantity, which is what a `static` is for. The
+// two descriptor fields that are genuinely a CLOSED SET of alternatives are the
+// enums below, where an exhaustive `match` and a pinned value are worth having.
+static DESC_VALID: UInt64 = 0x1u64
+static DESC_BLOCK: UInt64 = 0x0u64        // bit 1 clear at levels 1-2
+static DESC_TABLE: UInt64 = 0x2u64        // bit 1 set at levels 1-2
+static DESC_PAGE: UInt64 = 0x2u64         // at level 3 the same bit means "page"
+static ATTR_SH_INNER: UInt64 = 0x300u64   // bits 9:8 — inner shareable
+static ATTR_AF: UInt64 = 0x400u64         // bit 10 — access flag
+static ATTR_PXN: UInt64 = 0x20000000000000u64   // bit 53 — no execute at EL1
+static ATTR_UXN: UInt64 = 0x40000000000000u64   // bit 54 — no execute at EL0
+
+/// The access-permission field, descriptor bits 7:6. Exactly one of the four is
+/// in a descriptor, which is what makes this an enum rather than four constants
+/// that could be OR-ed together by accident.
+enum AccessPerm: UInt64 {
+    case El1Rw = 0,          // EL1 read/write, EL0 no access
+    case El0Rw = 64,         // EL1 + EL0 read/write
+    case El1Ro = 128,        // EL1 read-only, EL0 no access
+    case El0Ro = 192,        // EL1 + EL0 read-only
+}
+
+/// Which memory-attribute index a descriptor selects. The case VALUE is the
+/// index, and `mair_value()` below builds the register those indices describe
+/// out of the same cases — so a type added here cannot leave its attribute byte
+/// behind.
+enum MemoryType: UInt64 {
+    case Device = 0,         // Device-nGnRnE
+    case Normal = 1,         // Normal, write-back, read/write-allocate
+}
+
+extension MemoryType {
+    /// This type as the attribute-index bits of a descriptor.
+    func attr_index(&self) -> UInt64 {
+        (self as UInt64) << MAIR_INDEX_SHIFT
+    }
+}
+
+static MAIR_ATTR_DEVICE: UInt = 0x00
+static MAIR_ATTR_NORMAL: UInt = 0xFF
+static BITS_PER_MAIR_ATTR: Int = 8
+
+/// The memory-attribute register the `MemoryType` indices describe: one byte
+/// per index, low index first.
+///
+/// It crosses to the C activation leaf with the table address, rather than
+/// being spelled again there, because it is the OTHER HALF of the descriptor
+/// encoding this file owns — a memory type added above would otherwise need a
+/// matching edit in C with nothing to catch a missed one.
+@export("sos_mair_value")
+public func mair_value() -> UInt {
+    ((MAIR_ATTR_DEVICE << (BITS_PER_MAIR_ATTR * ((MemoryType.Device as UInt64) as Int)))
+     | (MAIR_ATTR_NORMAL << (BITS_PER_MAIR_ATTR * ((MemoryType.Normal as UInt64) as Int))))
+}
+
+/// This HAL's own failure code, distinct from anything the kernel or root
+/// chooses. A grant the window cannot express is a kernel bug, not an image
+/// problem, so it does not travel through the loader's `fatal_image`.
+static ABORT_GRANT_OUTSIDE_WINDOW: UInt = 66
+
+/// Round `v` up to the next multiple of `align` (a power of two).
+///
+/// The kernel core has one of these too and they are deliberately not shared:
+/// a HAL that had to import the kernel to build its own page tables would be
+/// the wrong way round.
+func align_up(v: UInt, align: UInt) -> UInt {
+    let rem = v & (align - 1)
+    if rem == 0 {
+        v
+    } else {
+        v + (align - rem)
+    }
+}
+
+/// The page-aligned base of the three tables.
+func tables_base() unsafe -> UInt {
+    align_up(((&var PAGE_TABLES) as UnsafePointer<UInt64>) as UInt, PAGE_SIZE)
+}
+
+/// Write descriptor `index` of the table at `table`.
+func put_desc(table: UInt, index: UInt, desc: UInt64) unsafe {
+    UnsafeMemory<UInt64, Normal>(table + index * DESC_BYTES).write(desc)
+}
+
+/// A grant-window page as the KERNEL sees it: read, write and execute at EL1,
+/// nothing at EL0.
+func kernel_page(va: UInt) -> UInt64 {
+    ((va as UInt64) | DESC_VALID | DESC_PAGE | MemoryType.Normal.attr_index()
+     | ATTR_AF | ATTR_SH_INNER | (AccessPerm.El1Rw as UInt64) | ATTR_UXN)
+}
+
+/// Every page of the window back to kernel-only.
+func reset_window(level3: UInt) unsafe {
+    var i: UInt = 0
+    while i < GRANT_PAGES {
+        put_desc(level3, i, kernel_page(RAM_BASE + (i << PAGE_SHIFT)))
+        i = i + 1
+    }
+}
+
+/// Build the identity map and hand back the level-1 table's address, which is
+/// what the low translation base register wants.
+///
+/// Called by `sink.c`'s activation leaf before it turns the MMU on, so this
+/// runs with translation OFF and physical == virtual. It must follow the `.bss`
+/// zerofill, because that is where `PAGE_TABLES` lives.
+@export("sos_page_tables_build")
+public func page_tables_build() unsafe -> UInt {
+    let level1 = tables_base()
+    let level2 = level1 + LEVEL2_OFFSET
+    let level3 = level1 + LEVEL3_OFFSET
+
+    // Level 1: the device window below RAM, a table over RAM, and nothing else
+    // — every other entry stays zero, i.e. INVALID.
+    put_desc(level1, 0,
+             DESC_VALID | DESC_BLOCK | MemoryType.Device.attr_index() | ATTR_AF
+             | (AccessPerm.El1Rw as UInt64) | ATTR_PXN | ATTR_UXN)
+    put_desc(level1, 1, (level2 as UInt64) | DESC_VALID | DESC_TABLE)
+
+    // Level 2: 2 MiB blocks over RAM, EL1 only.
+    var i: UInt = 0
+    while i < PT_ENTRIES {
+        put_desc(level2, i,
+                 ((RAM_BASE + (i << BLOCK_SHIFT)) as UInt64)
+                 | DESC_VALID | DESC_BLOCK | MemoryType.Normal.attr_index()
+                 | ATTR_AF | ATTR_SH_INNER | (AccessPerm.El1Rw as UInt64) | ATTR_UXN)
+        i = i + 1
+    }
+
+    // ...except the first few, which point at the level-3 tables instead: the
+    // grant window, where permissions are editable a page at a time.
+    var t: UInt = 0
+    while t < GRANT_PAGES / PT_ENTRIES {
+        put_desc(level2, t,
+                 ((level3 + t * PT_ENTRIES * DESC_BYTES) as UInt64)
+                 | DESC_VALID | DESC_TABLE)
+        t = t + 1
+    }
+
+    reset_window(level3)
+    level1
+}
+
+/// A grant the window cannot express. Never returns.
+///
+/// Skipping the page would be safe in the deny direction — EL0 simply would not
+/// reach it — but it would mean the kernel silently granted LESS than it was
+/// asked for, and the symptom would be a user-mode fault at some unrelated
+/// later address. The only way to get here is a memory map that outgrew the
+/// window, which is a kernel bug and reads as one.
+func grant_outside_window(va: UInt) {
+    report_str("SOS: grant outside the page-granular window: ")
+    report_hex(va)
+    report_str("\n")
+    exit_fail(ABORT_GRANT_OUTSIDE_WINDOW)
+}
+
+/// Revoke every grant. User mode then reaches nothing at all — the default-deny
+/// the grants below carve out of.
+public func prot_reset() unsafe {
+    reset_window(tables_base() + LEVEL3_OFFSET)
+}
+
+/// Stage grant `idx` as [base, top) with `perms`, a mask in the `SegFlag`
+/// vocabulary.
+///
+/// `idx` is unused here: PMP has a fixed number of NUMBERED regions and this
+/// profile has pages, so the index is a Profile-A budget concept the seam
+/// carries for both.
+///
+/// A grant installs exactly the permissions the image asked for — the same
+/// contract Profile A's PMP has, so the two profiles cannot disagree about what
+/// an image means. (W^X is the linker script's property and the loader's
+/// `has_sane_perms` validation; silently dropping a bit the image asked for
+/// would be the kind of quiet no-op that hides a bad image rather than refusing
+/// it.) `PXN` is the one thing added unconditionally: the kernel must not
+/// execute user memory even by accident, which is a guarantee Profile A's
+/// unconstrained M-mode cannot make.
+public func prot_region(idx: UInt, base: UInt, top: UInt, perms: UInt8) unsafe {
+    let level3 = tables_base() + LEVEL3_OFFSET
+    var attrs = (DESC_VALID | DESC_PAGE | MemoryType.Normal.attr_index() | ATTR_AF
+                 | ATTR_SH_INNER | ATTR_PXN)
+    if (perms & (SegFlag.Write as UInt8)) != 0u8 {
+        attrs = attrs | (AccessPerm.El0Rw as UInt64)
+    } else {
+        attrs = attrs | (AccessPerm.El0Ro as UInt64)
+    }
+    if (perms & (SegFlag.Execute as UInt8)) == 0u8 {
+        attrs = attrs | ATTR_UXN
+    }
+    // The bound is tested BEFORE the subtraction that would compute the page
+    // index: `va - RAM_BASE` underflows below the base, and overflow checks are
+    // always on, so the order is what turns a bad map into a diagnostic rather
+    // than into a panic from inside the protection primitive.
+    var va = base - (base & (PAGE_SIZE - 1))
+    while va < top {
+        if va < RAM_BASE {
+            grant_outside_window(va)
+        }
+        let page = (va - RAM_BASE) >> PAGE_SHIFT
+        if page >= GRANT_PAGES {
+            grant_outside_window(va)
+        }
+        put_desc(level3, page, (va as UInt64) | attrs)
+        va = va + PAGE_SIZE
+    }
 }
