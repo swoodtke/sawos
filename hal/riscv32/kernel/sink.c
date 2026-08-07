@@ -1,17 +1,33 @@
-// SOS riscv32 KERNEL HAL (design 140) — the board and the CSRs.
+// SOS riscv32 KERNEL HAL, native half (designs 140, 172).
 //
-// Everything in the kernel's runtime that knows it is riscv32 on QEMU `virt`:
-// the two per-side hooks `sos/rt/common_c/support.c` calls out to, the PMP
-// helpers (CSR writes need assembly-time immediates), and the linker-symbol
-// accessors Saw cannot express. `boot.S` beside this file is the rest.
+// EVERY LINE IN THIS FILE IS C FOR ONE OF TWO REASONS, and each function states
+// its own:
 //
-// `sos/hal/riscv32/user/` is the process-side counterpart. M1b (design 79)
-// adds `sos/hal/arm64/kernel/` and `.../user/` beside these — the layout is
-// chosen so that milestone ADDS directories rather than moving any.
+//   1. a CSR NUMBER is an assembly-time immediate — `csrw pmpaddr3, x` names
+//      the register in the instruction, so a computed index has to become a
+//      switch and there is no Saw spelling for any of it;
+//   2. a LINKER SYMBOL's ADDRESS, which Saw cannot name (DF-172a in
+//      designs/todo.md: `extern` declares only functions, an extern function is
+//      not usable as a value, and `@export` on a static emits a DEFINITION
+//      rather than a reference).
+//
+// What used to be here and is now `lib.saw`: the NS16550A write loop, the
+// finisher write that stops the machine, and all of the PMP region arithmetic —
+// the config-word staging, the TOR pairing and the grant budget. This file
+// programs the registers it is handed and decides nothing.
+//
+// `boot.S` beside this file is the trap entry and the M -> U transition;
+// `sos/hal/riscv32/user/` is the process-side counterpart.
 
 typedef unsigned int   u32;
 typedef unsigned char  u8;
 typedef unsigned long  usize;
+
+// ---- the board's console and its stop button ------------------------------
+//
+// NOT YET DIETED — design 172 unit 4 moves both. They are the runtime seams'
+// two hooks, including the panic seam's, which is why the replacement has to be
+// check-free by construction rather than merely correct.
 
 #define UART_BASE    0x10000000u
 #define UART_THR     0x0u
@@ -21,12 +37,6 @@ typedef unsigned long  usize;
 #define FINISH_FAIL  0x3333u
 #define FAIL_CODE_SHIFT 16u
 
-// ---- the two hooks the common runtime calls -------------------------------
-
-// The kernel owns the machine, so its console is the UART directly. (The Saw
-// side drives the same device through the design-112 `UnsafeMemory` driver;
-// this exists because the panic seam has to work even when Saw code is what
-// panicked.)
 void sos_rt_write(const char *ptr, usize len) {
     volatile u8 *lsr = (volatile u8 *)(UART_BASE + UART_LSR);
     volatile u8 *thr = (volatile u8 *)(UART_BASE + UART_THR);
@@ -49,41 +59,27 @@ void sos_rt_abort(u32 code) {
 
 // ---- the appended payload -------------------------------------------------
 //
-// The root image rides after the kernel in the same ELF, in the `.payload`
-// section virt.ld bounds with `_payload_start` / `_payload_end`. Saw cannot
-// name a linker symbol, so the bounds arrive through these accessors. An image
-// with no payload gets an empty section and start == end.
+// C BECAUSE: a linker symbol's address (reason 2 above). The root image rides
+// after the kernel in the same ELF, in the `.payload` section virt.ld bounds
+// with `_payload_start` / `_payload_end`. An image with no payload gets an
+// empty section and start == end.
 
 extern unsigned char _payload_start[];
 extern unsigned char _payload_end[];
 
-u32 sos_payload_start(void) { return (u32)(usize)_payload_start; }
-u32 sos_payload_end(void)   { return (u32)(usize)_payload_end; }
+u32 sos_payload_start(void) { return (u32)(unsigned long)_payload_start; }
+u32 sos_payload_end(void)   { return (u32)(unsigned long)_payload_end; }
 
-// ---- PMP: the Profile A isolation primitive -------------------------------
+// ---- PMP register access --------------------------------------------------
 //
-// Spec §5.5: on Profile A an AddressSpace IS a PMP region set. RISC-V gives us
-// default-deny for free — "if no PMP entry matches a U-mode access, and at
-// least one entry is implemented, the access fails" — so the kernel, the UART
-// and the finisher are locked away from root by SAYING NOTHING about them. The
-// kernel grants root exactly its own ranges. M-mode is unconstrained because
-// SOS never sets an entry's L (lock) bit.
+// C BECAUSE: the CSR number is an assembly-time immediate (reason 1 above),
+// which is why an indexed write is a switch rather than a loop.
 //
-// A region is a TOR pair: entry 2*idx holds the lower bound with A=OFF (a bound
-// only, never matched), entry 2*idx+1 holds the upper bound with A=TOR plus the
-// R/W/X bits. Addresses are stored shifted right by two — PMP's 4-byte grain.
-// The M1 budget is PMP_REGIONS regions / 8 of the 16 entries QEMU implements;
-// the layout is recorded in virt.ld.
+// What a region MEANS — the TOR pair, the config bits, which entries the board
+// budget spends, what a sosimg permission mask becomes — is `lib.saw`'s
+// (design 172 unit 1). These two functions place words in registers.
 
-#define PMP_A_TOR    (1u << 3)
-#define PMP_REGIONS  4
-
-static u32 pmpcfg_lo;       // entries 0-3
-static u32 pmpcfg_hi;       // entries 4-7
-
-static void pmpaddr_write(u32 i, u32 v) {
-    // The CSR number must be an assembly-time immediate, so this is a switch
-    // rather than a computed index.
+void sos_pmpaddr_write(u32 i, u32 v) {
     switch (i) {
     case 0: __asm__ volatile("csrw pmpaddr0, %0" :: "r"(v)); break;
     case 1: __asm__ volatile("csrw pmpaddr1, %0" :: "r"(v)); break;
@@ -97,39 +93,9 @@ static void pmpaddr_write(u32 i, u32 v) {
     }
 }
 
-// Clear every entry. Called before programming a fresh region set.
-void sos_pmp_reset(void) {
-    pmpcfg_lo = 0;
-    pmpcfg_hi = 0;
-    __asm__ volatile("csrw pmpcfg0, zero" ::: "memory");
-    __asm__ volatile("csrw pmpcfg1, zero" ::: "memory");
-    for (u32 i = 0; i < PMP_REGIONS * 2u; i++) {
-        pmpaddr_write(i, 0);
-    }
-}
-
-// Stage region `idx` as [base, top) with `perm` (bit 0 R, bit 1 W, bit 2 X).
-// Out-of-budget indices are ignored here and rejected by the caller, which owns
-// the diagnostic.
-void sos_pmp_region(u32 idx, u32 base, u32 top, u32 perm) {
-    if (idx >= PMP_REGIONS) {
-        return;
-    }
-    u32 lo = idx * 2u;
-    u32 hi = lo + 1u;
-    pmpaddr_write(lo, base >> 2);
-    pmpaddr_write(hi, top >> 2);
-    u32 cfg = (perm & 0x7u) | PMP_A_TOR;
-    if (hi < 4u) {
-        pmpcfg_lo |= cfg << (8u * hi);
-    } else {
-        pmpcfg_hi |= cfg << (8u * (hi - 4u));
-    }
-}
-
-// Publish the staged region set. Separate from `sos_pmp_region` so a partially
-// programmed set is never live.
-void sos_pmp_commit(void) {
-    __asm__ volatile("csrw pmpcfg0, %0" :: "r"(pmpcfg_lo) : "memory");
-    __asm__ volatile("csrw pmpcfg1, %0" :: "r"(pmpcfg_hi) : "memory");
+// The two config registers covering entries 0-3 and 4-7, written together so a
+// partially programmed region set is never live.
+void sos_pmpcfg_write(u32 lo, u32 hi) {
+    __asm__ volatile("csrw pmpcfg0, %0" :: "r"(lo) : "memory");
+    __asm__ volatile("csrw pmpcfg1, %0" :: "r"(hi) : "memory");
 }

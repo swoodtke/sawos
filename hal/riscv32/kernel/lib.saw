@@ -15,7 +15,7 @@
 // The image-format registry, for this profile's arch tag. The format is shared
 // with everyone who touches an image; the tag a HAL claims comes out of it
 // rather than being spelled again here.
-import imgformat.{SosimgArch}
+import imgformat.{SosimgArch, SegFlag}
 
 // =============================================================================
 // NS16550A UART (design 112's blessed MMIO idiom: register block + driver)
@@ -197,14 +197,15 @@ public func exit_fail(code: UInt) unsafe {
 // Privilege, protection and payload seams (boot.S / sink.c)
 // =============================================================================
 
-// The C half of this HAL. The names stay the hardware's — PMP is what these
-// program — because this file is where the arch-free `prot_*` vocabulary above
-// meets the machine.
+// The C half of this HAL, and since design 172 unit 1 the whole of it: a
+// privilege transition, two CSR writers, and two linker symbols. What a PMP
+// region MEANS is staged in Saw below; C only places a word in a numbered
+// register, because a `csrw` names its CSR in the INSTRUCTION. See `sink.c`'s
+// header for the reason each survivor carries.
 extern "C" {
     func sos_enter_user(entry: UInt, stack_top: UInt, boot_handle: UInt)
-    func sos_pmp_reset()
-    func sos_pmp_region(idx: UInt, base: UInt, top: UInt, perm: UInt)
-    func sos_pmp_commit()
+    func sos_pmpaddr_write(index: UInt, value: UInt)
+    func sos_pmpcfg_write(lo: UInt, hi: UInt)
     func sos_payload_start() -> UInt
     func sos_payload_end() -> UInt
 }
@@ -233,23 +234,89 @@ public static ROOT_STACK_LEN: UInt = 0x4000
 /// one succeeds.
 public static UNMAPPED_PROBE: UInt = 0x00000000
 
+// =============================================================================
+// PMP: the Profile A isolation primitive
+// =============================================================================
+//
+// Spec §5.5: on Profile A an AddressSpace IS a PMP region set. RISC-V gives us
+// default-deny for free — "if no PMP entry matches a U-mode access, and at
+// least one entry is implemented, the access fails" — so the kernel, the UART
+// and the finisher are locked away from root by SAYING NOTHING about them. The
+// kernel grants root exactly its own ranges. M-mode is unconstrained because
+// SOS never sets an entry's L (lock) bit.
+//
+// A region is a TOR pair: entry 2*idx holds the lower bound with A=OFF (a bound
+// only, never matched), entry 2*idx+1 holds the upper bound with A=TOR plus the
+// R/W/X bits. Bounds are stored shifted right by two — PMP's 4-byte grain. The
+// M1 budget is `PMP_REGIONS` regions out of the eight entries `sink.c`'s switch
+// covers; the layout is recorded in virt.ld.
+//
+// DESIGN 172 UNIT 1: all of that is arithmetic, so it is Saw. What stays native
+// is placing a word in a NUMBERED CSR, because `csrw pmpaddr3, x` names the
+// register in the instruction and an indexed write therefore has to be a switch
+// in assembly. Profile B makes the same split at the same seam: descriptors in
+// Saw, the activation instructions in C.
+
+/// Regions the board budget programs, as TOR pairs out of the eight entries
+/// `sink.c` can reach.
+static PMP_REGIONS: UInt = 4
+static PMP_A_TOR: UInt = 0x8              // cfg bits 4:3 = 1 (top-of-range)
+static PMP_PERM_MASK: UInt = 0x7          // cfg bits 2:0 — R, W, X
+static PMP_GRAIN_SHIFT: Int = 2           // bounds are stored >> 2
+static PMP_CFGS_PER_WORD: UInt = 4
+static BITS_PER_PMP_CFG: Int = 8
+
+/// The two `pmpcfg` shadow words — entries 0-3 and 4-7.
+///
+/// Compound global state: staged across several `prot_region` calls and
+/// published by one `prot_commit`, with no cheap way to read the hardware back.
+/// That is the shape design 149's `unsafe static var` exists for, and the
+/// serialization argument is spec §7's — uniprocessor, no interrupt sources in
+/// M1, and only the boot path touches these.
+unsafe static var PMPCFG_LO: UInt = 0
+unsafe static var PMPCFG_HI: UInt = 0
+
 /// Revoke every grant. User mode then reaches nothing at all — the default-deny
 /// the grants below carve out of.
-public func prot_reset() {
-    sos_pmp_reset()
+public func prot_reset() unsafe {
+    PMPCFG_LO = 0
+    PMPCFG_HI = 0
+    sos_pmpcfg_write(0, 0)
+    var i: UInt = 0
+    while i < PMP_REGIONS * 2 {
+        sos_pmpaddr_write(i, 0)
+        i = i + 1
+    }
 }
 
 /// Stage grant `idx` as [base, top) with `perms`, a mask in the `SegFlag`
-/// vocabulary. On this target the bits ARE a PMP config's low three bits, so
-/// the mask installs untranslated.
-public func prot_region(idx: UInt, base: UInt, top: UInt, perms: UInt8) {
-    sos_pmp_region(idx, base, top, perms as UInt)
+/// vocabulary. On this target those bits ARE a PMP config's low three bits
+/// (`imgformat` says why the format numbers them that way), so the mask
+/// installs untranslated.
+///
+/// An out-of-budget index is ignored here and rejected by the caller, which
+/// owns the diagnostic.
+public func prot_region(idx: UInt, base: UInt, top: UInt, perms: UInt8) unsafe {
+    if idx >= PMP_REGIONS {
+        return
+    }
+    let lo = idx * 2
+    let hi = lo + 1
+    sos_pmpaddr_write(lo, base >> PMP_GRAIN_SHIFT)
+    sos_pmpaddr_write(hi, top >> PMP_GRAIN_SHIFT)
+    let cfg = ((perms as UInt) & PMP_PERM_MASK) | PMP_A_TOR
+    if hi < PMP_CFGS_PER_WORD {
+        PMPCFG_LO = PMPCFG_LO | (cfg << (BITS_PER_PMP_CFG * (hi as Int)))
+    } else {
+        PMPCFG_HI = (PMPCFG_HI
+                     | (cfg << (BITS_PER_PMP_CFG * ((hi - PMP_CFGS_PER_WORD) as Int))))
+    }
 }
 
 /// Publish the staged grant set. Separate from `prot_region` so a partially
 /// programmed set is never live.
-public func prot_commit() {
-    sos_pmp_commit()
+public func prot_commit() unsafe {
+    sos_pmpcfg_write(PMPCFG_LO, PMPCFG_HI)
 }
 
 /// Drop to user mode at `entry` with `stack_top` as the stack pointer, handing
