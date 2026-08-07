@@ -18,6 +18,15 @@
 //! the CALLING CONVENTION (§5.7: handle in a0, op in a7), and that lives in the
 //! per-arch HAL stub, not here.
 //!
+//! WHY THESE ARE ENUMS AND NOT STATICS (design 145/153). Every family here is a
+//! CLOSED NAMED SET of values, which is what an Int-inheriting enum is for: it
+//! names the set, PINS the numbers so a reorder cannot renumber them, gives the
+//! dispatch an exhaustive `match`, and turns the read at the trap boundary into
+//! `from(raw:)` — a total function returning `E?`, so an unrecognized number is
+//! DATA the kernel rejects rather than an index it trusts. The parallel statics
+//! this replaced (`OP_SYSTEM_DEBUG_PRINT`, `SYS_ERR_BAD_OP`, …) could be
+//! compared against anything and validated only by a hand-written `> MAX` test.
+//!
 //! Delivery in v1 is static linking through the manifest/module-path
 //! mechanism. A genuinely mapped vDSO is an object-model-era upgrade that
 //! changes none of the above.
@@ -26,51 +35,126 @@
 // Object types
 // =============================================================================
 
-/// A handle that names nothing. Handle 0 is reserved so a zeroed register can
-/// never be mistaken for authority.
-public static OBJ_NONE: UInt = 0
-public static OBJ_SYSTEM: UInt = 1
+/// What a handle-table entry names.
+///
+/// `Unbound` is the reserved zero: handle 0 names nothing, so a zeroed register
+/// can never be mistaken for authority, and a table slot that was never filled
+/// reads as "no object" rather than as object type 0.
+///
+/// A `UInt8` backing because this is a kernel-internal field in `HandleEntry`,
+/// never a number that crosses the trap boundary.
+public enum ObjType: UInt8 {
+    case Unbound = 0,
+    case System = 1,
+}
 
 // =============================================================================
 // Rights (spec §3)
 // =============================================================================
-//
-// A bitmask, and attenuation is MONOTONIC — a derivation may only ever strip
-// bits. Rights are checked per-OP, not per-object: holding a handle is not the
-// same as being allowed to use every part of what it names.
 
-public static RIGHT_DEBUG: UInt = 1
-public static RIGHT_SHUTDOWN: UInt = 2
+/// One right, as the BIT it occupies in a rights mask.
+///
+/// Rights are a bitmask and attenuation is MONOTONIC — a derivation may only
+/// ever strip bits. They are checked per-OP, not per-object: holding a handle is
+/// not the same as being allowed to use every part of what it names.
+///
+/// The enum names the individual bits; a MASK stays a plain `UInt`, because a
+/// set of bits is not one of the cases. `HandleEntry.allows` is how the kernel
+/// asks the question, so `&` and a bare `1` appear in one place rather than at
+/// every call site.
+public enum Right: UInt {
+    case Debug = 1,
+    case Shutdown = 2,
+}
 
 /// What the kernel mints for root's System handle at boot (§12).
-public static ROOT_SYSTEM_RIGHTS: UInt = 3      // RIGHT_DEBUG | RIGHT_SHUTDOWN
+///
+/// A function rather than a `static` because a static initializer takes plain
+/// literals only — and `3` with a comment saying which bits it is made of is
+/// exactly the magic number this file is getting rid of.
+public func root_system_rights() -> UInt {
+    (Right.Debug as UInt) | (Right.Shutdown as UInt)
+}
 
 // =============================================================================
 // The System object's op table (spec §2)
 // =============================================================================
-//
-// These are METHOD IDS on the System object, not global syscall numbers.
-// Another object type numbers its own ops from zero, and the pair (handle, op)
-// is what selects an implementation.
 
-public static OP_SYSTEM_DEBUG_PRINT: UInt = 0
-public static OP_SYSTEM_SHUTDOWN: UInt = 1
-public static OP_SYSTEM_MAX: UInt = 1
+/// A METHOD ID on the System object — not a global syscall number. Another
+/// object type numbers its own ops from zero, and the pair (handle, op) is what
+/// selects an implementation.
+///
+/// Backed by `UInt`, the width of the register the op arrives in (a7), because
+/// that value is PROCESS-CONTROLLED. A narrower backing would need the kernel to
+/// truncate a7 before `from(raw:)` could look at it, and `0x100` would then
+/// arrive as a valid `DebugPrint` — a hostile process picking an op it was
+/// refused. At register width the conversion is exact and `from(raw:)` rejects
+/// every number that is not an op, which is also what retired `OP_SYSTEM_MAX`:
+/// the range check and the decode are now one operation instead of two that
+/// could disagree.
+public enum SysOp: UInt {
+    case DebugPrint = 0,
+    case Shutdown = 1,
+}
 
 // =============================================================================
 // Status words (spec §5.7)
 // =============================================================================
-//
-// Returned in a0. A failing op RETURNS one of these and the process keeps
-// running — a caller's mistake is an error, not a fault. These tags ARE part of
-// the contract in a way the op numbers are not, because a process branches on
-// them; the `sos` module maps them to a typed `SysError` so userspace branches
-// on names.
 
-public static SYS_OK: UInt = 0
-public static SYS_ERR_BAD_HANDLE: UInt = 1
-public static SYS_ERR_BAD_OP: UInt = 2
-public static SYS_ERR_ACCESS_DENIED: UInt = 3
+/// The status a syscall returns in a0.
+///
+/// A failing op RETURNS one of these and the process keeps running — a caller's
+/// mistake is an error, not a fault. These tags ARE part of the contract in a
+/// way the op numbers are not, because a process branches on them, so the
+/// backing is FIXED-WIDTH (design 47: a value that crosses an ABI pins its
+/// width) even though the register carrying it is wider.
+///
+/// `Ok` is a case because this enum is the wire table and 0 is in it. It is the
+/// one value that is not a failure, and `sos`'s `checked` is the single place
+/// that turns it into `Ok(())`.
+///
+/// `Unknown` is NOT a status the kernel returns. It is where the userspace
+/// mapping's `from(raw:)` miss lands, so a tag this build does not define stays
+/// a typed error instead of being read as success. In M1 it is unreachable —
+/// both halves compile from this one declaration — and it exists for the build
+/// skew that static linking makes impossible today and a mapped vDSO will not.
+public enum SysError: UInt8 {
+    case Ok = 0,
+    case BadHandle = 1,
+    case BadOp = 2,
+    case AccessDenied = 3,
+    case Unknown = 255,
+}
+
+public extension SysError {
+    /// A short human-readable tag, for a diagnostic or a log line.
+    public func describe(&self) -> String {
+        match self {
+            case Ok -> "ok",
+            case BadHandle -> "bad handle",
+            case BadOp -> "bad op",
+            case AccessDenied -> "access denied",
+            case Unknown -> "unknown status",
+        }
+    }
+
+    /// Whether this status reports a failure. The inverse of `Ok`, named so a
+    /// caller reads intent rather than a comparison.
+    public func is_failure(&self) -> Bool {
+        match self {
+            case Ok -> false,
+            case _ -> true,
+        }
+    }
+}
+
+public extension SysError: Printable {
+    public func format(&self, into: &var StringBuilder) {
+        into.append(self.describe())
+    }
+}
+
+public extension SysError: Error {}
 
 // =============================================================================
 // The boot handle set (spec §12)

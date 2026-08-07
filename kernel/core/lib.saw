@@ -21,7 +21,10 @@ import sosrt.{ascii_byte, hex_digit_of, HEX_DIGITS_PER_WORD}
 
 // The call numbers. Kernel-internal and shared with the `sos` module the kernel
 // exports (sos/kernel/sysapi/) — one definition, two halves of one contract.
-import sosabi.{OBJ_NONE, OBJ_SYSTEM, RIGHT_DEBUG, RIGHT_SHUTDOWN, OP_SYSTEM_DEBUG_PRINT, OP_SYSTEM_SHUTDOWN, OP_SYSTEM_MAX, SYS_OK, SYS_ERR_BAD_HANDLE, SYS_ERR_BAD_OP, SYS_ERR_ACCESS_DENIED, ROOT_SYSTEM_HANDLE, ROOT_SYSTEM_RIGHTS, NO_USER_STACK}
+import sosabi.{
+    ObjType, Right, SysOp, SysError,
+    root_system_rights, ROOT_SYSTEM_HANDLE, NO_USER_STACK,
+}
 
 // =============================================================================
 // NS16550A UART (design 112's blessed MMIO idiom: register block + driver)
@@ -213,9 +216,23 @@ static CAUSE_ECALL_FROM_U: UInt = 8
 
 /// One handle-table entry: the object a handle names and the rights its holder
 /// has on it (§3). The kernel validates both on every op.
+///
+/// `obj_type` is the typed tag; `rights` stays a plain `UInt` because it is a
+/// MASK — a set of `Right` bits, not one of them.
 struct HandleEntry {
-    obj_type: UInt,
+    obj_type: ObjType,
     rights: UInt,
+}
+
+extension HandleEntry {
+    /// Whether this entry's holder may perform an op requiring `right`.
+    ///
+    /// The mask arithmetic lives here rather than at each call site, so the
+    /// dispatch below reads as the question it is asking and there is one place
+    /// to change when rights become a wider word.
+    func allows(&self, right: Right) -> Bool {
+        (self.rights & (right as UInt)) != 0
+    }
 }
 
 /// `ecall` is a 4-byte instruction — `mepc` points AT it, so a returning
@@ -365,54 +382,61 @@ public func fatal(tag: String, cause: UInt, epc: UInt, tval: UInt, code: UInt) {
 /// stale-handle detection — §3) lands with the object model.
 func lookup_handle(handle: UInt) -> HandleEntry {
     if handle == ROOT_SYSTEM_HANDLE {
-        HandleEntry(obj_type: OBJ_SYSTEM, rights: ROOT_SYSTEM_RIGHTS)
+        HandleEntry(obj_type: ObjType.System, rights: root_system_rights())
     } else {
-        HandleEntry(obj_type: OBJ_NONE, rights: 0)
+        HandleEntry(obj_type: ObjType.Unbound, rights: 0)
     }
 }
 
-/// The System object's ops (§2). Returns a status word; `shutdown` does not
-/// return at all.
-func system_op(op: UInt, entry: &HandleEntry, arg0: UInt) unsafe -> UInt {
-    if op > OP_SYSTEM_MAX {
-        return SYS_ERR_BAD_OP
+/// The System object's ops (§2). Returns a status; `shutdown` does not return
+/// at all.
+///
+/// `op` arrives as the raw a7 word, which a process chooses, so it is DECODED
+/// rather than compared: `SysOp.from(raw:)` accepts exactly the numbers that
+/// are ops and hands back `None` for every other, which is both the range check
+/// and the dispatch in one step. The `match` is then exhaustive, so adding an
+/// op to `sosabi` makes this function fail to compile until it is handled —
+/// which is what the old `op > OP_SYSTEM_MAX` test could never do.
+func system_op(raw_op: UInt, entry: &HandleEntry, arg0: UInt) unsafe -> SysError {
+    guard let op = SysOp.from(raw: raw_op) else {
+        return SysError.BadOp
     }
 
-    if op == OP_SYSTEM_DEBUG_PRINT {
+    match op {
         // The rights check is per-OP, not per-object: holding the System
         // handle is not the same as being allowed to use every part of it.
-        if (entry.rights & RIGHT_DEBUG) == 0 {
-            return SYS_ERR_ACCESS_DENIED
-        }
-        console().write_byte((arg0 & BYTE_MASK) as UInt8)
-        return SYS_OK
+        case DebugPrint -> {
+            if not entry.allows(Right.Debug) {
+                return SysError.AccessDenied
+            }
+            console().write_byte((arg0 & BYTE_MASK) as UInt8)
+            SysError.Ok
+        },
+        // Stop the machine with `arg0` as the status. NOT process exit: that is
+        // a Process-object op when Process objects exist (ratified Aug 5). In
+        // M1's one-process world the distinction is invisible from outside,
+        // which is exactly why it is worth getting right now.
+        case Shutdown -> {
+            if not entry.allows(Right.Shutdown) {
+                return SysError.AccessDenied
+            }
+            if arg0 == 0 {
+                finisher().exit_pass()
+            } else {
+                finisher().exit_fail(arg0)
+            }
+            SysError.Ok
+        },
     }
-
-    // OP_SYSTEM_SHUTDOWN — stop the machine with `arg0` as the status. NOT
-    // process exit: that is a Process-object op when Process objects exist
-    // (ratified Aug 5). In M1's one-process world the distinction is invisible
-    // from outside, which is exactly why it is worth getting right now.
-    if (entry.rights & RIGHT_SHUTDOWN) == 0 {
-        return SYS_ERR_ACCESS_DENIED
-    }
-    if arg0 == 0 {
-        finisher().exit_pass()
-    } else {
-        finisher().exit_fail(arg0)
-    }
-    SYS_OK
 }
 
 /// Handle-table lookup -> object type -> op table -> rights check -> op.
-func dispatch(handle: UInt, op: UInt, arg0: UInt) unsafe -> UInt {
+func dispatch(handle: UInt, op: UInt, arg0: UInt) unsafe -> SysError {
     let entry = lookup_handle(handle)
-    if entry.obj_type == OBJ_NONE {
-        return SYS_ERR_BAD_HANDLE
+    match entry.obj_type {
+        case Unbound -> SysError.BadHandle,
+        case System -> system_op(op, &entry, arg0),
     }
-    if entry.obj_type == OBJ_SYSTEM {
-        return system_op(op, &entry, arg0)
-    }
-    SYS_ERR_BAD_HANDLE
 }
 
 // =============================================================================
@@ -439,7 +463,10 @@ public func ktrap(frame_addr: UInt, cause: UInt, tval: UInt) unsafe {
     // §5.7: a0 = handle, a7 = op, args a1-a5.
     let status = dispatch(frame.a0.read(), frame.a7.read(), frame.a1.read())
 
-    frame.a0.write(status)
+    // THE SYSCALL BOUNDARY: the one place the typed status becomes the number
+    // the ABI specifies. `as` on a backed enum is total — the enum IS its tag —
+    // so there is nothing here that can fail or disagree with `sosabi`'s table.
+    frame.a0.write(status as UInt8 as UInt)
     frame.a1.write(0)
     frame.mepc.write(epc + ECALL_INSN_LEN)
 }

@@ -26,7 +26,7 @@
 //! tags it branches on. The first lives in the HAL stub; the second is `SysError`
 //! below. Neither is a number this file's callers ever write.
 
-import sosabi.{OP_SYSTEM_DEBUG_PRINT, OP_SYSTEM_SHUTDOWN, SYS_OK, SYS_ERR_BAD_HANDLE, SYS_ERR_BAD_OP, SYS_ERR_ACCESS_DENIED}
+import sosabi.{SysOp, SysError}
 
 // The scalar-to-console-byte rule, shared with the kernel's own console so the
 // two cannot disagree about what a non-ASCII scalar becomes.
@@ -46,41 +46,39 @@ extern "C" {
 // Errors
 // =============================================================================
 
-/// What a syscall can go wrong with (spec §5.7). The kernel returns a small
-/// integer tag; this is that tag with a name on it, so userspace branches on
-/// meaning rather than on a number.
-public enum SysError {
-    case BadHandle,
-    case BadOp,
-    case AccessDenied,
-    case Unknown(status: UInt)
-}
+// What a syscall can go wrong with is `sosabi`'s `SysError` (spec §5.7) — the
+// SAME declaration the kernel's dispatch returns, so the two halves of the
+// contract cannot disagree about what tag 3 means. It carries its own
+// `describe()`, `Printable` and `Error` (design 145: an enum takes methods and
+// hand-written trait bodies), which is what retired the free `sys_error(status)`
+// helper this module used to need. A process reaches all of it through the
+// value it is handed and never imports `sosabi` — the type's own module is
+// always consulted for its methods (design 142), and an enum case pattern
+// resolves from the scrutinee.
+//
+// So userspace can now interpolate a failure (`print("{}", e)`) as well as
+// `match` it. Before, `SysError` could conform to nothing and had to be
+// branched on to say anything at all.
 
-/// Interpret a raw status word. `SYS_OK` is not an error and has no case here —
-/// a caller holding one of these already knows the call failed.
+/// Turn a raw status word into a Result. The one place a number becomes a type.
 ///
-/// A FREE FUNCTION, not a `SysError` method, because an enum cannot carry
-/// methods at all today: only empty derivable-trait conformances may extend one
-/// (DF-140i). The same limit is why `SysError` cannot conform to `Error` or
-/// `Printable`, so it cannot be interpolated — callers `match` it.
-public func sys_error(status: UInt) -> SysError {
-    if status == SYS_ERR_BAD_HANDLE {
-        SysError.BadHandle
-    } else if status == SYS_ERR_BAD_OP {
-        SysError.BadOp
-    } else if status == SYS_ERR_ACCESS_DENIED {
-        SysError.AccessDenied
-    } else {
-        SysError.Unknown(status: status)
+/// The narrowing is guarded rather than assumed: `a0` is register-wide, the enum
+/// is byte-wide (its width is ABI), and an `as UInt8` on a value above 255 is a
+/// PANIC — in a process, over a word the process did not choose. A kernel
+/// compiled from this same table never returns one, so the guard is unreachable
+/// in M1 and costs a compare; what it buys is that the impossible case is an
+/// error value rather than a trap.
+func checked(raw: UInt) -> Result<Void, SysError> {
+    if raw > (UInt8.max as UInt) {
+        return SysError.Unknown
     }
-}
-
-/// Turn a raw status into a Result. The one place a number becomes a type.
-func checked(status: UInt) -> Result<Void, SysError> {
-    if status == SYS_OK {
-        return
+    guard let status = SysError.from(raw: raw as UInt8) else {
+        return SysError.Unknown
     }
-    sys_error(status)
+    if status.is_failure() {
+        return status
+    }
+    return
 }
 
 // =============================================================================
@@ -103,14 +101,14 @@ func checked(status: UInt) -> Result<Void, SysError> {
 /// Returns a status word: 0 on success.
 @export("sos_system_debug_print")
 public func sos_system_debug_print(handle: UInt, byte: UInt) -> UInt {
-    sos_syscall1(handle, OP_SYSTEM_DEBUG_PRINT, byte)
+    sos_syscall1(handle, SysOp.DebugPrint as UInt, byte)
 }
 
 /// Stop the machine with `status`. Requires the SHUTDOWN right. Does not
 /// return on success; returns a status word if the call was refused.
 @export("sos_system_shutdown")
 public func sos_system_shutdown(handle: UInt, status: UInt) -> UInt {
-    sos_syscall1(handle, OP_SYSTEM_SHUTDOWN, status)
+    sos_syscall1(handle, SysOp.Shutdown as UInt, status)
 }
 
 // =============================================================================
