@@ -155,22 +155,27 @@ names provisional):
 - **Rights are a bitmask, SCOPED PER OBJECT KIND (ratified Aug 7,
   user).** Each kind defines its own backed rights enum —
   `SystemRight: UInt32 { case Transfer = 1, case Manage = 2, case
-  Debug = 4, case Shutdown = 8 }`, `ChannelRight { … Send, Receive }`
+  Debug = 256, case Shutdown = 512 }`, `ChannelRight { … Send,
+  Receive }`
   — spelled `SystemRight.Debug`, scoped by the ENUM (no flat
   name-mangling; exhaustive match + the design-145 wire discipline
   come free). Kind-specific bits OVERLAP freely across kinds: a
   rights word is only ever interpreted against its handle's kind,
   which dispatch establishes before the check (§3 order), so each
-  kind owns ~30 bits instead of sharing 32. With §3's typed handles,
+  kind owns 24 bits instead of sharing 32. With §3's typed handles,
   the check helper demands the MATCHING right type
   (`check(h: SystemHandle, r: SystemRight)`) — testing a channel
   right against a System handle is a COMPILE error. The exception:
-  **UNIVERSAL rights sit at pinned low bits, identical in every
-  kind's enum** — bit 0 = `Transfer` (may be sent over a channel —
-  the movability capability), bit 1 = `Manage` (derive children) —
-  because generic kernel paths (channel handle-transfer) check them
-  without knowing the kind; `sosabi` `static_assert`s each kind's
-  enum against the pinned table so no kind can drift. **No DUPLICATE right — no handle
+  **UNIVERSAL rights own the pinned LOW BYTE — bits 0-7, identical in
+  every kind's enum (ratified Aug 7, user: reserve room, more shared
+  operations are coming).** Assigned so far: bit 0 = `Transfer` (may
+  be sent over a channel — the movability capability), bit 1 =
+  `Manage` (derive children); bits 2-7 RESERVED (candidates as they
+  prove universal: wait/signal, introspect/info, revoke). Generic
+  kernel paths (channel handle-transfer) check universal bits without
+  knowing the kind; `sosabi` `static_assert`s each kind's enum
+  against the pinned table so no kind can drift, and a kind-specific
+  right below bit 8 is a spec violation the assert catches. **No DUPLICATE right — no handle
   duplication at all** (ratified Jul 29): every handle is unique, the
   exact `NoCopy` correspondence. If a second handle to a resource is
   legitimately needed, the resource's CREATOR (who holds MANAGE)
