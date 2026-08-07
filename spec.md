@@ -168,6 +168,27 @@ names provisional):
   is `(handle, op, args...) -> Result`. The kernel's dispatch is a
   table lookup + rights check + object-op — the fast path must stay
   tens of instructions.
+- **Typed handles in the Saw API (ratified Aug 7, user).** Each object
+  kind gets a DISTINCT handle type in the `sos` module —
+  `type SystemHandle = UInt`, `type ChannelHandle = UInt`, … — and the
+  Saw-facing wrappers take the typed handle (`sos_system_shutdown(h:
+  SystemHandle, ...)`). Saw's distinct-alias rule gives exactly the
+  wanted asymmetry for free: the typed handle FLOWS TO `UInt`
+  implicitly (one zero-cost lowering at the `sos_syscallN` stub), but
+  a raw word or a different kind's handle cannot flow IN — crossing
+  into a handle type is an explicit construction, done at creation
+  and, kernel-side, in dispatch AFTER table/generation/rights
+  validation (the type then means "validated as this kind", not just
+  "a number"). The typing stops at the ABI boundary: `@export`ed vDSO
+  symbols and the syscall stubs keep raw `UInt` words (C callers see
+  words; the export whitelist is primitives), and the kernel handle
+  TABLE indexes by word. This is TIER ONE (kind safety) of two: when
+  M2 brings closeable/transferable handles, the OWNING tier is a
+  NoCopy struct wrapping the alias (deinit closes, `move` transfers —
+  the TcpStream pattern, and §3's no-DUPLICATE rule is its exact
+  NoCopy correspondence), with the alias as its payload — additive,
+  not a migration. Adoption: the M1 candidate branch, as a
+  review-round change.
 
 ## 4. The Saw synergy (why this language, this kernel)
 
