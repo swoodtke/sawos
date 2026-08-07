@@ -2,7 +2,8 @@
 //!
 //! Everything a SOS kernel image shares: the two board drivers, the trap frame,
 //! the trap handler `ktrap`, the syscall table, and the PMP/privilege helpers.
-//! An image is `boot.S` + `rt.c` + this module + one entry `.saw` defining
+//! An image is the riscv32 kernel HAL (`boot.S` + `sink.c`) + the shared runtime
+//! seams (`sos/rt/common_c/support.c`) + this module + one entry `.saw` defining
 //! `kmain` — `sos/kernel/main.saw` for the real kernel, `sos/tests/*.saw` for
 //! the harness cases. Sharing the module is what keeps every test image on the
 //! SAME trap path instead of a copy of it.
@@ -95,8 +96,9 @@ public struct SifiveTestRegs {
 }
 
 /// Writing FINISHER_PASS exits the emulator with status 0; FINISHER_FAIL
-/// carries an exit code in its upper half. (boot.S's `kernel_fault` and rt.c's
-/// `__saw_rt_panic` drive the same device from asm/C.)
+/// carries an exit code in its upper half. (boot.S's `kernel_fault` and the
+/// HAL's `sos_rt_abort`, which `__saw_rt_panic` calls, drive the same device
+/// from asm/C.)
 public struct SifiveTest {
     regs: UnsafeMemory<SifiveTestRegs, Device>,
 }
@@ -246,7 +248,7 @@ static EXIT_CODE_BAD_SYSCALL: UInt = 3
 static EXIT_CODE_BAD_IMAGE: UInt = 4
 
 // =============================================================================
-// Privilege + PMP seams (boot.S / rt.c — the riscv32 HAL M1b extracts)
+// Privilege + PMP seams (the riscv32 kernel HAL: boot.S / sink.c)
 // =============================================================================
 
 extern "C" {

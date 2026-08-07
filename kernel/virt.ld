@@ -69,8 +69,10 @@ SECTIONS {
     } > RAM
 
     /* The appended root image (design 140 unit B): a blob the harness pulls in
-     * with `.incbin`, bounded by linker symbols the kernel reads through rt.c's
-     * accessors. Unit A's U-mode payloads ride the same slot as raw code, which
+     * with `.incbin`, bounded by linker symbols the kernel reads through the
+     * kernel HAL's `sos_payload_start`/`sos_payload_end` accessors (sink.c —
+     * Saw cannot name a linker symbol). Unit A's U-mode payloads ride the same
+     * slot as raw code, which
      * is why this section is executable. Empty (start == end) in an image built
      * without a payload. A real flash partition table is P4-hardware material. */
     /* PAGE-aligned, not merely word-aligned. Two reasons, one of them found the
