@@ -1,25 +1,30 @@
-// A root server that oversteps its grant (design 140).
+// A root server that oversteps its grant (designs 140, 162).
 //
-// The kernel's promise is that root runs in U-mode holding PMP grants for its
+// The kernel's promise is that root runs in user mode holding grants for its
 // own segments and its stack, and NOTHING else. This program tests the promise
 // the only way that counts: it prints a line through a System op (proving it is
-// alive, really in U-mode, and really holding `SystemRight.Debug`), then writes to
-// the kernel's text base.
+// alive, really in user mode, and really holding `SystemRight.Debug`), then
+// writes to the kernel's text base.
 //
-// The expected outcome is a store/AMO access fault the kernel diagnoses and
-// exits FAIL on. What must NOT happen: the write landing, or the machine
-// hanging. The unit-A payloads make the same point from hand-written assembly;
-// this makes it from ordinary Saw, through the real build pipeline.
+// The expected outcome is a store-access fault the kernel diagnoses and exits
+// FAIL on. What must NOT happen: the write landing, or the machine hanging. The
+// unit-A payloads make the same point from hand-written assembly; this makes it
+// from ordinary Saw, through the real build pipeline.
 //
 // The one architecture-specific thing here is the ADDRESS it reaches for, which
-// is the point of the test. Everything else goes through the kernel's exported
-// `sos` module like any process.
+// is the point of the test — and it is not in this file. It arrives from
+// `sos/tests/<arch>/fault_target.c`, named in this package's per-target
+// `native` list, so this source names no machine any more than the real root
+// server does. Everything else goes through the kernel's exported `sos` module
+// like any process.
 
 import sos.{System}
 
-/// The kernel's text base — inside the kernel image, outside every grant root
-/// holds.
-static KERNEL_TEXT_BASE: UInt = 0x80000000
+// The kernel's text base on whichever profile this was built for: inside the
+// kernel image, outside every grant root holds.
+extern "C" {
+    func sos_test_forbidden_addr() -> UInt
+}
 
 struct Word {
     value: UInt32,
@@ -30,7 +35,7 @@ func _start(boot_handle: UInt) unsafe {
     let system = System(boot_handle: boot_handle)
     let _ = system.debug_print("SOS root: reaching for the kernel\n")
 
-    let kernel = UnsafeMemory<Word, Normal>(KERNEL_TEXT_BASE)
+    let kernel = UnsafeMemory<Word, Normal>(sos_test_forbidden_addr())
     kernel.value.write(0u32)
 
     // Unreachable: the store above traps into the kernel, which never returns

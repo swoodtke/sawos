@@ -11,9 +11,20 @@
 //! machinery, no `String` building. That is what lets one module serve an
 //! M-mode kernel and a U-mode process on two architectures.
 
-/// Hex digits in a 32-bit word.
-public static HEX_DIGITS_PER_WORD: Int = 8
+/// Hex digits in a MACHINE word on this target — eight on a 32-bit profile,
+/// sixteen on a 64-bit one (spec §5b).
+///
+/// A function rather than a `static` because a static initializer takes plain
+/// literals only, and the literal is the bug: `8` was written here when riscv32
+/// was the only profile, and on arm64 it made every `write_hex` print the low
+/// half of the word with no sign that the top half existed — an address
+/// diagnostic that quietly lies. `sizeof<UInt>()` is the fact being asked for,
+/// so it is what the code asks.
+public func hex_digits_per_word() -> Int {
+    sizeof<UInt>() * HEX_DIGITS_PER_BYTE
+}
 
+static HEX_DIGITS_PER_BYTE: Int = 2
 static BITS_PER_HEX_DIGIT: Int = 4
 static HEX_NIBBLE_MASK: UInt = 0xF
 static HEX_DECIMAL_LIMIT: UInt = 10
@@ -38,10 +49,10 @@ public func hex_digit(nibble: UInt) -> UInt8 {
 }
 
 /// The `index`-th hex digit of `value`, MOST SIGNIFICANT FIRST — so a caller
-/// prints `0..HEX_DIGITS_PER_WORD` in order and gets a fixed-width word with
+/// prints `0..hex_digits_per_word()` in order and gets a full-width word with
 /// no reversal buffer and no allocation.
 public func hex_digit_of(value: UInt, index: Int) -> UInt8 {
-    let shift = (HEX_DIGITS_PER_WORD - 1 - index) * BITS_PER_HEX_DIGIT
+    let shift = (hex_digits_per_word() - 1 - index) * BITS_PER_HEX_DIGIT
     hex_digit(value >> shift)
 }
 

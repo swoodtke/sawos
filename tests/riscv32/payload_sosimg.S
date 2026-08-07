@@ -14,7 +14,8 @@
     .equ ROOT_ENTRY,      0x80200000
     /* spec 7 defaults: background 0, low/normal/high 1, low byte first. */
     .equ PRIO_MAP,        0x01010100
-    .equ SOSIMG_VERSION,  1
+    .equ SOSIMG_VERSION,  2
+    .equ SOSIMG_ARCH,     1                 /* SosimgArch.Riscv32          */
     .equ SEG_FLAG_R,      1
     .equ SEG_FLAG_X,      4
 
@@ -30,7 +31,7 @@ _img_start:
     .ascii  "SOSI"                          /* magic                       */
     .short  SOSIMG_VERSION                  /* version                     */
     .byte   1                               /* seg_count                   */
-    .byte   0                               /* reserved                    */
+    .byte   SOSIMG_ARCH                     /* arch                        */
     .word   ROOT_ENTRY                      /* entry (absolute)            */
     .word   PRIO_MAP                        /* prio_map                    */
 

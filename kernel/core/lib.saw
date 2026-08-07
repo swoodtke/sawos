@@ -27,7 +27,7 @@ import hal
 import imgformat.{SosimgHeader, SosimgSeg, SegFlag}
 
 // Arch-free, role-free formatting, shared with every SOS process build.
-import sosrt.{ascii_byte, hex_digit_of, HEX_DIGITS_PER_WORD}
+import sosrt.{ascii_byte, hex_digit_of, hex_digits_per_word}
 
 // The call numbers. Kernel-internal and shared with the `sos` module the kernel
 // exports (sos/kernel/sysapi/) — one definition, two halves of one contract.
@@ -69,13 +69,18 @@ public extension Console {
         }
     }
 
-    /// Write a machine word as `0x` + one hex digit per nibble. Fixed width, no
-    /// allocation, no formatting machinery — the kernel has neither an
-    /// allocator worth spending nor a reason to build a string.
+    /// Write a machine word as `0x` + one hex digit per nibble. No allocation,
+    /// no formatting machinery — the kernel has neither an allocator worth
+    /// spending nor a reason to build a string.
+    ///
+    /// The WIDTH is the target's word, not a constant: eight digits on a
+    /// 32-bit profile and sixteen on a 64-bit one. A fixed eight would print
+    /// the low half of a 64-bit address and look like a complete answer.
     public func write_hex(&self, v: UInt) {
         self.write_str("0x")
+        let digits = hex_digits_per_word()
         var n = 0
-        while n < HEX_DIGITS_PER_WORD {
+        while n < digits {
             hal.console_byte(hex_digit_of(v, n))
             n = n + 1
         }
@@ -401,6 +406,15 @@ func check_segment(seg: &SosimgSeg, img_len: UInt) {
     if load_addr < hal.ROOT_LOAD_BASE {
         fatal_image("segment loads below the root region", load_addr)
     }
+    // A grant covers whole units of the target's protection granularity, so a
+    // segment starting mid-unit would be granted along with whatever shares
+    // its first unit — the previous segment's tail, at the previous segment's
+    // permissions. On a page-granular profile that is how root's code would
+    // silently become writable; on a four-byte-granular one it never arises.
+    // Refusing the image is the only answer that is right on both.
+    if (load_addr & (hal.PROT_GRAIN - 1)) != 0 {
+        fatal_image("segment is not aligned to the grant granularity", load_addr)
+    }
     let limit = hal.ROOT_REGION_TOP - hal.ROOT_STACK_LEN
     if load_addr > limit {
         fatal_image("segment loads above the root region", load_addr)
@@ -443,6 +457,13 @@ public func load_root_and_enter() unsafe {
     }
     if not header.has_known_version() {
         fatal_image("unsupported version", header.version as UInt)
+    }
+    // An image built for the OTHER profile is refused rather than jumped into.
+    // Its instructions are not this machine's and its addresses need not be in
+    // this machine's map — and before the format carried a tag, the only thing
+    // that stopped one booting on the other was that nobody had tried.
+    if not header.is_for_arch(hal.arch_tag()) {
+        fatal_image("image is for another architecture", header.arch as UInt)
     }
 
     let seg_count = header.seg_count as UInt

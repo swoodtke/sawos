@@ -6,7 +6,8 @@
 
     .equ ROOT_ENTRY,      0x80200000
     .equ PRIO_MAP,        0x01010100
-    .equ SOSIMG_VERSION,  1
+    .equ SOSIMG_VERSION,  2
+    .equ SOSIMG_ARCH,     1                 /* SosimgArch.Riscv32          */
     .equ SEG_FLAG_R,      1
     .equ SEG_FLAG_X,      4
 
@@ -16,7 +17,7 @@ _img_start:
     .ascii  "NOPE"                          /* not 'SOSI'                  */
     .short  SOSIMG_VERSION
     .byte   1
-    .byte   0
+    .byte   SOSIMG_ARCH
     .word   ROOT_ENTRY
     .word   PRIO_MAP
 
