@@ -192,8 +192,9 @@ names provisional):
 - **Typed handles in the Saw API (ratified Aug 7, user).** Each object
   kind gets a DISTINCT handle type in the `sos` module —
   `type SystemHandle = UInt`, `type ChannelHandle = UInt`, … — and the
-  Saw-facing wrappers take the typed handle (`sos_system_shutdown(h:
-  SystemHandle, ...)`). Saw's distinct-alias rule gives exactly the
+  Saw-facing wrapper holds the typed handle (`System` stores a
+  `handle: SystemHandle`; its `shutdown` method passes it to the raw
+  exported `sos_system_shutdown`). Saw's distinct-alias rule gives exactly the
   wanted asymmetry for free: the typed handle FLOWS TO `UInt`
   implicitly (one zero-cost lowering at the `sos_syscallN` stub), but
   a raw word or a different kind's handle cannot flow IN — crossing
