@@ -16,7 +16,7 @@ operand must be an assembly-time immediate, and a linker symbol.
 | Name | Contract |
 |---|---|
 | `arch_name() -> String` | What the boot banner says this kernel is running on. |
-| `ARCH_TAG: UInt8` | This profile's `sosimg` arch tag. An image carrying another one is refused by the loader, not jumped into. |
+| `arch_tag() -> UInt8` | This profile's `sosimg` arch tag, read out of `imgformat`'s registry rather than spelled again. An image carrying another one is refused by the loader, not jumped into. |
 | `console_byte(b)` | Put one byte on the kernel's console. Byte-at-a-time on purpose: the arch-free half formats, this half places. |
 | `exit_pass()` / `exit_fail(code)` | Stop the machine, zero / non-zero. Never return. A zero `code` is promoted so a failing exit never reads as a passing one. |
 | `payload_start()` / `payload_end()` | Bounds of the appended root image. Equal when there is none. |
