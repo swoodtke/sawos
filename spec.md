@@ -274,7 +274,16 @@ names provisional):
    `object.method(args)` — there are NO bare numbered syscalls `[user,
    Aug 5]`. RISC-V registers: a0 = HANDLE, a7 = op (method id on that
    object's op table), args a1-a5, `ecall`; returns a0 = status word
-   (0 = ok, else a small SysError enum tag), a1 = value/handle. Kernel
+   (0 = ok, else a small **`SosStatus`** enum tag — RENAMED from
+   `SysError`, ratified Aug 7 [user]: an enum with an `Ok` case is a
+   STATUS, not an error (`SosStatus.Ok`, `SosStatus.BadOp`, …), and
+   the `Sos` prefix names whose status it is. The hosted runtime's
+   `SysError` in rt/ABI.md is a SEPARATE frozen contract (errno tags,
+   machine-parsed since design 149) and keeps its name; the spec notes
+   the correspondence, nothing more. An `Err(SosStatus.Ok)` never
+   arises by construction: the wrapper boundary splits on the status —
+   `Ok` → `Result.Ok(value)`, anything else → `Err(status)`),
+   a1 = value/handle. Kernel
    dispatch is §3's shape verbatim: handle-table lookup → object type →
    op table → rights check → op. Even the M1 primitives conform: a
    **System object** (kernel singleton; see §2 table) is minted to root
@@ -285,7 +294,7 @@ names provisional):
    M1's one-process world, root's `system.shutdown(status)` ends the run
    (QEMU: the sifive_test write). Maps 1:1 onto the
    `sos` module's typed wrappers (`system.debug_print(...)`,
-   `-> Result<T, SysError>` — auto-wrap does the rest).
+   `-> Result<T, SosStatus>` — auto-wrap does the rest).
    **API ownership (ratified Aug 5, revising the Jul-31 line):** the `sos`
    module is U-MODE LIBRARY CODE (never kernel-mode — that half of the
    Jul-31 decision stands) but it is OWNED AND EXPORTED BY THE KERNEL
