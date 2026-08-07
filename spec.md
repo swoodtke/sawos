@@ -294,8 +294,27 @@ names provisional):
 7. ~~Syscall ABI~~ **DECIDED (user, Jul 31; object-uniform Aug 5): (status,
    value) PAIR, every call an OBJECT OP.** Conceptually every syscall is
    `object.method(args)` — there are NO bare numbered syscalls `[user,
-   Aug 5]`. RISC-V registers: a0 = HANDLE, a7 = op (method id on that
-   object's op table), args a1-a5, `ecall`; returns a0 = status word
+   Aug 5]`. **The register convention, per profile (arm64 column ratified
+   Aug 7, design 162 decision 1):**
+
+   | Role | Profile A (riscv32) | Profile B (arm64) |
+   |---|---|---|
+   | handle in / status out | `a0` | `x0` |
+   | op (a method id on that object's table) | `a7` | `x8` |
+   | arguments | `a1`-`a5` | `x1`-`x5` |
+   | value/handle out | `a1` | `x1` |
+   | trap | `ecall` | `svc #0` |
+
+   The two are the same shape one-to-one, deliberately: the op sits in a
+   register OUTSIDE the argument run on both, so arguments are a clean
+   sequence and neither profile has to shuffle. `x8` is where AArch64 Linux
+   puts a syscall number, so every disassembler and every reader who has seen
+   one arm64 syscall reads this one correctly. ONE difference is not
+   cosmetic and belongs to the HAL rather than the kernel: `ecall` leaves the
+   saved PC pointing AT the instruction and `svc` leaves it pointing PAST,
+   so advancing on return is a per-profile decision (a kernel that advanced
+   on Profile B would skip the instruction after every syscall). Returns:
+   status word
    (0 = ok, else a small **`SosStatus`** enum tag — RENAMED from
    `SysError`, ratified Aug 7 [user]: an enum with an `Ok` case is a
    STATUS, not an error (`SosStatus.Ok`, `SosStatus.BadOp`, …), and
@@ -304,8 +323,8 @@ names provisional):
    machine-parsed since design 149) and keeps its name; the spec notes
    the correspondence, nothing more. An `Err(SosStatus.Ok)` never
    arises by construction: the wrapper boundary splits on the status —
-   `Ok` → `Result.Ok(value)`, anything else → `Err(status)`),
-   a1 = value/handle. Kernel
+   `Ok` → `Result.Ok(value)`, anything else → `Err(status)`).
+   Kernel
    dispatch is §3's shape verbatim: handle-table lookup → object type →
    op table → rights check → op. Even the M1 primitives conform: a
    **System object** (kernel singleton; see §2 table) is minted to root
@@ -353,13 +372,44 @@ object/handle/channel/syscall model is IDENTICAL across profiles —
 divergence is confined to a small per-arch HAL (boot, trap entry,
 context switch, Mapping/AddressSpace implementation), selected at
 build time via the module-path mechanism (`--module-path
-hal=sos/hal/<target>` — Blade/B0 machinery). All wire/boot formats
+hal=sos/hal/<target>/kernel` — Blade/B0 machinery). All wire/boot formats
 (sosimg, message headers) use FIXED-WIDTH fields (the design-47
 discipline) so 32/64-bit profiles interoperate. AddressSpace on A =
 PMP region set (+APM on P4); on B = page-table root. Roadmap: M1 =
 riscv32 boot-to-root-server (design 78); M1b = arm64 EL1 boot parity
-+ HAL extraction (design 79) BEFORE object-model work; then the
++ HAL extraction (design 162) BEFORE object-model work; then the
 object model lands once, two-profile-tested.
+
+**BOTH PROFILES ARE LIVE (design 162, Aug 7).** The claim above is no
+longer a plan: `make sos-test` boots the same kernel on
+`qemu-system-riscv32 -M virt` and `qemu-system-aarch64 -M virt -cpu
+cortex-a53`, twelve cases each, and either failing is red. What the port
+cost, and what it proved:
+
+- **The kernel has no architecture in it.** `sos/kernel/core/` names no
+  register, no trap cause, no protection hardware and no board; it reaches
+  all of it through one module it imports as `hal`, mapped per build to
+  `sos/hal/<arch>/kernel/`. The harness SCANS that directory for
+  architecture names and fails the run on a hit, comments included —
+  because a leaked constant still compiles and is only wrong on the profile
+  nobody happened to be building.
+- **The HAL is the whole of the difference**, and it is small: boot +
+  vectors, the privilege transition, the protection primitive, a console
+  byte sink, a way to stop the machine, the trap-frame accessors, and the
+  board's memory map. Everything else — dispatch, rights, the loader's
+  order of checks, the console's FORMATTING — is shared.
+- **Profile B's isolation is a static identity map** (design 162 decision
+  2): one map built at boot, EL0 default-deny, and the only mutable part is
+  the EL0 permission bits of the pages a root image was granted. That is
+  PMP parity, not paging — Mapping/AddressSpace objects stay M2.
+- **The same root server sources build for both.** `sos/root/src/` is
+  unchanged between profiles; only its manifest's `[sos.<triple>]` section
+  differs, and Blade grew per-target sections plus an ELF64 reader to make
+  that true.
+- **Images are arch-tagged** (sosimg v2): a wrong-profile image is a clean
+  load error, tested on both. Before the tag, the two profiles' headers
+  were byte-compatible wrappers around incompatible instructions and the
+  only thing stopping one booting on the other was that nobody had tried.
 
 ## 6. Explicitly NOT in the kernel
 
@@ -645,8 +695,45 @@ event-driven EDGE of a process gets a second, distinct construct:
     keeps them all on the same trap path; `sos/rt/common/` (Saw) and
     `sos/rt/common_c/support.c` (the C that must stay C) are shared by the
     kernel and every process; and the architecture lives in
-    `sos/hal/riscv32/{kernel,user}/`, each with an ABI.md, so M1b (design 79)
+    `sos/hal/riscv32/{kernel,user}/`, each with an ABI.md, so M1b (design 162)
     ADDS `sos/hal/arm64/...` without moving any of it.
+  - **M1b DONE (design 162), branch PARKED for user review:** arm64 EL1
+    parity and the HAL extraction. The M1 feature set above runs identically
+    on `qemu-system-aarch64 -M virt -cpu cortex-a53`: twelve cases per
+    architecture, twenty-four total, either failing red. The M1 claim that
+    "the architecture lives in `sos/hal/`" turned out to be half true — the
+    kernel still held a UART register block, an `mcause` enum, PMP wrappers,
+    `mepc + 4` and the board's memory map — so unit 1 moved all of it behind
+    a module the kernel imports as `hal` (§5b has the summary). Profile B's
+    HAL: `boot.S` (EL1 entry, sixteen exception vectors, `eret` to EL0),
+    `sink.c` (PL011, semihosting `SYS_EXIT`, and the static identity map),
+    `lib.saw` (the Saw surface: driver, trap frame, ESR decode, memory map),
+    `virt.ld`, and a user-side `svc` stub — each with an ABI.md. Four things
+    worth knowing beyond the brief:
+    (a) **FP/SIMD must be enabled at EL1 before any compiled code runs.**
+    `CPACR_EL1.FPEN` traps Advanced SIMD out of reset and LLVM vectorizes
+    ordinary loops, so the first page-table loop faulted before the vectors
+    could report it. FP state is NOT saved across a trap; with one thread and
+    no preemption nothing observes that, and M2's context switch is where it
+    stops being true.
+    (b) **Semihosting, not PSCI, stops the machine.** PSCI `SYSTEM_OFF`
+    always exits 0 and this harness asserts on exit STATUS — one case encodes
+    its whole verdict in the number.
+    (c) **Cortex-A53 is ARMv8.0** and has no LSE atomics, contrary to the
+    brief's decision-3 note; `ldxr`/`stxr` exclusives cover everything the
+    kernel and `SpinLock` need, so nothing was blocked.
+    (d) **The two profiles report the same fault names.** ESR's exception
+    class plus the data-abort direction bit decode to `store-access-fault`
+    and friends, so the harness asserts one string against both machines.
+    Also landed: sosimg **v2** with an `arch` tag (a wrong-profile image is a
+    clean load error, tested both ways), a loader check that a segment is
+    aligned to the target's grant granularity (a page here, four bytes
+    there — without it root's code could become writable because its data
+    started 200 bytes later), the kernel's hex output following the target's
+    WORD width instead of a hardcoded eight digits, Blade reading ELF64 as
+    well as ELF32 and refusing an address past the format's 32-bit field
+    rather than truncating it, and `[sos.<triple>]` manifest sections so one
+    root package builds for both profiles with `src/` unchanged.
 
 ## 12. The root server (ratified Aug 5, user)
 
