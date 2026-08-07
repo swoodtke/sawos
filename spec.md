@@ -613,7 +613,7 @@ event-driven EDGE of a process gets a second, distinct construct:
     args a1-a5, and dispatch is §3's shape verbatim — handle-table lookup ->
     object type -> op table -> rights check -> op. The v1 object is the
     **System** singleton (§2) with `debug_print` and `shutdown(status)`, gated
-    on DEBUG / SHUTDOWN rights; root receives its handle in the first argument
+    on `SystemRight.Debug` / `.Shutdown`; root receives its handle in the first argument
     register at entry (§12's boot handle set, one handle wide today). A bad
     handle, a bad op or a missing right returns a `SosStatus` and the
     process runs on; a FAULT is fatal and prints a cause tag (M0's never-hang
