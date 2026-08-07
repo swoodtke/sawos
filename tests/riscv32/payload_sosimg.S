@@ -3,7 +3,9 @@
  * A SECOND, independent producer of the format Blade emits. Blade's emitter
  * reads an ELF and computes everything; this file states the bytes outright.
  * If the two ever disagree, one of them is wrong and the kernel's loader —
- * which reads both — is the oracle that says so.
+ * which reads both — is the oracle that says so. The arm64 twin states the SAME
+ * 24-byte header and 24-byte record, which is the fixed-width claim: one format,
+ * two machines, identical bytes.
  *
  * The image carries one R+X segment: U-mode code that prints "SOS-R" through
  * `debug_putc` and exits 0. It is loaded at ROOT_ENTRY, not executed in place,
@@ -14,7 +16,7 @@
     .equ ROOT_ENTRY,      0x80200000
     /* spec 7 defaults: background 0, low/normal/high 1, low byte first. */
     .equ PRIO_MAP,        0x01010100
-    .equ SOSIMG_VERSION,  2
+    .equ SOSIMG_VERSION,  3
     .equ SOSIMG_ARCH,     1                 /* SosimgArch.Riscv32          */
     .equ SEG_FLAG_R,      1
     .equ SEG_FLAG_X,      4
@@ -32,12 +34,13 @@ _img_start:
     .short  SOSIMG_VERSION                  /* version                     */
     .byte   1                               /* seg_count                   */
     .byte   SOSIMG_ARCH                     /* arch                        */
-    .word   ROOT_ENTRY                      /* entry (absolute)            */
     .word   PRIO_MAP                        /* prio_map                    */
+    .word   0                               /* reserved0 (v3 padding)      */
+    .quad   ROOT_ENTRY                      /* entry (absolute, 64-bit)    */
 
     /* --- segment table --- */
+    .quad   ROOT_ENTRY                      /* load_addr (64-bit)          */
     .word   _seg0 - _img_start              /* file_off                    */
-    .word   ROOT_ENTRY                      /* load_addr                   */
     .word   _seg0_end - _seg0               /* file_len                    */
     .word   _seg0_end - _seg0               /* mem_len (no .bss tail)      */
     .byte   SEG_FLAG_R | SEG_FLAG_X         /* flags                       */

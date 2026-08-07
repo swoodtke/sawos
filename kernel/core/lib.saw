@@ -24,7 +24,7 @@ import hal
 
 // The image layout itself lives in the shared `imgformat` package, so the
 // loader below and the Blade target that writes the images read one definition.
-import imgformat.{SosimgHeader, SosimgSeg, SegFlag}
+import imgformat.{SosimgHeader, SosimgSeg, SegFlag, fits_target_word}
 
 // Arch-free, role-free formatting, shared with every SOS process build.
 import sosrt.{ascii_byte, hex_digit_of, hex_digits_per_word}
@@ -324,6 +324,13 @@ public func ktrap(frame_addr: UInt, cause: UInt, tval: UInt) {
 
 static BYTE_MASK: UInt = 0xFF
 
+/// What a refused too-high address REPORTS: its top 32 bits. The low half is
+/// what would have survived a narrowing, so it is the half that says nothing;
+/// the high half is the part the machine cannot reach and is what a reader
+/// needs to see. (`write_hex` prints a machine word, which on the profile that
+/// can raise this is 32 bits wide.)
+static HIGH_HALF_SHIFT: Int = 32
+
 // =============================================================================
 // The sosimg loader (design 140 unit B; spec §6, §7, §12)
 // =============================================================================
@@ -392,6 +399,16 @@ func check_segment(seg: &SosimgSeg, img_len: UInt) {
     let file_off = seg.file_off as UInt
     let file_len = seg.file_len as UInt
     let mem_len = seg.mem_len as UInt
+
+    // The format's addresses are 64-bit on both profiles (design 172 unit 8),
+    // so a 32-bit kernel can be handed an image it cannot address. Refusing is
+    // the only answer that cannot corrupt a boot — narrowing would wrap a high
+    // address into a low one and place the segment somewhere the linker never
+    // meant. The test folds away entirely on a 64-bit build.
+    if not fits_target_word(seg.load_addr) {
+        fatal_image("segment loads past this machine's address space",
+                    (seg.load_addr >> HIGH_HALF_SHIFT) as UInt)
+    }
     let load_addr = seg.load_addr as UInt
 
     if file_off > img_len {
@@ -478,6 +495,12 @@ public func load_root_and_enter() unsafe {
         fatal_image("segment table runs past the image", table_len)
     }
 
+    // Same rule as a segment's address, at the one other place a 64-bit field
+    // becomes a machine word: refuse, never narrow.
+    if not fits_target_word(header.entry) {
+        fatal_image("entry is past this machine's address space",
+                    (header.entry >> HIGH_HALF_SHIFT) as UInt)
+    }
     let entry = header.entry as UInt
     let prio_map = header.prio_map as UInt
 
