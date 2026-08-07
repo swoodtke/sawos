@@ -19,15 +19,29 @@
 //    freestanding build where this IS memcpy, is a call to itself. Keeping
 //    these in C lets them be compiled with `-fno-builtin`, which is the
 //    supported way to say "do not do that". (Same reason libcs write them in
-//    assembly or with the same flag.)
-//  - the arena : Saw has no mutable module state beyond `Atomic`, and no way
-//    to reserve a `.bss` region from source, so a bump allocator cannot be
-//    expressed. See DF-140g.
-//  - the seams : `__saw_rt_*` are reserved symbols that only `--runtime-build`
-//    may `@export`, and that mode is for authoring `sawc/rt/`, not for a
-//    kernel. See DF-140g.
+//    assembly or with the same flag.) This reason is PERMANENT.
 //
-// The arch-free, role-free logic that CAN be Saw is Saw: sos/rt/common/.
+// The other two reasons this file used to give are NO LONGER TRUE. Design 149
+// landed (Aug 6) and closed DF-140g, the gap they described:
+//
+//  - the arena needed mutable module state and a way to reserve `.bss`.
+//    `unsafe static var` now provides the first, and a zero-initialized static
+//    is zerofill in both profiles — `static ARENA: [UInt8; N] = [0; N]` costs
+//    no image bytes — so a bump allocator IS expressible in Saw.
+//  - the seams needed an `@export` of reserved `__saw_rt_*` names, which only
+//    `--runtime-build` allowed and which is scoped to authoring `sawc/rt/`.
+//    `sawc --runtime-provider` (Blade spells it `[package] runtime = true`) now
+//    lets an ordinary freestanding build implement them, with each signature
+//    checked against `sawc/rt/ABI.md`.
+//
+// So the arena and the four seams below COULD be Saw today. They are not yet:
+// moving them changes the allocation and panic paths of both the kernel and
+// every process image at once, which is a decision worth taking deliberately
+// rather than as part of an adoption sweep. Recorded in designs/todo.md under
+// the SOS M1 section; SOS is the case design 149 was built for, so this is the
+// obvious next step rather than an open question.
+//
+// The arch-free, role-free logic that is already Saw: sos/rt/common/.
 
 typedef unsigned int   u32;
 typedef unsigned char  u8;
