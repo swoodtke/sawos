@@ -21,8 +21,6 @@
 
 typedef unsigned long u64;
 typedef unsigned int  u32;
-typedef unsigned char u8;
-typedef unsigned long usize;   // LP64: 64-bit, matches platform `Int`
 
 // ---- from lib.saw ---------------------------------------------------------
 //
@@ -67,35 +65,6 @@ void sos_platform_exit(u64 code) {
     register u64 x1 __asm__("x1") = (u64)&block[0];
     __asm__ volatile("hlt #0xf000" :: "r"(x0), "r"(x1) : "memory");
     for (;;) { __asm__ volatile("wfi"); }
-}
-
-// ---- PL011 UART -----------------------------------------------------------
-//
-// NOT YET DIETED — design 172 unit 4 moves this. It is the console the runtime
-// seams write through, including the panic seam, which is why its replacement
-// has to be check-free by construction rather than merely correct.
-
-#define PL011_BASE   0x09000000UL
-#define UARTDR       0x00
-#define UARTFR       0x18
-#define FR_TXFF      (1u << 5)      // transmit FIFO full
-
-void sos_rt_write(const char *ptr, usize len) {
-    volatile u32 *fr = (volatile u32 *)(PL011_BASE + UARTFR);
-    volatile u32 *dr = (volatile u32 *)(PL011_BASE + UARTDR);
-    for (usize i = 0; i < len; i++) {
-        while (*fr & FR_TXFF) { }
-        *dr = (u8)ptr[i];
-    }
-}
-
-// Stop the machine, non-zero. A zero code would report success, so it is
-// promoted — a failing exit never reads as a passing one.
-__attribute__((noreturn))
-void sos_rt_abort(u32 code) {
-    u32 status = code & 0xFFu;
-    if (status == 0) status = 1u;
-    sos_platform_exit(status);
 }
 
 // ---- the appended payload -------------------------------------------------

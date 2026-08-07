@@ -1,0 +1,47 @@
+// SOS panic-recursion pin (design 172 unit 4): a COMPILER-RAISED panic reaches
+// the console intact, through a reporter that cannot itself panic.
+//
+// `panic.saw` beside this file calls `panic(...)` outright. This one does not
+// say the word: it takes an out-of-range `Vector` index, so the message is
+// assembled by the compiler's own trap path — the path that would recurse if
+// the writer under it were not check-free. What is under test:
+//
+//   1. The reporter is reached from the TRAP path, not from a hand-written
+//      call, so the whole design-137 stack-scratch assembly runs.
+//   2. The message arrives INTACT — the `panic at ` prefix, the location and
+//      the reason, three independent pieces — rather than truncated or
+//      interleaved, which is what a second panic raised mid-report produces.
+//      The location is `vector.saw`, not this file: design 122 reports the
+//      TRAPPING expression's own line, and for an indexed accessor that is
+//      inside std.
+//   3. The machine stops NON-ZERO rather than hanging, which is what a
+//      reporter that re-entered itself would do.
+//
+// The guarantee that makes (2) and (3) hold is not this test — it is that
+// `hal.rt_write` and `hal.console_byte` contain no bounds check, no allocation
+// and no checked arithmetic, verified from emitted IR (DF-172b). This test is
+// what notices if that ever stops being true, on a real machine, on both
+// profiles.
+//
+// The kernel core is imported for its `ktrap`, which the HAL's trap entry
+// calls: every SOS image links the same trap handler even when this one never
+// reaches it.
+
+import kcore
+
+@export("kmain")
+func kmain() {
+    // Built at run time so the index cannot be folded into a compile error.
+    var v = Vector<Int>()
+    v.push(11)
+    v.push(22)
+
+    // Out of range: the compiler's bounds check raises the panic, and its
+    // message is assembled in stack scratch and handed to the seam.
+    let n = v[v.len() + 5]
+
+    // Never reached. Consuming `n` keeps the read from being optimized away;
+    // if it somehow succeeded the harness sees a hang, which is also a failure.
+    kcore.console().write_hex(n as UInt)
+    while true { }
+}

@@ -19,43 +19,7 @@
 // `boot.S` beside this file is the trap entry and the M -> U transition;
 // `sos/hal/riscv32/user/` is the process-side counterpart.
 
-typedef unsigned int   u32;
-typedef unsigned char  u8;
-typedef unsigned long  usize;
-
-// ---- the board's console and its stop button ------------------------------
-//
-// NOT YET DIETED — design 172 unit 4 moves both. They are the runtime seams'
-// two hooks, including the panic seam's, which is why the replacement has to be
-// check-free by construction rather than merely correct.
-
-#define UART_BASE    0x10000000u
-#define UART_THR     0x0u
-#define UART_LSR     0x5u
-#define LSR_TX_EMPTY 0x20u          // LSR bit 5 — TX holding register empty
-#define SIFIVE_TEST  0x00100000u
-#define FINISH_FAIL  0x3333u
-#define FAIL_CODE_SHIFT 16u
-
-void sos_rt_write(const char *ptr, usize len) {
-    volatile u8 *lsr = (volatile u8 *)(UART_BASE + UART_LSR);
-    volatile u8 *thr = (volatile u8 *)(UART_BASE + UART_THR);
-    for (usize i = 0; i < len; i++) {
-        while ((*lsr & LSR_TX_EMPTY) == 0) { }
-        *thr = (u8)ptr[i];
-    }
-}
-
-// Stop the machine, non-zero. A zero code would make the finisher report
-// success, so it is promoted — a failing exit never reads as a passing one.
-__attribute__((noreturn))
-void sos_rt_abort(u32 code) {
-    u32 status = code & 0xFFu;
-    if (status == 0) status = 1u;
-    volatile u32 *test = (volatile u32 *)SIFIVE_TEST;
-    *test = FINISH_FAIL | (status << FAIL_CODE_SHIFT);
-    for (;;) { __asm__ volatile("wfi"); }
-}
+typedef unsigned int u32;
 
 // ---- the appended payload -------------------------------------------------
 //

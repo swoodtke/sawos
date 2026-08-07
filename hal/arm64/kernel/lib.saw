@@ -187,6 +187,56 @@ static FAIL_CODE_MASK: UInt = 0xFF
 static FAIL_CODE_MIN: UInt = 1
 
 // =============================================================================
+// The runtime's two hooks (design 172 unit 4)
+// =============================================================================
+//
+// `sos/rt/common_c/support.c` implements the frozen `__saw_rt_*` seams over
+// exactly two per-side hooks: where a byte goes, and how the machine stops. The
+// kernel HAL answers "the UART" and "the platform's exit". Both were C; both
+// are Saw now.
+
+/// Stop the machine with a non-zero status, for the common runtime.
+///
+/// The promote-zero rule lives in `exit_fail`, so this is the seam name and
+/// nothing else — there is one place that decides a failing exit never reads as
+/// a passing one.
+@export("sos_rt_abort")
+public func rt_abort(code: UInt32) {
+    exit_fail(code as UInt)
+}
+
+/// Write `len` bytes at `ptr` to the console. THE PANIC PATH'S WRITER.
+///
+/// CHECK-FREE BY CONSTRUCTION, and that is the whole contract rather than a
+/// nice property. This runs while a panic is being reported, so a bounds check
+/// or an overflow check that tripped here would call `__saw_rt_panic` again and
+/// either hang or garble the one diagnostic that matters. So: no indexing (raw
+/// `UnsafeMemory` reads), no allocation, no `String`, and the cursor advances
+/// with WRAPPING arithmetic (`&+` / `&-`) so even a nonsensical length cannot
+/// raise an overflow trap.
+///
+/// Verified rather than asserted (DF-172b): `--emit-ir` over this function and
+/// everything it calls shows `ptrtoint`, a plain `load i8`, `add`/`sub` — not
+/// `llvm.uadd.with.overflow` — an `icmp`, a `getelementptr inbounds`, and the
+/// driver's volatile MMIO load and store. There is no check, no trap block and
+/// no call to `__saw_rt_panic` anywhere in it. A panic inside the panic
+/// reporter is not unlikely here; it is unreachable.
+///
+/// A change to this function or to `console_byte` that introduces an index, an
+/// allocation or a checked `+` silently retires that guarantee, so re-read the
+/// IR if you touch either.
+@export("sos_rt_write")
+public func rt_write(ptr: UnsafePointer<UInt8>, len: UInt) unsafe {
+    var addr = ptr as UInt
+    var left = len
+    while left != 0 {
+        console_byte(UnsafeMemory<UInt8, Normal>(addr).read())
+        addr = addr &+ 1
+        left = left &- 1
+    }
+}
+
+// =============================================================================
 // Privilege, protection and payload seams (boot.S / sink.c)
 // =============================================================================
 
