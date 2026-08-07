@@ -23,7 +23,7 @@ import sosrt.{ascii_byte, hex_digit_of, HEX_DIGITS_PER_WORD}
 // The call numbers. Kernel-internal and shared with the `sos` module the kernel
 // exports (sos/kernel/sysapi/) — one definition, two halves of one contract.
 import sosabi.{
-    ObjType, Right, SysOp, SosStatus,
+    ObjType, SystemHandle, SystemRight, SysOp, SosStatus,
     root_system_rights, ROOT_SYSTEM_HANDLE, NO_USER_STACK,
 }
 
@@ -242,21 +242,38 @@ public extension TrapCause {
 /// One handle-table entry: the object a handle names and the rights its holder
 /// has on it (§3). The kernel validates both on every op.
 ///
-/// `obj_type` is the typed tag; `rights` stays a plain `UInt` because it is a
-/// MASK — a set of `Right` bits, not one of them.
+/// `obj_type` is the typed tag; `rights` stays a plain `UInt32` because it is a
+/// MASK — a set of bits, not one of the cases of any kind's rights enum. It is
+/// deliberately NOT interpretable on its own: which enum's bits these are is
+/// decided by `obj_type`, and the pairing happens below.
 struct HandleEntry {
     obj_type: ObjType,
-    rights: UInt,
+    rights: UInt32,
 }
 
-extension HandleEntry {
-    /// Whether this entry's holder may perform an op requiring `right`.
+/// A System handle the dispatch has VALIDATED (§3).
+///
+/// This type is the pairing of a handle kind with its rights word, and it is
+/// what makes the rights check typed rather than cosmetic. The only way to get
+/// one is through `dispatch`, after the table resolved the handle to a System
+/// object — so the type carries the claim "validated as System", and
+/// `allows` can accept a `SystemRight` and nothing else. When Channel arrives it
+/// gets `ChannelObject` with a `ChannelRight`-taking `allows` beside this one;
+/// testing one kind's right against the other's object is then a compile error,
+/// not a bit comparison that quietly returns an answer.
+struct SystemObject {
+    handle: SystemHandle,
+    rights: UInt32,
+}
+
+extension SystemObject {
+    /// Whether this holder may perform an op requiring `right`.
     ///
     /// The mask arithmetic lives here rather than at each call site, so the
     /// dispatch below reads as the question it is asking and there is one place
     /// to change when rights become a wider word.
-    func allows(&self, right: Right) -> Bool {
-        (self.rights & (right as UInt)) != 0
+    func allows(&self, right: SystemRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
     }
 }
 
@@ -295,8 +312,8 @@ extern "C" {
 
 /// One PMP permission, as the BIT a region's flags carry it in.
 ///
-/// Same shape as `imgformat`'s `SegFlag` and `sosabi`'s `Right`: the enum names
-/// the bits, a MASK stays a plain `UInt`, since no case names `R|X`. The two
+/// Same shape as `imgformat`'s `SegFlag` and `sosabi`'s `SystemRight`: the enum
+/// names the bits, a MASK stays a plain int, since no case names `R|X`. The two
 /// orderings agree on purpose — a sosimg's flags install as PMP permissions
 /// without translation.
 public enum PmpPerm: UInt {
@@ -428,7 +445,7 @@ func lookup_handle(handle: UInt) -> HandleEntry {
 /// and the dispatch in one step. The `match` is then exhaustive, so adding an
 /// op to `sosabi` makes this function fail to compile until it is handled —
 /// which is what the old `op > OP_SYSTEM_MAX` test could never do.
-func system_op(raw_op: UInt, entry: &HandleEntry, arg0: UInt) unsafe -> SosStatus {
+func system_op(raw_op: UInt, obj: &SystemObject, arg0: UInt) unsafe -> SosStatus {
     guard let op = SysOp.from(raw: raw_op) else {
         return SosStatus.BadOp
     }
@@ -437,7 +454,7 @@ func system_op(raw_op: UInt, entry: &HandleEntry, arg0: UInt) unsafe -> SosStatu
         // The rights check is per-OP, not per-object: holding the System
         // handle is not the same as being allowed to use every part of it.
         case DebugPrint -> {
-            if not entry.allows(Right.Debug) {
+            if not obj.allows(SystemRight.Debug) {
                 return SosStatus.AccessDenied
             }
             console().write_byte((arg0 & BYTE_MASK) as UInt8)
@@ -448,7 +465,7 @@ func system_op(raw_op: UInt, entry: &HandleEntry, arg0: UInt) unsafe -> SosStatu
         // M1's one-process world the distinction is invisible from outside,
         // which is exactly why it is worth getting right now.
         case Shutdown -> {
-            if not entry.allows(Right.Shutdown) {
+            if not obj.allows(SystemRight.Shutdown) {
                 return SosStatus.AccessDenied
             }
             if arg0 == 0 {
@@ -462,11 +479,21 @@ func system_op(raw_op: UInt, entry: &HandleEntry, arg0: UInt) unsafe -> SosStatu
 }
 
 /// Handle-table lookup -> object type -> op table -> rights check -> op.
+///
+/// This is where a raw word becomes a TYPED handle (§3), and the order is the
+/// point: the number arrives from a register, the table says what it names, and
+/// only then is a `SystemHandle` constructed. Below this line the kernel is no
+/// longer handling an integer a process chose — it is handling an object it
+/// resolved, paired with the rights that came with it.
 func dispatch(handle: UInt, op: UInt, arg0: UInt) unsafe -> SosStatus {
     let entry = lookup_handle(handle)
     match entry.obj_type {
         case Unbound -> SosStatus.BadHandle,
-        case System -> system_op(op, &entry, arg0),
+        case System -> {
+            let obj = SystemObject(handle: SystemHandle(handle),
+                                   rights: entry.rights)
+            system_op(op, &obj, arg0)
+        },
     }
 }
 

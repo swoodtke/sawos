@@ -26,7 +26,7 @@
 //! tags it branches on. The first lives in the HAL stub; the second is
 //! `SosStatus` below. Neither is a number this file's callers ever write.
 
-import sosabi.{SysOp, SosStatus}
+import sosabi.{SysOp, SosStatus, SystemHandle}
 
 // The scalar-to-console-byte rule, shared with the kernel's own console so the
 // two cannot disagree about what a non-ASCII scalar becomes.
@@ -128,22 +128,33 @@ public func sos_system_shutdown(handle: UInt, status: UInt) -> UInt {
 /// A handle to the kernel's System object — in M1 the whole of a process's
 /// authority (§12's boot handle set, one handle wide today).
 ///
+/// The field is a `SystemHandle`, not a `UInt`: one kind of handle cannot be
+/// built from a raw word or from another kind's handle, so handle-kind
+/// confusion is not expressible here even before the ops are considered. It
+/// still costs nothing — the alias flows to `UInt` implicitly at the stub, so
+/// the calls below pass `self.handle` with no cast and no conversion is emitted.
+///
 /// Real handles will be `NoCopy` with a `Deinit` that closes them (§4); this
 /// one is a plain value because M1 has no close op and root holds its handle
-/// for the life of the machine. The typed-wrapper SHAPE is what matters now: a
-/// handle is never a bare integer at a call site, so handle-kind confusion
-/// cannot be written down.
+/// for the life of the machine. That is the second tier and it is additive:
+/// the `NoCopy` wrapper takes this alias as its payload.
 public struct System {
-    handle: UInt,
+    handle: SystemHandle,
 }
 
 public extension System {
     /// Adopt the boot handle the kernel passed in the first argument register.
+    ///
+    /// The parameter is a raw `UInt` because that is what a register holds and
+    /// what the ABI specifies; this is one of the two places in the system that
+    /// crosses INTO a handle type (the other is the kernel's dispatch, after
+    /// the table has resolved it). Crossing at CREATION is what the explicit
+    /// construction is for.
     public init(boot_handle: UInt) -> System {
         // The runtime's panic path prints through this same handle, so it has
         // to be reachable from C before any Saw code can fail.
         sos_set_system_handle(boot_handle)
-        System(handle: boot_handle)
+        System(handle: SystemHandle(boot_handle))
     }
 
     /// Write one byte to the debug console.

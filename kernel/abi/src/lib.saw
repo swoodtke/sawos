@@ -1,6 +1,7 @@
 //! The SOS call numbers — KERNEL-INTERNAL (design 140; sos/spec.md §5.7).
 //!
-//! Every op number, rights bit and status tag in the system, in one place.
+//! Every op number, rights bit, status tag and handle type in the system, in
+//! one place.
 //! Exactly two things import this: the kernel's dispatch tables
 //! (`sos/kernel/core/`) and the `sos` wrapper module the kernel package exports
 //! to userspace (`sos/kernel/sysapi/`). Nothing else, ever.
@@ -49,31 +50,103 @@ public enum ObjType: UInt8 {
 }
 
 // =============================================================================
+// Handles (spec §3)
+// =============================================================================
+
+/// A handle naming the kernel's System object.
+///
+/// Each object kind gets its OWN handle type (ratified Aug 7). Saw's distinct
+/// `type` alias gives exactly the asymmetry a handle wants for free: it flows
+/// TO `UInt` implicitly, so the syscall stub takes it with no cast and no
+/// conversion is emitted — but a raw word, or another kind's handle, cannot
+/// flow IN. Crossing into a handle type is an explicit construction, and there
+/// are only two places that do it: userspace adopting its boot handle, and the
+/// kernel's dispatch AFTER the table has resolved the handle to a System
+/// object. That is what makes the type mean "validated as System" rather than
+/// merely "a number".
+///
+/// The typing stops at the ABI boundary. The `@export`ed vDSO symbols and the
+/// `sos_syscallN` stubs keep raw `UInt` words, because a C caller sees words
+/// and the export whitelist is primitives; the handle TABLE indexes by word too.
+///
+/// This is TIER ONE of two — kind safety. When M2 brings closeable and
+/// transferable handles, the OWNING tier is a `NoCopy` struct wrapping this
+/// alias (deinit closes, `move` transfers — the `TcpStream` pattern, and §3's
+/// no-DUPLICATE rule is its exact `NoCopy` correspondence). That is additive:
+/// this alias becomes the payload, and nothing written against it changes.
+public type SystemHandle = UInt
+
+// =============================================================================
 // Rights (spec §3)
 // =============================================================================
 
-/// One right, as the BIT it occupies in a rights mask.
+// RIGHTS ARE SCOPED PER OBJECT KIND (ratified Aug 7). Each kind declares its
+// own rights enum, so a bit means nothing until you know which kind's word it
+// sits in — and dispatch establishes the kind before any right is checked (§3's
+// order: table lookup -> object type -> op table -> rights check -> op). Two
+// consequences worth stating plainly:
+//
+//   - Kind-specific bits OVERLAP freely across kinds. A rights word is only ever
+//     interpreted against its handle's kind, so each kind owns 24 bits of its
+//     own instead of all kinds sharing 32.
+//   - The check is TYPED. `SystemObject.allows` takes a `SystemRight` and
+//     nothing else, so testing a channel right against a System handle is a
+//     compile error rather than a bit comparison that quietly answers.
+//
+// THE UNIVERSAL LOW BYTE. Bits 0-7 are identical in EVERY kind's enum:
+//
+//   bit 0   Transfer   may be sent over a channel — the movability capability
+//   bit 1   Manage     derive children
+//   bits 2-7           RESERVED (candidates as they prove universal:
+//                      wait/signal, introspect/info, revoke)
+//
+// Six bits are reserved rather than assigned because more shared operations are
+// coming and a universal right added later must not have to move a kind's bits
+// to make room. Generic kernel paths — channel handle-transfer is the first —
+// check universal bits without knowing the kind, which is only sound while the
+// table holds, so the `static_assert`s below hold it: they are what stops a kind
+// enum from drifting, and what catches a kind-specific right placed below bit 8.
+
+/// A right on the System object.
 ///
-/// Rights are a bitmask and attenuation is MONOTONIC — a derivation may only
-/// ever strip bits. They are checked per-OP, not per-object: holding a handle is
-/// not the same as being allowed to use every part of what it names.
-///
-/// The enum names the individual bits; a MASK stays a plain `UInt`, because a
-/// set of bits is not one of the cases. `HandleEntry.allows` is how the kernel
-/// asks the question, so `&` and a bare `1` appear in one place rather than at
-/// every call site.
-public enum Right: UInt {
-    case Debug = 1,
-    case Shutdown = 2,
+/// The low byte is the universal table above; System's own rights start at bit
+/// 8. `Debug` gates the console, `Shutdown` gates stopping the machine — a
+/// process holding the handle without them can name the object and do nothing
+/// with it, which is the point of checking rights per-OP rather than per-object.
+public enum SystemRight: UInt32 {
+    case Transfer = 1,
+    case Manage = 2,
+    case Debug = 256,
+    case Shutdown = 512,
 }
+
+// The universal low byte, pinned. Every kind's enum repeats these two asserts
+// verbatim; that repetition IS the check, since it is what makes a drifted bit
+// fail to build rather than fail in a channel transfer years later.
+static_assert((SystemRight.Transfer as UInt32) == 1,
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((SystemRight.Manage as UInt32) == 2,
+              "universal right Manage must be bit 1 in every kind's enum")
+
+// Kind-specific rights start at bit 8, leaving bits 2-7 free for universal
+// rights not yet assigned. One assert per kind-specific case.
+static_assert((SystemRight.Debug as UInt32) >= 256,
+              "kind-specific right Debug must start at bit 8 or above")
+static_assert((SystemRight.Shutdown as UInt32) >= 256,
+              "kind-specific right Shutdown must start at bit 8 or above")
 
 /// What the kernel mints for root's System handle at boot (§12).
 ///
 /// A function rather than a `static` because a static initializer takes plain
-/// literals only — and `3` with a comment saying which bits it is made of is
+/// literals only — and `768` with a comment saying which bits it is made of is
 /// exactly the magic number this file is getting rid of.
-public func root_system_rights() -> UInt {
-    (Right.Debug as UInt) | (Right.Shutdown as UInt)
+///
+/// Root gets the two System rights and NOT the universal pair: there is nobody
+/// to transfer a handle to in a one-process world, and nothing to derive it
+/// for. Attenuation is monotonic, so a right withheld here can never appear
+/// later — which is the right default for a set the boot handle hands out.
+public func root_system_rights() -> UInt32 {
+    (SystemRight.Debug as UInt32) | (SystemRight.Shutdown as UInt32)
 }
 
 // =============================================================================
