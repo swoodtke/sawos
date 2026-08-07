@@ -40,7 +40,7 @@ names provisional):
 | `MemoryObject` | Physical memory (RAM or device MMIO). Ownership/authority over the pages; mappable, sendable — see §2.3 (ratified Jul 29). |
 | `Mapping` | An installed virtual placement of a MemoryObject; distinct object, own handle; only it can unmap — see §2.3. |
 | `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. |
-| `System` | Kernel singleton (ratified Aug 5): the object behind system-scoped primitives so that EVERY syscall is an object op (§5.7) — v1 ops `debug_print`, `shutdown(status)` (stop the machine; QEMU: sifive_test), rights-gated (DEBUG/SHUTDOWN). Root receives its handle at boot (§12). `exit` is NOT here — process exit belongs to the Process object when it exists (ratified Aug 5). Later candidates: info queries. |
+| `System` | Kernel singleton (ratified Aug 5): the object behind system-scoped primitives so that EVERY syscall is an object op (§5.7) — v1 ops `debug_print`, `shutdown(status)` (stop the machine; QEMU: sifive_test), rights-gated (`SystemRight.Debug`/`.Shutdown`, §3 scoped rights). Root receives its handle at boot (§12). `exit` is NOT here — process exit belongs to the Process object when it exists (ratified Aug 5). Later candidates: info queries. |
 
 ### 2.1 Channels: bounded messages + built-in request/reply (ratified Jul 29)
 
@@ -152,9 +152,25 @@ names provisional):
 - Per-process handle table: index → (object ref, rights word).
   Handles are plain integers in the syscall ABI; the kernel validates
   index + generation (stale-handle detection) + rights on every use.
-- **Rights are a bitmask**, e.g.: READ, WRITE, MAP, SIGNAL, WAIT,
-  MANAGE (derive children), **TRANSFER** (may be sent over a channel —
-  the movability capability). **No DUPLICATE right — no handle
+- **Rights are a bitmask, SCOPED PER OBJECT KIND (ratified Aug 7,
+  user).** Each kind defines its own backed rights enum —
+  `SystemRight: UInt32 { case Transfer = 1, case Manage = 2, case
+  Debug = 4, case Shutdown = 8 }`, `ChannelRight { … Send, Receive }`
+  — spelled `SystemRight.Debug`, scoped by the ENUM (no flat
+  name-mangling; exhaustive match + the design-145 wire discipline
+  come free). Kind-specific bits OVERLAP freely across kinds: a
+  rights word is only ever interpreted against its handle's kind,
+  which dispatch establishes before the check (§3 order), so each
+  kind owns ~30 bits instead of sharing 32. With §3's typed handles,
+  the check helper demands the MATCHING right type
+  (`check(h: SystemHandle, r: SystemRight)`) — testing a channel
+  right against a System handle is a COMPILE error. The exception:
+  **UNIVERSAL rights sit at pinned low bits, identical in every
+  kind's enum** — bit 0 = `Transfer` (may be sent over a channel —
+  the movability capability), bit 1 = `Manage` (derive children) —
+  because generic kernel paths (channel handle-transfer) check them
+  without knowing the kind; `sosabi` `static_assert`s each kind's
+  enum against the pinned table so no kind can drift. **No DUPLICATE right — no handle
   duplication at all** (ratified Jul 29): every handle is unique, the
   exact `NoCopy` correspondence. If a second handle to a resource is
   legitimately needed, the resource's CREATOR (who holds MANAGE)
@@ -288,7 +304,7 @@ names provisional):
    op table → rights check → op. Even the M1 primitives conform: a
    **System object** (kernel singleton; see §2 table) is minted to root
    at boot, and `debug_print` / `shutdown(status)` are its first ops,
-   rights-gated (DEBUG, SHUTDOWN bits) — a process without the System
+   rights-gated (`SystemRight.Debug`/`.Shutdown`, §3) — a process without the System
    handle cannot even print. `exit` is deliberately absent: process exit
    is a Process-object op when Process objects land (ratified Aug 5); in
    M1's one-process world, root's `system.shutdown(status)` ends the run
