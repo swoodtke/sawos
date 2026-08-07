@@ -109,16 +109,24 @@ public enum SysOp: UInt {
 /// backing is FIXED-WIDTH (design 47: a value that crosses an ABI pins its
 /// width) even though the register carrying it is wider.
 ///
+/// A STATUS, NOT AN ERROR (ratified Aug 7): the type is named for what it is —
+/// an enum with an `Ok` case describes how a call went, and only some of those
+/// ways are failures. The `Sos` prefix says whose status it is, which is the
+/// other half of the rename: the hosted runtime has its own frozen `SysError`
+/// (errno tags, `sawc/rt/ABI.md`) and the two contracts are unrelated. They now
+/// read as unrelated too.
+///
 /// `Ok` is a case because this enum is the wire table and 0 is in it. It is the
 /// one value that is not a failure, and `sos`'s `checked` is the single place
-/// that turns it into `Ok(())`.
+/// that turns it into `Ok(())` — which is why an `Err(SosStatus.Ok)` cannot be
+/// constructed anywhere downstream.
 ///
 /// `Unknown` is NOT a status the kernel returns. It is where the userspace
 /// mapping's `from(raw:)` miss lands, so a tag this build does not define stays
 /// a typed error instead of being read as success. In M1 it is unreachable —
 /// both halves compile from this one declaration — and it exists for the build
 /// skew that static linking makes impossible today and a mapped vDSO will not.
-public enum SysError: UInt8 {
+public enum SosStatus: UInt8 {
     case Ok = 0,
     case BadHandle = 1,
     case BadOp = 2,
@@ -126,7 +134,7 @@ public enum SysError: UInt8 {
     case Unknown = 255,
 }
 
-public extension SysError {
+public extension SosStatus {
     /// A short human-readable tag, for a diagnostic or a log line.
     public func describe(&self) -> String {
         match self {
@@ -148,13 +156,13 @@ public extension SysError {
     }
 }
 
-public extension SysError: Printable {
+public extension SosStatus: Printable {
     public func format(&self, into: &var StringBuilder) {
         into.append(self.describe())
     }
 }
 
-public extension SysError: Error {}
+public extension SosStatus: Error {}
 
 // =============================================================================
 // The boot handle set (spec §12)

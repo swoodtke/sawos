@@ -12,7 +12,7 @@ not three (sos/spec.md §5.7):
 
 | Altitude | Spelling | For |
 |---|---|---|
-| typed Saw | `system.shutdown(0)` | **Saw processes. Use this.** Handles are typed, statuses are a `SysError`, no number appears. |
+| typed Saw | `system.shutdown(0)` | **Saw processes. Use this.** Handles are typed, statuses are a `SosStatus`, no number appears. |
 | typed C | `sos_system_shutdown(h, 0)` | **Non-Saw languages.** One `@export`ed function per op, named for the op; still no number. |
 | raw | `sos_syscall1(h, op, a)` | **The HAL and the kernel package only.** It takes an op NUMBER, which is the thing the arrangement above exists to keep out of callers. Not a supported application interface. |
 
@@ -48,7 +48,7 @@ Every syscall is an object op — there are no bare numbered syscalls.
 | `a7` | op — a method id on that object's table, not a global number |
 | `a1`-`a5` | arguments; `a1` also carries the value half on return |
 
-`ecall` traps. A status of 0 is success; anything else is a `SysError` tag, and
+`ecall` traps. A status of 0 is success; anything else is a `SosStatus` tag, and
 the process keeps running — a bad call is an error, not a fault.
 
 ## What is riscv32-specific here

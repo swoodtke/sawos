@@ -23,10 +23,10 @@
 //!
 //! WHAT A PROCESS MUST STILL AGREE WITH THE KERNEL ABOUT: the calling
 //! convention (§5.7 — handle in a0, op in a7, status back in a0) and the status
-//! tags it branches on. The first lives in the HAL stub; the second is `SysError`
-//! below. Neither is a number this file's callers ever write.
+//! tags it branches on. The first lives in the HAL stub; the second is
+//! `SosStatus` below. Neither is a number this file's callers ever write.
 
-import sosabi.{SysOp, SysError}
+import sosabi.{SysOp, SosStatus}
 
 // The scalar-to-console-byte rule, shared with the kernel's own console so the
 // two cannot disagree about what a non-ASCII scalar becomes.
@@ -46,8 +46,8 @@ extern "C" {
 // Errors
 // =============================================================================
 
-// What a syscall can go wrong with is `sosabi`'s `SysError` (spec §5.7) — the
-// SAME declaration the kernel's dispatch returns, so the two halves of the
+// How a syscall reports what happened is `sosabi`'s `SosStatus` (spec §5.7) —
+// the SAME declaration the kernel's dispatch returns, so the two halves of the
 // contract cannot disagree about what tag 3 means. It carries its own
 // `describe()`, `Printable` and `Error` (design 145: an enum takes methods and
 // hand-written trait bodies), which is what retired the free `sys_error(status)`
@@ -57,10 +57,20 @@ extern "C" {
 // resolves from the scrutinee.
 //
 // So userspace can now interpolate a failure (`print("{}", e)`) as well as
-// `match` it. Before, `SysError` could conform to nothing and had to be
-// branched on to say anything at all.
+// `match` it. Before, the type could conform to nothing and had to be branched
+// on to say anything at all.
+//
+// IT IS A STATUS, AND ONLY SOME STATUSES ARE ERRORS. `checked` below is the one
+// place that distinction is made, and it is what keeps the `Ok` case out of the
+// error channel entirely.
 
 /// Turn a raw status word into a Result. The one place a number becomes a type.
+///
+/// THE SPLIT (ratified Aug 7): `Ok` becomes `Result.Ok`, everything else becomes
+/// `Err(status)`. So the `Ok` case exists on the wire, where 0 has to mean
+/// something, and cannot exist in an `Err` — `Err(SosStatus.Ok)`, a value that
+/// would claim a call both failed and succeeded, is unconstructible downstream
+/// because this function is the only constructor of the error channel.
 ///
 /// The narrowing is guarded rather than assumed: `a0` is register-wide, the enum
 /// is byte-wide (its width is ABI), and an `as UInt8` on a value above 255 is a
@@ -68,12 +78,12 @@ extern "C" {
 /// compiled from this same table never returns one, so the guard is unreachable
 /// in M1 and costs a compare; what it buys is that the impossible case is an
 /// error value rather than a trap.
-func checked(raw: UInt) -> Result<Void, SysError> {
+func checked(raw: UInt) -> Result<Void, SosStatus> {
     if raw > (UInt8.max as UInt) {
-        return SysError.Unknown
+        return SosStatus.Unknown
     }
-    guard let status = SysError.from(raw: raw as UInt8) else {
-        return SysError.Unknown
+    guard let status = SosStatus.from(raw: raw as UInt8) else {
+        return SosStatus.Unknown
     }
     if status.is_failure() {
         return status
@@ -137,13 +147,13 @@ public extension System {
     }
 
     /// Write one byte to the debug console.
-    public func debug_print_byte(&self, byte: UInt8) -> Result<Void, SysError> {
+    public func debug_print_byte(&self, byte: UInt8) -> Result<Void, SosStatus> {
         checked(sos_system_debug_print(self.handle, byte as UInt))
     }
 
     /// Write an ASCII string. Stops at the FIRST failure and reports it — a
     /// partial write is surfaced, never swallowed.
-    public func debug_print(&self, msg: String) -> Result<Void, SysError> {
+    public func debug_print(&self, msg: String) -> Result<Void, SosStatus> {
         for scalar in msg.chars() {
             try self.debug_print_byte(ascii_byte(scalar))
         }
@@ -152,7 +162,7 @@ public extension System {
 
     /// Stop the machine with `status`. Does not return when it succeeds; a
     /// refusal (no SHUTDOWN right, say) comes back as an error.
-    public func shutdown(&self, status: UInt) -> Result<Void, SysError> {
+    public func shutdown(&self, status: UInt) -> Result<Void, SosStatus> {
         checked(sos_system_shutdown(self.handle, status))
     }
 }

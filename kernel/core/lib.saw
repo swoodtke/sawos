@@ -23,7 +23,7 @@ import sosrt.{ascii_byte, hex_digit_of, HEX_DIGITS_PER_WORD}
 // The call numbers. Kernel-internal and shared with the `sos` module the kernel
 // exports (sos/kernel/sysapi/) — one definition, two halves of one contract.
 import sosabi.{
-    ObjType, Right, SysOp, SysError,
+    ObjType, Right, SysOp, SosStatus,
     root_system_rights, ROOT_SYSTEM_HANDLE, NO_USER_STACK,
 }
 
@@ -272,7 +272,7 @@ static ECALL_INSN_LEN: UInt = 4
 /// asserts on these values.
 /// 3 is deliberately absent. It was `BadSyscall`, from when a bad op number
 /// killed the process; under the object-op model a caller's mistake is a STATUS
-/// the process receives and survives (`SysError.BadOp`), so nothing could raise
+/// the process receives and survives (`SosStatus.BadOp`), so nothing could raise
 /// it any more. A future case may take 3 — the values are per-case, so a gap
 /// costs nothing and a dead name would have cost a reader a search.
 public enum ExitCode: UInt {
@@ -428,9 +428,9 @@ func lookup_handle(handle: UInt) -> HandleEntry {
 /// and the dispatch in one step. The `match` is then exhaustive, so adding an
 /// op to `sosabi` makes this function fail to compile until it is handled —
 /// which is what the old `op > OP_SYSTEM_MAX` test could never do.
-func system_op(raw_op: UInt, entry: &HandleEntry, arg0: UInt) unsafe -> SysError {
+func system_op(raw_op: UInt, entry: &HandleEntry, arg0: UInt) unsafe -> SosStatus {
     guard let op = SysOp.from(raw: raw_op) else {
-        return SysError.BadOp
+        return SosStatus.BadOp
     }
 
     match op {
@@ -438,10 +438,10 @@ func system_op(raw_op: UInt, entry: &HandleEntry, arg0: UInt) unsafe -> SysError
         // handle is not the same as being allowed to use every part of it.
         case DebugPrint -> {
             if not entry.allows(Right.Debug) {
-                return SysError.AccessDenied
+                return SosStatus.AccessDenied
             }
             console().write_byte((arg0 & BYTE_MASK) as UInt8)
-            SysError.Ok
+            SosStatus.Ok
         },
         // Stop the machine with `arg0` as the status. NOT process exit: that is
         // a Process-object op when Process objects exist (ratified Aug 5). In
@@ -449,23 +449,23 @@ func system_op(raw_op: UInt, entry: &HandleEntry, arg0: UInt) unsafe -> SysError
         // which is exactly why it is worth getting right now.
         case Shutdown -> {
             if not entry.allows(Right.Shutdown) {
-                return SysError.AccessDenied
+                return SosStatus.AccessDenied
             }
             if arg0 == 0 {
                 finisher().exit_pass()
             } else {
                 finisher().exit_fail(arg0)
             }
-            SysError.Ok
+            SosStatus.Ok
         },
     }
 }
 
 /// Handle-table lookup -> object type -> op table -> rights check -> op.
-func dispatch(handle: UInt, op: UInt, arg0: UInt) unsafe -> SysError {
+func dispatch(handle: UInt, op: UInt, arg0: UInt) unsafe -> SosStatus {
     let entry = lookup_handle(handle)
     match entry.obj_type {
-        case Unbound -> SysError.BadHandle,
+        case Unbound -> SosStatus.BadHandle,
         case System -> system_op(op, &entry, arg0),
     }
 }
