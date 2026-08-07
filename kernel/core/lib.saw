@@ -185,16 +185,39 @@ static FAIL_CODE_MASK: UInt = 0xFF
 static FAIL_CODE_MIN: UInt = 1
 
 
-/// `mcause` codes for the M-mode exceptions M1 can take (interrupt bit clear).
-static CAUSE_INSN_MISALIGNED: UInt = 0
-static CAUSE_INSN_ACCESS_FAULT: UInt = 1
-static CAUSE_ILLEGAL_INSN: UInt = 2
-static CAUSE_BREAKPOINT: UInt = 3
-static CAUSE_LOAD_MISALIGNED: UInt = 4
-static CAUSE_LOAD_ACCESS_FAULT: UInt = 5
-static CAUSE_STORE_MISALIGNED: UInt = 6
-static CAUSE_STORE_ACCESS_FAULT: UInt = 7
-static CAUSE_ECALL_FROM_U: UInt = 8
+/// The `mcause` exception codes M1 can take (interrupt bit clear).
+///
+/// Backed by `UInt` — the width of the CSR the value arrives in. The numbers are
+/// RISC-V's, not ours, which is exactly why they are pinned per case: a reorder
+/// here must never renumber them.
+public enum TrapCause: UInt {
+    case InsnMisaligned = 0,
+    case InsnAccessFault = 1,
+    case IllegalInsn = 2,
+    case Breakpoint = 3,
+    case LoadMisaligned = 4,
+    case LoadAccessFault = 5,
+    case StoreMisaligned = 6,
+    case StoreAccessFault = 7,
+    case EcallFromU = 8,
+}
+
+public extension TrapCause {
+    /// The short symbolic name a fault line reports.
+    public func describe(&self) -> String {
+        match self {
+            case InsnMisaligned -> "instruction-address-misaligned",
+            case InsnAccessFault -> "instruction-access-fault",
+            case IllegalInsn -> "illegal-instruction",
+            case Breakpoint -> "breakpoint",
+            case LoadMisaligned -> "load-address-misaligned",
+            case LoadAccessFault -> "load-access-fault",
+            case StoreMisaligned -> "store-address-misaligned",
+            case StoreAccessFault -> "store-access-fault",
+            case EcallFromU -> "ecall-from-u-mode",
+        }
+    }
+}
 
 // =============================================================================
 // Objects, handles, rights (spec §2, §3, §5.7)
@@ -243,9 +266,15 @@ static ECALL_INSN_LEN: UInt = 4
 
 /// Exit codes the kernel reports through the finisher, distinct from any status
 /// root chooses for itself.
-static EXIT_CODE_UMODE_FAULT: UInt = 2
-static EXIT_CODE_BAD_SYSCALL: UInt = 3
-static EXIT_CODE_BAD_IMAGE: UInt = 4
+///
+/// A type rather than three `UInt`s so `fatal` cannot be handed an arbitrary
+/// number: the kernel's own failure vocabulary is closed, and the harness
+/// asserts on these values.
+public enum ExitCode: UInt {
+    case UmodeFault = 2,
+    case BadSyscall = 3,
+    case BadImage = 4,
+}
 
 // =============================================================================
 // Privilege + PMP seams (the riscv32 kernel HAL: boot.S / sink.c)
@@ -260,10 +289,17 @@ extern "C" {
     func sos_payload_end() -> UInt
 }
 
-/// PMP permission bits, as the region flags carry them.
-public static PERM_R: UInt = 1
-public static PERM_W: UInt = 2
-public static PERM_X: UInt = 4
+/// One PMP permission, as the BIT a region's flags carry it in.
+///
+/// Same shape as `imgformat`'s `SegFlag` and `sosabi`'s `Right`: the enum names
+/// the bits, a MASK stays a plain `UInt`, since no case names `R|X`. The two
+/// orderings agree on purpose — a sosimg's flags install as PMP permissions
+/// without translation.
+public enum PmpPerm: UInt {
+    case Read = 1,
+    case Write = 2,
+    case Execute = 4,
+}
 
 /// PMP's address granularity: bounds are stored shifted right by two.
 public static PMP_GRAIN: UInt = 4
@@ -328,35 +364,24 @@ public func finisher() unsafe -> SifiveTest {
     SifiveTest(at: TEST_BASE)
 }
 
-/// A short symbolic name for an `mcause` value.
-public func cause_tag(cause: UInt) -> String {
-    if cause == CAUSE_INSN_MISALIGNED {
-        "instruction-address-misaligned"
-    } else if cause == CAUSE_INSN_ACCESS_FAULT {
-        "instruction-access-fault"
-    } else if cause == CAUSE_ILLEGAL_INSN {
-        "illegal-instruction"
-    } else if cause == CAUSE_BREAKPOINT {
-        "breakpoint"
-    } else if cause == CAUSE_LOAD_MISALIGNED {
-        "load-address-misaligned"
-    } else if cause == CAUSE_LOAD_ACCESS_FAULT {
-        "load-access-fault"
-    } else if cause == CAUSE_STORE_MISALIGNED {
-        "store-address-misaligned"
-    } else if cause == CAUSE_STORE_ACCESS_FAULT {
-        "store-access-fault"
-    } else if cause == CAUSE_ECALL_FROM_U {
-        "ecall-from-u-mode"
-    } else {
-        "unexpected-trap"
+/// A short symbolic name for a raw `mcause` value.
+///
+/// The decode is where an unknown code stops being a number: `from(raw:)` is
+/// total, and the hardware may raise a cause this kernel does not model (an
+/// interrupt, a Profile B code), so the miss has its own name rather than an
+/// arm. Everything it DOES model is an exhaustive `match` in `describe`, so a
+/// cause added to the enum fails to compile until it is given a name.
+public func cause_tag(raw: UInt) -> String {
+    guard let cause = TrapCause.from(raw: raw) else {
+        return "unexpected-trap"
     }
+    cause.describe()
 }
 
 /// Report a fatal condition on the console and FAIL the run. Never returns —
 /// M0's discipline, carried into the M/U split: a fault is diagnosed and the
 /// emulator exits non-zero, never a hang.
-public func fatal(tag: String, cause: UInt, epc: UInt, tval: UInt, code: UInt) {
+public func fatal(tag: String, cause: UInt, epc: UInt, tval: UInt, code: ExitCode) {
     let uart = console()
     uart.write_str("SOS: fault ")
     uart.write_str(tag)
@@ -367,7 +392,7 @@ public func fatal(tag: String, cause: UInt, epc: UInt, tval: UInt, code: UInt) {
     uart.write_str(" tval=")
     uart.write_hex(tval)
     uart.write_str("\n")
-    finisher().exit_fail(code)
+    finisher().exit_fail(code as UInt)
 }
 
 // =============================================================================
@@ -458,8 +483,8 @@ public func ktrap(frame_addr: UInt, cause: UInt, tval: UInt) unsafe {
     let frame = UnsafeMemory<TrapFrame, Normal>(frame_addr)
     let epc = frame.mepc.read()
 
-    if cause != CAUSE_ECALL_FROM_U {
-        fatal(cause_tag(cause), cause, epc, tval, EXIT_CODE_UMODE_FAULT)
+    if cause != (TrapCause.EcallFromU as UInt) {
+        fatal(cause_tag(cause), cause, epc, tval, ExitCode.UmodeFault)
     }
 
     // §5.7: a0 = handle, a7 = op, args a1-a5.
@@ -544,7 +569,7 @@ public func fatal_image(reason: String, detail: UInt) {
     uart.write_str(" (")
     uart.write_hex(detail)
     uart.write_str(")\n")
-    finisher().exit_fail(EXIT_CODE_BAD_IMAGE)
+    finisher().exit_fail(ExitCode.BadImage as UInt)
 }
 
 /// Validate one segment record against the image bounds and the root region.
@@ -673,7 +698,7 @@ public func load_root_and_enter() unsafe {
     // The stack is the kernel's grant, not the image's: root asks for code and
     // data, the kernel decides where it runs.
     pmp_region(seg_count, ROOT_REGION_TOP - ROOT_STACK_LEN, ROOT_REGION_TOP,
-               PERM_R | PERM_W)
+               (PmpPerm.Read as UInt) | (PmpPerm.Write as UInt))
     pmp_commit()
 
     // spec §7: root's band map applies verbatim from its image. There is no
