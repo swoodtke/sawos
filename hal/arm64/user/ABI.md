@@ -1,9 +1,13 @@
 # arm64 user HAL — the seam
 
-The entire architecture-dependent surface of an SOS process on Profile B. A
-process names these four symbols and nothing else about its machine, which is
-what lets `sos/root/src/` build for both profiles with only its manifest
-changing — design 162 is the milestone that proved it rather than claiming it.
+The entire architecture-dependent surface of an SOS process on Profile B: ONE
+symbol. `sos/root/src/` builds for both profiles with only its manifest changing
+— design 162 is the milestone that proved it rather than claiming it.
+
+Design 172 part 2 shrank this from four symbols to one, for the reason set out
+in `sos/hal/riscv32/user/ABI.md`: the three that left named no architecture, so
+two per-arch C copies were two copies of one thing. They are Saw now, once, in
+`sos/kernel/sysapi/`.
 
 ## Which altitude is supported for whom
 
@@ -11,16 +15,18 @@ Unchanged from `sos/hal/riscv32/user/ABI.md`: typed Saw (`system.shutdown(0)`)
 for Saw processes, typed C (`sos_system_shutdown(h, 0)`) for other languages,
 and the raw `sos_syscall1(h, op, a)` for the HAL and the kernel package only.
 The first two are the kernel package's (`sos/kernel/sysapi/`), not this
-directory's; this directory supplies only the bottom of the chain.
+directory's; this directory supplies only the bottom of the chain. The typed C
+row's in-tree caller went away with the C sinks — see DF-172i, recorded there.
 
 ## Provided to a process
 
 | Symbol | Contract |
 |---|---|
 | `sos_syscall1(handle, op, arg0) -> status` | Perform one object op. Returns the status word. |
-| `sos_set_system_handle(handle)` | Remember the boot handle so the runtime's own sinks can use it. Must be called before anything can print or panic. |
-| `sos_rt_write(ptr, len)` | Write bytes to the debug console, via the System object. Called by `sos/rt/common_c/support.c`. |
-| `sos_rt_abort(code)` | Stop the machine, via the System object. Never returns. |
+
+The runtime's two hooks (`sos_rt_write`, `sos_rt_abort`) and the parked boot
+handle are still part of a process's contract; they are just not this
+directory's any more. See `sos/kernel/sysapi/src/lib.saw`.
 
 ## Required of a process
 
@@ -43,8 +49,9 @@ and the process keeps running — a bad call is an error, not a fault.
 
 ## What is arm64-specific here
 
-Only the register names and the `svc` instruction. The handle/op/status *shape*
-is the architecture-neutral part and belongs to the spec, not to this directory.
+Only the register names and the `svc` instruction — which, since design 172
+part 2, is the whole of this directory. The handle/op/status *shape* is the
+architecture-neutral part and belongs to the spec, not here.
 
 Two choices worth their sentence (design 162 decision 1, ratified):
 

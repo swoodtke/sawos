@@ -32,14 +32,12 @@ import sosabi.{SysOp, SosStatus, SystemHandle}
 // two cannot disagree about what a non-ASCII scalar becomes.
 import sosrt.{ascii_byte}
 
-// The per-arch HAL: the one instruction in the system that crosses the trap
-// boundary, plus the hook that lets the runtime's own panic path print. FIXED
-// ARITY on purpose — a varargs call across a trap boundary has no portable
-// register story, so a wider op gets `sos_syscall2` beside this, not an
-// ellipsis.
+// The per-arch HAL, and since design 172 part 2 the WHOLE of it: the one
+// instruction in the system that crosses the trap boundary. FIXED ARITY on
+// purpose — a varargs call across a trap boundary has no portable register
+// story, so a wider op gets `sos_syscall2` beside this, not an ellipsis.
 extern "C" {
     func sos_syscall1(handle: UInt, op: UInt, arg0: UInt) -> UInt
-    func sos_set_system_handle(handle: UInt)
 }
 
 // =============================================================================
@@ -152,8 +150,9 @@ public extension System {
     /// construction is for.
     public init(boot_handle: UInt) -> System {
         // The runtime's panic path prints through this same handle, so it has
-        // to be reachable from C before any Saw code can fail.
-        sos_set_system_handle(boot_handle)
+        // to be parked where the seams below can reach it before any Saw code
+        // can fail.
+        park_system_handle(boot_handle)
         System(handle: SystemHandle(boot_handle))
     }
 
@@ -176,5 +175,86 @@ public extension System {
     public func shutdown(&self, status: UInt) -> Result<Void, SosStatus> {
         checked(sos_system_shutdown(self.handle, status))
     }
+}
+
+// =============================================================================
+// The runtime's two hooks, process side (design 172 part 2)
+// =============================================================================
+//
+// `sosrt` implements the frozen `__saw_rt_*` seams over exactly two per-side
+// hooks — where a byte goes, and how the machine stops. The kernel HAL answers
+// "the UART" and "the board's stop". A PROCESS owns no device, so it answers
+// "a System op" to both, and that is the M/U split being real rather than
+// claimed: if `panic()` could reach a UART from userspace, it would not be.
+//
+// WHY THEY LIVE HERE and not in `sos/hal/<arch>/user/`, where they were C until
+// now. They name no architecture — a byte reaches the console through a System
+// op, which is the same op on both profiles — so two per-arch copies were two
+// copies of one thing. They belong to whoever owns the System object, which is
+// this module. What kept them C was DF-172e, the `noreturn` panic sink Saw
+// could not type; design 177 closed it, and `sos/hal/<arch>/user/syscall.c` is
+// now the syscall instruction and nothing else, exactly as its own header said
+// it should be.
+
+/// The boot handle, parked for the seams below.
+///
+/// The runtime seams take no handle — the ABI has no room for one — so the one
+/// root is given at boot is remembered here by `System.init` before anything
+/// can print. It is root's own authority being kept in root's own address
+/// space, NOT ambient authority: a process that was never given the handle has
+/// nothing to remember and its panics are simply silent.
+///
+/// `unsafe static var` (design 149) rather than an `Atomic`: it is plain
+/// compound process state written once at boot, and spec §7's uniprocessor
+/// argument covers it exactly as it covers the arena.
+unsafe static var SYSTEM_HANDLE: UInt = 0
+
+/// Park the boot handle. A small named `unsafe` helper is how design 136 says
+/// to confine contact with an unsafe-typed value, and it is what keeps the
+/// public `System(boot_handle:)` an ordinary safe signature.
+func park_system_handle(handle: UInt) unsafe {
+    SYSTEM_HANDLE = handle
+}
+
+/// Write `len` bytes at `ptr` to the debug console. THE PANIC PATH'S WRITER.
+///
+/// CHECK-FREE BY CONSTRUCTION, on the same terms as the kernel HAL's writer
+/// (DF-172b) and for the same reason: this runs while a panic is being
+/// reported, so a bounds check or an overflow check that tripped here would
+/// re-enter `__saw_rt_panic` and either hang or garble the one diagnostic that
+/// matters. So no indexing (raw `UnsafeMemory` reads), no allocation, no
+/// `String`, and a cursor that advances with WRAPPING arithmetic (`&+` / `&-`)
+/// so even a nonsensical length cannot raise an overflow trap.
+///
+/// A per-byte status is deliberately dropped. There is nowhere to report it TO
+/// — the console is the thing that would have failed — and inventing a second
+/// channel for "the console is broken" is how a panic path stops being one.
+/// The typed surface above is where a caller who CAN act on a failure gets it.
+@export("sos_rt_write")
+func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
+    if SYSTEM_HANDLE == 0 {
+        return
+    }
+    var addr = ptr as UInt
+    var left = len
+    while left != 0 {
+        let byte = UnsafeMemory<UInt8, Normal>(addr).read()
+        let _ = sos_system_debug_print(SYSTEM_HANDLE, byte as UInt)
+        addr = addr &+ 1
+        left = left &- 1
+    }
+}
+
+/// Stop the machine with `code`, for the common runtime.
+///
+/// `-> Never` is what `sosrt` declares this hook to be, and it is true twice
+/// over: `shutdown` does not return when it succeeds, and when it is refused —
+/// no handle was ever parked, or the right was stripped — there is nothing left
+/// to try, so the loop is what keeps a failed abort from running off the end of
+/// the granted region.
+@export("sos_rt_abort")
+func rt_abort(code: UInt32) unsafe -> Never {
+    let _ = sos_system_shutdown(SYSTEM_HANDLE, code as UInt)
+    while { }
 }
 

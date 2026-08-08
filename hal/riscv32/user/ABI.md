@@ -1,9 +1,16 @@
 # riscv32 user HAL — the seam
 
-The entire architecture-dependent surface of an SOS process. A process names
-these four symbols and nothing else about its machine, which is what should let
-`sos/root/src/` build for arm64 (design 79) with only the manifest's
-`[sos] native` line changing.
+The entire architecture-dependent surface of an SOS process: ONE symbol.
+`sos/root/src/` builds for arm64 with only the manifest's `[sos] native` line
+changing, and that line names one C file holding one function.
+
+Design 172 part 2 shrank this from four symbols to one. The three that left —
+`sos_set_system_handle`, `sos_rt_write` and `sos_rt_abort` — named no
+architecture: a byte reaches the console through a System op, which is the same
+op on both profiles, so two per-arch C copies were two copies of one thing. They
+are Saw now, once, in `sos/kernel/sysapi/`, beside the System object whose
+authority they use. What kept them here was DF-172e (a `noreturn` panic sink Saw
+could not type), which design 177 closed.
 
 ## Which altitude is supported for whom
 
@@ -17,19 +24,26 @@ not three (sos/spec.md §5.7):
 | raw | `sos_syscall1(h, op, a)` | **The HAL and the kernel package only.** It takes an op NUMBER, which is the thing the arrangement above exists to keep out of callers. Not a supported application interface. |
 
 The first two are the kernel package's (`sos/kernel/sysapi/`), not this
-directory's. This directory supplies only the bottom of the chain — the one
-instruction that crosses the trap boundary — plus the two runtime sinks, which
-themselves call the typed C surface rather than the raw form, so no op number
-appears in this HAL either.
+directory's. This directory supplies only the bottom of the chain: the one
+instruction that crosses the trap boundary. No op number appears in this HAL.
+
+**A note on the typed C row, recorded rather than hidden (DF-172i).** It is a
+SPECIFIED and linked interface with no in-tree caller since design 172 part 2 —
+the process-side runtime sinks used to be C and were its only consumer. It is
+still exactly what a non-Saw process would use, and the Saw sinks call the same
+functions, so its BODIES run on every boot; what no longer runs on every boot is
+a C caller crossing into them.
 
 ## Provided to a process
 
 | Symbol | Contract |
 |---|---|
 | `sos_syscall1(handle, op, arg0) -> status` | Perform one object op. Returns the status word; no M1 op returns a value, so the value half is not read. A `sos_syscall1_value` twin belongs beside this the day one does — the same way a wider op gets `sos_syscall2` rather than an ellipsis. |
-| `sos_set_system_handle(handle)` | Remember the boot handle so the runtime's own sinks can use it. Must be called before anything can print or panic. |
-| `sos_rt_write(ptr, len)` | Write bytes to the debug console, via the System object. Called by `sos/rt/common_c/support.c`. |
-| `sos_rt_abort(code)` | Stop the machine, via the System object. Never returns. |
+
+The runtime's two hooks (`sos_rt_write`, `sos_rt_abort`) and the parked boot
+handle are still part of a process's contract; they are just not this
+directory's any more. See `sos/kernel/sysapi/src/lib.saw`, and
+`sos/rt/common/src/lib.saw` for what calls them.
 
 ## Required of a process
 
@@ -52,6 +66,7 @@ the process keeps running — a bad call is an error, not a fault.
 
 ## What is riscv32-specific here
 
-Only the register names and the `ecall` instruction. The handle/op/status
-*shape* is the architecture-neutral part and belongs to the spec, not to this
-directory; an arm64 HAL implements the same five functions over `svc`.
+Only the register names and the `ecall` instruction — which, since design 172
+part 2, is the whole of this directory. The handle/op/status *shape* is the
+architecture-neutral part and belongs to the spec, not here; the arm64 HAL
+implements the same one function over `svc`.

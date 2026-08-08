@@ -5,22 +5,21 @@
 // arguments in, so this one file exists — and nothing else in a process needs
 // to know it is arm64.
 //
-// WHY EACH THING HERE IS C (design 172's reason sweep). The kernel side of
-// this HAL went almost entirely to Saw; the process side did not, and the
-// reasons are different for the two halves of the file:
+// WHY THIS IS C, and it is the only reason left (design 172's reason sweep):
+// the `svc` INSTRUCTION plus the register pinning the ABI requires. Neither has
+// a Saw spelling and neither will without inline asm, which design 172
+// explicitly does not open. PERMANENT as written.
 //
-//   - `sos_syscall1` : the `svc` INSTRUCTION plus the register pinning the ABI
-//     requires. Neither has a Saw spelling and neither will without inline asm,
-//     which design 172 explicitly does not open. PERMANENT as written.
-//   - the two hooks + the parked handle : these ARE expressible. They name no
-//     architecture — a byte reaches the console through a System op, which is
-//     the same op on both profiles — so they belong in ONE arch-free Saw
-//     module, not in two per-arch C files. What stops it today is the same
-//     thing that stopped design 172 unit 2 (DF-172e): the runtime seams they
-//     serve include a `noreturn` panic sink Saw cannot type. When that lands,
-//     this file should be `sos_syscall1` and nothing else.
+// This file used to carry the runtime's two hooks and a parked handle beside
+// the stub, and its own header said it should be `sos_syscall1` and nothing
+// else as soon as DF-172e closed. Design 177 closed it, so design 172 part 2
+// moved them: they name no architecture — a byte reaches the console through a
+// System op, which is the same op on both profiles — so two per-arch C copies
+// were two copies of one thing. They are one arch-free Saw module now, in
+// `sos/kernel/sysapi/`, beside the System object whose authority they use.
 //
-// `sos/hal/arm64/kernel/` is the kernel's counterpart.
+// `sos/hal/arm64/kernel/` is the kernel's counterpart; `sos/hal/riscv32/user/`
+// is this file for Profile A, and is now the same six lines.
 //
 // ABI (sos/spec.md §5.7): x0 = HANDLE, x8 = OP, args x1-x5, `svc #0`; returns
 // x0 = status word, x1 = value. Every syscall is an object op, so there is no
@@ -51,52 +50,4 @@ u64 sos_syscall1(u64 handle, u64 op, u64 arg0) {
                      : "r"(x8)
                      : "memory");
     return x0;
-}
-
-// ---- the two hooks the common runtime calls -------------------------------
-//
-// A process owns no device, so both hooks are System ops. That is the whole
-// point of the privilege split: if `panic()` could reach a UART directly, the
-// split would not be real.
-//
-// The runtime seams take no handle, so the one root is given at boot is parked
-// here by `sos_set_system_handle` before anything can print. It is root's own
-// authority being remembered in root's own address space — not ambient
-// authority, because a process that was never given the handle has nothing to
-// remember and its panics are simply silent.
-
-// These are the kernel package's `@export`ed C-ABI surface (the `sos` module,
-// sos/kernel/sysapi/) — the SUPPORTED interface for non-Saw callers. The sinks
-// below go through them rather than through `sos_syscall1` directly, which is
-// the point: no op number appears in this file, or anywhere outside the kernel
-// package. It also means the C altitude is exercised on every boot rather than
-// only by a test.
-u64 sos_system_debug_print(u64 handle, u64 byte);
-u64 sos_system_shutdown(u64 handle, u64 status);
-
-typedef unsigned int u32;
-typedef unsigned long usize;
-
-static u64 system_handle = 0;
-
-void sos_set_system_handle(u64 handle) {
-    system_handle = handle;
-}
-
-void sos_rt_write(const char *ptr, usize len) {
-    if (system_handle == 0) {
-        return;
-    }
-    for (usize i = 0; i < len; i++) {
-        sos_system_debug_print(system_handle, (u64)(unsigned char)ptr[i]);
-    }
-}
-
-__attribute__((noreturn))
-void sos_rt_abort(u32 code) {
-    sos_system_shutdown(system_handle, (u64)code);
-    // `shutdown` does not return. If the handle was never set, or the right
-    // was stripped, there is nothing left to try — do not run off the end of
-    // the granted region.
-    for (;;) { }
 }
