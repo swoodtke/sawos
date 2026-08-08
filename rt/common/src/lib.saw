@@ -1,14 +1,33 @@
-//! SOS common runtime helpers (design 140) — arch-free, role-free Saw.
+//! `sosrt` — the SOS runtime (designs 140, 172): arch-free, role-free Saw.
 //!
-//! The kernel and every SOS process end up doing the same two small things:
-//! turning a machine word into hex for a diagnostic, and pushing an ASCII
-//! string out one byte at a time. What DIFFERS is only where the byte goes —
-//! the kernel stores it to a UART register, a process passes it to a System op
-//! — so the byte-producing half belongs here and the sink stays with the side
-//! that owns the device.
+//! Two halves, one module, and the same argument for both: the kernel and every
+//! SOS process need exactly these, and differ only in where a byte ends up.
 //!
-//! Nothing here allocates, suspends, or names a target: no arena, no format
-//! machinery, no `String` building. That is what lets one module serve an
+//!   - THE DIAGNOSTIC HELPERS (the public surface, first below). Turning a
+//!     machine word into hex, and turning a Unicode scalar into a console byte.
+//!     The byte-PRODUCING half belongs here; the sink stays with the side that
+//!     owns the device.
+//!   - THE RUNTIME PROPER (second below). The four frozen `__saw_rt_*` seams
+//!     every compiled Saw program calls — write, panic, alloc, dealloc, spelled
+//!     out in `sawc/rt/ABI.md` — plus the bump arena behind the last two. These
+//!     have no Saw callers: the COMPILER emits the calls, and this module
+//!     answers them.
+//!
+//! ALL OF IT RESTS ON TWO PER-SIDE HOOKS AND NOTHING ELSE — where a byte goes,
+//! and how the machine stops:
+//!
+//!     sos_rt_write(ptr, len)      // supplied per side
+//!     sos_rt_abort(code)          // supplied per side, does not return
+//!
+//! The kernel HAL answers "the UART" and "the board's stop"
+//! (`sos/hal/<arch>/kernel/lib.saw`); a process answers "a System op" to both
+//! (`sos/kernel/sysapi/`). That second answer is the M/U split being real
+//! rather than claimed: if `panic()` could reach a UART from userspace, it
+//! would not be.
+//!
+//! Nothing here suspends and nothing names a target. No code here CALLS an
+//! allocator either — the arena below IS the one, and it hands out a fixed
+//! region it was given at link time. That is what lets one module serve an
 //! M-mode kernel and a U-mode process on two architectures.
 
 /// Hex digits in a MACHINE word on this target — eight on a 32-bit profile,
@@ -70,4 +89,152 @@ public func ascii_byte(scalar: Int) -> UInt8 {
     } else {
         scalar as UInt8
     }
+}
+
+// =============================================================================
+// The runtime seams (design 172 part 2)
+// =============================================================================
+//
+// These four `@export`s ARE the SOS runtime. `sawc/rt/ABI.md` freezes what a
+// compiled Saw program calls; the compiler emits the calls under every profile
+// and the environment supplies the bodies. Here is that environment.
+//
+// THE ONE THING THAT KEPT THEM IN C UNTIL NOW, since the file that held them
+// says the move should be taken deliberately: the ABI freezes `__saw_rt_panic`
+// as `noreturn`, and a Saw function could not be typed `Never` without CALLING
+// something that already was — which for the panic sink is circular, since this
+// IS what `panic()` reaches. Design 177 supplied the missing producer: a
+// conditionless `while { }` with no `break` types `Never`, so a Saw body can
+// satisfy the signature on its own. `sos_rt_abort` below is declared
+// `-> Never` for the same reason it was `__attribute__((noreturn))` in C, and
+// that is now a promise the type system carries rather than a comment.
+//
+// WHO TURNS THESE ON. `@export`ing a `__saw_rt_*` name is refused unless the
+// compile declares itself a runtime provider (design 149): the kernel builds
+// pass `--runtime-provider` from `tools/sos_runner.py`, and a process image
+// gets it from `[package] runtime = true` in its own manifest, because the
+// image's compile is where these definitions land. A compile that forgets it
+// gets a clean error naming the frozen set; a LINK that never compiled this
+// module gets an undefined `__saw_rt_write`. Neither failure is quiet.
+//
+// The signatures are machine-checked against `sawc/rt/ABI.md` (arity + machine
+// width), so editing one here without editing that document is a compile error.
+// Sizes and lengths are `UInt` rather than `Int` — same machine word, and the
+// unsigned reading is the one the bounds arithmetic below wants.
+
+// Where a byte goes, and how the machine stops. Everything below is written
+// against these two and nothing else. See the module header for who answers.
+// (A plain comment, not `///`: an `extern` block is a container, and design 121
+// attaches a doc block to a DECLARATION.)
+extern "C" {
+    func sos_rt_write(ptr: UnsafePointer<Int8>, len: UInt)
+    func sos_rt_abort(code: UInt32) -> Never
+}
+
+// Abort codes the RUNTIME raises on its own behalf. A side's own exit codes
+// live with that side; these two are ours, and they stay distinct so a
+// transcript can tell "the program panicked" from "the arena ran dry".
+static ABORT_PANIC: UInt32 = 64u32
+static ABORT_NO_MEMORY: UInt32 = 65u32
+
+/// `print`'s output primitive: `len` bytes at `ptr`, to whatever this side
+/// calls a console.
+@export("__saw_rt_write")
+func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
+    sos_rt_write(ptr, len)
+}
+
+/// The infallible-tier panic sink (design 19): report, then stop.
+///
+/// CHECK-FREE BY CONSTRUCTION, like the writers under it (DF-172b) — it does no
+/// arithmetic at all, so there is nothing here that could raise the panic it is
+/// in the middle of reporting.
+@export("__saw_rt_panic")
+func rt_panic(ptr: UnsafePointer<Int8>, len: UInt) unsafe -> Never {
+    sos_rt_write(ptr, len)
+    sos_rt_abort(ABORT_PANIC)
+}
+
+// -----------------------------------------------------------------------------
+// The bump arena
+// -----------------------------------------------------------------------------
+//
+// SOS allocates nothing on the steady path — the kernel's diagnostics and
+// root's banner are string literals walked byte by byte, and every kernel
+// source builds under `--no-hidden-alloc`. The arena exists because the
+// COMPILER's panic path can allocate, and an unbacked seam would turn a
+// diagnosable panic into a wild jump.
+//
+// No reclamation: `dealloc` is a no-op and the real slab allocator arrives with
+// the kernel object model (spec §4).
+
+/// The arena's region, sized ONCE. The length lives in this type and nowhere
+/// else: `arena_bytes()` reads it back with `sizeof`, and the initializer's own
+/// length is checked against it, so the size cannot be edited in one place and
+/// left stale in another.
+type ArenaRegion = [UInt8; 65536]
+
+/// The region and the cursor over it — compound global state whose consistency
+/// spans two words, which is what design 149's `unsafe static var` is for. The
+/// serialization argument is spec §7's: SOS v1 is a uniprocessor kernel and M1
+/// enables no interrupt sources, so no other agent can observe the window
+/// between the bound check and the cursor store. Enabling interrupts, SMP or
+/// preemption each invalidate that and take a `SpinLock` here.
+///
+/// An all-zero static costs no image bytes (design 149) — this is 64 KiB of
+/// `.bss`, not 64 KiB of ELF.
+unsafe static var ARENA: ArenaRegion = [0; 65536]
+unsafe static var ARENA_NEXT: UInt = 0
+
+/// The arena's capacity, read off the region's own type.
+func arena_bytes() -> UInt {
+    sizeof<ArenaRegion>() as UInt
+}
+
+/// The region's base address.
+func arena_base() unsafe -> UInt {
+    ((&var ARENA) as UnsafePointer<UInt8>) as UInt
+}
+
+/// Hand out `size` bytes aligned to `align`, or stop the machine.
+///
+/// ALIGNMENT IS APPLIED TO THE ABSOLUTE ADDRESS, not to the offset — which is
+/// where this differs from the C it replaces, and it is a fix rather than a
+/// translation. The C rounded `arena_next` up and returned `&arena[p]`, which
+/// only satisfies the caller if the REGION itself is at least as aligned as
+/// anything asked of it; a `[UInt8; N]` has an alignment of one, and so did the
+/// C array in principle. Rounding the address the caller actually receives is
+/// correct whatever the region landed on.
+///
+/// The bound is checked as a SUBTRACTION so a hostile `size` cannot wrap past
+/// it, exactly as the C did. The padding step uses `&-` because a checked one
+/// would put a panic branch inside the allocator for a subtraction that cannot
+/// go negative (`rem` is a remainder of `step`, so `rem < step` always) — the
+/// compiler cannot see that, and the allocator is not a place to spend a trap.
+@export("__saw_rt_alloc")
+func rt_alloc(size: UInt, align: UInt) unsafe -> UnsafePointer<Int8> {
+    var step = align
+    if step < 1 {
+        step = 1
+    }
+    let base = arena_base()
+    let capacity = arena_bytes()
+    var offset = ARENA_NEXT
+    let rem = (base &+ offset) % step
+    if rem != 0 {
+        offset = offset &+ (step &- rem)
+    }
+    if size > capacity || offset > capacity - size {
+        let msg = "sos: out of arena memory\n"
+        sos_rt_write(msg, UInt.from(truncating: msg.len()))
+        sos_rt_abort(ABORT_NO_MEMORY)
+    }
+    ARENA_NEXT = offset &+ size
+    (base &+ offset) as UnsafePointer<Int8>
+}
+
+/// Free a block. A bump arena reclaims nothing, so this is deliberately empty —
+/// see the section header for when that changes.
+@export("__saw_rt_dealloc")
+func rt_dealloc(ptr: UnsafePointer<Int8>, size: UInt, align: UInt) unsafe {
 }

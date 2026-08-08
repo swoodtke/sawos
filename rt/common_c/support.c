@@ -1,110 +1,43 @@
-// SOS common runtime support (design 140) — the C that must stay C, once.
+// SOS common runtime support (designs 140, 172) — the C that must stay C, once.
 //
-// Before this file, sos/kernel/rt.c and sos/root/src/rt.c held ~200 duplicated
-// lines: two bump arenas, two sets of mem* helpers, two atomic families, two
-// copies of the uniprocessor caveat. They differed in exactly two places —
-// where a byte goes and how the machine stops — so those two are the seam:
+// EVERY LINE IN THIS FILE IS C FOR ONE OF TWO REASONS, and both are PERMANENT.
+// Nothing here is waiting on a language feature; when this file was written it
+// also held a bump arena and the four `__saw_rt_*` seams, and design 172 part 2
+// moved those to Saw (`sos/rt/common/src/lib.saw`), which is what leaves the
+// two reasons below as the whole story.
 //
-//     void sos_rt_write(const char *ptr, usize len);   // supplied per side
-//     void sos_rt_abort(u32 code);                     // supplied per side
+//  1. mem* : a byte-copy loop written in Saw is exactly the pattern LLVM's
+//     loop-idiom recognizer rewrites into a call to `memcpy` — which, in a
+//     freestanding build where this IS memcpy, is a call to itself. Keeping
+//     these in C lets them be compiled with `-fno-builtin`, which is the
+//     supported way to say "do not do that". (Same reason libcs write them in
+//     assembly or with the same flag.)
 //
-// The kernel HAL writes to the UART and stops via the test finisher; the user
-// HAL writes through a System op and stops via another. Everything else is
-// here, once.
+//  2. the __atomic_* family : a compiler-generated LIBCALL, so it must exist
+//     under the name and signature the backend emits, for a build that does not
+//     name an atomics extension. There is nothing for Saw to express — the
+//     caller is codegen, not source. See the uniprocessor caveat below.
 //
-// WHY EACH THING HERE IS C AND NOT SAW (design 172's reason sweep):
+// So this file has no seam of its own any more and declares no hook. The two
+// per-side hooks it used to be written against — `sos_rt_write` and
+// `sos_rt_abort`, where a byte goes and how the machine stops — are still the
+// system's one runtime seam; they are just Saw on both ends now. See
+// `sos/rt/common/src/lib.saw` for that contract, and `sos/spec.md` §5c for the
+// C floor as a whole.
 //
-//  - mem* : a byte-copy loop written in Saw is exactly the pattern LLVM's
-//    loop-idiom recognizer rewrites into a call to `memcpy` — which, in a
-//    freestanding build where this IS memcpy, is a call to itself. Keeping
-//    these in C lets them be compiled with `-fno-builtin`, which is the
-//    supported way to say "do not do that". (Same reason libcs write them in
-//    assembly or with the same flag.) This reason is PERMANENT.
-//
-//  - the __atomic_* family : a compiler-generated LIBCALL, so it must exist
-//    under the name and signature the backend emits, for a build that does not
-//    name an atomics extension. There is nothing for Saw to express — the
-//    caller is codegen, not source. See the uniprocessor caveat below.
-//
-//  - the arena and the four seams : BLOCKED ON A LANGUAGE FEATURE, not on
-//    effort. Design 172 unit 2 probed the whole move and it works but for one
-//    signature: `sawc/rt/ABI.md` freezes `__saw_rt_panic` as `noreturn`, and
-//    Saw cannot type a diverging loop as `Never` — `func f() -> Never { while
-//    true { } }` is "body has no value". The only `Never` producers are
-//    `panic()`, which is what this seam IS, and an `extern` already declared
-//    noreturn, which Profile A no longer has since its finisher write became
-//    Saw. Splitting the family — three seams in Saw, one in C — was declined:
-//    it would leave this file with a story harder to state than the one it has.
-//    Filed as DF-172e. Everything ELSE about the move is measured and working:
-//    the bump arena is expressible (design 149's `unsafe static var` over a
-//    zero static), `--runtime-provider` permits the exports and checks them,
-//    and `sosrt` is already a dependency of both the kernel and every process.
-//
-// What design 172 DID move out of this layer: the board consoles, the machine
-// stops, the arm64 page tables, the PMP region staging and the kernel-fault
-// report are all Saw now, in sos/hal/<arch>/kernel/lib.saw. The arch-free,
-// role-free logic that was already Saw: sos/rt/common/.
+// What design 172 moved out of the SOS C layer over its two parts: the board
+// consoles, the machine stops, the arm64 page tables, the PMP region staging,
+// the kernel-fault report, the runtime seams, the arena, and the process side's
+// console/abort hooks. What is left, across the whole tree, is this file plus
+// four inline-asm leaves.
 
 typedef unsigned int   u32;
 typedef unsigned char  u8;
 typedef unsigned long  usize;   // ilp32: 32-bit, matches platform `Int`
 
-// ---- the two per-side hooks ----------------------------------------------
-
-void sos_rt_write(const char *ptr, usize len);
-
-__attribute__((noreturn))
-void sos_rt_abort(u32 code);
-
-// Abort codes this file raises on its own behalf. A side's own exit codes live
-// with that side; these are the runtime's.
-#define ABORT_PANIC      64u
-#define ABORT_NO_MEMORY  65u
-
-// ---- runtime seams --------------------------------------------------------
-
-void __saw_rt_write(const char *ptr, usize len) {
-    sos_rt_write(ptr, len);
-}
-
-__attribute__((noreturn))
-void __saw_rt_panic(const char *msg, usize len) {
-    sos_rt_write(msg, len);
-    sos_rt_abort(ABORT_PANIC);
-}
-
-// A bump arena over a fixed .bss region. SOS allocates nothing on the steady
-// path — the kernel's diagnostics and root's banner are string literals walked
-// byte by byte — but the compiler's panic path can allocate, and an unbacked
-// seam would turn a diagnosable panic into a wild jump. No reclamation:
-// `dealloc` is a no-op and the real slab allocator arrives with the kernel
-// object model (spec §4).
-#ifndef SOS_ARENA_BYTES
-#define SOS_ARENA_BYTES (64u * 1024u)
-#endif
-
-static u8    arena[SOS_ARENA_BYTES];
-static usize arena_next = 0;
-
-void *__saw_rt_alloc(usize size, usize align) {
-    if (align < 1) align = 1;
-    usize p = (arena_next + (align - 1)) & ~(align - 1);
-    // Checked as a subtraction so a hostile `size` cannot wrap the bound.
-    if (size > SOS_ARENA_BYTES || p > SOS_ARENA_BYTES - size) {
-        sos_rt_write("sos: out of arena memory\n", 25);
-        sos_rt_abort(ABORT_NO_MEMORY);
-    }
-    arena_next = p + size;
-    return &arena[p];
-}
-
-void __saw_rt_dealloc(void *ptr, usize size, usize align) {
-    (void)ptr; (void)size; (void)align;
-}
-
 // ---- mem* (the compiler's implicit block-copy / zero helpers) -------------
 //
-// Compiled with -fno-builtin; see the header note.
+// Compiled with -fno-builtin; see reason 1 in the header.
 
 void *memset(void *dst, int c, usize n) {
     u8 *d = (u8 *)dst;

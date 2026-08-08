@@ -201,19 +201,26 @@ public func exit_fail(code: UInt) unsafe {
 // The runtime's two hooks (design 172 unit 4)
 // =============================================================================
 //
-// `sos/rt/common_c/support.c` implements the frozen `__saw_rt_*` seams over
-// exactly two per-side hooks: where a byte goes, and how the machine stops. The
-// kernel HAL answers "the UART" and "the test finisher". Both were C; both are
-// Saw now.
+// `sosrt` (sos/rt/common/src/lib.saw) implements the frozen `__saw_rt_*` seams
+// over exactly two per-side hooks: where a byte goes, and how the machine
+// stops. The kernel HAL answers "the UART" and "the test finisher". Both hooks
+// were C; both are Saw now, and since design 172 part 2 so is everything above
+// them.
 
 /// Stop the machine with a non-zero status, for the common runtime.
 ///
 /// The promote-zero rule lives in `exit_fail`, so this is the seam name and
 /// nothing else — there is one place that decides a failing exit never reads as
 /// a passing one.
+///
+/// `-> Never` states in the type what the C spelled `__attribute__((noreturn))`
+/// and what `sosrt` declares this hook to be. `exit_fail` diverges on its own
+/// (it spins if the finisher write is somehow ignored) but is typed `Void`, so
+/// the trailing loop is what carries the promise up to this signature.
 @export("sos_rt_abort")
-public func rt_abort(code: UInt32) unsafe {
+public func rt_abort(code: UInt32) unsafe -> Never {
     exit_fail(code as UInt)
+    while { }
 }
 
 /// Write `len` bytes at `ptr` to the console. THE PANIC PATH'S WRITER.
@@ -237,7 +244,7 @@ public func rt_abort(code: UInt32) unsafe {
 /// allocation or a checked `+` silently retires that guarantee, so re-read the
 /// IR if you touch either.
 @export("sos_rt_write")
-public func rt_write(ptr: UnsafePointer<UInt8>, len: UInt) unsafe {
+public func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
     var addr = ptr as UInt
     var left = len
     while left != 0 {
