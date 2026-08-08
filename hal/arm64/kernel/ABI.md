@@ -23,6 +23,14 @@ instruction with no Saw spelling, or a linker symbol's address (DF-172a).
 Identical in name and meaning to the riscv32 HAL's — that table is not repeated
 here. What follows is only what this profile does differently, and why.
 
+The design 172 review round changed how much of that surface this file writes,
+not the surface: the poll-and-place, the panic path's write LOOP and the
+exit-status promotion are `sosrt`'s, once, for both profiles. What stays here is
+the DEVICE, and the PL011's polarity is the reason this is a trait rather than a
+shared function — readiness is FR bit 5 CLEAR (transmit FIFO not full), the
+opposite sense to the 16550's LSR bit 5 SET, and `put` stores a `UInt32` to DR
+rather than a byte to THR.
+
 ## The native half
 
 | Symbol | Where | Contract | Why not Saw |

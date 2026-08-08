@@ -39,6 +39,14 @@ states its own reason at the top of its section.
 | `syscall_return(frame, status, value)` | Place the (status, value) pair where the caller reads them and step the saved PC past the trapping instruction — which is a no-op on a profile whose trap already points past it. |
 | `UNMAPPED_PROBE: UInt` | An address the KERNEL cannot reach here. The harness's kernel-fault case reads it; it is per-target because "unmapped" is. |
 
+This surface is unchanged by the design 172 review round; what changed is how
+much of it this file writes. `console_byte`, `exit_fail` and the `sos_rt_write`
+seam are now thin over `sosrt`: the poll-and-place (`ConsoleSink.write_byte`),
+the panic path's write LOOP (`console_write`, generic and monomorphized here)
+and the exit-status promotion (`abort_status`) live there, once, for both
+profiles. What stays here is the DEVICE — `can_write` reads LSR bit 5, `put`
+stores to THR — and the mechanism that stops the machine.
+
 ## The native half (`boot.S`, `sink.c`)
 
 | Symbol | Where | Contract | Why not Saw |

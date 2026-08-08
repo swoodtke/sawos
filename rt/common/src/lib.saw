@@ -4,9 +4,11 @@
 //! SOS process need exactly these, and differ only in where a byte ends up.
 //!
 //!   - THE DIAGNOSTIC HELPERS (the public surface, first below). Turning a
-//!     machine word into hex, and turning a Unicode scalar into a console byte.
-//!     The byte-PRODUCING half belongs here; the sink stays with the side that
-//!     owns the device.
+//!     machine word into hex, turning a Unicode scalar into a console byte, and
+//!     — since the design 172 review round — the `ConsoleSink` trait with the
+//!     ONE write loop over it, plus the abort-status promotion. What stays with
+//!     the side that owns the device is now only the device: two register
+//!     touches per HAL, and the mechanism that stops the machine.
 //!   - THE RUNTIME PROPER (second below). The four frozen `__saw_rt_*` seams
 //!     every compiled Saw program calls — write, panic, alloc, dealloc, spelled
 //!     out in `sawc/rt/ABI.md` — plus the bump arena behind the last two. These
@@ -89,6 +91,102 @@ public func ascii_byte(scalar: Int) -> UInt8 {
     } else {
         scalar as UInt8
     }
+}
+
+// =============================================================================
+// The console sink, and the ONE write loop over it (design 172 review round)
+// =============================================================================
+//
+// Both kernel HALs had the same twelve lines: poll a status register, place a
+// byte, advance a cursor with wrapping arithmetic, count down. Only the two
+// register touches differed — a 16550 polls LSR bit 5 for "TX holding register
+// empty", a PL011 polls FR bit 5 for "transmit FIFO full", opposite senses of
+// opposite bits on differently-shaped blocks. That is a DEVICE difference, and
+// it is the only thing that belongs in a HAL.
+//
+// So the device is a trait and the loop is written once, generic over it. The
+// bound is static: `console_write<S: ConsoleSink>` MONOMORPHIZES per sink, one
+// instantiation per architecture, and there is no vtable, no existential and no
+// indirect call anywhere on the panic path.
+//
+// THE CHECK-FREEDOM CONTRACT COMES WITH IT, and it is the reason this is worth
+// stating rather than assuming. The panic reporter runs while a panic is being
+// reported, so a bounds check or an overflow check that tripped here would
+// re-enter `__saw_rt_panic` and either hang or garble the one diagnostic that
+// matters. The loop below earns that the same way the per-HAL copies did (see
+// DF-172b): raw `UnsafeMemory` reads rather than indexing, no allocation, no
+// `String`, and a cursor that advances with `&+` / `&-` so even a nonsensical
+// length cannot raise an overflow trap.
+//
+// Generic-ness does not weaken it, and that was checked rather than hoped:
+// `--emit-ir` on BOTH monomorphizations shows the trait default body and both
+// accessor bodies fully inlined, leaving `ptrtoint`, a plain `load i8`, the
+// device's volatile load, an `and`, an `icmp`, the volatile store, and
+// `add`/`add -1` — no `llvm.uadd.with.overflow`, no bounds check, no trap block
+// and no call to `__saw_rt_panic` in either. Re-read the IR of both if you
+// touch this loop or either sink.
+
+/// A byte-oriented console the kernel can reach with no allocator, no
+/// interrupts and no driver state beyond the register block itself.
+///
+/// Two requirements, because two is what a polled transmitter is: ask whether
+/// the device will take a byte, and give it one. Splitting them is what lets
+/// the WAITING live here, once, instead of in each HAL.
+public trait ConsoleSink {
+    /// Can the device accept a byte right now?
+    func can_write(&self) -> Bool
+
+    /// Place one byte. Called only when `can_write()` has answered true.
+    func put(&self, b: UInt8)
+
+    /// Spin until the device is ready, then place one byte.
+    ///
+    /// A default body rather than a requirement: every polled transmitter waits
+    /// the same way, and a HAL that overrode this would be saying something
+    /// about its device that `can_write` should have said instead.
+    func write_byte(&self, b: UInt8) {
+        while not self.can_write() {
+        }
+        self.put(b)
+    }
+}
+
+/// Write `len` bytes at `ptr` to `sink`. THE PANIC PATH'S WRITE LOOP, once.
+///
+/// Check-free by construction — see the section header for what that means and
+/// how it is verified.
+public func console_write<S: ConsoleSink>(sink: &S, ptr: UnsafePointer<Int8>,
+                                          len: UInt) unsafe {
+    var addr = ptr as UInt
+    var left = len
+    while left != 0 {
+        sink.write_byte(UnsafeMemory<UInt8, Normal>(addr).read())
+        addr = addr &+ 1
+        left = left &- 1
+    }
+}
+
+// A failing exit must never read as a passing one, and both HALs said so in
+// their own copy of these three lines.
+static ABORT_CODE_MASK: UInt = 0xFF
+static ABORT_CODE_MIN: UInt = 1
+
+/// The exit status a failing abort actually carries: `code` narrowed to the
+/// byte an exit status is, with zero promoted.
+///
+/// The promotion is the whole point. A machine-stop mechanism reports one byte,
+/// and `0` is what "the run passed" looks like — so an abort raised with a code
+/// that happens to be zero, or whose low byte is, would exit clean and turn a
+/// failure into a green run. Deciding that ONCE is what keeps the two HALs from
+/// drifting on it.
+///
+/// The mechanism stays per-arch: this says WHAT status, not how to stop.
+public func abort_status(code: UInt) -> UInt {
+    let masked = code & ABORT_CODE_MASK
+    if masked == 0 {
+        return ABORT_CODE_MIN
+    }
+    masked
 }
 
 // =============================================================================

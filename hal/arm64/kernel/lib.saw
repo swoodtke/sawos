@@ -22,7 +22,11 @@ import imgformat.{SosimgArch, SegFlag}
 // ABOVE it and cannot be imported from here — so it reaches for the same
 // helpers the kernel console does, and the two agree on what a non-ASCII scalar
 // becomes and on how wide a machine word is.
-import sosrt.{ascii_byte, hex_digit_of, hex_digits_per_word}
+// The last three are the arch-free half of the console and the stop: the sink
+// trait this file's UART conforms to, the one write loop over it, and the
+// exit-status promotion both HALs used to spell out (design 172 review round).
+import sosrt.{ascii_byte, hex_digit_of, hex_digits_per_word,
+              ConsoleSink, console_write, abort_status}
 
 // =============================================================================
 // PL011 UART (design 112's blessed MMIO idiom: register block + driver)
@@ -52,13 +56,25 @@ extension Pl011 {
     init(at: UInt) unsafe -> Pl011 {
         Pl011(regs: UnsafeMemory<Pl011Regs, Device>(at))
     }
+}
 
-    /// Poll the transmit-FIFO-full flag, then write one byte to the data
-    /// register — no interrupts in M1. QEMU's PL011 comes up transmitting, so
-    /// there is no baud-rate or line-control programming to do; a real board
-    /// would need it and it would go here.
-    func write_byte(&self, b: UInt8) unsafe {
-        while (self.regs.fr.read() & FR_TX_FULL) != 0u32 { }
+/// The two register touches, and nothing else — no interrupts in M1, so the
+/// transmitter is polled. QEMU's PL011 comes up transmitting, so there is no
+/// baud-rate or line-control programming to do; a real board would need it and
+/// it would go in `init`.
+///
+/// `write_byte` and the panic path's write LOOP are `sosrt`'s, once, generic
+/// over this conformance and monomorphized here (design 172 review round). What
+/// makes a PL011 a PL011 is the pair below, and note that it is the OPPOSITE
+/// sense to the 16550's: readiness is FR bit 5 CLEAR (the transmit FIFO is not
+/// full), and the byte goes to DR. Having each HAL answer `can_write` in its
+/// own terms is what lets one loop serve both.
+extension Pl011: ConsoleSink {
+    func can_write(&self) unsafe -> Bool {
+        (self.regs.fr.read() & FR_TX_FULL) == 0u32
+    }
+
+    func put(&self, b: UInt8) unsafe {
         self.regs.dr.write(b as UInt32)
     }
 }
@@ -171,20 +187,16 @@ public func exit_pass() {
     while true { }
 }
 
-/// Stop the machine with a NON-ZERO status. A zero code would report success,
-/// so it is promoted to `FAIL_CODE_MIN` — a failing exit never reads as a
-/// passing one.
+/// Stop the machine with a NON-ZERO status.
+///
+/// WHAT status is `sosrt.abort_status`'s call — a zero code would report
+/// success, and the rule that a failing exit never reads as a passing one is
+/// decided once, for both profiles. HOW to stop is this file's: a semihosting
+/// exit through the C leaf.
 public func exit_fail(code: UInt) {
-    var status = code & FAIL_CODE_MASK
-    if status == 0 {
-        status = FAIL_CODE_MIN
-    }
-    sos_platform_exit(status)
+    sos_platform_exit(abort_status(code))
     while true { }
 }
-
-static FAIL_CODE_MASK: UInt = 0xFF
-static FAIL_CODE_MIN: UInt = 1
 
 // =============================================================================
 // The runtime's two hooks (design 172 unit 4)
@@ -214,33 +226,22 @@ public func rt_abort(code: UInt32) -> Never {
 
 /// Write `len` bytes at `ptr` to the console. THE PANIC PATH'S WRITER.
 ///
-/// CHECK-FREE BY CONSTRUCTION, and that is the whole contract rather than a
-/// nice property. This runs while a panic is being reported, so a bounds check
-/// or an overflow check that tripped here would call `__saw_rt_panic` again and
-/// either hang or garble the one diagnostic that matters. So: no indexing (raw
-/// `UnsafeMemory` reads), no allocation, no `String`, and the cursor advances
-/// with WRAPPING arithmetic (`&+` / `&-`) so even a nonsensical length cannot
-/// raise an overflow trap.
+/// The loop itself is `sosrt.console_write`, once for both profiles, and its
+/// CHECK-FREEDOM contract (DF-172b) is stated there — this file supplies the
+/// device it walks. What is per-arch is the sink; what is per-arch about the
+/// sink is two register touches.
 ///
-/// Verified rather than asserted (DF-172b): `--emit-ir` over this function and
-/// everything it calls shows `ptrtoint`, a plain `load i8`, `add`/`sub` — not
-/// `llvm.uadd.with.overflow` — an `icmp`, a `getelementptr inbounds`, and the
-/// driver's volatile MMIO load and store. There is no check, no trap block and
-/// no call to `__saw_rt_panic` anywhere in it. A panic inside the panic
-/// reporter is not unlikely here; it is unreachable.
-///
-/// A change to this function or to `console_byte` that introduces an index, an
-/// allocation or a checked `+` silently retires that guarantee, so re-read the
-/// IR if you touch either.
+/// Verified rather than asserted, on THIS instantiation: `--emit-ir` shows the
+/// generic loop, the trait's default `write_byte` and both accessor bodies
+/// fully inlined, leaving `ptrtoint`, a plain `load i8`, the volatile FR load,
+/// an `and`, an `icmp`, the volatile DR store and `add`/`add -1`. No
+/// `llvm.uadd.with.overflow`, no bounds check, no trap block, no call to
+/// `__saw_rt_panic`. A panic inside the panic reporter is not unlikely here; it
+/// is unreachable.
 @export("sos_rt_write")
 public func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
-    var addr = ptr as UInt
-    var left = len
-    while left != 0 {
-        console_byte(UnsafeMemory<UInt8, Normal>(addr).read())
-        addr = addr &+ 1
-        left = left &- 1
-    }
+    let sink = Pl011(at: UART_BASE)
+    console_write(&sink, ptr, len)
 }
 
 // =============================================================================
