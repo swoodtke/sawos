@@ -411,7 +411,7 @@ cost, and what it proved:
   were byte-compatible wrappers around incompatible instructions and the
   only thing stopping one booting on the other was that nobody had tried.
 
-## 5c. The native floor (design 172, Aug 7)
+## 5c. The native floor (design 172, both parts, Aug 7)
 
 SOS is written in Saw, and the exceptions are ENUMERATED rather than tolerated.
 Every surviving line of C states, in the file that holds it, why it is not Saw —
@@ -434,11 +434,25 @@ and there are only three reasons in the whole system:
    static emits a definition rather than a reference. Four accessor bodies, two
    per profile. Filed as DF-172a.
 
-What that cost, measured: the C went from 383 code lines to 207, a 46%
-reduction, and the two kernel HALs took nearly all of it — `sink.c` is 170 code
-lines to 47 on arm64 and 75 to 22 on riscv32. What moved: both board consoles
-and both machine-stops, the arm64 static identity map and its grant editing, the
-riscv32 PMP region staging, and the kernel-fault report with its hex formatting.
+What that cost, measured: the C went from 383 code lines to 135, a 65%
+reduction, over two passes.
+
+Part 1 took it to 207, nearly all of it out of the two kernel HALs — `sink.c` is
+170 code lines to 47 on arm64 and 75 to 22 on riscv32. What moved: both board
+consoles and both machine-stops, the arm64 static identity map and its grant
+editing, the riscv32 PMP region staging, and the kernel-fault report with its
+hex formatting.
+
+Part 2 took it to 135, out of the two places part 1 could not reach. The bump
+arena and the four `__saw_rt_*` seams are Saw in `sos/rt/common/src/lib.saw`,
+one copy serving the kernel and every process; the process side's two hooks and
+its parked boot handle are Saw in `sos/kernel/sysapi/`, beside the System object
+whose authority they spend. Both user HALs are now their syscall instruction and
+nothing else, and `sos/rt/common_c/support.c` is `mem*` and the atomic libcalls
+— reason 2, and reason 2 only.
+
+So the floor is one shared C file plus four inline-asm leaves, and every one of
+them is reason 1 or reason 2. Reason 3 is the only open language gap.
 
 **The panic path is the interesting one.** The console writer the runtime seams
 call is now Saw, and it is CHECK-FREE BY CONSTRUCTION rather than by
@@ -450,15 +464,24 @@ back into `__saw_rt_panic`. A harness case pins it on both machines by taking a
 compiler-raised bounds check and asserting the message arrives in three
 independent pieces.
 
-**One thing is blocked on the LANGUAGE, not on effort** (DF-172e): the bump
-arena and the `__saw_rt_*` seams in `sos/rt/common_c/support.c`. Every part of
-that move was probed and works — the arena is expressible, `--runtime-provider`
-permits and checks the exports, and `sosrt` is already a dependency of both the
-kernel and every process — except one signature. `rt/ABI.md` freezes
-`__saw_rt_panic` as `noreturn`, and Saw cannot type a diverging loop as `Never`.
-The two things that produce `Never` are `panic()`, which is what the seam IS,
-and an `extern` already declared noreturn, which Profile A no longer has now
-that its finisher write is Saw.
+**What blocked part 2, and what unblocked it** (DF-172e, now CLOSED). The seams
+were the one place the diet stalled on the LANGUAGE rather than on effort. Every
+part of the move had been probed and worked — the arena is expressible,
+`--runtime-provider` permits and checks the exports, and `sosrt` is already a
+dependency of both the kernel and every process — except one signature.
+`rt/ABI.md` freezes `__saw_rt_panic` as `noreturn`, and the only things that
+produced `Never` were `panic()`, which is what the seam IS, and an `extern`
+already declared noreturn, which Profile A lost when its finisher write became
+Saw. Design 177 supplied the missing producer: a conditionless `while { }` with
+no `break` types `Never`. The seams landed unchanged in every other respect,
+which is what the probing bought.
+
+**Who declares the runtime.** `@export`ing a frozen `__saw_rt_*` name needs the
+COMPILE to say it implements the ABI (design 149), so `tools/sos_runner.py`
+passes `--runtime-provider` for kernel images (a kernel is not a Blade package)
+and a process image carries `[package] runtime = true`. The seam bodies arrive
+from a dependency in both cases, which is sound because the flag describes the
+compile and a package build compiles its whole module graph into one unit.
 
 ## 6. Explicitly NOT in the kernel
 
@@ -741,8 +764,10 @@ event-driven EDGE of a process gets a second, distinct construct:
     `make sos-test` is 11 cases including the two-image boot, a root that
     oversteps its grant, and one that makes bad calls and checks the statuses.
     Structure: `sos/kernel/core/lib.saw` is shared by every kernel image, which
-    keeps them all on the same trap path; `sos/rt/common/` (Saw) and
-    `sos/rt/common_c/support.c` (the C that must stay C) are shared by the
+    keeps them all on the same trap path; `sos/rt/common/` (Saw — since design
+    172 part 2 the runtime seams and the arena too) and
+    `sos/rt/common_c/support.c` (the C that must stay C: `mem*` and the atomic
+    libcalls) are shared by the
     kernel and every process; and the architecture lives in
     `sos/hal/riscv32/{kernel,user}/`, each with an ABI.md, so M1b (design 162)
     ADDS `sos/hal/arm64/...` without moving any of it.
