@@ -1,0 +1,113 @@
+// design 158 unit 3, freestanding: the task dump on bare metal, under QEMU.
+//
+// This is the payoff the design was sold on. A kernel that dies with work in
+// flight has no debugger attached and no core to open; what it has is a serial
+// port. The dump walks its own task slots through the in-binary table and
+// writes every live task's logical stack straight to that port — no allocator,
+// no unwinder, no host, and built under `--no-hidden-alloc` like every other
+// kernel image.
+//
+// The kernel spawns a task, lets it park in a sleep, and dumps; then it panics
+// while that task is still parked, and the panic path dumps again on its own.
+// So the serial transcript carries both halves of unit 3 in order: the explicit
+// `dump_tasks()` and the automatic post-panic one.
+//
+// THE STUB SEAMS BELOW ARE THIS TEST'S, not a kernel facility. SOS has no
+// reactor and no clock, and the cooperative executor's PARK path names both —
+// a freestanding link needs every name resolved even down a branch nothing
+// takes. These tasks only ever yield, so none of these is ever called; each
+// body is the honest "there is no such facility on this machine" answer rather
+// than a pretend one. `--runtime-provider` checks every signature against
+// sawc/rt/ABI.md, so they cannot drift from the contract they satisfy.
+//
+// ARM64 ONLY, and DF-158c is why: on a 32-bit target an `@export`ed seam
+// returning `Int64` is emitted `i32` (and one returning `Int` is emitted i64),
+// so the clock stub below and the executor's own `Int64` clock arithmetic
+// disagree and LLVM rejects the module. That is a pre-existing compiler bug
+// about `@export` return widths, not about anything here — riscv32 gets the
+// no-live-tasks case (`taskdump_empty`) until it is fixed.
+
+import kcore
+import std.task.*
+
+@export("__saw_rt_reactor_create")
+func rt_reactor_create() -> Int {
+    0
+}
+
+@export("__saw_rt_reactor_destroy")
+func rt_reactor_destroy(r: Int) {
+}
+
+@export("__saw_rt_reactor_register")
+func rt_reactor_register(r: Int, fd: Int, write: Int, token: Int) {
+}
+
+@export("__saw_rt_reactor_unregister")
+func rt_reactor_unregister(r: Int, fd: Int, write: Int) {
+}
+
+@export("__saw_rt_reactor_poll")
+func rt_reactor_poll(r: Int, timeout_ms: Int) -> Int {
+    0
+}
+
+@export("__saw_rt_reactor_wake")
+func rt_reactor_wake(r: Int) {
+}
+
+@export("__saw_rt_sleep_ns")
+func rt_sleep_ns(ns: Int64) {
+}
+
+@export("__saw_rt_clock_monotonic_nanos")
+func rt_clock_monotonic_nanos() -> Int64 {
+    0 as Int64
+}
+
+@export("__saw_rt_op_budget_tick")
+func rt_op_budget_tick() -> Int {
+    0
+}
+
+@export("__saw_rt_op_budget_reset")
+func rt_op_budget_reset() {
+}
+
+// The thread and mutex stand-ins the MT drain names live in
+// `taskdump_stubs.c`, not here: `__saw_rt_thread_spawn` takes a raw C function
+// pointer, which Saw cannot express (DF-113b), so it is one of the three bodies
+// that must be C wherever it appears.
+
+// ONE frame deep, and DF-158e is why: the freestanding profile compiles to an
+// object, an object compile does not treat `main` as an entry, and without that
+// the transform never embeds a nested suspending callee — `ksleeper` calling a
+// suspending helper would call it BLOCKING instead. So this task parks in its
+// own body, and the multi-frame nest lives in the hosted tests
+// (`examples/task_backtrace_nest.saw`) until that is fixed. Everything else
+// about the walk is the same code on both sides.
+//
+// It SLEEPS rather than yielding: a yield leaves the task ready, and the sweep
+// would run it to completion before the watcher's turn.
+func ksleeper(n: Int) -> Int {
+    sleep(Duration.ms(5))
+    n * 2
+}
+
+// (The explicit `return` is load-bearing: a suspending call in a Void body's
+// TAIL position is rejected by the coroutine transform — DF-158b.)
+func kwatcher() {
+    dump_tasks()
+    return
+}
+
+@export("kmain")
+func kmain() {
+    var g = TaskGroup()
+    let a = g.spawn(ksleeper(4))
+    let b = g.spawn(kwatcher())
+    b.join()
+    // The panic runs while `a` is STILL PARKED, so the panic path has a live
+    // task to dump on its own — the automatic half of unit 3, on bare metal.
+    panic("SOS task dump: deliberate panic")
+}
