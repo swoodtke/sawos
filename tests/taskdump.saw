@@ -79,19 +79,24 @@ func rt_op_budget_reset() {
 // pointer, which Saw cannot express (DF-113b), so it is one of the three bodies
 // that must be C wherever it appears.
 
-// ONE frame deep, and DF-158e is why: the freestanding profile compiles to an
-// object, an object compile does not treat `main` as an entry, and without that
-// the transform never embeds a nested suspending callee — `ksleeper` calling a
-// suspending helper would call it BLOCKING instead. So this task parks in its
-// own body, and the multi-frame nest lives in the hosted tests
-// (`examples/task_backtrace_nest.saw`) until that is fixed. Everything else
-// about the walk is the same code on both sides.
+// TWO frames deep, which is the honest proof of the walk on bare metal: the
+// dump has to reconstruct a logical stack the machine has no record of. It was
+// one frame until design 187 closed DF-158e — the freestanding profile compiles
+// to an object, an object compile did not treat `main` as an entry, and without
+// that the transform never embedded a nested suspending callee, so `ksleeper`
+// calling `knap` would have called it BLOCKING and the park would have run
+// inline on the kernel's only stack.
 //
-// It SLEEPS rather than yielding: a yield leaves the task ready, and the sweep
-// would run it to completion before the watcher's turn.
-func ksleeper(n: Int) -> Int {
+// `knap` SLEEPS rather than yielding: a yield leaves the task ready, and the
+// sweep would run it to completion before the watcher's turn.
+func knap(n: Int) -> Int {
     sleep(Duration.ms(5))
     n * 2
+}
+
+func ksleeper(n: Int) -> Int {
+    let r = knap(n)
+    r
 }
 
 // (The explicit `return` is load-bearing: a suspending call in a Void body's
