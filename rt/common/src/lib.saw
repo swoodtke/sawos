@@ -232,8 +232,14 @@ extern "C" {
 // Abort codes the RUNTIME raises on its own behalf. A side's own exit codes
 // live with that side; these two are ours, and they stay distinct so a
 // transcript can tell "the program panicked" from "the arena ran dry".
-static ABORT_PANIC: UInt32 = 64u32
-static ABORT_NO_MEMORY: UInt32 = 65u32
+//
+// A closed named set is a backed enum rather than a family of statics (design
+// 153), on the same terms as the kernel's `ExitCode`; the backing is the width
+// `sos_rt_abort` takes, so the projection at the call is one `as`.
+enum AbortCode: UInt32 {
+    case Panic = 64,
+    case NoMemory = 65
+}
 
 /// `print`'s output primitive: `len` bytes at `ptr`, to whatever this side
 /// calls a console.
@@ -250,7 +256,7 @@ func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
 @export("__saw_rt_panic")
 func rt_panic(ptr: UnsafePointer<Int8>, len: UInt) unsafe -> Never {
     sos_rt_write(ptr, len)
-    sos_rt_abort(ABORT_PANIC)
+    sos_rt_abort(AbortCode.Panic as UInt32)
 }
 
 // -----------------------------------------------------------------------------
@@ -325,7 +331,7 @@ func rt_alloc(size: UInt, align: UInt) unsafe -> UnsafePointer<Int8> {
     if size > capacity || offset > capacity - size {
         let msg = "sos: out of arena memory\n"
         sos_rt_write(msg, UInt.from(truncating: msg.len()))
-        sos_rt_abort(ABORT_NO_MEMORY)
+        sos_rt_abort(AbortCode.NoMemory as UInt32)
     }
     ARENA_NEXT = offset &+ size
     (base &+ offset) as UnsafePointer<Int8>
