@@ -1,0 +1,206 @@
+// SOS M2 unit 3: Events and a Waiter, in ONE thread (design 178 D5; spec §2.2,
+// §2.4).
+//
+// Nothing here parks, and that is the point of splitting it from `event-wake`:
+// every claim below is about what an Event ACCUMULATES and what a Waiter
+// REPORTS, with the scheduler held out of it. The transcript is six lines and
+// each is a separate ratified sentence:
+//
+//   signal-then-wait key=11 signalled=1 word=4   <- §2.2 level-triggered: the
+//                                                   signal came FIRST and was
+//                                                   still there
+//   second key=22 signalled=1 word=8             <- §2.2 the key identifies
+//                                                   WHICH of two attachments
+//   or key=11 word=3                             <- §2.4 bitwise-OR: 1|2|1
+//   detached word=8                              <- §2.2 remove: still an
+//                                                   Event, no longer watched
+//   counting key=33 n=5 saturated=1              <- §2.4 saturating-sum, and
+//                                                   that it SATURATES
+//   done
+//
+// EVERY WAIT RETURNS IMMEDIATELY. A wait that found nothing would park the only
+// thread in the system, which the kernel reports as the deadlock it is — so a
+// regression in the level-triggered path fails this case in a few microseconds
+// rather than at the harness timeout.
+
+import sos.{System, Process, Event, Waiter, WaitReport}
+
+/// The keys this process attaches under. They are ITS OWN WORDS — §2.2 has the
+/// kernel store one and hand it back unread, so what a key means is entirely a
+/// question for whoever attached it. Here they are just distinguishable.
+static KEY_A: UInt = 11
+static KEY_B: UInt = 22
+static KEY_C: UInt = 33
+
+static BIT_ONE: UInt = 1
+static BIT_TWO: UInt = 2
+static BIT_FOUR: UInt = 4
+static BIT_EIGHT: UInt = 8
+
+/// How many times the counting event is signalled before it is read.
+static COUNT_TIMES: Int = 5
+
+/// A `UInt` 1 and 0, so a `Bool` can be printed without a literal having to
+/// adopt a type through a branch (DF-178e's neighbourhood).
+static YES: UInt = 1
+static NO: UInt = 0
+
+/// What a failed read reports, distinct from every value the case expects.
+static NO_VALUE: UInt = 0xDEAD
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+func flag(b: Bool) -> UInt {
+    if b { YES } else { NO }
+}
+
+/// Drain an event, or report the sentinel. A failure cannot happen here — this
+/// process created the event and holds every right on it — so the arm exists to
+/// make that visible in the transcript rather than to be taken.
+func drained(e: &Event) -> UInt {
+    match e.receive() {
+        case Ok(word) -> word,
+        case Err(_) -> NO_VALUE,
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.self_process() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS events: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let waiter = match proc.create_waiter() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS events: no waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let a = match proc.create_event() {
+        case Ok(ev) -> ev,
+        case Err(e) -> {
+            print("SOS events: no event a: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let b = match proc.create_event() {
+        case Ok(ev) -> ev,
+        case Err(e) -> {
+            print("SOS events: no event b: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let _ = waiter.add(&a, KEY_A)
+    let _ = waiter.add(&b, KEY_B)
+
+    // ---- §2.2 LEVEL-TRIGGERED: signal first, wait afterwards --------------
+    // The order is the claim. An edge-triggered waiter would have nothing to
+    // report here, because the only edge happened before anyone was listening.
+    let _ = a.signal(BIT_FOUR)
+    let first = match waiter.wait() {
+        case Ok(r) -> r,
+        case Err(e) -> {
+            print("SOS events: first wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let first_word = drained(&a)
+    print("SOS events: signal-then-wait key={} signalled={} word={}\n",
+          first.key, flag(first.is_signalled()), first_word)
+
+    // ---- §2.2 WHICH one became ready ---------------------------------------
+    // Two handles on one Waiter and the other one signalled: the answer has to
+    // name the second attachment, and the key is how it names it.
+    let _ = b.signal(BIT_EIGHT)
+    let second = match waiter.wait() {
+        case Ok(r) -> r,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS events: second wait failed\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let second_word = drained(&b)
+    print("SOS events: second key={} signalled={} word={}\n",
+          second.key, flag(second.is_signalled()), second_word)
+
+    // ---- §2.4 BITWISE-OR accumulation --------------------------------------
+    // Three signals, one repeated: a flag set answers 3, not 4.
+    let _ = a.signal(BIT_ONE)
+    let _ = a.signal(BIT_TWO)
+    let _ = a.signal(BIT_ONE)
+    let third = match waiter.wait() {
+        case Ok(r) -> r,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS events: third wait failed\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let or_word = drained(&a)
+    print("SOS events: or key={} word={}\n", third.key, or_word)
+
+    // ---- §2.2 REMOVE: the attachment goes, the object stays ----------------
+    // A detached Event still accumulates and still drains; it is simply not
+    // watched. Nothing waits after this, because nothing would find it.
+    let _ = waiter.remove(&b)
+    let _ = b.signal(BIT_EIGHT)
+    print("SOS events: detached word={}\n", drained(&b))
+
+    // ---- §2.4 SATURATING-SUM ----------------------------------------------
+    // Signalled five times BEFORE it is attached, which exercises the other
+    // half of level-triggering: an attachment that is already ready is ready.
+    let c = match proc.create_counting_event() {
+        case Ok(ev) -> ev,
+        case Err(e) -> {
+            print("SOS events: no counting event: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    var n = 0
+    while n < COUNT_TIMES {
+        let _ = c.signal(BIT_ONE)
+        n = n + 1
+    }
+    let _ = waiter.add(&c, KEY_C)
+    let fourth = match waiter.wait() {
+        case Ok(r) -> r,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS events: fourth wait failed\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let counted = drained(&c)
+
+    // And that it SATURATES rather than wrapping: two signals of the largest
+    // word there is would wrap a plain sum straight back through zero, which is
+    // the value that means "not ready".
+    let _ = c.signal(UInt.max)
+    let _ = c.signal(UInt.max)
+    let saturated = drained(&c)
+    print("SOS events: counting key={} n={} saturated={}\n",
+          fourth.key, counted, flag(saturated == UInt.max))
+
+    let _ = system.debug_print("SOS events: done\n")
+
+    // Process exit, so the kernel's teardown line reports what this process
+    // owned: five handles it was given or made, one thread, three events and
+    // one waiter.
+    let _ = proc.exit(EXIT_OK)
+}
