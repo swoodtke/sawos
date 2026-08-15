@@ -13,13 +13,16 @@
  * THE ITERATION COUNT BUYS TIME, and how much depends on the machine. What the
  * cases need is two milliseconds of user mode (two ticks at the 1 ms period);
  * what this count must not do is outlast the harness's QEMU timeout. Measured
- * here: ~500 million iterations per second, so a hundred million of them is
- * about a fifth of a second and roughly 100x the two milliseconds needed.
+ * here: a hundred million iterations put a whole case — emulator startup, boot,
+ * loop and shutdown — at 0.10-0.12s, with four ticks reported inside it, so the
+ * loop clears the two milliseconds it owes by more than an order of magnitude
+ * and clears the timeout by two.
  *
- * That rate is three thousand times Profile A's for the same loop, and the
- * difference is not the architecture: a grant there is four-byte-granular,
- * finer than the page an emulator's address translation caches, while a grant
- * here IS pages. See that payload's own note.
+ * Profile A's payload spins the SAME count at the same order of speed. It did
+ * not when this unit was written — its user mode ran a thousand times slower,
+ * for a reason that turned out to be one missing round-up in its linker script
+ * rather than anything about either architecture (DF-178b). See that payload's
+ * own note.
  */
 
     .equ SYSTEM_HANDLE,     1       /* the boot handle, also arriving in x0 */

@@ -89,7 +89,7 @@ stores to THR — and the mechanism that stops the machine.
 | `sos_mie_write(mask)` | sink.c | Place a word in `mie` — which CLASSES of interrupt may reach this hart. | `csrw` names its CSR. WHICH classes, and the shadow the mask is staged in, are Saw. Note what is absent: nothing here writes the GLOBAL enable, and that absence is design 178's D2. |
 | `sos_pmpcfg_write(lo, hi)` | sink.c | Publish both config registers together. | Same: `csrw pmpcfg0` names its register. The config words are STAGED in Saw. |
 | `sos_payload_start()` / `sos_payload_end()` | sink.c | Bounds of the appended payload. | A linker symbol's ADDRESS, which Saw cannot name — DF-172a. |
-| `virt.ld` | — | Places the image at this board's RAM base, first section first, and bounds the appended payload. | Not a program. |
+| `virt.ld` | — | Places the image at this board's RAM base, first section first, and bounds the appended payload — on PAGE boundaries at both ends since design 178, which is a speed property under emulation rather than a protection one (DF-178b: a PMP region covering part of a page defeats the emulator's per-page translation cache, and the same user-mode loop measured 62.6s before the round-up and 0.03s after). | Not a program. |
 
 Moved to `lib.saw` by design 172, and no longer C: `sos_rt_write` (unit 4, and
 now check-free by construction so the panic path cannot re-enter it),
