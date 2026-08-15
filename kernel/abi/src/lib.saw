@@ -28,6 +28,17 @@
 //! this replaced (`OP_SYSTEM_DEBUG_PRINT`, `SYS_ERR_BAD_OP`, …) could be
 //! compared against anything and validated only by a hand-written `> MAX` test.
 //!
+//! HOW A FAMILY IS NAMED (ruled Aug 15, user). An op table or a rights set is
+//! named for the spec §2 OBJECT it belongs to, spelled OUT, plus the
+//! term-of-art suffix §5.7 already uses: `SystemOp`, `ProcessOp`, `ThreadOp`,
+//! `SystemRight`, `ProcessRight`, `ThreadRight`. No abbreviated object prefix —
+//! not `SysOp`, not `ProcRight` — because the abbreviation saves four
+//! characters in a file nobody types into and costs every reader the question
+//! of whether `Sys` means the System object or the syscall. The rule extends to
+//! anything else here named after an object (`ProcessStatusKind`,
+//! `process_status_word`), and the next object kind inherits it: name the
+//! family after the row in the §2 table.
+//!
 //! Delivery in v1 is static linking through the manifest/module-path
 //! mechanism. A genuinely mapped vDSO is an object-model-era upgrade that
 //! changes none of the above.
@@ -281,7 +292,7 @@ public func thread_rights() -> UInt32 {
 /// every number that is not an op, which is also what retired `OP_SYSTEM_MAX`:
 /// the range check and the decode are now one operation instead of two that
 /// could disagree.
-public enum SysOp: UInt {
+public enum SystemOp: UInt {
     case DebugPrint = 0,
     case Shutdown = 1,
     case SelfProcess = 2,
@@ -304,7 +315,7 @@ public enum SysOp: UInt {
 /// Absent, with reasons: `Kill` (see `ProcessRight`), and `CreateProcess`,
 /// which needs an image to load and a second address space to load it into —
 /// both M3, per design 178's option A.
-public enum ProcOp: UInt {
+public enum ProcessOp: UInt {
     case CreateThread = 0,
     case SelfThread = 1,
     case Exit = 2,
@@ -466,7 +477,7 @@ public extension FaultReason {
 /// gives: there is no second process to be killed by. It is here because the
 /// word's ENCODING is what a supervisor parses, and a kind added later would
 /// renumber nothing but would still be a wire change.
-public enum ProcStatusKind: UInt8 {
+public enum ProcessStatusKind: UInt8 {
     case Running = 0,
     case Exited = 1,
     case Faulted = 2,
@@ -475,13 +486,13 @@ public enum ProcStatusKind: UInt8 {
 
 /// Where the kind sits in the status word. The low half is the code — an exit
 /// status, or a `FaultReason` — so both fit a 32-bit reader on either profile.
-public static PROC_STATUS_KIND_SHIFT: Int = 16
-public static PROC_STATUS_CODE_MASK: UInt = 0xFFFF
+public static PROCESS_STATUS_KIND_SHIFT: Int = 16
+public static PROCESS_STATUS_CODE_MASK: UInt = 0xFFFF
 
 /// Assemble the §8 status word.
-public func proc_status_word(kind: ProcStatusKind, code: UInt) -> UInt {
-    ((((kind as UInt8) as UInt) << PROC_STATUS_KIND_SHIFT)
-     | (code & PROC_STATUS_CODE_MASK))
+public func process_status_word(kind: ProcessStatusKind, code: UInt) -> UInt {
+    ((((kind as UInt8) as UInt) << PROCESS_STATUS_KIND_SHIFT)
+     | (code & PROCESS_STATUS_CODE_MASK))
 }
 
 // =============================================================================

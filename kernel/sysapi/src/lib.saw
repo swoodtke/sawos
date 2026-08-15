@@ -26,7 +26,7 @@
 //! tags it branches on. The first lives in the HAL stub; the second is
 //! `SosStatus` below. Neither is a number this file's callers ever write.
 
-import sosabi.{SysOp, ProcOp, ThreadOp, SosStatus,
+import sosabi.{SystemOp, ProcessOp, ThreadOp, SosStatus,
                SystemHandle, ProcessHandle, ThreadHandle}
 
 // The scalar-to-console-byte rule, shared with the kernel's own console so the
@@ -135,14 +135,14 @@ func call_value(handle: UInt, op: UInt, arg0: UInt, arg1: UInt,
 /// Returns a status word: 0 on success.
 @export("sos_system_debug_print")
 public func sos_system_debug_print(handle: UInt, byte: UInt) -> UInt {
-    sos_syscall1(handle, SysOp.DebugPrint as UInt, byte)
+    sos_syscall1(handle, SystemOp.DebugPrint as UInt, byte)
 }
 
 /// Stop the machine with `status`. Requires `SystemRight.Shutdown`. Does not
 /// return on success; returns a status word if the call was refused.
 @export("sos_system_shutdown")
 public func sos_system_shutdown(handle: UInt, status: UInt) -> UInt {
-    sos_syscall1(handle, SysOp.Shutdown as UInt, status)
+    sos_syscall1(handle, SystemOp.Shutdown as UInt, status)
 }
 
 // The ops that answer with a VALUE take an out-parameter for it, exactly as the
@@ -153,7 +153,7 @@ public func sos_system_shutdown(handle: UInt, status: UInt) -> UInt {
 @export("sos_system_self_process")
 public func sos_system_self_process(handle: UInt,
                                     value_out: UnsafePointer<UInt>) unsafe -> UInt {
-    sos_syscall3(handle, SysOp.SelfProcess as UInt, 0, 0, 0, value_out)
+    sos_syscall3(handle, SystemOp.SelfProcess as UInt, 0, 0, 0, value_out)
 }
 
 /// Make a thread in this process, ready to start. Requires
@@ -162,7 +162,7 @@ public func sos_system_self_process(handle: UInt,
 public func sos_process_create_thread(handle: UInt, entry: UInt, stack_top: UInt,
                                       arg: UInt,
                                       value_out: UnsafePointer<UInt>) unsafe -> UInt {
-    sos_syscall3(handle, ProcOp.CreateThread as UInt, entry, stack_top, arg,
+    sos_syscall3(handle, ProcessOp.CreateThread as UInt, entry, stack_top, arg,
                  value_out)
 }
 
@@ -170,21 +170,21 @@ public func sos_process_create_thread(handle: UInt, entry: UInt, stack_top: UInt
 @export("sos_process_self_thread")
 public func sos_process_self_thread(handle: UInt,
                                     value_out: UnsafePointer<UInt>) unsafe -> UInt {
-    sos_syscall3(handle, ProcOp.SelfThread as UInt, 0, 0, 0, value_out)
+    sos_syscall3(handle, ProcessOp.SelfThread as UInt, 0, 0, 0, value_out)
 }
 
 /// End this process with `status`. Requires `ProcessRight.Exit`. Does not
 /// return on success.
 @export("sos_process_exit")
 public func sos_process_exit(handle: UInt, status: UInt) -> UInt {
-    sos_syscall1(handle, ProcOp.Exit as UInt, status)
+    sos_syscall1(handle, ProcessOp.Exit as UInt, status)
 }
 
 /// This process's §8 status word. Requires `ProcessRight.Wait`.
 @export("sos_process_get_status")
 public func sos_process_get_status(handle: UInt,
                                    value_out: UnsafePointer<UInt>) unsafe -> UInt {
-    sos_syscall3(handle, ProcOp.GetStatus as UInt, 0, 0, 0, value_out)
+    sos_syscall3(handle, ProcessOp.GetStatus as UInt, 0, 0, 0, value_out)
 }
 
 /// Make a created thread runnable. Requires `ThreadRight.Start`.
@@ -278,7 +278,7 @@ public extension System {
     /// it, and §3 forbids duplicating a handle — so calling this twice is a
     /// query, not two capabilities.
     public func self_process(&self) -> Result<Process, SosStatus> {
-        let raw = try call_value(self.handle, SysOp.SelfProcess as UInt, 0, 0, 0)
+        let raw = try call_value(self.handle, SystemOp.SelfProcess as UInt, 0, 0, 0)
         return Process(adopting: raw)
     }
 }
@@ -326,7 +326,7 @@ public extension Process {
     /// have known.
     public func create_thread(&self, entry: UInt, stack_top: UInt,
                               arg: UInt) -> Result<Thread, SosStatus> {
-        let raw = try call_value(self.handle, ProcOp.CreateThread as UInt,
+        let raw = try call_value(self.handle, ProcessOp.CreateThread as UInt,
                                  entry, stack_top, arg)
         return Thread(adopting: raw)
     }
@@ -353,7 +353,7 @@ public extension Process {
     /// This is how a thread reaches the handle it needs to exit or yield: it is
     /// handed its process, and asks the process which thread it is.
     public func self_thread(&self) -> Result<Thread, SosStatus> {
-        let raw = try call_value(self.handle, ProcOp.SelfThread as UInt, 0, 0, 0)
+        let raw = try call_value(self.handle, ProcessOp.SelfThread as UInt, 0, 0, 0)
         return Thread(adopting: raw)
     }
 
@@ -367,7 +367,7 @@ public extension Process {
     /// This process's §8 status word: kind in the high bits, code in the low
     /// ones. Requires `ProcessRight.Wait`.
     public func get_status(&self) -> Result<UInt, SosStatus> {
-        call_value(self.handle, ProcOp.GetStatus as UInt, 0, 0, 0)
+        call_value(self.handle, ProcessOp.GetStatus as UInt, 0, 0, 0)
     }
 }
 

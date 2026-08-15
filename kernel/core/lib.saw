@@ -34,8 +34,8 @@ import sosrt.{ascii_byte, hex_digit_of, hex_digits_per_word}
 import sosabi.{
     ObjType, SystemHandle, ProcessHandle, ThreadHandle,
     SystemRight, ProcessRight, ThreadRight,
-    SysOp, ProcOp, ThreadOp,
-    SosStatus, FaultReason, ProcStatusKind, proc_status_word,
+    SystemOp, ProcessOp, ThreadOp,
+    SosStatus, FaultReason, ProcessStatusKind, process_status_word,
     root_system_rights, root_process_rights, thread_rights,
     ROOT_SYSTEM_HANDLE, NO_HANDLE, ENTRY_IMAGE,
 }
@@ -335,7 +335,7 @@ struct ThreadSlot {
 }
 
 /// What a process slot is doing.
-enum ProcState: UInt8 {
+enum ProcessState: UInt8 {
     case Free = 0,
     case Running = 1,
     case Gone = 2,
@@ -354,15 +354,15 @@ enum ProcState: UInt8 {
 /// primitive. Real Mapping objects are M3; what this pair does today is answer
 /// the one question thread creation has to ask — is this entry, is this stack,
 /// inside the process at all.
-struct ProcSlot {
-    state: ProcState,
+struct ProcessSlot {
+    state: ProcessState,
     /// This process's own handle in its own table (what `SelfProcess` returns).
     self_handle: UInt,
     /// The image entry, which is what `ENTRY_IMAGE` resolves to.
     entry: UInt,
     region_base: UInt,
     region_top: UInt,
-    exit_kind: ProcStatusKind,
+    exit_kind: ProcessStatusKind,
     exit_code: UInt,
 }
 
@@ -370,10 +370,10 @@ unsafe static var THREADS: [ThreadSlot; MAX_THREADS] = [
     ThreadSlot(state: ThreadState.Free, process: 0, self_handle: 0,
                exit_code: 0, joiners: 0, link: 0); MAX_THREADS]
 
-unsafe static var PROCESSES: [ProcSlot; MAX_PROCESSES] = [
-    ProcSlot(state: ProcState.Free, self_handle: 0, entry: 0,
+unsafe static var PROCESSES: [ProcessSlot; MAX_PROCESSES] = [
+    ProcessSlot(state: ProcessState.Free, self_handle: 0, entry: 0,
              region_base: 0, region_top: 0,
-             exit_kind: ProcStatusKind.Running, exit_code: 0); MAX_PROCESSES]
+             exit_kind: ProcessStatusKind.Running, exit_code: 0); MAX_PROCESSES]
 
 /// Every process's handle table, back to back: process `p`'s handle `h`
 /// (1-based, §3's "handle 0 names nothing") lives at `p * MAX_HANDLES + h - 1`.
@@ -612,7 +612,7 @@ func exit_thread(slot: Int, code: UInt) unsafe {
     // ordinary way a program finishes when nobody called `Process.Exit`.
     let p = THREADS[slot].process
     if live_threads(p) == 0 {
-        end_process(p, ProcStatusKind.Exited, code, code)
+        end_process(p, ProcessStatusKind.Exited, code, code)
     }
     NEED_RESCHED = true
 }
@@ -641,9 +641,9 @@ func block_on_join(slot: Int, target: Int) unsafe {
 /// questions: `code` is what a supervisor would read out of the §8 status word,
 /// and `machine_status` is what the EMULATOR exits with — which for a fault is
 /// the kernel's own vocabulary rather than anything the process chose.
-func end_process(p: Int, kind: ProcStatusKind, code: UInt,
+func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
                  machine_status: UInt) unsafe -> Never {
-    PROCESSES[p].state = ProcState.Gone
+    PROCESSES[p].state = ProcessState.Gone
     PROCESSES[p].exit_kind = kind
     PROCESSES[p].exit_code = code
 
@@ -708,7 +708,7 @@ func fault_process(p: Int, reason: FaultReason) unsafe -> Never {
     uart.write_str("SOS: process fault: ")
     uart.write_str(reason.describe())
     uart.write_str("\n")
-    end_process(p, ProcStatusKind.Faulted, (reason as UInt8) as UInt,
+    end_process(p, ProcessStatusKind.Faulted, (reason as UInt8) as UInt,
                 ExitCode.ProcessFault as UInt)
     // The loop is what carries the `Never` up to this signature. A call to a
     // `-> Never` function does not currently do it — see DF-178d — and without
@@ -732,7 +732,7 @@ func fault_trap(tag: String, cause: UInt, epc: UInt, tval: UInt) unsafe -> Never
     uart.write_hex(tval)
     uart.write_str("\n")
     if CURRENT_THREAD != NO_THREAD {
-        end_process(THREADS[CURRENT_THREAD].process, ProcStatusKind.Faulted, 0,
+        end_process(THREADS[CURRENT_THREAD].process, ProcessStatusKind.Faulted, 0,
                     ExitCode.UmodeFault as UInt)
     }
     // No process object yet: the harness kernels that enter user mode directly.
@@ -773,36 +773,36 @@ public func fatal(tag: String, cause: UInt, epc: UInt, tval: UInt, code: ExitCod
 /// is written into its frame by whatever wakes it, exactly once. Modelling that
 /// as a field rather than as a magic status is what keeps the return path from
 /// having to know which ops can park.
-struct SysResult {
+struct SyscallResult {
     status: SosStatus,
     value: UInt,
     blocked: Bool,
 }
 
-func op_ok() -> SysResult {
-    SysResult(status: SosStatus.Ok, value: 0, blocked: false)
+func op_ok() -> SyscallResult {
+    SyscallResult(status: SosStatus.Ok, value: 0, blocked: false)
 }
 
-func op_value(v: UInt) -> SysResult {
-    SysResult(status: SosStatus.Ok, value: v, blocked: false)
+func op_value(v: UInt) -> SyscallResult {
+    SyscallResult(status: SosStatus.Ok, value: v, blocked: false)
 }
 
-func op_status(s: SosStatus) -> SysResult {
-    SysResult(status: s, value: 0, blocked: false)
+func op_status(s: SosStatus) -> SyscallResult {
+    SyscallResult(status: s, value: 0, blocked: false)
 }
 
-func op_blocked() -> SysResult {
-    SysResult(status: SosStatus.Ok, value: 0, blocked: true)
+func op_blocked() -> SyscallResult {
+    SyscallResult(status: SosStatus.Ok, value: 0, blocked: true)
 }
 
-/// Terminate the process from a position that OWES a `SysResult`.
+/// Terminate the process from a position that OWES a `SyscallResult`.
 ///
 /// `fault_process` is declared `-> Never` and nothing after it runs, but a
 /// `Never`-typed CALL is not currently accepted everywhere a diverging tail is
 /// (DF-178d), so the one place that difference would show up is wrapped once
 /// here rather than worked around at each op. The trailing conditionless loop
 /// is what carries the divergence up to this signature; it is unreachable.
-func fault_result(p: Int, reason: FaultReason) unsafe -> SysResult {
+func fault_result(p: Int, reason: FaultReason) unsafe -> SyscallResult {
     fault_process(p, reason)
     while { }
 }
@@ -821,7 +821,7 @@ func calling_process() unsafe -> Int {
 /// at all.
 ///
 /// `op` arrives as the raw register word, which a process chooses, so it is
-/// DECODED rather than compared: `SysOp.from(raw:)` accepts exactly the numbers
+/// DECODED rather than compared: `SystemOp.from(raw:)` accepts exactly the numbers
 /// that are ops and hands back `None` for every other, which is both the range
 /// check and the dispatch in one step. The `match` is then exhaustive, so adding
 /// an op to `sosabi` makes this function fail to compile until it is handled —
@@ -836,16 +836,16 @@ func calling_process() unsafe -> Int {
 /// `panic` and a conditionless `while { }` as its exit, but NOT a call to a
 /// function declared `-> Never`, which is what terminating a process is. See
 /// DF-178d.
-func system_op(raw_op: UInt, obj: &SystemObject, arg0: UInt) unsafe -> SysResult {
+func system_op(raw_op: UInt, obj: &SystemObject, arg0: UInt) unsafe -> SyscallResult {
     let p = calling_process()
-    if let op = SysOp.from(raw: raw_op) {
+    if let op = SystemOp.from(raw: raw_op) {
         return system_op_decoded(op, &obj, arg0, p)
     }
     fault_result(p, FaultReason.BadOp)
 }
 
-func system_op_decoded(op: SysOp, obj: &SystemObject, arg0: UInt,
-                       p: Int) unsafe -> SysResult {
+func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt,
+                       p: Int) unsafe -> SyscallResult {
     match op {
         // The rights check is per-OP, not per-object: holding the System
         // handle is not the same as being allowed to use every part of it.
@@ -857,7 +857,7 @@ func system_op_decoded(op: SysOp, obj: &SystemObject, arg0: UInt,
             op_ok()
         },
         // Stop the machine with `arg0` as the status. NOT process exit, which
-        // is `ProcOp.Exit` — this is the whole machine, and it is what the
+        // is `ProcessOp.Exit` — this is the whole machine, and it is what the
         // harness kernels with no Process object still use to finish a run.
         case Shutdown -> {
             if not obj.allows(SystemRight.Shutdown) {
@@ -886,17 +886,17 @@ func system_op_decoded(op: SysOp, obj: &SystemObject, arg0: UInt,
 
 /// The Process object's ops (§2, §7, §8; design 178 D4).
 func process_op(raw_op: UInt, obj: &ProcessObject,
-                arg0: UInt, arg1: UInt, arg2: UInt) unsafe -> SysResult {
+                arg0: UInt, arg1: UInt, arg2: UInt) unsafe -> SyscallResult {
     let p = calling_process()
-    if let op = ProcOp.from(raw: raw_op) {
+    if let op = ProcessOp.from(raw: raw_op) {
         return process_op_decoded(op, &obj, arg0, arg1, arg2, p)
     }
     fault_result(p, FaultReason.BadOp)
 }
 
-func process_op_decoded(op: ProcOp, obj: &ProcessObject,
+func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
                         arg0: UInt, arg1: UInt, arg2: UInt,
-                        p: Int) unsafe -> SysResult {
+                        p: Int) unsafe -> SyscallResult {
     match op {
         case CreateThread -> {
             if not obj.allows(ProcessRight.CreateThread) {
@@ -920,7 +920,7 @@ func process_op_decoded(op: ProcOp, obj: &ProcessObject,
             if not obj.allows(ProcessRight.Exit) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            end_process(obj.slot, ProcStatusKind.Exited, arg0, arg0)
+            end_process(obj.slot, ProcessStatusKind.Exited, arg0, arg0)
             // Unreachable: `end_process` stops the machine. The loop is what
             // carries that up to this arm's type (DF-178d).
             while { }
@@ -934,7 +934,7 @@ func process_op_decoded(op: ProcOp, obj: &ProcessObject,
             if not obj.allows(ProcessRight.Wait) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            op_value(proc_status_word(PROCESSES[obj.slot].exit_kind,
+            op_value(process_status_word(PROCESSES[obj.slot].exit_kind,
                                       PROCESSES[obj.slot].exit_code))
         },
     }
@@ -947,7 +947,7 @@ func process_op_decoded(op: ProcOp, obj: &ProcessObject,
 /// stacks are — so a bad one terminates it rather than producing a thread that
 /// would fault on its first instruction and take the process down anyway, with
 /// a worse diagnostic.
-func create_thread(p: Int, entry: UInt, stack_top: UInt, arg: UInt) unsafe -> SysResult {
+func create_thread(p: Int, entry: UInt, stack_top: UInt, arg: UInt) unsafe -> SyscallResult {
     let start = if entry == ENTRY_IMAGE { PROCESSES[p].entry } else { entry }
     if start < PROCESSES[p].region_base || start >= PROCESSES[p].region_top {
         fault_process(p, FaultReason.BadEntry)
@@ -978,7 +978,7 @@ func create_thread(p: Int, entry: UInt, stack_top: UInt, arg: UInt) unsafe -> Sy
 /// the handle names the caller. That check is the faults ruling's `NotSelf`:
 /// driving another thread's execution is not something the object model offers,
 /// and a process that tries has misread its own handles.
-func thread_op(raw_op: UInt, obj: &ThreadObject, arg0: UInt) unsafe -> SysResult {
+func thread_op(raw_op: UInt, obj: &ThreadObject, arg0: UInt) unsafe -> SyscallResult {
     let p = calling_process()
     if let op = ThreadOp.from(raw: raw_op) {
         return thread_op_decoded(op, &obj, arg0, p)
@@ -987,7 +987,7 @@ func thread_op(raw_op: UInt, obj: &ThreadObject, arg0: UInt) unsafe -> SysResult
 }
 
 func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
-                       p: Int) unsafe -> SysResult {
+                       p: Int) unsafe -> SyscallResult {
     let target = obj.slot
 
     match op {
@@ -1062,7 +1062,7 @@ func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
 /// content — the three caller errors it covers are exactly the three the
 /// dispatch can raise before an op body runs.
 func dispatch(handle: UInt, op: UInt,
-              arg0: UInt, arg1: UInt, arg2: UInt) unsafe -> SysResult {
+              arg0: UInt, arg1: UInt, arg2: UInt) unsafe -> SyscallResult {
     let p = calling_process()
     let entry = lookup_handle(p, handle)
     match entry.obj_type {
@@ -1544,10 +1544,10 @@ public func load_root_and_enter() unsafe {
 public func start_process(entry: UInt, stack_top: UInt,
                           region_base: UInt, region_top: UInt) unsafe -> Never {
     let p: Int = 0
-    PROCESSES[p] = ProcSlot(state: ProcState.Running, self_handle: 0,
+    PROCESSES[p] = ProcessSlot(state: ProcessState.Running, self_handle: 0,
                             entry: entry, region_base: region_base,
                             region_top: region_top,
-                            exit_kind: ProcStatusKind.Running, exit_code: 0)
+                            exit_kind: ProcessStatusKind.Running, exit_code: 0)
 
     let system = mint_handle(p, ObjType.System, root_system_rights(), 0)
     let own = mint_handle(p, ObjType.Process, root_process_rights(), p)
