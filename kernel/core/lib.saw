@@ -370,6 +370,13 @@ static TICK_REPORT_LIMIT: UInt = 4
 /// cannot see, which is design 149's `unsafe static var`: uniprocessor kernel,
 /// interrupts taken from user mode only, so the tick path is the only writer
 /// and nothing can interleave with it.
+///
+/// BOTH COUNTERS BELOW WRAP ON PURPOSE (`&+`, not `+`). Overflow checks are
+/// always on, so a plain `+` would make a full counter PANIC — and a kernel
+/// that stops after seven weeks of uptime, or after four billion spurious
+/// interrupts, has turned a number nobody was reading into an outage. A
+/// wrapped count is what every tick counter does; deltas across a wrap are
+/// still right, which is what the scheduler will ask of this one.
 unsafe static var TIMER_TICKS: UInt = 0
 
 /// Interrupts the controller had nothing to give for. ONE is not an error — a
@@ -397,7 +404,7 @@ public func timer_ticks() unsafe -> UInt {
 /// rewrite. Today it is only read, to say where user mode was when the tick
 /// landed, which is also the harness's evidence that the tick came from there.
 func on_timer_tick(frame_addr: UInt) unsafe {
-    TIMER_TICKS = TIMER_TICKS + 1
+    TIMER_TICKS = TIMER_TICKS &+ 1
     if TIMER_TICKS > TICK_REPORT_LIMIT {
         return
     }
@@ -435,7 +442,7 @@ func on_external_irq(line: UInt) {
 func service_irq(frame_addr: UInt, cause: UInt) unsafe {
     let line = hal.irq_claim(cause)
     if line == hal.IRQ_NONE {
-        SPURIOUS_IRQS = SPURIOUS_IRQS + 1
+        SPURIOUS_IRQS = SPURIOUS_IRQS &+ 1
         if SPURIOUS_IRQS == 1 {
             console().write_str("SOS: spurious interrupt\n")
         }
