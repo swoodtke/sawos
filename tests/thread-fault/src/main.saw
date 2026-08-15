@@ -1,0 +1,34 @@
+// SOS M2 unit 2: A CALLER'S MISTAKE ENDS THE CALLER (design 178's faults
+// ruling, ratified Aug 15).
+//
+// This process joins a Thread handle it never held. That is a mistake it could
+// have checked — it knows which handles it holds — so under the ruling it is
+// not a status word to branch on: the kernel TERMINATES the process, tears down
+// everything it owned, and stays up to report both.
+//
+//   SOS fault: joining a thread handle we never held
+//   SOS: process fault: bad handle
+//   SOS: process teardown handles=... threads=...
+//
+// The line after the join is what makes the case an assertion rather than a
+// hope: if the kernel ever answered a bad handle with a status again, this
+// process would print `UNREACHABLE` and shut the machine down CLEANLY, and the
+// harness asserts a failing exit.
+
+import sos.{System, Thread}
+
+/// A handle index nothing in this process's table can ever have been given: the
+/// boot set is three handles wide and it created nothing.
+static NEVER_HELD: UInt = 42
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let _ = system.debug_print("SOS fault: joining a thread handle we never held\n")
+
+    let bogus = Thread(adopting: NEVER_HELD)
+    let _ = bogus.join()
+
+    let _ = system.debug_print("UNREACHABLE: the join came back\n")
+    let _ = system.shutdown(0)
+}

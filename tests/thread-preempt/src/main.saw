@@ -1,0 +1,171 @@
+// SOS M2 unit 2: PREEMPTION (design 178 D3; spec §7).
+//
+// Two workers that print a letter and then SPIN. Neither yields, neither
+// blocks, neither makes any call that could give the processor up — so if the
+// letters interleave at all, something took it away, and the only thing that
+// can is the timer running out a thread's slice.
+//
+//   AABBAABB...                 <- the exact grouping is timing; the
+//                                  ALTERNATION is the claim
+//   SOS preempt: joined a=33 b=44
+//
+// The kernel booting this image is `sos/tests/threads_timer.saw`, which arms
+// the periodic tick before it loads the image. The cooperative twin of this
+// case (`thread-basics`) runs under a kernel that arms nothing, so the two
+// transcripts together separate "the scheduler switches" from "a thread asked
+// it to".
+//
+// THE SPIN LENGTH IS THE ONLY TUNED NUMBER, and it is tuned in one direction:
+// long enough that a round outlasts a slice, so a preemption lands between two
+// of a worker's own prints rather than after all of them. Too SHORT and one
+// worker would finish inside a single slice and the transcript would be AAAA
+// then BBBB; too long only makes the case slower.
+
+import sos.{System, Process, Thread}
+
+/// The process handle, parked for the workers — and the witness that says which
+/// thread `_start` is running as. See `thread-basics` for why every thread of
+/// an image written in Saw enters at the same address (DF-178c).
+unsafe static var PROCESS_WORD: UInt = 0
+
+/// The System handle, parked beside it — a worker writes its tag with no
+/// newline after it, and `print` always ends a line.
+unsafe static var SYSTEM_WORD: UInt = 0
+
+/// Where `burn` leaves its result. A spin loop whose value nothing reads is a
+/// spin loop the optimizer DELETES, and a deleted spin makes this whole case
+/// pass or fail on which thread happened to be interrupted first — which is
+/// exactly what it did the first time it ran.
+unsafe static var BURN_SINK: UInt = 0
+
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_A: [UInt64; STACK_WORDS] = [0u64; STACK_WORDS]
+unsafe static var STACK_B: [UInt64; STACK_WORDS] = [0u64; STACK_WORDS]
+
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+static ROLE_A: UInt = 1
+static ROLE_B: UInt = 2
+static ROUNDS: Int = 8
+/// Iterations between two prints. At the kernel's 1 ms tick and a 1-tick slice,
+/// this is comfortably more than one slice on both machines.
+static SPIN: Int = 400000
+static EXIT_A: UInt = 33
+static EXIT_B: UInt = 44
+
+static NO_VALUE: UInt = 0
+
+func stack_top(base: UInt) -> UInt {
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func stack_a_top() unsafe -> UInt {
+    stack_top(((&var STACK_A) as UnsafePointer<UInt64>) as UInt)
+}
+
+func stack_b_top() unsafe -> UInt {
+    stack_top(((&var STACK_B) as UnsafePointer<UInt64>) as UInt)
+}
+
+func park_handles(system: UInt, process: UInt) unsafe {
+    SYSTEM_WORD = system
+    PROCESS_WORD = process
+}
+
+func parked_process() unsafe -> UInt {
+    PROCESS_WORD
+}
+
+func parked_system() unsafe -> UInt {
+    SYSTEM_WORD
+}
+
+/// Burn time without touching the kernel.
+///
+/// The body is a linear-congruential step, which is NOT an accident: a counter
+/// loop has a closed form and the optimizer writes it, leaving no time burned
+/// at all. Each step depends on the one before it and the result is stored, so
+/// the loop has to run. Arithmetic is wrapped (`&*`, `&+`) because overflow is
+/// what an LCG is made of.
+func burn(iterations: Int) unsafe {
+    var x = BURN_SINK
+    var i = 0
+    while i < iterations {
+        x = (x &* 1664525) &+ 1013904223
+        i = i + 1
+    }
+    BURN_SINK = x
+}
+
+func worker(role: UInt) {
+    let proc = Process(adopting: parked_process())
+    let system = System(boot_handle: parked_system())
+    let me = match proc.self_thread() {
+        case Ok(t) -> t,
+        case Err(_) -> { return },
+    }
+    let tag = if role == ROLE_A { "A" } else { "B" }
+    var round = 0
+    while round < ROUNDS {
+        let _ = system.debug_print(tag)
+        burn(SPIN)
+        round = round + 1
+    }
+    let _ = me.exit(if role == ROLE_A { EXIT_A } else { EXIT_B })
+}
+
+func initial(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = match system.self_process() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS preempt: no process handle\n")
+            let _ = system.shutdown(1)
+            return
+        },
+    }
+    park_handles(boot_handle, proc.as_word())
+
+    let a = match proc.create_thread(stack_top: stack_a_top(), arg: ROLE_A) {
+        case Ok(t) -> t,
+        case Err(e) -> {
+            print("SOS preempt: create failed: {}\n", e)
+            let _ = system.shutdown(1)
+            return
+        },
+    }
+    let b = match proc.create_thread(stack_top: stack_b_top(), arg: ROLE_B) {
+        case Ok(t) -> t,
+        case Err(e) -> {
+            print("SOS preempt: create failed: {}\n", e)
+            let _ = system.shutdown(1)
+            return
+        },
+    }
+
+    let _ = system.debug_print("SOS preempt: two spinners, no yields\n")
+    let _ = a.start()
+    let _ = b.start()
+
+    let ra: UInt = match a.join() {
+        case Ok(v) -> v,
+        case Err(_) -> NO_VALUE,
+    }
+    let rb: UInt = match b.join() {
+        case Ok(v) -> v,
+        case Err(_) -> NO_VALUE,
+    }
+    print("\nSOS preempt: joined a={} b={}\n", ra, rb)
+    let _ = proc.exit(0)
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_process() == 0 {
+        initial(arg)
+    } else {
+        worker(arg)
+    }
+}

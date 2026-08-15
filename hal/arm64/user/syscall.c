@@ -39,8 +39,8 @@
 
 typedef unsigned long u64;
 
-// One argument covers every M1 op (`debug_print` takes a character,
-// `shutdown` a status). Wider forms add x2-x5 the same way.
+// One argument covers the two System ops that answer with a status alone
+// (`debug_print` takes a character, `shutdown` a status).
 u64 sos_syscall1(u64 handle, u64 op, u64 arg0) {
     register u64 x0 __asm__("x0") = handle;
     register u64 x1 __asm__("x1") = arg0;
@@ -49,5 +49,25 @@ u64 sos_syscall1(u64 handle, u64 op, u64 arg0) {
                      : "+r"(x0), "+r"(x1)
                      : "r"(x8)
                      : "memory");
+    return x0;
+}
+
+// Three arguments AND the value register, for the ops that answer with one: a
+// created thread's handle, a joined thread's exit code, a process's status word
+// (design 178 M2 unit 2). The value comes back through a pointer rather than in
+// the return, because the Saw side declares these symbols against a C ABI whose
+// whitelist has no aggregate return — one out-parameter is the shape that
+// crosses. Ops with fewer arguments pass zeros.
+u64 sos_syscall3(u64 handle, u64 op, u64 arg0, u64 arg1, u64 arg2, u64 *value_out) {
+    register u64 x0 __asm__("x0") = handle;
+    register u64 x1 __asm__("x1") = arg0;
+    register u64 x2 __asm__("x2") = arg1;
+    register u64 x3 __asm__("x3") = arg2;
+    register u64 x8 __asm__("x8") = op;
+    __asm__ volatile("svc #0"
+                     : "+r"(x0), "+r"(x1)
+                     : "r"(x2), "r"(x3), "r"(x8)
+                     : "memory");
+    *value_out = x1;
     return x0;
 }

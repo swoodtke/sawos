@@ -1,0 +1,31 @@
+// SOS M2 unit 2: the kernel that arms a timer before loading root.
+//
+// The real kernel (`sos/kernel/main.saw`) does not arm one — there was nothing
+// to preempt until this unit, and a kernel that ticked with one thread would be
+// paying for a scheduler it never used. The preemption case needs one, so this
+// entry is the ordinary boot with two seam calls in front of it.
+//
+// It names no architecture: which controller, which timer and what a period
+// costs are all `hal`'s (design 178 D6). What is here is the POLICY — that the
+// tick exists at all, and how often.
+
+import kcore.{console, load_root_and_enter}
+import hal
+
+/// A millisecond, the same period the unit-1 interrupt cases use. With the
+/// scheduler's one-tick slice that is also the timeslice, which is what makes
+/// the preemption transcript interleave at a human-readable rate.
+static TICK_PERIOD_US: UInt = 1000
+
+@export("kmain")
+func kmain() {
+    let uart = console()
+    uart.write_str("SOS M2: preemptive kernel up on ")
+    uart.write_str(hal.arch_name())
+    uart.write_str("\n")
+
+    hal.intc_init()
+    hal.timer_start(TICK_PERIOD_US)
+
+    load_root_and_enter()
+}

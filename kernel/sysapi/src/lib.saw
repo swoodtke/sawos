@@ -26,7 +26,8 @@
 //! tags it branches on. The first lives in the HAL stub; the second is
 //! `SosStatus` below. Neither is a number this file's callers ever write.
 
-import sosabi.{SysOp, SosStatus, SystemHandle}
+import sosabi.{SysOp, ProcOp, ThreadOp, SosStatus,
+               SystemHandle, ProcessHandle, ThreadHandle}
 
 // The scalar-to-console-byte rule, shared with the kernel's own console so the
 // two cannot disagree about what a non-ASCII scalar becomes.
@@ -38,7 +39,10 @@ import sosrt.{ascii_byte}
 // story, so a wider op gets `sos_syscall2` beside this, not an ellipsis.
 extern "C" {
     func sos_syscall1(handle: UInt, op: UInt, arg0: UInt) -> UInt
+    func sos_syscall3(handle: UInt, op: UInt, arg0: UInt, arg1: UInt, arg2: UInt,
+                      value_out: UnsafePointer<UInt>) -> UInt
 }
+
 
 // =============================================================================
 // Errors
@@ -89,6 +93,28 @@ func checked(raw: UInt) -> Result<Void, SosStatus> {
     return
 }
 
+/// The same split for an op that answers with a VALUE — a created thread's
+/// handle, a joined thread's exit code, a status word. `Ok` carries the value;
+/// anything else is the error and the value is not read.
+func checked_value(raw: UInt, value: UInt) -> Result<UInt, SosStatus> {
+    try checked(raw)
+    return value
+}
+
+/// Issue an op that answers with a value.
+///
+/// `unsafe` because it names a pointer: the value register comes back through
+/// an out-parameter, which is the shape that crosses a C ABI with no aggregate
+/// return. The typed methods below call this and stay safe signatures — the
+/// pointer never leaves this function, which is design 136's confinement rule.
+func call_value(handle: UInt, op: UInt, arg0: UInt, arg1: UInt,
+                arg2: UInt) unsafe -> Result<UInt, SosStatus> {
+    var value: UInt = 0
+    let raw = sos_syscall3(handle, op, arg0, arg1, arg2,
+                           (&var value) as UnsafePointer<UInt>)
+    checked_value(raw, value)
+}
+
 // =============================================================================
 // The C-ABI surface (spec §5.7) — for non-Saw languages
 // =============================================================================
@@ -117,6 +143,75 @@ public func sos_system_debug_print(handle: UInt, byte: UInt) -> UInt {
 @export("sos_system_shutdown")
 public func sos_system_shutdown(handle: UInt, status: UInt) -> UInt {
     sos_syscall1(handle, SysOp.Shutdown as UInt, status)
+}
+
+// The ops that answer with a VALUE take an out-parameter for it, exactly as the
+// raw form does. A C caller writes `unsigned long h; sos_process_self_thread(p,
+// &h);` and gets the same contract a Saw caller does minus the Result.
+
+/// This process's own handle. Requires `SystemRight.Manage`.
+@export("sos_system_self_process")
+public func sos_system_self_process(handle: UInt,
+                                    value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, SysOp.SelfProcess as UInt, 0, 0, 0, value_out)
+}
+
+/// Make a thread in this process, ready to start. Requires
+/// `ProcessRight.CreateThread`. `entry` may be `ENTRY_IMAGE`.
+@export("sos_process_create_thread")
+public func sos_process_create_thread(handle: UInt, entry: UInt, stack_top: UInt,
+                                      arg: UInt,
+                                      value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, ProcOp.CreateThread as UInt, entry, stack_top, arg,
+                 value_out)
+}
+
+/// The CALLING thread's own handle. Requires `ProcessRight.Manage`.
+@export("sos_process_self_thread")
+public func sos_process_self_thread(handle: UInt,
+                                    value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, ProcOp.SelfThread as UInt, 0, 0, 0, value_out)
+}
+
+/// End this process with `status`. Requires `ProcessRight.Exit`. Does not
+/// return on success.
+@export("sos_process_exit")
+public func sos_process_exit(handle: UInt, status: UInt) -> UInt {
+    sos_syscall1(handle, ProcOp.Exit as UInt, status)
+}
+
+/// This process's §8 status word. Requires `ProcessRight.Wait`.
+@export("sos_process_get_status")
+public func sos_process_get_status(handle: UInt,
+                                   value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, ProcOp.GetStatus as UInt, 0, 0, 0, value_out)
+}
+
+/// Make a created thread runnable. Requires `ThreadRight.Start`.
+@export("sos_thread_start")
+public func sos_thread_start(handle: UInt) -> UInt {
+    sos_syscall1(handle, ThreadOp.Start as UInt, 0)
+}
+
+/// Wait for a thread and take its exit value. Requires `ThreadRight.Join`.
+@export("sos_thread_join")
+public func sos_thread_join(handle: UInt,
+                            value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, ThreadOp.Join as UInt, 0, 0, 0, value_out)
+}
+
+/// End the CALLING thread with `code`. Requires `ThreadRight.Control` on the
+/// caller's own handle. Does not return.
+@export("sos_thread_exit")
+public func sos_thread_exit(handle: UInt, code: UInt) -> UInt {
+    sos_syscall1(handle, ThreadOp.Exit as UInt, code)
+}
+
+/// Give the processor up. Requires `ThreadRight.Control` on the caller's own
+/// handle.
+@export("sos_thread_yield")
+public func sos_thread_yield(handle: UInt) -> UInt {
+    sos_syscall1(handle, ThreadOp.Yield as UInt, 0)
 }
 
 // =============================================================================
@@ -174,6 +269,164 @@ public extension System {
     /// refusal (no `SystemRight.Shutdown`, say) comes back as an error.
     public func shutdown(&self, status: UInt) -> Result<Void, SosStatus> {
         checked(sos_system_shutdown(self.handle, status))
+    }
+
+    /// This process's own Process object (§3's derivation rule: a handle is
+    /// obtained through a handle already held). Requires `SystemRight.Manage`.
+    ///
+    /// The same handle every time — the process's table has ONE entry naming
+    /// it, and §3 forbids duplicating a handle — so calling this twice is a
+    /// query, not two capabilities.
+    public func self_process(&self) -> Result<Process, SosStatus> {
+        let raw = try call_value(self.handle, SysOp.SelfProcess as UInt, 0, 0, 0)
+        return Process(adopting: raw)
+    }
+}
+
+// =============================================================================
+// Process (spec §2, §7, §8; design 178 D4)
+// =============================================================================
+
+/// A handle to a Process — an address-space domain, a handle table and threads.
+///
+/// A process reaches its OWN through `System.self_process`. Holding somebody
+/// else's is what supervision will look like when there is somebody else (M3).
+public struct Process {
+    handle: ProcessHandle,
+}
+
+public extension Process {
+    /// Adopt a raw handle word as a Process handle.
+    ///
+    /// The other place userspace crosses INTO a handle type, beside
+    /// `System(boot_handle:)`, and it is here for one reason: a thread's entry
+    /// receives its argument as a REGISTER, so a creator that wants to hand a
+    /// worker the process handle hands it a word. The crossing is safe because
+    /// the kernel validates on use — a word that names nothing terminates the
+    /// process on the first op, per the faults ruling.
+    public init(adopting: UInt) -> Process {
+        Process(handle: ProcessHandle(adopting))
+    }
+
+    /// This handle as a plain word, for handing to a thread as its argument.
+    public func as_word(&self) -> UInt {
+        self.handle
+    }
+
+    /// Make a thread at `entry`, ready to be started. Requires
+    /// `ProcessRight.CreateThread`.
+    ///
+    /// The thread runs with `stack_top` as its stack pointer and `arg` in its
+    /// first argument register, and it must NOT return: its link register is
+    /// zero, so returning faults and the fault ends the process (spec §8).
+    ///
+    /// An entry or a stack outside this process TERMINATES it (the faults
+    /// ruling — a process knows where its own memory is). A full thread slab or
+    /// handle table comes back as `SosStatus.NoResource`, which it could not
+    /// have known.
+    public func create_thread(&self, entry: UInt, stack_top: UInt,
+                              arg: UInt) -> Result<Thread, SosStatus> {
+        let raw = try call_value(self.handle, ProcOp.CreateThread as UInt,
+                                 entry, stack_top, arg)
+        return Thread(adopting: raw)
+    }
+
+    /// Make a thread that starts at this process's own IMAGE ENTRY — the entry
+    /// the kernel took out of the image header — with `arg` in its first
+    /// argument register, so the entry can tell which thread it is running as.
+    ///
+    /// THIS OVERLOAD EXISTS BECAUSE OF A LANGUAGE GAP, and it is worth knowing
+    /// which: Saw cannot name the address of a function (design 172's reason 3,
+    /// DF-172a — `extern` declares functions, an extern function is not usable
+    /// as a value, and `@export` on a static emits a definition). So a process
+    /// written entirely in Saw cannot compute an entry address at all, and this
+    /// is the one entry it can ask for by name. A process with a C leaf that
+    /// CAN produce an address uses the overload above. See DF-178c.
+    public func create_thread(&self, stack_top: UInt,
+                              arg: UInt) -> Result<Thread, SosStatus> {
+        self.create_thread(entry: sosabi.ENTRY_IMAGE, stack_top: stack_top,
+                           arg: arg)
+    }
+
+    /// The CALLING thread's own Thread object. Requires `ProcessRight.Manage`.
+    ///
+    /// This is how a thread reaches the handle it needs to exit or yield: it is
+    /// handed its process, and asks the process which thread it is.
+    public func self_thread(&self) -> Result<Thread, SosStatus> {
+        let raw = try call_value(self.handle, ProcOp.SelfThread as UInt, 0, 0, 0)
+        return Thread(adopting: raw)
+    }
+
+    /// End this process with `status`. Every thread goes with it and the kernel
+    /// closes every handle it held (spec §2's Process row). Does not return
+    /// when it succeeds. Requires `ProcessRight.Exit`.
+    public func exit(&self, status: UInt) -> Result<Void, SosStatus> {
+        checked(sos_process_exit(self.handle, status))
+    }
+
+    /// This process's §8 status word: kind in the high bits, code in the low
+    /// ones. Requires `ProcessRight.Wait`.
+    public func get_status(&self) -> Result<UInt, SosStatus> {
+        call_value(self.handle, ProcOp.GetStatus as UInt, 0, 0, 0)
+    }
+}
+
+// =============================================================================
+// Thread (spec §2, §8; design 178 D4)
+// =============================================================================
+
+/// A handle to a Thread — a kernel-scheduled execution context in a process.
+///
+/// Saw's own TaskGroups run INSIDE one of these, in userspace; the kernel never
+/// sees a task (spec §2).
+public struct Thread {
+    handle: ThreadHandle,
+}
+
+public extension Thread {
+    /// Adopt a raw handle word as a Thread handle. Same crossing, same reason,
+    /// as `Process(adopting:)`.
+    public init(adopting: UInt) -> Thread {
+        Thread(handle: ThreadHandle(adopting))
+    }
+
+    /// This handle as a plain word.
+    public func as_word(&self) -> UInt {
+        self.handle
+    }
+
+    /// Make a created thread runnable. It runs when the scheduler next picks
+    /// it, which is not necessarily before this call returns. Requires
+    /// `ThreadRight.Start`.
+    public func start(&self) -> Result<Void, SosStatus> {
+        checked(sos_thread_start(self.handle))
+    }
+
+    /// Wait for this thread to exit and take its exit value. Requires
+    /// `ThreadRight.Join`.
+    ///
+    /// An already-exited thread answers immediately; a running one parks the
+    /// caller until it exits. Joining YOURSELF terminates the process — it is a
+    /// wait that could never end, and the caller could have checked.
+    public func join(&self) -> Result<UInt, SosStatus> {
+        call_value(self.handle, ThreadOp.Join as UInt, 0, 0, 0)
+    }
+
+    /// End the CALLING thread with `code`, which whoever joins it receives.
+    /// Does not return. Requires `ThreadRight.Control`, and the handle must
+    /// name the calling thread.
+    public func exit(&self, code: UInt) -> Result<Void, SosStatus> {
+        checked(sos_thread_exit(self.handle, code))
+    }
+
+    /// Give the processor up to the next runnable thread, and go to the back of
+    /// the queue. Requires `ThreadRight.Control` on the caller's own handle.
+    ///
+    /// Named for `std.task`'s `yield_now` so that the kernel-thread spelling
+    /// and the cooperative-task spelling read alike — they are the same idea at
+    /// two scales, and a reader should not have to learn two words.
+    public func yield_now(&self) -> Result<Void, SosStatus> {
+        checked(sos_thread_yield(self.handle))
     }
 }
 

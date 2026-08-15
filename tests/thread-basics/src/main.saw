@@ -1,0 +1,171 @@
+// SOS M2 unit 2: threads, cooperatively (design 178 D3/D4; spec §2, §8).
+//
+// Two workers that print a letter and YIELD, joined by the thread that made
+// them. The kernel booting this image arms no timer, so nothing can take the
+// processor away — every switch in the transcript is one a thread asked for,
+// and the alternation is therefore exactly the round-robin queue's behaviour:
+//
+//   ABABABAB                    <- eight yields, strictly alternating
+//   SOS threads: joined a=11 b=22
+//
+// WHAT IT PROVES, in one boot: create, start, yield-driven switching, join
+// returning each worker's own exit value, the §8 status word, and the ratified
+// process teardown at the end.
+//
+// EVERY THREAD OF THIS IMAGE ENTERS AT `_start`, because Saw cannot name the
+// address of a function (DF-178c / design 172's reason 3) and `create_thread`
+// therefore has no entry to be given. So the entry has to work out which thread
+// it is, and it does that the only way that needs no second register: the
+// INITIAL thread is the one that has not yet parked the process handle.
+
+import sos.{System, Process, Thread}
+
+/// The process handle, parked for the workers.
+///
+/// It is also the "have I run yet" witness — see the header. A worker reaches
+/// its own Thread object through it (`self_thread`), which is how it gets a
+/// handle to yield and exit with.
+unsafe static var PROCESS_WORD: UInt = 0
+
+/// The System handle, parked beside it. A worker needs it to write its tag: the
+/// tag has to reach the console with NO newline after it (the alternation is
+/// read as one unbroken run), and `print` always ends a line.
+unsafe static var SYSTEM_WORD: UInt = 0
+
+/// A worker's stack, in this process's own zero-init data. Spec §8: thread
+/// stacks are USERSPACE memory passed to thread creation, so a process finds
+/// them where it finds anything else.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_A: [UInt64; STACK_WORDS] = [0u64; STACK_WORDS]
+unsafe static var STACK_B: [UInt64; STACK_WORDS] = [0u64; STACK_WORDS]
+
+static BYTES_PER_WORD: UInt = 8
+/// Every profile wants a 16-byte-aligned stack pointer; one of them checks.
+static STACK_ALIGN: UInt = 16
+
+static ROLE_A: UInt = 1
+static ROLE_B: UInt = 2
+static TURNS: Int = 4
+static EXIT_A: UInt = 11
+static EXIT_B: UInt = 22
+
+/// What a failed read reports. Named `UInt` constants rather than bare literals
+/// in the `Err` arms because a bare literal does not adopt the annotated type
+/// through a `match` — see DF-178e.
+static NO_VALUE: UInt = 0
+static NO_STATUS: UInt = 0xFFFF
+
+/// The highest 16-aligned address inside a worker stack reservation. Stacks
+/// grow down, so this is where the thread starts.
+func stack_top(base: UInt) -> UInt {
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func stack_a_top() unsafe -> UInt {
+    stack_top(((&var STACK_A) as UnsafePointer<UInt64>) as UInt)
+}
+
+func stack_b_top() unsafe -> UInt {
+    stack_top(((&var STACK_B) as UnsafePointer<UInt64>) as UInt)
+}
+
+func park_handles(system: UInt, process: UInt) unsafe {
+    SYSTEM_WORD = system
+    PROCESS_WORD = process
+}
+
+func parked_process() unsafe -> UInt {
+    PROCESS_WORD
+}
+
+func parked_system() unsafe -> UInt {
+    SYSTEM_WORD
+}
+
+/// A worker: print, yield, repeat, then exit with a value its joiner reads.
+func worker(role: UInt) {
+    let proc = Process(adopting: parked_process())
+    let system = System(boot_handle: parked_system())
+    let me = match proc.self_thread() {
+        case Ok(t) -> t,
+        case Err(_) -> { return },
+    }
+    let tag = if role == ROLE_A { "A" } else { "B" }
+    var turn = 0
+    while turn < TURNS {
+        let _ = system.debug_print(tag)
+        // The switch. With no timer running, this is the ONLY thing that can
+        // move the processor to the other worker.
+        let _ = me.yield_now()
+        turn = turn + 1
+    }
+    let _ = me.exit(if role == ROLE_A { EXIT_A } else { EXIT_B })
+}
+
+/// The initial thread: make two workers, start them, wait for both.
+func initial(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = match system.self_process() {
+        case Ok(p) -> p,
+        case Err(e) -> {
+            let _ = system.debug_print("SOS threads: no process handle\n")
+            let _ = system.shutdown(1)
+            return
+        },
+    }
+    park_handles(boot_handle, proc.as_word())
+
+    let a = match proc.create_thread(stack_top: stack_a_top(), arg: ROLE_A) {
+        case Ok(t) -> t,
+        case Err(e) -> {
+            print("SOS threads: create failed: {}\n", e)
+            let _ = system.shutdown(1)
+            return
+        },
+    }
+    let b = match proc.create_thread(stack_top: stack_b_top(), arg: ROLE_B) {
+        case Ok(t) -> t,
+        case Err(e) -> {
+            print("SOS threads: create failed: {}\n", e)
+            let _ = system.shutdown(1)
+            return
+        },
+    }
+
+    // §8's status word, read from inside the process it describes: kind in the
+    // high bits, code in the low ones, and a running process reads Running/0.
+    let status: UInt = match proc.get_status() {
+        case Ok(w) -> w,
+        case Err(_) -> NO_STATUS,
+    }
+    print("SOS threads: two workers, status word {}\n", status)
+
+    let _ = a.start()
+    let _ = b.start()
+
+    // Both joins: the first parks this thread until A exits, and the second
+    // finds B already gone and answers out of its slot.
+    let ra: UInt = match a.join() {
+        case Ok(v) -> v,
+        case Err(_) -> NO_VALUE,
+    }
+    let rb: UInt = match b.join() {
+        case Ok(v) -> v,
+        case Err(_) -> NO_VALUE,
+    }
+    print("\nSOS threads: joined a={} b={}\n", ra, rb)
+
+    // Process exit, not System shutdown: this is the object the op belongs to
+    // (spec §5.7, ratified Aug 5), and the kernel's teardown line proves it ran.
+    let _ = proc.exit(0)
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_process() == 0 {
+        initial(arg)
+    } else {
+        worker(arg)
+    }
+}
