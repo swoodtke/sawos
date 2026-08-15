@@ -18,10 +18,18 @@ kernel-fault report and its hex formatting are all Saw now. What is left is
 four functions, and each states its own reason at the top of its section — an
 instruction with no Saw spelling, or a linker symbol's address (DF-172a).
 
+Design 178's interrupt work added four more, one LINE each: this profile's timer
+is system registers, so reading its frequency, reading and writing its control
+and setting its countdown cannot be anything but instructions. Everything above
+them — the period arithmetic, the tick policy, and the whole interrupt
+controller, which is memory-mapped — is Saw. C code lines: 47 to 51.
+
 ## The Saw surface (`lib.saw`)
 
 Identical in name and meaning to the riscv32 HAL's — that table is not repeated
-here. What follows is only what this profile does differently, and why.
+here, and neither is the interrupt half design 178 added beside it (the timer,
+the controller, and the one funnel above them). What follows is only what this
+profile does differently, and why.
 
 The design 172 review round changed how much of that surface this file writes,
 not the surface: the poll-and-place, the panic path's write LOOP and the
@@ -36,13 +44,15 @@ rather than a byte to THR.
 | Symbol | Where | Contract | Why not Saw |
 |---|---|---|---|
 | `_start` | boot.S | Reset entry. Stack, `VBAR_EL1`, `CPACR_EL1.FPEN`, `.bss` zerofill, `sos_mmu_init`, `kmain`. Never returns. | Instructions: `msr`, and a stack pointer before any compiled code can run. |
-| `_vectors` | boot.S | The 16-entry EL1 vector table. Only "lower EL, AArch64, synchronous" is a user trap; every other entry is a kernel bug or an interrupt M1 never enables, and all land on `kernel_fault_entry`. | A vector table is placement + branches at fixed 0x80 strides. |
+| `_vectors` | boot.S | The 16-entry EL1 vector table. TWO entries are a user trap now — "lower EL, AArch64, synchronous" and, since design 178, "lower EL, AArch64, IRQ"; every other entry is a kernel bug (an interrupt among them, see D2 below) and lands on `kernel_fault_entry`. | A vector table is placement + branches at fixed 0x80 strides. |
 | `user_trap_entry` | boot.S | Builds the 34-doubleword frame on the kernel stack, calls `ktrap(frame, ESR, FAR)`, restores, `eret`. | Register saves and `eret`. |
+| `user_irq_entry` | boot.S | The same frame, then `ktrap(frame, IRQ_CAUSE, 0)`, then the same return path — the save is a macro and the restore is shared code, so the two entries cannot drift. | Register saves and `eret`. |
 | `kernel_fault_entry` | boot.S | Reads `ESR`/`ELR`/`FAR` and calls the SAW `sos_kernel_fault` with them. | `mrs` names a register at assembly time. The REPORT is Saw (design 172 unit 3). |
 | `sos_enter_user(entry, stack_top, boot_handle)` | boot.S | `ELR_EL1` / `SP_EL0` / `SPSR_EL1` = EL0t with interrupts masked, every register but x0 zeroed, `eret`. | `msr` + `eret` + a register file the caller must not be able to leave anything in. |
 | `sos_platform_exit(code)` | sink.c | Stop the machine through semihosting `SYS_EXIT`. | `hlt #0xf000` with the call number and parameter block pinned in x0/x1. |
 | `sos_mmu_init()` | sink.c | Ask `lib.saw` for a finished identity map, then turn the MMU on. Called by `_start` after `.bss` is zeroed, because the tables live there. | `msr`/`mrs` to four system registers plus `dsb`/`isb`. The MAP is Saw (design 172 unit 1). |
 | `sos_prot_commit()` | sink.c | Publish the staged grant set. | `dsb`/`isb` barriers and a `tlbi`. The DESCRIPTORS are Saw. |
+| `sos_timer_freq()` / `sos_timer_ctl_read()` / `sos_timer_ctl_write(v)` / `sos_timer_set_countdown(n)` | sink.c | The core's physical timer: its frequency, its control register (enabled / masked / fired), and the down-counter whose expiry raises the line. | `mrs`/`msr` name a system register at assembly time. One instruction each; the period arithmetic and the tick policy are Saw. |
 | `sos_payload_start()` / `sos_payload_end()` | sink.c | Bounds of the appended payload. | A linker symbol's ADDRESS, which Saw cannot name — DF-172a. |
 | `virt.ld` | — | Places the image at RAM base 0x4000_0000 and bounds the appended payload on PAGE boundaries — protection granularity here is the page. | Not a program. |
 
@@ -117,6 +127,33 @@ now check-free by construction so the panic path cannot re-enter it),
   BEFORE the MMU comes on, where a real board would want a data-cache clean
   first; QEMU does not model caches, and a board port is where that stops being
   free.
-- **No GIC.** M1 enables no interrupt sources on either profile; the vector
-  table routes IRQ/FIQ to the kernel-bug path so an unexpected one is a
-  diagnostic rather than a silent return. The GIC arrives with M2.
+- **The interrupt controller is v2, and it is PINNED** (design 178 M2 unit 1).
+  `tools/sos_runner.py` passes `gic-version=2` rather than taking the machine's
+  default: this HAL programs a v2 distributor and CPU interface, and a newer
+  emulator changing its default would swap the hardware under a kernel with no
+  way to say so. A v3 port is system registers instead of the CPU-interface
+  window and is a HAL change, not a kernel one.
+- **The timer IS a controller line here** (a per-core one, 30), which is the
+  seam difference a reader trips over: Profile A's timer is a core-local
+  comparator with an interrupt class of its own and never reaches its
+  controller, so its `IRQ_TIMER` is a stand-in number and its `irq_complete`
+  does nothing for the timer. Here every tick goes round the ordinary
+  claim/complete cycle, which is also why THIS profile exercises that cycle
+  without the selftest line and Profile A does not.
+- **D2 is masking plus a vector.** The kernel runs with interrupts masked at
+  its own exception level throughout — the hardware masks on every exception
+  entry, and the boot path never unmasks — and the user-mode return is where
+  they come back on: `SPSR_EL0T` leaves the I bit CLEAR (it was set until
+  design 178), and a returning trap restores the user's own saved state. Should
+  an interrupt arrive at kernel level anyway, the four current-EL vectors send
+  it to `kernel_fault_entry`: a diagnosed stop, never a silent reentry.
+- **The interrupt entry passes a cause the syndrome register cannot hold.** An
+  interrupt has its own vector and no syndrome, but the kernel's handler takes
+  one cause word for every trap, so `user_irq_entry` passes `1 << 32` — this
+  architecture's syndrome is 32 bits, so no fault or syscall can look like it.
+  `boot.S`'s `IRQ_CAUSE_HI` and `lib.saw`'s `IRQ_CAUSE` are one description and
+  must move together, exactly as the frame size is.
+- **`irq_raise_selftest_line` raises a software-generated line**, because this
+  controller has a register for exactly that. Profile A has none and has to make
+  a real device interrupt instead — the same seam, answered by what each board
+  can do.

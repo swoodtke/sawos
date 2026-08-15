@@ -16,6 +16,11 @@ NS16550A write loop, the finisher write that stops the machine, and all of the
 PMP region arithmetic are Saw now. What is left is four functions, and each
 states its own reason at the top of its section.
 
+Design 178's interrupt work added a fifth, and it is ONE LINE (`sos_mie_write`)
+— the timer here is memory-mapped and so is the interrupt controller, so the
+counter arithmetic, the comparator write order, the priorities, the claim and
+the completion are all Saw. C code lines: 22 to 23.
+
 ## The Saw surface (`lib.saw`) — what `kcore` may use
 
 | Name | Contract |
@@ -33,11 +38,36 @@ states its own reason at the top of its section.
 | `prot_commit()` | Publish the staged set. Separate so a half-programmed set is never live. |
 | `enter_user(entry, stack_top, boot_handle)` | Drop to user mode, `boot_handle` in the first argument register, every other register zeroed. Never returns. |
 | `is_syscall(cause) -> Bool` | Did this trap come from a syscall instruction, or is it a fault? |
+| `is_interrupt(cause) -> Bool` | Is this trap an interrupt instead of either? Asked FIRST, because an interrupt is not the running program's business and its instruction has not run. |
 | `cause_tag(cause) -> String` | A short symbolic name for a raw trap cause; unmodelled codes get their own name rather than an arm. |
-| `fault_pc(frame) -> UInt` | Where the trapped instruction was, for a fault line. |
+| `trap_pc(frame) -> UInt` | Where the trapped context resumes: the faulting instruction on a fault, the interrupted one on an interrupt. (Was `fault_pc`; the value never was fault-specific.) |
 | `syscall_handle/op/arg0(frame) -> UInt` | The §5.7 argument registers, by role rather than by name. |
 | `syscall_return(frame, status, value)` | Place the (status, value) pair where the caller reads them and step the saved PC past the trapping instruction — which is a no-op on a profile whose trap already points past it. |
 | `UNMAPPED_PROBE: UInt` | An address the KERNEL cannot reach here. The harness's kernel-fault case reads it; it is per-target because "unmapped" is. |
+
+## Interrupts (design 178 M2 unit 1)
+
+The same list again, for the half of the seam that arrived with M2. It is stated
+separately only because it is new; `sos/hal/arm64/kernel/` implements every row.
+
+| Name | Contract |
+|---|---|
+| `IRQ_NONE: UInt` | What a claim answers when the controller had nothing to give. Zero on both profiles, and never a real line on either. |
+| `IRQ_TIMER: UInt` | The line the periodic timer arrives on. |
+| `intc_init()` | Bring the interrupt controller up with every line masked. |
+| `irq_unmask(line)` / `irq_mask(line)` | Let a line interrupt the kernel, or stop it. Masking is spec §9's mask-on-fire; the Interrupt object's ack will be what unmasks. |
+| `irq_claim(cause) -> UInt` | Which line is being serviced, `IRQ_NONE` if none. Takes the cause because one profile answers the timer half out of it. |
+| `irq_complete(line)` | End of service for a line. |
+| `timer_start(period_us)` | Arm a periodic tick and make it reachable. |
+| `timer_rearm()` | Schedule the next tick. On both profiles this is also what LOWERS the timer's line, which is why the tick path calls it rather than acknowledging something. |
+| `timer_pending() -> Bool` | Has the timer come due without a tick having been taken for it? The masking case's evidence. |
+| `irq_raise_selftest_line() -> UInt` | Raise a line from software, for bring-up, and say which. Per-board because what a board can interrupt itself with is: here a real device, on Profile B a software-generated line. The Interrupt object is what retires it. |
+
+WHAT THE KERNEL PROVIDES ABOVE THIS: one funnel. `ktrap` decides interrupt /
+fault / syscall in that order and hands an interrupt to `service_irq`, which
+claims, runs the arch-free hook that owns the line, and completes. There is no
+second entry point, and the two hooks — the timer tick and a device line — are
+where the scheduler and the Interrupt object land.
 
 This surface is unchanged by the design 172 review round; what changed is how
 much of it this file writes. `console_byte`, `exit_fail` and the `sos_rt_write`
@@ -56,6 +86,7 @@ stores to THR — and the mechanism that stops the machine.
 | `kernel_fault` | boot.S | A trap the kernel itself took. Writes the finisher with `mcause` in the code bits and stops the machine. Never returns, never hangs. | `csrr mcause` plus the finisher store, in the one path that must work with no assumptions about kernel state. |
 | `sos_enter_user(entry, stack_top, boot_handle)` | boot.S | The privilege transition behind `enter_user`. | `csrw` to `mepc`/`mstatus`/`mscratch`, `mret`, and a register file the caller must not be able to leave anything in. |
 | `sos_pmpaddr_write(index, value)` | sink.c | Place a word in `pmpaddr<index>`. | The CSR NUMBER is an assembly-time immediate, so an indexed write is a switch. What a region MEANS is Saw (design 172 unit 1). |
+| `sos_mie_write(mask)` | sink.c | Place a word in `mie` — which CLASSES of interrupt may reach this hart. | `csrw` names its CSR. WHICH classes, and the shadow the mask is staged in, are Saw. Note what is absent: nothing here writes the GLOBAL enable, and that absence is design 178's D2. |
 | `sos_pmpcfg_write(lo, hi)` | sink.c | Publish both config registers together. | Same: `csrw pmpcfg0` names its register. The config words are STAGED in Saw. |
 | `sos_payload_start()` / `sos_payload_end()` | sink.c | Bounds of the appended payload. | A linker symbol's ADDRESS, which Saw cannot name — DF-172a. |
 | `virt.ld` | — | Places the image at this board's RAM base, first section first, and bounds the appended payload. | Not a program. |
@@ -109,3 +140,31 @@ and they are compiled from one definition so they cannot skew.
 - **`UNMAPPED_PROBE` is address 0.** The kernel runs with no translation, so
   nothing is there. On a profile whose kernel runs with an MMU on, address 0 is
   the device window and reading it succeeds.
+- **D2 IS A BIT THIS KERNEL NEVER SETS.** An interrupt reaches M-mode only with
+  `mstatus.MIE` set, and reaches a LOWER privilege mode whatever that bit says —
+  so leaving it clear forever is exactly design 178's "interrupts are taken from
+  user mode only", with no masking in the trap path and no epilogue to get
+  wrong. `mie` still selects which CLASSES are reachable, and that is the one
+  interrupt register this HAL writes. Should one arrive in kernel mode anyway,
+  the mode witness sends it to `kernel_fault`, which stops the machine with the
+  cause in its status: a diagnosed bug, never a silent reentry.
+- **The timer is NOT one of the interrupt controller's sources**, and that is
+  the difference in the seam a reader trips over first. It is a core-local
+  comparator with an interrupt class of its own, so `IRQ_TIMER` here is a number
+  one past the controller's last source rather than a line — a `static_assert`
+  holds the two apart — and `irq_complete` has nothing to do for it. Profile B
+  has the timer ON its controller and does the ordinary end-of-interrupt.
+- **The timer is memory-mapped, so all of it is Saw**, including the two things
+  a split 64-bit counter needs on a 32-bit machine: a carry-safe read (the high
+  half either side of the low one) and a write order that never leaves the
+  comparator naming a deadline in the past (low half to all-ones first).
+- **A line is masked by PRIORITY, not by its enable bit.** This controller
+  ignores a completion for a source that is not enabled for the context, so
+  masking by disabling between claim and complete would leave the source in
+  service forever. Priority 0 is the architecture's "never wins" and is the same
+  mask with none of that.
+- **`irq_raise_selftest_line` makes the CONSOLE interrupt.** There is no
+  software-trigger register here, so the bring-up path uses the one device this
+  kernel already owns: its transmit-empty interrupt asserts as soon as it is
+  enabled and needs no input. The kernel masks the line while servicing it,
+  which is what stops the still-asserting device re-firing.

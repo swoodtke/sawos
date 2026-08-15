@@ -74,6 +74,4 @@ void sos_pmpcfg_write(u32 lo, u32 hi) {
 // lower privilege mode unconditionally and reaches M-mode only through that
 // bit, so leaving it clear IS "interrupts are taken from user mode only".
 
-void sos_mie_write(u32 mask) {
-    __asm__ volatile("csrw mie, %0" :: "r"(mask) : "memory");
-}
+void sos_mie_write(u32 mask) { __asm__ volatile("csrw mie, %0" :: "r"(mask) : "memory"); }
