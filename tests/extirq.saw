@@ -1,0 +1,49 @@
+// SOS M2 unit 1: a device line through the interrupt controller (design 178).
+//
+// The timer proves the trap path; this proves the CONTROLLER — enable, claim,
+// mask, complete — because on one of the two profiles the timer never reaches
+// the controller at all and that whole path would otherwise ship untested.
+//
+// The line is raised from software before user mode is entered, so it is
+// pending across the same kernel section D2 governs: the transcript shows it
+// raised, then user mode entered, and only then serviced. The kernel masks the
+// line as it services it (spec §9's mask-on-fire), which is why a source that
+// goes on asserting — one of the two profiles raises a real device — does not
+// re-enter the handler.
+//
+// WHICH line is the HAL's answer, and the two profiles answer differently on
+// purpose: one board can trigger an interrupt from software and the other
+// cannot, so one raises a software line and the other makes the console
+// interrupt. The kernel above them sees a line number either way.
+
+import kcore.{console, align_up}
+import hal
+import imgformat.{SegFlag}
+import sosabi.{NO_USER_STACK, ROOT_SYSTEM_HANDLE}
+
+static PAYLOAD_REGION: UInt = 0
+
+@export("kmain")
+func kmain() {
+    let uart = console()
+    uart.write_str("SOS M2: interrupt controller bring-up on ")
+    uart.write_str(hal.arch_name())
+    uart.write_str("\n")
+
+    hal.intc_init()
+    let line = hal.irq_raise_selftest_line()
+    uart.write_str("SOS M2: raised external irq ")
+    uart.write_hex(line)
+    uart.write_str("\n")
+
+    let base = hal.payload_start()
+    let top = align_up(hal.payload_end(), hal.PROT_GRAIN)
+
+    hal.prot_reset()
+    hal.prot_region(PAYLOAD_REGION, base, top,
+                    (SegFlag.Read as UInt8) | (SegFlag.Execute as UInt8))
+    hal.prot_commit()
+
+    uart.write_str("SOS M2: entering U-mode\n")
+    hal.enter_user(base, NO_USER_STACK, ROOT_SYSTEM_HANDLE)
+}
