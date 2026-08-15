@@ -35,8 +35,17 @@
  */
 
     .equ FRAME_SIZE,  272
-    .equ SPSR_EL0T,   0x3c0     /* D,A,I,F masked; M[3:0] = 0 -> EL0t */
+    /* D,A,F masked, I NOT: interrupts are enabled at the user-mode return and
+     * nowhere else (design 178 D2). The kernel's own level masks them on every
+     * exception entry in hardware, so a syscall runs with interrupts off and
+     * the `eret` below restores the user state that had them on. M[3:0] = 0
+     * selects EL0t. */
+    .equ SPSR_EL0T,   0x340
     .equ CPACR_FPEN,  (3 << 20)
+    /* The high half of the cause the interrupt entry calls `ktrap` with. The
+     * syndrome register is 32 bits, so this value cannot be one; `lib.saw`'s
+     * `IRQ_CAUSE` is the same description and must move with it. */
+    .equ IRQ_CAUSE_HI, 1
 
     .section .text.boot, "ax", @progbits
     .globl _start
@@ -91,7 +100,7 @@ _vectors:
     ventry_to kernel_fault_entry     /* 0x300  current EL, SPx, FIQ         */
     ventry_to kernel_fault_entry     /* 0x380  current EL, SPx, SError      */
     ventry_to user_trap_entry        /* 0x400  lower EL, AArch64, sync      */
-    ventry_to kernel_fault_entry     /* 0x480  lower EL, AArch64, IRQ       */
+    ventry_to user_irq_entry         /* 0x480  lower EL, AArch64, IRQ       */
     ventry_to kernel_fault_entry     /* 0x500  lower EL, AArch64, FIQ       */
     ventry_to kernel_fault_entry     /* 0x580  lower EL, AArch64, SError    */
     ventry_to kernel_fault_entry     /* 0x600  lower EL, AArch32, sync      */
@@ -107,9 +116,11 @@ _vectors:
  * kernel stack rather than in a static reservation, which is what a per-thread
  * frame will want when threads exist.
  */
-    .section .text.trap, "ax", @progbits
-    .globl user_trap_entry
-user_trap_entry:
+/* A syscall and an interrupt save and restore the SAME frame and differ only in
+ * what the kernel is called with, so the save is a macro used twice and the
+ * restore is shared code both fall into — a second copy of thirty stores is
+ * how the two paths would drift. */
+    .macro save_user_frame
     sub     sp, sp, #FRAME_SIZE
     stp     x0,  x1,  [sp, #(3*8)]
     stp     x2,  x3,  [sp, #(5*8)]
@@ -133,16 +144,43 @@ user_trap_entry:
     mrs     x2, sp_el0
     stp     x0, x1, [sp, #0]
     str     x2,     [sp, #16]
+    .endm
+
+    .section .text.trap, "ax", @progbits
+    .globl user_trap_entry
+user_trap_entry:
+    save_user_frame
 
     /* ktrap(frame, cause, tval): the cause is ESR, the address is FAR. */
     mov     x0, sp
     mrs     x1, esr_el1
     mrs     x2, far_el1
     bl      ktrap
+    b       .Luser_return
+
+/* An interrupt taken at EL0 (design 178 M2 unit 1). It has a vector of its own,
+ * so there is no syndrome register to pass and nothing to decode: `ktrap` is
+ * called with a cause value the syndrome register cannot hold, which is what
+ * `lib.saw`'s `is_interrupt` recognizes. WHICH line it was comes from the
+ * interrupt controller, not from here.
+ *
+ * There is deliberately no EL1 counterpart: an interrupt taken in kernel mode
+ * lands on `kernel_fault_entry` through the vector table, because the kernel
+ * runs with interrupts masked and one arriving there is a bug (D2). */
+    .globl user_irq_entry
+user_irq_entry:
+    save_user_frame
+
+    mov     x0, sp
+    movz    x1, #IRQ_CAUSE_HI, lsl #32
+    mov     x2, xzr
+    bl      ktrap
 
     /* Resume whatever context the frame now describes. A returning syscall has
      * had its (status, value) pair written into the x0/x1 slots; ELR already
-     * points past the `svc`, so nothing here advances it. */
+     * points past the `svc`, so nothing here advances it — and an interrupted
+     * instruction has not run at all, so nothing may. */
+.Luser_return:
     ldp     x0, x1, [sp, #0]
     msr     elr_el1, x0
     msr     spsr_el1, x1

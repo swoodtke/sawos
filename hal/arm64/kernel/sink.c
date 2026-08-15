@@ -128,3 +128,33 @@ void sos_mmu_init(void) {
 void sos_prot_commit(void) {
     __asm__ volatile("dsb ishst; tlbi vmalle1; dsb ish; isb" ::: "memory");
 }
+
+// ---- the core's physical timer --------------------------------------------
+//
+// C BECAUSE: `mrs`/`msr` name a system register at assembly time (reason 1
+// above). Unlike Profile A's memory-mapped comparator, this timer IS system
+// registers, so there is no way to reach it from Saw. One instruction each; the
+// period arithmetic, the tick policy and the interrupt controller are
+// `lib.saw`'s (design 178 M2 unit 1).
+
+u64 sos_timer_freq(void) {
+    u64 v;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v));
+    return v;
+}
+
+u64 sos_timer_ctl_read(void) {
+    u64 v;
+    __asm__ volatile("mrs %0, cntp_ctl_el0" : "=r"(v));
+    return v;
+}
+
+void sos_timer_ctl_write(u64 v) {
+    __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(v));
+}
+
+// The timer counts DOWN from this and asserts when it runs out; writing it is
+// also what lowers the line for a tick already taken.
+void sos_timer_set_countdown(u64 units) {
+    __asm__ volatile("msr cntp_tval_el0, %0" :: "r"(units));
+}

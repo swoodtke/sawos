@@ -63,3 +63,17 @@ void sos_pmpcfg_write(u32 lo, u32 hi) {
     __asm__ volatile("csrw pmpcfg0, %0" :: "r"(lo) : "memory");
     __asm__ volatile("csrw pmpcfg1, %0" :: "r"(hi) : "memory");
 }
+
+// ---- which interrupt classes may reach this hart --------------------------
+//
+// C BECAUSE: the CSR number is an assembly-time immediate (reason 1 above).
+// WHICH classes, and the shadow the mask is staged in, are `lib.saw`'s.
+//
+// Note what is NOT written here: the GLOBAL interrupt enable (mstatus.MIE).
+// SOS never sets it, which is design 178's D2 — a machine interrupt reaches a
+// lower privilege mode unconditionally and reaches M-mode only through that
+// bit, so leaving it clear IS "interrupts are taken from user mode only".
+
+void sos_mie_write(u32 mask) {
+    __asm__ volatile("csrw mie, %0" :: "r"(mask) : "memory");
+}

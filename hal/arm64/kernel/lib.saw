@@ -139,6 +139,17 @@ static_assert(sizeof<TrapFrame>() == 272, "the arm64 trap frame is 34 doubleword
 static UART_BASE: UInt = 0x09000000
 static FR_TX_FULL: UInt32 = 0x20u32       // FR bit 5 — transmit FIFO full
 
+/// The interrupt controller: a distributor shared by the machine and a
+/// per-core interface. This board wires the v2 layout, which is what
+/// `tools/sos_runner.py` pins on the command line so a newer emulator's default
+/// cannot quietly become a controller this HAL does not program.
+static GIC_DIST_BASE: UInt = 0x08000000
+static GIC_CPU_BASE: UInt = 0x08010000
+
+/// The line the core's physical timer arrives on: a per-core interrupt, so it
+/// is the same number on every core and needs no distributor target.
+static TIMER_IRQ: UInt = 30
+
 // =============================================================================
 // Identity (design 162)
 // =============================================================================
@@ -380,6 +391,25 @@ public func is_syscall(cause: UInt) -> Bool {
     ((cause >> ESR_EC_SHIFT) & ESR_EC_MASK) == (ExceptionClass.Svc64 as UInt)
 }
 
+/// The cause `boot.S`'s interrupt entry calls the kernel with.
+///
+/// An interrupt arrives on a VECTOR of its own here — there is no syndrome
+/// register for it and nothing to decode — but the kernel's trap handler takes
+/// one cause word for every trap, so the entry passes a value the syndrome
+/// register cannot hold: this architecture's syndrome is 32 bits wide, so any
+/// bit above that is impossible. `boot.S` builds the same value (`.equ
+/// IRQ_CAUSE_HI`); the two are one description and must move together.
+static IRQ_CAUSE: UInt = 1 << 32
+
+/// Is this trap an interrupt rather than a syscall or a fault?
+///
+/// Interrupts only ever arrive from USER mode (design 178 D2): they are masked
+/// at this exception level throughout, and the vector table sends an interrupt
+/// taken at kernel level to the kernel-bug path rather than to the kernel.
+public func is_interrupt(cause: UInt) -> Bool {
+    cause == IRQ_CAUSE
+}
+
 /// A short symbolic name for a raw `ESR_EL1` value.
 ///
 /// The decode is where an unknown class stops being a number: `from(raw:)` is
@@ -400,8 +430,10 @@ func frame_at(frame_addr: UInt) unsafe -> UnsafeMemory<TrapFrame, Normal> {
     UnsafeMemory<TrapFrame, Normal>(frame_addr)
 }
 
-/// Where the trapped instruction was — for a fault line.
-public func fault_pc(frame_addr: UInt) unsafe -> UInt {
+/// Where the trapped context resumes — the faulting instruction on a fault, the
+/// interrupted one on an interrupt. (It was `fault_pc` until interrupts had a
+/// use for it too; the value never was fault-specific.)
+public func trap_pc(frame_addr: UInt) unsafe -> UInt {
     frame_at(frame_addr).elr.read()
 }
 
@@ -783,4 +815,280 @@ public func prot_region(idx: UInt, base: UInt, top: UInt, perms: UInt8) unsafe {
         put_desc(level3, page, (va as UInt64) | attrs)
         va = va + PAGE_SIZE
     }
+}
+
+// =============================================================================
+// The interrupt controller (design 178 M2 unit 1, D6)
+// =============================================================================
+//
+// Every interrupt on this board arrives through one controller, in two halves:
+// a DISTRIBUTOR that decides which line wins, shared by the machine, and a
+// per-core INTERFACE the winner is delivered through. Both are ordinary MMIO,
+// so all of this is Saw.
+//
+// The cycle is claim-then-complete: reading the acknowledge register both says
+// which line won and marks it active, and writing the same value back ends it.
+// Between the two the line cannot win again, which makes the handler
+// non-reentrant for free.
+//
+// Unlike Profile A, the TIMER IS ONE OF THESE LINES (a per-core one), so the
+// tick path exercises this claim/complete cycle on every tick and the seam's
+// `IRQ_TIMER` is a real line number rather than a stand-in.
+
+/// The per-core interface: what may be delivered, what won, and what is done.
+struct GicCpuRegs {
+    ctlr: UInt32,               // +0x00  deliver to this core at all
+    pmr: UInt32,                // +0x04  the priority a line must beat
+    bpr: UInt32,                // +0x08  preemption grouping (unused: no nesting)
+    iar: ReadOnly<UInt32>,      // +0x0C  acknowledge: claims the winning line
+    eoir: WriteOnly<UInt32>,    // +0x10  end of interrupt
+}
+
+/// The distributor's own two registers. Everything else it has is an ARRAY
+/// indexed by line — enables, priorities, targets — reached by address below,
+/// because a register block struct cannot describe a 1024-entry table this
+/// kernel touches four entries of.
+struct GicDistRegs {
+    ctlr: UInt32,               // +0x000  forward anything at all
+    typer: ReadOnly<UInt32>,    // +0x004  how many lines this board wired
+}
+
+struct Gic {
+    dist: UnsafeMemory<GicDistRegs, Device>,
+    cpu: UnsafeMemory<GicCpuRegs, Device>,
+}
+
+/// Distributor array offsets, and the one write-only command register.
+static GICD_ISENABLER: UInt = 0x100
+static GICD_ICENABLER: UInt = 0x180
+static GICD_IPRIORITYR: UInt = 0x400
+static GICD_ITARGETSR: UInt = 0x800
+static GICD_SGIR: UInt = 0xF00
+
+static GIC_ENABLE: UInt32 = 1u32
+/// The priority floor: a line is delivered only if its priority is NUMERICALLY
+/// BELOW this (lower means more urgent here), so one floor plus one shared
+/// active level is the whole policy — SOS prioritizes in software (spec §7).
+static GIC_PRIORITY_FLOOR: UInt32 = 0xF0u32
+static GIC_PRIORITY_ACTIVE: UInt8 = 0x80u8
+static GIC_CPU0: UInt8 = 0x01u8
+
+/// Lines below this are per-core and have no target register: the software
+/// -generated ones and the per-core peripheral ones, the timer among them.
+static GIC_PERCORE_LINES: UInt = 32
+static GIC_LINES_PER_WORD: UInt = 32
+static GIC_LINES_PER_TYPER_STEP: UInt = 32
+static GIC_TYPER_LINES_MASK: UInt32 = 0x1Fu32
+/// What the acknowledge register reads as when nothing is deliverable.
+static GIC_SPURIOUS: UInt = 1023
+/// Send to the requesting core only — the software-trigger register's target
+/// filter, in bits 25:24.
+static GIC_SGIR_TO_SELF: UInt32 = 0x2000000u32
+static REGISTER_BYTES: UInt = 4
+
+extension Gic {
+    init() unsafe -> Gic {
+        Gic(dist: UnsafeMemory<GicDistRegs, Device>(GIC_DIST_BASE),
+            cpu: UnsafeMemory<GicCpuRegs, Device>(GIC_CPU_BASE))
+    }
+
+    /// How many lines this board wired, out of the field that counts them in
+    /// blocks of 32.
+    func line_count(&self) unsafe -> UInt {
+        let blocks = ((self.dist.typer.read() & GIC_TYPER_LINES_MASK) as UInt) + 1
+        blocks * GIC_LINES_PER_TYPER_STEP
+    }
+
+    func word_at(&self, base: UInt, line: UInt) unsafe -> UnsafeMemory<UInt32, Device> {
+        UnsafeMemory<UInt32, Device>(
+            GIC_DIST_BASE + base + (line / GIC_LINES_PER_WORD) * REGISTER_BYTES)
+    }
+
+    /// A per-line BYTE register — priorities and targets are one byte each,
+    /// which is why these are not the word view above.
+    func byte_at(&self, base: UInt, line: UInt) unsafe -> UnsafeMemory<UInt8, Device> {
+        UnsafeMemory<UInt8, Device>(GIC_DIST_BASE + base + line)
+    }
+
+    /// Every line masked, then both halves on. Nothing is deliverable until
+    /// `irq_unmask` opens a line.
+    func reset(&self) unsafe {
+        self.dist.ctlr.write(0u32)
+        let lines = self.line_count()
+        var word: UInt = 0
+        while word * GIC_LINES_PER_WORD < lines {
+            let disable = UnsafeMemory<UInt32, Device>(
+                GIC_DIST_BASE + GICD_ICENABLER + word * REGISTER_BYTES)
+            disable.write(0xFFFFFFFFu32)
+            word = word + 1
+        }
+        self.dist.ctlr.write(GIC_ENABLE)
+        self.cpu.pmr.write(GIC_PRIORITY_FLOOR)
+        self.cpu.ctlr.write(GIC_ENABLE)
+    }
+
+    func unmask(&self, line: UInt) unsafe {
+        self.byte_at(GICD_IPRIORITYR, line).write(GIC_PRIORITY_ACTIVE)
+        // A per-core line is delivered to the core it belongs to and its target
+        // register is read-only; a shared one has to be pointed at a core, and
+        // this kernel is uniprocessor.
+        if line >= GIC_PERCORE_LINES {
+            self.byte_at(GICD_ITARGETSR, line).write(GIC_CPU0)
+        }
+        let enable = self.word_at(GICD_ISENABLER, line)
+        enable.write(1u32 << ((line % GIC_LINES_PER_WORD) as Int))
+    }
+
+    /// Masking is a WRITE-ONE-TO-CLEAR register, so this touches one line and
+    /// needs no read-modify-write of the word around it.
+    func mask(&self, line: UInt) unsafe {
+        let disable = self.word_at(GICD_ICENABLER, line)
+        disable.write(1u32 << ((line % GIC_LINES_PER_WORD) as Int))
+    }
+
+    func claim(&self) unsafe -> UInt {
+        self.cpu.iar.read() as UInt
+    }
+
+    func complete(&self, line: UInt) unsafe {
+        self.cpu.eoir.write(line as UInt32)
+    }
+
+    /// Raise a software-generated line on this core.
+    func raise_to_self(&self, line: UInt) unsafe {
+        let trigger = UnsafeMemory<UInt32, Device>(GIC_DIST_BASE + GICD_SGIR)
+        trigger.write(GIC_SGIR_TO_SELF | (line as UInt32))
+    }
+}
+
+/// The controller had nothing to give. Both profiles report a spurious
+/// interrupt as this value; here the hardware says 1023 and the seam maps it,
+/// and line 0 is a software-generated line SOS never raises.
+public static IRQ_NONE: UInt = 0
+
+/// The line the periodic timer arrives on.
+public static IRQ_TIMER: UInt = TIMER_IRQ
+
+/// The line `irq_raise_selftest_line` raises: a software-generated one, which
+/// is this controller's own way to make an interrupt happen.
+static SELFTEST_IRQ: UInt = 5
+
+/// Bring the interrupt controller up with every line masked.
+public func intc_init() unsafe {
+    Gic().reset()
+}
+
+/// Let `line` interrupt the kernel.
+public func irq_unmask(line: UInt) unsafe {
+    Gic().unmask(line)
+}
+
+/// Stop `line` interrupting the kernel — spec §9's mask-on-fire, which the
+/// Interrupt object's `ack` will undo when there is one.
+public func irq_mask(line: UInt) unsafe {
+    Gic().mask(line)
+}
+
+/// Which line is being serviced, or `IRQ_NONE`.
+///
+/// The cause is unused on this profile: an interrupt has its own vector, so the
+/// controller is the only thing that knows which line it was. (Profile A
+/// answers the timer half out of the cause word, which is why the seam passes
+/// it at all.)
+///
+/// The acknowledge value is returned WHOLE rather than masked to its line
+/// number, because on a multi-core machine it also carries which core sent a
+/// software-generated line and the completion has to give that back. This
+/// kernel is uniprocessor, so the field is always zero and the value IS the
+/// line; an SMP port is where that stops being true.
+public func irq_claim(cause: UInt) unsafe -> UInt {
+    let acknowledged = Gic().claim()
+    if acknowledged == GIC_SPURIOUS {
+        return IRQ_NONE
+    }
+    acknowledged
+}
+
+/// End of service for `line`.
+public func irq_complete(line: UInt) unsafe {
+    Gic().complete(line)
+}
+
+/// Raise a line from software, for interrupt bring-up. Returns the line raised.
+///
+/// This controller HAS a software trigger, so unlike Profile A no device is
+/// involved: the line is one of the software-generated ones, raised at this
+/// core. It is edge-like — one raise is one delivery — so nothing re-fires
+/// after the handler completes.
+///
+/// Bring-up scaffolding in the honest sense: a kernel with no Interrupt object
+/// (spec §2) has no other way to reach a real claim/complete cycle, and the
+/// object-model unit is where a driver takes a real line over.
+public func irq_raise_selftest_line() unsafe -> UInt {
+    let gic = Gic()
+    gic.unmask(SELFTEST_IRQ)
+    gic.raise_to_self(SELFTEST_IRQ)
+    SELFTEST_IRQ
+}
+
+// =============================================================================
+// The core's physical timer (design 178 M2 unit 1)
+// =============================================================================
+//
+// The periodic tick comes from the core's own timer, which is SYSTEM REGISTERS
+// rather than MMIO — so unlike Profile A's memory-mapped comparator, the three
+// touches below are C leaves. What they are worth is one instruction each; the
+// arithmetic, the period and the policy are here.
+//
+// The timer counts DOWN from a value the kernel writes and asserts its line
+// while the count is negative — a level condition, so the tick path REARMS
+// (writes the next countdown) and that is what lowers the line. The controller
+// still needs its end-of-interrupt afterwards, which is the one asymmetry with
+// Profile A worth knowing: there, the timer is not a controller line at all.
+
+extern "C" {
+    // The timer's frequency in ticks per second — a property of the machine,
+    // readable only through a system register.
+    func sos_timer_freq() -> UInt
+    // The control register: enabled, masked, and whether the timer has fired.
+    func sos_timer_ctl_read() -> UInt
+    func sos_timer_ctl_write(value: UInt)
+    // Count down from `units` and assert the line when it runs out.
+    func sos_timer_set_countdown(units: UInt)
+}
+
+static TIMER_CTL_ENABLE: UInt = 1         // bit 0
+static TIMER_CTL_FIRED: UInt = 4          // bit 2 — the condition is met
+static US_PER_SECOND: UInt = 1000000
+
+/// The tick period in timer units, staged for `timer_rearm`. Compound global
+/// state on a serialization argument the compiler cannot see (design 149):
+/// uniprocessor, and only bring-up writes it.
+unsafe static var TIMER_PERIOD: UInt = 0
+
+/// Start a periodic tick every `period_us` microseconds.
+///
+/// The conversion multiplies BEFORE dividing: this machine's timer runs at
+/// 62.5 MHz, so a ticks-per-microsecond constant would be 62 and every period
+/// would be short by 0.8%.
+public func timer_start(period_us: UInt) unsafe {
+    TIMER_PERIOD = (period_us * sos_timer_freq()) / US_PER_SECOND
+    irq_unmask(IRQ_TIMER)
+    timer_rearm()
+    sos_timer_ctl_write(TIMER_CTL_ENABLE)
+}
+
+/// Schedule the next tick, which is also what lowers the line for the tick the
+/// kernel is servicing.
+///
+/// The countdown restarts from NOW rather than from the missed deadline: a tick
+/// the kernel was late for is one tick, never a burst of catch-up ticks whose
+/// only effect would be to keep the machine in the trap handler.
+public func timer_rearm() unsafe {
+    sos_timer_set_countdown(TIMER_PERIOD)
+}
+
+/// Has the timer fired without a tick having been taken for it?
+public func timer_pending() -> Bool {
+    (sos_timer_ctl_read() & TIMER_CTL_FIRED) != 0
 }

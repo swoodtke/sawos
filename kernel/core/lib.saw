@@ -301,14 +301,25 @@ func dispatch(handle: UInt, op: UInt, arg0: UInt) -> SosStatus {
 /// resumes past the trapping instruction — both through the HAL, because both
 /// are register conventions.
 ///
-/// A FAULT is fatal — spec §8 makes a thread fault kill its process, and in M1
-/// root IS the system. A bad SYSCALL is not: an unknown handle, an unknown op
-/// or a missing right come back as a status word and the process runs on.
-/// Confusing the two is how a kernel turns a caller's mistake into its own.
+/// THREE KINDS OF TRAP, and the order below is what tells them apart. An
+/// INTERRUPT is not the running program's business at all — it is serviced and
+/// the interrupted instruction resumes untouched, which is why it is decided
+/// first and why it never reaches the syscall return path (that path steps the
+/// saved PC, and stepping past an instruction that has not run yet would lose
+/// it). A FAULT is fatal — spec §8 makes a thread fault kill its process, and
+/// in M1 root IS the system. A bad SYSCALL is not: an unknown handle, an
+/// unknown op or a missing right come back as a status word and the process
+/// runs on. Confusing the last two is how a kernel turns a caller's mistake
+/// into its own.
 @export("ktrap")
 public func ktrap(frame_addr: UInt, cause: UInt, tval: UInt) {
+    if hal.is_interrupt(cause) {
+        service_irq(frame_addr, cause)
+        return
+    }
+
     if not hal.is_syscall(cause) {
-        fatal(hal.cause_tag(cause), cause, hal.fault_pc(frame_addr), tval,
+        fatal(hal.cause_tag(cause), cause, hal.trap_pc(frame_addr), tval,
               ExitCode.UmodeFault)
     }
 
@@ -323,6 +334,123 @@ public func ktrap(frame_addr: UInt, cause: UInt, tval: UInt) {
 }
 
 static BYTE_MASK: UInt = 0xFF
+
+// =============================================================================
+// Interrupts (design 178 D2 + D6; spec §9)
+// =============================================================================
+//
+// THE KERNEL IS NON-PREEMPTIBLE (design 178 D2). An interrupt is taken from
+// USER mode and from nowhere else: the kernel runs with them masked from boot,
+// each machine masks them again on trap entry in hardware, and each machine's
+// return to user mode is where they come back on. Nothing below has to arrange
+// any of that — it is a property of the two HALs, and each states in its ABI.md
+// that an interrupt arriving in kernel mode lands on its kernel-bug path rather
+// than on this code. So there are no critical sections here, no interrupt
+// masking vocabulary, and no `IntrSpinLock` (spec §9b) until SMP needs one.
+//
+// The cost is recorded rather than hidden: syscall latency bounds interrupt
+// latency, which is design 178's M3 tripwire and the reason the hooks below say
+// what they must not grow into.
+//
+// WHAT IS ARCH-FREE HERE: which hook a line belongs to, what the kernel does
+// with it, and the ORDER of claim / service / complete. What is not: how a line
+// is claimed, masked and completed, and how a timer is rearmed — all six are
+// seam calls, because a controller is a machine's, not a kernel's (D6).
+
+/// How many of the first ticks the kernel narrates on the console.
+///
+/// A kernel that logged every tick would BE its own workload — at a
+/// millisecond period the log is the machine — so the hook says enough to prove
+/// the path ran and then goes quiet. The count keeps rising either way.
+static TICK_REPORT_LIMIT: UInt = 4
+
+/// Ticks the periodic timer has delivered since boot.
+///
+/// Compound global state resting on a serialization argument the compiler
+/// cannot see, which is design 149's `unsafe static var`: uniprocessor kernel,
+/// interrupts taken from user mode only, so the tick path is the only writer
+/// and nothing can interleave with it.
+unsafe static var TIMER_TICKS: UInt = 0
+
+/// Interrupts the controller had nothing to give for. ONE is not an error — a
+/// line can stop asserting between raising the interrupt and being asked about
+/// it — but a stream of them is, so the first is reported and the rest are
+/// counted.
+unsafe static var SPURIOUS_IRQS: UInt = 0
+
+/// Ticks the periodic timer has delivered since boot. The scheduler's clock
+/// when there is a scheduler; today the harness's evidence that a tick was
+/// taken, and when.
+public func timer_ticks() unsafe -> UInt {
+    TIMER_TICKS
+}
+
+/// THE TIMER TICK — the arch-free landing point for the periodic timer.
+///
+/// This is where the scheduler's timeslice accounting goes (spec §7:
+/// round-robin within a level, preemption decided on the way out of the
+/// kernel), and until that unit exists the body counts and narrates. What it
+/// must not grow into is anything LONG: it runs with interrupts masked, so its
+/// length is interrupt latency.
+///
+/// `frame_addr` is the interrupted context — the thing a context switch will
+/// rewrite. Today it is only read, to say where user mode was when the tick
+/// landed, which is also the harness's evidence that the tick came from there.
+func on_timer_tick(frame_addr: UInt) unsafe {
+    TIMER_TICKS = TIMER_TICKS + 1
+    if TIMER_TICKS > TICK_REPORT_LIMIT {
+        return
+    }
+    let uart = console()
+    uart.write_str("SOS: timer tick ")
+    uart.write_hex(TIMER_TICKS)
+    uart.write_str(" at ")
+    uart.write_hex(hal.trap_pc(frame_addr))
+    uart.write_str("\n")
+}
+
+/// A DEVICE INTERRUPT — the arch-free landing point for an external line.
+///
+/// This is where the Interrupt object (spec §2) marks itself ready and wakes
+/// whoever waits on it. Until that unit exists the body reports the line and
+/// the line stays MASKED: spec §9's mask-on-fire happens before this runs, and
+/// only an ack through the handle unmasks — so a device that is still asserting
+/// cannot re-enter here, and the "at most one unacked fire per Interrupt"
+/// invariant holds before there is anything to hold it for.
+func on_external_irq(line: UInt) {
+    let uart = console()
+    uart.write_str("SOS: external irq ")
+    uart.write_hex(line)
+    uart.write_str("\n")
+}
+
+/// EVERY interrupt the kernel takes arrives here, through `ktrap` and through
+/// nothing else.
+///
+/// Machine, then kernel, then machine: claim the line, run the hook that owns
+/// it, end the service. The two branches differ in exactly one step, and it is
+/// spec §9's: the timer is REARMED, which is what lowers its line, while a
+/// device line is MASKED, because a device goes on asserting until its driver
+/// has been told.
+func service_irq(frame_addr: UInt, cause: UInt) unsafe {
+    let line = hal.irq_claim(cause)
+    if line == hal.IRQ_NONE {
+        SPURIOUS_IRQS = SPURIOUS_IRQS + 1
+        if SPURIOUS_IRQS == 1 {
+            console().write_str("SOS: spurious interrupt\n")
+        }
+        return
+    }
+
+    if line == hal.IRQ_TIMER {
+        hal.timer_rearm()
+        on_timer_tick(frame_addr)
+    } else {
+        hal.irq_mask(line)
+        on_external_irq(line)
+    }
+    hal.irq_complete(line)
+}
 
 /// What a refused too-high address REPORTS: its top 32 bits. The low half is
 /// what would have survived a narrowing, so it is the half that says nothing;

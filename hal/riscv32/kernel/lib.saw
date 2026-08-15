@@ -150,9 +150,33 @@ static_assert(sizeof<TrapFrame>() == 128, "the riscv32 trap frame is 32 words")
 static UART_BASE: UInt = 0x10000000
 static TEST_BASE: UInt = 0x00100000
 static LSR_TX_EMPTY: UInt8 = 0x20u8       // LSR bit 5 — TX holding register empty
+static IER_TX_EMPTY: UInt8 = 0x02u8       // IER bit 1 — interrupt when TX is empty
 static FINISHER_PASS: UInt32 = 0x5555u32
 static FINISHER_FAIL: UInt = 0x3333
 static FAIL_CODE_SHIFT: Int = 16
+
+/// The core-local timer, whose comparator this hart's periodic tick comes from.
+/// The counter is at its own address rather than at an offset from the
+/// comparator — they are far apart in this block, so they are two views.
+static TIMER_CMP_BASE: UInt = 0x02004000
+static TIMER_COUNT_BASE: UInt = 0x0200BFF8
+/// The board's timebase, as counter units per microsecond: 10 MHz on this
+/// machine (`timebase-frequency` in its device tree). There is no register to
+/// read it from — it is a property of the board, which is why it is here.
+static TIMER_UNITS_PER_US: UInt = 10
+
+/// The platform interrupt controller, in the four windows this kernel uses.
+/// The context is the one this hart takes interrupts in; the second context
+/// this board wires is for a privilege mode SOS does not run in.
+static PLIC_PRIORITY_BASE: UInt = 0x0C000000
+static PLIC_ENABLE_BASE: UInt = 0x0C002000
+static PLIC_CONTEXT_BASE: UInt = 0x0C200000
+/// Sources this board wires (`riscv,ndev`). Source 0 is reserved as "no
+/// source", which is what a claim returns when it has nothing to give.
+static PLIC_MAX_SOURCE: UInt = 95
+/// The line the board's console sits on — the one device this kernel can make
+/// interrupt on demand, which is what `irq_raise_selftest_line` spends.
+static CONSOLE_IRQ: UInt = 10
 
 // =============================================================================
 // Identity (design 162)
@@ -269,6 +293,7 @@ extern "C" {
     func sos_pmpcfg_write(lo: UInt, hi: UInt)
     func sos_payload_start() -> UInt
     func sos_payload_end() -> UInt
+    func sos_mie_write(mask: UInt)
 }
 
 /// This target's protection granularity. PMP stores its bounds shifted right by
@@ -447,6 +472,28 @@ public func is_syscall(cause: UInt) -> Bool {
     cause == (TrapCause.EcallFromU as UInt)
 }
 
+/// The high bit of a cause word says "this is an interrupt, not an exception",
+/// and the rest of the word is then an INTERRUPT code with its own numbering —
+/// a 7 with the flag set has nothing to do with a 7 without it.
+static INTERRUPT_FLAG: UInt = 0x80000000
+
+/// The interrupt codes this kernel can take. Numbered by the architecture, not
+/// by us, so each is pinned per case; the flag above is stripped before the
+/// decode, which is why these are small numbers and not high ones.
+enum InterruptCause: UInt {
+    case MachineTimer = 7,
+    case MachineExternal = 11,
+}
+
+/// Is this trap an interrupt rather than a syscall or a fault?
+///
+/// Interrupts only ever arrive from USER mode (design 178 D2): this hart takes
+/// them in kernel mode only with the global enable set, which SOS never sets,
+/// and a trap taken in kernel mode goes to `boot.S`'s kernel-bug path anyway.
+public func is_interrupt(cause: UInt) -> Bool {
+    (cause & INTERRUPT_FLAG) != 0
+}
+
 /// A short symbolic name for a raw trap cause.
 ///
 /// The decode is where an unknown code stops being a number: `from(raw:)` is
@@ -466,8 +513,10 @@ func frame_at(frame_addr: UInt) unsafe -> UnsafeMemory<TrapFrame, Normal> {
     UnsafeMemory<TrapFrame, Normal>(frame_addr)
 }
 
-/// Where the trapped instruction was — for a fault line.
-public func fault_pc(frame_addr: UInt) unsafe -> UInt {
+/// Where the trapped context resumes — the faulting instruction on a fault, the
+/// interrupted one on an interrupt. (It was `fault_pc` until interrupts had a
+/// use for it too; the value never was fault-specific.)
+public func trap_pc(frame_addr: UInt) unsafe -> UInt {
     frame_at(frame_addr).mepc.read()
 }
 
@@ -492,4 +541,323 @@ public func syscall_return(frame_addr: UInt, status: UInt, value: UInt) unsafe {
     frame.a0.write(status)
     frame.a1.write(value)
     frame.mepc.write(frame.mepc.read() + SYSCALL_INSN_LEN)
+}
+
+// =============================================================================
+// Which sources may interrupt this hart (design 178 M2 unit 1)
+// =============================================================================
+//
+// Two masks stand between a device and this kernel, and they are not
+// interchangeable. THIS one is the hart's: one bit per interrupt CLASS (timer,
+// external), and it is what makes a class reachable at all. The PLIC's, below,
+// is per SOURCE within the external class.
+//
+// What is NOT here is the GLOBAL enable, and its absence is design 178's D2:
+// this hart delivers a machine interrupt to a lower privilege mode
+// UNCONDITIONALLY, and to itself only with the global bit set — so leaving that
+// bit clear forever is exactly "interrupts are taken from user mode only". The
+// kernel needs no critical sections and the trap path needs no epilogue; a
+// wrongly-arrived interrupt lands on `boot.S`'s kernel-bug path, which is a
+// diagnosed stop rather than a silent reentry.
+
+/// The class mask, staged here because the register it mirrors is written
+/// through a C leaf and reading it back would cost a second one. Compound
+/// global state on a serialization argument the compiler cannot see (design
+/// 149): uniprocessor, and only bring-up writes it.
+unsafe static var IRQ_CLASSES: UInt = 0
+
+/// Class bits, by their architectural positions.
+static IRQ_CLASS_TIMER: UInt = 0x80         // bit 7
+static IRQ_CLASS_EXTERNAL: UInt = 0x800     // bit 11
+
+/// Let a class of interrupt reach this hart.
+func irq_class_enable(bit: UInt) unsafe {
+    IRQ_CLASSES = IRQ_CLASSES | bit
+    sos_mie_write(IRQ_CLASSES)
+}
+
+// =============================================================================
+// The machine timer (design 178 M2 unit 1)
+// =============================================================================
+//
+// The periodic tick comes from the core-local timer: a free-running 64-bit
+// counter and a per-hart comparator, both ordinary MMIO, so all of it is Saw
+// through the design-112 driver idiom and none of it is C.
+//
+// The condition is a LEVEL, not an edge — the timer asserts while the counter
+// is at or past the comparator — so the tick path REARMS rather than
+// acknowledging: writing the next deadline is what lowers the line. That is why
+// the seam has `timer_rearm` and why `irq_complete` has nothing to do for it.
+//
+// The counter is 64 bits on a 32-bit machine, which is the whole awkwardness
+// here: each half is its own register, so a read has to survive a carry between
+// them and a write has to avoid the instant where the halves describe a
+// deadline that is neither the old one nor the new one.
+
+/// The comparator, low half first.
+struct TimerCmpRegs {
+    lo: UInt32,
+    hi: UInt32,
+}
+
+/// The counter, same shape and read-only.
+struct TimerCountRegs {
+    lo: ReadOnly<UInt32>,
+    hi: ReadOnly<UInt32>,
+}
+
+/// The driver: this hart's comparator, and the counter it is compared against.
+struct MachineTimer {
+    cmp: UnsafeMemory<TimerCmpRegs, Device>,
+    count: UnsafeMemory<TimerCountRegs, Device>,
+}
+
+extension MachineTimer {
+    init() unsafe -> MachineTimer {
+        MachineTimer(cmp: UnsafeMemory<TimerCmpRegs, Device>(TIMER_CMP_BASE),
+                     count: UnsafeMemory<TimerCountRegs, Device>(TIMER_COUNT_BASE))
+    }
+
+    /// The counter, read carry-safely: the high half is read either side of the
+    /// low one, and a carry between the two reads is retried. Without this a
+    /// read that straddled a carry would be off by 2^32 counter units — about
+    /// seven minutes here, and only ever on the one read in seven minutes that
+    /// hits it.
+    func now(&self) unsafe -> UInt64 {
+        var hi = self.count.hi.read()
+        var lo = self.count.lo.read()
+        var hi2 = self.count.hi.read()
+        while hi != hi2 {
+            hi = hi2
+            lo = self.count.lo.read()
+            hi2 = self.count.hi.read()
+        }
+        (((hi as UInt64) << WORD_BITS) | (lo as UInt64))
+    }
+
+    func deadline(&self) unsafe -> UInt64 {
+        (((self.cmp.hi.read() as UInt64) << WORD_BITS)
+         | (self.cmp.lo.read() as UInt64))
+    }
+
+    /// Program the next deadline. The low half goes to all-ones FIRST, so the
+    /// pair never momentarily names a deadline in the past — the classic
+    /// split-comparator write order, and the reason this is a method rather
+    /// than two stores at the call site.
+    ///
+    /// The halves are taken with `truncating:`, which is what splitting a wide
+    /// value into two registers MEANS; a checked cast would be a panic edge on
+    /// the one path a kernel wants free of them.
+    func set_deadline(&self, at: UInt64) unsafe {
+        self.cmp.lo.write(0xFFFFFFFFu32)
+        self.cmp.hi.write(UInt32.from(truncating: at >> WORD_BITS))
+        self.cmp.lo.write(UInt32.from(truncating: at))
+    }
+
+    /// Has the timer expired without being serviced? This IS the pending
+    /// condition — the hardware asserts on exactly this comparison — so it
+    /// needs no interrupt-controller state and no extra register.
+    func expired(&self) unsafe -> Bool {
+        self.now() >= self.deadline()
+    }
+}
+
+static WORD_BITS: Int = 32
+
+/// The tick period in counter units, staged for `timer_rearm`. Same shape and
+/// same argument as `IRQ_CLASSES` above.
+unsafe static var TIMER_PERIOD: UInt = 0
+
+/// Start a periodic tick every `period_us` microseconds.
+public func timer_start(period_us: UInt) unsafe {
+    TIMER_PERIOD = period_us * TIMER_UNITS_PER_US
+    timer_rearm()
+    irq_class_enable(IRQ_CLASS_TIMER)
+}
+
+/// Schedule the next tick, which is also what lowers the line for the tick the
+/// kernel is servicing.
+///
+/// The next deadline is measured from NOW rather than from the last one: a tick
+/// the kernel was late for is one tick, never a burst of catch-up ticks whose
+/// only effect would be to keep the machine in the trap handler.
+public func timer_rearm() unsafe {
+    let timer = MachineTimer()
+    timer.set_deadline(timer.now() + (TIMER_PERIOD as UInt64))
+}
+
+/// Has the timer expired without a tick having been taken for it?
+public func timer_pending() unsafe -> Bool {
+    MachineTimer().expired()
+}
+
+// =============================================================================
+// The platform interrupt controller (design 178 M2 unit 1, D6)
+// =============================================================================
+//
+// Every device interrupt on this board arrives through one controller, which
+// prioritizes the sources and hands the winner to a CONTEXT — a (hart,
+// privilege) pair. SOS uses one context, the one this kernel runs in.
+//
+// The cycle is claim-then-complete: reading the claim register both says which
+// source won and marks it in service, and writing the same number back releases
+// it. Between the two the source cannot win again, which is what makes the
+// handler non-reentrant for free.
+//
+// MASKING IS BY PRIORITY, NOT BY THE ENABLE BIT, and that is worth knowing:
+// this controller ignores a completion for a source that is not enabled for the
+// context, so masking a line by disabling it between claim and complete would
+// leave it in service forever. Priority 0 means "never wins", which is the same
+// mask with none of that.
+
+/// The context window: the priority a source must beat to be delivered here,
+/// and the register that claims and completes.
+struct PlicContextRegs {
+    threshold: UInt32,
+    claim: UInt32,
+}
+
+struct Plic {
+    context: UnsafeMemory<PlicContextRegs, Device>,
+}
+
+/// Priority levels this kernel uses: 0 is the architecture's "never
+/// interrupt", and every unmasked line shares the one level above it — SOS
+/// prioritizes in software (spec §7), not in the controller.
+static PLIC_PRIORITY_MASKED: UInt32 = 0u32
+static PLIC_PRIORITY_ACTIVE: UInt32 = 1u32
+static PLIC_SOURCES_PER_WORD: UInt = 32
+static REGISTER_BYTES: UInt = 4
+
+extension Plic {
+    init() unsafe -> Plic {
+        Plic(context: UnsafeMemory<PlicContextRegs, Device>(PLIC_CONTEXT_BASE))
+    }
+
+    /// One source's priority register.
+    func priority_at(&self, line: UInt) unsafe -> UnsafeMemory<UInt32, Device> {
+        UnsafeMemory<UInt32, Device>(PLIC_PRIORITY_BASE + line * REGISTER_BYTES)
+    }
+
+    /// The enable word holding this source's bit, for this context.
+    func enable_word_at(&self, line: UInt) unsafe -> UnsafeMemory<UInt32, Device> {
+        UnsafeMemory<UInt32, Device>(
+            PLIC_ENABLE_BASE + (line / PLIC_SOURCES_PER_WORD) * REGISTER_BYTES)
+    }
+
+    /// Every source masked and disabled, and the context's threshold at 0 so
+    /// that an unmasked source at any priority above it gets through.
+    func reset(&self) unsafe {
+        var line: UInt = 1
+        while line <= PLIC_MAX_SOURCE {
+            self.priority_at(line).write(PLIC_PRIORITY_MASKED)
+            line = line + 1
+        }
+        var word: UInt = 0
+        while word * PLIC_SOURCES_PER_WORD <= PLIC_MAX_SOURCE {
+            UnsafeMemory<UInt32, Device>(
+                PLIC_ENABLE_BASE + word * REGISTER_BYTES).write(0u32)
+            word = word + 1
+        }
+        self.context.threshold.write(0u32)
+    }
+
+    func set_priority(&self, line: UInt, priority: UInt32) unsafe {
+        self.priority_at(line).write(priority)
+    }
+
+    func set_enabled(&self, line: UInt) unsafe {
+        let word = self.enable_word_at(line)
+        word.write(word.read() | (1u32 << ((line % PLIC_SOURCES_PER_WORD) as Int)))
+    }
+
+    /// Which source won, and mark it in service. 0 means none — the
+    /// architecture reserves source 0 for exactly that.
+    func claim(&self) unsafe -> UInt {
+        self.context.claim.read() as UInt
+    }
+
+    /// Release the source, so it may win again once it is unmasked.
+    func complete(&self, line: UInt) unsafe {
+        self.context.claim.write(line as UInt32)
+    }
+}
+
+/// The controller had nothing to give. Both profiles report a spurious
+/// interrupt as this value, and neither ever uses it as a real line.
+public static IRQ_NONE: UInt = 0
+
+/// The line the periodic timer arrives on.
+///
+/// The timer is NOT one of this controller's sources here — it is a class of
+/// its own at the hart — so the seam needs a number the controller can never
+/// produce, and one past its last source is that number.
+public static IRQ_TIMER: UInt = 1024
+
+static_assert(IRQ_TIMER > PLIC_MAX_SOURCE,
+              "the timer's line must not collide with a real interrupt source")
+
+/// Bring the interrupt controller up with every line masked, and make the
+/// external class reachable at the hart. Individual lines are opened by
+/// `irq_unmask` and by nothing else.
+public func intc_init() unsafe {
+    Plic().reset()
+    irq_class_enable(IRQ_CLASS_EXTERNAL)
+}
+
+/// Let `line` interrupt the kernel.
+public func irq_unmask(line: UInt) unsafe {
+    let plic = Plic()
+    plic.set_enabled(line)
+    plic.set_priority(line, PLIC_PRIORITY_ACTIVE)
+}
+
+/// Stop `line` interrupting the kernel — spec §9's mask-on-fire, which the
+/// Interrupt object's `ack` will undo when there is one.
+public func irq_mask(line: UInt) unsafe {
+    Plic().set_priority(line, PLIC_PRIORITY_MASKED)
+}
+
+/// Which line is being serviced, or `IRQ_NONE`.
+///
+/// The class comes from the cause word and the SOURCE, for an external
+/// interrupt, from the controller — which is why claiming takes the cause: on
+/// this profile the timer never reaches the controller at all.
+public func irq_claim(cause: UInt) unsafe -> UInt {
+    let code = cause & ~INTERRUPT_FLAG
+    if code == (InterruptCause.MachineTimer as UInt) {
+        return IRQ_TIMER
+    }
+    if code == (InterruptCause.MachineExternal as UInt) {
+        return Plic().claim()
+    }
+    IRQ_NONE
+}
+
+/// End of service for `line`.
+///
+/// The timer has none: its line is lowered by rearming the comparator, and this
+/// controller never saw it.
+public func irq_complete(line: UInt) unsafe {
+    if line == IRQ_TIMER {
+        return
+    }
+    Plic().complete(line)
+}
+
+/// Raise a line from software, for interrupt bring-up. Returns the line raised.
+///
+/// There is no software-trigger register on this controller, so the source is a
+/// real device: the console's "transmit register is empty" interrupt, which
+/// asserts as soon as it is enabled and needs no input to arrive. It is the one
+/// device this kernel already owns, and the kernel masks the line in its
+/// handler, so the still-asserting device does not re-fire.
+///
+/// This is bring-up scaffolding in the honest sense — a kernel with no Interrupt
+/// object (spec §2) has no other way to reach a real claim/complete cycle — and
+/// the object-model unit is where a driver takes the line over.
+public func irq_raise_selftest_line() unsafe -> UInt {
+    irq_unmask(CONSOLE_IRQ)
+    Uart16550(at: UART_BASE).regs.ier.write(IER_TX_EMPTY)
+    CONSOLE_IRQ
 }
