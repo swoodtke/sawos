@@ -24,6 +24,13 @@ and setting its countdown cannot be anything but instructions. Everything above
 them — the period arithmetic, the tick policy, and the whole interrupt
 controller, which is memory-mapped — is Saw. C code lines: 47 to 51.
 
+Design 178's THREAD work moved the line again, in the other direction from
+usual: `boot.S` went from 166 code lines to 134. The privilege transition used
+to build a user context by zeroing thirty registers and setting three system
+registers; a context is now a FRAME the kernel owns, built by `frame_init` in
+Saw with its `SPSR` among the words, and the transition is a single branch into
+the trap entry's own restore path.
+
 ## The Saw surface (`lib.saw`)
 
 Identical in name and meaning to the riscv32 HAL's — that table is not repeated
@@ -45,10 +52,10 @@ rather than a byte to THR.
 |---|---|---|---|
 | `_start` | boot.S | Reset entry. Stack, `VBAR_EL1`, `CPACR_EL1.FPEN`, `.bss` zerofill, `sos_mmu_init`, `kmain`. Never returns. | Instructions: `msr`, and a stack pointer before any compiled code can run. |
 | `_vectors` | boot.S | The 16-entry EL1 vector table. TWO entries are a user trap now — "lower EL, AArch64, synchronous" and, since design 178, "lower EL, AArch64, IRQ"; every other entry is a kernel bug (an interrupt among them, see D2 below) and lands on `kernel_fault_entry`. | A vector table is placement + branches at fixed 0x80 strides. |
-| `user_trap_entry` | boot.S | Builds the 34-doubleword frame on the kernel stack, calls `ktrap(frame, ESR, FAR)`, restores, `eret`. | Register saves and `eret`. |
+| `user_trap_entry` | boot.S | Saves the RUNNING THREAD'S 34-doubleword frame, switches `SP_EL1` to the kernel stack, calls `ktrap(frame, ESR, FAR)`, and resumes the frame `ktrap` RETURNS — which need not be the one it was called with, and that is the context switch. | Register saves and `eret`. |
 | `user_irq_entry` | boot.S | The same frame, then `ktrap(frame, IRQ_CAUSE, 0)`, then the same return path — the save is a macro and the restore is shared code, so the two entries cannot drift. | Register saves and `eret`. |
 | `kernel_fault_entry` | boot.S | Reads `ESR`/`ELR`/`FAR` and calls the SAW `sos_kernel_fault` with them. | `mrs` names a register at assembly time. The REPORT is Saw (design 172 unit 3). |
-| `sos_enter_user(entry, stack_top, boot_handle)` | boot.S | `ELR_EL1` / `SP_EL0` / `SPSR_EL1` = EL0t with interrupts masked, every register but x0 zeroed, `eret`. | `msr` + `eret` + a register file the caller must not be able to leave anything in. |
+| `sos_resume_frame(frame)` | boot.S | Enter EL0 in a saved context, behind `resume_frame`. One branch into the restore path above, because the frame already holds the `SPSR` that selects EL0t. | The `eret` the restore path owns. |
 | `sos_platform_exit(code)` | sink.c | Stop the machine through semihosting `SYS_EXIT`. | `hlt #0xf000` with the call number and parameter block pinned in x0/x1. |
 | `sos_mmu_init()` | sink.c | Ask `lib.saw` for a finished identity map, then turn the MMU on. Called by `_start` after `.bss` is zeroed, because the tables live there. | `msr`/`mrs` to four system registers plus `dsb`/`isb`. The MAP is Saw (design 172 unit 1). |
 | `sos_prot_commit()` | sink.c | Publish the staged grant set. | `dsb`/`isb` barriers and a `tlbi`. The DESCRIPTORS are Saw. |
@@ -65,16 +72,39 @@ now check-free by construction so the panic path cannot re-enter it),
 ## Required of the kernel
 
 - `kmain()` — the Saw entry `_start` calls.
-- `ktrap(frame, cause, tval)` — the Saw handler `user_trap_entry` calls. `cause`
-  is `ESR_EL1`, `tval` is `FAR_EL1`.
+- `ktrap(frame, cause, tval) -> UInt` — the Saw handler `user_trap_entry` calls.
+  `cause` is `ESR_EL1`, `tval` is `FAR_EL1`. It RETURNS THE FRAME TO RESUME
+  (design 178 M2 unit 2): the same one for an ordinary return, another thread's
+  for a switch. The trap entry does not know which happened and must not care.
+
+## Thread contexts (design 178 M2 unit 2)
+
+Identical in name and meaning to the riscv32 HAL's three rows — `FRAME_BYTES`,
+`frame_init`, `resume_frame` — and that table is not repeated here. Two things
+are this profile's:
+
+- **`SP_EL1` IS the "current thread" pointer.** Between traps it points at the
+  TOP of the running thread's frame, so the entry's `sub sp, sp, #FRAME_SIZE`
+  lands on that frame with nothing to look up, and the return's matching `add`
+  leaves it pointing at whatever frame was resumed. That is the whole of the
+  switch, and it is the same trick RISC-V plays with `mscratch`. The kernel's
+  own stack is a separate reservation the entry switches to once the frame is
+  written, because everything past that point is Saw and needs a stack the frame
+  is not sitting on.
+- **The `SPSR` is a word of the frame**, not a value the transition writes. A
+  thread carries the processor state it resumes in, which is what lets one
+  restore path serve the first entry and every switch after it.
+
+`enter_user` is GONE, on both profiles and for the same reason: it was a context
+built in assembly, entered once, with no storage a second thread could have had.
 
 ## What is arm64-specific here, and why
 
-- **No mode witness.** RISC-V needs `mscratch` (0 in the kernel, `&_trapframe`
-  in user mode) to tell a syscall from a kernel bug. Here the hardware picks a
-  different vector per source EL, so the question is answered by which of
-  sixteen entries ran. That also means the frame is built on `SP_EL1` with no
-  window in which the kernel runs on the user's stack.
+- **No mode witness.** RISC-V needs `mscratch` (0 in the kernel, the running
+  thread's frame in user mode) to tell a syscall from a kernel bug. Here the
+  hardware picks a different vector per source EL, so the question is answered by
+  which of sixteen entries ran. `SP_EL1` still carries the running thread's frame
+  (above), but for scheduling rather than for mode.
 - **`svc` traps with `ELR_EL1` already past the instruction**, so
   `syscall_return` advances nothing. Doing what Profile A does here would skip
   the instruction AFTER a syscall — which is exactly why "how far to resume" is
@@ -90,9 +120,12 @@ now check-free by construction so the panic path cannot re-enter it),
   compiles to 16 SIMD references at `-O2`. Removing it needs
   `-mgeneral-regs-only` on every aarch64 C compile, which means a Blade manifest
   key for per-target C flags — see DF-172c. FP state is NOT saved across a trap
-  (the frame holds x0-x30 and three system registers); with one user thread and
-  no preemption nothing can observe that, and M2's context switch is where it
-  stops being true.
+  (the frame holds x0-x30 and three system registers), and design 178 M2 unit 2
+  brought the context switch that would have made that observable — except that
+  D1 ratified the other half of the answer: processes stay INTEGER-ONLY in M2,
+  because the freestanding profile denies them SIMD in the first place. So there
+  is no FP state to save, by construction rather than by luck, and the frame is
+  right as it stands. Revisit when the Float family meets userspace.
 - **Semihosting, not PSCI, for shutdown.** PSCI `SYSTEM_OFF` over the HVC
   conduit works on `-M virt` but always exits the emulator with status 0, and
   this harness asserts on exit STATUS — one case encodes its entire verdict in

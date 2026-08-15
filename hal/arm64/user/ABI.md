@@ -13,7 +13,8 @@ two per-arch C copies were two copies of one thing. They are Saw now, once, in
 
 Unchanged from `sos/hal/riscv32/user/ABI.md`: typed Saw (`system.shutdown(0)`)
 for Saw processes, typed C (`sos_system_shutdown(h, 0)`) for other languages,
-and the raw `sos_syscall1(h, op, a)` for the HAL and the kernel package only.
+and the raw `sos_syscall1` / `sos_syscall3` for the HAL and the kernel package
+only.
 The first two are the kernel package's (`sos/kernel/sysapi/`), not this
 directory's; this directory supplies only the bottom of the chain. The typed C
 row's in-tree caller went away with the C sinks — see DF-172i, recorded there.
@@ -22,7 +23,8 @@ row's in-tree caller went away with the C sinks — see DF-172i, recorded there.
 
 | Symbol | Contract |
 |---|---|
-| `sos_syscall1(handle, op, arg0) -> status` | Perform one object op. Returns the status word. |
+| `sos_syscall1(handle, op, arg0) -> status` | Perform one object op that answers with a status alone. |
+| `sos_syscall3(handle, op, arg0, arg1, arg2, value_out) -> status` | The same, for ops that take up to three arguments AND answer with a VALUE (design 178 M2 unit 2). The value comes back through a pointer — the C ABI the Saw side declares against has no aggregate return. Same contract as the riscv32 twin, which states the reasoning. |
 
 The runtime's two hooks (`sos_rt_write`, `sos_rt_abort`) and the parked boot
 handle are still part of a process's contract; they are just not this

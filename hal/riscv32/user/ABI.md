@@ -21,7 +21,7 @@ not three (sos/spec.md §5.7):
 |---|---|---|
 | typed Saw | `system.shutdown(0)` | **Saw processes. Use this.** Handles are typed, statuses are a `SosStatus`, no number appears. |
 | typed C | `sos_system_shutdown(h, 0)` | **Non-Saw languages.** One `@export`ed function per op, named for the op; still no number. |
-| raw | `sos_syscall1(h, op, a)` | **The HAL and the kernel package only.** It takes an op NUMBER, which is the thing the arrangement above exists to keep out of callers. Not a supported application interface. |
+| raw | `sos_syscall1(h, op, a)` / `sos_syscall3(h, op, a, b, c, &v)` | **The HAL and the kernel package only.** They take an op NUMBER, which is the thing the arrangement above exists to keep out of callers. Not a supported application interface. |
 
 The first two are the kernel package's (`sos/kernel/sysapi/`), not this
 directory's. This directory supplies only the bottom of the chain: the one
@@ -38,7 +38,8 @@ a C caller crossing into them.
 
 | Symbol | Contract |
 |---|---|
-| `sos_syscall1(handle, op, arg0) -> status` | Perform one object op. Returns the status word; no M1 op returns a value, so the value half is not read. A `sos_syscall1_value` twin belongs beside this the day one does — the same way a wider op gets `sos_syscall2` rather than an ellipsis. |
+| `sos_syscall1(handle, op, arg0) -> status` | Perform one object op that answers with a status alone. The value half is not read. |
+| `sos_syscall3(handle, op, arg0, arg1, arg2, value_out) -> status` | The same, for ops that take up to three arguments AND answer with a VALUE — a created thread's handle, a joined thread's exit code, a process's status word (design 178 M2 unit 2). The value comes back through a POINTER rather than in the return, because the Saw side declares these symbols against a C ABI whose whitelist has no aggregate return; one out-parameter is the shape that crosses. Ops with fewer arguments pass zeros. |
 
 The runtime's two hooks (`sos_rt_write`, `sos_rt_abort`) and the parked boot
 handle are still part of a process's contract; they are just not this

@@ -21,6 +21,12 @@ Design 178's interrupt work added a fifth, and it is ONE LINE (`sos_mie_write`)
 counter arithmetic, the comparator write order, the priorities, the claim and
 the completion are all Saw. C code lines: 22 to 23.
 
+Design 178's THREAD work moved the line again, in the other direction from
+usual: `boot.S` went from 176 code lines to 134. The privilege transition used
+to build a user context by zeroing twenty-nine registers in assembly; a context
+is now a FRAME the kernel owns, built by `frame_init` in Saw, and the transition
+is four instructions and a branch into the trap entry's own restore path.
+
 ## The Saw surface (`lib.saw`) — what `kcore` may use
 
 | Name | Contract |
@@ -36,14 +42,34 @@ the completion are all Saw. C code lines: 22 to 23.
 | `prot_reset()` | Revoke every grant. User mode then reaches nothing. |
 | `prot_region(idx, base, top, perms)` | Stage grant `idx` as `[base, top)` with `perms`, a mask in the `imgformat` `SegFlag` vocabulary (R = 1, W = 2, X = 4). |
 | `prot_commit()` | Publish the staged set. Separate so a half-programmed set is never live. |
-| `enter_user(entry, stack_top, boot_handle)` | Drop to user mode, `boot_handle` in the first argument register, every other register zeroed. Never returns. |
 | `is_syscall(cause) -> Bool` | Did this trap come from a syscall instruction, or is it a fault? |
 | `is_interrupt(cause) -> Bool` | Is this trap an interrupt instead of either? Asked FIRST, because an interrupt is not the running program's business and its instruction has not run. |
 | `cause_tag(cause) -> String` | A short symbolic name for a raw trap cause; unmodelled codes get their own name rather than an arm. |
 | `trap_pc(frame) -> UInt` | Where the trapped context resumes: the faulting instruction on a fault, the interrupted one on an interrupt. (Was `fault_pc`; the value never was fault-specific.) |
-| `syscall_handle/op/arg0(frame) -> UInt` | The §5.7 argument registers, by role rather than by name. |
+| `syscall_handle/op/arg0/arg1/arg2(frame) -> UInt` | The §5.7 argument registers, by role rather than by name. Three argument slots since design 178 M2 unit 2: `Process.CreateThread` takes an entry, a stack and an argument. |
 | `syscall_return(frame, status, value)` | Place the (status, value) pair where the caller reads them and step the saved PC past the trapping instruction — which is a no-op on a profile whose trap already points past it. |
 | `UNMAPPED_PROBE: UInt` | An address the KERNEL cannot reach here. The harness's kernel-fault case reads it; it is per-target because "unmapped" is. |
+
+## Thread contexts (design 178 M2 unit 2)
+
+THE TRAP FRAME IS A THREAD'S CONTEXT, and that is what makes a context switch
+cost nothing extra here: the kernel reserves one frame per thread, the trap
+entry saves into the RUNNING thread's, and `ktrap` returns the frame to resume.
+Handing back a different one IS the switch. The three rows below are the whole
+of what the kernel needs to know about a context; everything else — the layout,
+the register roles, the mode the frame resumes in — stays this file's.
+
+| Name | Contract |
+|---|---|
+| `FRAME_BYTES: Int` | Bytes in one saved context (128 here, 272 on Profile B). The kernel asserts its per-thread stride against it, so a frame that outgrew the stride is a build error. |
+| `frame_init(frame, entry, stack_top, arg0)` | Build a fresh user context: the entry as the resume address, the stack pointer, `arg0` in the first argument register, and every other word ZEROED — including the return-address register, so a thread entry that returns faults instead of running on. |
+| `resume_frame(frame) -> Never` | Enter user mode in a saved context. The FIRST entry only; every one after it is `ktrap` returning a frame to the trap entry's restore path. |
+
+`enter_user` is GONE. It was the one thing above that a Thread object made
+redundant: a context built in assembly, entered once, with no storage a second
+thread could have had. Its callers — the loader and four harness kernels — now
+go through `kcore.start_process`, which reifies a program as a Process with one
+Thread and resumes its frame.
 
 ## Interrupts (design 178 M2 unit 1)
 
@@ -82,9 +108,9 @@ stores to THR — and the mechanism that stops the machine.
 | Symbol | Where | Contract | Why not Saw |
 |---|---|---|---|
 | `_start` | boot.S | Reset entry. Sets up the stack, clears the mode witness, installs the trap vector, zeroes `.bss`, calls `kmain`. Never returns. | `csrw`, and a stack pointer before any compiled code can run. |
-| `trap_entry` | boot.S | Machine trap vector. Saves the U-mode context into a 32-word frame, calls `ktrap(frame, cause, tval)` on the kernel stack, restores, `mret`. A trap taken in kernel mode goes to `kernel_fault` instead. | `csrrw` on `mscratch` as the mode witness, register saves, `mret`. |
+| `trap_entry` | boot.S | Machine trap vector. Saves the U-mode context into the RUNNING THREAD'S 32-word frame, calls `ktrap(frame, cause, tval)` on the kernel stack, and resumes the frame `ktrap` RETURNS — which need not be the one it was called with, and that is the context switch. A trap taken in kernel mode goes to `kernel_fault` instead. | `csrrw` on `mscratch` as the mode witness, register saves, `mret`. |
 | `kernel_fault` | boot.S | A trap the kernel itself took. Writes the finisher with `mcause` in the code bits and stops the machine. Never returns, never hangs. | `csrr mcause` plus the finisher store, in the one path that must work with no assumptions about kernel state. |
-| `sos_enter_user(entry, stack_top, boot_handle)` | boot.S | The privilege transition behind `enter_user`. | `csrw` to `mepc`/`mstatus`/`mscratch`, `mret`, and a register file the caller must not be able to leave anything in. |
+| `sos_resume_frame(frame)` | boot.S | Enter user mode in a saved context, behind `resume_frame`. Selects U-mode as the `mret` target with the global interrupt enable left clear (D2), then branches into the restore path above rather than repeating it. | `csrc` on `mstatus`, and a `mret` the restore path owns. |
 | `sos_pmpaddr_write(index, value)` | sink.c | Place a word in `pmpaddr<index>`. | The CSR NUMBER is an assembly-time immediate, so an indexed write is a switch. What a region MEANS is Saw (design 172 unit 1). |
 | `sos_mie_write(mask)` | sink.c | Place a word in `mie` — which CLASSES of interrupt may reach this hart. | `csrw` names its CSR. WHICH classes, and the shadow the mask is staged in, are Saw. Note what is absent: nothing here writes the GLOBAL enable, and that absence is design 178's D2. |
 | `sos_pmpcfg_write(lo, hi)` | sink.c | Publish both config registers together. | Same: `csrw pmpcfg0` names its register. The config words are STAGED in Saw. |
@@ -101,9 +127,12 @@ now check-free by construction so the panic path cannot re-enter it),
 ## Required of the kernel
 
 - `kmain()` — the Saw entry `_start` calls.
-- `ktrap(frame, cause, tval)` — the Saw handler `trap_entry` calls. May rewrite
-  the frame; a returning syscall goes back through `syscall_return`, which is
-  what knows whether the saved PC needs advancing.
+- `ktrap(frame, cause, tval) -> UInt` — the Saw handler `trap_entry` calls. May
+  rewrite the frame; a returning syscall goes back through `syscall_return`,
+  which is what knows whether the saved PC needs advancing. It RETURNS THE FRAME
+  TO RESUME (design 178 M2 unit 2): the same one for an ordinary return, another
+  thread's for a switch. The trap entry does not know which happened and must
+  not care.
 
 ## Which altitude is supported for whom
 
@@ -119,12 +148,17 @@ and they are compiled from one definition so they cannot skew.
 
 ## What is riscv32-specific here, and why
 
-- **`mscratch` as the mode witness** (0 in the kernel, `&_trapframe` in user
-  mode) — one `csrrw` plus one branch separates a syscall from a kernel bug.
-  arm64 has separate exception vectors per source EL and needs no equivalent.
+- **`mscratch` as the mode witness** (0 in the kernel, the RUNNING THREAD'S
+  FRAME ADDRESS in user mode) — one `csrrw` plus one branch separates a syscall
+  from a kernel bug. arm64 has separate exception vectors per source EL and
+  needs no equivalent. Since design 178 M2 unit 2 the witness is also how a
+  switch takes effect: the restore path re-arms it from the frame it resumed, so
+  the next trap saves into the thread that is actually running. Profile B does
+  the same thing through `SP_EL1`.
 - **The 32-word trap frame**, word `i` holding `x<i>` and word 0 holding the
   saved PC. `TrapFrame` in `lib.saw` is the same layout declared as a struct;
-  the two are one description and must move together.
+  the two are one description and must move together. The FRAME IS THE THREAD'S
+  CONTEXT — the kernel reserves one per thread, this file no longer reserves any.
 - **`ecall` is 4 bytes and `mepc` points AT it**, so `syscall_return` advances
   the saved PC. Profile B's `ELR` already points past the `svc`.
 - **PMP as TOR pairs.** Region granularity, the reserved write-without-read
