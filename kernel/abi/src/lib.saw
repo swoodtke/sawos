@@ -31,13 +31,14 @@
 //! HOW A FAMILY IS NAMED (ruled Aug 15, user). An op table or a rights set is
 //! named for the spec §2 OBJECT it belongs to, spelled OUT, plus the
 //! term-of-art suffix §5.7 already uses: `SystemOp`, `ProcessOp`, `ThreadOp`,
-//! `SystemRight`, `ProcessRight`, `ThreadRight`. No abbreviated object prefix —
-//! not `SysOp`, not `ProcRight` — because the abbreviation saves four
-//! characters in a file nobody types into and costs every reader the question
-//! of whether `Sys` means the System object or the syscall. The rule extends to
-//! anything else here named after an object (`ProcessStatusKind`,
-//! `process_status_word`), and the next object kind inherits it: name the
-//! family after the row in the §2 table.
+//! `EventOp`, `WaiterOp`, `SystemRight`, `ProcessRight`, `ThreadRight`,
+//! `EventRight`, `WaiterRight`. No abbreviated object prefix — not `SysOp`, not
+//! `ProcRight`, not `EvtRight` — because the abbreviation saves four characters
+//! in a file nobody types into and costs every reader the question of whether
+//! `Sys` means the System object or the syscall. The rule extends to anything
+//! else here named after an object (`ProcessStatusKind`, `process_status_word`,
+//! `EventMode`, `WaiterReadiness`), and the next object kind inherits it: name
+//! the family after the row in the §2 table.
 //!
 //! Delivery in v1 is static linking through the manifest/module-path
 //! mechanism. A genuinely mapped vDSO is an object-model-era upgrade that
@@ -60,7 +61,16 @@ public enum ObjType: UInt8 {
     case System = 1,
     case Process = 2,
     case Thread = 3,
+    case Event = 4,
+    case Waiter = 5,
 }
+
+// WHICH KINDS ARE WAITABLE is deliberately NOT recorded here (§2.2). It cannot
+// be a property of the kind alone: attaching a handle to a Waiter also spends a
+// RIGHT, and which enum's bits that right lives in is decided by the kind — so
+// the two questions are one question, answered in one exhaustive `match` in the
+// kernel's `waitable_slot`. A `Bool` here would be the same fact in a second
+// place, and the place that could go stale.
 
 // =============================================================================
 // Handles (spec §3)
@@ -95,6 +105,12 @@ public type ProcessHandle = UInt
 
 /// A handle naming a Thread object (§2 table).
 public type ThreadHandle = UInt
+
+/// A handle naming an Event object (§2.4). Same discipline again.
+public type EventHandle = UInt
+
+/// A handle naming a Waiter object (§2.2).
+public type WaiterHandle = UInt
 
 /// A handle index the table can never hand out. Handle 0 names nothing, so a
 /// zeroed register is never authority (see `ObjType.Unbound`).
@@ -187,12 +203,31 @@ static_assert((SystemRight.Shutdown as UInt32) >= 256,
 /// process. With one process in the system it is `Exit` under a second name,
 /// and an op whose only reachable use is degenerate is an op nothing tests. It
 /// lands with M3's multi-process loading, beside `create_process`.
+///
+/// `CreateEvent` and `CreateWaiter` are M2 unit 3's, and where they sit ANSWERS
+/// an open pin: spec §12 leaves the creation-authority model for plain objects
+/// (Channel/Event/Waiter/Timer) open between quota-gated free creation and a
+/// factory capability. This is the factory capability, and it is one a process
+/// already holds — the Process object is what an Event or a Waiter is CHARGED
+/// to (its slab slot, its handle-table entry, its teardown), so making the
+/// authority to create one flow through the Process handle is §3's derivation
+/// rule rather than a new mechanism beside it. A quota is additive on top: it
+/// would be a field on the process slot, checked where `NoResource` is returned
+/// today. Nothing here forecloses it.
+///
+/// ONE BIT PER CREATION OP rather than a single `Create`, matching
+/// `CreateThread`. The bits are what attenuation strips, so an object kind a
+/// process may not make is a bit it was not given — collapsing them would make
+/// "may create Events" and "may create Waiters" the same capability, which they
+/// are not. Twenty-four bits are available and five are used.
 public enum ProcessRight: UInt32 {
     case Transfer = 1,
     case Manage = 2,
     case CreateThread = 256,
     case Exit = 512,
     case Wait = 1024,
+    case CreateEvent = 2048,
+    case CreateWaiter = 4096,
 }
 
 static_assert((ProcessRight.Transfer as UInt32) == 1,
@@ -205,6 +240,10 @@ static_assert((ProcessRight.Exit as UInt32) >= 256,
               "kind-specific right Exit must start at bit 8 or above")
 static_assert((ProcessRight.Wait as UInt32) >= 256,
               "kind-specific right Wait must start at bit 8 or above")
+static_assert((ProcessRight.CreateEvent as UInt32) >= 256,
+              "kind-specific right CreateEvent must start at bit 8 or above")
+static_assert((ProcessRight.CreateWaiter as UInt32) >= 256,
+              "kind-specific right CreateWaiter must start at bit 8 or above")
 
 /// A right on a Thread object (§2 table row; design 178 D4).
 ///
@@ -231,6 +270,67 @@ static_assert((ThreadRight.Join as UInt32) >= 256,
               "kind-specific right Join must start at bit 8 or above")
 static_assert((ThreadRight.Control as UInt32) >= 256,
               "kind-specific right Control must start at bit 8 or above")
+
+/// A right on an Event object (§2.4; design 178 D5).
+///
+/// THE THREE ARE THE THREE ENDS OF A NOTIFICATION and they attenuate apart on
+/// purpose. `Signal` is the producer's — it is the whole of what a driver or a
+/// peer needs, and a handle carrying only this bit can raise the event and can
+/// never learn anything from it. `Receive` is the consumer's: it drains the
+/// word and resets it. `Wait` is the right to have READINESS OBSERVED — what
+/// attaching to a Waiter spends — and it is separate from `Receive` because a
+/// dispatcher that parks on a set of events need not be the code that reads any
+/// of them.
+///
+/// `Manage` is withheld at creation for the reason `thread_rights` gives: an
+/// Event derives nothing, so the universal derive bit would name an authority
+/// that does not exist.
+public enum EventRight: UInt32 {
+    case Transfer = 1,
+    case Manage = 2,
+    case Signal = 256,
+    case Receive = 512,
+    case Wait = 1024,
+}
+
+static_assert((EventRight.Transfer as UInt32) == 1,
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((EventRight.Manage as UInt32) == 2,
+              "universal right Manage must be bit 1 in every kind's enum")
+static_assert((EventRight.Signal as UInt32) >= 256,
+              "kind-specific right Signal must start at bit 8 or above")
+static_assert((EventRight.Receive as UInt32) >= 256,
+              "kind-specific right Receive must start at bit 8 or above")
+static_assert((EventRight.Wait as UInt32) >= 256,
+              "kind-specific right Wait must start at bit 8 or above")
+
+/// A right on a Waiter object (§2.2; design 178 D5).
+///
+/// `Attach` gates BOTH `Add` and `Remove`, which is one bit for what reads like
+/// two operations — deliberately, because they are one capability: the power to
+/// decide what a Waiter watches. A holder who may add may already replace the
+/// whole attachment set by adding and never removing, so splitting the pair
+/// would produce a right that withholds nothing.
+///
+/// `Wait` is the right to PARK on it, and it is separate because the two roles
+/// genuinely divide: §2.2 ratifies many threads waiting on one Waiter, so a
+/// pool of workers holds `Wait` while whoever builds the attachment set holds
+/// `Attach`.
+public enum WaiterRight: UInt32 {
+    case Transfer = 1,
+    case Manage = 2,
+    case Attach = 256,
+    case Wait = 512,
+}
+
+static_assert((WaiterRight.Transfer as UInt32) == 1,
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((WaiterRight.Manage as UInt32) == 2,
+              "universal right Manage must be bit 1 in every kind's enum")
+static_assert((WaiterRight.Attach as UInt32) >= 256,
+              "kind-specific right Attach must start at bit 8 or above")
+static_assert((WaiterRight.Wait as UInt32) >= 256,
+              "kind-specific right Wait must start at bit 8 or above")
 
 /// What the kernel mints for root's System handle at boot (§12).
 ///
@@ -260,7 +360,9 @@ public func root_system_rights() -> UInt32 {
 /// threads, hand a thread its own handle, exit, and read its own status.
 public func root_process_rights() -> UInt32 {
     ((ProcessRight.Manage as UInt32) | (ProcessRight.CreateThread as UInt32)
-     | (ProcessRight.Exit as UInt32) | (ProcessRight.Wait as UInt32))
+     | (ProcessRight.Exit as UInt32) | (ProcessRight.Wait as UInt32)
+     | (ProcessRight.CreateEvent as UInt32)
+     | (ProcessRight.CreateWaiter as UInt32))
 }
 
 /// What the kernel mints for a thread's own handle — root's initial thread at
@@ -274,6 +376,22 @@ public func root_process_rights() -> UInt32 {
 public func thread_rights() -> UInt32 {
     ((ThreadRight.Start as UInt32) | (ThreadRight.Join as UInt32)
      | (ThreadRight.Control as UInt32))
+}
+
+/// What the kernel mints for an Event a process has just created (§2.4).
+///
+/// The creator gets every end of its own notification — it made the object, so
+/// there is nobody to attenuate against yet. Attenuation happens when a handle
+/// is DERIVED for somebody else, and §3 makes that monotonic, so a producer
+/// handed `Signal` alone can never widen back to this.
+public func event_rights() -> UInt32 {
+    ((EventRight.Signal as UInt32) | (EventRight.Receive as UInt32)
+     | (EventRight.Wait as UInt32))
+}
+
+/// What the kernel mints for a Waiter a process has just created (§2.2).
+public func waiter_rights() -> UInt32 {
+    ((WaiterRight.Attach as UInt32) | (WaiterRight.Wait as UInt32))
 }
 
 // =============================================================================
@@ -320,6 +438,8 @@ public enum ProcessOp: UInt {
     case SelfThread = 1,
     case Exit = 2,
     case GetStatus = 3,
+    case CreateEvent = 4,
+    case CreateWaiter = 5,
 }
 
 // =============================================================================
@@ -341,6 +461,76 @@ public enum ThreadOp: UInt {
     case Join = 1,
     case Exit = 2,
     case Yield = 3,
+}
+
+// =============================================================================
+// The Event object's op table (spec §2.4; design 178 D5)
+// =============================================================================
+
+/// A METHOD ID on an Event object.
+///
+/// TWO OPS AND THE OBJECT IS COMPLETE, which is why §2.4 calls it the smallest
+/// thing that can be a kernel object at all: bits go IN and never block, and one
+/// read takes them all OUT and resets. There is no third question to ask an
+/// Event — "is it ready" is `word != 0`, and it is asked by the Waiter, not by
+/// an op.
+///
+/// There is deliberately no non-draining PEEK. A drain that could be skipped
+/// would make level-triggered readiness a thing a reader could observe without
+/// clearing, so a poll loop could spin forever on a readiness nothing consumes;
+/// §2.4's "one drain reads-and-clears" is what forecloses that, and one op is
+/// how it stays foreclosed.
+public enum EventOp: UInt {
+    case Signal = 0,
+    case Receive = 1,
+}
+
+// =============================================================================
+// The Waiter object's op table (spec §2.2; design 178 D5)
+// =============================================================================
+
+/// A METHOD ID on a Waiter object.
+///
+/// The names are §2.2's own (`add`, `remove`, `wait`); the RIGHT that gates the
+/// first two is `WaiterRight.Attach`, which is one capability under a name that
+/// says what it is rather than repeating either op.
+public enum WaiterOp: UInt {
+    case Add = 0,
+    case Remove = 1,
+    case Wait = 2,
+}
+
+/// How an Event ACCUMULATES — a per-Event property, chosen at creation and
+/// fixed for its life (§2.4).
+///
+/// It is fixed rather than settable because the accumulated word means two
+/// different things under the two modes, and a mode change with a non-zero word
+/// would have to either reinterpret it or discard it. Creating a second Event
+/// costs one slab slot.
+///
+/// Backed by `UInt`, the width of the register the mode arrives in, for the
+/// reason `SystemOp` gives: the value is PROCESS-CONTROLLED, so a narrower
+/// backing would need a truncation before `from(raw:)` and `0x100` would arrive
+/// as a valid `Or`.
+public enum EventMode: UInt {
+    case Or = 0,
+    case SaturatingSum = 1,
+}
+
+/// WHAT BECAME READY, the second half of `Waiter.Wait`'s answer (§2.2's
+/// `(key, readiness)` pair).
+///
+/// A MASK, not a tag — several conditions on one handle can be ready at once,
+/// which is why the wait result carries a `UInt` of these bits rather than one
+/// case. M2's only waitable is the Event, which has exactly one condition; the
+/// bits §2.2 and §8 already imply are what the remaining values are reserved
+/// for (a Channel readable vs reply-ready, a Thread or Process exited).
+///
+/// The KEY is the first half and it is not here, because it is a word the
+/// ATTACHER chose — §2.2's point is that it can directly encode the waiting Saw
+/// task's identity, so the kernel neither interprets it nor constrains it.
+public enum WaiterReadiness: UInt {
+    case Signalled = 1,
 }
 
 // =============================================================================
@@ -448,6 +638,8 @@ public enum FaultReason: UInt8 {
     case BadState = 5,
     case BadEntry = 6,
     case Deadlock = 7,
+    case NotWaitable = 8,
+    case BadArg = 9,
 }
 
 public extension FaultReason {
@@ -461,6 +653,8 @@ public extension FaultReason {
             case BadState -> "thread in the wrong state",
             case BadEntry -> "thread entry outside the process",
             case Deadlock -> "every thread blocked",
+            case NotWaitable -> "not a waitable",
+            case BadArg -> "argument outside its domain",
         }
     }
 }

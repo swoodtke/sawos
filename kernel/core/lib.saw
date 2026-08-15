@@ -32,11 +32,13 @@ import sosrt.{ascii_byte, hex_digit_of, hex_digits_per_word}
 // The call numbers. Kernel-internal and shared with the `sos` module the kernel
 // exports (sos/kernel/sysapi/) — one definition, two halves of one contract.
 import sosabi.{
-    ObjType, SystemHandle, ProcessHandle, ThreadHandle,
-    SystemRight, ProcessRight, ThreadRight,
-    SystemOp, ProcessOp, ThreadOp,
+    ObjType, SystemHandle, ProcessHandle, ThreadHandle, EventHandle, WaiterHandle,
+    SystemRight, ProcessRight, ThreadRight, EventRight, WaiterRight,
+    SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp,
+    EventMode, WaiterReadiness,
     SosStatus, FaultReason, ProcessStatusKind, process_status_word,
     root_system_rights, root_process_rights, thread_rights,
+    event_rights, waiter_rights,
     ROOT_SYSTEM_HANDLE, NO_HANDLE, ENTRY_IMAGE,
 }
 
@@ -108,9 +110,11 @@ public func console() -> Console {
 // the per-arch table); dispatch is §3's shape verbatim: handle-table lookup ->
 // object type -> op table -> rights check -> op.
 //
-// M2 (design 178 D4) makes the table three kinds wide: the System singleton
-// the milestone before it had, plus Process and Thread. The SHAPE did not have
-// to change to take them, which was the claim M1 made about it.
+// M2 makes the table FIVE kinds wide: the System singleton the milestone before
+// it had, plus Process and Thread (D4) and then Event and Waiter (D5). The
+// SHAPE did not have to change to take any of them, which was the claim M1 made
+// about it — the fifth kind cost one `struct`, one `allows`, and one arm in the
+// dispatch below.
 //
 // The NUMBERS are not here. They are `sosabi`, imported at the top of this
 // file, and the `sos` module the kernel exports to userspace imports the same
@@ -190,6 +194,34 @@ extension ThreadObject {
     }
 }
 
+/// An Event handle the dispatch has VALIDATED, paired with its rights and the
+/// event slot it names (spec §2.4).
+struct EventObject {
+    handle: EventHandle,
+    rights: UInt32,
+    slot: Int,
+}
+
+extension EventObject {
+    func allows(&self, right: EventRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
+    }
+}
+
+/// A Waiter handle the dispatch has VALIDATED, paired with its rights and the
+/// waiter slot it names (spec §2.2).
+struct WaiterObject {
+    handle: WaiterHandle,
+    rights: UInt32,
+    slot: Int,
+}
+
+extension WaiterObject {
+    func allows(&self, right: WaiterRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
+    }
+}
+
 /// Exit codes the kernel reports through the platform's failure channel,
 /// distinct from any status root chooses for itself.
 ///
@@ -260,6 +292,15 @@ static MAX_PROCESSES: Int = 1
 
 /// Threads the kernel can hold, across all processes.
 static MAX_THREADS: Int = 8
+
+/// Events the kernel can hold, across all processes (spec §2.4).
+static MAX_EVENTS: Int = 8
+
+/// Waiters the kernel can hold, across all processes (spec §2.2). Fewer than
+/// events on purpose: a Waiter is a DISPATCH POINT, and the shape §2.2 ratifies
+/// — many handles per Waiter, many threads per Waiter — is one per pool of
+/// workers rather than one per notification.
+static MAX_WAITERS: Int = 4
 
 /// Handles one process's table can hold (§3).
 static MAX_HANDLES: Int = 16
@@ -366,6 +407,64 @@ struct ProcessSlot {
     exit_code: UInt,
 }
 
+/// Whether an Event or a Waiter slot is in use.
+///
+/// ONE enum for both because it really is one question. Threads and processes
+/// have state MACHINES — a thread is created, then runnable, then running, then
+/// blocked or exited, and a join arriving after the exit still has to find the
+/// code — while an Event and a Waiter are either there or not: an Event's whole
+/// state is its accumulated word, and a Waiter's is its two lists.
+enum SlotState: UInt8 {
+    case Free = 0,
+    case Live = 1,
+}
+
+/// One Event (spec §2.4): the accumulating non-blocking notification.
+///
+/// `word` IS the object. Non-zero means ready, which is what makes readiness
+/// LEVEL-TRIGGERED for free (§2.2) — nothing records that a waiter has been
+/// told, so every look at the word gives the same answer until a `Receive`
+/// drains it. There is no edge to lose because there is no edge.
+///
+/// `waiter`/`key`/`link` are the ATTACHMENT, and they live on the event rather
+/// than in a table on the Waiter because §2.2 ratifies at most one Waiter per
+/// handle: one attachment per event is a field, and "which waiter" is then a
+/// question the event can answer in one read — which is what `Signal` needs on
+/// its hot path. Slot indices are stored PLUS ONE so that zero means "none",
+/// which is what a zeroed static already says.
+struct EventSlot {
+    state: SlotState,
+    process: Int,
+    /// §2.4's per-Event accumulation mode, fixed at creation.
+    mode: EventMode,
+    /// The accumulated word. Non-zero = ready.
+    word: UInt,
+    /// The Waiter this event is attached to (slot + 1); 0 = unattached.
+    waiter: Int,
+    /// The word-sized key the attacher supplied (§2.2). The kernel stores it
+    /// and hands it back; it never interprets it.
+    key: UInt,
+    /// Next event on that waiter's attachment list (slot + 1).
+    link: Int,
+}
+
+/// One Waiter (spec §2.2): the generic wait aggregator.
+///
+/// TWO LISTS AND NOTHING ELSE. `attached` is the persistent subscription set —
+/// §2.2 has no one-shot mode, so an attachment is removed and never consumed —
+/// and `blocked` is the threads parked in `Wait`, which §2.2 allows to be
+/// several. Readiness is NOT a third list: it is derived by scanning `attached`
+/// for a non-zero word, which is the level-triggered semantics stated as an
+/// implementation rather than maintained beside one.
+struct WaiterSlot {
+    state: SlotState,
+    process: Int,
+    /// Head of the attachment list (event slot + 1).
+    attached: Int,
+    /// Head of the list of threads parked in `Wait` (thread slot + 1).
+    blocked: Int,
+}
+
 unsafe static var THREADS: [ThreadSlot; MAX_THREADS] = [
     ThreadSlot(state: ThreadState.Free, process: 0, self_handle: 0,
                exit_code: 0, joiners: 0, link: 0); MAX_THREADS]
@@ -381,9 +480,21 @@ unsafe static var HANDLES: [HandleEntry; MAX_PROCESSES * MAX_HANDLES] = [
     HandleEntry(obj_type: ObjType.Unbound, rights: 0, target: 0);
     MAX_PROCESSES * MAX_HANDLES]
 
+unsafe static var EVENTS: [EventSlot; MAX_EVENTS] = [
+    EventSlot(state: SlotState.Free, process: 0, mode: EventMode.Or, word: 0,
+              waiter: 0, key: 0, link: 0); MAX_EVENTS]
+
+unsafe static var WAITERS: [WaiterSlot; MAX_WAITERS] = [
+    WaiterSlot(state: SlotState.Free, process: 0, attached: 0,
+               blocked: 0); MAX_WAITERS]
+
 /// "No thread". Slot indices are ordinary 0-based `Int`s in the tables and
 /// PLUS-ONE inside list links; this is the sentinel for the plain form.
 static NO_THREAD: Int = -1
+
+/// The same sentinel for the two new tables.
+static NO_EVENT: Int = -1
+static NO_WAITER: Int = -1
 
 /// The running thread's slot, or `NO_THREAD`.
 ///
@@ -502,6 +613,32 @@ func alloc_thread() unsafe -> Int {
     NO_THREAD
 }
 
+/// Take a free event slot, or `NO_EVENT` when the slab is empty.
+func alloc_event() unsafe -> Int {
+    var i: Int = 0
+    while i < MAX_EVENTS {
+        match EVENTS[i].state {
+            case Free -> { return i },
+            case Live -> {},
+        }
+        i = i + 1
+    }
+    NO_EVENT
+}
+
+/// Take a free waiter slot, or `NO_WAITER` when the slab is empty.
+func alloc_waiter() unsafe -> Int {
+    var i: Int = 0
+    while i < MAX_WAITERS {
+        match WAITERS[i].state {
+            case Free -> { return i },
+            case Live -> {},
+        }
+        i = i + 1
+    }
+    NO_WAITER
+}
+
 // -----------------------------------------------------------------------------
 // The scheduler (design 178 D3)
 // -----------------------------------------------------------------------------
@@ -551,11 +688,13 @@ func pick_next(current_frame: UInt) unsafe -> UInt {
     let next = ready_pop()
     if next == NO_THREAD {
         // Nothing runnable and the process has not ended: every thread is
-        // blocked on something no thread can now deliver. In M2 that is a
-        // genuine deadlock — the only wake sources are other threads of this
-        // process, since Event and Interrupt objects are the next unit. When
-        // there ARE external wake sources this becomes the idle path, a
-        // per-profile wait-for-interrupt loop (spec §7).
+        // blocked on something no thread can now deliver. In M2 that is still a
+        // genuine deadlock, and Events do not change it — an Event is signalled
+        // BY A THREAD, so a system with no runnable thread has nobody left to
+        // signal one. The Interrupt object is what makes readiness arrive from
+        // outside the set of runnable threads, and this is the line that becomes
+        // an idle path — a per-profile wait-for-interrupt loop (spec §7) — in
+        // the unit that lands it.
         fault_process(THREADS[cur].process, FaultReason.Deadlock)
     }
 
@@ -603,7 +742,7 @@ func exit_thread(slot: Int, code: UInt) unsafe {
     while j != 0 {
         let waiter = j - 1
         j = THREADS[waiter].link
-        hal.syscall_return(frame_slot(waiter), (SosStatus.Ok as UInt8) as UInt, code)
+        write_result(frame_slot(waiter), op_value(code))
         THREADS[waiter].state = ThreadState.Runnable
         ready_push(waiter)
     }
@@ -623,6 +762,145 @@ func block_on_join(slot: Int, target: Int) unsafe {
     THREADS[slot].link = THREADS[target].joiners
     THREADS[target].joiners = slot + 1
     NEED_RESCHED = true
+}
+
+// -----------------------------------------------------------------------------
+// Events and Waiters (spec §2.2, §2.4; design 178 D5)
+// -----------------------------------------------------------------------------
+//
+// THE TWO SMALLEST OBJECTS IN THE §2 TABLE, and between them the whole of
+// asynchronous notification: an Event is a word that accumulates and never
+// blocks, a Waiter is a set of them plus the threads parked on the set. They
+// are here rather than in M3 because they are what proves the handle machinery
+// generalizes past the singleton — three kinds became five with no change to
+// the dispatch's shape, which is the claim §3 has been making since M1.
+//
+// LEVEL-TRIGGERED IS AN ABSENCE, NOT A MECHANISM (§2.2, ratified Jul 29). The
+// kernel records nowhere that a waiter has been told about a ready event, so
+// every look at the attachment set gives the same answer until a `Receive`
+// drains the word. Two consequences worth naming because both are test cases:
+// a signal that lands BEFORE anyone waits is not lost — the word is still
+// non-zero when the wait arrives, and the scan finds it — and an event that is
+// still ready after one waiter has been woken is still ready for the next one.
+// An edge-triggered design would need a "reported" flag per attachment and
+// would lose exactly the first of those.
+//
+// WHAT WAKES WHOM. `Signal` is the only wake source in this unit, and it wakes
+// AT MOST ONE parked thread (§2.2: "a ready handle wakes one waiter" — the
+// shared readiness-queue shape). A second parked thread is not starved by that:
+// it is level-triggered readiness, so its own next `Wait` scans and finds the
+// same event still ready.
+
+/// §2.4's accumulation, both modes.
+///
+/// THE SUM SATURATES RATHER THAN WRAPPING, which is the half of §2.4 that is a
+/// correctness requirement rather than a convenience: a producer faster than
+/// its consumer must not roll a full count back through zero, because zero is
+/// what "not ready" means — a wrap would make a saturated event go quiet.
+/// `&+` is the wrapping add (Saw's overflow checks are always on, so a plain
+/// `+` would panic in the kernel), and the comparison after it is the carry.
+func accumulate(slot: Int, bits: UInt) unsafe {
+    match EVENTS[slot].mode {
+        case Or -> {
+            EVENTS[slot].word = EVENTS[slot].word | bits
+        },
+        case SaturatingSum -> {
+            let old = EVENTS[slot].word
+            let sum = old &+ bits
+            EVENTS[slot].word = if sum < old { UInt.max } else { sum }
+        },
+    }
+}
+
+/// The first attached event of `w` that is ready, or `NO_EVENT`.
+///
+/// A SCAN, and that is the level-triggered semantics implemented rather than
+/// maintained: there is no ready QUEUE to keep in step with the words, so a
+/// word that goes back to zero cannot leave a stale entry behind and a word
+/// that stays non-zero is found again by the next scan. It is O(attachments),
+/// which at M2's slab sizes is a handful of loads and is bounded by the same
+/// argument the ready queue's is — this runs with interrupts masked, so its
+/// length is interrupt latency (design 178 D2), and a Waiter with hundreds of
+/// attachments is what an M3 ready-list optimisation would be for.
+func waiter_ready_event(w: Int) unsafe -> Int {
+    var cur = WAITERS[w].attached
+    while cur != 0 {
+        let slot = cur - 1
+        if EVENTS[slot].word != 0 {
+            return slot
+        }
+        cur = EVENTS[slot].link
+    }
+    NO_EVENT
+}
+
+/// Park the running thread on `w`'s blocked list.
+func block_on_wait(slot: Int, w: Int) unsafe {
+    THREADS[slot].state = ThreadState.Blocked
+    THREADS[slot].link = WAITERS[w].blocked
+    WAITERS[w].blocked = slot + 1
+    NEED_RESCHED = true
+}
+
+/// Hand a ready attachment to ONE thread parked on `w`, if any is (§2.2).
+///
+/// The pair is written into the woken thread's frame HERE and nowhere else,
+/// which is the same discipline `exit_thread` follows for a joiner: a thread
+/// that blocked in a syscall was answered by nobody when it blocked, so its
+/// waker is the single writer of its (status, value) — here (status, key,
+/// readiness), the one op that answers with two words.
+func wake_one_waiter(w: Int, key: UInt, readiness: UInt) unsafe {
+    let head = WAITERS[w].blocked
+    if head == 0 {
+        return
+    }
+    let slot = head - 1
+    WAITERS[w].blocked = THREADS[slot].link
+    THREADS[slot].link = 0
+    write_result(frame_slot(slot), op_pair(key, readiness))
+    THREADS[slot].state = ThreadState.Runnable
+    ready_push(slot)
+}
+
+/// §2.4's signal: accumulate, NEVER block, and tell the Waiter if there is one.
+func signal_event(slot: Int, bits: UInt) unsafe {
+    accumulate(slot, bits)
+    // A signal of nothing is not a readiness. Both modes can produce it —
+    // `signal(0)` in either — and reporting it would wake a waiter for a word
+    // it would then read as empty.
+    if EVENTS[slot].word == 0 {
+        return
+    }
+    let attached = EVENTS[slot].waiter
+    if attached == 0 {
+        return
+    }
+    wake_one_waiter(attached - 1, EVENTS[slot].key,
+                    WaiterReadiness.Signalled as UInt)
+}
+
+/// Take event `e` off waiter `w`'s attachment list, and clear the attachment
+/// fields on the event. The caller has established that it is on that list.
+func detach_event(w: Int, e: Int) unsafe {
+    var prev: Int = 0
+    var cur = WAITERS[w].attached
+    while cur != 0 {
+        let slot = cur - 1
+        let next = EVENTS[slot].link
+        if slot == e {
+            if prev == 0 {
+                WAITERS[w].attached = next
+            } else {
+                EVENTS[prev - 1].link = next
+            }
+            EVENTS[e].link = 0
+            EVENTS[e].waiter = 0
+            EVENTS[e].key = 0
+            return
+        }
+        prev = cur
+        cur = next
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -681,11 +959,53 @@ func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     READY_HEAD = 0
     READY_TAIL = 0
 
+    // Events and Waiters go back to their slabs whole (spec §2's Process row:
+    // free what the process owned). No unlinking is needed first — an
+    // attachment only ever joins two objects of the SAME process, so freeing
+    // both ends is freeing the list, and a Waiter's blocked list named threads
+    // this loop's predecessor has already reclaimed.
+    var events_freed: UInt = 0
+    var e: Int = 0
+    while e < MAX_EVENTS {
+        if EVENTS[e].process == p {
+            match EVENTS[e].state {
+                case Free -> {},
+                case Live -> {
+                    EVENTS[e] = EventSlot(state: SlotState.Free, process: 0,
+                                          mode: EventMode.Or, word: 0,
+                                          waiter: 0, key: 0, link: 0)
+                    events_freed = events_freed + 1
+                },
+            }
+        }
+        e = e + 1
+    }
+
+    var waiters_freed: UInt = 0
+    var w: Int = 0
+    while w < MAX_WAITERS {
+        if WAITERS[w].process == p {
+            match WAITERS[w].state {
+                case Free -> {},
+                case Live -> {
+                    WAITERS[w] = WaiterSlot(state: SlotState.Free, process: 0,
+                                            attached: 0, blocked: 0)
+                    waiters_freed = waiters_freed + 1
+                },
+            }
+        }
+        w = w + 1
+    }
+
     let uart = console()
     uart.write_str("SOS: process teardown handles=")
     uart.write_hex(closed)
     uart.write_str(" threads=")
     uart.write_hex(freed)
+    uart.write_str(" events=")
+    uart.write_hex(events_freed)
+    uart.write_str(" waiters=")
+    uart.write_hex(waiters_freed)
     uart.write_str("\n")
 
     if machine_status == 0 {
@@ -773,26 +1093,67 @@ public func fatal(tag: String, cause: UInt, epc: UInt, tval: UInt, code: ExitCod
 /// is written into its frame by whatever wakes it, exactly once. Modelling that
 /// as a field rather than as a magic status is what keeps the return path from
 /// having to know which ops can park.
+/// `pair` says the answer occupies BOTH value registers — spec §2.2 ratifies
+/// `Waiter.Wait`'s result as a `(key, readiness)` pair, and it is the only op
+/// that answers with two words. It is a field rather than an inference from
+/// `value2 != 0` because the second register is an ARGUMENT register on the way
+/// in: an op that did not promise to answer in it must not write it, and a key
+/// of zero is a perfectly good key.
 struct SyscallResult {
     status: SosStatus,
     value: UInt,
+    value2: UInt,
+    pair: Bool,
     blocked: Bool,
 }
 
 func op_ok() -> SyscallResult {
-    SyscallResult(status: SosStatus.Ok, value: 0, blocked: false)
+    SyscallResult(status: SosStatus.Ok, value: 0, value2: 0, pair: false,
+                  blocked: false)
 }
 
 func op_value(v: UInt) -> SyscallResult {
-    SyscallResult(status: SosStatus.Ok, value: v, blocked: false)
+    SyscallResult(status: SosStatus.Ok, value: v, value2: 0, pair: false,
+                  blocked: false)
+}
+
+/// §2.2's `(key, readiness)`.
+func op_pair(key: UInt, readiness: UInt) -> SyscallResult {
+    SyscallResult(status: SosStatus.Ok, value: key, value2: readiness,
+                  pair: true, blocked: false)
 }
 
 func op_status(s: SosStatus) -> SyscallResult {
-    SyscallResult(status: s, value: 0, blocked: false)
+    SyscallResult(status: s, value: 0, value2: 0, pair: false, blocked: false)
 }
 
 func op_blocked() -> SyscallResult {
-    SyscallResult(status: SosStatus.Ok, value: 0, blocked: true)
+    SyscallResult(status: SosStatus.Ok, value: 0, value2: 0, pair: false,
+                  blocked: true)
+}
+
+/// THE ONE PLACE a syscall's answer is written into a thread's frame.
+///
+/// A funnel rather than a rule repeated per caller, because the writers are not
+/// all on the return path: an op that PARKS is answered later, by whatever wakes
+/// it, and "later" is a different function each time. Its ENTRY POINTS, all of
+/// them:
+///
+///   - `ktrap`, for an op that answered immediately;
+///   - `exit_thread`, waking everything that joined the thread that just left;
+///   - `wake_one_waiter`, handing a ready attachment to a parked waiter (§2.2).
+///
+/// Each writes EXACTLY ONCE for one syscall, which is the invariant the whole
+/// blocking protocol rests on: a blocked caller is skipped on the return path
+/// precisely so that its waker is the only writer, and a second write would
+/// step the saved PC twice on the profile that steps it at all.
+func write_result(frame_addr: UInt, result: SyscallResult) unsafe {
+    let status = (result.status as UInt8) as UInt
+    if result.pair {
+        hal.syscall_return_pair(frame_addr, status, result.value, result.value2)
+    } else {
+        hal.syscall_return(frame_addr, status, result.value)
+    }
 }
 
 /// Terminate the process from a position that OWES a `SyscallResult`.
@@ -803,6 +1164,13 @@ func op_blocked() -> SyscallResult {
 /// here rather than worked around at each op. The trailing conditionless loop
 /// is what carries the divergence up to this signature; it is unreachable.
 func fault_result(p: Int, reason: FaultReason) unsafe -> SyscallResult {
+    fault_process(p, reason)
+    while { }
+}
+
+/// The same, from a position that owes a slot index. One wrapper per return
+/// type is what DF-178d costs; both are unreachable past their first line.
+func fault_slot(p: Int, reason: FaultReason) unsafe -> Int {
     fault_process(p, reason)
     while { }
 }
@@ -937,7 +1305,67 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             op_value(process_status_word(PROCESSES[obj.slot].exit_kind,
                                       PROCESSES[obj.slot].exit_code))
         },
+        // The creation authority for §2's plain objects, answering spec §12's
+        // open pin the way `CreateThread` already does: it flows through a
+        // handle the process holds, so it is §3's derivation rule rather than a
+        // new mechanism beside it. See `ProcessRight`.
+        case CreateEvent -> {
+            if not obj.allows(ProcessRight.CreateEvent) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            create_event(obj.slot, arg0)
+        },
+        case CreateWaiter -> {
+            if not obj.allows(ProcessRight.CreateWaiter) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            create_waiter(obj.slot)
+        },
     }
+}
+
+/// Make an Event in process `slot` (spec §2.4).
+///
+/// The MODE arrives as a raw register word the process chose, so it is decoded
+/// rather than trusted: a number that is not a mode is a caller error the
+/// process could have checked, which under design 178's faults ruling ends it.
+func create_event(p: Int, raw_mode: UInt) unsafe -> SyscallResult {
+    if let mode = EventMode.from(raw: raw_mode) {
+        return create_event_moded(p, mode)
+    }
+    fault_result(p, FaultReason.BadArg)
+}
+
+func create_event_moded(p: Int, mode: EventMode) unsafe -> SyscallResult {
+    let slot = alloc_event()
+    if slot == NO_EVENT {
+        return op_status(SosStatus.NoResource)
+    }
+    let handle = mint_handle(p, ObjType.Event, event_rights(), slot)
+    if handle == NO_HANDLE {
+        return op_status(SosStatus.NoResource)
+    }
+    // Written only once BOTH allocations succeeded, so a refused handle leaves
+    // the slab exactly as it found it — the all-or-nothing shape design 123
+    // asks of a `try_` op, for the same reason.
+    EVENTS[slot] = EventSlot(state: SlotState.Live, process: p, mode: mode,
+                             word: 0, waiter: 0, key: 0, link: 0)
+    op_value(handle)
+}
+
+/// Make a Waiter in process `slot` (spec §2.2).
+func create_waiter(p: Int) unsafe -> SyscallResult {
+    let slot = alloc_waiter()
+    if slot == NO_WAITER {
+        return op_status(SosStatus.NoResource)
+    }
+    let handle = mint_handle(p, ObjType.Waiter, waiter_rights(), slot)
+    if handle == NO_HANDLE {
+        return op_status(SosStatus.NoResource)
+    }
+    WAITERS[slot] = WaiterSlot(state: SlotState.Live, process: p, attached: 0,
+                               blocked: 0)
+    op_value(handle)
 }
 
 /// Make a thread in process `slot`, ready to be started.
@@ -1047,6 +1475,171 @@ func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
     }
 }
 
+/// The Event object's ops (spec §2.4; design 178 D5).
+func event_op(raw_op: UInt, obj: &EventObject, arg0: UInt) unsafe -> SyscallResult {
+    let p = calling_process()
+    if let op = EventOp.from(raw: raw_op) {
+        return event_op_decoded(op, &obj, arg0, p)
+    }
+    fault_result(p, FaultReason.BadOp)
+}
+
+func event_op_decoded(op: EventOp, obj: &EventObject, arg0: UInt,
+                      p: Int) unsafe -> SyscallResult {
+    let target = obj.slot
+
+    match op {
+        // NEVER BLOCKS and never fails (§2.4): whatever the word holds, more
+        // bits fit — the OR mode is idempotent and the sum saturates. That is
+        // what makes it the fire-and-forget primitive, and it is why there is
+        // no status here to branch on.
+        case Signal -> {
+            if not obj.allows(EventRight.Signal) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            signal_event(target, arg0)
+            op_ok()
+        },
+        // DRAINS AND RESETS, in one operation (§2.4). Reading an empty event
+        // answers zero rather than parking: an Event is not a queue, and
+        // blocking is the Waiter's job.
+        case Receive -> {
+            if not obj.allows(EventRight.Receive) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            let word = EVENTS[target].word
+            EVENTS[target].word = 0
+            op_value(word)
+        },
+    }
+}
+
+/// Resolve `handle` as something this caller may ATTACH TO A WAITER, or
+/// terminate the process.
+///
+/// THE ONE PLACE WAITABILITY IS DECIDED, and it decides the rights check with
+/// it — because they are one question. Whether a handle may be attached depends
+/// on its KIND, and which enum a rights word is read against depends on the
+/// kind too (§3), so a separate `is_waitable` predicate would have to be joined
+/// back to a per-kind rights check at every call site. Here the match that
+/// establishes the kind is the match that spends the right.
+///
+/// Every case is spelled out rather than falling through a `_`, which is what
+/// makes the next waitable kind — a Channel, a Timer, an Interrupt (§2.2), a
+/// Thread or a Process (§8) — fail to compile until somebody answers for it.
+func waitable_slot(p: Int, handle: UInt) unsafe -> Int {
+    let entry = lookup_handle(p, handle)
+    match entry.obj_type {
+        case Event -> {
+            let ev = EventObject(handle: EventHandle(handle),
+                                 rights: entry.rights, slot: entry.target)
+            if not ev.allows(EventRight.Wait) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            entry.target
+        },
+        case Unbound -> fault_slot(p, FaultReason.BadHandle),
+        case System -> fault_slot(p, FaultReason.NotWaitable),
+        case Process -> fault_slot(p, FaultReason.NotWaitable),
+        case Thread -> fault_slot(p, FaultReason.NotWaitable),
+        case Waiter -> fault_slot(p, FaultReason.NotWaitable),
+    }
+}
+
+/// The Waiter object's ops (spec §2.2; design 178 D5).
+func waiter_op(raw_op: UInt, obj: &WaiterObject, arg0: UInt,
+               arg1: UInt) unsafe -> SyscallResult {
+    let p = calling_process()
+    if let op = WaiterOp.from(raw: raw_op) {
+        return waiter_op_decoded(op, &obj, arg0, arg1, p)
+    }
+    fault_result(p, FaultReason.BadOp)
+}
+
+func waiter_op_decoded(op: WaiterOp, obj: &WaiterObject, arg0: UInt, arg1: UInt,
+                       p: Int) unsafe -> SyscallResult {
+    let w = obj.slot
+
+    match op {
+        case Add -> {
+            if not obj.allows(WaiterRight.Attach) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            waiter_add(p, w, arg0, arg1)
+        },
+        case Remove -> {
+            if not obj.allows(WaiterRight.Attach) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            waiter_remove(p, w, arg0)
+        },
+        case Wait -> {
+            if not obj.allows(WaiterRight.Wait) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            waiter_wait(p, w)
+        },
+    }
+}
+
+/// §2.2's `add(handle, key)`: a PERSISTENT attachment, at most one Waiter per
+/// handle.
+///
+/// Attaching something already attached TERMINATES the process. It is the
+/// ratified one-Waiter rule, and it is caller-checkable in the strongest sense
+/// — the process is the only thing that attaches anything, so it knows.
+func waiter_add(p: Int, w: Int, handle: UInt, key: UInt) unsafe -> SyscallResult {
+    let e = waitable_slot(p, handle)
+    if EVENTS[e].waiter != 0 {
+        fault_process(p, FaultReason.BadState)
+    }
+
+    EVENTS[e].waiter = w + 1
+    EVENTS[e].key = key
+    EVENTS[e].link = WAITERS[w].attached
+    WAITERS[w].attached = e + 1
+
+    // LEVEL-TRIGGERED, at the attach (§2.2). An event that is already ready
+    // when it joins the set is ready NOW, and a thread parked on this Waiter
+    // has to learn about it — otherwise the order "signal, then attach, then
+    // wait" would lose the notification, which is the exact lost-edge this
+    // semantics exists to rule out.
+    if EVENTS[e].word != 0 {
+        wake_one_waiter(w, key, WaiterReadiness.Signalled as UInt)
+    }
+    op_ok()
+}
+
+/// §2.2's `remove(handle)`. Removing something this Waiter does not hold is a
+/// caller error, on the same terms as attaching twice.
+func waiter_remove(p: Int, w: Int, handle: UInt) unsafe -> SyscallResult {
+    let e = waitable_slot(p, handle)
+    if EVENTS[e].waiter != w + 1 {
+        fault_process(p, FaultReason.BadState)
+    }
+    detach_event(w, e)
+    op_ok()
+}
+
+/// §2.2's `wait()`: block until an attached handle is ready, then answer with
+/// the key its attacher supplied and what became ready.
+///
+/// THE SCAN COMES FIRST, and that ordering is the level-triggered guarantee
+/// doing its work: a signal that arrived before this call is still in the word,
+/// so the wait returns immediately and nothing was lost. Only an empty set
+/// parks.
+func waiter_wait(p: Int, w: Int) unsafe -> SyscallResult {
+    let ready = waiter_ready_event(w)
+    if ready != NO_EVENT {
+        return op_pair(EVENTS[ready].key, WaiterReadiness.Signalled as UInt)
+    }
+    if CURRENT_THREAD == NO_THREAD {
+        fault_process(p, FaultReason.BadState)
+    }
+    block_on_wait(CURRENT_THREAD, w)
+    op_blocked()
+}
+
 /// Handle-table lookup -> object type -> op table -> rights check -> op.
 ///
 /// This is where a raw word becomes a TYPED handle (§3), and the order is the
@@ -1081,6 +1674,16 @@ func dispatch(handle: UInt, op: UInt,
             let obj = ThreadObject(handle: ThreadHandle(handle),
                                    rights: entry.rights, slot: entry.target)
             thread_op(op, &obj, arg0)
+        },
+        case Event -> {
+            let obj = EventObject(handle: EventHandle(handle),
+                                  rights: entry.rights, slot: entry.target)
+            event_op(op, &obj, arg0)
+        },
+        case Waiter -> {
+            let obj = WaiterObject(handle: WaiterHandle(handle),
+                                   rights: entry.rights, slot: entry.target)
+            waiter_op(op, &obj, arg0, arg1)
         },
     }
 }
@@ -1139,8 +1742,7 @@ public func ktrap(frame_addr: UInt, cause: UInt, tval: UInt) unsafe -> UInt {
     // on the profile whose saved PC points AT the trapping instruction, step
     // that PC a second time when the wake wrote the real pair.
     if not result.blocked {
-        hal.syscall_return(frame_addr, (result.status as UInt8) as UInt,
-                           result.value)
+        write_result(frame_addr, result)
     }
     pick_next(frame_addr)
 }

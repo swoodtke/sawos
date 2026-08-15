@@ -59,3 +59,28 @@ u32 sos_syscall3(u32 handle, u32 op, u32 arg0, u32 arg1, u32 arg2, u32 *value_ou
     *value_out = a1;
     return a0;
 }
+
+// One argument and TWO values back, for `Waiter.Wait` — spec §2.2 ratifies its
+// result as a `(key, readiness)` PAIR, and one out-parameter cannot carry two
+// words (design 178 M2 unit 3).
+//
+// The difference from `sos_syscall3` is the second value register's CONSTRAINT:
+// there it is `"r"` — an input the asm promises not to change — and here it is
+// `"+r"`, because this op's answer lands in it. That is why the two are
+// separate functions rather than one with a wider signature: a kernel writing
+// the register on a return the stub declared input-only would be breaking a
+// promise the compiler is entitled to schedule around.
+u32 sos_syscall1_pair(u32 handle, u32 op, u32 arg0, u32 *value_out,
+                      u32 *value2_out) {
+    register u32 a0 __asm__("a0") = handle;
+    register u32 a1 __asm__("a1") = arg0;
+    register u32 a2 __asm__("a2") = 0;
+    register u32 a7 __asm__("a7") = op;
+    __asm__ volatile("ecall"
+                     : "+r"(a0), "+r"(a1), "+r"(a2)
+                     : "r"(a7)
+                     : "memory");
+    *value_out = a1;
+    *value2_out = a2;
+    return a0;
+}

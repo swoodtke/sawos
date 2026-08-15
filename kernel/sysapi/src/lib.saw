@@ -40,8 +40,9 @@
 //! non-Saw process the same operations with none of the same protection, and a
 //! process that wants the protection writes Saw.
 
-import sosabi.{SystemOp, ProcessOp, ThreadOp, SosStatus,
-               SystemHandle, ProcessHandle, ThreadHandle}
+import sosabi.{SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp, SosStatus,
+               SystemHandle, ProcessHandle, ThreadHandle, EventHandle,
+               WaiterHandle, EventMode, WaiterReadiness}
 
 // The scalar-to-console-byte rule, shared with the kernel's own console so the
 // two cannot disagree about what a non-ASCII scalar becomes.
@@ -55,6 +56,9 @@ extern "C" {
     func sos_syscall1(handle: UInt, op: UInt, arg0: UInt) -> UInt
     func sos_syscall3(handle: UInt, op: UInt, arg0: UInt, arg1: UInt, arg2: UInt,
                       value_out: UnsafePointer<UInt>) -> UInt
+    func sos_syscall1_pair(handle: UInt, op: UInt, arg0: UInt,
+                           value_out: UnsafePointer<UInt>,
+                           value2_out: UnsafePointer<UInt>) -> UInt
 }
 
 
@@ -127,6 +131,21 @@ func call_value(handle: UInt, op: UInt, arg0: UInt, arg1: UInt,
     let raw = sos_syscall3(handle, op, arg0, arg1, arg2,
                            (&var value) as UnsafePointer<UInt>)
     checked_value(raw, value)
+}
+
+/// Issue the one op that answers with TWO values — `Waiter.wait`, whose result
+/// spec §2.2 ratifies as a `(key, readiness)` pair.
+///
+/// `unsafe` for the same confined reason `call_value` is: two out-parameters
+/// rather than one, neither of which leaves this function.
+func call_pair(handle: UInt, op: UInt, arg0: UInt) unsafe -> Result<WaitReport, SosStatus> {
+    var key: UInt = 0
+    var readiness: UInt = 0
+    let raw = sos_syscall1_pair(handle, op, arg0,
+                                (&var key) as UnsafePointer<UInt>,
+                                (&var readiness) as UnsafePointer<UInt>)
+    try checked(raw)
+    return WaitReport(key: key, readiness: readiness)
 }
 
 // =============================================================================
@@ -226,6 +245,73 @@ public func sos_thread_exit(handle: UInt, code: UInt) -> UInt {
 @export("sos_thread_yield")
 public func sos_thread_yield(handle: UInt) -> UInt {
     sos_syscall1(handle, ThreadOp.Yield as UInt, 0)
+}
+
+/// Make an Event in this process. Requires `ProcessRight.CreateEvent`. `mode`
+/// is 0 for bitwise-OR accumulation and 1 for saturating-sum (spec §2.4); any
+/// other value terminates the process.
+///
+/// THE C ALTITUDE WRITES THE MODE AS A NUMBER, and that is the documented
+/// difference in kind the module docstring describes rather than an oversight:
+/// a C caller has no enum to be handed, so it gets the wire value. The Saw
+/// altitude above never writes one — it offers a method per mode.
+@export("sos_process_create_event")
+public func sos_process_create_event(handle: UInt, mode: UInt,
+                                     value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, ProcessOp.CreateEvent as UInt, mode, 0, 0, value_out)
+}
+
+/// Make a Waiter in this process. Requires `ProcessRight.CreateWaiter`.
+@export("sos_process_create_waiter")
+public func sos_process_create_waiter(handle: UInt,
+                                      value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, ProcessOp.CreateWaiter as UInt, 0, 0, 0, value_out)
+}
+
+/// Accumulate `bits` into an Event. Never blocks. Requires `EventRight.Signal`.
+@export("sos_event_signal")
+public func sos_event_signal(handle: UInt, bits: UInt) -> UInt {
+    sos_syscall1(handle, EventOp.Signal as UInt, bits)
+}
+
+/// Drain an Event's word and reset it to zero. Requires `EventRight.Receive`.
+@export("sos_event_receive")
+public func sos_event_receive(handle: UInt,
+                              value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, EventOp.Receive as UInt, 0, 0, 0, value_out)
+}
+
+/// Attach a waitable to a Waiter under `key`. Requires `WaiterRight.Attach` on
+/// the waiter and `EventRight.Wait` on the target.
+///
+/// It is the first op taking TWO arguments and answering with a status alone,
+/// and the raw forms are fixed-arity by design (§5.7: no varargs across a trap
+/// boundary), so it rides the three-argument form and drops the value. The
+/// scratch that catches it is what makes this signature `unsafe`; the pointer
+/// never leaves the function, which is design 136's confinement rule.
+@export("sos_waiter_add")
+public func sos_waiter_add(handle: UInt, target: UInt, key: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, WaiterOp.Add as UInt, target, key, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// Detach a waitable. Requires `WaiterRight.Attach`.
+@export("sos_waiter_remove")
+public func sos_waiter_remove(handle: UInt, target: UInt) -> UInt {
+    sos_syscall1(handle, WaiterOp.Remove as UInt, target)
+}
+
+/// Block until an attached handle is ready; answer with the attacher's key and
+/// what became ready (spec §2.2). Requires `WaiterRight.Wait`.
+///
+/// TWO out-parameters, because the result is a PAIR and the C ABI this surface
+/// is declared against has no aggregate return — the same shape `value_out`
+/// takes for the ops that answer with one word, one register further along.
+@export("sos_waiter_wait")
+public func sos_waiter_wait(handle: UInt, key_out: UnsafePointer<UInt>,
+                            readiness_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall1_pair(handle, WaiterOp.Wait as UInt, 0, key_out, readiness_out)
 }
 
 // =============================================================================
@@ -372,6 +458,43 @@ public extension Process {
     public func get_status(&self) -> Result<UInt, SosStatus> {
         call_value(self.handle, ProcessOp.GetStatus as UInt, 0, 0, 0)
     }
+
+    /// Make an Event that accumulates BY OR — §2.4's flag set, "which of these
+    /// events occurred since last drain". The signal use case, and the one to
+    /// reach for unless you are counting. Requires `ProcessRight.CreateEvent`.
+    public func create_event(&self) -> Result<Event, SosStatus> {
+        self.event_of(EventMode.Or)
+    }
+
+    /// Make an Event that COUNTS, saturating — §2.4's counting semaphore, "how
+    /// many times". It saturates rather than wrapping, so a producer faster
+    /// than its consumer loses count but never rolls back through zero.
+    /// Requires `ProcessRight.CreateEvent`.
+    public func create_counting_event(&self) -> Result<Event, SosStatus> {
+        self.event_of(EventMode.SaturatingSum)
+    }
+
+    /// TWO METHODS RATHER THAN ONE TAKING A MODE, deliberately. The mode's wire
+    /// value lives in `sosabi`, which is KERNEL-INTERNAL (§5.7's vDSO
+    /// discipline) — a process links this module and never names one of its
+    /// types — so offering `create_event(mode:)` would mean either exporting an
+    /// enum out of a module nothing outside the kernel may import, or declaring
+    /// a second copy of it here, which is exactly the skew that file exists to
+    /// prevent. Naming the mode in the METHOD costs a word at the call site and
+    /// keeps the number where it belongs.
+    func event_of(&self, mode: EventMode) -> Result<Event, SosStatus> {
+        let raw = try call_value(self.handle, ProcessOp.CreateEvent as UInt,
+                                 mode as UInt, 0, 0)
+        return Event(handle: EventHandle(raw))
+    }
+
+    /// Make a Waiter — §2.2's generic wait aggregator. Requires
+    /// `ProcessRight.CreateWaiter`.
+    public func create_waiter(&self) -> Result<Waiter, SosStatus> {
+        let raw = try call_value(self.handle, ProcessOp.CreateWaiter as UInt,
+                                 0, 0, 0)
+        return Waiter(handle: WaiterHandle(raw))
+    }
 }
 
 // =============================================================================
@@ -426,6 +549,115 @@ public extension Thread {
     /// two scales, and a reader should not have to learn two words.
     public func yield_now(&self) -> Result<Void, SosStatus> {
         checked(sos_thread_yield(self.handle))
+    }
+}
+
+// =============================================================================
+// Event (spec §2.4; design 178 D5)
+// =============================================================================
+
+/// A handle to an Event — the accumulating non-blocking notification.
+///
+/// Bits go in through `signal` and never block; one `receive` takes them all
+/// out and resets the word. A non-zero word is what "ready" means to a Waiter,
+/// which is the only other thing that ever looks at it.
+///
+/// Built by `Process.create_event` / `create_counting_event` and by nothing
+/// else — no word constructor, no word extractor, the module docstring's rule.
+public struct Event {
+    handle: EventHandle,
+}
+
+public extension Event {
+    /// Accumulate `bits`. NEVER BLOCKS and never fails for want of room: under
+    /// OR the word saturates by being idempotent, and under counting it
+    /// saturates by refusing to wrap. Requires `EventRight.Signal`.
+    ///
+    /// Signalling ZERO is a no-op that leaves the event exactly as ready as it
+    /// already was — it cannot make one ready, because zero IS "not ready".
+    public func signal(&self, bits: UInt) -> Result<Void, SosStatus> {
+        checked(sos_event_signal(self.handle, bits))
+    }
+
+    /// Drain the accumulated word and reset it to zero, in one operation.
+    /// Answers zero for an event nothing has signalled — it does not park, which
+    /// is the Waiter's job. Requires `EventRight.Receive`.
+    public func receive(&self) -> Result<UInt, SosStatus> {
+        call_value(self.handle, EventOp.Receive as UInt, 0, 0, 0)
+    }
+}
+
+// =============================================================================
+// Waiter (spec §2.2; design 178 D5)
+// =============================================================================
+
+/// What `Waiter.wait` answers with: §2.2's `(key, readiness)` pair.
+///
+/// `key` is the WORD THE ATTACHER SUPPLIED, handed back unread — §2.2's point
+/// is that a word can directly encode the waiting task's identity, so a
+/// userspace executor dispatches on it with no side-table lookup. The kernel
+/// neither interprets it nor constrains it, zero included.
+///
+/// `readiness` is a MASK of what became ready. M2's only waitable is the Event,
+/// which has exactly one condition, so `is_signalled` is the whole of the
+/// question today — but it is a mask because a Channel has two (readable,
+/// reply-ready) and reading one bit out of a word is how that stays additive.
+public struct WaitReport {
+    public key: UInt,
+    public readiness: UInt,
+}
+
+public extension WaitReport {
+    /// Whether an Event was signalled. The predicate rather than the bit,
+    /// because the bit's value is `sosabi`'s and userspace never writes one.
+    public func is_signalled(&self) -> Bool {
+        (self.readiness & (WaiterReadiness.Signalled as UInt)) != 0
+    }
+}
+
+/// A handle to a Waiter — §2.2's generic wait aggregator, epoll/Port-style.
+///
+/// Attachments are PERSISTENT subscriptions: `add` once, and the handle stays
+/// watched until `remove`. There is no one-shot mode, and readiness is
+/// LEVEL-TRIGGERED, so a signal that lands before anyone waits is still there
+/// when the wait arrives.
+///
+/// Several threads may park on one Waiter (§2.2), and a ready handle wakes one
+/// of them; a handle attaches to at most one Waiter, and attaching it twice
+/// terminates the process, on the faults ruling's terms — it is a mistake only
+/// the attacher could have made.
+public struct Waiter {
+    handle: WaiterHandle,
+}
+
+public extension Waiter {
+    /// Attach `event` under `key`, which `wait` hands back when it becomes
+    /// ready. Requires `WaiterRight.Attach` here and `EventRight.Wait` there.
+    ///
+    /// IT TAKES A `&Event` AND NOT A HANDLE WORD. That is the module
+    /// docstring's rule reaching cross-type plumbing: there is no way to spell
+    /// a handle you were not given, so an attachment names an object this
+    /// process holds by construction. The field access below is same-module,
+    /// which is why no accessor is owed and none exists.
+    public func add(&self, event: &Event, key: UInt) -> Result<Void, SosStatus> {
+        checked(sos_waiter_add(self.handle, event.handle, key))
+    }
+
+    /// Stop watching `event`. Removing one this Waiter does not hold terminates
+    /// the process. Requires `WaiterRight.Attach`.
+    public func remove(&self, event: &Event) -> Result<Void, SosStatus> {
+        checked(sos_waiter_remove(self.handle, event.handle))
+    }
+
+    /// Block until an attached handle is ready, and answer with its key.
+    /// Requires `WaiterRight.Wait`.
+    ///
+    /// Returns IMMEDIATELY when something is already ready, which is what
+    /// level-triggering buys: the readiness a signal left behind is still
+    /// there, so "signal then wait" and "wait then signal" have the same
+    /// outcome and only the second one parks.
+    public func wait(&self) -> Result<WaitReport, SosStatus> {
+        call_pair(self.handle, WaiterOp.Wait as UInt, 0)
     }
 }
 

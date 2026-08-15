@@ -25,6 +25,7 @@ row's in-tree caller went away with the C sinks — see DF-172i, recorded there.
 |---|---|
 | `sos_syscall1(handle, op, arg0) -> status` | Perform one object op that answers with a status alone. |
 | `sos_syscall3(handle, op, arg0, arg1, arg2, value_out) -> status` | The same, for ops that take up to three arguments AND answer with a VALUE (design 178 M2 unit 2). The value comes back through a pointer — the C ABI the Saw side declares against has no aggregate return. Same contract as the riscv32 twin, which states the reasoning. |
+| `sos_syscall1_pair(handle, op, arg0, value_out, value2_out) -> status` | For the ONE op that answers with TWO words: `Waiter.Wait`, spec §2.2's `(key, readiness)` pair (design 178 M2 unit 3). Separate from `sos_syscall3` because of the second value register's CONSTRAINT, not its count — read-write here, input-only there. Same contract as the riscv32 twin, which states the reasoning. |
 
 The runtime's two hooks (`sos_rt_write`, `sos_rt_abort`) and the parked boot
 handle are still part of a process's contract; they are just not this
@@ -44,10 +45,13 @@ Every syscall is an object op — there are no bare numbered syscalls.
 |---|---|
 | `x0` | handle (in), status word (out) |
 | `x8` | op — a method id on that object's table, not a global number |
-| `x1`-`x5` | arguments; `x1` also carries the value half on return |
+| `x1`-`x5` | arguments; `x1` also carries the value half on return, and `x2` the SECOND value for the one op that answers with a pair |
 
-`svc #0` traps. A status of 0 is success; anything else is a `SosStatus` tag,
-and the process keeps running — a bad call is an error, not a fault.
+`svc #0` traps. A status of 0 is success; anything else is a `SosStatus` tag the
+process may branch on. A caller error the process could have CHECKED — an
+invalid handle, an unknown op, a missing right — does not come back at all:
+design 178's faults ruling terminates the process for it, and the kernel reports
+the reason. What is left as a status is what the caller could not have known.
 
 ## What is arm64-specific here
 

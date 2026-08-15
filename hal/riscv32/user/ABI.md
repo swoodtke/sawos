@@ -40,6 +40,7 @@ a C caller crossing into them.
 |---|---|
 | `sos_syscall1(handle, op, arg0) -> status` | Perform one object op that answers with a status alone. The value half is not read. |
 | `sos_syscall3(handle, op, arg0, arg1, arg2, value_out) -> status` | The same, for ops that take up to three arguments AND answer with a VALUE — a created thread's handle, a joined thread's exit code, a process's status word (design 178 M2 unit 2). The value comes back through a POINTER rather than in the return, because the Saw side declares these symbols against a C ABI whose whitelist has no aggregate return; one out-parameter is the shape that crosses. Ops with fewer arguments pass zeros. |
+| `sos_syscall1_pair(handle, op, arg0, value_out, value2_out) -> status` | For the ONE op that answers with TWO words: `Waiter.Wait`, whose result spec §2.2 ratifies as a `(key, readiness)` pair (design 178 M2 unit 3). Two out-parameters for the same aggregate-return reason. The difference from `sos_syscall3` is a CONSTRAINT, not a count: the second value register is declared read-write here and input-only there, which is why the two are separate functions rather than one — a kernel writing that register on a return the stub declared input-only would break a promise the compiler is entitled to schedule around. |
 
 The runtime's two hooks (`sos_rt_write`, `sos_rt_abort`) and the parked boot
 handle are still part of a process's contract; they are just not this
@@ -60,10 +61,13 @@ Every syscall is an object op — there are no bare numbered syscalls.
 |---|---|
 | `a0` | handle (in), status word (out) |
 | `a7` | op — a method id on that object's table, not a global number |
-| `a1`-`a5` | arguments; `a1` also carries the value half on return |
+| `a1`-`a5` | arguments; `a1` also carries the value half on return, and `a2` the SECOND value for the one op that answers with a pair |
 
-`ecall` traps. A status of 0 is success; anything else is a `SosStatus` tag, and
-the process keeps running — a bad call is an error, not a fault.
+`ecall` traps. A status of 0 is success; anything else is a `SosStatus` tag the
+process may branch on. A caller error the process could have CHECKED — an
+invalid handle, an unknown op, a missing right — does not come back at all:
+design 178's faults ruling terminates the process for it, and the kernel reports
+the reason. What is left as a status is what the caller could not have known.
 
 ## What is riscv32-specific here
 
