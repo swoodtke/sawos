@@ -16,21 +16,23 @@
 // address of a function (DF-178c / design 172's reason 3) and `create_thread`
 // therefore has no entry to be given. So the entry has to work out which thread
 // it is, and it does that the only way that needs no second register: the
-// INITIAL thread is the one that has not yet parked the process handle.
+// INITIAL thread is the one that has not yet parked the boot handle.
+//
+// A WORKER DERIVES ITS AUTHORITY, it is not handed it. The one thing parked for
+// it is the BOOT HANDLE — §12's root of trust and the only raw word the typed
+// layer accepts — and everything else comes off it by derivation:
+// `System(boot_handle:)` -> `self_process()` -> `self_thread()`. That is why
+// nothing here passes a handle WORD between threads: the `sos` module offers no
+// way to take one out of a typed handle, and this program needs none.
 
 import sos.{System, Process, Thread}
 
-/// The process handle, parked for the workers.
+/// The boot handle, parked by the initial thread for the workers.
 ///
-/// It is also the "have I run yet" witness — see the header. A worker reaches
-/// its own Thread object through it (`self_thread`), which is how it gets a
-/// handle to yield and exit with.
-unsafe static var PROCESS_WORD: UInt = 0
-
-/// The System handle, parked beside it. A worker needs it to write its tag: the
-/// tag has to reach the console with NO newline after it (the alternation is
-/// read as one unbroken run), and `print` always ends a line.
-unsafe static var SYSTEM_WORD: UInt = 0
+/// It is also the "have I run yet" witness, and that reading is grounded rather
+/// than lucky: handle 0 names nothing (the object table reserves zero), so a
+/// parked boot handle is never 0 and an unparked slot is never a handle.
+unsafe static var BOOT_HANDLE: UInt = 0
 
 /// A worker's stack, in this process's own zero-init data. Spec §8: thread
 /// stacks are USERSPACE memory passed to thread creation, so a process finds
@@ -70,23 +72,24 @@ func stack_b_top() unsafe -> UInt {
     stack_top(((&var STACK_B) as UnsafePointer<UInt64>) as UInt)
 }
 
-func park_handles(system: UInt, process: UInt) unsafe {
-    SYSTEM_WORD = system
-    PROCESS_WORD = process
+func park_boot_handle(word: UInt) unsafe {
+    BOOT_HANDLE = word
 }
 
-func parked_process() unsafe -> UInt {
-    PROCESS_WORD
-}
-
-func parked_system() unsafe -> UInt {
-    SYSTEM_WORD
+func parked_boot_handle() unsafe -> UInt {
+    BOOT_HANDLE
 }
 
 /// A worker: print, yield, repeat, then exit with a value its joiner reads.
+///
+/// The System object is what writes the tag — with NO newline after it, which
+/// `print` would add and which would break the alternation into lines.
 func worker(role: UInt) {
-    let proc = Process(adopting: parked_process())
-    let system = System(boot_handle: parked_system())
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = match system.self_process() {
+        case Ok(p) -> p,
+        case Err(_) -> { return },
+    }
     let me = match proc.self_thread() {
         case Ok(t) -> t,
         case Err(_) -> { return },
@@ -105,6 +108,10 @@ func worker(role: UInt) {
 
 /// The initial thread: make two workers, start them, wait for both.
 func initial(boot_handle: UInt) {
+    // Parked FIRST: it is what tells a worker's entry that it is a worker, and
+    // it is the seed the worker derives its own objects from.
+    park_boot_handle(boot_handle)
+
     let system = System(boot_handle: boot_handle)
     let proc = match system.self_process() {
         case Ok(p) -> p,
@@ -114,7 +121,6 @@ func initial(boot_handle: UInt) {
             return
         },
     }
-    park_handles(boot_handle, proc.as_word())
 
     let a = match proc.create_thread(stack_top: stack_a_top(), arg: ROLE_A) {
         case Ok(t) -> t,
@@ -163,7 +169,7 @@ func initial(boot_handle: UInt) {
 
 @export("_start")
 func _start(arg: UInt) {
-    if parked_process() == 0 {
+    if parked_boot_handle() == 0 {
         initial(arg)
     } else {
         worker(arg)

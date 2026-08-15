@@ -23,14 +23,12 @@
 
 import sos.{System, Process, Thread}
 
-/// The process handle, parked for the workers — and the witness that says which
-/// thread `_start` is running as. See `thread-basics` for why every thread of
-/// an image written in Saw enters at the same address (DF-178c).
-unsafe static var PROCESS_WORD: UInt = 0
-
-/// The System handle, parked beside it — a worker writes its tag with no
-/// newline after it, and `print` always ends a line.
-unsafe static var SYSTEM_WORD: UInt = 0
+/// The boot handle, parked for the workers — and the witness that says which
+/// thread `_start` is running as (handle 0 names nothing, so a parked one is
+/// never 0). A worker DERIVES everything else off it: `System(boot_handle:)`
+/// -> `self_process()` -> `self_thread()`. See `thread-basics` for why every
+/// thread of an image written in Saw enters at the same address (DF-178c).
+unsafe static var BOOT_HANDLE: UInt = 0
 
 /// Where `burn` leaves its result. A spin loop whose value nothing reads is a
 /// spin loop the optimizer DELETES, and a deleted spin makes this whole case
@@ -72,17 +70,12 @@ func stack_b_top() unsafe -> UInt {
     stack_top(((&var STACK_B) as UnsafePointer<UInt64>) as UInt)
 }
 
-func park_handles(system: UInt, process: UInt) unsafe {
-    SYSTEM_WORD = system
-    PROCESS_WORD = process
+func park_boot_handle(word: UInt) unsafe {
+    BOOT_HANDLE = word
 }
 
-func parked_process() unsafe -> UInt {
-    PROCESS_WORD
-}
-
-func parked_system() unsafe -> UInt {
-    SYSTEM_WORD
+func parked_boot_handle() unsafe -> UInt {
+    BOOT_HANDLE
 }
 
 /// Burn time without touching the kernel.
@@ -103,8 +96,11 @@ func burn(iterations: Int) unsafe {
 }
 
 func worker(role: UInt) {
-    let proc = Process(adopting: parked_process())
-    let system = System(boot_handle: parked_system())
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = match system.self_process() {
+        case Ok(p) -> p,
+        case Err(_) -> { return },
+    }
     let me = match proc.self_thread() {
         case Ok(t) -> t,
         case Err(_) -> { return },
@@ -120,6 +116,8 @@ func worker(role: UInt) {
 }
 
 func initial(boot_handle: UInt) {
+    park_boot_handle(boot_handle)
+
     let system = System(boot_handle: boot_handle)
     let proc = match system.self_process() {
         case Ok(p) -> p,
@@ -129,7 +127,6 @@ func initial(boot_handle: UInt) {
             return
         },
     }
-    park_handles(boot_handle, proc.as_word())
 
     let a = match proc.create_thread(stack_top: stack_a_top(), arg: ROLE_A) {
         case Ok(t) -> t,
@@ -166,7 +163,7 @@ func initial(boot_handle: UInt) {
 
 @export("_start")
 func _start(arg: UInt) {
-    if parked_process() == 0 {
+    if parked_boot_handle() == 0 {
         initial(arg)
     } else {
         worker(arg)

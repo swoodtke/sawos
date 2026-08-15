@@ -25,6 +25,20 @@
 //! convention (§5.7 — handle in a0, op in a7, status back in a0) and the status
 //! tags it branches on. The first lives in the HAL stub; the second is
 //! `SosStatus` below. Neither is a number this file's callers ever write.
+//!
+//! THE TWO LAYERS, AND WHICH ONE CARRIES A GUARANTEE (ruled Aug 15, user). The
+//! TYPED SAW SURFACE NEVER EXPOSES OR ACCEPTS A RAW HANDLE WORD: `System`,
+//! `Process` and `Thread` keep private fields, offer no word extractor and no
+//! word constructor, and every one of them is minted INSIDE this module by the
+//! op wrapper that received it from the kernel — so the only crossing INTO the
+//! typed layer is `System(boot_handle:)`, §12's root of trust, and there is no
+//! crossing out at all. A handle you hold is one the kernel handed you, and a
+//! handle you were never given is not a thing you can spell.
+//! The `@export`ed C SURFACE below is the FLOOR and keeps raw `UInt` handles,
+//! because a C caller has no type system to carry the guarantee in. That is a
+//! documented difference in kind, not an oversight: the C altitude buys a
+//! non-Saw process the same operations with none of the same protection, and a
+//! process that wants the protection writes Saw.
 
 import sosabi.{SystemOp, ProcessOp, ThreadOp, SosStatus,
                SystemHandle, ProcessHandle, ThreadHandle}
@@ -279,7 +293,7 @@ public extension System {
     /// query, not two capabilities.
     public func self_process(&self) -> Result<Process, SosStatus> {
         let raw = try call_value(self.handle, SystemOp.SelfProcess as UInt, 0, 0, 0)
-        return Process(adopting: raw)
+        return Process(handle: ProcessHandle(raw))
     }
 }
 
@@ -291,28 +305,17 @@ public extension System {
 ///
 /// A process reaches its OWN through `System.self_process`. Holding somebody
 /// else's is what supervision will look like when there is somebody else (M3).
+///
+/// THERE IS NO WAY TO BUILD ONE FROM A WORD and no way to get a word back out.
+/// The field is private (design 80), the only constructors are this module's own
+/// op wrappers, and the derivation chain starts at `System(boot_handle:)` — so
+/// a `Process` in hand is one the kernel handed over, not an integer somebody
+/// guessed. See the module docstring's two-layer rule.
 public struct Process {
     handle: ProcessHandle,
 }
 
 public extension Process {
-    /// Adopt a raw handle word as a Process handle.
-    ///
-    /// The other place userspace crosses INTO a handle type, beside
-    /// `System(boot_handle:)`, and it is here for one reason: a thread's entry
-    /// receives its argument as a REGISTER, so a creator that wants to hand a
-    /// worker the process handle hands it a word. The crossing is safe because
-    /// the kernel validates on use — a word that names nothing terminates the
-    /// process on the first op, per the faults ruling.
-    public init(adopting: UInt) -> Process {
-        Process(handle: ProcessHandle(adopting))
-    }
-
-    /// This handle as a plain word, for handing to a thread as its argument.
-    public func as_word(&self) -> UInt {
-        self.handle
-    }
-
     /// Make a thread at `entry`, ready to be started. Requires
     /// `ProcessRight.CreateThread`.
     ///
@@ -328,7 +331,7 @@ public extension Process {
                               arg: UInt) -> Result<Thread, SosStatus> {
         let raw = try call_value(self.handle, ProcessOp.CreateThread as UInt,
                                  entry, stack_top, arg)
-        return Thread(adopting: raw)
+        return Thread(handle: ThreadHandle(raw))
     }
 
     /// Make a thread that starts at this process's own IMAGE ENTRY — the entry
@@ -354,7 +357,7 @@ public extension Process {
     /// handed its process, and asks the process which thread it is.
     public func self_thread(&self) -> Result<Thread, SosStatus> {
         let raw = try call_value(self.handle, ProcessOp.SelfThread as UInt, 0, 0, 0)
-        return Thread(adopting: raw)
+        return Thread(handle: ThreadHandle(raw))
     }
 
     /// End this process with `status`. Every thread goes with it and the kernel
@@ -379,22 +382,18 @@ public extension Process {
 ///
 /// Saw's own TaskGroups run INSIDE one of these, in userspace; the kernel never
 /// sees a task (spec §2).
+///
+/// Like `Process`, it cannot be built from a word or turned back into one: a
+/// `Thread` comes from `Process.create_thread` or `Process.self_thread` and from
+/// nowhere else. Naming a thread you were never given is therefore not
+/// expressible in this layer — which is the point, and which is why the harness
+/// case that PROVES the kernel rejects such a handle is a hand-written payload
+/// at the raw altitude rather than a program written against this module.
 public struct Thread {
     handle: ThreadHandle,
 }
 
 public extension Thread {
-    /// Adopt a raw handle word as a Thread handle. Same crossing, same reason,
-    /// as `Process(adopting:)`.
-    public init(adopting: UInt) -> Thread {
-        Thread(handle: ThreadHandle(adopting))
-    }
-
-    /// This handle as a plain word.
-    public func as_word(&self) -> UInt {
-        self.handle
-    }
-
     /// Make a created thread runnable. It runs when the scheduler next picks
     /// it, which is not necessarily before this call returns. Requires
     /// `ThreadRight.Start`.
