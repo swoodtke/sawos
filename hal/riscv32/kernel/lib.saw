@@ -138,10 +138,22 @@ struct TrapFrame {
     t6: UInt,               // x31
 }
 
-// The frame boot.S reserves must be the frame this file describes. A field
-// added on one side and not the other would misread every register after it.
-// (`.equ TF_SIZE, 128` there; the arm64 HAL pins its own the same way.)
-static_assert(sizeof<TrapFrame>() == 128, "the riscv32 trap frame is 32 words")
+/// Bytes in one saved context.
+///
+/// Public because the KERNEL reserves a slot per thread and has to know this
+/// fits (design 178 M2 unit 2): a trap frame is a thread's context, so the
+/// kernel owns the storage and the HAL owns the layout. The assert below is
+/// what keeps the number honest on this side; the kernel's own assert is what
+/// keeps its stride honest on that side.
+public static FRAME_BYTES: Int = 128
+
+/// Words in a frame, for `frame_init`'s zeroing loop.
+static FRAME_WORDS: UInt = 32
+
+// The frame boot.S writes must be the frame this file describes. A field added
+// on one side and not the other would misread every register after it. (The
+// stores there are `sw x<i>, i*4(sp)`; the arm64 HAL pins its own the same way.)
+static_assert(sizeof<TrapFrame>() == FRAME_BYTES, "the riscv32 trap frame is 32 words")
 
 // =============================================================================
 // Board constants
@@ -288,7 +300,7 @@ public func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
 // register, because a `csrw` names its CSR in the INSTRUCTION. See `sink.c`'s
 // header for the reason each survivor carries.
 extern "C" {
-    func sos_enter_user(entry: UInt, stack_top: UInt, boot_handle: UInt)
+    func sos_resume_frame(frame_addr: UInt)
     func sos_pmpaddr_write(index: UInt, value: UInt)
     func sos_pmpcfg_write(lo: UInt, hi: UInt)
     func sos_payload_start() -> UInt
@@ -405,11 +417,40 @@ public func prot_commit() unsafe {
     sos_pmpcfg_write(PMPCFG_LO, PMPCFG_HI)
 }
 
-/// Drop to user mode at `entry` with `stack_top` as the stack pointer, handing
-/// over `boot_handle` in the first argument register — the boot handle set of
-/// spec §12. Never returns; the next kernel code to run is `ktrap`.
-public func enter_user(entry: UInt, stack_top: UInt, boot_handle: UInt) {
-    sos_enter_user(entry, stack_top, boot_handle)
+/// Build a fresh user context in `frame_addr`: `entry` as the resume address,
+/// `stack_top` as the stack pointer, `arg0` in the first argument register.
+///
+/// EVERY OTHER WORD IS ZEROED, which is the same promise the register-clearing
+/// `sos_enter_user` used to make in assembly and is now made by a loop the
+/// compiler can see: nothing of the kernel's, and nothing of another thread's,
+/// crosses into a context this builds. The return-address register is among the
+/// zeroed ones on purpose — a thread entry that RETURNS jumps to zero and takes
+/// an instruction-access fault, which spec §8 turns into the death of its
+/// process. That is a diagnosed stop rather than a run into whatever follows.
+public func frame_init(frame_addr: UInt, entry: UInt, stack_top: UInt,
+                       arg0: UInt) unsafe {
+    var w: UInt = 0
+    while w < FRAME_WORDS {
+        UnsafeMemory<UInt, Normal>(frame_addr + w * WORD_BYTES).write(0)
+        w = w + 1
+    }
+    let frame = frame_at(frame_addr)
+    frame.mepc.write(entry)
+    frame.sp.write(stack_top)
+    frame.a0.write(arg0)
+}
+
+static WORD_BYTES: UInt = 4
+
+/// Resume the context saved in `frame_addr`, in user mode. Never returns.
+///
+/// The FIRST entry to user mode, and the only one that is not `ktrap` handing a
+/// frame back to the trap entry — which is why the assembly behind it is a
+/// privilege-mode select and a branch into the trap entry's own restore path
+/// rather than a second copy of it.
+public func resume_frame(frame_addr: UInt) -> Never {
+    sos_resume_frame(frame_addr)
+    while { }
 }
 
 /// First byte of the appended payload — the `.payload` section `virt.ld`
@@ -531,6 +572,14 @@ public func syscall_op(frame_addr: UInt) unsafe -> UInt {
 
 public func syscall_arg0(frame_addr: UInt) unsafe -> UInt {
     frame_at(frame_addr).a1.read()
+}
+
+public func syscall_arg1(frame_addr: UInt) unsafe -> UInt {
+    frame_at(frame_addr).a2.read()
+}
+
+public func syscall_arg2(frame_addr: UInt) unsafe -> UInt {
+    frame_at(frame_addr).a3.read()
 }
 
 /// Place a syscall's (status, value) pair where the caller will find it and

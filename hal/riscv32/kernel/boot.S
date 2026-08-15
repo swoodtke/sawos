@@ -6,8 +6,9 @@
  * zeroes .bss, and calls the Saw `kmain`.
  *
  * M1 adds the M/U split. `mscratch` is the MODE WITNESS: it holds 0 while the
- * kernel runs and `&_trapframe` while U-mode runs. `trap_entry` swaps it with
- * sp on entry, so a single `bnez` separates the two worlds:
+ * kernel runs and the RUNNING THREAD'S FRAME ADDRESS while U-mode runs.
+ * `trap_entry` swaps it with sp on entry, so a single `bnez` separates the two
+ * worlds:
  *
  *   nonzero -> the trap came from U-mode. sp now points at the trap frame;
  *              save the user context, run the Saw handler `ktrap`, restore,
@@ -20,12 +21,17 @@
  * and word 0 — the slot x0 would occupy, which never needs saving — holds
  * `mepc`. So a register's offset is just its number times four.
  *
- * This file plus the CSR/PMP helpers in rt.c ARE the riscv32 half of the HAL
- * that design 79 (M1b) extracts when arm64 EL1 parity lands; nothing above the
- * `ktrap` call is architecture-neutral.
+ * DESIGN 178 M2 UNIT 2 — THE FRAME IS A THREAD'S CONTEXT. The kernel owns the
+ * storage (one slot per thread, in its own arena) and `ktrap` RETURNS the frame
+ * to resume, so this file no longer reserves a frame of its own and the restore
+ * path below is the whole of the context switch. Re-arming `mscratch` from the
+ * resumed sp is what makes the next trap save into the thread that is actually
+ * running.
+ *
+ * This file plus the CSR/PMP helpers in sink.c ARE the riscv32 half of the HAL;
+ * nothing above the `ktrap` call is architecture-neutral.
  */
 
-    .equ TF_SIZE,       128         /* 32 words */
     .equ SIFIVE_TEST,   0x00100000
     .equ FINISHER_FAIL, 0x3333
     .equ MSTATUS_MPP,   0x1800      /* bits 12:11 — previous privilege mode */
@@ -117,18 +123,23 @@ trap_entry:
     csrr    t0, mepc
     sw      t0,   0*4(sp)
 
-    /* Run the handler on the KERNEL stack, keeping the frame pointer in s0
-     * (callee-saved, so `ktrap` must give it back). */
-    mv      s0, sp
-    mv      a0, s0
+    /* Run the handler on the KERNEL stack. The frame address goes in a0 and
+     * comes BACK in a0: `ktrap` returns the frame to resume, which is either
+     * this one or another thread's (design 178 M2 unit 2). Nothing has to be
+     * preserved across the call, so no callee-saved register is spent. */
+    mv      a0, sp
     csrr    a1, mcause
     csrr    a2, mtval
     la      sp, _stack_top
     call    ktrap
 
-    /* Resume whatever context the frame now describes. `ktrap` may have
-     * advanced mepc past an `ecall` and written syscall results into a0/a1. */
-    mv      sp, s0
+    /* Resume whatever context a0 names. `ktrap` may have advanced mepc past an
+     * `ecall` and written syscall results into a0/a1 OF THAT FRAME — and the
+     * frame need not be the one we came in on, which is the whole of the
+     * context switch: mscratch below is re-armed with whatever we resume, so
+     * the next trap saves into the thread that is actually running. */
+.Lresume_frame:
+    mv      sp, a0
     lw      t0,   0*4(sp)
     csrw    mepc, t0
     /* Going back to U-mode: re-arm the witness. */
@@ -183,77 +194,33 @@ kernel_fault:
 
 /* ---- M -> U transition --------------------------------------------------- */
 
-/* void sos_enter_user(u32 entry, u32 stack_top, u32 boot_handle) — never returns.
+/* void sos_resume_frame(u32 frame_addr) — never returns.
  *
- * Arms the mode witness, points mepc at the user entry, selects U-mode as the
- * `mret` target (MPP = 0) with interrupts left off (MPIE = 0 — M1 has no
- * interrupt sources), and hands the user a zeroed register file so nothing of
- * the kernel's leaks across the privilege boundary. RISC-V has ONE `sp` across
- * modes, so setting it here is what gives root its stack.
+ * Enter user mode in the context `frame_addr` holds. This is the FIRST entry
+ * only: every entry after it is `ktrap` returning a frame to the path above,
+ * which is why this is four instructions and a branch INTO that path rather
+ * than a second copy of it. It replaced `sos_enter_user`, which built a user
+ * context by zeroing twenty-nine registers in assembly — the same context is
+ * now built by `frame_init` in Saw, and this only has to select the mode.
  *
- * The one register that is NOT zeroed is a0, which carries the boot handle set
- * (spec §12). In M1 that is a single handle — root's System handle — so it fits
- * in a register; when the set grows it becomes a structure the kernel places in
- * root's memory and a0 points at. Either way this is the handoff: root's entry
- * takes it as its first C-ABI argument, so a Saw `_start(system: UInt)` just
- * receives it. */
+ * What is left is the part with no Saw spelling (design 172's reason 1): MPP =
+ * 0 selects U-mode as the `mret` target and MPIE = 0 leaves the global
+ * interrupt enable clear, which is design 178 D2 — this hart delivers a machine
+ * interrupt to a lower privilege mode regardless of that bit, so clearing it
+ * IS "interrupts are taken from user mode only".
+ *
+ * A trap RETURN does not repeat this: the hardware sets MPP to the mode it
+ * trapped from, which is U for every trap that reaches the path above. */
     .section .text.enter, "ax", @progbits
-    .globl sos_enter_user
-sos_enter_user:
-    la      t0, _trapframe
-    csrw    mscratch, t0
-    csrw    mepc, a0
+    .globl sos_resume_frame
+sos_resume_frame:
     li      t1, MSTATUS_MPP
     csrc    mstatus, t1
     li      t1, MSTATUS_MPIE
     csrc    mstatus, t1
-    mv      sp, a1
-    /* Park the boot handle where the zeroing loop will not reach it. */
-    mv      t2, a2
-
-    li      x1, 0
-    li      x3, 0
-    li      x4, 0
-    li      x5, 0
-    li      x6, 0
-    li      x8, 0
-    li      x9, 0
-    li      x10, 0
-    li      x11, 0
-    li      x12, 0
-    li      x13, 0
-    li      x14, 0
-    li      x15, 0
-    li      x16, 0
-    li      x17, 0
-    li      x18, 0
-    li      x19, 0
-    li      x20, 0
-    li      x21, 0
-    li      x22, 0
-    li      x23, 0
-    li      x24, 0
-    li      x25, 0
-    li      x26, 0
-    li      x27, 0
-    li      x28, 0
-    li      x29, 0
-    li      x30, 0
-    li      x31, 0
-    /* a0 = the boot handle set; t2 (x7) is scratch and clears itself. */
-    mv      a0, t2
-    li      x7, 0
-    mret
+    j       .Lresume_frame
 
 /* ---- reservations -------------------------------------------------------- */
-
-/* The one trap frame. Uniprocessor kernel, one user thread (spec §7) — the
- * per-Thread frame arrives with the object model. */
-    .section .bss.trapframe, "aw", @nobits
-    .balign 16
-    .globl _trapframe
-_trapframe:
-    .skip TF_SIZE
 
 /* 64 KiB kernel stack, reserved in .bss (zeroed by the loop above). */
     .section .bss.stack, "aw", @nobits

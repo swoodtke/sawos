@@ -47,6 +47,8 @@
 public enum ObjType: UInt8 {
     case Unbound = 0,
     case System = 1,
+    case Process = 2,
+    case Thread = 3,
 }
 
 // =============================================================================
@@ -75,6 +77,32 @@ public enum ObjType: UInt8 {
 /// no-DUPLICATE rule is its exact `NoCopy` correspondence). That is additive:
 /// this alias becomes the payload, and nothing written against it changes.
 public type SystemHandle = UInt
+
+/// A handle naming a Process object (§2 table). Same discipline as
+/// `SystemHandle`: it flows TO `UInt` at the syscall stub and nothing flows in.
+public type ProcessHandle = UInt
+
+/// A handle naming a Thread object (§2 table).
+public type ThreadHandle = UInt
+
+/// A handle index the table can never hand out. Handle 0 names nothing, so a
+/// zeroed register is never authority (see `ObjType.Unbound`).
+public static NO_HANDLE: UInt = 0
+
+/// The `entry` argument to `Process.CreateThread` that means "start the thread
+/// at this process's own IMAGE ENTRY" — the entry the loader took out of the
+/// image header.
+///
+/// It exists because of a LANGUAGE GAP, and the gap is worth stating where the
+/// constant is: Saw cannot name the address of a function (design 172's reason
+/// 3, DF-172a — `extern` declares functions, an extern function is not usable
+/// as a value, and `@export` on a static emits a definition). So a process
+/// written in Saw has no way to compute an entry address for a thread it wants
+/// to create, and this is the one entry it can ask for by name. A process that
+/// CAN produce an address — one with a C leaf, which is what the harness's
+/// thread images use — passes it and the kernel checks it against the image's
+/// granted region. See DF-178c.
+public static ENTRY_IMAGE: UInt = 0
 
 // =============================================================================
 // Rights (spec §3)
@@ -135,18 +163,106 @@ static_assert((SystemRight.Debug as UInt32) >= 256,
 static_assert((SystemRight.Shutdown as UInt32) >= 256,
               "kind-specific right Shutdown must start at bit 8 or above")
 
+/// A right on a Process object (§2 table row; design 178 D4).
+///
+/// `Manage` is the universal derive bit and here it means one thing: asking the
+/// process for the CALLING THREAD's handle. That is a derivation in the §3
+/// sense — a handle obtained through a handle already held — and it is how a
+/// thread reaches its own Thread object without the kernel handing out ambient
+/// authority.
+///
+/// `Kill` is deliberately ABSENT. Spec §8 ratifies it as the capability-gated
+/// escape hatch userspace supervision needs against a wedged process — ANOTHER
+/// process. With one process in the system it is `Exit` under a second name,
+/// and an op whose only reachable use is degenerate is an op nothing tests. It
+/// lands with M3's multi-process loading, beside `create_process`.
+public enum ProcessRight: UInt32 {
+    case Transfer = 1,
+    case Manage = 2,
+    case CreateThread = 256,
+    case Exit = 512,
+    case Wait = 1024,
+}
+
+static_assert((ProcessRight.Transfer as UInt32) == 1,
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((ProcessRight.Manage as UInt32) == 2,
+              "universal right Manage must be bit 1 in every kind's enum")
+static_assert((ProcessRight.CreateThread as UInt32) >= 256,
+              "kind-specific right CreateThread must start at bit 8 or above")
+static_assert((ProcessRight.Exit as UInt32) >= 256,
+              "kind-specific right Exit must start at bit 8 or above")
+static_assert((ProcessRight.Wait as UInt32) >= 256,
+              "kind-specific right Wait must start at bit 8 or above")
+
+/// A right on a Thread object (§2 table row; design 178 D4).
+///
+/// The split is between what an OWNER of a thread may do to it — `Start` it,
+/// `Join` it — and what a thread does to ITSELF, which is `Control`: exit, and
+/// yield the processor. Both of the latter check that the caller IS the named
+/// thread, so `Control` on someone else's handle still cannot drive it; the
+/// right is what makes the check worth running rather than the check itself.
+public enum ThreadRight: UInt32 {
+    case Transfer = 1,
+    case Manage = 2,
+    case Start = 256,
+    case Join = 512,
+    case Control = 1024,
+}
+
+static_assert((ThreadRight.Transfer as UInt32) == 1,
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((ThreadRight.Manage as UInt32) == 2,
+              "universal right Manage must be bit 1 in every kind's enum")
+static_assert((ThreadRight.Start as UInt32) >= 256,
+              "kind-specific right Start must start at bit 8 or above")
+static_assert((ThreadRight.Join as UInt32) >= 256,
+              "kind-specific right Join must start at bit 8 or above")
+static_assert((ThreadRight.Control as UInt32) >= 256,
+              "kind-specific right Control must start at bit 8 or above")
+
 /// What the kernel mints for root's System handle at boot (§12).
 ///
 /// A function rather than a `static` because a static initializer takes plain
 /// literals only — and `768` with a comment saying which bits it is made of is
 /// exactly the magic number this file is getting rid of.
 ///
-/// Root gets the two System rights and NOT the universal pair: there is nobody
-/// to transfer a handle to in a one-process world, and nothing to derive it
-/// for. Attenuation is monotonic, so a right withheld here can never appear
-/// later — which is the right default for a set the boot handle hands out.
+/// Root gets the two System rights plus `Manage`, and not `Transfer`: there is
+/// nobody to transfer a handle to in a one-process world. `Manage` is new in
+/// M2 and it is what makes the boot set a SEED rather than the whole of root's
+/// authority — root asks the System object for its own Process handle, and the
+/// Process object for its own Thread handle, so every later object arrives
+/// through a handle already held (§3's derivation rule) instead of through a
+/// register the kernel had to widen.
+///
+/// Attenuation is monotonic, so a right withheld here can never appear later —
+/// which is the right default for a set the boot handle hands out.
 public func root_system_rights() -> UInt32 {
-    (SystemRight.Debug as UInt32) | (SystemRight.Shutdown as UInt32)
+    ((SystemRight.Debug as UInt32) | (SystemRight.Shutdown as UInt32)
+     | (SystemRight.Manage as UInt32))
+}
+
+/// What the kernel mints for root's own Process handle (§12, extended by
+/// design 178 D4).
+///
+/// Everything the Process object can do in M2, because root IS the system: make
+/// threads, hand a thread its own handle, exit, and read its own status.
+public func root_process_rights() -> UInt32 {
+    ((ProcessRight.Manage as UInt32) | (ProcessRight.CreateThread as UInt32)
+     | (ProcessRight.Exit as UInt32) | (ProcessRight.Wait as UInt32))
+}
+
+/// What the kernel mints for a thread's own handle — root's initial thread at
+/// boot, and every thread `Process.CreateThread` makes.
+///
+/// `Manage` is withheld: a Thread object derives nothing, so the bit would name
+/// an authority that does not exist. The three that are here are the whole of
+/// the object's surface, which is deliberate — a thread's creator holds its
+/// handle and so does the thread itself (one handle, §3's no-duplicate rule),
+/// so an attenuated split between the two would need two handles.
+public func thread_rights() -> UInt32 {
+    ((ThreadRight.Start as UInt32) | (ThreadRight.Join as UInt32)
+     | (ThreadRight.Control as UInt32))
 }
 
 // =============================================================================
@@ -168,19 +284,79 @@ public func root_system_rights() -> UInt32 {
 public enum SysOp: UInt {
     case DebugPrint = 0,
     case Shutdown = 1,
+    case SelfProcess = 2,
+}
+
+// =============================================================================
+// The Process object's op table (spec §2, §7, §8; design 178 D4)
+// =============================================================================
+
+/// A METHOD ID on the Process object. Numbered from zero in its OWN table —
+/// `CreateThread` is 0 here and `DebugPrint` is 0 on System, and the pair
+/// (handle, op) is what tells them apart.
+///
+/// `CreateThread` lives here rather than on Thread because there is no Thread
+/// to name yet, and because spec §7 puts the band map on the Process object:
+/// thread creation is where a band is resolved against it, which makes the
+/// Process the enforcement point. (M2 resolves nothing — D3 keeps the map a
+/// loader artifact — but the op is already in the place that will.)
+///
+/// Absent, with reasons: `Kill` (see `ProcessRight`), and `CreateProcess`,
+/// which needs an image to load and a second address space to load it into —
+/// both M3, per design 178's option A.
+public enum ProcOp: UInt {
+    case CreateThread = 0,
+    case SelfThread = 1,
+    case Exit = 2,
+    case GetStatus = 3,
+}
+
+// =============================================================================
+// The Thread object's op table (spec §2, §8; design 178 D4)
+// =============================================================================
+
+/// A METHOD ID on the Thread object.
+///
+/// `Join` is here because design 178's D4 puts it here (ratified Aug 15), which
+/// REVISES spec §8's "no join syscall" (ratified Aug 3). The §8 reasoning was
+/// that threads are pool workers and work completion is a task-level concept;
+/// D4 keeps the object honest instead — a thread you can create and start is a
+/// thread whose completion you must be able to observe, and §8 already conceded
+/// the observation is needed (it proposed thread handles as WAITABLES). Join is
+/// the same observation without a Waiter, which is the next unit's object. When
+/// Waiter lands, `Join` becomes the one-thread shorthand for parking on it.
+public enum ThreadOp: UInt {
+    case Start = 0,
+    case Join = 1,
+    case Exit = 2,
+    case Yield = 3,
 }
 
 // =============================================================================
 // Status words (spec §5.7)
 // =============================================================================
 
-/// The status a syscall returns in a0.
+/// The status a syscall returns in the status register.
 ///
-/// A failing op RETURNS one of these and the process keeps running — a caller's
-/// mistake is an error, not a fault. These tags ARE part of the contract in a
-/// way the op numbers are not, because a process branches on them, so the
-/// backing is FIXED-WIDTH (design 47: a value that crosses an ABI pins its
-/// width) even though the register carrying it is wider.
+/// **A STATUS IS FOR WHAT THE CALLER COULD NOT HAVE KNOWN** (ratified Aug 8,
+/// carried into design 178's ruling Aug 15). A caller error the process could
+/// have checked — an invalid handle, an op the object does not have, a right it
+/// was not given, driving a thread that is not itself — TERMINATES the process
+/// and is not in this enum at all. It is a `FaultReason` below. What is left
+/// here is the class a correct process can still meet: resource exhaustion, and
+/// (when there are peers to die, which is M3) peer death.
+///
+/// That cut is why `BadHandle`, `BadOp` and `AccessDenied` are GONE from this
+/// enum rather than merely unused. They moved to `FaultReason` keeping their
+/// numbers, so the tags read the same in a kernel report and cannot be confused
+/// with a status a process might branch on. Values 1-3 are left as a gap here
+/// for exactly that reason: reusing them would make an old build's `BadHandle`
+/// and a new build's status collide on the wire.
+///
+/// These tags ARE part of the contract in a way the op numbers are not, because
+/// a process branches on them, so the backing is FIXED-WIDTH (design 47: a
+/// value that crosses an ABI pins its width) even though the register carrying
+/// it is wider.
 ///
 /// A STATUS, NOT AN ERROR (ratified Aug 7): the type is named for what it is —
 /// an enum with an `Ok` case describes how a call went, and only some of those
@@ -201,9 +377,7 @@ public enum SysOp: UInt {
 /// skew that static linking makes impossible today and a mapped vDSO will not.
 public enum SosStatus: UInt8 {
     case Ok = 0,
-    case BadHandle = 1,
-    case BadOp = 2,
-    case AccessDenied = 3,
+    case NoResource = 4,
     case Unknown = 255,
 }
 
@@ -212,9 +386,7 @@ public extension SosStatus {
     public func describe(&self) -> String {
         match self {
             case Ok -> "ok",
-            case BadHandle -> "bad handle",
-            case BadOp -> "bad op",
-            case AccessDenied -> "access denied",
+            case NoResource -> "out of kernel objects",
             case Unknown -> "unknown status",
         }
     }
@@ -236,6 +408,81 @@ public extension SosStatus: Printable {
 }
 
 public extension SosStatus: Error {}
+
+// =============================================================================
+// Fault reasons (design 178's faults ruling, ratified Aug 15)
+// =============================================================================
+
+/// Why the kernel TERMINATED a process.
+///
+/// The other half of the cut `SosStatus` describes: these are the caller errors
+/// a process could have checked, and meeting one ends the process rather than
+/// returning it a word to branch on. It is the same line the language draws at
+/// an indexed accessor — an out-of-range index panics, it does not hand back a
+/// flag — and it cuts userspace error handling down to the failures that are
+/// real.
+///
+/// A process never RECEIVES one of these: it is dead by the time the tag
+/// exists. It reaches a human through the kernel's report, and the harness
+/// asserts on that line. The first three keep the numbers they had as statuses
+/// so a reader of an old transcript and a new one sees the same tag for the
+/// same mistake.
+///
+/// `UInt8` because it is a kernel-internal tag that crosses no register.
+public enum FaultReason: UInt8 {
+    case BadHandle = 1,
+    case BadOp = 2,
+    case AccessDenied = 3,
+    case NotSelf = 4,
+    case BadState = 5,
+    case BadEntry = 6,
+    case Deadlock = 7,
+}
+
+public extension FaultReason {
+    /// The short tag the kernel's termination line carries.
+    public func describe(&self) -> String {
+        match self {
+            case BadHandle -> "bad handle",
+            case BadOp -> "bad op",
+            case AccessDenied -> "access denied",
+            case NotSelf -> "not the calling thread",
+            case BadState -> "thread in the wrong state",
+            case BadEntry -> "thread entry outside the process",
+            case Deadlock -> "every thread blocked",
+        }
+    }
+}
+
+// =============================================================================
+// Process status (spec §8)
+// =============================================================================
+
+/// How a process ended, or that it has not. Spec §8: ONE fixed-width status
+/// word, KIND in the high bits and a code in the low bits, so a supervisor
+/// reads both out of one register.
+///
+/// `Killed` is declared and unreachable in M2 for the reason `ProcessRight`
+/// gives: there is no second process to be killed by. It is here because the
+/// word's ENCODING is what a supervisor parses, and a kind added later would
+/// renumber nothing but would still be a wire change.
+public enum ProcStatusKind: UInt8 {
+    case Running = 0,
+    case Exited = 1,
+    case Faulted = 2,
+    case Killed = 3,
+}
+
+/// Where the kind sits in the status word. The low half is the code — an exit
+/// status, or a `FaultReason` — so both fit a 32-bit reader on either profile.
+public static PROC_STATUS_KIND_SHIFT: Int = 16
+public static PROC_STATUS_CODE_MASK: UInt = 0xFFFF
+
+/// Assemble the §8 status word.
+public func proc_status_word(kind: ProcStatusKind, code: UInt) -> UInt {
+    ((((kind as UInt8) as UInt) << PROC_STATUS_KIND_SHIFT)
+     | (code & PROC_STATUS_CODE_MASK))
+}
 
 // =============================================================================
 // The boot handle set (spec §12)

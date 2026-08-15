@@ -35,12 +35,11 @@
  */
 
     .equ FRAME_SIZE,  272
-    /* D,A,F masked, I NOT: interrupts are enabled at the user-mode return and
-     * nowhere else (design 178 D2). The kernel's own level masks them on every
-     * exception entry in hardware, so a syscall runs with interrupts off and
-     * the `eret` below restores the user state that had them on. M[3:0] = 0
-     * selects EL0t. */
-    .equ SPSR_EL0T,   0x340
+    /* The saved processor state a user context resumes in is NOT here any more:
+     * it is a word of the frame, written by `frame_init` in lib.saw, because a
+     * thread carries the state it resumes in (design 178 M2 unit 2). D,A,F
+     * masked and I NOT is still the value — interrupts are enabled at the
+     * user-mode return and nowhere else (D2). */
     .equ CPACR_FPEN,  (3 << 20)
     /* The high half of the cause the interrupt entry calls `ktrap` with. The
      * syndrome register is 32 bits, so this value cannot be one; `lib.saw`'s
@@ -119,7 +118,14 @@ _vectors:
 /* A syscall and an interrupt save and restore the SAME frame and differ only in
  * what the kernel is called with, so the save is a macro used twice and the
  * restore is shared code both fall into — a second copy of thirty stores is
- * how the two paths would drift. */
+ * how the two paths would drift.
+ *
+ * DESIGN 178 M2 UNIT 2 — THE FRAME IS A THREAD'S CONTEXT. `SP_EL1` between
+ * traps points at the TOP of the running thread's frame, wherever the kernel
+ * put it, so the `sub` below lands exactly on that frame. The kernel's own
+ * stack is a different reservation and the macro switches to it once the frame
+ * is written, because everything after that point is Saw and needs a stack the
+ * frame is not sitting on. */
     .macro save_user_frame
     sub     sp, sp, #FRAME_SIZE
     stp     x0,  x1,  [sp, #(3*8)]
@@ -144,6 +150,12 @@ _vectors:
     mrs     x2, sp_el0
     stp     x0, x1, [sp, #0]
     str     x2,     [sp, #16]
+
+    /* Park the frame address in x3 and move SP_EL1 to the KERNEL stack: the
+     * frame is a thread's storage, not a stack, and `ktrap` needs one. */
+    mov     x3, sp
+    ldr     x4, =_stack_top
+    mov     sp, x4
     .endm
 
     .section .text.trap, "ax", @progbits
@@ -151,8 +163,9 @@ _vectors:
 user_trap_entry:
     save_user_frame
 
-    /* ktrap(frame, cause, tval): the cause is ESR, the address is FAR. */
-    mov     x0, sp
+    /* ktrap(frame, cause, tval): the cause is ESR, the address is FAR. It
+     * RETURNS the frame to resume in x0 — this one, or another thread's. */
+    mov     x0, x3
     mrs     x1, esr_el1
     mrs     x2, far_el1
     bl      ktrap
@@ -171,16 +184,22 @@ user_trap_entry:
 user_irq_entry:
     save_user_frame
 
-    mov     x0, sp
+    mov     x0, x3
     movz    x1, #IRQ_CAUSE_HI, lsl #32
     mov     x2, xzr
     bl      ktrap
 
-    /* Resume whatever context the frame now describes. A returning syscall has
-     * had its (status, value) pair written into the x0/x1 slots; ELR already
-     * points past the `svc`, so nothing here advances it — and an interrupted
-     * instruction has not run at all, so nothing may. */
+    /* Resume the context x0 names. A returning syscall has had its (status,
+     * value) pair written into that frame's x0/x1 slots; ELR already points
+     * past the `svc`, so nothing here advances it — and an interrupted
+     * instruction has not run at all, so nothing may.
+     *
+     * THE FRAME NEED NOT BE THE ONE WE CAME IN ON. `ktrap` returns whichever
+     * thread is to run, so pointing SP_EL1 at it here is the whole of the
+     * context switch — and the `add` at the bottom leaves SP_EL1 at that
+     * frame's top, which is where the next trap's `sub` expects to land. */
 .Luser_return:
+    mov     sp, x0
     ldp     x0, x1, [sp, #0]
     msr     elr_el1, x0
     msr     spsr_el1, x1
@@ -224,59 +243,19 @@ kernel_fault_entry:
 
 /* ---- EL1 -> EL0 ---------------------------------------------------------- */
 
-/* void sos_enter_user(u64 entry, u64 stack_top, u64 boot_handle) — never
- * returns.
+/* void sos_resume_frame(u64 frame_addr) — never returns.
  *
- * Points ELR at the user entry, gives EL0 its own stack through SP_EL0, selects
- * EL0t as the `eret` target with interrupts masked (M1 has no interrupt
- * sources), and hands the user a zeroed register file so nothing of the
- * kernel's leaks across the privilege boundary.
- *
- * The one register that is NOT zeroed is x0, which carries the boot handle set
- * (spec §12). In M1 that is a single handle — root's System handle — so it fits
- * in a register; when the set grows it becomes a structure the kernel places in
- * root's memory and x0 points at. Either way this is the handoff: root's entry
- * takes it as its first C-ABI argument, so a Saw `_start(boot_handle: UInt)`
- * just receives it. */
+ * Enter user mode in the context `frame_addr` holds. This is the FIRST entry
+ * only: every entry after it is `ktrap` returning a frame to the path above,
+ * which is why this is one branch INTO that path rather than a second copy of
+ * it. It replaced `sos_enter_user`, which built a user context by zeroing
+ * thirty registers in assembly and setting three system registers — the same
+ * context is now built by `frame_init` in Saw, SPSR included, and the restore
+ * path loads all of it. */
     .section .text.enter, "ax", @progbits
-    .globl sos_enter_user
-sos_enter_user:
-    msr     elr_el1, x0
-    msr     sp_el0, x1
-    mov     x3, #SPSR_EL0T
-    msr     spsr_el1, x3
-    mov     x0, x2
-    mov     x1, xzr
-    mov     x2, xzr
-    mov     x3, xzr
-    mov     x4, xzr
-    mov     x5, xzr
-    mov     x6, xzr
-    mov     x7, xzr
-    mov     x8, xzr
-    mov     x9, xzr
-    mov     x10, xzr
-    mov     x11, xzr
-    mov     x12, xzr
-    mov     x13, xzr
-    mov     x14, xzr
-    mov     x15, xzr
-    mov     x16, xzr
-    mov     x17, xzr
-    mov     x18, xzr
-    mov     x19, xzr
-    mov     x20, xzr
-    mov     x21, xzr
-    mov     x22, xzr
-    mov     x23, xzr
-    mov     x24, xzr
-    mov     x25, xzr
-    mov     x26, xzr
-    mov     x27, xzr
-    mov     x28, xzr
-    mov     x29, xzr
-    mov     x30, xzr
-    eret
+    .globl sos_resume_frame
+sos_resume_frame:
+    b       .Luser_return
 
 /* ---- reservations -------------------------------------------------------- */
 

@@ -32,8 +32,12 @@ import sosrt.{ascii_byte, hex_digit_of, hex_digits_per_word}
 // The call numbers. Kernel-internal and shared with the `sos` module the kernel
 // exports (sos/kernel/sysapi/) — one definition, two halves of one contract.
 import sosabi.{
-    ObjType, SystemHandle, SystemRight, SysOp, SosStatus,
-    root_system_rights, ROOT_SYSTEM_HANDLE,
+    ObjType, SystemHandle, ProcessHandle, ThreadHandle,
+    SystemRight, ProcessRight, ThreadRight,
+    SysOp, ProcOp, ThreadOp,
+    SosStatus, FaultReason, ProcStatusKind, proc_status_word,
+    root_system_rights, root_process_rights, thread_rights,
+    ROOT_SYSTEM_HANDLE, NO_HANDLE, ENTRY_IMAGE,
 }
 
 // =============================================================================
@@ -104,9 +108,9 @@ public func console() -> Console {
 // the per-arch table); dispatch is §3's shape verbatim: handle-table lookup ->
 // object type -> op table -> rights check -> op.
 //
-// M1 implements one object, the System singleton, so the table is one entry
-// wide. That is deliberately not the interesting part: the SHAPE is, because
-// it is what every later object plugs into unchanged.
+// M2 (design 178 D4) makes the table three kinds wide: the System singleton
+// the milestone before it had, plus Process and Thread. The SHAPE did not have
+// to change to take them, which was the claim M1 made about it.
 //
 // The NUMBERS are not here. They are `sosabi`, imported at the top of this
 // file, and the `sos` module the kernel exports to userspace imports the same
@@ -114,16 +118,22 @@ public func console() -> Console {
 // A syscall-number skew would not be a compile error anywhere; it would be a
 // working call that did the wrong thing.
 
-/// One handle-table entry: the object a handle names and the rights its holder
-/// has on it (§3). The kernel validates both on every op.
+/// One handle-table entry: the object a handle names, the rights its holder has
+/// on it (§3), and WHICH object of that kind it is. The kernel validates all
+/// three on every op.
 ///
 /// `obj_type` is the typed tag; `rights` stays a plain `UInt32` because it is a
 /// MASK — a set of bits, not one of the cases of any kind's rights enum. It is
 /// deliberately NOT interpretable on its own: which enum's bits these are is
 /// decided by `obj_type`, and the pairing happens below.
+///
+/// `target` is the object's slot in its kind's table. It was not needed while
+/// the only object was a singleton; with Threads it is the whole point of the
+/// entry, because "which thread" is exactly what a handle answers.
 struct HandleEntry {
     obj_type: ObjType,
     rights: UInt32,
+    target: Int,
 }
 
 /// A System handle the dispatch has VALIDATED (§3).
@@ -132,17 +142,10 @@ struct HandleEntry {
 /// what makes the rights check typed rather than cosmetic. The only way to get
 /// one is through `dispatch`, after the table resolved the handle to a System
 /// object — so the type carries the claim "validated as System", and
-/// `allows` can accept a `SystemRight` and nothing else. When Channel arrives it
-/// gets `ChannelObject` with a `ChannelRight`-taking `allows` beside this one;
-/// testing one kind's right against the other's object is then a compile error,
-/// not a bit comparison that quietly returns an answer.
-///
-/// No M1 op READS `handle` yet — there is one System object, so no op has to ask
-/// which one it was handed. It is carried because this is the site §3 names as
-/// the crossing from a raw word into a typed handle, and an op that needs the
-/// identity (a close, a transfer, anything with more than one object of a kind)
-/// finds it already here rather than reaching back to the register. It costs
-/// nothing: the struct never materializes.
+/// `allows` can accept a `SystemRight` and nothing else. `ProcessObject` and
+/// `ThreadObject` below are the same construction with their own rights enums,
+/// so testing one kind's right against another's object is a compile error, not
+/// a bit comparison that quietly returns an answer.
 struct SystemObject {
     handle: SystemHandle,
     rights: UInt32,
@@ -159,20 +162,50 @@ extension SystemObject {
     }
 }
 
+/// A Process handle the dispatch has VALIDATED, paired with its rights and the
+/// process slot it names.
+struct ProcessObject {
+    handle: ProcessHandle,
+    rights: UInt32,
+    slot: Int,
+}
+
+extension ProcessObject {
+    func allows(&self, right: ProcessRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
+    }
+}
+
+/// A Thread handle the dispatch has VALIDATED, paired with its rights and the
+/// thread slot it names.
+struct ThreadObject {
+    handle: ThreadHandle,
+    rights: UInt32,
+    slot: Int,
+}
+
+extension ThreadObject {
+    func allows(&self, right: ThreadRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
+    }
+}
+
 /// Exit codes the kernel reports through the platform's failure channel,
 /// distinct from any status root chooses for itself.
 ///
-/// A type rather than three `UInt`s so `fatal` cannot be handed an arbitrary
-/// number: the kernel's own failure vocabulary is closed, and the harness
-/// asserts on these values.
+/// A type rather than a family of `UInt`s so `fatal` cannot be handed an
+/// arbitrary number: the kernel's own failure vocabulary is closed, and the
+/// harness asserts on these values.
 /// 3 is deliberately absent. It was `BadSyscall`, from when a bad op number
-/// killed the process; under the object-op model a caller's mistake is a STATUS
-/// the process receives and survives (`SosStatus.BadOp`), so nothing could raise
-/// it any more. A future case may take 3 — the values are per-case, so a gap
-/// costs nothing and a dead name would have cost a reader a search.
+/// killed the process; under the object-op model a caller's mistake became a
+/// status the process received and survived — and design 178's faults ruling
+/// has since made it a kill again, under `ProcessFault`. The values are
+/// per-case, so a gap costs nothing and a reused number would have made two
+/// eras' transcripts read alike.
 public enum ExitCode: UInt {
     case UmodeFault = 2,
     case BadImage = 4,
+    case ProcessFault = 5,
 }
 
 // =============================================================================
@@ -187,6 +220,524 @@ public func align_up(v: UInt, align: UInt) -> UInt {
     } else {
         v + (align - rem)
     }
+}
+
+// =============================================================================
+// Processes, threads and the scheduler (design 178 D2/D3/D4; spec §2, §7, §8)
+// =============================================================================
+//
+// THE TRAP FRAME IS THE THREAD CONTEXT, and that one decision is most of this
+// unit. A thread's saved registers are the frame the HAL's trap entry writes on
+// the way in and reads on the way out; a thread SWITCH is therefore not a
+// separate save/restore at all — it is `ktrap` returning a DIFFERENT frame
+// address than it was called with. Entering user mode for the first time is the
+// same operation with a frame nothing has run in yet. Two seam calls carry the
+// whole of it: `hal.frame_init` builds a fresh context, `hal.resume_frame`
+// enters one, and the trap entry's ordinary return path does every switch after
+// that.
+//
+// WHERE A SWITCH CAN HAPPEN is design 178's D2, and the frame model is what
+// makes it free: the only place a frame address is chosen is the user-return
+// boundary, because that is the only place `ktrap` returns. The kernel is never
+// preempted, holds no lock, and has no half-saved context to protect — the
+// state a switch reads is a table, and the tick that motivates one only sets a
+// flag.
+//
+// THE PROTECTION-DOMAIN RELOAD IS NOT HERE, and its absence is deliberate
+// rather than forgotten (design 178 D4 + the M3 memory notes). Threads of one
+// process share one domain, so a same-process switch reloads nothing; the
+// reload belongs at exactly one point — `pick_next` below, where the outgoing
+// and incoming threads' PROCESSES are both in hand — and M3's per-process
+// region sets install it there and nowhere else. Whether that reload is a
+// register file or a table root is the HAL's business, which is why this
+// paragraph can say it without naming either.
+
+/// Processes the kernel can hold. ONE in M2: the kernel loads exactly one image
+/// ever (§12) and every later process is loaded BY root, which needs the
+/// MemoryObject/Mapping objects M3 brings. The table is indexed rather than
+/// assumed throughout so that raising this number is the only edit.
+static MAX_PROCESSES: Int = 1
+
+/// Threads the kernel can hold, across all processes.
+static MAX_THREADS: Int = 8
+
+/// Handles one process's table can hold (§3).
+static MAX_HANDLES: Int = 16
+
+/// Bytes reserved per thread for its saved context.
+///
+/// A STRIDE, not a size: the frame layout is the HAL's and differs per profile
+/// (32 words on one, 34 doublewords on the other), so the kernel reserves a
+/// generous power-of-two slot and asserts the machine's real frame fits. The
+/// stride is also the ALIGNMENT the arena is rounded to, which is how a frame
+/// gets the 16-byte alignment one profile's stack pointer requires without the
+/// kernel having to know that is why.
+static THREAD_FRAME_STRIDE: Int = 512
+
+static_assert(hal.FRAME_BYTES <= THREAD_FRAME_STRIDE,
+              "this machine's trap frame does not fit the kernel's per-thread stride")
+static_assert(THREAD_FRAME_STRIDE % 16 == 0,
+              "a frame slot must be 16-byte aligned on every profile")
+
+/// One extra stride of slack, so rounding the arena's base up to the stride
+/// cannot run the last slot past the end.
+static FRAME_ARENA_WORDS: Int = (THREAD_FRAME_STRIDE / 8) * (MAX_THREADS + 1)
+
+/// Every thread's saved context, back to back.
+///
+/// All-zero, so it costs no image bytes (design 149) — and a zeroed frame is
+/// also the right initial state, since `frame_init` only has to write the three
+/// or four words that are not zero.
+unsafe static var THREAD_FRAMES: [UInt64; FRAME_ARENA_WORDS] = [0u64; FRAME_ARENA_WORDS]
+
+/// The address of thread slot `index`'s frame.
+func frame_slot(index: Int) unsafe -> UInt {
+    let stride = THREAD_FRAME_STRIDE as UInt
+    let base = align_up(((&var THREAD_FRAMES) as UnsafePointer<UInt64>) as UInt, stride)
+    base + (index as UInt) * stride
+}
+
+/// What a thread slot is doing (spec §8).
+///
+/// `Exited` is a state a slot STAYS IN rather than a transition to `Free`,
+/// because a join arriving after the exit must still find the exit code. The
+/// slot returns to the pool at process teardown; reaping it earlier needs a
+/// handle-close op, which M2 does not have — and without close, no slot is ever
+/// reused, which is also why handles carry no generation yet (§3's
+/// stale-handle detection has nothing to detect until a slot can be reused).
+enum ThreadState: UInt8 {
+    case Free = 0,
+    case Created = 1,
+    case Runnable = 2,
+    case Running = 3,
+    case Blocked = 4,
+    case Exited = 5,
+}
+
+/// One thread (spec §2 table row).
+///
+/// `link` is the ONE list pointer a thread needs, because a thread is on at
+/// most one list at a time: the ready queue when it is runnable, or the joiner
+/// list of the thread it is waiting for when it is blocked. Slot indices are
+/// stored PLUS ONE so that zero means "no thread", which is what a zeroed
+/// static already says.
+struct ThreadSlot {
+    state: ThreadState,
+    process: Int,
+    /// This thread's own handle in its process's table — what `SelfThread`
+    /// hands back, kept here so the derivation is a read rather than a search.
+    self_handle: UInt,
+    exit_code: UInt,
+    /// Head of the list of threads blocked joining THIS one (slot + 1).
+    joiners: Int,
+    /// Next slot on whichever list this thread is on (slot + 1).
+    link: Int,
+}
+
+/// What a process slot is doing.
+enum ProcState: UInt8 {
+    case Free = 0,
+    case Running = 1,
+    case Gone = 2,
+}
+
+/// One process (spec §2 table row): its protection domain, its handle table and
+/// its threads.
+///
+/// The handle table is not a field: it is a slice of `HANDLES` below, indexed
+/// by this slot. That is the same arrangement as the frames and for the same
+/// reason — a fixed-size array of fixed-size arrays is a shape the kernel has
+/// no allocator for.
+///
+/// `region_base`/`region_top` ARE the address-space domain in M2: one granted
+/// range per process, installed by the loader through the HAL's protection
+/// primitive. Real Mapping objects are M3; what this pair does today is answer
+/// the one question thread creation has to ask — is this entry, is this stack,
+/// inside the process at all.
+struct ProcSlot {
+    state: ProcState,
+    /// This process's own handle in its own table (what `SelfProcess` returns).
+    self_handle: UInt,
+    /// The image entry, which is what `ENTRY_IMAGE` resolves to.
+    entry: UInt,
+    region_base: UInt,
+    region_top: UInt,
+    exit_kind: ProcStatusKind,
+    exit_code: UInt,
+}
+
+unsafe static var THREADS: [ThreadSlot; MAX_THREADS] = [
+    ThreadSlot(state: ThreadState.Free, process: 0, self_handle: 0,
+               exit_code: 0, joiners: 0, link: 0); MAX_THREADS]
+
+unsafe static var PROCESSES: [ProcSlot; MAX_PROCESSES] = [
+    ProcSlot(state: ProcState.Free, self_handle: 0, entry: 0,
+             region_base: 0, region_top: 0,
+             exit_kind: ProcStatusKind.Running, exit_code: 0); MAX_PROCESSES]
+
+/// Every process's handle table, back to back: process `p`'s handle `h`
+/// (1-based, §3's "handle 0 names nothing") lives at `p * MAX_HANDLES + h - 1`.
+unsafe static var HANDLES: [HandleEntry; MAX_PROCESSES * MAX_HANDLES] = [
+    HandleEntry(obj_type: ObjType.Unbound, rights: 0, target: 0);
+    MAX_PROCESSES * MAX_HANDLES]
+
+/// "No thread". Slot indices are ordinary 0-based `Int`s in the tables and
+/// PLUS-ONE inside list links; this is the sentinel for the plain form.
+static NO_THREAD: Int = -1
+
+/// The running thread's slot, or `NO_THREAD`.
+///
+/// It really is none before the first process exists, and it stays none for the
+/// harness kernels that enter user mode without one — those cases predate
+/// Thread objects and must go on working, which is what every `NO_THREAD` guard
+/// below is for. Compound global state on design 149's terms: uniprocessor
+/// kernel, interrupts taken from user mode only (D2), so the only writer is the
+/// trap path and nothing can interleave with it.
+unsafe static var CURRENT_THREAD: Int = NO_THREAD
+
+/// The ready queue: a FIFO of runnable threads, head and tail as slot + 1.
+/// The RUNNING thread is not on it — round-robin is "put the outgoing thread
+/// at the tail, take the head", and both halves happen in `pick_next`.
+unsafe static var READY_HEAD: Int = 0
+unsafe static var READY_TAIL: Int = 0
+
+/// Set by the tick when a thread's slice runs out, and by `Yield`. Read and
+/// cleared at the user-return boundary, which is the only place it can act.
+unsafe static var NEED_RESCHED: Bool = false
+
+/// Ticks left in the running thread's slice.
+unsafe static var SLICE_LEFT: UInt = 0
+
+/// Ticks a thread runs before the timer takes the processor away (spec §7's
+/// fixed timeslice). ONE tick, because M2's tick period is already the unit the
+/// scheduler cares about and a longer slice would only make the preemption
+/// harness wait for it.
+static SLICE_TICKS: UInt = 1
+
+// -----------------------------------------------------------------------------
+// The handle table (spec §3)
+// -----------------------------------------------------------------------------
+
+/// Where process `p`'s handle `h` sits in the flat table. Callers have already
+/// range-checked `h`.
+func handle_index(p: Int, h: UInt) unsafe -> Int {
+    p * MAX_HANDLES + (h as Int) - 1
+}
+
+/// Resolve a handle in a process's table.
+///
+/// An out-of-range or unbound handle resolves to `ObjType.Unbound`, and the
+/// rights travel WITH the entry rather than being assumed by the op — the two
+/// properties the M1 version already had, now over a real table.
+func lookup_handle(p: Int, h: UInt) unsafe -> HandleEntry {
+    if h == NO_HANDLE || h > (MAX_HANDLES as UInt) {
+        return HandleEntry(obj_type: ObjType.Unbound, rights: 0, target: 0)
+    }
+    HANDLES[handle_index(p, h)]
+}
+
+/// Mint a handle naming `target` of kind `kind` with `rights`, in process `p`'s
+/// table. Returns `NO_HANDLE` when the table is full — an exhaustion the caller
+/// could not have known about, which is what a status is for.
+func mint_handle(p: Int, kind: ObjType, rights: UInt32, target: Int) unsafe -> UInt {
+    var h: Int = 0
+    while h < MAX_HANDLES {
+        let entry = HANDLES[p * MAX_HANDLES + h]
+        match entry.obj_type {
+            case Unbound -> {
+                HANDLES[p * MAX_HANDLES + h] = HandleEntry(obj_type: kind,
+                                                           rights: rights,
+                                                           target: target)
+                return (h as UInt) + 1
+            },
+            case _ -> {},
+        }
+        h = h + 1
+    }
+    NO_HANDLE
+}
+
+// -----------------------------------------------------------------------------
+// The ready queue
+// -----------------------------------------------------------------------------
+
+func ready_push(slot: Int) unsafe {
+    THREADS[slot].link = 0
+    if READY_TAIL == 0 {
+        READY_HEAD = slot + 1
+        READY_TAIL = slot + 1
+    } else {
+        THREADS[READY_TAIL - 1].link = slot + 1
+        READY_TAIL = slot + 1
+    }
+}
+
+func ready_pop() unsafe -> Int {
+    if READY_HEAD == 0 {
+        return NO_THREAD
+    }
+    let slot = READY_HEAD - 1
+    READY_HEAD = THREADS[slot].link
+    if READY_HEAD == 0 {
+        READY_TAIL = 0
+    }
+    THREADS[slot].link = 0
+    slot
+}
+
+// -----------------------------------------------------------------------------
+// Allocation
+// -----------------------------------------------------------------------------
+
+/// Take a free thread slot, or `NO_THREAD` when the slab is empty.
+func alloc_thread() unsafe -> Int {
+    var i: Int = 0
+    while i < MAX_THREADS {
+        match THREADS[i].state {
+            case Free -> { return i },
+            case _ -> {},
+        }
+        i = i + 1
+    }
+    NO_THREAD
+}
+
+// -----------------------------------------------------------------------------
+// The scheduler (design 178 D3)
+// -----------------------------------------------------------------------------
+
+/// Whether the currently running thread should be left running.
+func stays_running(slot: Int) unsafe -> Bool {
+    match THREADS[slot].state {
+        case Running -> not NEED_RESCHED,
+        case _ -> false,
+    }
+}
+
+/// Choose the thread to run next and return the frame to resume in.
+///
+/// THE ONE SWITCH POINT. `ktrap` returns whatever this returns, and the HAL's
+/// trap entry resumes that frame — so every context switch in the system is
+/// this function picking a different slot, and there is no second path to keep
+/// in step. A kernel with no Thread objects at all (the harness cases that
+/// predate this unit) never has a current thread and gets its own frame back
+/// untouched.
+///
+/// M3's per-process protection reload goes HERE, between the outgoing thread
+/// and the incoming one, and nowhere else: this is the only place both are
+/// known. A same-process switch — every switch M2 can make — reloads nothing,
+/// which is why the point is marked rather than occupied.
+func pick_next(current_frame: UInt) unsafe -> UInt {
+    let cur = CURRENT_THREAD
+    if cur == NO_THREAD {
+        return current_frame
+    }
+    if stays_running(cur) {
+        return current_frame
+    }
+
+    // A thread leaving the processor while still runnable goes to the TAIL,
+    // which is the whole of round-robin. One that blocked or exited is already
+    // on the list it belongs to, or on none.
+    match THREADS[cur].state {
+        case Running -> {
+            THREADS[cur].state = ThreadState.Runnable
+            ready_push(cur)
+        },
+        case _ -> {},
+    }
+    NEED_RESCHED = false
+
+    let next = ready_pop()
+    if next == NO_THREAD {
+        // Nothing runnable and the process has not ended: every thread is
+        // blocked on something no thread can now deliver. In M2 that is a
+        // genuine deadlock — the only wake sources are other threads of this
+        // process, since Event and Interrupt objects are the next unit. When
+        // there ARE external wake sources this becomes the idle path, a
+        // per-profile wait-for-interrupt loop (spec §7).
+        fault_process(THREADS[cur].process, FaultReason.Deadlock)
+    }
+
+    CURRENT_THREAD = next
+    THREADS[next].state = ThreadState.Running
+    SLICE_LEFT = SLICE_TICKS
+    frame_slot(next)
+}
+
+// -----------------------------------------------------------------------------
+// Thread lifecycle
+// -----------------------------------------------------------------------------
+
+/// How many of a process's threads have not exited.
+func live_threads(p: Int) unsafe -> Int {
+    var live: Int = 0
+    var i: Int = 0
+    while i < MAX_THREADS {
+        if THREADS[i].process == p {
+            match THREADS[i].state {
+                case Free -> {},
+                case Exited -> {},
+                case _ -> { live = live + 1 },
+            }
+        }
+        i = i + 1
+    }
+    live
+}
+
+/// Retire the running thread with `code`, waking everything that joined it.
+///
+/// A JOINER'S RETURN IS WRITTEN HERE, into ITS frame, which is the half of the
+/// blocking protocol that is easy to get wrong: a thread that blocks in a
+/// syscall must not have its result written when it blocks, or the resume would
+/// step over the trapping instruction twice on one profile and hand back a
+/// value nobody computed on both. So `Join` writes nothing, and the wake writes
+/// the pair exactly once.
+func exit_thread(slot: Int, code: UInt) unsafe {
+    THREADS[slot].state = ThreadState.Exited
+    THREADS[slot].exit_code = code
+
+    var j = THREADS[slot].joiners
+    THREADS[slot].joiners = 0
+    while j != 0 {
+        let waiter = j - 1
+        j = THREADS[waiter].link
+        hal.syscall_return(frame_slot(waiter), (SosStatus.Ok as UInt8) as UInt, code)
+        THREADS[waiter].state = ThreadState.Runnable
+        ready_push(waiter)
+    }
+
+    // The last thread out ends the process, carrying its own exit code — the
+    // ordinary way a program finishes when nobody called `Process.Exit`.
+    let p = THREADS[slot].process
+    if live_threads(p) == 0 {
+        end_process(p, ProcStatusKind.Exited, code, code)
+    }
+    NEED_RESCHED = true
+}
+
+/// Park the running thread on `target`'s joiner list.
+func block_on_join(slot: Int, target: Int) unsafe {
+    THREADS[slot].state = ThreadState.Blocked
+    THREADS[slot].link = THREADS[target].joiners
+    THREADS[target].joiners = slot + 1
+    NEED_RESCHED = true
+}
+
+// -----------------------------------------------------------------------------
+// Process teardown (spec §2's Process row: close all handles, free what it owns)
+// -----------------------------------------------------------------------------
+
+/// End process `p` and stop the machine with `machine_status`. Never returns.
+///
+/// The teardown is the ratified one and it is unconditional: every handle in
+/// the process's table is closed, every thread slot and every frame it owns
+/// goes back to the kernel's pools, and only then does the machine stop. With
+/// one process that last step is the run ending; with M3's several it becomes a
+/// return to the scheduler, and nothing above this line changes.
+///
+/// `machine_status` is separate from `code` because they answer different
+/// questions: `code` is what a supervisor would read out of the §8 status word,
+/// and `machine_status` is what the EMULATOR exits with — which for a fault is
+/// the kernel's own vocabulary rather than anything the process chose.
+func end_process(p: Int, kind: ProcStatusKind, code: UInt,
+                 machine_status: UInt) unsafe -> Never {
+    PROCESSES[p].state = ProcState.Gone
+    PROCESSES[p].exit_kind = kind
+    PROCESSES[p].exit_code = code
+
+    var closed: UInt = 0
+    var h: Int = 0
+    while h < MAX_HANDLES {
+        match HANDLES[p * MAX_HANDLES + h].obj_type {
+            case Unbound -> {},
+            case _ -> {
+                HANDLES[p * MAX_HANDLES + h] = HandleEntry(obj_type: ObjType.Unbound,
+                                                           rights: 0, target: 0)
+                closed = closed + 1
+            },
+        }
+        h = h + 1
+    }
+
+    var freed: UInt = 0
+    var t: Int = 0
+    while t < MAX_THREADS {
+        if THREADS[t].process == p {
+            match THREADS[t].state {
+                case Free -> {},
+                case _ -> {
+                    THREADS[t] = ThreadSlot(state: ThreadState.Free, process: 0,
+                                            self_handle: 0, exit_code: 0,
+                                            joiners: 0, link: 0)
+                    freed = freed + 1
+                },
+            }
+        }
+        t = t + 1
+    }
+    CURRENT_THREAD = NO_THREAD
+    READY_HEAD = 0
+    READY_TAIL = 0
+
+    let uart = console()
+    uart.write_str("SOS: process teardown handles=")
+    uart.write_hex(closed)
+    uart.write_str(" threads=")
+    uart.write_hex(freed)
+    uart.write_str("\n")
+
+    if machine_status == 0 {
+        hal.exit_pass()
+    } else {
+        hal.exit_fail(machine_status)
+    }
+    while { }
+}
+
+/// TERMINATE a process for a caller error it could have checked — design 178's
+/// faults ruling, ratified Aug 15.
+///
+/// This is what an invalid handle, an unknown op, a missing right or an op
+/// aimed at the wrong thread DOES. It is not a status the process receives: the
+/// process is the thing that was wrong, so it ends, and the kernel stays up to
+/// say so. Never returns.
+func fault_process(p: Int, reason: FaultReason) unsafe -> Never {
+    let uart = console()
+    uart.write_str("SOS: process fault: ")
+    uart.write_str(reason.describe())
+    uart.write_str("\n")
+    end_process(p, ProcStatusKind.Faulted, (reason as UInt8) as UInt,
+                ExitCode.ProcessFault as UInt)
+    // The loop is what carries the `Never` up to this signature. A call to a
+    // `-> Never` function does not currently do it — see DF-178d — and without
+    // it a caller whose own tail is `fault_process(...)` miscompiles.
+    while { }
+}
+
+/// The same termination, reached from a hardware fault rather than a syscall
+/// (spec §8: a thread fault kills its process). The report keeps M1's wording
+/// and shape, because the harness reads it and because a reader of the two eras
+/// should see the same line for the same event.
+func fault_trap(tag: String, cause: UInt, epc: UInt, tval: UInt) unsafe -> Never {
+    let uart = console()
+    uart.write_str("SOS: fault ")
+    uart.write_str(tag)
+    uart.write_str(" cause=")
+    uart.write_hex(cause)
+    uart.write_str(" epc=")
+    uart.write_hex(epc)
+    uart.write_str(" tval=")
+    uart.write_hex(tval)
+    uart.write_str("\n")
+    if CURRENT_THREAD != NO_THREAD {
+        end_process(THREADS[CURRENT_THREAD].process, ProcStatusKind.Faulted, 0,
+                    ExitCode.UmodeFault as UInt)
+    }
+    // No process object yet: the harness kernels that enter user mode directly.
+    hal.exit_fail(ExitCode.UmodeFault as UInt)
+    while { }
 }
 
 // =============================================================================
@@ -214,20 +765,56 @@ public func fatal(tag: String, cause: UInt, epc: UInt, tval: UInt, code: ExitCod
 // Syscall dispatch (spec §3, §5.7)
 // =============================================================================
 
-/// Resolve a handle in the calling process's table.
+/// What one op did: a (status, value) pair for the caller, or the news that the
+/// caller is not going to receive one YET.
 ///
-/// v1 has ONE process holding ONE handle, so this is a comparison rather than
-/// a table walk — but it is the same function every later object arrives
-/// through, and it already does the two things that matter: an unknown handle
-/// resolves to nothing, and the rights travel WITH the entry rather than being
-/// assumed by the op. The real per-Process table (index + generation, for
-/// stale-handle detection — §3) lands with the object model.
-func lookup_handle(handle: UInt) -> HandleEntry {
-    if handle == ROOT_SYSTEM_HANDLE {
-        HandleEntry(obj_type: ObjType.System, rights: root_system_rights())
-    } else {
-        HandleEntry(obj_type: ObjType.Unbound, rights: 0)
+/// `blocked` is the third answer a syscall can give and it is not a failure. A
+/// thread that parks in `Join` has made no mistake and gets no status; its pair
+/// is written into its frame by whatever wakes it, exactly once. Modelling that
+/// as a field rather than as a magic status is what keeps the return path from
+/// having to know which ops can park.
+struct SysResult {
+    status: SosStatus,
+    value: UInt,
+    blocked: Bool,
+}
+
+func op_ok() -> SysResult {
+    SysResult(status: SosStatus.Ok, value: 0, blocked: false)
+}
+
+func op_value(v: UInt) -> SysResult {
+    SysResult(status: SosStatus.Ok, value: v, blocked: false)
+}
+
+func op_status(s: SosStatus) -> SysResult {
+    SysResult(status: s, value: 0, blocked: false)
+}
+
+func op_blocked() -> SysResult {
+    SysResult(status: SosStatus.Ok, value: 0, blocked: true)
+}
+
+/// Terminate the process from a position that OWES a `SysResult`.
+///
+/// `fault_process` is declared `-> Never` and nothing after it runs, but a
+/// `Never`-typed CALL is not currently accepted everywhere a diverging tail is
+/// (DF-178d), so the one place that difference would show up is wrapped once
+/// here rather than worked around at each op. The trailing conditionless loop
+/// is what carries the divergence up to this signature; it is unreachable.
+func fault_result(p: Int, reason: FaultReason) unsafe -> SysResult {
+    fault_process(p, reason)
+    while { }
+}
+
+/// The calling process. In M2 that is the process of the running thread, and
+/// before there are threads it is the only process there is — the harness
+/// kernels that enter user mode with no object model still make syscalls.
+func calling_process() unsafe -> Int {
+    if CURRENT_THREAD == NO_THREAD {
+        return 0
     }
+    THREADS[CURRENT_THREAD].process
 }
 
 /// The System object's ops (§2). Returns a status; `shutdown` does not return
@@ -239,35 +826,223 @@ func lookup_handle(handle: UInt) -> HandleEntry {
 /// check and the dispatch in one step. The `match` is then exhaustive, so adding
 /// an op to `sosabi` makes this function fail to compile until it is handled —
 /// which is what the old `op > OP_SYSTEM_MAX` test could never do.
-func system_op(raw_op: UInt, obj: &SystemObject, arg0: UInt) -> SosStatus {
-    guard let op = SysOp.from(raw: raw_op) else {
-        return SosStatus.BadOp
+///
+/// AN UNKNOWN OP AND A MISSING RIGHT BOTH TERMINATE THE PROCESS (design 178's
+/// faults ruling). Both are mistakes the caller could have checked: it chose
+/// the number, and it knows which rights it holds.
+///
+/// THE DECODE IS AN `if let` WITH A DIVERGING TAIL rather than the `guard` this
+/// wants to be: a `guard ... else` block accepts `return`, `break`, `continue`,
+/// `panic` and a conditionless `while { }` as its exit, but NOT a call to a
+/// function declared `-> Never`, which is what terminating a process is. See
+/// DF-178d.
+func system_op(raw_op: UInt, obj: &SystemObject, arg0: UInt) unsafe -> SysResult {
+    let p = calling_process()
+    if let op = SysOp.from(raw: raw_op) {
+        return system_op_decoded(op, &obj, arg0, p)
     }
+    fault_result(p, FaultReason.BadOp)
+}
 
+func system_op_decoded(op: SysOp, obj: &SystemObject, arg0: UInt,
+                       p: Int) unsafe -> SysResult {
     match op {
         // The rights check is per-OP, not per-object: holding the System
         // handle is not the same as being allowed to use every part of it.
         case DebugPrint -> {
             if not obj.allows(SystemRight.Debug) {
-                return SosStatus.AccessDenied
+                fault_process(p, FaultReason.AccessDenied)
             }
             hal.console_byte((arg0 & BYTE_MASK) as UInt8)
-            SosStatus.Ok
+            op_ok()
         },
-        // Stop the machine with `arg0` as the status. NOT process exit: that is
-        // a Process-object op when Process objects exist (ratified Aug 5). In
-        // M1's one-process world the distinction is invisible from outside,
-        // which is exactly why it is worth getting right now.
+        // Stop the machine with `arg0` as the status. NOT process exit, which
+        // is `ProcOp.Exit` — this is the whole machine, and it is what the
+        // harness kernels with no Process object still use to finish a run.
         case Shutdown -> {
             if not obj.allows(SystemRight.Shutdown) {
-                return SosStatus.AccessDenied
+                fault_process(p, FaultReason.AccessDenied)
             }
             if arg0 == 0 {
                 hal.exit_pass()
             } else {
                 hal.exit_fail(arg0)
             }
-            SosStatus.Ok
+            op_ok()
+        },
+        // §3's derivation rule, made real: the boot handle set is one handle
+        // wide and everything else is obtained THROUGH it. A process asks the
+        // System object which Process it is, and the Process object which
+        // Thread — so the kernel never has to widen the entry register, and a
+        // process that was given no System handle has no way to name either.
+        case SelfProcess -> {
+            if not obj.allows(SystemRight.Manage) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            op_value(PROCESSES[p].self_handle)
+        },
+    }
+}
+
+/// The Process object's ops (§2, §7, §8; design 178 D4).
+func process_op(raw_op: UInt, obj: &ProcessObject,
+                arg0: UInt, arg1: UInt, arg2: UInt) unsafe -> SysResult {
+    let p = calling_process()
+    if let op = ProcOp.from(raw: raw_op) {
+        return process_op_decoded(op, &obj, arg0, arg1, arg2, p)
+    }
+    fault_result(p, FaultReason.BadOp)
+}
+
+func process_op_decoded(op: ProcOp, obj: &ProcessObject,
+                        arg0: UInt, arg1: UInt, arg2: UInt,
+                        p: Int) unsafe -> SysResult {
+    match op {
+        case CreateThread -> {
+            if not obj.allows(ProcessRight.CreateThread) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            create_thread(obj.slot, arg0, arg1, arg2)
+        },
+        case SelfThread -> {
+            if not obj.allows(ProcessRight.Manage) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            if CURRENT_THREAD == NO_THREAD {
+                fault_process(p, FaultReason.BadState)
+            }
+            op_value(THREADS[CURRENT_THREAD].self_handle)
+        },
+        // Spec §5.7, ratified Aug 5: process exit belongs HERE and not on the
+        // System object. Every thread of the process goes with it (§8's
+        // teardown is unconditional), so this never returns.
+        case Exit -> {
+            if not obj.allows(ProcessRight.Exit) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            end_process(obj.slot, ProcStatusKind.Exited, arg0, arg0)
+            // Unreachable: `end_process` stops the machine. The loop is what
+            // carries that up to this arm's type (DF-178d).
+            while { }
+        },
+        // §8's ONE fixed-width status word: kind in the high bits, code in the
+        // low ones. A process asking about itself always reads `Running`, which
+        // is the honest answer and the only one M2 can produce — the interesting
+        // reader is a supervisor holding somebody else's handle, and that needs
+        // the second process M3 loads.
+        case GetStatus -> {
+            if not obj.allows(ProcessRight.Wait) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            op_value(proc_status_word(PROCESSES[obj.slot].exit_kind,
+                                      PROCESSES[obj.slot].exit_code))
+        },
+    }
+}
+
+/// Make a thread in process `slot`, ready to be started.
+///
+/// The entry and the stack are CHECKED against the process's granted region.
+/// Both are caller-checkable — a process knows where its own image and its own
+/// stacks are — so a bad one terminates it rather than producing a thread that
+/// would fault on its first instruction and take the process down anyway, with
+/// a worse diagnostic.
+func create_thread(p: Int, entry: UInt, stack_top: UInt, arg: UInt) unsafe -> SysResult {
+    let start = if entry == ENTRY_IMAGE { PROCESSES[p].entry } else { entry }
+    if start < PROCESSES[p].region_base || start >= PROCESSES[p].region_top {
+        fault_process(p, FaultReason.BadEntry)
+    }
+    if stack_top <= PROCESSES[p].region_base || stack_top > PROCESSES[p].region_top {
+        fault_process(p, FaultReason.BadEntry)
+    }
+
+    let slot = alloc_thread()
+    if slot == NO_THREAD {
+        return op_status(SosStatus.NoResource)
+    }
+    let handle = mint_handle(p, ObjType.Thread, thread_rights(), slot)
+    if handle == NO_HANDLE {
+        return op_status(SosStatus.NoResource)
+    }
+
+    hal.frame_init(frame_slot(slot), start, stack_top, arg)
+    THREADS[slot] = ThreadSlot(state: ThreadState.Created, process: p,
+                               self_handle: handle, exit_code: 0,
+                               joiners: 0, link: 0)
+    op_value(handle)
+}
+
+/// The Thread object's ops (§2, §8; design 178 D4).
+///
+/// `Exit` and `Yield` are ops a thread performs on ITSELF, so both check that
+/// the handle names the caller. That check is the faults ruling's `NotSelf`:
+/// driving another thread's execution is not something the object model offers,
+/// and a process that tries has misread its own handles.
+func thread_op(raw_op: UInt, obj: &ThreadObject, arg0: UInt) unsafe -> SysResult {
+    let p = calling_process()
+    if let op = ThreadOp.from(raw: raw_op) {
+        return thread_op_decoded(op, &obj, arg0, p)
+    }
+    fault_result(p, FaultReason.BadOp)
+}
+
+func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
+                       p: Int) unsafe -> SysResult {
+    let target = obj.slot
+
+    match op {
+        case Start -> {
+            if not obj.allows(ThreadRight.Start) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            match THREADS[target].state {
+                case Created -> {},
+                case _ -> fault_process(p, FaultReason.BadState),
+            }
+            THREADS[target].state = ThreadState.Runnable
+            ready_push(target)
+            op_ok()
+        },
+        case Join -> {
+            if not obj.allows(ThreadRight.Join) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            if target == CURRENT_THREAD {
+                fault_process(p, FaultReason.BadState)
+            }
+            match THREADS[target].state {
+                // Already gone: the answer is in the slot, so nothing parks.
+                case Exited -> op_value(THREADS[target].exit_code),
+                case Free -> fault_result(p, FaultReason.BadState),
+                case _ -> {
+                    block_on_join(CURRENT_THREAD, target)
+                    op_blocked()
+                },
+            }
+        },
+        case Exit -> {
+            if not obj.allows(ThreadRight.Control) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            if target != CURRENT_THREAD {
+                fault_process(p, FaultReason.NotSelf)
+            }
+            exit_thread(target, arg0)
+            // No pair is ever written: this thread does not resume.
+            op_blocked()
+        },
+        case Yield -> {
+            if not obj.allows(ThreadRight.Control) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            if target != CURRENT_THREAD {
+                fault_process(p, FaultReason.NotSelf)
+            }
+            // The yielder DOES resume, right after the trapping instruction, so
+            // its pair is written now; the requeue is `pick_next`'s, which is
+            // the one place a thread is put back on the ready queue.
+            NEED_RESCHED = true
+            op_ok()
         },
     }
 }
@@ -276,17 +1051,36 @@ func system_op(raw_op: UInt, obj: &SystemObject, arg0: UInt) -> SosStatus {
 ///
 /// This is where a raw word becomes a TYPED handle (§3), and the order is the
 /// point: the number arrives from a register, the table says what it names, and
-/// only then is a `SystemHandle` constructed. Below this line the kernel is no
-/// longer handling an integer a process chose — it is handling an object it
-/// resolved, paired with the rights that came with it.
-func dispatch(handle: UInt, op: UInt, arg0: UInt) -> SosStatus {
-    let entry = lookup_handle(handle)
+/// only then is a `SystemHandle` / `ProcessHandle` / `ThreadHandle` constructed.
+/// Below this line the kernel is no longer handling an integer a process chose —
+/// it is handling an object it resolved, paired with the rights that came with
+/// it and the slot it names.
+///
+/// AN UNBOUND HANDLE TERMINATES THE PROCESS, and it has to be decided here
+/// rather than per kind: a handle that names nothing names no kind either, so
+/// there is no op table to ask. That is the faults ruling's shape as much as its
+/// content — the three caller errors it covers are exactly the three the
+/// dispatch can raise before an op body runs.
+func dispatch(handle: UInt, op: UInt,
+              arg0: UInt, arg1: UInt, arg2: UInt) unsafe -> SysResult {
+    let p = calling_process()
+    let entry = lookup_handle(p, handle)
     match entry.obj_type {
-        case Unbound -> SosStatus.BadHandle,
+        case Unbound -> fault_result(p, FaultReason.BadHandle),
         case System -> {
             let obj = SystemObject(handle: SystemHandle(handle),
                                    rights: entry.rights)
             system_op(op, &obj, arg0)
+        },
+        case Process -> {
+            let obj = ProcessObject(handle: ProcessHandle(handle),
+                                    rights: entry.rights, slot: entry.target)
+            process_op(op, &obj, arg0, arg1, arg2)
+        },
+        case Thread -> {
+            let obj = ThreadObject(handle: ThreadHandle(handle),
+                                   rights: entry.rights, slot: entry.target)
+            thread_op(op, &obj, arg0)
         },
     }
 }
@@ -301,36 +1095,54 @@ func dispatch(handle: UInt, op: UInt, arg0: UInt) -> SosStatus {
 /// resumes past the trapping instruction — both through the HAL, because both
 /// are register conventions.
 ///
+/// IT RETURNS THE FRAME TO RESUME, and that return value is the whole of the
+/// context switch (design 178 D2/D3). Handing back the frame it was called with
+/// resumes the interrupted thread; handing back another thread's frame resumes
+/// THAT one, and the HAL's trap entry cannot tell the difference because there
+/// is none to tell. So a switch has one location, it is the user-return
+/// boundary by construction, and the kernel is never half-way through one.
+///
 /// THREE KINDS OF TRAP, and the order below is what tells them apart. An
 /// INTERRUPT is not the running program's business at all — it is serviced and
 /// the interrupted instruction resumes untouched, which is why it is decided
 /// first and why it never reaches the syscall return path (that path steps the
 /// saved PC, and stepping past an instruction that has not run yet would lose
-/// it). A FAULT is fatal — spec §8 makes a thread fault kill its process, and
-/// in M1 root IS the system. A bad SYSCALL is not: an unknown handle, an
-/// unknown op or a missing right come back as a status word and the process
-/// runs on. Confusing the last two is how a kernel turns a caller's mistake
-/// into its own.
+/// it). A FAULT is fatal — spec §8 makes a thread fault kill its process. A bad
+/// SYSCALL is fatal TOO since design 178's faults ruling: an unknown handle, an
+/// unknown op or a missing right is a mistake the caller could have checked, so
+/// it ends the process rather than handing back a word to branch on. What is
+/// left as a STATUS is what the caller could not have known — a full slab, and
+/// later a dead peer.
 @export("ktrap")
-public func ktrap(frame_addr: UInt, cause: UInt, tval: UInt) {
+public func ktrap(frame_addr: UInt, cause: UInt, tval: UInt) unsafe -> UInt {
     if hal.is_interrupt(cause) {
         service_irq(frame_addr, cause)
-        return
+        return pick_next(frame_addr)
     }
 
     if not hal.is_syscall(cause) {
-        fatal(hal.cause_tag(cause), cause, hal.trap_pc(frame_addr), tval,
-              ExitCode.UmodeFault)
+        fault_trap(hal.cause_tag(cause), cause, hal.trap_pc(frame_addr), tval)
     }
 
-    let status = dispatch(hal.syscall_handle(frame_addr),
+    let result = dispatch(hal.syscall_handle(frame_addr),
                           hal.syscall_op(frame_addr),
-                          hal.syscall_arg0(frame_addr))
+                          hal.syscall_arg0(frame_addr),
+                          hal.syscall_arg1(frame_addr),
+                          hal.syscall_arg2(frame_addr))
 
     // THE SYSCALL BOUNDARY: the one place the typed status becomes the number
     // the ABI specifies. `as` on a backed enum is total — the enum IS its tag —
     // so there is nothing here that can fail or disagree with `sosabi`'s table.
-    hal.syscall_return(frame_addr, status as UInt8 as UInt, 0)
+    //
+    // A BLOCKED CALLER IS SKIPPED. Its pair belongs to whatever wakes it, and
+    // writing one here would both answer a question nobody has asked yet and,
+    // on the profile whose saved PC points AT the trapping instruction, step
+    // that PC a second time when the wake wrote the real pair.
+    if not result.blocked {
+        hal.syscall_return(frame_addr, (result.status as UInt8) as UInt,
+                           result.value)
+    }
+    pick_next(frame_addr)
 }
 
 static BYTE_MASK: UInt = 0xFF
@@ -394,17 +1206,29 @@ public func timer_ticks() unsafe -> UInt {
 
 /// THE TIMER TICK — the arch-free landing point for the periodic timer.
 ///
-/// This is where the scheduler's timeslice accounting goes (spec §7:
-/// round-robin within a level, preemption decided on the way out of the
-/// kernel), and until that unit exists the body counts and narrates. What it
-/// must not grow into is anything LONG: it runs with interrupts masked, so its
-/// length is interrupt latency.
+/// THE TIMESLICE IS CHARGED HERE and nothing else about scheduling is: the tick
+/// decrements the running thread's slice and, when it runs out, RAISES A FLAG.
+/// It does not switch, does not walk the ready queue and does not touch the
+/// frame. That division is design 178 D2 in one function — the tick runs with
+/// interrupts masked, so its length is interrupt latency, while the switch it
+/// motivates happens later at the user-return boundary where it costs nothing.
 ///
-/// `frame_addr` is the interrupted context — the thing a context switch will
-/// rewrite. Today it is only read, to say where user mode was when the tick
-/// landed, which is also the harness's evidence that the tick came from there.
+/// `frame_addr` is the interrupted context. It is still only READ here, to say
+/// where user mode was when the tick landed; the switch reads it too, in
+/// `pick_next`, one call further out.
 func on_timer_tick(frame_addr: UInt) unsafe {
     TIMER_TICKS = TIMER_TICKS &+ 1
+
+    if CURRENT_THREAD != NO_THREAD {
+        if SLICE_LEFT > 0 {
+            SLICE_LEFT = SLICE_LEFT - 1
+        }
+        if SLICE_LEFT == 0 {
+            NEED_RESCHED = true
+            SLICE_LEFT = SLICE_TICKS
+        }
+    }
+
     if TIMER_TICKS > TICK_REPORT_LIMIT {
         return
     }
@@ -688,12 +1512,61 @@ public func load_root_and_enter() unsafe {
                     (SegFlag.Read as UInt8) | (SegFlag.Write as UInt8))
     hal.prot_commit()
 
-    // spec §7: root's band map applies verbatim from its image. There is no
-    // Process object to store it in until the object-model brief, so M1 parses
-    // and reports it — which is what proves the Blade-emitted field arrives
-    // intact.
+    // spec §7: root's band map applies verbatim from its image. D3 keeps the
+    // map a loader artifact for M2 — the scheduler is round-robin over one
+    // level — so the kernel still parses and reports it, which is what proves
+    // the Blade-emitted field arrives intact. Storing it in the Process slot is
+    // the priority unit's job, not this one's.
     //
-    // §12: root's boot handle set. In M1 that is exactly one handle — System —
-    // and every authority root has flows through it.
-    hal.enter_user(entry, hal.ROOT_REGION_TOP, ROOT_SYSTEM_HANDLE)
+    // §12: root's boot handle set. It is still exactly one handle — System —
+    // and every authority root has flows through it, now including its own
+    // Process and Thread objects, which it DERIVES (`SelfProcess` /
+    // `SelfThread`) rather than being handed.
+    start_process(entry, hal.ROOT_REGION_TOP, hal.ROOT_LOAD_BASE,
+                  hal.ROOT_REGION_TOP)
+}
+
+/// Reify a user-mode program as a Process with one Thread, mint its boot handle
+/// set, and run it. Never returns.
+///
+/// THE ONLY WAY INTO USER MODE. The loader reaches it with a root image's entry
+/// and region; the harness kernels that grant a hand-written payload its own
+/// bytes reach it with theirs. There is deliberately no second path — a kernel
+/// that could enter user mode without a Process would be a kernel with syscalls
+/// that no handle table answers, which is exactly the shape the M1 code had and
+/// exactly what this unit retired.
+///
+/// The three handles are minted in an order the boot ABI depends on: System
+/// first, so that it comes out as `ROOT_SYSTEM_HANDLE` and the register the
+/// program receives means what §12 says it means. The other two are not passed
+/// anywhere — the program asks for them — so their numbers are the kernel's
+/// business and stay that way.
+public func start_process(entry: UInt, stack_top: UInt,
+                          region_base: UInt, region_top: UInt) unsafe -> Never {
+    let p: Int = 0
+    PROCESSES[p] = ProcSlot(state: ProcState.Running, self_handle: 0,
+                            entry: entry, region_base: region_base,
+                            region_top: region_top,
+                            exit_kind: ProcStatusKind.Running, exit_code: 0)
+
+    let system = mint_handle(p, ObjType.System, root_system_rights(), 0)
+    let own = mint_handle(p, ObjType.Process, root_process_rights(), p)
+    PROCESSES[p].self_handle = own
+
+    let main = alloc_thread()
+    let main_handle = mint_handle(p, ObjType.Thread, thread_rights(), main)
+    THREADS[main] = ThreadSlot(state: ThreadState.Running, process: p,
+                               self_handle: main_handle, exit_code: 0,
+                               joiners: 0, link: 0)
+    CURRENT_THREAD = main
+    SLICE_LEFT = SLICE_TICKS
+
+    if system != ROOT_SYSTEM_HANDLE {
+        fatal_image("the boot handle set did not start at the System handle",
+                    system)
+    }
+
+    hal.frame_init(frame_slot(main), entry, stack_top, system)
+    hal.resume_frame(frame_slot(main))
+    while { }
 }

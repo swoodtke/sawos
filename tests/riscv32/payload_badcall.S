@@ -1,79 +1,55 @@
-/* SOS M1 unit-A U-mode payload: bad ops and bad handles (design 140).
+/* SOS user-mode payload: a caller's mistake is a FAULT (design 178's faults
+ * ruling, ratified Aug 15 — this file used to assert the opposite).
  *
- * A caller's mistake is an ERROR, not a fault: an op the object does not have,
- * or a handle naming nothing, comes back as a status word in a0 and the process
- * keeps running. That is the property under test — the kernel must not turn a
- * bad call into a kill, and must not hang.
+ * THE RULING: a caller error the process could have checked — an invalid handle,
+ * an op the object does not have, a right it was not given — TERMINATES the
+ * process. Statuses are reserved for what the caller could not have known
+ * (exhaustion, and later a dead peer). So `SosStatus.BadHandle`, `.BadOp` and
+ * `.AccessDenied` no longer exist as statuses at all: they are `FaultReason`
+ * tags in the kernel's own report.
  *
- * The payload makes three calls and shuts down with a code that encodes what it
- * saw, so the emulator's exit status IS the assertion:
+ * What that means here. The M1 version of this payload made three calls and
+ * encoded the three statuses it got back into its exit code; under the ruling
+ * the second call never returns, so there is nothing after it to encode. The
+ * case now proves two things in ORDER, which is what the harness asserts:
  *
- *   1. a valid op on a valid handle  -> expect SYS_OK (0)
- *   2. an unknown op on that handle  -> expect SYS_ERR_BAD_OP (2)
- *   3. any op on an unknown handle   -> expect SYS_ERR_BAD_HANDLE (1)
+ *   1. a good call still works             -> the '!' reaches the console
+ *   2. an unknown op on that same handle   -> the kernel reports `bad op`,
+ *                                             tears the process down, and stops
+ *                                             the machine with ExitCode
+ *                                             .ProcessFault
  *
- * Exit code EXPECTED_CODE means all three matched; anything else means one did
- * not, and the code says which.
+ * THE KERNEL STAYS UP, which is the other half of the ruling: it is the
+ * PROCESS that was wrong, so the kernel diagnoses it and reports the teardown
+ * rather than faulting itself or hanging.
+ *
+ * The bad-HANDLE half of the ruling is covered by `thread_fault`, whose root
+ * joins a handle it does not hold — a case that can say so in Saw through the
+ * `sos` module instead of writing an op number here.
  */
 
     .equ SYSTEM_HANDLE,     1
-    .equ BOGUS_HANDLE,      42
     .equ OP_DEBUG_PRINT,    0
-    .equ OP_SHUTDOWN,       1
     .equ OP_UNASSIGNED,     99
-
-    .equ SYS_OK,            0
-    .equ SYS_ERR_BAD_HANDLE, 1
-    .equ SYS_ERR_BAD_OP,    2
-
-    /* Distinct failure codes so a wrong status names its own step. */
-    .equ EXPECTED_CODE,     7
-    .equ FAIL_STEP1,        11
-    .equ FAIL_STEP2,        12
-    .equ FAIL_STEP3,        13
 
     .section .payload, "ax", @progbits
     .balign 4
     .globl _umode_payload
 _umode_payload:
-    /* 1. a good call still works after the bad ones are defined */
+    /* 1. a good call: '!' on the console proves the round trip resumed. */
     li      a7, OP_DEBUG_PRINT
     li      a0, SYSTEM_HANDLE
-    li      a1, '?'
+    li      a1, '!'
     ecall
-    li      t0, SYS_OK
-    bne     a0, t0, .Lfail1
 
-    /* 2. unknown op on a valid handle */
+    /* 2. an op the System object does not have. This does not return. */
     li      a7, OP_UNASSIGNED
     li      a0, SYSTEM_HANDLE
     li      a1, 0
     ecall
-    li      t0, SYS_ERR_BAD_OP
-    bne     a0, t0, .Lfail2
 
-    /* 3. valid op on a handle that names nothing */
-    li      a7, OP_DEBUG_PRINT
-    li      a0, BOGUS_HANDLE
-    li      a1, 'X'
-    ecall
-    li      t0, SYS_ERR_BAD_HANDLE
-    bne     a0, t0, .Lfail3
-
-    li      a1, EXPECTED_CODE
-    j       .Lshutdown
-.Lfail1:
-    li      a1, FAIL_STEP1
-    j       .Lshutdown
-.Lfail2:
-    li      a1, FAIL_STEP2
-    j       .Lshutdown
-.Lfail3:
-    li      a1, FAIL_STEP3
-.Lshutdown:
-    li      a7, OP_SHUTDOWN
-    li      a0, SYSTEM_HANDLE
-    ecall
-
+    /* Unreachable under the ruling. If the kernel ever let this run again, spin
+     * inside the granted region rather than run off into memory U-mode cannot
+     * read — the harness reads the exit status, and a hang is a failure. */
 1:
     j       1b
