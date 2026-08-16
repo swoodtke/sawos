@@ -61,6 +61,7 @@ rather than a byte to THR.
 | `sos_prot_commit()` | sink.c | Publish the staged grant set. | `dsb`/`isb` barriers and a `tlbi`. The DESCRIPTORS are Saw. |
 | `sos_timer_freq()` / `sos_timer_ctl_read()` / `sos_timer_ctl_write(v)` / `sos_timer_set_countdown(n)` | sink.c | The core's physical timer: its frequency, its control register (enabled / masked / fired), and the down-counter whose expiry raises the line. | `mrs`/`msr` name a system register at assembly time. One instruction each; the period arithmetic and the tick policy are Saw. |
 | `sos_payload_start()` / `sos_payload_end()` | sink.c | Bounds of the appended payload. | A linker symbol's ADDRESS, which Saw cannot name — DF-172a. |
+| `sos_wait_for_irq()` | sink.c | Park the core until an interrupt is pending, behind `wait_for_irq`. | `wfi` is an INSTRUCTION. One line, and it is the whole of design 178 M2 unit 4's native delta on this profile. |
 | `virt.ld` | — | Places the image at RAM base 0x4000_0000 and bounds the appended payload on PAGE boundaries — protection granularity here is the page. | Not a program. |
 
 Moved to `lib.saw` by design 172, and no longer C: `sos_rt_write` (unit 4, and
@@ -100,6 +101,25 @@ built in assembly, entered once, with no storage a second thread could have had.
 
 ## What is arm64-specific here, and why
 
+- **A DEVICE WINDOW IS AN ATTRIBUTE, not a place** (design 178 M2 unit 4). On
+  Profile A a page is uncached because of where it is; here it is device memory
+  because its descriptor says so, so a window mapped Normal would be cached,
+  speculatively read and merged — a register block under that is not slow, it is
+  WRONG. `prot_device` writes `Device-nGnRE` (the ordinary driver attribute:
+  non-Gathering, non-Reordering, early write acknowledgement permitted) and both
+  no-execute bits; the kernel's own MMIO keeps the stricter `nGnRnE`. The
+  ACCESS-SIZE half cannot be expressed in a descriptor and belongs to the
+  driver: device memory permits no unaligned and no multi-register access, so a
+  driver reads and writes each register at its own width and never copies a
+  block.
+- **Granting one page cost two more tables.** The device space below RAM was a
+  single 1 GiB block, and a block is not a grant unit — handing EL0 the block
+  holding the console would have handed over every peripheral beside it. So the
+  block became a level-2 table and the one 2 MiB block holding the console
+  became a level-3 table, which is the minimum that makes a single register page
+  grantable. `PAGE_TABLES` grew from three tables to five plus the same page of
+  alignment slack, and the arithmetic is spelled out beside it because a future
+  edit has to redo it.
 - **No mode witness.** RISC-V needs `mscratch` (0 in the kernel, the running
   thread's frame in user mode) to tell a syscall from a kernel bug. Here the
   hardware picks a different vector per source EL, so the question is answered by

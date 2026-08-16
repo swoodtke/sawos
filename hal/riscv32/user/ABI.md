@@ -76,6 +76,33 @@ invalid handle, an unknown op, a missing right — does not come back at all:
 design 178's faults ruling terminates the process for it, and the kernel reports
 the reason. What is left as a status is what the caller could not have known.
 
+## A granted device window (design 178 M2 unit 4)
+
+A DRIVER PROCESS REACHES ITS DEVICE DIRECTLY, through no stub in this directory
+and no op in the kernel. What it needs is one line in its own manifest —
+
+    [sos.riscv32-unknown-none-elf]
+    device-window = "0x10000000"
+
+— which becomes a device record in its `sosimg`, which the kernel installs as
+one page-aligned NAPOT protection entry before entering user mode. From then on
+the register block is ordinary memory to that process, and the driver is the
+design-112 MMIO idiom in plain process Saw (`UnsafeMemory<Regs, Device>` over a
+register-block struct). `sos/tests/uart-echo-ns16550/` is the worked example.
+
+TWO THINGS BOUND IT. The window is AUTHORIZED by the board, not merely declared:
+this profile's HAL publishes one (the console UART's page) and an image naming
+anything else is refused at load. And it is a PLACEHOLDER — M3's MemoryObject /
+Mapping (spec §2.5) makes a device window a handle derived from a device pool
+root, mapped by an op and revocable by closing the Mapping.
+
+**THE CONSOLE HANDOVER PROTOCOL** applies to whoever holds the console's window:
+the kernel goes quiet at its `SOS: console handover` marker and writes again
+only on a diagnostic path. A driver that owns the console owns its RECEIVE side
+outright — the kernel never touches the receiver or the interrupt-enable
+register — and shares only the transmitter, where a kernel byte lands BETWEEN
+two of the process's rather than inside one. See `kcore`'s `Console`.
+
 ## What is riscv32-specific here
 
 Only the register names and the `ecall` instruction — which, since design 172

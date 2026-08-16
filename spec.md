@@ -35,7 +35,7 @@ names provisional):
 | `Channel` | Synchronous message IPC with request/reply built in — see §2.1 (ratified Jul 29). |
 | `Event` | Accumulating non-blocking notification (OR / saturating-sum); a waitable — see §2.4 (ratified Jul 29). |
 | `Timer` | Deadline object; fires an Event / is waitable. |
-| `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it, ack via the handle. |
+| `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it, ack via the handle. BUILT M2 (design 178 unit 4): one op (`Ack`), two rights (`InterruptRight.Wait`/`.Ack`), created by `ProcessOp.CreateInterrupt` on its own Process right — the factory bit a launcher strips from everything that is not a driver. The BINDING IS THE OBJECT'S EXISTENCE (creation takes the line, there is no rebind), which is what stops one handle naming two devices over its life. A line the board does not have, the TIMER's line, and a line already bound are all faults. |
 | `Waiter` | Generic wait aggregator (epoll/Port-style) — see §2.2 (ratified Jul 29). |
 | `MemoryObject` | Physical memory (RAM or device MMIO). Ownership/authority over the pages; mappable, sendable — see §2.3 (ratified Jul 29). |
 | `Mapping` | An installed virtual placement of a MemoryObject; distinct object, own handle; only it can unmap — see §2.3. |
@@ -126,7 +126,14 @@ names provisional):
   already uses is a FAULT, because a duplicate makes two questions ambiguous at
   once — which attachment a `remove` names, and which one an answer came from.
 - Waitables: Channel (readable / reply-ready), Event, Timer,
-  Interrupt, ReplyHandle. **Attach semantics (ratified Jul 29):**
+  Interrupt, ReplyHandle. **Event and Interrupt are BUILT** (M2 units 3
+  and 4); the rest are M3. The second kind is what moved an attachment
+  out of the waitable and into a table of its own: a Waiter's set has to
+  be ONE list, since a wait scans it once and a `remove` walks it once,
+  so per-kind lists would make both a matrix over kinds. What stays
+  per-kind is four questions — who is watching me, am I ready, what does
+  a record say — each an exhaustive match, so a fifth waitable cannot be
+  added silently. **Attach semantics (ratified Jul 29):**
   **level-triggered** (keeps reporting ready until the waiter handles
   it — no lost edges); **persistent** attachments with explicit
   `remove(handle)` (no one-shot mode); a handle attaches to **at most
@@ -167,6 +174,14 @@ names provisional):
     kernel layer — a Device MemoryObject can only produce Device
     mappings, so a driver physically cannot get a cached view of a
     register block. The attribute travels with the handle.
+  - **ITS FIRST MIGRATION CASE ALREADY EXISTS** (design 178 unit 4): M2's
+    boot-time device grant is a `sosimg` record a driver package declares
+    in its manifest and the kernel installs before entering user mode,
+    authorized against one window the board publishes. Everything a
+    Mapping adds is what that placeholder lacks — a handle, a derivation,
+    an op that installs it, and a close that revokes it — so the migration
+    is "the same window, obtained rather than declared", and the M2 code
+    says so where the check is.
 - Sendable over channels — so the SAME physical memory can be mapped
   into multiple address spaces at multiple virtual locations (the
   shared-memory primitive). Derived by splitting / attenuating a
@@ -644,7 +659,56 @@ memory words, and nothing else.
 - **Combined form (pin): `waiter.wait(ack: irq_handle)`** — atomically
   ack, then block. Pure syscall-halving for the hot loop (one syscall
   per interrupt); not needed for correctness (level-triggering already
-  covers the gap). One optional arg on wait.
+  covers the gap). One optional arg on wait. STILL A PIN after M2 built
+  the object: the echo driver runs the two calls separately and the
+  transcript does not notice.
+- **BUILT M2, and what the implementation added to this section**
+  (design 178 unit 4):
+  - **The wait ANSWER carries the LINE** — `WaitPayload.Interrupt(line:)`
+    through §2.2's copy-out record. There is no fire COUNT, because the
+    mask-on-fire rule makes it always one; a dispatcher parked on several
+    lines gets which one without a side table, exactly as it gets the key.
+  - **An ACK WITH NO FIRE OUTSTANDING IS A FAULT**, not a tolerated no-op.
+    The only way to learn about a fire is to be told about one, so an
+    extra ack is a servicer that will ack the NEXT fire without servicing
+    it — a dropped byte or a wedged device with no first symptom.
+  - **THERE IS NO MASK OP AND NO MASK RIGHT.** Masking is the kernel's
+    half of the cycle; a driver that could mask at will could leave a line
+    masked, which is a denial of the device with no diagnostic. What a
+    driver controls is its own device's interrupt-enable register, through
+    the window it was granted.
+  - **"NOTHING RUNNABLE" STOPPED MEANING DEADLOCK.** An Interrupt is the
+    first readiness that arrives from outside the set of runnable threads,
+    so the kernel idles when any line is bound and reports the ratified
+    deadlock otherwise. It idles by PARKING THE CORE AND POLLING rather
+    than by taking the trap, which leaves design 178's D2 exactly as it
+    was: the kernel still never takes an interrupt in kernel mode.
+  - **THE MMIO GRANT IS DECLARED BY THE IMAGE** (finale constraint 1,
+    ruled Aug 16, user): a `sosimg` device record, emitted from the
+    driver package's own manifest, authorized against a window the board
+    publishes. It is the M2 PLACEHOLDER for §2.5's Mapping and is that
+    section's first migration case.
+
+### 9a. The console handover protocol (ratified Aug 16, user)
+
+Both v1 machines have ONE console UART, and both the kernel and a driver
+process can drive it. Unstated, that is a flaky-test mystery — two
+writers on one device interleave mid-word and neither is wrong.
+
+- **Boot**: the kernel owns the device outright and narrates.
+- **Handover**: entering user mode writes ONE marker line, and it is the
+  last thing the kernel says on its own initiative. After it, THE PROCESS
+  OWNS THE DEVICE.
+- **Reclaim, on diagnostics only**: a fault report, a process teardown, a
+  panic, or an interrupt on a line nothing is bound to. Interleaving
+  there is acceptable because there is no longer a transcript to protect.
+
+A `SystemOp.DebugPrint` is NOT a violation: that is the process asking
+the kernel to place a byte, and the process is the one sequencing it.
+What the protocol forbids is the kernel narrating over a process that is
+using the device. The one bounded exception is a kernel that arms a
+timer, whose first few ticks are narrated after handover — which is why a
+case whose transcript matters after handover arms none.
 
 ## 9b. Kernel sync primitives: IntrSpinLock (ratified Aug 6)
 
@@ -859,6 +923,13 @@ event-driven EDGE of a process gets a second, distinct construct:
   ratified Aug 5); the LAUNCH capability (§7); root MemoryObjects — the
   RAM pool root and the device-range roots (§2.5); the root IRQ table
   (§2 Interrupt). Root's band map applies verbatim from its image (§7).
+  **M2 ANSWERS THE LAST TWO WITH RIGHTS RATHER THAN OBJECTS**, and the
+  set stays ONE handle wide: root's Process handle carries
+  `CreateInterrupt`, so binding a line is a derivation through a handle
+  it already holds rather than a table it is given — and its device
+  window arrives in its own image (§2.5), not in the boot set. Both
+  become real objects in M3, and neither widens the register the kernel
+  enters user mode with.
   NOTE (object-model brief material): the creation-authority model for
   plain objects (Channel/Event/Waiter/Timer) — quota-gated free
   creation vs a factory capability — is an open pin; M1 does not need

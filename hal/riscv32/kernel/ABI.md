@@ -41,6 +41,8 @@ is four instructions and a branch into the trap entry's own restore path.
 | `ROOT_LOAD_BASE` / `ROOT_REGION_TOP` / `ROOT_STACK_LEN` | Root's region in this board's memory map. |
 | `prot_reset()` | Revoke every grant. User mode then reaches nothing. |
 | `prot_region(idx, base, top, perms)` | Stage grant `idx` as `[base, top)` with `perms`, a mask in the `imgformat` `SegFlag` vocabulary (R = 1, W = 2, X = 4). |
+| `prot_device(idx, base, len)` | Stage grant `idx` as a DEVICE WINDOW: read/write, never executable, with whatever memory type this machine needs for MMIO. `len` is a power of two and `base` is aligned to it. |
+| `DEVICE_GRANT_BASE` / `DEVICE_GRANT_LEN` | The ONE window this board offers a process — the console UART's page. The image DECLARES a window and this pair AUTHORIZES it; anything else is a refused image. |
 | `prot_commit()` | Publish the staged set. Separate so a half-programmed set is never live. |
 | `is_syscall(cause) -> Bool` | Did this trap come from a syscall instruction, or is it a fault? |
 | `is_interrupt(cause) -> Bool` | Is this trap an interrupt instead of either? Asked FIRST, because an interrupt is not the running program's business and its instruction has not run. |
@@ -94,17 +96,31 @@ separately only because it is new; `sos/hal/arm64/kernel/` implements every row.
 | `intc_init()` | Bring the interrupt controller up with every line masked. |
 | `irq_unmask(line)` / `irq_mask(line)` | Let a line interrupt the kernel, or stop it. Masking is spec §9's mask-on-fire; the Interrupt object's ack will be what unmasks. |
 | `irq_claim(cause) -> UInt` | Which line is being serviced, `IRQ_NONE` if none. Takes the cause because one profile answers the timer half out of it. |
+| `irq_poll() -> UInt` | The same question with NO trap behind it — the idle path's half of the seam (design 178 M2 unit 4). Here it also has to check the timer by hand, because on this profile the timer is not one of the controller's sources; there it is `irq_claim` under a second name. |
+| `wait_for_irq()` | Park the core until an interrupt is PENDING. Both machines wake from this whether or not the current privilege level would take one, which is exactly what the idle path needs — D2 keeps them masked in kernel mode forever, so the kernel notices by polling rather than by trapping. |
+| `irq_line_valid(line) -> Bool` | Is this a line the BOARD wires? What `Process.CreateInterrupt` checks a caller's number against. The TIMER's line is excluded arch-free by the kernel instead, because "the tick is not for rent" is a policy rather than a fact about the board. |
 | `irq_complete(line)` | End of service for a line. |
 | `timer_start(period_us)` | Arm a periodic tick and make it reachable. |
 | `timer_rearm()` | Schedule the next tick. On both profiles this is also what LOWERS the timer's line, which is why the tick path calls it rather than acknowledging something. |
 | `timer_pending() -> Bool` | Has the timer come due without a tick having been taken for it? The masking case's evidence. |
-| `irq_raise_selftest_line() -> UInt` | Raise a line from software, for bring-up, and say which. Per-board because what a board can interrupt itself with is: here a real device, on Profile B a software-generated line. The Interrupt object is what retires it. |
+| `irq_raise_selftest_line() -> UInt` | Raise a line from software, for bring-up, and say which. Per-board because what a board can interrupt itself with is: here a real device, on Profile B a software-generated line. |
 
-WHAT THE KERNEL PROVIDES ABOVE THIS: one funnel. `ktrap` decides interrupt /
-fault / syscall in that order and hands an interrupt to `service_irq`, which
-claims, runs the arch-free hook that owns the line, and completes. There is no
-second entry point, and the two hooks — the timer tick and a device line — are
-where the scheduler and the Interrupt object land.
+**`irq_raise_selftest_line` STAYS, and unit 1 expected it not to** (design 178 M2
+unit 4). The role it was built for is genuinely covered now — the echo driver
+takes a real device line round the claim / mask / complete cycle on both
+profiles — but two claims are only reachable through it. It raises a line IN THE
+KERNEL, so the transcript reads "raised, entered user mode, only then serviced",
+which is D2 for a DEVICE line where the timer case makes the same claim for a
+timer; and the line it raises is bound to NO Interrupt object, which is the one
+path where `on_external_irq` reports and leaves the line masked. Retiring it
+would delete both.
+
+WHAT THE KERNEL PROVIDES ABOVE THIS: one funnel with TWO WAYS IN. `ktrap`
+decides interrupt / fault / syscall in that order and hands an interrupt to
+`service_irq`; the idle path polls and hands one to `idle_poll`. Both meet at
+`deliver_line`, which rearms the timer or masks a device line, runs the hook
+that owns it, and completes. The two hooks — the timer tick and a device line —
+are where the scheduler and the Interrupt object land.
 
 This surface is unchanged by the design 172 review round; what changed is how
 much of it this file writes. `console_byte`, `exit_fail` and the `sos_rt_write`
@@ -126,6 +142,7 @@ stores to THR — and the mechanism that stops the machine.
 | `sos_mie_write(mask)` | sink.c | Place a word in `mie` — which CLASSES of interrupt may reach this hart. | `csrw` names its CSR. WHICH classes, and the shadow the mask is staged in, are Saw. Note what is absent: nothing here writes the GLOBAL enable, and that absence is design 178's D2. |
 | `sos_pmpcfg_write(lo, hi)` | sink.c | Publish both config registers together. | Same: `csrw pmpcfg0` names its register. The config words are STAGED in Saw. |
 | `sos_payload_start()` / `sos_payload_end()` | sink.c | Bounds of the appended payload. | A linker symbol's ADDRESS, which Saw cannot name — DF-172a. |
+| `sos_wait_for_irq()` | sink.c | Park the core until an interrupt is pending, behind `wait_for_irq`. | `wfi` is an INSTRUCTION. One line, and it is the whole of design 178 M2 unit 4's native delta on this profile. |
 | `virt.ld` | — | Places the image at this board's RAM base, first section first, and bounds the appended payload — on PAGE boundaries at both ends since design 178, which is a speed property under emulation rather than a protection one (DF-178b: a PMP region covering part of a page defeats the emulator's per-page translation cache, and the same user-mode loop measured 62.6s before the round-up and 0.03s after). | Not a program. |
 
 Moved to `lib.saw` by design 172, and no longer C: `sos_rt_write` (unit 4, and
@@ -166,6 +183,18 @@ and they are compiled from one definition so they cannot skew.
   switch takes effect: the restore path re-arms it from the frame it resumed, so
   the next trap saves into the thread that is actually running. Profile B does
   the same thing through `SP_EL1`.
+- **A DEVICE WINDOW IS ONE NAPOT ENTRY, not a TOR pair** (design 178 M2 unit 4).
+  PMP encodes a naturally aligned power-of-two region as a single address word
+  whose trailing ones give its size, so the console's page costs one entry where
+  a bounded region costs two — which is what keeps the four-region budget intact
+  once an image asks for segments, a stack AND a window. The window is
+  page-aligned and page-sized for a SPEED reason rather than a protection one,
+  and it is the same one `virt.ld` is rounded for: DF-178b measured a
+  byte-tight region putting every access on the emulator's slow path, and a
+  driver's register touch is the hottest thing in an interrupt path. This
+  profile's device space needs no memory-type bit — it is uncached because of
+  where it IS — which is why the seam has a device call at all: Profile B has to
+  say so in a descriptor.
 - **The 32-word trap frame**, word `i` holding `x<i>` and word 0 holding the
   saved PC. `TrapFrame` in `lib.saw` is the same layout declared as a struct;
   the two are one description and must move together. The FRAME IS THE THREAD'S

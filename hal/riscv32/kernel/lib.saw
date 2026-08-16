@@ -1040,9 +1040,16 @@ public func wait_for_irq() unsafe {
 /// device this kernel already owns, and the kernel masks the line in its
 /// handler, so the still-asserting device does not re-fire.
 ///
-/// This is bring-up scaffolding in the honest sense — a kernel with no Interrupt
-/// object (spec §2) has no other way to reach a real claim/complete cycle — and
-/// the object-model unit is where a driver takes the line over.
+/// IT WAS EXPECTED TO RETIRE WITH THE INTERRUPT OBJECT AND DOES NOT (design 178
+/// M2 unit 4). A driver now takes a real line round the whole claim / mask /
+/// complete cycle, so the role this was built for is covered — but two claims
+/// are reachable only through it, and both are the kernel's rather than a
+/// driver's. It raises a line IN KERNEL MODE, so the transcript reads "raised,
+/// entered user mode, only then serviced", which is D2 for a device line where
+/// the timer case makes the same claim for a timer; and the line it raises is
+/// bound to NO Interrupt object, which is the one path where `on_external_irq`
+/// reports and leaves the line masked. The scaffolding outlived its scaffolding
+/// role and became a test of the kernel's own behaviour.
 public func irq_raise_selftest_line() unsafe -> UInt {
     irq_unmask(CONSOLE_IRQ)
     Uart16550(at: UART_BASE).regs.ier.write(IER_TX_EMPTY)
