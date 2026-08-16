@@ -30,17 +30,25 @@ names provisional):
 | Object | Role |
 |---|---|
 | `AddressSpace` | Isolation domain, defined abstractly. P4: PMP region set + APM/REE security context (see §5.5 — the P4's MMU is real but global/external-memory-only, not per-process). Paging targets: page-table root. |
-| `Thread` | Kernel-scheduled execution context bound to an AddressSpace. Saw's cooperative TaskGroups run *inside* a thread, in userspace — the kernel never sees tasks. |
+| `Thread` | Kernel-scheduled execution context bound to an AddressSpace. Saw's cooperative TaskGroups run *inside* a thread, in userspace — the kernel never sees tasks. BUILT M2 (design 178 unit 2): ops `Start`/`Join`/`Exit`/`Yield`, rights `ThreadRight.Start`/`.Join`/`.Control`. The saved trap frame IS the context, so a switch is the trap handler returning a different frame — see §11. |
 | `MemoryObject` | A range of memory (RAM or device MMIO) that can be mapped into AddressSpaces. Derived by splitting/attenuating a parent MemoryObject; roots handed to the first process at boot. |
 | `Channel` | Synchronous message IPC with request/reply built in — see §2.1 (ratified Jul 29). |
-| `Event` | Accumulating non-blocking notification (OR / saturating-sum); a waitable — see §2.4 (ratified Jul 29). |
-| `Timer` | Deadline object; fires an Event / is waitable. |
+| `Event` | Accumulating non-blocking notification (OR / saturating-sum); a waitable — see §2.4 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Signal`/`Receive`, the mode chosen by the caller at creation (`create_event(mode:)`). |
+| `Timer` | Deadline object; fires an Event / is waitable. NOT BUILT: M2's timer is the scheduler tick and nothing else, so a process cannot sleep; the granted-Clock/Timer surface is design 232 unit 1. |
 | `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it, ack via the handle. BUILT M2 (design 178 unit 4): one op (`Ack`), two rights (`InterruptRight.Wait`/`.Ack`), created by `ProcessOp.BindInterrupt` on its own Process right — the factory bit a launcher strips from everything that is not a driver. The BINDING IS THE OBJECT'S EXISTENCE (creation takes the line, there is no rebind), which is what stops one handle naming two devices over its life. A line the board does not have, the TIMER's line, and a line already bound are all faults. |
-| `Waiter` | Generic wait aggregator (epoll/Port-style) — see §2.2 (ratified Jul 29). |
+| `Waiter` | Generic wait aggregator (epoll/Port-style) — see §2.2 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Add`/`Remove`/`Wait`, rights `WaiterRight.Attach`/`.Wait`, the wait answer a copy-out record. |
 | `MemoryObject` | Physical memory (RAM or device MMIO). Ownership/authority over the pages; mappable, sendable — see §2.3 (ratified Jul 29). |
 | `Mapping` | An installed virtual placement of a MemoryObject; distinct object, own handle; only it can unmap — see §2.3. |
-| `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. |
-| `System` | Kernel singleton (ratified Aug 5): the object behind system-scoped primitives so that EVERY syscall is an object op (§5.7) — v1 ops `debug_print`, `shutdown(status)` (stop the machine; QEMU: sifive_test), rights-gated (`SystemRight.Debug`/`.Shutdown`, §3 scoped rights). Root receives its handle at boot (§12). `exit` is NOT here — process exit belongs to the Process object when it exists (ratified Aug 5). Later candidates: info queries. |
+| `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. BUILT M2 (design 178 unit 2), one process: ops `CreateThread`/`SelfThread`/`Exit`/`GetStatus` plus the three factory ops `CreateEvent`/`CreateWaiter`/`BindInterrupt`, each on its own right. `create_process` is M3 (design 232 unit 2) and `kill` (§8) has no op yet. |
+| `System` | Kernel singleton (ratified Aug 5): the object behind system-scoped primitives so that EVERY syscall is an object op (§5.7) — v1 ops `debug_print`, `shutdown(status)` (stop the machine; QEMU: sifive_test), rights-gated (`SystemRight.Debug`/`.Shutdown`, §3 scoped rights). Root receives its handle at boot (§12). `exit` is NOT here — process exit belongs to the Process object when it exists (ratified Aug 5). M2 added a third op, `self_process` on `SystemRight.Manage` (design 178 unit 2): §3's derivation rule made real, so the boot register stays ONE handle wide and a process obtains its Process object THROUGH the System handle rather than being handed it. Later candidates: info queries. |
+
+**Six of these kinds exist today** — System, Process, Thread, Event, Waiter
+and Interrupt (`ObjType`, `sos/kernel/abi/`, the kernel-internal numbering
+§5.7's vDSO discipline keeps renumberable). The other rows are unbuilt:
+Channel is M4, Timer and the memory surface are M3 (design 232), and
+AddressSpace stays implicit while one process exists — a process gets one
+granted range plus a writable window, installed by the loader. §11 is the
+ledger.
 
 ### 2.1 Channels: bounded messages + built-in request/reply (ratified Jul 29)
 
@@ -127,16 +135,19 @@ names provisional):
   once — which attachment a `remove` names, and which one an answer came from.
 - Waitables: Channel (readable / reply-ready), Event, Timer,
   Interrupt, ReplyHandle. **Event and Interrupt are BUILT** (M2 units 3
-  and 4); the rest are M3. The second kind is what moved an attachment
+  and 4); Timer is M3 (design 232 unit 1) and Channel with its
+  ReplyHandle is M4. The second kind is what moved an attachment
   out of the waitable and into a table of its own: a Waiter's set has to
   be ONE list, since a wait scans it once and a `remove` walks it once,
   so per-kind lists would make both a matrix over kinds. What stays
-  per-kind is four questions — who is watching me, am I ready, what does
-  a record say — each an exhaustive match, so a fifth waitable cannot be
-  added silently. **Attach semantics (ratified Jul 29):**
+  per-kind is four questions — who is watching me, set who is watching
+  me, am I ready, what does a record say — each an exhaustive match, so
+  a fifth waitable cannot be added silently.
+  **Attach semantics (ratified Jul 29):**
   **level-triggered** (keeps reporting ready until the waiter handles
   it — no lost edges); **persistent** attachments with explicit
-  `remove(handle)` (no one-shot mode); a handle attaches to **at most
+  `remove(key)` (no one-shot mode — and the KEY, per the Aug-16 amendment
+  above, never the waitable's handle); a handle attaches to **at most
   one Waiter**, but **multiple threads/tasks may wait on the same
   Waiter** (a ready handle wakes one waiter — the shared
   readiness-queue shape).
@@ -204,6 +215,9 @@ names provisional):
 - Per-process handle table: index → (object ref, rights word).
   Handles are plain integers in the syscall ABI; the kernel validates
   index + generation (stale-handle detection) + rights on every use.
+  **GENERATIONS ARE NOT BUILT** (through M2): an entry is (object type,
+  rights, target) and nothing can make a slot stale, because there is no
+  close op either — see the close bullet below and §11's ledger.
 - **Rights are a bitmask, SCOPED PER OBJECT KIND (ratified Aug 7,
   user).** Each kind defines its own backed rights enum —
   `SystemRight: UInt32 { case Transfer = 1, case Manage = 2, case
@@ -237,6 +251,10 @@ names provisional):
   strip rights, never add. The only rights source is the boot handle
   set given to the root server.
 - Handle close is explicit in ABI, automatic in Saw (Deinit).
+  **UNBUILT through M2**: no op table has a close op, which is what the
+  generations above and the owning tier below both wait on (§11). A
+  process's handles are released by the ratified teardown and by nothing
+  else.
 - Syscall ABI sketch (riscv32 `ecall`, args in registers): every call
   is `(handle, op, args...) -> Result`. The kernel's dispatch is a
   table lookup + rights check + object-op — the fast path must stay
@@ -257,7 +275,9 @@ names provisional):
   symbols and the syscall stubs keep raw `UInt` words (C callers see
   words; the export whitelist is primitives), and the kernel handle
   TABLE indexes by word. This is TIER ONE (kind safety) of two: when
-  M2 brings closeable/transferable handles, the OWNING tier is a
+  closeable/transferable handles land — **M2 did NOT bring them**, having
+  built neither a close op nor any move of a handle between tables — the
+  OWNING tier is a
   NoCopy struct wrapping the alias (deinit closes, `move` transfers —
   the TcpStream pattern, and §3's no-DUPLICATE rule is its exact
   NoCopy correspondence), with the alias as its payload — additive,
@@ -369,13 +389,23 @@ names provisional):
    status word
    (0 = ok, else a small **`SosStatus`** enum tag — RENAMED from
    `SysError`, ratified Aug 7 [user]: an enum with an `Ok` case is a
-   STATUS, not an error (`SosStatus.Ok`, `SosStatus.BadOp`, …), and
+   STATUS, not an error (`SosStatus.Ok`, `SosStatus.NoResource`, …), and
    the `Sos` prefix names whose status it is. The hosted runtime's
    `SysError` in rt/ABI.md is a SEPARATE frozen contract (errno tags,
    machine-parsed since design 149) and keeps its name; the spec notes
    the correspondence, nothing more. An `Err(SosStatus.Ok)` never
    arises by construction: the wrapper boundary splits on the status —
    `Ok` → `Result.Ok(value)`, anything else → `Err(status)`).
+   **THE STATUS SPACE NARROWED AT M2** (the fault-don't-status ruling,
+   design 178 pin 6, ratified Aug 8): a caller error the process could
+   have checked — an invalid handle, a malformed op, a rights violation —
+   TERMINATES the offending process, so `BadHandle`, `BadOp` and
+   `AccessDenied` are `FaultReason` tags rather than statuses, keeping
+   their numbers. What is left in `SosStatus` is what a caller could not
+   have known — `NoResource`, a full slab — with `Unknown` still the
+   userspace mapping artifact. M3 adds `QuotaExceeded` beside it (design
+   232 unit 5) on the same line design 178's fourth round drew: a
+   dynamic resource condition answers with a status, broken code faults.
    Kernel
    dispatch is §3's shape verbatim: handle-table lookup → object type →
    op table → rights check → op. Even the M1 primitives conform: a
@@ -506,6 +536,19 @@ nothing else, and `sos/rt/common_c/support.c` is `mem*` and the atomic libcalls
 So the floor is one shared C file plus four inline-asm leaves, and every one of
 them is reason 1 or reason 2. Reason 3 is the only open language gap.
 
+**M2 moved both numbers and added no reason** (design 178's per-unit
+measurements): C went 135 -> 168 code lines — one interrupt-class mask register
+on Profile A and four timer system registers on Profile B (unit 1),
+`sos_syscall3` per profile (unit 2: an op that answers with a VALUE needs one,
+and the C ABI the Saw side declares against has no aggregate return), and
+`sos_wait_for_irq` per profile (unit 4: `wfi` is an instruction). Assembly went
+UP by 13 for Profile B's interrupt vector entry and then DOWN to 268 total,
+because a thread context built in Saw needs no register-clearing prologue —
+`enter_user` is gone from both HALs, replaced by a Saw `frame_init` and a
+`resume_frame` that branches into the trap entry's own restore path. Reason 1 in
+every case: an object model grew by five kinds and the diet's direction did not
+change.
+
 **The panic path is the interesting one.** The console writer the runtime seams
 call is now Saw, and it is CHECK-FREE BY CONSTRUCTION rather than by
 inspection: raw pointer reads, wrapping arithmetic, no indexing, no allocation.
@@ -544,6 +587,20 @@ Timer primitive). The kernel knows objects, handles, rights, threads,
 memory words, and nothing else.
 
 ## 7. Scheduling (ratified Aug 3)
+
+**STATUS AFTER M2: none of this section is built** (design 178 D3, ratified
+Aug 15). The kernel schedules ONE round-robin FIFO — no levels, no ready
+bitmap — on a one-tick slice, and no shipping kernel image even arms the
+tick: `sos/kernel/main.saw` arms none, and the harness kernels that test
+preemption arm their own. The §7 map stays a LOADER ARTIFACT: the loader parses the
+image's priority field and REPORTS it, no Process slot stores it, no syscall
+carries a band tag, and there is therefore no enforcement point yet. Two
+consequences worth reading here rather than deducing: `create_process` and
+its LAUNCH capability do not exist (M3, design 232 unit 2), and "nothing
+runnable" is not simply the idle case — it is idle when some interrupt line
+is bound and the ratified deadlock report otherwise (§9). Round-robin is
+ruled to stay through M3 (design 232 agenda item 10); what follows is what
+SMP-era work builds.
 
 - **Fixed-priority preemptive, 8 system levels (0–7).** Ready queue =
   per-level FIFO + a one-BYTE ready bitmap; pick-next = find-first-set
@@ -602,6 +659,21 @@ memory words, and nothing else.
   per-core queues — and nothing above precludes it).
 
 ## 8. Thread & process lifecycle (ratified Aug 3)
+
+**STATUS AFTER M2** (design 178 D4, ratified Aug 15). BUILT: the fault rule
+below, whole — a thread fault kills its process and the ratified teardown
+runs unconditionally — and `get_status` as `ProcessOp.GetStatus` gated on
+`ProcessRight.Wait`, answering the one fixed-width word (kind in the high
+bits, `Running` beside the three ratified ones, code in the low). **`Join`
+EXISTS, which supersedes the "no join syscall" line below**: D4 gave Thread
+`Start`/`Join`/`Exit`/`Yield`, and a joiner parks on the target's list and is
+answered exactly once through the funnel §2.2 describes. The observability
+this section reserved for stack reclamation therefore arrived a milestone
+early, because the wait/wake substrate needed a first consumer. NOT BUILT:
+thread and process handles are NOT waitable — attaching either is a
+`NotWaitable` fault, so §2.2's waitable list is the whole list — and
+`process.kill()` has neither op nor right, since with one process it would be
+`Exit` under a second name (design 232 unit 2 loads the second).
 
 - **A thread fault kills its process.** The process exits with a
   fault status; there is no per-thread fault recovery (a faulted
@@ -729,9 +801,17 @@ case whose transcript matters after handover arms none.
   stays even on uniprocessor (SMP-future correctness; under `+a` it is
   cheap; a FAILED acquire on uniprocessor signals reentrancy — panic,
   never spin forever).
-- Timing: DESIGN ratified now; IMPLEMENTATION lands with the M2-era
-  interrupt work — M1 never sets MIE, so the type would be untestable
-  dead code before then.
+- Timing: DESIGN ratified Aug 6. **STILL UNBUILT after M2, and correctly
+  so.** The M2-era interrupt work landed under design 178's D2 —
+  interrupts are taken from user mode only, enforced by both machines
+  rather than intended by the kernel, and the idle path POLLS rather than
+  taking the trap (§9) — so the kernel holds no state an ISR can
+  interrupt and there is no critical section for the type to protect. It
+  arrives when that stops being true: design 232 pin 1 takes kernel
+  interruptibility in M3 through explicit PREEMPTION POINTS, which need
+  no lock either (a point IS the assertion that state is consistent), and
+  SMP — sequenced after channels — is what forces the lock, with the
+  point placements as the map of where it must go.
 
 ## 10. Userspace runtime: HandlerGroup + the wake bridge (ratified Aug 3)
 
@@ -1047,7 +1127,15 @@ event-driven EDGE of a process gets a second, distinct construct:
   NOTE (object-model brief material): the creation-authority model for
   plain objects (Channel/Event/Waiter/Timer) — quota-gated free
   creation vs a factory capability — is an open pin; M1 does not need
-  it (root spawns nothing).
+  it (root spawns nothing). **ANSWERED BY M2 (design 178 unit 3): the
+  factory capability, spelled as rights bits on the Process object.**
+  `CreateEvent`/`CreateWaiter` — and `BindInterrupt` beside them — are
+  Process ops each on its own right, so creation flows through a handle
+  the process already holds and is §3's derivation rule rather than a new
+  mechanism next to it, and a launcher strips the bit from anything with
+  no business creating. A quota stays ADDITIVE: a field on the process
+  slot, checked where `NoResource` is returned today, and design 232
+  unit 5.
 - **Loader-above-boot.** The kernel loads exactly ONE image ever: root
   (sosimg, §6). Every later process is loaded BY ROOT from images root
   obtains itself (e.g. a flash MemoryObject it holds), via LAUNCH +
