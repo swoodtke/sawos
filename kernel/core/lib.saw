@@ -935,6 +935,24 @@ func signal_event(slot: Int, bits: UInt) unsafe {
     wake_one_waiter(attached - 1, slot)
 }
 
+/// The event attached to `w` under `key`, or `NO_EVENT`.
+///
+/// THE KEY IS THE ATTACHMENT'S NAME, which is what makes the attachment set a
+/// TABLE keyed by it rather than a bag: `Remove` names an attachment this way,
+/// and `Add` uses the same walk to refuse a duplicate. Both rest on keys being
+/// unique per Waiter, which is exactly why the duplicate is refused.
+func attached_by_key(w: Int, key: UInt) unsafe -> Int {
+    var cur = WAITERS[w].attached
+    while cur != 0 {
+        let slot = cur - 1
+        if EVENTS[slot].key == key {
+            return slot
+        }
+        cur = EVENTS[slot].link
+    }
+    NO_EVENT
+}
+
 /// Take event `e` off waiter `w`'s attachment list, and clear the attachment
 /// fields on the event. The caller has established that it is on that list.
 func detach_event(w: Int, e: Int) unsafe {
@@ -1711,6 +1729,13 @@ func waiter_add(p: Int, w: Int, handle: UInt, key: UInt) unsafe -> SyscallResult
     if EVENTS[e].waiter != 0 {
         fault_process(p, FaultReason.BadState)
     }
+    // KEYS ARE UNIQUE PER WAITER (ruled Aug 16). A duplicate would make two
+    // questions ambiguous at once — which attachment a `Remove` names, and
+    // which one an answer came from — and the attacher chose both keys, so it
+    // is caller-checkable in the strongest sense.
+    if attached_by_key(w, key) != NO_EVENT {
+        fault_process(p, FaultReason.DuplicateKey)
+    }
 
     EVENTS[e].waiter = w + 1
     EVENTS[e].key = key
@@ -1728,11 +1753,19 @@ func waiter_add(p: Int, w: Int, handle: UInt, key: UInt) unsafe -> SyscallResult
     op_ok()
 }
 
-/// §2.2's `remove(handle)`. Removing something this Waiter does not hold is a
-/// caller error, on the same terms as attaching twice.
-func waiter_remove(p: Int, w: Int, handle: UInt) unsafe -> SyscallResult {
-    let e = waitable_slot(p, handle)
-    if EVENTS[e].waiter != w + 1 {
+/// §2.2's `remove(key)`. Removing a key this Waiter does not use is a caller
+/// error, on the same terms as attaching twice.
+///
+/// IT NAMES THE ATTACHMENT BY KEY AND NEVER TOUCHES THE WAITABLE (ruled Aug 16,
+/// user), which is why no handle is resolved here and no right on the waitable
+/// is spent: detaching edits this Waiter's own table, so the Waiter handle
+/// already validated by the dispatch plus the key is the whole of the authority
+/// the operation needs. It is also the only form that survives M3: once handles
+/// can be CLOSED, a closed waitable's stale attachment has no handle left to
+/// name it with, and a handle-based remove could not reach it at all.
+func waiter_remove(p: Int, w: Int, key: UInt) unsafe -> SyscallResult {
+    let e = attached_by_key(w, key)
+    if e == NO_EVENT {
         fault_process(p, FaultReason.BadState)
     }
     detach_event(w, e)

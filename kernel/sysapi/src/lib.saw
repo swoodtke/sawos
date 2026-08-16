@@ -304,8 +304,9 @@ public func sos_event_receive(handle: UInt,
     sos_syscall3(handle, EventOp.Receive as UInt, 0, 0, 0, value_out)
 }
 
-/// Attach a waitable to a Waiter under `key`. Requires `WaiterRight.Attach` on
-/// the waiter and `EventRight.Wait` on the target.
+/// Attach a waitable to a Waiter under `key`, which must not already be in use
+/// on that Waiter. Requires `WaiterRight.Attach` on the waiter and
+/// `EventRight.Wait` on the target.
 ///
 /// It is the first op taking TWO arguments and answering with a status alone,
 /// and the raw forms are fixed-arity by design (§5.7: no varargs across a trap
@@ -319,10 +320,15 @@ public func sos_waiter_add(handle: UInt, target: UInt, key: UInt) unsafe -> UInt
                  (&var ignored) as UnsafePointer<UInt>)
 }
 
-/// Detach a waitable. Requires `WaiterRight.Attach`.
+/// Detach the attachment registered under `key`. Requires
+/// `WaiterRight.Attach`.
+///
+/// IT TAKES THE KEY, NOT THE WAITABLE'S HANDLE: detaching edits the Waiter's
+/// own table and never touches the waitable, so the key is the whole of what
+/// names the attachment.
 @export("sos_waiter_remove")
-public func sos_waiter_remove(handle: UInt, target: UInt) -> UInt {
-    sos_syscall1(handle, WaiterOp.Remove as UInt, target)
+public func sos_waiter_remove(handle: UInt, key: UInt) -> UInt {
+    sos_syscall1(handle, WaiterOp.Remove as UInt, key)
 }
 
 /// Block until an attached handle is ready, and COPY OUT a record describing it
@@ -654,19 +660,37 @@ public extension Waiter {
     /// Attach `event` under `key`, which `wait` hands back when it becomes
     /// ready. Requires `WaiterRight.Attach` here and `EventRight.Wait` there.
     ///
+    /// KEYS ARE UNIQUE PER WAITER: `key` must not already name an attachment on
+    /// this Waiter, and reusing one TERMINATES the process. It is the invariant
+    /// `remove` and the wait answer both rest on — with two attachments under
+    /// one key, neither could say which it meant.
+    ///
     /// IT TAKES A `&Event` AND NOT A HANDLE WORD. That is the module
     /// docstring's rule reaching cross-type plumbing: there is no way to spell
     /// a handle you were not given, so an attachment names an object this
     /// process holds by construction. The field access below is same-module,
     /// which is why no accessor is owed and none exists.
+    ///
+    /// ONE METHOD PER WAITABLE KIND, and it stays that way on purpose — see the
+    /// brief's note on why a `Waitable` trait is not the shape (a public trait
+    /// with a handle-producing requirement is a forged-handle door under the
+    /// orphan rule, and Saw has no sealed traits yet). Kinds are a LIST, so
+    /// overloads are a list; it is MODES that multiply, which is why
+    /// `create_event` takes its mode as a value.
     public func add(&self, event: &Event, key: UInt) -> Result<Void, SosStatus> {
         checked(sos_waiter_add(self.handle, event.handle, key))
     }
 
-    /// Stop watching `event`. Removing one this Waiter does not hold terminates
-    /// the process. Requires `WaiterRight.Attach`.
-    public func remove(&self, event: &Event) -> Result<Void, SosStatus> {
-        checked(sos_waiter_remove(self.handle, event.handle))
+    /// Stop watching whatever is attached under `key`. A key this Waiter does
+    /// not use terminates the process. Requires `WaiterRight.Attach`.
+    ///
+    /// THE KEY IS WHAT NAMES AN ATTACHMENT, not the waitable: detaching edits
+    /// this Waiter's own table and never touches the object on the other end,
+    /// so it needs no handle and no right over it. That is also what will let a
+    /// stale attachment be removed once handles can be closed — at which point
+    /// there is no handle left to name it with.
+    public func remove(&self, key: UInt) -> Result<Void, SosStatus> {
+        checked(sos_waiter_remove(self.handle, key))
     }
 
     /// Block until an attached handle is ready, and answer with the attacher's

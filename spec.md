@@ -116,6 +116,15 @@ names provisional):
   nowhere to put one that would outlive the call. The typed Saw wrapper
   supplies it out of its own frame, so a raw address never appears in
   that surface.
+- **`remove` TAKES THE KEY, and keys are UNIQUE per Waiter** (ratified Aug 16,
+  user, as design 178 M2 unit 3 rider 4). Detaching edits the WAITER's own
+  attachment table and never touches the waitable, so the authority it spends is
+  the Waiter handle plus the key that names the attachment — a waitable's handle
+  would be authority the operation does not use. It is also the only form that
+  survives handle CLOSE: a closed waitable's stale attachment has no handle left
+  to name it with. The invariant that forces: `add` with a key the Waiter
+  already uses is a FAULT, because a duplicate makes two questions ambiguous at
+  once — which attachment a `remove` names, and which one an answer came from.
 - Waitables: Channel (readable / reply-ready), Event, Timer,
   Interrupt, ReplyHandle. **Attach semantics (ratified Jul 29):**
   **level-triggered** (keeps reporting ready until the waiter handles

@@ -1,0 +1,81 @@
+// SOS M2 unit 3 rider 4: two attachments, one key (design 178 D5; spec §2.2).
+//
+// KEYS ARE UNIQUE PER WAITER. A `Waiter` names an attachment by its key —
+// `remove(key)` does, and so does the record a `wait` copies out — so two
+// attachments sharing one key would make both of those questions ambiguous.
+// The kernel refuses the second `add` and terminates the process for it, on the
+// faults ruling's terms: the attacher chose both keys, so it could have checked.
+//
+// THIS ONE IS WRITTEN IN ORDINARY SAW, and that is the point of it. The unit's
+// other fault cases are hand-written payloads because the typed layer makes
+// their mistakes unspellable — there is no way to name a handle you were not
+// given, and `wait` supplies its own buffer. A duplicate key is different:
+// both Events are real, both keys are the caller's own words, and no type can
+// tell you that you already used one. So the check has to be the kernel's, and
+// the test that proves it belongs at the altitude a real process writes.
+//
+// The transcript is two lines and an exit status:
+//
+//   SOS dupkey: first attach ok
+//   SOS: process fault: an attachment already uses that key
+//
+// The second `add` does not return, so nothing after it runs — which is what
+// the missing third line asserts.
+
+import sos.{System, Process, Event, Waiter}
+
+/// One key, used twice. Any word would do; this one is recognizable.
+static SHARED_KEY: UInt = 55
+
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.self_process() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS dupkey: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let waiter = match proc.create_waiter() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS dupkey: no waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let a = match proc.create_event() {
+        case Ok(ev) -> ev,
+        case Err(e) -> {
+            print("SOS dupkey: no event a: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let b = match proc.create_event() {
+        case Ok(ev) -> ev,
+        case Err(e) -> {
+            print("SOS dupkey: no event b: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let _ = waiter.add(&a, SHARED_KEY)
+    let _ = system.debug_print("SOS dupkey: first attach ok\n")
+
+    // The second one. A perfectly good Event and a perfectly good key, and the
+    // Waiter is already using it — this call does not return.
+    let _ = waiter.add(&b, SHARED_KEY)
+
+    // Unreachable. If the kernel ever allowed the duplicate, say so loudly
+    // rather than exiting in a way that could be mistaken for the fault path.
+    let _ = system.debug_print("SOS dupkey: DUPLICATE WAS ALLOWED\n")
+    let _ = proc.exit(EXIT_FAILED)
+}

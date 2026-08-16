@@ -494,6 +494,21 @@ public enum EventOp: UInt {
 /// The names are §2.2's own (`add`, `remove`, `wait`); the RIGHT that gates the
 /// first two is `WaiterRight.Attach`, which is one capability under a name that
 /// says what it is rather than repeating either op.
+///
+/// **`Remove` TAKES THE KEY, NOT THE WAITABLE'S HANDLE** (ruled Aug 16, user).
+/// Detaching edits the WAITER's own attachment table and never touches the
+/// waitable at all, so the authority it needs is the Waiter handle already in
+/// the handle register plus the key that names the attachment — asking for the
+/// waitable's handle too would be asking for authority the operation does not
+/// spend. It also has to be this way for M3: once handles can be CLOSED, a
+/// closed waitable's stale attachment is one whose handle no longer resolves,
+/// and a handle-based remove could never name it.
+///
+/// THE INVARIANT THAT FORCES: **keys are UNIQUE per Waiter.** `Add` with a key
+/// the Waiter already uses is a FAULT — caller-checkable, since the attacher
+/// chose both keys — and it has to be refused rather than allowed, because a
+/// duplicate makes two different questions ambiguous at once: which attachment
+/// a `Remove` names, and which one a `Wait` answer came from.
 public enum WaiterOp: UInt {
     case Add = 0,
     case Remove = 1,
@@ -713,6 +728,7 @@ public enum FaultReason: UInt8 {
     case BadArg = 9,
     case BadAlign = 10,
     case BadBuffer = 11,
+    case DuplicateKey = 12,
 }
 
 public extension FaultReason {
@@ -730,6 +746,7 @@ public extension FaultReason {
             case BadArg -> "argument outside its domain",
             case BadAlign -> "buffer is not word-aligned",
             case BadBuffer -> "buffer is not in the process's writable memory",
+            case DuplicateKey -> "an attachment already uses that key",
         }
     }
 }
