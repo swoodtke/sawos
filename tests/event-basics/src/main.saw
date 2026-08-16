@@ -23,7 +23,11 @@
 // regression in the level-triggered path fails this case in a few microseconds
 // rather than at the harness timeout.
 
-import sos.{System, Process, Event, Waiter, WaitReport}
+// `EventMode` is imported like any other name this module publishes: it is a
+// value a PROCESS chooses and passes as a syscall argument, which is what makes
+// it API rather than kernel bookkeeping. There is one declaration of it in the
+// system and this is not it — see the `sos` module docstring.
+import sos.{System, Process, Event, EventMode, Waiter, WaitReport}
 
 /// The keys this process attaches under. They are ITS OWN WORDS — §2.2 has the
 /// kernel store one and hand it back unread, so what a key means is entirely a
@@ -94,7 +98,10 @@ func _start(boot_handle: UInt) {
             return
         },
     }
-    let b = match proc.create_event() {
+    // `a` above took the DEFAULT mode and this one names it. The two events
+    // behave identically below, which is the default parameter being checked
+    // rather than assumed.
+    let b = match proc.create_event(mode: EventMode.Or) {
         case Ok(ev) -> ev,
         case Err(e) -> {
             print("SOS events: no event b: {}\n", e)
@@ -164,7 +171,7 @@ func _start(boot_handle: UInt) {
     // ---- §2.4 SATURATING-SUM ----------------------------------------------
     // Signalled five times BEFORE it is attached, which exercises the other
     // half of level-triggering: an attachment that is already ready is ready.
-    let c = match proc.create_counting_event() {
+    let c = match proc.create_event(mode: EventMode.SaturatingSum) {
         case Ok(ev) -> ev,
         case Err(e) -> {
             print("SOS events: no counting event: {}\n", e)

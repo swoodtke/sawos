@@ -39,6 +39,39 @@
 //! documented difference in kind, not an oversight: the C altitude buys a
 //! non-Saw process the same operations with none of the same protection, and a
 //! process that wants the protection writes Saw.
+//!
+//! WHICH ENUMS ARE PUBLIC API, AND WHICH ARE BOOKKEEPING (ruled Aug 16, user).
+//! The vDSO discipline is about OP NUMBERS, not about argument encodings, and
+//! the line runs exactly there:
+//!
+//!   PUBLIC — an enum whose values a PROCESS CHOOSES and passes as a syscall
+//!   argument. `EventMode` is the first. A caller names it
+//!   (`create_event(mode: EventMode.SaturatingSum)`), so it is API, and the
+//!   alternative — a method per mode — reads fine at two and stops scaling at
+//!   the next object: M3's Mapping brings an access mode AND a memory type, and
+//!   a method per combination is a matrix rather than a list. Mapping inherits
+//!   this pattern.
+//!
+//!   KERNEL-INTERNAL — op numbers, rights bits, `ObjType`, `FaultReason`, the
+//!   dispatch's bookkeeping. A process never writes one of these, which is what
+//!   leaves the kernel free to renumber between builds.
+//!
+//! EXACTLY ONE DECLARATION EITHER WAY, and for a public one that declaration
+//! stays in `sosabi` — the kernel's dispatch decodes the same enum, and a second
+//! copy here is precisely the skew that file exists to prevent. Saw's imports
+//! RE-EXPORT, so the one declaration is reachable through this module and a
+//! process writes `import sos.{EventMode}`. It is worth knowing that the
+//! re-export is INDISCRIMINATE — everything imported here is reachable through
+//! here, and `sosabi` is on a process's module path as a transitive dependency
+//! regardless — so the split above is held by what userspace is TOLD to write
+//! rather than by a wall. That was already true; the rule only says which side
+//! of the line each family sits on.
+//!
+//! (The other direction was probed and does not work: the enum cannot MOVE here
+//! and be imported by the kernel, because this module and the kernel HAL export
+//! the two runtime hooks under the same C names for their two sides — importing
+//! one into the other is a duplicate-`@export` error, since a Saw import
+//! compiles the whole module into the unit.)
 
 import sosabi.{SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp, SosStatus,
                SystemHandle, ProcessHandle, ThreadHandle, EventHandle,
@@ -459,30 +492,24 @@ public extension Process {
         call_value(self.handle, ProcessOp.GetStatus as UInt, 0, 0, 0)
     }
 
-    /// Make an Event that accumulates BY OR — §2.4's flag set, "which of these
-    /// events occurred since last drain". The signal use case, and the one to
-    /// reach for unless you are counting. Requires `ProcessRight.CreateEvent`.
-    public func create_event(&self) -> Result<Event, SosStatus> {
-        self.event_of(EventMode.Or)
-    }
-
-    /// Make an Event that COUNTS, saturating — §2.4's counting semaphore, "how
-    /// many times". It saturates rather than wrapping, so a producer faster
-    /// than its consumer loses count but never rolls back through zero.
-    /// Requires `ProcessRight.CreateEvent`.
-    public func create_counting_event(&self) -> Result<Event, SosStatus> {
-        self.event_of(EventMode.SaturatingSum)
-    }
-
-    /// TWO METHODS RATHER THAN ONE TAKING A MODE, deliberately. The mode's wire
-    /// value lives in `sosabi`, which is KERNEL-INTERNAL (§5.7's vDSO
-    /// discipline) — a process links this module and never names one of its
-    /// types — so offering `create_event(mode:)` would mean either exporting an
-    /// enum out of a module nothing outside the kernel may import, or declaring
-    /// a second copy of it here, which is exactly the skew that file exists to
-    /// prevent. Naming the mode in the METHOD costs a word at the call site and
-    /// keeps the number where it belongs.
-    func event_of(&self, mode: EventMode) -> Result<Event, SosStatus> {
+    /// Make an Event accumulating in `mode` — §2.4's per-Event property, fixed
+    /// for the object's life. Requires `ProcessRight.CreateEvent`.
+    ///
+    /// `EventMode.Or` is the flag set, "which of these events occurred since
+    /// last drain", and it is the default because it is the signal use case.
+    /// `EventMode.SaturatingSum` is the counting semaphore, "how many times",
+    /// and it saturates rather than wrapping — so a producer faster than its
+    /// consumer loses count but never rolls back through zero, which is the
+    /// value that means "not ready".
+    ///
+    /// ONE METHOD TAKING THE MODE, not one method per mode (ruled Aug 16,
+    /// user, reversing this module's first answer). A method per mode reads
+    /// fine at two and stops scaling immediately: M3's Mapping brings an access
+    /// mode and a memory type, and a method per combination is a matrix rather
+    /// than a list. The mode is a VALUE the caller chooses, so it is spelled
+    /// as one. See the module docstring for which enums are public API.
+    public func create_event(&self,
+                             mode: EventMode = EventMode.Or) -> Result<Event, SosStatus> {
         let raw = try call_value(self.handle, ProcessOp.CreateEvent as UInt,
                                  mode as UInt, 0, 0)
         return Event(handle: EventHandle(raw))
