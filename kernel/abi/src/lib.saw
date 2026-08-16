@@ -517,20 +517,91 @@ public enum EventMode: UInt {
     case SaturatingSum = 1,
 }
 
-/// WHAT BECAME READY, the second half of `Waiter.Wait`'s answer (§2.2's
-/// `(key, readiness)` pair).
+// =============================================================================
+// The wait record (spec §2.2, as amended by design 178 M2 unit 3 rider 3)
+// =============================================================================
+//
+// `Waiter.Wait` answers with a RECORD the kernel COPIES OUT into a buffer the
+// caller supplies, not with registers. That is what lets the answer carry a
+// per-waitable payload without the ABI growing a register per object kind: a
+// Channel's readiness is not a Timer's is not an Event's, and a fixed register
+// pair would have had to be the union of all of them forever.
+//
+// THE KEY IS UNIVERSAL AND IS FACTORED OUT. Every waitable answers with the
+// word its attacher supplied (§2.2: it can directly encode the waiting task's
+// identity, so the kernel neither interprets it nor constrains it); only the
+// PAYLOAD varies by kind. So the record is `key, tag, payload...` and a reader
+// gets the key without knowing what fired.
+//
+// THE WIRE FORMAT IS PUBLIC AND FIXED-WIDTH-BY-WORD: word 0 the key, word 1 the
+// tag, word 2 onward the payload. It is machine words rather than fixed 32-bit
+// fields because it never leaves the machine — unlike `sosimg`, which is a file
+// two profiles must both read (design 47's discipline applies there and not
+// here), this crosses one privilege boundary inside one address space.
+
+/// Which kind of waitable a record describes — the record's TAG WORD.
 ///
-/// A MASK, not a tag — several conditions on one handle can be ready at once,
-/// which is why the wait result carries a `UInt` of these bits rather than one
-/// case. M2's only waitable is the Event, which has exactly one condition; the
-/// bits §2.2 and §8 already imply are what the remaining values are reserved
-/// for (a Channel readable vs reply-ready, a Thread or Process exited).
+/// Raw-backed (design 145's wire idiom): every case states its number, so a
+/// reorder cannot renumber them, and the userspace decode reads it through
+/// `from(raw:)`, which is total. The tag SPACE is extensible: §2.2 and §8
+/// already name the kinds that follow (a Channel readable or reply-ready, a
+/// Timer fired, an Interrupt asserted, a Thread or Process exited), and each
+/// takes the next number without moving this one.
 ///
-/// The KEY is the first half and it is not here, because it is a word the
-/// ATTACHER chose — §2.2's point is that it can directly encode the waiting Saw
-/// task's identity, so the kernel neither interprets it nor constrains it.
-public enum WaiterReadiness: UInt {
-    case Signalled = 1,
+/// AN UNKNOWN TAG IS A PANIC in the decode, not a `None` a caller handles. The
+/// kernel WROTE it, out of this same declaration — so a tag userspace cannot
+/// name is a kernel/`sos` skew, which is a bug in the pair rather than data
+/// from an untrusted source. Never-hide says it should be loud.
+public enum WaitTag: UInt {
+    case Event = 0,
+}
+
+/// Words in a wait record: key, tag, payload.
+public static WAIT_RECORD_WORDS: Int = 3
+
+/// Where each lives. Named rather than written, on both sides of the boundary.
+public static WAIT_KEY_WORD: Int = 0
+public static WAIT_TAG_WORD: Int = 1
+public static WAIT_PAYLOAD_WORD: Int = 2
+
+/// Bytes in a wait record on THIS machine — the minimum capacity a caller must
+/// give `Waiter.Wait`, and what the kernel checks the buffer against.
+///
+/// A FUNCTION AND NOT A `static`, which is a language limitation rather than a
+/// choice: `sizeof<UInt>()` does not fold in a static initializer, even though
+/// design 186's own diagnostic lists it among the things that do (DF-178f). The
+/// arithmetic folds perfectly well in an ordinary expression, so the constant is
+/// spelled where it is used and this is the one place it is written.
+public func wait_record_bytes() -> Int {
+    WAIT_RECORD_WORDS * sizeof<UInt>()
+}
+
+/// What became ready, decoded — one case per waitable kind.
+///
+/// The Event's payload is its ACCUMULATED WORD, and carrying it here is what
+/// makes the common wait one syscall instead of two: a dispatcher that only
+/// needs to know how many times something happened never has to follow up with
+/// a `receive`. The word is a COPY — §2.4's drain is still `receive`, and the
+/// event stays ready until one happens, which is level-triggering unchanged.
+///
+/// IT IS A SNAPSHOT TAKEN WHEN THE WAIT WAS ANSWERED, not when the waiter next
+/// runs, and the difference is observable: a producer that signals again
+/// between the wake and the woken thread's first instruction makes the later
+/// `receive` LARGER than the word in the record. Neither number is wrong — the
+/// record says what the wait was woken for and `receive` says what has
+/// accumulated since the last drain — and a reader who needs the authoritative
+/// count reads the second. The alternative, filling the record at resume, would
+/// put a write to user memory somewhere other than the wake and buy nothing:
+/// the count could go stale again before the thread read it.
+public enum WaitPayload {
+    case Event(word: UInt),
+}
+
+/// `Waiter.Wait`'s answer: the attacher's key, and what fired.
+public struct WaitResult {
+    /// The word supplied at `add`, handed back unread.
+    public key: UInt,
+    public what: WaitPayload,
 }
 
 // =============================================================================
@@ -640,6 +711,8 @@ public enum FaultReason: UInt8 {
     case Deadlock = 7,
     case NotWaitable = 8,
     case BadArg = 9,
+    case BadAlign = 10,
+    case BadBuffer = 11,
 }
 
 public extension FaultReason {
@@ -655,6 +728,8 @@ public extension FaultReason {
             case Deadlock -> "every thread blocked",
             case NotWaitable -> "not a waitable",
             case BadArg -> "argument outside its domain",
+            case BadAlign -> "buffer is not word-aligned",
+            case BadBuffer -> "buffer is not in the process's writable memory",
         }
     }
 }

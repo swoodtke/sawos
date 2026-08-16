@@ -44,13 +44,17 @@
 //! The vDSO discipline is about OP NUMBERS, not about argument encodings, and
 //! the line runs exactly there:
 //!
-//!   PUBLIC — an enum whose values a PROCESS CHOOSES and passes as a syscall
-//!   argument. `EventMode` is the first. A caller names it
-//!   (`create_event(mode: EventMode.SaturatingSum)`), so it is API, and the
-//!   alternative — a method per mode — reads fine at two and stops scaling at
-//!   the next object: M3's Mapping brings an access mode AND a memory type, and
-//!   a method per combination is a matrix rather than a list. Mapping inherits
-//!   this pattern.
+//!   PUBLIC — an enum or record whose values a PROCESS CHOOSES and passes as a
+//!   syscall argument, or that the kernel HANDS BACK as data. `EventMode` is
+//!   the first kind: a caller names it (`create_event(mode:
+//!   EventMode.SaturatingSum)`), so it is API, and the alternative — a method
+//!   per mode — reads fine at two and stops scaling at the next object, where
+//!   M3's Mapping brings an access mode AND a memory type and a method per
+//!   combination is a matrix rather than a list. `WaitTag` / `WaitPayload` /
+//!   `WaitResult` and the wait record's word offsets are the second kind: the
+//!   kernel WRITES that record and userspace READS it, so its layout is a
+//!   contract between the two and one declaration has to serve both. Mapping
+//!   inherits both patterns.
 //!
 //!   KERNEL-INTERNAL — op numbers, rights bits, `ObjType`, `FaultReason`, the
 //!   dispatch's bookkeeping. A process never writes one of these, which is what
@@ -75,7 +79,10 @@
 
 import sosabi.{SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp, SosStatus,
                SystemHandle, ProcessHandle, ThreadHandle, EventHandle,
-               WaiterHandle, EventMode, WaiterReadiness}
+               WaiterHandle, EventMode,
+               WaitTag, WaitResult, WaitPayload, WAIT_RECORD_WORDS,
+               WAIT_KEY_WORD, WAIT_TAG_WORD, WAIT_PAYLOAD_WORD,
+               wait_record_bytes}
 
 // The scalar-to-console-byte rule, shared with the kernel's own console so the
 // two cannot disagree about what a non-ASCII scalar becomes.
@@ -89,9 +96,6 @@ extern "C" {
     func sos_syscall1(handle: UInt, op: UInt, arg0: UInt) -> UInt
     func sos_syscall3(handle: UInt, op: UInt, arg0: UInt, arg1: UInt, arg2: UInt,
                       value_out: UnsafePointer<UInt>) -> UInt
-    func sos_syscall1_pair(handle: UInt, op: UInt, arg0: UInt,
-                           value_out: UnsafePointer<UInt>,
-                           value2_out: UnsafePointer<UInt>) -> UInt
 }
 
 
@@ -166,20 +170,6 @@ func call_value(handle: UInt, op: UInt, arg0: UInt, arg1: UInt,
     checked_value(raw, value)
 }
 
-/// Issue the one op that answers with TWO values — `Waiter.wait`, whose result
-/// spec §2.2 ratifies as a `(key, readiness)` pair.
-///
-/// `unsafe` for the same confined reason `call_value` is: two out-parameters
-/// rather than one, neither of which leaves this function.
-func call_pair(handle: UInt, op: UInt, arg0: UInt) unsafe -> Result<WaitReport, SosStatus> {
-    var key: UInt = 0
-    var readiness: UInt = 0
-    let raw = sos_syscall1_pair(handle, op, arg0,
-                                (&var key) as UnsafePointer<UInt>,
-                                (&var readiness) as UnsafePointer<UInt>)
-    try checked(raw)
-    return WaitReport(key: key, readiness: readiness)
-}
 
 // =============================================================================
 // The C-ABI surface (spec §5.7) — for non-Saw languages
@@ -335,16 +325,24 @@ public func sos_waiter_remove(handle: UInt, target: UInt) -> UInt {
     sos_syscall1(handle, WaiterOp.Remove as UInt, target)
 }
 
-/// Block until an attached handle is ready; answer with the attacher's key and
-/// what became ready (spec §2.2). Requires `WaiterRight.Wait`.
+/// Block until an attached handle is ready, and COPY OUT a record describing it
+/// into `buf` (spec §2.2, as amended by design 178 unit 3 rider 3). Requires
+/// `WaiterRight.Wait`.
 ///
-/// TWO out-parameters, because the result is a PAIR and the C ABI this surface
-/// is declared against has no aggregate return — the same shape `value_out`
-/// takes for the ops that answer with one word, one register further along.
+/// `cap` is the buffer's size in BYTES and must be at least
+/// `wait_record_bytes()`. The buffer must be word-aligned and inside this
+/// process's writable memory; a buffer that is not TERMINATES the process,
+/// because it is a mistake only the caller could have made.
+///
+/// The record's layout is public: word 0 the attacher's key, word 1 a `WaitTag`,
+/// word 2 the payload. A C caller reads the words; a Saw caller gets them
+/// decoded into a `WaitResult` by `Waiter.wait` below.
 @export("sos_waiter_wait")
-public func sos_waiter_wait(handle: UInt, key_out: UnsafePointer<UInt>,
-                            readiness_out: UnsafePointer<UInt>) unsafe -> UInt {
-    sos_syscall1_pair(handle, WaiterOp.Wait as UInt, 0, key_out, readiness_out)
+public func sos_waiter_wait(handle: UInt, buf: UnsafePointer<UInt>,
+                            cap: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, WaiterOp.Wait as UInt, buf as UInt, cap, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
 }
 
 // =============================================================================
@@ -618,27 +616,22 @@ public extension Event {
 // Waiter (spec §2.2; design 178 D5)
 // =============================================================================
 
-/// What `Waiter.wait` answers with: §2.2's `(key, readiness)` pair.
+/// Decode a record the kernel copied out into `WaitResult`.
 ///
-/// `key` is the WORD THE ATTACHER SUPPLIED, handed back unread — §2.2's point
-/// is that a word can directly encode the waiting task's identity, so a
-/// userspace executor dispatches on it with no side-table lookup. The kernel
-/// neither interprets it nor constrains it, zero included.
-///
-/// `readiness` is a MASK of what became ready. M2's only waitable is the Event,
-/// which has exactly one condition, so `is_signalled` is the whole of the
-/// question today — but it is a mask because a Channel has two (readable,
-/// reply-ready) and reading one bit out of a word is how that stays additive.
-public struct WaitReport {
-    public key: UInt,
-    public readiness: UInt,
-}
-
-public extension WaitReport {
-    /// Whether an Event was signalled. The predicate rather than the bit,
-    /// because the bit's value is `sosabi`'s and userspace never writes one.
-    public func is_signalled(&self) -> Bool {
-        (self.readiness & (WaiterReadiness.Signalled as UInt)) != 0
+/// AN UNKNOWN TAG PANICS, loudly, and that is deliberate. Every other decode in
+/// this module treats its input as data a process might legitimately be handed;
+/// this one does not, because the KERNEL wrote it out of the same `WaitTag`
+/// declaration this function reads. A tag that does not decode is therefore a
+/// skew between the kernel and the `sos` module it exports — a bug in the pair,
+/// not a runtime condition — and the never-hide rule says a bug the caller
+/// cannot act on should stop the program where it happened rather than become
+/// an `Err` somebody maps to "unknown".
+func decode_wait(key: UInt, tag: UInt, payload: UInt) -> WaitResult {
+    guard let kind = WaitTag.from(raw: tag) else {
+        panic("sos: kernel wrote wait tag {}, which this build cannot name", tag)
+    }
+    match kind {
+        case Event -> WaitResult(key: key, what: WaitPayload.Event(word: payload)),
     }
 }
 
@@ -676,16 +669,35 @@ public extension Waiter {
         checked(sos_waiter_remove(self.handle, event.handle))
     }
 
-    /// Block until an attached handle is ready, and answer with its key.
-    /// Requires `WaiterRight.Wait`.
+    /// Block until an attached handle is ready, and answer with the attacher's
+    /// key and what fired. Requires `WaiterRight.Wait`.
     ///
     /// Returns IMMEDIATELY when something is already ready, which is what
     /// level-triggering buys: the readiness a signal left behind is still
     /// there, so "signal then wait" and "wait then signal" have the same
     /// outcome and only the second one parks.
-    public func wait(&self) -> Result<WaitReport, SosStatus> {
-        call_pair(self.handle, WaiterOp.Wait as UInt, 0)
+    ///
+    /// THE BUFFER IS THIS FRAME'S, and a caller never sees it. The kernel
+    /// answers a wait by copying a record into the caller's own memory (it has
+    /// no allocator and nowhere to put one that would outlive the call), so
+    /// somebody has to supply the bytes; supplying them HERE is what keeps a
+    /// raw address out of the typed surface, exactly as the handle rule keeps
+    /// raw handle words out. The stack is the right place for them: the record
+    /// is three words and the frame outlives the park, since the frame is the
+    /// parked thread's own stack.
+    public func wait(&self) -> Result<WaitResult, SosStatus> {
+        wait_into_frame(self.handle)
     }
+}
+
+/// The `unsafe` half of `wait`, confined to one small named helper (design 136).
+/// The buffer's address never leaves it.
+func wait_into_frame(handle: WaiterHandle) unsafe -> Result<WaitResult, SosStatus> {
+    var buf: [UInt; WAIT_RECORD_WORDS] = [0; WAIT_RECORD_WORDS]
+    try checked(sos_waiter_wait(handle, (&var buf) as UnsafePointer<UInt>,
+                                wait_record_bytes() as UInt))
+    return decode_wait(buf[WAIT_KEY_WORD], buf[WAIT_TAG_WORD],
+                       buf[WAIT_PAYLOAD_WORD])
 }
 
 // =============================================================================

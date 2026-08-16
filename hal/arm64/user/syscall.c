@@ -71,29 +71,3 @@ u64 sos_syscall3(u64 handle, u64 op, u64 arg0, u64 arg1, u64 arg2, u64 *value_ou
     *value_out = x1;
     return x0;
 }
-
-// One argument and TWO values back, for `Waiter.Wait` — spec §2.2 ratifies its
-// result as a `(key, readiness)` PAIR, and one out-parameter cannot carry two
-// words (design 178 M2 unit 3).
-//
-// The difference from `sos_syscall3` is the second value register's CONSTRAINT:
-// there it is `"r"` — an input the asm promises not to change — and here it is
-// `"+r"`, because this op's answer lands in it. That is why the two are
-// separate functions rather than one with a wider signature: a kernel writing
-// the register on a return the stub declared input-only would be breaking a
-// promise the compiler is entitled to schedule around. Kept in step with the
-// riscv32 twin.
-u64 sos_syscall1_pair(u64 handle, u64 op, u64 arg0, u64 *value_out,
-                      u64 *value2_out) {
-    register u64 x0 __asm__("x0") = handle;
-    register u64 x1 __asm__("x1") = arg0;
-    register u64 x2 __asm__("x2") = 0;
-    register u64 x8 __asm__("x8") = op;
-    __asm__ volatile("svc #0"
-                     : "+r"(x0), "+r"(x1), "+r"(x2)
-                     : "r"(x8)
-                     : "memory");
-    *value_out = x1;
-    *value2_out = x2;
-    return x0;
-}

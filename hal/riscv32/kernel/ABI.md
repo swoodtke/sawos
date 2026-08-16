@@ -48,8 +48,18 @@ is four instructions and a branch into the trap entry's own restore path.
 | `trap_pc(frame) -> UInt` | Where the trapped context resumes: the faulting instruction on a fault, the interrupted one on an interrupt. (Was `fault_pc`; the value never was fault-specific.) |
 | `syscall_handle/op/arg0/arg1/arg2(frame) -> UInt` | The §5.7 argument registers, by role rather than by name. Three argument slots since design 178 M2 unit 2: `Process.CreateThread` takes an entry, a stack and an argument. |
 | `syscall_return(frame, status, value)` | Place the (status, value) pair where the caller reads them and step the saved PC past the trapping instruction — which is a no-op on a profile whose trap already points past it. |
-| `syscall_return_pair(frame, status, value, value2)` | The same for the ONE op that answers with two words: `Waiter.Wait`, whose result spec §2.2 ratifies as a `(key, readiness)` pair (design 178 M2 unit 3). The second value lands in the register after the first. It is a SEPARATE entry point rather than a wider `syscall_return` because that register is an ARGUMENT register on the way in, and the user-side stub declares it input-only for every other op — a kernel writing it on a return that did not promise to would break a constraint the compiler is entitled to schedule around. So an op says which shape it answers in. |
 | `UNMAPPED_PROBE: UInt` | An address the KERNEL cannot reach here. The harness's kernel-fault case reads it; it is per-target because "unmapped" is. |
+
+**THE SYSCALL RETURN CARRIES A (status, value) PAIR AND NOTHING WIDER**, and
+that is a deliberate floor rather than a limit nobody hit. Design 178 M2 unit 3
+first added a `syscall_return_pair` so `Waiter.Wait` could answer with two
+values; the ruling that replaced it (rider 3) took the answer OUT of the
+registers entirely — the kernel now COPIES OUT a record into memory the caller
+supplies, which is SOS's first kernel-writes-userspace path. The HAL is not
+involved in that: a copy-out is a store to an address, and the check that makes
+it safe (`copy_out` in `kcore`, the only door) names no machine. So this seam
+has exactly the shape it had in M1, and the ops whose answers do not fit a word
+grow a buffer argument instead of a register.
 
 ## Thread contexts (design 178 M2 unit 2)
 

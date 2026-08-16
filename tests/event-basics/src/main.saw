@@ -6,17 +6,23 @@
 // REPORTS, with the scheduler held out of it. The transcript is six lines and
 // each is a separate ratified sentence:
 //
-//   signal-then-wait key=11 signalled=1 word=4   <- §2.2 level-triggered: the
+//   signal-then-wait key=11 at-wait=4 drained=4  <- §2.2 level-triggered: the
 //                                                   signal came FIRST and was
 //                                                   still there
-//   second key=22 signalled=1 word=8             <- §2.2 the key identifies
+//   second key=22 at-wait=8 drained=8            <- §2.2 the key identifies
 //                                                   WHICH of two attachments
-//   or key=11 word=3                             <- §2.4 bitwise-OR: 1|2|1
+//   or key=11 at-wait=3 drained=3                <- §2.4 bitwise-OR: 1|2|1
 //   detached word=8                              <- §2.2 remove: still an
 //                                                   Event, no longer watched
-//   counting key=33 n=5 saturated=1              <- §2.4 saturating-sum, and
+//   counting key=33 at-wait=5 drained=5 saturated=1
+//                                                <- §2.4 saturating-sum, and
 //                                                   that it SATURATES
 //   done
+//
+// `at-wait` is read out of the RECORD the kernel copied into this process's
+// memory and `drained` out of a following `receive`; they agree everywhere,
+// which is what says the record's payload is the real accumulated word rather
+// than a flag.
 //
 // EVERY WAIT RETURNS IMMEDIATELY. A wait that found nothing would park the only
 // thread in the system, which the kernel reports as the deadlock it is — so a
@@ -27,7 +33,7 @@
 // value a PROCESS chooses and passes as a syscall argument, which is what makes
 // it API rather than kernel bookkeeping. There is one declaration of it in the
 // system and this is not it — see the `sos` module docstring.
-import sos.{System, Process, Event, EventMode, Waiter, WaitReport}
+import sos.{System, Process, Event, EventMode, Waiter, WaitResult, WaitPayload}
 
 /// The keys this process attaches under. They are ITS OWN WORDS — §2.2 has the
 /// kernel store one and hand it back unread, so what a key means is entirely a
@@ -66,6 +72,19 @@ func drained(e: &Event) -> UInt {
     match e.receive() {
         case Ok(word) -> word,
         case Err(_) -> NO_VALUE,
+    }
+}
+
+/// The accumulated word a WAIT reported, out of the record the kernel copied
+/// out. A `match` rather than a field access because the payload is per-kind by
+/// construction (§2.2) — M2 has one kind, so one arm, and the next waitable
+/// makes this a real choice rather than an edit.
+///
+/// It is a SNAPSHOT taken when the wait returned, so it still reads what fired
+/// after the event has been drained — which is what the transcript compares.
+func at_wait(r: &WaitResult) -> UInt {
+    match r.what {
+        case Event(word) -> word,
     }
 }
 
@@ -125,9 +144,13 @@ func _start(boot_handle: UInt) {
             return
         },
     }
+    // The two numbers are the same fact observed twice: what the WAIT reported
+    // out of the copied-out record, and what the DRAIN took out of the event.
+    // They agree because the record carries the accumulated word, which is what
+    // makes the common case one syscall instead of two.
     let first_word = drained(&a)
-    print("SOS events: signal-then-wait key={} signalled={} word={}\n",
-          first.key, flag(first.is_signalled()), first_word)
+    print("SOS events: signal-then-wait key={} at-wait={} drained={}\n",
+          first.key, at_wait(&first), first_word)
 
     // ---- §2.2 WHICH one became ready ---------------------------------------
     // Two handles on one Waiter and the other one signalled: the answer has to
@@ -142,8 +165,8 @@ func _start(boot_handle: UInt) {
         },
     }
     let second_word = drained(&b)
-    print("SOS events: second key={} signalled={} word={}\n",
-          second.key, flag(second.is_signalled()), second_word)
+    print("SOS events: second key={} at-wait={} drained={}\n",
+          second.key, at_wait(&second), second_word)
 
     // ---- §2.4 BITWISE-OR accumulation --------------------------------------
     // Three signals, one repeated: a flag set answers 3, not 4.
@@ -159,7 +182,8 @@ func _start(boot_handle: UInt) {
         },
     }
     let or_word = drained(&a)
-    print("SOS events: or key={} word={}\n", third.key, or_word)
+    print("SOS events: or key={} at-wait={} drained={}\n",
+          third.key, at_wait(&third), or_word)
 
     // ---- §2.2 REMOVE: the attachment goes, the object stays ----------------
     // A detached Event still accumulates and still drains; it is simply not
@@ -201,8 +225,8 @@ func _start(boot_handle: UInt) {
     let _ = c.signal(UInt.max)
     let _ = c.signal(UInt.max)
     let saturated = drained(&c)
-    print("SOS events: counting key={} n={} saturated={}\n",
-          fourth.key, counted, flag(saturated == UInt.max))
+    print("SOS events: counting key={} at-wait={} drained={} saturated={}\n",
+          fourth.key, at_wait(&fourth), counted, flag(saturated == UInt.max))
 
     let _ = system.debug_print("SOS events: done\n")
 

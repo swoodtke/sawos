@@ -83,11 +83,39 @@ names provisional):
 ### 2.2 Waiter: the generic wait aggregator (ratified Jul 29)
 
 - epoll/Port-style. `waiter.add(handle, key)` attaches a waitable;
-  `waiter.wait() -> (key, readiness)` blocks until any attached handle
-  is ready and returns the **word-sized key the attacher supplied**
-  (not just a bit — a word can directly encode the waiting Saw task's
-  identity, so kernel wake sources dispatch to userspace tasks with no
-  side-table lookup — the async-executor integration point).
+  `waiter.wait(buffer, capacity)` blocks until any attached handle is
+  ready and **copies out a RECORD** naming the **word-sized key the
+  attacher supplied** (not just a bit — a word can directly encode the
+  waiting Saw task's identity, so kernel wake sources dispatch to
+  userspace tasks with no side-table lookup — the async-executor
+  integration point) plus a per-kind payload.
+- **THE RESULT SHAPE, AMENDED** (Jul 29's `wait() -> (key, readiness)`
+  register pair → this record; ratified Aug 16, user, as design 178 M2
+  unit 3 rider 3 — the one place a ratified section has changed).
+  The record is `key` word, `tag` word, payload words, with the sizes and
+  word offsets published as constants and the tag a raw-backed enum (the
+  §2 design-145 wire idiom) whose value space is extensible. Why: the KEY
+  is universal and the PAYLOAD is not — a Channel's readiness is not a
+  Timer's is not an Event's — so a fixed register pair would have had to
+  be the union of every waitable's answer forever, and the register file
+  is the one thing that cannot grow. The Event's payload is its
+  accumulated word, which makes the common wait one syscall instead of
+  two; it is a SNAPSHOT taken when the wait was answered, so a producer
+  signalling again before the woken thread runs makes a following
+  `receive` larger, and `receive` stays the authoritative drain.
+- **Copy-out is checked, and it is one door.** This is the first place the
+  kernel writes a process's memory. The destination must be word-aligned
+  and inside the process's writable grant; one that is not TERMINATES the
+  process (§5.7's faults ruling — a process linked its own image and knows
+  where its data is). A single kernel funnel performs that check for
+  everything that will ever copy out, §2.1's message body included; it is
+  also the only place the kernel dereferences a user address, which is
+  what makes the per-address-space mapping switch a one-place change when
+  there is more than one address space.
+- The buffer is the CALLER's, because the kernel has no allocator and
+  nowhere to put one that would outlive the call. The typed Saw wrapper
+  supplies it out of its own frame, so a raw address never appears in
+  that surface.
 - Waitables: Channel (readable / reply-ready), Event, Timer,
   Interrupt, ReplyHandle. **Attach semantics (ratified Jul 29):**
   **level-triggered** (keeps reporting ready until the waiter handles

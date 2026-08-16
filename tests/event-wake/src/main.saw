@@ -6,8 +6,16 @@
 //   SOS wake: worker started, parking     <- the initial thread, before wait()
 //   SOS wake: worker signalling           <- the OTHER thread, which could only
 //                                            have run because the first parked
-//   SOS wake: woke key=77 signalled=1 word=5
+//   SOS wake: woke key=77 at-wait=1 drained=5
 //   SOS wake: joined worker=99
+//
+// THE TWO NUMBERS DIFFER ON PURPOSE, and the gap is the third thing this case
+// proves. The worker signals five times; the FIRST signal is what wakes the
+// parked thread, so the record it copied out says 1 — the record is a SNAPSHOT
+// taken when the wait was answered. The other four land while the woken thread
+// is still only runnable, so the `receive` that follows drains 5. Neither is
+// wrong: the record says what the wait was woken for, `receive` says what has
+// accumulated. A reader who needs the authoritative count reads the second.
 //
 // A `wait` that answered without parking would put the middle line last, since
 // nothing else can move the processor: this image's kernel arms NO timer, and
@@ -28,7 +36,8 @@
 // the same object. The kernel is not involved, because the handle TABLE is the
 // process's and both threads were already inside it.
 
-import sos.{System, Process, Thread, Event, EventMode, Waiter}
+import sos.{System, Process, Thread, Event, EventMode, Waiter, WaitResult,
+            WaitPayload}
 
 /// The boot handle, parked for the worker — and the witness that says which
 /// thread `_start` is running as (handle 0 names nothing, so a parked one is
@@ -66,6 +75,16 @@ static EXIT_FAILED: UInt = 1
 
 func flag(b: Bool) -> UInt {
     if b { YES } else { NO }
+}
+
+/// The word the WAIT reported, out of the record the kernel copied into this
+/// process's memory while this thread was parked — which is the interesting
+/// part: the writer was the OTHER thread's signal, and this buffer is on the
+/// parked thread's own stack.
+func at_wait(r: &WaitResult) -> UInt {
+    match r.what {
+        case Event(word) -> word,
+    }
 }
 
 func stack_top(base: UInt) -> UInt {
@@ -186,8 +205,8 @@ func initial(boot_handle: UInt) {
         case Ok(v) -> v,
         case Err(_) -> NO_VALUE,
     }
-    print("SOS wake: woke key={} signalled={} word={}\n",
-          report.key, flag(report.is_signalled()), word)
+    print("SOS wake: woke key={} at-wait={} drained={}\n",
+          report.key, at_wait(&report), word)
 
     // The worker exited on its way out of `signal`, so this join answers out of
     // its slot rather than parking again.

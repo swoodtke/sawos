@@ -35,7 +35,7 @@ import sosabi.{
     ObjType, SystemHandle, ProcessHandle, ThreadHandle, EventHandle, WaiterHandle,
     SystemRight, ProcessRight, ThreadRight, EventRight, WaiterRight,
     SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp,
-    EventMode, WaiterReadiness,
+    EventMode, WaitTag, WAIT_RECORD_WORDS, wait_record_bytes,
     SosStatus, FaultReason, ProcessStatusKind, process_status_word,
     root_system_rights, root_process_rights, thread_rights,
     event_rights, waiter_rights,
@@ -373,6 +373,11 @@ struct ThreadSlot {
     joiners: Int,
     /// Next slot on whichever list this thread is on (slot + 1).
     link: Int,
+    /// Where a thread parked in `Waiter.Wait` wants its record written — a user
+    /// address, ALREADY VALIDATED by `copy_out_check` at the call. Validating at
+    /// the call rather than at the wake is what makes a bad buffer terminate the
+    /// process that supplied it, while it is still the running one.
+    wait_buf: UInt,
 }
 
 /// What a process slot is doing.
@@ -395,6 +400,24 @@ enum ProcessState: UInt8 {
 /// primitive. Real Mapping objects are M3; what this pair does today is answer
 /// the one question thread creation has to ask — is this entry, is this stack,
 /// inside the process at all.
+/// `rw_base`/`rw_top` are the WRITABLE window inside that range, and they exist
+/// because the kernel now writes into a process's memory (`copy_out`). A
+/// process that asks the kernel to place a record in its own CODE has made a
+/// caller-checkable mistake, and the check needs somewhere to read the answer
+/// from. It is ONE window rather than a per-segment list because M2 grants a
+/// contiguous image (spec §5.5's `code|rodata|rw` layout) plus a stack at the
+/// region's top edge, so the writable part is the span between them — and
+/// because the per-mapping answer is M3's, where a Mapping object records its
+/// own permissions and this pair is replaced by a lookup rather than widened.
+/// It is CONSERVATIVE in one direction only: a gap between the image's writable
+/// end and the stack falls inside the span, so the kernel may write RAM the
+/// process was not granted. That corrupts nothing — the process owns the whole
+/// region either way, and a process that names a hole gets a record it cannot
+/// read, which is its own bug.
+///
+/// Zero/zero means NO writable grant, and that is the honest answer for the
+/// harness kernels that grant a payload its own bytes read+execute: a process
+/// with nowhere to receive a record cannot receive one.
 struct ProcessSlot {
     state: ProcessState,
     /// This process's own handle in its own table (what `SelfProcess` returns).
@@ -403,6 +426,8 @@ struct ProcessSlot {
     entry: UInt,
     region_base: UInt,
     region_top: UInt,
+    rw_base: UInt,
+    rw_top: UInt,
     exit_kind: ProcessStatusKind,
     exit_code: UInt,
 }
@@ -467,11 +492,11 @@ struct WaiterSlot {
 
 unsafe static var THREADS: [ThreadSlot; MAX_THREADS] = [
     ThreadSlot(state: ThreadState.Free, process: 0, self_handle: 0,
-               exit_code: 0, joiners: 0, link: 0); MAX_THREADS]
+               exit_code: 0, joiners: 0, link: 0, wait_buf: 0); MAX_THREADS]
 
 unsafe static var PROCESSES: [ProcessSlot; MAX_PROCESSES] = [
     ProcessSlot(state: ProcessState.Free, self_handle: 0, entry: 0,
-             region_base: 0, region_top: 0,
+             region_base: 0, region_top: 0, rw_base: 0, rw_top: 0,
              exit_kind: ProcessStatusKind.Running, exit_code: 0); MAX_PROCESSES]
 
 /// Every process's handle table, back to back: process `p`'s handle `h`
@@ -834,22 +859,50 @@ func waiter_ready_event(w: Int) unsafe -> Int {
     NO_EVENT
 }
 
-/// Park the running thread on `w`'s blocked list.
-func block_on_wait(slot: Int, w: Int) unsafe {
+/// Park the running thread on `w`'s blocked list, remembering where its record
+/// goes. `dst` has already been through `copy_out_check`.
+func block_on_wait(slot: Int, w: Int, dst: UInt) unsafe {
     THREADS[slot].state = ThreadState.Blocked
+    THREADS[slot].wait_buf = dst
     THREADS[slot].link = WAITERS[w].blocked
     WAITERS[w].blocked = slot + 1
     NEED_RESCHED = true
 }
 
+/// The record `Waiter.Wait` answers with, in kernel memory (spec §2.2, as
+/// amended by design 178 unit 3 rider 3).
+///
+/// Declaration order IS the layout (design 58), so the field names here and the
+/// word indices `sosabi` publishes are one description — pinned by the assert
+/// below rather than by agreement.
+struct WaitRecord {
+    key: UInt,
+    tag: UInt,
+    payload: UInt,
+}
+
+static_assert(sizeof<WaitRecord>() == WAIT_RECORD_WORDS * sizeof<UInt>(),
+              "the wait record must be exactly the words sosabi publishes")
+
+/// Build one and hand it to a process. The only producer of the wire form.
+func deliver_wait_record(p: Int, dst: UInt, key: UInt, tag: WaitTag,
+                         payload: UInt) unsafe {
+    var rec = WaitRecord(key: key, tag: tag as UInt, payload: payload)
+    copy_out(p, dst, ((&var rec) as UnsafePointer<WaitRecord>) as UInt,
+             wait_record_bytes() as UInt)
+}
+
 /// Hand a ready attachment to ONE thread parked on `w`, if any is (§2.2).
 ///
-/// The pair is written into the woken thread's frame HERE and nowhere else,
-/// which is the same discipline `exit_thread` follows for a joiner: a thread
-/// that blocked in a syscall was answered by nobody when it blocked, so its
-/// waker is the single writer of its (status, value) — here (status, key,
-/// readiness), the one op that answers with two words.
-func wake_one_waiter(w: Int, key: UInt, readiness: UInt) unsafe {
+/// The record goes into the woken thread's own buffer and its STATUS into the
+/// woken thread's frame, both HERE and nowhere else — the same discipline
+/// `exit_thread` follows for a joiner: a thread that blocked in a syscall was
+/// answered by nobody when it blocked, so its waker is its single writer.
+///
+/// THE WRITER IS A DIFFERENT THREAD from the one being answered, which is sound
+/// today because M2 has one address space; `copy_out`'s docstring is where that
+/// stops being free.
+func wake_one_waiter(w: Int, e: Int) unsafe {
     let head = WAITERS[w].blocked
     if head == 0 {
         return
@@ -857,7 +910,11 @@ func wake_one_waiter(w: Int, key: UInt, readiness: UInt) unsafe {
     let slot = head - 1
     WAITERS[w].blocked = THREADS[slot].link
     THREADS[slot].link = 0
-    write_result(frame_slot(slot), op_pair(key, readiness))
+
+    deliver_wait_record(THREADS[slot].process, THREADS[slot].wait_buf,
+                        EVENTS[e].key, WaitTag.Event, EVENTS[e].word)
+    THREADS[slot].wait_buf = 0
+    write_result(frame_slot(slot), op_ok())
     THREADS[slot].state = ThreadState.Runnable
     ready_push(slot)
 }
@@ -875,8 +932,7 @@ func signal_event(slot: Int, bits: UInt) unsafe {
     if attached == 0 {
         return
     }
-    wake_one_waiter(attached - 1, EVENTS[slot].key,
-                    WaiterReadiness.Signalled as UInt)
+    wake_one_waiter(attached - 1, slot)
 }
 
 /// Take event `e` off waiter `w`'s attachment list, and clear the attachment
@@ -948,7 +1004,7 @@ func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
                 case _ -> {
                     THREADS[t] = ThreadSlot(state: ThreadState.Free, process: 0,
                                             self_handle: 0, exit_code: 0,
-                                            joiners: 0, link: 0)
+                                            joiners: 0, link: 0, wait_buf: 0)
                     freed = freed + 1
                 },
             }
@@ -1093,43 +1149,26 @@ public func fatal(tag: String, cause: UInt, epc: UInt, tval: UInt, code: ExitCod
 /// is written into its frame by whatever wakes it, exactly once. Modelling that
 /// as a field rather than as a magic status is what keeps the return path from
 /// having to know which ops can park.
-/// `pair` says the answer occupies BOTH value registers — spec §2.2 ratifies
-/// `Waiter.Wait`'s result as a `(key, readiness)` pair, and it is the only op
-/// that answers with two words. It is a field rather than an inference from
-/// `value2 != 0` because the second register is an ARGUMENT register on the way
-/// in: an op that did not promise to answer in it must not write it, and a key
-/// of zero is a perfectly good key.
 struct SyscallResult {
     status: SosStatus,
     value: UInt,
-    value2: UInt,
-    pair: Bool,
     blocked: Bool,
 }
 
 func op_ok() -> SyscallResult {
-    SyscallResult(status: SosStatus.Ok, value: 0, value2: 0, pair: false,
-                  blocked: false)
+    SyscallResult(status: SosStatus.Ok, value: 0, blocked: false)
 }
 
 func op_value(v: UInt) -> SyscallResult {
-    SyscallResult(status: SosStatus.Ok, value: v, value2: 0, pair: false,
-                  blocked: false)
-}
-
-/// §2.2's `(key, readiness)`.
-func op_pair(key: UInt, readiness: UInt) -> SyscallResult {
-    SyscallResult(status: SosStatus.Ok, value: key, value2: readiness,
-                  pair: true, blocked: false)
+    SyscallResult(status: SosStatus.Ok, value: v, blocked: false)
 }
 
 func op_status(s: SosStatus) -> SyscallResult {
-    SyscallResult(status: s, value: 0, value2: 0, pair: false, blocked: false)
+    SyscallResult(status: s, value: 0, blocked: false)
 }
 
 func op_blocked() -> SyscallResult {
-    SyscallResult(status: SosStatus.Ok, value: 0, value2: 0, pair: false,
-                  blocked: true)
+    SyscallResult(status: SosStatus.Ok, value: 0, blocked: true)
 }
 
 /// THE ONE PLACE a syscall's answer is written into a thread's frame.
@@ -1147,13 +1186,14 @@ func op_blocked() -> SyscallResult {
 /// blocking protocol rests on: a blocked caller is skipped on the return path
 /// precisely so that its waker is the only writer, and a second write would
 /// step the saved PC twice on the profile that steps it at all.
+///
+/// It answers with a (status, value) pair and nothing wider. An op whose answer
+/// does not fit — `Waiter.Wait`'s record is the first — writes the rest into the
+/// caller's own memory through `copy_out` and returns a status here, which is
+/// what keeps the register convention (§5.7) the same shape it was in M1.
 func write_result(frame_addr: UInt, result: SyscallResult) unsafe {
-    let status = (result.status as UInt8) as UInt
-    if result.pair {
-        hal.syscall_return_pair(frame_addr, status, result.value, result.value2)
-    } else {
-        hal.syscall_return(frame_addr, status, result.value)
-    }
+    hal.syscall_return(frame_addr, (result.status as UInt8) as UInt,
+                       result.value)
 }
 
 /// Terminate the process from a position that OWES a `SyscallResult`.
@@ -1173,6 +1213,84 @@ func fault_result(p: Int, reason: FaultReason) unsafe -> SyscallResult {
 func fault_slot(p: Int, reason: FaultReason) unsafe -> Int {
     fault_process(p, reason)
     while { }
+}
+
+// -----------------------------------------------------------------------------
+// COPY-OUT: the one door from kernel memory into a process's
+// -----------------------------------------------------------------------------
+//
+// This is SOS's FIRST kernel-writes-userspace path, and it is built as a funnel
+// on the first use rather than after the third, because the shape of what
+// follows is already known: spec §2.1 has a Channel `receive` copying a message
+// body into the receiver's address space, and that is the same operation with a
+// bigger length.
+//
+// WHAT IT REFUSES, and why each is a FAULT rather than a status (design 178's
+// ruling — a caller error the process could have checked ends it):
+//
+//   - a destination that is not word-aligned. The kernel writes machine words;
+//     a misaligned store traps on one profile and is merely wrong on the other,
+//     and neither is something to discover at the wake.
+//   - a destination outside the process's WRITABLE window. A process asking the
+//     kernel to place a record in its own code has misread its own memory map.
+//
+// A process knows where its own writable memory is — it linked the image — so
+// both are caller-checkable in the strongest sense.
+//
+// M2 IS ONE ADDRESS SPACE, and that is what makes the write a plain copy: the
+// writer may be a DIFFERENT thread from the one that asked (a signaller waking
+// a parked waiter), and both are in the same process today. When M3 brings
+// several address spaces, the mapping switch goes HERE — this function is the
+// only place the kernel dereferences a user address, which is precisely the
+// property that makes that a one-place change.
+
+/// Word alignment, from the machine rather than from a constant. A function
+/// because `sizeof` does not fold in a static initializer — DF-178f, the same
+/// gap `sosabi`'s `wait_record_bytes` works around, and it folds fine here.
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+/// Validate a destination the kernel is about to write, or TERMINATE the
+/// process. Never returns on a bad buffer.
+///
+/// Split out from `copy_out` for exactly one caller: `Waiter.Wait` validates
+/// when it PARKS, so that a bad buffer ends the process that supplied it while
+/// that process is still the running one, rather than at some later wake in
+/// another thread's context. Every other consumer validates and copies in one
+/// step, which is what `copy_out` is.
+func copy_out_check(p: Int, dst: UInt, bytes: UInt) unsafe {
+    if (dst % word_bytes()) != 0 {
+        fault_process(p, FaultReason.BadAlign)
+    }
+    if dst < PROCESSES[p].rw_base {
+        fault_process(p, FaultReason.BadBuffer)
+    }
+    // Ordered so the subtraction below cannot underflow: `rw_top - dst` is only
+    // computed once `dst` is known to be inside the window. A hostile length
+    // must produce a diagnostic, not a panic — the loader's own discipline.
+    if dst >= PROCESSES[p].rw_top {
+        fault_process(p, FaultReason.BadBuffer)
+    }
+    if bytes > PROCESSES[p].rw_top - dst {
+        fault_process(p, FaultReason.BadBuffer)
+    }
+}
+
+/// Copy `bytes` from kernel memory at `src` into process `p` at `dst`.
+///
+/// THE ONE DOOR. Its consumers, current and intended:
+///
+///   - `Waiter.Wait` (here, both paths — the ready one and the wake);
+///   - the Interrupt object's wait result, when that lands;
+///   - M3's Channel `receive`, which is §2.1's message body and the reason this
+///     is a general copy rather than a record writer.
+///
+/// Nothing else in the kernel may dereference a user address. That is the whole
+/// rule, and it is one function long so it stays checkable by reading.
+func copy_out(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe {
+    copy_out_check(p, dst, bytes)
+    copy_bytes(dst, src, bytes)
 }
 
 /// The calling process. In M2 that is the process of the running thread, and
@@ -1396,7 +1514,7 @@ func create_thread(p: Int, entry: UInt, stack_top: UInt, arg: UInt) unsafe -> Sy
     hal.frame_init(frame_slot(slot), start, stack_top, arg)
     THREADS[slot] = ThreadSlot(state: ThreadState.Created, process: p,
                                self_handle: handle, exit_code: 0,
-                               joiners: 0, link: 0)
+                               joiners: 0, link: 0, wait_buf: 0)
     op_value(handle)
 }
 
@@ -1577,7 +1695,7 @@ func waiter_op_decoded(op: WaiterOp, obj: &WaiterObject, arg0: UInt, arg1: UInt,
             if not obj.allows(WaiterRight.Wait) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            waiter_wait(p, w)
+            waiter_wait(p, w, arg0, arg1)
         },
     }
 }
@@ -1605,7 +1723,7 @@ func waiter_add(p: Int, w: Int, handle: UInt, key: UInt) unsafe -> SyscallResult
     // wait" would lose the notification, which is the exact lost-edge this
     // semantics exists to rule out.
     if EVENTS[e].word != 0 {
-        wake_one_waiter(w, key, WaiterReadiness.Signalled as UInt)
+        wake_one_waiter(w, e)
     }
     op_ok()
 }
@@ -1621,22 +1739,42 @@ func waiter_remove(p: Int, w: Int, handle: UInt) unsafe -> SyscallResult {
     op_ok()
 }
 
-/// §2.2's `wait()`: block until an attached handle is ready, then answer with
-/// the key its attacher supplied and what became ready.
+/// §2.2's `wait(buffer, capacity)`: block until an attached handle is ready,
+/// then COPY OUT a record naming the key its attacher supplied and what fired.
+///
+/// THE ANSWER IS A RECORD IN THE CALLER'S MEMORY, not registers, and the buffer
+/// is the caller's because the kernel has no allocator and no place to put one
+/// that would outlive the call. The status register still says how the call
+/// went; the record says what happened.
+///
+/// THE BUFFER IS VALIDATED HERE, ON THE CALL, even on the path that parks and
+/// will not use it for a while. That is deliberate: a bad buffer is the calling
+/// process's mistake, and terminating it while it is the RUNNING process is
+/// both a better diagnostic and a simpler thing to reason about than faulting
+/// it out of some later thread's wake.
 ///
 /// THE SCAN COMES FIRST, and that ordering is the level-triggered guarantee
 /// doing its work: a signal that arrived before this call is still in the word,
 /// so the wait returns immediately and nothing was lost. Only an empty set
 /// parks.
-func waiter_wait(p: Int, w: Int) unsafe -> SyscallResult {
+func waiter_wait(p: Int, w: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
+    // A capacity below the record's size is an argument outside its domain —
+    // the size is published, so the caller could have checked.
+    if cap < (wait_record_bytes() as UInt) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    copy_out_check(p, dst, wait_record_bytes() as UInt)
+
     let ready = waiter_ready_event(w)
     if ready != NO_EVENT {
-        return op_pair(EVENTS[ready].key, WaiterReadiness.Signalled as UInt)
+        deliver_wait_record(p, dst, EVENTS[ready].key, WaitTag.Event,
+                            EVENTS[ready].word)
+        return op_ok()
     }
     if CURRENT_THREAD == NO_THREAD {
         fault_process(p, FaultReason.BadState)
     }
-    block_on_wait(CURRENT_THREAD, w)
+    block_on_wait(CURRENT_THREAD, w, dst)
     op_blocked()
 }
 
@@ -2089,6 +2227,13 @@ public func load_root_and_enter() unsafe {
 
     hal.prot_reset()
 
+    // The WRITABLE window, accumulated as the segments are placed. It is what
+    // `copy_out` checks a kernel-written record against, and the stack below is
+    // always part of it — so it starts at the region's top edge and only ever
+    // grows downward, which means "no writable segment at all" still leaves the
+    // stack, and a process always has somewhere to receive one.
+    var rw_base = hal.ROOT_REGION_TOP - hal.ROOT_STACK_LEN
+
     var s: UInt = 0
     while s < seg_count {
         let seg = seg_at(base + header_len + s * seg_len)
@@ -2104,6 +2249,9 @@ public func load_root_and_enter() unsafe {
         // so a segment's permissions become its grant with nothing in between.
         hal.prot_region(s, load_addr,
                         align_up(load_addr + mem_len, hal.PROT_GRAIN), seg.flags)
+        if (seg.flags & (SegFlag.Write as UInt8)) != 0 && load_addr < rw_base {
+            rw_base = load_addr
+        }
         s = s + 1
     }
 
@@ -2125,7 +2273,7 @@ public func load_root_and_enter() unsafe {
     // Process and Thread objects, which it DERIVES (`SelfProcess` /
     // `SelfThread`) rather than being handed.
     start_process(entry, hal.ROOT_REGION_TOP, hal.ROOT_LOAD_BASE,
-                  hal.ROOT_REGION_TOP)
+                  hal.ROOT_REGION_TOP, rw_base, hal.ROOT_REGION_TOP)
 }
 
 /// Reify a user-mode program as a Process with one Thread, mint its boot handle
@@ -2143,12 +2291,20 @@ public func load_root_and_enter() unsafe {
 /// program receives means what §12 says it means. The other two are not passed
 /// anywhere — the program asks for them — so their numbers are the kernel's
 /// business and stay that way.
+///
+/// `rw_base`/`rw_top` DEFAULT TO NONE, and that default is the right answer
+/// rather than a convenience: the harness kernels that grant a hand-written
+/// payload its own bytes grant them read+execute, so those processes have
+/// nowhere the kernel may write and should be told so if they ask. Only the
+/// loader, which grants a data segment and a stack, passes a window.
 public func start_process(entry: UInt, stack_top: UInt,
-                          region_base: UInt, region_top: UInt) unsafe -> Never {
+                          region_base: UInt, region_top: UInt,
+                          rw_base: UInt = 0, rw_top: UInt = 0) unsafe -> Never {
     let p: Int = 0
     PROCESSES[p] = ProcessSlot(state: ProcessState.Running, self_handle: 0,
                             entry: entry, region_base: region_base,
                             region_top: region_top,
+                            rw_base: rw_base, rw_top: rw_top,
                             exit_kind: ProcessStatusKind.Running, exit_code: 0)
 
     let system = mint_handle(p, ObjType.System, root_system_rights(), 0)
@@ -2159,7 +2315,7 @@ public func start_process(entry: UInt, stack_top: UInt,
     let main_handle = mint_handle(p, ObjType.Thread, thread_rights(), main)
     THREADS[main] = ThreadSlot(state: ThreadState.Running, process: p,
                                self_handle: main_handle, exit_code: 0,
-                               joiners: 0, link: 0)
+                               joiners: 0, link: 0, wait_buf: 0)
     CURRENT_THREAD = main
     SLICE_LEFT = SLICE_TICKS
 
