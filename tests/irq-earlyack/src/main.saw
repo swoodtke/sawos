@@ -1,0 +1,52 @@
+// SOS M2 unit 4: acking an interrupt that has not fired (design 178 D6;
+// spec §9's at-most-one-unacked-fire, and the faults ruling).
+//
+// WHY THIS IS A FAULT RATHER THAN A NO-OP, which is the interesting half. §9
+// puts at most one unacked fire per Interrupt, and the only way a driver learns
+// about a fire is by being told — through a wait it made. So an ack with
+// nothing pending is a driver that acked twice for one fire, or acked before it
+// ever waited; in both cases the NEXT fire gets acked by a servicer that never
+// serviced it, and the symptom is a dropped byte or a wedged device somewhere
+// downstream with nothing to point at. Tolerating it here is what would make
+// that bug silent.
+//
+// The line is one BOTH boards have and neither raises on its own, so one source
+// serves both profiles and nothing can fire between the bind and the ack.
+
+import sos.{System, Process, Interrupt}
+
+/// A line both machines wire and neither asserts unasked.
+static QUIET_LINE: UInt = 5
+
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.self_process() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS earlyack: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let irq = match proc.create_interrupt(line: QUIET_LINE) {
+        case Ok(i) -> i,
+        case Err(e) -> {
+            print("SOS earlyack: no interrupt: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let _ = system.debug_print("SOS earlyack: bound, acking without a fire\n")
+
+    // Does not return: the kernel terminates this process.
+    let _ = irq.ack()
+
+    let _ = system.debug_print("SOS earlyack: still alive, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

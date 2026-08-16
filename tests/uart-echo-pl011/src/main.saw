@@ -1,0 +1,271 @@
+// SOS M2 unit 4: THE USERSPACE UART ECHO DRIVER (design 178 option A's proof;
+// spec §2's Interrupt row, §9, §12) — the PL011 half.
+//
+// The program is the ns16550 package's, sentence for sentence: bind the line,
+// watch it through a Waiter, enable the device, park, drain and echo before the
+// ack, ack, re-wait. That file carries the explanation of why a userspace
+// driver is the milestone's proof; this one carries what is different about
+// THIS chip, which is all any driver ever is.
+//
+// WHAT IS DIFFERENT, and each of these is a line below:
+//
+//   - the registers are 32 bits wide and sparsely placed, so the block has
+//     holes in it and every access is a 32-bit one. That is not tidiness on
+//     this profile: the page is mapped with DEVICE attributes, which forbid the
+//     hardware from merging or splitting accesses, and a driver that read two
+//     registers with one wider access would be asking for something the mapping
+//     does not permit.
+//   - readiness reads the OPPOSITE way — a flag that is CLEAR means the
+//     receiver has something.
+//   - interrupts are a mask register rather than an enable bit, and there is an
+//     explicit clear register beside it.
+//   - the device has a control register that has to be turned on. The kernel's
+//     transmitter works without it, so the kernel never wrote it; a driver that
+//     wants to RECEIVE must.
+
+import sos.{System, Process, Interrupt, Waiter, WaitResult, WaitPayload}
+
+// The scalar-to-byte rule, shared with the kernel's own console so a banner
+// written through the granted window and one written through a System op agree
+// about what a non-ASCII scalar becomes.
+import sosrt.{ascii_byte}
+
+// =============================================================================
+// The board
+// =============================================================================
+
+/// The console UART's register page — the window this image's manifest asks
+/// for, and the same number the kernel's board description carries.
+static UART_BASE: UInt = 0x09000000
+
+/// The interrupt line this board wires the console to: the first shared
+/// peripheral line, which this controller numbers after its thirty-two
+/// per-core ones.
+static UART_IRQ: UInt = 33
+
+/// The key this driver attaches under — its own word, handed back unread.
+static ECHO_KEY: UInt = 0x5541
+
+/// How many bytes the driver echoes before it stops the machine.
+static ECHO_BYTES: Int = 4
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+// =============================================================================
+// The PL011, through the granted window (design 112's blessed MMIO idiom)
+// =============================================================================
+
+/// The register block. Declaration order IS the layout (design 58), so the
+/// holes between registers are spelled out as fields rather than computed — a
+/// gap in a register block is a field like any other.
+struct Pl011Regs {
+    dr: UInt32,              // +0x00  data
+    rsr: UInt32,             // +0x04  receive status / error clear
+    reserved0: UInt32,       // +0x08
+    reserved1: UInt32,       // +0x0C
+    reserved2: UInt32,       // +0x10
+    reserved3: UInt32,       // +0x14
+    fr: ReadOnly<UInt32>,    // +0x18  flags
+    reserved4: UInt32,       // +0x1C
+    ilpr: UInt32,            // +0x20  IrDA low-power counter
+    ibrd: UInt32,            // +0x24  integer baud rate
+    fbrd: UInt32,            // +0x28  fractional baud rate
+    lcr_h: UInt32,           // +0x2C  line control
+    cr: UInt32,              // +0x30  control
+    ifls: UInt32,            // +0x34  interrupt FIFO level select
+    imsc: UInt32,            // +0x38  interrupt mask set/clear
+    ris: ReadOnly<UInt32>,   // +0x3C  raw interrupt status
+    mis: ReadOnly<UInt32>,   // +0x40  masked interrupt status
+    icr: WriteOnly<UInt32>,  // +0x44  interrupt clear
+}
+
+static_assert(sizeof<Pl011Regs>() == 0x48,
+              "the PL011 register block runs to the interrupt-clear register")
+
+/// FR bit 4: the receive FIFO is EMPTY — so data is waiting when it is CLEAR,
+/// which is the opposite sense to the other profile's data-ready bit.
+static FR_RX_EMPTY: UInt32 = 0x10u32
+/// FR bit 5: the transmit FIFO is full.
+static FR_TX_FULL: UInt32 = 0x20u32
+
+/// IMSC/ICR bit 4: the receive interrupt.
+static INT_RX: UInt32 = 0x10u32
+/// Every interrupt this device has, for the clear register.
+static INT_ALL: UInt32 = 0x7FFu32
+
+/// CR: enable the device, its transmitter and its receiver.
+static CR_ENABLE_RX_TX: UInt32 = 0x301u32
+
+/// The driver. A SAFE type (unsafety is not transitive — design 130).
+struct Pl011 {
+    regs: UnsafeMemory<Pl011Regs, Device>,
+}
+
+extension Pl011 {
+    init(at: UInt) unsafe -> Pl011 {
+        Pl011(regs: UnsafeMemory<Pl011Regs, Device>(at))
+    }
+
+    /// Turn the device on and let it raise its line when a byte arrives.
+    ///
+    /// NOTHING IS CLEARED FIRST, and that is the one line of this file worth
+    /// arguing about. The obvious bring-up sequence — enable, clear stale
+    /// status, unmask — LOSES A BYTE on this chip, because its receive
+    /// interrupt is a LATCH set when the FIFO level crosses the trigger rather
+    /// than a level read off the FIFO. A byte that arrived before the driver
+    /// existed has already set that latch; clearing it destroys the only edge
+    /// that byte will ever produce, and nothing re-raises it because the level
+    /// never crosses again until something reads. The driver would then park
+    /// forever holding a byte, which is exactly the hang this shape avoids.
+    ///
+    /// There is nothing stale to clear anyway: this driver owns the device from
+    /// reset — the kernel writes only the data register and only to transmit —
+    /// so unmasking on top of whatever the latch holds is unmasking on top of
+    /// the truth. A driver INHERITING a device from firmware would have to
+    /// clear, and would have to drain immediately afterwards to make up for it.
+    func listen(&self) unsafe {
+        self.regs.cr.write(CR_ENABLE_RX_TX)
+        self.regs.imsc.write(INT_RX)
+    }
+
+    func has_byte(&self) unsafe -> Bool {
+        (self.regs.fr.read() & FR_RX_EMPTY) == 0u32
+    }
+
+    /// Take the waiting byte. Reading the data register is also what lowers the
+    /// device's assertion once the receiver is empty.
+    func take_byte(&self) unsafe -> UInt8 {
+        UInt8.from(truncating: self.regs.dr.read())
+    }
+
+    func put_byte(&self, b: UInt8) unsafe {
+        while (self.regs.fr.read() & FR_TX_FULL) != 0u32 { }
+        self.regs.dr.write(b as UInt32)
+    }
+
+    func put_str(&self, msg: String) unsafe {
+        for scalar in msg.chars() {
+            self.put_byte(ascii_byte(scalar))
+        }
+    }
+
+    /// Drain everything the receiver holds, echoing each byte, and report how
+    /// many.
+    ///
+    /// NOTHING IS WRITTEN TO THE CLEAR REGISTER HERE, deliberately: reading the
+    /// data register is what lowers this device's receive interrupt, and a
+    /// clear on the way out would race a byte that arrived between the last
+    /// `has_byte` and the write — clearing the latch it had just set, which is
+    /// the byte lost forever described on `listen`.
+    func echo_available(&self) unsafe -> Int {
+        var n = 0
+        while self.has_byte() {
+            self.put_byte(self.take_byte())
+            n = n + 1
+        }
+        n
+    }
+}
+
+// =============================================================================
+// The driver
+// =============================================================================
+
+/// The line a wait answered with. An Event answer would mean the kernel
+/// reported an attachment this process never made, which is a bug in the pair
+/// rather than a condition to handle.
+func woke_on_line(r: &WaitResult) -> UInt {
+    match r.what {
+        case Interrupt(line) -> line,
+        case Event(_) -> panic("this driver attached no event"),
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.self_process() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS echo: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let irq = match proc.create_interrupt(line: UART_IRQ) {
+        case Ok(i) -> i,
+        case Err(e) -> {
+            print("SOS echo: no interrupt: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let waiter = match proc.create_waiter() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS echo: no waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match waiter.add(&irq, ECHO_KEY) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS echo: attach failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // From here on every console byte goes out through the GRANTED WINDOW, not
+    // through a System op — which is the point of the grant and is what the
+    // handover protocol makes safe to do.
+    let uart = Pl011(at: UART_BASE)
+    uart.listen()
+    uart.put_str("SOS echo: driver up\n")
+
+    var echoed = 0
+    var line = 0
+    var wakes = 0
+    while echoed < ECHO_BYTES {
+        let answer = match waiter.wait() {
+            case Ok(r) -> r,
+            case Err(e) -> {
+                print("SOS echo: wait failed: {}\n", e)
+                let _ = system.shutdown(EXIT_FAILED)
+                return
+            },
+        }
+        line = woke_on_line(&answer)
+        wakes = wakes + 1
+        if answer.key != ECHO_KEY {
+            print("SOS echo: woke on key {}, not {}\n", answer.key, ECHO_KEY)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+
+        // EVERYTHING THAT TOUCHES THE DEVICE HAPPENS BEFORE THE ACK — spec §9's
+        // release rule.
+        echoed = echoed + uart.echo_available()
+        match irq.ack() {
+            case Ok(_) -> {},
+            case Err(e) -> {
+                print("SOS echo: ack failed: {}\n", e)
+                let _ = system.shutdown(EXIT_FAILED)
+                return
+            },
+        }
+    }
+
+    // THE WAKE COUNT IS REPORTED AND NOT ASSERTED. Every byte is echoed and at
+    // least one interrupt was serviced — that is what the line number proves,
+    // since it came out of the wait RECORD — but how many wakes it took depends
+    // on how fast the host feeds the port relative to the guest, so pinning a
+    // number would be pinning the emulator's timing.
+    print("\nSOS echo: done {} bytes on line {} after {} wakes\n",
+          echoed, line, wakes)
+    let _ = system.shutdown(EXIT_OK)
+}

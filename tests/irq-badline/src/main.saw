@@ -1,0 +1,48 @@
+// SOS M2 unit 4: binding a line the machine does not have (design 178 D6;
+// spec §9, and the faults ruling).
+//
+// A LINE NUMBER IS THE CALLER'S OWN WORD, which is what puts this on the fault
+// side of the ratified cut: a driver reads its device's line out of the
+// device's description, so a number outside the board's range is a mistake the
+// process could have checked. The kernel terminates it, reports the reason, and
+// stays up to report the teardown.
+//
+// IT IS A ROOT SERVER RATHER THAN A HAND-WRITTEN PAYLOAD, and that is the same
+// distinction rider 4 drew for the duplicate key: the typed layer makes most
+// caller errors unspellable — you cannot name a handle you were not given, and
+// `wait` supplies its own buffer — but a LINE is an ordinary integer the caller
+// chooses, so no type can catch it and the check has to be the kernel's. The
+// test therefore lives at the altitude a real driver would hit it from.
+//
+// THE NUMBER IS ABOVE BOTH MACHINES' LINE SPACES, which is what lets one source
+// serve both profiles: one board wires ninety-six sources and the other reports
+// its own count, and neither reaches this.
+
+import sos.{System, Process, Interrupt}
+
+/// A line no board in this tree has.
+static ABSENT_LINE: UInt = 4000
+
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.self_process() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS badline: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let _ = system.debug_print("SOS badline: binding a line this board lacks\n")
+
+    // Does not return: the kernel terminates this process.
+    let _ = proc.create_interrupt(line: ABSENT_LINE)
+
+    let _ = system.debug_print("SOS badline: still alive, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

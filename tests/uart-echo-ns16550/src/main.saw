@@ -1,0 +1,261 @@
+// SOS M2 unit 4: THE USERSPACE UART ECHO DRIVER (design 178 option A's proof;
+// spec §2's Interrupt row, §9, §12).
+//
+// This is the milestone's money shot, and what makes it one is everything that
+// is NOT here. There is no kernel driver. The kernel's whole part in this
+// program is three things — it granted the register window the image asked for,
+// it routed the line, and it woke this thread — and none of them knows what a
+// UART is. Reading the receive register, deciding what the byte means, and
+// writing it back out are ordinary process code in this file.
+//
+// THE CYCLE, which is spec §9 read from the driver's side:
+//
+//   1. bind the line          `Process.create_interrupt(line:)`
+//   2. watch it               `Waiter.add(&interrupt, key)`
+//   3. enable the DEVICE      write its own interrupt-enable register — the
+//                             kernel never touches it, because the register is
+//                             behind the window and the window is this
+//                             process's
+//   4. park                   `Waiter.wait()`, which answers with the key and
+//                             the line
+//   5. service                drain the receiver and echo each byte, ALL of it
+//                             before the ack (§9's release rule)
+//   6. `interrupt.ack()`      unmask; a device still asserting fires again
+//
+// WHY THIS FILE NAMES A DEVICE when every other SOS process is arch-free: a
+// driver IS its device. The two profiles have different UARTs, so there are two
+// of these packages, named for the CHIP rather than for the machine — which is
+// the honest axis, since the same 16550 would want the same file on a different
+// architecture.
+//
+// THE ECHOED BYTES ARE THE TEST. The harness feeds a known short string into
+// the emulator's serial input and asserts it comes back out AFTER the kernel's
+// handover marker, which is a thing that can only happen if every step above
+// worked.
+
+import sos.{System, Process, Interrupt, Waiter, WaitResult, WaitPayload}
+
+// The scalar-to-byte rule, shared with the kernel's own console so a banner
+// written through the granted window and one written through a System op agree
+// about what a non-ASCII scalar becomes.
+import sosrt.{ascii_byte}
+
+// =============================================================================
+// The board
+// =============================================================================
+
+/// The console UART's register page — the window this image's manifest asks
+/// for, and the same number the kernel's board description carries. The two
+/// AGREE rather than one deriving from the other: the manifest is what the
+/// image declares and the board is what authorizes it, and a mismatch is a
+/// refused image rather than a driver reaching somewhere it should not.
+static UART_BASE: UInt = 0x10000000
+
+/// The interrupt line this board wires the console to.
+static UART_IRQ: UInt = 10
+
+/// The key this driver attaches under. It is ITS OWN WORD — the kernel stores
+/// one and hands it back unread — so a dispatcher watching several devices
+/// tells them apart by it. Here there is one, and the wait answer is checked
+/// against it anyway, because a key that came back wrong is the one bug this
+/// program could not otherwise see.
+static ECHO_KEY: UInt = 0x5541
+
+/// How many bytes the driver echoes before it stops the machine. The harness
+/// feeds exactly this many; a byte lost anywhere leaves this loop parked and
+/// the case fails on the emulator's timeout rather than passing quietly.
+static ECHO_BYTES: Int = 4
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+// =============================================================================
+// The NS16550A, through the granted window (design 112's blessed MMIO idiom)
+// =============================================================================
+
+/// The register block. Registers are byte-spaced; declaration order IS the
+/// layout (design 58), so each field sits at its hardware offset. `ReadOnly<T>`
+/// exposes only `.read()`.
+struct UartRegs {
+    thr: UInt8,             // +0  transmit holding / receive buffer
+    ier: UInt8,             // +1  interrupt enable
+    iir: UInt8,             // +2  interrupt id / FIFO control
+    lcr: UInt8,             // +3  line control
+    mcr: UInt8,             // +4  modem control
+    lsr: ReadOnly<UInt8>,   // +5  line status
+    msr: ReadOnly<UInt8>,   // +6  modem status
+    scr: UInt8,             // +7  scratch
+}
+
+static_assert(sizeof<UartRegs>() == 8,
+              "the 16550 register block is eight byte-wide registers")
+
+/// IER bit 0: interrupt when the receiver holds a byte. This is the ONE bit
+/// that makes the device assert its line, and writing it is the driver's — the
+/// kernel unmasked the line at the controller and stopped there.
+static IER_RX_READY: UInt8 = 0x01
+
+/// LSR bit 0: a byte is waiting. LSR bit 5: the transmitter will take one.
+static LSR_DATA_READY: UInt8 = 0x01
+static LSR_TX_EMPTY: UInt8 = 0x20
+
+/// The driver. A SAFE type (unsafety is not transitive — design 130): only the
+/// methods reaching through `regs` carry the `unsafe` effect.
+struct Uart {
+    regs: UnsafeMemory<UartRegs, Device>,
+}
+
+extension Uart {
+    init(at: UInt) unsafe -> Uart {
+        Uart(regs: UnsafeMemory<UartRegs, Device>(at))
+    }
+
+    /// Let the device raise its line when a byte arrives.
+    func listen(&self) unsafe {
+        self.regs.ier.write(IER_RX_READY)
+    }
+
+    func has_byte(&self) unsafe -> Bool {
+        (self.regs.lsr.read() & LSR_DATA_READY) != 0u8
+    }
+
+    /// Take the waiting byte. Reading the register is also what CLEARS the
+    /// device's assertion, which is why nothing else has to.
+    func take_byte(&self) unsafe -> UInt8 {
+        self.regs.thr.read()
+    }
+
+    func put_byte(&self, b: UInt8) unsafe {
+        while (self.regs.lsr.read() & LSR_TX_EMPTY) == 0u8 { }
+        self.regs.thr.write(b)
+    }
+
+    func put_str(&self, msg: String) unsafe {
+        for scalar in msg.chars() {
+            self.put_byte(ascii_byte(scalar))
+        }
+    }
+
+    /// Drain everything the receiver holds, echoing each byte, and report how
+    /// many. A LOOP rather than one byte per interrupt: the line is level
+    /// -triggered either way, so both work, but draining is what a driver
+    /// should do — it turns a burst into one wake instead of one wake per byte.
+    func echo_available(&self) unsafe -> Int {
+        var n = 0
+        while self.has_byte() {
+            self.put_byte(self.take_byte())
+            n = n + 1
+        }
+        n
+    }
+}
+
+// =============================================================================
+// The driver
+// =============================================================================
+
+/// The line a wait answered with. An Event answer would mean the kernel
+/// reported an attachment this process never made, which is a bug in the pair
+/// rather than a condition to handle.
+func woke_on_line(r: &WaitResult) -> UInt {
+    match r.what {
+        case Interrupt(line) -> line,
+        case Event(_) -> panic("this driver attached no event"),
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.self_process() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS echo: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // §2's Interrupt row: the line becomes an object, and the object is
+    // waitable. The kernel unmasks it here — the DEVICE is still quiet, because
+    // its own enable bit is below.
+    let irq = match proc.create_interrupt(line: UART_IRQ) {
+        case Ok(i) -> i,
+        case Err(e) -> {
+            print("SOS echo: no interrupt: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let waiter = match proc.create_waiter() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS echo: no waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match waiter.add(&irq, ECHO_KEY) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS echo: attach failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // From here on every console byte goes out through the GRANTED WINDOW, not
+    // through a System op — which is the point of the grant and is what the
+    // handover protocol makes safe to do.
+    let uart = Uart(at: UART_BASE)
+    uart.listen()
+    uart.put_str("SOS echo: driver up\n")
+
+    var echoed = 0
+    var line = 0
+    var wakes = 0
+    while echoed < ECHO_BYTES {
+        let answer = match waiter.wait() {
+            case Ok(r) -> r,
+            case Err(e) -> {
+                print("SOS echo: wait failed: {}\n", e)
+                let _ = system.shutdown(EXIT_FAILED)
+                return
+            },
+        }
+        line = woke_on_line(&answer)
+        wakes = wakes + 1
+        if answer.key != ECHO_KEY {
+            print("SOS echo: woke on key {}, not {}\n", answer.key, ECHO_KEY)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+
+        // EVERYTHING THAT TOUCHES THE DEVICE HAPPENS BEFORE THE ACK — spec §9's
+        // release rule. After the ack the line is live again and a second fire
+        // may be delivered, so a register read moved below it would be racing
+        // the next byte.
+        echoed = echoed + uart.echo_available()
+        match irq.ack() {
+            case Ok(_) -> {},
+            case Err(e) -> {
+                print("SOS echo: ack failed: {}\n", e)
+                let _ = system.shutdown(EXIT_FAILED)
+                return
+            },
+        }
+    }
+
+    // The last line goes through the RUNTIME SEAM instead, which is the other
+    // altitude and is still the process's own sequencing — the kernel writes
+    // because it was asked to.
+    // THE WAKE COUNT IS REPORTED AND NOT ASSERTED. Every byte is echoed and at
+    // least one interrupt was serviced — that is what the line number proves,
+    // since it came out of the wait RECORD — but how many wakes it took depends
+    // on how fast the host feeds the port relative to the guest, so pinning a
+    // number would be pinning the emulator's timing.
+    print("\nSOS echo: done {} bytes on line {} after {} wakes\n",
+          echoed, line, wakes)
+    let _ = system.shutdown(EXIT_OK)
+}

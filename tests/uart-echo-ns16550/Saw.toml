@@ -1,0 +1,37 @@
+[package]
+name = "uart-echo-ns16550"
+version = "0.1.0"
+
+# Same reason as sos/root's: this image carries its own `__saw_rt_*` seams, out
+# of the `sosrt` module its `sos` dependency pulls in. See that manifest.
+runtime = true
+
+# THE USERSPACE UART ECHO DRIVER (design 178 option A's proof), for the board
+# whose console is an NS16550A. It holds an Interrupt handle for the console's
+# line, waits on it through a Waiter, reads the device's registers DIRECTLY
+# through the window this manifest asks for, echoes each byte back out the same
+# device, acks and re-waits. The kernel has no driver code in it.
+#
+# IT IS PER-DEVICE, not per-architecture: a driver names its device, and the two
+# SOS profiles happen to have different UARTs. The pl011 package beside this one
+# is the same program for the other one.
+[dependencies]
+sos = { path = "../../kernel/sysapi" }
+
+[sos]
+emit = "sosimg"
+priorities = { background = 0, low = 1, normal = 1, high = 1 }
+
+# `device-window` is design 178's finale constraint 1: the MMIO grant is
+# DECLARED BY THE IMAGE and authorized by the board. It is per-machine because a
+# device address is — which is why it sits here beside the linker script rather
+# than in `[sos]` — and it is a PLACEHOLDER for M3's Mapping, where a device
+# window becomes a handle derived from a device pool root.
+#
+# The size defaults to one page, which is both profiles' protection granularity
+# and is what keeps the grant on the emulator's fast path (DF-178b: a byte-tight
+# device region put every register access on the slow path).
+[sos.riscv32-unknown-none-elf]
+linker-script = "../../hal/riscv32/user/root.ld"
+native = "../../hal/riscv32/user/syscall.c ../../rt/common_c/support.c"
+device-window = "0x10000000"

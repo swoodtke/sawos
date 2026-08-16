@@ -1,0 +1,28 @@
+[package]
+name = "uart-echo-pl011"
+version = "0.1.0"
+
+# Same reason as sos/root's: this image carries its own `__saw_rt_*` seams, out
+# of the `sosrt` module its `sos` dependency pulls in. See that manifest.
+runtime = true
+
+# THE USERSPACE UART ECHO DRIVER (design 178 option A's proof), for the board
+# whose console is a PL011. Same program as the ns16550 package beside it, and
+# the DIFFERENCES ARE THE DEVICE: a wider register file, the opposite sense on
+# the ready flags, an interrupt mask register instead of an enable bit, and a
+# control register the driver has to turn on itself.
+[dependencies]
+sos = { path = "../../kernel/sysapi" }
+
+[sos]
+emit = "sosimg"
+priorities = { background = 0, low = 1, normal = 1, high = 1 }
+
+# design 178's finale constraint 1 + 3: the MMIO grant is DECLARED BY THE IMAGE
+# and authorized by the board, and on this profile it is mapped with DEVICE
+# memory attributes (nGnRE) rather than Normal-cacheable — a cached register
+# block is a correctness bug, not a performance one. See `sos/hal/arm64/kernel`.
+[sos.aarch64-unknown-none-elf]
+linker-script = "../../hal/arm64/user/root.ld"
+native = "../../hal/arm64/user/syscall.c ../../rt/common_c/support.c"
+device-window = "0x09000000"
