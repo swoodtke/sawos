@@ -792,22 +792,64 @@ event-driven EDGE of a process gets a second, distinct construct:
   kernel permits both (one Waiter per handle; many Waiters per
   process).
 
-## 11. Remaining before the kernel briefs
+## 11. What is built, and what remains
 
 - ~~Design (with user): root server responsibilities~~ RESOLVED §12
   (ratified Aug 5).
-- **Orchestrator pins (veto-able), kernel-brief material:** rights-word
-  bit assignments + per-object op tables (the syscall number space);
-  kernel memory layout per profile (link scripts, static slab sizes,
-  QEMU `virt` boot maps); where the physical-region refcount lives
-  (§5.9); message limits (pinned 64-byte body / 4 handles) + concrete
-  `sosimg` header incl. the §7 priority-map field; root server's
-  bootstrap band map.
-- **Roadmap (unchanged from §5b, brief numbers assigned at dispatch —
-  the design-78/79 references there are stale):** M0 riscv32 QEMU
-  target (design 112) → M1 riscv32 QEMU boot-to-root-server → M1b arm64
-  EL1 parity + HAL extraction → the object model, landed once,
-  two-profile-tested.
+- **Orchestrator pins SETTLED by M1/M1b/M2:** the rights-word bit
+  assignments and the per-object op tables are concrete and
+  kernel-internal (`sos/kernel/abi/`, one file shared by the dispatch and
+  the wrappers — §5.7's vDSO discipline is what keeps them renumberable);
+  the per-profile kernel memory layout is two linker scripts under
+  `sos/hal/<arch>/kernel/` over per-type static slabs; the `sosimg`
+  header is concrete at v3, the §7 priority-map field included.
+- **Orchestrator pins STILL OPEN:** where the physical-region refcount
+  lives (§5.9), which nothing can answer until something allocates
+  physical regions; §2.1's message limits (pinned 64-byte body / 4
+  handles, unbuilt with the Channel); and the §7 priority map plus root's
+  bootstrap band map, which the loader parses and REPORTS while no
+  Process slot stores either.
+- **What the kernel does NOT have after M2.** One area per line, with the
+  section that specifies it; design 232 is the M3 plan of record and is
+  pointed at rather than duplicated.
+  - **Clock and Timer** (§2 rows) — neither object exists; the hardware
+    timer is the scheduler tick and nothing else, so a process cannot
+    sleep at all. Design 232 unit 1.
+  - **A second process** (§2 Process row, §12) — `create_process` is
+    absent and exactly one Process is ever built, so §12's
+    loader-above-boot rule has never been exercised. Design 232 unit 2,
+    with the launch flow (`give`, and the boot-handle iterator the child
+    drains) in unit 3.
+  - **Memory / IoMemory / MemoryMapping and `map()`** (§2.5) — no memory
+    object of any kind; a process gets one granted range plus a writable
+    window from the loader, and the M2 device grant is the declared
+    placeholder that surface retires. Design 232 unit 4.
+  - **Quotas** (§12's creation-authority pin, which M2 ANSWERED with a
+    factory-capability rights bit rather than a quota) — the per-process
+    table, `QuotaExceeded`, and creator-pays accounting are design 232
+    unit 5. A full slab answers `SosStatus.NoResource` today.
+  - **Channels and ReplyHandle** (§2.1) — M4; the one fully ratified
+    object surface with no implementation at all.
+  - **Handle close and generations** (§3) — no op table has a close op
+    and a handle entry carries no generation, so §3's stale-handle
+    detection and §4's owning NoCopy tier both wait on it.
+  - **Priorities** (§7) — nothing of §7 is built; round-robin is ruled to
+    stay through M3 (design 232 agenda item 10).
+  - **Thread and process waitability, and `kill`** (§8) — attaching
+    either kind is a fault today; `kill` has no op and no right.
+  - **Kernel interruptibility, `IntrSpinLock` (§9b), SMP** — design 178's
+    D2 holds (interrupts are taken from user mode only); design 232 pin 1
+    rules preemption points into M3 as unit 1.5, and SMP waits for
+    channels.
+  - **`HandlerGroup`** (§10) — userspace runtime work rather than kernel
+    surface, and unbuilt: a process wires a Waiter by hand today.
+  - **The mapped vDSO** (§5.7) — delivery is still static linking, which
+    changes nothing about the shape.
+- **Roadmap (brief numbers assigned at dispatch — the design-78/79
+  references in §5b are stale):** M0 riscv32 QEMU target (design 112) →
+  M1 riscv32 QEMU boot-to-root-server → M1b arm64 EL1 parity + HAL
+  extraction → M2 the concurrent kernel, landed once and two-profile
+  tested → M3 the multiprocess kernel (design 232).
   - **M0 DONE (design 112):** Profile A substrate is live —
     `sos/kernel/` (boot.S + virt.ld + rt.c runtime seams + a Saw `main.saw`
     whose NS16550A UART driver is built on `UnsafeMemory<_, Device>`),
@@ -909,6 +951,78 @@ event-driven EDGE of a process gets a second, distinct construct:
     well as ELF32 and refusing an address past the format's 32-bit field
     rather than truncating it, and `[sos.<triple>]` manifest sections so one
     root package builds for both profiles with `src/` unchanged.
+  - **M2 DONE (design 178), integrated Aug 16:** the concurrent kernel —
+    threads, a scheduler, Event, Waiter, the Interrupt object, and a UART
+    echo driver running in USERSPACE on both machines. Six object kinds
+    where M1b had one, and the dispatch shape of §3 did not move for any
+    of them. Four units, each per-arch-gated; the harness ends at 32 cases
+    per architecture, 64 runs, either machine failing red.
+    (a) **The interrupt seam.** Each HAL gained twelve names and the kernel
+    reaches interrupts through those and nothing else (`is_interrupt`,
+    `irq_claim`/`irq_complete`, `irq_mask`/`irq_unmask`, `timer_start`/
+    `timer_rearm`/`timer_pending`, and a selftest line). `ktrap` decides
+    interrupt / fault / syscall IN THAT ORDER — an interrupt's instruction
+    has not run, so it must never reach the syscall return path that steps
+    the saved PC — and `service_irq` is the one arch-free entry: claim,
+    rearm or mask (§9), run the hook, complete.
+    (b) **Thread and Process (D4), the scheduler (D3).** The trap frame IS
+    the thread context, so a context switch is `ktrap` RETURNING A
+    DIFFERENT FRAME than it was called with: one switch point, at the
+    user-return boundary by construction, which is D2 enforced by shape
+    rather than promised, and no half-saved state to protect.
+    `kcore.start_process` is the only way into user mode — a kernel that
+    could enter it without a Process would have syscalls no handle table
+    answers, which is what M1 was. Scheduling is ONE round-robin FIFO with
+    no levels and a one-tick slice (§7 carries the status note).
+    **The faults ruling landed whole** (178 pin 6, ratified Aug 8):
+    `BadHandle`, `BadOp` and `AccessDenied` are no longer statuses but
+    `FaultReason` tags that TERMINATE the offending process while the
+    kernel stays up, reports, and runs the ratified teardown. It had to be
+    uniform — an unbound handle names no KIND, so there is no op table to
+    ask which rule applies — and it reverses the M1 line above. What
+    survives as a status is `NoResource`, which a caller could not have
+    known. Op tables and rights sets are named for the §2 object, spelled
+    out (`SystemOp`/`ProcessOp`/`ThreadOp` beside `SystemRight`/… ; ruled
+    at review, user, Aug 15).
+    (c) **Event and Waiter (D5), and two funnels.** Level-triggered is an
+    ABSENCE: nothing records that a waiter has been told, so `Wait` SCANS
+    the attachment set — and three ratified sentences fall out of that one
+    decision rather than being coded separately (a signal before anyone
+    waits is not lost, an event still ready wakes the next waiter, and
+    attaching an already-ready handle reports immediately). `write_result`
+    became the only place an answer reaches a frame, its three entry points
+    named in its docstring, which is what makes "exactly one write per
+    syscall" checkable; `waitable_slot` is the only place waitability is
+    decided, one exhaustive match, so a further waitable kind cannot be
+    added silently. Three riders amended ratified text: an argument
+    encoding is API (`create_event(mode:)`), the wait ANSWER became a
+    validated copy-out record through the `copy_out` funnel (§2.2), and
+    `remove` names the KEY with keys unique per Waiter (§2.2).
+    (d) **The Interrupt object and the milestone proof.** The second
+    waitable kind moved the attachment OUT of the waitable into a third
+    object — (waiter, kind, target, key) — because a Waiter's set has to be
+    ONE list; what varies per kind is four small functions in one place,
+    each exhaustive. "Nothing runnable" split in two (§9): idle when any
+    line is bound, the ratified deadlock report otherwise, with the idle
+    path POLLING rather than taking the trap, which is what leaves D2
+    untouched. The device window is a `SegFlag.Device` record in the
+    driver's own `sosimg`, authorized against the one window each board
+    publishes (§2.5's placeholder, §9's grant bullet), and the console
+    handover protocol is §9a. The harness types four bytes AT the
+    emulator's serial port, one at a time behind a delay so the driver must
+    PARK — which is what puts the whole ladder under test rather than the
+    echo alone — and they come back out echoed by a PROCESS, on riscv32 and
+    arm64 both. The kernel's whole part is that it granted the window the
+    image declared, routed the line, and woke the thread; none of those
+    knows what a UART is. Two driver packages, one per DEVICE rather than
+    per machine, because a driver IS its device.
+    (e) **The native floor moved, and the reasons did not** (§5c has the
+    arc). Every line M2 added is reason 1: one interrupt-class mask
+    register on Profile A and four timer system registers on Profile B,
+    `sos_syscall3` per profile (an op that answers with a value needs one
+    and the C ABI declares no aggregate return), and `sos_wait_for_irq`
+    per profile (`wfi` is an instruction). Assembly went DOWN, because a
+    thread context built in Saw needs no register-clearing prologue.
 
 ## 12. The root server (ratified Aug 5, user)
 
