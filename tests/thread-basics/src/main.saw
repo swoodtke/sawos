@@ -25,7 +25,7 @@
 // nothing here passes a handle WORD between threads: the `sos` module offers no
 // way to take one out of a typed handle, and this program needs none.
 
-import sos.{System, Process, Thread}
+import sos.{System, Process, Thread, SosStatus}
 
 /// The boot handle, parked by the initial thread for the workers.
 ///
@@ -125,7 +125,14 @@ func initial(boot_handle: UInt) {
     let a = match proc.create_thread(stack_top: stack_a_top(), arg: ROLE_A) {
         case Ok(t) -> t,
         case Err(e) -> {
-            print("SOS threads: create failed: {}\n", e)
+            // The status tag NAMED, not just printed. `SosStatus` lives in
+            // `sosabi`, which is kernel-internal and which this process does
+            // not — and must not — import; it reaches here because `sos`
+            // re-exports that one type and nothing else beside it (design 229).
+            // A process that branches on a failure needs the name, so this line
+            // is the check that the export survives.
+            let tag: SosStatus = e
+            print("SOS threads: create failed: {}\n", tag)
             let _ = system.shutdown(1)
             return
         },
