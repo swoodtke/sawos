@@ -189,6 +189,21 @@ public func arch_tag() -> UInt8 {
 ///
 /// The kernel owns the machine, so this is the UART directly. Byte-at-a-time is
 /// what the seam needs: the arch-free half above formats, this half places.
+///
+/// THE HANDOVER PROTOCOL, DEVICE HALF (design 178's finale constraint 4; the
+/// protocol itself is stated on `kcore`'s `Console`). This board has ONE UART
+/// and a driver process may be granted its page, so after the handover marker
+/// there can be a second writer on this device. The cost is bounded: both
+/// writers use the data register and the transmit-full flag beside it, each
+/// write being one 32-bit store behind its own poll, so a kernel byte lands
+/// BETWEEN two of the process's rather than inside one. What the kernel never
+/// touches is the receive side, the interrupt-mask register or the control
+/// register — a driver that owns receive owns it alone.
+///
+/// A DRIVER ON THIS BOARD MUST ENABLE THE UART ITSELF. The kernel's transmitter
+/// works out of reset here without programming the control register, so a
+/// process that wants RECEIVE has to set it — which is the honest division:
+/// the kernel programs nothing it does not need, and the owner configures.
 public func console_byte(b: UInt8) unsafe {
     Pl011(at: UART_BASE).write_byte(b)
 }
@@ -202,6 +217,7 @@ public func console_byte(b: UInt8) unsafe {
 // `sink.c` for why semihosting rather than PSCI.
 extern "C" {
     func sos_platform_exit(code: UInt)
+    func sos_wait_for_irq()
 }
 
 /// Stop the machine with status 0. Never returns.
@@ -300,6 +316,19 @@ public static MAX_ROOT_SEGMENTS: UInt = 8
 public static ROOT_LOAD_BASE: UInt = 0x40200000
 public static ROOT_REGION_TOP: UInt = 0x40240000
 public static ROOT_STACK_LEN: UInt = 0x4000
+
+/// The ONE device window this board offers a process (design 178's finale
+/// constraint 3, ruled Aug 16, user): the console UART's page.
+///
+/// A PAGE because that is this profile's protection granularity — there is no
+/// finer grant to make — and one page is what the register block needs.
+public static DEVICE_GRANT_BASE: UInt = UART_BASE
+public static DEVICE_GRANT_LEN: UInt = 0x1000
+
+static_assert(DEVICE_GRANT_LEN >= PROT_GRAIN,
+              "a device window cannot be finer than the protection grain")
+static_assert((DEVICE_GRANT_BASE % PROT_GRAIN) == 0,
+              "a device window must start on a page boundary")
 
 /// An address the KERNEL itself cannot reach on this target. The level-1 entry
 /// covering it is invalid, so a read is a translation fault taken at EL1. It is
@@ -605,7 +634,7 @@ public func kernel_fault(esr: UInt, elr: UInt, far: UInt) unsafe {
 // The shape:
 //
 //   level 1 (1 GiB entries, 39-bit VA out of the low translation base)
-//     [0]  0x0000_0000  device block, EL1 RW, never executable
+//     [0]  0x0000_0000  -> the DEVICE level 2
 //     [1]  0x4000_0000  -> level 2
 //     rest             INVALID, which is what makes UNMAPPED_PROBE fault
 //   level 2 (2 MiB entries over RAM)
@@ -614,6 +643,12 @@ public func kernel_fault(esr: UInt, elr: UInt, far: UInt) unsafe {
 //   level 3 (4 KiB pages over the first 4 MiB of RAM)
 //     reset state      EL1 read/write/EXECUTE, no EL0 access at all
 //     granted pages    EL0 RO or RW, never EL0-writable-and-executable
+//   device level 2 (2 MiB entries below RAM)
+//     all              Device blocks, EL1 RW, never executable at either level
+//     except the one   containing the console UART -> the device level 3
+//   device level 3 (4 KiB device pages over that one 2 MiB block)
+//     reset state      Device, EL1 RW, no EL0 access at all
+//     granted pages    Device-nGnRE, EL0 RW, never executable
 //
 // The grant window covers the kernel image AND the root region, because BOTH
 // need page granularity: the root region obviously, and the kernel image
@@ -621,6 +656,14 @@ public func kernel_fault(esr: UInt, elr: UInt, far: UInt) unsafe {
 // inside it. Everything outside the window is EL1-only, so EL0 default-deny is
 // the same property PMP gives Profile A for free — a page EL0 was never granted
 // is a translation fault, not a permitted access.
+//
+// THE DEVICE HALF IS THE SAME SHAPE ONE LEVEL SHALLOWER (design 178's finale
+// constraint 3). The whole device space was one 1 GiB block until a process
+// could be granted a register page, and a block is not a grant unit: granting
+// EL0 the block that holds the console would have handed over every peripheral
+// beside it. So the block became a table, and the ONE 2 MiB block that holds
+// the console became a table too — which is the minimum that makes a single
+// page grantable, and costs two more page-sized tables.
 //
 // The kernel's own pages stay EL1-RWX: that is the arm64 spelling of "M-mode is
 // unconstrained", not a claim about kernel W^X, which neither profile has yet.
@@ -631,10 +674,11 @@ public func kernel_fault(esr: UInt, elr: UInt, far: UInt) unsafe {
 // that leaf and nothing else: it asks this file for a finished table and turns
 // the MMU on.
 
-/// The three translation tables, back to back: 512 level-1 descriptors, 512
-/// level-2, then 1024 level-3 covering the grant window.
+/// The five translation tables, back to back: 512 level-1 descriptors, 512
+/// level-2, 1024 level-3 covering the RAM grant window, then 512 device level-2
+/// and 512 device level-3 covering the console's 2 MiB of device space.
 ///
-/// ONE region with a page of slack rather than three arrays, because the
+/// ONE region with a page of slack rather than five arrays, because the
 /// hardware requires each table to be page-aligned and Saw has no alignment
 /// attribute on a static. Rounding the base up at run time costs three
 /// instructions at boot and asks nothing of the linker script — which matters,
@@ -642,14 +686,19 @@ public func kernel_fault(esr: UInt, elr: UInt, far: UInt) unsafe {
 ///
 /// THE SLACK IS EXACTLY ENOUGH, and the arithmetic is worth writing down
 /// because a future edit to `GRANT_PAGES` has to redo it. The tables need
-/// 512 + 512 + 1024 = 2048 descriptors (16 KiB). A `[UInt64; N]` static is
-/// 8-aligned, so rounding its address up to 4096 advances the base by at most
-/// 4096 - 8 = 4088 bytes, which is 511 descriptors. 2048 + 511 = 2559, and the
-/// region is 2560. Add a table and the trailing 512 has to grow with it.
+/// 512 + 512 + 1024 + 512 + 512 = 3072 descriptors (24 KiB). A `[UInt64; N]`
+/// static is 8-aligned, so rounding its address up to 4096 advances the base by
+/// at most 4096 - 8 = 4088 bytes, which is 511 descriptors. 3072 + 511 = 3583,
+/// and the region is 3584. Add a table and the trailing 512 has to grow with it.
 ///
 /// All-zero, so it costs no image bytes (design 149). An unwritten descriptor
 /// is INVALID, which is the state a default-deny map wants anyway.
-unsafe static var PAGE_TABLES: [UInt64; 512 + 512 + 1024 + 512] = [0u64; 512 + 512 + 1024 + 512]
+/// Level 1, level 2, the two RAM level-3 tables, the device level 2, the device
+/// level 3, and one table's worth of alignment slack — written once so the
+/// length and the initializer cannot disagree.
+static PT_DESCRIPTORS: Int = 512 + 512 + 1024 + 512 + 512 + 512
+
+unsafe static var PAGE_TABLES: [UInt64; PT_DESCRIPTORS] = [0u64; PT_DESCRIPTORS]
 
 /// Descriptors per table at the 4 KiB granule: a table is one page of 8-byte
 /// entries.
@@ -658,14 +707,23 @@ static PT_ENTRIES: UInt = 512
 static GRANT_PAGES: UInt = 1024
 static PAGE_SIZE: UInt = 4096
 static DESC_BYTES: UInt = 8
-/// Byte offsets of the second and third tables within `PAGE_TABLES`.
+/// Byte offsets of the later tables within `PAGE_TABLES`.
 static LEVEL2_OFFSET: UInt = 4096
 static LEVEL3_OFFSET: UInt = 8192
+static DEVICE_LEVEL2_OFFSET: UInt = 16384
+static DEVICE_LEVEL3_OFFSET: UInt = 20480
 
 static RAM_BASE: UInt = 0x40000000
 static PAGE_SHIFT: Int = 12
 static BLOCK_SHIFT: Int = 21              // a level-2 block is 2 MiB
 static MAIR_INDEX_SHIFT: Int = 2          // descriptor bits 4:2
+
+/// The 2 MiB block the console UART sits in, and its base. The device level-3
+/// table covers exactly this block, so a page grantable to EL0 is a page inside
+/// it — which is the whole of what M2 needs and is checked rather than assumed
+/// (`prot_device` diagnoses anything else).
+static DEVICE_WINDOW_BASE: UInt = (UART_BASE >> BLOCK_SHIFT) << BLOCK_SHIFT
+static DEVICE_WINDOW_LEN: UInt = 1 << BLOCK_SHIFT
 
 // Descriptor bits (ARMv8-A VMSA, 4 KiB granule). Each is a lone architectural
 // bit position — a standalone quantity, which is what a `static` is for. The
@@ -694,9 +752,22 @@ enum AccessPerm: UInt64 {
 /// index, and `mair_value()` below builds the register those indices describe
 /// out of the same cases — so a type added here cannot leave its attribute byte
 /// behind.
+///
+/// TWO DEVICE TYPES, AND THE DIFFERENCE IS RULED (design 178's finale
+/// constraint 3). `Device` is the strictest the architecture has —
+/// non-Gathering, non-Reordering, no Early write acknowledgement — and is what
+/// the kernel maps its own MMIO with, because a kernel that touches a
+/// controller register wants nothing between the store and the device.
+/// `DeviceNGnRE` relaxes exactly one of those: a write may be acknowledged
+/// before it reaches the peripheral, which is the ordinary attribute for a
+/// driver's register block and what a granted device page carries. What NEITHER
+/// may be is Normal-cacheable: a cached PL011 mapping would let a register read
+/// come out of a line filled minutes ago, which is a correctness bug and not a
+/// performance one.
 enum MemoryType: UInt64 {
     case Device = 0,         // Device-nGnRnE
     case Normal = 1,         // Normal, write-back, read/write-allocate
+    case DeviceNGnRE = 2,    // Device, early write acknowledgement permitted
 }
 
 extension MemoryType {
@@ -708,6 +779,7 @@ extension MemoryType {
 
 static MAIR_ATTR_DEVICE: UInt = 0x00
 static MAIR_ATTR_NORMAL: UInt = 0xFF
+static MAIR_ATTR_DEVICE_NGNRE: UInt = 0x04
 static BITS_PER_MAIR_ATTR: Int = 8
 
 /// The memory-attribute register the `MemoryType` indices describe: one byte
@@ -720,7 +792,9 @@ static BITS_PER_MAIR_ATTR: Int = 8
 @export("sos_mair_value")
 public func mair_value() -> UInt {
     ((MAIR_ATTR_DEVICE << (BITS_PER_MAIR_ATTR * ((MemoryType.Device as UInt64) as Int)))
-     | (MAIR_ATTR_NORMAL << (BITS_PER_MAIR_ATTR * ((MemoryType.Normal as UInt64) as Int))))
+     | (MAIR_ATTR_NORMAL << (BITS_PER_MAIR_ATTR * ((MemoryType.Normal as UInt64) as Int)))
+     | (MAIR_ATTR_DEVICE_NGNRE
+        << (BITS_PER_MAIR_ATTR * ((MemoryType.DeviceNGnRE as UInt64) as Int))))
 }
 
 /// This HAL's own failure code, distinct from anything the kernel or root
@@ -768,6 +842,22 @@ func reset_window(level3: UInt) unsafe {
     }
 }
 
+/// A device page as the KERNEL sees it: read and write at EL1, no EL0, no
+/// execution at either level, and the strictest device attribute.
+func kernel_device_page(va: UInt) -> UInt64 {
+    ((va as UInt64) | DESC_VALID | DESC_PAGE | MemoryType.Device.attr_index()
+     | ATTR_AF | (AccessPerm.El1Rw as UInt64) | ATTR_PXN | ATTR_UXN)
+}
+
+/// Every page of the DEVICE window back to kernel-only.
+func reset_device_window(level3: UInt) unsafe {
+    var i: UInt = 0
+    while i < PT_ENTRIES {
+        put_desc(level3, i, kernel_device_page(DEVICE_WINDOW_BASE + (i << PAGE_SHIFT)))
+        i = i + 1
+    }
+}
+
 /// Build the identity map and hand back the level-1 table's address, which is
 /// what the low translation base register wants.
 ///
@@ -779,13 +869,31 @@ public func page_tables_build() unsafe -> UInt {
     let level1 = tables_base()
     let level2 = level1 + LEVEL2_OFFSET
     let level3 = level1 + LEVEL3_OFFSET
+    let dev_level2 = level1 + DEVICE_LEVEL2_OFFSET
+    let dev_level3 = level1 + DEVICE_LEVEL3_OFFSET
 
-    // Level 1: the device window below RAM, a table over RAM, and nothing else
-    // — every other entry stays zero, i.e. INVALID.
-    put_desc(level1, 0,
-             DESC_VALID | DESC_BLOCK | MemoryType.Device.attr_index() | ATTR_AF
-             | (AccessPerm.El1Rw as UInt64) | ATTR_PXN | ATTR_UXN)
+    // Level 1: a table over the device space below RAM, a table over RAM, and
+    // nothing else — every other entry stays zero, i.e. INVALID.
+    put_desc(level1, 0, (dev_level2 as UInt64) | DESC_VALID | DESC_TABLE)
     put_desc(level1, 1, (level2 as UInt64) | DESC_VALID | DESC_TABLE)
+
+    // The device level 2: 2 MiB device blocks over everything below RAM,
+    // EL1-only and never executable — which is what the single 1 GiB block used
+    // to say in one descriptor.
+    var d: UInt = 0
+    while d < PT_ENTRIES {
+        put_desc(dev_level2, d,
+                 ((d << BLOCK_SHIFT) as UInt64)
+                 | DESC_VALID | DESC_BLOCK | MemoryType.Device.attr_index()
+                 | ATTR_AF | (AccessPerm.El1Rw as UInt64) | ATTR_PXN | ATTR_UXN)
+        d = d + 1
+    }
+
+    // ...except the one block holding the console, which points at a level-3
+    // table so a single register page can be granted to EL0.
+    put_desc(dev_level2, DEVICE_WINDOW_BASE >> BLOCK_SHIFT,
+             (dev_level3 as UInt64) | DESC_VALID | DESC_TABLE)
+    reset_device_window(dev_level3)
 
     // Level 2: 2 MiB blocks over RAM, EL1 only.
     var i: UInt = 0
@@ -827,8 +935,12 @@ func grant_outside_window(va: UInt) {
 
 /// Revoke every grant. User mode then reaches nothing at all — the default-deny
 /// the grants below carve out of.
+///
+/// BOTH windows, because a device grant is as revocable as a RAM one: a new
+/// process must not inherit the last one's registers.
 public func prot_reset() unsafe {
     reset_window(tables_base() + LEVEL3_OFFSET)
+    reset_device_window(tables_base() + DEVICE_LEVEL3_OFFSET)
 }
 
 /// Stage grant `idx` as [base, top) with `perms`, a mask in the `SegFlag`
@@ -872,6 +984,44 @@ public func prot_region(idx: UInt, base: UInt, top: UInt, perms: UInt8) unsafe {
             grant_outside_window(va)
         }
         put_desc(level3, page, (va as UInt64) | attrs)
+        va = va + PAGE_SIZE
+    }
+}
+
+/// Stage grant `idx` as a DEVICE WINDOW over `[base, base + len)` (design 178's
+/// finale constraint 3).
+///
+/// THE ATTRIBUTE IS THE POINT ON THIS PROFILE. A page is device memory because
+/// its descriptor says so, not because of where it is, so a window mapped with
+/// the Normal attribute would be cached, speculatively read and merged — and a
+/// register block under that is not slow, it is WRONG. `DeviceNGnRE` is the
+/// ordinary driver attribute (see `MemoryType`), and both no-execute bits go in
+/// unconditionally because registers are not instructions.
+///
+/// ACCESS-SIZE DISCIPLINE IS THE DRIVER'S HALF and cannot be expressed in a
+/// descriptor: device memory permits no unaligned and no multi-register access,
+/// so a driver reads and writes each register at ITS OWN WIDTH — 32 bits on
+/// this board's console — and never memcpy's a register block. What the
+/// attribute guarantees is that the hardware will not merge or split the
+/// accesses the driver does make.
+///
+/// `idx` is unused, as it is in `prot_region`: a numbered region is a Profile-A
+/// budget concept the seam carries for both.
+public func prot_device(idx: UInt, base: UInt, len: UInt) unsafe {
+    let dev_level3 = tables_base() + DEVICE_LEVEL3_OFFSET
+    let attrs = (DESC_VALID | DESC_PAGE | MemoryType.DeviceNGnRE.attr_index()
+                 | ATTR_AF | (AccessPerm.El0Rw as UInt64) | ATTR_PXN | ATTR_UXN)
+    // Tested BEFORE the subtraction that computes the page index, for the
+    // reason `prot_region` gives: overflow checks are always on, so the order
+    // is what turns a bad map into a diagnostic rather than a panic from inside
+    // the protection primitive.
+    var va = base - (base & (PAGE_SIZE - 1))
+    while va < base + len {
+        if va < DEVICE_WINDOW_BASE || va >= DEVICE_WINDOW_BASE + DEVICE_WINDOW_LEN {
+            grant_outside_window(va)
+        }
+        put_desc(dev_level3, (va - DEVICE_WINDOW_BASE) >> PAGE_SHIFT,
+                 (va as UInt64) | attrs)
         va = va + PAGE_SIZE
     }
 }
@@ -1071,6 +1221,41 @@ public func irq_claim(cause: UInt) unsafe -> UInt {
 /// End of service for `line`.
 public func irq_complete(line: UInt) unsafe {
     Gic().complete(line)
+}
+
+/// Is `line` one THIS BOARD wires?
+///
+/// The distributor reports how many it has, so the bound is read from the
+/// hardware rather than written here. Line 0 is a software-generated line SOS
+/// never raises and is what the seam reports for "nothing", so it is excluded
+/// at the same time. The timer's line IS in this range on this profile — it is
+/// an ordinary controller line here — and the kernel excludes it arch-free,
+/// because "the tick is not for rent" is a policy rather than a fact about the
+/// board.
+public func irq_line_valid(line: UInt) unsafe -> Bool {
+    line != IRQ_NONE && line < Gic().line_count()
+}
+
+/// Ask for a pending line WITHOUT a trap having delivered one — the idle path's
+/// half of the seam.
+///
+/// It is `irq_claim` under a second name here, and that is not an oversight:
+/// this controller answers "which line won" out of one register whether or not
+/// a vector ran, so the cause word `irq_claim` takes was already unused. Profile
+/// A's timer is not a controller source, which is why the two names exist.
+public func irq_poll() unsafe -> UInt {
+    irq_claim(IRQ_CAUSE)
+}
+
+/// Park this core until an interrupt is pending.
+///
+/// It wakes on a pending physical interrupt whether or not this exception level
+/// would take one — which is exactly the property the idle path needs, since
+/// design 178's D2 keeps them masked at EL1 forever. So the core sleeps, the
+/// line arrives, execution continues at the next instruction, and `irq_poll`
+/// finds it.
+public func wait_for_irq() {
+    sos_wait_for_irq()
 }
 
 /// Raise a line from software, for interrupt bring-up. Returns the line raised.

@@ -33,12 +33,14 @@ import sosrt.{ascii_byte, hex_digit_of, hex_digits_per_word}
 // exports (sos/kernel/sysapi/) — one definition, two halves of one contract.
 import sosabi.{
     ObjType, SystemHandle, ProcessHandle, ThreadHandle, EventHandle, WaiterHandle,
+    InterruptHandle,
     SystemRight, ProcessRight, ThreadRight, EventRight, WaiterRight,
-    SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp,
+    InterruptRight,
+    SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp, InterruptOp,
     EventMode, WaitTag, WAIT_RECORD_WORDS, wait_record_bytes,
     SosStatus, FaultReason, ProcessStatusKind, process_status_word,
     root_system_rights, root_process_rights, thread_rights,
-    event_rights, waiter_rights,
+    event_rights, waiter_rights, interrupt_rights,
     ROOT_SYSTEM_HANDLE, NO_HANDLE, ENTRY_IMAGE,
 }
 
@@ -52,6 +54,39 @@ import sosabi.{
 /// hex — and hands each byte to the HAL, which knows what device it is. The
 /// split is deliberate: `write_hex` is the same code on every target, and the
 /// only thing that ever differs is where the byte lands.
+///
+/// # THE UART HANDOVER PROTOCOL (ruled Aug 16, user — design 178's finale)
+///
+/// Both machines have ONE console UART and both the kernel and a driver process
+/// can drive it. Unstated, that is a flaky-test mystery: two writers on one
+/// device interleave mid-word and nothing in either is wrong.
+///
+/// So the ownership is stated, and it has three phases:
+///
+///   1. **Boot.** The kernel owns the device outright. It narrates the banner,
+///      the image, and anything that goes wrong.
+///   2. **Handover.** `start_process` writes ONE marker line — `SOS: console
+///      handover` — as the last thing the kernel says on its own initiative.
+///      After it, THE PROCESS OWNS THE DEVICE.
+///   3. **Reclaim, on diagnostics only.** The kernel writes again exactly where
+///      the run has already failed or ended: a fault report, a process
+///      teardown, a panic, or an interrupt on a line nothing is bound to. The
+///      interleaving those may cause is acceptable because there is no longer a
+///      transcript to protect.
+///
+/// WHAT THE KERNEL STILL WRITES ON DEMAND is not a violation of this: a
+/// `SystemOp.DebugPrint` is the PROCESS asking the kernel to place a byte, and
+/// the process is the one sequencing it. What the protocol forbids is the
+/// kernel narrating over a process that is using the device.
+///
+/// A KERNEL THAT ARMS A TIMER is the one exception worth knowing, and it is
+/// bounded: `TICK_REPORT_LIMIT` ticks are narrated after handover before the
+/// tick path goes quiet. That is why the preemption case does not assert its
+/// root's banner, and why a case whose transcript matters after handover arms
+/// no timer.
+///
+/// The DEVICE half of this — which registers, and what a second writer does to
+/// them — is stated in each HAL's console section.
 public struct Console {
     /// A console is a capability to write, not a device handle: the HAL owns
     /// the device. The field exists because a zero-field struct has no reason
@@ -222,6 +257,20 @@ extension WaiterObject {
     }
 }
 
+/// An Interrupt handle the dispatch has VALIDATED, paired with its rights and
+/// the interrupt slot it names (spec §2 table, §9).
+struct InterruptObject {
+    handle: InterruptHandle,
+    rights: UInt32,
+    slot: Int,
+}
+
+extension InterruptObject {
+    func allows(&self, right: InterruptRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
+    }
+}
+
 /// Exit codes the kernel reports through the platform's failure channel,
 /// distinct from any status root chooses for itself.
 ///
@@ -301,6 +350,21 @@ static MAX_EVENTS: Int = 8
 /// — many handles per Waiter, many threads per Waiter — is one per pool of
 /// workers rather than one per notification.
 static MAX_WAITERS: Int = 4
+
+/// Interrupts the kernel can hold, across all processes (spec §2 table, §9).
+///
+/// Small because an Interrupt is a BOUND DEVICE LINE, and a machine has as many
+/// of those as it has devices with drivers — not as many as it has
+/// notifications. Every one costs a masked/unmasked line in the controller,
+/// which is a real resource the board fixes.
+static MAX_INTERRUPTS: Int = 4
+
+/// Attachments the kernel can hold, across all Waiters.
+///
+/// Sized to cover every waitable being attached at once, which is the honest
+/// bound: an attachment is one (Waiter, waitable) pair and §2.2 allows a handle
+/// at most one Waiter, so nothing can need more than there are waitables.
+static MAX_ATTACHMENTS: Int = MAX_EVENTS + MAX_INTERRUPTS
 
 /// Handles one process's table can hold (§3).
 static MAX_HANDLES: Int = 16
@@ -444,6 +508,31 @@ enum SlotState: UInt8 {
     case Live = 1,
 }
 
+/// WHICH KINDS CAN BE ATTACHED TO A WAITER — the waitable kinds, and only
+/// those.
+///
+/// It is a SECOND enum beside `ObjType` rather than a `Bool` on it, and the
+/// reason is the same one `sosabi` gives for not recording waitability there at
+/// all: attaching also spends a RIGHT, and which enum's bits that right lives in
+/// is decided by the kind. `waitable_slot` is where an `ObjType` becomes one of
+/// these, and it is the only place — every non-waitable arm of that match
+/// terminates the process instead of producing a value.
+///
+/// What this enum buys downstream is that the four per-kind questions below are
+/// EXHAUSTIVE OVER WAITABLES rather than over object types: a fifth object kind
+/// that is not waitable costs them nothing, and a fifth WAITABLE kind fails all
+/// four to compile until somebody answers for it.
+enum WaitableKind: UInt8 {
+    case Event = 0,
+    case Interrupt = 1,
+}
+
+/// A waitable the dispatch has resolved: which table, which slot.
+struct Waitable {
+    kind: WaitableKind,
+    slot: Int,
+}
+
 /// One Event (spec §2.4): the accumulating non-blocking notification.
 ///
 /// `word` IS the object. Non-zero means ready, which is what makes readiness
@@ -451,11 +540,13 @@ enum SlotState: UInt8 {
 /// told, so every look at the word gives the same answer until a `Receive`
 /// drains it. There is no edge to lose because there is no edge.
 ///
-/// `waiter`/`key`/`link` are the ATTACHMENT, and they live on the event rather
-/// than in a table on the Waiter because §2.2 ratifies at most one Waiter per
-/// handle: one attachment per event is a field, and "which waiter" is then a
-/// question the event can answer in one read — which is what `Signal` needs on
-/// its hot path. Slot indices are stored PLUS ONE so that zero means "none",
+/// `attachment` is the ONE thing an Event knows about the wait side: which
+/// attachment names it, or zero. §2.2 ratifies at most one Waiter per handle,
+/// so that is a field rather than a list, and it is what makes `Signal`'s hot
+/// path one load. Everything else about the attachment — which Waiter, which
+/// key, what comes next on the list — lives in the attachment itself, because
+/// an Interrupt has the same field and neither kind should carry a copy of the
+/// wait machinery. Slot indices are stored PLUS ONE so that zero means "none",
 /// which is what a zeroed static already says.
 struct EventSlot {
     state: SlotState,
@@ -464,13 +555,35 @@ struct EventSlot {
     mode: EventMode,
     /// The accumulated word. Non-zero = ready.
     word: UInt,
-    /// The Waiter this event is attached to (slot + 1); 0 = unattached.
-    waiter: Int,
-    /// The word-sized key the attacher supplied (§2.2). The kernel stores it
-    /// and hands it back; it never interprets it.
-    key: UInt,
-    /// Next event on that waiter's attachment list (slot + 1).
-    link: Int,
+    /// The attachment naming this event (slot + 1); 0 = unattached.
+    attachment: Int,
+}
+
+/// One Interrupt (spec §2 table, §9): an IRQ line bound to a waitable.
+///
+/// `pending` IS the object, exactly as an Event's word is: it is set when the
+/// line fires and cleared by `Ack`, and "ready" means nothing more than that.
+/// §9's at-most-one-unacked-fire invariant is therefore not maintained, it is
+/// REPRESENTED — a `Bool` cannot hold two — and what makes it true rather than
+/// merely representable is that the kernel MASKS the line before the hook runs
+/// and only `Ack` unmasks it, so the device physically cannot fire again in
+/// between.
+///
+/// `line` is the number the controller answers with, and it is what makes an
+/// Interrupt findable from the trap path: the hook has a line and needs the
+/// object. A table scan is what answers that, which at this slab size is a
+/// handful of loads and is bounded by the same argument every other scan in the
+/// interrupt path is (design 178 D2 — it runs with interrupts masked, so its
+/// length is interrupt latency).
+struct InterruptSlot {
+    state: SlotState,
+    process: Int,
+    /// The IRQ line this object is bound to, for its whole life.
+    line: UInt,
+    /// Fired and not yet acked. Non-false = ready, in §2.2's sense.
+    pending: Bool,
+    /// The attachment naming this interrupt (slot + 1); 0 = unattached.
+    attachment: Int,
 }
 
 /// One Waiter (spec §2.2): the generic wait aggregator.
@@ -479,15 +592,42 @@ struct EventSlot {
 /// §2.2 has no one-shot mode, so an attachment is removed and never consumed —
 /// and `blocked` is the threads parked in `Wait`, which §2.2 allows to be
 /// several. Readiness is NOT a third list: it is derived by scanning `attached`
-/// for a non-zero word, which is the level-triggered semantics stated as an
+/// for something ready, which is the level-triggered semantics stated as an
 /// implementation rather than maintained beside one.
 struct WaiterSlot {
     state: SlotState,
     process: Int,
-    /// Head of the attachment list (event slot + 1).
+    /// Head of the attachment list (attachment slot + 1).
     attached: Int,
     /// Head of the list of threads parked in `Wait` (thread slot + 1).
     blocked: Int,
+}
+
+/// ONE ATTACHMENT: a Waiter, a waitable, and the key that names the pair.
+///
+/// IT IS A THIRD OBJECT RATHER THAN FIELDS ON THE WAITABLE, and the second
+/// waitable kind is what forced that (M2 unit 3 kept them on the Event). A
+/// Waiter's set has to be ONE list — a wait scans it once and a `Remove` walks
+/// it once — so a per-kind list would make both operations a matrix over kinds
+/// instead of a walk, and rider 4's "the same walk, and therefore one place to
+/// be wrong" would stop being true at exactly two kinds.
+///
+/// What each waitable still keeps is a single `attachment` field, which is the
+/// answer to the only question the SIGNAL side asks: who, if anyone, is
+/// watching me.
+struct Attachment {
+    state: SlotState,
+    /// Which table `target` indexes.
+    kind: WaitableKind,
+    /// The waitable's slot in that table.
+    target: Int,
+    /// The Waiter this attachment belongs to (slot index, 0-based).
+    waiter: Int,
+    /// The word-sized key the attacher supplied (§2.2). The kernel stores it
+    /// and hands it back; it never interprets it.
+    key: UInt,
+    /// Next attachment on that waiter's list (slot + 1).
+    link: Int,
 }
 
 unsafe static var THREADS: [ThreadSlot; MAX_THREADS] = [
@@ -507,19 +647,29 @@ unsafe static var HANDLES: [HandleEntry; MAX_PROCESSES * MAX_HANDLES] = [
 
 unsafe static var EVENTS: [EventSlot; MAX_EVENTS] = [
     EventSlot(state: SlotState.Free, process: 0, mode: EventMode.Or, word: 0,
-              waiter: 0, key: 0, link: 0); MAX_EVENTS]
+              attachment: 0); MAX_EVENTS]
 
 unsafe static var WAITERS: [WaiterSlot; MAX_WAITERS] = [
     WaiterSlot(state: SlotState.Free, process: 0, attached: 0,
                blocked: 0); MAX_WAITERS]
 
+unsafe static var INTERRUPTS: [InterruptSlot; MAX_INTERRUPTS] = [
+    InterruptSlot(state: SlotState.Free, process: 0, line: 0, pending: false,
+                  attachment: 0); MAX_INTERRUPTS]
+
+unsafe static var ATTACHMENTS: [Attachment; MAX_ATTACHMENTS] = [
+    Attachment(state: SlotState.Free, kind: WaitableKind.Event, target: 0,
+               waiter: 0, key: 0, link: 0); MAX_ATTACHMENTS]
+
 /// "No thread". Slot indices are ordinary 0-based `Int`s in the tables and
 /// PLUS-ONE inside list links; this is the sentinel for the plain form.
 static NO_THREAD: Int = -1
 
-/// The same sentinel for the two new tables.
+/// The same sentinel for the other tables.
 static NO_EVENT: Int = -1
 static NO_WAITER: Int = -1
+static NO_INTERRUPT: Int = -1
+static NO_ATTACHMENT: Int = -1
 
 /// The running thread's slot, or `NO_THREAD`.
 ///
@@ -664,6 +814,32 @@ func alloc_waiter() unsafe -> Int {
     NO_WAITER
 }
 
+/// Take a free interrupt slot, or `NO_INTERRUPT` when the slab is empty.
+func alloc_interrupt() unsafe -> Int {
+    var i: Int = 0
+    while i < MAX_INTERRUPTS {
+        match INTERRUPTS[i].state {
+            case Free -> { return i },
+            case Live -> {},
+        }
+        i = i + 1
+    }
+    NO_INTERRUPT
+}
+
+/// Take a free attachment slot, or `NO_ATTACHMENT` when the slab is empty.
+func alloc_attachment() unsafe -> Int {
+    var i: Int = 0
+    while i < MAX_ATTACHMENTS {
+        match ATTACHMENTS[i].state {
+            case Free -> { return i },
+            case Live -> {},
+        }
+        i = i + 1
+    }
+    NO_ATTACHMENT
+}
+
 // -----------------------------------------------------------------------------
 // The scheduler (design 178 D3)
 // -----------------------------------------------------------------------------
@@ -710,17 +886,18 @@ func pick_next(current_frame: UInt) unsafe -> UInt {
     }
     NEED_RESCHED = false
 
-    let next = ready_pop()
+    var next = ready_pop()
     if next == NO_THREAD {
-        // Nothing runnable and the process has not ended: every thread is
-        // blocked on something no thread can now deliver. In M2 that is still a
-        // genuine deadlock, and Events do not change it — an Event is signalled
-        // BY A THREAD, so a system with no runnable thread has nobody left to
-        // signal one. The Interrupt object is what makes readiness arrive from
-        // outside the set of runnable threads, and this is the line that becomes
-        // an idle path — a per-profile wait-for-interrupt loop (spec §7) — in
-        // the unit that lands it.
-        fault_process(THREADS[cur].process, FaultReason.Deadlock)
+        // Nothing runnable, and two readings of it (see THE IDLE PATH below).
+        // With a bound IRQ line, readiness can still arrive from outside the
+        // set of runnable threads, so the kernel WAITS for it; with none, every
+        // thread is blocked on something no thread can now deliver, which is
+        // the deadlock M2 has always reported here.
+        if not has_external_wake_source() {
+            fault_process(THREADS[cur].process, FaultReason.Deadlock)
+        }
+        idle_until_runnable()
+        next = ready_pop()
     }
 
     CURRENT_THREAD = next
@@ -837,26 +1014,91 @@ func accumulate(slot: Int, bits: UInt) unsafe {
     }
 }
 
-/// The first attached event of `w` that is ready, or `NO_EVENT`.
+// -----------------------------------------------------------------------------
+// THE PER-KIND MATRIX: four questions, one arm per waitable kind (obligation 1)
+// -----------------------------------------------------------------------------
+//
+// Everything the wait machinery needs to know about a waitable is one of these
+// four questions, and each is answered by an EXHAUSTIVE match on
+// `WaitableKind`:
+//
+//   `waitable_attachment` / `set_waitable_attachment`   who is watching me
+//   `waitable_ready`                                    am I ready
+//   `waitable_answer`                                   what does a record say
+//
+// That is a MATRIX rather than a funnel because the answers genuinely differ
+// per kind — an Event's readiness is a word and an Interrupt's is a masked line
+// — and it is written as four small functions in one place so the matrix is
+// READABLE AS ONE. Adding a fifth waitable kind fails all four to compile,
+// which is the property a `_` arm anywhere here would destroy.
+//
+// Everything ELSE about waiting — the list walk, the key lookup, the wake, the
+// copy-out — is kind-blind and appears exactly once below.
+
+/// Which attachment names this waitable (slot + 1), or 0.
+func waitable_attachment(kind: WaitableKind, slot: Int) unsafe -> Int {
+    match kind {
+        case Event -> EVENTS[slot].attachment,
+        case Interrupt -> INTERRUPTS[slot].attachment,
+    }
+}
+
+/// Record (or clear, with 0) which attachment names this waitable.
+func set_waitable_attachment(kind: WaitableKind, slot: Int, a: Int) unsafe {
+    match kind {
+        case Event -> { EVENTS[slot].attachment = a },
+        case Interrupt -> { INTERRUPTS[slot].attachment = a },
+    }
+}
+
+/// Is this waitable ready, in §2.2's level-triggered sense?
+///
+/// Both answers are a READ of the object's own state and neither consults a
+/// flag the wait machinery maintains, which is what makes level-triggering an
+/// absence rather than a mechanism: an Event is ready while its word is
+/// non-zero, an Interrupt while its fire is unacked.
+func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Bool {
+    match kind {
+        case Event -> EVENTS[slot].word != 0,
+        case Interrupt -> INTERRUPTS[slot].pending,
+    }
+}
+
+/// The tag and payload words a wait record carries for this waitable.
+func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> WaitAnswer {
+    match kind {
+        case Event -> WaitAnswer(tag: WaitTag.Event, payload: EVENTS[slot].word),
+        case Interrupt -> WaitAnswer(tag: WaitTag.Interrupt,
+                                     payload: INTERRUPTS[slot].line),
+    }
+}
+
+/// What `waitable_answer` produces: the two words that are not the key.
+struct WaitAnswer {
+    tag: WaitTag,
+    payload: UInt,
+}
+
+/// The first attachment of `w` whose waitable is ready, or `NO_ATTACHMENT`.
 ///
 /// A SCAN, and that is the level-triggered semantics implemented rather than
-/// maintained: there is no ready QUEUE to keep in step with the words, so a
-/// word that goes back to zero cannot leave a stale entry behind and a word
-/// that stays non-zero is found again by the next scan. It is O(attachments),
+/// maintained: there is no ready QUEUE to keep in step with the objects, so a
+/// waitable that goes back to not-ready cannot leave a stale entry behind and
+/// one that stays ready is found again by the next scan. It is O(attachments),
 /// which at M2's slab sizes is a handful of loads and is bounded by the same
 /// argument the ready queue's is — this runs with interrupts masked, so its
 /// length is interrupt latency (design 178 D2), and a Waiter with hundreds of
 /// attachments is what an M3 ready-list optimisation would be for.
-func waiter_ready_event(w: Int) unsafe -> Int {
+func waiter_ready_attachment(w: Int) unsafe -> Int {
     var cur = WAITERS[w].attached
     while cur != 0 {
-        let slot = cur - 1
-        if EVENTS[slot].word != 0 {
-            return slot
+        let a = cur - 1
+        if waitable_ready(ATTACHMENTS[a].kind, ATTACHMENTS[a].target) {
+            return a
         }
-        cur = EVENTS[slot].link
+        cur = ATTACHMENTS[a].link
     }
-    NO_EVENT
+    NO_ATTACHMENT
 }
 
 /// Park the running thread on `w`'s blocked list, remembering where its record
@@ -892,7 +1134,7 @@ func deliver_wait_record(p: Int, dst: UInt, key: UInt, tag: WaitTag,
              wait_record_bytes() as UInt)
 }
 
-/// Hand a ready attachment to ONE thread parked on `w`, if any is (§2.2).
+/// Hand attachment `a` to ONE thread parked on `w`, if any is (§2.2).
 ///
 /// The record goes into the woken thread's own buffer and its STATUS into the
 /// woken thread's frame, both HERE and nowhere else — the same discipline
@@ -901,8 +1143,11 @@ func deliver_wait_record(p: Int, dst: UInt, key: UInt, tag: WaitTag,
 ///
 /// THE WRITER IS A DIFFERENT THREAD from the one being answered, which is sound
 /// today because M2 has one address space; `copy_out`'s docstring is where that
-/// stops being free.
-func wake_one_waiter(w: Int, e: Int) unsafe {
+/// stops being free. Since the Interrupt object landed the writer need not be a
+/// THREAD at all — the trap path and the idle poll both reach here — which
+/// changes nothing about the write and everything about why the check that
+/// validated the buffer had to happen back at the `Wait` call.
+func wake_one_waiter(w: Int, a: Int) unsafe {
     let head = WAITERS[w].blocked
     if head == 0 {
         return
@@ -911,12 +1156,26 @@ func wake_one_waiter(w: Int, e: Int) unsafe {
     WAITERS[w].blocked = THREADS[slot].link
     THREADS[slot].link = 0
 
+    let answer = waitable_answer(ATTACHMENTS[a].kind, ATTACHMENTS[a].target)
     deliver_wait_record(THREADS[slot].process, THREADS[slot].wait_buf,
-                        EVENTS[e].key, WaitTag.Event, EVENTS[e].word)
+                        ATTACHMENTS[a].key, answer.tag, answer.payload)
     THREADS[slot].wait_buf = 0
     write_result(frame_slot(slot), op_ok())
     THREADS[slot].state = ThreadState.Runnable
     ready_push(slot)
+}
+
+/// A waitable just became ready: tell its Waiter, if it has one.
+///
+/// THE ONE PLACE READINESS TURNS INTO A WAKE, reached from both producers — an
+/// Event's `Signal` and an Interrupt's line firing. Neither knows anything
+/// about waiters beyond the attachment field the matrix reads.
+func notify_ready(kind: WaitableKind, slot: Int) unsafe {
+    let a = waitable_attachment(kind, slot)
+    if a == 0 {
+        return
+    }
+    wake_one_waiter(ATTACHMENTS[a - 1].waiter, a - 1)
 }
 
 /// §2.4's signal: accumulate, NEVER block, and tell the Waiter if there is one.
@@ -928,14 +1187,10 @@ func signal_event(slot: Int, bits: UInt) unsafe {
     if EVENTS[slot].word == 0 {
         return
     }
-    let attached = EVENTS[slot].waiter
-    if attached == 0 {
-        return
-    }
-    wake_one_waiter(attached - 1, slot)
+    notify_ready(WaitableKind.Event, slot)
 }
 
-/// The event attached to `w` under `key`, or `NO_EVENT`.
+/// The attachment on `w` under `key`, or `NO_ATTACHMENT`.
 ///
 /// THE KEY IS THE ATTACHMENT'S NAME, which is what makes the attachment set a
 /// TABLE keyed by it rather than a bag: `Remove` names an attachment this way,
@@ -944,32 +1199,34 @@ func signal_event(slot: Int, bits: UInt) unsafe {
 func attached_by_key(w: Int, key: UInt) unsafe -> Int {
     var cur = WAITERS[w].attached
     while cur != 0 {
-        let slot = cur - 1
-        if EVENTS[slot].key == key {
-            return slot
+        let a = cur - 1
+        if ATTACHMENTS[a].key == key {
+            return a
         }
-        cur = EVENTS[slot].link
+        cur = ATTACHMENTS[a].link
     }
-    NO_EVENT
+    NO_ATTACHMENT
 }
 
-/// Take event `e` off waiter `w`'s attachment list, and clear the attachment
-/// fields on the event. The caller has established that it is on that list.
-func detach_event(w: Int, e: Int) unsafe {
+/// Take attachment `a` off waiter `w`'s list, clear the waitable's back
+/// pointer, and return the slot to the slab. The caller has established that it
+/// is on that list.
+func detach_attachment(w: Int, a: Int) unsafe {
     var prev: Int = 0
     var cur = WAITERS[w].attached
     while cur != 0 {
         let slot = cur - 1
-        let next = EVENTS[slot].link
-        if slot == e {
+        let next = ATTACHMENTS[slot].link
+        if slot == a {
             if prev == 0 {
                 WAITERS[w].attached = next
             } else {
-                EVENTS[prev - 1].link = next
+                ATTACHMENTS[prev - 1].link = next
             }
-            EVENTS[e].link = 0
-            EVENTS[e].waiter = 0
-            EVENTS[e].key = 0
+            set_waitable_attachment(ATTACHMENTS[a].kind, ATTACHMENTS[a].target, 0)
+            ATTACHMENTS[a] = Attachment(state: SlotState.Free,
+                                        kind: WaitableKind.Event, target: 0,
+                                        waiter: 0, key: 0, link: 0)
             return
         }
         prev = cur
@@ -1033,6 +1290,50 @@ func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     READY_HEAD = 0
     READY_TAIL = 0
 
+    // Interrupts go back FIRST, and masking each line is the part that is not
+    // bookkeeping: a device the dead process was driving may still be
+    // asserting, and an unmasked line with no object behind it would be taken,
+    // reported and masked once per fire forever. Masking here is the kernel
+    // taking the line back, which is the same handover §9 describes running
+    // backwards.
+    var irqs_freed: UInt = 0
+    var q: Int = 0
+    while q < MAX_INTERRUPTS {
+        if INTERRUPTS[q].process == p {
+            match INTERRUPTS[q].state {
+                case Free -> {},
+                case Live -> {
+                    hal.irq_mask(INTERRUPTS[q].line)
+                    INTERRUPTS[q] = InterruptSlot(state: SlotState.Free,
+                                                  process: 0, line: 0,
+                                                  pending: false, attachment: 0)
+                    irqs_freed = irqs_freed + 1
+                },
+            }
+        }
+        q = q + 1
+    }
+
+    // Attachments belong to a WAITER, so they are reclaimed by walking the
+    // process's waiters rather than by scanning for a process field they do not
+    // carry — which is also the honest ownership statement: an attachment is a
+    // row in a Waiter's table and dies with it.
+    var a: Int = 0
+    while a < MAX_ATTACHMENTS {
+        match ATTACHMENTS[a].state {
+            case Free -> {},
+            case Live -> {
+                if WAITERS[ATTACHMENTS[a].waiter].process == p {
+                    ATTACHMENTS[a] = Attachment(state: SlotState.Free,
+                                                kind: WaitableKind.Event,
+                                                target: 0, waiter: 0, key: 0,
+                                                link: 0)
+                }
+            },
+        }
+        a = a + 1
+    }
+
     // Events and Waiters go back to their slabs whole (spec §2's Process row:
     // free what the process owned). No unlinking is needed first — an
     // attachment only ever joins two objects of the SAME process, so freeing
@@ -1047,7 +1348,7 @@ func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
                 case Live -> {
                     EVENTS[e] = EventSlot(state: SlotState.Free, process: 0,
                                           mode: EventMode.Or, word: 0,
-                                          waiter: 0, key: 0, link: 0)
+                                          attachment: 0)
                     events_freed = events_freed + 1
                 },
             }
@@ -1080,6 +1381,8 @@ func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     uart.write_hex(events_freed)
     uart.write_str(" waiters=")
     uart.write_hex(waiters_freed)
+    uart.write_str(" interrupts=")
+    uart.write_hex(irqs_freed)
     uart.write_str("\n")
 
     if machine_status == 0 {
@@ -1227,8 +1530,14 @@ func fault_result(p: Int, reason: FaultReason) unsafe -> SyscallResult {
 }
 
 /// The same, from a position that owes a slot index. One wrapper per return
-/// type is what DF-178d costs; both are unreachable past their first line.
+/// type is what DF-178d costs; all three are unreachable past their first line.
 func fault_slot(p: Int, reason: FaultReason) unsafe -> Int {
+    fault_process(p, reason)
+    while { }
+}
+
+/// The same, from a position that owes a resolved waitable.
+func fault_waitable(p: Int, reason: FaultReason) unsafe -> Waitable {
     fault_process(p, reason)
     while { }
 }
@@ -1457,6 +1766,16 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             }
             create_waiter(obj.slot)
         },
+        // Binding an IRQ line is the strongest of the creation authorities, and
+        // it flows through the same handle for the same reason: the Process
+        // object is what an Interrupt is charged to, and a bit is what a
+        // launcher strips from everything that is not a driver.
+        case CreateInterrupt -> {
+            if not obj.allows(ProcessRight.CreateInterrupt) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            create_interrupt(obj.slot, arg0)
+        },
     }
 }
 
@@ -1485,7 +1804,74 @@ func create_event_moded(p: Int, mode: EventMode) unsafe -> SyscallResult {
     // the slab exactly as it found it — the all-or-nothing shape design 123
     // asks of a `try_` op, for the same reason.
     EVENTS[slot] = EventSlot(state: SlotState.Live, process: p, mode: mode,
-                             word: 0, waiter: 0, key: 0, link: 0)
+                             word: 0, attachment: 0)
+    op_value(handle)
+}
+
+/// The Interrupt bound to `line`, or `NO_INTERRUPT`.
+///
+/// A SCAN over four slots, and it is what turns the trap path's line number
+/// back into an object. Keeping a line -> slot map instead would be a second
+/// description of the same fact — the bindings are already in the table, and
+/// the table is the only place a line may be bound twice, which `create_interrupt`
+/// refuses using exactly this walk.
+func interrupt_by_line(line: UInt) unsafe -> Int {
+    var i: Int = 0
+    while i < MAX_INTERRUPTS {
+        match INTERRUPTS[i].state {
+            case Live -> {
+                if INTERRUPTS[i].line == line {
+                    return i
+                }
+            },
+            case Free -> {},
+        }
+        i = i + 1
+    }
+    NO_INTERRUPT
+}
+
+/// Bind `line` to a new Interrupt in process `p` (spec §2 table, §9).
+///
+/// THREE REFUSALS, all faults, all caller-checkable:
+///
+///   - a line THIS MACHINE does not have. The board's line space is documented
+///     per profile and a driver names a number out of its own device's
+///     description, so a number outside it is a mistake the caller could have
+///     checked.
+///   - the TIMER's line. It is the scheduler's, and a process holding it could
+///     mask the tick and never yield — which is not a capability the object
+///     model offers, so asking for it is a caller error rather than a refusal
+///     to branch on. It is checked HERE, arch-free, because it is a KERNEL
+///     policy: which number the timer uses is the machine's business, that it
+///     is not for rent is not.
+///   - a line ALREADY BOUND. Two Interrupts on one line would be two objects
+///     with one `pending` between them and two acks for one fire, so the second
+///     bind is refused rather than serialized.
+///
+/// The line is UNMASKED on success, which is the initial state §9's cycle needs:
+/// mask-on-fire, ack-to-rearm, so something has to arm it first and creation is
+/// that something. The DEVICE's own interrupt-enable register is not touched —
+/// that is the driver's, through the window it was granted.
+func create_interrupt(p: Int, line: UInt) unsafe -> SyscallResult {
+    if line == hal.IRQ_TIMER || not hal.irq_line_valid(line) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    if interrupt_by_line(line) != NO_INTERRUPT {
+        fault_process(p, FaultReason.LineBound)
+    }
+
+    let slot = alloc_interrupt()
+    if slot == NO_INTERRUPT {
+        return op_status(SosStatus.NoResource)
+    }
+    let handle = mint_handle(p, ObjType.Interrupt, interrupt_rights(), slot)
+    if handle == NO_HANDLE {
+        return op_status(SosStatus.NoResource)
+    }
+    INTERRUPTS[slot] = InterruptSlot(state: SlotState.Live, process: p,
+                                     line: line, pending: false, attachment: 0)
+    hal.irq_unmask(line)
     op_value(handle)
 }
 
@@ -1650,6 +2036,49 @@ func event_op_decoded(op: EventOp, obj: &EventObject, arg0: UInt,
     }
 }
 
+/// The Interrupt object's ops (spec §2 table, §9; design 178 D6).
+func interrupt_op(raw_op: UInt, obj: &InterruptObject) unsafe -> SyscallResult {
+    let p = calling_process()
+    if let op = InterruptOp.from(raw: raw_op) {
+        return interrupt_op_decoded(op, &obj, p)
+    }
+    fault_result(p, FaultReason.BadOp)
+}
+
+func interrupt_op_decoded(op: InterruptOp, obj: &InterruptObject,
+                          p: Int) unsafe -> SyscallResult {
+    let target = obj.slot
+
+    match op {
+        // §9's ACK: end this fire and let the device interrupt again.
+        //
+        // ACKING SOMETHING THAT HAS NOT FIRED IS A FAULT, and it is worth
+        // saying why that is caller-checkable rather than harsh. §9 puts at
+        // most one unacked fire per Interrupt, and the driver learns about that
+        // fire by being told — through a wait it made. So an ack with nothing
+        // pending is a driver that acked twice for one fire, or acked before it
+        // waited: in both cases the NEXT ack lands on a fire nobody serviced,
+        // which is a dropped byte or a wedged device somewhere downstream. A
+        // tolerated no-op here would turn that into a bug with no first
+        // symptom.
+        //
+        // THE UNMASK IS LAST, and the order is spec §9's release discipline
+        // read from the kernel's side: everything that touches this object's
+        // state happens before the line can fire again.
+        case Ack -> {
+            if not obj.allows(InterruptRight.Ack) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            if not INTERRUPTS[target].pending {
+                fault_process(p, FaultReason.BadState)
+            }
+            INTERRUPTS[target].pending = false
+            hal.irq_unmask(INTERRUPTS[target].line)
+            op_ok()
+        },
+    }
+}
+
 /// Resolve `handle` as something this caller may ATTACH TO A WAITER, or
 /// terminate the process.
 ///
@@ -1663,7 +2092,7 @@ func event_op_decoded(op: EventOp, obj: &EventObject, arg0: UInt,
 /// Every case is spelled out rather than falling through a `_`, which is what
 /// makes the next waitable kind — a Channel, a Timer, an Interrupt (§2.2), a
 /// Thread or a Process (§8) — fail to compile until somebody answers for it.
-func waitable_slot(p: Int, handle: UInt) unsafe -> Int {
+func waitable_slot(p: Int, handle: UInt) unsafe -> Waitable {
     let entry = lookup_handle(p, handle)
     match entry.obj_type {
         case Event -> {
@@ -1672,13 +2101,26 @@ func waitable_slot(p: Int, handle: UInt) unsafe -> Int {
             if not ev.allows(EventRight.Wait) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            entry.target
+            Waitable(kind: WaitableKind.Event, slot: entry.target)
         },
-        case Unbound -> fault_slot(p, FaultReason.BadHandle),
-        case System -> fault_slot(p, FaultReason.NotWaitable),
-        case Process -> fault_slot(p, FaultReason.NotWaitable),
-        case Thread -> fault_slot(p, FaultReason.NotWaitable),
-        case Waiter -> fault_slot(p, FaultReason.NotWaitable),
+        // The second waitable kind, and the one the object model was built for:
+        // §2.2 lists Interrupt among the waitables and §9's whole delivery
+        // model is a driver parked on one. The right it spends is
+        // `InterruptRight.Wait`, which is a different enum from the Event arm's
+        // and is exactly why waitability and the rights check are one question.
+        case Interrupt -> {
+            let irq = InterruptObject(handle: InterruptHandle(handle),
+                                      rights: entry.rights, slot: entry.target)
+            if not irq.allows(InterruptRight.Wait) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            Waitable(kind: WaitableKind.Interrupt, slot: entry.target)
+        },
+        case Unbound -> fault_waitable(p, FaultReason.BadHandle),
+        case System -> fault_waitable(p, FaultReason.NotWaitable),
+        case Process -> fault_waitable(p, FaultReason.NotWaitable),
+        case Thread -> fault_waitable(p, FaultReason.NotWaitable),
+        case Waiter -> fault_waitable(p, FaultReason.NotWaitable),
     }
 }
 
@@ -1725,30 +2167,36 @@ func waiter_op_decoded(op: WaiterOp, obj: &WaiterObject, arg0: UInt, arg1: UInt,
 /// ratified one-Waiter rule, and it is caller-checkable in the strongest sense
 /// — the process is the only thing that attaches anything, so it knows.
 func waiter_add(p: Int, w: Int, handle: UInt, key: UInt) unsafe -> SyscallResult {
-    let e = waitable_slot(p, handle)
-    if EVENTS[e].waiter != 0 {
+    let target = waitable_slot(p, handle)
+    if waitable_attachment(target.kind, target.slot) != 0 {
         fault_process(p, FaultReason.BadState)
     }
     // KEYS ARE UNIQUE PER WAITER (ruled Aug 16). A duplicate would make two
     // questions ambiguous at once — which attachment a `Remove` names, and
     // which one an answer came from — and the attacher chose both keys, so it
     // is caller-checkable in the strongest sense.
-    if attached_by_key(w, key) != NO_EVENT {
+    if attached_by_key(w, key) != NO_ATTACHMENT {
         fault_process(p, FaultReason.DuplicateKey)
     }
 
-    EVENTS[e].waiter = w + 1
-    EVENTS[e].key = key
-    EVENTS[e].link = WAITERS[w].attached
-    WAITERS[w].attached = e + 1
+    let a = alloc_attachment()
+    if a == NO_ATTACHMENT {
+        return op_status(SosStatus.NoResource)
+    }
+    ATTACHMENTS[a] = Attachment(state: SlotState.Live, kind: target.kind,
+                                target: target.slot, waiter: w, key: key,
+                                link: WAITERS[w].attached)
+    WAITERS[w].attached = a + 1
+    set_waitable_attachment(target.kind, target.slot, a + 1)
 
-    // LEVEL-TRIGGERED, at the attach (§2.2). An event that is already ready
+    // LEVEL-TRIGGERED, at the attach (§2.2). A waitable that is already ready
     // when it joins the set is ready NOW, and a thread parked on this Waiter
     // has to learn about it — otherwise the order "signal, then attach, then
     // wait" would lose the notification, which is the exact lost-edge this
-    // semantics exists to rule out.
-    if EVENTS[e].word != 0 {
-        wake_one_waiter(w, e)
+    // semantics exists to rule out. It covers an Interrupt that fired before
+    // anyone attached, which is the ordering a driver hits at bring-up.
+    if waitable_ready(target.kind, target.slot) {
+        wake_one_waiter(w, a)
     }
     op_ok()
 }
@@ -1764,11 +2212,11 @@ func waiter_add(p: Int, w: Int, handle: UInt, key: UInt) unsafe -> SyscallResult
 /// can be CLOSED, a closed waitable's stale attachment has no handle left to
 /// name it with, and a handle-based remove could not reach it at all.
 func waiter_remove(p: Int, w: Int, key: UInt) unsafe -> SyscallResult {
-    let e = attached_by_key(w, key)
-    if e == NO_EVENT {
+    let a = attached_by_key(w, key)
+    if a == NO_ATTACHMENT {
         fault_process(p, FaultReason.BadState)
     }
-    detach_event(w, e)
+    detach_attachment(w, a)
     op_ok()
 }
 
@@ -1798,10 +2246,12 @@ func waiter_wait(p: Int, w: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
     }
     copy_out_check(p, dst, wait_record_bytes() as UInt)
 
-    let ready = waiter_ready_event(w)
-    if ready != NO_EVENT {
-        deliver_wait_record(p, dst, EVENTS[ready].key, WaitTag.Event,
-                            EVENTS[ready].word)
+    let ready = waiter_ready_attachment(w)
+    if ready != NO_ATTACHMENT {
+        let answer = waitable_answer(ATTACHMENTS[ready].kind,
+                                     ATTACHMENTS[ready].target)
+        deliver_wait_record(p, dst, ATTACHMENTS[ready].key, answer.tag,
+                            answer.payload)
         return op_ok()
     }
     if CURRENT_THREAD == NO_THREAD {
@@ -1855,6 +2305,11 @@ func dispatch(handle: UInt, op: UInt,
             let obj = WaiterObject(handle: WaiterHandle(handle),
                                    rights: entry.rights, slot: entry.target)
             waiter_op(op, &obj, arg0, arg1)
+        },
+        case Interrupt -> {
+            let obj = InterruptObject(handle: InterruptHandle(handle),
+                                      rights: entry.rights, slot: entry.target)
+            interrupt_op(op, &obj)
         },
     }
 }
@@ -1986,10 +2441,10 @@ public func timer_ticks() unsafe -> UInt {
 /// interrupts masked, so its length is interrupt latency, while the switch it
 /// motivates happens later at the user-return boundary where it costs nothing.
 ///
-/// `frame_addr` is the interrupted context. It is still only READ here, to say
-/// where user mode was when the tick landed; the switch reads it too, in
-/// `pick_next`, one call further out.
-func on_timer_tick(frame_addr: UInt) unsafe {
+/// `pc` is where the interrupted context will resume, read out of the frame by
+/// the caller — or `IDLE_PC` when the tick was found by the idle poll, where
+/// there is no interrupted context to name.
+func on_timer_tick(pc: UInt) unsafe {
     TIMER_TICKS = TIMER_TICKS &+ 1
 
     if CURRENT_THREAD != NO_THREAD {
@@ -2009,35 +2464,55 @@ func on_timer_tick(frame_addr: UInt) unsafe {
     uart.write_str("SOS: timer tick ")
     uart.write_hex(TIMER_TICKS)
     uart.write_str(" at ")
-    uart.write_hex(hal.trap_pc(frame_addr))
+    uart.write_hex(pc)
     uart.write_str("\n")
 }
 
-/// A DEVICE INTERRUPT — the arch-free landing point for an external line.
+/// What the tick report prints for a tick taken with nothing running. The
+/// kernel was idle, so there is no interrupted address, and zero is the honest
+/// answer rather than a stale one.
+static IDLE_PC: UInt = 0
+
+/// A DEVICE INTERRUPT — the arch-free landing point for an external line, and
+/// spec §9's delivery in five lines.
 ///
-/// This is where the Interrupt object (spec §2) marks itself ready and wakes
-/// whoever waits on it. Until that unit exists the body reports the line and
-/// the line stays MASKED: spec §9's mask-on-fire happens before this runs, and
-/// only an ack through the handle unmasks — so a device that is still asserting
-/// cannot re-enter here, and the "at most one unacked fire per Interrupt"
-/// invariant holds before there is anything to hold it for.
-func on_external_irq(line: UInt) {
-    let uart = console()
-    uart.write_str("SOS: external irq ")
-    uart.write_hex(line)
-    uart.write_str("\n")
+/// THE LINE IS ALREADY MASKED when this runs (`deliver_line` below), so what is
+/// left is to mark the object ready and tell its Waiter. Marking BEFORE waking
+/// is what makes the level-triggered path work in both orders: a driver already
+/// parked is woken with the record, and one that has not waited yet finds
+/// `pending` set by its own next `Wait`.
+///
+/// A LINE NOTHING IS BOUND TO is reported and left MASKED, which is the only
+/// safe answer: the kernel cannot service a device it has no driver for, and an
+/// unmasked line with nobody to ack it would re-fire forever. That is also the
+/// path the interrupt-controller bring-up case still exercises, which is what
+/// keeps `irq_raise_selftest_line` meaningful with no Interrupt object involved.
+func on_external_irq(line: UInt) unsafe {
+    let irq = interrupt_by_line(line)
+    if irq == NO_INTERRUPT {
+        let uart = console()
+        uart.write_str("SOS: external irq ")
+        uart.write_hex(line)
+        uart.write_str("\n")
+        return
+    }
+    INTERRUPTS[irq].pending = true
+    notify_ready(WaitableKind.Interrupt, irq)
 }
 
-/// EVERY interrupt the kernel takes arrives here, through `ktrap` and through
-/// nothing else.
+/// SERVICE ONE CLAIMED LINE — the arch-free half of an interrupt, and the one
+/// place a line number turns into work.
 ///
-/// Machine, then kernel, then machine: claim the line, run the hook that owns
-/// it, end the service. The two branches differ in exactly one step, and it is
-/// spec §9's: the timer is REARMED, which is what lowers its line, while a
-/// device line is MASKED, because a device goes on asserting until its driver
-/// has been told.
-func service_irq(frame_addr: UInt, cause: UInt) unsafe {
-    let line = hal.irq_claim(cause)
+/// Its two entry points, both of which have already CLAIMED the line from the
+/// controller:
+///
+///   - `service_irq`, from the trap path, with the interrupted PC;
+///   - `idle_poll`, from `pick_next`'s idle loop, with `IDLE_PC`.
+///
+/// The two branches differ in exactly one step, and it is spec §9's: the timer
+/// is REARMED, which is what lowers its line, while a device line is MASKED,
+/// because a device goes on asserting until its driver has been told.
+func deliver_line(line: UInt, pc: UInt) unsafe {
     if line == hal.IRQ_NONE {
         SPURIOUS_IRQS = SPURIOUS_IRQS &+ 1
         if SPURIOUS_IRQS == 1 {
@@ -2048,12 +2523,84 @@ func service_irq(frame_addr: UInt, cause: UInt) unsafe {
 
     if line == hal.IRQ_TIMER {
         hal.timer_rearm()
-        on_timer_tick(frame_addr)
+        on_timer_tick(pc)
     } else {
         hal.irq_mask(line)
         on_external_irq(line)
     }
     hal.irq_complete(line)
+}
+
+/// EVERY interrupt the kernel TAKES arrives here, through `ktrap` and through
+/// nothing else. (Interrupts the kernel POLLS FOR while idle arrive through
+/// `idle_poll`, which is the same service over a different way of noticing.)
+func service_irq(frame_addr: UInt, cause: UInt) unsafe {
+    deliver_line(hal.irq_claim(cause), hal.trap_pc(frame_addr))
+}
+
+// -----------------------------------------------------------------------------
+// THE IDLE PATH (spec §7; design 178 D6)
+// -----------------------------------------------------------------------------
+//
+// "NOTHING RUNNABLE" USED TO BE A DEADLOCK, AND THE INTERRUPT OBJECT IS WHAT
+// CHANGED THAT. Before it, every wake in the system came FROM a thread — an
+// Event is signalled by somebody — so a system with no runnable thread had
+// nobody left to signal one and the report was exact. A bound IRQ line is the
+// first readiness that arrives from OUTSIDE the set of runnable threads, so the
+// same state now has two readings and the kernel has to tell them apart.
+//
+// THE RULE: it is idle if any Interrupt is BOUND, and a deadlock otherwise. It
+// is deliberately conservative — the kernel does not try to prove that a
+// specific blocked thread is reachable by a specific line, which would mean
+// walking attachment sets to answer a question that a wrong answer only makes
+// SLOWER to diagnose (a hang at the harness timeout instead of a report). What
+// it never does is call a real wait a deadlock.
+//
+// WHY THE IDLE LOOP POLLS INSTEAD OF TAKING THE INTERRUPT. Design 178's D2 says
+// interrupts are taken from USER mode only, and that is enforced by the
+// machines rather than intended by the kernel — so an interrupt that arrives
+// while the kernel idles is not delivered, it is PENDING. `wait_for_irq` parks
+// the core until one is pending (both machines wake from it on a pending
+// interrupt whether or not it is deliverable), and `irq_poll` then asks the
+// controller for it directly. So D2 is untouched: the kernel still never takes
+// a trap in kernel mode, and the same `deliver_line` services the line either
+// way.
+
+/// Ask the controller for a line, and service it if there is one.
+func idle_poll() unsafe {
+    let line = hal.irq_poll()
+    if line == hal.IRQ_NONE {
+        return
+    }
+    deliver_line(line, IDLE_PC)
+}
+
+/// Is there a source of readiness OUTSIDE the set of runnable threads?
+func has_external_wake_source() unsafe -> Bool {
+    var i: Int = 0
+    while i < MAX_INTERRUPTS {
+        match INTERRUPTS[i].state {
+            case Live -> { return true },
+            case Free -> {},
+        }
+        i = i + 1
+    }
+    false
+}
+
+/// Park the core until something is runnable again.
+///
+/// The exit condition is the READY QUEUE, not the poll: a serviced line wakes a
+/// waiter through `deliver_line` -> `on_external_irq` -> `notify_ready`, which
+/// pushes that thread onto the queue. A line that wakes nobody — one bound to
+/// an Interrupt no thread is waiting on — leaves the queue empty and the loop
+/// goes back to sleep, which is correct and is why the test is on the queue
+/// rather than on "an interrupt happened".
+func idle_until_runnable() unsafe {
+    while READY_HEAD == 0 {
+        hal.wait_for_irq()
+        idle_poll()
+    }
 }
 
 /// What a refused too-high address REPORTS: its top 32 bits. The low half is
@@ -2152,6 +2699,23 @@ func check_segment(seg: &SosimgSeg, img_len: UInt) {
     if not seg.mem_covers_file() {
         fatal_image("segment mem_len below file_len", mem_len)
     }
+
+    // Write-without-read is not a grant any target should install, and one
+    // profile's hardware RESERVES the encoding outright. `imgformat` states the
+    // rule; refusing the image is the consequence. It is checked BEFORE the
+    // device branch because it holds for both kinds of record.
+    if not seg.has_sane_perms() {
+        fatal_image("segment permissions are not a valid grant", seg.flags as UInt)
+    }
+
+    // A DEVICE WINDOW is judged against the BOARD, not against the root region
+    // — it names hardware, which is nowhere near RAM — so it takes its own
+    // path and returns.
+    if seg.is_device_grant() {
+        check_device_grant(&seg, load_addr, file_len, mem_len)
+        return
+    }
+
     if load_addr < hal.ROOT_LOAD_BASE {
         fatal_image("segment loads below the root region", load_addr)
     }
@@ -2171,12 +2735,36 @@ func check_segment(seg: &SosimgSeg, img_len: UInt) {
     if mem_len > limit - load_addr {
         fatal_image("segment overruns the root region", mem_len)
     }
+}
 
-    // Write-without-read is not a grant any target should install, and one
-    // profile's hardware RESERVES the encoding outright. `imgformat` states the
-    // rule; refusing the image is the consequence.
-    if not seg.has_sane_perms() {
-        fatal_image("segment permissions are not a valid grant", seg.flags as UInt)
+/// Validate a DEVICE WINDOW record (design 178's finale constraint 1, ruled
+/// Aug 16, user).
+///
+/// THE IMAGE DECLARES AND THE BOARD AUTHORIZES, and both halves are load-bearing.
+/// A window in the image is what makes "this program drives that device" a
+/// property of the program; a window the BOARD publishes is what stops an image
+/// from naming any physical address it likes and being handed it. In M2 the
+/// board offers exactly one — the console UART's page, which is the only device
+/// a process has any business holding while the kernel owns everything else —
+/// so the authorization is a comparison rather than a table.
+///
+/// THIS IS THE PLACEHOLDER M3'S MAPPING RETIRES. Then a device window is a
+/// MemoryObject derived from a device pool root (spec §2.5), mapped by an op
+/// and revocable by closing the Mapping, and the board's comparison becomes the
+/// pool's contents. Everything above this line is what that migration replaces.
+func check_device_grant(seg: &SosimgSeg, load_addr: UInt, file_len: UInt,
+                        mem_len: UInt) {
+    // A window carries no bytes: there is nothing in an image file to place at
+    // a hardware address, and a record claiming otherwise has been built wrong.
+    if file_len != 0 {
+        fatal_image("device grant carries image bytes", file_len)
+    }
+    if load_addr != hal.DEVICE_GRANT_BASE {
+        fatal_image("device grant names a window this board does not offer",
+                    load_addr)
+    }
+    if mem_len != hal.DEVICE_GRANT_LEN {
+        fatal_image("device grant is not the size of that window", mem_len)
     }
 }
 
@@ -2274,16 +2862,27 @@ public func load_root_and_enter() unsafe {
         let file_len = seg.file_len as UInt
         let mem_len = seg.mem_len as UInt
 
-        copy_bytes(load_addr, base + (seg.file_off as UInt), file_len)
-        zero_bytes(load_addr + file_len, mem_len - file_len)
+        // A DEVICE WINDOW places no bytes and joins no writable window: it is a
+        // grant and nothing else. Keeping it out of `rw_base` is not tidiness —
+        // a hardware address is BELOW RAM on one profile, so folding it in
+        // would stretch the copy-out window from the device page to the top of
+        // the region and make `copy_out`'s check accept most of the machine.
+        if seg.is_device_grant() {
+            hal.prot_device(s, load_addr, mem_len)
+        } else {
+            copy_bytes(load_addr, base + (seg.file_off as UInt), file_len)
+            zero_bytes(load_addr + file_len, mem_len - file_len)
 
-        // The sosimg flag bits ARE the protection vocabulary (imgformat states
-        // the encoding; each HAL translates it into its own hardware's bits),
-        // so a segment's permissions become its grant with nothing in between.
-        hal.prot_region(s, load_addr,
-                        align_up(load_addr + mem_len, hal.PROT_GRAIN), seg.flags)
-        if (seg.flags & (SegFlag.Write as UInt8)) != 0 && load_addr < rw_base {
-            rw_base = load_addr
+            // The sosimg flag bits ARE the protection vocabulary (imgformat
+            // states the encoding; each HAL translates it into its own
+            // hardware's bits), so a segment's permissions become its grant
+            // with nothing in between.
+            hal.prot_region(s, load_addr,
+                            align_up(load_addr + mem_len, hal.PROT_GRAIN),
+                            seg.flags)
+            if (seg.flags & (SegFlag.Write as UInt8)) != 0 && load_addr < rw_base {
+                rw_base = load_addr
+            }
         }
         s = s + 1
     }
@@ -2356,6 +2955,11 @@ public func start_process(entry: UInt, stack_top: UInt,
         fatal_image("the boot handle set did not start at the System handle",
                     system)
     }
+
+    // THE HANDOVER MARKER — the last thing the kernel says on its own
+    // initiative, and the line a transcript reads everything after as the
+    // PROCESS's. See `Console` for the protocol it announces.
+    console().write_str("SOS: console handover\n")
 
     hal.frame_init(frame_slot(main), entry, stack_top, system)
     hal.resume_frame(frame_slot(main))

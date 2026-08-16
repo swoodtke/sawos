@@ -148,3 +148,15 @@ u64 sos_timer_freq(void) { u64 v; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v
 u64 sos_timer_ctl_read(void) { u64 v; __asm__ volatile("mrs %0, cntp_ctl_el0" : "=r"(v)); return v; }
 void sos_timer_ctl_write(u64 v) { __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(v)); }
 void sos_timer_set_countdown(u64 n) { __asm__ volatile("msr cntp_tval_el0, %0" :: "r"(n)); }
+
+// ---- parking the core while the kernel idles ------------------------------
+//
+// C BECAUSE: `wfi` is an INSTRUCTION (reason 1 above).
+//
+// It wakes on a pending physical interrupt regardless of the exception level's
+// mask, which is what the idle path needs: SOS masks them at EL1 throughout
+// (design 178 D2), so the interrupt is never TAKEN here — the core simply
+// resumes at the next instruction and `irq_poll` in lib.saw asks the controller
+// what arrived. A spurious wake costs one poll.
+
+void sos_wait_for_irq(void) { __asm__ volatile("wfi"); }

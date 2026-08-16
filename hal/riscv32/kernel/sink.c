@@ -75,3 +75,16 @@ void sos_pmpcfg_write(u32 lo, u32 hi) {
 // bit, so leaving it clear IS "interrupts are taken from user mode only".
 
 void sos_mie_write(u32 mask) { __asm__ volatile("csrw mie, %0" :: "r"(mask) : "memory"); }
+
+// ---- parking the core while the kernel idles ------------------------------
+//
+// C BECAUSE: `wfi` is an INSTRUCTION (reason 1 above), and there is no Saw
+// spelling for one.
+//
+// It wakes on a pending interrupt of a locally ENABLED class regardless of the
+// global enable, which is what the idle path needs: SOS never sets that bit
+// (design 178 D2), so the interrupt is never TAKEN here — the core simply
+// resumes at the next instruction and `irq_poll` in lib.saw asks the controller
+// what arrived. A spurious wake costs one poll.
+
+void sos_wait_for_irq(void) { __asm__ volatile("wfi"); }

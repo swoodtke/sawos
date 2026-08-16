@@ -89,9 +89,9 @@ public import sosabi.{SosStatus, EventMode, WaitResult, WaitPayload}
 // is an ordinary import, so a process cannot reach one through `sos` under any
 // spelling — the vDSO discipline ("syscall numbers are not ABI") is a wall now
 // rather than a convention the module docstring asks callers to respect.
-import sosabi.{SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp,
+import sosabi.{SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp, InterruptOp,
                SystemHandle, ProcessHandle, ThreadHandle, EventHandle,
-               WaiterHandle,
+               WaiterHandle, InterruptHandle,
                WaitTag, WAIT_RECORD_WORDS, WAIT_KEY_WORD, WAIT_TAG_WORD,
                WAIT_PAYLOAD_WORD, wait_record_bytes}
 
@@ -300,6 +300,22 @@ public func sos_process_create_event(handle: UInt, mode: UInt,
 public func sos_process_create_waiter(handle: UInt,
                                       value_out: UnsafePointer<UInt>) unsafe -> UInt {
     sos_syscall3(handle, ProcessOp.CreateWaiter as UInt, 0, 0, 0, value_out)
+}
+
+/// Bind IRQ `line` to a new Interrupt in this process. Requires
+/// `ProcessRight.CreateInterrupt`. A line this machine does not have, the
+/// timer's line, or one already bound TERMINATES the process.
+@export("sos_process_create_interrupt")
+public func sos_process_create_interrupt(handle: UInt, line: UInt,
+                                         value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, ProcessOp.CreateInterrupt as UInt, line, 0, 0, value_out)
+}
+
+/// End this fire and let the device interrupt again. Requires
+/// `InterruptRight.Ack`. Acking one that has not fired terminates the process.
+@export("sos_interrupt_ack")
+public func sos_interrupt_ack(handle: UInt) -> UInt {
+    sos_syscall1(handle, InterruptOp.Ack as UInt, 0)
 }
 
 /// Accumulate `bits` into an Event. Never blocks. Requires `EventRight.Signal`.
@@ -537,6 +553,27 @@ public extension Process {
                                  0, 0, 0)
         return Waiter(handle: WaiterHandle(raw))
     }
+
+    /// Bind IRQ `line` to an Interrupt — spec §2's row and §9's delivery.
+    /// Requires `ProcessRight.CreateInterrupt`.
+    ///
+    /// THE LINE IS A NUMBER THE CALLER CHOOSES, so it is spelled as one, which
+    /// is the same rule `create_event`'s mode follows. A driver knows its
+    /// device's line from the device's own description; the kernel checks it
+    /// against the board and TERMINATES the process for a line this machine
+    /// does not have, the timer's line, or one already bound — all three
+    /// caller-checkable, and all three the faults ruling's kind of mistake.
+    ///
+    /// The line comes back UNMASKED, which is §9's starting state: the object
+    /// exists, the controller will deliver, and the first fire masks it until
+    /// an `ack`. What the kernel does NOT touch is the device's own
+    /// interrupt-enable register — that is behind the driver's granted window
+    /// and is the driver's to write.
+    public func create_interrupt(&self, line: UInt) -> Result<Interrupt, SosStatus> {
+        let raw = try call_value(self.handle, ProcessOp.CreateInterrupt as UInt,
+                                 line, 0, 0)
+        return Interrupt(handle: InterruptHandle(raw))
+    }
 }
 
 // =============================================================================
@@ -630,6 +667,55 @@ public extension Event {
 }
 
 // =============================================================================
+// Interrupt (spec §2 table, §9; design 178 D6)
+// =============================================================================
+
+/// A handle to an Interrupt — an IRQ line bound to a waitable.
+///
+/// THE WHOLE OF A USERSPACE DRIVER'S KERNEL SURFACE, and it is two operations
+/// wide: attach it to a Waiter and park, then `ack` when the device has been
+/// serviced. Everything between those — reading the device's registers,
+/// deciding what the interrupt meant, writing a reply — happens in ordinary
+/// process code through the MMIO window the image was granted. There is no
+/// kernel driver, and this type is the reason there does not have to be one.
+///
+/// SPEC §9'S CYCLE, from the holder's side:
+///
+///   1. the line fires; the KERNEL masks it and marks this object ready;
+///   2. a `Waiter.wait` answers with this attachment's key and the line;
+///   3. the driver touches its device — everything that reads or writes a
+///      register belongs HERE, before the ack, which is §9's release rule;
+///   4. `ack` unmasks, and a device still asserting fires again immediately.
+///
+/// AT MOST ONE UNACKED FIRE EXISTS, ever, because step 1 masks. That is what
+/// makes a single-task driver non-reentrant with no lock: the line cannot come
+/// back while the handler runs.
+///
+/// Built by `Process.create_interrupt` and by nothing else — no word
+/// constructor, no word extractor, the module docstring's rule.
+public struct Interrupt {
+    handle: InterruptHandle,
+}
+
+public extension Interrupt {
+    /// End this fire and let the device interrupt again (spec §9's ack).
+    /// Requires `InterruptRight.Ack`.
+    ///
+    /// ACK IS A RELEASE: everything that touches device registers happens
+    /// BEFORE it, and code after it runs on data already extracted. A driver
+    /// that needs register work after the ack serializes it itself; the kernel
+    /// does not enforce single-servicing.
+    ///
+    /// Acking an Interrupt that has not fired TERMINATES the process. It is
+    /// caller-checkable in the strongest sense — the only way to learn about a
+    /// fire is to have been told about one — and tolerating it would mean the
+    /// NEXT fire got acked by a driver that never serviced it.
+    public func ack(&self) -> Result<Void, SosStatus> {
+        checked(sos_interrupt_ack(self.handle))
+    }
+}
+
+// =============================================================================
 // Waiter (spec §2.2; design 178 D5)
 // =============================================================================
 
@@ -649,6 +735,8 @@ func decode_wait(key: UInt, tag: UInt, payload: UInt) -> WaitResult {
     }
     match kind {
         case Event -> WaitResult(key: key, what: WaitPayload.Event(word: payload)),
+        case Interrupt -> WaitResult(key: key,
+                                     what: WaitPayload.Interrupt(line: payload)),
     }
 }
 
@@ -688,8 +776,32 @@ public extension Waiter {
     /// orphan rule, and Saw has no sealed traits yet). Kinds are a LIST, so
     /// overloads are a list; it is MODES that multiply, which is why
     /// `create_event` takes its mode as a value.
+    ///
+    /// The second kind is here now, and it is what the shape predicted: each
+    /// overload is TWO LINES delegating to one internal, so the list grows by a
+    /// method per kind and the wire call has one caller.
     public func add(&self, event: &Event, key: UInt) -> Result<Void, SosStatus> {
-        checked(sos_waiter_add(self.handle, event.handle, key))
+        self.attach(event.handle, key)
+    }
+
+    /// Attach an Interrupt under `key`, which `wait` hands back with the line
+    /// when it fires. Requires `WaiterRight.Attach` here and
+    /// `InterruptRight.Wait` there.
+    ///
+    /// Every rule the Event overload states holds unchanged: keys are unique
+    /// per Waiter, a handle attaches to at most one Waiter, and readiness is
+    /// level-triggered — so an Interrupt that fired BEFORE it was attached is
+    /// reported by this call, which is the ordering a driver hits when the
+    /// device was already asserting at bring-up.
+    public func add(&self, interrupt: &Interrupt, key: UInt) -> Result<Void, SosStatus> {
+        self.attach(interrupt.handle, key)
+    }
+
+    /// The one call the per-kind overloads share. Private: a raw handle word
+    /// crosses here and nowhere else in this type, which is the module
+    /// docstring's rule spelled as a boundary rather than repeated per method.
+    func attach(&self, target: UInt, key: UInt) -> Result<Void, SosStatus> {
+        checked(sos_waiter_add(self.handle, target, key))
     }
 
     /// Stop watching whatever is attached under `key`. A key this Waiter does

@@ -24,5 +24,18 @@ func kmain() {
     uart.write_str("SOS M1: kernel up on ")
     uart.write_str(hal.arch_name())
     uart.write_str("\n")
+
+    // The interrupt controller comes up with EVERY LINE MASKED (design 178 M2
+    // unit 1). A kernel that can hand a device line to a driver has to bring it
+    // up at boot — an Interrupt object's `create` unmasks one line and nothing
+    // else — and bringing it up masked is what makes that safe to do before
+    // there is any driver: nothing is deliverable until something asks.
+    //
+    // NO TIMER IS ARMED HERE. The scheduler works without one (a `yield` and a
+    // block both switch), and arming it would narrate over the process for the
+    // first few ticks — see the handover protocol on `kcore`'s `Console`. The
+    // preemption harness arms its own.
+    hal.intc_init()
+
     load_root_and_enter()
 }

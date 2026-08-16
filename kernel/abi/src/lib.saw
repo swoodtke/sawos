@@ -63,6 +63,7 @@ public enum ObjType: UInt8 {
     case Thread = 3,
     case Event = 4,
     case Waiter = 5,
+    case Interrupt = 6,
 }
 
 // WHICH KINDS ARE WAITABLE is deliberately NOT recorded here (§2.2). It cannot
@@ -111,6 +112,10 @@ public type EventHandle = UInt
 
 /// A handle naming a Waiter object (§2.2).
 public type WaiterHandle = UInt
+
+/// A handle naming an Interrupt object (§2 table, §9) — an IRQ line bound to a
+/// waitable. Same discipline as every other handle type.
+public type InterruptHandle = UInt
 
 /// A handle index the table can never hand out. Handle 0 names nothing, so a
 /// zeroed register is never authority (see `ObjType.Unbound`).
@@ -219,7 +224,14 @@ static_assert((SystemRight.Shutdown as UInt32) >= 256,
 /// `CreateThread`. The bits are what attenuation strips, so an object kind a
 /// process may not make is a bit it was not given — collapsing them would make
 /// "may create Events" and "may create Waiters" the same capability, which they
-/// are not. Twenty-four bits are available and five are used.
+/// are not. Twenty-four bits are available and six are used.
+///
+/// `CreateInterrupt` is the one whose absence MATTERS today, and it is worth
+/// saying why the same shape carries a much stronger authority: an Interrupt
+/// BINDS AN IRQ LINE, so the bit is what separates a driver process from an
+/// ordinary one. In M2 root holds it because root is the only process there is;
+/// M3's launcher strips it from everything it spawns except the drivers, which
+/// is §3's monotonic attenuation doing exactly what it is for.
 public enum ProcessRight: UInt32 {
     case Transfer = 1,
     case Manage = 2,
@@ -228,6 +240,7 @@ public enum ProcessRight: UInt32 {
     case Wait = 1024,
     case CreateEvent = 2048,
     case CreateWaiter = 4096,
+    case CreateInterrupt = 8192,
 }
 
 static_assert((ProcessRight.Transfer as UInt32) == 1,
@@ -244,6 +257,8 @@ static_assert((ProcessRight.CreateEvent as UInt32) >= 256,
               "kind-specific right CreateEvent must start at bit 8 or above")
 static_assert((ProcessRight.CreateWaiter as UInt32) >= 256,
               "kind-specific right CreateWaiter must start at bit 8 or above")
+static_assert((ProcessRight.CreateInterrupt as UInt32) >= 256,
+              "kind-specific right CreateInterrupt must start at bit 8 or above")
 
 /// A right on a Thread object (§2 table row; design 178 D4).
 ///
@@ -332,6 +347,42 @@ static_assert((WaiterRight.Attach as UInt32) >= 256,
 static_assert((WaiterRight.Wait as UInt32) >= 256,
               "kind-specific right Wait must start at bit 8 or above")
 
+/// A right on an Interrupt object (§2 table; spec §9; design 178 D6).
+///
+/// TWO RIGHTS, AND THEY ARE THE TWO HALVES OF spec §9's CYCLE. `Wait` is the
+/// right to have the line's assertion OBSERVED — what attaching to a Waiter
+/// spends, the same meaning `EventRight.Wait` has — and `Ack` is the right to
+/// END a fire, which is what unmasks the line and lets the device interrupt
+/// again. They attenuate apart for a real shape: a supervisor that watches a
+/// driver's lines holds `Wait` alone and can never rearm one, which is exactly
+/// the authority a monitor should have.
+///
+/// There is deliberately no `Mask` right and no mask op. Masking is the
+/// KERNEL's half of the cycle (§9's mask-on-fire), not something a driver
+/// asks for — a driver that could mask a line at will could also leave it
+/// masked, which is a denial of the device with no diagnostic. What a driver
+/// controls is its own device's interrupt-enable register, through the window
+/// it was granted, which is where that decision belongs.
+///
+/// `Manage` is withheld at creation for the reason `thread_rights` gives: an
+/// Interrupt derives nothing, so the universal derive bit would name an
+/// authority that does not exist.
+public enum InterruptRight: UInt32 {
+    case Transfer = 1,
+    case Manage = 2,
+    case Wait = 256,
+    case Ack = 512,
+}
+
+static_assert((InterruptRight.Transfer as UInt32) == 1,
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((InterruptRight.Manage as UInt32) == 2,
+              "universal right Manage must be bit 1 in every kind's enum")
+static_assert((InterruptRight.Wait as UInt32) >= 256,
+              "kind-specific right Wait must start at bit 8 or above")
+static_assert((InterruptRight.Ack as UInt32) >= 256,
+              "kind-specific right Ack must start at bit 8 or above")
+
 /// What the kernel mints for root's System handle at boot (§12).
 ///
 /// A function rather than a `static` because a static initializer takes plain
@@ -394,6 +445,16 @@ public func waiter_rights() -> UInt32 {
     ((WaiterRight.Attach as UInt32) | (WaiterRight.Wait as UInt32))
 }
 
+/// What the kernel mints for an Interrupt a process has just bound (§9).
+///
+/// Both ends of the cycle, for the reason `event_rights` gives: the creator
+/// made the object and there is nobody to attenuate against yet. A monitor
+/// handle carrying `Wait` alone is a DERIVATION, and §3 makes derivation
+/// monotonic, so it can never widen back to this.
+public func interrupt_rights() -> UInt32 {
+    ((InterruptRight.Wait as UInt32) | (InterruptRight.Ack as UInt32))
+}
+
 // =============================================================================
 // The System object's op table (spec §2)
 // =============================================================================
@@ -440,6 +501,7 @@ public enum ProcessOp: UInt {
     case GetStatus = 3,
     case CreateEvent = 4,
     case CreateWaiter = 5,
+    case CreateInterrupt = 6,
 }
 
 // =============================================================================
@@ -515,6 +577,32 @@ public enum WaiterOp: UInt {
     case Wait = 2,
 }
 
+// =============================================================================
+// The Interrupt object's op table (spec §2 table, §9; design 178 D6)
+// =============================================================================
+
+/// A METHOD ID on an Interrupt object.
+///
+/// ONE OP, and the object is complete — which is the same claim `EventOp` makes
+/// and for a sharper reason. Everything an Interrupt does TO a process happens
+/// through a Waiter (§2.2), and everything the KERNEL does to the line happens
+/// in the trap path; what is left for the holder to ask is the one question
+/// spec §9 names: this fire is finished, let the device interrupt again.
+///
+/// There is deliberately no `Wait` op here. Parking is the Waiter's, and a
+/// second way to park on one Interrupt would be a second wake protocol to keep
+/// in step with the first — §2.2's aggregator exists precisely so that every
+/// waitable has exactly one.
+///
+/// There is deliberately no `Bind`/`Unbind` pair either: the binding IS the
+/// object's existence (`ProcessOp.CreateInterrupt` takes the line), so a bound
+/// line is a live slot and an unbound one is a slot that was freed. A rebindable
+/// Interrupt would let one handle name two different devices over its life,
+/// which is exactly what a capability must not do.
+public enum InterruptOp: UInt {
+    case Ack = 0,
+}
+
 /// How an Event ACCUMULATES — a per-Event property, chosen at creation and
 /// fixed for its life (§2.4).
 ///
@@ -569,6 +657,7 @@ public enum EventMode: UInt {
 /// from an untrusted source. Never-hide says it should be loud.
 public enum WaitTag: UInt {
     case Event = 0,
+    case Interrupt = 1,
 }
 
 /// Words in a wait record: key, tag, payload.
@@ -608,8 +697,20 @@ public func wait_record_bytes() -> Int {
 /// count reads the second. The alternative, filling the record at resume, would
 /// put a write to user memory somewhere other than the wake and buy nothing:
 /// the count could go stale again before the thread read it.
+/// THE INTERRUPT'S PAYLOAD IS ITS LINE, and that is the whole answer a driver
+/// needs: it woke because a device asserted, and the line says which. There is
+/// no count and no timestamp, because §9 ratifies AT MOST ONE UNACKED FIRE per
+/// Interrupt — a second assertion while the first is unacked cannot happen, the
+/// line being masked — so "how many" is always one and would be a field that
+/// only ever held the same number.
+///
+/// A driver that owns exactly one line already knows which it is, so the field
+/// looks redundant there; it is not, because the shape §2.2 exists for is a
+/// dispatcher parked on SEVERAL. Such a dispatcher gets the line without a
+/// side-table, exactly as it gets the key.
 public enum WaitPayload {
     case Event(word: UInt),
+    case Interrupt(line: UInt),
 }
 
 /// `Waiter.Wait`'s answer: the attacher's key, and what fired.
@@ -729,6 +830,7 @@ public enum FaultReason: UInt8 {
     case BadAlign = 10,
     case BadBuffer = 11,
     case DuplicateKey = 12,
+    case LineBound = 13,
 }
 
 public extension FaultReason {
@@ -739,7 +841,10 @@ public extension FaultReason {
             case BadOp -> "bad op",
             case AccessDenied -> "access denied",
             case NotSelf -> "not the calling thread",
-            case BadState -> "thread in the wrong state",
+            // Not "thread in the wrong state" any more: the tag has covered
+            // every object kind since Events and Waiters landed, and it covers
+            // an Interrupt acked before it fired now.
+            case BadState -> "object in the wrong state",
             case BadEntry -> "thread entry outside the process",
             case Deadlock -> "every thread blocked",
             case NotWaitable -> "not a waitable",
@@ -747,6 +852,7 @@ public extension FaultReason {
             case BadAlign -> "buffer is not word-aligned",
             case BadBuffer -> "buffer is not in the process's writable memory",
             case DuplicateKey -> "an attachment already uses that key",
+            case LineBound -> "that interrupt line is already bound",
         }
     }
 }

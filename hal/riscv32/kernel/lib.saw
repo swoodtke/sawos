@@ -217,6 +217,22 @@ public func arch_tag() -> UInt8 {
 ///
 /// The kernel owns the machine, so this is the UART directly. Byte-at-a-time is
 /// what the seam needs: the arch-free half above formats, this half places.
+///
+/// THE HANDOVER PROTOCOL, DEVICE HALF (design 178's finale constraint 4; the
+/// protocol itself is stated on `kcore`'s `Console`). This board has ONE UART
+/// and a driver process may be granted its page, so after the handover marker
+/// there can be a second writer on this device. What that costs is bounded and
+/// worth knowing: the two writers share the transmit holding register and the
+/// line-status bit this loop polls, so a byte written here between two of the
+/// process's lands BETWEEN them — interleaved, never lost or corrupted, since
+/// each write is one register store guarded by its own poll. So the kernel's
+/// diagnostic paths stay usable after handover (a fault report is still
+/// readable), and the protocol is what keeps them from being NOISE on a
+/// transcript that is still being written.
+///
+/// What the kernel never touches is the RECEIVE side or the interrupt-enable
+/// register: the transmitter is polled here and always has been, so a driver
+/// that owns receive owns it alone.
 public func console_byte(b: UInt8) unsafe {
     Uart16550(at: UART_BASE).write_byte(b)
 }
@@ -306,6 +322,7 @@ extern "C" {
     func sos_payload_start() -> UInt
     func sos_payload_end() -> UInt
     func sos_mie_write(mask: UInt)
+    func sos_wait_for_irq()
 }
 
 /// This target's protection granularity. PMP stores its bounds shifted right by
@@ -323,6 +340,28 @@ public static MAX_ROOT_SEGMENTS: UInt = 3
 public static ROOT_LOAD_BASE: UInt = 0x80200000
 public static ROOT_REGION_TOP: UInt = 0x80240000
 public static ROOT_STACK_LEN: UInt = 0x4000
+
+/// The ONE device window this board offers a process (design 178's finale
+/// constraint 2, ruled Aug 16, user): the console UART's page.
+///
+/// A PAGE, NOT THE REGISTER BLOCK, and that is not rounding for tidiness. The
+/// eight registers occupy eight bytes, but this board's emulator only puts an
+/// access on its fast path when the protection region covers a whole aligned
+/// page — DF-178b, where a byte-tight kernel region made user mode two thousand
+/// times slower. A driver's register touch is the hottest thing in an interrupt
+/// path, so the grant is page-aligned and page-sized and the extra bytes belong
+/// to nothing.
+///
+/// It is also what makes ONE NAPOT entry express the window: a naturally
+/// aligned power-of-two region is one PMP entry rather than a TOR pair, which
+/// matters when the budget is four regions.
+public static DEVICE_GRANT_BASE: UInt = UART_BASE
+public static DEVICE_GRANT_LEN: UInt = 0x1000
+
+static_assert(DEVICE_GRANT_LEN >= PROT_GRAIN,
+              "a device window cannot be finer than the protection grain")
+static_assert((DEVICE_GRANT_BASE % DEVICE_GRANT_LEN) == 0,
+              "a NAPOT region must be aligned to its own size")
 
 /// An address the KERNEL itself cannot reach on this target — nothing is there
 /// and nothing maps it. The harness's kernel-fault case reads it to prove a
@@ -359,10 +398,19 @@ public static UNMAPPED_PROBE: UInt = 0x00000000
 /// `sink.c` can reach.
 static PMP_REGIONS: UInt = 4
 static PMP_A_TOR: UInt = 0x8              // cfg bits 4:3 = 1 (top-of-range)
+static PMP_A_NAPOT: UInt = 0x18           // cfg bits 4:3 = 3 (naturally aligned)
 static PMP_PERM_MASK: UInt = 0x7          // cfg bits 2:0 — R, W, X
+static PMP_PERM_RW: UInt = 0x3            // R | W, with X deliberately clear
 static PMP_GRAIN_SHIFT: Int = 2           // bounds are stored >> 2
 static PMP_CFGS_PER_WORD: UInt = 4
 static BITS_PER_PMP_CFG: Int = 8
+
+// The region budget has to cover a root image's segments, its stack, AND its
+// device window — which is what makes `MAX_ROOT_SEGMENTS` one less than the
+// budget, since a device window arrives AS a segment record and the stack is
+// the kernel's own grant on top.
+static_assert(MAX_ROOT_SEGMENTS + 1 <= PMP_REGIONS,
+              "a root image's segments plus its stack must fit the region budget")
 
 /// The two `pmpcfg` shadow words — entries 0-3 and 4-7.
 ///
@@ -402,13 +450,56 @@ public func prot_region(idx: UInt, base: UInt, top: UInt, perms: UInt8) unsafe {
     let hi = lo + 1
     sos_pmpaddr_write(lo, base >> PMP_GRAIN_SHIFT)
     sos_pmpaddr_write(hi, top >> PMP_GRAIN_SHIFT)
-    let cfg = ((perms as UInt) & PMP_PERM_MASK) | PMP_A_TOR
-    if hi < PMP_CFGS_PER_WORD {
-        PMPCFG_LO = PMPCFG_LO | (cfg << (BITS_PER_PMP_CFG * (hi as Int)))
+    stage_cfg(hi, ((perms as UInt) & PMP_PERM_MASK) | PMP_A_TOR)
+}
+
+/// Put one entry's config byte into the shadow word that holds it.
+///
+/// Shared by the TOR and NAPOT stagers so there is ONE place that knows which
+/// shadow word an entry's byte lives in — the arithmetic is small and getting
+/// it wrong in one of two copies would install a grant at the wrong index.
+func stage_cfg(entry: UInt, cfg: UInt) unsafe {
+    if entry < PMP_CFGS_PER_WORD {
+        PMPCFG_LO = PMPCFG_LO | (cfg << (BITS_PER_PMP_CFG * (entry as Int)))
     } else {
         PMPCFG_HI = (PMPCFG_HI
-                     | (cfg << (BITS_PER_PMP_CFG * ((hi - PMP_CFGS_PER_WORD) as Int))))
+                     | (cfg << (BITS_PER_PMP_CFG * ((entry - PMP_CFGS_PER_WORD) as Int))))
     }
+}
+
+/// The NAPOT encoding of `[base, base + len)`: the base with the low bits of
+/// the size set, shifted into a PMP address.
+///
+/// A NAPOT entry encodes a naturally aligned power-of-two region as ONE address
+/// word — the trailing ones say how big it is — which is why a device window
+/// costs one entry where a TOR region costs two. `len` is a power of two and
+/// `base` is aligned to it; the loader's own asserts pin both, so there is
+/// nothing to validate here.
+func napot_bound(base: UInt, len: UInt) -> UInt {
+    (base | (len / 2 - 1)) >> PMP_GRAIN_SHIFT
+}
+
+/// Stage grant `idx` as a DEVICE WINDOW over `[base, base + len)` (design 178's
+/// finale constraint 2).
+///
+/// ONE ENTRY, NOT A PAIR, and read/write with EXECUTE DELIBERATELY CLEAR —
+/// registers are not instructions. A device window is otherwise an ordinary
+/// grant on this profile: PMP has no memory-type field, and this machine's
+/// device space is uncached because of where it IS, not because of how it is
+/// granted. (Profile B has to say so in the descriptor, which is why the seam
+/// carries a device call at all rather than reusing `prot_region`.)
+///
+/// It spends the same numbered region slot a segment would, so the budget
+/// arithmetic above covers it with nothing extra: the entry it programs is the
+/// pair's HIGH one, whose config byte is where `prot_region` puts a TOR
+/// region's permissions, and the pair's low entry stays disabled.
+public func prot_device(idx: UInt, base: UInt, len: UInt) unsafe {
+    if idx >= PMP_REGIONS {
+        return
+    }
+    let entry = idx * 2 + 1
+    sos_pmpaddr_write(entry, napot_bound(base, len))
+    stage_cfg(entry, PMP_PERM_RW | PMP_A_NAPOT)
 }
 
 /// Publish the staged grant set. Separate from `prot_region` so a partially
@@ -892,6 +983,53 @@ public func irq_complete(line: UInt) unsafe {
         return
     }
     Plic().complete(line)
+}
+
+/// Is `line` a source THIS BOARD wires?
+///
+/// The controller's source space is what a driver's line number has to be in,
+/// and source 0 is architecturally reserved for "no source" — so a bind of
+/// either end is a number that could never name a device. The TIMER's line is
+/// not excluded here: on this profile it is not one of this controller's
+/// sources at all (see `IRQ_TIMER`), so it is already outside this range, and
+/// the kernel excludes it arch-free anyway because that is a policy rather than
+/// a fact about the board.
+public func irq_line_valid(line: UInt) -> Bool {
+    line != IRQ_NONE && line <= PLIC_MAX_SOURCE
+}
+
+/// Ask for a pending line WITHOUT a trap having delivered one — the idle path's
+/// half of the seam.
+///
+/// The kernel idles with interrupts masked (design 178 D2), so a line that
+/// arrives then is PENDING rather than delivered and nothing hands the kernel a
+/// cause word. This is the same claim `irq_claim` performs, driven by a
+/// question instead of by a trap.
+///
+/// THE TIMER IS CHECKED FIRST AND BY HAND, because on this profile it is not
+/// one of the controller's sources: its condition is the comparator's, so the
+/// only way to notice it is to compare. It is consulted only when the timer
+/// CLASS has been enabled — an unarmed comparator reads as permanently expired
+/// (its deadline is zero), and treating that as a tick would make an idle
+/// kernel spin on a timer nobody started.
+public func irq_poll() unsafe -> UInt {
+    if (IRQ_CLASSES & IRQ_CLASS_TIMER) != 0 {
+        if MachineTimer().expired() {
+            return IRQ_TIMER
+        }
+    }
+    Plic().claim()
+}
+
+/// Park this hart until an interrupt is pending.
+///
+/// It wakes on a pending interrupt of an ENABLED CLASS whether or not the
+/// global enable would let it be taken — which is exactly the property the idle
+/// path needs, since design 178's D2 keeps that bit clear forever. So the core
+/// sleeps, the line arrives, execution continues at the next instruction, and
+/// `irq_poll` finds it.
+public func wait_for_irq() unsafe {
+    sos_wait_for_irq()
 }
 
 /// Raise a line from software, for interrupt bring-up. Returns the line raised.
