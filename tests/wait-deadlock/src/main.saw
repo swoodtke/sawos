@@ -1,0 +1,69 @@
+// SOS M2 unit 4: nothing runnable, and nothing that could ever make something
+// runnable (design 178 D3/D6; spec §7).
+//
+// THE OTHER HALF OF A DECISION UNIT 4 MADE CONDITIONAL. Before the Interrupt
+// object, "no runnable thread" had one reading: every wake in the system came
+// FROM a thread, so a system with none had nobody left to signal one, and the
+// kernel reported a deadlock. A bound IRQ line is the first readiness that
+// arrives from outside that set, so the kernel now IDLES when one exists — and
+// this case is the branch that did not change, pinned so that widening the idle
+// rule cannot quietly swallow it.
+//
+// The program is the smallest thing that can deadlock: one thread, one Event
+// nobody else holds, one Waiter, and a wait. It binds NO interrupt, which is
+// exactly what makes the answer a report rather than a wait.
+
+import sos.{System, Process, Event, Waiter}
+
+static KEY: UInt = 1
+
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.self_process() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS deadlock: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let waiter = match proc.create_waiter() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS deadlock: no waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let event = match proc.create_event() {
+        case Ok(ev) -> ev,
+        case Err(e) -> {
+            print("SOS deadlock: no event: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match waiter.add(&event, KEY) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS deadlock: attach failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let _ = system.debug_print("SOS deadlock: waiting for a signal nobody sends\n")
+
+    // Does not return: this thread parks, nothing else is runnable, and no
+    // readiness can arrive from outside — so the kernel terminates the process
+    // rather than waiting for a wake that cannot come.
+    let _ = waiter.wait()
+
+    let _ = system.debug_print("SOS deadlock: woke, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}
