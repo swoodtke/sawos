@@ -1062,7 +1062,7 @@ event-driven EDGE of a process gets a second, distinct construct:
     ask which rule applies — and it reverses the M1 line above. What
     survives as a status is `NoResource`, which a caller could not have
     known. Op tables and rights sets are named for the §2 object, spelled
-    out (`SystemOp`/`ProcessOp`/`ThreadOp` beside `SystemRight`/… ; ruled
+    out (`SystemOp`/`ProcessOp`/`ThreadOp` beside `SystemRight`/…; ruled
     at review, user, Aug 15).
     (c) **Event and Waiter (D5), and two funnels.** Level-triggered is an
     ABSENCE: nothing records that a waiter has been told, so `Wait` SCANS
