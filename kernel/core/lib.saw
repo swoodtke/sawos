@@ -131,7 +131,7 @@ public extension Console {
 /// A console for this board. Constructing one costs nothing; a true `static`
 /// singleton waits on Once/Lazy (tracker F5).
 public func console() -> Console {
-    Console(sink: 0u8)
+    Console(sink: 0)
 }
 
 // =============================================================================
@@ -393,7 +393,7 @@ static FRAME_ARENA_WORDS: Int = (THREAD_FRAME_STRIDE / 8) * (MAX_THREADS + 1)
 /// All-zero, so it costs no image bytes (design 149) — and a zeroed frame is
 /// also the right initial state, since `frame_init` only has to write the three
 /// or four words that are not zero.
-unsafe static var THREAD_FRAMES: [UInt64; FRAME_ARENA_WORDS] = [0u64; FRAME_ARENA_WORDS]
+unsafe static var THREAD_FRAMES: [UInt64; FRAME_ARENA_WORDS] = [0; FRAME_ARENA_WORDS]
 
 /// The address of thread slot `index`'s frame.
 func frame_slot(index: Int) unsafe -> UInt {
@@ -1770,11 +1770,11 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
         // it flows through the same handle for the same reason: the Process
         // object is what an Interrupt is charged to, and a bit is what a
         // launcher strips from everything that is not a driver.
-        case CreateInterrupt -> {
-            if not obj.allows(ProcessRight.CreateInterrupt) {
+        case BindInterrupt -> {
+            if not obj.allows(ProcessRight.BindInterrupt) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            create_interrupt(obj.slot, arg0)
+            bind_interrupt(obj.slot, arg0)
         },
     }
 }
@@ -1813,7 +1813,7 @@ func create_event_moded(p: Int, mode: EventMode) unsafe -> SyscallResult {
 /// A SCAN over four slots, and it is what turns the trap path's line number
 /// back into an object. Keeping a line -> slot map instead would be a second
 /// description of the same fact — the bindings are already in the table, and
-/// the table is the only place a line may be bound twice, which `create_interrupt`
+/// the table is the only place a line may be bound twice, which `bind_interrupt`
 /// refuses using exactly this walk.
 func interrupt_by_line(line: UInt) unsafe -> Int {
     var i: Int = 0
@@ -1853,7 +1853,7 @@ func interrupt_by_line(line: UInt) unsafe -> Int {
 /// mask-on-fire, ack-to-rearm, so something has to arm it first and creation is
 /// that something. The DEVICE's own interrupt-enable register is not touched —
 /// that is the driver's, through the window it was granted.
-func create_interrupt(p: Int, line: UInt) unsafe -> SyscallResult {
+func bind_interrupt(p: Int, line: UInt) unsafe -> SyscallResult {
     if line == hal.IRQ_TIMER || not hal.irq_line_valid(line) {
         fault_process(p, FaultReason.BadArg)
     }
@@ -2655,7 +2655,7 @@ func copy_bytes(dst: UInt, src: UInt, len: UInt) unsafe {
 func zero_bytes(dst: UInt, len: UInt) unsafe {
     var i: UInt = 0
     while i < len {
-        UnsafeMemory<UInt8, Normal>(dst + i).write(0u8)
+        UnsafeMemory<UInt8, Normal>(dst + i).write(0)
         i = i + 1
     }
 }

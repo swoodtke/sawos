@@ -98,7 +98,7 @@ separately only because it is new; `sos/hal/arm64/kernel/` implements every row.
 | `irq_claim(cause) -> UInt` | Which line is being serviced, `IRQ_NONE` if none. Takes the cause because one profile answers the timer half out of it. |
 | `irq_poll() -> UInt` | The same question with NO trap behind it — the idle path's half of the seam (design 178 M2 unit 4). Here it also has to check the timer by hand, because on this profile the timer is not one of the controller's sources; there it is `irq_claim` under a second name. |
 | `wait_for_irq()` | Park the core until an interrupt is PENDING. Both machines wake from this whether or not the current privilege level would take one, which is exactly what the idle path needs — D2 keeps them masked in kernel mode forever, so the kernel notices by polling rather than by trapping. |
-| `irq_line_valid(line) -> Bool` | Is this a line the BOARD wires? What `Process.CreateInterrupt` checks a caller's number against. The TIMER's line is excluded arch-free by the kernel instead, because "the tick is not for rent" is a policy rather than a fact about the board. |
+| `irq_line_valid(line) -> Bool` | Is this a line the BOARD wires? What `Process.BindInterrupt` checks a caller's number against. The TIMER's line is excluded arch-free by the kernel instead, because "the tick is not for rent" is a policy rather than a fact about the board. |
 | `irq_complete(line)` | End of service for a line. |
 | `timer_start(period_us)` | Arm a periodic tick and make it reachable. |
 | `timer_rearm()` | Schedule the next tick. On both profiles this is also what LOWERS the timer's line, which is why the tick path calls it rather than acknowledging something. |

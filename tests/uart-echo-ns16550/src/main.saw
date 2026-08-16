@@ -10,7 +10,7 @@
 //
 // THE CYCLE, which is spec §9 read from the driver's side:
 //
-//   1. bind the line          `Process.create_interrupt(line:)`
+//   1. bind the line          `Process.bind_interrupt(line:)`
 //   2. watch it               `Waiter.add(&interrupt, key)`
 //   3. enable the DEVICE      write its own interrupt-enable register — the
 //                             kernel never touches it, because the register is
@@ -116,7 +116,7 @@ extension Uart {
     }
 
     func has_byte(&self) unsafe -> Bool {
-        (self.regs.lsr.read() & LSR_DATA_READY) != 0u8
+        (self.regs.lsr.read() & LSR_DATA_READY) != 0
     }
 
     /// Take the waiting byte. Reading the register is also what CLEARS the
@@ -126,7 +126,7 @@ extension Uart {
     }
 
     func put_byte(&self, b: UInt8) unsafe {
-        while (self.regs.lsr.read() & LSR_TX_EMPTY) == 0u8 { }
+        while (self.regs.lsr.read() & LSR_TX_EMPTY) == 0 { }
         self.regs.thr.write(b)
     }
 
@@ -180,7 +180,7 @@ func _start(boot_handle: UInt) {
     // §2's Interrupt row: the line becomes an object, and the object is
     // waitable. The kernel unmasks it here — the DEVICE is still quiet, because
     // its own enable bit is below.
-    let irq = match proc.create_interrupt(line: UART_IRQ) {
+    let irq = match proc.bind_interrupt(line: UART_IRQ) {
         case Ok(i) -> i,
         case Err(e) -> {
             print("SOS echo: no interrupt: {}\n", e)

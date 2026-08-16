@@ -303,12 +303,12 @@ public func sos_process_create_waiter(handle: UInt,
 }
 
 /// Bind IRQ `line` to a new Interrupt in this process. Requires
-/// `ProcessRight.CreateInterrupt`. A line this machine does not have, the
+/// `ProcessRight.BindInterrupt`. A line this machine does not have, the
 /// timer's line, or one already bound TERMINATES the process.
-@export("sos_process_create_interrupt")
-public func sos_process_create_interrupt(handle: UInt, line: UInt,
+@export("sos_process_bind_interrupt")
+public func sos_process_bind_interrupt(handle: UInt, line: UInt,
                                          value_out: UnsafePointer<UInt>) unsafe -> UInt {
-    sos_syscall3(handle, ProcessOp.CreateInterrupt as UInt, line, 0, 0, value_out)
+    sos_syscall3(handle, ProcessOp.BindInterrupt as UInt, line, 0, 0, value_out)
 }
 
 /// End this fire and let the device interrupt again. Requires
@@ -555,7 +555,7 @@ public extension Process {
     }
 
     /// Bind IRQ `line` to an Interrupt — spec §2's row and §9's delivery.
-    /// Requires `ProcessRight.CreateInterrupt`.
+    /// Requires `ProcessRight.BindInterrupt`.
     ///
     /// THE LINE IS A NUMBER THE CALLER CHOOSES, so it is spelled as one, which
     /// is the same rule `create_event`'s mode follows. A driver knows its
@@ -569,8 +569,8 @@ public extension Process {
     /// an `ack`. What the kernel does NOT touch is the device's own
     /// interrupt-enable register — that is behind the driver's granted window
     /// and is the driver's to write.
-    public func create_interrupt(&self, line: UInt) -> Result<Interrupt, SosStatus> {
-        let raw = try call_value(self.handle, ProcessOp.CreateInterrupt as UInt,
+    public func bind_interrupt(&self, line: UInt) -> Result<Interrupt, SosStatus> {
+        let raw = try call_value(self.handle, ProcessOp.BindInterrupt as UInt,
                                  line, 0, 0)
         return Interrupt(handle: InterruptHandle(raw))
     }
@@ -691,7 +691,7 @@ public extension Event {
 /// makes a single-task driver non-reentrant with no lock: the line cannot come
 /// back while the handler runs.
 ///
-/// Built by `Process.create_interrupt` and by nothing else — no word
+/// Built by `Process.bind_interrupt` and by nothing else — no word
 /// constructor, no word extractor, the module docstring's rule.
 public struct Interrupt {
     handle: InterruptHandle,

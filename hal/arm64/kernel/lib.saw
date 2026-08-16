@@ -71,7 +71,7 @@ extension Pl011 {
 /// own terms is what lets one loop serve both.
 extension Pl011: ConsoleSink {
     func can_write(&self) unsafe -> Bool {
-        (self.regs.fr.read() & FR_TX_FULL) == 0u32
+        (self.regs.fr.read() & FR_TX_FULL) == 0
     }
 
     func put(&self, b: UInt8) unsafe {
@@ -149,7 +149,7 @@ static_assert(sizeof<TrapFrame>() == FRAME_BYTES, "the arm64 trap frame is 34 do
 // =============================================================================
 
 static UART_BASE: UInt = 0x09000000
-static FR_TX_FULL: UInt32 = 0x20u32       // FR bit 5 — transmit FIFO full
+static FR_TX_FULL: UInt32 = 0x20         // FR bit 5 — transmit FIFO full
 
 /// The interrupt controller: a distributor shared by the machine and a
 /// per-core interface. This board wires the v2 layout, which is what
@@ -595,7 +595,7 @@ func report_hex(v: UInt) {
 /// `Atomic`: SOS v1 is a uniprocessor kernel that enables no interrupt sources
 /// (spec §7), and this flag is only ever touched with the machine already
 /// failing.
-unsafe static var IN_KERNEL_FAULT: UInt8 = 0u8
+unsafe static var IN_KERNEL_FAULT: UInt8 = 0
 
 /// A trap the KERNEL itself took, i.e. a kernel bug. Reports the exception
 /// class and stops the machine with it as the status — the arm64 spelling of
@@ -607,10 +607,10 @@ unsafe static var IN_KERNEL_FAULT: UInt8 = 0u8
 @export("sos_kernel_fault")
 public func kernel_fault(esr: UInt, elr: UInt, far: UInt) unsafe {
     let ec = (esr >> ESR_EC_SHIFT) & ESR_EC_MASK
-    if IN_KERNEL_FAULT != 0u8 {
+    if IN_KERNEL_FAULT != 0 {
         exit_fail(ec)
     }
-    IN_KERNEL_FAULT = 1u8
+    IN_KERNEL_FAULT = 1
     report_str("SOS: kernel fault ec=")
     report_hex(ec)
     report_str(" elr=")
@@ -698,7 +698,7 @@ public func kernel_fault(esr: UInt, elr: UInt, far: UInt) unsafe {
 /// length and the initializer cannot disagree.
 static PT_DESCRIPTORS: Int = 512 + 512 + 1024 + 512 + 512 + 512
 
-unsafe static var PAGE_TABLES: [UInt64; PT_DESCRIPTORS] = [0u64; PT_DESCRIPTORS]
+unsafe static var PAGE_TABLES: [UInt64; PT_DESCRIPTORS] = [0; PT_DESCRIPTORS]
 
 /// Descriptors per table at the 4 KiB granule: a table is one page of 8-byte
 /// entries.
@@ -729,14 +729,14 @@ static DEVICE_WINDOW_LEN: UInt = 1 << BLOCK_SHIFT
 // bit position — a standalone quantity, which is what a `static` is for. The
 // two descriptor fields that are genuinely a CLOSED SET of alternatives are the
 // enums below, where an exhaustive `match` and a pinned value are worth having.
-static DESC_VALID: UInt64 = 0x1u64
-static DESC_BLOCK: UInt64 = 0x0u64        // bit 1 clear at levels 1-2
-static DESC_TABLE: UInt64 = 0x2u64        // bit 1 set at levels 1-2
-static DESC_PAGE: UInt64 = 0x2u64         // at level 3 the same bit means "page"
-static ATTR_SH_INNER: UInt64 = 0x300u64   // bits 9:8 — inner shareable
-static ATTR_AF: UInt64 = 0x400u64         // bit 10 — access flag
-static ATTR_PXN: UInt64 = 0x20000000000000u64   // bit 53 — no execute at EL1
-static ATTR_UXN: UInt64 = 0x40000000000000u64   // bit 54 — no execute at EL0
+static DESC_VALID: UInt64 = 0x1
+static DESC_BLOCK: UInt64 = 0x0           // bit 1 clear at levels 1-2
+static DESC_TABLE: UInt64 = 0x2           // bit 1 set at levels 1-2
+static DESC_PAGE: UInt64 = 0x2            // at level 3 the same bit means "page"
+static ATTR_SH_INNER: UInt64 = 0x300      // bits 9:8 — inner shareable
+static ATTR_AF: UInt64 = 0x400            // bit 10 — access flag
+static ATTR_PXN: UInt64 = 0x20000000000000      // bit 53 — no execute at EL1
+static ATTR_UXN: UInt64 = 0x40000000000000      // bit 54 — no execute at EL0
 
 /// The access-permission field, descriptor bits 7:6. Exactly one of the four is
 /// in a descriptor, which is what makes this an enum rather than four constants
@@ -962,12 +962,12 @@ public func prot_region(idx: UInt, base: UInt, top: UInt, perms: UInt8) unsafe {
     let level3 = tables_base() + LEVEL3_OFFSET
     var attrs = (DESC_VALID | DESC_PAGE | MemoryType.Normal.attr_index() | ATTR_AF
                  | ATTR_SH_INNER | ATTR_PXN)
-    if (perms & (SegFlag.Write as UInt8)) != 0u8 {
+    if (perms & (SegFlag.Write as UInt8)) != 0 {
         attrs = attrs | (AccessPerm.El0Rw as UInt64)
     } else {
         attrs = attrs | (AccessPerm.El0Ro as UInt64)
     }
-    if (perms & (SegFlag.Execute as UInt8)) == 0u8 {
+    if (perms & (SegFlag.Execute as UInt8)) == 0 {
         attrs = attrs | ATTR_UXN
     }
     // The bound is tested BEFORE the subtraction that would compute the page
@@ -1074,25 +1074,25 @@ static GICD_IPRIORITYR: UInt = 0x400
 static GICD_ITARGETSR: UInt = 0x800
 static GICD_SGIR: UInt = 0xF00
 
-static GIC_ENABLE: UInt32 = 1u32
+static GIC_ENABLE: UInt32 = 1
 /// The priority floor: a line is delivered only if its priority is NUMERICALLY
 /// BELOW this (lower means more urgent here), so one floor plus one shared
 /// active level is the whole policy — SOS prioritizes in software (spec §7).
-static GIC_PRIORITY_FLOOR: UInt32 = 0xF0u32
-static GIC_PRIORITY_ACTIVE: UInt8 = 0x80u8
-static GIC_CPU0: UInt8 = 0x01u8
+static GIC_PRIORITY_FLOOR: UInt32 = 0xF0
+static GIC_PRIORITY_ACTIVE: UInt8 = 0x80
+static GIC_CPU0: UInt8 = 0x01
 
 /// Lines below this are per-core and have no target register: the software
 /// -generated ones and the per-core peripheral ones, the timer among them.
 static GIC_PERCORE_LINES: UInt = 32
 static GIC_LINES_PER_WORD: UInt = 32
 static GIC_LINES_PER_TYPER_STEP: UInt = 32
-static GIC_TYPER_LINES_MASK: UInt32 = 0x1Fu32
+static GIC_TYPER_LINES_MASK: UInt32 = 0x1F
 /// What the acknowledge register reads as when nothing is deliverable.
 static GIC_SPURIOUS: UInt = 1023
 /// Send to the requesting core only — the software-trigger register's target
 /// filter, in bits 25:24.
-static GIC_SGIR_TO_SELF: UInt32 = 0x2000000u32
+static GIC_SGIR_TO_SELF: UInt32 = 0x2000000
 static REGISTER_BYTES: UInt = 4
 
 extension Gic {
@@ -1122,13 +1122,13 @@ extension Gic {
     /// Every line masked, then both halves on. Nothing is deliverable until
     /// `irq_unmask` opens a line.
     func reset(&self) unsafe {
-        self.dist.ctlr.write(0u32)
+        self.dist.ctlr.write(0)
         let lines = self.line_count()
         var word: UInt = 0
         while word * GIC_LINES_PER_WORD < lines {
             let disable = UnsafeMemory<UInt32, Device>(
                 GIC_DIST_BASE + GICD_ICENABLER + word * REGISTER_BYTES)
-            disable.write(0xFFFFFFFFu32)
+            disable.write(0xFFFFFFFF)
             word = word + 1
         }
         self.dist.ctlr.write(GIC_ENABLE)
@@ -1145,14 +1145,14 @@ extension Gic {
             self.byte_at(GICD_ITARGETSR, line).write(GIC_CPU0)
         }
         let enable = self.word_at(GICD_ISENABLER, line)
-        enable.write(1u32 << ((line % GIC_LINES_PER_WORD) as Int))
+        enable.write(1 << ((line % GIC_LINES_PER_WORD) as Int))
     }
 
     /// Masking is a WRITE-ONE-TO-CLEAR register, so this touches one line and
     /// needs no read-modify-write of the word around it.
     func mask(&self, line: UInt) unsafe {
         let disable = self.word_at(GICD_ICENABLER, line)
-        disable.write(1u32 << ((line % GIC_LINES_PER_WORD) as Int))
+        disable.write(1 << ((line % GIC_LINES_PER_WORD) as Int))
     }
 
     func claim(&self) unsafe -> UInt {

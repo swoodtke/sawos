@@ -35,7 +35,7 @@ names provisional):
 | `Channel` | Synchronous message IPC with request/reply built in — see §2.1 (ratified Jul 29). |
 | `Event` | Accumulating non-blocking notification (OR / saturating-sum); a waitable — see §2.4 (ratified Jul 29). |
 | `Timer` | Deadline object; fires an Event / is waitable. |
-| `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it, ack via the handle. BUILT M2 (design 178 unit 4): one op (`Ack`), two rights (`InterruptRight.Wait`/`.Ack`), created by `ProcessOp.CreateInterrupt` on its own Process right — the factory bit a launcher strips from everything that is not a driver. The BINDING IS THE OBJECT'S EXISTENCE (creation takes the line, there is no rebind), which is what stops one handle naming two devices over its life. A line the board does not have, the TIMER's line, and a line already bound are all faults. |
+| `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it, ack via the handle. BUILT M2 (design 178 unit 4): one op (`Ack`), two rights (`InterruptRight.Wait`/`.Ack`), created by `ProcessOp.BindInterrupt` on its own Process right — the factory bit a launcher strips from everything that is not a driver. The BINDING IS THE OBJECT'S EXISTENCE (creation takes the line, there is no rebind), which is what stops one handle naming two devices over its life. A line the board does not have, the TIMER's line, and a line already bound are all faults. |
 | `Waiter` | Generic wait aggregator (epoll/Port-style) — see §2.2 (ratified Jul 29). |
 | `MemoryObject` | Physical memory (RAM or device MMIO). Ownership/authority over the pages; mappable, sendable — see §2.3 (ratified Jul 29). |
 | `Mapping` | An installed virtual placement of a MemoryObject; distinct object, own handle; only it can unmap — see §2.3. |
@@ -925,7 +925,7 @@ event-driven EDGE of a process gets a second, distinct construct:
   (§2 Interrupt). Root's band map applies verbatim from its image (§7).
   **M2 ANSWERS THE LAST TWO WITH RIGHTS RATHER THAN OBJECTS**, and the
   set stays ONE handle wide: root's Process handle carries
-  `CreateInterrupt`, so binding a line is a derivation through a handle
+  `BindInterrupt`, so binding a line is a derivation through a handle
   it already holds rather than a table it is given — and its device
   window arrives in its own image (§2.5), not in the boot set. Both
   become real objects in M3, and neither widens the register the kernel
