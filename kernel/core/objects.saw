@@ -1,0 +1,235 @@
+//! HANDLES AND THE OBJECTS THEY NAME (spec §2, §3, §5.7): the process-indexed
+//! handle table, and the VALIDATED wrapper each object kind gets out of it.
+//!
+//! This is the vocabulary the dispatch is written in, held below every table it
+//! indexes into: a `HandleEntry` says which kind and which slot, and the typed
+//! wrappers pair a kind with its rights word so testing one kind's right against
+//! another's object is a compile error rather than a bit comparison.
+//!
+//! `SlotState` is here rather than beside any one slab because four of them
+//! answer the same question with it.
+
+import sosabi.{
+    ObjType,
+    SystemHandle,
+    ProcessHandle,
+    ThreadHandle,
+    EventHandle,
+    WaiterHandle,
+    InterruptHandle,
+    ClockHandle,
+    TimerHandle,
+    SystemRight,
+    ProcessRight,
+    ThreadRight,
+    EventRight,
+    WaiterRight,
+    InterruptRight,
+    ClockRight,
+    TimerRight,
+    NO_HANDLE,
+}
+import kcore.limits.{MAX_HANDLES, MAX_PROCESSES}
+
+/// One handle-table entry: the object a handle names, the rights its holder has
+/// on it (§3), and WHICH object of that kind it is. The kernel validates all
+/// three on every op.
+///
+/// `obj_type` is the typed tag; `rights` stays a plain `UInt32` because it is a
+/// MASK — a set of bits, not one of the cases of any kind's rights enum. It is
+/// deliberately NOT interpretable on its own: which enum's bits these are is
+/// decided by `obj_type`, and the pairing happens below.
+///
+/// `target` is the object's slot in its kind's table. It was not needed while
+/// the only object was a singleton; with Threads it is the whole point of the
+/// entry, because "which thread" is exactly what a handle answers.
+public struct HandleEntry {
+    public obj_type: ObjType,
+    public rights: UInt32,
+    public target: Int,
+}
+
+/// A System handle the dispatch has VALIDATED (§3).
+///
+/// This type is the pairing of a handle kind with its rights word, and it is
+/// what makes the rights check typed rather than cosmetic. The only way to get
+/// one is through `dispatch`, after the table resolved the handle to a System
+/// object — so the type carries the claim "validated as System", and
+/// `allows` can accept a `SystemRight` and nothing else. `ProcessObject` and
+/// `ThreadObject` below are the same construction with their own rights enums,
+/// so testing one kind's right against another's object is a compile error, not
+/// a bit comparison that quietly returns an answer.
+public struct SystemObject {
+    public handle: SystemHandle,
+    public rights: UInt32,
+}
+
+extension SystemObject {
+    /// Whether this holder may perform an op requiring `right`.
+    ///
+    /// The mask arithmetic lives here rather than at each call site, so the
+    /// dispatch below reads as the question it is asking and there is one place
+    /// to change when rights become a wider word.
+    public func allows(&self, right: SystemRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
+    }
+}
+
+/// A Process handle the dispatch has VALIDATED, paired with its rights and the
+/// process slot it names.
+public struct ProcessObject {
+    public handle: ProcessHandle,
+    public rights: UInt32,
+    public slot: Int,
+}
+
+extension ProcessObject {
+    public func allows(&self, right: ProcessRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
+    }
+}
+
+/// A Thread handle the dispatch has VALIDATED, paired with its rights and the
+/// thread slot it names.
+public struct ThreadObject {
+    public handle: ThreadHandle,
+    public rights: UInt32,
+    public slot: Int,
+}
+
+extension ThreadObject {
+    public func allows(&self, right: ThreadRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
+    }
+}
+
+/// An Event handle the dispatch has VALIDATED, paired with its rights and the
+/// event slot it names (spec §2.4).
+public struct EventObject {
+    public handle: EventHandle,
+    public rights: UInt32,
+    public slot: Int,
+}
+
+extension EventObject {
+    public func allows(&self, right: EventRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
+    }
+}
+
+/// A Waiter handle the dispatch has VALIDATED, paired with its rights and the
+/// waiter slot it names (spec §2.2).
+public struct WaiterObject {
+    public handle: WaiterHandle,
+    public rights: UInt32,
+    public slot: Int,
+}
+
+extension WaiterObject {
+    public func allows(&self, right: WaiterRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
+    }
+}
+
+/// An Interrupt handle the dispatch has VALIDATED, paired with its rights and
+/// the interrupt slot it names (spec §2 table, §9).
+public struct InterruptObject {
+    public handle: InterruptHandle,
+    public rights: UInt32,
+    public slot: Int,
+}
+
+extension InterruptObject {
+    public func allows(&self, right: InterruptRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
+    }
+}
+
+/// A Clock handle the dispatch has VALIDATED, paired with its rights and the
+/// clock slot it names (spec §2 table; design 232 unit 1).
+public struct ClockObject {
+    public handle: ClockHandle,
+    public rights: UInt32,
+    public slot: Int,
+}
+
+extension ClockObject {
+    public func allows(&self, right: ClockRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
+    }
+}
+
+/// A Timer handle the dispatch has VALIDATED, paired with its rights and the
+/// timer slot it names (spec §2 table; design 232 unit 1).
+public struct TimerObject {
+    public handle: TimerHandle,
+    public rights: UInt32,
+    public slot: Int,
+}
+
+extension TimerObject {
+    public func allows(&self, right: TimerRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
+    }
+}
+
+/// Whether an Event or a Waiter slot is in use.
+///
+/// ONE enum for both because it really is one question. Threads and processes
+/// have state MACHINES — a thread is created, then runnable, then running, then
+/// blocked or exited, and a join arriving after the exit still has to find the
+/// code — while an Event and a Waiter are either there or not: an Event's whole
+/// state is its accumulated word, and a Waiter's is its two lists.
+public enum SlotState: UInt8 {
+    case Free = 0,
+    case Live = 1,
+}
+
+/// Every process's handle table, back to back: process `p`'s handle `h`
+/// (1-based, §3's "handle 0 names nothing") lives at `p * MAX_HANDLES + h - 1`.
+public unsafe static var HANDLES: [HandleEntry; MAX_PROCESSES * MAX_HANDLES] = [
+    HandleEntry(obj_type: ObjType.Unbound, rights: 0, target: 0);
+    MAX_PROCESSES * MAX_HANDLES]
+
+// -----------------------------------------------------------------------------
+// The handle table (spec §3)
+// -----------------------------------------------------------------------------
+
+/// Where process `p`'s handle `h` sits in the flat table. Callers have already
+/// range-checked `h`.
+func handle_index(p: Int, h: UInt) unsafe -> Int {
+    p * MAX_HANDLES + (h as Int) - 1
+}
+
+/// Resolve a handle in a process's table.
+///
+/// An out-of-range or unbound handle resolves to `ObjType.Unbound`, and the
+/// rights travel WITH the entry rather than being assumed by the op — the two
+/// properties the M1 version already had, now over a real table.
+public func lookup_handle(p: Int, h: UInt) unsafe -> HandleEntry {
+    if h == NO_HANDLE || h > (MAX_HANDLES as UInt) {
+        return HandleEntry(obj_type: ObjType.Unbound, rights: 0, target: 0)
+    }
+    HANDLES[handle_index(p, h)]
+}
+
+/// Mint a handle naming `target` of kind `kind` with `rights`, in process `p`'s
+/// table. Returns `NO_HANDLE` when the table is full — an exhaustion the caller
+/// could not have known about, which is what a status is for.
+public func mint_handle(p: Int, kind: ObjType, rights: UInt32, target: Int) unsafe -> UInt {
+    var h: Int = 0
+    while h < MAX_HANDLES {
+        let entry = HANDLES[p * MAX_HANDLES + h]
+        match entry.obj_type {
+            case Unbound -> {
+                HANDLES[p * MAX_HANDLES + h] = HandleEntry(obj_type: kind,
+                                                           rights: rights,
+                                                           target: target)
+                return (h as UInt) + 1
+            },
+            case _ -> {},
+        }
+        h = h + 1
+    }
+    NO_HANDLE
+}

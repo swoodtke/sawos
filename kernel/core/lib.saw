@@ -81,327 +81,93 @@ import kcore.result.{
 // A syscall-number skew would not be a compile error anywhere; it would be a
 // working call that did the wrong thing.
 
-/// One handle-table entry: the object a handle names, the rights its holder has
-/// on it (§3), and WHICH object of that kind it is. The kernel validates all
-/// three on every op.
-///
-/// `obj_type` is the typed tag; `rights` stays a plain `UInt32` because it is a
-/// MASK — a set of bits, not one of the cases of any kind's rights enum. It is
-/// deliberately NOT interpretable on its own: which enum's bits these are is
-/// decided by `obj_type`, and the pairing happens below.
-///
-/// `target` is the object's slot in its kind's table. It was not needed while
-/// the only object was a singleton; with Threads it is the whole point of the
-/// entry, because "which thread" is exactly what a handle answers.
-struct HandleEntry {
-    obj_type: ObjType,
-    rights: UInt32,
-    target: Int,
+import kcore.limits.{
+    MAX_ATTACHMENTS,
+    MAX_EVENTS,
+    MAX_HANDLES,
+    MAX_INTERRUPTS,
+    MAX_PROCESSES,
+    MAX_THREADS,
+    MAX_TIMERS,
+    MAX_WAITERS,
+    NO_ATTACHMENT,
+    NO_EVENT,
+    NO_INTERRUPT,
+    NO_THREAD,
+    NO_TIMER,
+    NO_WAITER,
 }
-
-/// A System handle the dispatch has VALIDATED (§3).
-///
-/// This type is the pairing of a handle kind with its rights word, and it is
-/// what makes the rights check typed rather than cosmetic. The only way to get
-/// one is through `dispatch`, after the table resolved the handle to a System
-/// object — so the type carries the claim "validated as System", and
-/// `allows` can accept a `SystemRight` and nothing else. `ProcessObject` and
-/// `ThreadObject` below are the same construction with their own rights enums,
-/// so testing one kind's right against another's object is a compile error, not
-/// a bit comparison that quietly returns an answer.
-struct SystemObject {
-    handle: SystemHandle,
-    rights: UInt32,
+import kcore.objects.{
+    ClockObject,
+    EventObject,
+    HANDLES,
+    HandleEntry,
+    InterruptObject,
+    ProcessObject,
+    SlotState,
+    SystemObject,
+    ThreadObject,
+    TimerObject,
+    WaiterObject,
+    lookup_handle,
+    mint_handle,
 }
-
-extension SystemObject {
-    /// Whether this holder may perform an op requiring `right`.
-    ///
-    /// The mask arithmetic lives here rather than at each call site, so the
-    /// dispatch below reads as the question it is asking and there is one place
-    /// to change when rights become a wider word.
-    func allows(&self, right: SystemRight) -> Bool {
-        (self.rights & (right as UInt32)) != 0
-    }
+import kcore.threads.{
+    CURRENT_THREAD,
+    NEED_RESCHED,
+    READY_HEAD,
+    READY_TAIL,
+    SLICE_LEFT,
+    SLICE_TICKS,
+    THREADS,
+    ThreadSlot,
+    ThreadState,
+    alloc_thread,
+    block_on_join,
+    calling_process,
+    frame_slot,
+    live_threads,
+    ready_pop,
+    ready_push,
 }
-
-/// A Process handle the dispatch has VALIDATED, paired with its rights and the
-/// process slot it names.
-struct ProcessObject {
-    handle: ProcessHandle,
-    rights: UInt32,
-    slot: Int,
+public import kcore.time.{
+    CLOCKS,
+    NEVER_NS,
+    NEXT_TICK_NS,
+    TICK_PERIOD_NS,
+    TIMERS,
+    TimerSlot,
+    alloc_timer,
+    clock_slot,
+    reprogram_timer,
+    start_tick,
 }
-
-extension ProcessObject {
-    func allows(&self, right: ProcessRight) -> Bool {
-        (self.rights & (right as UInt32)) != 0
-    }
-}
-
-/// A Thread handle the dispatch has VALIDATED, paired with its rights and the
-/// thread slot it names.
-struct ThreadObject {
-    handle: ThreadHandle,
-    rights: UInt32,
-    slot: Int,
-}
-
-extension ThreadObject {
-    func allows(&self, right: ThreadRight) -> Bool {
-        (self.rights & (right as UInt32)) != 0
-    }
-}
-
-/// An Event handle the dispatch has VALIDATED, paired with its rights and the
-/// event slot it names (spec §2.4).
-struct EventObject {
-    handle: EventHandle,
-    rights: UInt32,
-    slot: Int,
-}
-
-extension EventObject {
-    func allows(&self, right: EventRight) -> Bool {
-        (self.rights & (right as UInt32)) != 0
-    }
-}
-
-/// A Waiter handle the dispatch has VALIDATED, paired with its rights and the
-/// waiter slot it names (spec §2.2).
-struct WaiterObject {
-    handle: WaiterHandle,
-    rights: UInt32,
-    slot: Int,
-}
-
-extension WaiterObject {
-    func allows(&self, right: WaiterRight) -> Bool {
-        (self.rights & (right as UInt32)) != 0
-    }
-}
-
-/// An Interrupt handle the dispatch has VALIDATED, paired with its rights and
-/// the interrupt slot it names (spec §2 table, §9).
-struct InterruptObject {
-    handle: InterruptHandle,
-    rights: UInt32,
-    slot: Int,
-}
-
-extension InterruptObject {
-    func allows(&self, right: InterruptRight) -> Bool {
-        (self.rights & (right as UInt32)) != 0
-    }
-}
-
-/// A Clock handle the dispatch has VALIDATED, paired with its rights and the
-/// clock slot it names (spec §2 table; design 232 unit 1).
-struct ClockObject {
-    handle: ClockHandle,
-    rights: UInt32,
-    slot: Int,
-}
-
-extension ClockObject {
-    func allows(&self, right: ClockRight) -> Bool {
-        (self.rights & (right as UInt32)) != 0
-    }
-}
-
-/// A Timer handle the dispatch has VALIDATED, paired with its rights and the
-/// timer slot it names (spec §2 table; design 232 unit 1).
-struct TimerObject {
-    handle: TimerHandle,
-    rights: UInt32,
-    slot: Int,
-}
-
-extension TimerObject {
-    func allows(&self, right: TimerRight) -> Bool {
-        (self.rights & (right as UInt32)) != 0
-    }
-}
-
-// =============================================================================
-// Processes, threads and the scheduler (design 178 D2/D3/D4; spec §2, §7, §8)
-// =============================================================================
-//
-// THE TRAP FRAME IS THE THREAD CONTEXT, and that one decision is most of this
-// unit. A thread's saved registers are the frame the HAL's trap entry writes on
-// the way in and reads on the way out; a thread SWITCH is therefore not a
-// separate save/restore at all — it is `ktrap` returning a DIFFERENT frame
-// address than it was called with. Entering user mode for the first time is the
-// same operation with a frame nothing has run in yet. Two seam calls carry the
-// whole of it: `hal.frame_init` builds a fresh context, `hal.resume_frame`
-// enters one, and the trap entry's ordinary return path does every switch after
-// that.
-//
-// WHERE A SWITCH CAN HAPPEN is design 178's D2, and the frame model is what
-// makes it free: the only place a frame address is chosen is the user-return
-// boundary, because that is the only place `ktrap` returns. The kernel is never
-// preempted, holds no lock, and has no half-saved context to protect — the
-// state a switch reads is a table, and the tick that motivates one only sets a
-// flag.
-//
-// THE PROTECTION-DOMAIN RELOAD IS NOT HERE, and its absence is deliberate
-// rather than forgotten (design 178 D4 + the M3 memory notes). Threads of one
-// process share one domain, so a same-process switch reloads nothing; the
-// reload belongs at exactly one point — `pick_next` below, where the outgoing
-// and incoming threads' PROCESSES are both in hand — and M3's per-process
-// region sets install it there and nowhere else. Whether that reload is a
-// register file or a table root is the HAL's business, which is why this
-// paragraph can say it without naming either.
-
-/// Processes the kernel can hold. ONE in M2: the kernel loads exactly one image
-/// ever (§12) and every later process is loaded BY root, which needs the
-/// MemoryObject/Mapping objects M3 brings. The table is indexed rather than
-/// assumed throughout so that raising this number is the only edit.
-static MAX_PROCESSES: Int = 1
-
-
-/// Threads the kernel can hold, across all processes.
-static MAX_THREADS: Int = 8
-
-
-/// Events the kernel can hold, across all processes (spec §2.4).
-static MAX_EVENTS: Int = 8
-
-
-/// Waiters the kernel can hold, across all processes (spec §2.2). Fewer than
-/// events on purpose: a Waiter is a DISPATCH POINT, and the shape §2.2 ratifies
-/// — many handles per Waiter, many threads per Waiter — is one per pool of
-/// workers rather than one per notification.
-static MAX_WAITERS: Int = 4
-
-
-/// Interrupts the kernel can hold, across all processes (spec §2 table, §9).
-///
-/// Small because an Interrupt is a BOUND DEVICE LINE, and a machine has as many
-/// of those as it has devices with drivers — not as many as it has
-/// notifications. Every one costs a masked/unmasked line in the controller,
-/// which is a real resource the board fixes.
-static MAX_INTERRUPTS: Int = 4
-
-
-/// Clock objects in the system (spec §2 table; design 232 unit 1, amended
-/// Aug 17).
-///
-/// NOT A SLAB BUDGET — A CENSUS OF DOMAINS. A hardware-backed Clock is ONE
-/// KERNEL-ETERNAL OBJECT PER `ClockType`, existing from boot and owned by
-/// nobody: a machine has one monotonic counter, and a per-process object naming
-/// it would be a copy of a fact with a lifetime attached to it. So the slab has
-/// exactly one slot per domain, THE SLOT IS THE DOMAIN'S ORDINAL, and nothing is
-/// ever allocated or freed here. v1 declares one domain, hence one.
-///
-/// This is what a VIRTUAL clock will NOT be: a virtual clock is a separately
-/// created, STATEFUL object (it has an offset, a rate, an owner) and it will get
-/// its own creation op and its own lifetime. Sharing this slab with it would put
-/// two different kinds of thing in one table for the sake of a name they share.
-static CLOCK_KINDS: Int = 1
-
-
-/// Timers the kernel can hold, across all processes (spec §2 table; design 232
-/// unit 1).
-///
-/// Sized like Events rather than like Interrupts: a Timer is a per-DEADLINE
-/// object — one per timeout a process is tracking — not a per-device one, and
-/// the shape M4's select-with-timeout makes is one Timer beside each thing
-/// being waited on.
-static MAX_TIMERS: Int = 8
-
-
-/// Attachments the kernel can hold, across all Waiters.
-///
-/// Sized to cover every waitable being attached at once, which is the honest
-/// bound: an attachment is one (Waiter, waitable) pair and §2.2 allows a handle
-/// at most one Waiter, so nothing can need more than there are waitables. The
-/// Timer is the third waitable kind and joins the sum for that reason — a
-/// Clock does NOT, because a Clock is not waitable.
-static MAX_ATTACHMENTS: Int = MAX_EVENTS + MAX_INTERRUPTS + MAX_TIMERS
-
-
-/// Handles one process's table can hold (§3).
-static MAX_HANDLES: Int = 16
-
-
-/// Bytes reserved per thread for its saved context.
-///
-/// A STRIDE, not a size: the frame layout is the HAL's and differs per profile
-/// (32 words on one, 34 doublewords on the other), so the kernel reserves a
-/// generous power-of-two slot and asserts the machine's real frame fits. The
-/// stride is also the ALIGNMENT the arena is rounded to, which is how a frame
-/// gets the 16-byte alignment one profile's stack pointer requires without the
-/// kernel having to know that is why.
-static THREAD_FRAME_STRIDE: Int = 512
-
-
-static_assert(hal.FRAME_BYTES <= THREAD_FRAME_STRIDE,
-              "this machine's trap frame does not fit the kernel's per-thread stride")
-
-static_assert(THREAD_FRAME_STRIDE % 16 == 0,
-              "a frame slot must be 16-byte aligned on every profile")
-
-/// One extra stride of slack, so rounding the arena's base up to the stride
-/// cannot run the last slot past the end.
-static FRAME_ARENA_WORDS: Int = (THREAD_FRAME_STRIDE / 8) * (MAX_THREADS + 1)
-
-
-/// Every thread's saved context, back to back.
-///
-/// All-zero, so it costs no image bytes (design 149) — and a zeroed frame is
-/// also the right initial state, since `frame_init` only has to write the three
-/// or four words that are not zero.
-unsafe static var THREAD_FRAMES: [UInt64; FRAME_ARENA_WORDS] = [0; FRAME_ARENA_WORDS]
-
-
-/// The address of thread slot `index`'s frame.
-func frame_slot(index: Int) unsafe -> UInt {
-    let stride = THREAD_FRAME_STRIDE as UInt
-    let base = align_up(((&var THREAD_FRAMES) as UnsafePointer<UInt64>) as UInt, stride)
-    base + (index as UInt) * stride
-}
-
-/// What a thread slot is doing (spec §8).
-///
-/// `Exited` is a state a slot STAYS IN rather than a transition to `Free`,
-/// because a join arriving after the exit must still find the exit code. The
-/// slot returns to the pool at process teardown; reaping it earlier needs a
-/// handle-close op, which M2 does not have — and without close, no slot is ever
-/// reused, which is also why handles carry no generation yet (§3's
-/// stale-handle detection has nothing to detect until a slot can be reused).
-enum ThreadState: UInt8 {
-    case Free = 0,
-    case Created = 1,
-    case Runnable = 2,
-    case Running = 3,
-    case Blocked = 4,
-    case Exited = 5,
-}
-
-/// One thread (spec §2 table row).
-///
-/// `link` is the ONE list pointer a thread needs, because a thread is on at
-/// most one list at a time: the ready queue when it is runnable, or the joiner
-/// list of the thread it is waiting for when it is blocked. Slot indices are
-/// stored PLUS ONE so that zero means "no thread", which is what a zeroed
-/// static already says.
-struct ThreadSlot {
-    state: ThreadState,
-    process: Int,
-    /// This thread's own handle in its process's table — what `ThreadSelf`
-    /// hands back, kept here so the derivation is a read rather than a search.
-    self_handle: UInt,
-    exit_code: UInt,
-    /// Head of the list of threads blocked joining THIS one (slot + 1).
-    joiners: Int,
-    /// Next slot on whichever list this thread is on (slot + 1).
-    link: Int,
-    /// Where a thread parked in `Waiter.Wait` wants its record written — a user
-    /// address, ALREADY VALIDATED by `copy_out_check` at the call. Validating at
-    /// the call rather than at the wake is what makes a bad buffer terminate the
-    /// process that supplied it, while it is still the running one.
-    wait_buf: UInt,
+import kcore.waitables.{
+    ATTACHMENTS,
+    Attachment,
+    EVENTS,
+    EventSlot,
+    INTERRUPTS,
+    InterruptSlot,
+    WAITERS,
+    Waitable,
+    WaitableKind,
+    WaiterSlot,
+    accumulate,
+    alloc_attachment,
+    alloc_event,
+    alloc_interrupt,
+    alloc_waiter,
+    attached_by_key,
+    block_on_wait,
+    detach_attachment,
+    interrupt_by_line,
+    set_waitable_attachment,
+    waitable_answer,
+    waitable_attachment,
+    waitable_consume,
+    waitable_ready,
+    waiter_ready_attachment,
 }
 
 /// What a process slot is doing.
@@ -456,474 +222,10 @@ struct ProcessSlot {
     exit_code: UInt,
 }
 
-/// Whether an Event or a Waiter slot is in use.
-///
-/// ONE enum for both because it really is one question. Threads and processes
-/// have state MACHINES — a thread is created, then runnable, then running, then
-/// blocked or exited, and a join arriving after the exit still has to find the
-/// code — while an Event and a Waiter are either there or not: an Event's whole
-/// state is its accumulated word, and a Waiter's is its two lists.
-enum SlotState: UInt8 {
-    case Free = 0,
-    case Live = 1,
-}
-
-/// WHICH KINDS CAN BE ATTACHED TO A WAITER — the waitable kinds, and only
-/// those.
-///
-/// It is a SECOND enum beside `ObjType` rather than a `Bool` on it, and the
-/// reason is the same one `sosabi` gives for not recording waitability there at
-/// all: attaching also spends a RIGHT, and which enum's bits that right lives in
-/// is decided by the kind. `waitable_slot` is where an `ObjType` becomes one of
-/// these, and it is the only place — every non-waitable arm of that match
-/// terminates the process instead of producing a value.
-///
-/// What this enum buys downstream is that the four per-kind questions below are
-/// EXHAUSTIVE OVER WAITABLES rather than over object types: a fifth object kind
-/// that is not waitable costs them nothing, and a fifth WAITABLE kind fails all
-/// four to compile until somebody answers for it.
-enum WaitableKind: UInt8 {
-    case Event = 0,
-    case Interrupt = 1,
-    case Timer = 2,
-}
-
-/// A waitable the dispatch has resolved: which table, which slot.
-struct Waitable {
-    kind: WaitableKind,
-    slot: Int,
-}
-
-/// One Event (spec §2.4): the accumulating non-blocking notification.
-///
-/// `word` IS the object. Non-zero means ready, which is what makes readiness
-/// LEVEL-TRIGGERED for free (§2.2) — nothing records that a waiter has been
-/// told, so every look at the word gives the same answer until somebody TAKES
-/// it. There is no edge to lose because there is no edge.
-///
-/// TAKING IT IS READ-AND-CLEAR THROUGH EITHER DOOR (ruled Aug 17, user):
-/// §2.4's `Receive` is the non-blocking poll, a `Waiter.wait` delivery is the
-/// blocking one, and both hand the word to a process and reset it. So the word
-/// is never reported twice, and a signal arriving after a take re-arms this
-/// object with its own bits alone.
-///
-/// `attachment` is the ONE thing an Event knows about the wait side: which
-/// attachment names it, or zero. §2.2 ratifies at most one Waiter per handle,
-/// so that is a field rather than a list, and it is what makes `Signal`'s hot
-/// path one load. Everything else about the attachment — which Waiter, which
-/// key, what comes next on the list — lives in the attachment itself, because
-/// an Interrupt has the same field and neither kind should carry a copy of the
-/// wait machinery. Slot indices are stored PLUS ONE so that zero means "none",
-/// which is what a zeroed static already says.
-struct EventSlot {
-    state: SlotState,
-    process: Int,
-    /// §2.4's per-Event accumulation mode, fixed at creation.
-    mode: EventMode,
-    /// The accumulated word. Non-zero = ready.
-    word: UInt,
-    /// The attachment naming this event (slot + 1); 0 = unattached.
-    attachment: Int,
-}
-
-/// One Interrupt (spec §2 table, §9): an IRQ line bound to a waitable.
-///
-/// `pending` IS the object, exactly as an Event's word is: it is set when the
-/// line fires and cleared by `Ack`, and "ready" means nothing more than that.
-/// §9's at-most-one-unacked-fire invariant is therefore not maintained, it is
-/// REPRESENTED — a `Bool` cannot hold two — and what makes it true rather than
-/// merely representable is that the kernel MASKS the line before the hook runs
-/// and only `Ack` unmasks it, so the device physically cannot fire again in
-/// between.
-///
-/// `line` is the number the controller answers with, and it is what makes an
-/// Interrupt findable from the trap path: the hook has a line and needs the
-/// object. A table scan is what answers that, which at this slab size is a
-/// handful of loads and is bounded by the same argument every other scan in the
-/// interrupt path is (design 178 D2 — it runs with interrupts masked, so its
-/// length is interrupt latency).
-struct InterruptSlot {
-    state: SlotState,
-    process: Int,
-    /// The IRQ line this object is bound to, for its whole life.
-    line: UInt,
-    /// Fired and not yet acked. Non-false = ready, in §2.2's sense.
-    pending: Bool,
-    /// The attachment naming this interrupt (slot + 1); 0 = unattached.
-    attachment: Int,
-}
-
-/// One Clock (spec §2 table; design 232 unit 1, amended Aug 17): a GRANTED TIME
-/// SOURCE, and a KERNEL-ETERNAL one.
-///
-/// IT HOLDS NO TIME AND NO OWNER. The machine's counter is the clock
-/// (`hal.timer_now_ns`) and this slot records only WHICH DOMAIN it names, so two
-/// processes' Clocks cannot drift apart — there is nothing here to drift, and
-/// nothing that belongs to anybody. That is why the object outlives every
-/// process: a slot with no per-process state has nothing a teardown could
-/// reclaim, and one object per domain is what stops two names existing for one
-/// counter (§3's no-duplicate rule).
-///
-/// What the object buys is still the capability: a process that was never
-/// granted a handle cannot read the counter at all, which is what makes handing
-/// a child a VIRTUAL clock later a substitution rather than a redesign. The
-/// virtual one will be a different animal — created, stateful, owned — and it
-/// gets its own slab when it lands.
-///
-/// `kind` IS ALSO THE SLOT'S INDEX, and it is stored anyway because it is what
-/// `clock_now` dispatches on: the domain decides what reading the object
-/// answers with, and a second domain should fail to compile until somebody says
-/// what its reading is.
-struct ClockSlot {
-    /// The domain this clock answers in, for the life of the machine.
-    kind: ClockType,
-}
-
-/// One Timer (spec §2 table; design 232 unit 1): a deadline on a Clock.
-///
-/// `fires` IS THE OBJECT, exactly as an Event's word and an Interrupt's
-/// `pending` are: non-zero means ready, and that is the whole of what a Waiter
-/// looks at. Readiness is level-triggered by the same absence — nothing records
-/// that a waiter has been told, so the count is simply there until a wait
-/// consumes it.
-///
-/// `deadline_ns` IS THE NEXT FIRE, NOT THE LAST ONE, and it is what makes the
-/// re-arm drift-free: `fire_timer` advances it by whole intervals from ITSELF
-/// rather than from the clock, so a fire the kernel was late for shortens the
-/// next gap instead of pushing every later one out. That is the timerfd model
-/// and it is the reason this field is absolute rather than a remaining count.
-///
-/// `clock` binds the Timer to the Clock that made it, for the object's whole
-/// life (the M3 time notes: the timer binds its clock at creation). Today every
-/// Clock reads one counter, so the binding costs nothing and decides nothing;
-/// it exists because a second domain — or a virtual clock — makes "which time
-/// is this deadline measured in" a real question, and a Timer that could be
-/// re-pointed would answer it differently over its life.
-///
-/// WHAT YOU CAN DO TO ONE lives in this type's extension, down beside the ops
-/// that call it: `arm`, `disarm`, `is_due`, `sooner_of`, `fire`. Those are safe
-/// functions, and the `unsafe` on the ops around them is the SLAB's rather than
-/// the timer's.
-struct TimerSlot {
-    state: SlotState,
-    process: Int,
-    /// The Clock slot this timer measures against, for its life.
-    clock: Int,
-    /// Whether a deadline is scheduled. A one-shot clears this when it fires.
-    armed: Bool,
-    /// The absolute deadline of the NEXT fire, in the clock's nanoseconds.
-    deadline_ns: UInt64,
-    /// The re-arm period; 0 is a ONE-SHOT.
-    interval_ns: UInt64,
-    /// Fires not yet delivered to a waiter. Non-zero = ready. Saturates.
-    fires: UInt,
-    /// The attachment naming this timer (slot + 1); 0 = unattached.
-    attachment: Int,
-}
-
-/// One Waiter (spec §2.2): the generic wait aggregator.
-///
-/// TWO LISTS AND NOTHING ELSE. `attached` is the persistent subscription set —
-/// §2.2 has no one-shot mode, so an attachment is removed and never consumed —
-/// and `blocked` is the threads parked in `Wait`, which §2.2 allows to be
-/// several. Readiness is NOT a third list: it is derived by scanning `attached`
-/// for something ready, which is the level-triggered semantics stated as an
-/// implementation rather than maintained beside one.
-struct WaiterSlot {
-    state: SlotState,
-    process: Int,
-    /// Head of the attachment list (attachment slot + 1).
-    attached: Int,
-    /// Head of the list of threads parked in `Wait` (thread slot + 1).
-    blocked: Int,
-}
-
-/// ONE ATTACHMENT: a Waiter, a waitable, and the key that names the pair.
-///
-/// IT IS A THIRD OBJECT RATHER THAN FIELDS ON THE WAITABLE, and the second
-/// waitable kind is what forced that (M2 unit 3 kept them on the Event). A
-/// Waiter's set has to be ONE list — a wait scans it once and a `Remove` walks
-/// it once — so a per-kind list would make both operations a matrix over kinds
-/// instead of a walk, and rider 4's "the same walk, and therefore one place to
-/// be wrong" would stop being true at exactly two kinds.
-///
-/// What each waitable still keeps is a single `attachment` field, which is the
-/// answer to the only question the SIGNAL side asks: who, if anyone, is
-/// watching me.
-struct Attachment {
-    state: SlotState,
-    /// Which table `target` indexes.
-    kind: WaitableKind,
-    /// The waitable's slot in that table.
-    target: Int,
-    /// The Waiter this attachment belongs to (slot index, 0-based).
-    waiter: Int,
-    /// The word-sized key the attacher supplied (§2.2). The kernel stores it
-    /// and hands it back; it never interprets it.
-    key: UInt,
-    /// Next attachment on that waiter's list (slot + 1).
-    link: Int,
-}
-
-unsafe static var THREADS: [ThreadSlot; MAX_THREADS] = [
-    ThreadSlot(state: ThreadState.Free, process: 0, self_handle: 0,
-               exit_code: 0, joiners: 0, link: 0, wait_buf: 0); MAX_THREADS]
-
 unsafe static var PROCESSES: [ProcessSlot; MAX_PROCESSES] = [
     ProcessSlot(state: ProcessState.Free, self_handle: 0, entry: 0,
              region_base: 0, region_top: 0, rw_base: 0, rw_top: 0,
              exit_kind: ProcessStatusKind.Running, exit_code: 0); MAX_PROCESSES]
-
-/// Every process's handle table, back to back: process `p`'s handle `h`
-/// (1-based, §3's "handle 0 names nothing") lives at `p * MAX_HANDLES + h - 1`.
-unsafe static var HANDLES: [HandleEntry; MAX_PROCESSES * MAX_HANDLES] = [
-    HandleEntry(obj_type: ObjType.Unbound, rights: 0, target: 0);
-    MAX_PROCESSES * MAX_HANDLES]
-
-unsafe static var EVENTS: [EventSlot; MAX_EVENTS] = [
-    EventSlot(state: SlotState.Free, process: 0, mode: EventMode.Or, word: 0,
-              attachment: 0); MAX_EVENTS]
-
-unsafe static var WAITERS: [WaiterSlot; MAX_WAITERS] = [
-    WaiterSlot(state: SlotState.Free, process: 0, attached: 0,
-               blocked: 0); MAX_WAITERS]
-
-unsafe static var INTERRUPTS: [InterruptSlot; MAX_INTERRUPTS] = [
-    InterruptSlot(state: SlotState.Free, process: 0, line: 0, pending: false,
-                  attachment: 0); MAX_INTERRUPTS]
-
-unsafe static var ATTACHMENTS: [Attachment; MAX_ATTACHMENTS] = [
-    Attachment(state: SlotState.Free, kind: WaitableKind.Event, target: 0,
-               waiter: 0, key: 0, link: 0); MAX_ATTACHMENTS]
-
-/// The machine's clocks, one per domain, LIVE FROM BOOT. There is no `Free`
-/// state and no allocation step: the table is the domain list written down, and
-/// `clock_slot` is the only thing that indexes it.
-unsafe static var CLOCKS: [ClockSlot; CLOCK_KINDS] = [
-    ClockSlot(kind: ClockType.Monotonic); CLOCK_KINDS]
-
-/// The slot naming `kind`'s clock — the whole of the lookup, because THE SLOT IS
-/// THE ORDINAL. `ClockType`'s raw values start at zero and are dense by
-/// construction (design 145's wire idiom numbers them), so the domain and its
-/// row are one fact rather than two kept in step.
-func clock_slot(kind: ClockType) -> Int {
-    (kind as UInt) as Int
-}
-
-static_assert(CLOCK_KINDS == 1,
-              "one slot per ClockType, and v1 declares exactly one domain")
-
-unsafe static var TIMERS: [TimerSlot; MAX_TIMERS] = [
-    TimerSlot(state: SlotState.Free, process: 0, clock: 0, armed: false,
-              deadline_ns: 0, interval_ns: 0, fires: 0,
-              attachment: 0); MAX_TIMERS]
-
-/// "No thread". Slot indices are ordinary 0-based `Int`s in the tables and
-/// PLUS-ONE inside list links; this is the sentinel for the plain form.
-static NO_THREAD: Int = -1
-
-
-/// The same sentinel for the other tables. There is none for CLOCKS: every
-/// domain's slot exists from boot, so "no clock" is not a state the kernel can
-/// be in.
-static NO_EVENT: Int = -1
-static NO_WAITER: Int = -1
-
-static NO_INTERRUPT: Int = -1
-static NO_ATTACHMENT: Int = -1
-
-static NO_TIMER: Int = -1
-
-
-/// The running thread's slot, or `NO_THREAD`.
-///
-/// It really is none before the first process exists, and it stays none for the
-/// harness kernels that enter user mode without one — those cases predate
-/// Thread objects and must go on working, which is what every `NO_THREAD` guard
-/// below is for. Compound global state on design 149's terms: uniprocessor
-/// kernel, interrupts taken from user mode only (D2), so the only writer is the
-/// trap path and nothing can interleave with it.
-unsafe static var CURRENT_THREAD: Int = NO_THREAD
-
-
-/// The ready queue: a FIFO of runnable threads, head and tail as slot + 1.
-/// The RUNNING thread is not on it — round-robin is "put the outgoing thread
-/// at the tail, take the head", and both halves happen in `pick_next`.
-unsafe static var READY_HEAD: Int = 0
-unsafe static var READY_TAIL: Int = 0
-
-/// Set by the tick when a thread's slice runs out, and by `Yield`. Read and
-/// cleared at the user-return boundary, which is the only place it can act.
-unsafe static var NEED_RESCHED: Bool = false
-
-
-/// Ticks left in the running thread's slice.
-unsafe static var SLICE_LEFT: UInt = 0
-
-
-/// Ticks a thread runs before the timer takes the processor away (spec §7's
-/// fixed timeslice). ONE tick, because M2's tick period is already the unit the
-/// scheduler cares about and a longer slice would only make the preemption
-/// harness wait for it.
-static SLICE_TICKS: UInt = 1
-
-
-// -----------------------------------------------------------------------------
-// The handle table (spec §3)
-// -----------------------------------------------------------------------------
-
-/// Where process `p`'s handle `h` sits in the flat table. Callers have already
-/// range-checked `h`.
-func handle_index(p: Int, h: UInt) unsafe -> Int {
-    p * MAX_HANDLES + (h as Int) - 1
-}
-
-/// Resolve a handle in a process's table.
-///
-/// An out-of-range or unbound handle resolves to `ObjType.Unbound`, and the
-/// rights travel WITH the entry rather than being assumed by the op — the two
-/// properties the M1 version already had, now over a real table.
-func lookup_handle(p: Int, h: UInt) unsafe -> HandleEntry {
-    if h == NO_HANDLE || h > (MAX_HANDLES as UInt) {
-        return HandleEntry(obj_type: ObjType.Unbound, rights: 0, target: 0)
-    }
-    HANDLES[handle_index(p, h)]
-}
-
-/// Mint a handle naming `target` of kind `kind` with `rights`, in process `p`'s
-/// table. Returns `NO_HANDLE` when the table is full — an exhaustion the caller
-/// could not have known about, which is what a status is for.
-func mint_handle(p: Int, kind: ObjType, rights: UInt32, target: Int) unsafe -> UInt {
-    var h: Int = 0
-    while h < MAX_HANDLES {
-        let entry = HANDLES[p * MAX_HANDLES + h]
-        match entry.obj_type {
-            case Unbound -> {
-                HANDLES[p * MAX_HANDLES + h] = HandleEntry(obj_type: kind,
-                                                           rights: rights,
-                                                           target: target)
-                return (h as UInt) + 1
-            },
-            case _ -> {},
-        }
-        h = h + 1
-    }
-    NO_HANDLE
-}
-
-// -----------------------------------------------------------------------------
-// The ready queue
-// -----------------------------------------------------------------------------
-
-func ready_push(slot: Int) unsafe {
-    THREADS[slot].link = 0
-    if READY_TAIL == 0 {
-        READY_HEAD = slot + 1
-        READY_TAIL = slot + 1
-    } else {
-        THREADS[READY_TAIL - 1].link = slot + 1
-        READY_TAIL = slot + 1
-    }
-}
-
-func ready_pop() unsafe -> Int {
-    if READY_HEAD == 0 {
-        return NO_THREAD
-    }
-    let slot = READY_HEAD - 1
-    READY_HEAD = THREADS[slot].link
-    if READY_HEAD == 0 {
-        READY_TAIL = 0
-    }
-    THREADS[slot].link = 0
-    slot
-}
-
-// -----------------------------------------------------------------------------
-// Allocation
-// -----------------------------------------------------------------------------
-
-/// Take a free thread slot, or `NO_THREAD` when the slab is empty.
-func alloc_thread() unsafe -> Int {
-    var i: Int = 0
-    while i < MAX_THREADS {
-        match THREADS[i].state {
-            case Free -> { return i },
-            case _ -> {},
-        }
-        i = i + 1
-    }
-    NO_THREAD
-}
-
-/// Take a free event slot, or `NO_EVENT` when the slab is empty.
-func alloc_event() unsafe -> Int {
-    var i: Int = 0
-    while i < MAX_EVENTS {
-        match EVENTS[i].state {
-            case Free -> { return i },
-            case Live -> {},
-        }
-        i = i + 1
-    }
-    NO_EVENT
-}
-
-/// Take a free waiter slot, or `NO_WAITER` when the slab is empty.
-func alloc_waiter() unsafe -> Int {
-    var i: Int = 0
-    while i < MAX_WAITERS {
-        match WAITERS[i].state {
-            case Free -> { return i },
-            case Live -> {},
-        }
-        i = i + 1
-    }
-    NO_WAITER
-}
-
-/// Take a free interrupt slot, or `NO_INTERRUPT` when the slab is empty.
-func alloc_interrupt() unsafe -> Int {
-    var i: Int = 0
-    while i < MAX_INTERRUPTS {
-        match INTERRUPTS[i].state {
-            case Free -> { return i },
-            case Live -> {},
-        }
-        i = i + 1
-    }
-    NO_INTERRUPT
-}
-
-/// Take a free attachment slot, or `NO_ATTACHMENT` when the slab is empty.
-func alloc_attachment() unsafe -> Int {
-    var i: Int = 0
-    while i < MAX_ATTACHMENTS {
-        match ATTACHMENTS[i].state {
-            case Free -> { return i },
-            case Live -> {},
-        }
-        i = i + 1
-    }
-    NO_ATTACHMENT
-}
-
-// There is no `alloc_clock`. A Clock is kernel-eternal and its slot is its
-// domain's ordinal (`clock_slot`), so there is nothing to take and nothing to
-// run out of — `System.ClockGet` mints a HANDLE and never an object.
-
-/// Take a free timer slot, or `NO_TIMER` when the slab is empty.
-func alloc_timer() unsafe -> Int {
-    var i: Int = 0
-    while i < MAX_TIMERS {
-        match TIMERS[i].state {
-            case Free -> { return i },
-            case Live -> {},
-        }
-        i = i + 1
-    }
-    NO_TIMER
-}
 
 // -----------------------------------------------------------------------------
 // The scheduler (design 178 D3)
@@ -991,27 +293,6 @@ func pick_next(current_frame: UInt) unsafe -> UInt {
     frame_slot(next)
 }
 
-// -----------------------------------------------------------------------------
-// Thread lifecycle
-// -----------------------------------------------------------------------------
-
-/// How many of a process's threads have not exited.
-func live_threads(p: Int) unsafe -> Int {
-    var live: Int = 0
-    var i: Int = 0
-    while i < MAX_THREADS {
-        if THREADS[i].process == p {
-            match THREADS[i].state {
-                case Free -> {},
-                case Exited -> {},
-                case _ -> { live = live + 1 },
-            }
-        }
-        i = i + 1
-    }
-    live
-}
-
 /// Retire the running thread with `code`, waking everything that joined it.
 ///
 /// A JOINER'S RETURN IS WRITTEN HERE, into ITS frame, which is the half of the
@@ -1040,238 +321,6 @@ func exit_thread(slot: Int, code: UInt) unsafe {
     if live_threads(p) == 0 {
         end_process(p, ProcessStatusKind.Exited, code, code)
     }
-    NEED_RESCHED = true
-}
-
-/// Park the running thread on `target`'s joiner list.
-func block_on_join(slot: Int, target: Int) unsafe {
-    THREADS[slot].state = ThreadState.Blocked
-    THREADS[slot].link = THREADS[target].joiners
-    THREADS[target].joiners = slot + 1
-    NEED_RESCHED = true
-}
-
-// -----------------------------------------------------------------------------
-// Events and Waiters (spec §2.2, §2.4; design 178 D5)
-// -----------------------------------------------------------------------------
-//
-// THE TWO SMALLEST OBJECTS IN THE §2 TABLE, and between them the whole of
-// asynchronous notification: an Event is a word that accumulates and never
-// blocks, a Waiter is a set of them plus the threads parked on the set. They
-// are here rather than in M3 because they are what proves the handle machinery
-// generalizes past the singleton — three kinds became five with no change to
-// the dispatch's shape, which is the claim §3 has been making since M1.
-//
-// LEVEL-TRIGGERED IS AN ABSENCE, NOT A MECHANISM (§2.2, ratified Jul 29). The
-// kernel records nowhere that a waiter has been told about a ready event, so
-// every look at the attachment set gives the same answer until somebody TAKES
-// the word. That is what makes a signal landing BEFORE anyone waits safe: the
-// word is still non-zero when the wait arrives, and the scan finds it. An
-// edge-triggered design would need a "reported" flag per attachment and would
-// lose exactly that.
-//
-// THE TAKE HAS TWO DOORS, AND BOTH CONSUME (ruled Aug 17, user). `Receive` is
-// the non-blocking poll and a `Waiter.wait` is the blocking one; each hands the
-// accumulated word to a process, so each clears it. A delivery that left the
-// word behind would report the same bits to the next wait as well, and the
-// recipient could not tell that duplicate from a real second signal — the one
-// failure mode a notification must not have. Nothing is lost either way: a
-// signal that lands after the take re-arms readiness with its own bits alone.
-//
-// WHAT WAKES WHOM, and it is a DISTRIBUTION rather than a broadcast. `Signal`
-// wakes AT MOST ONE parked thread (§2.2: "a ready handle wakes one waiter"),
-// and that thread's record carries the word — so with several threads parked on
-// one Waiter, one signal feeds exactly one of them and the rest wait for the
-// next, which is the worker-pool shape §2.2 exists for. THE RECIPIENT IS UNIQUE
-// BY CONSTRUCTION and no multi-watcher caveat is owed: a waitable has at most
-// ONE attachment (§2.2), so a signal reaches exactly one Waiter, which hands it
-// to exactly one thread.
-
-/// §2.4's accumulation, both modes.
-///
-/// THE SUM SATURATES RATHER THAN WRAPPING, which is the half of §2.4 that is a
-/// correctness requirement rather than a convenience: a producer faster than
-/// its consumer must not roll a full count back through zero, because zero is
-/// what "not ready" means — a wrap would make a saturated event go quiet.
-/// `&+` is the wrapping add (Saw's overflow checks are always on, so a plain
-/// `+` would panic in the kernel), and the comparison after it is the carry.
-func accumulate(slot: Int, bits: UInt) unsafe {
-    match EVENTS[slot].mode {
-        case Or -> {
-            EVENTS[slot].word = EVENTS[slot].word | bits
-        },
-        case SaturatingSum -> {
-            EVENTS[slot].word = saturating_add(EVENTS[slot].word, bits)
-        },
-    }
-}
-
-/// Add without ever rolling through zero — §2.4's counting rule, and since
-/// design 232 unit 1 the Timer's fire count uses the same one.
-///
-/// IT IS SHARED RATHER THAN WRITTEN TWICE because the REASON is the same in both
-/// places, not merely the arithmetic: zero is what "not ready" means to a
-/// Waiter, so a count that wrapped would make a saturated Event or a busy Timer
-/// go quiet — the one failure mode a level-triggered notification must not have.
-/// `&+` is the wrapping add (Saw's overflow checks are always on, so a plain `+`
-/// would panic in the kernel), and the comparison after it is the carry.
-func saturating_add(a: UInt, b: UInt) -> UInt {
-    let sum = a &+ b
-    if sum < a { UInt.max } else { sum }
-}
-
-/// Narrow a 64-bit fire count to a machine word, SATURATING rather than
-/// panicking.
-///
-/// A checked `as` would be a panic edge in the kernel on a number a PROCESS
-/// chose — arm a one-nanosecond interval, wait long enough, and the coalesced
-/// count exceeds a 32-bit word on Profile A. Saturating is the same answer the
-/// count already gives at its own ceiling, so nothing new has to be explained
-/// to a reader of the payload.
-func fires_word(n: UInt64) -> UInt {
-    if n > (UInt.max as UInt64) { UInt.max } else { n as UInt }
-}
-
-// -----------------------------------------------------------------------------
-// THE PER-KIND MATRIX: four questions, one arm per waitable kind (obligation 1)
-// -----------------------------------------------------------------------------
-//
-// Everything the wait machinery needs to know about a waitable is one of these
-// five questions, and each is answered by an EXHAUSTIVE match on
-// `WaitableKind`:
-//
-//   `waitable_attachment` / `set_waitable_attachment`   who is watching me
-//   `waitable_ready`                                    am I ready
-//   `waitable_answer`                                   what does a record say
-//   `waitable_consume`                                  a record was delivered
-//
-// That is a MATRIX rather than a funnel because the answers genuinely differ
-// per kind — an Event's readiness is a word, an Interrupt's is a masked line and
-// a Timer's is a count of expiries — and it is written as five small functions
-// in one place so the matrix is READABLE AS ONE. Adding a fourth waitable kind
-// fails all five to compile, which is the property a `_` arm anywhere here would
-// destroy. (The Timer, design 232 unit 1's third kind, is what added the fifth
-// question and it added it to every existing row at once — which is the matrix
-// working.)
-//
-// Everything ELSE about waiting — the list walk, the key lookup, the wake, the
-// copy-out — is kind-blind and appears exactly once below.
-
-/// Which attachment names this waitable (slot + 1), or 0.
-func waitable_attachment(kind: WaitableKind, slot: Int) unsafe -> Int {
-    match kind {
-        case Event -> EVENTS[slot].attachment,
-        case Interrupt -> INTERRUPTS[slot].attachment,
-        case Timer -> TIMERS[slot].attachment,
-    }
-}
-
-/// Record (or clear, with 0) which attachment names this waitable.
-func set_waitable_attachment(kind: WaitableKind, slot: Int, a: Int) unsafe {
-    match kind {
-        case Event -> { EVENTS[slot].attachment = a },
-        case Interrupt -> { INTERRUPTS[slot].attachment = a },
-        case Timer -> { TIMERS[slot].attachment = a },
-    }
-}
-
-/// Is this waitable ready, in §2.2's level-triggered sense?
-///
-/// Every answer is a READ of the object's own state and none consults a flag
-/// the wait machinery maintains, which is what makes level-triggering an
-/// absence rather than a mechanism: an Event is ready while its word is
-/// non-zero, an Interrupt while its fire is unacked, a Timer while it has
-/// expiries nobody has been told about.
-func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Bool {
-    match kind {
-        case Event -> EVENTS[slot].word != 0,
-        case Interrupt -> INTERRUPTS[slot].pending,
-        case Timer -> TIMERS[slot].fires != 0,
-    }
-}
-
-/// The tag and payload words a wait record carries for this waitable.
-func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> WaitAnswer {
-    match kind {
-        case Event -> WaitAnswer(tag: WaitTag.Event, payload: EVENTS[slot].word),
-        case Interrupt -> WaitAnswer(tag: WaitTag.Interrupt,
-                                     payload: INTERRUPTS[slot].line),
-        case Timer -> WaitAnswer(tag: WaitTag.Timer,
-                                 payload: TIMERS[slot].fires),
-    }
-}
-
-/// A record describing this waitable HAS BEEN DELIVERED to a thread. Update
-/// whatever the delivery spent.
-///
-/// THE THREE ANSWERS, and the differences between them are real rather than
-/// accidents of how each object happens to be written:
-///
-///   - an EVENT's word is CONSUMED BY WHOEVER TAKES THE VALUE, through either
-///     door (ruled Aug 17, user). §2.4's `receive` is the non-blocking poll and
-///     a `Waiter.wait` is the blocking one; both hand the accumulated word to a
-///     process, so both clear it. A delivery that left the word behind would
-///     report the same bits to the next wait as well, which is a duplicate the
-///     recipient cannot tell from a real second signal.
-///   - an INTERRUPT's readiness is ended by the driver's `ack` and by nothing
-///     else (§9), because the line stays masked until the device has actually
-///     been serviced. The kernel cannot know that a record was enough.
-///   - a TIMER's fire count is SPENT by the delivery, because a Timer has no
-///     second op to drain with and needs none. It has no mask to hold and no
-///     device to service, so the fire has done its whole job once somebody has
-///     been told — which is the ack-free half of the timerfd model, and what
-///     makes a periodic timer a schedule rather than a request/response.
-///
-/// So the ODD KIND OUT IS THE INTERRUPT, and its emptiness says what it is: the
-/// only readiness in the system whose end is a DEVICE's business rather than the
-/// kernel's.
-func waitable_consume(kind: WaitableKind, slot: Int) unsafe {
-    match kind {
-        // The take is READ-AND-CLEAR, and `deliver_attachment` is what makes it
-        // one act: the read happened a few lines earlier in the same
-        // interrupts-masked region, so no signal can land between the two and
-        // there are no bits here that the record did not carry.
-        case Event -> { EVENTS[slot].word = 0 },
-        case Interrupt -> {},
-        case Timer -> { TIMERS[slot].fires = 0 },
-    }
-}
-
-/// What `waitable_answer` produces: the two words that are not the key.
-struct WaitAnswer {
-    tag: WaitTag,
-    payload: UInt,
-}
-
-/// The first attachment of `w` whose waitable is ready, or `NO_ATTACHMENT`.
-///
-/// A SCAN, and that is the level-triggered semantics implemented rather than
-/// maintained: there is no ready QUEUE to keep in step with the objects, so a
-/// waitable that goes back to not-ready cannot leave a stale entry behind and
-/// one that stays ready is found again by the next scan. It is O(attachments),
-/// which at M2's slab sizes is a handful of loads and is bounded by the same
-/// argument the ready queue's is — this runs with interrupts masked, so its
-/// length is interrupt latency (design 178 D2), and a Waiter with hundreds of
-/// attachments is what an M3 ready-list optimisation would be for.
-func waiter_ready_attachment(w: Int) unsafe -> Int {
-    var cur = WAITERS[w].attached
-    while cur != 0 {
-        let a = cur - 1
-        if waitable_ready(ATTACHMENTS[a].kind, ATTACHMENTS[a].target) {
-            return a
-        }
-        cur = ATTACHMENTS[a].link
-    }
-    NO_ATTACHMENT
-}
-
-/// Park the running thread on `w`'s blocked list, remembering where its record
-/// goes. `dst` has already been through `copy_out_check`.
-func block_on_wait(slot: Int, w: Int, dst: UInt) unsafe {
-    THREADS[slot].state = ThreadState.Blocked
-    THREADS[slot].wait_buf = dst
-    THREADS[slot].link = WAITERS[w].blocked
-    WAITERS[w].blocked = slot + 1
     NEED_RESCHED = true
 }
 
@@ -1379,50 +428,6 @@ func signal_event(slot: Int, bits: UInt) unsafe {
         return
     }
     notify_ready(WaitableKind.Event, slot)
-}
-
-/// The attachment on `w` under `key`, or `NO_ATTACHMENT`.
-///
-/// THE KEY IS THE ATTACHMENT'S NAME, which is what makes the attachment set a
-/// TABLE keyed by it rather than a bag: `Remove` names an attachment this way,
-/// and `Add` uses the same walk to refuse a duplicate. Both rest on keys being
-/// unique per Waiter, which is exactly why the duplicate is refused.
-func attached_by_key(w: Int, key: UInt) unsafe -> Int {
-    var cur = WAITERS[w].attached
-    while cur != 0 {
-        let a = cur - 1
-        if ATTACHMENTS[a].key == key {
-            return a
-        }
-        cur = ATTACHMENTS[a].link
-    }
-    NO_ATTACHMENT
-}
-
-/// Take attachment `a` off waiter `w`'s list, clear the waitable's back
-/// pointer, and return the slot to the slab. The caller has established that it
-/// is on that list.
-func detach_attachment(w: Int, a: Int) unsafe {
-    var prev: Int = 0
-    var cur = WAITERS[w].attached
-    while cur != 0 {
-        let slot = cur - 1
-        let next = ATTACHMENTS[slot].link
-        if slot == a {
-            if prev == 0 {
-                WAITERS[w].attached = next
-            } else {
-                ATTACHMENTS[prev - 1].link = next
-            }
-            set_waitable_attachment(ATTACHMENTS[a].kind, ATTACHMENTS[a].target, 0)
-            ATTACHMENTS[a] = Attachment(state: SlotState.Free,
-                                        kind: WaitableKind.Event, target: 0,
-                                        waiter: 0, key: 0, link: 0)
-            return
-        }
-        prev = cur
-        cur = next
-    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1812,16 +817,6 @@ func copy_in(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe {
     copy_bytes(dst, src, bytes)
 }
 
-/// The calling process. In M2 that is the process of the running thread, and
-/// before there are threads it is the only process there is — the harness
-/// kernels that enter user mode with no object model still make syscalls.
-func calling_process() unsafe -> Int {
-    if CURRENT_THREAD == NO_THREAD {
-        return 0
-    }
-    THREADS[CURRENT_THREAD].process
-}
-
 /// The System object's ops (§2). Returns a status; `shutdown` does not return
 /// at all.
 ///
@@ -2068,29 +1063,6 @@ func event_create_moded(p: Int, mode: EventMode) unsafe -> SyscallResult {
     EVENTS[slot] = EventSlot(state: SlotState.Live, process: p, mode: mode,
                              word: 0, attachment: 0)
     op_value(handle)
-}
-
-/// The Interrupt bound to `line`, or `NO_INTERRUPT`.
-///
-/// A SCAN over four slots, and it is what turns the trap path's line number
-/// back into an object. Keeping a line -> slot map instead would be a second
-/// description of the same fact — the bindings are already in the table, and
-/// the table is the only place a line may be bound twice, which `interrupt_bind`
-/// refuses using exactly this walk.
-func interrupt_by_line(line: UInt) unsafe -> Int {
-    var i: Int = 0
-    while i < MAX_INTERRUPTS {
-        match INTERRUPTS[i].state {
-            case Live -> {
-                if INTERRUPTS[i].line == line {
-                    return i
-                }
-            },
-            case Free -> {},
-        }
-        i = i + 1
-    }
-    NO_INTERRUPT
 }
 
 /// Bind `line` to a new Interrupt in process `p` (spec §2 table, §9).
@@ -2470,131 +1442,6 @@ func timer_op_decoded(op: TimerOp, obj: &TimerObject, arg0: UInt, arg1: UInt,
     }
 }
 
-// -----------------------------------------------------------------------------
-// A TIMER'S OWN VERBS (ruled Aug 17, user; design 212's extraction idiom)
-// -----------------------------------------------------------------------------
-//
-// EVERY MULTI-FIELD OPERATION ON A TIMER IS A METHOD ON THE SLOT, and the ops
-// below index the slab and call one — `TIMERS[slot].fire(now)` where there used
-// to be five `TIMERS[slot].<field>` fetches in a row. Design 212's rule (a
-// 2+-hop chain spelled three times wants extraction) with a RECEIVER rather than
-// a reference parameter, because a slot is a type and these are its verbs.
-//
-// AND THE `unsafe` EFFECT RETREATS TO THE CALL SITES. `TIMERS` is an
-// `unsafe static var`, so every function that NAMES it is declared `unsafe`
-// (design 130/136) — but `TimerSlot` is an ordinary safe type, so a body working
-// through `self` names nothing unsafe and is a SAFE function. What is left
-// inside an unsafe body is the indexing, which is where the compound global
-// state actually is; the arithmetic a reviewer most wants to check is now
-// outside it, and the compiler agrees rather than being asked to take it on
-// trust.
-//
-// A SINGLE FIELD ACCESS IS LEFT ALONE (`TIMERS[t].armed` in the idle rule, the
-// whole-slot writes in `timer_create` and teardown): wrapping one load in a
-// method buys a name for something that already had one.
-
-extension TimerSlot {
-    /// Replace this timer's whole schedule: fire at `deadline`, then every
-    /// `interval` nanoseconds (0 being a one-shot).
-    ///
-    /// **ARMING REPLACES, AND IT IS NOT AN ERROR** (pinned here, design 232 unit
-    /// 1). Arming a timer that is already armed discards the old schedule
-    /// wholesale — new deadline, new interval — AND CLEARS THE FIRE COUNT,
-    /// because a count carried forward would be owed against a schedule the
-    /// caller just threw away. It is deliberately not a fault: re-arming a
-    /// running timer is the ordinary way to change a timeout, which is the shape
-    /// M4's select-with-timeout is made of, and refusing it would make the
-    /// common idiom unwritable.
-    func arm(&var self, deadline: UInt64, interval: UInt64) {
-        self.armed = true
-        self.deadline_ns = deadline
-        self.interval_ns = interval
-        self.fires = 0
-    }
-
-    /// This timer is off and owes nothing.
-    ///
-    /// It clears the FIRE COUNT as well as the schedule, which is what makes it
-    /// a clean cancel: a caller who wants the fires reads them with a wait
-    /// first. Why disarming an UNARMED timer is a no-op rather than a fault is
-    /// `timer_disarm`'s business, since that is the question the OP answers.
-    func disarm(&var self) {
-        // The `u64` suffixes are owed to DF-232a and should come off when it
-        // closes: a bare literal does NOT adopt the expected fixed-width type in
-        // plain assignment position (it does in an annotation, a struct literal
-        // and a compound assignment), and on a 32-bit profile the mismatch is an
-        // INTERNAL COMPILER ERROR rather than a diagnostic. The suffix is the
-        // documented spelling for a literal no expected type reaches, which is
-        // exactly what these are until the gap is fixed.
-        self.armed = false
-        self.deadline_ns = 0u64
-        self.interval_ns = 0u64
-        self.fires = 0
-    }
-
-    /// Has this timer come due by `now`? An unarmed one never has.
-    func is_due(&self, now: UInt64) -> Bool {
-        self.armed && self.deadline_ns <= now
-    }
-
-    /// The SOONER of `deadline` and this timer's own — the fold
-    /// `earliest_timer_deadline` is written as. An unarmed timer answers
-    /// `deadline` unchanged, because a schedule nobody wrote is not a deadline
-    /// the hardware has to be programmed for.
-    func sooner_of(&self, deadline: UInt64) -> UInt64 {
-        if self.armed && self.deadline_ns < deadline { self.deadline_ns } else { deadline }
-    }
-
-    /// This timer came due: count the fire, and re-arm it if it is periodic.
-    ///
-    /// **DRIFT-FREE, AND THE ARITHMETIC IS WHERE THAT LIVES.** The next deadline
-    /// is measured from THIS DEADLINE, never from `now` — so a fire the kernel
-    /// was late for shortens the next gap instead of pushing every later one
-    /// out, and a timer armed at 1 ms is still on the millisecond a thousand
-    /// fires later. That is the timerfd model, and it is the exact OPPOSITE of
-    /// the scheduler tick's rule (`on_timer_interrupt` measures from now)
-    /// because the two want opposite things: a timeslice has no history to be
-    /// faithful to, and an interval does.
-    ///
-    /// **MISSED FIRES COALESCE, BY DIVISION RATHER THAN BY A LOOP.** A consumer
-    /// that was descheduled across several periods gets ONE wake carrying HOW
-    /// MANY, which is what stops it either falling permanently behind a queue of
-    /// fires or silently losing them. Computing the count with a division rather
-    /// than advancing the deadline in a `while` is what keeps this bounded: an
-    /// interval far shorter than the machine can serve costs one divide, not a
-    /// spin — so there is no long loop here for design 232 unit 1.5's preemption
-    /// points to have to cover, and no minimum interval anyone has to invent.
-    func fire(&var self, now: UInt64) {
-        let interval = self.interval_ns
-        if interval == 0 {
-            // A ONE-SHOT DISARMS ITSELF. There is no schedule left, so the
-            // object goes quiet after one fire and a later `disarm` finds
-            // nothing to do — which is exactly the race `timer_disarm`
-            // documents.
-            self.armed = false
-            self.fires = saturating_add(self.fires, 1)
-        } else {
-            let late = now - self.deadline_ns
-            let missed = (late / interval) + 1
-            // The PRODUCT cannot overflow: when `interval` exceeds `late`,
-            // `missed` is 1 and the product is the interval itself; otherwise
-            // `missed` is bounded by `late / interval`, so the product is at
-            // most `late + interval` with both terms real times.
-            let step = missed * interval
-            // The SUM can, and a process chose the number that makes it — an
-            // interval near the end of time pushes the next deadline past it.
-            // Saw's overflow checks are always on, so an unguarded `+` here
-            // would PANIC THE KERNEL on a value userspace picked, which is a
-            // denial of service wearing an arithmetic bug's clothes. Saturating
-            // is also the honest answer: a deadline past the end of time is one
-            // nothing will see fire.
-            let base = self.deadline_ns
-            self.deadline_ns = if step > NEVER_NS - base { NEVER_NS } else { base + step }
-            self.fires = saturating_add(self.fires, fires_word(missed))
-        }
-    }
-}
-
 /// §2's `arm(after, interval)`, taken through the COPY-IN door.
 ///
 /// THE OP IS THE DOOR AND THE SCHEDULE IS THE SLOT'S: everything below this line
@@ -2643,21 +1490,6 @@ func timer_disarm(slot: Int) unsafe -> SyscallResult {
     TIMERS[slot].disarm()
     reprogram_timer()
     op_ok()
-}
-
-/// The earliest deadline any armed Timer is waiting on, or `soonest` if none is
-/// sooner. The Timer half of `reprogram_timer`'s question.
-func earliest_timer_deadline(soonest: UInt64) unsafe -> UInt64 {
-    var next = soonest
-    var i: Int = 0
-    while i < MAX_TIMERS {
-        match TIMERS[i].state {
-            case Live -> { next = TIMERS[i].sooner_of(next) },
-            case Free -> {},
-        }
-        i = i + 1
-    }
-    next
 }
 
 /// Fire every Timer whose deadline `now` has reached.
@@ -3005,7 +1837,6 @@ public func ktrap(frame_addr: UInt, cause: UInt, tval: UInt) unsafe -> UInt {
 
 static BYTE_MASK: UInt = 0xFF
 
-
 // =============================================================================
 // Interrupts (design 178 D2 + D6; spec §9)
 // =============================================================================
@@ -3035,7 +1866,6 @@ static BYTE_MASK: UInt = 0xFF
 /// the path ran and then goes quiet. The count keeps rising either way.
 static TICK_REPORT_LIMIT: UInt = 4
 
-
 /// Ticks the periodic timer has delivered since boot.
 ///
 /// Compound global state resting on a serialization argument the compiler
@@ -3051,135 +1881,17 @@ static TICK_REPORT_LIMIT: UInt = 4
 /// still right, which is what the scheduler will ask of this one.
 unsafe static var TIMER_TICKS: UInt = 0
 
-
 /// Interrupts the controller had nothing to give for. ONE is not an error — a
 /// line can stop asserting between raising the interrupt and being asked about
 /// it — but a stream of them is, so the first is reported and the rest are
 /// counted.
 unsafe static var SPURIOUS_IRQS: UInt = 0
 
-
 /// Ticks the periodic timer has delivered since boot. The scheduler's clock
 /// when there is a scheduler; today the harness's evidence that a tick was
 /// taken, and when.
 public func timer_ticks() unsafe -> UInt {
     TIMER_TICKS
-}
-
-// -----------------------------------------------------------------------------
-// ONE HARDWARE TIMER, TWO CUSTOMERS (design 232 unit 1)
-// -----------------------------------------------------------------------------
-//
-// Both machines have exactly ONE comparator, and from this unit onward two
-// things want it: the SCHEDULER TICK (spec §7's timeslice) and the TIMER OBJECTS
-// (spec §2's row) a process arms. The composition is here, arch-free, and it is
-// the whole of the mechanism:
-//
-//   the kernel keeps every deadline it owes in nanoseconds — the next tick in
-//   `NEXT_TICK_NS`, each armed Timer's in its own slot — and programs the
-//   hardware with the EARLIEST of them. A fire means "something MAY be due":
-//   the handler asks what actually is, services it, and programs the next
-//   earliest. Nothing else touches the comparator.
-//
-// THE TICK IS INVIOLATE, and this arrangement is what keeps it so rather than a
-// promise beside it. A Timer deadline can only ever move the hardware EARLIER
-// than the tick, never later, so the tick's cadence is unchanged by any number
-// of Timers — a fire that turns out to be a Timer's still checks the tick, and
-// a tick that comes due while a Timer is being serviced is taken in the same
-// pass. There is no ordering between the two customers to get wrong, because
-// both are read out of the same `now`.
-//
-// WHY THE PERIOD MOVED OUT OF THE HAL. M2's seam was `timer_start(period_us)` +
-// `timer_rearm()`, which can express exactly one periodic customer — the period
-// lived in each HAL and the rearm was the only way to program anything. The
-// seam is now `timer_now_ns()` + `timer_set_deadline_ns(at)`, which is hardware
-// and nothing else, and the tick's PERIOD is scheduler policy, so it lives
-// where the scheduler does.
-
-/// Nanoseconds in a microsecond — the unit `start_tick` is written in and the
-/// unit `Clock`/`Timer` speak.
-static NS_PER_US: UInt64 = 1000
-
-
-/// The deadline that means "nothing is due" — far enough out that no machine
-/// this kernel runs on reaches it. It is a VALUE rather than an absence so that
-/// `reprogram_timer` has one code path: an empty schedule programs `never`,
-/// which is what stops a level-triggered comparator left in the past from
-/// re-firing forever.
-static NEVER_NS: UInt64 = UInt64.max
-
-
-/// How far ahead of NOW the hardware is ever programmed.
-///
-/// THIS IS WHAT TURNS A TOO-FAST SCHEDULE INTO COALESCING INSTEAD OF A LIVELOCK,
-/// and it is the one place the machine's own limits appear in the Timer's
-/// semantics. A process may arm a one-nanosecond interval; without a floor the
-/// comparator would be due again before the trap returned, and the machine would
-/// live in the trap handler making no user-mode progress. With one, the fire
-/// arrives at most this often and the intervening expiries COALESCE into the
-/// fire count — which is exactly what coalescing is for, so nothing has to be
-/// refused and no minimum interval has to be invented.
-///
-/// The LOGICAL schedule is untouched by it: a Timer's next deadline is still
-/// `previous + interval` (drift-free), so lateness never accumulates and a
-/// one-shot still reports exactly one fire. What the floor bounds is the
-/// RESOLUTION, and 50 microseconds is two orders of magnitude below the
-/// millisecond scheduler tick, so §7's cadence never notices it.
-static TIMER_MIN_LEAD_NS: UInt64 = 50_000
-
-
-/// The scheduler tick's period in nanoseconds; 0 means NO PERIODIC TICK.
-///
-/// Zero is the real kernel's state (`sos/kernel/main.saw` arms none — the
-/// scheduler works without one, and a tick would narrate over the process for
-/// its first few ticks, see `Console`'s handover protocol). It is a state the
-/// composition has to carry rather than an edge case, because a kernel with no
-/// tick and one armed Timer is exactly the shape a sleeping process makes.
-unsafe static var TICK_PERIOD_NS: UInt64 = 0
-
-
-/// When the next scheduler tick is due, on the same clock every deadline uses.
-unsafe static var NEXT_TICK_NS: UInt64 = 0
-
-
-/// Start the periodic scheduler tick (spec §7's fixed timeslice).
-///
-/// ARCH-FREE, and that is the move this unit made: the PERIOD is scheduler
-/// policy and belongs beside the scheduler, while the hardware — a counter and
-/// a comparator — is all the HAL still owns. The harness kernels that want a
-/// preemptive machine call this instead of the HAL's retired `timer_start`.
-public func start_tick(period_us: UInt) unsafe {
-    TICK_PERIOD_NS = (period_us as UInt64) * NS_PER_US
-    NEXT_TICK_NS = hal.timer_now_ns() + TICK_PERIOD_NS
-    reprogram_timer()
-}
-
-/// THE ONE PLACE THE HARDWARE COMPARATOR IS PROGRAMMED (obligation 1).
-///
-/// Its entry points, all of them:
-///
-///   - `start_tick`, when a kernel decides to be preemptive;
-///   - `on_timer_interrupt`, after servicing whatever came due;
-///   - `timer_arm` and `timer_disarm`, when a process changes what it owes;
-///   - `end_process`, whose teardown frees a dying process's Timers.
-///
-/// A funnel rather than a rule repeated per caller, because the question it
-/// answers — what is the earliest thing this kernel owes anybody — has to be
-/// asked over the WHOLE schedule every time, and a caller that programmed only
-/// its own deadline would silently push somebody else's out.
-func reprogram_timer() unsafe {
-    var next = NEVER_NS
-    if TICK_PERIOD_NS != 0 && NEXT_TICK_NS < next {
-        next = NEXT_TICK_NS
-    }
-    next = earliest_timer_deadline(next)
-
-    if next == NEVER_NS {
-        hal.timer_set_deadline_ns(NEVER_NS)
-        return
-    }
-    let floor = hal.timer_now_ns() + TIMER_MIN_LEAD_NS
-    hal.timer_set_deadline_ns(if next < floor { floor } else { next })
 }
 
 /// THE TIMER INTERRUPT — the arch-free landing point for the one comparator.
@@ -3255,7 +1967,6 @@ func on_timer_tick(pc: UInt) unsafe {
 /// kernel was idle, so there is no interrupted address, and zero is the honest
 /// answer rather than a stale one.
 static IDLE_PC: UInt = 0
-
 
 /// A DEVICE INTERRUPT — the arch-free landing point for an external line, and
 /// spec §9's delivery in five lines.
@@ -3421,7 +2132,6 @@ func idle_until_runnable() unsafe {
 /// needs to see. (`write_hex` prints a machine word, which on the profile that
 /// can raise this is 32 bits wide.)
 static HIGH_HALF_SHIFT: Int = 32
-
 
 // =============================================================================
 // The sosimg loader (design 140 unit B; spec §6, §7, §12)

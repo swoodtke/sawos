@@ -1,0 +1,404 @@
+//! CLOCKS, TIMERS, AND THE ONE HARDWARE COMPARATOR (spec §2 table; design 232
+//! unit 1): the slabs, a Timer's own verbs, and the funnel that programs the
+//! machine.
+//!
+//! WHAT COMES DUE IS NOT HERE. Expiring a deadline wakes a waiter, so it sits
+//! above the wait machinery in `irq`; what is left here is everything that can
+//! be said about a schedule without delivering anything — which is also why the
+//! teardown in `process` can reprogram the comparator without importing the
+//! interrupt path.
+
+import hal
+import sosabi.{ClockType}
+import kcore.limits.{CLOCK_KINDS, MAX_TIMERS, NO_TIMER}
+import kcore.objects.{SlotState}
+
+/// One Clock (spec §2 table; design 232 unit 1, amended Aug 17): a GRANTED TIME
+/// SOURCE, and a KERNEL-ETERNAL one.
+///
+/// IT HOLDS NO TIME AND NO OWNER. The machine's counter is the clock
+/// (`hal.timer_now_ns`) and this slot records only WHICH DOMAIN it names, so two
+/// processes' Clocks cannot drift apart — there is nothing here to drift, and
+/// nothing that belongs to anybody. That is why the object outlives every
+/// process: a slot with no per-process state has nothing a teardown could
+/// reclaim, and one object per domain is what stops two names existing for one
+/// counter (§3's no-duplicate rule).
+///
+/// What the object buys is still the capability: a process that was never
+/// granted a handle cannot read the counter at all, which is what makes handing
+/// a child a VIRTUAL clock later a substitution rather than a redesign. The
+/// virtual one will be a different animal — created, stateful, owned — and it
+/// gets its own slab when it lands.
+///
+/// `kind` IS ALSO THE SLOT'S INDEX, and it is stored anyway because it is what
+/// `clock_now` dispatches on: the domain decides what reading the object
+/// answers with, and a second domain should fail to compile until somebody says
+/// what its reading is.
+public struct ClockSlot {
+    /// The domain this clock answers in, for the life of the machine. `public`
+    /// because `Clock.Now` dispatches on it, and the ops are their own module
+    /// since the split.
+    public kind: ClockType,
+}
+
+/// One Timer (spec §2 table; design 232 unit 1): a deadline on a Clock.
+///
+/// `fires` IS THE OBJECT, exactly as an Event's word and an Interrupt's
+/// `pending` are: non-zero means ready, and that is the whole of what a Waiter
+/// looks at. Readiness is level-triggered by the same absence — nothing records
+/// that a waiter has been told, so the count is simply there until a wait
+/// consumes it.
+///
+/// `deadline_ns` IS THE NEXT FIRE, NOT THE LAST ONE, and it is what makes the
+/// re-arm drift-free: `fire_timer` advances it by whole intervals from ITSELF
+/// rather than from the clock, so a fire the kernel was late for shortens the
+/// next gap instead of pushing every later one out. That is the timerfd model
+/// and it is the reason this field is absolute rather than a remaining count.
+///
+/// `clock` binds the Timer to the Clock that made it, for the object's whole
+/// life (the M3 time notes: the timer binds its clock at creation). Today every
+/// Clock reads one counter, so the binding costs nothing and decides nothing;
+/// it exists because a second domain — or a virtual clock — makes "which time
+/// is this deadline measured in" a real question, and a Timer that could be
+/// re-pointed would answer it differently over its life.
+///
+/// WHAT YOU CAN DO TO ONE lives in this type's extension, down beside the ops
+/// that call it: `arm`, `disarm`, `is_due`, `sooner_of`, `fire`. Those are safe
+/// functions, and the `unsafe` on the ops around them is the SLAB's rather than
+/// the timer's.
+public struct TimerSlot {
+    public state: SlotState,
+    public process: Int,
+    /// The Clock slot this timer measures against, for its life.
+    public clock: Int,
+    /// Whether a deadline is scheduled. A one-shot clears this when it fires.
+    public armed: Bool,
+    /// The absolute deadline of the NEXT fire, in the clock's nanoseconds.
+    public deadline_ns: UInt64,
+    /// The re-arm period; 0 is a ONE-SHOT.
+    public interval_ns: UInt64,
+    /// Fires not yet delivered to a waiter. Non-zero = ready. Saturates.
+    ///
+    /// `public` because READINESS IS ASKED FROM THE WAIT SIDE: the per-kind
+    /// matrix in `waitables` reads this to answer "is this waitable ready" and
+    /// "what does its record say", and since the split that is another module.
+    public fires: UInt,
+    /// The attachment naming this timer (slot + 1); 0 = unattached.
+    ///
+    /// `public` to the same reader: who is watching me is one of the matrix's
+    /// five questions, and it both reads and clears this.
+    public attachment: Int,
+}
+
+/// The machine's clocks, one per domain, LIVE FROM BOOT. There is no `Free`
+/// state and no allocation step: the table is the domain list written down, and
+/// `clock_slot` is the only thing that indexes it.
+public unsafe static var CLOCKS: [ClockSlot; CLOCK_KINDS] = [
+    ClockSlot(kind: ClockType.Monotonic); CLOCK_KINDS]
+
+/// The slot naming `kind`'s clock — the whole of the lookup, because THE SLOT IS
+/// THE ORDINAL. `ClockType`'s raw values start at zero and are dense by
+/// construction (design 145's wire idiom numbers them), so the domain and its
+/// row are one fact rather than two kept in step.
+public func clock_slot(kind: ClockType) -> Int {
+    (kind as UInt) as Int
+}
+
+public unsafe static var TIMERS: [TimerSlot; MAX_TIMERS] = [
+    TimerSlot(state: SlotState.Free, process: 0, clock: 0, armed: false,
+              deadline_ns: 0, interval_ns: 0, fires: 0,
+              attachment: 0); MAX_TIMERS]
+
+// There is no `alloc_clock`. A Clock is kernel-eternal and its slot is its
+// domain's ordinal (`clock_slot`), so there is nothing to take and nothing to
+// run out of — `System.ClockGet` mints a HANDLE and never an object.
+
+/// Take a free timer slot, or `NO_TIMER` when the slab is empty.
+public func alloc_timer() unsafe -> Int {
+    var i: Int = 0
+    while i < MAX_TIMERS {
+        match TIMERS[i].state {
+            case Free -> { return i },
+            case Live -> {},
+        }
+        i = i + 1
+    }
+    NO_TIMER
+}
+
+/// Add without ever rolling through zero — §2.4's counting rule, and since
+/// design 232 unit 1 the Timer's fire count uses the same one.
+///
+/// IT IS SHARED RATHER THAN WRITTEN TWICE because the REASON is the same in both
+/// places, not merely the arithmetic: zero is what "not ready" means to a
+/// Waiter, so a count that wrapped would make a saturated Event or a busy Timer
+/// go quiet — the one failure mode a level-triggered notification must not have.
+/// `&+` is the wrapping add (Saw's overflow checks are always on, so a plain `+`
+/// would panic in the kernel), and the comparison after it is the carry.
+public func saturating_add(a: UInt, b: UInt) -> UInt {
+    let sum = a &+ b
+    if sum < a { UInt.max } else { sum }
+}
+
+/// Narrow a 64-bit fire count to a machine word, SATURATING rather than
+/// panicking.
+///
+/// A checked `as` would be a panic edge in the kernel on a number a PROCESS
+/// chose — arm a one-nanosecond interval, wait long enough, and the coalesced
+/// count exceeds a 32-bit word on Profile A. Saturating is the same answer the
+/// count already gives at its own ceiling, so nothing new has to be explained
+/// to a reader of the payload.
+func fires_word(n: UInt64) -> UInt {
+    if n > (UInt.max as UInt64) { UInt.max } else { n as UInt }
+}
+
+// -----------------------------------------------------------------------------
+// A TIMER'S OWN VERBS (ruled Aug 17, user; design 212's extraction idiom)
+// -----------------------------------------------------------------------------
+//
+// EVERY MULTI-FIELD OPERATION ON A TIMER IS A METHOD ON THE SLOT, and the ops
+// below index the slab and call one — `TIMERS[slot].fire(now)` where there used
+// to be five `TIMERS[slot].<field>` fetches in a row. Design 212's rule (a
+// 2+-hop chain spelled three times wants extraction) with a RECEIVER rather than
+// a reference parameter, because a slot is a type and these are its verbs.
+//
+// AND THE `unsafe` EFFECT RETREATS TO THE CALL SITES. `TIMERS` is an
+// `unsafe static var`, so every function that NAMES it is declared `unsafe`
+// (design 130/136) — but `TimerSlot` is an ordinary safe type, so a body working
+// through `self` names nothing unsafe and is a SAFE function. What is left
+// inside an unsafe body is the indexing, which is where the compound global
+// state actually is; the arithmetic a reviewer most wants to check is now
+// outside it, and the compiler agrees rather than being asked to take it on
+// trust.
+//
+// A SINGLE FIELD ACCESS IS LEFT ALONE (`TIMERS[t].armed` in the idle rule, the
+// whole-slot writes in `timer_create` and teardown): wrapping one load in a
+// method buys a name for something that already had one.
+
+extension TimerSlot {
+    /// Replace this timer's whole schedule: fire at `deadline`, then every
+    /// `interval` nanoseconds (0 being a one-shot).
+    ///
+    /// **ARMING REPLACES, AND IT IS NOT AN ERROR** (pinned here, design 232 unit
+    /// 1). Arming a timer that is already armed discards the old schedule
+    /// wholesale — new deadline, new interval — AND CLEARS THE FIRE COUNT,
+    /// because a count carried forward would be owed against a schedule the
+    /// caller just threw away. It is deliberately not a fault: re-arming a
+    /// running timer is the ordinary way to change a timeout, which is the shape
+    /// M4's select-with-timeout is made of, and refusing it would make the
+    /// common idiom unwritable.
+    public func arm(&var self, deadline: UInt64, interval: UInt64) {
+        self.armed = true
+        self.deadline_ns = deadline
+        self.interval_ns = interval
+        self.fires = 0
+    }
+
+    /// This timer is off and owes nothing.
+    ///
+    /// It clears the FIRE COUNT as well as the schedule, which is what makes it
+    /// a clean cancel: a caller who wants the fires reads them with a wait
+    /// first. Why disarming an UNARMED timer is a no-op rather than a fault is
+    /// `timer_disarm`'s business, since that is the question the OP answers.
+    public func disarm(&var self) {
+        // The `u64` suffixes are owed to DF-232a and should come off when it
+        // closes: a bare literal does NOT adopt the expected fixed-width type in
+        // plain assignment position (it does in an annotation, a struct literal
+        // and a compound assignment), and on a 32-bit profile the mismatch is an
+        // INTERNAL COMPILER ERROR rather than a diagnostic. The suffix is the
+        // documented spelling for a literal no expected type reaches, which is
+        // exactly what these are until the gap is fixed.
+        self.armed = false
+        self.deadline_ns = 0u64
+        self.interval_ns = 0u64
+        self.fires = 0
+    }
+
+    /// Has this timer come due by `now`? An unarmed one never has.
+    public func is_due(&self, now: UInt64) -> Bool {
+        self.armed && self.deadline_ns <= now
+    }
+
+    /// The SOONER of `deadline` and this timer's own — the fold
+    /// `earliest_timer_deadline` is written as. An unarmed timer answers
+    /// `deadline` unchanged, because a schedule nobody wrote is not a deadline
+    /// the hardware has to be programmed for.
+    func sooner_of(&self, deadline: UInt64) -> UInt64 {
+        if self.armed && self.deadline_ns < deadline { self.deadline_ns } else { deadline }
+    }
+
+    /// This timer came due: count the fire, and re-arm it if it is periodic.
+    ///
+    /// **DRIFT-FREE, AND THE ARITHMETIC IS WHERE THAT LIVES.** The next deadline
+    /// is measured from THIS DEADLINE, never from `now` — so a fire the kernel
+    /// was late for shortens the next gap instead of pushing every later one
+    /// out, and a timer armed at 1 ms is still on the millisecond a thousand
+    /// fires later. That is the timerfd model, and it is the exact OPPOSITE of
+    /// the scheduler tick's rule (`on_timer_interrupt` measures from now)
+    /// because the two want opposite things: a timeslice has no history to be
+    /// faithful to, and an interval does.
+    ///
+    /// **MISSED FIRES COALESCE, BY DIVISION RATHER THAN BY A LOOP.** A consumer
+    /// that was descheduled across several periods gets ONE wake carrying HOW
+    /// MANY, which is what stops it either falling permanently behind a queue of
+    /// fires or silently losing them. Computing the count with a division rather
+    /// than advancing the deadline in a `while` is what keeps this bounded: an
+    /// interval far shorter than the machine can serve costs one divide, not a
+    /// spin — so there is no long loop here for design 232 unit 1.5's preemption
+    /// points to have to cover, and no minimum interval anyone has to invent.
+    public func fire(&var self, now: UInt64) {
+        let interval = self.interval_ns
+        if interval == 0 {
+            // A ONE-SHOT DISARMS ITSELF. There is no schedule left, so the
+            // object goes quiet after one fire and a later `disarm` finds
+            // nothing to do — which is exactly the race `timer_disarm`
+            // documents.
+            self.armed = false
+            self.fires = saturating_add(self.fires, 1)
+        } else {
+            let late = now - self.deadline_ns
+            let missed = (late / interval) + 1
+            // The PRODUCT cannot overflow: when `interval` exceeds `late`,
+            // `missed` is 1 and the product is the interval itself; otherwise
+            // `missed` is bounded by `late / interval`, so the product is at
+            // most `late + interval` with both terms real times.
+            let step = missed * interval
+            // The SUM can, and a process chose the number that makes it — an
+            // interval near the end of time pushes the next deadline past it.
+            // Saw's overflow checks are always on, so an unguarded `+` here
+            // would PANIC THE KERNEL on a value userspace picked, which is a
+            // denial of service wearing an arithmetic bug's clothes. Saturating
+            // is also the honest answer: a deadline past the end of time is one
+            // nothing will see fire.
+            let base = self.deadline_ns
+            self.deadline_ns = if step > NEVER_NS - base { NEVER_NS } else { base + step }
+            self.fires = saturating_add(self.fires, fires_word(missed))
+        }
+    }
+}
+
+/// The earliest deadline any armed Timer is waiting on, or `soonest` if none is
+/// sooner. The Timer half of `reprogram_timer`'s question.
+func earliest_timer_deadline(soonest: UInt64) unsafe -> UInt64 {
+    var next = soonest
+    var i: Int = 0
+    while i < MAX_TIMERS {
+        match TIMERS[i].state {
+            case Live -> { next = TIMERS[i].sooner_of(next) },
+            case Free -> {},
+        }
+        i = i + 1
+    }
+    next
+}
+
+// -----------------------------------------------------------------------------
+// ONE HARDWARE TIMER, TWO CUSTOMERS (design 232 unit 1)
+// -----------------------------------------------------------------------------
+//
+// Both machines have exactly ONE comparator, and from this unit onward two
+// things want it: the SCHEDULER TICK (spec §7's timeslice) and the TIMER OBJECTS
+// (spec §2's row) a process arms. The composition is here, arch-free, and it is
+// the whole of the mechanism:
+//
+//   the kernel keeps every deadline it owes in nanoseconds — the next tick in
+//   `NEXT_TICK_NS`, each armed Timer's in its own slot — and programs the
+//   hardware with the EARLIEST of them. A fire means "something MAY be due":
+//   the handler asks what actually is, services it, and programs the next
+//   earliest. Nothing else touches the comparator.
+//
+// THE TICK IS INVIOLATE, and this arrangement is what keeps it so rather than a
+// promise beside it. A Timer deadline can only ever move the hardware EARLIER
+// than the tick, never later, so the tick's cadence is unchanged by any number
+// of Timers — a fire that turns out to be a Timer's still checks the tick, and
+// a tick that comes due while a Timer is being serviced is taken in the same
+// pass. There is no ordering between the two customers to get wrong, because
+// both are read out of the same `now`.
+//
+// WHY THE PERIOD MOVED OUT OF THE HAL. M2's seam was `timer_start(period_us)` +
+// `timer_rearm()`, which can express exactly one periodic customer — the period
+// lived in each HAL and the rearm was the only way to program anything. The
+// seam is now `timer_now_ns()` + `timer_set_deadline_ns(at)`, which is hardware
+// and nothing else, and the tick's PERIOD is scheduler policy, so it lives
+// where the scheduler does.
+
+/// Nanoseconds in a microsecond — the unit `start_tick` is written in and the
+/// unit `Clock`/`Timer` speak.
+static NS_PER_US: UInt64 = 1000
+
+/// The deadline that means "nothing is due" — far enough out that no machine
+/// this kernel runs on reaches it. It is a VALUE rather than an absence so that
+/// `reprogram_timer` has one code path: an empty schedule programs `never`,
+/// which is what stops a level-triggered comparator left in the past from
+/// re-firing forever.
+public static NEVER_NS: UInt64 = UInt64.max
+
+/// How far ahead of NOW the hardware is ever programmed.
+///
+/// THIS IS WHAT TURNS A TOO-FAST SCHEDULE INTO COALESCING INSTEAD OF A LIVELOCK,
+/// and it is the one place the machine's own limits appear in the Timer's
+/// semantics. A process may arm a one-nanosecond interval; without a floor the
+/// comparator would be due again before the trap returned, and the machine would
+/// live in the trap handler making no user-mode progress. With one, the fire
+/// arrives at most this often and the intervening expiries COALESCE into the
+/// fire count — which is exactly what coalescing is for, so nothing has to be
+/// refused and no minimum interval has to be invented.
+///
+/// The LOGICAL schedule is untouched by it: a Timer's next deadline is still
+/// `previous + interval` (drift-free), so lateness never accumulates and a
+/// one-shot still reports exactly one fire. What the floor bounds is the
+/// RESOLUTION, and 50 microseconds is two orders of magnitude below the
+/// millisecond scheduler tick, so §7's cadence never notices it.
+static TIMER_MIN_LEAD_NS: UInt64 = 50_000
+
+/// The scheduler tick's period in nanoseconds; 0 means NO PERIODIC TICK.
+///
+/// Zero is the real kernel's state (`sos/kernel/main.saw` arms none — the
+/// scheduler works without one, and a tick would narrate over the process for
+/// its first few ticks, see `Console`'s handover protocol). It is a state the
+/// composition has to carry rather than an edge case, because a kernel with no
+/// tick and one armed Timer is exactly the shape a sleeping process makes.
+public unsafe static var TICK_PERIOD_NS: UInt64 = 0
+
+/// When the next scheduler tick is due, on the same clock every deadline uses.
+public unsafe static var NEXT_TICK_NS: UInt64 = 0
+
+/// Start the periodic scheduler tick (spec §7's fixed timeslice).
+///
+/// ARCH-FREE, and that is the move this unit made: the PERIOD is scheduler
+/// policy and belongs beside the scheduler, while the hardware — a counter and
+/// a comparator — is all the HAL still owns. The harness kernels that want a
+/// preemptive machine call this instead of the HAL's retired `timer_start`.
+public func start_tick(period_us: UInt) unsafe {
+    TICK_PERIOD_NS = (period_us as UInt64) * NS_PER_US
+    NEXT_TICK_NS = hal.timer_now_ns() + TICK_PERIOD_NS
+    reprogram_timer()
+}
+
+/// THE ONE PLACE THE HARDWARE COMPARATOR IS PROGRAMMED (obligation 1).
+///
+/// Its entry points, all of them:
+///
+///   - `start_tick`, when a kernel decides to be preemptive;
+///   - `on_timer_interrupt`, after servicing whatever came due;
+///   - `timer_arm` and `timer_disarm`, when a process changes what it owes;
+///   - `end_process`, whose teardown frees a dying process's Timers.
+///
+/// A funnel rather than a rule repeated per caller, because the question it
+/// answers — what is the earliest thing this kernel owes anybody — has to be
+/// asked over the WHOLE schedule every time, and a caller that programmed only
+/// its own deadline would silently push somebody else's out.
+public func reprogram_timer() unsafe {
+    var next = NEVER_NS
+    if TICK_PERIOD_NS != 0 && NEXT_TICK_NS < next {
+        next = NEXT_TICK_NS
+    }
+    next = earliest_timer_deadline(next)
+
+    if next == NEVER_NS {
+        hal.timer_set_deadline_ns(NEVER_NS)
+        return
+    }
+    let floor = hal.timer_now_ns() + TIMER_MIN_LEAD_NS
+    hal.timer_set_deadline_ns(if next < floor { floor } else { next })
+}

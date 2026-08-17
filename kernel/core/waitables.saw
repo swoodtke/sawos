@@ -1,0 +1,489 @@
+//! EVENTS, WAITERS AND ATTACHMENTS (spec §2.2, §2.4; design 178 D5) — the
+//! slabs, and THE PER-KIND MATRIX in one place.
+//!
+//! Between them the whole of asynchronous notification: an Event is a word that
+//! accumulates and never blocks, a Waiter is a set of waitables plus the threads
+//! parked on the set, and an Attachment is the pair.
+//!
+//! THE DELIVERY IS NOT HERE (`wake`), and the split is the module order rather
+//! than a preference: answering a wait writes into a process's memory, which is
+//! the copy door in `process`, which tears a process down, which frees these
+//! slabs. So the tables and the questions asked OF them stay below the teardown,
+//! and the act of telling somebody stays above it.
+
+import sosabi.{EventMode, WaitTag}
+import kcore.limits.{
+    MAX_ATTACHMENTS,
+    MAX_EVENTS,
+    MAX_INTERRUPTS,
+    MAX_WAITERS,
+    NO_ATTACHMENT,
+    NO_EVENT,
+    NO_INTERRUPT,
+    NO_WAITER,
+}
+import kcore.objects.{SlotState}
+import kcore.threads.{NEED_RESCHED, THREADS, ThreadState}
+import kcore.time.{TIMERS, saturating_add}
+
+/// WHICH KINDS CAN BE ATTACHED TO A WAITER — the waitable kinds, and only
+/// those.
+///
+/// It is a SECOND enum beside `ObjType` rather than a `Bool` on it, and the
+/// reason is the same one `sosabi` gives for not recording waitability there at
+/// all: attaching also spends a RIGHT, and which enum's bits that right lives in
+/// is decided by the kind. `waitable_slot` is where an `ObjType` becomes one of
+/// these, and it is the only place — every non-waitable arm of that match
+/// terminates the process instead of producing a value.
+///
+/// What this enum buys downstream is that the four per-kind questions below are
+/// EXHAUSTIVE OVER WAITABLES rather than over object types: a fifth object kind
+/// that is not waitable costs them nothing, and a fifth WAITABLE kind fails all
+/// four to compile until somebody answers for it.
+public enum WaitableKind: UInt8 {
+    case Event = 0,
+    case Interrupt = 1,
+    case Timer = 2,
+}
+
+/// A waitable the dispatch has resolved: which table, which slot.
+public struct Waitable {
+    public kind: WaitableKind,
+    public slot: Int,
+}
+
+/// One Event (spec §2.4): the accumulating non-blocking notification.
+///
+/// `word` IS the object. Non-zero means ready, which is what makes readiness
+/// LEVEL-TRIGGERED for free (§2.2) — nothing records that a waiter has been
+/// told, so every look at the word gives the same answer until somebody TAKES
+/// it. There is no edge to lose because there is no edge.
+///
+/// TAKING IT IS READ-AND-CLEAR THROUGH EITHER DOOR (ruled Aug 17, user):
+/// §2.4's `Receive` is the non-blocking poll, a `Waiter.wait` delivery is the
+/// blocking one, and both hand the word to a process and reset it. So the word
+/// is never reported twice, and a signal arriving after a take re-arms this
+/// object with its own bits alone.
+///
+/// `attachment` is the ONE thing an Event knows about the wait side: which
+/// attachment names it, or zero. §2.2 ratifies at most one Waiter per handle,
+/// so that is a field rather than a list, and it is what makes `Signal`'s hot
+/// path one load. Everything else about the attachment — which Waiter, which
+/// key, what comes next on the list — lives in the attachment itself, because
+/// an Interrupt has the same field and neither kind should carry a copy of the
+/// wait machinery. Slot indices are stored PLUS ONE so that zero means "none",
+/// which is what a zeroed static already says.
+public struct EventSlot {
+    public state: SlotState,
+    public process: Int,
+    /// §2.4's per-Event accumulation mode, fixed at creation.
+    public mode: EventMode,
+    /// The accumulated word. Non-zero = ready.
+    public word: UInt,
+    /// The attachment naming this event (slot + 1); 0 = unattached.
+    public attachment: Int,
+}
+
+/// One Interrupt (spec §2 table, §9): an IRQ line bound to a waitable.
+///
+/// `pending` IS the object, exactly as an Event's word is: it is set when the
+/// line fires and cleared by `Ack`, and "ready" means nothing more than that.
+/// §9's at-most-one-unacked-fire invariant is therefore not maintained, it is
+/// REPRESENTED — a `Bool` cannot hold two — and what makes it true rather than
+/// merely representable is that the kernel MASKS the line before the hook runs
+/// and only `Ack` unmasks it, so the device physically cannot fire again in
+/// between.
+///
+/// `line` is the number the controller answers with, and it is what makes an
+/// Interrupt findable from the trap path: the hook has a line and needs the
+/// object. A table scan is what answers that, which at this slab size is a
+/// handful of loads and is bounded by the same argument every other scan in the
+/// interrupt path is (design 178 D2 — it runs with interrupts masked, so its
+/// length is interrupt latency).
+public struct InterruptSlot {
+    public state: SlotState,
+    public process: Int,
+    /// The IRQ line this object is bound to, for its whole life.
+    public line: UInt,
+    /// Fired and not yet acked. Non-false = ready, in §2.2's sense.
+    public pending: Bool,
+    /// The attachment naming this interrupt (slot + 1); 0 = unattached.
+    public attachment: Int,
+}
+
+/// One Waiter (spec §2.2): the generic wait aggregator.
+///
+/// TWO LISTS AND NOTHING ELSE. `attached` is the persistent subscription set —
+/// §2.2 has no one-shot mode, so an attachment is removed and never consumed —
+/// and `blocked` is the threads parked in `Wait`, which §2.2 allows to be
+/// several. Readiness is NOT a third list: it is derived by scanning `attached`
+/// for something ready, which is the level-triggered semantics stated as an
+/// implementation rather than maintained beside one.
+public struct WaiterSlot {
+    public state: SlotState,
+    public process: Int,
+    /// Head of the attachment list (attachment slot + 1).
+    public attached: Int,
+    /// Head of the list of threads parked in `Wait` (thread slot + 1).
+    public blocked: Int,
+}
+
+/// ONE ATTACHMENT: a Waiter, a waitable, and the key that names the pair.
+///
+/// IT IS A THIRD OBJECT RATHER THAN FIELDS ON THE WAITABLE, and the second
+/// waitable kind is what forced that (M2 unit 3 kept them on the Event). A
+/// Waiter's set has to be ONE list — a wait scans it once and a `Remove` walks
+/// it once — so a per-kind list would make both operations a matrix over kinds
+/// instead of a walk, and rider 4's "the same walk, and therefore one place to
+/// be wrong" would stop being true at exactly two kinds.
+///
+/// What each waitable still keeps is a single `attachment` field, which is the
+/// answer to the only question the SIGNAL side asks: who, if anyone, is
+/// watching me.
+public struct Attachment {
+    public state: SlotState,
+    /// Which table `target` indexes.
+    public kind: WaitableKind,
+    /// The waitable's slot in that table.
+    public target: Int,
+    /// The Waiter this attachment belongs to (slot index, 0-based).
+    public waiter: Int,
+    /// The word-sized key the attacher supplied (§2.2). The kernel stores it
+    /// and hands it back; it never interprets it.
+    public key: UInt,
+    /// Next attachment on that waiter's list (slot + 1).
+    public link: Int,
+}
+
+public unsafe static var EVENTS: [EventSlot; MAX_EVENTS] = [
+    EventSlot(state: SlotState.Free, process: 0, mode: EventMode.Or, word: 0,
+              attachment: 0); MAX_EVENTS]
+
+public unsafe static var WAITERS: [WaiterSlot; MAX_WAITERS] = [
+    WaiterSlot(state: SlotState.Free, process: 0, attached: 0,
+               blocked: 0); MAX_WAITERS]
+
+public unsafe static var INTERRUPTS: [InterruptSlot; MAX_INTERRUPTS] = [
+    InterruptSlot(state: SlotState.Free, process: 0, line: 0, pending: false,
+                  attachment: 0); MAX_INTERRUPTS]
+
+public unsafe static var ATTACHMENTS: [Attachment; MAX_ATTACHMENTS] = [
+    Attachment(state: SlotState.Free, kind: WaitableKind.Event, target: 0,
+               waiter: 0, key: 0, link: 0); MAX_ATTACHMENTS]
+
+/// Take a free event slot, or `NO_EVENT` when the slab is empty.
+public func alloc_event() unsafe -> Int {
+    var i: Int = 0
+    while i < MAX_EVENTS {
+        match EVENTS[i].state {
+            case Free -> { return i },
+            case Live -> {},
+        }
+        i = i + 1
+    }
+    NO_EVENT
+}
+
+/// Take a free waiter slot, or `NO_WAITER` when the slab is empty.
+public func alloc_waiter() unsafe -> Int {
+    var i: Int = 0
+    while i < MAX_WAITERS {
+        match WAITERS[i].state {
+            case Free -> { return i },
+            case Live -> {},
+        }
+        i = i + 1
+    }
+    NO_WAITER
+}
+
+/// Take a free interrupt slot, or `NO_INTERRUPT` when the slab is empty.
+public func alloc_interrupt() unsafe -> Int {
+    var i: Int = 0
+    while i < MAX_INTERRUPTS {
+        match INTERRUPTS[i].state {
+            case Free -> { return i },
+            case Live -> {},
+        }
+        i = i + 1
+    }
+    NO_INTERRUPT
+}
+
+/// Take a free attachment slot, or `NO_ATTACHMENT` when the slab is empty.
+public func alloc_attachment() unsafe -> Int {
+    var i: Int = 0
+    while i < MAX_ATTACHMENTS {
+        match ATTACHMENTS[i].state {
+            case Free -> { return i },
+            case Live -> {},
+        }
+        i = i + 1
+    }
+    NO_ATTACHMENT
+}
+
+// -----------------------------------------------------------------------------
+// Events and Waiters (spec §2.2, §2.4; design 178 D5)
+// -----------------------------------------------------------------------------
+//
+// THE TWO SMALLEST OBJECTS IN THE §2 TABLE, and between them the whole of
+// asynchronous notification: an Event is a word that accumulates and never
+// blocks, a Waiter is a set of them plus the threads parked on the set. They
+// are here rather than in M3 because they are what proves the handle machinery
+// generalizes past the singleton — three kinds became five with no change to
+// the dispatch's shape, which is the claim §3 has been making since M1.
+//
+// LEVEL-TRIGGERED IS AN ABSENCE, NOT A MECHANISM (§2.2, ratified Jul 29). The
+// kernel records nowhere that a waiter has been told about a ready event, so
+// every look at the attachment set gives the same answer until somebody TAKES
+// the word. That is what makes a signal landing BEFORE anyone waits safe: the
+// word is still non-zero when the wait arrives, and the scan finds it. An
+// edge-triggered design would need a "reported" flag per attachment and would
+// lose exactly that.
+//
+// THE TAKE HAS TWO DOORS, AND BOTH CONSUME (ruled Aug 17, user). `Receive` is
+// the non-blocking poll and a `Waiter.wait` is the blocking one; each hands the
+// accumulated word to a process, so each clears it. A delivery that left the
+// word behind would report the same bits to the next wait as well, and the
+// recipient could not tell that duplicate from a real second signal — the one
+// failure mode a notification must not have. Nothing is lost either way: a
+// signal that lands after the take re-arms readiness with its own bits alone.
+//
+// WHAT WAKES WHOM, and it is a DISTRIBUTION rather than a broadcast. `Signal`
+// wakes AT MOST ONE parked thread (§2.2: "a ready handle wakes one waiter"),
+// and that thread's record carries the word — so with several threads parked on
+// one Waiter, one signal feeds exactly one of them and the rest wait for the
+// next, which is the worker-pool shape §2.2 exists for. THE RECIPIENT IS UNIQUE
+// BY CONSTRUCTION and no multi-watcher caveat is owed: a waitable has at most
+// ONE attachment (§2.2), so a signal reaches exactly one Waiter, which hands it
+// to exactly one thread.
+
+/// §2.4's accumulation, both modes.
+///
+/// THE SUM SATURATES RATHER THAN WRAPPING, which is the half of §2.4 that is a
+/// correctness requirement rather than a convenience: a producer faster than
+/// its consumer must not roll a full count back through zero, because zero is
+/// what "not ready" means — a wrap would make a saturated event go quiet.
+/// `&+` is the wrapping add (Saw's overflow checks are always on, so a plain
+/// `+` would panic in the kernel), and the comparison after it is the carry.
+public func accumulate(slot: Int, bits: UInt) unsafe {
+    match EVENTS[slot].mode {
+        case Or -> {
+            EVENTS[slot].word = EVENTS[slot].word | bits
+        },
+        case SaturatingSum -> {
+            EVENTS[slot].word = saturating_add(EVENTS[slot].word, bits)
+        },
+    }
+}
+
+// -----------------------------------------------------------------------------
+// THE PER-KIND MATRIX: four questions, one arm per waitable kind (obligation 1)
+// -----------------------------------------------------------------------------
+//
+// Everything the wait machinery needs to know about a waitable is one of these
+// five questions, and each is answered by an EXHAUSTIVE match on
+// `WaitableKind`:
+//
+//   `waitable_attachment` / `set_waitable_attachment`   who is watching me
+//   `waitable_ready`                                    am I ready
+//   `waitable_answer`                                   what does a record say
+//   `waitable_consume`                                  a record was delivered
+//
+// That is a MATRIX rather than a funnel because the answers genuinely differ
+// per kind — an Event's readiness is a word, an Interrupt's is a masked line and
+// a Timer's is a count of expiries — and it is written as five small functions
+// in one place so the matrix is READABLE AS ONE. Adding a fourth waitable kind
+// fails all five to compile, which is the property a `_` arm anywhere here would
+// destroy. (The Timer, design 232 unit 1's third kind, is what added the fifth
+// question and it added it to every existing row at once — which is the matrix
+// working.)
+//
+// Everything ELSE about waiting — the list walk, the key lookup, the wake, the
+// copy-out — is kind-blind and appears exactly once below.
+
+/// Which attachment names this waitable (slot + 1), or 0.
+public func waitable_attachment(kind: WaitableKind, slot: Int) unsafe -> Int {
+    match kind {
+        case Event -> EVENTS[slot].attachment,
+        case Interrupt -> INTERRUPTS[slot].attachment,
+        case Timer -> TIMERS[slot].attachment,
+    }
+}
+
+/// Record (or clear, with 0) which attachment names this waitable.
+public func set_waitable_attachment(kind: WaitableKind, slot: Int, a: Int) unsafe {
+    match kind {
+        case Event -> { EVENTS[slot].attachment = a },
+        case Interrupt -> { INTERRUPTS[slot].attachment = a },
+        case Timer -> { TIMERS[slot].attachment = a },
+    }
+}
+
+/// Is this waitable ready, in §2.2's level-triggered sense?
+///
+/// Every answer is a READ of the object's own state and none consults a flag
+/// the wait machinery maintains, which is what makes level-triggering an
+/// absence rather than a mechanism: an Event is ready while its word is
+/// non-zero, an Interrupt while its fire is unacked, a Timer while it has
+/// expiries nobody has been told about.
+public func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Bool {
+    match kind {
+        case Event -> EVENTS[slot].word != 0,
+        case Interrupt -> INTERRUPTS[slot].pending,
+        case Timer -> TIMERS[slot].fires != 0,
+    }
+}
+
+/// The tag and payload words a wait record carries for this waitable.
+public func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> WaitAnswer {
+    match kind {
+        case Event -> WaitAnswer(tag: WaitTag.Event, payload: EVENTS[slot].word),
+        case Interrupt -> WaitAnswer(tag: WaitTag.Interrupt,
+                                     payload: INTERRUPTS[slot].line),
+        case Timer -> WaitAnswer(tag: WaitTag.Timer,
+                                 payload: TIMERS[slot].fires),
+    }
+}
+
+/// A record describing this waitable HAS BEEN DELIVERED to a thread. Update
+/// whatever the delivery spent.
+///
+/// THE THREE ANSWERS, and the differences between them are real rather than
+/// accidents of how each object happens to be written:
+///
+///   - an EVENT's word is CONSUMED BY WHOEVER TAKES THE VALUE, through either
+///     door (ruled Aug 17, user). §2.4's `receive` is the non-blocking poll and
+///     a `Waiter.wait` is the blocking one; both hand the accumulated word to a
+///     process, so both clear it. A delivery that left the word behind would
+///     report the same bits to the next wait as well, which is a duplicate the
+///     recipient cannot tell from a real second signal.
+///   - an INTERRUPT's readiness is ended by the driver's `ack` and by nothing
+///     else (§9), because the line stays masked until the device has actually
+///     been serviced. The kernel cannot know that a record was enough.
+///   - a TIMER's fire count is SPENT by the delivery, because a Timer has no
+///     second op to drain with and needs none. It has no mask to hold and no
+///     device to service, so the fire has done its whole job once somebody has
+///     been told — which is the ack-free half of the timerfd model, and what
+///     makes a periodic timer a schedule rather than a request/response.
+///
+/// So the ODD KIND OUT IS THE INTERRUPT, and its emptiness says what it is: the
+/// only readiness in the system whose end is a DEVICE's business rather than the
+/// kernel's.
+public func waitable_consume(kind: WaitableKind, slot: Int) unsafe {
+    match kind {
+        // The take is READ-AND-CLEAR, and `deliver_attachment` is what makes it
+        // one act: the read happened a few lines earlier in the same
+        // interrupts-masked region, so no signal can land between the two and
+        // there are no bits here that the record did not carry.
+        case Event -> { EVENTS[slot].word = 0 },
+        case Interrupt -> {},
+        case Timer -> { TIMERS[slot].fires = 0 },
+    }
+}
+
+/// What `waitable_answer` produces: the two words that are not the key.
+struct WaitAnswer {
+    tag: WaitTag,
+    payload: UInt,
+}
+
+/// The first attachment of `w` whose waitable is ready, or `NO_ATTACHMENT`.
+///
+/// A SCAN, and that is the level-triggered semantics implemented rather than
+/// maintained: there is no ready QUEUE to keep in step with the objects, so a
+/// waitable that goes back to not-ready cannot leave a stale entry behind and
+/// one that stays ready is found again by the next scan. It is O(attachments),
+/// which at M2's slab sizes is a handful of loads and is bounded by the same
+/// argument the ready queue's is — this runs with interrupts masked, so its
+/// length is interrupt latency (design 178 D2), and a Waiter with hundreds of
+/// attachments is what an M3 ready-list optimisation would be for.
+public func waiter_ready_attachment(w: Int) unsafe -> Int {
+    var cur = WAITERS[w].attached
+    while cur != 0 {
+        let a = cur - 1
+        if waitable_ready(ATTACHMENTS[a].kind, ATTACHMENTS[a].target) {
+            return a
+        }
+        cur = ATTACHMENTS[a].link
+    }
+    NO_ATTACHMENT
+}
+
+/// Park the running thread on `w`'s blocked list, remembering where its record
+/// goes. `dst` has already been through `copy_out_check`.
+public func block_on_wait(slot: Int, w: Int, dst: UInt) unsafe {
+    THREADS[slot].state = ThreadState.Blocked
+    THREADS[slot].wait_buf = dst
+    THREADS[slot].link = WAITERS[w].blocked
+    WAITERS[w].blocked = slot + 1
+    NEED_RESCHED = true
+}
+
+/// The attachment on `w` under `key`, or `NO_ATTACHMENT`.
+///
+/// THE KEY IS THE ATTACHMENT'S NAME, which is what makes the attachment set a
+/// TABLE keyed by it rather than a bag: `Remove` names an attachment this way,
+/// and `Add` uses the same walk to refuse a duplicate. Both rest on keys being
+/// unique per Waiter, which is exactly why the duplicate is refused.
+public func attached_by_key(w: Int, key: UInt) unsafe -> Int {
+    var cur = WAITERS[w].attached
+    while cur != 0 {
+        let a = cur - 1
+        if ATTACHMENTS[a].key == key {
+            return a
+        }
+        cur = ATTACHMENTS[a].link
+    }
+    NO_ATTACHMENT
+}
+
+/// Take attachment `a` off waiter `w`'s list, clear the waitable's back
+/// pointer, and return the slot to the slab. The caller has established that it
+/// is on that list.
+public func detach_attachment(w: Int, a: Int) unsafe {
+    var prev: Int = 0
+    var cur = WAITERS[w].attached
+    while cur != 0 {
+        let slot = cur - 1
+        let next = ATTACHMENTS[slot].link
+        if slot == a {
+            if prev == 0 {
+                WAITERS[w].attached = next
+            } else {
+                ATTACHMENTS[prev - 1].link = next
+            }
+            set_waitable_attachment(ATTACHMENTS[a].kind, ATTACHMENTS[a].target, 0)
+            ATTACHMENTS[a] = Attachment(state: SlotState.Free,
+                                        kind: WaitableKind.Event, target: 0,
+                                        waiter: 0, key: 0, link: 0)
+            return
+        }
+        prev = cur
+        cur = next
+    }
+}
+
+/// The Interrupt bound to `line`, or `NO_INTERRUPT`.
+///
+/// A SCAN over four slots, and it is what turns the trap path's line number
+/// back into an object. Keeping a line -> slot map instead would be a second
+/// description of the same fact — the bindings are already in the table, and
+/// the table is the only place a line may be bound twice, which `interrupt_bind`
+/// refuses using exactly this walk.
+public func interrupt_by_line(line: UInt) unsafe -> Int {
+    var i: Int = 0
+    while i < MAX_INTERRUPTS {
+        match INTERRUPTS[i].state {
+            case Live -> {
+                if INTERRUPTS[i].line == line {
+                    return i
+                }
+            },
+            case Free -> {},
+        }
+        i = i + 1
+    }
+    NO_INTERRUPT
+}

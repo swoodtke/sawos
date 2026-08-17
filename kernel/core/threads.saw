@@ -1,0 +1,225 @@
+//! THE THREAD TABLE, THE FRAME ARENA AND THE READY QUEUE — a thread's STATE,
+//! held below everything that acts on it.
+//!
+//! What is NOT here is the SWITCH (`sched`) and the exit (`sched` again,
+//! because retiring the last thread ends the process): this module is the
+//! storage and the queue discipline, so the seams that wake a thread — a
+//! waiter's delivery, a timer's expiry — can push one onto the ready queue
+//! without reaching for the scheduler that will pick it up.
+
+import kcore.limits.{
+    FRAME_ARENA_WORDS,
+    MAX_THREADS,
+    NO_THREAD,
+    THREAD_FRAME_STRIDE,
+}
+import kcore.mem.{align_up}
+
+// =============================================================================
+// Processes, threads and the scheduler (design 178 D2/D3/D4; spec §2, §7, §8)
+// =============================================================================
+//
+// THE TRAP FRAME IS THE THREAD CONTEXT, and that one decision is most of this
+// unit. A thread's saved registers are the frame the HAL's trap entry writes on
+// the way in and reads on the way out; a thread SWITCH is therefore not a
+// separate save/restore at all — it is `ktrap` returning a DIFFERENT frame
+// address than it was called with. Entering user mode for the first time is the
+// same operation with a frame nothing has run in yet. Two seam calls carry the
+// whole of it: `hal.frame_init` builds a fresh context, `hal.resume_frame`
+// enters one, and the trap entry's ordinary return path does every switch after
+// that.
+//
+// WHERE A SWITCH CAN HAPPEN is design 178's D2, and the frame model is what
+// makes it free: the only place a frame address is chosen is the user-return
+// boundary, because that is the only place `ktrap` returns. The kernel is never
+// preempted, holds no lock, and has no half-saved context to protect — the
+// state a switch reads is a table, and the tick that motivates one only sets a
+// flag.
+//
+// THE PROTECTION-DOMAIN RELOAD IS NOT HERE, and its absence is deliberate
+// rather than forgotten (design 178 D4 + the M3 memory notes). Threads of one
+// process share one domain, so a same-process switch reloads nothing; the
+// reload belongs at exactly one point — `pick_next` below, where the outgoing
+// and incoming threads' PROCESSES are both in hand — and M3's per-process
+// region sets install it there and nowhere else. Whether that reload is a
+// register file or a table root is the HAL's business, which is why this
+// paragraph can say it without naming either.
+
+/// Every thread's saved context, back to back.
+///
+/// All-zero, so it costs no image bytes (design 149) — and a zeroed frame is
+/// also the right initial state, since `frame_init` only has to write the three
+/// or four words that are not zero.
+unsafe static var THREAD_FRAMES: [UInt64; FRAME_ARENA_WORDS] = [0; FRAME_ARENA_WORDS]
+
+/// The address of thread slot `index`'s frame.
+public func frame_slot(index: Int) unsafe -> UInt {
+    let stride = THREAD_FRAME_STRIDE as UInt
+    let base = align_up(((&var THREAD_FRAMES) as UnsafePointer<UInt64>) as UInt, stride)
+    base + (index as UInt) * stride
+}
+
+/// What a thread slot is doing (spec §8).
+///
+/// `Exited` is a state a slot STAYS IN rather than a transition to `Free`,
+/// because a join arriving after the exit must still find the exit code. The
+/// slot returns to the pool at process teardown; reaping it earlier needs a
+/// handle-close op, which M2 does not have — and without close, no slot is ever
+/// reused, which is also why handles carry no generation yet (§3's
+/// stale-handle detection has nothing to detect until a slot can be reused).
+public enum ThreadState: UInt8 {
+    case Free = 0,
+    case Created = 1,
+    case Runnable = 2,
+    case Running = 3,
+    case Blocked = 4,
+    case Exited = 5,
+}
+
+/// One thread (spec §2 table row).
+///
+/// `link` is the ONE list pointer a thread needs, because a thread is on at
+/// most one list at a time: the ready queue when it is runnable, or the joiner
+/// list of the thread it is waiting for when it is blocked. Slot indices are
+/// stored PLUS ONE so that zero means "no thread", which is what a zeroed
+/// static already says.
+public struct ThreadSlot {
+    /// `public` because PARKING A THREAD HAPPENS OUTSIDE THIS MODULE since the
+    /// split: `waitables` blocks one on a Waiter's list. The state machine is
+    /// still described here and nowhere else.
+    public state: ThreadState,
+    public process: Int,
+    /// This thread's own handle in its process's table — what `ThreadSelf`
+    /// hands back, kept here so the derivation is a read rather than a search.
+    public self_handle: UInt,
+    public exit_code: UInt,
+    /// Head of the list of threads blocked joining THIS one (slot + 1).
+    public joiners: Int,
+    /// Next slot on whichever list this thread is on (slot + 1). `public`: the
+    /// list a parked thread is on may be a Waiter's, which `waitables` owns.
+    public link: Int,
+    /// Where a thread parked in `Waiter.Wait` wants its record written — a user
+    /// address, ALREADY VALIDATED by `copy_out_check` at the call. Validating at
+    /// the call rather than at the wake is what makes a bad buffer terminate the
+    /// process that supplied it, while it is still the running one. `public`
+    /// because the wait side is what sets it, at the park.
+    public wait_buf: UInt,
+}
+
+public unsafe static var THREADS: [ThreadSlot; MAX_THREADS] = [
+    ThreadSlot(state: ThreadState.Free, process: 0, self_handle: 0,
+               exit_code: 0, joiners: 0, link: 0, wait_buf: 0); MAX_THREADS]
+
+/// The running thread's slot, or `NO_THREAD`.
+///
+/// It really is none before the first process exists, and it stays none for the
+/// harness kernels that enter user mode without one — those cases predate
+/// Thread objects and must go on working, which is what every `NO_THREAD` guard
+/// below is for. Compound global state on design 149's terms: uniprocessor
+/// kernel, interrupts taken from user mode only (D2), so the only writer is the
+/// trap path and nothing can interleave with it.
+public unsafe static var CURRENT_THREAD: Int = NO_THREAD
+
+/// The ready queue: a FIFO of runnable threads, head and tail as slot + 1.
+/// The RUNNING thread is not on it — round-robin is "put the outgoing thread
+/// at the tail, take the head", and both halves happen in `pick_next`.
+public unsafe static var READY_HEAD: Int = 0
+
+public unsafe static var READY_TAIL: Int = 0
+
+/// Set by the tick when a thread's slice runs out, and by `Yield`. Read and
+/// cleared at the user-return boundary, which is the only place it can act.
+public unsafe static var NEED_RESCHED: Bool = false
+
+/// Ticks left in the running thread's slice.
+public unsafe static var SLICE_LEFT: UInt = 0
+
+/// Ticks a thread runs before the timer takes the processor away (spec §7's
+/// fixed timeslice). ONE tick, because M2's tick period is already the unit the
+/// scheduler cares about and a longer slice would only make the preemption
+/// harness wait for it.
+public static SLICE_TICKS: UInt = 1
+
+// -----------------------------------------------------------------------------
+// The ready queue
+// -----------------------------------------------------------------------------
+
+public func ready_push(slot: Int) unsafe {
+    THREADS[slot].link = 0
+    if READY_TAIL == 0 {
+        READY_HEAD = slot + 1
+        READY_TAIL = slot + 1
+    } else {
+        THREADS[READY_TAIL - 1].link = slot + 1
+        READY_TAIL = slot + 1
+    }
+}
+
+public func ready_pop() unsafe -> Int {
+    if READY_HEAD == 0 {
+        return NO_THREAD
+    }
+    let slot = READY_HEAD - 1
+    READY_HEAD = THREADS[slot].link
+    if READY_HEAD == 0 {
+        READY_TAIL = 0
+    }
+    THREADS[slot].link = 0
+    slot
+}
+
+// -----------------------------------------------------------------------------
+// Allocation
+// -----------------------------------------------------------------------------
+
+/// Take a free thread slot, or `NO_THREAD` when the slab is empty.
+public func alloc_thread() unsafe -> Int {
+    var i: Int = 0
+    while i < MAX_THREADS {
+        match THREADS[i].state {
+            case Free -> { return i },
+            case _ -> {},
+        }
+        i = i + 1
+    }
+    NO_THREAD
+}
+
+// -----------------------------------------------------------------------------
+// Thread lifecycle
+// -----------------------------------------------------------------------------
+
+/// How many of a process's threads have not exited.
+public func live_threads(p: Int) unsafe -> Int {
+    var live: Int = 0
+    var i: Int = 0
+    while i < MAX_THREADS {
+        if THREADS[i].process == p {
+            match THREADS[i].state {
+                case Free -> {},
+                case Exited -> {},
+                case _ -> { live = live + 1 },
+            }
+        }
+        i = i + 1
+    }
+    live
+}
+
+/// Park the running thread on `target`'s joiner list.
+public func block_on_join(slot: Int, target: Int) unsafe {
+    THREADS[slot].state = ThreadState.Blocked
+    THREADS[slot].link = THREADS[target].joiners
+    THREADS[target].joiners = slot + 1
+    NEED_RESCHED = true
+}
+
+/// The calling process. In M2 that is the process of the running thread, and
+/// before there are threads it is the only process there is — the harness
+/// kernels that enter user mode with no object model still make syscalls.
+public func calling_process() unsafe -> Int {
+    if CURRENT_THREAD == NO_THREAD {
+        return 0
+    }
+    THREADS[CURRENT_THREAD].process
+}
