@@ -26,7 +26,7 @@ import sos.{System, Process, Thread}
 /// The boot handle, parked for the workers — and the witness that says which
 /// thread `_start` is running as (handle 0 names nothing, so a parked one is
 /// never 0). A worker DERIVES everything else off it: `System(boot_handle:)`
-/// -> `self_process()` -> `self_thread()`. See `thread-basics` for why every
+/// -> `process_self()` -> `thread_self()`. See `thread-basics` for why every
 /// thread of an image written in Saw enters at the same address (DF-178c).
 unsafe static var BOOT_HANDLE: UInt = 0
 
@@ -51,7 +51,7 @@ static ROUNDS: Int = 8
 /// a round that fits inside a slice would let a worker print several times
 /// before losing the processor, and the transcript would read as blocks rather
 /// than as alternation. Measured at 400 000 it did exactly that.
-static SPIN: Int = 1500000
+static SPIN: Int = 1_500_000
 static EXIT_A: UInt = 33
 static EXIT_B: UInt = 44
 
@@ -89,7 +89,7 @@ func burn(iterations: Int) unsafe {
     var x = BURN_SINK
     var i = 0
     while i < iterations {
-        x = (x &* 1664525) &+ 1013904223
+        x = (x &* 1_664_525) &+ 1_013_904_223
         i = i + 1
     }
     BURN_SINK = x
@@ -97,11 +97,11 @@ func burn(iterations: Int) unsafe {
 
 func worker(role: UInt) {
     let system = System(boot_handle: parked_boot_handle())
-    let proc = match system.self_process() {
+    let proc = match system.process_self() {
         case Ok(p) -> p,
         case Err(_) -> { return },
     }
-    let me = match proc.self_thread() {
+    let me = match proc.thread_self() {
         case Ok(t) -> t,
         case Err(_) -> { return },
     }
@@ -119,7 +119,7 @@ func initial(boot_handle: UInt) {
     park_boot_handle(boot_handle)
 
     let system = System(boot_handle: boot_handle)
-    let proc = match system.self_process() {
+    let proc = match system.process_self() {
         case Ok(p) -> p,
         case Err(_) -> {
             let _ = system.debug_print("SOS preempt: no process handle\n")
@@ -128,7 +128,7 @@ func initial(boot_handle: UInt) {
         },
     }
 
-    let a = match proc.create_thread(stack_top: stack_a_top(), arg: ROLE_A) {
+    let a = match proc.thread_create(stack_top: stack_a_top(), arg: ROLE_A) {
         case Ok(t) -> t,
         case Err(e) -> {
             print("SOS preempt: create failed: {}\n", e)
@@ -136,7 +136,7 @@ func initial(boot_handle: UInt) {
             return
         },
     }
-    let b = match proc.create_thread(stack_top: stack_b_top(), arg: ROLE_B) {
+    let b = match proc.thread_create(stack_top: stack_b_top(), arg: ROLE_B) {
         case Ok(t) -> t,
         case Err(e) -> {
             print("SOS preempt: create failed: {}\n", e)

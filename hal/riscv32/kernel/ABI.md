@@ -48,7 +48,7 @@ is four instructions and a branch into the trap entry's own restore path.
 | `is_interrupt(cause) -> Bool` | Is this trap an interrupt instead of either? Asked FIRST, because an interrupt is not the running program's business and its instruction has not run. |
 | `cause_tag(cause) -> String` | A short symbolic name for a raw trap cause; unmodelled codes get their own name rather than an arm. |
 | `trap_pc(frame) -> UInt` | Where the trapped context resumes: the faulting instruction on a fault, the interrupted one on an interrupt. (Was `fault_pc`; the value never was fault-specific.) |
-| `syscall_handle/op/arg0/arg1/arg2(frame) -> UInt` | The §5.7 argument registers, by role rather than by name. Three argument slots since design 178 M2 unit 2: `Process.CreateThread` takes an entry, a stack and an argument. |
+| `syscall_handle/op/arg0/arg1/arg2(frame) -> UInt` | The §5.7 argument registers, by role rather than by name. Three argument slots since design 178 M2 unit 2: `Process.ThreadCreate` takes an entry, a stack and an argument. |
 | `syscall_return(frame, status, value)` | Place the (status, value) pair where the caller reads them and step the saved PC past the trapping instruction — which is a no-op on a profile whose trap already points past it. |
 | `UNMAPPED_PROBE: UInt` | An address the KERNEL cannot reach here. The harness's kernel-fault case reads it; it is per-target because "unmapped" is. |
 
@@ -98,7 +98,7 @@ separately only because it is new; `sos/hal/arm64/kernel/` implements every row.
 | `irq_claim(cause) -> UInt` | Which line is being serviced, `IRQ_NONE` if none. Takes the cause because one profile answers the timer half out of it. |
 | `irq_poll() -> UInt` | The same question with NO trap behind it — the idle path's half of the seam (design 178 M2 unit 4). Here it also has to check the timer by hand, because on this profile the timer is not one of the controller's sources; there it is `irq_claim` under a second name. |
 | `wait_for_irq()` | Park the core until an interrupt is PENDING. Both machines wake from this whether or not the current privilege level would take one, which is exactly what the idle path needs — D2 keeps them masked in kernel mode forever, so the kernel notices by polling rather than by trapping. |
-| `irq_line_valid(line) -> Bool` | Is this a line the BOARD wires? What `Process.BindInterrupt` checks a caller's number against. The TIMER's line is excluded arch-free by the kernel instead, because "the tick is not for rent" is a policy rather than a fact about the board. |
+| `irq_line_valid(line) -> Bool` | Is this a line the BOARD wires? What `Process.InterruptBind` checks a caller's number against. The TIMER's line is excluded arch-free by the kernel instead, because "the tick is not for rent" is a policy rather than a fact about the board. |
 | `irq_complete(line)` | End of service for a line. |
 | `timer_now_ns() -> UInt64` | This machine's monotonic time in nanoseconds since the counter started. What a `Clock.now()` reads and what every deadline is measured against — one time source, so the two cannot disagree. |
 | `timer_set_deadline_ns(at_ns)` | Program the ONE comparator to interrupt at an ABSOLUTE deadline. On both profiles this is also what LOWERS the timer's line, which is why the fire path calls it rather than acknowledging something. `UInt64.max` is the kernel's "never". Enables the timer interrupt every time — idempotent, and what lets a kernel that armed no tick still serve a Timer armed later. |

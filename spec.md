@@ -33,15 +33,15 @@ names provisional):
 | `Thread` | Kernel-scheduled execution context bound to an AddressSpace. Saw's cooperative TaskGroups run *inside* a thread, in userspace — the kernel never sees tasks. BUILT M2 (design 178 unit 2): ops `Start`/`Join`/`Exit`/`Yield`, rights `ThreadRight.Start`/`.Join`/`.Control`. The saved trap frame IS the context, so a switch is the trap handler returning a different frame — see §11. |
 | `MemoryObject` | A range of memory (RAM or device MMIO) that can be mapped into AddressSpaces. Derived by splitting/attenuating a parent MemoryObject; roots handed to the first process at boot. |
 | `Channel` | Synchronous message IPC with request/reply built in — see §2.1 (ratified Jul 29). |
-| `Event` | Accumulating non-blocking notification (OR / saturating-sum); a waitable — see §2.4 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Signal`/`Receive`, the mode chosen by the caller at creation (`create_event(mode:)`). |
-| `Clock` | A GRANTED TIME SOURCE — time is a capability, not an ambient facility. BUILT M3 (design 232 unit 1): obtained through `SystemOp.GetClock` on `SystemRight.GetClock`, ops `Now`/`CreateTimer`, rights `ClockRight.Read`/`.CreateTimer`. It is a GETTER, not a factory — the same handle every ask, per (process, `ClockType`), on the `SelfProcess` precedent, since a machine has one monotonic clock and two objects naming it would be two names for one thing. `ClockType` declares `Monotonic` ONLY in v1 (`Boot`/`Realtime` are future values of a raw-backed enum, undeclared because an unproducible case is dead surface). `Now` answers through a copy-out record, because a nanosecond count is 64 bits and one profile's registers are not. The point of the capability: strip the right from a child and hand it a VIRTUAL clock over IPC instead, with no code change on either side. |
+| `Event` | Accumulating non-blocking notification (OR / saturating-sum); a waitable — see §2.4 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Signal`/`Receive`, the mode chosen by the caller at creation (`event_create(mode:)`). |
+| `Clock` | A GRANTED TIME SOURCE — time is a capability, not an ambient facility. BUILT M3 (design 232 unit 1): obtained through `SystemOp.ClockGet` on `SystemRight.ClockGet`, ops `Now`/`TimerCreate`, rights `ClockRight.Read`/`.TimerCreate`. It is a GETTER, not a factory — the same handle every ask, per (process, `ClockType`), on the `ProcessSelf` precedent, since a machine has one monotonic clock and two objects naming it would be two names for one thing. `ClockType` declares `Monotonic` ONLY in v1 (`Boot`/`Realtime` are future values of a raw-backed enum, undeclared because an unproducible case is dead surface). `Now` answers through a copy-out record, because a nanosecond count is 64 bits and one profile's registers are not. The point of the capability: strip the right from a child and hand it a VIRTUAL clock over IPC instead, with no code change on either side. |
 | `Timer` | Deadline object bound to the Clock that created it; directly waitable. BUILT M3 (design 232 unit 1) — THE PROCESS-SLEEP PRIMITIVE, and before it a wait either returned at once or blocked forever. Ops `Arm`/`Disarm`, rights `TimerRight.Arm` (gating both) / `.Wait`. `arm(after_ns, interval_ns)` arrives through the new COPY-IN record (§2.2's copy-out funnel's mirror twin, built here and inherited by M4's IPC send) because two 64-bit times exceed the argument registers on a 32-bit profile; `interval_ns == 0` is a one-shot, which disarms itself when it fires. The re-arm is DRIFT-FREE (next = previous DEADLINE + interval, the timerfd model) and missed expiries COALESCE into a saturating fire count delivered as `WaitPayload.Timer(fires:)`. **There is NO ACK**: unlike §9's Interrupt there is no mask to release, so the wait that reports the fires is what consumes them. Arming an armed timer REPLACES its schedule and clears the count; disarming an unarmed one is a NO-OP, deliberately opposite to §9's ack-with-no-fire — a one-shot disarms itself, so cancelling a timeout that just expired is an ordinary race rather than a caller error. |
-| `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it, ack via the handle. BUILT M2 (design 178 unit 4): one op (`Ack`), two rights (`InterruptRight.Wait`/`.Ack`), created by `ProcessOp.BindInterrupt` on its own Process right — the factory bit a launcher strips from everything that is not a driver. The BINDING IS THE OBJECT'S EXISTENCE (creation takes the line, there is no rebind), which is what stops one handle naming two devices over its life. A line the board does not have, the TIMER's line, and a line already bound are all faults. |
+| `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it, ack via the handle. BUILT M2 (design 178 unit 4): one op (`Ack`), two rights (`InterruptRight.Wait`/`.Ack`), created by `ProcessOp.InterruptBind` on its own Process right — the factory bit a launcher strips from everything that is not a driver. The BINDING IS THE OBJECT'S EXISTENCE (creation takes the line, there is no rebind), which is what stops one handle naming two devices over its life. A line the board does not have, the TIMER's line, and a line already bound are all faults. |
 | `Waiter` | Generic wait aggregator (epoll/Port-style) — see §2.2 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Add`/`Remove`/`Wait`, rights `WaiterRight.Attach`/`.Wait`, the wait answer a copy-out record. |
 | `MemoryObject` | Physical memory (RAM or device MMIO). Ownership/authority over the pages; mappable, sendable — see §2.3 (ratified Jul 29). |
 | `Mapping` | An installed virtual placement of a MemoryObject; distinct object, own handle; only it can unmap — see §2.3. |
-| `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. BUILT M2 (design 178 unit 2), one process: ops `CreateThread`/`SelfThread`/`Exit`/`GetStatus` plus the three factory ops `CreateEvent`/`CreateWaiter`/`BindInterrupt`, each on its own right. `create_process` is M3 (design 232 unit 2) and `kill` (§8) has no op yet. |
-| `System` | Kernel singleton (ratified Aug 5): the object behind system-scoped primitives so that EVERY syscall is an object op (§5.7) — v1 ops `debug_print`, `shutdown(status)` (stop the machine; QEMU: sifive_test), rights-gated (`SystemRight.Debug`/`.Shutdown`, §3 scoped rights). Root receives its handle at boot (§12). `exit` is NOT here — process exit belongs to the Process object when it exists (ratified Aug 5). M2 added a third op, `self_process` on `SystemRight.Manage` (design 178 unit 2): §3's derivation rule made real, so the boot register stays ONE handle wide and a process obtains its Process object THROUGH the System handle rather than being handed it. Later candidates: info queries. |
+| `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. BUILT M2 (design 178 unit 2), one process: ops `ThreadCreate`/`ThreadSelf`/`Exit`/`GetStatus` plus the three factory ops `EventCreate`/`WaiterCreate`/`InterruptBind`, each on its own right. `create_process` is M3 (design 232 unit 2) and `kill` (§8) has no op yet. |
+| `System` | Kernel singleton (ratified Aug 5): the object behind system-scoped primitives so that EVERY syscall is an object op (§5.7) — v1 ops `debug_print`, `shutdown(status)` (stop the machine; QEMU: sifive_test), rights-gated (`SystemRight.Debug`/`.Shutdown`, §3 scoped rights). Root receives its handle at boot (§12). `exit` is NOT here — process exit belongs to the Process object when it exists (ratified Aug 5). M2 added a third op, `process_self` on `SystemRight.Manage` (design 178 unit 2): §3's derivation rule made real, so the boot register stays ONE handle wide and a process obtains its Process object THROUGH the System handle rather than being handed it. Later candidates: info queries. |
 
 **Eight of these kinds exist today** — System, Process, Thread, Event, Waiter,
 Interrupt, Clock and Timer (`ObjType`, `sos/kernel/abi/`, the kernel-internal
@@ -1099,7 +1099,7 @@ event-driven EDGE of a process gets a second, distinct construct:
     syscall" checkable; `waitable_slot` is the only place waitability is
     decided, one exhaustive match, so a further waitable kind cannot be
     added silently. Three riders amended ratified text: an argument
-    encoding is API (`create_event(mode:)`), the wait ANSWER became a
+    encoding is API (`event_create(mode:)`), the wait ANSWER became a
     validated copy-out record through the `copy_out` funnel (§2.2), and
     `remove` names the KEY with keys unique per Waiter (§2.2).
     (d) **The Interrupt object and the milestone proof.** The second
@@ -1162,7 +1162,7 @@ event-driven EDGE of a process gets a second, distinct construct:
     as a harness timeout rather than as a report.
     (e) **Two language findings, neither worked around** (DF-232a, an internal
     compiler error on a bare literal assigned to a fixed-width place; DF-232b,
-    `type` is a keyword so the ruled `get_clock(type:)` label is unwritable and
+    `type` is a keyword so the ruled `clock_get(type:)` label is unwritable and
     is built as `kind:`).
 
 ## 12. The root server (ratified Aug 5, user)
@@ -1180,7 +1180,7 @@ event-driven EDGE of a process gets a second, distinct construct:
   (§2 Interrupt). Root's band map applies verbatim from its image (§7).
   **M2 ANSWERS THE LAST TWO WITH RIGHTS RATHER THAN OBJECTS**, and the
   set stays ONE handle wide: root's Process handle carries
-  `BindInterrupt`, so binding a line is a derivation through a handle
+  `InterruptBind`, so binding a line is a derivation through a handle
   it already holds rather than a table it is given — and its device
   window arrives in its own image (§2.5), not in the boot set. Both
   become real objects in M3, and neither widens the register the kernel
@@ -1190,7 +1190,7 @@ event-driven EDGE of a process gets a second, distinct construct:
   creation vs a factory capability — is an open pin; M1 does not need
   it (root spawns nothing). **ANSWERED BY M2 (design 178 unit 3): the
   factory capability, spelled as rights bits on the Process object.**
-  `CreateEvent`/`CreateWaiter` — and `BindInterrupt` beside them — are
+  `EventCreate`/`WaiterCreate` — and `InterruptBind` beside them — are
   Process ops each on its own right, so creation flows through a handle
   the process already holds and is §3's derivation rule rather than a new
   mechanism next to it, and a launcher strips the bit from anything with

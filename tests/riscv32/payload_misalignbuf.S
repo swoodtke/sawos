@@ -16,7 +16,7 @@
  */
 
     .equ PROCESS_HANDLE,    2
-    .equ OP_CREATE_WAITER,  5       /* ProcessOp.CreateWaiter */
+    .equ OP_WAITER_CREATE,  5       /* ProcessOp.WaiterCreate */
     .equ OP_WAITER_WAIT,    2       /* WaiterOp.Wait */
     .equ ODD_BUF,           1       /* not a multiple of any word size */
     .equ BUF_CAP,           64
@@ -25,7 +25,7 @@
     .balign 4
     .globl _umode_payload
 _umode_payload:
-    li      a7, OP_CREATE_WAITER
+    li      a7, OP_WAITER_CREATE
     li      a0, PROCESS_HANDLE
     li      a1, 0
     li      a2, 0

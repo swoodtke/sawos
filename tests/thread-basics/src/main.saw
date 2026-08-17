@@ -13,7 +13,7 @@
 // process teardown at the end.
 //
 // EVERY THREAD OF THIS IMAGE ENTERS AT `_start`, because Saw cannot name the
-// address of a function (DF-178c / design 172's reason 3) and `create_thread`
+// address of a function (DF-178c / design 172's reason 3) and `thread_create`
 // therefore has no entry to be given. So the entry has to work out which thread
 // it is, and it does that the only way that needs no second register: the
 // INITIAL thread is the one that has not yet parked the boot handle.
@@ -21,7 +21,7 @@
 // A WORKER DERIVES ITS AUTHORITY, it is not handed it. The one thing parked for
 // it is the BOOT HANDLE — §12's root of trust and the only raw word the typed
 // layer accepts — and everything else comes off it by derivation:
-// `System(boot_handle:)` -> `self_process()` -> `self_thread()`. That is why
+// `System(boot_handle:)` -> `process_self()` -> `thread_self()`. That is why
 // nothing here passes a handle WORD between threads: the `sos` module offers no
 // way to take one out of a typed handle, and this program needs none.
 
@@ -86,11 +86,11 @@ func parked_boot_handle() unsafe -> UInt {
 /// `print` would add and which would break the alternation into lines.
 func worker(role: UInt) {
     let system = System(boot_handle: parked_boot_handle())
-    let proc = match system.self_process() {
+    let proc = match system.process_self() {
         case Ok(p) -> p,
         case Err(_) -> { return },
     }
-    let me = match proc.self_thread() {
+    let me = match proc.thread_self() {
         case Ok(t) -> t,
         case Err(_) -> { return },
     }
@@ -113,7 +113,7 @@ func initial(boot_handle: UInt) {
     park_boot_handle(boot_handle)
 
     let system = System(boot_handle: boot_handle)
-    let proc = match system.self_process() {
+    let proc = match system.process_self() {
         case Ok(p) -> p,
         case Err(e) -> {
             let _ = system.debug_print("SOS threads: no process handle\n")
@@ -122,7 +122,7 @@ func initial(boot_handle: UInt) {
         },
     }
 
-    let a = match proc.create_thread(stack_top: stack_a_top(), arg: ROLE_A) {
+    let a = match proc.thread_create(stack_top: stack_a_top(), arg: ROLE_A) {
         case Ok(t) -> t,
         case Err(e) -> {
             // The status tag NAMED, not just printed. `SosStatus` lives in
@@ -137,7 +137,7 @@ func initial(boot_handle: UInt) {
             return
         },
     }
-    let b = match proc.create_thread(stack_top: stack_b_top(), arg: ROLE_B) {
+    let b = match proc.thread_create(stack_top: stack_b_top(), arg: ROLE_B) {
         case Ok(t) -> t,
         case Err(e) -> {
             print("SOS threads: create failed: {}\n", e)

@@ -26,7 +26,7 @@
 //
 // EVERY THREAD ENTERS AT `_start` and works out which it is from the parked
 // boot handle, for the reason `thread-basics` gives (DF-178c: Saw cannot name a
-// function's address, so `create_thread` has no entry to be handed).
+// function's address, so `thread_create` has no entry to be handed).
 //
 // HOW TWO THREADS SHARE A KERNEL OBJECT, since this is the first program that
 // needs to. NOT by passing a handle word — the `sos` module offers no way to
@@ -117,15 +117,15 @@ func shared_event() unsafe -> Event {
 /// The worker: say so, signal, leave.
 ///
 /// It derives its own authority off the parked boot handle rather than being
-/// handed any — `System(boot_handle:)` -> `self_process()` -> `self_thread()` —
+/// handed any — `System(boot_handle:)` -> `process_self()` -> `thread_self()` —
 /// and reaches the Event out of the process's own memory.
 func worker() {
     let system = System(boot_handle: parked_boot_handle())
-    let proc = match system.self_process() {
+    let proc = match system.process_self() {
         case Ok(p) -> p,
         case Err(_) -> { return },
     }
-    let me = match proc.self_thread() {
+    let me = match proc.thread_self() {
         case Ok(t) -> t,
         case Err(_) -> { return },
     }
@@ -150,7 +150,7 @@ func initial(boot_handle: UInt) {
     park_boot_handle(boot_handle)
 
     let system = System(boot_handle: boot_handle)
-    let proc = match system.self_process() {
+    let proc = match system.process_self() {
         case Ok(p) -> p,
         case Err(_) -> {
             let _ = system.debug_print("SOS wake: no process handle\n")
@@ -159,7 +159,7 @@ func initial(boot_handle: UInt) {
         },
     }
 
-    let waiter = match proc.create_waiter() {
+    let waiter = match proc.waiter_create() {
         case Ok(w) -> w,
         case Err(e) -> {
             print("SOS wake: no waiter: {}\n", e)
@@ -167,7 +167,7 @@ func initial(boot_handle: UInt) {
             return
         },
     }
-    let event = match proc.create_event(mode: EventMode.SaturatingSum) {
+    let event = match proc.event_create(mode: EventMode.SaturatingSum) {
         case Ok(ev) -> ev,
         case Err(e) -> {
             print("SOS wake: no event: {}\n", e)
@@ -178,7 +178,7 @@ func initial(boot_handle: UInt) {
     let _ = waiter.add(&event, ATTACH_KEY)
     park_event(event)
 
-    let w = match proc.create_thread(stack_top: worker_stack_top(),
+    let w = match proc.thread_create(stack_top: worker_stack_top(),
                                      arg: WORKER_ROLE) {
         case Ok(t) -> t,
         case Err(e) -> {

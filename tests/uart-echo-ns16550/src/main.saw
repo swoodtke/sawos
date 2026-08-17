@@ -10,7 +10,7 @@
 //
 // THE CYCLE, which is spec §9 read from the driver's side:
 //
-//   1. bind the line          `Process.bind_interrupt(line:)`
+//   1. bind the line          `Process.interrupt_bind(line:)`
 //   2. watch it               `Waiter.add(&interrupt, key)`
 //   3. enable the DEVICE      write its own interrupt-enable register — the
 //                             kernel never touches it, because the register is
@@ -49,7 +49,7 @@ import sosrt.{ascii_byte}
 /// AGREE rather than one deriving from the other: the manifest is what the
 /// image declares and the board is what authorizes it, and a mismatch is a
 /// refused image rather than a driver reaching somewhere it should not.
-static UART_BASE: UInt = 0x10000000
+static UART_BASE: UInt = 0x1000_0000
 
 /// The interrupt line this board wires the console to.
 static UART_IRQ: UInt = 10
@@ -169,7 +169,7 @@ func woke_on_line(r: &WaitResult) -> UInt {
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
-    let proc = match system.self_process() {
+    let proc = match system.process_self() {
         case Ok(p) -> p,
         case Err(_) -> {
             let _ = system.debug_print("SOS echo: no process handle\n")
@@ -181,7 +181,7 @@ func _start(boot_handle: UInt) {
     // §2's Interrupt row: the line becomes an object, and the object is
     // waitable. The kernel unmasks it here — the DEVICE is still quiet, because
     // its own enable bit is below.
-    let irq = match proc.bind_interrupt(line: UART_IRQ) {
+    let irq = match proc.interrupt_bind(line: UART_IRQ) {
         case Ok(i) -> i,
         case Err(e) -> {
             print("SOS echo: no interrupt: {}\n", e)
@@ -189,7 +189,7 @@ func _start(boot_handle: UInt) {
             return
         },
     }
-    let waiter = match proc.create_waiter() {
+    let waiter = match proc.waiter_create() {
         case Ok(w) -> w,
         case Err(e) -> {
             print("SOS echo: no waiter: {}\n", e)

@@ -26,7 +26,7 @@
  */
 
     .equ PROCESS_HANDLE,    2
-    .equ OP_CREATE_WAITER,  5       /* ProcessOp.CreateWaiter */
+    .equ OP_WAITER_CREATE,  5       /* ProcessOp.WaiterCreate */
     .equ OP_WAITER_WAIT,    2       /* WaiterOp.Wait */
     .equ BAD_BUF,           0       /* word-aligned, and in nobody's grant */
     .equ BUF_CAP,           64      /* ample — the capacity is not what fails */
@@ -36,7 +36,7 @@
     .globl _umode_payload
 _umode_payload:
     /* 1. a Waiter of our own. The handle comes back in the value register. */
-    li      a7, OP_CREATE_WAITER
+    li      a7, OP_WAITER_CREATE
     li      a0, PROCESS_HANDLE
     li      a1, 0
     li      a2, 0

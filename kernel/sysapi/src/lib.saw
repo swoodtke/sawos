@@ -46,7 +46,7 @@
 //!
 //!   PUBLIC — an enum or record whose values a PROCESS CHOOSES and passes as a
 //!   syscall argument, or that the kernel HANDS BACK as data. `EventMode` is
-//!   the first kind: a caller names it (`create_event(mode:
+//!   the first kind: a caller names it (`event_create(mode:
 //!   EventMode.SaturatingSum)`), so it is API, and the alternative — a method
 //!   per mode — reads fine at two and stops scaling at the next object, where
 //!   M3's Mapping brings an access mode AND a memory type and a method per
@@ -79,7 +79,7 @@
 
 // THE ENCODINGS A PROCESS IS MEANT TO WRITE OR MATCH ON, and the only things
 // this module re-exports (design 229): the status tag every `Result<_,
-// SosStatus>` hands back, the mode a `create_event(mode:)` caller names, and
+// SosStatus>` hands back, the mode a `event_create(mode:)` caller names, and
 // the record + payload a `wait()` caller matches on. `import sos.{SosStatus}`
 // (etc.) is how a process takes them.
 public import sosabi.{SosStatus, EventMode, ClockType, WaitResult, WaitPayload}
@@ -218,31 +218,31 @@ public func sos_system_shutdown(handle: UInt, status: UInt) -> UInt {
 }
 
 // The ops that answer with a VALUE take an out-parameter for it, exactly as the
-// raw form does. A C caller writes `unsigned long h; sos_process_self_thread(p,
+// raw form does. A C caller writes `unsigned long h; sos_process_thread_self(p,
 // &h);` and gets the same contract a Saw caller does minus the Result.
 
 /// This process's own handle. Requires `SystemRight.Manage`.
-@export("sos_system_self_process")
-public func sos_system_self_process(handle: UInt,
+@export("sos_system_process_self")
+public func sos_system_process_self(handle: UInt,
                                     value_out: UnsafePointer<UInt>) unsafe -> UInt {
-    sos_syscall3(handle, SystemOp.SelfProcess as UInt, 0, 0, 0, value_out)
+    sos_syscall3(handle, SystemOp.ProcessSelf as UInt, 0, 0, 0, value_out)
 }
 
 /// Make a thread in this process, ready to start. Requires
-/// `ProcessRight.CreateThread`. `entry` may be `ENTRY_IMAGE`.
-@export("sos_process_create_thread")
-public func sos_process_create_thread(handle: UInt, entry: UInt, stack_top: UInt,
+/// `ProcessRight.ThreadCreate`. `entry` may be `ENTRY_IMAGE`.
+@export("sos_process_thread_create")
+public func sos_process_thread_create(handle: UInt, entry: UInt, stack_top: UInt,
                                       arg: UInt,
                                       value_out: UnsafePointer<UInt>) unsafe -> UInt {
-    sos_syscall3(handle, ProcessOp.CreateThread as UInt, entry, stack_top, arg,
+    sos_syscall3(handle, ProcessOp.ThreadCreate as UInt, entry, stack_top, arg,
                  value_out)
 }
 
 /// The CALLING thread's own handle. Requires `ProcessRight.Manage`.
-@export("sos_process_self_thread")
-public func sos_process_self_thread(handle: UInt,
+@export("sos_process_thread_self")
+public func sos_process_thread_self(handle: UInt,
                                     value_out: UnsafePointer<UInt>) unsafe -> UInt {
-    sos_syscall3(handle, ProcessOp.SelfThread as UInt, 0, 0, 0, value_out)
+    sos_syscall3(handle, ProcessOp.ThreadSelf as UInt, 0, 0, 0, value_out)
 }
 
 /// End this process with `status`. Requires `ProcessRight.Exit`. Does not
@@ -286,7 +286,7 @@ public func sos_thread_yield(handle: UInt) -> UInt {
     sos_syscall1(handle, ThreadOp.Yield as UInt, 0)
 }
 
-/// Make an Event in this process. Requires `ProcessRight.CreateEvent`. `mode`
+/// Make an Event in this process. Requires `ProcessRight.EventCreate`. `mode`
 /// is 0 for bitwise-OR accumulation and 1 for saturating-sum (spec §2.4); any
 /// other value terminates the process.
 ///
@@ -294,26 +294,26 @@ public func sos_thread_yield(handle: UInt) -> UInt {
 /// difference in kind the module docstring describes rather than an oversight:
 /// a C caller has no enum to be handed, so it gets the wire value. The Saw
 /// altitude above never writes one — it offers a method per mode.
-@export("sos_process_create_event")
-public func sos_process_create_event(handle: UInt, mode: UInt,
+@export("sos_process_event_create")
+public func sos_process_event_create(handle: UInt, mode: UInt,
                                      value_out: UnsafePointer<UInt>) unsafe -> UInt {
-    sos_syscall3(handle, ProcessOp.CreateEvent as UInt, mode, 0, 0, value_out)
+    sos_syscall3(handle, ProcessOp.EventCreate as UInt, mode, 0, 0, value_out)
 }
 
-/// Make a Waiter in this process. Requires `ProcessRight.CreateWaiter`.
-@export("sos_process_create_waiter")
-public func sos_process_create_waiter(handle: UInt,
+/// Make a Waiter in this process. Requires `ProcessRight.WaiterCreate`.
+@export("sos_process_waiter_create")
+public func sos_process_waiter_create(handle: UInt,
                                       value_out: UnsafePointer<UInt>) unsafe -> UInt {
-    sos_syscall3(handle, ProcessOp.CreateWaiter as UInt, 0, 0, 0, value_out)
+    sos_syscall3(handle, ProcessOp.WaiterCreate as UInt, 0, 0, 0, value_out)
 }
 
 /// Bind IRQ `line` to a new Interrupt in this process. Requires
-/// `ProcessRight.BindInterrupt`. A line this machine does not have, the
+/// `ProcessRight.InterruptBind`. A line this machine does not have, the
 /// timer's line, or one already bound TERMINATES the process.
-@export("sos_process_bind_interrupt")
-public func sos_process_bind_interrupt(handle: UInt, line: UInt,
+@export("sos_process_interrupt_bind")
+public func sos_process_interrupt_bind(handle: UInt, line: UInt,
                                          value_out: UnsafePointer<UInt>) unsafe -> UInt {
-    sos_syscall3(handle, ProcessOp.BindInterrupt as UInt, line, 0, 0, value_out)
+    sos_syscall3(handle, ProcessOp.InterruptBind as UInt, line, 0, 0, value_out)
 }
 
 /// End this fire and let the device interrupt again. Requires
@@ -384,15 +384,15 @@ public func sos_waiter_wait(handle: UInt, buf: UnsafePointer<UInt>,
 }
 
 /// This process's Clock for the domain `kind` names. Requires
-/// `SystemRight.GetClock`. A `kind` that is not a `ClockType` terminates the
+/// `SystemRight.ClockGet`. A `kind` that is not a `ClockType` terminates the
 /// process.
 ///
 /// The same handle every time — a machine has one monotonic clock, so asking
 /// twice is a query rather than two capabilities.
-@export("sos_system_get_clock")
-public func sos_system_get_clock(handle: UInt, kind: UInt,
+@export("sos_system_clock_get")
+public func sos_system_clock_get(handle: UInt, kind: UInt,
                                  value_out: UnsafePointer<UInt>) unsafe -> UInt {
-    sos_syscall3(handle, SystemOp.GetClock as UInt, kind, 0, 0, value_out)
+    sos_syscall3(handle, SystemOp.ClockGet as UInt, kind, 0, 0, value_out)
 }
 
 /// Read the clock into `buf` — a COPY-OUT record, because a nanosecond count is
@@ -408,11 +408,11 @@ public func sos_clock_now(handle: UInt, buf: UnsafePointer<UInt64>,
                  (&var ignored) as UnsafePointer<UInt>)
 }
 
-/// Make a Timer bound to this Clock. Requires `ClockRight.CreateTimer`.
-@export("sos_clock_create_timer")
-public func sos_clock_create_timer(handle: UInt,
+/// Make a Timer bound to this Clock. Requires `ClockRight.TimerCreate`.
+@export("sos_clock_timer_create")
+public func sos_clock_timer_create(handle: UInt,
                                    value_out: UnsafePointer<UInt>) unsafe -> UInt {
-    sos_syscall3(handle, ClockOp.CreateTimer as UInt, 0, 0, 0, value_out)
+    sos_syscall3(handle, ClockOp.TimerCreate as UInt, 0, 0, 0, value_out)
 }
 
 /// Arm a Timer from a COPY-IN record at `record` — doubleword 0 the delay from
@@ -511,13 +511,13 @@ public extension System {
     /// The same handle every time — the process's table has ONE entry naming
     /// it, and §3 forbids duplicating a handle — so calling this twice is a
     /// query, not two capabilities.
-    public func self_process(&self) -> Result<Process, SosStatus> {
-        let raw = try call_value(self.handle, SystemOp.SelfProcess as UInt, 0, 0, 0)
+    public func process_self(&self) -> Result<Process, SosStatus> {
+        let raw = try call_value(self.handle, SystemOp.ProcessSelf as UInt, 0, 0, 0)
         return Process(handle: ProcessHandle(raw))
     }
 
     /// This process's Clock for `kind` — a GRANTED TIME SOURCE. Requires
-    /// `SystemRight.GetClock`.
+    /// `SystemRight.ClockGet`.
     ///
     /// TIME IS A CAPABILITY HERE, and that is the whole reason this is an op
     /// rather than a free function. A process that was not granted the right
@@ -537,9 +537,9 @@ public extension System {
     /// cannot be a parameter name; `kind` is the vocabulary the rest of this
     /// system already uses for the same idea (`ProcessStatusKind`,
     /// `WaitableKind`).
-    public func get_clock(&self,
+    public func clock_get(&self,
                           kind: ClockType = ClockType.Monotonic) -> Result<Clock, SosStatus> {
-        let raw = try call_value(self.handle, SystemOp.GetClock as UInt,
+        let raw = try call_value(self.handle, SystemOp.ClockGet as UInt,
                                  kind as UInt, 0, 0)
         return Clock(handle: ClockHandle(raw))
     }
@@ -551,7 +551,7 @@ public extension System {
 
 /// A handle to a Process — an address-space domain, a handle table and threads.
 ///
-/// A process reaches its OWN through `System.self_process`. Holding somebody
+/// A process reaches its OWN through `System.process_self`. Holding somebody
 /// else's is what supervision will look like when there is somebody else (M3).
 ///
 /// THERE IS NO WAY TO BUILD ONE FROM A WORD and no way to get a word back out.
@@ -565,7 +565,7 @@ public struct Process {
 
 public extension Process {
     /// Make a thread at `entry`, ready to be started. Requires
-    /// `ProcessRight.CreateThread`.
+    /// `ProcessRight.ThreadCreate`.
     ///
     /// The thread runs with `stack_top` as its stack pointer and `arg` in its
     /// first argument register, and it must NOT return: its link register is
@@ -575,9 +575,9 @@ public extension Process {
     /// ruling — a process knows where its own memory is). A full thread slab or
     /// handle table comes back as `SosStatus.NoResource`, which it could not
     /// have known.
-    public func create_thread(&self, entry: UInt, stack_top: UInt,
+    public func thread_create(&self, entry: UInt, stack_top: UInt,
                               arg: UInt) -> Result<Thread, SosStatus> {
-        let raw = try call_value(self.handle, ProcessOp.CreateThread as UInt,
+        let raw = try call_value(self.handle, ProcessOp.ThreadCreate as UInt,
                                  entry, stack_top, arg)
         return Thread(handle: ThreadHandle(raw))
     }
@@ -593,9 +593,9 @@ public extension Process {
     /// written entirely in Saw cannot compute an entry address at all, and this
     /// is the one entry it can ask for by name. A process with a C leaf that
     /// CAN produce an address uses the overload above. See DF-178c.
-    public func create_thread(&self, stack_top: UInt,
+    public func thread_create(&self, stack_top: UInt,
                               arg: UInt) -> Result<Thread, SosStatus> {
-        self.create_thread(entry: sosabi.ENTRY_IMAGE, stack_top: stack_top,
+        self.thread_create(entry: sosabi.ENTRY_IMAGE, stack_top: stack_top,
                            arg: arg)
     }
 
@@ -603,8 +603,8 @@ public extension Process {
     ///
     /// This is how a thread reaches the handle it needs to exit or yield: it is
     /// handed its process, and asks the process which thread it is.
-    public func self_thread(&self) -> Result<Thread, SosStatus> {
-        let raw = try call_value(self.handle, ProcessOp.SelfThread as UInt, 0, 0, 0)
+    public func thread_self(&self) -> Result<Thread, SosStatus> {
+        let raw = try call_value(self.handle, ProcessOp.ThreadSelf as UInt, 0, 0, 0)
         return Thread(handle: ThreadHandle(raw))
     }
 
@@ -622,7 +622,7 @@ public extension Process {
     }
 
     /// Make an Event accumulating in `mode` — §2.4's per-Event property, fixed
-    /// for the object's life. Requires `ProcessRight.CreateEvent`.
+    /// for the object's life. Requires `ProcessRight.EventCreate`.
     ///
     /// `EventMode.Or` is the flag set, "which of these events occurred since
     /// last drain", and it is the default because it is the signal use case.
@@ -637,26 +637,26 @@ public extension Process {
     /// mode and a memory type, and a method per combination is a matrix rather
     /// than a list. The mode is a VALUE the caller chooses, so it is spelled
     /// as one. See the module docstring for which enums are public API.
-    public func create_event(&self,
+    public func event_create(&self,
                              mode: EventMode = EventMode.Or) -> Result<Event, SosStatus> {
-        let raw = try call_value(self.handle, ProcessOp.CreateEvent as UInt,
+        let raw = try call_value(self.handle, ProcessOp.EventCreate as UInt,
                                  mode as UInt, 0, 0)
         return Event(handle: EventHandle(raw))
     }
 
     /// Make a Waiter — §2.2's generic wait aggregator. Requires
-    /// `ProcessRight.CreateWaiter`.
-    public func create_waiter(&self) -> Result<Waiter, SosStatus> {
-        let raw = try call_value(self.handle, ProcessOp.CreateWaiter as UInt,
+    /// `ProcessRight.WaiterCreate`.
+    public func waiter_create(&self) -> Result<Waiter, SosStatus> {
+        let raw = try call_value(self.handle, ProcessOp.WaiterCreate as UInt,
                                  0, 0, 0)
         return Waiter(handle: WaiterHandle(raw))
     }
 
     /// Bind IRQ `line` to an Interrupt — spec §2's row and §9's delivery.
-    /// Requires `ProcessRight.BindInterrupt`.
+    /// Requires `ProcessRight.InterruptBind`.
     ///
     /// THE LINE IS A NUMBER THE CALLER CHOOSES, so it is spelled as one, which
-    /// is the same rule `create_event`'s mode follows. A driver knows its
+    /// is the same rule `event_create`'s mode follows. A driver knows its
     /// device's line from the device's own description; the kernel checks it
     /// against the board and TERMINATES the process for a line this machine
     /// does not have, the timer's line, or one already bound — all three
@@ -667,8 +667,8 @@ public extension Process {
     /// an `ack`. What the kernel does NOT touch is the device's own
     /// interrupt-enable register — that is behind the driver's granted window
     /// and is the driver's to write.
-    public func bind_interrupt(&self, line: UInt) -> Result<Interrupt, SosStatus> {
-        let raw = try call_value(self.handle, ProcessOp.BindInterrupt as UInt,
+    public func interrupt_bind(&self, line: UInt) -> Result<Interrupt, SosStatus> {
+        let raw = try call_value(self.handle, ProcessOp.InterruptBind as UInt,
                                  line, 0, 0)
         return Interrupt(handle: InterruptHandle(raw))
     }
@@ -684,7 +684,7 @@ public extension Process {
 /// sees a task (spec §2).
 ///
 /// Like `Process`, it cannot be built from a word or turned back into one: a
-/// `Thread` comes from `Process.create_thread` or `Process.self_thread` and from
+/// `Thread` comes from `Process.thread_create` or `Process.thread_self` and from
 /// nowhere else. Naming a thread you were never given is therefore not
 /// expressible in this layer — which is the point, and which is why the harness
 /// case that PROVES the kernel rejects such a handle is a hand-written payload
@@ -739,8 +739,8 @@ public extension Thread {
 /// out and resets the word. A non-zero word is what "ready" means to a Waiter,
 /// which is the only other thing that ever looks at it.
 ///
-/// Built by `Process.create_event` / `create_counting_event` and by nothing
-/// else — no word constructor, no word extractor, the module docstring's rule.
+/// Built by `Process.event_create` and by nothing else — no word constructor,
+/// no word extractor, the module docstring's rule.
 public struct Event {
     handle: EventHandle,
 }
@@ -789,7 +789,7 @@ public extension Event {
 /// makes a single-task driver non-reentrant with no lock: the line cannot come
 /// back while the handler runs.
 ///
-/// Built by `Process.bind_interrupt` and by nothing else — no word
+/// Built by `Process.interrupt_bind` and by nothing else — no word
 /// constructor, no word extractor, the module docstring's rule.
 public struct Interrupt {
     handle: InterruptHandle,
@@ -823,7 +823,7 @@ public extension Interrupt {
 /// something that fires at a time. There is no way to SET one — a monotonic
 /// clock that could be set would not be monotonic.
 ///
-/// Built by `System.get_clock` and by nothing else — no word constructor, no
+/// Built by `System.clock_get` and by nothing else — no word constructor, no
 /// word extractor, the module docstring's rule.
 public struct Clock {
     handle: ClockHandle,
@@ -847,14 +847,14 @@ public extension Clock {
     }
 
     /// Make a Timer that measures against THIS clock, for its whole life.
-    /// Requires `ClockRight.CreateTimer`.
+    /// Requires `ClockRight.TimerCreate`.
     ///
     /// It comes back DISARMED and owing nothing: a Timer is a schedule you have
     /// not written yet, so attaching one to a Waiter before arming it parks
     /// rather than reporting. A full timer slab comes back as
     /// `SosStatus.NoResource`, which the caller could not have known.
-    public func create_timer(&self) -> Result<Timer, SosStatus> {
-        let raw = try call_value(self.handle, ClockOp.CreateTimer as UInt, 0, 0, 0)
+    public func timer_create(&self) -> Result<Timer, SosStatus> {
+        let raw = try call_value(self.handle, ClockOp.TimerCreate as UInt, 0, 0, 0)
         return Timer(handle: TimerHandle(raw))
     }
 }
@@ -890,7 +890,7 @@ func now_into_frame(handle: ClockHandle) unsafe -> Result<UInt64, SosStatus> {
 /// it, so a timer armed at one millisecond is still on the millisecond a
 /// thousand fires later.
 ///
-/// Built by `Clock.create_timer` and by nothing else — no word constructor, no
+/// Built by `Clock.timer_create` and by nothing else — no word constructor, no
 /// word extractor, the module docstring's rule.
 public struct Timer {
     handle: TimerHandle,
@@ -1014,7 +1014,7 @@ public extension Waiter {
     /// with a handle-producing requirement is a forged-handle door under the
     /// orphan rule, and Saw has no sealed traits yet). Kinds are a LIST, so
     /// overloads are a list; it is MODES that multiply, which is why
-    /// `create_event` takes its mode as a value.
+    /// `event_create` takes its mode as a value.
     ///
     /// The second kind is here now, and it is what the shape predicted: each
     /// overload is TWO LINES delegating to one internal, so the list grows by a

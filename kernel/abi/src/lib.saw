@@ -40,6 +40,21 @@
 //! `EventMode`, `WaiterReadiness`), and the next object kind inherits it: name
 //! the family after the row in the §2 table.
 //!
+//! HOW AN OP IS NAMED (ruled Aug 17, user). Inside a family an op reads
+//! `object_operation`: the OBJECT KIND the op concerns leads, then the verb —
+//! `ProcessOp.ThreadCreate`, `SystemOp.ClockGet`, `ClockOp.TimerCreate` — and
+//! the typed method and the C export mirror it (`process.thread_create`,
+//! `sos_system_clock_get`). An op whose RECEIVER IS the object it concerns keeps
+//! the bare verb, there being no second noun to lead with: `Arm`, `Ack`, `Wait`,
+//! `Signal`, `Join`, `Start`, `Exit`, `Yield`, `Now`, `Add`, `Remove`,
+//! `Shutdown`, `DebugPrint`, `GetStatus`. What the rule buys is that every op
+//! concerning a kind sorts together — a reader looking for what makes a Timer
+//! finds `TimerCreate` without having to know which object is the factory — and
+//! that a rights bit named after an op (`ProcessRight.ThreadCreate`) reads
+//! exactly like the op it gates. A right naming a CAPABILITY rather than an op
+//! (`Transfer`, `Manage`, `Read`, `Control`, `Attach`, `Debug`) is not under this
+//! rule and keeps its own noun.
+//!
 //! Delivery in v1 is static linking through the manifest/module-path
 //! mechanism. A genuinely mapped vDSO is an object-model-era upgrade that
 //! changes none of the above.
@@ -131,7 +146,7 @@ public type TimerHandle = UInt
 /// zeroed register is never authority (see `ObjType.Unbound`).
 public static NO_HANDLE: UInt = 0
 
-/// The `entry` argument to `Process.CreateThread` that means "start the thread
+/// The `entry` argument to `Process.ThreadCreate` that means "start the thread
 /// at this process's own IMAGE ENTRY" — the entry the loader took out of the
 /// image header.
 ///
@@ -183,7 +198,7 @@ public static ENTRY_IMAGE: UInt = 0
 /// 8. `Debug` gates the console, `Shutdown` gates stopping the machine — a
 /// process holding the handle without them can name the object and do nothing
 /// with it, which is the point of checking rights per-OP rather than per-object.
-/// `GetClock` gates the one op that hands out a time source, and it is a right
+/// `ClockGet` gates the one op that hands out a time source, and it is a right
 /// rather than an ambient facility for a reason worth stating where the bit is
 /// (design 232 unit 1; the M3 time notes): TIME IS A GRANTED CAPABILITY. A
 /// launcher that strips this bit from a child's System handle has a process
@@ -197,7 +212,7 @@ public enum SystemRight: UInt32 {
     case Manage = 2,
     case Debug = 256,
     case Shutdown = 512,
-    case GetClock = 1024,
+    case ClockGet = 1024,
 }
 
 // The universal low byte, pinned. Every kind's enum repeats these two asserts
@@ -214,8 +229,8 @@ static_assert((SystemRight.Debug as UInt32) >= 256,
               "kind-specific right Debug must start at bit 8 or above")
 static_assert((SystemRight.Shutdown as UInt32) >= 256,
               "kind-specific right Shutdown must start at bit 8 or above")
-static_assert((SystemRight.GetClock as UInt32) >= 256,
-              "kind-specific right GetClock must start at bit 8 or above")
+static_assert((SystemRight.ClockGet as UInt32) >= 256,
+              "kind-specific right ClockGet must start at bit 8 or above")
 
 /// A right on a Process object (§2 table row; design 178 D4).
 ///
@@ -231,7 +246,7 @@ static_assert((SystemRight.GetClock as UInt32) >= 256,
 /// and an op whose only reachable use is degenerate is an op nothing tests. It
 /// lands with M3's multi-process loading, beside `create_process`.
 ///
-/// `CreateEvent` and `CreateWaiter` are M2 unit 3's, and where they sit ANSWERS
+/// `EventCreate` and `WaiterCreate` are M2 unit 3's, and where they sit ANSWERS
 /// an open pin: spec §12 leaves the creation-authority model for plain objects
 /// (Channel/Event/Waiter/Timer) open between quota-gated free creation and a
 /// factory capability. This is the factory capability, and it is one a process
@@ -243,12 +258,12 @@ static_assert((SystemRight.GetClock as UInt32) >= 256,
 /// today. Nothing here forecloses it.
 ///
 /// ONE BIT PER CREATION OP rather than a single `Create`, matching
-/// `CreateThread`. The bits are what attenuation strips, so an object kind a
+/// `ThreadCreate`. The bits are what attenuation strips, so an object kind a
 /// process may not make is a bit it was not given — collapsing them would make
 /// "may create Events" and "may create Waiters" the same capability, which they
 /// are not. Twenty-four bits are available and six are used.
 ///
-/// `BindInterrupt` is the one whose absence MATTERS today, and it is worth
+/// `InterruptBind` is the one whose absence MATTERS today, and it is worth
 /// saying why the same shape carries a much stronger authority: an Interrupt
 /// BINDS AN IRQ LINE, so the bit is what separates a driver process from an
 /// ordinary one. In M2 root holds it because root is the only process there is;
@@ -257,30 +272,30 @@ static_assert((SystemRight.GetClock as UInt32) >= 256,
 public enum ProcessRight: UInt32 {
     case Transfer = 1,
     case Manage = 2,
-    case CreateThread = 256,
+    case ThreadCreate = 256,
     case Exit = 512,
     case Wait = 1024,
-    case CreateEvent = 2048,
-    case CreateWaiter = 4096,
-    case BindInterrupt = 8192,
+    case EventCreate = 2048,
+    case WaiterCreate = 4096,
+    case InterruptBind = 8192,
 }
 
 static_assert((ProcessRight.Transfer as UInt32) == 1,
               "universal right Transfer must be bit 0 in every kind's enum")
 static_assert((ProcessRight.Manage as UInt32) == 2,
               "universal right Manage must be bit 1 in every kind's enum")
-static_assert((ProcessRight.CreateThread as UInt32) >= 256,
-              "kind-specific right CreateThread must start at bit 8 or above")
+static_assert((ProcessRight.ThreadCreate as UInt32) >= 256,
+              "kind-specific right ThreadCreate must start at bit 8 or above")
 static_assert((ProcessRight.Exit as UInt32) >= 256,
               "kind-specific right Exit must start at bit 8 or above")
 static_assert((ProcessRight.Wait as UInt32) >= 256,
               "kind-specific right Wait must start at bit 8 or above")
-static_assert((ProcessRight.CreateEvent as UInt32) >= 256,
-              "kind-specific right CreateEvent must start at bit 8 or above")
-static_assert((ProcessRight.CreateWaiter as UInt32) >= 256,
-              "kind-specific right CreateWaiter must start at bit 8 or above")
-static_assert((ProcessRight.BindInterrupt as UInt32) >= 256,
-              "kind-specific right BindInterrupt must start at bit 8 or above")
+static_assert((ProcessRight.EventCreate as UInt32) >= 256,
+              "kind-specific right EventCreate must start at bit 8 or above")
+static_assert((ProcessRight.WaiterCreate as UInt32) >= 256,
+              "kind-specific right WaiterCreate must start at bit 8 or above")
+static_assert((ProcessRight.InterruptBind as UInt32) >= 256,
+              "kind-specific right InterruptBind must start at bit 8 or above")
 
 /// A right on a Thread object (§2 table row; design 178 D4).
 ///
@@ -411,7 +426,7 @@ static_assert((InterruptRight.Ack as UInt32) >= 256,
 /// a shape that already exists: a process that only ever stamps a log line
 /// holds `Read` alone and can never consume a Timer slot, while a dispatcher
 /// that arms timeouts holds both. Neither is the other's subset in practice —
-/// `CreateTimer` without `Read` is a process that sleeps by the clock without
+/// `TimerCreate` without `Read` is a process that sleeps by the clock without
 /// being able to name what time it is, which is exactly what a pure event loop
 /// does.
 ///
@@ -422,7 +437,7 @@ public enum ClockRight: UInt32 {
     case Transfer = 1,
     case Manage = 2,
     case Read = 256,
-    case CreateTimer = 512,
+    case TimerCreate = 512,
 }
 
 static_assert((ClockRight.Transfer as UInt32) == 1,
@@ -431,8 +446,8 @@ static_assert((ClockRight.Manage as UInt32) == 2,
               "universal right Manage must be bit 1 in every kind's enum")
 static_assert((ClockRight.Read as UInt32) >= 256,
               "kind-specific right Read must start at bit 8 or above")
-static_assert((ClockRight.CreateTimer as UInt32) >= 256,
-              "kind-specific right CreateTimer must start at bit 8 or above")
+static_assert((ClockRight.TimerCreate as UInt32) >= 256,
+              "kind-specific right TimerCreate must start at bit 8 or above")
 
 /// A right on a Timer object (§2 table; design 232 unit 1).
 ///
@@ -484,7 +499,7 @@ static_assert((TimerRight.Wait as UInt32) >= 256,
 /// which is the right default for a set the boot handle hands out.
 public func root_system_rights() -> UInt32 {
     ((SystemRight.Debug as UInt32) | (SystemRight.Shutdown as UInt32)
-     | (SystemRight.Manage as UInt32) | (SystemRight.GetClock as UInt32))
+     | (SystemRight.Manage as UInt32) | (SystemRight.ClockGet as UInt32))
 }
 
 /// What the kernel mints for root's own Process handle (§12, extended by
@@ -495,20 +510,20 @@ public func root_system_rights() -> UInt32 {
 /// every object kind there is — Interrupts included, since root is also the
 /// only process there is to drive a device.
 ///
-/// `BindInterrupt` is the bit M3 will stop handing out freely: root keeps it
+/// `InterruptBind` is the bit M3 will stop handing out freely: root keeps it
 /// (it launches the drivers), and everything root spawns that is not one gets a
 /// handle without it, which is §3's monotonic attenuation with nothing new
 /// added to make it work.
 public func root_process_rights() -> UInt32 {
-    ((ProcessRight.Manage as UInt32) | (ProcessRight.CreateThread as UInt32)
+    ((ProcessRight.Manage as UInt32) | (ProcessRight.ThreadCreate as UInt32)
      | (ProcessRight.Exit as UInt32) | (ProcessRight.Wait as UInt32)
-     | (ProcessRight.CreateEvent as UInt32)
-     | (ProcessRight.CreateWaiter as UInt32)
-     | (ProcessRight.BindInterrupt as UInt32))
+     | (ProcessRight.EventCreate as UInt32)
+     | (ProcessRight.WaiterCreate as UInt32)
+     | (ProcessRight.InterruptBind as UInt32))
 }
 
 /// What the kernel mints for a thread's own handle — root's initial thread at
-/// boot, and every thread `Process.CreateThread` makes.
+/// boot, and every thread `Process.ThreadCreate` makes.
 ///
 /// `Manage` is withheld: a Thread object derives nothing, so the bit would name
 /// an authority that does not exist. The three that are here are the whole of
@@ -553,7 +568,7 @@ public func interrupt_rights() -> UInt32 {
 /// read-only clock is a DERIVATION, and §3 makes derivation monotonic, so it
 /// can never widen back to this.
 public func clock_rights() -> UInt32 {
-    ((ClockRight.Read as UInt32) | (ClockRight.CreateTimer as UInt32))
+    ((ClockRight.Read as UInt32) | (ClockRight.TimerCreate as UInt32))
 }
 
 /// What the kernel mints for a Timer a process has just created (§2 table).
@@ -577,18 +592,18 @@ public func timer_rights() -> UInt32 {
 /// every number that is not an op, which is also what retired `OP_SYSTEM_MAX`:
 /// the range check and the decode are now one operation instead of two that
 /// could disagree.
-/// `GetClock` is the fourth, and it is a GETTER rather than a factory: it
+/// `ClockGet` is the fourth, and it is a GETTER rather than a factory: it
 /// answers with the process's Clock for the domain asked about, minting the
 /// object on first ask and handing back the SAME handle every time after — the
-/// shape `SelfProcess` above already has. There is one monotonic clock on a
+/// shape `ProcessSelf` above already has. There is one monotonic clock on a
 /// machine, so two handles to it would be two names for one thing, which §3's
 /// no-duplicate rule exists to prevent; and an op that cannot allocate on
 /// repetition needs no quota row when quotas land.
 public enum SystemOp: UInt {
     case DebugPrint = 0,
     case Shutdown = 1,
-    case SelfProcess = 2,
-    case GetClock = 3,
+    case ProcessSelf = 2,
+    case ClockGet = 3,
 }
 
 // =============================================================================
@@ -596,10 +611,10 @@ public enum SystemOp: UInt {
 // =============================================================================
 
 /// A METHOD ID on the Process object. Numbered from zero in its OWN table —
-/// `CreateThread` is 0 here and `DebugPrint` is 0 on System, and the pair
+/// `ThreadCreate` is 0 here and `DebugPrint` is 0 on System, and the pair
 /// (handle, op) is what tells them apart.
 ///
-/// `CreateThread` lives here rather than on Thread because there is no Thread
+/// `ThreadCreate` lives here rather than on Thread because there is no Thread
 /// to name yet, and because spec §7 puts the band map on the Process object:
 /// thread creation is where a band is resolved against it, which makes the
 /// Process the enforcement point. (M2 resolves nothing — D3 keeps the map a
@@ -609,13 +624,13 @@ public enum SystemOp: UInt {
 /// which needs an image to load and a second address space to load it into —
 /// both M3, per design 178's option A.
 public enum ProcessOp: UInt {
-    case CreateThread = 0,
-    case SelfThread = 1,
+    case ThreadCreate = 0,
+    case ThreadSelf = 1,
     case Exit = 2,
     case GetStatus = 3,
-    case CreateEvent = 4,
-    case CreateWaiter = 5,
-    case BindInterrupt = 6,
+    case EventCreate = 4,
+    case WaiterCreate = 5,
+    case InterruptBind = 6,
 }
 
 // =============================================================================
@@ -709,7 +724,7 @@ public enum WaiterOp: UInt {
 /// waitable has exactly one.
 ///
 /// There is deliberately no `Bind`/`Unbind` pair either: the binding IS the
-/// object's existence (`ProcessOp.BindInterrupt` takes the line), so a bound
+/// object's existence (`ProcessOp.InterruptBind` takes the line), so a bound
 /// line is a live slot and an unbound one is a slot that was freed. A rebindable
 /// Interrupt would let one handle name two different devices over its life,
 /// which is exactly what a capability must not do.
@@ -734,7 +749,7 @@ public enum InterruptOp: UInt {
 /// syscall-free future for this one op and changes nothing about its shape.
 public enum ClockOp: UInt {
     case Now = 0,
-    case CreateTimer = 1,
+    case TimerCreate = 1,
 }
 
 // =============================================================================
@@ -764,7 +779,7 @@ public enum TimerOp: UInt {
     case Disarm = 1,
 }
 
-/// WHICH CLOCK a Timer runs against, and what `System.GetClock` names (§2's
+/// WHICH CLOCK a Timer runs against, and what `System.ClockGet` names (§2's
 /// Clock row; design 232 unit 1, the M3 time notes).
 ///
 /// **v1 DECLARES `Monotonic` AND NOTHING ELSE.** `Boot` and `Realtime` are named

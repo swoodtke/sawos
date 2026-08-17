@@ -393,7 +393,7 @@ static MAX_INTERRUPTS: Int = 4
 /// Clocks the kernel can hold, across all processes (spec §2 table; design 232
 /// unit 1).
 ///
-/// TINY, AND IT IS A BOUND RATHER THAN A BUDGET. `System.GetClock` is a getter:
+/// TINY, AND IT IS A BOUND RATHER THAN A BUDGET. `System.ClockGet` is a getter:
 /// it mints a process's Clock for a domain on first ask and hands the same
 /// handle back every time after, so a process can hold at most one per
 /// `ClockType` and v1 declares one type. One per process is therefore the exact
@@ -482,7 +482,7 @@ enum ThreadState: UInt8 {
 struct ThreadSlot {
     state: ThreadState,
     process: Int,
-    /// This thread's own handle in its process's table — what `SelfThread`
+    /// This thread's own handle in its process's table — what `ThreadSelf`
     /// hands back, kept here so the derivation is a read rather than a search.
     self_handle: UInt,
     exit_code: UInt,
@@ -537,7 +537,7 @@ enum ProcessState: UInt8 {
 /// with nowhere to receive a record cannot receive one.
 struct ProcessSlot {
     state: ProcessState,
-    /// This process's own handle in its own table (what `SelfProcess` returns).
+    /// This process's own handle in its own table (what `ProcessSelf` returns).
     self_handle: UInt,
     /// The image entry, which is what `ENTRY_IMAGE` resolves to.
     entry: UInt,
@@ -1996,7 +1996,7 @@ func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt,
         // System object which Process it is, and the Process object which
         // Thread — so the kernel never has to widen the entry register, and a
         // process that was given no System handle has no way to name either.
-        case SelfProcess -> {
+        case ProcessSelf -> {
             if not obj.allows(SystemRight.Manage) {
                 fault_process(p, FaultReason.AccessDenied)
             }
@@ -2007,11 +2007,11 @@ func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt,
         // clock at all — which is what makes handing a child a VIRTUAL clock
         // over IPC a substitution rather than a rewrite, since a child holding
         // no kernel Clock has no second way to ask.
-        case GetClock -> {
-            if not obj.allows(SystemRight.GetClock) {
+        case ClockGet -> {
+            if not obj.allows(SystemRight.ClockGet) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            get_clock(p, arg0)
+            clock_get(p, arg0)
         },
     }
 }
@@ -2019,13 +2019,13 @@ func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt,
 /// Hand process `p` its Clock for the domain `raw_kind` names (§2's Clock row).
 ///
 /// The DOMAIN arrives as a raw register word the process chose, so it is decoded
-/// rather than trusted, on `create_event`'s precedent exactly: a number that is
+/// rather than trusted, on `event_create`'s precedent exactly: a number that is
 /// not a `ClockType` is a caller error the process could have checked, which
 /// under design 178's faults ruling ends it. v1 declares one domain, so every
 /// number but zero lands here.
-func get_clock(p: Int, raw_kind: UInt) unsafe -> SyscallResult {
+func clock_get(p: Int, raw_kind: UInt) unsafe -> SyscallResult {
     guard let kind = ClockType.from(raw: raw_kind) else { fault_process(p, FaultReason.BadArg) }
-    return get_clock_typed(p, kind)
+    return clock_get_typed(p, kind)
 }
 
 /// FIND OR CREATE, and the find is what makes this a getter rather than a
@@ -2034,9 +2034,9 @@ func get_clock(p: Int, raw_kind: UInt) unsafe -> SyscallResult {
 /// A machine has ONE monotonic clock, so two Clock objects naming it would be
 /// two names for one thing — which is what §3's no-duplicate rule exists to
 /// prevent. Asking twice is therefore a QUERY that answers with the same handle,
-/// exactly as `SelfProcess` does, and an op that cannot allocate on repetition
+/// exactly as `ProcessSelf` does, and an op that cannot allocate on repetition
 /// is one no quota row has to bound when quotas land in M3 unit 5.
-func get_clock_typed(p: Int, kind: ClockType) unsafe -> SyscallResult {
+func clock_get_typed(p: Int, kind: ClockType) unsafe -> SyscallResult {
     var i: Int = 0
     while i < MAX_CLOCKS {
         match CLOCKS[i].state {
@@ -2059,7 +2059,7 @@ func get_clock_typed(p: Int, kind: ClockType) unsafe -> SyscallResult {
         return op_status(SosStatus.NoResource)
     }
     // Written only once BOTH allocations succeeded, so a refused handle leaves
-    // the slab exactly as it found it — `create_event`'s all-or-nothing shape.
+    // the slab exactly as it found it — `event_create`'s all-or-nothing shape.
     CLOCKS[slot] = ClockSlot(state: SlotState.Live, process: p, kind: kind)
     op_value(handle)
 }
@@ -2102,13 +2102,13 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
                         arg0: UInt, arg1: UInt, arg2: UInt,
                         p: Int) unsafe -> SyscallResult {
     match op {
-        case CreateThread -> {
-            if not obj.allows(ProcessRight.CreateThread) {
+        case ThreadCreate -> {
+            if not obj.allows(ProcessRight.ThreadCreate) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            create_thread(obj.slot, arg0, arg1, arg2)
+            thread_create(obj.slot, arg0, arg1, arg2)
         },
-        case SelfThread -> {
+        case ThreadSelf -> {
             if not obj.allows(ProcessRight.Manage) {
                 fault_process(p, FaultReason.AccessDenied)
             }
@@ -2141,30 +2141,30 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
                                       PROCESSES[obj.slot].exit_code))
         },
         // The creation authority for §2's plain objects, answering spec §12's
-        // open pin the way `CreateThread` already does: it flows through a
+        // open pin the way `ThreadCreate` already does: it flows through a
         // handle the process holds, so it is §3's derivation rule rather than a
         // new mechanism beside it. See `ProcessRight`.
-        case CreateEvent -> {
-            if not obj.allows(ProcessRight.CreateEvent) {
+        case EventCreate -> {
+            if not obj.allows(ProcessRight.EventCreate) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            create_event(obj.slot, arg0)
+            event_create(obj.slot, arg0)
         },
-        case CreateWaiter -> {
-            if not obj.allows(ProcessRight.CreateWaiter) {
+        case WaiterCreate -> {
+            if not obj.allows(ProcessRight.WaiterCreate) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            create_waiter(obj.slot)
+            waiter_create(obj.slot)
         },
         // Binding an IRQ line is the strongest of the creation authorities, and
         // it flows through the same handle for the same reason: the Process
         // object is what an Interrupt is charged to, and a bit is what a
         // launcher strips from everything that is not a driver.
-        case BindInterrupt -> {
-            if not obj.allows(ProcessRight.BindInterrupt) {
+        case InterruptBind -> {
+            if not obj.allows(ProcessRight.InterruptBind) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            bind_interrupt(obj.slot, arg0)
+            interrupt_bind(obj.slot, arg0)
         },
     }
 }
@@ -2174,12 +2174,12 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
 /// The MODE arrives as a raw register word the process chose, so it is decoded
 /// rather than trusted: a number that is not a mode is a caller error the
 /// process could have checked, which under design 178's faults ruling ends it.
-func create_event(p: Int, raw_mode: UInt) unsafe -> SyscallResult {
+func event_create(p: Int, raw_mode: UInt) unsafe -> SyscallResult {
     guard let mode = EventMode.from(raw: raw_mode) else { fault_process(p, FaultReason.BadArg) }
-    return create_event_moded(p, mode)
+    return event_create_moded(p, mode)
 }
 
-func create_event_moded(p: Int, mode: EventMode) unsafe -> SyscallResult {
+func event_create_moded(p: Int, mode: EventMode) unsafe -> SyscallResult {
     let slot = alloc_event()
     if slot == NO_EVENT {
         return op_status(SosStatus.NoResource)
@@ -2201,7 +2201,7 @@ func create_event_moded(p: Int, mode: EventMode) unsafe -> SyscallResult {
 /// A SCAN over four slots, and it is what turns the trap path's line number
 /// back into an object. Keeping a line -> slot map instead would be a second
 /// description of the same fact — the bindings are already in the table, and
-/// the table is the only place a line may be bound twice, which `bind_interrupt`
+/// the table is the only place a line may be bound twice, which `interrupt_bind`
 /// refuses using exactly this walk.
 func interrupt_by_line(line: UInt) unsafe -> Int {
     var i: Int = 0
@@ -2241,7 +2241,7 @@ func interrupt_by_line(line: UInt) unsafe -> Int {
 /// mask-on-fire, ack-to-rearm, so something has to arm it first and creation is
 /// that something. The DEVICE's own interrupt-enable register is not touched —
 /// that is the driver's, through the window it was granted.
-func bind_interrupt(p: Int, line: UInt) unsafe -> SyscallResult {
+func interrupt_bind(p: Int, line: UInt) unsafe -> SyscallResult {
     if line == hal.IRQ_TIMER || not hal.irq_line_valid(line) {
         fault_process(p, FaultReason.BadArg)
     }
@@ -2264,7 +2264,7 @@ func bind_interrupt(p: Int, line: UInt) unsafe -> SyscallResult {
 }
 
 /// Make a Waiter in process `slot` (spec §2.2).
-func create_waiter(p: Int) unsafe -> SyscallResult {
+func waiter_create(p: Int) unsafe -> SyscallResult {
     let slot = alloc_waiter()
     if slot == NO_WAITER {
         return op_status(SosStatus.NoResource)
@@ -2285,7 +2285,7 @@ func create_waiter(p: Int) unsafe -> SyscallResult {
 /// stacks are — so a bad one terminates it rather than producing a thread that
 /// would fault on its first instruction and take the process down anyway, with
 /// a worse diagnostic.
-func create_thread(p: Int, entry: UInt, stack_top: UInt, arg: UInt) unsafe -> SyscallResult {
+func thread_create(p: Int, entry: UInt, stack_top: UInt, arg: UInt) unsafe -> SyscallResult {
     let start = if entry == ENTRY_IMAGE { PROCESSES[p].entry } else { entry }
     if start < PROCESSES[p].region_base || start >= PROCESSES[p].region_top {
         fault_process(p, FaultReason.BadEntry)
@@ -2511,11 +2511,11 @@ func clock_op_decoded(op: ClockOp, obj: &ClockObject, arg0: UInt, arg1: UInt,
         // other factory ops: the authority and the binding are one act, and a
         // Timer made through a Process handle would have no domain to measure
         // against.
-        case CreateTimer -> {
-            if not obj.allows(ClockRight.CreateTimer) {
+        case TimerCreate -> {
+            if not obj.allows(ClockRight.TimerCreate) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            create_timer(p, obj.slot)
+            timer_create(p, obj.slot)
         },
     }
 }
@@ -2535,7 +2535,7 @@ func clock_now(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
 }
 
 /// Make a Timer bound to clock `c` in process `p` (spec §2 table).
-func create_timer(p: Int, c: Int) unsafe -> SyscallResult {
+func timer_create(p: Int, c: Int) unsafe -> SyscallResult {
     let slot = alloc_timer()
     if slot == NO_TIMER {
         return op_status(SosStatus.NoResource)
@@ -3165,7 +3165,7 @@ static NEVER_NS: UInt64 = UInt64.max
 /// one-shot still reports exactly one fire. What the floor bounds is the
 /// RESOLUTION, and 50 microseconds is two orders of magnitude below the
 /// millisecond scheduler tick, so §7's cadence never notices it.
-static TIMER_MIN_LEAD_NS: UInt64 = 50000
+static TIMER_MIN_LEAD_NS: UInt64 = 50_000
 
 /// The scheduler tick's period in nanoseconds; 0 means NO PERIODIC TICK.
 ///
@@ -3750,8 +3750,8 @@ public func load_root_and_enter() unsafe {
     //
     // §12: root's boot handle set. It is still exactly one handle — System —
     // and every authority root has flows through it, now including its own
-    // Process and Thread objects, which it DERIVES (`SelfProcess` /
-    // `SelfThread`) rather than being handed.
+    // Process and Thread objects, which it DERIVES (`ProcessSelf` /
+    // `ThreadSelf`) rather than being handed.
     start_process(entry, hal.ROOT_REGION_TOP, hal.ROOT_LOAD_BASE,
                   hal.ROOT_REGION_TOP, rw_base, hal.ROOT_REGION_TOP)
 }
