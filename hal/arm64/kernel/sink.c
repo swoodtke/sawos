@@ -140,14 +140,19 @@ void sos_prot_commit(void) {
 // One instruction each, so one line each — the same shape the payload bounds
 // above have, for the same reason.
 //
-// `sos_timer_set_countdown` is the timer's down-counter: it counts from what is
-// written here and asserts when it runs out, so writing it is also what lowers
-// the line for a tick already taken.
+// `sos_timer_count` and `sos_timer_set_compare` are the ABSOLUTE pair (design
+// 232 unit 1): the counter is free-running and 64 bits wide, and the compare
+// register is a 64-bit deadline on the same scale, so writing a deadline in the
+// future is what lowers the line for a fire already taken. The DOWN-counter
+// (`cntp_tval_el0`) that M2 used instead is gone with the periodic-only seam it
+// belonged to — it is 32 bits signed, so it could not express a deadline more
+// than ~34 seconds out at this machine's 62.5 MHz, which a Timer object can.
 
 u64 sos_timer_freq(void) { u64 v; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v)); return v; }
 u64 sos_timer_ctl_read(void) { u64 v; __asm__ volatile("mrs %0, cntp_ctl_el0" : "=r"(v)); return v; }
 void sos_timer_ctl_write(u64 v) { __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(v)); }
-void sos_timer_set_countdown(u64 n) { __asm__ volatile("msr cntp_tval_el0, %0" :: "r"(n)); }
+u64 sos_timer_count(void) { u64 v; __asm__ volatile("mrs %0, cntpct_el0" : "=r"(v)); return v; }
+void sos_timer_set_compare(u64 v) { __asm__ volatile("msr cntp_cval_el0, %0" :: "r"(v)); }
 
 // ---- parking the core while the kernel idles ------------------------------
 //

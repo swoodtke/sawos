@@ -59,7 +59,7 @@ rather than a byte to THR.
 | `sos_platform_exit(code)` | sink.c | Stop the machine through semihosting `SYS_EXIT`. | `hlt #0xf000` with the call number and parameter block pinned in x0/x1. |
 | `sos_mmu_init()` | sink.c | Ask `lib.saw` for a finished identity map, then turn the MMU on. Called by `_start` after `.bss` is zeroed, because the tables live there. | `msr`/`mrs` to four system registers plus `dsb`/`isb`. The MAP is Saw (design 172 unit 1). |
 | `sos_prot_commit()` | sink.c | Publish the staged grant set. | `dsb`/`isb` barriers and a `tlbi`. The DESCRIPTORS are Saw. |
-| `sos_timer_freq()` / `sos_timer_ctl_read()` / `sos_timer_ctl_write(v)` / `sos_timer_set_countdown(n)` | sink.c | The core's physical timer: its frequency, its control register (enabled / masked / fired), and the down-counter whose expiry raises the line. | `mrs`/`msr` name a system register at assembly time. One instruction each; the period arithmetic and the tick policy are Saw. |
+| `sos_timer_freq()` / `sos_timer_ctl_read()` / `sos_timer_ctl_write(v)` / `sos_timer_count()` / `sos_timer_set_compare(v)` | sink.c | The core's physical timer: its frequency, its control register (enabled / masked / fired), the free-running 64-bit counter, and the 64-bit ABSOLUTE deadline it is compared against. | `mrs`/`msr` name a system register at assembly time. One instruction each; the nanosecond arithmetic, the tick policy and the deadline composition are Saw. |
 | `sos_payload_start()` / `sos_payload_end()` | sink.c | Bounds of the appended payload. | A linker symbol's ADDRESS, which Saw cannot name — DF-172a. |
 | `sos_wait_for_irq()` | sink.c | Park the core until an interrupt is pending, behind `wait_for_irq`. | `wfi` is an INSTRUCTION. One line, and it is the whole of design 178 M2 unit 4's native delta on this profile. |
 | `virt.ld` | — | Places the image at RAM base 0x4000_0000 and bounds the appended payload on PAGE boundaries — protection granularity here is the page. | Not a program. |
@@ -193,6 +193,20 @@ built in assembly, entered once, with no storage a second thread could have had.
   does nothing for the timer. Here every tick goes round the ordinary
   claim/complete cycle, which is also why THIS profile exercises that cycle
   without the selftest line and Profile A does not.
+- **ONE COMPARE REGISTER, TWO CUSTOMERS** (design 232 unit 1). The scheduler
+  tick and the Timer objects share `cntp_cval_el0`, and the sharing is the
+  KERNEL's arithmetic, not this HAL's: the seam is `timer_now_ns()` +
+  `timer_set_deadline_ns(at)` — a counter read and an absolute deadline — and
+  `sos/kernel/core/` programs the earliest deadline it owes anybody. What this
+  machine does with such a deadline: converts nanoseconds to counter units at
+  `cntfrq_el0` (62.5 MHz under QEMU, so 16 ns a unit), rounding UP so a deadline
+  never fires early; writes `cntp_cval_el0` BEFORE enabling, so a stale compare
+  value cannot assert in the gap; then enables `cntp_ctl_el0` and unmasks line
+  30 at the distributor, both idempotently. The kernel's "never" deadline
+  (`UInt64.max`) saturates to a counter value this machine reaches in some nine
+  thousand years. M2's `sos_timer_set_countdown` retired with the periodic-only
+  seam: `cntp_tval_el0` is 32 bits SIGNED, so it could not express a deadline
+  more than ~34 seconds out, which a Timer object can.
 - **D2 is masking plus a vector.** The kernel runs with interrupts masked at
   its own exception level throughout — the hardware masks on every exception
   entry, and the boot path never unmasks — and the user-mode return is where

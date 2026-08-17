@@ -1286,11 +1286,19 @@ public func irq_raise_selftest_line() unsafe -> UInt {
 // touches below are C leaves. What they are worth is one instruction each; the
 // arithmetic, the period and the policy are here.
 //
-// The timer counts DOWN from a value the kernel writes and asserts its line
-// while the count is negative — a level condition, so the tick path REARMS
-// (writes the next countdown) and that is what lowers the line. The controller
-// still needs its end-of-interrupt afterwards, which is the one asymmetry with
-// Profile A worth knowing: there, the timer is not a controller line at all.
+// The counter is free-running and the compare register is an ABSOLUTE deadline
+// on the same scale; the line asserts while the counter is at or past it — a
+// level condition, so servicing a fire means PROGRAMMING THE NEXT DEADLINE
+// rather than acknowledging one. The controller still needs its
+// end-of-interrupt afterwards, which is the one asymmetry with Profile A worth
+// knowing: there, the timer is not a controller line at all.
+//
+// ONE COMPARE REGISTER, TWO CUSTOMERS (design 232 unit 1). The scheduler tick
+// (spec §7) and the Timer objects (§2) share this single piece of hardware, and
+// the seam takes an absolute deadline precisely so that sharing is the KERNEL's
+// arithmetic: it programs the earliest of the two and this file never learns
+// there were two. That is what replaced M2's `timer_start`/`timer_rearm` pair,
+// which could only express one periodic customer.
 
 extern "C" {
     // The timer's frequency in ticks per second — a property of the machine,
@@ -1299,39 +1307,73 @@ extern "C" {
     // The control register: enabled, masked, and whether the timer has fired.
     func sos_timer_ctl_read() -> UInt
     func sos_timer_ctl_write(value: UInt)
-    // Count down from `units` and assert the line when it runs out.
-    func sos_timer_set_countdown(units: UInt)
+    // The free-running counter, and the deadline it is compared against.
+    func sos_timer_count() -> UInt
+    func sos_timer_set_compare(value: UInt)
 }
 
 static TIMER_CTL_ENABLE: UInt = 1         // bit 0
 static TIMER_CTL_FIRED: UInt = 4          // bit 2 — the condition is met
-static US_PER_SECOND: UInt = 1000000
+static NS_PER_SECOND: UInt64 = 1000000000
 
-/// The tick period in timer units, staged for `timer_rearm`. Compound global
-/// state on a serialization argument the compiler cannot see (design 149):
-/// uniprocessor, and only bring-up writes it.
-unsafe static var TIMER_PERIOD: UInt = 0
-
-/// Start a periodic tick every `period_us` microseconds.
+/// Counter units to nanoseconds, exactly and without overflowing.
 ///
-/// The conversion multiplies BEFORE dividing: this machine's timer runs at
-/// 62.5 MHz, so a ticks-per-microsecond constant would be 62 and every period
-/// would be short by 0.8%.
-public func timer_start(period_us: UInt) unsafe {
-    TIMER_PERIOD = (period_us * sos_timer_freq()) / US_PER_SECOND
-    irq_unmask(IRQ_TIMER)
-    timer_rearm()
-    sos_timer_ctl_write(TIMER_CTL_ENABLE)
+/// THE SPLIT IS WHAT MAKES IT EXACT AT BOTH ENDS. A plain `units * 1e9 / freq`
+/// overflows a 64-bit product after about five minutes of uptime at this
+/// machine's 62.5 MHz; a plain `units / (freq / 1e9)` is a division by zero,
+/// since no sane timer runs at a gigahertz. Splitting into whole seconds plus a
+/// remainder keeps every intermediate inside the word and loses nothing: the
+/// remainder is below `freq`, so its product with 1e9 cannot overflow either.
+func units_to_ns(units: UInt64) unsafe -> UInt64 {
+    let freq = sos_timer_freq() as UInt64
+    (units / freq) * NS_PER_SECOND + ((units % freq) * NS_PER_SECOND) / freq
 }
 
-/// Schedule the next tick, which is also what lowers the line for the tick the
-/// kernel is servicing.
+/// Nanoseconds to counter units, the same split run backwards, rounding UP.
 ///
-/// The countdown restarts from NOW rather than from the missed deadline: a tick
-/// the kernel was late for is one tick, never a burst of catch-up ticks whose
-/// only effect would be to keep the machine in the trap handler.
-public func timer_rearm() unsafe {
-    sos_timer_set_countdown(TIMER_PERIOD)
+/// UP rather than nearest, because the seam's contract is that a deadline never
+/// fires EARLY: the kernel's composition treats an interrupt as "something may
+/// be due" and reprograms if nothing is, so an early fire costs a round trip
+/// while a late one costs nothing. The saturating guard is what keeps the
+/// kernel's "never" deadline representable — the seconds product would
+/// otherwise overflow, and Saw's overflow checks are on in a kernel.
+func ns_to_units(ns: UInt64) unsafe -> UInt64 {
+    let freq = sos_timer_freq() as UInt64
+    let secs = ns / NS_PER_SECOND
+    if secs > UInt64.max / freq {
+        return UInt64.max
+    }
+    let rem = ns % NS_PER_SECOND
+    secs * freq + ((rem * freq) + NS_PER_SECOND - 1) / NS_PER_SECOND
+}
+
+/// This machine's monotonic time in NANOSECONDS since the counter started
+/// (design 232 unit 1; spec §2's Clock row).
+///
+/// THE COUNTER IS THE CLOCK. There is no second time source and no software
+/// accumulator — the free-running counter is what a `Clock.now()` reads and
+/// what every Timer deadline is measured against, so the two can never disagree
+/// about what "now" is. Its epoch is the machine's power-on, which is exactly
+/// the Monotonic domain's contract: it never steps and never goes backwards.
+public func timer_now_ns() unsafe -> UInt64 {
+    units_to_ns(sos_timer_count() as UInt64)
+}
+
+/// Program the ONE compare register to interrupt at `at_ns`.
+///
+/// A deadline already past fires as soon as interrupts are deliverable. A
+/// deadline of `UInt64.max` is the kernel's "never", and saturates to a counter
+/// value this machine reaches in some nine thousand years.
+///
+/// THE ORDER IS DELIBERATE: the deadline is written BEFORE the timer is
+/// enabled, so a stale compare value left over from an earlier schedule can
+/// never assert in the gap. Enabling and unmasking every time is idempotent and
+/// is what lets a kernel that armed no tick at boot — the real one — still
+/// serve a Timer a process armed later.
+public func timer_set_deadline_ns(at_ns: UInt64) unsafe {
+    sos_timer_set_compare(ns_to_units(at_ns) as UInt)
+    sos_timer_ctl_write(TIMER_CTL_ENABLE)
+    irq_unmask(IRQ_TIMER)
 }
 
 /// Has the timer fired without a tick having been taken for it?

@@ -1,0 +1,175 @@
+// SOS M3 unit 1: A PROCESS SLEEPS (design 232; spec §2's Timer row, §2.2).
+//
+// The headline of the unit, and the transcript is read as an ORDER:
+//
+//   SOS oneshot: parking on a timer      <- written BEFORE the wait
+//   SOS oneshot: woke key=55 fires=1 slept=1
+//   SOS oneshot: rearmed woke fires=1
+//   SOS oneshot: done
+//
+// WHAT THE FIRST WAKE RULES OUT. This image's kernel arms NO scheduler tick and
+// the process has ONE thread, so at the moment of the wait there is nothing
+// runnable and no other thread that could ever make something runnable. Every
+// wake source SOS had before this unit came from a thread (an Event is
+// signalled by somebody) or from a device (a bound IRQ line), and this process
+// binds no line. So the wait either parks and is woken BY THE CLOCK, or the
+// kernel reports the deadlock — which is exactly what `timer-deadlock` beside
+// this case makes it do by arming nothing. The two together are the idle rule's
+// two branches.
+//
+// `slept=1` IS THE CLOCK AGREEING WITH ITSELF. It compares readings taken
+// either side of the wait and asserts that at least the armed delay passed, so
+// a `wait` that returned immediately — a readiness bug — fails here even though
+// the fire count would look right.
+//
+// `fires=1` AND THE SECOND ARM ARE THE ONE-SHOT CONTRACT. A one-shot disarms
+// ITSELF when it fires, so the second wait can only be reached by arming again;
+// a timer that stayed armed would make the count on the second wake wrong, and
+// one that stayed ready would make the second wait answer without parking.
+//
+// THERE IS NO ACK ANYWHERE IN THIS FILE. That is the difference from §9's
+// Interrupt, and it is deliberate: the wait that reported the fire is what
+// consumed it.
+
+import sos.{System, Process, Clock, ClockType, Timer, Waiter, WaitResult,
+            WaitPayload}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static YES: UInt = 1
+static NO: UInt = 0
+
+/// The key this case attaches under and expects back — a number no bit pattern
+/// in this file could produce by accident.
+static KEY: UInt = 55
+
+/// Two milliseconds: long enough that the wait genuinely parks on either
+/// machine, short enough that the case costs nothing.
+static DELAY_NS: UInt64 = 2000000
+
+func flag(b: Bool) -> UInt {
+    if b { YES } else { NO }
+}
+
+/// The fire count out of the record the kernel copied into this process's
+/// memory while the thread was parked.
+func fires_of(r: &WaitResult) -> UInt {
+    match r.what {
+        case Timer(fires) -> fires,
+        case Event(_) -> panic("this program attached no event"),
+        case Interrupt(_) -> panic("this program attached no interrupt"),
+    }
+}
+
+func now_of(clock: &Clock) -> UInt64 {
+    match clock.now() {
+        case Ok(t) -> t,
+        case Err(_) -> 0u64,
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.self_process() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS oneshot: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let clock = match system.get_clock(kind: ClockType.Monotonic) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS oneshot: no clock: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let waiter = match proc.create_waiter() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS oneshot: no waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let timer = match clock.create_timer() {
+        case Ok(t) -> t,
+        case Err(e) -> {
+            print("SOS oneshot: no timer: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // ATTACH BEFORE ARMING, on purpose. A disarmed Timer is never ready, so
+    // this attach reports nothing and the wait below is reached with an empty
+    // wait set that only the arm can fill — which is the ordering a dispatcher
+    // uses (build the set once, arm timeouts as they come up).
+    match waiter.add(&timer, KEY) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS oneshot: attach failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // READ THE CLOCK BEFORE ARMING, not after. The deadline is set relative to
+    // the arm, so a reading taken after it would be LATER than the instant the
+    // delay is measured from and `slept` could read false on a correct kernel —
+    // the assertion has to bracket the arm, not sit inside it.
+    let before = now_of(&clock)
+
+    // No `interval_ns`, so this is a ONE-SHOT: it fires once and disarms itself.
+    match timer.arm(after_ns: DELAY_NS) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS oneshot: arm failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let _ = system.debug_print("SOS oneshot: parking on a timer\n")
+
+    let first = match waiter.wait() {
+        case Ok(r) -> r,
+        case Err(e) -> {
+            print("SOS oneshot: wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let after = now_of(&clock)
+    print("SOS oneshot: woke key={} fires={} slept={}\n",
+          first.key, fires_of(&first), flag(after - before >= DELAY_NS))
+
+    // The one-shot disarmed itself, so the attachment is still in the wait set
+    // and still not ready. Arming again is the whole of what it takes to use
+    // the same Timer a second time — no detach, no re-attach, no ack.
+    match timer.arm(after_ns: DELAY_NS) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS oneshot: rearm failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let second = match waiter.wait() {
+        case Ok(r) -> r,
+        case Err(e) -> {
+            print("SOS oneshot: second wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    print("SOS oneshot: rearmed woke fires={}\n", fires_of(&second))
+
+    print("SOS oneshot: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

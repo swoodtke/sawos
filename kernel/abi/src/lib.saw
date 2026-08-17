@@ -64,6 +64,8 @@ public enum ObjType: UInt8 {
     case Event = 4,
     case Waiter = 5,
     case Interrupt = 6,
+    case Clock = 7,
+    case Timer = 8,
 }
 
 // WHICH KINDS ARE WAITABLE is deliberately NOT recorded here (§2.2). It cannot
@@ -116,6 +118,14 @@ public type WaiterHandle = UInt
 /// A handle naming an Interrupt object (§2 table, §9) — an IRQ line bound to a
 /// waitable. Same discipline as every other handle type.
 public type InterruptHandle = UInt
+
+/// A handle naming a Clock object (§2 table; design 232 unit 1) — a granted
+/// time source. Same discipline as every other handle type.
+public type ClockHandle = UInt
+
+/// A handle naming a Timer object (§2 table; design 232 unit 1) — a deadline
+/// bound to the Clock that created it. Same discipline again.
+public type TimerHandle = UInt
 
 /// A handle index the table can never hand out. Handle 0 names nothing, so a
 /// zeroed register is never authority (see `ObjType.Unbound`).
@@ -173,11 +183,21 @@ public static ENTRY_IMAGE: UInt = 0
 /// 8. `Debug` gates the console, `Shutdown` gates stopping the machine — a
 /// process holding the handle without them can name the object and do nothing
 /// with it, which is the point of checking rights per-OP rather than per-object.
+/// `GetClock` gates the one op that hands out a time source, and it is a right
+/// rather than an ambient facility for a reason worth stating where the bit is
+/// (design 232 unit 1; the M3 time notes): TIME IS A GRANTED CAPABILITY. A
+/// launcher that strips this bit from a child's System handle has a process
+/// that cannot read the machine's clock at all — which is what makes handing it
+/// a VIRTUAL clock over IPC later a substitution rather than a rewrite. It is
+/// deliberately NOT in the stripped-by-construction set the M3 device rulings
+/// describe (`Shutdown` and the bind/alloc ops): an ordinary process needs to
+/// tell the time, and a clock grants authority over nothing.
 public enum SystemRight: UInt32 {
     case Transfer = 1,
     case Manage = 2,
     case Debug = 256,
     case Shutdown = 512,
+    case GetClock = 1024,
 }
 
 // The universal low byte, pinned. Every kind's enum repeats these two asserts
@@ -194,6 +214,8 @@ static_assert((SystemRight.Debug as UInt32) >= 256,
               "kind-specific right Debug must start at bit 8 or above")
 static_assert((SystemRight.Shutdown as UInt32) >= 256,
               "kind-specific right Shutdown must start at bit 8 or above")
+static_assert((SystemRight.GetClock as UInt32) >= 256,
+              "kind-specific right GetClock must start at bit 8 or above")
 
 /// A right on a Process object (§2 table row; design 178 D4).
 ///
@@ -383,6 +405,67 @@ static_assert((InterruptRight.Wait as UInt32) >= 256,
 static_assert((InterruptRight.Ack as UInt32) >= 256,
               "kind-specific right Ack must start at bit 8 or above")
 
+/// A right on a Clock object (§2 table; design 232 unit 1).
+///
+/// THE TWO SPLIT READING TIME FROM SCHEDULING IT, and they attenuate apart for
+/// a shape that already exists: a process that only ever stamps a log line
+/// holds `Read` alone and can never consume a Timer slot, while a dispatcher
+/// that arms timeouts holds both. Neither is the other's subset in practice —
+/// `CreateTimer` without `Read` is a process that sleeps by the clock without
+/// being able to name what time it is, which is exactly what a pure event loop
+/// does.
+///
+/// `Manage` is withheld at creation for the reason `ProcessRight` gives about
+/// one bit per creation op: a Clock's only derivation IS a Timer, and that has
+/// its own bit, so the universal derive bit would be a second name for it.
+public enum ClockRight: UInt32 {
+    case Transfer = 1,
+    case Manage = 2,
+    case Read = 256,
+    case CreateTimer = 512,
+}
+
+static_assert((ClockRight.Transfer as UInt32) == 1,
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((ClockRight.Manage as UInt32) == 2,
+              "universal right Manage must be bit 1 in every kind's enum")
+static_assert((ClockRight.Read as UInt32) >= 256,
+              "kind-specific right Read must start at bit 8 or above")
+static_assert((ClockRight.CreateTimer as UInt32) >= 256,
+              "kind-specific right CreateTimer must start at bit 8 or above")
+
+/// A right on a Timer object (§2 table; design 232 unit 1).
+///
+/// `Arm` GATES BOTH `Arm` AND `Disarm`, which is one bit for what reads like two
+/// operations — the same call `WaiterRight.Attach` makes, and for the same
+/// reason: they are one capability, the power to decide when this timer fires.
+/// A holder who may arm can already silence a timer by arming it a century out,
+/// so splitting the pair would produce a right that withholds nothing.
+///
+/// `Wait` is the right to have readiness OBSERVED — what attaching to a Waiter
+/// spends, the same meaning it has on an Event and an Interrupt — and it is
+/// separate because the roles genuinely divide: a supervisor parked on a set of
+/// timeouts holds `Wait` alone and can never reschedule one.
+///
+/// `Manage` is withheld at creation for the reason `thread_rights` gives: a
+/// Timer derives nothing, so the universal derive bit would name an authority
+/// that does not exist.
+public enum TimerRight: UInt32 {
+    case Transfer = 1,
+    case Manage = 2,
+    case Arm = 256,
+    case Wait = 512,
+}
+
+static_assert((TimerRight.Transfer as UInt32) == 1,
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((TimerRight.Manage as UInt32) == 2,
+              "universal right Manage must be bit 1 in every kind's enum")
+static_assert((TimerRight.Arm as UInt32) >= 256,
+              "kind-specific right Arm must start at bit 8 or above")
+static_assert((TimerRight.Wait as UInt32) >= 256,
+              "kind-specific right Wait must start at bit 8 or above")
+
 /// What the kernel mints for root's System handle at boot (§12).
 ///
 /// A function rather than a `static` because a static initializer takes plain
@@ -401,7 +484,7 @@ static_assert((InterruptRight.Ack as UInt32) >= 256,
 /// which is the right default for a set the boot handle hands out.
 public func root_system_rights() -> UInt32 {
     ((SystemRight.Debug as UInt32) | (SystemRight.Shutdown as UInt32)
-     | (SystemRight.Manage as UInt32))
+     | (SystemRight.Manage as UInt32) | (SystemRight.GetClock as UInt32))
 }
 
 /// What the kernel mints for root's own Process handle (§12, extended by
@@ -463,6 +546,21 @@ public func interrupt_rights() -> UInt32 {
     ((InterruptRight.Wait as UInt32) | (InterruptRight.Ack as UInt32))
 }
 
+/// What the kernel mints for a Clock a process has just been granted (§2 table).
+///
+/// Both ends, for the reason `event_rights` gives: the grant is the whole
+/// capability and there is nobody to attenuate against yet. A child handed a
+/// read-only clock is a DERIVATION, and §3 makes derivation monotonic, so it
+/// can never widen back to this.
+public func clock_rights() -> UInt32 {
+    ((ClockRight.Read as UInt32) | (ClockRight.CreateTimer as UInt32))
+}
+
+/// What the kernel mints for a Timer a process has just created (§2 table).
+public func timer_rights() -> UInt32 {
+    ((TimerRight.Arm as UInt32) | (TimerRight.Wait as UInt32))
+}
+
 // =============================================================================
 // The System object's op table (spec §2)
 // =============================================================================
@@ -479,10 +577,18 @@ public func interrupt_rights() -> UInt32 {
 /// every number that is not an op, which is also what retired `OP_SYSTEM_MAX`:
 /// the range check and the decode are now one operation instead of two that
 /// could disagree.
+/// `GetClock` is the fourth, and it is a GETTER rather than a factory: it
+/// answers with the process's Clock for the domain asked about, minting the
+/// object on first ask and handing back the SAME handle every time after — the
+/// shape `SelfProcess` above already has. There is one monotonic clock on a
+/// machine, so two handles to it would be two names for one thing, which §3's
+/// no-duplicate rule exists to prevent; and an op that cannot allocate on
+/// repetition needs no quota row when quotas land.
 public enum SystemOp: UInt {
     case DebugPrint = 0,
     case Shutdown = 1,
     case SelfProcess = 2,
+    case GetClock = 3,
 }
 
 // =============================================================================
@@ -611,6 +717,76 @@ public enum InterruptOp: UInt {
     case Ack = 0,
 }
 
+// =============================================================================
+// The Clock object's op table (spec §2 table; design 232 unit 1)
+// =============================================================================
+
+/// A METHOD ID on a Clock object.
+///
+/// TWO OPS: read the time, and make something that fires against it. There is
+/// deliberately no SET — a Monotonic clock that could be set would not be one,
+/// and the domains that CAN step (Realtime) are future values of `ClockType`
+/// that will bring their own op if they need it.
+///
+/// `Now` answers through a COPY-OUT RECORD rather than the value register,
+/// because a nanosecond count is 64 bits and one of the two profiles has 32-bit
+/// registers. The vDSO true-mapping upgrade (spec §5.7) is the named
+/// syscall-free future for this one op and changes nothing about its shape.
+public enum ClockOp: UInt {
+    case Now = 0,
+    case CreateTimer = 1,
+}
+
+// =============================================================================
+// The Timer object's op table (spec §2 table; design 232 unit 1)
+// =============================================================================
+
+/// A METHOD ID on a Timer object.
+///
+/// TWO OPS, AND NO ACK — which is the difference from an Interrupt worth reading
+/// here. §9's cycle needs an ack because the KERNEL masks the line and only the
+/// driver can say the device has been serviced; a Timer has no device and no
+/// mask, so it re-arms itself and a fire is consumed by the WAIT that reports
+/// it. That is the timerfd model, and it is what makes a periodic timer a
+/// fire-and-forget schedule rather than a request/response.
+///
+/// `Arm` takes its arguments through a COPY-IN RECORD, because two 64-bit
+/// nanosecond counts are four words on a 32-bit profile and the argument
+/// registers are three. See `TIMER_ARM_RECORD_DOUBLEWORDS` below.
+///
+/// `Disarm` is separate from "arm with no deadline" because the two mean
+/// different things to the fire count: arming REPLACES a schedule and clears
+/// what the old one owed, while disarming says the timer is off and owes
+/// nothing at all. Collapsing them would make "cancel" and "reschedule"
+/// indistinguishable at the ABI.
+public enum TimerOp: UInt {
+    case Arm = 0,
+    case Disarm = 1,
+}
+
+/// WHICH CLOCK a Timer runs against, and what `System.GetClock` names (§2's
+/// Clock row; design 232 unit 1, the M3 time notes).
+///
+/// **v1 DECLARES `Monotonic` AND NOTHING ELSE.** `Boot` and `Realtime` are named
+/// in the design as future domains and are deliberately NOT declared here: an
+/// unproducible case is dead surface, and a caller able to name one the kernel
+/// cannot mint would get a runtime refusal where the absence is a compile error.
+/// The raw backing is what lets them be ADDED without renumbering (design 145's
+/// wire idiom), which is the whole point of stating the number.
+///
+/// Backed by `UInt`, the width of the register the domain arrives in, for the
+/// reason `SystemOp` and `EventMode` give: the value is PROCESS-CONTROLLED, so a
+/// narrower backing would need a truncation before `from(raw:)` and `0x100`
+/// would arrive as a valid `Monotonic`.
+///
+/// MONOTONIC'S CONTRACT: nanoseconds since the machine started counting, never
+/// stepping and never going backwards. The epoch is not published and must not
+/// be relied on — two readings are comparable, one reading means nothing on its
+/// own.
+public enum ClockType: UInt {
+    case Monotonic = 0,
+}
+
 /// How an Event ACCUMULATES — a per-Event property, chosen at creation and
 /// fixed for its life (§2.4).
 ///
@@ -666,6 +842,7 @@ public enum EventMode: UInt {
 public enum WaitTag: UInt {
     case Event = 0,
     case Interrupt = 1,
+    case Timer = 2,
 }
 
 /// Words in a wait record: key, tag, payload.
@@ -716,9 +893,28 @@ public func wait_record_bytes() -> Int {
 /// looks redundant there; it is not, because the shape §2.2 exists for is a
 /// dispatcher parked on SEVERAL. Such a dispatcher gets the line without a
 /// side-table, exactly as it gets the key.
+/// THE TIMER'S PAYLOAD IS ITS FIRE COUNT, and it is a count where the
+/// Interrupt's deliberately is not (design 232 unit 1). The two differ because
+/// their invariants do: §9 masks a line on fire, so an Interrupt can never have
+/// two outstanding and "how many" would always read one — while a Timer has no
+/// mask and nothing to hold it back, so a periodic one whose consumer was
+/// descheduled genuinely expired several times. COALESCING those into a number
+/// is what stops a slow consumer from either falling permanently behind a queue
+/// of fires or silently losing them.
+///
+/// It SATURATES rather than wrapping, on §2.4's counting-Event reasoning
+/// exactly: zero is what "not ready" means, so a count that rolled through it
+/// would make a busy timer go quiet.
+///
+/// THE WAIT CONSUMES IT. Unlike an Event's word — a SNAPSHOT that `receive`
+/// remains authoritative over — this count is drained by the wait that reports
+/// it, because a Timer has no second op to drain with and needs none: the fire
+/// was delivered to somebody, so it is spent. That is the ack-free half of the
+/// timerfd model.
 public enum WaitPayload {
     case Event(word: UInt),
     case Interrupt(line: UInt),
+    case Timer(fires: UInt),
 }
 
 /// `Waiter.Wait`'s answer: the attacher's key, and what fired.
@@ -726,6 +922,69 @@ public struct WaitResult {
     /// The word supplied at `add`, handed back unread.
     public key: UInt,
     public what: WaitPayload,
+}
+
+// =============================================================================
+// The Clock and Timer records (spec §2's Clock/Timer rows; design 232 unit 1)
+// =============================================================================
+//
+// TWO MORE RECORDS, AND ONE OF THEM GOES THE OTHER WAY. `Clock.Now` answers
+// with a copy-OUT record on the `Waiter.Wait` precedent; `Timer.Arm` takes its
+// arguments through a copy-IN record, which is the funnel's mirror twin and is
+// built here because M4's Channel `send` needs exactly this shape for a message
+// body (§2.1). Timer.Arm is its small first consumer precisely as Waiter.Wait
+// was for copy-out.
+//
+// WHY EITHER NEEDS A RECORD AT ALL: a NANOSECOND COUNT IS 64 BITS. Anything
+// narrower wraps in four seconds, which is not a clock. One of the two profiles
+// has 32-bit registers, so one time is two words and `arm`'s pair is four —
+// past the three argument registers §5.7 gives an op, and past what a single
+// value register can answer with.
+//
+// THESE RECORDS ARE INDEXED IN DOUBLEWORDS, NOT MACHINE WORDS, and that is the
+// one way they differ from the wait record above. A wait record's fields are a
+// KEY, a TAG and a PAYLOAD — all of them machine-word-shaped things (a task
+// identity, a line number, an accumulated word), so it follows the register.
+// These fields are TIMES, and a time is 64 bits on every machine SOS will ever
+// run on, so following the register would make the layout differ per profile
+// for no reason. Both still stay inside one address space, so design 47's
+// wire-format discipline still does not apply — what applies is that the field
+// width is a property of the QUANTITY rather than of the machine.
+
+/// Doublewords in a `Clock.Now` answer: the reading, and nothing else.
+public static CLOCK_NOW_RECORD_DOUBLEWORDS: Int = 1
+
+/// Where the reading sits. Named rather than written, on both sides.
+public static CLOCK_NOW_TIME_SLOT: Int = 0
+
+/// Bytes in a `Clock.Now` record — the minimum capacity a caller must give the
+/// op, and what the kernel checks the buffer against.
+///
+/// A FUNCTION AND NOT A `static` for the reason `wait_record_bytes` gives:
+/// `sizeof<T>()` does not fold in a static initializer (DF-178f) and folds
+/// perfectly well in an ordinary expression.
+public func clock_now_record_bytes() -> Int {
+    CLOCK_NOW_RECORD_DOUBLEWORDS * sizeof<UInt64>()
+}
+
+/// Doublewords in a `Timer.Arm` request: the first deadline, then the interval.
+public static TIMER_ARM_RECORD_DOUBLEWORDS: Int = 2
+
+/// Where each lives.
+///
+/// `AFTER` IS RELATIVE AND `INTERVAL` IS NOT A TIME AT ALL, which is the one
+/// thing a reader has to carry away from this layout. The first field says how
+/// long from NOW the first fire is — relative, because an absolute first
+/// deadline would make every caller read the clock first and race between the
+/// two syscalls. The second is a PERIOD, and zero means one-shot: a timer that
+/// fires once and disarms itself.
+public static TIMER_ARM_AFTER_SLOT: Int = 0
+public static TIMER_ARM_INTERVAL_SLOT: Int = 1
+
+/// Bytes in a `Timer.Arm` record — exactly what the caller must hand over, and
+/// what the kernel checks the length against.
+public func timer_arm_record_bytes() -> Int {
+    TIMER_ARM_RECORD_DOUBLEWORDS * sizeof<UInt64>()
 }
 
 // =============================================================================
@@ -858,7 +1117,12 @@ public extension FaultReason {
             case NotWaitable -> "not a waitable",
             case BadArg -> "argument outside its domain",
             case BadAlign -> "buffer is not word-aligned",
-            case BadBuffer -> "buffer is not in the process's writable memory",
+            // Direction-neutral since design 232 unit 1 opened the copy-IN
+            // door beside the copy-out one. The two check DIFFERENT windows —
+            // outbound must land in the process's writable memory, inbound
+            // merely inside the memory it was granted — so a wording naming
+            // one of them was accurate for exactly as long as there was one.
+            case BadBuffer -> "buffer is outside the process's memory",
             case DuplicateKey -> "an attachment already uses that key",
             case LineBound -> "that interrupt line is already bound",
         }

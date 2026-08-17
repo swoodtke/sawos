@@ -1,0 +1,138 @@
+// SOS M3 unit 1: the Clock object (design 232; spec §2's Clock row).
+//
+// THE CLAIMS, and each is printed as a DERIVED FACT rather than as a number,
+// because the numbers are a real machine's and no assertion can name them:
+//
+//   same=1               a Clock arrives through the System handle, and asking
+//                        twice returns the SAME object rather than a second
+//                        one — the getter contract, not a factory's. The
+//                        teardown line is the other half of that evidence:
+//                        clocks=1 after two asks.
+//   monotonic=1          two readings in a row never go backwards.
+//   advanced=1 spanned=1 a reading taken after a spin is strictly greater, and
+//                        the difference covers the interval spun. `advanced`
+//                        alone would pass on a clock wired to a register that
+//                        merely counts something; `spanned` is the one that
+//                        says the units are NANOSECONDS. Together they are also
+//                        the copy-out record's only real check on the 32-bit
+//                        profile: a high half arriving as garbage makes both
+//                        comparisons nonsense.
+//   disarm_unarmed=1     disarming a Timer that was never armed is a NO-OP.
+//                        It is here, in the no-waiting case, precisely because
+//                        it must not fault: the whole select-with-timeout idiom
+//                        rests on being allowed to cancel a timeout that may
+//                        already have expired.
+//
+// NOTHING HERE WAITS. Every call answers immediately, so a regression that
+// parked would park the only thread in the system and be reported as the
+// deadlock it is — in microseconds, not at the timeout.
+
+import sos.{System, Process, Clock, ClockType, Timer}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static YES: UInt = 1
+static NO: UInt = 0
+
+/// How far to spin before the second reading. A microsecond is far longer than
+/// the syscall round trip and far shorter than anything a harness waits for.
+static SPIN_NS: UInt64 = 1000
+
+func flag(b: Bool) -> UInt {
+    if b { YES } else { NO }
+}
+
+/// Spin on the clock itself until it reads `deadline` — which dogfoods `now()`
+/// as the timekeeper rather than counting iterations, so the delay is a real
+/// duration on either machine rather than a guess about instruction speed.
+func spin_to(clock: &Clock, deadline: UInt64) {
+    var done = false
+    while not done {
+        match clock.now() {
+            case Ok(t) -> {
+                if t >= deadline {
+                    done = true
+                }
+            },
+            case Err(_) -> { done = true },
+        }
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.self_process() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS clock: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let clock = match system.get_clock(kind: ClockType.Monotonic) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS clock: no clock: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // Asking twice must hand back the same object. A machine has ONE monotonic
+    // clock, so a second Clock would be a second name for it — which §3's
+    // no-duplicate rule exists to prevent. The evidence is that the second ask
+    // succeeds AND that the timer slab is untouched by it, which the teardown
+    // line below reports as clocks=1.
+    let same = match system.get_clock() {
+        case Ok(_) -> true,
+        case Err(_) -> false,
+    }
+    print("SOS clock: same={}\n", flag(same))
+
+    let first: UInt64 = match clock.now() {
+        case Ok(t) -> t,
+        case Err(e) -> {
+            print("SOS clock: now failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let second: UInt64 = match clock.now() {
+        case Ok(t) -> t,
+        case Err(_) -> 0u64,
+    }
+    print("SOS clock: monotonic={}\n", flag(second >= first))
+
+    spin_to(&clock, first + SPIN_NS)
+    let third: UInt64 = match clock.now() {
+        case Ok(t) -> t,
+        case Err(_) -> 0u64,
+    }
+    print("SOS clock: advanced={} spanned={}\n",
+          flag(third > second), flag(third - first >= SPIN_NS))
+
+    // A Timer that is created and never armed. Disarming it is the no-op the
+    // cancel idiom depends on; it is also, deliberately, the only thing done
+    // with it, so this case creates a Timer without ever making the kernel owe
+    // a deadline for it.
+    let timer = match clock.create_timer() {
+        case Ok(t) -> t,
+        case Err(e) -> {
+            print("SOS clock: no timer: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let quiet = match timer.disarm() {
+        case Ok(_) -> true,
+        case Err(_) -> false,
+    }
+    print("SOS clock: disarm_unarmed={}\n", flag(quiet))
+
+    print("SOS clock: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

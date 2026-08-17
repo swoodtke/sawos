@@ -1,0 +1,208 @@
+// SOS M3 unit 1: a PERIODIC timer, ack-free, with missed fires COALESCING
+// (design 232; spec §2's Timer row).
+//
+// Three claims, in the order the transcript makes them:
+//
+//   SOS interval: tick one fires=1
+//   SOS interval: tick two fires=1 ackfree=1
+//   SOS interval: coalesced=1
+//   SOS interval: drained fires=1
+//   SOS interval: done
+//
+// 1. THE KERNEL RE-ARMS, NOT THE PROCESS. The first two waits are the whole of
+//    what this program does between them — no ack, no re-arm, no re-attach.
+//    A timer that did not re-arm itself would leave the second wait parked
+//    forever with nothing to wake it, which this kernel reports as a deadlock
+//    rather than hanging, so the failure is a red run in milliseconds.
+//    `ackfree=1` records that claim where a reader will see it.
+//
+// 2. FIRES COALESCE WHEN NOBODY IS WAITING. The third phase spins in userspace
+//    for several periods WITHOUT waiting, then waits. Those expiries did not
+//    queue up as separate wakes and were not dropped: they accumulated into one
+//    count, so the wait answers once with `fires` above one. `coalesced=1` is
+//    that comparison. This is the property that makes a slow consumer degrade
+//    into coarser reporting instead of falling permanently behind.
+//
+// 3. THE WAIT CONSUMES THE COUNT, and the last phase proves it WITHOUT a
+//    stopwatch: cancel, re-arm as a one-shot, wait. That count can only be one.
+//    A kernel that never reset the count would report the coalesced total again
+//    there, and a `disarm` that left the fires behind would report them too, so
+//    one line covers both. Comparing counts between the periodic wakes would
+//    have raced the emulator instead — how many periods a `print` takes is not
+//    this program's to know.
+//
+// WHY THE COUNTS ARE COMPARED AND NOT PRINTED RAW. How many periods a spin
+// covers is a real machine's business and no assertion can name it, so every
+// line here is a derived fact.
+
+import sos.{System, Process, Clock, ClockType, Timer, Waiter, WaitResult,
+            WaitPayload}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static YES: UInt = 1
+static NO: UInt = 0
+
+static KEY: UInt = 66
+
+/// A millisecond period — the same scale the M2 tick uses, and far above the
+/// kernel's minimum lead, so every fire here is a real scheduled one.
+static PERIOD_NS: UInt64 = 1000000
+
+/// Spin across this much time without waiting, so several periods expire with
+/// no consumer. Five periods, which gives the comparison below room to be true
+/// on a slow emulator without being true by accident.
+static SPIN_NS: UInt64 = 5000000
+
+func flag(b: Bool) -> UInt {
+    if b { YES } else { NO }
+}
+
+func fires_of(r: &WaitResult) -> UInt {
+    match r.what {
+        case Timer(fires) -> fires,
+        case Event(_) -> panic("this program attached no event"),
+        case Interrupt(_) -> panic("this program attached no interrupt"),
+    }
+}
+
+func now_of(clock: &Clock) -> UInt64 {
+    match clock.now() {
+        case Ok(t) -> t,
+        case Err(_) -> 0u64,
+    }
+}
+
+/// Spin on the clock until it reads `deadline`. Timer fires land during this —
+/// the line is enabled and the kernel takes each interrupt — and they
+/// accumulate in the object rather than waking anybody, which is exactly the
+/// state the third claim is about.
+func spin_to(clock: &Clock, deadline: UInt64) {
+    var done = false
+    while not done {
+        if now_of(&clock) >= deadline {
+            done = true
+        }
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.self_process() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS interval: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let clock = match system.get_clock() {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS interval: no clock: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let waiter = match proc.create_waiter() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS interval: no waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let timer = match clock.create_timer() {
+        case Ok(t) -> t,
+        case Err(e) -> {
+            print("SOS interval: no timer: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match waiter.add(&timer, KEY) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS interval: attach failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // A REPEATING schedule: first fire one period out, then every period.
+    match timer.arm(after_ns: PERIOD_NS, interval_ns: PERIOD_NS) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS interval: arm failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let one = match waiter.wait() {
+        case Ok(r) -> r,
+        case Err(e) -> {
+            print("SOS interval: first wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    print("SOS interval: tick one fires={}\n", fires_of(&one))
+
+    // NOTHING HAPPENS BETWEEN THESE TWO WAITS. No ack, no re-arm.
+    let two = match waiter.wait() {
+        case Ok(r) -> r,
+        case Err(e) -> {
+            print("SOS interval: second wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let count_two = fires_of(&two)
+    print("SOS interval: tick two fires={} ackfree={}\n",
+          count_two, flag(count_two >= 1))
+
+    // Now go away for several periods without waiting.
+    spin_to(&clock, now_of(&clock) + SPIN_NS)
+    let many = match waiter.wait() {
+        case Ok(r) -> r,
+        case Err(e) -> {
+            print("SOS interval: third wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    print("SOS interval: coalesced={}\n", flag(fires_of(&many) > 1))
+
+    // THE DRAIN, PROVED WITHOUT A STOPWATCH. Comparing counts BETWEEN the
+    // periodic wakes above would race the emulator — how many periods a print
+    // takes is not this program's to know — so the claim is made where it is
+    // deterministic instead: cancel, re-arm as a ONE-SHOT, wait. That count can
+    // only be one. A kernel that never reset the count would report the
+    // coalesced total again here, and a `disarm` that left the fires behind
+    // would report them too, so the single line covers both.
+    let _ = timer.disarm()
+    match timer.arm(after_ns: PERIOD_NS) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS interval: rearm failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let fresh = match waiter.wait() {
+        case Ok(r) -> r,
+        case Err(e) -> {
+            print("SOS interval: fourth wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    print("SOS interval: drained fires={}\n", fires_of(&fresh))
+
+    print("SOS interval: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

@@ -61,6 +61,53 @@ void *memmove(void *dst, const void *src, usize n) {
     return dst;
 }
 
+// ---- 64-bit division libcalls --------------------------------------------
+//
+// REASON 2 AGAIN, and only a 32-bit profile needs them: rv32 has no 64-bit
+// divide instruction even with `+m` (which buys the 32-bit pair), so a
+// `u64 / u64` in Saw lowers to a call the BACKEND emits and no source names.
+// arm64 divides 64 bits natively, so `--gc-sections` drops both there.
+//
+// SOS started needing them at design 232 unit 1, and the reason is not
+// incidental: a Clock reads NANOSECONDS, which is a 64-bit quantity on every
+// profile — 32 bits of nanoseconds wraps in four seconds, which is not a clock
+// — and the Timer's drift-free coalescing divides a 64-bit lateness by a
+// 64-bit interval to get a fire count. The alternative to this file entry was
+// advancing the deadline in a LOOP, which is exactly the unbounded kernel loop
+// the division was chosen to avoid.
+//
+// Shift-subtract, most significant bit first: the schoolbook algorithm, and
+// deliberately the simple one. It is a fixed 64 iterations with no table and no
+// wide intermediate, and — the part that matters — it uses no `/` or `%` on a
+// 64-bit value itself, which would be a call back into this function.
+
+typedef unsigned long long u64;
+
+static u64 udivmod64(u64 n, u64 d, u64 *rem) {
+    // Division by zero is undefined, and the freestanding convention is
+    // all-ones rather than a trap: a kernel that faulted HERE would report a
+    // machine fault with no hint of which arithmetic produced it. Saw's own
+    // checks are what a caller meets first, so this is the unreachable floor.
+    if (d == 0) {
+        if (rem) *rem = 0;
+        return ~(u64)0;
+    }
+    u64 q = 0, r = 0;
+    for (int i = 63; i >= 0; i--) {
+        r = (r << 1) | ((n >> i) & 1ULL);
+        if (r >= d) {
+            r -= d;
+            q |= (1ULL << i);
+        }
+    }
+    if (rem) *rem = r;
+    return q;
+}
+
+u64 __udivdi3(u64 n, u64 d) { return udivmod64(n, d, 0); }
+
+u64 __umoddi3(u64 n, u64 d) { u64 r; udivmod64(n, d, &r); return r; }
+
 // ---- atomic libcalls, by width -------------------------------------------
 //
 // CURRENTLY UNREFERENCED, and kept deliberately. Both builds now pass

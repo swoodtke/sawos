@@ -177,6 +177,11 @@ static TIMER_COUNT_BASE: UInt = 0x0200BFF8
 /// read it from — it is a property of the board, which is why it is here.
 static TIMER_UNITS_PER_US: UInt = 10
 
+/// Nanoseconds per counter unit — the timebase above, inverted, because the
+/// seam speaks nanoseconds and this counter does not. It divides exactly here
+/// (10 MHz is 100 ns a tick), so no resolution is lost stating it this way.
+static NS_PER_UNIT: UInt64 = 100
+
 /// The platform interrupt controller, in the four windows this kernel uses.
 /// The context is the one this hart takes interrupts in; the second context
 /// this board wires is for a privilege mode SOS does not run in.
@@ -725,9 +730,16 @@ func irq_class_enable(bit: UInt) unsafe {
 // through the design-112 driver idiom and none of it is C.
 //
 // The condition is a LEVEL, not an edge — the timer asserts while the counter
-// is at or past the comparator — so the tick path REARMS rather than
-// acknowledging: writing the next deadline is what lowers the line. That is why
-// the seam has `timer_rearm` and why `irq_complete` has nothing to do for it.
+// is at or past the comparator — so servicing a fire means PROGRAMMING THE NEXT
+// DEADLINE rather than acknowledging one: writing a comparator in the future is
+// what lowers the line. That is why the seam is `timer_set_deadline_ns` and why
+// `irq_complete` has nothing to do for this line.
+//
+// ONE COMPARATOR, TWO CUSTOMERS (design 232 unit 1). The scheduler tick and the
+// Timer objects share this single piece of hardware, and the seam is absolute
+// rather than periodic precisely so that sharing is the KERNEL's arithmetic —
+// it programs the earliest deadline of the two and this file never learns there
+// were two.
 //
 // The counter is 64 bits on a 32-bit machine, which is the whole awkwardness
 // here: each half is its own register, so a read has to survive a carry between
@@ -804,26 +816,53 @@ extension MachineTimer {
 
 static WORD_BITS: Int = 32
 
-/// The tick period in counter units, staged for `timer_rearm`. Same shape and
-/// same argument as `IRQ_CLASSES` above.
-unsafe static var TIMER_PERIOD: UInt = 0
-
-/// Start a periodic tick every `period_us` microseconds.
-public func timer_start(period_us: UInt) unsafe {
-    TIMER_PERIOD = period_us * TIMER_UNITS_PER_US
-    timer_rearm()
-    irq_class_enable(IRQ_CLASS_TIMER)
+/// Round a nanosecond time UP to a whole counter unit.
+///
+/// UP rather than nearest, because the seam's contract is that a deadline never
+/// fires EARLY: the kernel's composition treats an interrupt as "something may
+/// be due" and reprograms if nothing is, so an early fire costs a round trip
+/// while a late one costs nothing at all. The saturating guard is what keeps
+/// the "never" deadline representable — rounding `UInt64.max` up would
+/// otherwise overflow, and Saw's overflow checks are on in a kernel.
+func ns_to_units(ns: UInt64) -> UInt64 {
+    if ns > UInt64.max - (NS_PER_UNIT - 1) {
+        return UInt64.max / NS_PER_UNIT
+    }
+    (ns + NS_PER_UNIT - 1) / NS_PER_UNIT
 }
 
-/// Schedule the next tick, which is also what lowers the line for the tick the
-/// kernel is servicing.
+/// This machine's monotonic time in NANOSECONDS since the counter started
+/// (design 232 unit 1; spec §2's Clock row).
 ///
-/// The next deadline is measured from NOW rather than from the last one: a tick
-/// the kernel was late for is one tick, never a burst of catch-up ticks whose
-/// only effect would be to keep the machine in the trap handler.
-public func timer_rearm() unsafe {
-    let timer = MachineTimer()
-    timer.set_deadline(timer.now() + (TIMER_PERIOD as UInt64))
+/// THE COUNTER IS THE CLOCK. There is no second time source and no software
+/// accumulator — the free-running counter above is what a `Clock.now()` reads
+/// and what every Timer deadline is measured against, so the two can never
+/// disagree about what "now" is. Its epoch is the machine's power-on, which is
+/// exactly the Monotonic domain's contract: it never steps and never goes
+/// backwards.
+public func timer_now_ns() unsafe -> UInt64 {
+    MachineTimer().now() * NS_PER_UNIT
+}
+
+/// Program the ONE hardware comparator to interrupt at `at_ns`.
+///
+/// THE MACHINE HAS ONE COMPARATOR AND TWO CUSTOMERS — the scheduler tick (spec
+/// §7) and the Timer objects (§2) — so this seam takes an ABSOLUTE deadline and
+/// nothing else: the kernel composes the two arch-free by programming the
+/// EARLIEST, and the HAL never needs to know which customer a deadline came
+/// from. That is what replaced M2's `timer_start`/`timer_rearm` pair, which
+/// could only express one periodic customer.
+///
+/// A deadline already past fires as soon as interrupts are deliverable. A
+/// deadline of `UInt64.max` is the kernel's "never", and lands far enough out
+/// that this counter reaches it in some six hundred years.
+///
+/// It ENABLES the timer interrupt class every time, which is idempotent and is
+/// what lets a kernel that armed no tick at boot — the real one — still serve a
+/// Timer a process armed later.
+public func timer_set_deadline_ns(at_ns: UInt64) unsafe {
+    MachineTimer().set_deadline(ns_to_units(at_ns))
+    irq_class_enable(IRQ_CLASS_TIMER)
 }
 
 /// Has the timer expired without a tick having been taken for it?
@@ -976,8 +1015,8 @@ public func irq_claim(cause: UInt) unsafe -> UInt {
 
 /// End of service for `line`.
 ///
-/// The timer has none: its line is lowered by rearming the comparator, and this
-/// controller never saw it.
+/// The timer has none: its line is lowered by programming the next deadline
+/// into the comparator, and this controller never saw it.
 public func irq_complete(line: UInt) unsafe {
     if line == IRQ_TIMER {
         return
@@ -1009,9 +1048,11 @@ public func irq_line_valid(line: UInt) -> Bool {
 /// THE TIMER IS CHECKED FIRST AND BY HAND, because on this profile it is not
 /// one of the controller's sources: its condition is the comparator's, so the
 /// only way to notice it is to compare. It is consulted only when the timer
-/// CLASS has been enabled — an unarmed comparator reads as permanently expired
-/// (its deadline is zero), and treating that as a tick would make an idle
-/// kernel spin on a timer nobody started.
+/// CLASS has been enabled — a comparator nothing has ever programmed reads as
+/// permanently expired (its deadline is zero), and treating that as a fire
+/// would make an idle kernel spin on a timer nobody started. Once something HAS
+/// programmed it, the kernel's "never" deadline keeps the same loop quiet
+/// without the gate's help.
 public func irq_poll() unsafe -> UInt {
     if (IRQ_CLASSES & IRQ_CLASS_TIMER) != 0 {
         if MachineTimer().expired() {

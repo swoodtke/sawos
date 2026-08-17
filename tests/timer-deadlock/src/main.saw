@@ -1,0 +1,80 @@
+// SOS M3 unit 1: an UNARMED Timer is not a wake source (design 232; spec §7,
+// §9's idle rule).
+//
+// THE NEGATIVE OF `timer-oneshot`, and the reason it is worth its own case.
+// Unit 1 taught the kernel that a process parked with an ARMED timer is idle
+// rather than deadlocked — readiness will arrive from the clock. The cheap way
+// to write that rule is "idle if this process owns a Timer", and it is wrong:
+// a Timer that is not armed will never fire, so a system holding only those is
+// as deadlocked as one holding none.
+//
+// Getting it wrong that way does not fail loudly on its own — the kernel would
+// simply idle forever and the run would die at the harness timeout, which is
+// the failure mode hardest to read. So the case is here, and it asserts the
+// REPORT.
+//
+// The program is the smallest thing that can make the mistake attractive: a
+// Clock, a Timer, an attachment, and a wait — everything `timer-oneshot` does
+// except the one call that arms.
+
+import sos.{System, Process, Clock, ClockType, Timer, Waiter}
+
+static KEY: UInt = 77
+
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.self_process() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS timerdead: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let clock = match system.get_clock(kind: ClockType.Monotonic) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS timerdead: no clock: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let waiter = match proc.create_waiter() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS timerdead: no waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let timer = match clock.create_timer() {
+        case Ok(t) -> t,
+        case Err(e) -> {
+            print("SOS timerdead: no timer: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match waiter.add(&timer, KEY) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS timerdead: attach failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let _ = system.debug_print("SOS timerdead: waiting on a timer nobody armed\n")
+
+    // Does not return: this thread parks, nothing else is runnable, and the one
+    // Timer in the system is not armed — so no readiness can arrive from
+    // outside and the kernel terminates the process rather than idling forever.
+    let _ = waiter.wait()
+
+    let _ = system.debug_print("SOS timerdead: woke, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

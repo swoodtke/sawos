@@ -82,7 +82,7 @@
 // SosStatus>` hands back, the mode a `create_event(mode:)` caller names, and
 // the record + payload a `wait()` caller matches on. `import sos.{SosStatus}`
 // (etc.) is how a process takes them.
-public import sosabi.{SosStatus, EventMode, WaitResult, WaitPayload}
+public import sosabi.{SosStatus, EventMode, ClockType, WaitResult, WaitPayload}
 
 // Everything else `sosabi` holds is KERNEL-INTERNAL and stays that way: the op
 // numbers, the rights, the handle aliases, the wait record's wire layout. This
@@ -90,10 +90,15 @@ public import sosabi.{SosStatus, EventMode, WaitResult, WaitPayload}
 // spelling — the vDSO discipline ("syscall numbers are not ABI") is a wall now
 // rather than a convention the module docstring asks callers to respect.
 import sosabi.{SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp, InterruptOp,
+               ClockOp, TimerOp,
                SystemHandle, ProcessHandle, ThreadHandle, EventHandle,
-               WaiterHandle, InterruptHandle,
+               WaiterHandle, InterruptHandle, ClockHandle, TimerHandle,
                WaitTag, WAIT_RECORD_WORDS, WAIT_KEY_WORD, WAIT_TAG_WORD,
-               WAIT_PAYLOAD_WORD, wait_record_bytes}
+               WAIT_PAYLOAD_WORD, wait_record_bytes,
+               CLOCK_NOW_RECORD_DOUBLEWORDS, CLOCK_NOW_TIME_SLOT,
+               clock_now_record_bytes,
+               TIMER_ARM_RECORD_DOUBLEWORDS, TIMER_ARM_AFTER_SLOT,
+               TIMER_ARM_INTERVAL_SLOT, timer_arm_record_bytes}
 
 // The scalar-to-console-byte rule, shared with the kernel's own console so the
 // two cannot disagree about what a non-ASCII scalar becomes.
@@ -378,6 +383,71 @@ public func sos_waiter_wait(handle: UInt, buf: UnsafePointer<UInt>,
                  (&var ignored) as UnsafePointer<UInt>)
 }
 
+/// This process's Clock for the domain `kind` names. Requires
+/// `SystemRight.GetClock`. A `kind` that is not a `ClockType` terminates the
+/// process.
+///
+/// The same handle every time — a machine has one monotonic clock, so asking
+/// twice is a query rather than two capabilities.
+@export("sos_system_get_clock")
+public func sos_system_get_clock(handle: UInt, kind: UInt,
+                                 value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, SystemOp.GetClock as UInt, kind, 0, 0, value_out)
+}
+
+/// Read the clock into `buf` — a COPY-OUT record, because a nanosecond count is
+/// 64 bits and one profile's registers are not. Requires `ClockRight.Read`.
+///
+/// `cap` is the buffer's size in BYTES and must be at least
+/// `clock_now_record_bytes()`. Doubleword 0 is the reading.
+@export("sos_clock_now")
+public func sos_clock_now(handle: UInt, buf: UnsafePointer<UInt64>,
+                          cap: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, ClockOp.Now as UInt, buf as UInt, cap, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// Make a Timer bound to this Clock. Requires `ClockRight.CreateTimer`.
+@export("sos_clock_create_timer")
+public func sos_clock_create_timer(handle: UInt,
+                                   value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, ClockOp.CreateTimer as UInt, 0, 0, 0, value_out)
+}
+
+/// Arm a Timer from a COPY-IN record at `record` — doubleword 0 the delay from
+/// now, doubleword 1 the repeat interval (0 for one-shot), both in nanoseconds.
+/// Requires `TimerRight.Arm`.
+///
+/// THIS IS THE COPY-OUT FUNNEL'S MIRROR TWIN, and the first op in the system to
+/// hand the kernel a record rather than take one. `bytes` must be EXACTLY
+/// `timer_arm_record_bytes()`; a record that is misaligned, outside this
+/// process's memory, or the wrong length TERMINATES the process, because all
+/// three are mistakes only the caller could have made.
+///
+/// Arming an already-armed Timer REPLACES its schedule and clears any fires it
+/// had not yet delivered. That is not an error — it is how a timeout is
+/// changed.
+@export("sos_timer_arm")
+public func sos_timer_arm(handle: UInt, record: UnsafePointer<UInt64>,
+                          bytes: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, TimerOp.Arm as UInt, record as UInt, bytes, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// Stop a Timer and discard any fires it had not delivered. Requires
+/// `TimerRight.Arm`.
+///
+/// Disarming one that is not armed is a NO-OP, deliberately — a one-shot
+/// disarms itself when it fires, so cancelling a timeout that has just expired
+/// is an ordinary race rather than a caller error. (This is the opposite call
+/// from `sos_interrupt_ack`, whose no-fire case IS a fault; see `Timer.disarm`.)
+@export("sos_timer_disarm")
+public func sos_timer_disarm(handle: UInt) -> UInt {
+    sos_syscall1(handle, TimerOp.Disarm as UInt, 0)
+}
+
 // =============================================================================
 // The typed Saw surface
 // =============================================================================
@@ -444,6 +514,34 @@ public extension System {
     public func self_process(&self) -> Result<Process, SosStatus> {
         let raw = try call_value(self.handle, SystemOp.SelfProcess as UInt, 0, 0, 0)
         return Process(handle: ProcessHandle(raw))
+    }
+
+    /// This process's Clock for `kind` — a GRANTED TIME SOURCE. Requires
+    /// `SystemRight.GetClock`.
+    ///
+    /// TIME IS A CAPABILITY HERE, and that is the whole reason this is an op
+    /// rather than a free function. A process that was not granted the right
+    /// cannot read the machine's clock at all — which is what makes handing a
+    /// child a VIRTUAL clock later a substitution with no code change on either
+    /// side: the child asks its System object for a Clock exactly as it does
+    /// now, and what it gets back is somebody else's idea of the time.
+    ///
+    /// The same Clock every time — a machine has one monotonic clock, and §3
+    /// forbids duplicating a handle — so calling this twice is a query, not two
+    /// capabilities. `ClockType.Monotonic` is the only domain v1 declares; it
+    /// counts nanoseconds from an unpublished epoch, never steps and never goes
+    /// backwards, so two readings are comparable and one means nothing alone.
+    ///
+    /// THE LABEL IS `kind:` AND THE RULED SPELLING WAS `type:` — see DF-232b.
+    /// `type` is a Saw keyword (it introduces a distinct type alias), so it
+    /// cannot be a parameter name; `kind` is the vocabulary the rest of this
+    /// system already uses for the same idea (`ProcessStatusKind`,
+    /// `WaitableKind`).
+    public func get_clock(&self,
+                          kind: ClockType = ClockType.Monotonic) -> Result<Clock, SosStatus> {
+        let raw = try call_value(self.handle, SystemOp.GetClock as UInt,
+                                 kind as UInt, 0, 0)
+        return Clock(handle: ClockHandle(raw))
     }
 }
 
@@ -716,6 +814,145 @@ public extension Interrupt {
 }
 
 // =============================================================================
+// Clock and Timer (spec §2 table; design 232 unit 1)
+// =============================================================================
+
+/// A handle to a Clock — a granted time source.
+///
+/// It answers two questions and holds no state: what time is it, and give me
+/// something that fires at a time. There is no way to SET one — a monotonic
+/// clock that could be set would not be monotonic.
+///
+/// Built by `System.get_clock` and by nothing else — no word constructor, no
+/// word extractor, the module docstring's rule.
+public struct Clock {
+    handle: ClockHandle,
+}
+
+public extension Clock {
+    /// Nanoseconds on this clock. Requires `ClockRight.Read`.
+    ///
+    /// THE EPOCH IS NOT PUBLISHED and must not be relied on: `Monotonic` counts
+    /// from whenever the machine started counting, so two readings are
+    /// comparable and one reading means nothing on its own. What it guarantees
+    /// is that it never steps and never goes backwards, which is what a
+    /// duration measurement and a timeout both actually need.
+    ///
+    /// THE BUFFER IS THIS FRAME'S and a caller never sees it, exactly as
+    /// `Waiter.wait`'s is: the kernel answers 64 bits through a copy-out record
+    /// because one profile's registers are 32 wide, and supplying the bytes
+    /// here is what keeps a raw address out of the typed surface.
+    public func now(&self) -> Result<UInt64, SosStatus> {
+        now_into_frame(self.handle)
+    }
+
+    /// Make a Timer that measures against THIS clock, for its whole life.
+    /// Requires `ClockRight.CreateTimer`.
+    ///
+    /// It comes back DISARMED and owing nothing: a Timer is a schedule you have
+    /// not written yet, so attaching one to a Waiter before arming it parks
+    /// rather than reporting. A full timer slab comes back as
+    /// `SosStatus.NoResource`, which the caller could not have known.
+    public func create_timer(&self) -> Result<Timer, SosStatus> {
+        let raw = try call_value(self.handle, ClockOp.CreateTimer as UInt, 0, 0, 0)
+        return Timer(handle: TimerHandle(raw))
+    }
+}
+
+/// The `unsafe` half of `Clock.now`, confined to one small named helper
+/// (design 136). The buffer's address never leaves it.
+func now_into_frame(handle: ClockHandle) unsafe -> Result<UInt64, SosStatus> {
+    var buf: [UInt64; CLOCK_NOW_RECORD_DOUBLEWORDS] = [0; CLOCK_NOW_RECORD_DOUBLEWORDS]
+    try checked(sos_clock_now(handle, (&var buf) as UnsafePointer<UInt64>,
+                              clock_now_record_bytes() as UInt))
+    return buf[CLOCK_NOW_TIME_SLOT]
+}
+
+/// A handle to a Timer — a deadline on the Clock that made it.
+///
+/// THE PROCESS-SLEEP PRIMITIVE, and the thing that makes waiting on time
+/// possible at all: attach one to a Waiter, arm it, and the wait returns when it
+/// fires. Before this object a process could block forever or not at all.
+///
+/// SPEC §2'S CYCLE, from the holder's side:
+///
+///   1. `arm(after_ns:)` — one-shot — or `arm(after_ns:interval_ns:)` for a
+///      repeating schedule;
+///   2. a `Waiter.wait` answers with this attachment's key and a FIRE COUNT;
+///   3. there is NO ACK. A periodic timer has already re-armed itself, and the
+///      wait that reported the fires is what consumed them.
+///
+/// THE COUNT IS WHY STEP 3 IS SAFE. A consumer descheduled across several
+/// periods is told HOW MANY expired rather than being handed them one at a time
+/// or losing them — so a slow consumer degrades into coarser reporting instead
+/// of falling permanently behind. The re-arm is DRIFT-FREE: each deadline is
+/// measured from the previous DEADLINE, not from when the kernel got round to
+/// it, so a timer armed at one millisecond is still on the millisecond a
+/// thousand fires later.
+///
+/// Built by `Clock.create_timer` and by nothing else — no word constructor, no
+/// word extractor, the module docstring's rule.
+public struct Timer {
+    handle: TimerHandle,
+}
+
+public extension Timer {
+    /// Fire once `after_ns` nanoseconds from now, and then every `interval_ns`
+    /// after that. Requires `TimerRight.Arm`.
+    ///
+    /// `interval_ns` DEFAULTS TO ZERO, WHICH IS A ONE-SHOT — the timer fires
+    /// once and disarms itself. That is the default because a timeout is the
+    /// common case and a repeating schedule is the deliberate one.
+    ///
+    /// `after_ns` is RELATIVE to now, not an absolute time, so a caller never
+    /// has to read the clock first and race between two syscalls.
+    ///
+    /// **ARMING AN ARMED TIMER REPLACES ITS SCHEDULE** and discards any fires it
+    /// had not yet delivered — it is how a timeout is CHANGED, not an error. A
+    /// caller who wants the outstanding fires reads them with a wait first.
+    ///
+    /// The arguments cross as a COPY-IN RECORD out of this frame, because two
+    /// 64-bit times are four words on a 32-bit profile and an op has three
+    /// argument registers. A caller never sees the buffer, for the reason
+    /// `Waiter.wait` gives about its own.
+    ///
+    /// A schedule finer than the machine can serve is not refused: fires
+    /// COALESCE into the count, so an interval below the kernel's resolution
+    /// reports many fires per wake rather than wedging the machine.
+    public func arm(&self, after_ns: UInt64,
+                    interval_ns: UInt64 = 0) -> Result<Void, SosStatus> {
+        arm_from_frame(self.handle, after_ns, interval_ns)
+    }
+
+    /// Stop this timer and discard any fires it had not delivered. Requires
+    /// `TimerRight.Arm`.
+    ///
+    /// **DISARMING ONE THAT IS NOT ARMED IS A NO-OP**, and that is the deliberate
+    /// opposite of `Interrupt.ack`, which faults when nothing has fired. The
+    /// difference is whether the caller could have known: an extra ack is
+    /// provably a bug, since the only way to learn about a fire is to be told
+    /// about one — while a ONE-SHOT DISARMS ITSELF, so whether a timer is still
+    /// armed is kernel state that changed without the caller acting. Cancelling
+    /// a timeout that has just expired is the ordinary race in every
+    /// select-with-timeout, and faulting it would make the safe idiom
+    /// unwritable.
+    public func disarm(&self) -> Result<Void, SosStatus> {
+        checked(sos_timer_disarm(self.handle))
+    }
+}
+
+/// The `unsafe` half of `Timer.arm`, confined to one small named helper
+/// (design 136). The record's address never leaves it.
+func arm_from_frame(handle: TimerHandle, after_ns: UInt64,
+                    interval_ns: UInt64) unsafe -> Result<Void, SosStatus> {
+    var buf: [UInt64; TIMER_ARM_RECORD_DOUBLEWORDS] = [0; TIMER_ARM_RECORD_DOUBLEWORDS]
+    buf[TIMER_ARM_AFTER_SLOT] = after_ns
+    buf[TIMER_ARM_INTERVAL_SLOT] = interval_ns
+    checked(sos_timer_arm(handle, (&var buf) as UnsafePointer<UInt64>,
+                          timer_arm_record_bytes() as UInt))
+}
+
+// =============================================================================
 // Waiter (spec §2.2; design 178 D5)
 // =============================================================================
 
@@ -737,6 +974,8 @@ func decode_wait(key: UInt, tag: UInt, payload: UInt) -> WaitResult {
         case Event -> WaitResult(key: key, what: WaitPayload.Event(word: payload)),
         case Interrupt -> WaitResult(key: key,
                                      what: WaitPayload.Interrupt(line: payload)),
+        case Timer -> WaitResult(key: key,
+                                 what: WaitPayload.Timer(fires: payload)),
     }
 }
 
@@ -795,6 +1034,22 @@ public extension Waiter {
     /// device was already asserting at bring-up.
     public func add(&self, interrupt: &Interrupt, key: UInt) -> Result<Void, SosStatus> {
         self.attach(interrupt.handle, key)
+    }
+
+    /// Attach a Timer under `key`, which `wait` hands back with the FIRE COUNT
+    /// when it comes due. Requires `WaiterRight.Attach` here and
+    /// `TimerRight.Wait` there.
+    ///
+    /// The third kind, and every rule the other two state holds unchanged: keys
+    /// are unique per Waiter, a handle attaches to at most one Waiter, and
+    /// readiness is level-triggered — so a Timer that fired BEFORE it was
+    /// attached is reported by this call rather than lost.
+    ///
+    /// A DISARMED Timer is simply never ready, so attaching one and waiting
+    /// parks until somebody arms it. That is what makes "arm, then wait" and
+    /// "attach, then arm" both work.
+    public func add(&self, timer: &Timer, key: UInt) -> Result<Void, SosStatus> {
+        self.attach(timer.handle, key)
     }
 
     /// The one call the per-kind overloads share. Private: a raw handle word

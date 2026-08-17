@@ -1,0 +1,49 @@
+// SOS M3 unit 1: a clock domain this kernel cannot name is a FAULT (design 232;
+// design 178's faults ruling).
+//
+// `ClockType` is raw-backed so the domain space can GROW without renumbering
+// (spec §2's design-145 wire idiom), and v1 declares exactly one value. A
+// process naming any other has chosen a number it could have checked — it knows
+// which kernel it was linked against — so the ruling ends it rather than handing
+// back a status to branch on. Same call `create_event(mode:)` makes for the same
+// reason.
+//
+// IT GOES THROUGH THE C ALTITUDE, and that is half the point. The typed Saw
+// surface takes a `ClockType` value, so `get_clock` cannot be handed a number
+// there at all; the mistake only exists one floor down, where a non-Saw caller
+// writes the wire value. So this case proves the kernel's refusal AND documents
+// that the Saw layer makes the refusal unreachable — the same division
+// `umode_bad_handle` draws for handle words.
+//
+// The boot handle is used RAW here for the same reason: the typed `System`
+// offers no way to get a word back out, which is the ruled guarantee, and
+// `_start` receives the register directly.
+
+import sos.{System, sos_system_get_clock}
+
+/// A domain no `ClockType` names. Not adjacent to the one that exists, so a
+/// reader cannot mistake this for an off-by-one in the enum.
+static UNKNOWN_DOMAIN: UInt = 99
+
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let _ = system.debug_print("SOS badclock: asking for a domain that does not exist\n")
+
+    // Does not return: the kernel terminates this process for an argument
+    // outside its domain.
+    let _ = ask(boot_handle)
+
+    let _ = system.debug_print("SOS badclock: survived, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+/// The `unsafe` half, confined to one small named helper (design 136) — the
+/// out-parameter's address never leaves it.
+func ask(handle: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    sos_system_get_clock(handle, UNKNOWN_DOMAIN, (&var out) as UnsafePointer<UInt>)
+}

@@ -100,9 +100,9 @@ separately only because it is new; `sos/hal/arm64/kernel/` implements every row.
 | `wait_for_irq()` | Park the core until an interrupt is PENDING. Both machines wake from this whether or not the current privilege level would take one, which is exactly what the idle path needs — D2 keeps them masked in kernel mode forever, so the kernel notices by polling rather than by trapping. |
 | `irq_line_valid(line) -> Bool` | Is this a line the BOARD wires? What `Process.BindInterrupt` checks a caller's number against. The TIMER's line is excluded arch-free by the kernel instead, because "the tick is not for rent" is a policy rather than a fact about the board. |
 | `irq_complete(line)` | End of service for a line. |
-| `timer_start(period_us)` | Arm a periodic tick and make it reachable. |
-| `timer_rearm()` | Schedule the next tick. On both profiles this is also what LOWERS the timer's line, which is why the tick path calls it rather than acknowledging something. |
-| `timer_pending() -> Bool` | Has the timer come due without a tick having been taken for it? The masking case's evidence. |
+| `timer_now_ns() -> UInt64` | This machine's monotonic time in nanoseconds since the counter started. What a `Clock.now()` reads and what every deadline is measured against — one time source, so the two cannot disagree. |
+| `timer_set_deadline_ns(at_ns)` | Program the ONE comparator to interrupt at an ABSOLUTE deadline. On both profiles this is also what LOWERS the timer's line, which is why the fire path calls it rather than acknowledging something. `UInt64.max` is the kernel's "never". Enables the timer interrupt every time — idempotent, and what lets a kernel that armed no tick still serve a Timer armed later. |
+| `timer_pending() -> Bool` | Has the timer come due without a fire having been taken for it? The masking case's evidence. |
 | `irq_raise_selftest_line() -> UInt` | Raise a line from software, for bring-up, and say which. Per-board because what a board can interrupt itself with is: here a real device, on Profile B a software-generated line. |
 
 **`irq_raise_selftest_line` STAYS, and unit 1 expected it not to** (design 178 M2
@@ -232,6 +232,20 @@ and they are compiled from one definition so they cannot skew.
   a split 64-bit counter needs on a 32-bit machine: a carry-safe read (the high
   half either side of the low one) and a write order that never leaves the
   comparator naming a deadline in the past (low half to all-ones first).
+- **ONE COMPARATOR, TWO CUSTOMERS** (design 232 unit 1). The scheduler tick and
+  the Timer objects share `mtimecmp`, and the sharing is the KERNEL's
+  arithmetic, not this HAL's: the seam is `timer_now_ns()` +
+  `timer_set_deadline_ns(at)` — a counter read and an absolute deadline — and
+  `sos/kernel/core/` programs the earliest deadline it owes anybody. What this
+  machine does with such a deadline: converts nanoseconds to counter units at
+  the board's 10 MHz timebase (100 ns a unit, which divides exactly), rounding
+  UP so a deadline never fires early, and writes the comparator through the
+  split-write order above. The kernel's "never" deadline (`UInt64.max`)
+  saturates to a counter value this machine reaches in some six hundred years,
+  which is also what keeps the idle poll quiet when nothing is due. M2's
+  `timer_start`/`timer_rearm` pair retired with it: a periodic-only seam can
+  express exactly one customer, and the period was scheduler policy sitting in
+  a HAL.
 - **A line is masked by PRIORITY, not by its enable bit.** This controller
   ignores a completion for a source that is not enabled for the context, so
   masking by disabling between claim and complete would leave the source in

@@ -1,0 +1,69 @@
+// SOS M3 unit 1: a malformed `Timer.Arm` record is a FAULT (design 232;
+// design 178's faults ruling).
+//
+// THE COPY-IN DOOR'S FIRST REFUSAL. `Timer.Arm` is the first op in SOS that
+// reads a record OUT of a process's memory rather than writing one into it, and
+// the record's size is PUBLISHED — so a caller handing over the wrong number of
+// bytes has made a mistake it could have checked, which the ruling ends the
+// process for.
+//
+// THE LENGTH IS CHECKED FOR EQUALITY, NOT FOR "AT LEAST", and that is the one
+// place this door's rule differs from the outbound one's. A copy-OUT capacity is
+// a buffer the caller provides and may reasonably over-provision; a copy-IN
+// length is the caller's statement of what it is handing over, so a number that
+// is not the record's size means the two sides disagree about the shape of the
+// thing being passed — which is exactly the skew a funnel exists to catch before
+// the kernel reads a field out of the wrong offset.
+//
+// IT GOES THROUGH THE C ALTITUDE for the reason `timer-badclock` gives: the
+// typed `Timer.arm` builds the record itself out of its own frame, so a wrong
+// length is not expressible there at all. That the mistake needs one floor down
+// to even write IS the guarantee, and this case is where it is recorded.
+//
+// The chain of raw handles comes from the C surface too — boot handle, clock,
+// timer — because the typed layer offers no way to get a word back out of a
+// handle, which is the ruled guarantee it exists to keep.
+
+import sos.{System, sos_system_get_clock, sos_clock_create_timer, sos_timer_arm}
+
+/// `ClockType.Monotonic`'s wire value, written as a number because this is the
+/// altitude where a caller does that.
+static MONOTONIC: UInt = 0
+
+/// HALF A RECORD. The record is two 64-bit fields on every profile, so eight
+/// bytes is short by exactly one field — a length a caller could plausibly
+/// arrive at by counting the fields and forgetting their width, which makes it
+/// a better test than a wild number.
+static SHORT_BYTES: UInt = 8
+
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let _ = system.debug_print("SOS badrecord: arming with a short record\n")
+
+    // Does not return: the kernel terminates this process for an argument
+    // outside its domain.
+    let _ = arm_short(boot_handle)
+
+    let _ = system.debug_print("SOS badrecord: survived, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+/// The `unsafe` half, confined to one small named helper (design 136). Every
+/// pointer here is to this frame's own storage and none of them leaves it.
+func arm_short(handle: UInt) unsafe -> UInt {
+    var clock: UInt = 0
+    let _ = sos_system_get_clock(handle, MONOTONIC,
+                                 (&var clock) as UnsafePointer<UInt>)
+    var timer: UInt = 0
+    let _ = sos_clock_create_timer(clock, (&var timer) as UnsafePointer<UInt>)
+
+    // The buffer itself is perfectly good — word-aligned, in this process's own
+    // memory, big enough. Only the LENGTH is wrong, which is what isolates the
+    // check under test from the address checks beside it.
+    var record: [UInt64; 2] = [0; 2]
+    sos_timer_arm(timer, (&var record) as UnsafePointer<UInt64>, SHORT_BYTES)
+}
