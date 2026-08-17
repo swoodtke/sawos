@@ -390,16 +390,21 @@ static MAX_WAITERS: Int = 4
 /// which is a real resource the board fixes.
 static MAX_INTERRUPTS: Int = 4
 
-/// Clocks the kernel can hold, across all processes (spec §2 table; design 232
-/// unit 1).
+/// Clock objects in the system (spec §2 table; design 232 unit 1, amended
+/// Aug 17).
 ///
-/// TINY, AND IT IS A BOUND RATHER THAN A BUDGET. `System.ClockGet` is a getter:
-/// it mints a process's Clock for a domain on first ask and hands the same
-/// handle back every time after, so a process can hold at most one per
-/// `ClockType` and v1 declares one type. One per process is therefore the exact
-/// ceiling; the spare slot is headroom for the second domain rather than for a
-/// second ask.
-static MAX_CLOCKS: Int = MAX_PROCESSES + 1
+/// NOT A SLAB BUDGET — A CENSUS OF DOMAINS. A hardware-backed Clock is ONE
+/// KERNEL-ETERNAL OBJECT PER `ClockType`, existing from boot and owned by
+/// nobody: a machine has one monotonic counter, and a per-process object naming
+/// it would be a copy of a fact with a lifetime attached to it. So the slab has
+/// exactly one slot per domain, THE SLOT IS THE DOMAIN'S ORDINAL, and nothing is
+/// ever allocated or freed here. v1 declares one domain, hence one.
+///
+/// This is what a VIRTUAL clock will NOT be: a virtual clock is a separately
+/// created, STATEFUL object (it has an offset, a rate, an owner) and it will get
+/// its own creation op and its own lifetime. Sharing this slab with it would put
+/// two different kinds of thing in one table for the sake of a name they share.
+static CLOCK_KINDS: Int = 1
 
 /// Timers the kernel can hold, across all processes (spec §2 table; design 232
 /// unit 1).
@@ -646,18 +651,29 @@ struct InterruptSlot {
     attachment: Int,
 }
 
-/// One Clock (spec §2 table; design 232 unit 1): a GRANTED TIME SOURCE.
+/// One Clock (spec §2 table; design 232 unit 1, amended Aug 17): a GRANTED TIME
+/// SOURCE, and a KERNEL-ETERNAL one.
 ///
-/// IT HOLDS NO TIME. The machine's counter is the clock (`hal.timer_now_ns`),
-/// and this slot records only WHOSE it is and WHICH DOMAIN it names — so two
-/// processes' Clocks cannot drift apart, because there is nothing here to
-/// drift. What the object buys is the capability: a process that was never
-/// granted one cannot read the counter at all, which is what makes handing a
-/// child a VIRTUAL clock later a substitution rather than a redesign.
+/// IT HOLDS NO TIME AND NO OWNER. The machine's counter is the clock
+/// (`hal.timer_now_ns`) and this slot records only WHICH DOMAIN it names, so two
+/// processes' Clocks cannot drift apart — there is nothing here to drift, and
+/// nothing that belongs to anybody. That is why the object outlives every
+/// process: a slot with no per-process state has nothing a teardown could
+/// reclaim, and one object per domain is what stops two names existing for one
+/// counter (§3's no-duplicate rule).
+///
+/// What the object buys is still the capability: a process that was never
+/// granted a handle cannot read the counter at all, which is what makes handing
+/// a child a VIRTUAL clock later a substitution rather than a redesign. The
+/// virtual one will be a different animal — created, stateful, owned — and it
+/// gets its own slab when it lands.
+///
+/// `kind` IS ALSO THE SLOT'S INDEX, and it is stored anyway because it is what
+/// `clock_now` dispatches on: the domain decides what reading the object
+/// answers with, and a second domain should fail to compile until somebody says
+/// what its reading is.
 struct ClockSlot {
-    state: SlotState,
-    process: Int,
-    /// The domain this clock answers in, fixed at the grant.
+    /// The domain this clock answers in, for the life of the machine.
     kind: ClockType,
 }
 
@@ -778,9 +794,22 @@ unsafe static var ATTACHMENTS: [Attachment; MAX_ATTACHMENTS] = [
     Attachment(state: SlotState.Free, kind: WaitableKind.Event, target: 0,
                waiter: 0, key: 0, link: 0); MAX_ATTACHMENTS]
 
-unsafe static var CLOCKS: [ClockSlot; MAX_CLOCKS] = [
-    ClockSlot(state: SlotState.Free, process: 0,
-              kind: ClockType.Monotonic); MAX_CLOCKS]
+/// The machine's clocks, one per domain, LIVE FROM BOOT. There is no `Free`
+/// state and no allocation step: the table is the domain list written down, and
+/// `clock_slot` is the only thing that indexes it.
+unsafe static var CLOCKS: [ClockSlot; CLOCK_KINDS] = [
+    ClockSlot(kind: ClockType.Monotonic); CLOCK_KINDS]
+
+/// The slot naming `kind`'s clock — the whole of the lookup, because THE SLOT IS
+/// THE ORDINAL. `ClockType`'s raw values start at zero and are dense by
+/// construction (design 145's wire idiom numbers them), so the domain and its
+/// row are one fact rather than two kept in step.
+func clock_slot(kind: ClockType) -> Int {
+    (kind as UInt) as Int
+}
+
+static_assert(CLOCK_KINDS == 1,
+              "one slot per ClockType, and v1 declares exactly one domain")
 
 unsafe static var TIMERS: [TimerSlot; MAX_TIMERS] = [
     TimerSlot(state: SlotState.Free, process: 0, clock: 0, armed: false,
@@ -791,12 +820,13 @@ unsafe static var TIMERS: [TimerSlot; MAX_TIMERS] = [
 /// PLUS-ONE inside list links; this is the sentinel for the plain form.
 static NO_THREAD: Int = -1
 
-/// The same sentinel for the other tables.
+/// The same sentinel for the other tables. There is none for CLOCKS: every
+/// domain's slot exists from boot, so "no clock" is not a state the kernel can
+/// be in.
 static NO_EVENT: Int = -1
 static NO_WAITER: Int = -1
 static NO_INTERRUPT: Int = -1
 static NO_ATTACHMENT: Int = -1
-static NO_CLOCK: Int = -1
 static NO_TIMER: Int = -1
 
 /// The running thread's slot, or `NO_THREAD`.
@@ -968,18 +998,9 @@ func alloc_attachment() unsafe -> Int {
     NO_ATTACHMENT
 }
 
-/// Take a free clock slot, or `NO_CLOCK` when the slab is empty.
-func alloc_clock() unsafe -> Int {
-    var i: Int = 0
-    while i < MAX_CLOCKS {
-        match CLOCKS[i].state {
-            case Free -> { return i },
-            case Live -> {},
-        }
-        i = i + 1
-    }
-    NO_CLOCK
-}
+// There is no `alloc_clock`. A Clock is kernel-eternal and its slot is its
+// domain's ordinal (`clock_slot`), so there is nothing to take and nothing to
+// run out of — `System.ClockGet` mints a HANDLE and never an object.
 
 /// Take a free timer slot, or `NO_TIMER` when the slab is empty.
 func alloc_timer() unsafe -> Int {
@@ -1632,27 +1653,18 @@ func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
         w = w + 1
     }
 
-    // Clocks and Timers go back on the same terms as everything above. The
-    // TIMERS matter beyond the bookkeeping, for the reason the interrupt loop
-    // does: a dead process's armed deadline is one the kernel would otherwise
-    // keep waking itself for, forever, with nobody left to tell. Freeing them
-    // and reprogramming is the kernel taking the comparator back.
-    var clocks_freed: UInt = 0
-    var c: Int = 0
-    while c < MAX_CLOCKS {
-        if CLOCKS[c].process == p {
-            match CLOCKS[c].state {
-                case Free -> {},
-                case Live -> {
-                    CLOCKS[c] = ClockSlot(state: SlotState.Free, process: 0,
-                                          kind: ClockType.Monotonic)
-                    clocks_freed = clocks_freed + 1
-                },
-            }
-        }
-        c = c + 1
-    }
-
+    // NO CLOCK IS RECLAIMED HERE, and the absence is the point (ruled Aug 17,
+    // user). A Clock is kernel-eternal and owned by nobody, so a dead process
+    // leaves nothing behind: its clock HANDLE was unbound by the close-all loop
+    // above like every other, and the loop touches only the table entry, never
+    // the object it names — which is exactly why that path needs no per-kind
+    // arm to skip this one. Freeing a domain's slot on a process's death would
+    // take the machine's monotonic clock away from everybody else.
+    //
+    // TIMERS go back, and they matter beyond the bookkeeping for the reason the
+    // interrupt loop does: a dead process's armed deadline is one the kernel
+    // would otherwise keep waking itself for, forever, with nobody left to tell.
+    // Freeing them and reprogramming is the kernel taking the comparator back.
     var timers_freed: UInt = 0
     var tm: Int = 0
     while tm < MAX_TIMERS {
@@ -1683,8 +1695,9 @@ func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     uart.write_hex(waiters_freed)
     uart.write_str(" interrupts=")
     uart.write_hex(irqs_freed)
-    uart.write_str(" clocks=")
-    uart.write_hex(clocks_freed)
+    // No `clocks=` field: this line counts what the process OWNED, and a Clock
+    // is owned by nobody. A permanent zero would be a column that only ever
+    // says the same thing.
     uart.write_str(" timers=")
     uart.write_hex(timers_freed)
     uart.write_str("\n")
@@ -2068,45 +2081,43 @@ func clock_get(p: Int, raw_kind: UInt) unsafe -> SyscallResult {
     return clock_get_typed(p, kind)
 }
 
-/// FIND OR CREATE, and the find is what makes this a getter rather than a
-/// factory.
+/// THERE IS NOTHING TO CREATE, which is what makes this a getter rather than a
+/// factory (amended Aug 17, user).
 ///
-/// A machine has ONE monotonic clock, so two Clock objects naming it would be
-/// two names for one thing — which is what §3's no-duplicate rule exists to
-/// prevent. Asking twice is therefore a QUERY that answers with the same handle,
-/// exactly as `ProcessSelf` does, and an op that cannot allocate on repetition
-/// is one no quota row has to bound when quotas land in M3 unit 5.
+/// The object already exists — one kernel-eternal Clock per domain, live since
+/// boot — so this op only ever mints a HANDLE onto a well-known slot. The
+/// find-or-create scan it used to open with is gone with the per-process object
+/// it was scanning for, and so is the `NoResource` a full clock slab could
+/// answer with: a domain's slot cannot be occupied by somebody else. What can
+/// still fail is the HANDLE TABLE, which is the process's own resource.
+///
+/// ASKING TWICE STILL ANSWERS THE SAME HANDLE, and it is the process's table
+/// that says so rather than a scan of the slab. That keeps §3's no-duplicate
+/// rule (two handles onto one object would be two names for one thing) and keeps
+/// the op out of unit 5's quota rows, since it cannot allocate on repetition.
+/// Under the mint-per-call model the lifecycle unit 2.75 owns, this becomes pure
+/// minting; that flip is not made here.
 func clock_get_typed(p: Int, kind: ClockType) unsafe -> SyscallResult {
-    var i: Int = 0
-    while i < MAX_CLOCKS {
-        match CLOCKS[i].state {
-            case Live -> {
-                if CLOCKS[i].process == p && CLOCKS[i].kind == kind {
-                    return op_value(clock_handle_of(p, i))
-                }
-            },
-            case Free -> {},
-        }
-        i = i + 1
-    }
-
-    let slot = alloc_clock()
-    if slot == NO_CLOCK {
-        return op_status(SosStatus.NoResource)
+    let slot = clock_slot(kind)
+    let existing = clock_handle_of(p, slot)
+    if existing != NO_HANDLE {
+        return op_value(existing)
     }
     let handle = mint_handle(p, ObjType.Clock, clock_rights(), slot)
     if handle == NO_HANDLE {
         return op_status(SosStatus.NoResource)
     }
-    // Written only once BOTH allocations succeeded, so a refused handle leaves
-    // the slab exactly as it found it — `event_create`'s all-or-nothing shape.
-    CLOCKS[slot] = ClockSlot(state: SlotState.Live, process: p, kind: kind)
     op_value(handle)
 }
 
-/// The handle in `p`'s table naming clock slot `slot`.
+/// The handle in `p`'s table naming clock slot `slot`, or `NO_HANDLE`.
 ///
-/// A SEARCH rather than a field on the slot, and the asymmetry with
+/// SINCE THE CLOCK WENT GLOBAL THIS IS THE WHOLE OF `ClockGet`'S "SAME HANDLE
+/// EVERY ASK": the object cannot tell you who holds it, so the process's own
+/// table is what answers. That is also the only place the answer could live —
+/// a field on a shared object would have to be a field per process.
+///
+/// A SEARCH rather than a cached word, and the asymmetry with
 /// `ProcessSlot.self_handle` is the honest one: a process has exactly one
 /// Process handle by construction, so caching it is caching a fact. A Clock's
 /// handle is merely the one this table happens to hold, and a second copy of
@@ -2548,7 +2559,7 @@ func clock_op_decoded(op: ClockOp, obj: &ClockObject, arg0: UInt, arg1: UInt,
             if not obj.allows(ClockRight.Read) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            clock_now(p, arg0, arg1)
+            clock_now(p, obj.slot, arg0, arg1)
         },
         // The Timer BINDS THIS CLOCK at creation (the M3 time notes), which is
         // why creation lives on the Clock rather than on the Process beside the
@@ -2564,15 +2575,24 @@ func clock_op_decoded(op: ClockOp, obj: &ClockObject, arg0: UInt, arg1: UInt,
     }
 }
 
-/// Read the clock into the caller's buffer.
-func clock_now(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
+/// Read clock `slot` into the caller's buffer.
+///
+/// THE DOMAIN DECIDES THE READING, which is why the slot is passed in rather
+/// than the reading being taken straight off the machine. Today there is one
+/// domain and it is the raw counter; the match is exhaustive, so a second
+/// `ClockType` fails to compile here until somebody says what its reading is —
+/// which is the one question adding a domain actually poses.
+func clock_now(p: Int, slot: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
     // A capacity below the record's size is an argument outside its domain —
     // the size is published, so the caller could have checked. `Waiter.Wait`'s
     // rule, and the same diagnostic.
     if cap < (clock_now_record_bytes() as UInt) {
         fault_process(p, FaultReason.BadArg)
     }
-    var rec = ClockNowRecord(now_ns: hal.timer_now_ns())
+    let reading = match CLOCKS[slot].kind {
+        case Monotonic -> hal.timer_now_ns(),
+    }
+    var rec = ClockNowRecord(now_ns: reading)
     copy_out(p, dst, ((&var rec) as UnsafePointer<ClockNowRecord>) as UInt,
              clock_now_record_bytes() as UInt)
     op_ok()
