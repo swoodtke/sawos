@@ -34,7 +34,8 @@ names provisional):
 | `MemoryObject` | A range of memory (RAM or device MMIO) that can be mapped into AddressSpaces. Derived by splitting/attenuating a parent MemoryObject; roots handed to the first process at boot. |
 | `Channel` | Synchronous message IPC with request/reply built in — see §2.1 (ratified Jul 29). |
 | `Event` | Accumulating non-blocking notification (OR / saturating-sum); a waitable — see §2.4 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Signal`/`Receive`, the mode chosen by the caller at creation (`create_event(mode:)`). |
-| `Timer` | Deadline object; fires an Event / is waitable. NOT BUILT: M2's timer is the scheduler tick and nothing else, so a process cannot sleep; the granted-Clock/Timer surface is design 232 unit 1. |
+| `Clock` | A GRANTED TIME SOURCE — time is a capability, not an ambient facility. BUILT M3 (design 232 unit 1): obtained through `SystemOp.GetClock` on `SystemRight.GetClock`, ops `Now`/`CreateTimer`, rights `ClockRight.Read`/`.CreateTimer`. It is a GETTER, not a factory — the same handle every ask, per (process, `ClockType`), on the `SelfProcess` precedent, since a machine has one monotonic clock and two objects naming it would be two names for one thing. `ClockType` declares `Monotonic` ONLY in v1 (`Boot`/`Realtime` are future values of a raw-backed enum, undeclared because an unproducible case is dead surface). `Now` answers through a copy-out record, because a nanosecond count is 64 bits and one profile's registers are not. The point of the capability: strip the right from a child and hand it a VIRTUAL clock over IPC instead, with no code change on either side. |
+| `Timer` | Deadline object bound to the Clock that created it; directly waitable. BUILT M3 (design 232 unit 1) — THE PROCESS-SLEEP PRIMITIVE, and before it a wait either returned at once or blocked forever. Ops `Arm`/`Disarm`, rights `TimerRight.Arm` (gating both) / `.Wait`. `arm(after_ns, interval_ns)` arrives through the new COPY-IN record (§2.2's copy-out funnel's mirror twin, built here and inherited by M4's IPC send) because two 64-bit times exceed the argument registers on a 32-bit profile; `interval_ns == 0` is a one-shot, which disarms itself when it fires. The re-arm is DRIFT-FREE (next = previous DEADLINE + interval, the timerfd model) and missed expiries COALESCE into a saturating fire count delivered as `WaitPayload.Timer(fires:)`. **There is NO ACK**: unlike §9's Interrupt there is no mask to release, so the wait that reports the fires is what consumes them. Arming an armed timer REPLACES its schedule and clears the count; disarming an unarmed one is a NO-OP, deliberately opposite to §9's ack-with-no-fire — a one-shot disarms itself, so cancelling a timeout that just expired is an ordinary race rather than a caller error. |
 | `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it, ack via the handle. BUILT M2 (design 178 unit 4): one op (`Ack`), two rights (`InterruptRight.Wait`/`.Ack`), created by `ProcessOp.BindInterrupt` on its own Process right — the factory bit a launcher strips from everything that is not a driver. The BINDING IS THE OBJECT'S EXISTENCE (creation takes the line, there is no rebind), which is what stops one handle naming two devices over its life. A line the board does not have, the TIMER's line, and a line already bound are all faults. |
 | `Waiter` | Generic wait aggregator (epoll/Port-style) — see §2.2 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Add`/`Remove`/`Wait`, rights `WaiterRight.Attach`/`.Wait`, the wait answer a copy-out record. |
 | `MemoryObject` | Physical memory (RAM or device MMIO). Ownership/authority over the pages; mappable, sendable — see §2.3 (ratified Jul 29). |
@@ -42,10 +43,10 @@ names provisional):
 | `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. BUILT M2 (design 178 unit 2), one process: ops `CreateThread`/`SelfThread`/`Exit`/`GetStatus` plus the three factory ops `CreateEvent`/`CreateWaiter`/`BindInterrupt`, each on its own right. `create_process` is M3 (design 232 unit 2) and `kill` (§8) has no op yet. |
 | `System` | Kernel singleton (ratified Aug 5): the object behind system-scoped primitives so that EVERY syscall is an object op (§5.7) — v1 ops `debug_print`, `shutdown(status)` (stop the machine; QEMU: sifive_test), rights-gated (`SystemRight.Debug`/`.Shutdown`, §3 scoped rights). Root receives its handle at boot (§12). `exit` is NOT here — process exit belongs to the Process object when it exists (ratified Aug 5). M2 added a third op, `self_process` on `SystemRight.Manage` (design 178 unit 2): §3's derivation rule made real, so the boot register stays ONE handle wide and a process obtains its Process object THROUGH the System handle rather than being handed it. Later candidates: info queries. |
 
-**Six of these kinds exist today** — System, Process, Thread, Event, Waiter
-and Interrupt (`ObjType`, `sos/kernel/abi/`, the kernel-internal numbering
-§5.7's vDSO discipline keeps renumberable). The other rows are unbuilt:
-Channel is M4, Timer and the memory surface are M3 (design 232), and
+**Eight of these kinds exist today** — System, Process, Thread, Event, Waiter,
+Interrupt, Clock and Timer (`ObjType`, `sos/kernel/abi/`, the kernel-internal
+numbering §5.7's vDSO discipline keeps renumberable). The other rows are
+unbuilt: Channel is M4, the memory surface is M3 (design 232 unit 4), and
 AddressSpace stays implicit while one process exists — a process gets one
 granted range plus a writable window, installed by the loader. §11 is the
 ledger.
@@ -134,15 +135,33 @@ ledger.
   already uses is a FAULT, because a duplicate makes two questions ambiguous at
   once — which attachment a `remove` names, and which one an answer came from.
 - Waitables: Channel (readable / reply-ready), Event, Timer,
-  Interrupt, ReplyHandle. **Event and Interrupt are BUILT** (M2 units 3
-  and 4); Timer is M3 (design 232 unit 1) and Channel with its
+  Interrupt, ReplyHandle. **Event, Interrupt and Timer are BUILT** (M2 units
+  3 and 4; design 232 unit 1); Channel with its
   ReplyHandle is M4. The second kind is what moved an attachment
   out of the waitable and into a table of its own: a Waiter's set has to
   be ONE list, since a wait scans it once and a `remove` walks it once,
   so per-kind lists would make both a matrix over kinds. What stays
-  per-kind is four questions — who is watching me, set who is watching
-  me, am I ready, what does a record say — each an exhaustive match, so
-  a fifth waitable cannot be added silently.
+  per-kind is FIVE questions — who is watching me, set who is watching
+  me, am I ready, what does a record say, and (added by the Timer) a
+  record was DELIVERED — each an exhaustive match, so a fourth waitable
+  cannot be added silently. The fifth is the Timer's ACK-FREE DRAIN: an
+  Event's payload is a snapshot `receive` stays authoritative over and an
+  Interrupt's readiness is ended by the driver's ack, so both answer it
+  with nothing, while a Timer's fire count is SPENT by the delivery.
+  Delivery is one funnel, so the drain cannot happen on the already-ready
+  path and not on the wake path.
+- **THE COPY-IN DOOR is the copy-out funnel's mirror twin** (design 232
+  unit 1), built for `Timer.Arm` and inherited by §2.1's message body. It
+  refuses the same two things — a misaligned address, an address outside
+  the process — and TERMINATES the process for either, on the same
+  reasoning. One asymmetry is deliberate: copy-out's window is the
+  process's WRITABLE memory and copy-in's is the whole GRANTED region,
+  because a record may legitimately come out of a process's own rodata,
+  and the two doors guard different hazards (writing outside the writable
+  window corrupts the process; reading outside the granted region reads
+  somebody else). A copy-in LENGTH is checked for equality rather than
+  "at least": a capacity may be over-provisioned, but an inbound length is
+  the caller's statement of what it is handing over.
   **Attach semantics (ratified Jul 29):**
   **level-triggered** (keeps reporting ready until the waiter handles
   it — no lost edges); **persistent** attachments with explicit
@@ -530,8 +549,13 @@ arena and the four `__saw_rt_*` seams are Saw in `sos/rt/common/src/lib.saw`,
 one copy serving the kernel and every process; the process side's two hooks and
 its parked boot handle are Saw in `sos/kernel/sysapi/`, beside the System object
 whose authority they spend. Both user HALs are now their syscall instruction and
-nothing else, and `sos/rt/common_c/support.c` is `mem*` and the atomic libcalls
-— reason 2, and reason 2 only.
+nothing else, and `sos/rt/common_c/support.c` is `mem*`, the atomic libcalls and
+(since design 232 unit 1) the 64-bit division pair — reason 2, and reason 2
+only. That last entry is worth its line: a Clock reads NANOSECONDS, which is a
+64-bit quantity on every profile because 32 bits of them wraps in four seconds,
+and rv32 has no 64-bit divide instruction even with `+m`. So the floor grows
+when a 32-bit machine meets an arithmetic width the ISA does not have — not
+when the language falls short.
 
 So the floor is one shared C file plus four inline-asm leaves, and every one of
 them is reason 1 or reason 2. Reason 3 is the only open language gap.
@@ -892,9 +916,8 @@ event-driven EDGE of a process gets a second, distinct construct:
 - **What the kernel does NOT have after M2.** One area per line, with the
   section that specifies it; design 232 is the M3 plan of record and is
   pointed at rather than duplicated.
-  - **Clock and Timer** (§2 rows) — neither object exists; the hardware
-    timer is the scheduler tick and nothing else, so a process cannot
-    sleep at all. Design 232 unit 1.
+  - ~~**Clock and Timer**~~ BUILT by design 232 unit 1 — see the M3 entry in
+    the roadmap below. A process can sleep.
   - **A second process** (§2 Process row, §12) — `create_process` is
     absent and exactly one Process is ever built, so §12's
     loader-above-boot rule has never been exercised. Design 232 unit 2,
@@ -1040,7 +1063,8 @@ event-driven EDGE of a process gets a second, distinct construct:
     (a) **The interrupt seam.** Each HAL gained twelve names and the kernel
     reaches interrupts through those and nothing else (`is_interrupt`,
     `irq_claim`/`irq_complete`, `irq_mask`/`irq_unmask`, `timer_start`/
-    `timer_rearm`/`timer_pending`, and a selftest line). `ktrap` decides
+    `timer_rearm`/`timer_pending`, and a selftest line) — the timer trio was
+    reshaped by M3 unit 1, see that entry. `ktrap` decides
     interrupt / fault / syscall IN THAT ORDER — an interrupt's instruction
     has not run, so it must never reach the syscall return path that steps
     the saved PC — and `service_irq` is the one arch-free entry: claim,
@@ -1103,6 +1127,43 @@ event-driven EDGE of a process gets a second, distinct construct:
     and the C ABI declares no aggregate return), and `sos_wait_for_irq`
     per profile (`wfi` is an instruction). Assembly went DOWN, because a
     thread context built in Saw needs no register-clearing prologue.
+  - **M3 IN PROGRESS (design 232) — unit 1 DONE, branch PARKED for user
+    review:** the Clock and Timer objects, and with them the thing SOS could
+    not do before — **a process can sleep**. Eight object kinds where M2 had
+    six; six new harness cases per architecture, 38 each, 76 runs. What the
+    implementation added to §2's two new rows:
+    (a) **ONE HARDWARE TIMER, TWO CUSTOMERS.** Both machines have a single
+    comparator, and the scheduler tick (§7) and every armed Timer now want it.
+    The per-arch seam flipped from PERIODIC (`timer_start(period_us)` +
+    `timer_rearm()`) to ABSOLUTE (`timer_now_ns()` + `timer_set_deadline_ns(at)`)
+    — a periodic seam can express exactly one customer — and the tick's PERIOD
+    moved out of the HALs into the arch-free kernel, where scheduler policy
+    belongs. The kernel keeps every deadline it owes in nanoseconds and programs
+    the EARLIEST; a fire means "something MAY be due", and one reading of the
+    clock answers for every customer with the TICK ASKED FIRST. **§7's tick is
+    thereby inviolate by construction**: a Timer deadline can only ever move the
+    hardware earlier, never later.
+    (b) **THE TWO RE-ARM RULES ARE OPPOSITE, deliberately.** The tick re-arms
+    from NOW (a late tick is one tick, never a burst of catch-up), a Timer from
+    its own DEADLINE (drift-free, the timerfd model) — a timeslice has no
+    history to be faithful to and an interval does. Missed expiries COALESCE
+    into a saturating count by DIVISION rather than by a loop, so an interval
+    far below what the machine can serve costs one divide; what keeps it from
+    livelocking is a floor on how soon the hardware is ever programmed, which
+    leaves the logical schedule untouched. No minimum interval is imposed and
+    nothing is refused.
+    (c) **The copy-IN funnel**, §2.2's copy-out door run backwards, built here
+    for `Timer.Arm` and inherited by M4's message body.
+    (d) **"Nothing runnable" split again, and the rule GENERALIZED.** M2 made it
+    "idle iff a line is bound"; an armed Timer is readiness the clock will
+    deliver, so the rule is now "idle iff something outside the thread set can
+    still wake somebody". An unarmed Timer is NOT one — it will never fire — and
+    that distinction has its own case, because getting it wrong that way fails
+    as a harness timeout rather than as a report.
+    (e) **Two language findings, neither worked around** (DF-232a, an internal
+    compiler error on a bare literal assigned to a fixed-width place; DF-232b,
+    `type` is a keyword so the ruled `get_clock(type:)` label is unwritable and
+    is built as `kind:`).
 
 ## 12. The root server (ratified Aug 5, user)
 
