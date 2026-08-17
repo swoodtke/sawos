@@ -1,0 +1,564 @@
+//! A PROCESS: the slab, the two doors into and out of its memory, its TEARDOWN,
+//! and the one way into user mode.
+//!
+//! THE TEARDOWN IS WHY THIS MODULE SITS WHERE IT DOES. Ending a process frees
+//! what it owned in EVERY slab — handles, threads, events, waiters,
+//! attachments, interrupts, timers — and reprograms the comparator, so it must
+//! be above all of those; and a caller error found in the copy door TERMINATES
+//! the process, so the doors are here beside it rather than below.
+//!
+//! What that leaves above: every seam that answers a process (`wake`, `irq`,
+//! `sched`, `dispatch`) and the loader that starts one.
+
+import hal
+import sosabi.{
+    ObjType,
+    EventMode,
+    FaultReason,
+    ProcessStatusKind,
+    root_system_rights,
+    root_process_rights,
+    thread_rights,
+    ROOT_SYSTEM_HANDLE,
+}
+import kcore.limits.{
+    MAX_ATTACHMENTS,
+    MAX_EVENTS,
+    MAX_HANDLES,
+    MAX_INTERRUPTS,
+    MAX_PROCESSES,
+    MAX_THREADS,
+    MAX_TIMERS,
+    MAX_WAITERS,
+    NO_THREAD,
+}
+import kcore.mem.{copy_bytes, word_bytes}
+import kcore.diag.{ExitCode, console, fatal_image}
+import kcore.objects.{HANDLES, HandleEntry, SlotState, mint_handle}
+import kcore.threads.{
+    CURRENT_THREAD,
+    READY_HEAD,
+    READY_TAIL,
+    SLICE_LEFT,
+    SLICE_TICKS,
+    THREADS,
+    ThreadSlot,
+    ThreadState,
+    alloc_thread,
+    frame_slot,
+}
+import kcore.time.{TIMERS, TimerSlot, reprogram_timer}
+import kcore.waitables.{
+    ATTACHMENTS,
+    Attachment,
+    EVENTS,
+    EventSlot,
+    INTERRUPTS,
+    InterruptSlot,
+    WAITERS,
+    WaitableKind,
+    WaiterSlot,
+}
+
+/// What a process slot is doing.
+enum ProcessState: UInt8 {
+    case Free = 0,
+    case Running = 1,
+    case Gone = 2,
+}
+
+/// One process (spec §2 table row): its protection domain, its handle table and
+/// its threads.
+///
+/// The handle table is not a field: it is a slice of `HANDLES` below, indexed
+/// by this slot. That is the same arrangement as the frames and for the same
+/// reason — a fixed-size array of fixed-size arrays is a shape the kernel has
+/// no allocator for.
+///
+/// `region_base`/`region_top` ARE the address-space domain in M2: one granted
+/// range per process, installed by the loader through the HAL's protection
+/// primitive. Real Mapping objects are M3; what this pair does today is answer
+/// the one question thread creation has to ask — is this entry, is this stack,
+/// inside the process at all.
+/// `rw_base`/`rw_top` are the WRITABLE window inside that range, and they exist
+/// because the kernel now writes into a process's memory (`copy_out`). A
+/// process that asks the kernel to place a record in its own CODE has made a
+/// caller-checkable mistake, and the check needs somewhere to read the answer
+/// from. It is ONE window rather than a per-segment list because M2 grants a
+/// contiguous image (spec §5.5's `code|rodata|rw` layout) plus a stack at the
+/// region's top edge, so the writable part is the span between them — and
+/// because the per-mapping answer is M3's, where a Mapping object records its
+/// own permissions and this pair is replaced by a lookup rather than widened.
+/// It is CONSERVATIVE in one direction only: a gap between the image's writable
+/// end and the stack falls inside the span, so the kernel may write RAM the
+/// process was not granted. That corrupts nothing — the process owns the whole
+/// region either way, and a process that names a hole gets a record it cannot
+/// read, which is its own bug.
+///
+/// Zero/zero means NO writable grant, and that is the honest answer for the
+/// harness kernels that grant a payload its own bytes read+execute: a process
+/// with nowhere to receive a record cannot receive one.
+struct ProcessSlot {
+    state: ProcessState,
+    /// This process's own handle in its own table (what `ProcessSelf` returns).
+    self_handle: UInt,
+    /// The image entry, which is what `ENTRY_IMAGE` resolves to.
+    entry: UInt,
+    region_base: UInt,
+    region_top: UInt,
+    rw_base: UInt,
+    rw_top: UInt,
+    exit_kind: ProcessStatusKind,
+    exit_code: UInt,
+}
+
+public unsafe static var PROCESSES: [ProcessSlot; MAX_PROCESSES] = [
+    ProcessSlot(state: ProcessState.Free, self_handle: 0, entry: 0,
+             region_base: 0, region_top: 0, rw_base: 0, rw_top: 0,
+             exit_kind: ProcessStatusKind.Running, exit_code: 0); MAX_PROCESSES]
+
+// -----------------------------------------------------------------------------
+// Process teardown (spec §2's Process row: close all handles, free what it owns)
+// -----------------------------------------------------------------------------
+
+/// End process `p` and stop the machine with `machine_status`. Never returns.
+///
+/// The teardown is the ratified one and it is unconditional: every handle in
+/// the process's table is closed, every thread slot and every frame it owns
+/// goes back to the kernel's pools, and only then does the machine stop. With
+/// one process that last step is the run ending; with M3's several it becomes a
+/// return to the scheduler, and nothing above this line changes.
+///
+/// `machine_status` is separate from `code` because they answer different
+/// questions: `code` is what a supervisor would read out of the §8 status word,
+/// and `machine_status` is what the EMULATOR exits with — which for a fault is
+/// the kernel's own vocabulary rather than anything the process chose.
+public func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
+                 machine_status: UInt) unsafe -> Never {
+    PROCESSES[p].state = ProcessState.Gone
+    PROCESSES[p].exit_kind = kind
+    PROCESSES[p].exit_code = code
+
+    var closed: UInt = 0
+    var h: Int = 0
+    while h < MAX_HANDLES {
+        match HANDLES[p * MAX_HANDLES + h].obj_type {
+            case Unbound -> {},
+            case _ -> {
+                HANDLES[p * MAX_HANDLES + h] = HandleEntry(obj_type: ObjType.Unbound,
+                                                           rights: 0, target: 0)
+                closed = closed + 1
+            },
+        }
+        h = h + 1
+    }
+
+    var freed: UInt = 0
+    var t: Int = 0
+    while t < MAX_THREADS {
+        if THREADS[t].process == p {
+            match THREADS[t].state {
+                case Free -> {},
+                case _ -> {
+                    THREADS[t] = ThreadSlot(state: ThreadState.Free, process: 0,
+                                            self_handle: 0, exit_code: 0,
+                                            joiners: 0, link: 0, wait_buf: 0)
+                    freed = freed + 1
+                },
+            }
+        }
+        t = t + 1
+    }
+    CURRENT_THREAD = NO_THREAD
+    READY_HEAD = 0
+    READY_TAIL = 0
+
+    // Interrupts go back FIRST, and masking each line is the part that is not
+    // bookkeeping: a device the dead process was driving may still be
+    // asserting, and an unmasked line with no object behind it would be taken,
+    // reported and masked once per fire forever. Masking here is the kernel
+    // taking the line back, which is the same handover §9 describes running
+    // backwards.
+    var irqs_freed: UInt = 0
+    var q: Int = 0
+    while q < MAX_INTERRUPTS {
+        if INTERRUPTS[q].process == p {
+            match INTERRUPTS[q].state {
+                case Free -> {},
+                case Live -> {
+                    hal.irq_mask(INTERRUPTS[q].line)
+                    INTERRUPTS[q] = InterruptSlot(state: SlotState.Free,
+                                                  process: 0, line: 0,
+                                                  pending: false, attachment: 0)
+                    irqs_freed = irqs_freed + 1
+                },
+            }
+        }
+        q = q + 1
+    }
+
+    // Attachments belong to a WAITER, so they are reclaimed by walking the
+    // process's waiters rather than by scanning for a process field they do not
+    // carry — which is also the honest ownership statement: an attachment is a
+    // row in a Waiter's table and dies with it.
+    var a: Int = 0
+    while a < MAX_ATTACHMENTS {
+        match ATTACHMENTS[a].state {
+            case Free -> {},
+            case Live -> {
+                if WAITERS[ATTACHMENTS[a].waiter].process == p {
+                    ATTACHMENTS[a] = Attachment(state: SlotState.Free,
+                                                kind: WaitableKind.Event,
+                                                target: 0, waiter: 0, key: 0,
+                                                link: 0)
+                }
+            },
+        }
+        a = a + 1
+    }
+
+    // Events and Waiters go back to their slabs whole (spec §2's Process row:
+    // free what the process owned). No unlinking is needed first — an
+    // attachment only ever joins two objects of the SAME process, so freeing
+    // both ends is freeing the list, and a Waiter's blocked list named threads
+    // this loop's predecessor has already reclaimed.
+    var events_freed: UInt = 0
+    var e: Int = 0
+    while e < MAX_EVENTS {
+        if EVENTS[e].process == p {
+            match EVENTS[e].state {
+                case Free -> {},
+                case Live -> {
+                    EVENTS[e] = EventSlot(state: SlotState.Free, process: 0,
+                                          mode: EventMode.Or, word: 0,
+                                          attachment: 0)
+                    events_freed = events_freed + 1
+                },
+            }
+        }
+        e = e + 1
+    }
+
+    var waiters_freed: UInt = 0
+    var w: Int = 0
+    while w < MAX_WAITERS {
+        if WAITERS[w].process == p {
+            match WAITERS[w].state {
+                case Free -> {},
+                case Live -> {
+                    WAITERS[w] = WaiterSlot(state: SlotState.Free, process: 0,
+                                            attached: 0, blocked: 0)
+                    waiters_freed = waiters_freed + 1
+                },
+            }
+        }
+        w = w + 1
+    }
+
+    // NO CLOCK IS RECLAIMED HERE, and the absence is the point (ruled Aug 17,
+    // user). A Clock is kernel-eternal and owned by nobody, so a dead process
+    // leaves nothing behind: its clock HANDLE was unbound by the close-all loop
+    // above like every other, and the loop touches only the table entry, never
+    // the object it names — which is exactly why that path needs no per-kind
+    // arm to skip this one. Freeing a domain's slot on a process's death would
+    // take the machine's monotonic clock away from everybody else.
+    //
+    // TIMERS go back, and they matter beyond the bookkeeping for the reason the
+    // interrupt loop does: a dead process's armed deadline is one the kernel
+    // would otherwise keep waking itself for, forever, with nobody left to tell.
+    // Freeing them and reprogramming is the kernel taking the comparator back.
+    var timers_freed: UInt = 0
+    var tm: Int = 0
+    while tm < MAX_TIMERS {
+        if TIMERS[tm].process == p {
+            match TIMERS[tm].state {
+                case Free -> {},
+                case Live -> {
+                    TIMERS[tm] = TimerSlot(state: SlotState.Free, process: 0,
+                                           clock: 0, armed: false,
+                                           deadline_ns: 0, interval_ns: 0,
+                                           fires: 0, attachment: 0)
+                    timers_freed = timers_freed + 1
+                },
+            }
+        }
+        tm = tm + 1
+    }
+    reprogram_timer()
+
+    let uart = console()
+    uart.write_str("SOS: process teardown handles=")
+    uart.write_hex(closed)
+    uart.write_str(" threads=")
+    uart.write_hex(freed)
+    uart.write_str(" events=")
+    uart.write_hex(events_freed)
+    uart.write_str(" waiters=")
+    uart.write_hex(waiters_freed)
+    uart.write_str(" interrupts=")
+    uart.write_hex(irqs_freed)
+    // No `clocks=` field: this line counts what the process OWNED, and a Clock
+    // is owned by nobody. A permanent zero would be a column that only ever
+    // says the same thing.
+    uart.write_str(" timers=")
+    uart.write_hex(timers_freed)
+    uart.write_str("\n")
+
+    if machine_status == 0 {
+        hal.exit_pass()
+    } else {
+        hal.exit_fail(machine_status)
+    }
+    while { }
+}
+
+/// TERMINATE a process for a caller error it could have checked — design 178's
+/// faults ruling, ratified Aug 15.
+///
+/// This is what an invalid handle, an unknown op, a missing right or an op
+/// aimed at the wrong thread DOES. It is not a status the process receives: the
+/// process is the thing that was wrong, so it ends, and the kernel stays up to
+/// say so. Never returns.
+public func fault_process(p: Int, reason: FaultReason) unsafe -> Never {
+    let uart = console()
+    uart.write_str("SOS: process fault: ")
+    uart.write_str(reason.describe())
+    uart.write_str("\n")
+    end_process(p, ProcessStatusKind.Faulted, (reason as UInt8) as UInt,
+                ExitCode.ProcessFault as UInt)
+}
+
+/// The same termination, reached from a hardware fault rather than a syscall
+/// (spec §8: a thread fault kills its process). The report keeps M1's wording
+/// and shape, because the harness reads it and because a reader of the two eras
+/// should see the same line for the same event.
+public func fault_trap(tag: String, cause: UInt, epc: UInt, tval: UInt) unsafe -> Never {
+    let uart = console()
+    uart.write_str("SOS: fault ")
+    uart.write_str(tag)
+    uart.write_str(" cause=")
+    uart.write_hex(cause)
+    uart.write_str(" epc=")
+    uart.write_hex(epc)
+    uart.write_str(" tval=")
+    uart.write_hex(tval)
+    uart.write_str("\n")
+    if CURRENT_THREAD != NO_THREAD {
+        end_process(THREADS[CURRENT_THREAD].process, ProcessStatusKind.Faulted, 0,
+                    ExitCode.UmodeFault as UInt)
+    }
+    // No process object yet: the harness kernels that enter user mode directly.
+    hal.exit_fail(ExitCode.UmodeFault as UInt)
+    while { }
+}
+
+// -----------------------------------------------------------------------------
+// COPY-OUT: the one door from kernel memory into a process's
+// -----------------------------------------------------------------------------
+//
+// This is SOS's FIRST kernel-writes-userspace path, and it is built as a funnel
+// on the first use rather than after the third, because the shape of what
+// follows is already known: spec §2.1 has a Channel `receive` copying a message
+// body into the receiver's address space, and that is the same operation with a
+// bigger length.
+//
+// WHAT IT REFUSES, and why each is a FAULT rather than a status (design 178's
+// ruling — a caller error the process could have checked ends it):
+//
+//   - a destination that is not word-aligned. The kernel writes machine words;
+//     a misaligned store traps on one profile and is merely wrong on the other,
+//     and neither is something to discover at the wake.
+//   - a destination outside the process's WRITABLE window. A process asking the
+//     kernel to place a record in its own code has misread its own memory map.
+//
+// A process knows where its own writable memory is — it linked the image — so
+// both are caller-checkable in the strongest sense.
+//
+// M2 IS ONE ADDRESS SPACE, and that is what makes the write a plain copy: the
+// writer may be a DIFFERENT thread from the one that asked (a signaller waking
+// a parked waiter), and both are in the same process today. When M3 brings
+// several address spaces, the mapping switch goes HERE — this function is the
+// only place the kernel dereferences a user address, which is precisely the
+// property that makes that a one-place change.
+
+/// Validate a destination the kernel is about to write, or TERMINATE the
+/// process. Never returns on a bad buffer.
+///
+/// Split out from `copy_out` for exactly one caller: `Waiter.Wait` validates
+/// when it PARKS, so that a bad buffer ends the process that supplied it while
+/// that process is still the running one, rather than at some later wake in
+/// another thread's context. Every other consumer validates and copies in one
+/// step, which is what `copy_out` is.
+public func copy_out_check(p: Int, dst: UInt, bytes: UInt) unsafe {
+    if (dst % word_bytes()) != 0 {
+        fault_process(p, FaultReason.BadAlign)
+    }
+    if dst < PROCESSES[p].rw_base {
+        fault_process(p, FaultReason.BadBuffer)
+    }
+    // Ordered so the subtraction below cannot underflow: `rw_top - dst` is only
+    // computed once `dst` is known to be inside the window. A hostile length
+    // must produce a diagnostic, not a panic — the loader's own discipline.
+    if dst >= PROCESSES[p].rw_top {
+        fault_process(p, FaultReason.BadBuffer)
+    }
+    if bytes > PROCESSES[p].rw_top - dst {
+        fault_process(p, FaultReason.BadBuffer)
+    }
+}
+
+/// Copy `bytes` from kernel memory at `src` into process `p` at `dst`.
+///
+/// THE ONE DOOR. Its consumers, current and intended:
+///
+///   - `Waiter.Wait` (here, both paths — the ready one and the wake);
+///   - the Interrupt object's wait result, when that lands;
+///   - M3's Channel `receive`, which is §2.1's message body and the reason this
+///     is a general copy rather than a record writer.
+///
+/// Nothing else in the kernel may dereference a user address. That is the whole
+/// rule, and it is one function long so it stays checkable by reading.
+public func copy_out(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe {
+    copy_out_check(p, dst, bytes)
+    copy_bytes(dst, src, bytes)
+}
+
+// -----------------------------------------------------------------------------
+// COPY-IN: the one door from a process's memory into the kernel's
+// -----------------------------------------------------------------------------
+//
+// THE MIRROR TWIN OF `copy_out`, and it is built as a funnel on its first use
+// for the same reason that one was: the shape of what follows is already known.
+// Spec §2.1 has a Channel `send` copying a message BODY out of the sender's
+// address space, and that is this operation with a bigger length — so design
+// 232 unit 1 builds the door, and `Timer.Arm` is its small first consumer
+// exactly as `Waiter.Wait` was for copy-out.
+//
+// WHY AN OP NEEDS IT AT ALL. §5.7 gives an op three argument registers. A
+// nanosecond time is 64 bits — anything narrower wraps in four seconds — so
+// `arm`'s (first deadline, interval) pair is FOUR words on a 32-bit profile.
+// The arguments do not fit, and widening the register convention would widen it
+// for every op forever to suit one.
+//
+// WHAT IT REFUSES, and why each is a FAULT rather than a status (design 178's
+// ruling — a caller error the process could have checked ends it):
+//
+//   - a source that is not word-aligned. Same rule the copy-out door applies,
+//     and stated once so a caller learns ONE alignment rule for kernel records
+//     rather than one per direction.
+//   - a source outside the process's own memory. A process asking the kernel to
+//     read a record from an address it does not own has misread its own memory
+//     map — and this is the check that stops it naming KERNEL memory, which is
+//     the whole reason the door exists.
+//
+// THE WINDOW IS THE WHOLE GRANTED REGION, NOT THE WRITABLE ONE, and the
+// asymmetry with `copy_out` is deliberate. A process may legitimately hand the
+// kernel a record out of its own RODATA — a constant schedule is exactly the
+// thing a driver would write — so demanding a writable source would refuse
+// correct programs. The hazard the two doors guard against is not the same one:
+// writing outside the writable window CORRUPTS the process, while reading
+// outside the granted region READS SOMEBODY ELSE, so each door checks the
+// window that answers its own question.
+//
+// M2 WAS ONE ADDRESS SPACE and M3 is about to stop being. When it does, the
+// mapping switch goes HERE and in `copy_out` and nowhere else — between them
+// they are the only two places the kernel dereferences a user address, which is
+// precisely the property that makes that a two-place change instead of a sweep.
+
+/// Copy `bytes` from process `p` at `src` into kernel memory at `dst`, or
+/// TERMINATE the process. Never returns on a bad buffer.
+///
+/// THE ONE DOOR INWARD. Its consumers, current and intended:
+///
+///   - `timer_arm` (design 232 unit 1), the (after, interval) pair;
+///   - M4's Channel `send`, which is §2.1's message body and the reason this is
+///     a general copy rather than a record reader.
+///
+/// Nothing else in the kernel may dereference a user address for reading. That
+/// is the whole rule, and it is one function long so it stays checkable by
+/// reading.
+///
+/// There is deliberately no `copy_in_check` split beside `copy_out_check`. That
+/// split exists for exactly one caller — `Waiter.Wait`, which validates a
+/// destination when it PARKS and writes it much later — and no inbound op can
+/// have that shape: a copy-in happens while the calling process is still the
+/// running one, by construction, because its arguments are what the op is
+/// about. A door that cannot be used late needs no early check.
+public func copy_in(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe {
+    if (src % word_bytes()) != 0 {
+        fault_process(p, FaultReason.BadAlign)
+    }
+    if src < PROCESSES[p].region_base {
+        fault_process(p, FaultReason.BadBuffer)
+    }
+    // Ordered so the subtraction below cannot underflow, exactly as the
+    // outbound door orders its own: `region_top - src` is computed only once
+    // `src` is known to be inside the region. A hostile length must produce a
+    // diagnostic, not a panic.
+    if src >= PROCESSES[p].region_top {
+        fault_process(p, FaultReason.BadBuffer)
+    }
+    if bytes > PROCESSES[p].region_top - src {
+        fault_process(p, FaultReason.BadBuffer)
+    }
+    copy_bytes(dst, src, bytes)
+}
+
+/// Reify a user-mode program as a Process with one Thread, mint its boot handle
+/// set, and run it. Never returns.
+///
+/// THE ONLY WAY INTO USER MODE. The loader reaches it with a root image's entry
+/// and region; the harness kernels that grant a hand-written payload its own
+/// bytes reach it with theirs. There is deliberately no second path — a kernel
+/// that could enter user mode without a Process would be a kernel with syscalls
+/// that no handle table answers, which is exactly the shape the M1 code had and
+/// exactly what this unit retired.
+///
+/// The three handles are minted in an order the boot ABI depends on: System
+/// first, so that it comes out as `ROOT_SYSTEM_HANDLE` and the register the
+/// program receives means what §12 says it means. The other two are not passed
+/// anywhere — the program asks for them — so their numbers are the kernel's
+/// business and stay that way.
+///
+/// `rw_base`/`rw_top` DEFAULT TO NONE, and that default is the right answer
+/// rather than a convenience: the harness kernels that grant a hand-written
+/// payload its own bytes grant them read+execute, so those processes have
+/// nowhere the kernel may write and should be told so if they ask. Only the
+/// loader, which grants a data segment and a stack, passes a window.
+public func start_process(entry: UInt, stack_top: UInt,
+                          region_base: UInt, region_top: UInt,
+                          rw_base: UInt = 0, rw_top: UInt = 0) unsafe -> Never {
+    let p: Int = 0
+    PROCESSES[p] = ProcessSlot(state: ProcessState.Running, self_handle: 0,
+                            entry: entry, region_base: region_base,
+                            region_top: region_top,
+                            rw_base: rw_base, rw_top: rw_top,
+                            exit_kind: ProcessStatusKind.Running, exit_code: 0)
+
+    let system = mint_handle(p, ObjType.System, root_system_rights(), 0)
+    let own = mint_handle(p, ObjType.Process, root_process_rights(), p)
+    PROCESSES[p].self_handle = own
+
+    let main = alloc_thread()
+    let main_handle = mint_handle(p, ObjType.Thread, thread_rights(), main)
+    THREADS[main] = ThreadSlot(state: ThreadState.Running, process: p,
+                               self_handle: main_handle, exit_code: 0,
+                               joiners: 0, link: 0, wait_buf: 0)
+    CURRENT_THREAD = main
+    SLICE_LEFT = SLICE_TICKS
+
+    if system != ROOT_SYSTEM_HANDLE {
+        fatal_image("the boot handle set did not start at the System handle",
+                    system)
+    }
+
+    // THE HANDOVER MARKER — the last thing the kernel says on its own
+    // initiative, and the line a transcript reads everything after as the
+    // PROCESS's. See `Console` for the protocol it announces.
+    console().write_str("SOS: console handover\n")
+
+    hal.frame_init(frame_slot(main), entry, stack_top, system)
+    // `resume_frame` is `-> Never`: it enters the process and the kernel is
+    // only ever re-entered through a trap. That is this function's divergence.
+    hal.resume_frame(frame_slot(main))
+}

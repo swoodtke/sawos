@@ -1,0 +1,341 @@
+//! WHAT THE MACHINE INTERRUPTS FOR (design 178 D2 + D6; spec §7, §9): the
+//! scheduler tick, the Timers that come due, a device line, and the idle poll.
+//!
+//! ONE COMPARATOR, TWO CUSTOMERS, and this is where they are composed: a fire
+//! says only that something MAY be due, so every customer is asked out of ONE
+//! reading of the clock and the tick is asked first.
+//!
+//! Everything here SERVICES state that lives below it — the timer slabs
+//! (`time`), the interrupt slab (`waitables`), the ready queue (`threads`) —
+//! and tells somebody through `wake`. The scheduler above it is what acts on
+//! the flag a tick raises.
+
+import hal
+import kcore.limits.{MAX_INTERRUPTS, MAX_TIMERS, NO_INTERRUPT, NO_THREAD}
+import kcore.diag.{console}
+import kcore.threads.{
+    CURRENT_THREAD,
+    NEED_RESCHED,
+    READY_HEAD,
+    SLICE_LEFT,
+    SLICE_TICKS,
+}
+import kcore.time.{NEXT_TICK_NS, TICK_PERIOD_NS, TIMERS, reprogram_timer}
+import kcore.waitables.{INTERRUPTS, WaitableKind, interrupt_by_line}
+import kcore.wake.{notify_ready}
+
+/// Fire every Timer whose deadline `now` has reached.
+func expire_timers(now: UInt64) unsafe {
+    var i: Int = 0
+    while i < MAX_TIMERS {
+        match TIMERS[i].state {
+            case Live -> {
+                if TIMERS[i].is_due(now) {
+                    fire_timer(i, now)
+                }
+            },
+            case Free -> {},
+        }
+        i = i + 1
+    }
+}
+
+/// One Timer came due: advance its schedule, and tell its Waiter.
+///
+/// TWO LINES, AND THE SPLIT IS THE POINT. `TimerSlot.fire` is the whole of the
+/// drift-free re-arm and the coalescing division — arithmetic on one slot's own
+/// fields, and a SAFE function for exactly that reason. What is left here is the
+/// half that reaches the rest of the kernel: the slab index, and the wake.
+func fire_timer(slot: Int, now: UInt64) unsafe {
+    TIMERS[slot].fire(now)
+    notify_ready(WaitableKind.Timer, slot)
+}
+
+// =============================================================================
+// Interrupts (design 178 D2 + D6; spec §9)
+// =============================================================================
+//
+// THE KERNEL IS NON-PREEMPTIBLE (design 178 D2). An interrupt is taken from
+// USER mode and from nowhere else: the kernel runs with them masked from boot,
+// each machine masks them again on trap entry in hardware, and each machine's
+// return to user mode is where they come back on. Nothing below has to arrange
+// any of that — it is a property of the two HALs, and each states in its ABI.md
+// that an interrupt arriving in kernel mode lands on its kernel-bug path rather
+// than on this code. So there are no critical sections here, no interrupt
+// masking vocabulary, and no `IntrSpinLock` (spec §9b) until SMP needs one.
+//
+// The cost is recorded rather than hidden: syscall latency bounds interrupt
+// latency, which is design 178's M3 tripwire and the reason the hooks below say
+// what they must not grow into.
+//
+// WHAT IS ARCH-FREE HERE: which hook a line belongs to, what the kernel does
+// with it, and the ORDER of claim / service / complete. What is not: how a line
+// is claimed, masked and completed, and how a timer is rearmed — all six are
+// seam calls, because a controller is a machine's, not a kernel's (D6).
+
+/// How many of the first ticks the kernel narrates on the console.
+///
+/// A kernel that logged every tick would BE its own workload — at a
+/// millisecond period the log is the machine — so the hook says enough to prove
+/// the path ran and then goes quiet. The count keeps rising either way.
+static TICK_REPORT_LIMIT: UInt = 4
+
+/// Ticks the periodic timer has delivered since boot.
+///
+/// Compound global state resting on a serialization argument the compiler
+/// cannot see, which is design 149's `unsafe static var`: uniprocessor kernel,
+/// interrupts taken from user mode only, so the tick path is the only writer
+/// and nothing can interleave with it.
+///
+/// BOTH COUNTERS BELOW WRAP ON PURPOSE (`&+`, not `+`). Overflow checks are
+/// always on, so a plain `+` would make a full counter PANIC — and a kernel
+/// that stops after seven weeks of uptime, or after four billion spurious
+/// interrupts, has turned a number nobody was reading into an outage. A
+/// wrapped count is what every tick counter does; deltas across a wrap are
+/// still right, which is what the scheduler will ask of this one.
+unsafe static var TIMER_TICKS: UInt = 0
+
+/// Interrupts the controller had nothing to give for. ONE is not an error — a
+/// line can stop asserting between raising the interrupt and being asked about
+/// it — but a stream of them is, so the first is reported and the rest are
+/// counted.
+unsafe static var SPURIOUS_IRQS: UInt = 0
+
+/// Ticks the periodic timer has delivered since boot. The scheduler's clock
+/// when there is a scheduler; today the harness's evidence that a tick was
+/// taken, and when.
+public func timer_ticks() unsafe -> UInt {
+    TIMER_TICKS
+}
+
+/// THE TIMER INTERRUPT — the arch-free landing point for the one comparator.
+///
+/// A fire says only that SOMETHING MAY BE DUE, so every customer is asked out
+/// of ONE reading of the clock, and the TICK IS ASKED FIRST — a timeslice charge
+/// that a Timer's servicing delayed would be a scheduler bug wearing a Timer's
+/// clothes. Programming the next deadline is last, and it is also what lowers
+/// the line (both machines' timer condition is a level).
+///
+/// ONE `now` FOR BOTH is what makes the two customers unorderable in any way
+/// that matters: the tick and every Timer are judged against the same instant,
+/// so a Timer cannot be late because the tick ran first, and the tick cannot
+/// slip because several Timers came due together.
+///
+/// `pc` is where the interrupted context resumes, or `IDLE_PC` when the fire was
+/// found by the idle poll.
+func on_timer_interrupt(pc: UInt) unsafe {
+    let now = hal.timer_now_ns()
+
+    if TICK_PERIOD_NS != 0 && now >= NEXT_TICK_NS {
+        // Measured from NOW rather than from the deadline missed, which is M2's
+        // rule kept verbatim: a tick the kernel was late for is ONE tick, never
+        // a burst of catch-up ticks whose only effect would be to keep the
+        // machine in the trap handler. A Timer's rule is the opposite (see
+        // `fire_timer`) and deliberately so — a timeslice has no history to be
+        // faithful to, and an interval does.
+        NEXT_TICK_NS = now + TICK_PERIOD_NS
+        on_timer_tick(pc)
+    }
+
+    expire_timers(now)
+    reprogram_timer()
+}
+
+/// THE TIMER TICK — the arch-free landing point for the periodic timer.
+///
+/// THE TIMESLICE IS CHARGED HERE and nothing else about scheduling is: the tick
+/// decrements the running thread's slice and, when it runs out, RAISES A FLAG.
+/// It does not switch, does not walk the ready queue and does not touch the
+/// frame. That division is design 178 D2 in one function — the tick runs with
+/// interrupts masked, so its length is interrupt latency, while the switch it
+/// motivates happens later at the user-return boundary where it costs nothing.
+///
+/// `pc` is where the interrupted context will resume, read out of the frame by
+/// the caller — or `IDLE_PC` when the tick was found by the idle poll, where
+/// there is no interrupted context to name.
+func on_timer_tick(pc: UInt) unsafe {
+    TIMER_TICKS = TIMER_TICKS &+ 1
+
+    if CURRENT_THREAD != NO_THREAD {
+        if SLICE_LEFT > 0 {
+            SLICE_LEFT = SLICE_LEFT - 1
+        }
+        if SLICE_LEFT == 0 {
+            NEED_RESCHED = true
+            SLICE_LEFT = SLICE_TICKS
+        }
+    }
+
+    if TIMER_TICKS > TICK_REPORT_LIMIT {
+        return
+    }
+    let uart = console()
+    uart.write_str("SOS: timer tick ")
+    uart.write_hex(TIMER_TICKS)
+    uart.write_str(" at ")
+    uart.write_hex(pc)
+    uart.write_str("\n")
+}
+
+/// What the tick report prints for a tick taken with nothing running. The
+/// kernel was idle, so there is no interrupted address, and zero is the honest
+/// answer rather than a stale one.
+static IDLE_PC: UInt = 0
+
+/// A DEVICE INTERRUPT — the arch-free landing point for an external line, and
+/// spec §9's delivery in five lines.
+///
+/// THE LINE IS ALREADY MASKED when this runs (`deliver_line` below), so what is
+/// left is to mark the object ready and tell its Waiter. Marking BEFORE waking
+/// is what makes the level-triggered path work in both orders: a driver already
+/// parked is woken with the record, and one that has not waited yet finds
+/// `pending` set by its own next `Wait`.
+///
+/// A LINE NOTHING IS BOUND TO is reported and left MASKED, which is the only
+/// safe answer: the kernel cannot service a device it has no driver for, and an
+/// unmasked line with nobody to ack it would re-fire forever. That is also the
+/// path the interrupt-controller bring-up case still exercises, which is what
+/// keeps `irq_raise_selftest_line` meaningful with no Interrupt object involved.
+func on_external_irq(line: UInt) unsafe {
+    let irq = interrupt_by_line(line)
+    if irq == NO_INTERRUPT {
+        let uart = console()
+        uart.write_str("SOS: external irq ")
+        uart.write_hex(line)
+        uart.write_str("\n")
+        return
+    }
+    INTERRUPTS[irq].pending = true
+    notify_ready(WaitableKind.Interrupt, irq)
+}
+
+/// SERVICE ONE CLAIMED LINE — the arch-free half of an interrupt, and the one
+/// place a line number turns into work.
+///
+/// Its two entry points, both of which have already CLAIMED the line from the
+/// controller:
+///
+///   - `service_irq`, from the trap path, with the interrupted PC;
+///   - `idle_poll`, from `pick_next`'s idle loop, with `IDLE_PC`.
+///
+/// The two branches differ in exactly one step, and it is spec §9's: the timer
+/// programs its NEXT DEADLINE, which is what lowers its line, while a device
+/// line is MASKED, because a device goes on asserting until its driver has been
+/// told.
+func deliver_line(line: UInt, pc: UInt) unsafe {
+    if line == hal.IRQ_NONE {
+        SPURIOUS_IRQS = SPURIOUS_IRQS &+ 1
+        if SPURIOUS_IRQS == 1 {
+            console().write_str("SOS: spurious interrupt\n")
+        }
+        return
+    }
+
+    if line == hal.IRQ_TIMER {
+        on_timer_interrupt(pc)
+    } else {
+        hal.irq_mask(line)
+        on_external_irq(line)
+    }
+    hal.irq_complete(line)
+}
+
+/// EVERY interrupt the kernel TAKES arrives here, through `ktrap` and through
+/// nothing else. (Interrupts the kernel POLLS FOR while idle arrive through
+/// `idle_poll`, which is the same service over a different way of noticing.)
+public func service_irq(frame_addr: UInt, cause: UInt) unsafe {
+    deliver_line(hal.irq_claim(cause), hal.trap_pc(frame_addr))
+}
+
+// -----------------------------------------------------------------------------
+// THE IDLE PATH (spec §7; design 178 D6)
+// -----------------------------------------------------------------------------
+//
+// "NOTHING RUNNABLE" USED TO BE A DEADLOCK, AND THE INTERRUPT OBJECT IS WHAT
+// CHANGED THAT. Before it, every wake in the system came FROM a thread — an
+// Event is signalled by somebody — so a system with no runnable thread had
+// nobody left to signal one and the report was exact. A bound IRQ line is the
+// first readiness that arrives from OUTSIDE the set of runnable threads, so the
+// same state now has two readings and the kernel has to tell them apart.
+//
+// THE RULE: it is idle if any Interrupt is BOUND, and a deadlock otherwise. It
+// is deliberately conservative — the kernel does not try to prove that a
+// specific blocked thread is reachable by a specific line, which would mean
+// walking attachment sets to answer a question that a wrong answer only makes
+// SLOWER to diagnose (a hang at the harness timeout instead of a report). What
+// it never does is call a real wait a deadlock.
+//
+// WHY THE IDLE LOOP POLLS INSTEAD OF TAKING THE INTERRUPT. Design 178's D2 says
+// interrupts are taken from USER mode only, and that is enforced by the
+// machines rather than intended by the kernel — so an interrupt that arrives
+// while the kernel idles is not delivered, it is PENDING. `wait_for_irq` parks
+// the core until one is pending (both machines wake from it on a pending
+// interrupt whether or not it is deliverable), and `irq_poll` then asks the
+// controller for it directly. So D2 is untouched: the kernel still never takes
+// a trap in kernel mode, and the same `deliver_line` services the line either
+// way.
+
+/// Ask the controller for a line, and service it if there is one.
+func idle_poll() unsafe {
+    let line = hal.irq_poll()
+    if line == hal.IRQ_NONE {
+        return
+    }
+    deliver_line(line, IDLE_PC)
+}
+
+/// Is there a source of readiness OUTSIDE the set of runnable threads?
+///
+/// TWO KINDS ANSWER YES, and the second generalizes the rule rather than
+/// widening it (design 232 unit 1). A BOUND IRQ LINE is readiness a device will
+/// deliver; an ARMED TIMER is readiness the CLOCK will deliver. Neither needs a
+/// thread to run for it to arrive, which is the whole of what this question
+/// asks — so "idle iff a line is bound" was always the special case of "idle iff
+/// something outside the thread set can still wake somebody".
+///
+/// Getting this wrong in the Timer's direction would be the worst kind of bug:
+/// a process that armed a timer and parked is SLEEPING, which is the headline
+/// thing this unit exists to make possible, and reporting it as a deadlock would
+/// terminate exactly the program that finally works. Getting it wrong the other
+/// way turns a real deadlock into a harness timeout, which is why an armed timer
+/// counts and a merely EXISTING one does not: a disarmed Timer will never fire,
+/// so it is not a wake source, and a system holding only those is as deadlocked
+/// as one holding none.
+public func has_external_wake_source() unsafe -> Bool {
+    var i: Int = 0
+    while i < MAX_INTERRUPTS {
+        match INTERRUPTS[i].state {
+            case Live -> { return true },
+            case Free -> {},
+        }
+        i = i + 1
+    }
+    var t: Int = 0
+    while t < MAX_TIMERS {
+        match TIMERS[t].state {
+            case Live -> {
+                if TIMERS[t].armed {
+                    return true
+                }
+            },
+            case Free -> {},
+        }
+        t = t + 1
+    }
+    false
+}
+
+/// Park the core until something is runnable again.
+///
+/// The exit condition is the READY QUEUE, not the poll: a serviced line wakes a
+/// waiter through `deliver_line` -> `on_external_irq` -> `notify_ready`, which
+/// pushes that thread onto the queue. A line that wakes nobody — one bound to
+/// an Interrupt no thread is waiting on — leaves the queue empty and the loop
+/// goes back to sleep, which is correct and is why the test is on the queue
+/// rather than on "an interrupt happened".
+public func idle_until_runnable() unsafe {
+    while READY_HEAD == 0 {
+        hal.wait_for_irq()
+        idle_poll()
+    }
+}

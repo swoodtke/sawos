@@ -1,0 +1,132 @@
+//! DELIVERY — readiness turning into a woken thread (spec §2.2).
+//!
+//! Three funnels, one act: `notify_ready` is the only place a ready waitable
+//! reaches its Waiter, `wake_one_waiter` hands the answer to at most one parked
+//! thread, and `deliver_attachment` is where the answer is READ AND THE
+//! READINESS SPENT in one step, so no kind is drained on one path and not the
+//! other.
+//!
+//! It is above `process` because a record goes through the copy door, and above
+//! `waitables` because the answer comes out of those tables. Its callers are the
+//! two producers — a signal (`dispatch`) and a line or a deadline (`irq`).
+
+import sosabi.{WaitTag, WAIT_RECORD_WORDS, wait_record_bytes}
+import kcore.result.{op_ok, write_result}
+import kcore.threads.{THREADS, ThreadState, frame_slot, ready_push}
+import kcore.waitables.{
+    ATTACHMENTS,
+    EVENTS,
+    WAITERS,
+    WaitableKind,
+    accumulate,
+    waitable_answer,
+    waitable_attachment,
+    waitable_consume,
+}
+import kcore.process.{copy_out}
+
+/// The record `Waiter.Wait` answers with, in kernel memory (spec §2.2, as
+/// amended by design 178 unit 3 rider 3).
+///
+/// Declaration order IS the layout (design 58), so the field names here and the
+/// word indices `sosabi` publishes are one description — pinned by the assert
+/// below rather than by agreement.
+struct WaitRecord {
+    key: UInt,
+    tag: UInt,
+    payload: UInt,
+}
+
+static_assert(sizeof<WaitRecord>() == WAIT_RECORD_WORDS * sizeof<UInt>(),
+              "the wait record must be exactly the words sosabi publishes")
+
+/// Build one and hand it to a process. The only producer of the wire form.
+func deliver_wait_record(p: Int, dst: UInt, key: UInt, tag: WaitTag,
+                         payload: UInt) unsafe {
+    var rec = WaitRecord(key: key, tag: tag as UInt, payload: payload)
+    copy_out(p, dst, ((&var rec) as UnsafePointer<WaitRecord>) as UInt,
+             wait_record_bytes() as UInt)
+}
+
+/// ANSWER ONE ATTACHMENT INTO A PROCESS'S MEMORY, and spend what the answer
+/// spent (obligation 1). Its entry points, both of them:
+///
+///   - `waiter_wait`, when something was ALREADY ready and nothing parks;
+///   - `wake_one_waiter`, handing a ready attachment to a thread that did.
+///
+/// A funnel rather than two call sites, because "read the answer" and "record
+/// that it was delivered" have to be one step: split apart, a kind whose
+/// readiness is CONSUMED by delivery — the Timer and, since Aug 17, the Event —
+/// would be drained on one path and not the other, and the bug would be a
+/// periodic timer that reports the same fire twice to whichever caller forgot.
+/// Both paths are equally "a record reached a thread", which is exactly the
+/// event `waitable_consume` is about.
+///
+/// THE READ AND THE CLEAR ARE ONE ACT, and this function's body is where that is
+/// true: `waitable_answer` takes the value, `waitable_consume` clears it, and
+/// nothing between them can run. The kernel takes no trap in kernel mode (design
+/// 178 D2 — interrupts are taken from user mode only), so a signal cannot land
+/// inside this window; one landing after it finds the object empty and re-arms
+/// readiness with its own bits alone, which is neither a loss nor a double
+/// count.
+public func deliver_attachment(p: Int, dst: UInt, a: Int) unsafe {
+    let kind = ATTACHMENTS[a].kind
+    let target = ATTACHMENTS[a].target
+    let answer = waitable_answer(kind, target)
+    deliver_wait_record(p, dst, ATTACHMENTS[a].key, answer.tag, answer.payload)
+    waitable_consume(kind, target)
+}
+
+/// Hand attachment `a` to ONE thread parked on `w`, if any is (§2.2).
+///
+/// The record goes into the woken thread's own buffer and its STATUS into the
+/// woken thread's frame, both HERE and nowhere else — the same discipline
+/// `exit_thread` follows for a joiner: a thread that blocked in a syscall was
+/// answered by nobody when it blocked, so its waker is its single writer.
+///
+/// THE WRITER IS A DIFFERENT THREAD from the one being answered, which is sound
+/// today because M2 has one address space; `copy_out`'s docstring is where that
+/// stops being free. Since the Interrupt object landed the writer need not be a
+/// THREAD at all — the trap path and the idle poll both reach here — which
+/// changes nothing about the write and everything about why the check that
+/// validated the buffer had to happen back at the `Wait` call.
+public func wake_one_waiter(w: Int, a: Int) unsafe {
+    let head = WAITERS[w].blocked
+    if head == 0 {
+        return
+    }
+    let slot = head - 1
+    WAITERS[w].blocked = THREADS[slot].link
+    THREADS[slot].link = 0
+
+    deliver_attachment(THREADS[slot].process, THREADS[slot].wait_buf, a)
+    THREADS[slot].wait_buf = 0
+    write_result(frame_slot(slot), op_ok())
+    THREADS[slot].state = ThreadState.Runnable
+    ready_push(slot)
+}
+
+/// A waitable just became ready: tell its Waiter, if it has one.
+///
+/// THE ONE PLACE READINESS TURNS INTO A WAKE, reached from both producers — an
+/// Event's `Signal` and an Interrupt's line firing. Neither knows anything
+/// about waiters beyond the attachment field the matrix reads.
+public func notify_ready(kind: WaitableKind, slot: Int) unsafe {
+    let a = waitable_attachment(kind, slot)
+    if a == 0 {
+        return
+    }
+    wake_one_waiter(ATTACHMENTS[a - 1].waiter, a - 1)
+}
+
+/// §2.4's signal: accumulate, NEVER block, and tell the Waiter if there is one.
+public func signal_event(slot: Int, bits: UInt) unsafe {
+    accumulate(slot, bits)
+    // A signal of nothing is not a readiness. Both modes can produce it —
+    // `signal(0)` in either — and reporting it would wake a waiter for a word
+    // it would then read as empty.
+    if EVENTS[slot].word == 0 {
+        return
+    }
+    notify_ready(WaitableKind.Event, slot)
+}
