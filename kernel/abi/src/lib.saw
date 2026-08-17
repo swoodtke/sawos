@@ -334,6 +334,16 @@ static_assert((ThreadRight.Control as UInt32) >= 256,
 /// dispatcher that parks on a set of events need not be the code that reads any
 /// of them.
 ///
+/// `Wait` IS A CONSUMING RIGHT TOO, since the Aug-17 ruling: a wait's record
+/// carries the accumulated word and the delivery clears it, so a handle holding
+/// only this bit takes values as well as observes them. That was always half
+/// true — the record has carried the word since M2 — and what changed is that it
+/// now empties the object as well. The two bits therefore attenuate by DOOR
+/// (park or poll) rather than by whether the holder learns anything, and a
+/// launcher that wants a pure readiness observer has no bit for it. Nothing in
+/// SOS needs one yet: with no handle transfer before M4, every right on an Event
+/// is held by the process that made it.
+///
 /// `Manage` is withheld at creation for the reason `thread_rights` gives: an
 /// Event derives nothing, so the universal derive bit would name an authority
 /// that does not exist.
@@ -666,6 +676,11 @@ public enum ThreadOp: UInt {
 /// Event — "is it ready" is `word != 0`, and it is asked by the Waiter, not by
 /// an op.
 ///
+/// `Receive` IS THE NON-BLOCKING DOOR, not the only one: a `Waiter.wait`
+/// delivery takes the same word the same way (ruled Aug 17, user). What the two
+/// differ in is parking, which is why this stayed one op rather than growing a
+/// blocking twin.
+///
 /// There is deliberately no non-draining PEEK. A drain that could be skipped
 /// would make level-triggered readiness a thing a reader could observe without
 /// clearing, so a poll loop could spin forever on a readiness nothing consumes;
@@ -885,18 +900,21 @@ public func wait_record_bytes() -> Int {
 /// The Event's payload is its ACCUMULATED WORD, and carrying it here is what
 /// makes the common wait one syscall instead of two: a dispatcher that only
 /// needs to know how many times something happened never has to follow up with
-/// a `receive`. The word is a COPY — §2.4's drain is still `receive`, and the
-/// event stays ready until one happens, which is level-triggering unchanged.
+/// a `receive`.
 ///
-/// IT IS A SNAPSHOT TAKEN WHEN THE WAIT WAS ANSWERED, not when the waiter next
-/// runs, and the difference is observable: a producer that signals again
-/// between the wake and the woken thread's first instruction makes the later
-/// `receive` LARGER than the word in the record. Neither number is wrong — the
-/// record says what the wait was woken for and `receive` says what has
-/// accumulated since the last drain — and a reader who needs the authoritative
-/// count reads the second. The alternative, filling the record at resume, would
-/// put a write to user memory somewhere other than the wake and buy nothing:
-/// the count could go stale again before the thread read it.
+/// **THE DELIVERY CONSUMES THE WORD** (ruled Aug 17, user). This record is not a
+/// copy left beside the object — the kernel reads the word and clears it in one
+/// masked-interrupts step, so the bits in the record are bits nothing else will
+/// ever be told about. A `receive` right after a wake therefore answers ZERO
+/// unless somebody signalled in between, and a signal that lands after the take
+/// re-arms readiness with its own bits alone.
+///
+/// TWO DOORS ONTO ONE VALUE, and that is the whole model: §2.4's `receive` is
+/// the non-blocking poll and this record is the blocking one. A process picks
+/// the door by whether it wants to park, never by what it will be told. The
+/// alternative — a snapshot the wait leaves behind — would report the same bits
+/// to the next wait as well, and a recipient cannot tell that duplicate from a
+/// real second signal.
 /// THE INTERRUPT'S PAYLOAD IS ITS LINE, and that is the whole answer a driver
 /// needs: it woke because a device asserted, and the line says which. There is
 /// no count and no timestamp, because §9 ratifies AT MOST ONE UNACKED FIRE per
@@ -921,11 +939,12 @@ public func wait_record_bytes() -> Int {
 /// exactly: zero is what "not ready" means, so a count that rolled through it
 /// would make a busy timer go quiet.
 ///
-/// THE WAIT CONSUMES IT. Unlike an Event's word — a SNAPSHOT that `receive`
-/// remains authoritative over — this count is drained by the wait that reports
-/// it, because a Timer has no second op to drain with and needs none: the fire
-/// was delivered to somebody, so it is spent. That is the ack-free half of the
-/// timerfd model.
+/// THE WAIT CONSUMES IT, exactly as it consumes an Event's word: the count is
+/// drained by the wait that reports it, because a Timer has no second op to
+/// drain with and needs none — the fire was delivered to somebody, so it is
+/// spent. That is the ack-free half of the timerfd model. The Interrupt is the
+/// kind that differs, and §9 says why: its readiness ends at the driver's `ack`,
+/// because the line stays masked until the DEVICE has been serviced.
 public enum WaitPayload {
     case Event(word: UInt),
     case Interrupt(line: UInt),

@@ -1,0 +1,179 @@
+// SOS M3: A WAIT DELIVERY TAKES THE EVENT'S WORD (ruled Aug 17, user; spec
+// §2.2, §2.4).
+//
+// Nothing here parks — every wait finds something already ready — which is the
+// same trick `event-basics` uses and for the same reason: a regression that
+// parked would park the only thread in the system, and the kernel reports that
+// as the deadlock it is, in microseconds rather than at the harness timeout.
+// The parking half of the ruling is `event-consume-wake` beside this case.
+//
+// Three lines, three separate sentences:
+//
+//   or key=11 at-wait=3 after=0       <- TWO SIGNALS, ONE RECORD. 1 then 2 land
+//                                        with nobody waiting, and the wait that
+//                                        follows carries the MERGED word. Had
+//                                        the delivery been per signal, this
+//                                        would read 1.
+//   newbits key=11 at-wait=8 after=0  <- a signal AFTER the take is answered
+//                                        with ONLY the new bits: 8, not 11. The
+//                                        object was emptied, so the old bits
+//                                        cannot come back.
+//   sum key=22 at-wait=3 after=0      <- the same, in the counting mode: three
+//                                        signals of one make a record of three,
+//                                        and the count restarts from zero.
+//
+// `after` IS THE `receive` IMMEDIATELY FOLLOWING EACH WAIT, and it reads zero
+// every time. That is the whole ruling in one column: `receive` is the
+// NON-BLOCKING POLL and the wait record is the blocking one, and a value goes
+// through exactly one of them.
+//
+// The zeroes are not a broken `receive` — `event-basics`'s `detached` line has
+// the same call answering a real number when no wait took it first.
+
+import sos.{System, Process, Event, EventMode, Waiter, WaitResult, WaitPayload}
+
+/// The keys this process attaches under: its own words, handed back unread
+/// (§2.2), and here just distinguishable.
+static KEY_FLAGS: UInt = 11
+static KEY_COUNT: UInt = 22
+
+static BIT_ONE: UInt = 1
+static BIT_TWO: UInt = 2
+static BIT_EIGHT: UInt = 8
+
+/// How many times the counting event is signalled before the wait takes it.
+static COUNT_TIMES: Int = 3
+
+/// What a failed read reports, distinct from every value this case expects.
+static NO_VALUE: UInt = 0xDEAD
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// What is LEFT in the event after a wait took its word. Zero everywhere in
+/// this file, which is the claim.
+func left(e: &Event) -> UInt {
+    match e.receive() {
+        case Ok(word) -> word,
+        case Err(_) -> NO_VALUE,
+    }
+}
+
+/// The word the delivery TOOK, out of the record the kernel copied into this
+/// process's memory. A `match` rather than a field access because the payload is
+/// per-kind by construction (§2.2): this program attaches nothing but Events, so
+/// any other answer is a kernel reporting an attachment it was never given.
+func taken(r: &WaitResult) -> UInt {
+    match r.what {
+        case Event(word) -> word,
+        case Interrupt(_) -> panic("this program attached no interrupt"),
+        case Timer(_) -> panic("this program attached no timer"),
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS consume: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let waiter = match proc.waiter_create() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS consume: no waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let flags = match proc.event_create(mode: EventMode.Or) {
+        case Ok(ev) -> ev,
+        case Err(e) -> {
+            print("SOS consume: no flags event: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let counter = match proc.event_create(mode: EventMode.SaturatingSum) {
+        case Ok(ev) -> ev,
+        case Err(e) -> {
+            print("SOS consume: no counting event: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // BOTH ATTACHED UP FRONT, and the wait set never changes after this. Each
+    // wait below therefore has to pick the ready one out of two, which is what
+    // makes the key in every line evidence rather than decoration.
+    let _ = waiter.add(&flags, KEY_FLAGS)
+    let _ = waiter.add(&counter, KEY_COUNT)
+
+    // ---- TWO SIGNALS COALESCE INTO ONE RECORD ------------------------------
+    // Both land with nobody parked, so nothing is delivered as they arrive; the
+    // wait that follows is the first take, and it takes the OR of the two.
+    let _ = flags.signal(BIT_ONE)
+    let _ = flags.signal(BIT_TWO)
+    let merged = match waiter.wait() {
+        case Ok(r) -> r,
+        case Err(e) -> {
+            print("SOS consume: or wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let after_merged = left(&flags)
+    print("SOS consume: or key={} at-wait={} after={}\n",
+          merged.key, taken(&merged), after_merged)
+
+    // ---- A SIGNAL AFTER THE TAKE CARRIES ONLY THE NEW BITS -----------------
+    // The event was emptied by the wait above, so this one re-arms readiness
+    // from zero: 8, not 1|2|8. A delivery that had left the old word behind
+    // would report 11 here, and the difference between those two numbers is the
+    // whole of what "the record is the value, not a copy of it" means.
+    let _ = flags.signal(BIT_EIGHT)
+    let fresh = match waiter.wait() {
+        case Ok(r) -> r,
+        case Err(e) -> {
+            print("SOS consume: newbits wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let after_fresh = left(&flags)
+    print("SOS consume: newbits key={} at-wait={} after={}\n",
+          fresh.key, taken(&fresh), after_fresh)
+
+    // ---- THE SAME, IN THE COUNTING MODE ------------------------------------
+    // §2.4's two accumulation modes are one field to the wait machinery, so a
+    // take that worked only for flag sets would be a per-mode bug — which this
+    // line is here to rule out. Three signals of one, one record of three.
+    var n = 0
+    while n < COUNT_TIMES {
+        let _ = counter.signal(BIT_ONE)
+        n = n + 1
+    }
+    let counted = match waiter.wait() {
+        case Ok(r) -> r,
+        case Err(e) -> {
+            print("SOS consume: sum wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let after_counted = left(&counter)
+    print("SOS consume: sum key={} at-wait={} after={}\n",
+          counted.key, taken(&counted), after_counted)
+
+    let _ = system.debug_print("SOS consume: done\n")
+
+    // Process exit, so the teardown line reports what this process owned: six
+    // handles — the three it was given (System, Process, its own Thread) and the
+    // three it made — one thread, two events and one waiter.
+    let _ = proc.exit(EXIT_OK)
+}

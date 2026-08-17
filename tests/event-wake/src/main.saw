@@ -6,16 +6,17 @@
 //   SOS wake: worker started, parking     <- the initial thread, before wait()
 //   SOS wake: worker signalling           <- the OTHER thread, which could only
 //                                            have run because the first parked
-//   SOS wake: woke key=77 at-wait=1 drained=5
+//   SOS wake: woke key=77 at-wait=1 after=4
 //   SOS wake: joined worker=99
 //
-// THE TWO NUMBERS DIFFER ON PURPOSE, and the gap is the third thing this case
-// proves. The worker signals five times; the FIRST signal is what wakes the
-// parked thread, so the record it copied out says 1 — the record is a SNAPSHOT
-// taken when the wait was answered. The other four land while the woken thread
-// is still only runnable, so the `receive` that follows drains 5. Neither is
-// wrong: the record says what the wait was woken for, `receive` says what has
-// accumulated. A reader who needs the authoritative count reads the second.
+// THE TWO NUMBERS ARE ONE ARITHMETIC CLAIM, and it is the third thing this case
+// proves. The worker signals five times. The FIRST signal is what wakes the
+// parked thread, so the record it copied out says 1 — and the delivery TAKES
+// that 1, which is the Aug-17 ruling. The other four land while the woken thread
+// is still only runnable and accumulate from zero, so the `receive` that follows
+// reads 4. One plus four is five: nothing was lost and nothing was counted
+// twice, which is exactly what the old snapshot semantics could not say — it
+// answered 1 and 5, with the 1 reported to nobody's cost.
 //
 // A `wait` that answered without parking would put the middle line last, since
 // nothing else can move the processor: this image's kernel arms NO timer, and
@@ -136,8 +137,9 @@ func worker() {
     var n = 0
     while n < SIGNAL_TIMES {
         // §2.4: signalling NEVER blocks, whether or not anyone is parked. The
-        // first of these is the one that wakes the sleeper; the rest simply
-        // accumulate, which is what makes the drained word five and not one.
+        // first of these is the one that wakes the sleeper — and the wake TAKES
+        // it — so the rest accumulate from zero, which is what makes the word
+        // left behind four and not five.
         let _ = event.signal(ONE)
         n = n + 1
     }
@@ -203,12 +205,12 @@ func initial(boot_handle: UInt) {
             return
         },
     }
-    let word: UInt = match event.receive() {
+    let left: UInt = match event.receive() {
         case Ok(v) -> v,
         case Err(_) -> NO_VALUE,
     }
-    print("SOS wake: woke key={} at-wait={} drained={}\n",
-          report.key, at_wait(&report), word)
+    print("SOS wake: woke key={} at-wait={} after={}\n",
+          report.key, at_wait(&report), left)
 
     // The worker exited on its way out of `signal`, so this join answers out of
     // its slot rather than parking again.

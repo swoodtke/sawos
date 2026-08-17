@@ -6,23 +6,28 @@
 // REPORTS, with the scheduler held out of it. The transcript is six lines and
 // each is a separate ratified sentence:
 //
-//   signal-then-wait key=11 at-wait=4 drained=4  <- §2.2 level-triggered: the
+//   signal-then-wait key=11 at-wait=4 after=0    <- §2.2 level-triggered: the
 //                                                   signal came FIRST and was
 //                                                   still there
-//   second key=22 at-wait=8 drained=8            <- §2.2 the key identifies
+//   second key=22 at-wait=8 after=0              <- §2.2 the key identifies
 //                                                   WHICH of two attachments
-//   or key=11 at-wait=3 drained=3                <- §2.4 bitwise-OR: 1|2|1
+//   or key=11 at-wait=3 after=0                  <- §2.4 bitwise-OR: 1|2|1
 //   detached word=8                              <- §2.2 remove: still an
 //                                                   Event, no longer watched
-//   counting key=33 at-wait=5 drained=5 saturated=1
+//   counting key=33 at-wait=5 after=0 saturated=1
 //                                                <- §2.4 saturating-sum, and
 //                                                   that it SATURATES
 //   done
 //
 // `at-wait` is read out of the RECORD the kernel copied into this process's
-// memory and `drained` out of a following `receive`; they agree everywhere,
-// which is what says the record's payload is the real accumulated word rather
-// than a flag.
+// memory, and it is the real accumulated word rather than a flag — 4, then 8,
+// then 1|2|1 = 3, then a count of five, each the number that was signalled.
+//
+// `after` IS THE `receive` THAT FOLLOWS, AND IT READS ZERO EVERY TIME. That is
+// the Aug-17 ruling: a wait DELIVERY takes the word, exactly as `receive` does,
+// so the record is not a copy left beside a still-full event. The two doors are
+// checked against each other on the `detached` line below, where nothing waits
+// and the drain is the only taker.
 //
 // EVERY WAIT RETURNS IMMEDIATELY. A wait that found nothing would park the only
 // thread in the system, which the kernel reports as the deadlock it is — so a
@@ -68,6 +73,9 @@ func flag(b: Bool) -> UInt {
 /// Drain an event, or report the sentinel. A failure cannot happen here — this
 /// process created the event and holds every right on it — so the arm exists to
 /// make that visible in the transcript rather than to be taken.
+///
+/// After a wait it answers ZERO, because the wait already took the word; the
+/// `detached` line is where it is the only taker and answers what was signalled.
 func drained(e: &Event) -> UInt {
     match e.receive() {
         case Ok(word) -> word,
@@ -81,8 +89,8 @@ func drained(e: &Event) -> UInt {
 /// program attaches nothing but Events, so any other answer is a kernel that
 /// reported an attachment this process never made.
 ///
-/// It is a SNAPSHOT taken when the wait returned, so it still reads what fired
-/// after the event has been drained — which is what the transcript compares.
+/// It is the word the delivery TOOK — the record is the value, not a copy of it
+/// — which is why every `after` in the transcript beside it reads zero.
 func at_wait(r: &WaitResult) -> UInt {
     match r.what {
         case Event(word) -> word,
@@ -147,13 +155,13 @@ func _start(boot_handle: UInt) {
             return
         },
     }
-    // The two numbers are the same fact observed twice: what the WAIT reported
-    // out of the copied-out record, and what the DRAIN took out of the event.
-    // They agree because the record carries the accumulated word, which is what
-    // makes the common case one syscall instead of two.
-    let first_word = drained(&a)
-    print("SOS events: signal-then-wait key={} at-wait={} drained={}\n",
-          first.key, at_wait(&first), first_word)
+    // The two numbers are one fact stated from both ends: the WAIT reported the
+    // accumulated word out of the copied-out record, and the `receive` after it
+    // finds nothing left because that report was the take. One syscall, not two,
+    // and no value delivered twice.
+    let first_after = drained(&a)
+    print("SOS events: signal-then-wait key={} at-wait={} after={}\n",
+          first.key, at_wait(&first), first_after)
 
     // ---- §2.2 WHICH one became ready ---------------------------------------
     // Two handles on one Waiter and the other one signalled: the answer has to
@@ -167,9 +175,9 @@ func _start(boot_handle: UInt) {
             return
         },
     }
-    let second_word = drained(&b)
-    print("SOS events: second key={} at-wait={} drained={}\n",
-          second.key, at_wait(&second), second_word)
+    let second_after = drained(&b)
+    print("SOS events: second key={} at-wait={} after={}\n",
+          second.key, at_wait(&second), second_after)
 
     // ---- §2.4 BITWISE-OR accumulation --------------------------------------
     // Three signals, one repeated: a flag set answers 3, not 4.
@@ -184,13 +192,16 @@ func _start(boot_handle: UInt) {
             return
         },
     }
-    let or_word = drained(&a)
-    print("SOS events: or key={} at-wait={} drained={}\n",
-          third.key, at_wait(&third), or_word)
+    let or_after = drained(&a)
+    print("SOS events: or key={} at-wait={} after={}\n",
+          third.key, at_wait(&third), or_after)
 
     // ---- §2.2 REMOVE: the attachment goes, the object stays ----------------
     // A detached Event still accumulates and still drains; it is simply not
-    // watched. Nothing waits after this, because nothing would find it.
+    // watched. Nothing waits after this, because nothing would find it — which
+    // makes this the one line where `receive` is the ONLY taker, and the number
+    // it reports is what says the zeroes above are a take rather than a broken
+    // drain.
     //
     // IT NAMES THE ATTACHMENT BY KEY, never by the waitable — detaching edits
     // the Waiter's own table, so `b` is not mentioned here at all.
@@ -223,16 +234,18 @@ func _start(boot_handle: UInt) {
             return
         },
     }
-    let counted = drained(&c)
+    let counted_after = drained(&c)
 
     // And that it SATURATES rather than wrapping: two signals of the largest
     // word there is would wrap a plain sum straight back through zero, which is
-    // the value that means "not ready".
+    // the value that means "not ready". The count starts from zero here because
+    // the wait above took the five, which is the consume showing up as
+    // arithmetic rather than as an assertion.
     let _ = c.signal(UInt.max)
     let _ = c.signal(UInt.max)
     let saturated = drained(&c)
-    print("SOS events: counting key={} at-wait={} drained={} saturated={}\n",
-          fourth.key, at_wait(&fourth), counted, flag(saturated == UInt.max))
+    print("SOS events: counting key={} at-wait={} after={} saturated={}\n",
+          fourth.key, at_wait(&fourth), counted_after, flag(saturated == UInt.max))
 
     let _ = system.debug_print("SOS events: done\n")
 

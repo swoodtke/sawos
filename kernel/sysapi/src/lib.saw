@@ -739,6 +739,11 @@ public extension Thread {
 /// out and resets the word. A non-zero word is what "ready" means to a Waiter,
 /// which is the only other thing that ever looks at it.
 ///
+/// TAKING THE WORD HAS TWO DOORS AND BOTH EMPTY IT: `receive` polls without
+/// parking, and a `Waiter.wait` on this event hands the same word back in its
+/// record and clears it. So a value is delivered exactly once — pick the door by
+/// whether you want to block, not by what you will be told.
+///
 /// Built by `Process.event_create` and by nothing else — no word constructor,
 /// no word extractor, the module docstring's rule.
 public struct Event {
@@ -759,6 +764,11 @@ public extension Event {
     /// Drain the accumulated word and reset it to zero, in one operation.
     /// Answers zero for an event nothing has signalled — it does not park, which
     /// is the Waiter's job. Requires `EventRight.Receive`.
+    ///
+    /// THE NON-BLOCKING DOOR, and its semantics are exactly what they have
+    /// always been. The other door is a `Waiter.wait` on this event, whose
+    /// record carries the same word and empties it the same way — so calling
+    /// this right after a wake answers zero unless a signal landed in between.
     public func receive(&self) -> Result<UInt, SosStatus> {
         call_value(self.handle, EventOp.Receive as UInt, 0, 0, 0)
     }
@@ -1078,6 +1088,18 @@ public extension Waiter {
     /// level-triggering buys: the readiness a signal left behind is still
     /// there, so "signal then wait" and "wait then signal" have the same
     /// outcome and only the second one parks.
+    ///
+    /// THE ANSWER CONSUMES WHAT IT REPORTS, for an Event and a Timer alike: the
+    /// record carries the accumulated word (or the fire count) and the object is
+    /// emptied in the same step, so nothing is reported twice. An Interrupt is
+    /// the exception and §9 is why — its readiness ends at `ack`, because the
+    /// line stays masked until the device has been serviced.
+    ///
+    /// SEVERAL THREADS ON ONE WAITER IS A DISTRIBUTION: a ready handle wakes one
+    /// of them and that thread's record carries the value, so a worker pool
+    /// shares a stream of notifications with no coordination. Ownership is the
+    /// other axis and it is structural — a waitable attaches to at most one
+    /// Waiter, so nobody else can be watching the object you are waiting on.
     ///
     /// THE BUFFER IS THIS FRAME'S, and a caller never sees it. The kernel
     /// answers a wait by copying a record into the caller's own memory (it has

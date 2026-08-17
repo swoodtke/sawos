@@ -1,0 +1,301 @@
+// SOS M3: A WAKE TAKES THE EVENT'S WORD (ruled Aug 17, user; spec §2.2, §2.4).
+//
+// `event-consume` proves the take through the door that never parks. This is
+// the other door, and the difference matters because the delivery happens on a
+// different path: there, the waiting thread reads the record itself; here, the
+// SIGNALLING thread writes it into a parked thread's frame. The Aug-17 ruling
+// says both take, and one funnel (`deliver_attachment`) is what makes that true
+// rather than hoped for — so a case per path is what an assertion of "one
+// funnel" costs.
+//
+// TWO THREADS AND TWO PARKS, arranged as a ping-pong so the ordering is forced
+// rather than raced. This image's kernel arms NO scheduler tick, and a wake only
+// makes a thread RUNNABLE — it does not switch — so a thread runs until it
+// blocks or exits, and the transcript below is the only order the program can
+// produce:
+//
+//   initial parking            <- before the first wait
+//   worker signalling          <- could only run because the initial parked
+//   woke first at-wait=5 after=0
+//   worker second signal       <- could only run because the initial parked AGAIN
+//   woke second at-wait=2
+//   joined worker=99
+//
+// WHAT EACH NUMBER RULES OUT.
+//
+//   `at-wait=5` — the record carries the accumulated word, written into a parked
+//   thread's own stack by the OTHER thread's signal.
+//
+//   `after=0` — the `receive` that follows the wake finds NOTHING. Under the
+//   snapshot semantics this read 5, because the record was a copy and the object
+//   was still full.
+//
+//   `at-wait=2` — the second wake carries ONLY the bits signalled after the
+//   first take. A delivery that had left the word behind would report 5|2 = 7,
+//   and the difference between 2 and 7 is the whole claim.
+//
+// EVERY THREAD ENTERS AT `_start` and works out which it is from the parked boot
+// handle, for the reason `thread-basics` gives (DF-178c: Saw cannot name a
+// function's address, so `thread_create` has no entry to be handed). The shared
+// objects travel the same way `event-wake`'s do — as VALUES in this process's
+// own memory, never as handle words, since the `sos` module offers no way to
+// take one out of a typed handle.
+
+import sos.{System, Process, Thread, Event, EventMode, Waiter, WaitResult,
+            WaitPayload}
+
+/// The boot handle, parked for the worker — and the witness that says which
+/// thread `_start` is running as (handle 0 names nothing, so a parked one is
+/// never 0).
+unsafe static var BOOT_HANDLE: UInt = 0
+
+/// Worker -> initial. Zero-initialized, which for a handle-carrying struct means
+/// "names nothing" — the same reservation that makes handle 0 unforgeable makes
+/// these slots safe to read before they are written.
+unsafe static var UP_EVENT: Event
+unsafe static var UP_WAITER: Waiter
+
+/// Initial -> worker. A SECOND Waiter rather than a second attachment on the
+/// first: each thread parks on its own, so a wake never has to pick between two
+/// sleepers and the ping-pong stays an ordering rather than a race.
+unsafe static var DOWN_EVENT: Event
+unsafe static var DOWN_WAITER: Waiter
+
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_W: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+/// The keys each side attaches under, and expects back.
+static KEY_UP: UInt = 41
+static KEY_DOWN: UInt = 42
+
+/// The first word the worker sends, and the second. Both are flag sets under
+/// `EventMode.Or`, and neither is a prefix of the other's bits — 5 is 0b101 and
+/// 2 is 0b010 — so a record carrying the merge of the two (7) is impossible to
+/// mistake for either.
+static FIRST_BITS: UInt = 5
+static SECOND_BITS: UInt = 2
+
+/// The worker's wake-up word. Its value is never asserted; what matters is that
+/// the worker's wait answered at all.
+static DOWN_BITS: UInt = 1
+
+static WORKER_ROLE: UInt = 1
+static WORKER_EXIT: UInt = 99
+
+/// What a failed read reports, distinct from every value this case expects.
+static NO_VALUE: UInt = 0xDEAD
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The word the delivery TOOK, out of the record the kernel copied into this
+/// process's memory while the thread was parked.
+func taken(r: &WaitResult) -> UInt {
+    match r.what {
+        case Event(word) -> word,
+        case Interrupt(_) -> panic("this program attached no interrupt"),
+        case Timer(_) -> panic("this program attached no timer"),
+    }
+}
+
+/// What is LEFT in the event after the wake took its word.
+func left(e: &Event) -> UInt {
+    match e.receive() {
+        case Ok(word) -> word,
+        case Err(_) -> NO_VALUE,
+    }
+}
+
+func stack_top(base: UInt) -> UInt {
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func worker_stack_top() unsafe -> UInt {
+    stack_top(((&var STACK_W) as UnsafePointer<UInt64>) as UInt)
+}
+
+func park_boot_handle(word: UInt) unsafe {
+    BOOT_HANDLE = word
+}
+
+func parked_boot_handle() unsafe -> UInt {
+    BOOT_HANDLE
+}
+
+func park_shared(up: Event, up_waiter: Waiter,
+                 down: Event, down_waiter: Waiter) unsafe {
+    UP_EVENT = up
+    UP_WAITER = up_waiter
+    DOWN_EVENT = down
+    DOWN_WAITER = down_waiter
+}
+
+func shared_up() unsafe -> Event {
+    UP_EVENT
+}
+
+func shared_down_waiter() unsafe -> Waiter {
+    DOWN_WAITER
+}
+
+/// The worker: signal, park, signal again, leave.
+///
+/// It derives its own authority off the parked boot handle rather than being
+/// handed any — `System(boot_handle:)` -> `process_self()` -> `thread_self()` —
+/// and reaches the shared objects out of the process's own memory.
+func worker() {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> { return },
+    }
+    let me = match proc.thread_self() {
+        case Ok(t) -> t,
+        case Err(_) -> { return },
+    }
+
+    let _ = system.debug_print("SOS consumewake: worker signalling\n")
+
+    // The wake this raises does not switch — it only makes the initial thread
+    // runnable — so everything below still runs before it does.
+    let up = shared_up()
+    let _ = up.signal(FIRST_BITS)
+
+    // PARK, which is what hands the processor over. The initial thread is what
+    // wakes this, and it does so only after it has read its own record and
+    // drained the event, which is what puts the two halves of the transcript in
+    // the order they are asserted in.
+    let mine = shared_down_waiter()
+    match mine.wait() {
+        case Ok(_) -> {},
+        case Err(_) -> {
+            let _ = system.debug_print("SOS consumewake: worker wait failed\n")
+            let _ = me.exit(WORKER_EXIT)
+            return
+        },
+    }
+
+    let _ = system.debug_print("SOS consumewake: worker second signal\n")
+    // The second word, sent to an event the first wake emptied.
+    let _ = up.signal(SECOND_BITS)
+
+    let _ = me.exit(WORKER_EXIT)
+}
+
+/// The initial thread: build both wait sets, start the worker, park twice.
+func initial(boot_handle: UInt) {
+    park_boot_handle(boot_handle)
+
+    let system = System(boot_handle: boot_handle)
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS consumewake: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let up_waiter = match proc.waiter_create() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS consumewake: no up waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let down_waiter = match proc.waiter_create() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS consumewake: no down waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let up = match proc.event_create(mode: EventMode.Or) {
+        case Ok(ev) -> ev,
+        case Err(e) -> {
+            print("SOS consumewake: no up event: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let down = match proc.event_create(mode: EventMode.Or) {
+        case Ok(ev) -> ev,
+        case Err(e) -> {
+            print("SOS consumewake: no down event: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let _ = up_waiter.add(&up, KEY_UP)
+    let _ = down_waiter.add(&down, KEY_DOWN)
+    park_shared(up, up_waiter, down, down_waiter)
+
+    let w = match proc.thread_create(stack_top: worker_stack_top(),
+                                     arg: WORKER_ROLE) {
+        case Ok(t) -> t,
+        case Err(e) -> {
+            print("SOS consumewake: create failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = w.start()
+
+    let _ = system.debug_print("SOS consumewake: initial parking\n")
+
+    // ---- THE FIRST WAKE ----------------------------------------------------
+    let first = match up_waiter.wait() {
+        case Ok(r) -> r,
+        case Err(e) -> {
+            print("SOS consumewake: first wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let after_first = left(&up)
+    print("SOS consumewake: woke first key={} at-wait={} after={}\n",
+          first.key, taken(&first), after_first)
+
+    // ---- HAND THE PROCESSOR BACK, THEN PARK AGAIN --------------------------
+    // The signal makes the worker runnable; the wait below is what lets it run.
+    // `up` was emptied by the wake above, so this wait genuinely parks — a take
+    // that had left the word behind would find it still ready and answer at
+    // once, which would put the next two lines in the other order.
+    let _ = down.signal(DOWN_BITS)
+    let second = match up_waiter.wait() {
+        case Ok(r) -> r,
+        case Err(e) -> {
+            print("SOS consumewake: second wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    print("SOS consumewake: woke second key={} at-wait={}\n",
+          second.key, taken(&second))
+
+    // The worker exited on its way out of the second signal, so this join
+    // answers out of its slot rather than parking again.
+    let code: UInt = match w.join() {
+        case Ok(v) -> v,
+        case Err(_) -> NO_VALUE,
+    }
+    print("SOS consumewake: joined worker={}\n", code)
+
+    let _ = proc.exit(EXIT_OK)
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        worker()
+    }
+}

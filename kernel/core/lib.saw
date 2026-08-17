@@ -591,8 +591,14 @@ struct Waitable {
 ///
 /// `word` IS the object. Non-zero means ready, which is what makes readiness
 /// LEVEL-TRIGGERED for free (§2.2) — nothing records that a waiter has been
-/// told, so every look at the word gives the same answer until a `Receive`
-/// drains it. There is no edge to lose because there is no edge.
+/// told, so every look at the word gives the same answer until somebody TAKES
+/// it. There is no edge to lose because there is no edge.
+///
+/// TAKING IT IS READ-AND-CLEAR THROUGH EITHER DOOR (ruled Aug 17, user):
+/// §2.4's `Receive` is the non-blocking poll, a `Waiter.wait` delivery is the
+/// blocking one, and both hand the word to a process and reset it. So the word
+/// is never reported twice, and a signal arriving after a take re-arms this
+/// object with its own bits alone.
 ///
 /// `attachment` is the ONE thing an Event knows about the wait side: which
 /// attachment names it, or zero. §2.2 ratifies at most one Waiter per handle,
@@ -1122,19 +1128,28 @@ func block_on_join(slot: Int, target: Int) unsafe {
 //
 // LEVEL-TRIGGERED IS AN ABSENCE, NOT A MECHANISM (§2.2, ratified Jul 29). The
 // kernel records nowhere that a waiter has been told about a ready event, so
-// every look at the attachment set gives the same answer until a `Receive`
-// drains the word. Two consequences worth naming because both are test cases:
-// a signal that lands BEFORE anyone waits is not lost — the word is still
-// non-zero when the wait arrives, and the scan finds it — and an event that is
-// still ready after one waiter has been woken is still ready for the next one.
-// An edge-triggered design would need a "reported" flag per attachment and
-// would lose exactly the first of those.
+// every look at the attachment set gives the same answer until somebody TAKES
+// the word. That is what makes a signal landing BEFORE anyone waits safe: the
+// word is still non-zero when the wait arrives, and the scan finds it. An
+// edge-triggered design would need a "reported" flag per attachment and would
+// lose exactly that.
 //
-// WHAT WAKES WHOM. `Signal` is the only wake source in this unit, and it wakes
-// AT MOST ONE parked thread (§2.2: "a ready handle wakes one waiter" — the
-// shared readiness-queue shape). A second parked thread is not starved by that:
-// it is level-triggered readiness, so its own next `Wait` scans and finds the
-// same event still ready.
+// THE TAKE HAS TWO DOORS, AND BOTH CONSUME (ruled Aug 17, user). `Receive` is
+// the non-blocking poll and a `Waiter.wait` is the blocking one; each hands the
+// accumulated word to a process, so each clears it. A delivery that left the
+// word behind would report the same bits to the next wait as well, and the
+// recipient could not tell that duplicate from a real second signal — the one
+// failure mode a notification must not have. Nothing is lost either way: a
+// signal that lands after the take re-arms readiness with its own bits alone.
+//
+// WHAT WAKES WHOM, and it is a DISTRIBUTION rather than a broadcast. `Signal`
+// wakes AT MOST ONE parked thread (§2.2: "a ready handle wakes one waiter"),
+// and that thread's record carries the word — so with several threads parked on
+// one Waiter, one signal feeds exactly one of them and the rest wait for the
+// next, which is the worker-pool shape §2.2 exists for. THE RECIPIENT IS UNIQUE
+// BY CONSTRUCTION and no multi-watcher caveat is owed: a waitable has at most
+// ONE attachment (§2.2), so a signal reaches exactly one Waiter, which hands it
+// to exactly one thread.
 
 /// §2.4's accumulation, both modes.
 ///
@@ -1253,12 +1268,15 @@ func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> WaitAnswer {
 /// A record describing this waitable HAS BEEN DELIVERED to a thread. Update
 /// whatever the delivery spent.
 ///
-/// THE THIRD KIND IS WHY THIS QUESTION EXISTS, and the two older answers being
-/// empty is the honest statement of a real difference rather than a gap:
+/// THE THREE ANSWERS, and the differences between them are real rather than
+/// accidents of how each object happens to be written:
 ///
-///   - an EVENT's payload is a SNAPSHOT. §2.4 makes `receive` the authoritative
-///     drain, so a delivered record spends nothing — the word is still there,
-///     the event is still ready, and a reader who needs the true count reads it.
+///   - an EVENT's word is CONSUMED BY WHOEVER TAKES THE VALUE, through either
+///     door (ruled Aug 17, user). §2.4's `receive` is the non-blocking poll and
+///     a `Waiter.wait` is the blocking one; both hand the accumulated word to a
+///     process, so both clear it. A delivery that left the word behind would
+///     report the same bits to the next wait as well, which is a duplicate the
+///     recipient cannot tell from a real second signal.
 ///   - an INTERRUPT's readiness is ended by the driver's `ack` and by nothing
 ///     else (§9), because the line stays masked until the device has actually
 ///     been serviced. The kernel cannot know that a record was enough.
@@ -1267,9 +1285,17 @@ func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> WaitAnswer {
 ///     device to service, so the fire has done its whole job once somebody has
 ///     been told — which is the ack-free half of the timerfd model, and what
 ///     makes a periodic timer a schedule rather than a request/response.
+///
+/// So the ODD KIND OUT IS THE INTERRUPT, and its emptiness says what it is: the
+/// only readiness in the system whose end is a DEVICE's business rather than the
+/// kernel's.
 func waitable_consume(kind: WaitableKind, slot: Int) unsafe {
     match kind {
-        case Event -> {},
+        // The take is READ-AND-CLEAR, and `deliver_attachment` is what makes it
+        // one act: the read happened a few lines earlier in the same
+        // interrupts-masked region, so no signal can land between the two and
+        // there are no bits here that the record did not carry.
+        case Event -> { EVENTS[slot].word = 0 },
         case Interrupt -> {},
         case Timer -> { TIMERS[slot].fires = 0 },
     }
@@ -1344,10 +1370,19 @@ func deliver_wait_record(p: Int, dst: UInt, key: UInt, tag: WaitTag,
 ///
 /// A funnel rather than two call sites, because "read the answer" and "record
 /// that it was delivered" have to be one step: split apart, a kind whose
-/// readiness is CONSUMED by delivery — the Timer — would be drained on one path
-/// and not the other, and the bug would be a periodic timer that reports the
-/// same fire twice to whichever caller forgot. Both paths are equally "a record
-/// reached a thread", which is exactly the event `waitable_consume` is about.
+/// readiness is CONSUMED by delivery — the Timer and, since Aug 17, the Event —
+/// would be drained on one path and not the other, and the bug would be a
+/// periodic timer that reports the same fire twice to whichever caller forgot.
+/// Both paths are equally "a record reached a thread", which is exactly the
+/// event `waitable_consume` is about.
+///
+/// THE READ AND THE CLEAR ARE ONE ACT, and this function's body is where that is
+/// true: `waitable_answer` takes the value, `waitable_consume` clears it, and
+/// nothing between them can run. The kernel takes no trap in kernel mode (design
+/// 178 D2 — interrupts are taken from user mode only), so a signal cannot land
+/// inside this window; one landing after it finds the object empty and re-arms
+/// readiness with its own bits alone, which is neither a loss nor a double
+/// count.
 func deliver_attachment(p: Int, dst: UInt, a: Int) unsafe {
     let kind = ATTACHMENTS[a].kind
     let target = ATTACHMENTS[a].target
@@ -2406,9 +2441,13 @@ func event_op_decoded(op: EventOp, obj: &EventObject, arg0: UInt,
             signal_event(target, arg0)
             op_ok()
         },
-        // DRAINS AND RESETS, in one operation (§2.4). Reading an empty event
-        // answers zero rather than parking: an Event is not a queue, and
-        // blocking is the Waiter's job.
+        // DRAINS AND RESETS, in one operation (§2.4) — THE NON-BLOCKING DOOR of
+        // the two a take can come through, and its semantics are exactly what
+        // they always were. Reading an empty event answers zero rather than
+        // parking: an Event is not a queue, and blocking is the Waiter's job.
+        // The blocking door is a `Waiter.wait` delivery, which consumes the same
+        // word the same way (`waitable_consume`); a process picks a door by
+        // whether it wants to park, never by what it will be told.
         case Receive -> {
             if not obj.allows(EventRight.Receive) {
                 fault_process(p, FaultReason.AccessDenied)

@@ -33,7 +33,7 @@ names provisional):
 | `Thread` | Kernel-scheduled execution context bound to an AddressSpace. Saw's cooperative TaskGroups run *inside* a thread, in userspace — the kernel never sees tasks. BUILT M2 (design 178 unit 2): ops `Start`/`Join`/`Exit`/`Yield`, rights `ThreadRight.Start`/`.Join`/`.Control`. The saved trap frame IS the context, so a switch is the trap handler returning a different frame — see §11. |
 | `MemoryObject` | A range of memory (RAM or device MMIO) that can be mapped into AddressSpaces. Derived by splitting/attenuating a parent MemoryObject; roots handed to the first process at boot. |
 | `Channel` | Synchronous message IPC with request/reply built in — see §2.1 (ratified Jul 29). |
-| `Event` | Accumulating non-blocking notification (OR / saturating-sum); a waitable — see §2.4 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Signal`/`Receive`, the mode chosen by the caller at creation (`event_create(mode:)`). |
+| `Event` | Accumulating non-blocking notification (OR / saturating-sum); a waitable — see §2.4 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Signal`/`Receive`, the mode chosen by the caller at creation (`event_create(mode:)`). AMENDED Aug 17 (user): the word is CONSUMED BY WHOEVER TAKES IT, through either door — `receive` is the non-blocking poll, a `Waiter.wait` delivery is the blocking one, and both read-and-clear, so a value is reported exactly once (§2.2, §2.4). |
 | `Clock` | A GRANTED TIME SOURCE — time is a capability, not an ambient facility. BUILT M3 (design 232 unit 1): obtained through `SystemOp.ClockGet` on `SystemRight.ClockGet`, ops `Now`/`TimerCreate`, rights `ClockRight.Read`/`.TimerCreate`. It is a GETTER, not a factory — the same handle every ask, per (process, `ClockType`), on the `ProcessSelf` precedent, since a machine has one monotonic clock and two objects naming it would be two names for one thing. `ClockType` declares `Monotonic` ONLY in v1 (`Boot`/`Realtime` are future values of a raw-backed enum, undeclared because an unproducible case is dead surface). `Now` answers through a copy-out record, because a nanosecond count is 64 bits and one profile's registers are not. The point of the capability: strip the right from a child and hand it a VIRTUAL clock over IPC instead, with no code change on either side. |
 | `Timer` | Deadline object bound to the Clock that created it; directly waitable. BUILT M3 (design 232 unit 1) — THE PROCESS-SLEEP PRIMITIVE, and before it a wait either returned at once or blocked forever. Ops `Arm`/`Disarm`, rights `TimerRight.Arm` (gating both) / `.Wait`. `arm(after_ns, interval_ns)` arrives through the new COPY-IN record (§2.2's copy-out funnel's mirror twin, built here and inherited by M4's IPC send) because two 64-bit times exceed the argument registers on a 32-bit profile; `interval_ns == 0` is a one-shot, which disarms itself when it fires. The re-arm is DRIFT-FREE (next = previous DEADLINE + interval, the timerfd model) and missed expiries COALESCE into a saturating fire count delivered as `WaitPayload.Timer(fires:)`. **There is NO ACK**: unlike §9's Interrupt there is no mask to release, so the wait that reports the fires is what consumes them. Arming an armed timer REPLACES its schedule and clears the count; disarming an unarmed one is a NO-OP, deliberately opposite to §9's ack-with-no-fire — a one-shot disarms itself, so cancelling a timeout that just expired is an ordinary race rather than a caller error. |
 | `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it, ack via the handle. BUILT M2 (design 178 unit 4): one op (`Ack`), two rights (`InterruptRight.Wait`/`.Ack`), created by `ProcessOp.InterruptBind` on its own Process right — the factory bit a launcher strips from everything that is not a driver. The BINDING IS THE OBJECT'S EXISTENCE (creation takes the line, there is no rebind), which is what stops one handle naming two devices over its life. A line the board does not have, the TIMER's line, and a line already bound are all faults. |
@@ -109,9 +109,24 @@ ledger.
   be the union of every waitable's answer forever, and the register file
   is the one thing that cannot grow. The Event's payload is its
   accumulated word, which makes the common wait one syscall instead of
-  two; it is a SNAPSHOT taken when the wait was answered, so a producer
-  signalling again before the woken thread runs makes a following
-  `receive` larger, and `receive` stays the authoritative drain.
+  two.
+- **THE ANSWER CONSUMES WHAT IT REPORTS** (ruled Aug 17, user, amending
+  the Aug-16 snapshot wording above). A delivery of an Event READS AND
+  CLEARS the word into the wait record, in one interrupts-masked step —
+  so the bits a record carries are bits nothing else will ever be told
+  about, and a `receive` right after a wake answers zero. A signal
+  landing after the take re-arms readiness with its own bits alone:
+  nothing lost, nothing double-counted. The alternative — a snapshot the
+  wait leaves behind — reports the same bits to the next wait as well,
+  and a recipient cannot tell that duplicate from a real second signal.
+  §2.4's `receive` keeps its exact semantics as the NON-BLOCKING POLL;
+  the two are doors onto one value, and a process picks by whether it
+  wants to park.
+- **THE MULTIPLEXING RULE, in one line:** many threads per Waiter is
+  DISTRIBUTION (one wake per delivery, the worker-pool shape); one
+  Waiter per waitable is OWNERSHIP, and it is structural — a handle
+  attaches to at most one Waiter, so a delivered value has exactly one
+  recipient by construction and no multi-watcher caveat exists.
 - **Copy-out is checked, and it is one door.** This is the first place the
   kernel writes a process's memory. The destination must be word-aligned
   and inside the process's writable grant; one that is not TERMINATES the
@@ -144,12 +159,14 @@ ledger.
   per-kind is FIVE questions — who is watching me, set who is watching
   me, am I ready, what does a record say, and (added by the Timer) a
   record was DELIVERED — each an exhaustive match, so a fourth waitable
-  cannot be added silently. The fifth is the Timer's ACK-FREE DRAIN: an
-  Event's payload is a snapshot `receive` stays authoritative over and an
-  Interrupt's readiness is ended by the driver's ack, so both answer it
-  with nothing, while a Timer's fire count is SPENT by the delivery.
-  Delivery is one funnel, so the drain cannot happen on the already-ready
-  path and not on the wake path.
+  cannot be added silently. The fifth is the ACK-FREE DRAIN, and since
+  Aug 17 two of the three kinds answer it: an Event's word and a Timer's
+  fire count are both SPENT by the delivery, while an INTERRUPT alone
+  answers with nothing — its readiness ends at the driver's ack, because
+  the line stays masked until the device has actually been serviced, so
+  the kernel cannot know a record was enough. Delivery is one funnel, so
+  the drain cannot happen on the already-ready path and not on the wake
+  path.
 - **THE COPY-IN DOOR is the copy-out funnel's mirror twin** (design 232
   unit 1), built for `Timer.Arm` and inherited by §2.1's message body. It
   refuses the same two things — a misaligned address, an address outside
@@ -177,6 +194,15 @@ ledger.
   the kernel accumulates into the Event's word. `event.receive() ->
   word` drains and resets to 0. Waitable (non-zero = ready → attach to
   a Waiter).
+- **THE WORD HAS TWO DOORS AND BOTH CONSUME IT** (ruled Aug 17, user).
+  `receive` is the NON-BLOCKING POLL — drain-and-reset, 0 when empty,
+  never parks — and a `Waiter.wait` delivery is the blocking one, whose
+  record carries the same accumulated word and clears it in the same
+  interrupts-masked step (§2.2). A value is therefore delivered exactly
+  once, whichever door it came through, and the choice between them is
+  only whether the caller wants to park. The recipient is unique by
+  construction: a handle attaches to at most one Waiter, so no second
+  watcher can be deprived of a word a wait took.
 - **Accumulation mode is a per-Event property:**
   - **bitwise-OR** — "which of these events occurred since last drain"
     (flag set; the signal use case).
