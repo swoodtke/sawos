@@ -1,0 +1,293 @@
+//! THE SOSIMG LOADER (design 140 unit B; spec §6, §7, §12).
+//!
+//! The kernel loads exactly ONE image, ever: the root server. What stays here is
+//! everything that holds on EVERY target — the order the checks run in, that
+//! nothing is placed before everything validates, and that a malformed shape is
+//! a diagnosed FAIL rather than a hang or a partial load.
+//!
+//! It is the last module in the order because it ends by handing the machine to
+//! `process`'s one way into user mode.
+
+import hal
+import imgformat.{SosimgHeader, SosimgSeg, SegFlag, fits_target_word}
+import kcore.mem.{align_up, copy_bytes, zero_bytes}
+import kcore.diag.{console, fatal_image}
+import kcore.process.{start_process}
+
+/// What a refused too-high address REPORTS: its top 32 bits. The low half is
+/// what would have survived a narrowing, so it is the half that says nothing;
+/// the high half is the part the machine cannot reach and is what a reader
+/// needs to see. (`write_hex` prints a machine word, which on the profile that
+/// can raise this is 32 bits wide.)
+static HIGH_HALF_SHIFT: Int = 32
+
+// =============================================================================
+// The sosimg loader (design 140 unit B; spec §6, §7, §12)
+// =============================================================================
+//
+// The kernel loads exactly ONE image, ever: the root server (spec §12). Every
+// later process is loaded BY ROOT, so there is deliberately no second code path
+// here. The image is not ELF — a microkernel-sized loader gets a flat header.
+//
+// The LAYOUT is not described here: it is the `imgformat` package, shared with
+// the Blade target that emits it, and this loader reads it by OVERLAYING those
+// structs on the appended bytes — one `UnsafeMemory` view construction per
+// record, then plain field names (`seg.mem_len`). The format's alignment
+// discipline (every u32 4-aligned, no interior padding, pinned there by
+// `static_assert`) is what makes the overlay exact, and it is what turns a
+// layout edit into a compile error instead of a silent misparse at boot.
+//
+// What stays HERE is everything that holds on EVERY target: the order the
+// checks run in, that nothing is placed before everything validates, and that a
+// malformed shape is a diagnosed FAIL rather than a hang or a partial load.
+// Where root's region is, how many grants there are to spend and what a
+// permission bit does to the hardware are the HAL's — which is why the numbers
+// below are read from it rather than written here.
+
+/// Overlay the header on the image's first bytes. One view construction, then
+/// an ordinary safe struct — the unsafety is confined to this line.
+func header_at(addr: UInt) unsafe -> SosimgHeader {
+    UnsafeMemory<SosimgHeader, Normal>(addr).read()
+}
+
+/// Overlay one segment record.
+func seg_at(addr: UInt) unsafe -> SosimgSeg {
+    UnsafeMemory<SosimgSeg, Normal>(addr).read()
+}
+
+/// Validate one segment record against the image bounds and the root region.
+/// Checks are ordered so no bound is computed by an addition that could
+/// overflow — a hostile length must produce a diagnostic, not a panic.
+func check_segment(seg: &SosimgSeg, img_len: UInt) {
+    let file_off = seg.file_off as UInt
+    let file_len = seg.file_len as UInt
+    let mem_len = seg.mem_len as UInt
+
+    // The format's addresses are 64-bit on both profiles (design 172 unit 8),
+    // so a 32-bit kernel can be handed an image it cannot address. Refusing is
+    // the only answer that cannot corrupt a boot — narrowing would wrap a high
+    // address into a low one and place the segment somewhere the linker never
+    // meant. The test folds away entirely on a 64-bit build.
+    if not fits_target_word(seg.load_addr) {
+        fatal_image("segment loads past this machine's address space",
+                    (seg.load_addr >> HIGH_HALF_SHIFT) as UInt)
+    }
+    let load_addr = seg.load_addr as UInt
+
+    if file_off > img_len {
+        fatal_image("segment starts past the image", file_off)
+    }
+    if file_len > img_len - file_off {
+        fatal_image("segment runs past the image", file_len)
+    }
+    if not seg.mem_covers_file() {
+        fatal_image("segment mem_len below file_len", mem_len)
+    }
+
+    // Write-without-read is not a grant any target should install, and one
+    // profile's hardware RESERVES the encoding outright. `imgformat` states the
+    // rule; refusing the image is the consequence. It is checked BEFORE the
+    // device branch because it holds for both kinds of record.
+    if not seg.has_sane_perms() {
+        fatal_image("segment permissions are not a valid grant", seg.flags as UInt)
+    }
+
+    // A DEVICE WINDOW is judged against the BOARD, not against the root region
+    // — it names hardware, which is nowhere near RAM — so it takes its own
+    // path and returns.
+    if seg.is_device_grant() {
+        check_device_grant(&seg, load_addr, file_len, mem_len)
+        return
+    }
+
+    if load_addr < hal.ROOT_LOAD_BASE {
+        fatal_image("segment loads below the root region", load_addr)
+    }
+    // A grant covers whole units of the target's protection granularity, so a
+    // segment starting mid-unit would be granted along with whatever shares
+    // its first unit — the previous segment's tail, at the previous segment's
+    // permissions. On a page-granular profile that is how root's code would
+    // silently become writable; on a four-byte-granular one it never arises.
+    // Refusing the image is the only answer that is right on both.
+    if (load_addr & (hal.PROT_GRAIN - 1)) != 0 {
+        fatal_image("segment is not aligned to the grant granularity", load_addr)
+    }
+    let limit = hal.ROOT_REGION_TOP - hal.ROOT_STACK_LEN
+    if load_addr > limit {
+        fatal_image("segment loads above the root region", load_addr)
+    }
+    if mem_len > limit - load_addr {
+        fatal_image("segment overruns the root region", mem_len)
+    }
+}
+
+/// Validate a DEVICE WINDOW record (design 178's finale constraint 1, ruled
+/// Aug 16, user).
+///
+/// THE IMAGE DECLARES AND THE BOARD AUTHORIZES, and both halves are load-bearing.
+/// A window in the image is what makes "this program drives that device" a
+/// property of the program; a window the BOARD publishes is what stops an image
+/// from naming any physical address it likes and being handed it. In M2 the
+/// board offers exactly one — the console UART's page, which is the only device
+/// a process has any business holding while the kernel owns everything else —
+/// so the authorization is a comparison rather than a table.
+///
+/// THIS IS THE PLACEHOLDER M3'S MAPPING RETIRES. Then a device window is a
+/// MemoryObject derived from a device pool root (spec §2.5), mapped by an op
+/// and revocable by closing the Mapping, and the board's comparison becomes the
+/// pool's contents. Everything above this line is what that migration replaces.
+func check_device_grant(seg: &SosimgSeg, load_addr: UInt, file_len: UInt,
+                        mem_len: UInt) {
+    // A window carries no bytes: there is nothing in an image file to place at
+    // a hardware address, and a record claiming otherwise has been built wrong.
+    if file_len != 0 {
+        fatal_image("device grant carries image bytes", file_len)
+    }
+    if load_addr != hal.DEVICE_GRANT_BASE {
+        fatal_image("device grant names a window this board does not offer",
+                    load_addr)
+    }
+    if mem_len != hal.DEVICE_GRANT_LEN {
+        fatal_image("device grant is not the size of that window", mem_len)
+    }
+}
+
+/// Parse the appended root image, place its segments, grant root exactly the
+/// regions the image asks for plus a stack, and drop to user mode at its entry.
+/// Never returns.
+public func load_root_and_enter() unsafe {
+    let base = hal.payload_start()
+    let end = hal.payload_end()
+    if end < base {
+        fatal_image("payload bounds inverted", base)
+    }
+    let img_len = end - base
+
+    // The record strides come from the shared structs, so they cannot drift
+    // from the layout the reads assume.
+    let header_len = sizeof<SosimgHeader>() as UInt
+    let seg_len = sizeof<SosimgSeg>() as UInt
+
+    if img_len < header_len {
+        fatal_image("no root image appended", img_len)
+    }
+
+    let header = header_at(base)
+    if not header.has_magic() {
+        fatal_image("bad magic", header.magic as UInt)
+    }
+    if not header.has_known_version() {
+        fatal_image("unsupported version", header.version as UInt)
+    }
+    // An image built for the OTHER profile is refused rather than jumped into.
+    // Its instructions are not this machine's and its addresses need not be in
+    // this machine's map — and before the format carried a tag, the only thing
+    // that stopped one booting on the other was that nobody had tried.
+    if not header.is_for_arch(hal.arch_tag()) {
+        fatal_image("image is for another architecture", header.arch as UInt)
+    }
+
+    let seg_count = header.seg_count as UInt
+    if seg_count == 0 {
+        fatal_image("image has no segments", 0)
+    }
+    if seg_count > hal.MAX_ROOT_SEGMENTS {
+        fatal_image("more segments than the grant budget", seg_count)
+    }
+    let table_len = seg_count * seg_len
+    if table_len > img_len - header_len {
+        fatal_image("segment table runs past the image", table_len)
+    }
+
+    // Same rule as a segment's address, at the one other place a 64-bit field
+    // becomes a machine word: refuse, never narrow.
+    if not fits_target_word(header.entry) {
+        fatal_image("entry is past this machine's address space",
+                    (header.entry >> HIGH_HALF_SHIFT) as UInt)
+    }
+    let entry = header.entry as UInt
+    let prio_map = header.prio_map as UInt
+
+    // Validate EVERY segment before placing any of them: a rejected image must
+    // leave the root region untouched.
+    var i: UInt = 0
+    while i < seg_count {
+        let seg = seg_at(base + header_len + i * seg_len)
+        check_segment(&seg, img_len)
+        i = i + 1
+    }
+
+    if entry < hal.ROOT_LOAD_BASE || entry >= hal.ROOT_REGION_TOP - hal.ROOT_STACK_LEN {
+        fatal_image("entry outside the root region", entry)
+    }
+
+    let uart = console()
+    uart.write_str("SOS: root image ok segments=")
+    uart.write_hex(seg_count)
+    uart.write_str(" entry=")
+    uart.write_hex(entry)
+    uart.write_str(" prio=")
+    uart.write_hex(prio_map)
+    uart.write_str("\n")
+
+    hal.prot_reset()
+
+    // The WRITABLE window, accumulated as the segments are placed. It is what
+    // `copy_out` checks a kernel-written record against, and the stack below is
+    // always part of it — so it starts at the region's top edge and only ever
+    // grows downward, which means "no writable segment at all" still leaves the
+    // stack, and a process always has somewhere to receive one.
+    var rw_base = hal.ROOT_REGION_TOP - hal.ROOT_STACK_LEN
+
+    var s: UInt = 0
+    while s < seg_count {
+        let seg = seg_at(base + header_len + s * seg_len)
+        let load_addr = seg.load_addr as UInt
+        let file_len = seg.file_len as UInt
+        let mem_len = seg.mem_len as UInt
+
+        // A DEVICE WINDOW places no bytes and joins no writable window: it is a
+        // grant and nothing else. Keeping it out of `rw_base` is not tidiness —
+        // a hardware address is BELOW RAM on one profile, so folding it in
+        // would stretch the copy-out window from the device page to the top of
+        // the region and make `copy_out`'s check accept most of the machine.
+        if seg.is_device_grant() {
+            hal.prot_device(s, load_addr, mem_len)
+        } else {
+            copy_bytes(load_addr, base + (seg.file_off as UInt), file_len)
+            zero_bytes(load_addr + file_len, mem_len - file_len)
+
+            // The sosimg flag bits ARE the protection vocabulary (imgformat
+            // states the encoding; each HAL translates it into its own
+            // hardware's bits), so a segment's permissions become its grant
+            // with nothing in between.
+            hal.prot_region(s, load_addr,
+                            align_up(load_addr + mem_len, hal.PROT_GRAIN),
+                            seg.flags)
+            if (seg.flags & (SegFlag.Write as UInt8)) != 0 && load_addr < rw_base {
+                rw_base = load_addr
+            }
+        }
+        s = s + 1
+    }
+
+    // The stack is the kernel's grant, not the image's: root asks for code and
+    // data, the kernel decides where it runs.
+    hal.prot_region(seg_count, hal.ROOT_REGION_TOP - hal.ROOT_STACK_LEN,
+                    hal.ROOT_REGION_TOP,
+                    (SegFlag.Read as UInt8) | (SegFlag.Write as UInt8))
+    hal.prot_commit()
+
+    // spec §7: root's band map applies verbatim from its image. D3 keeps the
+    // map a loader artifact for M2 — the scheduler is round-robin over one
+    // level — so the kernel still parses and reports it, which is what proves
+    // the Blade-emitted field arrives intact. Storing it in the Process slot is
+    // the priority unit's job, not this one's.
+    //
+    // §12: root's boot handle set. It is still exactly one handle — System —
+    // and every authority root has flows through it, now including its own
+    // Process and Thread objects, which it DERIVES (`ProcessSelf` /
+    // `ThreadSelf`) rather than being handed.
+    start_process(entry, hal.ROOT_REGION_TOP, hal.ROOT_LOAD_BASE,
+                  hal.ROOT_REGION_TOP, rw_base, hal.ROOT_REGION_TOP)
+}

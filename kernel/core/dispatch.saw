@@ -1,0 +1,1137 @@
+//! THE OBJECT-OP DISPATCH AND THE TRAP HANDLER (spec §3, §5.7).
+//!
+//! Handle-table lookup -> object type -> op table -> rights check -> op, and
+//! then every op body the eight kinds have. It is the top of the kernel: an op
+//! may reach any seam below it, and nothing below may reach an op.
+//!
+//! `ktrap` is the HAL's landing point for every trap taken from user mode, and
+//! the frame it RETURNS is the whole of the context switch.
+
+import hal
+import sosabi.{
+    ObjType,
+    SystemHandle,
+    ProcessHandle,
+    ThreadHandle,
+    EventHandle,
+    WaiterHandle,
+    InterruptHandle,
+    ClockHandle,
+    TimerHandle,
+    SystemRight,
+    ProcessRight,
+    ThreadRight,
+    EventRight,
+    WaiterRight,
+    InterruptRight,
+    ClockRight,
+    TimerRight,
+    SystemOp,
+    ProcessOp,
+    ThreadOp,
+    EventOp,
+    WaiterOp,
+    InterruptOp,
+    ClockOp,
+    TimerOp,
+    EventMode,
+    ClockType,
+    wait_record_bytes,
+    CLOCK_NOW_RECORD_DOUBLEWORDS,
+    clock_now_record_bytes,
+    TIMER_ARM_RECORD_DOUBLEWORDS,
+    timer_arm_record_bytes,
+    SosStatus,
+    FaultReason,
+    ProcessStatusKind,
+    process_status_word,
+    thread_rights,
+    event_rights,
+    waiter_rights,
+    interrupt_rights,
+    clock_rights,
+    timer_rights,
+    NO_HANDLE,
+    ENTRY_IMAGE,
+}
+import kcore.limits.{
+    MAX_HANDLES,
+    NO_ATTACHMENT,
+    NO_EVENT,
+    NO_INTERRUPT,
+    NO_THREAD,
+    NO_TIMER,
+    NO_WAITER,
+}
+import kcore.result.{
+    SyscallResult,
+    op_blocked,
+    op_ok,
+    op_status,
+    op_value,
+    write_result,
+}
+import kcore.objects.{
+    ClockObject,
+    EventObject,
+    HANDLES,
+    InterruptObject,
+    ProcessObject,
+    SlotState,
+    SystemObject,
+    ThreadObject,
+    TimerObject,
+    WaiterObject,
+    lookup_handle,
+    mint_handle,
+}
+import kcore.threads.{
+    CURRENT_THREAD,
+    NEED_RESCHED,
+    THREADS,
+    ThreadSlot,
+    ThreadState,
+    alloc_thread,
+    block_on_join,
+    calling_process,
+    frame_slot,
+    ready_push,
+}
+import kcore.time.{
+    CLOCKS,
+    NEVER_NS,
+    TIMERS,
+    TimerSlot,
+    alloc_timer,
+    clock_slot,
+    reprogram_timer,
+}
+import kcore.waitables.{
+    ATTACHMENTS,
+    Attachment,
+    EVENTS,
+    EventSlot,
+    INTERRUPTS,
+    InterruptSlot,
+    WAITERS,
+    Waitable,
+    WaitableKind,
+    WaiterSlot,
+    alloc_attachment,
+    alloc_event,
+    alloc_interrupt,
+    alloc_waiter,
+    attached_by_key,
+    block_on_wait,
+    detach_attachment,
+    interrupt_by_line,
+    set_waitable_attachment,
+    waitable_attachment,
+    waitable_ready,
+    waiter_ready_attachment,
+}
+import kcore.process.{
+    PROCESSES,
+    copy_in,
+    copy_out,
+    copy_out_check,
+    end_process,
+    fault_process,
+    fault_trap,
+}
+import kcore.wake.{deliver_attachment, signal_event, wake_one_waiter}
+import kcore.irq.{service_irq}
+import kcore.sched.{exit_thread, pick_next}
+
+/// The System object's ops (§2). Returns a status; `shutdown` does not return
+/// at all.
+///
+/// `op` arrives as the raw register word, which a process chooses, so it is
+/// DECODED rather than compared: `SystemOp.from(raw:)` accepts exactly the numbers
+/// that are ops and hands back `None` for every other, which is both the range
+/// check and the dispatch in one step. The `match` is then exhaustive, so adding
+/// an op to `sosabi` makes this function fail to compile until it is handled —
+/// which is what the old `op > OP_SYSTEM_MAX` test could never do.
+///
+/// AN UNKNOWN OP AND A MISSING RIGHT BOTH TERMINATE THE PROCESS (design 178's
+/// faults ruling). Both are mistakes the caller could have checked: it chose
+/// the number, and it knows which rights it holds.
+func system_op(raw_op: UInt, obj: &SystemObject, arg0: UInt) unsafe -> SyscallResult {
+    let p = calling_process()
+    guard let op = SystemOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
+    return system_op_decoded(op, &obj, arg0, p)
+}
+
+func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt,
+                       p: Int) unsafe -> SyscallResult {
+    match op {
+        // The rights check is per-OP, not per-object: holding the System
+        // handle is not the same as being allowed to use every part of it.
+        case DebugPrint -> {
+            if not obj.allows(SystemRight.Debug) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            hal.console_byte((arg0 & BYTE_MASK) as UInt8)
+            op_ok()
+        },
+        // Stop the machine with `arg0` as the status. NOT process exit, which
+        // is `ProcessOp.Exit` — this is the whole machine, and it is what the
+        // harness kernels with no Process object still use to finish a run.
+        case Shutdown -> {
+            if not obj.allows(SystemRight.Shutdown) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            if arg0 == 0 {
+                hal.exit_pass()
+            } else {
+                hal.exit_fail(arg0)
+            }
+            op_ok()
+        },
+        // §3's derivation rule, made real: the boot handle set is one handle
+        // wide and everything else is obtained THROUGH it. A process asks the
+        // System object which Process it is, and the Process object which
+        // Thread — so the kernel never has to widen the entry register, and a
+        // process that was given no System handle has no way to name either.
+        case ProcessSelf -> {
+            if not obj.allows(SystemRight.Manage) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            op_value(PROCESSES[p].self_handle)
+        },
+        // TIME IS A GRANTED CAPABILITY (design 232 unit 1, the M3 time notes).
+        // A process that was not given this right cannot read the machine's
+        // clock at all — which is what makes handing a child a VIRTUAL clock
+        // over IPC a substitution rather than a rewrite, since a child holding
+        // no kernel Clock has no second way to ask.
+        case ClockGet -> {
+            if not obj.allows(SystemRight.ClockGet) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            clock_get(p, arg0)
+        },
+    }
+}
+
+/// Hand process `p` its Clock for the domain `raw_kind` names (§2's Clock row).
+///
+/// The DOMAIN arrives as a raw register word the process chose, so it is decoded
+/// rather than trusted, on `event_create`'s precedent exactly: a number that is
+/// not a `ClockType` is a caller error the process could have checked, which
+/// under design 178's faults ruling ends it. v1 declares one domain, so every
+/// number but zero lands here.
+func clock_get(p: Int, raw_kind: UInt) unsafe -> SyscallResult {
+    guard let kind = ClockType.from(raw: raw_kind) else { fault_process(p, FaultReason.BadArg) }
+    return clock_get_typed(p, kind)
+}
+
+/// THERE IS NOTHING TO CREATE, which is what makes this a getter rather than a
+/// factory (amended Aug 17, user).
+///
+/// The object already exists — one kernel-eternal Clock per domain, live since
+/// boot — so this op only ever mints a HANDLE onto a well-known slot. The
+/// find-or-create scan it used to open with is gone with the per-process object
+/// it was scanning for, and so is the `NoResource` a full clock slab could
+/// answer with: a domain's slot cannot be occupied by somebody else. What can
+/// still fail is the HANDLE TABLE, which is the process's own resource.
+///
+/// ASKING TWICE STILL ANSWERS THE SAME HANDLE, and it is the process's table
+/// that says so rather than a scan of the slab. That keeps §3's no-duplicate
+/// rule (two handles onto one object would be two names for one thing) and keeps
+/// the op out of unit 5's quota rows, since it cannot allocate on repetition.
+/// Under the mint-per-call model the lifecycle unit 2.75 owns, this becomes pure
+/// minting; that flip is not made here.
+func clock_get_typed(p: Int, kind: ClockType) unsafe -> SyscallResult {
+    let slot = clock_slot(kind)
+    let existing = clock_handle_of(p, slot)
+    if existing != NO_HANDLE {
+        return op_value(existing)
+    }
+    let handle = mint_handle(p, ObjType.Clock, clock_rights(), slot)
+    if handle == NO_HANDLE {
+        return op_status(SosStatus.NoResource)
+    }
+    op_value(handle)
+}
+
+/// The handle in `p`'s table naming clock slot `slot`, or `NO_HANDLE`.
+///
+/// SINCE THE CLOCK WENT GLOBAL THIS IS THE WHOLE OF `ClockGet`'S "SAME HANDLE
+/// EVERY ASK": the object cannot tell you who holds it, so the process's own
+/// table is what answers. That is also the only place the answer could live —
+/// a field on a shared object would have to be a field per process.
+///
+/// A SEARCH rather than a cached word, and the asymmetry with
+/// `ProcessSlot.self_handle` is the honest one: a process has exactly one
+/// Process handle by construction, so caching it is caching a fact. A Clock's
+/// handle is merely the one this table happens to hold, and a second copy of
+/// it here would be a place to go stale once handles can be closed and
+/// re-minted. The table is the truth; at sixteen entries the walk is cheaper
+/// than the invalidation rule would be.
+func clock_handle_of(p: Int, slot: Int) unsafe -> UInt {
+    var h: Int = 0
+    while h < MAX_HANDLES {
+        let entry = HANDLES[p * MAX_HANDLES + h]
+        match entry.obj_type {
+            case Clock -> {
+                if entry.target == slot {
+                    return (h as UInt) + 1
+                }
+            },
+            case _ -> {},
+        }
+        h = h + 1
+    }
+    NO_HANDLE
+}
+
+/// The Process object's ops (§2, §7, §8; design 178 D4).
+func process_op(raw_op: UInt, obj: &ProcessObject,
+                arg0: UInt, arg1: UInt, arg2: UInt) unsafe -> SyscallResult {
+    let p = calling_process()
+    guard let op = ProcessOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
+    return process_op_decoded(op, &obj, arg0, arg1, arg2, p)
+}
+
+func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
+                        arg0: UInt, arg1: UInt, arg2: UInt,
+                        p: Int) unsafe -> SyscallResult {
+    match op {
+        case ThreadCreate -> {
+            if not obj.allows(ProcessRight.ThreadCreate) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            thread_create(obj.slot, arg0, arg1, arg2)
+        },
+        case ThreadSelf -> {
+            if not obj.allows(ProcessRight.Manage) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            if CURRENT_THREAD == NO_THREAD {
+                fault_process(p, FaultReason.BadState)
+            }
+            op_value(THREADS[CURRENT_THREAD].self_handle)
+        },
+        // Spec §5.7, ratified Aug 5: process exit belongs HERE and not on the
+        // System object. Every thread of the process goes with it (§8's
+        // teardown is unconditional), so this never returns.
+        case Exit -> {
+            if not obj.allows(ProcessRight.Exit) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            // `end_process` stops the machine, so this arm diverges and owes
+            // the `match` no value.
+            end_process(obj.slot, ProcessStatusKind.Exited, arg0, arg0)
+        },
+        // §8's ONE fixed-width status word: kind in the high bits, code in the
+        // low ones. A process asking about itself always reads `Running`, which
+        // is the honest answer and the only one M2 can produce — the interesting
+        // reader is a supervisor holding somebody else's handle, and that needs
+        // the second process M3 loads.
+        case GetStatus -> {
+            if not obj.allows(ProcessRight.Wait) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            op_value(process_status_word(PROCESSES[obj.slot].exit_kind,
+                                      PROCESSES[obj.slot].exit_code))
+        },
+        // The creation authority for §2's plain objects, answering spec §12's
+        // open pin the way `ThreadCreate` already does: it flows through a
+        // handle the process holds, so it is §3's derivation rule rather than a
+        // new mechanism beside it. See `ProcessRight`.
+        case EventCreate -> {
+            if not obj.allows(ProcessRight.EventCreate) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            event_create(obj.slot, arg0)
+        },
+        case WaiterCreate -> {
+            if not obj.allows(ProcessRight.WaiterCreate) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            waiter_create(obj.slot)
+        },
+        // Binding an IRQ line is the strongest of the creation authorities, and
+        // it flows through the same handle for the same reason: the Process
+        // object is what an Interrupt is charged to, and a bit is what a
+        // launcher strips from everything that is not a driver.
+        case InterruptBind -> {
+            if not obj.allows(ProcessRight.InterruptBind) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            interrupt_bind(obj.slot, arg0)
+        },
+    }
+}
+
+/// Make an Event in process `slot` (spec §2.4).
+///
+/// The MODE arrives as a raw register word the process chose, so it is decoded
+/// rather than trusted: a number that is not a mode is a caller error the
+/// process could have checked, which under design 178's faults ruling ends it.
+func event_create(p: Int, raw_mode: UInt) unsafe -> SyscallResult {
+    guard let mode = EventMode.from(raw: raw_mode) else { fault_process(p, FaultReason.BadArg) }
+    return event_create_moded(p, mode)
+}
+
+func event_create_moded(p: Int, mode: EventMode) unsafe -> SyscallResult {
+    let slot = alloc_event()
+    if slot == NO_EVENT {
+        return op_status(SosStatus.NoResource)
+    }
+    let handle = mint_handle(p, ObjType.Event, event_rights(), slot)
+    if handle == NO_HANDLE {
+        return op_status(SosStatus.NoResource)
+    }
+    // Written only once BOTH allocations succeeded, so a refused handle leaves
+    // the slab exactly as it found it — the all-or-nothing shape design 123
+    // asks of a `try_` op, for the same reason.
+    EVENTS[slot] = EventSlot(state: SlotState.Live, process: p, mode: mode,
+                             word: 0, attachment: 0)
+    op_value(handle)
+}
+
+/// Bind `line` to a new Interrupt in process `p` (spec §2 table, §9).
+///
+/// THREE REFUSALS, all faults, all caller-checkable:
+///
+///   - a line THIS MACHINE does not have. The board's line space is documented
+///     per profile and a driver names a number out of its own device's
+///     description, so a number outside it is a mistake the caller could have
+///     checked.
+///   - the TIMER's line. It is the scheduler's, and a process holding it could
+///     mask the tick and never yield — which is not a capability the object
+///     model offers, so asking for it is a caller error rather than a refusal
+///     to branch on. It is checked HERE, arch-free, because it is a KERNEL
+///     policy: which number the timer uses is the machine's business, that it
+///     is not for rent is not.
+///   - a line ALREADY BOUND. Two Interrupts on one line would be two objects
+///     with one `pending` between them and two acks for one fire, so the second
+///     bind is refused rather than serialized.
+///
+/// The line is UNMASKED on success, which is the initial state §9's cycle needs:
+/// mask-on-fire, ack-to-rearm, so something has to arm it first and creation is
+/// that something. The DEVICE's own interrupt-enable register is not touched —
+/// that is the driver's, through the window it was granted.
+func interrupt_bind(p: Int, line: UInt) unsafe -> SyscallResult {
+    if line == hal.IRQ_TIMER || not hal.irq_line_valid(line) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    if interrupt_by_line(line) != NO_INTERRUPT {
+        fault_process(p, FaultReason.LineBound)
+    }
+
+    let slot = alloc_interrupt()
+    if slot == NO_INTERRUPT {
+        return op_status(SosStatus.NoResource)
+    }
+    let handle = mint_handle(p, ObjType.Interrupt, interrupt_rights(), slot)
+    if handle == NO_HANDLE {
+        return op_status(SosStatus.NoResource)
+    }
+    INTERRUPTS[slot] = InterruptSlot(state: SlotState.Live, process: p,
+                                     line: line, pending: false, attachment: 0)
+    hal.irq_unmask(line)
+    op_value(handle)
+}
+
+/// Make a Waiter in process `slot` (spec §2.2).
+func waiter_create(p: Int) unsafe -> SyscallResult {
+    let slot = alloc_waiter()
+    if slot == NO_WAITER {
+        return op_status(SosStatus.NoResource)
+    }
+    let handle = mint_handle(p, ObjType.Waiter, waiter_rights(), slot)
+    if handle == NO_HANDLE {
+        return op_status(SosStatus.NoResource)
+    }
+    WAITERS[slot] = WaiterSlot(state: SlotState.Live, process: p, attached: 0,
+                               blocked: 0)
+    op_value(handle)
+}
+
+/// Make a thread in process `slot`, ready to be started.
+///
+/// The entry and the stack are CHECKED against the process's granted region.
+/// Both are caller-checkable — a process knows where its own image and its own
+/// stacks are — so a bad one terminates it rather than producing a thread that
+/// would fault on its first instruction and take the process down anyway, with
+/// a worse diagnostic.
+func thread_create(p: Int, entry: UInt, stack_top: UInt, arg: UInt) unsafe -> SyscallResult {
+    let start = if entry == ENTRY_IMAGE { PROCESSES[p].entry } else { entry }
+    if start < PROCESSES[p].region_base || start >= PROCESSES[p].region_top {
+        fault_process(p, FaultReason.BadEntry)
+    }
+    if stack_top <= PROCESSES[p].region_base || stack_top > PROCESSES[p].region_top {
+        fault_process(p, FaultReason.BadEntry)
+    }
+
+    let slot = alloc_thread()
+    if slot == NO_THREAD {
+        return op_status(SosStatus.NoResource)
+    }
+    let handle = mint_handle(p, ObjType.Thread, thread_rights(), slot)
+    if handle == NO_HANDLE {
+        return op_status(SosStatus.NoResource)
+    }
+
+    hal.frame_init(frame_slot(slot), start, stack_top, arg)
+    THREADS[slot] = ThreadSlot(state: ThreadState.Created, process: p,
+                               self_handle: handle, exit_code: 0,
+                               joiners: 0, link: 0, wait_buf: 0)
+    op_value(handle)
+}
+
+/// The Thread object's ops (§2, §8; design 178 D4).
+///
+/// `Exit` and `Yield` are ops a thread performs on ITSELF, so both check that
+/// the handle names the caller. That check is the faults ruling's `NotSelf`:
+/// driving another thread's execution is not something the object model offers,
+/// and a process that tries has misread its own handles.
+func thread_op(raw_op: UInt, obj: &ThreadObject, arg0: UInt) unsafe -> SyscallResult {
+    let p = calling_process()
+    guard let op = ThreadOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
+    return thread_op_decoded(op, &obj, arg0, p)
+}
+
+func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
+                       p: Int) unsafe -> SyscallResult {
+    let target = obj.slot
+
+    match op {
+        case Start -> {
+            if not obj.allows(ThreadRight.Start) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            match THREADS[target].state {
+                case Created -> {},
+                case _ -> fault_process(p, FaultReason.BadState),
+            }
+            THREADS[target].state = ThreadState.Runnable
+            ready_push(target)
+            op_ok()
+        },
+        case Join -> {
+            if not obj.allows(ThreadRight.Join) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            if target == CURRENT_THREAD {
+                fault_process(p, FaultReason.BadState)
+            }
+            match THREADS[target].state {
+                // Already gone: the answer is in the slot, so nothing parks.
+                case Exited -> op_value(THREADS[target].exit_code),
+                case Free -> fault_process(p, FaultReason.BadState),
+                case _ -> {
+                    block_on_join(CURRENT_THREAD, target)
+                    op_blocked()
+                },
+            }
+        },
+        case Exit -> {
+            if not obj.allows(ThreadRight.Control) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            if target != CURRENT_THREAD {
+                fault_process(p, FaultReason.NotSelf)
+            }
+            exit_thread(target, arg0)
+            // No pair is ever written: this thread does not resume.
+            op_blocked()
+        },
+        case Yield -> {
+            if not obj.allows(ThreadRight.Control) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            if target != CURRENT_THREAD {
+                fault_process(p, FaultReason.NotSelf)
+            }
+            // The yielder DOES resume, right after the trapping instruction, so
+            // its pair is written now; the requeue is `pick_next`'s, which is
+            // the one place a thread is put back on the ready queue.
+            NEED_RESCHED = true
+            op_ok()
+        },
+    }
+}
+
+/// The Event object's ops (spec §2.4; design 178 D5).
+func event_op(raw_op: UInt, obj: &EventObject, arg0: UInt) unsafe -> SyscallResult {
+    let p = calling_process()
+    guard let op = EventOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
+    return event_op_decoded(op, &obj, arg0, p)
+}
+
+func event_op_decoded(op: EventOp, obj: &EventObject, arg0: UInt,
+                      p: Int) unsafe -> SyscallResult {
+    let target = obj.slot
+
+    match op {
+        // NEVER BLOCKS and never fails (§2.4): whatever the word holds, more
+        // bits fit — the OR mode is idempotent and the sum saturates. That is
+        // what makes it the fire-and-forget primitive, and it is why there is
+        // no status here to branch on.
+        case Signal -> {
+            if not obj.allows(EventRight.Signal) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            signal_event(target, arg0)
+            op_ok()
+        },
+        // DRAINS AND RESETS, in one operation (§2.4) — THE NON-BLOCKING DOOR of
+        // the two a take can come through, and its semantics are exactly what
+        // they always were. Reading an empty event answers zero rather than
+        // parking: an Event is not a queue, and blocking is the Waiter's job.
+        // The blocking door is a `Waiter.wait` delivery, which consumes the same
+        // word the same way (`waitable_consume`); a process picks a door by
+        // whether it wants to park, never by what it will be told.
+        case Receive -> {
+            if not obj.allows(EventRight.Receive) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            let word = EVENTS[target].word
+            EVENTS[target].word = 0
+            op_value(word)
+        },
+    }
+}
+
+/// The Interrupt object's ops (spec §2 table, §9; design 178 D6).
+func interrupt_op(raw_op: UInt, obj: &InterruptObject) unsafe -> SyscallResult {
+    let p = calling_process()
+    guard let op = InterruptOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
+    return interrupt_op_decoded(op, &obj, p)
+}
+
+func interrupt_op_decoded(op: InterruptOp, obj: &InterruptObject,
+                          p: Int) unsafe -> SyscallResult {
+    let target = obj.slot
+
+    match op {
+        // §9's ACK: end this fire and let the device interrupt again.
+        //
+        // ACKING SOMETHING THAT HAS NOT FIRED IS A FAULT, and it is worth
+        // saying why that is caller-checkable rather than harsh. §9 puts at
+        // most one unacked fire per Interrupt, and the driver learns about that
+        // fire by being told — through a wait it made. So an ack with nothing
+        // pending is a driver that acked twice for one fire, or acked before it
+        // waited: in both cases the NEXT ack lands on a fire nobody serviced,
+        // which is a dropped byte or a wedged device somewhere downstream. A
+        // tolerated no-op here would turn that into a bug with no first
+        // symptom.
+        //
+        // THE UNMASK IS LAST, and the order is spec §9's release discipline
+        // read from the kernel's side: everything that touches this object's
+        // state happens before the line can fire again.
+        case Ack -> {
+            if not obj.allows(InterruptRight.Ack) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            if not INTERRUPTS[target].pending {
+                fault_process(p, FaultReason.BadState)
+            }
+            INTERRUPTS[target].pending = false
+            hal.irq_unmask(INTERRUPTS[target].line)
+            op_ok()
+        },
+    }
+}
+
+/// The record `Clock.Now` answers with, in kernel memory (design 232 unit 1).
+///
+/// Declaration order IS the layout (design 58), so the field here and the
+/// doubleword index `sosabi` publishes are one description — pinned by the
+/// assert below rather than by agreement.
+struct ClockNowRecord {
+    now_ns: UInt64,
+}
+
+static_assert(sizeof<ClockNowRecord>()
+              == CLOCK_NOW_RECORD_DOUBLEWORDS * sizeof<UInt64>(),
+              "the clock reading must be exactly the doublewords sosabi publishes")
+
+/// The record `Timer.Arm` READS out of the caller's memory. Same discipline,
+/// running the other way.
+struct TimerArmRecord {
+    after_ns: UInt64,
+    interval_ns: UInt64,
+}
+
+static_assert(sizeof<TimerArmRecord>()
+              == TIMER_ARM_RECORD_DOUBLEWORDS * sizeof<UInt64>(),
+              "the arm record must be exactly the doublewords sosabi publishes")
+
+/// The Clock object's ops (spec §2 table; design 232 unit 1).
+func clock_op(raw_op: UInt, obj: &ClockObject, arg0: UInt,
+              arg1: UInt) unsafe -> SyscallResult {
+    let p = calling_process()
+    guard let op = ClockOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
+    return clock_op_decoded(op, &obj, arg0, arg1, p)
+}
+
+func clock_op_decoded(op: ClockOp, obj: &ClockObject, arg0: UInt, arg1: UInt,
+                      p: Int) unsafe -> SyscallResult {
+    match op {
+        // THE ANSWER IS A RECORD, not the value register, because a nanosecond
+        // count is 64 bits and one of the two profiles has 32-bit registers.
+        // It rides the same copy-out door `Waiter.Wait`'s answer does — the
+        // door checks the buffer, so nothing here has to.
+        case Now -> {
+            if not obj.allows(ClockRight.Read) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            clock_now(p, obj.slot, arg0, arg1)
+        },
+        // The Timer BINDS THIS CLOCK at creation (the M3 time notes), which is
+        // why creation lives on the Clock rather than on the Process beside the
+        // other factory ops: the authority and the binding are one act, and a
+        // Timer made through a Process handle would have no domain to measure
+        // against.
+        case TimerCreate -> {
+            if not obj.allows(ClockRight.TimerCreate) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            timer_create(p, obj.slot)
+        },
+    }
+}
+
+/// Read clock `slot` into the caller's buffer.
+///
+/// THE DOMAIN DECIDES THE READING, which is why the slot is passed in rather
+/// than the reading being taken straight off the machine. Today there is one
+/// domain and it is the raw counter; the match is exhaustive, so a second
+/// `ClockType` fails to compile here until somebody says what its reading is —
+/// which is the one question adding a domain actually poses.
+func clock_now(p: Int, slot: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
+    // A capacity below the record's size is an argument outside its domain —
+    // the size is published, so the caller could have checked. `Waiter.Wait`'s
+    // rule, and the same diagnostic.
+    if cap < (clock_now_record_bytes() as UInt) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    let reading = match CLOCKS[slot].kind {
+        case Monotonic -> hal.timer_now_ns(),
+    }
+    var rec = ClockNowRecord(now_ns: reading)
+    copy_out(p, dst, ((&var rec) as UnsafePointer<ClockNowRecord>) as UInt,
+             clock_now_record_bytes() as UInt)
+    op_ok()
+}
+
+/// Make a Timer bound to clock `c` in process `p` (spec §2 table).
+func timer_create(p: Int, c: Int) unsafe -> SyscallResult {
+    let slot = alloc_timer()
+    if slot == NO_TIMER {
+        return op_status(SosStatus.NoResource)
+    }
+    let handle = mint_handle(p, ObjType.Timer, timer_rights(), slot)
+    if handle == NO_HANDLE {
+        return op_status(SosStatus.NoResource)
+    }
+    // Born DISARMED and owing nothing: a Timer is a schedule you have not
+    // written yet, so it is not ready, and attaching one to a Waiter before
+    // arming it parks rather than reporting.
+    TIMERS[slot] = TimerSlot(state: SlotState.Live, process: p, clock: c,
+                             armed: false, deadline_ns: 0, interval_ns: 0,
+                             fires: 0, attachment: 0)
+    op_value(handle)
+}
+
+/// The Timer object's ops (spec §2 table; design 232 unit 1).
+func timer_op(raw_op: UInt, obj: &TimerObject, arg0: UInt,
+              arg1: UInt) unsafe -> SyscallResult {
+    let p = calling_process()
+    guard let op = TimerOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
+    return timer_op_decoded(op, &obj, arg0, arg1, p)
+}
+
+func timer_op_decoded(op: TimerOp, obj: &TimerObject, arg0: UInt, arg1: UInt,
+                      p: Int) unsafe -> SyscallResult {
+    let target = obj.slot
+
+    match op {
+        // ONE RIGHT FOR BOTH, because they are one capability: the power to
+        // decide when this timer fires. See `TimerRight`.
+        case Arm -> {
+            if not obj.allows(TimerRight.Arm) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            timer_arm(p, target, arg0, arg1)
+        },
+        case Disarm -> {
+            if not obj.allows(TimerRight.Arm) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            timer_disarm(target)
+        },
+    }
+}
+
+/// §2's `arm(after, interval)`, taken through the COPY-IN door.
+///
+/// THE OP IS THE DOOR AND THE SCHEDULE IS THE SLOT'S: everything below this line
+/// is validating what a process handed over and turning a RELATIVE delay into an
+/// absolute deadline. `TimerSlot.arm` is what the schedule then means, including
+/// why re-arming an armed timer is legal.
+func timer_arm(p: Int, slot: Int, src: UInt, bytes: UInt) unsafe -> SyscallResult {
+    // The length is published, so a caller that got it wrong could have checked
+    // — `Waiter.Wait`'s capacity rule, running inward. EXACT rather than
+    // at-least: an inbound record is the whole of what the op was told, and a
+    // caller handing over more than the kernel reads has misunderstood the
+    // call rather than merely over-provisioned a buffer.
+    if bytes != (timer_arm_record_bytes() as UInt) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    var rec = TimerArmRecord(after_ns: 0, interval_ns: 0)
+    copy_in(p, ((&var rec) as UnsafePointer<TimerArmRecord>) as UInt, src, bytes)
+
+    let now = hal.timer_now_ns()
+    // Saturating, because `now + after` is arithmetic on a number the PROCESS
+    // chose and Saw's overflow checks are on in the kernel. A deadline that
+    // would land past the end of time IS the end of time, which is a schedule
+    // nothing will ever see fire — the honest answer, and not a panic.
+    let deadline = if rec.after_ns > NEVER_NS - now { NEVER_NS } else { now + rec.after_ns }
+
+    TIMERS[slot].arm(deadline, rec.interval_ns)
+    reprogram_timer()
+    op_ok()
+}
+
+/// §2's `disarm()`: this timer is off and owes nothing.
+///
+/// **DISARMING AN UNARMED TIMER IS A NO-OP, NOT A FAULT** (pinned here, design
+/// 232 unit 1), and it is worth saying why that is the opposite call from §9's
+/// ack-with-no-fire. An extra ACK is provably a bug: the only way to learn about
+/// a fire is to be TOLD about one, so the caller had the information. A disarm's
+/// precondition is not like that — a ONE-SHOT DISARMS ITSELF when it fires, so
+/// "is it still armed" is kernel state that changed without the caller acting.
+/// Cancelling a timeout that has just expired is the ordinary race at the heart
+/// of every select-with-timeout, and faulting it would make the safe idiom
+/// unwritable.
+///
+/// It clears the FIRE COUNT as well as the schedule, which is what makes it a
+/// clean cancel: a caller who wants the fires reads them with a wait first.
+func timer_disarm(slot: Int) unsafe -> SyscallResult {
+    TIMERS[slot].disarm()
+    reprogram_timer()
+    op_ok()
+}
+
+/// Resolve `handle` as something this caller may ATTACH TO A WAITER, or
+/// terminate the process.
+///
+/// THE ONE PLACE WAITABILITY IS DECIDED, and it decides the rights check with
+/// it — because they are one question. Whether a handle may be attached depends
+/// on its KIND, and which enum a rights word is read against depends on the
+/// kind too (§3), so a separate `is_waitable` predicate would have to be joined
+/// back to a per-kind rights check at every call site. Here the match that
+/// establishes the kind is the match that spends the right.
+///
+/// Every case is spelled out rather than falling through a `_`, which is what
+/// makes the next waitable kind — a Channel, a Timer, an Interrupt (§2.2), a
+/// Thread or a Process (§8) — fail to compile until somebody answers for it.
+func waitable_slot(p: Int, handle: UInt) unsafe -> Waitable {
+    let entry = lookup_handle(p, handle)
+    match entry.obj_type {
+        case Event -> {
+            let ev = EventObject(handle: EventHandle(handle),
+                                 rights: entry.rights, slot: entry.target)
+            if not ev.allows(EventRight.Wait) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            Waitable(kind: WaitableKind.Event, slot: entry.target)
+        },
+        // The second waitable kind, and the one the object model was built for:
+        // §2.2 lists Interrupt among the waitables and §9's whole delivery
+        // model is a driver parked on one. The right it spends is
+        // `InterruptRight.Wait`, which is a different enum from the Event arm's
+        // and is exactly why waitability and the rights check are one question.
+        case Interrupt -> {
+            let irq = InterruptObject(handle: InterruptHandle(handle),
+                                      rights: entry.rights, slot: entry.target)
+            if not irq.allows(InterruptRight.Wait) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            Waitable(kind: WaitableKind.Interrupt, slot: entry.target)
+        },
+        // The THIRD waitable kind (design 232 unit 1), and it cost this
+        // function one arm and the matrix above one column — which is what the
+        // M2 finale's refactor was for. The right it spends is `TimerRight.Wait`,
+        // a third enum again, which is why waitability and the rights check stay
+        // one question.
+        case Timer -> {
+            let t = TimerObject(handle: TimerHandle(handle),
+                                rights: entry.rights, slot: entry.target)
+            if not t.allows(TimerRight.Wait) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            Waitable(kind: WaitableKind.Timer, slot: entry.target)
+        },
+        case Unbound -> fault_process(p, FaultReason.BadHandle),
+        case System -> fault_process(p, FaultReason.NotWaitable),
+        case Process -> fault_process(p, FaultReason.NotWaitable),
+        case Thread -> fault_process(p, FaultReason.NotWaitable),
+        case Waiter -> fault_process(p, FaultReason.NotWaitable),
+        // A CLOCK IS NOT WAITABLE, and the arm is worth its line: a clock is
+        // always running, so "ready" would either be permanently true or
+        // meaningless. Waiting for a TIME is what the Timer it creates is for.
+        case Clock -> fault_process(p, FaultReason.NotWaitable),
+    }
+}
+
+/// The Waiter object's ops (spec §2.2; design 178 D5).
+func waiter_op(raw_op: UInt, obj: &WaiterObject, arg0: UInt,
+               arg1: UInt) unsafe -> SyscallResult {
+    let p = calling_process()
+    guard let op = WaiterOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
+    return waiter_op_decoded(op, &obj, arg0, arg1, p)
+}
+
+func waiter_op_decoded(op: WaiterOp, obj: &WaiterObject, arg0: UInt, arg1: UInt,
+                       p: Int) unsafe -> SyscallResult {
+    let w = obj.slot
+
+    match op {
+        case Add -> {
+            if not obj.allows(WaiterRight.Attach) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            waiter_add(p, w, arg0, arg1)
+        },
+        case Remove -> {
+            if not obj.allows(WaiterRight.Attach) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            waiter_remove(p, w, arg0)
+        },
+        case Wait -> {
+            if not obj.allows(WaiterRight.Wait) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            waiter_wait(p, w, arg0, arg1)
+        },
+    }
+}
+
+/// §2.2's `add(handle, key)`: a PERSISTENT attachment, at most one Waiter per
+/// handle.
+///
+/// Attaching something already attached TERMINATES the process. It is the
+/// ratified one-Waiter rule, and it is caller-checkable in the strongest sense
+/// — the process is the only thing that attaches anything, so it knows.
+func waiter_add(p: Int, w: Int, handle: UInt, key: UInt) unsafe -> SyscallResult {
+    let target = waitable_slot(p, handle)
+    if waitable_attachment(target.kind, target.slot) != 0 {
+        fault_process(p, FaultReason.BadState)
+    }
+    // KEYS ARE UNIQUE PER WAITER (ruled Aug 16). A duplicate would make two
+    // questions ambiguous at once — which attachment a `Remove` names, and
+    // which one an answer came from — and the attacher chose both keys, so it
+    // is caller-checkable in the strongest sense.
+    if attached_by_key(w, key) != NO_ATTACHMENT {
+        fault_process(p, FaultReason.DuplicateKey)
+    }
+
+    let a = alloc_attachment()
+    if a == NO_ATTACHMENT {
+        return op_status(SosStatus.NoResource)
+    }
+    ATTACHMENTS[a] = Attachment(state: SlotState.Live, kind: target.kind,
+                                target: target.slot, waiter: w, key: key,
+                                link: WAITERS[w].attached)
+    WAITERS[w].attached = a + 1
+    set_waitable_attachment(target.kind, target.slot, a + 1)
+
+    // LEVEL-TRIGGERED, at the attach (§2.2). A waitable that is already ready
+    // when it joins the set is ready NOW, and a thread parked on this Waiter
+    // has to learn about it — otherwise the order "signal, then attach, then
+    // wait" would lose the notification, which is the exact lost-edge this
+    // semantics exists to rule out. It covers an Interrupt that fired before
+    // anyone attached, which is the ordering a driver hits at bring-up.
+    if waitable_ready(target.kind, target.slot) {
+        wake_one_waiter(w, a)
+    }
+    op_ok()
+}
+
+/// §2.2's `remove(key)`. Removing a key this Waiter does not use is a caller
+/// error, on the same terms as attaching twice.
+///
+/// IT NAMES THE ATTACHMENT BY KEY AND NEVER TOUCHES THE WAITABLE (ruled Aug 16,
+/// user), which is why no handle is resolved here and no right on the waitable
+/// is spent: detaching edits this Waiter's own table, so the Waiter handle
+/// already validated by the dispatch plus the key is the whole of the authority
+/// the operation needs. It is also the only form that survives M3: once handles
+/// can be CLOSED, a closed waitable's stale attachment has no handle left to
+/// name it with, and a handle-based remove could not reach it at all.
+func waiter_remove(p: Int, w: Int, key: UInt) unsafe -> SyscallResult {
+    let a = attached_by_key(w, key)
+    if a == NO_ATTACHMENT {
+        fault_process(p, FaultReason.BadState)
+    }
+    detach_attachment(w, a)
+    op_ok()
+}
+
+/// §2.2's `wait(buffer, capacity)`: block until an attached handle is ready,
+/// then COPY OUT a record naming the key its attacher supplied and what fired.
+///
+/// THE ANSWER IS A RECORD IN THE CALLER'S MEMORY, not registers, and the buffer
+/// is the caller's because the kernel has no allocator and no place to put one
+/// that would outlive the call. The status register still says how the call
+/// went; the record says what happened.
+///
+/// THE BUFFER IS VALIDATED HERE, ON THE CALL, even on the path that parks and
+/// will not use it for a while. That is deliberate: a bad buffer is the calling
+/// process's mistake, and terminating it while it is the RUNNING process is
+/// both a better diagnostic and a simpler thing to reason about than faulting
+/// it out of some later thread's wake.
+///
+/// THE SCAN COMES FIRST, and that ordering is the level-triggered guarantee
+/// doing its work: a signal that arrived before this call is still in the word,
+/// so the wait returns immediately and nothing was lost. Only an empty set
+/// parks.
+func waiter_wait(p: Int, w: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
+    // A capacity below the record's size is an argument outside its domain —
+    // the size is published, so the caller could have checked.
+    if cap < (wait_record_bytes() as UInt) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    copy_out_check(p, dst, wait_record_bytes() as UInt)
+
+    let ready = waiter_ready_attachment(w)
+    if ready != NO_ATTACHMENT {
+        deliver_attachment(p, dst, ready)
+        return op_ok()
+    }
+    if CURRENT_THREAD == NO_THREAD {
+        fault_process(p, FaultReason.BadState)
+    }
+    block_on_wait(CURRENT_THREAD, w, dst)
+    op_blocked()
+}
+
+/// Handle-table lookup -> object type -> op table -> rights check -> op.
+///
+/// This is where a raw word becomes a TYPED handle (§3), and the order is the
+/// point: the number arrives from a register, the table says what it names, and
+/// only then is a `SystemHandle` / `ProcessHandle` / `ThreadHandle` constructed.
+/// Below this line the kernel is no longer handling an integer a process chose —
+/// it is handling an object it resolved, paired with the rights that came with
+/// it and the slot it names.
+///
+/// AN UNBOUND HANDLE TERMINATES THE PROCESS, and it has to be decided here
+/// rather than per kind: a handle that names nothing names no kind either, so
+/// there is no op table to ask. That is the faults ruling's shape as much as its
+/// content — the three caller errors it covers are exactly the three the
+/// dispatch can raise before an op body runs.
+func dispatch(handle: UInt, op: UInt,
+              arg0: UInt, arg1: UInt, arg2: UInt) unsafe -> SyscallResult {
+    let p = calling_process()
+    let entry = lookup_handle(p, handle)
+    match entry.obj_type {
+        case Unbound -> fault_process(p, FaultReason.BadHandle),
+        case System -> {
+            let obj = SystemObject(handle: SystemHandle(handle),
+                                   rights: entry.rights)
+            system_op(op, &obj, arg0)
+        },
+        case Process -> {
+            let obj = ProcessObject(handle: ProcessHandle(handle),
+                                    rights: entry.rights, slot: entry.target)
+            process_op(op, &obj, arg0, arg1, arg2)
+        },
+        case Thread -> {
+            let obj = ThreadObject(handle: ThreadHandle(handle),
+                                   rights: entry.rights, slot: entry.target)
+            thread_op(op, &obj, arg0)
+        },
+        case Event -> {
+            let obj = EventObject(handle: EventHandle(handle),
+                                  rights: entry.rights, slot: entry.target)
+            event_op(op, &obj, arg0)
+        },
+        case Waiter -> {
+            let obj = WaiterObject(handle: WaiterHandle(handle),
+                                   rights: entry.rights, slot: entry.target)
+            waiter_op(op, &obj, arg0, arg1)
+        },
+        case Interrupt -> {
+            let obj = InterruptObject(handle: InterruptHandle(handle),
+                                      rights: entry.rights, slot: entry.target)
+            interrupt_op(op, &obj)
+        },
+        case Clock -> {
+            let obj = ClockObject(handle: ClockHandle(handle),
+                                  rights: entry.rights, slot: entry.target)
+            clock_op(op, &obj, arg0, arg1)
+        },
+        case Timer -> {
+            let obj = TimerObject(handle: TimerHandle(handle),
+                                  rights: entry.rights, slot: entry.target)
+            timer_op(op, &obj, arg0, arg1)
+        },
+    }
+}
+
+// =============================================================================
+// The trap handler
+// =============================================================================
+
+/// The HAL's landing point for every trap taken from user mode. `frame_addr`
+/// addresses the saved context, which this handler may rewrite: a returning
+/// syscall leaves its (status, value) pair where the caller reads them and
+/// resumes past the trapping instruction — both through the HAL, because both
+/// are register conventions.
+///
+/// IT RETURNS THE FRAME TO RESUME, and that return value is the whole of the
+/// context switch (design 178 D2/D3). Handing back the frame it was called with
+/// resumes the interrupted thread; handing back another thread's frame resumes
+/// THAT one, and the HAL's trap entry cannot tell the difference because there
+/// is none to tell. So a switch has one location, it is the user-return
+/// boundary by construction, and the kernel is never half-way through one.
+///
+/// THREE KINDS OF TRAP, and the order below is what tells them apart. An
+/// INTERRUPT is not the running program's business at all — it is serviced and
+/// the interrupted instruction resumes untouched, which is why it is decided
+/// first and why it never reaches the syscall return path (that path steps the
+/// saved PC, and stepping past an instruction that has not run yet would lose
+/// it). A FAULT is fatal — spec §8 makes a thread fault kill its process. A bad
+/// SYSCALL is fatal TOO since design 178's faults ruling: an unknown handle, an
+/// unknown op or a missing right is a mistake the caller could have checked, so
+/// it ends the process rather than handing back a word to branch on. What is
+/// left as a STATUS is what the caller could not have known — a full slab, and
+/// later a dead peer.
+@export("ktrap")
+public func ktrap(frame_addr: UInt, cause: UInt, tval: UInt) unsafe -> UInt {
+    if hal.is_interrupt(cause) {
+        service_irq(frame_addr, cause)
+        return pick_next(frame_addr)
+    }
+
+    if not hal.is_syscall(cause) {
+        fault_trap(hal.cause_tag(cause), cause, hal.trap_pc(frame_addr), tval)
+    }
+
+    let result = dispatch(hal.syscall_handle(frame_addr),
+                          hal.syscall_op(frame_addr),
+                          hal.syscall_arg0(frame_addr),
+                          hal.syscall_arg1(frame_addr),
+                          hal.syscall_arg2(frame_addr))
+
+    // THE SYSCALL BOUNDARY: the one place the typed status becomes the number
+    // the ABI specifies. `as` on a backed enum is total — the enum IS its tag —
+    // so there is nothing here that can fail or disagree with `sosabi`'s table.
+    //
+    // A BLOCKED CALLER IS SKIPPED. Its pair belongs to whatever wakes it, and
+    // writing one here would both answer a question nobody has asked yet and,
+    // on the profile whose saved PC points AT the trapping instruction, step
+    // that PC a second time when the wake wrote the real pair.
+    if not result.blocked {
+        write_result(frame_addr, result)
+    }
+    pick_next(frame_addr)
+}
+
+static BYTE_MASK: UInt = 0xFF
