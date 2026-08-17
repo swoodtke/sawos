@@ -1,0 +1,150 @@
+//! THE CONSOLE, AND THE WAYS A RUN ENDS BADLY.
+//!
+//! The formatting half of a diagnostic (a string one scalar at a time, a
+//! machine word as fixed-width hex) plus the two reports that stop the machine:
+//! `fatal` for a trap the kernel cannot survive and `fatal_image` for a root
+//! image it refuses to boot.
+//!
+//! IT CALLS NOTHING IN THE KERNEL, which is what lets every other seam report.
+//! The reports that TEAR A PROCESS DOWN are not here — they own kernel state and
+//! live in `process` — and the difference is exactly whether there is anything
+//! left to clean up.
+
+import hal
+import sosrt.{ascii_byte, hex_digit_of, hex_digits_per_word}
+
+/// The kernel's console: the arch-free half of writing a diagnostic.
+///
+/// It formats — a string one scalar at a time, a machine word as fixed-width
+/// hex — and hands each byte to the HAL, which knows what device it is. The
+/// split is deliberate: `write_hex` is the same code on every target, and the
+/// only thing that ever differs is where the byte lands.
+///
+/// # THE UART HANDOVER PROTOCOL (ruled Aug 16, user — design 178's finale)
+///
+/// Both machines have ONE console UART and both the kernel and a driver process
+/// can drive it. Unstated, that is a flaky-test mystery: two writers on one
+/// device interleave mid-word and nothing in either is wrong.
+///
+/// So the ownership is stated, and it has three phases:
+///
+///   1. **Boot.** The kernel owns the device outright. It narrates the banner,
+///      the image, and anything that goes wrong.
+///   2. **Handover.** `start_process` writes ONE marker line — `SOS: console
+///      handover` — as the last thing the kernel says on its own initiative.
+///      After it, THE PROCESS OWNS THE DEVICE.
+///   3. **Reclaim, on diagnostics only.** The kernel writes again exactly where
+///      the run has already failed or ended: a fault report, a process
+///      teardown, a panic, or an interrupt on a line nothing is bound to. The
+///      interleaving those may cause is acceptable because there is no longer a
+///      transcript to protect.
+///
+/// WHAT THE KERNEL STILL WRITES ON DEMAND is not a violation of this: a
+/// `SystemOp.DebugPrint` is the PROCESS asking the kernel to place a byte, and
+/// the process is the one sequencing it. What the protocol forbids is the
+/// kernel narrating over a process that is using the device.
+///
+/// A KERNEL THAT ARMS A TIMER is the one exception worth knowing, and it is
+/// bounded: `TICK_REPORT_LIMIT` ticks are narrated after handover before the
+/// tick path goes quiet. That is why the preemption case does not assert its
+/// root's banner, and why a case whose transcript matters after handover arms
+/// no timer.
+///
+/// The DEVICE half of this — which registers, and what a second writer does to
+/// them — is stated in each HAL's console section.
+public struct Console {
+    /// A console is a capability to write, not a device handle: the HAL owns
+    /// the device. The field exists because a zero-field struct has no reason
+    /// to exist either — it records which sink the writes go to, and today
+    /// there is one.
+    sink: UInt8,
+}
+
+public extension Console {
+    /// Write one byte.
+    public func write_byte(&self, b: UInt8) {
+        hal.console_byte(b)
+    }
+
+    /// Write an ASCII string, byte by byte. The scalar-to-byte rule is
+    /// `sosrt`'s, so the kernel console and a process console agree on what a
+    /// non-ASCII scalar becomes.
+    public func write_str(&self, msg: String) {
+        for scalar in msg.chars() {
+            hal.console_byte(ascii_byte(scalar))
+        }
+    }
+
+    /// Write a machine word as `0x` + one hex digit per nibble. No allocation,
+    /// no formatting machinery — the kernel has neither an allocator worth
+    /// spending nor a reason to build a string.
+    ///
+    /// The WIDTH is the target's word, not a constant: eight digits on a
+    /// 32-bit profile and sixteen on a 64-bit one. A fixed eight would print
+    /// the low half of a 64-bit address and look like a complete answer.
+    public func write_hex(&self, v: UInt) {
+        self.write_str("0x")
+        let digits = hex_digits_per_word()
+        var n = 0
+        while n < digits {
+            hal.console_byte(hex_digit_of(v, n))
+            n = n + 1
+        }
+    }
+}
+
+/// A console for this board. Constructing one costs nothing; a true `static`
+/// singleton waits on Once/Lazy (tracker F5).
+public func console() -> Console {
+    Console(sink: 0)
+}
+
+/// Exit codes the kernel reports through the platform's failure channel,
+/// distinct from any status root chooses for itself.
+///
+/// A type rather than a family of `UInt`s so `fatal` cannot be handed an
+/// arbitrary number: the kernel's own failure vocabulary is closed, and the
+/// harness asserts on these values.
+/// 3 is deliberately absent. It was `BadSyscall`, from when a bad op number
+/// killed the process; under the object-op model a caller's mistake became a
+/// status the process received and survived — and design 178's faults ruling
+/// has since made it a kill again, under `ProcessFault`. The values are
+/// per-case, so a gap costs nothing and a reused number would have made two
+/// eras' transcripts read alike.
+public enum ExitCode: UInt {
+    case UmodeFault = 2,
+    case BadImage = 4,
+    case ProcessFault = 5,
+}
+
+// =============================================================================
+// Fault reporting
+// =============================================================================
+
+/// Report a fatal condition on the console and FAIL the run. Never returns —
+/// M0's discipline, carried into the user-mode split: a fault is diagnosed and
+/// the machine stops non-zero, never a hang.
+public func fatal(tag: String, cause: UInt, epc: UInt, tval: UInt, code: ExitCode) {
+    let uart = console()
+    uart.write_str("SOS: fault ")
+    uart.write_str(tag)
+    uart.write_str(" cause=")
+    uart.write_hex(cause)
+    uart.write_str(" epc=")
+    uart.write_hex(epc)
+    uart.write_str(" tval=")
+    uart.write_hex(tval)
+    uart.write_str("\n")
+    hal.exit_fail(code as UInt)
+}
+
+/// Reject the root image. Never returns.
+public func fatal_image(reason: String, detail: UInt) {
+    let uart = console()
+    uart.write_str("SOS: bad root image: ")
+    uart.write_str(reason)
+    uart.write_str(" (")
+    uart.write_hex(detail)
+    uart.write_str(")\n")
+    hal.exit_fail(ExitCode.BadImage as UInt)
+}

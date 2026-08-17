@@ -1,0 +1,68 @@
+//! A SYSCALL'S ANSWER: the (status, value) pair, the third answer `blocked`,
+//! and the ONE place any of them is written into a thread's frame.
+//!
+//! Its own module because its writers sit in three different seams — the return
+//! path (`dispatch`), a thread's exit (`sched`) and a waiter's wake (`wake`) —
+//! which is the funnel `write_result` documents. A seam that can answer a
+//! syscall imports this one; nothing here imports anything.
+
+import hal
+import sosabi.{SosStatus}
+
+/// What one op did: a (status, value) pair for the caller, or the news that the
+/// caller is not going to receive one YET.
+///
+/// `blocked` is the third answer a syscall can give and it is not a failure. A
+/// thread that parks in `Join` has made no mistake and gets no status; its pair
+/// is written into its frame by whatever wakes it, exactly once. Modelling that
+/// as a field rather than as a magic status is what keeps the return path from
+/// having to know which ops can park.
+public struct SyscallResult {
+    status: SosStatus,
+    value: UInt,
+    /// Read by `ktrap` to decide whether to answer at all, which is the one
+    /// field of the three a caller of this module has any business seeing —
+    /// the pair itself is written by `write_result` and nowhere else.
+    public blocked: Bool,
+}
+
+public func op_ok() -> SyscallResult {
+    SyscallResult(status: SosStatus.Ok, value: 0, blocked: false)
+}
+
+public func op_value(v: UInt) -> SyscallResult {
+    SyscallResult(status: SosStatus.Ok, value: v, blocked: false)
+}
+
+public func op_status(s: SosStatus) -> SyscallResult {
+    SyscallResult(status: s, value: 0, blocked: false)
+}
+
+public func op_blocked() -> SyscallResult {
+    SyscallResult(status: SosStatus.Ok, value: 0, blocked: true)
+}
+
+/// THE ONE PLACE a syscall's answer is written into a thread's frame.
+///
+/// A funnel rather than a rule repeated per caller, because the writers are not
+/// all on the return path: an op that PARKS is answered later, by whatever wakes
+/// it, and "later" is a different function each time. Its ENTRY POINTS, all of
+/// them:
+///
+///   - `ktrap`, for an op that answered immediately;
+///   - `exit_thread`, waking everything that joined the thread that just left;
+///   - `wake_one_waiter`, handing a ready attachment to a parked waiter (§2.2).
+///
+/// Each writes EXACTLY ONCE for one syscall, which is the invariant the whole
+/// blocking protocol rests on: a blocked caller is skipped on the return path
+/// precisely so that its waker is the only writer, and a second write would
+/// step the saved PC twice on the profile that steps it at all.
+///
+/// It answers with a (status, value) pair and nothing wider. An op whose answer
+/// does not fit — `Waiter.Wait`'s record is the first — writes the rest into the
+/// caller's own memory through `copy_out` and returns a status here, which is
+/// what keeps the register convention (§5.7) the same shape it was in M1.
+public func write_result(frame_addr: UInt, result: SyscallResult) unsafe {
+    hal.syscall_return(frame_addr, (result.status as UInt8) as UInt,
+                       result.value)
+}

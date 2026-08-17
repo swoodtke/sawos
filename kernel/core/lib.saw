@@ -47,94 +47,15 @@ import sosabi.{
     ROOT_SYSTEM_HANDLE, NO_HANDLE, ENTRY_IMAGE,
 }
 
-// =============================================================================
-// The console
-// =============================================================================
-
-/// The kernel's console: the arch-free half of writing a diagnostic.
-///
-/// It formats — a string one scalar at a time, a machine word as fixed-width
-/// hex — and hands each byte to the HAL, which knows what device it is. The
-/// split is deliberate: `write_hex` is the same code on every target, and the
-/// only thing that ever differs is where the byte lands.
-///
-/// # THE UART HANDOVER PROTOCOL (ruled Aug 16, user — design 178's finale)
-///
-/// Both machines have ONE console UART and both the kernel and a driver process
-/// can drive it. Unstated, that is a flaky-test mystery: two writers on one
-/// device interleave mid-word and nothing in either is wrong.
-///
-/// So the ownership is stated, and it has three phases:
-///
-///   1. **Boot.** The kernel owns the device outright. It narrates the banner,
-///      the image, and anything that goes wrong.
-///   2. **Handover.** `start_process` writes ONE marker line — `SOS: console
-///      handover` — as the last thing the kernel says on its own initiative.
-///      After it, THE PROCESS OWNS THE DEVICE.
-///   3. **Reclaim, on diagnostics only.** The kernel writes again exactly where
-///      the run has already failed or ended: a fault report, a process
-///      teardown, a panic, or an interrupt on a line nothing is bound to. The
-///      interleaving those may cause is acceptable because there is no longer a
-///      transcript to protect.
-///
-/// WHAT THE KERNEL STILL WRITES ON DEMAND is not a violation of this: a
-/// `SystemOp.DebugPrint` is the PROCESS asking the kernel to place a byte, and
-/// the process is the one sequencing it. What the protocol forbids is the
-/// kernel narrating over a process that is using the device.
-///
-/// A KERNEL THAT ARMS A TIMER is the one exception worth knowing, and it is
-/// bounded: `TICK_REPORT_LIMIT` ticks are narrated after handover before the
-/// tick path goes quiet. That is why the preemption case does not assert its
-/// root's banner, and why a case whose transcript matters after handover arms
-/// no timer.
-///
-/// The DEVICE half of this — which registers, and what a second writer does to
-/// them — is stated in each HAL's console section.
-public struct Console {
-    /// A console is a capability to write, not a device handle: the HAL owns
-    /// the device. The field exists because a zero-field struct has no reason
-    /// to exist either — it records which sink the writes go to, and today
-    /// there is one.
-    sink: UInt8,
-}
-
-public extension Console {
-    /// Write one byte.
-    public func write_byte(&self, b: UInt8) {
-        hal.console_byte(b)
-    }
-
-    /// Write an ASCII string, byte by byte. The scalar-to-byte rule is
-    /// `sosrt`'s, so the kernel console and a process console agree on what a
-    /// non-ASCII scalar becomes.
-    public func write_str(&self, msg: String) {
-        for scalar in msg.chars() {
-            hal.console_byte(ascii_byte(scalar))
-        }
-    }
-
-    /// Write a machine word as `0x` + one hex digit per nibble. No allocation,
-    /// no formatting machinery — the kernel has neither an allocator worth
-    /// spending nor a reason to build a string.
-    ///
-    /// The WIDTH is the target's word, not a constant: eight digits on a
-    /// 32-bit profile and sixteen on a 64-bit one. A fixed eight would print
-    /// the low half of a 64-bit address and look like a complete answer.
-    public func write_hex(&self, v: UInt) {
-        self.write_str("0x")
-        let digits = hex_digits_per_word()
-        var n = 0
-        while n < digits {
-            hal.console_byte(hex_digit_of(v, n))
-            n = n + 1
-        }
-    }
-}
-
-/// A console for this board. Constructing one costs nothing; a true `static`
-/// singleton waits on Once/Lazy (tracker F5).
-public func console() -> Console {
-    Console(sink: 0)
+public import kcore.mem.{align_up, copy_bytes, word_bytes, zero_bytes}
+public import kcore.diag.{Console, ExitCode, console, fatal, fatal_image}
+import kcore.result.{
+    SyscallResult,
+    op_blocked,
+    op_ok,
+    op_status,
+    op_value,
+    write_result,
 }
 
 // =============================================================================
@@ -302,38 +223,6 @@ extension TimerObject {
     }
 }
 
-/// Exit codes the kernel reports through the platform's failure channel,
-/// distinct from any status root chooses for itself.
-///
-/// A type rather than a family of `UInt`s so `fatal` cannot be handed an
-/// arbitrary number: the kernel's own failure vocabulary is closed, and the
-/// harness asserts on these values.
-/// 3 is deliberately absent. It was `BadSyscall`, from when a bad op number
-/// killed the process; under the object-op model a caller's mistake became a
-/// status the process received and survived — and design 178's faults ruling
-/// has since made it a kill again, under `ProcessFault`. The values are
-/// per-case, so a gap costs nothing and a reused number would have made two
-/// eras' transcripts read alike.
-public enum ExitCode: UInt {
-    case UmodeFault = 2,
-    case BadImage = 4,
-    case ProcessFault = 5,
-}
-
-// =============================================================================
-// Arithmetic the loader needs
-// =============================================================================
-
-/// Round `v` up to the next multiple of `align` (a power of two).
-public func align_up(v: UInt, align: UInt) -> UInt {
-    let rem = v & (align - 1)
-    if rem == 0 {
-        v
-    } else {
-        v + (align - rem)
-    }
-}
-
 // =============================================================================
 // Processes, threads and the scheduler (design 178 D2/D3/D4; spec §2, §7, §8)
 // =============================================================================
@@ -370,17 +259,21 @@ public func align_up(v: UInt, align: UInt) -> UInt {
 /// assumed throughout so that raising this number is the only edit.
 static MAX_PROCESSES: Int = 1
 
+
 /// Threads the kernel can hold, across all processes.
 static MAX_THREADS: Int = 8
 
+
 /// Events the kernel can hold, across all processes (spec §2.4).
 static MAX_EVENTS: Int = 8
+
 
 /// Waiters the kernel can hold, across all processes (spec §2.2). Fewer than
 /// events on purpose: a Waiter is a DISPATCH POINT, and the shape §2.2 ratifies
 /// — many handles per Waiter, many threads per Waiter — is one per pool of
 /// workers rather than one per notification.
 static MAX_WAITERS: Int = 4
+
 
 /// Interrupts the kernel can hold, across all processes (spec §2 table, §9).
 ///
@@ -389,6 +282,7 @@ static MAX_WAITERS: Int = 4
 /// notifications. Every one costs a masked/unmasked line in the controller,
 /// which is a real resource the board fixes.
 static MAX_INTERRUPTS: Int = 4
+
 
 /// Clock objects in the system (spec §2 table; design 232 unit 1, amended
 /// Aug 17).
@@ -406,6 +300,7 @@ static MAX_INTERRUPTS: Int = 4
 /// two different kinds of thing in one table for the sake of a name they share.
 static CLOCK_KINDS: Int = 1
 
+
 /// Timers the kernel can hold, across all processes (spec §2 table; design 232
 /// unit 1).
 ///
@@ -414,6 +309,7 @@ static CLOCK_KINDS: Int = 1
 /// the shape M4's select-with-timeout makes is one Timer beside each thing
 /// being waited on.
 static MAX_TIMERS: Int = 8
+
 
 /// Attachments the kernel can hold, across all Waiters.
 ///
@@ -424,8 +320,10 @@ static MAX_TIMERS: Int = 8
 /// Clock does NOT, because a Clock is not waitable.
 static MAX_ATTACHMENTS: Int = MAX_EVENTS + MAX_INTERRUPTS + MAX_TIMERS
 
+
 /// Handles one process's table can hold (§3).
 static MAX_HANDLES: Int = 16
+
 
 /// Bytes reserved per thread for its saved context.
 ///
@@ -437,8 +335,10 @@ static MAX_HANDLES: Int = 16
 /// kernel having to know that is why.
 static THREAD_FRAME_STRIDE: Int = 512
 
+
 static_assert(hal.FRAME_BYTES <= THREAD_FRAME_STRIDE,
               "this machine's trap frame does not fit the kernel's per-thread stride")
+
 static_assert(THREAD_FRAME_STRIDE % 16 == 0,
               "a frame slot must be 16-byte aligned on every profile")
 
@@ -446,12 +346,14 @@ static_assert(THREAD_FRAME_STRIDE % 16 == 0,
 /// cannot run the last slot past the end.
 static FRAME_ARENA_WORDS: Int = (THREAD_FRAME_STRIDE / 8) * (MAX_THREADS + 1)
 
+
 /// Every thread's saved context, back to back.
 ///
 /// All-zero, so it costs no image bytes (design 149) — and a zeroed frame is
 /// also the right initial state, since `frame_init` only has to write the three
 /// or four words that are not zero.
 unsafe static var THREAD_FRAMES: [UInt64; FRAME_ARENA_WORDS] = [0; FRAME_ARENA_WORDS]
+
 
 /// The address of thread slot `index`'s frame.
 func frame_slot(index: Int) unsafe -> UInt {
@@ -820,14 +722,18 @@ unsafe static var TIMERS: [TimerSlot; MAX_TIMERS] = [
 /// PLUS-ONE inside list links; this is the sentinel for the plain form.
 static NO_THREAD: Int = -1
 
+
 /// The same sentinel for the other tables. There is none for CLOCKS: every
 /// domain's slot exists from boot, so "no clock" is not a state the kernel can
 /// be in.
 static NO_EVENT: Int = -1
 static NO_WAITER: Int = -1
+
 static NO_INTERRUPT: Int = -1
 static NO_ATTACHMENT: Int = -1
+
 static NO_TIMER: Int = -1
+
 
 /// The running thread's slot, or `NO_THREAD`.
 ///
@@ -839,6 +745,7 @@ static NO_TIMER: Int = -1
 /// trap path and nothing can interleave with it.
 unsafe static var CURRENT_THREAD: Int = NO_THREAD
 
+
 /// The ready queue: a FIFO of runnable threads, head and tail as slot + 1.
 /// The RUNNING thread is not on it — round-robin is "put the outgoing thread
 /// at the tail, take the head", and both halves happen in `pick_next`.
@@ -849,14 +756,17 @@ unsafe static var READY_TAIL: Int = 0
 /// cleared at the user-return boundary, which is the only place it can act.
 unsafe static var NEED_RESCHED: Bool = false
 
+
 /// Ticks left in the running thread's slice.
 unsafe static var SLICE_LEFT: UInt = 0
+
 
 /// Ticks a thread runs before the timer takes the processor away (spec §7's
 /// fixed timeslice). ONE tick, because M2's tick period is already the unit the
 /// scheduler cares about and a longer slice would only make the preemption
 /// harness wait for it.
 static SLICE_TICKS: UInt = 1
+
 
 // -----------------------------------------------------------------------------
 // The handle table (spec §3)
@@ -1750,86 +1660,6 @@ func fault_trap(tag: String, cause: UInt, epc: UInt, tval: UInt) unsafe -> Never
     while { }
 }
 
-// =============================================================================
-// Fault reporting
-// =============================================================================
-
-/// Report a fatal condition on the console and FAIL the run. Never returns —
-/// M0's discipline, carried into the user-mode split: a fault is diagnosed and
-/// the machine stops non-zero, never a hang.
-public func fatal(tag: String, cause: UInt, epc: UInt, tval: UInt, code: ExitCode) {
-    let uart = console()
-    uart.write_str("SOS: fault ")
-    uart.write_str(tag)
-    uart.write_str(" cause=")
-    uart.write_hex(cause)
-    uart.write_str(" epc=")
-    uart.write_hex(epc)
-    uart.write_str(" tval=")
-    uart.write_hex(tval)
-    uart.write_str("\n")
-    hal.exit_fail(code as UInt)
-}
-
-// =============================================================================
-// Syscall dispatch (spec §3, §5.7)
-// =============================================================================
-
-/// What one op did: a (status, value) pair for the caller, or the news that the
-/// caller is not going to receive one YET.
-///
-/// `blocked` is the third answer a syscall can give and it is not a failure. A
-/// thread that parks in `Join` has made no mistake and gets no status; its pair
-/// is written into its frame by whatever wakes it, exactly once. Modelling that
-/// as a field rather than as a magic status is what keeps the return path from
-/// having to know which ops can park.
-struct SyscallResult {
-    status: SosStatus,
-    value: UInt,
-    blocked: Bool,
-}
-
-func op_ok() -> SyscallResult {
-    SyscallResult(status: SosStatus.Ok, value: 0, blocked: false)
-}
-
-func op_value(v: UInt) -> SyscallResult {
-    SyscallResult(status: SosStatus.Ok, value: v, blocked: false)
-}
-
-func op_status(s: SosStatus) -> SyscallResult {
-    SyscallResult(status: s, value: 0, blocked: false)
-}
-
-func op_blocked() -> SyscallResult {
-    SyscallResult(status: SosStatus.Ok, value: 0, blocked: true)
-}
-
-/// THE ONE PLACE a syscall's answer is written into a thread's frame.
-///
-/// A funnel rather than a rule repeated per caller, because the writers are not
-/// all on the return path: an op that PARKS is answered later, by whatever wakes
-/// it, and "later" is a different function each time. Its ENTRY POINTS, all of
-/// them:
-///
-///   - `ktrap`, for an op that answered immediately;
-///   - `exit_thread`, waking everything that joined the thread that just left;
-///   - `wake_one_waiter`, handing a ready attachment to a parked waiter (§2.2).
-///
-/// Each writes EXACTLY ONCE for one syscall, which is the invariant the whole
-/// blocking protocol rests on: a blocked caller is skipped on the return path
-/// precisely so that its waker is the only writer, and a second write would
-/// step the saved PC twice on the profile that steps it at all.
-///
-/// It answers with a (status, value) pair and nothing wider. An op whose answer
-/// does not fit — `Waiter.Wait`'s record is the first — writes the rest into the
-/// caller's own memory through `copy_out` and returns a status here, which is
-/// what keeps the register convention (§5.7) the same shape it was in M1.
-func write_result(frame_addr: UInt, result: SyscallResult) unsafe {
-    hal.syscall_return(frame_addr, (result.status as UInt8) as UInt,
-                       result.value)
-}
-
 // -----------------------------------------------------------------------------
 // COPY-OUT: the one door from kernel memory into a process's
 // -----------------------------------------------------------------------------
@@ -1858,13 +1688,6 @@ func write_result(frame_addr: UInt, result: SyscallResult) unsafe {
 // several address spaces, the mapping switch goes HERE — this function is the
 // only place the kernel dereferences a user address, which is precisely the
 // property that makes that a one-place change.
-
-/// Word alignment, from the machine rather than from a constant. A function
-/// because `sizeof` does not fold in a static initializer — DF-178f, the same
-/// gap `sosabi`'s `wait_record_bytes` works around, and it folds fine here.
-func word_bytes() -> UInt {
-    sizeof<UInt>() as UInt
-}
 
 /// Validate a destination the kernel is about to write, or TERMINATE the
 /// process. Never returns on a bad buffer.
@@ -2669,6 +2492,7 @@ func timer_op_decoded(op: TimerOp, obj: &TimerObject, arg0: UInt, arg1: UInt,
 // A SINGLE FIELD ACCESS IS LEFT ALONE (`TIMERS[t].armed` in the idle rule, the
 // whole-slot writes in `timer_create` and teardown): wrapping one load in a
 // method buys a name for something that already had one.
+
 extension TimerSlot {
     /// Replace this timer's whole schedule: fire at `deadline`, then every
     /// `interval` nanoseconds (0 being a one-shot).
@@ -3181,6 +3005,7 @@ public func ktrap(frame_addr: UInt, cause: UInt, tval: UInt) unsafe -> UInt {
 
 static BYTE_MASK: UInt = 0xFF
 
+
 // =============================================================================
 // Interrupts (design 178 D2 + D6; spec §9)
 // =============================================================================
@@ -3210,6 +3035,7 @@ static BYTE_MASK: UInt = 0xFF
 /// the path ran and then goes quiet. The count keeps rising either way.
 static TICK_REPORT_LIMIT: UInt = 4
 
+
 /// Ticks the periodic timer has delivered since boot.
 ///
 /// Compound global state resting on a serialization argument the compiler
@@ -3225,11 +3051,13 @@ static TICK_REPORT_LIMIT: UInt = 4
 /// still right, which is what the scheduler will ask of this one.
 unsafe static var TIMER_TICKS: UInt = 0
 
+
 /// Interrupts the controller had nothing to give for. ONE is not an error — a
 /// line can stop asserting between raising the interrupt and being asked about
 /// it — but a stream of them is, so the first is reported and the rest are
 /// counted.
 unsafe static var SPURIOUS_IRQS: UInt = 0
+
 
 /// Ticks the periodic timer has delivered since boot. The scheduler's clock
 /// when there is a scheduler; today the harness's evidence that a tick was
@@ -3272,12 +3100,14 @@ public func timer_ticks() unsafe -> UInt {
 /// unit `Clock`/`Timer` speak.
 static NS_PER_US: UInt64 = 1000
 
+
 /// The deadline that means "nothing is due" — far enough out that no machine
 /// this kernel runs on reaches it. It is a VALUE rather than an absence so that
 /// `reprogram_timer` has one code path: an empty schedule programs `never`,
 /// which is what stops a level-triggered comparator left in the past from
 /// re-firing forever.
 static NEVER_NS: UInt64 = UInt64.max
+
 
 /// How far ahead of NOW the hardware is ever programmed.
 ///
@@ -3297,6 +3127,7 @@ static NEVER_NS: UInt64 = UInt64.max
 /// millisecond scheduler tick, so §7's cadence never notices it.
 static TIMER_MIN_LEAD_NS: UInt64 = 50_000
 
+
 /// The scheduler tick's period in nanoseconds; 0 means NO PERIODIC TICK.
 ///
 /// Zero is the real kernel's state (`sos/kernel/main.saw` arms none — the
@@ -3306,8 +3137,10 @@ static TIMER_MIN_LEAD_NS: UInt64 = 50_000
 /// tick and one armed Timer is exactly the shape a sleeping process makes.
 unsafe static var TICK_PERIOD_NS: UInt64 = 0
 
+
 /// When the next scheduler tick is due, on the same clock every deadline uses.
 unsafe static var NEXT_TICK_NS: UInt64 = 0
+
 
 /// Start the periodic scheduler tick (spec §7's fixed timeslice).
 ///
@@ -3422,6 +3255,7 @@ func on_timer_tick(pc: UInt) unsafe {
 /// kernel was idle, so there is no interrupted address, and zero is the honest
 /// answer rather than a stale one.
 static IDLE_PC: UInt = 0
+
 
 /// A DEVICE INTERRUPT — the arch-free landing point for an external line, and
 /// spec §9's delivery in five lines.
@@ -3588,6 +3422,7 @@ func idle_until_runnable() unsafe {
 /// can raise this is 32 bits wide.)
 static HIGH_HALF_SHIFT: Int = 32
 
+
 // =============================================================================
 // The sosimg loader (design 140 unit B; spec §6, §7, §12)
 // =============================================================================
@@ -3620,33 +3455,6 @@ func header_at(addr: UInt) unsafe -> SosimgHeader {
 /// Overlay one segment record.
 func seg_at(addr: UInt) unsafe -> SosimgSeg {
     UnsafeMemory<SosimgSeg, Normal>(addr).read()
-}
-
-func copy_bytes(dst: UInt, src: UInt, len: UInt) unsafe {
-    var i: UInt = 0
-    while i < len {
-        UnsafeMemory<UInt8, Normal>(dst + i).write(UnsafeMemory<UInt8, Normal>(src + i).read())
-        i = i + 1
-    }
-}
-
-func zero_bytes(dst: UInt, len: UInt) unsafe {
-    var i: UInt = 0
-    while i < len {
-        UnsafeMemory<UInt8, Normal>(dst + i).write(0)
-        i = i + 1
-    }
-}
-
-/// Reject the root image. Never returns.
-public func fatal_image(reason: String, detail: UInt) {
-    let uart = console()
-    uart.write_str("SOS: bad root image: ")
-    uart.write_str(reason)
-    uart.write_str(" (")
-    uart.write_hex(detail)
-    uart.write_str(")\n")
-    hal.exit_fail(ExitCode.BadImage as UInt)
 }
 
 /// Validate one segment record against the image bounds and the root region.
