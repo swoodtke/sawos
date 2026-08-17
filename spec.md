@@ -1035,8 +1035,10 @@ event-driven EDGE of a process gets a second, distinct construct:
     of it, so a segment aimed at the kernel is refused rather than obeyed.
     `make sos-test` is 11 cases including the two-image boot, a root that
     oversteps its grant, and one that makes bad calls and checks the statuses.
-    Structure: `sos/kernel/core/lib.saw` is shared by every kernel image, which
-    keeps them all on the same trap path; `sos/rt/common/` (Saw — since design
+    Structure: `sos/kernel/core/` is shared by every kernel image, which
+    keeps them all on the same trap path — one module per seam since the
+    Aug-17 split, with `lib.saw` the facade that re-exports what an image
+    entry names; `sos/rt/common/` (Saw — since design
     172 part 2 the runtime seams and the arena too) and
     `sos/rt/common_c/support.c` (the C that must stay C: `mem*` and the atomic
     libcalls) are shared by the
