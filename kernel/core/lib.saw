@@ -681,6 +681,11 @@ struct ClockSlot {
 /// it exists because a second domain — or a virtual clock — makes "which time
 /// is this deadline measured in" a real question, and a Timer that could be
 /// re-pointed would answer it differently over its life.
+///
+/// WHAT YOU CAN DO TO ONE lives in this type's extension, down beside the ops
+/// that call it: `arm`, `disarm`, `is_due`, `sooner_of`, `fire`. Those are safe
+/// functions, and the `unsafe` on the ops around them is the SLAB's rather than
+/// the timer's.
 struct TimerSlot {
     state: SlotState,
     process: Int,
@@ -2622,15 +2627,136 @@ func timer_op_decoded(op: TimerOp, obj: &TimerObject, arg0: UInt, arg1: UInt,
     }
 }
 
+// -----------------------------------------------------------------------------
+// A TIMER'S OWN VERBS (ruled Aug 17, user; design 212's extraction idiom)
+// -----------------------------------------------------------------------------
+//
+// EVERY MULTI-FIELD OPERATION ON A TIMER IS A METHOD ON THE SLOT, and the ops
+// below index the slab and call one — `TIMERS[slot].fire(now)` where there used
+// to be five `TIMERS[slot].<field>` fetches in a row. Design 212's rule (a
+// 2+-hop chain spelled three times wants extraction) with a RECEIVER rather than
+// a reference parameter, because a slot is a type and these are its verbs.
+//
+// AND THE `unsafe` EFFECT RETREATS TO THE CALL SITES. `TIMERS` is an
+// `unsafe static var`, so every function that NAMES it is declared `unsafe`
+// (design 130/136) — but `TimerSlot` is an ordinary safe type, so a body working
+// through `self` names nothing unsafe and is a SAFE function. What is left
+// inside an unsafe body is the indexing, which is where the compound global
+// state actually is; the arithmetic a reviewer most wants to check is now
+// outside it, and the compiler agrees rather than being asked to take it on
+// trust.
+//
+// A SINGLE FIELD ACCESS IS LEFT ALONE (`TIMERS[t].armed` in the idle rule, the
+// whole-slot writes in `timer_create` and teardown): wrapping one load in a
+// method buys a name for something that already had one.
+extension TimerSlot {
+    /// Replace this timer's whole schedule: fire at `deadline`, then every
+    /// `interval` nanoseconds (0 being a one-shot).
+    ///
+    /// **ARMING REPLACES, AND IT IS NOT AN ERROR** (pinned here, design 232 unit
+    /// 1). Arming a timer that is already armed discards the old schedule
+    /// wholesale — new deadline, new interval — AND CLEARS THE FIRE COUNT,
+    /// because a count carried forward would be owed against a schedule the
+    /// caller just threw away. It is deliberately not a fault: re-arming a
+    /// running timer is the ordinary way to change a timeout, which is the shape
+    /// M4's select-with-timeout is made of, and refusing it would make the
+    /// common idiom unwritable.
+    func arm(&var self, deadline: UInt64, interval: UInt64) {
+        self.armed = true
+        self.deadline_ns = deadline
+        self.interval_ns = interval
+        self.fires = 0
+    }
+
+    /// This timer is off and owes nothing.
+    ///
+    /// It clears the FIRE COUNT as well as the schedule, which is what makes it
+    /// a clean cancel: a caller who wants the fires reads them with a wait
+    /// first. Why disarming an UNARMED timer is a no-op rather than a fault is
+    /// `timer_disarm`'s business, since that is the question the OP answers.
+    func disarm(&var self) {
+        // The `u64` suffixes are owed to DF-232a and should come off when it
+        // closes: a bare literal does NOT adopt the expected fixed-width type in
+        // plain assignment position (it does in an annotation, a struct literal
+        // and a compound assignment), and on a 32-bit profile the mismatch is an
+        // INTERNAL COMPILER ERROR rather than a diagnostic. The suffix is the
+        // documented spelling for a literal no expected type reaches, which is
+        // exactly what these are until the gap is fixed.
+        self.armed = false
+        self.deadline_ns = 0u64
+        self.interval_ns = 0u64
+        self.fires = 0
+    }
+
+    /// Has this timer come due by `now`? An unarmed one never has.
+    func is_due(&self, now: UInt64) -> Bool {
+        self.armed && self.deadline_ns <= now
+    }
+
+    /// The SOONER of `deadline` and this timer's own — the fold
+    /// `earliest_timer_deadline` is written as. An unarmed timer answers
+    /// `deadline` unchanged, because a schedule nobody wrote is not a deadline
+    /// the hardware has to be programmed for.
+    func sooner_of(&self, deadline: UInt64) -> UInt64 {
+        if self.armed && self.deadline_ns < deadline { self.deadline_ns } else { deadline }
+    }
+
+    /// This timer came due: count the fire, and re-arm it if it is periodic.
+    ///
+    /// **DRIFT-FREE, AND THE ARITHMETIC IS WHERE THAT LIVES.** The next deadline
+    /// is measured from THIS DEADLINE, never from `now` — so a fire the kernel
+    /// was late for shortens the next gap instead of pushing every later one
+    /// out, and a timer armed at 1 ms is still on the millisecond a thousand
+    /// fires later. That is the timerfd model, and it is the exact OPPOSITE of
+    /// the scheduler tick's rule (`on_timer_interrupt` measures from now)
+    /// because the two want opposite things: a timeslice has no history to be
+    /// faithful to, and an interval does.
+    ///
+    /// **MISSED FIRES COALESCE, BY DIVISION RATHER THAN BY A LOOP.** A consumer
+    /// that was descheduled across several periods gets ONE wake carrying HOW
+    /// MANY, which is what stops it either falling permanently behind a queue of
+    /// fires or silently losing them. Computing the count with a division rather
+    /// than advancing the deadline in a `while` is what keeps this bounded: an
+    /// interval far shorter than the machine can serve costs one divide, not a
+    /// spin — so there is no long loop here for design 232 unit 1.5's preemption
+    /// points to have to cover, and no minimum interval anyone has to invent.
+    func fire(&var self, now: UInt64) {
+        let interval = self.interval_ns
+        if interval == 0 {
+            // A ONE-SHOT DISARMS ITSELF. There is no schedule left, so the
+            // object goes quiet after one fire and a later `disarm` finds
+            // nothing to do — which is exactly the race `timer_disarm`
+            // documents.
+            self.armed = false
+            self.fires = saturating_add(self.fires, 1)
+        } else {
+            let late = now - self.deadline_ns
+            let missed = (late / interval) + 1
+            // The PRODUCT cannot overflow: when `interval` exceeds `late`,
+            // `missed` is 1 and the product is the interval itself; otherwise
+            // `missed` is bounded by `late / interval`, so the product is at
+            // most `late + interval` with both terms real times.
+            let step = missed * interval
+            // The SUM can, and a process chose the number that makes it — an
+            // interval near the end of time pushes the next deadline past it.
+            // Saw's overflow checks are always on, so an unguarded `+` here
+            // would PANIC THE KERNEL on a value userspace picked, which is a
+            // denial of service wearing an arithmetic bug's clothes. Saturating
+            // is also the honest answer: a deadline past the end of time is one
+            // nothing will see fire.
+            let base = self.deadline_ns
+            self.deadline_ns = if step > NEVER_NS - base { NEVER_NS } else { base + step }
+            self.fires = saturating_add(self.fires, fires_word(missed))
+        }
+    }
+}
+
 /// §2's `arm(after, interval)`, taken through the COPY-IN door.
 ///
-/// **ARMING REPLACES, AND IT IS NOT AN ERROR** (pinned here, design 232 unit 1).
-/// Arming a timer that is already armed discards the old schedule wholesale —
-/// new deadline, new interval — AND CLEARS THE FIRE COUNT, because a count
-/// carried forward would be owed against a schedule the caller just threw away.
-/// It is deliberately not a fault: re-arming a running timer is the ordinary way
-/// to change a timeout, which is the shape M4's select-with-timeout is made of,
-/// and refusing it would make the common idiom unwritable.
+/// THE OP IS THE DOOR AND THE SCHEDULE IS THE SLOT'S: everything below this line
+/// is validating what a process handed over and turning a RELATIVE delay into an
+/// absolute deadline. `TimerSlot.arm` is what the schedule then means, including
+/// why re-arming an armed timer is legal.
 func timer_arm(p: Int, slot: Int, src: UInt, bytes: UInt) unsafe -> SyscallResult {
     // The length is published, so a caller that got it wrong could have checked
     // — `Waiter.Wait`'s capacity rule, running inward. EXACT rather than
@@ -2650,10 +2776,7 @@ func timer_arm(p: Int, slot: Int, src: UInt, bytes: UInt) unsafe -> SyscallResul
     // nothing will ever see fire — the honest answer, and not a panic.
     let deadline = if rec.after_ns > NEVER_NS - now { NEVER_NS } else { now + rec.after_ns }
 
-    TIMERS[slot].armed = true
-    TIMERS[slot].deadline_ns = deadline
-    TIMERS[slot].interval_ns = rec.interval_ns
-    TIMERS[slot].fires = 0
+    TIMERS[slot].arm(deadline, rec.interval_ns)
     reprogram_timer()
     op_ok()
 }
@@ -2673,17 +2796,7 @@ func timer_arm(p: Int, slot: Int, src: UInt, bytes: UInt) unsafe -> SyscallResul
 /// It clears the FIRE COUNT as well as the schedule, which is what makes it a
 /// clean cancel: a caller who wants the fires reads them with a wait first.
 func timer_disarm(slot: Int) unsafe -> SyscallResult {
-    // The `u64` suffixes are owed to DF-232a and should come off when it
-    // closes: a bare literal does NOT adopt the expected fixed-width type in
-    // plain assignment position (it does in an annotation, a struct literal and
-    // a compound assignment), and on a 32-bit profile the mismatch is an
-    // INTERNAL COMPILER ERROR rather than a diagnostic. The suffix is the
-    // documented spelling for a literal no expected type reaches, which is
-    // exactly what these are until the gap is fixed.
-    TIMERS[slot].armed = false
-    TIMERS[slot].deadline_ns = 0u64
-    TIMERS[slot].interval_ns = 0u64
-    TIMERS[slot].fires = 0
+    TIMERS[slot].disarm()
     reprogram_timer()
     op_ok()
 }
@@ -2695,11 +2808,7 @@ func earliest_timer_deadline(soonest: UInt64) unsafe -> UInt64 {
     var i: Int = 0
     while i < MAX_TIMERS {
         match TIMERS[i].state {
-            case Live -> {
-                if TIMERS[i].armed && TIMERS[i].deadline_ns < next {
-                    next = TIMERS[i].deadline_ns
-                }
-            },
+            case Live -> { next = TIMERS[i].sooner_of(next) },
             case Free -> {},
         }
         i = i + 1
@@ -2713,7 +2822,7 @@ func expire_timers(now: UInt64) unsafe {
     while i < MAX_TIMERS {
         match TIMERS[i].state {
             case Live -> {
-                if TIMERS[i].armed && TIMERS[i].deadline_ns <= now {
+                if TIMERS[i].is_due(now) {
                     fire_timer(i, now)
                 }
             },
@@ -2723,52 +2832,14 @@ func expire_timers(now: UInt64) unsafe {
     }
 }
 
-/// One Timer came due: count the fire, re-arm if it is periodic, tell its
-/// Waiter.
+/// One Timer came due: advance its schedule, and tell its Waiter.
 ///
-/// **DRIFT-FREE, AND THE ARITHMETIC IS WHERE THAT LIVES.** The next deadline is
-/// measured from THIS DEADLINE, never from `now` — so a fire the kernel was late
-/// for shortens the next gap instead of pushing every later one out, and a timer
-/// armed at 1 ms is still on the millisecond a thousand fires later. That is the
-/// timerfd model, and it is the exact OPPOSITE of the scheduler tick's rule
-/// (`on_timer_interrupt` measures from now) because the two want opposite
-/// things: a timeslice has no history to be faithful to, and an interval does.
-///
-/// **MISSED FIRES COALESCE, BY DIVISION RATHER THAN BY A LOOP.** A consumer that
-/// was descheduled across several periods gets ONE wake carrying HOW MANY, which
-/// is what stops it either falling permanently behind a queue of fires or
-/// silently losing them. Computing the count with a division rather than
-/// advancing the deadline in a `while` is what keeps this bounded: an interval
-/// far shorter than the machine can serve costs one divide, not a spin — so
-/// there is no long loop here for design 232 unit 1.5's preemption points to
-/// have to cover, and no minimum interval anyone has to invent.
+/// TWO LINES, AND THE SPLIT IS THE POINT. `TimerSlot.fire` is the whole of the
+/// drift-free re-arm and the coalescing division — arithmetic on one slot's own
+/// fields, and a SAFE function for exactly that reason. What is left here is the
+/// half that reaches the rest of the kernel: the slab index, and the wake.
 func fire_timer(slot: Int, now: UInt64) unsafe {
-    let interval = TIMERS[slot].interval_ns
-    if interval == 0 {
-        // A ONE-SHOT DISARMS ITSELF. There is no schedule left, so the object
-        // goes quiet after one fire and a later `disarm` finds nothing to do —
-        // which is exactly the race `timer_disarm` documents.
-        TIMERS[slot].armed = false
-        TIMERS[slot].fires = saturating_add(TIMERS[slot].fires, 1)
-    } else {
-        let late = now - TIMERS[slot].deadline_ns
-        let missed = (late / interval) + 1
-        // The PRODUCT cannot overflow: when `interval` exceeds `late`, `missed`
-        // is 1 and the product is the interval itself; otherwise `missed` is
-        // bounded by `late / interval`, so the product is at most
-        // `late + interval` with both terms real times.
-        let step = missed * interval
-        // The SUM can, and a process chose the number that makes it — an
-        // interval near the end of time pushes the next deadline past it. Saw's
-        // overflow checks are always on, so an unguarded `+` here would PANIC
-        // THE KERNEL on a value userspace picked, which is a denial of service
-        // wearing an arithmetic bug's clothes. Saturating is also the honest
-        // answer: a deadline past the end of time is one nothing will see fire.
-        let base = TIMERS[slot].deadline_ns
-        TIMERS[slot].deadline_ns = if step > NEVER_NS - base { NEVER_NS } else { base + step }
-        TIMERS[slot].fires = saturating_add(TIMERS[slot].fires,
-                                            fires_word(missed))
-    }
+    TIMERS[slot].fire(now)
     notify_ready(WaitableKind.Timer, slot)
 }
 
