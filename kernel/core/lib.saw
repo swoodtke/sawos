@@ -1407,10 +1407,6 @@ func fault_process(p: Int, reason: FaultReason) unsafe -> Never {
     uart.write_str("\n")
     end_process(p, ProcessStatusKind.Faulted, (reason as UInt8) as UInt,
                 ExitCode.ProcessFault as UInt)
-    // The loop is what carries the `Never` up to this signature. A call to a
-    // `-> Never` function does not currently do it — see DF-178d — and without
-    // it a caller whose own tail is `fault_process(...)` miscompiles.
-    while { }
 }
 
 /// The same termination, reached from a hardware fault rather than a syscall
@@ -1517,31 +1513,6 @@ func write_result(frame_addr: UInt, result: SyscallResult) unsafe {
                        result.value)
 }
 
-/// Terminate the process from a position that OWES a `SyscallResult`.
-///
-/// `fault_process` is declared `-> Never` and nothing after it runs, but a
-/// `Never`-typed CALL is not currently accepted everywhere a diverging tail is
-/// (DF-178d), so the one place that difference would show up is wrapped once
-/// here rather than worked around at each op. The trailing conditionless loop
-/// is what carries the divergence up to this signature; it is unreachable.
-func fault_result(p: Int, reason: FaultReason) unsafe -> SyscallResult {
-    fault_process(p, reason)
-    while { }
-}
-
-/// The same, from a position that owes a slot index. One wrapper per return
-/// type is what DF-178d costs; all three are unreachable past their first line.
-func fault_slot(p: Int, reason: FaultReason) unsafe -> Int {
-    fault_process(p, reason)
-    while { }
-}
-
-/// The same, from a position that owes a resolved waitable.
-func fault_waitable(p: Int, reason: FaultReason) unsafe -> Waitable {
-    fault_process(p, reason)
-    while { }
-}
-
 // -----------------------------------------------------------------------------
 // COPY-OUT: the one door from kernel memory into a process's
 // -----------------------------------------------------------------------------
@@ -1643,18 +1614,10 @@ func calling_process() unsafe -> Int {
 /// AN UNKNOWN OP AND A MISSING RIGHT BOTH TERMINATE THE PROCESS (design 178's
 /// faults ruling). Both are mistakes the caller could have checked: it chose
 /// the number, and it knows which rights it holds.
-///
-/// THE DECODE IS AN `if let` WITH A DIVERGING TAIL rather than the `guard` this
-/// wants to be: a `guard ... else` block accepts `return`, `break`, `continue`,
-/// `panic` and a conditionless `while { }` as its exit, but NOT a call to a
-/// function declared `-> Never`, which is what terminating a process is. See
-/// DF-178d.
 func system_op(raw_op: UInt, obj: &SystemObject, arg0: UInt) unsafe -> SyscallResult {
     let p = calling_process()
-    if let op = SystemOp.from(raw: raw_op) {
-        return system_op_decoded(op, &obj, arg0, p)
-    }
-    fault_result(p, FaultReason.BadOp)
+    guard let op = SystemOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
+    return system_op_decoded(op, &obj, arg0, p)
 }
 
 func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt,
@@ -1701,10 +1664,8 @@ func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt,
 func process_op(raw_op: UInt, obj: &ProcessObject,
                 arg0: UInt, arg1: UInt, arg2: UInt) unsafe -> SyscallResult {
     let p = calling_process()
-    if let op = ProcessOp.from(raw: raw_op) {
-        return process_op_decoded(op, &obj, arg0, arg1, arg2, p)
-    }
-    fault_result(p, FaultReason.BadOp)
+    guard let op = ProcessOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
+    return process_op_decoded(op, &obj, arg0, arg1, arg2, p)
 }
 
 func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
@@ -1733,10 +1694,9 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             if not obj.allows(ProcessRight.Exit) {
                 fault_process(p, FaultReason.AccessDenied)
             }
+            // `end_process` stops the machine, so this arm diverges and owes
+            // the `match` no value.
             end_process(obj.slot, ProcessStatusKind.Exited, arg0, arg0)
-            // Unreachable: `end_process` stops the machine. The loop is what
-            // carries that up to this arm's type (DF-178d).
-            while { }
         },
         // §8's ONE fixed-width status word: kind in the high bits, code in the
         // low ones. A process asking about itself always reads `Running`, which
@@ -1785,10 +1745,8 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
 /// rather than trusted: a number that is not a mode is a caller error the
 /// process could have checked, which under design 178's faults ruling ends it.
 func create_event(p: Int, raw_mode: UInt) unsafe -> SyscallResult {
-    if let mode = EventMode.from(raw: raw_mode) {
-        return create_event_moded(p, mode)
-    }
-    fault_result(p, FaultReason.BadArg)
+    guard let mode = EventMode.from(raw: raw_mode) else { fault_process(p, FaultReason.BadArg) }
+    return create_event_moded(p, mode)
 }
 
 func create_event_moded(p: Int, mode: EventMode) unsafe -> SyscallResult {
@@ -1930,10 +1888,8 @@ func create_thread(p: Int, entry: UInt, stack_top: UInt, arg: UInt) unsafe -> Sy
 /// and a process that tries has misread its own handles.
 func thread_op(raw_op: UInt, obj: &ThreadObject, arg0: UInt) unsafe -> SyscallResult {
     let p = calling_process()
-    if let op = ThreadOp.from(raw: raw_op) {
-        return thread_op_decoded(op, &obj, arg0, p)
-    }
-    fault_result(p, FaultReason.BadOp)
+    guard let op = ThreadOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
+    return thread_op_decoded(op, &obj, arg0, p)
 }
 
 func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
@@ -1963,7 +1919,7 @@ func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
             match THREADS[target].state {
                 // Already gone: the answer is in the slot, so nothing parks.
                 case Exited -> op_value(THREADS[target].exit_code),
-                case Free -> fault_result(p, FaultReason.BadState),
+                case Free -> fault_process(p, FaultReason.BadState),
                 case _ -> {
                     block_on_join(CURRENT_THREAD, target)
                     op_blocked()
@@ -2000,10 +1956,8 @@ func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
 /// The Event object's ops (spec §2.4; design 178 D5).
 func event_op(raw_op: UInt, obj: &EventObject, arg0: UInt) unsafe -> SyscallResult {
     let p = calling_process()
-    if let op = EventOp.from(raw: raw_op) {
-        return event_op_decoded(op, &obj, arg0, p)
-    }
-    fault_result(p, FaultReason.BadOp)
+    guard let op = EventOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
+    return event_op_decoded(op, &obj, arg0, p)
 }
 
 func event_op_decoded(op: EventOp, obj: &EventObject, arg0: UInt,
@@ -2039,10 +1993,8 @@ func event_op_decoded(op: EventOp, obj: &EventObject, arg0: UInt,
 /// The Interrupt object's ops (spec §2 table, §9; design 178 D6).
 func interrupt_op(raw_op: UInt, obj: &InterruptObject) unsafe -> SyscallResult {
     let p = calling_process()
-    if let op = InterruptOp.from(raw: raw_op) {
-        return interrupt_op_decoded(op, &obj, p)
-    }
-    fault_result(p, FaultReason.BadOp)
+    guard let op = InterruptOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
+    return interrupt_op_decoded(op, &obj, p)
 }
 
 func interrupt_op_decoded(op: InterruptOp, obj: &InterruptObject,
@@ -2116,11 +2068,11 @@ func waitable_slot(p: Int, handle: UInt) unsafe -> Waitable {
             }
             Waitable(kind: WaitableKind.Interrupt, slot: entry.target)
         },
-        case Unbound -> fault_waitable(p, FaultReason.BadHandle),
-        case System -> fault_waitable(p, FaultReason.NotWaitable),
-        case Process -> fault_waitable(p, FaultReason.NotWaitable),
-        case Thread -> fault_waitable(p, FaultReason.NotWaitable),
-        case Waiter -> fault_waitable(p, FaultReason.NotWaitable),
+        case Unbound -> fault_process(p, FaultReason.BadHandle),
+        case System -> fault_process(p, FaultReason.NotWaitable),
+        case Process -> fault_process(p, FaultReason.NotWaitable),
+        case Thread -> fault_process(p, FaultReason.NotWaitable),
+        case Waiter -> fault_process(p, FaultReason.NotWaitable),
     }
 }
 
@@ -2128,10 +2080,8 @@ func waitable_slot(p: Int, handle: UInt) unsafe -> Waitable {
 func waiter_op(raw_op: UInt, obj: &WaiterObject, arg0: UInt,
                arg1: UInt) unsafe -> SyscallResult {
     let p = calling_process()
-    if let op = WaiterOp.from(raw: raw_op) {
-        return waiter_op_decoded(op, &obj, arg0, arg1, p)
-    }
-    fault_result(p, FaultReason.BadOp)
+    guard let op = WaiterOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
+    return waiter_op_decoded(op, &obj, arg0, arg1, p)
 }
 
 func waiter_op_decoded(op: WaiterOp, obj: &WaiterObject, arg0: UInt, arg1: UInt,
@@ -2280,7 +2230,7 @@ func dispatch(handle: UInt, op: UInt,
     let p = calling_process()
     let entry = lookup_handle(p, handle)
     match entry.obj_type {
-        case Unbound -> fault_result(p, FaultReason.BadHandle),
+        case Unbound -> fault_process(p, FaultReason.BadHandle),
         case System -> {
             let obj = SystemObject(handle: SystemHandle(handle),
                                    rights: entry.rights)
@@ -2962,6 +2912,7 @@ public func start_process(entry: UInt, stack_top: UInt,
     console().write_str("SOS: console handover\n")
 
     hal.frame_init(frame_slot(main), entry, stack_top, system)
+    // `resume_frame` is `-> Never`: it enters the process and the kernel is
+    // only ever re-entered through a trap. That is this function's divergence.
     hal.resume_frame(frame_slot(main))
-    while { }
 }
