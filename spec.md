@@ -11,14 +11,14 @@ freestanding profile; the design must not preclude MMU-class targets.
   required to efficiently provide core OS resources:
   processes/address spaces, threads/tasks/scheduling, timers,
   interrupts, memory management. Everything else runs in userspace,
-  with processes communicating via shared memory and channels/events.
+  with processes communicating via shared memory and pipes/events.
 - **Handles.** Every kernel resource is referenced by a Handle: an
   opaque integer mapping to a kernel object through a per-process
   table lookup (fd-style). No ambient authority.
 - **Derivation.** A Handle is ideally obtained via an operation on
   another Handle the process already holds, with the required
   capability enabled — authority flows only through held authority.
-- **Channels** send data synchronously, optionally carrying Handles,
+- **Pipes** send data synchronously, optionally carrying Handles,
   which are MOVED to the receiving process. Not every Handle is
   movable — transferability is a capability of the Handle itself.
 
@@ -32,7 +32,7 @@ names provisional):
 | `AddressSpace` | Isolation domain, defined abstractly. P4: PMP region set + APM/REE security context (see §5.5 — the P4's MMU is real but global/external-memory-only, not per-process). Paging targets: page-table root. |
 | `Thread` | Kernel-scheduled execution context bound to an AddressSpace. Saw's cooperative TaskGroups run *inside* a thread, in userspace — the kernel never sees tasks. BUILT M2 (design 178 unit 2): ops `Start`/`Join`/`Exit`/`Yield`, rights `ThreadRight.Start`/`.Join`/`.Control`. The saved trap frame IS the context, so a switch is the trap handler returning a different frame — see §11. |
 | `MemoryObject` | A range of memory (RAM or device MMIO) that can be mapped into AddressSpaces. Derived by splitting/attenuating a parent MemoryObject; roots handed to the first process at boot. |
-| `Channel` | Synchronous message IPC with request/reply built in — see §2.1 (ratified Jul 29). |
+| `Pipe` | Synchronous message IPC with request/reply built in — see §2.1 (ratified Jul 29; renamed from Channel + client API amended Aug 20). |
 | `Event` | Accumulating non-blocking notification (OR / saturating-sum); a waitable — see §2.4 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Signal`/`Receive`, the mode chosen by the caller at creation (`event_create(mode:)`). AMENDED Aug 17 (user): the word is CONSUMED BY WHOEVER TAKES IT, through either door — `receive` is the non-blocking poll, a `Waiter.wait` delivery is the blocking one, and both read-and-clear, so a value is reported exactly once (§2.2, §2.4). |
 | `Clock` | A GRANTED TIME SOURCE — time is a capability, not an ambient facility. BUILT M3 (design 232 unit 1): obtained through `SystemOp.ClockGet` on `SystemRight.ClockGet`, ops `Now`/`TimerCreate`, rights `ClockRight.Read`/`.TimerCreate`. **A HARDWARE-BACKED CLOCK IS ONE KERNEL-ETERNAL OBJECT PER `ClockType`** (ruled Aug 17, user), existing from boot and owned by NOBODY: the machine has one monotonic counter, and a per-process object naming it would be a copy of a fact with a lifetime attached. So there is one slot per domain (the slot IS the domain's ordinal), no allocation and no `NoResource`, and process teardown frees no clock — a dead process's clock HANDLE is unbound like any other, and the object it named is not the process's to reclaim. `ClockGet` is therefore a GETTER that mints a handle onto a well-known object: asking twice answers the SAME handle, which the process's own handle table is what records. `ClockType` declares `Monotonic` ONLY in v1 (`Boot`/`Realtime` are future values of a raw-backed enum, undeclared because an unproducible case is dead surface), and `Now` dispatches on the clock's domain, so a second domain fails to compile until somebody says what its reading is. `Now` answers through a copy-out record, because a nanosecond count is 64 bits and one profile's registers are not. The point of the capability: strip the right from a child and hand it a VIRTUAL clock over IPC instead, with no code change on either side — and a virtual clock is a DIFFERENT animal, separately created and STATEFUL (offset, rate, owner), so it gets its own creation op and its own lifetime rather than a row in this table. |
 | `Timer` | Deadline object bound to the Clock that created it; directly waitable. BUILT M3 (design 232 unit 1) — THE PROCESS-SLEEP PRIMITIVE, and before it a wait either returned at once or blocked forever. Ops `Arm`/`Disarm`, rights `TimerRight.Arm` (gating both) / `.Wait`. `arm(after_ns, interval_ns)` arrives through the new COPY-IN record (§2.2's copy-out funnel's mirror twin, built here and inherited by M4's IPC send) because two 64-bit times exceed the argument registers on a 32-bit profile; `interval_ns == 0` is a one-shot, which disarms itself when it fires. The re-arm is DRIFT-FREE (next = previous DEADLINE + interval, the timerfd model) and missed expiries COALESCE into a saturating fire count delivered as `WaitPayload.Timer(fires:)`. **There is NO ACK**: unlike §9's Interrupt there is no mask to release, so the wait that reports the fires is what consumes them. Arming an armed timer REPLACES its schedule and clears the count; disarming an unarmed one is a NO-OP, deliberately opposite to §9's ack-with-no-fire — a one-shot disarms itself, so cancelling a timeout that just expired is an ordinary race rather than a caller error. |
@@ -46,14 +46,15 @@ names provisional):
 **Eight of these kinds exist today** — System, Process, Thread, Event, Waiter,
 Interrupt, Clock and Timer (`ObjType`, `sos/kernel/abi/`, the kernel-internal
 numbering §5.7's vDSO discipline keeps renumberable). The other rows are
-unbuilt: Channel is M4, the memory surface is M3 (design 232 unit 4), and
+unbuilt: Pipe is M4, the memory surface is M3 (design 232 unit 4), and
 AddressSpace stays implicit while one process exists — a process gets one
 granted range plus a writable window, installed by the loader. §11 is the
 ledger.
 
-### 2.1 Channels: bounded messages + built-in request/reply (ratified Jul 29)
+### 2.1 Pipes: bounded messages + built-in request/reply (ratified Jul 29;
+### renamed from Channels + client API amended Aug 20)
 
-- **`send(data?, handles?) -> ReplyHandle`.** Body bytes are copied
+- **`send(data?, handles?) -> PipeReplyHandle`.** Body bytes are copied
   from the sender's address space; handles are attached but TRANSFERRED
   into the receiver's table only when the receiver actually receives
   the message (rendezvous transfer — no orphaned handles if the send
@@ -65,29 +66,74 @@ ledger.
   carries the MemoryObject handle. (Concrete limits: TBD — a small
   body, e.g. 64–256 bytes, and a handful of handles.)
 - **Request/reply is a PRIMITIVE, not a convention.** `send` returns a
-  **ReplyHandle** — a single-use, one-shot "reply channel" the sender
-  waits on. `receive(...) -> (message, RequestHandle)` returns a
-  matching one-shot **RequestHandle** the server replies through
+  **PipeReplyHandle** — a single-use, one-shot "reply pipe" the sender
+  waits on. `receive(...) -> (message, PipeRequestHandle)` returns a
+  matching one-shot **PipeRequestHandle** the server replies through
   (`request.reply(data?, handles?)`). Properties:
   - The reply capability is unforgeable and **consumed on reply**
     (NoCopy in Saw — the type system enforces single-use on top of the
     kernel's own check).
-  - If the server drops its RequestHandle without replying, the
+  - If the server drops its PipeRequestHandle without replying, the
     client's wait wakes with a **peer-closed error** — no hung
     clients, no timeout hacks. (seL4 call/reply + Zircon channel-call,
     fused.)
-  - ReplyHandle/RequestHandle **are transferable** (ratified Jul 29) —
+  - PipeReplyHandle/PipeRequestHandle **are transferable** (ratified Jul 29) —
     this is the delegation primitive, not a hazard. A server may MOVE
-    its RequestHandle to a third party who replies directly to the
+    its PipeRequestHandle to a third party who replies directly to the
     original client. **Canonical example — zero-copy delegation:** the
-    filesystem receives a read (a RequestHandle), forwards that handle
-    over a channel to the flash driver; the flash driver replies
+    filesystem receives a read (a PipeRequestHandle), forwards that handle
+    over a pipe to the flash driver; the flash driver replies
     through it with the hardware bytes straight to the client — the
     payload never transits the fs address space. Single-use is
     preserved through transfer: the handle is consumed on reply
     regardless of who holds it (transfer moves the reply *obligation*).
-  - **Fire-and-forget is NOT a channel concern** — use an Event
-    (§2.4), the accumulating non-blocking notification object.
+  - **Fire-and-forget is NOT a pipe concern** — use an Event
+    (§2.4), the accumulating non-blocking notification object. (Amended
+    Aug 20: the TELL idiom below sanctions the payload-carrying one-way
+    message; Event remains the payload-free door.)
+
+**AMENDED Aug 20 (user) — the RENAME and the client API.** The object is a
+**Pipe** (was Channel): the old name collided with Saw's own `Channel`
+while sharing none of its semantics (buffered queue, any-holder close,
+fire-and-forget — everything a rendezvous request/reply object is not),
+and the planned Plan 9-style namespace resolves paths like `/dev/uart0` to
+a server-owned object speaking a protocol, which is the NAMED-PIPE model
+nearly verbatim (path-registered, message-framed, transactional). `Pipe`
+names the PER-CLIENT connection object; the path-attached acceptor the
+namespace will need is a separate, later object, named in the namespace
+design. Handle types follow the abi's object-kind convention —
+`PipeHandle`, `PipeRight`, and the auxiliary pair `PipeRequestHandle` /
+`PipeReplyHandle` (the prefix also reserves bare Request/Reply for a
+future protocol layer's own message types).
+
+The client API (superseding Jul 31's separate `call` verb): ONE `send`
+name, overloaded by the presence of `timeout:` — a runtime flag cannot
+change a return type, so blocking-ness is never a parameter.
+`pipe.send(msg) -> Result<PipeReply, PipeError>` suspends until the reply;
+`pipe.send(msg, timeout: Duration) -> Result<PipeReply, PipeSendError>`,
+where `case TimedOut(pending: PipeReplyHandle)` carries the still-live
+claim in the error payload. `PipeReply` is the RESOLVED reply (body plus
+transferred handles); a `PipeReplyHandle` resolves to one. The split-phase
+form (send now, wait later; returns the bare `PipeReplyHandle`) is what a
+client attaches to a Waiter to multiplex outstanding requests; its method
+name is an M4-brief decision (leading candidate `post`).
+
+**Abandoned requests** (a client drop and a client crash are the same
+event to the kernel): `reply()` to an abandoned request answers
+`Err(PeerClosed)`, never a silent success — ignorable with `let _ =`, the
+std-Channel close precedent. The obligation is discharged and attached
+handles closed either way. The `PipeRequestHandle` is WAITABLE for
+"abandoned" (opt-in early notice; state on the kernel object, so it
+travels with a delegated handle). Drop of a `PipeReplyHandle` is thereby
+the CANCELLATION primitive — time out, then drop the pending handle; no
+`cancel()` verb, and deterministic destruction makes the timing
+deterministic. ABANDONMENT IS INFORMATION, NOT AN IMPERATIVE: whether it
+cancels is the protocol's per-request-type decision (a tell-style message
+ignores the signal; a cancellable read honors it). The TELL idiom is
+sanctioned: send-then-drop carries data an Event cannot, the server
+discharging with `let _ = request.reply()`; it is spelled on the
+split-phase form, since the suspending `send` would wait for the very
+reply it is about to discard.
 
 ### 2.2 Waiter: the generic wait aggregator (ratified Jul 29)
 
@@ -104,7 +150,7 @@ ledger.
   The record is `key` word, `tag` word, payload words, with the sizes and
   word offsets published as constants and the tag a raw-backed enum (the
   §2 design-145 wire idiom) whose value space is extensible. Why: the KEY
-  is universal and the PAYLOAD is not — a Channel's readiness is not a
+  is universal and the PAYLOAD is not — a Pipe's readiness is not a
   Timer's is not an Event's — so a fixed register pair would have had to
   be the union of every waitable's answer forever, and the register file
   is the one thing that cannot grow. The Event's payload is its
@@ -149,10 +195,11 @@ ledger.
   to name it with. The invariant that forces: `add` with a key the Waiter
   already uses is a FAULT, because a duplicate makes two questions ambiguous at
   once — which attachment a `remove` names, and which one an answer came from.
-- Waitables: Channel (readable / reply-ready), Event, Timer,
-  Interrupt, ReplyHandle. **Event, Interrupt and Timer are BUILT** (M2 units
-  3 and 4; design 232 unit 1); Channel with its
-  ReplyHandle is M4. The second kind is what moved an attachment
+- Waitables: Pipe (readable / reply-ready), Event, Timer,
+  Interrupt, PipeReplyHandle, and PipeRequestHandle (abandoned — the Aug 20
+  amendment, §2.1). **Event, Interrupt and Timer are BUILT** (M2 units
+  3 and 4; design 232 unit 1); Pipe with its
+  PipeReplyHandle is M4. The second kind is what moved an attachment
   out of the waitable and into a table of its own: a Waiter's set has to
   be ONE list, since a wait scans it once and a `remove` walks it once,
   so per-kind lists would make both a matrix over kinds. What stays
@@ -238,7 +285,7 @@ ledger.
     an op that installs it, and a close that revokes it — so the migration
     is "the same window, obtained rather than declared", and the M2 code
     says so where the check is.
-- Sendable over channels — so the SAME physical memory can be mapped
+- Sendable over pipes — so the SAME physical memory can be mapped
   into multiple address spaces at multiple virtual locations (the
   shared-memory primitive). Derived by splitting / attenuating a
   parent; pool roots given to the root server at boot.
@@ -266,7 +313,7 @@ ledger.
 - **Rights are a bitmask, SCOPED PER OBJECT KIND (ratified Aug 7,
   user).** Each kind defines its own backed rights enum —
   `SystemRight: UInt32 { case Transfer = 1, case Manage = 2, case
-  Debug = 256, case Shutdown = 512 }`, `ChannelRight { … Send,
+  Debug = 256, case Shutdown = 512 }`, `PipeRight { … Send,
   Receive }`
   — spelled `SystemRight.Debug`, scoped by the ENUM (no flat
   name-mangling; exhaustive match + the design-145 wire discipline
@@ -275,15 +322,15 @@ ledger.
   which dispatch establishes before the check (§3 order), so each
   kind owns 24 bits instead of sharing 32. With §3's typed handles,
   the check helper demands the MATCHING right type
-  (`check(h: SystemHandle, r: SystemRight)`) — testing a channel
+  (`check(h: SystemHandle, r: SystemRight)`) — testing a pipe
   right against a System handle is a COMPILE error. The exception:
   **UNIVERSAL rights own the pinned LOW BYTE — bits 0-7, identical in
   every kind's enum (ratified Aug 7, user: reserve room, more shared
   operations are coming).** Assigned so far: bit 0 = `Transfer` (may
-  be sent over a channel — the movability capability), bit 1 =
+  be sent over a pipe — the movability capability), bit 1 =
   `Manage` (derive children); bits 2-7 RESERVED (candidates as they
   prove universal: wait/signal, introspect/info, revoke). Generic
-  kernel paths (channel handle-transfer) check universal bits without
+  kernel paths (pipe handle-transfer) check universal bits without
   knowing the kind; `sosabi` `static_assert`s each kind's enum
   against the pinned table so no kind can drift, and a kind-specific
   right below bit 8 is a spec violation the assert catches. **No DUPLICATE right — no handle
@@ -306,7 +353,7 @@ ledger.
   tens of instructions.
 - **Typed handles in the Saw API (ratified Aug 7, user).** Each object
   kind gets a DISTINCT handle type in the `sos` module —
-  `type SystemHandle = UInt`, `type ChannelHandle = UInt`, … — and the
+  `type SystemHandle = UInt`, `type PipeHandle = UInt`, … — and the
   Saw-facing wrapper holds the typed handle (`System` stores a
   `handle: SystemHandle`; its `shutdown` method passes it to the raw
   exported `sos_system_shutdown`). Saw's distinct-alias rule gives exactly the
@@ -334,7 +381,7 @@ ledger.
 - **Handle lifecycle = ownership.** Userspace handles are
   `NoCopy + Deinit` wrappers: scope exit closes (capability leaks are
   a compile error class); `move` is transfer;
-  `channel.send(move h)` enforces at COMPILE TIME that the sender no
+  `pipe.send(move h)` enforces at COMPILE TIME that the sender no
   longer holds what it sent. Kernel-side transferability (TRANSFER
   right) is checked at runtime; the language makes the userspace
   discipline free. Distinct types (`type TimerHandle = ...`) make
@@ -358,12 +405,14 @@ ledger.
 
 ## 5. Open questions (need decisions before the kernel brief)
 
-1. ~~Channel semantics~~ RESOLVED §2.1 + **base-send DECIDED (user,
+1. ~~Pipe semantics~~ RESOLVED §2.1 + **base-send DECIDED (user,
    Jul 31): STRICT RENDEZVOUS.** Every send blocks until a receiver
    takes the message — the kernel holds NO message buffers (bounded
    only by waiting senders; zero-copy handoff at the rendezvous).
    Async notification is the Event object's job (§2.4). Request/reply:
-   `call` = rendezvous handoff + block on the ReplyHandle. Message
+   `call` = rendezvous handoff + block on the PipeReplyHandle (AMENDED
+   Aug 20: no separate `call` verb — the send-and-wait form is the
+   suspending overload of `send`; §2.1). Message
    limits (max body + max handles) still apply per message; concrete
    numbers are a kernel-brief constant (orchestrator pin, veto-able:
    64-byte body, 4 handles).
@@ -405,7 +454,7 @@ ledger.
    (orchestrator pin, veto-able: magic, version, entry offset,
    segment table of {flash_off, load_addr, len, flags}) that Blade
    emits as a build target. Kernel: parse header → map/copy segments
-   (PMP/APM per §5.5) → mint root handles (boot channel, root
+   (PMP/APM per §5.5) → mint root handles (boot pipe, root
    MemoryObjects for RAM + device ranges, root IRQ table) → enter
    U-mode at the entry. Everything else derives from those handles.
 7. ~~Syscall ABI~~ **DECIDED (user, Jul 31; object-uniform Aug 5): (status,
@@ -495,7 +544,7 @@ QEMU-runnable for a fast dev loop:
   directly; no firmware protocol needed for M1-class work.)
 
 Rationale: multi-arch + 32/64-bit awareness from day one; the
-object/handle/channel/syscall model is IDENTICAL across profiles —
+object/handle/pipe/syscall model is IDENTICAL across profiles —
 divergence is confined to a small per-arch HAL (boot, trap entry,
 context switch, Mapping/AddressSpace implementation), selected at
 build time via the module-path mechanism (`--module-path
@@ -689,7 +738,7 @@ SMP-era work builds.
 - **Launching is a capability.** `create_process` requires a
   specialized LAUNCH capability, minted at boot to the root server.
   Ordinary processes cannot create processes in v1 — they ask the
-  launcher service over a channel.
+  launcher service over a pipe.
 - **The map is immutable after creation.** No remap syscall, no
   self-modification, no visibility into the map from inside the
   process (each process sees only its 4 named bands). Changing a
@@ -697,7 +746,7 @@ SMP-era work builds.
   re-prioritization design could add a LAUNCH-gated syscall without
   disturbing anything here.)
 - **No priority inheritance.** Inheritance chains through transferable
-  ReplyHandles are ill-defined (the reply obligation migrates). The
+  PipeReplyHandles are ill-defined (the reply obligation migrates). The
   mitigations: (a) the CONVENTION that servers run at ≥ the max
   priority of their clients (the launcher assigns both, so this is
   enforceable policy); (b) the **direct-switch fastpath** — on a
@@ -860,12 +909,12 @@ case whose transcript matters after handover arms none.
   arrives when that stops being true: design 232 pin 1 takes kernel
   interruptibility in M3 through explicit PREEMPTION POINTS, which need
   no lock either (a point IS the assertion that state is consistent), and
-  SMP — sequenced after channels — is what forces the lock, with the
+  SMP — sequenced after pipes — is what forces the lock, with the
   point placements as the map of where it must go.
 
 ## 10. Userspace runtime: HandlerGroup + the wake bridge (ratified Aug 3)
 
-Saw's sequential surface is UNCHANGED: `channel.call()`, `receive()`,
+Saw's sequential surface is UNCHANGED: `pipe.send()`, `receive()`,
 `read()` suspend in place on plain tasks — colorless straight-line
 code stays the substrate, and TaskGroup remains exactly what it is
 today (a lifetime/join scope for tasks on a thread pool). The
@@ -901,7 +950,7 @@ event-driven EDGE of a process gets a second, distinct construct:
   scoped non-escaping lend — the `with_ref` shape), which is sound
   precisely BECAUSE of non-reentrancy: at most one borrow live per
   attachment. Per-kind signatures: Timer → `(&Timer, fired)`;
-  Channel → `(&Channel, msg, RequestHandle)` — the RequestHandle is
+  Pipe → `(&Pipe, msg, PipeRequestHandle)` — the PipeRequestHandle is
   fresh PER MESSAGE and moves in (forwardable, per §2.1 delegation);
   Interrupt → `(&Interrupt)` with ack-on-exit default (§9).
 - **Cross-handle parallelism up to `workers`.** Parallelism WITHIN one
@@ -936,7 +985,7 @@ event-driven EDGE of a process gets a second, distinct construct:
 - **Orchestrator pins STILL OPEN:** where the physical-region refcount
   lives (§5.9), which nothing can answer until something allocates
   physical regions; §2.1's message limits (pinned 64-byte body / 4
-  handles, unbuilt with the Channel); and the §7 priority map plus root's
+  handles, unbuilt with the Pipe); and the §7 priority map plus root's
   bootstrap band map, which the loader parses and REPORTS while no
   Process slot stores either.
 - **What the kernel does NOT have after M2.** One area per line, with the
@@ -957,7 +1006,7 @@ event-driven EDGE of a process gets a second, distinct construct:
     factory-capability rights bit rather than a quota) — the per-process
     table, `QuotaExceeded`, and creator-pays accounting are design 232
     unit 5. A full slab answers `SosStatus.NoResource` today.
-  - **Channels and ReplyHandle** (§2.1) — M4; the one fully ratified
+  - **Pipes and PipeReplyHandle** (§2.1) — M4; the one fully ratified
     object surface with no implementation at all.
   - **Handle close and generations** (§3) — no op table has a close op
     and a handle entry carries no generation, so §3's stale-handle
@@ -969,7 +1018,7 @@ event-driven EDGE of a process gets a second, distinct construct:
   - **Kernel interruptibility, `IntrSpinLock` (§9b), SMP** — design 178's
     D2 holds (interrupts are taken from user mode only); design 232 pin 1
     rules preemption points into M3 as unit 1.5, and SMP waits for
-    channels.
+    pipes.
   - **`HandlerGroup`** (§10) — userspace runtime work rather than kernel
     surface, and unbuilt: a process wires a Waiter by hand today.
   - **The mapped vDSO** (§5.7) — delivery is still static linking, which
@@ -1224,7 +1273,7 @@ event-driven EDGE of a process gets a second, distinct construct:
   become real objects in M3, and neither widens the register the kernel
   enters user mode with.
   NOTE (object-model brief material): the creation-authority model for
-  plain objects (Channel/Event/Waiter/Timer) — quota-gated free
+  plain objects (Pipe/Event/Waiter/Timer) — quota-gated free
   creation vs a factory capability — is an open pin; M1 does not need
   it (root spawns nothing). **ANSWERED BY M2 (design 178 unit 3): the
   factory capability, spelled as rights bits on the Process object.**
@@ -1240,8 +1289,8 @@ event-driven EDGE of a process gets a second, distinct construct:
   obtains itself (e.g. a flash MemoryObject it holds), via LAUNCH +
   `create_process`. The kernel has no second code path for process two.
 - **v1 protocol conventions** (userspace convention section, not kernel
-  surface): a launched process receives ONE bootstrap channel handle at
+  surface): a launched process receives ONE bootstrap pipe handle at
   launch; its first messages request its initial handle set from the
   launcher (name-service discovery = ask by string name over that
-  channel). Conventions are versioned in the `sos` userspace module,
+  pipe). Conventions are versioned in the `sos` userspace module,
   not in the kernel.

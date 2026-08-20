@@ -175,19 +175,19 @@ public static ENTRY_IMAGE: UInt = 0
 //     interpreted against its handle's kind, so each kind owns 24 bits of its
 //     own instead of all kinds sharing 32.
 //   - The check is TYPED. `SystemObject.allows` takes a `SystemRight` and
-//     nothing else, so testing a channel right against a System handle is a
+//     nothing else, so testing a pipe right against a System handle is a
 //     compile error rather than a bit comparison that quietly answers.
 //
 // THE UNIVERSAL LOW BYTE. Bits 0-7 are identical in EVERY kind's enum:
 //
-//   bit 0   Transfer   may be sent over a channel — the movability capability
+//   bit 0   Transfer   may be sent over a pipe — the movability capability
 //   bit 1   Manage     derive children
 //   bits 2-7           RESERVED (candidates as they prove universal:
 //                      wait/signal, introspect/info, revoke)
 //
 // Six bits are reserved rather than assigned because more shared operations are
 // coming and a universal right added later must not have to move a kind's bits
-// to make room. Generic kernel paths — channel handle-transfer is the first —
+// to make room. Generic kernel paths — pipe handle-transfer is the first —
 // check universal bits without knowing the kind, which is only sound while the
 // table holds, so the `static_assert`s below hold it: they are what stops a kind
 // enum from drifting, and what catches a kind-specific right placed below bit 8.
@@ -217,7 +217,7 @@ public enum SystemRight: UInt32 {
 
 // The universal low byte, pinned. Every kind's enum repeats these two asserts
 // verbatim; that repetition IS the check, since it is what makes a drifted bit
-// fail to build rather than fail in a channel transfer years later.
+// fail to build rather than fail in a pipe transfer years later.
 static_assert((SystemRight.Transfer as UInt32) == 1,
               "universal right Transfer must be bit 0 in every kind's enum")
 static_assert((SystemRight.Manage as UInt32) == 2,
@@ -248,7 +248,7 @@ static_assert((SystemRight.ClockGet as UInt32) >= 256,
 ///
 /// `EventCreate` and `WaiterCreate` are M2 unit 3's, and where they sit ANSWERS
 /// an open pin: spec §12 leaves the creation-authority model for plain objects
-/// (Channel/Event/Waiter/Timer) open between quota-gated free creation and a
+/// (Pipe/Event/Waiter/Timer) open between quota-gated free creation and a
 /// factory capability. This is the factory capability, and it is one a process
 /// already holds — the Process object is what an Event or a Waiter is CHARGED
 /// to (its slab slot, its handle-table entry, its teardown), so making the
@@ -841,7 +841,7 @@ public enum EventMode: UInt {
 // `Waiter.Wait` answers with a RECORD the kernel COPIES OUT into a buffer the
 // caller supplies, not with registers. That is what lets the answer carry a
 // per-waitable payload without the ABI growing a register per object kind: a
-// Channel's readiness is not a Timer's is not an Event's, and a fixed register
+// Pipe's readiness is not a Timer's is not an Event's, and a fixed register
 // pair would have had to be the union of all of them forever.
 //
 // THE KEY IS UNIVERSAL AND IS FACTORED OUT. Every waitable answers with the
@@ -861,7 +861,7 @@ public enum EventMode: UInt {
 /// Raw-backed (design 145's wire idiom): every case states its number, so a
 /// reorder cannot renumber them, and the userspace decode reads it through
 /// `from(raw:)`, which is total. The tag SPACE is extensible: §2.2 and §8
-/// already name the kinds that follow (a Channel readable or reply-ready, a
+/// already name the kinds that follow (a Pipe readable or reply-ready, a
 /// Timer fired, an Interrupt asserted, a Thread or Process exited), and each
 /// takes the next number without moving this one.
 ///
@@ -965,7 +965,7 @@ public struct WaitResult {
 // TWO MORE RECORDS, AND ONE OF THEM GOES THE OTHER WAY. `Clock.Now` answers
 // with a copy-OUT record on the `Waiter.Wait` precedent; `Timer.Arm` takes its
 // arguments through a copy-IN record, which is the funnel's mirror twin and is
-// built here because M4's Channel `send` needs exactly this shape for a message
+// built here because M4's Pipe `send` needs exactly this shape for a message
 // body (§2.1). Timer.Arm is its small first consumer precisely as Waiter.Wait
 // was for copy-out.
 //
