@@ -40,14 +40,14 @@ import kcore.time.{TIMERS, saturating_add}
 /// EXHAUSTIVE OVER WAITABLES rather than over object types: a fifth object kind
 /// that is not waitable costs them nothing, and a fifth WAITABLE kind fails all
 /// four to compile until somebody answers for it.
-public enum WaitableKind: UInt8 {
+public(package) enum WaitableKind: UInt8 {
     case Event = 0,
     case Interrupt = 1,
     case Timer = 2,
 }
 
 /// A waitable the dispatch has resolved: which table, which slot.
-public struct Waitable {
+public(package) struct Waitable {
     public kind: WaitableKind,
     public slot: Int,
 }
@@ -73,7 +73,7 @@ public struct Waitable {
 /// an Interrupt has the same field and neither kind should carry a copy of the
 /// wait machinery. Slot indices are stored PLUS ONE so that zero means "none",
 /// which is what a zeroed static already says.
-public struct EventSlot {
+public(package) struct EventSlot {
     public state: SlotState,
     public process: Int,
     /// §2.4's per-Event accumulation mode, fixed at creation.
@@ -100,7 +100,7 @@ public struct EventSlot {
 /// handful of loads and is bounded by the same argument every other scan in the
 /// interrupt path is (design 178 D2 — it runs with interrupts masked, so its
 /// length is interrupt latency).
-public struct InterruptSlot {
+public(package) struct InterruptSlot {
     public state: SlotState,
     public process: Int,
     /// The IRQ line this object is bound to, for its whole life.
@@ -119,7 +119,7 @@ public struct InterruptSlot {
 /// several. Readiness is NOT a third list: it is derived by scanning `attached`
 /// for something ready, which is the level-triggered semantics stated as an
 /// implementation rather than maintained beside one.
-public struct WaiterSlot {
+public(package) struct WaiterSlot {
     public state: SlotState,
     public process: Int,
     /// Head of the attachment list (attachment slot + 1).
@@ -140,7 +140,7 @@ public struct WaiterSlot {
 /// What each waitable still keeps is a single `attachment` field, which is the
 /// answer to the only question the SIGNAL side asks: who, if anyone, is
 /// watching me.
-public struct Attachment {
+public(package) struct Attachment {
     public state: SlotState,
     /// Which table `target` indexes.
     public kind: WaitableKind,
@@ -155,24 +155,24 @@ public struct Attachment {
     public link: Int,
 }
 
-public unsafe static var EVENTS: [EventSlot; MAX_EVENTS] = [
+public(package) unsafe static var EVENTS: [EventSlot; MAX_EVENTS] = [
     EventSlot(state: SlotState.Free, process: 0, mode: EventMode.Or, word: 0,
               attachment: 0); MAX_EVENTS]
 
-public unsafe static var WAITERS: [WaiterSlot; MAX_WAITERS] = [
+public(package) unsafe static var WAITERS: [WaiterSlot; MAX_WAITERS] = [
     WaiterSlot(state: SlotState.Free, process: 0, attached: 0,
                blocked: 0); MAX_WAITERS]
 
-public unsafe static var INTERRUPTS: [InterruptSlot; MAX_INTERRUPTS] = [
+public(package) unsafe static var INTERRUPTS: [InterruptSlot; MAX_INTERRUPTS] = [
     InterruptSlot(state: SlotState.Free, process: 0, line: 0, pending: false,
                   attachment: 0); MAX_INTERRUPTS]
 
-public unsafe static var ATTACHMENTS: [Attachment; MAX_ATTACHMENTS] = [
+public(package) unsafe static var ATTACHMENTS: [Attachment; MAX_ATTACHMENTS] = [
     Attachment(state: SlotState.Free, kind: WaitableKind.Event, target: 0,
                waiter: 0, key: 0, link: 0); MAX_ATTACHMENTS]
 
 /// Take a free event slot, or `NO_EVENT` when the slab is empty.
-public func alloc_event() unsafe -> Int {
+public(package) func alloc_event() unsafe -> Int {
     var i: Int = 0
     while i < MAX_EVENTS {
         match EVENTS[i].state {
@@ -185,7 +185,7 @@ public func alloc_event() unsafe -> Int {
 }
 
 /// Take a free waiter slot, or `NO_WAITER` when the slab is empty.
-public func alloc_waiter() unsafe -> Int {
+public(package) func alloc_waiter() unsafe -> Int {
     var i: Int = 0
     while i < MAX_WAITERS {
         match WAITERS[i].state {
@@ -198,7 +198,7 @@ public func alloc_waiter() unsafe -> Int {
 }
 
 /// Take a free interrupt slot, or `NO_INTERRUPT` when the slab is empty.
-public func alloc_interrupt() unsafe -> Int {
+public(package) func alloc_interrupt() unsafe -> Int {
     var i: Int = 0
     while i < MAX_INTERRUPTS {
         match INTERRUPTS[i].state {
@@ -211,7 +211,7 @@ public func alloc_interrupt() unsafe -> Int {
 }
 
 /// Take a free attachment slot, or `NO_ATTACHMENT` when the slab is empty.
-public func alloc_attachment() unsafe -> Int {
+public(package) func alloc_attachment() unsafe -> Int {
     var i: Int = 0
     while i < MAX_ATTACHMENTS {
         match ATTACHMENTS[i].state {
@@ -267,7 +267,7 @@ public func alloc_attachment() unsafe -> Int {
 /// what "not ready" means — a wrap would make a saturated event go quiet.
 /// `&+` is the wrapping add (Saw's overflow checks are always on, so a plain
 /// `+` would panic in the kernel), and the comparison after it is the carry.
-public func accumulate(slot: Int, bits: UInt) unsafe {
+public(package) func accumulate(slot: Int, bits: UInt) unsafe {
     match EVENTS[slot].mode {
         case Or -> {
             EVENTS[slot].word = EVENTS[slot].word | bits
@@ -304,7 +304,7 @@ public func accumulate(slot: Int, bits: UInt) unsafe {
 // copy-out — is kind-blind and appears exactly once below.
 
 /// Which attachment names this waitable (slot + 1), or 0.
-public func waitable_attachment(kind: WaitableKind, slot: Int) unsafe -> Int {
+public(package) func waitable_attachment(kind: WaitableKind, slot: Int) unsafe -> Int {
     match kind {
         case Event -> EVENTS[slot].attachment,
         case Interrupt -> INTERRUPTS[slot].attachment,
@@ -313,7 +313,7 @@ public func waitable_attachment(kind: WaitableKind, slot: Int) unsafe -> Int {
 }
 
 /// Record (or clear, with 0) which attachment names this waitable.
-public func set_waitable_attachment(kind: WaitableKind, slot: Int, a: Int) unsafe {
+public(package) func set_waitable_attachment(kind: WaitableKind, slot: Int, a: Int) unsafe {
     match kind {
         case Event -> { EVENTS[slot].attachment = a },
         case Interrupt -> { INTERRUPTS[slot].attachment = a },
@@ -328,7 +328,7 @@ public func set_waitable_attachment(kind: WaitableKind, slot: Int, a: Int) unsaf
 /// absence rather than a mechanism: an Event is ready while its word is
 /// non-zero, an Interrupt while its fire is unacked, a Timer while it has
 /// expiries nobody has been told about.
-public func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Bool {
+public(package) func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Bool {
     match kind {
         case Event -> EVENTS[slot].word != 0,
         case Interrupt -> INTERRUPTS[slot].pending,
@@ -337,7 +337,7 @@ public func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Bool {
 }
 
 /// The tag and payload words a wait record carries for this waitable.
-public func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> WaitAnswer {
+public(package) func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> WaitAnswer {
     match kind {
         case Event -> WaitAnswer(tag: WaitTag.Event, payload: EVENTS[slot].word),
         case Interrupt -> WaitAnswer(tag: WaitTag.Interrupt,
@@ -371,7 +371,7 @@ public func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> WaitAnswer 
 /// So the ODD KIND OUT IS THE INTERRUPT, and its emptiness says what it is: the
 /// only readiness in the system whose end is a DEVICE's business rather than the
 /// kernel's.
-public func waitable_consume(kind: WaitableKind, slot: Int) unsafe {
+public(package) func waitable_consume(kind: WaitableKind, slot: Int) unsafe {
     match kind {
         // The take is READ-AND-CLEAR, and `deliver_attachment` is what makes it
         // one act: the read happened a few lines earlier in the same
@@ -399,7 +399,7 @@ struct WaitAnswer {
 /// argument the ready queue's is — this runs with interrupts masked, so its
 /// length is interrupt latency (design 178 D2), and a Waiter with hundreds of
 /// attachments is what an M3 ready-list optimisation would be for.
-public func waiter_ready_attachment(w: Int) unsafe -> Int {
+public(package) func waiter_ready_attachment(w: Int) unsafe -> Int {
     var cur = WAITERS[w].attached
     while cur != 0 {
         let a = cur - 1
@@ -413,7 +413,7 @@ public func waiter_ready_attachment(w: Int) unsafe -> Int {
 
 /// Park the running thread on `w`'s blocked list, remembering where its record
 /// goes. `dst` has already been through `copy_out_check`.
-public func block_on_wait(slot: Int, w: Int, dst: UInt) unsafe {
+public(package) func block_on_wait(slot: Int, w: Int, dst: UInt) unsafe {
     THREADS[slot].state = ThreadState.Blocked
     THREADS[slot].wait_buf = dst
     THREADS[slot].link = WAITERS[w].blocked
@@ -427,7 +427,7 @@ public func block_on_wait(slot: Int, w: Int, dst: UInt) unsafe {
 /// TABLE keyed by it rather than a bag: `Remove` names an attachment this way,
 /// and `Add` uses the same walk to refuse a duplicate. Both rest on keys being
 /// unique per Waiter, which is exactly why the duplicate is refused.
-public func attached_by_key(w: Int, key: UInt) unsafe -> Int {
+public(package) func attached_by_key(w: Int, key: UInt) unsafe -> Int {
     var cur = WAITERS[w].attached
     while cur != 0 {
         let a = cur - 1
@@ -442,7 +442,7 @@ public func attached_by_key(w: Int, key: UInt) unsafe -> Int {
 /// Take attachment `a` off waiter `w`'s list, clear the waitable's back
 /// pointer, and return the slot to the slab. The caller has established that it
 /// is on that list.
-public func detach_attachment(w: Int, a: Int) unsafe {
+public(package) func detach_attachment(w: Int, a: Int) unsafe {
     var prev: Int = 0
     var cur = WAITERS[w].attached
     while cur != 0 {
@@ -472,7 +472,7 @@ public func detach_attachment(w: Int, a: Int) unsafe {
 /// description of the same fact — the bindings are already in the table, and
 /// the table is the only place a line may be bound twice, which `interrupt_bind`
 /// refuses using exactly this walk.
-public func interrupt_by_line(line: UInt) unsafe -> Int {
+public(package) func interrupt_by_line(line: UInt) unsafe -> Int {
     var i: Int = 0
     while i < MAX_INTERRUPTS {
         match INTERRUPTS[i].state {

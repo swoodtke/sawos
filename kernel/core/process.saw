@@ -112,7 +112,7 @@ struct ProcessSlot {
     exit_code: UInt,
 }
 
-public unsafe static var PROCESSES: [ProcessSlot; MAX_PROCESSES] = [
+public(package) unsafe static var PROCESSES: [ProcessSlot; MAX_PROCESSES] = [
     ProcessSlot(state: ProcessState.Free, self_handle: 0, entry: 0,
              region_base: 0, region_top: 0, rw_base: 0, rw_top: 0,
              exit_kind: ProcessStatusKind.Running, exit_code: 0); MAX_PROCESSES]
@@ -133,7 +133,7 @@ public unsafe static var PROCESSES: [ProcessSlot; MAX_PROCESSES] = [
 /// questions: `code` is what a supervisor would read out of the §8 status word,
 /// and `machine_status` is what the EMULATOR exits with — which for a fault is
 /// the kernel's own vocabulary rather than anything the process chose.
-public func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
+public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
                  machine_status: UInt) unsafe -> Never {
     PROCESSES[p].state = ProcessState.Gone
     PROCESSES[p].exit_kind = kind
@@ -319,7 +319,7 @@ public func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
 /// aimed at the wrong thread DOES. It is not a status the process receives: the
 /// process is the thing that was wrong, so it ends, and the kernel stays up to
 /// say so. Never returns.
-public func fault_process(p: Int, reason: FaultReason) unsafe -> Never {
+public(package) func fault_process(p: Int, reason: FaultReason) unsafe -> Never {
     let uart = console()
     uart.write_str("SOS: process fault: ")
     uart.write_str(reason.describe())
@@ -332,7 +332,7 @@ public func fault_process(p: Int, reason: FaultReason) unsafe -> Never {
 /// (spec §8: a thread fault kills its process). The report keeps M1's wording
 /// and shape, because the harness reads it and because a reader of the two eras
 /// should see the same line for the same event.
-public func fault_trap(tag: String, cause: UInt, epc: UInt, tval: UInt) unsafe -> Never {
+public(package) func fault_trap(tag: String, cause: UInt, epc: UInt, tval: UInt) unsafe -> Never {
     let uart = console()
     uart.write_str("SOS: fault ")
     uart.write_str(tag)
@@ -389,7 +389,7 @@ public func fault_trap(tag: String, cause: UInt, epc: UInt, tval: UInt) unsafe -
 /// that process is still the running one, rather than at some later wake in
 /// another thread's context. Every other consumer validates and copies in one
 /// step, which is what `copy_out` is.
-public func copy_out_check(p: Int, dst: UInt, bytes: UInt) unsafe {
+public(package) func copy_out_check(p: Int, dst: UInt, bytes: UInt) unsafe {
     if (dst % word_bytes()) != 0 {
         fault_process(p, FaultReason.BadAlign)
     }
@@ -418,7 +418,7 @@ public func copy_out_check(p: Int, dst: UInt, bytes: UInt) unsafe {
 ///
 /// Nothing else in the kernel may dereference a user address. That is the whole
 /// rule, and it is one function long so it stays checkable by reading.
-public func copy_out(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe {
+public(package) func copy_out(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe {
     copy_out_check(p, dst, bytes)
     copy_bytes(dst, src, bytes)
 }
@@ -484,7 +484,7 @@ public func copy_out(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe {
 /// have that shape: a copy-in happens while the calling process is still the
 /// running one, by construction, because its arguments are what the op is
 /// about. A door that cannot be used late needs no early check.
-public func copy_in(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe {
+public(package) func copy_in(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe {
     if (src % word_bytes()) != 0 {
         fault_process(p, FaultReason.BadAlign)
     }

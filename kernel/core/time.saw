@@ -34,7 +34,7 @@ import kcore.objects.{SlotState}
 /// `clock_now` dispatches on: the domain decides what reading the object
 /// answers with, and a second domain should fail to compile until somebody says
 /// what its reading is.
-public struct ClockSlot {
+public(package) struct ClockSlot {
     /// The domain this clock answers in, for the life of the machine. `public`
     /// because `Clock.Now` dispatches on it, and the ops are their own module
     /// since the split.
@@ -66,7 +66,7 @@ public struct ClockSlot {
 /// that call it: `arm`, `disarm`, `is_due`, `sooner_of`, `fire`. Those are safe
 /// functions, and the `unsafe` on the ops around them is the SLAB's rather than
 /// the timer's.
-public struct TimerSlot {
+public(package) struct TimerSlot {
     public state: SlotState,
     public process: Int,
     /// The Clock slot this timer measures against, for its life.
@@ -93,18 +93,18 @@ public struct TimerSlot {
 /// The machine's clocks, one per domain, LIVE FROM BOOT. There is no `Free`
 /// state and no allocation step: the table is the domain list written down, and
 /// `clock_slot` is the only thing that indexes it.
-public unsafe static var CLOCKS: [ClockSlot; CLOCK_KINDS] = [
+public(package) unsafe static var CLOCKS: [ClockSlot; CLOCK_KINDS] = [
     ClockSlot(kind: ClockType.Monotonic); CLOCK_KINDS]
 
 /// The slot naming `kind`'s clock — the whole of the lookup, because THE SLOT IS
 /// THE ORDINAL. `ClockType`'s raw values start at zero and are dense by
 /// construction (design 145's wire idiom numbers them), so the domain and its
 /// row are one fact rather than two kept in step.
-public func clock_slot(kind: ClockType) -> Int {
+public(package) func clock_slot(kind: ClockType) -> Int {
     (kind as UInt) as Int
 }
 
-public unsafe static var TIMERS: [TimerSlot; MAX_TIMERS] = [
+public(package) unsafe static var TIMERS: [TimerSlot; MAX_TIMERS] = [
     TimerSlot(state: SlotState.Free, process: 0, clock: 0, armed: false,
               deadline_ns: 0, interval_ns: 0, fires: 0,
               attachment: 0); MAX_TIMERS]
@@ -114,7 +114,7 @@ public unsafe static var TIMERS: [TimerSlot; MAX_TIMERS] = [
 // run out of — `System.ClockGet` mints a HANDLE and never an object.
 
 /// Take a free timer slot, or `NO_TIMER` when the slab is empty.
-public func alloc_timer() unsafe -> Int {
+public(package) func alloc_timer() unsafe -> Int {
     var i: Int = 0
     while i < MAX_TIMERS {
         match TIMERS[i].state {
@@ -135,7 +135,7 @@ public func alloc_timer() unsafe -> Int {
 /// go quiet — the one failure mode a level-triggered notification must not have.
 /// `&+` is the wrapping add (Saw's overflow checks are always on, so a plain `+`
 /// would panic in the kernel), and the comparison after it is the carry.
-public func saturating_add(a: UInt, b: UInt) -> UInt {
+public(package) func saturating_add(a: UInt, b: UInt) -> UInt {
     let sum = a &+ b
     if sum < a { UInt.max } else { sum }
 }
@@ -331,7 +331,7 @@ static NS_PER_US: UInt64 = 1000
 /// `reprogram_timer` has one code path: an empty schedule programs `never`,
 /// which is what stops a level-triggered comparator left in the past from
 /// re-firing forever.
-public static NEVER_NS: UInt64 = UInt64.max
+public(package) static NEVER_NS: UInt64 = UInt64.max
 
 /// How far ahead of NOW the hardware is ever programmed.
 ///
@@ -358,10 +358,10 @@ static TIMER_MIN_LEAD_NS: UInt64 = 50_000
 /// its first few ticks, see `Console`'s handover protocol). It is a state the
 /// composition has to carry rather than an edge case, because a kernel with no
 /// tick and one armed Timer is exactly the shape a sleeping process makes.
-public unsafe static var TICK_PERIOD_NS: UInt64 = 0
+public(package) unsafe static var TICK_PERIOD_NS: UInt64 = 0
 
 /// When the next scheduler tick is due, on the same clock every deadline uses.
-public unsafe static var NEXT_TICK_NS: UInt64 = 0
+public(package) unsafe static var NEXT_TICK_NS: UInt64 = 0
 
 /// Start the periodic scheduler tick (spec §7's fixed timeslice).
 ///
@@ -388,7 +388,7 @@ public func start_tick(period_us: UInt) unsafe {
 /// answers — what is the earliest thing this kernel owes anybody — has to be
 /// asked over the WHOLE schedule every time, and a caller that programmed only
 /// its own deadline would silently push somebody else's out.
-public func reprogram_timer() unsafe {
+public(package) func reprogram_timer() unsafe {
     var next = NEVER_NS
     if TICK_PERIOD_NS != 0 && NEXT_TICK_NS < next {
         next = NEXT_TICK_NS

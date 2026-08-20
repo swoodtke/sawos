@@ -53,7 +53,7 @@ import kcore.mem.{align_up}
 unsafe static var THREAD_FRAMES: [UInt64; FRAME_ARENA_WORDS] = [0; FRAME_ARENA_WORDS]
 
 /// The address of thread slot `index`'s frame.
-public func frame_slot(index: Int) unsafe -> UInt {
+public(package) func frame_slot(index: Int) unsafe -> UInt {
     let stride = THREAD_FRAME_STRIDE as UInt
     let base = align_up(((&var THREAD_FRAMES) as UnsafePointer<UInt64>) as UInt, stride)
     base + (index as UInt) * stride
@@ -67,7 +67,7 @@ public func frame_slot(index: Int) unsafe -> UInt {
 /// handle-close op, which M2 does not have — and without close, no slot is ever
 /// reused, which is also why handles carry no generation yet (§3's
 /// stale-handle detection has nothing to detect until a slot can be reused).
-public enum ThreadState: UInt8 {
+public(package) enum ThreadState: UInt8 {
     case Free = 0,
     case Created = 1,
     case Runnable = 2,
@@ -83,7 +83,7 @@ public enum ThreadState: UInt8 {
 /// list of the thread it is waiting for when it is blocked. Slot indices are
 /// stored PLUS ONE so that zero means "no thread", which is what a zeroed
 /// static already says.
-public struct ThreadSlot {
+public(package) struct ThreadSlot {
     /// `public` because PARKING A THREAD HAPPENS OUTSIDE THIS MODULE since the
     /// split: `waitables` blocks one on a Waiter's list. The state machine is
     /// still described here and nowhere else.
@@ -106,7 +106,7 @@ public struct ThreadSlot {
     public wait_buf: UInt,
 }
 
-public unsafe static var THREADS: [ThreadSlot; MAX_THREADS] = [
+public(package) unsafe static var THREADS: [ThreadSlot; MAX_THREADS] = [
     ThreadSlot(state: ThreadState.Free, process: 0, self_handle: 0,
                exit_code: 0, joiners: 0, link: 0, wait_buf: 0); MAX_THREADS]
 
@@ -118,33 +118,33 @@ public unsafe static var THREADS: [ThreadSlot; MAX_THREADS] = [
 /// below is for. Compound global state on design 149's terms: uniprocessor
 /// kernel, interrupts taken from user mode only (D2), so the only writer is the
 /// trap path and nothing can interleave with it.
-public unsafe static var CURRENT_THREAD: Int = NO_THREAD
+public(package) unsafe static var CURRENT_THREAD: Int = NO_THREAD
 
 /// The ready queue: a FIFO of runnable threads, head and tail as slot + 1.
 /// The RUNNING thread is not on it — round-robin is "put the outgoing thread
 /// at the tail, take the head", and both halves happen in `pick_next`.
-public unsafe static var READY_HEAD: Int = 0
+public(package) unsafe static var READY_HEAD: Int = 0
 
-public unsafe static var READY_TAIL: Int = 0
+public(package) unsafe static var READY_TAIL: Int = 0
 
 /// Set by the tick when a thread's slice runs out, and by `Yield`. Read and
 /// cleared at the user-return boundary, which is the only place it can act.
-public unsafe static var NEED_RESCHED: Bool = false
+public(package) unsafe static var NEED_RESCHED: Bool = false
 
 /// Ticks left in the running thread's slice.
-public unsafe static var SLICE_LEFT: UInt = 0
+public(package) unsafe static var SLICE_LEFT: UInt = 0
 
 /// Ticks a thread runs before the timer takes the processor away (spec §7's
 /// fixed timeslice). ONE tick, because M2's tick period is already the unit the
 /// scheduler cares about and a longer slice would only make the preemption
 /// harness wait for it.
-public static SLICE_TICKS: UInt = 1
+public(package) static SLICE_TICKS: UInt = 1
 
 // -----------------------------------------------------------------------------
 // The ready queue
 // -----------------------------------------------------------------------------
 
-public func ready_push(slot: Int) unsafe {
+public(package) func ready_push(slot: Int) unsafe {
     THREADS[slot].link = 0
     if READY_TAIL == 0 {
         READY_HEAD = slot + 1
@@ -155,7 +155,7 @@ public func ready_push(slot: Int) unsafe {
     }
 }
 
-public func ready_pop() unsafe -> Int {
+public(package) func ready_pop() unsafe -> Int {
     if READY_HEAD == 0 {
         return NO_THREAD
     }
@@ -173,7 +173,7 @@ public func ready_pop() unsafe -> Int {
 // -----------------------------------------------------------------------------
 
 /// Take a free thread slot, or `NO_THREAD` when the slab is empty.
-public func alloc_thread() unsafe -> Int {
+public(package) func alloc_thread() unsafe -> Int {
     var i: Int = 0
     while i < MAX_THREADS {
         match THREADS[i].state {
@@ -190,7 +190,7 @@ public func alloc_thread() unsafe -> Int {
 // -----------------------------------------------------------------------------
 
 /// How many of a process's threads have not exited.
-public func live_threads(p: Int) unsafe -> Int {
+public(package) func live_threads(p: Int) unsafe -> Int {
     var live: Int = 0
     var i: Int = 0
     while i < MAX_THREADS {
@@ -207,7 +207,7 @@ public func live_threads(p: Int) unsafe -> Int {
 }
 
 /// Park the running thread on `target`'s joiner list.
-public func block_on_join(slot: Int, target: Int) unsafe {
+public(package) func block_on_join(slot: Int, target: Int) unsafe {
     THREADS[slot].state = ThreadState.Blocked
     THREADS[slot].link = THREADS[target].joiners
     THREADS[target].joiners = slot + 1
@@ -217,7 +217,7 @@ public func block_on_join(slot: Int, target: Int) unsafe {
 /// The calling process. In M2 that is the process of the running thread, and
 /// before there are threads it is the only process there is — the harness
 /// kernels that enter user mode with no object model still make syscalls.
-public func calling_process() unsafe -> Int {
+public(package) func calling_process() unsafe -> Int {
     if CURRENT_THREAD == NO_THREAD {
         return 0
     }
