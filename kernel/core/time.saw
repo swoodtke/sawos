@@ -35,10 +35,10 @@ import kcore.objects.{SlotState}
 /// answers with, and a second domain should fail to compile until somebody says
 /// what its reading is.
 public(package) struct ClockSlot {
-    /// The domain this clock answers in, for the life of the machine. `public`
-    /// because `Clock.Now` dispatches on it, and the ops are their own module
-    /// since the split.
-    public kind: ClockType,
+    /// The domain this clock answers in, for the life of the machine.
+    /// `public(package)` because `Clock.Now` dispatches on it, and the ops are
+    /// their own module since the split.
+    public(package) kind: ClockType,
 }
 
 /// One Timer (spec §2 table; design 232 unit 1): a deadline on a Clock.
@@ -67,27 +67,28 @@ public(package) struct ClockSlot {
 /// functions, and the `unsafe` on the ops around them is the SLAB's rather than
 /// the timer's.
 public(package) struct TimerSlot {
-    public state: SlotState,
-    public process: Int,
+    public(package) state: SlotState,
+    public(package) process: Int,
     /// The Clock slot this timer measures against, for its life.
-    public clock: Int,
+    public(package) clock: Int,
     /// Whether a deadline is scheduled. A one-shot clears this when it fires.
-    public armed: Bool,
+    public(package) armed: Bool,
     /// The absolute deadline of the NEXT fire, in the clock's nanoseconds.
-    public deadline_ns: UInt64,
+    public(package) deadline_ns: UInt64,
     /// The re-arm period; 0 is a ONE-SHOT.
-    public interval_ns: UInt64,
+    public(package) interval_ns: UInt64,
     /// Fires not yet delivered to a waiter. Non-zero = ready. Saturates.
     ///
-    /// `public` because READINESS IS ASKED FROM THE WAIT SIDE: the per-kind
-    /// matrix in `waitables` reads this to answer "is this waitable ready" and
-    /// "what does its record say", and since the split that is another module.
-    public fires: UInt,
+    /// `public(package)` because READINESS IS ASKED FROM THE WAIT SIDE: the
+    /// per-kind matrix in `waitables` reads this to answer "is this waitable
+    /// ready" and "what does its record say", and since the split that is
+    /// another module.
+    public(package) fires: UInt,
     /// The attachment naming this timer (slot + 1); 0 = unattached.
     ///
-    /// `public` to the same reader: who is watching me is one of the matrix's
-    /// five questions, and it both reads and clears this.
-    public attachment: Int,
+    /// `public(package)` to the same reader: who is watching me is one of the
+    /// matrix's five questions, and it both reads and clears this.
+    public(package) attachment: Int,
 }
 
 /// The machine's clocks, one per domain, LIVE FROM BOOT. There is no `Free`
@@ -187,7 +188,7 @@ extension TimerSlot {
     /// running timer is the ordinary way to change a timeout, which is the shape
     /// M4's select-with-timeout is made of, and refusing it would make the
     /// common idiom unwritable.
-    public func arm(&var self, deadline: UInt64, interval: UInt64) {
+    public(package) func arm(&var self, deadline: UInt64, interval: UInt64) {
         self.armed = true
         self.deadline_ns = deadline
         self.interval_ns = interval
@@ -200,7 +201,7 @@ extension TimerSlot {
     /// a clean cancel: a caller who wants the fires reads them with a wait
     /// first. Why disarming an UNARMED timer is a no-op rather than a fault is
     /// `timer_disarm`'s business, since that is the question the OP answers.
-    public func disarm(&var self) {
+    public(package) func disarm(&var self) {
         // The `u64` suffixes are owed to DF-232a and should come off when it
         // closes: a bare literal does NOT adopt the expected fixed-width type in
         // plain assignment position (it does in an annotation, a struct literal
@@ -215,7 +216,7 @@ extension TimerSlot {
     }
 
     /// Has this timer come due by `now`? An unarmed one never has.
-    public func is_due(&self, now: UInt64) -> Bool {
+    public(package) func is_due(&self, now: UInt64) -> Bool {
         self.armed && self.deadline_ns <= now
     }
 
@@ -246,7 +247,7 @@ extension TimerSlot {
     /// interval far shorter than the machine can serve costs one divide, not a
     /// spin — so there is no long loop here for design 232 unit 1.5's preemption
     /// points to have to cover, and no minimum interval anyone has to invent.
-    public func fire(&var self, now: UInt64) {
+    public(package) func fire(&var self, now: UInt64) {
         let interval = self.interval_ns
         if interval == 0 {
             // A ONE-SHOT DISARMS ITSELF. There is no schedule left, so the
