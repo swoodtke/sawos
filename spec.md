@@ -1239,8 +1239,9 @@ event-driven EDGE of a process gets a second, distinct construct:
     as a harness timeout rather than as a report.
     (e) **Two language findings, neither worked around** (DF-232a, an internal
     compiler error on a bare literal assigned to a fixed-width place; DF-232b,
-    `type` is a keyword so the ruled `clock_get(type:)` label is unwritable and
-    is built as `kind:`).
+    `type` was a keyword so the ruled `clock_get(type:)` label was unwritable
+    and shipped as `kind:`. `type` became CONTEXTUAL Aug 17 and the label reads
+    `type:` as ruled).
     (f) **THREE REVIEW RULINGS (user, Aug 17), all on this branch.** (i) An
     EVENT'S WORD IS CONSUMED ON DELIVERY: a wait record reads and clears it in
     one interrupts-masked step, so a value is reported exactly once, and
