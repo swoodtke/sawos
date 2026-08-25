@@ -232,6 +232,21 @@ public func abort_status(code: UInt) -> UInt {
 // That coincidence is recorded rather than engineered around: SOS stores no
 // second copy of the number, and `code` reads back as the same value `kind` was
 // built from.
+//
+// AND THE SAME QUESTION FOR THREADS (design 242 ruling 4, unit 3). The hosted
+// runtime grew `__saw_rt_thread_detach(ctrl)` — `pthread_detach`, plus the
+// handoff of the thread control block's ownership to that thread's own exit
+// path. There is nothing here to detach: this runtime has no thread surface at
+// all, so it implements neither `__saw_rt_thread_spawn` nor `_join` either, and
+// a seam nobody can reach needs no body.
+//
+// The ruled answer for when SOS does grow one is REFUSE, never NO-OP. A silent
+// no-op would tell a caller its thread was detached when no thread exists, and
+// would leak the control block of every one — two failures the never-hide-errors
+// doctrine forbids on their own. Today that refusal arrives for free and by the
+// same route the rest of the thread surface takes: a `Thread.spawn` in an SOS
+// image fails at LINK with the spawn seam missing, long before a `detach` could
+// be reached.
 
 // Where a byte goes, and how the machine stops. Everything below is written
 // against these two and nothing else. See the module header for who answers.
