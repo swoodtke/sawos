@@ -21,10 +21,12 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
-- M3 unit 1.5 — kernel interruptibility [sawlang#232 pin 1]: preemption
-  points (lean mechanism), synthetic long-op + selftest proof both
-  arches, placement audit of every existing kernel loop. Opens sawos
-  design #1
+- M3 unit 1.5 — kernel interruptibility [sawlang#232 pin 1, #1 —
+  designs/001-kernel-interruptibility.md, authored Aug 28]: poll-based
+  preemption points (D-1), IN_DELIVERY guard (D-2), PREEMPT_STRIDE
+  (D-3), placement audit table, `preempt_tick`/`preempt_extirq` proof
+  cases both arches. DISPATCHED to an implementing agent Aug 28;
+  closes in place here when the branch parks
 - M3 unit 2 — CreateProcess [sawlang#232]: two-phase inert-until-started
   lifecycle, image copy born with its points
 - M3 unit 2.75 — handle lifecycle [sawlang#232]
