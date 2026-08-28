@@ -1,0 +1,98 @@
+//! LONG OPERATIONS, MADE INTERRUPTIBLE (design 1, M3 unit 1.5).
+//!
+//! Two movers, and they are `mem`'s two byte loops with a CADENCE around them:
+//! every `PREEMPT_STRIDE` bytes the operation stops and asks the machine whether
+//! it wants anything (`irq.preempt_point`). Everything that copies or clears in
+//! bulk goes through these — the loader's segment placement today, unit 2's
+//! CreateProcess image copy next — so the audit sentence for a long copy is
+//! written ONCE, here, instead of once per caller.
+//!
+//! # WHY THE POINTS ARE NOT IN `mem` BESIDE THE LOOPS THEY DRIVE
+//!
+//! Design 1 asked for the points INSIDE `copy_bytes`/`zero_bytes`, with no twin
+//! and no parameter. They cannot go there, and the reason is a genuine cycle
+//! rather than a tidiness question — it is recorded in the design's as-built
+//! section and restated here because this module IS the resolution.
+//!
+//! A point delivers, so it needs `irq.deliver_line`. Delivery reaches down:
+//! `deliver_line` -> `on_timer_interrupt` -> `expire_timers` -> `fire_timer` ->
+//! `wake.notify_ready` -> `wake_one_waiter` -> `deliver_attachment` ->
+//! `process.copy_out` -> `mem.copy_bytes`. So the byte loop is BELOW delivery in
+//! the module order and delivery is ABOVE it, and a point written in the loop
+//! would be `mem` importing `irq` — the cycle DF-232e diagnoses. There is no
+//! indirection to route around it either: a `FuncPointer` hook installed at boot
+//! would need a mutable static holding a function address, and a static
+//! initializer is a constant expression (`static X must be initialized by a
+//! compile-time constant`), so the hook cannot even be declared.
+//!
+//! WHAT SURVIVES OF THE ORIGINAL SHAPE, which is what matters: the byte loop
+//! exists ONCE (in `mem`), the point exists ONCE (in `irq`), and the cadence that
+//! joins them exists ONCE (here). Nothing is duplicated and no call site chooses
+//! a policy — it chooses an ALTITUDE, and the two altitudes are named for what
+//! they are. `mem`'s loops are the primitive; these are the operation.
+//!
+//! WHAT DOES NOT SURVIVE: a bulk copy issued from BELOW this module cannot take
+//! a point. Today that is only `process.copy_out`/`copy_in`, whose one bulk
+//! caller is a wait record of 24 bytes — under a single stride, and inert under
+//! `IN_DELIVERY` anyway. §2.1's Pipe bodies are the length that will want one,
+//! and their callers (`dispatch`) sit above this module, so the door can grow a
+//! pointed sibling THERE when it does. `mem`'s movers say so at their site.
+
+import kcore.mem.{copy_bytes, zero_bytes}
+import kcore.irq.{preempt_point}
+
+/// How many bytes a long operation moves between preemption points.
+///
+/// A POINT COSTS A CONTROLLER ROUND TRIP — a claim read on one profile, an
+/// acknowledge register on the other — so polling per byte would multiply a
+/// 240 KiB copy by that cost. 4 KiB is design 1's D-3 starting value, and the
+/// reasoning is a pair of bounds: a stride's worth of byte moves is tens of
+/// microseconds of masked latency, which is the number this unit exists to bring
+/// down, and one
+/// poll per 4096 moves is under 1% of the copy, which is what it may cost to do
+/// it. Both bounds are loose; the number is meant to be re-measured, not
+/// defended.
+///
+/// It is a page on both profiles, which is not why it was chosen but is why it
+/// reads well beside a loader that places page-aligned segments.
+public(package) static PREEMPT_STRIDE: UInt = 4096
+
+/// Copy `len` bytes from `src` to `dst`, stopping to serve the machine every
+/// `PREEMPT_STRIDE` bytes.
+///
+/// THE POINT IS AFTER EACH CHUNK, and design 1's audit sentence for it is:
+/// partially-written destination bytes are no IRQ-read state — nothing on the
+/// interrupt path reads the region being filled — so between two chunks there is
+/// no in-flight invariant for a delivery to land inside. The caller still owes
+/// the sentence for ITS OWN state: a caller holding a half-built structure the
+/// IRQ path can see must finish it before it copies.
+public func long_copy(dst: UInt, src: UInt, len: UInt) unsafe {
+    var done: UInt = 0
+    while done < len {
+        var chunk = len - done
+        if chunk > PREEMPT_STRIDE {
+            chunk = PREEMPT_STRIDE
+        }
+        copy_bytes(dst + done, src + done, chunk)
+        done = done + chunk
+        preempt_point()
+    }
+}
+
+/// Clear `len` bytes at `dst`, stopping to serve the machine every
+/// `PREEMPT_STRIDE` bytes.
+///
+/// Same sentence as `long_copy`'s, and this is the one that matters most today:
+/// a root image's `.bss` is the largest single masked window the kernel has.
+public func long_zero(dst: UInt, len: UInt) unsafe {
+    var done: UInt = 0
+    while done < len {
+        var chunk = len - done
+        if chunk > PREEMPT_STRIDE {
+            chunk = PREEMPT_STRIDE
+        }
+        zero_bytes(dst + done, chunk)
+        done = done + chunk
+        preempt_point()
+    }
+}

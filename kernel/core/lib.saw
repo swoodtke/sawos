@@ -20,7 +20,7 @@
 //!
 //! # THIS FILE IS THE FACADE (the Aug-17 split)
 //!
-//! The kernel used to be one 4000-line file. It is now thirteen, one per seam,
+//! The kernel used to be one 4000-line file. It is now fourteen, one per seam,
 //! and this file holds no code: it re-exports the names an image entry uses, so
 //! `import kcore.{console, load_root_and_enter}` in `main.saw` and in every
 //! `sos/tests/` entry means exactly what it always did.
@@ -39,10 +39,20 @@
 //!   `waitables`  the Event/Waiter/Interrupt slabs and the per-kind matrix
 //!   `process`    the copy doors, the teardown, the way into user mode
 //!   `wake`       delivery: readiness becoming a woken thread
-//!   `irq`        the tick, expiry, device lines, the idle path
+//!   `irq`        the tick, expiry, device lines, the idle path, the point
+//!   `preempt`    the strided long-op movers that take that point
 //!   `sched`      the switch point
 //!   `dispatch`   every object op, and `ktrap`
 //!   `loader`     the sosimg loader
+//!
+//! `preempt` is where it is because of design 1's one structural finding: a
+//! preemption point DELIVERS, so it sits above `irq`, while the byte loops it
+//! drives sit at the bottom under `mem` — delivery reaches them through
+//! `wake` -> `process` -> `copy_out`. A point written inside the loop would be
+//! `mem` importing `irq`, which is the cycle this list exists to prevent. So the
+//! loop stays a primitive, the point stays beside the idle poll, and the cadence
+//! that joins them is its own module between them. `preempt.saw`'s header has
+//! the full argument.
 //!
 //! WHERE THE LINE FELL, when a seam of the sketch came in two: the STATE of a
 //! thing sits below the process teardown that frees it, and ACTING on it sits
@@ -64,5 +74,6 @@ public import kcore.diag.{Console, ExitCode, console, fatal, fatal_image}
 public import kcore.time.{start_tick}
 public import kcore.process.{start_process}
 public import kcore.irq.{timer_ticks}
+public import kcore.preempt.{long_copy, long_zero}
 public import kcore.dispatch.{ktrap}
 public import kcore.loader.{load_root_and_enter}

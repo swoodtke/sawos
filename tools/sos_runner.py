@@ -523,6 +523,58 @@ TEST_CASES = [
                        "SOS: external irq {irq_line}"],
         "expect_clean_exit": True,
     },
+    # --- sawos design 1 (M3 unit 1.5): kernel interruptibility ---------------
+    # The two cases above are D2's witnesses: an interrupt that comes due while
+    # the kernel runs is not TAKEN there. The two below are design 1's, and they
+    # invert those assertions rather than replacing them — the kernel still takes
+    # no trap in kernel mode, and now it ASKS at named points inside long
+    # operations, so the same interrupt is SERVICED there.
+    #
+    # Both run the SHIPPED mover (`kcore.preempt.long_zero`, which is what the
+    # loader places a root image with) over a kernel scratch buffer. A test-only
+    # loop with a point in it would prove that a point can work rather than that
+    # the one the kernel ships does.
+    {
+        # timer_mask's mirror, over the comparator. The exit condition IS the
+        # proof: the section runs until the tick COUNTER moves, and in kernel
+        # mode nothing but a preemption point can move it — a hardware delivery
+        # here is each HAL's kernel-bug path. So a broken poll is a timeout, not
+        # a wrong number, and the ticks-taken line asserts the count as well as
+        # the order.
+        #
+        # `at {one}` is `PREEMPT_PC`, the sentinel a tick taken at a point
+        # reports (the idle poll's is zero, and a real interrupted PC is even on
+        # both profiles). Asserting it is what says WHICH of the three
+        # deliveries ran.
+        "name": "preempt_tick",
+        "src": os.path.join(TESTS_DIR, "preempt_tick.saw"),
+        "asm": "payload_spin.S",
+        "expect_out": ["SOS M3: kernel section begin",
+                       "SOS: timer tick {one} at {one}",
+                       "SOS M3: kernel section end, ticks taken={one}",
+                       "SOS M3: entering U-mode"],
+        "expect_clean_exit": True,
+    },
+    {
+        # extirq's mirror, over the interrupt controller — and the ORDER is the
+        # inversion: that case asserts the report lands after the entry to user
+        # mode, this one asserts it lands before, from inside the kernel section.
+        # Ordered matching is what makes "before" an assertion.
+        #
+        # It arms no timer, which is why both cases exist: on one profile the
+        # comparator is not a controller source at all, so "the point delivers
+        # what the controller has" and "the point delivers what the comparator
+        # has" are two claims about two pieces of hardware.
+        "name": "preempt_extirq",
+        "src": os.path.join(TESTS_DIR, "preempt_extirq.saw"),
+        "asm": "payload_spin.S",
+        "expect_out": ["SOS M3: raised external irq {irq_line}",
+                       "SOS M3: kernel section begin",
+                       "SOS: external irq {irq_line}",
+                       "SOS M3: kernel section end",
+                       "SOS M3: entering U-mode"],
+        "expect_clean_exit": True,
+    },
     # --- design 140 unit B: the sosimg format and the kernel's loader -------
     # These images are assembled by hand (sos/tests/<arch>/payload_*.S), so they
     # pin the format independently of Blade's emitter — two producers, one

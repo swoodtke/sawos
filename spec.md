@@ -860,6 +860,36 @@ thread and process handles are NOT waitable — attaching either is a
     driver package's own manifest, authorized against a window the board
     publishes. It is the M2 PLACEHOLDER for §2.5's Mapping and is that
     section's first migration case.
+- **BUILT M3 unit 1.5 (sawos design 1), and what it amends here.**
+  Delivery gains a THIRD entry point beside the trap path and the idle
+  poll: a PREEMPTION POINT inside a long kernel operation. The sentence
+  design 178's D2 is now written in:
+  - **The hardware never delivers an interrupt in kernel mode; the kernel
+    ASKS, at named points.** The first half is unchanged and still
+    enforced by both machines — an interrupt arriving in kernel mode is
+    each HAL's kernel-bug path, which stays a live tripwire rather than
+    becoming a delivery path. What is new is that a long operation POLLS,
+    through the same `irq_poll` the idle path already needed and the same
+    delivery funnel. No new seam, no brief unmask, no nested trap frame.
+  - **A point interrupts LATENCY, NOT ATOMICITY.** A reschedule the
+    delivery signals is honored where it always was, at the user-return
+    boundary; the operation still completes before the switch it may have
+    motivated.
+  - **The placement rule is one reviewable sentence per site**: a point
+    is legal where no in-flight invariant spans state the IRQ path
+    touches. The design carries the audit of every kernel-mode loop, and
+    the verdicts live as comments at the sites.
+  - **One guard backs the rule mechanically** — a kernel flag set around
+    the delivery funnel's body and checked first at every point, so a
+    point reached from INSIDE delivery is inert. It exists because the
+    byte movers are shared: the loader's segment placement is preemptible
+    boot context and §2.2's record copy-out runs in IRQ context.
+  - **What still takes no point**, recorded rather than hidden: the
+    console write loops and the UART ready spin (device-drain-bounded, a
+    long diagnostic line IS masked latency), the controller and grant
+    walks (half-configured hardware is IRQ-shared state in flight), the
+    bounded slab scans, and process teardown (the scheduler is dismantled
+    across it).
 
 ### 9a. The console handover protocol (ratified Aug 16, user)
 
@@ -901,17 +931,20 @@ case whose transcript matters after handover arms none.
   stays even on uniprocessor (SMP-future correctness; under `+a` it is
   cheap; a FAILED acquire on uniprocessor signals reentrancy — panic,
   never spin forever).
-- Timing: DESIGN ratified Aug 6. **STILL UNBUILT after M2, and correctly
-  so.** The M2-era interrupt work landed under design 178's D2 —
-  interrupts are taken from user mode only, enforced by both machines
-  rather than intended by the kernel, and the idle path POLLS rather than
-  taking the trap (§9) — so the kernel holds no state an ISR can
-  interrupt and there is no critical section for the type to protect. It
-  arrives when that stops being true: design 232 pin 1 takes kernel
-  interruptibility in M3 through explicit PREEMPTION POINTS, which need
-  no lock either (a point IS the assertion that state is consistent), and
-  SMP — sequenced after pipes — is what forces the lock, with the
-  point placements as the map of where it must go.
+- Timing: DESIGN ratified Aug 6. **STILL UNBUILT after M3 unit 1.5, and
+  correctly so.** The M2-era interrupt work landed under design 178's
+  D2 — interrupts are taken from user mode only, enforced by both
+  machines rather than intended by the kernel, and the idle path POLLS
+  rather than taking the trap (§9) — so the kernel held no state an ISR
+  could interrupt and there was no critical section for the type to
+  protect. **Kernel interruptibility has since been BUILT (sawos design
+  1) and did not change that**, which is the amendment worth recording:
+  it landed as explicit PREEMPTION POINTS, and a point IS the assertion
+  that state is consistent, so it needs no lock — what it needs is a
+  placement sentence per site plus one reentrancy guard for the code the
+  two contexts share. SMP — sequenced after pipes — is what still forces
+  the lock, and the point placements are now a REAL map of where it must
+  go rather than a promised one.
 
 ## 10. Userspace runtime: HandlerGroup + the wake bridge (ratified Aug 3)
 
@@ -1016,10 +1049,13 @@ event-driven EDGE of a process gets a second, distinct construct:
     stay through M3 (design 232 agenda item 10).
   - **Thread and process waitability, and `kill`** (§8) — attaching
     either kind is a fault today; `kill` has no op and no right.
-  - **Kernel interruptibility, `IntrSpinLock` (§9b), SMP** — design 178's
-    D2 holds (interrupts are taken from user mode only); design 232 pin 1
-    rules preemption points into M3 as unit 1.5, and SMP waits for
-    pipes.
+  - **`IntrSpinLock` (§9b), SMP** — still unbuilt, and correctly so: a
+    preemption point IS the assertion that state is consistent, so
+    nothing yet has a critical section for the type to protect. SMP
+    waits for pipes. **Kernel interruptibility itself is BUILT** (sawos
+    design 1, M3 unit 1.5): design 178's D2 holds in its sharpened form —
+    the hardware never delivers in kernel mode, and the kernel asks at
+    named points inside long operations. §9 records what that amended.
   - **`HandlerGroup`** (§10) — userspace runtime work rather than kernel
     surface, and unbuilt: a process wires a Waiter by hand today.
   - **The mapped vDSO** (§5.7) — delivery is still static linking, which
@@ -1205,7 +1241,30 @@ event-driven EDGE of a process gets a second, distinct construct:
     and the C ABI declares no aggregate return), and `sos_wait_for_irq`
     per profile (`wfi` is an instruction). Assembly went DOWN, because a
     thread context built in Saw needs no register-clearing prologue.
-  - **M3 IN PROGRESS (design 232) — unit 1 DONE, branch PARKED for user
+  - **M3 IN PROGRESS (design 232) — units 1 and 1.5 DONE.** Unit 1.5 is
+    the first sawos-native design (`designs/001-kernel-interruptibility.md`,
+    implementing 232 pin 1) and the first unit to land in this repository
+    rather than in sawlang: **a long kernel operation is interruptible.**
+    Design 178's D2 sharpens rather than repeals — the hardware still never
+    delivers an interrupt in kernel mode, and the kernel now ASKS at named
+    preemption points, polling and delivering through the funnel the idle
+    path already proved. The mechanism is three pieces: `preempt_point()`
+    beside the idle poll, one reentrancy guard around the delivery funnel's
+    body (the byte movers are shared with IRQ context), and a 4 KiB stride
+    on the long-op movers every bulk copy goes through. Every kernel-mode
+    loop carries a one-sentence placement verdict at its site, and the
+    console paths' verdict is an ACCEPTED latency rather than an argued-away
+    one. Two new all-arch cases invert the two D2 witnesses — a tick taken
+    in kernel mode, and a device line serviced before the entry to user
+    mode — 42 per architecture, 84 runs, with the 80 existing rows
+    unchanged. §9 and §9b carry the amendments; `IntrSpinLock` stayed
+    correctly unbuilt, because a point IS the assertion that state is
+    consistent. One structural finding, recorded in the design's as-built:
+    a point delivers, so it sits ABOVE the byte loops it drives in the
+    module order while delivery reaches back down to them, and the
+    resulting cycle is why the cadence is its own module (`kcore.preempt`)
+    rather than a point written inside `copy_bytes`.
+  - **Unit 1 DONE, branch PARKED for user
     review:** the Clock and Timer objects, and with them the thing SOS could
     not do before — **a process can sleep**. Eight object kinds where M2 had
     six; eight new harness cases per architecture, 40 each, 80 runs. What the

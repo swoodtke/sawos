@@ -1,6 +1,8 @@
 # SawOS design 1 — Kernel interruptibility: preemption points (M3 unit 1.5)
 
-Status: AUTHORED Aug 28 2026 (lead), implementing sawlang#232 pin 1 —
+Status: BUILT Aug 28 2026 (see "As built" at the end — one deviation,
+D-2's placement, with the module cycle that forced it). AUTHORED
+Aug 28 2026 (lead), implementing sawlang#232 pin 1 —
 ruled Aug 16 by the user: M3 takes kernel interruptibility EARLY, lean
 mechanism (a), explicit preemption points. The first sawos-native
 design. Copies of the sawlang briefs cited here live in
@@ -95,6 +97,12 @@ are ≤ 24 bytes (wait records), far under one stride, so the guard is
 belt-and-braces there; the loader's 240 KiB copies are where the
 points actually fire.
 
+> **AS BUILT — this paragraph's placement did not survive.** A point
+> delivers, and delivery reaches back down to the byte loops, so a point
+> written inside `mem`'s movers is an import cycle. The guard, the point
+> and the loop are each still single-sited; the cadence became its own
+> module between them. Full argument in "As built" below.
+
 ## D-3: Cadence — a stride, not a poll per byte
 
 `irq_poll` costs a CSR read (riscv32 mip, plus a PLIC claim read on a
@@ -184,6 +192,171 @@ to shipped transcripts.
 
 ## As built
 
-(To be completed by the implementing agent: point sites as landed,
-guard mechanics, stride value, any audit-table verdicts that moved and
-why, final case names + counts, findings.)
+Landed Aug 28 2026. `SAWLANG_ROOT=… make sos-test`: 84/84 across
+riscv32 + arm64, 42 cases per architecture, 43 entries.
+
+### The mechanism, three pieces in three places
+
+- **`preempt_point()` — `kernel/core/irq.saw`, beside `idle_poll`**, as
+  D-1 asked. Body: the guard, `hal.irq_poll()`, `deliver_line(line,
+  PREEMPT_PC)`. It is `idle_poll` with a different reason for asking, and
+  the file says so. NO NEW HAL SEAM — `irq_poll` was reused exactly as
+  expected, so neither `ABI.md` changed.
+- **`IN_DELIVERY` — `irq.saw`, beside the counters**, `public(package)
+  unsafe static var`, with design 149's serialization argument written
+  out (uniprocessor, hardware delivery from user mode only, and the
+  polled entries are the flag's own readers, so the single kernel context
+  is the only writer; SMP is where that ends). `deliver_line` SPLIT into
+  a guarded entry (`IN_DELIVERY = true` / body / `= false`) and its body
+  `service_claimed_line`. The split is the mechanism, not decoration:
+  Saw has no `defer`, and the old body had an early return, so an inline
+  set/clear pair would need the clear written twice — the second is the
+  one a later edit forgets.
+- **`PREEMPT_STRIDE = 4096` and the movers — a NEW module,
+  `kernel/core/preempt.saw`**, between `irq` and `sched`. It holds the
+  stride and `long_copy` / `long_zero`, the strided long-op movers every
+  bulk copy goes through. This is the one deviation from the brief's
+  letter, and the finding below is why.
+
+### FINDING: the points cannot live inside the movers (module cycle)
+
+D-2 asked for the points inside `copy_bytes`/`zero_bytes`, no twin and no
+parameter. That is not expressible, and the obstacle is real rather than
+stylistic:
+
+- A point DELIVERS, so it needs `irq.deliver_line`.
+- Delivery reaches back DOWN to the byte loops: `deliver_line` →
+  `on_timer_interrupt` → `expire_timers` → `fire_timer` →
+  `wake.notify_ready` → `wake_one_waiter` → `deliver_attachment` →
+  `process.copy_out` → `mem.copy_bytes`.
+- So a point written in the loop is `mem` importing `irq` from below it —
+  the import cycle DF-232e diagnoses. **The call graph genuinely has this
+  cycle, and `IN_DELIVERY` is exactly what breaks it at run time**; the
+  module system has no way to express a cycle a runtime flag makes safe.
+
+An indirection was probed and does not exist either: a `FuncPointer` hook
+installed at boot needs a mutable static holding a function address, and
+``static `X` must be initialized by a compile-time constant`` refuses it
+(probed against the pinned sawc). `@export`/`extern "C"` would break the
+cycle at the linker, but this tree reserves that for genuine machine
+seams and it would put a kernel-internal call outside the type system.
+
+**Resolution, and what it preserves.** Every piece stays single-sited:
+the byte loop exists once (`mem`), the point exists once (`irq`), the
+cadence that joins them exists once (`kcore.preempt`). Nothing is
+duplicated and no call site picks a POLICY — it picks an ALTITUDE, and
+the two altitudes are named for what they are (`mem`'s loops are the
+primitive, `preempt`'s movers are the operation). `mem.saw`'s movers and
+`kcore/lib.saw`'s module-order list both carry the reason at their site,
+and `preempt.saw`'s header has the full argument.
+
+**What it costs.** A bulk copy issued from BELOW `kcore.preempt` cannot
+take a point. Today that is only `process.copy_out`/`copy_in`, whose
+whole traffic is a 24-byte wait record — under one stride, and inert
+under `IN_DELIVERY` anyway. §2.1's Pipe bodies are the length that will
+want one; their callers (`dispatch`) sit ABOVE `kcore.preempt`, so the
+pointed door goes there in M4. Unit 2's CreateProcess image copy is
+unaffected — it can call `long_copy` directly.
+
+### The two calls the brief delegated
+
+- **`PREEMPT_PC = 1`, a distinct sentinel rather than a shared
+  `IDLE_PC`.** Diagnosability decides it: the two polled deliveries are
+  the two ways the kernel notices an interrupt nothing trapped it into,
+  and a transcript that cannot tell "idle" from "halfway through a
+  240 KiB copy" has lost the fact the unit exists to make visible. Safe
+  for the same reason zero is — an odd address is not an instruction
+  address on either profile, both machines fetching on at least a
+  two-byte boundary. Recorded at the definition. `preempt_tick` ASSERTS
+  it (`SOS: timer tick 0x…01 at 0x…01`), which is what makes "which
+  delivery ran" a claim rather than an inference.
+- **Stride placement: with the movers (`preempt.saw`), not with the
+  point.** The cadence is a property of the operation, and the point is
+  correct at any cadence. Recorded at the definition.
+
+### The audit, as landed
+
+Every verdict in the design-time table SURVIVED — none moved. The
+verdicts are comments at the sites, in the one-sentence-rule form:
+
+| Site | Where the verdict is written |
+|---|---|
+| `copy_bytes` / `zero_bytes` | `kernel/core/mem.saw` (primitive; and why the point is not here) |
+| the strided movers | `kernel/core/preempt.saw`, on `long_copy` / `long_zero` |
+| loader validate walk | `kernel/core/loader.saw`, at the walk |
+| loader place walk | `kernel/core/loader.saw`, at the walk (incl. the mid-load tick note) |
+| PLIC reset | `hal/riscv32/kernel/lib.saw`, on `Plic.reset` |
+| GIC disable-all | `hal/arm64/kernel/lib.saw`, on `Gic.reset` |
+| arm64 page-table build | `hal/arm64/kernel/lib.saw`, on `page_tables_build` |
+| `prot_reset` / `prot_region` walks | both HALs, on `prot_reset` |
+| slab scans / handle walks | `kernel/core/limits.saw` header — one verdict where the bounds are declared |
+| `end_process` teardown | `kernel/core/process.saw`, on `end_process` |
+| IRQ-path loops | `kernel/core/irq.saw`, on `expire_timers` |
+| console write loops + UART spin | `kernel/core/diag.saw` (`write_str`) and `rt/common/src/lib.saw` (`ConsoleSink.write_byte`) |
+| `.bss` zero / `frame_init` / `mem*` | both `boot.S`s, both `frame_init`s, `rt/common_c/support.c` |
+| `MachineTimer.now` carry retry | `hal/riscv32/kernel/lib.saw`, on `now` |
+| `idle_until_runnable` | `kernel/core/irq.saw`, on the function |
+
+One addition the table did not name: `mem*` in `support.c` gets the
+verdict too, because its CALLER is codegen and there is no source site to
+write a placement sentence at.
+
+### The proof, and the transcript
+
+`preempt_tick` and `preempt_extirq`, both all-arch, both entered at
+`tests/preempt_*.saw` and both running the SHIPPED mover (`long_zero`
+over an 8 KiB kernel scratch buffer — two strides, so one call crosses
+two points).
+
+```
+SOS M3: preemption check on riscv32 (QEMU virt)
+SOS M3: kernel section begin
+SOS: timer tick 0x00000001 at 0x00000001      <- taken IN KERNEL MODE
+SOS M3: kernel section end, ticks taken=0x00000001
+SOS M3: entering U-mode
+
+SOS M3: raised external irq 0x0000000a
+SOS M3: kernel section begin
+SOS: external irq 0x0000000a                  <- BEFORE the entry
+SOS M3: kernel section end
+SOS M3: entering U-mode
+```
+
+Counts: **43 entries, 42 per architecture, 84 runs**, as the brief
+specified.
+
+ACCEPTANCE, and exactly what was diffed. The Aug-21 oracle
+(`designs/sawlang/238-sos-oracle-2026-08-21.txt`) predates the repository
+split, so its build-info lines carry `sos/` path prefixes and pre-split
+image sizes; a raw diff against it cannot separate this unit's effect
+from three months of intervening commits. So the suite was run TWICE on
+this machine under the suite lock — once with the change stashed
+(baseline, at `1893143`) and once with it applied — and both were diffed:
+
+- **baseline vs the Aug-21 oracle**: the 80 case rows
+  (`[i/40] ✓ <name>`) are byte-identical, in order, both architectures.
+  The only differences are the 38 sosimg build-info lines: the `sos/`
+  path prefix (the split) and image sizes that grew before this unit.
+- **baseline vs this change**: the ONLY differences are the two new rows
+  per architecture at positions 13-14, the `/40` → `/42` denominator on
+  every row, and the total line. **Every sosimg size line is unchanged**,
+  and `timer_masked_in_kernel` still reads `ticks taken=0x…0` — the
+  witness that UNPOINTED kernel code stays masked is intact.
+
+`thread_preempt` is the one shipped case whose CONSOLE output moves: it
+arms a tick before loading root, so ticks are now taken mid-load at
+preemption points. The brief anticipated this and ruled it legal (no
+current thread, no armed Timer objects pre-root); its assertions do not
+name the tick lines and the row is unchanged. The loader's place walk
+carries that note at the site.
+
+### Nothing left open
+
+No HAL `ABI.md` changed (no new seam). No spec text was contradicted —
+§9 gained a `BUILT M3 unit 1.5` block, §9b's timing bullet now says still
+unbuilt *after* unit 1.5 and why a point needs no lock, and §11's ledger
+row flipped from "kernel interruptibility … unbuilt" to
+"`IntrSpinLock`/SMP unbuilt, interruptibility BUILT". No compiler defect
+was worked around silently: the one language limit met (a `FuncPointer`
+cannot initialize a mutable static) is recorded above and in the tracker,
+and it shaped the module layout rather than being hidden by it.

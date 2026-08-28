@@ -38,6 +38,12 @@ typedef unsigned long  usize;   // ilp32: 32-bit, matches platform `Int`
 // ---- mem* (the compiler's implicit block-copy / zero helpers) -------------
 //
 // Compiled with -fno-builtin; see reason 1 in the header.
+//
+// AUDIT (sawos design 1, M3 unit 1.5): these loops take no preemption point and
+// cannot. Their CALLER is codegen — a struct assignment, an array initializer —
+// so there is no source site to write a placement verdict at, and the moves the
+// compiler emits are single values rather than bulk regions. The kernel's own
+// bulk moves go through `kcore.preempt`, which is where the points are.
 
 void *memset(void *dst, int c, usize n) {
     u8 *d = (u8 *)dst;

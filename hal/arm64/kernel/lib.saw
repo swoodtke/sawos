@@ -363,6 +363,9 @@ static SPSR_EL0T: UInt = 0x340
 /// ones on purpose — a thread entry that RETURNS branches to zero and takes an
 /// instruction abort, which spec §8 turns into the death of its process. That is
 /// a diagnosed stop rather than a run into whatever follows.
+///
+/// AUDIT (design 1): NO PREEMPTION POINT. 36 word stores, and a half-built
+/// context is an in-flight invariant the trap path can reach.
 public func frame_init(frame_addr: UInt, entry: UInt, stack_top: UInt,
                        arg0: UInt) unsafe {
     var w: UInt = 0
@@ -864,6 +867,11 @@ func reset_device_window(level3: UInt) unsafe {
 /// Called by `sink.c`'s activation leaf before it turns the MMU on, so this
 /// runs with translation OFF and physical == virtual. It must follow the `.bss`
 /// zerofill, because that is where `PAGE_TABLES` lives.
+///
+/// AUDIT (design 1): NO PREEMPTION POINT in any of the four walks below (~2560
+/// descriptor stores). This runs before `kmain`, with the MMU off and no
+/// interrupt controller yet — pre-IRQ by construction, so there is nothing a
+/// point could deliver.
 @export("sos_page_tables_build")
 func page_tables_build() unsafe -> UInt {
     let level1 = tables_base()
@@ -938,6 +946,12 @@ func grant_outside_window(va: UInt) {
 ///
 /// BOTH windows, because a device grant is as revocable as a RAM one: a new
 /// process must not inherit the last one's registers.
+///
+/// AUDIT (design 1): NO PREEMPTION POINT here or in the `prot_region` /
+/// `prot_device` walks below (at most 1536 RAM stores between them). They are
+/// bounded and RAM-speed, microseconds; and a HALF-REWRITTEN descriptor table is
+/// exactly an in-flight invariant — the staged `prot_*` sequence is one edit,
+/// published by `prot_commit`.
 public func prot_reset() unsafe {
     reset_window(tables_base() + LEVEL3_OFFSET)
     reset_device_window(tables_base() + DEVICE_LEVEL3_OFFSET)
@@ -1121,6 +1135,11 @@ extension Gic {
 
     /// Every line masked, then both halves on. Nothing is deliverable until
     /// `irq_unmask` opens a line.
+    ///
+    /// AUDIT (design 1): NO PREEMPTION POINT. The distributor is OFF for the
+    /// whole loop, so a half-disabled controller is IRQ-shared state in flight —
+    /// and there is nothing to deliver anyway, since this is what brings the
+    /// controller up. At most 32 word writes.
     func reset(&self) unsafe {
         self.dist.ctlr.write(0)
         let lines = self.line_count()

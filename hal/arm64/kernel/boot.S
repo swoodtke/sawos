@@ -62,7 +62,11 @@ _start:
     msr     cpacr_el1, x0
     isb
 
-    /* Zero .bss [_bss_start, _bss_end) a doubleword at a time. */
+    /* Zero .bss [_bss_start, _bss_end) a doubleword at a time.
+     *
+     * AUDIT (design 1): no preemption point, here or in the page-table build
+     * below. Both are native code running before kmain and before the GIC comes
+     * up — pre-IRQ by construction. */
     ldr     x0, =_bss_start
     ldr     x1, =_bss_end
 1:  cmp     x0, x1

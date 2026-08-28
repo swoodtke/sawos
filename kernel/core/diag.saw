@@ -69,6 +69,15 @@ extension Console {
     /// Write an ASCII string, byte by byte. The scalar-to-byte rule is
     /// `sosrt`'s, so the kernel console and a process console agree on what a
     /// non-ASCII scalar becomes.
+    ///
+    /// AUDIT (design 1): NO PREEMPTION POINT, and this is the one verdict that
+    /// ACCEPTS latency rather than arguing it away. The loop is bounded by the
+    /// device drain, so a long diagnostic line IS masked latency and is recorded
+    /// as such. Two reasons not to point it anyway: half of this module's callers
+    /// are the fault reports, which run with the kernel's state already
+    /// deliberately inconsistent; and a delivery here would interleave the tick
+    /// path's own console output into the middle of the line being written —
+    /// into the very transcript the acceptance oracle diffs.
     public func write_str(&self, msg: String) {
         for scalar in msg.chars() {
             hal.console_byte(ascii_byte(scalar))

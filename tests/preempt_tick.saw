@@ -1,0 +1,81 @@
+// SawOS design 1 (M3 unit 1.5): a long kernel operation IS interruptible.
+//
+// TIMER_MASK'S MIRROR, AND THE ASSERTIONS ARE INVERTED ON PURPOSE. That case
+// spins on `timer_pending()` in a kernel section that calls no mover, and reads
+// `ticks taken=0` — the witness that UNPOINTED kernel code still runs masked,
+// which design 1 does not repeal. This case runs the same kind of section
+// through the SHIPPED long-op mover and reads a tick taken IN KERNEL MODE:
+//
+//   kernel section begin
+//   timer tick 1 at 0x00000001              <- taken at a PREEMPTION POINT
+//   kernel section end, ticks taken=1       <- and the counter says so
+//   entering U-mode
+//
+// THE EXIT CONDITION IS ITSELF THE PROOF. The section runs until the tick
+// counter moves, and in kernel mode the counter can only move through a
+// preemption point: the hardware never delivers an interrupt here, and both
+// HALs turn one that arrives anyway into their kernel-bug path. So a broken
+// poll cannot produce a wrong number — it produces a harness timeout.
+//
+// `0x00000001` is `PREEMPT_PC`, the sentinel `kcore.irq` prints for a tick taken
+// at a point (the idle poll's is zero, and a real interrupted PC is even on both
+// profiles). It is asserted, because "which of the three deliveries ran" is the
+// whole claim.
+//
+// THE MOVER IS THE REAL ONE — `long_zero` over a kernel scratch buffer, the same
+// function the loader places a root image with. A test-only loop with a point in
+// it would prove that a point can work rather than that the shipped one does.
+
+import kcore.{console, align_up, long_zero, timer_ticks, start_process, start_tick}
+import hal
+import imgformat.{SegFlag}
+import sosabi.{NO_USER_STACK}
+
+static PAYLOAD_REGION: UInt = 0
+static TICK_PERIOD_US: UInt = 1000
+
+/// Two strides' worth, so one call through the mover crosses a point twice —
+/// enough that the section cannot finish a pass without asking the machine, and
+/// small enough that the buffer is a rounding error in a 64 KiB image.
+static SCRATCH_BYTES: Int = 8192
+
+unsafe static var SCRATCH: [UInt8; SCRATCH_BYTES] = [0; SCRATCH_BYTES]
+
+/// The buffer's address, hoisted so `kmain` never names an unsafe type.
+func scratch_base() unsafe -> UInt {
+    ((&var SCRATCH) as UnsafePointer<UInt8>) as UInt
+}
+
+@export("kmain")
+func kmain() {
+    let uart = console()
+    uart.write_str("SOS M3: preemption check on ")
+    uart.write_str(hal.arch_name())
+    uart.write_str("\n")
+
+    hal.intc_init()
+    start_tick(TICK_PERIOD_US)
+
+    // Stay in kernel mode, moving bytes through the shipped mover, until a tick
+    // has been taken. Nothing here unmasks anything: the kernel still runs with
+    // interrupts off, and the tick arrives because the mover ASKED.
+    uart.write_str("SOS M3: kernel section begin\n")
+    let base = scratch_base()
+    while timer_ticks() == 0 {
+        long_zero(base, SCRATCH_BYTES as UInt)
+    }
+    uart.write_str("SOS M3: kernel section end, ticks taken=")
+    uart.write_hex(timer_ticks())
+    uart.write_str("\n")
+
+    let payload = hal.payload_start()
+    let top = align_up(hal.payload_end(), hal.PROT_GRAIN)
+
+    hal.prot_reset()
+    hal.prot_region(PAYLOAD_REGION, payload, top,
+                    (SegFlag.Read as UInt8) | (SegFlag.Execute as UInt8))
+    hal.prot_commit()
+
+    uart.write_str("SOS M3: entering U-mode\n")
+    start_process(payload, NO_USER_STACK, payload, top)
+}

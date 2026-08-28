@@ -50,7 +50,11 @@ _start:
     la      t0, trap_entry
     csrw    mtvec, t0
 
-    /* Zero .bss [_bss_start, _bss_end) a word at a time. */
+    /* Zero .bss [_bss_start, _bss_end) a word at a time.
+     *
+     * AUDIT (design 1): no preemption point. This is native code running before
+     * kmain, before the interrupt controller and before the trap vector has
+     * anything to deliver to — pre-IRQ by construction. */
     la      t0, _bss_start
     la      t1, _bss_end
 1:

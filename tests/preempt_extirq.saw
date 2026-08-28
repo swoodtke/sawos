@@ -1,0 +1,75 @@
+// SawOS design 1 (M3 unit 1.5): a DEVICE line reaches its hook from a long
+// kernel operation.
+//
+// EXTIRQ'S MIRROR, AND THE ORDER IS INVERTED ON PURPOSE. That case raises the
+// selftest line, enters user mode, and asserts the report arrives AFTER the
+// entry — the witness that a device line raised in kernel mode waits for user
+// mode, which is design 178's D2 for a device where the timer case makes it for
+// a clock. This case raises the same line and then runs a long operation through
+// the shipped mover, and asserts the report arrives BEFORE the entry:
+//
+//   raised external irq <line>
+//   kernel section begin
+//   external irq <line>                 <- serviced AT A PREEMPTION POINT
+//   kernel section end
+//   entering U-mode
+//
+// TWO PROFILES, TWO SOURCES, ONE CLAIM. One board raises a software-generated
+// line and the other makes its console assert; the kernel above them polls the
+// controller either way, and the line number crossing from the raise to the hook
+// is what says the claim gave back the line that was raised.
+//
+// The line is bound to no Interrupt object, so `on_external_irq` reports it and
+// leaves it MASKED — which is the same path the bring-up case exercises, and is
+// why the section can go on running without the source re-firing under it.
+//
+// IT NEEDS NO TIMER, which is the point of having both cases: this one proves
+// the point delivers what the CONTROLLER has, where `preempt_tick` proves it
+// delivers what the comparator has, and on one of the two profiles those are not
+// the same hardware at all.
+
+import kcore.{console, align_up, long_zero, start_process}
+import hal
+import imgformat.{SegFlag}
+import sosabi.{NO_USER_STACK}
+
+static PAYLOAD_REGION: UInt = 0
+
+/// Two strides' worth, so the one call below crosses a point twice.
+static SCRATCH_BYTES: Int = 8192
+
+unsafe static var SCRATCH: [UInt8; SCRATCH_BYTES] = [0; SCRATCH_BYTES]
+
+/// The buffer's address, hoisted so `kmain` never names an unsafe type.
+func scratch_base() unsafe -> UInt {
+    ((&var SCRATCH) as UnsafePointer<UInt8>) as UInt
+}
+
+@export("kmain")
+func kmain() {
+    let uart = console()
+    uart.write_str("SOS M3: preemption check on ")
+    uart.write_str(hal.arch_name())
+    uart.write_str("\n")
+
+    hal.intc_init()
+    let line = hal.irq_raise_selftest_line()
+    uart.write_str("SOS M3: raised external irq ")
+    uart.write_hex(line)
+    uart.write_str("\n")
+
+    uart.write_str("SOS M3: kernel section begin\n")
+    long_zero(scratch_base(), SCRATCH_BYTES as UInt)
+    uart.write_str("SOS M3: kernel section end\n")
+
+    let payload = hal.payload_start()
+    let top = align_up(hal.payload_end(), hal.PROT_GRAIN)
+
+    hal.prot_reset()
+    hal.prot_region(PAYLOAD_REGION, payload, top,
+                    (SegFlag.Read as UInt8) | (SegFlag.Execute as UInt8))
+    hal.prot_commit()
+
+    uart.write_str("SOS M3: entering U-mode\n")
+    start_process(payload, NO_USER_STACK, payload, top)
+}

@@ -25,6 +25,12 @@ import kcore.waitables.{INTERRUPTS, WaitableKind, interrupt_by_line}
 import kcore.wake.{notify_ready}
 
 /// Fire every Timer whose deadline `now` has reached.
+///
+/// AUDIT (design 1): NO PREEMPTION POINT — INELIGIBLE, and by definition. This
+/// walk IS the IRQ path, so `IN_DELIVERY` is set for the whole of it and a point
+/// written here would be inert anyway. Same for every loop it reaches: the wake
+/// walks and the attachment unlinks under `notify_ready`. The bound is
+/// `MAX_TIMERS` slots of O(1) work.
 func expire_timers(now: UInt64) unsafe {
     var i: Int = 0
     while i < MAX_TIMERS {
@@ -52,26 +58,45 @@ func fire_timer(slot: Int, now: UInt64) unsafe {
 }
 
 // =============================================================================
-// Interrupts (design 178 D2 + D6; spec §9)
+// Interrupts (design 178 D2 + D6, as amended by design 1; spec §9)
 // =============================================================================
 //
-// THE KERNEL IS NON-PREEMPTIBLE (design 178 D2). An interrupt is taken from
-// USER mode and from nowhere else: the kernel runs with them masked from boot,
-// each machine masks them again on trap entry in hardware, and each machine's
-// return to user mode is where they come back on. Nothing below has to arrange
-// any of that — it is a property of the two HALs, and each states in its ABI.md
-// that an interrupt arriving in kernel mode lands on its kernel-bug path rather
-// than on this code. So there are no critical sections here, no interrupt
-// masking vocabulary, and no `IntrSpinLock` (spec §9b) until SMP needs one.
+// THE HARDWARE NEVER DELIVERS AN INTERRUPT IN KERNEL MODE; THE KERNEL ASKS, AT
+// NAMED POINTS. That is design 178's D2 as design 1 (M3 unit 1.5) sharpened it,
+// and the two halves are worth reading apart.
 //
-// The cost is recorded rather than hidden: syscall latency bounds interrupt
-// latency, which is design 178's M3 tripwire and the reason the hooks below say
-// what they must not grow into.
+// THE FIRST HALF IS UNCHANGED AND STILL ENFORCED BY THE MACHINES. An interrupt
+// is TAKEN from user mode and from nowhere else: the kernel runs with them
+// masked from boot, each machine masks them again on trap entry in hardware, and
+// each machine's return to user mode is where they come back on. Nothing below
+// has to arrange any of that — it is a property of the two HALs, and each states
+// in its ABI.md that an interrupt arriving in kernel mode lands on its
+// kernel-bug path rather than on this code. So there are still no critical
+// sections here, no interrupt masking vocabulary, and no `IntrSpinLock`
+// (spec §9b) until SMP needs one.
+//
+// THE SECOND HALF IS WHAT DESIGN 1 ADDED: a long kernel operation POLLS. At a
+// `preempt_point()` — below, beside the idle poll it is modelled on — the kernel
+// asks the controller what is pending and services it synchronously through the
+// same `deliver_line` the trap path uses. Semantics from the interrupt's side
+// are the trap's: serviced at the point, the operation resumes. What it is NOT
+// is a brief unmask, which is why the hardware enforcement above survives intact
+// and goes on being a live tripwire rather than becoming a delivery path.
+//
+// SO THE M3 TRIPWIRE IS SPENT RATHER THAN RECORDED. Design 178 wrote down the
+// cost — syscall latency bounds interrupt latency — and said to re-examine it
+// when an M3 syscall grew a loop; the loops arrived, and this is the answer.
+// What replaces the tripwire is a PLACEMENT RULE, one reviewable sentence per
+// site: a point is legal where no in-flight invariant spans state the IRQ path
+// touches. `IN_DELIVERY` below is that rule's mechanical backstop for the one
+// place the rule cannot be read off a single function — the code the kernel's
+// two contexts SHARE.
 //
 // WHAT IS ARCH-FREE HERE: which hook a line belongs to, what the kernel does
 // with it, and the ORDER of claim / service / complete. What is not: how a line
 // is claimed, masked and completed, and how a timer is rearmed — all six are
-// seam calls, because a controller is a machine's, not a kernel's (D6).
+// seam calls, because a controller is a machine's, not a kernel's (D6). A point
+// adds no seam: it is `irq_poll` again, which the idle path already needs.
 
 /// How many of the first ticks the kernel narrates on the console.
 ///
@@ -101,6 +126,38 @@ unsafe static var TIMER_TICKS: UInt = 0
 /// counted.
 unsafe static var SPURIOUS_IRQS: UInt = 0
 
+/// IS A DELIVERY IN FLIGHT? — the reentrancy guard for the code the kernel's two
+/// contexts SHARE (design 1 D-2).
+///
+/// THE BYTE MOVERS SERVE TWO MASTERS. The loader's segment placement is
+/// preemptible boot context and copies up to 240 KiB; `copy_out` runs in IRQ
+/// CONTEXT — `wake.deliver_attachment` writes a parked thread's wait record from
+/// the WAKER's context, and for an expired Timer that context is under
+/// `deliver_line`. A preemption point inside a mover must therefore be INERT
+/// when the mover is itself running under delivery, or a timer coming due during
+/// that copy would re-enter delivery mid-delivery.
+///
+/// So the flag is set around `deliver_line`'s whole body and checked FIRST in
+/// `preempt_point`. It is the MECHANICAL form of "no point runs inside the IRQ
+/// path": it converts a placement error in shared code from a corruption into a
+/// no-op, at ONE auditable site rather than as a convention every call site has
+/// to remember. Every way into delivery funnels through `deliver_line` — the
+/// trap path's `service_irq`, the idle poll, and now the preemption point — so
+/// one flag covers all three.
+///
+/// Today's IRQ-path copies are wait records, 24 bytes, far under one stride, so
+/// this is belt-and-braces at the moment; §2.1's Pipe `receive` is the length
+/// that makes it load-bearing.
+///
+/// Compound global state resting on a serialization argument the compiler cannot
+/// see, which is design 149's `unsafe static var`. The argument: uniprocessor
+/// kernel, hardware delivery from user mode only, and the polled entries are
+/// this flag's own readers — so the single kernel context is the only writer,
+/// and no interleaving between the set and the clear is expressible. SMP is
+/// where that ends, and the flag becomes per-core state behind the IntrSpinLock
+/// spec §9b reserves.
+public(package) unsafe static var IN_DELIVERY: Bool = false
+
 /// Ticks the periodic timer has delivered since boot. The scheduler's clock
 /// when there is a scheduler; today the harness's evidence that a tick was
 /// taken, and when.
@@ -121,8 +178,9 @@ public func timer_ticks() unsafe -> UInt {
 /// so a Timer cannot be late because the tick ran first, and the tick cannot
 /// slip because several Timers came due together.
 ///
-/// `pc` is where the interrupted context resumes, or `IDLE_PC` when the fire was
-/// found by the idle poll.
+/// `pc` is where the interrupted context resumes — or one of the two POLL
+/// sentinels when nothing trapped: `IDLE_PC` when the idle path found the fire,
+/// `PREEMPT_PC` when a preemption point did.
 func on_timer_interrupt(pc: UInt) unsafe {
     let now = hal.timer_now_ns()
 
@@ -151,8 +209,10 @@ func on_timer_interrupt(pc: UInt) unsafe {
 /// motivates happens later at the user-return boundary where it costs nothing.
 ///
 /// `pc` is where the interrupted context will resume, read out of the frame by
-/// the caller — or `IDLE_PC` when the tick was found by the idle poll, where
-/// there is no interrupted context to name.
+/// the caller — or a POLL SENTINEL when the tick was found rather than taken,
+/// where there is no interrupted context to name: `IDLE_PC` from the idle path,
+/// `PREEMPT_PC` from a preemption point. The report prints whichever, which is
+/// what lets a transcript say which of the three deliveries ran.
 func on_timer_tick(pc: UInt) unsafe {
     TIMER_TICKS = TIMER_TICKS &+ 1
 
@@ -212,17 +272,31 @@ func on_external_irq(line: UInt) unsafe {
 /// SERVICE ONE CLAIMED LINE — the arch-free half of an interrupt, and the one
 /// place a line number turns into work.
 ///
-/// Its two entry points, both of which have already CLAIMED the line from the
+/// Its three entry points, all of which have already CLAIMED the line from the
 /// controller:
 ///
 ///   - `service_irq`, from the trap path, with the interrupted PC;
-///   - `idle_poll`, from `pick_next`'s idle loop, with `IDLE_PC`.
+///   - `idle_poll`, from `pick_next`'s idle loop, with `IDLE_PC`;
+///   - `preempt_point`, from inside a long operation, with `PREEMPT_PC`.
 ///
-/// The two branches differ in exactly one step, and it is spec §9's: the timer
+/// THE GUARD IS HERE, AND IT WRAPS THE WHOLE BODY, because what it asserts is "a
+/// delivery is in flight" and that is true from the claim to the completion. The
+/// body is a function of its own for one reason: Saw has no `defer`, so a body
+/// with an early return would need the clear written twice, and the second one
+/// is the one a later edit forgets. One entry, one exit, one pair.
+func deliver_line(line: UInt, pc: UInt) unsafe {
+    IN_DELIVERY = true
+    service_claimed_line(line, pc)
+    IN_DELIVERY = false
+}
+
+/// The delivery itself, under the guard above and reached through nothing else.
+///
+/// Its two branches differ in exactly one step, and it is spec §9's: the timer
 /// programs its NEXT DEADLINE, which is what lowers its line, while a device
 /// line is MASKED, because a device goes on asserting until its driver has been
 /// told.
-func deliver_line(line: UInt, pc: UInt) unsafe {
+func service_claimed_line(line: UInt, pc: UInt) unsafe {
     if line == hal.IRQ_NONE {
         SPURIOUS_IRQS = SPURIOUS_IRQS &+ 1
         if SPURIOUS_IRQS == 1 {
@@ -241,8 +315,10 @@ func deliver_line(line: UInt, pc: UInt) unsafe {
 }
 
 /// EVERY interrupt the kernel TAKES arrives here, through `ktrap` and through
-/// nothing else. (Interrupts the kernel POLLS FOR while idle arrive through
-/// `idle_poll`, which is the same service over a different way of noticing.)
+/// nothing else. (Interrupts the kernel POLLS FOR arrive through `idle_poll`
+/// while it has nothing to run and through `preempt_point` while it is in the
+/// middle of a long operation — the same service over two other ways of
+/// noticing.)
 public(package) func service_irq(frame_addr: UInt, cause: UInt) unsafe {
     deliver_line(hal.irq_claim(cause), hal.trap_pc(frame_addr))
 }
@@ -333,9 +409,74 @@ public(package) func has_external_wake_source() unsafe -> Bool {
 /// an Interrupt no thread is waiting on — leaves the queue empty and the loop
 /// goes back to sleep, which is correct and is why the test is on the queue
 /// rather than on "an interrupt happened".
+///
+/// AUDIT (design 1): NO POINT NEEDED — this loop IS delivery, and the two
+/// bounded scans it sits beside (`has_external_wake_source` over the interrupt
+/// and timer slabs) are the same shape as every other bounded-tiny slab walk in
+/// the kernel: `MAX_INTERRUPTS` + `MAX_TIMERS` iterations of O(1) work.
 public(package) func idle_until_runnable() unsafe {
     while READY_HEAD == 0 {
         hal.wait_for_irq()
         idle_poll()
     }
+}
+
+// -----------------------------------------------------------------------------
+// THE PREEMPTION POINT (design 1, M3 unit 1.5)
+// -----------------------------------------------------------------------------
+//
+// IT IS THE IDLE POLL WITH A DIFFERENT REASON FOR ASKING, and that is the whole
+// of design 1's D-1. The idle path polls because the kernel has nothing to run;
+// a long operation polls because the kernel has been running too long. Both ask
+// the same seam, service through the same funnel, and leave the hardware rule
+// (interrupts are TAKEN from user mode only) exactly where it was — which is
+// what design 1 chose over briefly unmasking, since an unmask needs a kernel-mode
+// trap path on both machines and spends the tripwire that today catches a kernel
+// bug on both.
+//
+// WHAT A POINT INTERRUPTS IS LATENCY, NOT ATOMICITY. A reschedule the delivery
+// signals — NEED_RESCHED from a tick, a wake from an expired Timer — is honored
+// where it always was, at the user-return boundary through `pick_next`. The
+// operation still runs to completion before the switch it may have motivated.
+//
+// WHERE THE POINTS THEMSELVES ARE: `kcore.preempt`, which is one module above
+// this one and holds the strided long-op movers that call this. They are not
+// here, and they are not in `mem` beside the byte loops they drive, for a reason
+// worth stating once — see that module's header.
+
+/// The sentinel a tick report prints for a tick taken at a preemption point.
+///
+/// A DISTINCT VALUE RATHER THAN A SHARED `IDLE_PC`, decided here because design 1
+/// left it to the implementation and diagnosability decides it: the two polled
+/// deliveries are the two ways the kernel notices an interrupt nothing trapped it
+/// into, and a transcript that cannot tell "the kernel was idle" from "the kernel
+/// was halfway through a 240 KiB copy" has lost the very fact this unit exists to
+/// make visible. One costs nothing and is safe for the same reason zero is: an
+/// ODD address is not an instruction address on either profile — both machines
+/// fetch on at least a two-byte boundary — so it can never collide with a real
+/// interrupted PC.
+static PREEMPT_PC: UInt = 1
+
+/// A PREEMPTION POINT — the kernel asking, mid-operation, whether the machine
+/// wants anything (design 1 D-1).
+///
+/// THE GUARD IS FIRST and it is not an optimization: `IN_DELIVERY` set means this
+/// call is already inside the IRQ path, where a second delivery would re-enter
+/// the tables the first one is halfway through. Returning is the whole handling —
+/// the interrupt stays pending and is taken at the next legal moment, which is
+/// what "the point is inert here" means.
+///
+/// THE CALLER OWES THE PLACEMENT SENTENCE. This function cannot check that no
+/// in-flight invariant spans state the IRQ path touches; it is a property of
+/// where the call is written, so every call site carries the one-line verdict
+/// design 1's audit table records.
+public(package) func preempt_point() unsafe {
+    if IN_DELIVERY {
+        return
+    }
+    let line = hal.irq_poll()
+    if line == hal.IRQ_NONE {
+        return
+    }
+    deliver_line(line, PREEMPT_PC)
 }

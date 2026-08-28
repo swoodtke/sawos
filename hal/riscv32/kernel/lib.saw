@@ -429,6 +429,10 @@ unsafe static var PMPCFG_HI: UInt = 0
 
 /// Revoke every grant. User mode then reaches nothing at all — the default-deny
 /// the grants below carve out of.
+///
+/// AUDIT (design 1): NO PREEMPTION POINT. Sixteen register writes, and a
+/// half-rewritten grant table is exactly an in-flight invariant — the whole
+/// staged `prot_*` sequence is one edit, published by `prot_commit`.
 public func prot_reset() unsafe {
     PMPCFG_LO = 0
     PMPCFG_HI = 0
@@ -523,6 +527,9 @@ public func prot_commit() unsafe {
 /// zeroed ones on purpose — a thread entry that RETURNS jumps to zero and takes
 /// an instruction-access fault, which spec §8 turns into the death of its
 /// process. That is a diagnosed stop rather than a run into whatever follows.
+///
+/// AUDIT (design 1): NO PREEMPTION POINT. 32 word stores, and a half-built
+/// context is an in-flight invariant the trap path can reach.
 public func frame_init(frame_addr: UInt, entry: UInt, stack_top: UInt,
                        arg0: UInt) unsafe {
     var w: UInt = 0
@@ -775,6 +782,9 @@ extension MachineTimer {
     /// read that straddled a carry would be off by 2^32 counter units — about
     /// seven minutes here, and only ever on the one read in seven minutes that
     /// hits it.
+    ///
+    /// AUDIT (design 1): NO PREEMPTION POINT. The retry is bounded by one carry,
+    /// and this is reached FROM the delivery path anyway.
     func now(&self) unsafe -> UInt64 {
         var hi = self.count.hi.read()
         var lo = self.count.lo.read()
@@ -926,6 +936,13 @@ extension Plic {
 
     /// Every source masked and disabled, and the context's threshold at 0 so
     /// that an unmasked source at any priority above it gets through.
+    ///
+    /// AUDIT (design 1): NO PREEMPTION POINT, for two independent reasons and
+    /// either would be enough. A HALF-MASKED CONTROLLER IS ITSELF IRQ-shared
+    /// state in flight — a point in the middle would poll the very device it is
+    /// halfway through reconfiguring — and this runs before `intc_init`
+    /// completes, so nothing can be pending to find. 98 register stores at MMIO
+    /// speed, once, at boot.
     func reset(&self) unsafe {
         var line: UInt = 1
         while line <= PLIC_MAX_SOURCE {

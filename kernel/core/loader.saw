@@ -10,8 +10,9 @@
 
 import hal
 import imgformat.{SosimgHeader, SosimgSeg, SegFlag, fits_target_word}
-import kcore.mem.{align_up, copy_bytes, zero_bytes}
+import kcore.mem.{align_up}
 import kcore.diag.{console, fatal_image}
+import kcore.preempt.{long_copy, long_zero}
 import kcore.process.{start_process}
 
 /// What a refused too-high address REPORTS: its top 32 bits. The low half is
@@ -210,6 +211,9 @@ public func load_root_and_enter() unsafe {
 
     // Validate EVERY segment before placing any of them: a rejected image must
     // leave the root region untouched.
+    //
+    // AUDIT (design 1): NO POINT. At most eight iterations of an O(1) body —
+    // bounded-small, so there is nothing here for a point to shorten.
     var i: UInt = 0
     while i < seg_count {
         let seg = seg_at(base + header_len + i * seg_len)
@@ -239,6 +243,18 @@ public func load_root_and_enter() unsafe {
     // stack, and a process always has somewhere to receive one.
     var rw_base = hal.ROOT_REGION_TOP - hal.ROOT_STACK_LEN
 
+    // AUDIT (design 1): the walk itself takes NO point; its POINTS ARE THE
+    // MOVERS' (`long_copy`/`long_zero` below), which is where the time is — up
+    // to 240 KiB of it. The staged `prot_*` state is uncommitted across the
+    // whole walk, and that is legal rather than lucky: the IRQ path never reads
+    // protection state, so the staged descriptors are not an in-flight invariant
+    // a delivery could observe.
+    //
+    // A TICK CAN NOW FIRE MID-LOAD in a harness kernel that arms one before
+    // loading (`tests/threads_timer.saw`), and that is legal by the same audit:
+    // no thread is current, so the tick charges no slice; no Timer object exists
+    // before root runs, so expiry walks a table of free slots; and the
+    // reprogramming it ends with is the same one the idle path does.
     var s: UInt = 0
     while s < seg_count {
         let seg = seg_at(base + header_len + s * seg_len)
@@ -254,8 +270,8 @@ public func load_root_and_enter() unsafe {
         if seg.is_device_grant() {
             hal.prot_device(s, load_addr, mem_len)
         } else {
-            copy_bytes(load_addr, base + (seg.file_off as UInt), file_len)
-            zero_bytes(load_addr + file_len, mem_len - file_len)
+            long_copy(load_addr, base + (seg.file_off as UInt), file_len)
+            long_zero(load_addr + file_len, mem_len - file_len)
 
             // The sosimg flag bits ARE the protection vocabulary (imgformat
             // states the encoding; each HAL translates it into its own
