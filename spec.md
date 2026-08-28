@@ -1,6 +1,7 @@
 # SOS — a capability-based microkernel in Saw
 
-Working notes. Name "SOS" is a placeholder (Saw OS). Requirements in
+Working notes. The name is SawOS ("SOS" for short — ruled Aug 28 2026, no
+longer a placeholder). Requirements in
 §1 are ratified (user, Jul 29); later sections are proposals and open
 questions for discussion. First target: ESP32-P4 (riscv32) via Saw's
 freestanding profile; the design must not preclude MMU-class targets.
