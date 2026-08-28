@@ -1074,7 +1074,7 @@ event-driven EDGE of a process gets a second, distinct construct:
     emitted by a Blade `emit = "sosimg"` build target reading the package's
     `[sos]` manifest section, appended to the kernel image as a `.payload` blob
     with linker-symbol bounds. The layout lives ONCE, in the shared
-    `sos/imgformat/` package: Blade consumes it as a path dependency and emits
+    `libs/imgformat/` package: Blade consumes it as a path dependency and emits
     bytes through it, the kernel consumes it through `--module-path` and reads
     images by overlaying the same structs as `UnsafeMemory` typed views, with
     `static_assert` pinning the sizes on both sides. `sos/root/` is a real
