@@ -57,13 +57,17 @@ this machine it is a user-level symlink
 sawlang#238 D-f) — one canonical copy, no drift. On a machine without a
 sawlang checkout, re-create the symlink against one or copy the skill in.
 
-## Design records (sawlang#238 D-c)
-sawlang's design briefs 78/79/112/140/162/172/178/232 and the sos DF
-entries STAY in sawlang as the archival record — cite them as
-`sawlang#NNN`. sawos numbering starts at 1 in `designs/` here when the
-first sawos-native design lands. The M3 ladder (sawlang#232: interrupt
-interruptibility, CreateProcess, handle lifecycle, give, Memory/IoMemory,
-quotas, death notifications) is the plan of record and runs HERE.
+## Design records (sawlang#238 D-c, amended Aug 28)
+sawlang stays the archival record for its briefs and the sos DF
+entries — cite them as `sawlang#NNN` — but the sos briefs
+(78/79/112/140/162/172/178/232, the 238 split brief, and the 238
+oracle transcript) are COPIED into `designs/sawlang/` here for
+reference. sawos-native numbering starts at 1 in `designs/`. The open
+work tracker is `designs/todo.md` (sawlang's tracker flow: agents
+close entries in place, the lead moves closed entries to done files at
+integration). The M3 ladder (sawlang#232: interruptibility,
+CreateProcess, handle lifecycle, give, Memory/IoMemory, quotas, death
+notifications) is the plan of record and runs HERE.
 
 ## Conduct
 Same doctrine as sawlang (its CLAUDE.md is the fuller statement): never
