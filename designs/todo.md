@@ -21,8 +21,17 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
-- M3 unit 2 — CreateProcess [sawlang#232]: two-phase inert-until-started
-  lifecycle, image copy born with its points
+- M3 unit 2 — CreateProcess [sawlang#232, #2 —
+  designs/002-create-process.md, authored Aug 28]: ZERO-COPY (user
+  ruled Aug 28 — kernel maps, never copies; the ladder's image-copy
+  loop is never born), link-in-place children flattened by the
+  stitcher, region table + minimal Memory kind (unit 4's first
+  slice), boot_handle_next pulled forward (unit 3's iterator),
+  stack is root-provided Memory (user ruled Aug 28, amends the
+  Aug-16 "sosimg declares both" letter), protection reload at
+  pick_next's marked point (forced both arches), end_process forks
+  (root stops the machine, a child reschedules). DISPATCHED Aug 28;
+  closes in place when the branch parks
 - M3 unit 2.75 — handle lifecycle [sawlang#232]
 - M3 unit 3 — give(handle, tag:) [sawlang#232]
 - M3 unit 4 — Memory/IoMemory [sawlang#232]
