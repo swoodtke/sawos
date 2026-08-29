@@ -21,29 +21,6 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
-- ~~sysapi split~~ **BUILT Aug 29 — branch parked** [user-requested
-  Aug 29, #5 — designs/005-sysapi-split.md]: kernel/sysapi/src/lib.saw
-  becomes the kcore-style facade over per-object files, declared order,
-  zero behavior change, every row byte-identical. DISPATCHED Aug 29.
-  2,000 lines became ten modules plus the facade — floor, memory,
-  thread, event, interrupt, timer, clock, waiter, system, rt, lib —
-  with bodies moved by line range so every docstring and statement is
-  byte-identical. Acceptance met in full: 124/124 both arches with the
-  WHOLE transcript byte-identical to the merge base (no size movement
-  to account for, build-info lines included), and the exported `sos_*`
-  symbol list identical across four packages x two arches x every `.o`
-  and `.elf`. FIVE FINDINGS in the brief's As-built, two of them
-  structural: `System`/`Process`/`BootHandle` cannot be three files
-  (each pair names the other, and a facade re-export widens no
-  extension scope, so there is no `process.saw`), and a locally
-  DECLARED type name beats the prelude where an IMPORTED one ties with
-  it — `Thread` vs `std.task`'s `Thread<T>`, which is why `system.saw`
-  writes `thread.Thread`. Also: the whole per-op C surface had to stay
-  with the syscall externs (an `extern "C"` decl is private by
-  construction and cannot be shared), `waiter` had to move above the
-  three kinds it attaches, and the facade needs one plain
-  `import sos.rt` because that module publishes nothing to re-export.
-  OPEN: nothing. Closes in place; the lead moves it at integration
 - M3 unit 4 — Memory/IoMemory [sawlang#232]
 - M3 unit 5 — quotas [sawlang#232]
 - M3 unit 5.5 — death notifications [sawlang#232]
