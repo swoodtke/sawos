@@ -100,3 +100,41 @@ repo's first done file; sawos was born Aug 28 (sawlang#238).
   there (a platform-`UInt` const-adoption gap; no op mints a second
   handle onto a process's own Event/Waiter/Timer, which unit 3's
   `give` is the answer to). OPEN: nothing. INTEGRATED to main Aug 29 (lead-reviewed, gate re-run 108/108, fast-forward d3c9620)
+
+- M3 unit 3 — give(handle, tag:) [sawlang#232 Aug-16 launch-flow
+  ruling, #4 — designs/004-give.md, authored Aug 29]: give as
+  unbind-and-rebind rights-verbatim, tags the only cross-process
+  vocabulary, per-process boot queues, start(boot_tag:) kernel-resolved
+  a0, give-before-start the frozen barrier. No authorized transcript
+  changes. DISPATCHED Aug 29.
+  **BUILT Aug 29, after FIVE USER RULINGS taken at review — branch
+  parked.** The chain is recorded in the brief ("THE RULING CHAIN",
+  amending D-3/D-4) and started from the implementation's finding that
+  D-3's give-then-start sequence was not writable: `Start` is an op on
+  the one handle a `give` would have moved. The answer went to the root:
+  **`MINT_OP = 0xFFFE`**, a second universal op minting a SIBLING handle
+  onto the same object with rights the source's INTERSECTED with a KEEP
+  mask, gated on a new universal `Mint` bit. That closes design 3's
+  finding 2, makes §3's attenuation something a HOLDER performs, and
+  lets a launcher hand a child a MASKED SYSTEM HANDLE — so every process
+  now bootstraps exactly as root does (§12 symmetry), a child can PRINT
+  without owning a device, and a launcher keeps supervision while the
+  child manages itself. `start(boot_tag:)`'s resolution CONSUMES its
+  record. And **`Manage` is removed as a right everywhere** (specific
+  rights for specific operations; `Mint` takes bit 1;
+  `SystemRight.ProcessSelf`, `ProcessRight.ThreadSelf` and
+  `ProcessRight.Give` replaced it), which collapsed the two Process
+  default sets into one.
+  Gate: 124/124 across riscv32 + arm64 (62 cases each) against a 108
+  baseline at the merge base; the 108 pre-existing rows byte-identical
+  in name, verdict and ORDER, eight new rows appended per architecture.
+  FOR THE LEAD, three items: the uniform-`Mint`-in-every-default-set
+  lean is recorded as a LEAN and is the user's to veto at integration; a
+  handle cannot be narrowed below `Transfer` and still be given (so a
+  receiver holds that bit — inert today, a ruling for the pipe unit);
+  and `FaultReason.DuplicateKey`'s text still names attachments,
+  unchanged because `event_dupkey` asserts it and no expectation edit
+  was authorized. The `event-wake` / `event-consume-wake` rewrite that
+  `MINT_OP` now makes possible is BACKLOG, deliberately not done here —
+  it would move shipped rows
+  INTEGRATED to main Aug 29 (lead-reviewed, gate re-run 124/124, fast-forward 355ca4b).
