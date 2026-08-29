@@ -1,0 +1,97 @@
+// SOS M3 unit 3: A BOOT TAG THAT NAMES NOTHING IS A FAULT (sawos design 4).
+//
+// `start(boot_tag:)` asks the kernel to resolve a tag against the child's boot
+// set and put the CHILD-SIDE word in its first argument register. A tag no give
+// ever used resolves to nothing, and there is no honest thing to put there: a
+// zero would be indistinguishable from the deliberate no-tag form, which is a
+// real and useful shape (the sandboxed compute process), so a child started with
+// a typo would silently become a sandbox instead of failing.
+//
+//   SOS badtag: gave tag 3
+//   SOS: process fault: argument outside its domain process=0
+//   SOS: process teardown ... process=0
+//
+// IT IS A FAULT AND NOT A STATUS because it is caller-checkable in the strongest
+// sense there is: the launcher wrote BOTH halves — the tag it gave and the tag it
+// started with — and nothing about the kernel, the child or any resource is
+// involved in the disagreement between them.
+//
+// THE GIVE ABOVE IS WHAT MAKES THE CASE SHARP. A set with a record in it is one
+// where "the tag resolved to nothing" cannot be confused with "there was nothing
+// to resolve against": tag 3 is there, and 9 is not.
+//
+// Zero would have been the tempting sentinel for "no tag" and is why `start`
+// takes a FORM argument instead: root's own boot regions are tagged with
+// ordinals starting at 0, so zero is a legitimate tag and reserving it would
+// have made the first row of every region table unnameable.
+
+import sos.{System, Process, Memory, BootHandle, SosStatus}
+
+static EXIT_FAILED: UInt = 1
+
+/// The tag root gives.
+static TAG_GIVEN: UInt = 3
+
+/// The tag root starts with. It is not `TAG_GIVEN`, and that is the whole case.
+static TAG_WRONG: UInt = 9
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS badtag: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    var image = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS badtag: no image region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    var dest = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS badtag: no destination region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let image_mem = image.take_memory()!
+    let dest_mem = dest.take_memory()!
+
+    let child = match system.process_create(image: &image_mem,
+                                            memory: &dest_mem) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS badtag: create failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    match child.give(memory: move image_mem, tag: TAG_GIVEN) {
+        case Ok(_) -> {
+            print("SOS badtag: gave tag {}\n", TAG_GIVEN)
+        },
+        case Err(e) -> {
+            print("SOS badtag: give failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // The set holds tag 3 and nothing else, so this resolves to nothing and does
+    // not return.
+    let _ = child.start(boot_tag: TAG_WRONG)
+
+    let _ = system.debug_print("SOS badtag: survived, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

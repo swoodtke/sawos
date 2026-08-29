@@ -41,7 +41,7 @@ names provisional):
 | `Waiter` | Generic wait aggregator (epoll/Port-style) — see §2.2 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Add`/`Remove`/`Wait`, rights `WaiterRight.Attach`/`.Wait`, the wait answer a copy-out record. |
 | `MemoryObject` | Physical memory (RAM or device MMIO). Ownership/authority over the pages; mappable, sendable — see §2.3 (ratified Jul 29). |
 | `Mapping` | An installed virtual placement of a MemoryObject; distinct object, own handle; only it can unmap — see §2.3. |
-| `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. BUILT M2 (design 178 unit 2), one process: ops `ThreadCreate`/`ThreadSelf`/`Exit`/`GetStatus` plus the three factory ops `EventCreate`/`WaiterCreate`/`InterruptBind`, each on its own right. BUILT M3 unit 2 (sawos design 2), **TWO processes**: `Start` (on the CHILD's handle, `ProcessRight.Start`) mints the first thread of a created process and runs it; `BootHandleNext` (`ProcessRight.BootHandles`) drains §12's boot set one record at a time. The CREATE half of that lifecycle is not an op on this object — design 2's RIDER (Aug 29) puts `ProcessCreate` on System, because a process is a machine-wide resource (§12's amended creation-authority note). The child's handle carries `Start | Wait | Manage` and nothing else — everything a process may do to ITSELF is withheld from its creator. The TEARDOWN now forks (§8): process 0 stops the machine, any other reschedules. **THE SLOT OF A DEAD PROCESS IS RECLAIMED** (sawos design 3 D-3, M3 unit 2.75), and it is the ONLY slab that reclaims on a handle release. A `Gone` slot holds one thing — its §8 status word — and the only way to read that word is `GetStatus` through a Process handle, so "no handle names this slot" IS "no possible reader", exactly. The check therefore scans the handle tables (bounded: `MAX_PROCESSES` × `MAX_HANDLES`) when a released entry named a `Gone` process, and again at the end of a process's own teardown for its own slot. D-1's generations are what make the reuse safe, and `clear_domain` already invalidated `LAST_PROT_PROCESS` in anticipation. `MAX_PROCESSES` consequently bounds CONCURRENT processes again, which is what the name says. Every other kind still frees only at its owner's teardown: their "may I free this" question needs a refcount nothing yet justifies. `kill` (§8) still has no op. |
+| `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. BUILT M2 (design 178 unit 2), one process: ops `ThreadCreate`/`ThreadSelf`/`Exit`/`GetStatus` plus the three factory ops `EventCreate`/`WaiterCreate`/`InterruptBind`, each on its own right. BUILT M3 unit 2 (sawos design 2), **TWO processes**: `Start` (on the CHILD's handle, `ProcessRight.Start`) mints the first thread of a created process and runs it; `BootHandleNext` (`ProcessRight.BootHandles`) drains §12's boot set one record at a time. The CREATE half of that lifecycle is not an op on this object — design 2's RIDER (Aug 29) puts `ProcessCreate` on System, because a process is a machine-wide resource (§12's amended creation-authority note). The child's handle carries `Start | Wait | Manage` and nothing else — everything a process may do to ITSELF is withheld from its creator. The TEARDOWN now forks (§8): process 0 stops the machine, any other reschedules. **THE SLOT OF A DEAD PROCESS IS RECLAIMED** (sawos design 3 D-3, M3 unit 2.75), and it is the ONLY slab that reclaims on a handle release. A `Gone` slot holds one thing — its §8 status word — and the only way to read that word is `GetStatus` through a Process handle, so "no handle names this slot" IS "no possible reader", exactly. The check therefore scans the handle tables (bounded: `MAX_PROCESSES` × `MAX_HANDLES`) when a released entry named a `Gone` process, and again at the end of a process's own teardown for its own slot. D-1's generations are what make the reuse safe, and `clear_domain` already invalidated `LAST_PROT_PROCESS` in anticipation. `MAX_PROCESSES` consequently bounds CONCURRENT processes again, which is what the name says. Every other kind still frees only at its owner's teardown: their "may I free this" question needs a refcount nothing yet justifies. `kill` (§8) still has no op. **BUILT M3 unit 3 (sawos design 4): `Give` — THE COURIER OP.** `give(handle, tag:)` on the CHILD's handle (gated by `ProcessRight.Manage` there, plus the UNIVERSAL `Transfer` right on the handle being given) MOVES a handle into a fresh slot of the child's table and returns ONLY ITS STATUS: the child-side word is meaningless to the giver, which can call no op through it. What crosses instead is the TAG — the giver's own word, handed back unread at the child's drain. It is unbind-and-rebind with RIGHTS VERBATIM (a move, not a mint: no default set is consulted and nothing amplifies), the caller's entry unbinds exactly as a release does so the giver's word goes stale, and a full child table is `NoResource` with the give not having happened. Four caller errors END the caller: a handle that names nothing (`BadHandle`), one without `Transfer` (`AccessDenied`), a child that has already been STARTED (`BadState` — the boot set FREEZES at start, which is the launch flow's whole soundness argument), and a tag the child's set already carries (`DuplicateKey` — the tag is the identity, and one naming two handles would make the boot lookup ambiguous). `Start` gained a `boot_tag` argument in the same unit: the kernel resolves the tag to the child-side word and puts it in the child's first argument register, so `_start(boot_handle)` is unchanged and a launcher never sees a child-relative word. `BootHandleNext` now drains the CALLER's own PER-PROCESS set — the kernel writes root's at boot and a launcher writes a child's with `give`, through one op with one exhaustion rule. The child's handle from `process_create` was RE-RULED to the full self-management set plus `Start`, `BootHandles` and `Transfer`, so root chooses: KEEP it and supervise, or GIVE it and donate. One handle, one choice; a second handle onto one process is design 3's finding-2 re-mint question, which unit 5.5 owns. |
 | `System` | Kernel singleton (ratified Aug 5): the object behind system-scoped primitives so that EVERY syscall is an object op (§5.7) — v1 ops `debug_print`, `shutdown(status)` (stop the machine; QEMU: sifive_test), rights-gated (`SystemRight.Debug`/`.Shutdown`, §3 scoped rights). Root receives its handle at boot (§12). `exit` is NOT here — process exit belongs to the Process object when it exists (ratified Aug 5). M2 added a third op, `process_self` on `SystemRight.Manage` (design 178 unit 2): §3's derivation rule made real, so the boot register stays ONE handle wide and a process obtains its Process object THROUGH the System handle rather than being handed it. M3 added `clock_get` on `SystemRight.ClockGet` (design 232 unit 1: time is a granted capability) and, by sawos design 2's RIDER (Aug 29), `process_create` on `SystemRight.ProcessCreate` — the object's one FACTORY, here because a process is machine-wide and only this object is (§12's amended creation-authority note); `process_self` was already the precedent, since a Process handle has always come out of this object. Later candidates: info queries. |
 
 **Nine of these kinds exist today** — System, Process, Thread, Event, Waiter,
@@ -372,7 +372,19 @@ money shot rides unit 4's IoMemory, not this slice.
   kernel paths (pipe handle-transfer) check universal bits without
   knowing the kind; `sosabi` `static_assert`s each kind's enum
   against the pinned table so no kind can drift, and a kind-specific
-  right below bit 8 is a spec violation the assert catches. **No DUPLICATE right — no handle
+  right below bit 8 is a spec violation the assert catches.
+  **`Transfer` HAS ITS FIRST CONSUMER** (sawos design 4, M3 unit 3): the
+  bit was declared in every kind's enum in M2 and read by NOTHING until
+  `ProcessOp.Give`, which checks it on the handle BEING GIVEN — at the
+  one altitude that has the entry and has not yet branched on its kind,
+  the same place `RELEASE_OP` is intercepted. So the universal low byte
+  is now load-bearing rather than reserved, and `rights_allow_transfer`
+  is the one function that reads it. Which kinds' DEFAULT sets mint it
+  is a per-kind ruling: v1 mints it in `memory_rights()` and
+  `child_process_rights()` and nowhere else, so a Thread, Event, Waiter,
+  Interrupt, Clock or Timer handle cannot be given yet, and root's own
+  System handle deliberately withholds it (the M2 "nobody to transfer
+  to" choice, which is why a child stays console-silent until pipes). **No DUPLICATE right — no handle
   duplication at all** (ratified Jul 29): every handle is unique, the
   exact `NoCopy` correspondence. If a second handle to a resource is
   legitimately needed, the resource's CREATOR (who holds MANAGE)
@@ -395,6 +407,18 @@ money shot rides unit 4's IoMemory, not this slice.
   What instances buy is OWNERSHIP: each is independently held and
   independently released, which is what makes the `NoCopy` wrapper an
   owner rather than a name.
+  **AND A GIVE IS A MOVE, NOT A MINT** (sawos design 4 D-1, M3 unit 3),
+  which is the same invariant read from the transfer side. `ProcessOp.Give`
+  copies the entry's kind, target and RIGHTS WORD verbatim into the
+  receiver's table and consults no default set at all, so what the giver
+  attenuated stays attenuated and no handle is ever wider on the far side
+  of a transfer than it was on the near one. It cannot be, either: there
+  is no attenuate op yet, so rights travel exactly as minted, and building
+  one is the unit that needs it. The giver's entry is UNBOUND by the same
+  act — `unbind_handle`, generation bump included, the same function
+  release and the teardown call — so exactly one process holds the
+  capability at every instant and the giver's word is a diagnosed
+  `BadHandle` afterwards rather than an alias.
 - **Attenuation is monotonic**: any derivation or duplication may only
   strip rights, never add. The only rights source is the boot handle
   set given to the root server.
@@ -459,6 +483,15 @@ money shot rides unit 4's IoMemory, not this slice.
     leaves a disarmed-but-unsent word. User code never touches the
     sentinel; generations backstop the discipline, so a funnel bug that
     released after a transfer is a diagnosed `BadHandle`, not corruption.
+    **IT HAS ITS FIRST CONSUMERS** (sawos design 4, M3 unit 3):
+    `Process.give(memory:tag:)` and `give(system:tag:)` take their wrapper
+    BY VALUE and disarm it before the syscall, so a given capability is
+    unreachable from the giver by construction rather than by discipline.
+    `Process.start(donating:)` is the one place the wrapper is DISARMED
+    rather than consumed — Saw has no consuming `self` receiver, and the
+    handle being moved is the one the op is invoked through — so it leaves
+    a husk whose drop does nothing and whose use is the ordinary
+    `BadHandle`.
 
 ## 4. The Saw synergy (why this language, this kernel)
 
@@ -1148,11 +1181,27 @@ event-driven EDGE of a process gets a second, distinct construct:
     `process_create(image:memory:)` + `start()` are real, §12's
     loader-above-boot rule is EXERCISED — one loader, two doors, differing
     only in region parameters and failure vocabulary — and the protection
-    domain is RELOADED per process at the scheduler's one switch point. What
-    remains of the launch flow is unit 3's: `give(handle, tag:)` and
-    `start(boot_tag:)`, so that a child receives something. A child today is
-    the ruled "legal-but-doomed" sandboxed compute process, holding no handle
-    at all.
+    domain is RELOADED per process at the scheduler's one switch point.
+  - ~~**The launch flow — a child that RECEIVES something**~~ BUILT by sawos
+    design 4 (M3 unit 3), and it is what turns a second address space into a
+    second PROCESS. `give(handle, tag:)` moves a capability into a child's
+    table under a word the launcher chooses and the kernel never reads;
+    `start(boot_tag:)` resolves that word to the child-side handle and puts
+    it in the child's first argument register; `BootHandleNext` drains the
+    caller's own PER-PROCESS set, so a child's boot sequence is literally a
+    receive loop. THE BOOT SET FREEZES AT START — a give afterwards is
+    `BadState` — and that ordering is the whole soundness argument: what a
+    launcher furnishes must be complete at the child's first instruction, and
+    the barrier makes a half-populated table unrepresentable with no
+    synchronization invented. A child handed nothing is STILL the ruled
+    "legal-but-doomed" sandboxed compute process, which is a feature and the
+    default. Three things the flow still lacks, each named rather than
+    pending: nothing mints a GIVABLE System handle, so a child has no console
+    and reports through its exit code; a launcher cannot both supervise and
+    donate, because there is one Process handle per child and a second needs
+    the re-mint question design 3's finding 2 recorded (unit 5.5); and there
+    is no ATTENUATE op, so rights travel exactly as minted. Dynamic transfer
+    to a RUNNING process is M4 IPC's, over pipes, to a receiver expecting it.
   - **Memory / IoMemory / MemoryMapping and `map()`** (§2.5) — the FIRST
     SLICE is built (sawos design 2 D-2): a sealed `{base, len}` MemoryObject,
     minted only at boot from a build-emitted region table, delivered through
@@ -1581,6 +1630,39 @@ event-driven EDGE of a process gets a second, distinct construct:
   it no meaning: which ordinal is an image, which is a destination, which is a
   device is ROOT's config. That is what keeps the kernel's half of the launch
   flow identical for a hand-built M3 system and for M4's dynamic loading.
+- **AND EVERY PROCESS HAS ONE** (M3 unit 3, sawos design 4). The boot set went
+  PER-PROCESS when there were two drainers: the kernel writes root's at boot and
+  a LAUNCHER writes a child's with `ProcessOp.Give`, through the same machinery,
+  and a child drains its own through its own Process handle exactly as root
+  drains root's. The two producers are indistinguishable on purpose — the kernel
+  is the giver nobody gave to — and the drain is one op with one exhaustion rule.
+  Three sentences carry the model:
+  - **THE TAG IS THE IDENTITY, and tags are the ONLY cross-process vocabulary.**
+    A tag is the giver's own word handed back unread (the `Waiter.add` key
+    precedent): the kernel is a courier, never an interpreter, and a launcher and
+    a child agree on meaning through config and manifest. So a give answers with
+    a STATUS ALONE — the child-side word means nothing to the giver, which can
+    call no op through it — and a DUPLICATE tag is refused at the give, because
+    an identity naming two handles would make the boot lookup ambiguous.
+  - **THE SET FREEZES AT `start`.** Whatever a launcher gives must be complete at
+    the child's first instruction, and the start call is the barrier that makes a
+    half-populated table unrepresentable with no synchronization invented; a give
+    afterwards is a `BadState` fault. The DRAIN has no deadline at all — records
+    persist until consumed, so a child that drains late drains correctly.
+  - **`start(boot_tag:)` IS HOW THE FIRST HANDLE ARRIVES.** The kernel resolves
+    the tag to the child-side word and puts it in the first argument register, so
+    `_start(boot_handle)` is unchanged from M2 and a launcher never sees a
+    child-relative word at any point. Resolution consumes no record, so the child
+    meets that handle again in its drain. The no-tag form is the sandboxed
+    compute process and is still the default; a tag naming no given record is a
+    `BadArg` fault, and "no tag" is a FORM argument rather than a reserved tag
+    value, because zero is a legitimate tag (root's region ordinals start there).
+  A child that is to DRAIN must hold its own Process handle, which only its
+  launcher can put there — so `process_create`'s handle carries the full
+  self-management set plus `Transfer`, and the launcher chooses once: keep it and
+  supervise, or hand it over at the barrier and donate. It cannot do both, since
+  a second handle onto one process is the re-mint question unit 5.5 owns. The
+  v1 bootstrap-pipe convention below is where that division stops being a choice.
 - **v1 protocol conventions** (userspace convention section, not kernel
   surface): a launched process receives ONE bootstrap pipe handle at
   launch; its first messages request its initial handle set from the

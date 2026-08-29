@@ -1,0 +1,90 @@
+// SOS M3 unit 3: A HANDLE WITHOUT `Transfer` CANNOT BE GIVEN (sawos design 4).
+//
+// **THE FIRST CONSUMER §3's UNIVERSAL LOW BYTE HAS EVER HAD.** Bit 0 —
+// `Transfer`, "may be sent over a pipe", the movability capability — has been
+// declared in every kind's rights enum since M2 and READ BY NOTHING. `give` is
+// what reads it, and it reads it on the handle BEING GIVEN rather than on the
+// receiver, which is the ruling's own gate.
+//
+// ROOT'S SYSTEM HANDLE WITHHOLDS IT, deliberately and since M2:
+// `root_system_rights()` mints `Debug | Shutdown | Manage | ClockGet |
+// ProcessCreate` and no `Transfer`, on the reasoning that in a one-process world
+// there was nobody to transfer to. That is still v1-correct — a child holding a
+// System handle could print, stop the machine and spawn — and design 4 changed
+// exactly one default set (the child's own Process handle) and no other. So this
+// give is refused:
+//
+//   SOS notransfer: giving the System handle away
+//   SOS: process fault: access denied process=0
+//   SOS: process teardown ... process=0
+//
+// WHICH IS ALSO WHY A CHILD IS CONSOLE-SILENT. `child-drain` reports through its
+// exit code rather than by printing, and this line is the reason: nothing in v1
+// mints a givable System handle, so nothing can hand a child a voice. The echo
+// driver speaks its device, not the debug console.
+//
+// The funnel CONSUMES the wrapper before the syscall (design 3 D-5's
+// disarm-before-syscall), so the last line this program can print is the one
+// above the give. That ordering is the contract, not an accident of this file.
+
+import sos.{System, Process, Memory, BootHandle, SosStatus}
+
+static EXIT_FAILED: UInt = 1
+
+static TAG: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS notransfer: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    var image = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS notransfer: no image region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    var dest = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS notransfer: no destination region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let image_mem = image.take_memory()!
+    let dest_mem = dest.take_memory()!
+
+    let child = match system.process_create(image: &image_mem,
+                                            memory: &dest_mem) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS notransfer: create failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // Said BEFORE the give, because the funnel consumes the wrapper and there is
+    // no console on the far side of this line.
+    let _ = system.debug_print("SOS notransfer: giving the System handle away\n")
+
+    // REFUSED. The handle resolves and the receiver is `Created`; what it lacks
+    // is the one universal bit this op checks.
+    let _ = child.give(system: move system, tag: TAG)
+
+    // Unreachable, and it cannot print: the System wrapper is gone. Exiting with
+    // a failure code is the only diagnostic left, and its exit STATUS is what
+    // the harness would see instead of the fault code.
+    let _ = proc.exit(EXIT_FAILED)
+}

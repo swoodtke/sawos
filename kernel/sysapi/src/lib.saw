@@ -95,7 +95,7 @@ import sosabi.{SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp, InterruptOp,
                SystemHandle, ProcessHandle, ThreadHandle, EventHandle,
                WaiterHandle, InterruptHandle, ClockHandle, TimerHandle,
                MemoryHandle,
-               RELEASE_OP, NO_HANDLE,
+               RELEASE_OP, NO_HANDLE, BootTagForm,
                WaitTag, WAIT_RECORD_WORDS, WAIT_KEY_WORD, WAIT_TAG_WORD,
                WAIT_PAYLOAD_WORD, wait_record_bytes,
                BOOT_HANDLE_RECORD_WORDS, BOOT_HANDLE_TAG_WORD,
@@ -366,9 +366,58 @@ public func sos_interrupt_ack(handle: UInt) -> UInt {
 ///
 /// A SECOND START TERMINATES THE CALLER — it is broken code, and the caller is
 /// the one that started it the first time.
+///
+/// **`boot_tag_form` SAYS WHETHER `boot_tag` MEANS ANYTHING** (sawos design 4
+/// D-4): 0 is the no-tag form and puts nothing (`NO_HANDLE`) in the child's
+/// first argument register; 1 resolves `boot_tag` against the child's boot set
+/// and puts the CHILD-SIDE word there. Any other value terminates the caller.
+///
+/// It is a flag argument rather than a reserved tag value because ZERO IS A
+/// LEGITIMATE TAG — root's region ordinals start at 0 — and because a tag is the
+/// giver's own word, which the kernel must not reserve values out of. A tag that
+/// names no given record terminates the caller: it is config the caller wrote
+/// both halves of.
+///
+/// THE C ALTITUDE WRITES THE FORM AS A NUMBER, which is the documented
+/// difference in kind the module docstring describes (see
+/// `sos_process_event_create`'s mode): a C caller has no enum to be handed. The
+/// Saw altitude above never writes one — it offers `start()` and
+/// `start(boot_tag:)`.
 @export("sos_process_start")
-public func sos_process_start(handle: UInt) -> UInt {
-    sos_syscall1(handle, ProcessOp.Start as UInt, 0)
+public func sos_process_start(handle: UInt, boot_tag_form: UInt,
+                              boot_tag: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, ProcessOp.Start as UInt, boot_tag_form, boot_tag, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// **GIVE `given` TO THIS PROCESS UNDER `tag`** — the courier op (sawos design
+/// 4). Requires `ProcessRight.Manage` on the CHILD's handle and the universal
+/// `Transfer` right on the handle BEING GIVEN.
+///
+/// It MOVES the handle: the caller's entry is unbound and its generation bumped,
+/// a fresh entry binds in the child's table carrying the SAME kind, target and
+/// RIGHTS, and a record is appended to the child's boot set under `tag`. **THE
+/// RETURN IS A STATUS ALONE** — the child-side word is meaningless to the caller,
+/// which can call no op through it, so nothing hands it back. What crosses is the
+/// TAG, which the child reads at its drain and which the kernel never interprets.
+///
+/// **THE GIVER'S WORD IS DEAD AFTERWARDS.** Using it again is the ordinary
+/// `BadHandle` fault, which is design 3's generations doing the only job they
+/// have. Typed Saw callers cannot meet that: `Process.give` consumes the wrapper
+/// and disarms it before the syscall.
+///
+/// FOUR WAYS TO TERMINATE THE CALLER, all caller-checkable: a `given` that names
+/// nothing (`BadHandle`); one without `Transfer`, or a receiver handle without
+/// `Manage` (`AccessDenied`); a child that has already been STARTED — the boot
+/// set freezes at start (`BadState`); and a `tag` the child's set already carries
+/// (`DuplicateKey`). A full child table is `SosStatus.NoResource`, a STATUS, and
+/// the give did not happen — the caller's handle is untouched.
+@export("sos_process_give")
+public func sos_process_give(handle: UInt, given: UInt, tag: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, ProcessOp.Give as UInt, given, tag, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
 }
 
 /// Take the next handle out of this process's BOOT SET, as a record copied into
@@ -804,6 +853,36 @@ extension Process: NoCopy {
 }
 
 extension Process {
+    /// **ADOPT THE PROCESS HANDLE THE KERNEL PUT IN THE FIRST ARGUMENT
+    /// REGISTER** — a donated child's `_start`, and the second blessed crossing
+    /// into the typed layer (sawos design 4 D-4).
+    ///
+    /// `System(boot_handle:)` was the first and the rule is the same one: the
+    /// parameter is a raw `UInt` because that is what a register holds and what
+    /// the ABI specifies, and crossing at CREATION is what the explicit
+    /// construction is for. What arrives here is the word
+    /// `start(boot_tag:)` resolved out of this process's own boot set, so it is a
+    /// handle the kernel handed over rather than an integer somebody guessed.
+    ///
+    /// A CHILD MUST ADOPT IT BEFORE IT CAN DRAIN, which is why the donation is
+    /// the boot tag: `boot_handle_next` is an op on the Process object, so the
+    /// Process handle is the one handle that has to arrive by register rather
+    /// than through the iterator.
+    ///
+    /// **EXACTLY ONE WRAPPER PER WORD IS THE CALLER'S OBLIGATION HERE, and this
+    /// is the one place in the module where it is not automatic.** Resolving a
+    /// boot tag does not consume the record, so a child that adopts a0 AND takes
+    /// the same record's `Process` out of its drain holds TWO owners of ONE word
+    /// — and the second drop is a `BadHandle` fault the program did nothing to
+    /// deserve. This module cannot detect it: the two constructions are a
+    /// register read and an iterator entry, and nothing connects them. The rule
+    /// for a donated child is therefore: adopt a0 as your Process, and let the
+    /// matching record's wrapper live exactly as long — which it does, since a
+    /// child's last act is `exit`, and `exit` never returns.
+    public init(boot_handle: UInt) -> Process {
+        Process(handle: ProcessHandle(boot_handle))
+    }
+
     /// Make a thread at `entry`, ready to be started. Requires
     /// `ProcessRight.ThreadCreate`.
     ///
@@ -913,24 +992,159 @@ extension Process {
         return Interrupt(handle: InterruptHandle(raw))
     }
 
-    /// **PHASE TWO**: run this process. Requires `ProcessRight.Start`, which is
-    /// a right on the CHILD's handle — the one `process_create` handed back.
+    /// **PHASE TWO**: run this process, handing it NOTHING in its first argument
+    /// register. Requires `ProcessRight.Start`, which is a right on the CHILD's
+    /// handle — the one `process_create` handed back.
     ///
     /// It mints the first thread at the entry and stack RECORDED AT CREATE, so
     /// the caller supplies neither: a launcher never parses an image, and there
-    /// is no address it could get wrong. The thread starts with NO boot handle
-    /// in its first argument register, which is the v1 form — a child that was
-    /// given nothing is a fully sandboxed compute process, which is a feature
-    /// rather than a state to detect.
+    /// is no address it could get wrong. The thread starts with `NO_HANDLE` in
+    /// its first argument register — a child that was given nothing, or that was
+    /// given handles but no BOOT TAG to find one of them by, is a fully
+    /// sandboxed compute process, which is a FEATURE rather than a state to
+    /// detect.
     ///
     /// THE CALLER KEEPS RUNNING. The child becomes runnable and the scheduler
     /// picks it up, exactly as `Thread.start` does.
     ///
     /// **A SECOND `start()` TERMINATES THE CALLER.** It is broken code — the
     /// caller is the one that started it the first time — so it is a fault on
-    /// the faults ruling's terms rather than a status to branch on.
+    /// the faults ruling's terms rather than a status to branch on. The same
+    /// state word FREEZES THE BOOT SET: a `give` after this call is the same
+    /// fault, which is the ordering the whole launch flow rests on.
     public func start(&self) -> Result<Void, SosStatus> {
-        checked(sos_process_start(self.handle))
+        checked(sos_process_start(self.handle, BootTagForm.Absent as UInt, 0))
+    }
+
+    /// **PHASE TWO, WITH THE CHILD'S FIRST HANDLE IN ITS FIRST ARGUMENT
+    /// REGISTER** (sawos design 4). The kernel resolves `boot_tag` against this
+    /// process's boot set and puts the CHILD-SIDE word in a0, so
+    /// `_start(boot_handle)` is unchanged from M2 and **the launcher never sees
+    /// a child-relative word at any point**.
+    ///
+    /// That is the whole reason `give` answers with a status alone: the word it
+    /// minted means nothing on this side, and the one place it means anything is
+    /// the register the child wakes up with. The launcher speaks TAGS, which are
+    /// its own words handed back unread — the kernel is a courier, and what a
+    /// tag means is config the launcher and the child agree on.
+    ///
+    /// **THE TAGGED RECORD IS STILL DRAINED.** Resolution consumes nothing, so a
+    /// child that receives its own Process handle in a0 also meets that handle's
+    /// record in its drain. Exactly one wrapper per word is the child's
+    /// obligation there; see `Process(boot_handle:)`.
+    ///
+    /// **A TAG THAT NAMES NO GIVEN RECORD TERMINATES THE CALLER** — config
+    /// error, and the caller wrote both halves of it (the tag it gave and the
+    /// tag it started with). So is a second start, exactly as for `start()`.
+    public func start(&self, boot_tag: UInt) -> Result<Void, SosStatus> {
+        checked(sos_process_start(self.handle, BootTagForm.Present as UInt,
+                                  boot_tag))
+    }
+
+    /// **PHASE TWO, DONATING THIS HANDLE TO THE PROCESS IT NAMES** — the third
+    /// form, and the one that makes a self-managing child expressible (sawos
+    /// design 4 D-3, as implemented).
+    ///
+    /// It GIVES this very handle to the child under `donating` and puts the
+    /// child-side word in a0, so the child wakes up holding its OWN Process
+    /// object: it can drain its boot set, make threads and exit with a code.
+    /// Root retains nothing — one handle, one choice, and the choice is made
+    /// here.
+    ///
+    /// **WHY THE DONATION IS SPELLED AT `start` AND NOT AS A `give`.** `Give` is
+    /// a MOVE and `start` is an op on the handle being moved, so a launcher that
+    /// gave this handle away a moment earlier would have nothing left to start
+    /// the child with — the sequence D-3 describes cannot be written. The
+    /// transfer therefore happens at the barrier, which is the one instant that
+    /// is both before the child's first instruction and while the launcher still
+    /// holds the handle. Everything else about it is an ordinary give: rights
+    /// travel verbatim, a tagged record joins the child's boot set, and the
+    /// child meets that record again in its drain.
+    ///
+    /// **THIS WRAPPER IS DISARMED, NOT CONSUMED**, and the reason is a language
+    /// fact rather than a choice: Saw has no consuming `self` receiver, and
+    /// `child.give(process: move child, …)` would move a value the same call is
+    /// borrowing as its receiver. So the funnel takes `&var self` and writes
+    /// `NO_HANDLE` into the field before the syscall, exactly as design 3 D-5's
+    /// transfer contract prescribes — and what is left behind is a husk whose
+    /// drop does nothing. USING IT AFTERWARDS IS A DIAGNOSED FAULT, not silent
+    /// corruption: the word is gone from the caller's table, so any op through
+    /// the husk is `BadHandle`. Let it fall out of scope.
+    public func start(&var self, donating: UInt) -> Result<Void, SosStatus> {
+        let word: UInt = self.handle
+        self.handle = ProcessHandle(NO_HANDLE)
+        return checked(sos_process_start(word, BootTagForm.Donate as UInt,
+                                         donating))
+    }
+
+    // -------------------------------------------------------------------------
+    // THE GIVE FUNNELS (sawos design 4 D-4; design 3 D-5's transfer contract)
+    // -------------------------------------------------------------------------
+    //
+    // **ONE FUNNEL PER GIVABLE WRAPPER KIND, each CONSUMING its wrapper.** They
+    // are label-distinguished overloads of one verb — `child.give(memory: move
+    // r, tag: 3)` — because `give` is one operation over one op number and what
+    // varies is only which typed thing is crossing.
+    //
+    // EACH ONE IS THE TRANSFER-FUNNEL CONTRACT, spelled the same way three
+    // times (design 3 D-5): take the wrapper BY VALUE so the caller cannot keep
+    // it, read the word, write `NO_HANDLE` into the field BEFORE the syscall,
+    // and let the disarmed value drop. Disarm-before-syscall is deliberate —
+    // every failure of this syscall is a FAULT, so there is no path on which a
+    // disarmed-but-unsent word leaks — and the local `var` exists only because a
+    // by-value parameter is a `let` and the disarm is a write.
+    //
+    // **TWO FUNNELS AND NOT NINE, and the rights audit is the reason.** A handle
+    // can be given only if its rights word carries the universal `Transfer` bit,
+    // and v1 mints that bit in exactly two places: `memory_rights()` (M3 unit 2)
+    // and `child_process_rights()` (design 4 D-3). A Thread, Event, Waiter,
+    // Interrupt, Clock or Timer handle therefore cannot be given at all, and a
+    // funnel for one would be a method whose every call is an `AccessDenied`
+    // fault — dead surface, on the same rule that has `ClockType` declare one
+    // domain. The Process half is spelled `start(donating:)` instead, for the
+    // ordering reason recorded there. `give(system:)` is the exception that
+    // proves the rule: root's System handle also withholds `Transfer` (the
+    // deliberate M2 "nobody to transfer to" choice), and the funnel exists
+    // because that refusal is a claim worth being able to WRITE —
+    // `give_no_transfer` is the case that makes it. When a unit needs a kind to
+    // travel, it rules on that kind's default set and adds the funnel beside it.
+
+    /// Give a memory REGION to this process under `tag`, consuming the wrapper.
+    /// Requires `ProcessRight.Manage` here and `MemoryRight.Transfer` on the
+    /// region — which every boot region carries.
+    public func give(&self, memory: Memory, tag: UInt) -> Result<Void, SosStatus> {
+        var region = move memory
+        let word: UInt = region.handle
+        region.handle = MemoryHandle(NO_HANDLE)
+        return checked(sos_process_give(self.handle, word, tag))
+    }
+
+    // **THERE IS NO `give(process:)`, and its absence is the design rather than
+    // an omission.** A Process handle CAN travel — `child_process_rights()`
+    // mints `Transfer` (design 4 D-3) — but the only Process handle any v1
+    // launcher holds is the one `process_create` returned for a child, and
+    // giving that away leaves nothing to `start` the child with. The transfer
+    // that matters is therefore spelled `start(donating:)` above, which performs
+    // exactly the same give at the one instant it can be performed at. A funnel
+    // for a Process handle onto a DIFFERENT process is what a supervision
+    // hand-off would want; nothing can hold two such handles today, so writing
+    // one now would be a method with no caller.
+
+    /// Give a SYSTEM handle to this process under `tag`, consuming the wrapper.
+    ///
+    /// **NOTHING IN v1 CAN SUCCEED AT THIS, and that is stated rather than
+    /// hidden.** `root_system_rights()` withholds `Transfer` — the deliberate M2
+    /// choice, made when there was nobody to transfer to — so the only System
+    /// handle that exists is ungivable and this call is an `AccessDenied` fault.
+    /// The funnel exists because the refusal is a PROPERTY worth being able to
+    /// write down and prove (`give_no_transfer`), and because the day something
+    /// mints a givable System handle for a child, the spelling is already here
+    /// and the ruling is about the rights word alone.
+    public func give(&self, system: System, tag: UInt) -> Result<Void, SosStatus> {
+        var authority = move system
+        let word: UInt = authority.handle
+        authority.handle = SystemHandle(NO_HANDLE)
+        return checked(sos_process_give(self.handle, word, tag))
     }
 
     /// Take the next handle out of this process's BOOT SET (spec §12).
@@ -1019,16 +1233,25 @@ extension Memory: NoCopy {
 /// owners for one word, and the second drop would be a fault the program did
 /// nothing to deserve.
 public struct BootHandle {
-    /// The REGION ORDINAL this handle came from — row `n` of the build's region
-    /// table is tag `n`. The kernel assigns it no meaning; a launcher's config
-    /// is what says which ordinal is which.
+    /// **THE GIVER'S OWN WORD, HANDED BACK UNREAD.** For root's boot set the
+    /// kernel is the giver and this is a REGION ORDINAL — row `n` of the build's
+    /// region table is tag `n`. For a child's set the LAUNCHER is the giver and
+    /// this is whatever it chose at `Process.give(…, tag:)`. Either way the
+    /// kernel assigns it no meaning: the tag IS the identity, and identities are
+    /// the only cross-process vocabulary there is.
     public tag: UInt,
-    /// What kind of object was minted. v1 mints regions and nothing else, so a
-    /// caller that asserts this is asserting the build did what it said.
+    /// What kind of object was minted, so a caller knows which accessor to
+    /// reach for. Regions and (since M3 unit 3) Process handles are what v1 can
+    /// deliver; a caller that asserts this is asserting the giver gave what its
+    /// config says it gave.
     public kind: BootHandleKind,
     /// The region itself, until somebody takes it. Private on purpose: the only
     /// way out is `take_memory`, which is what makes the one-owner rule hold.
     memory: Memory?,
+    /// The Process handle, on the same terms — `take_process` is its one door.
+    /// A record has ONE object, so exactly one of these two slots is ever
+    /// occupied and `kind` is what says which.
+    process: Process?,
 }
 
 extension BootHandle: NoCopy {}
@@ -1036,15 +1259,30 @@ extension BootHandle: NoCopy {}
 extension BootHandle {
     /// Take the region out of this record, leaving it empty.
     ///
-    /// It answers `None` on the second call, which is not an error condition to
-    /// dress up: a record has one region and taking it twice is asking for a
-    /// capability that has already been handed over. Callers that know they have
-    /// not taken it write `!`.
+    /// It answers `None` on the second call, and `None` on a record that is not
+    /// a region at all — neither is an error condition to dress up: a record has
+    /// one object, and asking for the wrong kind or asking twice are both asking
+    /// for a capability this record does not have. Callers that know better
+    /// write `!`. It never DISTURBS the other slot, which is what makes asking
+    /// the wrong question harmless.
     ///
     /// `&var self` because taking WRITES the record — which is also what makes
     /// the transfer visible in the type rather than in a convention.
     public func take_memory(&var self) -> Memory? {
         self.memory.take()
+    }
+
+    /// Take the Process handle out of this record, leaving it empty. Same terms
+    /// as `take_memory`.
+    ///
+    /// **A DONATED CHILD MUST TAKE THIS ONE.** Its record names the very word
+    /// the child adopted from its first argument register (resolving a boot tag
+    /// consumes no record), so a record left holding it would RELEASE that word
+    /// when it drops and leave the child's own Process handle stale. See
+    /// `Process(boot_handle:)` for the one-wrapper-per-word obligation this is
+    /// half of.
+    public func take_process(&var self) -> Process? {
+        self.process.take()
     }
 }
 
@@ -1062,7 +1300,10 @@ func decode_boot_handle(tag: UInt, kind: UInt, handle: UInt) -> BootHandle {
     }
     match what {
         case Memory -> BootHandle(tag: tag, kind: what,
-                                  memory: Memory(handle: MemoryHandle(handle))),
+                                  memory: Memory(handle: MemoryHandle(handle)),
+                                  process: None),
+        case Process -> BootHandle(tag: tag, kind: what, memory: None,
+                                   process: Process(handle: ProcessHandle(handle))),
     }
 }
 

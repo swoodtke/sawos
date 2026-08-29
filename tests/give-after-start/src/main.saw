@@ -1,0 +1,95 @@
+// SOS M3 unit 3: THE BOOT SET FREEZES AT START (sawos design 4).
+//
+// **THE ORDERING IS THE SOUNDNESS ARGUMENT, and this case is what makes it a
+// rule rather than a convention.** Whatever a launcher gives a child must be
+// complete at the child's FIRST INSTRUCTION — a child that drains a
+// half-populated set has no way to tell "not given yet" from "not given" — and
+// `start` is the barrier that makes a half-populated table unrepresentable. No
+// synchronization is invented anywhere: the launcher gives, then starts, and
+// after that the set is closed.
+//
+//   SOS giveafter: started
+//   SOS: process fault: object in the wrong state process=0
+//   SOS: process teardown ... process=0
+//
+// A give afterwards is `BadState` — the same fault a second `start` raises,
+// through the same process-state word, which is what says the two refusals are
+// one rule. It is a FAULT and not a status because the caller could have known:
+// it is the one that started the child.
+//
+// DYNAMIC TRANSFER IS NOT REFUSED FOREVER, only here. M4's pipes are where a
+// handle travels to a process that is already running and EXPECTING it — over a
+// channel, with a protocol, to a receiver that asked. What this refuses is a
+// launcher reaching into a running process's table behind its back.
+//
+// The child never runs: root dies first, and root's death stops the machine
+// (§8's fork — process 0 is init). Which child image is appended is therefore
+// immaterial, and the case reuses `child-fault`.
+
+import sos.{System, Process, Memory, BootHandle, SosStatus}
+
+static EXIT_FAILED: UInt = 1
+
+static TAG: UInt = 3
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS giveafter: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    var image = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS giveafter: no image region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    var dest = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS giveafter: no destination region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let image_mem = image.take_memory()!
+    let dest_mem = dest.take_memory()!
+
+    let child = match system.process_create(image: &image_mem,
+                                            memory: &dest_mem) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS giveafter: create failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // The no-tag form, which is what a launcher writes when it is furnishing
+    // nothing — and here, what closes the set before anything was furnished at
+    // all. Root keeps running, which is what lets the next line be reached.
+    match child.start() {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS giveafter: start failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS giveafter: started\n")
+
+    // TOO LATE. The set froze one line up, and this does not return.
+    let _ = child.give(memory: move image_mem, tag: TAG)
+
+    let _ = system.debug_print("SOS giveafter: survived, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

@@ -1,0 +1,150 @@
+// SOS M3 unit 3: THE GIVER'S WORD IS DEAD (sawos design 4 D-1 composing with
+// design 3 D-1).
+//
+// A GIVE IS UNBIND-AND-REBIND, and the unbind is `unbind_handle` — the SAME
+// function a release and a teardown call, generation bump included. So the
+// moment a give returns, the word the giver held names a live slot at the wrong
+// life, resolves to nothing, and using it is the ordinary `BadHandle` fault:
+//
+//   SOS worddead: gave the region, ok=1
+//   SOS worddead: using the word we gave away
+//   SOS: process fault: bad handle process=0
+//   SOS: process teardown ... process=0
+//
+// WITHOUT GENERATIONS THIS WOULD BE AN ALIAS RATHER THAN A DIAGNOSIS. The slot
+// the give freed is the lowest free one, so the very next mint takes it back —
+// and a kernel whose words carried no generation would resolve the giver's stale
+// word onto whatever landed there. Design 3 built the mechanism; this is unit 3
+// composing with it, and it is the same claim `handle_remint` makes about
+// release, made about the other way a handle leaves a table.
+//
+// **IT GOES THROUGH THE C ALTITUDE, and that is half the claim.** The typed Saw
+// surface has no word extractor and no word constructor, and `Process.give`
+// CONSUMES its wrapper and disarms it before the syscall — so "use the word you
+// gave away" is not a sentence that layer can express. That is the transfer
+// funnel working exactly as design 3 D-5 specified, and it is why this file
+// works one storey down, as `handle_remint` and `timer_badclock` do.
+//
+// THE RECORD LAYOUT IS WRITTEN OUT HERE, deliberately. Three machine words —
+// tag, kind, handle — is the published contract of `sos_process_boot_handle_next`
+// (its docstring states it), and a caller at the C altitude supplies the buffer
+// and its capacity itself. Naming the constants would mean importing the
+// kernel-internal `sosabi`, which is exactly the wall the vDSO discipline puts
+// up; a C caller writes the numbers, and so does this file.
+
+import sos.{System, SosStatus, sos_system_process_self, sos_process_boot_handle_next,
+            sos_system_process_create, sos_process_give, sos_handle_release}
+
+static EXIT_FAILED: UInt = 1
+
+/// The status word a successful op answers with (`SosStatus.Ok`). Spelled as a
+/// number because this file works at the C altitude, where a status is one.
+static STATUS_OK: UInt = 0
+
+/// The boot-handle record: tag, kind, handle. See the header for why the layout
+/// is written here rather than imported.
+static RECORD_WORDS: Int = 3
+static RECORD_HANDLE_WORD: Int = 2
+
+/// The tag root gives the region under. Any word would do — the kernel
+/// interprets none of them.
+static TAG: UInt = 3
+
+static YES: UInt = 1
+static NO: UInt = 0
+
+func flag(b: Bool) -> UInt {
+    if b { YES } else { NO }
+}
+
+// EACH POINTER LIVES IN ONE SMALL NAMED HELPER (design 136's confinement rule),
+// which is what keeps `_start` a safe signature: a value register comes back
+// through an out-parameter, that being the shape a C ABI with no aggregate
+// return has, and the pointer never leaves the function that made it. Every one
+// answers 0 — the word that names nothing — when the call was refused.
+
+/// This process's own Process handle, as a raw word.
+func ask_process(handle: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_system_process_self(handle,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return 0
+    }
+    out
+}
+
+/// A child loaded from `image` into `ram`, as a raw Process handle word.
+func make_child(system: UInt, image: UInt, ram: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_system_process_create(system, image, ram,
+                                           (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return 0
+    }
+    out
+}
+
+/// Take the next boot record, answering the raw HANDLE WORD it carries — or 0,
+/// which names nothing, when the set is drained.
+func next_region_word(process: UInt) unsafe -> UInt {
+    var buf: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+    let bytes = (RECORD_WORDS * sizeof<UInt>()) as UInt
+    let status = sos_process_boot_handle_next(process,
+                                              (&var buf) as UnsafePointer<UInt>,
+                                              bytes)
+    if status != STATUS_OK {
+        return 0
+    }
+    buf[RECORD_HANDLE_WORD]
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let process = ask_process(boot_handle)
+    if process == 0 {
+        let _ = system.debug_print("SOS worddead: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // The two boot regions, as WORDS. Row 0 is the child's image blob and row 1
+    // is the RAM it will run in — root's config, exactly as in every other case.
+    let image = next_region_word(process)
+    let ram = next_region_word(process)
+    if image == 0 || ram == 0 {
+        let _ = system.debug_print("SOS worddead: boot regions missing\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let child = make_child(boot_handle, image, ram)
+    if child == 0 {
+        let _ = system.debug_print("SOS worddead: create refused\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // THE GIVE. It answers a STATUS AND NOTHING ELSE — the child-side word is
+    // meaningless here, since root can call no op through it — which is why
+    // `image` below is the ONLY word this program has for that region, and why
+    // it is now worthless.
+    let gave = sos_process_give(child, image, TAG)
+    print("SOS worddead: gave the region, ok={}\n", flag(gave == STATUS_OK))
+    if gave != STATUS_OK {
+        let _ = system.shutdown(EXIT_FAILED)
+    }
+
+    // THE OLD WORD. Its slot is live — the give freed it and it is the lowest
+    // free index, so the next mint will take it — but its generation moved when
+    // the entry was unbound, so this word names nothing and the kernel ends this
+    // process. `release` is the shortest op that takes a bare word; the fault
+    // would be the same through any of them.
+    let _ = system.debug_print("SOS worddead: using the word we gave away\n")
+    let _ = sos_handle_release(image)
+
+    let _ = system.debug_print("SOS worddead: survived, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

@@ -208,6 +208,17 @@ HANDLE_RELEASE_TWICE_PKG = os.path.join(TESTS_DIR, "handle-release-twice")
 HANDLE_MALFORMED_WORD_PKG = os.path.join(TESTS_DIR, "handle-malformed-word")
 HANDLE_DROP_RELEASE_PKG = os.path.join(TESTS_DIR, "handle-drop-release")
 PROCESS_RECLAIM_PKG = os.path.join(TESTS_DIR, "process-reclaim")
+# sawos design 4 (M3 unit 3): give, tags and the boot drain. Six root servers
+# and one more CHILD — the first SOS process that is neither root nor a
+# sandboxed compute process, since it is donated its own Process handle and can
+# therefore drain, make threads and exit.
+GIVE_BOOT_DRAIN_PKG = os.path.join(TESTS_DIR, "give-boot-drain")
+GIVE_DUPLICATE_TAG_PKG = os.path.join(TESTS_DIR, "give-duplicate-tag")
+GIVE_AFTER_START_PKG = os.path.join(TESTS_DIR, "give-after-start")
+GIVE_NO_TRANSFER_PKG = os.path.join(TESTS_DIR, "give-no-transfer")
+START_BAD_TAG_PKG = os.path.join(TESTS_DIR, "start-bad-tag")
+GIVE_WORD_DEAD_PKG = os.path.join(TESTS_DIR, "give-word-dead")
+CHILD_DRAIN_PKG = os.path.join(TESTS_DIR, "child-drain")
 
 CLOCK_BASICS_PKG = os.path.join(TESTS_DIR, "clock-basics")
 TIMER_ONESHOT_PKG = os.path.join(TESTS_DIR, "timer-oneshot")
@@ -1652,6 +1663,163 @@ TEST_CASES = [
                        "SOS reclaim: refused_before=1 reclaimed_after=1",
                        "SOS reclaim: done"],
         "expect_clean_exit": True,
+    },
+    # =========================================================================
+    # M3 unit 3 — give, tags, and the boot drain (sawos design 4)
+    # =========================================================================
+    #
+    # Six cases, and the thing they have in common is that BEFORE this unit a
+    # child held no handle at all. Every one of them is therefore about a
+    # sentence that could not previously be written: hand a capability across a
+    # process boundary, name it with a word the kernel never reads, and let the
+    # receiver find it.
+    #
+    # All six append a child image and publish a two-row region table, exactly
+    # as unit 2's do.
+    {
+        # THE MONEY SHOT, and it is read as an ORDER. Root furnishes the child
+        # with two regions under tags 3 and 5, DONATES it its own Process handle
+        # at the start barrier under tag 7, and then knows nothing more: it gave
+        # the handle away, so there is no `get_status` here and there could not
+        # be one (design 4 D-3's "one handle, one choice", seen from the side
+        # that chose donation).
+        #
+        # `SOS: process exit: code={three}` IS THE PROOF ROOT NEVER HAD TO
+        # WITNESS. The child drained three records, checked their tags, kinds and
+        # ORDER, checked that `Drained` stays `Drained`, and put the COUNT in its
+        # exit code — the only voice a donated child has, since nothing in v1
+        # mints a givable System handle and it therefore cannot print. A kernel
+        # that delivered the records out of order, or that let the tagged record
+        # be consumed by the start's resolution, would print `code=0x…63` (99)
+        # instead. THAT LINE IS NEW IN THIS UNIT and is unreachable for every
+        # case written before it: root takes the other arm of the fork, and no
+        # child before now could exit at all.
+        #
+        # `handles={one}` in the teardown is the child's estate: three gives, and
+        # it declined both regions at the drain (their records dropped and
+        # released them), keeping only the Process handle it is exiting through.
+        "name": "give_boot_drain",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": GIVE_BOOT_DRAIN_PKG,
+        "children": [CHILD_DRAIN_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS givedrain: created",
+                       "SOS givedrain: gave regions 3 5",
+                       "SOS givedrain: donated and started",
+                       "SOS: process exit: code={three} process={one}",
+                       "SOS: process teardown handles={one} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS givedrain: root survived",
+                       "SOS givedrain: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # THE TAG IS THE IDENTITY, so two handles under one tag is broken config
+        # — caller-checkable, and it would make the boot record a multimap and
+        # `start(boot_tag:)`'s lookup ambiguous.
+        #
+        # The fault tag is the WAITER's, word for word: `DuplicateKey` was
+        # written for §2.2's attachment keys and says exactly the same thing
+        # here. It is asserted verbatim because a shipped transcript
+        # (`event_dupkey`) asserts that string and design 4 authorised no
+        # expectation changes.
+        "name": "give_duplicate_tag",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": GIVE_DUPLICATE_TAG_PKG,
+        "children": [CHILD_FAULT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS givedup: first give ok",
+                       "SOS: process fault: an attachment already uses that key "
+                       "process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # THE FREEZE. The give-before-start ordering IS the soundness argument
+        # for the launch flow — a child's boot handles must answer completely at
+        # its first instruction — and `start` is the barrier that makes a
+        # half-populated table unrepresentable with no synchronization invented.
+        # `BadState` is the same fault a second `start` raises, through the same
+        # process-state word, which is what says the two refusals are one rule.
+        "name": "give_after_start",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": GIVE_AFTER_START_PKG,
+        "children": [CHILD_FAULT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS giveafter: started",
+                       "SOS: process fault: object in the wrong state "
+                       "process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # THE RIGHTS AUDIT'S NEGATIVE EXHIBIT, and the FIRST CONSUMER §3's
+        # universal low byte has ever had: `Transfer` has been declared in every
+        # kind's rights enum since M2 and read by nothing until give. Root's
+        # System handle withholds it — the deliberate M2 "nobody to transfer to"
+        # choice — so the give is `AccessDenied`.
+        #
+        # It doubles as the reason a donated child is console-silent: nothing in
+        # v1 mints a givable System handle, which is why `give_boot_drain`'s
+        # child reports through its exit code.
+        "name": "give_no_transfer",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": GIVE_NO_TRANSFER_PKG,
+        "children": [CHILD_FAULT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS notransfer: giving the System handle away",
+                       "SOS: process fault: access denied process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # A BOOT TAG THAT NAMES NO GIVEN RECORD IS A FAULT. There is no honest
+        # word to put in the child's first argument register, and a zero would be
+        # indistinguishable from the deliberate no-tag form — so a typo'd tag
+        # would silently produce a sandboxed process instead of a diagnosis.
+        #
+        # The give above it is what makes the case sharp: tag 3 IS in the set, so
+        # "resolved to nothing" cannot be confused with "nothing to resolve
+        # against".
+        "name": "start_bad_tag",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": START_BAD_TAG_PKG,
+        "children": [CHILD_FAULT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS badtag: gave tag 3",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # THE GIVER'S WORD IS DEAD — unit 2.75's generations composing with a
+        # give. The unbind is `unbind_handle`, the same one release and the
+        # teardown call, so the word the giver held names a live slot at the
+        # wrong life and using it is the ordinary `BadHandle`. Without
+        # generations it would be an ALIAS instead: the freed slot is the lowest
+        # free index, so the very next mint takes it back.
+        #
+        # It works at the C altitude, and that is half the claim: `Process.give`
+        # CONSUMES its wrapper and disarms it before the syscall, so "use the
+        # word you gave away" is not a sentence the typed layer can express.
+        "name": "give_word_dead",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": GIVE_WORD_DEAD_PKG,
+        "children": [CHILD_FAULT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS worddead: gave the region, ok=1",
+                       "SOS worddead: using the word we gave away",
+                       "SOS: process fault: bad handle process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
     },
 ]
 

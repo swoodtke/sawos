@@ -28,8 +28,26 @@ entry below or the brief that carries it, never restating either.
   queues, start(boot_tag:) kernel-resolved a0, give-before-start the
   frozen barrier, child Process handle re-ruled full-set+Transfer
   (supervise OR donate — the second-handle question is 5.5's). No
-  authorized transcript changes. DISPATCHED Aug 29; closes in place
-  when the branch parks
+  authorized transcript changes. DISPATCHED Aug 29.
+  **BUILT Aug 29 — branch parked for review.** Gate: 120/120 across
+  riscv32 + arm64 (60 cases each) against a 108 baseline at the merge
+  base; the 108 pre-existing rows byte-identical in name, verdict and
+  ORDER, six new rows appended per architecture. Landed as briefed
+  except for ONE DEVIATION the lead must rule on, recorded in full in
+  the brief's As-built: **the donation of a child's own Process handle
+  happens AT the start barrier (`BootTagForm.Donate`), not as a
+  separate `give`**, because `Start` is an op on the very handle being
+  moved — a launcher that gave it away first has nothing left to start
+  the child with, so D-3's give-then-start sequence cannot be written.
+  Everything else about it is an ordinary give (same fault set, same
+  unbind-and-rebind, same rights verbatim, same tagged record), and
+  the alternative — a SECOND handle onto one process — is design 3's
+  finding-2 re-mint question, which is unit 5.5's. Two smaller items
+  for the lead: one new kernel report line (`SOS: process exit:
+  code=…`, child-only, unreachable for every pre-existing case) exists
+  because a donated child has no other voice; and `FaultReason
+  .DuplicateKey`'s text still names attachments, unchanged because
+  `event_dupkey` asserts it and no expectation edit was authorized
 - M3 unit 4 — Memory/IoMemory [sawlang#232]
 - M3 unit 5 — quotas [sawlang#232]
 - M3 unit 5.5 — death notifications [sawlang#232]

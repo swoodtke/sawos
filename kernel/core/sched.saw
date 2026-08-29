@@ -53,6 +53,7 @@ import kcore.objects.{
     MEMORIES,
     MemorySlot,
     SlotState,
+    clear_boot_handles,
     unbind_handle,
 }
 import kcore.threads.{
@@ -291,6 +292,38 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     PROCESSES[p].exit_kind = kind
     PROCESSES[p].exit_code = code
 
+    // **A CHILD'S CLEAN EXIT IS REPORTED, and this line is new in M3 unit 3**
+    // (sawos design 4). Until give existed, a child could not exit at all — it
+    // held no Process handle, so it had no `Exit` right and its only way out was
+    // a fault, which `fault_process` already reports. A child that was DONATED
+    // its own Process handle exits with a code, and that code is the only thing
+    // it can say: root gave the handle away, so there is nobody left holding a
+    // §8 status word to read (D-3's one-handle-one-choice), and a donated child
+    // has no System handle and therefore no console.
+    //
+    // IT IS A SEPARATE LINE RATHER THAN A FIELD ON THE TEARDOWN, deliberately.
+    // Appending to that line would rewrite it for every process that has ever
+    // died, and design 4 authorised no change to a shipped transcript. This line
+    // is unreachable for every case written before it: root takes the other arm,
+    // and no child before this unit could exit.
+    //
+    // The FAULT half is unchanged and is reported one level up by
+    // `fault_process`, which is why the two reports read alike and neither
+    // repeats the other.
+    if p != ROOT_PROCESS {
+        match kind {
+            case Exited -> {
+                let out = console()
+                out.write_str("SOS: process exit: code=")
+                out.write_hex(code)
+                out.write_str(" process=")
+                out.write_hex(p as UInt)
+                out.write_str("\n")
+            },
+            case _ -> {},
+        }
+    }
+
     // THE CLOSE-ALL GOES THROUGH `unbind_handle` (sawos design 3 D-1), which is
     // what makes a teardown and a release do the SAME thing to a slot: zero the
     // binding, BUMP the generation. It matters even though the whole table is
@@ -478,6 +511,14 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // invalidated with them — a later process landing in this slot must not
     // compare equal to a domain that is no longer installed.
     clear_domain(p)
+
+    // AND THE BOOT SET, undrained records included (sawos design 4 D-2). Nothing
+    // is released here and nothing leaks: every record names a handle in the
+    // table the close-all above already emptied, so what is left is bookkeeping
+    // — a count and a cursor — and it MUST be reset, because a process slot is
+    // reclaimable (design 3 D-3) and the next occupant would otherwise inherit a
+    // stranger's boot set and drain handles that are not its own.
+    clear_boot_handles(p)
 
     // AND THE SLOT ITSELF, IF NOBODY CAN STILL READ IT (sawos design 3 D-3).
     // The dying process's own handles were closed at the top of this function,

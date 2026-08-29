@@ -453,23 +453,38 @@ public(package) func alloc_memory() unsafe -> Int {
 }
 
 // =============================================================================
-// The boot-handle queue (spec §12; sawos design 2 D-3)
+// The boot-handle queues, ONE PER PROCESS (spec §12; sawos design 2 D-3, as
+// re-shaped by design 4 D-2)
 // =============================================================================
 //
-// WHAT THE KERNEL MINTED FOR ROOT AT BOOT AND HAS NOT HANDED OVER YET. §12 keeps
-// the boot set ONE HANDLE WIDE at the entry register — the System handle — so
-// everything else the kernel makes for root before it runs has to be COLLECTED
-// rather than passed, and this is where it waits.
+// WHAT SOMEBODY MINTED FOR A PROCESS BEFORE IT RAN AND HAS NOT HANDED OVER YET.
+// §12 keeps the boot set ONE HANDLE WIDE at the entry register, so everything
+// else a process is furnished with has to be COLLECTED rather than passed, and
+// this is where it waits.
 //
-// It is a queue with a cursor and no removal: `BOOT_HANDLE_NEXT` only ever
-// advances, so a drained iterator STAYS drained and a delivered record can
-// never be delivered twice. That is the whole of the lifetime rule, and it is
-// why the records are plain storage rather than a slab.
+// **THE QUEUE WENT PER-PROCESS IN M3 UNIT 3, and the reason is that there are
+// two drainers now.** Unit 2's globals were correct for one — only root had a
+// boot set, because a child was handed nothing — and are wrong for two: a
+// launcher fills a child's set with `ProcessOp.Give`, and the child drains ITS
+// OWN through its own Process handle exactly as root drains root's. The two
+// producers are indistinguishable on purpose: THE KERNEL IS THE GIVER NOBODY
+// GAVE TO, root's records are written at boot by exactly the machinery a give
+// uses, and their tags are region ordinals because that is the config root and
+// the build agreed on.
 //
-// ONE QUEUE, NOT ONE PER PROCESS, because only root has a boot set: a child's
-// handles arrive through unit 3's `give`, which is a different act with a
-// different ordering argument. When unit 3 reuses this op for the child side,
-// the queue becomes per-process and nothing above it changes.
+// THE STORAGE IS THE HANDLE TABLE'S OWN IDIOM — one flat array indexed
+// `p * MAX_HANDLES + i`, with a count and a cursor per process — so the file has
+// one shape for "per-process storage" rather than two. **`MAX_HANDLES` IS THE
+// RIGHT BOUND AND NOT AN ARBITRARY ONE**: every record names a handle in that
+// process's table, so a boot set larger than the table it fills could never be
+// drained into existence.
+//
+// It is still a queue with a cursor and no removal: the cursor only ever
+// advances, so a drained iterator STAYS drained and a delivered record can never
+// be delivered twice. That is the whole of the lifetime rule, and it is why the
+// records are plain storage rather than a slab. The set FREEZES at `Start` —
+// enforced by the give's own `BadState` refusal, one level up — and the DRAIN
+// has no deadline at all.
 
 /// One boot handle waiting to be collected.
 public(package) struct BootHandleSlot {
@@ -478,20 +493,86 @@ public(package) struct BootHandleSlot {
     public(package) handle: UInt,
 }
 
-public(package) unsafe static var BOOT_HANDLES: [BootHandleSlot; MAX_MEMORIES] = [
-    BootHandleSlot(tag: 0, kind: BootHandleKind.Memory, handle: 0); MAX_MEMORIES]
+public(package) unsafe static var BOOT_HANDLES: [BootHandleSlot; MAX_PROCESSES * MAX_HANDLES] = [
+    BootHandleSlot(tag: 0, kind: BootHandleKind.Memory, handle: 0);
+    MAX_PROCESSES * MAX_HANDLES]
 
-/// How many records were queued at boot.
-public(package) unsafe static var BOOT_HANDLE_COUNT: Int = 0
+/// How many records are queued for each process.
+public(package) unsafe static var BOOT_HANDLE_COUNT: [Int; MAX_PROCESSES] = [0; MAX_PROCESSES]
 
-/// How many have been collected. `NEXT == COUNT` is "drained".
-public(package) unsafe static var BOOT_HANDLE_NEXT: Int = 0
+/// How many each has collected. `NEXT[p] == COUNT[p]` is "drained".
+public(package) unsafe static var BOOT_HANDLE_NEXT: [Int; MAX_PROCESSES] = [0; MAX_PROCESSES]
 
-/// Queue one record. Silently drops nothing: the caller has already bounded the
-/// region count against `MAX_MEMORIES`, and this is the one producer.
-public(package) func queue_boot_handle(tag: UInt, kind: BootHandleKind,
+/// Is there room for one more record in process `p`'s set?
+///
+/// Asked BEFORE a give does anything, so a refusal leaves both tables untouched.
+/// It can only ever answer `false` in theory — a record is queued beside a mint
+/// into the same process's table, so the handle table fills first — and the test
+/// is here anyway because a silently dropped record is a capability a child was
+/// given and can never collect.
+public(package) func boot_handle_room(p: Int) unsafe -> Bool {
+    BOOT_HANDLE_COUNT[p] < MAX_HANDLES
+}
+
+/// Does process `p`'s set already carry `tag`?
+///
+/// **THE DUPLICATE-TAG CHECK, and it scans rather than indexes** (sawos design 4
+/// D-2). A tag is the giver's own word and the kernel constrains it in no way,
+/// so there is nothing to index by; the array is bounded by `MAX_HANDLES` and
+/// tiny, and the walk runs once per give. It looks at the WHOLE set and not only
+/// the undelivered part, because the tag is an IDENTITY for the process's whole
+/// boot set — a tag reused after the child drained the first one would still name
+/// two handles.
+public(package) func boot_tag_used(p: Int, tag: UInt) unsafe -> Bool {
+    var i: Int = 0
+    while i < BOOT_HANDLE_COUNT[p] {
+        if BOOT_HANDLES[p * MAX_HANDLES + i].tag == tag {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+/// The handle word process `p`'s set carries under `tag`, or `NO_HANDLE`.
+///
+/// **`start(boot_tag:)`'s RESOLVER, and it does NOT consume the record** (sawos
+/// design 4). The tag is delivered to the child's first argument register AND
+/// stays in the set to be drained, which is what makes the child's boot sequence
+/// literally a receive loop over everything it was given, the boot handle
+/// included.
+public(package) func boot_handle_word(p: Int, tag: UInt) unsafe -> UInt {
+    var i: Int = 0
+    while i < BOOT_HANDLE_COUNT[p] {
+        let rec = BOOT_HANDLES[p * MAX_HANDLES + i]
+        if rec.tag == tag {
+            return rec.handle
+        }
+        i = i + 1
+    }
+    NO_HANDLE
+}
+
+/// Queue one record for process `p`. The caller has already asked
+/// `boot_handle_room`; this is the one producer, and both doors — the kernel's
+/// boot minting and a launcher's `give` — come through it.
+public(package) func queue_boot_handle(p: Int, tag: UInt, kind: BootHandleKind,
                                        handle: UInt) unsafe {
-    BOOT_HANDLES[BOOT_HANDLE_COUNT] = BootHandleSlot(tag: tag, kind: kind,
-                                                     handle: handle)
-    BOOT_HANDLE_COUNT = BOOT_HANDLE_COUNT + 1
+    let n = BOOT_HANDLE_COUNT[p]
+    BOOT_HANDLES[p * MAX_HANDLES + n] = BootHandleSlot(tag: tag, kind: kind,
+                                                       handle: handle)
+    BOOT_HANDLE_COUNT[p] = n + 1
+}
+
+/// Forget process `p`'s set. Called by the teardown.
+///
+/// **THE RECORDS ARE BOOKKEEPING AND CLEAR WITH THE SLOT** (sawos design 4 D-2).
+/// The handles they name are entries in the dying process's own table, already
+/// unbound by the close-all, so nothing is released here and nothing is leaked:
+/// what is reset is the count and the cursor, which MUST be reset because a
+/// process slot is reclaimable (design 3 D-3) and the next occupant would
+/// otherwise inherit a stranger's boot set.
+public(package) func clear_boot_handles(p: Int) unsafe {
+    BOOT_HANDLE_COUNT[p] = 0
+    BOOT_HANDLE_NEXT[p] = 0
 }

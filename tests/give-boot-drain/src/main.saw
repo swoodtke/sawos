@@ -1,0 +1,218 @@
+// SOS M3 unit 3: GIVE, TAGS, AND THE BOOT DRAIN (sawos design 4; spec §3, §12).
+//
+// **THE MONEY SHOT.** Root furnishes a child with three capabilities under three
+// tags, donates it its own Process handle at the start barrier, and then knows
+// nothing more about it — it gave the handle away, so it cannot even read how
+// the child died. The transcript is read as an ORDER:
+//
+//   SOS givedrain: created            <- a process exists, inert, table EMPTY
+//   SOS givedrain: gave regions 3 5   <- ...and now holds two capabilities
+//   SOS givedrain: donated and started
+//   SOS: process exit: code=3         <- the CHILD, saying what it drained
+//   SOS: process teardown ... process=1
+//   SOS givedrain: root survived
+//   SOS givedrain: done
+//
+// WHAT EACH LINE RULES OUT.
+//
+// `gave regions 3 5` before the start is the FREEZE: the boot set is complete at
+// the child's first instruction because `start` is the barrier, and a give after
+// it is a `BadState` fault (`give_after_start` is the case that proves it). No
+// synchronization is invented anywhere — the ordering IS the argument.
+//
+// `donated and started` is design 4 D-3's second option taken. Root's ONE handle
+// on the child either stays here (supervision — every unit-2 case) or goes there
+// (donation — this case), and it goes at the barrier because that is the last
+// instant root still holds it. Root retains nothing: there is no `get_status`
+// below this line and there could not be one.
+//
+// **`SOS: process exit: code=3` IS THE PROOF ROOT NEVER HAD TO WITNESS.** The
+// child drained three records, checked their tags and kinds and their ORDER,
+// checked that `Drained` stays `Drained`, and put the count in its exit code —
+// with no console, because a donated child has none. The kernel is what says so.
+// A `code=99` there would be the child reporting that its boot set was not what
+// this file's config promised.
+//
+// `root survived` is the same claim `process_lifecycle` makes, restated for a
+// child that ended WELL rather than by faulting: the teardown named process 1
+// and the run continued.
+//
+// THE TAGS ARE THE ONLY THING THE TWO PROGRAMS SHARE. 3 and 5 and 7 mean what
+// this file and `child-drain` agree they mean; the kernel hands each back unread
+// at the child's drain and interprets none of them. That is the whole of the
+// cross-process vocabulary in SOS today.
+//
+// ROOT PARKS ON A GENEROUS TIMER while the child runs, so the ordering above is
+// forced rather than raced: this image's kernel arms no scheduler tick, so the
+// only way root gives the processor up is the wait below.
+
+import sos.{System, Process, Memory, BootHandle, Clock, ClockType, Timer,
+            Waiter, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The key this case attaches its timer under. A number that appears nowhere
+/// else in the transcript.
+static KEY: UInt = 77
+
+/// Twenty milliseconds — three orders of magnitude more than the child needs to
+/// be scheduled, drain three records and exit. See `process_lifecycle`.
+static PARK_NS: UInt64 = 20_000_000
+
+/// ROOT'S CONFIG, and the whole of the contract with the child. These three
+/// numbers are words root chose; `child-drain` expects exactly them, in exactly
+/// this order, and the kernel supplies no meaning for any of them.
+static TAG_IMAGE: UInt = 3
+static TAG_RAM: UInt = 5
+static TAG_SELF: UInt = 7
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS givedrain: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // The boot set, drained in ordinal order: row 0 is the child's image blob,
+    // row 1 is the RAM it will run in. Root's config is what says which is
+    // which, exactly as in every unit-2 case.
+    var image = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS givedrain: no image region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    var dest = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS givedrain: no destination region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let image_mem = image.take_memory()!
+    let dest_mem = dest.take_memory()!
+
+    var child = match system.process_create(image: &image_mem,
+                                            memory: &dest_mem) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS givedrain: create failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS givedrain: created\n")
+
+    // **THE GIVES.** Each one CONSUMES its wrapper — that is the transfer
+    // funnel's contract (design 3 D-5), and it is why there is no way to touch
+    // either region below this point: the funnel disarms the value before the
+    // syscall and lets it drop. What root gives away it cannot keep.
+    //
+    // Root hands the child the two regions it holds. Neither is a region the
+    // child NEEDS — its image was already copied into its RAM at create, and it
+    // declines both at the drain — which is the point: they are capabilities,
+    // and what a launcher furnishes is a matter of config rather than of
+    // mechanism.
+    match child.give(memory: move image_mem, tag: TAG_IMAGE) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS givedrain: give image failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match child.give(memory: move dest_mem, tag: TAG_RAM) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS givedrain: give ram failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    print("SOS givedrain: gave regions {} {}\n", TAG_IMAGE, TAG_RAM)
+
+    // **THE DONATION, AT THE BARRIER.** This gives `child` itself to the child
+    // under tag 7 and puts the child-side word in its first argument register,
+    // all in the one op — because `start` is an op on the handle being given, so
+    // no earlier moment could have given it (see `Process.start(donating:)`).
+    // `child` is a disarmed husk afterwards and is never touched again.
+    match child.start(donating: TAG_SELF) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS givedrain: start failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS givedrain: donated and started\n")
+
+    // Park, so the child gets the processor. Everything below happens after the
+    // child has lived, drained and exited.
+    let clock = match system.clock_get(type: ClockType.Monotonic) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS givedrain: no clock: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let waiter = match proc.waiter_create() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS givedrain: no waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let timer = match clock.timer_create() {
+        case Ok(t) -> t,
+        case Err(e) -> {
+            print("SOS givedrain: no timer: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match waiter.add(&timer, KEY) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS givedrain: attach failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match timer.arm(after_ns: PARK_NS) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS givedrain: arm failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match waiter.wait() {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS givedrain: wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // AND THERE IS NOTHING TO ASK. A supervising launcher would read the child's
+    // §8 status word here (`process_lifecycle` does); root gave that handle away,
+    // so this line is the whole of what it can say about a child it furnished
+    // and released. Design 4 D-3's "one handle, one choice", from this side.
+    let _ = system.debug_print("SOS givedrain: root survived\n")
+
+    print("SOS givedrain: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

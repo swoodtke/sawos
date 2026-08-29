@@ -37,6 +37,9 @@ import sosabi.{
     TimerOp,
     EventMode,
     ClockType,
+    BootTagForm,
+    BootHandleKind,
+    rights_allow_transfer,
     wait_record_bytes,
     CLOCK_NOW_RECORD_DOUBLEWORDS,
     clock_now_record_bytes,
@@ -61,6 +64,7 @@ import sosabi.{
     ENTRY_IMAGE,
 }
 import kcore.limits.{
+    MAX_HANDLES,
     NO_ATTACHMENT,
     NO_EVENT,
     NO_INTERRUPT,
@@ -93,9 +97,13 @@ import kcore.objects.{
     ThreadObject,
     TimerObject,
     WaiterObject,
+    boot_handle_room,
+    boot_handle_word,
+    boot_tag_used,
     handle_word_index,
     lookup_handle,
     mint_handle,
+    queue_boot_handle,
     unbind_handle,
 }
 import kcore.threads.{
@@ -425,21 +433,42 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
         // advance. PHASE ONE is `SystemOp.ProcessCreate`, one object over: a
         // process is a machine-wide resource, so the System object is what mints
         // one (sawos design 2's RIDER, ruled Aug 29).
+        //
+        // `arg0` IS THE BOOT-TAG FORM AND `arg1` THE TAG (sawos design 4 D-4).
+        // Two registers rather than one because ZERO IS A LEGITIMATE TAG —
+        // root's region ordinal 0 exists today — so "no tag" cannot be a value
+        // of the tag; see `BootTagForm`.
         case Start -> {
             if not obj.allows(ProcessRight.Start) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            process_start(p, obj.slot)
+            process_start(p, &obj, arg0, arg1)
         },
         // §12's boot set, drained one record at a time. It is asked of the
-        // process's OWN handle: the set belongs to the process the kernel
-        // minted it for, so `obj.slot` and the caller are the same process by
-        // the time the right check has passed.
+        // process's OWN handle: the set belongs to the process it was minted
+        // FOR, so `obj.slot` and the caller are the same process by the time the
+        // right check has passed. **THE SET IS PER-PROCESS SINCE UNIT 3** (sawos
+        // design 4 D-2), so `p` below reads the CALLER's own records — root's,
+        // written by the kernel at boot, or a child's, written by its launcher's
+        // gives — and the op is one drain over two producers.
         case BootHandleNext -> {
             if not obj.allows(ProcessRight.BootHandles) {
                 fault_process(p, FaultReason.AccessDenied)
             }
             boot_handle_next(p, arg0, arg1)
+        },
+        // **THE COURIER OP** (sawos design 4). It is asked of the CHILD's handle
+        // — `obj.slot` is the process being furnished — which is why it keeps
+        // the bare verb, and it is gated on `Manage` on that handle: handing a
+        // capability into a process you created is management OF it, the same
+        // bar `Start` sits behind. The OTHER gate is on the handle being GIVEN
+        // and is the ruling's own: the universal `Transfer` bit, checked inside
+        // `process_give` where the entry is known and the kind is not.
+        case Give -> {
+            if not obj.allows(ProcessRight.Manage) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            process_give(p, obj.slot, arg0, arg1)
         },
     }
 }
@@ -540,6 +569,14 @@ func process_create(p: Int, image_handle: UInt,
     if slot == NO_PROCESS {
         return op_status(SosStatus.NoResource)
     }
+    // THE CHILD'S FIRST HANDLE, and unit 2's "unit 3 revisits" note is
+    // RESOLVED: `child_process_rights()` is the full self-management set plus
+    // `Start`, `BootHandles` and `Transfer` (sawos design 4 D-3). The width is
+    // what makes the launch flow work — the drain lives on the Process object,
+    // so a child that is to drain must hold its own Process handle, and this is
+    // the only handle onto it that exists. `Transfer` is what lets root CHOOSE:
+    // keep it and supervise, or give it and donate. One handle, one choice; the
+    // second-handle question is unit 5.5's.
     let handle = mint_handle(p, ObjType.Process, child_process_rights(), slot)
     if handle == NO_HANDLE {
         return op_status(SosStatus.NoResource)
@@ -549,12 +586,13 @@ func process_create(p: Int, image_handle: UInt,
     let rw_base = place_image(slot, img_base, &dest)
 
     PROCESSES[slot].state = ProcessState.Created
-    // A CHILD HOLDS NO HANDLE AT ALL in this unit — its table is empty, so it
-    // cannot name its own System object and `ProcessSelf` is not a call it can
-    // make. There is nothing to record here any more: mint-per-call means a
-    // process's own Process handle is minted when it is asked for, and a child
-    // that cannot ask has none (sawos design 3 D-4). Unit 3 is where a child
-    // receives handles, and what it receives is what `give` decides.
+    // A CHILD'S TABLE STARTS EMPTY AND `give` IS WHAT FILLS IT (sawos design 4).
+    // There is nothing to record here: mint-per-call means a process's own
+    // Process handle is minted when it is asked for, and a child cannot ask —
+    // `ProcessSelf` needs a System handle it has not been given. So every handle
+    // a child ever holds arrives through `ProcessOp.Give` between this call and
+    // `Start`, and a child that was given nothing is still the ruled
+    // "legal-but-doomed" sandboxed compute process, which is a FEATURE.
     PROCESSES[slot].entry = image_entry(img_base)
     PROCESSES[slot].stack_top = dest.top
     PROCESSES[slot].region_base = dest.base
@@ -567,19 +605,57 @@ func process_create(p: Int, image_handle: UInt,
     op_value(handle)
 }
 
-/// §2's `start()` — phase two, and the whole of it.
+/// §2's `start(boot_tag:)` — phase two, and the whole of it.
 ///
 /// It MINTS THE FIRST THREAD INTERNALLY and hands out no handle for it: nobody
-/// holds a child's thread in this unit, and what a child receives is unit 3's
-/// question. The entry and the stack come out of the process slot, recorded at
+/// holds a child's thread, and what a child receives is what `give` put in its
+/// table. The entry and the stack come out of the process slot, recorded at
 /// create, so **root supplies neither** — which is what keeps "root never
 /// parses" airtight (sawlang#232 unit 2, ruled Aug 16).
 ///
-/// `a0 = NO_HANDLE` is the no-boot-tag form. Every child in this unit is the
-/// ruled "legal-but-doomed" sandboxed compute process: it is handed no System
-/// handle, so it cannot print, cannot exit and cannot make a syscall that
-/// resolves — a fully sandboxed process is a FEATURE, not an error to detect.
-/// `start(boot_tag:)` arrives with `give` in unit 3.
+/// **THE KERNEL RESOLVES THE TAG TO THE CHILD-SIDE WORD** (sawos design 4), so
+/// `_start(boot_handle)` is unchanged from M2 and root never sees a
+/// child-relative word at any point. That is the whole reason the resolution is
+/// here rather than in the give's return: the give answers with a STATUS ALONE
+/// because the word it minted means nothing to the giver, and the one place it
+/// does mean something is the register the child wakes up with.
+///
+///   - `BootTagForm.Absent` keeps unit 2's `NO_HANDLE` in a0. The sandboxed
+///     compute process stays a FEATURE, not an error to detect, and every
+///     existing `start()` caller is this form.
+///   - `BootTagForm.Present` resolves `tag` against the child's boot set. A tag
+///     that names no given record is a `BadArg` FAULT — config error, and the
+///     caller is the one that chose both the tag it gave and the tag it started
+///     with.
+///   - `BootTagForm.Donate` is **THE GIVE AT THE BARRIER**, and it is the form
+///     that makes a self-managing child expressible at all. See below.
+///   - Resolution does NOT consume the record. The child receives the word in a0
+///     AND drains the record like any other, which is what makes its boot
+///     sequence literally a receive loop over everything it was given.
+///
+/// **WHY `Donate` EXISTS — a gap in design 4 D-3, and the deviation that closes
+/// it.** D-3 rules that a child which is to drain must hold its own Process
+/// handle, "which only root can put there, by giving the one create minted", and
+/// the proof it describes is give-then-start. That sequence cannot be written:
+/// `Start` is an op on the CHILD's Process handle, `Give` is a MOVE that unbinds
+/// the giver's entry, and there is exactly ONE such handle — so a launcher that
+/// gives it away has, at that instant, no way left to name the child and can
+/// never start it. Both halves are ruled, so neither could bend:
+///
+///   - Keeping the handle would need a SECOND one onto the same process, which
+///     is design 3's finding-2 re-mint question and is explicitly unit 5.5's.
+///   - Giving after start would unfreeze the boot set, whose freeze IS the
+///     soundness argument for the whole launch flow.
+///
+/// So the transfer happens AT the barrier, which is the one instant that is
+/// both "before the child's first instruction" and "while the launcher still
+/// holds the handle". Nothing about a give changes: it is the same
+/// unbind-and-rebind, the same rights VERBATIM, the same tagged record appended
+/// to the child's set, performed by the same helpers `Give` uses — the only
+/// difference is that the handle being moved is THE ONE THE OP WAS INVOKED
+/// THROUGH, which is exactly why it could not have been moved a moment earlier.
+/// "One handle, one choice" is unchanged and is now made at ONE call site:
+/// `start()` keeps it and supervises, `start(donating: tag)` hands it over.
 ///
 /// **ROOT KEEPS RUNNING.** The thread goes on the ready queue and the caller
 /// returns normally; the child runs when the scheduler next picks it, which is
@@ -587,25 +663,213 @@ func process_create(p: Int, image_handle: UInt,
 ///
 /// A SECOND START IS A `BadState` FAULT (ruled). The state word is what makes
 /// that checkable, and the caller could have known: it is the one that started
-/// it the first time.
-func process_start(caller: Int, child: Int) unsafe -> SyscallResult {
+/// it the first time. THE SAME WORD FREEZES THE BOOT SET — a give after this
+/// point is the same `BadState` — which is the give-before-start ordering that
+/// makes a half-populated table unrepresentable.
+func process_start(caller: Int, obj: &ProcessObject,
+                   raw_form: UInt, tag: UInt) unsafe -> SyscallResult {
+    let child = obj.slot
+    // The FORM arrives as a raw register word the process chose, so it is
+    // decoded rather than trusted, on `event_create`'s and `clock_get`'s
+    // precedent exactly: a number that is not a `BootTagForm` is a caller error
+    // the process could have checked.
+    guard let form = BootTagForm.from(raw: raw_form) else {
+        fault_process(caller, FaultReason.BadArg)
+    }
     match PROCESSES[child].state {
         case Created -> {},
         case _ -> fault_process(caller, FaultReason.BadState),
     }
 
+    // EVERY FAULT IS RAISED BEFORE ANY EFFECT, which for the donating form means
+    // the whole of a give's fault set — `Transfer`, the record spelling and the
+    // duplicate tag — is settled here, while both tables are still untouched.
+    // `own` is the entry for THE HANDLE THIS OP WAS INVOKED THROUGH, which is the
+    // one the donating form moves; reading it on the other two forms costs a
+    // table lookup and keeps the shape flat.
+    //
+    // The other two arms answer a kind nothing reads — only the `Donate` arm
+    // below names `donate_kind` — because a `match` must produce a value on
+    // every path and there is no kind to name where no handle moves.
+    let own = lookup_handle(caller, obj.handle)
+    let donate_kind = match form {
+        case Donate -> give_faults(caller, child, own, tag),
+        case _ -> BootHandleKind.Memory,
+    }
+
+    // The statuses next, in the order that leaves the least behind. Nothing
+    // below `alloc_thread` can fail once the handle has moved, and
+    // `alloc_thread` itself is a pure scan that reserves nothing — so an early
+    // return here leaks neither a slot nor a capability.
     let slot = alloc_thread()
     if slot == NO_THREAD {
         return op_status(SosStatus.NoResource)
     }
+    match form {
+        case Donate -> {
+            if not boot_handle_room(child) {
+                return op_status(SosStatus.NoResource)
+            }
+        },
+        case _ -> {},
+    }
+
+    let boot_word = match form {
+        case Absent -> NO_HANDLE,
+        case Present -> {
+            let w = boot_handle_word(child, tag)
+            if w == NO_HANDLE {
+                fault_process(caller, FaultReason.BadArg)
+            }
+            w
+        },
+        case Donate -> {
+            let given = move_handle(caller, child, obj.handle, own,
+                                    donate_kind, tag)
+            if given == NO_HANDLE {
+                return op_status(SosStatus.NoResource)
+            }
+            given
+        },
+    }
+
     hal.frame_init(frame_slot(slot), PROCESSES[child].entry,
-                   PROCESSES[child].stack_top, NO_HANDLE)
+                   PROCESSES[child].stack_top, boot_word)
     THREADS[slot] = ThreadSlot(state: ThreadState.Runnable, process: child,
                                exit_code: 0,
                                joiners: 0, link: 0, wait_buf: 0)
     ready_push(slot)
     PROCESSES[child].state = ProcessState.Running
     op_ok()
+}
+
+/// Which `BootHandleKind` a given handle's `ObjType` is delivered as, or `None`
+/// when the boot record has no spelling for it.
+///
+/// **THE ONE PLACE THE KERNEL-INTERNAL KIND AND THE PUBLIC ONE MEET** (sawos
+/// design 4). `ObjType` is renumberable bookkeeping and `BootHandleKind` crosses
+/// the trap boundary, so neither is a cast of the other; this function is the
+/// translation, written out, and it is deliberately PARTIAL. The kinds it cannot
+/// spell are exactly the kinds nothing mints `Transfer` on today — a Thread,
+/// Event, Waiter, Interrupt, Clock or Timer handle never reaches here, because
+/// the `Transfer` check above refuses it first. The arm exists so that the day a
+/// kind becomes givable, the compiler asks for its record spelling instead of
+/// letting it arrive mis-tagged.
+func boot_kind_of(kind: ObjType) -> BootHandleKind? {
+    match kind {
+        case Memory -> BootHandleKind.Memory,
+        case Process -> BootHandleKind.Process,
+        case _ -> None,
+    }
+}
+
+/// §2's `give(handle, tag:)` — **UNBIND AND REBIND, RIGHTS VERBATIM** (sawos
+/// design 4 D-1), and the whole of the launch flow's furnishing half.
+///
+/// A GIVE IS A MOVE, NOT A MINT. The fresh entry in the child's table carries the
+/// SAME kind, the SAME target and the SAME rights word as the caller's did — no
+/// default set is consulted and nothing amplifies, so what root attenuated stays
+/// attenuated. (There is no attenuate op yet; rights today are as minted. That is
+/// recorded rather than solved — design 4's out-of-scope list.) The caller's
+/// entry unbinds exactly as a release does, GENERATION BUMP INCLUDED, so the
+/// giver's word is stale the instant the op returns and its later use is the
+/// diagnosed `BadHandle` fault design 3's generations exist to draw.
+///
+/// **THE ORDER OF CHECKS IS THE CONTRACT**: every FAULT first, then the capacity
+/// STATUS, then the move. A fault leaves both tables unchanged by definition, and
+/// the capacity refusal is ordered so that it too leaves the caller's entry
+/// exactly as it was — the mint into the child happens BEFORE the unbind for
+/// precisely that reason, so a full child table is a give that did not happen
+/// rather than a capability lost between two tables.
+///
+///   - the given handle must RESOLVE — `BadHandle`, the ordinary one.
+///   - it must carry the universal `Transfer` bit — `AccessDenied`. This is the
+///     ruling's own gate and the first consumer §3's universal low byte has ever
+///     had. It is checked HERE, where the entry is known and the kind is not,
+///     which is the same altitude `RELEASE_OP` is intercepted at.
+///   - the child must still be `Created` — `BadState`. **THE BOOT SET FREEZES AT
+///     START**, and that ordering IS the soundness argument: a child's boot
+///     handles must answer completely at its first instruction, and start is the
+///     barrier that makes a half-populated table unrepresentable with no
+///     synchronization invented. Dynamic transfer is M4 IPC's job, over pipes, to
+///     a process expecting it.
+///   - the tag must be UNUSED in the child's set — `DuplicateKey`. An identity
+///     naming two handles is broken config, caller-checkable, and it would make
+///     the record a multimap and the boot lookup ambiguous.
+///   - a full child table (or boot set) is `NoResource`, a STATUS, because a
+///     dynamic resource running out is exactly what a caller could not have
+///     known.
+///
+/// GIVING TO YOURSELF NEEDS NO SPECIAL CASE and is refused by the state check: a
+/// running process is not `Created`, so `give` through your own Process handle is
+/// the same `BadState` a give after start is.
+func process_give(p: Int, child: Int, word: UInt, tag: UInt) unsafe -> SyscallResult {
+    let entry = lookup_handle(p, word)
+    let kind = give_faults(p, child, entry, tag)
+    if not boot_handle_room(child) {
+        return op_status(SosStatus.NoResource)
+    }
+    let given = move_handle(p, child, word, entry, kind, tag)
+    if given == NO_HANDLE {
+        return op_status(SosStatus.NoResource)
+    }
+    op_ok()
+}
+
+/// Every FAULT a transfer of `entry` into `child` under `tag` can raise, in
+/// D-1's order, answering the record kind the move will use. Never returns on a
+/// fault; touches nothing on any path.
+///
+/// **ONE FAULT SET, TWO DOORS** — `ProcessOp.Give` and `Start`'s donating form
+/// (which is a give at the barrier, see `process_start`). Sharing the checks is
+/// what makes "the donation is an ordinary give" a fact rather than two
+/// implementations that agree today.
+func give_faults(p: Int, child: Int, entry: HandleEntry,
+                 tag: UInt) unsafe -> BootHandleKind {
+    match entry.obj_type {
+        case Unbound -> fault_process(p, FaultReason.BadHandle),
+        case _ -> {},
+    }
+    if not rights_allow_transfer(entry.rights) {
+        fault_process(p, FaultReason.AccessDenied)
+    }
+    guard let kind = boot_kind_of(entry.obj_type) else {
+        fault_process(p, FaultReason.BadArg)
+    }
+    match PROCESSES[child].state {
+        case Created -> {},
+        case _ -> fault_process(p, FaultReason.BadState),
+    }
+    if boot_tag_used(child, tag) {
+        fault_process(p, FaultReason.DuplicateKey)
+    }
+    kind
+}
+
+/// THE MOVE ITSELF: bind in the child, unbind in the giver, append the record.
+/// Answers the child-side word, or `NO_HANDLE` when the child's table was full —
+/// in which case NOTHING happened and the giver's entry is untouched.
+///
+/// The two halves are ordered so that the failing one cannot lose a capability:
+/// the child-side binding is made FIRST, so a full table is a refusal with the
+/// caller's entry exactly as it was, and only a mint that succeeded is followed
+/// by the unbind that makes the giver's word stale. The unbind is
+/// `unbind_handle`, the same one release and the teardown use, so the generation
+/// bump comes for free and design 3's diagnosis of a stale word covers a giver
+/// exactly as it covers a releaser.
+///
+/// RIGHTS TRAVEL VERBATIM — `entry.rights` is copied, not recomputed — because a
+/// give is a MOVE AND NOT A MINT: no default set is consulted and nothing
+/// amplifies, so what the giver attenuated stays attenuated.
+func move_handle(p: Int, child: Int, word: UInt, entry: HandleEntry,
+                 kind: BootHandleKind, tag: UInt) unsafe -> UInt {
+    let given = mint_handle(child, entry.obj_type, entry.rights, entry.target)
+    if given == NO_HANDLE {
+        return NO_HANDLE
+    }
+    unbind_handle(p, handle_word_index(word))
+    queue_boot_handle(child, tag, kind, given)
+    given
 }
 
 /// The record `Process.BootHandleNext` answers with, in kernel memory.
@@ -622,7 +886,14 @@ struct BootHandleWire {
 static_assert(sizeof<BootHandleWire>() == BOOT_HANDLE_RECORD_WORDS * sizeof<UInt>(),
               "a boot handle record must be exactly the words sosabi publishes")
 
-/// §12's boot set, one record at a time (sawos design 2 D-3).
+/// §12's boot set, one record at a time (sawos design 2 D-3), **out of the
+/// CALLER's own per-process set** (sawos design 4 D-2).
+///
+/// The op did not change shape when the set went per-process, which is the claim
+/// D-2 makes: root drains records the kernel wrote at boot and a child drains
+/// records its launcher wrote with `give`, through one op, one record layout and
+/// one exhaustion rule. `p` is the caller, established by the dispatch before the
+/// `BootHandles` right was checked.
 ///
 /// **EXHAUSTION IS A STATUS AND IT STAYS EXHAUSTED.** A caller draining an
 /// iterator ENDS by meeting the end, so faulting would kill the correct program;
@@ -645,10 +916,11 @@ func boot_handle_next(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
     if cap < (boot_handle_record_bytes() as UInt) {
         fault_process(p, FaultReason.BadArg)
     }
-    if BOOT_HANDLE_NEXT >= BOOT_HANDLE_COUNT {
+    let cursor = BOOT_HANDLE_NEXT[p]
+    if cursor >= BOOT_HANDLE_COUNT[p] {
         return op_status(SosStatus.Drained)
     }
-    let queued = BOOT_HANDLES[BOOT_HANDLE_NEXT]
+    let queued = BOOT_HANDLES[p * MAX_HANDLES + cursor]
     var rec = BootHandleWire(tag: queued.tag, kind: queued.kind as UInt,
                              handle: queued.handle)
     if let why = copy_out(p, dst,
@@ -656,7 +928,7 @@ func boot_handle_next(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
                           boot_handle_record_bytes() as UInt) {
         fault_process(p, why)
     }
-    BOOT_HANDLE_NEXT = BOOT_HANDLE_NEXT + 1
+    BOOT_HANDLE_NEXT[p] = cursor + 1
     op_ok()
 }
 

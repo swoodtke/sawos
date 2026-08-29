@@ -443,6 +443,14 @@ static_assert((SystemRight.ProcessCreate as UInt32) >= (1 << 8),
 /// ordinary one. In M2 root holds it because root is the only process there is;
 /// M3's launcher strips it from everything it spawns except the drivers, which
 /// is §3's monotonic attenuation doing exactly what it is for.
+/// `Manage` GAINS A SECOND MEANING IN M3 UNIT 3, and it is the same meaning read
+/// against a different receiver (sawos design 4 D-1). On your OWN Process handle
+/// it is the derive bit — ask the process for the calling thread. On a CHILD's
+/// handle it is what gates `Give`: handing a capability into a process you
+/// created is management OF that process, the same bar `Start` sits behind, and
+/// inventing a `Give` bit beside `Start` would have split one authority — "run
+/// this child, having furnished it" — across two bits nothing would ever strip
+/// apart.
 public enum ProcessRight: UInt32 {
     case Transfer = 1 << 0,
     case Manage = 1 << 1,
@@ -698,6 +706,24 @@ static_assert((MemoryRight.Transfer as UInt32) == (1 << 0),
 static_assert((MemoryRight.Manage as UInt32) == (1 << 1),
               "universal right Manage must be bit 1 in every kind's enum")
 
+/// Whether a rights word carries the UNIVERSAL `Transfer` bit (§3's low byte).
+///
+/// **IT TAKES A PLAIN MASK RATHER THAN A TYPED RIGHT, and that is the point**
+/// (sawos design 4 D-1). `ProcessOp.Give` checks this bit on the handle BEING
+/// GIVEN, which may be any kind at all — so the check happens at the one
+/// altitude that has the entry and has not branched on its `obj_type`, exactly
+/// as `RELEASE_OP` does. A typed `allows` cannot be written there, and writing
+/// nine of them would be nine spellings of one universal bit.
+///
+/// `SystemRight.Transfer` is the spelling and ANY kind's would do: the
+/// `static_assert`s above pin all ten enums' `Transfer` to bit 0, and that
+/// repetition is what makes this function's one reading safe. This is the first
+/// consumer of the universal low byte the §3 table has ever had — the bit was
+/// declared in M2 and read by nothing until give.
+public func rights_allow_transfer(rights: UInt32) -> Bool {
+    (rights & (SystemRight.Transfer as UInt32)) != 0
+}
+
 /// What the kernel mints for root's System handle at boot (§12).
 ///
 /// A function rather than a `static`, and THE ORIGINAL REASON HAS EXPIRED: a
@@ -761,21 +787,47 @@ public func root_process_rights() -> UInt32 {
 }
 
 /// What `process_create` mints for the CALLER on the child it just made (sawos
-/// design 2 D-4).
+/// design 2 D-4, **RE-RULED by design 4 D-3**).
 ///
-/// THREE BITS, AND WHAT IS WITHHELD IS THE POINT. `Start` runs it, `Wait` reads
-/// its §8 status word, `Manage` is the universal derive bit. Everything else a
-/// Process handle can carry is a CHILD's own authority over itself — making
-/// threads, making Events and Waiters, binding an interrupt line, exiting — and
-/// the creator holding those would let root reach inside a process it is
-/// supposed to be isolated from. §3's attenuation is monotonic, so a bit not
-/// minted here can never appear on this handle.
+/// **THE FULL DEFAULT SET PLUS `Transfer`, AND THE WIDTH IS WHAT MAKES THE
+/// LAUNCH FLOW WORK.** Unit 2 minted `Start | Wait | Manage` and wrote "unit 3
+/// revisits"; this is the revisit. The set is now the self-management vocabulary
+/// (`ThreadCreate | Exit | Wait | EventCreate | WaiterCreate | InterruptBind |
+/// Manage`) plus `Start`, `BootHandles` and `Transfer`.
 ///
-/// `Transfer` is deliberately absent: handing a child's Process handle to a
-/// third party is unit 3's question and there is nobody to hand it to yet.
+/// WHY IT HAD TO WIDEN: the boot-set drain lives on the Process object, so a
+/// child that is to drain must hold ITS OWN Process handle — and the only place
+/// such a handle can come from is the one `process_create` minted, given across
+/// by `Give`. A narrow set would have made the handle useless the moment it
+/// arrived: a child holding `Start | Wait | Manage` onto itself cannot drain,
+/// cannot make a thread and cannot exit.
+///
+/// **`Transfer` IS WHAT MAKES IT ONE HANDLE AND ONE CHOICE**, and that is stated
+/// rather than papered over. Root either KEEPS this handle — supervision, where
+/// it reads `get_status` and the child holds nothing and is the sandboxed
+/// compute process unit 2's cases exercise — or GIVES it, donation, where the
+/// child drains its boot set and root retains nothing. Root cannot have both
+/// today: holding supervision AND donating self-management needs a SECOND handle
+/// onto one process, which is exactly the re-mint question design 3's finding 2
+/// recorded and which **unit 5.5 owns** (death notifications are when root
+/// genuinely needs to retain while the child holds its own).
+///
+/// WHAT THE WIDENING DOES NOT DO is hand root anything it did not have. The set
+/// is what a process may do to ITSELF, minted onto a process root created; §3's
+/// attenuation stays monotonic, and a launcher that wants a narrower child
+/// still has no attenuate op to build one with (design 4's out-of-scope list —
+/// rights travel as minted).
+///
+/// IT IS DERIVED FROM `root_process_rights()` RATHER THAN RESPELLED, because
+/// that function IS this v1's "what a process may do to itself" vocabulary —
+/// the name says whose handle it was written for, not whose vocabulary it is —
+/// and a second copy of the list is a second place to forget a bit. The two
+/// additions are exactly the two authorities that are not self-management:
+/// `Start`, which is a right on the handle of the process being started, and
+/// `Transfer`, which is the choice D-3 hands root.
 public func child_process_rights() -> UInt32 {
-    ((ProcessRight.Start as UInt32) | (ProcessRight.Wait as UInt32)
-     | (ProcessRight.Manage as UInt32))
+    (root_process_rights() | (ProcessRight.Start as UInt32)
+     | (ProcessRight.Transfer as UInt32))
 }
 
 /// What the kernel mints for a Memory region at boot (spec §2.5).
@@ -961,7 +1013,21 @@ public enum SystemOp: UInt {
 /// `BootHandleNext` is unit 3's iterator, arriving early because root is its
 /// first consumer: the boot set still enters user mode ONE handle wide (§12),
 /// the register carries System, and everything else the kernel minted for root
-/// at boot is DRAINED through this op one record at a time.
+/// at boot is DRAINED through this op one record at a time. **SINCE M3 UNIT 3
+/// THE SET IT DRAINS IS PER-PROCESS** (sawos design 4 D-2): the caller's own,
+/// reached through its own Process handle, whether the kernel filled it at boot
+/// or a launcher filled it with `Give`.
+///
+/// **`Give` IS THE COURIER OP** (sawos design 4), and it keeps the bare verb
+/// under the Aug-17 naming rule for the reason `Start` does: THE RECEIVER IS THE
+/// CHILD. Root asks the child's Process handle to accept a capability, tagged
+/// with a word root chooses; the kernel MOVES the handle into a fresh slot of
+/// the child's table and answers with a STATUS ALONE, because the child-side
+/// word is irrelevant to root — root can call no op through it, so nothing
+/// returns it. What crosses instead is the TAG: the giver's own word handed back
+/// unread at the child's drain, the `Waiter.add` key precedent exactly. The
+/// kernel is a courier, never an interpreter; root and child agree on meaning
+/// through config and manifest.
 ///
 /// Absent, with reasons: `Kill` (see `ProcessRight`).
 public enum ProcessOp: UInt {
@@ -974,6 +1040,52 @@ public enum ProcessOp: UInt {
     case InterruptBind = 6,
     case Start = 7,
     case BootHandleNext = 8,
+    case Give = 9,
+}
+
+/// Whether `ProcessOp.Start`'s SECOND argument carries a boot tag — the op's
+/// first argument, and the thing that makes "no tag" expressible (sawos design 4
+/// D-4).
+///
+/// **ZERO IS A LEGITIMATE TAG, so the absence cannot be encoded in the tag
+/// itself.** Root's boot regions are tagged with region ordinals and ordinal 0
+/// exists today, so reusing `NO_HANDLE`'s zero would have made the very first
+/// row of every region table unnameable. A RESERVED ALL-ONES SENTINEL was the
+/// other candidate and is refused for a sharper reason: a tag is the giver's own
+/// word handed back unread, so a kernel that reserved one value would be
+/// interpreting the vocabulary it exists not to interpret. A FLAG ARGUMENT costs
+/// one register that `Start` was not using and reserves nothing.
+///
+/// It is a backed enum rather than a bare 0/1 for the house rule (design 145/153:
+/// a closed named set of values is an enum, not a family of statics), which also
+/// makes the decode at the trap boundary `from(raw:)` — total, so a process
+/// passing 2 gets the ordinary `BadArg` fault rather than an index the kernel
+/// trusts.
+///
+/// Backed by `UInt`, the width of the register it arrives in, for the reason
+/// `EventMode` and `ClockType` give: the value is PROCESS-CONTROLLED, so a
+/// narrower backing would need a truncation before `from(raw:)` and `0x100`
+/// would arrive as a valid `Absent`.
+///
+/// The cases are `Absent`/`Present` rather than `None`/`Tag` so that nothing in
+/// a `match` over one reads like an `Optional`.
+///
+/// **`Donate` IS THE THIRD, AND IT IS A GIVE PERFORMED AT THE BARRIER** — the
+/// deviation design 4's implementation had to make, argued in full at
+/// `kcore.dispatch`'s `process_start`. In one sentence: D-3 rules that a
+/// self-managing child holds the Process handle `process_create` minted, and
+/// `Give` is a MOVE, so a launcher that gives that handle away has nothing left
+/// to call `Start` on and can never run the child. The transfer therefore
+/// happens AT `Start`, the one instant that is both before the child's first
+/// instruction and while the launcher still holds the handle. It is an ordinary
+/// give in every other respect — same fault set, same unbind-and-rebind, same
+/// rights verbatim, same tagged record — and it moves THE HANDLE THE OP WAS
+/// INVOKED THROUGH, which is exactly the handle no earlier moment could have
+/// moved.
+public enum BootTagForm: UInt {
+    case Absent = 0,
+    case Present = 1,
+    case Donate = 2,
 }
 
 // =============================================================================
@@ -1135,7 +1247,7 @@ public enum TimerOp: UInt {
 // build rather than fail as a release that quietly ran somebody's op.
 static_assert((SystemOp.ProcessCreate as UInt) < RELEASE_OP,
               "an op table must stay below the universal RELEASE_OP")
-static_assert((ProcessOp.BootHandleNext as UInt) < RELEASE_OP,
+static_assert((ProcessOp.Give as UInt) < RELEASE_OP,
               "an op table must stay below the universal RELEASE_OP")
 static_assert((ThreadOp.Yield as UInt) < RELEASE_OP,
               "an op table must stay below the universal RELEASE_OP")
@@ -1396,6 +1508,16 @@ public func timer_arm_record_bytes() -> Int {
 // answers `SosStatus.Drained` forever — a loop's termination check, never a
 // fault, because exhaustion is exactly what a caller could not have known in
 // advance and is the ordinary way the loop ends.
+//
+// **THE SET IS PER-PROCESS SINCE M3 UNIT 3** (sawos design 4 D-2), and there are
+// now two ways one gets filled: the KERNEL writes root's at boot, one record per
+// row of the build-emitted region table, and a LAUNCHER writes a child's with
+// `ProcessOp.Give`, one record per capability it hands across. Nothing about the
+// record or the op distinguishes them — the kernel is the giver nobody gave to.
+// The set FREEZES at `Start` (a give afterwards is a `BadState` fault), which is
+// what makes a half-populated table unrepresentable at the child's first
+// instruction with no synchronization invented; the DRAIN has no deadline at
+// all, so a child that drains late drains correctly.
 
 /// Words in a boot-handle record: tag, kind, handle.
 public static BOOT_HANDLE_RECORD_WORDS: Int = 3
@@ -1422,21 +1544,38 @@ public func boot_handle_record_bytes() -> Int {
 /// and renumberable — a boot handle's kind crosses the trap boundary, so it is
 /// its own closed set with its own stated numbers.
 ///
-/// v1 declares one kind, because the boot set is exactly the region table's
-/// rows. The raw backing is what lets a second kind be ADDED without
-/// renumbering (design 145's wire idiom), which is what unit 4's IoMemory and
-/// unit 5.5's death channels will want.
+/// M3 unit 2 declared one kind, because the boot set was exactly the region
+/// table's rows. **UNIT 3 DECLARES THE SECOND** (sawos design 4 D-3): a give may
+/// carry a PROCESS handle, and the one that matters is the child's own — the
+/// drain lives on the Process object, so a child that is to drain must be handed
+/// the handle `process_create` minted. The raw backing is what lets a kind be
+/// ADDED without renumbering (design 145's wire idiom), which is exactly what
+/// happened here and what unit 4's IoMemory and unit 5.5's death channels will
+/// want next.
+///
+/// **THE SET IS EXACTLY THE GIVABLE KINDS, and it is smaller than `ObjType` on
+/// purpose.** A kind reaches this enum when something can actually deliver one:
+/// v1 mints the universal `Transfer` bit in `memory_rights()` and (since D-3)
+/// `child_process_rights()` and NOWHERE ELSE, so a Thread, Event, Waiter,
+/// Interrupt, Clock or Timer handle cannot be given at all and a case for one
+/// would be dead surface — the same rule `ClockType` follows in declaring one
+/// domain. The kernel's `boot_kind_of` is the one place the two enums meet, and
+/// it refuses what it cannot spell rather than inventing a number.
 ///
 /// Backed by `UInt`, the width of the word it travels in, for the reason
 /// `WaitTag` gives: userspace decodes it through `from(raw:)`, which is total.
-/// **THE TAG BESIDE IT IS THE REGION ORDINAL** (sawos design 2 D-3): row `n` of
-/// the build-emitted region table is tag `n`, and the kernel knows nothing else
-/// about it. Which ordinal is the image blob, which is a child's destination
-/// RAM, which device a window belongs to — all of that is ROOT's config, and
-/// keeping it there is what makes the kernel's half of the launch flow the same
-/// code for a hand-built M3 system and for M4's dynamic loading.
+/// **THE TAG BESIDE IT IS THE GIVER'S OWN WORD, HANDED BACK UNREAD.** For root's
+/// boot set the kernel is the giver and the tags are region ordinals (row `n` is
+/// tag `n`, sawos design 2 D-3); for a child's set the LAUNCHER is the giver and
+/// the tag is whatever it chose. The kernel knows nothing about either — which
+/// ordinal is an image blob, which is destination RAM, which capability a child
+/// expects under 7 — because THE TAG IS THE IDENTITY and identities are the only
+/// cross-process vocabulary there is (design 4's ruled surface). Keeping the
+/// meaning in root's config is what makes the kernel's half of the launch flow
+/// the same code for a hand-built M3 system and for M4's dynamic loading.
 public enum BootHandleKind: UInt {
     case Memory = 0,
+    case Process = 1,
 }
 
 // THE DECODED RECORD IS NOT DECLARED HERE, and the asymmetry with `WaitResult`
@@ -1608,6 +1747,17 @@ extension FaultReason {
             // merely inside the memory it was granted — so a wording naming
             // one of them was accurate for exactly as long as there was one.
             case BadBuffer -> "buffer is outside the process's memory",
+            // TWO CONSUMERS SINCE M3 UNIT 3, and the WORDING DID NOT MOVE: a
+            // give whose tag is already in the child's boot set raises this
+            // exact tag (sawos design 4 — an identity naming two handles is
+            // broken config, caller-checkable, and it would make the record a
+            // multimap and the boot lookup ambiguous). The sentence names the
+            // Waiter case because that is the one it was written for and
+            // because the string is ASSERTED by a shipped transcript
+            // (`event_dupkey`); design 4 authorised no expectation changes, so
+            // the generalisation is recorded here rather than spelled in the
+            // line. A later unit that touches that row should widen it to name
+            // the key rather than the attachment.
             case DuplicateKey -> "an attachment already uses that key",
             case LineBound -> "that interrupt line is already bound",
         }

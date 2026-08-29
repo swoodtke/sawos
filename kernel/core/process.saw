@@ -45,6 +45,7 @@ import kcore.objects.{
     MemorySlot,
     SlotState,
     alloc_memory,
+    boot_handle_room,
     mint_handle,
     queue_boot_handle,
 }
@@ -637,8 +638,15 @@ func mint_boot_regions(p: Int) unsafe {
             fatal_image("no handle table room for the boot regions", i)
         }
         // THE TAG IS THE ROW ORDINAL and nothing else — root's config is what
-        // gives it a meaning.
-        queue_boot_handle(i, BootHandleKind.Memory, handle)
+        // gives it a meaning. **THE KERNEL IS THE GIVER NOBODY GAVE TO** (sawos
+        // design 4 D-2): this writes root's boot record through exactly the
+        // machinery `ProcessOp.Give` writes a child's, into root's own
+        // per-process set, so the two producers are one and the drain cannot
+        // tell them apart.
+        if not boot_handle_room(p) {
+            fatal_image("no boot-record room for the boot regions", i)
+        }
+        queue_boot_handle(p, i, BootHandleKind.Memory, handle)
         i = i + 1
     }
 

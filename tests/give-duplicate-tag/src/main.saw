@@ -1,0 +1,98 @@
+// SOS M3 unit 3: A DUPLICATE TAG IS A FAULT (sawos design 4).
+//
+// THE TAG IS THE IDENTITY. It is the giver's own word, handed back unread at the
+// child's drain, and it is the ONLY cross-process vocabulary SOS has — so an
+// identity naming two handles is not a collision to resolve, it is broken
+// config. Two things follow, and the second is why it cannot be tolerated:
+//
+//   - It is CALLER-CHECKABLE in the strongest sense. The launcher chose both
+//     tags; nothing about the kernel or the child was involved.
+//   - It would make the boot record a MULTIMAP. `start(boot_tag:)` looks a tag
+//     up, and a lookup with two answers has no defensible one.
+//
+// So the second give ends this process, and the transcript reads:
+//
+//   SOS givedup: first give ok
+//   SOS: process fault: an attachment already uses that key process=0
+//   SOS: process teardown ... process=0
+//
+// THE FAULT TAG IS THE WAITER'S, WORD FOR WORD, and that is deliberate rather
+// than sloppy: `FaultReason.DuplicateKey` was written for §2.2's attachment keys
+// and says exactly the same thing about a boot tag — one key, one thing. The
+// sentence still names attachments because a shipped transcript asserts it
+// (`event_dupkey`) and design 4 authorised no expectation changes; the
+// generalisation is recorded at the declaration.
+//
+// `process=0` in both report lines is what says ROOT died, which is the whole
+// difference between this transcript and a case where a child does.
+
+import sos.{System, Process, Memory, BootHandle, SosStatus}
+
+static EXIT_FAILED: UInt = 1
+
+/// One tag, given twice. The value is arbitrary and that is the point: the
+/// kernel constrains a tag in no way at all, so what makes the second give wrong
+/// is only that the first used it.
+static TAG: UInt = 3
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS givedup: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    var image = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS givedup: no image region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    var dest = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS givedup: no destination region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let image_mem = image.take_memory()!
+    let dest_mem = dest.take_memory()!
+
+    let child = match system.process_create(image: &image_mem,
+                                            memory: &dest_mem) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS givedup: create failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    match child.give(memory: move image_mem, tag: TAG) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS givedup: first give ok\n")
+        },
+        case Err(e) -> {
+            print("SOS givedup: first give failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // THE SECOND GIVE, with the tag the first one spent. It does not return: a
+    // duplicate identity is a caller error, and design 178's faults ruling ends
+    // the process that made it.
+    let _ = child.give(memory: move dest_mem, tag: TAG)
+
+    let _ = system.debug_print("SOS givedup: survived, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

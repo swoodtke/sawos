@@ -1,0 +1,33 @@
+[package]
+name = "child-drain"
+version = "0.1.0"
+
+# Same reason as sos/root's: this image carries its own `__saw_rt_*` seams, out
+# of the `sosrt` module its `sos` dependency pulls in. See that manifest.
+runtime = true
+
+# THE DONATED CHILD (sawos design 4) — the first SOS process that is neither
+# root nor a sandboxed compute process. It is handed its OWN Process handle in
+# its first argument register, drains the boot set its launcher filled with
+# `give`, and ends itself with a code. Everything it can do it can do because
+# `child_process_rights()` carries the full self-management set (design 4 D-3);
+# a child built before this unit could do none of it.
+#
+# IT SAYS NOTHING ON THE CONSOLE, and cannot: `debug_print` is a System op and
+# no System handle is givable in v1 (design 4's out-of-scope list — nothing
+# mints one, and root's withholds `Transfer`). Its exit CODE is the whole of its
+# report, which is what makes the kernel's exit line the oracle for this case.
+[dependencies]
+sos = { path = "../../kernel/sysapi" }
+
+[sos]
+emit = "sosimg"
+priorities = { background = 0, low = 1, normal = 1, high = 1 }
+
+[sos.riscv32-unknown-none-elf]
+linker-script = "../../hal/riscv32/user/child.ld"
+native = "../../hal/riscv32/user/syscall.c ../../rt/common_c/support.c"
+
+[sos.aarch64-unknown-none-elf]
+linker-script = "../../hal/arm64/user/child.ld"
+native = "../../hal/arm64/user/syscall.c ../../rt/common_c/support.c"

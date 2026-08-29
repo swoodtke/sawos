@@ -413,7 +413,21 @@ the constant moved.
 2. **No op mints a second handle onto an object a process already
    owns** — the getters that mint are System's and Process's, so a
    process cannot derive a second `Event`/`Waiter`/`Timer`/`Interrupt`
-   handle for a sibling thread. Before the owning tier this was hidden:
+   handle for a sibling thread.
+   **OWNER: UNIT 5.5** (recorded by design 4 D-3, Aug 29, and sharpened
+   by building it). Unit 3 met this finding from the other side and it
+   is now the launch flow's one real limitation: a child that is to
+   drain must hold its OWN Process handle, the only such handle is the
+   one `process_create` minted, and `give` is a MOVE — so a launcher
+   either KEEPS it and supervises (`get_status`, and 5.5's death-wait)
+   or HANDS IT OVER and donates, and cannot do both. Unit 3 found the
+   ordering half of this too: because `Start` is an op on that same
+   handle, the donation cannot even be a separate give — a launcher
+   that gave it away a moment earlier would have nothing left to start
+   the child with — so it happens AT the start barrier
+   (`BootTagForm.Donate`). A second handle onto one process is what
+   would dissolve both halves, and death notifications are the unit
+   that genuinely needs root to retain while the child holds its own. Before the owning tier this was hidden:
    `event-wake` and `event-consume-wake` shared the COPYABLE wrapper
    value through an `unsafe static var`, which NoCopy correctly
    refuses (and which a static could not hold anyway — statics are
