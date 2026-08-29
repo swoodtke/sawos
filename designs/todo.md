@@ -21,6 +21,11 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
+- sysapi split [user-requested Aug 29, #5 —
+  designs/005-sysapi-split.md]: kernel/sysapi/src/lib.saw becomes the
+  kcore-style facade over per-object files, declared order, zero
+  behavior change, every row byte-identical. DISPATCHED Aug 29;
+  closes in place when the branch parks
 - M3 unit 4 — Memory/IoMemory [sawlang#232]
 - M3 unit 5 — quotas [sawlang#232]
 - M3 unit 5.5 — death notifications [sawlang#232]
