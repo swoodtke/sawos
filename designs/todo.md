@@ -21,6 +21,15 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
+- DESIGN 2 RIDER — `process_create` moves from Process to System (Aug-29
+  user ruling; the record is the RIDER section at the end of
+  `designs/002-create-process.md`) — DISPATCHED, BUILT, closed in place:
+  `SystemOp.ProcessCreate = 4` on new `SystemRight.ProcessCreate = 1 << 11`
+  minted in `root_system_rights()`, the Process op/right retired and
+  `Start`/`BootHandles(Next)` renumbered down, `System.process_create` +
+  `sos_system_process_create` in sysapi, four root packages and spec
+  §2/§8/§12 amended. Gate re-run green, every case transcript unchanged.
+  Nothing open; for the LEAD to move at integration [#2]
 - M3 unit 2.75 — handle lifecycle [sawlang#232]
 - M3 unit 3 — give(handle, tag:) [sawlang#232]
 - M3 unit 4 — Memory/IoMemory [sawlang#232]

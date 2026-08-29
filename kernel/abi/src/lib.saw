@@ -240,12 +240,26 @@ public static ENTRY_IMAGE: UInt = 0
 /// deliberately NOT in the stripped-by-construction set the M3 device rulings
 /// describe (`Shutdown` and the bind/alloc ops): an ordinary process needs to
 /// tell the time, and a clock grants authority over nothing.
+///
+/// `ProcessCreate` is the newest bit, and WHY IT IS HERE rather than on Process
+/// is the Aug-29 user ruling recorded as sawos design 2's RIDER: process-scoped
+/// objects are minted by your Process; PROCESSES ARE MINTED BY THE SYSTEM. The
+/// process table is a machine-global resource bounded by machine facts — the
+/// slab today, the protection-domain reloads, ASIDs when Profile B grows real
+/// translation — so its refusals and its limits are SYSTEM answers, while
+/// threads, events, waiters and timers stay a process's own. `ProcessSelf` is
+/// the precedent that was already sitting here: Process handles have always
+/// come from System, and now they all do. A launcher that is handed a System
+/// handle stripped of this bit cannot spawn — which is the attenuation the old
+/// placement only appeared to offer, since with a root/launcher topology a
+/// creation right on the CALLER's own Process handle gates nothing real.
 public enum SystemRight: UInt32 {
     case Transfer = 1 << 0,
     case Manage = 1 << 1,
     case Debug = 1 << 8,
     case Shutdown = 1 << 9,
     case ClockGet = 1 << 10,
+    case ProcessCreate = 1 << 11,
 }
 
 // The universal low byte, pinned. Every kind's enum repeats these two asserts
@@ -264,6 +278,8 @@ static_assert((SystemRight.Shutdown as UInt32) >= (1 << 8),
               "kind-specific right Shutdown must start at bit 8 or above")
 static_assert((SystemRight.ClockGet as UInt32) >= (1 << 8),
               "kind-specific right ClockGet must start at bit 8 or above")
+static_assert((SystemRight.ProcessCreate as UInt32) >= (1 << 8),
+              "kind-specific right ProcessCreate must start at bit 8 or above")
 
 /// A right on a Process object (§2 table row; design 178 D4).
 ///
@@ -279,13 +295,9 @@ static_assert((SystemRight.ClockGet as UInt32) >= (1 << 8),
 /// and an op whose only reachable use is degenerate is an op nothing tests. It
 /// lands with M3's multi-process loading, beside `process_create`.
 ///
-/// THE THREE M3-UNIT-2 BITS, and each one gates a DIFFERENT ROLE the Process
-/// object now plays (sawos design 2 D-4):
+/// THE TWO M3-UNIT-2 BITS, and each one gates a DIFFERENT ROLE the Process
+/// object now plays (sawos design 2 D-4, as amended by its RIDER):
 ///
-///   - `ProcessCreate` is a FACTORY authority on the CALLER's own Process
-///     handle, exactly as `EventCreate` and `WaiterCreate` are: creation flows
-///     through a handle already held (§3's derivation rule), and a launcher
-///     that strips this bit has a process which cannot spawn.
 ///   - `Start` is a RECEIVER authority on the CHILD's handle — the second
 ///     phase of the two-phase lifecycle, and the reason it is its own bit is
 ///     that a supervisor may legitimately hold a child's handle to WATCH it
@@ -293,6 +305,15 @@ static_assert((SystemRight.ClockGet as UInt32) >= (1 << 8),
 ///   - `BootHandles` gates the boot-set iterator. Root holds it because root is
 ///     the process the kernel minted the boot set FOR; what a CHILD gets is
 ///     unit 3's question, and a bit withheld here is the whole of the answer.
+///
+/// THERE WAS A THIRD, AND IT MOVED. `ProcessCreate` sat here as a factory
+/// authority on the CALLER's own Process handle until the Aug-29 user ruling
+/// (sawos design 2's RIDER) put it on System: process-scoped objects are minted
+/// by your Process; PROCESSES ARE MINTED BY THE SYSTEM. It is now
+/// `SystemRight.ProcessCreate`, and `Start`/`BootHandles` renumbered DOWN into
+/// the hole it left — legal because `kernel/sysapi` is vDSO discipline and
+/// these numbers are not ABI: userspace names the case, the module supplies the
+/// value, and the two are compiled together in one image.
 ///
 /// `EventCreate` and `WaiterCreate` are M2 unit 3's, and where they sit ANSWERS
 /// an open pin: spec §12 leaves the creation-authority model for plain objects
@@ -309,7 +330,7 @@ static_assert((SystemRight.ClockGet as UInt32) >= (1 << 8),
 /// `ThreadCreate`. The bits are what attenuation strips, so an object kind a
 /// process may not make is a bit it was not given — collapsing them would make
 /// "may create Events" and "may create Waiters" the same capability, which they
-/// are not. Twenty-four bits are available and six are used.
+/// are not. Twenty-four bits are available and eight are used.
 ///
 /// `InterruptBind` is the one whose absence MATTERS today, and it is worth
 /// saying why the same shape carries a much stronger authority: an Interrupt
@@ -326,9 +347,8 @@ public enum ProcessRight: UInt32 {
     case EventCreate = 1 << 11,
     case WaiterCreate = 1 << 12,
     case InterruptBind = 1 << 13,
-    case ProcessCreate = 1 << 14,
-    case Start = 1 << 15,
-    case BootHandles = 1 << 16,
+    case Start = 1 << 14,
+    case BootHandles = 1 << 15,
 }
 
 static_assert((ProcessRight.Transfer as UInt32) == (1 << 0),
@@ -347,8 +367,6 @@ static_assert((ProcessRight.WaiterCreate as UInt32) >= (1 << 8),
               "kind-specific right WaiterCreate must start at bit 8 or above")
 static_assert((ProcessRight.InterruptBind as UInt32) >= (1 << 8),
               "kind-specific right InterruptBind must start at bit 8 or above")
-static_assert((ProcessRight.ProcessCreate as UInt32) >= (1 << 8),
-              "kind-specific right ProcessCreate must start at bit 8 or above")
 static_assert((ProcessRight.Start as UInt32) >= (1 << 8),
               "kind-specific right Start must start at bit 8 or above")
 static_assert((ProcessRight.BootHandles as UInt32) >= (1 << 8),
@@ -555,11 +573,12 @@ static_assert((TimerRight.Wait as UInt32) >= (1 << 8),
 /// a region is exactly the kind of thing a launcher hands to a child — and
 /// `Manage` is the derive bit unit 4's pools and sub-ranges will spend. Neither
 /// is READ by anything in this unit: `process_create`'s authority is
-/// `ProcessRight.ProcessCreate` on the CALLER's own Process handle, and the two
-/// Memory handles are its ARGUMENTS rather than a second authority (see the op
-/// body). They are minted now rather than withheld because attenuation is
-/// monotonic: a bit not minted at boot could never appear later, and both are
-/// bits the boot region roots must have for units 3 and 4 to be additive.
+/// `SystemRight.ProcessCreate` on the caller's System handle (design 2's
+/// RIDER), and the two Memory handles are its ARGUMENTS rather than a second
+/// authority (see the op body). They are minted now rather than withheld
+/// because attenuation is monotonic: a bit not minted at boot could never
+/// appear later, and both are bits the boot region roots must have for units 3
+/// and 4 to be additive.
 ///
 /// There is deliberately NO `Read`/`Write` pair. Those are properties of a
 /// MAPPING (§2.5's `map(access:)`), not of the region, and inventing them here
@@ -592,11 +611,18 @@ static_assert((MemoryRight.Manage as UInt32) == (1 << 1),
 /// through a handle already held (§3's derivation rule) instead of through a
 /// register the kernel had to widen.
 ///
+/// `ProcessCreate` joins in M3 unit 2, by design 2's RIDER (Aug 29): processes
+/// are minted by the SYSTEM, so root's authority to launch is a bit on the one
+/// handle the entry register carries. A launcher handed a System handle without
+/// it cannot spawn — which, with a root/launcher topology, is the only place
+/// that refusal could have been made to mean anything.
+///
 /// Attenuation is monotonic, so a right withheld here can never appear later —
 /// which is the right default for a set the boot handle hands out.
 public func root_system_rights() -> UInt32 {
     ((SystemRight.Debug as UInt32) | (SystemRight.Shutdown as UInt32)
-     | (SystemRight.Manage as UInt32) | (SystemRight.ClockGet as UInt32))
+     | (SystemRight.Manage as UInt32) | (SystemRight.ClockGet as UInt32)
+     | (SystemRight.ProcessCreate as UInt32))
 }
 
 /// What the kernel mints for root's own Process handle (§12, extended by
@@ -611,20 +637,21 @@ public func root_system_rights() -> UInt32 {
 /// (it launches the drivers), and everything root spawns that is not one gets a
 /// handle without it, which is §3's monotonic attenuation with nothing new
 /// added to make it work.
-/// `ProcessCreate` and `BootHandles` join in M3 unit 2, and `Start` does NOT —
-/// which is the two-phase lifecycle showing through the rights word. `Start` is
-/// a right on the handle of the process being started, and nobody starts root:
-/// the kernel does, by entering user mode. Root receives a child's handle
-/// carrying `Start` from `process_create` (see `child_process_rights`), so the
-/// authority to run a child arrives WITH the child rather than being held in
-/// advance.
+/// `BootHandles` joins in M3 unit 2, and `Start` does NOT — which is the
+/// two-phase lifecycle showing through the rights word. `Start` is a right on
+/// the handle of the process being started, and nobody starts root: the kernel
+/// does, by entering user mode. Root receives a child's handle carrying `Start`
+/// from `process_create` (see `child_process_rights`), so the authority to run
+/// a child arrives WITH the child rather than being held in advance.
+/// The authority to CREATE one is not here at all: design 2's RIDER moved it to
+/// `root_system_rights` above, because a process is a machine-wide resource and
+/// only the System object is machine-wide.
 public func root_process_rights() -> UInt32 {
     ((ProcessRight.Manage as UInt32) | (ProcessRight.ThreadCreate as UInt32)
      | (ProcessRight.Exit as UInt32) | (ProcessRight.Wait as UInt32)
      | (ProcessRight.EventCreate as UInt32)
      | (ProcessRight.WaiterCreate as UInt32)
      | (ProcessRight.InterruptBind as UInt32)
-     | (ProcessRight.ProcessCreate as UInt32)
      | (ProcessRight.BootHandles as UInt32))
 }
 
@@ -732,11 +759,22 @@ public func timer_rights() -> UInt32 {
 /// machine, so two handles to it would be two names for one thing, which §3's
 /// no-duplicate rule exists to prevent; and an op that cannot allocate on
 /// repetition needs no quota row when quotas land.
+///
+/// `ProcessCreate` is the fifth, and it is THE ONE FACTORY ON THIS OBJECT —
+/// placed here by the Aug-29 user ruling recorded as sawos design 2's RIDER:
+/// process-scoped objects are minted by your Process; PROCESSES ARE MINTED BY
+/// THE SYSTEM. A process table is machine-global and bounded by machine facts,
+/// so a refusal to create one is a SYSTEM answer, while threads, events,
+/// waiters and timers stay their process's own. `ProcessSelf` in this same
+/// table is the precedent: a Process handle has always been something you ask
+/// the System object for. It is gated on `SystemRight.ProcessCreate`; its
+/// ARGUMENTS are two Memory handles, which spend no right of their own.
 public enum SystemOp: UInt {
     case DebugPrint = 0,
     case Shutdown = 1,
     case ProcessSelf = 2,
     case ClockGet = 3,
+    case ProcessCreate = 4,
 }
 
 // =============================================================================
@@ -753,12 +791,19 @@ public enum SystemOp: UInt {
 /// Process the enforcement point. (M2 resolves nothing — D3 keeps the map a
 /// loader artifact — but the op is already in the place that will.)
 ///
-/// **THE OBJECT IS BOTH A FACTORY AND A RECEIVER, and this table now shows it**
-/// (sawos design 2 D-4). `ProcessCreate` is asked of the CALLER's own Process
-/// handle — creation authority is a rights bit on Process (§12) — while `Start`
-/// is asked of the CHILD's, which is why it keeps the bare verb under the
-/// Aug-17 naming rule: the receiver IS the process being started. Reading the
-/// two side by side is reading the two-phase lifecycle.
+/// **`Start` IS A RECEIVER OP**, which is why it keeps the bare verb under the
+/// Aug-17 naming rule: the receiver IS the process being started, so it is asked
+/// of the CHILD's handle and gated on `ProcessRight.Start`. Its other half, the
+/// creation that produced that child, is NOT in this table — sawos design 2's
+/// RIDER (Aug 29) moved `ProcessCreate` to `SystemOp`, since a process is a
+/// machine-wide resource and only the System object is machine-wide. Reading the
+/// two-phase lifecycle is now reading one op on each object, which is what the
+/// ruling says the phases always were.
+///
+/// `Start` and `BootHandleNext` RENUMBERED DOWN into the hole `ProcessCreate`
+/// left, from 8/9 to 7/8. That is legal because `kernel/sysapi` is vDSO
+/// discipline: an op NUMBER is not ABI, userspace names the case and this module
+/// supplies the value, and the two are compiled into one image together.
 ///
 /// `BootHandleNext` is unit 3's iterator, arriving early because root is its
 /// first consumer: the boot set still enters user mode ONE handle wide (§12),
@@ -774,9 +819,8 @@ public enum ProcessOp: UInt {
     case EventCreate = 4,
     case WaiterCreate = 5,
     case InterruptBind = 6,
-    case ProcessCreate = 7,
-    case Start = 8,
-    case BootHandleNext = 9,
+    case Start = 7,
+    case BootHandleNext = 8,
 }
 
 // =============================================================================

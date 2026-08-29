@@ -41,8 +41,8 @@ names provisional):
 | `Waiter` | Generic wait aggregator (epoll/Port-style) — see §2.2 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Add`/`Remove`/`Wait`, rights `WaiterRight.Attach`/`.Wait`, the wait answer a copy-out record. |
 | `MemoryObject` | Physical memory (RAM or device MMIO). Ownership/authority over the pages; mappable, sendable — see §2.3 (ratified Jul 29). |
 | `Mapping` | An installed virtual placement of a MemoryObject; distinct object, own handle; only it can unmap — see §2.3. |
-| `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. BUILT M2 (design 178 unit 2), one process: ops `ThreadCreate`/`ThreadSelf`/`Exit`/`GetStatus` plus the three factory ops `EventCreate`/`WaiterCreate`/`InterruptBind`, each on its own right. BUILT M3 unit 2 (sawos design 2), **TWO processes**: `ProcessCreate` (on the caller's own handle, `ProcessRight.ProcessCreate`) takes an image region and a destination region and returns an INERT process; `Start` (on the CHILD's handle, `ProcessRight.Start`) mints its first thread and runs it; `BootHandleNext` (`ProcessRight.BootHandles`) drains §12's boot set one record at a time. The child's handle carries `Start | Wait | Manage` and nothing else — everything a process may do to ITSELF is withheld from its creator. The TEARDOWN now forks (§8): process 0 stops the machine, any other reschedules. `kill` (§8) still has no op. |
-| `System` | Kernel singleton (ratified Aug 5): the object behind system-scoped primitives so that EVERY syscall is an object op (§5.7) — v1 ops `debug_print`, `shutdown(status)` (stop the machine; QEMU: sifive_test), rights-gated (`SystemRight.Debug`/`.Shutdown`, §3 scoped rights). Root receives its handle at boot (§12). `exit` is NOT here — process exit belongs to the Process object when it exists (ratified Aug 5). M2 added a third op, `process_self` on `SystemRight.Manage` (design 178 unit 2): §3's derivation rule made real, so the boot register stays ONE handle wide and a process obtains its Process object THROUGH the System handle rather than being handed it. Later candidates: info queries. |
+| `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. BUILT M2 (design 178 unit 2), one process: ops `ThreadCreate`/`ThreadSelf`/`Exit`/`GetStatus` plus the three factory ops `EventCreate`/`WaiterCreate`/`InterruptBind`, each on its own right. BUILT M3 unit 2 (sawos design 2), **TWO processes**: `Start` (on the CHILD's handle, `ProcessRight.Start`) mints the first thread of a created process and runs it; `BootHandleNext` (`ProcessRight.BootHandles`) drains §12's boot set one record at a time. The CREATE half of that lifecycle is not an op on this object — design 2's RIDER (Aug 29) puts `ProcessCreate` on System, because a process is a machine-wide resource (§12's amended creation-authority note). The child's handle carries `Start | Wait | Manage` and nothing else — everything a process may do to ITSELF is withheld from its creator. The TEARDOWN now forks (§8): process 0 stops the machine, any other reschedules. `kill` (§8) still has no op. |
+| `System` | Kernel singleton (ratified Aug 5): the object behind system-scoped primitives so that EVERY syscall is an object op (§5.7) — v1 ops `debug_print`, `shutdown(status)` (stop the machine; QEMU: sifive_test), rights-gated (`SystemRight.Debug`/`.Shutdown`, §3 scoped rights). Root receives its handle at boot (§12). `exit` is NOT here — process exit belongs to the Process object when it exists (ratified Aug 5). M2 added a third op, `process_self` on `SystemRight.Manage` (design 178 unit 2): §3's derivation rule made real, so the boot register stays ONE handle wide and a process obtains its Process object THROUGH the System handle rather than being handed it. M3 added `clock_get` on `SystemRight.ClockGet` (design 232 unit 1: time is a granted capability) and, by sawos design 2's RIDER (Aug 29), `process_create` on `SystemRight.ProcessCreate` — the object's one FACTORY, here because a process is machine-wide and only this object is (§12's amended creation-authority note); `process_self` was already the precedent, since a Process handle has always come out of this object. Later candidates: info queries. |
 
 **Nine of these kinds exist today** — System, Process, Thread, Event, Waiter,
 Interrupt, Clock, Timer and (since M3 unit 2) MemoryObject in its first slice
@@ -783,8 +783,9 @@ SMP-era work builds.
 
 **BUILT M3 unit 2 — THE SECOND ADDRESS SPACE** (sawos design 2). Process
 creation is real, and the lifecycle it is built on is the one ruled Aug 16:
-**TWO PHASES, INERT UNTIL STARTED.** `ProcessOp.ProcessCreate` (on the
-CALLER's own Process handle, gated by `ProcessRight.ProcessCreate`) takes two
+**TWO PHASES, INERT UNTIL STARTED.** `SystemOp.ProcessCreate` (on the caller's
+SYSTEM handle, gated by `SystemRight.ProcessCreate` — the Aug-29 receiver ruling
+amended into §12: processes are minted by the System) takes two
 Memory regions — a read-only image blob and the child's destination RAM — and
 returns a process with an address space, a recorded entry and stack, and NO
 THREAD. `ProcessOp.Start` (on the CHILD's handle, gated by
@@ -1450,6 +1451,25 @@ event-driven EDGE of a process gets a second, distinct construct:
   no business creating. A quota stays ADDITIVE: a field on the process
   slot, checked where `NoResource` is returned today, and design 232
   unit 5.
+  **AMENDED Aug 29 (user ruling; sawos design 2's RIDER) — THE M2 ANSWER
+  STANDS FOR PROCESS-SCOPED OBJECTS, AND A PROCESS IS NOT ONE OF THEM.**
+  The sharpened line: process-scoped objects are minted by your Process;
+  PROCESSES ARE MINTED BY THE SYSTEM. Threads, Events, Waiters, Timers
+  and Interrupts are a process's own — charged to its slab slots, its
+  handle table and its teardown — so their creation stays a rights bit on
+  the Process object exactly as ruled in M2. The process TABLE is a
+  machine-global resource bounded by machine facts (the slab, the
+  protection-domain reloads, ASIDs when Profile B grows real
+  translation), so its refusals and its limits are SYSTEM answers:
+  `process_create` is `SystemOp.ProcessCreate` gated on
+  `SystemRight.ProcessCreate`, and `SystemOp.ProcessSelf` was already the
+  precedent — Process handles have always come from System, and now they
+  all do. Two arguments carried the ruling. The topology one is the
+  sharper: with a root/launcher creating every process, a creation right
+  on the CALLER's own Process handle gates nothing real, and creator-pays
+  accounting through the caller's slot would attribute everything to
+  root — so attribution in that world is ASSIGNED BY POLICY (unit 5's
+  quota vocabulary), not derived from who called.
 - **Loader-above-boot.** The kernel loads exactly ONE image ever: root
   (sosimg, §6). Every later process is loaded BY ROOT from images root
   obtains itself (e.g. a flash MemoryObject it holds), via LAUNCH +

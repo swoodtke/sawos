@@ -243,6 +243,27 @@ public func sos_system_process_self(handle: UInt,
     sos_syscall3(handle, SystemOp.ProcessSelf as UInt, 0, 0, 0, value_out)
 }
 
+/// Load the image in region `image` into region `memory` and answer with a
+/// handle to the new, INERT process. Requires `SystemRight.ProcessCreate` on
+/// the caller's SYSTEM handle — processes are minted by the System (sawos
+/// design 2's RIDER, ruled Aug 29).
+///
+/// Both arguments are Memory handles — the read-only source blob and the
+/// child's destination RAM. The kernel copies each segment to its link address
+/// inside `memory` and grants a stack at that region's top; the caller supplies
+/// no addresses at all.
+///
+/// A malformed image is `SosStatus.BadImage` — a VALUE, not a fault — because
+/// image bytes are data the caller was handed rather than something it wrote.
+/// A handle that names nothing, or names something that is not a Memory, IS a
+/// fault: the caller chose which handles to pass.
+@export("sos_system_process_create")
+public func sos_system_process_create(handle: UInt, image: UInt, memory: UInt,
+                                      value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, SystemOp.ProcessCreate as UInt, image, memory, 0,
+                 value_out)
+}
+
 /// Make a thread in this process, ready to start. Requires
 /// `ProcessRight.ThreadCreate`. `entry` may be `ENTRY_IMAGE`.
 @export("sos_process_thread_create")
@@ -336,26 +357,6 @@ public func sos_process_interrupt_bind(handle: UInt, line: UInt,
 @export("sos_interrupt_ack")
 public func sos_interrupt_ack(handle: UInt) -> UInt {
     sos_syscall1(handle, InterruptOp.Ack as UInt, 0)
-}
-
-/// Load the image in region `image` into region `memory` and answer with a
-/// handle to the new, INERT process. Requires `ProcessRight.ProcessCreate` on
-/// the caller's own Process handle.
-///
-/// Both arguments are Memory handles — the read-only source blob and the
-/// child's destination RAM. The kernel copies each segment to its link address
-/// inside `memory` and grants a stack at that region's top; the caller supplies
-/// no addresses at all.
-///
-/// A malformed image is `SosStatus.BadImage` — a VALUE, not a fault — because
-/// image bytes are data the caller was handed rather than something it wrote.
-/// A handle that names nothing, or names something that is not a Memory, IS a
-/// fault: the caller chose which handles to pass.
-@export("sos_process_process_create")
-public func sos_process_process_create(handle: UInt, image: UInt, memory: UInt,
-                                       value_out: UnsafePointer<UInt>) unsafe -> UInt {
-    sos_syscall3(handle, ProcessOp.ProcessCreate as UInt, image, memory, 0,
-                 value_out)
 }
 
 /// Run a created process: mint its first thread at the recorded entry, on the
@@ -582,6 +583,49 @@ extension System {
         return Process(handle: ProcessHandle(raw))
     }
 
+    /// **PHASE ONE OF THE TWO-PHASE LIFECYCLE**: load `image` into `memory` and
+    /// answer with a process that exists and is not running. Requires
+    /// `SystemRight.ProcessCreate`.
+    ///
+    /// **IT IS ASKED OF THE SYSTEM OBJECT**, and that is the Aug-29 user ruling
+    /// recorded as sawos design 2's RIDER: process-scoped objects are minted by
+    /// your Process; PROCESSES ARE MINTED BY THE SYSTEM. A process table is a
+    /// machine-global resource bounded by machine facts, so its refusals are
+    /// System answers — and `process_self` directly above is the precedent,
+    /// since a Process handle has always come out of this object. It sat on
+    /// `Process` through unit 2; the move costs a caller one word at the
+    /// receiver and nothing else.
+    ///
+    /// THE CALLER SUPPLIES CAPABILITIES AND NO NUMBERS. `image` is the
+    /// read-only region holding a process image; `memory` is the RAM the child
+    /// will run in. The kernel copies each segment to the address the image was
+    /// LINKED at, checks that every one of them lands inside `memory`, and
+    /// grants a stack at that region's top — so where the child's stack is, and
+    /// how big, is the kernel's answer rather than the launcher's. That is the
+    /// same rule the kernel applies to itself when it loads root.
+    ///
+    /// WHAT COMES BACK IS INERT: an address space, an entry and a stack
+    /// recorded, and NO THREAD. Nothing runs until `Process.start()`, which is
+    /// what makes "hand the child its handles, then run it" expressible without
+    /// inventing any synchronization — the start call IS the barrier.
+    ///
+    /// **A MALFORMED IMAGE IS `SosStatus.BadImage`, A VALUE** — not a fault.
+    /// Image bytes are DATA the launcher was handed, and a launcher that cannot
+    /// report a bad image cannot launch anything else either. What IS a fault is
+    /// passing a handle that names nothing or names something that is not a
+    /// region: the caller chose which handles to pass. A full process table or
+    /// handle table comes back as `SosStatus.NoResource`.
+    ///
+    /// The two regions must be DISJOINT, which also means the same region
+    /// cannot serve as both. Nothing is copied until every check has passed, so
+    /// a refusal leaves `memory` exactly as it was.
+    public func process_create(&self, image: &Memory,
+                               memory: &Memory) -> Result<Process, SosStatus> {
+        let raw = try call_value(self.handle, SystemOp.ProcessCreate as UInt,
+                                 image.handle, memory.handle, 0)
+        return Process(handle: ProcessHandle(raw))
+    }
+
     /// This process's Clock for `type` — a GRANTED TIME SOURCE. Requires
     /// `SystemRight.ClockGet`.
     ///
@@ -737,40 +781,6 @@ extension Process {
         return Interrupt(handle: InterruptHandle(raw))
     }
 
-    /// **PHASE ONE OF THE TWO-PHASE LIFECYCLE**: load `image` into `memory` and
-    /// answer with a process that exists and is not running. Requires
-    /// `ProcessRight.ProcessCreate` on the caller's OWN Process handle.
-    ///
-    /// THE CALLER SUPPLIES CAPABILITIES AND NO NUMBERS. `image` is the
-    /// read-only region holding a process image; `memory` is the RAM the child
-    /// will run in. The kernel copies each segment to the address the image was
-    /// LINKED at, checks that every one of them lands inside `memory`, and
-    /// grants a stack at that region's top — so where the child's stack is, and
-    /// how big, is the kernel's answer rather than the launcher's. That is the
-    /// same rule the kernel applies to itself when it loads root.
-    ///
-    /// WHAT COMES BACK IS INERT: an address space, an entry and a stack
-    /// recorded, and NO THREAD. Nothing runs until `start()`, which is what
-    /// makes "hand the child its handles, then run it" expressible without
-    /// inventing any synchronization — the start call IS the barrier.
-    ///
-    /// **A MALFORMED IMAGE IS `SosStatus.BadImage`, A VALUE** — not a fault.
-    /// Image bytes are DATA the launcher was handed, and a launcher that cannot
-    /// report a bad image cannot launch anything else either. What IS a fault is
-    /// passing a handle that names nothing or names something that is not a
-    /// region: the caller chose which handles to pass. A full process table or
-    /// handle table comes back as `SosStatus.NoResource`.
-    ///
-    /// The two regions must be DISJOINT, which also means the same region
-    /// cannot serve as both. Nothing is copied until every check has passed, so
-    /// a refusal leaves `memory` exactly as it was.
-    public func process_create(&self, image: &Memory,
-                               memory: &Memory) -> Result<Process, SosStatus> {
-        let raw = try call_value(self.handle, ProcessOp.ProcessCreate as UInt,
-                                 image.handle, memory.handle, 0)
-        return Process(handle: ProcessHandle(raw))
-    }
-
     /// **PHASE TWO**: run this process. Requires `ProcessRight.Start`, which is
     /// a right on the CHILD's handle — the one `process_create` handed back.
     ///
@@ -820,7 +830,7 @@ extension Process {
 ///
 /// THE FIRST SLICE OF §2.5's OBJECT, and its whole v1 surface is being NAMED:
 /// a process receives regions at boot through `Process.boot_handle_next` and
-/// passes them to `Process.process_create`. There is no `map()`, no `alloc()`,
+/// passes them to `System.process_create`. There is no `map()`, no `alloc()`,
 /// no sub-range and no way to read the bounds — a region is authority over
 /// bytes, not a description of them. Unit 4 is where pools, derivation,
 /// mapping and memory types arrive; nothing here forecloses any of it.

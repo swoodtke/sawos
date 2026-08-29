@@ -181,13 +181,17 @@ import kcore.sched.{
 /// AN UNKNOWN OP AND A MISSING RIGHT BOTH TERMINATE THE PROCESS (design 178's
 /// faults ruling). Both are mistakes the caller could have checked: it chose
 /// the number, and it knows which rights it holds.
-func system_op(raw_op: UInt, obj: &SystemObject, arg0: UInt) unsafe -> SyscallResult {
+///
+/// `arg1` arrives because `ProcessCreate` takes two Memory handles (design 2's
+/// RIDER). Every other System op reads `arg0` alone, exactly as before.
+func system_op(raw_op: UInt, obj: &SystemObject,
+               arg0: UInt, arg1: UInt) unsafe -> SyscallResult {
     let p = calling_process()
     guard let op = SystemOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
-    return system_op_decoded(op, &obj, arg0, p)
+    return system_op_decoded(op, &obj, arg0, arg1, p)
 }
 
-func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt,
+func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt, arg1: UInt,
                        p: Int) unsafe -> SyscallResult {
     match op {
         // The rights check is per-OP, not per-object: holding the System
@@ -234,6 +238,23 @@ func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt,
                 fault_process(p, FaultReason.AccessDenied)
             }
             clock_get(p, arg0)
+        },
+        // PHASE ONE OF THE TWO-PHASE LIFECYCLE (sawos design 2 D-4; the
+        // RECEIVER ruled Aug 29 by design 2's RIDER). It is asked of the
+        // SYSTEM object, because a process is a machine-wide resource:
+        // process-scoped objects are minted by your Process, and PROCESSES ARE
+        // MINTED BY THE SYSTEM. `ProcessSelf` above is the precedent — a
+        // Process handle has always come out of this object.
+        //
+        // It is the first System op to read a SECOND argument, which is why
+        // this decoder takes `arg1` at all. Both are Memory HANDLES, and they
+        // spend no `MemoryRight` of their own — they are the operation's
+        // arguments, not a second authority (see `memory_arg`).
+        case ProcessCreate -> {
+            if not obj.allows(SystemRight.ProcessCreate) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            process_create(p, arg0, arg1)
         },
     }
 }
@@ -386,21 +407,14 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             }
             interrupt_bind(obj.slot, arg0)
         },
-        // PHASE ONE OF THE TWO-PHASE LIFECYCLE (sawos design 2 D-4; ruled
-        // Aug 16). It is asked of the CALLER's own Process handle, because
-        // creation authority is a rights bit on Process (§12) — the same shape
-        // `EventCreate` and `WaiterCreate` already have.
-        case ProcessCreate -> {
-            if not obj.allows(ProcessRight.ProcessCreate) {
-                fault_process(p, FaultReason.AccessDenied)
-            }
-            process_create(p, arg0, arg1)
-        },
-        // PHASE TWO, and it is asked of the CHILD's handle — `obj.slot` is the
-        // process being started, not the caller. That is what the bare verb in
-        // the op's name says (the receiver IS the object), and it is why the
-        // right is minted on the handle `process_create` hands back rather than
-        // held by the launcher in advance.
+        // PHASE TWO of the two-phase lifecycle, and it is asked of the CHILD's
+        // handle — `obj.slot` is the process being started, not the caller. That
+        // is what the bare verb in the op's name says (the receiver IS the
+        // object), and it is why the right is minted on the handle
+        // `process_create` hands back rather than held by the launcher in
+        // advance. PHASE ONE is `SystemOp.ProcessCreate`, one object over: a
+        // process is a machine-wide resource, so the System object is what mints
+        // one (sawos design 2's RIDER, ruled Aug 29).
         case Start -> {
             if not obj.allows(ProcessRight.Start) {
                 fault_process(p, FaultReason.AccessDenied)
@@ -433,10 +447,12 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
 /// the BYTES (data, reported), and this function is where it falls.
 ///
 /// NO `MemoryRight` IS SPENT. The authority to create a process is
-/// `ProcessRight.ProcessCreate` on the caller's own Process handle, already
-/// checked; these two are the operation's ARGUMENTS. Unit 3's `give` and unit
-/// 4's `map` are the ops that start asking what a holder may do with a region,
-/// and the wrapper is built to answer them (`MemoryObject.allows`).
+/// `SystemRight.ProcessCreate` on the caller's System handle (design 2's RIDER,
+/// ruled Aug 29), already checked; these two are the operation's ARGUMENTS —
+/// which is exactly why that ruling could move the authority to another object
+/// without touching a line below this comment. Unit 3's `give` and unit 4's
+/// `map` are the ops that start asking what a holder may do with a region, and
+/// the wrapper is built to answer them (`MemoryObject.allows`).
 func memory_arg(p: Int, handle: UInt) unsafe -> Int {
     let entry = lookup_handle(p, handle)
     match entry.obj_type {
@@ -1320,7 +1336,7 @@ func dispatch(handle: UInt, op: UInt,
         case System -> {
             let obj = SystemObject(handle: SystemHandle(handle),
                                    rights: entry.rights)
-            system_op(op, &obj, arg0)
+            system_op(op, &obj, arg0, arg1)
         },
         case Process -> {
             let obj = ProcessObject(handle: ProcessHandle(handle),
