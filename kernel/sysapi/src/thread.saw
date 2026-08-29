@@ -1,0 +1,75 @@
+//! THREAD — a kernel-scheduled execution context in a process (spec §2, §8;
+//! design 178 D4).
+//!
+//! Start it, join it, exit it, yield it: four ops on a handle, and no way to
+//! build one from a word. A `Thread` is MINTED by `Process.thread_create` and
+//! `Process.thread_self`, both of which live above this file, so nothing here
+//! reaches upward.
+
+import sosabi.{SosStatus, ThreadOp, ThreadHandle, NO_HANDLE}
+
+import sos.floor.{call_value, checked, sos_handle_release, sos_thread_exit,
+                  sos_thread_start, sos_thread_yield}
+
+/// A handle to a Thread — a kernel-scheduled execution context in a process.
+///
+/// Saw's own TaskGroups run INSIDE one of these, in userspace; the kernel never
+/// sees a task (spec §2).
+///
+/// Like `Process`, it cannot be built from a word or turned back into one: a
+/// `Thread` comes from `Process.thread_create` or `Process.thread_self` and from
+/// nowhere else. Naming a thread you were never given is therefore not
+/// expressible in this layer — which is the point, and which is why the harness
+/// case that PROVES the kernel rejects such a handle is a hand-written payload
+/// at the raw altitude rather than a program written against this module.
+/// **`NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5).
+/// `Process.thread_self()` mints a fresh instance on every ask, so a thread that
+/// asks twice owns two handles onto itself and may release either.
+public struct Thread {
+    public(package) handle: ThreadHandle,
+}
+
+extension Thread: NoCopy {
+    /// Drop is release; see `System`'s deinit for the sentinel and the discard.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
+}
+
+extension Thread {
+    /// Make a created thread runnable. It runs when the scheduler next picks
+    /// it, which is not necessarily before this call returns. Requires
+    /// `ThreadRight.Start`.
+    public func start(&self) -> Result<Void, SosStatus> {
+        checked(sos_thread_start(self.handle))
+    }
+
+    /// Wait for this thread to exit and take its exit value. Requires
+    /// `ThreadRight.Join`.
+    ///
+    /// An already-exited thread answers immediately; a running one parks the
+    /// caller until it exits. Joining YOURSELF terminates the process — it is a
+    /// wait that could never end, and the caller could have checked.
+    public func join(&self) -> Result<UInt, SosStatus> {
+        call_value(self.handle, ThreadOp.Join as UInt, 0, 0, 0)
+    }
+
+    /// End the CALLING thread with `code`, which whoever joins it receives.
+    /// Does not return. Requires `ThreadRight.Control`, and the handle must
+    /// name the calling thread.
+    public func exit(&self, code: UInt) -> Result<Void, SosStatus> {
+        checked(sos_thread_exit(self.handle, code))
+    }
+
+    /// Give the processor up to the next runnable thread, and go to the back of
+    /// the queue. Requires `ThreadRight.Control` on the caller's own handle.
+    ///
+    /// Named for `std.task`'s `yield_now` so that the kernel-thread spelling
+    /// and the cooperative-task spelling read alike — they are the same idea at
+    /// two scales, and a reader should not have to learn two words.
+    public func yield_now(&self) -> Result<Void, SosStatus> {
+        checked(sos_thread_yield(self.handle))
+    }
+}

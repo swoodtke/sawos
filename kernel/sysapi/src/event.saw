@@ -1,0 +1,66 @@
+//! EVENT — the accumulating non-blocking notification (spec §2.4;
+//! design 178 D5).
+//!
+//! Bits go in through `signal` and come out through `receive`, and a non-zero
+//! word is what "ready" means to a Waiter. The Waiter is the OTHER door onto
+//! the same word and it lives above this file, which is why the attachment
+//! that joins the two is written there.
+
+import sosabi.{SosStatus, EventOp, EventHandle, NO_HANDLE}
+
+import sos.floor.{call_value, checked, sos_event_signal, sos_handle_release}
+
+/// A handle to an Event — the accumulating non-blocking notification.
+///
+/// Bits go in through `signal` and never block; one `receive` takes them all
+/// out and resets the word. A non-zero word is what "ready" means to a Waiter,
+/// which is the only other thing that ever looks at it.
+///
+/// TAKING THE WORD HAS TWO DOORS AND BOTH EMPTY IT: `receive` polls without
+/// parking, and a `Waiter.wait` on this event hands the same word back in its
+/// record and clears it. So a value is delivered exactly once — pick the door by
+/// whether you want to block, not by what you will be told.
+///
+/// Built by `Process.event_create` and by nothing else — no word constructor,
+/// no word extractor, the module docstring's rule.
+/// **`NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5).
+/// Release destroys the HANDLE and never the Event — an event whose last handle
+/// is gone is unreachable-but-live until its process's teardown, which is where
+/// the slab slot comes back. Ending an object for everyone is `close`, which is
+/// M4's and is not this.
+public struct Event {
+    public(package) handle: EventHandle,
+}
+
+extension Event: NoCopy {
+    /// Drop is release; see `System`'s deinit for the sentinel and the discard.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
+}
+
+extension Event {
+    /// Accumulate `bits`. NEVER BLOCKS and never fails for want of room: under
+    /// OR the word saturates by being idempotent, and under counting it
+    /// saturates by refusing to wrap. Requires `EventRight.Signal`.
+    ///
+    /// Signalling ZERO is a no-op that leaves the event exactly as ready as it
+    /// already was — it cannot make one ready, because zero IS "not ready".
+    public func signal(&self, bits: UInt) -> Result<Void, SosStatus> {
+        checked(sos_event_signal(self.handle, bits))
+    }
+
+    /// Drain the accumulated word and reset it to zero, in one operation.
+    /// Answers zero for an event nothing has signalled — it does not park, which
+    /// is the Waiter's job. Requires `EventRight.Receive`.
+    ///
+    /// THE NON-BLOCKING DOOR, and its semantics are exactly what they have
+    /// always been. The other door is a `Waiter.wait` on this event, whose
+    /// record carries the same word and empties it the same way — so calling
+    /// this right after a wake answers zero unless a signal landed in between.
+    public func receive(&self) -> Result<UInt, SosStatus> {
+        call_value(self.handle, EventOp.Receive as UInt, 0, 0, 0)
+    }
+}

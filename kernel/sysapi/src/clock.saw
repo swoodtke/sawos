@@ -1,0 +1,78 @@
+//! CLOCK — a granted time source, and the thing that mints Timers
+//! (spec §2 table; design 232 unit 1).
+//!
+//! It answers two questions and holds no state: what time is it, and give me
+//! something that fires at a time. The second is why it sits above
+//! `sos.timer` — `timer_create` constructs one — and both are why it sits
+//! below `sos.system`, which is where a process is granted the clock at all.
+
+import sosabi.{SosStatus, ClockOp, ClockHandle, TimerHandle, NO_HANDLE,
+               CLOCK_NOW_RECORD_DOUBLEWORDS, CLOCK_NOW_TIME_SLOT,
+               clock_now_record_bytes}
+
+import sos.floor.{call_value, checked, sos_clock_now, sos_handle_release}
+import sos.timer.{Timer}
+
+/// A handle to a Clock — a granted time source.
+///
+/// It answers two questions and holds no state: what time is it, and give me
+/// something that fires at a time. There is no way to SET one — a monotonic
+/// clock that could be set would not be monotonic.
+///
+/// Built by `System.clock_get` and by nothing else — no word constructor, no
+/// word extractor, the module docstring's rule.
+/// **`NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5). A
+/// Clock is kernel-eternal and owned by nobody, so releasing one gives back only
+/// a handle-table entry — and `System.clock_get` mints a fresh handle on every
+/// ask, so a process that dropped its clock simply asks again.
+public struct Clock {
+    public(package) handle: ClockHandle,
+}
+
+extension Clock: NoCopy {
+    /// Drop is release; see `System`'s deinit for the sentinel and the discard.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
+}
+
+extension Clock {
+    /// Nanoseconds on this clock. Requires `ClockRight.Read`.
+    ///
+    /// THE EPOCH IS NOT PUBLISHED and must not be relied on: `Monotonic` counts
+    /// from whenever the machine started counting, so two readings are
+    /// comparable and one reading means nothing on its own. What it guarantees
+    /// is that it never steps and never goes backwards, which is what a
+    /// duration measurement and a timeout both actually need.
+    ///
+    /// THE BUFFER IS THIS FRAME'S and a caller never sees it, exactly as
+    /// `Waiter.wait`'s is: the kernel answers 64 bits through a copy-out record
+    /// because one profile's registers are 32 wide, and supplying the bytes
+    /// here is what keeps a raw address out of the typed surface.
+    public func now(&self) -> Result<UInt64, SosStatus> {
+        now_into_frame(self.handle)
+    }
+
+    /// Make a Timer that measures against THIS clock, for its whole life.
+    /// Requires `ClockRight.TimerCreate`.
+    ///
+    /// It comes back DISARMED and owing nothing: a Timer is a schedule you have
+    /// not written yet, so attaching one to a Waiter before arming it parks
+    /// rather than reporting. A full timer slab comes back as
+    /// `SosStatus.NoResource`, which the caller could not have known.
+    public func timer_create(&self) -> Result<Timer, SosStatus> {
+        let raw = try call_value(self.handle, ClockOp.TimerCreate as UInt, 0, 0, 0)
+        return Timer(handle: TimerHandle(raw))
+    }
+}
+
+/// The `unsafe` half of `Clock.now`, confined to one small named helper
+/// (design 136). The buffer's address never leaves it.
+func now_into_frame(handle: ClockHandle) unsafe -> Result<UInt64, SosStatus> {
+    var buf: [UInt64; CLOCK_NOW_RECORD_DOUBLEWORDS] = [0; CLOCK_NOW_RECORD_DOUBLEWORDS]
+    try checked(sos_clock_now(handle, (&var buf) as UnsafePointer<UInt64>,
+                              clock_now_record_bytes() as UInt))
+    return buf[CLOCK_NOW_TIME_SLOT]
+}

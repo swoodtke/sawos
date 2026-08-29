@@ -1,0 +1,724 @@
+//! SYSTEM, PROCESS, AND THE BOOT-SET RECORD — the authority objects, and the
+//! one module in this package that holds more than one of them.
+//!
+//! THE THREE CANNOT BE SEPARATED, and that is design 5's one structural
+//! finding rather than a placement choice. Every pair of them names the other:
+//!
+//!   - `System.process_self` and `System.process_create` CONSTRUCT a
+//!     `Process`, so System is above Process;
+//!   - `Process.give(system:)` takes a `System` BY VALUE — the courier funnel
+//!     the launch flow turns on (sawos design 4 D-4) — so Process is above
+//!     System;
+//!   - `BootHandle` carries a `Memory?`, a `Process?` AND a `System?`, and
+//!     `Process.boot_handle_next` answers with one, so the record is above all
+//!     three and below Process at the same time.
+//!
+//! An import cycle is a compile error naming the loop (DF-232e) and a type's
+//! extension methods must sit in the module that DECLARES the type — a
+//! re-export widens no extension scope (design 142/229) — so there is no
+//! spelling in today's Saw that puts these in three files. They are one
+//! module, and the sections below keep the three seams visibly apart.
+//!
+//! Everything else this file names is BELOW it: the floor's raw seams, the
+//! region, and the five objects a Process mints.
+
+import sosabi.{SosStatus, SystemOp, ProcessOp, MINT_OP,
+               SystemHandle, ProcessHandle, ThreadHandle, EventHandle,
+               WaiterHandle, InterruptHandle, ClockHandle, MemoryHandle,
+               NO_HANDLE, BootTagForm, EventMode, ClockType, BootHandleKind,
+               BOOT_HANDLE_RECORD_WORDS, BOOT_HANDLE_TAG_WORD,
+               BOOT_HANDLE_KIND_WORD, BOOT_HANDLE_HANDLE_WORD,
+               boot_handle_record_bytes}
+
+// And the `sosabi.` qualifier, for the one encoding this module names WITHOUT
+// binding bare: `sosabi.ENTRY_IMAGE`, the sentinel a process passes when it has
+// no way to compute an entry address (see `thread_create` below). Since
+// DF-247b's amendment to design 150 a selective import binds its list and no
+// qualifier, so the reach is written rather than inherited — which is the
+// point: this line is what says the module depends on more of `sosabi` than
+// the braces above list. It is an ORDINARY import, so it re-exports nothing and
+// the vDSO wall above is unchanged.
+import sosabi
+
+// The scalar-to-console-byte rule, shared with the kernel's own console so the
+// two cannot disagree about what a non-ASCII scalar becomes.
+import sosrt.{ascii_byte}
+
+import sos.floor.{ALL_RIGHTS, call_value, checked, park_system_handle,
+                  sos_handle_release, sos_process_boot_handle_next,
+                  sos_process_exit, sos_process_give, sos_process_start,
+                  sos_system_debug_print, sos_system_shutdown}
+import sos.memory.{Memory}
+// QUALIFIED, ALONE AMONG THE NINE: `std.task` publishes a prelude
+// `Thread<T>`, and a bare imported `Thread` ties with it where a locally
+// DECLARED one used to win — which is what the split turned this name into.
+// `thread.Thread` says which, at the five places `Process` names one; the
+// facade re-exports the bare spelling a process writes, unchanged.
+import sos.thread
+import sos.event.{Event}
+import sos.interrupt.{Interrupt}
+import sos.clock.{Clock}
+import sos.waiter.{Waiter}
+
+// =============================================================================
+// System (spec §12; sawos design 3 D-5)
+// =============================================================================
+
+/// A handle to the kernel's System object — in M1 the whole of a process's
+/// authority (§12's boot handle set, one handle wide today).
+///
+/// The field is a `SystemHandle`, not a `UInt`: one kind of handle cannot be
+/// built from a raw word or from another kind's handle, so handle-kind
+/// confusion is not expressible here even before the ops are considered. It
+/// still costs nothing — the alias flows to `UInt` implicitly at the stub, so
+/// the calls below pass `self.handle` with no cast and no conversion is emitted.
+///
+/// **IT IS `NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5),
+/// which is the OWNING tier this docstring used to promise for "§4" — it is
+/// built. A `System` is a capability instance, not a description of one, so it
+/// cannot be duplicated and its scope is its life.
+///
+/// **ROOT'S OWN `System` NORMALLY DIES IN THE KERNEL'S TEARDOWN, not here**, and
+/// that is not an oversight: a root server's last act is `shutdown()` or
+/// `exit()`, neither of which returns, so the deinit below is never reached and
+/// the handle is closed by the process teardown along with everything else. The
+/// deinit is what covers the cases that DO fall out of a scope.
+public struct System {
+    handle: SystemHandle,
+}
+
+extension System: NoCopy {
+    /// DROP IS RELEASE. The word field doubles as the disarm flag because
+    /// `NO_HANDLE` cannot name a live handle at any generation; a transfer
+    /// funnel writes it there before handing the word to the kernel, and this
+    /// deinit then has nothing to do.
+    ///
+    /// The status is discarded because there is nobody to report it to — a
+    /// deinit runs at a point no source construct names, so it has no error
+    /// channel and needs none: the only way this call fails is a word that does
+    /// not resolve, which the kernel answers by ending the process rather than
+    /// by returning.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
+}
+
+extension System {
+    /// Adopt the boot handle the kernel passed in the first argument register.
+    ///
+    /// The parameter is a raw `UInt` because that is what a register holds and
+    /// what the ABI specifies; this is one of the two places in the system that
+    /// crosses INTO a handle type (the other is the kernel's dispatch, after
+    /// the table has resolved it). Crossing at CREATION is what the explicit
+    /// construction is for.
+    ///
+    /// **EVERY PROCESS COMES THROUGH HERE SINCE M3 UNIT 3, not just root** (the
+    /// Aug-29 rulings; §12's symmetry). Root's word is the one the kernel minted
+    /// at boot; a child's is a MASKED SIBLING its launcher minted and gave under
+    /// the tag it was started with. Neither can tell the difference, and neither
+    /// needs to: what a process may do with the handle is the rights word, and
+    /// where it came from is the launcher's business. From here both bootstrap
+    /// identically — derive the Process object, drain the boot set.
+    ///
+    /// A word arriving here is one the KERNEL RESOLVED, never one anybody
+    /// guessed, and it can be adopted at most once: `start(boot_tag:)` CONSUMES
+    /// the record it resolved, so the drain can never hand the same word back a
+    /// second time and there is no way to end up with two wrappers over one
+    /// handle. An earlier cut of this unit had to document that hazard instead;
+    /// the ruling made it unrepresentable.
+    public init(boot_handle: UInt) -> System {
+        // The runtime's panic path prints through this same handle, so it has
+        // to be parked where the seams below can reach it before any Saw code
+        // can fail.
+        park_system_handle(boot_handle)
+        System(handle: SystemHandle(boot_handle))
+    }
+
+    /// **MINT A SIBLING of this System handle, narrowed by a KEEP MASK** — the
+    /// universal `MINT_OP` (the Aug-29 user rulings on design 4). Requires the
+    /// universal `SystemRight.Mint` on THIS handle.
+    ///
+    /// `rights` is what the sibling may KEEP: its rights are this handle's
+    /// INTERSECTED with the mask, so the default (all ones) is "the same rights"
+    /// and anything narrower attenuates. Naming a right this handle does not hold
+    /// is a no-op — the intersection makes no-amplification structural rather
+    /// than checked, so there is nothing to fault on and nothing to introspect
+    /// first.
+    ///
+    /// **THIS IS HOW A CHILD GETS A SYSTEM HANDLE**, and the mask is the whole
+    /// of the policy:
+    ///
+    /// ```saw
+    /// let for_child = system.mint(rights: SystemRight.Debug
+    ///                                     | SystemRight.ProcessSelf
+    ///                                     | SystemRight.ClockGet)!
+    /// child.give(system: move for_child, tag: BOOT)
+    /// ```
+    ///
+    /// Everything not named is absent BY SILENCE, which is the polarity ruling:
+    /// a keep mask FAILS CLOSED when a later unit adds a System right, where a
+    /// removal mask would have handed every future capability to every child a
+    /// launcher had ever configured. Write a complement
+    /// (`~(SystemRight.Transfer as UInt32) & 0xFFFF_FFFF`) when subtractive
+    /// intent really is what you mean — the fail-open choice then reads at the
+    /// call site rather than hiding in the op.
+    ///
+    /// **`Mint` IS ITSELF MASKABLE.** A sibling minted through a mask that left
+    /// it out cannot mint again, so proliferation stops exactly where the mask
+    /// says it does.
+    ///
+    /// A full handle table is `SosStatus.NoResource`. A handle without `Mint`
+    /// TERMINATES the caller.
+    public func mint(&self,
+                     rights: UInt32 = ALL_RIGHTS) -> Result<System, SosStatus> {
+        let raw = try call_value(self.handle, MINT_OP, rights as UInt, 0, 0)
+        return System(handle: SystemHandle(raw))
+    }
+
+    /// Write one byte to the debug console.
+    public func debug_print_byte(&self, byte: UInt8) -> Result<Void, SosStatus> {
+        checked(sos_system_debug_print(self.handle, byte as UInt))
+    }
+
+    /// Write an ASCII string. Stops at the FIRST failure and reports it — a
+    /// partial write is surfaced, never swallowed.
+    public func debug_print(&self, msg: String) -> Result<Void, SosStatus> {
+        for scalar in msg.chars() {
+            try self.debug_print_byte(ascii_byte(scalar))
+        }
+        return
+    }
+
+    /// Stop the machine with `status`. Does not return when it succeeds; a
+    /// refusal (no `SystemRight.Shutdown`, say) comes back as an error.
+    public func shutdown(&self, status: UInt) -> Result<Void, SosStatus> {
+        checked(sos_system_shutdown(self.handle, status))
+    }
+
+    /// This process's own Process object (§3's derivation rule: a handle is
+    /// obtained through a handle already held). Requires
+    /// `SystemRight.ProcessSelf`.
+    ///
+    /// **A FRESH HANDLE EVERY TIME** (sawos design 3 D-4), which supersedes this
+    /// method's old "the same handle every time". Calling it twice is two
+    /// capability INSTANCES of one authority, each independently owned and
+    /// independently released — which is what makes the `NoCopy` wrapper an
+    /// owner rather than a name. It amplifies nothing: a mint carries the kind's
+    /// default rights and `SystemRight.ProcessSelf` gates the minting, so a caller
+    /// asking twice ends up with exactly the authority it asked once for.
+    ///
+    /// It can therefore FAIL, where reading a cached word could not: a full
+    /// handle table is `SosStatus.NoResource`.
+    public func process_self(&self) -> Result<Process, SosStatus> {
+        let raw = try call_value(self.handle, SystemOp.ProcessSelf as UInt, 0, 0, 0)
+        return Process(handle: ProcessHandle(raw))
+    }
+
+    /// **PHASE ONE OF THE TWO-PHASE LIFECYCLE**: load `image` into `memory` and
+    /// answer with a process that exists and is not running. Requires
+    /// `SystemRight.ProcessCreate`.
+    ///
+    /// **IT IS ASKED OF THE SYSTEM OBJECT**, and that is the Aug-29 user ruling
+    /// recorded as sawos design 2's RIDER: process-scoped objects are minted by
+    /// your Process; PROCESSES ARE MINTED BY THE SYSTEM. A process table is a
+    /// machine-global resource bounded by machine facts, so its refusals are
+    /// System answers — and `process_self` directly above is the precedent,
+    /// since a Process handle has always come out of this object. It sat on
+    /// `Process` through unit 2; the move costs a caller one word at the
+    /// receiver and nothing else.
+    ///
+    /// THE CALLER SUPPLIES CAPABILITIES AND NO NUMBERS. `image` is the
+    /// read-only region holding a process image; `memory` is the RAM the child
+    /// will run in. The kernel copies each segment to the address the image was
+    /// LINKED at, checks that every one of them lands inside `memory`, and
+    /// grants a stack at that region's top — so where the child's stack is, and
+    /// how big, is the kernel's answer rather than the launcher's. That is the
+    /// same rule the kernel applies to itself when it loads root.
+    ///
+    /// WHAT COMES BACK IS INERT: an address space, an entry and a stack
+    /// recorded, and NO THREAD. Nothing runs until `Process.start()`, which is
+    /// what makes "hand the child its handles, then run it" expressible without
+    /// inventing any synchronization — the start call IS the barrier.
+    ///
+    /// **A MALFORMED IMAGE IS `SosStatus.BadImage`, A VALUE** — not a fault.
+    /// Image bytes are DATA the launcher was handed, and a launcher that cannot
+    /// report a bad image cannot launch anything else either. What IS a fault is
+    /// passing a handle that names nothing or names something that is not a
+    /// region: the caller chose which handles to pass. A full process table or
+    /// handle table comes back as `SosStatus.NoResource`.
+    ///
+    /// The two regions must be DISJOINT, which also means the same region
+    /// cannot serve as both. Nothing is copied until every check has passed, so
+    /// a refusal leaves `memory` exactly as it was.
+    public func process_create(&self, image: &Memory,
+                               memory: &Memory) -> Result<Process, SosStatus> {
+        let raw = try call_value(self.handle, SystemOp.ProcessCreate as UInt,
+                                 image.handle, memory.handle, 0)
+        return Process(handle: ProcessHandle(raw))
+    }
+
+    /// This process's Clock for `type` — a GRANTED TIME SOURCE. Requires
+    /// `SystemRight.ClockGet`.
+    ///
+    /// TIME IS A CAPABILITY HERE, and that is the whole reason this is an op
+    /// rather than a free function. A process that was not granted the right
+    /// cannot read the machine's clock at all — which is what makes handing a
+    /// child a VIRTUAL clock later a substitution with no code change on either
+    /// side: the child asks its System object for a Clock exactly as it does
+    /// now, and what it gets back is somebody else's idea of the time.
+    ///
+    /// **A FRESH HANDLE EVERY TIME onto the one Clock** (sawos design 3 D-4),
+    /// superseding this method's old "the same Clock every time". A machine has
+    /// one monotonic clock and this hands out capability INSTANCES naming it, so
+    /// two asks are two owned handles rather than two names one caller must not
+    /// both drop. It amplifies nothing — `SystemRight.ClockGet` gates the
+    /// minting and every mint carries the kind's default rights — and it makes
+    /// the call fallible on repetition: a full handle table is
+    /// `SosStatus.NoResource`. `ClockType.Monotonic` is the only domain v1
+    /// declares; it counts nanoseconds from an unpublished epoch, never steps
+    /// and never goes backwards, so two readings are comparable and one means
+    /// nothing alone.
+    ///
+    /// The label is `type:` and it is a label, not a declaration: `type` is a
+    /// CONTEXTUAL keyword in Saw (DF-232b), reserved only where an alias
+    /// begins, so the domain is named by the word for it.
+    public func clock_get(&self,
+                          type: ClockType = ClockType.Monotonic) -> Result<Clock, SosStatus> {
+        let raw = try call_value(self.handle, SystemOp.ClockGet as UInt,
+                                 type as UInt, 0, 0)
+        return Clock(handle: ClockHandle(raw))
+    }
+}
+
+// =============================================================================
+// Process (spec §2, §7, §8; design 178 D4)
+// =============================================================================
+
+/// A handle to a Process — an address-space domain, a handle table and threads.
+///
+/// A process reaches its OWN through `System.process_self`. Holding somebody
+/// else's is what supervision will look like when there is somebody else (M3).
+///
+/// THERE IS NO WAY TO BUILD ONE FROM A WORD and no way to get a word back out.
+/// The field is private (design 80), the only constructors are this module's own
+/// op wrappers, and the derivation chain starts at `System(boot_handle:)` — so
+/// a `Process` in hand is one the kernel handed over, not an integer somebody
+/// guessed. See the module docstring's two-layer rule.
+///
+/// **`NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5).
+/// `System.process_self()` MINTS a fresh instance on every ask now, so two calls
+/// give two independently-owned handles rather than two names the caller must
+/// not both drop — which is exactly why mint-per-call and this policy had to
+/// land together.
+///
+/// DROPPING A CHILD'S HANDLE IS HOW ITS SLOT COMES BACK. A dead child's process
+/// slot is held only by the §8 status word somebody might still read, so the
+/// last handle onto it going away is what frees it (design 3 D-3) — which makes
+/// letting a supervisor's `Process` fall out of scope a real reclamation rather
+/// than mere tidiness.
+public struct Process {
+    handle: ProcessHandle,
+}
+
+extension Process: NoCopy {
+    /// Drop is release; see `System`'s deinit for the sentinel and the discard.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
+}
+
+extension Process {
+    /// Make a thread at `entry`, ready to be started. Requires
+    /// `ProcessRight.ThreadCreate`.
+    ///
+    /// The thread runs with `stack_top` as its stack pointer and `arg` in its
+    /// first argument register, and it must NOT return: its link register is
+    /// zero, so returning faults and the fault ends the process (spec §8).
+    ///
+    /// An entry or a stack outside this process TERMINATES it (the faults
+    /// ruling — a process knows where its own memory is). A full thread slab or
+    /// handle table comes back as `SosStatus.NoResource`, which it could not
+    /// have known.
+    public func thread_create(&self, entry: UInt, stack_top: UInt,
+                              arg: UInt) -> Result<thread.Thread, SosStatus> {
+        let raw = try call_value(self.handle, ProcessOp.ThreadCreate as UInt,
+                                 entry, stack_top, arg)
+        return thread.Thread(handle: ThreadHandle(raw))
+    }
+
+    /// Make a thread that starts at this process's own IMAGE ENTRY — the entry
+    /// the kernel took out of the image header — with `arg` in its first
+    /// argument register, so the entry can tell which thread it is running as.
+    ///
+    /// THIS OVERLOAD EXISTS BECAUSE OF A LANGUAGE GAP, and it is worth knowing
+    /// which: Saw cannot name the address of a function (design 172's reason 3,
+    /// DF-172a — `extern` declares functions, an extern function is not usable
+    /// as a value, and `@export` on a static emits a definition). So a process
+    /// written entirely in Saw cannot compute an entry address at all, and this
+    /// is the one entry it can ask for by name. A process with a C leaf that
+    /// CAN produce an address uses the overload above. See DF-178c.
+    public func thread_create(&self, stack_top: UInt,
+                              arg: UInt) -> Result<thread.Thread, SosStatus> {
+        self.thread_create(entry: sosabi.ENTRY_IMAGE, stack_top: stack_top,
+                           arg: arg)
+    }
+
+    /// The CALLING thread's own Thread object. Requires
+    /// `ProcessRight.ThreadSelf`.
+    ///
+    /// This is how a thread reaches the handle it needs to exit or yield: it is
+    /// handed its process, and asks the process which thread it is.
+    public func thread_self(&self) -> Result<thread.Thread, SosStatus> {
+        let raw = try call_value(self.handle, ProcessOp.ThreadSelf as UInt, 0, 0, 0)
+        return thread.Thread(handle: ThreadHandle(raw))
+    }
+
+    /// End this process with `status`. Every thread goes with it and the kernel
+    /// closes every handle it held (spec §2's Process row). Does not return
+    /// when it succeeds. Requires `ProcessRight.Exit`.
+    public func exit(&self, status: UInt) -> Result<Void, SosStatus> {
+        checked(sos_process_exit(self.handle, status))
+    }
+
+    /// This process's §8 status word: kind in the high bits, code in the low
+    /// ones. Requires `ProcessRight.Wait`.
+    public func get_status(&self) -> Result<UInt, SosStatus> {
+        call_value(self.handle, ProcessOp.GetStatus as UInt, 0, 0, 0)
+    }
+
+    /// Make an Event accumulating in `mode` — §2.4's per-Event property, fixed
+    /// for the object's life. Requires `ProcessRight.EventCreate`.
+    ///
+    /// `EventMode.Or` is the flag set, "which of these events occurred since
+    /// last drain", and it is the default because it is the signal use case.
+    /// `EventMode.SaturatingSum` is the counting semaphore, "how many times",
+    /// and it saturates rather than wrapping — so a producer faster than its
+    /// consumer loses count but never rolls back through zero, which is the
+    /// value that means "not ready".
+    ///
+    /// ONE METHOD TAKING THE MODE, not one method per mode (ruled Aug 16,
+    /// user, reversing this module's first answer). A method per mode reads
+    /// fine at two and stops scaling immediately: M3's Mapping brings an access
+    /// mode and a memory type, and a method per combination is a matrix rather
+    /// than a list. The mode is a VALUE the caller chooses, so it is spelled
+    /// as one. See the module docstring for which enums are public API.
+    public func event_create(&self,
+                             mode: EventMode = EventMode.Or) -> Result<Event, SosStatus> {
+        let raw = try call_value(self.handle, ProcessOp.EventCreate as UInt,
+                                 mode as UInt, 0, 0)
+        return Event(handle: EventHandle(raw))
+    }
+
+    /// Make a Waiter — §2.2's generic wait aggregator. Requires
+    /// `ProcessRight.WaiterCreate`.
+    public func waiter_create(&self) -> Result<Waiter, SosStatus> {
+        let raw = try call_value(self.handle, ProcessOp.WaiterCreate as UInt,
+                                 0, 0, 0)
+        return Waiter(handle: WaiterHandle(raw))
+    }
+
+    /// Bind IRQ `line` to an Interrupt — spec §2's row and §9's delivery.
+    /// Requires `ProcessRight.InterruptBind`.
+    ///
+    /// THE LINE IS A NUMBER THE CALLER CHOOSES, so it is spelled as one, which
+    /// is the same rule `event_create`'s mode follows. A driver knows its
+    /// device's line from the device's own description; the kernel checks it
+    /// against the board and TERMINATES the process for a line this machine
+    /// does not have, the timer's line, or one already bound — all three
+    /// caller-checkable, and all three the faults ruling's kind of mistake.
+    ///
+    /// The line comes back UNMASKED, which is §9's starting state: the object
+    /// exists, the controller will deliver, and the first fire masks it until
+    /// an `ack`. What the kernel does NOT touch is the device's own
+    /// interrupt-enable register — that is behind the driver's granted window
+    /// and is the driver's to write.
+    public func interrupt_bind(&self, line: UInt) -> Result<Interrupt, SosStatus> {
+        let raw = try call_value(self.handle, ProcessOp.InterruptBind as UInt,
+                                 line, 0, 0)
+        return Interrupt(handle: InterruptHandle(raw))
+    }
+
+    /// **PHASE TWO**: run this process, handing it NOTHING in its first argument
+    /// register. Requires `ProcessRight.Start`, which is a right on the CHILD's
+    /// handle — the one `process_create` handed back.
+    ///
+    /// It mints the first thread at the entry and stack RECORDED AT CREATE, so
+    /// the caller supplies neither: a launcher never parses an image, and there
+    /// is no address it could get wrong. The thread starts with `NO_HANDLE` in
+    /// its first argument register — a child that was given nothing, or that was
+    /// given handles but no BOOT TAG to find one of them by, is a fully
+    /// sandboxed compute process, which is a FEATURE rather than a state to
+    /// detect.
+    ///
+    /// THE CALLER KEEPS RUNNING. The child becomes runnable and the scheduler
+    /// picks it up, exactly as `Thread.start` does.
+    ///
+    /// **A SECOND `start()` TERMINATES THE CALLER.** It is broken code — the
+    /// caller is the one that started it the first time — so it is a fault on
+    /// the faults ruling's terms rather than a status to branch on. The same
+    /// state word FREEZES THE BOOT SET: a `give` after this call is the same
+    /// fault, which is the ordering the whole launch flow rests on.
+    public func start(&self) -> Result<Void, SosStatus> {
+        checked(sos_process_start(self.handle, BootTagForm.Absent as UInt, 0))
+    }
+
+    /// **PHASE TWO, WITH THE CHILD'S FIRST HANDLE IN ITS FIRST ARGUMENT
+    /// REGISTER** (sawos design 4). The kernel resolves `boot_tag` against this
+    /// process's boot set and puts the CHILD-SIDE word in a0, so
+    /// `_start(boot_handle)` is unchanged from M2 and **the launcher never sees
+    /// a child-relative word at any point**.
+    ///
+    /// That is the whole reason `give` answers with a status alone: the word it
+    /// minted means nothing on this side, and the one place it means anything is
+    /// the register the child wakes up with. The launcher speaks TAGS, which are
+    /// its own words handed back unread — the kernel is a courier, and what a
+    /// tag means is config the launcher and the child agree on.
+    ///
+    /// **THE TAGGED RECORD IS STILL DRAINED.** Resolution consumes nothing, so a
+    /// child that receives its own Process handle in a0 also meets that handle's
+    /// record in its drain. Exactly one wrapper per word is the child's
+    /// obligation there; see `Process(boot_handle:)`.
+    ///
+    /// **A TAG THAT NAMES NO GIVEN RECORD TERMINATES THE CALLER** — config
+    /// error, and the caller wrote both halves of it (the tag it gave and the
+    /// tag it started with). So is a second start, exactly as for `start()`.
+    public func start(&self, boot_tag: UInt) -> Result<Void, SosStatus> {
+        checked(sos_process_start(self.handle, BootTagForm.Present as UInt,
+                                  boot_tag))
+    }
+
+    // -------------------------------------------------------------------------
+    // THE GIVE FUNNELS (sawos design 4 D-4; design 3 D-5's transfer contract)
+    // -------------------------------------------------------------------------
+    //
+    // **ONE FUNNEL PER GIVABLE WRAPPER KIND, each CONSUMING its wrapper.** They
+    // are label-distinguished overloads of one verb — `child.give(memory: move
+    // r, tag: 3)` — because `give` is one operation over one op number and what
+    // varies is only which typed thing is crossing.
+    //
+    // EACH ONE IS THE TRANSFER-FUNNEL CONTRACT, spelled the same way three
+    // times (design 3 D-5): take the wrapper BY VALUE so the caller cannot keep
+    // it, read the word, write `NO_HANDLE` into the field BEFORE the syscall,
+    // and let the disarmed value drop. Disarm-before-syscall is deliberate —
+    // every failure of this syscall is a FAULT, so there is no path on which a
+    // disarmed-but-unsent word leaks — and the local `var` exists only because a
+    // by-value parameter is a `let` and the disarm is a write.
+    //
+    // **TWO FUNNELS AND NOT NINE, and the rights audit is the reason.** A handle
+    // can be given only if its rights word carries the universal `Transfer` bit,
+    // and v1 mints that bit in exactly three places: `memory_rights()` (M3 unit
+    // 2), `process_rights()` (design 4 D-3) and `root_system_rights()` (the
+    // Aug-29 rulings). A Thread, Event, Waiter, Interrupt, Clock or Timer
+    // handle therefore cannot be given at all, and a funnel for one would be a
+    // method whose every call is an `AccessDenied` fault — dead surface, on the
+    // same rule that has `ClockType` declare one domain.
+    //
+    // `give(system:)` IS THE ONE THE LAUNCH FLOW TURNS ON: a launcher mints a
+    // MASKED sibling of its own System handle and gives that, which is how a
+    // child gets a voice, a clock and its own Process handle without getting the
+    // machine's off switch. There is no `give(process:)` because nothing needs
+    // one — a launcher keeps the child's Process handle to supervise WITH, and a
+    // Process handle onto some THIRD process is a supervision hand-off nothing
+    // can hold two of yet. When a unit needs a kind to travel, it rules on that
+    // kind's default set and adds the funnel beside it.
+
+    /// Give a memory REGION to this process under `tag`, consuming the wrapper.
+    /// Requires `ProcessRight.Give` here and `MemoryRight.Transfer` on the
+    /// region — which every boot region carries.
+    public func give(&self, memory: Memory, tag: UInt) -> Result<Void, SosStatus> {
+        var region = move memory
+        let word: UInt = region.handle
+        region.handle = MemoryHandle(NO_HANDLE)
+        return checked(sos_process_give(self.handle, word, tag))
+    }
+
+
+    /// Give a SYSTEM handle to this process under `tag`, consuming the wrapper.
+    ///
+    /// **THIS IS THE ONE THE LAUNCH FLOW TURNS ON.** A launcher does not give
+    /// away the System handle it holds — it MINTS a masked sibling
+    /// (`System.mint(rights:)`) and gives that, so what a child receives was
+    /// narrowed before it left. Pair it with `start(boot_tag:)` naming the same
+    /// tag and the child wakes up holding it, which is how every process in the
+    /// system bootstraps: System in the first argument register, its own Process
+    /// handle derived from it, its boot set drained from there (§12).
+    ///
+    /// The sibling's mask is the whole of the policy. `Debug | ProcessSelf |
+    /// ClockGet` gives a child a voice, an identity and a clock; `Shutdown`,
+    /// `ProcessCreate` and `Mint` are absent BY SILENCE, so the child cannot stop
+    /// the machine, cannot spawn and cannot widen what it holds — a mint's result
+    /// is a subset of its source, so no sequence of ops recovers a masked bit.
+    ///
+    /// **THE MASK MUST KEEP `Transfer`**, because that is the bit this op checks
+    /// on the thing being given: a launcher cannot narrow below the ticket that
+    /// lets the narrowed handle arrive. So a child holds `Transfer` too, which is
+    /// inert today (nothing it can reach is a receiver) and is a recorded finding
+    /// for the unit that gives a child a pipe.
+    public func give(&self, system: System, tag: UInt) -> Result<Void, SosStatus> {
+        var authority = move system
+        let word: UInt = authority.handle
+        authority.handle = SystemHandle(NO_HANDLE)
+        return checked(sos_process_give(self.handle, word, tag))
+    }
+
+    /// Take the next handle out of this process's BOOT SET (spec §12).
+    /// Requires `ProcessRight.BootHandles`.
+    ///
+    /// §12 keeps the boot set ONE HANDLE WIDE at the entry register — the
+    /// System handle — so everything else the kernel minted before the process
+    /// ran is COLLECTED rather than passed. This is that collection, one record
+    /// at a time, and it is what a launcher's first loop looks like.
+    ///
+    /// **EXHAUSTION IS `Err(SosStatus.Drained)` AND IT IS THE LOOP'S EXIT**, not
+    /// a failure to report: a drain ENDS by meeting the end. It stays drained,
+    /// so asking again is safe and answers the same.
+    ///
+    /// Each record carries the REGION ORDINAL it came from. The kernel assigns
+    /// no meaning to that number — which image, which destination, which device
+    /// — because the meaning is the launcher's config, and keeping it there is
+    /// what lets the same kernel serve a hand-built system and a dynamic one.
+    public func boot_handle_next(&self) -> Result<BootHandle, SosStatus> {
+        boot_handle_into_frame(self.handle)
+    }
+}
+
+// =============================================================================
+// The boot set's record (spec §12; sawos design 4 D-4)
+// =============================================================================
+
+/// One entry of a process's BOOT SET, decoded.
+///
+/// It is declared HERE and not in `sosabi` — where `WaitResult` lives — for one
+/// reason: it carries a HANDLE. A wait answer is made of plain words, so one
+/// declaration serves both sides of the trap boundary; a boot handle's whole
+/// point is that what a process receives is a `Memory` and never a number, and
+/// that type is this module's. The three-word WIRE layout is still declared
+/// exactly once, in `sosabi`, which is what the vDSO discipline actually asks.
+///
+/// **EXACTLY ONE WRAPPER PER WORD is the constraint the owning tier puts on this
+/// record** (sawos design 3 D-5), and it is what shaped the two things that
+/// changed here. The record is `NoCopy`, because a copyable record holding a
+/// `Memory` would be two owners of one handle; and the region is an `Optional`
+/// behind `take_memory` rather than a public field, because a `NoCopy` field
+/// cannot be moved OUT of a struct (there are no partial moves in Saw) and a
+/// caller that only ever borrows could never keep the region past the record.
+/// `Optional.take` is exactly the tool for this: it writes `None` into the place
+/// and hands the payload over owned.
+///
+/// A record whose region was never taken RELEASES IT when the record drops,
+/// which is the right default — an iterator entry a launcher looked at and did
+/// not want is a capability it declined.
+///
+/// The rejected alternative, recorded because it is the obvious one: a copyable
+/// record with a `memory()` method minting a wrapper. Two copies would mint two
+/// owners for one word, and the second drop would be a fault the program did
+/// nothing to deserve.
+public struct BootHandle {
+    /// **THE GIVER'S OWN WORD, HANDED BACK UNREAD.** For root's boot set the
+    /// kernel is the giver and this is a REGION ORDINAL — row `n` of the build's
+    /// region table is tag `n`. For a child's set the LAUNCHER is the giver and
+    /// this is whatever it chose at `Process.give(…, tag:)`. Either way the
+    /// kernel assigns it no meaning: the tag IS the identity, and identities are
+    /// the only cross-process vocabulary there is.
+    public tag: UInt,
+    /// What kind of object was minted, so a caller knows which accessor to
+    /// reach for. Regions and (since M3 unit 3) Process handles are what v1 can
+    /// deliver; a caller that asserts this is asserting the giver gave what its
+    /// config says it gave.
+    public kind: BootHandleKind,
+    /// The region itself, until somebody takes it. Private on purpose: the only
+    /// way out is `take_memory`, which is what makes the one-owner rule hold.
+    memory: Memory?,
+    /// The Process handle, on the same terms — `take_process` is its one door.
+    process: Process?,
+    /// The System handle, on the same terms — `take_system` is its one door.
+    /// A record has ONE object, so exactly one of these three slots is ever
+    /// occupied and `kind` is what says which. Three fields rather than an enum
+    /// payload because asking the WRONG one must be harmless: an enum would have
+    /// to be taken out of the record to be matched, and a mismatch would then
+    /// drop a capability the caller still wanted.
+    system: System?,
+}
+
+extension BootHandle: NoCopy {}
+
+extension BootHandle {
+    /// Take the region out of this record, leaving it empty.
+    ///
+    /// It answers `None` on the second call, and `None` on a record that is not
+    /// a region at all — neither is an error condition to dress up: a record has
+    /// one object, and asking for the wrong kind or asking twice are both asking
+    /// for a capability this record does not have. Callers that know better
+    /// write `!`. It never DISTURBS the other slot, which is what makes asking
+    /// the wrong question harmless.
+    ///
+    /// `&var self` because taking WRITES the record — which is also what makes
+    /// the transfer visible in the type rather than in a convention.
+    public func take_memory(&var self) -> Memory? {
+        self.memory.take()
+    }
+
+    /// Take the Process handle out of this record, leaving it empty. Same terms
+    /// as `take_memory`.
+    ///
+    /// **A DONATED CHILD MUST TAKE THIS ONE.** Its record names the very word
+    /// the child adopted from its first argument register (resolving a boot tag
+    /// consumes no record), so a record left holding it would RELEASE that word
+    /// when it drops and leave the child's own Process handle stale. See
+    /// `Process(boot_handle:)` for the one-wrapper-per-word obligation this is
+    /// half of.
+    public func take_process(&var self) -> Process? {
+        self.process.take()
+    }
+
+    /// Take the System handle out of this record. Same terms as `take_memory`.
+    ///
+    /// A launcher's masked sibling arrives as one of these when it is given
+    /// under a tag the child DRAINS. When it is given as the child's BOOT TAG —
+    /// the ordinary shape — the child never meets this accessor at all: the
+    /// register is the delivery and the record is consumed by it.
+    public func take_system(&var self) -> System? {
+        self.system.take()
+    }
+}
+
+/// Decode a record the kernel copied out into a `BootHandle`.
+///
+/// AN UNKNOWN KIND PANICS, loudly, for exactly the reason `decode_wait`'s
+/// unknown tag does: the KERNEL wrote it, out of the same `BootHandleKind`
+/// declaration this function reads, so a kind that does not decode is a skew
+/// between the kernel and the `sos` module it exports — a bug in the pair, not
+/// a runtime condition a caller could act on.
+func decode_boot_handle(tag: UInt, kind: UInt, handle: UInt) -> BootHandle {
+    guard let what = BootHandleKind.from(raw: kind) else {
+        panic("sos: kernel wrote boot handle kind {}, which this build cannot name",
+              kind)
+    }
+    match what {
+        case Memory -> BootHandle(tag: tag, kind: what,
+                                  memory: Memory(handle: MemoryHandle(handle)),
+                                  process: None, system: None),
+        case Process -> BootHandle(tag: tag, kind: what, memory: None,
+                                   process: Process(handle: ProcessHandle(handle)),
+                                   system: None),
+        case System -> BootHandle(tag: tag, kind: what, memory: None,
+                                  process: None,
+                                  system: System(handle: SystemHandle(handle))),
+    }
+}
+
+/// The `unsafe` half of `Process.boot_handle_next`, confined to one small named
+/// helper (design 136). The buffer's address never leaves it.
+func boot_handle_into_frame(handle: ProcessHandle) unsafe -> Result<BootHandle, SosStatus> {
+    var buf: [UInt; BOOT_HANDLE_RECORD_WORDS] = [0; BOOT_HANDLE_RECORD_WORDS]
+    try checked(sos_process_boot_handle_next(handle,
+                                             (&var buf) as UnsafePointer<UInt>,
+                                             boot_handle_record_bytes() as UInt))
+    return decode_boot_handle(buf[BOOT_HANDLE_TAG_WORD],
+                              buf[BOOT_HANDLE_KIND_WORD],
+                              buf[BOOT_HANDLE_HANDLE_WORD])
+}

@@ -1,0 +1,191 @@
+//! WAITER — §2.2's generic wait aggregator, and the decode of the record the
+//! kernel copies back (design 178 D5).
+//!
+//! It is the TOP of the waitable stack rather than the bottom of it: `add` is
+//! one overload per kind, so this file names `Event`, `Interrupt` and `Timer`
+//! and each of those names nothing here. That is the whole reason it moved
+//! above them in the declared order — the brief's sketch had it below, which
+//! the three overloads make impossible.
+
+import sosabi.{SosStatus, WaiterHandle, NO_HANDLE, WaitTag, WaitResult,
+               WaitPayload, WAIT_RECORD_WORDS, WAIT_KEY_WORD, WAIT_TAG_WORD,
+               WAIT_PAYLOAD_WORD, wait_record_bytes}
+
+import sos.floor.{checked, sos_handle_release, sos_waiter_add,
+                  sos_waiter_remove, sos_waiter_wait}
+import sos.event.{Event}
+import sos.interrupt.{Interrupt}
+import sos.timer.{Timer}
+
+/// Decode a record the kernel copied out into `WaitResult`.
+///
+/// AN UNKNOWN TAG PANICS, loudly, and that is deliberate. Every other decode in
+/// this package treats its input as data a process might legitimately be handed;
+/// this one does not, because the KERNEL wrote it out of the same `WaitTag`
+/// declaration this function reads. A tag that does not decode is therefore a
+/// skew between the kernel and the `sos` module it exports — a bug in the pair,
+/// not a runtime condition — and the never-hide rule says a bug the caller
+/// cannot act on should stop the program where it happened rather than become
+/// an `Err` somebody maps to "unknown".
+func decode_wait(key: UInt, tag: UInt, payload: UInt) -> WaitResult {
+    guard let kind = WaitTag.from(raw: tag) else {
+        panic("sos: kernel wrote wait tag {}, which this build cannot name", tag)
+    }
+    match kind {
+        case Event -> WaitResult(key: key, what: WaitPayload.Event(word: payload)),
+        case Interrupt -> WaitResult(key: key,
+                                     what: WaitPayload.Interrupt(line: payload)),
+        case Timer -> WaitResult(key: key,
+                                 what: WaitPayload.Timer(fires: payload)),
+    }
+}
+
+/// A handle to a Waiter — §2.2's generic wait aggregator, epoll/Port-style.
+///
+/// Attachments are PERSISTENT subscriptions: `add` once, and the handle stays
+/// watched until `remove`. There is no one-shot mode, and readiness is
+/// LEVEL-TRIGGERED, so a signal that lands before anyone waits is still there
+/// when the wait arrives.
+///
+/// Several threads may park on one Waiter (§2.2), and a ready handle wakes one
+/// of them; a handle attaches to at most one Waiter, and attaching it twice
+/// terminates the process, on the faults ruling's terms — it is a mistake only
+/// the attacher could have made.
+/// **`NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5).
+/// Attachments belong to the WAITER object, not to the handle, so a released
+/// handle detaches nothing — the subscriptions live until the object does, which
+/// is until the process's teardown.
+public struct Waiter {
+    public(package) handle: WaiterHandle,
+}
+
+extension Waiter: NoCopy {
+    /// Drop is release; see `System`'s deinit for the sentinel and the discard.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
+}
+
+extension Waiter {
+    /// Attach `event` under `key`, which `wait` hands back when it becomes
+    /// ready. Requires `WaiterRight.Attach` here and `EventRight.Wait` there.
+    ///
+    /// KEYS ARE UNIQUE PER WAITER: `key` must not already name an attachment on
+    /// this Waiter, and reusing one TERMINATES the process. It is the invariant
+    /// `remove` and the wait answer both rest on — with two attachments under
+    /// one key, neither could say which it meant.
+    ///
+    /// IT TAKES A `&Event` AND NOT A HANDLE WORD. That is the module
+    /// docstring's rule reaching cross-type plumbing: there is no way to spell
+    /// a handle you were not given, so an attachment names an object this
+    /// process holds by construction. The field access below is same-PACKAGE —
+    /// design 5 made each waitable's `handle` `public(package)` so this
+    /// module can read a sibling's — which is why no accessor is owed and
+    /// none exists.
+    ///
+    /// ONE METHOD PER WAITABLE KIND, and it stays that way on purpose — see the
+    /// brief's note on why a `Waitable` trait is not the shape (a public trait
+    /// with a handle-producing requirement is a forged-handle door under the
+    /// orphan rule, and Saw has no sealed traits yet). Kinds are a LIST, so
+    /// overloads are a list; it is MODES that multiply, which is why
+    /// `event_create` takes its mode as a value.
+    ///
+    /// The second kind is here now, and it is what the shape predicted: each
+    /// overload is TWO LINES delegating to one internal, so the list grows by a
+    /// method per kind and the wire call has one caller.
+    public func add(&self, event: &Event, key: UInt) -> Result<Void, SosStatus> {
+        self.attach(event.handle, key)
+    }
+
+    /// Attach an Interrupt under `key`, which `wait` hands back with the line
+    /// when it fires. Requires `WaiterRight.Attach` here and
+    /// `InterruptRight.Wait` there.
+    ///
+    /// Every rule the Event overload states holds unchanged: keys are unique
+    /// per Waiter, a handle attaches to at most one Waiter, and readiness is
+    /// level-triggered — so an Interrupt that fired BEFORE it was attached is
+    /// reported by this call, which is the ordering a driver hits when the
+    /// device was already asserting at bring-up.
+    public func add(&self, interrupt: &Interrupt, key: UInt) -> Result<Void, SosStatus> {
+        self.attach(interrupt.handle, key)
+    }
+
+    /// Attach a Timer under `key`, which `wait` hands back with the FIRE COUNT
+    /// when it comes due. Requires `WaiterRight.Attach` here and
+    /// `TimerRight.Wait` there.
+    ///
+    /// The third kind, and every rule the other two state holds unchanged: keys
+    /// are unique per Waiter, a handle attaches to at most one Waiter, and
+    /// readiness is level-triggered — so a Timer that fired BEFORE it was
+    /// attached is reported by this call rather than lost.
+    ///
+    /// A DISARMED Timer is simply never ready, so attaching one and waiting
+    /// parks until somebody arms it. That is what makes "arm, then wait" and
+    /// "attach, then arm" both work.
+    public func add(&self, timer: &Timer, key: UInt) -> Result<Void, SosStatus> {
+        self.attach(timer.handle, key)
+    }
+
+    /// The one call the per-kind overloads share. Private: a raw handle word
+    /// crosses here and nowhere else in this type, which is the module
+    /// docstring's rule spelled as a boundary rather than repeated per method.
+    func attach(&self, target: UInt, key: UInt) -> Result<Void, SosStatus> {
+        checked(sos_waiter_add(self.handle, target, key))
+    }
+
+    /// Stop watching whatever is attached under `key`. A key this Waiter does
+    /// not use terminates the process. Requires `WaiterRight.Attach`.
+    ///
+    /// THE KEY IS WHAT NAMES AN ATTACHMENT, not the waitable: detaching edits
+    /// this Waiter's own table and never touches the object on the other end,
+    /// so it needs no handle and no right over it. That is also what will let a
+    /// stale attachment be removed once handles can be closed — at which point
+    /// there is no handle left to name it with.
+    public func remove(&self, key: UInt) -> Result<Void, SosStatus> {
+        checked(sos_waiter_remove(self.handle, key))
+    }
+
+    /// Block until an attached handle is ready, and answer with the attacher's
+    /// key and what fired. Requires `WaiterRight.Wait`.
+    ///
+    /// Returns IMMEDIATELY when something is already ready, which is what
+    /// level-triggering buys: the readiness a signal left behind is still
+    /// there, so "signal then wait" and "wait then signal" have the same
+    /// outcome and only the second one parks.
+    ///
+    /// THE ANSWER CONSUMES WHAT IT REPORTS, for an Event and a Timer alike: the
+    /// record carries the accumulated word (or the fire count) and the object is
+    /// emptied in the same step, so nothing is reported twice. An Interrupt is
+    /// the exception and §9 is why — its readiness ends at `ack`, because the
+    /// line stays masked until the device has been serviced.
+    ///
+    /// SEVERAL THREADS ON ONE WAITER IS A DISTRIBUTION: a ready handle wakes one
+    /// of them and that thread's record carries the value, so a worker pool
+    /// shares a stream of notifications with no coordination. Ownership is the
+    /// other axis and it is structural — a waitable attaches to at most one
+    /// Waiter, so nobody else can be watching the object you are waiting on.
+    ///
+    /// THE BUFFER IS THIS FRAME'S, and a caller never sees it. The kernel
+    /// answers a wait by copying a record into the caller's own memory (it has
+    /// no allocator and nowhere to put one that would outlive the call), so
+    /// somebody has to supply the bytes; supplying them HERE is what keeps a
+    /// raw address out of the typed surface, exactly as the handle rule keeps
+    /// raw handle words out. The stack is the right place for them: the record
+    /// is three words and the frame outlives the park, since the frame is the
+    /// parked thread's own stack.
+    public func wait(&self) -> Result<WaitResult, SosStatus> {
+        wait_into_frame(self.handle)
+    }
+}
+
+/// The `unsafe` half of `wait`, confined to one small named helper (design 136).
+/// The buffer's address never leaves it.
+func wait_into_frame(handle: WaiterHandle) unsafe -> Result<WaitResult, SosStatus> {
+    var buf: [UInt; WAIT_RECORD_WORDS] = [0; WAIT_RECORD_WORDS]
+    try checked(sos_waiter_wait(handle, (&var buf) as UnsafePointer<UInt>,
+                                wait_record_bytes() as UInt))
+    return decode_wait(buf[WAIT_KEY_WORD], buf[WAIT_TAG_WORD],
+                       buf[WAIT_PAYLOAD_WORD])
+}

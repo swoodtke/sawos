@@ -1,0 +1,112 @@
+//! TIMER — a deadline on the Clock that made it, and the process-sleep
+//! primitive (spec §2 table; design 232 unit 1).
+//!
+//! It is BELOW `sos.clock` even though a Clock is what mints one, because the
+//! arrow runs the way construction runs: `Clock.timer_create` names `Timer`,
+//! and a Timer names no Clock at all — its schedule is measured against the
+//! clock it was made by, which is kernel state rather than a field here.
+
+import sosabi.{SosStatus, TimerHandle, NO_HANDLE, TIMER_ARM_RECORD_DOUBLEWORDS,
+               TIMER_ARM_AFTER_SLOT, TIMER_ARM_INTERVAL_SLOT,
+               timer_arm_record_bytes}
+
+import sos.floor.{checked, sos_handle_release, sos_timer_arm, sos_timer_disarm}
+
+/// A handle to a Timer — a deadline on the Clock that made it.
+///
+/// THE PROCESS-SLEEP PRIMITIVE, and the thing that makes waiting on time
+/// possible at all: attach one to a Waiter, arm it, and the wait returns when it
+/// fires. Before this object a process could block forever or not at all.
+///
+/// SPEC §2'S CYCLE, from the holder's side:
+///
+///   1. `arm(after_ns:)` — one-shot — or `arm(after_ns:interval_ns:)` for a
+///      repeating schedule;
+///   2. a `Waiter.wait` answers with this attachment's key and a FIRE COUNT;
+///   3. there is NO ACK. A periodic timer has already re-armed itself, and the
+///      wait that reported the fires is what consumed them.
+///
+/// THE COUNT IS WHY STEP 3 IS SAFE. A consumer descheduled across several
+/// periods is told HOW MANY expired rather than being handed them one at a time
+/// or losing them — so a slow consumer degrades into coarser reporting instead
+/// of falling permanently behind. The re-arm is DRIFT-FREE: each deadline is
+/// measured from the previous DEADLINE, not from when the kernel got round to
+/// it, so a timer armed at one millisecond is still on the millisecond a
+/// thousand fires later.
+///
+/// Built by `Clock.timer_create` and by nothing else — no word constructor, no
+/// word extractor, the module docstring's rule.
+/// **`NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5). It
+/// does NOT disarm the timer: release touches the handle and never the object,
+/// so a dropped `Timer` that was armed keeps its deadline and the kernel keeps
+/// waking for it until the process's teardown takes the comparator back. Disarm
+/// first if that matters — which is the same distinction `close` would draw, and
+/// the reason release is not it.
+public struct Timer {
+    public(package) handle: TimerHandle,
+}
+
+extension Timer: NoCopy {
+    /// Drop is release; see `System`'s deinit for the sentinel and the discard.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
+}
+
+extension Timer {
+    /// Fire once `after_ns` nanoseconds from now, and then every `interval_ns`
+    /// after that. Requires `TimerRight.Arm`.
+    ///
+    /// `interval_ns` DEFAULTS TO ZERO, WHICH IS A ONE-SHOT — the timer fires
+    /// once and disarms itself. That is the default because a timeout is the
+    /// common case and a repeating schedule is the deliberate one.
+    ///
+    /// `after_ns` is RELATIVE to now, not an absolute time, so a caller never
+    /// has to read the clock first and race between two syscalls.
+    ///
+    /// **ARMING AN ARMED TIMER REPLACES ITS SCHEDULE** and discards any fires it
+    /// had not yet delivered — it is how a timeout is CHANGED, not an error. A
+    /// caller who wants the outstanding fires reads them with a wait first.
+    ///
+    /// The arguments cross as a COPY-IN RECORD out of this frame, because two
+    /// 64-bit times are four words on a 32-bit profile and an op has three
+    /// argument registers. A caller never sees the buffer, for the reason
+    /// `Waiter.wait` gives about its own.
+    ///
+    /// A schedule finer than the machine can serve is not refused: fires
+    /// COALESCE into the count, so an interval below the kernel's resolution
+    /// reports many fires per wake rather than wedging the machine.
+    public func arm(&self, after_ns: UInt64,
+                    interval_ns: UInt64 = 0) -> Result<Void, SosStatus> {
+        arm_from_frame(self.handle, after_ns, interval_ns)
+    }
+
+    /// Stop this timer and discard any fires it had not delivered. Requires
+    /// `TimerRight.Arm`.
+    ///
+    /// **DISARMING ONE THAT IS NOT ARMED IS A NO-OP**, and that is the deliberate
+    /// opposite of `Interrupt.ack`, which faults when nothing has fired. The
+    /// difference is whether the caller could have known: an extra ack is
+    /// provably a bug, since the only way to learn about a fire is to be told
+    /// about one — while a ONE-SHOT DISARMS ITSELF, so whether a timer is still
+    /// armed is kernel state that changed without the caller acting. Cancelling
+    /// a timeout that has just expired is the ordinary race in every
+    /// select-with-timeout, and faulting it would make the safe idiom
+    /// unwritable.
+    public func disarm(&self) -> Result<Void, SosStatus> {
+        checked(sos_timer_disarm(self.handle))
+    }
+}
+
+/// The `unsafe` half of `Timer.arm`, confined to one small named helper
+/// (design 136). The record's address never leaves it.
+func arm_from_frame(handle: TimerHandle, after_ns: UInt64,
+                    interval_ns: UInt64) unsafe -> Result<Void, SosStatus> {
+    var buf: [UInt64; TIMER_ARM_RECORD_DOUBLEWORDS] = [0; TIMER_ARM_RECORD_DOUBLEWORDS]
+    buf[TIMER_ARM_AFTER_SLOT] = after_ns
+    buf[TIMER_ARM_INTERVAL_SLOT] = interval_ns
+    checked(sos_timer_arm(handle, (&var buf) as UnsafePointer<UInt64>,
+                          timer_arm_record_bytes() as UInt))
+}

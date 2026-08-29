@@ -1,0 +1,607 @@
+//! THE FLOOR — the trap seam, the status split, and the whole `@export`ed
+//! C-ABI surface (spec §5.7) every typed wrapper above is written on.
+//!
+//! It is the bottom of the module order because it names no wrapper type: an
+//! op here takes a raw handle word and answers a raw status, which is exactly
+//! what makes it reachable from all nine objects without reaching back into
+//! any of them. `checked` is where a number becomes a `Result`, and
+//! `sos_handle_release` is the one call every wrapper's `deinit` issues — so
+//! the owning tier's whole contract is recorded here too, below the nine
+//! files that implement it.
+//!
+//! THE TWO SYSCALL EXTERNS LIVE HERE AND NOWHERE ELSE, and that is what put
+//! the per-op C surface here with them: an `extern "C"` declaration carries no
+//! visibility modifier, so it cannot be shared with a sibling module, and two
+//! modules declaring one symbol is an ambiguity error at the importer. One
+//! declaration, one file, and the typed layer above calls the named seams.
+
+import sosabi.{SosStatus, SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp,
+               InterruptOp, ClockOp, TimerOp, RELEASE_OP, MINT_OP}
+
+// The per-arch HAL, and since design 172 part 2 the WHOLE of it: the one
+// instruction in the system that crosses the trap boundary. FIXED ARITY on
+// purpose — a varargs call across a trap boundary has no portable register
+// story, so a wider op gets `sos_syscall2` beside this, not an ellipsis.
+extern "C" {
+    func sos_syscall1(handle: UInt, op: UInt, arg0: UInt) -> UInt
+    func sos_syscall3(handle: UInt, op: UInt, arg0: UInt, arg1: UInt, arg2: UInt,
+                      value_out: UnsafePointer<UInt>) -> UInt
+}
+
+// =============================================================================
+// Errors
+// =============================================================================
+
+// How a syscall reports what happened is `sosabi`'s `SosStatus` (spec §5.7) —
+// the SAME declaration the kernel's dispatch returns, so the two halves of the
+// contract cannot disagree about what tag 3 means. It carries its own
+// `describe()`, `Printable` and `Error` (design 145: an enum takes methods and
+// hand-written trait bodies), which is what retired the free `sys_error(status)`
+// helper this module used to need. A process reaches all of it through the
+// value it is handed and never imports `sosabi` — the type's own module is
+// always consulted for its methods (design 142), and an enum case pattern
+// resolves from the scrutinee.
+//
+// So userspace can now interpolate a failure (`print("{}", e)`) as well as
+// `match` it. Before, the type could conform to nothing and had to be branched
+// on to say anything at all.
+//
+// IT IS A STATUS, AND ONLY SOME STATUSES ARE ERRORS. `checked` below is the one
+// place that distinction is made, and it is what keeps the `Ok` case out of the
+// error channel entirely.
+
+/// Turn a raw status word into a Result. The one place a number becomes a type.
+///
+/// THE SPLIT (ratified Aug 7): `Ok` becomes `Result.Ok`, everything else becomes
+/// `Err(status)`. So the `Ok` case exists on the wire, where 0 has to mean
+/// something, and cannot exist in an `Err` — `Err(SosStatus.Ok)`, a value that
+/// would claim a call both failed and succeeded, is unconstructible downstream
+/// because this function is the only constructor of the error channel.
+///
+/// The narrowing is guarded rather than assumed: `a0` is register-wide, the enum
+/// is byte-wide (its width is ABI), and an `as UInt8` on a value above 255 is a
+/// PANIC — in a process, over a word the process did not choose. A kernel
+/// compiled from this same table never returns one, so the guard is unreachable
+/// in M1 and costs a compare; what it buys is that the impossible case is an
+/// error value rather than a trap.
+public(package) func checked(raw: UInt) -> Result<Void, SosStatus> {
+    if raw > (UInt8.max as UInt) {
+        return SosStatus.Unknown
+    }
+    guard let status = SosStatus.from(raw: raw as UInt8) else {
+        return SosStatus.Unknown
+    }
+    if status.is_failure() {
+        return status
+    }
+    return
+}
+
+/// The same split for an op that answers with a VALUE — a created thread's
+/// handle, a joined thread's exit code, a status word. `Ok` carries the value;
+/// anything else is the error and the value is not read.
+func checked_value(raw: UInt, value: UInt) -> Result<UInt, SosStatus> {
+    try checked(raw)
+    return value
+}
+
+/// Issue an op that answers with a value.
+///
+/// `unsafe` because it names a pointer: the value register comes back through
+/// an out-parameter, which is the shape that crosses a C ABI with no aggregate
+/// return. The typed methods above call this and stay safe signatures — the
+/// pointer never leaves this function, which is design 136's confinement rule.
+public(package) func call_value(handle: UInt, op: UInt, arg0: UInt, arg1: UInt,
+                                arg2: UInt) unsafe -> Result<UInt, SosStatus> {
+    var value: UInt = 0
+    let raw = sos_syscall3(handle, op, arg0, arg1, arg2,
+                           (&var value) as UnsafePointer<UInt>)
+    checked_value(raw, value)
+}
+
+// =============================================================================
+// The C-ABI surface (spec §5.7) — for non-Saw languages
+// =============================================================================
+//
+// PER-OP functions are the supported C interface: one function per operation,
+// named for it, with the arguments the operation actually takes. A C caller
+// gets the same contract a Saw caller does minus the type wrapper, and still
+// never writes an op number.
+//
+// `sos_syscall1` underneath is the raw form and is reachable, but it is the
+// escape hatch, not the interface: it takes an op number, which is the thing
+// this whole arrangement exists to keep out of callers.
+//
+// Whitelist-clean by construction — handles, ops and statuses are all
+// integers, so nothing here needs a type the C ABI cannot carry.
+
+/// Write one byte to the debug console. Requires `SystemRight.Debug`.
+/// Returns a status word: 0 on success.
+@export("sos_system_debug_print")
+public func sos_system_debug_print(handle: UInt, byte: UInt) -> UInt {
+    sos_syscall1(handle, SystemOp.DebugPrint as UInt, byte)
+}
+
+/// Stop the machine with `status`. Requires `SystemRight.Shutdown`. Does not
+/// return on success; returns a status word if the call was refused.
+@export("sos_system_shutdown")
+public func sos_system_shutdown(handle: UInt, status: UInt) -> UInt {
+    sos_syscall1(handle, SystemOp.Shutdown as UInt, status)
+}
+
+// The ops that answer with a VALUE take an out-parameter for it, exactly as the
+// raw form does. A C caller writes `unsigned long h; sos_process_thread_self(p,
+// &h);` and gets the same contract a Saw caller does minus the Result.
+
+/// This process's own handle. Requires `SystemRight.ProcessSelf`.
+@export("sos_system_process_self")
+public func sos_system_process_self(handle: UInt,
+                                    value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, SystemOp.ProcessSelf as UInt, 0, 0, 0, value_out)
+}
+
+/// Load the image in region `image` into region `memory` and answer with a
+/// handle to the new, INERT process. Requires `SystemRight.ProcessCreate` on
+/// the caller's SYSTEM handle — processes are minted by the System (sawos
+/// design 2's RIDER, ruled Aug 29).
+///
+/// Both arguments are Memory handles — the read-only source blob and the
+/// child's destination RAM. The kernel copies each segment to its link address
+/// inside `memory` and grants a stack at that region's top; the caller supplies
+/// no addresses at all.
+///
+/// A malformed image is `SosStatus.BadImage` — a VALUE, not a fault — because
+/// image bytes are data the caller was handed rather than something it wrote.
+/// A handle that names nothing, or names something that is not a Memory, IS a
+/// fault: the caller chose which handles to pass.
+@export("sos_system_process_create")
+public func sos_system_process_create(handle: UInt, image: UInt, memory: UInt,
+                                      value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, SystemOp.ProcessCreate as UInt, image, memory, 0,
+                 value_out)
+}
+
+/// Make a thread in this process, ready to start. Requires
+/// `ProcessRight.ThreadCreate`. `entry` may be `ENTRY_IMAGE`.
+@export("sos_process_thread_create")
+public func sos_process_thread_create(handle: UInt, entry: UInt, stack_top: UInt,
+                                      arg: UInt,
+                                      value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, ProcessOp.ThreadCreate as UInt, entry, stack_top, arg,
+                 value_out)
+}
+
+/// The CALLING thread's own handle. Requires `ProcessRight.ThreadSelf`.
+@export("sos_process_thread_self")
+public func sos_process_thread_self(handle: UInt,
+                                    value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, ProcessOp.ThreadSelf as UInt, 0, 0, 0, value_out)
+}
+
+/// End this process with `status`. Requires `ProcessRight.Exit`. Does not
+/// return on success.
+@export("sos_process_exit")
+public func sos_process_exit(handle: UInt, status: UInt) -> UInt {
+    sos_syscall1(handle, ProcessOp.Exit as UInt, status)
+}
+
+/// This process's §8 status word. Requires `ProcessRight.Wait`.
+@export("sos_process_get_status")
+public func sos_process_get_status(handle: UInt,
+                                   value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, ProcessOp.GetStatus as UInt, 0, 0, 0, value_out)
+}
+
+/// Make a created thread runnable. Requires `ThreadRight.Start`.
+@export("sos_thread_start")
+public func sos_thread_start(handle: UInt) -> UInt {
+    sos_syscall1(handle, ThreadOp.Start as UInt, 0)
+}
+
+/// Wait for a thread and take its exit value. Requires `ThreadRight.Join`.
+@export("sos_thread_join")
+public func sos_thread_join(handle: UInt,
+                            value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, ThreadOp.Join as UInt, 0, 0, 0, value_out)
+}
+
+/// End the CALLING thread with `code`. Requires `ThreadRight.Control` on the
+/// caller's own handle. Does not return.
+@export("sos_thread_exit")
+public func sos_thread_exit(handle: UInt, code: UInt) -> UInt {
+    sos_syscall1(handle, ThreadOp.Exit as UInt, code)
+}
+
+/// Give the processor up. Requires `ThreadRight.Control` on the caller's own
+/// handle.
+@export("sos_thread_yield")
+public func sos_thread_yield(handle: UInt) -> UInt {
+    sos_syscall1(handle, ThreadOp.Yield as UInt, 0)
+}
+
+/// Make an Event in this process. Requires `ProcessRight.EventCreate`. `mode`
+/// is 0 for bitwise-OR accumulation and 1 for saturating-sum (spec §2.4); any
+/// other value terminates the process.
+///
+/// THE C ALTITUDE WRITES THE MODE AS A NUMBER, and that is the documented
+/// difference in kind the module docstring describes rather than an oversight:
+/// a C caller has no enum to be handed, so it gets the wire value. The Saw
+/// altitude above never writes one — it offers a method per mode.
+@export("sos_process_event_create")
+public func sos_process_event_create(handle: UInt, mode: UInt,
+                                     value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, ProcessOp.EventCreate as UInt, mode, 0, 0, value_out)
+}
+
+/// Make a Waiter in this process. Requires `ProcessRight.WaiterCreate`.
+@export("sos_process_waiter_create")
+public func sos_process_waiter_create(handle: UInt,
+                                      value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, ProcessOp.WaiterCreate as UInt, 0, 0, 0, value_out)
+}
+
+/// Bind IRQ `line` to a new Interrupt in this process. Requires
+/// `ProcessRight.InterruptBind`. A line this machine does not have, the
+/// timer's line, or one already bound TERMINATES the process.
+@export("sos_process_interrupt_bind")
+public func sos_process_interrupt_bind(handle: UInt, line: UInt,
+                                         value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, ProcessOp.InterruptBind as UInt, line, 0, 0, value_out)
+}
+
+/// End this fire and let the device interrupt again. Requires
+/// `InterruptRight.Ack`. Acking one that has not fired terminates the process.
+@export("sos_interrupt_ack")
+public func sos_interrupt_ack(handle: UInt) -> UInt {
+    sos_syscall1(handle, InterruptOp.Ack as UInt, 0)
+}
+
+/// Run a created process: mint its first thread at the recorded entry, on the
+/// recorded stack, and make it runnable. Requires `ProcessRight.Start` on the
+/// CHILD's handle. The caller keeps running.
+///
+/// A SECOND START TERMINATES THE CALLER — it is broken code, and the caller is
+/// the one that started it the first time.
+///
+/// **`boot_tag_form` SAYS WHETHER `boot_tag` MEANS ANYTHING** (sawos design 4
+/// D-4): 0 is the no-tag form and puts nothing (`NO_HANDLE`) in the child's
+/// first argument register; 1 resolves `boot_tag` against the child's boot set
+/// and puts the CHILD-SIDE word there. Any other value terminates the caller.
+///
+/// It is a flag argument rather than a reserved tag value because ZERO IS A
+/// LEGITIMATE TAG — root's region ordinals start at 0 — and because a tag is the
+/// giver's own word, which the kernel must not reserve values out of. A tag that
+/// names no given record terminates the caller: it is config the caller wrote
+/// both halves of.
+///
+/// THE C ALTITUDE WRITES THE FORM AS A NUMBER, which is the documented
+/// difference in kind the module docstring describes (see
+/// `sos_process_event_create`'s mode): a C caller has no enum to be handed. The
+/// Saw altitude above never writes one — it offers `start()` and
+/// `start(boot_tag:)`.
+@export("sos_process_start")
+public func sos_process_start(handle: UInt, boot_tag_form: UInt,
+                              boot_tag: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, ProcessOp.Start as UInt, boot_tag_form, boot_tag, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// **GIVE `given` TO THIS PROCESS UNDER `tag`** — the courier op (sawos design
+/// 4). Requires `ProcessRight.Give` on the CHILD's handle — "may place handles
+/// into this child's boot set" — and the universal `Transfer` right on the
+/// handle BEING GIVEN.
+///
+/// It MOVES the handle: the caller's entry is unbound and its generation bumped,
+/// a fresh entry binds in the child's table carrying the SAME kind, target and
+/// RIGHTS, and a record is appended to the child's boot set under `tag`. **THE
+/// RETURN IS A STATUS ALONE** — the child-side word is meaningless to the caller,
+/// which can call no op through it, so nothing hands it back. What crosses is the
+/// TAG, which the child reads at its drain and which the kernel never interprets.
+///
+/// **THE GIVER'S WORD IS DEAD AFTERWARDS.** Using it again is the ordinary
+/// `BadHandle` fault, which is design 3's generations doing the only job they
+/// have. Typed Saw callers cannot meet that: `Process.give` consumes the wrapper
+/// and disarms it before the syscall.
+///
+/// FOUR WAYS TO TERMINATE THE CALLER, all caller-checkable: a `given` that names
+/// nothing (`BadHandle`); one without `Transfer`, or a receiver handle without
+/// `Give` (`AccessDenied`); a child that has already been STARTED — the boot
+/// set freezes at start (`BadState`); and a `tag` the child's set already carries
+/// (`DuplicateKey`). A full child table is `SosStatus.NoResource`, a STATUS, and
+/// the give did not happen — the caller's handle is untouched.
+@export("sos_process_give")
+public func sos_process_give(handle: UInt, given: UInt, tag: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, ProcessOp.Give as UInt, given, tag, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// Take the next handle out of this process's BOOT SET, as a record copied into
+/// `buf` (spec §12). Requires `ProcessRight.BootHandles`.
+///
+/// `cap` is the buffer's size in BYTES and must be at least
+/// `boot_handle_record_bytes()`. The buffer must be word-aligned and inside
+/// this process's writable memory; a buffer that is not TERMINATES the process,
+/// because it is a mistake only the caller could have made.
+///
+/// The record's layout is public: word 0 the region ordinal, word 1 a
+/// `BootHandleKind`, word 2 the handle. An exhausted set answers
+/// `SosStatus.Drained` and keeps answering it — that is a loop's termination
+/// check, not a failure.
+@export("sos_process_boot_handle_next")
+public func sos_process_boot_handle_next(handle: UInt, buf: UnsafePointer<UInt>,
+                                         cap: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, ProcessOp.BootHandleNext as UInt, buf as UInt, cap, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// Accumulate `bits` into an Event. Never blocks. Requires `EventRight.Signal`.
+@export("sos_event_signal")
+public func sos_event_signal(handle: UInt, bits: UInt) -> UInt {
+    sos_syscall1(handle, EventOp.Signal as UInt, bits)
+}
+
+/// Drain an Event's word and reset it to zero. Requires `EventRight.Receive`.
+@export("sos_event_receive")
+public func sos_event_receive(handle: UInt,
+                              value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, EventOp.Receive as UInt, 0, 0, 0, value_out)
+}
+
+/// Attach a waitable to a Waiter under `key`, which must not already be in use
+/// on that Waiter. Requires `WaiterRight.Attach` on the waiter and
+/// `EventRight.Wait` on the target.
+///
+/// It is the first op taking TWO arguments and answering with a status alone,
+/// and the raw forms are fixed-arity by design (§5.7: no varargs across a trap
+/// boundary), so it rides the three-argument form and drops the value. The
+/// scratch that catches it is what makes this signature `unsafe`; the pointer
+/// never leaves the function, which is design 136's confinement rule.
+@export("sos_waiter_add")
+public func sos_waiter_add(handle: UInt, target: UInt, key: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, WaiterOp.Add as UInt, target, key, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// Detach the attachment registered under `key`. Requires
+/// `WaiterRight.Attach`.
+///
+/// IT TAKES THE KEY, NOT THE WAITABLE'S HANDLE: detaching edits the Waiter's
+/// own table and never touches the waitable, so the key is the whole of what
+/// names the attachment.
+@export("sos_waiter_remove")
+public func sos_waiter_remove(handle: UInt, key: UInt) -> UInt {
+    sos_syscall1(handle, WaiterOp.Remove as UInt, key)
+}
+
+/// Block until an attached handle is ready, and COPY OUT a record describing it
+/// into `buf` (spec §2.2, as amended by design 178 unit 3 rider 3). Requires
+/// `WaiterRight.Wait`.
+///
+/// `cap` is the buffer's size in BYTES and must be at least
+/// `wait_record_bytes()`. The buffer must be word-aligned and inside this
+/// process's writable memory; a buffer that is not TERMINATES the process,
+/// because it is a mistake only the caller could have made.
+///
+/// The record's layout is public: word 0 the attacher's key, word 1 a `WaitTag`,
+/// word 2 the payload. A C caller reads the words; a Saw caller gets them
+/// decoded into a `WaitResult` by `sos.waiter`'s `Waiter.wait`.
+@export("sos_waiter_wait")
+public func sos_waiter_wait(handle: UInt, buf: UnsafePointer<UInt>,
+                            cap: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, WaiterOp.Wait as UInt, buf as UInt, cap, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// This process's Clock for the domain `type` names. Requires
+/// `SystemRight.ClockGet`. A `type` that is not a `ClockType` terminates the
+/// process.
+///
+/// **A FRESH HANDLE EVERY TIME onto the one Clock** (sawos design 3 D-4),
+/// superseding this seam's old "the same handle every time". Two asks are two
+/// capability instances naming one kernel-eternal object; the caller owns each
+/// and releases each. A full handle table is `SosStatus.NoResource`, which
+/// repetition can now reach.
+@export("sos_system_clock_get")
+public func sos_system_clock_get(handle: UInt, type: UInt,
+                                 value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, SystemOp.ClockGet as UInt, type, 0, 0, value_out)
+}
+
+/// Read the clock into `buf` — a COPY-OUT record, because a nanosecond count is
+/// 64 bits and one profile's registers are not. Requires `ClockRight.Read`.
+///
+/// `cap` is the buffer's size in BYTES and must be at least
+/// `clock_now_record_bytes()`. Doubleword 0 is the reading.
+@export("sos_clock_now")
+public func sos_clock_now(handle: UInt, buf: UnsafePointer<UInt64>,
+                          cap: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, ClockOp.Now as UInt, buf as UInt, cap, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// Make a Timer bound to this Clock. Requires `ClockRight.TimerCreate`.
+@export("sos_clock_timer_create")
+public func sos_clock_timer_create(handle: UInt,
+                                   value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, ClockOp.TimerCreate as UInt, 0, 0, 0, value_out)
+}
+
+/// Arm a Timer from a COPY-IN record at `record` — doubleword 0 the delay from
+/// now, doubleword 1 the repeat interval (0 for one-shot), both in nanoseconds.
+/// Requires `TimerRight.Arm`.
+///
+/// THIS IS THE COPY-OUT FUNNEL'S MIRROR TWIN, and the first op in the system to
+/// hand the kernel a record rather than take one. `bytes` must be EXACTLY
+/// `timer_arm_record_bytes()`; a record that is misaligned, outside this
+/// process's memory, or the wrong length TERMINATES the process, because all
+/// three are mistakes only the caller could have made.
+///
+/// Arming an already-armed Timer REPLACES its schedule and clears any fires it
+/// had not yet delivered. That is not an error — it is how a timeout is
+/// changed.
+@export("sos_timer_arm")
+public func sos_timer_arm(handle: UInt, record: UnsafePointer<UInt64>,
+                          bytes: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, TimerOp.Arm as UInt, record as UInt, bytes, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// Stop a Timer and discard any fires it had not delivered. Requires
+/// `TimerRight.Arm`.
+///
+/// Disarming one that is not armed is a NO-OP, deliberately — a one-shot
+/// disarms itself when it fires, so cancelling a timeout that has just expired
+/// is an ordinary race rather than a caller error. (This is the opposite call
+/// from `sos_interrupt_ack`, whose no-fire case IS a fault; see `Timer.disarm`.)
+@export("sos_timer_disarm")
+public func sos_timer_disarm(handle: UInt) -> UInt {
+    sos_syscall1(handle, TimerOp.Disarm as UInt, 0)
+}
+
+/// **RELEASE — destroy this handle, whatever kind it names** (sawos design 3
+/// D-2). The ONE spelling of release in this module.
+///
+/// It is not `sos_<object>_release` nine times, because release is not an op on
+/// any object: it is one universal op number the kernel intercepts before it
+/// has decided the kind, so there is one function here for the same reason there
+/// is one op number there.
+///
+/// **UNGATED.** No right is checked. A handle is a capability INSTANCE and the
+/// object's identity lives in its slot, so destroying your own instance takes
+/// nothing from anybody else holding one. Releasing your System handle or your
+/// own Process handle is legal-but-doomed: you lose the authority, which is what
+/// you asked for.
+///
+/// **A WORD THAT DOES NOT RESOLVE TERMINATES THE PROCESS.** `NO_HANDLE`, a
+/// malformed word, a word whose handle was already released — all of them are
+/// the ordinary `BadHandle` fault, because using a handle you released is broken
+/// code and the kernel's generations exist to diagnose it rather than to
+/// tolerate it. This function therefore does not return on that path, and its
+/// status word is only ever `Ok`.
+///
+/// TYPED SAW CALLERS DO NOT WRITE THIS. In the typed layer release is DROPPING
+/// the wrapper — that is what its `deinit` does, and this is the syscall the
+/// deinit issues. It is public because the C altitude is the floor and a non-Saw
+/// process needs a way to say it; a Saw process that reaches for it is working
+/// with raw words, which is a thing only the raw altitude does.
+@export("sos_handle_release")
+public func sos_handle_release(handle: UInt) -> UInt {
+    sos_syscall1(handle, RELEASE_OP, 0)
+}
+
+/// **MINT — a SIBLING handle onto the same object, whatever kind it names** (the
+/// Aug-29 user rulings on design 4). The second universal op, beside release and
+/// for the same reason: naming an object twice is one act for every kind.
+///
+/// `keep` is a KEEP MASK: the sibling's rights are the source's INTERSECTED with
+/// it, so all-ones means "the same rights" and anything narrower attenuates. The
+/// intersection is what makes no-amplification structural — a sibling is a
+/// subset of its source by construction — and it is TOTAL, so naming a right the
+/// source does not hold is a no-op rather than an error. Its polarity is the
+/// ruling: a keep mask FAILS CLOSED when a kind gains a right later, where a
+/// removal mask would have passed the new authority through in silence. Write a
+/// complement (`~(SystemRight.Transfer as UInt32) & 0xFFFF_FFFF`) when
+/// subtractive intent is what you mean — the fail-open choice then reads at the
+/// call site.
+///
+/// **IT IS GATED ON THE UNIVERSAL `Mint` BIT, WHICH IS ITSELF MASKABLE**: a
+/// sibling minted through a mask that left `Mint` out cannot mint again, so a
+/// launcher stops proliferation exactly where it says it does. A source without
+/// `Mint` TERMINATES the caller, as does a word that names nothing.
+///
+/// The sibling is INDEPENDENT — its own slot, its own generation, its own
+/// release — and names the same object, which is what makes it a second NAME
+/// rather than a second object.
+@export("sos_handle_mint")
+public func sos_handle_mint(handle: UInt, keep: UInt,
+                            value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, MINT_OP, keep, 0, 0, value_out)
+}
+
+/// The keep mask that narrows nothing — `System.mint()`'s default.
+///
+/// It is spelled as every bit rather than as a list of the rights that exist,
+/// which is the KEEP mask's own polarity applied to itself: a mask naming the
+/// rights of today would silently start narrowing the day a right is added, and
+/// "the same rights this handle has" is what the no-argument spelling means.
+public static ALL_RIGHTS: UInt32 = 0xFFFF_FFFF
+
+// =============================================================================
+// The OWNING tier's contract (sawos design 3 D-5) — what every wrapper's
+// `deinit` above this file is written to
+// =============================================================================
+//
+// **ALL NINE WRAPPERS ARE `NoCopy`, AND DROP IS RELEASE** (the Aug-29 user
+// ruling). Each holds one handle word and one hand-written `deinit` that
+// releases it, so a wrapper going out of scope destroys the capability instance
+// it owned — RAII, over kernel handles, with the kernel's own generations
+// backstopping it.
+//
+// WHY THE TWO HALVES HAD TO LAND TOGETHER. A release op beside COPYABLE wrappers
+// is a stale-fault factory: copy a `Clock`, let one copy drop, and the sibling's
+// next use is a `BadHandle` fault the program did nothing to deserve. `NoCopy`
+// is what makes "this value owns that word" true, and it is what §3's
+// no-DUPLICATE rule always meant at this altitude.
+//
+// **THE DISARM SENTINEL IS THE WORD FIELD ITSELF**, which costs no second field
+// and cannot get out of step with one: `NO_HANDLE` is unrepresentable as a LIVE
+// handle (design 3 D-1 makes it the index byte's zero at every generation), so
+// a field holding it is exactly a wrapper that has already given its word away.
+//
+// **THERE IS NO TYPED `release()` METHOD, deliberately.** Early release is
+// dropping the value — `let _ = move clock` — which is one concept for the
+// reader instead of two ways to say it, and it is the same spelling every other
+// owning type in Saw uses. A `release()` beside a RAII deinit would also be a
+// second way to reach the disarmed state, which is precisely the state the
+// sentinel exists to make unreachable from user code.
+//
+// **THE TRANSFER-FUNNEL CONTRACT, recorded now for unit 3's `give` and M4's
+// pipes.** When a kernel op MOVES the word out of the caller's table, the sysapi
+// funnel that owns that syscall CONSUMES the wrapper, reads the word, sets the
+// field to `NO_HANDLE` BEFORE issuing the syscall, and lets the disarmed value
+// drop. Disarm-before-syscall is the deliberate order: every failure of such a
+// syscall is a FAULT (the process ends, and teardown covers everything it held),
+// so there is no path on which a disarmed-but-unsent word leaks. User code never
+// touches the sentinel. Generations are the backstop: a funnel bug that released
+// after a transfer is a diagnosed `BadHandle` fault, never corruption.
+//
+// **`shutdown()` NEVER RETURNS**, so wrappers live at that moment never run
+// their deinit and die in the kernel's teardown instead. That is the backstop
+// working as designed rather than a leak, and the transcript's `handles=` count
+// is what says which path each handle took.
+
+// =============================================================================
+// The boot handle the runtime hooks print through (design 172 part 2)
+// =============================================================================
+//
+// It sits at the floor because TWO files need it and neither is below the
+// other: `sos.system` WRITES it, out of `System(boot_handle:)`, and `sos.rt`
+// READS it, out of the panic path's writer. A helper two seams share lives
+// below both.
+
+/// The boot handle, parked for the runtime hooks in `sos.rt`.
+///
+/// The runtime seams take no handle — the ABI has no room for one — so the one
+/// root is given at boot is remembered here by `System.init` before anything
+/// can print. It is root's own authority being kept in root's own address
+/// space, NOT ambient authority: a process that was never given the handle has
+/// nothing to remember and its panics are simply silent.
+///
+/// `unsafe static var` (design 149) rather than an `Atomic`: it is plain
+/// compound process state written once at boot, and spec §7's uniprocessor
+/// argument covers it exactly as it covers the arena.
+public(package) unsafe static var SYSTEM_HANDLE: UInt = 0
+
+/// Park the boot handle. A small named `unsafe` helper is how design 136 says
+/// to confine contact with an unsafe-typed value, and it is what keeps the
+/// public `System(boot_handle:)` an ordinary safe signature.
+public(package) func park_system_handle(handle: UInt) unsafe {
+    SYSTEM_HANDLE = handle
+}

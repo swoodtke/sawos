@@ -1,0 +1,69 @@
+//! INTERRUPT — an IRQ line bound to a waitable, and the whole of a userspace
+//! driver's kernel surface (spec §2 table, §9; design 178 D6).
+//!
+//! Two operations wide: attach it to a Waiter and park, then `ack` when the
+//! device has been serviced. The attach is the Waiter's, above; the ack is
+//! here, with the object it ends a fire on.
+
+import sosabi.{SosStatus, InterruptHandle, NO_HANDLE}
+
+import sos.floor.{checked, sos_handle_release, sos_interrupt_ack}
+
+/// A handle to an Interrupt — an IRQ line bound to a waitable.
+///
+/// THE WHOLE OF A USERSPACE DRIVER'S KERNEL SURFACE, and it is two operations
+/// wide: attach it to a Waiter and park, then `ack` when the device has been
+/// serviced. Everything between those — reading the device's registers,
+/// deciding what the interrupt meant, writing a reply — happens in ordinary
+/// process code through the MMIO window the image was granted. There is no
+/// kernel driver, and this type is the reason there does not have to be one.
+///
+/// SPEC §9'S CYCLE, from the holder's side:
+///
+///   1. the line fires; the KERNEL masks it and marks this object ready;
+///   2. a `Waiter.wait` answers with this attachment's key and the line;
+///   3. the driver touches its device — everything that reads or writes a
+///      register belongs HERE, before the ack, which is §9's release rule;
+///   4. `ack` unmasks, and a device still asserting fires again immediately.
+///
+/// AT MOST ONE UNACKED FIRE EXISTS, ever, because step 1 masks. That is what
+/// makes a single-task driver non-reentrant with no lock: the line cannot come
+/// back while the handler runs.
+///
+/// Built by `Process.interrupt_bind` and by nothing else — no word
+/// constructor, no word extractor, the module docstring's rule.
+/// **`NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5). The
+/// LINE is not given back by a release — the binding IS the object's existence,
+/// and the object outlives its last handle until the process's teardown, which
+/// is where the line is masked and returned. A driver that drops its `Interrupt`
+/// has made its own device unreachable, not freed it for somebody else.
+public struct Interrupt {
+    public(package) handle: InterruptHandle,
+}
+
+extension Interrupt: NoCopy {
+    /// Drop is release; see `System`'s deinit for the sentinel and the discard.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
+}
+
+extension Interrupt {
+    /// End this fire and let the device interrupt again (spec §9's ack).
+    /// Requires `InterruptRight.Ack`.
+    ///
+    /// ACK IS A RELEASE: everything that touches device registers happens
+    /// BEFORE it, and code after it runs on data already extracted. A driver
+    /// that needs register work after the ack serializes it itself; the kernel
+    /// does not enforce single-servicing.
+    ///
+    /// Acking an Interrupt that has not fired TERMINATES the process. It is
+    /// caller-checkable in the strongest sense — the only way to learn about a
+    /// fire is to have been told about one — and tolerating it would mean the
+    /// NEXT fire got acked by a driver that never serviced it.
+    public func ack(&self) -> Result<Void, SosStatus> {
+        checked(sos_interrupt_ack(self.handle))
+    }
+}
