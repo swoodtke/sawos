@@ -33,3 +33,39 @@ repo's first done file; sawos was born Aug 28 (sawlang#238).
   §2.1's Pipe bodies are the length that will want one, and their
   callers sit above `kcore.preempt`, so the pointed door goes there in
   M4. Noted at `mem.saw`'s movers and in `kcore/lib.saw`'s module order
+
+- M3 unit 2 — CreateProcess [sawlang#232, #2 —
+  designs/002-create-process.md, authored + revised Aug 28]: THE
+  LOADER STAYS IN THE KERNEL (user ruled Aug 28, superseding the
+  same day's zero-copy ruling — split to userspace later if/when
+  necessary): one loader, shared phases, `process_create(image:,
+  memory:)` over two root-provided Memory regions, copy through
+  unit 1.5's pointed movers, stack = kernel's grant at the
+  destination's top (root's own pattern). Region table + minimal
+  Memory kind (unit 4's first slice), boot_handle_next pulled
+  forward (unit 3's iterator), protection reload at pick_next's
+  marked point (forced both arches), end_process forks (root stops
+  the machine, a child reschedules). DISPATCHED Aug 28.
+  **BUILT Aug 28, INTEGRATED to main same day (lead-reviewed, gate
+  re-run 94/94, fast-forward e18c1ef).** All of D-1..D-7
+  landed as briefed; the brief's As-built has the detail. Counts:
+  `SAWLANG_ROOT=… make sos-test` 94/94 across riscv32 + arm64, 47
+  cases per architecture, the 84 pre-existing rows byte-identical in
+  name, verdict and order. Five new all-arch cases
+  (`process_lifecycle`, `process_isolation`, `process_badimage`,
+  `process_doublestart`, `process_bootdrain`), two new child packages
+  and five new root packages. ONE STRUCTURAL FINDING, recorded in the
+  As-built and in `sched.saw`'s header: the teardown could not stay in
+  `kcore.process`, because a child's death reschedules, a reschedule
+  can idle, idling delivers, and delivery reaches back down into that
+  module's own copy door — design 1's cycle at a second site, resolved
+  the same way (an altitude split, nothing duplicated). Its visible
+  cost is that the copy doors REPORT a bad buffer and their callers
+  above the switch point terminate on it. TWO DEVIATIONS from the
+  brief's letter, both argued in the As-built: `sos.Memory` is a plain
+  handle wrapper rather than `NoCopy` (the owning tier is unit 2.75's
+  whole subject, and a move-only field makes the ruled `{tag, kind,
+  handle}` record unwritable), and the loader MOVED down the module
+  order rather than staying last (its phases have to be reachable from
+  the dispatch now that `process_create` is an op). Nothing left open
+  inside the entry
