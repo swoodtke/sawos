@@ -414,20 +414,33 @@ the constant moved.
    owns** — the getters that mint are System's and Process's, so a
    process cannot derive a second `Event`/`Waiter`/`Timer`/`Interrupt`
    handle for a sibling thread.
-   **OWNER: UNIT 5.5** (recorded by design 4 D-3, Aug 29, and sharpened
-   by building it). Unit 3 met this finding from the other side and it
-   is now the launch flow's one real limitation: a child that is to
-   drain must hold its OWN Process handle, the only such handle is the
-   one `process_create` minted, and `give` is a MOVE — so a launcher
-   either KEEPS it and supervises (`get_status`, and 5.5's death-wait)
-   or HANDS IT OVER and donates, and cannot do both. Unit 3 found the
-   ordering half of this too: because `Start` is an op on that same
-   handle, the donation cannot even be a separate give — a launcher
-   that gave it away a moment earlier would have nothing left to start
-   the child with — so it happens AT the start barrier
-   (`BootTagForm.Donate`). A second handle onto one process is what
-   would dissolve both halves, and death notifications are the unit
-   that genuinely needs root to retain while the child holds its own. Before the owning tier this was hidden:
+   **CLOSED BY M3 UNIT 3 (sawos design 4), by the Aug-29 user rulings
+   — and it was unit 3 that forced them.** Building `give` met this
+   finding from the far side and made it the launch flow's blocking
+   limitation rather than an inconvenience: a child that is to drain
+   must hold its OWN handle, the only one is what `process_create`
+   minted, and `give` is a MOVE — so a launcher either kept it and
+   supervised or handed it over and donated, and could do neither
+   half-way. Worse, `Start` is an op on that same handle, so the
+   donation could not even be a separate give (a launcher that gave it
+   away a moment earlier had nothing left to start the child with). An
+   implementation folded the transfer into `start` to get past it; the
+   user's answer went to the root instead.
+   **`MINT_OP` IS THE ANSWER: a second universal op that mints a
+   SIBLING handle onto the same object, in the caller's own table,
+   narrowed by a KEEP MASK.** So a launcher mints what it hands over,
+   keeps its own, and supervision and self-management stop being
+   alternatives. The thing this finding said no op could do is now the
+   thing the second universal op does — and because the sibling's
+   rights are an intersection, the answer arrived with attenuation
+   attached rather than as a bare duplicate. Unit 5.5's death
+   notifications no longer wait on it.
+   The two sharing-by-address rewrites this finding records
+   (`event-wake`, `event-consume-wake`) are now expressible as one
+   handle each, which is what the finding said the programs WANTED.
+   That rewrite is BACKLOG and deliberately not done in unit 3: it
+   would move shipped transcript rows, which design 4 authorised none
+   of. Before the owning tier this was hidden:
    `event-wake` and `event-consume-wake` shared the COPYABLE wrapper
    value through an `unsafe static var`, which NoCopy correctly
    refuses (and which a static could not hold anyway — statics are

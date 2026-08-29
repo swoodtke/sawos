@@ -85,6 +85,20 @@
 public import sosabi.{SosStatus, EventMode, ClockType, WaitResult, WaitPayload,
                       BootHandleKind}
 
+// **AND `SystemRight`, WHICH THE MINT MASK MADE PUBLIC** (the Aug-29 rulings on
+// design 4). Rights bits were kernel-internal for as long as no argument
+// carried one; `MINT_OP` takes a KEEP MASK the caller assembles, so the bits are
+// now exactly what the module docstring's rule calls PUBLIC — values a PROCESS
+// CHOOSES and passes as a syscall argument. `System.mint(rights:)` is the one
+// consumer, which is why this is the one rights enum re-exported: a kind whose
+// handles nothing masks has no reason to publish its bits, and each one joins
+// this line with the funnel that needs it.
+//
+// It does NOT breach the vDSO wall, which is about OP NUMBERS: userspace still
+// never writes an op, and a right is a capability rather than an index the
+// kernel trusts.
+public import sosabi.{SystemRight}
+
 // Everything else `sosabi` holds is KERNEL-INTERNAL and stays that way: the op
 // numbers, the rights, the handle aliases, the wait record's wire layout. This
 // is an ordinary import, so a process cannot reach one through `sos` under any
@@ -95,7 +109,7 @@ import sosabi.{SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp, InterruptOp,
                SystemHandle, ProcessHandle, ThreadHandle, EventHandle,
                WaiterHandle, InterruptHandle, ClockHandle, TimerHandle,
                MemoryHandle,
-               RELEASE_OP, NO_HANDLE, BootTagForm,
+               RELEASE_OP, MINT_OP, NO_HANDLE, BootTagForm,
                WaitTag, WAIT_RECORD_WORDS, WAIT_KEY_WORD, WAIT_TAG_WORD,
                WAIT_PAYLOAD_WORD, wait_record_bytes,
                BOOT_HANDLE_RECORD_WORDS, BOOT_HANDLE_TAG_WORD,
@@ -237,7 +251,7 @@ public func sos_system_shutdown(handle: UInt, status: UInt) -> UInt {
 // raw form does. A C caller writes `unsigned long h; sos_process_thread_self(p,
 // &h);` and gets the same contract a Saw caller does minus the Result.
 
-/// This process's own handle. Requires `SystemRight.Manage`.
+/// This process's own handle. Requires `SystemRight.ProcessSelf`.
 @export("sos_system_process_self")
 public func sos_system_process_self(handle: UInt,
                                     value_out: UnsafePointer<UInt>) unsafe -> UInt {
@@ -275,7 +289,7 @@ public func sos_process_thread_create(handle: UInt, entry: UInt, stack_top: UInt
                  value_out)
 }
 
-/// The CALLING thread's own handle. Requires `ProcessRight.Manage`.
+/// The CALLING thread's own handle. Requires `ProcessRight.ThreadSelf`.
 @export("sos_process_thread_self")
 public func sos_process_thread_self(handle: UInt,
                                     value_out: UnsafePointer<UInt>) unsafe -> UInt {
@@ -392,8 +406,9 @@ public func sos_process_start(handle: UInt, boot_tag_form: UInt,
 }
 
 /// **GIVE `given` TO THIS PROCESS UNDER `tag`** — the courier op (sawos design
-/// 4). Requires `ProcessRight.Manage` on the CHILD's handle and the universal
-/// `Transfer` right on the handle BEING GIVEN.
+/// 4). Requires `ProcessRight.Give` on the CHILD's handle — "may place handles
+/// into this child's boot set" — and the universal `Transfer` right on the
+/// handle BEING GIVEN.
 ///
 /// It MOVES the handle: the caller's entry is unbound and its generation bumped,
 /// a fresh entry binds in the child's table carrying the SAME kind, target and
@@ -409,7 +424,7 @@ public func sos_process_start(handle: UInt, boot_tag_form: UInt,
 ///
 /// FOUR WAYS TO TERMINATE THE CALLER, all caller-checkable: a `given` that names
 /// nothing (`BadHandle`); one without `Transfer`, or a receiver handle without
-/// `Manage` (`AccessDenied`); a child that has already been STARTED — the boot
+/// `Give` (`AccessDenied`); a child that has already been STARTED — the boot
 /// set freezes at start (`BadState`); and a `tag` the child's set already carries
 /// (`DuplicateKey`). A full child table is `SosStatus.NoResource`, a STATUS, and
 /// the give did not happen — the caller's handle is untouched.
@@ -599,6 +614,43 @@ public func sos_handle_release(handle: UInt) -> UInt {
     sos_syscall1(handle, RELEASE_OP, 0)
 }
 
+/// **MINT — a SIBLING handle onto the same object, whatever kind it names** (the
+/// Aug-29 user rulings on design 4). The second universal op, beside release and
+/// for the same reason: naming an object twice is one act for every kind.
+///
+/// `keep` is a KEEP MASK: the sibling's rights are the source's INTERSECTED with
+/// it, so all-ones means "the same rights" and anything narrower attenuates. The
+/// intersection is what makes no-amplification structural — a sibling is a
+/// subset of its source by construction — and it is TOTAL, so naming a right the
+/// source does not hold is a no-op rather than an error. Its polarity is the
+/// ruling: a keep mask FAILS CLOSED when a kind gains a right later, where a
+/// removal mask would have passed the new authority through in silence. Write a
+/// complement (`~(SystemRight.Transfer as UInt32) & 0xFFFF_FFFF`) when
+/// subtractive intent is what you mean — the fail-open choice then reads at the
+/// call site.
+///
+/// **IT IS GATED ON THE UNIVERSAL `Mint` BIT, WHICH IS ITSELF MASKABLE**: a
+/// sibling minted through a mask that left `Mint` out cannot mint again, so a
+/// launcher stops proliferation exactly where it says it does. A source without
+/// `Mint` TERMINATES the caller, as does a word that names nothing.
+///
+/// The sibling is INDEPENDENT — its own slot, its own generation, its own
+/// release — and names the same object, which is what makes it a second NAME
+/// rather than a second object.
+@export("sos_handle_mint")
+public func sos_handle_mint(handle: UInt, keep: UInt,
+                            value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, MINT_OP, keep, 0, 0, value_out)
+}
+
+/// The keep mask that narrows nothing — `System.mint()`'s default.
+///
+/// It is spelled as every bit rather than as a list of the rights that exist,
+/// which is the KEEP mask's own polarity applied to itself: a mask naming the
+/// rights of today would silently start narrowing the day a right is added, and
+/// "the same rights this handle has" is what the no-argument spelling means.
+public static ALL_RIGHTS: UInt32 = 0xFFFF_FFFF
+
 // =============================================================================
 // The typed Saw surface — and the OWNING tier (sawos design 3 D-5)
 // =============================================================================
@@ -691,12 +743,68 @@ extension System {
     /// crosses INTO a handle type (the other is the kernel's dispatch, after
     /// the table has resolved it). Crossing at CREATION is what the explicit
     /// construction is for.
+    ///
+    /// **EVERY PROCESS COMES THROUGH HERE SINCE M3 UNIT 3, not just root** (the
+    /// Aug-29 rulings; §12's symmetry). Root's word is the one the kernel minted
+    /// at boot; a child's is a MASKED SIBLING its launcher minted and gave under
+    /// the tag it was started with. Neither can tell the difference, and neither
+    /// needs to: what a process may do with the handle is the rights word, and
+    /// where it came from is the launcher's business. From here both bootstrap
+    /// identically — derive the Process object, drain the boot set.
+    ///
+    /// A word arriving here is one the KERNEL RESOLVED, never one anybody
+    /// guessed, and it can be adopted at most once: `start(boot_tag:)` CONSUMES
+    /// the record it resolved, so the drain can never hand the same word back a
+    /// second time and there is no way to end up with two wrappers over one
+    /// handle. An earlier cut of this unit had to document that hazard instead;
+    /// the ruling made it unrepresentable.
     public init(boot_handle: UInt) -> System {
         // The runtime's panic path prints through this same handle, so it has
         // to be parked where the seams below can reach it before any Saw code
         // can fail.
         park_system_handle(boot_handle)
         System(handle: SystemHandle(boot_handle))
+    }
+
+    /// **MINT A SIBLING of this System handle, narrowed by a KEEP MASK** — the
+    /// universal `MINT_OP` (the Aug-29 user rulings on design 4). Requires the
+    /// universal `SystemRight.Mint` on THIS handle.
+    ///
+    /// `rights` is what the sibling may KEEP: its rights are this handle's
+    /// INTERSECTED with the mask, so the default (all ones) is "the same rights"
+    /// and anything narrower attenuates. Naming a right this handle does not hold
+    /// is a no-op — the intersection makes no-amplification structural rather
+    /// than checked, so there is nothing to fault on and nothing to introspect
+    /// first.
+    ///
+    /// **THIS IS HOW A CHILD GETS A SYSTEM HANDLE**, and the mask is the whole
+    /// of the policy:
+    ///
+    /// ```saw
+    /// let for_child = system.mint(rights: SystemRight.Debug
+    ///                                     | SystemRight.ProcessSelf
+    ///                                     | SystemRight.ClockGet)!
+    /// child.give(system: move for_child, tag: BOOT)
+    /// ```
+    ///
+    /// Everything not named is absent BY SILENCE, which is the polarity ruling:
+    /// a keep mask FAILS CLOSED when a later unit adds a System right, where a
+    /// removal mask would have handed every future capability to every child a
+    /// launcher had ever configured. Write a complement
+    /// (`~(SystemRight.Transfer as UInt32) & 0xFFFF_FFFF`) when subtractive
+    /// intent really is what you mean — the fail-open choice then reads at the
+    /// call site rather than hiding in the op.
+    ///
+    /// **`Mint` IS ITSELF MASKABLE.** A sibling minted through a mask that left
+    /// it out cannot mint again, so proliferation stops exactly where the mask
+    /// says it does.
+    ///
+    /// A full handle table is `SosStatus.NoResource`. A handle without `Mint`
+    /// TERMINATES the caller.
+    public func mint(&self,
+                     rights: UInt32 = ALL_RIGHTS) -> Result<System, SosStatus> {
+        let raw = try call_value(self.handle, MINT_OP, rights as UInt, 0, 0)
+        return System(handle: SystemHandle(raw))
     }
 
     /// Write one byte to the debug console.
@@ -720,14 +828,15 @@ extension System {
     }
 
     /// This process's own Process object (§3's derivation rule: a handle is
-    /// obtained through a handle already held). Requires `SystemRight.Manage`.
+    /// obtained through a handle already held). Requires
+    /// `SystemRight.ProcessSelf`.
     ///
     /// **A FRESH HANDLE EVERY TIME** (sawos design 3 D-4), which supersedes this
     /// method's old "the same handle every time". Calling it twice is two
     /// capability INSTANCES of one authority, each independently owned and
     /// independently released — which is what makes the `NoCopy` wrapper an
     /// owner rather than a name. It amplifies nothing: a mint carries the kind's
-    /// default rights and `SystemRight.Manage` gates the minting, so a caller
+    /// default rights and `SystemRight.ProcessSelf` gates the minting, so a caller
     /// asking twice ends up with exactly the authority it asked once for.
     ///
     /// It can therefore FAIL, where reading a cached word could not: a full
@@ -853,36 +962,6 @@ extension Process: NoCopy {
 }
 
 extension Process {
-    /// **ADOPT THE PROCESS HANDLE THE KERNEL PUT IN THE FIRST ARGUMENT
-    /// REGISTER** — a donated child's `_start`, and the second blessed crossing
-    /// into the typed layer (sawos design 4 D-4).
-    ///
-    /// `System(boot_handle:)` was the first and the rule is the same one: the
-    /// parameter is a raw `UInt` because that is what a register holds and what
-    /// the ABI specifies, and crossing at CREATION is what the explicit
-    /// construction is for. What arrives here is the word
-    /// `start(boot_tag:)` resolved out of this process's own boot set, so it is a
-    /// handle the kernel handed over rather than an integer somebody guessed.
-    ///
-    /// A CHILD MUST ADOPT IT BEFORE IT CAN DRAIN, which is why the donation is
-    /// the boot tag: `boot_handle_next` is an op on the Process object, so the
-    /// Process handle is the one handle that has to arrive by register rather
-    /// than through the iterator.
-    ///
-    /// **EXACTLY ONE WRAPPER PER WORD IS THE CALLER'S OBLIGATION HERE, and this
-    /// is the one place in the module where it is not automatic.** Resolving a
-    /// boot tag does not consume the record, so a child that adopts a0 AND takes
-    /// the same record's `Process` out of its drain holds TWO owners of ONE word
-    /// — and the second drop is a `BadHandle` fault the program did nothing to
-    /// deserve. This module cannot detect it: the two constructions are a
-    /// register read and an iterator entry, and nothing connects them. The rule
-    /// for a donated child is therefore: adopt a0 as your Process, and let the
-    /// matching record's wrapper live exactly as long — which it does, since a
-    /// child's last act is `exit`, and `exit` never returns.
-    public init(boot_handle: UInt) -> Process {
-        Process(handle: ProcessHandle(boot_handle))
-    }
-
     /// Make a thread at `entry`, ready to be started. Requires
     /// `ProcessRight.ThreadCreate`.
     ///
@@ -918,7 +997,8 @@ extension Process {
                            arg: arg)
     }
 
-    /// The CALLING thread's own Thread object. Requires `ProcessRight.Manage`.
+    /// The CALLING thread's own Thread object. Requires
+    /// `ProcessRight.ThreadSelf`.
     ///
     /// This is how a thread reaches the handle it needs to exit or yield: it is
     /// handed its process, and asks the process which thread it is.
@@ -1041,42 +1121,6 @@ extension Process {
                                   boot_tag))
     }
 
-    /// **PHASE TWO, DONATING THIS HANDLE TO THE PROCESS IT NAMES** — the third
-    /// form, and the one that makes a self-managing child expressible (sawos
-    /// design 4 D-3, as implemented).
-    ///
-    /// It GIVES this very handle to the child under `donating` and puts the
-    /// child-side word in a0, so the child wakes up holding its OWN Process
-    /// object: it can drain its boot set, make threads and exit with a code.
-    /// Root retains nothing — one handle, one choice, and the choice is made
-    /// here.
-    ///
-    /// **WHY THE DONATION IS SPELLED AT `start` AND NOT AS A `give`.** `Give` is
-    /// a MOVE and `start` is an op on the handle being moved, so a launcher that
-    /// gave this handle away a moment earlier would have nothing left to start
-    /// the child with — the sequence D-3 describes cannot be written. The
-    /// transfer therefore happens at the barrier, which is the one instant that
-    /// is both before the child's first instruction and while the launcher still
-    /// holds the handle. Everything else about it is an ordinary give: rights
-    /// travel verbatim, a tagged record joins the child's boot set, and the
-    /// child meets that record again in its drain.
-    ///
-    /// **THIS WRAPPER IS DISARMED, NOT CONSUMED**, and the reason is a language
-    /// fact rather than a choice: Saw has no consuming `self` receiver, and
-    /// `child.give(process: move child, …)` would move a value the same call is
-    /// borrowing as its receiver. So the funnel takes `&var self` and writes
-    /// `NO_HANDLE` into the field before the syscall, exactly as design 3 D-5's
-    /// transfer contract prescribes — and what is left behind is a husk whose
-    /// drop does nothing. USING IT AFTERWARDS IS A DIAGNOSED FAULT, not silent
-    /// corruption: the word is gone from the caller's table, so any op through
-    /// the husk is `BadHandle`. Let it fall out of scope.
-    public func start(&var self, donating: UInt) -> Result<Void, SosStatus> {
-        let word: UInt = self.handle
-        self.handle = ProcessHandle(NO_HANDLE)
-        return checked(sos_process_start(word, BootTagForm.Donate as UInt,
-                                         donating))
-    }
-
     // -------------------------------------------------------------------------
     // THE GIVE FUNNELS (sawos design 4 D-4; design 3 D-5's transfer contract)
     // -------------------------------------------------------------------------
@@ -1096,21 +1140,24 @@ extension Process {
     //
     // **TWO FUNNELS AND NOT NINE, and the rights audit is the reason.** A handle
     // can be given only if its rights word carries the universal `Transfer` bit,
-    // and v1 mints that bit in exactly two places: `memory_rights()` (M3 unit 2)
-    // and `child_process_rights()` (design 4 D-3). A Thread, Event, Waiter,
-    // Interrupt, Clock or Timer handle therefore cannot be given at all, and a
-    // funnel for one would be a method whose every call is an `AccessDenied`
-    // fault — dead surface, on the same rule that has `ClockType` declare one
-    // domain. The Process half is spelled `start(donating:)` instead, for the
-    // ordering reason recorded there. `give(system:)` is the exception that
-    // proves the rule: root's System handle also withholds `Transfer` (the
-    // deliberate M2 "nobody to transfer to" choice), and the funnel exists
-    // because that refusal is a claim worth being able to WRITE —
-    // `give_no_transfer` is the case that makes it. When a unit needs a kind to
-    // travel, it rules on that kind's default set and adds the funnel beside it.
+    // and v1 mints that bit in exactly three places: `memory_rights()` (M3 unit
+    // 2), `process_rights()` (design 4 D-3) and `root_system_rights()` (the
+    // Aug-29 rulings). A Thread, Event, Waiter, Interrupt, Clock or Timer
+    // handle therefore cannot be given at all, and a funnel for one would be a
+    // method whose every call is an `AccessDenied` fault — dead surface, on the
+    // same rule that has `ClockType` declare one domain.
+    //
+    // `give(system:)` IS THE ONE THE LAUNCH FLOW TURNS ON: a launcher mints a
+    // MASKED sibling of its own System handle and gives that, which is how a
+    // child gets a voice, a clock and its own Process handle without getting the
+    // machine's off switch. There is no `give(process:)` because nothing needs
+    // one — a launcher keeps the child's Process handle to supervise WITH, and a
+    // Process handle onto some THIRD process is a supervision hand-off nothing
+    // can hold two of yet. When a unit needs a kind to travel, it rules on that
+    // kind's default set and adds the funnel beside it.
 
     /// Give a memory REGION to this process under `tag`, consuming the wrapper.
-    /// Requires `ProcessRight.Manage` here and `MemoryRight.Transfer` on the
+    /// Requires `ProcessRight.Give` here and `MemoryRight.Transfer` on the
     /// region — which every boot region carries.
     public func give(&self, memory: Memory, tag: UInt) -> Result<Void, SosStatus> {
         var region = move memory
@@ -1119,27 +1166,28 @@ extension Process {
         return checked(sos_process_give(self.handle, word, tag))
     }
 
-    // **THERE IS NO `give(process:)`, and its absence is the design rather than
-    // an omission.** A Process handle CAN travel — `child_process_rights()`
-    // mints `Transfer` (design 4 D-3) — but the only Process handle any v1
-    // launcher holds is the one `process_create` returned for a child, and
-    // giving that away leaves nothing to `start` the child with. The transfer
-    // that matters is therefore spelled `start(donating:)` above, which performs
-    // exactly the same give at the one instant it can be performed at. A funnel
-    // for a Process handle onto a DIFFERENT process is what a supervision
-    // hand-off would want; nothing can hold two such handles today, so writing
-    // one now would be a method with no caller.
 
     /// Give a SYSTEM handle to this process under `tag`, consuming the wrapper.
     ///
-    /// **NOTHING IN v1 CAN SUCCEED AT THIS, and that is stated rather than
-    /// hidden.** `root_system_rights()` withholds `Transfer` — the deliberate M2
-    /// choice, made when there was nobody to transfer to — so the only System
-    /// handle that exists is ungivable and this call is an `AccessDenied` fault.
-    /// The funnel exists because the refusal is a PROPERTY worth being able to
-    /// write down and prove (`give_no_transfer`), and because the day something
-    /// mints a givable System handle for a child, the spelling is already here
-    /// and the ruling is about the rights word alone.
+    /// **THIS IS THE ONE THE LAUNCH FLOW TURNS ON.** A launcher does not give
+    /// away the System handle it holds — it MINTS a masked sibling
+    /// (`System.mint(rights:)`) and gives that, so what a child receives was
+    /// narrowed before it left. Pair it with `start(boot_tag:)` naming the same
+    /// tag and the child wakes up holding it, which is how every process in the
+    /// system bootstraps: System in the first argument register, its own Process
+    /// handle derived from it, its boot set drained from there (§12).
+    ///
+    /// The sibling's mask is the whole of the policy. `Debug | ProcessSelf |
+    /// ClockGet` gives a child a voice, an identity and a clock; `Shutdown`,
+    /// `ProcessCreate` and `Mint` are absent BY SILENCE, so the child cannot stop
+    /// the machine, cannot spawn and cannot widen what it holds — a mint's result
+    /// is a subset of its source, so no sequence of ops recovers a masked bit.
+    ///
+    /// **THE MASK MUST KEEP `Transfer`**, because that is the bit this op checks
+    /// on the thing being given: a launcher cannot narrow below the ticket that
+    /// lets the narrowed handle arrive. So a child holds `Transfer` too, which is
+    /// inert today (nothing it can reach is a receiver) and is a recorded finding
+    /// for the unit that gives a child a pipe.
     public func give(&self, system: System, tag: UInt) -> Result<Void, SosStatus> {
         var authority = move system
         let word: UInt = authority.handle
@@ -1249,9 +1297,14 @@ public struct BootHandle {
     /// way out is `take_memory`, which is what makes the one-owner rule hold.
     memory: Memory?,
     /// The Process handle, on the same terms — `take_process` is its one door.
-    /// A record has ONE object, so exactly one of these two slots is ever
-    /// occupied and `kind` is what says which.
     process: Process?,
+    /// The System handle, on the same terms — `take_system` is its one door.
+    /// A record has ONE object, so exactly one of these three slots is ever
+    /// occupied and `kind` is what says which. Three fields rather than an enum
+    /// payload because asking the WRONG one must be harmless: an enum would have
+    /// to be taken out of the record to be matched, and a mismatch would then
+    /// drop a capability the caller still wanted.
+    system: System?,
 }
 
 extension BootHandle: NoCopy {}
@@ -1284,6 +1337,16 @@ extension BootHandle {
     public func take_process(&var self) -> Process? {
         self.process.take()
     }
+
+    /// Take the System handle out of this record. Same terms as `take_memory`.
+    ///
+    /// A launcher's masked sibling arrives as one of these when it is given
+    /// under a tag the child DRAINS. When it is given as the child's BOOT TAG —
+    /// the ordinary shape — the child never meets this accessor at all: the
+    /// register is the delivery and the record is consumed by it.
+    public func take_system(&var self) -> System? {
+        self.system.take()
+    }
 }
 
 /// Decode a record the kernel copied out into a `BootHandle`.
@@ -1301,9 +1364,13 @@ func decode_boot_handle(tag: UInt, kind: UInt, handle: UInt) -> BootHandle {
     match what {
         case Memory -> BootHandle(tag: tag, kind: what,
                                   memory: Memory(handle: MemoryHandle(handle)),
-                                  process: None),
+                                  process: None, system: None),
         case Process -> BootHandle(tag: tag, kind: what, memory: None,
-                                   process: Process(handle: ProcessHandle(handle))),
+                                   process: Process(handle: ProcessHandle(handle)),
+                                   system: None),
+        case System -> BootHandle(tag: tag, kind: what, memory: None,
+                                  process: None,
+                                  system: System(handle: SystemHandle(handle))),
     }
 }
 

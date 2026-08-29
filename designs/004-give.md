@@ -1,14 +1,84 @@
 # SawOS design 4 — give, tags, and the boot drain (M3 unit 3)
 
-Status: BUILT Aug 29 2026 (see "As built" at the end — ONE deviation
-from a ruled sentence, with its argument, plus three findings; the
-deviation is the lead's to rule on). AUTHORED Aug 29 2026 (lead),
+Status: BUILT Aug 29 2026, after FOUR USER RULINGS taken at review
+that reshaped the unit — see "THE RULING CHAIN" directly below, which
+amends D-3 and D-4, and the "As built" at the end. AUTHORED Aug 29 2026 (lead),
 implementing the Aug-16 launch-
 flow ruling as amended same day (sawlang#232 unit 3: the give-return
 carries ONLY status; the boot-delivery op is an ITERATOR — third
 refinement, superseding the batch-buffer and one-shot shapes). Unit 2
 built the iterator early for root; this unit makes it what the ruling
 describes: the child's boot sequence as literally a receive loop.
+
+## THE RULING CHAIN (user, Aug 29 — amends D-3 and D-4)
+
+Four rulings landed in order during review, each answering what the
+one before it exposed. They are recorded as a CHAIN because the last
+one is only legible as the end of it.
+
+**0. WHAT FORCED THE CONVERSATION (the implementation's finding 1).**
+D-3's give-then-start sequence is not writable. `Start` is an op on
+the CHILD's Process handle, `Give` is a MOVE that unbinds the giver's
+entry, and there was exactly ONE such handle — so a launcher that
+gave it away had, at that instant, no way left to name the child and
+could never start it. Keeping it needed a SECOND handle onto one
+process, which design 3's finding 2 recorded as impossible; giving
+after start would unfreeze the boot set. An implementation folded the
+transfer into `start` (a `Donate` form) to get past it. That fold is
+SUPERSEDED.
+
+**1. A SECOND UNIVERSAL OP: `MINT_OP = 0xFFFE`.** Intercepted where
+`RELEASE_OP` is — after the lookup, before the kind match — it mints a
+SIBLING handle onto the same object into the CALLER's own table. Gated
+on a NEW UNIVERSAL RIGHT, `Mint`, using §3's reserved universal bits
+as the layout always intended. A source lacking it is `AccessDenied`.
+So design 3's finding 2 is CLOSED, and with it the whole ordering
+problem: a launcher mints what it hands over and keeps its own.
+
+**2. THE MASK IS A KEEP SET** (superseding a removal-mask first cut in
+the same conversation): `new_rights = held & rights`, all-ones being
+"the same rights". Still total — naming a right the source lacks is a
+no-op — and still needs no introspection op. **THE REASON IS EVOLUTION
+POLARITY: a keep mask FAILS CLOSED** as kinds gain rights, because a
+whitelist denies what it has never heard of, where the removal form
+failed OPEN. The case that decided it is ruling 3's: under a removal
+mask, a launcher masking a System handle would have handed every
+FUTURE System capability to every child it had ever configured.
+Subtractive intent survives as NOTATION — `mint(rights: ~Transfer …)`
+— so the fail-open choice is visible at the call site instead of being
+the language of the op.
+
+**3. CHILDREN GET A MASKED SYSTEM HANDLE.** `root_system_rights()`
+gains `Transfer`; M2 withheld it because "there is nobody to transfer
+a handle to in a one-process world", and unit 2 ended that world. So
+the launch flow is MINT -> GIVE -> START: a launcher mints a System
+sibling through a keep mask, gives it as the boot-tag record, starts
+the child naming that tag, and RETAINS the child's Process handle.
+**EVERY PROCESS THEN BOOTSTRAPS EXACTLY AS ROOT DOES** — System handle
+in the first argument register, own Process handle derived from it,
+boot set drained from there — which is a §12 symmetry the kernel now
+has by construction rather than by coincidence. A child can PRINT
+(`Debug` travelled) without owning a device, and cannot stop the
+machine (`Shutdown` did not). The brief's out-of-scope line "children
+stay console-silent until pipes" is RETIRED.
+
+**4. RESOLUTION CONSUMES ITS RECORD.** `start(boot_tag:)` spends the
+boot record it names: the register IS the delivery. This closes the
+implementation's finding 2 — a child could otherwise meet one word
+through two doors and release it twice — by making the hazard
+unrepresentable rather than documented.
+
+**5. `Manage` IS REMOVED AS A RIGHT, EVERYWHERE.** The doctrine:
+SPECIFIC RIGHTS FOR SPECIFIC OPERATIONS, PER OBJECT TYPE; UNIVERSAL
+BITS FOR UNIVERSAL OPS; THERE IS NO GENERIC AUTHORITY. `Manage` was
+too generic to mean anything — it stood in front of `ProcessSelf`,
+`ThreadSelf`, `Give` and a reading of sibling-derivation — and now
+means nothing. `Mint` takes its bit (1 << 1; numbers are not ABI), and
+`SystemRight.ProcessSelf`, `ProcessRight.ThreadSelf` and
+`ProcessRight.Give` are the bits that replaced it. It does NOT mean
+one bit per op number: `TimerRight.Arm` still gates `Arm` and
+`Disarm`, because that pair is ONE capability and splitting it would
+withhold nothing. The unit of a right is an AUTHORITY.
 
 ## The ruled surface, transcribed
 
@@ -96,65 +166,69 @@ bookkeeping and clear with the slot).
 
 ## D-3: The child's first handle — the create-mint re-ruled
 
-Unit 2 minted the child's Process handle with `Start | Wait |
-Manage` and wrote "unit 3 revisits". Revisited: **the handle
-`process_create` returns carries the FULL Process default set plus
-`Transfer`** — the self-management vocabulary (`ThreadCreate | Exit |
-Wait | EventCreate | WaiterCreate | InterruptBind | Manage`) plus
-`Start`, `BootHandles`, and `Transfer`.
+**AMENDED BY THE RULING CHAIN above; this section's reasoning stands
+and its conclusion moved.** As authored: unit 2 minted the child's
+Process handle with `Start | Wait | Manage` and wrote "unit 3
+revisits", and D-3 revisited it to the full Process default set plus
+`Transfer`, because the drain lives on Process and a child that is to
+drain must hold its own Process handle.
 
-Why: the drain lives on Process, and a child that is to drain must
-hold ITS OWN Process handle — which only root can put there, by
-giving the one create minted. With Transfer on it, root chooses per
-child:
+What the rulings changed is WHERE the child's authority comes from,
+and therefore what that width is for:
 
-- **KEEP it — supervision**: root retains `get_status` (and unit
-  5.5's death-wait); the child holds nothing and is the sandboxed
-  compute process. Unit 2's cases keep working unchanged this way.
-- **GIVE it (tagged, say, as the boot_tag) — donation**: the child
-  receives its own Process handle in a0, drains its boot set, makes
-  threads, exits with a code. Root retains nothing on the child.
+- **A CHILD DOES NOT RECEIVE A PROCESS HANDLE AT ALL.** It receives a
+  MASKED SYSTEM handle and derives its own Process object from it
+  (`SystemRight.ProcessSelf`), exactly as root does at boot. So the
+  Process default set is what a process holds over ITSELF and what a
+  launcher holds over its CHILD — one set, three minters, since the
+  doctrine left nothing distinguishing them.
+- **"ONE HANDLE, ONE CHOICE" IS GONE, and it was the finding that
+  removed it.** `MINT_OP` closes design 3's finding 2, so a launcher
+  KEEPS the child's Process handle (supervision: `get_status`, and
+  unit 5.5's death-wait) while the child manages itself. Unit 5.5 no
+  longer waits on the re-mint question.
+- The set is named for its ops throughout, per ruling 5: `ThreadCreate
+  | ThreadSelf | Exit | Wait | EventCreate | WaiterCreate |
+  InterruptBind | Start | BootHandles | Give`, plus the universal
+  `Transfer | Mint`.
 
-ONE handle, ONE choice — root cannot have both today, and that is
-stated rather than papered over: holding supervision AND donating
-self-management needs a SECOND handle onto the same process, which
-is exactly the re-mint question design 3's finding 2 recorded (no op
-mints a second handle onto an owned object). Unit 5.5 owns it: death
-notifications are when root genuinely needs to retain while the
-child holds its own. The harness meanwhile needs no root-side
-observation — the kernel's exit/fault/teardown transcript is the
-oracle either way.
-
-Rights-audit rider: the brief's implementer records, in the
-As-built, WHICH kinds' default sets currently mint `Transfer` (the
-universal bit exists in every enum; whether each `*_rights()` SETS
-it was decided before give existed). No default changes in this unit
-beyond the child-Process re-rule above — a kind whose default
-withholds Transfer simply cannot be given yet, and adjusting that is
-a per-kind ruling for the unit that needs it. Known today:
-`memory_rights()` mints it (unit 2), `root_system_rights()` does NOT
-(deliberate M2 choice — "nobody to transfer to"; root's System
-handle staying ungivable is v1-correct and gets a proof case).
+Rights-audit rider: the implementer records, in the As-built, WHICH
+kinds' default sets mint `Transfer` and `Mint`, BEFORE and AFTER. The
+rulings changed three things — `Manage` removed everywhere, `Mint`
+added everywhere (ruling 1's uniform lean, which the user may veto at
+integration), `Transfer` added to `root_system_rights()` (ruling 3) —
+and nothing else.
 
 ## D-4: The surface
 
 - `ProcessOp.Give` (bare verb — the receiver is the child) — args:
-  handle word, tag. Status-only return.
-- `ProcessOp.Start` gains the `boot_tag:` argument. The no-tag form
-  is arg = a sentinel; lean: reuse `NO_HANDLE`'s zero as "no tag" is
+  handle word, tag. Status-only return. **Gated on `ProcessRight.Give`
+  per ruling 5** (as authored it borrowed `Manage`), plus the
+  universal `Transfer` on the handle being given.
+- `ProcessOp.Start` gains the `boot_tag:` argument. The no-tag form is
+  arg = a sentinel; lean: reuse `NO_HANDLE`'s zero as "no tag" is
   WRONG (zero is a legitimate tag — root's region ordinal 0 exists
-  today!). The op takes a HAS-TAG flag argument or a reserved
-  all-ones sentinel; implementer picks and documents in sosabi. The
-  existing `start()` callers are the no-tag form.
-- sysapi: `Process.give(...)` — one funnel per wrapper kind (the
-  overload set or per-kind labels, implementer's call), each
-  consuming the wrapper and disarming per design 3's contract;
-  `start(boot_tag:)` overload. The child-side story needs one more
-  crossing: **adopting a0 as a Process wrapper** — `_start`'s raw
-  word becomes a typed `Process` (the `System(boot_handle:)`
-  precedent: one blessed crossing into the typed layer, sysapi-owned).
-- No new rights beyond D-3's re-rule; no new statuses; faults reuse
-  `DuplicateKey`, `BadState`, `BadArg`, `AccessDenied`.
+  today!). The op takes a HAS-TAG flag argument or a reserved all-ones
+  sentinel; implementer picks and documents in sosabi. The existing
+  `start()` callers are the no-tag form. **Resolution CONSUMES the
+  record it names, per ruling 4.**
+- **`MINT_OP` (ruling 1), universal, gated on the universal `Mint`
+  bit, argument a KEEP MASK (ruling 2), answering the sibling's word.**
+- sysapi: `Process.give(...)` — one funnel per givable wrapper kind,
+  each consuming the wrapper and disarming per design 3's contract;
+  `start(boot_tag:)` overload; `System.mint()` / `mint(rights:)`. The
+  child-side story needs one more crossing, and ruling 3 made it one
+  that ALREADY EXISTS: a child adopts a0 as a `System`, through
+  `System(boot_handle:)`, which is root's own blessed crossing. No
+  second one is owed.
+- Ruling 2 makes a rights ENUM public API for the first time — a keep
+  mask is a value a process assembles and passes as a syscall argument
+  — so `sosabi`'s `SystemRight` is re-exported through `sos`. The vDSO
+  wall is about OP NUMBERS and is unchanged.
+- New rights: the universal `Mint`, plus `SystemRight.ProcessSelf`,
+  `ProcessRight.ThreadSelf` and `ProcessRight.Give` (ruling 5).
+  `Manage` is removed. No new statuses; faults reuse `DuplicateKey`,
+  `BadState`, `BadArg`, `AccessDenied`, `BadHandle`.
 
 ## The proof (harness; children are real Blade packages)
 
@@ -168,9 +242,16 @@ handle staying ungivable is v1-correct and gets a proof case).
 2. **`give_duplicate_tag`** — second give with a used tag: root's
    `DuplicateKey` fault, transcript shows the sharpened line.
 3. **`give_after_start`** — `BadState` fault.
-4. **`give_no_transfer`** — root tries to give its own System handle
-   (whose default set withholds Transfer): `AccessDenied` fault. The
-   case doubles as the D-3 rights-audit's negative exhibit.
+4. **`give_no_transfer`** — as authored, root tries to give its own
+   System handle (whose default set withheld Transfer): `AccessDenied`
+   fault. **RESHAPED BY RULING 3**, which gave root's System handle
+   `Transfer`: the ungivable handle is now one a launcher MADE
+   ungivable, by minting a sibling through a mask that omits the bit.
+   Same fault, sharper claim — it is simultaneously the give's gate and
+   the attenuation proof. Rulings 1-2 add two more cases: `mint_revoked`
+   (a sibling masked below `Mint` cannot mint) and `child_no_shutdown`
+   (the mask holds at RUN TIME — the child prints, asks to halt, is
+   refused, and dies while root survives).
 5. **`start_bad_tag`** — boot_tag naming no record: `BadArg` fault.
 6. **Giver's word is dead** — an arm of case 1 or its own case: after
    a give, root touches the given handle's old word → `BadHandle`
@@ -200,370 +281,351 @@ counted anywhere a transcript shows).
 
 ## Out of scope
 
-Attenuation ops (rights travel as minted); a second handle onto an
-owned object (unit 5.5's re-mint question); give after start / any
-dynamic transfer (M4 pipes); System handles for children (nothing
-mints one to give; children stay console-silent until pipes — the
-echo driver speaks UART, not debug_print); quotas on boot records
-(unit 5); death notifications (5.5).
+**THREE OF THESE WERE BROUGHT IN SCOPE BY THE RULING CHAIN**, which is
+what makes it a chain rather than a clarification. ~~Attenuation ops~~
+and ~~a second handle onto an owned object~~ are BUILT, and they are one
+op (`MINT_OP`, rulings 1-2); ~~System handles for children~~ is BUILT
+(ruling 3), so the console-silent sentence is retired and the echo
+driver is no longer the only way anything but root can speak.
+
+Still out: give after start / any dynamic transfer to a RUNNING process
+(M4 pipes, to a receiver expecting it); quotas on boot records (unit 5);
+death notifications (5.5, which no longer waits on the re-mint
+question). And one the rulings ADDED: a handle cannot be narrowed below
+`Transfer` and still be given, so a receiver holds that bit too — a
+ruling for the unit that gives a child a pipe.
 
 ## As built
 
 Landed Aug 29. Gate: `SAWLANG_ROOT=$HOME/Projects/sawlang make
-sos-test` — **120 passed across riscv32 + arm64 (60 cases each)**,
+sos-test` — **124 passed across riscv32 + arm64 (62 cases each)**,
 against a baseline of 108 (54 each) taken at the merge base `546d0de`.
 
-D-1, D-2 and D-4's encoding landed as briefed. **D-3 could not**, and
-the reason is a genuine gap in the brief rather than a preference; it
-is the first section below, because everything else composes with it.
+D-1 and D-2 landed as briefed. D-3 and D-4 landed as the RULING CHAIN
+amends them; the chain's history is above, and what follows is what the
+tree now contains.
 
-### THE FINDING THAT MOVED THE DESIGN: a donation cannot be a give
+### The launch flow as landed
 
-D-3 rules that a child which is to drain must hold its own Process
-handle, "which only root can put there, by giving the one create
-minted", and proof case 1 describes give-then-start. **That sequence
-is not writable.** `Start` is an op on the CHILD's Process handle;
-`Give` is a MOVE that unbinds the giver's entry; and there is exactly
-ONE such handle in the system. So a launcher that gives it away has,
-at that instant, no way left to name the child and can never start it.
-Both halves of the collision are ruled, so neither could bend:
+```saw
+let for_child = system.mint(rights: Debug | ProcessSelf | ClockGet | Transfer)!
+child.give(system: move for_child, tag: 7)      // and the regions, 3 and 5
+child.start(boot_tag: 7)                        // resolution CONSUMES record 7
+// ...root still holds `child`, and reads get_status through it
+```
 
-- keeping the handle needs a SECOND one onto the same process, which
-  is design 3's finding-2 re-mint question and is explicitly unit
-  5.5's;
-- giving after start unfreezes the boot set, whose freeze IS the
-  soundness argument for the launch flow.
+Three ordinary ops, and the child then does what root does at boot:
+`System(boot_handle:)`, `process_self()`, drain. **The kernel has ONE
+way into user mode for every process** — the same claim §12's
+loader-above-boot rule makes about images — and the only difference
+between root and a child is a rights word.
 
-**Resolution, and it is a DEVIATION for the lead to rule on: the
-transfer happens AT the barrier.** `BootTagForm` has a third case,
-`Donate`, and `start(donating: tag)` moves the handle the op was
-invoked through into the child under `tag`, putting the child-side
-word in a0. That instant is the only one that is both *before the
-child's first instruction* and *while the launcher still holds the
-handle*. Nothing else about a give changes — it goes through the same
-`give_faults` and `move_handle` helpers `ProcessOp.Give` uses, so the
-fault set, the unbind-and-rebind, the rights-verbatim rule and the
-tagged record are literally the same code. D-3's "ONE handle, ONE
-choice" is unchanged and is now made at ONE call site: `start()` keeps
-it and supervises, `start(donating:)` hands it over.
+### `MINT_OP` as landed (rulings 1, 2)
 
-Consequences worth seeing together:
+`MINT_OP: UInt = 0xFFFE` in `sosabi`, intercepted in `dispatch()`
+immediately after `RELEASE_OP` and before the kind match.
+`mint_sibling` faults `BadHandle` on an unresolved source and
+`AccessDenied` without the universal `Mint`; otherwise `rights =
+entry.rights & UInt32.from(truncating: keep)`, a fresh `mint_handle`
+into the caller's own table, `NoResource` if that table is full.
 
-- `ProcessOp.Give` is unchanged and is what carries every OTHER
-  capability; the give order in proof case 1 is therefore 3, 5, 7
-  rather than 7, 3, 5 (the two regions, then the donation-at-start).
-- There is deliberately NO `Process.give(process:tag:)` funnel. The op
-  supports it, but the only Process handle a v1 launcher holds is the
-  one whose give it cannot survive, so a funnel for it would be a
-  method with no caller. The absence is documented at the site.
-- The alternative resolutions were weighed and rejected in the brief's
-  own terms: a special case that does not unbind on a self-give (two
-  handles onto one process by the back door, and "give is a move"
-  broken); a carve-out permitting a give while `Running` but not yet
-  scheduled (too clever, and racy the moment a tick exists); moving
-  the freeze (a ruling).
+Two mechanics worth recording:
+
+- **THE MASK IS TRUNCATED, NOT `as`-CAST.** `keep` is a register-wide
+  word a PROCESS chose, and `as UInt32` on a 64-bit profile would PANIC
+  INSIDE THE KERNEL over a number userspace picked. Rights are a 32-bit
+  word, so bits above the budget name no right and dropping them
+  changes no answer. (`handle_word_generation` refuses to narrow for
+  the opposite reason — its high bits MEAN something — and the two
+  sites together are the rule: narrow when the bits are meaningless,
+  widen the comparison when they are not.)
+- **THE EIGHT OP-TABLE ASSERTS NOW TEST `MINT_OP`**, the LOWER of the
+  two universal numbers, so one assert per table covers both and a
+  third universal op below it would tighten all eight at once. A ninth
+  assert pins `MINT_OP < RELEASE_OP`.
+
+### The universal byte as landed (ruling 5)
+
+| bit | before | after |
+|---|---|---|
+| 0 | `Transfer` | `Transfer` |
+| 1 | `Manage` | **`Mint`** |
+| 2-7 | reserved | reserved |
+
+`Manage` is REMOVED from all nine rights enums, not renamed; `Mint`
+takes its bit because numbers are not ABI and a hole where a retired
+right used to be is a number nobody can read a reason for. Each enum's
+universal `static_assert` pair is a pair again (`Transfer` at 0, `Mint`
+at 1), nine of each.
+
+Three kind-specific bits replaced it, each named for the op it gates:
+`SystemRight.ProcessSelf = 1 << 12`, `ProcessRight.ThreadSelf = 1 <<
+16`, `ProcessRight.Give = 1 << 17`, with the ordinary "at bit 8 or
+above" asserts.
+
+### The rights-audit table (D-3's rider), before and after
+
+`T` = `Transfer`, `M` = `Mint`, `Mg` = the retired `Manage`.
+
+| default set | before | after |
+|---|---|---|
+| `root_system_rights()` | Debug, Shutdown, ClockGet, ProcessCreate, **Mg** | Debug, Shutdown, ClockGet, ProcessCreate, **ProcessSelf**, **T**, **M** |
+| `root_process_rights()` | ThreadCreate, Exit, Wait, EventCreate, WaiterCreate, InterruptBind, BootHandles, **Mg** | *(collapsed — below)* |
+| `child_process_rights()` | Start, Wait, **Mg** | *(collapsed — below)* |
+| **`process_rights()`** *(new: one set, three minters)* | — | ThreadCreate, **ThreadSelf**, Exit, Wait, EventCreate, WaiterCreate, InterruptBind, Start, BootHandles, **Give**, **T**, **M** |
+| `memory_rights()` | T, **Mg** | T, **M** |
+| `thread_rights()` | Start, Join, Control | Start, Join, Control, **M** |
+| `event_rights()` | Signal, Receive, Wait | Signal, Receive, Wait, **M** |
+| `waiter_rights()` | Attach, Wait | Attach, Wait, **M** |
+| `interrupt_rights()` | Wait, Ack | Wait, Ack, **M** |
+| `clock_rights()` | Read, TimerCreate | Read, TimerCreate, **M** |
+| `timer_rights()` | Arm, Wait | Arm, Wait, **M** |
+
+**`Mint` IS IN EVERY SET UNIFORMLY**, the lead's lean the user may veto
+at integration. The argument is at the definition: a per-kind table
+nobody can predict from outside would mean a launcher has to know which
+kinds are mintable before it can write a policy, and a withheld `Mint`
+only means "this kind cannot be attenuated" — strictly worse, since the
+alternative to giving a narrowed sibling is giving the full-rights
+original.
+
+**THE TWO PROCESS SETS COLLAPSED INTO ONE.** Unit 2 gave a child's
+handle three bits, D-3 widened it to the self-management vocabulary
+plus `Start` and `Transfer`, and once `Manage` was retired nothing
+distinguished the lists. `Start` and `Give` read oddly on root's own
+handle and are harmless there — both refuse on the process STATE word,
+which answers for a child too.
+
+**SO TWO KINDS TRAVEL** (`Transfer`): Memory, and — new in this unit —
+System. A Process handle can travel and nothing needs it to; every
+other kind still cannot be given at all.
+
+### The keep mask, and the one thing it cannot narrow
+
+`new = held & keep`, all-ones the default (`ALL_RIGHTS` in `sos`), and
+subtractive intent spelled as a complement where a case means one:
+
+```saw
+static NO_TRANSFER: UInt32 = ~(SystemRight.Transfer as UInt32) & 0xFFFF_FFFF
+```
+
+The `& 0xFFFF_FFFF` is load-bearing and worth knowing: Saw folds
+constants in the SIGNED platform-`Int` domain, so a bare `~x` is
+negative and does not fit `UInt32` (design 185's documented gotcha).
+
+**A HANDLE CANNOT BE NARROWED BELOW `Transfer` AND STILL BE GIVEN** —
+found by building it, and caught by the gate on the first run. `give`
+checks `Transfer` on the thing being given, so a launcher cannot narrow
+past the ticket that lets the narrowed thing arrive; the child
+therefore holds `Transfer` on its System handle. Inert today (no
+`ProcessCreate` to make a receiver with, no pipe until M4), recorded at
+four sites, and a ruling for the unit that gives a child a pipe. It is
+the same constraint `give_no_transfer` proves from the refusing side.
+
+### The boot-queue shape as landed (D-2, ruling 4)
+
+The handle table's own idiom, so the file has ONE shape for per-process
+storage: `BOOT_HANDLES[MAX_PROCESSES * MAX_HANDLES]` indexed `p *
+MAX_HANDLES + i`, with `BOOT_HANDLE_COUNT` and `BOOT_HANDLE_NEXT`
+arrays. `MAX_HANDLES` is the bound D-2 asked for and is not arbitrary:
+every record names a handle in that process's table.
+
+`BootHandleSlot` gained a `taken: Bool`, which is ruling 4's mechanism.
+A record leaves through one of TWO doors — the drain, or
+`start(boot_tag:)`'s resolution — and either spends it; the flag is
+what lets the second door reach the middle of a queue a cursor alone
+cannot, and `boot_handle_cursor` steps the cursor over spent records so
+it still only ever advances. Six functions are the whole surface:
+`boot_handle_room`, `boot_tag_used` (the duplicate scan, which counts
+spent records because a tag is an IDENTITY for the process's whole
+set), `boot_handle_take` (the consuming resolver), `boot_handle_cursor`,
+`queue_boot_handle` and `clear_boot_handles`.
+
+`clear_boot_handles` at the teardown is load-bearing, not tidiness: a
+process slot is reclaimable since design 3 D-3, so a stale count and
+cursor would give the next occupant a stranger's set to drain.
 
 ### The no-tag encoding as landed (D-4)
 
 **A FLAG ARGUMENT, spelled as a backed enum: `BootTagForm: UInt {
-Absent = 0, Present = 1, Donate = 2 }` in `sosabi`.** `Start` takes
-the form in `arg0` and the tag in `arg1`.
+Absent = 0, Present = 1 }`.** `Start` takes the form in `arg0` and the
+tag in `arg1`. The all-ones sentinel was refused for a sharper reason
+than the brief's own (zero being a legitimate tag settles it alone): a
+tag is the giver's own word, so a kernel reserving ANY value would be
+interpreting the vocabulary it exists not to interpret. It is an enum
+rather than a bare 0/1 for the house rule, which also makes the decode
+`from(raw:)` — total, so `arg0 = 3` is `BadArg` rather than a number
+the kernel trusts.
 
-The all-ones sentinel was refused for a sharper reason than the
-brief's own (zero is a legitimate tag — root's region ordinals start
-at 0 — and that alone settles it against reusing `NO_HANDLE`): **a
-tag is the giver's own word handed back unread, so a kernel that
-reserved any value would be interpreting the vocabulary it exists not
-to interpret.** A flag costs one register `Start` was not using and
-reserves nothing. It is an enum rather than a bare 0/1 for the
-house rule (a closed named set is an enum), which also makes the
-decode `from(raw:)` — total, so `arg0 = 3` is the ordinary `BadArg`
-fault rather than a number the kernel trusts. Cases are
-`Absent`/`Present` rather than `None`/`Tag` so nothing in a `match`
-reads like an `Optional`.
-
-The C floor takes the form as a NUMBER
-(`sos_process_start(handle, boot_tag_form, boot_tag)`), which is the
-documented difference in kind the sysapi docstring already describes
-for `event_create`'s mode; the typed layer never writes one and offers
-`start()`, `start(boot_tag:)`, `start(donating:)` instead. The single
-export replaced unit 2's one-argument `sos_process_start`.
-
-### The boot-queue shape as landed (D-2)
-
-The handle table's own idiom, so the file has ONE shape for
-per-process storage:
-
-```saw
-BOOT_HANDLES: [BootHandleSlot; MAX_PROCESSES * MAX_HANDLES]   // p * MAX_HANDLES + i
-BOOT_HANDLE_COUNT: [Int; MAX_PROCESSES]
-BOOT_HANDLE_NEXT:  [Int; MAX_PROCESSES]
-```
-
-`MAX_HANDLES` is the bound D-2 asked for and it is not arbitrary:
-every record names a handle in that process's table, so a boot set
-larger than the table it fills could never be drained into existence.
-Five functions in `kcore.objects` are the whole surface —
-`boot_handle_room`, `boot_tag_used` (the duplicate scan),
-`boot_handle_word` (the tag resolver, which does NOT consume),
-`queue_boot_handle` and `clear_boot_handles`.
-
-**`clear_boot_handles` at the teardown is load-bearing, not tidiness.**
-A process slot is reclaimable since design 3 D-3, so a stale count and
-cursor would give the next occupant a stranger's boot set to drain.
-Nothing is released there — every record names an entry the close-all
-already unbound — which is exactly D-2's "the records are bookkeeping
-and clear with the slot".
-
-Root's boot minting goes through the same producer
-(`queue_boot_handle(ROOT_PROCESS, ordinal, …)`), which is what makes
-"the kernel is the giver nobody gave to" a fact about the code rather
-than a metaphor.
-
-### The funnel shapes as landed (D-4)
-
-An OVERLOAD SET on one verb, label-distinguished, each taking its
-wrapper BY VALUE and disarming before the syscall (design 3 D-5):
+### The funnel shapes as landed
 
 | spelling | receiver | wrapper |
 |---|---|---|
-| `child.give(memory: move r, tag: 3)` | `&self` | consumed |
-| `child.give(system: move s, tag: 1)` | `&self` | consumed |
-| `child.start(donating: 7)` | `&var self` | DISARMED, not consumed |
+| `system.mint()` / `mint(rights:)` | `&self` | answers a new `System` |
+| `child.give(memory: move r, tag:)` | `&self` | consumed |
+| `child.give(system: move s, tag:)` | `&self` | consumed |
+| `child.start()` / `start(boot_tag:)` | `&self` | — |
 
-The consuming shape is `var w = move <param>` — a by-value parameter
-is a `let`, and the disarm is a write. The third row is the exception
-and the reason is a language fact rather than a choice: **Saw has no
-consuming `self` receiver**, and `child.give(process: move child, …)`
-would move a value the same call is borrowing as its receiver. So the
-donation takes `&var self`, writes `NO_HANDLE` into the field, and
-leaves a HUSK whose drop does nothing and whose later use is the
-ordinary `BadHandle` — the generations backstopping the discipline
-exactly as D-5 said they would.
+The give funnels take their wrapper BY VALUE and disarm before the
+syscall (design 3 D-5); the consuming shape is `var w = move <param>`,
+because a by-value parameter is a `let` and the disarm is a write.
 
-**Two funnels and not nine**, per the rights audit below: a funnel for
-a kind whose default set withholds `Transfer` would be a method whose
-every call is an `AccessDenied` fault. `give(system:)` is the
-deliberate exception — the refusal is a claim worth being able to
-WRITE, and `give_no_transfer` is the case that writes it.
+**TWO GIVE FUNNELS AND NOT NINE**: a funnel for a kind whose default
+set withholds `Transfer` would be a method whose every call is an
+`AccessDenied` fault. There is no `give(process:)` because nothing
+needs one — a launcher KEEPS its child's Process handle, and a Process
+handle onto a THIRD process is a supervision hand-off nothing can hold
+two of yet. `System.mint` is the only mint funnel for the mirror
+reason: the op is universal and works on every kind, and a funnel
+arrives with the unit that narrows one.
 
-The a0-adoption crossing is `Process(boot_handle:)`, the
-`System(boot_handle:)` precedent with no side effects (the System one
-parks the panic path's handle; a Process one has nothing to park).
+**`Process(boot_handle:)` WAS BUILT AND THEN DELETED.** Ruling 3 made
+the ruled bootstrap System-in-a0, so a second crossing for a shape
+nothing takes would be surface with no caller. `System(boot_handle:)`
+carries the note about it.
 
-`BootHandle` gained a second private slot and a second accessor —
-`process: Process?` + `take_process()` — beside the existing
-`memory`/`take_memory`. Two optionals of which exactly one is ever
-occupied, with `kind` saying which: asking the wrong question answers
-`None` and DISTURBS NOTHING, where an enum payload would have had to
-be taken out of the record to be matched and then dropped on a
-mismatch.
+`BootHandle` gained two private slots and two accessors —
+`process`/`take_process` and `system`/`take_system` — beside `memory`.
+Three optionals of which exactly one is ever occupied, with `kind`
+saying which: asking the wrong question answers `None` and DISTURBS
+NOTHING, where an enum payload would have to be taken out of the record
+to be matched and a mismatch would then drop a capability the caller
+wanted.
 
-### The rights-audit table (D-3's rider)
+**`SystemRight` IS RE-EXPORTED THROUGH `sos`**, the first time a rights
+enum has been public API. Ruling 2 makes a keep mask a value a process
+assembles and passes as a syscall argument, which is exactly the module
+docstring's own definition of PUBLIC. The vDSO wall is about OP NUMBERS
+and is untouched; one enum is re-exported rather than nine, because a
+kind whose handles nothing masks has no reason to publish its bits.
 
-Which `*_rights()` default sets mint the universal `Transfer` bit,
-BEFORE and AFTER this unit. **Exactly one changed**, and it is the one
-D-3 re-ruled.
-
-| default set | Transfer before | Transfer after | note |
-|---|---|---|---|
-| `root_system_rights()` | NO | NO | the deliberate M2 "nobody to transfer to" choice; root's System handle stays ungivable and `give_no_transfer` is its proof |
-| `root_process_rights()` | NO | NO | nobody to give root's own Process handle to |
-| `child_process_rights()` | NO | **YES** | **the one change** — plus the full self-management set and `Start` |
-| `memory_rights()` | YES | YES | minted in unit 2 for exactly this unit |
-| `thread_rights()` | NO | NO | |
-| `event_rights()` | NO | NO | |
-| `waiter_rights()` | NO | NO | |
-| `interrupt_rights()` | NO | NO | |
-| `clock_rights()` | NO | NO | |
-| `timer_rights()` | NO | NO | |
-
-So **two kinds are givable in v1**: Memory, and a child's own Process
-handle. Everything else is refused at the `Transfer` check, which is
-why `BootHandleKind` declares two cases and `boot_kind_of` is
-deliberately PARTIAL — the day a kind becomes givable, the compiler
-asks for its record spelling rather than letting one arrive mis-tagged.
-
-`child_process_rights()` is DERIVED (`root_process_rights() | Start |
-Transfer`) rather than respelled, because that function IS this v1's
-"what a process may do to itself" vocabulary and a second copy of the
-list is a second place to forget a bit.
-
-### The numbers as landed
-
-| What | Value | Where |
-|---|---|---|
-| `ProcessOp.Give` | 9 | `kernel/abi/src/lib.saw` |
-| `BootTagForm.Absent` / `.Present` / `.Donate` | 0 / 1 / 2 | same |
-| `BootHandleKind.Process` | 1 | same |
-| `rights_allow_transfer(rights:)` | bit 0, kind-independent | same |
-
-**No new rights, no new statuses, no new fault reasons** — the unit
-reuses `DuplicateKey`, `BadState`, `BadArg`, `AccessDenied`,
-`BadHandle` and `NoResource`, exactly as D-4 required.
-
-### The order of checks, as landed
-
-`give_faults` raises every fault before anything is touched, and
-`move_handle` performs the two-table edit; `ProcessOp.Give` and
-`Start`'s donating form both call them, which is what makes "the
-donation is an ordinary give" a fact rather than two implementations
-that agree today.
-
-1. `Manage` on the receiver's handle (in the dispatch arm, like every
-   other op) — `AccessDenied`
-2. the given handle resolves — `BadHandle`
-3. it carries `Transfer` — `AccessDenied`
-4. its kind has a boot-record spelling — `BadArg` (unreachable today;
-   3 refuses everything 4 could)
-5. the child is still `Created` — `BadState`
-6. the tag is unused in the child's set — `DuplicateKey`
-7. room in the child's boot set — `NoResource` STATUS
-8. mint into the CHILD — `NoResource` STATUS, caller's entry untouched
-9. unbind the giver's entry (generation bump), append the record
-
-Steps 8 and 9 are in that order deliberately: the child-side binding
-is made FIRST, so a full table is a give that did not happen rather
-than a capability lost between two tables.
-
-In `Start`'s donating form the fault set runs before `alloc_thread`,
-which is a pure scan that reserves nothing — so an early `NoResource`
-there leaks neither a thread slot nor a capability.
-
-### One new kernel report line, and why it moves no shipped row
+### One new kernel report line
 
 ```
-SOS: process exit: code=0x00000003 process=0x00000001
+SOS: process exit: code=0x00000002 process=0x00000001
 ```
 
-**A donated child has no other voice.** It holds no System handle
-(nothing in v1 mints a givable one), so it cannot print; and its
-launcher gave the Process handle away, so there is no §8 status word
-left for anyone to read. The brief asks the transcript to show the
-exit code, and this is the minimum that makes that true.
-
-It is a SEPARATE line rather than a field appended to the teardown,
-because appending would rewrite a line every process that ever died
-has printed. It is gated on `p != ROOT_PROCESS && kind == Exited`, and
-**no case written before this unit can reach it**: root takes the
-other arm of §8's fork, and no child before now could exit at all
-(both existing children fault). Verified against the transcript diff —
-the 108 pre-existing rows are byte-identical.
+Gated on `p != ROOT_PROCESS && kind == Exited`, so **no case written
+before this unit can reach it**: root takes the other arm of §8's fork,
+and no child before now could exit at all. It is a separate line rather
+than a field appended to the teardown, because appending would rewrite
+a line every process that ever died has printed.
 
 ### The proof, and exactly what was diffed
 
-Six all-arch cases, seven new Blade packages (six root servers and one
-CHILD — `child-drain`, the first SOS process that is neither root nor
-a sandboxed compute process).
+Eight all-arch cases, ten new Blade packages (eight root servers and
+TWO children — the first SOS processes that are neither root nor
+sandboxed).
 
 | case | claim | verdict |
 |---|---|---|
-| `give_boot_drain` | the money shot: three records in give order, `Drained` stays `Drained`, exit code == drain count | clean exit |
+| `give_boot_drain` | mint -> give -> start; the child SPEAKS, drains TWO, exits 2; root reads status through the handle it KEPT | clean exit |
 | `give_duplicate_tag` | a reused tag is `DuplicateKey` | root faults |
 | `give_after_start` | the set freezes at start — `BadState` | root faults |
-| `give_no_transfer` | root's own System handle withholds `Transfer` — `AccessDenied` | root faults |
+| `give_no_transfer` | a sibling masked below `Transfer` cannot be given — `AccessDenied` | root faults |
 | `start_bad_tag` | a tag naming no record is `BadArg` | root faults |
 | `give_word_dead` | the giver's word is stale afterwards — `BadHandle` | root faults |
+| `mint_revoked` | a sibling masked below `Mint` cannot mint — `AccessDenied` | root faults |
+| `child_no_shutdown` | the mask holds at RUN TIME: the child prints, asks to halt, is refused, dies; root survives | clean exit |
 
-The money shot's transcript, riscv32 (arm64 identical but for word
-width):
+The money shot, riscv32 (arm64 identical but for word width):
 
 ```
-SOS: boot regions=0x00000002
-SOS: console handover
 SOS givedrain: created
-SOS givedrain: gave regions 3 5
-SOS givedrain: donated and started
-SOS: process exit: code=0x00000003 process=0x00000001
-SOS: process teardown handles=0x00000001 threads=0x00000001 ... process=0x00000001
-SOS givedrain: root survived
+SOS givedrain: minted a masked System
+SOS givedrain: gave 7 3 5
+SOS givedrain: started
+SOS childdrain: n=2 tags=35 kinds=0
+SOS: process exit: code=0x00000002 process=0x00000001
+SOS: process teardown handles=0x00000002 ... process=0x00000001
+SOS givedrain: root observed child status=65538
 SOS givedrain: done
 ```
 
-`code=3` is the child counting its own drain — three records, tags
-`357` accumulated as digits so the number carries the ORDER, kinds
-`001`, and a second ask that answered `Drained`. A mismatch on any of
-those exits `99` instead. `handles=1` is the child's whole estate: it
-declined both regions at the drain (their records dropped and released
-them) and kept only the Process handle it exited through.
+`SOS childdrain:` is the first time anything but root has spoken. `n=2`
+is ruling 4 asserted — three capabilities given, the boot-tag record
+consumed by resolution — and `tags=35` carries the ORDER as digits.
+`code=2` and `status=65538` are the same fact from the two sides of the
+boundary: the kernel's account, and root's, through the Process handle
+it never gave away. `handles=2` is the child's estate — the System
+handle it printed through and the Process handle it derived — the two
+regions having been declined at the drain.
 
-`give_word_dead` works at the C altitude, and that is half the claim
-rather than a shortcut: the typed funnel CONSUMES its wrapper, so "use
-the word you gave away" is not a sentence the typed layer can express.
-`handle_remint` reaches the same floor for the mirror reason.
+`mint_revoked` carries TWO claims in one transcript, recorded rather
+than padded: every default set grants `Mint`, so the only way to hold a
+source lacking it is to have minted one, and "the sibling cannot mint"
+and "a source without `Mint` is `AccessDenied`" are the same program.
+`give_no_transfer` is the same doubling for `Transfer` — the give's
+gate and the attenuation proof at once.
 
-**ACCEPTANCE.** The suite was run TWICE under the machine-wide lock:
-once at the merge base (`546d0de`, unmodified) and once with the change.
+**ACCEPTANCE.** The suite was run under the machine-wide lock at the
+merge base (`546d0de`, unmodified) and again with the change.
 
 - **The 108 pre-existing case rows are BYTE-IDENTICAL** in name,
   verdict and ORDER on both architectures with the `[i/N]` denominator
   stripped (`diff` reports no difference at all). The only row-level
-  change is six new rows appended per architecture.
+  change is eight new rows appended per architecture.
 - **The only other differences are sosimg build-info lines and the
-  total.** Seven new package lines; every riscv32 image grew 56–872
-  bytes, which is the `sos` module gaining `sos_process_give` and a
-  wider `sos_process_start` as `@export`ed C-ABI seams that
-  `--gc-sections` keeps in every image linking the module — the same
-  reason design 2 recorded. On arm64 32 of 33 images did not move at
-  all: that profile page-aligns its sections, so the growth is
-  absorbed by padding, and only `process-lifecycle` crossed a boundary.
+  total**: ten new package lines, and every pre-existing riscv32 image
+  grew 80-1712 bytes — the `sos` module gaining `sos_handle_mint`,
+  `sos_process_give` and a wider `sos_process_start` as `@export`ed
+  C-ABI seams that `--gc-sections` keeps in every image linking the
+  module. On arm64 29 of 33 images did not move at all: that profile
+  page-aligns its sections and the growth is absorbed by padding.
 - Each new case was additionally booted by hand on both machines and
   its console transcript read line by line, not merely matched.
 
 ### Findings
 
-1. **A DONATION CANNOT BE A GIVE** — the design gap above. It is the
-   headline finding and the one thing the lead must rule on.
-2. **A give whose tag is also the boot tag hands the child ONE word
-   through TWO doors**, and sysapi cannot detect it. Resolving a tag
-   consumes no record (D-2's rule), so a donated child meets its own
-   Process handle as a register AND as an iterator entry; two live
-   wrappers would mean two releases and the second is a `BadHandle`
-   the program did nothing to deserve. It is sound in practice because
-   a child's last act is `exit`, which never returns, so no deinit runs
-   — but "exactly one owner" is the child program's obligation here
-   rather than the type system's, which is the one place in the `sos`
-   module where that is true. Recorded at `Process(boot_handle:)`, at
-   `BootHandle.take_process` and in `child-drain`'s header. A unit that
-   wants it closed should consider whether `start(boot_tag:)` ought to
-   CONSUME the record it resolves.
-3. **`FaultReason.DuplicateKey`'s text still names attachments.** "an
+1. **A HANDLE CANNOT BE NARROWED BELOW `Transfer` AND STILL BE GIVEN.**
+   The one the rulings did not anticipate; caught by the gate. See the
+   keep-mask section — recorded at four sites, inert today, a ruling
+   for the unit that gives a child a pipe.
+2. ~~A give whose tag is also the boot tag hands the child one word
+   through two doors~~ CLOSED by ruling 4 — the hazard is
+   unrepresentable rather than documented, which is what the ruling was
+   for.
+3. ~~A donation cannot be a give~~ CLOSED by rulings 1-3; it is what
+   forced them, and design 3's finding 2 closed with it.
+4. **`FaultReason.DuplicateKey`'s text still names attachments.** "an
    attachment already uses that key" was written for §2.2's keys and
    now covers a give's tag as well. The string is ASSERTED by a shipped
    transcript (`event_dupkey`) and this unit authorised no expectation
    changes, so it did not move; the generalisation is recorded at the
-   declaration and `give_duplicate_tag` asserts the same sentence. A
-   later unit that touches that row should widen it to name the key
-   rather than the attachment.
-4. **No compiler defect was hit.** One ordinary Saw limitation was met
-   and is the documented one: DF-172d — a binary expression does not
-   wrap unless brackets enclose it — so a four-clause condition in
-   `child-drain` is bound to a parenthesised `let` first. Everything
-   else the unit needed worked as documented on the pinned toolchain:
-   an `&var self` method disarming its own field, a by-value NoCopy
-   parameter moved into a `var` local for the same purpose, a second
-   `Optional<NoCopy>` slot on a `NoCopy` record, `Optional.take`
-   through a new accessor, a three-case `match` on a raw-backed enum
-   inside a `let`, and a `&ProcessObject` forwarded from a match arm.
+   declaration and `give_duplicate_tag` asserts the same sentence.
+5. **`MINT_OP` makes design 3's finding-2 rewrite possible and it is
+   NOT done here.** `event-wake` and `event-consume-wake` share a
+   handle by ADDRESS through a parked `UnsafePointer` because no op
+   could mint a second one; they can now hold one handle each, which is
+   the shape those programs always wanted. BACKLOG on purpose: the
+   rewrite would move shipped transcript rows, which this unit
+   authorised none of.
+6. **No compiler defect was hit.** Two ordinary Saw facts were met and
+   both are documented: DF-172d (a binary expression does not wrap
+   unless brackets enclose it), and design 185's signed-`Int` const
+   fold (a bare `~x` is negative, so a complement mask needs
+   `& 0xFFFF_FFFF`). Everything else worked as documented on the pinned
+   toolchain — a keep mask assembled from re-exported enum cases at a
+   `UInt32` parameter (DF-240a's const adoption), a third
+   `Optional<NoCopy>` slot on a `NoCopy` record, a by-value NoCopy
+   parameter moved into a `var` local to disarm it.
 
 ### Docs updated
 
-spec §2's Process row (`Give`, the `boot_tag` start, the per-process
-drain, the re-ruled child mint); §3's universal-low-byte bullet (the
-`Transfer` bit's first consumer and which defaults mint it), the
-no-amplification amendment (a give is a move, not a mint), and the
-transfer-funnel paragraph (its first consumers, and the one wrapper
-that is disarmed rather than consumed); §11's launch-flow entry
-flipped to BUILT with the three things still absent named; §12 gained
-the per-process boot set, the tag-is-the-identity rule, the freeze and
-the `start(boot_tag:)` sentence. `sosabi`: `ProcessOp.Give`,
-`BootTagForm`, `BootHandleKind.Process`, `rights_allow_transfer`,
-`child_process_rights`'s re-rule, `ProcessRight`'s second meaning for
-`Manage`, and a note at `DuplicateKey`. `kcore.objects`' boot-queue
-section rewritten for the per-process shape; `kcore.dispatch`'s
-`process_start`, `process_create` mint and `boot_handle_next`
-docstrings — every unit-2 "unit 3 revisits" note now resolves;
-`kcore.sched`'s teardown. `sysapi`: the give funnels, the three `start`
-forms, `Process(boot_handle:)`, `BootHandle`'s second slot, and the C
-floor's two new/changed exports. Design 3's finding 2 gained unit 5.5
-as its owner. Tracker closed in place.
+spec §2's `MemoryObject`, `Process` and `System` rows; §3's universal
+byte (the doctrine, `Mint` at bit 1, `Manage` removed), the
+no-amplification example list, the `Transfer`-first-consumer bullet, a
+new `Mint`/`MINT_OP` bullet, and the attenuation-is-monotonic bullet
+(attenuation is PERFORMABLE now); §11's launch-flow entry plus a new
+BUILT entry for attenuation-and-a-second-handle; §12's boot-set section
+(per-process sets, the tag doctrine, the freeze, consume-on-resolution,
+the bootstrap symmetry). `sosabi` throughout: the doctrine, nine rights
+enums, three new kind-specific bits, `MINT_OP`, `rights_allow_mint`,
+the collapsed `process_rights()`, `root_system_rights()`'s `Transfer`,
+`BootTagForm`, `BootHandleKind`, and the `Manage` history notes.
+`kcore.objects`' boot-queue section; `kcore.dispatch`'s mint
+interception, `process_start`, `process_give`, the three re-gated ops
+and the create-mint; `kcore.sched`'s teardown. `sysapi`: `System.mint`,
+the give funnels, the two `start` forms, `BootHandle`'s three slots,
+`SystemRight`'s re-export, and the C floor. Design 3's finding 2 marked
+CLOSED with the chain that closed it. Tracker closed in place.

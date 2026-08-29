@@ -487,14 +487,26 @@ public(package) func alloc_memory() unsafe -> Int {
 // has no deadline at all.
 
 /// One boot handle waiting to be collected.
+///
+/// **`taken` IS WHICH DELIVERY ALREADY HAPPENED** (the Aug-29 user ruling on
+/// design 4). A record leaves the set through one of two doors — the drain, or
+/// `start(boot_tag:)` putting its word in the child's first argument register —
+/// and a delivery through either spends it. The flag is what lets the SECOND
+/// door reach into the middle of the queue, which a cursor alone cannot: a
+/// resolved record may sit anywhere, and the drain simply skips it.
+///
+/// A TAG STAYS SPENT WHETHER OR NOT ITS RECORD WAS DELIVERED — `boot_tag_used`
+/// scans the whole set, flag and all — because a tag is an IDENTITY for the
+/// process's boot set, not a slot in a queue.
 public(package) struct BootHandleSlot {
     public(package) tag: UInt,
     public(package) kind: BootHandleKind,
     public(package) handle: UInt,
+    public(package) taken: Bool,
 }
 
 public(package) unsafe static var BOOT_HANDLES: [BootHandleSlot; MAX_PROCESSES * MAX_HANDLES] = [
-    BootHandleSlot(tag: 0, kind: BootHandleKind.Memory, handle: 0);
+    BootHandleSlot(tag: 0, kind: BootHandleKind.Memory, handle: 0, taken: false);
     MAX_PROCESSES * MAX_HANDLES]
 
 /// How many records are queued for each process.
@@ -534,19 +546,27 @@ public(package) func boot_tag_used(p: Int, tag: UInt) unsafe -> Bool {
     false
 }
 
-/// The handle word process `p`'s set carries under `tag`, or `NO_HANDLE`.
+/// TAKE the handle word process `p`'s set carries under `tag`, or `NO_HANDLE`
+/// when no record carries it.
 ///
-/// **`start(boot_tag:)`'s RESOLVER, and it does NOT consume the record** (sawos
-/// design 4). The tag is delivered to the child's first argument register AND
-/// stays in the set to be drained, which is what makes the child's boot sequence
-/// literally a receive loop over everything it was given, the boot handle
-/// included.
-public(package) func boot_handle_word(p: Int, tag: UInt) unsafe -> UInt {
+/// **`start(boot_tag:)`'s RESOLVER, AND IT CONSUMES** (the Aug-29 user ruling on
+/// design 4). Putting the word in the child's first argument register IS the
+/// delivery, so the record is marked spent and the drain will skip it — a child
+/// is never handed one word twice, and the two-owners-of-one-word hazard that
+/// the non-consuming reading created is unrepresentable rather than documented.
+///
+/// A record already taken answers `NO_HANDLE` too, which is the same answer a
+/// tag nobody gave gets: both are "there is no word here to deliver", and the
+/// caller turns either into the `BadArg` fault. Nothing today can reach the
+/// second — a set freezes at start and start happens once — and the arm costs a
+/// comparison.
+public(package) func boot_handle_take(p: Int, tag: UInt) unsafe -> UInt {
     var i: Int = 0
     while i < BOOT_HANDLE_COUNT[p] {
-        let rec = BOOT_HANDLES[p * MAX_HANDLES + i]
-        if rec.tag == tag {
-            return rec.handle
+        let at = p * MAX_HANDLES + i
+        if BOOT_HANDLES[at].tag == tag && not BOOT_HANDLES[at].taken {
+            BOOT_HANDLES[at].taken = true
+            return BOOT_HANDLES[at].handle
         }
         i = i + 1
     }
@@ -560,8 +580,26 @@ public(package) func queue_boot_handle(p: Int, tag: UInt, kind: BootHandleKind,
                                        handle: UInt) unsafe {
     let n = BOOT_HANDLE_COUNT[p]
     BOOT_HANDLES[p * MAX_HANDLES + n] = BootHandleSlot(tag: tag, kind: kind,
-                                                       handle: handle)
+                                                       handle: handle,
+                                                       taken: false)
     BOOT_HANDLE_COUNT[p] = n + 1
+}
+
+/// Advance process `p`'s cursor past every record already delivered, and answer
+/// where it now points.
+///
+/// **THE CURSOR ONLY EVER ADVANCES**, which is the whole of the lifetime rule and
+/// is unchanged by the second delivery door: a record `start(boot_tag:)` took is
+/// one the drain steps over, exactly as it steps over one it delivered itself.
+/// So a drained iterator stays drained, and no record is ever handed out twice
+/// however it left the set.
+public(package) func boot_handle_cursor(p: Int) unsafe -> Int {
+    var at = BOOT_HANDLE_NEXT[p]
+    while at < BOOT_HANDLE_COUNT[p] && BOOT_HANDLES[p * MAX_HANDLES + at].taken {
+        at = at + 1
+    }
+    BOOT_HANDLE_NEXT[p] = at
+    at
 }
 
 /// Forget process `p`'s set. Called by the teardown.

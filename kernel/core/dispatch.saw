@@ -40,6 +40,7 @@ import sosabi.{
     BootTagForm,
     BootHandleKind,
     rights_allow_transfer,
+    rights_allow_mint,
     wait_record_bytes,
     CLOCK_NOW_RECORD_DOUBLEWORDS,
     clock_now_record_bytes,
@@ -57,10 +58,10 @@ import sosabi.{
     interrupt_rights,
     clock_rights,
     timer_rights,
-    child_process_rights,
-    root_process_rights,
+    process_rights,
     NO_HANDLE,
     RELEASE_OP,
+    MINT_OP,
     ENTRY_IMAGE,
 }
 import kcore.limits.{
@@ -97,8 +98,9 @@ import kcore.objects.{
     ThreadObject,
     TimerObject,
     WaiterObject,
+    boot_handle_cursor,
     boot_handle_room,
-    boot_handle_word,
+    boot_handle_take,
     boot_tag_used,
     handle_word_index,
     lookup_handle,
@@ -238,24 +240,26 @@ func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt, arg1: UInt,
         // to read a word cached on the process slot, which said "a process has
         // one Process handle" — and that is not what §3 guarantees. What §3
         // forbids is AMPLIFICATION: a mint carries the kind's DEFAULT rights and
-        // the minting is itself gated (`Manage`, right here), so a caller asking
+        // the minting is itself gated (`ProcessSelf`, right here), so a caller asking
         // twice gets two capability INSTANCES of exactly the authority it
         // already had. Instances are the point — each is independently held and
         // independently released, which is what an owning wrapper is an owner
         // OF, and the cached word could not have been released by anybody.
         //
-        // The default set is `root_process_rights()`, this v1's vocabulary for
-        // "a process's authority over itself". What a CHILD's default withholds
-        // is unit 3's question and is deliberately not answered here.
+        // The default set is `process_rights()`, and there is exactly ONE —
+        // root's, a process's own, and a child's are the same list since the
+        // Aug-29 doctrine left nothing distinguishing them (see `sosabi`). What
+        // a CHILD gets narrower than that is now a launcher's KEEP MASK at
+        // `MINT_OP` rather than a second default set.
         //
         // IT CAN NOW FAIL, which the cached read could not: a full handle table
         // is `NoResource`, a thing the caller could not have known. Unit 5 is
         // where that gets a quota row.
         case ProcessSelf -> {
-            if not obj.allows(SystemRight.Manage) {
+            if not obj.allows(SystemRight.ProcessSelf) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            let handle = mint_handle(p, ObjType.Process, root_process_rights(), p)
+            let handle = mint_handle(p, ObjType.Process, process_rights(), p)
             if handle == NO_HANDLE {
                 return op_status(SosStatus.NoResource)
             }
@@ -359,11 +363,13 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
         },
         // MINT-PER-CALL, exactly as `ProcessSelf` above (sawos design 3 D-4):
         // the cached word on the thread slot is gone, the default rights are
-        // `thread_rights()`, and `Manage` on the PROCESS handle is what gates
-        // the derivation. A full table is `NoResource` — reachable now, where
-        // reading a cached word never was.
+        // `thread_rights()`, and `ThreadSelf` on the PROCESS handle is what
+        // gates the derivation — a bit named for its op since the Aug-29
+        // doctrine retired the generic `Manage` it used to borrow. A full table
+        // is `NoResource` — reachable now, where reading a cached word never
+        // was.
         case ThreadSelf -> {
-            if not obj.allows(ProcessRight.Manage) {
+            if not obj.allows(ProcessRight.ThreadSelf) {
                 fault_process(p, FaultReason.AccessDenied)
             }
             if CURRENT_THREAD == NO_THREAD {
@@ -442,7 +448,7 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             if not obj.allows(ProcessRight.Start) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            process_start(p, &obj, arg0, arg1)
+            process_start(p, obj.slot, arg0, arg1)
         },
         // §12's boot set, drained one record at a time. It is asked of the
         // process's OWN handle: the set belongs to the process it was minted
@@ -459,13 +465,17 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
         },
         // **THE COURIER OP** (sawos design 4). It is asked of the CHILD's handle
         // — `obj.slot` is the process being furnished — which is why it keeps
-        // the bare verb, and it is gated on `Manage` on that handle: handing a
-        // capability into a process you created is management OF it, the same
-        // bar `Start` sits behind. The OTHER gate is on the handle being GIVEN
-        // and is the ruling's own: the universal `Transfer` bit, checked inside
+        // the bare verb, and it is gated on `ProcessRight.Give` on that handle
+        // — "may place handles into this child's boot set", an authority with
+        // its own name since the Aug-29 doctrine (an earlier cut borrowed the
+        // generic `Manage`, which is exactly the borrowing the doctrine
+        // refuses). It sits BESIDE `Start` rather than inside it because the two
+        // are separable: a supervisor may run and watch a child without being
+        // allowed to furnish it. The OTHER gate is on the handle being GIVEN and
+        // is the ruling's own: the universal `Transfer` bit, checked inside
         // `process_give` where the entry is known and the kind is not.
         case Give -> {
-            if not obj.allows(ProcessRight.Manage) {
+            if not obj.allows(ProcessRight.Give) {
                 fault_process(p, FaultReason.AccessDenied)
             }
             process_give(p, obj.slot, arg0, arg1)
@@ -570,14 +580,13 @@ func process_create(p: Int, image_handle: UInt,
         return op_status(SosStatus.NoResource)
     }
     // THE CHILD'S FIRST HANDLE, and unit 2's "unit 3 revisits" note is
-    // RESOLVED: `child_process_rights()` is the full self-management set plus
-    // `Start`, `BootHandles` and `Transfer` (sawos design 4 D-3). The width is
-    // what makes the launch flow work — the drain lives on the Process object,
-    // so a child that is to drain must hold its own Process handle, and this is
-    // the only handle onto it that exists. `Transfer` is what lets root CHOOSE:
-    // keep it and supervise, or give it and donate. One handle, one choice; the
-    // second-handle question is unit 5.5's.
-    let handle = mint_handle(p, ObjType.Process, child_process_rights(), slot)
+    // RESOLVED: it is `process_rights()`, the one Process default set (sawos
+    // design 4 D-3, collapsed by the Aug-29 doctrine). A LAUNCHER KEEPS THIS
+    // HANDLE — it is what it supervises the child with — and the child derives
+    // its own from the masked System handle it was given, exactly as root does
+    // at boot. So the width here is not what a child receives; it is what a
+    // launcher holds, and what it hands on is a keep mask's business.
+    let handle = mint_handle(p, ObjType.Process, process_rights(), slot)
     if handle == NO_HANDLE {
         return op_status(SosStatus.NoResource)
     }
@@ -627,35 +636,29 @@ func process_create(p: Int, image_handle: UInt,
 ///     that names no given record is a `BadArg` FAULT — config error, and the
 ///     caller is the one that chose both the tag it gave and the tag it started
 ///     with.
-///   - `BootTagForm.Donate` is **THE GIVE AT THE BARRIER**, and it is the form
-///     that makes a self-managing child expressible at all. See below.
-///   - Resolution does NOT consume the record. The child receives the word in a0
-///     AND drains the record like any other, which is what makes its boot
-///     sequence literally a receive loop over everything it was given.
+///   - **RESOLUTION CONSUMES THE RECORD** (the Aug-29 user ruling). Putting the
+///     word in the child's first argument register IS the delivery, so the drain
+///     never answers with a word the child already holds. That is what makes
+///     "a child cannot be handed one word twice" a property of the kernel rather
+///     than an obligation on the child: two live wrappers over one word would be
+///     two releases, and the second a fault the program did nothing to deserve.
 ///
-/// **WHY `Donate` EXISTS — a gap in design 4 D-3, and the deviation that closes
-/// it.** D-3 rules that a child which is to drain must hold its own Process
-/// handle, "which only root can put there, by giving the one create minted", and
-/// the proof it describes is give-then-start. That sequence cannot be written:
-/// `Start` is an op on the CHILD's Process handle, `Give` is a MOVE that unbinds
-/// the giver's entry, and there is exactly ONE such handle — so a launcher that
-/// gives it away has, at that instant, no way left to name the child and can
-/// never start it. Both halves are ruled, so neither could bend:
+/// **THE LAUNCH FLOW IS MINT -> GIVE -> START, and `Start` does one thing.** A
+/// launcher mints a MASKED SIBLING of its own System handle (`MINT_OP` with a
+/// keep mask), GIVES the sibling under a tag, and STARTS the child naming that
+/// tag — keeping the child's Process handle throughout, so it retains
+/// supervision (`get_status`, and unit 5.5's death-wait) while the child holds
+/// its own authority. Both at once, which is what the mint bought.
 ///
-///   - Keeping the handle would need a SECOND one onto the same process, which
-///     is design 3's finding-2 re-mint question and is explicitly unit 5.5's.
-///   - Giving after start would unfreeze the boot set, whose freeze IS the
-///     soundness argument for the whole launch flow.
-///
-/// So the transfer happens AT the barrier, which is the one instant that is
-/// both "before the child's first instruction" and "while the launcher still
-/// holds the handle". Nothing about a give changes: it is the same
-/// unbind-and-rebind, the same rights VERBATIM, the same tagged record appended
-/// to the child's set, performed by the same helpers `Give` uses — the only
-/// difference is that the handle being moved is THE ONE THE OP WAS INVOKED
-/// THROUGH, which is exactly why it could not have been moved a moment earlier.
-/// "One handle, one choice" is unchanged and is now made at ONE call site:
-/// `start()` keeps it and supervises, `start(donating: tag)` hands it over.
+/// **AND THE CHILD BOOTSTRAPS EXACTLY AS ROOT DOES** (§12's symmetry): a System
+/// handle in the first argument register, its own Process handle derived through
+/// its own `ProcessSelf` right, its boot set drained from there. The kernel has
+/// ONE way in for
+/// every process, which is the same claim §12's loader-above-boot rule makes
+/// about images. An implementation of design 4 briefly folded a handle transfer
+/// into this op, because with only ONE Process handle per child a launcher that
+/// gave it away had nothing left to start with; the Aug-29 rulings dissolved
+/// that by making a second handle mintable, and the fold went with it.
 ///
 /// **ROOT KEEPS RUNNING.** The thread goes on the ready queue and the caller
 /// returns normally; the child runs when the scheduler next picks it, which is
@@ -666,9 +669,8 @@ func process_create(p: Int, image_handle: UInt,
 /// it the first time. THE SAME WORD FREEZES THE BOOT SET — a give after this
 /// point is the same `BadState` — which is the give-before-start ordering that
 /// makes a half-populated table unrepresentable.
-func process_start(caller: Int, obj: &ProcessObject,
+func process_start(caller: Int, child: Int,
                    raw_form: UInt, tag: UInt) unsafe -> SyscallResult {
-    let child = obj.slot
     // The FORM arrives as a raw register word the process chose, so it is
     // decoded rather than trusted, on `event_create`'s and `clock_get`'s
     // precedent exactly: a number that is not a `BootTagForm` is a caller error
@@ -681,55 +683,23 @@ func process_start(caller: Int, obj: &ProcessObject,
         case _ -> fault_process(caller, FaultReason.BadState),
     }
 
-    // EVERY FAULT IS RAISED BEFORE ANY EFFECT, which for the donating form means
-    // the whole of a give's fault set — `Transfer`, the record spelling and the
-    // duplicate tag — is settled here, while both tables are still untouched.
-    // `own` is the entry for THE HANDLE THIS OP WAS INVOKED THROUGH, which is the
-    // one the donating form moves; reading it on the other two forms costs a
-    // table lookup and keeps the shape flat.
-    //
-    // The other two arms answer a kind nothing reads — only the `Donate` arm
-    // below names `donate_kind` — because a `match` must produce a value on
-    // every path and there is no kind to name where no handle moves.
-    let own = lookup_handle(caller, obj.handle)
-    let donate_kind = match form {
-        case Donate -> give_faults(caller, child, own, tag),
-        case _ -> BootHandleKind.Memory,
-    }
-
-    // The statuses next, in the order that leaves the least behind. Nothing
-    // below `alloc_thread` can fail once the handle has moved, and
-    // `alloc_thread` itself is a pure scan that reserves nothing — so an early
-    // return here leaks neither a slot nor a capability.
+    // The one status this op can answer with, taken BEFORE the record is
+    // consumed so that a refusal leaves the boot set exactly as it was.
+    // `alloc_thread` is a pure scan and reserves nothing, so an early return
+    // here leaks no slot either.
     let slot = alloc_thread()
     if slot == NO_THREAD {
         return op_status(SosStatus.NoResource)
-    }
-    match form {
-        case Donate -> {
-            if not boot_handle_room(child) {
-                return op_status(SosStatus.NoResource)
-            }
-        },
-        case _ -> {},
     }
 
     let boot_word = match form {
         case Absent -> NO_HANDLE,
         case Present -> {
-            let w = boot_handle_word(child, tag)
+            let w = boot_handle_take(child, tag)
             if w == NO_HANDLE {
                 fault_process(caller, FaultReason.BadArg)
             }
             w
-        },
-        case Donate -> {
-            let given = move_handle(caller, child, obj.handle, own,
-                                    donate_kind, tag)
-            if given == NO_HANDLE {
-                return op_status(SosStatus.NoResource)
-            }
-            given
         },
     }
 
@@ -759,6 +729,7 @@ func boot_kind_of(kind: ObjType) -> BootHandleKind? {
     match kind {
         case Memory -> BootHandleKind.Memory,
         case Process -> BootHandleKind.Process,
+        case System -> BootHandleKind.System,
         case _ -> None,
     }
 }
@@ -769,8 +740,10 @@ func boot_kind_of(kind: ObjType) -> BootHandleKind? {
 /// A GIVE IS A MOVE, NOT A MINT. The fresh entry in the child's table carries the
 /// SAME kind, the SAME target and the SAME rights word as the caller's did — no
 /// default set is consulted and nothing amplifies, so what root attenuated stays
-/// attenuated. (There is no attenuate op yet; rights today are as minted. That is
-/// recorded rather than solved — design 4's out-of-scope list.) The caller's
+/// attenuated — and since the Aug-29 rulings a launcher ATTENUATES BEFORE IT
+/// GIVES, by minting a masked sibling (`MINT_OP`) and giving that. The two ops
+/// divide cleanly: mint narrows a capability inside one table, give moves one
+/// between two. The caller's
 /// entry unbinds exactly as a release does, GENERATION BUMP INCLUDED, so the
 /// giver's word is stale the instant the op returns and its later use is the
 /// diagnosed `BadHandle` fault design 3's generations exist to draw.
@@ -820,10 +793,9 @@ func process_give(p: Int, child: Int, word: UInt, tag: UInt) unsafe -> SyscallRe
 /// D-1's order, answering the record kind the move will use. Never returns on a
 /// fault; touches nothing on any path.
 ///
-/// **ONE FAULT SET, TWO DOORS** — `ProcessOp.Give` and `Start`'s donating form
-/// (which is a give at the barrier, see `process_start`). Sharing the checks is
-/// what makes "the donation is an ordinary give" a fact rather than two
-/// implementations that agree today.
+/// It is split out of `process_give` rather than inlined so that the FAULT SET
+/// and the EFFECT read as the two separate things D-1 orders them as: everything
+/// here happens before anything below `move_handle` touches a table.
 func give_faults(p: Int, child: Int, entry: HandleEntry,
                  tag: UInt) unsafe -> BootHandleKind {
     match entry.obj_type {
@@ -916,7 +888,10 @@ func boot_handle_next(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
     if cap < (boot_handle_record_bytes() as UInt) {
         fault_process(p, FaultReason.BadArg)
     }
-    let cursor = BOOT_HANDLE_NEXT[p]
+    // The cursor first steps over anything `start(boot_tag:)` already delivered
+    // through the register door — one record, one delivery, whichever door it
+    // went out of (the Aug-29 user ruling).
+    let cursor = boot_handle_cursor(p)
     if cursor >= BOOT_HANDLE_COUNT[p] {
         return op_status(SosStatus.Drained)
     }
@@ -1606,7 +1581,10 @@ func waiter_wait(p: Int, w: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
 /// one — there is no one to protect from it. Releasing your System handle or
 /// your own Process handle is legal-but-doomed on the sandboxed-compute
 /// precedent: you lose the authority, which is what you asked for. A gate, if
-/// one is ever wanted, is a NEW universal bit and never a retasking of `Manage`.
+/// one is ever wanted, is a NEW universal bit and never a retasking of an
+/// existing one. (The ruling said "never a retasking of `Manage`"; that bit has
+/// since been retired outright by the Aug-29 doctrine, which is the same
+/// sentence taken further.)
 ///
 /// **A WORD THAT DOES NOT RESOLVE IS THE ORDINARY `BadHandle` FAULT** — the
 /// caller reached this line with `entry` already looked up, so `NO_HANDLE`, a
@@ -1636,6 +1614,65 @@ func release_handle(p: Int, word: UInt, entry: HandleEntry) unsafe -> SyscallRes
     op_ok()
 }
 
+/// `MINT_OP` — a SIBLING handle onto the same object, in the caller's own table,
+/// with rights the caller may only NARROW (the Aug-29 user rulings on design 4).
+///
+/// **IT IS UNIVERSAL FOR RELEASE'S REASON**, and it sits beside release for the
+/// same one: naming an object twice is the same act for every kind, so it is one
+/// number the dispatch intercepts at the one point that knows the ENTRY and not
+/// yet the KIND. Nine per-kind cases would be one body written nine times.
+///
+/// **THE MASK IS A KEEP SET.** `new = held & keep`, all-ones is "same rights",
+/// and the intersection is what makes NO-AMPLIFICATION STRUCTURAL rather than
+/// checked: a sibling is a subset of its source by construction, so a garbage
+/// mask cannot widen anything. It is also TOTAL — naming a right the source does
+/// not hold is a no-op, so there is nothing to fault on — which is what lets one
+/// policy mask apply to handles of several kinds without the launcher knowing
+/// which bits each carries. The polarity is the ruling: a keep mask FAILS CLOSED
+/// when a kind gains a right later, where a removal mask would have passed the
+/// new authority through silently. `sosabi`'s `MINT_OP` carries the full
+/// argument.
+///
+/// **IT IS GATED ON THE UNIVERSAL `Mint` BIT**, and that bit is itself maskable
+/// — so a launcher hands out a sibling whose mask omitted `Mint` and the
+/// proliferation stops exactly where it said it would. A source that does not
+/// resolve is the ordinary `BadHandle`, as for release; a source without `Mint`
+/// is `AccessDenied`.
+///
+/// What comes back is INDEPENDENT: its own slot, its own generation, its own
+/// release. It names the same object, which is what makes it a second NAME
+/// rather than a second object. The generic `Manage` bit that once half-covered
+/// this act is gone (the Aug-29 doctrine), which is why the universal byte now
+/// holds exactly the two authorities that are genuinely kind-independent.
+///
+/// A full table is `NoResource`, a STATUS: a caller could not have known.
+func mint_sibling(p: Int, entry: HandleEntry, keep: UInt) unsafe -> SyscallResult {
+    match entry.obj_type {
+        case Unbound -> fault_process(p, FaultReason.BadHandle),
+        case _ -> {},
+    }
+    if not rights_allow_mint(entry.rights) {
+        fault_process(p, FaultReason.AccessDenied)
+    }
+    // THE MASK IS A KEEP SET AND THE OPERATION IS AN INTERSECTION, which is what
+    // makes no-amplification STRUCTURAL: the result is a subset of the source by
+    // construction, not by a check somebody could forget. Naming a right the
+    // source does not hold is a no-op, so there is no over-ask to fault on.
+    //
+    // The narrowing is TRUNCATING and not `as`, deliberately: `keep` is a
+    // register-wide word a PROCESS chose, and an `as UInt32` on a 64-bit profile
+    // would PANIC INSIDE THE KERNEL over a number userspace picked. Rights are a
+    // 32-bit word, so the bits above the budget name no right and dropping them
+    // changes no answer — `handle_word_generation` refuses to narrow for the
+    // opposite reason, and the difference is that its bits MEAN something.
+    let rights = entry.rights & UInt32.from(truncating: keep)
+    let word = mint_handle(p, entry.obj_type, rights, entry.target)
+    if word == NO_HANDLE {
+        return op_status(SosStatus.NoResource)
+    }
+    op_value(word)
+}
+
 /// Handle-table lookup -> object type -> op table -> rights check -> op.
 ///
 /// This is where a raw word becomes a TYPED handle (§3), and the order is the
@@ -1651,18 +1688,23 @@ func release_handle(p: Int, word: UInt, entry: HandleEntry) unsafe -> SyscallRes
 /// content — the three caller errors it covers are exactly the three the
 /// dispatch can raise before an op body runs.
 ///
-/// **RELEASE IS INTERCEPTED BETWEEN THE TWO** (sawos design 3 D-2), and the
-/// position is the design: after the lookup, so the entry is resolved and a word
-/// naming nothing still faults; before the kind match, so the op never has to
-/// exist nine times. This is the one point in the kernel that knows a handle's
-/// ENTRY and not yet its KIND, which is exactly the altitude a kind-independent
-/// op belongs at.
+/// **THE UNIVERSAL OPS ARE INTERCEPTED BETWEEN THE TWO** (sawos design 3 D-2 for
+/// release, design 4's Aug-29 rulings for mint), and the position is the design:
+/// after the lookup, so the entry is resolved and a word naming nothing still
+/// faults; before the kind match, so neither op has to exist nine times. This is
+/// the one point in the kernel that knows a handle's ENTRY and not yet its KIND,
+/// which is exactly the altitude a kind-independent op belongs at — and having
+/// TWO of them now is what says that altitude was a real place rather than a
+/// convenience for one op.
 func dispatch(handle: UInt, op: UInt,
               arg0: UInt, arg1: UInt, arg2: UInt) unsafe -> SyscallResult {
     let p = calling_process()
     let entry = lookup_handle(p, handle)
     if op == RELEASE_OP {
         return release_handle(p, handle, entry)
+    }
+    if op == MINT_OP {
+        return mint_sibling(p, entry, arg0)
     }
     match entry.obj_type {
         case Unbound -> fault_process(p, FaultReason.BadHandle),

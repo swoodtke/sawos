@@ -1,55 +1,56 @@
-// SOS CHILD: THE DONATED PROCESS (sawos design 4 — M3 unit 3's money shot).
+// SOS CHILD: THE FURNISHED PROCESS (sawos design 4 — M3 unit 3's money shot).
 //
-// **THE FIRST SOS PROCESS THAT IS NEITHER ROOT NOR DOOMED.** Every child before
-// this unit received `NO_HANDLE` in its first argument register and could do
-// exactly one thing — die trying (see `child-fault`). This one is handed its OWN
-// Process handle there, drains the boot set its launcher furnished, and ends
-// itself with a code. The whole of unit 3 is what makes those three sentences
-// writable.
+// **THE FIRST SOS PROCESS THAT IS NEITHER ROOT NOR DOOMED, and the first that
+// ever spoke.** Every child before this unit received `NO_HANDLE` in its first
+// argument register and could do exactly one thing — die trying (see
+// `child-fault`). This one receives a MASKED SYSTEM HANDLE there and bootstraps
+// exactly as root does: derive its own Process object, drain the boot set its
+// launcher furnished, report, exit with a code.
 //
-// WHAT IT ASSERTS, and every one of these is a property of `give`:
+// **THE SYMMETRY IS THE POINT** (§12). The kernel has one way in for every
+// process — a System handle in a0 and nothing else — and root's differs from
+// this one only in which bits its rights word carries. Root's was minted by the
+// kernel at boot; this one is a SIBLING its launcher minted through a keep mask
+// and gave under the tag it was started with. Neither side can tell, and neither
+// needs to.
 //
-//   - THREE RECORDS arrive, which is exactly what the launcher gave.
-//   - THEY ARRIVE IN GIVE ORDER — tags 3, 5, 7, accumulated as DIGITS into
-//     `357` so that one number carries the ORDER and not only the set. A kernel
-//     that delivered them out of order would produce a different number.
-//   - THEIR KINDS are Memory, Memory, Process — `001` accumulated, so `1`.
-//   - `Drained` STAYS `Drained`: the second ask after the loop hands nothing
-//     back, which is the claim that the cursor only advances and that a boot
-//     set cannot be collected twice.
+// WHAT IT ASSERTS, and every one is a property of `give`, `mint` or `start`:
 //
-// AND IT REPORTS THEM WITH ITS EXIT CODE, because it has no other voice. A
-// donated child holds no System handle — nothing mints a givable one in v1 — so
-// it cannot print, and its LAUNCHER cannot read its §8 status word either: root
-// gave the one Process handle away, which is design 4 D-3's "one handle, one
-// choice" seen from the far side. The kernel's own `SOS: process exit:` line is
-// therefore the oracle, and root never has to witness anything. That is the
-// proof the unit is actually about.
+//   - IT CAN SPEAK. `Debug` was in the mask, so this program prints — the first
+//     time in SOS that anything but root has. It owns no device and drives no
+//     UART; the authority came through a handle.
+//   - IT CAN NAME ITSELF. `ProcessSelf` was in the mask, so `process_self()`
+//     answers and everything below hangs off it.
+//   - TWO RECORDS arrive, not three. The launcher gave THREE capabilities; the
+//     one named by the boot tag was CONSUMED by `start`'s resolution, because
+//     the register IS its delivery. `n=2` is that ruling, asserted.
+//   - THEY ARRIVE IN GIVE ORDER — tags 3 then 5, accumulated as DIGITS into
+//     `35` so one number carries the ORDER and not only the set.
+//   - `Drained` STAYS `Drained`: the second ask hands nothing back, which is the
+//     claim that the cursor only advances — over records delivered through
+//     EITHER door.
 //
-// **THE ONE HAZARD IN THIS PROGRAM, and it is the design's rather than this
-// file's.** The handle in a0 and the record tagged 7 are THE SAME WORD: starting
-// with a boot tag resolves the tag, it does not consume the record, so the child
-// meets its own Process handle twice — once as a register and once as an
-// iterator entry. Two live wrappers over one word would mean two releases, and
-// the second is a `BadHandle` fault the program did nothing to deserve. So this
-// file TAKES the Process out of its record and keeps it for the rest of `_start`,
-// beside the adopted one, and ends with `exit` — which never returns, so neither
-// wrapper ever runs its deinit and the word is closed exactly once, by the
-// kernel's teardown. `sos` cannot check this for you: one construction is a
-// register read and the other an iterator entry, and nothing connects them.
+// AND THE EXIT CODE IS THE DRAIN COUNT, which is what the launcher reads back
+// through the Process handle it kept. The console line and the status word say
+// the same thing from the two sides of the boundary, which is the whole of
+// supervision working while the child manages itself.
+//
+// WHAT IT CANNOT DO is the other half of the claim, and `child_no_shutdown` is
+// where that is proved: `Shutdown`, `ProcessCreate`, `Transfer` and `Mint` were
+// absent BY SILENCE from the keep mask, so this process cannot stop the machine,
+// cannot spawn, cannot pass its authority on and cannot widen it.
 //
 // It names no architecture and would build for either profile unchanged; the
 // only per-machine thing about it is the linker script the manifest points at.
 
-import sos.{Process, BootHandle, BootHandleKind, SosStatus}
+import sos.{System, Process, BootHandle, BootHandleKind, SosStatus}
 
-/// What the launcher's config says it gave, in the order it gave it. This side
-/// of the contract is the child's manifest of expectations; the other side is
-/// `give-boot-drain`'s three `give` calls. THE TAGS ARE THE ONLY THING THE TWO
-/// SHARE — the kernel supplies no meaning for any of them.
-static WANT_RECORDS: UInt = 3
-static WANT_TAGS: UInt = 357
-static WANT_KINDS: UInt = 1
+/// What the launcher's config says it gave, in the order it gave it — and what
+/// `start`'s resolution took back out again. THE TAGS ARE THE ONLY THING THE TWO
+/// PROGRAMS SHARE; the kernel supplies no meaning for any of them.
+static WANT_RECORDS: UInt = 2
+static WANT_TAGS: UInt = 35
+static WANT_KINDS: UInt = 0
 
 /// What it ends with when the boot set was not what the config promised. A
 /// number that could not be a record count, so the transcript's `code=` field
@@ -58,57 +59,58 @@ static EXIT_MISMATCH: UInt = 99
 
 @export("_start")
 func _start(boot_handle: UInt) {
-    // THE ADOPTION. `boot_handle` is the word the kernel resolved out of this
-    // process's own boot set at `start(donating:)`, so it is a handle the kernel
-    // handed over rather than a number anybody guessed — the same blessed
-    // crossing `System(boot_handle:)` is for root.
-    let me = Process(boot_handle: boot_handle)
+    // THE ADOPTION, and it is the same line root writes. `boot_handle` is the
+    // word the kernel resolved out of this process's own boot set at
+    // `start(boot_tag:)` — a handle the kernel handed over, not a number anybody
+    // guessed — and that record is spent, so nothing can hand it over twice.
+    let system = System(boot_handle: boot_handle)
 
-    // The record tagged 7 names the very word above (see the header). Taking it
-    // here is what stops the record from releasing that word when it drops.
-    var donated: Process? = None
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(e) -> {
+            print("SOS childdrain: no process handle: {}\n", e)
+            return
+        },
+    }
 
     var count: UInt = 0
     var tags: UInt = 0
     var kinds: UInt = 0
     var going = true
     while going {
-        match me.boot_handle_next() {
+        match proc.boot_handle_next() {
             case Ok(h) -> {
                 var rec = move h
                 tags = tags * 10 + rec.tag
                 kinds = kinds * 10 + (rec.kind as UInt)
-                match rec.kind {
-                    case Process -> { donated = rec.take_process() },
-                    // A region this child was given and does not want is a
-                    // capability it declines: the record drops at the end of
-                    // this arm and releases it, which is drop-is-release doing
-                    // exactly what design 3 built it for.
-                    case Memory -> {},
-                }
+                // A region this child was given and does not want is a
+                // capability it declines: the record drops at the end of this
+                // arm and releases it, which is drop-is-release doing exactly
+                // what design 3 built it for.
                 count = count + 1
             },
             case Err(_) -> { going = false },
         }
     }
 
-    // AND IT STAYS DRAINED. The cursor only advances, so a boot set is collected
-    // once — which matters more for a child than it did for root, since these
-    // records are capabilities a launcher may have given away exactly once.
-    let still_drained = match me.boot_handle_next() {
+    // AND IT STAYS DRAINED. The cursor only advances — over the record `start`
+    // took as well as the ones delivered here — so a boot set is collected once.
+    let still_drained = match proc.boot_handle_next() {
         case Ok(_) -> false,
         case Err(_) -> true,
     }
+
+    print("SOS childdrain: n={} tags={} kinds={}\n", count, tags, kinds)
 
     // The brackets are load-bearing: a binary expression does not wrap in Saw
     // unless something already encloses it (DF-172d).
     let as_promised = (count == WANT_RECORDS && tags == WANT_TAGS
                        && kinds == WANT_KINDS && still_drained)
     if not as_promised {
-        let _ = me.exit(EXIT_MISMATCH)
+        let _ = proc.exit(EXIT_MISMATCH)
     }
 
-    // THE EXIT CODE IS THE DRAIN COUNT, and this call does not return — which is
-    // also what keeps the two wrappers over one word harmless (see the header).
-    let _ = me.exit(count)
+    // THE EXIT CODE IS THE DRAIN COUNT, and the launcher reads it back through
+    // the Process handle it kept. This call does not return.
+    let _ = proc.exit(count)
 }

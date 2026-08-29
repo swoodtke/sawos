@@ -1,0 +1,64 @@
+// SOS M3 unit 3: A SIBLING WITHOUT `Mint` CANNOT MINT (sawos design 4, as ruled
+// Aug 29).
+//
+// **THE PROPERTY THAT MAKES MINTING SAFE TO GIVE AWAY.** `MINT_OP` is gated on
+// the universal `Mint` bit, and `Mint` is a bit like any other in the keep mask
+// — so a launcher may hand out a handle that can be used and cannot be
+// multiplied. Without that, one `Mint` anywhere would be `Mint` everywhere
+// downstream forever, and attenuating a chain would mean never starting one.
+//
+//   SOS mintrevoked: minted without Mint
+//   SOS: process fault: access denied process=0
+//   SOS: process teardown ... process=0
+//
+// **IT IS ALSO THE ONLY WAY TO HOLD A SOURCE THAT LACKS `Mint` AT ALL**, which
+// is why one transcript carries two claims that read as separate rulings. Every
+// default set in the system grants `Mint` (the uniform lean), so a handle
+// without it is necessarily one somebody MASKED — and the refusal proved here is
+// simultaneously "the sibling cannot mint" and "a mint through a source lacking
+// `Mint` is `AccessDenied`". A second case would have been the same program.
+//
+// THE SOURCE IS ROOT'S OWN SYSTEM HANDLE and the first mint SUCCEEDS, which is
+// what makes the second refusal mean something: the op works, the caller holds a
+// perfectly good handle onto the machine's System object, and the ONE thing it
+// cannot do is the thing its mask took away. A kernel that ignored the bit would
+// print the survival line instead.
+//
+// The mask is spelled as a COMPLEMENT — everything except `Mint` — which is the
+// notation the polarity ruling leaves available for exactly this: the case means
+// "the same authority, minus the power to copy it".
+
+import sos.{System, SosStatus, SystemRight}
+
+static EXIT_FAILED: UInt = 1
+
+/// Everything this handle has, EXCEPT the universal mint bit. The
+/// `& 0xFFFF_FFFF` keeps the fold inside `UInt32`: Saw folds constants in the
+/// signed platform-`Int` domain, where a bare `~x` is negative.
+static NO_MINT: UInt32 = ~(SystemRight.Mint as UInt32) & 0xFFFF_FFFF
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    // ONE: a sibling of root's System handle, carrying everything root has
+    // except the authority to make another. The op is ungated by anything but
+    // `Mint`, which root holds, so this succeeds.
+    let narrowed = match system.mint(rights: NO_MINT) {
+        case Ok(s) -> s,
+        case Err(e) -> {
+            print("SOS mintrevoked: first mint failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS mintrevoked: minted without Mint\n")
+
+    // TWO: ask the sibling for a sibling. The chain stops here — this does not
+    // return, because a source without `Mint` is a caller error and design 178's
+    // faults ruling ends the process that made it.
+    let _ = narrowed.mint()
+
+    let _ = system.debug_print("SOS mintrevoked: survived, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

@@ -208,17 +208,20 @@ HANDLE_RELEASE_TWICE_PKG = os.path.join(TESTS_DIR, "handle-release-twice")
 HANDLE_MALFORMED_WORD_PKG = os.path.join(TESTS_DIR, "handle-malformed-word")
 HANDLE_DROP_RELEASE_PKG = os.path.join(TESTS_DIR, "handle-drop-release")
 PROCESS_RECLAIM_PKG = os.path.join(TESTS_DIR, "process-reclaim")
-# sawos design 4 (M3 unit 3): give, tags and the boot drain. Six root servers
-# and one more CHILD — the first SOS process that is neither root nor a
-# sandboxed compute process, since it is donated its own Process handle and can
-# therefore drain, make threads and exit.
+# sawos design 4 (M3 unit 3): mint, give, and the boot drain. Eight root servers
+# and two more CHILDREN — the first SOS processes that are neither root nor
+# sandboxed, since each receives a MASKED SYSTEM HANDLE and can therefore print,
+# name itself, drain and exit.
 GIVE_BOOT_DRAIN_PKG = os.path.join(TESTS_DIR, "give-boot-drain")
 GIVE_DUPLICATE_TAG_PKG = os.path.join(TESTS_DIR, "give-duplicate-tag")
 GIVE_AFTER_START_PKG = os.path.join(TESTS_DIR, "give-after-start")
 GIVE_NO_TRANSFER_PKG = os.path.join(TESTS_DIR, "give-no-transfer")
 START_BAD_TAG_PKG = os.path.join(TESTS_DIR, "start-bad-tag")
 GIVE_WORD_DEAD_PKG = os.path.join(TESTS_DIR, "give-word-dead")
+MINT_REVOKED_PKG = os.path.join(TESTS_DIR, "mint-revoked")
+CHILD_NO_SHUTDOWN_PKG = os.path.join(TESTS_DIR, "child-no-shutdown")
 CHILD_DRAIN_PKG = os.path.join(TESTS_DIR, "child-drain")
+CHILD_OVERSTEPS_PKG = os.path.join(TESTS_DIR, "child-oversteps")
 
 CLOCK_BASICS_PKG = os.path.join(TESTS_DIR, "clock-basics")
 TIMER_ONESHOT_PKG = os.path.join(TESTS_DIR, "timer-oneshot")
@@ -1665,39 +1668,54 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     # =========================================================================
-    # M3 unit 3 — give, tags, and the boot drain (sawos design 4)
+    # M3 unit 3 — mint, give, and the boot drain (sawos design 4)
     # =========================================================================
     #
-    # Six cases, and the thing they have in common is that BEFORE this unit a
-    # child held no handle at all. Every one of them is therefore about a
-    # sentence that could not previously be written: hand a capability across a
+    # Eight cases, and the thing they have in common is that BEFORE this unit a
+    # child held no handle at all. Every one is therefore about a sentence that
+    # could not previously be written: NARROW an authority, hand it across a
     # process boundary, name it with a word the kernel never reads, and let the
     # receiver find it.
     #
-    # All six append a child image and publish a two-row region table, exactly
-    # as unit 2's do.
+    # THE THREE OPS DIVIDE CLEANLY and the cases follow them. `MINT_OP` narrows a
+    # capability inside one table (`mint_revoked`, `give_no_transfer`); `Give`
+    # moves one between two (`give_duplicate_tag`, `give_after_start`,
+    # `give_word_dead`); `Start` delivers one to a register and freezes the set
+    # (`start_bad_tag`). `give_boot_drain` is all three at once, and
+    # `child_no_shutdown` is what the narrowing was FOR.
     {
-        # THE MONEY SHOT, and it is read as an ORDER. Root furnishes the child
-        # with two regions under tags 3 and 5, DONATES it its own Process handle
-        # at the start barrier under tag 7, and then knows nothing more: it gave
-        # the handle away, so there is no `get_status` here and there could not
-        # be one (design 4 D-3's "one handle, one choice", seen from the side
-        # that chose donation).
+        # THE MONEY SHOT: MINT -> GIVE -> START, three ordinary ops, and the
+        # launcher keeps what it supervises with.
         #
-        # `SOS: process exit: code={three}` IS THE PROOF ROOT NEVER HAD TO
-        # WITNESS. The child drained three records, checked their tags, kinds and
-        # ORDER, checked that `Drained` stays `Drained`, and put the COUNT in its
-        # exit code — the only voice a donated child has, since nothing in v1
-        # mints a givable System handle and it therefore cannot print. A kernel
-        # that delivered the records out of order, or that let the tagged record
-        # be consumed by the start's resolution, would print `code=0x…63` (99)
-        # instead. THAT LINE IS NEW IN THIS UNIT and is unreachable for every
-        # case written before it: root takes the other arm of the fork, and no
-        # child before now could exit at all.
+        # Root NARROWS its own System authority into a sibling (`Debug |
+        # ProcessSelf | ClockGet | Transfer` — `Shutdown`, `ProcessCreate` and
+        # `Mint` absent BY SILENCE, which is the keep mask's fail-closed
+        # polarity), GIVES the sibling under tag 7 with two Memory regions under
+        # 3 and 5, and STARTS the child naming tag 7. It never gives away the
+        # child's Process handle, so it still supervises. `Transfer` stays in the
+        # mask because it is the bit `give` checks on the thing being given — a
+        # launcher cannot narrow below the ticket that lets the handle arrive,
+        # which is a finding recorded in the brief.
         #
-        # `handles={one}` in the teardown is the child's estate: three gives, and
-        # it declined both regions at the drain (their records dropped and
-        # released them), keeping only the Process handle it is exiting through.
+        # `SOS childdrain:` IS THE FIRST TIME ANYTHING BUT ROOT HAS SPOKEN. The
+        # child owns no device; `Debug` travelled in the mask.
+        #
+        # `n=2` IS A RULING, not an off-by-one: three capabilities were given and
+        # the one named by the boot tag was CONSUMED by `start`'s resolution,
+        # because the register IS its delivery. `tags=35` carries the ORDER as
+        # digits, so a kernel delivering out of order prints `53`.
+        #
+        # `code=2` and `status=65538` are the SAME FACT from the two sides of the
+        # boundary — the kernel's account of the child's exit, and root reading
+        # `Exited`(1)<<16 | 2 through the Process handle it kept. Both at once is
+        # what the mint bought: before it, a launcher had one Process handle per
+        # child and had to choose between supervising and furnishing.
+        #
+        # `handles={two}` in the teardown is the child's estate: the System
+        # handle it printed through and the Process handle it derived from it.
+        # Three capabilities were given and it DECLINED both regions at the drain
+        # — their records dropped and released them — which is drop-is-release
+        # showing up in a case that is not about it.
         "name": "give_boot_drain",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": GIVE_BOOT_DRAIN_PKG,
@@ -1705,13 +1723,15 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
                        "SOS givedrain: created",
-                       "SOS givedrain: gave regions 3 5",
-                       "SOS givedrain: donated and started",
-                       "SOS: process exit: code={three} process={one}",
-                       "SOS: process teardown handles={one} threads={one} "
+                       "SOS givedrain: minted a masked System",
+                       "SOS givedrain: gave 7 3 5",
+                       "SOS givedrain: started",
+                       "SOS childdrain: n=2 tags=35 kinds=0",
+                       "SOS: process exit: code={two} process={one}",
+                       "SOS: process teardown handles={two} threads={one} "
                        "events={zero} waiters={zero} interrupts={zero} "
                        "timers={zero} process={one}",
-                       "SOS givedrain: root survived",
+                       "SOS givedrain: root observed child status=65538",
                        "SOS givedrain: done"],
         "expect_clean_exit": True,
     },
@@ -1757,21 +1777,28 @@ TEST_CASES = [
         "expect_status": EXIT_PROCESS_FAULT,
     },
     {
-        # THE RIGHTS AUDIT'S NEGATIVE EXHIBIT, and the FIRST CONSUMER §3's
-        # universal low byte has ever had: `Transfer` has been declared in every
-        # kind's rights enum since M2 and read by nothing until give. Root's
-        # System handle withholds it — the deliberate M2 "nobody to transfer to"
-        # choice — so the give is `AccessDenied`.
+        # THE ATTENUATION PROOF, and the FIRST CONSUMER §3's universal low byte
+        # has ever had: `Transfer` has been declared in every kind's rights enum
+        # since M2 and read by nothing until give.
         #
-        # It doubles as the reason a donated child is console-silent: nothing in
-        # v1 mints a givable System handle, which is why `give_boot_drain`'s
-        # child reports through its exit code.
+        # ONE TRANSCRIPT, TWO CLAIMS. Root MINTS a sibling through a mask that
+        # omits `Transfer` — the complement notation, which is what the polarity
+        # ruling leaves available for "the same handle, minus one bit" — and the
+        # give of it is `AccessDenied`. So the give's gate is real AND a masked
+        # sibling is genuinely narrower than its source, with no way back: a
+        # mint's result is a subset, so minting again only narrows further.
+        #
+        # It used to give root's own System handle, on the M2 fact that
+        # `root_system_rights()` withheld `Transfer`. The Aug-29 rulings ended
+        # that — root's handle carries it now, because giving a masked System
+        # sibling to a child IS the launch flow — so the ungivable handle in this
+        # system is one a launcher MADE ungivable.
         "name": "give_no_transfer",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": GIVE_NO_TRANSFER_PKG,
         "children": [CHILD_FAULT_PKG],
         "expect_out": ["{banner}",
-                       "SOS notransfer: giving the System handle away",
+                       "SOS notransfer: minted without Transfer",
                        "SOS: process fault: access denied process={zero}",
                        "SOS: process teardown handles="],
         "expect_clean_exit": False,
@@ -1820,6 +1847,61 @@ TEST_CASES = [
                        "SOS: process teardown handles="],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # PROLIFERATION IS REVOCABLE. `MINT_OP` is gated on the universal `Mint`
+        # bit and that bit is maskable, so a launcher hands out a handle that can
+        # be USED and not MULTIPLIED — without which one `Mint` anywhere would be
+        # `Mint` everywhere downstream forever.
+        #
+        # THE FIRST MINT SUCCEEDS, which is what makes the second refusal mean
+        # something: the caller holds a perfectly good System handle and the one
+        # thing it cannot do is the thing its mask took away.
+        #
+        # It is also the ONLY way to hold a source lacking `Mint` at all — every
+        # default set grants it under the uniform lean — so this transcript is
+        # simultaneously "the sibling cannot mint" and "a mint through a source
+        # without `Mint` is `AccessDenied`". A second case would be this program.
+        "name": "mint_revoked",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MINT_REVOKED_PKG,
+        "expect_out": ["{banner}",
+                       "SOS mintrevoked: minted without Mint",
+                       "SOS: process fault: access denied process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # THE MASK HOLDS AT RUN TIME — what the narrowing was FOR, and the only
+        # case in the suite where a RIGHTS refusal falls on a process that is not
+        # root.
+        #
+        # The child prints first, which is half the claim: a keep mask is a SET
+        # rather than a wall, `Debug` was named, so the program has a voice and
+        # can announce what it is about to try. Then it asks to stop the machine,
+        # `Shutdown` is absent BY SILENCE, and the fault names PROCESS 1 — the
+        # asker, not the launcher — while the machine keeps running.
+        #
+        # `status=131075` is that same fact as a VALUE through root's retained
+        # handle: `Faulted`(2)<<16 | `AccessDenied`(3). A masked bit is enforced
+        # by exactly the path a never-minted one is.
+        "name": "child_no_shutdown",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": CHILD_NO_SHUTDOWN_PKG,
+        "children": [CHILD_OVERSTEPS_PKG],
+        "expect_out": ["{banner}",
+                       "SOS noshutdown: started a child that may print and not "
+                       "stop the machine",
+                       "SOS childover: I can print, so Debug travelled",
+                       "SOS childover: now trying to stop the machine",
+                       "SOS: process fault: access denied process={one}",
+                       "SOS: process teardown handles={one} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS noshutdown: root survived child status=131075",
+                       "SOS noshutdown: done"],
+        "expect_clean_exit": True,
     },
 ]
 

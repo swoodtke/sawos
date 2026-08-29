@@ -23,31 +23,40 @@ entry below or the brief that carries it, never restating either.
 
 - M3 unit 3 — give(handle, tag:) [sawlang#232 Aug-16 launch-flow
   ruling, #4 — designs/004-give.md, authored Aug 29]: give as
-  unbind-and-rebind rights-verbatim (2.75 composes: giver's word goes
-  stale), tags the only cross-process vocabulary, per-process boot
-  queues, start(boot_tag:) kernel-resolved a0, give-before-start the
-  frozen barrier, child Process handle re-ruled full-set+Transfer
-  (supervise OR donate — the second-handle question is 5.5's). No
-  authorized transcript changes. DISPATCHED Aug 29.
-  **BUILT Aug 29 — branch parked for review.** Gate: 120/120 across
-  riscv32 + arm64 (60 cases each) against a 108 baseline at the merge
-  base; the 108 pre-existing rows byte-identical in name, verdict and
-  ORDER, six new rows appended per architecture. Landed as briefed
-  except for ONE DEVIATION the lead must rule on, recorded in full in
-  the brief's As-built: **the donation of a child's own Process handle
-  happens AT the start barrier (`BootTagForm.Donate`), not as a
-  separate `give`**, because `Start` is an op on the very handle being
-  moved — a launcher that gave it away first has nothing left to start
-  the child with, so D-3's give-then-start sequence cannot be written.
-  Everything else about it is an ordinary give (same fault set, same
-  unbind-and-rebind, same rights verbatim, same tagged record), and
-  the alternative — a SECOND handle onto one process — is design 3's
-  finding-2 re-mint question, which is unit 5.5's. Two smaller items
-  for the lead: one new kernel report line (`SOS: process exit:
-  code=…`, child-only, unreachable for every pre-existing case) exists
-  because a donated child has no other voice; and `FaultReason
-  .DuplicateKey`'s text still names attachments, unchanged because
-  `event_dupkey` asserts it and no expectation edit was authorized
+  unbind-and-rebind rights-verbatim, tags the only cross-process
+  vocabulary, per-process boot queues, start(boot_tag:) kernel-resolved
+  a0, give-before-start the frozen barrier. No authorized transcript
+  changes. DISPATCHED Aug 29.
+  **BUILT Aug 29, after FIVE USER RULINGS taken at review — branch
+  parked.** The chain is recorded in the brief ("THE RULING CHAIN",
+  amending D-3/D-4) and started from the implementation's finding that
+  D-3's give-then-start sequence was not writable: `Start` is an op on
+  the one handle a `give` would have moved. The answer went to the root:
+  **`MINT_OP = 0xFFFE`**, a second universal op minting a SIBLING handle
+  onto the same object with rights the source's INTERSECTED with a KEEP
+  mask, gated on a new universal `Mint` bit. That closes design 3's
+  finding 2, makes §3's attenuation something a HOLDER performs, and
+  lets a launcher hand a child a MASKED SYSTEM HANDLE — so every process
+  now bootstraps exactly as root does (§12 symmetry), a child can PRINT
+  without owning a device, and a launcher keeps supervision while the
+  child manages itself. `start(boot_tag:)`'s resolution CONSUMES its
+  record. And **`Manage` is removed as a right everywhere** (specific
+  rights for specific operations; `Mint` takes bit 1;
+  `SystemRight.ProcessSelf`, `ProcessRight.ThreadSelf` and
+  `ProcessRight.Give` replaced it), which collapsed the two Process
+  default sets into one.
+  Gate: 124/124 across riscv32 + arm64 (62 cases each) against a 108
+  baseline at the merge base; the 108 pre-existing rows byte-identical
+  in name, verdict and ORDER, eight new rows appended per architecture.
+  FOR THE LEAD, three items: the uniform-`Mint`-in-every-default-set
+  lean is recorded as a LEAN and is the user's to veto at integration; a
+  handle cannot be narrowed below `Transfer` and still be given (so a
+  receiver holds that bit — inert today, a ruling for the pipe unit);
+  and `FaultReason.DuplicateKey`'s text still names attachments,
+  unchanged because `event_dupkey` asserts it and no expectation edit
+  was authorized. The `event-wake` / `event-consume-wake` rewrite that
+  `MINT_OP` now makes possible is BACKLOG, deliberately not done here —
+  it would move shipped rows
 - M3 unit 4 — Memory/IoMemory [sawlang#232]
 - M3 unit 5 — quotas [sawlang#232]
 - M3 unit 5.5 — death notifications [sawlang#232]
@@ -61,6 +70,13 @@ entry below or the brief that carries it, never restating either.
 - First `sawlang.pin` bump — expected after sawlang design 218 unit 1.5
   (monomorphization) lands; bump version + sha TOGETHER [sawlang#238
   D-b2]
+- `event-wake` / `event-consume-wake` rewritten to ONE HANDLE EACH,
+  now that `MINT_OP` exists [#4 finding 5; design 3 finding 2]. They
+  share an Event handle by ADDRESS through a parked `UnsafePointer`
+  because no op could mint a second one; a mint makes the shape those
+  programs always wanted writable. AUTHORIZED AS BACKLOG by the lead
+  and deliberately NOT done in unit 3 — it moves shipped transcript
+  rows, so it needs a unit that authorizes them by name
 - M4 seeds — pipes + PipeReplyHandle IPC (select-with-timeout via
   Timer), IOMMU driver + critical processes, priorities/§7 bands,
   SMP + IntrSpinLock (after channels; unit 1.5's point map is its

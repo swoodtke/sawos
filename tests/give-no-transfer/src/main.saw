@@ -1,37 +1,52 @@
-// SOS M3 unit 3: A HANDLE WITHOUT `Transfer` CANNOT BE GIVEN (sawos design 4).
+// SOS M3 unit 3: A MASK THAT OMITS `Transfer` MAKES AN UNGIVABLE HANDLE (sawos
+// design 4 as ruled Aug 29).
 //
-// **THE FIRST CONSUMER §3's UNIVERSAL LOW BYTE HAS EVER HAD.** Bit 0 —
-// `Transfer`, "may be sent over a pipe", the movability capability — has been
-// declared in every kind's rights enum since M2 and READ BY NOTHING. `give` is
-// what reads it, and it reads it on the handle BEING GIVEN rather than on the
-// receiver, which is the ruling's own gate.
+// **ONE TRANSCRIPT, TWO CLAIMS, and they are the same claim from two ends.**
+// `give` is gated on the UNIVERSAL `Transfer` bit of the handle being given —
+// the first consumer §3's universal low byte ever had, declared in M2 and read
+// by nothing until this unit — and `mint` produces a handle whose rights are the
+// source's INTERSECTED with a keep mask. So a sibling minted through a mask that
+// does not name `Transfer` cannot be given, and this file proves the gate and
+// the attenuation in one line of transcript:
 //
-// ROOT'S SYSTEM HANDLE WITHHOLDS IT, deliberately and since M2:
-// `root_system_rights()` mints `Debug | Shutdown | Manage | ClockGet |
-// ProcessCreate` and no `Transfer`, on the reasoning that in a one-process world
-// there was nobody to transfer to. That is still v1-correct — a child holding a
-// System handle could print, stop the machine and spawn — and design 4 changed
-// exactly one default set (the child's own Process handle) and no other. So this
-// give is refused:
-//
-//   SOS notransfer: giving the System handle away
+//   SOS notransfer: minted without Transfer
 //   SOS: process fault: access denied process=0
 //   SOS: process teardown ... process=0
 //
-// WHICH IS ALSO WHY A CHILD IS CONSOLE-SILENT. `child-drain` reports through its
-// exit code rather than by printing, and this line is the reason: nothing in v1
-// mints a givable System handle, so nothing can hand a child a voice. The echo
-// driver speaks its device, not the debug console.
+// **WHY IT IS A MINTED SIBLING RATHER THAN ROOT'S OWN HANDLE.** An earlier cut
+// of this case gave root's System handle directly, on the M2 fact that
+// `root_system_rights()` withheld `Transfer` ("nobody to transfer to in a
+// one-process world"). The Aug-29 rulings ended that: root's handle CARRIES
+// `Transfer` now, because giving a masked System sibling to a child is the whole
+// launch flow. So the ungivable handle in this system is one a launcher MADE
+// ungivable, which is the more interesting fact and the one worth a case.
+//
+// **AND IT CANNOT BE UNDONE.** There is no sequence of ops that recovers a
+// masked bit: a mint's result is a subset of its source, so minting again from
+// the narrowed sibling only narrows further. Attenuation is monotonic (§3), and
+// with `MINT_OP` it is finally something a launcher can perform rather than
+// something the kernel does at creation.
+//
+// The keep mask is spelled as a COMPLEMENT here — everything except `Transfer` —
+// which is the notation the polarity ruling deliberately leaves available: this
+// case means "the same handle, minus one bit", and writing it that way puts the
+// fail-OPEN choice at the call site where a reader can see it. `give-boot-drain`
+// means a whitelist and writes one.
 //
 // The funnel CONSUMES the wrapper before the syscall (design 3 D-5's
 // disarm-before-syscall), so the last line this program can print is the one
 // above the give. That ordering is the contract, not an accident of this file.
 
-import sos.{System, Process, Memory, BootHandle, SosStatus}
+import sos.{System, Process, Memory, BootHandle, SosStatus, SystemRight}
 
 static EXIT_FAILED: UInt = 1
 
 static TAG: UInt = 1
+
+/// Everything this handle has, EXCEPT the movability bit. The `& 0xFFFF_FFFF`
+/// is not decoration: Saw folds a constant in the signed platform-`Int` domain,
+/// so a bare `~x` is negative and would not fit the mask's `UInt32`.
+static NO_TRANSFER: UInt32 = ~(SystemRight.Transfer as UInt32) & 0xFFFF_FFFF
 
 @export("_start")
 func _start(boot_handle: UInt) {
@@ -75,16 +90,20 @@ func _start(boot_handle: UInt) {
         },
     }
 
-    // Said BEFORE the give, because the funnel consumes the wrapper and there is
-    // no console on the far side of this line.
-    let _ = system.debug_print("SOS notransfer: giving the System handle away\n")
+    let stuck = match system.mint(rights: NO_TRANSFER) {
+        case Ok(s) -> s,
+        case Err(e) -> {
+            print("SOS notransfer: mint failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS notransfer: minted without Transfer\n")
 
     // REFUSED. The handle resolves and the receiver is `Created`; what it lacks
-    // is the one universal bit this op checks.
-    let _ = child.give(system: move system, tag: TAG)
+    // is the one universal bit this op checks — because a mask left it out.
+    let _ = child.give(system: move stuck, tag: TAG)
 
-    // Unreachable, and it cannot print: the System wrapper is gone. Exiting with
-    // a failure code is the only diagnostic left, and its exit STATUS is what
-    // the harness would see instead of the fault code.
-    let _ = proc.exit(EXIT_FAILED)
+    let _ = system.debug_print("SOS notransfer: survived, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
 }
