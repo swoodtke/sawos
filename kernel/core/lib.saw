@@ -33,17 +33,36 @@
 //!   `mem`        addresses and byte moves
 //!   `diag`       the console, and the reports that stop the machine
 //!   `result`     a syscall's answer, and the one place it enters a frame
-//!   `objects`    the handle table and the validated per-kind objects
+//!   `objects`    the handle table, the validated per-kind objects, the Memory
+//!                slab and the boot-handle queue
 //!   `threads`    the thread slab, the frame arena, the ready queue
 //!   `time`       the Clock/Timer slabs and the one hardware comparator
 //!   `waitables`  the Event/Waiter/Interrupt slabs and the per-kind matrix
-//!   `process`    the copy doors, the teardown, the way into user mode
+//!   `process`    the process slab, the grant record, the copy doors, the way
+//!                into user mode
 //!   `wake`       delivery: readiness becoming a woken thread
 //!   `irq`        the tick, expiry, device lines, the idle path, the point
 //!   `preempt`    the strided long-op movers that take that point
-//!   `sched`      the switch point
+//!   `loader`     the sosimg loader — validate, place, record
+//!   `sched`      the switch point, and the end of a process
 //!   `dispatch`   every object op, and `ktrap`
-//!   `loader`     the sosimg loader
+//!
+//! TWO OF THOSE MOVED IN M3 UNIT 2 (sawos design 2), and both moves are the
+//! same rule the `preempt` split below states — a module sits at the altitude
+//! its CALL GRAPH allows, and where a piece lives is decided by what it has to
+//! reach:
+//!
+//!   - the TEARDOWN left `process` for `sched`. Ending a process used to stop
+//!     the machine; with more than one it RESCHEDULES, and a reschedule can
+//!     idle, and idling delivers, and delivery reaches back down into
+//!     `process`'s own copy door. Written in `process` it would be the cycle
+//!     DF-232e diagnoses. `sched.saw`'s header has the full argument; its
+//!     visible cost is that the copy doors REPORT a bad buffer and their callers
+//!     terminate on it.
+//!   - the LOADER left the top for just below `sched`. It was last because it
+//!     ended by handing the machine to `start_process`; it now has a SECOND
+//!     door — `process_create`, which is an op — so its phases have to be
+//!     reachable from `dispatch`. It reaches nothing above itself either way.
 //!
 //! `preempt` is where it is because of design 1's one structural finding: a
 //! preemption point DELIVERS, so it sits above `irq`, while the byte loops it

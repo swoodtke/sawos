@@ -170,6 +170,24 @@ WAIT_DEADLOCK_PKG = os.path.join(TESTS_DIR, "wait-deadlock")
 # follows the M2 units' rule — what an object ANSWERS and whether a wait PARKS
 # are separate questions, so testing them together would let a scheduling bug
 # hide behind an arithmetic one.
+# sawos design 2 (M3 unit 2): the second address space. FIVE root packages and
+# TWO CHILD packages, and the split is the same one every unit above has used —
+# one claim per image, so a bug in the reload cannot hide behind a load that
+# happened to work.
+#
+# The CHILDREN are the first Blade packages in the tree that are not root
+# servers. They are built exactly as a root is and linked at a DIFFERENT base
+# (`hal/<arch>/user/child.ld`), because under the no-translation contract every
+# process shares one physical address space. Neither holds a handle: `start()`
+# hands a child `NO_HANDLE`, so its observable behaviour is faulting.
+PROCESS_LIFECYCLE_PKG = os.path.join(TESTS_DIR, "process-lifecycle")
+PROCESS_ISOLATION_PKG = os.path.join(TESTS_DIR, "process-isolation")
+PROCESS_BADIMAGE_PKG = os.path.join(TESTS_DIR, "process-badimage")
+PROCESS_DOUBLESTART_PKG = os.path.join(TESTS_DIR, "process-doublestart")
+PROCESS_BOOTDRAIN_PKG = os.path.join(TESTS_DIR, "process-bootdrain")
+CHILD_FAULT_PKG = os.path.join(TESTS_DIR, "child-fault")
+CHILD_POKE_PKG = os.path.join(TESTS_DIR, "child-poke")
+
 CLOCK_BASICS_PKG = os.path.join(TESTS_DIR, "clock-basics")
 TIMER_ONESHOT_PKG = os.path.join(TESTS_DIR, "timer-oneshot")
 TIMER_INTERVAL_PKG = os.path.join(TESTS_DIR, "timer-interval")
@@ -233,6 +251,13 @@ ARCHES = [
         "features": "+m,+a,+c",
         "hex_width": 8,
         "root_entry": 0x80200000,
+        # Where a CHILD process's memory is (sawos design 2). This is the
+        # "config-assigned destination range" the ruled hybrid puts on the build
+        # side: the kernel never knows it, the region table publishes it as an
+        # ordinary free-RAM row, and root learns it as a capability. It is one
+        # region above root's top, and the per-arch child linker script
+        # (`hal/<arch>/user/child.ld`) is linked at exactly this base.
+        "child_region_base": 0x80240000,
         # The line `hal.irq_raise_selftest_line()` raises (design 178 M2 unit
         # 1). It is per-machine because WHAT a board can interrupt itself with
         # is: this one has no software trigger, so the HAL makes the console
@@ -258,11 +283,36 @@ ARCHES = [
         "features": None,
         "hex_width": 16,
         "root_entry": 0x40200000,
+        # One region above root's top, as on Profile A — and here the choice is
+        # CONSTRAINED as well as tidy: EL0 can only be granted pages inside the
+        # HAL's grant window, the first 4 MiB of RAM, so a child's destination
+        # has to sit between root's top (0x4024_0000) and 0x4040_0000. See
+        # `hal/arm64/user/child.ld`.
+        "child_region_base": 0x40240000,
         # This controller HAS a software trigger, so the selftest line is a
         # software-generated one and no device is involved.
         "selftest_line": 5,
     },
 ]
+
+# How big a child's destination region is, on both profiles.
+#
+# THE SAME 256 KiB ROOT GETS, and for the same reasons: 240 KiB of image plus
+# the kernel's 16 KiB stack grant at the top, which is `hal.ROOT_STACK_LEN` and
+# is the one stack length v1 has (a per-create length is unit 4/5 vocabulary).
+# Keeping the two the same size is what lets one number here and one `ORIGIN`
+# per child linker script express the whole layout.
+CHILD_REGION_LEN = 0x40000
+
+# The BOOT REGION TABLE's wire format (sawos design 2 D-2), frozen: an 8-byte
+# header — magic, version u16, count u8, reserved u8 — then `count` rows of
+# {base: u64, len: u64}, all little-endian. The header's size is what puts every
+# row on an 8-byte boundary, which is what lets the kernel overlay a struct on
+# the section instead of assembling bytes. Kept in step with
+# `kernel/core/process.saw`'s `RegionTableHeader` / `RegionRow` and the two
+# `static_assert`s beside them.
+REGION_TABLE_MAGIC = 0x4E475253          # 'S','R','G','N' read little-endian
+REGION_TABLE_VERSION = 1
 
 
 def arch_dirs(arch):
@@ -1218,6 +1268,152 @@ TEST_CASES = [
                        "fault store-access-fault"],
         "expect_clean_exit": False,
     },
+    # =========================================================================
+    # M3 unit 2 — CreateProcess: the second address space (sawos design 2)
+    # =========================================================================
+    #
+    # Five cases, one claim each, and each claim is INVERTED somewhere above:
+    # every earlier case in this file runs in a system with exactly one process,
+    # where a process's death was the machine's and a protection domain never
+    # had to be put back.
+    #
+    # All five append a child image and publish a two-row region table, which is
+    # what makes them the only cases in the suite whose `_region_table_start`
+    # and `_region_table_end` differ. Every case ABOVE this line links no
+    # `.regions` section at all, so the kernel reads zero regions and mints
+    # nothing — which is why their transcripts are untouched.
+    {
+        # THE HEADLINE. Root creates a process, starts it, and is still there
+        # after it dies. Read the transcript as an ORDER: the two-phase
+        # lifecycle (created, then started), root printing AFTER the start
+        # (`start()` makes a child runnable, it does not hand the processor
+        # over), the child's death naming PROCESS 1, and root's own line after
+        # it.
+        #
+        # `handles={zero} threads={one}` in the teardown is the child's whole
+        # estate: a child in this unit is handed nothing, so it owns one thread
+        # and not one handle. That number is also the assertion that the
+        # teardown ran against the CHILD's table and not root's — root holds
+        # nine handles by then.
+        #
+        # `child status=131073` is the §8 status word root reads out of the dead
+        # child through the handle it still holds: kind `Faulted` (2) in the
+        # high half, reason `BadHandle` (1) in the low. It is the supervision
+        # story working, and it is what makes "the child died, and this is how"
+        # a value rather than an inference from the console.
+        "name": "process_lifecycle",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PROCESS_LIFECYCLE_PKG,
+        "children": [CHILD_FAULT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS lifecycle: boot regions tag0=0 tag1=1",
+                       "SOS lifecycle: created",
+                       "SOS lifecycle: started",
+                       "SOS: process fault: bad handle process={one}",
+                       "SOS: process teardown handles={zero} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS lifecycle: root survived child status=131073",
+                       "SOS lifecycle: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # THE MONEY PROOF. The child stores into ROOT's region and the access
+        # faults, which can only happen if the switch INTO the child reloaded
+        # the protection domain — riscv32 spends all four PMP regions on one
+        # image and arm64's grant window is a single shared EL0 permission map,
+        # so neither profile can carry two processes' grants at once.
+        #
+        # THE ASSERTION IS THE PRESENCE OF THE FAULT. A kernel that left root's
+        # rows installed would let the store LAND, the child would spin, and the
+        # line would be missing rather than wrong — which is the failure mode
+        # worth engineering for.
+        #
+        # `child status=131072` is `Faulted` with code ZERO, because a hardware
+        # fault carries no `FaultReason`: the cause is in the console line. That
+        # is the one thing that differs from the lifecycle case's `131073`, and
+        # it is what says the two children died in two different ways.
+        "name": "process_isolation",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PROCESS_ISOLATION_PKG,
+        "children": [CHILD_POKE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS isolation: started",
+                       # The kernel's hardware-fault report. The tag and the
+                       # cause differ per machine — a store access fault here, a
+                       # data abort there — so what is asserted is that ONE was
+                       # taken, and the teardown below says whose it was.
+                       "SOS: fault ",
+                       "SOS: process teardown handles={zero} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS isolation: root survived child status=131072",
+                       "SOS isolation: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # BADIMAGE IS A STATUS. Root hands `process_create` a region of zeros
+        # (its two arguments swapped), gets a VALUE back, reports it and exits
+        # CLEAN — which is the assertion that separates this from every other
+        # you-handed-the-kernel-something-wrong case in this file, all of which
+        # end with the process dead.
+        #
+        # `expect_clean_exit` is the load-bearing half: a kernel that faulted
+        # here would still print a plausible-looking transcript and exit
+        # non-zero.
+        "name": "process_badimage",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PROCESS_BADIMAGE_PKG,
+        "children": [CHILD_FAULT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS badimage: create refused: "
+                       "not a loadable process image",
+                       "SOS badimage: still running, exiting clean"],
+        "expect_clean_exit": True,
+    },
+    {
+        # THE LINE'S OTHER SIDE: a second `start()` is the CALLER's fault, not a
+        # status. `process=0` in both lines is what says root itself died, which
+        # is what makes this transcript different from the lifecycle case's —
+        # the same two report lines, a different process, and the machine stops.
+        "name": "process_doublestart",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PROCESS_DOUBLESTART_PKG,
+        "children": [CHILD_FAULT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS doublestart: started once",
+                       "SOS: process fault: object in the wrong state "
+                       "process={zero}",
+                       "SOS: process teardown handles=",
+                       # ...and NOT the line root would print if the op had
+                       # answered with a status instead of ending it. `_check`
+                       # matches in order, so its absence is asserted by the
+                       # clean-exit expectation below rather than by a pattern.
+                       ],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # THE BOOT-HANDLE ITERATOR, drained. Two rows in, two records out, in
+        # ordinal order — and then `Drained`, twice, because the cursor only
+        # advances. It creates no process: the claim is the DELIVERY, and a
+        # launch beside it would let an iterator bug hide behind a load that
+        # happened to work.
+        "name": "process_bootdrain",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PROCESS_BOOTDRAIN_PKG,
+        "children": [CHILD_FAULT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       # `tags` is the ordinals accumulated as DIGITS, so it
+                       # carries the delivery ORDER and not only the set: 0 then
+                       # 1 accumulates to 1, while 1 then 0 would print 10.
+                       "SOS bootdrain: n=2 tags=1 kinds=0",
+                       "SOS bootdrain: exhausted, and still exhausted",
+                       "SOS bootdrain: done"],
+        "expect_clean_exit": True,
+    },
 ]
 
 INSTALL_HINTS = {
@@ -1465,6 +1661,94 @@ def _stitch_root_image(image, arch, clang):
     return stub_o
 
 
+def _emit_word64(lines, arch, expr):
+    """Emit one 64-bit little-endian field, however wide this target's `.word` is.
+
+    The region table's fields are 64-bit on BOTH profiles — the same decision
+    sosimg v3 made about addresses, and for the same reason: one layout both
+    kernels read. A 32-bit assembler has no 8-byte relocation to point at a
+    symbol with, so a 32-bit target writes the low half and a zero high half,
+    which is the same bytes little-endian. A 64-bit one writes the field.
+    """
+    if arch["hex_width"] == 8:
+        lines.append(f"    .4byte {expr}")
+        lines.append("    .4byte 0")
+    else:
+        lines.append(f"    .8byte {expr}")
+
+
+def _stitch_children(case, arch, clang):
+    """Append this case's child images and emit the BOOT REGION TABLE.
+
+    THE RULED HYBRID (sawlang#232 agenda item 2; sawos design 2 D-2): the
+    stitcher appends each child sosimg AS IT IS — no flattening, no absolute
+    placement, the blob lands wherever the linker puts it — and records offsets
+    and lengths in a table. The kernel mints one Memory per row and interprets
+    nothing; ROOT's config is what says which ordinal is which.
+
+    THE STUB IS GENERATED RATHER THAN COMMITTED, and that is what buys the
+    linker-resolved bases: a blob row names the child section's own symbols, so
+    `ld.lld` fills in the address when it places the section and nothing here
+    computes one. A committed stub would have had to be per-case anyway (the
+    number of children is a property of the case), so generating it costs a file
+    nobody has to keep in step and removes the one thing that could have gone
+    wrong.
+
+    ROW ORDER IS THE CONTRACT: every blob row first, in the order the case lists
+    its children, then every destination row in the same order. That is what
+    root's config reads — tag 0 is child 0's image, tag N is child 0's RAM — and
+    it is stated here because it is stated nowhere else.
+    """
+    dirs = arch_dirs(arch)
+    os.makedirs(dirs["build"], exist_ok=True)
+    name = case["name"]
+    children = case["children"]
+
+    lines = [
+        "/* GENERATED by tools/sos_runner.py — sawos design 2 D-2. */",
+        "",
+        "    .section .childimg, \"a\", @progbits",
+        "    .balign 16",
+    ]
+    for i, _pkg in enumerate(children):
+        staged = os.path.join(dirs["build"], f"{name}.child{i}.sosimg")
+        shutil.copyfile(case["_child_images"][arch["name"]][i], staged)
+        lines += [
+            f"_sos_child{i}_start:",
+            f"    .incbin \"{os.path.basename(staged)}\"",
+            f"_sos_child{i}_end:",
+            "    .balign 16",
+        ]
+
+    lines += [
+        "",
+        "    .section .regions, \"a\", @progbits",
+        "    .balign 8",
+        f"    .4byte {REGION_TABLE_MAGIC:#010x}",
+        f"    .2byte {REGION_TABLE_VERSION}",
+        f"    .byte  {2 * len(children)}",
+        "    .byte  0",
+    ]
+    for i, _pkg in enumerate(children):
+        lines.append(f"    /* row {i}: child {i}'s image blob (linker-resolved) */")
+        _emit_word64(lines, arch, f"_sos_child{i}_start")
+        _emit_word64(lines, arch, f"_sos_child{i}_end - _sos_child{i}_start")
+    for i, _pkg in enumerate(children):
+        base = arch["child_region_base"] + i * CHILD_REGION_LEN
+        lines.append(f"    /* row {len(children) + i}: child {i}'s destination RAM */")
+        _emit_word64(lines, arch, f"{base:#x}")
+        _emit_word64(lines, arch, f"{CHILD_REGION_LEN:#x}")
+    lines.append("")
+
+    stub_s = os.path.join(dirs["build"], f"{name}.regions.S")
+    with open(stub_s, "w") as f:
+        f.write("\n".join(lines))
+    stub_o = os.path.join(dirs["build"], f"{name}.regions.o")
+    _run([clang, f"--target={arch['triple']}", *arch["cc_args"],
+          "-nostdlib", "-I", dirs["build"], "-c", stub_s, "-o", stub_o])
+    return stub_o
+
+
 def _build_elf(case, arch, shared_objs, lld, clang):
     """Compile + link one test case for one architecture; return its ELF path.
 
@@ -1522,6 +1806,12 @@ def _build_elf(case, arch, shared_objs, lld, clang):
         objs.append(payload_o)
     if case.get("root_pkg"):
         objs.append(_stitch_root_image(case["_root_image"][arch["name"]], arch, clang))
+    # sawos design 2: the child images and the region table that names them.
+    # A case with no children links neither section, so `_region_table_start`
+    # and `_region_table_end` come out equal and the kernel sees ZERO REGIONS —
+    # which is every case that existed before this unit.
+    if case.get("children"):
+        objs.append(_stitch_children(case, arch, clang))
 
     _run([lld, "-T", os.path.join(dirs["hal_kernel"], "virt.ld"), "--gc-sections",
           "-o", elf, *objs])
@@ -1657,10 +1947,19 @@ def _run_arch(arch, qemu, lld, clang, blade_bin):
     # per-DEVICE: a driver names its device, so each echo package has a
     # `[sos.<triple>]` section for one machine only and building it for the
     # other is a refusal rather than wasted work.
+    #
+    # CHILD packages (sawos design 2) ride the same list. They are not root
+    # servers — nothing loads one at boot — but they are built by exactly the
+    # same call, which is the claim: a child image goes through the pipeline
+    # every SOS process goes through, and the only thing that differs is the
+    # linker script its manifest names.
     root_pkgs = []
     for case in cases:
         if case.get("root_pkg") and case["root_pkg"] not in root_pkgs:
             root_pkgs.append(case["root_pkg"])
+        for child in case.get("children", ()):
+            if child not in root_pkgs:
+                root_pkgs.append(child)
     if root_pkgs:
         try:
             for pkg in root_pkgs:
@@ -1671,6 +1970,10 @@ def _run_arch(arch, qemu, lld, clang, blade_bin):
                 if case.get("root_pkg"):
                     holder = case.setdefault("_root_image", {})
                     holder[arch["name"]] = _root_image_path(case["root_pkg"], arch)
+                if case.get("children"):
+                    holder = case.setdefault("_child_images", {})
+                    holder[arch["name"]] = [_root_image_path(c, arch)
+                                            for c in case["children"]]
         except ToolError as e:
             print(f"{CROSS} failed to build a {arch['name']} root image\n{e}",
                   file=sys.stderr)

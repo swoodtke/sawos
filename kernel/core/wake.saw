@@ -23,6 +23,7 @@ import kcore.waitables.{
     waitable_attachment,
     waitable_consume,
 }
+import kcore.diag.{ExitCode, fatal}
 import kcore.process.{copy_out}
 
 /// The record `Waiter.Wait` answers with, in kernel memory (spec §2.2, as
@@ -41,11 +42,28 @@ static_assert(sizeof<WaitRecord>() == WAIT_RECORD_WORDS * sizeof<UInt>(),
               "the wait record must be exactly the words sosabi publishes")
 
 /// Build one and hand it to a process. The only producer of the wire form.
+///
+/// A REFUSED DESTINATION HERE IS A KERNEL BUG, NOT A PROCESS ERROR, and that is
+/// why it stops the machine rather than terminating anybody. `Waiter.Wait`
+/// validates the buffer AT THE CALL — that is exactly what `copy_out_check`
+/// exists for and what `ThreadSlot.wait_buf`'s docstring records — and a
+/// process's writable window is fixed for its life, so a buffer that passed
+/// then cannot fail now. Reaching this arm means the two facts disagree, which
+/// is a kernel invariant broken and nothing a process could have done.
+///
+/// It is also the shape this module's ALTITUDE forces (sawos design 2): the
+/// wake path runs below the scheduler — a timer expiry reaches here out of the
+/// IRQ path with no current thread of its own — so terminating a process from
+/// here would be terminating one with nowhere to go next. The door reports, and
+/// the callers that can kill are the ones above the switch point.
 func deliver_wait_record(p: Int, dst: UInt, key: UInt, tag: WaitTag,
                          payload: UInt) unsafe {
     var rec = WaitRecord(key: key, tag: tag as UInt, payload: payload)
-    copy_out(p, dst, ((&var rec) as UnsafePointer<WaitRecord>) as UInt,
-             wait_record_bytes() as UInt)
+    if let why = copy_out(p, dst, ((&var rec) as UnsafePointer<WaitRecord>) as UInt,
+                          wait_record_bytes() as UInt) {
+        fatal("wait record refused by the copy door", (why as UInt8) as UInt,
+              dst, p as UInt, ExitCode.ProcessFault)
+    }
 }
 
 /// ANSWER ONE ATTACHMENT INTO A PROCESS'S MEMORY, and spend what the answer

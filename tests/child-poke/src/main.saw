@@ -1,0 +1,89 @@
+// SOS CHILD: the one that reaches for its neighbour (sawos design 2 D-5).
+//
+// **THE UNIT'S MONEY PROOF, from the wrong side of the fence.** This child
+// stores a word into ROOT's memory. If the per-process protection reload does
+// its job the access faults, the child dies and root carries on; if the reload
+// were skipped — root's grants left installed across the switch — the store
+// would land in root's stack and the run would come apart somewhere else
+// entirely, with no diagnostic naming the cause.
+//
+// So the transcript's fault line IS the assertion, and the case is written so
+// that a broken kernel fails by its ABSENCE rather than by a wrong value.
+//
+// # HOW IT FINDS ROOT WITHOUT KNOWING WHICH MACHINE IT IS ON
+//
+// It names no address and no architecture. Both profiles place a child's region
+// exactly one 256 KiB region above root's, so a child can locate its own base
+// by ROUNDING ITS OWN ADDRESS DOWN and root's top is that same number. The
+// address of a `static` is the one address Saw can compute (DF-172a: a linker
+// symbol is not nameable, a function is not a value — but `&var` on a static
+// is), and it is what makes this file arch-free.
+//
+// The word it writes lands sixteen bytes below root's region top, which is
+// inside root's STACK — live data root is using while it waits. That is
+// deliberate: the target is memory whose corruption would be unmistakable, so
+// "the store was refused" is a claim about isolation rather than about an
+// unused hole.
+
+// The `sos` module is imported for the RUNTIME rather than for the API: it is
+// what pulls `sosrt` into this compilation unit, and `sosrt` is what defines
+// the frozen `__saw_rt_*` seams every freestanding image needs — the panic path
+// among them, which the overflow checks below can reach. A child holding no
+// handles calls no op through it; parking its (absent) System handle is what
+// makes those seams MUTE rather than absent, which is exactly the property a
+// sandboxed process should have.
+import sos.{System}
+
+/// Somewhere in this image's own writable memory. It exists to HAVE AN ADDRESS
+/// — the value is never read — and the address is how the program finds out
+/// where it was loaded.
+unsafe static var ANCHOR: UInt = 0
+
+/// Bytes in one process region, the size the build's config assigns. Root's
+/// region and every child's are this size and adjacent, which is what makes
+/// the arithmetic below a rounding rather than a lookup.
+static REGION_LEN: UInt = 0x4_0000
+
+/// How far below root's top to aim. Sixteen bytes is inside root's initial
+/// stack frame on both profiles — memory in use, not padding.
+static POKE_OFFSET: UInt = 16
+
+/// A value with no other reason to exist, so a debugger finding it in root's
+/// memory would know exactly what put it there.
+static POKE_VALUE: UInt = 0xD00D
+
+/// Where root's region ends, which is where this child's begins.
+///
+/// `unsafe` by design 130's trigger rule — it names an `unsafe static var` and
+/// an `UnsafePointer` — and the unsafety stops here: `_start` below calls it and
+/// stays an ordinary safe signature.
+func my_region_base() unsafe -> UInt {
+    let here = ((&var ANCHOR) as UnsafePointer<UInt>) as UInt
+    here - (here % REGION_LEN)
+}
+
+/// Store into ROOT's memory. Never comes back on a correct kernel.
+///
+/// The address arrives through an integer, which DESTROYS PROVENANCE and so
+/// blocks the alias analysis that could otherwise decide this store is dead —
+/// which matters here, because nothing in this program ever reads it back.
+func poke_the_neighbour() unsafe {
+    let target = my_region_base() - POKE_OFFSET
+    UnsafeMemory<UInt, Normal>(target).write(POKE_VALUE)
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    // Park the handle the kernel actually gave this process, which is nothing.
+    // The runtime's writer checks it and stays silent, so a panic here would
+    // cost a fault rather than a garbled line on somebody else's console.
+    let _ = System(boot_handle: boot_handle)
+
+    poke_the_neighbour()
+
+    // Unreachable on a correct kernel: the store above faults and the kernel
+    // ends this process. A child that got here has been granted somebody else's
+    // memory, and it has no handle to complain with — so it spins, and the
+    // harness catches the MISSING fault report rather than a wrong one.
+    while { }
+}

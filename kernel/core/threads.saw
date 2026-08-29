@@ -10,6 +10,7 @@
 import kcore.limits.{
     FRAME_ARENA_WORDS,
     MAX_THREADS,
+    NO_PROCESS,
     NO_THREAD,
     THREAD_FRAME_STRIDE,
 }
@@ -39,11 +40,13 @@ import kcore.mem.{align_up}
 // THE PROTECTION-DOMAIN RELOAD IS NOT HERE, and its absence is deliberate
 // rather than forgotten (design 178 D4 + the M3 memory notes). Threads of one
 // process share one domain, so a same-process switch reloads nothing; the
-// reload belongs at exactly one point — `pick_next` below, where the outgoing
-// and incoming threads' PROCESSES are both in hand — and M3's per-process
-// region sets install it there and nowhere else. Whether that reload is a
-// register file or a table root is the HAL's business, which is why this
-// paragraph can say it without naming either.
+// reload belongs at exactly one point — `kcore.sched`'s `pick_next`, where the
+// outgoing and incoming threads' PROCESSES are both in hand — and sawos design
+// 2 D-5 installed it there and nowhere else. Whether that reload is a register
+// file or a table root is the HAL's business, which is why this paragraph can
+// say it without naming either. What DOES live here is the one word the
+// scheduler compares against: `LAST_PROT_PROCESS`, below, beside the rest of
+// the state a switch reads.
 
 /// Every thread's saved context, back to back.
 ///
@@ -141,6 +144,23 @@ public(package) unsafe static var SLICE_LEFT: UInt = 0
 /// harness wait for it.
 public(package) static SLICE_TICKS: UInt = 1
 
+/// Whose protection domain is CURRENTLY INSTALLED in the hardware, or
+/// `NO_PROCESS` when none is (sawos design 2 D-5).
+///
+/// THE ONE WORD THAT MAKES THE RELOAD CHEAP. A switch between two threads of one
+/// process must reload nothing — that is every switch every M2 case makes, and
+/// keeping it free is what keeps the shipped transcripts untouched — so the
+/// scheduler compares the incoming thread's process against this and does the
+/// work only when they differ. It is set by whoever installs a domain, which is
+/// the boot path (through `start_process`) and `kcore.sched`'s reload, and
+/// INVALIDATED when a process is torn down, so a slot reused by a later child
+/// can never inherit the dead one's map by number.
+///
+/// It lives here rather than beside the reload because it is scheduler state in
+/// exactly the sense `CURRENT_THREAD` is, and because `process` — which is below
+/// the scheduler — has to write it at boot.
+public(package) unsafe static var LAST_PROT_PROCESS: Int = NO_PROCESS
+
 // -----------------------------------------------------------------------------
 // The ready queue
 // -----------------------------------------------------------------------------
@@ -167,6 +187,51 @@ public(package) func ready_pop() unsafe -> Int {
     }
     THREADS[slot].link = 0
     slot
+}
+
+/// Take every thread of process `p` OFF the ready queue, leaving everybody
+/// else's where they were (sawos design 2 D-6).
+///
+/// THIS IS WHAT REPLACED `READY_HEAD = READY_TAIL = 0` in the teardown, and the
+/// zeroing was not a shortcut so much as a ONE-PROCESS SPELLING: with a single
+/// process every runnable thread belonged to the process that was ending, so
+/// emptying the queue and removing its threads were the same act. With two they
+/// are not, and the wholesale version would take ROOT's runnable threads away
+/// when a child died.
+///
+/// A singly-linked walk with a trailing pointer, because that is what the list
+/// is — `link` is the one list pointer a thread has (see `ThreadSlot`), so
+/// there is no back pointer to unlink through and no second list to keep in
+/// step. `READY_TAIL` follows the removal rather than being recomputed: it is
+/// the only other word the queue has, and it is wrong exactly when the removed
+/// node was the last one.
+///
+/// AUDIT (design 1): NO PREEMPTION POINT. `MAX_THREADS` iterations at most, of
+/// an O(1) body — and the ready queue IS state the IRQ path writes
+/// (`ready_push` from a wake), so a delivery landing mid-walk is precisely the
+/// in-flight invariant the placement rule refuses.
+public(package) func ready_remove_process(p: Int) unsafe {
+    // Slot + 1 throughout, matching the list's own encoding: 0 means "no node".
+    var prev: Int = 0
+    var cur = READY_HEAD
+    while cur != 0 {
+        let slot = cur - 1
+        let next = THREADS[slot].link
+        if THREADS[slot].process == p {
+            if prev == 0 {
+                READY_HEAD = next
+            } else {
+                THREADS[prev - 1].link = next
+            }
+            if READY_TAIL == cur {
+                READY_TAIL = prev
+            }
+            THREADS[slot].link = 0
+        } else {
+            prev = cur
+        }
+        cur = next
+    }
 }
 
 // -----------------------------------------------------------------------------

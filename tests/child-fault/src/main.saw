@@ -1,0 +1,48 @@
+// SOS CHILD: the handle-less process (sawos design 2 D-4).
+//
+// THIS FILE IS THE SHAPE OF EVERY M3 CHILD, and it is deliberately three lines
+// long. A child created by `process_create` and run by `start()` receives
+// `NO_HANDLE` in its first argument register — the no-boot-tag form — so it
+// holds no authority at all: no console, no clock, no way to end itself
+// politely. `give` (unit 3) is what will hand a child its first handle, and
+// until then a fully sandboxed compute process is a FEATURE rather than a state
+// to detect.
+//
+// SO IT DIES BY TRYING. `System(boot_handle: 0)` builds a wrapper around handle
+// zero, which §3 reserves to name nothing, and the first byte of the print
+// below is an `ecall` the kernel answers by TERMINATING this process for a bad
+// handle. That is the fault path a SYSCALL takes, which is exactly the one this
+// unit had to generalize: before design 2 a fault ended the machine, and now it
+// ends a process and reschedules.
+//
+// WHAT THE TRANSCRIPT SHOWS, and what it would show if the unit were broken:
+//
+//   SOS: process fault: bad handle process=0x00000001   <- process ONE
+//   SOS: process teardown ... process=0x00000001        <- and the machine
+//   SOS lifecycle: root survived ...                    <- ...stayed up
+//
+// A kernel that still stopped on any process's death would end the run at the
+// second line, and root's would never be printed.
+//
+// It names no architecture and would build for either profile unchanged; the
+// only per-machine thing about it is the linker script the manifest points at.
+
+import sos.{System}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    // The wrapper is honest: `boot_handle` really is what the kernel put in the
+    // register, and for a child in this unit that is `NO_HANDLE`.
+    let system = System(boot_handle: boot_handle)
+
+    // This does not come back. The first `ecall` names handle 0, the kernel's
+    // dispatch resolves it to nothing, and design 178's faults ruling ends the
+    // process — which is the point of the case rather than an accident of it.
+    let _ = system.debug_print("a child with no handles cannot say this\n")
+
+    // Unreachable. A child that somehow survived the call above still has
+    // nowhere to go: there is no `exit` without a Process handle, so spinning
+    // inside its own granted region is the only legal thing left. The harness
+    // would catch it as a timeout rather than as a pass.
+    while { }
+}

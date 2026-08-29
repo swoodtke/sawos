@@ -81,6 +81,20 @@ public enum ObjType: UInt8 {
     case Interrupt = 6,
     case Clock = 7,
     case Timer = 8,
+    /// A sealed range of physical memory (spec §2.5; sawos design 2 D-2).
+    ///
+    /// THE FIRST SLICE OF §2.5's OBJECT, and deliberately the smallest one that
+    /// is useful: a Memory is `{base, len}` and NOTHING ELSE — no pools, no
+    /// derivation, no `map()`, no attributes. It is minted only at boot, one
+    /// per row of the build-emitted region table, and its whole surface is
+    /// being NAMED: `process_create` takes two of them (the image blob and the
+    /// child's destination RAM) and reads their bounds. There is no `MemoryOp`
+    /// table, so an op aimed at one is a `BadOp` fault.
+    ///
+    /// §2.5 is not contradicted, it is STARTED: these are the "pool roots given
+    /// to the root server at boot" in their v1 static form, and unit 4 adds the
+    /// pools, the derivation and the mapping ops on top without moving this.
+    case Memory = 9,
 }
 
 // WHICH KINDS ARE WAITABLE is deliberately NOT recorded here (§2.2). It cannot
@@ -141,6 +155,10 @@ public type ClockHandle = UInt
 /// A handle naming a Timer object (§2 table; design 232 unit 1) — a deadline
 /// bound to the Clock that created it. Same discipline again.
 public type TimerHandle = UInt
+
+/// A handle naming a Memory object (spec §2.5; sawos design 2 D-2) — a sealed
+/// range of physical memory. Same discipline again.
+public type MemoryHandle = UInt
 
 /// A handle index the table can never hand out. Handle 0 names nothing, so a
 /// zeroed register is never authority (see `ObjType.Unbound`).
@@ -259,7 +277,22 @@ static_assert((SystemRight.ClockGet as UInt32) >= (1 << 8),
 /// escape hatch userspace supervision needs against a wedged process — ANOTHER
 /// process. With one process in the system it is `Exit` under a second name,
 /// and an op whose only reachable use is degenerate is an op nothing tests. It
-/// lands with M3's multi-process loading, beside `create_process`.
+/// lands with M3's multi-process loading, beside `process_create`.
+///
+/// THE THREE M3-UNIT-2 BITS, and each one gates a DIFFERENT ROLE the Process
+/// object now plays (sawos design 2 D-4):
+///
+///   - `ProcessCreate` is a FACTORY authority on the CALLER's own Process
+///     handle, exactly as `EventCreate` and `WaiterCreate` are: creation flows
+///     through a handle already held (§3's derivation rule), and a launcher
+///     that strips this bit has a process which cannot spawn.
+///   - `Start` is a RECEIVER authority on the CHILD's handle — the second
+///     phase of the two-phase lifecycle, and the reason it is its own bit is
+///     that a supervisor may legitimately hold a child's handle to WATCH it
+///     (`Wait`) without being allowed to run it.
+///   - `BootHandles` gates the boot-set iterator. Root holds it because root is
+///     the process the kernel minted the boot set FOR; what a CHILD gets is
+///     unit 3's question, and a bit withheld here is the whole of the answer.
 ///
 /// `EventCreate` and `WaiterCreate` are M2 unit 3's, and where they sit ANSWERS
 /// an open pin: spec §12 leaves the creation-authority model for plain objects
@@ -293,6 +326,9 @@ public enum ProcessRight: UInt32 {
     case EventCreate = 1 << 11,
     case WaiterCreate = 1 << 12,
     case InterruptBind = 1 << 13,
+    case ProcessCreate = 1 << 14,
+    case Start = 1 << 15,
+    case BootHandles = 1 << 16,
 }
 
 static_assert((ProcessRight.Transfer as UInt32) == (1 << 0),
@@ -311,6 +347,12 @@ static_assert((ProcessRight.WaiterCreate as UInt32) >= (1 << 8),
               "kind-specific right WaiterCreate must start at bit 8 or above")
 static_assert((ProcessRight.InterruptBind as UInt32) >= (1 << 8),
               "kind-specific right InterruptBind must start at bit 8 or above")
+static_assert((ProcessRight.ProcessCreate as UInt32) >= (1 << 8),
+              "kind-specific right ProcessCreate must start at bit 8 or above")
+static_assert((ProcessRight.Start as UInt32) >= (1 << 8),
+              "kind-specific right Start must start at bit 8 or above")
+static_assert((ProcessRight.BootHandles as UInt32) >= (1 << 8),
+              "kind-specific right BootHandles must start at bit 8 or above")
 
 /// A right on a Thread object (§2 table row; design 178 D4).
 ///
@@ -506,6 +548,32 @@ static_assert((TimerRight.Arm as UInt32) >= (1 << 8),
 static_assert((TimerRight.Wait as UInt32) >= (1 << 8),
               "kind-specific right Wait must start at bit 8 or above")
 
+/// A right on a Memory object (spec §2.5; sawos design 2 D-2).
+///
+/// **THE UNIVERSAL LOW BYTE AND NOTHING ELSE**, which is the honest surface for
+/// an object whose whole v1 API is being NAMED. `Transfer` is unit 3's `give` —
+/// a region is exactly the kind of thing a launcher hands to a child — and
+/// `Manage` is the derive bit unit 4's pools and sub-ranges will spend. Neither
+/// is READ by anything in this unit: `process_create`'s authority is
+/// `ProcessRight.ProcessCreate` on the CALLER's own Process handle, and the two
+/// Memory handles are its ARGUMENTS rather than a second authority (see the op
+/// body). They are minted now rather than withheld because attenuation is
+/// monotonic: a bit not minted at boot could never appear later, and both are
+/// bits the boot region roots must have for units 3 and 4 to be additive.
+///
+/// There is deliberately NO `Read`/`Write` pair. Those are properties of a
+/// MAPPING (§2.5's `map(access:)`), not of the region, and inventing them here
+/// would give unit 4 two places to say what a process may do with memory.
+public enum MemoryRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Manage = 1 << 1,
+}
+
+static_assert((MemoryRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((MemoryRight.Manage as UInt32) == (1 << 1),
+              "universal right Manage must be bit 1 in every kind's enum")
+
 /// What the kernel mints for root's System handle at boot (§12).
 ///
 /// A function rather than a `static`, and THE ORIGINAL REASON HAS EXPIRED: a
@@ -543,12 +611,48 @@ public func root_system_rights() -> UInt32 {
 /// (it launches the drivers), and everything root spawns that is not one gets a
 /// handle without it, which is §3's monotonic attenuation with nothing new
 /// added to make it work.
+/// `ProcessCreate` and `BootHandles` join in M3 unit 2, and `Start` does NOT —
+/// which is the two-phase lifecycle showing through the rights word. `Start` is
+/// a right on the handle of the process being started, and nobody starts root:
+/// the kernel does, by entering user mode. Root receives a child's handle
+/// carrying `Start` from `process_create` (see `child_process_rights`), so the
+/// authority to run a child arrives WITH the child rather than being held in
+/// advance.
 public func root_process_rights() -> UInt32 {
     ((ProcessRight.Manage as UInt32) | (ProcessRight.ThreadCreate as UInt32)
      | (ProcessRight.Exit as UInt32) | (ProcessRight.Wait as UInt32)
      | (ProcessRight.EventCreate as UInt32)
      | (ProcessRight.WaiterCreate as UInt32)
-     | (ProcessRight.InterruptBind as UInt32))
+     | (ProcessRight.InterruptBind as UInt32)
+     | (ProcessRight.ProcessCreate as UInt32)
+     | (ProcessRight.BootHandles as UInt32))
+}
+
+/// What `process_create` mints for the CALLER on the child it just made (sawos
+/// design 2 D-4).
+///
+/// THREE BITS, AND WHAT IS WITHHELD IS THE POINT. `Start` runs it, `Wait` reads
+/// its §8 status word, `Manage` is the universal derive bit. Everything else a
+/// Process handle can carry is a CHILD's own authority over itself — making
+/// threads, making Events and Waiters, binding an interrupt line, exiting — and
+/// the creator holding those would let root reach inside a process it is
+/// supposed to be isolated from. §3's attenuation is monotonic, so a bit not
+/// minted here can never appear on this handle.
+///
+/// `Transfer` is deliberately absent: handing a child's Process handle to a
+/// third party is unit 3's question and there is nobody to hand it to yet.
+public func child_process_rights() -> UInt32 {
+    ((ProcessRight.Start as UInt32) | (ProcessRight.Wait as UInt32)
+     | (ProcessRight.Manage as UInt32))
+}
+
+/// What the kernel mints for a Memory region at boot (spec §2.5).
+///
+/// The universal pair, for the reason `MemoryRight` states: a boot region root
+/// is the thing units 3 and 4 give away and derive from, and attenuation runs
+/// one way only.
+public func memory_rights() -> UInt32 {
+    ((MemoryRight.Transfer as UInt32) | (MemoryRight.Manage as UInt32))
 }
 
 /// What the kernel mints for a thread's own handle — root's initial thread at
@@ -649,9 +753,19 @@ public enum SystemOp: UInt {
 /// Process the enforcement point. (M2 resolves nothing — D3 keeps the map a
 /// loader artifact — but the op is already in the place that will.)
 ///
-/// Absent, with reasons: `Kill` (see `ProcessRight`), and `CreateProcess`,
-/// which needs an image to load and a second address space to load it into —
-/// both M3, per design 178's option A.
+/// **THE OBJECT IS BOTH A FACTORY AND A RECEIVER, and this table now shows it**
+/// (sawos design 2 D-4). `ProcessCreate` is asked of the CALLER's own Process
+/// handle — creation authority is a rights bit on Process (§12) — while `Start`
+/// is asked of the CHILD's, which is why it keeps the bare verb under the
+/// Aug-17 naming rule: the receiver IS the process being started. Reading the
+/// two side by side is reading the two-phase lifecycle.
+///
+/// `BootHandleNext` is unit 3's iterator, arriving early because root is its
+/// first consumer: the boot set still enters user mode ONE handle wide (§12),
+/// the register carries System, and everything else the kernel minted for root
+/// at boot is DRAINED through this op one record at a time.
+///
+/// Absent, with reasons: `Kill` (see `ProcessRight`).
 public enum ProcessOp: UInt {
     case ThreadCreate = 0,
     case ThreadSelf = 1,
@@ -660,6 +774,9 @@ public enum ProcessOp: UInt {
     case EventCreate = 4,
     case WaiterCreate = 5,
     case InterruptBind = 6,
+    case ProcessCreate = 7,
+    case Start = 8,
+    case BootHandleNext = 9,
 }
 
 // =============================================================================
@@ -1041,6 +1158,77 @@ public func timer_arm_record_bytes() -> Int {
 }
 
 // =============================================================================
+// The boot-handle record (spec §12; sawos design 2 D-3, settling sawlang#232
+// agenda item 5)
+// =============================================================================
+//
+// `Process.BootHandleNext` answers with a RECORD the kernel copies out, on the
+// `Waiter.Wait` precedent exactly and through the same funnel. Three machine
+// words: which region this is, what kind of object was minted for it, and the
+// handle.
+//
+// IT IS MACHINE WORDS, NOT DOUBLEWORDS, and the rule is the wait record's: a
+// tag, a kind and a handle are all machine-word-shaped things, so the layout
+// follows the register. Only a TIME is a fixed 64 bits on every profile.
+//
+// THE RECORD IS CONSUMED BY DELIVERY. Each call hands back the next one and
+// advances; there is no rewind, no peek and no count op. A drained iterator
+// answers `SosStatus.Drained` forever — a loop's termination check, never a
+// fault, because exhaustion is exactly what a caller could not have known in
+// advance and is the ordinary way the loop ends.
+
+/// Words in a boot-handle record: tag, kind, handle.
+public static BOOT_HANDLE_RECORD_WORDS: Int = 3
+
+/// Where each lives. Named rather than written, on both sides of the boundary.
+public static BOOT_HANDLE_TAG_WORD: Int = 0
+public static BOOT_HANDLE_KIND_WORD: Int = 1
+public static BOOT_HANDLE_HANDLE_WORD: Int = 2
+
+/// Bytes in a boot-handle record — the minimum capacity a caller must give the
+/// op, and what the kernel checks the buffer against.
+///
+/// A FUNCTION AND NOT A `static` for the reason `wait_record_bytes` gives:
+/// `sizeof<T>()` does not fold in a static initializer (DF-178f).
+public func boot_handle_record_bytes() -> Int {
+    BOOT_HANDLE_RECORD_WORDS * sizeof<UInt>()
+}
+
+/// What kind of object a boot-handle record names — the record's KIND WORD.
+///
+/// PUBLIC API rather than kernel bookkeeping, on the module docstring's line:
+/// the kernel WRITES this value and userspace READS it, so one declaration has
+/// to serve both. It is deliberately NOT `ObjType`, which is kernel-internal
+/// and renumberable — a boot handle's kind crosses the trap boundary, so it is
+/// its own closed set with its own stated numbers.
+///
+/// v1 declares one kind, because the boot set is exactly the region table's
+/// rows. The raw backing is what lets a second kind be ADDED without
+/// renumbering (design 145's wire idiom), which is what unit 4's IoMemory and
+/// unit 5.5's death channels will want.
+///
+/// Backed by `UInt`, the width of the word it travels in, for the reason
+/// `WaitTag` gives: userspace decodes it through `from(raw:)`, which is total.
+/// **THE TAG BESIDE IT IS THE REGION ORDINAL** (sawos design 2 D-3): row `n` of
+/// the build-emitted region table is tag `n`, and the kernel knows nothing else
+/// about it. Which ordinal is the image blob, which is a child's destination
+/// RAM, which device a window belongs to — all of that is ROOT's config, and
+/// keeping it there is what makes the kernel's half of the launch flow the same
+/// code for a hand-built M3 system and for M4's dynamic loading.
+public enum BootHandleKind: UInt {
+    case Memory = 0,
+}
+
+// THE DECODED RECORD IS NOT DECLARED HERE, and the asymmetry with `WaitResult`
+// is worth one note. A wait answer is made of plain words — a key, a tag, a
+// count — so one declaration serves the kernel that writes it and the process
+// that reads it. A boot-handle answer carries a HANDLE, and the whole point of
+// the `sos` module's typed layer is that a handle a process holds is a `Memory`
+// or a `Process` and never a word. So the decoded form is `sos`'s
+// `BootHandle`, which this file could not name; what crosses is the three-word
+// layout above, and that is declared once, here.
+
+// =============================================================================
 // Status words (spec §5.7)
 // =============================================================================
 
@@ -1083,9 +1271,29 @@ public func timer_arm_record_bytes() -> Int {
 /// a typed error instead of being read as success. In M1 it is unreachable —
 /// both halves compile from this one declaration — and it exists for the build
 /// skew that static linking makes impossible today and a mapped vDSO will not.
+/// **THE TWO M3-UNIT-2 CASES, and each is here because of the same cut** (sawos
+/// design 2 D-3/D-4; the numbers continue past the 1-3 gap rather than filling
+/// it, for the reason above).
+///
+/// `BadImage` (5) is a malformed process image handed to `process_create`.
+/// sawlang#232 agenda item 2 leaned this way and design 2 ruled it: IMAGE BYTES
+/// ARE DATA, on the `from(raw:)` precedent — an unrecognized wire byte is data
+/// a reader rejects, never a trap — and a launcher that fetches images
+/// dynamically (M4) must be able to report a bad download rather than die of
+/// it. It is the one place the faults ruling's line falls on the STATUS side
+/// for something the caller supplied, and the reason it does is that the caller
+/// did not WRITE those bytes: it was handed a region and asked to launch it.
+///
+/// `Drained` (6) is the boot-handle iterator having nothing left to give. It is
+/// a status and not a fault for the plainest possible reason: a loop that
+/// drains an iterator ENDS by meeting it, so faulting would make the correct
+/// program the one that dies. It STAYS drained — every later call answers the
+/// same — so a caller may test it as often as it likes.
 public enum SosStatus: UInt8 {
     case Ok = 0,
     case NoResource = 4,
+    case BadImage = 5,
+    case Drained = 6,
     case Unknown = 255,
 }
 
@@ -1095,6 +1303,8 @@ extension SosStatus {
         match self {
             case Ok -> "ok",
             case NoResource -> "out of kernel objects",
+            case BadImage -> "not a loadable process image",
+            case Drained -> "no more boot handles",
             case Unknown -> "unknown status",
         }
     }

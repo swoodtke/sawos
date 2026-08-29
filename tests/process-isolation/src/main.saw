@@ -1,0 +1,160 @@
+// SOS M3 unit 2: ISOLATION — THE MONEY PROOF (sawos design 2 D-5).
+//
+// One process cannot touch another's memory, and this is the case that makes
+// that a CLAIM rather than an assumption. Root launches `child-poke`, which
+// stores a word into root's own stack; the transcript reads:
+//
+//   SOS isolation: started
+//   SOS: fault <store/data-abort> cause=... epc=... tval=...
+//   SOS: process teardown ... process=1
+//   SOS isolation: root survived child status=131072
+//   SOS isolation: done
+//
+// WHAT THE FAULT LINE PROVES. The child's store names an address inside root's
+// granted region. It faults because the SWITCH INTO THE CHILD RELOADED THE
+// PROTECTION DOMAIN — root's rows out, the child's rows in — which is the one
+// thing this unit had to add and the one thing neither profile could fake:
+// riscv32 spends all four PMP regions on a three-segment image, and arm64's
+// grant window is a single shared EL0 permission map. A kernel that left root's
+// grants installed would let the store LAND, the child would spin, and this
+// line would simply not be here.
+//
+// So the assertion is the PRESENCE of a hardware fault, and a broken reload
+// fails by omission rather than by a wrong value — which is the failure mode
+// worth engineering for, because a wrong value can be argued with.
+//
+// `child status=131072` is `Faulted` with code 0: kind 2 in the high half
+// (2 * 65536), and zero in the low, because a HARDWARE fault carries no
+// `FaultReason` — the cause is in the console line, not in the status word.
+// That is the difference from the lifecycle case, whose child died in a syscall
+// and reports `131073`.
+//
+// ROOT PARKS ON A GENEROUS TIMER for the same reason the lifecycle case does:
+// this image's kernel arms no tick, so the wait below is the only way root
+// gives the processor up and the timer is the only way it gets it back.
+
+import sos.{System, Process, Memory, BootHandle, Clock, ClockType, Timer,
+            Waiter, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static KEY: UInt = 88
+
+/// Twenty milliseconds — three orders of magnitude more than the child needs to
+/// be scheduled and take one fault.
+static PARK_NS: UInt64 = 20_000_000
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS isolation: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // Row 0 is the child's image blob, row 1 the RAM it runs in — this build's
+    // config, which is root's business and never the kernel's.
+    let image = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS isolation: no image region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let dest = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS isolation: no destination region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let child = match proc.process_create(image: &image.memory,
+                                          memory: &dest.memory) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS isolation: create failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match child.start() {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS isolation: start failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS isolation: started\n")
+
+    let clock = match system.clock_get(type: ClockType.Monotonic) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS isolation: no clock: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let waiter = match proc.waiter_create() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS isolation: no waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let timer = match clock.timer_create() {
+        case Ok(t) -> t,
+        case Err(e) -> {
+            print("SOS isolation: no timer: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match waiter.add(&timer, KEY) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS isolation: attach failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match timer.arm(after_ns: PARK_NS) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS isolation: arm failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match waiter.wait() {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS isolation: wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let status = match child.get_status() {
+        case Ok(s) -> s,
+        case Err(e) -> {
+            print("SOS isolation: status failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    print("SOS isolation: root survived child status={}\n", status)
+
+    print("SOS isolation: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

@@ -18,6 +18,7 @@ import sosabi.{
     InterruptHandle,
     ClockHandle,
     TimerHandle,
+    MemoryHandle,
     SystemRight,
     ProcessRight,
     ThreadRight,
@@ -41,6 +42,8 @@ import sosabi.{
     clock_now_record_bytes,
     TIMER_ARM_RECORD_DOUBLEWORDS,
     timer_arm_record_bytes,
+    BOOT_HANDLE_RECORD_WORDS,
+    boot_handle_record_bytes,
     SosStatus,
     FaultReason,
     ProcessStatusKind,
@@ -51,6 +54,7 @@ import sosabi.{
     interrupt_rights,
     clock_rights,
     timer_rights,
+    child_process_rights,
     NO_HANDLE,
     ENTRY_IMAGE,
 }
@@ -59,6 +63,7 @@ import kcore.limits.{
     NO_ATTACHMENT,
     NO_EVENT,
     NO_INTERRUPT,
+    NO_PROCESS,
     NO_THREAD,
     NO_TIMER,
     NO_WAITER,
@@ -72,10 +77,15 @@ import kcore.result.{
     write_result,
 }
 import kcore.objects.{
+    BOOT_HANDLES,
+    BOOT_HANDLE_COUNT,
+    BOOT_HANDLE_NEXT,
     ClockObject,
     EventObject,
     HANDLES,
     InterruptObject,
+    MEMORIES,
+    MemoryObject,
     ProcessObject,
     SlotState,
     SystemObject,
@@ -132,16 +142,31 @@ import kcore.waitables.{
 }
 import kcore.process.{
     PROCESSES,
+    ProcessState,
+    alloc_process,
     copy_in,
     copy_out,
     copy_out_check,
-    end_process,
-    fault_process,
-    fault_trap,
+}
+import kcore.loader.{
+    LoadRegion,
+    image_entry,
+    place_image,
+    validate_image,
 }
 import kcore.wake.{deliver_attachment, signal_event, wake_one_waiter}
 import kcore.irq.{service_irq}
-import kcore.sched.{exit_thread, pick_next}
+// The teardown and the two fault reports moved UP here with the scheduler when
+// a process's death became a scheduling event (sawos design 2 D-6). Every call
+// site below is unchanged — a fault still terminates and still never returns —
+// and `sched.saw`'s header holds the argument for why the altitude moved.
+import kcore.sched.{
+    end_process,
+    exit_thread,
+    fault_process,
+    fault_trap,
+    pick_next,
+}
 
 /// The System object's ops (§2). Returns a status; `shutdown` does not return
 /// at all.
@@ -361,7 +386,250 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             }
             interrupt_bind(obj.slot, arg0)
         },
+        // PHASE ONE OF THE TWO-PHASE LIFECYCLE (sawos design 2 D-4; ruled
+        // Aug 16). It is asked of the CALLER's own Process handle, because
+        // creation authority is a rights bit on Process (§12) — the same shape
+        // `EventCreate` and `WaiterCreate` already have.
+        case ProcessCreate -> {
+            if not obj.allows(ProcessRight.ProcessCreate) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            process_create(p, arg0, arg1)
+        },
+        // PHASE TWO, and it is asked of the CHILD's handle — `obj.slot` is the
+        // process being started, not the caller. That is what the bare verb in
+        // the op's name says (the receiver IS the object), and it is why the
+        // right is minted on the handle `process_create` hands back rather than
+        // held by the launcher in advance.
+        case Start -> {
+            if not obj.allows(ProcessRight.Start) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            process_start(p, obj.slot)
+        },
+        // §12's boot set, drained one record at a time. It is asked of the
+        // process's OWN handle: the set belongs to the process the kernel
+        // minted it for, so `obj.slot` and the caller are the same process by
+        // the time the right check has passed.
+        case BootHandleNext -> {
+            if not obj.allows(ProcessRight.BootHandles) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            boot_handle_next(p, arg0, arg1)
+        },
     }
+}
+
+// -----------------------------------------------------------------------------
+// process_create / start / boot_handle_next (sawos design 2 D-3, D-4, D-7)
+// -----------------------------------------------------------------------------
+
+/// Resolve a handle the caller passed as a REGION, or terminate it.
+///
+/// A handle that names nothing, or names something that is not a Memory, is a
+/// caller error in the strongest sense — the process was handed these handles
+/// and chose which to pass — so it is a fault and not a `BadImage` status. The
+/// line design 2 draws is between the HANDLE (authority, caller-checkable) and
+/// the BYTES (data, reported), and this function is where it falls.
+///
+/// NO `MemoryRight` IS SPENT. The authority to create a process is
+/// `ProcessRight.ProcessCreate` on the caller's own Process handle, already
+/// checked; these two are the operation's ARGUMENTS. Unit 3's `give` and unit
+/// 4's `map` are the ops that start asking what a holder may do with a region,
+/// and the wrapper is built to answer them (`MemoryObject.allows`).
+func memory_arg(p: Int, handle: UInt) unsafe -> Int {
+    let entry = lookup_handle(p, handle)
+    match entry.obj_type {
+        case Memory -> {
+            let mem = MemoryObject(handle: MemoryHandle(handle),
+                                   rights: entry.rights, slot: entry.target)
+            mem.slot
+        },
+        case Unbound -> fault_process(p, FaultReason.BadHandle),
+        case _ -> fault_process(p, FaultReason.BadHandle),
+    }
+}
+
+/// Would `[base, base + len)` run past the end of the address space?
+///
+/// Asked BEFORE the addition, exactly as every other bound in the loader is:
+/// overflow checks are always on, so an unchecked `base + len` on a region the
+/// build emitted wrong would be a panic from inside the kernel rather than a
+/// refusal the caller can report.
+func region_wraps(base: UInt, len: UInt) -> Bool {
+    len > UInt.max - base
+}
+
+/// §2's `process_create(image:memory:)` — the second address space.
+///
+/// **EVERYTHING IS VALIDATED BEFORE THE FIRST BYTE MOVES**, which is the boot
+/// loader's phase discipline and is what makes a refusal harmless: a caller
+/// that gets `BadImage` back has a destination region exactly as it left it.
+/// The slot and the handle are taken before the copy too, so the one failure
+/// that is not about the image — a full table — also leaves the bytes alone.
+///
+/// The three things `process_create` decides that the boot path does not:
+///
+///   - THE DESTINATION IS THE CALLER'S, not a HAL constant. Root supplies two
+///     capabilities and no numbers; the stack is still the KERNEL's grant at the
+///     region's top, which is root's own loader rule applied to a child.
+///   - DEVICE WINDOWS ARE REFUSED (`allow_device: false`). See `check_segment`.
+///   - THE TWO REGIONS MUST BE DISJOINT, which also refuses the same Memory
+///     passed twice. Overlap ACROSS separate creates is deliberately not
+///     policed: regions are capabilities, the region table is build-emitted
+///     disjoint, and root double-spending what it holds corrupts only what it
+///     holds. Real accounting arrives with unit 4's pools and unit 5's quotas.
+func process_create(p: Int, image_handle: UInt,
+                    memory_handle: UInt) unsafe -> SyscallResult {
+    let img = memory_arg(p, image_handle)
+    let dst = memory_arg(p, memory_handle)
+
+    let img_base = MEMORIES[img].base
+    let img_len = MEMORIES[img].len
+    let dst_base = MEMORIES[dst].base
+    let dst_len = MEMORIES[dst].len
+
+    if region_wraps(img_base, img_len) || region_wraps(dst_base, dst_len) {
+        return op_status(SosStatus.BadImage)
+    }
+    // A destination that cannot even hold the kernel's stack grant is refused
+    // here rather than by an underflow inside `LoadRegion`'s arithmetic.
+    if dst_len <= hal.ROOT_STACK_LEN {
+        return op_status(SosStatus.BadImage)
+    }
+    if img_base < dst_base + dst_len && dst_base < img_base + img_len {
+        return op_status(SosStatus.BadImage)
+    }
+
+    // ONE STACK LENGTH SERVES BOTH PROCESSES in v1 (sawos design 2 D-4). A
+    // per-create length is unit 4/5 vocabulary — it is a quota question, and
+    // inventing an argument for it now would be an ABI to keep.
+    let dest = LoadRegion(base: dst_base, top: dst_base + dst_len,
+                          stack_len: hal.ROOT_STACK_LEN)
+    if let _ = validate_image(img_base, img_len, &dest, false) {
+        return op_status(SosStatus.BadImage)
+    }
+
+    let slot = alloc_process()
+    if slot == NO_PROCESS {
+        return op_status(SosStatus.NoResource)
+    }
+    let handle = mint_handle(p, ObjType.Process, child_process_rights(), slot)
+    if handle == NO_HANDLE {
+        return op_status(SosStatus.NoResource)
+    }
+
+    // Only now does anything happen to the destination region.
+    let rw_base = place_image(slot, img_base, &dest)
+
+    PROCESSES[slot].state = ProcessState.Created
+    // A CHILD HOLDS NO HANDLE ON ITSELF in this unit — its table is empty, so
+    // `ProcessSelf` has nothing to answer with. Unit 3 is where a child receives
+    // handles, and what it receives is what `give` decides.
+    PROCESSES[slot].self_handle = NO_HANDLE
+    PROCESSES[slot].entry = image_entry(img_base)
+    PROCESSES[slot].stack_top = dest.top
+    PROCESSES[slot].region_base = dest.base
+    PROCESSES[slot].region_top = dest.top
+    PROCESSES[slot].rw_base = rw_base
+    PROCESSES[slot].rw_top = dest.top
+    PROCESSES[slot].exit_kind = ProcessStatusKind.Running
+    PROCESSES[slot].exit_code = 0
+
+    op_value(handle)
+}
+
+/// §2's `start()` — phase two, and the whole of it.
+///
+/// It MINTS THE FIRST THREAD INTERNALLY and hands out no handle for it: nobody
+/// holds a child's thread in this unit, and what a child receives is unit 3's
+/// question. The entry and the stack come out of the process slot, recorded at
+/// create, so **root supplies neither** — which is what keeps "root never
+/// parses" airtight (sawlang#232 unit 2, ruled Aug 16).
+///
+/// `a0 = NO_HANDLE` is the no-boot-tag form. Every child in this unit is the
+/// ruled "legal-but-doomed" sandboxed compute process: it is handed no System
+/// handle, so it cannot print, cannot exit and cannot make a syscall that
+/// resolves — a fully sandboxed process is a FEATURE, not an error to detect.
+/// `start(boot_tag:)` arrives with `give` in unit 3.
+///
+/// **ROOT KEEPS RUNNING.** The thread goes on the ready queue and the caller
+/// returns normally; the child runs when the scheduler next picks it, which is
+/// the same contract `Thread.start` has.
+///
+/// A SECOND START IS A `BadState` FAULT (ruled). The state word is what makes
+/// that checkable, and the caller could have known: it is the one that started
+/// it the first time.
+func process_start(caller: Int, child: Int) unsafe -> SyscallResult {
+    match PROCESSES[child].state {
+        case Created -> {},
+        case _ -> fault_process(caller, FaultReason.BadState),
+    }
+
+    let slot = alloc_thread()
+    if slot == NO_THREAD {
+        return op_status(SosStatus.NoResource)
+    }
+    hal.frame_init(frame_slot(slot), PROCESSES[child].entry,
+                   PROCESSES[child].stack_top, NO_HANDLE)
+    THREADS[slot] = ThreadSlot(state: ThreadState.Runnable, process: child,
+                               self_handle: NO_HANDLE, exit_code: 0,
+                               joiners: 0, link: 0, wait_buf: 0)
+    ready_push(slot)
+    PROCESSES[child].state = ProcessState.Running
+    op_ok()
+}
+
+/// The record `Process.BootHandleNext` answers with, in kernel memory.
+///
+/// Declaration order IS the layout (design 58), so the field here and the word
+/// index `sosabi` publishes are one description — pinned by the assert below
+/// rather than by agreement, exactly as the wait record is.
+struct BootHandleWire {
+    tag: UInt,
+    kind: UInt,
+    handle: UInt,
+}
+
+static_assert(sizeof<BootHandleWire>() == BOOT_HANDLE_RECORD_WORDS * sizeof<UInt>(),
+              "a boot handle record must be exactly the words sosabi publishes")
+
+/// §12's boot set, one record at a time (sawos design 2 D-3).
+///
+/// **EXHAUSTION IS A STATUS AND IT STAYS EXHAUSTED.** A caller draining an
+/// iterator ENDS by meeting the end, so faulting would kill the correct program;
+/// and the cursor only advances, so a drained iterator answers `Drained` for
+/// ever and a loop's termination check is stable.
+///
+/// The record rides the EXISTING copy-out funnel — three machine words, the
+/// wait record's shape — because that door already answers the two questions an
+/// answer-in-memory poses (is the buffer aligned, is it inside the process's
+/// writable window) and a second one would be a second set of rules.
+///
+/// IT IS CONSUMED BY DELIVERY, and the cursor advances only after the copy
+/// SUCCEEDS: a caller whose buffer was refused is dead by then, but the ordering
+/// is what makes the rule "a record is handed over exactly once" true rather
+/// than nearly true.
+func boot_handle_next(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
+    // A capacity below the record's size is an argument outside its domain —
+    // the size is published, so the caller could have checked. `Waiter.Wait`'s
+    // rule, and the same diagnostic.
+    if cap < (boot_handle_record_bytes() as UInt) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    if BOOT_HANDLE_NEXT >= BOOT_HANDLE_COUNT {
+        return op_status(SosStatus.Drained)
+    }
+    let queued = BOOT_HANDLES[BOOT_HANDLE_NEXT]
+    var rec = BootHandleWire(tag: queued.tag, kind: queued.kind as UInt,
+                             handle: queued.handle)
+    if let why = copy_out(p, dst,
+                          ((&var rec) as UnsafePointer<BootHandleWire>) as UInt,
+                          boot_handle_record_bytes() as UInt) {
+        fault_process(p, why)
+    }
+    BOOT_HANDLE_NEXT = BOOT_HANDLE_NEXT + 1
+    op_ok()
 }
 
 /// Make an Event in process `slot` (spec §2.4).
@@ -714,8 +982,14 @@ func clock_now(p: Int, slot: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult 
         case Monotonic -> hal.timer_now_ns(),
     }
     var rec = ClockNowRecord(now_ns: reading)
-    copy_out(p, dst, ((&var rec) as UnsafePointer<ClockNowRecord>) as UInt,
-             clock_now_record_bytes() as UInt)
+    // The door REPORTS a refused destination and the caller terminates on it
+    // (sawos design 2): with more than one process a fault is a scheduling
+    // event, so the kill lives above the switch point. What is checked and what
+    // happens to the caller are exactly what they were.
+    if let why = copy_out(p, dst, ((&var rec) as UnsafePointer<ClockNowRecord>) as UInt,
+                          clock_now_record_bytes() as UInt) {
+        fault_process(p, why)
+    }
     op_ok()
 }
 
@@ -784,7 +1058,10 @@ func timer_arm(p: Int, slot: Int, src: UInt, bytes: UInt) unsafe -> SyscallResul
         fault_process(p, FaultReason.BadArg)
     }
     var rec = TimerArmRecord(after_ns: 0, interval_ns: 0)
-    copy_in(p, ((&var rec) as UnsafePointer<TimerArmRecord>) as UInt, src, bytes)
+    if let why = copy_in(p, ((&var rec) as UnsafePointer<TimerArmRecord>) as UInt,
+                         src, bytes) {
+        fault_process(p, why)
+    }
 
     let now = hal.timer_now_ns()
     // Saturating, because `now + after` is arithmetic on a number the PROCESS
@@ -877,6 +1154,12 @@ func waitable_slot(p: Int, handle: UInt) unsafe -> Waitable {
         // always running, so "ready" would either be permanently true or
         // meaningless. Waiting for a TIME is what the Timer it creates is for.
         case Clock -> fault_process(p, FaultReason.NotWaitable),
+        // A MEMORY IS NOT WAITABLE EITHER, and for a sharper reason: a region
+        // has no state at all in v1 — it is a sealed pair — so there is nothing
+        // that could become ready. Unit 4's Mapping is where memory grows an
+        // event worth waiting on (a fault, a revocation), and it will be that
+        // object's readiness rather than the region's.
+        case Memory -> fault_process(p, FaultReason.NotWaitable),
     }
 }
 
@@ -998,7 +1281,9 @@ func waiter_wait(p: Int, w: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
     if cap < (wait_record_bytes() as UInt) {
         fault_process(p, FaultReason.BadArg)
     }
-    copy_out_check(p, dst, wait_record_bytes() as UInt)
+    if let why = copy_out_check(p, dst, wait_record_bytes() as UInt) {
+        fault_process(p, why)
+    }
 
     let ready = waiter_ready_attachment(w)
     if ready != NO_ATTACHMENT {
@@ -1072,6 +1357,13 @@ func dispatch(handle: UInt, op: UInt,
                                   rights: entry.rights, slot: entry.target)
             timer_op(op, &obj, arg0, arg1)
         },
+        // A MEMORY HAS NO OP TABLE IN v1 (spec §2.5's first slice; sawos design
+        // 2 D-2), so every op number aimed at one is an op the object does not
+        // have — which is a `BadOp` fault by the same rule that covers an
+        // unknown number on any other kind. The whole of a region's surface
+        // today is being NAMED as an argument to `process_create`; unit 4's
+        // `map`/`alloc` are what put a table here.
+        case Memory -> fault_process(p, FaultReason.BadOp),
     }
 }
 

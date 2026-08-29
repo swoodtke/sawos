@@ -1,0 +1,81 @@
+// SOS M3 unit 2: A MALFORMED IMAGE IS A STATUS (sawos design 2 D-4).
+//
+// Root calls `process_create` WITH ITS TWO REGIONS THE WRONG WAY ROUND: the
+// child's empty destination RAM as the image, and the image blob as the
+// destination. The first region holds zeros, so it has no magic, and the
+// kernel answers:
+//
+//   SOS badimage: create refused: not a loadable process image
+//   SOS badimage: still running, exiting clean
+//
+// and the machine exits ZERO.
+//
+// WHAT THIS RULES OUT, and it is the whole point of the case: every OTHER way a
+// process can hand the kernel something wrong ends the process. A bad handle,
+// an unknown op, a right it was not given, a misaligned buffer, a duplicate
+// attachment key — all of them are caller errors the process could have
+// checked, and design 178's faults ruling ends it. This one is not: A LAUNCHER
+// DID NOT WRITE THE BYTES IT WAS HANDED. It received a region capability and
+// was asked to start what is in it, and a launcher that cannot report a bad
+// image cannot go on to launch anything else — which is exactly the shape M4's
+// dynamically-fetched images make unavoidable.
+//
+// The `from(raw:)` precedent is the same one: an unrecognized wire byte is DATA
+// a reader rejects, never a trap.
+//
+// THE SWAP IS A REALISTIC MISTAKE rather than a contrived one — it is what a
+// launcher does when its config maps ordinals to roles backwards — and it also
+// keeps the two regions DISJOINT, so what the kernel refuses is the magic
+// rather than an overlap. Nothing is copied: the whole of the validation
+// happens before the first byte moves, so the real destination region is
+// untouched and root could try again with the arguments the right way round.
+
+import sos.{System, Process, Memory, BootHandle, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS badimage: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let image = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS badimage: no image region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let dest = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS badimage: no destination region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // THE ARGUMENTS ARE SWAPPED ON PURPOSE.
+    match proc.process_create(image: &dest.memory, memory: &image.memory) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS badimage: a region of zeros LOADED\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        case Err(e) -> print("SOS badimage: create refused: {}\n", e),
+    }
+
+    // The point of the whole case: root is still here.
+    print("SOS badimage: still running, exiting clean\n")
+    let _ = proc.exit(EXIT_OK)
+}

@@ -1,0 +1,99 @@
+// SOS M3 unit 2: THE BOOT SET, DRAINED (sawos design 2 D-3).
+//
+// §12 keeps the entry register ONE HANDLE WIDE — the System handle — so
+// everything else the kernel minted for root before it ran has to be collected
+// rather than passed. This is what collecting looks like:
+//
+//   SOS bootdrain: n=2 tags=1 kinds=0
+//   SOS bootdrain: exhausted, and still exhausted
+//   SOS bootdrain: done
+//
+// THREE CLAIMS, one per line.
+//
+// `n=2` and `tags` are ROOT ASSERTING ITS OWN CONFIG. The build appended one
+// child image and assigned it one destination range, so the region table has
+// two rows and their ordinals are 0 and 1 — and the kernel, which minted a
+// Memory for each, knows nothing about what either is FOR. A launcher's config
+// is what supplies the meaning, and the tag is what it looks the meaning up by.
+//
+// The tags are accumulated as DIGITS rather than printed one per record, so the
+// single number carries the ORDER as well as the set: 0 then 1 accumulates to
+// 1, where 1 then 0 would read 10. The kinds are both `BootHandleKind.Memory`
+// (0), because regions are the only thing v1 mints, and they accumulate to 0.
+//
+// THE LOOP ENDS BY MEETING `Drained`, which is why exhaustion is a status
+// rather than a fault: the correct program is exactly the one that walks off
+// the end. A kernel that faulted there would kill every launcher ever written.
+//
+// AND IT STAYS DRAINED. The second ask after the loop is the claim that the
+// cursor only ever advances — a record is delivered once, and asking again is
+// safe rather than a way to receive the same capability twice, which §3's
+// no-duplicate rule is what forbids.
+
+import sos.{System, Process, Memory, BootHandle, BootHandleKind, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// What this build's region table is expected to publish: one blob row for the
+/// appended child image, one free-RAM row for its destination.
+static WANT_REGIONS: UInt = 2
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS bootdrain: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // The drain. It reads exactly like a launcher's first loop, because it is
+    // one: take what you were given, and stop when there is no more.
+    var count: UInt = 0
+    var tags: UInt = 0
+    var kinds: UInt = 0
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                // Accumulated as digits rather than printed per record, so the
+                // assertion is one line whose ORDER is part of the claim: a
+                // kernel that delivered the rows out of order would produce
+                // `10` here rather than `01`.
+                tags = tags * 10 + h.tag
+                kinds = kinds * 10 + (h.kind as UInt)
+                count = count + 1
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+    print("SOS bootdrain: n={} tags={} kinds={}\n", count, tags, kinds)
+
+    if count != WANT_REGIONS {
+        let _ = system.debug_print("SOS bootdrain: wrong region count\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // EXHAUSTION IS STABLE. Asking a drained iterator again is not an error and
+    // does not hand anything back — which is what makes the loop above safe to
+    // write without a count the kernel would have had to publish separately.
+    match proc.boot_handle_next() {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS bootdrain: a drained set gave more\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        case Err(_) -> {
+            let _ = system.debug_print("SOS bootdrain: exhausted, and still exhausted\n")
+        },
+    }
+
+    print("SOS bootdrain: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

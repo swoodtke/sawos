@@ -83,6 +83,37 @@ SECTIONS {
         _payload_end = .;
     } > RAM
 
+    /* THE BOOT REGION TABLE and the child images it points at (sawos design 2
+     * D-2). Both come from a stub the harness GENERATES per case: the table's
+     * blob rows name the child sections' own symbols, so the LINKER fills in
+     * the bases and nothing computes an address by hand.
+     *
+     * `.regions` gets the one new fixed symbol pair in the system — the kernel
+     * reads it through the HAL's `sos_region_table_*` accessors, exactly as it
+     * reads `.payload`'s bounds. An image built with no children has neither
+     * input section, so start == end and the kernel sees ZERO REGIONS. That is
+     * every case that existed before this unit, unchanged.
+     *
+     * 8-ALIGNED because the table's rows are pairs of 64-bit fields on both
+     * profiles, which is what lets the kernel overlay a struct on them instead
+     * of assembling bytes.
+     *
+     * NO PAGE ALIGNMENT, and the absence is the point on THIS profile
+     * especially: neither section is ever granted to EL0. A child image is read
+     * by the KERNEL at EL1 during the copy, so the grant window's page
+     * granularity does not reach it, and the blob is dead bytes once the copy
+     * is done. `.payload` above is page-aligned precisely because it IS
+     * granted; these are not. */
+    .regions : ALIGN(8) {
+        _region_table_start = .;
+        KEEP(*(.regions))
+        _region_table_end = .;
+    } > RAM
+
+    .childimg : ALIGN(16) {
+        KEEP(*(.childimg))
+    } > RAM
+
     .bss (NOLOAD) : ALIGN(4096) {
         _bss_start = .;
         *(.bss .bss.*)

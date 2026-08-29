@@ -36,6 +36,7 @@ is four instructions and a branch into the trap entry's own restore path.
 | `console_byte(b)` | Put one byte on the kernel's console. Byte-at-a-time on purpose: the arch-free half formats, this half places. |
 | `exit_pass()` / `exit_fail(code)` | Stop the machine, zero / non-zero. Never return. A zero `code` is promoted so a failing exit never reads as a passing one. |
 | `payload_start()` / `payload_end()` | Bounds of the appended root image. Equal when there is none. |
+| `region_table_start()` / `region_table_end()` | Bounds of the build-emitted BOOT REGION TABLE (sawos design 2 D-2). Equal when there is none, which is ZERO REGIONS and the ordinary state of an image that appends no child images. |
 | `PROT_GRAIN: UInt` | Protection granularity — what a region bound is rounded up to. |
 | `MAX_ROOT_SEGMENTS: UInt` | How many segments a root image may ask for, i.e. the grant budget minus the stack. |
 | `ROOT_LOAD_BASE` / `ROOT_REGION_TOP` / `ROOT_STACK_LEN` | Root's region in this board's memory map. |
@@ -142,6 +143,7 @@ stores to THR — and the mechanism that stops the machine.
 | `sos_mie_write(mask)` | sink.c | Place a word in `mie` — which CLASSES of interrupt may reach this hart. | `csrw` names its CSR. WHICH classes, and the shadow the mask is staged in, are Saw. Note what is absent: nothing here writes the GLOBAL enable, and that absence is design 178's D2. |
 | `sos_pmpcfg_write(lo, hi)` | sink.c | Publish both config registers together. | Same: `csrw pmpcfg0` names its register. The config words are STAGED in Saw. |
 | `sos_payload_start()` / `sos_payload_end()` | sink.c | Bounds of the appended payload. | A linker symbol's ADDRESS, which Saw cannot name — DF-172a. |
+| `sos_region_table_start()` / `sos_region_table_end()` | sink.c | Bounds of the `.regions` section — the boot region table (sawos design 2 D-2). | Same reason, DF-172a. It is the ONE new fixed symbol pair that unit brought: the table's blob rows carry bases the LINKER resolved when it placed the generated stub, so no per-child symbol has to be nameable here. |
 | `sos_wait_for_irq()` | sink.c | Park the core until an interrupt is pending, behind `wait_for_irq`. | `wfi` is an INSTRUCTION. One line, and it is the whole of design 178 M2 unit 4's native delta on this profile. |
 | `virt.ld` | — | Places the image at this board's RAM base, first section first, and bounds the appended payload — on PAGE boundaries at both ends since design 178, which is a speed property under emulation rather than a protection one (DF-178b: a PMP region covering part of a page defeats the emulator's per-page translation cache, and the same user-mode loop measured 62.6s before the round-up and 0.03s after). | Not a program. |
 

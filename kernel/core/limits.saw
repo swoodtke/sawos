@@ -26,11 +26,57 @@
 import hal
 import sosabi.{ClockType}
 
-/// Processes the kernel can hold. ONE in M2: the kernel loads exactly one image
-/// ever (§12) and every later process is loaded BY root, which needs the
-/// MemoryObject/Mapping objects M3 brings. The table is indexed rather than
-/// assumed throughout so that raising this number is the only edit.
-public(package) static MAX_PROCESSES: Int = 1
+/// Processes the kernel can hold. TWO since M3 unit 2 (sawos design 2 D-6):
+/// root, and the one child a `process_create` proof needs.
+///
+/// **"RAISING THIS NUMBER IS THE ONLY EDIT" GETS ITS FIRST EXERCISE, and it
+/// held.** Every table that is per-process was already indexed rather than
+/// assumed — the handle table is a slice of `HANDLES` at `p * MAX_HANDLES`, the
+/// thread/event/waiter/interrupt/timer slabs carry a `process` field their
+/// teardown scans by — so the one-to-two step is this line and the `ProcessSlot`
+/// arithmetic that follows from it. What did NOT come for free is what design 2
+/// is about: the protection domain, which one process could leave installed and
+/// two cannot (D-5), and the end of a process, which with one was the end of the
+/// machine (D-6).
+///
+/// Two rather than eight because a slot is not free: it costs `MAX_HANDLES`
+/// handle entries and a grant record, and nothing above unit 2 needs a third
+/// yet. Quotas (unit 5) are where the number stops being the whole policy.
+public(package) static MAX_PROCESSES: Int = 2
+
+/// Root's slot. The kernel loads exactly one image (§12) and it lands here, so
+/// "process 0" and "root" are the same statement — which is what lets
+/// `end_process` fork on a comparison rather than on a flag.
+public(package) static ROOT_PROCESS: Int = 0
+
+/// "No process". The plain-form sentinel, like `NO_THREAD`.
+public(package) static NO_PROCESS: Int = -1
+
+/// Memory objects the kernel can hold (spec §2.5; sawos design 2 D-2).
+///
+/// A CENSUS OF BOOT REGIONS rather than a slab a process draws on: v1 mints
+/// these only at boot, one per row of the build-emitted region table, and
+/// nothing creates one at run time. Eight is a comfortable ceiling on a
+/// hand-written system's images plus their destination ranges; a table with
+/// more rows than this is refused at boot rather than silently truncated.
+/// Unit 4's pools are what make this a real allocation budget.
+public(package) static MAX_MEMORIES: Int = 8
+
+/// The same sentinel for the Memory slab.
+public(package) static NO_MEMORY: Int = -1
+
+/// Rows in a process's GRANT RECORD (sawos design 2 D-5) — the protection map
+/// the scheduler REPLAYS when it switches into that process.
+///
+/// One row per image segment plus one for the kernel's stack grant, which is
+/// `hal.MAX_ROOT_SEGMENTS + 1` on each profile. It is written as a literal here
+/// rather than derived from the HAL because an array LENGTH must be an `Int`
+/// and the HAL's budget is a `UInt`; the assert below is what keeps the two
+/// from drifting, at the profile with the larger budget.
+public(package) static MAX_GRANT_ROWS: Int = 9
+
+static_assert(hal.MAX_ROOT_SEGMENTS + 1 <= 9,
+              "a process's grant record must hold every segment plus its stack")
 
 /// Threads the kernel can hold, across all processes.
 public(package) static MAX_THREADS: Int = 8

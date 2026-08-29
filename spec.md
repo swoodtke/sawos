@@ -32,7 +32,7 @@ names provisional):
 |---|---|
 | `AddressSpace` | Isolation domain, defined abstractly. P4: PMP region set + APM/REE security context (see §5.5 — the P4's MMU is real but global/external-memory-only, not per-process). Paging targets: page-table root. |
 | `Thread` | Kernel-scheduled execution context bound to an AddressSpace. Saw's cooperative TaskGroups run *inside* a thread, in userspace — the kernel never sees tasks. BUILT M2 (design 178 unit 2): ops `Start`/`Join`/`Exit`/`Yield`, rights `ThreadRight.Start`/`.Join`/`.Control`. The saved trap frame IS the context, so a switch is the trap handler returning a different frame — see §11. |
-| `MemoryObject` | A range of memory (RAM or device MMIO) that can be mapped into AddressSpaces. Derived by splitting/attenuating a parent MemoryObject; roots handed to the first process at boot. |
+| `MemoryObject` | A range of memory (RAM or device MMIO) that can be mapped into AddressSpaces. Derived by splitting/attenuating a parent MemoryObject; roots handed to the first process at boot. BUILT M3 unit 2, FIRST SLICE (sawos design 2 D-2): a SEALED `{base, len}` and nothing else — no pools, no derivation, no `map()`, no attributes, no op table (an op aimed at one is a `BadOp` fault). Minted only at boot, one per row of the build-emitted REGION TABLE, delivered to root through `ProcessOp.BootHandleNext`, and NAMED as the two arguments of `process_create`. Rights are the universal pair, `MemoryRight.Transfer` (unit 3's `give`) and `.Manage` (unit 4's derivation), minted because attenuation is monotonic and neither read by anything yet. §2.5 is not contradicted, it is STARTED: these ARE that section's "pool roots given to the root server at boot", in their v1 static form. |
 | `Pipe` | Synchronous message IPC with request/reply built in — see §2.1 (ratified Jul 29; renamed from Channel + client API amended Aug 20). |
 | `Event` | Accumulating non-blocking notification (OR / saturating-sum); a waitable — see §2.4 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Signal`/`Receive`, the mode chosen by the caller at creation (`event_create(mode:)`). AMENDED Aug 17 (user): the word is CONSUMED BY WHOEVER TAKES IT, through either door — `receive` is the non-blocking poll, a `Waiter.wait` delivery is the blocking one, and both read-and-clear, so a value is reported exactly once (§2.2, §2.4). |
 | `Clock` | A GRANTED TIME SOURCE — time is a capability, not an ambient facility. BUILT M3 (design 232 unit 1): obtained through `SystemOp.ClockGet` on `SystemRight.ClockGet`, ops `Now`/`TimerCreate`, rights `ClockRight.Read`/`.TimerCreate`. **A HARDWARE-BACKED CLOCK IS ONE KERNEL-ETERNAL OBJECT PER `ClockType`** (ruled Aug 17, user), existing from boot and owned by NOBODY: the machine has one monotonic counter, and a per-process object naming it would be a copy of a fact with a lifetime attached. So there is one slot per domain (the slot IS the domain's ordinal), no allocation and no `NoResource`, and process teardown frees no clock — a dead process's clock HANDLE is unbound like any other, and the object it named is not the process's to reclaim. `ClockGet` is therefore a GETTER that mints a handle onto a well-known object: asking twice answers the SAME handle, which the process's own handle table is what records. `ClockType` declares `Monotonic` ONLY in v1 (`Boot`/`Realtime` are future values of a raw-backed enum, undeclared because an unproducible case is dead surface), and `Now` dispatches on the clock's domain, so a second domain fails to compile until somebody says what its reading is. `Now` answers through a copy-out record, because a nanosecond count is 64 bits and one profile's registers are not. The point of the capability: strip the right from a child and hand it a VIRTUAL clock over IPC instead, with no code change on either side — and a virtual clock is a DIFFERENT animal, separately created and STATEFUL (offset, rate, owner), so it gets its own creation op and its own lifetime rather than a row in this table. |
@@ -41,16 +41,19 @@ names provisional):
 | `Waiter` | Generic wait aggregator (epoll/Port-style) — see §2.2 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Add`/`Remove`/`Wait`, rights `WaiterRight.Attach`/`.Wait`, the wait answer a copy-out record. |
 | `MemoryObject` | Physical memory (RAM or device MMIO). Ownership/authority over the pages; mappable, sendable — see §2.3 (ratified Jul 29). |
 | `Mapping` | An installed virtual placement of a MemoryObject; distinct object, own handle; only it can unmap — see §2.3. |
-| `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. BUILT M2 (design 178 unit 2), one process: ops `ThreadCreate`/`ThreadSelf`/`Exit`/`GetStatus` plus the three factory ops `EventCreate`/`WaiterCreate`/`InterruptBind`, each on its own right. `create_process` is M3 (design 232 unit 2) and `kill` (§8) has no op yet. |
+| `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. BUILT M2 (design 178 unit 2), one process: ops `ThreadCreate`/`ThreadSelf`/`Exit`/`GetStatus` plus the three factory ops `EventCreate`/`WaiterCreate`/`InterruptBind`, each on its own right. BUILT M3 unit 2 (sawos design 2), **TWO processes**: `ProcessCreate` (on the caller's own handle, `ProcessRight.ProcessCreate`) takes an image region and a destination region and returns an INERT process; `Start` (on the CHILD's handle, `ProcessRight.Start`) mints its first thread and runs it; `BootHandleNext` (`ProcessRight.BootHandles`) drains §12's boot set one record at a time. The child's handle carries `Start | Wait | Manage` and nothing else — everything a process may do to ITSELF is withheld from its creator. The TEARDOWN now forks (§8): process 0 stops the machine, any other reschedules. `kill` (§8) still has no op. |
 | `System` | Kernel singleton (ratified Aug 5): the object behind system-scoped primitives so that EVERY syscall is an object op (§5.7) — v1 ops `debug_print`, `shutdown(status)` (stop the machine; QEMU: sifive_test), rights-gated (`SystemRight.Debug`/`.Shutdown`, §3 scoped rights). Root receives its handle at boot (§12). `exit` is NOT here — process exit belongs to the Process object when it exists (ratified Aug 5). M2 added a third op, `process_self` on `SystemRight.Manage` (design 178 unit 2): §3's derivation rule made real, so the boot register stays ONE handle wide and a process obtains its Process object THROUGH the System handle rather than being handed it. Later candidates: info queries. |
 
-**Eight of these kinds exist today** — System, Process, Thread, Event, Waiter,
-Interrupt, Clock and Timer (`ObjType`, `sos/kernel/abi/`, the kernel-internal
-numbering §5.7's vDSO discipline keeps renumberable). The other rows are
-unbuilt: Pipe is M4, the memory surface is M3 (design 232 unit 4), and
-AddressSpace stays implicit while one process exists — a process gets one
-granted range plus a writable window, installed by the loader. §11 is the
-ledger.
+**Nine of these kinds exist today** — System, Process, Thread, Event, Waiter,
+Interrupt, Clock, Timer and (since M3 unit 2) MemoryObject in its first slice
+(`ObjType`, `sos/kernel/abi/`, the kernel-internal numbering §5.7's vDSO
+discipline keeps renumberable). The other rows are unbuilt: Pipe is M4, and
+Mapping is M3 unit 4 — which is also where MemoryObject stops being a sealed
+pair. **AddressSpace is still implicit, and is now implicit for TWO processes**:
+each gets one granted range plus a writable window, and its protection rows are
+recorded in its process slot and REPLAYED by the scheduler when it switches in
+(sawos design 2 D-5). That record is what an AddressSpace object would own if
+one existed; nothing above it would change if it did. §11 is the ledger.
 
 ### 2.1 Pipes: bounded messages + built-in request/reply (ratified Jul 29;
 ### renamed from Channels + client API amended Aug 20)
@@ -262,6 +265,24 @@ reply it is about to discard.
   harmlessly (atomic accumulate); one drain reads-and-clears.
 
 ### 2.5 Memory: MemoryObject vs Mapping (ratified Jul 29)
+
+**BUILT M3 unit 2, THE FIRST SLICE** (sawos design 2 D-2), and what was built is
+deliberately the smallest useful part of it: a MemoryObject is a SEALED
+`{base, len}` — no pool, no derivation, no `map()`, no attribute, no ops. It is
+minted only at boot, one per row of a build-emitted region table, and its whole
+surface is being NAMED as an argument to `process_create`. These are exactly
+this section's "**pool roots given to the root server at boot**" in a v1 static
+form, which is why nothing below is contradicted by them: the pools, the
+attribute that travels with the handle, the derivation and the Mapping object
+are unit 4's, and every one of them is ADDITIVE over what exists. The one thing
+the slice does settle is that a region is a CAPABILITY rather than a
+description: there is no op that reads a MemoryObject's bounds, so a process
+that holds one can hand it to the kernel and cannot learn a number from it.
+The migration case below stays exactly as written — M2's boot-time device grant
+is still a `sosimg` record, because a child image is REFUSED one (design 2 D-7:
+a boot-time image-declared window is a statement about the one process the
+kernel loads, and generalizing a placeholder would outlive it). The echo-driver
+money shot rides unit 4's IoMemory, not this slice.
 
 - **`MemoryObject`** = authority over a physical page range, allocated
   **from a typed pool** (ratified Jul 29). The pool's attribute governs
@@ -760,6 +781,39 @@ SMP-era work builds.
 
 ## 8. Thread & process lifecycle (ratified Aug 3)
 
+**BUILT M3 unit 2 — THE SECOND ADDRESS SPACE** (sawos design 2). Process
+creation is real, and the lifecycle it is built on is the one ruled Aug 16:
+**TWO PHASES, INERT UNTIL STARTED.** `ProcessOp.ProcessCreate` (on the
+CALLER's own Process handle, gated by `ProcessRight.ProcessCreate`) takes two
+Memory regions — a read-only image blob and the child's destination RAM — and
+returns a process with an address space, a recorded entry and stack, and NO
+THREAD. `ProcessOp.Start` (on the CHILD's handle, gated by
+`ProcessRight.Start`) mints the first thread at that recorded entry and makes
+it runnable; the caller keeps running. The ordering IS the soundness argument
+for the launch flow: whatever a launcher gives a child must be complete at its
+first instruction, and the start call is the barrier that makes a
+half-populated table unrepresentable — with no synchronization invented. **A
+SECOND `start` is a `BadState` fault** (ruled): broken code, and the caller is
+the one that started it the first time. **A malformed image is a `BadImage`
+STATUS, not a fault** — the one caller-supplied thing that does not end the
+caller, because image bytes are DATA a launcher was handed rather than
+something it wrote (the `from(raw:)` precedent).
+**THE FAULT RULE BELOW NOW FORKS.** A thread fault still kills its process and
+the teardown still runs unconditionally; what changed is what happens after.
+Process 0 — root, the one image the kernel loads (§12) — stops the machine,
+byte-identically to every earlier era. **ANY OTHER PROCESS RESCHEDULES**: its
+threads are REMOVED from the ready queue (leaving everybody else's), its slabs
+and its protection rows go back, and the path ends in the scheduler rather than
+in a stopped machine. Children die with the machine when root ends, uncounted;
+observing a child's death as an event is unit 5.5's death notifications, and
+until then a supervisor reads `get_status` through the handle it still holds —
+which outlives the child, because the teardown closes the handles in the DEAD
+process's table and not in its creator's.
+**`process.kill()` still has neither op nor right.** The second process exists
+now, so the argument that made it degenerate has expired; what it waits on is a
+ruling about what killing a process that is not the caller does to a scheduler
+that may be running its thread.
+
 **STATUS AFTER M2** (design 178 D4, ratified Aug 15). BUILT: the fault rule
 below, whole — a thread fault kills its process and the ratified teardown
 runs unconditionally — and `get_status` as `ProcessOp.GetStatus` gated on
@@ -1027,15 +1081,23 @@ event-driven EDGE of a process gets a second, distinct construct:
   pointed at rather than duplicated.
   - ~~**Clock and Timer**~~ BUILT by design 232 unit 1 — see the M3 entry in
     the roadmap below. A process can sleep.
-  - **A second process** (§2 Process row, §12) — `create_process` is
-    absent and exactly one Process is ever built, so §12's
-    loader-above-boot rule has never been exercised. Design 232 unit 2,
-    with the launch flow (`give`, and the boot-handle iterator the child
-    drains) in unit 3.
-  - **Memory / IoMemory / MemoryMapping and `map()`** (§2.5) — no memory
-    object of any kind; a process gets one granted range plus a writable
-    window from the loader, and the M2 device grant is the declared
-    placeholder that surface retires. Design 232 unit 4.
+  - ~~**A second process**~~ BUILT by sawos design 2 (M3 unit 2).
+    `process_create(image:memory:)` + `start()` are real, §12's
+    loader-above-boot rule is EXERCISED — one loader, two doors, differing
+    only in region parameters and failure vocabulary — and the protection
+    domain is RELOADED per process at the scheduler's one switch point. What
+    remains of the launch flow is unit 3's: `give(handle, tag:)` and
+    `start(boot_tag:)`, so that a child receives something. A child today is
+    the ruled "legal-but-doomed" sandboxed compute process, holding no handle
+    at all.
+  - **Memory / IoMemory / MemoryMapping and `map()`** (§2.5) — the FIRST
+    SLICE is built (sawos design 2 D-2): a sealed `{base, len}` MemoryObject,
+    minted only at boot from a build-emitted region table, delivered through
+    `BootHandleNext` and NAMED as `process_create`'s two arguments. What is
+    still absent is everything that makes it a memory SYSTEM — pools, the
+    attribute that travels with a handle, derivation, `map()` and the Mapping
+    object — and the M2 device grant is still the declared placeholder that
+    surface retires (a child image is refused one outright). Design 232 unit 4.
   - **Quotas** (§12's creation-authority pin, which M2 ANSWERED with a
     factory-capability rights bit rather than a quota) — the per-process
     table, `QuotaExceeded`, and creator-pays accounting are design 232
@@ -1048,7 +1110,10 @@ event-driven EDGE of a process gets a second, distinct construct:
   - **Priorities** (§7) — nothing of §7 is built; round-robin is ruled to
     stay through M3 (design 232 agenda item 10).
   - **Thread and process waitability, and `kill`** (§8) — attaching
-    either kind is a fault today; `kill` has no op and no right.
+    either kind is a fault today (and so is attaching a MemoryObject, which
+    has no state that could become ready); `kill` has no op and no right. A
+    supervisor learns a child died by READING `get_status` through the handle
+    it still holds; being WOKEN by the death is unit 5.5's.
   - **`IntrSpinLock` (§9b), SMP** — still unbuilt, and correctly so: a
     preemption point IS the assertion that state is consistent, so
     nothing yet has a critical section for the type to protect. SMP
@@ -1241,7 +1306,47 @@ event-driven EDGE of a process gets a second, distinct construct:
     and the C ABI declares no aggregate return), and `sos_wait_for_irq`
     per profile (`wfi` is an instruction). Assembly went DOWN, because a
     thread context built in Saw needs no register-clearing prologue.
-  - **M3 IN PROGRESS (design 232) — units 1 and 1.5 DONE.** Unit 1.5 is
+  - **M3 IN PROGRESS (design 232) — units 1, 1.5 and 2 DONE.** Unit 2 is
+    `designs/002-create-process.md`, and it is the one the milestone is named
+    for: **SOS RUNS TWO PROCESSES.** `process_create(image:memory:)` takes two
+    Memory capabilities and returns an INERT process; `start()` mints its
+    first thread and lets the scheduler pick it up while the caller keeps
+    running. Nine object kinds where unit 1 had eight; five new harness cases
+    per architecture, 47 each, 94 runs, with the 84 existing rows unchanged.
+    What the implementation added to §2, §8, §11 and §12:
+    (a) **THE LOADER STAYS IN THE KERNEL** (user, Aug 28, superseding the same
+    day's zero-copy ruling), and it is ONE loader with two doors: the phases
+    take the destination as a region parameter and differ only in whether a
+    refusal is `fatal_image` or a `BadImage` status. §12's loader-above-boot
+    rule is exercised without a second code path existing anywhere.
+    (b) **PROTECTION IS RELOADED AT THE SWITCH, forced on both profiles.** One
+    has a small fixed budget of numbered regions that a three-segment root
+    spends entirely; the other's grant window is a single shared user-mode
+    permission map. So a process's rows are DATA in its slot, replayed by the
+    scheduler when the incoming thread's process differs from the installed
+    domain — and a same-process switch, which is every switch every earlier
+    case makes, reloads nothing. That is what kept the shipped transcripts
+    byte-identical.
+    (c) **A PROCESS'S DEATH IS A SCHEDULING EVENT.** `end_process` forks: root
+    stops the machine exactly as before, a child leaves the ready queue BY
+    REMOVAL (the wholesale zeroing was a one-process spelling that would have
+    taken root's runnable threads) and the path ends in the scheduler. That
+    forced the teardown UP a module — the reschedule can idle, idling
+    delivers, and delivery reaches back down into the copy door — which is
+    design 1's cycle at a second site, resolved the same way: the doors REPORT
+    a bad buffer and the callers above the switch point terminate on it.
+    (d) **THE BUILD EMITS A REGION TABLE; THE KERNEL INTERPRETS NOTHING**
+    (sawlang#232 agenda item 2's ruled hybrid). The stitcher appends each
+    child image as it is and records `{base, len}` rows in a new fixed-symbol
+    section; the kernel mints one sealed MemoryObject per row and hands them
+    to root through `BootHandleNext`; root's config is what says which ordinal
+    is which. A missing table is zero regions, which is why every image built
+    without children boots unchanged.
+    (e) **THE MONEY PROOF IS AN ABSENCE.** A child stores into root's region,
+    the access faults, the child dies and root says so — and a kernel with a
+    broken reload fails by the fault report going MISSING rather than by a
+    wrong value, which is the failure mode worth engineering for.
+  - **Unit 1.5 DONE** —
     the first sawos-native design (`designs/001-kernel-interruptibility.md`,
     implementing 232 pin 1) and the first unit to land in this repository
     rather than in sawlang: **a long kernel operation is interruptible.**
@@ -1349,6 +1454,36 @@ event-driven EDGE of a process gets a second, distinct construct:
   (sosimg, §6). Every later process is loaded BY ROOT from images root
   obtains itself (e.g. a flash MemoryObject it holds), via LAUNCH +
   `create_process`. The kernel has no second code path for process two.
+  **EXERCISED, M3 unit 2 (sawos design 2 D-1), AND THE KERNEL STILL HAS ONE
+  LOADER.** Two rulings of Aug 28 settled the shape and the second superseded
+  the first: zero-copy link-in-place was ruled and then overturned — **the
+  loader stays in the kernel entirely**, doing the copying, with a userspace
+  split deferred until it is necessary. So the kernel parses sosimg at boot and
+  at `process_create` through the SAME phases: `validate_image` and
+  `place_image` take the destination as a REGION PARAMETER (`LoadRegion`), and
+  the only thing that differs between the two doors is the FAILURE VOCABULARY —
+  the boot door raises `fatal_image` because a machine whose only image is
+  malformed has nothing else to run, and the create door returns `BadImage`
+  because a launcher must be able to report what it was handed. "No second code
+  path" is therefore kept BY CONSTRUCTION rather than by discipline: there is
+  nowhere else in the tree that reads a segment record.
+  **ROOT PROVIDES THE MEMORY AND SUPPLIES NO NUMBERS** (ruled Aug 28, via the
+  stack question): `process_create(image:memory:)` takes two Memory
+  capabilities, segments are copied to their LINK addresses inside `memory`,
+  and **the stack is the kernel's grant at that region's top** — root's own
+  loader rule, applied to a child. So a launcher never parses an image, never
+  computes a load address and never chooses a stack, which is what makes "root
+  never parses" airtight rather than merely intended.
+- **THE BOOT SET IS COLLECTED, NOT WIDENED** (M3 unit 2, sawos design 2 D-3).
+  The entry register still carries exactly ONE handle — System — and everything
+  else the kernel minted for root before it ran is drained through
+  `ProcessOp.BootHandleNext`, one `{tag, kind, handle}` record per call, through
+  §2.2's existing copy-out funnel. Exhaustion is a STATUS (`Drained`) that stays
+  exhausted, because a loop that drains an iterator ends by meeting the end. The
+  TAG is a region ordinal out of the build-emitted table and the kernel assigns
+  it no meaning: which ordinal is an image, which is a destination, which is a
+  device is ROOT's config. That is what keeps the kernel's half of the launch
+  flow identical for a hand-built M3 system and for M4's dynamic loading.
 - **v1 protocol conventions** (userspace convention section, not kernel
   surface): a launched process receives ONE bootstrap pipe handle at
   launch; its first messages request its initial handle set from the

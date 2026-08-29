@@ -1,0 +1,92 @@
+// SOS M3 unit 2: A SECOND `start()` FAULTS THE CALLER (sawos design 2 D-4).
+//
+// Root creates a child, starts it, and starts it again. The transcript:
+//
+//   SOS doublestart: started once
+//   SOS: process fault: object in the wrong state process=0
+//   SOS: process teardown ... process=0
+//
+// and the machine exits with the kernel's process-fault status. The line after
+// "started once" is never printed, because the second call does not return.
+//
+// WHY A FAULT AND NOT A STATUS, which is the ruling this case pins. A launcher
+// knows whether it has started a process: it is the thing that started it, one
+// call earlier, in its own code. That is caller-checkable in the strongest
+// sense design 178's faults ruling recognises — unlike a malformed image, which
+// is data the launcher was HANDED (see `process-badimage`, the case beside this
+// one, where the same launcher survives the mistake it could not have
+// prevented).
+//
+// PROCESS 0 IS THE ONE THAT DIES, and the teardown line says so — which is what
+// separates this transcript from the lifecycle case's, where the same two lines
+// name process 1 and the run continues. Root is init: its death stops the
+// machine, children and all.
+//
+// THE CHILD NEVER RUNS. This image's kernel arms no tick and root makes no
+// blocking call between the two starts, so nothing takes the processor away
+// from root and the ordering is forced rather than raced.
+
+import sos.{System, Process, Memory, BootHandle, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS doublestart: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let image = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS doublestart: no image region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let dest = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS doublestart: no destination region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let child = match proc.process_create(image: &image.memory,
+                                          memory: &dest.memory) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS doublestart: create failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match child.start() {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS doublestart: first start failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS doublestart: started once\n")
+
+    // THIS DOES NOT RETURN. The kernel ends THIS process — the caller — because
+    // starting a started process is broken code rather than a condition to
+    // report.
+    let _ = child.start()
+
+    // Unreachable. Printing it would be the failure: it would mean the kernel
+    // handed back a status where the ruling says it terminates.
+    let _ = system.debug_print("SOS doublestart: second start RETURNED\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

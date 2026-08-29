@@ -61,6 +61,7 @@ rather than a byte to THR.
 | `sos_prot_commit()` | sink.c | Publish the staged grant set. | `dsb`/`isb` barriers and a `tlbi`. The DESCRIPTORS are Saw. |
 | `sos_timer_freq()` / `sos_timer_ctl_read()` / `sos_timer_ctl_write(v)` / `sos_timer_count()` / `sos_timer_set_compare(v)` | sink.c | The core's physical timer: its frequency, its control register (enabled / masked / fired), the free-running 64-bit counter, and the 64-bit ABSOLUTE deadline it is compared against. | `mrs`/`msr` name a system register at assembly time. One instruction each; the nanosecond arithmetic, the tick policy and the deadline composition are Saw. |
 | `sos_payload_start()` / `sos_payload_end()` | sink.c | Bounds of the appended payload. | A linker symbol's ADDRESS, which Saw cannot name — DF-172a. |
+| `sos_region_table_start()` / `sos_region_table_end()` | sink.c | Bounds of the `.regions` section — the boot region table (sawos design 2 D-2). | Same reason, DF-172a. It is the ONE new fixed symbol pair that unit brought: the table's blob rows carry bases the LINKER resolved when it placed the generated stub, so no per-child symbol has to be nameable here. |
 | `sos_wait_for_irq()` | sink.c | Park the core until an interrupt is pending, behind `wait_for_irq`. | `wfi` is an INSTRUCTION. One line, and it is the whole of design 178 M2 unit 4's native delta on this profile. |
 | `virt.ld` | — | Places the image at RAM base 0x4000_0000 and bounds the appended payload on PAGE boundaries — protection granularity here is the page. | Not a program. |
 

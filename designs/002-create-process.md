@@ -1,6 +1,8 @@
 # SawOS design 2 — CreateProcess: the second address space (M3 unit 2)
 
-Status: AUTHORED Aug 28 2026 (lead), REVISED same day. Implements
+Status: BUILT Aug 28 2026 (see "As built" at the end — two deviations
+from the brief's letter and one structural finding, each with its
+argument). AUTHORED Aug 28 2026 (lead), REVISED same day. Implements
 sawlang#232 unit 2 (the two-phase lifecycle ruled Aug 16; agenda
 item 2's hybrid ruled Aug 16). Ruling history of Aug 28, recorded in
 order because the day held three:
@@ -303,7 +305,402 @@ necessary"); any sawlang/imgformat change.
 
 ## As built
 
-(To be completed by the implementing agent: numbers as landed, the
-region-table format as frozen, canonical child bases per arch, the
-reload implementation per arch, ready-queue removal mechanics, the
-loader phase-split shape, case names + counts, findings.)
+Landed Aug 28 2026. `SAWLANG_ROOT=… make sos-test`: **94/94 across
+riscv32 + arm64, 47 cases per architecture**, with the 84 pre-existing
+rows byte-identical in name, verdict and order.
+
+D-1 through D-7 landed as briefed. Two deviations from the brief's
+LETTER, both argued below and neither touching a ruling: `sos.Memory`
+is not `NoCopy` (D-4's parenthetical), and the loader MOVED in the
+module order (D-1 did not anticipate that `process_create` being an op
+puts the dispatch above it). One structural FINDING forced the
+teardown to change altitude; it is the section after the numbers.
+
+### The numbers as landed
+
+| What | Value | Where |
+|---|---|---|
+| `ObjType.Memory` | 9 | `kernel/abi/src/lib.saw` |
+| `ProcessOp.ProcessCreate` / `.Start` / `.BootHandleNext` | 7 / 8 / 9 | same |
+| `ProcessRight.ProcessCreate` / `.Start` / `.BootHandles` | `1<<14` / `1<<15` / `1<<16` | same |
+| `MemoryRight` | `Transfer = 1<<0`, `Manage = 1<<1` — the universal pair and nothing else | same |
+| `SosStatus.BadImage` | **5** | same |
+| `SosStatus.Drained` | **6** | same |
+| `BootHandleKind.Memory` | 0 | same |
+| boot-handle record | 3 machine words: tag, kind, handle | same |
+| `MAX_PROCESSES` / `MAX_MEMORIES` / `MAX_GRANT_ROWS` | 2 / 8 / 9 | `kernel/core/limits.saw` |
+
+The two new statuses continue past the documented 1-3 gap rather than
+filling it, for the reason the gap exists: an old build's `BadHandle`
+must not collide with a new build's status on the wire.
+
+**`Drained` is a status and not a magic record**, as the brief leaned.
+The alternative — a record with a sentinel kind — would have made the
+loop's termination check a value comparison inside a successful call,
+which is exactly the shape a caller forgets to write.
+
+**Rights minted.** `root_process_rights()` gains `ProcessCreate` and
+`BootHandles` and NOT `Start`: nobody starts root, and a child's
+handle carries `Start | Wait | Manage` (`child_process_rights()`), so
+the authority to run a child arrives WITH the child. Everything a
+process may do to itself — make threads, make Events and Waiters, bind
+a line, exit — is withheld from its creator.
+
+**No `MemoryRight` is spent by anything.** `process_create`'s authority
+is `ProcessRight.ProcessCreate` on the CALLER's own Process handle; the
+two Memory handles are its ARGUMENTS. A handle that names nothing or
+names a non-Memory is a `BadHandle` FAULT (the caller chose which
+handles to pass); the BYTES behind a valid handle are what can be
+`BadImage`. That line — authority is caller-checkable, data is not — is
+what the whole status-versus-fault split rests on, and it is stated at
+`memory_arg`.
+
+### The region table, frozen
+
+Eight-byte header then `count` rows, all little-endian (design 47's
+discipline, the sosimg format's own):
+
+```
+  offset 0   magic     u32   0x4E47_5253   'S','R','G','N' read LE
+  offset 4   version   u16   1
+  offset 6   count     u8
+  offset 7   reserved  u8    0
+  offset 8   rows      count × { base: u64, len: u64 }
+```
+
+The header is EIGHT bytes so that every row lands 8-aligned, which is
+what lets the kernel overlay `RegionRow` on the section instead of
+assembling bytes; two `static_assert`s pin both sizes
+(`kernel/core/process.saw`). Fields are 64-bit on both profiles for
+sosimg v3's reason — one layout both kernels read — and a 32-bit kernel
+REFUSES a row it cannot address rather than narrowing one.
+
+**Emission mechanics: a GENERATED stub, not a committed one**
+(`tools/sos_runner.py:_stitch_children`). Each child sosimg is
+`.incbin`'d into its own `.childimg` section between local symbols, and
+the table's blob rows name those symbols — so `ld.lld` fills in the
+base when it places the section and nothing computes an address by
+hand. A 32-bit target emits each 64-bit field as `.4byte sym` + a zero
+high half (there is no 8-byte relocation to point at a symbol with); a
+64-bit one emits `.8byte`. Generating rather than committing is what
+the case shape asked for anyway — the number of children is a property
+of the case — so it costs a file nobody keeps in step.
+
+**Row order is the contract**: every blob row first, in the order the
+case lists its children, then every destination row in the same order.
+With one child that is tag 0 = image, tag 1 = destination, and root's
+config (a comment and two `let`s) is the only thing that knows it.
+
+**Sections and symbols.** ONE new fixed pair,
+`_region_table_start`/`_region_table_end`, bounding a new `.regions`
+output section in both `virt.ld`s, reached through new
+`sos_region_table_start`/`_end` accessors in both `sink.c`s and
+`region_table_start()`/`region_table_end()` in both HALs (both
+`kernel/ABI.md`s updated). `.childimg` gets an output section and NO
+symbol pair, which is the point: the blob bases are linker-resolved
+into the table. Neither section is page-aligned, deliberately — a child
+image is read by the KERNEL and is never granted to a process, so no
+grant-window constraint reaches it.
+
+A missing or empty section is `start == end`, which is ZERO REGIONS and
+not an error. That is the branch every pre-existing case takes, and it
+is why their transcripts are untouched.
+
+### Canonical child bases
+
+Both profiles: **one 256 KiB region immediately above root's top**, the
+same size root gets, with the kernel's 16 KiB stack grant at its top.
+
+| Profile | Child region | Committed link script |
+|---|---|---|
+| riscv32 | `0x8024_0000 .. 0x8028_0000` | `hal/riscv32/user/child.ld` (`ORIGIN 0x80240000`, `LENGTH 240K`) |
+| arm64 | `0x4024_0000 .. 0x4028_0000` | `hal/arm64/user/child.ld` (`ORIGIN 0x40240000`, `LENGTH 240K`) |
+
+**Committed per-arch scripts, not generated ones.** The brief left the
+mechanics open; committed won because a link script is exactly the kind
+of thing the tree already keeps per profile beside `root.ld`, and the
+per-profile DIFFERENCE is real rather than a number substitution —
+Profile B page-aligns `.text` and `.data` because its protection
+granularity is the page, and Profile A does not. A generator would have
+had to encode that difference anyway, in Python, away from the two
+files that state it.
+
+**On arm64 the base is CONSTRAINED, not merely tidy**: EL0 can only be
+granted pages inside the HAL's grant window (the first 4 MiB of RAM),
+so a child's destination must sit between root's top and
+`0x4040_0000`. There is room for seven more regions; an eighth would
+have to widen `GRANT_PAGES`, which is the honest place for that
+decision. The child scripts say so.
+
+The runner carries `child_region_base` per arch and one shared
+`CHILD_REGION_LEN`; `child-poke` finds root's region by ROUNDING ITS
+OWN ADDRESS DOWN to that length, which is what keeps the child's source
+arch-free.
+
+### The reload, per arch
+
+`process.load_domain(p)` is the ONE place a domain is installed:
+`hal.prot_reset()`, replay row `i` at index `i`, `hal.prot_commit()`.
+Two callers — the boot path once, and `sched.run_thread` when the
+incoming thread's process differs from `threads.LAST_PROT_PROCESS`.
+
+- **riscv32**: `prot_reset` zeroes both config words and eight address
+  registers, then each row is a TOR pair (or a NAPOT device entry), then
+  one `pmpcfg` write publishes. About nineteen control-register writes
+  and no translation-buffer work.
+- **arm64**: `prot_reset` walks the 1024-entry RAM level-3 table and
+  the 512-entry device level-3 table back to EL0-no-access, each row
+  re-grants its pages, and `sos_prot_commit` is the existing full
+  barrier + `tlbi vmalle1`. Order of 1.6k stores.
+
+**The full window reset was taken over a targeted clear of the outgoing
+rows**, which D-5 permits as an improvement. Reason: `load_domain` is
+the same three steps the boot path already performed inline, so ONE
+spelling installs a domain — a targeted clear would need the outgoing
+process's rows as a second input and would make boot and switch two
+different operations. At M3 switch rates the cost is invisible (the
+suite's timings did not move), and the improvement stays available with
+nothing above `load_domain` changing.
+
+**`LAST_PROT_PROCESS` lives in `kcore.threads`**, beside `CURRENT_THREAD`
+and the ready queue, and not beside the reload — because `process`
+(below the scheduler) has to write it at boot, when the loader installs
+root's domain directly. It is INVALIDATED by `clear_domain` at teardown,
+which is what makes slot reuse safe without handle generations.
+
+**The two early returns in `pick_next` keep the same thread**, so the
+domain cannot have changed at either — which is why the reload is at the
+tail, in `run_thread`, and the site says so.
+
+### Ready-queue removal
+
+`threads.ready_remove_process(p)`: a singly-linked walk with a trailing
+`prev` in the list's own slot-plus-one encoding, unlinking every node
+whose `process == p` and following `READY_TAIL` when the removed node
+was the last. It runs BEFORE the thread slots are freed, because the
+walk reads each thread's `process` field to decide.
+
+It replaced `READY_HEAD = READY_TAIL = 0` for BOTH arms rather than only
+the child arm: with one process the two are the same act (every runnable
+thread belonged to the process that was ending), so one spelling covers
+both and the wholesale version has no remaining caller to drift from.
+
+### The loader phase split
+
+`kernel/core/loader.saw`, and it is a split rather than a copy:
+
+- `validate_image(img_base, img_len, dest: &LoadRegion, allow_device) -> ImageFault?`
+  — phases A/B, and **not one effect happens inside it**.
+- `place_image(p, img_base, dest: &LoadRegion) -> UInt` — phases C/D:
+  `long_copy`/`long_zero` per segment, `record_grant` per row plus the
+  stack row, returns the writable window's floor. It commits NOTHING to
+  hardware.
+- `image_entry` / `image_seg_count` / `image_prio_map` — header reads
+  after validation.
+- `LoadRegion { base, top, stack_len }` is the region parameter;
+  `root_region()` builds root's from the HAL's constants.
+- `ImageFault { reason: String, detail: UInt }` is the failure
+  vocabulary, raised as `fatal_image(bad.reason, bad.detail)` at the
+  boot door and as `SosStatus.BadImage` at the create door. The SENTENCE
+  is the same in both mouths, which is what makes it one vocabulary.
+
+**`allow_device: Bool` is the only per-door behaviour difference**, and
+it is D-7's refusal: a child image declaring an MMIO window is
+`BadImage`. The reason is written at the site — the image-declares /
+board-authorizes grant is a boot-time placeholder about the one process
+the KERNEL loads, and generalizing a placeholder outlives it.
+
+**One check is new to both doors**: the entry must be inside an
+EXECUTABLE segment's load range. It is ordered LAST so every earlier
+diagnostic keeps the wording it has always had, and the existing
+hand-assembled fixtures pass it unchanged.
+
+**DEVIATION: the loader moved down the module order**, from last to
+between `preempt` and `sched`. It has to: `process_create` is an op, so
+`kcore.dispatch` needs the phases, and `dispatch` sits above `sched`.
+Nothing in the loader reaches upward either way (it calls the HAL, the
+movers and the process slot, all below), so the move is free. `lib.saw`'s
+module-order list records it and why.
+
+### THE FINDING: the teardown cannot stay in `kcore.process`
+
+D-6 asked for `end_process` to grow the fork in place and end in
+`pick_next` + `resume_frame`. **That is not expressible, and the
+obstacle is the same one design 1 met**:
+
+- A child's death RESCHEDULES, and choosing what runs next can IDLE.
+- `irq.idle_until_runnable` DELIVERS: `deliver_line` →
+  `on_timer_interrupt` → `expire_timers` → `fire_timer` →
+  `wake.notify_ready` → `wake_one_waiter` → `deliver_attachment` →
+  `process.copy_out`.
+- So a reschedule written in `process` is `process` importing `irq` from
+  above it — the import cycle DF-232e diagnoses. The call graph
+  genuinely has the cycle; unlike design 1's, no runtime flag makes it
+  safe, because the recursion is real.
+
+**Resolution, and what it preserves.** `end_process`, `fault_process`
+and `fault_trap` moved to `kcore.sched`, which is the altitude that can
+also say what runs next. Nothing is duplicated and every piece stays
+single-sited: the process slot and its grant record stay in `process`,
+every slab stays where it is, and the one function that frees them sits
+with the one function that picks the next thread. The module's identity
+survives the move because a process's death IS a scheduling event now —
+`sched.saw`'s header states the whole argument, and `lib.saw`'s
+module-order list points at it.
+
+**What it costs, and this is the visible half.** The copy doors sit
+BELOW the scheduler, so they can no longer terminate: `copy_out_check`,
+`copy_out` and `copy_in` now answer `FaultReason?` — `None` when the
+buffer is good — and their callers fault. Three of the four callers are
+in `dispatch` (above the switch point) and fault exactly as before. The
+fourth is `wake.deliver_wait_record`, which cannot fault at all: its
+buffer was validated at the PARK and a process's writable window is
+fixed for its life, so a refusal there is a KERNEL invariant broken
+rather than a process error, and it is a `fatal` stop. No check was
+removed; only where the kill is spelled moved.
+
+**Every `fault_process(` call site in `dispatch` is textually
+unchanged** — the import moved, the name did not — which is why a
+diff of this unit shows the ~45 fault sites untouched.
+
+### DEVIATION: `sos.Memory` is a plain wrapper, not `NoCopy`
+
+D-4's parenthetical asked for `NoCopy`. Two reasons it is not, both
+about keeping ONE rule across nine handle types rather than nine rules:
+
+1. **The owning tier is unit 2.75's whole subject.** `sosabi`'s
+   `SystemHandle` docstring already says the `NoCopy` wrapper arrives
+   when handles become CLOSEABLE — a move-only handle whose drop does
+   nothing is a discipline with no enforcement behind it. Making one of
+   nine types move-only a unit early would be the one handle that reads
+   differently, for no property gained.
+2. **It is not expressible with the ruled record shape.** D-3 rules that
+   `boot_handle_next` hands back a `{tag, kind, handle}` VALUE. A
+   move-only field inside a returned struct cannot be taken out again —
+   `move h.memory` is the no-partial-moves error and `h.memory` is the
+   NoCopy read error — so the record would need a consuming accessor
+   that Saw cannot write against `self` either. The record shape is a
+   ruling; the copy tier was a parenthetical.
+
+When 2.75 makes handles closeable, all nine become `NoCopy` together and
+the record becomes a consuming accessor. `Memory`'s docstring carries
+this argument.
+
+### The proof, and the transcripts
+
+Five all-arch cases, seven new Blade packages (five root servers, two
+CHILDREN — the first packages in the tree that are not root servers).
+Case names as landed: `process_lifecycle`, `process_isolation`,
+`process_badimage`, `process_doublestart`, `process_bootdrain`.
+
+```
+SOS: boot regions=0x00000002
+SOS: console handover
+SOS lifecycle: boot regions tag0=0 tag1=1
+SOS lifecycle: created
+SOS lifecycle: started
+SOS: process fault: bad handle process=0x00000001
+SOS: process teardown handles=0x00000000 threads=0x00000001 ... process=0x00000001
+SOS lifecycle: root survived child status=131073
+SOS lifecycle: done
+```
+
+```
+SOS isolation: started
+SOS: fault store-access-fault cause=0x00000007 epc=0x802403ce tval=0x8023fff0
+SOS: process teardown handles=0x00000000 threads=0x00000001 ... process=0x00000001
+SOS isolation: root survived child status=131072
+```
+
+`tval` IS the money proof: `0x8023fff0` is sixteen bytes below root's
+region top, inside root's live stack, and the store was REFUSED because
+the switch into the child reloaded the domain. A kernel with a broken
+reload fails by that line being ABSENT — the child's store would land
+and it would spin — which is the failure mode worth engineering for.
+The arm64 twin reads `tval=0x000000004023fff0`.
+
+`child status=131073` is `Faulted` (2) in the high half and `BadHandle`
+(1) in the low, read through the handle root STILL HOLDS after the
+child is gone (the teardown closes the dead process's table, not its
+creator's). The isolation child's `131072` is the same kind with code
+zero, because a HARDWARE fault carries no `FaultReason` — which is what
+says the two children died in two different ways.
+
+**Two report lines gained a trailing ` process=<hex>` field**, appended
+rather than led with, so every transcript written before there were two
+processes reads the same up to that point and no existing expectation
+sees it. "Root survived" is exactly the claim that the teardown line
+says 1 and the run continues.
+
+`process_doublestart` is the one case that FAILS the machine
+(`expect_status = 5`, the kernel's process-fault code), and `process=0`
+in both report lines is what distinguishes its transcript from the
+lifecycle case's identical pair.
+
+### ACCEPTANCE, and exactly what was diffed
+
+The suite was run TWICE under the machine-wide lock: once at the merge
+base (`cba373e`, unmodified) and once with the change applied.
+
+- **The 84 pre-existing case rows are byte-identical** in name, verdict
+  and ORDER on both architectures, with the `[i/N]` denominator
+  stripped. The only row-level difference is the five new rows per
+  architecture, appended at the end.
+- **The only other differences are sosimg build-info lines and the
+  total.** Seven new lines for the new packages — and every EXISTING
+  package's image grew, by 100 to 500 bytes. That is the `sos` module
+  gaining a public API: `sos_process_process_create`,
+  `sos_process_start` and `sos_process_boot_handle_next` are `@export`ed
+  C-ABI seams, so `--gc-sections` keeps them in every image that links
+  the module. It is the same reason every earlier unit's exports are
+  there, and it is the first unit since the split to add to that
+  surface.
+
+### Two arms the cases do not reach, stated rather than glossed
+
+`resume_after_death` has three ways out and the suite exercises one of them —
+the IDLE one, which is the shape the lifecycle and isolation cases make (root is
+parked on its timer when the child dies, so nothing is runnable and the clock is
+what brings it back). Not reached:
+
+- **Something already runnable.** It is `pick_next`'s own tail, shared as
+  `run_thread` precisely so the two cannot drift, and `ready_pop` is exercised
+  by every multi-thread case above.
+- **Nothing runnable and no wake source**, which ends root and stops the
+  machine. Reaching it needs a child dying while root is blocked on something
+  no thread can deliver, which is a case about the deadlock rule rather than
+  about this unit; the rule itself is covered by `wait_deadlock` and
+  `timer_deadlock` through `pick_next`'s arm.
+
+The ready-queue REMOVAL's matching branch is covered, and not by the new cases:
+`thread_preempt` and its siblings end a process with several of its own threads
+still queued, so the unlink, the head case and the tail-follow all run there —
+byte-identically, which is what the unchanged rows say.
+
+### Nothing left open
+
+No compiler defect was met and none was worked around. One parse
+limitation was hit and is ordinary Saw rather than a defect (DF-172d: a
+binary expression does not wrap unless brackets enclose it, so an
+assignment split after `=` is a parse error) — the fix was a `let`.
+
+The arch-free scan (`_check_arch_free`) caught nine architecture names
+in this unit's new COMMENTS and every one was rewritten in
+profile-neutral language; the scan is doing exactly what design 162 unit
+1 built it for, and the comments read better for it.
+
+`MAX_PROCESSES = 2` is the ceiling, so a third `process_create`
+answers `NoResource`. Raising it is still the one edit the constant
+claims to be — this unit is the exercise that proves it — but two
+v1 statements are worth carrying forward. **A DEAD SLOT IS NEVER SPENT
+AGAIN**: the teardown leaves it `Gone` holding its §8 status word,
+because the creator's handle outlives the child and reading how it died
+is the whole of this unit's supervision story. So the constant bounds
+how many processes a run may CREATE rather than how many may exist at
+once, and reclaiming one waits on unit 2.75's handle close (which is
+also what makes `LAST_PROT_PROCESS`'s invalidation load-bearing rather
+than merely correct — `clear_domain` says so at the site). **And a
+child holds no handle onto itself**: its table is empty, so
+`ProcessSelf` has nothing to answer with, which is exactly the
+"legal-but-doomed" sandboxed process the ruling asked for and what unit
+3's `give` changes.

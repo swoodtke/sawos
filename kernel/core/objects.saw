@@ -27,9 +27,17 @@ import sosabi.{
     InterruptRight,
     ClockRight,
     TimerRight,
+    MemoryHandle,
+    MemoryRight,
+    BootHandleKind,
     NO_HANDLE,
 }
-import kcore.limits.{MAX_HANDLES, MAX_PROCESSES}
+import kcore.limits.{
+    MAX_HANDLES,
+    MAX_MEMORIES,
+    MAX_PROCESSES,
+    NO_MEMORY,
+}
 
 /// One handle-table entry: the object a handle names, the rights its holder has
 /// on it (§3), and WHICH object of that kind it is. The kernel validates all
@@ -173,6 +181,27 @@ extension TimerObject {
     }
 }
 
+/// A Memory handle the dispatch has VALIDATED, paired with its rights and the
+/// region slot it names (spec §2.5; sawos design 2 D-2).
+///
+/// It carries an `allows` like every other kind even though NOTHING SPENDS a
+/// `MemoryRight` in this unit, and that is deliberate rather than dead code:
+/// the wrapper is what makes "this handle resolved to a Memory" a TYPE rather
+/// than a comment, which is exactly the claim `process_create` needs about the
+/// two regions it is handed. Unit 3's `give` and unit 4's `map` are what start
+/// asking the question the method answers.
+public(package) struct MemoryObject {
+    public(package) handle: MemoryHandle,
+    public(package) rights: UInt32,
+    public(package) slot: Int,
+}
+
+extension MemoryObject {
+    public(package) func allows(&self, right: MemoryRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
+    }
+}
+
 /// Whether an Event or a Waiter slot is in use.
 ///
 /// ONE enum for both because it really is one question. Threads and processes
@@ -232,4 +261,93 @@ public(package) func mint_handle(p: Int, kind: ObjType, rights: UInt32, target: 
         h = h + 1
     }
     NO_HANDLE
+}
+
+// =============================================================================
+// The Memory slab (spec §2.5; sawos design 2 D-2)
+// =============================================================================
+//
+// A MEMORY IS A SEALED PAIR, which is why its slab is here beside the handle
+// table rather than in a module of its own. Every other object kind has
+// behaviour somewhere — a thread has a state machine, a timer a schedule, an
+// event an accumulation rule — and this one has none in v1: it is `{base, len}`
+// plus the process it is charged to, read by exactly one op and freed by the
+// teardown. A file per object would be a file with no verbs in it.
+//
+// It sits BELOW `process` for the same reason every other slab does: ending a
+// process frees what it owned, so the storage has to be reachable from the
+// teardown. Unit 4's pools, derivation and mappings are what turn this into a
+// module.
+
+/// One Memory object: a range of physical memory, and whose it is.
+///
+/// `len` rather than a top address, because that is the shape the region table
+/// carries and the shape a pool will hand out. The kernel computes the top
+/// where it needs one, with the bound test ordered so the addition cannot
+/// overflow — the loader's own discipline.
+public(package) struct MemorySlot {
+    public(package) state: SlotState,
+    public(package) process: Int,
+    public(package) base: UInt,
+    public(package) len: UInt,
+}
+
+public(package) unsafe static var MEMORIES: [MemorySlot; MAX_MEMORIES] = [
+    MemorySlot(state: SlotState.Free, process: 0, base: 0, len: 0); MAX_MEMORIES]
+
+/// Take a free Memory slot, or `NO_MEMORY` when the slab is full.
+public(package) func alloc_memory() unsafe -> Int {
+    var i: Int = 0
+    while i < MAX_MEMORIES {
+        match MEMORIES[i].state {
+            case Free -> { return i },
+            case Live -> {},
+        }
+        i = i + 1
+    }
+    NO_MEMORY
+}
+
+// =============================================================================
+// The boot-handle queue (spec §12; sawos design 2 D-3)
+// =============================================================================
+//
+// WHAT THE KERNEL MINTED FOR ROOT AT BOOT AND HAS NOT HANDED OVER YET. §12 keeps
+// the boot set ONE HANDLE WIDE at the entry register — the System handle — so
+// everything else the kernel makes for root before it runs has to be COLLECTED
+// rather than passed, and this is where it waits.
+//
+// It is a queue with a cursor and no removal: `BOOT_HANDLE_NEXT` only ever
+// advances, so a drained iterator STAYS drained and a delivered record can
+// never be delivered twice. That is the whole of the lifetime rule, and it is
+// why the records are plain storage rather than a slab.
+//
+// ONE QUEUE, NOT ONE PER PROCESS, because only root has a boot set: a child's
+// handles arrive through unit 3's `give`, which is a different act with a
+// different ordering argument. When unit 3 reuses this op for the child side,
+// the queue becomes per-process and nothing above it changes.
+
+/// One boot handle waiting to be collected.
+public(package) struct BootHandleSlot {
+    public(package) tag: UInt,
+    public(package) kind: BootHandleKind,
+    public(package) handle: UInt,
+}
+
+public(package) unsafe static var BOOT_HANDLES: [BootHandleSlot; MAX_MEMORIES] = [
+    BootHandleSlot(tag: 0, kind: BootHandleKind.Memory, handle: 0); MAX_MEMORIES]
+
+/// How many records were queued at boot.
+public(package) unsafe static var BOOT_HANDLE_COUNT: Int = 0
+
+/// How many have been collected. `NEXT == COUNT` is "drained".
+public(package) unsafe static var BOOT_HANDLE_NEXT: Int = 0
+
+/// Queue one record. Silently drops nothing: the caller has already bounded the
+/// region count against `MAX_MEMORIES`, and this is the one producer.
+public(package) func queue_boot_handle(tag: UInt, kind: BootHandleKind,
+                                       handle: UInt) unsafe {
+    BOOT_HANDLES[BOOT_HANDLE_COUNT] = BootHandleSlot(tag: tag, kind: kind,
+                                                     handle: handle)
+    BOOT_HANDLE_COUNT = BOOT_HANDLE_COUNT + 1
 }

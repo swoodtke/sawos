@@ -1,0 +1,184 @@
+// SOS M3 unit 2: THE SECOND ADDRESS SPACE (sawos design 2; spec §2, §8, §12).
+//
+// The headline of the unit, and the transcript is read as an ORDER:
+//
+//   SOS lifecycle: boot regions tag0=0 tag1=1   <- the boot set, drained
+//   SOS lifecycle: created                      <- a process exists, inert
+//   SOS lifecycle: started                      <- ...and root is STILL RUNNING
+//   SOS: process fault: bad handle process=1    <- the child, dying
+//   SOS: process teardown ... process=1         <- ...and only the child
+//   SOS lifecycle: root survived child status=131073
+//   SOS lifecycle: done                         <- clean exit
+//
+// WHAT EACH LINE RULES OUT.
+//
+// `created` before `started` is the two-phase lifecycle: `process_create`
+// populates an address space and returns a process with NO THREAD, and nothing
+// runs until `start()`. A one-phase create would make the two lines one.
+//
+// `started` printed by ROOT is the half that is easy to get wrong. `start()`
+// makes the child runnable and returns; it does not hand the processor over.
+// A kernel that entered the child from inside the op would print the child's
+// death before this line, or never return here at all.
+//
+// THE FAULT AND TEARDOWN NAMING PROCESS 1 ARE THE UNIT. Every earlier era of
+// SOS ended the machine when any process ended, so a transcript could not have
+// contained these two lines followed by anything. Here they are followed by
+// root's own, which is the whole claim.
+//
+// `child status=131073` IS `Faulted` PLUS `BadHandle`, read out of the dead
+// child's §8 status word through the handle root still holds: kind 2 in the
+// high half, reason 1 in the low (2 * 65536 + 1). It is the supervision story
+// working — root learns HOW its child died — and it is what makes "the child
+// died" a value rather than an inference from the console.
+//
+// ROOT PARKS ON A GENEROUS TIMER while the child runs, so the ordering above is
+// forced rather than raced: this image's kernel arms no scheduler tick, so the
+// only way root gives the processor up is the wait below, and the only way it
+// gets it back is the timer it armed.
+
+import sos.{System, Process, Memory, BootHandle, Clock, ClockType, Timer,
+            Waiter, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The key this case attaches its timer under. A number that appears nowhere
+/// else in the transcript.
+static KEY: UInt = 77
+
+/// Twenty milliseconds. The child needs microseconds to be scheduled, run its
+/// one syscall and die; this is three orders of magnitude of slack, which is
+/// what "generous" is for — the case must not depend on how fast the emulator
+/// happens to be.
+static PARK_NS: UInt64 = 20_000_000
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS lifecycle: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // THE BOOT SET, drained in ordinal order. §12 keeps the entry register one
+    // handle wide, so everything else the kernel minted arrives here. This
+    // build's region table publishes exactly two rows and ROOT'S CONFIG — this
+    // comment and the two `let`s below — is what says which is which: row 0 is
+    // the child's image blob, row 1 is the RAM it will run in. The kernel knows
+    // neither.
+    let image = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS lifecycle: no image region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let dest = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS lifecycle: no destination region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    print("SOS lifecycle: boot regions tag0={} tag1={}\n", image.tag, dest.tag)
+
+    // PHASE ONE. Two capabilities and no numbers: root never reads the image,
+    // never computes a load address and never chooses a stack.
+    let child = match proc.process_create(image: &image.memory,
+                                          memory: &dest.memory) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS lifecycle: create failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS lifecycle: created\n")
+
+    // PHASE TWO. The child becomes runnable; root does not stop.
+    match child.start() {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS lifecycle: start failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS lifecycle: started\n")
+
+    // Park, so the child gets the processor. Everything below the wait happens
+    // after the child has lived and died.
+    let clock = match system.clock_get(type: ClockType.Monotonic) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS lifecycle: no clock: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let waiter = match proc.waiter_create() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS lifecycle: no waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let timer = match clock.timer_create() {
+        case Ok(t) -> t,
+        case Err(e) -> {
+            print("SOS lifecycle: no timer: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match waiter.add(&timer, KEY) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS lifecycle: attach failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match timer.arm(after_ns: PARK_NS) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS lifecycle: arm failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match waiter.wait() {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS lifecycle: wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // THE HANDLE OUTLIVES THE PROCESS, which is what makes this readable at
+    // all: the teardown closes the handles in the CHILD's table, and root's
+    // handle onto the child's slot is root's own. `Wait` is the right that
+    // gates it, and it is one of the three `process_create` minted.
+    let status = match child.get_status() {
+        case Ok(s) -> s,
+        case Err(e) -> {
+            print("SOS lifecycle: status failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    print("SOS lifecycle: root survived child status={}\n", status)
+
+    print("SOS lifecycle: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

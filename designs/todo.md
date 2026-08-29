@@ -32,8 +32,29 @@ entry below or the brief that carries it, never restating either.
   Memory kind (unit 4's first slice), boot_handle_next pulled
   forward (unit 3's iterator), protection reload at pick_next's
   marked point (forced both arches), end_process forks (root stops
-  the machine, a child reschedules). DISPATCHED Aug 28; closes in
-  place when the branch parks
+  the machine, a child reschedules). DISPATCHED Aug 28.
+  **BUILT Aug 28, branch PARKED for user review.** All of D-1..D-7
+  landed as briefed; the brief's As-built has the detail. Counts:
+  `SAWLANG_ROOT=… make sos-test` 94/94 across riscv32 + arm64, 47
+  cases per architecture, the 84 pre-existing rows byte-identical in
+  name, verdict and order. Five new all-arch cases
+  (`process_lifecycle`, `process_isolation`, `process_badimage`,
+  `process_doublestart`, `process_bootdrain`), two new child packages
+  and five new root packages. ONE STRUCTURAL FINDING, recorded in the
+  As-built and in `sched.saw`'s header: the teardown could not stay in
+  `kcore.process`, because a child's death reschedules, a reschedule
+  can idle, idling delivers, and delivery reaches back down into that
+  module's own copy door — design 1's cycle at a second site, resolved
+  the same way (an altitude split, nothing duplicated). Its visible
+  cost is that the copy doors REPORT a bad buffer and their callers
+  above the switch point terminate on it. TWO DEVIATIONS from the
+  brief's letter, both argued in the As-built: `sos.Memory` is a plain
+  handle wrapper rather than `NoCopy` (the owning tier is unit 2.75's
+  whole subject, and a move-only field makes the ruled `{tag, kind,
+  handle}` record unwritable), and the loader MOVED down the module
+  order rather than staying last (its phases have to be reachable from
+  the dispatch now that `process_create` is an op). Nothing left open
+  inside the entry
 - M3 unit 2.75 — handle lifecycle [sawlang#232]
 - M3 unit 3 — give(handle, tag:) [sawlang#232]
 - M3 unit 4 — Memory/IoMemory [sawlang#232]

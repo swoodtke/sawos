@@ -82,7 +82,8 @@
 // SosStatus>` hands back, the mode a `event_create(mode:)` caller names, and
 // the record + payload a `wait()` caller matches on. `import sos.{SosStatus}`
 // (etc.) is how a process takes them.
-public import sosabi.{SosStatus, EventMode, ClockType, WaitResult, WaitPayload}
+public import sosabi.{SosStatus, EventMode, ClockType, WaitResult, WaitPayload,
+                      BootHandleKind}
 
 // Everything else `sosabi` holds is KERNEL-INTERNAL and stays that way: the op
 // numbers, the rights, the handle aliases, the wait record's wire layout. This
@@ -93,8 +94,12 @@ import sosabi.{SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp, InterruptOp,
                ClockOp, TimerOp,
                SystemHandle, ProcessHandle, ThreadHandle, EventHandle,
                WaiterHandle, InterruptHandle, ClockHandle, TimerHandle,
+               MemoryHandle,
                WaitTag, WAIT_RECORD_WORDS, WAIT_KEY_WORD, WAIT_TAG_WORD,
                WAIT_PAYLOAD_WORD, wait_record_bytes,
+               BOOT_HANDLE_RECORD_WORDS, BOOT_HANDLE_TAG_WORD,
+               BOOT_HANDLE_KIND_WORD, BOOT_HANDLE_HANDLE_WORD,
+               boot_handle_record_bytes,
                CLOCK_NOW_RECORD_DOUBLEWORDS, CLOCK_NOW_TIME_SLOT,
                clock_now_record_bytes,
                TIMER_ARM_RECORD_DOUBLEWORDS, TIMER_ARM_AFTER_SLOT,
@@ -331,6 +336,57 @@ public func sos_process_interrupt_bind(handle: UInt, line: UInt,
 @export("sos_interrupt_ack")
 public func sos_interrupt_ack(handle: UInt) -> UInt {
     sos_syscall1(handle, InterruptOp.Ack as UInt, 0)
+}
+
+/// Load the image in region `image` into region `memory` and answer with a
+/// handle to the new, INERT process. Requires `ProcessRight.ProcessCreate` on
+/// the caller's own Process handle.
+///
+/// Both arguments are Memory handles — the read-only source blob and the
+/// child's destination RAM. The kernel copies each segment to its link address
+/// inside `memory` and grants a stack at that region's top; the caller supplies
+/// no addresses at all.
+///
+/// A malformed image is `SosStatus.BadImage` — a VALUE, not a fault — because
+/// image bytes are data the caller was handed rather than something it wrote.
+/// A handle that names nothing, or names something that is not a Memory, IS a
+/// fault: the caller chose which handles to pass.
+@export("sos_process_process_create")
+public func sos_process_process_create(handle: UInt, image: UInt, memory: UInt,
+                                       value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, ProcessOp.ProcessCreate as UInt, image, memory, 0,
+                 value_out)
+}
+
+/// Run a created process: mint its first thread at the recorded entry, on the
+/// recorded stack, and make it runnable. Requires `ProcessRight.Start` on the
+/// CHILD's handle. The caller keeps running.
+///
+/// A SECOND START TERMINATES THE CALLER — it is broken code, and the caller is
+/// the one that started it the first time.
+@export("sos_process_start")
+public func sos_process_start(handle: UInt) -> UInt {
+    sos_syscall1(handle, ProcessOp.Start as UInt, 0)
+}
+
+/// Take the next handle out of this process's BOOT SET, as a record copied into
+/// `buf` (spec §12). Requires `ProcessRight.BootHandles`.
+///
+/// `cap` is the buffer's size in BYTES and must be at least
+/// `boot_handle_record_bytes()`. The buffer must be word-aligned and inside
+/// this process's writable memory; a buffer that is not TERMINATES the process,
+/// because it is a mistake only the caller could have made.
+///
+/// The record's layout is public: word 0 the region ordinal, word 1 a
+/// `BootHandleKind`, word 2 the handle. An exhausted set answers
+/// `SosStatus.Drained` and keeps answering it — that is a loop's termination
+/// check, not a failure.
+@export("sos_process_boot_handle_next")
+public func sos_process_boot_handle_next(handle: UInt, buf: UnsafePointer<UInt>,
+                                         cap: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, ProcessOp.BootHandleNext as UInt, buf as UInt, cap, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
 }
 
 /// Accumulate `bits` into an Event. Never blocks. Requires `EventRight.Signal`.
@@ -680,6 +736,163 @@ extension Process {
                                  line, 0, 0)
         return Interrupt(handle: InterruptHandle(raw))
     }
+
+    /// **PHASE ONE OF THE TWO-PHASE LIFECYCLE**: load `image` into `memory` and
+    /// answer with a process that exists and is not running. Requires
+    /// `ProcessRight.ProcessCreate` on the caller's OWN Process handle.
+    ///
+    /// THE CALLER SUPPLIES CAPABILITIES AND NO NUMBERS. `image` is the
+    /// read-only region holding a process image; `memory` is the RAM the child
+    /// will run in. The kernel copies each segment to the address the image was
+    /// LINKED at, checks that every one of them lands inside `memory`, and
+    /// grants a stack at that region's top — so where the child's stack is, and
+    /// how big, is the kernel's answer rather than the launcher's. That is the
+    /// same rule the kernel applies to itself when it loads root.
+    ///
+    /// WHAT COMES BACK IS INERT: an address space, an entry and a stack
+    /// recorded, and NO THREAD. Nothing runs until `start()`, which is what
+    /// makes "hand the child its handles, then run it" expressible without
+    /// inventing any synchronization — the start call IS the barrier.
+    ///
+    /// **A MALFORMED IMAGE IS `SosStatus.BadImage`, A VALUE** — not a fault.
+    /// Image bytes are DATA the launcher was handed, and a launcher that cannot
+    /// report a bad image cannot launch anything else either. What IS a fault is
+    /// passing a handle that names nothing or names something that is not a
+    /// region: the caller chose which handles to pass. A full process table or
+    /// handle table comes back as `SosStatus.NoResource`.
+    ///
+    /// The two regions must be DISJOINT, which also means the same region
+    /// cannot serve as both. Nothing is copied until every check has passed, so
+    /// a refusal leaves `memory` exactly as it was.
+    public func process_create(&self, image: &Memory,
+                               memory: &Memory) -> Result<Process, SosStatus> {
+        let raw = try call_value(self.handle, ProcessOp.ProcessCreate as UInt,
+                                 image.handle, memory.handle, 0)
+        return Process(handle: ProcessHandle(raw))
+    }
+
+    /// **PHASE TWO**: run this process. Requires `ProcessRight.Start`, which is
+    /// a right on the CHILD's handle — the one `process_create` handed back.
+    ///
+    /// It mints the first thread at the entry and stack RECORDED AT CREATE, so
+    /// the caller supplies neither: a launcher never parses an image, and there
+    /// is no address it could get wrong. The thread starts with NO boot handle
+    /// in its first argument register, which is the v1 form — a child that was
+    /// given nothing is a fully sandboxed compute process, which is a feature
+    /// rather than a state to detect.
+    ///
+    /// THE CALLER KEEPS RUNNING. The child becomes runnable and the scheduler
+    /// picks it up, exactly as `Thread.start` does.
+    ///
+    /// **A SECOND `start()` TERMINATES THE CALLER.** It is broken code — the
+    /// caller is the one that started it the first time — so it is a fault on
+    /// the faults ruling's terms rather than a status to branch on.
+    public func start(&self) -> Result<Void, SosStatus> {
+        checked(sos_process_start(self.handle))
+    }
+
+    /// Take the next handle out of this process's BOOT SET (spec §12).
+    /// Requires `ProcessRight.BootHandles`.
+    ///
+    /// §12 keeps the boot set ONE HANDLE WIDE at the entry register — the
+    /// System handle — so everything else the kernel minted before the process
+    /// ran is COLLECTED rather than passed. This is that collection, one record
+    /// at a time, and it is what a launcher's first loop looks like.
+    ///
+    /// **EXHAUSTION IS `Err(SosStatus.Drained)` AND IT IS THE LOOP'S EXIT**, not
+    /// a failure to report: a drain ENDS by meeting the end. It stays drained,
+    /// so asking again is safe and answers the same.
+    ///
+    /// Each record carries the REGION ORDINAL it came from. The kernel assigns
+    /// no meaning to that number — which image, which destination, which device
+    /// — because the meaning is the launcher's config, and keeping it there is
+    /// what lets the same kernel serve a hand-built system and a dynamic one.
+    public func boot_handle_next(&self) -> Result<BootHandle, SosStatus> {
+        boot_handle_into_frame(self.handle)
+    }
+}
+
+// =============================================================================
+// Memory (spec §2.5; sawos design 2 D-2)
+// =============================================================================
+
+/// A handle to a Memory — a sealed range of physical memory.
+///
+/// THE FIRST SLICE OF §2.5's OBJECT, and its whole v1 surface is being NAMED:
+/// a process receives regions at boot through `Process.boot_handle_next` and
+/// passes them to `Process.process_create`. There is no `map()`, no `alloc()`,
+/// no sub-range and no way to read the bounds — a region is authority over
+/// bytes, not a description of them. Unit 4 is where pools, derivation,
+/// mapping and memory types arrive; nothing here forecloses any of it.
+///
+/// Built by `Process.boot_handle_next` and by nothing else — no word
+/// constructor, no word extractor, the module docstring's rule.
+///
+/// **IT IS A PLAIN VALUE, LIKE EVERY OTHER HANDLE IN THIS MODULE**, and that is
+/// a deliberate deviation from design 2 D-4's parenthetical, which asked for
+/// `NoCopy`. Two reasons, both about keeping one rule rather than nine. First,
+/// the OWNING tier is unit 2.75's whole subject: `SystemHandle`'s docstring in
+/// `sosabi` already says the `NoCopy` wrapper arrives when handles become
+/// CLOSEABLE, because a move-only handle whose drop does nothing buys a
+/// discipline with no enforcement behind it. Second, the ruled boot-handle
+/// record is a `{tag, kind, handle}` VALUE the iterator hands back — and a
+/// move-only field inside a returned struct cannot be got out again without a
+/// partial move, so the record shape and `NoCopy` are not both expressible
+/// today. When 2.75 makes handles closeable, all nine become `NoCopy` together
+/// and the record becomes a consuming accessor; doing one of them early would
+/// have made this the one handle type that reads differently for a unit.
+public struct Memory {
+    handle: MemoryHandle,
+}
+
+/// One entry of a process's BOOT SET, decoded.
+///
+/// It is declared HERE and not in `sosabi` — where `WaitResult` lives — for one
+/// reason: it carries a HANDLE. A wait answer is made of plain words, so one
+/// declaration serves both sides of the trap boundary; a boot handle's whole
+/// point is that what a process receives is a `Memory` and never a number, and
+/// that type is this module's. The three-word WIRE layout is still declared
+/// exactly once, in `sosabi`, which is what the vDSO discipline actually asks.
+public struct BootHandle {
+    /// The REGION ORDINAL this handle came from — row `n` of the build's region
+    /// table is tag `n`. The kernel assigns it no meaning; a launcher's config
+    /// is what says which ordinal is which.
+    public tag: UInt,
+    /// What kind of object was minted. v1 mints regions and nothing else, so a
+    /// caller that asserts this is asserting the build did what it said.
+    public kind: BootHandleKind,
+    /// The region itself.
+    public memory: Memory,
+}
+
+/// Decode a record the kernel copied out into a `BootHandle`.
+///
+/// AN UNKNOWN KIND PANICS, loudly, for exactly the reason `decode_wait`'s
+/// unknown tag does: the KERNEL wrote it, out of the same `BootHandleKind`
+/// declaration this function reads, so a kind that does not decode is a skew
+/// between the kernel and the `sos` module it exports — a bug in the pair, not
+/// a runtime condition a caller could act on.
+func decode_boot_handle(tag: UInt, kind: UInt, handle: UInt) -> BootHandle {
+    guard let what = BootHandleKind.from(raw: kind) else {
+        panic("sos: kernel wrote boot handle kind {}, which this build cannot name",
+              kind)
+    }
+    match what {
+        case Memory -> BootHandle(tag: tag, kind: what,
+                                  memory: Memory(handle: MemoryHandle(handle))),
+    }
+}
+
+/// The `unsafe` half of `Process.boot_handle_next`, confined to one small named
+/// helper (design 136). The buffer's address never leaves it.
+func boot_handle_into_frame(handle: ProcessHandle) unsafe -> Result<BootHandle, SosStatus> {
+    var buf: [UInt; BOOT_HANDLE_RECORD_WORDS] = [0; BOOT_HANDLE_RECORD_WORDS]
+    try checked(sos_process_boot_handle_next(handle,
+                                             (&var buf) as UnsafePointer<UInt>,
+                                             boot_handle_record_bytes() as UInt))
+    return decode_boot_handle(buf[BOOT_HANDLE_TAG_WORD],
+                              buf[BOOT_HANDLE_KIND_WORD],
+                              buf[BOOT_HANDLE_HANDLE_WORD])
 }
 
 // =============================================================================

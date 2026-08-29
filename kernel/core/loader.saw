@@ -1,19 +1,31 @@
-//! THE SOSIMG LOADER (design 140 unit B; spec §6, §7, §12).
+//! THE SOSIMG LOADER (design 140 unit B; spec §6, §7, §12; sawos design 2 D-1).
 //!
-//! The kernel loads exactly ONE image, ever: the root server. What stays here is
-//! everything that holds on EVERY target — the order the checks run in, that
-//! nothing is placed before everything validates, and that a malformed shape is
-//! a diagnosed FAIL rather than a hang or a partial load.
+//! **ONE LOADER, TWO DOORS.** The kernel loads root at boot and a child at
+//! `process_create`, and both go through the phases below with different REGION
+//! PARAMETERS and different FAILURE VOCABULARY — never through two copies of the
+//! walk. §12's "no second code path" is kept by construction rather than by
+//! discipline: `validate_image` and `place_image` take the destination as an
+//! argument, `fatal_image` versus a `BadImage` status is the caller's choice,
+//! and there is nowhere else in the tree that reads a segment record.
 //!
-//! It is the last module in the order because it ends by handing the machine to
-//! `process`'s one way into user mode.
+//! What stays here is everything that holds on EVERY target and for EVERY
+//! image — the order the checks run in, that nothing is placed before
+//! everything validates, and that a malformed shape is diagnosed rather than
+//! half-loaded.
+//!
+//! IT SITS BELOW THE DISPATCH, not above it, and that is what the second door
+//! cost: `load_root_and_enter` is still the machine's last boot step, but
+//! `process_create` is an OP, so the phases have to be reachable from
+//! `kcore.dispatch`. Nothing here reaches upward — the placement calls the
+//! HAL, the movers and the process slot, all of which are below.
 
 import hal
 import imgformat.{SosimgHeader, SosimgSeg, SegFlag, fits_target_word}
 import kcore.mem.{align_up}
 import kcore.diag.{console, fatal_image}
 import kcore.preempt.{long_copy, long_zero}
-import kcore.process.{start_process}
+import kcore.limits.{ROOT_PROCESS}
+import kcore.process.{load_domain, record_grant, start_process}
 
 /// What a refused too-high address REPORTS: its top 32 bits. The low half is
 /// what would have survived a narrowing, so it is the half that says nothing;
@@ -26,9 +38,7 @@ static HIGH_HALF_SHIFT: Int = 32
 // The sosimg loader (design 140 unit B; spec §6, §7, §12)
 // =============================================================================
 //
-// The kernel loads exactly ONE image, ever: the root server (spec §12). Every
-// later process is loaded BY ROOT, so there is deliberately no second code path
-// here. The image is not ELF — a microkernel-sized loader gets a flat header.
+// The image is not ELF — a microkernel-sized loader gets a flat header.
 //
 // The LAYOUT is not described here: it is the `imgformat` package, shared with
 // the Blade target that emits it, and this loader reads it by OVERLAYING those
@@ -38,12 +48,45 @@ static HIGH_HALF_SHIFT: Int = 32
 // `static_assert`) is what makes the overlay exact, and it is what turns a
 // layout edit into a compile error instead of a silent misparse at boot.
 //
-// What stays HERE is everything that holds on EVERY target: the order the
-// checks run in, that nothing is placed before everything validates, and that a
-// malformed shape is a diagnosed FAIL rather than a hang or a partial load.
-// Where root's region is, how many grants there are to spend and what a
+// Where a process's region IS, how many grants there are to spend and what a
 // permission bit does to the hardware are the HAL's — which is why the numbers
-// below are read from it rather than written here.
+// are read from it (for root) or carried in a `LoadRegion` (for a child) rather
+// than written here.
+
+/// WHERE AN IMAGE IS GOING — the parameter that turns one loader into two doors.
+///
+/// `base`..`top` is the whole destination range and `stack_len` is what the
+/// KERNEL takes off the top for the first thread's stack, so segments must fit
+/// below `top - stack_len`. That is root's own rule ("the stack is the kernel's
+/// grant, not the image's"), and a child gets it unchanged: root supplies a
+/// region capability and no numbers at all.
+public(package) struct LoadRegion {
+    public(package) base: UInt,
+    public(package) top: UInt,
+    public(package) stack_len: UInt,
+}
+
+/// WHY AN IMAGE WAS REFUSED — the answer the shared phases give, so that the
+/// two doors can say it their own way.
+///
+/// The boot door turns it into `fatal_image`, because a machine whose only
+/// image is malformed has nothing else to do. The create door turns it into
+/// `SosStatus.BadImage`, because image bytes are DATA a launcher was handed and
+/// a launcher that cannot report a bad image cannot launch anything else
+/// either (sawos design 2 D-4; sawlang#232 agenda item 2's lean (i)).
+///
+/// `reason` is the same sentence in both mouths, which is the point: one
+/// vocabulary, two ways of raising it.
+public(package) struct ImageFault {
+    public(package) reason: String,
+    public(package) detail: UInt,
+}
+
+/// Root's destination, from the HAL's own constants.
+public(package) func root_region() -> LoadRegion {
+    LoadRegion(base: hal.ROOT_LOAD_BASE, top: hal.ROOT_REGION_TOP,
+               stack_len: hal.ROOT_STACK_LEN)
+}
 
 /// Overlay the header on the image's first bytes. One view construction, then
 /// an ordinary safe struct — the unsafety is confined to this line.
@@ -56,33 +99,36 @@ func seg_at(addr: UInt) unsafe -> SosimgSeg {
     UnsafeMemory<SosimgSeg, Normal>(addr).read()
 }
 
-/// Validate one segment record against the image bounds and the root region.
+/// Validate one segment record against the image bounds and the destination
+/// region. `None` when it is loadable.
+///
 /// Checks are ordered so no bound is computed by an addition that could
 /// overflow — a hostile length must produce a diagnostic, not a panic.
-func check_segment(seg: &SosimgSeg, img_len: UInt) {
+func check_segment(seg: &SosimgSeg, img_len: UInt, dest: &LoadRegion,
+                   allow_device: Bool) -> ImageFault? {
     let file_off = seg.file_off as UInt
     let file_len = seg.file_len as UInt
     let mem_len = seg.mem_len as UInt
 
     // The format's addresses are 64-bit on both profiles (design 172 unit 8),
     // so a 32-bit kernel can be handed an image it cannot address. Refusing is
-    // the only answer that cannot corrupt a boot — narrowing would wrap a high
+    // the only answer that cannot corrupt a load — narrowing would wrap a high
     // address into a low one and place the segment somewhere the linker never
     // meant. The test folds away entirely on a 64-bit build.
     if not fits_target_word(seg.load_addr) {
-        fatal_image("segment loads past this machine's address space",
-                    (seg.load_addr >> HIGH_HALF_SHIFT) as UInt)
+        return ImageFault(reason: "segment loads past this machine's address space",
+                          detail: (seg.load_addr >> HIGH_HALF_SHIFT) as UInt)
     }
     let load_addr = seg.load_addr as UInt
 
     if file_off > img_len {
-        fatal_image("segment starts past the image", file_off)
+        return ImageFault(reason: "segment starts past the image", detail: file_off)
     }
     if file_len > img_len - file_off {
-        fatal_image("segment runs past the image", file_len)
+        return ImageFault(reason: "segment runs past the image", detail: file_len)
     }
     if not seg.mem_covers_file() {
-        fatal_image("segment mem_len below file_len", mem_len)
+        return ImageFault(reason: "segment mem_len below file_len", detail: mem_len)
     }
 
     // Write-without-read is not a grant any target should install, and one
@@ -90,36 +136,53 @@ func check_segment(seg: &SosimgSeg, img_len: UInt) {
     // rule; refusing the image is the consequence. It is checked BEFORE the
     // device branch because it holds for both kinds of record.
     if not seg.has_sane_perms() {
-        fatal_image("segment permissions are not a valid grant", seg.flags as UInt)
+        return ImageFault(reason: "segment permissions are not a valid grant",
+                          detail: seg.flags as UInt)
     }
 
-    // A DEVICE WINDOW is judged against the BOARD, not against the root region
-    // — it names hardware, which is nowhere near RAM — so it takes its own
-    // path and returns.
+    // A DEVICE WINDOW is judged against the BOARD, not against the destination
+    // region — it names hardware, which is nowhere near RAM — so it takes its
+    // own path and returns.
     if seg.is_device_grant() {
-        check_device_grant(&seg, load_addr, file_len, mem_len)
-        return
+        if not allow_device {
+            // **A CHILD MAY NOT DECLARE AN MMIO WINDOW, v1** (sawos design 2
+            // D-7). The image-declares/board-authorizes placeholder below is a
+            // BOOT-time grant of the one window this board offers to the one
+            // process the kernel loads; extending it to every child would make
+            // "which process gets the UART" a race between images rather than a
+            // decision anybody made. A driver child waits for unit 4's
+            // IoMemory, where the window is a capability root HANDS OVER, and
+            // the echo-driver money shot rides that.
+            return ImageFault(reason: "a child image may not declare a device window",
+                              detail: load_addr)
+        }
+        return check_device_grant(&seg, load_addr, file_len, mem_len)
     }
 
-    if load_addr < hal.ROOT_LOAD_BASE {
-        fatal_image("segment loads below the root region", load_addr)
+    if load_addr < dest.base {
+        return ImageFault(reason: "segment loads below the root region",
+                          detail: load_addr)
     }
     // A grant covers whole units of the target's protection granularity, so a
     // segment starting mid-unit would be granted along with whatever shares
     // its first unit — the previous segment's tail, at the previous segment's
-    // permissions. On a page-granular profile that is how root's code would
-    // silently become writable; on a four-byte-granular one it never arises.
+    // permissions. On a page-granular profile that is how code would silently
+    // become writable; on a four-byte-granular one it never arises.
     // Refusing the image is the only answer that is right on both.
     if (load_addr & (hal.PROT_GRAIN - 1)) != 0 {
-        fatal_image("segment is not aligned to the grant granularity", load_addr)
+        return ImageFault(reason: "segment is not aligned to the grant granularity",
+                          detail: load_addr)
     }
-    let limit = hal.ROOT_REGION_TOP - hal.ROOT_STACK_LEN
+    let limit = dest.top - dest.stack_len
     if load_addr > limit {
-        fatal_image("segment loads above the root region", load_addr)
+        return ImageFault(reason: "segment loads above the root region",
+                          detail: load_addr)
     }
     if mem_len > limit - load_addr {
-        fatal_image("segment overruns the root region", mem_len)
+        return ImageFault(reason: "segment overruns the root region",
+                          detail: mem_len)
     }
+    None
 }
 
 /// Validate a DEVICE WINDOW record (design 178's finale constraint 1, ruled
@@ -133,25 +196,242 @@ func check_segment(seg: &SosimgSeg, img_len: UInt) {
 /// a process has any business holding while the kernel owns everything else —
 /// so the authorization is a comparison rather than a table.
 ///
-/// THIS IS THE PLACEHOLDER M3'S MAPPING RETIRES. Then a device window is a
-/// MemoryObject derived from a device pool root (spec §2.5), mapped by an op
+/// THIS IS THE PLACEHOLDER UNIT 4'S MAPPING RETIRES. Then a device window is a
+/// Memory object derived from a device pool root (spec §2.5), mapped by an op
 /// and revocable by closing the Mapping, and the board's comparison becomes the
-/// pool's contents. Everything above this line is what that migration replaces.
+/// pool's contents. Everything above this line is what that migration replaces
+/// — which is also why `check_segment` refuses one outright for a CHILD: a
+/// boot-time image-declared grant is a statement about the one process the
+/// kernel loads, and generalizing it would outlive its own placeholder.
 func check_device_grant(seg: &SosimgSeg, load_addr: UInt, file_len: UInt,
-                        mem_len: UInt) {
+                        mem_len: UInt) -> ImageFault? {
     // A window carries no bytes: there is nothing in an image file to place at
     // a hardware address, and a record claiming otherwise has been built wrong.
     if file_len != 0 {
-        fatal_image("device grant carries image bytes", file_len)
+        return ImageFault(reason: "device grant carries image bytes",
+                          detail: file_len)
     }
     if load_addr != hal.DEVICE_GRANT_BASE {
-        fatal_image("device grant names a window this board does not offer",
-                    load_addr)
+        return ImageFault(reason: "device grant names a window this board does not offer",
+                          detail: load_addr)
     }
     if mem_len != hal.DEVICE_GRANT_LEN {
-        fatal_image("device grant is not the size of that window", mem_len)
+        return ImageFault(reason: "device grant is not the size of that window",
+                          detail: mem_len)
     }
+    None
 }
+
+// -----------------------------------------------------------------------------
+// PHASE A/B: everything, before anything
+// -----------------------------------------------------------------------------
+
+/// Validate a whole image against `img_len` bytes at `img_base` and the
+/// destination `dest`. `None` when every byte of it may be placed.
+///
+/// **NOT ONE EFFECT HAPPENS IN HERE**, which is the phase discipline both doors
+/// depend on: a refused image leaves the destination region untouched, so a
+/// launcher that gets `BadImage` back has lost nothing but the call, and a
+/// refused boot image leaves a machine whose root region is exactly as the
+/// linker left it.
+///
+/// AUDIT (design 1): NO POINT. At most eight iterations of an O(1) body —
+/// bounded-small, so there is nothing here for a point to shorten.
+public(package) func validate_image(img_base: UInt, img_len: UInt,
+                                    dest: &LoadRegion,
+                                    allow_device: Bool) unsafe -> ImageFault? {
+    let header_len = sizeof<SosimgHeader>() as UInt
+    let seg_len = sizeof<SosimgSeg>() as UInt
+
+    if img_len < header_len {
+        return ImageFault(reason: "no root image appended", detail: img_len)
+    }
+
+    let header = header_at(img_base)
+    if not header.has_magic() {
+        return ImageFault(reason: "bad magic", detail: header.magic as UInt)
+    }
+    if not header.has_known_version() {
+        return ImageFault(reason: "unsupported version", detail: header.version as UInt)
+    }
+    // An image built for the OTHER profile is refused rather than jumped into.
+    // Its instructions are not this machine's and its addresses need not be in
+    // this machine's map — and before the format carried a tag, the only thing
+    // that stopped one booting on the other was that nobody had tried.
+    if not header.is_for_arch(hal.arch_tag()) {
+        return ImageFault(reason: "image is for another architecture",
+                          detail: header.arch as UInt)
+    }
+
+    let seg_count = header.seg_count as UInt
+    if seg_count == 0 {
+        return ImageFault(reason: "image has no segments", detail: 0)
+    }
+    // THE BUDGET IS THE RELOAD SET'S, not the image's: segments plus the
+    // kernel's stack grant have to fit the rows one process's domain is made
+    // of, and `MAX_ROOT_SEGMENTS` is that budget minus the stack on each
+    // profile. A child is bounded by the same number for the same reason —
+    // only one domain is installed at a time.
+    if seg_count > hal.MAX_ROOT_SEGMENTS {
+        return ImageFault(reason: "more segments than the grant budget",
+                          detail: seg_count)
+    }
+    let table_len = seg_count * seg_len
+    if table_len > img_len - header_len {
+        return ImageFault(reason: "segment table runs past the image",
+                          detail: table_len)
+    }
+
+    // Same rule as a segment's address, at the one other place a 64-bit field
+    // becomes a machine word: refuse, never narrow.
+    if not fits_target_word(header.entry) {
+        return ImageFault(reason: "entry is past this machine's address space",
+                          detail: (header.entry >> HIGH_HALF_SHIFT) as UInt)
+    }
+    let entry = header.entry as UInt
+
+    var i: UInt = 0
+    while i < seg_count {
+        let seg = seg_at(img_base + header_len + i * seg_len)
+        if let bad = check_segment(&seg, img_len, &dest, allow_device) {
+            return bad
+        }
+        i = i + 1
+    }
+
+    if entry < dest.base || entry >= dest.top - dest.stack_len {
+        return ImageFault(reason: "entry outside the root region", detail: entry)
+    }
+    // THE ENTRY MUST BE SOMETHING THE PROCESS MAY EXECUTE (sawos design 2 D-7).
+    // Being inside the region is not enough: an entry in a data segment is a
+    // program that faults on its first instruction, which the kernel can see
+    // and the image's author cannot. It is checked LAST so that every earlier
+    // diagnostic keeps the wording it has always had.
+    if not entry_is_executable(img_base, seg_count, entry) {
+        return ImageFault(reason: "entry is not inside an executable segment",
+                          detail: entry)
+    }
+    None
+}
+
+/// Is `entry` inside the load range of a segment the image asked to be
+/// executable?
+func entry_is_executable(img_base: UInt, seg_count: UInt, entry: UInt) unsafe -> Bool {
+    let header_len = sizeof<SosimgHeader>() as UInt
+    let seg_len = sizeof<SosimgSeg>() as UInt
+    var i: UInt = 0
+    while i < seg_count {
+        let seg = seg_at(img_base + header_len + i * seg_len)
+        if not seg.is_device_grant() && (seg.flags & (SegFlag.Execute as UInt8)) != 0 {
+            let load_addr = seg.load_addr as UInt
+            let mem_len = seg.mem_len as UInt
+            if entry >= load_addr && entry - load_addr < mem_len {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    false
+}
+
+/// The validated header's entry point.
+public(package) func image_entry(img_base: UInt) unsafe -> UInt {
+    header_at(img_base).entry as UInt
+}
+
+/// The validated header's segment count.
+public(package) func image_seg_count(img_base: UInt) unsafe -> UInt {
+    header_at(img_base).seg_count as UInt
+}
+
+/// The validated header's §7 band map.
+public(package) func image_prio_map(img_base: UInt) unsafe -> UInt {
+    header_at(img_base).prio_map as UInt
+}
+
+// -----------------------------------------------------------------------------
+// PHASE C/D: place the bytes, record the domain
+// -----------------------------------------------------------------------------
+
+/// Copy a VALIDATED image's segments into `dest` and record process `p`'s grant
+/// rows. Returns the writable window's floor.
+///
+/// **PHASE C IS WHERE UNIT 1.5 PAYS OFF.** The copy goes through
+/// `kcore.preempt`'s strided movers, so the loop is born with its preemption
+/// points rather than being retrofitted with them — which is the sequencing
+/// sawlang#232 pin 1 asked for, and the reason design 1 landed first.
+///
+/// **PHASE D COMMITS NOTHING TO HARDWARE.** The rows go into the process's grant
+/// record and the domain is installed by whoever is about to run the process:
+/// the boot path calls `load_domain` immediately, and a child's is installed by
+/// the scheduler at the switch (sawos design 2 D-5). One place installs a
+/// domain, and it is not here.
+///
+/// AUDIT (design 1): the walk itself takes NO point; its POINTS ARE THE MOVERS'
+/// (`long_copy`/`long_zero`), which is where the time is — up to 240 KiB of it.
+/// The grant record is plain kernel storage no IRQ path reads, so a delivery
+/// landing between two segments observes nothing in flight.
+///
+/// A TICK CAN FIRE MID-LOAD in a harness kernel that arms one before loading
+/// (`tests/threads_timer.saw`), and that is legal by the same audit: no thread
+/// is current, so the tick charges no slice; no Timer object exists before root
+/// runs, so expiry walks a table of free slots; and the reprogramming it ends
+/// with is the same one the idle path does.
+public(package) func place_image(p: Int, img_base: UInt,
+                                 dest: &LoadRegion) unsafe -> UInt {
+    let header_len = sizeof<SosimgHeader>() as UInt
+    let seg_len = sizeof<SosimgSeg>() as UInt
+    let seg_count = image_seg_count(img_base)
+
+    // The WRITABLE window, accumulated as the segments are placed. It is what
+    // `copy_out` checks a kernel-written record against, and the stack below is
+    // always part of it — so it starts at the region's top edge and only ever
+    // grows downward, which means "no writable segment at all" still leaves the
+    // stack, and a process always has somewhere to receive one.
+    var rw_base = dest.top - dest.stack_len
+
+    var s: UInt = 0
+    while s < seg_count {
+        let seg = seg_at(img_base + header_len + s * seg_len)
+        let load_addr = seg.load_addr as UInt
+        let file_len = seg.file_len as UInt
+        let mem_len = seg.mem_len as UInt
+
+        // A DEVICE WINDOW places no bytes and joins no writable window: it is a
+        // grant and nothing else. Keeping it out of `rw_base` is not tidiness —
+        // a hardware address is BELOW RAM on one profile, so folding it in
+        // would stretch the copy-out window from the device page to the top of
+        // the region and make `copy_out`'s check accept most of the machine.
+        if seg.is_device_grant() {
+            record_grant(p, load_addr, load_addr + mem_len, seg.flags, true)
+        } else {
+            long_copy(load_addr, img_base + (seg.file_off as UInt), file_len)
+            long_zero(load_addr + file_len, mem_len - file_len)
+
+            // The sosimg flag bits ARE the protection vocabulary (imgformat
+            // states the encoding; each HAL translates it into its own
+            // hardware's bits), so a segment's permissions become its grant
+            // with nothing in between.
+            record_grant(p, load_addr,
+                         align_up(load_addr + mem_len, hal.PROT_GRAIN),
+                         seg.flags, false)
+            if (seg.flags & (SegFlag.Write as UInt8)) != 0 && load_addr < rw_base {
+                rw_base = load_addr
+            }
+        }
+        s = s + 1
+    }
+
+    // The stack is the kernel's grant, not the image's: a program asks for code
+    // and data, the kernel decides where it runs.
+    record_grant(p, dest.top - dest.stack_len, dest.top,
+                 (SegFlag.Read as UInt8) | (SegFlag.Write as UInt8), false)
+    rw_base
+}
+
+// -----------------------------------------------------------------------------
+// THE BOOT DOOR
+// -----------------------------------------------------------------------------
 
 /// Parse the appended root image, place its segments, grant root exactly the
 /// regions the image asks for plus a stack, and drop to user mode at its entry.
@@ -163,67 +443,18 @@ public func load_root_and_enter() unsafe {
         fatal_image("payload bounds inverted", base)
     }
     let img_len = end - base
+    let dest = root_region()
 
-    // The record strides come from the shared structs, so they cannot drift
-    // from the layout the reads assume.
-    let header_len = sizeof<SosimgHeader>() as UInt
-    let seg_len = sizeof<SosimgSeg>() as UInt
-
-    if img_len < header_len {
-        fatal_image("no root image appended", img_len)
-    }
-
-    let header = header_at(base)
-    if not header.has_magic() {
-        fatal_image("bad magic", header.magic as UInt)
-    }
-    if not header.has_known_version() {
-        fatal_image("unsupported version", header.version as UInt)
-    }
-    // An image built for the OTHER profile is refused rather than jumped into.
-    // Its instructions are not this machine's and its addresses need not be in
-    // this machine's map — and before the format carried a tag, the only thing
-    // that stopped one booting on the other was that nobody had tried.
-    if not header.is_for_arch(hal.arch_tag()) {
-        fatal_image("image is for another architecture", header.arch as UInt)
+    // THE BOOT FAILURE VOCABULARY: a machine whose only image is malformed has
+    // nothing else to run, so every refusal stops it with the reason. The
+    // create door turns the same `ImageFault` into a status instead.
+    if let bad = validate_image(base, img_len, &dest, true) {
+        fatal_image(bad.reason, bad.detail)
     }
 
-    let seg_count = header.seg_count as UInt
-    if seg_count == 0 {
-        fatal_image("image has no segments", 0)
-    }
-    if seg_count > hal.MAX_ROOT_SEGMENTS {
-        fatal_image("more segments than the grant budget", seg_count)
-    }
-    let table_len = seg_count * seg_len
-    if table_len > img_len - header_len {
-        fatal_image("segment table runs past the image", table_len)
-    }
-
-    // Same rule as a segment's address, at the one other place a 64-bit field
-    // becomes a machine word: refuse, never narrow.
-    if not fits_target_word(header.entry) {
-        fatal_image("entry is past this machine's address space",
-                    (header.entry >> HIGH_HALF_SHIFT) as UInt)
-    }
-    let entry = header.entry as UInt
-    let prio_map = header.prio_map as UInt
-
-    // Validate EVERY segment before placing any of them: a rejected image must
-    // leave the root region untouched.
-    //
-    // AUDIT (design 1): NO POINT. At most eight iterations of an O(1) body —
-    // bounded-small, so there is nothing here for a point to shorten.
-    var i: UInt = 0
-    while i < seg_count {
-        let seg = seg_at(base + header_len + i * seg_len)
-        check_segment(&seg, img_len)
-        i = i + 1
-    }
-
-    if entry < hal.ROOT_LOAD_BASE || entry >= hal.ROOT_REGION_TOP - hal.ROOT_STACK_LEN {
-        fatal_image("entry outside the root region", entry)
-    }
+    let entry = image_entry(base)
+    let seg_count = image_seg_count(base)
+    let prio_map = image_prio_map(base)
 
     let uart = console()
     uart.write_str("SOS: root image ok segments=")
@@ -234,65 +465,14 @@ public func load_root_and_enter() unsafe {
     uart.write_hex(prio_map)
     uart.write_str("\n")
 
-    hal.prot_reset()
-
-    // The WRITABLE window, accumulated as the segments are placed. It is what
-    // `copy_out` checks a kernel-written record against, and the stack below is
-    // always part of it — so it starts at the region's top edge and only ever
-    // grows downward, which means "no writable segment at all" still leaves the
-    // stack, and a process always has somewhere to receive one.
-    var rw_base = hal.ROOT_REGION_TOP - hal.ROOT_STACK_LEN
-
-    // AUDIT (design 1): the walk itself takes NO point; its POINTS ARE THE
-    // MOVERS' (`long_copy`/`long_zero` below), which is where the time is — up
-    // to 240 KiB of it. The staged `prot_*` state is uncommitted across the
-    // whole walk, and that is legal rather than lucky: the IRQ path never reads
-    // protection state, so the staged descriptors are not an in-flight invariant
-    // a delivery could observe.
-    //
-    // A TICK CAN NOW FIRE MID-LOAD in a harness kernel that arms one before
-    // loading (`tests/threads_timer.saw`), and that is legal by the same audit:
-    // no thread is current, so the tick charges no slice; no Timer object exists
-    // before root runs, so expiry walks a table of free slots; and the
-    // reprogramming it ends with is the same one the idle path does.
-    var s: UInt = 0
-    while s < seg_count {
-        let seg = seg_at(base + header_len + s * seg_len)
-        let load_addr = seg.load_addr as UInt
-        let file_len = seg.file_len as UInt
-        let mem_len = seg.mem_len as UInt
-
-        // A DEVICE WINDOW places no bytes and joins no writable window: it is a
-        // grant and nothing else. Keeping it out of `rw_base` is not tidiness —
-        // a hardware address is BELOW RAM on one profile, so folding it in
-        // would stretch the copy-out window from the device page to the top of
-        // the region and make `copy_out`'s check accept most of the machine.
-        if seg.is_device_grant() {
-            hal.prot_device(s, load_addr, mem_len)
-        } else {
-            long_copy(load_addr, base + (seg.file_off as UInt), file_len)
-            long_zero(load_addr + file_len, mem_len - file_len)
-
-            // The sosimg flag bits ARE the protection vocabulary (imgformat
-            // states the encoding; each HAL translates it into its own
-            // hardware's bits), so a segment's permissions become its grant
-            // with nothing in between.
-            hal.prot_region(s, load_addr,
-                            align_up(load_addr + mem_len, hal.PROT_GRAIN),
-                            seg.flags)
-            if (seg.flags & (SegFlag.Write as UInt8)) != 0 && load_addr < rw_base {
-                rw_base = load_addr
-            }
-        }
-        s = s + 1
-    }
-
-    // The stack is the kernel's grant, not the image's: root asks for code and
-    // data, the kernel decides where it runs.
-    hal.prot_region(seg_count, hal.ROOT_REGION_TOP - hal.ROOT_STACK_LEN,
-                    hal.ROOT_REGION_TOP,
-                    (SegFlag.Read as UInt8) | (SegFlag.Write as UInt8))
-    hal.prot_commit()
+    // ROOT'S ROWS ARE RECORDED LIKE EVERY OTHER PROCESS'S, and that is new in
+    // M3 unit 2 rather than incidental: the reload at the switch is what
+    // installs a domain from now on, so a root that had no grant record would
+    // be a process the scheduler could switch away from and never back into.
+    // The device-window row is in there too, which is what keeps a driver
+    // image's window across a switch.
+    let rw_base = place_image(ROOT_PROCESS, base, &dest)
+    load_domain(ROOT_PROCESS)
 
     // spec §7: root's band map applies verbatim from its image. D3 keeps the
     // map a loader artifact for M2 — the scheduler is round-robin over one
@@ -300,10 +480,8 @@ public func load_root_and_enter() unsafe {
     // the Blade-emitted field arrives intact. Storing it in the Process slot is
     // the priority unit's job, not this one's.
     //
-    // §12: root's boot handle set. It is still exactly one handle — System —
-    // and every authority root has flows through it, now including its own
-    // Process and Thread objects, which it DERIVES (`ProcessSelf` /
-    // `ThreadSelf`) rather than being handed.
-    start_process(entry, hal.ROOT_REGION_TOP, hal.ROOT_LOAD_BASE,
-                  hal.ROOT_REGION_TOP, rw_base, hal.ROOT_REGION_TOP)
+    // §12: root's boot handle set. The entry register still carries exactly one
+    // handle — System — and everything else the kernel minted for root is
+    // COLLECTED through `ProcessOp.BootHandleNext` rather than passed.
+    start_process(entry, dest.top, dest.base, dest.top, rw_base, dest.top)
 }

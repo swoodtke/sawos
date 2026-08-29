@@ -80,6 +80,24 @@ extern unsigned char _payload_end[];
 u64 sos_payload_start(void) { return (u64)_payload_start; }
 u64 sos_payload_end(void)   { return (u64)_payload_end; }
 
+// ---- the boot region table ------------------------------------------------
+//
+// C BECAUSE: a linker symbol's address — the SAME reason and the same shape as
+// the payload bounds. The build-emitted region table (sawos design 2 D-2) lands
+// in the `.regions` section virt.ld bounds; an image built with no children
+// gets an empty section and start == end, which the kernel reads as ZERO
+// REGIONS.
+//
+// Only ONE new symbol pair, and that is a property of the format rather than of
+// this file: the table's rows carry blob BASES the linker resolved when it
+// placed the generated stub, so no per-child symbol has to be nameable here.
+
+extern unsigned char _region_table_start[];
+extern unsigned char _region_table_end[];
+
+u64 sos_region_table_start(void) { return (u64)_region_table_start; }
+u64 sos_region_table_end(void)   { return (u64)_region_table_end; }
+
 // ---- turning the MMU on ---------------------------------------------------
 //
 // C BECAUSE: `msr`/`mrs` name a system register at assembly time, and `dsb`/
