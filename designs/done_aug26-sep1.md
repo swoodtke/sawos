@@ -69,3 +69,13 @@ repo's first done file; sawos was born Aug 28 (sawlang#238).
   order rather than staying last (its phases have to be reachable from
   the dispatch now that `process_create` is an op). Nothing left open
   inside the entry
+
+- DESIGN 2 RIDER — `process_create` moves from Process to System (Aug-29
+  user ruling; the record is the RIDER section at the end of
+  `designs/002-create-process.md`) — DISPATCHED, BUILT, closed in place:
+  `SystemOp.ProcessCreate = 4` on new `SystemRight.ProcessCreate = 1 << 11`
+  minted in `root_system_rights()`, the Process op/right retired and
+  `Start`/`BootHandles(Next)` renumbered down, `System.process_create` +
+  `sos_system_process_create` in sysapi, four root packages and spec
+  §2/§8/§12 amended. Gate re-run green, every case transcript unchanged.
+  Nothing open; INTEGRATED to main Aug 29 (lead-reviewed, gate re-run 94/94, fast-forward 136cddd) [#2]
