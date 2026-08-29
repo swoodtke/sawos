@@ -21,7 +21,16 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
-- M3 unit 2.75 — handle lifecycle [sawlang#232]
+- M3 unit 2.75 — handle lifecycle [sawlang#232 Aug-17 ruling, #3 —
+  designs/003-handle-lifecycle.md, authored Aug 29]: mint-per-call +
+  ungated universal RELEASE_OP + 24-bit generations (gen 0 stamps
+  nothing — every existing handle contract survives), Gone
+  process-slot reclaim on last release, DROP IS RELEASE (Aug-29 user
+  ruling: all nine sysapi wrappers flip NoCopy+deinit in this unit;
+  no typed release() method; the transfer-funnel disarm contract
+  recorded for unit 3/M4). First unit whose transcripts MOVE — the
+  authorized row set and the per-case accounting duty are D-6.
+  DISPATCHED Aug 29; closes in place when the branch parks
 - M3 unit 3 — give(handle, tag:) [sawlang#232]
 - M3 unit 4 — Memory/IoMemory [sawlang#232]
 - M3 unit 5 — quotas [sawlang#232]
