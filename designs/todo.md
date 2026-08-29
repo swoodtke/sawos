@@ -21,7 +21,15 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
-- M3 unit 3 — give(handle, tag:) [sawlang#232]
+- M3 unit 3 — give(handle, tag:) [sawlang#232 Aug-16 launch-flow
+  ruling, #4 — designs/004-give.md, authored Aug 29]: give as
+  unbind-and-rebind rights-verbatim (2.75 composes: giver's word goes
+  stale), tags the only cross-process vocabulary, per-process boot
+  queues, start(boot_tag:) kernel-resolved a0, give-before-start the
+  frozen barrier, child Process handle re-ruled full-set+Transfer
+  (supervise OR donate — the second-handle question is 5.5's). No
+  authorized transcript changes. DISPATCHED Aug 29; closes in place
+  when the branch parks
 - M3 unit 4 — Memory/IoMemory [sawlang#232]
 - M3 unit 5 — quotas [sawlang#232]
 - M3 unit 5.5 — death notifications [sawlang#232]
