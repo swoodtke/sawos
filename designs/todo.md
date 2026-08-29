@@ -21,7 +21,17 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
-- M3 unit 4 — Memory/IoMemory [sawlang#232]
+- M3 unit 4 — Memory/IoMemory/Mapping [sawlang#232 §2.5, #6 —
+  designs/006-memory.md, authored Aug 29]: a Mapping IS an installed
+  grant row; Split (exclusive, one cut from the front — the parent is
+  the pool cursor) vs Carve (non-exclusive device windows); map/unmap
+  with the live-domain reload rule; the PMP budget widens 4→8 TOR
+  regions (16 entries); region table v2 grows a kind column; the
+  uart-echo pair migrates to obtained-not-declared (the ONLY two
+  authorized transcript moves); SegFlag.Device goes dormant
+  (retirement = sawlang-side pin-bump backlog); free-on-last-ref
+  explicitly unit 5's. DISPATCHED Aug 29; closes in place when the
+  branch parks
 - M3 unit 5 — quotas [sawlang#232]
 - M3 unit 5.5 — death notifications [sawlang#232]
 - M3 unit 6 — the money shot [sawlang#232]
