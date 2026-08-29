@@ -704,3 +704,39 @@ child holds no handle onto itself**: its table is empty, so
 `ProcessSelf` has nothing to answer with, which is exactly the
 "legal-but-doomed" sandboxed process the ruling asked for and what unit
 3's `give` changes.
+
+## RIDER (Aug 29, user ruling): `process_create` moves to System
+
+Examined at review, ruled the day after integration. The receiver
+question — System or Process — was decided for Process by following
+§12's M2-era sentence; the user ruled it the other way, on two
+arguments the lead concurs with:
+
+1. **PROCESSES ARE SYSTEM-WIDE; THE OTHER OBJECTS ARE PROCESS-WIDE.**
+   The process table is a machine-global resource bounded by machine
+   facts — the slab today, PMP reload domains, ASIDs when Profile B
+   grows real translation — so its refusals and limits are SYSTEM
+   answers. Threads, events, waiters, timers are a process's own and
+   their creation stays on Process, exactly as ruled in M2.
+2. **THE LAUNCHER TOPOLOGY EMPTIES THE OLD PLACEMENT.** With a
+   root/launcher creating every process (at startup or on behalf of
+   spawn requests over IPC), a creation right on the CREATOR's
+   Process handle gates nothing real, and creator-pays accounting
+   through the caller's slot would attribute everything to root.
+   Attribution in that world is ASSIGNED BY POLICY — unit 5's quota
+   vocabulary — not derived from who called.
+
+The sharpened line, recorded for §12's amendment: process-scoped
+objects are minted by your Process; PROCESSES ARE MINTED BY THE
+SYSTEM. `SystemOp.ProcessSelf` was already the precedent — Process
+handles have always come from System; now they all do.
+
+AS BUILT (rider): `SystemOp.ProcessCreate = 4` gated on NEW
+`SystemRight.ProcessCreate = 1 << 11`, minted in
+`root_system_rights()`. `ProcessOp.ProcessCreate` and
+`ProcessRight.ProcessCreate` retired; `Start`/`BootHandleNext`
+renumber down (the vDSO discipline: numbers are not ABI). sysapi:
+`System.process_create(image:memory:)`, C export
+`sos_system_process_create`; the five unit-2 root packages follow.
+`start()`/`boot_handle_next` stay on Process (receiver-verb; your own
+boot set). Gate: suite re-run, all rows' claims unchanged.
