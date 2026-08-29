@@ -1,0 +1,97 @@
+// SOS M3 unit 2.75: RELEASE IS UNGATED, AND MINT-PER-CALL REFILLS (sawos
+// design 3 D-2 and D-4; the Aug-17 handle-lifecycle ruling).
+//
+//   SOS release: ungated=1 refilled=1
+//   SOS release: done
+//
+// **`ungated`** is a release SUCCEEDING with no right checked. Destroying your
+// own capability instance harms nobody — identity lives in the object's slot,
+// not in the handle, so a released handle takes nothing away from anyone else
+// holding one — and there is consequently nobody for a gate to protect. If one
+// is ever wanted it is a NEW universal bit, never a retasking of `Manage`.
+//
+// WHAT THIS CASE CANNOT YET DO, stated rather than faked: the sharpest form of
+// the claim is a release succeeding through a handle whose rights word is ZERO,
+// and no attenuation op exists to build one — §3's monotonic attenuation
+// arrives with unit 3's `give`. So the claim is made in the strongest form
+// available: a Clock handle, whose kind's rights (`ClockRight.Read`,
+// `ClockRight.TimerCreate`) gate reading the time and making timers and say
+// nothing whatever about release. A kernel that checked ANY per-kind right here
+// would have to invent one, and this would fail.
+//
+// **`refilled`** is the other half, and the two belong in one case because
+// either alone is misleading. A release that succeeded but left the slot
+// unusable would be a leak with a success status; a mint that worked but only
+// because the release had not really unbound anything would prove nothing. The
+// second ask succeeding after the release is what says the slot came back AND
+// that the getter mints rather than caching.
+//
+// IT EXITS CLEAN, and that is load-bearing: every other case in this family
+// ends with the process dead, so this is the one that says a release is an
+// ORDINARY SUCCESSFUL OP rather than a differently-spelled fault.
+//
+// It reaches the C altitude because a raw word is the only thing that can be
+// released twice or asked about — the typed layer releases by DROPPING, which
+// `handle-drop-release` is the case for.
+
+import sos.{System, Process, ClockType, sos_system_clock_get, sos_handle_release}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The status word a successful op answers with (`SosStatus.Ok`).
+static STATUS_OK: UInt = 0
+
+static YES: UInt = 1
+static NO: UInt = 0
+
+func flag(b: Bool) -> UInt {
+    if b { YES } else { NO }
+}
+
+/// Ask for a Clock, answering the raw handle WORD — or 0, which names nothing.
+func ask_clock(handle: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_system_clock_get(handle, ClockType.Monotonic as UInt,
+                                      (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return 0
+    }
+    out
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS release: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let first = ask_clock(boot_handle)
+    if first == 0 {
+        let _ = system.debug_print("SOS release: no clock\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // NO RIGHT IS CHECKED. A Clock's rights gate reading the time and making
+    // timers; neither is a right to destroy your own handle, and there is no
+    // such right on any kind.
+    let ungated = sos_handle_release(first) == STATUS_OK
+
+    // AND THE SLOT COMES BACK. Under the old getter model this second ask would
+    // have answered the same word it answered the first time, whether or not
+    // anything had been released — which is exactly why mint-per-call and
+    // release had to land together.
+    let refilled = ask_clock(boot_handle) != 0
+
+    print("SOS release: ungated={} refilled={}\n", flag(ungated), flag(refilled))
+    print("SOS release: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

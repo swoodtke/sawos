@@ -1,0 +1,126 @@
+// SOS M3 unit 2.75: DROP IS RELEASE (sawos design 3 D-5, the Aug-29 user
+// ruling), seen end to end.
+//
+//   SOS droprelease: scoped=3 kept=1
+//   SOS droprelease: done
+//   SOS: process teardown handles=5 ...
+//
+// **READ THE TWO NUMBERS TOGETHER — that is the whole case.** This program mints
+// FOUR Clock handles. Three of them are born inside `used_and_dropped`, used
+// there, and die when it returns; one is kept to the end. The teardown line
+// counts FIVE handles: §12's three boot handles, the Process handle
+// `process_self()` minted, and the one Clock that outlived a scope. The three
+// that did not are missing because their wrappers' `deinit` released them — no
+// call was written, no method exists to write, and nothing in this file names
+// the release op.
+//
+// A count of EIGHT would be the pre-ruling world: mint-per-call without RAII,
+// which is a leak by design and is exactly why the two halves of design 3 could
+// not land apart.
+//
+// **THE TYPED HALF OF THE UNIT'S PROOF.** `handle-remint` and its siblings work
+// at the C altitude, where a handle is a word that can be released twice or
+// forged; this case never names a word at all. The mechanism is the same one —
+// a wrapper's deinit issues the same syscall those cases issue by hand — and
+// seeing it from both sides is what says the RAII surface and the kernel op are
+// one thing rather than two that happen to agree.
+//
+// `scoped` counts the successful uses inside the inner scope, so a regression
+// that released the handle too EARLY — before the body finished with it — would
+// fail here rather than silently in the count: the `now()` call would fault the
+// process on a handle its own frame had already given back.
+//
+// NOTHING WAITS. Every call answers immediately, so a regression that parked
+// would park the only thread in the system and be reported as the deadlock it
+// is, in microseconds rather than at the harness timeout.
+
+import sos.{System, Process, Clock, ClockType}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static YES: UInt = 1
+static NO: UInt = 0
+
+/// How many handles are minted and dropped inside an inner scope.
+///
+/// Three rather than one, so the teardown count cannot be right by accident: a
+/// kernel that released one handle too few would report six, one too many five
+/// — and only releasing exactly the three that died reports five with four
+/// minted.
+static SCOPED_ASKS: Int = 3
+
+func flag(b: Bool) -> UInt {
+    if b { YES } else { NO }
+}
+
+/// Mint a Clock, USE it, and let it die at the end of this function.
+///
+/// The whole point is what is NOT written here: no release, no close, no
+/// disarm. The `Clock` is a `NoCopy` wrapper whose `deinit` releases the handle,
+/// so returning from this function is what gives the capability back — the same
+/// thing `let _ = move clock` would say explicitly, which is why no typed
+/// `release()` method exists to say it twice.
+///
+/// The receiver is `&System` because a borrow is all that is wanted: this
+/// function must not consume the caller's System handle, and `NoCopy` is what
+/// makes the difference between the two visible in the signature.
+func used_and_dropped(system: &System) -> Bool {
+    match system.clock_get(type: ClockType.Monotonic) {
+        case Ok(clock) -> {
+            // Used while it is alive. A handle released before this line would
+            // fault the process here, which is what makes `scoped` an assertion
+            // about the TIMING of the release and not only about its happening.
+            match clock.now() {
+                case Ok(_) -> true,
+                case Err(_) -> false,
+            }
+        },
+        case Err(_) -> false,
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS droprelease: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // THREE HANDLES THAT DIE WHERE THEY WERE BORN. The table grows and shrinks
+    // three times over these iterations and ends where it started, which is the
+    // claim the teardown count makes in one number.
+    var scoped = 0
+    var n = 0
+    while n < SCOPED_ASKS {
+        if used_and_dropped(&system) {
+            scoped = scoped + 1
+        }
+        n = n + 1
+    }
+
+    // ...AND ONE THAT DOES NOT. It is still bound at the exit, so the teardown
+    // counts it — which is what makes the other three's absence mean something.
+    let kept = match system.clock_get(type: ClockType.Monotonic) {
+        case Ok(c) -> c,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS droprelease: no kept clock\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let alive = match kept.now() {
+        case Ok(_) -> true,
+        case Err(_) -> false,
+    }
+
+    print("SOS droprelease: scoped={} kept={}\n", scoped, flag(alive))
+    print("SOS droprelease: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

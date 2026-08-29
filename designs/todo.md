@@ -21,16 +21,26 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
-- M3 unit 2.75 — handle lifecycle [sawlang#232 Aug-17 ruling, #3 —
-  designs/003-handle-lifecycle.md, authored Aug 29]: mint-per-call +
-  ungated universal RELEASE_OP + 24-bit generations (gen 0 stamps
-  nothing — every existing handle contract survives), Gone
-  process-slot reclaim on last release, DROP IS RELEASE (Aug-29 user
-  ruling: all nine sysapi wrappers flip NoCopy+deinit in this unit;
-  no typed release() method; the transfer-funnel disarm contract
-  recorded for unit 3/M4). First unit whose transcripts MOVE — the
-  authorized row set and the per-case accounting duty are D-6.
-  DISPATCHED Aug 29; closes in place when the branch parks
+- ~~M3 unit 2.75 — handle lifecycle~~ **CLOSED Aug 29** [sawlang#232
+  Aug-17 ruling, #3 — designs/003-handle-lifecycle.md]. All of D-1..D-6
+  landed, both arches green (108 = 54 cases x 2). What is in the tree:
+  a CONFIGURABLE split word (`HANDLE_INDEX_BITS`, default 8, in sosabi
+  with mask/shift/asserts derived — the Aug-29 user note; gen 0 stamps
+  nothing, so §12's 1/2/3 and every asm payload are untouched); one
+  ungated universal `RELEASE_OP = 0xFFFF` intercepted between lookup
+  and the kind match; mint-per-call on `ClockGet`/`ProcessSelf`/
+  `ThreadSelf` with both `self_handle` caches and `clock_handle_of`
+  DELETED; `Gone` process-slot reclaim on last release, closing unit
+  2's `alloc_process` pend; DROP IS RELEASE — all nine wrappers
+  NoCopy + deinit, no typed `release()`, `BootHandle` reshaped to
+  `memory: Memory?` + `take_memory`. Seven new all-arch cases
+  (handle_remint, handle_release_ungated/_nothing/_twice,
+  handle_malformed_word, handle_drop_release, process_reclaim). D-6's
+  authorized row set moved and NOTHING outside it; the per-case
+  accounting table is in the brief's As-built. TWO FINDINGS recorded
+  there (a platform-`UInt` const-adoption gap; no op mints a second
+  handle onto a process's own Event/Waiter/Timer, which unit 3's
+  `give` is the answer to). OPEN: nothing
 - M3 unit 3 — give(handle, tag:) [sawlang#232]
 - M3 unit 4 — Memory/IoMemory [sawlang#232]
 - M3 unit 5 — quotas [sawlang#232]

@@ -31,11 +31,26 @@
 //
 // HOW TWO THREADS SHARE A KERNEL OBJECT, since this is the first program that
 // needs to. NOT by passing a handle word — the `sos` module offers no way to
-// take one out of a typed handle, which is the ruled guarantee. By sharing the
-// VALUE: an `Event` is a small plain struct, so it parks in this process's own
-// memory exactly as the boot handle does, and a thread that reads it back holds
-// the same object. The kernel is not involved, because the handle TABLE is the
-// process's and both threads were already inside it.
+// take one out of a typed handle, which is the ruled guarantee. And NOT by
+// sharing the wrapper VALUE, which is what this program used to do: since sawos
+// design 3 a handle wrapper is `NoCopy` and its drop RELEASES the handle, so two
+// copies would be two owners of one word and the second drop would be a
+// `BadHandle` fault the program did nothing to deserve.
+//
+// **BY ADDRESS.** The initial thread stays the sole OWNER — its `Event` lives in
+// its frame for the whole run, since it is parked inside `wait()` while the
+// worker runs — and it parks a POINTER to that owned value where the worker can
+// find it. The worker BORROWS through the pointer to call `signal`, which takes
+// `&self` and moves nothing. One owner, one release, exactly as the type system
+// would enforce if a reference could cross a thread boundary; the pointer is the
+// unsafe-tier spelling of a borrow the checker cannot see, which is what this
+// file already does for the worker's stack.
+//
+// WHAT WOULD BE BETTER, recorded rather than worked around: each thread holding
+// its OWN handle onto the one Event. Mint-per-call (design 3 D-4) is exactly
+// that shape, but the getters that mint are System's and Process's — there is no
+// op that hands out a second handle onto an Event a process already owns, so
+// there is nothing to call. Unit 3's `give` is where that arrives.
 
 import sos.{System, Process, Thread, Event, EventMode, Waiter, WaitResult,
             WaitPayload}
@@ -45,10 +60,14 @@ import sos.{System, Process, Thread, Event, EventMode, Waiter, WaitResult,
 /// never 0).
 unsafe static var BOOT_HANDLE: UInt = 0
 
-/// The Event both threads use. Zero-initialized, which for a handle-carrying
-/// struct means "names nothing" — the same reservation that makes handle 0
-/// unforgeable makes this slot safe to read before it is written.
-unsafe static var SHARED_EVENT: Event
+/// WHERE the initial thread's Event lives, for the worker to borrow through.
+///
+/// An ADDRESS and not the value, because a handle wrapper is `NoCopy` with a
+/// releasing deinit (sawos design 3 D-5) and so may have exactly one owner — and
+/// because a static could not hold one anyway: statics are immortal and never
+/// run a deinit, which the compiler refuses outright. Zero means "not parked
+/// yet", which no real address is.
+unsafe static var SHARED_EVENT_AT: UInt = 0
 
 static STACK_WORDS: Int = 1024
 unsafe static var STACK_W: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
@@ -107,12 +126,22 @@ func parked_boot_handle() unsafe -> UInt {
     BOOT_HANDLE
 }
 
-func park_event(e: Event) unsafe {
-    SHARED_EVENT = e
+/// Park the address of the OWNER's Event. The owner keeps it; this records only
+/// where it is.
+func park_event(e: &Event) unsafe {
+    SHARED_EVENT_AT = ((&e) as UnsafePointer<Event>) as UInt
 }
 
-func shared_event() unsafe -> Event {
-    SHARED_EVENT
+/// Signal the shared Event, borrowed through the parked address.
+///
+/// The borrow is sound because of WHERE the owner is when this runs: the initial
+/// thread is parked inside `waiter.wait()`, so its frame — and the `Event` in it
+/// — is alive for the whole of the worker's life. A status is discarded here for
+/// the reason `signal` cannot meaningfully fail: §2.4 says accumulating never
+/// blocks and never runs out of room.
+func signal_shared(bits: UInt) unsafe {
+    let at = SHARED_EVENT_AT as UnsafePointer<Event>
+    let _ = at[0].signal(bits)
 }
 
 /// The worker: say so, signal, leave.
@@ -133,14 +162,13 @@ func worker() {
 
     let _ = system.debug_print("SOS wake: worker signalling\n")
 
-    let event = shared_event()
     var n = 0
     while n < SIGNAL_TIMES {
         // §2.4: signalling NEVER blocks, whether or not anyone is parked. The
         // first of these is the one that wakes the sleeper — and the wake TAKES
         // it — so the rest accumulate from zero, which is what makes the word
         // left behind four and not five.
-        let _ = event.signal(ONE)
+        signal_shared(ONE)
         n = n + 1
     }
 
@@ -178,7 +206,9 @@ func initial(boot_handle: UInt) {
         },
     }
     let _ = waiter.add(&event, ATTACH_KEY)
-    park_event(event)
+    // The OWNER stays here, in this frame, for the whole run; the worker is told
+    // only where it is.
+    park_event(&event)
 
     let w = match proc.thread_create(stack_top: worker_stack_top(),
                                      arg: WORKER_ROLE) {

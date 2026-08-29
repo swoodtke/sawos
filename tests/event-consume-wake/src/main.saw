@@ -49,17 +49,20 @@ import sos.{System, Process, Thread, Event, EventMode, Waiter, WaitResult,
 /// never 0).
 unsafe static var BOOT_HANDLE: UInt = 0
 
-/// Worker -> initial. Zero-initialized, which for a handle-carrying struct means
-/// "names nothing" — the same reservation that makes handle 0 unforgeable makes
-/// these slots safe to read before they are written.
-unsafe static var UP_EVENT: Event
-unsafe static var UP_WAITER: Waiter
-
-/// Initial -> worker. A SECOND Waiter rather than a second attachment on the
-/// first: each thread parks on its own, so a wake never has to pick between two
-/// sleepers and the ping-pong stays an ordering rather than a race.
-unsafe static var DOWN_EVENT: Event
-unsafe static var DOWN_WAITER: Waiter
+/// WHERE the two objects the WORKER touches live — the up Event it signals and
+/// the down Waiter it parks on. Addresses, not values: a handle wrapper is
+/// `NoCopy` with a releasing deinit (sawos design 3 D-5) and has exactly one
+/// owner, and a static cannot hold one at all (statics are immortal and never
+/// run a deinit). The owner is the initial thread's frame, which is alive for
+/// the whole run because it is parked. See `event-wake`'s header for the full
+/// argument; this file is the same shape with two objects.
+///
+/// The up WAITER and the down EVENT are not parked because the worker never
+/// touches them — a SECOND Waiter exists so that each thread parks on its own
+/// and a wake never has to pick between two sleepers, which keeps the ping-pong
+/// an ordering rather than a race.
+unsafe static var UP_EVENT_AT: UInt = 0
+unsafe static var DOWN_WAITER_AT: UInt = 0
 
 static STACK_WORDS: Int = 1024
 unsafe static var STACK_W: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
@@ -126,20 +129,30 @@ func parked_boot_handle() unsafe -> UInt {
     BOOT_HANDLE
 }
 
-func park_shared(up: Event, up_waiter: Waiter,
-                 down: Event, down_waiter: Waiter) unsafe {
-    UP_EVENT = up
-    UP_WAITER = up_waiter
-    DOWN_EVENT = down
-    DOWN_WAITER = down_waiter
+/// Park the addresses of the two objects the worker borrows. The initial thread
+/// keeps ownership of both.
+func park_shared(up: &Event, down_waiter: &Waiter) unsafe {
+    UP_EVENT_AT = ((&up) as UnsafePointer<Event>) as UInt
+    DOWN_WAITER_AT = ((&down_waiter) as UnsafePointer<Waiter>) as UInt
 }
 
-func shared_up() unsafe -> Event {
-    UP_EVENT
+/// Signal the shared up Event, borrowed through its parked address. §2.4 says
+/// accumulating never blocks and never runs out of room, so there is nothing a
+/// status could tell this caller.
+func signal_up(bits: UInt) unsafe {
+    let at = UP_EVENT_AT as UnsafePointer<Event>
+    let _ = at[0].signal(bits)
 }
 
-func shared_down_waiter() unsafe -> Waiter {
-    DOWN_WAITER
+/// Park on the shared down Waiter, borrowed through its parked address. The
+/// answer is only "did the wait work" — the record itself is the initial
+/// thread's business.
+func wait_down() unsafe -> Bool {
+    let at = DOWN_WAITER_AT as UnsafePointer<Waiter>
+    match at[0].wait() {
+        case Ok(_) -> true,
+        case Err(_) -> false,
+    }
 }
 
 /// The worker: signal, park, signal again, leave.
@@ -162,26 +175,21 @@ func worker() {
 
     // The wake this raises does not switch — it only makes the initial thread
     // runnable — so everything below still runs before it does.
-    let up = shared_up()
-    let _ = up.signal(FIRST_BITS)
+    signal_up(FIRST_BITS)
 
     // PARK, which is what hands the processor over. The initial thread is what
     // wakes this, and it does so only after it has read its own record and
     // drained the event, which is what puts the two halves of the transcript in
     // the order they are asserted in.
-    let mine = shared_down_waiter()
-    match mine.wait() {
-        case Ok(_) -> {},
-        case Err(_) -> {
-            let _ = system.debug_print("SOS consumewake: worker wait failed\n")
-            let _ = me.exit(WORKER_EXIT)
-            return
-        },
+    if not wait_down() {
+        let _ = system.debug_print("SOS consumewake: worker wait failed\n")
+        let _ = me.exit(WORKER_EXIT)
+        return
     }
 
     let _ = system.debug_print("SOS consumewake: worker second signal\n")
     // The second word, sent to an event the first wake emptied.
-    let _ = up.signal(SECOND_BITS)
+    signal_up(SECOND_BITS)
 
     let _ = me.exit(WORKER_EXIT)
 }
@@ -235,7 +243,9 @@ func initial(boot_handle: UInt) {
 
     let _ = up_waiter.add(&up, KEY_UP)
     let _ = down_waiter.add(&down, KEY_DOWN)
-    park_shared(up, up_waiter, down, down_waiter)
+    // The OWNERS stay in this frame for the whole run; the worker is told only
+    // where the two it touches are.
+    park_shared(&up, &down_waiter)
 
     let w = match proc.thread_create(stack_top: worker_stack_top(),
                                      arg: WORKER_ROLE) {

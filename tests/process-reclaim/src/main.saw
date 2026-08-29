@@ -1,0 +1,190 @@
+// SOS M3 unit 2.75: A DEAD PROCESS'S SLOT COMES BACK WHEN THE LAST HANDLE ONTO
+// IT DOES (sawos design 3 D-3), closing the pend unit 2 recorded at
+// `alloc_process`.
+//
+// The transcript is read as an ORDER, and the two flags are the two sides of one
+// claim:
+//
+//   SOS reclaim: started
+//   SOS: process fault: bad handle process=1     <- the child, dying
+//   SOS: process teardown ... process=1
+//   SOS reclaim: refused_before=1 reclaimed_after=1
+//   SOS reclaim: done
+//
+// **`refused_before=1` IS THE HALF THAT IS EASY TO LOSE.** With the child dead
+// but root still holding its Process handle, a second create must be refused —
+// `MAX_PROCESSES` is two and the dead slot is `Gone`, not `Free`, because the §8
+// status word in it still has a possible reader. That refusal is the behaviour
+// unit 2 shipped, and asserting it here is what stops this case from passing on
+// a kernel that simply reclaimed slots eagerly and lost the supervision story.
+//
+// **`reclaimed_after=1` IS THE UNIT.** Root drops the child's handle — no method
+// call, just a value going out of scope, which is what `NoCopy` + `deinit` makes
+// a release (design 3 D-5) — and the create that was refused a moment ago now
+// succeeds. Between the two calls the only thing that changed is that no handle
+// anywhere names slot 1 any more, which is precisely the reader-count the
+// reclaim asks for.
+//
+// WHY A READER-COUNT AT ALL, since it reads like bookkeeping: the only thing a
+// `Gone` slot still holds is its §8 status word, and the only way to read that
+// word is `GetStatus` through a Process handle. So "no handle names the slot"
+// IS "no possible reader", exactly — which is why this slab reclaims and no
+// other does. Events, Waiters, Timers and Memories still come back only at their
+// process's teardown, because their "may I free this" question needs a refcount
+// nothing yet justifies.
+//
+// D-1's GENERATIONS ARE WHAT MAKE THE REUSE SAFE. The second child lands in the
+// slot the first one had; a word onto the first child would now name a live slot
+// at the wrong life and resolve to nothing. Nothing in this case can hold such a
+// word — the typed layer has no word extractor, by design — so the stale-word
+// half of the claim is `handle-remint`'s, made where words are visible.
+//
+// ROOT PARKS ON A GENEROUS TIMER while the child runs, so the ordering above is
+// forced rather than raced: this image's kernel arms no scheduler tick, so the
+// only way root gives the processor up is the wait, and the only way it gets it
+// back is the timer it armed.
+
+import sos.{System, Process, Memory, BootHandle, Clock, ClockType, Timer,
+            Waiter, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static YES: UInt = 1
+static NO: UInt = 0
+
+/// The key this case attaches its timer under.
+static KEY: UInt = 88
+
+/// Twenty milliseconds — three orders of magnitude more than the child needs to
+/// be scheduled, run its one syscall and die. See `process-lifecycle`.
+static PARK_NS: UInt64 = 20_000_000
+
+func flag(b: Bool) -> UInt {
+    if b { YES } else { NO }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS reclaim: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // Row 0 is the child's image blob, row 1 the RAM it runs in — this build's
+    // config, which is root's business and never the kernel's.
+    var image = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS reclaim: no image region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    var dest = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS reclaim: no destination region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // The record hands the region over — see `process-lifecycle` for why
+    // `take_memory` is the one way out (sawos design 3 D-5). BOTH regions are
+    // used TWICE here, which is the reason they are taken into locals: the
+    // second child is loaded from the same image into the same RAM, the first
+    // child's remains being nothing the kernel tracks.
+    let image_mem = image.take_memory()!
+    let dest_mem = dest.take_memory()!
+
+    let child = match system.process_create(image: &image_mem,
+                                            memory: &dest_mem) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS reclaim: create failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match child.start() {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS reclaim: start failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS reclaim: started\n")
+
+    // Park, so the child gets the processor and dies before anything below runs.
+    let clock = match system.clock_get(type: ClockType.Monotonic) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS reclaim: no clock: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let waiter = match proc.waiter_create() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS reclaim: no waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let timer = match clock.timer_create() {
+        case Ok(t) -> t,
+        case Err(e) -> {
+            print("SOS reclaim: no timer: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = waiter.add(&timer, KEY)
+    let _ = timer.arm(after_ns: PARK_NS)
+    match waiter.wait() {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS reclaim: wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // BEFORE THE RELEASE: the slot is `Gone`, not `Free`, because root's handle
+    // onto it keeps the §8 status word readable. `MAX_PROCESSES` is two and root
+    // is one of them, so this create has nowhere to go and is refused with a
+    // STATUS — the caller could not have known the table was full, which is what
+    // keeps this out of the faults ruling.
+    let refused_before = match system.process_create(image: &image_mem,
+                                                     memory: &dest_mem) {
+        case Ok(_) -> false,
+        case Err(_) -> true,
+    }
+
+    // THE RELEASE, WRITTEN AS A DROP. `let _ = move child` consumes the wrapper
+    // and its `deinit` issues the release — there is no typed `release()` method
+    // to call, because dropping IS the spelling (design 3 D-5). With that entry
+    // unbound, no handle in any process's table names slot 1, so the kernel's
+    // reclaim scan frees it.
+    let _ = move child
+
+    let reclaimed_after = match system.process_create(image: &image_mem,
+                                                      memory: &dest_mem) {
+        case Ok(_) -> true,
+        case Err(_) -> false,
+    }
+
+    print("SOS reclaim: refused_before={} reclaimed_after={}\n",
+          flag(refused_before), flag(reclaimed_after))
+    print("SOS reclaim: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

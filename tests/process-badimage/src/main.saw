@@ -48,7 +48,7 @@ func _start(boot_handle: UInt) {
         },
     }
 
-    let image = match proc.boot_handle_next() {
+    var image = match proc.boot_handle_next() {
         case Ok(h) -> h,
         case Err(e) -> {
             print("SOS badimage: no image region: {}\n", e)
@@ -56,7 +56,7 @@ func _start(boot_handle: UInt) {
             return
         },
     }
-    let dest = match proc.boot_handle_next() {
+    var dest = match proc.boot_handle_next() {
         case Ok(h) -> h,
         case Err(e) -> {
             print("SOS badimage: no destination region: {}\n", e)
@@ -65,8 +65,13 @@ func _start(boot_handle: UInt) {
         },
     }
 
+    // The record hands the region over — see `process-lifecycle` for why
+    // `take_memory` is the one way out (sawos design 3 D-5).
+    let image_mem = image.take_memory()!
+    let dest_mem = dest.take_memory()!
+
     // THE ARGUMENTS ARE SWAPPED ON PURPOSE.
-    match system.process_create(image: &dest.memory, memory: &image.memory) {
+    match system.process_create(image: &dest_mem, memory: &image_mem) {
         case Ok(_) -> {
             let _ = system.debug_print("SOS badimage: a region of zeros LOADED\n")
             let _ = system.shutdown(EXIT_FAILED)

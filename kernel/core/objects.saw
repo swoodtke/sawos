@@ -31,6 +31,9 @@ import sosabi.{
     MemoryRight,
     BootHandleKind,
     NO_HANDLE,
+    HANDLE_INDEX_BITS,
+    HANDLE_INDEX_MASK,
+    HANDLE_GENERATION_MODULUS,
 }
 import kcore.limits.{
     MAX_HANDLES,
@@ -40,8 +43,8 @@ import kcore.limits.{
 }
 
 /// One handle-table entry: the object a handle names, the rights its holder has
-/// on it (§3), and WHICH object of that kind it is. The kernel validates all
-/// three on every op.
+/// on it (§3), WHICH object of that kind it is, and which LIFE of this slot it
+/// belongs to.
 ///
 /// `obj_type` is the typed tag; `rights` stays a plain `UInt32` because it is a
 /// MASK — a set of bits, not one of the cases of any kind's rights enum. It is
@@ -51,10 +54,23 @@ import kcore.limits.{
 /// `target` is the object's slot in its kind's table. It was not needed while
 /// the only object was a singleton; with Threads it is the whole point of the
 /// entry, because "which thread" is exactly what a handle answers.
+///
+/// **`gen` SURVIVES THE UNBIND, and that is the whole mechanism** (sawos design
+/// 3 D-1). It is the only field a release does not clear: unbinding zeroes the
+/// binding and INCREMENTS the generation, so the next mint in this slot stamps
+/// a word that no word handed out before it can equal. A stale word therefore
+/// fails the equality test in `lookup_handle` and becomes the `Unbound` answer
+/// the callers already turn into a `BadHandle` fault — which is what makes
+/// use-after-release a DIAGNOSED bug rather than a silent alias onto whatever
+/// took the slot.
+///
+/// It lives in the ENTRY rather than in a parallel array because the two are one
+/// fact about one slot, and a second array would be a second place to forget.
 public(package) struct HandleEntry {
     public(package) obj_type: ObjType,
     public(package) rights: UInt32,
     public(package) target: Int,
+    public(package) gen: UInt32,
 }
 
 /// A System handle the dispatch has VALIDATED (§3).
@@ -214,37 +230,140 @@ public(package) enum SlotState: UInt8 {
     case Live = 1,
 }
 
-/// Every process's handle table, back to back: process `p`'s handle `h`
-/// (1-based, §3's "handle 0 names nothing") lives at `p * MAX_HANDLES + h - 1`.
+/// Every process's handle table, back to back: process `p`'s handle INDEX `i`
+/// (0-based inside the table) lives at `p * MAX_HANDLES + i`, and the word a
+/// process holds carries `i + 1` in its low byte (§3's "handle 0 names
+/// nothing").
+///
+/// Generations start at zero, which is what makes a fresh slot's first word the
+/// bare index — D-1's compatibility rule, and the reason §12's boot order still
+/// hands root 1, 2, 3.
 public(package) unsafe static var HANDLES: [HandleEntry; MAX_PROCESSES * MAX_HANDLES] = [
-    HandleEntry(obj_type: ObjType.Unbound, rights: 0, target: 0);
+    HandleEntry(obj_type: ObjType.Unbound, rights: 0, target: 0, gen: 0);
     MAX_PROCESSES * MAX_HANDLES]
 
 // -----------------------------------------------------------------------------
-// The handle table (spec §3)
+// The handle table (spec §3) and the split word (sawos design 3 D-1)
 // -----------------------------------------------------------------------------
 
-/// Where process `p`'s handle `h` sits in the flat table. Callers have already
-/// range-checked `h`.
-func handle_index(p: Int, h: UInt) unsafe -> Int {
-    p * MAX_HANDLES + (h as Int) - 1
+// THE TABLE MUST FIT THE INDEX FIELD, and this is the module that knows both
+// numbers — `sosabi` owns the encoding and `kcore.limits` owns the table size,
+// so the bound tying them belongs here rather than in either.
+//
+// The comparison is `<=` because the field carries a 1-BASED index: the largest
+// value it must hold is `MAX_HANDLES` itself (naming slot `MAX_HANDLES - 1`),
+// not `MAX_HANDLES - 1`. Zero is spent on "names nothing", which is the whole
+// reason the index is 1-based, so a field of `HANDLE_INDEX_BITS` bits addresses
+// `HANDLE_INDEX_MASK` slots and no more.
+//
+// Raising `MAX_HANDLES` past what the field can hold fails the build here rather
+// than silently aliasing slot 1 onto slot 257.
+static_assert(MAX_HANDLES <= (1 << HANDLE_INDEX_BITS) - 1,
+              "MAX_HANDLES must fit the handle word's index field — raise HANDLE_INDEX_BITS")
+
+/// The Unbound answer — what a word that resolves to nothing looks like.
+///
+/// One constructor rather than three literals, because `lookup_handle` has
+/// three ways to reach it and a reader should be able to see that they are the
+/// SAME answer: the callers turn it into one `BadHandle` fault, so a difference
+/// between them would be a difference with no observer.
+func unbound_entry() -> HandleEntry {
+    HandleEntry(obj_type: ObjType.Unbound, rights: 0, target: 0, gen: 0)
+}
+
+/// The 0-based table index a handle word names, or a number past `MAX_HANDLES`
+/// when it names none.
+///
+/// **THE INDEX FIELD IS 1-BASED, so zero is not an index** — that is the whole
+/// of "handle 0 names nothing", and it is why it survives generations.
+/// `NO_HANDLE` is the index field's zero AT EVERY GENERATION, so a malformed
+/// word like `0x100` (generation 1 over a zero index, at the default split)
+/// names nothing exactly as a plain `0` does. Testing the WORD against
+/// `NO_HANDLE` would have missed that one; testing the FIELD cannot. The 1-based
+/// spelling is also what keeps slot 0 usable and generation 0 free to mean
+/// "first life".
+///
+/// Answering `MAX_HANDLES` for a zero byte rather than a separate signal is
+/// deliberate: the one range test below covers both refusals, so there is one
+/// place that decides what a word can name.
+///
+/// `public(package)` for exactly one caller: the release op, which has a word
+/// and a resolved entry and needs the INDEX to unbind. It gets it from the same
+/// function `lookup_handle` used, so the two can never disagree about which slot
+/// a word names.
+public(package) func handle_word_index(word: UInt) unsafe -> Int {
+    let byte = word & HANDLE_INDEX_MASK
+    if byte == 0 {
+        return MAX_HANDLES
+    }
+    (byte as Int) - 1
+}
+
+/// The generation a handle word claims — everything above its index field.
+///
+/// **IT IS NOT NARROWED AND NOT MASKED**, and both are deliberate. Narrowing to
+/// `UInt32` with `as` would PANIC INSIDE THE KERNEL on a 64-bit profile over a
+/// word a PROCESS chose, which is the one thing a decode at the trap boundary
+/// must never do. Masking to 24 bits would be worse than a panic: it would make
+/// a word with garbage above bit 31 compare EQUAL to a low generation and
+/// RESOLVE, quietly handing out somebody's handle.
+///
+/// Answering the whole field in the word's own width instead makes the
+/// comparison in `lookup_handle` do the range check for free: a stored
+/// generation is always below `HANDLE_GENERATION_MODULUS`, so any word claiming
+/// a wider generation than the portable budget allows equals no entry and names
+/// nothing. That is D-1's "the top half of a 64-bit word stays zero" as an
+/// ENFORCED rule rather than an assumed one.
+func handle_word_generation(word: UInt) unsafe -> UInt {
+    word >> HANDLE_INDEX_BITS
+}
+
+/// Build the word for slot index `i` at generation `gen`.
+///
+/// `gen == 0` yields the bare 1-based index, which is D-1's load-bearing
+/// compatibility rule: a slot's first-life word is what it always was.
+func handle_word(index: Int, gen: UInt32) unsafe -> UInt {
+    ((gen as UInt) << HANDLE_INDEX_BITS) | ((index as UInt) + 1)
 }
 
 /// Resolve a handle in a process's table.
 ///
-/// An out-of-range or unbound handle resolves to `ObjType.Unbound`, and the
-/// rights travel WITH the entry rather than being assumed by the op — the two
-/// properties the M1 version already had, now over a real table.
+/// An out-of-range, unbound or STALE handle resolves to `ObjType.Unbound`, and
+/// the rights travel WITH the entry rather than being assumed by the op — the
+/// two properties the M1 version already had, now over a real table with
+/// generations.
+///
+/// THREE WAYS TO NAME NOTHING and one answer for all of them: a word whose index
+/// byte is not an index (zero at any generation, or past the table), a slot that
+/// holds no binding, and a slot whose GENERATION has moved on since this word
+/// was handed out. The third is design 3 D-1's whole purpose — a word from a
+/// released handle points at a live slot with the wrong life, and the caller's
+/// `BadHandle` fault is the diagnosis.
 public(package) func lookup_handle(p: Int, h: UInt) unsafe -> HandleEntry {
-    if h == NO_HANDLE || h > (MAX_HANDLES as UInt) {
-        return HandleEntry(obj_type: ObjType.Unbound, rights: 0, target: 0)
+    let index = handle_word_index(h)
+    if index >= MAX_HANDLES {
+        return unbound_entry()
     }
-    HANDLES[handle_index(p, h)]
+    let entry = HANDLES[p * MAX_HANDLES + index]
+    match entry.obj_type {
+        case Unbound -> unbound_entry(),
+        case _ -> {
+            if (entry.gen as UInt) != handle_word_generation(h) {
+                return unbound_entry()
+            }
+            entry
+        },
+    }
 }
 
 /// Mint a handle naming `target` of kind `kind` with `rights`, in process `p`'s
 /// table. Returns `NO_HANDLE` when the table is full — an exhaustion the caller
 /// could not have known about, which is what a status is for.
+///
+/// LOWEST FREE INDEX WINS, which is what makes a released slot the one the next
+/// mint reuses — the property `handle_remint` observes. The word it stamps
+/// carries the slot's SURVIVING generation, so the reuse is visible in the word
+/// and the old word is stale rather than aliasing.
 public(package) func mint_handle(p: Int, kind: ObjType, rights: UInt32, target: Int) unsafe -> UInt {
     var h: Int = 0
     while h < MAX_HANDLES {
@@ -253,14 +372,39 @@ public(package) func mint_handle(p: Int, kind: ObjType, rights: UInt32, target: 
             case Unbound -> {
                 HANDLES[p * MAX_HANDLES + h] = HandleEntry(obj_type: kind,
                                                            rights: rights,
-                                                           target: target)
-                return (h as UInt) + 1
+                                                           target: target,
+                                                           gen: entry.gen)
+                return handle_word(h, entry.gen)
             },
             case _ -> {},
         }
         h = h + 1
     }
     NO_HANDLE
+}
+
+/// Unbind the entry at index `i` of process `p`'s table and BUMP its generation.
+///
+/// THE ONE PLACE A BINDING IS DESTROYED — the release op and the teardown's
+/// close-all both come through here, which is what makes "release and teardown
+/// do the same thing to a slot" a fact rather than two implementations that
+/// agree today. It NEVER touches the object the entry named: an object whose
+/// last handle is gone is unreachable-but-live until its process's teardown,
+/// which is the close-all's own long-standing precedent (design 3 D-2). The one
+/// exception is a Gone process's slot, and it is decided by the caller, above
+/// this line.
+///
+/// The generation WRAPS at 2^24 rather than saturating, and the wrap is the
+/// documented limit of the mechanism: after 2^24 reuses of one slot a word can
+/// alias again. That is best-effort bug detection working as ruled, not a hole
+/// to close with unbounded bookkeeping — the table is per-process, so a wrap
+/// collision crosses no boundary and grants nothing.
+public(package) func unbind_handle(p: Int, index: Int) unsafe {
+    let entry = HANDLES[p * MAX_HANDLES + index]
+    let next = (entry.gen + 1) % HANDLE_GENERATION_MODULUS
+    HANDLES[p * MAX_HANDLES + index] = HandleEntry(obj_type: ObjType.Unbound,
+                                                   rights: 0, target: 0,
+                                                   gen: next)
 }
 
 // =============================================================================

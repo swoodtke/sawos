@@ -1,0 +1,118 @@
+// SOS M3 unit 2.75: RELEASE, RE-MINT, AND THE STALE WORD (sawos design 3 D-1;
+// the Aug-17 handle-lifecycle ruling).
+//
+// THE MONEY PROOF of the whole unit, and it is impossible to write before it:
+// there was no way to release a handle, so there was no way for a slot to be
+// reused and no such thing as a stale word.
+//
+// The transcript is read as an ORDER, and each line rules something out:
+//
+//   SOS remint: differs=1 reused=1     <- the re-mint took the SAME slot back
+//                                         and stamped a DIFFERENT word on it
+//   SOS: process fault: bad handle     <- ...and the old word names nothing now
+//   SOS: process teardown ...
+//
+// `differs` is the word moving: the slot's generation SURVIVED the unbind and
+// was incremented by it, so the next mint in that slot cannot produce the word
+// the last one did.
+//
+// `reused` is the harder half, and it is asserted WITHOUT naming the split —
+// which matters, because `HANDLE_INDEX_BITS` is configurable (design 3 D-1, as
+// amended Aug 29) and a test that hardcoded `0xFF` would silently stop checking
+// anything if it moved. The argument is arithmetic instead: a FIRST-LIFE word is
+// the bare index (generation 0 stamps nothing), so it is a small number bounded
+// by the table size; a REUSED slot's word carries generation bits and is
+// therefore larger than any first-life word can be. So the program mints three
+// handles — one it releases, one that must take the freed slot back, and one
+// that must land on a fresh slot — and asserts the reused one's word is GREATER
+// than the fresh one's. Nothing but a generation stamp can make that true.
+//
+// THE FAULT IS THE POINT. Using a handle you released is broken code, which is
+// the sharpened line the Aug-17 ruling drew, and generations are what turn it
+// from an alias onto a stranger's object into a `BadHandle` the kernel names.
+// Best-effort, verbatim from the ruling: a word held across a full wrap of one
+// slot's generation aliases silently. Tables are per-process, so such a
+// collision crosses no boundary and grants nothing.
+//
+// IT GOES THROUGH THE C ALTITUDE, and that is half the claim rather than a
+// shortcut. The typed Saw surface has no word extractor and no word constructor
+// — a `Clock` in hand is one the kernel handed over — so a claim ABOUT a word,
+// and a use of a word the caller has already given up, are both unspellable
+// there. `timer_badclock` reaches this floor for the mirror reason. What the
+// typed layer offers instead is `handle-drop-release`: the same mechanism seen
+// as scopes rather than as numbers.
+
+import sos.{System, ClockType, sos_system_clock_get, sos_handle_release}
+
+static EXIT_FAILED: UInt = 1
+
+/// The status word a successful op answers with (`SosStatus.Ok`). Spelled as a
+/// number because this file works at the C altitude, where a status is one.
+static STATUS_OK: UInt = 0
+
+static YES: UInt = 1
+static NO: UInt = 0
+
+func flag(b: Bool) -> UInt {
+    if b { YES } else { NO }
+}
+
+/// Ask for a Clock, answering the raw handle WORD — or 0, which names nothing,
+/// if the call was refused.
+///
+/// Every ask MINTS (design 3 D-4), so each call here is a fresh capability
+/// instance and a fresh word.
+func ask_clock(handle: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_system_clock_get(handle, ClockType.Monotonic as UInt,
+                                      (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return 0
+    }
+    out
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    // ONE: a handle, at generation 0, so its word is the bare index.
+    let first = ask_clock(boot_handle)
+    if first == 0 {
+        let _ = system.debug_print("SOS remint: no clock\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // TWO: give it back. UNGATED — no right is checked, on any kind — and it
+    // unbinds the entry while INCREMENTING the slot's generation. The object is
+    // untouched: the machine's Clock is kernel-eternal and owned by nobody.
+    let released = sos_handle_release(first)
+    if released != STATUS_OK {
+        let _ = system.debug_print("SOS remint: release refused\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // THREE: ask again. `mint_handle` takes the LOWEST free index, which is the
+    // one just freed, and stamps it with the generation that survived the
+    // unbind — so this word is the same slot at a new life.
+    let again = ask_clock(boot_handle)
+
+    // FOUR: and once more, which must land on a slot that has never been used
+    // and so carries generation 0 — a first-life word, the bare index.
+    let fresh = ask_clock(boot_handle)
+
+    print("SOS remint: differs={} reused={}\n",
+          flag(again != first),
+          flag(again > fresh))
+
+    // FIVE: the old word. It names a live slot at the WRONG life, so it
+    // resolves to nothing and the kernel ends this process — which is the whole
+    // claim, and the reason this case does not exit clean.
+    let _ = system.debug_print("SOS remint: using the word we gave back\n")
+    let _ = sos_handle_release(first)
+
+    let _ = system.debug_print("SOS remint: survived, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

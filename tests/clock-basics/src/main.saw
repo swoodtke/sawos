@@ -3,15 +3,29 @@
 // THE CLAIMS, and each is printed as a DERIVED FACT rather than as a number,
 // because the numbers are a real machine's and no assertion can name them:
 //
-//   same=1               a Clock arrives through the System handle, and asking
-//                        twice returns the SAME handle rather than a second one
-//                        — the getter contract, not a factory's. The teardown
-//                        line is the other half of that evidence: `handles=5`
-//                        after TWO asks, where a second minting would make it
-//                        six. (There is no `clocks=` column to check any more:
-//                        since Aug 17 the machine's Clock is one kernel-eternal
-//                        object per domain, owned by nobody, so a dead process
-//                        frees none.)
+//   minted=1 differs=1   a Clock arrives through the System handle, and asking
+//                        twice MINTS A SECOND HANDLE onto the same object whose
+//                        WORD differs from the first. That is sawos design 3
+//                        D-4 replacing this case's old `same=1` claim, and the
+//                        replacement is a sharpening rather than a loosening:
+//                        §3's no-duplicate rule was never about uniqueness, it
+//                        was about NO AMPLIFICATION, and a mint that carries the
+//                        kind's default rights through a gate the caller already
+//                        passed hands out no authority a second ask could not
+//                        have had the first time. What two instances BUY is
+//                        ownership — each can be released on its own, which is
+//                        what makes the wrapper an owner rather than a name.
+//                        (There is no `clocks=` column to check: since Aug 17
+//                        the machine's Clock is one kernel-eternal object per
+//                        domain, owned by nobody, so a dead process frees none.)
+//
+//                        THE WORD IS READ AT THE C ALTITUDE, and that is not a
+//                        gap in the typed layer but the ruled guarantee showing:
+//                        a typed `Clock` has no word extractor, by design, so a
+//                        claim ABOUT the word can only be made one floor down.
+//                        `timer_badclock` reaches the same floor for the mirror
+//                        reason. The typed half of this claim is the teardown
+//                        count.
 //   monotonic=1          two readings in a row never go backwards.
 //   advanced=1 spanned=1 a reading taken after a spin is strictly greater, and
 //                        the difference covers the interval spun. `advanced`
@@ -31,7 +45,7 @@
 // parked would park the only thread in the system and be reported as the
 // deadlock it is — in microseconds, not at the timeout.
 
-import sos.{System, Process, Clock, ClockType, Timer}
+import sos.{System, Process, Clock, ClockType, Timer, sos_system_clock_get}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
@@ -43,8 +57,35 @@ static NO: UInt = 0
 /// the syscall round trip and far shorter than anything a harness waits for.
 static SPIN_NS: UInt64 = 1000
 
+/// The status word a successful op answers with (`SosStatus.Ok`). Spelled here
+/// because this file reaches the C altitude, where a status is a number.
+static STATUS_OK: UInt = 0
+
 func flag(b: Bool) -> UInt {
     if b { YES } else { NO }
+}
+
+/// Ask for a Clock at the C altitude, answering the raw handle WORD — or 0,
+/// which is `NO_HANDLE` and names nothing, if the call was refused.
+///
+/// **IT GOES ONE FLOOR DOWN BECAUSE THE TYPED LAYER HAS NO WORD EXTRACTOR**,
+/// which is the ruled guarantee rather than a gap: a `Clock` in hand is one the
+/// kernel handed over and there is no way back out to an integer. So a claim
+/// ABOUT the word — that a second ask's differs from the first's — can only be
+/// made here, exactly as `timer_badclock` makes its claim here for the mirror
+/// reason (the typed surface cannot express a bad domain at all).
+///
+/// EACH CALL MINTS (sawos design 3 D-4). Nothing releases these two words, so
+/// both are still bound at the exit and both are counted by the teardown line —
+/// which is the other half of the same claim, in a number.
+func ask_clock(handle: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_system_clock_get(handle, ClockType.Monotonic as UInt,
+                                      (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return 0
+    }
+    out
 }
 
 /// Spin on the clock itself until it reads `deadline` — which dogfoods `now()`
@@ -86,17 +127,23 @@ func _start(boot_handle: UInt) {
         },
     }
 
-    // Asking twice must hand back the same handle. A machine has ONE monotonic
-    // clock — since Aug 17 that is a single kernel-eternal object rather than a
-    // per-process one — so a second handle would be a second name for it, which
-    // §3's no-duplicate rule exists to prevent. The evidence is that the second
-    // ask succeeds AND that the process's table did not grow, which the teardown
-    // line below reports as handles=5.
-    let same = match system.clock_get() {
-        case Ok(_) -> true,
-        case Err(_) -> false,
-    }
-    print("SOS clock: same={}\n", flag(same))
+    // ASKING AGAIN MINTS AGAIN, and the two words DIFFER (sawos design 3 D-4).
+    // A machine has ONE monotonic clock — a single kernel-eternal object since
+    // Aug 17 — and these are two capability INSTANCES naming it, not two objects
+    // and not one handle handed out twice. §3's no-duplicate rule is not
+    // breached: its invariant is NO AMPLIFICATION, and both mints carry the
+    // kind's default rights through the `SystemRight.ClockGet` gate this caller
+    // already passed, so neither ask yields authority the other did not have.
+    //
+    // Two asks at the C altitude rather than one here and one above, so that
+    // BOTH words are visible and the comparison is between two things this line
+    // can see. The teardown line below is the other half: three asks in this
+    // program, three handles still bound at the exit.
+    let first_word = ask_clock(boot_handle)
+    let second_word = ask_clock(boot_handle)
+    print("SOS clock: minted={} differs={}\n",
+          flag(first_word != 0 && second_word != 0),
+          flag(second_word != first_word))
 
     let first: UInt64 = match clock.now() {
         case Ok(t) -> t,

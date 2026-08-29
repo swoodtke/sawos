@@ -1,0 +1,55 @@
+// SOS M3 unit 2.75: A MALFORMED WORD NAMES NOTHING AT EVERY GENERATION (sawos
+// design 3 D-1, as amended by the Aug-29 user note).
+//
+//   SOS malformed: releasing a word whose index field is zero
+//   SOS: process fault: bad handle process=0
+//   SOS: process teardown handles=3 ... process=0
+//
+// **THE REGRESSION THIS EXISTS TO CATCH.** Before the word was split, "names
+// nothing" was `word == NO_HANDLE` and that test was complete. With a split
+// word it is not: `0x100` is a generation of 1 over an index field of ZERO, it
+// is NOT equal to `NO_HANDLE`, and a lookup that kept the old whole-word test
+// would take it as a real handle and index the table with it. The rule the
+// kernel implements instead is that the INDEX FIELD carries a 1-BASED index, so
+// zero is not an index — at any generation — and `lookup_handle` tests the field.
+//
+// THE PROBE IS VALID AT EVERY SPLIT, which matters because `HANDLE_INDEX_BITS`
+// is configurable. At the default eight bits this word is index 0 at generation
+// 1, refused because zero is not an index. At a WIDER index field it is index
+// 256, refused because the table has nothing like that many entries. Either way
+// it names nothing, and either way a kernel that let it through would be reading
+// out of bounds or handing out slot 0 — so the case keeps checking the thing it
+// was written for without knowing where the boundary sits.
+//
+// It is spelled at the C altitude for the reason every case in this family is:
+// the typed layer has no way to build a handle from a word, which is the ruled
+// guarantee, so the mistake only exists one floor down.
+//
+// ONE FAULT PER CASE: a fault ends the process.
+
+import sos.{System, sos_handle_release}
+
+static EXIT_FAILED: UInt = 1
+
+/// A word a hostile or buggy process might write: generation bits set over an
+/// index field of zero.
+///
+/// A DELIBERATE MAGIC NUMBER, which is the one place in this tree that is the
+/// right thing to write. It is not derived from `HANDLE_INDEX_BITS` because the
+/// point is that it is UNTRUSTED INPUT — a number chosen by the process, not by
+/// the encoding — and the claim is that the kernel refuses it whatever the
+/// encoding happens to be. See the header for why it is refused at every split.
+static MALFORMED: UInt = 0x100
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let _ = system.debug_print("SOS malformed: releasing a word whose index field is zero\n")
+
+    // Does not return.
+    let _ = sos_handle_release(MALFORMED)
+
+    let _ = system.debug_print("SOS malformed: survived, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

@@ -92,9 +92,12 @@ public(package) struct ThreadSlot {
     /// machine is still described here and nowhere else.
     public(package) state: ThreadState,
     public(package) process: Int,
-    /// This thread's own handle in its process's table — what `ThreadSelf`
-    /// hands back, kept here so the derivation is a read rather than a search.
-    public(package) self_handle: UInt,
+    // (`self_handle` WAS HERE and is GONE — sawos design 3 D-4. It cached the
+    // word `ThreadSelf` handed back, which was a fact about the thread only
+    // while a getter answered the same handle every ask. Mint-per-call makes a
+    // thread's own handle a capability INSTANCE the caller owns and may release,
+    // so there is no single word to cache and a cached one would go stale at the
+    // first release. `ProcessSlot.self_handle` went with it.)
     public(package) exit_code: UInt,
     /// Head of the list of threads blocked joining THIS one (slot + 1).
     public(package) joiners: Int,
@@ -111,7 +114,7 @@ public(package) struct ThreadSlot {
 }
 
 public(package) unsafe static var THREADS: [ThreadSlot; MAX_THREADS] = [
-    ThreadSlot(state: ThreadState.Free, process: 0, self_handle: 0,
+    ThreadSlot(state: ThreadState.Free, process: 0,
                exit_code: 0, joiners: 0, link: 0, wait_buf: 0); MAX_THREADS]
 
 /// The running thread's slot, or `NO_THREAD`.

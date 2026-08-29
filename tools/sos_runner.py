@@ -188,6 +188,27 @@ PROCESS_BOOTDRAIN_PKG = os.path.join(TESTS_DIR, "process-bootdrain")
 CHILD_FAULT_PKG = os.path.join(TESTS_DIR, "child-fault")
 CHILD_POKE_PKG = os.path.join(TESTS_DIR, "child-poke")
 
+# sawos design 3 (M3 unit 2.75): the handle lifecycle. SEVEN packages, and the
+# split is the house rule taken literally — one claim per image — plus one fact
+# about this unit that forces it: five of the seven end in a FAULT, and a fault
+# ends the process, so a second probe after one would never run. Three of them
+# (`nothing`, `twice`, `malformed`) are the three shapes of "this word resolves
+# to no object", which is one ANSWER from the kernel and three different
+# mistakes from a caller.
+#
+# FOUR REACH THE C ALTITUDE, and that is a claim rather than a shortcut: the
+# typed Saw surface has no word extractor and no word constructor, so a handle
+# word cannot be compared, re-used after release, or forged there at all.
+# `handle-drop-release` is the same mechanism seen from the typed side, where
+# release is spelled by a value going out of scope and no word appears.
+HANDLE_REMINT_PKG = os.path.join(TESTS_DIR, "handle-remint")
+HANDLE_RELEASE_UNGATED_PKG = os.path.join(TESTS_DIR, "handle-release-ungated")
+HANDLE_RELEASE_NOTHING_PKG = os.path.join(TESTS_DIR, "handle-release-nothing")
+HANDLE_RELEASE_TWICE_PKG = os.path.join(TESTS_DIR, "handle-release-twice")
+HANDLE_MALFORMED_WORD_PKG = os.path.join(TESTS_DIR, "handle-malformed-word")
+HANDLE_DROP_RELEASE_PKG = os.path.join(TESTS_DIR, "handle-drop-release")
+PROCESS_RECLAIM_PKG = os.path.join(TESTS_DIR, "process-reclaim")
+
 CLOCK_BASICS_PKG = os.path.join(TESTS_DIR, "clock-basics")
 TIMER_ONESHOT_PKG = os.path.join(TESTS_DIR, "timer-oneshot")
 TIMER_INTERVAL_PKG = os.path.join(TESTS_DIR, "timer-interval")
@@ -343,6 +364,12 @@ def expectations(arch):
         "five": f"0x{5:0{width}x}",
         "six": f"0x{6:0{width}x}",
         "seven": f"0x{7:0{width}x}",
+        # sawos design 3 D-6: the getters MINT now, so handle counts rose and
+        # the placeholder list had to grow past seven. `ten` is thread-basics,
+        # where three threads each derive their own Process and Thread handles.
+        "eight": f"0x{8:0{width}x}",
+        "nine": f"0x{9:0{width}x}",
+        "ten": f"0x{10:0{width}x}",
         "prio": f"0x{0x01010100:0{width}x}",
         "irq_line": f"0x{arch['selftest_line']:0{width}x}",
     }
@@ -720,14 +747,22 @@ TEST_CASES = [
                        "SOS threads: two workers, status word 0",
                        "ABABABAB",
                        "SOS threads: joined a=11 b=22",
-                       # The ratified Process teardown, reported: three handles
-                       # (System, Process, the initial Thread) plus the two the
-                       # process made, and three thread slots. The two trailing
-                       # counts arrived with M2 unit 3 and are asserted here too
-                       # — a process that made no Event and no Waiter must
-                       # report none, which is the null row of the same claim
-                       # the Event cases below make with real objects.
-                       "SOS: process teardown handles={five} threads={three} "
+                       # The ratified Process teardown, reported. TEN handles
+                       # since sawos design 3 D-6, and the arithmetic is the
+                       # mint-per-call claim at its loudest: the three §12 boot
+                       # handles, the two Threads this process created, and then
+                       # FIVE derivations — each of the three threads asks the
+                       # System object which Process it is, and the two workers
+                       # additionally ask the Process which Thread they are.
+                       # Under the old getter model those five reads answered
+                       # cached words and minted nothing, which is what made
+                       # this five. Nothing is released before the exit, so
+                       # every one of them is still bound at teardown.
+                       # The two trailing counts arrived with M2 unit 3 and are
+                       # asserted here too — a process that made no Event and no
+                       # Waiter must report none, which is the null row of the
+                       # same claim the Event cases below make with real objects.
+                       "SOS: process teardown handles={ten} threads={three} "
                        "events={zero} waiters={zero}"],
         "expect_clean_exit": True,
     },
@@ -825,8 +860,13 @@ TEST_CASES = [
                        "saturated=1",
                        "SOS events: done",
                        # Teardown reports the two new object kinds: three events
-                       # and one waiter, beside seven handles and one thread.
-                       "SOS: process teardown handles={seven} threads={one} "
+                       # and one waiter, beside EIGHT handles and one thread.
+                       # Eight rather than seven since sawos design 3 D-6:
+                       # `process_self()` MINTS now, where it used to answer a
+                       # word cached on the process slot. The +1 is that mint,
+                       # and it is the same +1 on every single-threaded case
+                       # below.
+                       "SOS: process teardown handles={eight} threads={one} "
                        "events={three} waiters={one}"],
         "expect_clean_exit": True,
     },
@@ -889,10 +929,12 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS dupkey: first attach ok",
                        "SOS: process fault: an attachment already uses that key",
-                       # Six handles — the three it was given plus a waiter and
+                       # Seven handles — the three it was given, the Process
+                       # handle `process_self()` MINTED (sawos design 3 D-6:
+                       # +1 where a cached word used to be reused), a waiter and
                        # two events — and both events and the waiter still go
                        # back to their slabs.
-                       "SOS: process teardown handles={six} threads={one} "
+                       "SOS: process teardown handles={seven} threads={one} "
                        "events={two} waiters={one}"],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
@@ -997,7 +1039,10 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS badline: binding a line this board lacks",
                        "SOS: process fault: argument outside its domain",
-                       "SOS: process teardown handles={three} threads={one} "
+                       # Four rather than three since sawos design 3 D-6: the
+                       # `process_self()` this case makes before it binds now
+                       # MINTS a handle instead of answering a cached word.
+                       "SOS: process teardown handles={four} threads={one} "
                        "events={zero} waiters={zero} interrupts={zero}"],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
@@ -1013,7 +1058,9 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS earlyack: bound, acking without a fire",
                        "SOS: process fault: object in the wrong state",
-                       "SOS: process teardown handles={four} threads={one} "
+                       # Five rather than four: the design-3 D-6 `process_self`
+                       # mint, as everywhere in this file.
+                       "SOS: process teardown handles={five} threads={one} "
                        "events={zero} waiters={zero} interrupts={one}"],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
@@ -1036,7 +1083,9 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS deadlock: waiting for a signal nobody sends",
                        "SOS: process fault: every thread blocked",
-                       "SOS: process teardown handles={five} threads={one} "
+                       # Six rather than five: the design-3 D-6 `process_self`
+                       # mint.
+                       "SOS: process teardown handles={six} threads={one} "
                        "events={one} waiters={one} interrupts={zero}"],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
@@ -1056,13 +1105,18 @@ TEST_CASES = [
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": CLOCK_BASICS_PKG,
         "expect_out": ["{banner}",
-                       # Asking twice hands back the SAME handle — the machine's
-                       # one monotonic Clock is a single kernel-eternal object
-                       # (Aug 17), so there is nothing a second ask could mint a
-                       # second name for. The teardown line below carries no
-                       # `clocks=` column for the same reason: a process owns no
-                       # clock, so a dead one frees none.
-                       "SOS clock: same=1",
+                       # ASKING TWICE MINTS TWICE, which is sawos design 3 D-4
+                       # replacing this row's old `same=1` claim. `minted=1` is
+                       # the second ask succeeding and `differs=1` is its WORD
+                       # being a different one — two capability INSTANCES onto
+                       # the machine's single kernel-eternal Clock, each
+                       # independently owned and independently releasable. It
+                       # amplifies nothing: `SystemRight.ClockGet` gates the
+                       # minting and every mint carries the kind's default
+                       # rights. The teardown line below still carries no
+                       # `clocks=` column, and for the unchanged reason: a
+                       # process owns no clock, so a dead one frees none.
+                       "SOS clock: minted=1 differs=1",
                        "SOS clock: monotonic=1",
                        # `advanced` alone would pass on a counter of anything;
                        # `spanned` is what says the units are NANOSECONDS.
@@ -1072,7 +1126,15 @@ TEST_CASES = [
                        # already expired could not be cancelled safely.
                        "SOS clock: disarm_unarmed=1",
                        "SOS clock: done",
-                       "SOS: process teardown handles={five} threads={one} "
+                       # EIGHT, AND THE ARITHMETIC IS THE MINT-PER-CALL CLAIM IN
+                       # A NUMBER: the three §12 boot handles, the Process
+                       # handle `process_self()` minted, THREE Clock handles for
+                       # three asks, and the Timer. Under the old getter model
+                       # the three asks were one handle and `process_self` was
+                       # none, which is what made this five. Nothing here is
+                       # released — `handle_drop_release` below is the case that
+                       # proves the other direction.
+                       "SOS: process teardown handles={eight} threads={one} "
                        "events={zero} waiters={zero} interrupts={zero} "
                        "timers={one}"],
         "expect_clean_exit": True,
@@ -1096,7 +1158,9 @@ TEST_CASES = [
                        # be reached by arming again — no ack, no re-attach.
                        "SOS oneshot: rearmed woke fires=1",
                        "SOS oneshot: done",
-                       "SOS: process teardown handles={six} threads={one} "
+                       # Seven rather than six: the design-3 D-6 `process_self`
+                       # mint.
+                       "SOS: process teardown handles={seven} threads={one} "
                        "events={zero} waiters={one} interrupts={zero} "
                        "timers={one}"],
         "expect_clean_exit": True,
@@ -1132,7 +1196,9 @@ TEST_CASES = [
                        # would report the coalesced total here instead.
                        "SOS interval: drained fires=1",
                        "SOS interval: done",
-                       "SOS: process teardown handles={six} threads={one} "
+                       # Seven rather than six: the design-3 D-6 `process_self`
+                       # mint.
+                       "SOS: process teardown handles={seven} threads={one} "
                        "events={zero} waiters={one} interrupts={zero} "
                        "timers={one}"],
         "expect_clean_exit": True,
@@ -1151,7 +1217,9 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS timerdead: waiting on a timer nobody armed",
                        "SOS: process fault: every thread blocked",
-                       "SOS: process teardown handles={six} threads={one} "
+                       # Seven rather than six: the design-3 D-6 `process_self`
+                       # mint.
+                       "SOS: process teardown handles={seven} threads={one} "
                        "events={zero} waiters={one} interrupts={zero} "
                        "timers={one}"],
         "expect_clean_exit": False,
@@ -1225,10 +1293,11 @@ TEST_CASES = [
                        # three, and the count restarts from zero.
                        "SOS consume: sum key=22 at-wait=3 after=0",
                        "SOS consume: done",
-                       # Six handles — the three it was given plus a waiter and
-                       # two events — one thread, and both events back on the
-                       # slab.
-                       "SOS: process teardown handles={six} threads={one} "
+                       # Seven handles — the three it was given, the Process
+                       # handle `process_self()` minted (design 3 D-6), a waiter
+                       # and two events — one thread, and both events back on
+                       # the slab.
+                       "SOS: process teardown handles={seven} threads={one} "
                        "events={two} waiters={one}"],
         "expect_clean_exit": True,
     },
@@ -1412,6 +1481,176 @@ TEST_CASES = [
                        "SOS bootdrain: n=2 tags=1 kinds=0",
                        "SOS bootdrain: exhausted, and still exhausted",
                        "SOS bootdrain: done"],
+        "expect_clean_exit": True,
+    },
+    # =========================================================================
+    # M3 unit 2.75 — the handle lifecycle (sawos design 3)
+    # =========================================================================
+    #
+    # Seven cases, and every one of them is IMPOSSIBLE OR SILENTLY WRONG before
+    # this unit: there was no release op, so a slot was never reused, so there
+    # was no such thing as a stale word — and the wrappers were copyable values
+    # whose drop did nothing.
+    #
+    # The three mechanisms land together because each alone is broken.
+    # Mint-per-call without release is a leak by design (`handle-drop-release`
+    # is what makes the pairing visible). Release without generations is
+    # aliasing (`handle-remint` is the money proof that it is not). And a
+    # release op beside COPYABLE wrappers is a stale-fault factory, which is
+    # what the Aug-29 drop-is-release ruling closed.
+    {
+        # THE MONEY PROOF: a released handle's word does not name its slot's
+        # next occupant, it names NOTHING, and the kernel says so.
+        #
+        # `reused=1` is asserted without naming the split — see the source
+        # header for the arithmetic. `HANDLE_INDEX_BITS` is configurable, and a
+        # case that hardcoded `0xFF` would silently stop checking anything the
+        # day it moved.
+        "name": "handle_remint",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HANDLE_REMINT_PKG,
+        "expect_out": ["{banner}",
+                       "SOS remint: differs=1 reused=1",
+                       "SOS remint: using the word we gave back",
+                       "SOS: process fault: bad handle process={zero}",
+                       # Five bound at the fault: §12's three, plus the two
+                       # Clock handles still held (the re-mint and the fresh
+                       # one). The one that was released is not among them,
+                       # which is the count's own small statement.
+                       "SOS: process teardown handles={five} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # THE ONLY CLEAN EXIT IN THE FAMILY, and that is the assertion: a
+        # release is an ordinary successful op. No right is checked, and the
+        # slot it frees is available to the very next ask.
+        "name": "handle_release_ungated",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HANDLE_RELEASE_UNGATED_PKG,
+        "expect_out": ["{banner}",
+                       "SOS release: ungated=1 refilled=1",
+                       "SOS release: done",
+                       # Five: §12's three, the minted Process handle, and the
+                       # ONE Clock left after a mint, a release and a re-mint.
+                       "SOS: process teardown handles={five} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={zero}"],
+        "expect_clean_exit": True,
+    },
+    {
+        # `NO_HANDLE` names nothing, so releasing it is asking to destroy a
+        # capability the caller never had — the ordinary `BadHandle` fault.
+        # The teardown's THREE is §12's boot set and nothing else: this process
+        # derives nothing before it dies, which is what makes the number a
+        # statement about the fault rather than about what it happened to hold.
+        "name": "handle_release_nothing",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HANDLE_RELEASE_NOTHING_PKG,
+        "expect_out": ["{banner}",
+                       "SOS releasenothing: releasing a word that names nothing",
+                       "SOS: process fault: bad handle process={zero}",
+                       "SOS: process teardown handles={three} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # THE SAME ANSWER FOR A DIFFERENT MISTAKE, and the first line is what
+        # separates the two: the word released here was VALID one instruction
+        # earlier. What makes the second call a fault is the entry's LIFE having
+        # moved on, which is the generation doing the only job it has.
+        #
+        # This is also the shape a buggy transfer funnel would land in — a
+        # diagnosed fault naming the process, never a silent alias.
+        "name": "handle_release_twice",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HANDLE_RELEASE_TWICE_PKG,
+        "expect_out": ["{banner}",
+                       "SOS releasetwice: first release ok=1",
+                       "SOS releasetwice: releasing the same word again",
+                       "SOS: process fault: bad handle process={zero}",
+                       # Three: the Clock this program minted is the one it
+                       # released, so §12's boot set is all that is left. FOUR
+                       # would mean the first release did not unbind.
+                       "SOS: process teardown handles={three} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # THE REGRESSION THE SPLIT WORD INTRODUCED, pinned. `0x100` is not equal
+        # to `NO_HANDLE`, so a lookup that kept the old whole-word test would
+        # take it for a handle and index the table with a zero. The rule that
+        # refuses it is that the INDEX FIELD is 1-based, so zero is not an index
+        # at any generation — and the probe stays valid at every split, since a
+        # wider index field makes this word an out-of-range index instead.
+        "name": "handle_malformed_word",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HANDLE_MALFORMED_WORD_PKG,
+        "expect_out": ["{banner}",
+                       "SOS malformed: releasing a word whose index field is "
+                       "zero",
+                       "SOS: process fault: bad handle process={zero}",
+                       "SOS: process teardown handles={three} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # DROP IS RELEASE, from the TYPED side — the one case in this family
+        # that never names a handle word. Four Clock handles are minted; three
+        # die in an inner scope and one is kept, and the teardown counts FIVE
+        # (§12's three, the minted Process handle, the kept Clock). EIGHT would
+        # be mint-per-call without RAII, which is a leak by design and is why
+        # the two halves could not land apart.
+        #
+        # `scoped=3` is an assertion about the TIMING as well: the handle is
+        # USED inside the scope, so a release that ran too early would fault the
+        # process there rather than quietly changing a count.
+        "name": "handle_drop_release",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HANDLE_DROP_RELEASE_PKG,
+        "expect_out": ["{banner}",
+                       "SOS droprelease: scoped=3 kept=1",
+                       "SOS droprelease: done",
+                       "SOS: process teardown handles={five} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={zero}"],
+        "expect_clean_exit": True,
+    },
+    {
+        # THE ONE SLAB THAT RECLAIMS ON RELEASE (D-3), closing unit 2's pend.
+        # Both flags are asserted in one line because either alone is
+        # misleading: `refused_before` is unit 2's behaviour still holding while
+        # a reader exists, and `reclaimed_after` is the reader-count reaching
+        # zero. A kernel that reclaimed eagerly would pass the second and fail
+        # the first, and lose the supervision story with it.
+        #
+        # It reuses the child-fault package, and both creates load the same
+        # image into the same RAM — the first child's remains are nothing the
+        # kernel tracks.
+        "name": "process_reclaim",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PROCESS_RECLAIM_PKG,
+        "children": [CHILD_FAULT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS reclaim: started",
+                       # The child dies first, and the teardown names PROCESS 1
+                       # — the same two lines `process_lifecycle` asserts, here
+                       # only as the precondition for what follows.
+                       "SOS: process fault: bad handle process={one}",
+                       "SOS: process teardown handles={zero} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS reclaim: refused_before=1 reclaimed_after=1",
+                       "SOS reclaim: done"],
         "expect_clean_exit": True,
     },
 ]

@@ -1,0 +1,78 @@
+// SOS M3 unit 2.75: RELEASING ONE WORD TWICE IS A FAULT (sawos design 3 D-2;
+// the Aug-17 handle-lifecycle ruling).
+//
+//   SOS releasetwice: first release ok=1
+//   SOS releasetwice: releasing the same word again
+//   SOS: process fault: bad handle process=0
+//   SOS: process teardown handles=3 ... process=0
+//
+// THE FIRST LINE IS WHY THIS IS A SEPARATE CASE FROM `handle-release-nothing`.
+// The word released here was VALID one instruction earlier — the kernel said
+// `Ok` — so what makes the second call a fault is not the number's shape but the
+// entry's LIFE having moved on. That is the generation doing the only job it has
+// (design 3 D-1), and it is the difference between "you wrote a number that was
+// never a handle" and "you used a handle after giving it back".
+//
+// It is also the mechanism that makes the wrapper discipline safe to get wrong.
+// A transfer funnel that released a word it had already handed to the kernel
+// would land exactly here: a diagnosed `BadHandle` naming the process, never a
+// silent alias onto whatever took the slot.
+//
+// THE TEARDOWN COUNT is three — §12's boot set — because the Clock handle this
+// program minted is the one it released, and nothing else was derived. A count
+// of four would mean the first release did not unbind.
+//
+// ONE FAULT PER CASE: a fault ends the process, so this cannot be an arm of
+// another case.
+
+import sos.{System, ClockType, sos_system_clock_get, sos_handle_release}
+
+static EXIT_FAILED: UInt = 1
+
+/// The status word a successful op answers with (`SosStatus.Ok`).
+static STATUS_OK: UInt = 0
+
+static YES: UInt = 1
+static NO: UInt = 0
+
+func flag(b: Bool) -> UInt {
+    if b { YES } else { NO }
+}
+
+/// Ask for a Clock, answering the raw handle WORD — or 0, which names nothing.
+func ask_clock(handle: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_system_clock_get(handle, ClockType.Monotonic as UInt,
+                                      (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return 0
+    }
+    out
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let word = ask_clock(boot_handle)
+    if word == 0 {
+        let _ = system.debug_print("SOS releasetwice: no clock\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // THE WORD IS GOOD, and the kernel says so. Everything after this line is
+    // about the same number having stopped being a handle.
+    let ok = sos_handle_release(word) == STATUS_OK
+    print("SOS releasetwice: first release ok={}\n", flag(ok))
+
+    let _ = system.debug_print("SOS releasetwice: releasing the same word again\n")
+
+    // Does not return. The entry is unbound AND its generation has moved, so
+    // this word resolves to nothing whichever of the two the kernel notices
+    // first.
+    let _ = sos_handle_release(word)
+
+    let _ = system.debug_print("SOS releasetwice: survived, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

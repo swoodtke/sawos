@@ -50,10 +50,10 @@ import kcore.result.{op_value, write_result}
 import kcore.diag.{ExitCode, console}
 import kcore.objects.{
     HANDLES,
-    HandleEntry,
     MEMORIES,
     MemorySlot,
     SlotState,
+    unbind_handle,
 }
 import kcore.threads.{
     CURRENT_THREAD,
@@ -82,7 +82,8 @@ import kcore.waitables.{
     WaitableKind,
     WaiterSlot,
 }
-import kcore.process.{PROCESSES, ProcessState, clear_domain, load_domain}
+import kcore.process.{PROCESSES, ProcessState, clear_domain, load_domain,
+                      reclaim_process_slot}
 import kcore.irq.{has_external_wake_source, idle_until_runnable}
 
 // =============================================================================
@@ -290,14 +291,22 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     PROCESSES[p].exit_kind = kind
     PROCESSES[p].exit_code = code
 
+    // THE CLOSE-ALL GOES THROUGH `unbind_handle` (sawos design 3 D-1), which is
+    // what makes a teardown and a release do the SAME thing to a slot: zero the
+    // binding, BUMP the generation. It matters even though the whole table is
+    // about to belong to somebody else — a process slot is reclaimable now
+    // (D-3), so these very entries can be minted into again, and a word from the
+    // dead process's life must not resolve in the next one's.
+    //
+    // It still touches only the ENTRY and never the OBJECT: what the process
+    // owned is freed by the loops below, per slab, exactly as before.
     var closed: UInt = 0
     var h: Int = 0
     while h < MAX_HANDLES {
         match HANDLES[p * MAX_HANDLES + h].obj_type {
             case Unbound -> {},
             case _ -> {
-                HANDLES[p * MAX_HANDLES + h] = HandleEntry(obj_type: ObjType.Unbound,
-                                                           rights: 0, target: 0)
+                unbind_handle(p, h)
                 closed = closed + 1
             },
         }
@@ -320,7 +329,7 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
                 case Free -> {},
                 case _ -> {
                     THREADS[t] = ThreadSlot(state: ThreadState.Free, process: 0,
-                                            self_handle: 0, exit_code: 0,
+                                            exit_code: 0,
                                             joiners: 0, link: 0, wait_buf: 0)
                     freed = freed + 1
                 },
@@ -469,6 +478,17 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // invalidated with them — a later process landing in this slot must not
     // compare equal to a domain that is no longer installed.
     clear_domain(p)
+
+    // AND THE SLOT ITSELF, IF NOBODY CAN STILL READ IT (sawos design 3 D-3).
+    // The dying process's own handles were closed at the top of this function,
+    // so this is the point at which the reader-count is finally right — and a
+    // process that happened to hold the last handle onto its own slot (or onto
+    // itself) frees it here rather than leaving a `Gone` slot nothing can ever
+    // reach. The usual case is the opposite one and is why the check has to ask
+    // rather than assume: a CREATOR's handle onto its dead child normally
+    // survives, which is what keeps the §8 status word readable, and that
+    // creator's release is what frees the slot later.
+    reclaim_process_slot(p)
 
     let uart = console()
     uart.write_str("SOS: process teardown handles=")

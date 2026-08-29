@@ -72,7 +72,7 @@ func _start(boot_handle: UInt) {
     // comment and the two `let`s below — is what says which is which: row 0 is
     // the child's image blob, row 1 is the RAM it will run in. The kernel knows
     // neither.
-    let image = match proc.boot_handle_next() {
+    var image = match proc.boot_handle_next() {
         case Ok(h) -> h,
         case Err(e) -> {
             print("SOS lifecycle: no image region: {}\n", e)
@@ -80,7 +80,7 @@ func _start(boot_handle: UInt) {
             return
         },
     }
-    let dest = match proc.boot_handle_next() {
+    var dest = match proc.boot_handle_next() {
         case Ok(h) -> h,
         case Err(e) -> {
             print("SOS lifecycle: no destination region: {}\n", e)
@@ -90,10 +90,19 @@ func _start(boot_handle: UInt) {
     }
     print("SOS lifecycle: boot regions tag0={} tag1={}\n", image.tag, dest.tag)
 
+    // THE RECORD HANDS THE REGION OVER (sawos design 3 D-5). A `Memory` is a
+    // `NoCopy` wrapper whose drop releases the handle, so it has exactly one
+    // owner — and `take_memory` is the one way out of the record, which is what
+    // makes this frame that owner. A record whose region is never taken releases
+    // it when the record drops, which is the right default for an iterator entry
+    // a launcher looked at and did not want.
+    let image_mem = image.take_memory()!
+    let dest_mem = dest.take_memory()!
+
     // PHASE ONE. Two capabilities and no numbers: root never reads the image,
     // never computes a load address and never chooses a stack.
-    let child = match system.process_create(image: &image.memory,
-                                            memory: &dest.memory) {
+    let child = match system.process_create(image: &image_mem,
+                                            memory: &dest_mem) {
         case Ok(c) -> c,
         case Err(e) -> {
             print("SOS lifecycle: create failed: {}\n", e)

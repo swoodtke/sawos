@@ -95,6 +95,7 @@ import sosabi.{SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp, InterruptOp,
                SystemHandle, ProcessHandle, ThreadHandle, EventHandle,
                WaiterHandle, InterruptHandle, ClockHandle, TimerHandle,
                MemoryHandle,
+               RELEASE_OP, NO_HANDLE,
                WaitTag, WAIT_RECORD_WORDS, WAIT_KEY_WORD, WAIT_TAG_WORD,
                WAIT_PAYLOAD_WORD, wait_record_bytes,
                BOOT_HANDLE_RECORD_WORDS, BOOT_HANDLE_TAG_WORD,
@@ -515,9 +516,79 @@ public func sos_timer_disarm(handle: UInt) -> UInt {
     sos_syscall1(handle, TimerOp.Disarm as UInt, 0)
 }
 
+/// **RELEASE — destroy this handle, whatever kind it names** (sawos design 3
+/// D-2). The ONE spelling of release in this module.
+///
+/// It is not `sos_<object>_release` nine times, because release is not an op on
+/// any object: it is one universal op number the kernel intercepts before it
+/// has decided the kind, so there is one function here for the same reason there
+/// is one op number there.
+///
+/// **UNGATED.** No right is checked. A handle is a capability INSTANCE and the
+/// object's identity lives in its slot, so destroying your own instance takes
+/// nothing from anybody else holding one. Releasing your System handle or your
+/// own Process handle is legal-but-doomed: you lose the authority, which is what
+/// you asked for.
+///
+/// **A WORD THAT DOES NOT RESOLVE TERMINATES THE PROCESS.** `NO_HANDLE`, a
+/// malformed word, a word whose handle was already released — all of them are
+/// the ordinary `BadHandle` fault, because using a handle you released is broken
+/// code and the kernel's generations exist to diagnose it rather than to
+/// tolerate it. This function therefore does not return on that path, and its
+/// status word is only ever `Ok`.
+///
+/// TYPED SAW CALLERS DO NOT WRITE THIS. In the typed layer release is DROPPING
+/// the wrapper — that is what its `deinit` does, and this is the syscall the
+/// deinit issues. It is public because the C altitude is the floor and a non-Saw
+/// process needs a way to say it; a Saw process that reaches for it is working
+/// with raw words, which is a thing only the raw altitude does.
+@export("sos_handle_release")
+public func sos_handle_release(handle: UInt) -> UInt {
+    sos_syscall1(handle, RELEASE_OP, 0)
+}
+
 // =============================================================================
-// The typed Saw surface
+// The typed Saw surface — and the OWNING tier (sawos design 3 D-5)
 // =============================================================================
+//
+// **ALL NINE WRAPPERS ARE `NoCopy`, AND DROP IS RELEASE** (the Aug-29 user
+// ruling). Each holds one handle word and one hand-written `deinit` that
+// releases it, so a wrapper going out of scope destroys the capability instance
+// it owned — RAII, over kernel handles, with the kernel's own generations
+// backstopping it.
+//
+// WHY THE TWO HALVES HAD TO LAND TOGETHER. A release op beside COPYABLE wrappers
+// is a stale-fault factory: copy a `Clock`, let one copy drop, and the sibling's
+// next use is a `BadHandle` fault the program did nothing to deserve. `NoCopy`
+// is what makes "this value owns that word" true, and it is what §3's
+// no-DUPLICATE rule always meant at this altitude.
+//
+// **THE DISARM SENTINEL IS THE WORD FIELD ITSELF**, which costs no second field
+// and cannot get out of step with one: `NO_HANDLE` is unrepresentable as a LIVE
+// handle (design 3 D-1 makes it the index byte's zero at every generation), so
+// a field holding it is exactly a wrapper that has already given its word away.
+//
+// **THERE IS NO TYPED `release()` METHOD, deliberately.** Early release is
+// dropping the value — `let _ = move clock` — which is one concept for the
+// reader instead of two ways to say it, and it is the same spelling every other
+// owning type in Saw uses. A `release()` beside a RAII deinit would also be a
+// second way to reach the disarmed state, which is precisely the state the
+// sentinel exists to make unreachable from user code.
+//
+// **THE TRANSFER-FUNNEL CONTRACT, recorded now for unit 3's `give` and M4's
+// pipes.** When a kernel op MOVES the word out of the caller's table, the sysapi
+// funnel that owns that syscall CONSUMES the wrapper, reads the word, sets the
+// field to `NO_HANDLE` BEFORE issuing the syscall, and lets the disarmed value
+// drop. Disarm-before-syscall is the deliberate order: every failure of such a
+// syscall is a FAULT (the process ends, and teardown covers everything it held),
+// so there is no path on which a disarmed-but-unsent word leaks. User code never
+// touches the sentinel. Generations are the backstop: a funnel bug that released
+// after a transfer is a diagnosed `BadHandle` fault, never corruption.
+//
+// **`shutdown()` NEVER RETURNS**, so wrappers live at that moment never run
+// their deinit and die in the kernel's teardown instead. That is the backstop
+// working as designed rather than a leak, and the transcript's `handles=` count
+// is what says which path each handle took.
 
 /// A handle to the kernel's System object — in M1 the whole of a process's
 /// authority (§12's boot handle set, one handle wide today).
@@ -528,12 +599,36 @@ public func sos_timer_disarm(handle: UInt) -> UInt {
 /// still costs nothing — the alias flows to `UInt` implicitly at the stub, so
 /// the calls below pass `self.handle` with no cast and no conversion is emitted.
 ///
-/// Real handles will be `NoCopy` with a `Deinit` that closes them (§4); this
-/// one is a plain value because M1 has no close op and root holds its handle
-/// for the life of the machine. That is the second tier and it is additive:
-/// the `NoCopy` wrapper takes this alias as its payload.
+/// **IT IS `NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5),
+/// which is the OWNING tier this docstring used to promise for "§4" — it is
+/// built. A `System` is a capability instance, not a description of one, so it
+/// cannot be duplicated and its scope is its life.
+///
+/// **ROOT'S OWN `System` NORMALLY DIES IN THE KERNEL'S TEARDOWN, not here**, and
+/// that is not an oversight: a root server's last act is `shutdown()` or
+/// `exit()`, neither of which returns, so the deinit below is never reached and
+/// the handle is closed by the process teardown along with everything else. The
+/// deinit is what covers the cases that DO fall out of a scope.
 public struct System {
     handle: SystemHandle,
+}
+
+extension System: NoCopy {
+    /// DROP IS RELEASE. The word field doubles as the disarm flag because
+    /// `NO_HANDLE` cannot name a live handle at any generation; a transfer
+    /// funnel writes it there before handing the word to the kernel, and this
+    /// deinit then has nothing to do.
+    ///
+    /// The status is discarded because there is nobody to report it to — a
+    /// deinit runs at a point no source construct names, so it has no error
+    /// channel and needs none: the only way this call fails is a word that does
+    /// not resolve, which the kernel answers by ending the process rather than
+    /// by returning.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
 }
 
 extension System {
@@ -575,9 +670,16 @@ extension System {
     /// This process's own Process object (§3's derivation rule: a handle is
     /// obtained through a handle already held). Requires `SystemRight.Manage`.
     ///
-    /// The same handle every time — the process's table has ONE entry naming
-    /// it, and §3 forbids duplicating a handle — so calling this twice is a
-    /// query, not two capabilities.
+    /// **A FRESH HANDLE EVERY TIME** (sawos design 3 D-4), which supersedes this
+    /// method's old "the same handle every time". Calling it twice is two
+    /// capability INSTANCES of one authority, each independently owned and
+    /// independently released — which is what makes the `NoCopy` wrapper an
+    /// owner rather than a name. It amplifies nothing: a mint carries the kind's
+    /// default rights and `SystemRight.Manage` gates the minting, so a caller
+    /// asking twice ends up with exactly the authority it asked once for.
+    ///
+    /// It can therefore FAIL, where reading a cached word could not: a full
+    /// handle table is `SosStatus.NoResource`.
     public func process_self(&self) -> Result<Process, SosStatus> {
         let raw = try call_value(self.handle, SystemOp.ProcessSelf as UInt, 0, 0, 0)
         return Process(handle: ProcessHandle(raw))
@@ -636,11 +738,17 @@ extension System {
     /// side: the child asks its System object for a Clock exactly as it does
     /// now, and what it gets back is somebody else's idea of the time.
     ///
-    /// The same Clock every time — a machine has one monotonic clock, and §3
-    /// forbids duplicating a handle — so calling this twice is a query, not two
-    /// capabilities. `ClockType.Monotonic` is the only domain v1 declares; it
-    /// counts nanoseconds from an unpublished epoch, never steps and never goes
-    /// backwards, so two readings are comparable and one means nothing alone.
+    /// **A FRESH HANDLE EVERY TIME onto the one Clock** (sawos design 3 D-4),
+    /// superseding this method's old "the same Clock every time". A machine has
+    /// one monotonic clock and this hands out capability INSTANCES naming it, so
+    /// two asks are two owned handles rather than two names one caller must not
+    /// both drop. It amplifies nothing — `SystemRight.ClockGet` gates the
+    /// minting and every mint carries the kind's default rights — and it makes
+    /// the call fallible on repetition: a full handle table is
+    /// `SosStatus.NoResource`. `ClockType.Monotonic` is the only domain v1
+    /// declares; it counts nanoseconds from an unpublished epoch, never steps
+    /// and never goes backwards, so two readings are comparable and one means
+    /// nothing alone.
     ///
     /// The label is `type:` and it is a label, not a declaration: `type` is a
     /// CONTEXTUAL keyword in Saw (DF-232b), reserved only where an alias
@@ -667,8 +775,29 @@ extension System {
 /// op wrappers, and the derivation chain starts at `System(boot_handle:)` — so
 /// a `Process` in hand is one the kernel handed over, not an integer somebody
 /// guessed. See the module docstring's two-layer rule.
+///
+/// **`NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5).
+/// `System.process_self()` MINTS a fresh instance on every ask now, so two calls
+/// give two independently-owned handles rather than two names the caller must
+/// not both drop — which is exactly why mint-per-call and this policy had to
+/// land together.
+///
+/// DROPPING A CHILD'S HANDLE IS HOW ITS SLOT COMES BACK. A dead child's process
+/// slot is held only by the §8 status word somebody might still read, so the
+/// last handle onto it going away is what frees it (design 3 D-3) — which makes
+/// letting a supervisor's `Process` fall out of scope a real reclamation rather
+/// than mere tidiness.
 public struct Process {
     handle: ProcessHandle,
+}
+
+extension Process: NoCopy {
+    /// Drop is release; see `System`'s deinit for the sentinel and the discard.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
 }
 
 extension Process {
@@ -838,21 +967,25 @@ extension Process {
 /// Built by `Process.boot_handle_next` and by nothing else — no word
 /// constructor, no word extractor, the module docstring's rule.
 ///
-/// **IT IS A PLAIN VALUE, LIKE EVERY OTHER HANDLE IN THIS MODULE**, and that is
-/// a deliberate deviation from design 2 D-4's parenthetical, which asked for
-/// `NoCopy`. Two reasons, both about keeping one rule rather than nine. First,
-/// the OWNING tier is unit 2.75's whole subject: `SystemHandle`'s docstring in
-/// `sosabi` already says the `NoCopy` wrapper arrives when handles become
-/// CLOSEABLE, because a move-only handle whose drop does nothing buys a
-/// discipline with no enforcement behind it. Second, the ruled boot-handle
-/// record is a `{tag, kind, handle}` VALUE the iterator hands back — and a
-/// move-only field inside a returned struct cannot be got out again without a
-/// partial move, so the record shape and `NoCopy` are not both expressible
-/// today. When 2.75 makes handles closeable, all nine become `NoCopy` together
-/// and the record becomes a consuming accessor; doing one of them early would
-/// have made this the one handle type that reads differently for a unit.
+/// **IT IS `NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5),
+/// which SUPERSEDES this docstring's own unit-2 paragraph explaining why it was
+/// a plain value. Both reasons that paragraph gave have been answered rather
+/// than overridden. The OWNING tier is here, so a move-only handle's drop now
+/// does something — it is the enforcement the discipline was waiting for. And
+/// the boot-handle record's shape is what changed to fit: see `BootHandle`
+/// below, whose `Memory` is an optional the caller TAKES rather than a field it
+/// would have had to partially move out of.
 public struct Memory {
     handle: MemoryHandle,
+}
+
+extension Memory: NoCopy {
+    /// Drop is release; see `System`'s deinit for the sentinel and the discard.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
 }
 
 /// One entry of a process's BOOT SET, decoded.
@@ -863,6 +996,25 @@ public struct Memory {
 /// point is that what a process receives is a `Memory` and never a number, and
 /// that type is this module's. The three-word WIRE layout is still declared
 /// exactly once, in `sosabi`, which is what the vDSO discipline actually asks.
+///
+/// **EXACTLY ONE WRAPPER PER WORD is the constraint the owning tier puts on this
+/// record** (sawos design 3 D-5), and it is what shaped the two things that
+/// changed here. The record is `NoCopy`, because a copyable record holding a
+/// `Memory` would be two owners of one handle; and the region is an `Optional`
+/// behind `take_memory` rather than a public field, because a `NoCopy` field
+/// cannot be moved OUT of a struct (there are no partial moves in Saw) and a
+/// caller that only ever borrows could never keep the region past the record.
+/// `Optional.take` is exactly the tool for this: it writes `None` into the place
+/// and hands the payload over owned.
+///
+/// A record whose region was never taken RELEASES IT when the record drops,
+/// which is the right default — an iterator entry a launcher looked at and did
+/// not want is a capability it declined.
+///
+/// The rejected alternative, recorded because it is the obvious one: a copyable
+/// record with a `memory()` method minting a wrapper. Two copies would mint two
+/// owners for one word, and the second drop would be a fault the program did
+/// nothing to deserve.
 public struct BootHandle {
     /// The REGION ORDINAL this handle came from — row `n` of the build's region
     /// table is tag `n`. The kernel assigns it no meaning; a launcher's config
@@ -871,8 +1023,26 @@ public struct BootHandle {
     /// What kind of object was minted. v1 mints regions and nothing else, so a
     /// caller that asserts this is asserting the build did what it said.
     public kind: BootHandleKind,
-    /// The region itself.
-    public memory: Memory,
+    /// The region itself, until somebody takes it. Private on purpose: the only
+    /// way out is `take_memory`, which is what makes the one-owner rule hold.
+    memory: Memory?,
+}
+
+extension BootHandle: NoCopy {}
+
+extension BootHandle {
+    /// Take the region out of this record, leaving it empty.
+    ///
+    /// It answers `None` on the second call, which is not an error condition to
+    /// dress up: a record has one region and taking it twice is asking for a
+    /// capability that has already been handed over. Callers that know they have
+    /// not taken it write `!`.
+    ///
+    /// `&var self` because taking WRITES the record — which is also what makes
+    /// the transfer visible in the type rather than in a convention.
+    public func take_memory(&var self) -> Memory? {
+        self.memory.take()
+    }
 }
 
 /// Decode a record the kernel copied out into a `BootHandle`.
@@ -920,8 +1090,20 @@ func boot_handle_into_frame(handle: ProcessHandle) unsafe -> Result<BootHandle, 
 /// expressible in this layer — which is the point, and which is why the harness
 /// case that PROVES the kernel rejects such a handle is a hand-written payload
 /// at the raw altitude rather than a program written against this module.
+/// **`NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5).
+/// `Process.thread_self()` mints a fresh instance on every ask, so a thread that
+/// asks twice owns two handles onto itself and may release either.
 public struct Thread {
     handle: ThreadHandle,
+}
+
+extension Thread: NoCopy {
+    /// Drop is release; see `System`'s deinit for the sentinel and the discard.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
 }
 
 extension Thread {
@@ -977,8 +1159,22 @@ extension Thread {
 ///
 /// Built by `Process.event_create` and by nothing else — no word constructor,
 /// no word extractor, the module docstring's rule.
+/// **`NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5).
+/// Release destroys the HANDLE and never the Event — an event whose last handle
+/// is gone is unreachable-but-live until its process's teardown, which is where
+/// the slab slot comes back. Ending an object for everyone is `close`, which is
+/// M4's and is not this.
 public struct Event {
     handle: EventHandle,
+}
+
+extension Event: NoCopy {
+    /// Drop is release; see `System`'s deinit for the sentinel and the discard.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
 }
 
 extension Event {
@@ -1032,8 +1228,22 @@ extension Event {
 ///
 /// Built by `Process.interrupt_bind` and by nothing else — no word
 /// constructor, no word extractor, the module docstring's rule.
+/// **`NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5). The
+/// LINE is not given back by a release — the binding IS the object's existence,
+/// and the object outlives its last handle until the process's teardown, which
+/// is where the line is masked and returned. A driver that drops its `Interrupt`
+/// has made its own device unreachable, not freed it for somebody else.
 public struct Interrupt {
     handle: InterruptHandle,
+}
+
+extension Interrupt: NoCopy {
+    /// Drop is release; see `System`'s deinit for the sentinel and the discard.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
 }
 
 extension Interrupt {
@@ -1066,8 +1276,21 @@ extension Interrupt {
 ///
 /// Built by `System.clock_get` and by nothing else — no word constructor, no
 /// word extractor, the module docstring's rule.
+/// **`NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5). A
+/// Clock is kernel-eternal and owned by nobody, so releasing one gives back only
+/// a handle-table entry — and `System.clock_get` mints a fresh handle on every
+/// ask, so a process that dropped its clock simply asks again.
 public struct Clock {
     handle: ClockHandle,
+}
+
+extension Clock: NoCopy {
+    /// Drop is release; see `System`'s deinit for the sentinel and the discard.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
 }
 
 extension Clock {
@@ -1133,8 +1356,23 @@ func now_into_frame(handle: ClockHandle) unsafe -> Result<UInt64, SosStatus> {
 ///
 /// Built by `Clock.timer_create` and by nothing else — no word constructor, no
 /// word extractor, the module docstring's rule.
+/// **`NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5). It
+/// does NOT disarm the timer: release touches the handle and never the object,
+/// so a dropped `Timer` that was armed keeps its deadline and the kernel keeps
+/// waking for it until the process's teardown takes the comparator back. Disarm
+/// first if that matters — which is the same distinction `close` would draw, and
+/// the reason release is not it.
 public struct Timer {
     handle: TimerHandle,
+}
+
+extension Timer: NoCopy {
+    /// Drop is release; see `System`'s deinit for the sentinel and the discard.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
 }
 
 extension Timer {
@@ -1231,8 +1469,21 @@ func decode_wait(key: UInt, tag: UInt, payload: UInt) -> WaitResult {
 /// of them; a handle attaches to at most one Waiter, and attaching it twice
 /// terminates the process, on the faults ruling's terms — it is a mistake only
 /// the attacher could have made.
+/// **`NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5).
+/// Attachments belong to the WAITER object, not to the handle, so a released
+/// handle detaches nothing — the subscriptions live until the object does, which
+/// is until the process's teardown.
 public struct Waiter {
     handle: WaiterHandle,
+}
+
+extension Waiter: NoCopy {
+    /// Drop is release; see `System`'s deinit for the sentinel and the discard.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
 }
 
 extension Waiter {

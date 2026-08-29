@@ -35,13 +35,13 @@ names provisional):
 | `MemoryObject` | A range of memory (RAM or device MMIO) that can be mapped into AddressSpaces. Derived by splitting/attenuating a parent MemoryObject; roots handed to the first process at boot. BUILT M3 unit 2, FIRST SLICE (sawos design 2 D-2): a SEALED `{base, len}` and nothing else — no pools, no derivation, no `map()`, no attributes, no op table (an op aimed at one is a `BadOp` fault). Minted only at boot, one per row of the build-emitted REGION TABLE, delivered to root through `ProcessOp.BootHandleNext`, and NAMED as the two arguments of `process_create`. Rights are the universal pair, `MemoryRight.Transfer` (unit 3's `give`) and `.Manage` (unit 4's derivation), minted because attenuation is monotonic and neither read by anything yet. §2.5 is not contradicted, it is STARTED: these ARE that section's "pool roots given to the root server at boot", in their v1 static form. |
 | `Pipe` | Synchronous message IPC with request/reply built in — see §2.1 (ratified Jul 29; renamed from Channel + client API amended Aug 20). |
 | `Event` | Accumulating non-blocking notification (OR / saturating-sum); a waitable — see §2.4 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Signal`/`Receive`, the mode chosen by the caller at creation (`event_create(mode:)`). AMENDED Aug 17 (user): the word is CONSUMED BY WHOEVER TAKES IT, through either door — `receive` is the non-blocking poll, a `Waiter.wait` delivery is the blocking one, and both read-and-clear, so a value is reported exactly once (§2.2, §2.4). |
-| `Clock` | A GRANTED TIME SOURCE — time is a capability, not an ambient facility. BUILT M3 (design 232 unit 1): obtained through `SystemOp.ClockGet` on `SystemRight.ClockGet`, ops `Now`/`TimerCreate`, rights `ClockRight.Read`/`.TimerCreate`. **A HARDWARE-BACKED CLOCK IS ONE KERNEL-ETERNAL OBJECT PER `ClockType`** (ruled Aug 17, user), existing from boot and owned by NOBODY: the machine has one monotonic counter, and a per-process object naming it would be a copy of a fact with a lifetime attached. So there is one slot per domain (the slot IS the domain's ordinal), no allocation and no `NoResource`, and process teardown frees no clock — a dead process's clock HANDLE is unbound like any other, and the object it named is not the process's to reclaim. `ClockGet` is therefore a GETTER that mints a handle onto a well-known object: asking twice answers the SAME handle, which the process's own handle table is what records. `ClockType` declares `Monotonic` ONLY in v1 (`Boot`/`Realtime` are future values of a raw-backed enum, undeclared because an unproducible case is dead surface), and `Now` dispatches on the clock's domain, so a second domain fails to compile until somebody says what its reading is. `Now` answers through a copy-out record, because a nanosecond count is 64 bits and one profile's registers are not. The point of the capability: strip the right from a child and hand it a VIRTUAL clock over IPC instead, with no code change on either side — and a virtual clock is a DIFFERENT animal, separately created and STATEFUL (offset, rate, owner), so it gets its own creation op and its own lifetime rather than a row in this table. |
+| `Clock` | A GRANTED TIME SOURCE — time is a capability, not an ambient facility. BUILT M3 (design 232 unit 1): obtained through `SystemOp.ClockGet` on `SystemRight.ClockGet`, ops `Now`/`TimerCreate`, rights `ClockRight.Read`/`.TimerCreate`. **A HARDWARE-BACKED CLOCK IS ONE KERNEL-ETERNAL OBJECT PER `ClockType`** (ruled Aug 17, user), existing from boot and owned by NOBODY: the machine has one monotonic counter, and a per-process object naming it would be a copy of a fact with a lifetime attached. So there is one slot per domain (the slot IS the domain's ordinal), no allocation and no `NoResource`, and process teardown frees no clock — a dead process's clock HANDLE is unbound like any other, and the object it named is not the process's to reclaim. `ClockGet` is therefore a GETTER that mints a handle onto a well-known object — and it MINTS ON EVERY ASK (sawos design 3 D-4, M3 unit 2.75), superseding this row's earlier "asking twice answers the SAME handle": two asks are two capability INSTANCES naming the one Clock, each independently owned and independently released, which is what §4's owning wrapper is an owner OF. It amplifies nothing (see §3's no-amplification amendment) and it makes the op fallible on repetition — a full handle table is `NoResource`, which is what earns it a quota row in unit 5. `ClockType` declares `Monotonic` ONLY in v1 (`Boot`/`Realtime` are future values of a raw-backed enum, undeclared because an unproducible case is dead surface), and `Now` dispatches on the clock's domain, so a second domain fails to compile until somebody says what its reading is. `Now` answers through a copy-out record, because a nanosecond count is 64 bits and one profile's registers are not. The point of the capability: strip the right from a child and hand it a VIRTUAL clock over IPC instead, with no code change on either side — and a virtual clock is a DIFFERENT animal, separately created and STATEFUL (offset, rate, owner), so it gets its own creation op and its own lifetime rather than a row in this table. |
 | `Timer` | Deadline object bound to the Clock that created it; directly waitable. BUILT M3 (design 232 unit 1) — THE PROCESS-SLEEP PRIMITIVE, and before it a wait either returned at once or blocked forever. Ops `Arm`/`Disarm`, rights `TimerRight.Arm` (gating both) / `.Wait`. `arm(after_ns, interval_ns)` arrives through the new COPY-IN record (§2.2's copy-out funnel's mirror twin, built here and inherited by M4's IPC send) because two 64-bit times exceed the argument registers on a 32-bit profile; `interval_ns == 0` is a one-shot, which disarms itself when it fires. The re-arm is DRIFT-FREE (next = previous DEADLINE + interval, the timerfd model) and missed expiries COALESCE into a saturating fire count delivered as `WaitPayload.Timer(fires:)`. **There is NO ACK**: unlike §9's Interrupt there is no mask to release, so the wait that reports the fires is what consumes them. Arming an armed timer REPLACES its schedule and clears the count; disarming an unarmed one is a NO-OP, deliberately opposite to §9's ack-with-no-fire — a one-shot disarms itself, so cancelling a timeout that just expired is an ordinary race rather than a caller error. |
 | `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it, ack via the handle. BUILT M2 (design 178 unit 4): one op (`Ack`), two rights (`InterruptRight.Wait`/`.Ack`), created by `ProcessOp.InterruptBind` on its own Process right — the factory bit a launcher strips from everything that is not a driver. The BINDING IS THE OBJECT'S EXISTENCE (creation takes the line, there is no rebind), which is what stops one handle naming two devices over its life. A line the board does not have, the TIMER's line, and a line already bound are all faults. |
 | `Waiter` | Generic wait aggregator (epoll/Port-style) — see §2.2 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Add`/`Remove`/`Wait`, rights `WaiterRight.Attach`/`.Wait`, the wait answer a copy-out record. |
 | `MemoryObject` | Physical memory (RAM or device MMIO). Ownership/authority over the pages; mappable, sendable — see §2.3 (ratified Jul 29). |
 | `Mapping` | An installed virtual placement of a MemoryObject; distinct object, own handle; only it can unmap — see §2.3. |
-| `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. BUILT M2 (design 178 unit 2), one process: ops `ThreadCreate`/`ThreadSelf`/`Exit`/`GetStatus` plus the three factory ops `EventCreate`/`WaiterCreate`/`InterruptBind`, each on its own right. BUILT M3 unit 2 (sawos design 2), **TWO processes**: `Start` (on the CHILD's handle, `ProcessRight.Start`) mints the first thread of a created process and runs it; `BootHandleNext` (`ProcessRight.BootHandles`) drains §12's boot set one record at a time. The CREATE half of that lifecycle is not an op on this object — design 2's RIDER (Aug 29) puts `ProcessCreate` on System, because a process is a machine-wide resource (§12's amended creation-authority note). The child's handle carries `Start | Wait | Manage` and nothing else — everything a process may do to ITSELF is withheld from its creator. The TEARDOWN now forks (§8): process 0 stops the machine, any other reschedules. `kill` (§8) still has no op. |
+| `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. BUILT M2 (design 178 unit 2), one process: ops `ThreadCreate`/`ThreadSelf`/`Exit`/`GetStatus` plus the three factory ops `EventCreate`/`WaiterCreate`/`InterruptBind`, each on its own right. BUILT M3 unit 2 (sawos design 2), **TWO processes**: `Start` (on the CHILD's handle, `ProcessRight.Start`) mints the first thread of a created process and runs it; `BootHandleNext` (`ProcessRight.BootHandles`) drains §12's boot set one record at a time. The CREATE half of that lifecycle is not an op on this object — design 2's RIDER (Aug 29) puts `ProcessCreate` on System, because a process is a machine-wide resource (§12's amended creation-authority note). The child's handle carries `Start | Wait | Manage` and nothing else — everything a process may do to ITSELF is withheld from its creator. The TEARDOWN now forks (§8): process 0 stops the machine, any other reschedules. **THE SLOT OF A DEAD PROCESS IS RECLAIMED** (sawos design 3 D-3, M3 unit 2.75), and it is the ONLY slab that reclaims on a handle release. A `Gone` slot holds one thing — its §8 status word — and the only way to read that word is `GetStatus` through a Process handle, so "no handle names this slot" IS "no possible reader", exactly. The check therefore scans the handle tables (bounded: `MAX_PROCESSES` × `MAX_HANDLES`) when a released entry named a `Gone` process, and again at the end of a process's own teardown for its own slot. D-1's generations are what make the reuse safe, and `clear_domain` already invalidated `LAST_PROT_PROCESS` in anticipation. `MAX_PROCESSES` consequently bounds CONCURRENT processes again, which is what the name says. Every other kind still frees only at its owner's teardown: their "may I free this" question needs a refcount nothing yet justifies. `kill` (§8) still has no op. |
 | `System` | Kernel singleton (ratified Aug 5): the object behind system-scoped primitives so that EVERY syscall is an object op (§5.7) — v1 ops `debug_print`, `shutdown(status)` (stop the machine; QEMU: sifive_test), rights-gated (`SystemRight.Debug`/`.Shutdown`, §3 scoped rights). Root receives its handle at boot (§12). `exit` is NOT here — process exit belongs to the Process object when it exists (ratified Aug 5). M2 added a third op, `process_self` on `SystemRight.Manage` (design 178 unit 2): §3's derivation rule made real, so the boot register stays ONE handle wide and a process obtains its Process object THROUGH the System handle rather than being handed it. M3 added `clock_get` on `SystemRight.ClockGet` (design 232 unit 1: time is a granted capability) and, by sawos design 2's RIDER (Aug 29), `process_create` on `SystemRight.ProcessCreate` — the object's one FACTORY, here because a process is machine-wide and only this object is (§12's amended creation-authority note); `process_self` was already the precedent, since a Process handle has always come out of this object. Later candidates: info queries. |
 
 **Nine of these kinds exist today** — System, Process, Thread, Event, Waiter,
@@ -329,9 +329,26 @@ money shot rides unit 4's IoMemory, not this slice.
 - Per-process handle table: index → (object ref, rights word).
   Handles are plain integers in the syscall ABI; the kernel validates
   index + generation (stale-handle detection) + rights on every use.
-  **GENERATIONS ARE NOT BUILT** (through M2): an entry is (object type,
-  rights, target) and nothing can make a slot stale, because there is no
-  close op either — see the close bullet below and §11's ledger.
+  **GENERATIONS ARE BUILT** (sawos design 3 D-1, M3 unit 2.75). An entry
+  is (object type, rights, target, generation), and a handle word is
+  `(generation << HANDLE_INDEX_BITS) | (index + 1)` — the index field's
+  width is ONE NAMED CONSTANT in `sosabi` (default 8) with every mask and
+  shift derived from it, and the remaining bits of a portable 32-bit
+  budget are generation, identically on both profiles. Four properties
+  worth stating here:
+  - **Generation 0 stamps nothing.** A slot's first-life word IS the bare
+    1-based index, so §12's boot order and every contract written before
+    generations existed survive verbatim.
+  - **"Names nothing" is the INDEX FIELD's zero, at every generation.** A
+    malformed word carrying generation bits over a zero index is not equal
+    to `NO_HANDLE` and must still resolve to nothing.
+  - The generation SURVIVES an unbind and is incremented BY it, so a
+    released word fails the equality test and becomes the ordinary
+    `BadHandle` fault the callers already raise.
+  - **BEST-EFFORT detection of a bug, not a uniqueness guarantee.** A word
+    held across a full wrap of one slot's generation aliases silently;
+    tables are per-process, so such a collision crosses no boundary and
+    grants nothing. This is not to be "fixed" into unbounded bookkeeping.
 - **Rights are a bitmask, SCOPED PER OBJECT KIND (ratified Aug 7,
   user).** Each kind defines its own backed rights enum —
   `SystemRight: UInt32 { case Transfer = 1, case Manage = 2, case
@@ -361,14 +378,44 @@ money shot rides unit 4's IoMemory, not this slice.
   legitimately needed, the resource's CREATOR (who holds MANAGE)
   mints a fresh one; there is no in-process copy. Attenuation happens
   only at that creation, monotonically.
+- **THE NO-DUPLICATE RULE'S REAL INVARIANT IS NO AMPLIFICATION** (sawos
+  design 3 D-4, M3 unit 2.75; the compact amendment — the full §3 rewrite
+  stays unit 7). Every getter of an existing object MINTS A FRESH HANDLE
+  now, so "asking twice gives the same handle" is no longer true anywhere
+  and was never what the rule protected. What it protects is that no
+  sequence of asks yields authority the asker did not already have, and
+  two facts hold it: a mint always carries the KIND'S DEFAULT rights, and
+  the authority to mint is itself rights-gated (`SystemRight.ClockGet`,
+  `SystemRight.Manage`, `ProcessRight.Manage`). So a second `clock_get`
+  hands out a second capability INSTANCE of an authority already held,
+  never a wider one — and attenuating a handle you GIVE AWAY stays
+  meaningful exactly where it always was: when the receiver lacks its own
+  minting authority. A process whose System handle has `ClockGet` stripped
+  cannot re-mint what it was handed, which is the whole of the guarantee.
+  What instances buy is OWNERSHIP: each is independently held and
+  independently released, which is what makes the `NoCopy` wrapper an
+  owner rather than a name.
 - **Attenuation is monotonic**: any derivation or duplication may only
   strip rights, never add. The only rights source is the boot handle
   set given to the root server.
 - Handle close is explicit in ABI, automatic in Saw (Deinit).
-  **UNBUILT through M2**: no op table has a close op, which is what the
-  generations above and the owning tier below both wait on (§11). A
-  process's handles are released by the ratified teardown and by nothing
-  else.
+  **RELEASE IS BUILT; CLOSE IS NOT** (sawos design 3 D-2, M3 unit 2.75),
+  and the two are different acts that were once one word. RELEASE
+  destroys the CALLER'S HANDLE: one universal op number
+  (`sosabi.RELEASE_OP`, documented forever outside every per-object
+  table, which is dense from 0), intercepted by dispatch between the
+  table lookup and the kind match; UNGATED, since destroying your own
+  capability instance harms nobody and identity lives in the object's
+  slot; it unbinds the entry, bumps the generation and NEVER touches the
+  object. Releasing a word that does not resolve — `NO_HANDLE`, a
+  malformed word, a stale one, a second release — is the ordinary
+  `BadHandle` fault. In Saw it is automatic: all nine `sos` wrappers are
+  `NoCopy` with a `deinit` that releases, so DROP IS RELEASE and there is
+  no typed `release()` method to write. CLOSE — ending the OBJECT for
+  everyone — is still unbuilt: it is object-protocol, exists only on kinds
+  with an end-state, and arrives with Pipe in M4 under a per-kind right.
+  A process's remaining handles are still released by the ratified
+  teardown.
 - Syscall ABI sketch (riscv32 `ecall`, args in registers): every call
   is `(handle, op, args...) -> Result`. The kernel's dispatch is a
   table lookup + rights check + object-op — the fast path must stay
@@ -388,15 +435,30 @@ money shot rides unit 4's IoMemory, not this slice.
   "a number"). The typing stops at the ABI boundary: `@export`ed vDSO
   symbols and the syscall stubs keep raw `UInt` words (C callers see
   words; the export whitelist is primitives), and the kernel handle
-  TABLE indexes by word. This is TIER ONE (kind safety) of two: when
-  closeable/transferable handles land — **M2 did NOT bring them**, having
-  built neither a close op nor any move of a handle between tables — the
-  OWNING tier is a
-  NoCopy struct wrapping the alias (deinit closes, `move` transfers —
-  the TcpStream pattern, and §3's no-DUPLICATE rule is its exact
-  NoCopy correspondence), with the alias as its payload — additive,
-  not a migration. Adoption: the M1 candidate branch, as a
-  review-round change.
+  TABLE indexes by word. This is TIER ONE (kind safety) of two, and
+  **TIER TWO IS BUILT** (sawos design 3 D-5, M3 unit 2.75; the Aug-29
+  drop-is-release ruling). All nine wrappers are `NoCopy` structs over the
+  aliases with a hand-written `deinit` that releases the word — the
+  TcpStream pattern, and §3's no-DUPLICATE rule is its exact `NoCopy`
+  correspondence — so the alias became the payload and nothing written
+  against it changed, exactly as the additive claim promised. M2 brought
+  neither half; 2.75 brought both TOGETHER, because a release op beside
+  copyable wrappers is a stale-fault factory (copy, drop, and the
+  sibling's next use is a manufactured `BadHandle`). Three consequences:
+  - The word field doubles as the DISARM SENTINEL, since `NO_HANDLE` is
+    unrepresentable as a live handle at any generation.
+  - There is deliberately no typed `release()` method. Early release is
+    dropping the value (`let _ = move w`), which is one concept rather
+    than two spellings of it.
+  - **THE TRANSFER-FUNNEL CONTRACT**, recorded for unit 3's `give` and
+    M4's pipes: when an op MOVES the word out of the caller's table, the
+    sysapi funnel consumes the wrapper, reads the word, sets the field to
+    `NO_HANDLE` BEFORE the syscall, and lets the disarmed value drop.
+    Disarm-before-syscall because every failure of such a syscall is a
+    fault (the process ends, teardown covers everything), so no path
+    leaves a disarmed-but-unsent word. User code never touches the
+    sentinel; generations backstop the discipline, so a funnel bug that
+    released after a transfer is a diagnosed `BadHandle`, not corruption.
 
 ## 4. The Saw synergy (why this language, this kernel)
 
@@ -1105,9 +1167,24 @@ event-driven EDGE of a process gets a second, distinct construct:
     unit 5. A full slab answers `SosStatus.NoResource` today.
   - **Pipes and PipeReplyHandle** (§2.1) — M4; the one fully ratified
     object surface with no implementation at all.
-  - **Handle close and generations** (§3) — no op table has a close op
-    and a handle entry carries no generation, so §3's stale-handle
-    detection and §4's owning NoCopy tier both wait on it.
+  - ~~**Handle close and generations**~~ **THE LIFECYCLE TIER IS BUILT**
+    (§3; sawos design 3, M3 unit 2.75). Three mechanisms landed together
+    because each alone is broken — mint-per-call without release is a leak
+    by design, release without generations is aliasing, and a release op
+    beside copyable wrappers is a stale-fault factory. What exists now:
+    one UNIVERSAL `RELEASE_OP` intercepted between the table lookup and
+    the kind match; a split handle word carrying a per-slot GENERATION
+    that survives the unbind, so §3's stale-handle detection is real; every
+    getter MINTING a fresh handle; §4's owning `NoCopy` tier over all nine
+    wrappers, so DROP IS RELEASE; and one slab reclaiming on release — a
+    `Gone` process's slot, once no handle names it (closing unit 2's pend
+    at `alloc_process`, so `MAX_PROCESSES` bounds CONCURRENT processes
+    again). What is STILL absent is CLOSE, which is a different act: it
+    ends the OBJECT for everyone, exists only on kinds with an end-state,
+    and arrives with Pipe in M4 under a per-kind right. Also still absent:
+    refcounted reclamation of the other slabs on last release (quotas
+    era), and per-kind release rights (which would be a new universal bit
+    and are explicitly not built).
   - **Priorities** (§7) — nothing of §7 is built; round-robin is ruled to
     stay through M3 (design 232 agenda item 10).
   - **Thread and process waitability, and `kill`** (§8) — attaching

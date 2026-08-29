@@ -1,0 +1,46 @@
+// SOS M3 unit 2.75: RELEASING `NO_HANDLE` IS A FAULT (sawos design 3 D-2; the
+// faults ruling, design 178).
+//
+//   SOS releasenothing: releasing a word that names nothing
+//   SOS: process fault: bad handle process=0
+//   SOS: process teardown handles=3 ... process=0
+//
+// Handle 0 names nothing — §3's oldest rule, and the reason a zeroed register is
+// never authority — so releasing it is asking the kernel to destroy a
+// capability the caller never had. That is caller-checkable in the strongest
+// sense: the process chose the number. The faults ruling ends it, and it is the
+// SAME `BadHandle` any other unresolvable word gets, which is the point of the
+// three cases in this family: `NO_HANDLE`, a malformed word and a stale one are
+// one answer, not three.
+//
+// THE TEARDOWN COUNT IS THE SECOND ASSERTION. Three handles — §12's boot set and
+// nothing else — because this process deliberately derives nothing before it
+// dies. That is what makes the number a statement about the FAULT rather than
+// about whatever the program happened to be holding.
+//
+// ONE FAULT PER CASE, which is why this is not an arm of `handle-remint`: a
+// fault ends the process, so a second probe after one would never run.
+
+import sos.{System, sos_handle_release}
+
+static EXIT_FAILED: UInt = 1
+
+/// The word that names nothing, at every generation. It is `sosabi`'s
+/// `NO_HANDLE`, spelled here because this file works at the C altitude where a
+/// handle is a number — and because the whole claim is that a PROCESS may write
+/// this number and the kernel must refuse it.
+static NAMES_NOTHING: UInt = 0
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let _ = system.debug_print("SOS releasenothing: releasing a word that names nothing\n")
+
+    // Does not return: the kernel ends this process for a handle that resolves
+    // to no object.
+    let _ = sos_handle_release(NAMES_NOTHING)
+
+    let _ = system.debug_print("SOS releasenothing: survived, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

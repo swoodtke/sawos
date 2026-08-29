@@ -124,11 +124,41 @@ public enum ObjType: UInt8 {
 /// `sos_syscallN` stubs keep raw `UInt` words, because a C caller sees words
 /// and the export whitelist is primitives; the handle TABLE indexes by word too.
 ///
-/// This is TIER ONE of two — kind safety. When M2 brings closeable and
-/// transferable handles, the OWNING tier is a `NoCopy` struct wrapping this
-/// alias (deinit closes, `move` transfers — the `TcpStream` pattern, and §3's
-/// no-DUPLICATE rule is its exact `NoCopy` correspondence). That is additive:
-/// this alias becomes the payload, and nothing written against it changes.
+/// This is TIER ONE of two — kind safety. TIER TWO, the OWNING tier, IS BUILT
+/// (sawos design 3, M3 unit 2.75): `kernel/sysapi`'s nine wrappers are `NoCopy`
+/// structs over these aliases whose `deinit` releases the word, so DROP IS
+/// RELEASE and §3's no-DUPLICATE rule has its exact `NoCopy` correspondence.
+/// The alias became the payload and nothing written against it changed, which
+/// is what the additive claim promised.
+///
+/// **WHAT A HANDLE WORD IS MADE OF (sawos design 3 D-1).** The word is
+/// `(generation << HANDLE_INDEX_BITS) | (index + 1)` on BOTH profiles — the low
+/// `HANDLE_INDEX_BITS` bits are a 1-based table index, the rest of the portable
+/// 32-bit budget is the slot's generation, and the top 32 bits of an arm64 word
+/// stay zero. Same split and same width everywhere means the wrap behaves
+/// identically on both machines: one story, one test. **THE SPLIT IS ONE NAMED
+/// CONSTANT** (`HANDLE_INDEX_BITS`, default 8, below) with every mask and shift
+/// derived from it, so moving it is a one-line edit.
+///
+///   - **THE INDEX IS 1-BASED, which is what keeps generation 0 free.** Slot 0
+///     is usable and `NO_HANDLE = 0` still names nothing, because "names
+///     nothing" is the INDEX FIELD being zero rather than the whole word being
+///     zero. A malformed word like `0x100` — generation 1 over a zero index, at
+///     the default split — is not equal to `NO_HANDLE` and must still name
+///     nothing; the kernel's `lookup_handle` tests the field for exactly that
+///     reason.
+///   - **GENERATION 0 STAMPS NOTHING.** A slot's first-life word EQUALS the
+///     bare index, so every contract written before generations existed
+///     survives verbatim: §12's boot order (1 = System, 2 = Process, 3 =
+///     Thread) that the hand-assembled payloads encode, and root's "boot
+///     handle 1". Only a REUSED slot's word grows high bits, and no reuse
+///     exists until a release happens.
+///   - **IT IS BEST-EFFORT DETECTION OF A BUG, not a uniqueness guarantee.** A
+///     word held across exactly `HANDLE_GENERATION_MODULUS` reuses of one slot
+///     aliases silently.
+///     Tables are per-process, so a wrap collision crosses no process boundary
+///     and grants nothing; nobody later "fixes" this into unbounded
+///     bookkeeping.
 public type SystemHandle = UInt
 
 /// A handle naming a Process object (§2 table). Same discipline as
@@ -160,9 +190,84 @@ public type TimerHandle = UInt
 /// range of physical memory. Same discipline again.
 public type MemoryHandle = UInt
 
-/// A handle index the table can never hand out. Handle 0 names nothing, so a
+/// A handle word the table can never hand out. Handle 0 names nothing, so a
 /// zeroed register is never authority (see `ObjType.Unbound`).
+///
+/// Under design 3's split word this is the LOW BYTE's zero, at every
+/// generation: `0x100` is as unbindable as `0` is, because the index a word
+/// carries is 1-based and zero is not an index. The kernel's `lookup_handle`
+/// tests the byte rather than the word, and the wrappers' disarm sentinel is
+/// this value for the same reason — an armed wrapper's word always has a
+/// non-zero low byte.
 public static NO_HANDLE: UInt = 0
+
+// -----------------------------------------------------------------------------
+// THE HANDLE WORD'S ENCODING — one constant, everything else derived
+// (sawos design 3 D-1, as amended by the Aug-29 user note)
+// -----------------------------------------------------------------------------
+//
+// **THE SPLIT IS POLICY, STATED ONCE.** Where the index field ends and the
+// generation field begins is a design choice this system will want to revisit —
+// ~254 per-process handles is generous for a microkernel with sixteen and not
+// obviously enough for one that grows — so it is ONE named constant with every
+// mask, shift, bound and assert derived from it. Raising `HANDLE_INDEX_BITS` is
+// a one-line edit that moves all of them together; there are no hardcoded `0xFF`
+// masks and no bare `>> 8` shifts anywhere in the kernel or this module.
+//
+// It lives HERE, beside `NO_HANDLE`, because it defines what a handle word IS.
+// The kernel's table and the wrappers' sentinel are both consequences of this
+// encoding, and a consequence should not be where the rule is written.
+//
+// The budget being divided is 32 BITS on BOTH profiles — the portable width, so
+// the wrap behaves identically on either machine and there is one story to test.
+// A 64-bit word's top 32 bits stay zero, and `lookup_handle` enforces that
+// rather than assuming it (see `handle_word_generation`).
+
+/// The portable width a handle word is encoded in, on both profiles.
+public static HANDLE_WORD_BITS: Int = 32
+
+/// **THE ONE KNOB.** How many low bits of a handle word carry the table index;
+/// the rest carry the generation. Default 8.
+///
+/// It is a SHIFT COUNT everywhere it is used, which is the one operand position
+/// exempt from Saw's type-agreement rule, so it stays a plain `Int` and needs no
+/// conversion at any use site.
+public static HANDLE_INDEX_BITS: Int = 8
+
+/// What is left of the portable budget for the generation counter.
+public static HANDLE_GENERATION_BITS: Int = HANDLE_WORD_BITS - HANDLE_INDEX_BITS
+
+/// The mask that takes the index field out of a handle word.
+///
+/// The `as UInt` is WRITTEN rather than implied, and the reason is a language
+/// fact worth recording where it bites: a platform-`UInt` slot is not a
+/// FIXED-WIDTH one, so DF-240a's constant adoption does not reach it and the
+/// derivation folds in the signed platform-`Int` domain. Saying `as UInt` on a
+/// constant costs nothing (design 170 answers a constant cast at compile time)
+/// and keeps the derivation in one place, which is the point.
+public static HANDLE_INDEX_MASK: UInt = ((1 << HANDLE_INDEX_BITS) - 1) as UInt
+
+/// The generation counter's modulus — it WRAPS here, identically on both
+/// profiles (D-1's "one story, one test").
+///
+/// It is also what makes the top-half-stays-zero rule ENFORCED rather than
+/// assumed: a stored generation is always below this, and a word resolves by
+/// comparing its whole generation FIELD against one, so a 64-bit word with
+/// anything set above the portable budget has a generation no entry can equal
+/// and names nothing. No separate range test is owed.
+public static HANDLE_GENERATION_MODULUS: UInt32 = 1 << HANDLE_GENERATION_BITS
+
+// THE KNOB'S OWN GUARD RAILS. Each field must exist, and the two must exactly
+// divide the portable budget — a split that lost a bit would silently make some
+// words unrepresentable, and one that overlapped would make a generation alias
+// an index. The bound tying `MAX_HANDLES` to the index field is in
+// `kcore.objects`, which is the module that knows both numbers.
+static_assert(HANDLE_INDEX_BITS >= 1,
+              "the index field must be at least one bit wide")
+static_assert(HANDLE_GENERATION_BITS >= 1,
+              "the generation field must be at least one bit wide")
+static_assert(HANDLE_INDEX_BITS + HANDLE_GENERATION_BITS == HANDLE_WORD_BITS,
+              "the index and generation fields must exactly divide the portable word")
 
 /// The `entry` argument to `Process.ThreadCreate` that means "start the thread
 /// at this process's own IMAGE ENTRY" — the entry the loader took out of the
@@ -737,6 +842,45 @@ public func timer_rights() -> UInt32 {
 }
 
 // =============================================================================
+// The one UNIVERSAL op (sawos design 3 D-2)
+// =============================================================================
+
+/// RELEASE — destroy the caller's handle, whatever kind it names.
+///
+/// **IT IS ONE NUMBER AND NOT NINE ENUM CASES**, because release is the same
+/// act for every kind: unbind the entry, bump the slot's generation, touch the
+/// OBJECT not at all. A per-kind case would be the same code written nine times
+/// with nine ways to drift, and the dispatch would have to reach the kind
+/// before it could see the op — which is one step later than the only step that
+/// matters here.
+///
+/// **`0xFFFF` IS OUTSIDE EVERY PER-OBJECT TABLE, FOREVER, and that is a rule
+/// rather than a coincidence.** Every op table in this file is DENSE FROM ZERO
+/// — `SystemOp` runs 0..4, `ProcessOp` 0..8, `EventOp` 0..1 — and stays that
+/// way, so no kind can ever grow into this number. A table that wanted 65535
+/// ops would have to say so here first. `from(raw:)` on a per-kind enum
+/// therefore never sees this value: the dispatch intercepts it BEFORE the kind
+/// match, at the one point that knows the handle's ENTRY and not yet its kind.
+///
+/// **IT IS UNGATED** (the Aug-17 ruling, sawos design 3 D-2). No right is
+/// checked, on any kind. Destroying your own capability INSTANCE harms nobody:
+/// identity lives in the object's slot, not in the handle, so a released handle
+/// takes nothing away from anyone else holding one. Releasing your System
+/// handle or your own Process handle is legal-but-doomed — the sandboxed-compute
+/// precedent — and losing the authority is what the caller asked for. If a gate
+/// is ever wanted it is a NEW universal bit, never a retasking of `Manage`.
+///
+/// Releasing a word that does not resolve — `NO_HANDLE`, a malformed word, a
+/// stale one whose generation has moved, or a second release of the same word —
+/// is the ordinary `FaultReason.BadHandle`. Using a handle you released is
+/// broken code, which is the sharpened line the generations exist to draw.
+///
+/// CLOSE IS NOT THIS OP and is not built. Release destroys YOUR handle; close
+/// would end the OBJECT for everyone, exists only on kinds with an end-state,
+/// and arrives with Pipe in M4 under a per-kind right.
+public static RELEASE_OP: UInt = 0xFFFF
+
+// =============================================================================
 // The System object's op table (spec §2)
 // =============================================================================
 
@@ -752,13 +896,18 @@ public func timer_rights() -> UInt32 {
 /// every number that is not an op, which is also what retired `OP_SYSTEM_MAX`:
 /// the range check and the decode are now one operation instead of two that
 /// could disagree.
-/// `ClockGet` is the fourth, and it is a GETTER rather than a factory: it
-/// answers with the process's Clock for the domain asked about, minting the
-/// object on first ask and handing back the SAME handle every time after — the
-/// shape `ProcessSelf` above already has. There is one monotonic clock on a
-/// machine, so two handles to it would be two names for one thing, which §3's
-/// no-duplicate rule exists to prevent; and an op that cannot allocate on
-/// repetition needs no quota row when quotas land.
+/// `ClockGet` is the fourth, and it is a GETTER rather than a factory: the
+/// object already exists — one kernel-eternal Clock per domain — so the op only
+/// ever hands out a HANDLE onto it. **EVERY ASK MINTS A FRESH ONE** (sawos
+/// design 3 D-4), which is the same flip `ProcessSelf` above took: a handle is a
+/// capability INSTANCE, independently held and independently released, and that
+/// is what an owning wrapper needs to be an owner OF. It supersedes the
+/// same-handle-every-ask reading this paragraph used to carry. What §3 forbids
+/// is AMPLIFICATION, not two names — a mint always carries the kind's DEFAULT
+/// rights and the minting itself is gated (`ClockGet`, `Manage`) — so asking
+/// twice gets a caller nothing it could not have got once. The op is
+/// consequently fallible on repetition (a full handle table is `NoResource`)
+/// and it earns a quota row when quotas land in unit 5.
 ///
 /// `ProcessCreate` is the fifth, and it is THE ONE FACTORY ON THIS OBJECT —
 /// placed here by the Aug-29 user ruling recorded as sawos design 2's RIDER:
@@ -973,6 +1122,29 @@ public enum TimerOp: UInt {
     case Arm = 0,
     case Disarm = 1,
 }
+
+// EVERY OP TABLE IS DENSE FROM ZERO, AND STAYS BELOW `RELEASE_OP` (design 3
+// D-2). That is what makes one universal op number safe: `RELEASE_OP` can never
+// collide with a per-kind op because no kind is allowed to reach it. One assert
+// per table, on its highest case, in the spirit of the rights asserts above —
+// the repetition IS the check, and a table that grew toward 0xFFFF would fail to
+// build rather than fail as a release that quietly ran somebody's op.
+static_assert((SystemOp.ProcessCreate as UInt) < RELEASE_OP,
+              "an op table must stay below the universal RELEASE_OP")
+static_assert((ProcessOp.BootHandleNext as UInt) < RELEASE_OP,
+              "an op table must stay below the universal RELEASE_OP")
+static_assert((ThreadOp.Yield as UInt) < RELEASE_OP,
+              "an op table must stay below the universal RELEASE_OP")
+static_assert((EventOp.Receive as UInt) < RELEASE_OP,
+              "an op table must stay below the universal RELEASE_OP")
+static_assert((WaiterOp.Wait as UInt) < RELEASE_OP,
+              "an op table must stay below the universal RELEASE_OP")
+static_assert((InterruptOp.Ack as UInt) < RELEASE_OP,
+              "an op table must stay below the universal RELEASE_OP")
+static_assert((ClockOp.TimerCreate as UInt) < RELEASE_OP,
+              "an op table must stay below the universal RELEASE_OP")
+static_assert((TimerOp.Disarm as UInt) < RELEASE_OP,
+              "an op table must stay below the universal RELEASE_OP")
 
 /// WHICH CLOCK a Timer runs against, and what `System.ClockGet` names (§2's
 /// Clock row; design 232 unit 1, the M3 time notes).

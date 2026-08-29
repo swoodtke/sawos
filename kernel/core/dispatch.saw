@@ -55,11 +55,12 @@ import sosabi.{
     clock_rights,
     timer_rights,
     child_process_rights,
+    root_process_rights,
     NO_HANDLE,
+    RELEASE_OP,
     ENTRY_IMAGE,
 }
 import kcore.limits.{
-    MAX_HANDLES,
     NO_ATTACHMENT,
     NO_EVENT,
     NO_INTERRUPT,
@@ -82,7 +83,7 @@ import kcore.objects.{
     BOOT_HANDLE_NEXT,
     ClockObject,
     EventObject,
-    HANDLES,
+    HandleEntry,
     InterruptObject,
     MEMORIES,
     MemoryObject,
@@ -92,8 +93,10 @@ import kcore.objects.{
     ThreadObject,
     TimerObject,
     WaiterObject,
+    handle_word_index,
     lookup_handle,
     mint_handle,
+    unbind_handle,
 }
 import kcore.threads.{
     CURRENT_THREAD,
@@ -147,6 +150,7 @@ import kcore.process.{
     copy_in,
     copy_out,
     copy_out_check,
+    reclaim_process_slot,
 }
 import kcore.loader.{
     LoadRegion,
@@ -222,11 +226,32 @@ func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt, arg1: UInt,
         // System object which Process it is, and the Process object which
         // Thread — so the kernel never has to widen the entry register, and a
         // process that was given no System handle has no way to name either.
+        // **IT MINTS A FRESH HANDLE EVERY ASK** (sawos design 3 D-4). It used
+        // to read a word cached on the process slot, which said "a process has
+        // one Process handle" — and that is not what §3 guarantees. What §3
+        // forbids is AMPLIFICATION: a mint carries the kind's DEFAULT rights and
+        // the minting is itself gated (`Manage`, right here), so a caller asking
+        // twice gets two capability INSTANCES of exactly the authority it
+        // already had. Instances are the point — each is independently held and
+        // independently released, which is what an owning wrapper is an owner
+        // OF, and the cached word could not have been released by anybody.
+        //
+        // The default set is `root_process_rights()`, this v1's vocabulary for
+        // "a process's authority over itself". What a CHILD's default withholds
+        // is unit 3's question and is deliberately not answered here.
+        //
+        // IT CAN NOW FAIL, which the cached read could not: a full handle table
+        // is `NoResource`, a thing the caller could not have known. Unit 5 is
+        // where that gets a quota row.
         case ProcessSelf -> {
             if not obj.allows(SystemRight.Manage) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            op_value(PROCESSES[p].self_handle)
+            let handle = mint_handle(p, ObjType.Process, root_process_rights(), p)
+            if handle == NO_HANDLE {
+                return op_status(SosStatus.NoResource)
+            }
+            op_value(handle)
         },
         // TIME IS A GRANTED CAPABILITY (design 232 unit 1, the M3 time notes).
         // A process that was not given this right cannot read the machine's
@@ -272,63 +297,38 @@ func clock_get(p: Int, raw_type: UInt) unsafe -> SyscallResult {
 }
 
 /// THERE IS NOTHING TO CREATE, which is what makes this a getter rather than a
-/// factory (amended Aug 17, user).
+/// factory (amended Aug 17, user) — and **PURE MINTING**, which is what makes it
+/// mint-per-call (sawos design 3 D-4).
 ///
 /// The object already exists — one kernel-eternal Clock per domain, live since
 /// boot — so this op only ever mints a HANDLE onto a well-known slot. The
-/// find-or-create scan it used to open with is gone with the per-process object
-/// it was scanning for, and so is the `NoResource` a full clock slab could
-/// answer with: a domain's slot cannot be occupied by somebody else. What can
-/// still fail is the HANDLE TABLE, which is the process's own resource.
+/// find-or-create scan it opened with is gone with the per-process object it was
+/// scanning for; the by-kind scan of the handle table that REPLACED it
+/// (`clock_handle_of`) is gone too, and with it the tree's only walk of
+/// `HANDLES` looking for a kind.
 ///
-/// ASKING TWICE STILL ANSWERS THE SAME HANDLE, and it is the process's table
-/// that says so rather than a scan of the slab. That keeps §3's no-duplicate
-/// rule (two handles onto one object would be two names for one thing) and keeps
-/// the op out of unit 5's quota rows, since it cannot allocate on repetition.
-/// Under the mint-per-call model the lifecycle unit 2.75 owns, this becomes pure
-/// minting; that flip is not made here.
+/// **ASKING TWICE ANSWERS TWO DIFFERENT HANDLES ONTO ONE CLOCK**, which
+/// supersedes this function's own "same handle every ask" and is not a hole in
+/// §3. The no-duplicate rule's real invariant was never uniqueness, it was NO
+/// AMPLIFICATION: every mint carries the kind's DEFAULT rights and the minting
+/// is gated by `SystemRight.ClockGet` on the System handle the caller already
+/// holds, so a second ask hands out a second INSTANCE of an authority already
+/// held and never a wider one. Attenuating a handle you give away stays
+/// meaningful exactly where it always was — when the receiver lacks its own
+/// minting authority, which for the clock is the process with `ClockGet`
+/// stripped.
+///
+/// **`NoResource` IS REACHABLE ON REPETITION NOW.** A process that asks
+/// sixteen times fills its handle table, and a full table is a thing the caller
+/// could not have known, so it stays a status rather than becoming a fault. That
+/// is precisely what earns this op a quota row in unit 5.
 func clock_get_typed(p: Int, type: ClockType) unsafe -> SyscallResult {
     let slot = clock_slot(type)
-    let existing = clock_handle_of(p, slot)
-    if existing != NO_HANDLE {
-        return op_value(existing)
-    }
     let handle = mint_handle(p, ObjType.Clock, clock_rights(), slot)
     if handle == NO_HANDLE {
         return op_status(SosStatus.NoResource)
     }
     op_value(handle)
-}
-
-/// The handle in `p`'s table naming clock slot `slot`, or `NO_HANDLE`.
-///
-/// SINCE THE CLOCK WENT GLOBAL THIS IS THE WHOLE OF `ClockGet`'S "SAME HANDLE
-/// EVERY ASK": the object cannot tell you who holds it, so the process's own
-/// table is what answers. That is also the only place the answer could live —
-/// a field on a shared object would have to be a field per process.
-///
-/// A SEARCH rather than a cached word, and the asymmetry with
-/// `ProcessSlot.self_handle` is the honest one: a process has exactly one
-/// Process handle by construction, so caching it is caching a fact. A Clock's
-/// handle is merely the one this table happens to hold, and a second copy of
-/// it here would be a place to go stale once handles can be closed and
-/// re-minted. The table is the truth; at sixteen entries the walk is cheaper
-/// than the invalidation rule would be.
-func clock_handle_of(p: Int, slot: Int) unsafe -> UInt {
-    var h: Int = 0
-    while h < MAX_HANDLES {
-        let entry = HANDLES[p * MAX_HANDLES + h]
-        match entry.obj_type {
-            case Clock -> {
-                if entry.target == slot {
-                    return (h as UInt) + 1
-                }
-            },
-            case _ -> {},
-        }
-        h = h + 1
-    }
-    NO_HANDLE
 }
 
 /// The Process object's ops (§2, §7, §8; design 178 D4).
@@ -349,6 +349,11 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             }
             thread_create(obj.slot, arg0, arg1, arg2)
         },
+        // MINT-PER-CALL, exactly as `ProcessSelf` above (sawos design 3 D-4):
+        // the cached word on the thread slot is gone, the default rights are
+        // `thread_rights()`, and `Manage` on the PROCESS handle is what gates
+        // the derivation. A full table is `NoResource` — reachable now, where
+        // reading a cached word never was.
         case ThreadSelf -> {
             if not obj.allows(ProcessRight.Manage) {
                 fault_process(p, FaultReason.AccessDenied)
@@ -356,7 +361,12 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             if CURRENT_THREAD == NO_THREAD {
                 fault_process(p, FaultReason.BadState)
             }
-            op_value(THREADS[CURRENT_THREAD].self_handle)
+            let handle = mint_handle(p, ObjType.Thread, thread_rights(),
+                                     CURRENT_THREAD)
+            if handle == NO_HANDLE {
+                return op_status(SosStatus.NoResource)
+            }
+            op_value(handle)
         },
         // Spec §5.7, ratified Aug 5: process exit belongs HERE and not on the
         // System object. Every thread of the process goes with it (§8's
@@ -539,10 +549,12 @@ func process_create(p: Int, image_handle: UInt,
     let rw_base = place_image(slot, img_base, &dest)
 
     PROCESSES[slot].state = ProcessState.Created
-    // A CHILD HOLDS NO HANDLE ON ITSELF in this unit — its table is empty, so
-    // `ProcessSelf` has nothing to answer with. Unit 3 is where a child receives
-    // handles, and what it receives is what `give` decides.
-    PROCESSES[slot].self_handle = NO_HANDLE
+    // A CHILD HOLDS NO HANDLE AT ALL in this unit — its table is empty, so it
+    // cannot name its own System object and `ProcessSelf` is not a call it can
+    // make. There is nothing to record here any more: mint-per-call means a
+    // process's own Process handle is minted when it is asked for, and a child
+    // that cannot ask has none (sawos design 3 D-4). Unit 3 is where a child
+    // receives handles, and what it receives is what `give` decides.
     PROCESSES[slot].entry = image_entry(img_base)
     PROCESSES[slot].stack_top = dest.top
     PROCESSES[slot].region_base = dest.base
@@ -589,7 +601,7 @@ func process_start(caller: Int, child: Int) unsafe -> SyscallResult {
     hal.frame_init(frame_slot(slot), PROCESSES[child].entry,
                    PROCESSES[child].stack_top, NO_HANDLE)
     THREADS[slot] = ThreadSlot(state: ThreadState.Runnable, process: child,
-                               self_handle: NO_HANDLE, exit_code: 0,
+                               exit_code: 0,
                                joiners: 0, link: 0, wait_buf: 0)
     ready_push(slot)
     PROCESSES[child].state = ProcessState.Running
@@ -761,7 +773,7 @@ func thread_create(p: Int, entry: UInt, stack_top: UInt, arg: UInt) unsafe -> Sy
 
     hal.frame_init(frame_slot(slot), start, stack_top, arg)
     THREADS[slot] = ThreadSlot(state: ThreadState.Created, process: p,
-                               self_handle: handle, exit_code: 0,
+                               exit_code: 0,
                                joiners: 0, link: 0, wait_buf: 0)
     op_value(handle)
 }
@@ -1313,6 +1325,45 @@ func waiter_wait(p: Int, w: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
     op_blocked()
 }
 
+/// `RELEASE_OP` — destroy the caller's handle, whatever kind it named (sawos
+/// design 3 D-2).
+///
+/// **UNGATED, and deliberately so.** No right is checked, on any kind. A handle
+/// is a capability INSTANCE and identity lives in the object's slot, so
+/// destroying your own instance takes nothing away from anybody else holding
+/// one — there is no one to protect from it. Releasing your System handle or
+/// your own Process handle is legal-but-doomed on the sandboxed-compute
+/// precedent: you lose the authority, which is what you asked for. A gate, if
+/// one is ever wanted, is a NEW universal bit and never a retasking of `Manage`.
+///
+/// **A WORD THAT DOES NOT RESOLVE IS THE ORDINARY `BadHandle` FAULT** — the
+/// caller reached this line with `entry` already looked up, so `NO_HANDLE`, a
+/// malformed word, a stale word whose generation has moved and a SECOND release
+/// of the same word all arrive here as `Unbound` and all end the process. Using
+/// a handle you released is broken code, and D-1's generations are what turn it
+/// from a silent alias into this diagnosis.
+///
+/// **IT NEVER TOUCHES THE OBJECT** — the teardown close-all's own precedent, and
+/// `unbind_handle` is the shared implementation of exactly that. An object whose
+/// last handle is gone is unreachable-but-live until its process's teardown;
+/// quotas (unit 5) are where that costs something. THE ONE EXCEPTION is D-3's:
+/// a released entry that named a PROCESS whose slot is `Gone` may have been the
+/// last possible reader of its §8 status word, so the reclaim check runs. It is
+/// asked AFTER the unbind, because the entry being released is one of the ones
+/// the scan must not find.
+func release_handle(p: Int, word: UInt, entry: HandleEntry) unsafe -> SyscallResult {
+    match entry.obj_type {
+        case Unbound -> fault_process(p, FaultReason.BadHandle),
+        case _ -> {},
+    }
+    unbind_handle(p, handle_word_index(word))
+    match entry.obj_type {
+        case Process -> { reclaim_process_slot(entry.target) },
+        case _ -> {},
+    }
+    op_ok()
+}
+
 /// Handle-table lookup -> object type -> op table -> rights check -> op.
 ///
 /// This is where a raw word becomes a TYPED handle (§3), and the order is the
@@ -1327,10 +1378,20 @@ func waiter_wait(p: Int, w: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
 /// there is no op table to ask. That is the faults ruling's shape as much as its
 /// content — the three caller errors it covers are exactly the three the
 /// dispatch can raise before an op body runs.
+///
+/// **RELEASE IS INTERCEPTED BETWEEN THE TWO** (sawos design 3 D-2), and the
+/// position is the design: after the lookup, so the entry is resolved and a word
+/// naming nothing still faults; before the kind match, so the op never has to
+/// exist nine times. This is the one point in the kernel that knows a handle's
+/// ENTRY and not yet its KIND, which is exactly the altitude a kind-independent
+/// op belongs at.
 func dispatch(handle: UInt, op: UInt,
               arg0: UInt, arg1: UInt, arg2: UInt) unsafe -> SyscallResult {
     let p = calling_process()
     let entry = lookup_handle(p, handle)
+    if op == RELEASE_OP {
+        return release_handle(p, handle, entry)
+    }
     match entry.obj_type {
         case Unbound -> fault_process(p, FaultReason.BadHandle),
         case System -> {

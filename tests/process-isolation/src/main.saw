@@ -60,7 +60,7 @@ func _start(boot_handle: UInt) {
 
     // Row 0 is the child's image blob, row 1 the RAM it runs in — this build's
     // config, which is root's business and never the kernel's.
-    let image = match proc.boot_handle_next() {
+    var image = match proc.boot_handle_next() {
         case Ok(h) -> h,
         case Err(e) -> {
             print("SOS isolation: no image region: {}\n", e)
@@ -68,7 +68,7 @@ func _start(boot_handle: UInt) {
             return
         },
     }
-    let dest = match proc.boot_handle_next() {
+    var dest = match proc.boot_handle_next() {
         case Ok(h) -> h,
         case Err(e) -> {
             print("SOS isolation: no destination region: {}\n", e)
@@ -77,8 +77,13 @@ func _start(boot_handle: UInt) {
         },
     }
 
-    let child = match system.process_create(image: &image.memory,
-                                            memory: &dest.memory) {
+    // The record hands the region over — see `process-lifecycle` for why
+    // `take_memory` is the one way out (sawos design 3 D-5).
+    let image_mem = image.take_memory()!
+    let dest_mem = dest.take_memory()!
+
+    let child = match system.process_create(image: &image_mem,
+                                            memory: &dest_mem) {
         case Ok(c) -> c,
         case Err(e) -> {
             print("SOS isolation: create failed: {}\n", e)

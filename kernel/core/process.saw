@@ -30,6 +30,7 @@ import sosabi.{
 }
 import kcore.limits.{
     MAX_GRANT_ROWS,
+    MAX_HANDLES,
     MAX_MEMORIES,
     MAX_PROCESSES,
     NO_MEMORY,
@@ -39,6 +40,7 @@ import kcore.limits.{
 import kcore.mem.{copy_bytes, word_bytes}
 import kcore.diag.{console, fatal_image}
 import kcore.objects.{
+    HANDLES,
     MEMORIES,
     MemorySlot,
     SlotState,
@@ -132,10 +134,16 @@ public(package) struct GrantRow {
 /// `kcore.sched` read slots out of that table, so a private element type would
 /// be a value a sibling module holds and cannot name (refused since the Aug-21
 /// signature-visibility rule).
+/// (`self_handle` WAS HERE and is GONE — sawos design 3 D-4. It cached the word
+/// `ProcessSelf` answered with, which only made sense while a getter handed the
+/// same handle back every ask. Under mint-per-call a process's own Process
+/// handle is not a fact about the process at all: it is however many capability
+/// instances the process asked for, each independently releasable, so a cached
+/// word would name one of them and go stale the moment that one was released.
+/// The table is the truth. `ThreadSlot.self_handle` went the same way and for
+/// the same reason.)
 public(package) struct ProcessSlot {
     public(package) state: ProcessState,
-    /// This process's own handle in its own table (what `ProcessSelf` returns).
-    public(package) self_handle: UInt,
     /// The image entry, which is what `ENTRY_IMAGE` resolves to.
     public(package) entry: UInt,
     /// Where a `start` puts the first thread's stack pointer — the kernel's
@@ -153,7 +161,7 @@ public(package) struct ProcessSlot {
 }
 
 public(package) unsafe static var PROCESSES: [ProcessSlot; MAX_PROCESSES] = [
-    ProcessSlot(state: ProcessState.Free, self_handle: 0, entry: 0,
+    ProcessSlot(state: ProcessState.Free, entry: 0,
              stack_top: 0, region_base: 0, region_top: 0, rw_base: 0, rw_top: 0,
              grant_count: 0,
              grants: [GrantRow(base: 0, top: 0, perms: 0, device: false);
@@ -162,19 +170,21 @@ public(package) unsafe static var PROCESSES: [ProcessSlot; MAX_PROCESSES] = [
 
 /// Take a free process slot, or `NO_PROCESS` when the table is full.
 ///
-/// **`Gone` IS NOT `Free`, AND A DEAD SLOT IS NEVER SPENT AGAIN in v1** — which
-/// is why this scans rather than counting how many processes have been made.
-/// The teardown leaves the slot holding its §8 status word, because the
-/// creator's handle onto it OUTLIVES it (the teardown closes the handles in the
-/// DEAD process's table, not in its creator's) and reading how a child died is
-/// the whole of the supervision story this unit has. Reclaiming the slot needs
-/// somewhere for that status to go first, which is the handle-close op unit
-/// 2.75 brings and unit 5.5's death notification is the consumer of. Until
-/// then, `MAX_PROCESSES` bounds how many processes a run may CREATE rather than
-/// how many may exist at once, and a request past it is `NoResource`.
+/// **`Gone` IS NOT `Free`, AND A DEAD SLOT IS SPENT AGAIN ONLY WHEN NOTHING CAN
+/// READ IT** (sawos design 3 D-3, amending unit 2's pend) — which is why this
+/// scans rather than counting how many processes have been made. The teardown
+/// leaves the slot holding its §8 status word, because the creator's handle onto
+/// it OUTLIVES it (the teardown closes the handles in the DEAD process's table,
+/// not in its creator's) and reading how a child died is the whole of the
+/// supervision story. What unit 2 lacked was a way to know when the last reader
+/// was gone; RELEASE is that reader-count, and `reclaim_process_slot` below is
+/// the check. So `MAX_PROCESSES` bounds CONCURRENT processes again, which is
+/// what the name says, and a request past it is still `NoResource`.
 ///
-/// `ThreadState.Exited` is the same decision one level down, for the same
-/// reason: a join arriving after the exit still has to find the exit code.
+/// `ThreadState.Exited` is the same decision one level down, and it has NOT
+/// moved: a join arriving after the exit still has to find the exit code, and no
+/// handle names a thread slot the way one names a process slot, so there is no
+/// reader-count to run. Thread slots come back at the process's teardown.
 public(package) func alloc_process() unsafe -> Int {
     var i: Int = 0
     while i < MAX_PROCESSES {
@@ -185,6 +195,56 @@ public(package) func alloc_process() unsafe -> Int {
         i = i + 1
     }
     NO_PROCESS
+}
+
+/// Free a `Gone` process's slot if no handle ANYWHERE still names it (sawos
+/// design 3 D-3).
+///
+/// **THE ONE SLAB THAT RECLAIMS ON RELEASE, and it is special for a reason the
+/// others do not share.** Every other kind's slot is freed by its owner's
+/// teardown, because "may I free this" has no cheap answer for an Event or a
+/// Timer — it needs a refcount nothing yet justifies. A Gone process's slot is
+/// different twice over: unit 2 explicitly queued it (`alloc_process` above
+/// recorded the pend), and its question has a PRECISE answer. The only thing a
+/// Gone slot still holds is its §8 status word, the only way to read that word
+/// is `GetStatus` through a Process handle, so no handle naming the slot means
+/// no possible reader and the slot may go.
+///
+/// SCANNED, NOT COUNTED. A per-slot refcount would be a second fact to keep in
+/// step with the table across mint, release, teardown and `give`; the table
+/// itself cannot disagree with the table. The walk is `MAX_PROCESSES *
+/// MAX_HANDLES` — thirty-two entries — at a release, which is the rate a process
+/// drops capabilities and nowhere near a hot path.
+///
+/// EVERY PROCESS'S TABLE, not the caller's: the reader that matters is whoever
+/// still holds a handle, and that need not be the process releasing one. It runs
+/// at the END of a process's own teardown too, for its own slot — the dying
+/// process's handles are closed there, and if it happened to hold the last one
+/// (a process that released its creator's handle, or a self-referring root) that
+/// close is what makes the slot free.
+///
+/// D-1's generations are what make the reused slot SAFE: a later process landing
+/// here gets a new life, and a word onto the old one has a generation that no
+/// longer matches. `clear_domain` already invalidated `LAST_PROT_PROCESS` in
+/// anticipation of exactly this.
+public(package) func reclaim_process_slot(slot: Int) unsafe {
+    match PROCESSES[slot].state {
+        case Gone -> {},
+        case _ -> { return },
+    }
+    var i: Int = 0
+    while i < MAX_PROCESSES * MAX_HANDLES {
+        match HANDLES[i].obj_type {
+            case Process -> {
+                if HANDLES[i].target == slot {
+                    return
+                }
+            },
+            case _ -> {},
+        }
+        i = i + 1
+    }
+    PROCESSES[slot].state = ProcessState.Free
 }
 
 // -----------------------------------------------------------------------------
@@ -255,15 +315,20 @@ public(package) func load_domain(p: Int) unsafe {
 
 /// Forget process `p`'s domain and its rows. Called by the teardown.
 ///
-/// INVALIDATING `LAST_PROT_PROCESS` IS THE PART THAT MATTERS, and it is written
-/// for a hazard that does not exist YET rather than one that does. Today a dead
-/// process's slot is never spent again (`alloc_process` says why), so the next
-/// switch compares against a different number and reloads anyway. The moment a
-/// slot CAN be reused — unit 2.75's handle close is what makes reclaiming one
-/// possible — a new process landing in it would compare EQUAL to a domain that
-/// is no longer installed, and the next switch would skip the reload and run it
-/// under the dead one's map. Clearing the word here is what makes that safe
-/// without handle generations, and it costs one comparison.
+/// INVALIDATING `LAST_PROT_PROCESS` IS THE PART THAT MATTERS, and the hazard it
+/// was written for HAS ARRIVED (sawos design 3 D-3). A dead slot is reclaimed
+/// now, as soon as no handle names it, so a new process really can land in this
+/// slot — and it would compare EQUAL to a domain that is no longer installed,
+/// and the next switch would skip the reload and run it under the dead one's
+/// map. Clearing the word here is what makes the reuse safe, and it costs one
+/// comparison.
+///
+/// It is a SEPARATE mechanism from D-1's handle generations rather than a
+/// duplicate of one, and the difference is worth keeping straight: a generation
+/// stops a stale HANDLE from naming the new occupant, and this stops a stale
+/// PROTECTION DOMAIN from being left installed for it. Neither substitutes for
+/// the other — the first is about what userspace may name, the second about what
+/// the hardware is programmed with.
 public(package) func clear_domain(p: Int) unsafe {
     PROCESSES[p].grant_count = 0
     if LAST_PROT_PROCESS == p {
@@ -638,7 +703,6 @@ public func start_process(entry: UInt, stack_top: UInt,
     // is already there: the loader records root's rows as it places them, and a
     // struct literal here would erase them on the way past.
     PROCESSES[p].state = ProcessState.Running
-    PROCESSES[p].self_handle = 0
     PROCESSES[p].entry = entry
     PROCESSES[p].stack_top = stack_top
     PROCESSES[p].region_base = region_base
@@ -648,14 +712,21 @@ public func start_process(entry: UInt, stack_top: UInt,
     PROCESSES[p].exit_kind = ProcessStatusKind.Running
     PROCESSES[p].exit_code = 0
 
+    // §12's ORDER IS THE CONTRACT and it is unchanged by design 3: these three
+    // are minted into a virgin table, so each lands at generation 0 and D-1's
+    // rule makes its word the bare index — 1 = System, 2 = Process, 3 = Thread,
+    // exactly what root and the hand-assembled payloads have always been handed.
+    // The two that are not passed anywhere are minted so that root's own Process
+    // and its main Thread OCCUPY those indices; nothing reads the words back
+    // (`ProcessSelf` and `ThreadSelf` mint their own now, D-4), which is why
+    // neither is bound to a name here.
     let system = mint_handle(p, ObjType.System, root_system_rights(), 0)
-    let own = mint_handle(p, ObjType.Process, root_process_rights(), p)
-    PROCESSES[p].self_handle = own
+    let _ = mint_handle(p, ObjType.Process, root_process_rights(), p)
 
     let main = alloc_thread()
-    let main_handle = mint_handle(p, ObjType.Thread, thread_rights(), main)
+    let _ = mint_handle(p, ObjType.Thread, thread_rights(), main)
     THREADS[main] = ThreadSlot(state: ThreadState.Running, process: p,
-                               self_handle: main_handle, exit_code: 0,
+                               exit_code: 0,
                                joiners: 0, link: 0, wait_buf: 0)
     CURRENT_THREAD = main
     SLICE_LEFT = SLICE_TICKS
