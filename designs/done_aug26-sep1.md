@@ -267,3 +267,29 @@ repo's first done file; sawos was born Aug 28 (sawlang#238).
   the far end
   INTEGRATED to main Aug 30 2026 (lead-reviewed, gate re-run
   150/150, fast-forward a3d5fc2)
+
+- First `sawlang.pin` bump — expected after sawlang design 218 unit 1.5
+  (monomorphization) lands; bump version + sha TOGETHER [sawlang#238
+  D-b2]
+  CLOSED Aug 30: the first bump happened for sawlang 0.2.0 @
+  `3f15d2ee` (SL-7's fix — extension lookup follows `public
+  import`), ahead of the 218/1.5 expectation. version + sha
+  bumped together per D-b2
+
+- `Waiter.add(process:, key:)` respell — a PIN-BUMP EVENT, sawlang-side
+  [SL-7; #8 As-built finding 1; ruled by the user Aug 30]: once the
+  sawlang fix (extension lookup follows `public import`) ships in a
+  pin bump, design 8's ruled spelling becomes writable: `extension
+  Waiter` in `sos.system` adds `add(process:, key:)` (it can read
+  `process.handle` there — Process's module), the raw funnel
+  `attach(target:, key:)` in `waiter.saw` widens to `public(package)`
+  (NOT `public` — the no-forged-handles story rests on the raw form
+  being unreachable from user code), `Process.attach` retires, the
+  death tests respell, spec §2.2/§8 surface sentences + design 8
+  As-built finding 1 amended (rider), SL-7 closes. Seed edits sit
+  uncommitted in the lead's working tree (user, Aug 30). Transcript
+  expectation: nothing beyond address-only
+  CLOSED Aug 30 — EXECUTED with the first pin bump (sawlang
+  0.2.0): everything in scope landed as written, except that no
+  spec sentence names the method spelling, so no spec edit was
+  owed. INTEGRATED to main with the bump commit (lead)
