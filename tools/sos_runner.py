@@ -3041,7 +3041,7 @@ def _check(case, arch, status, out, timed_out):
     return True, ""
 
 
-def _run_arch(arch, qemu, lld, clang, blade_bin):
+def _run_arch(arch, qemu, lld, clang, blade_bin, selected_cases):
     """Build and run every case for one architecture. Returns (passed, failed)."""
     dirs = arch_dirs(arch)
     print(f"{BOLD}{arch['name']}{RESET}  ({arch['triple']}, {os.path.basename(qemu)} `virt`)")
@@ -3052,7 +3052,7 @@ def _run_arch(arch, qemu, lld, clang, blade_bin):
     # and each one says which in a comment beside it. It is decided FIRST, so
     # every "this whole architecture failed" count below is the number of cases
     # that would have run here.
-    cases = [c for c in TEST_CASES
+    cases = [c for c in selected_cases
              if arch["name"] in c.get("arches", (arch["name"],))]
 
     try:
@@ -3133,6 +3133,11 @@ def main():
     parser = argparse.ArgumentParser(description="SOS QEMU test harness")
     parser.add_argument("--arch", metavar="NAME",
                         help="run one architecture (default: every one — the GATE is every one)")
+    parser.add_argument("--case", metavar="NAME", action="append", dest="cases",
+                        help="run only the named case(s) — repeatable, or one "
+                             "comma-separated list; hyphens and underscores are "
+                             "interchangeable. A DEVELOPMENT convenience: the "
+                             "GATE is every case on every architecture")
     args = parser.parse_args()
 
     arches = ARCHES
@@ -3143,6 +3148,29 @@ def main():
             print(f"{RED}unknown --arch {args.arch!r}; known: {names}{RESET}",
                   file=sys.stderr)
             sys.exit(2)
+
+    # The case filter is applied to the ONE table everything downstream reads,
+    # so a filtered run builds only what the named cases need (the blade build
+    # below and the per-arch package list both see the narrowed list). Names
+    # are matched with '-' and '_' interchangeable because the case names use
+    # underscores while the tests/ directories use hyphens, and remembering
+    # which is nobody's job.
+    selected_cases = TEST_CASES
+    if args.cases:
+        wanted = [w.strip().replace("-", "_")
+                  for value in args.cases for w in value.split(",") if w.strip()]
+        by_name = {c["name"].replace("-", "_"): c for c in TEST_CASES}
+        unknown = [w for w in wanted if w not in by_name]
+        if unknown:
+            import difflib
+            for w in unknown:
+                close = difflib.get_close_matches(w, by_name, n=3)
+                hint = f" (did you mean: {', '.join(close)}?)" if close else ""
+                print(f"{RED}unknown --case {w!r}{hint}{RESET}", file=sys.stderr)
+            sys.exit(2)
+        seen = set()
+        names = [w for w in wanted if not (w in seen or seen.add(w))]
+        selected_cases = [by_name[w] for w in names]
 
     qemus, lld, clang = _probe_tools(arches)
     if not _check_arch_free():
@@ -3158,7 +3186,8 @@ def main():
     # Blade is architecture-neutral (a host binary), so it is built once and
     # driven per target.
     blade_bin = None
-    if any(case.get("root_pkg") for case in TEST_CASES):
+    if any(case.get("root_pkg") or case.get("children")
+           for case in selected_cases):
         shared_build = os.path.join(REPO_ROOT, ".build", "sos-host")
         os.makedirs(shared_build, exist_ok=True)
         try:
@@ -3172,7 +3201,8 @@ def main():
     total_passed = 0
     total_failed = 0
     for arch in arches:
-        passed, failed = _run_arch(arch, qemus[arch["name"]], lld, clang, blade_bin)
+        passed, failed = _run_arch(arch, qemus[arch["name"]], lld, clang,
+                                   blade_bin, selected_cases)
         total_passed += passed
         total_failed += failed
 
