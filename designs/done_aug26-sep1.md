@@ -202,3 +202,32 @@ repo's first done file; sawos was born Aug 28 (sawlang#238).
   carrying values the harness deliberately does not assert
   (`thread_preempt`'s interleaving ×2, `timer_interval`'s coalesced
   fire count). Full account in the brief's As-built
+
+- M3 unit 5 — quotas + the reference count [sawlang#232 unit 5 +
+  agenda 8, the Aug-29 refcount conversation as D-1; #7 —
+  designs/007-quotas.md, authored Aug 29]: per-slot refs (handles +
+  attachments, per-kind matrix), synchronous free-on-zero with credit
+  at the free site, creator-pays (mappings charge the TARGET — lead
+  ruling), QuotaExceeded=7 as the policy answer distinct from
+  NoResource, agenda-8's quota≤wall assert executable, orphan
+  write-off degenerate-by-construction v1 (nothing gives upward),
+  design 6's mapping-slot deviation resolved. Third authorized
+  transcript movement (free-on-zero moves teardown counts; per-case
+  accounting owed). DISPATCHED Aug 29.
+  **CLOSED Aug 29 — BUILT. Gate: 144 passed across riscv32 + arm64
+  (72 cases each), against a baseline of 134.** Every D landed; three
+  shapes deviate from the brief's letter and each is argued in the
+  As-built (the mapping row counts installed ROWS rather than Mapping
+  objects, so agenda 8's assert is provable; root's rows are
+  `QUOTA_UNLIMITED` rather than the slab sizes, so the machine keeps
+  its own voice; the ledger is per-process storage in `kcore.objects`
+  rather than a `ProcessSlot` field, because the handle row is charged
+  inside `mint_handle`). **AND THE THIRD AUTHORIZED MOVEMENT TURNED
+  OUT TO BE EMPTY**: NO teardown count moved, on either arch — the
+  suite's pre-exit drops are all of Clock handles (exempt) or of kinds
+  the teardown line has no column for. The one asserted line that moved
+  is `memory_split`'s, whose claim design 6's finding 5 tied to this
+  unit by name. New finding: D-4's "no orphan can exist in v1" is
+  false for a Mapping charged to its TARGET, and the row-based
+  accounting is what closes it. See designs/007-quotas.md's As-built
+  INTEGRATED to main Aug 29 (lead-reviewed incl. the four deviations — all accepted, two of them corrections to the brief; gate re-run 144/144, fast-forward e293648).
