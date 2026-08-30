@@ -21,6 +21,12 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
+- M3 unit 7 — the docs sweep [sawlang#232 item 7, #11 —
+  designs/011-m3-docs-sweep.md, authored Aug 30]: the §3 no-amplification
+  rewrite, §2.3 rename, §5.7 amendment, the DMA-TCB note, the §11 M3
+  refresh, and the stale-promise consistency grep. Docs only; gate
+  byte-identical. M3 CLOSES when this integrates
+
 ## [BACKLOG] — filed, not scheduled
 
 - M4 scoping — pipes [#10 — designs/010-m4-pipes.md, DRAFT Aug 30,
