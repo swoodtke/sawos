@@ -1079,10 +1079,19 @@ public func root_system_rights() -> UInt32 {
 /// state word answers them better than a rights word could, because it answers
 /// them for a CHILD too.
 ///
-/// `InterruptBind` is the bit M3 will stop handing out freely: root keeps it (it
-/// launches the drivers), and a launcher that spawns something which is not one
-/// hands over a handle its keep mask left the bit out of — which is §3's
-/// monotonic attenuation with `MINT_OP` as the tool, and no new mechanism.
+/// `InterruptBind` WAS EXPECTED TO STOP BEING HANDED OUT FREELY IN M3, AND IT
+/// DID NOT — recorded here rather than left to be discovered (sawos design 9,
+/// M3 unit 6's finding). The plan was §3's monotonic attenuation with `MINT_OP`
+/// as the tool: root keeps the bit because it launches the drivers, and a
+/// launcher spawning something that is not one hands over a handle its keep
+/// mask left the bit out of. The mask cannot reach it. `SystemOp.ProcessSelf`
+/// mints THIS ONE default set and takes no keep mask, so a child derives its
+/// own Process handle with `InterruptBind` and `Map` on it whatever its SYSTEM
+/// handle was narrowed to — a launcher's mask reaches the System sibling it
+/// gives, not the Process handle the child derives from it. Withholding either
+/// bit needs `ProcessSelf` to take a keep mask of its own; nothing in v1 needs
+/// that (a driver child is exactly the process that should hold both), and the
+/// attenuate-at-derive seam is a ruled M4 rider (`designs/010` agenda 7b).
 public func process_rights() -> UInt32 {
     ((ProcessRight.ThreadCreate as UInt32) | (ProcessRight.ThreadSelf as UInt32)
      | (ProcessRight.Exit as UInt32) | (ProcessRight.Wait as UInt32)

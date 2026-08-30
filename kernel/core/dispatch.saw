@@ -593,8 +593,10 @@ func region_wraps(base: UInt, len: UInt) -> Bool {
 ///     policed: regions are capabilities, the region table is build-emitted
 ///     disjoint, and root double-spending what it holds corrupts only what it
 ///     holds. Unit 4's pools made a region DIVISIBLE without making it
-///     accounted; real accounting arrives with unit 5's quotas and
-///     free-on-last-reference.
+///     accounted; unit 5 added the accounting there is — a per-process QUOTA
+///     ROW per kind and free-on-last-reference on the slab slot — and it
+///     counts OBJECTS, so overlap across creates is no more policed now than
+///     it was. Byte accounting waits for a real allocator (M4+).
 func process_create(p: Int, image_handle: UInt,
                     memory_handle: UInt) unsafe -> SyscallResult {
     let img = memory_arg(p, image_handle)
@@ -2115,8 +2117,12 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
         // the piece before it too.
         //
         // Slab exhaustion is `NoResource`, a STATUS, because a caller cannot
-        // know how many slots are left. Free-on-last-reference is unit 5's, so
-        // the slot comes back at teardown and not before.
+        // know how many slots are left — and since unit 5 it is a HARDER wall
+        // to reach than it was: free-on-last-reference landed, so a piece that
+        // is split off and dropped returns its slot at once rather than at the
+        // owner's teardown. What a splitting loop meets first is therefore the
+        // POOL, not the slab (`tests/memory-split` walks twenty rounds past a
+        // slab of sixteen), because the bytes are what nothing returns.
         case Split -> {
             if not obj.allows(MemoryRight.Split) {
                 fault_process(p, FaultReason.AccessDenied)
@@ -2323,14 +2329,21 @@ func mapping_op_decoded(op: MappingOp, obj: &MappingObject,
         // is reachable through that handle the moment the next `map` reuses it,
         // and design 3's generations cannot cover it: a generation lives in the
         // handle ENTRY, and the entry is not what went away. So an unmapped
-        // Mapping keeps its slot, answers `BadState` forever, and comes back at
-        // its owner's teardown — which is not a concession, it is the rule
-        // every other kind already follows (design 3 D-2: an object whose last
-        // handle is gone is unreachable-but-live until its process tears down;
-        // the one slab that reclaims earlier is a `Gone` PROCESS's, and it
-        // earns that with a reader-count scan nothing here has an equivalent
-        // of). Refcounted early reclamation is unit 5's, for this slab and for
-        // the others together.
+        // Mapping keeps its slot and answers `BadState` forever.
+        //
+        // **UNIT 5 CHANGED WHAT RECLAIMS THE SLOT AND LEFT THIS ARM ALONE**
+        // (sawos design 7 D-1/D-2). Refcounted reclamation landed for every
+        // countable kind, so the slot comes back when the LAST HANDLE naming
+        // this Mapping is released — inside that release, not at the owner's
+        // teardown — which is sound precisely because it is the case this
+        // paragraph excludes: no handle is left to reach the reused slot
+        // through. `refs.saw`'s Mapping arm deliberately LEAVES THE ROW when
+        // it frees, since a Mapping owns its row and the row is not a
+        // reference back. The two husks are therefore symmetric and both
+        // reachable: unmapped-but-referenced (this path — slot lives, `Unmap`
+        // is `BadState`) and mapped-but-unreferenced (slot freed, row
+        // installed until the TARGET tears down). `Unmap` itself still frees
+        // no slot, which is what the paragraph above says and is unchanged.
         case Unmap -> {
             if not obj.allows(MappingRight.Unmap) {
                 fault_process(p, FaultReason.AccessDenied)

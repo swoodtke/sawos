@@ -37,8 +37,18 @@ import sos.floor.{checked, sos_handle_release, sos_mapping_unmap}
 /// lifetime the wrapper's, and a wrapper drops on every path out of a scope
 /// including the ones a launcher takes right after handing a child its memory —
 /// so the shape unit 4 exists for (map into a child, then start it) would
-/// revoke the mapping before the child ever ran. Tying the two lifetimes wants
-/// the refcount §2.5 describes, which is unit 5's.
+/// revoke the mapping before the child ever ran.
+///
+/// **THE REFCOUNT ARRIVED IN M3 UNIT 5 AND DID NOT CHANGE THAT** (sawos design
+/// 7 D-2), which is why this note now records a RULING rather than a wait. A
+/// Mapping OWNS its row; the row is not a counted reference back. So a
+/// mapped-but-unreferenced Mapping — every handle released, the grant still
+/// installed — reaches zero, FREES ITS SLOT AND LEAVES THE ROW, and the row is
+/// then unremovable until the TARGET process's teardown. That is exactly the
+/// permanent-but-safe stance above, made mechanical instead of promised. An
+/// unmapping `deinit` is therefore not blocked on a mechanism any more; it is
+/// declined on the launcher argument, and the escape hatch is the one it always
+/// was — call `unmap()` where revocation is meant, and let the drop be a drop.
 public struct Mapping {
     public(package) handle: MappingHandle,
 }

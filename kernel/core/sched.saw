@@ -571,9 +571,12 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // MEMORY REGIONS go back too (sawos design 2 D-2). A Memory is a sealed
     // range and nothing else, so freeing one reclaims a slab slot and no
     // hardware — the bytes it named belong to whoever the build said they
-    // belong to, and unit 5's free-on-last-reference is where returning a
-    // range to an owner becomes an operation (§2.5's refcount clause; unit 4
-    // built the pools and deliberately left the returning out).
+    // belong to. This loop is the BACKSTOP now rather than the only path:
+    // unit 5's free-on-last-reference reclaims a region's slot the moment its
+    // last handle is released, so what is left here at teardown is whatever
+    // the process still held. Returning a RANGE to an owner is still not an
+    // operation anywhere — quotas count objects and not bytes in v1 (§2.5's
+    // narrowing), and it waits for a real allocator.
     var m: Int = 0
     while m < MAX_MEMORIES {
         if MEMORIES[m].process == p {

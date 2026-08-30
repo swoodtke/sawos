@@ -76,13 +76,18 @@ extension Memory {
     /// or handle table is `SosStatus.NoResource`, which it could not have known.
     ///
     /// THE PIECE IS PERMANENT UNTIL TEARDOWN, and it is worth being exact about
-    /// how permanent. Free-on-last-reference is unit 5's (§2.5's refcount
-    /// clause), so DROPPING the region that comes back gives up its HANDLE and
-    /// nothing else: not the range, which no longer belongs to this pool, and
-    /// not even the kernel slab slot, which returns at the owner's teardown like
-    /// every other kind's. A pool walked to its end stays walked, and a loop
-    /// that splits and discards runs out of SLOTS long before it runs out of
-    /// pool. Stated here rather than discovered.
+    /// WHICH piece. **Free-on-last-reference LANDED in M3 unit 5** (sawos
+    /// design 7 D-1), so DROPPING the region that comes back returns its kernel
+    /// SLAB SLOT immediately — inside the release that took the count to zero,
+    /// no teardown involved — and credits the caller's Memory quota row. What
+    /// it does NOT return is the RANGE: quotas count OBJECTS and not bytes in
+    /// v1, and a front-cut parent is a one-way cursor that cannot absorb an
+    /// arbitrary hole, so those bytes belong to no pool afterwards. A pool
+    /// walked to its end stays walked. The consequence is the opposite of what
+    /// this note used to say: a loop that splits and discards no longer runs
+    /// out of SLOTS at all — `tests/memory-split` completes twenty rounds past
+    /// a slab of sixteen — it runs out of POOL. Stated here rather than
+    /// discovered.
     public func split(&self, len: UInt) -> Result<Memory, SosStatus> {
         let raw = try call_value(self.handle, MemoryOp.Split as UInt, len, 0, 0)
         return Memory(handle: MemoryHandle(raw))
