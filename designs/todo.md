@@ -21,7 +21,18 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
-- M3 unit 5 — quotas [sawlang#232]
+- M3 unit 5 — quotas + the reference count [sawlang#232 unit 5 +
+  agenda 8, the Aug-29 refcount conversation as D-1; #7 —
+  designs/007-quotas.md, authored Aug 29]: per-slot refs (handles +
+  attachments, per-kind matrix), synchronous free-on-zero with credit
+  at the free site, creator-pays (mappings charge the TARGET — lead
+  ruling), QuotaExceeded=7 as the policy answer distinct from
+  NoResource, agenda-8's quota≤wall assert executable, orphan
+  write-off degenerate-by-construction v1 (nothing gives upward),
+  design 6's mapping-slot deviation resolved. Third authorized
+  transcript movement (free-on-zero moves teardown counts; per-case
+  accounting owed). DISPATCHED Aug 29; closes in place when the
+  branch parks
 - M3 unit 5.5 — death notifications [sawlang#232]
 - M3 unit 6 — the money shot [sawlang#232]
 
