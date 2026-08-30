@@ -21,50 +21,16 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
-- ~~M3 unit 4 — Memory/IoMemory/Mapping~~ **CLOSED Aug 29** [sawlang#232
-  §2.5, #6 — designs/006-memory.md]: a Mapping IS an installed grant
-  row, and the unit is small because of it — the grant record unit 2
-  built for the SCHEDULER is the record `map` edits. LANDED: three
-  kinds (`ObjType.IoMemory = 10`, `Mapping = 11`) with `Split`/`Map`,
-  `Carve`/`Map`, `Unmap`; `MemoryRight.Split|Map`, `IoMemoryRight`,
-  `MappingRight`, `ProcessRight.Map` (two rights on two objects at a
-  map); `MapAccess` as public API and access PER MAPPING, so
-  double-mapping RO+RW is allowed; the LIVE-DOMAIN RULE
-  (`domain_changed`, one helper, both ops) with unmap compacting the
-  record and fixing up the Mapping slab's stored row indices; the PMP
-  budget widened 4→8 TOR regions / 16 entries (`MAX_ROOT_SEGMENTS` 3→7,
-  four cfg shadows, four-way `stage_cfg`, `sink.c` cases 8..15 and a
-  four-word `sos_pmpcfg_write`); per-arch `GRANT_ROW_BUDGET` +
-  `map_target_ok` + `device_window_ok` (a map outside a window is a
-  caller-visible `BadArg`, not the HAL's kernel-bug stop); region table
-  VERSION 2 with a kind column (24-byte rows, `len == 0` short-circuit
-  kept ahead of every header read); the uart-echo pair migrated to
-  obtained-not-declared, same bytes and same line number; five new
-  proof cases + one child package. DEVIATIONS FROM THE BRIEF, both
-  recorded with reasons in the As-built: unmap does NOT free the
-  Mapping slot (a slab slot freed under a live handle is reachable
-  through it when the next map reuses it — the aliasing generations
-  cannot cover, since a generation lives in the handle ENTRY), and the
-  map funnels are `Process.map(memory:access:)` /
-  `Process.map(iomemory:)` rather than `Memory.map(into:)` (design 5
-  finding 1 again — `BootHandle` carries both region kinds, so both
-  modules are below `system` and a `map` naming `Process` there is a
-  cycle). Free-on-last-ref stays explicitly unit 5's.
-  GATE: 134 rows green on both arches (124 + 10 new, nothing removed).
-  The 124 pre-existing, bucketed mechanically: 37 byte-identical, 82
-  differing ONLY in an address the linker or the kernel chose (`entry=`,
-  `epc=`/`elr=`, a tick's `at 0x…` — the `sos` module and the kernel
-  both grew, so every root image's entry and the appended payload
-  moved; `tval=` and every asserted field are unchanged), the 2
-  AUTHORIZED uart-echo migrations accounted line by line, and 3 rows
-  carrying values the harness deliberately does not assert
-  (`thread_preempt`'s interleaving ×2, `timer_interval`'s coalesced
-  fire count). Full account in the brief's As-built
 - M3 unit 5 — quotas [sawlang#232]
 - M3 unit 5.5 — death notifications [sawlang#232]
 - M3 unit 6 — the money shot [sawlang#232]
 
 ## [BACKLOG] — filed, not scheduled
+
+- tools/sosimg_dump.py — landed Aug 29 (user-requested dev tool, this
+  line is its capture): dumps sosimg v3 headers/segments and raw v2
+  region tables; kept in step with imgformat + process.saw by hand —
+  a format bump edits it too
 
 - sawlang#238 unit 6 remainder — CI cold-fetch acceptance + negative
   tests PEND sawlang becoming public at the pinned sha (a82e06f4);
