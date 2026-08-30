@@ -1,7 +1,7 @@
 # SawOS design 10 — M4 SKETCH: pipes (agenda for the scoping session)
 
-**Status: DRAFT Aug 30 2026 (lead), for user review — the plan of
-record once ruled.** M4 starts after M3 closes (unit 6
+**Status: RULED Aug 30 2026 (user, all seven agenda items — see "As
+ruled") — THE PLAN OF RECORD.** M4 starts after M3 closes (unit 6
 = design 9, unit 7 = docs sweep). What this does NOT reopen: §2.1 is
 RATIFIED (Jul 29; renamed + client API amended Aug 20) — the message
 model, the one-shot reply pair, abandonment, the TELL idiom, and the
@@ -61,12 +61,14 @@ write-capable count never reaches zero until nobody is left to wake
 — the socket shutdown() hole). And a rights-partitioned count on one
 object is a SECOND LEDGER, against design 7's one-ledger doctrine.
 
-**A connection is a PAIR of counted endpoint kinds**: the client end
-(`Pipe`, §2.1's own name — "the PER-CLIENT connection object") and
-the server connection end (kind name an agenda item; `PipeServe`
-leading). Ops differ per end — send lives on one, receive on the
-other — so rights stay named for ops (Aug-29 doctrine) and the roles
-are structural, not a rights mask to count by. Then:
+**A connection is a PAIR of counted endpoint kinds** (names RULED
+Aug 30, user): **`PipeInlet`** is the CLIENT side — requests flow IN
+here — and **`PipeOutlet`** is the SERVER side, where they come out.
+"Pipe" survives as the connection's collective name (§2.1's
+"per-client connection object" sentence amends to name the pair).
+Ops differ per end — send lives on the inlet, receive on the outlet
+— so rights stay named for ops (Aug-29 doctrine) and the roles are
+structural, not a rights mask to count by. Then:
 
 - "Writers went to zero" IS "the client end reached zero references"
   — the existing ledger, no new vocabulary. `free_object` grows an
@@ -96,8 +98,8 @@ are structural, not a rights mask to count by. Then:
   the status word, the free-arm walk, `waiter-revoked` case (sibling
   parks, main drops last handle, sibling wakes with the status).
   Small; lands the terminal-status vocabulary everything later uses.
-- **Unit 1 — the pair.** Both endpoint kinds: create (the factory
-  and WHO owns it is agenda item 3), refcount arms, quota rows,
+- **Unit 1 — the pair.** `PipeInlet`/`PipeOutlet`:
+  `ProcessOp.PipeCreate` (agenda ruling 3), refcount arms, quota rows,
   blocking `send`/`receive` data-only rendezvous, PeerClosed on both
   zero-arms. No handles-in-messages, no waitability yet. The copy
   funnels exist (§2.2's one door); kernel interruptibility (M3 unit
@@ -108,11 +110,12 @@ are structural, not a rights mask to count by. Then:
   end-to-end, the memory doctrine).
 - **Unit 3 — waitability.** The three §2.2 arms (server end
   readable, reply-ready, request-abandoned) + the peer-gone terminal
-  levels through the notify machinery; split-phase send (verb:
-  agenda item 4); timeout composition (`TimedOut(pending:)` carries
-  the live claim; drop = cancel).
+  levels through the notify machinery; the `send`/`send(timeout:)`
+  LIBRARY compositions over post + wait + resolve become real here
+  (agenda ruling 4; `TimedOut(pending:)` carries the live claim;
+  drop = cancel).
 - **Unit 4 — handles in messages.** Rendezvous transfer through the
-  staged slot (a staged handle's refcount treatment is agenda item
+  staged slot (a staged handle's refcount treatment is agenda ruling
   5), the delegation proof as transcript: request forwarded to a
   third process, reply lands at the original client.
 - **Unit 5 — the money shot.** The M3-unit-6 driver child grows a
@@ -128,11 +131,12 @@ are structural, not a rights mask to count by. Then:
 - **Attenuate-at-give keep-mask** (the backlog's M4 seed): Transfer
   is inert-but-present on child System handles, recorded at four
   sites; pipes multiply the handles children hold, so the seam gets
-  hotter. Lean: TAKE as a small unit 2.5 or fold into unit 4.
+  hotter. RULED IN (agenda 7b) — unit 2.5 or folded into unit 4,
+  the unit brief decides.
 - **Event-wake / event-consume-wake one-handle-each rewrite via
   mint** (backlog; transcript-moving, pre-authorized case rewrite).
-  Lean: ride whichever unit first touches those transcripts, else
-  defer.
+  RULED DEFERRED (agenda 7b), on the standing reason — it rides
+  only a unit that moves those transcripts anyway.
 
 ## Explicitly NOT M4
 
@@ -141,34 +145,85 @@ separate, later design); kill; thread waitability; priorities/§7
 band map, SMP/IntrSpinLock, FP-in-userspace, vDSO true-mapping (the
 standing tail); the IOMMU driver (death-notification consumer 2).
 
-## The decisions agenda (the scoping session, worked item by item)
+## The decisions agenda — RULED Aug 30 (user), items 4 and 7 open
 
-1. **Ruling 1 confirmation**: revocation status word — new
-   `SosStatus` (`Revoked` leading) vs reuse; and does the same word
-   serve wait-on-freed-waiter and future revocation sites?
-2. **D-1 confirmation**: the pair model as ruled above; the server
-   end's kind name.
-3. **The factory**: where does the pair come from? Candidates: a
-   System op (`SystemRight.PipeCreate` — machine-wide resource like
-   ProcessCreate) returning both ends to the creator, who gives them
-   out (root wires children together — matches the launch flow); or
-   a Process-object factory like EventCreate. Lean: System, because
-   a connection spans processes and the wiring authority is the
-   launcher's.
-4. **Split-phase verb** (§2.1 leaves it to this brief): `post`
-   leading.
-5. **Staged-handle refcount rule**: a handle attached to an unsent/
-   unreceived message — counted where? Lean: it stays the sender's
-   entry until rendezvous (the ratified no-orphans rule), moved
-   exactly at receive, so the ledger never has an in-flight limbo
-   state.
-6. **Limits**: body bytes (64–256 ratified range) and handle count
-   per message; quota kinds and rows (ends, in-flight one-shots) —
-   creator-pays says the pair's creator is charged for both ends.
-7. **Slicing**: is unit 5's driver-as-service the right money shot,
-   and do the riders come in?
+1. **RULED: `SosStatus.Revoked`**, a new status. One word for
+   wait-on-freed-waiter and future revocation sites alike.
+2. **RULED: the pair model stands; the kinds are `PipeInlet`
+   (client) / `PipeOutlet` (server).**
+3. **RULED: the factory is on the PROCESS object**, like
+   `EventCreate`/`WaiterCreate` — pipes are IPC and carry nothing
+   system-shaped (user's words; the System lean is REJECTED). So:
+   `ProcessOp.PipeCreate` gated by a new `ProcessRight.PipeCreate`
+   in the default set, both ends minted into the creator's table,
+   wired outward with `give` (a launcher creates the pair and gives
+   inlet to one child, outlet to the other — the launch flow works
+   unchanged, and the authority is per-process attenuable, which the
+   System spelling could not offer without a mask).
+4. **RULED (Aug 30, user): `post` IS THE ONE KERNEL PRIMITIVE — the
+   PipeReplyHandle composes everything else.** The kernel's client
+   side has exactly one submission op: stage the message, return the
+   claim, never suspend. Blocking send is WAITING ON THE CLAIM
+   (attach to a Waiter, park, resolve on wake); timeout is the same
+   wait with a Timer on the same Waiter — `TimedOut(pending:)` falls
+   out because the composition holds the still-live handle when the
+   timer fires first; cancel is drop; TELL is post-then-drop; a
+   receipt/"rendezvous-complete" signal is NOT a send mode but a
+   RESERVED second level on the reply handle, unbuilt until a
+   consumer names itself. THE KERNEL NEVER LEARNS WHAT A TIMEOUT IS
+   — no duration argument, no 64-bit copy-in funnel for it, no
+   timeout code in the pipe paths; it composes from shipped Timer
+   machinery. §2.1's ratified client API is PRESERVED AS LIBRARY
+   SURFACE (vDSO discipline: surface is not ops): `send(msg)` /
+   `send(msg, timeout:)` are typed-sysapi compositions over post +
+   wait + resolve. Costs stated: a composed RPC is three traps where
+   a fused call could be fewer (a fused op is a later ADDITIVE
+   optimization, Zircon-call precedent, if profiles demand); the
+   composed send surfaces ruling 6's ring-full refusal rather than
+   parking for space ("outlet freed a slot" is another reservable
+   level); blocking a reply requires a Waiter, which the sosrt
+   wrapper owns. Ladder consequence: unit 1's proofs POLL (post +
+   nonblocking take), and the blocking wrappers become real when
+   waitability lands in unit 3. A mode-enum parameter on send was
+   CONSIDERED AND REJECTED: the four modes split into two success
+   types (the reply vs the claim), a runtime flag can change neither
+   a return type (§2.1 Aug-20's own sentence) nor a Saw function's
+   effect, and a unified outcome enum forces every blocking caller
+   through a `Pending` arm its mode cannot produce — the signature
+   shape design 234 bans.
+5. **RULED: a staged handle stays the SENDER's counted entry until
+   receive**, transferred exactly at rendezvous — the ledger never
+   has an in-flight limbo state, and an abandoned send unwinds with
+   nothing leaked (the ratified no-orphans rule made mechanical).
+6. **RULED: body 128 bytes, 4 handles per message, in-flight
+   messages per client 2 × MAX_THREADS — all BUILD DEFINES** (named
+   statics in `kcore.limits`, the tree's build-define mechanism, so
+   they change without touching logic; static_asserts pin the §2.1
+   ranges). Note the in-flight budget AMENDS §2.1's "stages one
+   message in a fixed slot": the staging is a small per-connection
+   ring of fixed slots — still zero dynamic kernel allocation, the
+   property the sentence existed for. Quota rows: creator-pays; the
+   pair's creator is charged for both ends.
+7. **RULED (Aug 30, user)**: (a) the MONEY SHOT is CONFIRMED —
+   driver-as-service: the M3 driver child grows a pipe-server face
+   and a sibling client reads the UART through the pipe protocol
+   instead of registers (the namespace's /dev/uart0 model, paths
+   still to come). (b) The attenuate-at-give KEEP-MASK rider is
+   TAKEN into the ladder (unit 2.5 or folded into unit 4, the unit
+   brief decides — and it now composes with unit 6's recorded
+   finding that `ProcessSelf` mints outside any keep mask); the
+   event-wake/event-consume-wake one-handle-each rewrite is
+   DEFERRED again, on the standing reason (transcript-moving, rides
+   only a unit that moves those transcripts anyway).
 
 ## As ruled
 
-(Filled at the scoping session; each unit then gets its own design
-brief per the M3 process.)
+Aug 30 (user): ALL SEVEN ITEMS RULED — this sketch is the PLAN OF
+RECORD. 1 `SosStatus.Revoked`; 2 `PipeInlet`/`PipeOutlet`; 3 the
+factory is `ProcessOp.PipeCreate`; 4 post is the ONE kernel
+primitive, send/send(timeout:) are library compositions; 5 staged
+handles stay the sender's until receive; 6 limits 128 B / 4 handles
+/ 2×MAX_THREADS in-flight as `kcore.limits` statics; 7
+driver-as-service confirmed, keep-mask rider taken, event rewrite
+deferred. Unit briefs are authored per the M3 process; M4 starts
+when M3 unit 7 closes.
