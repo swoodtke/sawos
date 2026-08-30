@@ -21,39 +21,6 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
-- M3 unit 5.5 — death notifications [sawlang#232 agenda 9, #8 —
-  designs/008-death-notifications.md, authored Aug 30]: Process
-  becomes the fourth waitable (not a new kind), WaitTag.Process=3
-  carrying the §8 status word, TERMINAL LEVEL (stays signaled,
-  attach-after-death wakes, consume clears nothing), end_process
-  notifies after status-record before the fork, the attachment joins
-  the Process refcount row (design 7 composition), deadlock predicate
-  deliberately untouched with the reasoning recorded. No authorized
-  transcript changes. DISPATCHED Aug 30. **CLOSED Aug 30 — BUILT, gate
-  green on both profiles.** All of D-1 landed as ruled: the five matrix
-  arms, `waitable_slot`'s Process arm replacing its `NotWaitable`
-  refusal, `notify_ready` in `end_process` after the status record with
-  the wake-only-queues note at the site, the attachment counted in
-  `ProcessSlot.refs`, and `has_external_wake_source` untouched with the
-  three-case reasoning written at the predicate. Three cases —
-  `death_notify` (no timer armed anywhere: the death is the only wake
-  source), `death_fault` (the same park, `Faulted` instead of `Exited`,
-  reusing `child-fault`), `death_late_attach` (`first=65541
-  second=65541`, then `held=1 freed=1` — the attachment alone holds the
-  dead slot until it is removed) — plus one new child, `child-bye`. Gate
-  150 passed; of the 144 baseline rows, 103 byte-identical, 40
-  address-only (`entry=` alone), 1 documented-nondeterministic
-  (`thread_preempt`'s interleaving, which the case's own comment records
-  as timing-dependent and which asserts direction changes, not a
-  sequence), and ZERO authorized changes. THREE FINDINGS worth the lead's
-  eye, all in the
-  As-built: (1) SL-7's third site MOVED THE RULED SPELLING — the brief's
-  `Waiter.add(process:, key:)` is the DF-232e cycle, so it is
-  `Process.attach(waiter:, key:)` on design 6's precedent; (2)
-  `kcore.waitables` now sits ABOVE `kcore.process`, the unit's one
-  altitude change; (3) a Process attachment is the first CROSS-PROCESS
-  attachment, so `end_process`'s attachment sweep had to start unhooking
-  the far end
 - M3 unit 6 — the money shot [sawlang#232]
 
 ## [BACKLOG] — filed, not scheduled
