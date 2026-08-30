@@ -22,8 +22,18 @@
 //   - the device has a control register that has to be turned on. The kernel's
 //     transmitter works without it, so the kernel never wrote it; a driver that
 //     wants to RECEIVE must.
+//
+// **MIGRATED IN M3 UNIT 4 alongside its twin (sawos design 6 D-6)**: the window
+// arrives as an `IoMemory` in the boot set and is mapped into this process,
+// where the manifest used to declare it. The ns16550 package carries the
+// argument; what is worth noting HERE is that this profile's DEVICE attribute
+// (nGnRE, uncached, no merging) is now a property of the object KIND rather
+// than of a segment flag — an `IoMemory` can only ever produce a
+// device-attribute row, so the access-size discipline above rests on something
+// the type system enforces.
 
-import sos.{System, Process, Interrupt, Waiter, WaitResult, WaitPayload}
+import sos.{System, Process, Interrupt, Mapping, Waiter, WaitResult,
+            WaitPayload}
 
 // The scalar-to-byte rule, shared with the kernel's own console so a banner
 // written through the granted window and one written through a System op agree
@@ -34,8 +44,10 @@ import sosrt.{ascii_byte}
 // The board
 // =============================================================================
 
-/// The console UART's register page — the window this image's manifest asks
-/// for, and the same number the kernel's board description carries.
+/// The console UART's register page — where the window this driver is HANDED
+/// lives, and the same number the kernel's board description carries. The
+/// number did not move when the acquisition did (sawos design 6 D-6): SOS does
+/// not translate, so a mapped window is where the hardware is.
 static UART_BASE: UInt = 0x0900_0000
 
 /// The interrupt line this board wires the console to: the first shared
@@ -195,6 +207,33 @@ func _start(boot_handle: UInt) {
             return
         },
     }
+
+    // **STEP 0 — OBTAIN THE WINDOW** (sawos design 6 D-6). Identical to the
+    // ns16550 package's, which is the point: acquiring a device window is not a
+    // per-device act, so the one thing these two files DO share is the code
+    // that gets them their registers.
+    var record = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS echo: no device window: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    guard let window = record.take_iomemory() else {
+        let _ = system.debug_print("SOS echo: boot record is not a window\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _mapping = match proc.map(iomemory: &window) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS echo: map failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS echo: window mapped\n")
 
     let irq = match proc.interrupt_bind(line: UART_IRQ) {
         case Ok(i) -> i,

@@ -38,6 +38,16 @@ here, and neither is the interrupt half design 178 added beside it (the timer,
 the controller, and the one funnel above them). What follows is only what this
 profile does differently, and why.
 
+**M3 unit 4 added three names to that table and this profile answers two of them
+differently** (sawos design 6 D-3/D-4), which is exactly why the kernel reads a
+HAL number rather than a shared constant:
+
+| Name | What it means HERE |
+|---|---|
+| `GRANT_ROW_BUDGET: UInt` | **A POLICY CAP, NOT A HARDWARE ONE.** There are no numbered regions to run out of — a grant is a walk of page descriptors — so what bounds a domain is the kernel's fixed-size grant RECORD, and this restates its length (`kcore.limits.MAX_GRANT_ROWS`, 9) as a HAL fact. On Profile A the same name is the PHYSICAL wall. A `map()` meeting either answers `NoResource`; the difference is what a later unit would have to change to raise it. |
+| `map_target_ok(base, top) -> Bool` | **THE 4 MiB GRANT WINDOW, ASKED RATHER THAN DIED IN.** `prot_region` already enforces this bound and enforces it by STOPPING THE MACHINE (`grant_outside_window`) — correct for the loader path, where a memory map that outgrew the window is a kernel bug, and wrong for a map, where the range came from a region a PROCESS chose. The predicate moves that refusal to the op as a caller-visible `BadArg`, and the HAL's kernel-bug stop stays for the path it was written for. Page alignment of `base` is NOT required: the walk rounds down to the page it starts in, exactly as it does for a segment. |
+| `device_window_ok(base, len) -> Bool` | Whole pages, both ends, inside the one device window this board publishes a level-3 table for. Profile A's rule differs in FORM (a naturally-aligned power of two, because a window there is ONE protection entry) and is identical in purpose, which is what makes the predicate per-HAL rather than a shared check with two branches. |
+
 The design 172 review round changed how much of that surface this file writes,
 not the surface: the poll-and-place, the panic path's write LOOP and the
 exit-status promotion are `sosrt`'s, once, for both profiles. What stays here is
@@ -112,7 +122,20 @@ built in assembly, entered once, with no storage a second thread could have had.
   ACCESS-SIZE half cannot be expressed in a descriptor and belongs to the
   driver: device memory permits no unaligned and no multi-register access, so a
   driver reads and writes each register at its own width and never copies a
-  block.
+  block. **SINCE M3 unit 4 THE ATTRIBUTE IS CARRIED BY AN OBJECT KIND** (sawos
+  design 6 D-1): only an `IoMemory` reaches `prot_device`, and `IoMemory` has no
+  op that could install anything else, so "a device region cannot produce a
+  cacheable mapping" stopped being a flag the loader honoured and became a
+  property of the type. On this profile that is the difference between a
+  correctness guarantee and a convention.
+- **NO REGION BUDGET, WHICH IS WHY M3 unit 4's WIDENING WAS PROFILE A's ALONE.**
+  Design 6 D-4 doubled Profile A's numbered-region budget because four TOR
+  regions were spent before the first `map()`; here a domain is a page-table
+  walk and there was nothing to widen. What bounds a domain instead is the
+  kernel's grant record (`GRANT_ROW_BUDGET` above) and the 4 MiB grant window,
+  and neither is hardware. The consequence worth stating: the two profiles' row
+  budgets now MEAN different things, and a unit that raises one has a different
+  argument to make than a unit that raises the other.
 - **Granting one page cost two more tables.** The device space below RAM was a
   single 1 GiB block, and a block is not a grant unit — handing EL0 the block
   holding the console would have handed over every peripheral beside it. So the

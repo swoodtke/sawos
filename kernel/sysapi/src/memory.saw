@@ -1,28 +1,36 @@
-//! MEMORY — a sealed range of physical memory, and the whole of its v1
-//! surface (spec §2.5; sawos design 2 D-2).
+//! MEMORY — a range of physical memory, and the one op it owns (spec §2.5;
+//! sawos design 2 D-2, grown by design 6 D-2).
 //!
-//! It sits one step above the floor and names nothing else: a region is
-//! authority over bytes, so the type is a handle, a `deinit` that releases it,
-//! and no operations at all. What a caller DOES with a region — hand it to
-//! `System.process_create`, give it to a child — is written where those ops
-//! are, in `sos.system`, which is why this file is imported by that one and
-//! not the other way round.
+//! It sits one step above the floor and names nothing else, which is what M3
+//! unit 4 had to keep true while giving the object ops. `split` is here because
+//! it needs only a Memory; `map` is NOT, because it needs a `Process` and
+//! `Process` is declared in `sos.system`, which imports this file. See
+//! `Process.map` there for the shape that cycle forced and why the funnel reads
+//! the way it does.
+//!
+//! A region is still AUTHORITY OVER BYTES rather than a description of them:
+//! there is no way to read a Memory's base or length, and unit 4 did not add
+//! one. `split` names a LENGTH and `map` names a target, and both answer with
+//! capabilities rather than numbers.
 
-import sosabi.{MemoryHandle, NO_HANDLE}
+import sosabi.{SosStatus, MemoryHandle, MemoryOp, NO_HANDLE}
 
-import sos.floor.{sos_handle_release}
+import sos.floor.{call_value, sos_handle_release}
 
 /// A handle to a Memory — a sealed range of physical memory.
 ///
-/// THE FIRST SLICE OF §2.5's OBJECT, and its whole v1 surface is being NAMED:
-/// a process receives regions at boot through `Process.boot_handle_next` and
-/// passes them to `System.process_create`. There is no `map()`, no `alloc()`,
-/// no sub-range and no way to read the bounds — a region is authority over
-/// bytes, not a description of them. Unit 4 is where pools, derivation,
-/// mapping and memory types arrive; nothing here forecloses any of it.
+/// §2.5's RAM AUTHORITY. A process receives pool roots at boot through
+/// `Process.boot_handle_next`, DERIVES pieces of them with `split`, INSTALLS
+/// those pieces with `Process.map`, and passes whole regions to
+/// `System.process_create`.
 ///
-/// Built by `Process.boot_handle_next` and by nothing else — no word
-/// constructor, no word extractor, the module docstring's rule.
+/// **THERE IS STILL NO WAY TO READ THE BOUNDS**, which is the unit-2 property
+/// unit 4 deliberately kept: a region is authority over bytes, not a
+/// description of them. What a caller names is a LENGTH (`split`) or a TARGET
+/// (`map`), and what it gets back is another capability.
+///
+/// Built by `Process.boot_handle_next` and by `split`, and by nothing else — no
+/// word constructor, no word extractor, the module docstring's rule.
 ///
 /// **IT IS `NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5),
 /// which SUPERSEDES this docstring's own unit-2 paragraph explaining why it was
@@ -42,5 +50,41 @@ extension Memory: NoCopy {
         if self.handle != NO_HANDLE {
             let _ = sos_handle_release(self.handle)
         }
+    }
+}
+
+extension Memory {
+    /// **CUT `len` BYTES OFF THE FRONT, and become the remainder.** Requires
+    /// `MemoryRight.Split`.
+    ///
+    /// **THIS RECEIVER IS THE POOL CURSOR**, which is the whole of design 6
+    /// D-2's allocation story: the region that comes back covers `[base, base +
+    /// len)` and THIS ONE now covers everything after it, so repeated splits
+    /// walk a pool forward and nothing else has to be remembered. Allocation is
+    /// this method in a loop.
+    ///
+    /// **IT CONSUMES NOTHING.** `&self`, no `move`, no disarm — the parent
+    /// handle is the same handle afterwards and the caller keeps using it. What
+    /// changed is kernel-side (the region the handle names is now shorter),
+    /// which is exactly the asymmetry that makes this NOT a transfer funnel: no
+    /// word moved between tables, so the owning tier has nothing to say here.
+    ///
+    /// `len` must be a non-zero multiple of the target's protection
+    /// granularity, and no larger than what this region still holds. All three
+    /// are caller-checkable, so all three TERMINATE the caller — the caller
+    /// chose the number, and it knows what it has split off so far. A full slab
+    /// or handle table is `SosStatus.NoResource`, which it could not have known.
+    ///
+    /// THE PIECE IS PERMANENT UNTIL TEARDOWN, and it is worth being exact about
+    /// how permanent. Free-on-last-reference is unit 5's (§2.5's refcount
+    /// clause), so DROPPING the region that comes back gives up its HANDLE and
+    /// nothing else: not the range, which no longer belongs to this pool, and
+    /// not even the kernel slab slot, which returns at the owner's teardown like
+    /// every other kind's. A pool walked to its end stays walked, and a loop
+    /// that splits and discards runs out of SLOTS long before it runs out of
+    /// pool. Stated here rather than discovered.
+    public func split(&self, len: UInt) -> Result<Memory, SosStatus> {
+        let raw = try call_value(self.handle, MemoryOp.Split as UInt, len, 0, 0)
+        return Memory(handle: MemoryHandle(raw))
     }
 }

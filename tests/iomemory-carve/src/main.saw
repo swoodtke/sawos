@@ -1,0 +1,111 @@
+// SOS M3 unit 4: CARVE (sawos design 6 D-1/D-2; spec §2.5).
+//
+// **A CARVE LEAVES THE PARENT WHOLE, AND THAT IS THE WHOLE DIFFERENCE FROM A
+// SPLIT.** §2.5: "a fixed region may be handed out many times" — MMIO is
+// pinned, nothing is consumed, and several drivers may legitimately hold
+// windows onto one peripheral. So this program carves the SAME range twice and
+// both succeed, which is exactly the sequence `Memory.split` must refuse.
+//
+// THE TRANSCRIPT, read as three claims:
+//
+//   SOS carve: carved twice          <- non-exclusive: the parent is unchanged
+//   SOS carve: mapped                <- a carved window installs
+//   SOS: process fault: argument outside its domain
+//                                    <- a window the hardware cannot express
+//
+// **THE THIRD CLAIM IS PER-PROFILE AND THE REFUSAL IS NOT.** One machine grants
+// a device window as a single naturally-aligned power-of-two protection entry,
+// so a length of `0xC00` is not expressible there; the other grants by page, so
+// `0xC00` is not a whole number of pages. Two different rules, one `BadArg`
+// fault, one line in the transcript — which is why the predicate is per-HAL and
+// the case is not.
+//
+// **X-ON-DEVICE IS IMPOSSIBLE BY VOCABULARY**, and that claim needs no line at
+// all: `Process.map(iomemory:)` takes no access argument. An IoMemory can only
+// ever produce a read-write, never-executable, device-attribute row, so a
+// driver cannot ask for an executable register block and there is nothing to
+// refuse. That is D-1's kind-not-a-flag ruling paying for itself — the
+// alternative would have been a fourth refusal here.
+//
+// The last line is deliberately a death, on `memory_split`'s terms: `BadArg` is
+// a fault, so the only way to assert it is to meet it.
+
+import sos.{System, Process, IoMemory, Mapping, SosStatus}
+
+/// The console page's length, the same on both boards.
+static WINDOW_LEN: UInt = 0x1000
+
+/// A length neither profile can express as one device grant: not a power of two
+/// on the one that needs one, not a whole number of pages on the other.
+static UNGRANTABLE_LEN: UInt = 0xC00
+
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS carve: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // The boot set carries one row and it is a DEVICE row, so what arrives is
+    // an `IoMemory` rather than a `Memory` — the kind column of the build's
+    // region table deciding which capability the same range becomes.
+    var record = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS carve: no device window: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    guard let window = record.take_iomemory() else {
+        let _ = system.debug_print("SOS carve: boot record is not a window\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let first = match window.carve(offset: 0, len: WINDOW_LEN) {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS carve: first carve failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    // **THE SAME RANGE AGAIN.** A split would have nothing left to give; a
+    // carve does, because the parent was never spent.
+    let _second = match window.carve(offset: 0, len: WINDOW_LEN) {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS carve: second carve failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS carve: carved twice\n")
+
+    let _mapping = match proc.map(iomemory: &first) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS carve: map failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS carve: mapped\n")
+
+    // **AND A WINDOW THE HARDWARE CANNOT EXPRESS IS A FAULT.** The caller chose
+    // the offset and the length, so it could have checked.
+    let _ = system.debug_print("SOS carve: asking for a window this board cannot grant\n")
+    let _ = window.carve(offset: 0, len: UNGRANTABLE_LEN)
+
+    let _ = system.debug_print("SOS carve: UNREACHABLE\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

@@ -22,9 +22,10 @@
 //! Everything else this file names is BELOW it: the floor's raw seams, the
 //! region, and the five objects a Process mints.
 
-import sosabi.{SosStatus, SystemOp, ProcessOp, MINT_OP,
+import sosabi.{SosStatus, SystemOp, ProcessOp, MemoryOp, IoMemoryOp, MINT_OP,
                SystemHandle, ProcessHandle, ThreadHandle, EventHandle,
                WaiterHandle, InterruptHandle, ClockHandle, MemoryHandle,
+               IoMemoryHandle, MappingHandle,
                NO_HANDLE, BootTagForm, EventMode, ClockType, BootHandleKind,
                BOOT_HANDLE_RECORD_WORDS, BOOT_HANDLE_TAG_WORD,
                BOOT_HANDLE_KIND_WORD, BOOT_HANDLE_HANDLE_WORD,
@@ -49,6 +50,8 @@ import sos.floor.{ALL_RIGHTS, call_value, checked, park_system_handle,
                   sos_process_exit, sos_process_give, sos_process_start,
                   sos_system_debug_print, sos_system_shutdown}
 import sos.memory.{Memory}
+import sos.iomemory.{IoMemory}
+import sos.mapping.{Mapping}
 // QUALIFIED, ALONE AMONG THE NINE: `std.task` publishes a prelude
 // `Thread<T>`, and a bare imported `Thread` ties with it where a locally
 // DECLARED one used to win — which is what the split turned this name into.
@@ -565,6 +568,108 @@ extension Process {
         return checked(sos_process_give(self.handle, word, tag))
     }
 
+    // -------------------------------------------------------------------------
+    // THE MAP FUNNELS (sawos design 6 D-3)
+    // -------------------------------------------------------------------------
+    //
+    // **THE RECEIVER IS THE PROCESS BEING MAPPED INTO, AND THAT IS A SHAPE THE
+    // MODULE ORDER FORCED.** Design 6 D-7 sketched these as `Memory.map(into:
+    // &Process)`, which does not compile in today's Saw: `BootHandle` carries a
+    // `Memory?` and an `IoMemory?`, so `sos.memory` and `sos.iomemory` are
+    // BELOW this module, and a `map` written there naming `Process` would be
+    // the import cycle DF-232e diagnoses. A type's extension methods must live
+    // in the module that declares the type (design 142/229 — a re-export widens
+    // no extension scope), so there is no arrangement of files that puts the
+    // method on the region. Recorded as design 5's finding 1 biting a second
+    // time.
+    //
+    // WHAT IT COSTS IS NOTHING AND WHAT IT BUYS IS CONSISTENCY: the funnels
+    // read exactly like `give` one section up — `child.map(memory: &region,
+    // access: RW)` beside `child.give(memory: move region, tag: 3)` — which is
+    // the same receiver answering the same question about the same child. The
+    // syscall's own receiver is still the REGION handle; a wrapper is not
+    // obliged to mirror the op's handle register, and every one of these
+    // methods passes `self.handle` as the target argument.
+    //
+    // **NOTHING IS CONSUMED, AND THERE IS NO DISARM**, which is the difference
+    // from the give funnels beside them and is worth saying at the funnel: a
+    // map MOVES NO HANDLE WORD. The region stays in the caller's table and
+    // stays the caller's, the target Process handle stays the caller's, and
+    // what comes back is a NEW capability naming a row. So the transfer-funnel
+    // contract (design 3 D-5) has nothing to say here — there is no word that
+    // left, so there is nothing to write `NO_HANDLE` over. The borrows say it
+    // in the signature: `&Memory`, `&IoMemory`, `&self`.
+
+    /// **INSTALL `memory` IN THIS PROCESS'S ADDRESS SPACE**, and answer with the
+    /// Mapping that names the row. Requires `ProcessRight.Map` here AND
+    /// `MemoryRight.Map` on the region.
+    ///
+    /// **TWO RIGHTS ON TWO OBJECTS**, and the doctrine is why: possession of
+    /// bytes must not imply authority over somebody's address space. A launcher
+    /// handed a region without `Map` on the child's handle has memory it cannot
+    /// install anywhere, which is exactly the attenuation a single right could
+    /// not express.
+    ///
+    /// **THE ADDRESS IS THE REGION'S OWN.** A caller supplies no address at all
+    /// — SOS does not translate, so a region maps where it IS — which is what
+    /// keeps a Memory a capability rather than a description and is why this
+    /// method answers with a Mapping instead of a number. What a process knows
+    /// about where its memory is, it knows from the config that gave it the
+    /// region, exactly as a driver knows its device's address.
+    ///
+    /// `access` is a mask of `MapAccess` bits, and it is a property of THIS
+    /// MAPPING rather than of the region — which is what makes double-mapping
+    /// one region read-only in one place and read-write in another expressible.
+    /// A double map is ALLOWED: two rows, two Mappings, no aliasing bookkeeping
+    /// owed on a machine with no translation.
+    ///
+    /// Write without read, no access at all, a bit outside the three, and a
+    /// range this machine cannot grant all TERMINATE the caller. A domain with
+    /// no protection row left is `SosStatus.NoResource` — the PHYSICAL wall,
+    /// which on one profile is a fixed number of hardware regions.
+    ///
+    /// **IT WORKS BEFORE `start()` AND AFTER IT.** A mapping is not a boot
+    /// record: the give-freeze (§12's "the boot set freezes at start") does not
+    /// apply to it, because a row is not a handle in the child's table and
+    /// installing one answers no question the child has already asked. Mapping
+    /// into a `Created` child is how a launcher hands over memory the child's
+    /// image never declared.
+    ///
+    /// **WHAT IT DOES NOT WORK ON IS A DEAD PROCESS** — that TERMINATES the
+    /// caller. A supervisor's handle onto a dead child outlives it on purpose
+    /// (reading how it died is what the handle is for), so the refusal has to be
+    /// stated rather than implied, and it is caller-checkable: ask
+    /// `get_status()` first if you cannot be sure.
+    public func map(&self, memory: &Memory,
+                    access: UInt32) -> Result<Mapping, SosStatus> {
+        let raw = try call_value(memory.handle, MemoryOp.Map as UInt,
+                                 self.handle, access as UInt, 0)
+        return Mapping(handle: MappingHandle(raw))
+    }
+
+    /// **INSTALL `iomemory` IN THIS PROCESS'S ADDRESS SPACE** — a device window,
+    /// with device memory attributes. Requires `ProcessRight.Map` here AND
+    /// `IoMemoryRight.Map` on the window.
+    ///
+    /// **THERE IS NO `access:` ARGUMENT, AND THAT IS THE TYPE DOING ITS JOB**
+    /// (design 6 D-1). An IoMemory can only ever produce a device-attribute row
+    /// — read-write, never executable, never cacheable — so a driver cannot get
+    /// a cached view of a register block by any spelling available to it. The
+    /// guarantee is which method exists, not a check somebody runs.
+    ///
+    /// **THIS IS "THE SAME WINDOW, OBTAINED RATHER THAN DECLARED"** (§2.5's
+    /// migration case, come true). M2's driver declared its MMIO window in its
+    /// manifest and the kernel installed it before user mode; a driver now
+    /// receives the window as a capability, maps it into itself with this call,
+    /// and drives exactly the same registers at exactly the same addresses. The
+    /// difference is that the window is now something a launcher HANDS OVER,
+    /// which is what makes a driver child possible at all.
+    public func map(&self, iomemory: &IoMemory) -> Result<Mapping, SosStatus> {
+        let raw = try call_value(iomemory.handle, IoMemoryOp.Map as UInt,
+                                 self.handle, 0, 0)
+        return Mapping(handle: MappingHandle(raw))
+    }
+
     /// Take the next handle out of this process's BOOT SET (spec §12).
     /// Requires `ProcessRight.BootHandles`.
     ///
@@ -636,12 +741,17 @@ public struct BootHandle {
     /// The Process handle, on the same terms — `take_process` is its one door.
     process: Process?,
     /// The System handle, on the same terms — `take_system` is its one door.
-    /// A record has ONE object, so exactly one of these three slots is ever
-    /// occupied and `kind` is what says which. Three fields rather than an enum
+    /// A record has ONE object, so exactly one of these slots is ever occupied
+    /// and `kind` is what says which. Separate fields rather than an enum
     /// payload because asking the WRONG one must be harmless: an enum would have
     /// to be taken out of the record to be matched, and a mismatch would then
     /// drop a capability the caller still wanted.
     system: System?,
+    /// The device window, on the same terms — `take_iomemory` is its one door.
+    /// The fourth slot, and the one M3 unit 4 added: a DEVICE row of the
+    /// build's region table mints an `IoMemory`, and a driver's first act is to
+    /// drain it (sawos design 6 D-1/D-5).
+    iomemory: IoMemory?,
 }
 
 extension BootHandle: NoCopy {}
@@ -684,6 +794,16 @@ extension BootHandle {
     public func take_system(&var self) -> System? {
         self.system.take()
     }
+
+    /// Take the DEVICE WINDOW out of this record. Same terms as `take_memory`.
+    ///
+    /// A driver's first act, and the one that makes the M2 device-grant
+    /// placeholder retire: the window its manifest used to declare is now a
+    /// capability its boot set carries, and `Process.map(iomemory:)` is what
+    /// installs it.
+    public func take_iomemory(&var self) -> IoMemory? {
+        self.iomemory.take()
+    }
 }
 
 /// Decode a record the kernel copied out into a `BootHandle`.
@@ -701,13 +821,17 @@ func decode_boot_handle(tag: UInt, kind: UInt, handle: UInt) -> BootHandle {
     match what {
         case Memory -> BootHandle(tag: tag, kind: what,
                                   memory: Memory(handle: MemoryHandle(handle)),
-                                  process: None, system: None),
+                                  process: None, system: None, iomemory: None),
         case Process -> BootHandle(tag: tag, kind: what, memory: None,
                                    process: Process(handle: ProcessHandle(handle)),
-                                   system: None),
+                                   system: None, iomemory: None),
         case System -> BootHandle(tag: tag, kind: what, memory: None,
                                   process: None,
-                                  system: System(handle: SystemHandle(handle))),
+                                  system: System(handle: SystemHandle(handle)),
+                                  iomemory: None),
+        case IoMemory -> BootHandle(tag: tag, kind: what, memory: None,
+                                    process: None, system: None,
+                                    iomemory: IoMemory(handle: IoMemoryHandle(handle))),
     }
 }
 

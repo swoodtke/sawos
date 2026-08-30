@@ -1,0 +1,63 @@
+// SOS M3 unit 4: THE CHILD THAT TOUCHES MEMORY ITS IMAGE NEVER DECLARED
+// (sawos design 6 D-3) — `map-into-child`'s other half.
+//
+// **EVERY ADDRESS THIS PROGRAM TOUCHES OUTSIDE ITS OWN IMAGE IS A GIFT.** Its
+// sosimg declares two segments and its kernel grants a stack; the pool page it
+// writes below is in its domain for exactly one reason — its launcher installed
+// a protection row there before starting it. A child in M3 unit 2 that reached
+// for an address like this died (`process_isolation` is that case), and nothing
+// about the isolation changed: what changed is that a row can now be installed
+// deliberately.
+//
+// It bootstraps exactly as root does (§12's symmetry): a System handle in its
+// first argument register, its own Process handle derived from it. The handle
+// it got is a MASKED sibling of root's — `Debug | ProcessSelf | Transfer` and
+// nothing else — so it can print, learn which process it is, and neither stop
+// the machine nor spawn.
+//
+// THE EXIT CODE IS THE BYTE IT READ BACK, which is what lets root assert the
+// round trip through the §8 status word as well as through the console.
+
+import sos.{System, Process, SosStatus}
+
+extern "C" {
+    func sos_test_pool_base() -> UInt
+}
+
+static EXIT_FAILED: UInt = 1
+
+/// The byte this child writes. A number that appears nowhere else in the
+/// transcript, so a line carrying it can only have come from here.
+static MARK: UInt8 = 0x3C
+
+func poke(addr: UInt, value: UInt8) unsafe {
+    UnsafeMemory<UInt8, Normal>(addr).write(value)
+}
+
+func peek(addr: UInt) unsafe -> UInt8 {
+    UnsafeMemory<UInt8, Normal>(addr).read()
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS childtouch: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // THE MAPPED PAGE. Nothing in this process's own boot set names it — the
+    // child was given no regions at all — so the only thing that makes this
+    // address reachable is the row its launcher installed.
+    let base = sos_test_pool_base()
+    poke(base, MARK)
+    let seen = peek(base)
+    print("SOS childtouch: wrote {} read {}\n", MARK as Int, seen as Int)
+
+    let _ = proc.exit(seen as UInt)
+}

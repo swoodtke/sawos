@@ -39,6 +39,8 @@ import kcore.limits.{
     MAX_EVENTS,
     MAX_HANDLES,
     MAX_INTERRUPTS,
+    MAX_IOMEMORIES,
+    MAX_MAPPINGS,
     MAX_MEMORIES,
     MAX_THREADS,
     MAX_TIMERS,
@@ -50,8 +52,13 @@ import kcore.result.{op_value, write_result}
 import kcore.diag.{ExitCode, console}
 import kcore.objects.{
     HANDLES,
+    IOMEMORIES,
+    IoMemorySlot,
+    MAPPINGS,
     MEMORIES,
+    MappingSlot,
     MemorySlot,
+    NO_ROW,
     SlotState,
     clear_boot_handles,
     unbind_handle,
@@ -491,8 +498,9 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // MEMORY REGIONS go back too (sawos design 2 D-2). A Memory is a sealed
     // range and nothing else, so freeing one reclaims a slab slot and no
     // hardware — the bytes it named belong to whoever the build said they
-    // belong to, and unit 4's pools are where returning a range to an owner
-    // becomes an operation.
+    // belong to, and unit 5's free-on-last-reference is where returning a
+    // range to an owner becomes an operation (§2.5's refcount clause; unit 4
+    // built the pools and deliberately left the returning out).
     var m: Int = 0
     while m < MAX_MEMORIES {
         if MEMORIES[m].process == p {
@@ -505,6 +513,58 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
             }
         }
         m = m + 1
+    }
+
+    // IO WINDOWS go back on the same terms, and the terms are worth stating
+    // because they read like the opposite of what they are (sawos design 6
+    // D-1). MMIO is PINNED — the registers were there before this process and
+    // will be there after it — so freeing an IoMemory reclaims a SLAB SLOT and
+    // touches no hardware whatsoever. What actually revokes the driver's reach
+    // is `clear_domain` below, which takes the protection rows away.
+    var io: Int = 0
+    while io < MAX_IOMEMORIES {
+        if IOMEMORIES[io].process == p {
+            match IOMEMORIES[io].state {
+                case Free -> {},
+                case Live -> {
+                    IOMEMORIES[io] = IoMemorySlot(state: SlotState.Free,
+                                                  process: 0, base: 0, len: 0)
+                },
+            }
+        }
+        io = io + 1
+    }
+
+    // **MAPPINGS COME APART FROM BOTH ENDS** (sawos design 6 D-3), which is why
+    // this loop has two arms over one slab rather than one arm like every
+    // teardown above it. A Mapping names TWO processes — the OWNER, whose
+    // handle it is, and the TARGET, whose domain carries the row — and a death
+    // means something different at each end:
+    //
+    //   - the owner dying frees the SLOT. The row is not touched, and that is
+    //     §2.5's own stance rather than an omission: a mapping dropped without
+    //     an unmap is permanent, safe-but-leaked. Here the leak is bounded by
+    //     the target's own death, one arm down.
+    //   - the target dying takes the ROW, because `clear_domain` below drops
+    //     the whole record. The slot stays LIVE and its owner still holds the
+    //     handle, so what is left is a Mapping with nothing installed — which
+    //     is exactly the state an `unmap` already answers `BadState` for. It
+    //     must NOT be freed here: the owner's word still names this slot, and a
+    //     freed slot the next `map` reused would be reachable through it.
+    var mp: Int = 0
+    while mp < MAX_MAPPINGS {
+        match MAPPINGS[mp].state {
+            case Free -> {},
+            case Live -> {
+                if MAPPINGS[mp].process == p {
+                    MAPPINGS[mp] = MappingSlot(state: SlotState.Free, process: 0,
+                                               target: 0, row: NO_ROW)
+                } else if MAPPINGS[mp].target == p {
+                    MAPPINGS[mp].row = NO_ROW
+                }
+            },
+        }
+        mp = mp + 1
     }
 
     // The protection rows go with the slot, and `LAST_PROT_PROCESS` is

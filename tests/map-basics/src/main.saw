@@ -1,0 +1,129 @@
+// SOS M3 unit 4: MAP (sawos design 6 D-3; spec §2.5).
+//
+// **AN ADDRESS THAT FAULTED YESTERDAY IS MEMORY TODAY**, which is the inverse
+// of every protection proof this suite has run so far. `root_server_oversteps`
+// reaches for an address it was not granted and dies; this program reaches for
+// an address it was not granted, obtains the authority, installs it, and writes.
+// The two together are what a protection domain being DATA means.
+//
+// THE TRANSCRIPT, read as three claims:
+//
+//   SOS mapbasics: wrote 0x5a read 90       <- the row installed, immediately
+//                                              (90 is 0x5a; the byte renders as
+//                                              decimal)
+//   SOS mapbasics: double-mapped read-only  <- agenda item 7: it is ALLOWED
+//   SOS mapbasics: still 90                 <- the alias destroyed nothing
+//
+// **THE FIRST LINE ALSO PROVES THE LIVE-DOMAIN RULE HALF THE TIME.** The
+// scheduler skips equal domains, so a `map` into the RUNNING process would
+// never be installed at all if the op did not reload — not "installed late":
+// never. The write on the next line is what says it did. (`map_unmap` proves
+// the other direction, which is the one that matters for revocation.)
+//
+// **THE DOUBLE MAP IS THE POINT OF PER-MAPPING ACCESS.** Access is a property
+// of the MAPPING, not of the region (`MemoryRight` has no R/W/X pair on
+// purpose), so one region can be installed read-write here and read-only there.
+// On a machine with no translation both rows name the same addresses and the
+// hardware's own matching rule decides which one answers — which is why this
+// case asserts that both INSTALL and that a read still works, and deliberately
+// does not write again afterwards. What would be owed on a translating machine
+// — two virtual placements, aliasing bookkeeping — is owed here to nobody.
+
+import sos.{System, Process, Memory, Mapping, MapAccess, SosStatus}
+
+extern "C" {
+    func sos_test_pool_base() -> UInt
+}
+
+static CHUNK: UInt = 0x1000
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+// THE `as` IS OWED BY THE LANGUAGE AND NOT BY THE TYPE, which is worth a line
+// because the two spellings sit next to each other: a COMBINATION of raw-backed
+// enum cases folds to the backing integer at a fixed-width slot (DF-240a), and
+// a LONE case is still an enum-typed value there. So one bit needs the
+// projection and two bits do not. Filed as SL-9.
+static RO: UInt32 = MapAccess.Read as UInt32
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+func poke(addr: UInt, value: UInt8) unsafe {
+    UnsafeMemory<UInt8, Normal>(addr).write(value)
+}
+
+func peek(addr: UInt) unsafe -> UInt8 {
+    UnsafeMemory<UInt8, Normal>(addr).read()
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS mapbasics: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    var record = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS mapbasics: no pool region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    guard let pool = record.take_memory() else {
+        let _ = system.debug_print("SOS mapbasics: boot record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let base = sos_test_pool_base()
+
+    let chunk = match pool.split(len: CHUNK) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS mapbasics: split failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // **THE MAP.** `proc` is this process's own handle, so root is mapping into
+    // ITSELF — which spends `ProcessRight.Map` on that handle and
+    // `MemoryRight.Map` on the region, two rights on two objects.
+    let _rw_map = match proc.map(memory: &chunk, access: RW) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS mapbasics: map failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    poke(base, 0x5A)
+    print("SOS mapbasics: wrote 0x5a read {}\n", peek(base) as Int)
+
+    // **THE DOUBLE MAP.** The same region, a second Mapping, read-only. Nothing
+    // refuses it and nothing has to: two rows over one range on a
+    // no-translation machine are two rows, and the region is not consumed by
+    // being installed.
+    let _ro_map = match proc.map(memory: &chunk, access: RO) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS mapbasics: double map failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS mapbasics: double-mapped read-only\n")
+    print("SOS mapbasics: still {}\n", peek(base) as Int)
+
+    let _ = system.debug_print("SOS mapbasics: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}

@@ -1,0 +1,160 @@
+// SOS M3 unit 4: THE POOL, SPLIT (sawos design 6 D-2; spec §2.5).
+//
+// **THE PARENT IS THE CURSOR.** `split(len)` mints a region over the first
+// `len` bytes and leaves THIS handle naming everything after it, so allocation
+// is this call in a loop and a pool needs no second bookkeeping. The transcript
+// is read as four claims:
+//
+//   SOS split: a=170 b=187 a-again=170       <- the pieces are DISJOINT
+//                                               (0xaa, 0xbb, 0xaa — the bytes
+//                                               render as decimal)
+//   SOS split: pool exhausted after 13 cuts  <- exhaustion is a STATUS
+//   SOS: process fault: argument outside its domain
+//                                            <- an oversize cut is a FAULT
+//
+// WHY THE FIRST LINE PROVES THE ARITHMETIC. A region has no bounds reader —
+// unit 4 deliberately did not add one — so "the parent advanced" cannot be
+// observed by asking. It is observed by USING both pieces: write 0xaa into the
+// first, 0xbb into the second, read the first again. A parent that had not
+// advanced would hand out the same range twice and the second write would have
+// destroyed the first.
+//
+// AND THE MAPS ARE WHAT MAKE THE WRITES POSSIBLE AT ALL. Every address in this
+// program faulted before it was mapped; the pool is memory this image never
+// declared and the linker never heard of.
+//
+// THE LAST LINE IS DELIBERATELY A DEATH. `BadArg` is a fault by the faults
+// ruling — a caller that asks for more than it holds could have checked — so
+// the only way to assert it is to meet it, and a case that meets a fault ends
+// there. Everything above it has already been proven by then.
+
+import sos.{System, Process, Memory, Mapping, MapAccess, SosStatus}
+
+// WHERE THE POOL IS — this program's config, per architecture, in C because Saw
+// cannot name an address (DF-172a). See `tests/poolbase_riscv32.c`.
+extern "C" {
+    func sos_test_pool_base() -> UInt
+}
+
+/// One protection unit's worth on either profile — 4 KiB is a multiple of both
+/// `PROT_GRAIN`s, so one number serves both machines.
+static CHUNK: UInt = 0x1000
+
+/// Read and write, which is what a scratch region wants. The bits fold at this
+/// annotated `static` because a fixed-width slot is a const position.
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// A length no remaining pool can satisfy — the oversize cut.
+static OVERSIZE: UInt = 0x0100_0000
+
+static EXIT_FAILED: UInt = 1
+
+/// Write one byte through a mapping. `unsafe` because it names a pointer type,
+/// and confined to one line for design 136's reason.
+func poke(addr: UInt, value: UInt8) unsafe {
+    UnsafeMemory<UInt8, Normal>(addr).write(value)
+}
+
+/// Read one byte back.
+func peek(addr: UInt) unsafe -> UInt8 {
+    UnsafeMemory<UInt8, Normal>(addr).read()
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS split: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // The boot set carries one row: the RAM POOL. Its tag is 0 because it is
+    // the only row, which is root's config knowing the build's row order.
+    var record = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS split: no pool region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    guard let pool = record.take_memory() else {
+        let _ = system.debug_print("SOS split: boot record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let base = sos_test_pool_base()
+
+    // **CUT ONE.** The piece covers `[base, base + CHUNK)` and `pool` now names
+    // everything after it.
+    let first = match pool.split(len: CHUNK) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS split: first cut failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _first_map = match proc.map(memory: &first, access: RW) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS split: first map failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    poke(base, 0xAA)
+
+    // **CUT TWO**, which lands where the cursor now points.
+    let second = match pool.split(len: CHUNK) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS split: second cut failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _second_map = match proc.map(memory: &second, access: RW) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS split: second map failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    poke(base + CHUNK, 0xBB)
+
+    // THE DISJOINTNESS CLAIM, as a value: the first byte is still what it was.
+    print("SOS split: a={} b={} a-again={}\n", peek(base) as Int,
+          peek(base + CHUNK) as Int, peek(base) as Int)
+
+    // **EXHAUSTION IS A STATUS.** Each cut takes a slab slot and the slot is
+    // not returned when the handle is released — free-on-last-reference is unit
+    // 5's — so a loop that drops every piece still walks the slab to its end.
+    // That is the honest state of the system today, and `NoResource` is what
+    // says so.
+    var cuts = 0
+    var going = true
+    while going {
+        match pool.split(len: CHUNK) {
+            case Ok(_) -> { cuts = cuts + 1 },
+            case Err(_) -> { going = false },
+        }
+    }
+    print("SOS split: pool exhausted after {} cuts\n", cuts)
+
+    // **AND AN OVERSIZE CUT IS A FAULT.** The caller knows what it has split
+    // off; asking for more than it holds is a mistake it could have checked, so
+    // it ends here.
+    let _ = system.debug_print("SOS split: asking for more than is left\n")
+    let _ = pool.split(len: OVERSIZE)
+
+    let _ = system.debug_print("SOS split: UNREACHABLE\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

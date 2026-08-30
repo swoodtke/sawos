@@ -8,8 +8,26 @@
 // UART is. Reading the receive register, deciding what the byte means, and
 // writing it back out are ordinary process code in this file.
 //
+// **MIGRATED IN M3 UNIT 4 (sawos design 6 D-6): THE SAME WINDOW, OBTAINED
+// RATHER THAN DECLARED.** In M2 this package's manifest carried a
+// `device-window` key, the kernel installed the grant before user mode, and the
+// board authorized it by comparison. §2.5 said in as many words that this was a
+// placeholder for the Mapping object; it is now one. The driver receives the
+// console's register page as an `IoMemory` CAPABILITY in its boot set and maps
+// it into ITSELF, and everything below that line is byte-for-byte the program
+// it always was — same registers, same addresses (SOS does not translate), same
+// echoed bytes, same line number.
+//
+// WHAT THAT BUYS, and it is the reason the migration is worth a unit: a window
+// that arrives as a capability is a window somebody can HAND OVER. The M2 shape
+// could only ever grant the one process the kernel loads, which is why a child
+// image was refused a device window outright; unit 6's driver child is what this
+// makes possible.
+//
 // THE CYCLE, which is spec §9 read from the driver's side:
 //
+//   0. obtain the window      drain the boot set for the `IoMemory` and
+//                             `Process.map(iomemory:)` it into this process
 //   1. bind the line          `Process.interrupt_bind(line:)`
 //   2. watch it               `Waiter.add(&interrupt, key)`
 //   3. enable the DEVICE      write its own interrupt-enable register — the
@@ -33,7 +51,8 @@
 // handover marker, which is a thing that can only happen if every step above
 // worked.
 
-import sos.{System, Process, Interrupt, Waiter, WaitResult, WaitPayload}
+import sos.{System, Process, Interrupt, Mapping, Waiter, WaitResult,
+            WaitPayload}
 
 // The scalar-to-byte rule, shared with the kernel's own console so a banner
 // written through the granted window and one written through a System op agree
@@ -44,11 +63,15 @@ import sosrt.{ascii_byte}
 // The board
 // =============================================================================
 
-/// The console UART's register page — the window this image's manifest asks
-/// for, and the same number the kernel's board description carries. The two
-/// AGREE rather than one deriving from the other: the manifest is what the
-/// image declares and the board is what authorizes it, and a mismatch is a
-/// refused image rather than a driver reaching somewhere it should not.
+/// The console UART's register page — where the window this driver is HANDED
+/// lives, and the same number the kernel's board description carries.
+///
+/// **THE NUMBER DID NOT MOVE WHEN THE ACQUISITION DID** (sawos design 6 D-6),
+/// and that is the migration's whole point: SOS does not translate (spec §5.5),
+/// so a mapped window is where the hardware is. What changed is that this
+/// address is now something the driver was GIVEN authority over rather than
+/// something its manifest asked for — and a driver knowing its own device's
+/// address is a fact about the device, which is where it belongs.
 static UART_BASE: UInt = 0x1000_0000
 
 /// The interrupt line this board wires the console to.
@@ -177,6 +200,40 @@ func _start(boot_handle: UInt) {
             return
         },
     }
+
+    // **STEP 0 — OBTAIN THE WINDOW** (sawos design 6 D-6). The build published
+    // one DEVICE row, the kernel minted an `IoMemory` for it, and it is waiting
+    // in this process's boot set. Draining it and mapping it into THIS process
+    // is what the manifest's `device-window` key used to do before the first
+    // instruction ran.
+    //
+    // THE MAPPING IS HELD FOR THE PROGRAM'S LIFE. Dropping it would release the
+    // HANDLE and not the row (§2.5: a mapping dropped without an unmap is
+    // permanent), so the registers would stay reachable either way — but a
+    // driver that means to keep its device keeps the capability that names the
+    // mapping, which is what `unmap` would need.
+    var record = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS echo: no device window: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    guard let window = record.take_iomemory() else {
+        let _ = system.debug_print("SOS echo: boot record is not a window\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _mapping = match proc.map(iomemory: &window) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS echo: map failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS echo: window mapped\n")
 
     // §2's Interrupt row: the line becomes an object, and the object is
     // waitable. The kernel unmasks it here — the DEVICE is still quiet, because

@@ -29,6 +29,10 @@ import sosabi.{
     TimerRight,
     MemoryHandle,
     MemoryRight,
+    IoMemoryHandle,
+    IoMemoryRight,
+    MappingHandle,
+    MappingRight,
     BootHandleKind,
     NO_HANDLE,
     HANDLE_INDEX_BITS,
@@ -37,8 +41,12 @@ import sosabi.{
 }
 import kcore.limits.{
     MAX_HANDLES,
+    MAX_IOMEMORIES,
+    MAX_MAPPINGS,
     MAX_MEMORIES,
     MAX_PROCESSES,
+    NO_IOMEMORY,
+    NO_MAPPING,
     NO_MEMORY,
 }
 
@@ -200,12 +208,12 @@ extension TimerObject {
 /// A Memory handle the dispatch has VALIDATED, paired with its rights and the
 /// region slot it names (spec §2.5; sawos design 2 D-2).
 ///
-/// It carries an `allows` like every other kind even though NOTHING SPENDS a
-/// `MemoryRight` in this unit, and that is deliberate rather than dead code:
+/// **ITS `allows` WAS BUILT BEFORE ANYTHING SPENT A `MemoryRight`, AND UNIT 4
+/// IS WHAT IT WAS BUILT FOR.** Unit 2 wrote it with nothing calling it, because
 /// the wrapper is what makes "this handle resolved to a Memory" a TYPE rather
-/// than a comment, which is exactly the claim `process_create` needs about the
-/// two regions it is handed. Unit 3's `give` and unit 4's `map` are what start
-/// asking the question the method answers.
+/// than a comment — which is exactly the claim `process_create` needs about the
+/// two regions it is handed, and that op still spends no right. `MemoryOp.Split`
+/// and `MemoryOp.Map` are the callers it was waiting for.
 public(package) struct MemoryObject {
     public(package) handle: MemoryHandle,
     public(package) rights: UInt32,
@@ -214,6 +222,40 @@ public(package) struct MemoryObject {
 
 extension MemoryObject {
     public(package) func allows(&self, right: MemoryRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
+    }
+}
+
+/// An IoMemory handle the dispatch has VALIDATED, paired with its rights and
+/// the window slot it names (spec §2.5; sawos design 6 D-1).
+///
+/// It is a SEPARATE wrapper from `MemoryObject` and not a flag on one, which is
+/// the type-system half of D-1's ruling: a function that takes one of these can
+/// only ever have been handed a device window, so "a Device region cannot
+/// produce a cacheable mapping" is a fact about which `allows` compiles rather
+/// than a check somebody runs.
+public(package) struct IoMemoryObject {
+    public(package) handle: IoMemoryHandle,
+    public(package) rights: UInt32,
+    public(package) slot: Int,
+}
+
+extension IoMemoryObject {
+    public(package) func allows(&self, right: IoMemoryRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
+    }
+}
+
+/// A Mapping handle the dispatch has VALIDATED, paired with its rights and the
+/// mapping slot it names (spec §2.5; sawos design 6 D-3).
+public(package) struct MappingObject {
+    public(package) handle: MappingHandle,
+    public(package) rights: UInt32,
+    public(package) slot: Int,
+}
+
+extension MappingObject {
+    public(package) func allows(&self, right: MappingRight) -> Bool {
         (self.rights & (right as UInt32)) != 0
     }
 }
@@ -408,20 +450,23 @@ public(package) func unbind_handle(p: Int, index: Int) unsafe {
 }
 
 // =============================================================================
-// The Memory slab (spec §2.5; sawos design 2 D-2)
+// The Memory slab, first of three (spec §2.5; sawos design 2 D-2, grown by
+// design 6)
 // =============================================================================
 //
-// A MEMORY IS A SEALED PAIR, which is why its slab is here beside the handle
-// table rather than in a module of its own. Every other object kind has
-// behaviour somewhere — a thread has a state machine, a timer a schedule, an
-// event an accumulation rule — and this one has none in v1: it is `{base, len}`
-// plus the process it is charged to, read by exactly one op and freed by the
-// teardown. A file per object would be a file with no verbs in it.
+// **THREE SLABS, AND NONE OF THEM IS A MODULE — WHICH UNIT 4 TESTED AND KEPT.**
+// Unit 2 put the Memory slab here beside the handle table on the argument that
+// a Memory is a SEALED PAIR: every other object kind has behaviour somewhere
+// (a thread has a state machine, a timer a schedule, an event an accumulation
+// rule) and a region had none, so a file per object would have been a file with
+// no verbs in it. Unit 4 gave all three kinds verbs — `Split`, `Carve`, `Map`,
+// `Unmap` — and they still live here, because the verbs went to the DISPATCH
+// where every other kind's do. What is here is what was here: storage, an
+// allocator per slab, and one index fixup.
 //
-// It sits BELOW `process` for the same reason every other slab does: ending a
+// They sit BELOW `process` for the reason every other slab does: ending a
 // process frees what it owned, so the storage has to be reachable from the
-// teardown. Unit 4's pools, derivation and mappings are what turn this into a
-// module.
+// teardown.
 
 /// One Memory object: a range of physical memory, and whose it is.
 ///
@@ -450,6 +495,131 @@ public(package) func alloc_memory() unsafe -> Int {
         i = i + 1
     }
     NO_MEMORY
+}
+
+// =============================================================================
+// The IoMemory slab (spec §2.5; sawos design 6 D-1)
+// =============================================================================
+//
+// THE SAME SHAPE AS THE MEMORY SLAB, AND A DIFFERENT LIFETIME. An IoMemory is
+// `{base, len}` plus the process it is charged to, exactly as a Memory is —
+// which is why the two slabs are two arrays rather than one array with a flag,
+// per D-1: what differs is not the SHAPE but everything the shape is used for.
+// The bytes it names are REGISTERS, so nothing is ever placed in them, nothing
+// is ever zeroed, and the range is never returned to anybody — carving hands
+// out a view and leaves the parent whole (§2.5's "a fixed region may be handed
+// out many times"). The teardown reclaims the slot and touches no hardware.
+
+/// One IoMemory object: a range of device registers, and whose it is.
+public(package) struct IoMemorySlot {
+    public(package) state: SlotState,
+    public(package) process: Int,
+    public(package) base: UInt,
+    public(package) len: UInt,
+}
+
+public(package) unsafe static var IOMEMORIES: [IoMemorySlot; MAX_IOMEMORIES] = [
+    IoMemorySlot(state: SlotState.Free, process: 0, base: 0, len: 0); MAX_IOMEMORIES]
+
+/// Take a free IoMemory slot, or `NO_IOMEMORY` when the slab is full.
+public(package) func alloc_iomemory() unsafe -> Int {
+    var i: Int = 0
+    while i < MAX_IOMEMORIES {
+        match IOMEMORIES[i].state {
+            case Free -> { return i },
+            case Live -> {},
+        }
+        i = i + 1
+    }
+    NO_IOMEMORY
+}
+
+// =============================================================================
+// The Mapping slab (spec §2.5; sawos design 6 D-3)
+// =============================================================================
+//
+// **A MAPPING IS AN INSTALLED GRANT ROW**, so a slot records WHICH domain
+// carries the row and WHICH row it is — an index into `PROCESSES[target].grants`
+// — and nothing else. There is no base, no length and no access word here,
+// because the row already holds all three and a copy would be a second place
+// for them to disagree.
+//
+// **THE ROW INDEX IS THE ONE INDEX-SENSITIVE FACT IN THE SYSTEM** (design 6
+// D-3's census). `load_domain` replays rows BY POSITION, so unmapping row `i`
+// COMPACTS the record — and every Mapping slot naming a later row of the same
+// domain has to move with it. `compact_mapping_rows` below is that fixup, and
+// it is a bounded scan of this slab rather than a back-pointer per row: eight
+// slots, at an unmap, against a per-row pointer that four other paths would
+// have to keep in step.
+//
+// **A SLOT OUTLIVES ITS ROW, DELIBERATELY.** Two things end a row without
+// ending the object: an `unmap`, and the death of the TARGET process (whose
+// whole domain goes with it). Both leave the slot Live with `row == NO_ROW`,
+// which is what a later `unmap` sees as `BadState`. The slot itself comes back
+// at its OWNER's teardown, like every other kind — an op that freed a slab slot
+// while a handle still named it would let the next occupant be reached through
+// a stale word, which is exactly the aliasing design 3's generations exist to
+// prevent and which they cannot cover here (a generation lives in the handle
+// ENTRY, and the entry is not what went away).
+
+/// "This mapping has no row" — unmapped, or its target process is gone.
+///
+/// A row index is a position in a bounded array, so a negative is unusable as
+/// one and needs no reserved slot of its own.
+public(package) static NO_ROW: Int = -1
+
+/// One Mapping object: who owns the handle, whose domain holds the row, and
+/// which row it is.
+///
+/// `process` is the OWNER — the process whose teardown reclaims this slot —
+/// and `target` is the process whose domain the row sits in. They are usually
+/// the same and are genuinely different for the shape unit 4 exists to make
+/// possible: a launcher mapping a region into a child it created.
+public(package) struct MappingSlot {
+    public(package) state: SlotState,
+    public(package) process: Int,
+    public(package) target: Int,
+    public(package) row: Int,
+}
+
+public(package) unsafe static var MAPPINGS: [MappingSlot; MAX_MAPPINGS] = [
+    MappingSlot(state: SlotState.Free, process: 0, target: 0, row: NO_ROW);
+    MAX_MAPPINGS]
+
+/// Take a free Mapping slot, or `NO_MAPPING` when the slab is full.
+public(package) func alloc_mapping() unsafe -> Int {
+    var i: Int = 0
+    while i < MAX_MAPPINGS {
+        match MAPPINGS[i].state {
+            case Free -> { return i },
+            case Live -> {},
+        }
+        i = i + 1
+    }
+    NO_MAPPING
+}
+
+/// A row was removed from process `target`'s grant record at index `removed`,
+/// and the record COMPACTED. Move every Mapping that named a later row down
+/// with it.
+///
+/// THE ONLY INDEX-SENSITIVE FIXUP IN THE KERNEL, and it is small because the
+/// census said it would be: `load_domain` is the one place a row's POSITION
+/// means anything to the hardware, and this slab is the one place a position is
+/// remembered across a syscall.
+public(package) func compact_mapping_rows(target: Int, removed: Int) unsafe {
+    var i: Int = 0
+    while i < MAX_MAPPINGS {
+        match MAPPINGS[i].state {
+            case Live -> {
+                if MAPPINGS[i].target == target && MAPPINGS[i].row > removed {
+                    MAPPINGS[i].row = MAPPINGS[i].row - 1
+                }
+            },
+            case Free -> {},
+        }
+        i = i + 1
+    }
 }
 
 // =============================================================================

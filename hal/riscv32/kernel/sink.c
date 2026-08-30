@@ -61,25 +61,42 @@ u32 sos_region_table_end(void)   { return (u32)(unsigned long)_region_table_end;
 // budget spends, what a sosimg permission mask becomes — is `lib.saw`'s
 // (design 172 unit 1). These two functions place words in registers.
 
+// SIXTEEN ENTRIES, NOT EIGHT (sawos design 6 D-4). Four TOR regions were never
+// enough: a driver-shaped root spends two on its segments, one on its stack and
+// one on its device window before the first `map()` has a slot to take. The
+// switch covers every entry the part implements, so the budget above it is
+// `lib.saw`'s decision alone.
 void sos_pmpaddr_write(u32 i, u32 v) {
     switch (i) {
-    case 0: __asm__ volatile("csrw pmpaddr0, %0" :: "r"(v)); break;
-    case 1: __asm__ volatile("csrw pmpaddr1, %0" :: "r"(v)); break;
-    case 2: __asm__ volatile("csrw pmpaddr2, %0" :: "r"(v)); break;
-    case 3: __asm__ volatile("csrw pmpaddr3, %0" :: "r"(v)); break;
-    case 4: __asm__ volatile("csrw pmpaddr4, %0" :: "r"(v)); break;
-    case 5: __asm__ volatile("csrw pmpaddr5, %0" :: "r"(v)); break;
-    case 6: __asm__ volatile("csrw pmpaddr6, %0" :: "r"(v)); break;
-    case 7: __asm__ volatile("csrw pmpaddr7, %0" :: "r"(v)); break;
+    case 0:  __asm__ volatile("csrw pmpaddr0, %0"  :: "r"(v)); break;
+    case 1:  __asm__ volatile("csrw pmpaddr1, %0"  :: "r"(v)); break;
+    case 2:  __asm__ volatile("csrw pmpaddr2, %0"  :: "r"(v)); break;
+    case 3:  __asm__ volatile("csrw pmpaddr3, %0"  :: "r"(v)); break;
+    case 4:  __asm__ volatile("csrw pmpaddr4, %0"  :: "r"(v)); break;
+    case 5:  __asm__ volatile("csrw pmpaddr5, %0"  :: "r"(v)); break;
+    case 6:  __asm__ volatile("csrw pmpaddr6, %0"  :: "r"(v)); break;
+    case 7:  __asm__ volatile("csrw pmpaddr7, %0"  :: "r"(v)); break;
+    case 8:  __asm__ volatile("csrw pmpaddr8, %0"  :: "r"(v)); break;
+    case 9:  __asm__ volatile("csrw pmpaddr9, %0"  :: "r"(v)); break;
+    case 10: __asm__ volatile("csrw pmpaddr10, %0" :: "r"(v)); break;
+    case 11: __asm__ volatile("csrw pmpaddr11, %0" :: "r"(v)); break;
+    case 12: __asm__ volatile("csrw pmpaddr12, %0" :: "r"(v)); break;
+    case 13: __asm__ volatile("csrw pmpaddr13, %0" :: "r"(v)); break;
+    case 14: __asm__ volatile("csrw pmpaddr14, %0" :: "r"(v)); break;
+    case 15: __asm__ volatile("csrw pmpaddr15, %0" :: "r"(v)); break;
     default: break;
     }
 }
 
-// The two config registers covering entries 0-3 and 4-7, written together so a
-// partially programmed region set is never live.
-void sos_pmpcfg_write(u32 lo, u32 hi) {
-    __asm__ volatile("csrw pmpcfg0, %0" :: "r"(lo) : "memory");
-    __asm__ volatile("csrw pmpcfg1, %0" :: "r"(hi) : "memory");
+// The FOUR config registers covering entries 0-3, 4-7, 8-11 and 12-15, written
+// together so a partially programmed region set is never live. (On RV32 each
+// holds four entries' config bytes; RV64 packs eight per register and numbers
+// them evenly, which is one of the several reasons this file is per-profile.)
+void sos_pmpcfg_write(u32 w0, u32 w1, u32 w2, u32 w3) {
+    __asm__ volatile("csrw pmpcfg0, %0" :: "r"(w0) : "memory");
+    __asm__ volatile("csrw pmpcfg1, %0" :: "r"(w1) : "memory");
+    __asm__ volatile("csrw pmpcfg2, %0" :: "r"(w2) : "memory");
+    __asm__ volatile("csrw pmpcfg3, %0" :: "r"(w3) : "memory");
 }
 
 // ---- which interrupt classes may reach this hart --------------------------

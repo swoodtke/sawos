@@ -1,0 +1,90 @@
+//! IOMEMORY — a range of device registers, and the one op it owns (spec §2.5;
+//! sawos design 6 D-1/D-2).
+//!
+//! **IT IS A DISTINCT KIND FROM `Memory`, NOT A FLAG ON ONE**, and this file
+//! exists rather than a `device: Bool` field for the reason D-1 gives: an
+//! IoMemory can only ever produce DEVICE-attribute rows, so a driver cannot
+//! obtain a cacheable view of a register block by any spelling. That is a
+//! property of which methods exist, which is the strongest way a type system
+//! can say it — and it is why `Process.map(iomemory:)` takes no access
+//! argument while `Process.map(memory:)` requires one.
+//!
+//! The lifetime differs everywhere too, and `carve` is where a reader meets it:
+//! MMIO is PINNED, so a carve hands out a view and LEAVES THE PARENT WHOLE.
+//! §2.5's own words — "a fixed region may be handed out many times" — which is
+//! exactly what a `Memory.split` must not do.
+//!
+//! It sits beside `sos.memory` in the module order for the same reason that one
+//! sits where it does: it names only the floor, so `sos.system` can name it.
+
+import sosabi.{SosStatus, IoMemoryHandle, IoMemoryOp, NO_HANDLE}
+
+import sos.floor.{call_value, sos_handle_release}
+
+/// A handle to an IoMemory — a range of memory-mapped device registers.
+///
+/// A driver receives one at boot through `Process.boot_handle_next` (a DEVICE
+/// row of the build's region table mints one), narrows it with `carve` if its
+/// hardware has sub-blocks worth separating, and installs it with
+/// `Process.map`. From then on the registers are at their own addresses — this
+/// is a no-translation machine, so a mapped window is where the hardware is —
+/// and the driver reaches them through `UnsafeMemory<_, Device>` exactly as it
+/// always has.
+///
+/// **THERE IS NO WAY TO READ THE BOUNDS**, on `Memory`'s terms and for the same
+/// reason. What a driver knows about its device's address it knows from the
+/// device's own description, which is where a board fact belongs.
+///
+/// Built by `Process.boot_handle_next` and by `carve`, and by nothing else.
+///
+/// **IT IS `NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3
+/// D-5), like every other wrapper here. Dropping it does NOT close any mapping
+/// made from it: a Mapping is its own object with its own handle, which is
+/// §2.5's "only the Mapping handle can unmap" seen from the other end.
+public struct IoMemory {
+    public(package) handle: IoMemoryHandle,
+}
+
+extension IoMemory: NoCopy {
+    /// Drop is release; see `System`'s deinit for the sentinel and the discard.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
+}
+
+extension IoMemory {
+    /// **TAKE A SUB-WINDOW, AND LEAVE THIS ONE WHOLE.** Requires
+    /// `IoMemoryRight.Carve`.
+    ///
+    /// `offset` is relative to THIS window, which is what lets a driver name a
+    /// sub-block without ever learning an address: a caller says "the second
+    /// page of what I hold", not "0x0900_1000".
+    ///
+    /// **THE PARENT IS UNCHANGED, WHICH IS THE WHOLE DIFFERENCE FROM
+    /// `Memory.split`.** Registers are pinned and shared by nature — several
+    /// drivers may legitimately hold windows onto one peripheral — so a carve
+    /// is non-exclusive and carving the same range twice succeeds twice. There
+    /// is no cursor here and nothing is spent.
+    ///
+    /// **THE MACHINE'S GRANULARITY IS CHECKED HERE, WHERE YOU CHOSE THE
+    /// NUMBERS** — a window that could never be installed anywhere is a
+    /// capability that lies about itself, and a refusal deferred to the map
+    /// would arrive one op later than the mistake. (`Process.map(iomemory:)`
+    /// checks it again, for the one window no carve ever saw: a boot root.)
+    ///
+    /// The rule is per-profile — one machine grants a device window as a single
+    /// naturally-aligned power-of-two protection entry, the other by page — so
+    /// the same carve can be legal on one and refused on the other, and BOTH
+    /// refusals TERMINATE the caller. A range past this window's end is the
+    /// same fault.
+    ///
+    /// A full slab or handle table is `SosStatus.NoResource`.
+    public func carve(&self, offset: UInt,
+                      len: UInt) -> Result<IoMemory, SosStatus> {
+        let raw = try call_value(self.handle, IoMemoryOp.Carve as UInt, offset,
+                                 len, 0)
+        return IoMemory(handle: IoMemoryHandle(raw))
+    }
+}

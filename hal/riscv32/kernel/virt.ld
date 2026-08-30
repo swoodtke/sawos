@@ -33,14 +33,22 @@
  * simply never granting them. M-mode is unconstrained (SOS sets no L bits).
  *
  * Regions are TOR pairs — entry 2*i is the lower bound (A=OFF, a bound only),
- * entry 2*i+1 is the upper bound (A=TOR) and carries R/W/X. Four regions, eight
- * of QEMU's sixteen entries:
+ * entry 2*i+1 is the upper bound (A=TOR) and carries R/W/X. EIGHT regions,
+ * SIXTEEN of QEMU's sixteen entries (sawos design 6 D-4 — the budget doubled,
+ * so this is now every entry the part implements and the last widening there
+ * is):
  *
  *   region 0..N-1  one per sosimg segment, permissions from the segment flags
  *   region N       the root stack, RW
+ *   region N+1..   rows installed at RUN TIME by MemoryOp.Map / IoMemoryOp.Map
+ *
+ * A device window costs ONE region rather than a pair, because it is staged as
+ * a naturally-aligned power-of-two (NAPOT) entry: the pair's high entry carries
+ * the config and the low one stays disabled.
  *
  * A sosimg with more segments than the budget allows is rejected as a malformed
- * image rather than being silently under-protected.
+ * image rather than being silently under-protected, and a map() that would need
+ * a ninth region is refused with NoResource rather than dropped.
  */
 
 OUTPUT_ARCH(riscv)

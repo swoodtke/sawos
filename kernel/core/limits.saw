@@ -52,31 +52,78 @@ public(package) static ROOT_PROCESS: Int = 0
 /// "No process". The plain-form sentinel, like `NO_THREAD`.
 public(package) static NO_PROCESS: Int = -1
 
-/// Memory objects the kernel can hold (spec §2.5; sawos design 2 D-2).
+/// Memory objects the kernel can hold (spec §2.5; sawos design 2 D-2, raised
+/// by design 6 D-7).
 ///
-/// A CENSUS OF BOOT REGIONS rather than a slab a process draws on: v1 mints
-/// these only at boot, one per row of the build-emitted region table, and
-/// nothing creates one at run time. Eight is a comfortable ceiling on a
-/// hand-written system's images plus their destination ranges; a table with
-/// more rows than this is refused at boot rather than silently truncated.
-/// Unit 4's pools are what make this a real allocation budget.
-public(package) static MAX_MEMORIES: Int = 8
+/// **IT IS A REAL ALLOCATION BUDGET NOW, which is what unit 4 changed about
+/// it.** Unit 2's number was a census of boot regions — v1 minted these only at
+/// boot, one per row of the build-emitted region table, and nothing created one
+/// at run time. `MemoryOp.Split` creates one per cut, so the slab is what a
+/// pool is spent THROUGH: sixteen is the boot rows plus room for a handful of
+/// derived regions, which is what a hand-written system's launcher needs.
+///
+/// It is deliberately NOT large. Free-on-last-reference is unit 5's (§2.5's
+/// refcount clause), so a split is permanent until its owner's teardown and a
+/// long-running allocator would meet this number; that is the honest state of
+/// the system and `NoResource` is what says so, rather than a bigger table
+/// hiding the same fact one order of magnitude further out.
+public(package) static MAX_MEMORIES: Int = 16
 
 /// The same sentinel for the Memory slab.
 public(package) static NO_MEMORY: Int = -1
 
+/// IoMemory objects the kernel can hold (spec §2.5; sawos design 6 D-1/D-7).
+///
+/// SMALLER THAN THE RAM SLAB, and for the reason `MAX_INTERRUPTS` is small: an
+/// IoMemory is a DEVICE WINDOW, and a machine has as many of those as it has
+/// peripherals a driver wants — a board fact, not a workload one. Carving is
+/// non-exclusive, so several windows onto one peripheral cost several slots,
+/// which is what makes eight rather than four.
+public(package) static MAX_IOMEMORIES: Int = 8
+
+/// The same sentinel for the IoMemory slab.
+public(package) static NO_IOMEMORY: Int = -1
+
+/// Mapping objects the kernel can hold (spec §2.5; sawos design 6 D-3/D-7).
+///
+/// A Mapping is one INSTALLED ROW with a handle on it, so the honest ceiling is
+/// the rows every process's domain can hold at once — which is smaller than
+/// this on one profile and the same order on the other. Eight is that, and a
+/// map that meets it answers `NoResource` exactly as one that meets the
+/// hardware's row budget does.
+public(package) static MAX_MAPPINGS: Int = 8
+
+/// The same sentinel for the Mapping slab.
+public(package) static NO_MAPPING: Int = -1
+
 /// Rows in a process's GRANT RECORD (sawos design 2 D-5) — the protection map
 /// the scheduler REPLAYS when it switches into that process.
 ///
-/// One row per image segment plus one for the kernel's stack grant, which is
-/// `hal.MAX_ROOT_SEGMENTS + 1` on each profile. It is written as a literal here
-/// rather than derived from the HAL because an array LENGTH must be an `Int`
-/// and the HAL's budget is a `UInt`; the assert below is what keeps the two
-/// from drifting, at the profile with the larger budget.
+/// It is the ARRAY LENGTH, and since M3 unit 4 that is ALL it is. One row per
+/// image segment plus one for the kernel's stack grant was the whole story
+/// while grants were made at load time only; `MemoryOp.Map` installs rows at
+/// run time, so what a process may actually hold is a PER-PROFILE budget the
+/// HAL publishes (`hal.GRANT_ROW_BUDGET`) and this number is the storage that
+/// has to cover the larger of them.
+///
+/// **THE TWO PROFILES' BUDGETS NOW MEAN DIFFERENT THINGS**, and that is the
+/// note unit 4 owes this constant. One profile's wall is HARDWARE — a fixed
+/// number of numbered protection regions, eight of them since design 6 D-4
+/// widened the budget — so a map meeting it is a map the machine cannot
+/// install. The other has no such limit at all (it grants by page table) and
+/// its wall is this POLICY number, chosen so that one array serves both. A map
+/// checks the HAL's number and never this one; this one is what stops the array
+/// from being too short for it (the assert below).
+///
+/// It stays 9 because raising it costs every process slot a row of storage and
+/// nothing needs more yet.
 public(package) static MAX_GRANT_ROWS: Int = 9
 
 static_assert(hal.MAX_ROOT_SEGMENTS + 1 <= 9,
               "a process's grant record must hold every segment plus its stack")
+
+static_assert(hal.GRANT_ROW_BUDGET <= 9,
+              "a process's grant record must hold every row its profile may install")
 
 /// Threads the kernel can hold, across all processes.
 public(package) static MAX_THREADS: Int = 8

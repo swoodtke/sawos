@@ -3,11 +3,11 @@
 //!
 //! It is the bottom of the module order because it names no wrapper type: an
 //! op here takes a raw handle word and answers a raw status, which is exactly
-//! what makes it reachable from all nine objects without reaching back into
+//! what makes it reachable from every object kind without reaching back into
 //! any of them. `checked` is where a number becomes a `Result`, and
 //! `sos_handle_release` is the one call every wrapper's `deinit` issues — so
-//! the owning tier's whole contract is recorded here too, below the nine
-//! files that implement it.
+//! the owning tier's whole contract is recorded here too, below every file
+//! that implements it.
 //!
 //! THE TWO SYSCALL EXTERNS LIVE HERE AND NOWHERE ELSE, and that is what put
 //! the per-op C surface here with them: an `extern "C"` declaration carries no
@@ -16,7 +16,8 @@
 //! declaration, one file, and the typed layer above calls the named seams.
 
 import sosabi.{SosStatus, SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp,
-               InterruptOp, ClockOp, TimerOp, RELEASE_OP, MINT_OP}
+               InterruptOp, ClockOp, TimerOp, MemoryOp, IoMemoryOp, MappingOp,
+               RELEASE_OP, MINT_OP}
 
 // The per-arch HAL, and since design 172 part 2 the WHOLE of it: the one
 // instruction in the system that crosses the trap boundary. FIXED ARITY on
@@ -465,6 +466,101 @@ public func sos_timer_disarm(handle: UInt) -> UInt {
     sos_syscall1(handle, TimerOp.Disarm as UInt, 0)
 }
 
+// -----------------------------------------------------------------------------
+// Memory, IoMemory and Mapping (spec §2.5; sawos design 6)
+// -----------------------------------------------------------------------------
+//
+// FIVE OPS ACROSS THREE KINDS, and the pairing is the design: each memory kind
+// has a DERIVATION verb and an INSTALL verb, and the third kind is what an
+// install produces. The verbs differ because the kinds do — a split consumes
+// what it hands out and a carve does not — which is D-2's whole argument, seen
+// from the ABI.
+
+/// **SPLIT — one cut from the FRONT of a region.** Requires
+/// `MemoryRight.Split`.
+///
+/// The new Memory covers the first `len` bytes and THE PARENT BECOMES THE
+/// REMAINDER, so repeated splits walk a pool forward and the parent handle is
+/// the cursor. `len` must be a non-zero multiple of the target's protection
+/// granularity and no larger than the parent; anything else TERMINATES the
+/// caller, which chose the number. A full Memory slab or handle table is
+/// `SosStatus.NoResource`.
+///
+/// There is no carve-from-the-middle, and the reason is the representation
+/// rather than a policy: a region is one `{base, len}` slot, and a cut from the
+/// middle would leave the parent as two ranges.
+@export("sos_memory_split")
+public func sos_memory_split(handle: UInt, len: UInt,
+                             value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, MemoryOp.Split as UInt, len, 0, 0, value_out)
+}
+
+/// **MAP — install this region in `process`'s address space, and answer with a
+/// MAPPING handle.** Requires `MemoryRight.Map` here AND `ProcessRight.Map` on
+/// `process`.
+///
+/// TWO RIGHTS ON TWO OBJECTS, because holding bytes must not imply authority
+/// over somebody's address space. `access` is a mask of `MapAccess` bits; write
+/// without read, no access at all, and any bit outside the three all TERMINATE
+/// the caller. A region whose range this machine cannot grant is the same
+/// fault. A domain with no protection row left, or a full Mapping slab or
+/// handle table, is `SosStatus.NoResource`.
+///
+/// THE CALLER SUPPLIES NO ADDRESSES. The range is the region's own, which is
+/// why there is still no op that reads a Memory's bounds.
+@export("sos_memory_map")
+public func sos_memory_map(handle: UInt, process: UInt, access: UInt,
+                           value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, MemoryOp.Map as UInt, process, access, 0, value_out)
+}
+
+/// **CARVE — a sub-window of this device window, LEAVING THE PARENT WHOLE.**
+/// Requires `IoMemoryRight.Carve`.
+///
+/// `offset` is relative to the parent, so a caller names a sub-window without
+/// learning an address. The parent is UNCHANGED — MMIO is pinned and a fixed
+/// region may be handed out many times — which is the whole difference from
+/// `sos_memory_split`.
+///
+/// A window this machine cannot express as one protection grant TERMINATES the
+/// caller, and the rule is per-profile: one wants a naturally-aligned power of
+/// two, the other a whole number of pages. So does a range past the parent's
+/// end. A full slab or handle table is `SosStatus.NoResource`.
+@export("sos_iomemory_carve")
+public func sos_iomemory_carve(handle: UInt, offset: UInt, len: UInt,
+                               value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, IoMemoryOp.Carve as UInt, offset, len, 0, value_out)
+}
+
+/// **MAP — install this device window in `process`'s address space.** Requires
+/// `IoMemoryRight.Map` here AND `ProcessRight.Map` on `process`.
+///
+/// THERE IS NO ACCESS ARGUMENT, and that is the type doing its job: an IoMemory
+/// can only ever produce a device-attribute row, read-write, never executable.
+/// A driver therefore cannot obtain a cacheable view of a register block by any
+/// spelling — the guarantee is the object kind, not a check.
+@export("sos_iomemory_map")
+public func sos_iomemory_map(handle: UInt, process: UInt,
+                             value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, IoMemoryOp.Map as UInt, process, 0, 0, value_out)
+}
+
+/// **UNMAP — take this mapping's row out of the domain it was installed in.**
+/// Requires `MappingRight.Unmap`.
+///
+/// Only a Mapping unmaps (§2.5), which is what the object is for. A mapping
+/// that is already unmapped — or whose target process has died, taking its
+/// whole domain with it — TERMINATES the caller with `BadState`: the caller
+/// either unmapped it or created the child.
+///
+/// RELEASING THE HANDLE IS NOT AN UNMAP. Release destroys the entry and never
+/// the row (§2.5's stance: a mapping dropped without an unmap is permanent,
+/// safe-but-leaked), so a caller that means to revoke says so.
+@export("sos_mapping_unmap")
+public func sos_mapping_unmap(handle: UInt) -> UInt {
+    sos_syscall1(handle, MappingOp.Unmap as UInt, 0)
+}
+
 /// **RELEASE — destroy this handle, whatever kind it names** (sawos design 3
 /// D-2). The ONE spelling of release in this module.
 ///
@@ -538,11 +634,17 @@ public static ALL_RIGHTS: UInt32 = 0xFFFF_FFFF
 // `deinit` above this file is written to
 // =============================================================================
 //
-// **ALL NINE WRAPPERS ARE `NoCopy`, AND DROP IS RELEASE** (the Aug-29 user
-// ruling). Each holds one handle word and one hand-written `deinit` that
-// releases it, so a wrapper going out of scope destroys the capability instance
-// it owned — RAII, over kernel handles, with the kernel's own generations
-// backstopping it.
+// **EVERY WRAPPER IS `NoCopy`, AND DROP IS RELEASE** (the Aug-29 user ruling).
+// Each holds one handle word and one hand-written `deinit` that releases it, so
+// a wrapper going out of scope destroys the capability instance it owned —
+// RAII, over kernel handles, with the kernel's own generations backstopping it.
+//
+// There were nine when the ruling landed and there are ELEVEN since M3 unit 4
+// (`IoMemory`, `Mapping`); the count is not written here any more, because the
+// rule is what matters and a number in prose is what goes stale. `Mapping` is
+// the one worth reading its own docstring for: dropping it releases the HANDLE
+// and does not unmap the ROW, which is §2.5's ruled stance rather than an
+// omission.
 //
 // WHY THE TWO HALVES HAD TO LAND TOGETHER. A release op beside COPYABLE wrappers
 // is a stale-fault factory: copy a `Clock`, let one copy drop, and the sibling's

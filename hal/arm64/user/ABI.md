@@ -58,20 +58,38 @@ invalid handle, an unknown op, a missing right — does not come back at all:
 design 178's faults ruling terminates the process for it, and the kernel reports
 the reason. What is left as a status is what the caller could not have known.
 
-## A granted device window (design 178 M2 unit 4)
+## A granted device window (design 178 M2 unit 4, MIGRATED M3 unit 4)
 
 A DRIVER PROCESS REACHES ITS DEVICE DIRECTLY, through no stub in this directory
-and no op in the kernel. What it needs is one line in its own manifest —
+and no op in the kernel's fast path. From then on the register block is ordinary
+memory to that process, and the driver is the design-112 MMIO idiom in plain
+process Saw (`UnsafeMemory<Regs, Device>` over a register-block struct).
+`sos/tests/uart-echo-pl011/` is the worked example. **WHAT CHANGED IN M3 unit 4
+IS HOW THE WINDOW ARRIVES** (sawos design 6 D-6).
+
+**NOW — OBTAINED.** The build publishes a DEVICE row in the boot region table,
+the kernel mints an `IoMemory` capability for it, and the driver drains it from
+its boot set and installs it in itself:
+
+    var record = proc.boot_handle_next()!          // kind == IoMemory
+    let window = record.take_iomemory()!
+    let mapping = proc.map(iomemory: &window)!     // EL0 RW, PXN + UXN, nGnRE
+
+Note what the call does NOT take: an access argument. An `IoMemory` has one map
+op and it installs a device-attribute row, so the paragraph below about
+`Device-nGnRE` is now enforced by the object's KIND rather than by a flag the
+loader honoured.
+
+**BEFORE — DECLARED, and this path is DORMANT rather than deleted.** A driver
+wrote one line in its own manifest:
 
     [sos.aarch64-unknown-none-elf]
     device-window = "0x09000000"
 
-— which becomes a device record in its `sosimg`, which the kernel installs as
+— which became a device record in its `sosimg`, which the kernel installed as
 one EL0-readable, EL0-writable, never-executable page before entering user mode.
-From then on the register block is ordinary memory to that process, and the
-driver is the design-112 MMIO idiom in plain process Saw
-(`UnsafeMemory<Regs, Device>` over a register-block struct).
-`sos/tests/uart-echo-pl011/` is the worked example.
+No image in this tree uses it any more; the flag and the loader's door survive
+because the emitter is sawlang-side, so deleting them is a pin-bump event.
 
 **THE PAGE CARRIES DEVICE MEMORY ATTRIBUTES (`Device-nGnRE`), never
 Normal-cacheable**, and on this profile that is the driver's problem as much as
@@ -82,9 +100,12 @@ SIZE: device memory permits no unaligned and no multi-register access, so a
 driver reads and writes each register at its own width — 32 bits on this board's
 console — and never copies a register block.
 
-The window is AUTHORIZED by the board (this HAL publishes one; an image naming
-anything else is refused at load) and is a PLACEHOLDER for M3's
-MemoryObject / Mapping (spec §2.5).
+The window is AUTHORIZED by the board — this HAL publishes one, and since M3
+unit 4 that pair is what the BUILD mirrors when it emits the DEVICE row a driver
+obtains (`device_window_ok` is the same rule as a runtime predicate, checked at
+`carve` and at `map`, because a caller now chooses the bounds). §2.5's
+placeholder clause is DISCHARGED: a device window is a handle derived from a
+device pool root, installed by an op and revoked by unmapping the Mapping.
 
 **THE CONSOLE HANDOVER PROTOCOL** applies to whoever holds the console's window:
 the kernel goes quiet at its `SOS: console handover` marker and writes again only

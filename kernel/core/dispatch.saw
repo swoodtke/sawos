@@ -19,6 +19,8 @@ import sosabi.{
     ClockHandle,
     TimerHandle,
     MemoryHandle,
+    IoMemoryHandle,
+    MappingHandle,
     SystemRight,
     ProcessRight,
     ThreadRight,
@@ -27,6 +29,9 @@ import sosabi.{
     InterruptRight,
     ClockRight,
     TimerRight,
+    MemoryRight,
+    IoMemoryRight,
+    MappingRight,
     SystemOp,
     ProcessOp,
     ThreadOp,
@@ -35,8 +40,13 @@ import sosabi.{
     InterruptOp,
     ClockOp,
     TimerOp,
+    MemoryOp,
+    IoMemoryOp,
+    MappingOp,
     EventMode,
     ClockType,
+    MapAccess,
+    MAP_ACCESS_MASK,
     BootTagForm,
     BootHandleKind,
     rights_allow_transfer,
@@ -59,6 +69,9 @@ import sosabi.{
     clock_rights,
     timer_rights,
     process_rights,
+    memory_rights,
+    iomemory_rights,
+    mapping_rights,
     NO_HANDLE,
     RELEASE_OP,
     MINT_OP,
@@ -69,11 +82,16 @@ import kcore.limits.{
     NO_ATTACHMENT,
     NO_EVENT,
     NO_INTERRUPT,
+    NO_IOMEMORY,
+    NO_MAPPING,
+    NO_MEMORY,
     NO_PROCESS,
     NO_THREAD,
     NO_TIMER,
     NO_WAITER,
 }
+import kcore.mem.{align_up}
+import imgformat.{SegFlag}
 import kcore.result.{
     SyscallResult,
     op_blocked,
@@ -89,16 +107,28 @@ import kcore.objects.{
     ClockObject,
     EventObject,
     HandleEntry,
+    IOMEMORIES,
     InterruptObject,
+    IoMemoryObject,
+    IoMemorySlot,
+    MAPPINGS,
     MEMORIES,
+    MappingObject,
+    MappingSlot,
     MemoryObject,
+    MemorySlot,
+    NO_ROW,
     ProcessObject,
     SlotState,
     SystemObject,
     ThreadObject,
     TimerObject,
     WaiterObject,
+    alloc_iomemory,
+    alloc_mapping,
+    alloc_memory,
     boot_handle_cursor,
+    compact_mapping_rows,
     boot_handle_room,
     boot_handle_take,
     boot_tag_used,
@@ -160,7 +190,10 @@ import kcore.process.{
     copy_in,
     copy_out,
     copy_out_check,
+    domain_changed,
     reclaim_process_slot,
+    record_grant,
+    remove_grant,
 }
 import kcore.loader.{
     LoadRegion,
@@ -500,8 +533,9 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
 /// ruled Aug 29), already checked; these two are the operation's ARGUMENTS —
 /// which is exactly why that ruling could move the authority to another object
 /// without touching a line below this comment. Unit 3's `give` and unit 4's
-/// `map` are the ops that start asking what a holder may do with a region, and
-/// the wrapper is built to answer them (`MemoryObject.allows`).
+/// `Split`/`Map` are the ops that DO ask what a holder may do with a region,
+/// through the wrapper this one builds and does not question
+/// (`MemoryObject.allows`).
 func memory_arg(p: Int, handle: UInt) unsafe -> Int {
     let entry = lookup_handle(p, handle)
     match entry.obj_type {
@@ -543,7 +577,9 @@ func region_wraps(base: UInt, len: UInt) -> Bool {
 ///     passed twice. Overlap ACROSS separate creates is deliberately not
 ///     policed: regions are capabilities, the region table is build-emitted
 ///     disjoint, and root double-spending what it holds corrupts only what it
-///     holds. Real accounting arrives with unit 4's pools and unit 5's quotas.
+///     holds. Unit 4's pools made a region DIVISIBLE without making it
+///     accounted; real accounting arrives with unit 5's quotas and
+///     free-on-last-reference.
 func process_create(p: Int, image_handle: UInt,
                     memory_handle: UInt) unsafe -> SyscallResult {
     let img = memory_arg(p, image_handle)
@@ -730,6 +766,13 @@ func boot_kind_of(kind: ObjType) -> BootHandleKind? {
         case Memory -> BootHandleKind.Memory,
         case Process -> BootHandleKind.Process,
         case System -> BootHandleKind.System,
+        // **UNIT 4'S ARM, AND IT IS THE ARM THE COMMENT ABOVE PREDICTED**
+        // (sawos design 6 D-1): `iomemory_rights()` mints `Transfer`, so a
+        // window can travel, so the record needs a spelling for one. A Mapping
+        // stays in the `None` arm on purpose — `mapping_rights()` withholds
+        // `Transfer`, so the `Transfer` check above refuses one first and this
+        // spelling would be dead surface.
+        case IoMemory -> BootHandleKind.IoMemory,
         case _ -> None,
     }
 }
@@ -1429,12 +1472,17 @@ func waitable_slot(p: Int, handle: UInt) unsafe -> Waitable {
         // always running, so "ready" would either be permanently true or
         // meaningless. Waiting for a TIME is what the Timer it creates is for.
         case Clock -> fault_process(p, FaultReason.NotWaitable),
-        // A MEMORY IS NOT WAITABLE EITHER, and for a sharper reason: a region
-        // has no state at all in v1 — it is a sealed pair — so there is nothing
-        // that could become ready. Unit 4's Mapping is where memory grows an
-        // event worth waiting on (a fault, a revocation), and it will be that
-        // object's readiness rather than the region's.
+        // NONE OF THE THREE MEMORY KINDS IS WAITABLE, and unit 4 sharpens the
+        // reason rather than changing it. A region and a window have no STATE —
+        // they are sealed pairs, and ops on them succeed or fault immediately.
+        // A MAPPING has state (installed, or not) and still has no readiness: it
+        // changes only when its holder asks, so a wait on one could only ever
+        // report what the caller just did. What would make memory waitable is a
+        // fault or a REVOCATION arriving from elsewhere, and neither exists
+        // until a supervisor can revoke somebody else's mapping.
         case Memory -> fault_process(p, FaultReason.NotWaitable),
+        case IoMemory -> fault_process(p, FaultReason.NotWaitable),
+        case Mapping -> fault_process(p, FaultReason.NotWaitable),
     }
 }
 
@@ -1673,6 +1721,420 @@ func mint_sibling(p: Int, entry: HandleEntry, keep: UInt) unsafe -> SyscallResul
     op_value(word)
 }
 
+// =============================================================================
+// Memory, IoMemory and Mapping (spec §2.5; sawos design 6)
+// =============================================================================
+//
+// **A MAPPING IS AN INSTALLED GRANT ROW.** Everything below follows from that
+// one sentence on a machine that does not translate (spec §5.5: an address is
+// the same number in every process), and it is what makes this unit small: the
+// grant record M3 unit 2 built for the SCHEDULER is the same record `map`
+// edits, `load_domain` is the same installer, and the object this unit adds is
+// a handle onto one row of it.
+//
+// THREE THINGS ARE SHARED BY THE OPS BELOW AND ARE WRITTEN ONCE HERE:
+//
+//   - the ACCESS vocabulary, translated rather than cast (`grant_perms`);
+//   - the TARGET resolution, which spends `ProcessRight.Map` on a process the
+//     caller named (`map_target`);
+//   - the INSTALL itself, which is one place so that a RAM row and a device row
+//     cannot be recorded differently (`install_row`).
+
+/// Translate `MapAccess` bits into the `SegFlag` vocabulary a grant row carries.
+///
+/// **IT IS A TRANSLATION AND NOT A CAST, DELIBERATELY.** The two enums have the
+/// same numbers on purpose (`MapAccess` says why), and writing the conversion
+/// out anyway is what lets the two packages version apart: `sosabi` is the trap
+/// boundary's vocabulary and `imgformat` is the image format's, and a cast here
+/// would silently tie a future edit of either to the other. Three lines is the
+/// whole cost.
+func grant_perms(access: UInt32) -> UInt8 {
+    var perms: UInt8 = 0
+    if (access & (MapAccess.Read as UInt32)) != 0 {
+        perms = perms | (SegFlag.Read as UInt8)
+    }
+    if (access & (MapAccess.Write as UInt32)) != 0 {
+        perms = perms | (SegFlag.Write as UInt8)
+    }
+    if (access & (MapAccess.Execute as UInt32)) != 0 {
+        perms = perms | (SegFlag.Execute as UInt8)
+    }
+    perms
+}
+
+/// Decode and VALIDATE a caller's access word, or end the caller.
+///
+/// THREE REFUSALS, all `BadArg` faults and all caller-checkable — the caller
+/// assembled the word out of `MapAccess` cases it named:
+///
+///   - a bit outside the three. There is no fourth access, so a set bit the
+///     kernel cannot name is a number the caller made up.
+///   - WRITE WITHOUT READ. Not a grant any target should install, and one
+///     profile RESERVES the encoding outright — the same rule
+///     `imgformat.has_sane_perms` applies to an image, applied to a map, which
+///     is what keeps ONE answer to "what is a valid grant" in the system.
+///   - NO ACCESS AT ALL. A row that permits nothing spends a protection slot to
+///     say what default-deny already says.
+func map_access(p: Int, raw: UInt) unsafe -> UInt32 {
+    // THE WHOLE REGISTER IS TESTED FIRST, in its own width, and only then
+    // narrowed. `raw` is a word a PROCESS chose, so an `as UInt32` on a 64-bit
+    // profile would PANIC INSIDE THE KERNEL over somebody else's number — the
+    // hazard `handle_word_generation` refuses to take and `mint_sibling`
+    // truncates past. Testing before narrowing gets both: a bit set anywhere
+    // above the three is refused rather than dropped, and the narrowing that
+    // follows is exact by construction.
+    if (raw & (MAP_ACCESS_MASK as UInt)) != raw {
+        fault_process(p, FaultReason.BadArg)
+    }
+    let access = UInt32.from(truncating: raw)
+    // The parentheses around the whole condition are DF-172d's: an unbracketed
+    // binary expression does not wrap across lines in either spelling.
+    if ((access & (MapAccess.Write as UInt32)) != 0
+        && (access & (MapAccess.Read as UInt32)) == 0) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    if access == 0 {
+        fault_process(p, FaultReason.BadArg)
+    }
+    access
+}
+
+/// Resolve the Process handle a map names as its TARGET, spending
+/// `ProcessRight.Map` on it. Answers the target's process slot, or ends the
+/// caller.
+///
+/// **THIS IS THE SECOND RIGHT A MAP SPENDS, AND IT IS THE POINT OF THE
+/// ARGUMENT** (sawos design 6 D-3). Installing a row into a domain is an
+/// authority over THAT PROCESS, not something holding a region should imply —
+/// the doctrine's no-possession-implies-authority, applied to the one op that
+/// reaches across a process boundary. A launcher that hands a child a region
+/// without this bit on the child's handle has handed over bytes it cannot
+/// install anywhere.
+///
+/// A word that names nothing, or names something that is not a Process, is the
+/// ordinary `BadHandle`: the caller chose which handle to pass.
+///
+/// **THE TARGET MUST BE ALIVE, AND THAT CHECK IS LOAD-BEARING RATHER THAN
+/// TIDY.** A supervisor's handle onto a dead child OUTLIVES it — that is design
+/// 3 D-3's whole point, since reading how a child died is what the handle is
+/// for — so a `map` naming one would otherwise append a row to a `Gone` slot's
+/// grant record. The record was emptied by `clear_domain` at the teardown and
+/// the slot is RECLAIMED once no handle names it, so the next
+/// `process_create` would land in that slot and `place_image` would append its
+/// own rows ON TOP of the stranger's: a brand-new process holding a protection
+/// row it never asked for, granting somebody else's memory. `give` and `Start`
+/// were never exposed to this (both require `Created`); `map` is the first op
+/// that reaches into another process's slot without one, so it states its own
+/// requirement.
+///
+/// `Created` and `Running` are both legal — mapping into a child before or
+/// after its start are equally sensible, and a mapping is not a boot record, so
+/// the give-freeze does not apply. Anything else is `BadState`, a FAULT: the
+/// caller can ask (`GetStatus`), so it could have known.
+func map_target(p: Int, handle: UInt) unsafe -> Int {
+    let entry = lookup_handle(p, handle)
+    match entry.obj_type {
+        case Process -> {
+            let target = ProcessObject(handle: ProcessHandle(handle),
+                                       rights: entry.rights, slot: entry.target)
+            if not target.allows(ProcessRight.Map) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            match PROCESSES[target.slot].state {
+                case Created -> {},
+                case Running -> {},
+                case _ -> fault_process(p, FaultReason.BadState),
+            }
+            target.slot
+        },
+        case _ -> fault_process(p, FaultReason.BadHandle),
+    }
+}
+
+/// Install one row in process `t`'s domain and mint the Mapping that names it.
+///
+/// **THE PHYSICAL WALL IS CHECKED HERE** (sawos design 6 D-3, agenda item 8).
+/// `hal.GRANT_ROW_BUDGET` is how many rows this profile's domain may hold — a
+/// HARDWARE number on one and a POLICY one on the other, which is exactly why
+/// the kernel reads the HAL's rather than a shared constant — and a map that
+/// meets it is `NoResource`, a STATUS, because a caller cannot know how full
+/// somebody else's domain is. The quota (unit 5) is the policy cap layered
+/// ABOVE this one, and the sentence that unit will make true is worth recording
+/// at the check: **a `map()` meeting the physical wall with quota headroom left
+/// is a kernel bug to assert against.** There is no quota yet, so meeting it is
+/// ordinary today.
+///
+/// The budget is checked BEFORE anything is written, which is what keeps
+/// `record_grant`'s own `fatal_image` overflow arm a BOOT-door vocabulary: that
+/// arm exists for a table the build wrote, and this check is why a syscall can
+/// never reach it.
+///
+/// **AND THE LIVE-DOMAIN RULE IS OBEYED AT THE END** (`domain_changed`): an
+/// edit to the running process's record would otherwise never be installed at
+/// all, because the scheduler skips equal domains.
+func install_row(p: Int, t: Int, base: UInt, top: UInt, perms: UInt8,
+                 device: Bool) unsafe -> SyscallResult {
+    if (PROCESSES[t].grant_count as UInt) >= hal.GRANT_ROW_BUDGET {
+        return op_status(SosStatus.NoResource)
+    }
+    let slot = alloc_mapping()
+    if slot == NO_MAPPING {
+        return op_status(SosStatus.NoResource)
+    }
+    let handle = mint_handle(p, ObjType.Mapping, mapping_rights(), slot)
+    if handle == NO_HANDLE {
+        return op_status(SosStatus.NoResource)
+    }
+    // Nothing is written until every refusal is behind us — `event_create`'s
+    // all-or-nothing shape, and here it matters more: a half-installed row is a
+    // protection domain that disagrees with its own record.
+    let row = PROCESSES[t].grant_count
+    record_grant(t, base, top, perms, device)
+    MAPPINGS[slot] = MappingSlot(state: SlotState.Live, process: p, target: t,
+                                 row: row)
+    domain_changed(t)
+    op_value(handle)
+}
+
+/// The Memory object's ops (spec §2.5; sawos design 6 D-2/D-3).
+func memory_op(raw_op: UInt, obj: &MemoryObject, arg0: UInt,
+               arg1: UInt) unsafe -> SyscallResult {
+    let p = calling_process()
+    guard let op = MemoryOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
+    return memory_op_decoded(op, &obj, arg0, arg1, p)
+}
+
+func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
+                       p: Int) unsafe -> SyscallResult {
+    match op {
+        // **ONE CUT FROM THE FRONT, AND THE PARENT BECOMES THE REMAINDER**
+        // (sawos design 6 D-2). Allocation is repeated front-splits, so the
+        // parent IS the pool cursor and nothing else has to be remembered.
+        //
+        // THREE CALLER-CHECKABLE REFUSALS, all `BadArg` faults. A `len` of
+        // zero: a region naming no bytes is not a region. A `len` past what
+        // the parent holds: the caller knows what it has split off so far, and
+        // a split that silently clamped would hand back a region smaller than
+        // the number in the call. And a MISALIGNED `len`: a grant covers whole
+        // units of the target's protection granularity, so a cut mid-unit
+        // would leave a remainder that could never be mapped without granting
+        // the piece before it too.
+        //
+        // Slab exhaustion is `NoResource`, a STATUS, because a caller cannot
+        // know how many slots are left. Free-on-last-reference is unit 5's, so
+        // the slot comes back at teardown and not before.
+        case Split -> {
+            if not obj.allows(MemoryRight.Split) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            let len = arg0
+            if len == 0 || len > MEMORIES[obj.slot].len {
+                fault_process(p, FaultReason.BadArg)
+            }
+            if (len % hal.PROT_GRAIN) != 0 {
+                fault_process(p, FaultReason.BadArg)
+            }
+            let slot = alloc_memory()
+            if slot == NO_MEMORY {
+                return op_status(SosStatus.NoResource)
+            }
+            let handle = mint_handle(p, ObjType.Memory, memory_rights(), slot)
+            if handle == NO_HANDLE {
+                return op_status(SosStatus.NoResource)
+            }
+            // The cut, once both allocations are behind us. The child takes the
+            // front and the parent advances past it; a parent split down to
+            // zero is representable and simply refuses every later split, which
+            // is the honest end of a cursor.
+            let base = MEMORIES[obj.slot].base
+            MEMORIES[slot] = MemorySlot(state: SlotState.Live, process: p,
+                                        base: base, len: len)
+            MEMORIES[obj.slot].base = base + len
+            MEMORIES[obj.slot].len = MEMORIES[obj.slot].len - len
+            op_value(handle)
+        },
+        // **INSTALL THIS REGION IN A DOMAIN, AND ANSWER WITH THE MAPPING.**
+        // `arg0` is the target Process handle and `arg1` the `MapAccess` bits;
+        // the two rights it spends are checked on two objects, here and in
+        // `map_target`.
+        //
+        // THE RANGE IS THE REGION'S OWN — a caller supplies no addresses at all,
+        // which is the same rule `process_create` follows and the reason a
+        // Memory still needs no bounds reader. The top is rounded UP to the
+        // protection granularity exactly as the loader rounds a segment's, so a
+        // region shorter than one grant unit still gets a whole one.
+        case Map -> {
+            if not obj.allows(MemoryRight.Map) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            let t = map_target(p, arg0)
+            let access = map_access(p, arg1)
+            let base = MEMORIES[obj.slot].base
+            let len = MEMORIES[obj.slot].len
+            if len == 0 || region_wraps(base, len) {
+                fault_process(p, FaultReason.BadArg)
+            }
+            if (base % hal.PROT_GRAIN) != 0 {
+                fault_process(p, FaultReason.BadArg)
+            }
+            let top = align_up(base + len, hal.PROT_GRAIN)
+            // **THE HAL'S OWN WINDOW PREDICATE, AND THE ALTITUDE IS THE POINT**
+            // (sawos design 6 D-4). One profile's grant window cannot express
+            // every address, and its loader path answers that by STOPPING THE
+            // MACHINE — right for a memory map the build got wrong, wrong for a
+            // range a PROCESS chose. So a map asks first and faults with
+            // `BadArg`, and the HAL's kernel-bug stop stays for the path it was
+            // written for.
+            if not hal.map_target_ok(base, top) {
+                fault_process(p, FaultReason.BadArg)
+            }
+            install_row(p, t, base, top, grant_perms(access), false)
+        },
+    }
+}
+
+/// The IoMemory object's ops (spec §2.5; sawos design 6 D-1/D-2/D-3).
+func iomemory_op(raw_op: UInt, obj: &IoMemoryObject, arg0: UInt,
+                 arg1: UInt) unsafe -> SyscallResult {
+    let p = calling_process()
+    guard let op = IoMemoryOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
+    return iomemory_op_decoded(op, &obj, arg0, arg1, p)
+}
+
+func iomemory_op_decoded(op: IoMemoryOp, obj: &IoMemoryObject, arg0: UInt,
+                         arg1: UInt, p: Int) unsafe -> SyscallResult {
+    match op {
+        // **CARVE LEAVES THE PARENT ALONE** (sawos design 6 D-2), which is the
+        // whole difference from `Split` and is §2.5's own rule: MMIO is pinned,
+        // a fixed region may be handed out many times, and several drivers may
+        // legitimately hold windows onto one peripheral. So there is no cursor
+        // here and no arithmetic on the parent at all.
+        //
+        // `arg0` is an OFFSET into the parent and `arg1` a length, which is
+        // what makes the op writable without a bounds reader: a caller names a
+        // sub-window relative to what it holds and never learns an address.
+        //
+        // THE HARDWARE'S GRANULARITY IS CHECKED HERE, where the caller chose
+        // the numbers: a window that could never be installed anywhere is a
+        // capability that lies about itself, and a refusal deferred to the map
+        // would arrive one op later than the mistake. `Map` checks it AGAIN,
+        // for the one window a carve never saw — a boot ROOT, whose bounds came
+        // from the build's region table rather than from a caller. The rule is
+        // per-profile (`hal.device_window_ok`) because the two profiles express
+        // a device window differently — one as a single naturally-aligned
+        // power-of-two protection entry, the other by page.
+        case Carve -> {
+            if not obj.allows(IoMemoryRight.Carve) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            let offset = arg0
+            let len = arg1
+            let parent_len = IOMEMORIES[obj.slot].len
+            if len == 0 || offset > parent_len || len > parent_len - offset {
+                fault_process(p, FaultReason.BadArg)
+            }
+            let base = IOMEMORIES[obj.slot].base + offset
+            if not hal.device_window_ok(base, len) {
+                fault_process(p, FaultReason.BadArg)
+            }
+            let slot = alloc_iomemory()
+            if slot == NO_IOMEMORY {
+                return op_status(SosStatus.NoResource)
+            }
+            let handle = mint_handle(p, ObjType.IoMemory, iomemory_rights(), slot)
+            if handle == NO_HANDLE {
+                return op_status(SosStatus.NoResource)
+            }
+            IOMEMORIES[slot] = IoMemorySlot(state: SlotState.Live, process: p,
+                                            base: base, len: len)
+            op_value(handle)
+        },
+        // **INSTALL A DEVICE-ATTRIBUTE ROW, ALWAYS** — the guarantee
+        // `ObjType.IoMemory` exists for. There is no access argument: RW is
+        // fixed, because execute-on-device is refused vocabulary (registers are
+        // not instructions, and one profile's mapping cannot even express it)
+        // and a write-only register block is not a grant either profile has.
+        // `arg0` is the target Process handle, as it is for a Memory.
+        case Map -> {
+            if not obj.allows(IoMemoryRight.Map) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            let t = map_target(p, arg0)
+            let base = IOMEMORIES[obj.slot].base
+            let len = IOMEMORIES[obj.slot].len
+            if not hal.device_window_ok(base, len) {
+                fault_process(p, FaultReason.BadArg)
+            }
+            // The perms word is what a device grant's row carries; the HAL's
+            // own device path is what actually decides the attribute, so this
+            // says READ|WRITE and nothing about caching — which is the split
+            // the seam has had since M2.
+            install_row(p, t, base, base + len,
+                        (SegFlag.Read as UInt8) | (SegFlag.Write as UInt8), true)
+        },
+    }
+}
+
+/// The Mapping object's ops (spec §2.5; sawos design 6 D-3).
+func mapping_op(raw_op: UInt, obj: &MappingObject) unsafe -> SyscallResult {
+    let p = calling_process()
+    guard let op = MappingOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
+    return mapping_op_decoded(op, &obj, p)
+}
+
+func mapping_op_decoded(op: MappingOp, obj: &MappingObject,
+                        p: Int) unsafe -> SyscallResult {
+    match op {
+        // **ONLY A MAPPING UNMAPS** (§2.5), and this is that op.
+        //
+        // A MAPPING WITH NO ROW IS `BadState`, and two different things reach
+        // that arm: a second unmap, and a mapping whose TARGET PROCESS has died
+        // (its whole domain went with it, so there is nothing left to remove).
+        // Both are "this object is not in a state to do that", and both are
+        // caller-checkable — the caller either unmapped it or created the
+        // child.
+        //
+        // THE ORDER IS THE CONTRACT: remove the row, COMPACT the record, fix up
+        // every Mapping that named a later row of the same domain, and only
+        // then reload. Compaction is forced by `load_domain`'s replay-by-index
+        // and the fixup is the only index sensitivity in the system (the census,
+        // design 6 D-3).
+        //
+        // **THE SLOT IS NOT FREED** — the deviation from D-3's sketch, and the
+        // reason is soundness. A slab slot freed while a handle still names it
+        // is reachable through that handle the moment the next `map` reuses it,
+        // and design 3's generations cannot cover it: a generation lives in the
+        // handle ENTRY, and the entry is not what went away. So an unmapped
+        // Mapping keeps its slot, answers `BadState` forever, and comes back at
+        // its owner's teardown — which is not a concession, it is the rule
+        // every other kind already follows (design 3 D-2: an object whose last
+        // handle is gone is unreachable-but-live until its process tears down;
+        // the one slab that reclaims earlier is a `Gone` PROCESS's, and it
+        // earns that with a reader-count scan nothing here has an equivalent
+        // of). Refcounted early reclamation is unit 5's, for this slab and for
+        // the others together.
+        case Unmap -> {
+            if not obj.allows(MappingRight.Unmap) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            match MAPPINGS[obj.slot].state {
+                case Live -> {},
+                case Free -> fault_process(p, FaultReason.BadState),
+            }
+            let row = MAPPINGS[obj.slot].row
+            if row == NO_ROW {
+                fault_process(p, FaultReason.BadState)
+            }
+            let t = MAPPINGS[obj.slot].target
+            remove_grant(t, row)
+            MAPPINGS[obj.slot].row = NO_ROW
+            compact_mapping_rows(t, row)
+            domain_changed(t)
+            op_ok()
+        },
+    }
+}
+
 /// Handle-table lookup -> object type -> op table -> rights check -> op.
 ///
 /// This is where a raw word becomes a TYPED handle (§3), and the order is the
@@ -1748,13 +2210,25 @@ func dispatch(handle: UInt, op: UInt,
                                   rights: entry.rights, slot: entry.target)
             timer_op(op, &obj, arg0, arg1)
         },
-        // A MEMORY HAS NO OP TABLE IN v1 (spec §2.5's first slice; sawos design
-        // 2 D-2), so every op number aimed at one is an op the object does not
-        // have — which is a `BadOp` fault by the same rule that covers an
-        // unknown number on any other kind. The whole of a region's surface
-        // today is being NAMED as an argument to `process_create`; unit 4's
-        // `map`/`alloc` are what put a table here.
-        case Memory -> fault_process(p, FaultReason.BadOp),
+        // **UNIT 4 PUT THE TABLE HERE**, which is what unit 2's `BadOp` arm
+        // said would happen (spec §2.5; sawos design 6 D-2/D-3). A Memory has
+        // two ops now — derive, and install — and an unknown number aimed at
+        // one is `BadOp` inside `memory_op` rather than at this line.
+        case Memory -> {
+            let obj = MemoryObject(handle: MemoryHandle(handle),
+                                   rights: entry.rights, slot: entry.target)
+            memory_op(op, &obj, arg0, arg1)
+        },
+        case IoMemory -> {
+            let obj = IoMemoryObject(handle: IoMemoryHandle(handle),
+                                     rights: entry.rights, slot: entry.target)
+            iomemory_op(op, &obj, arg0, arg1)
+        },
+        case Mapping -> {
+            let obj = MappingObject(handle: MappingHandle(handle),
+                                    rights: entry.rights, slot: entry.target)
+            mapping_op(op, &obj)
+        },
     }
 }
 

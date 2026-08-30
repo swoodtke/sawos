@@ -223,6 +223,26 @@ CHILD_NO_SHUTDOWN_PKG = os.path.join(TESTS_DIR, "child-no-shutdown")
 CHILD_DRAIN_PKG = os.path.join(TESTS_DIR, "child-drain")
 CHILD_OVERSTEPS_PKG = os.path.join(TESTS_DIR, "child-oversteps")
 
+# sawos design 6 (M3 unit 4): Memory, IoMemory and Mapping. FIVE root servers
+# and one more CHILD, and the split is the house rule plus the same fact design
+# 3's split turned on: THREE of the five end in a FAULT, and a fault ends the
+# process, so a second probe after one would never run. Each of those three does
+# its positive work FIRST and meets its refusal last, which is `irq_early_ack`'s
+# shape — the transcript reads as everything that worked, then the one thing
+# that must not.
+#
+# THREE OF THEM NAME AN ADDRESS, through a one-line C constant per architecture
+# (`tests/poolbase_<arch>.c`). That is root's config, not kernel state leaking:
+# a region has no bounds reader and unit 4 deliberately did not add one, so
+# WHERE a pool is is a fact the build publishes and the program expects — the
+# same arrangement the uart-echo driver has always had with `UART_BASE`.
+MEMORY_SPLIT_PKG = os.path.join(TESTS_DIR, "memory-split")
+MAP_BASICS_PKG = os.path.join(TESTS_DIR, "map-basics")
+MAP_UNMAP_PKG = os.path.join(TESTS_DIR, "map-unmap")
+MAP_INTO_CHILD_PKG = os.path.join(TESTS_DIR, "map-into-child")
+IOMEMORY_CARVE_PKG = os.path.join(TESTS_DIR, "iomemory-carve")
+CHILD_TOUCH_PKG = os.path.join(TESTS_DIR, "child-touch")
+
 CLOCK_BASICS_PKG = os.path.join(TESTS_DIR, "clock-basics")
 TIMER_ONESHOT_PKG = os.path.join(TESTS_DIR, "timer-oneshot")
 TIMER_INTERVAL_PKG = os.path.join(TESTS_DIR, "timer-interval")
@@ -298,6 +318,25 @@ ARCHES = [
         # is: this one has no software trigger, so the HAL makes the console
         # interrupt, on the line this board wires it to.
         "selftest_line": 10,
+        # THE RAM POOL a `"pool": True` case publishes (sawos design 6 D-5) —
+        # a free window ABOVE every child region, so a case may have children
+        # and a pool at once and neither moves. It is a runner constant
+        # mirroring a HAL fact: this is ordinary RAM, past root's region
+        # (0x8024_0000) and past the one child region above it.
+        #
+        # THE TEST PACKAGES KNOW THIS NUMBER, through a one-line C constant per
+        # architecture (`tests/poolbase_<arch>.c`). That is not a leak of kernel
+        # state: root's config is what says which ordinal means what, and WHERE
+        # a pool is is the same class of config — the uart-echo driver has
+        # always known `UART_BASE` for exactly this reason. Saw cannot name an
+        # address any other way (DF-172a), which is why it is C.
+        "pool_base": 0x80280000,
+        "pool_len": 0x40000,
+        # THE DEVICE WINDOW a `"device": True` case publishes — the console
+        # UART's page, mirroring `hal.DEVICE_GRANT_BASE` / `DEVICE_GRANT_LEN`.
+        # This is what the uart-echo migration obtains instead of declaring.
+        "device_base": 0x10000000,
+        "device_len": 0x1000,
     },
     {
         "name": "arm64",
@@ -327,6 +366,16 @@ ARCHES = [
         # This controller HAS a software trigger, so the selftest line is a
         # software-generated one and no device is involved.
         "selftest_line": 5,
+        # The RAM pool, one region above the child region as on Profile A — and
+        # here the choice is CONSTRAINED as well as tidy, exactly as
+        # `child_region_base` is: EL0 can only be granted pages inside the HAL's
+        # 4 MiB grant window, so the pool has to end below 0x4040_0000. It does
+        # (0x4028_0000 + 256 KiB = 0x402C_0000).
+        "pool_base": 0x40280000,
+        "pool_len": 0x40000,
+        # The console UART's page, mirroring `hal.DEVICE_GRANT_BASE` / `_LEN`.
+        "device_base": 0x09000000,
+        "device_len": 0x1000,
     },
 ]
 
@@ -339,15 +388,28 @@ ARCHES = [
 # per child linker script express the whole layout.
 CHILD_REGION_LEN = 0x40000
 
-# The BOOT REGION TABLE's wire format (sawos design 2 D-2), frozen: an 8-byte
-# header — magic, version u16, count u8, reserved u8 — then `count` rows of
-# {base: u64, len: u64}, all little-endian. The header's size is what puts every
-# row on an 8-byte boundary, which is what lets the kernel overlay a struct on
-# the section instead of assembling bytes. Kept in step with
-# `kernel/core/process.saw`'s `RegionTableHeader` / `RegionRow` and the two
-# `static_assert`s beside them.
+# The BOOT REGION TABLE's wire format (sawos design 2 D-2, VERSION 2 by design
+# 6 D-5), frozen: an 8-byte header — magic, version u16, count u8, reserved u8 —
+# then `count` rows of {base: u64, len: u64, kind: u8, reserved x 7}, all
+# little-endian. The header's size is what puts the first row on an 8-byte
+# boundary and the row's own padding is what keeps the next one there, which is
+# what lets the kernel overlay a struct on the section instead of assembling
+# bytes. Kept in step with `kernel/core/process.saw`'s `RegionTableHeader` /
+# `RegionRow` / `RegionKind` and the two `static_assert`s beside them.
+#
+# THE KERNEL ACCEPTS EXACTLY VERSION 2 — no v1 arm — so this constant and that
+# file move in one commit. What survives the bump untouched is every image with
+# NO table at all: the kernel's `len == 0` short-circuit runs ahead of the
+# header read, which is why 122 of the suite's rows never see this format.
 REGION_TABLE_MAGIC = 0x4E475253          # 'S','R','G','N' read little-endian
-REGION_TABLE_VERSION = 1
+REGION_TABLE_VERSION = 2
+
+# The kind column's values, mirroring `kernel/core/process.saw`'s `RegionKind`.
+# A Ram row mints a Memory and a Device row mints an IoMemory, which is design
+# 6 D-1's kind-not-a-flag ruling arriving at the one place a window enters the
+# system.
+REGION_KIND_RAM = 0
+REGION_KIND_DEVICE = 1
 
 
 def arch_dirs(arch):
@@ -386,6 +448,12 @@ def expectations(arch):
         "ten": f"0x{10:0{width}x}",
         "prio": f"0x{0x01010100:0{width}x}",
         "irq_line": f"0x{arch['selftest_line']:0{width}x}",
+        # M3 unit 4: the byte `child-touch` writes into the page its launcher
+        # mapped and reads back, which is ALSO its exit code — so
+        # `map_into_child` can assert the round trip through the kernel's exit
+        # line as well as through the child's own console line and root's §8
+        # status word. A number that appears nowhere else in any transcript.
+        "touch_mark": f"0x{0x3C:0{width}x}",
     }
 
 
@@ -1009,18 +1077,41 @@ TEST_CASES = [
     # get two packages, named for the chip; the line number in the last line is
     # the board's and is asserted because it came back through the WAIT RECORD's
     # payload rather than from the program's own constant.
+    #
+    # **MIGRATED IN M3 UNIT 4 (sawos design 6 D-6), AND THESE ARE THE ONLY TWO
+    # EXISTING CASES THE UNIT AUTHORIZED TO MOVE.** The window is no longer
+    # DECLARED in the manifest and installed before user mode; it is a DEVICE row
+    # of the build's region table, minted as an `IoMemory`, drained from the boot
+    # set and mapped into the driver by the driver. Three lines change per case
+    # and each is accounted for here:
+    #
+    #   segments={three} -> {two}   the third segment WAS the declaration
+    #   + boot regions={one}        the kernel now mints one object at boot
+    #   + "window mapped"           the driver says it obtained what it used to
+    #                               be handed
+    #
+    # **THE ECHO BEHAVIOUR IS UNCHANGED — same bytes, same line number** — which
+    # is the migration proving "the same window, obtained rather than declared"
+    # (spec §2.5's migration case, come true). Everything the M2 transcript
+    # ruled out, this one still rules out.
     {
         "name": "uart_echo_ns16550",
         "arches": ["riscv32"],
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": UART_ECHO_NS16550_PKG,
+        "device": True,
         "stdin": ECHO_INPUT,
         "expect_out": ["{banner}",
-                       # THREE segments: code, data, and the DEVICE WINDOW the
-                       # manifest declared — which is the grant being carried in
-                       # the image rather than in kernel logic.
-                       "root image ok segments={three}",
+                       # TWO segments: code and data. The third was the device
+                       # window the manifest declared, and it is gone.
+                       "root image ok segments={two}",
+                       # ONE boot region: the DEVICE row. The kernel minted an
+                       # IoMemory for it and queued the record the driver drains.
+                       "SOS: boot regions={one}",
                        "SOS: console handover",
+                       # The obtained path, said out loud: the driver drained an
+                       # IoMemory and installed it in itself.
+                       "SOS echo: window mapped",
                        "SOS echo: driver up",
                        ECHO_INPUT,
                        "SOS echo: done 4 bytes on line 10"],
@@ -1031,10 +1122,13 @@ TEST_CASES = [
         "arches": ["arm64"],
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": UART_ECHO_PL011_PKG,
+        "device": True,
         "stdin": ECHO_INPUT,
         "expect_out": ["{banner}",
-                       "root image ok segments={three}",
+                       "root image ok segments={two}",
+                       "SOS: boot regions={one}",
                        "SOS: console handover",
+                       "SOS echo: window mapped",
                        "SOS echo: driver up",
                        ECHO_INPUT,
                        "SOS echo: done 4 bytes on line 33"],
@@ -1192,12 +1286,17 @@ TEST_CASES = [
                        # the feature under test. A fire delivered more than a
                        # period late COALESCES, by design — so under an emulator
                        # whose timing is the host's business, a correct kernel
-                       # legitimately reports 2 or 3 here. Pinning the number
-                       # would make coalescing itself the flake. (Observed: both
-                       # machines reported `fires=2` on the first wake.) What is
-                       # asserted is that each wake HAPPENED, with no ack and no
-                       # re-arm between them, which `ackfree` carries — and the
-                       # two counts that ARE deterministic are pinned below.
+                       # legitimately reports 1, 2 or 3 here. Pinning the number
+                       # would make coalescing itself the flake — and it WOULD
+                       # have flaked: both machines reported `fires=2` on the
+                       # first wake through M3 unit 3, and riscv32 reported
+                       # `fires=1` at unit 4, where a bigger kernel changed how
+                       # much of the first period was spent before the wait. The
+                       # count moved and nothing was wrong, which is exactly the
+                       # case this comment exists for. What is asserted is that
+                       # each wake HAPPENED, with no ack and no re-arm between
+                       # them, which `ackfree` carries — and the two counts that
+                       # ARE deterministic are pinned below.
                        "SOS interval: tick one fires=",
                        "SOS interval: tick two fires=",
                        "ackfree=1",
@@ -1903,6 +2002,158 @@ TEST_CASES = [
                        "SOS noshutdown: done"],
         "expect_clean_exit": True,
     },
+    # =========================================================================
+    # M3 unit 4 — Memory, IoMemory, Mapping (sawos design 6)
+    # =========================================================================
+    #
+    # **A MAPPING IS AN INSTALLED GRANT ROW**, and five cases is what proving
+    # that takes: derivation (two verbs, because the kinds differ), installation,
+    # revocation, and installation ACROSS a process boundary.
+    #
+    # THE INVERSION WORTH NAMING. Every protection case above this line asserts
+    # that an address a process was not granted FAULTS — `root_server_oversteps`,
+    # `process_isolation`, `child_oversteps`. These assert the other direction:
+    # an address that would have faulted is memory, because somebody installed a
+    # row. The two together are what makes a protection domain DATA rather than a
+    # property of an image.
+    #
+    # THREE OF THE FIVE END IN A FAULT and do their positive work first, which is
+    # `irq_early_ack`'s shape and is forced by the same fact: a `BadArg` fault
+    # ends the process, so a second probe would never run.
+    {
+        # DERIVATION, and the arithmetic made observable. A region has no bounds
+        # reader, so "the parent advanced" is proven by USING both pieces: 0xaa
+        # into the first, 0xbb into the second, and the first still 0xaa.
+        #
+        # `pool exhausted after N cuts` is the slab, and it is a STATUS rather
+        # than a fault because a caller cannot know how many slots are left.
+        # Free-on-last-reference is unit 5's, so the pieces this loop drops do
+        # NOT come back — which is the honest state of the system and is what
+        # the number says. It pins `MAX_MEMORIES` in the transcript, which is
+        # the point: raising the slab should move a line somebody reads.
+        #
+        # The last line is a DEATH: an oversize cut is caller-checkable, so it
+        # is a fault, so meeting it is the only way to assert it.
+        "name": "memory_split",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MEMORY_SPLIT_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS split: a=170 b=187 a-again=170",
+                       "SOS split: pool exhausted after 13 cuts",
+                       "SOS split: asking for more than is left",
+                       "SOS: process fault: argument outside its domain",
+                       "SOS: process teardown"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # INSTALLATION. Root maps a page into ITSELF and writes it, which is the
+        # inverse of every protection proof above — and it is also half the
+        # live-domain rule: the scheduler skips equal domains, so a map into the
+        # RUNNING process that did not reload would never be installed at all
+        # and the write below would fault instead of printing.
+        #
+        # The double map is agenda item 7's lean shown: two rows over one region
+        # with different access, allowed, no aliasing bookkeeping owed on a
+        # machine that does not translate. The case asserts that both INSTALL
+        # and that a read still answers — deliberately not a write afterwards,
+        # since which row answers is the hardware's own matching rule.
+        "name": "map_basics",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAP_BASICS_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS mapbasics: wrote 0x5a read 90",
+                       "SOS mapbasics: double-mapped read-only",
+                       "SOS mapbasics: still 90",
+                       "SOS mapbasics: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # REVOCATION, AND THE LIVE-DOMAIN RULE END TO END. Root maps, writes,
+        # reads, UNMAPS, and touches again — and the touch has to die.
+        #
+        # **THE ASSERTION IS THE PRESENCE OF THE FAULT**, which is the failure
+        # mode worth engineering for: a kernel that edited the grant record
+        # without reloading would let the touch LAND, the program would print
+        # `UNREACHABLE` and exit non-zero on its own account, and the missing
+        # line would be the tell. A revocation that does not revoke until the
+        # next reschedule is not a revocation.
+        #
+        # The fault's tag and cause differ per machine (a load access fault
+        # here, a data abort there), so what is asserted is that ONE was taken.
+        "name": "map_unmap",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAP_UNMAP_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS mapunmap: wrote 0x77 read 119",
+                       "SOS mapunmap: unmapped",
+                       "SOS: fault "],
+        "expect_clean_exit": False,
+    },
+    {
+        # INSTALLATION ACROSS A PROCESS BOUNDARY — the launcher shape, and the
+        # one unit 6 is built on. Root maps a page into a child it has CREATED
+        # but not started, and the child touches an address its image never
+        # declared.
+        #
+        # **THE MAP IS BEFORE THE START AND IS NOT A BOOT RECORD**, which is why
+        # the give-freeze does not reach it: §12's set freezes at `start`
+        # because a child's HANDLES must be complete at its first instruction,
+        # and a protection row is not a handle. The row reaches the child
+        # through the ordinary switch-in replay (design 2 D-5) carrying a row
+        # that did not come from an image.
+        #
+        # `status=65596` is `Exited`(1)<<16 | 60 — the byte the child read back,
+        # arriving as a VALUE through the Process handle root kept. The same
+        # fact as the child's console line, from the other side.
+        "name": "map_into_child",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAP_INTO_CHILD_PKG,
+        "children": [CHILD_TOUCH_PKG],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS mapchild: created",
+                       "SOS mapchild: mapped a page into it",
+                       "SOS mapchild: started",
+                       "SOS childtouch: wrote 60 read 60",
+                       "SOS: process exit: code={touch_mark} process={one}",
+                       "SOS mapchild: root observed child status=65596",
+                       "SOS mapchild: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # DEVICE AUTHORITY. A window is carved NON-EXCLUSIVELY — the same range
+        # twice, which a split could not do — mapped, and then a window the
+        # machine's protection hardware cannot express is a FAULT.
+        #
+        # THE REFUSAL IS ONE LINE FOR TWO DIFFERENT RULES: one profile needs a
+        # naturally-aligned power of two (one protection entry), the other a
+        # whole number of pages, and `0xC00` is neither. That is what a per-HAL
+        # predicate buys — the case is arch-free and the rule is not.
+        #
+        # X-on-device needs no line: `map(iomemory:)` takes no access argument,
+        # so an executable register block is not a thing a caller can ask for.
+        "name": "iomemory_carve",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": IOMEMORY_CARVE_PKG,
+        "device": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS carve: carved twice",
+                       "SOS carve: mapped",
+                       "SOS carve: asking for a window this board cannot grant",
+                       "SOS: process fault: argument outside its domain",
+                       "SOS: process teardown"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
 ]
 
 INSTALL_HINTS = {
@@ -2166,14 +2417,76 @@ def _emit_word64(lines, arch, expr):
         lines.append(f"    .8byte {expr}")
 
 
-def _stitch_children(case, arch, clang):
+def _emit_row(lines, arch, base_expr, len_expr, kind):
+    """Emit one VERSION 2 region row: {base u64, len u64, kind u8, 7 reserved}.
+
+    24 bytes, which is what keeps the NEXT row 8-aligned without a `.balign`
+    the kernel's overlay would have to know about.
+    """
+    _emit_word64(lines, arch, base_expr)
+    _emit_word64(lines, arch, len_expr)
+    lines.append(f"    .byte  {kind}")
+    lines.append("    .byte  0, 0, 0, 0, 0, 0, 0")
+
+
+def _region_rows(case, arch):
+    """Which rows this case's table carries, in ORDER — the whole contract.
+
+    ROW ORDER IS THE CONTRACT, and it is stated here because it is stated
+    nowhere else. Root's config reads it as tags:
+
+        every blob row       one per child, in the order the case lists them
+        every destination    one per child, same order
+        the RAM POOL         if the case asks for one
+        the DEVICE window    if the case asks for one
+
+    Blobs and destinations come first so that every M3-unit-2 case's tags are
+    exactly what they were (tag 0 is child 0's image, tag N is child 0's RAM),
+    and the two unit-4 rows APPEND rather than insert. A case that wants only a
+    pool gets tag 0 for it; that is not a special case, it is the same rule with
+    no children in front.
+
+    Each row is (comment, base-expression, length-expression, kind). A base may
+    be a linker EXPRESSION rather than a number — that is what makes a blob row
+    work at all, since the address is whatever `ld.lld` decides.
+    """
+    children = case.get("children", ())
+    rows = []
+    for i, _pkg in enumerate(children):
+        rows.append((f"child {i}'s image blob (linker-resolved)",
+                     f"_sos_child{i}_start",
+                     f"_sos_child{i}_end - _sos_child{i}_start",
+                     REGION_KIND_RAM))
+    for i, _pkg in enumerate(children):
+        base = arch["child_region_base"] + i * CHILD_REGION_LEN
+        rows.append((f"child {i}'s destination RAM", f"{base:#x}",
+                     f"{CHILD_REGION_LEN:#x}", REGION_KIND_RAM))
+    if case.get("pool"):
+        rows.append(("the RAM POOL — free memory above every child region",
+                     f"{arch['pool_base']:#x}", f"{arch['pool_len']:#x}",
+                     REGION_KIND_RAM))
+    if case.get("device"):
+        rows.append(("the DEVICE window — the console UART's register page",
+                     f"{arch['device_base']:#x}", f"{arch['device_len']:#x}",
+                     REGION_KIND_DEVICE))
+    return rows
+
+
+def _stitch_regions(case, arch, clang):
     """Append this case's child images and emit the BOOT REGION TABLE.
 
     THE RULED HYBRID (sawlang#232 agenda item 2; sawos design 2 D-2): the
     stitcher appends each child sosimg AS IT IS — no flattening, no absolute
     placement, the blob lands wherever the linker puts it — and records offsets
-    and lengths in a table. The kernel mints one Memory per row and interprets
+    and lengths in a table. The kernel mints one object per row and interprets
     nothing; ROOT's config is what says which ordinal is which.
+
+    **IT EMITS THREE KINDS OF ROW SINCE M3 UNIT 4** (sawos design 6 D-5), which
+    is why it is no longer named for children: a case asks for `children`, a
+    `pool`, a `device` window, or any combination, and `_region_rows` above is
+    the order they land in. The KIND COLUMN is what the kernel reads — a Ram row
+    mints a Memory, a Device row mints an IoMemory — and it is the only thing in
+    a row the kernel interprets at all.
 
     THE STUB IS GENERATED RATHER THAN COMMITTED, and that is what buys the
     linker-resolved bases: a blob row names the child section's own symbols, so
@@ -2182,51 +2495,46 @@ def _stitch_children(case, arch, clang):
     number of children is a property of the case), so generating it costs a file
     nobody has to keep in step and removes the one thing that could have gone
     wrong.
-
-    ROW ORDER IS THE CONTRACT: every blob row first, in the order the case lists
-    its children, then every destination row in the same order. That is what
-    root's config reads — tag 0 is child 0's image, tag N is child 0's RAM — and
-    it is stated here because it is stated nowhere else.
     """
     dirs = arch_dirs(arch)
     os.makedirs(dirs["build"], exist_ok=True)
     name = case["name"]
-    children = case["children"]
+    children = case.get("children", ())
 
     lines = [
-        "/* GENERATED by tools/sos_runner.py — sawos design 2 D-2. */",
+        "/* GENERATED by tools/sos_runner.py — sawos design 2 D-2, 6 D-5. */",
         "",
-        "    .section .childimg, \"a\", @progbits",
-        "    .balign 16",
     ]
-    for i, _pkg in enumerate(children):
-        staged = os.path.join(dirs["build"], f"{name}.child{i}.sosimg")
-        shutil.copyfile(case["_child_images"][arch["name"]][i], staged)
+    # A case with no children links no `.childimg` section at all, which is what
+    # keeps a pool-only or device-only case from carrying an empty one.
+    if children:
         lines += [
-            f"_sos_child{i}_start:",
-            f"    .incbin \"{os.path.basename(staged)}\"",
-            f"_sos_child{i}_end:",
+            "    .section .childimg, \"a\", @progbits",
             "    .balign 16",
         ]
+        for i, _pkg in enumerate(children):
+            staged = os.path.join(dirs["build"], f"{name}.child{i}.sosimg")
+            shutil.copyfile(case["_child_images"][arch["name"]][i], staged)
+            lines += [
+                f"_sos_child{i}_start:",
+                f"    .incbin \"{os.path.basename(staged)}\"",
+                f"_sos_child{i}_end:",
+                "    .balign 16",
+            ]
 
+    rows = _region_rows(case, arch)
     lines += [
         "",
         "    .section .regions, \"a\", @progbits",
         "    .balign 8",
         f"    .4byte {REGION_TABLE_MAGIC:#010x}",
         f"    .2byte {REGION_TABLE_VERSION}",
-        f"    .byte  {2 * len(children)}",
+        f"    .byte  {len(rows)}",
         "    .byte  0",
     ]
-    for i, _pkg in enumerate(children):
-        lines.append(f"    /* row {i}: child {i}'s image blob (linker-resolved) */")
-        _emit_word64(lines, arch, f"_sos_child{i}_start")
-        _emit_word64(lines, arch, f"_sos_child{i}_end - _sos_child{i}_start")
-    for i, _pkg in enumerate(children):
-        base = arch["child_region_base"] + i * CHILD_REGION_LEN
-        lines.append(f"    /* row {len(children) + i}: child {i}'s destination RAM */")
-        _emit_word64(lines, arch, f"{base:#x}")
-        _emit_word64(lines, arch, f"{CHILD_REGION_LEN:#x}")
+    for i, (what, base_expr, len_expr, kind) in enumerate(rows):
+        lines.append(f"    /* row {i}: {what} */")
+        _emit_row(lines, arch, base_expr, len_expr, kind)
     lines.append("")
 
     stub_s = os.path.join(dirs["build"], f"{name}.regions.S")
@@ -2295,12 +2603,14 @@ def _build_elf(case, arch, shared_objs, lld, clang):
         objs.append(payload_o)
     if case.get("root_pkg"):
         objs.append(_stitch_root_image(case["_root_image"][arch["name"]], arch, clang))
-    # sawos design 2: the child images and the region table that names them.
-    # A case with no children links neither section, so `_region_table_start`
-    # and `_region_table_end` come out equal and the kernel sees ZERO REGIONS —
-    # which is every case that existed before this unit.
-    if case.get("children"):
-        objs.append(_stitch_children(case, arch, clang))
+    # sawos design 2 + 6: the child images and the BOOT REGION TABLE that names
+    # them, the RAM pool and the device window. A case that asks for none of the
+    # three links no `.regions` section, so `_region_table_start` and
+    # `_region_table_end` come out equal and the kernel sees ZERO REGIONS —
+    # which is every case that predates unit 2 and is what keeps their
+    # transcripts untouched by a table format that has now versioned twice.
+    if case.get("children") or case.get("pool") or case.get("device"):
+        objs.append(_stitch_regions(case, arch, clang))
 
     _run([lld, "-T", os.path.join(dirs["hal_kernel"], "virt.ld"), "--gc-sections",
           "-o", elf, *objs])

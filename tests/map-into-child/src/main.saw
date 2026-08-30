@@ -1,0 +1,252 @@
+// SOS M3 unit 4: MAPPING INTO A CHILD (sawos design 6 D-3; spec §2.5, §12).
+//
+// **THE LAUNCHER SHAPE, AND THE ONE UNIT 6 IS BUILT ON.** Root creates a child,
+// splits a page off its own pool, INSTALLS that page in the child's address
+// space, furnishes the child with a masked System handle and starts it. The
+// child then writes and reads an address its image never declared.
+//
+// THE TRANSCRIPT, read as an order:
+//
+//   SOS mapchild: created                 <- an inert process, table EMPTY
+//   SOS mapchild: mapped a page into it   <- BEFORE the start, and before the
+//                                            child holds a single handle
+//   SOS mapchild: started
+//   SOS childtouch: wrote 60 read 60      <- THE CHILD'S OWN VOICE, from a page
+//                                            only the row above makes reachable
+//   SOS: process exit: code=60
+//   SOS mapchild: root observed child status=65596
+//
+// **A MAPPING IS NOT A BOOT RECORD**, which is why the map happens where it
+// does. §12's boot set FREEZES at `start` — a `give` afterwards is `BadState`,
+// which is the whole soundness argument for a child's handles being complete at
+// its first instruction — and a protection row is not a handle in the child's
+// table. It is state in the child's process slot, which the kernel installs
+// when it switches in. So `map` has no `Created` requirement at all and works
+// on a running process exactly as well; mapping first is simply what a launcher
+// would do.
+//
+// **AND THE ROW REACHES THE CHILD WITHOUT ANY RELOAD HERE.** The live-domain
+// rule is a no-op on this path — the child's domain is not the installed one —
+// which is the other half of what `map_unmap` proves: `domain_changed` costs
+// one comparison on the path that does not need it, and the switch INTO the
+// child is what installs the row (sawos design 2 D-5's replay, carrying a row
+// that did not come from an image).
+//
+// `status=65596` is `Exited` (1) in the high half and the byte the child read
+// back (0x3C = 60) in the low, read through the Process handle root never gave
+// away — the same round trip the console line states, arriving as a VALUE.
+
+import sos.{System, Process, Memory, Mapping, MapAccess, Clock, ClockType,
+            Timer, Waiter, SosStatus, SystemRight}
+
+extern "C" {
+    func sos_test_pool_base() -> UInt
+}
+
+static CHUNK: UInt = 0x1000
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// The key this case attaches its park timer under — a number that appears
+/// nowhere else in the transcript.
+static KEY: UInt = 91
+
+/// Twenty milliseconds: three orders of magnitude more than the child needs to
+/// be scheduled, touch a page, print and exit. See `process_lifecycle`.
+static PARK_NS: UInt64 = 20_000_000
+
+/// Root's config: the tag the child's System handle travels under.
+static TAG_BOOT: UInt = 11
+
+/// What a child of this launcher may ask its System object for: print, and
+/// learn its own Process object. `Transfer` is in the mask because it is the
+/// bit `give` checks on the thing being given — see `give-boot-drain`'s
+/// recorded finding. Everything else is absent BY SILENCE.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS mapchild: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // The boot set, in the build's row order: the child's image blob, the RAM
+    // it will run in, and the pool this launcher allocates out of. Root's
+    // config is what says which ordinal is which.
+    var image = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS mapchild: no image region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    var dest = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS mapchild: no destination region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    var pool_record = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS mapchild: no pool region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    guard let image_mem = image.take_memory() else {
+        let _ = system.debug_print("SOS mapchild: image record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest_mem = dest.take_memory() else {
+        let _ = system.debug_print("SOS mapchild: dest record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let pool = pool_record.take_memory() else {
+        let _ = system.debug_print("SOS mapchild: pool record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let child = match system.process_create(image: &image_mem,
+                                            memory: &dest_mem) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS mapchild: create failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS mapchild: created\n")
+
+    // **THE MAP, INTO SOMEBODY ELSE.** The receiver is the CHILD's Process
+    // handle, so the two rights this spends are `ProcessRight.Map` on that
+    // handle and `MemoryRight.Map` on the region — the doctrine's
+    // no-possession-implies-authority, which is why holding the page is not
+    // enough to install it anywhere.
+    let page = match pool.split(len: CHUNK) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS mapchild: split failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _page_map = match child.map(memory: &page, access: RW) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS mapchild: map failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    print("SOS mapchild: mapped a page into it at {}\n", sos_test_pool_base())
+
+    // The furnishing half, which is unit 3's flow unchanged: mint a masked
+    // sibling, give it under a tag, start naming that tag.
+    let for_child = match system.mint(rights: CHILD_SYSTEM) {
+        case Ok(s) -> s,
+        case Err(e) -> {
+            print("SOS mapchild: mint failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match child.give(system: move for_child, tag: TAG_BOOT) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS mapchild: give failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match child.start(boot_tag: TAG_BOOT) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS mapchild: start failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS mapchild: started\n")
+
+    // Park, so the child gets the processor. Everything below happens after the
+    // child has touched its page, printed and exited.
+    let clock = match system.clock_get(type: ClockType.Monotonic) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS mapchild: no clock: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let waiter = match proc.waiter_create() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS mapchild: no waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let timer = match clock.timer_create() {
+        case Ok(t) -> t,
+        case Err(e) -> {
+            print("SOS mapchild: no timer: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match waiter.add(&timer, KEY) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS mapchild: attach failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match timer.arm(after_ns: PARK_NS) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS mapchild: arm failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match waiter.wait() {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS mapchild: wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let status = match child.get_status() {
+        case Ok(s) -> s,
+        case Err(e) -> {
+            print("SOS mapchild: status failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    print("SOS mapchild: root observed child status={}\n", status)
+
+    print("SOS mapchild: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

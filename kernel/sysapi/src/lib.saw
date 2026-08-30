@@ -79,7 +79,7 @@
 //!
 //! # THIS FILE IS THE FACADE (sawos design 5)
 //!
-//! The module used to be one 2,000-line file. It is now ten modules and this
+//! The module used to be one 2,000-line file. It is now twelve modules and this
 //! facade, one file per object, and this file holds no code: it re-exports the
 //! names a process writes, so `import sos.{System}` in `root/src/main.saw` and
 //! every `import sos.{...}` in `tests/*/src/main.saw` means exactly what it
@@ -92,7 +92,9 @@
 //!                `@export`ed C-ABI surface, `ALL_RIGHTS`, the owning tier's
 //!                contract, and the boot handle the runtime hooks print
 //!                through
-//!   `memory`     Memory — a sealed range, and no operations at all
+//!   `memory`     Memory — RAM authority, and `split`
+//!   `iomemory`   IoMemory — device authority, and `carve`
+//!   `mapping`    Mapping — one installed protection row, and `unmap`
 //!   `thread`     Thread
 //!   `event`      Event
 //!   `interrupt`  Interrupt
@@ -117,16 +119,26 @@
 //!     `process.saw`; a type's extension methods must live in the module that
 //!     declares the type (a re-export widens no extension scope — design
 //!     142/229), so no arrangement of files splits them today.
+//!   - **THE SAME FINDING BIT AGAIN IN M3 UNIT 4, and it moved a METHOD rather
+//!     than a file.** Design 6 sketched the map funnels as `Memory.map(into:
+//!     &Process)`; `BootHandle` carries a `Memory?` and an `IoMemory?`, so both
+//!     of those modules are BELOW `system` and a `map` written in either naming
+//!     `Process` is the cycle DF-232e diagnoses. So the funnels are
+//!     `Process.map(memory:access:)` and `Process.map(iomemory:)`, which reads
+//!     exactly like the `give` overloads beside them — the same receiver
+//!     answering the same question about the same child — and the region is
+//!     BORROWED rather than consumed, because a map moves no handle word.
 //!
 //! WHAT A SPLIT COSTS HERE: the names two seams share are `public(package)`,
 //! which is a REAL package-internal tier here rather than kcore's DF-232f
 //! widening to bare `public`, because `kernel/sysapi/Saw.toml` is a manifest
-//! root and a manifest root IS a package. So the seven wrapper handle fields a
-//! sibling constructs or reads — Memory, Thread, Event, Interrupt, Timer,
-//! Clock, Waiter — are reachable by their siblings and by nothing outside the
-//! package, and `System`'s and `Process`'s stay private because only their own
-//! module touches them. Nothing widened to bare `public`, and the surface below
-//! is exactly what it was.
+//! root and a manifest root IS a package. So the NINE wrapper handle fields a
+//! sibling constructs or reads — Memory, IoMemory, Mapping (M3 unit 4), Thread,
+//! Event, Interrupt, Timer, Clock, Waiter — are reachable by their siblings and
+//! by nothing outside the package, and `System`'s and `Process`'s stay private
+//! because only their own module touches them. Nothing widened to bare
+//! `public`, and the surface below is exactly what it was plus what unit 4
+//! added.
 
 // THE ENCODINGS A PROCESS IS MEANT TO WRITE OR MATCH ON, and the only things
 // this module re-exports (design 229): the status tag every `Result<_,
@@ -135,6 +147,16 @@
 // (etc.) is how a process takes them.
 public import sosabi.{SosStatus, EventMode, ClockType, WaitResult, WaitPayload,
                       BootHandleKind}
+
+// **AND `MapAccess`, WHICH `Process.map` MADE PUBLIC** (sawos design 6 D-3).
+// It is the module docstring's PUBLIC kind exactly: a value a PROCESS CHOOSES
+// and passes as a syscall argument. It is also the case the docstring's own
+// `event_create` note PREDICTED — "M3's Mapping brings an access mode AND a
+// memory type and a method per combination is a matrix rather than a list" —
+// and the prediction held one way and not the other: the ACCESS is a value a
+// caller names, and the MEMORY TYPE turned out to be a KIND (`IoMemory`) rather
+// than an argument, so `map(iomemory:)` takes no mode at all.
+public import sosabi.{MapAccess}
 
 // **AND `SystemRight`, WHICH THE MINT MASK MADE PUBLIC** (the Aug-29 rulings on
 // design 4). Rights bits were kernel-internal for as long as no argument
@@ -178,8 +200,13 @@ public import sos.floor.{ALL_RIGHTS, sos_handle_mint, sos_handle_release,
                          sos_waiter_add, sos_waiter_remove, sos_waiter_wait,
                          sos_interrupt_ack,
                          sos_clock_now, sos_clock_timer_create,
-                         sos_timer_arm, sos_timer_disarm}
+                         sos_timer_arm, sos_timer_disarm,
+                         sos_memory_split, sos_memory_map,
+                         sos_iomemory_carve, sos_iomemory_map,
+                         sos_mapping_unmap}
 public import sos.memory.{Memory}
+public import sos.iomemory.{IoMemory}
+public import sos.mapping.{Mapping}
 public import sos.thread.{Thread}
 public import sos.event.{Event}
 public import sos.interrupt.{Interrupt}

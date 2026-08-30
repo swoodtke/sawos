@@ -145,14 +145,15 @@ func check_segment(seg: &SosimgSeg, img_len: UInt, dest: &LoadRegion,
     // own path and returns.
     if seg.is_device_grant() {
         if not allow_device {
-            // **A CHILD MAY NOT DECLARE AN MMIO WINDOW, v1** (sawos design 2
-            // D-7). The image-declares/board-authorizes placeholder below is a
-            // BOOT-time grant of the one window this board offers to the one
-            // process the kernel loads; extending it to every child would make
-            // "which process gets the UART" a race between images rather than a
-            // decision anybody made. A driver child waits for unit 4's
-            // IoMemory, where the window is a capability root HANDS OVER, and
-            // the echo-driver money shot rides that.
+            // **A CHILD MAY NOT DECLARE AN MMIO WINDOW** (sawos design 2 D-7),
+            // and unit 4 did not change it — it made it moot. The
+            // image-declares/board-authorizes placeholder below was a BOOT-time
+            // grant of the one window this board offers to the one process the
+            // kernel loads; extending it to every child would have made "which
+            // process gets the UART" a race between images rather than a
+            // decision anybody made. A driver child now gets its window as a
+            // CAPABILITY root hands over — an `IoMemory`, mapped or given —
+            // which is what this refusal was waiting for and is unit 6's flow.
             return ImageFault(reason: "a child image may not declare a device window",
                               detail: load_addr)
         }
@@ -196,13 +197,33 @@ func check_segment(seg: &SosimgSeg, img_len: UInt, dest: &LoadRegion,
 /// a process has any business holding while the kernel owns everything else —
 /// so the authorization is a comparison rather than a table.
 ///
-/// THIS IS THE PLACEHOLDER UNIT 4'S MAPPING RETIRES. Then a device window is a
-/// Memory object derived from a device pool root (spec §2.5), mapped by an op
-/// and revocable by closing the Mapping, and the board's comparison becomes the
-/// pool's contents. Everything above this line is what that migration replaces
-/// — which is also why `check_segment` refuses one outright for a CHILD: a
-/// boot-time image-declared grant is a statement about the one process the
-/// kernel loads, and generalizing it would outlive its own placeholder.
+/// **THE MIGRATION THIS PLACEHOLDER PROMISED HAS HAPPENED, AND THIS FUNCTION IS
+/// WHAT IS LEFT OF THE OLD PATH** (sawos design 6 D-6, M3 unit 4). A device
+/// window is now an `IoMemory` derived from a DEVICE row of the build-emitted
+/// region table (spec §2.5's device pool root), installed by `IoMemoryOp.Map`
+/// and revocable by unmapping the Mapping — and the board's comparison below
+/// became `hal.device_window_ok`, a predicate a CARVE is checked against,
+/// because a process can now choose a window's bounds where an image could only
+/// declare the one.
+///
+/// **NO IMAGE IN THIS TREE REACHES HERE ANY MORE.** Both driver packages
+/// obtain their window instead of declaring it, with the same echoed bytes and
+/// the same line number — which is the migration's own claim, "the same window,
+/// obtained rather than declared", as a diff of two console transcripts.
+///
+/// SO WHY IS IT STILL HERE. The flag this path reads (`imgformat`'s
+/// `SegFlag.Device`) and the emitter that writes it (`blade/sosimg.saw`) are
+/// SAWLANG-SIDE, so deleting them is a pin-bump event rather than an edit in
+/// this repository. The path is DORMANT — reachable only by an image nobody
+/// builds — and its retirement is a backlog entry naming the sawlang side and
+/// the four in-tree consumers that go with it (this function, `check_segment`'s
+/// device branch, `place_image`'s device arm, and `validate_image`'s
+/// `allow_device` parameter).
+///
+/// What does NOT change at that retirement: a CHILD image is still refused a
+/// declared window, and always was. A driver child gets its window because root
+/// MAPS it in or GIVES it a carved `IoMemory`, which is what obtaining rather
+/// than declaring bought and is unit 6's flow.
 func check_device_grant(seg: &SosimgSeg, load_addr: UInt, file_len: UInt,
                         mem_len: UInt) -> ImageFault? {
     // A window carries no bytes: there is nothing in an image file to place at

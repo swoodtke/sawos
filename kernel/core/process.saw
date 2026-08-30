@@ -24,6 +24,7 @@ import sosabi.{
     root_system_rights,
     process_rights,
     memory_rights,
+    iomemory_rights,
     thread_rights,
     NO_HANDLE,
     ROOT_SYSTEM_HANDLE,
@@ -31,8 +32,10 @@ import sosabi.{
 import kcore.limits.{
     MAX_GRANT_ROWS,
     MAX_HANDLES,
+    MAX_IOMEMORIES,
     MAX_MEMORIES,
     MAX_PROCESSES,
+    NO_IOMEMORY,
     NO_MEMORY,
     NO_PROCESS,
     ROOT_PROCESS,
@@ -41,9 +44,12 @@ import kcore.mem.{copy_bytes, word_bytes}
 import kcore.diag.{console, fatal_image}
 import kcore.objects.{
     HANDLES,
+    IOMEMORIES,
+    IoMemorySlot,
     MEMORIES,
     MemorySlot,
     SlotState,
+    alloc_iomemory,
     alloc_memory,
     boot_handle_room,
     mint_handle,
@@ -109,9 +115,13 @@ public(package) struct GrantRow {
 /// is contiguous (spec §5.5's `code|rodata|rw` layout) plus a stack at the
 /// region's top edge, so the writable part is the span between them. That holds
 /// for a CHILD exactly as it does for root — `process_create` computes it by
-/// root's own rule — and the per-mapping answer waits for unit 4's Mapping
-/// object, where a mapping records its own permissions and this pair is
-/// replaced by a lookup rather than widened.
+/// root's own rule. **UNIT 4's `Mapping` DID NOT REPLACE THIS PAIR, and the
+/// reason is worth recording where the pair is**: a mapping records its own
+/// access, so the per-mapping answer now EXISTS — but this window is what the
+/// KERNEL checks a record it is about to write against (`copy_out`), and
+/// answering that by walking the grant rows would make every copy-out a scan.
+/// The pair stays the conservative span it always was; a row-walk is the
+/// improvement, not the correction.
 /// It is CONSERVATIVE in one direction only: a gap between the image's writable
 /// end and the stack falls inside the span, so the kernel may write RAM the
 /// process was not granted. That corrupts nothing — the process owns the whole
@@ -314,6 +324,57 @@ public(package) func load_domain(p: Int) unsafe {
     LAST_PROT_PROCESS = p
 }
 
+/// Take row `row` out of process `p`'s grant record and COMPACT what is left.
+///
+/// **COMPACTION IS FORCED BY `load_domain`'s REPLAY-BY-INDEX** (sawos design 6
+/// D-3). A row's position is what the hardware sees on one profile — row `i`
+/// programs numbered region `i` — so a hole would either install a disabled
+/// region in the middle of the set or shift every later row's meaning at the
+/// next reload. Shifting them down HERE, once, is the version of that everybody
+/// can see; the Mapping slab's stored indices are fixed up beside this call
+/// (`compact_mapping_rows`), which is the whole of the index sensitivity the
+/// census found.
+///
+/// The caller has already established that `row` is in range, and it is worth
+/// saying HOW: a Mapping's stored index is the `grant_count` `install_row` read
+/// immediately before appending its row, and the only thing that has moved one
+/// since is a compaction — which is exactly what `compact_mapping_rows` beside
+/// this call keeps in step. So the index names a row this record still has.
+public(package) func remove_grant(p: Int, row: Int) unsafe {
+    var i = row
+    while i + 1 < PROCESSES[p].grant_count {
+        PROCESSES[p].grants[i] = PROCESSES[p].grants[i + 1]
+        i = i + 1
+    }
+    PROCESSES[p].grant_count = PROCESSES[p].grant_count - 1
+}
+
+/// **THE LIVE-DOMAIN RULE** (sawos design 6 D-3): any edit to `PROCESSES[p]`'s
+/// grant record RELOADS IMMEDIATELY when `p`'s domain is the one in the
+/// hardware.
+///
+/// **IT IS LAW BECAUSE `run_thread` SKIPS EQUAL DOMAINS.** The scheduler
+/// reloads only when the process changes, which is what keeps every
+/// one-process transcript free of protection work — and it means a grant record
+/// edited under the RUNNING process would never be installed at all. Not
+/// "installed late": never, for as long as that process keeps the processor.
+/// A `map()` would appear to succeed and the memory would still fault; an
+/// `unmap()` would return `Ok` and the window would stay open, which is the
+/// direction that matters.
+///
+/// ONE HELPER, BOTH OPS, and the `map_unmap` case is what asserts it end to
+/// end: the touch after the unmap FAULTS, which is only true if the reload
+/// happened.
+///
+/// It is a no-op for the common shape — a launcher mapping into a child it has
+/// not started — so the cost is one comparison on the path that does not need
+/// it.
+public(package) func domain_changed(p: Int) unsafe {
+    if LAST_PROT_PROCESS == p {
+        load_domain(p)
+    }
+}
+
 /// Forget process `p`'s domain and its rows. Called by the teardown.
 ///
 /// INVALIDATING `LAST_PROT_PROCESS` IS THE PART THAT MATTERS, and the hazard it
@@ -513,24 +574,41 @@ public(package) func copy_in(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe -
 // config is what says which ordinal is an image and which is a destination.
 // A kernel that knew would be a kernel with a launcher inside it.
 //
-// TWO KINDS OF ROW AND THEY ARE INDISTINGUISHABLE HERE ON PURPOSE — a blob
-// region (where an appended image sits, its base resolved by the LINKER) and a
-// free-RAM region (a child's destination range, assigned in config). Both are
-// `{base, len}` and the kernel treats them identically; the difference is
-// entirely in what root does with them.
+// **ROWS CARRY A KIND SINCE M3 UNIT 4** (sawos design 6 D-5), and that is the
+// one thing the kernel now reads out of a row besides its bounds. There are
+// three kinds of row in practice and only TWO the kernel distinguishes:
+//
+//   - a blob region (where an appended image sits, its base resolved by the
+//     LINKER) and a free-RAM region (a pool or a child's destination range,
+//     assigned in config) are both `kind = Ram` and are INDISTINGUISHABLE here
+//     on purpose — the difference is entirely in what root does with them;
+//   - a DEVICE row names a peripheral's registers and mints an `IoMemory`
+//     rather than a `Memory`, because §2.5's pool attribute is a KIND (D-1) and
+//     a kind cannot be inferred from an address the kernel is not allowed to
+//     interpret.
+//
+// That is why the column exists at all: everything else about a row stays the
+// build's business, and the kernel still assigns no MEANING to a Ram row.
 //
 // A MISSING OR EMPTY TABLE IS ZERO REGIONS. That is not a special case, it is
 // the ordinary reading of a section the linker script always defines and the
 // stitcher usually does not fill — which is what keeps every image built
-// without children booting byte-identically.
+// without regions booting byte-identically, and the `len == 0` short-circuit
+// below is deliberately AHEAD of every header read so that a v1-era image with
+// no table is not refused for a version it never wrote.
 //
-// WIRE LAYOUT (frozen by design 2 D-2, fixed-width little-endian, the design-47
-// discipline the sosimg format follows): an 8-byte header — magic `u32`,
-// version `u16`, count `u8`, reserved `u8` — then `count` rows of
-// `{base: u64, len: u64}`. The header's size is what puts every row on an
-// 8-byte boundary, which is what makes the overlay below exact.
+// WIRE LAYOUT (frozen by design 2 D-2 and REVISED by design 6 D-5, fixed-width
+// little-endian, the design-47 discipline the sosimg format follows): an 8-byte
+// header — magic `u32`, version `u16`, count `u8`, reserved `u8` — then `count`
+// rows of `{base: u64, len: u64, kind: u8, reserved × 7}`. The header's size is
+// what puts every row on an 8-byte boundary and the row's padding is what keeps
+// the NEXT one there, which is what makes the overlay below exact.
 
 /// The region table's header: 8 bytes at the section's start.
+///
+/// UNCHANGED BY VERSION 2, and pinned so it stays that way: the version field
+/// is the first thing a reader needs, so its position is the one part of a
+/// versioned format that may never move.
 struct RegionTableHeader {
     magic: UInt32,
     version: UInt16,
@@ -538,10 +616,39 @@ struct RegionTableHeader {
     reserved0: UInt8,
 }
 
-/// One row: a range, and nothing more.
+/// WHAT A REGION ROW IS (sawos design 6 D-5) — the table's kind column.
+///
+/// TWO KINDS, AND THEY ARE §2.5's TWO POOL ATTRIBUTES: RAM is cacheable memory
+/// a process runs in, Device is a peripheral's registers. The kernel mints a
+/// different OBJECT KIND for each (`Memory` / `IoMemory`), which is D-1's
+/// ruling arriving at the one place a window can enter the system.
+///
+/// Raw-backed, so a reorder cannot renumber them and the read at the boundary
+/// is `from(raw:)` — total, so an unrecognized byte is DATA the loader refuses
+/// rather than an index it trusts. Refusing is `fatal_image`, like every other
+/// malformation in this table: the build wrote it.
+enum RegionKind: UInt8 {
+    case Ram = 0,
+    case Device = 1,
+}
+
+/// One row: a range, what kind of memory it is, and room to grow.
+///
+/// **24 BYTES, SIZE-PINNED**, and the seven reserved bytes are not padding the
+/// compiler happened to add — they are declared, so the size is a decision
+/// rather than a consequence of field order. What they buy is the next column
+/// (a pool identity, an attribute finer than Ram/Device) without a version 3.
 struct RegionRow {
     base: UInt64,
     len: UInt64,
+    kind: UInt8,
+    reserved0: UInt8,
+    reserved1: UInt8,
+    reserved2: UInt8,
+    reserved3: UInt8,
+    reserved4: UInt8,
+    reserved5: UInt8,
+    reserved6: UInt8,
 }
 
 // The ABI pin, on the sosimg format's own terms: a layout edit that skews these
@@ -549,15 +656,24 @@ struct RegionRow {
 // profiles, which is what the field order is arranged to make true.
 static_assert(sizeof<RegionTableHeader>() == 8,
               "the region table header must be exactly 8 bytes")
-static_assert(sizeof<RegionRow>() == 16,
-              "a region table row must be exactly 16 bytes")
+static_assert(sizeof<RegionRow>() == 24,
+              "a region table row must be exactly 24 bytes")
 
 /// 'S','R','G','N' as a little-endian word — "SOS regions".
 static REGION_TABLE_MAGIC: UInt32 = 0x4E47_5253
 
-/// Version 1. A loader refuses anything it does not know, on the sosimg format's
-/// terms: there is no reading of an unknown layout that is safe to guess at.
-static REGION_TABLE_VERSION: UInt16 = 1
+/// **VERSION 2** (sawos design 6 D-5). A loader refuses anything it does not
+/// know, on the sosimg format's terms: there is no reading of an unknown layout
+/// that is safe to guess at, and a v1 row read as a v2 one would take the next
+/// row's base as this one's kind.
+///
+/// THE KERNEL ACCEPTS EXACTLY THIS NUMBER — no v1 compatibility arm — and that
+/// is the format's own refuse-unknown rule applied to itself rather than a
+/// convenience: v1 never shipped past this tree, and the stitcher and the
+/// kernel move in one commit. The compatibility that IS kept is the one that
+/// matters to every case in the suite: an image with no table at all reads as
+/// zero regions and never reaches this comparison.
+static REGION_TABLE_VERSION: UInt16 = 2
 
 /// Overlay the header on the section's first bytes. One view construction, then
 /// an ordinary safe struct — the unsafety is confined to this line.
@@ -610,7 +726,11 @@ func mint_boot_regions(p: Int) unsafe {
                     header.version as UInt)
     }
     let count = (header.count as UInt)
-    if count > (MAX_MEMORIES as UInt) {
+    // THE BOUND IS BOTH SLABS' — a row mints into one or the other by its kind,
+    // and a table larger than the two together could not be minted whichever
+    // way the kinds fell. The per-row `alloc_*` refusals below are what catch a
+    // table that is small enough overall and lopsided.
+    if count > ((MAX_MEMORIES + MAX_IOMEMORIES) as UInt) {
         fatal_image("more boot regions than the kernel can hold", count)
     }
     if count * row_len > len - header_len {
@@ -627,15 +747,16 @@ func mint_boot_regions(p: Int) unsafe {
         if not fits_word(row.base) || not fits_word(row.len) {
             fatal_image("boot region is past this machine's address space", i)
         }
-        let slot = alloc_memory()
-        if slot == NO_MEMORY {
-            fatal_image("out of Memory slots for the boot regions", i)
-        }
-        MEMORIES[slot] = MemorySlot(state: SlotState.Live, process: p,
-                                    base: row.base as UInt, len: row.len as UInt)
-        let handle = mint_handle(p, ObjType.Memory, memory_rights(), slot)
-        if handle == NO_HANDLE {
-            fatal_image("no handle table room for the boot regions", i)
+        // The kind is DATA the build wrote, so it is decoded rather than
+        // trusted — `from(raw:)` is total and an unknown byte stops the boot
+        // with the number in it, exactly as a bad magic does.
+        // The `return` is owed by the language rather than by the logic:
+        // `fatal_image` stops the machine but is not declared `-> Never`, so a
+        // guard's else block has to exit the scope itself.
+        guard let kind = RegionKind.from(raw: row.kind) else {
+            fatal_image("boot region has a kind this build cannot name",
+                        row.kind as UInt)
+            return
         }
         // THE TAG IS THE ROW ORDINAL and nothing else — root's config is what
         // gives it a meaning. **THE KERNEL IS THE GIVER NOBODY GAVE TO** (sawos
@@ -646,7 +767,41 @@ func mint_boot_regions(p: Int) unsafe {
         if not boot_handle_room(p) {
             fatal_image("no boot-record room for the boot regions", i)
         }
-        queue_boot_handle(p, i, BootHandleKind.Memory, handle)
+        // **TWO KINDS OF ROW, TWO KINDS OF OBJECT** (sawos design 6 D-5), and
+        // the arms are deliberately symmetrical: the same range becomes a
+        // different CAPABILITY depending on one byte the build wrote, which is
+        // the whole of what the kind column buys.
+        match kind {
+            case Ram -> {
+                let slot = alloc_memory()
+                if slot == NO_MEMORY {
+                    fatal_image("out of Memory slots for the boot regions", i)
+                }
+                MEMORIES[slot] = MemorySlot(state: SlotState.Live, process: p,
+                                            base: row.base as UInt,
+                                            len: row.len as UInt)
+                let handle = mint_handle(p, ObjType.Memory, memory_rights(), slot)
+                if handle == NO_HANDLE {
+                    fatal_image("no handle table room for the boot regions", i)
+                }
+                queue_boot_handle(p, i, BootHandleKind.Memory, handle)
+            },
+            case Device -> {
+                let slot = alloc_iomemory()
+                if slot == NO_IOMEMORY {
+                    fatal_image("out of IoMemory slots for the boot regions", i)
+                }
+                IOMEMORIES[slot] = IoMemorySlot(state: SlotState.Live, process: p,
+                                                base: row.base as UInt,
+                                                len: row.len as UInt)
+                let handle = mint_handle(p, ObjType.IoMemory, iomemory_rights(),
+                                         slot)
+                if handle == NO_HANDLE {
+                    fatal_image("no handle table room for the boot regions", i)
+                }
+                queue_boot_handle(p, i, BootHandleKind.IoMemory, handle)
+            },
+        }
         i = i + 1
     }
 

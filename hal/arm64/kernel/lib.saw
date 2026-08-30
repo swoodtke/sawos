@@ -332,6 +332,64 @@ static_assert(DEVICE_GRANT_LEN >= PROT_GRAIN,
 static_assert((DEVICE_GRANT_BASE % PROT_GRAIN) == 0,
               "a device window must start on a page boundary")
 
+/// **HOW MANY PROTECTION ROWS ONE PROCESS'S DOMAIN MAY HOLD ON THIS PROFILE**
+/// — the number `MemoryOp.Map` checks a target's `grant_count` against (sawos
+/// design 6 D-3/D-4).
+///
+/// **ON THIS PROFILE IT IS A POLICY NUMBER, NOT A HARDWARE ONE**, and the
+/// asymmetry with Profile A is the thing to read here. There are no numbered
+/// regions to run out of: a grant is a walk of page descriptors, so the
+/// hardware's only limit is the window's own size. What bounds a domain instead
+/// is the kernel's grant RECORD — a fixed array per process slot — and this is
+/// that array's length (`kcore.limits.MAX_GRANT_ROWS`), restated as a HAL fact
+/// so that one number serves both profiles at the map check and neither has to
+/// know which kind of wall the other has.
+///
+/// It is deliberately NOT widened past the array. Raising it means raising the
+/// storage every process slot carries, which is a decision for whoever needs
+/// the rows rather than a free consequence of this profile being page-granular.
+public static GRANT_ROW_BUDGET: UInt = 9
+
+/// **MAY `[base, top)` BE INSTALLED AS A RAM ROW IN A USER DOMAIN?** (sawos
+/// design 6 D-4.)
+///
+/// **THE 4 MiB GRANT WINDOW IS THE ANSWER, AND THIS IS WHERE A `map()` MEETS
+/// IT.** `prot_region` already enforces the same bound and enforces it by
+/// STOPPING THE MACHINE (`grant_outside_window`) — correct for the loader path,
+/// where a memory map that outgrew the window is a kernel bug, and wrong for a
+/// map, where the range came from a region a PROCESS chose. So the predicate
+/// exists to move that refusal to the op, as a caller-visible `BadArg`, and
+/// `grant_outside_window` stays exactly as it was for the path it was written
+/// for.
+///
+/// Page alignment is NOT required of `base`: `prot_region` rounds down to the
+/// page it starts in, exactly as it does for a segment, so a map of a region
+/// that begins mid-page grants the whole page. What is required is that every
+/// page the walk would touch is inside the window — which is what the top bound
+/// tests, since the walk stops at `top`.
+public func map_target_ok(base: UInt, top: UInt) -> Bool {
+    base < top && base >= RAM_BASE && top <= RAM_BASE + (GRANT_PAGES << PAGE_SHIFT)
+}
+
+/// **MAY `[base, base + len)` BE INSTALLED AS A DEVICE ROW?** — this profile's
+/// granularity rule, checked on caller-chosen numbers (sawos design 6 D-2).
+///
+/// A page is the finest thing this profile can grant, so a window is judged by
+/// pages: both ends on a page boundary, and inside the one device window the
+/// board publishes a level-3 table for. Profile A's rule is different in FORM
+/// (a naturally-aligned power of two, because a window there is one protection
+/// entry) and identical in PURPOSE, which is why the predicate is per-HAL
+/// rather than a shared check with two branches.
+public func device_window_ok(base: UInt, len: UInt) -> Bool {
+    if len < PROT_GRAIN || (len % PROT_GRAIN) != 0 {
+        return false
+    }
+    if (base % PROT_GRAIN) != 0 {
+        return false
+    }
+    base >= DEVICE_WINDOW_BASE && len <= DEVICE_WINDOW_BASE + DEVICE_WINDOW_LEN - base
+}
+
 /// An address the KERNEL itself cannot reach on this target. The level-1 entry
 /// covering it is invalid, so a read is a translation fault taken at EL1. It is
 /// NOT a low address: with the MMU on, low addresses are the device window and

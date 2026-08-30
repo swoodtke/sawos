@@ -76,25 +76,45 @@ invalid handle, an unknown op, a missing right — does not come back at all:
 design 178's faults ruling terminates the process for it, and the kernel reports
 the reason. What is left as a status is what the caller could not have known.
 
-## A granted device window (design 178 M2 unit 4)
+## A granted device window (design 178 M2 unit 4, MIGRATED M3 unit 4)
 
 A DRIVER PROCESS REACHES ITS DEVICE DIRECTLY, through no stub in this directory
-and no op in the kernel. What it needs is one line in its own manifest —
+and no op in the kernel's fast path. From the driver's side the device is
+ordinary memory and the code is the design-112 MMIO idiom in plain process Saw
+(`UnsafeMemory<Regs, Device>` over a register-block struct);
+`sos/tests/uart-echo-ns16550/` is the worked example. **WHAT CHANGED IN M3 unit
+4 IS HOW THE WINDOW ARRIVES** (sawos design 6 D-6).
+
+**NOW — OBTAINED.** The build publishes a DEVICE row in the boot region table,
+the kernel mints an `IoMemory` capability for it, and the driver drains it from
+its boot set and installs it in itself:
+
+    var record = proc.boot_handle_next()!          // kind == IoMemory
+    let window = record.take_iomemory()!
+    let mapping = proc.map(iomemory: &window)!     // one NAPOT entry, RW, NX
+
+The address the registers appear at is the hardware's own — SOS does not
+translate — so nothing else in the driver changes. `carve(offset, len)` narrows
+a window before mapping it and leaves the parent whole, which is what lets one
+peripheral's page serve several drivers.
+
+**BEFORE — DECLARED, and this path is DORMANT rather than deleted.** A driver
+wrote one line in its own manifest:
 
     [sos.riscv32-unknown-none-elf]
     device-window = "0x10000000"
 
-— which becomes a device record in its `sosimg`, which the kernel installs as
-one page-aligned NAPOT protection entry before entering user mode. From then on
-the register block is ordinary memory to that process, and the driver is the
-design-112 MMIO idiom in plain process Saw (`UnsafeMemory<Regs, Device>` over a
-register-block struct). `sos/tests/uart-echo-ns16550/` is the worked example.
-
-TWO THINGS BOUND IT. The window is AUTHORIZED by the board, not merely declared:
-this profile's HAL publishes one (the console UART's page) and an image naming
-anything else is refused at load. And it is a PLACEHOLDER — M3's MemoryObject /
-Mapping (spec §2.5) makes a device window a handle derived from a device pool
-root, mapped by an op and revocable by closing the Mapping.
+— which became a device record in its `sosimg`, which the kernel installed as
+one page-aligned NAPOT protection entry before entering user mode. It was
+AUTHORIZED by the board rather than merely declared (this HAL publishes one
+window; an image naming anything else is refused at load), and spec §2.5 called
+it a PLACEHOLDER for exactly the shape above. **No image in this tree uses it
+any more.** The flag and the loader's door survive because the emitter is
+sawlang-side (`blade/sosimg.saw`), so deleting them is a pin-bump event — a
+backlog entry, not a live path. A CHILD image was always refused a declared
+window and still is; a driver child gets its window because root maps it in or
+gives it a carved `IoMemory`, which is what obtaining rather than declaring
+bought.
 
 **THE CONSOLE HANDOVER PROTOCOL** applies to whoever holds the console's window:
 the kernel goes quiet at its `SOS: console handover` marker and writes again

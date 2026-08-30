@@ -1,0 +1,80 @@
+//! MAPPING — one installed protection row, with a handle on it (spec §2.5;
+//! sawos design 6 D-1/D-3).
+//!
+//! **A MAPPING IS AN INSTALLED GRANT ROW.** SOS does not translate (spec §5.5:
+//! an address is the same number in every process), so §2.5's "installed
+//! virtual placement" has no virtual half here — what a Mapping records is
+//! which process's domain carries the row and which row it is, and the address
+//! is the region's own.
+//!
+//! **ONLY A MAPPING UNMAPS** (§2.5), which is the object's whole reason to
+//! exist. That is why `Process.map` answers with one instead of returning a
+//! status: without a handle onto the row there would be no way to take it back,
+//! and revocation would have to be some other mechanism.
+//!
+//! It names only the floor, so `sos.system` — which produces one — can name it.
+
+import sosabi.{SosStatus, MappingHandle, NO_HANDLE}
+
+import sos.floor.{checked, sos_handle_release, sos_mapping_unmap}
+
+/// A handle to a Mapping — one protection row, installed.
+///
+/// Built by `Process.map` and by nothing else.
+///
+/// **`NoCopy`, AND DROPPING IT RELEASES THE HANDLE — WHICH IS NOT AN UNMAP.**
+/// That distinction is §2.5's ruled stance rather than an implementation
+/// detail, and it is worth reading carefully because the RAII habit points the
+/// other way. Release destroys the caller's ENTRY and never the object (design
+/// 3 D-2's entries-never-touch-objects rule), so a `Mapping` that falls out of
+/// scope leaves its row installed: **the mapping is permanent, safe-but-leaked,
+/// never a dangling-unmap hazard.** A caller that means to revoke calls
+/// `unmap()` and then drops the value.
+///
+/// §2.5 sketches a Deinit that unmaps at scope exit, so that "the common path
+/// is leak-free by construction". SOS does not do that today and the reason is
+/// stated rather than hidden: unmapping in a `deinit` would make the ROW's
+/// lifetime the wrapper's, and a wrapper drops on every path out of a scope
+/// including the ones a launcher takes right after handing a child its memory —
+/// so the shape unit 4 exists for (map into a child, then start it) would
+/// revoke the mapping before the child ever ran. Tying the two lifetimes wants
+/// the refcount §2.5 describes, which is unit 5's.
+public struct Mapping {
+    public(package) handle: MappingHandle,
+}
+
+extension Mapping: NoCopy {
+    /// Drop is release, and release is NOT unmap — see the type's docstring.
+    /// Otherwise this is `System`'s deinit exactly: the sentinel and the
+    /// discard for the same reasons.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
+}
+
+extension Mapping {
+    /// **TAKE THE ROW OUT OF THE DOMAIN IT WAS INSTALLED IN.** Requires
+    /// `MappingRight.Unmap`.
+    ///
+    /// The memory becomes unreachable to the target process at once — not at
+    /// its next switch, AT ONCE, even when the target is the process running
+    /// right now. That is the live-domain rule (design 6 D-3) and it is the
+    /// half of this op a caller most needs to be able to rely on: an `unmap`
+    /// that returned `Ok` and left the window open until some later reschedule
+    /// would be a revocation that did not revoke.
+    ///
+    /// **UNMAPPING TWICE TERMINATES THE CALLER** (`BadState`), and so does
+    /// unmapping a Mapping whose target process has DIED — its whole domain
+    /// went with it, so there is no row left to remove. Both are
+    /// caller-checkable: the caller either unmapped it or created the child.
+    ///
+    /// It consumes nothing. The wrapper stays valid and still owns its handle,
+    /// which is what makes "unmap, then drop" one ordinary sequence rather than
+    /// a consuming funnel with a disarm; there is no word moving between tables
+    /// here, only a row leaving a record.
+    public func unmap(&self) -> Result<Void, SosStatus> {
+        checked(sos_mapping_unmap(self.handle))
+    }
+}

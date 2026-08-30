@@ -32,28 +32,36 @@ names provisional):
 |---|---|
 | `AddressSpace` | Isolation domain, defined abstractly. P4: PMP region set + APM/REE security context (see §5.5 — the P4's MMU is real but global/external-memory-only, not per-process). Paging targets: page-table root. |
 | `Thread` | Kernel-scheduled execution context bound to an AddressSpace. Saw's cooperative TaskGroups run *inside* a thread, in userspace — the kernel never sees tasks. BUILT M2 (design 178 unit 2): ops `Start`/`Join`/`Exit`/`Yield`, rights `ThreadRight.Start`/`.Join`/`.Control`. The saved trap frame IS the context, so a switch is the trap handler returning a different frame — see §11. |
-| `MemoryObject` | A range of memory (RAM or device MMIO) that can be mapped into AddressSpaces. Derived by splitting/attenuating a parent MemoryObject; roots handed to the first process at boot. BUILT M3 unit 2, FIRST SLICE (sawos design 2 D-2): a SEALED `{base, len}` and nothing else — no pools, no derivation, no `map()`, no attributes, no op table (an op aimed at one is a `BadOp` fault). Minted only at boot, one per row of the build-emitted REGION TABLE, delivered to root through `ProcessOp.BootHandleNext`, and NAMED as the two arguments of `process_create`. Rights are the universal pair, `MemoryRight.Transfer` (unit 3's `give`) and `.Mint` (unit 3's attenuated sibling); a Memory has no kind-specific right yet, and unit 4's pools and mappings are what earn it one named for its op (the Aug-29 doctrine — the generic `Manage` that used to sit here for that borrowed purpose was removed). §2.5 is not contradicted, it is STARTED: these ARE that section's "pool roots given to the root server at boot", in their v1 static form. |
+| `MemoryObject` | A range of memory (RAM or device MMIO) that can be mapped into AddressSpaces. Derived by splitting/attenuating a parent MemoryObject; roots handed to the first process at boot. BUILT M3 unit 2, FIRST SLICE (sawos design 2 D-2): a SEALED `{base, len}` and nothing else — no pools, no derivation, no `map()`, no attributes, no op table (an op aimed at one is a `BadOp` fault). Minted only at boot, one per row of the build-emitted REGION TABLE, delivered to root through `ProcessOp.BootHandleNext`, and NAMED as the two arguments of `process_create`. **BUILT OUT M3 unit 4 (sawos design 6), and the slice's two open questions are both answered**: the row is now `Memory` (RAM) or `IoMemory` (device MMIO) by the region table's KIND COLUMN, and the object has an op table. Ops `Split`/`Map`, rights `MemoryRight.Split`/`.Map` beside the universal pair (`Transfer` for unit 3's `give`, `Mint` for its attenuated sibling — the generic `Manage` that once sat here was removed by the Aug-29 doctrine, and unit 4's bits are named for their ops as that doctrine requires). `split(len)` is ONE CUT FROM THE FRONT and the parent becomes the remainder, so allocation is repeated front-splits and THE PARENT IS THE POOL CURSOR — arbitrary-offset carving is refused BY THE SHAPE rather than by a check, since one `{base, len}` slot cannot hold two remainders. `map(process, access)` installs a protection row and answers with a `Mapping`; it spends `MemoryRight.Map` on the region AND `ProcessRight.Map` on the target, because possession of bytes must not imply authority over an address space. There is STILL no op that reads a MemoryObject's bounds: a region is a capability, and what a process knows about where its memory is, it knows from the config that gave it the region. Free-on-last-reference (§2.5's refcount clause) is NOT built — a split is permanent until teardown, and teardown returns SLOTS rather than ranges; it lands with unit 5's quotas. |
+| `IoMemoryObject` | Physical memory-mapped DEVICE registers. BUILT M3 unit 4 (sawos design 6 D-1) as a DISTINCT KIND rather than a flag on `MemoryObject`, which is §2.5's pool ATTRIBUTE made a type: an IoMemory can only ever produce device-attribute rows — `map` takes no access argument at all — so a driver cannot obtain a cacheable view of a register block BY CONSTRUCTION rather than by a check. Its lifecycle differs everywhere too: PINNED (never freed — MMIO is not reclaimable), carved NON-EXCLUSIVELY (§2.5's "a fixed region may be handed out many times", so `carve(offset, len)` leaves the parent WHOLE where `split` consumes), and it has no contents. Ops `Carve`/`Map`, rights `IoMemoryRight.Carve`/`.Map` plus the universal pair. The machine's own granularity is checked AT THE CARVE against a per-profile HAL predicate (Profile A needs a naturally-aligned power of two — one protection entry; Profile B needs whole pages), because a window that could never be installed anywhere is a capability that lies about itself. One dispatch arm is the entire cost, and what it RETIRES is the M2 device-grant placeholder: see §2.5's migration case and §11. |
+| `Mapping` | ONE INSTALLED PROTECTION ROW, with its own handle. BUILT M3 unit 4 (sawos design 6 D-1/D-3). **A MAPPING IS AN INSTALLED GRANT ROW** — SOS does not translate (§5.5: an address is the same number in every process), so §2.5's "installed virtual placement" has no virtual half here and the object records which process's domain carries the row and which row it is. ONE op (`Unmap`, on `MappingRight.Unmap`), because everything else about a mapping was decided when it was installed. **RELEASING THE HANDLE IS NOT AN UNMAP**: release destroys the entry and never the object (design 3 D-2), so §2.5's "dropped without unmap = permanent, safe-but-leaked" falls out of existing doctrine rather than being new law. §2.5's sketched unmapping Deinit is deliberately NOT built — it would make the ROW's lifetime the wrapper's, and a launcher's wrapper drops right after it hands a child its memory. **THE LIVE-DOMAIN RULE** is the half a caller relies on: any edit to a grant record RELOADS IMMEDIATELY when that domain is the installed one, because `run_thread` skips equal domains and an unmap that waited for the next reschedule would be a revocation that did not revoke. Unmapping twice, or unmapping a Mapping whose TARGET PROCESS has died (its whole domain went with it), are both `BadState`. It is not givable — `mapping_rights()` withholds `Transfer` — because a Mapping names a row in one specific domain. |
 | `Pipe` | Synchronous message IPC with request/reply built in — see §2.1 (ratified Jul 29; renamed from Channel + client API amended Aug 20). |
 | `Event` | Accumulating non-blocking notification (OR / saturating-sum); a waitable — see §2.4 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Signal`/`Receive`, the mode chosen by the caller at creation (`event_create(mode:)`). AMENDED Aug 17 (user): the word is CONSUMED BY WHOEVER TAKES IT, through either door — `receive` is the non-blocking poll, a `Waiter.wait` delivery is the blocking one, and both read-and-clear, so a value is reported exactly once (§2.2, §2.4). |
 | `Clock` | A GRANTED TIME SOURCE — time is a capability, not an ambient facility. BUILT M3 (design 232 unit 1): obtained through `SystemOp.ClockGet` on `SystemRight.ClockGet`, ops `Now`/`TimerCreate`, rights `ClockRight.Read`/`.TimerCreate`. **A HARDWARE-BACKED CLOCK IS ONE KERNEL-ETERNAL OBJECT PER `ClockType`** (ruled Aug 17, user), existing from boot and owned by NOBODY: the machine has one monotonic counter, and a per-process object naming it would be a copy of a fact with a lifetime attached. So there is one slot per domain (the slot IS the domain's ordinal), no allocation and no `NoResource`, and process teardown frees no clock — a dead process's clock HANDLE is unbound like any other, and the object it named is not the process's to reclaim. `ClockGet` is therefore a GETTER that mints a handle onto a well-known object — and it MINTS ON EVERY ASK (sawos design 3 D-4, M3 unit 2.75), superseding this row's earlier "asking twice answers the SAME handle": two asks are two capability INSTANCES naming the one Clock, each independently owned and independently released, which is what §4's owning wrapper is an owner OF. It amplifies nothing (see §3's no-amplification amendment) and it makes the op fallible on repetition — a full handle table is `NoResource`, which is what earns it a quota row in unit 5. `ClockType` declares `Monotonic` ONLY in v1 (`Boot`/`Realtime` are future values of a raw-backed enum, undeclared because an unproducible case is dead surface), and `Now` dispatches on the clock's domain, so a second domain fails to compile until somebody says what its reading is. `Now` answers through a copy-out record, because a nanosecond count is 64 bits and one profile's registers are not. The point of the capability: strip the right from a child and hand it a VIRTUAL clock over IPC instead, with no code change on either side — and a virtual clock is a DIFFERENT animal, separately created and STATEFUL (offset, rate, owner), so it gets its own creation op and its own lifetime rather than a row in this table. |
 | `Timer` | Deadline object bound to the Clock that created it; directly waitable. BUILT M3 (design 232 unit 1) — THE PROCESS-SLEEP PRIMITIVE, and before it a wait either returned at once or blocked forever. Ops `Arm`/`Disarm`, rights `TimerRight.Arm` (gating both) / `.Wait`. `arm(after_ns, interval_ns)` arrives through the new COPY-IN record (§2.2's copy-out funnel's mirror twin, built here and inherited by M4's IPC send) because two 64-bit times exceed the argument registers on a 32-bit profile; `interval_ns == 0` is a one-shot, which disarms itself when it fires. The re-arm is DRIFT-FREE (next = previous DEADLINE + interval, the timerfd model) and missed expiries COALESCE into a saturating fire count delivered as `WaitPayload.Timer(fires:)`. **There is NO ACK**: unlike §9's Interrupt there is no mask to release, so the wait that reports the fires is what consumes them. Arming an armed timer REPLACES its schedule and clears the count; disarming an unarmed one is a NO-OP, deliberately opposite to §9's ack-with-no-fire — a one-shot disarms itself, so cancelling a timeout that just expired is an ordinary race rather than a caller error. |
 | `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it, ack via the handle. BUILT M2 (design 178 unit 4): one op (`Ack`), two rights (`InterruptRight.Wait`/`.Ack`), created by `ProcessOp.InterruptBind` on its own Process right — the factory bit a launcher strips from everything that is not a driver. The BINDING IS THE OBJECT'S EXISTENCE (creation takes the line, there is no rebind), which is what stops one handle naming two devices over its life. A line the board does not have, the TIMER's line, and a line already bound are all faults. |
 | `Waiter` | Generic wait aggregator (epoll/Port-style) — see §2.2 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Add`/`Remove`/`Wait`, rights `WaiterRight.Attach`/`.Wait`, the wait answer a copy-out record. |
-| `MemoryObject` | Physical memory (RAM or device MMIO). Ownership/authority over the pages; mappable, sendable — see §2.3 (ratified Jul 29). |
-| `Mapping` | An installed virtual placement of a MemoryObject; distinct object, own handle; only it can unmap — see §2.3. |
+| ~~`MemoryObject`~~ | (A duplicate row from the Jul-29 draft, pointing at §2.3 where the section is §2.5. Both of its claims are in the rows above: RAM is `MemoryObject`, device MMIO is `IoMemoryObject`, and "mappable" is `Map`. Kept struck rather than deleted so a reader of the Jul-29 discussion finds where it went.) |
+| ~~`Mapping`~~ | (Likewise — see the `Mapping` row above, built M3 unit 4.) |
 | `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. BUILT M2 (design 178 unit 2), one process: ops `ThreadCreate`/`ThreadSelf`/`Exit`/`GetStatus` plus the three factory ops `EventCreate`/`WaiterCreate`/`InterruptBind`, each on its own right. BUILT M3 unit 2 (sawos design 2), **TWO processes**: `Start` (on the CHILD's handle, `ProcessRight.Start`) mints the first thread of a created process and runs it; `BootHandleNext` (`ProcessRight.BootHandles`) drains §12's boot set one record at a time. The CREATE half of that lifecycle is not an op on this object — design 2's RIDER (Aug 29) puts `ProcessCreate` on System, because a process is a machine-wide resource (§12's amended creation-authority note). The child's handle carried `Start | Wait | Manage` and nothing else at that unit — everything a process may do to ITSELF withheld from its creator (M3 unit 3 re-ruled the set; see below). The TEARDOWN now forks (§8): process 0 stops the machine, any other reschedules. **THE SLOT OF A DEAD PROCESS IS RECLAIMED** (sawos design 3 D-3, M3 unit 2.75), and it is the ONLY slab that reclaims on a handle release. A `Gone` slot holds one thing — its §8 status word — and the only way to read that word is `GetStatus` through a Process handle, so "no handle names this slot" IS "no possible reader", exactly. The check therefore scans the handle tables (bounded: `MAX_PROCESSES` × `MAX_HANDLES`) when a released entry named a `Gone` process, and again at the end of a process's own teardown for its own slot. D-1's generations are what make the reuse safe, and `clear_domain` already invalidated `LAST_PROT_PROCESS` in anticipation. `MAX_PROCESSES` consequently bounds CONCURRENT processes again, which is what the name says. Every other kind still frees only at its owner's teardown: their "may I free this" question needs a refcount nothing yet justifies. `kill` (§8) still has no op. **BUILT M3 unit 3 (sawos design 4): `Give` — THE COURIER OP.** `give(handle, tag:)` on the CHILD's handle (gated by `ProcessRight.Give` there, plus the UNIVERSAL `Transfer` right on the handle being given) MOVES a handle into a fresh slot of the child's table and returns ONLY ITS STATUS: the child-side word is meaningless to the giver, which can call no op through it. What crosses instead is the TAG — the giver's own word, handed back unread at the child's drain. It is unbind-and-rebind with RIGHTS VERBATIM (a move, not a mint: no default set is consulted and nothing amplifies), the caller's entry unbinds exactly as a release does so the giver's word goes stale, and a full child table is `NoResource` with the give not having happened. Four caller errors END the caller: a handle that names nothing (`BadHandle`), one without `Transfer` (`AccessDenied`), a child that has already been STARTED (`BadState` — the boot set FREEZES at start, which is the launch flow's whole soundness argument), and a tag the child's set already carries (`DuplicateKey` — the tag is the identity, and one naming two handles would make the boot lookup ambiguous). `Start` gained a `boot_tag` argument in the same unit: the kernel resolves the tag to the child-side word, puts it in the child's first argument register and CONSUMES the record it named (the register IS the delivery, so a child can never be handed one word twice), leaving `_start(boot_handle)` unchanged and a launcher never seeing a child-relative word. `BootHandleNext` now drains the CALLER's own PER-PROCESS set — the kernel writes root's at boot and a launcher writes a child's with `give`, through one op with one exhaustion rule. The Process default set is now ONE set for all three minters (root's, `ProcessSelf`'s and `ProcessCreate`'s), named for its ops throughout: `ThreadCreate | ThreadSelf | Exit | Wait | EventCreate | WaiterCreate | InterruptBind | Start | BootHandles | Give` plus the universal `Transfer | Mint`. A LAUNCHER KEEPS the child's handle — it is what supervises with — and the child derives its own authority from the masked System handle it was given, so supervision and self-management are no longer alternatives (`MINT_OP`, §3, closing design 3's finding 2). |
 | `System` | Kernel singleton (ratified Aug 5): the object behind system-scoped primitives so that EVERY syscall is an object op (§5.7) — v1 ops `debug_print`, `shutdown(status)` (stop the machine; QEMU: sifive_test), rights-gated (`SystemRight.Debug`/`.Shutdown`, §3 scoped rights). Root receives its handle at boot (§12). `exit` is NOT here — process exit belongs to the Process object when it exists (ratified Aug 5). M2 added a third op, `process_self` (design 178 unit 2): §3's derivation rule made real, so the boot register stays ONE handle wide and a process obtains its Process object THROUGH the System handle rather than being handed it. It was gated on the generic `Manage` until M3 unit 3 gave it `SystemRight.ProcessSelf` — a bit named for its op, per the Aug-29 doctrine, and a real attenuation seam: strip it and a child may print and tell the time and never learn its own identity. M3 added `clock_get` on `SystemRight.ClockGet` (design 232 unit 1: time is a granted capability) and, by sawos design 2's RIDER (Aug 29), `process_create` on `SystemRight.ProcessCreate` — the object's one FACTORY, here because a process is machine-wide and only this object is (§12's amended creation-authority note); `process_self` was already the precedent, since a Process handle has always come out of this object. **M3 unit 3 gave this object the launch flow's pivot** (sawos design 4, Aug-29 rulings): `root_system_rights()` gained `Transfer` — the M2 "nobody to transfer to" reason expired when unit 2 made a second process — so a launcher MINTS a masked sibling of its System handle (`MINT_OP`, §3) and GIVES that to a child. A child therefore bootstraps exactly as root does (§12's symmetry): System in the first argument register, its own Process handle derived from it, its boot set drained from there. `Debug` in the mask is what lets a child print without owning a device; `Shutdown` left out is what stops it halting the machine. Later candidates: info queries. |
 
-**Nine of these kinds exist today** — System, Process, Thread, Event, Waiter,
-Interrupt, Clock, Timer and (since M3 unit 2) MemoryObject in its first slice
-(`ObjType`, `sos/kernel/abi/`, the kernel-internal numbering §5.7's vDSO
-discipline keeps renumberable). The other rows are unbuilt: Pipe is M4, and
-Mapping is M3 unit 4 — which is also where MemoryObject stops being a sealed
-pair. **AddressSpace is still implicit, and is now implicit for TWO processes**:
-each gets one granted range plus a writable window, and its protection rows are
-recorded in its process slot and REPLAYED by the scheduler when it switches in
-(sawos design 2 D-5). That record is what an AddressSpace object would own if
-one existed; nothing above it would change if it did. §11 is the ledger.
+**Eleven of these kinds exist today** — System, Process, Thread, Event, Waiter,
+Interrupt, Clock, Timer, MemoryObject (M3 unit 2) and, since M3 unit 4,
+IoMemoryObject and Mapping (`ObjType`, `sos/kernel/abi/`, the kernel-internal
+numbering §5.7's vDSO discipline keeps renumberable). **PIPE IS THE ONE ROW
+LEFT**, and it is M4's.
+
+**AddressSpace is still implicit, and unit 4 is what makes the absence
+deliberate rather than pending.** Each process gets one granted range plus a
+writable window, and its protection rows are recorded in its process slot and
+REPLAYED by the scheduler when it switches in (sawos design 2 D-5). That record
+is what an AddressSpace object would own if one existed — and a `Mapping` is now
+a handle onto ONE ROW OF IT, which is the shape that would have needed the
+object most. It did not: `map` names a target PROCESS, because §5b says the
+domain IS the process on both profiles, so an AddressSpace object would be a
+second name for a thing every op already has. Nothing above it would change if
+it existed. §11 is the ledger.
 
 ### 2.1 Pipes: bounded messages + built-in request/reply (ratified Jul 29;
 ### renamed from Channels + client API amended Aug 20)
@@ -266,23 +274,76 @@ reply it is about to discard.
 
 ### 2.5 Memory: MemoryObject vs Mapping (ratified Jul 29)
 
-**BUILT M3 unit 2, THE FIRST SLICE** (sawos design 2 D-2), and what was built is
-deliberately the smallest useful part of it: a MemoryObject is a SEALED
-`{base, len}` — no pool, no derivation, no `map()`, no attribute, no ops. It is
-minted only at boot, one per row of a build-emitted region table, and its whole
-surface is being NAMED as an argument to `process_create`. These are exactly
+**BUILT M3 unit 2 (the first slice) AND M3 unit 4 (the rest of it)** — sawos
+designs 2 D-2 and 6. Everything this section describes exists now except the
+refcount, and the refcount's absence is stated below in the clause's own words.
+
+**WHAT UNIT 2 BUILT** was deliberately the smallest useful part: a MemoryObject
+was a SEALED `{base, len}` — no pool, no derivation, no `map()`, no attribute,
+no ops — minted only at boot, one per row of a build-emitted region table, its
+whole surface being NAMED as an argument to `process_create`. Those were exactly
 this section's "**pool roots given to the root server at boot**" in a v1 static
-form, which is why nothing below is contradicted by them: the pools, the
-attribute that travels with the handle, the derivation and the Mapping object
-are unit 4's, and every one of them is ADDITIVE over what exists. The one thing
-the slice does settle is that a region is a CAPABILITY rather than a
-description: there is no op that reads a MemoryObject's bounds, so a process
-that holds one can hand it to the kernel and cannot learn a number from it.
-The migration case below stays exactly as written — M2's boot-time device grant
-is still a `sosimg` record, because a child image is REFUSED one (design 2 D-7:
-a boot-time image-declared window is a statement about the one process the
-kernel loads, and generalizing a placeholder would outlive it). The echo-driver
-money shot rides unit 4's IoMemory, not this slice.
+form. The one thing the slice settled is the one thing unit 4 kept: a region is
+a CAPABILITY rather than a description, so there is STILL no op that reads a
+MemoryObject's bounds and a process that holds one can hand it to the kernel and
+cannot learn a number from it. What a process knows about where its memory IS,
+it knows from the config that gave it the region — which is what root's
+tag-to-meaning config has always been, and where the uart-echo driver's
+`UART_BASE` has always come from.
+
+**WHAT UNIT 4 BUILT, point by point against the bullets below** (sawos design 6):
+
+- **THE POOL ATTRIBUTE BECAME A KIND.** A RAM pool root is a `MemoryObject` and
+  a device pool root is an `IoMemoryObject`, decided by a KIND COLUMN in the
+  build-emitted region table (design 6 D-5, table version 2). Design 46's intent
+  marker is therefore not a flag anybody checks: an IoMemory's `map` takes no
+  access argument and installs a device-attribute row, and there is no other op
+  on the kind, so "a Device MemoryObject can only produce Device mappings"
+  holds BY CONSTRUCTION. The attribute travels with the handle because the
+  attribute IS the handle's kind.
+- **UNIQUE-VS-SHARED ALLOCATION BECAME TWO VERBS.** `MemoryObject.split(len)` is
+  ONE CUT FROM THE FRONT and the parent becomes the remainder — allocation is
+  repeated front-splits and the parent IS the pool cursor, so a piece is
+  allocated once and unavailable until freed. `IoMemoryObject.carve(offset, len)`
+  leaves the parent WHOLE, which is this section's "a fixed region may be handed
+  out many times", and the window is never freed because MMIO is pinned.
+- **`map(aspace, ...) -> Mapping` IS BUILT, and `aspace` is a PROCESS.** §5b
+  says the domain IS the process on both profiles, so the argument names the
+  process rather than an object that would be a second name for it. It answers
+  with a distinct kernel object with its own handle, and ONLY THE MAPPING HANDLE
+  CAN UNMAP.
+- **THE DELIBERATE STANCE HOLDS AND IS NOW FREE.** Dropping a Mapping handle
+  without unmapping means that mapping is permanent — safe-but-leaked, never a
+  dangling-unmap hazard — and it costs no new rule: release destroys a TABLE
+  ENTRY and never an object (design 3 D-2), so the stance falls out of doctrine
+  that predates it. **The Deinit-unmaps-at-scope-exit half is NOT built**, and
+  the reason is the shape unit 4 exists for: a launcher that maps a page into a
+  child holds the Mapping in a local, and a scope-exit unmap would revoke the
+  page before the child ever ran. Tying the row's lifetime to a wrapper wants
+  the refcount immediately below, which is unit 5's.
+- **THE REFCOUNT INVARIANT IS NOT BUILT, AND THE CLAUSE IS QUOTED HERE SO THE
+  DEFERRAL IS VISIBLE**: "*a Mapping holds a reference to the physical pages (not
+  merely to a MemoryObject handle). The pages are freed only when the LAST
+  reference of either kind — any MemoryObject handle OR any Mapping — drops.*"
+  Nothing in unit 4 frees pages at all: a split is PERMANENT until its owner's
+  teardown, and teardown returns slab SLOTS rather than ranges, so a pool walked
+  to its end stays walked and `NoResource` is what says so (the `memory_split`
+  case asserts exactly that). Free-on-last-reference lands with unit 5, beside
+  quotas, which is where a refcount has something to be checked against.
+
+**THE MIGRATION CASE BELOW CAME TRUE** (design 6 D-6). M2's boot-time device
+grant was a `sosimg` record a driver package declared in its manifest; both
+driver packages now receive the console's register page as an `IoMemory`
+capability in their boot set and map it into themselves, and the echoed bytes
+and the line number in their transcripts are UNCHANGED. That is the migration's
+own claim — "the same window, obtained rather than declared" — as a diff of two
+console transcripts. What has NOT retired is the `SegFlag.Device` flag itself
+and the boot loader's `allow_device: true` door: the emitter is sawlang-side
+(`blade/sosimg.saw`), so deleting the flag is a pin-bump event. The path is
+DORMANT — no image in this tree uses it — and its retirement is a backlog entry.
+Children still cannot declare windows (`allow_device: false`, unchanged); a
+driver child gets its window because root MAPS it in or GIVES it a carved
+IoMemory, which is unit 6's flow.
 
 - **`MemoryObject`** = authority over a physical page range, allocated
   **from a typed pool** (ratified Jul 29). The pool's attribute governs
@@ -306,7 +367,8 @@ money shot rides unit 4's IoMemory, not this slice.
     Mapping adds is what that placeholder lacks — a handle, a derivation,
     an op that installs it, and a close that revokes it — so the migration
     is "the same window, obtained rather than declared", and the M2 code
-    says so where the check is.
+    says so where the check is. **DONE M3 unit 4** (sawos design 6 D-6):
+    both driver packages migrated, same echoed bytes, same line number.
 - Sendable over pipes — so the SAME physical memory can be mapped
   into multiple address spaces at multiple virtual locations (the
   shared-memory primitive). Derived by splitting / attenuating a
@@ -484,7 +546,7 @@ money shot rides unit 4's IoMemory, not this slice.
   slot; it unbinds the entry, bumps the generation and NEVER touches the
   object. Releasing a word that does not resolve — `NO_HANDLE`, a
   malformed word, a stale one, a second release — is the ordinary
-  `BadHandle` fault. In Saw it is automatic: all nine `sos` wrappers are
+  `BadHandle` fault. In Saw it is automatic: every `sos` wrapper is
   `NoCopy` with a `deinit` that releases, so DROP IS RELEASE and there is
   no typed `release()` method to write. CLOSE — ending the OBJECT for
   everyone — is still unbuilt: it is object-protocol, exists only on kinds
@@ -512,7 +574,7 @@ money shot rides unit 4's IoMemory, not this slice.
   words; the export whitelist is primitives), and the kernel handle
   TABLE indexes by word. This is TIER ONE (kind safety) of two, and
   **TIER TWO IS BUILT** (sawos design 3 D-5, M3 unit 2.75; the Aug-29
-  drop-is-release ruling). All nine wrappers are `NoCopy` structs over the
+  drop-is-release ruling). Every wrapper is a `NoCopy` struct over the
   aliases with a hand-written `deinit` that releases the word — the
   TcpStream pattern, and §3's no-DUPLICATE rule is its exact `NoCopy`
   correspondence — so the alias became the payload and nothing written
@@ -1218,11 +1280,12 @@ event-driven EDGE of a process gets a second, distinct construct:
   `sos/hal/<arch>/kernel/` over per-type static slabs; the `sosimg`
   header is concrete at v3, the §7 priority-map field included.
 - **Orchestrator pins STILL OPEN:** where the physical-region refcount
-  lives (§5.9), which nothing can answer until something allocates
-  physical regions; §2.1's message limits (pinned 64-byte body / 4
-  handles, unbuilt with the Pipe); and the §7 priority map plus root's
-  bootstrap band map, which the loader parses and REPORTS while no
-  Process slot stores either.
+  lives (§5.9) — M3 unit 4 made something ALLOCATE physical regions
+  (`Memory.Split`) without answering it, deliberately: free-on-last-reference
+  is unit 5's, so the question now has a caller and still no home; §2.1's
+  message limits (pinned 64-byte body / 4 handles, unbuilt with the Pipe);
+  and the §7 priority map plus root's bootstrap band map, which the loader
+  parses and REPORTS while no Process slot stores either.
 - **What the kernel does NOT have after M2.** One area per line, with the
   section that specifies it; design 232 is the M3 plan of record and is
   pointed at rather than duplicated.
@@ -1262,14 +1325,28 @@ event-driven EDGE of a process gets a second, distinct construct:
     today, a ruling for the unit that gives a child a pipe); and dynamic
     transfer to a RUNNING process is M4 IPC's, over pipes, to a receiver
     expecting it.
-  - **Memory / IoMemory / MemoryMapping and `map()`** (§2.5) — the FIRST
-    SLICE is built (sawos design 2 D-2): a sealed `{base, len}` MemoryObject,
-    minted only at boot from a build-emitted region table, delivered through
-    `BootHandleNext` and NAMED as `process_create`'s two arguments. What is
-    still absent is everything that makes it a memory SYSTEM — pools, the
-    attribute that travels with a handle, derivation, `map()` and the Mapping
-    object — and the M2 device grant is still the declared placeholder that
-    surface retires (a child image is refused one outright). Design 232 unit 4.
+  - ~~**Memory / IoMemory / Mapping and `map()`**~~ (§2.5) **BUILT by sawos
+    design 6 (M3 unit 4)**, over unit 2's first slice. **A MAPPING IS AN
+    INSTALLED GRANT ROW**, which is what the unit costs so little: SOS does
+    not translate (§5.5), so the grant record M3 unit 2 built for the
+    SCHEDULER is the record `map` edits and the object is a handle onto one
+    row of it. Three kinds because the operations differ — `Memory`
+    (`Split`/`Map`), `IoMemory` (`Carve`/`Map`, a distinct KIND so a device
+    region cannot produce a cacheable mapping by construction), `Mapping`
+    (`Unmap`, and only it unmaps). Derivation is one cut FROM THE FRONT for
+    RAM (the parent is the pool cursor; arbitrary-offset carving is refused by
+    the SHAPE) and non-exclusive for device windows (§2.5's "handed out many
+    times"). Access is PER MAPPING, so double-mapping one region RO here and
+    RW there is expressible and allowed. **THE LIVE-DOMAIN RULE** is the one
+    piece of law the unit added: a grant-record edit reloads IMMEDIATELY when
+    that domain is the installed one, because `run_thread` skips equal domains
+    and a revocation that waited for a reschedule would not revoke. The M2
+    device-grant placeholder is RETIRED IN-TREE — both driver packages obtain
+    their window instead of declaring it, same bytes, same line number — with
+    the sawlang-side `SegFlag.Device` deletion left as a pin-bump backlog
+    entry. What is still absent is stated at §2.5 in the refcount clause's own
+    words: FREE-ON-LAST-REFERENCE, which is unit 5's beside quotas. A split is
+    permanent until teardown and teardown returns SLOTS, not ranges.
   - **Quotas** (§12's creation-authority pin, which M2 ANSWERED with a
     factory-capability rights bit rather than a quota) — the per-process
     table, `QuotaExceeded`, and creator-pays accounting are design 232
@@ -1284,8 +1361,8 @@ event-driven EDGE of a process gets a second, distinct construct:
     one UNIVERSAL `RELEASE_OP` intercepted between the table lookup and
     the kind match; a split handle word carrying a per-slot GENERATION
     that survives the unbind, so §3's stale-handle detection is real; every
-    getter MINTING a fresh handle; §4's owning `NoCopy` tier over all nine
-    wrappers, so DROP IS RELEASE; and one slab reclaiming on release — a
+    getter MINTING a fresh handle; §4's owning `NoCopy` tier over every
+    wrapper, so DROP IS RELEASE; and one slab reclaiming on release — a
     `Gone` process's slot, once no handle names it (closing unit 2's pend
     at `alloc_process`, so `MAX_PROCESSES` bounds CONCURRENT processes
     again). What is STILL absent is CLOSE, which is a different act: it
@@ -1625,6 +1702,19 @@ event-driven EDGE of a process gets a second, distinct construct:
   window arrives in its own image (§2.5), not in the boot set. Both
   become real objects in M3, and neither widens the register the kernel
   enters user mode with.
+  **AND THE POOL ROOTS ARE DELIVERED (M3 unit 4, sawos design 6 D-5).**
+  This bullet's "root MemoryObjects — the RAM pool root and the
+  device-range roots" now exist as written: the build-emitted region
+  table carries a KIND COLUMN, a Ram row mints a `MemoryObject` and a
+  Device row an `IoMemoryObject`, and both arrive through
+  `BootHandleNext` under their row ordinal. **THE SET IS STILL ONE
+  HANDLE WIDE AT THE REGISTER** — pool roots are COLLECTED, not passed,
+  which is the property that has survived every kind added to the set —
+  and the DEVICE ROOT is what retires the M2 "arrives in its own image"
+  clause above: a driver now obtains its window instead of declaring it,
+  which is what makes handing one to a driver CHILD possible at all.
+  What the kernel still assigns no meaning to is which ordinal is which;
+  that is root's config, exactly as it has been since unit 2.
   NOTE (object-model brief material): the creation-authority model for
   plain objects (Pipe/Event/Waiter/Timer) — quota-gated free
   creation vs a factory capability — is an open pin; M1 does not need

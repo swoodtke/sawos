@@ -1,0 +1,31 @@
+[package]
+name = "map-into-child"
+version = "0.1.0"
+
+runtime = true
+
+# M3 UNIT 4 ACROSS A PROCESS BOUNDARY (sawos design 6 D-3): a launcher maps a
+# region into a child it has CREATED but not started, and the child touches
+# memory its image never declared.
+#
+# **A MAPPING IS NOT A BOOT RECORD**, which is what makes this legal before
+# `start`: the give-freeze (§12's "the boot set freezes at start") governs
+# HANDLES arriving in the child's table, and a protection row is not one. Both
+# orderings work; mapping first is what a launcher would do.
+[dependencies]
+sos = { path = "../../kernel/sysapi" }
+
+[sos]
+emit = "sosimg"
+priorities = { background = 0, low = 1, normal = 1, high = 1 }
+
+# `poolbase_<arch>.c` is WHERE THE POOL IS — see `tests/poolbase_riscv32.c`.
+# The child package names the same file, which is the two halves of one config
+# agreeing about an address the kernel never interprets.
+[sos.riscv32-unknown-none-elf]
+linker-script = "../../hal/riscv32/user/root.ld"
+native = "../../hal/riscv32/user/syscall.c ../../rt/common_c/support.c ../poolbase_riscv32.c"
+
+[sos.aarch64-unknown-none-elf]
+linker-script = "../../hal/arm64/user/root.ld"
+native = "../../hal/arm64/user/syscall.c ../../rt/common_c/support.c ../poolbase_arm64.c"

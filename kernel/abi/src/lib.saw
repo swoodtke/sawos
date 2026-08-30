@@ -81,20 +81,62 @@ public enum ObjType: UInt8 {
     case Interrupt = 6,
     case Clock = 7,
     case Timer = 8,
-    /// A sealed range of physical memory (spec §2.5; sawos design 2 D-2).
+    /// RAM AUTHORITY — a range of physical memory, derived by `Split` and
+    /// installed by `Map` (spec §2.5; sawos design 2 D-2, grown by design 6).
     ///
-    /// THE FIRST SLICE OF §2.5's OBJECT, and deliberately the smallest one that
-    /// is useful: a Memory is `{base, len}` and NOTHING ELSE — no pools, no
-    /// derivation, no `map()`, no attributes. It is minted only at boot, one
-    /// per row of the build-emitted region table, and its whole surface is
-    /// being NAMED: `process_create` takes two of them (the image blob and the
-    /// child's destination RAM) and reads their bounds. There is no `MemoryOp`
-    /// table, so an op aimed at one is a `BadOp` fault.
+    /// **UNIT 2 BUILT THE FIRST SLICE AND UNIT 4 BUILT THE REST, WITHOUT
+    /// MOVING THIS ROW** — which is what the slice was shaped to make true.
+    /// M3 unit 2's Memory was `{base, len}` and NOTHING ELSE: no pools, no
+    /// derivation, no `map()`, no attributes and NO OP TABLE, minted only at
+    /// boot from the build-emitted region table and NAMED as the two arguments
+    /// of `process_create`. Design 6 gave it two ops, two rights and a slab a
+    /// process spends THROUGH, and the number, the handle type and every
+    /// existing caller stayed exactly as they were.
     ///
-    /// §2.5 is not contradicted, it is STARTED: these are the "pool roots given
-    /// to the root server at boot" in their v1 static form, and unit 4 adds the
-    /// pools, the derivation and the mapping ops on top without moving this.
+    /// §2.5 was never contradicted, only STARTED: unit 2's boot regions are
+    /// that section's "pool roots given to the root server at boot", and unit
+    /// 4 added the pools, the derivation and the mapping on top. What it did
+    /// NOT add is a bounds reader — a region is still a CAPABILITY rather than
+    /// a description, which is the one property of the slice that was load
+    /// -bearing rather than provisional.
     case Memory = 9,
+    /// DEVICE AUTHORITY — a range of memory-mapped registers (spec §2.5;
+    /// sawos design 6 D-1).
+    ///
+    /// **A DISTINCT KIND, NOT A FLAG ON `Memory`**, and the reason is that
+    /// every question about it answers differently. §2.5's pool ATTRIBUTE is
+    /// design 46's intent marker, and making it a KIND is what turns "a Device
+    /// MemoryObject can only produce Device mappings" from a rule somebody
+    /// checks into a fact of the type system: an IoMemory's `Map` installs a
+    /// device-attribute row and there is no other op on it that could install
+    /// anything else, so a driver cannot get a cacheable view of a register
+    /// block BY CONSTRUCTION.
+    ///
+    /// The lifecycle differs everywhere too, which is the other half: it is
+    /// PINNED (never freed — MMIO is not memory that can be reclaimed), it is
+    /// carved NON-EXCLUSIVELY (§2.5: "a fixed region may be handed out many
+    /// times", so several drivers may hold windows onto one peripheral), and
+    /// it has no contents — an image never carries bytes for it.
+    ///
+    /// ONE DISPATCH ARM IS THE ENTIRE COST, and what it retires is every
+    /// flag-check the M2 device-grant placeholder scattered (`check_device_grant`
+    /// in `kcore.loader`, `SegFlag.Device` in `imgformat`).
+    case IoMemory = 10,
+    /// ONE INSTALLED PROTECTION ROW, with its own handle (spec §2.5; sawos
+    /// design 6 D-1).
+    ///
+    /// **A MAPPING IS AN INSTALLED GRANT ROW.** That is the whole of it on a
+    /// no-translation machine (spec §5.5: an address is the same number in
+    /// every process), so this object records WHICH process's domain carries
+    /// the row and WHICH row it is — not a virtual placement, because there is
+    /// no virtual to place at.
+    ///
+    /// **ONLY A MAPPING UNMAPS** (§2.5), which is what the object is for.
+    /// Releasing a Mapping HANDLE frees the table entry and never the row —
+    /// the entries-never-touch-objects rule (design 3 D-2), which is what
+    /// makes §2.5's "dropped without unmap = permanent, safe-but-leaked" fall
+    /// out of existing doctrine rather than being new law.
+    case Mapping = 11,
 }
 
 // WHICH KINDS ARE WAITABLE is deliberately NOT recorded here (§2.2). It cannot
@@ -125,7 +167,7 @@ public enum ObjType: UInt8 {
 /// and the export whitelist is primitives; the handle TABLE indexes by word too.
 ///
 /// This is TIER ONE of two — kind safety. TIER TWO, the OWNING tier, IS BUILT
-/// (sawos design 3, M3 unit 2.75): `kernel/sysapi`'s nine wrappers are `NoCopy`
+/// (sawos design 3, M3 unit 2.75): every `kernel/sysapi` wrapper is a `NoCopy`
 /// structs over these aliases whose `deinit` releases the word, so DROP IS
 /// RELEASE and §3's no-DUPLICATE rule has its exact `NoCopy` correspondence.
 /// The alias became the payload and nothing written against it changed, which
@@ -189,6 +231,14 @@ public type TimerHandle = UInt
 /// A handle naming a Memory object (spec §2.5; sawos design 2 D-2) — a sealed
 /// range of physical memory. Same discipline again.
 public type MemoryHandle = UInt
+
+/// A handle naming an IoMemory object (spec §2.5; sawos design 6 D-1) — a
+/// range of device registers. Same discipline again.
+public type IoMemoryHandle = UInt
+
+/// A handle naming a Mapping object (spec §2.5; sawos design 6 D-1) — one
+/// installed protection row. Same discipline again.
+public type MappingHandle = UInt
 
 /// A handle word the table can never hand out. Handle 0 names nothing, so a
 /// zeroed register is never authority (see `ObjType.Unbound`).
@@ -487,6 +537,20 @@ static_assert((SystemRight.ProcessSelf as UInt32) >= (1 << 8),
 /// ordinary one. In M2 root holds it because root is the only process there is;
 /// M3's launcher strips it from everything it spawns except the drivers, which
 /// is §3's monotonic attenuation doing exactly what it is for.
+/// **`Map` IS THE UNIT-4 BIT, AND IT IS AN AUTHORITY OVER *THIS* PROCESS**
+/// (sawos design 6 D-3). `Memory.Map` / `IoMemory.Map` name a target Process as
+/// their argument, and installing a protection row into somebody's domain is
+/// not something possession of a region should imply — the doctrine, again: no
+/// possession-implies-authority. So a map spends TWO rights on two different
+/// objects, `MemoryRight.Map` on the region and this bit on the process being
+/// mapped into, and a launcher that hands a child a region without this bit on
+/// the child's handle has handed over bytes it cannot install anywhere.
+///
+/// It sits beside `Give` for the same reason `Give` sits beside `Start`: they
+/// are separable authorities over one child. A builder that may furnish a
+/// child's boot set need not be allowed to edit its address space, and a
+/// supervisor that may run and watch need not be allowed either.
+///
 /// **`Give` IS ITS OWN BIT** (M3 unit 3, as amended by the Aug-29 doctrine). An
 /// earlier cut of this unit gated the courier op on `Manage`, arguing that
 /// furnishing a process you created is management OF it; the doctrine refused
@@ -509,6 +573,7 @@ public enum ProcessRight: UInt32 {
     case BootHandles = 1 << 15,
     case ThreadSelf = 1 << 16,
     case Give = 1 << 17,
+    case Map = 1 << 18,
 }
 
 static_assert((ProcessRight.Transfer as UInt32) == (1 << 0),
@@ -535,6 +600,8 @@ static_assert((ProcessRight.ThreadSelf as UInt32) >= (1 << 8),
               "kind-specific right ThreadSelf must start at bit 8 or above")
 static_assert((ProcessRight.Give as UInt32) >= (1 << 8),
               "kind-specific right Give must start at bit 8 or above")
+static_assert((ProcessRight.Map as UInt32) >= (1 << 8),
+              "kind-specific right Map must start at bit 8 or above")
 
 /// A right on a Thread object (§2 table row; design 178 D4).
 ///
@@ -732,34 +799,113 @@ static_assert((TimerRight.Arm as UInt32) >= (1 << 8),
 static_assert((TimerRight.Wait as UInt32) >= (1 << 8),
               "kind-specific right Wait must start at bit 8 or above")
 
-/// A right on a Memory object (spec §2.5; sawos design 2 D-2).
+/// A right on a Memory object (spec §2.5; sawos design 2 D-2, grown by design
+/// 6 D-2/D-3).
 ///
-/// **THE UNIVERSAL LOW BYTE AND NOTHING ELSE**, which is the honest surface for
-/// an object whose whole v1 API is being NAMED. `Transfer` is unit 3's `give` —
-/// a region is exactly the kind of thing a launcher hands to a child — and
-/// `Mint` is unit 3's attenuated sibling. Unit 4's pools and sub-ranges get a
-/// SPECIFIC bit of their own when they arrive, per the Aug-29 doctrine, rather
-/// than borrowing a generic one (`Manage` sat here for exactly that borrowed
-/// purpose, and is gone). Neither is READ by anything in this unit: `process_create`'s authority is
-/// `SystemRight.ProcessCreate` on the caller's System handle (design 2's
-/// RIDER), and the two Memory handles are its ARGUMENTS rather than a second
-/// authority (see the op body). They are minted now rather than withheld
-/// because attenuation is monotonic: a bit not minted at boot could never
-/// appear later, and both are bits the boot region roots must have for units 3
-/// and 4 to be additive.
+/// `Transfer` is unit 3's `give` — a region is exactly the kind of thing a
+/// launcher hands to a child — and `Mint` is unit 3's attenuated sibling. Both
+/// were minted at boot before anything read either, because attenuation is
+/// monotonic: a bit not minted at boot could never appear later.
 ///
-/// There is deliberately NO `Read`/`Write` pair. Those are properties of a
-/// MAPPING (§2.5's `map(access:)`), not of the region, and inventing them here
-/// would give unit 4 two places to say what a process may do with memory.
+/// **THE TWO UNIT-4 BITS ARE NAMED FOR THEIR OPS**, per the Aug-29 doctrine —
+/// which is exactly what unit 2's docstring promised would happen here instead
+/// of a generic `Manage` (the bit that used to sit at 1 << 1 for that borrowed
+/// purpose, and is gone):
+///
+///   - `Split` is the authority to DERIVE — one cut from the front, the parent
+///     becoming the remainder. A pool root a launcher hands out with this bit
+///     withheld is a fixed range and nothing else, which is the honest way to
+///     say "here is your RAM, you may not subdivide it for anyone".
+///   - `Map` is the authority to INSTALL this region in some domain. It is
+///     half of what a map spends: `ProcessRight.Map` on the target process is
+///     the other half, because possession of bytes must not imply authority
+///     over an address space.
+///
+/// There is STILL deliberately NO `Read`/`Write` pair, and unit 4 is what makes
+/// the reason visible rather than merely stated: access is a property of the
+/// MAPPING (`map(access:)`), which is precisely what lets one region be mapped
+/// read-only in one place and read-write in another. Rights on the region could
+/// not express that without becoming per-mapping, at which point they would be
+/// the mapping's.
 public enum MemoryRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
+    case Split = 1 << 8,
+    case Map = 1 << 9,
 }
 
 static_assert((MemoryRight.Transfer as UInt32) == (1 << 0),
               "universal right Transfer must be bit 0 in every kind's enum")
 static_assert((MemoryRight.Mint as UInt32) == (1 << 1),
               "universal right Mint must be bit 1 in every kind's enum")
+static_assert((MemoryRight.Split as UInt32) >= (1 << 8),
+              "kind-specific right Split must start at bit 8 or above")
+static_assert((MemoryRight.Map as UInt32) >= (1 << 8),
+              "kind-specific right Map must start at bit 8 or above")
+
+/// A right on an IoMemory object (spec §2.5; sawos design 6 D-1/D-2).
+///
+/// **THE SAME TWO SHAPES AS `MemoryRight`, WITH THE DERIVATION VERB CHANGED**,
+/// and the change of verb is the whole difference between the kinds. `Carve`
+/// takes a sub-window and LEAVES THE PARENT ALONE — §2.5's "a fixed region may
+/// be handed out many times" — where `Split` consumes what it hands out. There
+/// is no bit that means both, because a holder of one authority is not a holder
+/// of the other: a driver handed a carve right over a peripheral's window can
+/// produce views for its own sub-devices without ever being able to take a
+/// range away from anyone.
+///
+/// `Map` means what it means on a Memory and spends the same second right
+/// (`ProcessRight.Map`) on the target. What differs is not the authority but the
+/// ROW it installs: an IoMemory can only ever produce a device-attribute row,
+/// which is the type-level guarantee `ObjType.IoMemory` exists for.
+///
+/// `Transfer` is here because handing a driver its window is the whole point of
+/// unit 6's flow, and `Mint` on the uniform lean the default-sets section
+/// records.
+public enum IoMemoryRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Mint = 1 << 1,
+    case Carve = 1 << 8,
+    case Map = 1 << 9,
+}
+
+static_assert((IoMemoryRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((IoMemoryRight.Mint as UInt32) == (1 << 1),
+              "universal right Mint must be bit 1 in every kind's enum")
+static_assert((IoMemoryRight.Carve as UInt32) >= (1 << 8),
+              "kind-specific right Carve must start at bit 8 or above")
+static_assert((IoMemoryRight.Map as UInt32) >= (1 << 8),
+              "kind-specific right Map must start at bit 8 or above")
+
+/// A right on a Mapping object (spec §2.5; sawos design 6 D-1/D-3).
+///
+/// **ONE KIND-SPECIFIC BIT, BECAUSE THE OBJECT HAS ONE OP.** `Unmap` is the
+/// authority to take the row out, and §2.5's "only the Mapping handle can
+/// unmap" is what makes holding one meaningful at all.
+///
+/// **`Transfer` IS DECLARED AND NEVER MINTED**, which is the one thing worth
+/// reading here. The bit exists because the universal low byte is pinned in
+/// every kind's enum by the asserts below — that repetition IS the check — but
+/// `mapping_rights()` does not grant it, so a Mapping cannot be given and
+/// `BootHandleKind` has no case for one. The reason is the object's own
+/// meaning: a Mapping names a row in a SPECIFIC process's domain, so handing
+/// one to a third party would be handing over the power to edit an address
+/// space that party was never given authority over. Revocation across a
+/// process boundary is a supervision story, and it wants a ruling rather than a
+/// bit granted by default.
+public enum MappingRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Mint = 1 << 1,
+    case Unmap = 1 << 8,
+}
+
+static_assert((MappingRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((MappingRight.Mint as UInt32) == (1 << 1),
+              "universal right Mint must be bit 1 in every kind's enum")
+static_assert((MappingRight.Unmap as UInt32) >= (1 << 8),
+              "kind-specific right Unmap must start at bit 8 or above")
 
 /// Whether a rights word carries the UNIVERSAL `Transfer` bit (§3's low byte).
 ///
@@ -784,7 +930,7 @@ public func rights_allow_transfer(rights: UInt32) -> Bool {
 /// The same shape and the same reasoning as `rights_allow_transfer` above:
 /// `MINT_OP` is intercepted BEFORE the kind match, so the check has the entry and
 /// not the kind and a typed `allows` cannot be written there. `SystemRight.Mint`
-/// is the spelling and any kind's would do — the `static_assert`s pin all nine to
+/// is the spelling and any kind's would do — the `static_assert`s pin every kind to
 /// bit 2.
 public func rights_allow_mint(rights: UInt32) -> Bool {
     (rights & (SystemRight.Mint as UInt32)) != 0
@@ -888,8 +1034,8 @@ public func root_system_rights() -> UInt32 {
 ///
 /// WHAT IS IN IT, all of it named for the op it gates: `ThreadCreate`,
 /// `ThreadSelf`, `Exit`, `Wait`, `EventCreate`, `WaiterCreate`, `InterruptBind`,
-/// `Start`, `BootHandles`, `Give`, plus the two universal bits `Transfer` and
-/// `Mint`.
+/// `Start`, `BootHandles`, `Give`, `Map` (M3 unit 4), plus the two universal
+/// bits `Transfer` and `Mint`.
 ///
 /// TWO BITS READ ODDLY ON ROOT'S OWN HANDLE and are harmless there, which is the
 /// price of one list. `Start` on a process that is already `Running` is the
@@ -910,17 +1056,51 @@ public func process_rights() -> UInt32 {
      | (ProcessRight.InterruptBind as UInt32)
      | (ProcessRight.Start as UInt32)
      | (ProcessRight.BootHandles as UInt32) | (ProcessRight.Give as UInt32)
+     | (ProcessRight.Map as UInt32)
      | (ProcessRight.Transfer as UInt32) | (ProcessRight.Mint as UInt32))
 }
 
-/// What the kernel mints for a Memory region at boot (spec §2.5).
+/// What the kernel mints for a Memory region — a boot RAM-pool root, and every
+/// region a `Split` derives from one (spec §2.5).
 ///
-/// The universal pair, for the reason `MemoryRight` states: a boot region root
-/// is the thing this unit gives away and narrows, and attenuation runs one way
-/// only. A Memory has no kind-specific right yet — unit 4's pools and mappings
-/// are what earn it one, named for the op, per the Aug-29 doctrine.
+/// **ONE SET, TWO MINTERS, on `process_rights()`'s precedent** (sawos design 6
+/// D-2). A boot root and a split child carry the same four bits, because a
+/// split is a DERIVATION and §3 makes derivation monotonic: a caller that wants
+/// a narrower child mints an attenuated sibling of it (`MINT_OP`) and hands
+/// THAT on. Two default sets here would be a second place to forget a bit, and
+/// would silently make "the second cut of a pool" less capable than the first.
+///
+/// The unit-2 docstring's promise is kept exactly: the two kind-specific bits
+/// are named for the ops they gate (`Split`, `Map`), per the Aug-29 doctrine,
+/// rather than a generic authority.
 public func memory_rights() -> UInt32 {
-    ((MemoryRight.Transfer as UInt32) | (MemoryRight.Mint as UInt32))
+    ((MemoryRight.Transfer as UInt32) | (MemoryRight.Mint as UInt32)
+     | (MemoryRight.Split as UInt32) | (MemoryRight.Map as UInt32))
+}
+
+/// What the kernel mints for an IoMemory window — a boot DEVICE-pool root, and
+/// every window a `Carve` derives from one (spec §2.5; sawos design 6 D-1).
+///
+/// The same one-set-two-minters shape `memory_rights` has, and for the same
+/// reason. `Transfer` is what makes unit 6's flow possible — root hands a
+/// driver child its window — and it is minted at boot because attenuation only
+/// ever narrows.
+public func iomemory_rights() -> UInt32 {
+    ((IoMemoryRight.Transfer as UInt32) | (IoMemoryRight.Mint as UInt32)
+     | (IoMemoryRight.Carve as UInt32) | (IoMemoryRight.Map as UInt32))
+}
+
+/// What the kernel mints for a Mapping a process has just installed (spec
+/// §2.5; sawos design 6 D-3).
+///
+/// **`Transfer` IS ABSENT BY SILENCE**, which is the one thing this set says
+/// that the others do not: a Mapping names a row in one particular process's
+/// domain, so it is not a capability that travels. `MappingRight` records the
+/// argument. `Mint` is granted on the uniform lean the section above states —
+/// a second NAME for a mapping costs nothing and can itself be attenuated,
+/// which is how a holder hands out an un-unmappable reference to one.
+public func mapping_rights() -> UInt32 {
+    ((MappingRight.Unmap as UInt32) | (MappingRight.Mint as UInt32))
 }
 
 /// What the kernel mints for a thread's own handle — root's initial thread at
@@ -1397,6 +1577,106 @@ public enum TimerOp: UInt {
     case Disarm = 1,
 }
 
+// =============================================================================
+// The Memory object's op table (spec §2.5; sawos design 6 D-2, D-3)
+// =============================================================================
+
+/// A METHOD ID on a Memory object.
+///
+/// **TWO OPS: DERIVE, AND INSTALL.** They are the whole of what a RAM region is
+/// for, and neither reads it — there is still no op that hands back a Memory's
+/// bounds, so a region stays a CAPABILITY rather than a description (spec
+/// §2.5's slice-1 property, unchanged by growing a table).
+///
+/// **`Split` IS ONE CUT FROM THE FRONT** (design 6 D-2): `split(len)` mints a
+/// new Memory over `[base, base + len)` and THE PARENT BECOMES THE REMAINDER
+/// `[base + len, top)`. Allocation is repeated front-splits, so THE PARENT IS
+/// THE POOL CURSOR and a pool needs no second bookkeeping — every piece stays
+/// representable in the one `{base, len}` slot shape the object already has.
+///
+/// ARBITRARY-OFFSET CARVING IS REFUSED BY THE SHAPE, NOT BY A CHECK, and that
+/// is worth recording where the op is: a cut from the middle would fragment the
+/// parent into TWO remainders, and one slot cannot hold two ranges. So the
+/// restriction is not a rule somebody could relax without noticing — it is what
+/// the representation permits.
+///
+/// It is exclusive, which is the difference from `IoMemoryOp.Carve`: what a
+/// split hands out, the parent no longer has. Free-on-last-reference (§2.5's
+/// refcount clause) is UNIT 5's, so a split is permanent until teardown and
+/// teardown returns SLOTS rather than ranges. Stated, not hidden.
+///
+/// **`Map` INSTALLS THE REGION IN A DOMAIN** and answers with a Mapping handle
+/// to the caller. Its arguments are a target Process handle and the access bits
+/// (`MapAccess`), and it spends TWO rights on two objects — `MemoryRight.Map`
+/// here and `ProcessRight.Map` on the target — because possession of bytes must
+/// not imply authority over an address space.
+public enum MemoryOp: UInt {
+    case Split = 0,
+    case Map = 1,
+}
+
+// =============================================================================
+// The IoMemory object's op table (spec §2.5; sawos design 6 D-1, D-2, D-3)
+// =============================================================================
+
+/// A METHOD ID on an IoMemory object.
+///
+/// The same two shapes `MemoryOp` has, with the derivation verb changed — and
+/// the change is the kind's whole reason for existing.
+///
+/// **`Carve` LEAVES THE PARENT ALONE** (design 6 D-2): `carve(offset, len)`
+/// mints a sub-window over `[base + offset, base + offset + len)` and the
+/// parent is UNCHANGED. That is §2.5's "a fixed region may be handed out many
+/// times" — MMIO is pinned, so there is nothing to consume and several drivers
+/// may legitimately hold windows onto one peripheral.
+///
+/// **THE HARDWARE'S OWN GRANULARITY IS CHECKED AT THE CARVE**, against a
+/// per-profile HAL predicate, and violating it is a `BadArg` FAULT because the
+/// caller chose both numbers. One profile expresses a device window as a single
+/// naturally-aligned power-of-two protection entry, so `len` must be a power of
+/// two and the base a multiple of it; the other grants by page.
+///
+/// **CHECKING IT AT THE CARVE IS THE POINT, AND `Map` CHECKS IT AGAIN.** At the
+/// carve because that is where a caller chose the numbers, and a window that
+/// could never be installed anywhere is a capability that lies about itself —
+/// a refusal deferred to the map would arrive one op later than the mistake.
+/// At the map because of the ONE window a carve never saw: a boot ROOT, whose
+/// bounds came from the build's region table rather than from any caller. Two
+/// checks, two different things being distrusted.
+///
+/// **`Map` INSTALLS A DEVICE-ATTRIBUTE ROW, always**, which is the type-level
+/// guarantee `ObjType.IoMemory` exists for: there is no other op on this kind,
+/// so a cacheable view of a register block is unreachable by construction.
+/// Access is RW and fixed — execute-on-device is already refused vocabulary
+/// (registers are not instructions), and a write-only register block is not a
+/// grant either profile can express.
+public enum IoMemoryOp: UInt {
+    case Carve = 0,
+    case Map = 1,
+}
+
+// =============================================================================
+// The Mapping object's op table (spec §2.5; sawos design 6 D-3)
+// =============================================================================
+
+/// A METHOD ID on a Mapping object.
+///
+/// ONE OP, and the object is complete — the same claim `InterruptOp` makes.
+/// §2.5 gives a Mapping exactly one job: it is the thing that can UNMAP, and
+/// everything else about it (where the row is, what access it carries) was
+/// decided when it was installed and cannot be edited afterwards. A mapping
+/// whose access should change is a mapping that is unmapped and made again,
+/// which is one fewer op and no ambiguity about what a half-changed row means.
+///
+/// **UNMAP OF AN ALREADY-UNMAPPED MAPPING IS `BadState`** — caller-checkable,
+/// since the caller is the one that unmapped it. The same tag covers a mapping
+/// whose TARGET PROCESS has died: its row went with the domain, so there is
+/// nothing left to remove, and "this object is not in a state to do that" is
+/// exactly what happened.
+public enum MappingOp: UInt {
+    case Unmap = 0,
+}
+
 // EVERY OP TABLE IS DENSE FROM ZERO, AND STAYS BELOW THE UNIVERSAL OPS (design
 // 3 D-2, widened by design 4's `MINT_OP`). That is what makes a universal op
 // number safe: it can never collide with a per-kind op, because no kind is
@@ -1421,6 +1701,12 @@ static_assert((InterruptOp.Ack as UInt) < MINT_OP,
 static_assert((ClockOp.TimerCreate as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
 static_assert((TimerOp.Disarm as UInt) < MINT_OP,
+              "an op table must stay below the universal ops")
+static_assert((MemoryOp.Map as UInt) < MINT_OP,
+              "an op table must stay below the universal ops")
+static_assert((IoMemoryOp.Map as UInt) < MINT_OP,
+              "an op table must stay below the universal ops")
+static_assert((MappingOp.Unmap as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
 
 // ...and the two universal numbers are distinct and ordered, which is the fact
@@ -1450,6 +1736,60 @@ static_assert(MINT_OP < RELEASE_OP,
 public enum ClockType: UInt {
     case Monotonic = 0,
 }
+
+/// WHAT A MAPPING PERMITS — the access bits `MemoryOp.Map` takes (spec §2.5's
+/// `map(access:)`; sawos design 6 D-3).
+///
+/// **ACCESS IS A PROPERTY OF THE MAPPING, NOT OF THE REGION**, and this enum is
+/// where that decision becomes API. `MemoryRight` deliberately has no R/W/X
+/// pair (its own docstring says why), so the only place a process names what it
+/// may do with memory is here — which is exactly what makes DOUBLE-MAPPING one
+/// region read-only in one place and read-write in another expressible. Agenda
+/// item 7's lean lands with it: a double map is ALLOWED, two rows and two
+/// Mappings, with no aliasing bookkeeping owed on a machine that does not
+/// translate.
+///
+/// **IT IS A FLAG SET, so the values are BITS and a combination is the BACKING
+/// INTEGER** — Saw ships no OptionSet and an enum is a set of tags (design
+/// 185's flag-enum rule). `MapAccess.Read | MapAccess.Write` folds to `3` in
+/// any fixed-width slot, which is what the funnels take.
+///
+/// **THE NUMBERS ARE THE `SegFlag` NUMBERS, and that is a fact rather than a
+/// coincidence**: R = 1, W = 2, X = 4 is the order one profile's protection
+/// config uses natively, so an image's declared permissions and a caller's
+/// requested access are the same vocabulary the whole way down. The kernel
+/// still TRANSLATES rather than casting — one small function beside the map op
+/// — because the two enums live in two packages that must be free to version
+/// apart.
+///
+/// WHAT IS REFUSED, and both are caller-checkable `BadArg` faults: write
+/// without read (not a grant any target should install, and one profile
+/// RESERVES the encoding outright), and no access at all (a row that permits
+/// nothing is a row that spends a protection slot to say no, which default-deny
+/// already says).
+///
+/// Backed by `UInt32` rather than by the register's `UInt`, which is the one
+/// place this file's usual reasoning inverts and is worth stating: a MASK is
+/// not a decoded number. It never reaches `from(raw:)` — the kernel tests bits
+/// and refuses anything outside the three — so there is no truncation hazard to
+/// avoid, and a fixed-width backing is what makes `MapAccess.Read |
+/// MapAccess.Write` fold at an ordinary annotated slot (DF-240a's adoption
+/// reaches fixed-width slots and not platform ones). `SystemRight`'s keep mask
+/// is the precedent: both are bit sets a caller assembles.
+public enum MapAccess: UInt32 {
+    case Read = 1 << 0,
+    case Write = 1 << 1,
+    case Execute = 1 << 2,
+}
+
+/// Every bit `MapAccess` defines — what a caller's access word may contain.
+///
+/// Named rather than written so the kernel's "these bits and no others" check
+/// and this declaration cannot drift: adding a case here is what widens the
+/// check.
+public static MAP_ACCESS_MASK: UInt32 = ((MapAccess.Read as UInt32)
+                                         | (MapAccess.Write as UInt32)
+                                         | (MapAccess.Execute as UInt32))
 
 /// How an Event ACCUMULATES — a per-Event property, chosen at creation and
 /// fixed for its life (§2.4).
@@ -1722,8 +2062,8 @@ public func boot_handle_record_bytes() -> Int {
 /// drain lives on the Process object, so a child that is to drain must be handed
 /// the handle `process_create` minted. The raw backing is what lets a kind be
 /// ADDED without renumbering (design 145's wire idiom), which is exactly what
-/// happened here and what unit 4's IoMemory and unit 5.5's death channels will
-/// want next.
+/// happened here and happened AGAIN at unit 4's `IoMemory` below; unit 5.5's
+/// death channels are the next to want it.
 ///
 /// **THE SET IS EXACTLY THE GIVABLE KINDS, and it is smaller than `ObjType` on
 /// purpose.** A kind reaches this enum when something can actually deliver one:
@@ -1750,10 +2090,21 @@ public func boot_handle_record_bytes() -> Int {
 /// cross-process vocabulary there is (design 4's ruled surface). Keeping the
 /// meaning in root's config is what makes the kernel's half of the launch flow
 /// the same code for a hand-built M3 system and for M4's dynamic loading.
+/// **UNIT 4 DECLARES THE FOURTH** (sawos design 6 D-1/D-5), which is the
+/// raw backing doing exactly what the paragraph above predicted: the region
+/// table now carries a KIND column, a Device row mints an `IoMemory`, and root
+/// receives it through the same drain as everything else. It is `Transfer`-able
+/// (`iomemory_rights()`) because handing a driver child its window is unit 6's
+/// whole flow.
+///
+/// There is deliberately NO `Mapping` case. A Mapping is not givable —
+/// `mapping_rights()` withholds `Transfer` on purpose (see `MappingRight`) — so
+/// a case for one would be dead surface on the rule this set already follows.
 public enum BootHandleKind: UInt {
     case Memory = 0,
     case Process = 1,
     case System = 2,
+    case IoMemory = 3,
 }
 
 // THE DECODED RECORD IS NOT DECLARED HERE, and the asymmetry with `WaitResult`

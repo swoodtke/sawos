@@ -38,12 +38,16 @@ is four instructions and a branch into the trap entry's own restore path.
 | `payload_start()` / `payload_end()` | Bounds of the appended root image. Equal when there is none. |
 | `region_table_start()` / `region_table_end()` | Bounds of the build-emitted BOOT REGION TABLE (sawos design 2 D-2). Equal when there is none, which is ZERO REGIONS and the ordinary state of an image that appends no child images. |
 | `PROT_GRAIN: UInt` | Protection granularity — what a region bound is rounded up to. |
-| `MAX_ROOT_SEGMENTS: UInt` | How many segments a root image may ask for, i.e. the grant budget minus the stack. |
+| `MAX_ROOT_SEGMENTS: UInt` | How many segments a root image may ask for, i.e. the grant budget minus the stack. **SEVEN since M3 unit 4** (sawos design 6 D-4), because the budget doubled. |
+| `GRANT_ROW_BUDGET: UInt` | **HOW MANY PROTECTION ROWS ONE PROCESS'S DOMAIN MAY HOLD** — what `MemoryOp.Map` checks a target's `grant_count` against (sawos design 6 D-3/D-4). **ON THIS PROFILE IT IS THE PHYSICAL WALL**: a row is a numbered hardware region and there are exactly eight, so a map meeting it is a map the machine cannot install and the answer is `NoResource`. Profile B publishes the same name meaning a POLICY cap, which is why the kernel reads the HAL's number rather than a shared constant. |
+| `RAM_BASE` / `RAM_TOP` | Where RAM is on this board, and how much of it there is — the window `map_target_ok` judges against. Stated rather than derived: nothing on this profile publishes it (the linker script knows where the KERNEL is, not where memory ends). |
+| `map_target_ok(base, top) -> Bool` | **MAY `[base, top)` BE INSTALLED AS A RAM ROW IN A USER DOMAIN?** (sawos design 6 D-4.) The point of the predicate is the ALTITUDE it moves a refusal to: the loader path answers an unrepresentable grant by STOPPING THE MACHINE, which is right for a memory map the build got wrong and wrong for a range a PROCESS chose. A map asks first and faults with `BadArg`. Here an entry can name any address, so this accepts everything in RAM — not vacuous: it is what refuses a device window through the RAM door and a region whose bounds have wrapped. |
+| `device_window_ok(base, len) -> Bool` | **MAY `[base, base + len)` BE INSTALLED AS A DEVICE ROW?** — this profile's granularity rule on caller-chosen numbers (design 6 D-2), checked at `IoMemoryOp.Carve` and again at its `Map`. Here: `len` a power of two, at least `PROT_GRAIN`, and `base` a multiple of it — the NAPOT shape, because a device window costs ONE entry rather than a TOR pair. |
 | `ROOT_LOAD_BASE` / `ROOT_REGION_TOP` / `ROOT_STACK_LEN` | Root's region in this board's memory map. |
 | `prot_reset()` | Revoke every grant. User mode then reaches nothing. |
 | `prot_region(idx, base, top, perms)` | Stage grant `idx` as `[base, top)` with `perms`, a mask in the `imgformat` `SegFlag` vocabulary (R = 1, W = 2, X = 4). |
-| `prot_device(idx, base, len)` | Stage grant `idx` as a DEVICE WINDOW: read/write, never executable, with whatever memory type this machine needs for MMIO. `len` is a power of two and `base` is aligned to it. |
-| `DEVICE_GRANT_BASE` / `DEVICE_GRANT_LEN` | The ONE window this board offers a process — the console UART's page. The image DECLARES a window and this pair AUTHORIZES it; anything else is a refused image. |
+| `prot_device(idx, base, len)` | Stage grant `idx` as a DEVICE WINDOW: read/write, never executable, with whatever memory type this machine needs for MMIO. `len` is a power of two and `base` is aligned to it — which `device_window_ok` above is the callable form of, so a caller-chosen window is refused before it reaches here. |
+| `DEVICE_GRANT_BASE` / `DEVICE_GRANT_LEN` | The ONE window this board offers a process — the console UART's page. In M2 the image DECLARED a window and this pair AUTHORIZED it. **SINCE M3 unit 4 the pair is what the BUILD mirrors** when it publishes a DEVICE row in the region table: the kernel mints an `IoMemory` for it and a driver obtains it (sawos design 6 D-6). The declare/authorize path is dormant, not deleted — see §2.5. |
 | `prot_commit()` | Publish the staged set. Separate so a half-programmed set is never live. |
 | `is_syscall(cause) -> Bool` | Did this trap come from a syscall instruction, or is it a fault? |
 | `is_interrupt(cause) -> Bool` | Is this trap an interrupt instead of either? Asked FIRST, because an interrupt is not the running program's business and its instruction has not run. |
@@ -139,9 +143,9 @@ stores to THR — and the mechanism that stops the machine.
 | `trap_entry` | boot.S | Machine trap vector. Saves the U-mode context into the RUNNING THREAD'S 32-word frame, calls `ktrap(frame, cause, tval)` on the kernel stack, and resumes the frame `ktrap` RETURNS — which need not be the one it was called with, and that is the context switch. A trap taken in kernel mode goes to `kernel_fault` instead. | `csrrw` on `mscratch` as the mode witness, register saves, `mret`. |
 | `kernel_fault` | boot.S | A trap the kernel itself took. Writes the finisher with `mcause` in the code bits and stops the machine. Never returns, never hangs. | `csrr mcause` plus the finisher store, in the one path that must work with no assumptions about kernel state. |
 | `sos_resume_frame(frame)` | boot.S | Enter user mode in a saved context, behind `resume_frame`. Selects U-mode as the `mret` target with the global interrupt enable left clear (D2), then branches into the restore path above rather than repeating it. | `csrc` on `mstatus`, and a `mret` the restore path owns. |
-| `sos_pmpaddr_write(index, value)` | sink.c | Place a word in `pmpaddr<index>`. | The CSR NUMBER is an assembly-time immediate, so an indexed write is a switch. What a region MEANS is Saw (design 172 unit 1). |
+| `sos_pmpaddr_write(index, value)` | sink.c | Place a word in `pmpaddr<index>`, `index` 0..15. | The CSR NUMBER is an assembly-time immediate, so an indexed write is a switch. **SIXTEEN ARMS since M3 unit 4** (sawos design 6 D-4), which is every entry the part implements — so the budget above it is `lib.saw`'s decision alone and this is the last widening available. What a region MEANS is Saw (design 172 unit 1). |
 | `sos_mie_write(mask)` | sink.c | Place a word in `mie` — which CLASSES of interrupt may reach this hart. | `csrw` names its CSR. WHICH classes, and the shadow the mask is staged in, are Saw. Note what is absent: nothing here writes the GLOBAL enable, and that absence is design 178's D2. |
-| `sos_pmpcfg_write(lo, hi)` | sink.c | Publish both config registers together. | Same: `csrw pmpcfg0` names its register. The config words are STAGED in Saw. |
+| `sos_pmpcfg_write(w0, w1, w2, w3)` | sink.c | Publish all FOUR config registers together — entries 0-3, 4-7, 8-11, 12-15 (widened from two by sawos design 6 D-4). | Same: `csrw pmpcfg0` names its register. The config words are STAGED in Saw, in four shadow variables rather than an array, because a `static` is not an array element. |
 | `sos_payload_start()` / `sos_payload_end()` | sink.c | Bounds of the appended payload. | A linker symbol's ADDRESS, which Saw cannot name — DF-172a. |
 | `sos_region_table_start()` / `sos_region_table_end()` | sink.c | Bounds of the `.regions` section — the boot region table (sawos design 2 D-2). | Same reason, DF-172a. It is the ONE new fixed symbol pair that unit brought: the table's blob rows carry bases the LINKER resolved when it placed the generated stub, so no per-child symbol has to be nameable here. |
 | `sos_wait_for_irq()` | sink.c | Park the core until an interrupt is pending, behind `wait_for_irq`. | `wfi` is an INSTRUCTION. One line, and it is the whole of design 178 M2 unit 4's native delta on this profile. |
@@ -188,8 +192,15 @@ and they are compiled from one definition so they cannot skew.
 - **A DEVICE WINDOW IS ONE NAPOT ENTRY, not a TOR pair** (design 178 M2 unit 4).
   PMP encodes a naturally aligned power-of-two region as a single address word
   whose trailing ones give its size, so the console's page costs one entry where
-  a bounded region costs two — which is what keeps the four-region budget intact
-  once an image asks for segments, a stack AND a window. The window is
+  a bounded region costs two — which is what kept the ORIGINAL four-region
+  budget intact once an image asked for segments, a stack AND a window. **THAT
+  BUDGET WAS NEVER ENOUGH FOR A `map()`, and M3 unit 4 doubled it to EIGHT**
+  (sawos design 6 D-4): a driver-shaped root spent all four before the first row
+  could be installed at run time. Eight regions is sixteen entries, every one
+  the part implements, so there is no third widening — and it is what turned the
+  NAPOT shape from a budget saving into a RULE a caller must satisfy, since
+  `carve` now lets a process choose a window's bounds (`device_window_ok`). The
+  window is
   page-aligned and page-sized for a SPEED reason rather than a protection one,
   and it is the same one `virt.ld` is rounded for: DF-178b measured a
   byte-tight region putting every access on the emulator's slow path, and a

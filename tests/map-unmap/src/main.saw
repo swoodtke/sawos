@@ -1,0 +1,121 @@
+// SOS M3 unit 4: UNMAP, AND THE LIVE-DOMAIN RULE (sawos design 6 D-3; spec
+// §2.5).
+//
+// **THE ASSERTION IS THE FAULT.** Root maps a region into ITSELF, writes and
+// reads it, unmaps it, and touches it again — and the touch has to die. That is
+// the whole case, and it is worth being precise about what a missing fault
+// would have meant: not a slow revocation, NO revocation. `run_thread` reloads
+// a protection domain only when the process CHANGES, so an `unmap` that edited
+// the grant record without reloading would leave the row installed for as long
+// as this process kept the processor — which, for a root server that never
+// yields, is forever. `domain_changed(p)` is the one helper that closes it and
+// this program is what asserts it ran.
+//
+// **THE SHAPE IS ROOT-INTO-ITSELF, AND THAT IS A RECORDED CHOICE.** Design 6's
+// proof list offered a child variant — map into a child, unmap mid-flight — and
+// named the deterministic one as the implementer's to pick. This is it: there
+// is no scheduling race anywhere in the sequence, the fault lands on a known
+// instruction in a known process, and the live-domain rule is exercised in its
+// HARDEST case rather than its easiest (a child's domain is not the installed
+// one, so mapping into a child would reload nothing and prove nothing about the
+// reload at all).
+//
+// THE TRANSCRIPT, read as an order:
+//
+//   SOS mapunmap: wrote 0x77 read 119    <- the row was installed (119 is
+//                                           0x77; the byte renders as decimal)
+//   SOS mapunmap: unmapped               <- the op returned Ok
+//   SOS: fault ...                       <- and the row is GONE, now
+//
+// The last line is the kernel's hardware-fault report; its tag and cause differ
+// per machine (a store/load access fault here, a data abort there), so what is
+// asserted is that ONE was taken and that root died of it.
+
+import sos.{System, Process, Memory, Mapping, MapAccess, SosStatus}
+
+extern "C" {
+    func sos_test_pool_base() -> UInt
+}
+
+static CHUNK: UInt = 0x1000
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+static EXIT_FAILED: UInt = 1
+
+func poke(addr: UInt, value: UInt8) unsafe {
+    UnsafeMemory<UInt8, Normal>(addr).write(value)
+}
+
+func peek(addr: UInt) unsafe -> UInt8 {
+    UnsafeMemory<UInt8, Normal>(addr).read()
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS mapunmap: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    var record = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS mapunmap: no pool region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    guard let pool = record.take_memory() else {
+        let _ = system.debug_print("SOS mapunmap: boot record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let base = sos_test_pool_base()
+
+    let chunk = match pool.split(len: CHUNK) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS mapunmap: split failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let mapping = match proc.map(memory: &chunk, access: RW) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS mapunmap: map failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    poke(base, 0x77)
+    print("SOS mapunmap: wrote 0x77 read {}\n", peek(base) as Int)
+
+    // **THE REVOCATION.** Only a Mapping unmaps (§2.5), which is why this op is
+    // on this object and not on the region.
+    match mapping.unmap() {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS mapunmap: unmap failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS mapunmap: unmapped\n")
+
+    // **AND THE TOUCH DIES HERE.** The read's value is PRINTED rather than
+    // discarded, deliberately: a load nobody uses is a load an optimiser may
+    // delete, and a deleted load takes no fault. The print never runs.
+    print("SOS mapunmap: UNREACHABLE {}\n", peek(base) as Int)
+
+    let _ = system.shutdown(EXIT_FAILED)
+}

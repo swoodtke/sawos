@@ -323,7 +323,7 @@ public func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
 extern "C" {
     func sos_resume_frame(frame_addr: UInt)
     func sos_pmpaddr_write(index: UInt, value: UInt)
-    func sos_pmpcfg_write(lo: UInt, hi: UInt)
+    func sos_pmpcfg_write(w0: UInt, w1: UInt, w2: UInt, w3: UInt)
     func sos_payload_start() -> UInt
     func sos_payload_end() -> UInt
     func sos_region_table_start() -> UInt
@@ -337,9 +337,81 @@ extern "C" {
 public static PROT_GRAIN: UInt = 4
 
 /// How many segments a root image may ask for. One PMP region per segment plus
-/// one for the stack, out of the four the board budget programs (see
-/// `sink.c`'s `PMP_REGIONS`).
-public static MAX_ROOT_SEGMENTS: UInt = 3
+/// one for the stack, out of the `PMP_REGIONS` this HAL programs — which is
+/// where that budget is decided (below in this file; `sink.c` only places words
+/// in numbered registers, and the stale cross-reference this comment used to
+/// carry is corrected here).
+///
+/// SEVEN SINCE M3 UNIT 4 (sawos design 6 D-4), because the budget doubled. What
+/// it buys is not seven-segment images — no image has more than three — but the
+/// HEADROOM `map()` draws on: an image using fewer segments than this leaves
+/// the rest of the budget for rows installed at run time.
+public static MAX_ROOT_SEGMENTS: UInt = 7
+
+/// **HOW MANY PROTECTION ROWS ONE PROCESS'S DOMAIN MAY HOLD ON THIS PROFILE**
+/// — the number `MemoryOp.Map` checks a target's `grant_count` against (sawos
+/// design 6 D-3/D-4).
+///
+/// **ON THIS PROFILE IT IS THE PHYSICAL WALL.** A row is a numbered hardware
+/// region and there are exactly this many, so a map that meets it is a map the
+/// machine cannot install — `NoResource`, a thing the caller could not have
+/// known. The other profile's budget is a POLICY number of the same name and
+/// the same meaning to the caller, which is why the kernel reads the HAL's
+/// number rather than a shared constant.
+///
+/// The quota (unit 5) is the policy cap layered ABOVE this one, and the
+/// sentence that unit will make true is worth recording where the number is:
+/// **a `map()` meeting the physical wall with quota headroom left is a kernel
+/// bug to assert against.** Today there is no quota, so meeting it is ordinary.
+public static GRANT_ROW_BUDGET: UInt = 8
+
+/// Where RAM is on this board, and how much of it there is — the window
+/// `map_target_ok` judges a RAM mapping against.
+///
+/// QEMU's `virt` machine places RAM at this base and gives it 128 MiB by
+/// default, which is what the harness runs. It is stated here rather than
+/// derived because nothing on this profile publishes it: the linker script
+/// knows where the KERNEL is, not where memory ends.
+public static RAM_BASE: UInt = 0x8000_0000
+public static RAM_TOP: UInt = 0x8800_0000
+
+/// **MAY `[base, top)` BE INSTALLED AS A RAM ROW IN A USER DOMAIN?** (sawos
+/// design 6 D-4.)
+///
+/// THE POINT OF THE PREDICATE IS THE ALTITUDE IT MOVES THE REFUSAL TO. Both
+/// profiles have addresses a grant cannot express, and the loader's answer for
+/// one has always been to stop the machine — a memory map that outgrew the
+/// hardware is a KERNEL bug and reads as one. A `map()` is different: the range
+/// comes from a region a PROCESS chose, so an unmappable one is a caller error,
+/// and the kernel must answer `BadArg` at the op rather than dying inside the
+/// protection primitive.
+///
+/// On this profile a PMP entry can name any address, so the predicate accepts
+/// everything in RAM — which is not vacuous: it is what refuses a map of a
+/// DEVICE window through the RAM door, and a region whose bounds have wrapped.
+public func map_target_ok(base: UInt, top: UInt) -> Bool {
+    base < top && base >= RAM_BASE && top <= RAM_TOP
+}
+
+/// **MAY `[base, base + len)` BE INSTALLED AS A DEVICE ROW?** — this profile's
+/// granularity rule, checked on caller-chosen numbers (sawos design 6 D-2).
+///
+/// A device window costs ONE naturally-aligned power-of-two entry here rather
+/// than a TOR pair, which is what makes it affordable at all — so the shape the
+/// static asserts below pin for the BOARD's window is the same shape a carved
+/// sub-window must have, and this is that rule as a runtime test. A violation
+/// is a `BadArg` fault at the carve: the caller chose the offset and the
+/// length.
+public func device_window_ok(base: UInt, len: UInt) -> Bool {
+    if len < PROT_GRAIN {
+        return false
+    }
+    // A power of two, tested without a loop: exactly one bit set.
+    if (len & (len - 1)) != 0 {
+        return false
+    }
+    (base % len) == 0
+}
 
 /// Root's region on this board (design 140 pin; mirrored by the root linker
 /// script and recorded in `virt.ld`'s memory map). Segments load from the base;
@@ -392,8 +464,16 @@ public static UNMAPPED_PROBE: UInt = 0x0000_0000
 // A region is a TOR pair: entry 2*idx holds the lower bound with A=OFF (a bound
 // only, never matched), entry 2*idx+1 holds the upper bound with A=TOR plus the
 // R/W/X bits. Bounds are stored shifted right by two — PMP's 4-byte grain. The
-// M1 budget is `PMP_REGIONS` regions out of the eight entries `sink.c`'s switch
+// budget is `PMP_REGIONS` regions out of the SIXTEEN entries `sink.c`'s switch
 // covers; the layout is recorded in virt.ld.
+//
+// **THE BUDGET DOUBLED IN M3 UNIT 4 (sawos design 6 D-4), and the reason is
+// arithmetic.** Four TOR regions were enough exactly as long as every row was
+// installed at load time: a driver-shaped root spends two on its segments, one
+// on its stack and one on its device window, which is all four before the first
+// `map()` has a slot to take. Eight regions is sixteen entries, which is every
+// entry the part implements — so this is the last widening available and the
+// budget is now the hardware's own.
 //
 // DESIGN 172 UNIT 1: all of that is arithmetic, so it is Saw. What stays native
 // is placing a word in a NUMBERED CSR, because `csrw pmpaddr3, x` names the
@@ -401,9 +481,11 @@ public static UNMAPPED_PROBE: UInt = 0x0000_0000
 // in assembly. Profile B makes the same split at the same seam: descriptors in
 // Saw, the activation instructions in C.
 
-/// Regions the board budget programs, as TOR pairs out of the eight entries
-/// `sink.c` can reach.
-static PMP_REGIONS: UInt = 4
+/// Regions the board budget programs, as TOR pairs out of the sixteen entries
+/// `sink.c` can reach. It IS `GRANT_ROW_BUDGET` — one installed protection row
+/// is one numbered region here — and the name above is what the arch-free
+/// kernel reads, since `pmp` is a word that may not appear in `kernel/core`.
+static PMP_REGIONS: UInt = GRANT_ROW_BUDGET
 static PMP_A_TOR: UInt = 0x8              // cfg bits 4:3 = 1 (top-of-range)
 static PMP_A_NAPOT: UInt = 0x18           // cfg bits 4:3 = 3 (naturally aligned)
 static PMP_PERM_MASK: UInt = 0x7          // cfg bits 2:0 — R, W, X
@@ -419,26 +501,33 @@ static BITS_PER_PMP_CFG: Int = 8
 static_assert(MAX_ROOT_SEGMENTS + 1 <= PMP_REGIONS,
               "a root image's segments plus its stack must fit the region budget")
 
-/// The two `pmpcfg` shadow words — entries 0-3 and 4-7.
+/// The FOUR `pmpcfg` shadow words — entries 0-3, 4-7, 8-11 and 12-15.
 ///
 /// Compound global state: staged across several `prot_region` calls and
 /// published by one `prot_commit`, with no cheap way to read the hardware back.
 /// That is the shape design 149's `unsafe static var` exists for, and the
-/// serialization argument is spec §7's — uniprocessor, no interrupt sources in
-/// M1, and only the boot path touches these.
-unsafe static var PMPCFG_LO: UInt = 0
-unsafe static var PMPCFG_HI: UInt = 0
+/// serialization argument is spec §7's — uniprocessor, and the whole staged
+/// sequence runs with no preemption point in it (see `prot_reset`).
+///
+/// FOUR RATHER THAN TWO SINCE M3 UNIT 4 (sawos design 6 D-4): eight TOR regions
+/// are sixteen entries, and four entries' config bytes fit one RV32 word.
+unsafe static var PMPCFG0: UInt = 0
+unsafe static var PMPCFG1: UInt = 0
+unsafe static var PMPCFG2: UInt = 0
+unsafe static var PMPCFG3: UInt = 0
 
 /// Revoke every grant. User mode then reaches nothing at all — the default-deny
 /// the grants below carve out of.
 ///
-/// AUDIT (design 1): NO PREEMPTION POINT. Sixteen register writes, and a
+/// AUDIT (design 1): NO PREEMPTION POINT. Twenty register writes, and a
 /// half-rewritten grant table is exactly an in-flight invariant — the whole
 /// staged `prot_*` sequence is one edit, published by `prot_commit`.
 public func prot_reset() unsafe {
-    PMPCFG_LO = 0
-    PMPCFG_HI = 0
-    sos_pmpcfg_write(0, 0)
+    PMPCFG0 = 0
+    PMPCFG1 = 0
+    PMPCFG2 = 0
+    PMPCFG3 = 0
+    sos_pmpcfg_write(0, 0, 0, 0)
     var i: UInt = 0
     while i < PMP_REGIONS * 2 {
         sos_pmpaddr_write(i, 0)
@@ -469,12 +558,21 @@ public func prot_region(idx: UInt, base: UInt, top: UInt, perms: UInt8) unsafe {
 /// Shared by the TOR and NAPOT stagers so there is ONE place that knows which
 /// shadow word an entry's byte lives in — the arithmetic is small and getting
 /// it wrong in one of two copies would install a grant at the wrong index.
+///
+/// FOUR-WAY SINCE M3 UNIT 4, and written as a chain rather than as an indexed
+/// store because a `static` is not an array element: Saw has no way to name
+/// "the nth of these four", and four arms is what the language spells today.
 func stage_cfg(entry: UInt, cfg: UInt) unsafe {
-    if entry < PMP_CFGS_PER_WORD {
-        PMPCFG_LO = PMPCFG_LO | (cfg << (BITS_PER_PMP_CFG * (entry as Int)))
+    let word = entry / PMP_CFGS_PER_WORD
+    let shift = BITS_PER_PMP_CFG * ((entry % PMP_CFGS_PER_WORD) as Int)
+    if word == 0 {
+        PMPCFG0 = PMPCFG0 | (cfg << shift)
+    } else if word == 1 {
+        PMPCFG1 = PMPCFG1 | (cfg << shift)
+    } else if word == 2 {
+        PMPCFG2 = PMPCFG2 | (cfg << shift)
     } else {
-        PMPCFG_HI = (PMPCFG_HI
-                     | (cfg << (BITS_PER_PMP_CFG * ((entry - PMP_CFGS_PER_WORD) as Int))))
+        PMPCFG3 = PMPCFG3 | (cfg << shift)
     }
 }
 
@@ -516,7 +614,7 @@ public func prot_device(idx: UInt, base: UInt, len: UInt) unsafe {
 /// Publish the staged grant set. Separate from `prot_region` so a partially
 /// programmed set is never live.
 public func prot_commit() unsafe {
-    sos_pmpcfg_write(PMPCFG_LO, PMPCFG_HI)
+    sos_pmpcfg_write(PMPCFG0, PMPCFG1, PMPCFG2, PMPCFG3)
 }
 
 /// Build a fresh user context in `frame_addr`: `entry` as the resume address,
