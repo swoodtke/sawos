@@ -827,11 +827,40 @@ static_assert((TimerRight.Wait as UInt32) >= (1 << 8),
 /// read-only in one place and read-write in another. Rights on the region could
 /// not express that without becoming per-mapping, at which point they would be
 /// the mapping's.
+///
+/// **AND `MapExecute` IS THE ONE EXCEPTION TO THAT PARAGRAPH, RULED AUG 30**
+/// (sawos design 9 D-1). X stays a property of the MAPPING — the sentence above
+/// is untouched, and a region carries no R/W/X triple — but WHICH access bits a
+/// handle may REQUEST is now itself an authority. `MemoryOp.Map` refuses
+/// `MapAccess.Execute` unless the handle carries this bit, which is the same
+/// refusal every unspent right answers.
+///
+/// **IT IS CAPABILITY FLOW, NOT IDENTITY.** "Only root maps executable" holds
+/// because root never GRANTS the bit — it mints an attenuated sibling and gives
+/// that — and not because the kernel asks who is calling. A launcher that hands
+/// a driver child its RAM through a mint whose keep mask omits `MapExecute` has
+/// handed over memory that child can read and write and can never execute from,
+/// stated once at the mint rather than checked at every map.
+///
+/// **WHY A FOURTH BIT RATHER THAN A W^X RULE ALONE**: the two answer different
+/// questions. W^X (below, in `MapAccess`) says no single ROW may be both
+/// writable and executable, which every process may still satisfy by
+/// double-mapping. This bit says whether a process may produce an executable row
+/// AT ALL. A system that only had W^X would let any holder of a region build
+/// itself a JIT; a system that only had this bit would let a privileged holder
+/// build a W|X row. Both, and each is one comparison.
+///
+/// **STATED HONESTLY: THIS IS PER-HANDLE, NOT PER-REGION.** A second handle onto
+/// the same bytes that still carries the bit can map them executable — the
+/// aliasing stance design 6 took (no aliasing bookkeeping on a machine that does
+/// not translate) is unchanged, and a region-level immutable flag was REJECTED
+/// as a second mechanism doing overlapping work.
 public enum MemoryRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
     case Split = 1 << 8,
     case Map = 1 << 9,
+    case MapExecute = 1 << 10,
 }
 
 static_assert((MemoryRight.Transfer as UInt32) == (1 << 0),
@@ -842,6 +871,8 @@ static_assert((MemoryRight.Split as UInt32) >= (1 << 8),
               "kind-specific right Split must start at bit 8 or above")
 static_assert((MemoryRight.Map as UInt32) >= (1 << 8),
               "kind-specific right Map must start at bit 8 or above")
+static_assert((MemoryRight.MapExecute as UInt32) >= (1 << 8),
+              "kind-specific right MapExecute must start at bit 8 or above")
 
 /// A right on an IoMemory object (spec §2.5; sawos design 6 D-1/D-2).
 ///
@@ -861,7 +892,11 @@ static_assert((MemoryRight.Map as UInt32) >= (1 << 8),
 ///
 /// `Transfer` is here because handing a driver its window is the whole point of
 /// unit 6's flow, and `Mint` on the uniform lean the default-sets section
-/// records.
+/// records. **UNIT 6 SPENT IT** (sawos design 9 D-2): `Process.give(iomemory:)`
+/// moves the console's register page into a driver child's table, and the child
+/// maps it into itself. There is deliberately no `MapExecute` bit beside `Map`
+/// here — `IoMemoryOp.Map` takes no access argument at all, so the authority
+/// design 9 added to `MemoryRight` has nothing to gate on this kind.
 public enum IoMemoryRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
@@ -1070,12 +1105,26 @@ public func process_rights() -> UInt32 {
 /// THAT on. Two default sets here would be a second place to forget a bit, and
 /// would silently make "the second cut of a pool" less capable than the first.
 ///
-/// The unit-2 docstring's promise is kept exactly: the two kind-specific bits
-/// are named for the ops they gate (`Split`, `Map`), per the Aug-29 doctrine,
-/// rather than a generic authority.
+/// The unit-2 docstring's promise is kept exactly: the kind-specific bits
+/// are named for the ops they gate (`Split`, `Map`, `MapExecute`), per the
+/// Aug-29 doctrine, rather than a generic authority.
+///
+/// **`MapExecute` IS IN THE SET, AND IT HAS TO BE** (sawos design 9 D-1). A boot
+/// pool root and every region a `Split` derives from one carry the authority to
+/// map executable, because §3's attenuation is MONOTONIC: a bit not minted at
+/// boot could never appear later by any sequence of ops, so a default set that
+/// withheld it would make an executable mapping unreachable in the whole system
+/// rather than merely restricted. The narrowing is the HOLDER's, done with
+/// `MINT_OP` and a keep mask that omits the bit — which is exactly the shape the
+/// one-set-two-minters doctrine above already asks for, applied to a fourth bit.
+///
+/// So the default is PERMISSIVE and the policy is written where the capability
+/// is handed over, not here. That is the same trade `Transfer` makes two lines
+/// up: root holds everything, and what a child holds is what root chose to mint.
 public func memory_rights() -> UInt32 {
     ((MemoryRight.Transfer as UInt32) | (MemoryRight.Mint as UInt32)
-     | (MemoryRight.Split as UInt32) | (MemoryRight.Map as UInt32))
+     | (MemoryRight.Split as UInt32) | (MemoryRight.Map as UInt32)
+     | (MemoryRight.MapExecute as UInt32))
 }
 
 /// What the kernel mints for an IoMemory window — a boot DEVICE-pool root, and
@@ -1084,7 +1133,12 @@ public func memory_rights() -> UInt32 {
 /// The same one-set-two-minters shape `memory_rights` has, and for the same
 /// reason. `Transfer` is what makes unit 6's flow possible — root hands a
 /// driver child its window — and it is minted at boot because attenuation only
-/// ever narrows.
+/// ever narrows. **THAT FLOW RUNS NOW** (sawos design 9 D-2), which is this
+/// set's bit being spent for the first time rather than merely reserved.
+///
+/// It gains NO `MapExecute` (`MemoryRight`'s design-9 addition): a device
+/// window has no access argument to gate, so the authority would name an ask
+/// nobody can make.
 public func iomemory_rights() -> UInt32 {
     ((IoMemoryRight.Transfer as UInt32) | (IoMemoryRight.Mint as UInt32)
      | (IoMemoryRight.Carve as UInt32) | (IoMemoryRight.Map as UInt32))
@@ -1610,6 +1664,11 @@ public enum TimerOp: UInt {
 /// (`MapAccess`), and it spends TWO rights on two objects — `MemoryRight.Map`
 /// here and `ProcessRight.Map` on the target — because possession of bytes must
 /// not imply authority over an address space.
+///
+/// **AND A THIRD, CONDITIONALLY** (sawos design 9 D-1): an access word naming
+/// `MapAccess.Execute` also spends `MemoryRight.MapExecute` on this region.
+/// Conditional because it is a bit about WHAT is being asked for rather than
+/// about the op — a caller mapping RW spends exactly what it always did.
 public enum MemoryOp: UInt {
     case Split = 0,
     case Map = 1,
@@ -1762,11 +1821,34 @@ public enum ClockType: UInt {
 /// — because the two enums live in two packages that must be free to version
 /// apart.
 ///
-/// WHAT IS REFUSED, and both are caller-checkable `BadArg` faults: write
+/// WHAT IS REFUSED, and all three are caller-checkable `BadArg` faults: write
 /// without read (not a grant any target should install, and one profile
-/// RESERVES the encoding outright), and no access at all (a row that permits
+/// RESERVES the encoding outright), no access at all (a row that permits
 /// nothing is a row that spends a protection slot to say no, which default-deny
-/// already says).
+/// already says), and — since sawos design 9 D-1 — **WRITE AND EXECUTE IN ONE
+/// ROW**.
+///
+/// **W^X IS PER ROW, AND IT COSTS NOTHING EXPRESSIBLE.** Double-mapping is
+/// already sanctioned (design 6's agenda item 7: two rows, two Mappings, no
+/// aliasing bookkeeping owed on a machine that does not translate), so the
+/// JIT-shaped pattern — an RW row here, an RX row there, over one region —
+/// remains available in full while every individual protection row is W^X. What
+/// the refusal removes is the ONE shape that has no honest use: a single row a
+/// process can write to and then fetch from.
+///
+/// It joins write-without-read rather than living beside it as a different kind
+/// of check, because they are the same kind: both are grants the caller
+/// assembled out of cases it named, and both are answered before anything is
+/// installed.
+///
+/// **THE BOUNDARY IS THE DYNAMIC MAP, STATED SO IT IS NOT MISREAD.** Neither
+/// this rule nor `MemoryRight.MapExecute` governs a process image's OWN
+/// executable segments: those arrive through `process_create`'s loader as
+/// `SegFlag` bits read out of the image, under `SystemRight.ProcessCreate`
+/// authority, and are validated by `imgformat.has_sane_perms` (which refuses
+/// write-without-read and X-on-device, and deliberately not W|X — an image's
+/// linker script is what keeps its segments apart). A driver child holds no
+/// `ProcessCreate`, so the two doors are not alternatives for it.
 ///
 /// Backed by `UInt32` rather than by the register's `UInt`, which is the one
 /// place this file's usual reasoning inverts and is worth stating: a MASK is
@@ -2122,7 +2204,10 @@ public func boot_handle_record_bytes() -> Int {
 /// table now carries a KIND column, a Device row mints an `IoMemory`, and root
 /// receives it through the same drain as everything else. It is `Transfer`-able
 /// (`iomemory_rights()`) because handing a driver child its window is unit 6's
-/// whole flow.
+/// whole flow. **THAT FLOW IS BUILT** (sawos design 9 D-2): root drains the
+/// console's window at boot and GIVES it to a child that maps it into itself and
+/// echoes the harness's bytes, on both profiles — so this case is now exercised
+/// end to end rather than merely declared.
 ///
 /// There is deliberately NO `Mapping` case. A Mapping is not givable —
 /// `mapping_rights()` withholds `Transfer` on purpose (see `MappingRight`) — so

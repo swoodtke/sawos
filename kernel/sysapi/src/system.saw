@@ -515,14 +515,23 @@ extension Process {
     // disarmed-but-unsent word leaks — and the local `var` exists only because a
     // by-value parameter is a `let` and the disarm is a write.
     //
-    // **TWO FUNNELS AND NOT NINE, and the rights audit is the reason.** A handle
-    // can be given only if its rights word carries the universal `Transfer` bit,
-    // and v1 mints that bit in exactly three places: `memory_rights()` (M3 unit
-    // 2), `process_rights()` (design 4 D-3) and `root_system_rights()` (the
-    // Aug-29 rulings). A Thread, Event, Waiter, Interrupt, Clock or Timer
-    // handle therefore cannot be given at all, and a funnel for one would be a
-    // method whose every call is an `AccessDenied` fault — dead surface, on the
-    // same rule that has `ClockType` declare one domain.
+    // **THREE FUNNELS AND NOT NINE, and the rights audit is the reason.** A
+    // handle can be given only if its rights word carries the universal
+    // `Transfer` bit, and v1 mints that bit in exactly four places:
+    // `memory_rights()` (M3 unit 2), `process_rights()` (design 4 D-3),
+    // `root_system_rights()` (the Aug-29 rulings) and `iomemory_rights()` (M3
+    // unit 4). A Thread, Event, Waiter, Interrupt, Clock or Timer handle
+    // therefore cannot be given at all, and a funnel for one would be a method
+    // whose every call is an `AccessDenied` fault — dead surface, on the same
+    // rule that has `ClockType` declare one domain. (A Mapping carries
+    // `Transfer` in its ENUM and never in its default set, which is the same
+    // answer arrived at from the other side — see `MappingRight`.)
+    //
+    // **THE THIRD ONE IS UNIT 6's** (sawos design 9 D-2). `iomemory_rights()`
+    // has minted `Transfer` since unit 4 and the kernel's `boot_kind_of` has
+    // had its `IoMemory` arm since then too, both of them written FOR this
+    // flow; what was missing was the typed funnel. A window is now a thing a
+    // launcher hands over, which is what a driver child is made of.
     //
     // `give(system:)` IS THE ONE THE LAUNCH FLOW TURNS ON: a launcher mints a
     // MASKED sibling of its own System handle and gives that, which is how a
@@ -543,6 +552,35 @@ extension Process {
         return checked(sos_process_give(self.handle, word, tag))
     }
 
+    /// Give a DEVICE WINDOW to this process under `tag`, consuming the wrapper.
+    /// Requires `ProcessRight.Give` here and `IoMemoryRight.Transfer` on the
+    /// window — which every boot window and every carved sub-window carries.
+    ///
+    /// **THIS IS THE HANDOVER A DRIVER CHILD IS MADE OF** (sawos design 9 D-2),
+    /// and it is what §2.5's migration case bought: M2's device grant was a
+    /// record in the driver's own manifest, so the kernel could only ever grant
+    /// the one process it loads and a child was refused a window outright. A
+    /// window that arrives as a CAPABILITY is a window somebody can hand over.
+    ///
+    /// **THE CHILD MAPS IT, NOT THE LAUNCHER.** Root gives the window and stops
+    /// there; the child drains the record, takes the `IoMemory` and calls
+    /// `Process.map(iomemory:)` on ITS OWN Process handle. That is the lean
+    /// deliberately: what crosses the boundary is authority over a device, and
+    /// where the row goes is then the holder's own business. (The other
+    /// direction — a launcher INSTALLING a row in a child it created — is
+    /// `Process.map` above, and unit 6 exercises both so the two read side by
+    /// side.)
+    ///
+    /// The transfer-funnel contract is the same as the two funnels beside this
+    /// one: by value, disarm before the syscall, let the disarmed value drop.
+    /// What root gives away it cannot map anywhere.
+    public func give(&self, iomemory: IoMemory,
+                     tag: UInt) -> Result<Void, SosStatus> {
+        var window = move iomemory
+        let word: UInt = window.handle
+        window.handle = IoMemoryHandle(NO_HANDLE)
+        return checked(sos_process_give(self.handle, word, tag))
+    }
 
     /// Give a SYSTEM handle to this process under `tag`, consuming the wrapper.
     ///

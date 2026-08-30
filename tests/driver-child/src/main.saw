@@ -1,0 +1,281 @@
+// SOS M3 unit 6: THE DRIVER CHILD, FROM THE LAUNCHER'S SIDE (sawos design 9
+// D-2; spec §2.5, §9, §12).
+//
+// **THE MILESTONE'S MONEY SHOT, AND THIS FILE IS THE HALF THAT KNOWS NO
+// HARDWARE.** M2 proved a driver can live in userspace; unit 4 proved its window
+// can arrive as a capability instead of a manifest key. What was still missing
+// was the sentence those two make possible together, which the migrated
+// uart-echo header wrote down and promised to this unit: *a window that arrives
+// as a capability is a window somebody can HAND OVER.* Here is somebody handing
+// one over.
+//
+// THE TRANSCRIPT, read as an order:
+//
+//   SOS driverchild: created            <- an inert process, table EMPTY
+//   SOS driverchild: gave the window    <- `Transfer` SPENT: root no longer has it
+//   SOS driverchild: started
+//   SOS echo: window mapped             <- THE CHILD, mapping what it was given
+//   SOS echo: driver up
+//   Zq7#                                <- the harness's own bytes, echoed by a
+//                                          process that is not root, through a
+//                                          device root gave away
+//   SOS echo: done 4 bytes on line 10
+//   SOS: process exit: code=...
+//   SOS driverchild: root observed child status=65536
+//
+// **WHAT EACH STEP RULES OUT.** `gave the window` is `ProcessOp.Give` over an
+// `IoMemory`, which spends the universal `Transfer` bit on the window and MOVES
+// it: root's wrapper is disarmed before the syscall and root can map that window
+// nowhere afterwards. `window mapped` is the child calling
+// `Process.map(iomemory:)` on ITS OWN Process handle — the handoff's ruled lean,
+// which is that what crosses the boundary is authority over a device and where
+// the row goes is then the holder's business. And the echoed bytes are every
+// step at once: give, drain, map, bind, enable, park and wake, all across a
+// process boundary, on a device the kernel has no driver for.
+//
+// **THE PARK IS THE CHILD'S DEATH AND THERE IS NO TIMER** (design 8's shape).
+// Two reasons, and the second is the one that matters here. A driver waits on
+// the harness typing at a real serial port, which is orders of magnitude longer
+// than the twenty-millisecond deadline every pre-unit-5.5 launcher used — so a
+// timer would have to be guessed at. And §9a's console handover has one bounded
+// exception, a kernel whose armed tick narrates over a process that owns the
+// device; a case whose transcript matters after handover arms none, and no
+// transcript matters more than this one.
+//
+// **WHAT ROOT DOES NOT DO IS THE OTHER HALF OF THE CLAIM.** It never maps the
+// device, never binds the line, never reads a register and never learns the
+// UART's address: `UART_BASE` appears nowhere in this file. Root's whole part is
+// deciding WHO gets the window, which is what a launcher is for.
+
+import sos.{System, Process, Memory, IoMemory, BootHandle, Waiter, WaitResult,
+            WaitPayload, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The key this launcher attaches the child's Process handle under — a number
+/// that appears nowhere else in the transcript, so reading it back proves the
+/// record came from THIS attachment.
+static KEY: UInt = 66
+
+/// Root's config, and the whole of the contract with the driver. `TAG_BOOT` is
+/// the tag the child's System handle travels under and is what `start` names;
+/// `TAG_WINDOW` is the device window, which the child meets at its DRAIN.
+///
+/// THE TWO TAGS ARE ORDERED BY WHAT CONSUMES THEM, not by when they are given:
+/// resolving a boot tag CONSUMES its record (the register IS the delivery), so
+/// the System handle never appears at the drain and the window is the only
+/// record the child ever sees. That is why the driver's drain loop is one call
+/// and needs no tag test — exactly as the root-as-driver twin's is.
+static TAG_BOOT: UInt = 31
+static TAG_WINDOW: UInt = 32
+
+/// **THE POLICY, AND IT IS A WHITELIST.** What a driver child of this launcher
+/// may ask its System object for: print, learn its own Process object, read the
+/// clock. `Shutdown`, `ProcessCreate` and `Mint` are absent BY SILENCE, which is
+/// the keep mask's polarity — a System right added tomorrow is denied to every
+/// child configured today.
+///
+/// `ClockGet` IS IN THE MASK AND THIS DRIVER NEVER SPENDS IT, deliberately: the
+/// mask is what a LAUNCHER grants a driver, and a driver with a device to
+/// service plausibly wants a timeout. Narrowing it to what one program happens
+/// to call would make the policy a transcript of the program.
+///
+/// `Transfer` is in the mask because it is the bit `give` checks on the thing
+/// being given — see `give-boot-drain`'s recorded finding, which is unchanged
+/// and still wants a ruling.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.ClockGet | SystemRight.Transfer)
+
+/// The §8 status word out of the record the kernel copied into this process's
+/// memory while the thread was parked.
+///
+/// THE OTHER THREE ARMS PANIC: this program attached exactly one thing, so a
+/// record of any other kind would mean the kernel reported an attachment nobody
+/// made — a bug in the pair rather than a condition to handle.
+func status_of(r: &WaitResult) -> UInt {
+    match r.what {
+        case Process(status) -> status,
+        case Event(_) -> panic("this launcher attached no event"),
+        case Interrupt(_) -> panic("this launcher attached no interrupt"),
+        case Timer(_) -> panic("this launcher attached no timer"),
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS driverchild: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // The boot set, in the build's row order: the child's image blob, the RAM it
+    // will run in, and the console's REGISTER PAGE. The third row is a DEVICE
+    // row, so the kernel minted an `IoMemory` for it rather than a `Memory` —
+    // design 6 D-1's kind-not-a-flag ruling arriving where a window enters the
+    // system — and root's config is what says which ordinal is which.
+    var image = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS driverchild: no image region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    var dest = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS driverchild: no destination region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    var device = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS driverchild: no device window: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    guard let image_mem = image.take_memory() else {
+        let _ = system.debug_print("SOS driverchild: image record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest_mem = dest.take_memory() else {
+        let _ = system.debug_print("SOS driverchild: dest record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let window = device.take_iomemory() else {
+        let _ = system.debug_print("SOS driverchild: device record is not a window\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let child = match system.process_create(image: &image_mem,
+                                            memory: &dest_mem) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS driverchild: create failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS driverchild: created\n")
+
+    // The supervision attachment, before the start: root will be woken by the
+    // child's ending, whatever ends it. A driver that faults on its first
+    // register read reports here exactly as one that finishes reports here,
+    // which is why this park needs no deadline to be safe.
+    let waiter = match proc.waiter_create() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS driverchild: no waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match waiter.add(process: &child, key: KEY) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS driverchild: attach failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // **THE FURNISHING, AND THE SECOND LINE IS THE UNIT.** The masked System is
+    // unit 3's flow unchanged. The window is new: `give(iomemory:)` spends
+    // `IoMemoryRight.Transfer` on the thing being given and `ProcessRight.Give`
+    // on the child, MOVES the word into the child's table under `TAG_WINDOW`,
+    // and CONSUMES root's wrapper — the transfer funnel disarms it before the
+    // syscall, so there is no spelling in this file that could touch the window
+    // below this point. What root gives away it cannot keep.
+    //
+    // **AND ROOT DOES NOT MAP IT ANYWHERE FIRST.** It could have — a `map`
+    // before a `give` is two ops with no rule against them — and doing so would
+    // leave a device row in root's own domain naming registers root has no
+    // business reaching. The whole point of the handoff is that the window ends
+    // up in exactly one address space.
+    let for_child = match system.mint(rights: CHILD_SYSTEM) {
+        case Ok(s) -> s,
+        case Err(e) -> {
+            print("SOS driverchild: mint failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match child.give(system: move for_child, tag: TAG_BOOT) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS driverchild: give system failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match child.give(iomemory: move window, tag: TAG_WINDOW) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS driverchild: give window failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS driverchild: gave the window\n")
+
+    // **THE CHILD'S OWN AUTHORITY OVER ITSELF IS WHAT MAKES IT A DRIVER, and it
+    // is not something root grants here.** Two Process rights are spent inside
+    // the child — `InterruptBind` to bind the console's line and `Map` to
+    // install the window in its own domain — and both arrive on the handle
+    // `SystemOp.ProcessSelf` mints for it, which carries the ONE Process default
+    // set (design 4 D-3). So the mask above is the whole of root's policy and it
+    // does not reach those two bits.
+    //
+    // RECORDED AS A FINDING (sawos design 9 As-built): that means a launcher
+    // CANNOT withhold `InterruptBind` from a child today. `process_rights()`
+    // says root "hands over a handle its keep mask left the bit out of", which
+    // is true of a Process handle root GIVES and not of the one a child derives
+    // from its own System — and every child derives that one, because
+    // `ProcessSelf` is what a masked System is for. Narrowing it wants
+    // `ProcessSelf` to take a keep mask of its own; nothing in unit 6 needs that,
+    // and this driver child is exactly the process that SHOULD hold both bits.
+    match child.start(boot_tag: TAG_BOOT) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS driverchild: start failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS driverchild: started\n")
+
+    // THE PARK. Nothing here is armed and nothing here is bound — the only
+    // interrupt in the machine is the child's, and the only thing that can end
+    // this call is the child ending. Everything between this line and the next
+    // one belongs to the driver, and to the device it owns.
+    let record = match waiter.wait() {
+        case Ok(r) -> r,
+        case Err(e) -> {
+            print("SOS driverchild: wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    if record.key != KEY {
+        print("SOS driverchild: woke on key {}, not {}\n", record.key, KEY)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    print("SOS driverchild: root observed child status={}\n", status_of(&record))
+    print("SOS driverchild: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

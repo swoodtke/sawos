@@ -13,9 +13,9 @@
 //! one. `split` names a LENGTH and `map` names a target, and both answer with
 //! capabilities rather than numbers.
 
-import sosabi.{SosStatus, MemoryHandle, MemoryOp, NO_HANDLE}
+import sosabi.{SosStatus, MemoryHandle, MemoryOp, MINT_OP, NO_HANDLE}
 
-import sos.floor.{call_value, sos_handle_release}
+import sos.floor.{ALL_RIGHTS, call_value, sos_handle_release}
 
 /// A handle to a Memory — a sealed range of physical memory.
 ///
@@ -85,6 +85,47 @@ extension Memory {
     /// pool. Stated here rather than discovered.
     public func split(&self, len: UInt) -> Result<Memory, SosStatus> {
         let raw = try call_value(self.handle, MemoryOp.Split as UInt, len, 0, 0)
+        return Memory(handle: MemoryHandle(raw))
+    }
+
+    /// **MINT A SIBLING of this region handle, narrowed by a KEEP MASK** — the
+    /// universal `MINT_OP`, on `System.mint`'s exact terms. Requires the
+    /// universal `MemoryRight.Mint` on THIS handle.
+    ///
+    /// **THIS IS WHERE A LAUNCHER'S MEMORY POLICY IS WRITTEN** (sawos design 9
+    /// D-1). A region's default set is permissive — `memory_rights()` carries
+    /// `Transfer | Mint | Split | Map | MapExecute`, and it has to, because
+    /// attenuation is monotonic and a bit not minted at boot could never appear
+    /// later — so what a child may do with the RAM it is handed is decided HERE,
+    /// once, by the mask the launcher writes:
+    ///
+    /// ```saw
+    /// let for_child = pool_page.mint(rights: MemoryRight.Transfer
+    ///                                        | MemoryRight.Map)!
+    /// child.give(memory: move for_child, tag: RAM)
+    /// ```
+    ///
+    /// That child can install its page and read and write it, and can never
+    /// execute from it — not because the kernel asks who is calling, but because
+    /// nothing it holds carries `MapExecute`. `Split` is absent from that mask
+    /// too, which is the honest way to say "here is your RAM, you may not
+    /// subdivide it for anyone".
+    ///
+    /// **THE MASK MUST KEEP `Transfer` if the sibling is to be GIVEN**, exactly
+    /// as `Process.give(system:)` records: `give` checks that bit on the thing
+    /// being given, so a launcher cannot narrow below the ticket that lets the
+    /// narrowed handle arrive.
+    ///
+    /// Everything else `System.mint` says holds unchanged: the rights are this
+    /// handle's INTERSECTED with the mask (so no-amplification is structural and
+    /// naming an absent right is a no-op), `Mint` is itself maskable, the
+    /// sibling is INDEPENDENT — its own slot, its own generation, its own
+    /// release — and it is a second NAME onto one region rather than a second
+    /// region. A full handle table is `SosStatus.NoResource`; a handle without
+    /// `Mint` TERMINATES the caller.
+    public func mint(&self,
+                     rights: UInt32 = ALL_RIGHTS) -> Result<Memory, SosStatus> {
+        let raw = try call_value(self.handle, MINT_OP, rights as UInt, 0, 0)
         return Memory(handle: MemoryHandle(raw))
     }
 }

@@ -1913,7 +1913,7 @@ func grant_perms(access: UInt32) -> UInt8 {
 
 /// Decode and VALIDATE a caller's access word, or end the caller.
 ///
-/// THREE REFUSALS, all `BadArg` faults and all caller-checkable — the caller
+/// FOUR REFUSALS, all `BadArg` faults and all caller-checkable — the caller
 /// assembled the word out of `MapAccess` cases it named:
 ///
 ///   - a bit outside the three. There is no fourth access, so a set bit the
@@ -1922,8 +1922,24 @@ func grant_perms(access: UInt32) -> UInt8 {
 ///     profile RESERVES the encoding outright — the same rule
 ///     `imgformat.has_sane_perms` applies to an image, applied to a map, which
 ///     is what keeps ONE answer to "what is a valid grant" in the system.
+///   - **WRITE AND EXECUTE IN ONE ROW** (sawos design 9 D-1), which lands here
+///     beside write-without-read because it is the same kind of judgement about
+///     the same word. It costs nothing expressible: a double map is sanctioned
+///     (design 6 agenda item 7 — two rows, two Mappings, no aliasing bookkeeping
+///     owed on a machine that does not translate), so the JIT-shaped pattern is
+///     still written as an RW row here and an RX row there, and what is refused
+///     is only the single row a process could write and then fetch from.
 ///   - NO ACCESS AT ALL. A row that permits nothing spends a protection slot to
 ///     say what default-deny already says.
+///
+/// **THE RULE IS THE DYNAMIC MAP'S, and the loader's door is not this door.** A
+/// process image's own executable segments arrive through `place_image` with
+/// `SegFlag` bits read out of the image and validated by
+/// `imgformat.has_sane_perms`, which refuses write-without-read and X-on-device
+/// and NOT W|X — an image's segments are kept apart by its linker script, and
+/// that path is `SystemRight.ProcessCreate` authority a driver child does not
+/// hold. Two doors, distrusting two different things, exactly as
+/// `IoMemoryOp.Carve` and `Map` already check granularity twice.
 func map_access(p: Int, raw: UInt) unsafe -> UInt32 {
     // THE WHOLE REGISTER IS TESTED FIRST, in its own width, and only then
     // narrowed. `raw` is a word a PROCESS chose, so an `as UInt32` on a 64-bit
@@ -1940,6 +1956,11 @@ func map_access(p: Int, raw: UInt) unsafe -> UInt32 {
     // binary expression does not wrap across lines in either spelling.
     if ((access & (MapAccess.Write as UInt32)) != 0
         && (access & (MapAccess.Read as UInt32)) == 0) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    // W^X, PER ROW. The parentheses are DF-172d's, as above.
+    if ((access & (MapAccess.Write as UInt32)) != 0
+        && (access & (MapAccess.Execute as UInt32)) != 0) {
         fault_process(p, FaultReason.BadArg)
     }
     if access == 0 {
@@ -2146,6 +2167,22 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
             }
             let t = map_target(p, arg0)
             let access = map_access(p, arg1)
+            // **THE EXEC GATE — A THIRD RIGHT, SPENT ONLY WHEN X IS ASKED FOR**
+            // (sawos design 9 D-1). It sits here rather than beside the
+            // `MemoryRight.Map` check above for one mechanical reason: it reads
+            // the access word, and the access word is not decoded until
+            // `map_access` has refused every shape that is not a grant. So the
+            // order is the ordinary one — every word-shaped `BadArg` first, then
+            // the authority that word turns out to require.
+            //
+            // AN UNSPENT RIGHT IS `AccessDenied`, the same answer every other
+            // one gives, and the caller could have known: rights are a property
+            // of the handle it chose to call through, and a launcher that
+            // minted the sibling knows exactly what it left out.
+            if ((access & (MapAccess.Execute as UInt32)) != 0
+                && not obj.allows(MemoryRight.MapExecute)) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
             let base = MEMORIES[obj.slot].base
             let len = MEMORIES[obj.slot].len
             if len == 0 || region_wraps(base, len) {

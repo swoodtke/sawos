@@ -280,6 +280,27 @@ DEATH_FAULT_PKG = os.path.join(TESTS_DIR, "death-fault")
 DEATH_LATE_ATTACH_PKG = os.path.join(TESTS_DIR, "death-late-attach")
 CHILD_BYE_PKG = os.path.join(TESTS_DIR, "child-bye")
 
+# sawos design 9 (M3 unit 6): the driver child, shared memory, and the exec
+# gate. FOUR root servers and THREE more CHILDREN, and the split follows the
+# house rule with one arithmetic fact forcing part of it: a rights refusal and a
+# bad-argument refusal are both FAULTS, and a fault ends the process, so the two
+# exec-gate claims cannot share an image.
+#
+# **THE DRIVER CHILD IS ONE LAUNCHER AND TWO DRIVERS, and that asymmetry is the
+# claim.** `driver-child` names no device at all — what it moves is a capability,
+# and a capability has no datasheet — so it is arch-free and built for both
+# profiles, while the two echo children are per-CHIP exactly as the
+# root-as-driver twins beside them are. The twins STAY, unmoved: the same driver
+# body running as root and as a child, in two transcripts, is what says the
+# difference is the launcher rather than the program.
+DRIVER_CHILD_PKG = os.path.join(TESTS_DIR, "driver-child")
+CHILD_ECHO_NS16550_PKG = os.path.join(TESTS_DIR, "child-echo-ns16550")
+CHILD_ECHO_PL011_PKG = os.path.join(TESTS_DIR, "child-echo-pl011")
+SHARE_DOUBLE_MAP_PKG = os.path.join(TESTS_DIR, "share-double-map")
+CHILD_SHARE_PKG = os.path.join(TESTS_DIR, "child-share")
+MAP_EXEC_GATED_PKG = os.path.join(TESTS_DIR, "map-exec-gated")
+MAP_WX_REFUSED_PKG = os.path.join(TESTS_DIR, "map-wx-refused")
+
 CLOCK_BASICS_PKG = os.path.join(TESTS_DIR, "clock-basics")
 TIMER_ONESHOT_PKG = os.path.join(TESTS_DIR, "timer-oneshot")
 TIMER_INTERVAL_PKG = os.path.join(TESTS_DIR, "timer-interval")
@@ -491,6 +512,13 @@ def expectations(arch):
         # line as well as through the child's own console line and root's §8
         # status word. A number that appears nowhere else in any transcript.
         "touch_mark": f"0x{0x3C:0{width}x}",
+        # M3 unit 6: the byte ROOT writes into the shared page, which is also
+        # `child-share`'s exit code — so `share_double_map` asserts the first
+        # direction of the round trip through the kernel's exit line as well as
+        # through root's §8 status word. Its partner (0x5A, the byte the CHILD
+        # writes) needs no placeholder: it comes back as a decimal on a console
+        # line rather than as a machine word.
+        "share_mark": f"0x{0xA5:0{width}x}",
     }
 
 
@@ -1131,6 +1159,13 @@ TEST_CASES = [
     # is the migration proving "the same window, obtained rather than declared"
     # (spec §2.5's migration case, come true). Everything the M2 transcript
     # ruled out, this one still rules out.
+    #
+    # **AND THESE TWO STAY, UNMOVED, PAST M3 UNIT 6** (sawos design 9 D-2). The
+    # driver body below now also runs as a CHILD (`child_echo_ns16550` /
+    # `child_echo_pl011` at the end of this file, launched by `driver-child`),
+    # and keeping both is the claim: the same program in two transcripts, one as
+    # root and one as a child, says the difference is the LAUNCHER rather than
+    # the driver. Neither of these two rows moved for that unit.
     {
         "name": "uart_echo_ns16550",
         "arches": ["riscv32"],
@@ -2147,7 +2182,9 @@ TEST_CASES = [
         # INSTALLATION ACROSS A PROCESS BOUNDARY — the launcher shape, and the
         # one unit 6 is built on. Root maps a page into a child it has CREATED
         # but not started, and the child touches an address its image never
-        # declared.
+        # declared. (Unit 6's `share_double_map` is this shape carried through
+        # to a conversation: the same install, plus a row in ROOT's own domain
+        # over the same region, plus bytes crossing in both directions.)
         #
         # **THE MAP IS BEFORE THE START AND IS NOT A BOOT RECORD**, which is why
         # the give-freeze does not reach it: §12's set freezes at `start`
@@ -2475,6 +2512,248 @@ TEST_CASES = [
                        "SOS deathlate: held=1 freed=1",
                        "SOS deathlate: done"],
         "expect_clean_exit": True,
+    },
+    # =========================================================================
+    # M3 unit 6 — the driver child, shared memory, and the exec gate
+    # (sawos design 9) — THE MILESTONE FINALE
+    # =========================================================================
+    #
+    # FIVE CASES, and the first two are what the whole ladder was for. Unit 2
+    # gave SOS a second process, unit 3 a way to furnish one, unit 4 a device
+    # window that arrives as a capability, unit 5 a budget and a reference
+    # count, unit 5.5 a death a supervisor is woken by. Put together they are a
+    # LAUNCHER THAT HANDS A DEVICE TO A DRIVER — which is the sentence the
+    # migrated `uart-echo` headers have been promising to this unit since M3
+    # unit 4, and which no earlier unit could write.
+    #
+    # THE SPLIT INTO FIVE follows the house rule (one claim per image) plus the
+    # arithmetic fact that has shaped every unit since design 6's: a fault ends
+    # the process, so two refusals cannot share a transcript. That is what makes
+    # the exec gate TWO cases rather than the one the brief sketched — see
+    # `map_exec_gated` for the argument, which is recorded there rather than
+    # here because it is a deviation.
+    {
+        # **THE MONEY SHOT: A DRIVER CHILD, FROM CONFIG, ON RISCV32.**
+        #
+        # It is `uart_echo_ns16550` above with one thing changed and it is not
+        # the driver: the echoing process is no longer the one the kernel
+        # loaded. Root drains the console's register page out of its own boot
+        # set, GIVES it away, mints a masked System beside it, starts the child
+        # and parks on its death. Everything after `gave the window` is a
+        # process that root created, driving a device root no longer has.
+        #
+        # WHAT EACH ASSERTED LINE RULES OUT, beyond what the root-as-driver twin
+        # already ruled out:
+        #
+        #   boot regions={three}   the child's blob, its RAM, and the DEVICE row
+        #   gave the window        `Transfer` spent on an `IoMemory`; root's
+        #                          wrapper is disarmed and root can map it nowhere
+        #   window mapped          the CHILD called `Process.map(iomemory:)` on
+        #                          its own Process handle — the give moved
+        #                          authority, and where the row goes was then the
+        #                          holder's business
+        #   Zq7#                   give, drain, map, bind, enable, park, wake and
+        #                          ack, all across a process boundary
+        #   status=65536           `Exited`(1) << 16 | 0, read by root through the
+        #                          Process handle it kept — so the driver's clean
+        #                          ending is a fact root OBSERVED rather than one
+        #                          the console merely showed
+        #
+        # **THERE IS NO TIMER ANYWHERE**, which matters twice here. A driver
+        # waits on a human-scale serial port, so a deadline would have to be
+        # guessed; and §9a's one bounded exception to the console handover is a
+        # kernel whose armed tick narrates over a process that owns the device.
+        # A case whose transcript matters after handover arms none.
+        "name": "child_echo_ns16550",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DRIVER_CHILD_PKG,
+        "children": [CHILD_ECHO_NS16550_PKG],
+        "device": True,
+        "stdin": ECHO_INPUT,
+        "expect_out": ["{banner}",
+                       "root image ok segments={two}",
+                       "SOS: boot regions={three}",
+                       "SOS: console handover",
+                       "SOS driverchild: created",
+                       "SOS driverchild: gave the window",
+                       "SOS driverchild: started",
+                       "SOS echo: window mapped",
+                       "SOS echo: driver up",
+                       ECHO_INPUT,
+                       "SOS echo: done 4 bytes on line 10",
+                       # THE DRIVER'S WHOLE ESTATE, counted by the kernel as it
+                       # takes it back: the masked System its launcher gave it,
+                       # the Process handle it derived, the IoMemory it was
+                       # given, the Mapping that window produced, the Interrupt
+                       # it bound and the Waiter it parked on. SIX, and every
+                       # one of them is a step of §9's cycle — which is another
+                       # way of saying a driver is exactly its handles.
+                       "SOS: process teardown handles={six} threads={one} "
+                       "events={zero} waiters={one} interrupts={one} "
+                       "timers={zero} process={one}",
+                       "SOS driverchild: root observed child status=65536",
+                       "SOS driverchild: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The same money shot on the other machine, and the same package split
+        # the root-as-driver twins have: a driver names its DEVICE, so there are
+        # two child packages named for the chip — while the launcher above them
+        # is arch-free and is built for both, because a capability has no
+        # datasheet.
+        "name": "child_echo_pl011",
+        "arches": ["arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DRIVER_CHILD_PKG,
+        "children": [CHILD_ECHO_PL011_PKG],
+        "device": True,
+        "stdin": ECHO_INPUT,
+        "expect_out": ["{banner}",
+                       "root image ok segments={two}",
+                       "SOS: boot regions={three}",
+                       "SOS: console handover",
+                       "SOS driverchild: created",
+                       "SOS driverchild: gave the window",
+                       "SOS driverchild: started",
+                       "SOS echo: window mapped",
+                       "SOS echo: driver up",
+                       ECHO_INPUT,
+                       "SOS echo: done 4 bytes on line 33",
+                       # The same six, on the other machine and the other chip —
+                       # which is the count saying what the two packages say:
+                       # what differs between them is the datasheet.
+                       "SOS: process teardown handles={six} threads={one} "
+                       "events={zero} waiters={one} interrupts={one} "
+                       "timers={zero} process={one}",
+                       "SOS driverchild: root observed child status=65536",
+                       "SOS driverchild: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **SHARED MEMORY: ONE REGION, TWO ROWS, TWO ADDRESS SPACES.** §2.5's
+        # own words — "the SAME physical memory ... the shared-memory primitive"
+        # — as a transcript, and the first CROSS-PROCESS double map.
+        #
+        # BOTH DIRECTIONS, AND EACH IS PROVED TWICE. Root writes 0xA5 through
+        # its own row; the child says it saw 165 AND carries that byte out as
+        # its exit code, which root reads back as the §8 status word
+        # (`Exited`(1) << 16 | 165 = 65701). The child writes 0x5A; root loads
+        # it back out of the same page. On a machine that does not translate
+        # there is no copy step for either fact to hide in.
+        #
+        # **ROOT INSTALLS THE CHILD'S ROW, AND THE CHILD HOLDS NO Memory
+        # HANDLE** — which is the deliberate contrast with the two echo cases
+        # above, where root gave the capability away and the child installed its
+        # own row. Access without possession, beside possession-then-install, in
+        # one unit: the object model answers both without a mode flag anywhere.
+        "name": "share_double_map",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": SHARE_DOUBLE_MAP_PKG,
+        "children": [CHILD_SHARE_PKG],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS sharemap: created",
+                       "SOS sharemap: mapped into both",
+                       "SOS sharemap: wrote 165",
+                       "SOS sharemap: started",
+                       "SOS childshare: saw 165 wrote 90",
+                       "SOS: process exit: code={share_mark} process={one}",
+                       # **`handles={two}` IS THE CLAIM OF THIS CASE, IN THE
+                       # KERNEL'S OWN ACCOUNTING.** The child's entire estate is
+                       # the masked System it was given and the Process handle
+                       # it derived from it. There is NO Memory handle among
+                       # them and no Mapping either — the row it read and wrote
+                       # through belongs to a region its launcher still holds,
+                       # installed by that launcher into this process's domain.
+                       # Access without possession, counted.
+                       "SOS: process teardown handles={two} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS sharemap: root observed child status=65701",
+                       "SOS sharemap: read back 90",
+                       "SOS sharemap: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **EXECUTABLE IS AN AUTHORITY** (design 9 D-1). Root maps a page
+        # read-execute through its full pool handle and it installs; root then
+        # mints a SIBLING with `MemoryRight.MapExecute` masked out, proves that
+        # sibling is a working handle by mapping read-write through it, and asks
+        # for read-execute through it — which ends the process.
+        #
+        # THE READ-WRITE LINE IS WHAT MAKES THE REFUSAL MEAN ANYTHING: without
+        # it, a sibling broken in any of a dozen ways would produce the same
+        # `access denied`. One handle, two asks, one refusal — the difference is
+        # the bit.
+        #
+        # **DEVIATION FROM THE BRIEF, RECORDED HERE AND ARGUED IN THE
+        # AS-BUILT.** Design 9's proof section sketches ONE case with three
+        # arms: root maps X successfully, a mint-without-`MapExecute` is
+        # refused, and `W|X` in one row is refused. Two of those three arms are
+        # FAULTS, and a fault ends the process — the fact design 6's own case
+        # split turned on and the runner has stated ever since ("a second probe
+        # after one would never run"). So the three arms are two cases: this
+        # one, whose positive arm and refusal are both about the RIGHT, and
+        # `map_wx_refused` below, whose positive arm and refusal are both about
+        # the WORD. Each case's success motivates its own failure, which reads
+        # better than the sketch did and costs one extra row per profile.
+        "name": "map_exec_gated",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAP_EXEC_GATED_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS execgate: mapped executable",
+                       "SOS execgate: minted a sibling without MapExecute",
+                       "SOS execgate: the sibling maps read-write",
+                       "SOS execgate: asking for execute through it",
+                       "SOS: process fault: access denied",
+                       # NINE, and the arithmetic is the program: §12's three
+                       # boot handles, the pool region, the Process handle
+                       # `process_self` minted, the page the split cut off, the
+                       # executable Mapping, the narrowed SIBLING, and the
+                       # read-write Mapping it installed. The refused map minted
+                       # nothing, which is what a fault before any allocation
+                       # means.
+                       "SOS: process teardown handles={nine} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # **W^X, PER ROW** (design 9 D-1's companion invariant), and the two
+        # lines above the refusal are why it costs nothing expressible: one
+        # region is mapped read-write HERE and read-execute THERE — the
+        # sanctioned double map — so the JIT-shaped pattern survives in full
+        # while every individual protection row is W^X.
+        #
+        # THE REFUSAL GOES THROUGH ROOT'S FULL POOL HANDLE, which carries
+        # `MemoryRight.MapExecute` and has just proved it. So this cannot be the
+        # exec gate wearing a different hat: every right is present and the WORD
+        # is what is wrong, which is what `argument outside its domain` says and
+        # `access denied` would not.
+        "name": "map_wx_refused",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAP_WX_REFUSED_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS mapwx: read-write here, wrote 107 read 107",
+                       "SOS mapwx: read-execute there: one region, two rows",
+                       "SOS mapwx: asking for write and execute in one row",
+                       "SOS: process fault: argument outside its domain",
+                       # EIGHT — `map_exec_gated`'s nine minus the sibling it
+                       # minted, since this case narrows nothing. TWO Mappings
+                       # are among them, over one region, which is the double
+                       # map counted rather than merely printed.
+                       "SOS: process teardown handles={eight} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
     },
 ]
 

@@ -1,0 +1,33 @@
+[package]
+name = "child-echo-ns16550"
+version = "0.1.0"
+
+# Same reason as sos/root's: this image carries its own `__saw_rt_*` seams, out
+# of the `sosrt` module its `sos` dependency pulls in. See that manifest.
+runtime = true
+
+# THE USERSPACE UART ECHO DRIVER, AS A CHILD (sawos design 9 D-2), for the board
+# whose console is an NS16550A. It is the `uart-echo-ns16550` package beside it
+# with ONE thing different: it is not root. It receives no boot region of its
+# own — its window is a capability its LAUNCHER gave it — and it ends with
+# `Process.exit` rather than `System.shutdown`, because a driver child holds no
+# `SystemRight.Shutdown` and should not.
+#
+# **IT IS LINKED AT THE CHILD BASE**, which is the only line of this manifest a
+# reader has to compare with the root-as-driver twin's: under the
+# no-translation contract every process shares one physical address space, so a
+# child's image is linked where its launcher's config puts it.
+#
+# IT IS PER-DEVICE, not per-architecture: a driver names its device, and the two
+# SOS profiles happen to have different UARTs. The pl011 package beside this one
+# is the same program for the other one.
+[dependencies]
+sos = { path = "../../kernel/sysapi" }
+
+[sos]
+emit = "sosimg"
+priorities = { background = 0, low = 1, normal = 1, high = 1 }
+
+[sos.riscv32-unknown-none-elf]
+linker-script = "../../hal/riscv32/user/child.ld"
+native = "../../hal/riscv32/user/syscall.c ../../rt/common_c/support.c"

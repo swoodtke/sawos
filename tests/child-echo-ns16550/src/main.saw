@@ -1,47 +1,46 @@
-// SOS M2 unit 4: THE USERSPACE UART ECHO DRIVER (design 178 option A's proof;
-// spec §2's Interrupt row, §9, §12).
+// SOS M3 unit 6: THE USERSPACE UART ECHO DRIVER, AS A CHILD (sawos design 9
+// D-2; spec §2.5, §9, §12). The board whose console is an NS16550A.
 //
-// This is the milestone's money shot, and what makes it one is everything that
-// is NOT here. There is no kernel driver. The kernel's whole part in this
-// program is three things — it granted the register window the image asked for,
-// it routed the line, and it woke this thread — and none of them knows what a
-// UART is. Reading the receive register, deciding what the byte means, and
-// writing it back out are ordinary process code in this file.
+// **THE PROMISE IN `uart-echo-ns16550`'s HEADER, KEPT.** That file — the M2
+// money shot, migrated in M3 unit 4 to obtain its window instead of declaring it
+// — ends with a sentence about what the migration bought:
 //
-// **MIGRATED IN M3 UNIT 4 (sawos design 6 D-6): THE SAME WINDOW, OBTAINED
-// RATHER THAN DECLARED.** In M2 this package's manifest carried a
-// `device-window` key, the kernel installed the grant before user mode, and the
-// board authorized it by comparison. §2.5 said in as many words that this was a
-// placeholder for the Mapping object; it is now one. The driver receives the
-// console's register page as an `IoMemory` CAPABILITY in its boot set and maps
-// it into ITSELF, and everything below that line is byte-for-byte the program
-// it always was — same registers, same addresses (SOS does not translate), same
-// echoed bytes, same line number.
+//     a window that arrives as a capability is a window somebody can HAND OVER.
+//     The M2 shape could only ever grant the one process the kernel loads, which
+//     is why a child image was refused a device window outright; unit 6's driver
+//     child is what this makes possible.
 //
-// WHAT THAT BUYS, and it is the reason the migration is worth a unit: a window
-// that arrives as a capability is a window somebody can HAND OVER. The M2 shape
-// could only ever grant the one process the kernel loads, which is why a child
-// image was refused a device window outright; unit 6's driver child is what this
-// makes possible.
+// This is that child. It is not root: it was created by a launcher
+// (`driver-child` beside it), it received its authority in its first argument
+// register like every SOS process does (§12's symmetry), and the console's
+// register page reached it as an `IoMemory` a launcher GAVE it under a tag.
 //
-// **AND UNIT 6 BUILT IT — THE PROMISE ABOVE IS KEPT** (sawos design 9 D-2).
-// `tests/child-echo-ns16550` is this program running as a CHILD: a launcher
-// (`tests/driver-child`) drains the window out of its own boot set, `give`s it
-// away, and the child maps it into itself and echoes the same bytes on the same
-// line. Three things differ there and none of them is the driver — the window
-// arrives by give rather than as a region row, the program ends with
-// `Process.exit` because a driver child holds no `SystemRight.Shutdown`, and it
-// is linked at the child base.
+// **THE DRIVER BODY BELOW IS THE ROOT-AS-DRIVER TWIN'S, UNCHANGED** — same
+// register block, same addresses, same enable bit, same drain loop, same
+// console lines, same line number in the last one. THREE THINGS DIFFER, all of
+// them about being a child rather than about being a driver:
 //
-// **THIS FILE STAYS, UNMOVED, AND THAT IS DELIBERATE.** The same driver body in
-// two transcripts — one as root, one as a child — is what says the difference is
-// the LAUNCHER rather than the program. Neither case's expected output changed
-// for unit 6.
+//   1. the window arrives by GIVE rather than as a boot region row. The drain
+//      call is byte-identical (`boot_handle_next` + `take_iomemory`), which is
+//      the point: a record is a record, and whether the kernel or a launcher
+//      queued it is not something the receiver can tell or needs to.
+//   2. it ends with `Process.exit`, not `System.shutdown`. Its System handle is
+//      a MASKED sibling of root's — `Debug | ProcessSelf | ClockGet | Transfer`
+//      — so stopping the machine is not a thing it can spell. A driver that
+//      could halt the box on a bad byte would be a worse driver.
+//   3. it is linked at the CHILD base (`hal/<arch>/user/child.ld`), because on a
+//      machine with no translation two processes cannot both live at root's
+//      address.
+//
+// EVERYTHING ELSE IS THE SAME PROGRAM, and that is the claim. The kernel's whole
+// part is still three things — it routed the line and woke this thread, and it
+// did not even grant the window this time; a PROCESS did.
 //
 // THE CYCLE, which is spec §9 read from the driver's side:
 //
-//   0. obtain the window      drain the boot set for the `IoMemory` and
-//                             `Process.map(iomemory:)` it into this process
+//   0. obtain the window      drain the boot set for the `IoMemory` its launcher
+//                             gave it and `Process.map(iomemory:)` it into this
+//                             process
 //   1. bind the line          `Process.interrupt_bind(line:)`
 //   2. watch it               `Waiter.add(&interrupt, key)`
 //   3. enable the DEVICE      write its own interrupt-enable register — the
@@ -58,12 +57,12 @@
 // driver IS its device. The two profiles have different UARTs, so there are two
 // of these packages, named for the CHIP rather than for the machine — which is
 // the honest axis, since the same 16550 would want the same file on a different
-// architecture.
+// architecture. Its launcher names no device at all.
 //
 // THE ECHOED BYTES ARE THE TEST. The harness feeds a known short string into
 // the emulator's serial input and asserts it comes back out AFTER the kernel's
-// handover marker, which is a thing that can only happen if every step above
-// worked.
+// handover marker — which now means it came out of a process that root created,
+// through a device root gave away.
 
 import sos.{System, Process, Interrupt, Mapping, Waiter, WaitResult,
             WaitPayload}
@@ -80,12 +79,13 @@ import sosrt.{ascii_byte}
 /// The console UART's register page — where the window this driver is HANDED
 /// lives, and the same number the kernel's board description carries.
 ///
-/// **THE NUMBER DID NOT MOVE WHEN THE ACQUISITION DID** (sawos design 6 D-6),
-/// and that is the migration's whole point: SOS does not translate (spec §5.5),
-/// so a mapped window is where the hardware is. What changed is that this
-/// address is now something the driver was GIVEN authority over rather than
-/// something its manifest asked for — and a driver knowing its own device's
-/// address is a fact about the device, which is where it belongs.
+/// **THE NUMBER DID NOT MOVE WHEN THE GIVER DID** (sawos design 9 D-2), which is
+/// the same statement design 6 made about the ACQUISITION and is worth making
+/// once more here: SOS does not translate (spec §5.5), so a mapped window is
+/// where the hardware is, whoever handed it over. In M2 this address was in a
+/// manifest; in M3 unit 4 it was a boot region row; here it arrives from another
+/// PROCESS. The driver's constant is unchanged in all three, because a driver
+/// knowing its own device's address is a fact about the device.
 static UART_BASE: UInt = 0x1000_0000
 
 /// The interrupt line this board wires the console to.
@@ -98,9 +98,9 @@ static UART_IRQ: UInt = 10
 /// program could not otherwise see.
 static ECHO_KEY: UInt = 0x5541
 
-/// How many bytes the driver echoes before it stops the machine. The harness
-/// feeds exactly this many; a byte lost anywhere leaves this loop parked and
-/// the case fails on the emulator's timeout rather than passing quietly.
+/// How many bytes the driver echoes before it stops. The harness feeds exactly
+/// this many; a byte lost anywhere leaves this loop parked and the case fails on
+/// the emulator's timeout rather than passing quietly.
 static ECHO_BYTES: Int = 4
 
 static EXIT_OK: UInt = 0
@@ -207,20 +207,28 @@ func woke_on_line(r: &WaitResult) -> UInt {
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
+    // §12's SYMMETRY, and it is what makes the rest of this file the same
+    // program root ran: a child bootstraps exactly as root does — System in the
+    // first argument register, its own Process handle derived from it. The
+    // handle is a MASKED sibling of its launcher's, and nothing below can tell.
+    //
+    // A failure here cannot report through `exit`, because `exit` is the op on
+    // the handle that just failed to arrive. It returns instead, which ends this
+    // process the way a child with no authority always ends.
     let proc = match system.process_self() {
         case Ok(p) -> p,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS echo: no process handle\n")
-            let _ = system.shutdown(EXIT_FAILED)
+        case Err(e) -> {
+            print("SOS echo: no process handle: {}\n", e)
             return
         },
     }
 
-    // **STEP 0 — OBTAIN THE WINDOW** (sawos design 6 D-6). The build published
-    // one DEVICE row, the kernel minted an `IoMemory` for it, and it is waiting
-    // in this process's boot set. Draining it and mapping it into THIS process
-    // is what the manifest's `device-window` key used to do before the first
-    // instruction ran.
+    // **STEP 0 — OBTAIN THE WINDOW**, and the drain is the twin's drain
+    // unchanged. What differs is upstream of this call and invisible to it: the
+    // record was queued by `ProcessOp.Give` from a launcher rather than by the
+    // kernel out of a DEVICE row of the build's region table. A record is a
+    // record; the tag is the giver's word and this driver never reads it,
+    // because its launcher's config gave it exactly one.
     //
     // THE MAPPING IS HELD FOR THE PROGRAM'S LIFE. Dropping it would release the
     // HANDLE and not the row (§2.5: a mapping dropped without an unmap is
@@ -231,20 +239,25 @@ func _start(boot_handle: UInt) {
         case Ok(h) -> h,
         case Err(e) -> {
             print("SOS echo: no device window: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
+            let _ = proc.exit(EXIT_FAILED)
             return
         },
     }
     guard let window = record.take_iomemory() else {
         let _ = system.debug_print("SOS echo: boot record is not a window\n")
-        let _ = system.shutdown(EXIT_FAILED)
+        let _ = proc.exit(EXIT_FAILED)
         return
     }
+    // **AND THE CHILD MAPS IT INTO ITSELF**, which is the handoff's ruled lean:
+    // what crossed the process boundary was authority over a device, and where
+    // the row goes is the holder's own business. It spends `IoMemoryRight.Map`
+    // on the window its launcher moved here and `ProcessRight.Map` on this
+    // process's own handle — two rights on two objects, neither of them root's.
     let _mapping = match proc.map(iomemory: &window) {
         case Ok(m) -> m,
         case Err(e) -> {
             print("SOS echo: map failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
+            let _ = proc.exit(EXIT_FAILED)
             return
         },
     }
@@ -252,12 +265,14 @@ func _start(boot_handle: UInt) {
 
     // §2's Interrupt row: the line becomes an object, and the object is
     // waitable. The kernel unmasks it here — the DEVICE is still quiet, because
-    // its own enable bit is below.
+    // its own enable bit is below. It spends `ProcessRight.InterruptBind`, which
+    // arrived on the handle `ProcessSelf` minted and is therefore NOT something
+    // this driver's launcher granted; see `driver-child`'s recorded finding.
     let irq = match proc.interrupt_bind(line: UART_IRQ) {
         case Ok(i) -> i,
         case Err(e) -> {
             print("SOS echo: no interrupt: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
+            let _ = proc.exit(EXIT_FAILED)
             return
         },
     }
@@ -265,7 +280,7 @@ func _start(boot_handle: UInt) {
         case Ok(w) -> w,
         case Err(e) -> {
             print("SOS echo: no waiter: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
+            let _ = proc.exit(EXIT_FAILED)
             return
         },
     }
@@ -273,7 +288,7 @@ func _start(boot_handle: UInt) {
         case Ok(_) -> {},
         case Err(e) -> {
             print("SOS echo: attach failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
+            let _ = proc.exit(EXIT_FAILED)
             return
         },
     }
@@ -293,7 +308,7 @@ func _start(boot_handle: UInt) {
             case Ok(r) -> r,
             case Err(e) -> {
                 print("SOS echo: wait failed: {}\n", e)
-                let _ = system.shutdown(EXIT_FAILED)
+                let _ = proc.exit(EXIT_FAILED)
                 return
             },
         }
@@ -301,7 +316,7 @@ func _start(boot_handle: UInt) {
         wakes = wakes + 1
         if answer.key != ECHO_KEY {
             print("SOS echo: woke on key {}, not {}\n", answer.key, ECHO_KEY)
-            let _ = system.shutdown(EXIT_FAILED)
+            let _ = proc.exit(EXIT_FAILED)
             return
         }
 
@@ -314,7 +329,7 @@ func _start(boot_handle: UInt) {
             case Ok(_) -> {},
             case Err(e) -> {
                 print("SOS echo: ack failed: {}\n", e)
-                let _ = system.shutdown(EXIT_FAILED)
+                let _ = proc.exit(EXIT_FAILED)
                 return
             },
         }
@@ -330,5 +345,11 @@ func _start(boot_handle: UInt) {
     // number would be pinning the emulator's timing.
     print("\nSOS echo: done {} bytes on line {} after {} wakes\n",
           echoed, line, wakes)
-    let _ = system.shutdown(EXIT_OK)
+
+    // **AND IT EXITS RATHER THAN STOPPING THE MACHINE**, which is the one line
+    // of the cycle a child could not have written the twin's way: this driver
+    // holds no `SystemRight.Shutdown`, so the op does not exist for it. Its
+    // launcher is parked on this process's death and takes the machine down
+    // afterwards, which is where that decision belongs.
+    let _ = proc.exit(EXIT_OK)
 }

@@ -1,0 +1,169 @@
+// SOS M3 unit 6: EXECUTABLE IS AN AUTHORITY, NOT A DEFAULT (sawos design 9 D-1;
+// spec §2.5, §3).
+//
+// **X STAYED A PROPERTY OF THE MAPPING; WHICH ACCESS BITS A HANDLE MAY REQUEST
+// BECAME A RIGHT.** Design 6's decision is untouched — a region still carries no
+// R/W/X triple, which is what lets one region be RO here and RW there — and the
+// new bit is one level up: `MemoryRight.MapExecute` says whether this HANDLE may
+// ask for `MapAccess.Execute` at all.
+//
+// THE TRANSCRIPT, read as an order:
+//
+//   SOS execgate: mapped executable                       <- root's FULL handle
+//   SOS execgate: minted a sibling without MapExecute
+//   SOS execgate: the sibling maps read-write             <- it is a live handle
+//   SOS execgate: asking for execute through it
+//   SOS: process fault: access denied
+//
+// **THE THIRD LINE IS WHAT MAKES THE FOURTH MEAN ANYTHING.** A sibling that
+// could not map at all would produce the same refusal for the wrong reason, so
+// this program maps read-write through the narrowed handle FIRST and only then
+// asks for execute. One handle, two asks, one refusal: the difference is the
+// bit, and nothing else.
+//
+// **IT IS CAPABILITY FLOW, NOT IDENTITY**, which is the whole ruling. The kernel
+// never asks who is calling. Root maps executable because root's boot pool root
+// carries the bit (`memory_rights()` mints it, and has to — attenuation is
+// monotonic, so a bit not minted at boot could never appear later); the sibling
+// cannot because the mask that made it left the bit out. "Only root maps
+// executable" is therefore something a launcher ARRANGES, once, at the mint
+// where it hands memory over — not a rule anybody enforces per call.
+//
+// THE MASK BELOW IS EXACTLY WHAT A LAUNCHER WOULD WRITE for a driver child's
+// RAM, applied here to a sibling root KEEPS. That is the only way to observe the
+// refusal in one transcript: a rights refusal is a FAULT, so it ends whichever
+// process meets it, and a launcher meeting its own child's refusal would be
+// reading it out of a §8 status word instead of off the console.
+//
+// **W|X IS A DIFFERENT CLAIM AND IS `map-wx-refused`'s.** Both refusals landed
+// in this unit and they answer different questions — this one is "may you
+// produce an executable row at all", that one is "may ONE row be both writable
+// and executable" — so they are two cases, because each is a fault and a fault
+// ends the process.
+
+import sos.{System, Process, Memory, Mapping, MapAccess, MemoryRight,
+            SosStatus}
+
+/// One page of the pool, which is the smallest thing either profile grants.
+static CHUNK: UInt = 0x1000
+
+/// Read and execute — a text mapping, and the one thing this unit gated.
+static RX: UInt32 = MapAccess.Read | MapAccess.Execute
+
+/// Read and write, which is what any scratch region wants and what the narrowed
+/// handle is still perfectly able to install.
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// **THE POLICY, AND IT IS THE ONE A LAUNCHER WRITES FOR A CHILD'S RAM.** Keep
+/// the ticket that lets the region travel (`Transfer`, the bit `give` checks)
+/// and the authority to install it (`Map`). `MapExecute` is absent BY SILENCE,
+/// which is the keep mask's polarity: what is not named is not kept, so a bit
+/// added to `MemoryRight` tomorrow is denied to every child configured today.
+/// `Split` is absent too, which is the honest way to say "here is your RAM, you
+/// may not subdivide it for anyone".
+static CHILD_RAM: UInt32 = (MemoryRight.Transfer | MemoryRight.Map)
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS execgate: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // One boot region: the RAM pool. Root's config is what says so.
+    var pool_record = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS execgate: no pool region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    guard let pool = pool_record.take_memory() else {
+        let _ = system.debug_print("SOS execgate: pool record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let page = match pool.split(len: CHUNK) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS execgate: split failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // **THE POSITIVE ARM: ROOT MAPS EXECUTABLE, AND THE ROW INSTALLING IS THE
+    // PROOF.** Nothing needs to be EXECUTED out of this page — a page of
+    // uninitialised pool is not a program — and asserting the jump would be
+    // asserting the loader rather than the gate. What is claimed is exactly that
+    // a handle carrying `MemoryRight.MapExecute` may ask for
+    // `MapAccess.Execute`, which is a row the kernel installs or a fault it
+    // raises, and one of those two things happens on the next line.
+    let _text = match proc.map(memory: &page, access: RX) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS execgate: mapping executable failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS execgate: mapped executable\n")
+
+    // **THE NARROWING**, and it is the ordinary universal mint: a SIBLING onto
+    // the same region, in root's own table, carrying root's rights INTERSECTED
+    // with the mask. Root's original handle is untouched and still maps
+    // executable, which is what "per handle, not per region" means and is stated
+    // honestly in `MemoryRight`: a second handle that still carries the bit can
+    // map the same bytes X, because design 6 accepted no aliasing bookkeeping.
+    let narrow = match page.mint(rights: CHILD_RAM) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS execgate: mint failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS execgate: minted a sibling without MapExecute\n")
+
+    // THE CONTROL. The narrowed handle is a working Memory handle: it maps
+    // read-write, over the same page, into the same domain. Without this line
+    // the refusal below would be consistent with the sibling being broken in
+    // any of a dozen ways.
+    let _data = match proc.map(memory: &narrow, access: RW) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS execgate: mapping read-write failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS execgate: the sibling maps read-write\n")
+
+    // **AND THE REFUSAL, which is a FAULT and therefore the last thing this
+    // program does.** An unspent right ends the caller — the same answer every
+    // other one gives, and caller-checkable, because rights are a property of
+    // the handle it chose to call through and this program is the one that
+    // minted it.
+    let _ = system.debug_print("SOS execgate: asking for execute through it\n")
+    match proc.map(memory: &narrow, access: RX) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS execgate: UNREACHABLE\n")
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+        case Err(e) -> {
+            print("SOS execgate: UNREACHABLE status {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+    }
+    let _ = proc.exit(EXIT_OK)
+}

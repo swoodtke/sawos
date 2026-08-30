@@ -32,8 +32,8 @@ names provisional):
 |---|---|
 | `AddressSpace` | Isolation domain, defined abstractly. P4: PMP region set + APM/REE security context (see §5.5 — the P4's MMU is real but global/external-memory-only, not per-process). Paging targets: page-table root. |
 | `Thread` | Kernel-scheduled execution context bound to an AddressSpace. Saw's cooperative TaskGroups run *inside* a thread, in userspace — the kernel never sees tasks. BUILT M2 (design 178 unit 2): ops `Start`/`Join`/`Exit`/`Yield`, rights `ThreadRight.Start`/`.Join`/`.Control`. The saved trap frame IS the context, so a switch is the trap handler returning a different frame — see §11. |
-| `MemoryObject` | A range of memory (RAM or device MMIO) that can be mapped into AddressSpaces. Derived by splitting/attenuating a parent MemoryObject; roots handed to the first process at boot. BUILT M3 unit 2, FIRST SLICE (sawos design 2 D-2): a SEALED `{base, len}` and nothing else — no pools, no derivation, no `map()`, no attributes, no op table (an op aimed at one is a `BadOp` fault). Minted only at boot, one per row of the build-emitted REGION TABLE, delivered to root through `ProcessOp.BootHandleNext`, and NAMED as the two arguments of `process_create`. **BUILT OUT M3 unit 4 (sawos design 6), and the slice's two open questions are both answered**: the row is now `Memory` (RAM) or `IoMemory` (device MMIO) by the region table's KIND COLUMN, and the object has an op table. Ops `Split`/`Map`, rights `MemoryRight.Split`/`.Map` beside the universal pair (`Transfer` for unit 3's `give`, `Mint` for its attenuated sibling — the generic `Manage` that once sat here was removed by the Aug-29 doctrine, and unit 4's bits are named for their ops as that doctrine requires). `split(len)` is ONE CUT FROM THE FRONT and the parent becomes the remainder, so allocation is repeated front-splits and THE PARENT IS THE POOL CURSOR — arbitrary-offset carving is refused BY THE SHAPE rather than by a check, since one `{base, len}` slot cannot hold two remainders. `map(process, access)` installs a protection row and answers with a `Mapping`; it spends `MemoryRight.Map` on the region AND `ProcessRight.Map` on the target, because possession of bytes must not imply authority over an address space. There is STILL no op that reads a MemoryObject's bounds: a region is a capability, and what a process knows about where its memory is, it knows from the config that gave it the region. Free-on-last-reference (§2.5's refcount clause) is NOT built — a split is permanent until teardown, and teardown returns SLOTS rather than ranges; it lands with unit 5's quotas. |
-| `IoMemoryObject` | Physical memory-mapped DEVICE registers. BUILT M3 unit 4 (sawos design 6 D-1) as a DISTINCT KIND rather than a flag on `MemoryObject`, which is §2.5's pool ATTRIBUTE made a type: an IoMemory can only ever produce device-attribute rows — `map` takes no access argument at all — so a driver cannot obtain a cacheable view of a register block BY CONSTRUCTION rather than by a check. Its lifecycle differs everywhere too: PINNED (never freed — MMIO is not reclaimable), carved NON-EXCLUSIVELY (§2.5's "a fixed region may be handed out many times", so `carve(offset, len)` leaves the parent WHOLE where `split` consumes), and it has no contents. Ops `Carve`/`Map`, rights `IoMemoryRight.Carve`/`.Map` plus the universal pair. The machine's own granularity is checked AT THE CARVE against a per-profile HAL predicate (Profile A needs a naturally-aligned power of two — one protection entry; Profile B needs whole pages), because a window that could never be installed anywhere is a capability that lies about itself. One dispatch arm is the entire cost, and what it RETIRES is the M2 device-grant placeholder: see §2.5's migration case and §11. |
+| `MemoryObject` | A range of memory (RAM or device MMIO) that can be mapped into AddressSpaces. Derived by splitting/attenuating a parent MemoryObject; roots handed to the first process at boot. BUILT M3 unit 2, FIRST SLICE (sawos design 2 D-2): a SEALED `{base, len}` and nothing else — no pools, no derivation, no `map()`, no attributes, no op table (an op aimed at one is a `BadOp` fault). Minted only at boot, one per row of the build-emitted REGION TABLE, delivered to root through `ProcessOp.BootHandleNext`, and NAMED as the two arguments of `process_create`. **BUILT OUT M3 unit 4 (sawos design 6), and the slice's two open questions are both answered**: the row is now `Memory` (RAM) or `IoMemory` (device MMIO) by the region table's KIND COLUMN, and the object has an op table. Ops `Split`/`Map`, rights `MemoryRight.Split`/`.Map` beside the universal pair (`Transfer` for unit 3's `give`, `Mint` for its attenuated sibling — the generic `Manage` that once sat here was removed by the Aug-29 doctrine, and unit 4's bits are named for their ops as that doctrine requires). `split(len)` is ONE CUT FROM THE FRONT and the parent becomes the remainder, so allocation is repeated front-splits and THE PARENT IS THE POOL CURSOR — arbitrary-offset carving is refused BY THE SHAPE rather than by a check, since one `{base, len}` slot cannot hold two remainders. `map(process, access)` installs a protection row and answers with a `Mapping`; it spends `MemoryRight.Map` on the region AND `ProcessRight.Map` on the target, because possession of bytes must not imply authority over an address space. There is STILL no op that reads a MemoryObject's bounds: a region is a capability, and what a process knows about where its memory is, it knows from the config that gave it the region. Free-on-last-reference (§2.5's refcount clause) is NOT built — a split is permanent until teardown, and teardown returns SLOTS rather than ranges; it lands with unit 5's quotas. **BUILT OUT AGAIN M3 unit 6 (sawos design 9 D-1): a fifth right, `MemoryRight.MapExecute`.** A `map` whose access word names `MapAccess.Execute` spends it, on top of the two above — so EXECUTABLE IS AN AUTHORITY rather than a free choice, and "only root maps executable" is a fact about capability FLOW (root never grants the bit at a mint) rather than about identity. `memory_rights()` mints it, of necessity: attenuation is monotonic, so a bit not minted at boot could never appear later, and the narrowing is a HOLDER's `MINT_OP` keep mask. Access is still per-MAPPING and a region still carries no R/W/X triple — what became a right is which access bits a HANDLE may request. Its companion is a `MapAccess` rule rather than a right: `Write | Execute` in ONE row is a caller-checkable `BadArg`, which costs nothing expressible because double-mapping is sanctioned (an RW row here and an RX row there is the same JIT-shaped pattern, with every individual row W^X). Both govern the DYNAMIC map only: an image's own X segments come through `process_create`'s loader under `SystemRight.ProcessCreate`. |
+| `IoMemoryObject` | Physical memory-mapped DEVICE registers. BUILT M3 unit 4 (sawos design 6 D-1) as a DISTINCT KIND rather than a flag on `MemoryObject`, which is §2.5's pool ATTRIBUTE made a type: an IoMemory can only ever produce device-attribute rows — `map` takes no access argument at all — so a driver cannot obtain a cacheable view of a register block BY CONSTRUCTION rather than by a check. Its lifecycle differs everywhere too: PINNED (never freed — MMIO is not reclaimable), carved NON-EXCLUSIVELY (§2.5's "a fixed region may be handed out many times", so `carve(offset, len)` leaves the parent WHOLE where `split` consumes), and it has no contents. Ops `Carve`/`Map`, rights `IoMemoryRight.Carve`/`.Map` plus the universal pair. The machine's own granularity is checked AT THE CARVE against a per-profile HAL predicate (Profile A needs a naturally-aligned power of two — one protection entry; Profile B needs whole pages), because a window that could never be installed anywhere is a capability that lies about itself. One dispatch arm is the entire cost, and what it RETIRES is the M2 device-grant placeholder: see §2.5's migration case and §11. **UNTOUCHED BY M3 unit 6's exec gate, and that is a property of the kind rather than an omission** (sawos design 9 D-1): `IoMemoryOp.Map` takes no access argument at all, so execute-on-device is refused vocabulary and there is no `IoMemoryRight.MapExecute` to add. What unit 6 DID exercise here is its `Transfer` bit: root gives a driver child the console's window and the child maps it into itself, which is the flow this kind's `Transfer` was minted for at unit 4. |
 | `Mapping` | ONE INSTALLED PROTECTION ROW, with its own handle. BUILT M3 unit 4 (sawos design 6 D-1/D-3). **A MAPPING IS AN INSTALLED GRANT ROW** — SOS does not translate (§5.5: an address is the same number in every process), so §2.5's "installed virtual placement" has no virtual half here and the object records which process's domain carries the row and which row it is. ONE op (`Unmap`, on `MappingRight.Unmap`), because everything else about a mapping was decided when it was installed. **RELEASING THE HANDLE IS NOT AN UNMAP**: release destroys the entry and never the object (design 3 D-2), so §2.5's "dropped without unmap = permanent, safe-but-leaked" falls out of existing doctrine rather than being new law. §2.5's sketched unmapping Deinit is deliberately NOT built — it would make the ROW's lifetime the wrapper's, and a launcher's wrapper drops right after it hands a child its memory. **THE LIVE-DOMAIN RULE** is the half a caller relies on: any edit to a grant record RELOADS IMMEDIATELY when that domain is the installed one, because `run_thread` skips equal domains and an unmap that waited for the next reschedule would be a revocation that did not revoke. Unmapping twice, or unmapping a Mapping whose TARGET PROCESS has died (its whole domain went with it), are both `BadState`. It is not givable — `mapping_rights()` withholds `Transfer` — because a Mapping names a row in one specific domain. |
 | `Pipe` | Synchronous message IPC with request/reply built in — see §2.1 (ratified Jul 29; renamed from Channel + client API amended Aug 20). |
 | `Event` | Accumulating non-blocking notification (OR / saturating-sum); a waitable — see §2.4 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Signal`/`Receive`, the mode chosen by the caller at creation (`event_create(mode:)`). AMENDED Aug 17 (user): the word is CONSUMED BY WHOEVER TAKES IT, through either door — `receive` is the non-blocking poll, a `Waiter.wait` delivery is the blocking one, and both read-and-clear, so a value is reported exactly once (§2.2, §2.4). |
@@ -413,6 +413,57 @@ Children still cannot declare windows (`allow_device: false`, unchanged); a
 driver child gets its window because root MAPS it in or GIVES it a carved
 IoMemory, which is unit 6's flow.
 
+**AND UNIT 6 RAN THAT FLOW** (sawos design 9 D-2). Root drains the console's
+register page out of its own boot set, `give`s the `IoMemory` to a child under a
+tag, and the CHILD maps it into itself and echoes the harness's bytes — on both
+profiles, with the driver body byte-identical to the root-as-driver twin's apart
+from the three things being a child changes (the window arrives by give rather
+than as a region row, it ends with `Process.exit` because it holds no
+`SystemRight.Shutdown`, and it is linked at the child base). The two twins STAY
+in the suite unmoved, so the same driver running as root and as a child is two
+transcripts side by side. `give(iomemory:)` is the one piece of surface it
+needed: `iomemory_rights()` has minted `Transfer` and the kernel's `boot_kind_of`
+has had its `IoMemory` arm since unit 4, both written for exactly this.
+
+**AND THE SHARED-MEMORY BULLET BELOW CAME TRUE WITH IT** (design 9 D-3): one
+region, `map`ped into two processes, written from each side and read from the
+other. The launcher installs the CHILD's row itself, so that child holds no
+`Memory` handle at all — access without possession — which is the deliberate
+contrast with the driver child, which was given the capability and installed its
+own row. Two installation directions, one unit, no mode flag anywhere.
+
+**EXECUTABLE BECAME A RIGHT** (design 9 D-1, ruled Aug 30), which is this
+section's `map(aspace, ...)` amended in one place and left alone everywhere else:
+
+- **ACCESS IS STILL A PROPERTY OF THE MAPPING.** A region carries no R/W/X
+  triple and nothing about double-mapping one region RO here and RW there
+  changed. What became an authority is WHICH ACCESS BITS A HANDLE MAY REQUEST:
+  `MemoryOp.Map` refuses `MapAccess.Execute` unless the Memory handle carries
+  **`MemoryRight.MapExecute`**, the same refusal (`AccessDenied`, a fault) every
+  unspent right answers. It is CAPABILITY FLOW, not identity — "only root maps
+  executable" holds because root never grants the bit, not because the kernel
+  asks who is calling — and `memory_rights()` therefore MINTS it at boot, of
+  necessity: §3's attenuation is monotonic, so a bit not minted at boot could
+  never appear later, and the narrowing is a holder's `MINT_OP` keep mask.
+- **NO ROW IS BOTH WRITABLE AND EXECUTABLE.** `Write | Execute` in one access
+  word is a caller-checkable `BadArg` fault, landing beside the existing
+  write-without-read refusal. It costs nothing expressible, because the double
+  map is already sanctioned: an RW row here and an RX row there over one region
+  is the JIT-shaped pattern in full, and what is removed is only the single row
+  a process could write and then fetch from.
+- **THE BOUNDARY IS THE DYNAMIC MAP.** Neither rule governs a process image's
+  own executable segments: those arrive through `process_create`'s loader as
+  `SegFlag` bits read out of the image, validated by `imgformat.has_sane_perms`
+  (which refuses write-without-read and X-on-device and deliberately not W|X —
+  an image's segments are kept apart by its linker script), under
+  `SystemRight.ProcessCreate` authority that a driver child does not hold.
+- **STATED HONESTLY: IT IS PER HANDLE, NOT PER REGION.** A second handle that
+  still carries the bit can map the same bytes executable. Design 6's aliasing
+  stance is unchanged, and a region-level immutable flag was REJECTED as a second
+  mechanism doing overlapping work. `IoMemory` is untouched throughout —
+  execute-on-device was already refused vocabulary and its `map` takes no access
+  argument at all.
+
 - **`MemoryObject`** = authority over a physical page range, allocated
   **from a typed pool** (ratified Jul 29). The pool's attribute governs
   three things at once:
@@ -441,6 +492,17 @@ IoMemory, which is unit 6's flow.
   into multiple address spaces at multiple virtual locations (the
   shared-memory primitive). Derived by splitting / attenuating a
   parent; pool roots given to the root server at boot.
+  **THE SHARED-MEMORY HALF IS BUILT (M3 unit 6, sawos design 9 D-3)** — one
+  region mapped into two processes, written from each side and read from
+  the other (`share_double_map`) — and NOT "at multiple virtual
+  locations", which SOS does not have: §5.5 says an address is the same
+  number in every process, so a region is shared AT ITS OWN ADDRESS. The
+  SENDABLE-OVER-PIPES half is M4's, because pipes are; until then a region
+  reaches a second process through `give` (before its start) or through a
+  row the launcher installs (any time). Splitting and attenuating are both
+  built — `MemoryOp.Split` and the universal `MINT_OP` over
+  `MemoryRight` — and unit 6 is the first unit with a reason to attenuate
+  a REGION rather than merely split one.
 - **`map(aspace, ...) -> Mapping`.** Mapping is a DISTINCT kernel
   object with its own handle, recording the virtual placement. **Only
   the Mapping handle can unmap** (`mapping.unmap()` / its Deinit).
@@ -1230,6 +1292,45 @@ STILL NOT BUILT: a THREAD handle is not waitable — attaching one is a
     driver package's own manifest, authorized against a window the board
     publishes. It is the M2 PLACEHOLDER for §2.5's Mapping and is that
     section's first migration case.
+    **RETIRED IN TWO STEPS, AND BOTH ARE DONE.** M3 unit 4 made the grant
+    an `IoMemory` a driver OBTAINS from its boot set and maps into itself
+    (§2.5's migration case); M3 unit 6 made it a capability a LAUNCHER
+    HANDS OVER — see the driver-child bullet below, which is where a
+    driver's authority now comes from.
+- **BUILT M3 unit 6 (sawos design 9), and it is the section's finale: A
+  DRIVER IS A CHILD PROCESS.** Every earlier §9 sentence is unchanged —
+  mask-on-fire, ack-to-rearm, ack-is-a-release, one task one Interrupt —
+  and what changed is WHO the driver is:
+  - **A DRIVER'S DEVICE ARRIVES FROM ANOTHER PROCESS.** Root drains the
+    console's register page as an `IoMemory`, `give`s it to a child under
+    a tag (spending the universal `Transfer` bit on the window and
+    `ProcessRight.Give` on the child), and the CHILD maps it into ITSELF
+    with `Process.map(iomemory:)`. The lean is deliberate: what crosses
+    the boundary is authority over a device, and where the row goes is
+    then the holder's own business. Root never maps the window, never
+    binds the line, and never learns the UART's address.
+  - **THE DRIVER PROGRAM DID NOT CHANGE.** The two child packages are the
+    two root-as-driver packages, driver body for driver body — same
+    registers, same enable bit, same drain-before-ack loop, same echoed
+    bytes, same line number — differing only in that the window arrives
+    by give, that they end with `Process.exit` (a driver child holds no
+    `SystemRight.Shutdown` and should not), and that they are linked at
+    the child base. Both twins stay in the suite, so the claim is two
+    transcripts side by side rather than an assertion.
+  - **THE TWO RIGHTS A DRIVER SPENDS ON ITSELF ARE NOT ITS LAUNCHER'S TO
+    WITHHOLD**, which is a recorded finding rather than a design.
+    `ProcessRight.InterruptBind` and `ProcessRight.Map` arrive on the
+    handle `SystemOp.ProcessSelf` mints, and that op mints the ONE Process
+    default set; a launcher's keep mask reaches the child's SYSTEM handle,
+    not the Process handle the child derives from it. Withholding them
+    would need `ProcessSelf` to take a keep mask of its own. Nothing in
+    v1 needs that — a driver child is exactly the process that should hold
+    both — and it is named here so the gap is visible.
+  - **THE SUPERVISOR PARKS ON THE DEATH, NOT ON A DEADLINE.** A driver
+    waits on a real serial port, so a timer would have to be guessed at —
+    and §9a's one bounded exception to the console handover is a kernel
+    whose armed tick narrates over a process that owns the device. Unit
+    5.5's Process waitable is what makes a launcher able to arm nothing.
 - **BUILT M3 unit 1.5 (sawos design 1), and what it amends here.**
   Delivery gains a THIRD entry point beside the trap path and the idle
   poll: a PREEMPTION POINT inside a long kernel operation. The sentence
@@ -1454,6 +1555,19 @@ event-driven EDGE of a process gets a second, distinct construct:
     entry. What is still absent is stated at §2.5 in the refcount clause's own
     words: FREE-ON-LAST-REFERENCE, which is unit 5's beside quotas. A split is
     permanent until teardown and teardown returns SLOTS, not ranges.
+    **AND M3 UNIT 6 (sawos design 9) FINISHED IT, in the two directions §2.5
+    named and one the ladder ruled on the way past.** SHARED MEMORY is real —
+    one region mapped into two processes, written from each side and read from
+    the other — and the launcher installs the second row itself, so a process
+    can be given ACCESS without possession of the region object. A DEVICE
+    WINDOW travels the other way: `give(iomemory:)` moves the console's page to
+    a driver child, which maps it into itself and echoes the harness's bytes on
+    both profiles. And EXECUTABLE BECAME AN AUTHORITY —
+    `MemoryRight.MapExecute` gates `MapAccess.Execute` per handle, and
+    `Write | Execute` in one row is a `BadArg` — which is the one piece of law
+    this unit added and is written out at §2.5. What stays absent is unchanged:
+    a freed Memory returns its SLOT and not its BYTES, and a region reaching a
+    RUNNING process is M4 IPC's.
   - **Quotas** (§12's creation-authority pin, which M2 ANSWERED with a
     factory-capability rights bit rather than a quota) — the per-process
     table, `QuotaExceeded`, and creator-pays accounting are design 232
@@ -1715,7 +1829,25 @@ event-driven EDGE of a process gets a second, distinct construct:
     and the C ABI declares no aggregate return), and `sos_wait_for_irq`
     per profile (`wfi` is an instruction). Assembly went DOWN, because a
     thread context built in Saw needs no register-clearing prologue.
-  - **M3 IN PROGRESS (design 232) — units 1, 1.5 and 2 DONE.** Unit 2 is
+  - **M3's LADDER IS COMPLETE (design 232, run in sawos designs 1-9) —
+    units 1, 1.5, 2, 2.75, 3, 4, 5, 5.5 and 6 all DONE.** The finale is
+    unit 6 (`designs/009-driver-child.md`): **A DRIVER IS A CHILD
+    PROCESS.** Root drains the console UART's register page out of its own
+    boot set as an `IoMemory`, GIVES it to a child, and the child maps it
+    into itself, binds the line, enables the device and echoes the
+    harness's bytes — on both profiles, with a driver body byte-identical
+    to the root-as-driver twin's. That one transcript spends every rung of
+    the ladder at once: the second address space (unit 2), the handle
+    lifecycle (2.75), give and the masked System handle (3), IoMemory and
+    `map` (4), the reference count and quotas (5), and a supervisor woken
+    by the death rather than by a guessed deadline (5.5). Beside it the
+    unit landed SHARED MEMORY — one region in two address spaces, the
+    launcher installing the child's row, the child holding no region
+    object — and, on an Aug-30 ruling, EXECUTABLE AS A RIGHT
+    (`MemoryRight.MapExecute`, with `Write | Execute` in one row refused);
+    §2.5 carries both. Eight new harness rows per the two profiles, 158
+    runs, with the 150 existing rows unchanged.
+    Unit 2 is
     `designs/002-create-process.md`, and it is the one the milestone is named
     for: **SOS RUNS TWO PROCESSES.** `process_create(image:memory:)` takes two
     Memory capabilities and returns an INERT process; `start()` mints its
@@ -1980,6 +2112,20 @@ event-driven EDGE of a process gets a second, distinct construct:
   Process handle per child and a launcher had to choose. What the mask withholds
   is enforced at run time by the ordinary rights check — a child that asks to
   `shutdown` is `AccessDenied` and dies, and the machine keeps running.
+  **AND WHAT A LAUNCHER FURNISHES REACHED HARDWARE** (M3 unit 6, sawos design 9
+  D-2). The furnishing vocabulary did not grow a mechanism — it grew a third
+  `give` funnel, `give(iomemory:)`, over a bit `iomemory_rights()` has minted
+  since unit 4 — and with it a launcher hands a child a DEVICE. That is this
+  section's design test taken literally: splitting the launcher's job out of
+  root required zero kernel changes, and so did moving a driver out of root,
+  because a device window was already a capability rather than a manifest key.
+  Two shapes are now both ordinary and a launcher picks by policy: GIVE the
+  capability and let the child install its own row (the driver child), or KEEP
+  the capability and install the child's row yourself (`share_double_map`'s
+  shared page, where the child holds no region object at all). Attenuation runs
+  the same way on either: `Memory.mint(rights:)` narrows a region before it
+  travels, which is where a launcher writes "this child may map its RAM and may
+  never map it executable" (§2.5's `MemoryRight.MapExecute`).
 - **v1 protocol conventions** (userspace convention section, not kernel
   surface): a launched process receives ONE bootstrap pipe handle at
   launch; its first messages request its initial handle set from the

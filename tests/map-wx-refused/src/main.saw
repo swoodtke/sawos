@@ -1,0 +1,154 @@
+// SOS M3 unit 6: NO ROW IS BOTH WRITABLE AND EXECUTABLE (sawos design 9 D-1;
+// spec §2.5).
+//
+// **THE COMPANION INVARIANT TO THE EXEC GATE, AND IT COSTS NOTHING
+// EXPRESSIBLE.** `map-exec-gated` beside this one asks whether a handle may
+// produce an executable row at all; this asks whether ONE row may be both
+// writable and executable. The answer is no, and the two lines above the refusal
+// are why that is not a restriction:
+//
+//   SOS mapwx: read-write here, wrote 107 read 107
+//   SOS mapwx: read-execute there: one region, two rows
+//   SOS mapwx: asking for write and execute in one row
+//   SOS: process fault: argument outside its domain
+//
+// **THE DOUBLE MAP IS THE POINT OF THE FIRST TWO LINES.** A double map is
+// sanctioned (design 6 agenda item 7 — two rows, two Mappings, no aliasing
+// bookkeeping owed on a machine that does not translate), so the JIT-shaped
+// pattern is fully available: write your instructions through the RW row, fetch
+// them through the RX row, over one region, with every individual protection row
+// W^X. What the refusal removes is only the single row a process could write to
+// and then fetch from, which has no honest use.
+//
+// **AND IT IS REFUSED THROUGH ROOT'S FULL POOL HANDLE**, which carries
+// `MemoryRight.MapExecute` and has just proved it two lines up. So this refusal
+// cannot be the exec gate wearing a different hat: the rights are all there, and
+// the word is what is wrong. `BadArg` rather than `AccessDenied` is the kernel
+// saying exactly that.
+//
+// **THE BOUNDARY, STATED HERE TOO** (it is stated at the check and in §2.5): this
+// rule governs the DYNAMIC map. A process image's own segments arrive through
+// `process_create`'s loader with `SegFlag` bits read out of the image, validated
+// by `imgformat.has_sane_perms`, which refuses write-without-read and
+// X-on-device and NOT W|X — an image's segments are kept apart by its linker
+// script. That door is `SystemRight.ProcessCreate` authority; this one is any
+// holder of a region.
+
+import sos.{System, Process, Memory, Mapping, MapAccess, SosStatus}
+
+extern "C" {
+    func sos_test_pool_base() -> UInt
+}
+
+/// One page of the pool, which is the smallest thing either profile grants.
+static CHUNK: UInt = 0x1000
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+static RX: UInt32 = MapAccess.Read | MapAccess.Execute
+
+/// The one word this unit refuses, spelled out of the same three cases every
+/// legal word is spelled out of — which is what makes it caller-checkable.
+static RWX: UInt32 = (MapAccess.Read | MapAccess.Write | MapAccess.Execute)
+
+/// The byte this case writes through its read-write row. A number that appears
+/// nowhere else in any transcript.
+static MARK: UInt8 = 0x6B
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+func poke(addr: UInt, value: UInt8) unsafe {
+    UnsafeMemory<UInt8, Normal>(addr).write(value)
+}
+
+func peek(addr: UInt) unsafe -> UInt8 {
+    UnsafeMemory<UInt8, Normal>(addr).read()
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS mapwx: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // One boot region: the RAM pool.
+    var pool_record = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS mapwx: no pool region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    guard let pool = pool_record.take_memory() else {
+        let _ = system.debug_print("SOS mapwx: pool record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let page = match pool.split(len: CHUNK) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS mapwx: split failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // THE WRITABLE ROW, and a byte through it — so "writable" is a fact about
+    // the machine rather than about the kernel's bookkeeping.
+    let _data = match proc.map(memory: &page, access: RW) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS mapwx: read-write map failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    // THE ADDRESS IS THE REGION'S OWN, and this program never learned it from
+    // the kernel: `map` answers with a Mapping, not a number, and a region has
+    // no bounds reader. Where the pool IS is the build's config, published to
+    // this package through one C constant per architecture, exactly as the map
+    // cases unit 4 landed do it.
+    let page_at = sos_test_pool_base()
+    poke(page_at, MARK)
+    print("SOS mapwx: read-write here, wrote {} read {}\n",
+          MARK as Int, peek(page_at) as Int)
+
+    // THE EXECUTABLE ROW, over the SAME region — the sanctioned double map, and
+    // the reason W^X-per-row takes nothing away.
+    let _text = match proc.map(memory: &page, access: RX) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS mapwx: read-execute map failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    // ASCII ONLY ON A CONSOLE LINE: `ascii_byte` renders a non-ASCII scalar as
+    // `?`, so an em dash here would reach the transcript as one. The prose
+    // above this file's code is where punctuation belongs.
+    let _ = system.debug_print("SOS mapwx: read-execute there: one region, two rows\n")
+
+    // **AND THE REFUSAL.** Same region, same full handle, same target — only the
+    // access word differs, and it is the one word the kernel will not install.
+    // A `BadArg` fault ends the process, so this is the last thing that happens.
+    let _ = system.debug_print("SOS mapwx: asking for write and execute in one row\n")
+    match proc.map(memory: &page, access: RWX) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS mapwx: UNREACHABLE\n")
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+        case Err(e) -> {
+            print("SOS mapwx: UNREACHABLE status {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+    }
+    let _ = proc.exit(EXIT_OK)
+}
