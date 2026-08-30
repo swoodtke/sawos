@@ -243,6 +243,24 @@ MAP_INTO_CHILD_PKG = os.path.join(TESTS_DIR, "map-into-child")
 IOMEMORY_CARVE_PKG = os.path.join(TESTS_DIR, "iomemory-carve")
 CHILD_TOUCH_PKG = os.path.join(TESTS_DIR, "child-touch")
 
+# sawos design 7 (M3 unit 5): quotas and the reference count. FIVE root servers
+# and two more CHILDREN, and the split into two halves is forced by the unit
+# itself rather than by the house rule.
+#
+# THE THREE REFCOUNT CASES ARE ROOT'S, because free-on-zero is about objects and
+# root may hold any number of them. THE TWO QUOTA CASES NEED A CHILD, because
+# root CANNOT MEET A QUOTA: root is init, its policy cap IS the machine (design
+# 7 D-3), so its ledger rows are unlimited and the slab is the only thing that
+# refuses it. A budget is a thing a launched process has, which is why proving
+# one costs a launcher and a child rather than a single image.
+QUOTA_EXCEEDED_PKG = os.path.join(TESTS_DIR, "quota-exceeded")
+QUOTA_VS_WALL_PKG = os.path.join(TESTS_DIR, "quota-vs-wall")
+REFCOUNT_FREE_PKG = os.path.join(TESTS_DIR, "refcount-free")
+INTERRUPT_UNBIND_PKG = os.path.join(TESTS_DIR, "interrupt-unbind")
+MAPPING_SLOT_FREE_PKG = os.path.join(TESTS_DIR, "mapping-slot-free")
+CHILD_QUOTA_PKG = os.path.join(TESTS_DIR, "child-quota")
+CHILD_MAPWALL_PKG = os.path.join(TESTS_DIR, "child-mapwall")
+
 CLOCK_BASICS_PKG = os.path.join(TESTS_DIR, "clock-basics")
 TIMER_ONESHOT_PKG = os.path.join(TESTS_DIR, "timer-oneshot")
 TIMER_INTERVAL_PKG = os.path.join(TESTS_DIR, "timer-interval")
@@ -2041,7 +2059,17 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS: boot regions={one}",
                        "SOS split: a=170 b=187 a-again=170",
-                       "SOS split: pool exhausted after 13 cuts",
+                       # M3 UNIT 5 MOVED THIS LINE, and moving it is the point
+                       # (sawos design 7 D-1). It used to read `pool exhausted
+                       # after 13 cuts` — the Memory SLAB running out with most
+                       # of the pool unallocated — and unit 4's own finding 5
+                       # said why: free-on-last-reference was unit 5's, so a
+                       # dropped piece returned a slot to nobody. It does now,
+                       # so twenty cut-and-drop rounds (past `MAX_MEMORIES`,
+                       # which is 16) complete with nothing refused. The number
+                       # that pinned the slab in a transcript is exactly what
+                       # stopped being true.
+                       "SOS split: cuts=20 refused=0",
                        "SOS split: asking for more than is left",
                        "SOS: process fault: argument outside its domain",
                        "SOS: process teardown"],
@@ -2153,6 +2181,172 @@ TEST_CASES = [
                        "SOS: process teardown"],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
+    },
+    # =========================================================================
+    # M3 unit 5 — quotas and the reference count (sawos design 7)
+    # =========================================================================
+    #
+    # Five cases, and every one of them is IMPOSSIBLE OR SILENTLY WRONG before
+    # this unit. There was no reference count, so an object's slot came back at
+    # its process's teardown and at no other moment — which made `refcount_free`
+    # unobservable, `interrupt_unbind` a `LineBound` FAULT, and
+    # `mapping_slot_free` the deviation design 6 recorded rather than a
+    # behaviour. And there was no ledger at all, so neither quota case had a
+    # refusal to name: `QuotaExceeded` did not exist as a value.
+    #
+    # The two mechanisms land together because the zero-crossing and the credit
+    # are ONE EVENT — a count without a ledger reclaims silently and a ledger
+    # without a count can only ever be credited by a death.
+    {
+        # **THE MONEY PROOF OF THE COUNT**: two ways an object outlives a
+        # release, and a teardown that counts NEITHER of the events this
+        # program made.
+        #
+        # `events={zero}` is the line to read. Two Events were created here;
+        # one was held by a SIBLING handle after its first was released, the
+        # other by an ATTACHMENT after its only handle was released, and each
+        # freed at its own zero — the first at the second release, the second
+        # at the `Waiter.Remove` that dropped its attachment. Yesterday this
+        # count was the number of events a program had ever made.
+        #
+        # `waiters={one}` beside it is the asymmetry that makes the cascade
+        # terminate: an attachment references the WAITABLE and never the Waiter
+        # that holds it, so the Waiter survives to the teardown while the thing
+        # it watched did not.
+        "name": "refcount_free",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": REFCOUNT_FREE_PKG,
+        "expect_out": ["{banner}",
+                       "SOS refcount: sibling word=42",
+                       "SOS refcount: attached key=77 word=9",
+                       "SOS refcount: done",
+                       "SOS: process teardown handles={five} threads={one} "
+                       "events={zero} waiters={one} interrupts={zero} "
+                       "timers={zero} process={zero}"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A BOUND LINE COMES BACK MID-LIFE. Releasing the last Interrupt handle
+        # masks the line and frees the slot, so the very next bind of the SAME
+        # line succeeds — where before this unit it met a live object and was a
+        # `LineBound` fault, which ends the process. The second line existing at
+        # all is therefore the claim.
+        #
+        # `interrupts={one}` says the kernel is holding exactly one Interrupt
+        # when the process ends, after this program bound the same line twice.
+        # `handles={five}` is §12's three, the Process handle this program
+        # derived, and the SECOND interrupt handle — the first is not among
+        # them, which is the count's own small statement.
+        "name": "interrupt_unbind",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": INTERRUPT_UNBIND_PKG,
+        "expect_out": ["{banner}",
+                       "SOS irqunbind: bound line 5",
+                       "SOS irqunbind: rebound=1",
+                       "SOS: process teardown handles={five} threads={one} "
+                       "events={zero} waiters={zero} interrupts={one} "
+                       "timers={zero} process={zero}"],
+        "expect_clean_exit": True,
+    },
+    {
+        # DESIGN 6's RECORDED DEVIATION, SHOWN RESOLVED, and §2.5's leak shown
+        # to be exactly what it always said it was.
+        #
+        # `rounds=12` is past `MAX_MAPPINGS` (8), so the slab is demonstrably
+        # recycling — and past root's own ROW allowance too (its free rows,
+        # five on the smaller profile), so `Unmap` is demonstrably crediting the
+        # ledger as well as returning the row. One number carries both halves.
+        #
+        # `husk wrote 0x5e read 94` is the other side: a Mapping dropped WITHOUT
+        # an unmap frees its slot and LEAVES its row, so the memory is still
+        # reachable through a grant no object names any more. That is §2.5's
+        # "permanent, safe-but-leaked", executed.
+        "name": "mapping_slot_free",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAPPING_SLOT_FREE_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS mapfree: rounds=12 refused=0",
+                       "SOS mapfree: husk wrote 94 read 94",
+                       "SOS mapfree: done",
+                       "SOS: process teardown"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **A PROCESS TOLD "NO" BY POLICY RATHER THAN BY THE MACHINE**, for the
+        # first time in SOS. The child creates Events to its own limit, meets
+        # `QuotaExceeded`, RELEASES one and creates again successfully — which
+        # is the half `NoResource` can never have, since a machine edge does not
+        # move because one process let go of something.
+        #
+        # THE SLAB WAS NEVER THE LIMIT THAT TRIPPED, and the numbers say so:
+        # `MAX_EVENTS` is 8, the child's allowance is 4, and root creates no
+        # events in this case at all — so half the slab was free at the moment
+        # of the refusal. If the two were confused, the fifth create would have
+        # succeeded and `made=` would read 5.
+        #
+        # `events={three}` in the child's teardown is the ledger's other half
+        # arriving as somebody else's count: five events made, one released, one
+        # dropped, three still held at the end.
+        #
+        # `status=65540` is `Exited`(1)<<16 | 4 — the child's own count, read
+        # through the Process handle root kept.
+        "name": "quota_exceeded",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_EXCEEDED_PKG,
+        "children": [CHILD_QUOTA_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS quotaex: created",
+                       "SOS quotaex: started",
+                       "SOS childquota: made=4 quota=1 resumed=1",
+                       "SOS: process exit: code={four} process={one}",
+                       # The child's estate: the System handle it printed
+                       # through, the Process handle it derived from it, and the
+                       # THREE events it was still holding. The one it released
+                       # and the one it dropped after the credit are not among
+                       # them — the same fact `events={three}` states from the
+                       # slab's side.
+                       "SOS: process teardown handles={five} threads={one} "
+                       "events={three} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS quotaex: root observed child status=65540",
+                       "SOS quotaex: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # AGENDA ITEM 8's ORDERING, OBSERVABLE — and a clean run IS the proof.
+        # The kernel's half of this claim is a `fatal_kernel` at the row-budget
+        # check, which by construction never appears in a passing transcript; so
+        # what a case can show is that the POLICY refusal arrives first, and
+        # that the machine is still standing to say so.
+        #
+        # `maps=2` IS THE SAME ON BOTH PROFILES, which is why this is a child
+        # and not root. A child's allowance is `DEFAULT_QUOTA_MAPPINGS`, clamped
+        # to the rows its own domain has left after its image spent three — two
+        # on both machines, against five free rows on riscv32 and six on arm64.
+        # Root's allowance IS its free row count, so a root-side version would
+        # print a different number per machine.
+        #
+        # EACH MAPPING OBJECT IS DROPPED AND EACH ROW STAYS, which is what makes
+        # this a LEDGER test: the Mapping slab is untouched at the refusal, so
+        # only a quota that counts installed ROWS could have refused the third.
+        "name": "quota_vs_wall",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_VS_WALL_PKG,
+        "children": [CHILD_MAPWALL_PKG],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS quotawall: created",
+                       "SOS quotawall: gave a page",
+                       "SOS quotawall: started",
+                       "SOS childmapwall: maps=2 quota=1",
+                       "SOS: process exit: code={two} process={one}",
+                       "SOS quotawall: root observed child status=65538",
+                       "SOS quotawall: done"],
+        "expect_clean_exit": True,
     },
 ]
 

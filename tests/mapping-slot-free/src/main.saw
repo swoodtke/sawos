@@ -1,0 +1,157 @@
+// SOS M3 unit 5: THE MAPPING SLOT COMES BACK, AND THE ROW SOMETIMES DOES NOT
+// (sawos design 7 D-2; §2.5).
+//
+// **DESIGN 6's RECORDED DEVIATION, RESOLVED.** Unit 4 wanted `Unmap` to free
+// the Mapping slot and could not do it: a slab slot freed while a handle still
+// named it would be reachable through that handle the moment the next `map`
+// reused it, and design 3's generations cannot cover that (a generation lives in
+// the handle ENTRY, and the entry is not what went away). The refcount is
+// exactly what retires the hazard — a slot frees when it is unmapped AND
+// unreferenced — and this case is that sentence, twice, from its two sides:
+//
+//   SOS mapfree: rounds=12 refused=0     <- MAP, UNMAP, DROP recycles past the
+//                                           slab. `MAX_MAPPINGS` is 8, so a
+//                                           twelfth round could not have been
+//                                           served out of fresh slots
+//   SOS mapfree: husk wrote 0x5e read 94 <- and a mapping DROPPED WITHOUT AN
+//                                           UNMAP frees its SLOT and LEAVES ITS
+//                                           ROW: the memory is still there
+//   SOS mapfree: done
+//
+// **THE SECOND LINE IS §2.5's LEAK, MADE MECHANICAL.** "A mapping dropped
+// without unmap is permanent, safe-but-leaked" was a sentence the spec ratified
+// and nothing executed; now the Mapping object really is gone — its slot is
+// back in the slab and no handle names it — while the protection row it
+// installed is still in this process's domain, which is what the write and the
+// read prove. The row is unremovable from here on, and that is what "leaked"
+// has always meant. It ends at the teardown, which is the bound.
+//
+// **THE FIRST LINE ALSO PROVES THE QUOTA CREDIT**, which is the half a reader
+// might not expect. The mapping quota counts INSTALLED ROWS in the target's
+// domain, and root's limit is its domain's free rows — five on the smaller
+// profile — so twelve rounds are only possible if `Unmap` gives a row back to
+// the ledger as well as to the hardware. A run that credited nothing would be
+// refused on round six.
+
+import sos.{System, Process, Memory, Mapping, MapAccess, SosStatus}
+
+// WHERE THE POOL IS — this program's config, per architecture, in C because Saw
+// cannot name an address (DF-172a). See `tests/poolbase_riscv32.c`.
+extern "C" {
+    func sos_test_pool_base() -> UInt
+}
+
+/// One protection unit's worth on either profile.
+static CHUNK: UInt = 0x1000
+
+/// Read and write, which is what a scratch region wants.
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// How many map/unmap/drop rounds the loop runs. **PAST `MAX_MAPPINGS` ON
+/// PURPOSE** — the kernel's Mapping slab holds eight and root's row budget is
+/// smaller still, so twelve completed rounds could not be served without both
+/// the slot and the quota row coming back each time.
+static ROUNDS: Int = 12
+
+/// The byte the husk arm writes through a row whose Mapping object no longer
+/// exists. A number that appears nowhere else in this transcript.
+static MARK: UInt8 = 0x5E
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Write one byte through a mapping. `unsafe` because it names a pointer type,
+/// and confined to one line for design 136's reason.
+func poke(addr: UInt, value: UInt8) unsafe {
+    UnsafeMemory<UInt8, Normal>(addr).write(value)
+}
+
+/// Read one byte back.
+func peek(addr: UInt) unsafe -> UInt8 {
+    UnsafeMemory<UInt8, Normal>(addr).read()
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS mapfree: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // The boot set carries one row: the RAM POOL, tag 0 because it is the only
+    // one. Root's config is what says so.
+    var record = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS mapfree: no pool region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    guard let pool = record.take_memory() else {
+        let _ = system.debug_print("SOS mapfree: boot record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let chunk = match pool.split(len: CHUNK) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS mapfree: split failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let base = sos_test_pool_base()
+
+    // ===== ROUND TRIPS: map, unmap, drop =====
+    //
+    // The mapping wrapper is bound BY THE ARM so it can be UNMAPPED — `unmap`
+    // is a method on the object — and then dies at the arm's end, which
+    // releases the only handle and takes the count to zero. Both halves are
+    // needed and they do different things: the unmap returns the ROW (to the
+    // hardware and to the ledger), the drop returns the SLOT.
+    var rounds = 0
+    var refused: UInt = 0
+    while rounds < ROUNDS && refused == 0 {
+        match proc.map(memory: &chunk, access: RW) {
+            case Ok(m) -> {
+                match m.unmap() {
+                    case Ok(_) -> {},
+                    case Err(_) -> { refused = 2 },
+                }
+                rounds = rounds + 1
+            },
+            case Err(_) -> { refused = 1 },
+        }
+    }
+    print("SOS mapfree: rounds={} refused={}\n", rounds, refused)
+
+    // ===== THE HUSK: dropped without an unmap =====
+    //
+    // The row goes in and the object goes away, in that order and with nothing
+    // between them. What is left is a grant this process holds and can never
+    // name again.
+    let husk = match proc.map(memory: &chunk, access: RW) {
+        case Ok(x) -> x,
+        case Err(e) -> {
+            print("SOS mapfree: husk map failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = move husk
+
+    poke(base, MARK)
+    print("SOS mapfree: husk wrote {} read {}\n", MARK as Int, peek(base) as Int)
+
+    let _ = system.debug_print("SOS mapfree: done\n")
+    let _ = proc.exit(EXIT_OK)
+    let _ = system.shutdown(EXIT_FAILED)
+}

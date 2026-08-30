@@ -31,7 +31,6 @@ import sosabi.{
 }
 import kcore.limits.{
     MAX_GRANT_ROWS,
-    MAX_HANDLES,
     MAX_IOMEMORIES,
     MAX_MEMORIES,
     MAX_PROCESSES,
@@ -43,17 +42,19 @@ import kcore.limits.{
 import kcore.mem.{copy_bytes, word_bytes}
 import kcore.diag.{console, fatal_image}
 import kcore.objects.{
-    HANDLES,
     IOMEMORIES,
     IoMemorySlot,
     MEMORIES,
     MemorySlot,
+    QuotaKind,
     SlotState,
     alloc_iomemory,
     alloc_memory,
     boot_handle_room,
+    install_quota_limits,
     mint_handle,
     queue_boot_handle,
+    quota_charge,
 }
 import kcore.threads.{
     CURRENT_THREAD,
@@ -169,6 +170,23 @@ public(package) struct ProcessSlot {
     public(package) grants: [GrantRow; MAX_GRANT_ROWS],
     public(package) exit_kind: ProcessStatusKind,
     public(package) exit_code: UInt,
+    /// How many handle entries ANYWHERE name this process (sawos design 7
+    /// D-1).
+    ///
+    /// **THIS IS DESIGN 3 D-3's SCAN, GENERALIZED INTO A COUNT.** Unit 2.75
+    /// answered "may this Gone slot be spent again" by walking every process's
+    /// handle table looking for a reference, and argued at the time that a
+    /// per-slot count would be a second fact to keep in step with the table.
+    /// Unit 5 keeps seven other kinds' counts in step at exactly the same
+    /// sites, so the argument reverses: the count is now the CHEAPER thing to
+    /// maintain and the walk is the odd one out. The answer is identical —
+    /// no handle naming the slot means no possible reader of its §8 status
+    /// word — and `reclaim_process_slot` reads this instead of scanning.
+    ///
+    /// It counts references from EVERY process's table, which is why it lives
+    /// on the slot rather than in the ledger: whoever still holds a handle is
+    /// the reader that matters, and that need not be the process releasing one.
+    public(package) refs: UInt16,
 }
 
 public(package) unsafe static var PROCESSES: [ProcessSlot; MAX_PROCESSES] = [
@@ -177,7 +195,8 @@ public(package) unsafe static var PROCESSES: [ProcessSlot; MAX_PROCESSES] = [
              grant_count: 0,
              grants: [GrantRow(base: 0, top: 0, perms: 0, device: false);
                       MAX_GRANT_ROWS],
-             exit_kind: ProcessStatusKind.Running, exit_code: 0); MAX_PROCESSES]
+             exit_kind: ProcessStatusKind.Running, exit_code: 0,
+             refs: 0); MAX_PROCESSES]
 
 /// Take a free process slot, or `NO_PROCESS` when the table is full.
 ///
@@ -221,39 +240,40 @@ public(package) func alloc_process() unsafe -> Int {
 /// is `GetStatus` through a Process handle, so no handle naming the slot means
 /// no possible reader and the slot may go.
 ///
-/// SCANNED, NOT COUNTED. A per-slot refcount would be a second fact to keep in
-/// step with the table across mint, release, teardown and `give`; the table
-/// itself cannot disagree with the table. The walk is `MAX_PROCESSES *
-/// MAX_HANDLES` — thirty-two entries — at a release, which is the rate a process
-/// drops capabilities and nowhere near a hot path.
+/// **COUNTED, NOT SCANNED — AND THAT IS WHAT UNIT 5 CHANGED HERE** (sawos
+/// design 7 D-1, superseding design 3 D-3's walk). Unit 2.75 argued the walk
+/// was the cheaper thing, because a per-slot count would be a second fact to
+/// keep in step with the table across mint, release, teardown and `give`.
+/// Design 7 keeps seven other kinds' counts in step at exactly those sites, so
+/// the second fact is no longer second: `ProcessSlot.refs` is maintained by the
+/// same lines that maintain an Event's, and the thirty-two-entry walk is gone
+/// with the era that needed it. The ANSWER is unchanged — zero references means
+/// no possible reader of the §8 status word — which is why no transcript moves
+/// for this alone.
 ///
-/// EVERY PROCESS'S TABLE, not the caller's: the reader that matters is whoever
-/// still holds a handle, and that need not be the process releasing one. It runs
+/// EVERY PROCESS'S TABLE, not the caller's, exactly as before: the count is
+/// incremented wherever a Process handle is bound, in whichever table. It runs
 /// at the END of a process's own teardown too, for its own slot — the dying
 /// process's handles are closed there, and if it happened to hold the last one
-/// (a process that released its creator's handle, or a self-referring root) that
-/// close is what makes the slot free.
+/// (a process that released its creator's handle, or a self-referring root)
+/// that close is what takes the count to zero.
 ///
 /// D-1's generations are what make the reused slot SAFE: a later process landing
 /// here gets a new life, and a word onto the old one has a generation that no
 /// longer matches. `clear_domain` already invalidated `LAST_PROT_PROCESS` in
 /// anticipation of exactly this.
+///
+/// A LIVE PROCESS IS NEVER RECLAIMED however far its count falls — a process
+/// nobody holds a handle to is still running, and its slot is what it is
+/// running IN. That is the whole reason this is a `Gone`-only arm rather than
+/// the plain "free at zero" every other kind gets.
 public(package) func reclaim_process_slot(slot: Int) unsafe {
     match PROCESSES[slot].state {
         case Gone -> {},
         case _ -> { return },
     }
-    var i: Int = 0
-    while i < MAX_PROCESSES * MAX_HANDLES {
-        match HANDLES[i].obj_type {
-            case Process -> {
-                if HANDLES[i].target == slot {
-                    return
-                }
-            },
-            case _ -> {},
-        }
-        i = i + 1
+    if PROCESSES[slot].refs != 0 {
+        return
     }
     PROCESSES[slot].state = ProcessState.Free
 }
@@ -777,13 +797,20 @@ func mint_boot_regions(p: Int) unsafe {
                 if slot == NO_MEMORY {
                     fatal_image("out of Memory slots for the boot regions", i)
                 }
+                // `refs: 1` IS THE MINT BELOW, WRITTEN AT THE SLOT (sawos
+                // design 7 D-1). A boot region is created with exactly one
+                // handle onto it, so the count starts at one rather than being
+                // incremented afterwards — a fresh slot's reference is not a
+                // change to a count, it IS the count.
                 MEMORIES[slot] = MemorySlot(state: SlotState.Live, process: p,
                                             base: row.base as UInt,
-                                            len: row.len as UInt)
+                                            len: row.len as UInt,
+                                            refs: 1)
                 let handle = mint_handle(p, ObjType.Memory, memory_rights(), slot)
                 if handle == NO_HANDLE {
                     fatal_image("no handle table room for the boot regions", i)
                 }
+                quota_charge(p, QuotaKind.Memory)
                 queue_boot_handle(p, i, BootHandleKind.Memory, handle)
             },
             case Device -> {
@@ -793,12 +820,14 @@ func mint_boot_regions(p: Int) unsafe {
                 }
                 IOMEMORIES[slot] = IoMemorySlot(state: SlotState.Live, process: p,
                                                 base: row.base as UInt,
-                                                len: row.len as UInt)
+                                                len: row.len as UInt,
+                                                refs: 1)
                 let handle = mint_handle(p, ObjType.IoMemory, iomemory_rights(),
                                          slot)
                 if handle == NO_HANDLE {
                     fatal_image("no handle table room for the boot regions", i)
                 }
+                quota_charge(p, QuotaKind.IoMemory)
                 queue_boot_handle(p, i, BootHandleKind.IoMemory, handle)
             },
         }
@@ -874,6 +903,20 @@ public func start_process(entry: UInt, stack_top: UInt,
     PROCESSES[p].rw_top = rw_top
     PROCESSES[p].exit_kind = ProcessStatusKind.Running
     PROCESSES[p].exit_code = 0
+    PROCESSES[p].refs = 0
+
+    // **THE LEDGER OPENS BEFORE THE FIRST MINT** (sawos design 7 D-3), because
+    // `mint_handle` consults the handle row and a slot with no limits installed
+    // can allocate nothing. Root's rows are `QUOTA_UNLIMITED` — root is init and
+    // its policy cap IS the machine, so the SLAB is what refuses it — with the
+    // one exception the mapping row is: it is clamped to the rows root's domain
+    // still has after the loader spent its image's, which is what makes
+    // `install_row`'s kernel-bug `fatal` unreachable.
+    //
+    // The loader has already recorded root's grant rows by this line, which is
+    // why the free-row count can be read here at all.
+    install_quota_limits(p, true,
+                         (hal.GRANT_ROW_BUDGET as Int) - PROCESSES[p].grant_count)
 
     // §12's ORDER IS THE CONTRACT and it is unchanged by design 3: these three
     // are minted into a virgin table, so each lands at generation 0 and D-1's
@@ -885,12 +928,17 @@ public func start_process(entry: UInt, stack_top: UInt,
     // neither is bound to a name here.
     let system = mint_handle(p, ObjType.System, root_system_rights(), 0)
     let _ = mint_handle(p, ObjType.Process, process_rights(), p)
+    // ROOT'S OWN PROCESS HANDLE IS A REFERENCE TO ROOT'S SLOT, counted like any
+    // other (sawos design 7 D-1). It is what makes root's count start at one
+    // rather than at zero, and the teardown's own check is what reads it back.
+    PROCESSES[p].refs = PROCESSES[p].refs + 1
 
     let main = alloc_thread()
     let _ = mint_handle(p, ObjType.Thread, thread_rights(), main)
     THREADS[main] = ThreadSlot(state: ThreadState.Running, process: p,
                                exit_code: 0,
                                joiners: 0, link: 0, wait_buf: 0)
+    quota_charge(p, QuotaKind.Thread)
     CURRENT_THREAD = main
     SLICE_LEFT = SLICE_TICKS
 

@@ -61,8 +61,10 @@ import kcore.objects.{
     NO_ROW,
     SlotState,
     clear_boot_handles,
+    quota_clear,
     unbind_handle,
 }
+import kcore.refs.{unref_teardown}
 import kcore.threads.{
     CURRENT_THREAD,
     LAST_PROT_PROCESS,
@@ -340,12 +342,25 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     //
     // It still touches only the ENTRY and never the OBJECT: what the process
     // owned is freed by the loops below, per slab, exactly as before.
+    //
+    // **AND IT COUNTS, WITHOUT FREEING** (sawos design 7 D-1). Every entry here
+    // is one reference fewer, and objects some OTHER process owns must see
+    // that — a region a launcher gave a child is the case that exists today.
+    // But the decrement is `unref_teardown`, which deliberately does not free
+    // at zero: the sweeps below free what this process OWNED, by ownership, and
+    // they COUNT what they freed for the report. A close-all that freed by
+    // reference would collapse those counts for objects being reclaimed either
+    // way, in this same function, and would move every teardown line in the
+    // suite — which design 7 D-5 authorizes for pre-exit releases and for
+    // nothing else. `unref_teardown`'s own docstring carries the argument.
     var closed: UInt = 0
     var h: Int = 0
     while h < MAX_HANDLES {
-        match HANDLES[p * MAX_HANDLES + h].obj_type {
+        let entry = HANDLES[p * MAX_HANDLES + h]
+        match entry.obj_type {
             case Unbound -> {},
             case _ -> {
+                unref_teardown(entry.obj_type, entry.target)
                 unbind_handle(p, h)
                 closed = closed + 1
             },
@@ -398,7 +413,8 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
                     hal.irq_mask(INTERRUPTS[q].line)
                     INTERRUPTS[q] = InterruptSlot(state: SlotState.Free,
                                                   process: 0, line: 0,
-                                                  pending: false, attachment: 0)
+                                                  pending: false, attachment: 0,
+                                                  refs: 0)
                     irqs_freed = irqs_freed + 1
                 },
             }
@@ -440,7 +456,7 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
                 case Live -> {
                     EVENTS[e] = EventSlot(state: SlotState.Free, process: 0,
                                           mode: EventMode.Or, word: 0,
-                                          attachment: 0)
+                                          attachment: 0, refs: 0)
                     events_freed = events_freed + 1
                 },
             }
@@ -456,7 +472,7 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
                 case Free -> {},
                 case Live -> {
                     WAITERS[w] = WaiterSlot(state: SlotState.Free, process: 0,
-                                            attached: 0, blocked: 0)
+                                            attached: 0, blocked: 0, refs: 0)
                     waiters_freed = waiters_freed + 1
                 },
             }
@@ -486,7 +502,7 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
                     TIMERS[tm] = TimerSlot(state: SlotState.Free, process: 0,
                                            clock: 0, armed: false,
                                            deadline_ns: 0, interval_ns: 0,
-                                           fires: 0, attachment: 0)
+                                           fires: 0, attachment: 0, refs: 0)
                     timers_freed = timers_freed + 1
                 },
             }
@@ -508,7 +524,7 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
                 case Free -> {},
                 case Live -> {
                     MEMORIES[m] = MemorySlot(state: SlotState.Free, process: 0,
-                                             base: 0, len: 0)
+                                             base: 0, len: 0, refs: 0)
                 },
             }
         }
@@ -528,7 +544,8 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
                 case Free -> {},
                 case Live -> {
                     IOMEMORIES[io] = IoMemorySlot(state: SlotState.Free,
-                                                  process: 0, base: 0, len: 0)
+                                                  process: 0, base: 0, len: 0,
+                                                  refs: 0)
                 },
             }
         }
@@ -558,7 +575,8 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
             case Live -> {
                 if MAPPINGS[mp].process == p {
                     MAPPINGS[mp] = MappingSlot(state: SlotState.Free, process: 0,
-                                               target: 0, row: NO_ROW)
+                                               target: 0, row: NO_ROW,
+                                               refs: 0)
                 } else if MAPPINGS[mp].target == p {
                     MAPPINGS[mp].row = NO_ROW
                 }
@@ -579,6 +597,22 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // reclaimable (design 3 D-3) and the next occupant would otherwise inherit a
     // stranger's boot set and drain handles that are not its own.
     clear_boot_handles(p)
+
+    // **AND THE QUOTA LEDGER — CREDITS DIE WITH IT** (sawos design 7 D-4). This
+    // is the whole of the orphan write-off, and one line is the right size for
+    // it because the interesting case cannot yet occur: nothing gives handles
+    // UPWARD (a give targets a `Created` child), so no object outlives the
+    // process charged for it, and every row this slot carries is written off
+    // exactly as the slabs above returned what it named. The LIMITS go with the
+    // used counts, for `clear_boot_handles`' own reason: the slot is
+    // reclaimable, and the next occupant must not inherit a stranger's
+    // allowance.
+    //
+    // The one charge that legitimately outlives its charger is a MAPPING ROW in
+    // somebody else's domain — and it is not this process's row at all: it is
+    // the TARGET's, credited when the row goes, which for a target that is
+    // still alive is its own `Unmap` or its own teardown.
+    quota_clear(p)
 
     // AND THE SLOT ITSELF, IF NOBODY CAN STILL READ IT (sawos design 3 D-3).
     // The dying process's own handles were closed at the top of this function,

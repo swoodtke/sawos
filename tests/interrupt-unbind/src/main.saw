@@ -1,0 +1,89 @@
+// SOS M3 unit 5: A BOUND LINE COMES BACK MID-LIFE (sawos design 7 D-1; spec
+// §9).
+//
+// **THIS PROGRAM COULD NOT HAVE SURVIVED YESTERDAY.** Until free-on-zero, an
+// Interrupt's slot came back at its process's teardown and at no other moment,
+// so the line it held stayed bound for as long as the process lived — and a
+// second bind of the same line was a `LineBound` FAULT, which ends the process.
+// The transcript is therefore the whole claim:
+//
+//   SOS irqunbind: bound line 5
+//   SOS irqunbind: rebound=1              <- the line was genuinely returned
+//   SOS: process teardown ... interrupts={one} ...
+//
+// **AND THE MASK IS THE PART THAT IS NOT BOOKKEEPING.** Freeing the slot is
+// half of it; the other half is that the kernel takes the LINE back, exactly as
+// the teardown does — §9's handover run backwards. A device the dropping
+// process was driving may still be asserting, and an unmasked line with no
+// object behind it would be taken, reported and masked once per fire forever.
+// That half is not directly observable from userspace, and the rebind is what
+// stands in for it: `interrupt_bind` UNMASKS on success, so a line that came
+// back masked is a line the second bind could arm.
+//
+// `interrupts={one}` in the teardown is the small statement beside the big one:
+// this program bound the same line twice and the kernel is holding exactly one
+// Interrupt when it ends. Two would mean the first was never reclaimed — and it
+// could not be two anyway, because the second bind would have been the fault.
+//
+// THE RELEASE IS SPELLED AS A DROP, which is the typed layer's only spelling
+// for it (design 3 D-5): `let _ = move first` consumes the wrapper and its
+// deinit issues the syscall. Nothing here names a handle word.
+
+import sos.{System, Process, Interrupt}
+
+/// A line both machines wire and neither asserts unasked — `irq_early_ack`'s
+/// own choice, and for the same reason: nothing can fire between the bind and
+/// the release, so the sequence below is forced rather than raced.
+static QUIET_LINE: UInt = 5
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS irqunbind: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let first = match proc.interrupt_bind(line: QUIET_LINE) {
+        case Ok(i) -> i,
+        case Err(e) -> {
+            print("SOS irqunbind: first bind failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    print("SOS irqunbind: bound line {}\n", QUIET_LINE)
+
+    // **THE RELEASE.** This is the only handle onto the object, so the count
+    // reaches zero inside this line: the kernel masks the line and the slot goes
+    // back to the slab, both before the next statement runs.
+    let _ = move first
+
+    // **AND THE PROOF.** A line still bound answers `LineBound`, which is a
+    // FAULT and would end this process without printing anything further. The
+    // line below existing in the transcript at all is the claim.
+    let second = match proc.interrupt_bind(line: QUIET_LINE) {
+        case Ok(i) -> i,
+        case Err(e) -> {
+            print("SOS irqunbind: rebind refused: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS irqunbind: rebound=1\n")
+
+    // The second Interrupt is still held here — nothing consumes `second`, and
+    // `exit` does not return — so the teardown reclaims exactly one, which is
+    // what its count says. EXIT rather than SHUTDOWN, so that line is printed
+    // at all: `shutdown` stops the machine with nothing said.
+    let _ = proc.exit(EXIT_OK)
+    let _ = system.shutdown(EXIT_FAILED)
+}

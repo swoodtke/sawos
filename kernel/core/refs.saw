@@ -1,0 +1,408 @@
+//! THE REFERENCE COUNT, AND WHAT ZERO DOES (sawos design 7 D-1/D-2) — the
+//! per-kind matrix in one place, on `waitables`' own model.
+//!
+//! Every countable slab slot carries a `refs`, and everything that can be said
+//! about maintaining it is one of three questions, each answered by an
+//! EXHAUSTIVE match on `ObjType`:
+//!
+//!   `ref_object`     something now names this object
+//!   `unref_object`   something no longer does — and zero FREES, right here
+//!   `free_object`    the slot goes back, and the kind's last rites run
+//!
+//! That is a MATRIX rather than a funnel because the answers genuinely differ
+//! per kind — an Interrupt's last rites mask a device line, a Timer's
+//! reprogram the comparator, a Waiter's detach a list, a Mapping's deliberately
+//! leave a protection row installed — and it is written as three functions in
+//! one place so the matrix is READABLE AS ONE. A kind added to `ObjType` fails
+//! all three to compile until somebody says what references it, which is the
+//! property a `_` arm anywhere here would destroy.
+//!
+//! # ZERO FREES, SYNCHRONOUSLY (D-1)
+//!
+//! The kernel is one context running to completion, so the count hits zero
+//! INSIDE the very syscall that dropped the last reference and the free is a
+//! plain call: no deferred reclamation, no cleanup queue, nothing to drain at a
+//! later point. Cascades compose out of the same two functions — releasing a
+//! Waiter to zero detaches its attachments, which may drop an Event to zero,
+//! which frees and credits — and they terminate because an attachment is
+//! counted on the WAITABLE and never on the Waiter, so the graph is a forest.
+//!
+//! WHAT ZERO DOES NOT FREE IS A RANGE. A freed Memory slot returns to the slab
+//! and its bytes return to no pool: the front-cut parent cannot absorb an
+//! arbitrary hole (the one-`{base,len}` shape, design 6 D-2). Quotas count
+//! OBJECTS, not bytes, in v1; byte accounting arrives with a real allocator,
+//! and §2.5's pages-free-on-last-reference clause is narrowed accordingly in
+//! the spec.
+//!
+//! # WHY THIS IS A MODULE AND WHERE IT SITS
+//!
+//! Between `process` and `wake`, and the call graph is what puts it there. It
+//! has to reach EVERY slab — the two memory slabs and the handle table below in
+//! `objects`, the Timer slab in `time`, the three wait slabs in `waitables` —
+//! and also `PROCESSES`, because a Process's own count is what design 3 D-3's
+//! reclaim now reads. Written any lower it could not see the process table;
+//! written any higher it would be above the teardown that also frees these
+//! slabs. It reaches nothing above itself.
+//!
+//! Two mints are NOT expressed through this matrix and could not be: the boot
+//! path's, in `process`, which sits below this file. They cost nothing to write
+//! out — a boot Memory and IoMemory are created with `refs: 1` in the slot
+//! literal (a fresh object's first reference is not a change to a count, it IS
+//! the count) and root's own Process handle is one increment on its own table.
+//! Every GENERIC site — where a handle is bound to a kind the code does not
+//! know — comes through here.
+
+import hal
+import sosabi.{EventMode, ObjType}
+import kcore.diag.{fatal_kernel}
+import kcore.objects.{
+    IOMEMORIES,
+    IoMemorySlot,
+    MAPPINGS,
+    MEMORIES,
+    MappingSlot,
+    MemorySlot,
+    NO_ROW,
+    QuotaKind,
+    SlotState,
+    quota_credit,
+}
+import kcore.time.{TIMERS, TimerSlot, reprogram_timer}
+import kcore.waitables.{
+    ATTACHMENTS,
+    Attachment,
+    EVENTS,
+    EventSlot,
+    INTERRUPTS,
+    InterruptSlot,
+    WAITERS,
+    WaitableKind,
+    WaiterSlot,
+    set_waitable_attachment,
+}
+import kcore.process.{PROCESSES, reclaim_process_slot}
+
+/// Something now names object `slot` of kind `kind`.
+///
+/// Called BESIDE every generic bind: `mint_handle` at each op that hands out a
+/// handle onto an object that already existed, `give`'s child-side bind, and
+/// `waiter_add`'s attachment (through `ref_waitable`). A creation site does not
+/// call it — a fresh slot is written with `refs: 1`, because its first
+/// reference is the count rather than a change to one.
+///
+/// FOUR KINDS ARE NOT COUNTED, and each arm says which reason it is:
+///
+///   - `System` has no slab at all. It is the singleton every process's boot
+///     handle names, so there is no slot to return and nothing to return it to.
+///   - `Clock` is EXEMPT — kernel-eternal, owned by nobody (the Aug-17 user
+///     ruling). Freeing a domain's slot on a release would take the machine's
+///     monotonic counter away from everybody else.
+///   - `Thread` is NOT COUNTED IN v1: the join/exit protocol owns a thread
+///     slot's lifetime and does it on terms a handle count cannot express
+///     (see `ThreadSlot`). Recorded, deferred.
+///   - `Unbound` names nothing, so a bind of it is not a thing that happens.
+public(package) func ref_object(kind: ObjType, slot: Int) unsafe {
+    match kind {
+        case Event -> { EVENTS[slot].refs = EVENTS[slot].refs + 1 },
+        case Waiter -> { WAITERS[slot].refs = WAITERS[slot].refs + 1 },
+        case Interrupt -> { INTERRUPTS[slot].refs = INTERRUPTS[slot].refs + 1 },
+        case Timer -> { TIMERS[slot].refs = TIMERS[slot].refs + 1 },
+        case Memory -> { MEMORIES[slot].refs = MEMORIES[slot].refs + 1 },
+        case IoMemory -> { IOMEMORIES[slot].refs = IOMEMORIES[slot].refs + 1 },
+        case Mapping -> { MAPPINGS[slot].refs = MAPPINGS[slot].refs + 1 },
+        case Process -> { PROCESSES[slot].refs = PROCESSES[slot].refs + 1 },
+        case System -> {},
+        case Clock -> {},
+        case Thread -> {},
+        case Unbound -> {},
+    }
+}
+
+/// Take one reference away, and answer whether that was the last.
+///
+/// SPLIT OUT FROM `unref_object` FOR ONE CALLER — the teardown, which must
+/// decrement without freeing. See `unref_teardown` for why that is not an
+/// inconsistency.
+///
+/// The zero test before the subtraction is not defensive bookkeeping: a
+/// teardown zeroes the slots a process owned, so a LATER decrement from another
+/// process's close-all can arrive at a slot whose count is already gone, and
+/// the honest answer for "take one away from nothing" is that nothing was taken
+/// and nothing reached zero.
+func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
+    match kind {
+        case Event -> {
+            if EVENTS[slot].refs == 0 { return false }
+            EVENTS[slot].refs = EVENTS[slot].refs - 1
+            EVENTS[slot].refs == 0
+        },
+        case Waiter -> {
+            if WAITERS[slot].refs == 0 { return false }
+            WAITERS[slot].refs = WAITERS[slot].refs - 1
+            WAITERS[slot].refs == 0
+        },
+        case Interrupt -> {
+            if INTERRUPTS[slot].refs == 0 { return false }
+            INTERRUPTS[slot].refs = INTERRUPTS[slot].refs - 1
+            INTERRUPTS[slot].refs == 0
+        },
+        case Timer -> {
+            if TIMERS[slot].refs == 0 { return false }
+            TIMERS[slot].refs = TIMERS[slot].refs - 1
+            TIMERS[slot].refs == 0
+        },
+        case Memory -> {
+            if MEMORIES[slot].refs == 0 { return false }
+            MEMORIES[slot].refs = MEMORIES[slot].refs - 1
+            MEMORIES[slot].refs == 0
+        },
+        case IoMemory -> {
+            if IOMEMORIES[slot].refs == 0 { return false }
+            IOMEMORIES[slot].refs = IOMEMORIES[slot].refs - 1
+            IOMEMORIES[slot].refs == 0
+        },
+        case Mapping -> {
+            if MAPPINGS[slot].refs == 0 { return false }
+            MAPPINGS[slot].refs = MAPPINGS[slot].refs - 1
+            MAPPINGS[slot].refs == 0
+        },
+        case Process -> {
+            if PROCESSES[slot].refs == 0 { return false }
+            PROCESSES[slot].refs = PROCESSES[slot].refs - 1
+            PROCESSES[slot].refs == 0
+        },
+        case System -> false,
+        case Clock -> false,
+        case Thread -> false,
+        case Unbound -> false,
+    }
+}
+
+/// Something no longer names object `slot` of kind `kind`. **ZERO FREES.**
+///
+/// The ordinary decrement, and the one every op uses: `release`, `give`'s
+/// caller-side unbind, `Waiter.Remove`'s detach, and the cascade out of a freed
+/// Waiter. It is a plain call because the kernel runs to completion — the free
+/// happens inside the syscall that dropped the last reference, so there is no
+/// window in which a zero-reference object is reachable.
+public(package) func unref_object(kind: ObjType, slot: Int) unsafe {
+    if drop_reference(kind, slot) {
+        free_object(kind, slot)
+    }
+}
+
+/// The teardown's decrement: it counts, and it DOES NOT FREE.
+///
+/// **THE ASYMMETRY IS THE POINT, and it is what keeps design 7 D-5's authorized
+/// set the size D-5 says it is.** A teardown frees what a process OWNED, by
+/// ownership, in per-slab sweeps that also COUNT what they freed for the
+/// report; if the close-all above those sweeps freed by reference instead,
+/// every one of those counts would collapse and every teardown line in the
+/// suite would move — for objects that were being reclaimed either way, in the
+/// same function, microseconds apart. So the close-all keeps the ledger honest
+/// (a handle in a dying table really is one reference fewer, and objects
+/// OTHER processes own must see that) and the sweeps below it do the freeing
+/// they have always done.
+///
+/// For the dying process's OWN objects the two agree by construction: the sweep
+/// zeroes the slot, count included, so nothing can be left half-counted.
+public(package) func unref_teardown(kind: ObjType, slot: Int) unsafe {
+    let _ = drop_reference(kind, slot)
+}
+
+/// Give object `slot` of kind `kind` back to its slab, and run the kind's own
+/// last rites.
+///
+/// **THE LAST RITES ARE WHAT MAKE THIS A MATRIX AND NOT A LOOP.** Three kinds
+/// have something to say to the machine or to the rest of the kernel on the way
+/// out, and the reasons are the teardown's own, arriving one object at a time
+/// instead of one process at a time:
+///
+///   - an INTERRUPT MASKS ITS LINE. A device the dropping process was driving
+///     may still be asserting, and an unmasked line with no object behind it
+///     would be taken, reported and masked once per fire forever. Masking is
+///     the kernel taking the line back — §9's handover run backwards — and it
+///     is what makes the line BINDABLE AGAIN, mid-life, which no release could
+///     achieve before this unit.
+///   - a TIMER REPROGRAMS THE COMPARATOR. A dropped armed deadline is one the
+///     kernel would otherwise keep waking itself for with nobody left to tell.
+///   - a WAITER DETACHES ITS LIST, which is the one cascade in the system.
+///
+/// And one kind has something deliberate NOT to do — see the `Mapping` arm.
+///
+/// THE QUOTA IS CREDITED AGAINST THE SLOT'S OWN `process` FIELD, which is
+/// creator-pays (D-3): whoever was charged for the object is who gets it back,
+/// whichever process happened to drop the last handle. `Mapping` and `Process`
+/// are the two arms with no credit here, each for its own stated reason.
+public(package) func free_object(kind: ObjType, slot: Int) unsafe {
+    match kind {
+        case Event -> {
+            // AN ATTACHED EVENT CANNOT BE HERE — an attachment is a counted
+            // reference (D-1's table), so reaching zero means nothing is
+            // watching. The test is the invariant written down: if it ever
+            // fired, the count and the wait machinery would have disagreed.
+            if EVENTS[slot].attachment != 0 {
+                fatal_kernel("an event reached zero references while attached",
+                             slot as UInt)
+            }
+            let owner = EVENTS[slot].process
+            EVENTS[slot] = EventSlot(state: SlotState.Free, process: 0,
+                                     mode: EventMode.Or, word: 0,
+                                     attachment: 0, refs: 0)
+            quota_credit(owner, QuotaKind.Event)
+        },
+        case Waiter -> {
+            // **THE ONE CASCADE.** A Waiter's attachments are references it
+            // HOLDS, so its death releases them — and each release may take a
+            // waitable to zero, which frees and credits through this same
+            // function. The list is walked whole rather than through
+            // `detach_attachment`, because there is no list left to unlink
+            // from: the Waiter is going.
+            //
+            // A THREAD STILL PARKED ON THIS WAITER IS STRANDED, and that is the
+            // release ruling's "legal-but-doomed" seen from one process's own
+            // inside: releasing the last handle to the Waiter a sibling thread
+            // is parked on is the same class of self-inflicted mistake as
+            // releasing your System handle. Nothing is corrupted — the parked
+            // thread simply never wakes, and the deadlock report is what names
+            // it.
+            var cur = WAITERS[slot].attached
+            while cur != 0 {
+                let a = cur - 1
+                let next = ATTACHMENTS[a].link
+                let watched = ATTACHMENTS[a].kind
+                let target = ATTACHMENTS[a].target
+                ATTACHMENTS[a] = Attachment(state: SlotState.Free,
+                                            kind: WaitableKind.Event, target: 0,
+                                            waiter: 0, key: 0, link: 0)
+                set_waitable_attachment(watched, target, 0)
+                unref_waitable(watched, target)
+                cur = next
+            }
+            let owner = WAITERS[slot].process
+            WAITERS[slot] = WaiterSlot(state: SlotState.Free, process: 0,
+                                       attached: 0, blocked: 0, refs: 0)
+            quota_credit(owner, QuotaKind.Waiter)
+        },
+        case Interrupt -> {
+            if INTERRUPTS[slot].attachment != 0 {
+                fatal_kernel("an interrupt reached zero references while attached",
+                             slot as UInt)
+            }
+            let owner = INTERRUPTS[slot].process
+            hal.irq_mask(INTERRUPTS[slot].line)
+            INTERRUPTS[slot] = InterruptSlot(state: SlotState.Free, process: 0,
+                                             line: 0, pending: false,
+                                             attachment: 0, refs: 0)
+            quota_credit(owner, QuotaKind.Interrupt)
+        },
+        case Timer -> {
+            if TIMERS[slot].attachment != 0 {
+                fatal_kernel("a timer reached zero references while attached",
+                             slot as UInt)
+            }
+            let owner = TIMERS[slot].process
+            TIMERS[slot] = TimerSlot(state: SlotState.Free, process: 0, clock: 0,
+                                     armed: false, deadline_ns: 0,
+                                     interval_ns: 0, fires: 0, attachment: 0,
+                                     refs: 0)
+            reprogram_timer()
+            quota_credit(owner, QuotaKind.Timer)
+        },
+        case Memory -> {
+            // THE SLOT COMES BACK; THE RANGE GOES NOWHERE. A front-cut parent
+            // cannot absorb an arbitrary hole, so the bytes stay spent until
+            // an allocator exists to spend them again (design 6 D-2; §2.5's
+            // narrowing).
+            let owner = MEMORIES[slot].process
+            MEMORIES[slot] = MemorySlot(state: SlotState.Free, process: 0,
+                                        base: 0, len: 0, refs: 0)
+            quota_credit(owner, QuotaKind.Memory)
+        },
+        case IoMemory -> {
+            // MMIO IS PINNED, so this touches no hardware whatever: the
+            // registers were there before the window and will be there after
+            // it. What actually revokes a driver's reach is the ROW, and a row
+            // is a Mapping.
+            let owner = IOMEMORIES[slot].process
+            IOMEMORIES[slot] = IoMemorySlot(state: SlotState.Free, process: 0,
+                                            base: 0, len: 0, refs: 0)
+            quota_credit(owner, QuotaKind.IoMemory)
+        },
+        case Mapping -> {
+            // **THE SLOT FREES AND THE ROW STAYS** (sawos design 7 D-2), and
+            // this arm is §2.5's own sentence made mechanical rather than an
+            // omission. A Mapping OWNS its row; the row does not own the
+            // Mapping. So a mapped-but-unreferenced Mapping — every handle
+            // released, the grant still installed — is exactly §2.5's
+            // "dropped without unmap = permanent, safe-but-leaked", and the row
+            // becomes unremovable until the TARGET's teardown, which is what
+            // "leaked" has always meant. Removing it here would be a
+            // revocation nobody asked for: the process whose domain carries it
+            // is a different process from the one that dropped the handle.
+            //
+            // NO QUOTA IS CREDITED HERE, and that is the consequence of the row
+            // being what the mapping quota counts (see `QuotaKind.Mapping`).
+            // The charge follows the ROW: `Unmap` credits it, the target's
+            // teardown zeroes it, and a leaked row stays charged for exactly as
+            // long as it stays installed — which is what keeps `used` and
+            // `grant_count` in step and `install_row`'s `fatal` unreachable.
+            MAPPINGS[slot] = MappingSlot(state: SlotState.Free, process: 0,
+                                         target: 0, row: NO_ROW, refs: 0)
+        },
+        case Process -> {
+            // A LIVE PROCESS IS NOT FREED BY LOSING ITS LAST HANDLE — it is
+            // still running, and its slot is what it is running in. Only a
+            // `Gone` slot's last reader going makes the §8 status word
+            // unreadable, and `reclaim_process_slot` is that rule, unchanged
+            // from design 3 D-3 except that it now READS the count this unit
+            // maintains instead of walking every table to recompute it.
+            //
+            // The ledger is not credited either: the teardown already zeroed
+            // this slot's rows, and a process is not something another process
+            // is charged for.
+            reclaim_process_slot(slot)
+        },
+        case System -> {
+            fatal_kernel("free_object on the System singleton", slot as UInt)
+        },
+        case Clock -> {
+            fatal_kernel("free_object on a kernel-eternal Clock", slot as UInt)
+        },
+        case Thread -> {
+            fatal_kernel("free_object on a Thread — the join protocol owns it",
+                         slot as UInt)
+        },
+        case Unbound -> {
+            fatal_kernel("free_object on a handle that names nothing",
+                         slot as UInt)
+        },
+    }
+}
+
+/// The wait machinery's kinds, translated into the object kinds this matrix is
+/// written over.
+///
+/// A SECOND ENUM MEETS THE FIRST HERE, and nowhere else. `WaitableKind` exists
+/// because attaching also spends a right and which enum's bits that is depends
+/// on the kind (`waitables`' header); `ObjType` is what a handle entry carries.
+/// One translation written out beats a cast between two enums that happen to be
+/// numbered differently, and it is total, so the third waitable kind cost it
+/// one line.
+func waitable_obj_type(kind: WaitableKind) -> ObjType {
+    match kind {
+        case Event -> ObjType.Event,
+        case Interrupt -> ObjType.Interrupt,
+        case Timer -> ObjType.Timer,
+    }
+}
+
+/// An attachment now names this waitable (§2.2; sawos design 7 D-1).
+public(package) func ref_waitable(kind: WaitableKind, slot: Int) unsafe {
+    ref_object(waitable_obj_type(kind), slot)
+}
+
+/// An attachment no longer names this waitable. Zero frees, as everywhere.
+public(package) func unref_waitable(kind: WaitableKind, slot: Int) unsafe {
+    unref_object(waitable_obj_type(kind), slot)
+}

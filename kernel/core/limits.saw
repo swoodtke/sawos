@@ -221,3 +221,108 @@ public(package) static NO_INTERRUPT: Int = -1
 public(package) static NO_ATTACHMENT: Int = -1
 
 public(package) static NO_TIMER: Int = -1
+
+// =============================================================================
+// THE QUOTA DEFAULTS (spec §12's promise; sawos design 7 D-3)
+// =============================================================================
+//
+// **THEY ARE IN THIS FILE BECAUSE THEY ARE THE SAME DECISION THE SLAB SIZES
+// ARE.** A slab size says how many of a thing the MACHINE can hold; a default
+// says how many one CHILD may hold of that. Choosing one without seeing the
+// other is how a policy cap ends up above the table it is supposed to sit
+// under, so the two blocks are adjacent and every number below is visibly
+// smaller than the slab above it.
+//
+// **THEY ARE THE CHILD'S NUMBERS AND NOBODY ELSE'S.** Root is init and its
+// policy cap IS the machine (D-3), so root's rows are `QUOTA_UNLIMITED` and the
+// SLAB is what refuses it — see `install_quota_limits` in `kcore.objects` for
+// why a numerically-equal cap would have been the wrong spelling. There is no
+// per-create quota argument in v1: a launcher gets these numbers for every
+// child it makes, and the vocabulary for assigning others arrives with the
+// "assigned by policy" sentence the `process_create` receiver ruling left open.
+//
+// **A THREAD ROW IS CHARGED AND NEVER CREDITED BEFORE TEARDOWN**, and that is
+// not an oversight: a thread slot itself is only returned at its process's
+// teardown (`ThreadState.Exited` is a state a slot stays in, so a join arriving
+// late still finds the exit code), so the quota tracks the slab exactly. A
+// process that creates and exits four threads has spent its four, which is what
+// the machine would have told it one slab larger.
+
+/// Threads a child may hold at once.
+public(package) static DEFAULT_QUOTA_THREADS: Int = 4
+
+/// Events a child may hold at once (spec §2.4).
+public(package) static DEFAULT_QUOTA_EVENTS: Int = 4
+
+/// Waiters a child may hold at once. Fewer than events for the reason
+/// `MAX_WAITERS` is: a Waiter is a DISPATCH POINT, one per pool of workers.
+public(package) static DEFAULT_QUOTA_WAITERS: Int = 2
+
+/// IRQ lines a child may hold bound at once. Small because a driver child
+/// drives a device, not a workload.
+public(package) static DEFAULT_QUOTA_INTERRUPTS: Int = 2
+
+/// Timers a child may hold at once.
+public(package) static DEFAULT_QUOTA_TIMERS: Int = 4
+
+/// RAM regions a child may hold at once — its own, plus what it has split.
+public(package) static DEFAULT_QUOTA_MEMORIES: Int = 4
+
+/// Device windows a child may hold at once.
+public(package) static DEFAULT_QUOTA_IOMEMORIES: Int = 2
+
+/// GRANT ROWS a child's domain may carry beyond the ones its image spent.
+///
+/// **THIS ROW COUNTS INSTALLED ROWS, NOT MAPPING OBJECTS**, which is the one
+/// place design 7's ledger departs from "quotas count objects" — and it is what
+/// makes agenda item 8's assert executable. See `QuotaKind.Mapping`.
+public(package) static DEFAULT_QUOTA_MAPPINGS: Int = 2
+
+/// Handle-table entries a child may hold at once (§3; design 3's promised row).
+///
+/// Below `MAX_HANDLES` on purpose, so a child meets ITS budget rather than the
+/// table's — the table is shared machinery and the number a child is told about
+/// should be its own.
+public(package) static DEFAULT_QUOTA_HANDLES: Int = 12
+
+/// Grant rows a v1 image spends before its process runs: `code|rodata|rw`
+/// collapses to two loadable segments, plus the kernel's stack grant at the
+/// region's top. Root's images and children's images both spend three.
+public(package) static IMAGE_GRANT_ROWS: Int = 3
+
+/// The SMALLER of the two profiles' row budgets, written down so the assert
+/// below can be a compile-time one. `hal.GRANT_ROW_BUDGET` is a `UInt` and the
+/// quota numbers are `Int`s; rather than cast in a `static_assert`, the minimum
+/// is stated here and pinned against the HAL on the next line.
+public(package) static MIN_GRANT_ROW_BUDGET: Int = 8
+
+static_assert(hal.GRANT_ROW_BUDGET >= 8,
+              "MIN_GRANT_ROW_BUDGET is stale — this profile grants fewer rows than it claims")
+
+// **AGENDA ITEM 8's ASSERT, THE COMPILE-TIME HALF** (sawos design 7 D-3). The
+// mapping default is chosen so that a child on it can always spend its whole
+// budget without the MACHINE refusing first — on either profile, since the
+// smaller of the two is what is tested. That is what makes `install_row`'s
+// `fatal` a statement about a kernel bug rather than about a number somebody
+// picked too large: a `map()` meeting the physical wall with quota headroom
+// left cannot be a policy mistake if policy was proven to fit.
+//
+// The RUNTIME half is `install_quota_limits`, which clamps every process's
+// mapping row to what its own domain actually has left after its image — the
+// part a compile-time test cannot know, because how many rows an image spends
+// is a property of the image.
+static_assert(DEFAULT_QUOTA_MAPPINGS + IMAGE_GRANT_ROWS <= MIN_GRANT_ROW_BUDGET,
+              "a child's mapping quota must fit the smaller profile's free grant rows")
+
+// Every default is under the slab it draws from, which is what makes a child
+// meet its OWN budget rather than the machine's. A default at or above its slab
+// would make `QuotaExceeded` unreachable for that kind and the row a lie.
+static_assert(DEFAULT_QUOTA_THREADS < MAX_THREADS, "a thread default must be under the slab")
+static_assert(DEFAULT_QUOTA_EVENTS < MAX_EVENTS, "an event default must be under the slab")
+static_assert(DEFAULT_QUOTA_WAITERS < MAX_WAITERS, "a waiter default must be under the slab")
+static_assert(DEFAULT_QUOTA_INTERRUPTS < MAX_INTERRUPTS, "an interrupt default must be under the slab")
+static_assert(DEFAULT_QUOTA_TIMERS < MAX_TIMERS, "a timer default must be under the slab")
+static_assert(DEFAULT_QUOTA_MEMORIES < MAX_MEMORIES, "a memory default must be under the slab")
+static_assert(DEFAULT_QUOTA_IOMEMORIES < MAX_IOMEMORIES, "an iomemory default must be under the slab")
+static_assert(DEFAULT_QUOTA_MAPPINGS < MAX_MAPPINGS, "a mapping default must be under the slab")
+static_assert(DEFAULT_QUOTA_HANDLES < MAX_HANDLES, "a handle default must be under the table")

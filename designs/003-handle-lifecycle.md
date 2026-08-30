@@ -77,6 +77,21 @@ yet the kind. Semantics, per the ruling:
   object whose last handle is gone is unreachable-but-live until its
   process's teardown; quotas (unit 5) are where that costs something.
   ONE exception, D-3.
+  **SUPERSEDED BY DESIGN 7 D-1 (M3 unit 5) — by the very unit this
+  sentence named.** "Unreachable-but-live until teardown" was true for
+  exactly the era between 2.75 and 5, and it ends there. Every countable
+  slab slot carries a reference count now; release decrements it, and
+  ZERO FREES — synchronously, inside the syscall that dropped the last
+  reference, with the kind's own last rites beside it (an Interrupt masks
+  its line and becomes bindable again, a Timer gives the comparator back,
+  a Waiter detaches its list, a Memory returns its SLOT and no bytes).
+  D-3's "ONE exception" stopped being an exception at the same moment: a
+  `Gone` process's slot is what every kind now does, and D-3's
+  handle-table SCAN became the count — same answer, so no transcript
+  moved for it. What release still never touches is the object's STATE.
+  And one kind keeps this sentence verbatim for its ROW rather than its
+  slot: a Mapping frees and LEAVES its grant installed (design 7 D-2),
+  which is §2.5's permanent-but-safe leak made mechanical.
 - Releasing your System handle or your own Process handle is
   legal-but-doomed, the sandboxed-compute precedent: you lose the
   authority, that is what you asked for.

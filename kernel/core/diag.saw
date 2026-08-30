@@ -124,6 +124,12 @@ public enum ExitCode: UInt {
     case UmodeFault = 2,
     case BadImage = 4,
     case ProcessFault = 5,
+    /// **THE KERNEL FOUND ITS OWN INVARIANT BROKEN** (sawos design 7). Not a
+    /// process's mistake and not the build's: a state the kernel's own rules
+    /// say cannot exist. It is a separate number from `BadImage` because the
+    /// two say opposite things about who is at fault, and a transcript reader
+    /// should never have to guess which.
+    case KernelBug = 6,
 }
 
 // =============================================================================
@@ -145,6 +151,30 @@ public func fatal(tag: String, cause: UInt, epc: UInt, tval: UInt, code: ExitCod
     uart.write_hex(tval)
     uart.write_str("\n")
     hal.exit_fail(code as UInt)
+}
+
+/// **STOP: THE KERNEL BROKE ITS OWN INVARIANT.** Never returns.
+///
+/// The third failure vocabulary, and the line between the three is WHOSE
+/// MISTAKE IT WAS. A caller error ends the PROCESS (`fault_process`); a
+/// malformed boot image ends the machine as `fatal_image`, because the build
+/// wrote those bytes; and this one ends the machine because the KERNEL reached
+/// a state its own rules say is unreachable. Reporting it as either of the
+/// others would blame somebody who did nothing wrong.
+///
+/// It exists because design 7 made two such states nameable for the first time:
+/// a `map()` that meets the physical row wall with quota headroom left (agenda
+/// item 8's ruled sentence, now executable — `install_quota_limits` is what
+/// makes it unreachable), and a `free_object` reaching a kind that has no slab
+/// to free into.
+public func fatal_kernel(reason: String, detail: UInt) {
+    let uart = console()
+    uart.write_str("SOS: kernel bug: ")
+    uart.write_str(reason)
+    uart.write_str(" (")
+    uart.write_hex(detail)
+    uart.write_str(")\n")
+    hal.exit_fail(ExitCode.KernelBug as UInt)
 }
 
 /// Reject the root image. Never returns.

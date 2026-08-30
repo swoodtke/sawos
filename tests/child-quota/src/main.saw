@@ -1,0 +1,145 @@
+// SOS CHILD: A PROCESS MEETING ITS OWN BUDGET (sawos design 7 D-3).
+//
+// **THE FIRST TIME A SOS PROCESS HAS BEEN TOLD "NO" BY POLICY RATHER THAN BY
+// THE MACHINE.** Every refusal in the system until this unit was
+// `NoResource` — a slab with nothing left, an edge nothing the caller does can
+// move. This child meets `QuotaExceeded` instead, and the difference is not
+// cosmetic: it releases something it already holds and the very next creation
+// succeeds, which is a thing `NoResource` could never promise.
+//
+// WHAT THE LINE SAYS:
+//
+//   SOS childquota: made=4 quota=1 resumed=1
+//                        ^      ^        ^
+//                        |      |        the release CREDITED the row, and the
+//                        |      |        next create was served
+//                        |      the refusal at limit+1 was the POLICY one
+//                        |      (`SosStatus.QuotaExceeded`), not the machine's
+//                        the child's whole allowance, `DEFAULT_QUOTA_EVENTS`
+//
+// **AND THE SLAB WAS NEVER THE LIMIT THAT TRIPPED.** `MAX_EVENTS` is 8 and this
+// child's allowance is 4; root creates no events in this case at all, so at the
+// moment of the refusal the kernel's Event slab has half its slots free. A
+// `quota=1` here therefore cannot be a machine edge wearing a policy name — if
+// the two were confused, the fifth create would have SUCCEEDED.
+//
+// `made=4` is asserted as a number rather than compared against a constant this
+// program declares, deliberately: the child does not know its own allowance and
+// has no op to ask for it (quota introspection is out of scope for unit 5). It
+// counts what it got, which is the only thing a process can honestly say.
+//
+// THE FOUR ARE HELD IN FOUR NAMED BINDINGS because there is no allocator here
+// and no way to keep a Vector of NoCopy wrappers; four is small enough to write
+// out, and writing them out is also what makes the release below spellable —
+// `let _ = move first` is the typed layer's ONLY spelling for an early release
+// (design 3 D-5), and it needs a name to consume.
+
+import sos.{System, Process, Event, SosStatus}
+
+/// What it ends with when the kernel's answers were not the shape this case
+/// claims. A number that could not be a count, so the transcript's `code=`
+/// field distinguishes the two outcomes on sight.
+static EXIT_MISMATCH: UInt = 98
+
+/// The report's flag values, so a reader sees a claim rather than a number.
+static YES: UInt = 1
+static NO: UInt = 0
+
+func flag(b: Bool) -> UInt {
+    if b { YES } else { NO }
+}
+
+/// Was this refusal the POLICY one?
+///
+/// It matches the case rather than comparing a number, which is what makes the
+/// claim survive a renumbering of `SosStatus` — the tag is ABI, but this
+/// program is written against the name.
+func is_quota(status: SosStatus) -> Bool {
+    match status {
+        case QuotaExceeded -> true,
+        case _ -> false,
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(e) -> {
+            print("SOS childquota: no process handle: {}\n", e)
+            return
+        },
+    }
+
+    // FOUR, WHICH IS THE ALLOWANCE. Each is a real Event with a real handle;
+    // nothing here is a probe.
+    let first = match proc.event_create() {
+        case Ok(e) -> e,
+        case Err(e) -> {
+            print("SOS childquota: create 1 failed: {}\n", e)
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        },
+    }
+    let second = match proc.event_create() {
+        case Ok(e) -> e,
+        case Err(e) -> {
+            print("SOS childquota: create 2 failed: {}\n", e)
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        },
+    }
+    let third = match proc.event_create() {
+        case Ok(e) -> e,
+        case Err(e) -> {
+            print("SOS childquota: create 3 failed: {}\n", e)
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        },
+    }
+    let fourth = match proc.event_create() {
+        case Ok(e) -> e,
+        case Err(e) -> {
+            print("SOS childquota: create 4 failed: {}\n", e)
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        },
+    }
+    var made: UInt = 4
+
+    // **THE FIFTH, WHICH IS THE POINT.** `case Ok(_)` would drop the event it
+    // was handed, so a kernel that wrongly served this call leaves nothing
+    // behind to confuse the arms below — the flag is what carries the verdict.
+    let quota = match proc.event_create() {
+        case Ok(_) -> {
+            made = made + 1
+            false
+        },
+        case Err(status) -> is_quota(status),
+    }
+
+    // **THE CREDIT.** One release, and the row that was full has room. This is
+    // the half `NoResource` cannot have: a machine edge does not move because
+    // one process let go of something.
+    let _ = move first
+
+    let resumed = match proc.event_create() {
+        case Ok(_) -> true,
+        case Err(_) -> false,
+    }
+
+    print("SOS childquota: made={} quota={} resumed={}\n",
+          made, flag(quota), flag(resumed))
+
+    // The three still-held events and this thread go back at the teardown,
+    // which is the launcher's next line. The exit code is the count, so root
+    // reads the same fact through the §8 status word that the console line
+    // states.
+    let as_promised = (quota && resumed)
+    if not as_promised {
+        let _ = proc.exit(EXIT_MISMATCH)
+    }
+    let _ = proc.exit(made)
+}

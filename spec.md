@@ -43,7 +43,7 @@ names provisional):
 | `Waiter` | Generic wait aggregator (epoll/Port-style) — see §2.2 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Add`/`Remove`/`Wait`, rights `WaiterRight.Attach`/`.Wait`, the wait answer a copy-out record. |
 | ~~`MemoryObject`~~ | (A duplicate row from the Jul-29 draft, pointing at §2.3 where the section is §2.5. Both of its claims are in the rows above: RAM is `MemoryObject`, device MMIO is `IoMemoryObject`, and "mappable" is `Map`. Kept struck rather than deleted so a reader of the Jul-29 discussion finds where it went.) |
 | ~~`Mapping`~~ | (Likewise — see the `Mapping` row above, built M3 unit 4.) |
-| `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. BUILT M2 (design 178 unit 2), one process: ops `ThreadCreate`/`ThreadSelf`/`Exit`/`GetStatus` plus the three factory ops `EventCreate`/`WaiterCreate`/`InterruptBind`, each on its own right. BUILT M3 unit 2 (sawos design 2), **TWO processes**: `Start` (on the CHILD's handle, `ProcessRight.Start`) mints the first thread of a created process and runs it; `BootHandleNext` (`ProcessRight.BootHandles`) drains §12's boot set one record at a time. The CREATE half of that lifecycle is not an op on this object — design 2's RIDER (Aug 29) puts `ProcessCreate` on System, because a process is a machine-wide resource (§12's amended creation-authority note). The child's handle carried `Start | Wait | Manage` and nothing else at that unit — everything a process may do to ITSELF withheld from its creator (M3 unit 3 re-ruled the set; see below). The TEARDOWN now forks (§8): process 0 stops the machine, any other reschedules. **THE SLOT OF A DEAD PROCESS IS RECLAIMED** (sawos design 3 D-3, M3 unit 2.75), and it is the ONLY slab that reclaims on a handle release. A `Gone` slot holds one thing — its §8 status word — and the only way to read that word is `GetStatus` through a Process handle, so "no handle names this slot" IS "no possible reader", exactly. The check therefore scans the handle tables (bounded: `MAX_PROCESSES` × `MAX_HANDLES`) when a released entry named a `Gone` process, and again at the end of a process's own teardown for its own slot. D-1's generations are what make the reuse safe, and `clear_domain` already invalidated `LAST_PROT_PROCESS` in anticipation. `MAX_PROCESSES` consequently bounds CONCURRENT processes again, which is what the name says. Every other kind still frees only at its owner's teardown: their "may I free this" question needs a refcount nothing yet justifies. `kill` (§8) still has no op. **BUILT M3 unit 3 (sawos design 4): `Give` — THE COURIER OP.** `give(handle, tag:)` on the CHILD's handle (gated by `ProcessRight.Give` there, plus the UNIVERSAL `Transfer` right on the handle being given) MOVES a handle into a fresh slot of the child's table and returns ONLY ITS STATUS: the child-side word is meaningless to the giver, which can call no op through it. What crosses instead is the TAG — the giver's own word, handed back unread at the child's drain. It is unbind-and-rebind with RIGHTS VERBATIM (a move, not a mint: no default set is consulted and nothing amplifies), the caller's entry unbinds exactly as a release does so the giver's word goes stale, and a full child table is `NoResource` with the give not having happened. Four caller errors END the caller: a handle that names nothing (`BadHandle`), one without `Transfer` (`AccessDenied`), a child that has already been STARTED (`BadState` — the boot set FREEZES at start, which is the launch flow's whole soundness argument), and a tag the child's set already carries (`DuplicateKey` — the tag is the identity, and one naming two handles would make the boot lookup ambiguous). `Start` gained a `boot_tag` argument in the same unit: the kernel resolves the tag to the child-side word, puts it in the child's first argument register and CONSUMES the record it named (the register IS the delivery, so a child can never be handed one word twice), leaving `_start(boot_handle)` unchanged and a launcher never seeing a child-relative word. `BootHandleNext` now drains the CALLER's own PER-PROCESS set — the kernel writes root's at boot and a launcher writes a child's with `give`, through one op with one exhaustion rule. The Process default set is now ONE set for all three minters (root's, `ProcessSelf`'s and `ProcessCreate`'s), named for its ops throughout: `ThreadCreate | ThreadSelf | Exit | Wait | EventCreate | WaiterCreate | InterruptBind | Start | BootHandles | Give` plus the universal `Transfer | Mint`. A LAUNCHER KEEPS the child's handle — it is what supervises with — and the child derives its own authority from the masked System handle it was given, so supervision and self-management are no longer alternatives (`MINT_OP`, §3, closing design 3's finding 2). |
+| `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. BUILT M2 (design 178 unit 2), one process: ops `ThreadCreate`/`ThreadSelf`/`Exit`/`GetStatus` plus the three factory ops `EventCreate`/`WaiterCreate`/`InterruptBind`, each on its own right. BUILT M3 unit 2 (sawos design 2), **TWO processes**: `Start` (on the CHILD's handle, `ProcessRight.Start`) mints the first thread of a created process and runs it; `BootHandleNext` (`ProcessRight.BootHandles`) drains §12's boot set one record at a time. The CREATE half of that lifecycle is not an op on this object — design 2's RIDER (Aug 29) puts `ProcessCreate` on System, because a process is a machine-wide resource (§12's amended creation-authority note). The child's handle carried `Start | Wait | Manage` and nothing else at that unit — everything a process may do to ITSELF withheld from its creator (M3 unit 3 re-ruled the set; see below). The TEARDOWN now forks (§8): process 0 stops the machine, any other reschedules. **THE SLOT OF A DEAD PROCESS IS RECLAIMED** (sawos design 3 D-3, M3 unit 2.75), and it is the ONLY slab that reclaims on a handle release. A `Gone` slot holds one thing — its §8 status word — and the only way to read that word is `GetStatus` through a Process handle, so "no handle names this slot" IS "no possible reader", exactly. The check therefore scans the handle tables (bounded: `MAX_PROCESSES` × `MAX_HANDLES`) when a released entry named a `Gone` process, and again at the end of a process's own teardown for its own slot. D-1's generations are what make the reuse safe, and `clear_domain` already invalidated `LAST_PROT_PROCESS` in anticipation. `MAX_PROCESSES` consequently bounds CONCURRENT processes again, which is what the name says. **SUPERSEDED IN ITS MECHANISM, NOT ITS ANSWER, BY M3 UNIT 5** (sawos design 7 D-1): the scan is a COUNT now — `ProcessSlot.refs`, maintained by the same lines that maintain an Event's — because unit 2.75's argument that a second fact would be one more thing to keep in step reverses once seven other kinds keep theirs at exactly those sites. The answer is identical, so no transcript moved for it. And this row is no longer the ONLY slab that reclaims on release: every countable kind does (see the counted-kinds column above), which is what makes a `Gone` process ordinary rather than special. `kill` (§8) still has no op. **BUILT M3 unit 3 (sawos design 4): `Give` — THE COURIER OP.** `give(handle, tag:)` on the CHILD's handle (gated by `ProcessRight.Give` there, plus the UNIVERSAL `Transfer` right on the handle being given) MOVES a handle into a fresh slot of the child's table and returns ONLY ITS STATUS: the child-side word is meaningless to the giver, which can call no op through it. What crosses instead is the TAG — the giver's own word, handed back unread at the child's drain. It is unbind-and-rebind with RIGHTS VERBATIM (a move, not a mint: no default set is consulted and nothing amplifies), the caller's entry unbinds exactly as a release does so the giver's word goes stale, and a full child table is `NoResource` with the give not having happened. Four caller errors END the caller: a handle that names nothing (`BadHandle`), one without `Transfer` (`AccessDenied`), a child that has already been STARTED (`BadState` — the boot set FREEZES at start, which is the launch flow's whole soundness argument), and a tag the child's set already carries (`DuplicateKey` — the tag is the identity, and one naming two handles would make the boot lookup ambiguous). `Start` gained a `boot_tag` argument in the same unit: the kernel resolves the tag to the child-side word, puts it in the child's first argument register and CONSUMES the record it named (the register IS the delivery, so a child can never be handed one word twice), leaving `_start(boot_handle)` unchanged and a launcher never seeing a child-relative word. `BootHandleNext` now drains the CALLER's own PER-PROCESS set — the kernel writes root's at boot and a launcher writes a child's with `give`, through one op with one exhaustion rule. The Process default set is now ONE set for all three minters (root's, `ProcessSelf`'s and `ProcessCreate`'s), named for its ops throughout: `ThreadCreate | ThreadSelf | Exit | Wait | EventCreate | WaiterCreate | InterruptBind | Start | BootHandles | Give` plus the universal `Transfer | Mint`. A LAUNCHER KEEPS the child's handle — it is what supervises with — and the child derives its own authority from the masked System handle it was given, so supervision and self-management are no longer alternatives (`MINT_OP`, §3, closing design 3's finding 2). |
 | `System` | Kernel singleton (ratified Aug 5): the object behind system-scoped primitives so that EVERY syscall is an object op (§5.7) — v1 ops `debug_print`, `shutdown(status)` (stop the machine; QEMU: sifive_test), rights-gated (`SystemRight.Debug`/`.Shutdown`, §3 scoped rights). Root receives its handle at boot (§12). `exit` is NOT here — process exit belongs to the Process object when it exists (ratified Aug 5). M2 added a third op, `process_self` (design 178 unit 2): §3's derivation rule made real, so the boot register stays ONE handle wide and a process obtains its Process object THROUGH the System handle rather than being handed it. It was gated on the generic `Manage` until M3 unit 3 gave it `SystemRight.ProcessSelf` — a bit named for its op, per the Aug-29 doctrine, and a real attenuation seam: strip it and a child may print and tell the time and never learn its own identity. M3 added `clock_get` on `SystemRight.ClockGet` (design 232 unit 1: time is a granted capability) and, by sawos design 2's RIDER (Aug 29), `process_create` on `SystemRight.ProcessCreate` — the object's one FACTORY, here because a process is machine-wide and only this object is (§12's amended creation-authority note); `process_self` was already the precedent, since a Process handle has always come out of this object. **M3 unit 3 gave this object the launch flow's pivot** (sawos design 4, Aug-29 rulings): `root_system_rights()` gained `Transfer` — the M2 "nobody to transfer to" reason expired when unit 2 made a second process — so a launcher MINTS a masked sibling of its System handle (`MINT_OP`, §3) and GIVES that to a child. A child therefore bootstraps exactly as root does (§12's symmetry): System in the first argument register, its own Process handle derived from it, its boot set drained from there. `Debug` in the mask is what lets a child print without owning a device; `Shutdown` left out is what stops it halting the machine. Later candidates: info queries. |
 
 **Eleven of these kinds exist today** — System, Process, Thread, Event, Waiter,
@@ -51,6 +51,32 @@ Interrupt, Clock, Timer, MemoryObject (M3 unit 2) and, since M3 unit 4,
 IoMemoryObject and Mapping (`ObjType`, `sos/kernel/abi/`, the kernel-internal
 numbering §5.7's vDSO discipline keeps renumberable). **PIPE IS THE ONE ROW
 LEFT**, and it is M4's.
+
+**AND EIGHT OF THE ELEVEN ARE COUNTED** (sawos design 7 D-1, M3 unit 5). Every
+countable kind's slab slot carries the number of handle entries naming it —
+plus, for a waitable, its attachment — and reaching ZERO frees the slot
+synchronously, inside the syscall that dropped the last reference. The column,
+enumerated per kind so that a new kind fails to compile until somebody says what
+references it:
+
+| kind | counted references |
+|---|---|
+| Event | handle entries (any process) + its attachment |
+| Waiter | handle entries |
+| Interrupt | handle entries + its attachment |
+| Timer | handle entries + its attachment |
+| MemoryObject / IoMemoryObject | handle entries |
+| Mapping | handle entries — **NOT its row**, which the Mapping owns rather than the reverse (§2.5) |
+| Process | handle entries; a LIVE process is never freed by losing its last handle, and a `Gone` one's slot is reclaimed exactly as design 3 D-3 ruled — this count is that ruling's handle-table scan, kept rather than recomputed |
+| Thread | **NOT COUNTED IN v1** — the join/exit protocol owns a thread slot's lifetime on terms a handle count cannot express (`Exited` is a state a slot stays in so a late join still finds the exit code, and a joiner holds no handle). Recorded, deferred; the slot comes back at the teardown |
+| Clock | **EXEMPT** — kernel-eternal, owned by nobody (the Aug-17 ruling). Freeing a domain's slot on a release would take the machine's counter from everybody else |
+| System | no slab: the singleton every process's boot handle names |
+
+The three kinds with LAST RITES are the three that hold something outside their
+slab: an Interrupt masks its line (and is then bindable again, mid-life), a
+Timer reprograms the comparator, and a Waiter detaches its list — which may take
+a waitable to zero in turn, the one cascade, terminating because an attachment
+references the WAITABLE and never the Waiter that holds it.
 
 **AddressSpace is still implicit, and unit 4 is what makes the absence
 deliberate rather than pending.** Each process gets one granted range plus a
@@ -331,6 +357,33 @@ tag-to-meaning config has always been, and where the uart-echo driver's
   case asserts exactly that). Free-on-last-reference lands with unit 5, beside
   quotas, which is where a refcount has something to be checked against.
 
+  **BUILT M3 UNIT 5 (sawos design 7 D-1), AND NARROWED WHERE IT LANDED.** The
+  refcount exists: every countable slab slot carries one, the count reaches zero
+  inside the syscall that drops the last reference, and the free is synchronous
+  — no deferred reclamation, no cleanup queue. `memory_split`'s claim flipped
+  with it, from "the slab runs out" to twenty cut-and-drop rounds past a slab of
+  sixteen. **What the clause above says about PAGES is deliberately still not
+  true, and the narrowing is the ruling rather than an omission: QUOTAS COUNT
+  OBJECTS, NOT BYTES, in v1.** A freed Memory slot returns to its slab and its
+  bytes return to NO POOL — a front-cut parent is a one-way cursor and cannot
+  absorb an arbitrary hole, which is the one-`{base, len}` shape design 6 D-2
+  chose — so what unit 5 reclaims is the SLOT, not the range. Byte accounting
+  and pool returns arrive with a real allocator (M4+); until then a program that
+  spends a pool has spent it, and the clause above is quoted here with this
+  paragraph beside it so the remaining gap stays visible rather than being
+  read as done.
+
+  **AND ONE MAPPING SHAPE IS RULED HERE RATHER THAN INFERRED** (design 7 D-2).
+  A Mapping OWNS its row; the row is not a counted reference back. So a
+  mapped-but-unreferenced Mapping — every handle released, the grant still
+  installed — reaches zero, FREES ITS SLOT AND LEAVES THE ROW: exactly this
+  section's "dropped without unmap = permanent, safe-but-leaked", now a line of
+  kernel rather than a sentence about one. The row is then unremovable until the
+  TARGET process's teardown, which is what "leaked" has always meant and is the
+  bound on it. `mapping_slot_free`'s husk arm writes and reads through such a
+  row to show it. The mirror case is a husk of the other kind — unmapped but
+  still referenced — whose `Unmap` stays the `BadState` fault it already was.
+
 **THE MIGRATION CASE BELOW CAME TRUE** (design 6 D-6). M2's boot-time device
 grant was a `sosimg` record a driver package declared in its manifest; both
 driver packages now receive the console's register page as an `IoMemory`
@@ -543,9 +596,26 @@ IoMemory, which is unit 6's flow.
   table, which is dense from 0), intercepted by dispatch between the
   table lookup and the kind match; UNGATED, since destroying your own
   capability instance harms nobody and identity lives in the object's
-  slot; it unbinds the entry, bumps the generation and NEVER touches the
-  object. Releasing a word that does not resolve — `NO_HANDLE`, a
-  malformed word, a stale one, a second release — is the ordinary
+  slot; it unbinds the entry, bumps the generation and never touches the
+  object's STATE. **IT DOES, SINCE M3 UNIT 5, TOUCH THE OBJECT'S
+  REFERENCE COUNT — AND ZERO FREES** (sawos design 7 D-1, amending unit
+  2.75's "an object whose last handle is gone is unreachable-but-live
+  until its process's teardown"; that era ends here). Every countable
+  slab slot carries a count of the handle entries naming it, plus, for a
+  waitable, its attachment; a release decrements, and a count reaching
+  zero frees SYNCHRONOUSLY, inside the very syscall that dropped the
+  last reference — the kernel runs to completion, so there is no
+  deferred reclamation and no cleanup queue. The kind's own last rites
+  run there: an Interrupt MASKS ITS LINE and becomes re-bindable, a
+  Timer gives the comparator back, a Waiter DETACHES ITS LIST (which may
+  take a waitable to zero in turn — the one cascade), a Memory returns
+  its SLOT and no bytes (§2.5's narrowing), and a `Gone` process's slot
+  is reclaimed, which is design 3 D-3's scan turned into the count it
+  was approximating. **THE ONE EXCEPTION IS A MAPPING**, whose row is not
+  a reference back: it frees its slot and LEAVES the row installed, which
+  is §2.5's own permanent-but-safe stance made mechanical. Releasing a
+  word that does not resolve — `NO_HANDLE`, a malformed word, a stale
+  one, a second release — is the ordinary
   `BadHandle` fault. In Saw it is automatic: every `sos` wrapper is
   `NoCopy` with a `deinit` that releases, so DROP IS RELEASE and there is
   no typed `release()` method to write. CLOSE — ending the OBJECT for
@@ -1351,6 +1421,22 @@ event-driven EDGE of a process gets a second, distinct construct:
     factory-capability rights bit rather than a quota) — the per-process
     table, `QuotaExceeded`, and creator-pays accounting are design 232
     unit 5. A full slab answers `SosStatus.NoResource` today.
+    **BUILT M3 UNIT 5 (sawos design 7 D-3).** The table is
+    `kcore.objects`' two flat per-process rows (used and limit, one column
+    per `QuotaKind`), charged at every allocation site that answers
+    `NoResource` — POLICY FIRST, so a process at its budget is told
+    `SosStatus.QuotaExceeded = 7` and only one still within it can meet
+    the machine's edge. Accounting is CREATOR-PAYS, against the slot's own
+    `process` field, with ONE ruled exception: a Mapping charges the
+    TARGET, because what it consumes is that process's grant-row budget
+    and charging the caller would let a launcher's allowance gate another
+    process's domain size. ROOT'S ROWS ARE UNLIMITED — root is init and
+    its policy cap IS the machine, so the slab is what refuses it — except
+    its mapping row, which is clamped to its own free grant rows; that
+    clamp is what makes agenda item 8's ruled `fatal` (a `map()` meeting
+    the physical wall with quota headroom left) unreachable rather than
+    merely unlikely. A child gets `kcore.limits`' documented defaults;
+    there is no per-create quota argument in v1.
   - **Pipes and PipeReplyHandle** (§2.1) — M4; the one fully ratified
     object surface with no implementation at all.
   - ~~**Handle close and generations**~~ **THE LIFECYCLE TIER IS BUILT**
@@ -1367,10 +1453,16 @@ event-driven EDGE of a process gets a second, distinct construct:
     at `alloc_process`, so `MAX_PROCESSES` bounds CONCURRENT processes
     again). What is STILL absent is CLOSE, which is a different act: it
     ends the OBJECT for everyone, exists only on kinds with an end-state,
-    and arrives with Pipe in M4 under a per-kind right. Also still absent:
-    refcounted reclamation of the other slabs on last release (quotas
-    era), and per-kind release rights (which would be a new universal bit
-    and are explicitly not built).
+    and arrives with Pipe in M4 under a per-kind right. **THE REFCOUNTED
+    RECLAMATION THIS ENTRY DEFERRED IS BUILT (M3 unit 5, sawos design 7
+    D-1)**: every countable slab reclaims on the last release now, not
+    only a `Gone` process's — and that one arm is no longer special, since
+    its handle-table scan became the count every other kind keeps. What
+    stays absent from this tier: CLOSE, and per-kind release rights (which
+    would be a new universal bit and are explicitly not built). What stays
+    absent from the RECLAMATION is stated at §2.5: a freed Memory returns
+    its SLOT and not its BYTES, because quotas count objects rather than
+    bytes in v1.
   - **Priorities** (§7) — nothing of §7 is built; round-robin is ruled to
     stay through M3 (design 232 agenda item 10).
   - **Thread and process waitability, and `kill`** (§8) — attaching
@@ -1727,6 +1819,19 @@ event-driven EDGE of a process gets a second, distinct construct:
   no business creating. A quota stays ADDITIVE: a field on the process
   slot, checked where `NoResource` is returned today, and design 232
   unit 5.
+  **AND THE QUOTA IS BUILT, ADDITIVE EXACTLY AS PROMISED (M3 unit 5,
+  sawos design 7 D-3).** Not one rights bit moved and not one op was
+  added: the factory capabilities still decide WHETHER a process may
+  create, and the quota decides HOW MANY — checked at the sites this
+  bullet named, ahead of the slab, answering `SosStatus.QuotaExceeded`
+  where the machine would have answered `NoResource`. The one
+  spelling that differs from the promise is WHERE the field lives: the
+  rows are per-process storage in `kcore.objects`, beside the handle
+  table, rather than on `ProcessSlot` — because the HANDLE row (design
+  3's promised addition, and the one kind whose "slab" is a region of a
+  per-process table) has to be charged inside `mint_handle` and credited
+  inside `unbind_handle`, and the process slab sits above that module.
+  `ProcessSlot`'s docstring points at it.
   **AMENDED Aug 29 (user ruling; sawos design 2's RIDER) — THE M2 ANSWER
   STANDS FOR PROCESS-SCOPED OBJECTS, AND A PROCESS IS NOT ONE OF THEM.**
   The sharpened line: process-scoped objects are minted by your Process;

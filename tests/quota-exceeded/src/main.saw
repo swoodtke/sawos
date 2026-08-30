@@ -1,0 +1,206 @@
+// SOS M3 unit 5: THE LAUNCHER SIDE OF THE QUOTA PROOF (sawos design 7 D-3).
+//
+// **ROOT CANNOT MEET A QUOTA, WHICH IS WHY THIS CASE HAS A CHILD.** Root is
+// init and its policy cap IS the machine: its ledger rows are
+// `QUOTA_UNLIMITED`, so the SLAB is the only thing that ever refuses it and
+// `NoResource` is the only refusal it can be told. A budget is a thing a
+// LAUNCHED process has, and this program is the launcher that gives one out —
+// by doing nothing at all, since the defaults are policy the kernel applies and
+// there is no per-create quota argument in v1 (an ABI unit 5 deliberately did
+// not open).
+//
+// The transcript is read as an order:
+//
+//   SOS quotaex: created
+//   SOS quotaex: started
+//   SOS childquota: made=4 quota=1 resumed=1   <- THE CHILD'S OWN VOICE
+//   SOS: process exit: code=4
+//   SOS: process teardown ... events={three} ... process={one}
+//   SOS quotaex: root observed child status=65540
+//   SOS quotaex: done
+//
+// `events={three}` in the child's teardown is the ledger's other half, arriving
+// as a count somebody else keeps: the child made five events in its life,
+// RELEASED one and dropped the one it made after the credit, and three were
+// still its when it ended. A quota that charged without crediting would have
+// refused that last create; one that credited without charging would never have
+// refused anything.
+//
+// `status=65540` is `Exited` (1) in the high half and the child's own count (4)
+// in the low, read through the Process handle root never gave away.
+//
+// ROOT PARKS ON A GENEROUS TIMER while the child runs, so the ordering above is
+// forced rather than raced — this image's kernel arms no scheduler tick, so the
+// only way root gives the processor up is the wait below.
+
+import sos.{System, Process, Memory, BootHandle, Clock, ClockType, Timer,
+            Waiter, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The key this case attaches its park timer under — a number that appears
+/// nowhere else in the transcript.
+static KEY: UInt = 63
+
+/// Twenty milliseconds: three orders of magnitude more than the child needs to
+/// make four events, meet its limit, print and exit. See `process_lifecycle`.
+static PARK_NS: UInt64 = 20_000_000
+
+/// Root's config: the tag the child's System handle travels under.
+static TAG_BOOT: UInt = 21
+
+/// What a child of this launcher may ask its System object for: print, and
+/// learn its own Process object — which is the handle its `event_create` calls
+/// go through, and the one its allowance is written against. `Transfer` is in
+/// the mask because it is the bit `give` checks on the thing being given (see
+/// `give-boot-drain`'s recorded finding); everything else is absent BY SILENCE.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS quotaex: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // The boot set, in the build's row order: the child's image blob, then the
+    // RAM it will run in. Root's config is what says which ordinal is which.
+    var image = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS quotaex: no image region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    var dest = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS quotaex: no destination region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    guard let image_mem = image.take_memory() else {
+        let _ = system.debug_print("SOS quotaex: image record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest_mem = dest.take_memory() else {
+        let _ = system.debug_print("SOS quotaex: dest record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let child = match system.process_create(image: &image_mem,
+                                            memory: &dest_mem) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS quotaex: create failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    // THE CHILD'S LEDGER OPENED AT THIS CALL, with the defaults and nothing
+    // said. Root chose the image and the RAM; it did not choose — and cannot
+    // choose — how many events the thing it made may hold.
+    let _ = system.debug_print("SOS quotaex: created\n")
+
+    let for_child = match system.mint(rights: CHILD_SYSTEM) {
+        case Ok(s) -> s,
+        case Err(e) -> {
+            print("SOS quotaex: mint failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match child.give(system: move for_child, tag: TAG_BOOT) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS quotaex: give failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match child.start(boot_tag: TAG_BOOT) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS quotaex: start failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS quotaex: started\n")
+
+    // Park, so the child gets the processor. Everything below happens after the
+    // child has met its limit, reported and exited.
+    let clock = match system.clock_get(type: ClockType.Monotonic) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS quotaex: no clock: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let waiter = match proc.waiter_create() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS quotaex: no waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let timer = match clock.timer_create() {
+        case Ok(t) -> t,
+        case Err(e) -> {
+            print("SOS quotaex: no timer: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match waiter.add(&timer, KEY) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS quotaex: attach failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match timer.arm(after_ns: PARK_NS) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS quotaex: arm failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match waiter.wait() {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS quotaex: wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let status = match child.get_status() {
+        case Ok(s) -> s,
+        case Err(e) -> {
+            print("SOS quotaex: status failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    print("SOS quotaex: root observed child status={}\n", status)
+
+    print("SOS quotaex: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

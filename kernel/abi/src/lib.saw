@@ -2177,11 +2177,28 @@ public enum BootHandleKind: UInt {
 /// drains an iterator ENDS by meeting it, so faulting would make the correct
 /// program the one that dies. It STAYS drained — every later call answers the
 /// same — so a caller may test it as often as it likes.
+///
+/// **`QuotaExceeded` (7) IS POLICY'S VOICE, AND `NoResource` IS THE MACHINE'S**
+/// (sawos design 7 D-3). They are two different answers to what used to be one
+/// refusal, and a caller can act on the difference: `NoResource` says the SLAB
+/// is full — a machine-wide edge, nothing this process can do about it —
+/// while `QuotaExceeded` says THIS PROCESS has spent its budget, which a
+/// release of something it already holds will fix. A launcher meeting the
+/// first has met the end of the machine; a program meeting the second has met
+/// the end of its allowance, and the two want different code.
+///
+/// IT IS A STATUS AND NOT A FAULT, which the sharpened faults line decides on
+/// its own terms: quota headroom is DYNAMIC resource vocabulary — how much of
+/// its budget a process has left changes as objects it does not own are freed
+/// and as its own peers release — so it is precisely the thing a caller could
+/// not have checked. That is the same carve-out `NoResource` sits in, which is
+/// why the two are neighbours here rather than one being a `FaultReason`.
 public enum SosStatus: UInt8 {
     case Ok = 0,
     case NoResource = 4,
     case BadImage = 5,
     case Drained = 6,
+    case QuotaExceeded = 7,
     case Unknown = 255,
 }
 
@@ -2193,6 +2210,7 @@ extension SosStatus {
             case NoResource -> "out of kernel objects",
             case BadImage -> "not a loadable process image",
             case Drained -> "no more boot handles",
+            case QuotaExceeded -> "this process is at its quota",
             case Unknown -> "unknown status",
         }
     }

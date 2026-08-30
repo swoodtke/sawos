@@ -31,8 +31,23 @@ entry below or the brief that carries it, never restating either.
   write-off degenerate-by-construction v1 (nothing gives upward),
   design 6's mapping-slot deviation resolved. Third authorized
   transcript movement (free-on-zero moves teardown counts; per-case
-  accounting owed). DISPATCHED Aug 29; closes in place when the
-  branch parks
+  accounting owed). DISPATCHED Aug 29.
+  **CLOSED Aug 29 — BUILT. Gate: 144 passed across riscv32 + arm64
+  (72 cases each), against a baseline of 134.** Every D landed; three
+  shapes deviate from the brief's letter and each is argued in the
+  As-built (the mapping row counts installed ROWS rather than Mapping
+  objects, so agenda 8's assert is provable; root's rows are
+  `QUOTA_UNLIMITED` rather than the slab sizes, so the machine keeps
+  its own voice; the ledger is per-process storage in `kcore.objects`
+  rather than a `ProcessSlot` field, because the handle row is charged
+  inside `mint_handle`). **AND THE THIRD AUTHORIZED MOVEMENT TURNED
+  OUT TO BE EMPTY**: NO teardown count moved, on either arch — the
+  suite's pre-exit drops are all of Clock handles (exempt) or of kinds
+  the teardown line has no column for. The one asserted line that moved
+  is `memory_split`'s, whose claim design 6's finding 5 tied to this
+  unit by name. New finding: D-4's "no orphan can exist in v1" is
+  false for a Mapping charged to its TARGET, and the row-based
+  accounting is what closes it. See designs/007-quotas.md's As-built
 - M3 unit 5.5 — death notifications [sawlang#232]
 - M3 unit 6 — the money shot [sawlang#232]
 

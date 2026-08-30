@@ -8,9 +8,24 @@
 //   SOS split: a=170 b=187 a-again=170       <- the pieces are DISJOINT
 //                                               (0xaa, 0xbb, 0xaa — the bytes
 //                                               render as decimal)
-//   SOS split: pool exhausted after 13 cuts  <- exhaustion is a STATUS
+//   SOS split: cuts=20 refused=0             <- a DROPPED PIECE RETURNS ITS
+//                                               SLOT, so the slab is no longer
+//                                               what a cursor runs into
 //   SOS: process fault: argument outside its domain
 //                                            <- an oversize cut is a FAULT
+//
+// **THE SECOND LINE IS UNIT 5's, AND IT REPLACES UNIT 4's.** This case used to
+// assert `pool exhausted after 13 cuts` — the Memory SLAB running out with
+// most of the pool still unallocated — and its own comment said why: free-on-
+// last-reference was unit 5's, so a dropped piece returned a slot to nobody.
+// Design 7 built it, and the number that pinned `MAX_MEMORIES` in a transcript
+// is exactly what stopped being true. Twenty rounds is more than the slab has
+// slots (`MAX_MEMORIES` is 16), so completing them all with nothing refused is
+// the claim: each cut mints a region, the wrapper dies at the end of the arm,
+// the release takes its count to zero, and the slot comes straight back for the
+// next round. What still cannot be recycled is the RANGE — the parent is a
+// one-way cursor and returns no bytes — which is why the pool, not the slab, is
+// the thing this loop would eventually meet.
 //
 // WHY THE FIRST LINE PROVES THE ARITHMETIC. A region has no bounds reader —
 // unit 4 deliberately did not add one — so "the parent advanced" cannot be
@@ -46,6 +61,15 @@ static RW: UInt32 = MapAccess.Read | MapAccess.Write
 
 /// A length no remaining pool can satisfy — the oversize cut.
 static OVERSIZE: UInt = 0x0100_0000
+
+/// How many cut-and-drop rounds the loop runs. **PAST `MAX_MEMORIES` ON
+/// PURPOSE** — the kernel's Memory slab holds sixteen, so a run that completes
+/// twenty rounds with nothing refused could not have happened before design 7
+/// made a dropped region give its slot back. It is also far inside the pool's
+/// own supply (256 KiB is 64 chunks, two of them already cut above), so the
+/// number this loop stops at is the one this program chose and not one the
+/// machine imposed.
+static CUT_ROUNDS: Int = 20
 
 static EXIT_FAILED: UInt = 1
 
@@ -134,20 +158,21 @@ func _start(boot_handle: UInt) {
     print("SOS split: a={} b={} a-again={}\n", peek(base) as Int,
           peek(base + CHUNK) as Int, peek(base) as Int)
 
-    // **EXHAUSTION IS A STATUS.** Each cut takes a slab slot and the slot is
-    // not returned when the handle is released — free-on-last-reference is unit
-    // 5's — so a loop that drops every piece still walks the slab to its end.
-    // That is the honest state of the system today, and `NoResource` is what
-    // says so.
+    // **AND A DROPPED PIECE RETURNS ITS SLOT** (sawos design 7 D-1). `case
+    // Ok(_)` binds nothing, so the region the kernel just minted dies at the
+    // end of the arm and its deinit releases the only handle onto it — which
+    // takes the reference count to zero INSIDE that release, and the slot is
+    // free before the next round asks for one. Twenty rounds is past the slab's
+    // sixteen slots, so `refused=0` is only possible if the recycling is real.
     var cuts = 0
-    var going = true
-    while going {
+    var refused: UInt = 0
+    while cuts < CUT_ROUNDS && refused == 0 {
         match pool.split(len: CHUNK) {
             case Ok(_) -> { cuts = cuts + 1 },
-            case Err(_) -> { going = false },
+            case Err(_) -> { refused = 1 },
         }
     }
-    print("SOS split: pool exhausted after {} cuts\n", cuts)
+    print("SOS split: cuts={} refused={}\n", cuts, refused)
 
     // **AND AN OVERSIZE CUT IS A FAULT.** The caller knows what it has split
     // off; asking for more than it holds is a mistake it could have checked, so

@@ -274,7 +274,19 @@ the Mapping slab's stored indices (`compact_mapping_rows`) and reloads.
 `load_domain`'s replay-by-index was indeed the only index-sensitive site
 the census named, and the slab scan is the whole fixup.
 
-**DEVIATION 1 — UNMAP DOES NOT FREE THE MAPPING SLOT.** D-3 said it
+**DEVIATION 1 — UNMAP DOES NOT FREE THE MAPPING SLOT.**
+**RESOLVED BY DESIGN 7 (M3 unit 5 D-1/D-2), exactly as this note's last
+sentence predicted.** The hazard below is real and the refcount is what
+retires it: a slot frees when it is unmapped AND UNREFERENCED, so
+nothing can be reached through a handle whose object the next `map`
+reused — for this slab and for the others together, which is what
+"refcounted early reclamation is unit 5's" meant. `mapping_slot_free`
+completes twelve map/unmap/drop rounds past a slab of eight, and its
+husk arm shows the other half design 7 D-2 ruled: a mapping dropped
+WITHOUT an unmap frees its slot and LEAVES its row, which is §2.5's
+permanent-but-safe stance made mechanical rather than described. The
+original note, unchanged, follows.
+D-3 said it
 should; it must not, and the reason is soundness rather than taste. A
 slab slot freed while a handle still names it is reachable through that
 handle the moment the next `map` reuses it — the caller could unmap a
@@ -491,6 +503,16 @@ unchanged.
    is unit 5's and a dropped piece returns a slot to nobody. That number
    pins `MAX_MEMORIES` in a transcript deliberately: raising the slab
    should move a line somebody reads.
+   **AND UNIT 5 MOVED IT — which is this finding working rather than
+   failing.** Design 7 D-1 built free-on-last-reference, so a dropped
+   piece returns its slot immediately and the slab stopped being what
+   the loop meets: the case now asserts `cuts=20 refused=0`, twenty
+   cut-and-drop rounds past a slab of sixteen. What is still NOT
+   reclaimed is the RANGE — a front-cut parent is a one-way cursor and
+   absorbs no hole — so the pool, not the slab, is what a long enough
+   loop would meet, and §2.5 carries that narrowing ("quotas count
+   objects, not bytes, in v1"). The moved line is the ONE asserted
+   claim design 7 changed in the whole shipped suite.
 6. **THE TEARDOWN LINE DID NOT GROW A FIELD.** Adding `iomemories=` /
    `mappings=` to `SOS: process teardown …` would have moved every
    existing transcript row, and this unit authorized exactly two. The

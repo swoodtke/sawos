@@ -119,6 +119,7 @@ import kcore.objects.{
     MemorySlot,
     NO_ROW,
     ProcessObject,
+    QuotaKind,
     SlotState,
     SystemObject,
     ThreadObject,
@@ -133,11 +134,18 @@ import kcore.objects.{
     boot_handle_take,
     boot_tag_used,
     handle_word_index,
+    install_quota_limits,
     lookup_handle,
     mint_handle,
+    mint_refusal,
     queue_boot_handle,
+    quota_charge,
+    quota_credit,
+    quota_room,
     unbind_handle,
 }
+import kcore.diag.{fatal_kernel}
+import kcore.refs.{ref_object, ref_waitable, unref_object, unref_waitable}
 import kcore.threads.{
     CURRENT_THREAD,
     NEED_RESCHED,
@@ -191,7 +199,6 @@ import kcore.process.{
     copy_out,
     copy_out_check,
     domain_changed,
-    reclaim_process_slot,
     record_grant,
     remove_grant,
 }
@@ -294,8 +301,12 @@ func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt, arg1: UInt,
             }
             let handle = mint_handle(p, ObjType.Process, process_rights(), p)
             if handle == NO_HANDLE {
-                return op_status(SosStatus.NoResource)
+                return op_status(mint_refusal(p))
             }
+            // A SECOND NAME FOR THE SAME SLOT IS A SECOND REFERENCE (sawos
+            // design 7 D-1), and it is what makes a process asking for itself
+            // twice cost something the ledger can see.
+            ref_object(ObjType.Process, p)
             op_value(handle)
         },
         // TIME IS A GRANTED CAPABILITY (design 232 unit 1, the M3 time notes).
@@ -369,9 +380,13 @@ func clock_get(p: Int, raw_type: UInt) unsafe -> SyscallResult {
 /// is precisely what earns this op a quota row in unit 5.
 func clock_get_typed(p: Int, type: ClockType) unsafe -> SyscallResult {
     let slot = clock_slot(type)
+    // NO REFERENCE IS COUNTED, and no quota row is charged for the OBJECT: a
+    // Clock is kernel-eternal and owned by nobody (design 7 D-1's exemption).
+    // What a repeated ask does cost is a HANDLE, and that row is charged inside
+    // `mint_handle` — which is what unit 5 owed this op's `NoResource` path.
     let handle = mint_handle(p, ObjType.Clock, clock_rights(), slot)
     if handle == NO_HANDLE {
-        return op_status(SosStatus.NoResource)
+        return op_status(mint_refusal(p))
     }
     op_value(handle)
 }
@@ -411,7 +426,7 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             let handle = mint_handle(p, ObjType.Thread, thread_rights(),
                                      CURRENT_THREAD)
             if handle == NO_HANDLE {
-                return op_status(SosStatus.NoResource)
+                return op_status(mint_refusal(p))
             }
             op_value(handle)
         },
@@ -624,7 +639,7 @@ func process_create(p: Int, image_handle: UInt,
     // launcher holds, and what it hands on is a keep mask's business.
     let handle = mint_handle(p, ObjType.Process, process_rights(), slot)
     if handle == NO_HANDLE {
-        return op_status(SosStatus.NoResource)
+        return op_status(mint_refusal(p))
     }
 
     // Only now does anything happen to the destination region.
@@ -646,6 +661,19 @@ func process_create(p: Int, image_handle: UInt,
     PROCESSES[slot].rw_top = dest.top
     PROCESSES[slot].exit_kind = ProcessStatusKind.Running
     PROCESSES[slot].exit_code = 0
+    // THE LAUNCHER'S HANDLE IS THE CHILD'S FIRST REFERENCE, and it is the one
+    // design 3 D-3 has always been about: it outlives the child so that reading
+    // how the child died stays possible, and its release is what frees the slot.
+    PROCESSES[slot].refs = 1
+
+    // **THE CHILD'S LEDGER OPENS HERE, AFTER `place_image`** (sawos design 7
+    // D-3), and the order is what the mapping row needs: `free_rows` is what
+    // this child's domain has left once its image has spent its own, and the
+    // image's rows are recorded by the call above. A child gets
+    // `kcore.limits`' documented defaults; nothing about them is a per-create
+    // argument, which is an ABI unit 5 deliberately did not open.
+    install_quota_limits(slot, false,
+                         (hal.GRANT_ROW_BUDGET as Int) - PROCESSES[slot].grant_count)
 
     op_value(handle)
 }
@@ -719,10 +747,20 @@ func process_start(caller: Int, child: Int,
         case _ -> fault_process(caller, FaultReason.BadState),
     }
 
-    // The one status this op can answer with, taken BEFORE the record is
-    // consumed so that a refusal leaves the boot set exactly as it was.
-    // `alloc_thread` is a pure scan and reserves nothing, so an early return
-    // here leaks no slot either.
+    // The statuses this op can answer with, taken BEFORE the record is consumed
+    // so that a refusal leaves the boot set exactly as it was. `alloc_thread`
+    // is a pure scan and reserves nothing, so an early return here leaks no
+    // slot either.
+    //
+    // **THE THREAD IS THE CHILD'S, SO THE CHILD IS CHARGED** (sawos design 7
+    // D-3's creator-pays, read carefully): the launcher is not spending one of
+    // its own threads, it is spending the first of the child's. That is the
+    // same rule every other row follows — the slot's `process` field is who
+    // pays — applied at the one site where the slot is written for somebody
+    // else.
+    if not quota_room(child, QuotaKind.Thread) {
+        return op_status(SosStatus.QuotaExceeded)
+    }
     let slot = alloc_thread()
     if slot == NO_THREAD {
         return op_status(SosStatus.NoResource)
@@ -744,6 +782,7 @@ func process_start(caller: Int, child: Int,
     THREADS[slot] = ThreadSlot(state: ThreadState.Runnable, process: child,
                                exit_code: 0,
                                joiners: 0, link: 0, wait_buf: 0)
+    quota_charge(child, QuotaKind.Thread)
     ready_push(slot)
     PROCESSES[child].state = ProcessState.Running
     op_ok()
@@ -827,7 +866,10 @@ func process_give(p: Int, child: Int, word: UInt, tag: UInt) unsafe -> SyscallRe
     }
     let given = move_handle(p, child, word, entry, kind, tag)
     if given == NO_HANDLE {
-        return op_status(SosStatus.NoResource)
+        // The child's table refused it — either because it is full, or because
+        // the CHILD is at its handle budget, which is the answer a launcher
+        // furnishing too much needs to hear (sawos design 7 D-3).
+        return op_status(mint_refusal(child))
     }
     op_ok()
 }
@@ -876,13 +918,22 @@ func give_faults(p: Int, child: Int, entry: HandleEntry,
 /// RIGHTS TRAVEL VERBATIM — `entry.rights` is copied, not recomputed — because a
 /// give is a MOVE AND NOT A MINT: no default set is consulted and nothing
 /// amplifies, so what the giver attenuated stays attenuated.
+/// **THE COUNT GOES UP BEFORE IT GOES DOWN, AND THE ORDER IS LOAD-BEARING**
+/// (sawos design 7 D-1). A give is a MOVE, so the object's reference count is
+/// the same on both sides of it — but it is written as an increment and then a
+/// decrement rather than as nothing at all, because "every bind refs, every
+/// unbind unrefs" is a rule with no exceptions or it is not a rule. Doing them
+/// in the other order would take the count to zero between two lines of one op
+/// and FREE the object the give was about to hand over.
 func move_handle(p: Int, child: Int, word: UInt, entry: HandleEntry,
                  kind: BootHandleKind, tag: UInt) unsafe -> UInt {
     let given = mint_handle(child, entry.obj_type, entry.rights, entry.target)
     if given == NO_HANDLE {
         return NO_HANDLE
     }
+    ref_object(entry.obj_type, entry.target)
     unbind_handle(p, handle_word_index(word))
+    unref_object(entry.obj_type, entry.target)
     queue_boot_handle(child, tag, kind, given)
     given
 }
@@ -961,19 +1012,30 @@ func event_create(p: Int, raw_mode: UInt) unsafe -> SyscallResult {
 }
 
 func event_create_moded(p: Int, mode: EventMode) unsafe -> SyscallResult {
+    // **POLICY REFUSES BEFORE THE MACHINE IS ASKED** (sawos design 7 D-3), and
+    // this is the order every allocation site in the kernel now follows: a
+    // process at its own budget is told so with `QuotaExceeded`, and only a
+    // process still within it can meet the slab's `NoResource`. The two are
+    // different facts and a caller can act on the difference — a release of
+    // something it already holds fixes the first and cannot fix the second.
+    if not quota_room(p, QuotaKind.Event) {
+        return op_status(SosStatus.QuotaExceeded)
+    }
     let slot = alloc_event()
     if slot == NO_EVENT {
         return op_status(SosStatus.NoResource)
     }
     let handle = mint_handle(p, ObjType.Event, event_rights(), slot)
     if handle == NO_HANDLE {
-        return op_status(SosStatus.NoResource)
+        return op_status(mint_refusal(p))
     }
     // Written only once BOTH allocations succeeded, so a refused handle leaves
     // the slab exactly as it found it — the all-or-nothing shape design 123
-    // asks of a `try_` op, for the same reason.
+    // asks of a `try_` op, for the same reason. The CHARGE joins that rule: a
+    // process must not pay for an object it never got.
     EVENTS[slot] = EventSlot(state: SlotState.Live, process: p, mode: mode,
-                             word: 0, attachment: 0)
+                             word: 0, attachment: 0, refs: 1)
+    quota_charge(p, QuotaKind.Event)
     op_value(handle)
 }
 
@@ -1007,32 +1069,41 @@ func interrupt_bind(p: Int, line: UInt) unsafe -> SyscallResult {
         fault_process(p, FaultReason.LineBound)
     }
 
+    if not quota_room(p, QuotaKind.Interrupt) {
+        return op_status(SosStatus.QuotaExceeded)
+    }
     let slot = alloc_interrupt()
     if slot == NO_INTERRUPT {
         return op_status(SosStatus.NoResource)
     }
     let handle = mint_handle(p, ObjType.Interrupt, interrupt_rights(), slot)
     if handle == NO_HANDLE {
-        return op_status(SosStatus.NoResource)
+        return op_status(mint_refusal(p))
     }
     INTERRUPTS[slot] = InterruptSlot(state: SlotState.Live, process: p,
-                                     line: line, pending: false, attachment: 0)
+                                     line: line, pending: false, attachment: 0,
+                                     refs: 1)
+    quota_charge(p, QuotaKind.Interrupt)
     hal.irq_unmask(line)
     op_value(handle)
 }
 
 /// Make a Waiter in process `slot` (spec §2.2).
 func waiter_create(p: Int) unsafe -> SyscallResult {
+    if not quota_room(p, QuotaKind.Waiter) {
+        return op_status(SosStatus.QuotaExceeded)
+    }
     let slot = alloc_waiter()
     if slot == NO_WAITER {
         return op_status(SosStatus.NoResource)
     }
     let handle = mint_handle(p, ObjType.Waiter, waiter_rights(), slot)
     if handle == NO_HANDLE {
-        return op_status(SosStatus.NoResource)
+        return op_status(mint_refusal(p))
     }
     WAITERS[slot] = WaiterSlot(state: SlotState.Live, process: p, attached: 0,
-                               blocked: 0)
+                               blocked: 0, refs: 1)
+    quota_charge(p, QuotaKind.Waiter)
     op_value(handle)
 }
 
@@ -1052,19 +1123,28 @@ func thread_create(p: Int, entry: UInt, stack_top: UInt, arg: UInt) unsafe -> Sy
         fault_process(p, FaultReason.BadEntry)
     }
 
+    // A THREAD ROW IS CHARGED AND NEVER CREDITED BEFORE THE TEARDOWN (sawos
+    // design 7 D-1), because a thread SLOT is not returned before it either:
+    // `Exited` is a state a slot stays in so a late join still finds the exit
+    // code. The quota tracks the slab exactly, which is what makes it honest
+    // rather than a second, looser story about the same resource.
+    if not quota_room(p, QuotaKind.Thread) {
+        return op_status(SosStatus.QuotaExceeded)
+    }
     let slot = alloc_thread()
     if slot == NO_THREAD {
         return op_status(SosStatus.NoResource)
     }
     let handle = mint_handle(p, ObjType.Thread, thread_rights(), slot)
     if handle == NO_HANDLE {
-        return op_status(SosStatus.NoResource)
+        return op_status(mint_refusal(p))
     }
 
     hal.frame_init(frame_slot(slot), start, stack_top, arg)
     THREADS[slot] = ThreadSlot(state: ThreadState.Created, process: p,
                                exit_code: 0,
                                joiners: 0, link: 0, wait_buf: 0)
+    quota_charge(p, QuotaKind.Thread)
     op_value(handle)
 }
 
@@ -1313,20 +1393,24 @@ func clock_now(p: Int, slot: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult 
 
 /// Make a Timer bound to clock `c` in process `p` (spec §2 table).
 func timer_create(p: Int, c: Int) unsafe -> SyscallResult {
+    if not quota_room(p, QuotaKind.Timer) {
+        return op_status(SosStatus.QuotaExceeded)
+    }
     let slot = alloc_timer()
     if slot == NO_TIMER {
         return op_status(SosStatus.NoResource)
     }
     let handle = mint_handle(p, ObjType.Timer, timer_rights(), slot)
     if handle == NO_HANDLE {
-        return op_status(SosStatus.NoResource)
+        return op_status(mint_refusal(p))
     }
     // Born DISARMED and owing nothing: a Timer is a schedule you have not
     // written yet, so it is not ready, and attaching one to a Waiter before
     // arming it parks rather than reporting.
     TIMERS[slot] = TimerSlot(state: SlotState.Live, process: p, clock: c,
                              armed: false, deadline_ns: 0, interval_ns: 0,
-                             fires: 0, attachment: 0)
+                             fires: 0, attachment: 0, refs: 1)
+    quota_charge(p, QuotaKind.Timer)
     op_value(handle)
 }
 
@@ -1548,6 +1632,12 @@ func waiter_add(p: Int, w: Int, handle: UInt, key: UInt) unsafe -> SyscallResult
                                 link: WAITERS[w].attached)
     WAITERS[w].attached = a + 1
     set_waitable_attachment(target.kind, target.slot, a + 1)
+    // **AN ATTACHMENT IS A REFERENCE TO THE WAITABLE** (sawos design 7 D-1's
+    // table), which is what keeps an Event alive past its last handle: a Waiter
+    // is watching it, and something being watched is something still in use.
+    // The Waiter is NOT referenced back — it owns the attachment — and that
+    // asymmetry is what makes the cascade terminate.
+    ref_waitable(target.kind, target.slot)
 
     // LEVEL-TRIGGERED, at the attach (§2.2). A waitable that is already ready
     // when it joins the set is ready NOW, and a thread parked on this Waiter
@@ -1576,7 +1666,15 @@ func waiter_remove(p: Int, w: Int, key: UInt) unsafe -> SyscallResult {
     if a == NO_ATTACHMENT {
         fault_process(p, FaultReason.BadState)
     }
+    // WHAT WAS BEING WATCHED IS READ BEFORE THE DETACH CLEARS IT, because the
+    // reference this drops is the attachment's and the attachment is about to
+    // stop existing. A waitable whose last handle went while it was attached
+    // reaches zero HERE and frees, which is design 7 D-1's cascade seen from
+    // its one user-visible door.
+    let watched = ATTACHMENTS[a].kind
+    let target = ATTACHMENTS[a].target
     detach_attachment(w, a)
+    unref_waitable(watched, target)
     op_ok()
 }
 
@@ -1655,10 +1753,17 @@ func release_handle(p: Int, word: UInt, entry: HandleEntry) unsafe -> SyscallRes
         case _ -> {},
     }
     unbind_handle(p, handle_word_index(word))
-    match entry.obj_type {
-        case Process -> { reclaim_process_slot(entry.target) },
-        case _ -> {},
-    }
+    // **AND THE OBJECT LOSES A REFERENCE — WHICH MAY BE ITS LAST** (sawos
+    // design 7 D-1). The one nine-arm `match` this function used to need is
+    // gone: `unref_object` is the per-kind matrix, so an Interrupt masks its
+    // line here, a Timer gives the comparator back, a Waiter detaches its list,
+    // a Memory returns its slot, and a `Gone` Process's slot is reclaimed —
+    // which is the arm design 3 D-3 wrote by hand and this one generalizes.
+    //
+    // It runs AFTER the unbind, exactly as the reclaim it replaces did, and now
+    // for a mechanical reason rather than a scan's: the count must not include
+    // the entry being destroyed.
+    unref_object(entry.obj_type, entry.target)
     op_ok()
 }
 
@@ -1716,8 +1821,12 @@ func mint_sibling(p: Int, entry: HandleEntry, keep: UInt) unsafe -> SyscallResul
     let rights = entry.rights & UInt32.from(truncating: keep)
     let word = mint_handle(p, entry.obj_type, rights, entry.target)
     if word == NO_HANDLE {
-        return op_status(SosStatus.NoResource)
+        return op_status(mint_refusal(p))
     }
+    // A SIBLING IS A SECOND NAME, AND A SECOND NAME IS A SECOND REFERENCE
+    // (sawos design 7 D-1) — which is what makes releasing one of two siblings
+    // leave the object alive, and the second release the one that ends it.
+    ref_object(entry.obj_type, entry.target)
     op_value(word)
 }
 
@@ -1853,16 +1962,27 @@ func map_target(p: Int, handle: UInt) unsafe -> Int {
 
 /// Install one row in process `t`'s domain and mint the Mapping that names it.
 ///
-/// **THE PHYSICAL WALL IS CHECKED HERE** (sawos design 6 D-3, agenda item 8).
-/// `hal.GRANT_ROW_BUDGET` is how many rows this profile's domain may hold — a
-/// HARDWARE number on one and a POLICY one on the other, which is exactly why
-/// the kernel reads the HAL's rather than a shared constant — and a map that
-/// meets it is `NoResource`, a STATUS, because a caller cannot know how full
-/// somebody else's domain is. The quota (unit 5) is the policy cap layered
-/// ABOVE this one, and the sentence that unit will make true is worth recording
-/// at the check: **a `map()` meeting the physical wall with quota headroom left
-/// is a kernel bug to assert against.** There is no quota yet, so meeting it is
-/// ordinary today.
+/// **THE POLICY CAP IS ASKED FIRST AND THE PHYSICAL WALL IS NOW A KERNEL BUG**
+/// (sawos design 6 D-3, agenda item 8, made executable by sawos design 7 D-3).
+///
+/// Unit 4 recorded the sentence this function now runs: *a `map()` meeting the
+/// physical wall with quota headroom left is a kernel bug to assert against.*
+/// Unit 5 is what makes it a statement rather than a hope, and the argument is
+/// short enough to write here in full.
+///
+/// The TARGET's mapping row counts INSTALLED ROWS, not Mapping objects (see
+/// `QuotaKind.Mapping`), so `used` and `grant_count - image rows` are the same
+/// number by construction: `install_row` charges one and appends one, `Unmap`
+/// credits one and removes one, and a teardown zeroes both at once.
+/// `install_quota_limits` then caps every process's limit at the rows its
+/// domain actually has left after its image spent its own. Passing the quota
+/// check therefore PROVES there is a row to take — so reaching the wall below
+/// means the ledger and the record disagree, which is the kernel's bug and
+/// nobody else's. `NoResource` would blame a caller for it.
+///
+/// `hal.GRANT_ROW_BUDGET` is still what the wall is measured against — a
+/// HARDWARE number on one profile and a POLICY one on the other, which is
+/// exactly why the kernel reads the HAL's rather than a shared constant.
 ///
 /// The budget is checked BEFORE anything is written, which is what keeps
 /// `record_grant`'s own `fatal_image` overflow arm a BOOT-door vocabulary: that
@@ -1874,7 +1994,19 @@ func map_target(p: Int, handle: UInt) unsafe -> Int {
 /// all, because the scheduler skips equal domains.
 func install_row(p: Int, t: Int, base: UInt, top: UInt, perms: UInt8,
                  device: Bool) unsafe -> SyscallResult {
+    // THE TARGET IS CHARGED, NOT THE CALLER — D-3's one ruled exception to
+    // creator-pays. What a mapping consumes is the target's grant-row budget,
+    // and charging the caller would let a launcher's own allowance gate how big
+    // another process's domain may be.
+    if not quota_room(t, QuotaKind.Mapping) {
+        return op_status(SosStatus.QuotaExceeded)
+    }
     if (PROCESSES[t].grant_count as UInt) >= hal.GRANT_ROW_BUDGET {
+        fatal_kernel("a map met the row budget with quota headroom left",
+                     PROCESSES[t].grant_count as UInt)
+        // `fatal_kernel` stops the machine but is not declared `-> Never`
+        // (design 6's finding 4), so the scope has to exit itself. Nothing
+        // reaches this line.
         return op_status(SosStatus.NoResource)
     }
     let slot = alloc_mapping()
@@ -1883,7 +2015,7 @@ func install_row(p: Int, t: Int, base: UInt, top: UInt, perms: UInt8,
     }
     let handle = mint_handle(p, ObjType.Mapping, mapping_rights(), slot)
     if handle == NO_HANDLE {
-        return op_status(SosStatus.NoResource)
+        return op_status(mint_refusal(p))
     }
     // Nothing is written until every refusal is behind us — `event_create`'s
     // all-or-nothing shape, and here it matters more: a half-installed row is a
@@ -1891,7 +2023,8 @@ func install_row(p: Int, t: Int, base: UInt, top: UInt, perms: UInt8,
     let row = PROCESSES[t].grant_count
     record_grant(t, base, top, perms, device)
     MAPPINGS[slot] = MappingSlot(state: SlotState.Live, process: p, target: t,
-                                 row: row)
+                                 row: row, refs: 1)
+    quota_charge(t, QuotaKind.Mapping)
     domain_changed(t)
     op_value(handle)
 }
@@ -1934,13 +2067,16 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
             if (len % hal.PROT_GRAIN) != 0 {
                 fault_process(p, FaultReason.BadArg)
             }
+            if not quota_room(p, QuotaKind.Memory) {
+                return op_status(SosStatus.QuotaExceeded)
+            }
             let slot = alloc_memory()
             if slot == NO_MEMORY {
                 return op_status(SosStatus.NoResource)
             }
             let handle = mint_handle(p, ObjType.Memory, memory_rights(), slot)
             if handle == NO_HANDLE {
-                return op_status(SosStatus.NoResource)
+                return op_status(mint_refusal(p))
             }
             // The cut, once both allocations are behind us. The child takes the
             // front and the parent advances past it; a parent split down to
@@ -1948,7 +2084,8 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
             // is the honest end of a cursor.
             let base = MEMORIES[obj.slot].base
             MEMORIES[slot] = MemorySlot(state: SlotState.Live, process: p,
-                                        base: base, len: len)
+                                        base: base, len: len, refs: 1)
+            quota_charge(p, QuotaKind.Memory)
             MEMORIES[obj.slot].base = base + len
             MEMORIES[obj.slot].len = MEMORIES[obj.slot].len - len
             op_value(handle)
@@ -2037,16 +2174,20 @@ func iomemory_op_decoded(op: IoMemoryOp, obj: &IoMemoryObject, arg0: UInt,
             if not hal.device_window_ok(base, len) {
                 fault_process(p, FaultReason.BadArg)
             }
+            if not quota_room(p, QuotaKind.IoMemory) {
+                return op_status(SosStatus.QuotaExceeded)
+            }
             let slot = alloc_iomemory()
             if slot == NO_IOMEMORY {
                 return op_status(SosStatus.NoResource)
             }
             let handle = mint_handle(p, ObjType.IoMemory, iomemory_rights(), slot)
             if handle == NO_HANDLE {
-                return op_status(SosStatus.NoResource)
+                return op_status(mint_refusal(p))
             }
             IOMEMORIES[slot] = IoMemorySlot(state: SlotState.Live, process: p,
-                                            base: base, len: len)
+                                            base: base, len: len, refs: 1)
+            quota_charge(p, QuotaKind.IoMemory)
             op_value(handle)
         },
         // **INSTALL A DEVICE-ATTRIBUTE ROW, ALWAYS** — the guarantee
@@ -2128,6 +2269,13 @@ func mapping_op_decoded(op: MappingOp, obj: &MappingObject,
             let t = MAPPINGS[obj.slot].target
             remove_grant(t, row)
             MAPPINGS[obj.slot].row = NO_ROW
+            // **THE CREDIT FOLLOWS THE ROW, NOT THE SLOT** (sawos design 7
+            // D-3). The mapping quota counts rows installed in the target's
+            // domain, so this is where one comes back — not `free_object`,
+            // which frees the SLOT and may leave the row standing (D-2). An
+            // unmapped-but-referenced Mapping is a husk that consumes nothing,
+            // and the ledger says so from this line onward.
+            quota_credit(t, QuotaKind.Mapping)
             compact_mapping_rows(t, row)
             domain_changed(t)
             op_ok()

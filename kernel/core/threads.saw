@@ -86,6 +86,20 @@ public(package) enum ThreadState: UInt8 {
 /// list of the thread it is waiting for when it is blocked. Slot indices are
 /// stored PLUS ONE so that zero means "no thread", which is what a zeroed
 /// static already says.
+///
+/// **THERE IS NO `refs` FIELD HERE, AND ITS ABSENCE IS A DECISION** (sawos
+/// design 7 D-1). Every other countable kind gained one; a Thread did not,
+/// because the JOIN/EXIT PROTOCOL already owns a thread slot's lifetime and it
+/// owns it on terms a handle count cannot express. `ThreadState.Exited` is a
+/// state a slot STAYS IN so that a join arriving after the exit still finds the
+/// exit code — a reader that holds no handle and is not counted anywhere — and
+/// the joiner list is a second such claim on the slot. Folding those into a
+/// reference count is real design (what is a joiner worth? what does a
+/// zero-reference `Exited` slot owe a join that has not arrived?) with no
+/// current payoff, since nothing yet runs out of thread slots before its
+/// process ends. So the slot comes back at the teardown exactly as it always
+/// has, the QUOTA row for threads is charged and only ever credited there, and
+/// this paragraph is the record that the question was asked and deferred.
 public(package) struct ThreadSlot {
     /// `public(package)` because PARKING A THREAD HAPPENS OUTSIDE THIS MODULE
     /// since the split: `waitables` blocks one on a Waiter's list. The state

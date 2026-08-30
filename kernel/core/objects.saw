@@ -34,17 +34,32 @@ import sosabi.{
     MappingHandle,
     MappingRight,
     BootHandleKind,
+    SosStatus,
     NO_HANDLE,
     HANDLE_INDEX_BITS,
     HANDLE_INDEX_MASK,
     HANDLE_GENERATION_MODULUS,
 }
 import kcore.limits.{
+    DEFAULT_QUOTA_EVENTS,
+    DEFAULT_QUOTA_HANDLES,
+    DEFAULT_QUOTA_INTERRUPTS,
+    DEFAULT_QUOTA_IOMEMORIES,
+    DEFAULT_QUOTA_MAPPINGS,
+    DEFAULT_QUOTA_MEMORIES,
+    DEFAULT_QUOTA_THREADS,
+    DEFAULT_QUOTA_TIMERS,
+    DEFAULT_QUOTA_WAITERS,
+    MAX_EVENTS,
     MAX_HANDLES,
+    MAX_INTERRUPTS,
     MAX_IOMEMORIES,
     MAX_MAPPINGS,
     MAX_MEMORIES,
     MAX_PROCESSES,
+    MAX_THREADS,
+    MAX_TIMERS,
+    MAX_WAITERS,
     NO_IOMEMORY,
     NO_MAPPING,
     NO_MEMORY,
@@ -406,7 +421,18 @@ public(package) func lookup_handle(p: Int, h: UInt) unsafe -> HandleEntry {
 /// mint reuses — the property `handle_remint` observes. The word it stamps
 /// carries the slot's SURVIVING generation, so the reuse is visible in the word
 /// and the old word is stale rather than aliasing.
+///
+/// **THE HANDLE ROW IS CHARGED HERE, POLICY BEFORE THE TABLE** (sawos design 7
+/// D-3). A process at its handle budget is refused before the table is walked,
+/// which is the check order every other allocation site follows spelled inside
+/// the allocator instead of beside it — `mint_handle` is the only one whose
+/// "slab" is a region of a per-process table, so there is no second scan for a
+/// caller to order against. The two refusals share `NO_HANDLE`, and
+/// `mint_refusal` is what tells them apart for the status.
 public(package) func mint_handle(p: Int, kind: ObjType, rights: UInt32, target: Int) unsafe -> UInt {
+    if not quota_room(p, QuotaKind.Handle) {
+        return NO_HANDLE
+    }
     var h: Int = 0
     while h < MAX_HANDLES {
         let entry = HANDLES[p * MAX_HANDLES + h]
@@ -416,6 +442,7 @@ public(package) func mint_handle(p: Int, kind: ObjType, rights: UInt32, target: 
                                                            rights: rights,
                                                            target: target,
                                                            gen: entry.gen)
+                quota_charge(p, QuotaKind.Handle)
                 return handle_word(h, entry.gen)
             },
             case _ -> {},
@@ -447,6 +474,231 @@ public(package) func unbind_handle(p: Int, index: Int) unsafe {
     HANDLES[p * MAX_HANDLES + index] = HandleEntry(obj_type: ObjType.Unbound,
                                                    rights: 0, target: 0,
                                                    gen: next)
+    // THE HANDLE ROW IS CREDITED HERE, at the one place a binding is destroyed
+    // — which is what makes the entry count and the quota count the same fact
+    // rather than two that agree today (sawos design 7 D-3).
+    quota_credit(p, QuotaKind.Handle)
+}
+
+// =============================================================================
+// THE QUOTA LEDGER (spec §12's promise; sawos design 7 D-3)
+// =============================================================================
+//
+// **PER-PROCESS STORAGE, SO IT LIVES WHERE THE PER-PROCESS STORAGE LIVES.**
+// §12 promised "a field on the process slot", and this is that promise kept one
+// module down, for a reason the module order decides rather than taste: the
+// HANDLE row has to be charged inside `mint_handle` and credited inside
+// `unbind_handle`, which are here, and `kcore.process` sits ABOVE this file —
+// so a table on `ProcessSlot` could not be reached from the two functions that
+// most need it, and the alternative was a second funnel over "the one place a
+// binding is destroyed". The flat `p * QUOTA_KINDS + kind` array is the handle
+// table's own idiom, one file down from where the boot-handle queue uses it,
+// which is the shape this module already has for per-process storage.
+// `ProcessSlot`'s docstring points here.
+//
+// **TWO ROWS PER KIND: what is spent, and what may be.** A charge happens at
+// the allocation sites that answer `NoResource` today, ordered POLICY FIRST —
+// the quota is asked before the machine is, so a process at its budget is told
+// whose limit it met. A credit happens where the thing is actually returned:
+// `free_object` for the refcounted kinds, `Unmap` for the mapping ROW, and the
+// teardown for everything at once.
+//
+// **NOTHING HERE IS INDEXED BY `ObjType`**, deliberately. The kinds with a
+// budget are not the kinds with a slab — a Clock is kernel-eternal and owned by
+// nobody, a System object is a singleton, and HANDLES are counted though they
+// have no slab at all — so this is its own closed set, and adding a case fails
+// `install_quota_limits` to compile until somebody says what a child may hold
+// of it.
+
+/// What a process may be charged for (sawos design 7 D-3).
+///
+/// Raw-backed and dense from zero, because the value IS the column index in the
+/// two arrays below — the same "the slot is the ordinal" arrangement `ClockType`
+/// uses, and the reason no lookup table is owed.
+///
+/// **`Handle` IS THE KIND WITH NO SLAB**, and that is why it is here rather
+/// than derived: a handle entry lives in the per-process table region, so the
+/// thing that bounds it is this row and nothing else. It is design 3's promised
+/// addition, arriving with the rest of the ledger.
+///
+/// **`Mapping` COUNTS INSTALLED ROWS, NOT OBJECTS**, and it is the one row in
+/// this enum that does. D-3 rules that a mapping charges its TARGET, because
+/// the scarce thing it consumes is that process's grant-row budget — and the
+/// row budget is what a `map` can physically meet, so a ledger that counted
+/// Mapping OBJECTS would drift from it the moment a mapped Mapping's last
+/// handle went away (D-2 frees the slot and LEAVES the row). Counting rows
+/// keeps `used` and the target's `grant_count` exactly in step, which is what
+/// makes `install_row`'s `fatal` provably unreachable rather than merely
+/// unlikely. `Thread` is the mirror asymmetry from the other side: it has a
+/// slab and no refcount, so its row is charged and only ever credited by the
+/// teardown.
+public(package) enum QuotaKind: UInt8 {
+    case Thread = 0,
+    case Event = 1,
+    case Waiter = 2,
+    case Interrupt = 3,
+    case Timer = 4,
+    case Memory = 5,
+    case IoMemory = 6,
+    case Mapping = 7,
+    case Handle = 8,
+}
+
+/// Columns in the ledger — one per `QuotaKind`, and the arrays' stride.
+public(package) static QUOTA_KINDS: Int = 9
+
+/// "No policy cap on this row: the MACHINE answers."
+///
+/// **THIS IS HOW ROOT'S LIMITS ARE THE SLAB SIZES** (D-3), and the sentinel is
+/// the right spelling rather than the numbers themselves. Writing root's rows
+/// as the slab sizes would put a policy cap at exactly the point the machine
+/// refuses, and since the quota is asked FIRST, every `NoResource` root has
+/// ever been answered with would become a `QuotaExceeded` — the machine's edge
+/// speaking in policy's voice, which is the opposite of what "its policy cap IS
+/// the machine" says. With the sentinel the slab is what refuses root, which is
+/// the sentence executed rather than approximated.
+public(package) static QUOTA_UNLIMITED: UInt16 = 0xFFFF
+
+/// What each process has spent, by kind.
+public(package) unsafe static var QUOTA_USED: [UInt16; MAX_PROCESSES * QUOTA_KINDS] = [
+    0; MAX_PROCESSES * QUOTA_KINDS]
+
+/// What each process may spend, by kind. Zero until `install_quota_limits`
+/// runs, which is deliberate: a slot with no limits installed can allocate
+/// nothing, so a process reached before its ledger exists refuses rather than
+/// running unbudgeted.
+public(package) unsafe static var QUOTA_LIMIT: [UInt16; MAX_PROCESSES * QUOTA_KINDS] = [
+    0; MAX_PROCESSES * QUOTA_KINDS]
+
+/// Where process `p`'s row for `kind` lives.
+func quota_at(p: Int, kind: QuotaKind) -> Int {
+    p * QUOTA_KINDS + ((kind as UInt8) as Int)
+}
+
+/// Has `p` room for one more of `kind`?
+///
+/// ASKED BEFORE THE SLAB IS, at every allocation site — D-3's check order, and
+/// the reason a caller can tell "my budget" from "the machine's edge".
+public(package) func quota_room(p: Int, kind: QuotaKind) unsafe -> Bool {
+    let at = quota_at(p, kind)
+    if QUOTA_LIMIT[at] == QUOTA_UNLIMITED {
+        return true
+    }
+    QUOTA_USED[at] < QUOTA_LIMIT[at]
+}
+
+/// Spend one of `kind` against `p`.
+///
+/// CALLED ONLY ONCE EVERY REFUSAL IS BEHIND US — `event_create`'s
+/// all-or-nothing shape, applied to the ledger: a charge made before a slab
+/// refusal would leave a process paying for an object it never got.
+public(package) func quota_charge(p: Int, kind: QuotaKind) unsafe {
+    let at = quota_at(p, kind)
+    QUOTA_USED[at] = QUOTA_USED[at] + 1
+}
+
+/// Give one of `kind` back to `p`.
+///
+/// The zero test is not defensive bookkeeping, it is the write-off D-4 names:
+/// a credit may land on a row the teardown has already zeroed, and the honest
+/// answer for "give back what nobody is charged for" is to do nothing.
+public(package) func quota_credit(p: Int, kind: QuotaKind) unsafe {
+    let at = quota_at(p, kind)
+    if QUOTA_USED[at] != 0 {
+        QUOTA_USED[at] = QUOTA_USED[at] - 1
+    }
+}
+
+/// Forget process `p`'s ledger. Called by the teardown.
+///
+/// **CREDITS DIE WITH THE LEDGER** (sawos design 7 D-4): a Gone process's rows
+/// zero with its slot, so everything it was ever charged for is written off in
+/// one line and the books balance by construction. Both rows go, not only the
+/// used ones — a process slot is reclaimable (design 3 D-3) and the next
+/// occupant must not inherit a stranger's allowance.
+public(package) func quota_clear(p: Int) unsafe {
+    var i: Int = 0
+    while i < QUOTA_KINDS {
+        QUOTA_USED[p * QUOTA_KINDS + i] = 0
+        QUOTA_LIMIT[p * QUOTA_KINDS + i] = 0
+        i = i + 1
+    }
+}
+
+/// Write one row of `p`'s allowance.
+func set_limit(p: Int, kind: QuotaKind, value: UInt16) unsafe {
+    QUOTA_LIMIT[quota_at(p, kind)] = value
+}
+
+/// Give process `p` its allowance, and zero what it has spent.
+///
+/// TWO POLICIES, ONE FUNCTION. `root` is init and its cap is the machine, so
+/// every row but one is `QUOTA_UNLIMITED` and the SLAB is what refuses it. A
+/// child gets `kcore.limits`' documented defaults, which are all visibly under
+/// their slabs.
+///
+/// **THE MAPPING ROW IS CLAMPED FOR BOTH, and that is agenda item 8's assert's
+/// runtime half.** `free_rows` is what the target's domain has left after its
+/// image spent its own — a fact no `static_assert` can know, since how many
+/// rows an image takes is a property of the image — and capping the row at it
+/// makes the invariant "quota limit <= free rows" true for EVERY process by
+/// construction. `install_row` then cannot meet the physical wall with quota
+/// headroom left, which is what turns its `fatal` from a hope into a
+/// consequence. Root is capped too, and that is not a departure from "root's
+/// cap is the machine": the row budget IS the machine, stated in the ledger's
+/// vocabulary so that the one refusal a `map` can meet is the one the assert
+/// reasons about.
+///
+/// It is called once per process life — at boot for root, at `process_create`
+/// for a child — and always AFTER the image's rows are recorded, because
+/// `free_rows` is read from the record.
+public(package) func install_quota_limits(p: Int, root: Bool, free_rows: Int) unsafe {
+    var i: Int = 0
+    while i < QUOTA_KINDS {
+        QUOTA_USED[p * QUOTA_KINDS + i] = 0
+        i = i + 1
+    }
+
+    if root {
+        set_limit(p, QuotaKind.Thread, QUOTA_UNLIMITED)
+        set_limit(p, QuotaKind.Event, QUOTA_UNLIMITED)
+        set_limit(p, QuotaKind.Waiter, QUOTA_UNLIMITED)
+        set_limit(p, QuotaKind.Interrupt, QUOTA_UNLIMITED)
+        set_limit(p, QuotaKind.Timer, QUOTA_UNLIMITED)
+        set_limit(p, QuotaKind.Memory, QUOTA_UNLIMITED)
+        set_limit(p, QuotaKind.IoMemory, QUOTA_UNLIMITED)
+        set_limit(p, QuotaKind.Handle, QUOTA_UNLIMITED)
+    } else {
+        set_limit(p, QuotaKind.Thread, DEFAULT_QUOTA_THREADS as UInt16)
+        set_limit(p, QuotaKind.Event, DEFAULT_QUOTA_EVENTS as UInt16)
+        set_limit(p, QuotaKind.Waiter, DEFAULT_QUOTA_WAITERS as UInt16)
+        set_limit(p, QuotaKind.Interrupt, DEFAULT_QUOTA_INTERRUPTS as UInt16)
+        set_limit(p, QuotaKind.Timer, DEFAULT_QUOTA_TIMERS as UInt16)
+        set_limit(p, QuotaKind.Memory, DEFAULT_QUOTA_MEMORIES as UInt16)
+        set_limit(p, QuotaKind.IoMemory, DEFAULT_QUOTA_IOMEMORIES as UInt16)
+        set_limit(p, QuotaKind.Handle, DEFAULT_QUOTA_HANDLES as UInt16)
+    }
+
+    // A record that somehow holds more rows than the profile grants would make
+    // this negative, and a negative allowance is not a number — zero is.
+    let rows = if free_rows < 0 { 0 } else { free_rows }
+    let want = if root { MAX_MAPPINGS } else { DEFAULT_QUOTA_MAPPINGS }
+    let mappings = if want < rows { want } else { rows }
+    set_limit(p, QuotaKind.Mapping, mappings as UInt16)
+}
+
+/// Which refusal a `mint_handle` that answered `NO_HANDLE` was.
+///
+/// The two are indistinguishable in the word — there is one sentinel — so this
+/// re-asks the question the mint asked first: a caller with no handle room left
+/// met ITS budget, anyone else met the TABLE. One helper rather than a second
+/// return channel, because every mint site already tests for `NO_HANDLE` and
+/// this turns that test into the right status without changing its shape.
+public(package) func mint_refusal(p: Int) unsafe -> SosStatus {
+    if quota_room(p, QuotaKind.Handle) {
+        return SosStatus.NoResource
+    }
+    SosStatus.QuotaExceeded
 }
 
 // =============================================================================
@@ -479,10 +731,13 @@ public(package) struct MemorySlot {
     public(package) process: Int,
     public(package) base: UInt,
     public(package) len: UInt,
+    /// How many handle entries name this region (sawos design 7 D-1).
+    public(package) refs: UInt16,
 }
 
 public(package) unsafe static var MEMORIES: [MemorySlot; MAX_MEMORIES] = [
-    MemorySlot(state: SlotState.Free, process: 0, base: 0, len: 0); MAX_MEMORIES]
+    MemorySlot(state: SlotState.Free, process: 0, base: 0, len: 0, refs: 0);
+    MAX_MEMORIES]
 
 /// Take a free Memory slot, or `NO_MEMORY` when the slab is full.
 public(package) func alloc_memory() unsafe -> Int {
@@ -516,10 +771,13 @@ public(package) struct IoMemorySlot {
     public(package) process: Int,
     public(package) base: UInt,
     public(package) len: UInt,
+    /// How many handle entries name this window (sawos design 7 D-1).
+    public(package) refs: UInt16,
 }
 
 public(package) unsafe static var IOMEMORIES: [IoMemorySlot; MAX_IOMEMORIES] = [
-    IoMemorySlot(state: SlotState.Free, process: 0, base: 0, len: 0); MAX_IOMEMORIES]
+    IoMemorySlot(state: SlotState.Free, process: 0, base: 0, len: 0, refs: 0);
+    MAX_IOMEMORIES]
 
 /// Take a free IoMemory slot, or `NO_IOMEMORY` when the slab is full.
 public(package) func alloc_iomemory() unsafe -> Int {
@@ -580,10 +838,18 @@ public(package) struct MappingSlot {
     public(package) process: Int,
     public(package) target: Int,
     public(package) row: Int,
+    /// How many handle entries name this mapping (sawos design 7 D-1).
+    ///
+    /// **THE ROW IS NOT ONE OF THEM** (design 7 D-2). A Mapping OWNS its row,
+    /// not the reverse, so a mapped-but-unreferenced Mapping is at zero and
+    /// frees — leaving the row behind, which is §2.5's "permanent,
+    /// safe-but-leaked" made mechanical rather than a new law.
+    public(package) refs: UInt16,
 }
 
 public(package) unsafe static var MAPPINGS: [MappingSlot; MAX_MAPPINGS] = [
-    MappingSlot(state: SlotState.Free, process: 0, target: 0, row: NO_ROW);
+    MappingSlot(state: SlotState.Free, process: 0, target: 0, row: NO_ROW,
+                refs: 0);
     MAX_MAPPINGS]
 
 /// Take a free Mapping slot, or `NO_MAPPING` when the slab is full.

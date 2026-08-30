@@ -82,6 +82,15 @@ public(package) struct EventSlot {
     public(package) word: UInt,
     /// The attachment naming this event (slot + 1); 0 = unattached.
     public(package) attachment: Int,
+    /// Handle entries naming this event, PLUS its attachment (sawos design 7
+    /// D-1).
+    ///
+    /// **THE ATTACHMENT COUNTS**, and that is what makes design 7's cascade
+    /// well-founded rather than circular: an attached Event cannot reach zero,
+    /// so nothing frees a waitable out from under the Waiter watching it — the
+    /// Waiter's own death detaches first, and THAT decrement is what may take
+    /// this one to zero.
+    public(package) refs: UInt16,
 }
 
 /// One Interrupt (spec §2 table, §9): an IRQ line bound to a waitable.
@@ -109,6 +118,11 @@ public(package) struct InterruptSlot {
     public(package) pending: Bool,
     /// The attachment naming this interrupt (slot + 1); 0 = unattached.
     public(package) attachment: Int,
+    /// Handle entries naming this interrupt, PLUS its attachment (sawos design
+    /// 7 D-1). Reaching zero MASKS THE LINE — the kernel taking the line back
+    /// exactly as the teardown does — and returns the slot, so the line becomes
+    /// bindable again mid-life.
+    public(package) refs: UInt16,
 }
 
 /// One Waiter (spec §2.2): the generic wait aggregator.
@@ -126,6 +140,14 @@ public(package) struct WaiterSlot {
     public(package) attached: Int,
     /// Head of the list of threads parked in `Wait` (thread slot + 1).
     public(package) blocked: Int,
+    /// Handle entries naming this waiter (sawos design 7 D-1).
+    ///
+    /// **ONLY HANDLES**, unlike the three waitable kinds: an attachment is a
+    /// reference to the WAITABLE, not to the Waiter that holds it — a Waiter
+    /// owns its attachment list, so counting them here would be an object
+    /// counting itself and nothing would ever reach zero. That asymmetry is
+    /// what makes the Waiter the one kind whose free CASCADES.
+    public(package) refs: UInt16,
 }
 
 /// ONE ATTACHMENT: a Waiter, a waitable, and the key that names the pair.
@@ -157,15 +179,15 @@ public(package) struct Attachment {
 
 public(package) unsafe static var EVENTS: [EventSlot; MAX_EVENTS] = [
     EventSlot(state: SlotState.Free, process: 0, mode: EventMode.Or, word: 0,
-              attachment: 0); MAX_EVENTS]
+              attachment: 0, refs: 0); MAX_EVENTS]
 
 public(package) unsafe static var WAITERS: [WaiterSlot; MAX_WAITERS] = [
     WaiterSlot(state: SlotState.Free, process: 0, attached: 0,
-               blocked: 0); MAX_WAITERS]
+               blocked: 0, refs: 0); MAX_WAITERS]
 
 public(package) unsafe static var INTERRUPTS: [InterruptSlot; MAX_INTERRUPTS] = [
     InterruptSlot(state: SlotState.Free, process: 0, line: 0, pending: false,
-                  attachment: 0); MAX_INTERRUPTS]
+                  attachment: 0, refs: 0); MAX_INTERRUPTS]
 
 public(package) unsafe static var ATTACHMENTS: [Attachment; MAX_ATTACHMENTS] = [
     Attachment(state: SlotState.Free, kind: WaitableKind.Event, target: 0,

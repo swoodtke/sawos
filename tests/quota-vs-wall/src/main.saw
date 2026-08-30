@@ -1,0 +1,234 @@
+// SOS M3 unit 5: THE POLICY CAP IS REACHED FIRST (sawos design 7 D-3;
+// sawlang#232 agenda item 8).
+//
+// **THE LAUNCHER FOR THE ONE CLAIM A KERNEL ASSERT CANNOT SHOW.** Design 6
+// recorded agenda item 8's sentence at the row-budget check — *a `map()`
+// meeting the physical wall with quota headroom left is a kernel bug to assert
+// against* — and design 7 made it executable: the check is a `fatal_kernel`
+// now, which by construction never appears in a passing transcript. So the
+// observable half is a child that maps until it is refused and reports WHICH
+// refusal it met, and a clean run is what says the ordering held.
+//
+//   SOS quotawall: created
+//   SOS quotawall: gave a page
+//   SOS quotawall: started
+//   SOS childmapwall: maps=2 quota=1     <- POLICY refused, and the machine's
+//                                           row budget was never reached
+//   SOS: process exit: code=2
+//   SOS quotawall: root observed child status=65538
+//   SOS quotawall: done
+//
+// **WHAT ROOT CONTRIBUTES IS A REGION AND NOTHING ELSE.** The child maps a page
+// its launcher split off the pool INTO ITSELF, through its own Process handle —
+// so the two rights the map spends (`MemoryRight.Map` on the page,
+// `ProcessRight.Map` on the target) are both the child's own, and root's
+// allowance has nothing to do with how many rows the child may install. That is
+// D-3's one ruled exception to creator-pays working: a mapping charges the
+// TARGET, because the scarce thing it consumes is the target's grant-row
+// budget, and charging the caller would let a launcher's quota gate another
+// process's domain size.
+//
+// ROOT PARKS ON A GENEROUS TIMER while the child runs, so the ordering above is
+// forced rather than raced.
+
+import sos.{System, Process, Memory, BootHandle, Clock, ClockType, Timer,
+            Waiter, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// One protection unit's worth on either profile.
+static CHUNK: UInt = 0x1000
+
+/// The key this case attaches its park timer under.
+static KEY: UInt = 64
+
+/// Twenty milliseconds. See `process_lifecycle`.
+static PARK_NS: UInt64 = 20_000_000
+
+/// Root's config: the tags the child's System handle and its page travel under.
+static TAG_BOOT: UInt = 31
+static TAG_PAGE: UInt = 33
+
+/// What a child of this launcher may ask its System object for: print, and
+/// learn its own Process object — which is also the handle it maps THROUGH.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS quotawall: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // The boot set, in the build's row order: the child's image blob, the RAM
+    // it will run in, and the pool this launcher allocates the page out of.
+    var image = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS quotawall: no image region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    var dest = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS quotawall: no destination region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    var pool_record = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS quotawall: no pool region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    guard let image_mem = image.take_memory() else {
+        let _ = system.debug_print("SOS quotawall: image record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest_mem = dest.take_memory() else {
+        let _ = system.debug_print("SOS quotawall: dest record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let pool = pool_record.take_memory() else {
+        let _ = system.debug_print("SOS quotawall: pool record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let child = match system.process_create(image: &image_mem,
+                                            memory: &dest_mem) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS quotawall: create failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS quotawall: created\n")
+
+    let page = match pool.split(len: CHUNK) {
+        case Ok(m) -> m,
+        case Err(e) -> {
+            print("SOS quotawall: split failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let for_child = match system.mint(rights: CHILD_SYSTEM) {
+        case Ok(s) -> s,
+        case Err(e) -> {
+            print("SOS quotawall: mint failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match child.give(system: move for_child, tag: TAG_BOOT) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS quotawall: give system failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    // **THE PAGE TRAVELS, AND ITS RIGHTS TRAVEL VERBATIM.** A give is a move,
+    // so the child receives `MemoryRight.Map` because root held it — which is
+    // what makes the child able to install rows at all, and what makes the
+    // rows it installs its OWN business.
+    match child.give(memory: move page, tag: TAG_PAGE) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS quotawall: give page failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS quotawall: gave a page\n")
+
+    match child.start(boot_tag: TAG_BOOT) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS quotawall: start failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS quotawall: started\n")
+
+    let clock = match system.clock_get(type: ClockType.Monotonic) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS quotawall: no clock: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let waiter = match proc.waiter_create() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS quotawall: no waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let timer = match clock.timer_create() {
+        case Ok(t) -> t,
+        case Err(e) -> {
+            print("SOS quotawall: no timer: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match waiter.add(&timer, KEY) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS quotawall: attach failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match timer.arm(after_ns: PARK_NS) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS quotawall: arm failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match waiter.wait() {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS quotawall: wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let status = match child.get_status() {
+        case Ok(s) -> s,
+        case Err(e) -> {
+            print("SOS quotawall: status failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    print("SOS quotawall: root observed child status={}\n", status)
+
+    print("SOS quotawall: done\n")
+    let _ = proc.exit(EXIT_OK)
+}
