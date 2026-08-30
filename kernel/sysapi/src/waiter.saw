@@ -8,12 +8,14 @@
 //! the three overloads make impossible.
 //!
 //! **AND THE FOURTH KIND IS WHERE THAT SHAPE RAN OUT** (sawos design 8, M3
-//! unit 5.5). A PROCESS handle is waitable now, but `Process` is declared
+//! unit 5.5). A PROCESS handle is waitable too, but `Process` is declared
 //! ABOVE this file (in `sos.system`, with `System` and `BootHandle`, because
 //! every pair of those three names the other), so the fourth `add` overload
-//! would import downward into its own importer. It is
-//! `Process.attach(waiter:, key:)` instead — same op, same rules — and a
-//! comment sits below the three overloads where it would have gone.
+//! written HERE would import downward into its own importer. It lives in
+//! `sos.system` instead, as an `extension Waiter` beside `Process` — same op,
+//! same rules — which callers see because extension lookup follows the
+//! facade's `public import` since sawlang 0.2.0 (the first pin bump; SL-7's
+//! resolution; unit 5.5 shipped `Process.attach` in the interim).
 
 import sosabi.{SosStatus, WaiterHandle, NO_HANDLE, WaitTag, WaitResult,
                WaitPayload, WAIT_RECORD_WORDS, WAIT_KEY_WORD, WAIT_TAG_WORD,
@@ -142,22 +144,24 @@ extension Waiter {
     }
 
     // **THE FOURTH KIND IS NOT HERE, AND IT IS THE ONLY ONE THAT IS NOT**
-    // (sawos design 8, M3 unit 5.5). A PROCESS handle attaches like the three
-    // above — same op, same key rules, same level-triggered contract — but the
-    // overload is `Process.attach(waiter:key:)`, written in `sos.system` where
-    // `Process` is declared, because this module sits BELOW that one: `add`
-    // reads its argument's handle field, so an overload naming `Process` here
-    // would be the import cycle DF-232e diagnoses, exactly as `Waiter` below
-    // the three waitables would have been.
-    //
-    // It is the SL-7 constraint's third site and design 6's precedent
-    // (`Memory.map(into:)` becoming `Process.map(memory:)`) applied verbatim —
-    // the receiver flips, nothing else does. See `sos`'s facade header.
+    // (sawos design 8, M3 unit 5.5; respelled at the first pin bump). A
+    // PROCESS handle attaches like the three above — same op, same key rules,
+    // same level-triggered contract — but the overload is declared in
+    // `sos.system` where `Process` is: this module sits BELOW that one (`add`
+    // reads its argument's handle field), so an overload naming `Process`
+    // here would be the import cycle DF-232e diagnoses, exactly as `Waiter`
+    // below the three waitables would have been. Since sawlang 0.2.0 an
+    // extension travels with `public import`, so the split is invisible at
+    // the call site — `waiter.add(process:, key:)` reads as the fourth
+    // member of this list, which is what design 8 ruled.
 
-    /// The one call the per-kind overloads share. Private: a raw handle word
-    /// crosses here and nowhere else in this type, which is the module
-    /// docstring's rule spelled as a boundary rather than repeated per method.
-    func attach(&self, target: UInt, key: UInt) -> Result<Void, SosStatus> {
+    /// The one call the per-kind overloads share. `public(package)` and not
+    /// `public` — a raw handle word crosses here and nowhere else, and the
+    /// module docstring's no-forged-handles rule rests on this form being
+    /// unreachable from USER code. Package width exists for exactly one
+    /// caller: the fourth overload, in `sos.system`, whose receiver type
+    /// cannot be named here (the header says why).
+    public(package) func attach(&self, target: UInt, key: UInt) -> Result<Void, SosStatus> {
         checked(sos_waiter_add(self.handle, target, key))
     }
 

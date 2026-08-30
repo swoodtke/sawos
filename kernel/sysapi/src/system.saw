@@ -390,46 +390,11 @@ extension Process {
     /// This process's §8 status word: kind in the high bits, code in the low
     /// ones. Requires `ProcessRight.Wait`.
     ///
-    /// THE POLLING DOOR. `attach` below is the blocking one, onto the same
-    /// word.
+    /// THE POLLING DOOR. `Waiter.add(process:, key:)` — the fourth overload,
+    /// declared at the bottom of this file — is the blocking one, onto the
+    /// same word.
     public func get_status(&self) -> Result<UInt, SosStatus> {
         call_value(self.handle, ProcessOp.GetStatus as UInt, 0, 0, 0)
-    }
-
-    /// WATCH THIS PROCESS DIE: attach it to `waiter` under `key`, which a
-    /// `wait()` hands back with the §8 status word when it ends, whatever ended
-    /// it (spec §8; sawos design 8, M3 unit 5.5). Requires `ProcessRight.Wait`
-    /// here and `WaiterRight.Attach` there.
-    ///
-    /// **IT SPENDS THE SAME BIT `get_status` SPENDS, AND NO NEW ONE.** Being
-    /// woken by a death and asking whether one happened are one question at two
-    /// tempos, so a second right would only let a supervisor poll a death it
-    /// may not be told about — which is a distinction with no use behind it.
-    ///
-    /// **DEATH IS A TERMINAL LEVEL**, and it is the one place this differs from
-    /// `Waiter.add`'s other three kinds. An Event's word and a Timer's fire
-    /// count are CONSUMED by the wait that reports them; a death is not. So a
-    /// process that was ALREADY DEAD when you attached still wakes you — there
-    /// is no window in which a death can be missed, which is what makes
-    /// supervision race-free — and a second `wait()` on the same attachment
-    /// answers the same word. Nothing un-dies.
-    ///
-    /// THE PROCESS IS BORROWED AND NOTHING IS CONSUMED: an attachment is a
-    /// subscription the WAITER owns, so the handle stays yours, and dropping it
-    /// detaches nothing (`remove(key)` is what detaches). Do keep in mind that
-    /// the attachment is a REFERENCE — a dead process's slot lives until BOTH
-    /// its last handle and its attachment are gone, which is what keeps the
-    /// status word readable for as long as anybody is watching.
-    ///
-    /// **WHY THIS IS A `Process` METHOD AND NOT A FOURTH `Waiter.add`
-    /// OVERLOAD**, which is what design 8 ruled: `sos.waiter` sits BELOW this
-    /// module (its `add` overloads name `Event`, `Interrupt` and `Timer`), so
-    /// an overload naming `Process` there would be the import cycle DF-232e
-    /// diagnoses. It is the same constraint that turned design 6's
-    /// `Memory.map(into: &Process)` into `Process.map(memory:)`, applied the
-    /// same way — the receiver flips and nothing else does.
-    public func attach(&self, waiter: &Waiter, key: UInt) -> Result<Void, SosStatus> {
-        checked(sos_waiter_add(waiter.handle, self.handle, key))
     }
 
     /// Make an Event accumulating in `mode` — §2.4's per-Event property, fixed
@@ -727,6 +692,44 @@ extension Process {
     /// what lets the same kernel serve a hand-built system and a dynamic one.
     public func boot_handle_next(&self) -> Result<BootHandle, SosStatus> {
         boot_handle_into_frame(self.handle)
+    }
+}
+
+// **THE FOURTH `Waiter.add` OVERLOAD LIVES HERE, NOT IN `sos.waiter`** — and
+// since sawlang 0.2.0 that placement is invisible to callers, which is the
+// point. Design 8 RULED this spelling and unit 5.5 could not write it: the
+// overload has to read `process.handle`, so it must sit where `Process` is
+// declared, and extension lookup did not follow the facade's `public import`,
+// so a method declared here was out of scope at every real call site
+// (`Process.attach` was the workaround — SL-7's third site). Sawlang 0.2.0
+// made extension lookup follow `public import`, so an `import sos.{Waiter}`
+// now carries this overload with it and the ruled surface is writable — the
+// first pin bump is what delivered it.
+extension Waiter {
+    /// WATCH A PROCESS DIE: attach it under `key`, which a `wait()` hands back
+    /// with the §8 status word when it ends, whatever ended it (spec §8; sawos
+    /// design 8, M3 unit 5.5). Requires `ProcessRight.Wait` there and
+    /// `WaiterRight.Attach` here — the same bit `get_status` spends and no new
+    /// one, because being woken by a death and asking whether one happened are
+    /// one question at two tempos.
+    ///
+    /// Every rule the other three overloads state holds unchanged: keys are
+    /// unique per Waiter, a handle attaches to at most one Waiter, readiness
+    /// is level-triggered. What is NEW here is that **DEATH IS A TERMINAL
+    /// LEVEL**: an Event's word and a Timer's fire count are CONSUMED by the
+    /// wait that reports them; a death is not. A process that was ALREADY DEAD
+    /// when you attached still wakes you — no window in which a death can be
+    /// missed, which is what makes supervision race-free — and a second
+    /// `wait()` on the same attachment answers the same word. Nothing un-dies.
+    ///
+    /// THE PROCESS IS BORROWED AND NOTHING IS CONSUMED: an attachment is a
+    /// subscription the WAITER owns, so the handle stays yours, and dropping
+    /// it detaches nothing (`remove(key)` is what detaches). The attachment is
+    /// also a REFERENCE — a dead process's slot lives until BOTH its last
+    /// handle and its attachment are gone, which is what keeps the status word
+    /// readable for as long as anybody is watching.
+    public func add(&self, process: &Process, key: UInt) -> Result<Void, SosStatus> {
+        self.attach(process.handle, key)
     }
 }
 

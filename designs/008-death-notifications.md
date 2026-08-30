@@ -212,6 +212,15 @@ Three cases, six rows, one new child package.
    extension lookup to the DECLARING module plus the caller's DIRECT
    imports, so every consumer would have needed an `import sos.system`
    whose purpose is invisible. SL-7 updated with this site.
+   **RIDER (first pin bump, sawlang 0.2.0, Aug 30): superseded as
+   ruled.** The user landed SL-7's resolution — extension lookup
+   follows `public import` — so the rejected alternative became the
+   ruled surface: `Waiter.add(process:, key:)` now lives in
+   `system.saw` as an `extension Waiter`, the raw funnel widened to
+   `public(package)` for that one caller, and `Process.attach`
+   retired. The three test call sites respelled; semantics
+   byte-identical. This unit's interim spelling was correct for the
+   toolchain it shipped against.
 2. **`kcore.waitables` moved ABOVE `kcore.process`** — the one altitude
    change. A Process's readiness, payload and watcher are all reads of
    `PROCESSES`, so the matrix has to see that table. The flip is sound
