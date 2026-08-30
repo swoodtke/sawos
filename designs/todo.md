@@ -21,23 +21,6 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
-- M3 unit 7 — the docs sweep — **CLOSED Aug 30** [sawlang#232 item 7, #11 —
-  designs/011-m3-docs-sweep.md]: all six owed items landed. §3 REWRITTEN
-  around NO AMPLIFICATION (the Jul-29 no-duplicate rule quoted and
-  superseded clause by clause, the three facts that hold the invariant,
-  the clock worked example, `MINT_OP`, and unit 6's exec gate as
-  policy-by-mask); §2.5 aligned to the built names (`Memory`/`IoMemory`/
-  `Mapping`, split/carve/map/give) with the two stale `§2.3` pointers
-  fixed; §5.7 amended (rights-gated ops, boot set one handle wide at the
-  register, the two copy funnels as the only user-memory doors); the
-  DMA-TCB note placed at §2.5 with its two prerequisites; §11 refreshed
-  whole (M3 ledger unit by unit, 79 cases/arch and 158 runs, M4 pointed at
-  designs/010, a DMA/IOMMU row added, the pins restated). Consistency grep
-  caught 26 stale sites — 16 in spec.md (one of them the 21 `sos/`-prefixed
-  paths the Aug-28 flattening left behind) and 10 in doc comments, all
-  fixed; the full list is in the As-built. Gate: 158/158, EVERY row
-  byte-identical to the merge-base transcript. M3 CLOSES with this
-
 ## [BACKLOG] — filed, not scheduled
 
 - M4 scoping — pipes [#10 — designs/010-m4-pipes.md, DRAFT Aug 30,

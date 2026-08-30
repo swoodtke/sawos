@@ -103,7 +103,7 @@ structural, not a rights mask to count by. Then:
   blocking `send`/`receive` data-only rendezvous, PeerClosed on both
   zero-arms. No handles-in-messages, no waitability yet. The copy
   funnels exist (§2.2's one door); kernel interruptibility (M3 unit
-  0) already covers the copy loops.
+  1.5, design #1) already covers the copy loops.
 - **Unit 2 — the one-shot pair.** PipeReplyHandle/PipeRequestHandle
   as objects: consumed-on-reply, transferable (delegation), drop
   semantics as ratified, NoCopy in the sosrt surface (RAII
