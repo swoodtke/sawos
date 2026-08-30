@@ -100,5 +100,160 @@ any teardown-report change; M4 anything.
 
 ## As built
 
-(Implementer: arms as landed, the notify ordering as landed,
-findings.)
+BUILT Aug 30 2026. `make sos-test` green on both profiles — 150 passed —
+against a baseline captured at the merge base (6616775). The bucketed
+account of the 144 baseline rows, whole transcripts diffed rather than
+"green" read:
+
+| bucket | rows |
+|---|---|
+| byte-identical | 103 |
+| address-only (`entry=` alone; the `sos` module grew) | 40 |
+| authorized changes to existing rows | **0**, as D-1 predicted |
+| documented-nondeterministic | 1 — `thread_preempt` on arm64 |
+
+Plus 6 new rows (3 cases × 2 arches). The nondeterministic row is the
+alternation string `thread_preempt` prints, which the case's own comment
+records as timing-dependent ("WHICH worker runs first depends on where
+the first tick lands relative to the two `start` calls") and which
+asserts DIRECTION CHANGES rather than a sequence; four earlier runs of
+unrelated trees in this session's scratchpad show four different strings,
+one of them starting with `B`, which no code change can cause. The 40
+address-only rows are the `entry=` line alone — nothing else in any of
+them moved.
+
+### The arms, as landed
+
+- **`WaitableKind.Process = 3`** (`kcore.waitables`) and the five matrix
+  arms beside it: `waitable_attachment` / `set_waitable_attachment` read
+  and write a new `ProcessSlot.attachment` field; `waitable_ready` is
+  `state == Gone` (a nested match, with `Created` refused by name —
+  see the findings); `waitable_answer` is
+  `WaitAnswer(tag: WaitTag.Process, payload: process_status_word(
+  exit_kind, exit_code))`; `waitable_consume` is **empty, and the
+  one-sentence contrast with Event's clear-on-consume is written at the
+  arm** — the two empty arms (Interrupt, Process) are empty for opposite
+  reasons, and that is the sentence.
+- **`WaitTag.Process = 3` and `WaitPayload.Process(status:)`** in
+  `sosabi`, both with the docstrings the brief asked for. The tag's own
+  "the space is extensible" paragraph got a line saying it had now been
+  collected.
+- **`waitable_slot`'s Process arm REPLACES its `NotWaitable` refusal**,
+  gating `ProcessRight.Wait` on the handle — the `GetStatus` bit, no new
+  right. `Thread` stays `NotWaitable` (D-2) and its arm now carries the
+  scope sentence rather than nothing.
+- **`end_process` notifies** — `notify_ready(WaitableKind.Process, p)`
+  immediately after the three status assignments, before the exit report
+  and before the close-all. The D-1 ordering note is at the site: the
+  wake only QUEUES, the teardown runs to completion inside the same
+  syscall, and `resume_after_death` at the bottom is what picks the woken
+  supervisor up. The transcripts show it — the wake line lands after the
+  teardown line in both notify cases.
+- **The refcount composes**: `ref_waitable` / `unref_waitable` reach
+  `ObjType.Process` through `waitable_obj_type`'s new arm, so the
+  attachment increments and decrements `PROCESSES[slot].refs` at exactly
+  the sites design 7 already had. `free_object`'s Process arm gained the
+  attached-at-zero `fatal_kernel` its three siblings carry. Design 7's
+  D-1 table row is amended, and so is §2's copy of it.
+- **`has_external_wake_source` gained NO arm**, and the D-1 reasoning is
+  recorded at the predicate in the three cases it resolves (parked on a
+  live started child / on a dead child / on a created-never-started
+  child).
+- **sysapi**: `decode_wait`'s tag vocabulary grew one arm. The attach
+  overload is **`Process.attach(waiter:, key:)`** and not
+  `Waiter.add(process:, key:)` — see finding 1. Borrow, nothing
+  consumed; no other wrapper changed.
+- **`MAX_ATTACHMENTS` grew by `MAX_PROCESSES`** (20 → 22): an attachment
+  is one (Waiter, waitable) pair, and there is a fourth kind of waitable
+  now.
+
+### The proof, as landed
+
+Three cases, six rows, one new child package.
+
+- **`death_notify`** (`tests/death-notify` + the new `tests/child-bye`) —
+  **the first launcher in the suite with no timer armed.** It attaches
+  the child's Process handle before starting it and parks; the child
+  exits with code 5; root wakes with `key=44 status=65541`
+  (`Exited` << 16 | 5). A kernel that failed to notify would have nothing
+  runnable and die with `every thread blocked`, so a plain `wait()` is
+  the assertion.
+- **`death_fault`** (`tests/death-fault` + the existing `child-fault`) —
+  the same program with the `give` taken away, so the child dies at its
+  first `ecall`. `status=131073` (`Faulted` << 16 | `BadHandle`), byte
+  for byte the word `process_lifecycle` reads through `get_status`.
+  Reusing the existing child is what made the fault arm cost one package.
+- **`death_late_attach`** (`tests/death-late-attach` + `child-bye`) —
+  root sleeps on a timer until the child is already dead, then attaches
+  and waits TWICE: `first=65541 second=65541`. Then the reclaim
+  interplay, asked one reference at a time: release the Process handle
+  and a second `process_create` is still refused (`held=1` — the
+  attachment alone holds the `Gone` slot); `remove` the attachment and
+  the same create succeeds (`freed=1`). A kernel that did not count the
+  attachment prints `held=0`, and its second wait would have been reading
+  a slot already given away.
+
+### Findings
+
+1. **SL-7's THIRD SITE, and it moved the ruled spelling.** The brief's
+   `Waiter.add(process:, key:)` is unwritable: `sos.waiter` sits BELOW
+   `sos.system` (its three `add` overloads read `Event`/`Interrupt`/
+   `Timer` handle fields, which is why it is above THEM), and `Process`
+   is declared in `sos.system` because System/Process/BootHandle
+   mutually reference. A fourth overload naming `Process` in
+   `waiter.saw` is the DF-232e cycle. Design 6 met the same wall and
+   answered it by flipping the receiver
+   (`Memory.map(into: &Process)` → `Process.map(memory:)`); this unit
+   applies that verbatim, so the surface is
+   **`child.attach(waiter: &w, key: K)`** with identical semantics, and
+   `waiter.saw` carries a comment where the fourth overload would have
+   gone so its list still reads as four. The rejected alternative was an
+   `extension Waiter` written in `system.saw`: design 142 scopes
+   extension lookup to the DECLARING module plus the caller's DIRECT
+   imports, so every consumer would have needed an `import sos.system`
+   whose purpose is invisible. SL-7 updated with this site.
+2. **`kcore.waitables` moved ABOVE `kcore.process`** — the one altitude
+   change. A Process's readiness, payload and watcher are all reads of
+   `PROCESSES`, so the matrix has to see that table. The flip is sound
+   because `process` names nothing in `waitables`; `kcore/lib.saw`'s
+   ordered list, both module headers and the "where the line fell"
+   paragraph are updated. Worth knowing for the next unit: the
+   state-below-teardown rule never fixed the order of two STATE modules
+   relative to each other, only relative to the teardown, and both are
+   still below it.
+3. **A Process attachment is the FIRST CROSS-PROCESS attachment**, which
+   falsified a sentence `end_process`'s attachment sweep rested on ("an
+   attachment only ever joins two objects of the SAME process, so
+   freeing both ends is freeing the list"). The sweep now also clears the
+   watched waitable's back pointer and drops the reference through a new
+   `unref_waitable_teardown` (the `unref_teardown` twin, count-don't-free,
+   for the close-all's own stated reason). Unreachable at
+   `MAX_PROCESSES == 2` — the only possible supervisor is root, and
+   root's death stops the machine — and it moved no transcript row,
+   because for a same-process waitable the per-slab sweep zeroes the slot
+   two loops later either way. Written because an invariant that has
+   quietly become false is worse than a branch nothing takes.
+4. **The compiler enumerated the unit.** Adding the three enum cases
+   broke, by name: five matrix arms, `waitable_obj_type`,
+   `waitable_slot`, `decode_wait`, and EIGHT userspace `WaitPayload`
+   matches in `tests/`. Nothing had to be searched for. §2.2's "a further
+   waitable cannot be added silently" is recorded as COLLECTED rather
+   than claimed, and `waitable_slot`'s docstring notes the sharper half:
+   a `_` arm would have hidden this one entirely, since a kind moving
+   from the refusal list to the waitable list is not a new case at all.
+5. **The deadlock predicate's third case is load-bearing, not just
+   correct.** A supervisor parked on a child it CREATED and never
+   STARTED is genuinely deadlocked — nothing can ever make that slot
+   `Gone` — and `has_external_wake_source` answering `false` is what
+   reports it. An arm counting live processes as a wake source (the
+   obvious "fix" a reviewer might propose) would have turned exactly that
+   mistake into a silent hang. Recorded at the predicate.
+6. **No new SAWLANG deficiency met.** Nothing in this unit needed a
+   language feature that is missing, and no existing SL entry got a new
+   site except SL-7 (finding 1). SL-10 is not owed.
+
+### What is still open
+
+Nothing from this brief. §8's other half — a waitable THREAD — stays
+deferred and is now the only `NotWaitable` arm in `waitable_slot` that
+§8 promises to remove; `kill` still has neither op nor right.

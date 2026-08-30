@@ -1,0 +1,46 @@
+// SOS CHILD: A PROCESS THAT ENDS ON PURPOSE (sawos design 8, M3 unit 5.5).
+//
+// THE SMALLEST PROGRAM THAT CAN DIE OBSERVABLY. It takes the masked System
+// handle its launcher gave it, derives its own Process object, says one line
+// and calls `exit`. Everything interesting about this child is on the OTHER
+// side of that call: its launcher is parked on a Waiter with this process's own
+// Process handle attached, and the exit code below is what lands in the §8
+// status word that wakes it.
+//
+// `EXIT_CODE` IS 5, AND THE NUMBER IS ARBITRARY — what is not arbitrary is that
+// it is distinctive. The launcher prints `Exited`(1) << 16 | 5 = 65541, a word
+// no other ending in this tree produces: a fault would read `Faulted`(2) in the
+// high half, and a child that never reached `exit` at all would read one too.
+// So the launcher's number is a claim about WHICH death happened, not merely
+// that one did.
+//
+// A CHILD THAT CANNOT REACH ITS OWN PROCESS OBJECT STILL DIES, and says so by
+// dying differently: it falls off `_start`, whose link register is zero (§8),
+// so the kernel faults it and the launcher reads `Faulted` where it expected
+// `Exited`. Nothing here papers over that failure, which is the whole reason
+// the error arm is three lines and not a retry.
+
+import sos.{System}
+
+/// The code this child ends with. See the header for why the value matters
+/// less than its distinctness.
+static EXIT_CODE: UInt = 5
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(e) -> {
+            print("SOS bye: no process handle: {}\n", e)
+            // There is nothing left to exit WITH. Returning from the entry
+            // faults this process, which the launcher reads as `Faulted` rather
+            // than as this case's `Exited` — a wrong answer that says so.
+            return
+        },
+    }
+
+    let _ = system.debug_print("SOS bye: exiting\n")
+    let _ = proc.exit(EXIT_CODE)
+}

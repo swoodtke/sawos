@@ -351,6 +351,17 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
                                          target: 0, row: NO_ROW, refs: 0)
         },
         case Process -> {
+            // A PROCESS IS A WAITABLE SINCE M3 UNIT 5.5, so it joins the three
+            // arms above in asserting the invariant an attachment-as-reference
+            // buys (sawos design 8): reaching zero means nothing is watching,
+            // because a watcher IS a reference. The test is the invariant
+            // written down, and it is what makes attach-after-death sound
+            // against the reclaim below — if it ever fired, a supervisor would
+            // be parked on a slot the kernel had already given away.
+            if PROCESSES[slot].attachment != 0 {
+                fatal_kernel("a process reached zero references while attached",
+                             slot as UInt)
+            }
             // A LIVE PROCESS IS NOT FREED BY LOSING ITS LAST HANDLE — it is
             // still running, and its slot is what it is running in. Only a
             // `Gone` slot's last reader going makes the §8 status word
@@ -388,12 +399,15 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
 /// on the kind (`waitables`' header); `ObjType` is what a handle entry carries.
 /// One translation written out beats a cast between two enums that happen to be
 /// numbered differently, and it is total, so the third waitable kind cost it
-/// one line.
+/// one line — and so did the FOURTH (sawos design 8), which is where the two
+/// enums genuinely stop being numbered alike: `WaitableKind.Process` is 3 and
+/// `ObjType.Process` is not.
 func waitable_obj_type(kind: WaitableKind) -> ObjType {
     match kind {
         case Event -> ObjType.Event,
         case Interrupt -> ObjType.Interrupt,
         case Timer -> ObjType.Timer,
+        case Process -> ObjType.Process,
     }
 }
 
@@ -405,4 +419,20 @@ public(package) func ref_waitable(kind: WaitableKind, slot: Int) unsafe {
 /// An attachment no longer names this waitable. Zero frees, as everywhere.
 public(package) func unref_waitable(kind: WaitableKind, slot: Int) unsafe {
     unref_object(waitable_obj_type(kind), slot)
+}
+
+/// The TEARDOWN's version: it counts, and it DOES NOT FREE — `unref_teardown`
+/// reached through the wait machinery's own enum.
+///
+/// **IT EXISTS BECAUSE M3 UNIT 5.5 MADE AN ATTACHMENT ABLE TO CROSS PROCESSES**
+/// (sawos design 8). Until a Process was waitable, every attachment joined a
+/// Waiter and a waitable of the SAME process, so the teardown's attachment
+/// sweep could free both ends and be done; a supervisor's attachment onto a
+/// CHILD's Process slot is the first pair that spans two processes, and the
+/// dying supervisor's side owes the other side a decrement exactly as the
+/// close-all above it owes one for a handle onto somebody else's object. Same
+/// asymmetry, same reason: the ledger stays honest and the per-slab sweeps keep
+/// doing the freeing they have always done.
+public(package) func unref_waitable_teardown(kind: WaitableKind, slot: Int) unsafe {
+    unref_teardown(waitable_obj_type(kind), slot)
 }

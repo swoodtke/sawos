@@ -6,6 +6,14 @@
 //! and each of those names nothing here. That is the whole reason it moved
 //! above them in the declared order — the brief's sketch had it below, which
 //! the three overloads make impossible.
+//!
+//! **AND THE FOURTH KIND IS WHERE THAT SHAPE RAN OUT** (sawos design 8, M3
+//! unit 5.5). A PROCESS handle is waitable now, but `Process` is declared
+//! ABOVE this file (in `sos.system`, with `System` and `BootHandle`, because
+//! every pair of those three names the other), so the fourth `add` overload
+//! would import downward into its own importer. It is
+//! `Process.attach(waiter:, key:)` instead — same op, same rules — and a
+//! comment sits below the three overloads where it would have gone.
 
 import sosabi.{SosStatus, WaiterHandle, NO_HANDLE, WaitTag, WaitResult,
                WaitPayload, WAIT_RECORD_WORDS, WAIT_KEY_WORD, WAIT_TAG_WORD,
@@ -37,6 +45,11 @@ func decode_wait(key: UInt, tag: UInt, payload: UInt) -> WaitResult {
                                      what: WaitPayload.Interrupt(line: payload)),
         case Timer -> WaitResult(key: key,
                                  what: WaitPayload.Timer(fires: payload)),
+        // THE FOURTH TAG (sawos design 8, M3 unit 5.5): a process ended, and
+        // the payload is §8's status word — the same bits `Process.get_status`
+        // answers with, so a supervisor parses one thing however it learned.
+        case Process -> WaitResult(key: key,
+                                   what: WaitPayload.Process(status: payload)),
     }
 }
 
@@ -127,6 +140,19 @@ extension Waiter {
     public func add(&self, timer: &Timer, key: UInt) -> Result<Void, SosStatus> {
         self.attach(timer.handle, key)
     }
+
+    // **THE FOURTH KIND IS NOT HERE, AND IT IS THE ONLY ONE THAT IS NOT**
+    // (sawos design 8, M3 unit 5.5). A PROCESS handle attaches like the three
+    // above — same op, same key rules, same level-triggered contract — but the
+    // overload is `Process.attach(waiter:key:)`, written in `sos.system` where
+    // `Process` is declared, because this module sits BELOW that one: `add`
+    // reads its argument's handle field, so an overload naming `Process` here
+    // would be the import cycle DF-232e diagnoses, exactly as `Waiter` below
+    // the three waitables would have been.
+    //
+    // It is the SL-7 constraint's third site and design 6's precedent
+    // (`Memory.map(into:)` becoming `Process.map(memory:)`) applied verbatim —
+    // the receiver flips, nothing else does. See `sos`'s facade header.
 
     /// The one call the per-kind overloads share. Private: a raw handle word
     /// crosses here and nowhere else in this type, which is the module

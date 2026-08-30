@@ -665,6 +665,14 @@ func process_create(p: Int, image_handle: UInt,
     // design 3 D-3 has always been about: it outlives the child so that reading
     // how the child died stays possible, and its release is what frees the slot.
     PROCESSES[slot].refs = 1
+    // NOBODY IS WATCHING A PROCESS THAT DOES NOT EXIST YET (sawos design 8).
+    // Written for `refs`' own reason rather than as belt-and-braces: this slot
+    // may be a RECLAIMED one (design 3 D-3), and every other field a previous
+    // occupant wrote is reset on these lines too. It cannot arrive non-zero —
+    // an attachment is a counted reference, so a watched slot never reaches
+    // zero and never reclaims — but the reset is where a reader looks to find
+    // that out.
+    PROCESSES[slot].attachment = 0
 
     // **THE CHILD'S LEDGER OPENS HERE, AFTER `place_image`** (sawos design 7
     // D-3), and the order is what the mapping row needs: `free_rows` is what
@@ -1510,6 +1518,11 @@ func timer_disarm(slot: Int) unsafe -> SyscallResult {
 /// Every case is spelled out rather than falling through a `_`, which is what
 /// makes the next waitable kind — a Pipe, a Timer, an Interrupt (§2.2), a
 /// Thread or a Process (§8) — fail to compile until somebody answers for it.
+/// THAT PROMISE HAS NOW BEEN COLLECTED TWICE: the Timer took an arm from
+/// nowhere (design 232 unit 1), and the PROCESS took one FROM THE REFUSAL LIST
+/// (sawos design 8) — which is the shape a `_` arm would have hidden entirely,
+/// since a kind moving from "not waitable" to "waitable" is not a new case at
+/// all.
 func waitable_slot(p: Int, handle: UInt) unsafe -> Waitable {
     let entry = lookup_handle(p, handle)
     match entry.obj_type {
@@ -1547,9 +1560,36 @@ func waitable_slot(p: Int, handle: UInt) unsafe -> Waitable {
             }
             Waitable(kind: WaitableKind.Timer, slot: entry.target)
         },
+        // **THE FOURTH WAITABLE KIND, AND IT IS AN OBJECT THAT ALREADY
+        // EXISTED** (spec §8; sawos design 8, M3 unit 5.5). This arm REPLACES a
+        // `NotWaitable` refusal rather than joining the list below it, which is
+        // the whole shape of the unit: no new kind, no new op, no new right.
+        // The bit it spends is `ProcessRight.Wait` — the SAME bit `GetStatus`
+        // spends two hundred lines up, because being woken by a death and
+        // asking about one are one question at two tempos, and a second bit
+        // would let a supervisor poll a death it may not be told about.
+        //
+        // A PROCESS MAY BE ATTACHED WHILE IT IS STILL ALIVE, which is the
+        // ordinary supervisor shape: readiness is `state == Gone`, so an
+        // attachment onto a running child simply is not ready yet. And it may
+        // be attached while it is already DEAD, which is terminal level's
+        // headline — see `waitable_consume`.
+        case Process -> {
+            let pr = ProcessObject(handle: ProcessHandle(handle),
+                                   rights: entry.rights, slot: entry.target)
+            if not pr.allows(ProcessRight.Wait) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            Waitable(kind: WaitableKind.Process, slot: entry.target)
+        },
         case Unbound -> fault_process(p, FaultReason.BadHandle),
         case System -> fault_process(p, FaultReason.NotWaitable),
-        case Process -> fault_process(p, FaultReason.NotWaitable),
+        // A THREAD IS STILL NOT WAITABLE, and the arm survives its neighbour's
+        // promotion deliberately (design 8 D-2): §8 names both halves and unit
+        // 5.5 built one. What a waitable Thread is FOR is safe stack
+        // reclamation when a dynamic pool scales down, which nothing in this
+        // tree does — and `ThreadOp.Join` already answers the question a fixed
+        // pool asks. So the refusal here is a scope line, not an oversight.
         case Thread -> fault_process(p, FaultReason.NotWaitable),
         case Waiter -> fault_process(p, FaultReason.NotWaitable),
         // A CLOCK IS NOT WAITABLE, and the arm is worth its line: a clock is

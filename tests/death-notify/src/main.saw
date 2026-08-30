@@ -1,0 +1,190 @@
+// SOS M3 unit 5.5: A SUPERVISOR WOKEN BY A DEATH (sawos design 8).
+//
+// **THERE IS NO TIMER IN THIS FILE.** That is the whole case. Every other
+// launcher in this tree parks on a generous deadline while its child runs,
+// because until this unit a death woke nobody and a launcher that waited for
+// one waited forever; this one attaches the CHILD'S OWN Process handle to a
+// Waiter and parks on it, so the only thing in the machine that can make root
+// runnable again is the child ending. A kernel that did not notify would leave
+// nothing runnable and the run would end in `every thread blocked` — the
+// failure mode is loud, which is what makes a plain `wait()` an assertion.
+//
+// The transcript is read as an order:
+//
+//   SOS deathnotify: started
+//   SOS bye: exiting                              <- THE CHILD'S LAST WORD
+//   SOS: process exit: code=... process=...
+//   SOS: process teardown ... process=...
+//   SOS deathnotify: woke key=44 status=65541     <- root, on the far side
+//   SOS deathnotify: done
+//
+// **THE WAKE LINE COMES AFTER THE TEARDOWN LINE, AND THAT ORDERING IS THE
+// UNIT'S OWN (design 8 D-1).** The kernel notifies as soon as the status word
+// is recorded — before it closes a single handle — but the notification only
+// QUEUES a thread; the dying process's teardown runs to completion inside the
+// same syscall and root is picked afterwards. So a supervisor can never observe
+// a half-dead process, and the transcript is where that is visible.
+//
+// `status=65541` is `Exited`(1) << 16 | 5: the kind in the high half and the
+// child's own exit code in the low one, out of a wait record rather than out of
+// a `get_status` poll. `key=44` is the word root chose at `attach` and the
+// kernel handed back unread.
+//
+// THE ATTACH HAPPENS BEFORE THE START, which is the supervisor shape rather
+// than a requirement: terminal level means a LATE attach works too, and
+// `death_late_attach` is where that is the claim.
+
+import sos.{System, Process, Memory, BootHandle, Waiter, WaitResult,
+            WaitPayload, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The key this case attaches the child's Process handle under — a number that
+/// appears nowhere else in the transcript, so reading it back proves the record
+/// came from THIS attachment.
+static KEY: UInt = 44
+
+/// Root's config: the tag the child's System handle travels under.
+static TAG_BOOT: UInt = 21
+
+/// What a child of this launcher may ask its System object for: print, and
+/// learn its own Process object — which is the handle its `exit` goes through.
+/// `Transfer` is in the mask because it is the bit `give` checks on the thing
+/// being given; everything else is absent BY SILENCE.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The §8 status word out of the record the kernel copied into this process's
+/// memory while the thread was parked.
+///
+/// THE OTHER THREE ARMS PANIC, and they are not defensive: this program
+/// attached exactly one thing, so a record of any other kind would mean the
+/// kernel reported an attachment nobody made — a bug in the pair rather than a
+/// condition to handle.
+func status_of(r: &WaitResult) -> UInt {
+    match r.what {
+        case Process(status) -> status,
+        case Event(_) -> panic("this program attached no event"),
+        case Interrupt(_) -> panic("this program attached no interrupt"),
+        case Timer(_) -> panic("this program attached no timer"),
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS deathnotify: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // The boot set, in the build's row order: the child's image blob, then the
+    // RAM it will run in. Root's config is what says which ordinal is which.
+    var image = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS deathnotify: no image region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    var dest = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS deathnotify: no destination region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    guard let image_mem = image.take_memory() else {
+        let _ = system.debug_print("SOS deathnotify: image record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest_mem = dest.take_memory() else {
+        let _ = system.debug_print("SOS deathnotify: dest record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let child = match system.process_create(image: &image_mem,
+                                            memory: &dest_mem) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS deathnotify: create failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let waiter = match proc.waiter_create() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS deathnotify: no waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // **THE ATTACHMENT, AND IT SPENDS `ProcessRight.Wait`** — the same bit
+    // `get_status` spends, because this is the same question asked
+    // asynchronously (design 8's ruled surface). It is written on the Process
+    // rather than on the Waiter for a module-graph reason the `sos` facade's
+    // header records; every rule `waiter.add` states holds unchanged.
+    match child.attach(waiter: &waiter, key: KEY) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS deathnotify: attach failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let for_child = match system.mint(rights: CHILD_SYSTEM) {
+        case Ok(s) -> s,
+        case Err(e) -> {
+            print("SOS deathnotify: mint failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match child.give(system: move for_child, tag: TAG_BOOT) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS deathnotify: give failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match child.start(boot_tag: TAG_BOOT) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS deathnotify: start failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS deathnotify: started\n")
+
+    // THE PARK. Nothing else in this machine is armed, so the child's death is
+    // the only thing that can end this call.
+    let record = match waiter.wait() {
+        case Ok(r) -> r,
+        case Err(e) -> {
+            print("SOS deathnotify: wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    print("SOS deathnotify: woke key={} status={}\n",
+          record.key, status_of(&record))
+    print("SOS deathnotify: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

@@ -261,6 +261,25 @@ MAPPING_SLOT_FREE_PKG = os.path.join(TESTS_DIR, "mapping-slot-free")
 CHILD_QUOTA_PKG = os.path.join(TESTS_DIR, "child-quota")
 CHILD_MAPWALL_PKG = os.path.join(TESTS_DIR, "child-mapwall")
 
+# sawos design 8 (M3 unit 5.5): death notifications. THREE root servers and ONE
+# more CHILD, and the split follows the house rule — one claim per image.
+#
+# THE TWO NOTIFY CASES DIFFER ONLY IN HOW THE CHILD DIES, which is the point:
+# the same attachment and the same park deliver `Exited` for one and `Faulted`
+# for the other, so a §8 status word arrives through one mechanism whichever
+# ending happened. `death_late_attach` is the terminal-level case and carries
+# the design-7 refcount interplay with it, because "which reference was holding
+# the dead slot open" only has an answer once there are two.
+#
+# `child-bye` is the new child: the smallest program that can die OBSERVABLY —
+# derive a Process object, say one line, `exit(5)`. `child-fault` is reused
+# unchanged for the fault arm, which is what makes that arm cost one root
+# package rather than two.
+DEATH_NOTIFY_PKG = os.path.join(TESTS_DIR, "death-notify")
+DEATH_FAULT_PKG = os.path.join(TESTS_DIR, "death-fault")
+DEATH_LATE_ATTACH_PKG = os.path.join(TESTS_DIR, "death-late-attach")
+CHILD_BYE_PKG = os.path.join(TESTS_DIR, "child-bye")
+
 CLOCK_BASICS_PKG = os.path.join(TESTS_DIR, "clock-basics")
 TIMER_ONESHOT_PKG = os.path.join(TESTS_DIR, "timer-oneshot")
 TIMER_INTERVAL_PKG = os.path.join(TESTS_DIR, "timer-interval")
@@ -2346,6 +2365,115 @@ TEST_CASES = [
                        "SOS: process exit: code={two} process={one}",
                        "SOS quotawall: root observed child status=65538",
                        "SOS quotawall: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **A SUPERVISOR WOKEN BY A DEATH** (sawos design 8, M3 unit 5.5) — the
+        # first case in the suite whose launcher parks with NO TIMER ARMED.
+        # Every earlier one waits on a generous deadline while its child runs,
+        # because until this unit a death woke nobody; this one attaches the
+        # CHILD's own Process handle to a Waiter and parks on it, so the only
+        # thing in the machine that can make root runnable again is the child
+        # ending. A kernel that failed to notify would leave nothing runnable
+        # and the run would die with `every thread blocked` — the failure mode
+        # is loud, which is what makes a plain `wait()` an assertion.
+        #
+        # **THE ORDER OF THE LAST THREE LINES IS THE UNIT'S OWN D-1 CLAIM.**
+        # The kernel notifies as soon as the §8 status word is recorded —
+        # before it closes a single handle — but a notification only QUEUES the
+        # woken thread, so the whole teardown runs first and root is picked up
+        # afterwards. The wake line therefore lands AFTER the teardown line,
+        # and there is no arrangement of these lines in which a supervisor
+        # observes a half-dead process.
+        #
+        # `status=65541` is `Exited`(1) << 16 | 5 — `child-bye`'s own exit code,
+        # arriving in a wait record rather than through a `get_status` poll.
+        # `key=44` is the word root chose at the attach and the kernel handed
+        # back unread.
+        #
+        # `handles={two}` in the child's teardown is its whole estate: the
+        # masked System handle it was given, and the Process handle it derived
+        # from it to call `exit` through.
+        "name": "death_notify",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DEATH_NOTIFY_PKG,
+        "children": [CHILD_BYE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS deathnotify: started",
+                       "SOS bye: exiting",
+                       "SOS: process exit: code={five} process={one}",
+                       "SOS: process teardown handles={two} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS deathnotify: woke key=44 status=65541",
+                       "SOS deathnotify: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # THE FAULT ARM — the same program with one thing taken away. This
+        # launcher gives its child NOTHING, so the child holds `NO_HANDLE` and
+        # the kernel terminates it at its first `ecall`. The attachment, the
+        # park and the wake are identical; what differs is the word that comes
+        # back, which is the whole claim: a supervisor learns THAT a child died
+        # and HOW through one mechanism, whether the child chose the ending or
+        # the kernel did.
+        #
+        # `status=131073` is `Faulted`(2) << 16 | `BadHandle`(1) — byte for byte
+        # the word `process_lifecycle` reads through `get_status`, arriving here
+        # as a wake instead of as a poll. That equality is the point: unit 5.5
+        # adds no vocabulary to §8, it adds a second door onto §8's word.
+        "name": "death_fault",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DEATH_FAULT_PKG,
+        "children": [CHILD_FAULT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS deathfault: started",
+                       "SOS: process fault: bad handle process={one}",
+                       "SOS: process teardown handles={zero} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS deathfault: woke key=45 status=131073",
+                       "SOS deathfault: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **NOTHING UN-DIES** — terminal level, and design 7's count observed
+        # through the supervision flow (sawos design 8, sharpening 1).
+        #
+        # `first=65541 second=65541` is two claims in one line. Root sleeps on a
+        # timer until the child is ALREADY DEAD and only then attaches, so an
+        # edge-triggered design would have nothing left to report and this wait
+        # would never return; it returns immediately, because readiness is
+        # `state == Gone` and that is still true. And the SECOND wait on the
+        # same attachment answers the same word, because a death — unlike an
+        # Event's word or a Timer's fire count — is not spent by the delivery
+        # that reports it.
+        #
+        # `held=1 freed=1` is which reference was load-bearing, asked one at a
+        # time. With the Process HANDLE released and only the attachment left, a
+        # second `process_create` is still refused (`MAX_PROCESSES` is two and
+        # slot 1 is still `Gone`); remove the attachment and the count reaches
+        # zero, the slot frees inside that very syscall, and the same create
+        # succeeds. A kernel that did not count the attachment would print
+        # `held=0` — and the second wait above would have been reading a slot
+        # the kernel had already given away.
+        "name": "death_late_attach",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DEATH_LATE_ATTACH_PKG,
+        "children": [CHILD_BYE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS deathlate: started",
+                       "SOS bye: exiting",
+                       "SOS: process exit: code={five} process={one}",
+                       "SOS: process teardown handles={two} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS deathlate: first=65541 second=65541",
+                       "SOS deathlate: held=1 freed=1",
+                       "SOS deathlate: done"],
         "expect_clean_exit": True,
     },
 ]

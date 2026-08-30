@@ -37,9 +37,9 @@
 //!                slab and the boot-handle queue
 //!   `threads`    the thread slab, the frame arena, the ready queue
 //!   `time`       the Clock/Timer slabs and the one hardware comparator
-//!   `waitables`  the Event/Waiter/Interrupt slabs and the per-kind matrix
 //!   `process`    the process slab, the grant record, the copy doors, the way
 //!                into user mode
+//!   `waitables`  the Event/Waiter/Interrupt slabs and the per-kind matrix
 //!   `refs`       the reference count, free-on-zero, and the per-kind last
 //!                rites (sawos design 7)
 //!   `wake`       delivery: readiness becoming a woken thread
@@ -75,13 +75,25 @@
 //! that joins them is its own module between them. `preempt.saw`'s header has
 //! the full argument.
 //!
+//! ONE MORE MOVED IN M3 UNIT 5.5 (sawos design 8), and it is the same rule
+//! again: `waitables` PASSED `process`, where the list above used to have it
+//! one line earlier. A Process handle became §2.2's fourth waitable, so the
+//! per-kind matrix's Process arms read `PROCESSES` — who is watching this
+//! slot, is it `Gone`, what §8 word does its record carry — and a module that
+//! reads the process table sits above the module that owns it. Nothing went
+//! the other way: `process` names nothing in `waitables`, which is what makes
+//! this a reordering rather than the cycle DF-232e diagnoses.
+//!
 //! WHERE THE LINE FELL, when a seam of the sketch came in two: the STATE of a
 //! thing sits below the process teardown that frees it, and ACTING on it sits
 //! above — because ending a process touches every slab, and answering a wait
 //! goes through the copy door that can end one. That is why a thread's table
 //! (`threads`) is not its scheduler (`sched`), a timer's schedule (`time`) is
 //! not its expiry (`irq`), and the wait tables (`waitables`) are not the
-//! delivery (`wake`).
+//! delivery (`wake`). The unit-5.5 move above does not bend that rule: the
+//! process SLAB and the wait tables are both STATE, so their order relative to
+//! each other was never fixed by it — only their order relative to the
+//! teardown was, and both are still below it.
 //!
 //! WHAT A SPLIT COSTS HERE (DF-232f): Saw has no package-internal visibility, so
 //! every name two seams share is `public` — visible to anything that imports

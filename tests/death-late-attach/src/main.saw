@@ -1,0 +1,265 @@
+// SOS M3 unit 5.5: NOTHING UN-DIES — terminal level, and what holds a dead
+// slot open (sawos design 8, sharpening 1 + the design-7 composition).
+//
+// THREE CLAIMS, IN ONE PROGRAM, BECAUSE THEY ARE ONE STORY: a death is a level
+// that never clears, so it can be observed by somebody who was not watching
+// when it happened, as often as they like, for as long as they keep a reference
+// to it. Take the last reference away and the slot goes.
+//
+//   SOS deathlate: started
+//   SOS bye: exiting
+//   SOS: process exit: code=... process=...
+//   SOS: process teardown ... process=...
+//   SOS deathlate: first=65541 second=65541      <- ATTACHED AFTER THE DEATH,
+//                                                   AND ANSWERED TWICE
+//   SOS deathlate: held=1 freed=1                <- which reference was holding
+//   SOS deathlate: done
+//
+// **`first=` IS THE LATE ATTACH.** Root sleeps on a timer until the child is
+// already gone, and only then attaches its Process handle. An edge-triggered
+// design would have nothing left to report — the edge passed while nobody was
+// listening — and this line would print a wait that never returned. It returns
+// IMMEDIATELY, because readiness is `state == Gone` and that is still true.
+//
+// **`second=` IS THE TERMINAL PART.** The delivery of an Event's word clears
+// it and a Timer's fire count is spent by the wait that reports it; a death
+// spends NOTHING. So the second wait on the same attachment answers the same
+// word, and would answer it a thousand times.
+//
+// **`held=1 freed=1` IS DESIGN 7'S COUNT, OBSERVED THROUGH THE SUPERVISION
+// FLOW.** A dead process's slot lives exactly as long as something can still
+// read its §8 status word, and after this unit an ATTACHMENT is one of those
+// things. So root drops the two references ONE AT A TIME and asks the machine
+// which was load-bearing:
+//
+//   - release the Process HANDLE, leaving only the attachment: a second
+//     `process_create` is still refused, because `MAX_PROCESSES` is two and
+//     slot 1 is still `Gone`. That is `held=1` — the attachment alone kept it.
+//   - remove the ATTACHMENT: the count reaches zero, the slot frees inside that
+//     very syscall, and the same create now succeeds. That is `freed=1`.
+//
+// A kernel that did not count the attachment would free the slot at the release
+// and print `held=0` — and the second wait above would have been reading a slot
+// the kernel had already given away, which is the hazard this composition
+// exists to close.
+
+import sos.{System, Process, Memory, BootHandle, Clock, ClockType, Timer,
+            Waiter, WaitResult, WaitPayload, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static YES: UInt = 1
+static NO: UInt = 0
+
+/// The key the park TIMER is attached under, and the key the DEAD CHILD is.
+/// Two numbers, because both attachments live on one Waiter at once — which is
+/// what §2.2's key uniqueness is for.
+static KEY_TIMER: UInt = 46
+static KEY_DEATH: UInt = 47
+
+/// Twenty milliseconds: three orders of magnitude more than the child needs to
+/// print one line and exit. See `process-lifecycle`.
+static PARK_NS: UInt64 = 20_000_000
+
+/// Root's config: the tag the child's System handle travels under.
+static TAG_BOOT: UInt = 21
+
+/// What this launcher's child may ask its System object for. See
+/// `death-notify`.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+func flag(b: Bool) -> UInt {
+    if b { YES } else { NO }
+}
+
+/// The §8 status word out of the record. The Timer arm panics like the other
+/// two even though this program DOES attach a timer: by the time this is
+/// called the timer has already fired and been consumed, so a Timer record
+/// here would mean the wait answered from the wrong attachment.
+func status_of(r: &WaitResult) -> UInt {
+    match r.what {
+        case Process(status) -> status,
+        case Event(_) -> panic("this program attached no event"),
+        case Interrupt(_) -> panic("this program attached no interrupt"),
+        case Timer(_) -> panic("the death attachment answered as a timer"),
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS deathlate: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    var image = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS deathlate: no image region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    var dest = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS deathlate: no destination region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    // BOTH REGIONS ARE USED THREE TIMES — the first child, the create that is
+    // refused, and the create that is served — which is why they are taken into
+    // locals rather than borrowed out of the records in place.
+    guard let image_mem = image.take_memory() else {
+        let _ = system.debug_print("SOS deathlate: image record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest_mem = dest.take_memory() else {
+        let _ = system.debug_print("SOS deathlate: dest record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let child = match system.process_create(image: &image_mem,
+                                            memory: &dest_mem) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS deathlate: create failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let for_child = match system.mint(rights: CHILD_SYSTEM) {
+        case Ok(s) -> s,
+        case Err(e) -> {
+            print("SOS deathlate: mint failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match child.give(system: move for_child, tag: TAG_BOOT) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS deathlate: give failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match child.start(boot_tag: TAG_BOOT) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS deathlate: start failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS deathlate: started\n")
+
+    // THE PARK IS A TIMER, DELIBERATELY. This case must attach LATE, so root
+    // has to give the processor up by some means that is not the death itself.
+    let clock = match system.clock_get(type: ClockType.Monotonic) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS deathlate: no clock: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let waiter = match proc.waiter_create() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS deathlate: no waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let timer = match clock.timer_create() {
+        case Ok(t) -> t,
+        case Err(e) -> {
+            print("SOS deathlate: no timer: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = waiter.add(&timer, KEY_TIMER)
+    let _ = timer.arm(after_ns: PARK_NS)
+    match waiter.wait() {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS deathlate: park failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // **THE LATE ATTACH.** The child has been dead for milliseconds.
+    match child.attach(waiter: &waiter, key: KEY_DEATH) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS deathlate: attach failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let first = match waiter.wait() {
+        case Ok(r) -> status_of(&r),
+        case Err(e) -> {
+            print("SOS deathlate: first wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let second = match waiter.wait() {
+        case Ok(r) -> status_of(&r),
+        case Err(e) -> {
+            print("SOS deathlate: second wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    print("SOS deathlate: first={} second={}\n", first, second)
+
+    // THE FIRST REFERENCE GOES, WRITTEN AS A DROP. `let _ = move child`
+    // consumes the wrapper and its `deinit` issues the release — dropping IS
+    // the spelling (design 3 D-5). The attachment is what is left.
+    let _ = move child
+
+    let held = match system.process_create(image: &image_mem,
+                                           memory: &dest_mem) {
+        case Ok(_) -> false,
+        case Err(_) -> true,
+    }
+
+    // AND THE SECOND. A `remove` names the attachment by KEY and never touches
+    // the waitable — but the reference it drops is the waitable's, and here
+    // that reference is the last one.
+    match waiter.remove(KEY_DEATH) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS deathlate: remove failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let freed = match system.process_create(image: &image_mem,
+                                            memory: &dest_mem) {
+        case Ok(_) -> true,
+        case Err(_) -> false,
+    }
+
+    print("SOS deathlate: held={} freed={}\n", flag(held), flag(freed))
+    print("SOS deathlate: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

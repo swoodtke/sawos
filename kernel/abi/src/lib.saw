@@ -1843,10 +1843,21 @@ public enum EventMode: UInt {
 /// kernel WROTE it, out of this same declaration — so a tag userspace cannot
 /// name is a kernel/`sos` skew, which is a bug in the pair rather than data
 /// from an untrusted source. Never-hide says it should be loud.
+///
+/// **THE EXTENSIBILITY PARAGRAPH ABOVE WAS COLLECTED BY `Process = 3`** (sawos
+/// design 8, M3 unit 5.5): the fourth tag took the next number, moved none of
+/// the three, and broke every exhaustive `WaitPayload` match in the tree until
+/// each said what it does about a death — which is the raw backing and the
+/// exhaustive match doing exactly what this docstring promised they would.
 public enum WaitTag: UInt {
     case Event = 0,
     case Interrupt = 1,
     case Timer = 2,
+    /// A PROCESS ENDED, any cause (spec §8; sawos design 8). The payload is the
+    /// §8 status word — `process_status_word(kind, code)` — so the `Exited` /
+    /// `Faulted` distinction rides vocabulary that already shipped rather than
+    /// a second tag per ending.
+    case Process = 3,
 }
 
 /// Words in a wait record: key, tag, payload.
@@ -1919,10 +1930,26 @@ public func wait_record_bytes() -> Int {
 /// spent. That is the ack-free half of the timerfd model. The Interrupt is the
 /// kind that differs, and §9 says why: its readiness ends at the driver's `ack`,
 /// because the line stays masked until the DEVICE has been serviced.
+///
+/// **THE PROCESS PAYLOAD IS §8's STATUS WORD, AND THAT IS THE WHOLE OF WHAT
+/// UNIT 5.5 ADDED TO THIS ENUM** (sawos design 8). Kind in the high bits,
+/// code in the low ones — read it with the same arithmetic `get_status`
+/// answers with, because it IS that answer: attaching a Process handle and
+/// polling one are two doors onto one word, exactly as `receive` and a wait
+/// are two doors onto an Event's.
+///
+/// **NOTHING UN-DIES, so the wait does NOT consume it.** An Event's word and a
+/// Timer's fire count are spent by the delivery that reports them; a death is
+/// the TERMINAL LEVEL, so the second wait on one attachment answers the same
+/// word as the first, and a waiter that attaches after the death is told at
+/// once. That is the property supervision needs — there is no window in which a
+/// death can be missed — and it is why this case has nothing to say about
+/// draining.
 public enum WaitPayload {
     case Event(word: UInt),
     case Interrupt(line: UInt),
     case Timer(fires: UInt),
+    case Process(status: UInt),
 }
 
 /// `Waiter.Wait`'s answer: the attacher's key, and what fired.

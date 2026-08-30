@@ -43,7 +43,7 @@ names provisional):
 | `Waiter` | Generic wait aggregator (epoll/Port-style) — see §2.2 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Add`/`Remove`/`Wait`, rights `WaiterRight.Attach`/`.Wait`, the wait answer a copy-out record. |
 | ~~`MemoryObject`~~ | (A duplicate row from the Jul-29 draft, pointing at §2.3 where the section is §2.5. Both of its claims are in the rows above: RAM is `MemoryObject`, device MMIO is `IoMemoryObject`, and "mappable" is `Map`. Kept struck rather than deleted so a reader of the Jul-29 discussion finds where it went.) |
 | ~~`Mapping`~~ | (Likewise — see the `Mapping` row above, built M3 unit 4.) |
-| `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. BUILT M2 (design 178 unit 2), one process: ops `ThreadCreate`/`ThreadSelf`/`Exit`/`GetStatus` plus the three factory ops `EventCreate`/`WaiterCreate`/`InterruptBind`, each on its own right. BUILT M3 unit 2 (sawos design 2), **TWO processes**: `Start` (on the CHILD's handle, `ProcessRight.Start`) mints the first thread of a created process and runs it; `BootHandleNext` (`ProcessRight.BootHandles`) drains §12's boot set one record at a time. The CREATE half of that lifecycle is not an op on this object — design 2's RIDER (Aug 29) puts `ProcessCreate` on System, because a process is a machine-wide resource (§12's amended creation-authority note). The child's handle carried `Start | Wait | Manage` and nothing else at that unit — everything a process may do to ITSELF withheld from its creator (M3 unit 3 re-ruled the set; see below). The TEARDOWN now forks (§8): process 0 stops the machine, any other reschedules. **THE SLOT OF A DEAD PROCESS IS RECLAIMED** (sawos design 3 D-3, M3 unit 2.75), and it is the ONLY slab that reclaims on a handle release. A `Gone` slot holds one thing — its §8 status word — and the only way to read that word is `GetStatus` through a Process handle, so "no handle names this slot" IS "no possible reader", exactly. The check therefore scans the handle tables (bounded: `MAX_PROCESSES` × `MAX_HANDLES`) when a released entry named a `Gone` process, and again at the end of a process's own teardown for its own slot. D-1's generations are what make the reuse safe, and `clear_domain` already invalidated `LAST_PROT_PROCESS` in anticipation. `MAX_PROCESSES` consequently bounds CONCURRENT processes again, which is what the name says. **SUPERSEDED IN ITS MECHANISM, NOT ITS ANSWER, BY M3 UNIT 5** (sawos design 7 D-1): the scan is a COUNT now — `ProcessSlot.refs`, maintained by the same lines that maintain an Event's — because unit 2.75's argument that a second fact would be one more thing to keep in step reverses once seven other kinds keep theirs at exactly those sites. The answer is identical, so no transcript moved for it. And this row is no longer the ONLY slab that reclaims on release: every countable kind does (see the counted-kinds column above), which is what makes a `Gone` process ordinary rather than special. `kill` (§8) still has no op. **BUILT M3 unit 3 (sawos design 4): `Give` — THE COURIER OP.** `give(handle, tag:)` on the CHILD's handle (gated by `ProcessRight.Give` there, plus the UNIVERSAL `Transfer` right on the handle being given) MOVES a handle into a fresh slot of the child's table and returns ONLY ITS STATUS: the child-side word is meaningless to the giver, which can call no op through it. What crosses instead is the TAG — the giver's own word, handed back unread at the child's drain. It is unbind-and-rebind with RIGHTS VERBATIM (a move, not a mint: no default set is consulted and nothing amplifies), the caller's entry unbinds exactly as a release does so the giver's word goes stale, and a full child table is `NoResource` with the give not having happened. Four caller errors END the caller: a handle that names nothing (`BadHandle`), one without `Transfer` (`AccessDenied`), a child that has already been STARTED (`BadState` — the boot set FREEZES at start, which is the launch flow's whole soundness argument), and a tag the child's set already carries (`DuplicateKey` — the tag is the identity, and one naming two handles would make the boot lookup ambiguous). `Start` gained a `boot_tag` argument in the same unit: the kernel resolves the tag to the child-side word, puts it in the child's first argument register and CONSUMES the record it named (the register IS the delivery, so a child can never be handed one word twice), leaving `_start(boot_handle)` unchanged and a launcher never seeing a child-relative word. `BootHandleNext` now drains the CALLER's own PER-PROCESS set — the kernel writes root's at boot and a launcher writes a child's with `give`, through one op with one exhaustion rule. The Process default set is now ONE set for all three minters (root's, `ProcessSelf`'s and `ProcessCreate`'s), named for its ops throughout: `ThreadCreate | ThreadSelf | Exit | Wait | EventCreate | WaiterCreate | InterruptBind | Start | BootHandles | Give` plus the universal `Transfer | Mint`. A LAUNCHER KEEPS the child's handle — it is what supervises with — and the child derives its own authority from the masked System handle it was given, so supervision and self-management are no longer alternatives (`MINT_OP`, §3, closing design 3's finding 2). |
+| `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. BUILT M2 (design 178 unit 2), one process: ops `ThreadCreate`/`ThreadSelf`/`Exit`/`GetStatus` plus the three factory ops `EventCreate`/`WaiterCreate`/`InterruptBind`, each on its own right. BUILT M3 unit 2 (sawos design 2), **TWO processes**: `Start` (on the CHILD's handle, `ProcessRight.Start`) mints the first thread of a created process and runs it; `BootHandleNext` (`ProcessRight.BootHandles`) drains §12's boot set one record at a time. The CREATE half of that lifecycle is not an op on this object — design 2's RIDER (Aug 29) puts `ProcessCreate` on System, because a process is a machine-wide resource (§12's amended creation-authority note). The child's handle carried `Start | Wait | Manage` and nothing else at that unit — everything a process may do to ITSELF withheld from its creator (M3 unit 3 re-ruled the set; see below). The TEARDOWN now forks (§8): process 0 stops the machine, any other reschedules. **THE SLOT OF A DEAD PROCESS IS RECLAIMED** (sawos design 3 D-3, M3 unit 2.75), and it is the ONLY slab that reclaims on a handle release. A `Gone` slot holds one thing — its §8 status word — and the only way to read that word is `GetStatus` through a Process handle, so "no handle names this slot" IS "no possible reader", exactly. The check therefore scans the handle tables (bounded: `MAX_PROCESSES` × `MAX_HANDLES`) when a released entry named a `Gone` process, and again at the end of a process's own teardown for its own slot. D-1's generations are what make the reuse safe, and `clear_domain` already invalidated `LAST_PROT_PROCESS` in anticipation. `MAX_PROCESSES` consequently bounds CONCURRENT processes again, which is what the name says. **SUPERSEDED IN ITS MECHANISM, NOT ITS ANSWER, BY M3 UNIT 5** (sawos design 7 D-1): the scan is a COUNT now — `ProcessSlot.refs`, maintained by the same lines that maintain an Event's — because unit 2.75's argument that a second fact would be one more thing to keep in step reverses once seven other kinds keep theirs at exactly those sites. The answer is identical, so no transcript moved for it. And this row is no longer the ONLY slab that reclaims on release: every countable kind does (see the counted-kinds column above), which is what makes a `Gone` process ordinary rather than special. `kill` (§8) still has no op. **BUILT M3 unit 3 (sawos design 4): `Give` — THE COURIER OP.** `give(handle, tag:)` on the CHILD's handle (gated by `ProcessRight.Give` there, plus the UNIVERSAL `Transfer` right on the handle being given) MOVES a handle into a fresh slot of the child's table and returns ONLY ITS STATUS: the child-side word is meaningless to the giver, which can call no op through it. What crosses instead is the TAG — the giver's own word, handed back unread at the child's drain. It is unbind-and-rebind with RIGHTS VERBATIM (a move, not a mint: no default set is consulted and nothing amplifies), the caller's entry unbinds exactly as a release does so the giver's word goes stale, and a full child table is `NoResource` with the give not having happened. Four caller errors END the caller: a handle that names nothing (`BadHandle`), one without `Transfer` (`AccessDenied`), a child that has already been STARTED (`BadState` — the boot set FREEZES at start, which is the launch flow's whole soundness argument), and a tag the child's set already carries (`DuplicateKey` — the tag is the identity, and one naming two handles would make the boot lookup ambiguous). `Start` gained a `boot_tag` argument in the same unit: the kernel resolves the tag to the child-side word, puts it in the child's first argument register and CONSUMES the record it named (the register IS the delivery, so a child can never be handed one word twice), leaving `_start(boot_handle)` unchanged and a launcher never seeing a child-relative word. `BootHandleNext` now drains the CALLER's own PER-PROCESS set — the kernel writes root's at boot and a launcher writes a child's with `give`, through one op with one exhaustion rule. The Process default set is now ONE set for all three minters (root's, `ProcessSelf`'s and `ProcessCreate`'s), named for its ops throughout: `ThreadCreate | ThreadSelf | Exit | Wait | EventCreate | WaiterCreate | InterruptBind | Start | BootHandles | Give` plus the universal `Transfer | Mint`. A LAUNCHER KEEPS the child's handle — it is what supervises with — and the child derives its own authority from the masked System handle it was given, so supervision and self-management are no longer alternatives (`MINT_OP`, §3, closing design 3's finding 2). **BUILT M3 unit 5.5 (sawos design 8): A PROCESS HANDLE IS A WAITABLE**, which is §8's own promise below and the fourth member of §2.2's list. Readiness is `state == Gone`; the payload is the §8 status word (`WaitTag.Process`, `WaitPayload.Process(status:)`); the right it spends is `ProcessRight.Wait`, the SAME bit `GetStatus` spends, because attaching is that question asked asynchronously and a second bit would let a supervisor poll a death it may not be woken by. It is TERMINAL LEVEL — the one readiness in the system a delivery does not consume — so a waiter attaching AFTER the death still wakes, a second wait answers the same word, and supervision has no lost-edge race. The attachment is a counted reference like every other waitable's, which is what keeps a dead child's slot readable for exactly as long as somebody is watching it. There is still no notification to anyone but a parked or attaching waiter: the Waiter IS the delivery system. |
 | `System` | Kernel singleton (ratified Aug 5): the object behind system-scoped primitives so that EVERY syscall is an object op (§5.7) — v1 ops `debug_print`, `shutdown(status)` (stop the machine; QEMU: sifive_test), rights-gated (`SystemRight.Debug`/`.Shutdown`, §3 scoped rights). Root receives its handle at boot (§12). `exit` is NOT here — process exit belongs to the Process object when it exists (ratified Aug 5). M2 added a third op, `process_self` (design 178 unit 2): §3's derivation rule made real, so the boot register stays ONE handle wide and a process obtains its Process object THROUGH the System handle rather than being handed it. It was gated on the generic `Manage` until M3 unit 3 gave it `SystemRight.ProcessSelf` — a bit named for its op, per the Aug-29 doctrine, and a real attenuation seam: strip it and a child may print and tell the time and never learn its own identity. M3 added `clock_get` on `SystemRight.ClockGet` (design 232 unit 1: time is a granted capability) and, by sawos design 2's RIDER (Aug 29), `process_create` on `SystemRight.ProcessCreate` — the object's one FACTORY, here because a process is machine-wide and only this object is (§12's amended creation-authority note); `process_self` was already the precedent, since a Process handle has always come out of this object. **M3 unit 3 gave this object the launch flow's pivot** (sawos design 4, Aug-29 rulings): `root_system_rights()` gained `Transfer` — the M2 "nobody to transfer to" reason expired when unit 2 made a second process — so a launcher MINTS a masked sibling of its System handle (`MINT_OP`, §3) and GIVES that to a child. A child therefore bootstraps exactly as root does (§12's symmetry): System in the first argument register, its own Process handle derived from it, its boot set drained from there. `Debug` in the mask is what lets a child print without owning a device; `Shutdown` left out is what stops it halting the machine. Later candidates: info queries. |
 
 **Eleven of these kinds exist today** — System, Process, Thread, Event, Waiter,
@@ -67,7 +67,7 @@ references it:
 | Timer | handle entries + its attachment |
 | MemoryObject / IoMemoryObject | handle entries |
 | Mapping | handle entries — **NOT its row**, which the Mapping owns rather than the reverse (§2.5) |
-| Process | handle entries; a LIVE process is never freed by losing its last handle, and a `Gone` one's slot is reclaimed exactly as design 3 D-3 ruled — this count is that ruling's handle-table scan, kept rather than recomputed |
+| Process | handle entries **+ its attachment** (M3 unit 5.5, sawos design 8 — a Process handle is a waitable now, and an attachment counts on every waitable); a LIVE process is never freed by losing its last handle, and a `Gone` one's slot is reclaimed exactly as design 3 D-3 ruled — this count is that ruling's handle-table scan, kept rather than recomputed. The attachment column is what makes attach-after-death SOUND against that reclaim: a watched dead slot cannot reach zero while somebody is watching it |
 | Thread | **NOT COUNTED IN v1** — the join/exit protocol owns a thread slot's lifetime on terms a handle count cannot express (`Exited` is a state a slot stays in so a late join still finds the exit code, and a joiner holds no handle). Recorded, deferred; the slot comes back at the teardown |
 | Clock | **EXEMPT** — kernel-eternal, owned by nobody (the Aug-17 ruling). Freeing a domain's slot on a release would take the machine's counter from everybody else |
 | System | no slab: the singleton every process's boot handle names |
@@ -234,22 +234,37 @@ reply it is about to discard.
   already uses is a FAULT, because a duplicate makes two questions ambiguous at
   once — which attachment a `remove` names, and which one an answer came from.
 - Waitables: Pipe (readable / reply-ready), Event, Timer,
-  Interrupt, PipeReplyHandle, and PipeRequestHandle (abandoned — the Aug 20
-  amendment, §2.1). **Event, Interrupt and Timer are BUILT** (M2 units
-  3 and 4; design 232 unit 1); Pipe with its
-  PipeReplyHandle is M4. The second kind is what moved an attachment
+  Interrupt, **Process** (§8), PipeReplyHandle, and PipeRequestHandle
+  (abandoned — the Aug 20
+  amendment, §2.1). **Event, Interrupt, Timer and Process are BUILT** (M2 units
+  3 and 4; design 232 unit 1; sawos design 8, M3 unit 5.5, for the fourth);
+  Pipe with its
+  PipeReplyHandle is M4, and a waitable THREAD is still §8's deferred half —
+  attaching one is a `NotWaitable` fault. The second kind is what moved an
+  attachment
   out of the waitable and into a table of its own: a Waiter's set has to
   be ONE list, since a wait scans it once and a `remove` walks it once,
   so per-kind lists would make both a matrix over kinds. What stays
   per-kind is FIVE questions — who is watching me, set who is watching
   me, am I ready, what does a record say, and (added by the Timer) a
-  record was DELIVERED — each an exhaustive match, so a fourth waitable
-  cannot be added silently. The fifth is the ACK-FREE DRAIN, and since
-  Aug 17 two of the three kinds answer it: an Event's word and a Timer's
-  fire count are both SPENT by the delivery, while an INTERRUPT alone
-  answers with nothing — its readiness ends at the driver's ack, because
+  record was DELIVERED — each an exhaustive match, so a further waitable
+  cannot be added silently. **THAT PROPERTY WAS COLLECTED RATHER THAN
+  CLAIMED when the fourth kind arrived** (sawos design 8): adding
+  `WaitableKind.Process` failed all five matrix arms, adding the `WaitTag`
+  and `WaitPayload` cases failed every userspace match on a wait answer,
+  and `waitable_slot` failed its own — so the compiler enumerated the
+  work instead of a reviewer having to.
+  The fifth question is the ACK-FREE DRAIN, and the four built kinds
+  answer it three different ways: an Event's word and a Timer's
+  fire count are both SPENT by the delivery; an INTERRUPT
+  answers with nothing, because its readiness ends at the driver's ack —
   the line stays masked until the device has actually been serviced, so
-  the kernel cannot know a record was enough. Delivery is one funnel, so
+  the kernel cannot know a record was enough; and a PROCESS's death also
+  spends nothing, for the OPPOSITE reason — it is the TERMINAL LEVEL, so
+  there is nothing to end. Nothing un-dies: a delivery reports the §8
+  status word and leaves it, so every later wait on that attachment
+  answers the same word, and a waiter that attaches after the death is
+  told at once. Delivery is one funnel, so
   the drain cannot happen on the already-ready path and not on the wake
   path.
 - **THE COPY-IN DOOR is the copy-out funnel's mirror twin** (design 232
@@ -1102,9 +1117,12 @@ EXISTS, which supersedes the "no join syscall" line below**: D4 gave Thread
 `Start`/`Join`/`Exit`/`Yield`, and a joiner parks on the target's list and is
 answered exactly once through the funnel §2.2 describes. The observability
 this section reserved for stack reclamation therefore arrived a milestone
-early, because the wait/wake substrate needed a first consumer. NOT BUILT:
-thread and process handles are NOT waitable — attaching either is a
-`NotWaitable` fault, so §2.2's waitable list is the whole list — and
+early, because the wait/wake substrate needed a first consumer. **AND THE
+PROCESS HALF OF THE WAITABILITY LINE BELOW IS BUILT SINCE M3 UNIT 5.5** (sawos
+design 8), amending this paragraph's own "NOT BUILT" of the M2 era: a Process
+handle attaches, on `ProcessRight.Wait`, and its death is the terminal level.
+STILL NOT BUILT: a THREAD handle is not waitable — attaching one is a
+`NotWaitable` fault — and
 `process.kill()` has neither op nor right, since with one process it would be
 `Exit` under a second name (design 232 unit 2 loads the second).
 
@@ -1125,7 +1143,26 @@ thread and process handles are NOT waitable — attaching either is a
   `thread_create`; reuse before real exit is a use-after-free). v1
   fixed pools never use it.
 - **Process handles are waitables** (ready on exit, any cause) — the
-  primitive userspace supervision parks a Waiter on.
+  primitive userspace supervision parks a Waiter on. **BUILT M3 unit 5.5
+  (sawos design 8), and it is the existing Process object becoming
+  waitable rather than a new kind.** §2.2's `waiter.add(handle, key)`
+  takes a Process handle
+  on `ProcessRight.Wait` — the SAME bit `get_status` below spends,
+  because being woken by a death and asking about one are the same
+  question at two tempos — readiness is the slot being `Gone` whatever
+  ended it, and the payload the record carries is exactly the status word
+  the next bullet defines (`WaitTag.Process`,
+  `WaitPayload.Process(status:)`). It adds no vocabulary to §8; it adds a
+  second DOOR onto §8's word. **DEATH IS A TERMINAL LEVEL**: the delivery
+  consumes nothing, so a waiter attaching after the death still wakes and
+  a second wait answers the same word — which is what makes supervision
+  race-free, since there is no window in which a death can be missed. The
+  attachment counts as a reference on the process slot (§2's counted-kinds
+  table), so a watched dead process's slot survives until the watcher
+  detaches. THE ORDERING: the kernel notifies once the status word is
+  recorded and BEFORE the teardown runs, but a notification only queues a
+  thread, so the woken supervisor runs after the teardown has completed
+  and no observer ever sees a half-dead process.
 - **`process.get_status()`**, gated on the WAIT right: ONE fixed-width
   status word — kind in the high bits (`Exited | Faulted | Killed`),
   code in the low bits (exit code, or a fault-cause tag). Detailed
@@ -1465,11 +1502,27 @@ event-driven EDGE of a process gets a second, distinct construct:
     bytes in v1.
   - **Priorities** (§7) — nothing of §7 is built; round-robin is ruled to
     stay through M3 (design 232 agenda item 10).
-  - **Thread and process waitability, and `kill`** (§8) — attaching
-    either kind is a fault today (and so is attaching a MemoryObject, which
-    has no state that could become ready); `kill` has no op and no right. A
-    supervisor learns a child died by READING `get_status` through the handle
-    it still holds; being WOKEN by the death is unit 5.5's.
+  - ~~**Process waitability**~~ **BUILT M3 UNIT 5.5 (sawos design 8)** — the
+    existing Process object became §2.2's fourth waitable, which is what the
+    ruling asked for and the whole of what the unit is: no new kind, no new
+    right (`ProcessRight.Wait` gates the attach exactly as it gates
+    `get_status`), no new status vocabulary (`WaitTag.Process` carries §8's
+    own word). **DEATH IS A TERMINAL LEVEL** — a delivery consumes nothing —
+    so attach-after-death wakes, a second wait answers again, and supervision
+    has no lost-edge race; the attachment is a counted reference (§2's
+    counted-kinds table), which is what makes that sound against design 3
+    D-3's slot reclaim. The kernel notifies after the status word is recorded
+    and before the teardown, and the wake only QUEUES, so a supervisor never
+    observes a half-dead process. The deadlock predicate deliberately gained
+    no arm: a death arrives from INSIDE the thread set, so a supervisor parked
+    on a live child is not idle-and-doomed — the child's own threads are
+    runnable — and one parked on a dead child was already woken.
+  - **Thread waitability, and `kill`** (§8) — attaching a THREAD is still a
+    `NotWaitable` fault (and so is attaching a MemoryObject, which
+    has no state that could become ready); `kill` still has no op and no
+    right. A supervisor may now learn a child died either way: by READING
+    `get_status` through the handle it holds, or by being WOKEN through an
+    attachment on the same handle.
   - **`IntrSpinLock` (§9b), SMP** — still unbuilt, and correctly so: a
     preemption point IS the assertion that state is consistent, so
     nothing yet has a critical section for the type to protect. SMP

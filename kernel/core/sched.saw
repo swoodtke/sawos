@@ -64,7 +64,7 @@ import kcore.objects.{
     quota_clear,
     unbind_handle,
 }
-import kcore.refs.{unref_teardown}
+import kcore.refs.{unref_teardown, unref_waitable_teardown}
 import kcore.threads.{
     CURRENT_THREAD,
     LAST_PROT_PROCESS,
@@ -91,9 +91,11 @@ import kcore.waitables.{
     WAITERS,
     WaitableKind,
     WaiterSlot,
+    set_waitable_attachment,
 }
 import kcore.process.{PROCESSES, ProcessState, clear_domain, load_domain,
                       reclaim_process_slot}
+import kcore.wake.{notify_ready}
 import kcore.irq.{has_external_wake_source, idle_until_runnable}
 
 // =============================================================================
@@ -212,9 +214,15 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
 /// there is nobody to blame — what is left is a machine whose surviving
 /// processes are all blocked on something no thread can now deliver. Today that
 /// set is exactly {root} (`MAX_PROCESSES` is 2), so the report ends root, which
-/// produces the same stop M2 always did. A system with more survivors is what
-/// unit 5.5's death notifications are for: then root is WOKEN by a child's death
-/// instead of being deadlocked by it.
+/// produces the same stop M2 always did.
+///
+/// **AND M3 UNIT 5.5 IS WHY THIS ARM IS NOW THE UNUSUAL PATH RATHER THAN THE
+/// SUPERVISORY ONE** (sawos design 8), which is what the sentence that used to
+/// end this paragraph predicted. A root parked on its child's Process handle is
+/// woken BY the death — `end_process` notified before it started tearing down,
+/// so the `ready_pop` above finds root and this arm is never reached. What
+/// still reaches it is a root parked on something the dead child was the only
+/// possible source of, which is a genuine deadlock and is reported as one.
 func resume_after_death() unsafe -> Never {
     var next = ready_pop()
     if next == NO_THREAD {
@@ -275,9 +283,11 @@ public(package) func exit_thread(slot: Int, code: UInt) unsafe {
 ///   - **PROCESS 0 STOPS THE MACHINE**, exactly as every earlier era did, with a
 ///     byte-identical report. Root is init: a system whose first process has
 ///     ended has nothing to run, and its children die with it, uncounted. That
-///     last part is a v1 statement rather than a principle — unit 5.5's death
-///     notifications are what make a child's end observable, and quotas (unit 5)
-///     are what make its resources worth reclaiming separately.
+///     last part is a v1 statement rather than a principle — quotas (unit 5)
+///     are what make a child's resources worth reclaiming separately, and unit
+///     5.5's death notifications (sawos design 8) are what made a child's end
+///     OBSERVABLE: a supervisor parked on the child's Process handle is woken
+///     by the `notify_ready` at the top of this function.
 ///   - **A CHILD RESCHEDULES.** Its threads leave the ready queue by REMOVAL,
 ///     its slot and its grant record go back, and the path ends in
 ///     `resume_after_death` — so the machine keeps running and root is simply
@@ -300,6 +310,25 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     PROCESSES[p].state = ProcessState.Gone
     PROCESSES[p].exit_kind = kind
     PROCESSES[p].exit_code = code
+
+    // **AND A PARKED SUPERVISOR IS TOLD, RIGHT HERE** (sawos design 8, M3 unit
+    // 5.5). The three lines above are the whole of what a wait record carries,
+    // so this is the earliest point the notification could be honest — and
+    // being early is what the ORDERING argument needs.
+    //
+    // THE WAKE ONLY QUEUES. `notify_ready` reaches `wake_one_waiter`, which
+    // writes the record into the supervisor's memory and pushes its thread onto
+    // the ready queue; it does not switch. So the whole teardown below runs to
+    // completion first, and the woken thread is picked up by
+    // `resume_after_death` at the bottom of this function. **NO OBSERVER EVER
+    // SEES A HALF-DEAD PROCESS**, and that is a consequence of the kernel
+    // running to completion rather than of where this line sits — which is
+    // exactly why the line can sit at the honest place instead of at the end.
+    //
+    // It is unconditional, root included. Root's own slot can only be attached
+    // by root, and root's death stops the machine a few lines down, so the arm
+    // is unreachable-but-correct rather than special-cased into silence.
+    notify_ready(WaitableKind.Process, p)
 
     // **A CHILD'S CLEAN EXIT IS REPORTED, and this line is new in M3 unit 3**
     // (sawos design 4). Until give existed, a child could not exit at all — it
@@ -426,16 +455,44 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // process's waiters rather than by scanning for a process field they do not
     // carry — which is also the honest ownership statement: an attachment is a
     // row in a Waiter's table and dies with it.
+    //
+    // **AND SINCE M3 UNIT 5.5 EACH ONE IS UNHOOKED FROM THE FAR END TOO**
+    // (sawos design 8). The sentence this loop used to rest on — "an attachment
+    // only ever joins two objects of the SAME process, so freeing both ends is
+    // freeing the list" — stopped being true the moment a Process handle became
+    // waitable: a supervisor's Waiter attaches to a CHILD's process slot, and
+    // that pair spans two processes. So the two lines added here are the far
+    // end's, and they are the close-all's own discipline one table down:
+    //
+    //   - CLEAR THE BACK POINTER, because the waitable's `attachment` field
+    //     would otherwise name a slot this loop has just freed. For a
+    //     same-process waitable the per-slab sweeps below zero it anyway, so
+    //     nothing observable changes; for a Process slot another process owns,
+    //     it is what stops a later death from notifying through a stale index.
+    //   - COUNT, WITHOUT FREEING (`unref_waitable_teardown`). Exactly the
+    //     asymmetry the handle close-all above states and for the same reason:
+    //     an object some OTHER process owns must see the reference go, and the
+    //     freeing is the per-slab sweeps' job.
+    //
+    // Reachable only when a supervisor dies before what it watches, which with
+    // `MAX_PROCESSES` at two means root — and root's death stops the machine.
+    // Written anyway: the sweep's stated invariant is what changed, and an
+    // invariant that has quietly become false is worse than a branch nothing
+    // takes.
     var a: Int = 0
     while a < MAX_ATTACHMENTS {
         match ATTACHMENTS[a].state {
             case Free -> {},
             case Live -> {
                 if WAITERS[ATTACHMENTS[a].waiter].process == p {
+                    let watched = ATTACHMENTS[a].kind
+                    let watched_slot = ATTACHMENTS[a].target
                     ATTACHMENTS[a] = Attachment(state: SlotState.Free,
                                                 kind: WaitableKind.Event,
                                                 target: 0, waiter: 0, key: 0,
                                                 link: 0)
+                    set_waitable_attachment(watched, watched_slot, 0)
+                    unref_waitable_teardown(watched, watched_slot)
                 }
             },
         }

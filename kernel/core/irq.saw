@@ -367,7 +367,8 @@ func idle_poll() unsafe {
 /// deliver; an ARMED TIMER is readiness the CLOCK will deliver. Neither needs a
 /// thread to run for it to arrive, which is the whole of what this question
 /// asks — so "idle iff a line is bound" was always the special case of "idle iff
-/// something outside the thread set can still wake somebody".
+/// something outside the thread set can still wake somebody". TWO, STILL, after
+/// the fourth waitable landed — see the design-8 paragraph below.
 ///
 /// Getting this wrong in the Timer's direction would be the worst kind of bug:
 /// a process that armed a timer and parked is SLEEPING, which is the headline
@@ -377,6 +378,28 @@ func idle_poll() unsafe {
 /// counts and a merely EXISTING one does not: a disarmed Timer will never fire,
 /// so it is not a wake source, and a system holding only those is as deadlocked
 /// as one holding none.
+///
+/// **THE FOURTH WAITABLE ADDED NO ARM HERE, AND THAT IS A RULING RATHER THAN AN
+/// OMISSION** (sawos design 8 D-1, M3 unit 5.5). A PROCESS DEATH ARRIVES FROM
+/// INSIDE THE THREAD SET: some syscall or fault of that process caused it, so
+/// some thread of that process had to RUN to produce it. That is the exact
+/// negation of what this predicate asks — "can readiness arrive with nothing
+/// runnable" — so a supervisor attached to a Process contributes nothing to the
+/// answer, and the three ways the question can come up all resolve without one:
+///
+///   - parked on a LIVE, STARTED child: that child's threads are runnable, so
+///     the ready queue is not empty and this predicate is never consulted.
+///   - parked on a DEAD child: `waiter_wait`'s scan found `Gone` and returned
+///     without parking. Terminal level means the state is still there, so this
+///     case does not exist.
+///   - parked on a child that was CREATED and never STARTED: it has no threads
+///     and never will, so nothing can ever make it `Gone`. That is a genuine
+///     deadlock, and answering `false` here is the correct — and load-bearing —
+///     answer. An arm counting live processes would have turned exactly this
+///     mistake into a silent hang.
+///
+/// It is the question a reviewer asks, which is why it is written here and not
+/// only in the brief.
 public(package) func has_external_wake_source() unsafe -> Bool {
     var i: Int = 0
     while i < MAX_INTERRUPTS {

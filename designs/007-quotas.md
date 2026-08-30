@@ -26,7 +26,7 @@ fails to compile until somebody says what references it):
 | Timer | handle entries + its attachment |
 | Memory / IoMemory | handle entries |
 | Mapping | handle entries |
-| Process | handle entries (generalizes design 3 D-3's scan into a count) |
+| Process | handle entries (generalizes design 3 D-3's scan into a count) **+ its attachment** — AMENDED by design 8 (M3 unit 5.5), which made a Process handle §2.2's fourth waitable; the attachment counts here exactly as it does on the three rows above, and that is what keeps a watched dead process's slot readable until its watcher detaches |
 | Thread | NOT COUNTED v1 — the join/exit protocol owns thread-slot lifetime (joiners, the Exited-until-read rule); folding it in is real design with no current payoff. Recorded, deferred. |
 | Clock | EXEMPT — kernel-eternal, owned by nobody (the Aug-17 ruling stands) |
 

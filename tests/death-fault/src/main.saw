@@ -1,0 +1,144 @@
+// SOS M3 unit 5.5: THE FAULT ARM — a death nobody chose (sawos design 8).
+//
+// **THE SAME PROGRAM AS `death-notify`, WITH ONE THING TAKEN AWAY.** This
+// launcher gives its child NOTHING: no System handle, no boot tag, so the child
+// holds `NO_HANDLE` and the kernel terminates it at its first `ecall`. Root's
+// park is identical, its attachment is identical, and what comes back out of
+// the wait record is a DIFFERENT §8 status word — which is the point. A
+// supervisor learns that a child died and how, through one mechanism, whether
+// the child chose the ending or the kernel did.
+//
+// The transcript:
+//
+//   SOS deathfault: started
+//   SOS: process fault: bad handle process=...      <- the kernel ending it
+//   SOS: process teardown ... process=...
+//   SOS deathfault: woke key=45 status=131073       <- root, on the far side
+//   SOS deathfault: done
+//
+// `status=131073` is `Faulted`(2) << 16 | 1, and the 1 is `FaultReason.BadHandle`
+// — the same word `process-lifecycle` reads through `get_status`, arriving here
+// as a WAKE instead of as a poll. That equality is worth stating: unit 5.5 adds
+// no vocabulary to §8, it adds a second door onto the word §8 already defines.
+//
+// **THE FAULT REPORT COMES FIRST AND THE WAKE LAST**, for design 8 D-1's
+// reason: `fault_process` prints, then records the status, then notifies, then
+// tears the process down — and the notification only queues a thread, so root
+// runs after the teardown has finished. There is no arrangement of these lines
+// in which root observes a half-dead process.
+
+import sos.{System, Process, Memory, BootHandle, Waiter, WaitResult,
+            WaitPayload, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The key this case attaches the child's Process handle under.
+static KEY: UInt = 45
+
+/// The §8 status word out of the record. See `death-notify` for why the other
+/// three arms panic rather than handle anything.
+func status_of(r: &WaitResult) -> UInt {
+    match r.what {
+        case Process(status) -> status,
+        case Event(_) -> panic("this program attached no event"),
+        case Interrupt(_) -> panic("this program attached no interrupt"),
+        case Timer(_) -> panic("this program attached no timer"),
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = match system.process_self() {
+        case Ok(p) -> p,
+        case Err(_) -> {
+            let _ = system.debug_print("SOS deathfault: no process handle\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    var image = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS deathfault: no image region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    var dest = match proc.boot_handle_next() {
+        case Ok(h) -> h,
+        case Err(e) -> {
+            print("SOS deathfault: no destination region: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    guard let image_mem = image.take_memory() else {
+        let _ = system.debug_print("SOS deathfault: image record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest_mem = dest.take_memory() else {
+        let _ = system.debug_print("SOS deathfault: dest record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let child = match system.process_create(image: &image_mem,
+                                            memory: &dest_mem) {
+        case Ok(c) -> c,
+        case Err(e) -> {
+            print("SOS deathfault: create failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    let waiter = match proc.waiter_create() {
+        case Ok(w) -> w,
+        case Err(e) -> {
+            print("SOS deathfault: no waiter: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    match child.attach(waiter: &waiter, key: KEY) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS deathfault: attach failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    // NO `give`, NO BOOT TAG. The child receives `NO_HANDLE` in its first
+    // argument register and dies at its first syscall — the ruled
+    // "legal-but-doomed" sandboxed compute process, used here as a fault
+    // generator.
+    match child.start() {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            print("SOS deathfault: start failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+    let _ = system.debug_print("SOS deathfault: started\n")
+
+    let record = match waiter.wait() {
+        case Ok(r) -> r,
+        case Err(e) -> {
+            print("SOS deathfault: wait failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    print("SOS deathfault: woke key={} status={}\n",
+          record.key, status_of(&record))
+    print("SOS deathfault: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

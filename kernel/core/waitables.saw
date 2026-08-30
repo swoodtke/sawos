@@ -10,8 +10,16 @@
 //! the copy door in `process`, which tears a process down, which frees these
 //! slabs. So the tables and the questions asked OF them stay below the teardown,
 //! and the act of telling somebody stays above it.
+//!
+//! **AND SINCE M3 UNIT 5.5 THIS FILE SITS ABOVE `process`** (sawos design 8),
+//! which is the one altitude the split moved. The fourth waitable is a PROCESS,
+//! and its three per-kind answers — who is watching it, is it dead, what does
+//! the record say — are reads of `PROCESSES`. The rule is unchanged and the
+//! order it produced changed: a module sits where its call graph allows, this
+//! one now reaches down into the process table, and `process` reaches nothing
+//! here.
 
-import sosabi.{EventMode, WaitTag}
+import sosabi.{EventMode, WaitTag, process_status_word}
 import kcore.limits.{
     MAX_ATTACHMENTS,
     MAX_EVENTS,
@@ -25,6 +33,14 @@ import kcore.limits.{
 import kcore.objects.{SlotState}
 import kcore.threads.{NEED_RESCHED, THREADS, ThreadState}
 import kcore.time.{TIMERS, saturating_add}
+// **THE ONE IMPORT M3 UNIT 5.5 ADDED, AND IT MOVED THIS MODULE'S ALTITUDE**
+// (sawos design 8). A Process handle is the fourth waitable, and everything the
+// matrix below has to know about one — is it ready, what does a record say, who
+// is watching it — is a read of the process slot. So this file now sits ABOVE
+// `process` in `kcore`'s dependency order instead of below it. Nothing went the
+// other way: `process` names nothing here, which is what makes the flip a
+// reordering rather than the cycle DF-232e diagnoses.
+import kcore.process.{PROCESSES, ProcessState}
 
 /// WHICH KINDS CAN BE ATTACHED TO A WAITER — the waitable kinds, and only
 /// those.
@@ -36,14 +52,25 @@ import kcore.time.{TIMERS, saturating_add}
 /// these, and it is the only place — every non-waitable arm of that match
 /// terminates the process instead of producing a value.
 ///
-/// What this enum buys downstream is that the four per-kind questions below are
-/// EXHAUSTIVE OVER WAITABLES rather than over object types: a fifth object kind
-/// that is not waitable costs them nothing, and a fifth WAITABLE kind fails all
-/// four to compile until somebody answers for it.
+/// What this enum buys downstream is that the five per-kind questions below are
+/// EXHAUSTIVE OVER WAITABLES rather than over object types: an object kind that
+/// is not waitable costs them nothing, and a new WAITABLE kind fails all five
+/// to compile until somebody answers for it. (The count was "four" here until
+/// design 232 unit 1's Timer added the drain question and this line was missed;
+/// design 8 fixes it while collecting the promise.)
+///
+/// **THE FOURTH KIND COLLECTED THAT PROMISE** (sawos design 8, M3 unit 5.5):
+/// adding `Process` here failed all five matrix arms and `waitable_obj_type`
+/// beside them, so the compiler enumerated the work rather than a reviewer.
 public(package) enum WaitableKind: UInt8 {
     case Event = 0,
     case Interrupt = 1,
     case Timer = 2,
+    /// A PROCESS, ready once it has ENDED (spec §8; sawos design 8). The one
+    /// waitable that is not a notification object: nothing creates it to be
+    /// waited on, it is the process itself, and what a supervisor attaches is
+    /// the handle `process_create` already gave it.
+    case Process = 3,
 }
 
 /// A waitable the dispatch has resolved: which table, which slot.
@@ -314,13 +341,15 @@ public(package) func accumulate(slot: Int, bits: UInt) unsafe {
 //   `waitable_consume`                                  a record was delivered
 //
 // That is a MATRIX rather than a funnel because the answers genuinely differ
-// per kind — an Event's readiness is a word, an Interrupt's is a masked line and
-// a Timer's is a count of expiries — and it is written as five small functions
-// in one place so the matrix is READABLE AS ONE. Adding a fourth waitable kind
-// fails all five to compile, which is the property a `_` arm anywhere here would
-// destroy. (The Timer, design 232 unit 1's third kind, is what added the fifth
-// question and it added it to every existing row at once — which is the matrix
-// working.)
+// per kind — an Event's readiness is a word, an Interrupt's is a masked line,
+// a Timer's is a count of expiries and a Process's is being dead — and it is
+// written as five small functions in one place so the matrix is READABLE AS
+// ONE. Adding a waitable kind fails all five to compile, which is the property
+// a `_` arm anywhere here would destroy. (The Timer, design 232 unit 1's third
+// kind, is what added the fifth question and it added it to every existing row
+// at once — which is the matrix working. The PROCESS, sawos design 8's fourth
+// kind, added no question and answered all five, which is the same claim from
+// the other side: the questions were the right ones.)
 //
 // Everything ELSE about waiting — the list walk, the key lookup, the wake, the
 // copy-out — is kind-blind and appears exactly once below.
@@ -331,6 +360,7 @@ public(package) func waitable_attachment(kind: WaitableKind, slot: Int) unsafe -
         case Event -> EVENTS[slot].attachment,
         case Interrupt -> INTERRUPTS[slot].attachment,
         case Timer -> TIMERS[slot].attachment,
+        case Process -> PROCESSES[slot].attachment,
     }
 }
 
@@ -340,6 +370,7 @@ public(package) func set_waitable_attachment(kind: WaitableKind, slot: Int, a: I
         case Event -> { EVENTS[slot].attachment = a },
         case Interrupt -> { INTERRUPTS[slot].attachment = a },
         case Timer -> { TIMERS[slot].attachment = a },
+        case Process -> { PROCESSES[slot].attachment = a },
     }
 }
 
@@ -349,16 +380,40 @@ public(package) func set_waitable_attachment(kind: WaitableKind, slot: Int, a: I
 /// the wait machinery maintains, which is what makes level-triggering an
 /// absence rather than a mechanism: an Event is ready while its word is
 /// non-zero, an Interrupt while its fire is unacked, a Timer while it has
-/// expiries nobody has been told about.
+/// expiries nobody has been told about, and a Process once it is `Gone`.
+///
+/// THE PROCESS ARM IS THE ONE THAT CAN NEVER GO BACK, which is the whole of
+/// what "terminal" means here (sawos design 8): the other three answers can
+/// flip to false again — a word is taken, a line is acked, a count is spent —
+/// while `Gone` is a state a slot leaves only by being freed, and it cannot be
+/// freed while somebody is attached to it. So the level a death raises stays
+/// raised for exactly as long as anyone can observe it.
 public(package) func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Bool {
     match kind {
         case Event -> EVENTS[slot].word != 0,
         case Interrupt -> INTERRUPTS[slot].pending,
         case Timer -> TIMERS[slot].fires != 0,
+        case Process -> {
+            match PROCESSES[slot].state {
+                case Gone -> true,
+                // `Created` is NOT ready, and the arm is worth its line: a
+                // process that has been made and never started has not ended,
+                // so a supervisor parked on one waits — correctly, and
+                // forever, which `pick_next`'s deadlock report is what names.
+                case _ -> false,
+            }
+        },
     }
 }
 
 /// The tag and payload words a wait record carries for this waitable.
+///
+/// THE PROCESS ARM CARRIES §8's OWN WORD and invents nothing (sawos design 8):
+/// `process_status_word` is the same assembly `ProcessOp.GetStatus` answers
+/// with, so being woken by a death and asking about one produce identical
+/// bits. Unit 5.5 adds a second DOOR onto §8's word rather than a second
+/// vocabulary for it — the `Exited`/`Faulted` distinction sharpening 2 asked
+/// for is the kind field that already shipped.
 public(package) func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> WaitAnswer {
     match kind {
         case Event -> WaitAnswer(tag: WaitTag.Event, payload: EVENTS[slot].word),
@@ -366,6 +421,10 @@ public(package) func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> Wa
                                      payload: INTERRUPTS[slot].line),
         case Timer -> WaitAnswer(tag: WaitTag.Timer,
                                  payload: TIMERS[slot].fires),
+        case Process -> WaitAnswer(
+            tag: WaitTag.Process,
+            payload: process_status_word(PROCESSES[slot].exit_kind,
+                                         PROCESSES[slot].exit_code)),
     }
 }
 
@@ -389,10 +448,18 @@ public(package) func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> Wa
 ///     device to service, so the fire has done its whole job once somebody has
 ///     been told — which is the ack-free half of the timerfd model, and what
 ///     makes a periodic timer a schedule rather than a request/response.
+///   - a PROCESS's death CLEARS NOTHING, and it is the fourth answer rather
+///     than a copy of the Interrupt's (sawos design 8, sharpening 1). The two
+///     empty arms are empty for OPPOSITE reasons: an Interrupt's readiness has
+///     an end the kernel does not own, and a death has no end at all. **THIS IS
+///     THE ONE PLACE TERMINAL DIFFERS FROM EVENT'S CLEAR-ON-CONSUME**:
+///     consuming a death REPORTS it, nothing un-dies, so the next wait on the
+///     same attachment answers the same §8 word and a waiter attaching after
+///     the death is told at once.
 ///
-/// So the ODD KIND OUT IS THE INTERRUPT, and its emptiness says what it is: the
-/// only readiness in the system whose end is a DEVICE's business rather than the
-/// kernel's.
+/// So the INTERRUPT is no longer the odd kind out — it shares its emptiness
+/// with the Process now, and what distinguishes them is whose business the end
+/// of the readiness is: a DEVICE's for one, nobody's for the other.
 public(package) func waitable_consume(kind: WaitableKind, slot: Int) unsafe {
     match kind {
         // The take is READ-AND-CLEAR, and `deliver_attachment` is what makes it
@@ -402,6 +469,10 @@ public(package) func waitable_consume(kind: WaitableKind, slot: Int) unsafe {
         case Event -> { EVENTS[slot].word = 0 },
         case Interrupt -> {},
         case Timer -> { TIMERS[slot].fires = 0 },
+        // TERMINAL LEVEL. Deliberately, and see the docstring above: this is
+        // the arm that would have to write something for a death to be
+        // reportable once, and there is nothing it could honestly write.
+        case Process -> {},
     }
 }
 

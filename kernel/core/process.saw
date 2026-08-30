@@ -186,7 +186,29 @@ public(package) struct ProcessSlot {
     /// It counts references from EVERY process's table, which is why it lives
     /// on the slot rather than in the ledger: whoever still holds a handle is
     /// the reader that matters, and that need not be the process releasing one.
+    ///
+    /// **AND SINCE M3 UNIT 5.5 IT COUNTS THE ATTACHMENT TOO** (sawos design 8,
+    /// amending design 7 D-1's table row): a Process handle is a waitable, an
+    /// attachment is a counted reference on every waitable, and this one is
+    /// load-bearing rather than uniform — it is what makes attach-after-death
+    /// SOUND. A supervisor watching a dead child holds the slot open, so the
+    /// §8 status word it is waiting to read cannot be reclaimed out from under
+    /// it by design 3 D-3's rule.
     public(package) refs: UInt16,
+    /// The attachment naming this process (slot + 1); 0 = unattached (sawos
+    /// design 8).
+    ///
+    /// THE SAME FIELD THE THREE OTHER WAITABLES CARRY, for the same reason
+    /// (`EventSlot.attachment`): §2.2 ratifies at most one Waiter per handle,
+    /// so it is a field rather than a list, and it is the ONE thing the
+    /// notifying side has to load — `end_process` asks it and nothing else
+    /// about the wait machinery.
+    ///
+    /// It lives here rather than beside the wait tables because it is a
+    /// property of the process slot, and that is also why `kcore.waitables`
+    /// now sits ABOVE this module: a Process's readiness and payload are read
+    /// out of this table. See `kcore`'s module-order list.
+    public(package) attachment: Int,
 }
 
 public(package) unsafe static var PROCESSES: [ProcessSlot; MAX_PROCESSES] = [
@@ -196,7 +218,7 @@ public(package) unsafe static var PROCESSES: [ProcessSlot; MAX_PROCESSES] = [
              grants: [GrantRow(base: 0, top: 0, perms: 0, device: false);
                       MAX_GRANT_ROWS],
              exit_kind: ProcessStatusKind.Running, exit_code: 0,
-             refs: 0); MAX_PROCESSES]
+             refs: 0, attachment: 0); MAX_PROCESSES]
 
 /// Take a free process slot, or `NO_PROCESS` when the table is full.
 ///

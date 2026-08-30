@@ -29,8 +29,31 @@ entry below or the brief that carries it, never restating either.
   notifies after status-record before the fork, the attachment joins
   the Process refcount row (design 7 composition), deadlock predicate
   deliberately untouched with the reasoning recorded. No authorized
-  transcript changes. DISPATCHED Aug 30; closes in place when the
-  branch parks
+  transcript changes. DISPATCHED Aug 30. **CLOSED Aug 30 — BUILT, gate
+  green on both profiles.** All of D-1 landed as ruled: the five matrix
+  arms, `waitable_slot`'s Process arm replacing its `NotWaitable`
+  refusal, `notify_ready` in `end_process` after the status record with
+  the wake-only-queues note at the site, the attachment counted in
+  `ProcessSlot.refs`, and `has_external_wake_source` untouched with the
+  three-case reasoning written at the predicate. Three cases —
+  `death_notify` (no timer armed anywhere: the death is the only wake
+  source), `death_fault` (the same park, `Faulted` instead of `Exited`,
+  reusing `child-fault`), `death_late_attach` (`first=65541
+  second=65541`, then `held=1 freed=1` — the attachment alone holds the
+  dead slot until it is removed) — plus one new child, `child-bye`. Gate
+  150 passed; of the 144 baseline rows, 103 byte-identical, 40
+  address-only (`entry=` alone), 1 documented-nondeterministic
+  (`thread_preempt`'s interleaving, which the case's own comment records
+  as timing-dependent and which asserts direction changes, not a
+  sequence), and ZERO authorized changes. THREE FINDINGS worth the lead's
+  eye, all in the
+  As-built: (1) SL-7's third site MOVED THE RULED SPELLING — the brief's
+  `Waiter.add(process:, key:)` is the DF-232e cycle, so it is
+  `Process.attach(waiter:, key:)` on design 6's precedent; (2)
+  `kcore.waitables` now sits ABOVE `kcore.process`, the unit's one
+  altitude change; (3) a Process attachment is the first CROSS-PROCESS
+  attachment, so `end_process`'s attachment sweep had to start unhooking
+  the far end
 - M3 unit 6 — the money shot [sawlang#232]
 
 ## [BACKLOG] — filed, not scheduled
@@ -86,6 +109,6 @@ One entry per issue, resolution-sufficient: the symptom verbatim, the probe/site
 - SL-4 — AMBIGUITY DIAGNOSTIC ANCHORS AT 1:1 WITH `<unknown>` MODULE: ``ambiguous struct `Thread`: defined in both `<unknown>` and `sos.thread` `` reports at line 1:1 of an arbitrary file — the location and the `<unknown>` are both noise (design 5, the std.task Thread<T> prelude collision). Resolution: real span + real module name on the ambiguity path.
 - SL-5 — DECLARED-VS-IMPORTED NAME PRECEDENCE ASYMMETRY AGAINST THE PRELUDE: a locally DECLARED type name beats a prelude generic of the same name; a selectively IMPORTED one ties with it and errors (design 5: `struct Thread` won in-file, `import sos.thread.{Thread}` lost to std.task's `Thread<T>` — worked around with the qualifier at five sites). Resolution: rule which precedence is intended and make the two paths agree.
 - SL-6 — `extern "C"` DECLARATIONS ARE PRIVATE-BY-CONSTRUCTION AND UNSHAREABLE: an extern decl carries no visibility modifier, and two sibling modules declaring one symbol is a hard ambiguity at the importer (probed, design 5) — which forces a package's entire extern surface into one bottom module. Resolution: visibility on extern blocks, or a ruled one-owner-module convention documented upstream.
-- SL-7 — EXTENSION-METHOD LOOKUP DOES NOT FOLLOW FACADE RE-EXPORTS (designs 142/229 by design): a type's extension methods must live in its declaring module, so mutually-referential types cannot be split across files even behind a facade (design 5 finding 1 — System/Process/BootHandle are one 724-line module with three banners). Resolution is a language design question, named in the finding: an internal/forward-declaration tier, or lookup that follows `public import`. **SECOND SITE, design 6**: it also decides METHOD PLACEMENT, not just file layout. `Memory.map(into: &Process)` is unwritable — `BootHandle` carries a `Memory?` and an `IoMemory?`, so both region modules sit below `sos.system` and a `map` written in either naming `Process` is the DF-232e cycle. The funnels became `Process.map(memory:access:)` / `Process.map(iomemory:)` instead. That reads well here (it matches the `give` overloads), but the constraint chose it rather than the design.
+- SL-7 — EXTENSION-METHOD LOOKUP DOES NOT FOLLOW FACADE RE-EXPORTS (designs 142/229 by design): a type's extension methods must live in its declaring module, so mutually-referential types cannot be split across files even behind a facade (design 5 finding 1 — System/Process/BootHandle are one 724-line module with three banners). Resolution is a language design question, named in the finding: an internal/forward-declaration tier, or lookup that follows `public import`. **SECOND SITE, design 6**: it also decides METHOD PLACEMENT, not just file layout. `Memory.map(into: &Process)` is unwritable — `BootHandle` carries a `Memory?` and an `IoMemory?`, so both region modules sit below `sos.system` and a `map` written in either naming `Process` is the DF-232e cycle. The funnels became `Process.map(memory:access:)` / `Process.map(iomemory:)` instead. That reads well here (it matches the `give` overloads), but the constraint chose it rather than the design. **THIRD SITE, design 8 — and this one MOVED A SPELLING THE BRIEF HAD RULED.** Design 8's ruled surface is `Waiter.add(process:, key:)`, the fourth member of the overload list `sos.waiter` already holds; it is unwritable, because `waiter` sits below `system` (its three `add` overloads read the waitables' handle fields, which is what put it above THEM) and `Process` is declared in `system` with `System` and `BootHandle`, all three mutually referential. So the surface is `Process.attach(waiter:, key:)` — design 6's flip applied verbatim — with a comment in `waiter.saw` where the fourth overload would have gone. The alternative was rejected on the same finding's other half: an `extension Waiter` written in `system.saw` IS legal under the orphan rule, but design 142 scopes extension-method LOOKUP to the declaring module plus the caller's DIRECT imports, so every consumer would have owed an `import sos.system` whose purpose nothing on the page explains. Resolution unchanged and now three-sited: an internal/forward-declaration tier, or lookup that follows `public import`.
 - SL-8 — DF-172d STILL BITES (already filed upstream as DF-172d; listed here as a cross-reference, not a new issue): unbracketed binary expressions do not wrap across lines; hit again in designs 2 and 4. Resolution tracked in sawlang's own DF. **THIRD SITE, design 6**: `if (a & X) != 0\n && (b & Y) == 0 {` in `kcore.dispatch`'s `map_access`, fixed by parenthesising the whole condition.
 - SL-9 — A LONE RAW-BACKED ENUM CASE DOES NOT ADOPT A FIXED-WIDTH SLOT, THOUGH A COMBINATION OF THEM DOES: ``static `RO` has type `UInt32` but its initializer has type `MapAccess` `` (design 6, `tests/map-basics`, pinned sawc a82e06f4). `static RW: UInt32 = MapAccess.Read | MapAccess.Write` COMPILES and folds to 3 — DF-240a's flag-enum rule — while `static RO: UInt32 = MapAccess.Read` at the same slot is refused, so ONE bit needs an `as UInt32` projection and TWO bits do not. Minimal example: `enum E: UInt32 { case A = 1, case B = 2 }` then `static X: UInt32 = E.A | E.B` (ok) beside `static Y: UInt32 = E.A` (error). Workaround in-tree: write `MapAccess.Read as UInt32`, with the asymmetry noted at the line. Resolution: let a bare case adopt a fixed-width slot exactly as a combination does (the value is as constant either way), or rule the asymmetry permanent and say so beside DF-240a — the current state teaches that adding a second flag REMOVES a cast, which is backwards.
