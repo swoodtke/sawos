@@ -21,7 +21,16 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
-- M3 unit 5.5 — death notifications [sawlang#232]
+- M3 unit 5.5 — death notifications [sawlang#232 agenda 9, #8 —
+  designs/008-death-notifications.md, authored Aug 30]: Process
+  becomes the fourth waitable (not a new kind), WaitTag.Process=3
+  carrying the §8 status word, TERMINAL LEVEL (stays signaled,
+  attach-after-death wakes, consume clears nothing), end_process
+  notifies after status-record before the fork, the attachment joins
+  the Process refcount row (design 7 composition), deadlock predicate
+  deliberately untouched with the reasoning recorded. No authorized
+  transcript changes. DISPATCHED Aug 30; closes in place when the
+  branch parks
 - M3 unit 6 — the money shot [sawlang#232]
 
 ## [BACKLOG] — filed, not scheduled
