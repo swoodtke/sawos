@@ -293,3 +293,46 @@ repo's first done file; sawos was born Aug 28 (sawlang#238).
   0.2.0): everything in scope landed as written, except that no
   spec sentence names the method spelling, so no spec edit was
   owed. INTEGRATED to main with the bump commit (lead)
+
+- M3 unit 6 — the money shot [sawlang#232, #9 —
+  designs/009-driver-child.md, authored Aug 30]: child echo driver
+  from config both arches + shared-memory double-map demo +
+  MemoryRight.MapExecute exec gating (ruled Aug 30) + W|X-in-one-row
+  refusal. **CLOSED Aug 30 — BUILT, and the M3 LADDER IS COMPLETE.**
+  A DRIVER IS A CHILD PROCESS: root drains the console UART's register
+  page as an `IoMemory`, `give`s it to a child (the new
+  `Process.give(iomemory:)` funnel, over a `Transfer` bit
+  `iomemory_rights()` has minted since unit 4), and the child maps it
+  into itself, binds the line, enables the device and echoes the
+  harness's bytes — both profiles, driver body byte-identical to the
+  root-as-driver twins, which STAY unmoved. Beside it: SHARED MEMORY
+  (one region, two address spaces, the launcher installing the child's
+  row so the child holds no region object — `handles=2` in its teardown
+  line is that claim counted), and EXECUTABLE AS A RIGHT
+  (`MemoryRight.MapExecute = 1 << 10` gating `MapAccess.Execute` per
+  handle, `memory_rights()` minting it of necessity since attenuation is
+  monotonic, and `Write | Execute` in ONE row refused `BadArg` beside
+  write-without-read). New surface: `Memory.mint(rights:)` and a
+  `MemoryRight` re-export, which is where a launcher's memory policy is
+  now written. Docs: spec §2.5 (the amendment + both new flows), §9's
+  driver-child chapter, §11's M3 entry (the ladder complete) and the
+  `MemoryObject`/`IoMemoryObject` rows, `memory_rights()`'s docstring.
+  Gate: 158 passed across both profiles (79 cases each) — 150 baseline
+  rows accounted (146 byte-identical, 1 address-only where the kernel's
+  own trapping PC moved because `kcore.dispatch` grew, 3
+  documented-nondeterministic: both `thread_preempt`s and
+  `timer_interval`'s unasserted coalescing count) and 8 new. The
+  authorized-with-cause bucket the brief anticipated for
+  `memory_rights()` growing a bit is EMPTY: no program in the tree
+  prints a Memory rights word. ONE DEVIATION, argued in the As-built: the exec-gate proof is TWO
+  cases (`map-exec-gated`, `map-wx-refused`) rather than the brief's one
+  with three arms, because two of those arms are FAULTS and a fault ends
+  the process — each case's positive arm now motivates its own refusal.
+  ONE FINDING for a later ruling: a launcher CANNOT withhold
+  `ProcessRight.InterruptBind`/`Map` from a child, because those arrive
+  on the handle `SystemOp.ProcessSelf` mints and a keep mask reaches only
+  the child's SYSTEM handle — narrowing them wants `ProcessSelf` to take
+  a mask of its own, which nothing in v1 needs
+  INTEGRATED to main Aug 30 2026 (lead-reviewed, gate re-run
+  158/158, fast-forward f336999) — M3's LADDER IS COMPLETE;
+  unit 7 (docs sweep) is the milestone's close
