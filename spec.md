@@ -40,7 +40,7 @@ names provisional):
 | `Clock` | A GRANTED TIME SOURCE — time is a capability, not an ambient facility. BUILT M3 (design 232 unit 1): obtained through `SystemOp.ClockGet` on `SystemRight.ClockGet`, ops `Now`/`TimerCreate`, rights `ClockRight.Read`/`.TimerCreate`. **A HARDWARE-BACKED CLOCK IS ONE KERNEL-ETERNAL OBJECT PER `ClockType`** (ruled Aug 17, user), existing from boot and owned by NOBODY: the machine has one monotonic counter, and a per-process object naming it would be a copy of a fact with a lifetime attached. So there is one slot per domain (the slot IS the domain's ordinal), no allocation and no `NoResource`, and process teardown frees no clock — a dead process's clock HANDLE is unbound like any other, and the object it named is not the process's to reclaim. `ClockGet` is therefore a GETTER that mints a handle onto a well-known object — and it MINTS ON EVERY ASK (sawos design 3 D-4, M3 unit 2.75), superseding this row's earlier "asking twice answers the SAME handle": two asks are two capability INSTANCES naming the one Clock, each independently owned and independently released, which is what §4's owning wrapper is an owner OF. It amplifies nothing (see §3's no-amplification amendment) and it makes the op fallible on repetition — a full handle table is `NoResource`, which is what earns it a quota row in unit 5. `ClockType` declares `Monotonic` ONLY in v1 (`Boot`/`Realtime` are future values of a raw-backed enum, undeclared because an unproducible case is dead surface), and `Now` dispatches on the clock's domain, so a second domain fails to compile until somebody says what its reading is. `Now` answers through a copy-out record, because a nanosecond count is 64 bits and one profile's registers are not. The point of the capability: strip the right from a child and hand it a VIRTUAL clock over IPC instead, with no code change on either side — and a virtual clock is a DIFFERENT animal, separately created and STATEFUL (offset, rate, owner), so it gets its own creation op and its own lifetime rather than a row in this table. |
 | `Timer` | Deadline object bound to the Clock that created it; directly waitable. BUILT M3 (design 232 unit 1) — THE PROCESS-SLEEP PRIMITIVE, and before it a wait either returned at once or blocked forever. Ops `Arm`/`Disarm`, rights `TimerRight.Arm` (gating both) / `.Wait`. `arm(after_ns, interval_ns)` arrives through the new COPY-IN record (§2.2's copy-out funnel's mirror twin, built here and inherited by M4's IPC send) because two 64-bit times exceed the argument registers on a 32-bit profile; `interval_ns == 0` is a one-shot, which disarms itself when it fires. The re-arm is DRIFT-FREE (next = previous DEADLINE + interval, the timerfd model) and missed expiries COALESCE into a saturating fire count delivered as `WaitPayload.Timer(fires:)`. **There is NO ACK**: unlike §9's Interrupt there is no mask to release, so the wait that reports the fires is what consumes them. Arming an armed timer REPLACES its schedule and clears the count; disarming an unarmed one is a NO-OP, deliberately opposite to §9's ack-with-no-fire — a one-shot disarms itself, so cancelling a timeout that just expired is an ordinary race rather than a caller error. |
 | `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it, ack via the handle. BUILT M2 (design 178 unit 4): one op (`Ack`), two rights (`InterruptRight.Wait`/`.Ack`), created by `ProcessOp.InterruptBind` on its own Process right — the factory bit a launcher strips from everything that is not a driver. The BINDING IS THE OBJECT'S EXISTENCE (creation takes the line, there is no rebind), which is what stops one handle naming two devices over its life. A line the board does not have, the TIMER's line, and a line already bound are all faults. |
-| `Waiter` | Generic wait aggregator (epoll/Port-style) — see §2.2 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Add`/`Remove`/`Wait`, rights `WaiterRight.Attach`/`.Wait`, the wait answer a copy-out record. |
+| `Waiter` | Generic wait aggregator (epoll/Port-style) — see §2.2 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Add`/`Remove`/`Wait`, rights `WaiterRight.Attach`/`.Wait`, the wait answer a copy-out record. AMENDED M4 unit 0 (sawos design 12): its free has a SECOND last rite beside the attachment cascade — REVOCATION. Reaching zero references wakes every thread on its blocked list with `SosStatus.Revoked`, writing no record (nothing became ready, so there is no key, tag or payload), which supersedes M3's recorded "legal-but-doomed" strand. The count is the gate, not the release: a release with a minted sibling still live frees nothing and wakes nobody. It is the peer-gone doctrine's first instance — nothing parked can be silently doomed (§2.2). |
 | ~~`MemoryObject`~~ | (A duplicate row from the Jul-29 draft, pointing at §2.3 where the section is §2.5. Both of its claims are in the rows above: RAM is `MemoryObject`, device MMIO is `IoMemoryObject`, and "mappable" is `Map`. Kept struck rather than deleted so a reader of the Jul-29 discussion finds where it went.) |
 | ~~`Mapping`~~ | (Likewise — see the `Mapping` row above, built M3 unit 4.) |
 | `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. BUILT M2 (design 178 unit 2), one process: ops `ThreadCreate`/`ThreadSelf`/`Exit`/`GetStatus` plus the three factory ops `EventCreate`/`WaiterCreate`/`InterruptBind`, each on its own right. BUILT M3 unit 2 (sawos design 2), **TWO processes**: `Start` (on the CHILD's handle, `ProcessRight.Start`) mints the first thread of a created process and runs it; `BootHandleNext` (`ProcessRight.BootHandles`) drains §12's boot set one record at a time. The CREATE half of that lifecycle is not an op on this object — design 2's RIDER (Aug 29) puts `ProcessCreate` on System, because a process is a machine-wide resource (§12's amended creation-authority note). The child's handle carried `Start | Wait | Manage` and nothing else at that unit — everything a process may do to ITSELF withheld from its creator (M3 unit 3 re-ruled the set; see below). The TEARDOWN now forks (§8): process 0 stops the machine, any other reschedules. **THE SLOT OF A DEAD PROCESS IS RECLAIMED** (sawos design 3 D-3, M3 unit 2.75), and it is the ONLY slab that reclaims on a handle release. A `Gone` slot holds one thing — its §8 status word — and the only way to read that word is `GetStatus` through a Process handle, so "no handle names this slot" IS "no possible reader", exactly. The check therefore scans the handle tables (bounded: `MAX_PROCESSES` × `MAX_HANDLES`) when a released entry named a `Gone` process, and again at the end of a process's own teardown for its own slot. D-1's generations are what make the reuse safe, and `clear_domain` already invalidated `LAST_PROT_PROCESS` in anticipation. `MAX_PROCESSES` consequently bounds CONCURRENT processes again, which is what the name says. **SUPERSEDED IN ITS MECHANISM, NOT ITS ANSWER, BY M3 UNIT 5** (sawos design 7 D-1): the scan is a COUNT now — `ProcessSlot.refs`, maintained by the same lines that maintain an Event's — because unit 2.75's argument that a second fact would be one more thing to keep in step reverses once seven other kinds keep theirs at exactly those sites. The answer is identical, so no transcript moved for it. And this row is no longer the ONLY slab that reclaims on release: every countable kind does (see the counted-kinds column above), which is what makes a `Gone` process ordinary rather than special. `kill` (§8) still has no op. **BUILT M3 unit 3 (sawos design 4): `Give` — THE COURIER OP.** `give(handle, tag:)` on the CHILD's handle (gated by `ProcessRight.Give` there, plus the UNIVERSAL `Transfer` right on the handle being given) MOVES a handle into a fresh slot of the child's table and returns ONLY ITS STATUS: the child-side word is meaningless to the giver, which can call no op through it. What crosses instead is the TAG — the giver's own word, handed back unread at the child's drain. It is unbind-and-rebind with RIGHTS VERBATIM (a move, not a mint: no default set is consulted and nothing amplifies), the caller's entry unbinds exactly as a release does so the giver's word goes stale, and a full child table is `NoResource` with the give not having happened. Four caller errors END the caller: a handle that names nothing (`BadHandle`), one without `Transfer` (`AccessDenied`), a child that has already been STARTED (`BadState` — the boot set FREEZES at start, which is the launch flow's whole soundness argument), and a tag the child's set already carries (`DuplicateKey` — the tag is the identity, and one naming two handles would make the boot lookup ambiguous). `Start` gained a `boot_tag` argument in the same unit: the kernel resolves the tag to the child-side word, puts it in the child's first argument register and CONSUMES the record it named (the register IS the delivery, so a child can never be handed one word twice), leaving `_start(boot_handle)` unchanged and a launcher never seeing a child-relative word. `BootHandleNext` now drains the CALLER's own PER-PROCESS set — the kernel writes root's at boot and a launcher writes a child's with `give`, through one op with one exhaustion rule. The Process default set is now ONE set for all three minters (root's, `ProcessSelf`'s and `ProcessCreate`'s), named for its ops throughout: `ThreadCreate | ThreadSelf | Exit | Wait | EventCreate | WaiterCreate | InterruptBind | Start | BootHandles | Give` plus the universal `Transfer | Mint`. A LAUNCHER KEEPS the child's handle — it is what supervises with — and the child derives its own authority from the masked System handle it was given, so supervision and self-management are no longer alternatives (`MINT_OP`, §3, closing design 3's finding 2). **BUILT M3 unit 5.5 (sawos design 8): A PROCESS HANDLE IS A WAITABLE**, which is §8's own promise below and the fourth member of §2.2's list. Readiness is `state == Gone`; the payload is the §8 status word (`WaitTag.Process`, `WaitPayload.Process(status:)`); the right it spends is `ProcessRight.Wait`, the SAME bit `GetStatus` spends, because attaching is that question asked asynchronously and a second bit would let a supervisor poll a death it may not be woken by. It is TERMINAL LEVEL — the one readiness in the system a delivery does not consume — so a waiter attaching AFTER the death still wakes, a second wait answers the same word, and supervision has no lost-edge race. The attachment is a counted reference like every other waitable's, which is what keeps a dead child's slot readable for exactly as long as somebody is watching it. There is still no notification to anyone but a parked or attaching waiter: the Waiter IS the delivery system. |
@@ -211,6 +211,46 @@ reply it is about to discard.
   Waiter per waitable is OWNERSHIP, and it is structural — a handle
   attaches to at most one Waiter, so a delivered value has exactly one
   recipient by construction and no multi-watcher caveat exists.
+- **THE WAITER ITSELF CAN GO, AND A PARKED THREAD IS TOLD** (BUILT M4
+  unit 0, sawos design 12; `designs/010` rulings 1 and 2). When a
+  Waiter's LAST reference drops, its free wakes every thread on its
+  blocked list with `SosStatus.Revoked`. Three things make that one
+  sentence:
+  - **NO RECORD IS WRITTEN, and that is the contrast to hold onto.** A
+    delivery copies a record into the caller's memory and THEN answers
+    `Ok`, because something became ready and the record is what became
+    ready. Nothing became ready here — no key, since a key names an
+    attachment; no tag, since no waitable fired; no payload, since there
+    is no value — so a revocation writes the STATUS REGISTER and nothing
+    else, and the woken `wait` returns with its buffer exactly as it left
+    it. Said as the pair: a delivery copies out and answers `Ok`; a
+    revocation answers `Revoked` and copies nothing.
+  - **THE WALK IS THE WHOLE LIST, not the pop a readiness does.** The
+    distribution rule above is about a ready HANDLE, of which there is
+    one; here the thing every parked thread is waiting on is what ceased
+    to exist, so every one of them is answered.
+  - **THE COUNT IS THE GATE, NOT THE RELEASE.** A release with a minted
+    sibling still live frees nothing and wakes nobody — that is the
+    §2 reference ledger unchanged, and it is the difference between
+    revocation and any-release.
+  It supersedes M3's recorded "legal-but-doomed" stance, under which such
+  a thread stayed `Blocked` forever for the deadlock report to name
+  (design 7's As-built finding 2, which carries the rider). The husk
+  alternative — count a parked thread as a reference so the Waiter never
+  reaches zero — was weighed and REJECTED: it keeps the thread alive and
+  makes the drop silent, turning an error a program can handle into a
+  hang somebody has to infer. **THIS IS THE PEER-GONE DOCTRINE'S FIRST
+  INSTANCE, and the doctrine is the contract: NOTHING PARKED CAN BE
+  SILENTLY DOOMED** — every "what you are waiting for can no longer
+  happen" is a delivered wake carrying a distinguishable status, never a
+  strand. Its other two instances are M4's and are specified in
+  `designs/010`: the ratified one-shot reply pair (§2.1's `PeerClosed`,
+  both directions) and a connection endpoint reaching zero references
+  (that sketch's D-1). Terminal levels follow design 8's precedent —
+  attaching after the fact still wakes, and nothing un-closes. The
+  deadlock predicate gained no arm: the wake is synchronous inside the
+  syscall that dropped the last reference, so there is no idle-and-doomed
+  state for it to see.
 - **Copy-out is checked, and it is one door.** This is the first place the
   kernel writes a process's memory. The destination must be word-aligned
   and inside the process's writable grant; one that is not TERMINATES the
@@ -1738,8 +1778,26 @@ event-driven EDGE of a process gets a second, distinct construct:
     `ProcessOp.PipeCreate` on its own Process right; and NOTHING PARKED CAN
     BE SILENTLY DOOMED — every "what you are waiting for can no longer
     happen" is a delivered wake with a distinguishable status
-    (`SosStatus.Revoked`, `PeerClosed`), which its unit 0 lands ahead of the
-    pipes themselves by making a freed Waiter wake its parked threads.
+    (`SosStatus.Revoked`, `PeerClosed`), whose unit 0 has LANDED ahead of the
+    pipes themselves (the entry below).
+  - ~~**A parked thread whose Waiter dies**~~ **BUILT M4 UNIT 0 (sawos design
+    12)**, and it is the doctrine above arriving before anything that needs
+    it. `free_object`'s Waiter arm gained a second last rite: reaching zero
+    references now WAKES every thread on the blocked list with the new
+    `SosStatus.Revoked`, where M3 left it `Blocked` forever and recorded the
+    strand as legal-but-doomed (design 7's As-built finding 2, which the
+    ruling answers "wake, don't count"). **NO RECORD IS WRITTEN** — a
+    delivery copies out then answers `Ok`, a revocation answers `Revoked` and
+    copies nothing, because nothing became ready — which is also why the wake
+    lives beside the free rather than in the delivery module: it touches no
+    process memory, so it needs neither the copy door nor its altitude. THE
+    COUNT IS THE GATE, NOT THE RELEASE (a minted sibling still live frees
+    nothing and wakes nobody), and the walk is the WHOLE blocked list rather
+    than the pop a readiness does. The husk alternative was weighed and
+    rejected; the deadlock predicate gained no arm; the typed surface gained
+    none either, since `Waiter.wait` already answers
+    `Result<WaitResult, SosStatus>`. One harness row per profile
+    (`waiter-revoked`), 160 runs.
   - ~~**Handle close and generations**~~ **THE LIFECYCLE TIER IS BUILT**
     (§3; sawos design 3, M3 unit 2.75). Three mechanisms landed together
     because each alone is broken — mint-per-call without release is a leak

@@ -301,6 +301,19 @@ CHILD_SHARE_PKG = os.path.join(TESTS_DIR, "child-share")
 MAP_EXEC_GATED_PKG = os.path.join(TESTS_DIR, "map-exec-gated")
 MAP_WX_REFUSED_PKG = os.path.join(TESTS_DIR, "map-wx-refused")
 
+# sawos design 12 (M4 unit 0): waiter revocation. ONE root server, and one is
+# the whole unit — the three claims it makes (a revocation is delivered, the
+# walk is the whole blocked list, the COUNT gates it rather than the release)
+# are one story about one release, and splitting them would need the same three
+# threads on the same one Waiter in each image.
+#
+# IT REACHES THE C ALTITUDE, and that is forced rather than chosen:
+# the count claim needs TWO NAMES for one Waiter, and the typed `sos` surface
+# publishes `mint` on `System` and `Memory` alone while a `Waiter` keeps its
+# handle word private. So the reference arithmetic is written where a handle IS
+# a word, which is `handle-remint`'s own stated reason for living down there.
+WAITER_REVOKED_PKG = os.path.join(TESTS_DIR, "waiter-revoked")
+
 CLOCK_BASICS_PKG = os.path.join(TESTS_DIR, "clock-basics")
 TIMER_ONESHOT_PKG = os.path.join(TESTS_DIR, "timer-oneshot")
 TIMER_INTERVAL_PKG = os.path.join(TESTS_DIR, "timer-interval")
@@ -2754,6 +2767,59 @@ TEST_CASES = [
                        "timers={zero} process={zero}"],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
+    },
+    # =========================================================================
+    # M4 unit 0 — waiter revocation (sawos design 12)
+    # =========================================================================
+    {
+        # **NOTHING PARKED CAN BE SILENTLY DOOMED** — the peer-gone doctrine's
+        # first instance (`designs/010` rulings 1 and 2). Through M3, releasing
+        # the last handle to a Waiter a sibling thread was parked on left that
+        # thread `Blocked` forever, recorded at the free arm as legal-but-doomed.
+        # It wakes now, with a status that names what happened.
+        #
+        # THREE CLAIMS IN ONE ORDERED TRANSCRIPT, and the ORDER is what carries
+        # two of them. Nothing in this image can move the processor except a
+        # thread giving it up — the kernel booting a root server arms no timer,
+        # and `start` only makes a thread runnable — so:
+        #
+        #   both `parking` lines            the two threads really are on ONE
+        #                                   Waiter's blocked list
+        #   `sibling released, nobody woke` printed AFTER a yield that offered
+        #                                   both workers the processor, so its
+        #                                   position IS the claim that the COUNT
+        #                                   gates the revocation and not the
+        #                                   release: 2 -> 1 frees nothing
+        #   two `woke` lines, one release   the walk is the WHOLE list, not the
+        #                                   pop a readiness does (§2.2's
+        #                                   distribution, which `event-wake`
+        #                                   proves on the other side)
+        #
+        # `b` before `a` is the blocked list being a stack — `block_on_wait`
+        # pushes at the head — which this transcript happens to show and nothing
+        # promises.
+        #
+        # THE STATUS IS NAMED, NOT NUMBERED. The program decodes the raw word
+        # through `SosStatus.from(raw:)`, so the words on the console are the
+        # ABI enum's own `describe()` and a case added without a describe arm
+        # would not compile.
+        #
+        # `waiters={zero}` in the teardown is the other half of "zero frees,
+        # synchronously": the slab sweep found nothing left, because the release
+        # freed it.
+        "name": "waiter_revoked",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": WAITER_REVOKED_PKG,
+        "expect_out": ["{banner}",
+                       "SOS revoked: a parking",
+                       "SOS revoked: b parking",
+                       "SOS revoked: sibling released, nobody woke",
+                       "SOS revoked: b woke: what this call was waiting for is gone",
+                       "SOS revoked: a woke: what this call was waiting for is gone",
+                       "SOS revoked: joined a=41 b=42",
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero}"],
+        "expect_clean_exit": True,
     },
 ]
 

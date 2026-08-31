@@ -1,0 +1,359 @@
+// SOS M4 unit 0: A FREED WAITER WAKES WHAT IS PARKED ON IT (sawos design 12;
+// `designs/010` rulings 1 and 2; spec §2.2).
+//
+// **THE PEER-GONE DOCTRINE'S FIRST INSTANCE: NOTHING PARKED CAN BE SILENTLY
+// DOOMED.** Through M3, releasing the last handle to a Waiter a sibling thread
+// was parked on left that thread `Blocked` forever — recorded at the free arm
+// as "legal-but-doomed" and left for the deadlock report to name. It now WAKES,
+// with a status that says what happened.
+//
+// The transcript is read as an ORDER, and every line rules something out:
+//
+//   SOS revoked: a parking
+//   SOS revoked: b parking                <- both are on the blocked list now
+//   SOS revoked: sibling released, nobody woke
+//   SOS revoked: b woke: what this call was waiting for is gone
+//   SOS revoked: a woke: what this call was waiting for is gone
+//   SOS revoked: joined a=41 b=42
+//
+// THREE CLAIMS, one image:
+//
+//   1. **A REVOCATION IS DELIVERED.** The last release wakes a parked `wait`
+//      and answers `SosStatus.Revoked` in its status register. Nothing else in
+//      this image can move the processor — the kernel booting a root server
+//      arms no timer, and `start` only makes a thread runnable — so the two
+//      `woke` lines exist at all only because the release put those threads
+//      back on the ready queue.
+//   2. **THE WALK IS THE WHOLE LIST, NOT A POP.** Both parked threads wake off
+//      ONE release. A readiness feeds one waiter (§2.2's distribution, which
+//      `event-wake` proves); a revocation answers everybody, because what they
+//      were all waiting on is what ceased to exist. They come out in reverse
+//      parking order because `block_on_wait` pushes at the head — an
+//      implementation fact this transcript happens to show, not a contract.
+//   3. **THE COUNT IS THE GATE, NOT THE RELEASE.** The `sibling released`
+//      line is printed AFTER a yield that gave both workers the processor, so
+//      its position in the transcript is the claim: releasing one of two names
+//      for the Waiter freed nothing and woke nobody. If a release rather than
+//      a zero count were what revoked, the two `woke` lines would sit above
+//      this one and the ordered oracle would say so.
+//
+// **NO RECORD IS WRITTEN ON THAT PATH.** A delivery copies a wait record into
+// the caller's memory and then answers `Ok`; a revocation answers `Revoked` and
+// copies nothing — there is no key, no tag and no payload, because nothing
+// became ready. The workers' record buffers are never read here for exactly
+// that reason.
+//
+// **IT GOES THROUGH THE C ALTITUDE, and that is forced rather than chosen.**
+// Claim 3 needs TWO NAMES FOR ONE WAITER, and the typed `sos` surface cannot
+// spell one: `mint` is published on `System` and on `Memory` — the two kinds a
+// launcher assembles keep masks for — and a `Waiter` wrapper holds its handle
+// word privately, by the no-forged-handles rule. So the reference arithmetic is
+// written where a handle IS a word, which is `handle-remint`'s own stated
+// reason for living at this floor. What the typed layer would add is the
+// decode, and this file does that half itself: the status comes back as a
+// number and is turned into a `SosStatus` through the same `from(raw:)` the
+// `sos` module's `checked` uses, so the name in the transcript is the enum's
+// and not this program's.
+//
+// EVERY THREAD ENTERS AT `_start` and works out which it is from the parked
+// boot handle, for the reason `thread-basics` gives (DF-178c: Saw cannot name a
+// function's address, so `thread_create` has no entry to be handed).
+
+// `Process` IS IMPORTED BY NAME AND HAS TO BE, though nothing here writes the
+// word: without it `proc.thread_create(stack_top:, arg:)` does not resolve —
+// the compiler binds only the FIRST member of that method's overload set and
+// reports "missing argument for parameter `entry`" at the label. See SL-11 in
+// `designs/todo.md`; every other root server in the tree imports the type
+// anyway, which is why the tree had not met it.
+import sos.{System, Process, SosStatus, ALL_RIGHTS,
+            sos_system_process_self, sos_process_waiter_create,
+            sos_waiter_wait, sos_handle_mint, sos_handle_release}
+
+/// The boot handle, parked for the workers — and the witness that says which
+/// thread `_start` is running as (handle 0 names nothing, so a parked one is
+/// never 0).
+unsafe static var BOOT_HANDLE: UInt = 0
+
+/// The Waiter's handle WORD, parked for the workers to park ON.
+///
+/// A WORD AND NOT A WRAPPER, unlike `event-wake`'s parked address. There is
+/// nothing to own here: the initial thread holds the two handles and this is
+/// the number a worker passes to the raw wait. It goes STALE the moment the
+/// last release lands, which is the same moment the workers stop needing it.
+unsafe static var SHARED_WAITER: UInt = 0
+
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_A: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_B: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+static BYTES_PER_WORD: UInt = 8
+/// Every profile wants a 16-byte-aligned stack pointer; one of them checks.
+static STACK_ALIGN: UInt = 16
+
+/// The wait record's buffer, in words.
+///
+/// FOUR, WHICH IS AN OVER-PROVISION, and the extra word is the vDSO wall doing
+/// its job rather than sloppiness: the record's published size lives in
+/// `sosabi`, which is kernel-internal and which this process neither imports
+/// nor could. §2.2 checks a copy-out capacity for AT LEAST the record — a
+/// capacity may be over-provisioned, where an inbound length may not — so a
+/// caller that knows only "three words, and it will not grow this week" says
+/// four and is correct at any record size up to it.
+///
+/// Nothing is ever read out of it. That IS the claim: a revocation writes no
+/// record.
+static WAIT_BUF_WORDS: Int = 4
+
+/// The status word a successful raw op answers with (`SosStatus.Ok`). Spelled
+/// as a number because this file works at the C altitude, where a status is
+/// one.
+static STATUS_OK: UInt = 0
+
+/// What `NO_HANDLE` is at this altitude: handle 0 names nothing, which the
+/// object table reserves.
+static NO_WORD: UInt = 0
+
+static ROLE_A: UInt = 1
+static ROLE_B: UInt = 2
+static EXIT_A: UInt = 41
+static EXIT_B: UInt = 42
+
+static NO_VALUE: UInt = 0xDEAD
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+// -----------------------------------------------------------------------------
+// The parked statics
+// -----------------------------------------------------------------------------
+
+func park_boot_handle(word: UInt) unsafe {
+    BOOT_HANDLE = word
+}
+
+func parked_boot_handle() unsafe -> UInt {
+    BOOT_HANDLE
+}
+
+func park_waiter(word: UInt) unsafe {
+    SHARED_WAITER = word
+}
+
+func parked_waiter() unsafe -> UInt {
+    SHARED_WAITER
+}
+
+/// The highest 16-aligned address inside a worker stack reservation. Stacks
+/// grow down, so this is where the thread starts.
+func stack_top(base: UInt) -> UInt {
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func stack_a_top() unsafe -> UInt {
+    stack_top(((&var STACK_A) as UnsafePointer<UInt64>) as UInt)
+}
+
+func stack_b_top() unsafe -> UInt {
+    stack_top(((&var STACK_B) as UnsafePointer<UInt64>) as UInt)
+}
+
+// -----------------------------------------------------------------------------
+// The C altitude: four calls, each confined to its own small `unsafe` helper
+// (design 136 — the pointer never leaves the function that makes it)
+// -----------------------------------------------------------------------------
+
+/// A second Process handle onto this process, as a WORD. `process_self` mints
+/// per call (sawos design 3 D-4), so this is a capability instance of its own
+/// and the typed `Process` the initial thread also holds is a different one.
+func process_word(boot_handle: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_system_process_self(boot_handle,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+/// A Waiter, as a WORD. Its first reference is the count rather than a change
+/// to one, so this handle is reference 1.
+func make_waiter(process: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_process_waiter_create(process,
+                                           (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+/// A SIBLING handle onto whatever `source` names, with the same rights —
+/// reference 2, and the whole reason this file is at the C altitude.
+///
+/// `ALL_RIGHTS` is the keep mask that narrows nothing. Nothing here wants an
+/// attenuated Waiter; what it wants is a SECOND NAME, so the mask says so.
+func mint_sibling(source: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_handle_mint(source, ALL_RIGHTS as UInt,
+                                 (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+/// Park on the Waiter `handle` names, and answer the raw status the wait came
+/// back with.
+///
+/// THE BUFFER IS THIS FRAME'S — the worker's own stack, inside the process's
+/// writable memory, which is what §2.2's copy-out check wants — and it is never
+/// read. A revocation writes no record into it, which is the whole point; a
+/// delivery would, and this program never produces one.
+func park_on_waiter(handle: UInt) unsafe -> UInt {
+    var buf: [UInt; WAIT_BUF_WORDS] = [0; WAIT_BUF_WORDS]
+    sos_waiter_wait(handle, (&var buf) as UnsafePointer<UInt>,
+                    (WAIT_BUF_WORDS * sizeof<UInt>()) as UInt)
+}
+
+/// A raw status word as a NAME, or `None` when this build cannot name it.
+///
+/// It is the narrowing `sos`'s own `checked` performs, spelled out because this
+/// file works at the C altitude: `a0` is register-wide, the enum is byte-wide
+/// (its width is ABI), and an `as UInt8` on a value above 255 would PANIC over a
+/// number the caller did not choose. The kernel is compiled from the same table
+/// this reads, so both arms are unreachable in a matched build and cost a
+/// compare.
+func named_status(raw: UInt) -> SosStatus? {
+    if raw > (UInt8.max as UInt) {
+        return None
+    }
+    SosStatus.from(raw: raw as UInt8)
+}
+
+// -----------------------------------------------------------------------------
+// The threads
+// -----------------------------------------------------------------------------
+
+/// A worker: say it is parking, park, and report what woke it.
+///
+/// It derives its own authority off the parked boot handle rather than being
+/// handed any — `System(boot_handle:)` -> `process_self()` -> `thread_self()`.
+///
+/// AFTER THE WAKE THE WAITER IS GONE, and this body is written to match: the
+/// parked word named an object that no longer exists, so nothing here touches
+/// it again. Using it would be the ordinary `BadHandle` fault a released
+/// handle's word always gets.
+func worker(role: UInt) {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch {
+        return
+    }
+    let me = try proc.thread_self() catch {
+        return
+    }
+
+    let _ = system.debug_print(if role == ROLE_A { "SOS revoked: a parking\n" }
+                               else { "SOS revoked: b parking\n" })
+
+    let raw = park_on_waiter(parked_waiter())
+    let tag = if role == ROLE_A { "a" } else { "b" }
+    guard let status = named_status(raw) else {
+        print("SOS revoked: {} woke with status {}, which this build cannot name\n",
+              tag, raw)
+        let _ = me.exit(EXIT_FAILED)
+        return
+    }
+    print("SOS revoked: {} woke: {}\n", tag, status)
+
+    let _ = me.exit(if role == ROLE_A { EXIT_A } else { EXIT_B })
+}
+
+/// The initial thread: make the Waiter and a sibling name for it, park two
+/// workers on it, then drop the names one at a time.
+func initial(boot_handle: UInt) {
+    // Parked FIRST: it is what tells a worker's entry that it is a worker, and
+    // it is the seed the worker derives its own objects from.
+    park_boot_handle(boot_handle)
+
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        print("SOS revoked: no process handle: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let me = try proc.thread_self() catch {
+        print("SOS revoked: no thread handle: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // TWO NAMES FOR ONE WAITER. The mint is what makes claim 3 sayable: a
+    // sibling is a second REFERENCE (sawos design 7 D-1), so the object now
+    // survives one release and not two.
+    let waiter = make_waiter(process_word(boot_handle))
+    let sibling = mint_sibling(waiter)
+    if waiter == NO_WORD || sibling == NO_WORD {
+        let _ = system.debug_print("SOS revoked: could not make the pair\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    park_waiter(waiter)
+
+    let a = try proc.thread_create(stack_top: stack_a_top(), arg: ROLE_A) catch {
+        print("SOS revoked: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let b = try proc.thread_create(stack_top: stack_b_top(), arg: ROLE_B) catch {
+        print("SOS revoked: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = a.start()
+    let _ = b.start()
+
+    // `start` makes a thread RUNNABLE; it does not switch. This yield is the
+    // only thing in the image that can hand the processor over, so after it
+    // both workers have run, printed and PARKED — and this thread is running
+    // again precisely because they are the only two things that could have
+    // taken it and both gave it back by blocking.
+    let _ = me.yield_now()
+
+    // ONE: the MINTED SIBLING. Two names, one object, so this takes the count
+    // from 2 to 1 — it frees nothing, runs no last rites, and wakes nobody.
+    let _ = sos_handle_release(sibling)
+
+    // The yield is what turns that into a CLAIM rather than an assertion. If
+    // the release had revoked, the workers would be runnable now and would
+    // print before this line does. They are still blocked, so nothing runs but
+    // this thread and the line lands where the oracle expects it.
+    let _ = me.yield_now()
+    let _ = system.debug_print("SOS revoked: sibling released, nobody woke\n")
+
+    // TWO: the LAST name. The count reaches zero inside this very syscall
+    // (sawos design 7 D-1: zero frees, synchronously), the Waiter's last rites
+    // run, and both parked threads are answered `Revoked` and pushed onto the
+    // ready queue. The wake only QUEUES — this thread keeps the processor — so
+    // the joins below are what actually let them speak.
+    let _ = sos_handle_release(waiter)
+
+    let ra = try a.join() catch { NO_VALUE }
+    let rb = try b.join() catch { NO_VALUE }
+    print("SOS revoked: joined a={} b={}\n", ra, rb)
+
+    // Process exit, not System shutdown: this is the object the op belongs to
+    // (spec §5.7). The teardown line that follows reports `waiters=0`, which is
+    // the other half of "the free happened at the release" — the sweep found
+    // nothing left to free.
+    let _ = proc.exit(EXIT_OK)
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        worker(arg)
+    }
+}

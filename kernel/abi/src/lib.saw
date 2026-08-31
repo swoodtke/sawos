@@ -2314,12 +2314,37 @@ public enum BootHandleKind: UInt {
 /// and as its own peers release — so it is precisely the thing a caller could
 /// not have checked. That is the same carve-out `NoResource` sits in, which is
 /// why the two are neighbours here rather than one being a `FaultReason`.
+///
+/// **`Revoked` (8) IS THE PEER-GONE DOCTRINE'S ONE WORD** (sawos design 12, M4
+/// unit 0; `designs/010` rulings 1 and 2). It answers a call that was PARKED on
+/// something which can no longer happen: today the one site is a `Waiter.Wait`
+/// whose Waiter reached zero references while the caller was on its blocked
+/// list, and the doctrine it lands is that nothing parked is ever silently
+/// doomed — every "what you are waiting for is gone" is a DELIVERED WAKE
+/// carrying a distinguishable status, never a strand for the deadlock report to
+/// name later.
+///
+/// IT IS A STATUS AND NOT A FAULT, and the cut is the faults ruling's own. The
+/// mistake belongs to whoever released the handle, and this word is delivered to
+/// somebody ELSE — a sibling thread that made no error and cannot be terminated
+/// for one it did not make. A parked caller is also in the one position from
+/// which nothing could have been checked in advance: the answer changed after
+/// the call was made.
+///
+/// **IT IS ONE WORD FOR EVERY REVOCATION SITE, deliberately** (ruling 1's own
+/// text), which is why it is not named for the Waiter. M4's later rungs reach
+/// the same doctrine with their own vocabulary — a pipe's peer closing is
+/// `PeerClosed`, because "the far end went away" is information a protocol acts
+/// on — and what belongs here is the case where the OBJECT BEING WAITED ON
+/// stopped existing under the waiter. A caller distinguishes the two, which is
+/// the whole reason neither is folded into the other.
 public enum SosStatus: UInt8 {
     case Ok = 0,
     case NoResource = 4,
     case BadImage = 5,
     case Drained = 6,
     case QuotaExceeded = 7,
+    case Revoked = 8,
     case Unknown = 255,
 }
 
@@ -2332,6 +2357,7 @@ extension SosStatus {
             case BadImage -> "not a loadable process image",
             case Drained -> "no more boot handles",
             case QuotaExceeded -> "this process is at its quota",
+            case Revoked -> "what this call was waiting for is gone",
             case Unknown -> "unknown status",
         }
     }

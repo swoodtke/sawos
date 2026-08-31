@@ -11,9 +11,10 @@
 //!
 //! That is a MATRIX rather than a funnel because the answers genuinely differ
 //! per kind — an Interrupt's last rites mask a device line, a Timer's
-//! reprogram the comparator, a Waiter's detach a list, a Mapping's deliberately
-//! leave a protection row installed — and it is written as three functions in
-//! one place so the matrix is READABLE AS ONE. A kind added to `ObjType` fails
+//! reprogram the comparator, a Waiter's detach a list AND WAKE WHAT IS PARKED
+//! ON IT (sawos design 12), a Mapping's deliberately leave a protection row
+//! installed — and it is written as three functions in one place so the matrix
+//! is READABLE AS ONE. A kind added to `ObjType` fails
 //! all three to compile until somebody says what references it, which is the
 //! property a `_` arm anywhere here would destroy.
 //!
@@ -53,8 +54,10 @@
 //! know — comes through here.
 
 import hal
-import sosabi.{EventMode, ObjType}
+import sosabi.{EventMode, ObjType, SosStatus}
 import kcore.diag.{fatal_kernel}
+import kcore.result.{op_status, write_result}
+import kcore.threads.{THREADS, ThreadState, frame_slot, ready_push}
 import kcore.objects.{
     IOMEMORIES,
     IoMemorySlot,
@@ -210,6 +213,57 @@ public(package) func unref_teardown(kind: ObjType, slot: Int) unsafe {
     let _ = drop_reference(kind, slot)
 }
 
+/// **REVOCATION: WAKE EVERY THREAD PARKED ON WAITER `w`, WITH `Revoked`**
+/// (sawos design 12, M4 unit 0; `designs/010` ruling 1). The second of the
+/// Waiter's two last rites: the cascade above it releases what this Waiter was
+/// WATCHING, and this answers everybody who was watching THROUGH it.
+///
+/// **NO RECORD IS WRITTEN, and that is the whole difference from a delivery.**
+/// `wake_one_waiter` answers a parked `Wait` by copying a wait record into the
+/// caller's memory and THEN writing `Ok` into its frame, because something
+/// became ready and the record is what became ready. Nothing became ready here:
+/// there is no key, because the key names an attachment and the attachment list
+/// is going; no tag, because no waitable fired; no payload, because there is no
+/// value. So a revocation writes the STATUS REGISTER and nothing else, and the
+/// woken `wait()` returns `Err(Revoked)` with the caller's buffer exactly as it
+/// left it. Said as the pair it is: A DELIVERY COPIES OUT AND THEN ANSWERS `Ok`;
+/// A REVOCATION ANSWERS `Revoked` AND COPIES NOTHING.
+///
+/// **THAT IS ALSO WHY THIS LIVES HERE AND NOT IN `wake`.** Delivery sits above
+/// the process teardown because it goes through `copy_out` — writing a process's
+/// memory is what fixes its altitude — and `refs` sits below. A revocation
+/// touches no process memory, so it needs neither the copy door nor that
+/// altitude: it needs a frame's status word and the ready queue, both of which
+/// are `threads`', below this file. The property that makes it not-a-delivery is
+/// exactly the property that lets it live beside the free it belongs to.
+///
+/// **THE WALK IS THE WHOLE LIST, not a pop.** §2.2 lets several threads park on
+/// one Waiter, and a distribution is what a READINESS is — one ready handle
+/// feeds one waiter. A revocation is not a readiness: the thing every one of
+/// them is waiting on has ceased to exist, so every one of them is answered.
+///
+/// **IT IS PROCESS-BLIND, like every wake.** Whose threads are on the list is
+/// not this function's question — a Waiter handle can be minted, and a Waiter's
+/// blocked list is simply the threads that parked on it.
+///
+/// `wait_buf` is cleared because it is a promise this wake does not keep: it
+/// records where a record was going to go, and no record is going there.
+func revoke_blocked(w: Int) unsafe {
+    var cur = WAITERS[w].blocked
+    WAITERS[w].blocked = 0
+    while cur != 0 {
+        let slot = cur - 1
+        // Read the link BEFORE `ready_push` takes the field for the ready
+        // queue — a thread is on at most one list at a time, and this is the
+        // moment it changes lists.
+        cur = THREADS[slot].link
+        THREADS[slot].wait_buf = 0
+        write_result(frame_slot(slot), op_status(SosStatus.Revoked))
+        THREADS[slot].state = ThreadState.Runnable
+        ready_push(slot)
+    }
+}
+
 /// Give object `slot` of kind `kind` back to its slab, and run the kind's own
 /// last rites.
 ///
@@ -226,7 +280,11 @@ public(package) func unref_teardown(kind: ObjType, slot: Int) unsafe {
 ///     achieve before this unit.
 ///   - a TIMER REPROGRAMS THE COMPARATOR. A dropped armed deadline is one the
 ///     kernel would otherwise keep waking itself for with nobody left to tell.
-///   - a WAITER DETACHES ITS LIST, which is the one cascade in the system.
+///   - a WAITER DETACHES ITS LIST, which is the one cascade in the system —
+///     **AND WAKES WHAT IS PARKED ON IT** (sawos design 12, M4 unit 0). It is
+///     the one kind with two things to say, and they are said to opposite
+///     sides: the detach releases what this Waiter was WATCHING, the revocation
+///     answers everybody who was watching THROUGH it.
 ///
 /// And one kind has something deliberate NOT to do — see the `Mapping` arm.
 ///
@@ -258,14 +316,6 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
             // function. The list is walked whole rather than through
             // `detach_attachment`, because there is no list left to unlink
             // from: the Waiter is going.
-            //
-            // A THREAD STILL PARKED ON THIS WAITER IS STRANDED, and that is the
-            // release ruling's "legal-but-doomed" seen from one process's own
-            // inside: releasing the last handle to the Waiter a sibling thread
-            // is parked on is the same class of self-inflicted mistake as
-            // releasing your System handle. Nothing is corrupted — the parked
-            // thread simply never wakes, and the deadlock report is what names
-            // it.
             var cur = WAITERS[slot].attached
             while cur != 0 {
                 let a = cur - 1
@@ -279,7 +329,44 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
                 unref_waitable(watched, target)
                 cur = next
             }
+
+            // **AND EVERY THREAD PARKED ON IT IS WOKEN, WITH `Revoked`** (sawos
+            // design 12, M4 unit 0; `designs/010` rulings 1 and 2 — THE
+            // PEER-GONE DOCTRINE, of which this is the first instance).
+            // NOTHING PARKED CAN BE SILENTLY DOOMED: what these threads were
+            // waiting on has ceased to exist, so they are TOLD, in the status
+            // register of the very syscall that parked them, and
+            // `revoke_blocked`'s docstring carries the no-record contrast that
+            // makes this a revocation rather than a delivery.
+            //
+            // It supersedes the recorded "legal-but-doomed" stance this arm
+            // carried through M3 — a parked thread left `Blocked` forever for
+            // the deadlock report to name. The alternative the ruling weighed
+            // and REJECTED was a husk: count a parked thread as a reference so
+            // the Waiter never reaches zero. That keeps the thread alive and
+            // makes the drop SILENT, which turns an error a program can handle
+            // into a hang somebody has to infer.
+            //
+            // THE COUNT IS THE GATE, NOT THE RELEASE, and that distinction is
+            // what makes this revocation rather than any-release: a release
+            // with a minted sibling still live never reaches this function at
+            // all, so it frees nothing and wakes nobody. Only the LAST name
+            // going is the object ceasing to exist, and only that is news.
+            //
+            // It runs AFTER the cascade and BEFORE the slot clears, which is
+            // free of consequence in both directions — the cascade reads no
+            // thread and the wake reads no attachment — and reads in the order
+            // the arm is about: release what this Waiter held, answer who held
+            // it, then hand the slot back.
+            revoke_blocked(slot)
+
             let owner = WAITERS[slot].process
+            // A REUSED SLOT STARTS WITH AN EMPTY BLOCKED LIST, which is what
+            // this literal says and what keeps the next Waiter in this slot
+            // from inheriting anybody. It was the half of the old stranding
+            // paragraph that was about the SLOT rather than about the thread,
+            // and it survives the ruling intact — the wake above is what makes
+            // the list empty honestly rather than merely emptily.
             WAITERS[slot] = WaiterSlot(state: SlotState.Free, process: 0,
                                        attached: 0, blocked: 0, refs: 0)
             quota_credit(owner, QuotaKind.Waiter)

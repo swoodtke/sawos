@@ -508,6 +508,25 @@ arrangement.
    unit that wants it should rule on what a parked thread is WORTH to the
    count.
 
+   > **RIDER (answered Aug 30/31): WAKE, DON'T COUNT — and the finding
+   > above stands as written.** The user ruled on exactly the question
+   > its last sentence asks (`designs/010` ruling 1), and the answer is
+   > that a parked thread is worth NOTHING to the count and everything
+   > to the wake: `free_object`'s Waiter arm now walks `blocked` and
+   > answers every thread on it with the new `SosStatus.Revoked`, so the
+   > strand this finding recorded no longer exists. The husk the finding
+   > named as the alternative — a Waiter that never frees because a
+   > parked thread is worth 1 — was weighed and REJECTED for the reason
+   > the ruling gives: it keeps the thread alive and makes the drop
+   > SILENT, which turns an error a program can handle into a hang
+   > somebody has to infer, and it is a deviation from D-1's "zero frees"
+   > that still nothing needs. What survives from this finding is the
+   > half about the SLOT (a reused slot starts with an empty blocked
+   > list); what dies is the half about the THREAD. Built as M4 unit 0,
+   > `designs/012-waiter-revocation.md`, which also lands the PEER-GONE
+   > DOCTRINE this is the first instance of: nothing parked can be
+   > silently doomed.
+
 3. **`fatal_kernel` IS NOT `-> Never`**, so `install_row`'s assert arm
    still owes a `return` — design 6's finding 4 met at a second site,
    for a second function, and worked around the same way (a note at the

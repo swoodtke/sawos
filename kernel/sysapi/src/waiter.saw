@@ -197,6 +197,16 @@ extension Waiter {
     /// other axis and it is structural — a waitable attaches to at most one
     /// Waiter, so nobody else can be watching the object you are waiting on.
     ///
+    /// **A PARK CAN END IN `Err(SosStatus.Revoked)`** (sawos design 12, M4 unit
+    /// 0): if this Waiter's last handle is released while you are parked on it,
+    /// the kernel WAKES you with that status rather than leaving you blocked
+    /// forever — nothing parked is silently doomed. No record is written on
+    /// that path, so the buffer is untouched and there is nothing to decode;
+    /// the handle you called through is stale from that moment, because the
+    /// object it named is gone. It needs no new surface here: a revocation is a
+    /// status like any other, and `checked` turns it into the error channel
+    /// this method already answers with.
+    ///
     /// THE BUFFER IS THIS FRAME'S, and a caller never sees it. The kernel
     /// answers a wait by copying a record into the caller's own memory (it has
     /// no allocator and nowhere to put one that would outlive the call), so
