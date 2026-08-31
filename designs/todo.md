@@ -21,6 +21,14 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
+- M4 unit 1 — the pair [#10 rulings 2/3/6, #13 —
+  designs/013-the-pair.md, authored Aug 31]: PipeInlet/PipeOutlet as
+  two counted kinds over one connection slab (two ref columns, both-
+  zero frees), ProcessOp.PipeCreate via copy-out record, Post/Take
+  data-only polling, PeerClosed=9 + WouldBlock=10, ring of
+  PIPE_INFLIGHT × PIPE_BODY_BYTES slots as kcore.limits statics,
+  give/boot-drain for both kinds. Everything polls; nothing parks
+
 ## [BACKLOG] — filed, not scheduled
 
 - M4 scoping — pipes [#10 — designs/010-m4-pipes.md, DRAFT Aug 30,
