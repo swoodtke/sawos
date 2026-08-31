@@ -21,26 +21,6 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
-- M4 unit 0 — waiter revocation [#10 ruling 1, #7 finding 2, #12 —
-  designs/012-waiter-revocation.md, authored Aug 31]: SosStatus.Revoked
-  appended; free_object's Waiter arm walks `blocked` and wakes every
-  parked thread with it, no record written; the peer-gone doctrine's
-  first instance. Existing rows unmoved; new case rows only.
-  **CLOSED Aug 31 — LANDED AS BRIEFED.** `SosStatus.Revoked = 8`
-  appended to `sosabi` with a `describe()` arm ("what this call was
-  waiting for is gone"); `kcore.refs` gained `revoke_blocked`, called
-  from `free_object`'s Waiter arm between the attachment cascade and the
-  slot clear, writing ONLY the status register (the no-record contrast is
-  written at the function and at §2.2). The legal-but-doomed paragraph is
-  struck and design 7's As-built finding 2 carries a RIDER (the finding
-  itself untouched); the reused-slot sentence survives, moved onto the
-  literal it describes. Sysapi took no new surface — one docstring
-  paragraph on `Waiter.wait`. One harness case, `waiter-revoked`, three
-  threads on one Waiter proving all three claims (a revocation is
-  delivered; the walk is the whole blocked list; the COUNT gates it, not
-  the release). Gate 160/160 across both profiles with every pre-existing
-  row byte-identical. One language deficiency met and filed: SL-11
-
 ## [BACKLOG] — filed, not scheduled
 
 - M4 scoping — pipes [#10 — designs/010-m4-pipes.md, DRAFT Aug 30,
