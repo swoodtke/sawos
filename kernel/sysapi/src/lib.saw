@@ -95,6 +95,14 @@
 //!   `memory`     Memory — RAM authority, and `split`
 //!   `iomemory`   IoMemory — device authority, and `carve`
 //!   `mapping`    Mapping — one installed protection row, and `unmap`
+//!   `pipe`       PipeInlet + PipeOutlet — the two ends of a connection, and
+//!                `post` / `take`. TWO TYPES IN ONE FILE, alone among these,
+//!                because the pair is one object and every sentence about
+//!                either explains it by contrast with the other. Nothing forced
+//!                it: neither type names the other, so the module graph was
+//!                indifferent and READABILITY chose — which is the placement
+//!                rule that became available when sawlang 0.2.0 made extension
+//!                lookup follow `public import` (SL-7)
 //!   `thread`     Thread
 //!   `event`      Event
 //!   `interrupt`  Interrupt
@@ -210,6 +218,26 @@ public import sosabi.{SystemRight}
 // a capability the caller already holds, not an index the kernel trusts.
 public import sosabi.{MemoryRight}
 
+// **AND THE PAIR'S THREE, WHICH M4 UNIT 1 MADE PUBLIC** (sawos design 13). The
+// same rule a third and fourth time — a rights enum joins this list with the
+// funnel that needs it, and `PipeInlet.mint(rights:)` / `PipeOutlet.mint(rights:)`
+// are callers assembling a keep mask out of these bits. That is where a
+// launcher's pipe policy is written: an endpoint's default set has to be
+// permissive (attenuation is monotonic, so a bit not minted at creation could
+// never appear later), so "this child may post and may not hand the end on" is a
+// mask at the mint and nothing else.
+//
+// `PIPE_BODY_BYTES` is here for a different reason and it is the plainest one in
+// the file: it is a SIZE THE TWO HALVES MUST AGREE ON. A `post` may not name
+// more, a `take` must supply at least that much, and the typed methods take a
+// `&[UInt8; PIPE_BODY_BYTES]` — so a caller cannot even declare the buffer
+// without the number. It publishes no op and gates no authority; it is the same
+// kind of thing `wait_record_bytes()` is, and it is the one build define of the
+// unit that crosses the boundary (the staging ring's DEPTH stays in
+// `kcore.limits`, because a caller meeting a full ring is told `WouldBlock`
+// without ever needing to know how deep it was).
+public import sosabi.{PipeInletRight, PipeOutletRight, PIPE_BODY_BYTES}
+
 // Everything else `sosabi` holds is KERNEL-INTERNAL and stays that way: the op
 // numbers, the rights, the handle aliases, the wait record's wire layout. The
 // modules below import what each of them needs directly, and every one of those
@@ -241,10 +269,13 @@ public import sos.floor.{ALL_RIGHTS, sos_handle_mint, sos_handle_release,
                          sos_timer_arm, sos_timer_disarm,
                          sos_memory_split, sos_memory_map,
                          sos_iomemory_carve, sos_iomemory_map,
-                         sos_mapping_unmap}
+                         sos_mapping_unmap,
+                         sos_process_pipe_create, sos_pipe_inlet_post,
+                         sos_pipe_outlet_take}
 public import sos.memory.{Memory}
 public import sos.iomemory.{IoMemory}
 public import sos.mapping.{Mapping}
+public import sos.pipe.{PipeInlet, PipeOutlet}
 public import sos.thread.{Thread}
 public import sos.event.{Event}
 public import sos.interrupt.{Interrupt}

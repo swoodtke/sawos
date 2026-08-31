@@ -27,7 +27,57 @@ entry below or the brief that carries it, never restating either.
   zero frees), ProcessOp.PipeCreate via copy-out record, Post/Take
   data-only polling, PeerClosed=9 + WouldBlock=10, ring of
   PIPE_INFLIGHT × PIPE_BODY_BYTES slots as kcore.limits statics,
-  give/boot-drain for both kinds. Everything polls; nothing parks
+  give/boot-drain for both kinds. Everything polls; nothing parks.
+  **CLOSED Aug 31 — LANDED.** Suite 170/170 (85 cases/arch, both
+  profiles) from 160/160; whole-transcript diff bucketed in the
+  design's As-built, and every one of the 160 pre-existing case rows is
+  BYTE-IDENTICAL (the only movement in them is the `[n/80]` -> `[n/85]`
+  denominator, plus image SIZES growing because every image links the
+  `sos` facade and the facade now compiles `sos.pipe`). VALIDATED ON
+  sawlang 0.2.1, which landed in the toolchain checkout before the
+  first build, so baseline and gate used one compiler; the tree's pin
+  still reads 0.2.0 and the bump is the lead's. What
+  landed: two `ObjType` kinds over one `PIPES` slab row with two
+  reference columns (the columns ARE the peer-gone state — a column
+  can only fall, so no flag beside them), the staging ring as separate
+  flat `.bss` storage rather than a slot field (2 KiB per connection
+  would otherwise be a memset per slot write), `ProcessOp.PipeCreate`
+  on a new `ProcessRight.PipeCreate` in the one Process default set,
+  `Post`/`Take` through the existing copy-in/copy-out doors,
+  `PeerClosed = 9` + `WouldBlock = 10`, `QuotaKind.Pipe` (creator-pays,
+  ONE charge for the pair, credited at both-zero), give + boot drain
+  for both kinds, typed `NoCopy` wrappers with `post`/`take`/`mint`,
+  and the two `NotWaitable` arms unit 3 removes. FIVE cases across six
+  packages: `pipe-basics`, `pipe-peer-gone`, `pipe-child` (+ the
+  `child-post` child package), `pipe-no-post`, `pipe-oversized`.
+  THREE DEVIATIONS, argued in the As-built: `PIPE_BODY_BYTES` lives in
+  `sosabi` rather than `kcore.limits` (it is a size the two halves must
+  agree on — `wait_record_bytes()`'s own reason — while `PIPE_INFLIGHT`
+  is a slab dimension and stayed); no `pipe-not-waitable` case (the
+  typed `Waiter.add` has no overload for either kind and the wrappers'
+  words are package-private, so the refusal is a COMPILE error, which
+  is why none of `NotWaitable`'s seven existing arms is tested either);
+  and `Post` answers `Result<Bool, _>` so the would-block stays out of
+  the error channel on both ops.
+  FINDINGS carried forward, each written up in the design's As-built:
+  (1) **CLOSE IS NOT NEEDED** — §11 has promised a `close` op "with
+  Pipe in M4" since M3 unit 2.75, and closing an END is releasing the
+  last handle onto it, which IS the column reaching zero; a `close`
+  beside that would be a second route to one state, reachable with a
+  sibling still live. §11 amended to say so. (2) A `PIPES` row's
+  `process` field is the CHARGED process and the teardown sweep frees
+  by it, so a creator dying while a peer holds an end frees the slot
+  under that peer — the EXISTING Memory/IoMemory shape, unreachable
+  while root dies last, and slightly sharper for pipes because a stale
+  decrement onto a reused slot would also drop staged messages. The
+  honest fix is ownership transfer at `give`, which wants a ruling.
+  (3) `PipeCreate` mints into the process its HANDLE names and copies
+  out to the CALLER; identical for every call today, and a
+  cross-process create would hand back child-relative words exactly as
+  `ThreadCreate` through a child's handle already does — named, not
+  fixed, since it is the whole `*Create` family's receiver question.
+  No new [SAWLANG] entry: nothing in this unit wanted a language
+  feature that is not there, and SL-12's workaround held at every site
 
 ## [BACKLOG] — filed, not scheduled
 

@@ -1,0 +1,162 @@
+// SOS M4 unit 1: THE PEER-GONE DOCTRINE ON A CONNECTION (sawos design 13 D-2;
+// `designs/010` D-1 and ruling 2; spec §2.1).
+//
+// **NOTHING IS SILENTLY DOOMED, AND THE TWO DIRECTIONS ARE NOT SYMMETRIC.** A
+// side of a connection reaching zero references raises PEER-GONE on the other —
+// and what that MEANS differs by which side went, which is the whole of D-2's
+// zero-arms and the whole of this transcript:
+//
+//   THE OUTLET WENT. Nobody can ever take again, so a post has no future: it is
+//   refused at once with `PeerClosed`, and whatever was staged was dropped at
+//   the transition. There is nothing to drain, because draining needs an outlet.
+//
+//   THE INLET WENT. Nobody can ever post again — but everything ALREADY STAGED
+//   is still owed to the server, so `take` HANDS IT ALL OVER FIRST and only a
+//   drained ring answers `PeerClosed`. That is design 230's close-drains-first
+//   rule, and it is why a client exiting mid-conversation loses nothing.
+//
+// **AND IT IS TERMINAL.** The second take answers exactly what the first did:
+// nothing un-closes, because a reference column only ever falls and a column at
+// zero has no handle left to mint a new sender from. A caller may stop rather
+// than retry, which is the difference between this and `WouldBlock`.
+//
+// THE STATUSES ARE NAMED, NOT NUMBERED — the program prints the ABI enum's own
+// `describe()`, so a case added without a describe arm would not compile and a
+// renumbering of the wire table would not move this transcript.
+//
+// TWO CONNECTIONS, because the two arms genuinely need different histories: the
+// first is killed empty from the server side, the second is loaded and then
+// killed from the client side.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, SosStatus, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The two payload bytes the drain has to hand back, in this order.
+static FIRST_BYTE: UInt8 = 7
+static SECOND_BYTE: UInt8 = 8
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS peergone: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+
+    // =========================================================================
+    // ARM ONE — the SERVER end goes, and the client is told.
+    // =========================================================================
+    let first_pair = try proc.pipe_create() catch {
+        print("SOS peergone: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let (client, server) = move first_pair
+
+    // **DROP IS RELEASE, AND THAT IS HOW AN END IS CLOSED.** There is no typed
+    // `close()` — early release is dropping the value, which is one concept for
+    // the reader instead of two ways to say it (design 3 D-5). This is the LAST
+    // outlet handle onto the connection, so the column reaches zero and the
+    // far end's answer changes inside this very statement.
+    let _ = move server
+    let _ = system.debug_print("SOS peergone: outlet dropped\n")
+
+    msg[0] = FIRST_BYTE
+    match client.post(body: &msg, len: 1) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS peergone: post survived a dead outlet\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        case Err(e) -> { print("SOS peergone: post says {}\n", e) },
+    }
+
+    // =========================================================================
+    // ARM TWO — the CLIENT end goes, and the server drains BEFORE it is told.
+    // =========================================================================
+    let second_pair = try proc.pipe_create() catch {
+        print("SOS peergone: second create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let (sender, receiver) = move second_pair
+
+    msg[0] = FIRST_BYTE
+    let one = try sender.post(body: &msg, len: 1) catch {
+        print("SOS peergone: stage 1 failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    msg[0] = SECOND_BYTE
+    let two = try sender.post(body: &msg, len: 1) catch {
+        print("SOS peergone: stage 2 failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    if not (one && two) {
+        let _ = system.debug_print("SOS peergone: fresh ring refused a post\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS peergone: staged 2\n")
+
+    // The sender goes away with its messages still in flight. A design that
+    // unwound the ring here would lose both of them, silently.
+    let _ = move sender
+    let _ = system.debug_print("SOS peergone: inlet dropped\n")
+
+    let first = try receiver.take(into: &var buf) catch {
+        print("SOS peergone: first take was refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let _ = first else {
+        let _ = system.debug_print("SOS peergone: first message vanished\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let a = buf[0] as UInt
+    let second = try receiver.take(into: &var buf) catch {
+        print("SOS peergone: second take was refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let _ = second else {
+        let _ = system.debug_print("SOS peergone: second message vanished\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS peergone: drained a={} b={}\n", a, buf[0] as UInt)
+
+    // ...and ONLY NOW is the server told. The ring is empty and no sender can
+    // ever appear, so this is the terminal answer rather than a would-block.
+    match receiver.take(into: &var buf) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS peergone: drained ring still had one\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        case Err(e) -> { print("SOS peergone: take says {}\n", e) },
+    }
+
+    // NOTHING UN-CLOSES. Asking again answers the same word, which is what makes
+    // this a level a caller can act on rather than an edge it might miss.
+    match receiver.take(into: &var buf) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS peergone: a closed pipe re-opened\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        case Err(e) -> { print("SOS peergone: again says {}\n", e) },
+    }
+
+    print("SOS peergone: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

@@ -191,6 +191,50 @@ public(package) static MAX_TIMERS: Int = 8
 public(package) static MAX_ATTACHMENTS: Int = (MAX_EVENTS + MAX_INTERRUPTS
                                                + MAX_TIMERS + MAX_PROCESSES)
 
+/// Pipe CONNECTIONS the kernel can hold (spec §2.1; sawos design 13).
+///
+/// **ONE SLAB FOR THE PAIR, NOT ONE PER END** (design 10 D-1): a `PipeInlet` and
+/// a `PipeOutlet` are two counted KINDS over one connection slot, so this is a
+/// census of live connections rather than of endpoints. A connection frees when
+/// BOTH of its reference columns reach zero.
+///
+/// Four rather than eight because a slot is not free: it carries
+/// `PIPE_INFLIGHT` staging slots of `PIPE_BODY_BYTES` each, which is the only
+/// per-object storage in the kernel that is measured in kilobytes. Sized like
+/// `MAX_WAITERS` and for a related reason — a connection is a per-CLIENT
+/// relationship, and a hand-written system has a handful — and unit 5's
+/// driver-as-service is the first workload that will argue for more.
+public(package) static MAX_PIPES: Int = 4
+
+/// The same sentinel for the Pipe slab.
+public(package) static NO_PIPE: Int = -1
+
+/// **MESSAGES ONE CONNECTION MAY HOLD STAGED, AS A BUILD DEFINE** (spec §2.1 as
+/// amended by design 10 ruling 6; sawos design 13).
+///
+/// **IT DERIVES FROM `MAX_THREADS`, AND THAT IS THE RULING'S OWN ARITHMETIC**:
+/// two per thread, so a system in which every thread has a request in flight and
+/// a reply outstanding still cannot fill the ring on the sender's own account.
+/// A derived size beside the number it derives from is what DF-232g permits and
+/// what this file exists for.
+///
+/// **IT AMENDS §2.1's "STAGES ONE MESSAGE IN A FIXED SLOT"** (ruling 6): the
+/// staging is a small per-connection RING of fixed slots, which keeps the
+/// property that sentence was ratified FOR — zero dynamic kernel allocation —
+/// while letting a client post again before the server has taken the first.
+///
+/// It is deliberately NOT published to userspace, and that is the cut design 13
+/// records against ruling 6: a ring's depth is a slab dimension, and a caller
+/// that meets a full one is told `WouldBlock` without ever needing the number.
+/// `PIPE_BODY_BYTES` is the half that IS a published contract, so it lives in
+/// `sosabi` where both halves compile against one declaration.
+public(package) static PIPE_INFLIGHT: Int = 2 * MAX_THREADS
+
+static_assert(PIPE_INFLIGHT >= 1,
+              "a connection must be able to stage at least one message")
+static_assert(PIPE_INFLIGHT <= 64,
+              "the staging ring is inline per connection — keep the storage bounded")
+
 /// Handles one process's table can hold (§3).
 public(package) static MAX_HANDLES: Int = 16
 
@@ -290,6 +334,19 @@ public(package) static DEFAULT_QUOTA_IOMEMORIES: Int = 2
 /// makes agenda item 8's assert executable. See `QuotaKind.Mapping`.
 public(package) static DEFAULT_QUOTA_MAPPINGS: Int = 2
 
+/// Pipe CONNECTIONS a child may hold at once (spec §2.1; sawos design 13).
+///
+/// **CREATOR-PAYS, so this row counts what a child MADE and not what it was
+/// handed** (design 10 ruling 6's "the pair's creator is charged for both
+/// ends"). A child given one end of a connection its launcher created spends
+/// nothing here — it spends a HANDLE row, like every other capability that
+/// arrives — which is what makes a server child able to hold many sessions
+/// under a small pipe budget.
+///
+/// Two, on `DEFAULT_QUOTA_WAITERS`' reasoning: a connection is a per-client
+/// relationship and a child that makes its own is a launcher in miniature.
+public(package) static DEFAULT_QUOTA_PIPES: Int = 2
+
 /// Handle-table entries a child may hold at once (§3; design 3's promised row).
 ///
 /// Below `MAX_HANDLES` on purpose, so a child meets ITS budget rather than the
@@ -337,4 +394,5 @@ static_assert(DEFAULT_QUOTA_TIMERS < MAX_TIMERS, "a timer default must be under 
 static_assert(DEFAULT_QUOTA_MEMORIES < MAX_MEMORIES, "a memory default must be under the slab")
 static_assert(DEFAULT_QUOTA_IOMEMORIES < MAX_IOMEMORIES, "an iomemory default must be under the slab")
 static_assert(DEFAULT_QUOTA_MAPPINGS < MAX_MAPPINGS, "a mapping default must be under the slab")
+static_assert(DEFAULT_QUOTA_PIPES < MAX_PIPES, "a pipe default must be under the slab")
 static_assert(DEFAULT_QUOTA_HANDLES < MAX_HANDLES, "a handle default must be under the table")

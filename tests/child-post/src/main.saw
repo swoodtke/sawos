@@ -1,0 +1,91 @@
+// SOS CHILD: THE FIRST PROCESS TO SEND ANYTHING (sawos design 13 D-3, M4 unit
+// 1; spec §2.1, §12).
+//
+// It bootstraps exactly as every other child does — a masked System handle in
+// its first argument register, its own Process object derived from it, its boot
+// set drained from there — and the ONE new thing in it is what the set carries:
+// a `PipeInlet`, the client end of a connection its launcher created and kept
+// the other half of.
+//
+// **THE END ARRIVES AS A CAPABILITY, WHICH IS THE WHOLE POINT.** This program
+// has no `PipeCreate` right of its own and no way to name root's connection; it
+// can post because it was HANDED an end, and it can post through nothing else.
+// `BootHandleKind.PipeInlet` is what tells it which accessor to reach for, and
+// asking for the wrong one would have been `None` and would have disturbed
+// nothing.
+//
+// **AND THE MESSAGE OUTLIVES IT.** The inlet drops at the end of the branch that
+// took it — drop is release, so that is this process closing the client end —
+// and then the process exits. Root reads the bytes AFTER both, which is design
+// 230's close-drains-first rule proved across a process boundary: a sender
+// exiting mid-conversation loses nothing.
+//
+// The payload is `PIPE` in ASCII, and the launcher asserts all four bytes: a
+// status alone would not have shown that the copy funnel carried the data.
+
+import sos.{System, Process, PipeInlet, BootHandle, BootHandleKind, SosStatus,
+            PIPE_BODY_BYTES}
+
+/// What it ends with when the boot set was not what the config promised. A
+/// number the transcript's `code=` field distinguishes on sight.
+static EXIT_NO_INLET: UInt = 98
+
+/// The message, and the exit code that says how many bytes of it went.
+static PAYLOAD_LEN: UInt = 4
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS childpost: no process handle: {}\n", error)
+        return
+    }
+
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = 80
+    body[1] = 73
+    body[2] = 80
+    body[3] = 69
+
+    var posted = false
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                match rec.kind {
+                    case PipeInlet -> {
+                        if let inlet = rec.take_inlet() {
+                            let staged = try inlet.post(body: &body,
+                                                        len: PAYLOAD_LEN) catch {
+                                print("SOS childpost: post failed: {}\n", error)
+                                let _ = proc.exit(EXIT_NO_INLET)
+                                return
+                            }
+                            if staged {
+                                posted = true
+                            }
+                        }
+                    },
+                    // A record of any other kind is a capability this child was
+                    // given and does not want: it drops at the end of this arm
+                    // and releases whatever it held.
+                    case _ -> {},
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+
+    if not posted {
+        let _ = system.debug_print("SOS childpost: no inlet in the boot set\n")
+        let _ = proc.exit(EXIT_NO_INLET)
+    }
+
+    let _ = system.debug_print("SOS childpost: posted\n")
+    // THE EXIT CODE IS THE PAYLOAD'S LENGTH, so the kernel's account of this
+    // process and the launcher's reading of the message say the same number from
+    // the two sides of the boundary.
+    let _ = proc.exit(PAYLOAD_LEN)
+}

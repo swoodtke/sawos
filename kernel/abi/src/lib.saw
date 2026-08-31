@@ -137,6 +137,38 @@ public enum ObjType: UInt8 {
     /// makes §2.5's "dropped without unmap = permanent, safe-but-leaked" fall
     /// out of existing doctrine rather than being new law.
     case Mapping = 11,
+    /// THE CLIENT END OF A CONNECTION — requests flow IN here (spec §2.1;
+    /// sawos design 10 D-1 / ruling 2, built by design 13).
+    ///
+    /// **TWO KINDS, ONE SLAB, AND THAT IS THE WHOLE OF D-1's "ROLES ARE
+    /// OBJECTS".** A Pipe carries traffic both ways, so "how many handles can
+    /// still send" cannot be asked of one symmetric object — a parked receiver
+    /// is itself a holder, which is the socket-`shutdown()` hole — and a
+    /// rights-partitioned count on one object would be a SECOND LEDGER against
+    /// design 7's one-ledger doctrine. So the bidirectionality DISSOLVES: the
+    /// connection is a pair of counted ENDPOINT kinds, and "the writers went to
+    /// zero" is "the client end reached zero references", which is the existing
+    /// ledger with no new vocabulary.
+    ///
+    /// Both kinds TARGET THE SAME `PIPES` slot, and which of the connection's
+    /// two reference columns a handle counts on is decided by its KIND — which
+    /// §3's order establishes before anything else is asked. `kcore.refs` is
+    /// where that becomes mechanical.
+    ///
+    /// **A SIDE REACHING ZERO RAISES PEER-GONE ON THE OTHER**, and the
+    /// connection frees only when BOTH columns are zero. In unit 1 nothing
+    /// parks, so peer-gone is visible as `SosStatus.PeerClosed` answers alone;
+    /// unit 3 gives it a waitable level.
+    case PipeInlet = 12,
+    /// THE SERVER END OF A CONNECTION — requests come OUT here (spec §2.1;
+    /// sawos design 10 D-1 / ruling 2, built by design 13).
+    ///
+    /// The mirror of `PipeInlet` in every respect except which column it counts
+    /// on and which op it carries: an inlet posts, an outlet takes. Rights stay
+    /// named for ops (the Aug-29 doctrine), so the ROLE is structural rather
+    /// than a rights mask somebody counts by — which is exactly what let D-1
+    /// answer the writer-count question with the ledger it already had.
+    case PipeOutlet = 13,
 }
 
 // WHICH KINDS ARE WAITABLE is deliberately NOT recorded here (§2.2). It cannot
@@ -239,6 +271,19 @@ public type IoMemoryHandle = UInt
 /// A handle naming a Mapping object (spec §2.5; sawos design 6 D-1) — one
 /// installed protection row. Same discipline again.
 public type MappingHandle = UInt
+
+/// A handle naming a PipeInlet (spec §2.1; sawos design 13) — the CLIENT end of
+/// a connection. Same discipline again.
+public type PipeInletHandle = UInt
+
+/// A handle naming a PipeOutlet (spec §2.1; sawos design 13) — the SERVER end
+/// of a connection. Same discipline again.
+///
+/// Two handle types for two kinds, exactly as the §2 table's other rows get
+/// one each: a word validated as an inlet cannot flow into a place that wants
+/// an outlet, which is the whole reason each kind gets its own alias rather
+/// than a shared `PipeHandle` with a role field.
+public type PipeOutletHandle = UInt
 
 /// A handle word the table can never hand out. Handle 0 names nothing, so a
 /// zeroed register is never authority (see `ObjType.Unbound`).
@@ -560,6 +605,22 @@ static_assert((SystemRight.ProcessSelf as UInt32) >= (1 << 8),
 /// inside it because the two are genuinely separable: a supervisor may hold a
 /// child's handle to run and watch it without being allowed to furnish it, and a
 /// builder may furnish without being allowed to run.
+///
+/// **`PipeCreate` IS M4 UNIT 1's BIT, AND WHY IT IS *HERE* IS A RULING** (sawos
+/// design 10 ruling 3, built by design 13). The factory for a connection sits on
+/// the PROCESS object, like `EventCreate` and `WaiterCreate` and unlike
+/// `ProcessCreate` — pipes are IPC and carry nothing system-shaped, so the
+/// System lean was REJECTED. What that buys is the thing a machine-global
+/// factory could not offer without a mask: the authority is PER-PROCESS
+/// ATTENUABLE. A launcher that hands a child a Process handle minted through a
+/// keep mask without this bit has a child that can hold and use connections
+/// somebody else made and can never make one of its own.
+///
+/// It joins the ONE default set below, on the same terms `EventCreate` did: the
+/// Process object is what a connection is CHARGED to (its slab slot, its two
+/// handle entries, its quota row), so the authority to make one flows through
+/// the handle that is charged — §3's derivation rule rather than a new mechanism
+/// beside it.
 public enum ProcessRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
@@ -574,6 +635,7 @@ public enum ProcessRight: UInt32 {
     case ThreadSelf = 1 << 16,
     case Give = 1 << 17,
     case Map = 1 << 18,
+    case PipeCreate = 1 << 19,
 }
 
 static_assert((ProcessRight.Transfer as UInt32) == (1 << 0),
@@ -602,6 +664,8 @@ static_assert((ProcessRight.Give as UInt32) >= (1 << 8),
               "kind-specific right Give must start at bit 8 or above")
 static_assert((ProcessRight.Map as UInt32) >= (1 << 8),
               "kind-specific right Map must start at bit 8 or above")
+static_assert((ProcessRight.PipeCreate as UInt32) >= (1 << 8),
+              "kind-specific right PipeCreate must start at bit 8 or above")
 
 /// A right on a Thread object (§2 table row; design 178 D4).
 ///
@@ -942,6 +1006,66 @@ static_assert((MappingRight.Mint as UInt32) == (1 << 1),
 static_assert((MappingRight.Unmap as UInt32) >= (1 << 8),
               "kind-specific right Unmap must start at bit 8 or above")
 
+/// A right on a PipeInlet — the CLIENT end of a connection (spec §2.1; sawos
+/// design 13, on design 10 ruling 2).
+///
+/// **ONE KIND-SPECIFIC BIT IN UNIT 1, AND IT IS NAMED FOR ITS OP** (the Aug-29
+/// doctrine): `Post` gates the one submission op the kernel's client side has.
+/// Ruling 4 is why there is exactly one — `post` IS the primitive, and blocking
+/// send, timeout and TELL are all LIBRARY compositions over it, so there is no
+/// second door for a bit to gate.
+///
+/// **A `Wait` BIT ARRIVES WITH WAITABILITY** (unit 3), and its absence here is a
+/// scope line rather than a decision: attaching an endpoint to a Waiter spends a
+/// right, and which right that is cannot be answered before there is a readiness
+/// to observe. `waitable_slot` refuses both kinds with `NotWaitable` today and
+/// says so at the arm.
+///
+/// `Transfer` is minted because handing a child one end of a connection is the
+/// whole point of the pair (design 13's `pipe-child` proof), and `Mint` on the
+/// uniform lean the default-sets section records — a second NAME for an endpoint
+/// is a second REFERENCE on that endpoint's column, which is what makes "any
+/// handle to an end holds that end open" (D-1's v1 rule, the Unix dup
+/// precedent) true by construction rather than by a check.
+public enum PipeInletRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Mint = 1 << 1,
+    case Post = 1 << 8,
+}
+
+static_assert((PipeInletRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((PipeInletRight.Mint as UInt32) == (1 << 1),
+              "universal right Mint must be bit 1 in every kind's enum")
+static_assert((PipeInletRight.Post as UInt32) >= (1 << 8),
+              "kind-specific right Post must start at bit 8 or above")
+
+/// A right on a PipeOutlet — the SERVER end of a connection (spec §2.1; sawos
+/// design 13).
+///
+/// The mirror of `PipeInletRight` with the verb changed, and the change of verb
+/// is the whole difference between the ends: `Take` gates the one op that reads
+/// a staged message out. Everything `PipeInletRight` says about the missing
+/// `Wait` bit, about `Transfer` and about `Mint` holds here word for word.
+///
+/// **THE BITS OVERLAP `PipeInletRight`'s AND THAT IS SOUND** — a rights word is
+/// only ever interpreted against its handle's KIND, which §3's order establishes
+/// first, so `Post` and `Take` sharing bit 8 is the per-kind scoping working
+/// rather than a collision. Testing an inlet's right against an outlet is a
+/// COMPILE error, not a bit comparison that quietly answers.
+public enum PipeOutletRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Mint = 1 << 1,
+    case Take = 1 << 8,
+}
+
+static_assert((PipeOutletRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((PipeOutletRight.Mint as UInt32) == (1 << 1),
+              "universal right Mint must be bit 1 in every kind's enum")
+static_assert((PipeOutletRight.Take as UInt32) >= (1 << 8),
+              "kind-specific right Take must start at bit 8 or above")
+
 /// Whether a rights word carries the UNIVERSAL `Transfer` bit (§3's low byte).
 ///
 /// **IT TAKES A PLAIN MASK RATHER THAN A TYPED RIGHT, and that is the point**
@@ -1101,7 +1225,34 @@ public func process_rights() -> UInt32 {
      | (ProcessRight.Start as UInt32)
      | (ProcessRight.BootHandles as UInt32) | (ProcessRight.Give as UInt32)
      | (ProcessRight.Map as UInt32)
+     | (ProcessRight.PipeCreate as UInt32)
      | (ProcessRight.Transfer as UInt32) | (ProcessRight.Mint as UInt32))
+}
+
+/// What the kernel mints for a PipeInlet at `ProcessOp.PipeCreate` (spec §2.1;
+/// sawos design 13).
+///
+/// **THE CREATOR GETS EVERY END OF ITS OWN CONNECTION**, on `event_rights`'
+/// reasoning exactly: it made the object and there is nobody to attenuate
+/// against yet. Attenuation happens when a handle is DERIVED for somebody else —
+/// a `MINT_OP` sibling through a keep mask — and §3 makes that monotonic, so a
+/// client handed a post-only inlet can never widen back to this.
+///
+/// `Transfer` HAS TO BE HERE, and for the reason `memory_rights` states about
+/// `MapExecute`: attenuation only ever narrows, so a bit not minted at creation
+/// could never appear later by any sequence of ops — and a connection whose ends
+/// cannot travel is a connection with exactly one process on both sides of it,
+/// which is not IPC.
+public func pipe_inlet_rights() -> UInt32 {
+    ((PipeInletRight.Transfer as UInt32) | (PipeInletRight.Mint as UInt32)
+     | (PipeInletRight.Post as UInt32))
+}
+
+/// What the kernel mints for a PipeOutlet at `ProcessOp.PipeCreate`. The mirror
+/// of `pipe_inlet_rights`, with the verb changed and nothing else.
+public func pipe_outlet_rights() -> UInt32 {
+    ((PipeOutletRight.Transfer as UInt32) | (PipeOutletRight.Mint as UInt32)
+     | (PipeOutletRight.Take as UInt32))
 }
 
 /// What the kernel mints for a Memory region — a boot RAM-pool root, and every
@@ -1426,6 +1577,21 @@ public enum SystemOp: UInt {
 /// kernel is a courier, never an interpreter; root and child agree on meaning
 /// through config and manifest.
 ///
+/// **`PipeCreate` IS THE FACTORY FOR A CONNECTION** (sawos design 10 ruling 3,
+/// built by design 13), and it sits here rather than on System because pipes are
+/// IPC and carry nothing system-shaped — the user's own words when the lean was
+/// ruled. It reads `object_operation` under the Aug-17 naming rule exactly as
+/// `EventCreate` and `WaiterCreate` do, and it is gated by
+/// `ProcessRight.PipeCreate`.
+///
+/// **IT ANSWERS WITH BOTH ENDS THROUGH A COPY-OUT RECORD** — two machine words,
+/// offsets published beside the wait record's — because the one-op-one-return
+/// convention cannot carry two words in the value register and the copy funnel
+/// is the precedented door (`Clock.Now`'s is the two-word-record precedent).
+/// BOTH ends are minted into the creator's table and wired outward with `give`,
+/// which is what makes a launcher able to hand the inlet to one child and the
+/// outlet to another with the launch flow unchanged.
+///
 /// Absent, with reasons: `Kill` (see `ProcessRight`).
 public enum ProcessOp: UInt {
     case ThreadCreate = 0,
@@ -1438,6 +1604,7 @@ public enum ProcessOp: UInt {
     case Start = 7,
     case BootHandleNext = 8,
     case Give = 9,
+    case PipeCreate = 10,
 }
 
 /// Whether `ProcessOp.Start`'s SECOND argument carries a boot tag — the op's
@@ -1745,6 +1912,48 @@ public enum MappingOp: UInt {
     case Unmap = 0,
 }
 
+// =============================================================================
+// The PipeInlet and PipeOutlet op tables (spec §2.1; sawos design 13)
+// =============================================================================
+
+/// A METHOD ID on a PipeInlet — the CLIENT end.
+///
+/// **ONE OP IN UNIT 1, AND RULING 4 IS WHY.** `post` IS the one kernel primitive
+/// on the client side: stage the message, never suspend, answer. Blocking send,
+/// `send(timeout:)`, TELL and cancel are LIBRARY COMPOSITIONS over it plus the
+/// Timer and Waiter machinery that already shipped — so the kernel never learns
+/// what a timeout is, and there is no second submission door for this table to
+/// hold.
+///
+/// **IT ANSWERS A PLAIN STATUS TODAY AND WILL GROW A RETURN VALUE**: the
+/// `PipeReplyHandle` a post mints is UNIT 2's, and an op growing a return
+/// between units is exactly what §5.7's renumberable-op discipline makes free —
+/// userspace names the case, this module supplies the number, and the two are
+/// compiled together. Said here so the shape is a stated slice rather than an
+/// omission a later reader has to reconstruct.
+///
+/// ITS ARGUMENTS ARE (address, length), taken through the copy-IN funnel
+/// `Timer.Arm` opened: a body up to `PIPE_BODY_BYTES`, and a length of ZERO is
+/// legal because §2.1 makes a data-free message an option.
+public enum PipeInletOp: UInt {
+    case Post = 0,
+}
+
+/// A METHOD ID on a PipeOutlet — the SERVER end.
+///
+/// **ONE OP, AND IT IS NONBLOCKING.** `take` copies the OLDEST staged message
+/// out through the funnel and answers its length; an empty ring is
+/// `SosStatus.WouldBlock`, never a park, because unit 1 has no waitability and
+/// ruling 4's ladder has the proofs POLL until unit 3 lands it.
+///
+/// Its arguments are (buffer, capacity), and the capacity must be at least
+/// `PIPE_BODY_BYTES` — the published-minimum rule `Waiter.Wait` set, running the
+/// same way: the size is published, so a caller that got it wrong could have
+/// checked.
+public enum PipeOutletOp: UInt {
+    case Take = 0,
+}
+
 // EVERY OP TABLE IS DENSE FROM ZERO, AND STAYS BELOW THE UNIVERSAL OPS (design
 // 3 D-2, widened by design 4's `MINT_OP`). That is what makes a universal op
 // number safe: it can never collide with a per-kind op, because no kind is
@@ -1756,7 +1965,7 @@ public enum MappingOp: UInt {
 // failing as a release or a mint that quietly ran somebody's op.
 static_assert((SystemOp.ProcessCreate as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
-static_assert((ProcessOp.Give as UInt) < MINT_OP,
+static_assert((ProcessOp.PipeCreate as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
 static_assert((ThreadOp.Yield as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
@@ -1775,6 +1984,10 @@ static_assert((MemoryOp.Map as UInt) < MINT_OP,
 static_assert((IoMemoryOp.Map as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
 static_assert((MappingOp.Unmap as UInt) < MINT_OP,
+              "an op table must stay below the universal ops")
+static_assert((PipeInletOp.Post as UInt) < MINT_OP,
+              "an op table must stay below the universal ops")
+static_assert((PipeOutletOp.Take as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
 
 // ...and the two universal numbers are distinct and ordered, which is the fact
@@ -2226,6 +2439,15 @@ public enum BootHandleKind: UInt {
     case Process = 1,
     case System = 2,
     case IoMemory = 3,
+    /// **M4 UNIT 1's PAIR, AND THE RAW BACKING DOING WHAT IT KEEPS DOING**
+    /// (sawos design 13 D-3): two more givable kinds took the next two numbers
+    /// and moved none of the four above them. `pipe_inlet_rights()` and
+    /// `pipe_outlet_rights()` mint `Transfer` because handing a child ONE END of
+    /// a connection is the whole point of the pair — a launcher creates it and
+    /// wires the two ends outward, which is what makes `pipe-child` the seed of
+    /// unit 5's driver-as-service.
+    case PipeInlet = 4,
+    case PipeOutlet = 5,
 }
 
 // THE DECODED RECORD IS NOT DECLARED HERE, and the asymmetry with `WaitResult`
@@ -2236,6 +2458,70 @@ public enum BootHandleKind: UInt {
 // or a `Process` and never a word. So the decoded form is `sos`'s
 // `BootHandle`, which this file could not name; what crosses is the three-word
 // layout above, and that is declared once, here.
+
+// =============================================================================
+// The pipe records (spec §2.1; sawos design 13)
+// =============================================================================
+//
+// TWO PUBLISHED NUMBERS AND ONE RECORD, and they are here rather than in
+// `kcore.limits` for the reason `wait_record_bytes()` is here: THEY ARE THE
+// CONTRACT BETWEEN THE TWO HALVES. Design 10 ruling 6 asks for the limits as
+// named build defines and does not say which module — `kcore.limits` is where a
+// SLAB dimension belongs, and a slab dimension is a fact about the kernel that
+// userspace never needs. `PIPE_BODY_BYTES` is the other kind: a `Post` caller
+// must not name more and a `Take` caller must supply at least that much, so it
+// is exactly the published minimum a copy funnel's two sides have to agree on.
+// One declaration, in the module both halves compile against.
+//
+// `PIPE_INFLIGHT` STAYED IN `kcore.limits` on the same cut, and it is the honest
+// half of it: how deep the staging ring is derives from `MAX_THREADS`, and a
+// caller that meets a full ring is told `WouldBlock` without ever having to know
+// the number.
+
+/// **THE MESSAGE BODY'S MAXIMUM, AS A BUILD DEFINE** (spec §2.1's fixed body;
+/// sawos design 10 ruling 6).
+///
+/// It is the size of one staging slot, the largest `len` a `PipeInletOp.Post`
+/// may name, and the smallest buffer a `PipeOutletOp.Take` may be handed. All
+/// three are one number because they are one fixed slot seen from three sides.
+///
+/// §2.1 ratifies a FIXED body maximum without fixing the number, so this is the
+/// tree's choice within it: large enough for a protocol header plus a small
+/// payload, small enough that `PIPE_INFLIGHT` slots per connection stay a
+/// zerofill array rather than a budget anybody has to think about. The assert
+/// below pins the range the ratified sentence implies — a body must hold at
+/// least a machine word, and must stay small enough that one bounded copy is
+/// still a bounded copy (see design 1's preemption-point audit).
+public static PIPE_BODY_BYTES: Int = 128
+
+static_assert(PIPE_BODY_BYTES >= 8,
+              "a message body must hold at least one 64-bit word")
+static_assert(PIPE_BODY_BYTES <= 1024,
+              "a message body is copied with interrupts masked — keep it bounded")
+static_assert(PIPE_BODY_BYTES % 8 == 0,
+              "a staging slot must be doubleword-sized on both profiles")
+
+/// Words in a `Process.PipeCreate` answer: the inlet handle, then the outlet.
+///
+/// **MACHINE WORDS, NOT DOUBLEWORDS**, and the rule is the boot-handle record's:
+/// a HANDLE is a machine-word-shaped thing, so the layout follows the register.
+/// Only a TIME is a fixed 64 bits on every profile.
+public static PIPE_CREATE_RECORD_WORDS: Int = 2
+
+/// Where each end's handle lives. Named rather than written, on both sides of
+/// the boundary. The ORDER is inlet-then-outlet — client end first, the way the
+/// pair reads in every sentence about it.
+public static PIPE_CREATE_INLET_WORD: Int = 0
+public static PIPE_CREATE_OUTLET_WORD: Int = 1
+
+/// Bytes in a `Process.PipeCreate` record — the minimum capacity a caller must
+/// give the op, and what the kernel checks the buffer against.
+///
+/// A FUNCTION AND NOT A `static` for the reason `wait_record_bytes` gives:
+/// `sizeof<T>()` does not fold in a static initializer (DF-178f).
+public func pipe_create_record_bytes() -> Int {
+    PIPE_CREATE_RECORD_WORDS * sizeof<UInt>()
+}
 
 // =============================================================================
 // Status words (spec §5.7)
@@ -2338,6 +2624,48 @@ public enum BootHandleKind: UInt {
 /// on — and what belongs here is the case where the OBJECT BEING WAITED ON
 /// stopped existing under the waiter. A caller distinguishes the two, which is
 /// the whole reason neither is folded into the other.
+/// **`PeerClosed` (9) IS THE PEER-GONE DOCTRINE'S OTHER WORD** (sawos design 13,
+/// M4 unit 1; `designs/010` D-1 and ruling 2). It is §2.1's own term, and it
+/// answers a call whose FAR END no longer exists: a `Post` through an inlet
+/// whose outlet column reached zero (nobody can ever take it), and a `Take`
+/// through an outlet whose inlet column reached zero AND whose ring has been
+/// drained (no sender can ever appear, since attenuation is monotonic and the
+/// count is zero).
+///
+/// **IT IS NOT `Revoked`, AND THE TWO MUST NOT FOLD INTO EACH OTHER.** `Revoked`
+/// is for the OBJECT BEING WAITED ON ceasing to exist under a parked caller —
+/// nothing to act on, only to report. `PeerClosed` is INFORMATION A PROTOCOL
+/// ACTS ON: the connection is still there and still yours, and what changed is
+/// that the other role is unoccupied. A client meeting it stops sending; a
+/// server meeting it closes the session. `Revoked`'s own docstring names this
+/// split from the other side.
+///
+/// **IT IS TERMINAL.** Nothing un-closes — the ends' reference columns only ever
+/// fall to zero and a zero column can never rise (a handle onto an end is what
+/// would raise it, and there is none) — so a caller may test it as often as it
+/// likes and will be told the same. That is design 8's terminal-level shape
+/// arriving in a second vocabulary.
+///
+/// **`WouldBlock` (10) IS ONE TRANSIENT FOR BOTH DIRECTIONS**: a `Post` whose
+/// ring is full, and a `Take` whose ring is empty. It says CALL AGAIN — the
+/// answer will change when the peer acts — which is the exact opposite of the
+/// case above and is why the two could not share a word.
+///
+/// ONE CASE AND NOT TWO, deliberately, and the reason is design 234's
+/// narrowest-type doctrine read the way that doctrine actually runs: a status is
+/// narrow when it names ONE CONDITION, and post-full and take-empty are the same
+/// condition — the ring is not in a state to serve this call yet. Which
+/// direction it was is already in the op the caller made, so a `PostWouldBlock`
+/// beside a `TakeWouldBlock` would encode the receiver twice and force every
+/// poll loop to match two tags that mean one thing. `describe()` is worded for
+/// the CONDITION rather than for either op, which is the same rule stated in the
+/// text a human reads.
+///
+/// IT IS A STATUS AND NOT A FAULT, and the cut is the faults ruling's own: how
+/// full a shared ring is changes as the PEER acts, so it is precisely the thing
+/// a caller could not have checked in advance. It is `NoResource`'s neighbour in
+/// spirit — a resource edge — and differs in being the peer's to clear rather
+/// than the machine's.
 public enum SosStatus: UInt8 {
     case Ok = 0,
     case NoResource = 4,
@@ -2345,6 +2673,8 @@ public enum SosStatus: UInt8 {
     case Drained = 6,
     case QuotaExceeded = 7,
     case Revoked = 8,
+    case PeerClosed = 9,
+    case WouldBlock = 10,
     case Unknown = 255,
 }
 
@@ -2358,6 +2688,11 @@ extension SosStatus {
             case Drained -> "no more boot handles",
             case QuotaExceeded -> "this process is at its quota",
             case Revoked -> "what this call was waiting for is gone",
+            case PeerClosed -> "the other end of this connection is gone",
+            // WORDED FOR THE CONDITION, NOT FOR THE OP (the case's own
+            // docstring): one sentence has to be true of a full ring and of an
+            // empty one, because one tag answers both.
+            case WouldBlock -> "not right now — try again",
             case Unknown -> "unknown status",
         }
     }

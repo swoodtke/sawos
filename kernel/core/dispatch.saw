@@ -21,6 +21,8 @@ import sosabi.{
     MemoryHandle,
     IoMemoryHandle,
     MappingHandle,
+    PipeInletHandle,
+    PipeOutletHandle,
     SystemRight,
     ProcessRight,
     ThreadRight,
@@ -32,6 +34,8 @@ import sosabi.{
     MemoryRight,
     IoMemoryRight,
     MappingRight,
+    PipeInletRight,
+    PipeOutletRight,
     SystemOp,
     ProcessOp,
     ThreadOp,
@@ -43,6 +47,8 @@ import sosabi.{
     MemoryOp,
     IoMemoryOp,
     MappingOp,
+    PipeInletOp,
+    PipeOutletOp,
     EventMode,
     ClockType,
     MapAccess,
@@ -58,6 +64,9 @@ import sosabi.{
     timer_arm_record_bytes,
     BOOT_HANDLE_RECORD_WORDS,
     boot_handle_record_bytes,
+    PIPE_BODY_BYTES,
+    PIPE_CREATE_RECORD_WORDS,
+    pipe_create_record_bytes,
     SosStatus,
     FaultReason,
     ProcessStatusKind,
@@ -72,6 +81,8 @@ import sosabi.{
     memory_rights,
     iomemory_rights,
     mapping_rights,
+    pipe_inlet_rights,
+    pipe_outlet_rights,
     NO_HANDLE,
     RELEASE_OP,
     MINT_OP,
@@ -85,10 +96,12 @@ import kcore.limits.{
     NO_IOMEMORY,
     NO_MAPPING,
     NO_MEMORY,
+    NO_PIPE,
     NO_PROCESS,
     NO_THREAD,
     NO_TIMER,
     NO_WAITER,
+    PIPE_INFLIGHT,
 }
 import kcore.mem.{align_up}
 import imgformat.{SegFlag}
@@ -118,6 +131,11 @@ import kcore.objects.{
     MemoryObject,
     MemorySlot,
     NO_ROW,
+    PIPES,
+    PIPE_LENS,
+    PipeInletObject,
+    PipeOutletObject,
+    PipeSlot,
     ProcessObject,
     QuotaKind,
     SlotState,
@@ -128,7 +146,10 @@ import kcore.objects.{
     alloc_iomemory,
     alloc_mapping,
     alloc_memory,
+    alloc_pipe,
     boot_handle_cursor,
+    pipe_body_addr,
+    pipe_len_at,
     compact_mapping_rows,
     boot_handle_room,
     boot_handle_take,
@@ -528,6 +549,23 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             }
             process_give(p, obj.slot, arg0, arg1)
         },
+        // **THE FACTORY FOR A CONNECTION** (sawos design 10 ruling 3, built by
+        // design 13). It sits on the Process object beside `EventCreate` and
+        // `WaiterCreate` because a pipe is IPC and carries nothing
+        // system-shaped, and because the Process object is what a connection is
+        // CHARGED to — its slab slot, its two handle entries, its quota row. The
+        // System lean was considered and REJECTED at the ruling.
+        //
+        // `arg0` is the answer buffer and `arg1` its capacity: BOTH ENDS come
+        // back through a copy-out record, because the one-op-one-return
+        // convention cannot carry two words in the value register. `Clock.Now`
+        // is the precedent for answering through the funnel at all.
+        case PipeCreate -> {
+            if not obj.allows(ProcessRight.PipeCreate) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            pipe_create(obj.slot, p, arg0, arg1)
+        },
     }
 }
 
@@ -822,6 +860,14 @@ func boot_kind_of(kind: ObjType) -> BootHandleKind? {
         // `Transfer`, so the `Transfer` check above refuses one first and this
         // spelling would be dead surface.
         case IoMemory -> BootHandleKind.IoMemory,
+        // **M4 UNIT 1's TWO ARMS, AND THEY ARE THE SAME PREDICTION COLLECTED A
+        // SECOND TIME** (sawos design 13 D-3): `pipe_inlet_rights()` and
+        // `pipe_outlet_rights()` mint `Transfer`, because handing a child ONE
+        // END of a connection is what the pair is FOR — a launcher creates the
+        // pair, gives the inlet to the client and the outlet to the server, and
+        // the launch flow is unchanged.
+        case PipeInlet -> BootHandleKind.PipeInlet,
+        case PipeOutlet -> BootHandleKind.PipeOutlet,
         case _ -> None,
     }
 }
@@ -1609,6 +1655,22 @@ func waitable_slot(p: Int, handle: UInt) unsafe -> Waitable {
         case Memory -> fault_process(p, FaultReason.NotWaitable),
         case IoMemory -> fault_process(p, FaultReason.NotWaitable),
         case Mapping -> fault_process(p, FaultReason.NotWaitable),
+        // **NEITHER END IS WAITABLE IN UNIT 1, AND UNIT 3 REMOVES BOTH ARMS**
+        // (sawos design 13 D-1; the §8-thread-deferral pattern). Both kinds have
+        // a genuine readiness — an outlet is readable when its ring is not
+        // empty, an inlet is postable when its ring is not full — and §2.2 lists
+        // the pipe arms among the waitables owed. What unit 1 deliberately does
+        // NOT have is the parking, the wake dispatch or the `Wait` rights bit
+        // that attaching would spend, so everything in this unit POLLS and these
+        // two arms say so out loud rather than letting an attach half-work.
+        //
+        // Written here rather than left to a `_` for the reason every arm in
+        // this function is: a kind moving from "not waitable" to "waitable" is
+        // not a new case at all, so a default would hide exactly the change unit
+        // 3 makes. The Process arm one screen up is that promise already
+        // collected once.
+        case PipeInlet -> fault_process(p, FaultReason.NotWaitable),
+        case PipeOutlet -> fault_process(p, FaultReason.NotWaitable),
     }
 }
 
@@ -2373,6 +2435,298 @@ func mapping_op_decoded(op: MappingOp, obj: &MappingObject,
     }
 }
 
+// =============================================================================
+// The pair: PipeInlet and PipeOutlet (spec §2.1; sawos design 13)
+// =============================================================================
+//
+// **ONE CONNECTION, TWO KINDS, THREE OPS.** The factory is on the Process object
+// (ruling 3); the two data ops are one per end, and each end's op table has
+// exactly one entry because ruling 4 makes `post` the ONE kernel primitive on
+// the client side and nonblocking `take` its mirror. Everything polls: unit 1
+// has no waitability, so a full ring and an empty one are both `WouldBlock` and
+// nothing ever parks.
+//
+// THE TWO DOORS ARE THE EXISTING TWO. A post rides `copy_in`, which `Timer.Arm`
+// opened and which §2.2's one-door rule says is the only way a process's memory
+// is read; a take rides `copy_out`, which every record-answering op already
+// uses. Neither op invents a check: the doors answer alignment and containment,
+// and what is left here is the DOMAIN question (is this length one this op can
+// mean) and the RING question (is there a slot / is there a message).
+//
+// **THE PEER-GONE ARMS ARE READS OF THE REFERENCE COLUMNS AND NOTHING ELSE**
+// (design 13 D-2, on `kcore.refs`' transition). A `Post` asks whether the outlet
+// column is zero; a `Take` asks whether the inlet column is zero, but only once
+// the ring has run dry — which is design 230's close-drains-first rule spelled
+// as an order of two comparisons.
+//
+// AUDIT (design 1, M3 unit 1.5): NEITHER OP WANTS A PREEMPTION POINT. The one
+// unbounded-looking thing in either is the body copy, and it is bounded by
+// `PIPE_BODY_BYTES` — 128 bytes, an order of magnitude under the arena zero the
+// point map exists for, and comparable to a boot-handle record's three words.
+// `alloc_pipe` scans `MAX_PIPES`, which is 4. Recorded either way, as D-4 asks.
+
+/// The record `Process.PipeCreate` answers with, in kernel memory.
+///
+/// Declaration order IS the layout (design 58), so the fields here and the word
+/// indices `sosabi` publishes are one description — pinned by the assert below
+/// rather than by agreement, exactly as the boot-handle record is.
+struct PipeCreateRecord {
+    inlet: UInt,
+    outlet: UInt,
+}
+
+static_assert(sizeof<PipeCreateRecord>()
+              == PIPE_CREATE_RECORD_WORDS * sizeof<UInt>(),
+              "a pipe-create record must be exactly the words sosabi publishes")
+
+/// **MAKE A CONNECTION AND HAND BACK BOTH OF ITS ENDS** (spec §2.1; sawos design
+/// 13 D-3).
+///
+/// `owner` is the process the connection is made IN — charged for it, and whose
+/// table the two handles land in — and `caller` is the process whose memory the
+/// answer is written to. They are the same process for every call anything makes
+/// today (a process creates a pipe through its OWN Process handle), and they are
+/// two parameters because the op reaches them by two different routes: `owner`
+/// is `obj.slot`, the process the HANDLE names, which is where every other
+/// `*Create` op on this object puts its object; `caller` is who trapped, which
+/// is whose buffer `copy_out` may write. A launcher creating a pipe through a
+/// CHILD's Process handle is the one shape where they differ, and it hands back
+/// child-relative words exactly as `ThreadCreate` through a child's handle
+/// already does — an existing wart named rather than a new one introduced.
+///
+/// **THE REFUSAL ORDER IS THE ALL-OR-NOTHING SHAPE** every allocation site in
+/// this kernel follows: the caller-checkable faults first (a capacity below the
+/// published record size, a destination the copy door refuses), then POLICY
+/// (`QuotaExceeded` — a process at its budget is told whose limit it met), then
+/// the MACHINE (`NoResource`), and only then is anything written. The
+/// destination is checked BEFORE the slab is touched, which is what makes a
+/// refused buffer leave the slab exactly as it found it.
+///
+/// **THE SECOND MINT IS THE ONE THAT CAN HALF-SUCCEED, AND IT IS UNWOUND.** A
+/// connection with one handle would be a connection whose other end is
+/// unreachable and whose column can never fall — a permanent slot leak dressed
+/// as a live object — so a refused outlet unbinds the inlet and answers, leaving
+/// both tables as they were. No slot has been marked Live at that point, so
+/// there is nothing else to give back.
+func pipe_create(owner: Int, caller: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
+    // A capacity below the record's size is an argument outside its domain —
+    // the size is published, so the caller could have checked. `Waiter.Wait`'s
+    // rule, and the same diagnostic.
+    if cap < (pipe_create_record_bytes() as UInt) {
+        fault_process(caller, FaultReason.BadArg)
+    }
+    // ASKED HERE, BEFORE ANYTHING IS ALLOCATED, which is `Waiter.Wait`'s
+    // ordering and for its reason: a bad buffer is the calling process's
+    // mistake, and terminating it before the kernel has minted anything is both
+    // the better diagnostic and the simpler thing to reason about. It also makes
+    // the copy at the bottom of this function unable to fail, which is what
+    // keeps a successful creation from ever ending in a fault with two live
+    // handles nobody was told about.
+    if let why = copy_out_check(caller, dst, pipe_create_record_bytes() as UInt) {
+        fault_process(caller, why)
+    }
+
+    if not quota_room(owner, QuotaKind.Pipe) {
+        return op_status(SosStatus.QuotaExceeded)
+    }
+    let slot = alloc_pipe()
+    if slot == NO_PIPE {
+        return op_status(SosStatus.NoResource)
+    }
+    let inlet = mint_handle(owner, ObjType.PipeInlet, pipe_inlet_rights(), slot)
+    if inlet == NO_HANDLE {
+        return op_status(mint_refusal(owner))
+    }
+    let outlet = mint_handle(owner, ObjType.PipeOutlet, pipe_outlet_rights(),
+                             slot)
+    if outlet == NO_HANDLE {
+        // THE UNWIND. `unbind_handle` is the same one release and the teardown
+        // use, so the generation bump comes for free and the word this op never
+        // handed out could not have been used by anybody.
+        unbind_handle(owner, handle_word_index(inlet))
+        return op_status(mint_refusal(owner))
+    }
+
+    // **BOTH COLUMNS START AT ONE, and that is the count rather than a change to
+    // one** (design 7 D-1's creation rule, applied twice because there are two
+    // ends). The slot is written only once both mints succeeded, which is
+    // `event_create`'s all-or-nothing shape; the charge joins that rule, because
+    // a process must not pay for an object it never got.
+    PIPES[slot] = PipeSlot(state: SlotState.Live, process: owner, head: 0,
+                           count: 0, inlet_refs: 1, outlet_refs: 1)
+    quota_charge(owner, QuotaKind.Pipe)
+
+    var rec = PipeCreateRecord(inlet: inlet, outlet: outlet)
+    if let why = copy_out(caller, dst,
+                          ((&var rec) as UnsafePointer<PipeCreateRecord>) as UInt,
+                          pipe_create_record_bytes() as UInt) {
+        // UNREACHABLE, and deliberately still written: the same destination
+        // passed `copy_out_check` before anything was allocated, and nothing
+        // between here and there can move a process's window. Never-hide says
+        // the arm reports rather than assumes.
+        fault_process(caller, why)
+    }
+    op_ok()
+}
+
+/// The PipeInlet's ops (spec §2.1; sawos design 13 D-2).
+func pipe_inlet_op(raw_op: UInt, obj: &PipeInletObject, arg0: UInt,
+                   arg1: UInt) unsafe -> SyscallResult {
+    let p = calling_process()
+    guard let op = PipeInletOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
+    return pipe_inlet_op_decoded(op, &obj, arg0, arg1, p)
+}
+
+func pipe_inlet_op_decoded(op: PipeInletOp, obj: &PipeInletObject, arg0: UInt,
+                           arg1: UInt, p: Int) unsafe -> SyscallResult {
+    match op {
+        case Post -> {
+            if not obj.allows(PipeInletRight.Post) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            pipe_post(p, obj.slot, arg0, arg1)
+        },
+    }
+}
+
+/// **STAGE ONE MESSAGE, AND NEVER SUSPEND** (design 10 ruling 4: post IS the one
+/// kernel primitive on the client side).
+///
+/// `src` is the body's address in the caller's memory and `len` its length. A
+/// LENGTH OF ZERO IS LEGAL — §2.1 makes a data-free message an option — and it
+/// reads no buffer at all: there is nothing to copy, so no address is touched
+/// and none is validated. A caller with no data has no buffer to name, and
+/// demanding an aligned in-range address for a copy of nothing would be a rule
+/// that only ever refuses correct programs.
+///
+/// THREE ANSWERS, and the order they are asked in is the design:
+///
+///   - a `len` above `PIPE_BODY_BYTES` is a FAULT. The maximum is published, the
+///     caller chose the number, and design 178's line puts a caller-checkable
+///     mistake outside the status enum entirely.
+///   - the OUTLET COLUMN AT ZERO is `PeerClosed`, and it is asked before the
+///     ring because it is the stronger fact: nobody can ever take again, so a
+///     free slot would be a place to put a message that has no future. The
+///     staged bodies were already dropped at that transition (`kcore.refs`), so
+///     this arm has nothing to clean up — it only reports.
+///   - a FULL RING is `WouldBlock` — caller-checkable, transient, never a park.
+///     Ruling 4 is explicit that post never suspends, and the composed blocking
+///     send that unit 3 builds surfaces this refusal rather than waiting for
+///     space ("the outlet freed a slot" is a reservable level, not built).
+///
+/// **IT ANSWERS A PLAIN STATUS, and the `PipeReplyHandle` is unit 2's.** An op
+/// growing a return value between units costs nothing under §5.7's renumberable
+/// discipline — userspace names the case, `sosabi` supplies the number, the two
+/// compile together — which is why this is a stated slice rather than a
+/// signature somebody will have to break.
+func pipe_post(p: Int, slot: Int, src: UInt, len: UInt) unsafe -> SyscallResult {
+    if len > (PIPE_BODY_BYTES as UInt) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    if PIPES[slot].outlet_refs == 0 {
+        return op_status(SosStatus.PeerClosed)
+    }
+    if PIPES[slot].count >= PIPE_INFLIGHT {
+        return op_status(SosStatus.WouldBlock)
+    }
+
+    // The tail is derived rather than stored — one index and a count describe a
+    // ring, and a second index would be a second thing to keep in step.
+    let at = (PIPES[slot].head + PIPES[slot].count) % PIPE_INFLIGHT
+    if len != 0 {
+        // THE ONE DOOR INWARD (§2.2's one-door rule). It reports a refused
+        // source and the caller terminates on it, exactly as `Timer.Arm` does —
+        // a misaligned or out-of-region buffer is a mistake only the caller
+        // could have made.
+        if let why = copy_in(p, pipe_body_addr(slot, at), src, len) {
+            fault_process(p, why)
+        }
+    }
+    // `as UInt16` is exact rather than hopeful: the length was refused above
+    // unless it fits `PIPE_BODY_BYTES`, which the ABI's own assert keeps well
+    // inside the width. An out-of-range value here would be a kernel bug, which
+    // is precisely when design 170 says to write `as`.
+    PIPE_LENS[pipe_len_at(slot, at)] = len as UInt16
+    PIPES[slot].count = PIPES[slot].count + 1
+    op_ok()
+}
+
+/// The PipeOutlet's ops (spec §2.1; sawos design 13 D-2).
+func pipe_outlet_op(raw_op: UInt, obj: &PipeOutletObject, arg0: UInt,
+                    arg1: UInt) unsafe -> SyscallResult {
+    let p = calling_process()
+    guard let op = PipeOutletOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
+    return pipe_outlet_op_decoded(op, &obj, arg0, arg1, p)
+}
+
+func pipe_outlet_op_decoded(op: PipeOutletOp, obj: &PipeOutletObject, arg0: UInt,
+                            arg1: UInt, p: Int) unsafe -> SyscallResult {
+    match op {
+        case Take -> {
+            if not obj.allows(PipeOutletRight.Take) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            pipe_take(p, obj.slot, arg0, arg1)
+        },
+    }
+}
+
+/// **TAKE THE OLDEST STAGED MESSAGE, AND NEVER PARK** (spec §2.1; design 10
+/// ruling 4's polling ladder).
+///
+/// `dst` is the caller's buffer and `cap` its size in bytes, which must be at
+/// least `PIPE_BODY_BYTES` — the published-minimum rule `Waiter.Wait` set,
+/// running the same way. It is the WHOLE slot's size and not the message's,
+/// because the message's length is what the op ANSWERS with and a caller cannot
+/// size a buffer against a number it has not been told yet.
+///
+/// **THE ZERO-ARM IS DRAIN-THEN-TERMINAL** (design 13 D-2, on design 230's
+/// close-drains-first rule), and it is two comparisons in this order:
+///
+///   - anything STAGED is handed over, whatever the inlet column says. The
+///     sender being gone does not un-send what it sent, and a message dropped
+///     because its author exited would be exactly the silent loss §2.1's
+///     bounded-IPC model exists to rule out.
+///   - only an EMPTY ring asks about the peer. Empty with a live inlet is
+///     `WouldBlock` — call again, the answer will change. Empty with the inlet
+///     column at zero is `PeerClosed`, and it is TERMINAL: no new sender can
+///     appear, because attenuation is monotonic and a column at zero has no
+///     handle left to mint from. A second take answers the same.
+///
+/// The answer's VALUE is the message's length, which is how a caller tells a
+/// zero-length message from a full one without a second op.
+func pipe_take(p: Int, slot: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
+    // The published minimum, checked before the ring is consulted — the
+    // capacity is a domain question about the call, and it is wrong or right
+    // whether or not there is anything to hand over. `boot_handle_next`'s
+    // ordering exactly.
+    if cap < (PIPE_BODY_BYTES as UInt) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    if PIPES[slot].count == 0 {
+        if PIPES[slot].inlet_refs == 0 {
+            return op_status(SosStatus.PeerClosed)
+        }
+        return op_status(SosStatus.WouldBlock)
+    }
+
+    let at = PIPES[slot].head
+    let len = PIPE_LENS[pipe_len_at(slot, at)] as UInt
+    if len != 0 {
+        // THE ONE DOOR OUTWARD. It checks the destination and reports a refusal
+        // the caller terminates on, exactly as `Clock.Now` does.
+        if let why = copy_out(p, dst, pipe_body_addr(slot, at), len) {
+            fault_process(p, why)
+        }
+    }
+    // CONSUMED BY DELIVERY, and the cursor advances only after the copy
+    // SUCCEEDED — the boot-handle drain's own ordering, and what makes "a staged
+    // message is handed over exactly once" true rather than nearly true.
+    PIPES[slot].head = (at + 1) % PIPE_INFLIGHT
+    PIPES[slot].count = PIPES[slot].count - 1
+    op_value(len)
+}
+
 /// Handle-table lookup -> object type -> op table -> rights check -> op.
 ///
 /// This is where a raw word becomes a TYPED handle (§3), and the order is the
@@ -2466,6 +2820,20 @@ func dispatch(handle: UInt, op: UInt,
             let obj = MappingObject(handle: MappingHandle(handle),
                                     rights: entry.rights, slot: entry.target)
             mapping_op(op, &obj)
+        },
+        // **TWO ARMS ONTO ONE SLAB** (sawos design 13 D-1). `entry.target` is
+        // the CONNECTION for both, and the kind is what decides which op table
+        // answers and which rights enum the word is read against — which is §3's
+        // order doing exactly what D-1 leans on it for.
+        case PipeInlet -> {
+            let obj = PipeInletObject(handle: PipeInletHandle(handle),
+                                      rights: entry.rights, slot: entry.target)
+            pipe_inlet_op(op, &obj, arg0, arg1)
+        },
+        case PipeOutlet -> {
+            let obj = PipeOutletObject(handle: PipeOutletHandle(handle),
+                                       rights: entry.rights, slot: entry.target)
+            pipe_outlet_op(op, &obj, arg0, arg1)
         },
     }
 }

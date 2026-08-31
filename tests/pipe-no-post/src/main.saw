@@ -1,0 +1,78 @@
+// SOS M4 unit 1: AN UNSPENT RIGHT ON A CONNECTION END (sawos design 13; spec
+// §3).
+//
+// **THE ATTENUATION PROOF FOR THE NEW KINDS.** `pipe_inlet_rights()` mints
+// `Transfer | Mint | Post`, and it HAS TO be permissive — §3's attenuation is
+// monotonic, so a bit not minted at creation could never appear later by any
+// sequence of ops. Which means the narrowing is the HOLDER's, written once at a
+// `MINT_OP` keep mask, and this program is that sentence executed:
+//
+//   SOS nopost: minted without Post     a sibling that may travel and may mint
+//   SOS: process fault: access denied   ...and may not send a single byte
+//
+// The mask names `Transfer | Mint` and says nothing about `Post`, which is what
+// a KEEP mask's polarity means: absent by silence. A launcher hands a child such
+// a sibling and the child holds a real connection end it can pass on and can
+// never write to — stated once at the mint rather than checked at every post.
+//
+// **IT IS A FAULT AND NOT A STATUS** (design 178's faults ruling): a process
+// knows which rights it holds, so spending one it was not given is a mistake it
+// could have checked. The kernel terminates it and stays up to say so.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, SosStatus, PipeInletRight,
+            PIPE_BODY_BYTES}
+
+static EXIT_FAILED: UInt = 1
+
+/// **THE KEEP MASK, AND `Post` IS ABSENT BY SILENCE.** Two bits rather than one
+/// because a combination of raw-backed cases folds into a fixed-width slot where
+/// a lone case does not (SL-9) — and because it reads as the policy it is: this
+/// end may be handed on and may be narrowed further, and may not be used.
+static NO_POST: UInt32 = (PipeInletRight.Transfer | PipeInletRight.Mint)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS nopost: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let pair = try proc.pipe_create() catch {
+        print("SOS nopost: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let (inlet, outlet) = move pair
+
+    let narrowed = try inlet.mint(rights: NO_POST) catch {
+        print("SOS nopost: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS nopost: minted without Post\n")
+
+    // A SECOND NAME IS A SECOND REFERENCE on this connection's inlet column, so
+    // the original is still perfectly able to post — what is refused is THIS
+    // handle, which is what makes attenuation per-capability rather than
+    // per-object.
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 1
+    match narrowed.post(body: &msg, len: 1) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS nopost: an unspent right posted\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        // UNREACHABLE: the line above does not return, because the kernel ends
+        // this process at the rights check. The arm is written so the refusal
+        // reads as a refusal rather than as a missing case.
+        case Err(e) -> {
+            print("SOS nopost: post refused: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+}

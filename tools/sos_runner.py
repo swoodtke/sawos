@@ -314,6 +314,26 @@ MAP_WX_REFUSED_PKG = os.path.join(TESTS_DIR, "map-wx-refused")
 # a word, which is `handle-remint`'s own stated reason for living down there.
 WAITER_REVOKED_PKG = os.path.join(TESTS_DIR, "waiter-revoked")
 
+# sawos design 13 (M4 unit 1): the pair. FOUR root servers and ONE child, and
+# the split is the house rule plus the arithmetic that keeps forcing it — a
+# rights refusal and a bad-argument refusal are both FAULTS, and a fault ends
+# the process, so the two negative arms cannot share an image with each other or
+# with anything that has work left to do.
+#
+# **`pipe-basics` AND `pipe-peer-gone` ARE ONE PROCESS EACH, DELIBERATELY.** Unit
+# 1 has no waitability and nothing parks, so the entire data path — round trip,
+# FIFO, the empty message, the ring's depth, both zero-arms — is provable inside
+# one address space with both ends in one hand. That is what makes `pipe-child`
+# a proof about GIVE and the boot drain rather than a second copy of the data
+# path: it moves ONE message, and everything else about it is the launch flow
+# that shipped in M3 unit 3.
+PIPE_BASICS_PKG = os.path.join(TESTS_DIR, "pipe-basics")
+PIPE_PEER_GONE_PKG = os.path.join(TESTS_DIR, "pipe-peer-gone")
+PIPE_CHILD_PKG = os.path.join(TESTS_DIR, "pipe-child")
+CHILD_POST_PKG = os.path.join(TESTS_DIR, "child-post")
+PIPE_NO_POST_PKG = os.path.join(TESTS_DIR, "pipe-no-post")
+PIPE_OVERSIZED_PKG = os.path.join(TESTS_DIR, "pipe-oversized")
+
 CLOCK_BASICS_PKG = os.path.join(TESTS_DIR, "clock-basics")
 TIMER_ONESHOT_PKG = os.path.join(TESTS_DIR, "timer-oneshot")
 TIMER_INTERVAL_PKG = os.path.join(TESTS_DIR, "timer-interval")
@@ -2820,6 +2840,171 @@ TEST_CASES = [
                        "events={zero} waiters={zero} interrupts={zero} "
                        "timers={zero}"],
         "expect_clean_exit": True,
+    },
+    # =========================================================================
+    # M4 unit 1 — the pair (sawos design 13)
+    # =========================================================================
+    {
+        # **THE DATA PATH, IN ONE PROCESS.** Root holds both ends, so every claim
+        # below is about the CONNECTION rather than about scheduling — nothing
+        # parks, nothing is given, and the transcript is a list of properties.
+        #
+        # `round trip len=3 b=65,66,67` is the BYTES, not a status: the copy-in
+        # and copy-out funnels really carried the body, which a status alone
+        # would not have shown.
+        #
+        # `fifo order=123` carries the ORDER as digits (`child-drain`'s `tags=35`
+        # idiom), so a ring that handed back the newest first would print 321.
+        #
+        # `empty message len=0` and `take empty is none` are the two halves of
+        # one distinction: a data-free message is a MESSAGE (§2.1's own option),
+        # and the typed tier's `Optional` is what keeps it apart from "nothing
+        # staged". A shape that could not tell them apart would make the poll
+        # loop below unwritable.
+        #
+        # **`ring depth=16` IS A CLAIM ABOUT A BUILD DEFINE THIS PROGRAM CANNOT
+        # NAME.** `PIPE_INFLIGHT` is `2 * MAX_THREADS` in `kcore.limits` and is
+        # deliberately not published to userspace; root posts until the kernel
+        # refuses and COUNTS. `drained=16` beside it says the refusal was a
+        # refusal — a ring that dropped the oldest to make room would drain
+        # fewer than it staged.
+        "name": "pipe_basics",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_BASICS_PKG,
+        "expect_out": ["{banner}",
+                       "SOS pipebasics: created",
+                       "SOS pipebasics: round trip len=3 b=65,66,67",
+                       "SOS pipebasics: fifo order=123",
+                       "SOS pipebasics: empty message len=0",
+                       "SOS pipebasics: ring depth=16",
+                       "SOS pipebasics: drained=16",
+                       "SOS pipebasics: take empty is none",
+                       "SOS pipebasics: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **THE PEER-GONE DOCTRINE, AND THE TWO DIRECTIONS ARE NOT SYMMETRIC**
+        # (sawos design 13 D-2; `designs/010` D-1). Two connections, killed from
+        # opposite ends, and the difference between the two answers IS the unit's
+        # sharpest claim.
+        #
+        # THE OUTLET GOES: `post says …` at once. Nobody can ever take again, so
+        # there is no future for a staged message and the refusal is immediate.
+        #
+        # THE INLET GOES: `drained a=7 b=8` FIRST, and only then `take says …`.
+        # Everything the departed sender staged is handed over before the server
+        # is ever told — design 230's close-drains-first rule — so a client
+        # exiting mid-conversation loses nothing. A kernel that unwound the ring
+        # at the inlet's zero would print the terminal line with no drain before
+        # it.
+        #
+        # `again says …` is TERMINAL LEVEL: nothing un-closes, so a caller may
+        # stop rather than retry. That is what separates `PeerClosed` from
+        # `WouldBlock`, which `pipe_basics` meets on the same two ops.
+        #
+        # THE STATUSES ARE NAMED, NOT NUMBERED — the program prints the ABI
+        # enum's own `describe()`, so a case added without a describe arm would
+        # not compile and a renumbering of the wire table would not move this
+        # transcript.
+        "name": "pipe_peer_gone",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_PEER_GONE_PKG,
+        "expect_out": ["{banner}",
+                       "SOS peergone: outlet dropped",
+                       "SOS peergone: post says the other end of this "
+                       "connection is gone",
+                       "SOS peergone: staged 2",
+                       "SOS peergone: inlet dropped",
+                       "SOS peergone: drained a=7 b=8",
+                       "SOS peergone: take says the other end of this "
+                       "connection is gone",
+                       "SOS peergone: again says the other end of this "
+                       "connection is gone",
+                       "SOS peergone: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **A CONNECTION THAT CROSSES A PROCESS BOUNDARY** — the seed of unit 5's
+        # client (sawos design 13 D-3). Root creates the pair, keeps the outlet,
+        # GIVES the inlet, and the child posts through it.
+        #
+        # **NOTHING ABOUT THE LAUNCH FLOW CHANGED**, which is what ruling 3 buys
+        # by putting the factory on the Process object: mint a masked System
+        # sibling, give it, give the pipe end, start naming the boot tag. The
+        # only new thing is the KIND that travelled, and `Transfer` is minted in
+        # `pipe_inlet_rights()` for exactly this.
+        #
+        # **THE ORDER IS THE CLAIM.** `SOS childpost: posted`, the child's exit
+        # and its teardown all come BEFORE root reads the bytes — root's first
+        # take necessarily answered `Ok(None)` (the child was runnable and had
+        # not run), so root parked on a timer and the child ran to completion.
+        # So the message outlives its sender, which is `pipe_peer_gone`'s
+        # drain-first rule proved across a real process boundary.
+        #
+        # `code={four}` and `len=4` are the SAME FACT from the two sides of the
+        # boundary: the child exits with its payload's length, and root reads
+        # that many bytes. `b=80,73,80,69` is `PIPE` in ASCII — the bytes, so
+        # that a status alone could not have passed this case.
+        "name": "pipe_child",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_CHILD_PKG,
+        "children": [CHILD_POST_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS pipechild: created",
+                       "SOS pipechild: gave the inlet",
+                       "SOS pipechild: started",
+                       "SOS childpost: posted",
+                       "SOS: process exit: code={four} process={one}",
+                       "SOS: process teardown handles={two} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS pipechild: received len=4 b=80,73,80,69",
+                       "SOS pipechild: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **AN UNSPENT RIGHT ON A CONNECTION END** (spec §3). An endpoint's
+        # default set is permissive and HAS TO BE — attenuation is monotonic, so
+        # a bit not minted at creation could never appear later — which means the
+        # narrowing is the holder's, written once at a `MINT_OP` keep mask.
+        #
+        # ONE TRANSCRIPT, TWO CLAIMS, exactly as `give_no_transfer` makes them:
+        # a masked sibling of a pipe end is genuinely narrower than its source,
+        # and the op's gate is real. The mask names `Transfer | Mint` and says
+        # nothing about `Post`, which is what a KEEP mask's polarity means —
+        # absent by silence, and no sequence of ops recovers it.
+        "name": "pipe_no_post",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_NO_POST_PKG,
+        "expect_out": ["{banner}",
+                       "SOS nopost: minted without Post",
+                       "SOS: process fault: access denied process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # **A BODY BIGGER THAN THE SLOT** (spec §2.1's fixed body). The maximum
+        # is published in `sosabi` — a caller cannot even declare the buffer
+        # without it — so overshooting it is a mistake the process could have
+        # checked, which design 178's faults ruling puts outside the status enum
+        # entirely.
+        #
+        # THE CHECK IS BEFORE THE COPY, which is what makes the refusal safe
+        # rather than merely correct: nothing is read out of the caller's memory
+        # and no staging slot is touched, so a hostile length is a diagnostic and
+        # never a partial write.
+        "name": "pipe_oversized",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_OVERSIZED_PKG,
+        "expect_out": ["{banner}",
+                       "SOS oversized: asking for 129",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
     },
 ]
 

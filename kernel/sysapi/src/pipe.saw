@@ -1,0 +1,222 @@
+//! THE PAIR — `PipeInlet` and `PipeOutlet`, the two ends of a connection (spec
+//! §2.1; sawos design 10 D-1, built by design 13).
+//!
+//! **ONE FILE FOR TWO TYPES, BECAUSE THE PAIR IS ONE OBJECT.** Every other
+//! module here is one file per §2 row, and this one is two rows — deliberately:
+//! an inlet and an outlet are two counted KINDS over one connection, so every
+//! sentence that explains either explains it by contrast with the other. Neither
+//! type names the other (an inlet has no way to reach its outlet, and that is the
+//! capability model working), so the module graph did not force this; readability
+//! did, which is the placement rule the facade's header states now that extension
+//! lookup follows `public import` (sawlang 0.2.0, SL-7 closed).
+//!
+//! It sits one step above the floor and names nothing else, exactly as `memory`
+//! does: the FACTORY is `Process.pipe_create`, because it needs a `Process` and
+//! `Process` is declared in `sos.system`, which imports this file. See there for
+//! the shape that ordering forces — it is the same one `Process.map` has.
+//!
+//! **EVERYTHING POLLS.** Unit 1 has no waitability and nothing parks, so a full
+//! ring and an empty one are both "not right now" — and at THIS tier that is not
+//! an error: `take` answers `Ok(None)` and `post` answers `Ok(false)`, on design
+//! 234 §4's two-channel shape, so a poll loop never matches an error case for a
+//! condition that clears itself. What IS an error is a peer that is gone, and it
+//! is terminal.
+
+import sosabi.{SosStatus, PipeInletHandle, PipeInletOp, PipeOutletHandle,
+               PipeOutletOp, MINT_OP, NO_HANDLE, PIPE_BODY_BYTES}
+
+import sos.floor.{ALL_RIGHTS, call_value, polled_ok, polled_value,
+                  sos_handle_release, sos_pipe_inlet_post,
+                  sos_pipe_outlet_take}
+
+/// A handle to a PipeInlet — the CLIENT end of a connection, where requests flow
+/// IN (spec §2.1; the names are design 10 ruling 2's).
+///
+/// **A ROLE IS AN OBJECT, NOT A RIGHTS MASK** (design 10 D-1). The kernel does
+/// not carry one symmetric pipe object with read and write rights on it, because
+/// a parked receiver is itself a holder and a write-capable count on such a thing
+/// could never reach zero — the socket-`shutdown()` hole. The bidirectionality
+/// dissolves instead: holding one of these means you are the client, and "the
+/// writers went to zero" is "every PipeInlet handle onto this connection is
+/// gone", which the ordinary reference ledger answers.
+///
+/// Built by `Process.pipe_create` and by `BootHandle.take_inlet`, and by nothing
+/// else — no word constructor, no word extractor, the module docstring's rule.
+///
+/// **`NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5). What
+/// makes that interesting here rather than merely tidy: dropping the LAST inlet
+/// is what tells the far end that no request will ever arrive again. Release is
+/// the only way to say it, and RAII is what makes saying it the default —
+/// `let _ = move inlet` is a deliberate close, and letting one fall out of scope
+/// is the same act written by the language.
+public struct PipeInlet {
+    public(package) handle: PipeInletHandle,
+}
+
+extension PipeInlet: NoCopy {
+    /// Drop is release; see `System`'s deinit for the sentinel and the discard.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
+}
+
+extension PipeInlet {
+    /// **STAGE A MESSAGE FOR THE FAR END.** Requires `PipeInletRight.Post`.
+    ///
+    /// `Ok(true)` the message is staged; `Ok(false)` THE RING IS FULL and
+    /// nothing was staged — call again once the far end has taken something.
+    /// The false is not a failure and does not belong in the error channel:
+    /// design 234 §4's rule, that a poll loop must be able to tell "not yet"
+    /// from "broken", read at the sending end.
+    ///
+    /// **IT NEVER BLOCKS AND NEVER WILL** (design 10 ruling 4): `post` is the
+    /// ONE kernel primitive on the client side, and blocking send,
+    /// `send(timeout:)`, TELL and cancel are all compositions over it plus the
+    /// Timer and Waiter machinery — which is what keeps the kernel from ever
+    /// learning what a timeout is. Those compositions arrive with waitability in
+    /// unit 3; until then this is the whole client surface.
+    ///
+    /// `len` may be ZERO — a data-free message is §2.1's own option — and a
+    /// zero-length post reads no buffer at all. A `len` above `PIPE_BODY_BYTES`
+    /// TERMINATES the caller: the maximum is published, and the caller chose the
+    /// number.
+    ///
+    /// `Err(SosStatus.PeerClosed)` means every outlet handle onto this
+    /// connection is gone, so nobody can ever take what you would send. It is
+    /// TERMINAL — nothing un-closes — so a caller may stop rather than retry.
+    ///
+    /// **IT ANSWERS NO CLAIM YET.** §2.1's `send` yields a `PipeReplyHandle`,
+    /// and that is UNIT 2's — an op growing a return value between units is free
+    /// under §5.7's renumberable discipline, and saying so here is what makes
+    /// this a stated slice rather than a signature somebody will have to break.
+    public func post(&self, body: &[UInt8; PIPE_BODY_BYTES],
+                     len: UInt) -> Result<Bool, SosStatus> {
+        post_body(self.handle, &body, len)
+    }
+
+    /// **MINT A SIBLING of this inlet, narrowed by a KEEP MASK** — the universal
+    /// `MINT_OP`, on `Memory.mint`'s exact terms. Requires the universal
+    /// `PipeInletRight.Mint` on THIS handle.
+    ///
+    /// **THIS IS WHERE A LAUNCHER'S PIPE POLICY IS WRITTEN.** An endpoint's
+    /// default set is permissive — `Transfer | Mint | Post`, and it has to be,
+    /// because attenuation is monotonic and a bit not minted at creation could
+    /// never appear later — so what a child may do with the end it is handed is
+    /// decided here, once, by the mask:
+    ///
+    /// ```saw
+    /// let for_child = inlet.mint(rights: PipeInletRight.Transfer
+    ///                                    | PipeInletRight.Post)!
+    /// child.give(inlet: move for_child, tag: REQUESTS)
+    /// ```
+    ///
+    /// That child can post and can hand the end on, and can never mint a
+    /// narrower sibling of its own.
+    ///
+    /// **A SIBLING IS A SECOND NAME AND THEREFORE A SECOND REFERENCE** on this
+    /// connection's INLET column, which is what makes D-1's v1 rule — any handle
+    /// to an end holds that end open, the Unix `dup` precedent — true by
+    /// construction. Dropping one of two siblings tells the far end nothing;
+    /// only the last one going is news.
+    public func mint(&self,
+                     rights: UInt32 = ALL_RIGHTS) -> Result<PipeInlet, SosStatus> {
+        let raw = try call_value(self.handle, MINT_OP, rights as UInt, 0, 0)
+        return PipeInlet(handle: PipeInletHandle(raw))
+    }
+}
+
+/// The `unsafe` half of `PipeInlet.post`, confined to one small named helper
+/// (design 136). The body's address never leaves it.
+func post_body(handle: PipeInletHandle, body: &[UInt8; PIPE_BODY_BYTES],
+               len: UInt) unsafe -> Result<Bool, SosStatus> {
+    polled_ok(sos_pipe_inlet_post(handle,
+                                  (&body) as UnsafePointer<UInt8>, len))
+}
+
+/// A handle to a PipeOutlet — the SERVER end of a connection, where requests
+/// come OUT (spec §2.1; design 10 ruling 2).
+///
+/// The mirror of `PipeInlet` in every respect but two: which reference column it
+/// counts on, and which op it carries. Everything that type's docstring says
+/// about roles-as-objects, about `NoCopy` and about what dropping the last one
+/// means holds here with the direction reversed — a dropped last OUTLET tells
+/// the client that nothing it sends can ever be read, which is the same peer-gone
+/// doctrine seen from the other side.
+///
+/// Built by `Process.pipe_create` and by `BootHandle.take_outlet`, and by
+/// nothing else.
+public struct PipeOutlet {
+    public(package) handle: PipeOutletHandle,
+}
+
+extension PipeOutlet: NoCopy {
+    /// Drop is release; see `System`'s deinit for the sentinel and the discard.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
+}
+
+extension PipeOutlet {
+    /// **TAKE THE OLDEST STAGED MESSAGE** into `into`, and answer how many bytes
+    /// of it are real. Requires `PipeOutletRight.Take`.
+    ///
+    /// `Ok(Some(n))` a message arrived and its first `n` bytes are yours;
+    /// `Ok(None)` NOTHING IS STAGED — call again. The `None` is design 234 §4's
+    /// two-channel shape, and the reason it is not an error is that reason
+    /// exactly: a server polling an idle connection is not a server meeting a
+    /// failure, and a shape that could not tell those apart would make the poll
+    /// loop unwritable.
+    ///
+    /// `n` MAY BE ZERO, and that is a message rather than an absence — §2.1
+    /// makes a data-free message an option, so the two are genuinely different
+    /// answers and the `Optional` is what keeps them apart.
+    ///
+    /// **THE BUFFER IS A WHOLE SLOT, NOT A MESSAGE.** It is
+    /// `PIPE_BODY_BYTES` wide because a caller cannot size a buffer against a
+    /// length it has not been told yet, which is the same published-minimum rule
+    /// `Waiter.wait`'s record follows.
+    ///
+    /// **IT NEVER PARKS**, and unit 1 has no waitability to park with; unit 3 is
+    /// where an outlet becomes attachable and a blocking receive becomes a
+    /// composition over this call plus a wait.
+    ///
+    /// `Err(SosStatus.PeerClosed)` means the ring is EMPTY *and* every inlet
+    /// handle is gone. **THE ORDER IS THE CONTRACT AND IT IS DRAIN-FIRST**
+    /// (design 230's close-drains-first rule): everything the departed client
+    /// staged is handed over before this is ever answered, so a sender exiting
+    /// mid-conversation loses nothing. Afterwards it is TERMINAL — no new sender
+    /// can appear, because attenuation is monotonic and a column at zero has no
+    /// handle left to mint from — so every later take answers the same.
+    public func take(&self,
+                     into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<UInt?, SosStatus> {
+        take_into(self.handle, &var into)
+    }
+
+    /// **MINT A SIBLING of this outlet, narrowed by a KEEP MASK.** Everything
+    /// `PipeInlet.mint` says holds here with `Take` in `Post`'s place — including
+    /// the part that matters for the connection: a sibling is a second reference
+    /// on the OUTLET column, so a server that mints one and hands it to a helper
+    /// has two names on one end and the client is told nothing until both are
+    /// gone.
+    public func mint(&self,
+                     rights: UInt32 = ALL_RIGHTS) -> Result<PipeOutlet, SosStatus> {
+        let raw = try call_value(self.handle, MINT_OP, rights as UInt, 0, 0)
+        return PipeOutlet(handle: PipeOutletHandle(raw))
+    }
+}
+
+/// The `unsafe` half of `PipeOutlet.take`, confined to one small named helper
+/// (design 136). The buffer's address never leaves it.
+func take_into(handle: PipeOutletHandle,
+               into: &var [UInt8; PIPE_BODY_BYTES]) unsafe -> Result<UInt?, SosStatus> {
+    var value: UInt = 0
+    let raw = sos_pipe_outlet_take(handle,
+                                   (&var into) as UnsafePointer<UInt8>,
+                                   PIPE_BODY_BYTES as UInt,
+                                   (&var value) as UnsafePointer<UInt>)
+    polled_value(raw, value)
+}

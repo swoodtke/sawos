@@ -17,6 +17,7 @@
 
 import sosabi.{SosStatus, SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp,
                InterruptOp, ClockOp, TimerOp, MemoryOp, IoMemoryOp, MappingOp,
+               PipeInletOp, PipeOutletOp,
                RELEASE_OP, MINT_OP}
 
 // The per-arch HAL, and since design 172 part 2 the WHOLE of it: the one
@@ -84,6 +85,67 @@ public(package) func checked(raw: UInt) -> Result<Void, SosStatus> {
 func checked_value(raw: UInt, value: UInt) -> Result<UInt, SosStatus> {
     try checked(raw)
     return value
+}
+
+// -----------------------------------------------------------------------------
+// THE POLL SPLIT — where `WouldBlock` stops being an error (sawos design 13 D-2;
+// design 234 §4's two-channel shape)
+// -----------------------------------------------------------------------------
+//
+// **A WOULD-BLOCK IS NOT AN ERROR AT THE TYPED TIER.** `Channel.try_receive` is
+// the precedent design 234 §4 set and the reason it gives is exactly the pipe's:
+// a poll loop that cannot tell "nothing yet" from "this is broken" waits for
+// ever. So the transient gets the OK channel and a distinguishable absence, and
+// only the genuine refusals — a peer that is gone, a full table, a build skew —
+// reach the error channel.
+//
+// TWO FUNCTIONS BECAUSE THE TWO DIRECTIONS ANSWER DIFFERENT SHAPES. A take
+// yields a LENGTH, so its absence is an `Optional`; a post yields nothing, so
+// its absence is a `Bool` — `Result<Void?, _>` is not a type worth writing, and
+// "was it staged" is a question a caller can act on directly. Both keep the
+// property that matters: the caller never matches an error case for a condition
+// that will clear itself.
+
+/// Decode a status word for an op whose refusal may be transient and whose
+/// success carries NO value: `Ok(true)` it happened, `Ok(false)` not right now.
+public(package) func polled_ok(raw: UInt) -> Result<Bool, SosStatus> {
+    // The same guarded narrowing `checked` writes, and for the same reason: `a0`
+    // is register-wide and the enum is byte-wide, so an `as UInt8` on a word a
+    // kernel skew produced would be a PANIC in a process over a number it did
+    // not choose.
+    if raw > (UInt8.max as UInt) {
+        return SosStatus.Unknown
+    }
+    guard let status = SosStatus.from(raw: raw as UInt8) else {
+        return SosStatus.Unknown
+    }
+    match status {
+        case Ok -> { return true },
+        case WouldBlock -> { return false },
+        case _ -> {},
+    }
+    return status
+}
+
+/// Decode a status word for an op whose refusal may be transient and whose
+/// success carries a VALUE: `Ok(Some(v))` here it is, `Ok(None)` not right now.
+public(package) func polled_value(raw: UInt,
+                                  value: UInt) -> Result<UInt?, SosStatus> {
+    if raw > (UInt8.max as UInt) {
+        return SosStatus.Unknown
+    }
+    guard let status = SosStatus.from(raw: raw as UInt8) else {
+        return SosStatus.Unknown
+    }
+    match status {
+        case Ok -> {
+            let got: UInt? = value
+            return got
+        },
+        case WouldBlock -> { return None },
+        case _ -> {},
+    }
+    return status
 }
 
 /// Issue an op that answers with a value.
@@ -559,6 +621,86 @@ public func sos_iomemory_map(handle: UInt, process: UInt,
 @export("sos_mapping_unmap")
 public func sos_mapping_unmap(handle: UInt) -> UInt {
     sos_syscall1(handle, MappingOp.Unmap as UInt, 0)
+}
+
+// -----------------------------------------------------------------------------
+// The pair (spec §2.1; sawos design 13)
+// -----------------------------------------------------------------------------
+//
+// THREE OPS: make a connection, put a message in, take one out. The factory is
+// on the PROCESS object because a pipe is IPC and carries nothing system-shaped
+// (design 10 ruling 3), and each END has exactly one op because `post` is the
+// one kernel primitive on the client side (ruling 4) and nonblocking `take` is
+// its mirror.
+
+/// **MAKE A CONNECTION, and answer with BOTH of its ends** as a record copied
+/// into `buf` (spec §2.1). Requires `ProcessRight.PipeCreate`.
+///
+/// `cap` is the buffer's size in BYTES and must be at least
+/// `pipe_create_record_bytes()`. The buffer must be word-aligned and inside this
+/// process's writable memory; a buffer that is not TERMINATES the process,
+/// because it is a mistake only the caller could have made.
+///
+/// The record's layout is public: word 0 the PipeInlet handle — the client end,
+/// where requests flow in — and word 1 the PipeOutlet handle, the server end
+/// where they come out. It answers through the funnel rather than the value
+/// register for the plainest reason: an op returns ONE word and this one has two
+/// to say (`sos_clock_now` is the precedent for answering in memory at all).
+///
+/// Both ends are minted into the CALLER's table; wiring them outward is
+/// `sos_process_give`'s job, which is what makes a launcher able to hand the
+/// inlet to one child and keep or pass the outlet. A process at its pipe budget
+/// is `SosStatus.QuotaExceeded`; a full slab or handle table is
+/// `SosStatus.NoResource`.
+@export("sos_process_pipe_create")
+public func sos_process_pipe_create(handle: UInt, buf: UnsafePointer<UInt>,
+                                    cap: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, ProcessOp.PipeCreate as UInt, buf as UInt, cap, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// **POST — stage `len` bytes from `body` for the far end.** Requires
+/// `PipeInletRight.Post`.
+///
+/// IT NEVER SUSPENDS (design 10 ruling 4). `len` may be 0 — a data-free message
+/// is §2.1's own option, and a zero-length post reads no buffer at all, so the
+/// address is not even looked at. A `len` above `PIPE_BODY_BYTES` TERMINATES the
+/// caller: the maximum is published and the caller chose the number. So does a
+/// body that is misaligned or outside this process's memory.
+///
+/// TWO REFUSALS ARE STATUSES, and they are the two a correct program meets:
+/// `SosStatus.PeerClosed` when the far end is gone (nobody can ever take it,
+/// and it is terminal — nothing un-closes), and `SosStatus.WouldBlock` when the
+/// staging ring is full, which is transient and clears when the far end takes.
+@export("sos_pipe_inlet_post")
+public func sos_pipe_inlet_post(handle: UInt, body: UnsafePointer<UInt8>,
+                                len: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, PipeInletOp.Post as UInt, body as UInt, len, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// **TAKE — copy the OLDEST staged message into `buf`, and answer its length**
+/// through `value_out`. Requires `PipeOutletRight.Take`.
+///
+/// IT NEVER PARKS. `cap` is the buffer's size in BYTES and must be at least
+/// `PIPE_BODY_BYTES` — the whole slot's size, because a caller cannot size a
+/// buffer against a length it has not been told yet. A smaller one TERMINATES
+/// the caller, as does a buffer outside this process's writable memory.
+///
+/// TWO REFUSALS ARE STATUSES: `SosStatus.WouldBlock` when the ring is empty and
+/// the far end still exists, and `SosStatus.PeerClosed` when the ring is empty
+/// AND the far end is gone. THE ORDER IS THE CONTRACT — everything staged is
+/// handed over first, whatever became of the sender, and only a drained ring
+/// answers `PeerClosed`. Nothing un-closes, so every later take answers the
+/// same.
+@export("sos_pipe_outlet_take")
+public func sos_pipe_outlet_take(handle: UInt, buf: UnsafePointer<UInt8>,
+                                 cap: UInt,
+                                 value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, PipeOutletOp.Take as UInt, buf as UInt, cap, 0,
+                 value_out)
 }
 
 /// **RELEASE — destroy this handle, whatever kind it names** (sawos design 3

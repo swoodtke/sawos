@@ -1,0 +1,60 @@
+// SOS M4 unit 1: A BODY BIGGER THAN THE SLOT (sawos design 13 D-2; spec §2.1).
+//
+// **THE FIXED BODY MAXIMUM IS PUBLISHED, SO OVERSHOOTING IT IS A FAULT.**
+// `PIPE_BODY_BYTES` is `sosabi`'s — a caller cannot even declare the buffer
+// without it — so a `len` above it is a mistake the process could have checked,
+// which design 178's faults ruling puts outside the status enum entirely. It is
+// the same line `Waiter.wait`'s capacity check falls on, running inward.
+//
+//   SOS oversized: asking for 129
+//   SOS: process fault: argument outside its domain
+//
+// **THE CHECK IS BEFORE THE COPY**, which is what makes the refusal safe rather
+// than merely correct: nothing is read out of the caller's memory and no staging
+// slot is touched, so a hostile length is a diagnostic and never a partial
+// write. §2.1's zero dynamic allocation is what leaves the kernel with a fixed
+// slot to compare against in the first place.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, SosStatus, PIPE_BODY_BYTES}
+
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS oversized: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let pair = try proc.pipe_create() catch {
+        print("SOS oversized: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let (inlet, outlet) = move pair
+
+    // ONE BYTE PAST THE SLOT. The buffer this names is a whole slot wide, so
+    // nothing here is out of bounds in the caller's own memory — what is out of
+    // bounds is the ASK, which is the only thing the kernel is being told.
+    let too_much: UInt = (PIPE_BODY_BYTES as UInt) + 1
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    print("SOS oversized: asking for {}\n", too_much)
+
+    match inlet.post(body: &msg, len: too_much) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS oversized: an oversized body was staged\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        // UNREACHABLE: the kernel ends this process at the length check, so
+        // neither arm runs. Written so the refusal reads as a refusal.
+        case Err(e) -> {
+            print("SOS oversized: post refused: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+}

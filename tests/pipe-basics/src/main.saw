@@ -1,0 +1,228 @@
+// SOS M4 unit 1: THE PAIR, END TO END IN ONE PROCESS (sawos design 13; spec
+// §2.1).
+//
+// **A CONNECTION IS AN OBJECT, AND THIS IS THE SMALLEST PROGRAM THAT PROVES
+// IT.** Root creates a pair, holds both ends itself, and exercises every claim
+// the unit makes about the data path — with no second process, no waitability
+// and no parking anywhere. The transcript is read as a list of properties:
+//
+//   round trip len=3 b=65,66,67   the BYTES came through, not merely a status
+//   fifo first=1 second=2 third=3 ORDER is preserved across several messages
+//   empty message len=0           a data-free message is a MESSAGE (§2.1's
+//                                 option), distinguishable from "nothing yet"
+//   ring depth=16                 the staging ring is 2 x MAX_THREADS deep and
+//                                 a full one REFUSES rather than overwriting
+//   drained=16                    ...and every one of them was still there
+//   take empty is none            an empty ring is Ok(None), not an error
+//
+// **WHY `depth=16` IS A CLAIM AND NOT A NUMBER.** `PIPE_INFLIGHT` is
+// `2 * MAX_THREADS` in `kcore.limits` and is deliberately NOT published to
+// userspace — this program does not know it and cannot name it. It posts until
+// the kernel says no and COUNTS, so the number in the transcript is what the
+// build define produced. A kernel that silently overwrote a staged message, or
+// that stopped one slot early, would print a different number here.
+//
+// **AND `Ok(false)` / `Ok(None)` ARE NOT ERRORS**, which is the typed tier's
+// half of the unit (design 234 §4). A ring that is full and a ring that is empty
+// are both "not right now" — transient, cleared by the peer — so they arrive in
+// the OK channel with a distinguishable absence, and the loops below are
+// ordinary `if`s rather than error matches. What does reach the error channel is
+// `PeerClosed`, and `pipe-peer-gone` is where that is proved.
+//
+// EVERY LOOP IS BOUNDED. A poll loop with no ceiling is a hang the deadlock
+// report cannot see, so both counting loops stop after `MAX_ROUNDS` whatever the
+// kernel answers, and a run that hit the ceiling would print a number the
+// expectation does not match.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, SosStatus, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The ceiling on every poll loop below. Comfortably past any staging ring this
+/// kernel could have — the point is that the loop terminates whatever the
+/// kernel answers, not that the number is tight.
+static MAX_ROUNDS: Int = 64
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS pipebasics: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // **THE FACTORY IS ON THE PROCESS OBJECT** (design 10 ruling 3), and it
+    // hands back BOTH ends at once through a two-word copy-out record — one op
+    // returns one word, and a connection has two ends. Root keeps both here;
+    // `pipe-child` is where one of them travels.
+    let pair = try proc.pipe_create() catch {
+        print("SOS pipebasics: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let (inlet, outlet) = move pair
+    let _ = system.debug_print("SOS pipebasics: created\n")
+
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+
+    // ---- THE ROUND TRIP. The bytes are what is asserted, not the status.
+    msg[0] = 65
+    msg[1] = 66
+    msg[2] = 67
+    let staged = try inlet.post(body: &msg, len: 3) catch {
+        print("SOS pipebasics: post failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    if not staged {
+        let _ = system.debug_print("SOS pipebasics: fresh ring refused a post\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let first = try outlet.take(into: &var buf) catch {
+        print("SOS pipebasics: take failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let n = first else {
+        let _ = system.debug_print("SOS pipebasics: nothing staged\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS pipebasics: round trip len={} b={},{},{}\n", n,
+          buf[0] as UInt, buf[1] as UInt, buf[2] as UInt)
+
+    // ---- FIFO. Three messages in, three out, and the ORDER is the claim: a
+    // ring that handed back the newest first would print 3,2,1 here.
+    msg[0] = 1
+    let a = try inlet.post(body: &msg, len: 1) catch {
+        print("SOS pipebasics: fifo post 1 failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    msg[0] = 2
+    let b = try inlet.post(body: &msg, len: 1) catch {
+        print("SOS pipebasics: fifo post 2 failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    msg[0] = 3
+    let c = try inlet.post(body: &msg, len: 1) catch {
+        print("SOS pipebasics: fifo post 3 failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    if not (a && b && c) {
+        let _ = system.debug_print("SOS pipebasics: fifo posts refused\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var order: UInt = 0
+    var seen: Int = 0
+    while seen < 3 {
+        let got = try outlet.take(into: &var buf) catch {
+            print("SOS pipebasics: fifo take failed: {}\n", error)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        guard let _ = got else {
+            let _ = system.debug_print("SOS pipebasics: fifo ran dry\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        // The three first-bytes accumulated as DIGITS, so ONE number carries the
+        // order and not only the set — `child-drain`'s `tags=35` idiom.
+        order = order * 10 + (buf[0] as UInt)
+        seen = seen + 1
+    }
+    print("SOS pipebasics: fifo order={}\n", order)
+
+    // ---- THE EMPTY MESSAGE. §2.1 makes a data-free body an option, and the
+    // Optional is what keeps "a message of length 0" apart from "no message":
+    // this take answers `Ok(Some(0))`, where the one after the drain below
+    // answers `Ok(None)`.
+    let empty_staged = try inlet.post(body: &msg, len: 0) catch {
+        print("SOS pipebasics: empty post failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    if not empty_staged {
+        let _ = system.debug_print("SOS pipebasics: empty post refused\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let empty = try outlet.take(into: &var buf) catch {
+        print("SOS pipebasics: empty take failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let zero = empty else {
+        let _ = system.debug_print("SOS pipebasics: empty message vanished\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS pipebasics: empty message len={}\n", zero)
+
+    // ---- THE RING'S DEPTH, COUNTED. Post until the kernel refuses; the count
+    // is `PIPE_INFLIGHT`, which this program has no way to name.
+    var depth: UInt = 0
+    var filling = true
+    var rounds: Int = 0
+    while filling && rounds < MAX_ROUNDS {
+        rounds = rounds + 1
+        let put = try inlet.post(body: &msg, len: 1) catch {
+            print("SOS pipebasics: fill failed: {}\n", error)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        if put {
+            depth = depth + 1
+        } else {
+            filling = false
+        }
+    }
+    print("SOS pipebasics: ring depth={}\n", depth)
+
+    // ...and every one of them is still there. A ring that dropped the oldest to
+    // make room would drain fewer than it staged.
+    var drained: UInt = 0
+    var draining = true
+    var passes: Int = 0
+    while draining && passes < MAX_ROUNDS {
+        passes = passes + 1
+        let got = try outlet.take(into: &var buf) catch {
+            print("SOS pipebasics: drain failed: {}\n", error)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        if let _ = got {
+            drained = drained + 1
+        } else {
+            draining = false
+        }
+    }
+    print("SOS pipebasics: drained={}\n", drained)
+
+    // ---- AND AN EMPTY RING IS `Ok(None)`, NOT AN ERROR. The loop above already
+    // met it once; asking again says it is stable, and says it through the
+    // typed tier's two channels rather than through a status a caller would
+    // have had to match as a failure.
+    let nothing = try outlet.take(into: &var buf) catch {
+        print("SOS pipebasics: empty ring is an error: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    if let _ = nothing {
+        let _ = system.debug_print("SOS pipebasics: drained ring still had one\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS pipebasics: take empty is none\n")
+
+    print("SOS pipebasics: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

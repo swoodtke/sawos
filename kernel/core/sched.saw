@@ -42,6 +42,7 @@ import kcore.limits.{
     MAX_IOMEMORIES,
     MAX_MAPPINGS,
     MAX_MEMORIES,
+    MAX_PIPES,
     MAX_THREADS,
     MAX_TIMERS,
     MAX_WAITERS,
@@ -59,6 +60,8 @@ import kcore.objects.{
     MappingSlot,
     MemorySlot,
     NO_ROW,
+    PIPES,
+    PipeSlot,
     SlotState,
     clear_boot_handles,
     quota_clear,
@@ -643,6 +646,42 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
             },
         }
         mp = mp + 1
+    }
+
+    // **PIPE CONNECTIONS GO BACK, BY CREATOR** (spec §2.1; sawos design 13
+    // D-1), on the Memory sweep's exact terms — and this loop is the BACKSTOP
+    // rather than the ordinary path, for the same reason that one is: a
+    // connection frees the moment BOTH of its reference columns reach zero, and
+    // the close-all at the top of this function is what drops the columns for
+    // every endpoint this process still held. What is left here is a connection
+    // whose creator died while some OTHER process still holds an end.
+    //
+    // **THAT LEAVES THE FAR END NAMING A FREED SLOT, and it is the existing
+    // shape rather than a new hazard**: a Memory a launcher gave a child has
+    // carried exactly this property since M3 unit 2 (a region's `process` field
+    // is who was CHARGED, and a give does not move it). It is unreachable today
+    // for the reason the attachment sweep records — with `MAX_PROCESSES` at two
+    // the only process that can outlive a peer is root, and root's death stops
+    // the machine — and the honest fix is per-object ownership transfer at
+    // `give`, which is a ruling no unit has asked for.
+    //
+    // NOTHING IS COUNTED FOR THE REPORT. The teardown line counts what a
+    // process owned of the kinds it has always counted; the three memory slabs
+    // are swept silently for the same reason, and adding a column would rewrite
+    // every teardown line in the suite for a number that is zero in all of them.
+    var pi: Int = 0
+    while pi < MAX_PIPES {
+        if PIPES[pi].process == p {
+            match PIPES[pi].state {
+                case Free -> {},
+                case Live -> {
+                    PIPES[pi] = PipeSlot(state: SlotState.Free, process: 0,
+                                         head: 0, count: 0, inlet_refs: 0,
+                                         outlet_refs: 0)
+                },
+            }
+        }
+        pi = pi + 1
     }
 
     // The protection rows go with the slot, and `LAST_PROT_PROCESS` is

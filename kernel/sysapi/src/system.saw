@@ -26,10 +26,13 @@ import sosabi.{SosStatus, SystemOp, ProcessOp, MemoryOp, IoMemoryOp, MINT_OP,
                SystemHandle, ProcessHandle, ThreadHandle, EventHandle,
                WaiterHandle, InterruptHandle, ClockHandle, MemoryHandle,
                IoMemoryHandle, MappingHandle,
+               PipeInletHandle, PipeOutletHandle,
                NO_HANDLE, BootTagForm, EventMode, ClockType, BootHandleKind,
                BOOT_HANDLE_RECORD_WORDS, BOOT_HANDLE_TAG_WORD,
                BOOT_HANDLE_KIND_WORD, BOOT_HANDLE_HANDLE_WORD,
-               boot_handle_record_bytes}
+               boot_handle_record_bytes,
+               PIPE_CREATE_RECORD_WORDS, PIPE_CREATE_INLET_WORD,
+               PIPE_CREATE_OUTLET_WORD, pipe_create_record_bytes}
 
 // And the `sosabi.` qualifier, for the one encoding this module names WITHOUT
 // binding bare: `sosabi.ENTRY_IMAGE`, the sentinel a process passes when it has
@@ -47,11 +50,13 @@ import sosrt.{ascii_byte}
 
 import sos.floor.{ALL_RIGHTS, call_value, checked, park_system_handle,
                   sos_handle_release, sos_process_boot_handle_next,
-                  sos_process_exit, sos_process_give, sos_process_start,
+                  sos_process_exit, sos_process_give, sos_process_pipe_create,
+                  sos_process_start,
                   sos_system_debug_print, sos_system_shutdown, sos_waiter_add}
 import sos.memory.{Memory}
 import sos.iomemory.{IoMemory}
 import sos.mapping.{Mapping}
+import sos.pipe.{PipeInlet, PipeOutlet}
 // QUALIFIED, ALONE AMONG THE NINE: `std.task` publishes a prelude
 // `Thread<T>`, and a bare imported `Thread` ties with it where a locally
 // DECLARED one used to win — which is what the split turned this name into.
@@ -614,6 +619,86 @@ extension Process {
         return checked(sos_process_give(self.handle, word, tag))
     }
 
+    /// Give the CLIENT END of a connection to this process under `tag`,
+    /// consuming the wrapper. Requires `ProcessRight.Give` here and
+    /// `PipeInletRight.Transfer` on the end — which every end
+    /// `Process.pipe_create` mints carries.
+    ///
+    /// **THIS IS WHAT A PAIR IS FOR** (sawos design 13 D-3). A launcher creates
+    /// the connection, keeps or gives the outlet, and hands the inlet to whoever
+    /// is to be the client — two ordinary gives, and the two processes are then
+    /// joined by a capability neither of them could have named otherwise.
+    /// `pipe-child` is that flow at its smallest: root keeps the outlet, the
+    /// child posts through the inlet, and the only thing the two programs share
+    /// is the tag.
+    ///
+    /// **THE COUNT DOES NOT CHANGE, AND THAT MATTERS HERE MORE THAN ANYWHERE
+    /// ELSE.** A give is a MOVE: the connection's inlet column is exactly what
+    /// it was on both sides of this call, so handing an end over is never the
+    /// event that tells the far end anything. Only the LAST holder of an end
+    /// dropping it is news — which is what makes a launcher able to route an end
+    /// through itself without the peer ever seeing a flicker of peer-gone.
+    ///
+    /// The transfer-funnel contract is the same as the three funnels above: by
+    /// value, disarm before the syscall, let the disarmed value drop. What you
+    /// give away you cannot post through.
+    public func give(&self, inlet: PipeInlet,
+                     tag: UInt) -> Result<Void, SosStatus> {
+        var client = move inlet
+        let word: UInt = client.handle
+        client.handle = PipeInletHandle(NO_HANDLE)
+        return checked(sos_process_give(self.handle, word, tag))
+    }
+
+    /// Give the SERVER END of a connection to this process under `tag`,
+    /// consuming the wrapper. Requires `ProcessRight.Give` here and
+    /// `PipeOutletRight.Transfer` on the end.
+    ///
+    /// The mirror of `give(inlet:)`, and the direction a launcher uses when the
+    /// CHILD is the server: root creates the pair, gives the child the outlet
+    /// and keeps the inlet, and the child's loop is a `take` poll. Unit 5's
+    /// driver-as-service is that shape with a protocol on top.
+    public func give(&self, outlet: PipeOutlet,
+                     tag: UInt) -> Result<Void, SosStatus> {
+        var server = move outlet
+        let word: UInt = server.handle
+        server.handle = PipeOutletHandle(NO_HANDLE)
+        return checked(sos_process_give(self.handle, word, tag))
+    }
+
+    /// **MAKE A CONNECTION IN THIS PROCESS, and receive BOTH of its ends** (spec
+    /// §2.1; sawos design 10 ruling 3, built by design 13). Requires
+    /// `ProcessRight.PipeCreate`.
+    ///
+    /// **THE FACTORY IS ON THE PROCESS OBJECT**, not on System, and that is a
+    /// ruling rather than a placement: pipes are IPC and carry nothing
+    /// system-shaped, and putting the authority on a per-process handle is what
+    /// makes it ATTENUABLE — a child whose Process handle was minted through a
+    /// keep mask without the bit can hold and use connections somebody else made
+    /// and can never make one of its own. `EventCreate` and `WaiterCreate` are
+    /// the precedents; `ProcessCreate` is the one op that went the other way,
+    /// because a process is machine-global and a pipe is not.
+    ///
+    /// **BOTH ENDS COME BACK AT ONCE, AND THAT IS WHY THE KERNEL ANSWERS IN
+    /// MEMORY.** An op returns one word; a connection has two ends. So the
+    /// answer is a two-word copy-out record — the funnel `Clock.now` already
+    /// uses — decoded here into the two owning wrappers. A caller never sees the
+    /// record and never sees a word.
+    ///
+    /// **THE CREATOR HOLDS BOTH, AND WIRES THEM OUTWARD WITH `give`.** That is
+    /// the whole launch story for a connection: `let (inlet, outlet) = try
+    /// proc.pipe_create()`, then `child.give(inlet: move inlet, tag: …)` and
+    /// keep the outlet — or the mirror. Nothing about the flow is new; a
+    /// connection end is a capability like any other.
+    ///
+    /// A process at its pipe budget is `SosStatus.QuotaExceeded` — creator-pays,
+    /// so this ONE charge covers the pair — and a full slab or handle table is
+    /// `SosStatus.NoResource`. Either way nothing was created and neither table
+    /// moved.
+    public func pipe_create(&self) -> Result<(PipeInlet, PipeOutlet), SosStatus> {
+        pipe_create_into_frame(self.handle)
+    }
+
     // -------------------------------------------------------------------------
     // THE MAP FUNNELS (sawos design 6 D-3)
     // -------------------------------------------------------------------------
@@ -836,6 +921,16 @@ public struct BootHandle {
     /// build's region table mints an `IoMemory`, and a driver's first act is to
     /// drain it (sawos design 6 D-1/D-5).
     iomemory: IoMemory?,
+    /// The CLIENT end of a connection, on the same terms — `take_inlet` is its
+    /// one door. M4 unit 1's slot (sawos design 13 D-3): a launcher creates a
+    /// pair and gives one end across, and the child drains it exactly as it
+    /// drains a region.
+    inlet: PipeInlet?,
+    /// The SERVER end, on the same terms — `take_outlet` is its one door. The
+    /// sixth slot, and the pair's other half: which end a child receives is
+    /// entirely its launcher's config, so both spellings exist and a record
+    /// carries at most one of them.
+    outlet: PipeOutlet?,
 }
 
 extension BootHandle: NoCopy {}
@@ -888,6 +983,23 @@ extension BootHandle {
     public func take_iomemory(&var self) -> IoMemory? {
         self.iomemory.take()
     }
+
+    /// Take the CLIENT END of a connection out of this record. Same terms as
+    /// `take_memory`.
+    ///
+    /// A child that is to be a client drains this and posts through it. Asking
+    /// for the wrong end is `None` and disturbs nothing, which is the property
+    /// that makes SIX separate slots the right shape rather than an enum
+    /// payload: a mismatch must not drop the capability the caller still wanted.
+    public func take_inlet(&var self) -> PipeInlet? {
+        self.inlet.take()
+    }
+
+    /// Take the SERVER END of a connection out of this record. Same terms as
+    /// `take_memory`.
+    public func take_outlet(&var self) -> PipeOutlet? {
+        self.outlet.take()
+    }
 }
 
 /// Decode a record the kernel copied out into a `BootHandle`.
@@ -905,18 +1017,50 @@ func decode_boot_handle(tag: UInt, kind: UInt, handle: UInt) -> BootHandle {
     match what {
         case Memory -> BootHandle(tag: tag, kind: what,
                                   memory: Memory(handle: MemoryHandle(handle)),
-                                  process: None, system: None, iomemory: None),
+                                  process: None, system: None, iomemory: None,
+                                  inlet: None, outlet: None),
         case Process -> BootHandle(tag: tag, kind: what, memory: None,
                                    process: Process(handle: ProcessHandle(handle)),
-                                   system: None, iomemory: None),
+                                   system: None, iomemory: None,
+                                   inlet: None, outlet: None),
         case System -> BootHandle(tag: tag, kind: what, memory: None,
                                   process: None,
                                   system: System(handle: SystemHandle(handle)),
-                                  iomemory: None),
+                                  iomemory: None, inlet: None, outlet: None),
         case IoMemory -> BootHandle(tag: tag, kind: what, memory: None,
                                     process: None, system: None,
-                                    iomemory: IoMemory(handle: IoMemoryHandle(handle))),
+                                    iomemory: IoMemory(handle: IoMemoryHandle(handle)),
+                                    inlet: None, outlet: None),
+        case PipeInlet -> BootHandle(tag: tag, kind: what, memory: None,
+                                     process: None, system: None, iomemory: None,
+                                     inlet: PipeInlet(handle: PipeInletHandle(handle)),
+                                     outlet: None),
+        case PipeOutlet -> BootHandle(tag: tag, kind: what, memory: None,
+                                      process: None, system: None,
+                                      iomemory: None, inlet: None,
+                                      outlet: PipeOutlet(handle: PipeOutletHandle(handle))),
     }
+}
+
+/// The `unsafe` half of `Process.pipe_create`, confined to one small named
+/// helper (design 136). The record buffer's address never leaves it.
+///
+/// **THE TUPLE IS THE ANSWER, AND IT IS THE RIGHT ONE HERE** — where the boot
+/// record needed an `Optional` per slot and a `take_*` per Optional. The reason
+/// is the difference between the two records: a `BootHandle` carries at most ONE
+/// of six kinds and a caller must be able to ask the wrong question harmlessly,
+/// so its slots have to survive being looked at; a pipe-create answer always
+/// carries EXACTLY TWO wrappers and the caller always wants both, so a
+/// destructuring `let` moves each into its own binding and there is no husk to
+/// leave behind.
+func pipe_create_into_frame(handle: ProcessHandle) unsafe -> Result<(PipeInlet, PipeOutlet), SosStatus> {
+    var buf: [UInt; PIPE_CREATE_RECORD_WORDS] = [0; PIPE_CREATE_RECORD_WORDS]
+    try checked(sos_process_pipe_create(handle,
+                                        (&var buf) as UnsafePointer<UInt>,
+                                        pipe_create_record_bytes() as UInt))
+    let inlet = PipeInlet(handle: PipeInletHandle(buf[PIPE_CREATE_INLET_WORD]))
+    let outlet = PipeOutlet(handle: PipeOutletHandle(buf[PIPE_CREATE_OUTLET_WORD]))
+    return (move inlet, move outlet)
 }
 
 /// The `unsafe` half of `Process.boot_handle_next`, confined to one small named

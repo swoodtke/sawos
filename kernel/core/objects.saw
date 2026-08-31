@@ -33,6 +33,11 @@ import sosabi.{
     IoMemoryRight,
     MappingHandle,
     MappingRight,
+    PipeInletHandle,
+    PipeInletRight,
+    PipeOutletHandle,
+    PipeOutletRight,
+    PIPE_BODY_BYTES,
     BootHandleKind,
     SosStatus,
     NO_HANDLE,
@@ -47,6 +52,7 @@ import kcore.limits.{
     DEFAULT_QUOTA_IOMEMORIES,
     DEFAULT_QUOTA_MAPPINGS,
     DEFAULT_QUOTA_MEMORIES,
+    DEFAULT_QUOTA_PIPES,
     DEFAULT_QUOTA_THREADS,
     DEFAULT_QUOTA_TIMERS,
     DEFAULT_QUOTA_WAITERS,
@@ -56,6 +62,7 @@ import kcore.limits.{
     MAX_IOMEMORIES,
     MAX_MAPPINGS,
     MAX_MEMORIES,
+    MAX_PIPES,
     MAX_PROCESSES,
     MAX_THREADS,
     MAX_TIMERS,
@@ -63,6 +70,8 @@ import kcore.limits.{
     NO_IOMEMORY,
     NO_MAPPING,
     NO_MEMORY,
+    NO_PIPE,
+    PIPE_INFLIGHT,
 }
 
 /// One handle-table entry: the object a handle names, the rights its holder has
@@ -271,6 +280,46 @@ public(package) struct MappingObject {
 
 extension MappingObject {
     public(package) func allows(&self, right: MappingRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
+    }
+}
+
+/// A PipeInlet handle the dispatch has VALIDATED, paired with its rights and the
+/// CONNECTION slot it names (spec §2.1; sawos design 13).
+///
+/// **`slot` NAMES THE CONNECTION, NOT AN ENDPOINT**, which is D-1's one slab
+/// seen from the dispatch: both endpoint kinds target the same `PIPES` row, and
+/// what makes this handle the CLIENT end is its `obj_type` — established by §3's
+/// order before any right is read. Which reference column it counts on, which op
+/// table it answers to and which rights enum its word is read against all follow
+/// from that one fact.
+public(package) struct PipeInletObject {
+    public(package) handle: PipeInletHandle,
+    public(package) rights: UInt32,
+    public(package) slot: Int,
+}
+
+extension PipeInletObject {
+    public(package) func allows(&self, right: PipeInletRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
+    }
+}
+
+/// A PipeOutlet handle the dispatch has VALIDATED, paired with its rights and
+/// the CONNECTION slot it names (spec §2.1; sawos design 13).
+///
+/// A SEPARATE WRAPPER AND NOT A FLAG, exactly as `IoMemoryObject` is separate
+/// from `MemoryObject`: a function taking one of these can only ever have been
+/// handed the server end, so "an inlet cannot take and an outlet cannot post" is
+/// a fact about which `allows` compiles rather than a check somebody runs.
+public(package) struct PipeOutletObject {
+    public(package) handle: PipeOutletHandle,
+    public(package) rights: UInt32,
+    public(package) slot: Int,
+}
+
+extension PipeOutletObject {
+    public(package) func allows(&self, right: PipeOutletRight) -> Bool {
         (self.rights & (right as UInt32)) != 0
     }
 }
@@ -532,6 +581,17 @@ public(package) func unbind_handle(p: Int, index: Int) unsafe {
 /// unlikely. `Thread` is the mirror asymmetry from the other side: it has a
 /// slab and no refcount, so its row is charged and only ever credited by the
 /// teardown.
+/// **`Pipe` IS M4 UNIT 1's ROW, AND IT IS CREATOR-PAYS FOR A CONNECTION RATHER
+/// THAN FOR AN ENDPOINT** (sawos design 10 ruling 6; design 13 D-1). One charge
+/// at `ProcessOp.PipeCreate`, credited when BOTH reference columns reach zero
+/// and the connection's slot goes back — which is the only moment the scarce
+/// thing it counts (a `PIPES` row and its staging ring) is actually returned.
+///
+/// **CHARGING THE PAIR ONCE IS THE POINT.** Two ends of one connection are two
+/// handle entries, and the HANDLE row already counts those; a second charge per
+/// endpoint would make a launcher that keeps both ends pay twice for one slab
+/// slot, and would make "give one end away" look like a refund. What the ledger
+/// tracks is what the slab holds.
 public(package) enum QuotaKind: UInt8 {
     case Thread = 0,
     case Event = 1,
@@ -542,10 +602,11 @@ public(package) enum QuotaKind: UInt8 {
     case IoMemory = 6,
     case Mapping = 7,
     case Handle = 8,
+    case Pipe = 9,
 }
 
 /// Columns in the ledger — one per `QuotaKind`, and the arrays' stride.
-public(package) static QUOTA_KINDS: Int = 9
+public(package) static QUOTA_KINDS: Int = 10
 
 /// "No policy cap on this row: the MACHINE answers."
 ///
@@ -668,6 +729,7 @@ public(package) func install_quota_limits(p: Int, root: Bool, free_rows: Int) un
         set_limit(p, QuotaKind.Memory, QUOTA_UNLIMITED)
         set_limit(p, QuotaKind.IoMemory, QUOTA_UNLIMITED)
         set_limit(p, QuotaKind.Handle, QUOTA_UNLIMITED)
+        set_limit(p, QuotaKind.Pipe, QUOTA_UNLIMITED)
     } else {
         set_limit(p, QuotaKind.Thread, DEFAULT_QUOTA_THREADS as UInt16)
         set_limit(p, QuotaKind.Event, DEFAULT_QUOTA_EVENTS as UInt16)
@@ -677,6 +739,7 @@ public(package) func install_quota_limits(p: Int, root: Bool, free_rows: Int) un
         set_limit(p, QuotaKind.Memory, DEFAULT_QUOTA_MEMORIES as UInt16)
         set_limit(p, QuotaKind.IoMemory, DEFAULT_QUOTA_IOMEMORIES as UInt16)
         set_limit(p, QuotaKind.Handle, DEFAULT_QUOTA_HANDLES as UInt16)
+        set_limit(p, QuotaKind.Pipe, DEFAULT_QUOTA_PIPES as UInt16)
     }
 
     // A record that somehow holds more rows than the profile grants would make
@@ -886,6 +949,141 @@ public(package) func compact_mapping_rows(target: Int, removed: Int) unsafe {
         }
         i = i + 1
     }
+}
+
+// =============================================================================
+// The Pipe slab — ONE CONNECTION, TWO COUNTED KINDS (spec §2.1; sawos design 13
+// D-1, on design 10 D-1 and ruling 6)
+// =============================================================================
+//
+// **ONE SLAB, TWO REFERENCE COLUMNS, AND THAT IS THE WHOLE OF "ROLES ARE
+// OBJECTS".** `ObjType.PipeInlet` and `ObjType.PipeOutlet` are two counted kinds
+// that TARGET THE SAME ROW here, and which column a handle entry maintains is
+// decided by its kind — which §3's order establishes before any right is read.
+// So "the writers went to zero" is "the inlet column reached zero", asked of the
+// ledger design 7 already built, with no second ledger and no rights-partitioned
+// count.
+//
+// **THE SLOT FREES WHEN BOTH COLUMNS ARE ZERO**, and only then; ONE column
+// reaching zero is the PEER-GONE transition, which `kcore.refs` is where it
+// becomes mechanical. A connection with a live outlet and no inlet is a slot
+// that still has messages to hand over — design 230's close-drains-first rule,
+// which is exactly why the free cannot be per-endpoint.
+//
+// **THE STAGING IS SEPARATE STORAGE, NOT A FIELD.** A ring of `PIPE_INFLIGHT`
+// slots at `PIPE_BODY_BYTES` each is kilobytes per connection, and a slot struct
+// holding one would make every `PIPES[slot] = PipeSlot(...)` a multi-kilobyte
+// memset inside a syscall. So the bodies live in their own flat array, indexed
+// `c * PIPE_INFLIGHT * PIPE_BODY_BYTES + i * PIPE_BODY_BYTES` — the handle
+// table's own idiom, one file up from where the boot-handle queue uses it — and
+// the slot carries the three numbers that describe the ring rather than the ring
+// itself. Both arrays are all-zero initializers, so they cost NO IMAGE BYTES
+// (design 149) and the kernel's `.bss` is where the storage lands.
+//
+// **NOTHING IS EVER ALLOCATED PER MESSAGE**, which is the property §2.1's fixed
+// body and fixed in-flight budget were ratified for. A post writes an existing
+// slot; a take reads one and advances a cursor.
+//
+// It sits BELOW `process` for the reason every other slab does: ending a process
+// frees what it owned, so the storage has to be reachable from the teardown.
+
+/// One Pipe CONNECTION: whose it is, what is staged, and how many handles name
+/// each of its two ends.
+///
+/// `process` is the CREATOR — creator-pays (design 7 D-3), so whoever was
+/// charged is who gets the quota row back when the connection frees, whichever
+/// process happened to drop the last handle onto either end.
+///
+/// `head` and `count` are the ring, and there is no `tail` because a tail is
+/// `(head + count) % PIPE_INFLIGHT` — one derivation beats a second index two
+/// paths would have to keep in step.
+///
+/// **THE TWO COLUMNS ARE THE PEER-GONE STATE, and no flag beside them says so.**
+/// "The inlet side is gone" IS `inlet_refs == 0`, because a column can only fall
+/// to zero and can never rise again: what would raise it is a handle onto that
+/// end, and a mint needs a source handle there is none of. So the terminal level
+/// is a fact about the count rather than a bit somebody has to remember to set,
+/// and the two can never disagree.
+public(package) struct PipeSlot {
+    public(package) state: SlotState,
+    public(package) process: Int,
+    /// The oldest staged message's ring index.
+    public(package) head: Int,
+    /// How many messages are staged.
+    public(package) count: Int,
+    /// How many handle entries name the CLIENT end (sawos design 7 D-1's
+    /// counting rule, one column per kind).
+    public(package) inlet_refs: UInt16,
+    /// How many handle entries name the SERVER end.
+    public(package) outlet_refs: UInt16,
+}
+
+public(package) unsafe static var PIPES: [PipeSlot; MAX_PIPES] = [
+    PipeSlot(state: SlotState.Free, process: 0, head: 0, count: 0,
+             inlet_refs: 0, outlet_refs: 0);
+    MAX_PIPES]
+
+/// Every connection's staging ring, back to back — the storage the slots above
+/// describe.
+static PIPE_BODY_STORAGE: Int = MAX_PIPES * PIPE_INFLIGHT * PIPE_BODY_BYTES
+
+public(package) unsafe static var PIPE_BODIES: [UInt8; PIPE_BODY_STORAGE] = [
+    0; PIPE_BODY_STORAGE]
+
+/// How long the message in each staging slot is. A separate array for the
+/// reason the bodies are a separate array: the slot struct stays small.
+static PIPE_LEN_SLOTS: Int = MAX_PIPES * PIPE_INFLIGHT
+
+public(package) unsafe static var PIPE_LENS: [UInt16; PIPE_LEN_SLOTS] = [
+    0; PIPE_LEN_SLOTS]
+
+/// Take a free Pipe slot, or `NO_PIPE` when the slab is full.
+public(package) func alloc_pipe() unsafe -> Int {
+    var i: Int = 0
+    while i < MAX_PIPES {
+        match PIPES[i].state {
+            case Free -> { return i },
+            case Live -> {},
+        }
+        i = i + 1
+    }
+    NO_PIPE
+}
+
+/// The KERNEL address of connection `c`'s staging slot `i`.
+///
+/// The whole-array address plus an offset, which is `frame_slot`'s own idiom in
+/// `kcore.threads` — an `unsafe static var` array has one address and every slot
+/// is arithmetic on it. Confined to this small named helper (design 136), so the
+/// callers stay ordinary code and the pointer never leaves the expression.
+public(package) func pipe_body_addr(c: Int, i: Int) unsafe -> UInt {
+    let base = ((&var PIPE_BODIES) as UnsafePointer<UInt8>) as UInt
+    base + (((c * PIPE_INFLIGHT + i) * PIPE_BODY_BYTES) as UInt)
+}
+
+/// Where connection `c`'s staging slot `i` records its length.
+public(package) func pipe_len_at(c: Int, i: Int) -> Int {
+    c * PIPE_INFLIGHT + i
+}
+
+/// **DROP EVERYTHING CONNECTION `c` HAS STAGED** — the outlet-side zero-arm's
+/// half of the peer-gone transition (sawos design 13 D-2).
+///
+/// It is called at the moment the OUTLET column reaches zero, because from that
+/// moment nobody can ever take again: a take needs an outlet handle, a mint
+/// needs a source, and a column at zero has neither. Messages that could never
+/// be delivered are not held, they are dropped.
+///
+/// **NOTHING OWNS ANYTHING, WHICH IS WHY THIS IS TWO ASSIGNMENTS.** A staged
+/// message is BYTES THAT WERE COPIED — the sender's buffer is still the sender's
+/// and the kernel's slot is plain storage — so dropping them is forgetting them.
+/// The bytes are deliberately not zeroed: the slot is unreachable until a later
+/// post writes it, and every read of a staging slot is bounded by the length the
+/// post that wrote it recorded. Handles in messages are UNIT 4's, and that is
+/// the unit in which this function grows a body.
+public(package) func pipe_drop_staged(c: Int) unsafe {
+    PIPES[c].head = 0
+    PIPES[c].count = 0
 }
 
 // =============================================================================
