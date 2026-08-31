@@ -194,12 +194,9 @@ func _start(boot_handle: UInt) {
     // §12's SYMMETRY: a child bootstraps exactly as root does. A failure here
     // cannot report through `exit`, because `exit` is the op on the handle that
     // just failed to arrive.
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(e) -> {
-            print("SOS echo: no process handle: {}\n", e)
-            return
-        },
+    let proc = try system.process_self() catch {
+        print("SOS echo: no process handle: {}\n", error)
+        return
     }
 
     // **STEP 0 — OBTAIN THE WINDOW.** Identical to the ns16550 child package's,
@@ -207,44 +204,32 @@ func _start(boot_handle: UInt) {
     // per-device act, and receiving one from a LAUNCHER is not a different act
     // from receiving one from the kernel. The record was queued by
     // `ProcessOp.Give`; nothing in this call can tell, and nothing needs to.
-    var record = match proc.boot_handle_next() {
-        case Ok(h) -> h,
-        case Err(e) -> {
-            print("SOS echo: no device window: {}\n", e)
-            let _ = proc.exit(EXIT_FAILED)
-            return
-        },
+    var record = try proc.boot_handle_next() catch {
+        print("SOS echo: no device window: {}\n", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
     }
     guard let window = record.take_iomemory() else {
         let _ = system.debug_print("SOS echo: boot record is not a window\n")
         let _ = proc.exit(EXIT_FAILED)
         return
     }
-    let _mapping = match proc.map(iomemory: &window) {
-        case Ok(m) -> m,
-        case Err(e) -> {
-            print("SOS echo: map failed: {}\n", e)
-            let _ = proc.exit(EXIT_FAILED)
-            return
-        },
+    let _mapping = try proc.map(iomemory: &window) catch {
+        print("SOS echo: map failed: {}\n", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
     }
     let _ = system.debug_print("SOS echo: window mapped\n")
 
-    let irq = match proc.interrupt_bind(line: UART_IRQ) {
-        case Ok(i) -> i,
-        case Err(e) -> {
-            print("SOS echo: no interrupt: {}\n", e)
-            let _ = proc.exit(EXIT_FAILED)
-            return
-        },
+    let irq = try proc.interrupt_bind(line: UART_IRQ) catch {
+        print("SOS echo: no interrupt: {}\n", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
     }
-    let waiter = match proc.waiter_create() {
-        case Ok(w) -> w,
-        case Err(e) -> {
-            print("SOS echo: no waiter: {}\n", e)
-            let _ = proc.exit(EXIT_FAILED)
-            return
-        },
+    let waiter = try proc.waiter_create() catch {
+        print("SOS echo: no waiter: {}\n", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
     }
     match waiter.add(&irq, ECHO_KEY) {
         case Ok(_) -> {},
@@ -266,13 +251,10 @@ func _start(boot_handle: UInt) {
     var line: UInt = 0        // a line number, which is what `woke_on_line` answers
     var wakes = 0
     while echoed < ECHO_BYTES {
-        let answer = match waiter.wait() {
-            case Ok(r) -> r,
-            case Err(e) -> {
-                print("SOS echo: wait failed: {}\n", e)
-                let _ = proc.exit(EXIT_FAILED)
-                return
-            },
+        let answer = try waiter.wait() catch {
+            print("SOS echo: wait failed: {}\n", error)
+            let _ = proc.exit(EXIT_FAILED)
+            return
         }
         line = woke_on_line(&answer)
         wakes = wakes + 1

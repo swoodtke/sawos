@@ -69,24 +69,18 @@ func is_quota(status: SosStatus) -> Bool {
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(e) -> {
-            print("SOS childmapwall: no process handle: {}\n", e)
-            return
-        },
+    let proc = try system.process_self() catch {
+        print("SOS childmapwall: no process handle: {}\n", error)
+        return
     }
 
     // ONE RECORD: the region its launcher gave it. The tag is the launcher's
     // config and this program does not read it — the drain hands records back
     // in give order and there is only one.
-    var record = match proc.boot_handle_next() {
-        case Ok(h) -> h,
-        case Err(e) -> {
-            print("SOS childmapwall: no region: {}\n", e)
-            let _ = proc.exit(EXIT_MISMATCH)
-            return
-        },
+    var record = try proc.boot_handle_next() catch {
+        print("SOS childmapwall: no region: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
     }
     guard let region = record.take_memory() else {
         print("SOS childmapwall: the record is not a region\n")

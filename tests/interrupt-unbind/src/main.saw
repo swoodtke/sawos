@@ -43,22 +43,16 @@ static EXIT_FAILED: UInt = 1
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS irqunbind: no process handle\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS irqunbind: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
-    let first = match proc.interrupt_bind(line: QUIET_LINE) {
-        case Ok(i) -> i,
-        case Err(e) -> {
-            print("SOS irqunbind: first bind failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let first = try proc.interrupt_bind(line: QUIET_LINE) catch {
+        print("SOS irqunbind: first bind failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     print("SOS irqunbind: bound line {}\n", QUIET_LINE)
 
@@ -70,13 +64,10 @@ func _start(boot_handle: UInt) {
     // **AND THE PROOF.** A line still bound answers `LineBound`, which is a
     // FAULT and would end this process without printing anything further. The
     // line below existing in the transcript at all is the claim.
-    let second = match proc.interrupt_bind(line: QUIET_LINE) {
-        case Ok(i) -> i,
-        case Err(e) -> {
-            print("SOS irqunbind: rebind refused: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let second = try proc.interrupt_bind(line: QUIET_LINE) catch {
+        print("SOS irqunbind: rebind refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let _ = system.debug_print("SOS irqunbind: rebound=1\n")
 

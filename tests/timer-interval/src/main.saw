@@ -99,37 +99,25 @@ func spin_to(clock: &Clock, deadline: UInt64) {
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS interval: no process handle\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS interval: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let clock = match system.clock_get() {
-        case Ok(c) -> c,
-        case Err(e) -> {
-            print("SOS interval: no clock: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let clock = try system.clock_get() catch {
+        print("SOS interval: no clock: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let waiter = match proc.waiter_create() {
-        case Ok(w) -> w,
-        case Err(e) -> {
-            print("SOS interval: no waiter: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let waiter = try proc.waiter_create() catch {
+        print("SOS interval: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let timer = match clock.timer_create() {
-        case Ok(t) -> t,
-        case Err(e) -> {
-            print("SOS interval: no timer: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let timer = try clock.timer_create() catch {
+        print("SOS interval: no timer: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     match waiter.add(&timer, KEY) {
         case Ok(_) -> {},
@@ -150,24 +138,18 @@ func _start(boot_handle: UInt) {
         },
     }
 
-    let one = match waiter.wait() {
-        case Ok(r) -> r,
-        case Err(e) -> {
-            print("SOS interval: first wait failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let one = try waiter.wait() catch {
+        print("SOS interval: first wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     print("SOS interval: tick one fires={}\n", fires_of(&one))
 
     // NOTHING HAPPENS BETWEEN THESE TWO WAITS. No ack, no re-arm.
-    let two = match waiter.wait() {
-        case Ok(r) -> r,
-        case Err(e) -> {
-            print("SOS interval: second wait failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let two = try waiter.wait() catch {
+        print("SOS interval: second wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let count_two = fires_of(&two)
     print("SOS interval: tick two fires={} ackfree={}\n",
@@ -175,13 +157,10 @@ func _start(boot_handle: UInt) {
 
     // Now go away for several periods without waiting.
     spin_to(&clock, now_of(&clock) + SPIN_NS)
-    let many = match waiter.wait() {
-        case Ok(r) -> r,
-        case Err(e) -> {
-            print("SOS interval: third wait failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let many = try waiter.wait() catch {
+        print("SOS interval: third wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     print("SOS interval: coalesced={}\n", flag(fires_of(&many) > 1))
 
@@ -201,13 +180,10 @@ func _start(boot_handle: UInt) {
             return
         },
     }
-    let fresh = match waiter.wait() {
-        case Ok(r) -> r,
-        case Err(e) -> {
-            print("SOS interval: fourth wait failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let fresh = try waiter.wait() catch {
+        print("SOS interval: fourth wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     print("SOS interval: drained fires={}\n", fires_of(&fresh))
 

@@ -49,32 +49,23 @@ static PARK_NS: UInt64 = 20_000_000
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS isolation: no process handle\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS isolation: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     // Row 0 is the child's image blob, row 1 the RAM it runs in — this build's
     // config, which is root's business and never the kernel's.
-    var image = match proc.boot_handle_next() {
-        case Ok(h) -> h,
-        case Err(e) -> {
-            print("SOS isolation: no image region: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    var image = try proc.boot_handle_next() catch {
+        print("SOS isolation: no image region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    var dest = match proc.boot_handle_next() {
-        case Ok(h) -> h,
-        case Err(e) -> {
-            print("SOS isolation: no destination region: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    var dest = try proc.boot_handle_next() catch {
+        print("SOS isolation: no destination region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     // The record hands the region over — see `process-lifecycle` for why
@@ -82,14 +73,11 @@ func _start(boot_handle: UInt) {
     let image_mem = image.take_memory()!
     let dest_mem = dest.take_memory()!
 
-    let child = match system.process_create(image: &image_mem,
-                                            memory: &dest_mem) {
-        case Ok(c) -> c,
-        case Err(e) -> {
-            print("SOS isolation: create failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let child = try system.process_create(image: &image_mem,
+                                          memory: &dest_mem) catch {
+        print("SOS isolation: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     match child.start() {
         case Ok(_) -> {},
@@ -101,29 +89,20 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS isolation: started\n")
 
-    let clock = match system.clock_get(type: ClockType.Monotonic) {
-        case Ok(c) -> c,
-        case Err(e) -> {
-            print("SOS isolation: no clock: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
+        print("SOS isolation: no clock: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let waiter = match proc.waiter_create() {
-        case Ok(w) -> w,
-        case Err(e) -> {
-            print("SOS isolation: no waiter: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let waiter = try proc.waiter_create() catch {
+        print("SOS isolation: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let timer = match clock.timer_create() {
-        case Ok(t) -> t,
-        case Err(e) -> {
-            print("SOS isolation: no timer: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let timer = try clock.timer_create() catch {
+        print("SOS isolation: no timer: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     match waiter.add(&timer, KEY) {
         case Ok(_) -> {},
@@ -150,13 +129,10 @@ func _start(boot_handle: UInt) {
         },
     }
 
-    let status = match child.get_status() {
-        case Ok(s) -> s,
-        case Err(e) -> {
-            print("SOS isolation: status failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let status = try child.get_status() catch {
+        print("SOS isolation: status failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     print("SOS isolation: root survived child status={}\n", status)
 

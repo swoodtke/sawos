@@ -75,32 +75,23 @@ func status_of(r: &WaitResult) -> UInt {
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS deathnotify: no process handle\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS deathnotify: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     // The boot set, in the build's row order: the child's image blob, then the
     // RAM it will run in. Root's config is what says which ordinal is which.
-    var image = match proc.boot_handle_next() {
-        case Ok(h) -> h,
-        case Err(e) -> {
-            print("SOS deathnotify: no image region: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    var image = try proc.boot_handle_next() catch {
+        print("SOS deathnotify: no image region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    var dest = match proc.boot_handle_next() {
-        case Ok(h) -> h,
-        case Err(e) -> {
-            print("SOS deathnotify: no destination region: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    var dest = try proc.boot_handle_next() catch {
+        print("SOS deathnotify: no destination region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     guard let image_mem = image.take_memory() else {
         let _ = system.debug_print("SOS deathnotify: image record is not a region\n")
@@ -113,23 +104,17 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    let child = match system.process_create(image: &image_mem,
-                                            memory: &dest_mem) {
-        case Ok(c) -> c,
-        case Err(e) -> {
-            print("SOS deathnotify: create failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let child = try system.process_create(image: &image_mem,
+                                          memory: &dest_mem) catch {
+        print("SOS deathnotify: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
-    let waiter = match proc.waiter_create() {
-        case Ok(w) -> w,
-        case Err(e) -> {
-            print("SOS deathnotify: no waiter: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let waiter = try proc.waiter_create() catch {
+        print("SOS deathnotify: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     // **THE ATTACHMENT, AND IT SPENDS `ProcessRight.Wait`** — the same bit
@@ -146,13 +131,10 @@ func _start(boot_handle: UInt) {
         },
     }
 
-    let for_child = match system.mint(rights: CHILD_SYSTEM) {
-        case Ok(s) -> s,
-        case Err(e) -> {
-            print("SOS deathnotify: mint failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let for_child = try system.mint(rights: CHILD_SYSTEM) catch {
+        print("SOS deathnotify: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     match child.give(system: move for_child, tag: TAG_BOOT) {
         case Ok(_) -> {},
@@ -174,13 +156,10 @@ func _start(boot_handle: UInt) {
 
     // THE PARK. Nothing else in this machine is armed, so the child's death is
     // the only thing that can end this call.
-    let record = match waiter.wait() {
-        case Ok(r) -> r,
-        case Err(e) -> {
-            print("SOS deathnotify: wait failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let record = try waiter.wait() catch {
+        print("SOS deathnotify: wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     print("SOS deathnotify: woke key={} status={}\n",

@@ -69,47 +69,35 @@ func peek(addr: UInt) unsafe -> UInt8 {
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS mapwx: no process handle\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS mapwx: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     // One boot region: the RAM pool.
-    var pool_record = match proc.boot_handle_next() {
-        case Ok(h) -> h,
-        case Err(e) -> {
-            print("SOS mapwx: no pool region: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    var pool_record = try proc.boot_handle_next() catch {
+        print("SOS mapwx: no pool region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     guard let pool = pool_record.take_memory() else {
         let _ = system.debug_print("SOS mapwx: pool record is not a region\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let page = match pool.split(len: CHUNK) {
-        case Ok(m) -> m,
-        case Err(e) -> {
-            print("SOS mapwx: split failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let page = try pool.split(len: CHUNK) catch {
+        print("SOS mapwx: split failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     // THE WRITABLE ROW, and a byte through it — so "writable" is a fact about
     // the machine rather than about the kernel's bookkeeping.
-    let _data = match proc.map(memory: &page, access: RW) {
-        case Ok(m) -> m,
-        case Err(e) -> {
-            print("SOS mapwx: read-write map failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let _data = try proc.map(memory: &page, access: RW) catch {
+        print("SOS mapwx: read-write map failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     // THE ADDRESS IS THE REGION'S OWN, and this program never learned it from
     // the kernel: `map` answers with a Mapping, not a number, and a region has
@@ -123,13 +111,10 @@ func _start(boot_handle: UInt) {
 
     // THE EXECUTABLE ROW, over the SAME region — the sanctioned double map, and
     // the reason W^X-per-row takes nothing away.
-    let _text = match proc.map(memory: &page, access: RX) {
-        case Ok(m) -> m,
-        case Err(e) -> {
-            print("SOS mapwx: read-execute map failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let _text = try proc.map(memory: &page, access: RX) catch {
+        print("SOS mapwx: read-execute map failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     // ASCII ONLY ON A CONSOLE LINE: `ascii_byte` renders a non-ASCII scalar as
     // `?`, so an em dash here would reach the transcript as one. The prose

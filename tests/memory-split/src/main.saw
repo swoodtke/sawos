@@ -88,24 +88,18 @@ func peek(addr: UInt) unsafe -> UInt8 {
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS split: no process handle\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS split: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     // The boot set carries one row: the RAM POOL. Its tag is 0 because it is
     // the only row, which is root's config knowing the build's row order.
-    var record = match proc.boot_handle_next() {
-        case Ok(h) -> h,
-        case Err(e) -> {
-            print("SOS split: no pool region: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    var record = try proc.boot_handle_next() catch {
+        print("SOS split: no pool region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     guard let pool = record.take_memory() else {
         let _ = system.debug_print("SOS split: boot record is not a region\n")
@@ -117,40 +111,28 @@ func _start(boot_handle: UInt) {
 
     // **CUT ONE.** The piece covers `[base, base + CHUNK)` and `pool` now names
     // everything after it.
-    let first = match pool.split(len: CHUNK) {
-        case Ok(m) -> m,
-        case Err(e) -> {
-            print("SOS split: first cut failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let first = try pool.split(len: CHUNK) catch {
+        print("SOS split: first cut failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let _first_map = match proc.map(memory: &first, access: RW) {
-        case Ok(m) -> m,
-        case Err(e) -> {
-            print("SOS split: first map failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let _first_map = try proc.map(memory: &first, access: RW) catch {
+        print("SOS split: first map failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     poke(base, 0xAA)
 
     // **CUT TWO**, which lands where the cursor now points.
-    let second = match pool.split(len: CHUNK) {
-        case Ok(m) -> m,
-        case Err(e) -> {
-            print("SOS split: second cut failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let second = try pool.split(len: CHUNK) catch {
+        print("SOS split: second cut failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let _second_map = match proc.map(memory: &second, access: RW) {
-        case Ok(m) -> m,
-        case Err(e) -> {
-            print("SOS split: second map failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let _second_map = try proc.map(memory: &second, access: RW) catch {
+        print("SOS split: second map failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     poke(base + CHUNK, 0xBB)
 

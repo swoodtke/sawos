@@ -57,13 +57,10 @@ static PARK_NS: UInt64 = 20_000_000
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS lifecycle: no process handle\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS lifecycle: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     // THE BOOT SET, drained in ordinal order. §12 keeps the entry register one
@@ -72,21 +69,15 @@ func _start(boot_handle: UInt) {
     // comment and the two `let`s below — is what says which is which: row 0 is
     // the child's image blob, row 1 is the RAM it will run in. The kernel knows
     // neither.
-    var image = match proc.boot_handle_next() {
-        case Ok(h) -> h,
-        case Err(e) -> {
-            print("SOS lifecycle: no image region: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    var image = try proc.boot_handle_next() catch {
+        print("SOS lifecycle: no image region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    var dest = match proc.boot_handle_next() {
-        case Ok(h) -> h,
-        case Err(e) -> {
-            print("SOS lifecycle: no destination region: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    var dest = try proc.boot_handle_next() catch {
+        print("SOS lifecycle: no destination region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     print("SOS lifecycle: boot regions tag0={} tag1={}\n", image.tag, dest.tag)
 
@@ -101,14 +92,11 @@ func _start(boot_handle: UInt) {
 
     // PHASE ONE. Two capabilities and no numbers: root never reads the image,
     // never computes a load address and never chooses a stack.
-    let child = match system.process_create(image: &image_mem,
-                                            memory: &dest_mem) {
-        case Ok(c) -> c,
-        case Err(e) -> {
-            print("SOS lifecycle: create failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let child = try system.process_create(image: &image_mem,
+                                          memory: &dest_mem) catch {
+        print("SOS lifecycle: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let _ = system.debug_print("SOS lifecycle: created\n")
 
@@ -125,29 +113,20 @@ func _start(boot_handle: UInt) {
 
     // Park, so the child gets the processor. Everything below the wait happens
     // after the child has lived and died.
-    let clock = match system.clock_get(type: ClockType.Monotonic) {
-        case Ok(c) -> c,
-        case Err(e) -> {
-            print("SOS lifecycle: no clock: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
+        print("SOS lifecycle: no clock: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let waiter = match proc.waiter_create() {
-        case Ok(w) -> w,
-        case Err(e) -> {
-            print("SOS lifecycle: no waiter: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let waiter = try proc.waiter_create() catch {
+        print("SOS lifecycle: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let timer = match clock.timer_create() {
-        case Ok(t) -> t,
-        case Err(e) -> {
-            print("SOS lifecycle: no timer: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let timer = try clock.timer_create() catch {
+        print("SOS lifecycle: no timer: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     match waiter.add(&timer, KEY) {
         case Ok(_) -> {},
@@ -178,13 +157,10 @@ func _start(boot_handle: UInt) {
     // all: the teardown closes the handles in the CHILD's table, and root's
     // handle onto the child's slot is root's own. `Wait` is the right that
     // gates it, and it is one of the three `process_create` minted.
-    let status = match child.get_status() {
-        case Ok(s) -> s,
-        case Err(e) -> {
-            print("SOS lifecycle: status failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let status = try child.get_status() catch {
+        print("SOS lifecycle: status failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     print("SOS lifecycle: root survived child status={}\n", status)
 

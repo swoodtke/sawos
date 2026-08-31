@@ -104,41 +104,29 @@ func at_wait(r: &WaitResult) -> UInt {
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS events: no process handle\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS events: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
-    let waiter = match proc.waiter_create() {
-        case Ok(w) -> w,
-        case Err(e) -> {
-            print("SOS events: no waiter: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let waiter = try proc.waiter_create() catch {
+        print("SOS events: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let a = match proc.event_create() {
-        case Ok(ev) -> ev,
-        case Err(e) -> {
-            print("SOS events: no event a: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let a = try proc.event_create() catch {
+        print("SOS events: no event a: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     // `a` above took the DEFAULT mode and this one names it. The two events
     // behave identically below, which is the default parameter being checked
     // rather than assumed.
-    let b = match proc.event_create(mode: EventMode.Or) {
-        case Ok(ev) -> ev,
-        case Err(e) -> {
-            print("SOS events: no event b: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let b = try proc.event_create(mode: EventMode.Or) catch {
+        print("SOS events: no event b: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     let _ = waiter.add(&a, KEY_A)
@@ -148,13 +136,10 @@ func _start(boot_handle: UInt) {
     // The order is the claim. An edge-triggered waiter would have nothing to
     // report here, because the only edge happened before anyone was listening.
     let _ = a.signal(BIT_FOUR)
-    let first = match waiter.wait() {
-        case Ok(r) -> r,
-        case Err(e) -> {
-            print("SOS events: first wait failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let first = try waiter.wait() catch {
+        print("SOS events: first wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     // The two numbers are one fact stated from both ends: the WAIT reported the
     // accumulated word out of the copied-out record, and the `receive` after it
@@ -168,13 +153,10 @@ func _start(boot_handle: UInt) {
     // Two handles on one Waiter and the other one signalled: the answer has to
     // name the second attachment, and the key is how it names it.
     let _ = b.signal(BIT_EIGHT)
-    let second = match waiter.wait() {
-        case Ok(r) -> r,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS events: second wait failed\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let second = try waiter.wait() catch {
+        let _ = system.debug_print("SOS events: second wait failed\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let second_after = drained(&b)
     print("SOS events: second key={} at-wait={} after={}\n",
@@ -185,13 +167,10 @@ func _start(boot_handle: UInt) {
     let _ = a.signal(BIT_ONE)
     let _ = a.signal(BIT_TWO)
     let _ = a.signal(BIT_ONE)
-    let third = match waiter.wait() {
-        case Ok(r) -> r,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS events: third wait failed\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let third = try waiter.wait() catch {
+        let _ = system.debug_print("SOS events: third wait failed\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let or_after = drained(&a)
     print("SOS events: or key={} at-wait={} after={}\n",
@@ -213,13 +192,10 @@ func _start(boot_handle: UInt) {
     // ---- §2.4 SATURATING-SUM ----------------------------------------------
     // Signalled five times BEFORE it is attached, which exercises the other
     // half of level-triggering: an attachment that is already ready is ready.
-    let c = match proc.event_create(mode: EventMode.SaturatingSum) {
-        case Ok(ev) -> ev,
-        case Err(e) -> {
-            print("SOS events: no counting event: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let c = try proc.event_create(mode: EventMode.SaturatingSum) catch {
+        print("SOS events: no counting event: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     var n = 0
     while n < COUNT_TIMES {
@@ -227,13 +203,10 @@ func _start(boot_handle: UInt) {
         n = n + 1
     }
     let _ = waiter.add(&c, KEY_C)
-    let fourth = match waiter.wait() {
-        case Ok(r) -> r,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS events: fourth wait failed\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let fourth = try waiter.wait() catch {
+        let _ = system.debug_print("SOS events: fourth wait failed\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let counted_after = drained(&c)
 

@@ -27,37 +27,25 @@ static EXIT_FAILED: UInt = 1
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS timerdead: no process handle\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS timerdead: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let clock = match system.clock_get(type: ClockType.Monotonic) {
-        case Ok(c) -> c,
-        case Err(e) -> {
-            print("SOS timerdead: no clock: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
+        print("SOS timerdead: no clock: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let waiter = match proc.waiter_create() {
-        case Ok(w) -> w,
-        case Err(e) -> {
-            print("SOS timerdead: no waiter: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let waiter = try proc.waiter_create() catch {
+        print("SOS timerdead: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let timer = match clock.timer_create() {
-        case Ok(t) -> t,
-        case Err(e) -> {
-            print("SOS timerdead: no timer: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let timer = try clock.timer_create() catch {
+        print("SOS timerdead: no timer: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     match waiter.add(&timer, KEY) {
         case Ok(_) -> {},

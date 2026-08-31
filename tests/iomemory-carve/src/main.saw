@@ -45,25 +45,19 @@ static EXIT_FAILED: UInt = 1
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS carve: no process handle\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS carve: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     // The boot set carries one row and it is a DEVICE row, so what arrives is
     // an `IoMemory` rather than a `Memory` — the kind column of the build's
     // region table deciding which capability the same range becomes.
-    var record = match proc.boot_handle_next() {
-        case Ok(h) -> h,
-        case Err(e) -> {
-            print("SOS carve: no device window: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    var record = try proc.boot_handle_next() catch {
+        print("SOS carve: no device window: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     guard let window = record.take_iomemory() else {
         let _ = system.debug_print("SOS carve: boot record is not a window\n")
@@ -71,33 +65,24 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    let first = match window.carve(offset: 0, len: WINDOW_LEN) {
-        case Ok(w) -> w,
-        case Err(e) -> {
-            print("SOS carve: first carve failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let first = try window.carve(offset: 0, len: WINDOW_LEN) catch {
+        print("SOS carve: first carve failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     // **THE SAME RANGE AGAIN.** A split would have nothing left to give; a
     // carve does, because the parent was never spent.
-    let _second = match window.carve(offset: 0, len: WINDOW_LEN) {
-        case Ok(w) -> w,
-        case Err(e) -> {
-            print("SOS carve: second carve failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let _second = try window.carve(offset: 0, len: WINDOW_LEN) catch {
+        print("SOS carve: second carve failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let _ = system.debug_print("SOS carve: carved twice\n")
 
-    let _mapping = match proc.map(iomemory: &first) {
-        case Ok(m) -> m,
-        case Err(e) -> {
-            print("SOS carve: map failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let _mapping = try proc.map(iomemory: &first) catch {
+        print("SOS carve: map failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let _ = system.debug_print("SOS carve: mapped\n")
 

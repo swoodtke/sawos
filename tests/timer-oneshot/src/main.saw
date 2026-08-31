@@ -74,37 +74,25 @@ func now_of(clock: &Clock) -> UInt64 {
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS oneshot: no process handle\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS oneshot: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let clock = match system.clock_get(type: ClockType.Monotonic) {
-        case Ok(c) -> c,
-        case Err(e) -> {
-            print("SOS oneshot: no clock: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
+        print("SOS oneshot: no clock: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let waiter = match proc.waiter_create() {
-        case Ok(w) -> w,
-        case Err(e) -> {
-            print("SOS oneshot: no waiter: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let waiter = try proc.waiter_create() catch {
+        print("SOS oneshot: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let timer = match clock.timer_create() {
-        case Ok(t) -> t,
-        case Err(e) -> {
-            print("SOS oneshot: no timer: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let timer = try clock.timer_create() catch {
+        print("SOS oneshot: no timer: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     // ATTACH BEFORE ARMING, on purpose. A disarmed Timer is never ready, so
@@ -138,13 +126,10 @@ func _start(boot_handle: UInt) {
 
     let _ = system.debug_print("SOS oneshot: parking on a timer\n")
 
-    let first = match waiter.wait() {
-        case Ok(r) -> r,
-        case Err(e) -> {
-            print("SOS oneshot: wait failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let first = try waiter.wait() catch {
+        print("SOS oneshot: wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let after = now_of(&clock)
     print("SOS oneshot: woke key={} fires={} slept={}\n",
@@ -161,13 +146,10 @@ func _start(boot_handle: UInt) {
             return
         },
     }
-    let second = match waiter.wait() {
-        case Ok(r) -> r,
-        case Err(e) -> {
-            print("SOS oneshot: second wait failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let second = try waiter.wait() catch {
+        print("SOS oneshot: second wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     print("SOS oneshot: rearmed woke fires={}\n", fires_of(&second))
 

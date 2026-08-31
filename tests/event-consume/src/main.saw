@@ -76,37 +76,25 @@ func taken(r: &WaitResult) -> UInt {
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS consume: no process handle\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS consume: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let waiter = match proc.waiter_create() {
-        case Ok(w) -> w,
-        case Err(e) -> {
-            print("SOS consume: no waiter: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let waiter = try proc.waiter_create() catch {
+        print("SOS consume: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let flags = match proc.event_create(mode: EventMode.Or) {
-        case Ok(ev) -> ev,
-        case Err(e) -> {
-            print("SOS consume: no flags event: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let flags = try proc.event_create(mode: EventMode.Or) catch {
+        print("SOS consume: no flags event: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let counter = match proc.event_create(mode: EventMode.SaturatingSum) {
-        case Ok(ev) -> ev,
-        case Err(e) -> {
-            print("SOS consume: no counting event: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let counter = try proc.event_create(mode: EventMode.SaturatingSum) catch {
+        print("SOS consume: no counting event: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     // BOTH ATTACHED UP FRONT, and the wait set never changes after this. Each
@@ -120,13 +108,10 @@ func _start(boot_handle: UInt) {
     // wait that follows is the first take, and it takes the OR of the two.
     let _ = flags.signal(BIT_ONE)
     let _ = flags.signal(BIT_TWO)
-    let merged = match waiter.wait() {
-        case Ok(r) -> r,
-        case Err(e) -> {
-            print("SOS consume: or wait failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let merged = try waiter.wait() catch {
+        print("SOS consume: or wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let after_merged = left(&flags)
     print("SOS consume: or key={} at-wait={} after={}\n",
@@ -138,13 +123,10 @@ func _start(boot_handle: UInt) {
     // would report 11 here, and the difference between those two numbers is the
     // whole of what "the record is the value, not a copy of it" means.
     let _ = flags.signal(BIT_EIGHT)
-    let fresh = match waiter.wait() {
-        case Ok(r) -> r,
-        case Err(e) -> {
-            print("SOS consume: newbits wait failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let fresh = try waiter.wait() catch {
+        print("SOS consume: newbits wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let after_fresh = left(&flags)
     print("SOS consume: newbits key={} at-wait={} after={}\n",
@@ -159,13 +141,10 @@ func _start(boot_handle: UInt) {
         let _ = counter.signal(BIT_ONE)
         n = n + 1
     }
-    let counted = match waiter.wait() {
-        case Ok(r) -> r,
-        case Err(e) -> {
-            print("SOS consume: sum wait failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let counted = try waiter.wait() catch {
+        print("SOS consume: sum wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let after_counted = left(&counter)
     print("SOS consume: sum key={} at-wait={} after={}\n",

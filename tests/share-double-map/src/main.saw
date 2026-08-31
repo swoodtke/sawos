@@ -113,40 +113,28 @@ func status_of(r: &WaitResult) -> UInt {
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS sharemap: no process handle\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS sharemap: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     // The boot set, in the build's row order: the child's image blob, the RAM it
     // will run in, and the pool this launcher allocates the shared page out of.
-    var image = match proc.boot_handle_next() {
-        case Ok(h) -> h,
-        case Err(e) -> {
-            print("SOS sharemap: no image region: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    var image = try proc.boot_handle_next() catch {
+        print("SOS sharemap: no image region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    var dest = match proc.boot_handle_next() {
-        case Ok(h) -> h,
-        case Err(e) -> {
-            print("SOS sharemap: no destination region: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    var dest = try proc.boot_handle_next() catch {
+        print("SOS sharemap: no destination region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    var pool_record = match proc.boot_handle_next() {
-        case Ok(h) -> h,
-        case Err(e) -> {
-            print("SOS sharemap: no pool region: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    var pool_record = try proc.boot_handle_next() catch {
+        print("SOS sharemap: no pool region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     guard let image_mem = image.take_memory() else {
         let _ = system.debug_print("SOS sharemap: image record is not a region\n")
@@ -164,14 +152,11 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    let child = match system.process_create(image: &image_mem,
-                                            memory: &dest_mem) {
-        case Ok(c) -> c,
-        case Err(e) -> {
-            print("SOS sharemap: create failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let child = try system.process_create(image: &image_mem,
+                                          memory: &dest_mem) catch {
+        print("SOS sharemap: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let _ = system.debug_print("SOS sharemap: created\n")
 
@@ -181,29 +166,20 @@ func _start(boot_handle: UInt) {
     // process, `child` is the other one. Two rows exist afterwards and two
     // Mapping handles name them; §2.5's refcount clause is what keeps the page
     // alive for as long as either does.
-    let shared = match pool.split(len: CHUNK) {
-        case Ok(m) -> m,
-        case Err(e) -> {
-            print("SOS sharemap: split failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let shared = try pool.split(len: CHUNK) catch {
+        print("SOS sharemap: split failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let _here = match proc.map(memory: &shared, access: RW) {
-        case Ok(m) -> m,
-        case Err(e) -> {
-            print("SOS sharemap: map into self failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let _here = try proc.map(memory: &shared, access: RW) catch {
+        print("SOS sharemap: map into self failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let _there = match child.map(memory: &shared, access: RW) {
-        case Ok(m) -> m,
-        case Err(e) -> {
-            print("SOS sharemap: map into child failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let _there = try child.map(memory: &shared, access: RW) catch {
+        print("SOS sharemap: map into child failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let _ = system.debug_print("SOS sharemap: mapped into both\n")
 
@@ -217,13 +193,10 @@ func _start(boot_handle: UInt) {
     // The furnishing half, unit 3's flow unchanged, plus the supervision
     // attachment `death_notify` established: the child's ending is the only
     // thing that can wake this process, so no timer is armed anywhere.
-    let waiter = match proc.waiter_create() {
-        case Ok(w) -> w,
-        case Err(e) -> {
-            print("SOS sharemap: no waiter: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let waiter = try proc.waiter_create() catch {
+        print("SOS sharemap: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     match waiter.add(process: &child, key: KEY) {
         case Ok(_) -> {},
@@ -233,13 +206,10 @@ func _start(boot_handle: UInt) {
             return
         },
     }
-    let for_child = match system.mint(rights: CHILD_SYSTEM) {
-        case Ok(s) -> s,
-        case Err(e) -> {
-            print("SOS sharemap: mint failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let for_child = try system.mint(rights: CHILD_SYSTEM) catch {
+        print("SOS sharemap: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     match child.give(system: move for_child, tag: TAG_BOOT) {
         case Ok(_) -> {},
@@ -259,13 +229,10 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS sharemap: started\n")
 
-    let record = match waiter.wait() {
-        case Ok(r) -> r,
-        case Err(e) -> {
-            print("SOS sharemap: wait failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let record = try waiter.wait() catch {
+        print("SOS sharemap: wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     print("SOS sharemap: root observed child status={}\n", status_of(&record))
 

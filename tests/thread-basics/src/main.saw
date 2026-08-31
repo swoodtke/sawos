@@ -86,14 +86,8 @@ func parked_boot_handle() unsafe -> UInt {
 /// `print` would add and which would break the alternation into lines.
 func worker(role: UInt) {
     let system = System(boot_handle: parked_boot_handle())
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> { return },
-    }
-    let me = match proc.thread_self() {
-        case Ok(t) -> t,
-        case Err(_) -> { return },
-    }
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
     let tag = if role == ROLE_A { "A" } else { "B" }
     var turn = 0
     while turn < TURNS {
@@ -113,37 +107,28 @@ func initial(boot_handle: UInt) {
     park_boot_handle(boot_handle)
 
     let system = System(boot_handle: boot_handle)
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(e) -> {
-            let _ = system.debug_print("SOS threads: no process handle\n")
-            let _ = system.shutdown(1)
-            return
-        },
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS threads: no process handle\n")
+        let _ = system.shutdown(1)
+        return
     }
 
-    let a = match proc.thread_create(stack_top: stack_a_top(), arg: ROLE_A) {
-        case Ok(t) -> t,
-        case Err(e) -> {
-            // The status tag NAMED, not just printed. `SosStatus` lives in
-            // `sosabi`, which is kernel-internal and which this process does
-            // not — and must not — import; it reaches here because `sos`
-            // re-exports that one type and nothing else beside it (design 229).
-            // A process that branches on a failure needs the name, so this line
-            // is the check that the export survives.
-            let tag: SosStatus = e
-            print("SOS threads: create failed: {}\n", tag)
-            let _ = system.shutdown(1)
-            return
-        },
+    let a = try proc.thread_create(stack_top: stack_a_top(), arg: ROLE_A) catch {
+        // The status tag NAMED, not just printed. `SosStatus` lives in
+        // `sosabi`, which is kernel-internal and which this process does
+        // not — and must not — import; it reaches here because `sos`
+        // re-exports that one type and nothing else beside it (design 229).
+        // A process that branches on a failure needs the name, so this line
+        // is the check that the export survives.
+        let tag: SosStatus = error
+        print("SOS threads: create failed: {}\n", tag)
+        let _ = system.shutdown(1)
+        return
     }
-    let b = match proc.thread_create(stack_top: stack_b_top(), arg: ROLE_B) {
-        case Ok(t) -> t,
-        case Err(e) -> {
-            print("SOS threads: create failed: {}\n", e)
-            let _ = system.shutdown(1)
-            return
-        },
+    let b = try proc.thread_create(stack_top: stack_b_top(), arg: ROLE_B) catch {
+        print("SOS threads: create failed: {}\n", error)
+        let _ = system.shutdown(1)
+        return
     }
 
     // §8's status word, read from inside the process it describes: kind in the

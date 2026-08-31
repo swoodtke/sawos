@@ -70,36 +70,27 @@ static EXIT_FAILED: UInt = 1
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS execgate: no process handle\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS execgate: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     // One boot region: the RAM pool. Root's config is what says so.
-    var pool_record = match proc.boot_handle_next() {
-        case Ok(h) -> h,
-        case Err(e) -> {
-            print("SOS execgate: no pool region: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    var pool_record = try proc.boot_handle_next() catch {
+        print("SOS execgate: no pool region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     guard let pool = pool_record.take_memory() else {
         let _ = system.debug_print("SOS execgate: pool record is not a region\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let page = match pool.split(len: CHUNK) {
-        case Ok(m) -> m,
-        case Err(e) -> {
-            print("SOS execgate: split failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let page = try pool.split(len: CHUNK) catch {
+        print("SOS execgate: split failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     // **THE POSITIVE ARM: ROOT MAPS EXECUTABLE, AND THE ROW INSTALLING IS THE
@@ -109,13 +100,10 @@ func _start(boot_handle: UInt) {
     // a handle carrying `MemoryRight.MapExecute` may ask for
     // `MapAccess.Execute`, which is a row the kernel installs or a fault it
     // raises, and one of those two things happens on the next line.
-    let _text = match proc.map(memory: &page, access: RX) {
-        case Ok(m) -> m,
-        case Err(e) -> {
-            print("SOS execgate: mapping executable failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let _text = try proc.map(memory: &page, access: RX) catch {
+        print("SOS execgate: mapping executable failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let _ = system.debug_print("SOS execgate: mapped executable\n")
 
@@ -125,13 +113,10 @@ func _start(boot_handle: UInt) {
     // executable, which is what "per handle, not per region" means and is stated
     // honestly in `MemoryRight`: a second handle that still carries the bit can
     // map the same bytes X, because design 6 accepted no aliasing bookkeeping.
-    let narrow = match page.mint(rights: CHILD_RAM) {
-        case Ok(m) -> m,
-        case Err(e) -> {
-            print("SOS execgate: mint failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let narrow = try page.mint(rights: CHILD_RAM) catch {
+        print("SOS execgate: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let _ = system.debug_print("SOS execgate: minted a sibling without MapExecute\n")
 
@@ -139,13 +124,10 @@ func _start(boot_handle: UInt) {
     // read-write, over the same page, into the same domain. Without this line
     // the refusal below would be consistent with the sibling being broken in
     // any of a dozen ways.
-    let _data = match proc.map(memory: &narrow, access: RW) {
-        case Ok(m) -> m,
-        case Err(e) -> {
-            print("SOS execgate: mapping read-write failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let _data = try proc.map(memory: &narrow, access: RW) catch {
+        print("SOS execgate: mapping read-write failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let _ = system.debug_print("SOS execgate: the sibling maps read-write\n")
 

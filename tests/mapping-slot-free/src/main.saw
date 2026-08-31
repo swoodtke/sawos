@@ -75,24 +75,18 @@ func peek(addr: UInt) unsafe -> UInt8 {
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS mapfree: no process handle\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS mapfree: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     // The boot set carries one row: the RAM POOL, tag 0 because it is the only
     // one. Root's config is what says so.
-    var record = match proc.boot_handle_next() {
-        case Ok(h) -> h,
-        case Err(e) -> {
-            print("SOS mapfree: no pool region: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    var record = try proc.boot_handle_next() catch {
+        print("SOS mapfree: no pool region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     guard let pool = record.take_memory() else {
         let _ = system.debug_print("SOS mapfree: boot record is not a region\n")
@@ -100,13 +94,10 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    let chunk = match pool.split(len: CHUNK) {
-        case Ok(m) -> m,
-        case Err(e) -> {
-            print("SOS mapfree: split failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let chunk = try pool.split(len: CHUNK) catch {
+        print("SOS mapfree: split failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let base = sos_test_pool_base()
 
@@ -138,13 +129,10 @@ func _start(boot_handle: UInt) {
     // The row goes in and the object goes away, in that order and with nothing
     // between them. What is left is a grant this process holds and can never
     // name again.
-    let husk = match proc.map(memory: &chunk, access: RW) {
-        case Ok(x) -> x,
-        case Err(e) -> {
-            print("SOS mapfree: husk map failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let husk = try proc.map(memory: &chunk, access: RW) catch {
+        print("SOS mapfree: husk map failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let _ = move husk
 

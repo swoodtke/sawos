@@ -60,22 +60,16 @@ func peek(addr: UInt) unsafe -> UInt8 {
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS mapbasics: no process handle\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS mapbasics: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
-    var record = match proc.boot_handle_next() {
-        case Ok(h) -> h,
-        case Err(e) -> {
-            print("SOS mapbasics: no pool region: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    var record = try proc.boot_handle_next() catch {
+        print("SOS mapbasics: no pool region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     guard let pool = record.take_memory() else {
         let _ = system.debug_print("SOS mapbasics: boot record is not a region\n")
@@ -85,25 +79,19 @@ func _start(boot_handle: UInt) {
 
     let base = sos_test_pool_base()
 
-    let chunk = match pool.split(len: CHUNK) {
-        case Ok(m) -> m,
-        case Err(e) -> {
-            print("SOS mapbasics: split failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let chunk = try pool.split(len: CHUNK) catch {
+        print("SOS mapbasics: split failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     // **THE MAP.** `proc` is this process's own handle, so root is mapping into
     // ITSELF — which spends `ProcessRight.Map` on that handle and
     // `MemoryRight.Map` on the region, two rights on two objects.
-    let _rw_map = match proc.map(memory: &chunk, access: RW) {
-        case Ok(m) -> m,
-        case Err(e) -> {
-            print("SOS mapbasics: map failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let _rw_map = try proc.map(memory: &chunk, access: RW) catch {
+        print("SOS mapbasics: map failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     poke(base, 0x5A)
@@ -113,13 +101,10 @@ func _start(boot_handle: UInt) {
     // refuses it and nothing has to: two rows over one range on a
     // no-translation machine are two rows, and the region is not consumed by
     // being installed.
-    let _ro_map = match proc.map(memory: &chunk, access: RO) {
-        case Ok(m) -> m,
-        case Err(e) -> {
-            print("SOS mapbasics: double map failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let _ro_map = try proc.map(memory: &chunk, access: RO) catch {
+        print("SOS mapbasics: double map failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let _ = system.debug_print("SOS mapbasics: double-mapped read-only\n")
     print("SOS mapbasics: still {}\n", peek(base) as Int)

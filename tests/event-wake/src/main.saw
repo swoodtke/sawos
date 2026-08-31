@@ -152,14 +152,8 @@ func signal_shared(bits: UInt) unsafe {
 /// and reaches the Event out of the process's own memory.
 func worker() {
     let system = System(boot_handle: parked_boot_handle())
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> { return },
-    }
-    let me = match proc.thread_self() {
-        case Ok(t) -> t,
-        case Err(_) -> { return },
-    }
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
 
     let _ = system.debug_print("SOS wake: worker signalling\n")
 
@@ -181,44 +175,32 @@ func initial(boot_handle: UInt) {
     park_boot_handle(boot_handle)
 
     let system = System(boot_handle: boot_handle)
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS wake: no process handle\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS wake: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
-    let waiter = match proc.waiter_create() {
-        case Ok(w) -> w,
-        case Err(e) -> {
-            print("SOS wake: no waiter: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let waiter = try proc.waiter_create() catch {
+        print("SOS wake: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let event = match proc.event_create(mode: EventMode.SaturatingSum) {
-        case Ok(ev) -> ev,
-        case Err(e) -> {
-            print("SOS wake: no event: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let event = try proc.event_create(mode: EventMode.SaturatingSum) catch {
+        print("SOS wake: no event: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let _ = waiter.add(&event, ATTACH_KEY)
     // The OWNER stays here, in this frame, for the whole run; the worker is told
     // only where it is.
     park_event(&event)
 
-    let w = match proc.thread_create(stack_top: worker_stack_top(),
-                                     arg: WORKER_ROLE) {
-        case Ok(t) -> t,
-        case Err(e) -> {
-            print("SOS wake: create failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let w = try proc.thread_create(stack_top: worker_stack_top(),
+                                   arg: WORKER_ROLE) catch {
+        print("SOS wake: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let _ = w.start()
 
@@ -228,13 +210,10 @@ func initial(boot_handle: UInt) {
     // is the only thing here that does.
     let _ = system.debug_print("SOS wake: worker started, parking\n")
 
-    let report = match waiter.wait() {
-        case Ok(r) -> r,
-        case Err(e) -> {
-            print("SOS wake: wait failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let report = try waiter.wait() catch {
+        print("SOS wake: wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let left: UInt = match event.receive() {
         case Ok(v) -> v,

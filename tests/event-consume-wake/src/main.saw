@@ -163,14 +163,8 @@ func wait_down() unsafe -> Bool {
 /// and reaches the shared objects out of the process's own memory.
 func worker() {
     let system = System(boot_handle: parked_boot_handle())
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> { return },
-    }
-    let me = match proc.thread_self() {
-        case Ok(t) -> t,
-        case Err(_) -> { return },
-    }
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
 
     let _ = system.debug_print("SOS consumewake: worker signalling\n")
 
@@ -200,46 +194,31 @@ func initial(boot_handle: UInt) {
     park_boot_handle(boot_handle)
 
     let system = System(boot_handle: boot_handle)
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS consumewake: no process handle\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS consumewake: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
-    let up_waiter = match proc.waiter_create() {
-        case Ok(w) -> w,
-        case Err(e) -> {
-            print("SOS consumewake: no up waiter: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let up_waiter = try proc.waiter_create() catch {
+        print("SOS consumewake: no up waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let down_waiter = match proc.waiter_create() {
-        case Ok(w) -> w,
-        case Err(e) -> {
-            print("SOS consumewake: no down waiter: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let down_waiter = try proc.waiter_create() catch {
+        print("SOS consumewake: no down waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let up = match proc.event_create(mode: EventMode.Or) {
-        case Ok(ev) -> ev,
-        case Err(e) -> {
-            print("SOS consumewake: no up event: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let up = try proc.event_create(mode: EventMode.Or) catch {
+        print("SOS consumewake: no up event: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    let down = match proc.event_create(mode: EventMode.Or) {
-        case Ok(ev) -> ev,
-        case Err(e) -> {
-            print("SOS consumewake: no down event: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let down = try proc.event_create(mode: EventMode.Or) catch {
+        print("SOS consumewake: no down event: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     let _ = up_waiter.add(&up, KEY_UP)
@@ -248,27 +227,21 @@ func initial(boot_handle: UInt) {
     // where the two it touches are.
     park_shared(&up, &down_waiter)
 
-    let w = match proc.thread_create(stack_top: worker_stack_top(),
-                                     arg: WORKER_ROLE) {
-        case Ok(t) -> t,
-        case Err(e) -> {
-            print("SOS consumewake: create failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let w = try proc.thread_create(stack_top: worker_stack_top(),
+                                   arg: WORKER_ROLE) catch {
+        print("SOS consumewake: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let _ = w.start()
 
     let _ = system.debug_print("SOS consumewake: initial parking\n")
 
     // ---- THE FIRST WAKE ----------------------------------------------------
-    let first = match up_waiter.wait() {
-        case Ok(r) -> r,
-        case Err(e) -> {
-            print("SOS consumewake: first wait failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let first = try up_waiter.wait() catch {
+        print("SOS consumewake: first wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let after_first = left(&up)
     print("SOS consumewake: woke first key={} at-wait={} after={}\n",
@@ -280,13 +253,10 @@ func initial(boot_handle: UInt) {
     // that had left the word behind would find it still ready and answer at
     // once, which would put the next two lines in the other order.
     let _ = down.signal(DOWN_BITS)
-    let second = match up_waiter.wait() {
-        case Ok(r) -> r,
-        case Err(e) -> {
-            print("SOS consumewake: second wait failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let second = try up_waiter.wait() catch {
+        print("SOS consumewake: second wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     print("SOS consumewake: woke second key={} at-wait={}\n",
           second.key, taken(&second))

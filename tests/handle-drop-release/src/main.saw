@@ -84,13 +84,10 @@ func used_and_dropped(system: &System) -> Bool {
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
-    let proc = match system.process_self() {
-        case Ok(p) -> p,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS droprelease: no process handle\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS droprelease: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     // THREE HANDLES THAT DIE WHERE THEY WERE BORN. The table grows and shrinks
@@ -107,13 +104,10 @@ func _start(boot_handle: UInt) {
 
     // ...AND ONE THAT DOES NOT. It is still bound at the exit, so the teardown
     // counts it — which is what makes the other three's absence mean something.
-    let kept = match system.clock_get(type: ClockType.Monotonic) {
-        case Ok(c) -> c,
-        case Err(_) -> {
-            let _ = system.debug_print("SOS droprelease: no kept clock\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    let kept = try system.clock_get(type: ClockType.Monotonic) catch {
+        let _ = system.debug_print("SOS droprelease: no kept clock\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let alive = match kept.now() {
         case Ok(_) -> true,
