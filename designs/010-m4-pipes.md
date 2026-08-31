@@ -1,7 +1,9 @@
 # SawOS design 10 — M4 SKETCH: pipes (agenda for the scoping session)
 
 **Status: RULED Aug 30 2026 (user, all seven agenda items — see "As
-ruled") — THE PLAN OF RECORD.** M4 starts after M3 closes (unit 6
+ruled") — THE PLAN OF RECORD; ruling 4 amended Aug 31 (the fused
+fast paths `Call` + `ReplyRecv`, taken together).** M4 started at
+unit 0's dispatch (Aug 31). M3 closed Aug 30 (unit 6
 = design 9, unit 7 = docs sweep). What this does NOT reopen: §2.1 is
 RATIFIED (Jul 29; renamed + client API amended Aug 20) — the message
 model, the one-shot reply pair, abandonment, the TELL idiom, and the
@@ -113,7 +115,10 @@ structural, not a rights mask to count by. Then:
   levels through the notify machinery; the `send`/`send(timeout:)`
   LIBRARY compositions over post + wait + resolve become real here
   (agenda ruling 4; `TimedOut(pending:)` carries the live claim;
-  drop = cancel).
+  drop = cancel); **and the FUSED FAST PATHS `Call` + `ReplyRecv`**
+  (ruling 4's Aug-31 rider — the unit brief may split them into a
+  3.5 if the unit runs long; the ping-pong trap-count case is their
+  proof).
 - **Unit 4 — handles in messages.** Rendezvous transfer through the
   staged slot (a staged handle's refcount treatment is agenda ruling
   5), the delegation proof as transcript: request forwarded to a
@@ -191,6 +196,37 @@ standing tail); the IOMMU driver (death-notification consumer 2).
    effect, and a unified outcome enum forces every blocking caller
    through a `Pending` arm its mode cannot produce — the signature
    shape design 234 bans.
+   **RIDER (ruled Aug 31, user): THE FUSED FAST PATHS — `Call` and
+   `ReplyRecv` — join `post` in the kernel, taken TOGETHER in one
+   unit.** The performance amendment, not a semantic one: a fused op
+   is THE COMPOSITION RUN WITHOUT RETURNING TO USERSPACE, so every
+   rule the composed path obeys applies verbatim. Client side:
+   `Call` = post; park; resolve behind one trap — the dominant RPC
+   shape drops from three traps to one. Server side: `ReplyRecv` =
+   reply-then-receive-next behind one trap — the steady-state server
+   loop halves. Mechanics, ruled with it: the reply body BOUNCES
+   THROUGH THE RING SLOT (replier copies in, wakes; the caller's
+   thread resumes inside its own syscall and copies out through the
+   one checked funnel — the kernel never dereferences another
+   process's memory, and ruling 6's fixed slots carry the reply);
+   the wake dispatch grows ONE arm (a claim is a parked fused call
+   -> wake the thread, or a split-phase claim -> notify the Waiter —
+   not a second wake protocol); a fused call mints NO
+   `PipeReplyHandle` into the caller's table (the claim is
+   kernel-internal, tied to the parked thread, consumed at reply —
+   zero handle traffic and zero one-shot quota rows on the fast
+   path; `post` keeps minting the real handle for multiplexers);
+   and `end_process`'s sweep gains an arm for a process dying while
+   parked in a call (the orphaned claim becomes ABANDONED, so the
+   server's later `reply()` answers `Err(PeerClosed)` per the
+   ratified rule — name this in the unit brief). `Call` takes NO
+   duration: the kernel still never learns what a timeout is, and
+   `send(msg, timeout:)` keeps the library composition. Surface
+   unchanged: `send(msg)` compiles to the `Call` trap,
+   `send(timeout:)` to the composition, `post` to the primitive.
+   The proof is a ping-pong case that COUNTS TRAPS. Unit placement:
+   unit-3 territory (wants the pair, the one-shots and the reply
+   path); the unit brief places it.
 5. **RULED: a staged handle stays the SENDER's counted entry until
    receive**, transferred exactly at rendezvous — the ledger never
    has an in-flight limbo state, and an abandoned send unwinds with

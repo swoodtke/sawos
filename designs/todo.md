@@ -38,6 +38,12 @@ entry below or the brief that carries it, never restating either.
   on unknowns); the filter narrows the package builds too. NEVER the
   gate — the gate stays every case on every architecture
 
+- tests idiom sweep — landed Aug 31 (user-ruled, this line is its
+  capture): 290 bind-or-bail match-on-Result sites across 55 test
+  packages became the inline try/catch guard form (CLAUDE.md carries
+  the ruling); 75 statement-position sites stay `match` on SL-12's
+  ICE, 25 fold-shaped sites (Err supplies a value) left as a possible
+  follow-on, 12 real-work + 4 negative-test matches stay by design
 - sawlang#238 unit 6 remainder — CI cold-fetch acceptance + negative
   tests PEND sawlang becoming public at the pinned sha (a82e06f4);
   dispatches from the sawlang side [sawlang#238]
@@ -100,3 +106,4 @@ One entry per issue, resolution-sufficient: the symptom verbatim, the probe/site
   func main() { let c = hand()  print("{}", c.make(top: 1)) }
   ```
   Workaround in-tree: import the receiver type by name, with the reason written at the import (`tests/waiter-revoked/src/main.saw`). The tree had not met this before because every other root server imports `Process` and `Thread` anyway — a program that only ever HOLDS a value of a type, never names it, is the shape that hits it. Resolution: bind the whole overload set for an extension method exactly as design 249 binds one for a free function, keyed on the receiver type rather than on which of its names an import happened to mention; failing that, a diagnostic that names the unbound sibling and the import that would bind it, since the current one sends the reader to the argument list.
+- SL-12 — STATEMENT-POSITION `try ... catch` ON A `Result<Void, E>` CALL IS AN INTERNAL COMPILER ERROR: ``internal compiler error at src/main.saw:257:5 (TryExpr): 'NoneType' object has no attribute 'type'`` (the Aug-31 idiom sweep, sawlang 0.2.0 @ `3f15d2ee`). `try give(...) catch { ... }` as a bare STATEMENT — and the `let _ =` spelling identically — dies in sawc when the callee's Ok type is `Void`; the same catch with a non-Void Ok compiles and runs, so it is the Void, not the discard. Probe: any `Result<Void, SosStatus>` op (`give`/`start`/`waiter.add`/`timer.arm`/`interrupt.ack`/`waiter.remove`/`mapping.unmap`) under a statement-position inline catch. In-tree workaround: statement-position checks stay `match { case Ok(_) -> {}, case Err(e) -> ... }` — 75 such sites deliberately kept at the Aug-31 sweep, and CLAUDE.md's idiom ruling carries the caveat until the fix ships in a pin. Resolution: the inline catch's lowering handles a Void Ok payload (nothing to bind is not nothing to type); the guard form should be legal at statement position exactly as the binding form is.

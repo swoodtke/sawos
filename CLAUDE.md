@@ -51,7 +51,17 @@ foreground steps, never background the wait or the gate, clear only
 verified-dead.
 
 ## Writing Saw here
-Load the **saw-lang skill** before writing or reviewing any .saw file. On
+Load the **saw-lang skill** before writing or reviewing any .saw file.
+**Idiom ruling (user, Aug 31): the bind-or-bail shape on a Result is
+an inline `let x = try f() catch { …; return }`** — the implicit
+`error` is in scope, a diverging catch satisfies any type — never a
+`match` whose Err arm just prints and exits. `match` stays for arms
+doing genuinely different work and for negative tests asserting a
+specific error value. Freestanding printing stays `{}` format args.
+CAVEAT (SL-12): statement-position `try f() catch {…}` on a
+`Result<Void, E>` call ICEs the pinned sawc — until a pin bump
+delivers the fix, STATEMENT-position checks stay `match`
+(`case Ok(_) -> {}`); only the BINDING form takes the guard shape. On
 this machine it is a user-level symlink
 (`~/.claude/skills/saw-lang -> <sawlang checkout>/.claude/skills/saw-lang`,
 sawlang#238 D-f) — one canonical copy, no drift. On a machine without a
