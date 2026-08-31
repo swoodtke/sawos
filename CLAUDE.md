@@ -58,10 +58,10 @@ an inline `let x = try f() catch { …; return }`** — the implicit
 `match` whose Err arm just prints and exits. `match` stays for arms
 doing genuinely different work and for negative tests asserting a
 specific error value. Freestanding printing stays `{}` format args.
-CAVEAT (SL-12): statement-position `try f() catch {…}` on a
-`Result<Void, E>` call ICEs the pinned sawc — until a pin bump
-delivers the fix, STATEMENT-position checks stay `match`
-(`case Ok(_) -> {}`); only the BINDING form takes the guard shape. On
+The statement-position form (`try f() catch {…}` on Result<Void, E>)
+is legal since sawc 0.2.1 (SL-12 closed) — use the guard shape at
+every position; the 75 match sites kept during the ICE era are a
+queued conversion pass. On
 this machine it is a user-level symlink
 (`~/.claude/skills/saw-lang -> <sawlang checkout>/.claude/skills/saw-lang`,
 sawlang#238 D-f) — one canonical copy, no drift. On a machine without a

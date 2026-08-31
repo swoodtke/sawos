@@ -109,8 +109,13 @@ structural, not a rights mask to count by. Then:
 - **Unit 2 — the one-shot pair.** PipeReplyHandle/PipeRequestHandle
   as objects: consumed-on-reply, transferable (delegation), drop
   semantics as ratified, NoCopy in the sosrt surface (RAII
-  end-to-end, the memory doctrine).
-- **Unit 3 — waitability.** The three §2.2 arms (server end
+  end-to-end, the memory doctrine). **Plus ruling 10's rider**: the
+  teardown force-free arms for counted kinds are deleted, D-4's
+  orphan write-off activates, references govern lifetime.
+- **Unit 3 — waitability.** The §2.2 arms — now FOUR with ruling 8
+  (the inlet's room-to-post level joins the list) — plus ruling 9's
+  attachment pair (consume-detaches + `AttachMode.OneShot`, and the
+  two §2.2 amendments ride together): (server end
   readable, reply-ready, request-abandoned) + the peer-gone terminal
   levels through the notify machinery; the `send`/`send(timeout:)`
   LIBRARY compositions over post + wait + resolve become real here
@@ -183,11 +188,10 @@ standing tail); the IOMMU driver (death-notification consumer 2).
    `send(msg, timeout:)` are typed-sysapi compositions over post +
    wait + resolve. Costs stated: a composed RPC is three traps where
    a fused call could be fewer (a fused op is a later ADDITIVE
-   optimization, Zircon-call precedent, if profiles demand); the
-   composed send surfaces ruling 6's ring-full refusal rather than
-   parking for space ("outlet freed a slot" is another reservable
-   level); blocking a reply requires a Waiter, which the sosrt
-   wrapper owns. Ladder consequence: unit 1's proofs POLL (post +
+   optimization, Zircon-call precedent, if profiles demand);
+   blocking a reply requires a Waiter, which the sosrt wrapper owns.
+   [The ring-full cost note this rider carried is SUPERSEDED by
+   ruling 8: the composed send PARKS on the inlet's room level.] Ladder consequence: unit 1's proofs POLL (post +
    nonblocking take), and the blocking wrappers become real when
    waitability lands in unit 3. A mode-enum parameter on send was
    CONSIDERED AND REJECTED: the four modes split into two success
@@ -252,6 +256,90 @@ standing tail); the IOMMU driver (death-notification consumer 2).
    DEFERRED again, on the standing reason (transcript-moving, rides
    only a unit that moves those transcripts anyway).
 
+8. **RULED (Aug 31, user): `PipeInlet` IS A WAITABLE — the
+   ROOM-TO-POST level.** `post` can never block, so a refused poster
+   must have something better than a poll loop: the inlet joins
+   §2.2's waitable list with a level that is READY while the ring
+   has a free slot OR the peer is gone (the payload word
+   distinguishes room from `PeerClosed`, so a waker learns which
+   without a probe post). A plain LEVEL, not terminal: true while
+   space exists, false while full, consume clears nothing — the
+   level's end is the poster's own next post, the Interrupt-shaped
+   emptiness. `PipeInletRight.Wait` gates the attach (the Timer
+   precedent). The composed blocking `send` gains its missing leg —
+   wait-for-room, post, wait-for-reply — so the library form PARKS
+   under backpressure instead of surfacing `WouldBlock` (which
+   remains the polling caller's honest answer). Lands in UNIT 3 with
+   the rest of waitability; §2.2's ratified list amendment (the
+   inlet as a member) rides that unit. This promotes the "reservable
+   level" hedge ruling 4's rider carried, which is struck.
+
+9. **RULED (Aug 31, user): ONE-SHOT ATTACHMENTS — a pair of rules,
+   landing in unit 3.**
+   (a) **MANDATORY — an op that CONSUMES the object DETACHES it
+   implicitly.** An attachment is a counted reference (design 7),
+   and `resolve` consumes the reply object as `reply()` discharges
+   the request — without this rule the consuming op either cannot
+   free the slot or must refuse while attached, wedging the op
+   ordering. Precedent: unit 5.5's teardown taught the kernel to
+   unhook an attachment's far end. This alone takes the multiplexed
+   RPC from five traps to four.
+   (b) **OPT-IN — `AttachMode.OneShot` on `add`**: the attachment
+   detaches AT DELIVERY (when the record for its key is copied out —
+   never at mere readiness; the delivery is otherwise identical).
+   One-shot is a property of the ATTACHMENT, the attacher's choice
+   like the key; spelled as a mode-value (the `EventMode` doctrine)
+   with a defaulted trailing parameter (`mode: AttachMode =
+   AttachMode.Persistent`) — zero churn at existing call sites. What
+   it buys: the composed blocked send's room-wait is attach-oneshot
+   / wait / post (no trailing remove per backpressure stall);
+   request-abandoned watchers and wait-once death supervisors — the
+   LEVEL kinds nothing consumes — get the same save.
+   Pinned with it: the detach-at-delivery drops a counted reference
+   and CAN CASCADE A FREE — a new unref site the unit-3 brief must
+   census (delivery runs in the notifier's context and the waiter's
+   both), plus iterate-while-removing care in the delivery walk.
+   AMENDS ratified §2.2: "attachments are persistent subscriptions /
+   there is no one-shot mode" flips to persistent-BY-DEFAULT (the
+   amendment rides unit 3, beside ruling 8's). The
+   wait-on-now-empty-Waiter footgun (attach one-shot, deliver, wait
+   again) gets the existing behavior STATED at the site. Recorded as
+   not-the-motivation: EPOLLONESHOT's re-arm race does not exist
+   here (§2.2's one-wake distribution) — this is the syscall save
+   and lifecycle hygiene only; the fused `Call` still beats all of
+   it at one trap.
+
+10. **RULED (Aug 31, user): REFERENCES GOVERN LIFETIME — teardown
+    WRITES OFF, it never force-frees a counted kind.** Design 13's
+    finding 2 named the hazard (a creator dying would free a pipe's
+    slot under a peer still holding an end — the staged messages
+    with it) and proposed ownership-transfer-at-`give`; this ruling
+    takes the OTHER fix, because it deletes code instead of adding
+    bookkeeping. The slabs were always ONE GLOBAL POOL — what is
+    per-process is the quota charge and the teardown sweep, and the
+    sweep's by-charged-process FORCE-FREE is a pre-refcount survivor
+    (units ≤4 had no count to consult). Now: a dying process's
+    teardown drops ITS OWN references (the close-all, unchanged) and
+    WRITES OFF its quota charges — design 7 D-4's orphan vocabulary,
+    landed as a degenerate case in anticipation of exactly this —
+    and the force-free arms for counted kinds are DELETED. A slot
+    outlives its creator for exactly as long as anyone holds a
+    reference: possession keeps alive, the capability model's own
+    answer. An orphaned object is charged to NOBODY until it frees;
+    the machine stays bounded because quota ≤ wall (unit 5's
+    assert). Ownership-transfer-at-give is REJECTED: charge-follows-
+    handle goes incoherent once minted siblings span processes.
+    UNREACHABLE TODAY, and provably (MAX_PROCESSES = 2, give flows
+    only downward, root dies last) — ruled on the unit-5.5
+    principle: an invariant that has quietly become false is worse
+    than a branch nothing takes. Lands as a RIDER ON UNIT 2 (sweep
+    arms deleted, D-4's write-off activates, the reasoning recorded
+    at the sweeps); the transcript proof is DEFERRED to whatever
+    wiring first makes a holder outlive a creator. Parked beside it
+    as an M5 SEED, deliberately not entangled: a GROWABLE pool wants
+    a kernel allocation story — a Memory-backed slab-donation op is
+    the capability-shaped candidate.
+
 ## As ruled
 
 Aug 30 (user): ALL SEVEN ITEMS RULED — this sketch is the PLAN OF
@@ -261,5 +349,9 @@ primitive, send/send(timeout:) are library compositions; 5 staged
 handles stay the sender's until receive; 6 limits 128 B / 4 handles
 / 2×MAX_THREADS in-flight as `kcore.limits` statics; 7
 driver-as-service confirmed, keep-mask rider taken, event rewrite
-deferred. Unit briefs are authored per the M3 process; M4 starts
-when M3 unit 7 closes.
+deferred; 8 (Aug 31) the inlet's room-to-post waitable level; 9
+(Aug 31) one-shot attachments — consume-detaches mandatory,
+`AttachMode.OneShot` opt-in; 10 (Aug 31) references govern lifetime
+— teardown writes off, never force-frees a counted kind (rider on
+unit 2; growable-pool M5 seed parked). Unit briefs are authored per
+the M3 process; M4 started Aug 31.
