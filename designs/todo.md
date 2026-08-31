@@ -21,6 +21,12 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
+- M4 unit 0 — waiter revocation [#10 ruling 1, #7 finding 2, #12 —
+  designs/012-waiter-revocation.md, authored Aug 31]: SosStatus.Revoked
+  appended; free_object's Waiter arm walks `blocked` and wakes every
+  parked thread with it, no record written; the peer-gone doctrine's
+  first instance. Existing rows unmoved; new case rows only
+
 ## [BACKLOG] — filed, not scheduled
 
 - M4 scoping — pipes [#10 — designs/010-m4-pipes.md, DRAFT Aug 30,
