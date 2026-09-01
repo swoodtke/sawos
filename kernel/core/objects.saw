@@ -37,6 +37,10 @@ import sosabi.{
     PipeInletRight,
     PipeOutletHandle,
     PipeOutletRight,
+    PipeReplyHandle,
+    PipeReplyRight,
+    PipeRequestHandle,
+    PipeRequestRight,
     PIPE_BODY_BYTES,
     BootHandleKind,
     SosStatus,
@@ -320,6 +324,45 @@ public(package) struct PipeOutletObject {
 
 extension PipeOutletObject {
     public(package) func allows(&self, right: PipeOutletRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
+    }
+}
+
+/// A PipeReply handle the dispatch has VALIDATED — the CLIENT's claim on one
+/// reply, paired with the EXCHANGE it names (spec §2.1; sawos design 14 D-1).
+///
+/// **`slot` NAMES AN EXCHANGE, WHICH IS A RING SLOT** — `connection *
+/// PIPE_INFLIGHT + ring index`, the same flat arithmetic the bodies and lengths
+/// already use. That is D-1's "the claim IS ring-slot state" seen from the
+/// dispatch: there is no third slab, because a one-shot pair exists for exactly
+/// as long as one in-flight message does.
+public(package) struct PipeReplyObject {
+    public(package) handle: PipeReplyHandle,
+    public(package) rights: UInt32,
+    public(package) slot: Int,
+}
+
+extension PipeReplyObject {
+    public(package) func allows(&self, right: PipeReplyRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
+    }
+}
+
+/// A PipeRequest handle the dispatch has VALIDATED — the SERVER's obligation,
+/// paired with the EXCHANGE it names (spec §2.1; sawos design 14 D-1).
+///
+/// The mirror of `PipeReplyObject`, and separate for `PipeOutletObject`'s reason:
+/// a function taking one of these can only ever have been handed the obligation,
+/// so "a claim cannot reply and an obligation cannot resolve" is a fact about
+/// which `allows` compiles.
+public(package) struct PipeRequestObject {
+    public(package) handle: PipeRequestHandle,
+    public(package) rights: UInt32,
+    public(package) slot: Int,
+}
+
+extension PipeRequestObject {
+    public(package) func allows(&self, right: PipeRequestRight) -> Bool {
         (self.rights & (right as UInt32)) != 0
     }
 }
@@ -1004,13 +1047,23 @@ public(package) func compact_mapping_rows(target: Int, removed: Int) unsafe {
 /// end, and a mint needs a source handle there is none of. So the terminal level
 /// is a fact about the count rather than a bit somebody has to remember to set,
 /// and the two can never disagree.
+///
+/// **THE RING WENT FROM A QUEUE OF BYTES TO A TABLE OF EXCHANGES IN M4 UNIT 2**
+/// (sawos design 14 D-1), which is what cost this struct its `head` and `count`.
+/// A slot used to live until its bytes were taken, so the staged messages were
+/// contiguous and a head plus a count described them; a slot now carries the
+/// REPLY back and recycles only when the exchange settles, and exchanges settle
+/// in whatever order their two holders act — so occupancy is per-slot and the
+/// staged messages are a LIST threaded through them. `staged` is that list's
+/// head, 1-based so that zero is "nothing staged", and there is no tail because
+/// appending walks at most `PIPE_INFLIGHT` links — design 13's own argument
+/// against a second index to keep in step.
 public(package) struct PipeSlot {
     public(package) state: SlotState,
     public(package) process: Int,
-    /// The oldest staged message's ring index.
-    public(package) head: Int,
-    /// How many messages are staged.
-    public(package) count: Int,
+    /// The oldest STAGED (untaken) exchange's ring index, PLUS ONE. Zero is
+    /// "nothing staged", which is the list-link idiom the thread queues use.
+    public(package) staged: Int,
     /// How many handle entries name the CLIENT end (sawos design 7 D-1's
     /// counting rule, one column per kind).
     public(package) inlet_refs: UInt16,
@@ -1019,7 +1072,7 @@ public(package) struct PipeSlot {
 }
 
 public(package) unsafe static var PIPES: [PipeSlot; MAX_PIPES] = [
-    PipeSlot(state: SlotState.Free, process: 0, head: 0, count: 0,
+    PipeSlot(state: SlotState.Free, process: 0, staged: 0,
              inlet_refs: 0, outlet_refs: 0);
     MAX_PIPES]
 
@@ -1030,12 +1083,108 @@ static PIPE_BODY_STORAGE: Int = MAX_PIPES * PIPE_INFLIGHT * PIPE_BODY_BYTES
 public(package) unsafe static var PIPE_BODIES: [UInt8; PIPE_BODY_STORAGE] = [
     0; PIPE_BODY_STORAGE]
 
-/// How long the message in each staging slot is. A separate array for the
-/// reason the bodies are a separate array: the slot struct stays small.
-static PIPE_LEN_SLOTS: Int = MAX_PIPES * PIPE_INFLIGHT
+/// Ring slots in the whole machine — the stride every per-exchange array below
+/// is sized to. One row per (connection, ring slot) pair, which is what an
+/// EXCHANGE index names.
+public(package) static PIPE_EXCHANGES: Int = MAX_PIPES * PIPE_INFLIGHT
 
-public(package) unsafe static var PIPE_LENS: [UInt16; PIPE_LEN_SLOTS] = [
-    0; PIPE_LEN_SLOTS]
+/// How long the message in each staging slot is — and, once a reply has been
+/// written, how long THAT is. One number, because a slot holds one body at a
+/// time and the exchange's state is what says which body it is.
+public(package) unsafe static var PIPE_LENS: [UInt16; PIPE_EXCHANGES] = [
+    0; PIPE_EXCHANGES]
+
+// =============================================================================
+// The one-shot pair — CLAIM AND OBLIGATION, AS RING-SLOT STATE (spec §2.1;
+// sawos design 14 D-1/D-2)
+// =============================================================================
+//
+// **NO THIRD SLAB, AND D-1's ARGUMENT IS ONE SENTENCE**: a one-shot pair exists
+// for exactly as long as one in-flight message does, and design 10 ruling 4's
+// rider already pins the reply body to the staging slot that carried the
+// request. So the claim state lives WITH THE SLOT — four parallel arrays beside
+// `PIPE_LENS`, all zero-initialized, all in `.bss` (design 149), costing no
+// image bytes and no new limit.
+//
+// **THE EXCHANGE INDEX IS THE OBJECT'S IDENTITY.** `ObjType.PipeReply` and
+// `ObjType.PipeRequest` both target `connection * PIPE_INFLIGHT + ring slot`,
+// which is the flat arithmetic `pipe_body_addr` already uses — design 13's "two
+// kinds, one slab" one level down, with the same consequence: which column a
+// handle counts on is decided by its KIND, before any right is read.
+//
+// **THE TWO COLUMNS ARE THE ABANDONMENT STATE**, exactly as the connection's two
+// are the peer-gone state, and no flag beside them says so:
+//
+//   the claim column at zero          the client abandoned the exchange
+//   `Taken` with the request column
+//     at zero                         the server abandoned the obligation
+//   `Staged` with the connection's
+//     outlet column at zero           nobody can ever take it, so likewise
+//
+// **AND THE SLOT SETTLES WHEN NOBODY NAMES IT AND NOTHING IS OWED.** That is one
+// predicate (`exchange_can_settle`) and it is the counted-object rule with one
+// extra clause: a STAGED message is owed to a live outlet whatever became of the
+// claim, which is §2.1's TELL idiom (post, drop the claim, and the server still
+// receives the message) and design 230's close-drains-first rule reaching one
+// level down.
+
+/// Where an exchange is in its life. FOUR STATES, and the two abandonment
+/// answers are derived from the columns rather than stored beside them.
+///
+/// `Free` is the slot nobody is using — the ring's own occupancy, which is what
+/// `PipeInletOp.Post` scans for and what makes a full ring count AWAITING-REPLY
+/// exchanges rather than merely untaken messages (D-1's literal reading of
+/// design 10 ruling 6's in-flight budget).
+public(package) enum ExchangeState: UInt8 {
+    case Free = 0,
+    /// A request body is in the slot and nobody has taken it. The obligation has
+    /// not been minted, so its column is zero for a reason that is not
+    /// abandonment — which is exactly why the state has to be recorded and the
+    /// columns alone would not do.
+    case Staged = 1,
+    /// The obligation has been minted and the reply is owed.
+    case Taken = 2,
+    /// The reply body is in the slot and the claim may take it.
+    case Replied = 3,
+}
+
+public(package) unsafe static var PIPE_EX_STATE: [ExchangeState; PIPE_EXCHANGES] = [
+    ExchangeState.Free; PIPE_EXCHANGES]
+
+/// How many handle entries name each exchange's CLAIM.
+public(package) unsafe static var PIPE_REPLY_REFS: [UInt16; PIPE_EXCHANGES] = [
+    0; PIPE_EXCHANGES]
+
+/// How many name its OBLIGATION.
+public(package) unsafe static var PIPE_REQUEST_REFS: [UInt16; PIPE_EXCHANGES] = [
+    0; PIPE_EXCHANGES]
+
+/// The staged list's links — the next STAGED exchange in this connection, plus
+/// one, or zero at the end. Only ever appended at the tail and removed at the
+/// head (a take), or cleared whole (the outlet's zero-arm), so it is a strict
+/// FIFO and never needs a removal from the middle.
+public(package) unsafe static var PIPE_NEXT: [Int; PIPE_EXCHANGES] = [
+    0; PIPE_EXCHANGES]
+
+/// "No exchange" — the sentinel a full ring answers with.
+public(package) static NO_EXCHANGE: Int = -1
+
+/// Which connection exchange `x` belongs to.
+public(package) func exchange_pipe(x: Int) -> Int {
+    x / PIPE_INFLIGHT
+}
+
+/// Which ring slot of that connection it is.
+public(package) func exchange_index(x: Int) -> Int {
+    x % PIPE_INFLIGHT
+}
+
+/// The exchange index of connection `c`'s ring slot `i` — the flat arithmetic
+/// every per-exchange array is indexed by, and the identity `ObjType.PipeReply`
+/// and `ObjType.PipeRequest` handle entries carry.
+public(package) func pipe_exchange_at(c: Int, i: Int) -> Int {
+    c * PIPE_INFLIGHT + i
+}
 
 /// Take a free Pipe slot, or `NO_PIPE` when the slab is full.
 public(package) func alloc_pipe() unsafe -> Int {
@@ -1050,40 +1199,208 @@ public(package) func alloc_pipe() unsafe -> Int {
     NO_PIPE
 }
 
-/// The KERNEL address of connection `c`'s staging slot `i`.
+/// The KERNEL address of exchange `x`'s body slot.
 ///
 /// The whole-array address plus an offset, which is `frame_slot`'s own idiom in
 /// `kcore.threads` — an `unsafe static var` array has one address and every slot
 /// is arithmetic on it. Confined to this small named helper (design 136), so the
 /// callers stay ordinary code and the pointer never leaves the expression.
-public(package) func pipe_body_addr(c: Int, i: Int) unsafe -> UInt {
+///
+/// ONE SLOT CARRIES BOTH BODIES, one at a time: the request on the way in, and
+/// then the reply written over it (sawos design 14 D-1, on design 10 ruling 4's
+/// rider — "ruling 6's fixed slots carry the reply"). Nothing is owed to the
+/// request bytes once the taker has copied them out.
+public(package) func exchange_body_addr(x: Int) unsafe -> UInt {
     let base = ((&var PIPE_BODIES) as UnsafePointer<UInt8>) as UInt
-    base + (((c * PIPE_INFLIGHT + i) * PIPE_BODY_BYTES) as UInt)
+    base + ((x * PIPE_BODY_BYTES) as UInt)
 }
 
-/// Where connection `c`'s staging slot `i` records its length.
-public(package) func pipe_len_at(c: Int, i: Int) -> Int {
-    c * PIPE_INFLIGHT + i
+/// Take a FREE ring slot of connection `c`, or `NO_EXCHANGE` when every one of
+/// them is in use.
+///
+/// **THIS SCAN IS THE RING-FULL TEST** (sawos design 14 D-1), and what it counts
+/// is what changed in unit 2: a slot is in use from the post that stages a
+/// message until the exchange SETTLES, so a full ring is `PIPE_INFLIGHT`
+/// AWAITING-REPLY exchanges rather than `PIPE_INFLIGHT` untaken messages. That is
+/// design 10 ruling 6's "in-flight messages per client" read literally, and it is
+/// why `PipeOutletOp.Take` no longer frees anything.
+///
+/// A scan rather than a cursor, for the reason `alloc_pipe` above is one:
+/// exchanges settle in whatever order their two holders act, so the free slots
+/// are not contiguous and there is no cursor that could describe them. It is
+/// bounded by `PIPE_INFLIGHT` (16), which `kcore.limits`' audit note covers.
+public(package) func alloc_exchange(c: Int) unsafe -> Int {
+    var i: Int = 0
+    while i < PIPE_INFLIGHT {
+        let x = pipe_exchange_at(c, i)
+        match PIPE_EX_STATE[x] {
+            case Free -> { return x },
+            case _ -> {},
+        }
+        i = i + 1
+    }
+    NO_EXCHANGE
 }
 
-/// **DROP EVERYTHING CONNECTION `c` HAS STAGED** — the outlet-side zero-arm's
-/// half of the peer-gone transition (sawos design 13 D-2).
+/// Append exchange `x` to its connection's STAGED list — the FIFO a take reads
+/// from.
+///
+/// The walk to the tail is bounded by `PIPE_INFLIGHT` and buys the absence of a
+/// tail index, which is design 13's own trade taken again: a second index is a
+/// second thing two paths have to keep in step.
+public(package) func stage_push(c: Int, x: Int) unsafe {
+    PIPE_NEXT[x] = 0
+    if PIPES[c].staged == 0 {
+        PIPES[c].staged = x + 1
+        return
+    }
+    var cur = PIPES[c].staged - 1
+    while PIPE_NEXT[cur] != 0 {
+        cur = PIPE_NEXT[cur] - 1
+    }
+    PIPE_NEXT[cur] = x + 1
+}
+
+/// The OLDEST staged exchange of connection `c`, or `NO_EXCHANGE` when nothing
+/// is staged. Looks and does not remove — a take mints its obligation before it
+/// consumes anything, so the refusal path must leave the list as it found it.
+public(package) func stage_peek(c: Int) unsafe -> Int {
+    if PIPES[c].staged == 0 {
+        return NO_EXCHANGE
+    }
+    PIPES[c].staged - 1
+}
+
+/// Remove the oldest staged exchange from the list. Called only once the take
+/// that asked for it can no longer be refused.
+public(package) func stage_pop(c: Int) unsafe {
+    let head = PIPES[c].staged
+    if head == 0 {
+        return
+    }
+    PIPES[c].staged = PIPE_NEXT[head - 1]
+    PIPE_NEXT[head - 1] = 0
+}
+
+/// Is every ring slot of connection `c` free — is there no exchange left in it?
+///
+/// **THE CONNECTION OUTLIVES ITS ENDPOINTS FOR EXACTLY AS LONG AS AN EXCHANGE
+/// INSIDE IT DOES** (sawos design 14 D-1, which is design 10 ruling 10's
+/// "references govern lifetime" one level down). A claim is a reference on a RING
+/// SLOT, and a ring slot lives inside the `PIPES` row — so freeing the row while
+/// a claim is live would hand that claim a recycled connection. This predicate is
+/// what stops it, and it is a scan rather than a third column for `alloc_pipe`'s
+/// reason: it is the same bounded walk, and a maintained count would be one more
+/// thing to keep in step.
+public(package) func pipe_idle(c: Int) unsafe -> Bool {
+    var i: Int = 0
+    while i < PIPE_INFLIGHT {
+        match PIPE_EX_STATE[pipe_exchange_at(c, i)] {
+            case Free -> {},
+            case _ -> { return false },
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// Give connection `slot` back to the Pipe slab, and credit its CREATOR.
+///
+/// **CREATOR-PAYS, ONE CHARGE, ONE CREDIT** (design 10 ruling 6; design 7 D-3's
+/// rule applied to an object with two names). The `process` field is who
+/// `PipeCreate` charged, and it is credited here whichever process happened to
+/// drop the last handle onto whichever end.
+///
+/// Its precondition is both columns at zero AND `pipe_idle` — no endpoint names
+/// it and no exchange lives in it — so the ring slots are already `Free` and
+/// there is nothing to unwind here.
+public(package) func free_pipe(slot: Int) unsafe {
+    let owner = PIPES[slot].process
+    PIPES[slot] = PipeSlot(state: SlotState.Free, process: 0, staged: 0,
+                           inlet_refs: 0, outlet_refs: 0)
+    quota_credit(owner, QuotaKind.Pipe)
+}
+
+/// Can exchange `x` be given back — does nobody name it and is nothing owed?
+///
+/// **IT IS THE COUNTED-OBJECT RULE WITH ONE EXTRA CLAUSE** (sawos design 14
+/// D-2). Both columns at zero is what says no handle can ever act on this
+/// exchange again; the extra clause is that a `Staged` message is still OWED to a
+/// live outlet whatever became of the claim — which is §2.1's TELL idiom (post,
+/// drop the claim, and the server still receives the message) and design 230's
+/// close-drains-first rule reaching one level down. Once the outlet column is
+/// zero nobody can ever take it, so the message is owed to nobody and the slot
+/// may go.
+public(package) func exchange_can_settle(x: Int) unsafe -> Bool {
+    if PIPE_REPLY_REFS[x] != 0 || PIPE_REQUEST_REFS[x] != 0 {
+        return false
+    }
+    match PIPE_EX_STATE[x] {
+        case Free -> false,
+        case Staged -> PIPES[exchange_pipe(x)].outlet_refs == 0,
+        case Taken -> true,
+        case Replied -> true,
+    }
+}
+
+/// Give exchange `x`'s ring slot back — **and the CONNECTION with it, if that
+/// was the last thing keeping the row alive.**
+///
+/// The cascade is the one design 7's header describes over a different pair of
+/// kinds, and it terminates for the same reason: an exchange references its
+/// connection's storage and a connection references no exchange, so the graph is
+/// a forest.
+///
+/// THE BYTES ARE NOT ZEROED, on `pipe_drop_staged`'s own reasoning: a staged or
+/// replied body is bytes that were COPIED, the slot is unreachable until a later
+/// post writes it, and every read of one is bounded by the length that post
+/// recorded.
+public(package) func exchange_settle(x: Int) unsafe {
+    PIPE_EX_STATE[x] = ExchangeState.Free
+    PIPE_REPLY_REFS[x] = 0
+    PIPE_REQUEST_REFS[x] = 0
+    PIPE_LENS[x] = 0
+    PIPE_NEXT[x] = 0
+
+    let c = exchange_pipe(x)
+    match PIPES[c].state {
+        case Free -> {},
+        case Live -> {
+            if (PIPES[c].inlet_refs == 0 && PIPES[c].outlet_refs == 0
+                && pipe_idle(c)) {
+                free_pipe(c)
+            }
+        },
+    }
+}
+
+/// **THE OUTLET'S ZERO-ARM: NOTHING STAGED CAN EVER BE TAKEN AGAIN** (sawos
+/// design 13 D-2, as amended by design 14 D-2).
 ///
 /// It is called at the moment the OUTLET column reaches zero, because from that
-/// moment nobody can ever take again: a take needs an outlet handle, a mint
-/// needs a source, and a column at zero has neither. Messages that could never
-/// be delivered are not held, they are dropped.
+/// moment nobody can ever take: a take needs an outlet handle, a mint needs a
+/// source, and a column at zero has neither.
 ///
-/// **NOTHING OWNS ANYTHING, WHICH IS WHY THIS IS TWO ASSIGNMENTS.** A staged
-/// message is BYTES THAT WERE COPIED — the sender's buffer is still the sender's
-/// and the kernel's slot is plain storage — so dropping them is forgetting them.
-/// The bytes are deliberately not zeroed: the slot is unreachable until a later
-/// post writes it, and every read of a staging slot is bounded by the length the
-/// post that wrote it recorded. Handles in messages are UNIT 4's, and that is
-/// the unit in which this function grows a body.
+/// **UNIT 1 DROPPED THE MESSAGES AND UNIT 2 SETTLES THE CLAIMS** — which is the
+/// same act now that a staged message carries one. Each staged exchange's claim
+/// becomes ABANDONED-BY-SERVER (its obligation will never be minted), and D-2
+/// says what that means: a later `Resolve` answers `PeerClosed` and consumes the
+/// claim. So the list is emptied — nothing will ever read it again — and each
+/// exchange that NOBODY NAMES is given back on the spot. The rest stay exactly
+/// where they are, holding the answer their claims are owed, and `Resolve` reads
+/// `outlet_refs == 0` to know what to say. That is the derivation D-2 asks for:
+/// abandonment is the columns, not a flag beside them.
 public(package) func pipe_drop_staged(c: Int) unsafe {
-    PIPES[c].head = 0
-    PIPES[c].count = 0
+    var cur = PIPES[c].staged
+    PIPES[c].staged = 0
+    while cur != 0 {
+        let x = cur - 1
+        cur = PIPE_NEXT[x]
+        PIPE_NEXT[x] = 0
+        if exchange_can_settle(x) {
+            exchange_settle(x)
+        }
+    }
 }
 
 // =============================================================================

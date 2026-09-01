@@ -32,8 +32,9 @@
 // BEFORE the bytes — so this is also `pipe-peer-gone`'s drain-first rule seen
 // across a real process boundary rather than inside one program.
 
-import sos.{System, Process, PipeInlet, PipeOutlet, Clock, ClockType, Timer,
-            Waiter, SosStatus, SystemRight, PIPE_BODY_BYTES}
+import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
+            Clock, ClockType, Timer, Waiter, SosStatus, SystemRight,
+            PIPE_BODY_BYTES}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
@@ -61,6 +62,20 @@ static TAG_PIPE: UInt = 9
 /// reason `give-boot-drain` records — it is the ticket the give itself checks.
 static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
                                | SystemRight.Transfer)
+
+/// Take, and discharge the obligation by dropping it. The child posted with the
+/// TELL idiom — it gave its claim up at once — so nobody is listening and the
+/// exchange settles here (sawos design 14).
+func take_message(outlet: &PipeOutlet,
+                  into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<UInt?, SosStatus> {
+    let got = try outlet.take(into: &var into)
+    if let (n, request) = move got {
+        let _ = move request
+        let some: UInt? = n
+        return move some
+    }
+    return None
+}
 
 @export("_start")
 func _start(boot_handle: UInt) {
@@ -165,7 +180,7 @@ func _start(boot_handle: UInt) {
     var rounds: Int = 0
     while (not have) && rounds < POLL_ROUNDS {
         rounds = rounds + 1
-        let got = try outlet.take(into: &var buf) catch {
+        let got = try take_message(&outlet, &var buf) catch {
             print("SOS pipechild: take refused: {}\n", error)
             let _ = system.shutdown(EXIT_FAILED)
             return

@@ -17,7 +17,7 @@
 
 import sosabi.{SosStatus, SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp,
                InterruptOp, ClockOp, TimerOp, MemoryOp, IoMemoryOp, MappingOp,
-               PipeInletOp, PipeOutletOp,
+               PipeInletOp, PipeOutletOp, PipeReplyOp, PipeRequestOp,
                RELEASE_OP, MINT_OP}
 
 // The per-arch HAL, and since design 172 part 2 the WHOLE of it: the one
@@ -660,8 +660,8 @@ public func sos_process_pipe_create(handle: UInt, buf: UnsafePointer<UInt>,
                  (&var ignored) as UnsafePointer<UInt>)
 }
 
-/// **POST — stage `len` bytes from `body` for the far end.** Requires
-/// `PipeInletRight.Post`.
+/// **POST — stage `len` bytes from `body` for the far end, and answer with the
+/// CLAIM on its reply** through `value_out`. Requires `PipeInletRight.Post`.
 ///
 /// IT NEVER SUSPENDS (design 10 ruling 4). `len` may be 0 — a data-free message
 /// is §2.1's own option, and a zero-length post reads no buffer at all, so the
@@ -669,38 +669,101 @@ public func sos_process_pipe_create(handle: UInt, buf: UnsafePointer<UInt>,
 /// caller: the maximum is published and the caller chose the number. So does a
 /// body that is misaligned or outside this process's memory.
 ///
-/// TWO REFUSALS ARE STATUSES, and they are the two a correct program meets:
-/// `SosStatus.PeerClosed` when the far end is gone (nobody can ever take it,
-/// and it is terminal — nothing un-closes), and `SosStatus.WouldBlock` when the
-/// staging ring is full, which is transient and clears when the far end takes.
+/// **THE VALUE IS A `PipeReply` HANDLE** (sawos design 14) — the client's claim
+/// on the one reply this message is owed, minted into the caller's table. On a
+/// refusal nothing is minted and the value means nothing.
+///
+/// THREE REFUSALS ARE STATUSES: `SosStatus.PeerClosed` when the far end is gone
+/// (nobody can ever take it, and it is terminal — nothing un-closes),
+/// `SosStatus.WouldBlock` when the ring has no free slot, which is transient and
+/// clears when an exchange settles, and `SosStatus.NoResource` /
+/// `SosStatus.QuotaExceeded` when there is no room in the caller's table for the
+/// claim.
 @export("sos_pipe_inlet_post")
 public func sos_pipe_inlet_post(handle: UInt, body: UnsafePointer<UInt8>,
-                                len: UInt) unsafe -> UInt {
-    var ignored: UInt = 0
+                                len: UInt,
+                                value_out: UnsafePointer<UInt>) unsafe -> UInt {
     sos_syscall3(handle, PipeInletOp.Post as UInt, body as UInt, len, 0,
-                 (&var ignored) as UnsafePointer<UInt>)
+                 value_out)
 }
 
-/// **TAKE — copy the OLDEST staged message into `buf`, and answer its length**
-/// through `value_out`. Requires `PipeOutletRight.Take`.
+/// **TAKE — copy the OLDEST staged message into `body`, and answer a RECORD
+/// naming its length and the obligation to reply to it.** Requires
+/// `PipeOutletRight.Take`.
 ///
-/// IT NEVER PARKS. `cap` is the buffer's size in BYTES and must be at least
-/// `PIPE_BODY_BYTES` — the whole slot's size, because a caller cannot size a
-/// buffer against a length it has not been told yet. A smaller one TERMINATES
-/// the caller, as does a buffer outside this process's writable memory.
+/// IT NEVER PARKS. `rec` is a two-word buffer — word 0 the message's LENGTH,
+/// word 1 a `PipeRequest` handle minted into the caller's table — and `rec_cap`
+/// is its size in BYTES, which must be at least `pipe_take_record_bytes()`. A
+/// smaller one TERMINATES the caller, as does a record buffer outside this
+/// process's writable memory.
 ///
-/// TWO REFUSALS ARE STATUSES: `SosStatus.WouldBlock` when the ring is empty and
-/// the far end still exists, and `SosStatus.PeerClosed` when the ring is empty
+/// `body` takes no capacity of its own: it is checked against `PIPE_BODY_BYTES`,
+/// still the published minimum, but against the caller's REAL memory rather than
+/// against a number the caller typed — a buffer that short TERMINATES the caller
+/// with `BadBuffer`.
+///
+/// TWO REFUSALS ARE STATUSES: `SosStatus.WouldBlock` when nothing is staged and
+/// the far end still exists, and `SosStatus.PeerClosed` when nothing is staged
 /// AND the far end is gone. THE ORDER IS THE CONTRACT — everything staged is
 /// handed over first, whatever became of the sender, and only a drained ring
-/// answers `PeerClosed`. Nothing un-closes, so every later take answers the
-/// same.
+/// answers `PeerClosed`. Nothing un-closes, so every later take answers the same.
+/// A full table or a spent handle budget is `SosStatus.NoResource` /
+/// `SosStatus.QuotaExceeded`, with the message left staged for whoever takes it
+/// next.
 @export("sos_pipe_outlet_take")
-public func sos_pipe_outlet_take(handle: UInt, buf: UnsafePointer<UInt8>,
-                                 cap: UInt,
-                                 value_out: UnsafePointer<UInt>) unsafe -> UInt {
-    sos_syscall3(handle, PipeOutletOp.Take as UInt, buf as UInt, cap, 0,
+public func sos_pipe_outlet_take(handle: UInt, rec: UnsafePointer<UInt>,
+                                 rec_cap: UInt,
+                                 body: UnsafePointer<UInt8>) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, PipeOutletOp.Take as UInt, rec as UInt, rec_cap,
+                 body as UInt, (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// **RESOLVE — take the reply if it has been written, and answer its length**
+/// through `value_out`. Requires `PipeReplyRight.Resolve`.
+///
+/// IT NEVER PARKS, and unit 2 has no waitability to park with: the blocking
+/// `send(msg)` / `send(msg, timeout:)` compositions are unit 3's. `cap` is the
+/// buffer's size in BYTES and must be at least `PIPE_BODY_BYTES` — the whole
+/// slot's size, because a caller cannot size a buffer against a length it has not
+/// been told yet.
+///
+/// **IT CONSUMES THE CLAIM UNLESS IT ANSWERS `WouldBlock`.** A delivered reply
+/// and a `SosStatus.PeerClosed` both end the exchange, so the caller's handle is
+/// destroyed with them and using the word again is the ordinary `BadHandle`
+/// fault; a would-block consumes nothing and the claim is still yours.
+///
+/// `SosStatus.PeerClosed` means the server side abandoned it — the obligation was
+/// dropped without a reply, or the connection's server end went away before the
+/// message could ever be taken.
+@export("sos_pipe_reply_resolve")
+public func sos_pipe_reply_resolve(handle: UInt, buf: UnsafePointer<UInt8>,
+                                   cap: UInt,
+                                   value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, PipeReplyOp.Resolve as UInt, buf as UInt, cap, 0,
                  value_out)
+}
+
+/// **REPLY — copy `len` bytes from `body` back to the client, and DISCHARGE the
+/// obligation.** Requires `PipeRequestRight.Reply`.
+///
+/// `len` may be 0 — a reply that carries no data is still an answer — and a `len`
+/// above `PIPE_BODY_BYTES` TERMINATES the caller, exactly as it does at a post.
+///
+/// **IT ALWAYS CONSUMES THE REQUEST**, which is what single-use means: the
+/// caller's handle is destroyed whether the reply landed or not, and using the
+/// word again is the ordinary `BadHandle` fault.
+///
+/// `SosStatus.PeerClosed` says the reply was not delivered because the client
+/// abandoned its claim — §2.1's ratified answer, never a silent success, and
+/// ignorable with `let _ =` on the std-Channel close precedent. The obligation is
+/// discharged either way.
+@export("sos_pipe_request_reply")
+public func sos_pipe_request_reply(handle: UInt, body: UnsafePointer<UInt8>,
+                                   len: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, PipeRequestOp.Reply as UInt, body as UInt, len, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
 }
 
 /// **RELEASE — destroy this handle, whatever kind it names** (sawos design 3

@@ -1,5 +1,5 @@
 // SOS M4 unit 1: THE PAIR, END TO END IN ONE PROCESS (sawos design 13; spec
-// §2.1).
+// §2.1). **AMENDED BY UNIT 2 (sawos design 14) WITHOUT MOVING A ROW.**
 //
 // **A CONNECTION IS AN OBJECT, AND THIS IS THE SMALLEST PROGRAM THAT PROVES
 // IT.** Root creates a pair, holds both ends itself, and exercises every claim
@@ -22,19 +22,31 @@
 // build define produced. A kernel that silently overwrote a staged message, or
 // that stopped one slot early, would print a different number here.
 //
-// **AND `Ok(false)` / `Ok(None)` ARE NOT ERRORS**, which is the typed tier's
-// half of the unit (design 234 §4). A ring that is full and a ring that is empty
-// are both "not right now" — transient, cleared by the peer — so they arrive in
-// the OK channel with a distinguishable absence, and the loops below are
-// ordinary `if`s rather than error matches. What does reach the error channel is
-// `PeerClosed`, and `pipe-peer-gone` is where that is proved.
+// **AND `Ok(None)` IS NOT AN ERROR**, which is the typed tier's half of the unit
+// (design 234 §4). A ring that is full and a ring that is empty are both "not
+// right now" — transient, cleared by the peer — so they arrive in the OK channel
+// with a distinguishable absence, and the loops below are ordinary `if`s rather
+// than error matches. What does reach the error channel is `PeerClosed`, and
+// `pipe-peer-gone` is where that is proved.
+//
+// **WHAT M4 UNIT 2 CHANGED HERE, AND WHY THE NUMBERS DID NOT MOVE.** A post now
+// answers a CLAIM on the reply that message is owed, a take answers the
+// OBLIGATION to send it, and a ring slot lives until the exchange SETTLES rather
+// than until its bytes are taken. This case is about the DATA path, so it takes
+// §2.1's TELL idiom at every step — post, give the claim up, and the message is
+// still owed to the server — and discharges each obligation by dropping it. Both
+// halves of every exchange therefore go before the next line runs, the slot
+// recycles, and `depth=16` / `drained=16` mean exactly what they meant in unit 1.
+// `pipe-oneshot` is where an exchange is deliberately LEFT open, and where the
+// ring is counted again with one in flight.
 //
 // EVERY LOOP IS BOUNDED. A poll loop with no ceiling is a hang the deadlock
 // report cannot see, so both counting loops stop after `MAX_ROUNDS` whatever the
 // kernel answers, and a run that hit the ceiling would print a number the
 // expectation does not match.
 
-import sos.{System, Process, PipeInlet, PipeOutlet, SosStatus, PIPE_BODY_BYTES}
+import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
+            SosStatus, PIPE_BODY_BYTES}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
@@ -43,6 +55,40 @@ static EXIT_FAILED: UInt = 1
 /// kernel could have — the point is that the loop terminates whatever the
 /// kernel answers, not that the number is tight.
 static MAX_ROUNDS: Int = 64
+
+/// **POST AND GIVE THE CLAIM UP — §2.1's TELL IDIOM** (sawos design 14).
+///
+/// The message is staged and the client says at once that it does not want the
+/// answer. That is a legal shape and not a leak: a staged message is owed to a
+/// LIVE outlet whatever became of its claim, so the server still receives it, and
+/// the exchange's ring slot is released the moment the server's obligation goes
+/// too. Answers "was it staged", which is the `Bool` unit 1's `post` used to
+/// return and is all this case ever needed.
+func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
+          len: UInt) -> Result<Bool, SosStatus> {
+    let staged = try inlet.post(body: &body, len: len)
+    if let claim = move staged {
+        let _ = move claim
+        return true
+    }
+    return false
+}
+
+/// **TAKE AND DISCHARGE BY DROPPING.** The obligation this hands back is answered
+/// the one way a server with nothing to say can answer it — by releasing it,
+/// which tells a client that is still listening `PeerClosed`. Here nobody is
+/// listening (the claim went at the post), so the exchange simply settles and its
+/// ring slot goes back.
+func take_message(outlet: &PipeOutlet,
+                  into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<UInt?, SosStatus> {
+    let got = try outlet.take(into: &var into)
+    if let (n, request) = move got {
+        let _ = move request
+        let some: UInt? = n
+        return move some
+    }
+    return None
+}
 
 @export("_start")
 func _start(boot_handle: UInt) {
@@ -73,7 +119,7 @@ func _start(boot_handle: UInt) {
     msg[0] = 65
     msg[1] = 66
     msg[2] = 67
-    let staged = try inlet.post(body: &msg, len: 3) catch {
+    let staged = try tell(&inlet, &msg, 3) catch {
         print("SOS pipebasics: post failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
@@ -83,7 +129,7 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let first = try outlet.take(into: &var buf) catch {
+    let first = try take_message(&outlet, &var buf) catch {
         print("SOS pipebasics: take failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
@@ -99,19 +145,19 @@ func _start(boot_handle: UInt) {
     // ---- FIFO. Three messages in, three out, and the ORDER is the claim: a
     // ring that handed back the newest first would print 3,2,1 here.
     msg[0] = 1
-    let a = try inlet.post(body: &msg, len: 1) catch {
+    let a = try tell(&inlet, &msg, 1) catch {
         print("SOS pipebasics: fifo post 1 failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
     msg[0] = 2
-    let b = try inlet.post(body: &msg, len: 1) catch {
+    let b = try tell(&inlet, &msg, 1) catch {
         print("SOS pipebasics: fifo post 2 failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
     msg[0] = 3
-    let c = try inlet.post(body: &msg, len: 1) catch {
+    let c = try tell(&inlet, &msg, 1) catch {
         print("SOS pipebasics: fifo post 3 failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
@@ -124,7 +170,7 @@ func _start(boot_handle: UInt) {
     var order: UInt = 0
     var seen: Int = 0
     while seen < 3 {
-        let got = try outlet.take(into: &var buf) catch {
+        let got = try take_message(&outlet, &var buf) catch {
             print("SOS pipebasics: fifo take failed: {}\n", error)
             let _ = system.shutdown(EXIT_FAILED)
             return
@@ -145,7 +191,7 @@ func _start(boot_handle: UInt) {
     // Optional is what keeps "a message of length 0" apart from "no message":
     // this take answers `Ok(Some(0))`, where the one after the drain below
     // answers `Ok(None)`.
-    let empty_staged = try inlet.post(body: &msg, len: 0) catch {
+    let empty_staged = try tell(&inlet, &msg, 0) catch {
         print("SOS pipebasics: empty post failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
@@ -155,7 +201,7 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let empty = try outlet.take(into: &var buf) catch {
+    let empty = try take_message(&outlet, &var buf) catch {
         print("SOS pipebasics: empty take failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
@@ -174,7 +220,7 @@ func _start(boot_handle: UInt) {
     var rounds: Int = 0
     while filling && rounds < MAX_ROUNDS {
         rounds = rounds + 1
-        let put = try inlet.post(body: &msg, len: 1) catch {
+        let put = try tell(&inlet, &msg, 1) catch {
             print("SOS pipebasics: fill failed: {}\n", error)
             let _ = system.shutdown(EXIT_FAILED)
             return
@@ -194,7 +240,7 @@ func _start(boot_handle: UInt) {
     var passes: Int = 0
     while draining && passes < MAX_ROUNDS {
         passes = passes + 1
-        let got = try outlet.take(into: &var buf) catch {
+        let got = try take_message(&outlet, &var buf) catch {
             print("SOS pipebasics: drain failed: {}\n", error)
             let _ = system.shutdown(EXIT_FAILED)
             return
@@ -211,7 +257,7 @@ func _start(boot_handle: UInt) {
     // met it once; asking again says it is stable, and says it through the
     // typed tier's two channels rather than through a status a caller would
     // have had to match as a failure.
-    let nothing = try outlet.take(into: &var buf) catch {
+    let nothing = try take_message(&outlet, &var buf) catch {
         print("SOS pipebasics: empty ring is an error: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return

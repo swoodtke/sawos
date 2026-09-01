@@ -28,7 +28,8 @@
 // first is killed empty from the server side, the second is loaded and then
 // killed from the client side.
 
-import sos.{System, Process, PipeInlet, PipeOutlet, SosStatus, PIPE_BODY_BYTES}
+import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
+            SosStatus, PIPE_BODY_BYTES}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
@@ -36,6 +37,35 @@ static EXIT_FAILED: UInt = 1
 /// The two payload bytes the drain has to hand back, in this order.
 static FIRST_BYTE: UInt8 = 7
 static SECOND_BYTE: UInt8 = 8
+
+/// **POST AND GIVE THE CLAIM UP — §2.1's TELL IDIOM** (sawos design 14). This
+/// case is about the CONNECTION's peer-gone doctrine, not the one-shot pair's, so
+/// every message here is a tell: the client never asks for an answer, and what is
+/// proved is that the staged message survives its sender exactly as unit 1 said.
+/// `pipe-abandon` is where the pair's own abandonment arms are proved.
+func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
+          len: UInt) -> Result<Bool, SosStatus> {
+    let staged = try inlet.post(body: &body, len: len)
+    if let claim = move staged {
+        let _ = move claim
+        return true
+    }
+    return false
+}
+
+/// Take, and discharge the obligation by dropping it. Nobody is listening — the
+/// claims went at the posts — so each exchange settles and its ring slot goes
+/// back.
+func take_message(outlet: &PipeOutlet,
+                  into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<UInt?, SosStatus> {
+    let got = try outlet.take(into: &var into)
+    if let (n, request) = move got {
+        let _ = move request
+        let some: UInt? = n
+        return move some
+    }
+    return None
+}
 
 @export("_start")
 func _start(boot_handle: UInt) {
@@ -89,13 +119,13 @@ func _start(boot_handle: UInt) {
     let (sender, receiver) = move second_pair
 
     msg[0] = FIRST_BYTE
-    let one = try sender.post(body: &msg, len: 1) catch {
+    let one = try tell(&sender, &msg, 1) catch {
         print("SOS peergone: stage 1 failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
     msg[0] = SECOND_BYTE
-    let two = try sender.post(body: &msg, len: 1) catch {
+    let two = try tell(&sender, &msg, 1) catch {
         print("SOS peergone: stage 2 failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
@@ -112,7 +142,7 @@ func _start(boot_handle: UInt) {
     let _ = move sender
     let _ = system.debug_print("SOS peergone: inlet dropped\n")
 
-    let first = try receiver.take(into: &var buf) catch {
+    let first = try take_message(&receiver, &var buf) catch {
         print("SOS peergone: first take was refused: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
@@ -123,7 +153,7 @@ func _start(boot_handle: UInt) {
         return
     }
     let a = buf[0] as UInt
-    let second = try receiver.take(into: &var buf) catch {
+    let second = try take_message(&receiver, &var buf) catch {
         print("SOS peergone: second take was refused: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
@@ -137,7 +167,7 @@ func _start(boot_handle: UInt) {
 
     // ...and ONLY NOW is the server told. The ring is empty and no sender can
     // ever appear, so this is the terminal answer rather than a would-block.
-    match receiver.take(into: &var buf) {
+    match take_message(&receiver, &var buf) {
         case Ok(_) -> {
             let _ = system.debug_print("SOS peergone: drained ring still had one\n")
             let _ = system.shutdown(EXIT_FAILED)
@@ -148,7 +178,7 @@ func _start(boot_handle: UInt) {
 
     // NOTHING UN-CLOSES. Asking again answers the same word, which is what makes
     // this a level a caller can act on rather than an edge it might miss.
-    match receiver.take(into: &var buf) {
+    match take_message(&receiver, &var buf) {
         case Ok(_) -> {
             let _ = system.debug_print("SOS peergone: a closed pipe re-opened\n")
             let _ = system.shutdown(EXIT_FAILED)

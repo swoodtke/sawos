@@ -30,6 +30,22 @@
 //! one column at zero is the PEER-GONE transition, and `free_object` runs only
 //! when both are, so there is no other site it could be written at.
 //!
+//! **AND M4 UNIT 2 REPEATED THE WHOLE SHAPE ONE LEVEL DOWN** (sawos design 14).
+//! `PipeReply` and `PipeRequest` — the client's claim on a reply and the server's
+//! obligation to send one — are two counted kinds over one RING SLOT with two
+//! reference columns, exactly as the endpoint pair is over one connection: each
+//! arm decrements its column and answers about the whole exchange, and reaching
+//! zero on one column alone is the ABANDONMENT transition that `Reply` and
+//! `Resolve` read off the counts. The one thing that is not the endpoint pair's
+//! rule verbatim is `exchange_can_settle`'s extra clause — a STAGED message is
+//! still owed to a live outlet whatever became of its claim, which is §2.1's TELL
+//! idiom — and it is written there rather than here.
+//!
+//! **THE TEARDOWN'S FORCE-FREE IS GONE** (`designs/010` ruling 10, design 14
+//! D-3): `end_process` no longer sweeps the Memory, IoMemory and Pipe slabs by
+//! charged process. `reap_unreferenced` below is what took its place and the
+//! block above it carries the argument.
+//!
 //! # ZERO FREES, SYNCHRONOUSLY (D-1)
 //!
 //! The kernel is one context running to completion, so the count hits zero
@@ -67,6 +83,7 @@
 
 import hal
 import sosabi.{EventMode, ObjType, SosStatus}
+import kcore.limits.{MAX_IOMEMORIES, MAX_MEMORIES, MAX_PIPES}
 import kcore.diag.{fatal_kernel}
 import kcore.result.{op_status, write_result}
 import kcore.threads.{THREADS, ThreadState, frame_slot, ready_push}
@@ -79,10 +96,16 @@ import kcore.objects.{
     MemorySlot,
     NO_ROW,
     PIPES,
-    PipeSlot,
+    PIPE_EXCHANGES,
+    PIPE_REPLY_REFS,
+    PIPE_REQUEST_REFS,
     QuotaKind,
     SlotState,
+    exchange_can_settle,
+    exchange_settle,
+    free_pipe,
     pipe_drop_staged,
+    pipe_idle,
     quota_credit,
 }
 import kcore.time.{TIMERS, TimerSlot, reprogram_timer}
@@ -136,10 +159,45 @@ public(package) func ref_object(kind: ObjType, slot: Int) unsafe {
         // already established before this function was reached (§3's order).
         case PipeInlet -> { PIPES[slot].inlet_refs = PIPES[slot].inlet_refs + 1 },
         case PipeOutlet -> { PIPES[slot].outlet_refs = PIPES[slot].outlet_refs + 1 },
+        // **THE SAME MECHANISM ONE LEVEL DOWN** (sawos design 14 D-1). `slot` is
+        // an EXCHANGE — a connection's ring slot — and the kind is what says
+        // whether this handle is the client's CLAIM or the server's OBLIGATION,
+        // and therefore which of the exchange's two columns it counts on. Two
+        // kinds over one slot, decided by `obj_type`, exactly as the two
+        // endpoint kinds are over the connection above.
+        case PipeReply -> { PIPE_REPLY_REFS[slot] = PIPE_REPLY_REFS[slot] + 1 },
+        case PipeRequest -> {
+            PIPE_REQUEST_REFS[slot] = PIPE_REQUEST_REFS[slot] + 1
+        },
         case System -> {},
         case Clock -> {},
         case Thread -> {},
         case Unbound -> {},
+    }
+}
+
+/// Whether connection `slot` may be given back NOW: no endpoint names it, and no
+/// exchange lives in it.
+///
+/// **THE THIRD CLAUSE IS M4 UNIT 2's** (sawos design 14 D-1). A `PipeReply` or a
+/// `PipeRequest` is a reference on a RING SLOT, and the ring slots live inside
+/// the `PIPES` row — so freeing the row while a claim is live would hand that
+/// claim a recycled connection. `pipe_idle` is what makes "the connection
+/// outlives its endpoints for exactly as long as an exchange inside it does"
+/// true, which is design 10 ruling 10's own sentence one level down.
+///
+/// **AND THE STATE TEST IS NOT DEFENSIVE.** Settling an exchange can CASCADE into
+/// freeing the connection (`exchange_settle`), and the outlet's zero-arm settles
+/// exchanges before it asks this question — so by the time it is asked the row
+/// may already be back on the slab, and the honest answer for "should the caller
+/// free it" is then no.
+func pipe_frees_now(slot: Int) unsafe -> Bool {
+    match PIPES[slot].state {
+        case Free -> false,
+        case Live -> {
+            (PIPES[slot].inlet_refs == 0 && PIPES[slot].outlet_refs == 0
+             && pipe_idle(slot))
+        },
     }
 }
 
@@ -213,21 +271,54 @@ func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
             // by a sender that is gone, and the OUTLET may still take every word
             // of it. `Take` reads the column when the ring runs dry and answers
             // `PeerClosed` then, which is drain-then-terminal in one comparison.
-            (PIPES[slot].inlet_refs == 0 && PIPES[slot].outlet_refs == 0)
+            //
+            // **AND A CLAIM OUTLIVES THE INLET IT WAS POSTED THROUGH** (sawos
+            // design 14 D-2). A `PipeReply` is a counted object in its own right,
+            // rooted in the ring slot rather than in the endpoint, so a client
+            // may drop its inlet and still resolve every claim it holds — which
+            // is what makes post-then-drop-the-inlet a legal shape rather than a
+            // way to lose an answer.
+            pipe_frees_now(slot)
         },
         case PipeOutlet -> {
             if PIPES[slot].outlet_refs == 0 { return false }
             PIPES[slot].outlet_refs = PIPES[slot].outlet_refs - 1
             if PIPES[slot].outlet_refs == 0 {
-                // **AND THE STAGED BODIES GO** (sawos design 13 D-2). Nobody can
-                // ever take again — a take needs an outlet handle and this
-                // column is zero — so messages that could never be delivered are
-                // dropped rather than held. Nothing owns anything: a staged
-                // message is bytes that were copied, so the drop is two
-                // assignments. See `pipe_drop_staged`.
+                // **AND THE STAGED EXCHANGES ARE SETTLED** (sawos design 13 D-2,
+                // as amended by design 14 D-2). Nobody can ever take again — a
+                // take needs an outlet handle and this column is zero — so a
+                // staged message has no future and its CLAIM is abandoned by the
+                // server. `pipe_drop_staged` empties the list and gives back
+                // every exchange nobody names; the ones a live claim still names
+                // stay, holding the `PeerClosed` their `Resolve` is owed.
                 pipe_drop_staged(slot)
             }
-            (PIPES[slot].inlet_refs == 0 && PIPES[slot].outlet_refs == 0)
+            pipe_frees_now(slot)
+        },
+        // **AN EXCHANGE IS THE SAME TWO-COLUMN OBJECT ONE LEVEL DOWN** (sawos
+        // design 14 D-2), so these two arms read exactly like the pair above
+        // them: each decrements ITS column and then answers about the WHOLE
+        // exchange. `exchange_can_settle` is that question — nobody names it, and
+        // nothing is owed — and it is where design 14's one asymmetry lives: a
+        // STAGED message is still owed to a live outlet whatever became of its
+        // claim, which is §2.1's TELL idiom.
+        //
+        // WHAT REACHING ZERO MEANS IS THE OTHER HALF, and it is not written here
+        // because it is not a transition anybody has to record: a claim column at
+        // zero IS abandoned-by-client and a request column at zero on a `Taken`
+        // exchange IS abandoned-by-server, read off the counts by `Reply` and
+        // `Resolve` at the moment they need an answer. Design 13's "the two
+        // columns are the peer-gone state, and no flag beside them says so",
+        // inherited exactly.
+        case PipeReply -> {
+            if PIPE_REPLY_REFS[slot] == 0 { return false }
+            PIPE_REPLY_REFS[slot] = PIPE_REPLY_REFS[slot] - 1
+            exchange_can_settle(slot)
+        },
+        case PipeRequest -> {
+            if PIPE_REQUEST_REFS[slot] == 0 { return false }
+            PIPE_REQUEST_REFS[slot] = PIPE_REQUEST_REFS[slot] - 1
+            exchange_can_settle(slot)
         },
         case Process -> {
             if PROCESSES[slot].refs == 0 { return false }
@@ -322,25 +413,6 @@ func revoke_blocked(w: Int) unsafe {
         THREADS[slot].state = ThreadState.Runnable
         ready_push(slot)
     }
-}
-
-/// Give connection `slot` back to the Pipe slab, and credit its CREATOR.
-///
-/// **CREATOR-PAYS, ONE CHARGE, ONE CREDIT** (sawos design 10 ruling 6; design 7
-/// D-3's rule applied to an object with two names). The `process` field is who
-/// `PipeCreate` charged, and it is credited here whichever process happened to
-/// drop the last handle onto whichever end — the same sentence every other
-/// counted kind's arm states, over an object that can legitimately have its two
-/// ends in two different processes.
-///
-/// It is a named helper rather than a body repeated in two arms, because the two
-/// arms above it really are one act (see the comment there) and a reader should
-/// not have to diff them to be sure.
-func free_pipe(slot: Int) unsafe {
-    let owner = PIPES[slot].process
-    PIPES[slot] = PipeSlot(state: SlotState.Free, process: 0, head: 0, count: 0,
-                           inlet_refs: 0, outlet_refs: 0)
-    quota_credit(owner, QuotaKind.Pipe)
 }
 
 /// Give object `slot` of kind `kind` back to its slab, and run the kind's own
@@ -555,6 +627,26 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
         // hands back.
         case PipeInlet -> { free_pipe(slot) },
         case PipeOutlet -> { free_pipe(slot) },
+        // **AND THE ONE-SHOT PAIR IS THE SAME ACT WRITTEN TWICE AGAIN** (sawos
+        // design 14 D-1/D-2). Reaching this function through EITHER one-shot kind
+        // means `drop_reference` already found both of the exchange's columns at
+        // zero with nothing owed, so which half happened to go last is not a fact
+        // anything downstream has a use for.
+        //
+        // NO QUOTA IS CREDITED HERE, and that is D-1's ruling rather than an
+        // omission: a claim mints NO quota row. The scarce thing an exchange
+        // occupies is a ring slot, and the ring is part of the CONNECTION —
+        // charged once at `PipeCreate`, credited once when the row goes back. A
+        // per-exchange row would charge a client twice for the same kilobytes and
+        // would make design 10 ruling 4's "zero one-shot quota rows on the fast
+        // path" a difference in kind rather than one of handle traffic.
+        //
+        // The settle may CASCADE into freeing the connection — the ring slot is
+        // storage inside the `PIPES` row — and that cascade terminates because an
+        // exchange references its connection and a connection references no
+        // exchange.
+        case PipeReply -> { exchange_settle(slot) },
+        case PipeRequest -> { exchange_settle(slot) },
         case System -> {
             fatal_kernel("free_object on the System singleton", slot as UInt)
         },
@@ -569,6 +661,91 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
             fatal_kernel("free_object on a handle that names nothing",
                          slot as UInt)
         },
+    }
+}
+
+// =============================================================================
+// THE TEARDOWN'S WRITE-OFF — what replaced the by-charged-process force-free
+// (spec §2.1; `designs/010` ruling 10, landed by sawos design 14 D-3)
+// =============================================================================
+//
+// **REFERENCES GOVERN LIFETIME, SO A TEARDOWN NEVER FORCE-FREES A COUNTED
+// KIND.** `end_process` used to sweep the Memory, IoMemory and Pipe slabs by
+// `process == p` and zero every slot the dying process had been CHARGED for —
+// a pre-refcount survivor, from the units that had no count to consult — and
+// design 13's finding 2 named the hazard it leaves: a connection whose creator
+// dies while a PEER still holds an end has its row freed under that holder,
+// staged messages and all. Ruling 10 takes the fix that deletes bookkeeping
+// rather than adding it. A slot outlives its creator for exactly as long as
+// anybody holds a reference; possession keeps alive, which is the capability
+// model's own answer.
+//
+// **WHAT IS LEFT IS NOT A SWEEP BY OWNERSHIP BUT A REAP OF WHAT NOBODY NAMES**,
+// and the reason it cannot simply be deleted is design 7 D-5's deliberate
+// asymmetry one function up: the close-all counts WITHOUT freeing
+// (`unref_teardown`), because the per-slab sweeps that DO free are also what
+// count for the teardown report. Delete the three silent sweeps outright and a
+// slot the dying process held the last handle onto reaches zero references with
+// nothing left to free it — a leak, not a write-off. So the CONDITION changes
+// from "charged to this process" to "named by nobody", which is ruling 10's
+// sentence made mechanical: the force-free is gone, and the reclamation the
+// close-all defers still happens.
+//
+// It frees through `free_object`, so every kind's own last rites and its quota
+// CREDIT run exactly as they do on the ordinary release path — which is the
+// other half of what the old sweeps got wrong. They zeroed a slot another
+// process had been charged for and credited nobody.
+//
+// **THE OTHER FIVE SWEEPS STAY, and Mapping stays with them.** Threads, Events,
+// Waiters, Interrupts and Timers are counted for the teardown report, and D-5
+// authorises no change to those numbers. A Mapping is a counted kind whose sweep
+// looks like the three deleted ones and is NOT one: `mapping_rights()` withholds
+// `Transfer`, so a Mapping handle cannot leave the process that owns it and a
+// sibling cannot outlive its owner — the hazard ruling 10 names cannot arise —
+// and its second arm (clearing the row of a mapping whose TARGET died) is not a
+// free at all.
+
+/// Reap every Memory, IoMemory, exchange and Pipe connection that NOTHING NAMES
+/// any more. Called by `end_process` after the close-all.
+///
+/// The order is inner-to-outer: an exchange lives inside a connection's row, so
+/// the exchanges are given back first and the connections they were in can then
+/// answer `pipe_idle` honestly. (`exchange_settle` cascades into `free_pipe`
+/// itself, so the second loop is what catches a connection with no exchanges at
+/// all — the ordinary case.)
+public(package) func reap_unreferenced() unsafe {
+    var m: Int = 0
+    while m < MAX_MEMORIES {
+        match MEMORIES[m].state {
+            case Free -> {},
+            case Live -> {
+                if MEMORIES[m].refs == 0 { free_object(ObjType.Memory, m) }
+            },
+        }
+        m = m + 1
+    }
+
+    var io: Int = 0
+    while io < MAX_IOMEMORIES {
+        match IOMEMORIES[io].state {
+            case Free -> {},
+            case Live -> {
+                if IOMEMORIES[io].refs == 0 { free_object(ObjType.IoMemory, io) }
+            },
+        }
+        io = io + 1
+    }
+
+    var x: Int = 0
+    while x < PIPE_EXCHANGES {
+        if exchange_can_settle(x) { exchange_settle(x) }
+        x = x + 1
+    }
+
+    var c: Int = 0
+    while c < MAX_PIPES {
+        if pipe_frees_now(c) { free_pipe(c) }
+        c = c + 1
     }
 }
 

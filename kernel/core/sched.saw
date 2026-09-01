@@ -39,10 +39,7 @@ import kcore.limits.{
     MAX_EVENTS,
     MAX_HANDLES,
     MAX_INTERRUPTS,
-    MAX_IOMEMORIES,
     MAX_MAPPINGS,
-    MAX_MEMORIES,
-    MAX_PIPES,
     MAX_THREADS,
     MAX_TIMERS,
     MAX_WAITERS,
@@ -53,21 +50,15 @@ import kcore.result.{op_value, write_result}
 import kcore.diag.{ExitCode, console}
 import kcore.objects.{
     HANDLES,
-    IOMEMORIES,
-    IoMemorySlot,
     MAPPINGS,
-    MEMORIES,
     MappingSlot,
-    MemorySlot,
     NO_ROW,
-    PIPES,
-    PipeSlot,
     SlotState,
     clear_boot_handles,
     quota_clear,
     unbind_handle,
 }
-import kcore.refs.{unref_teardown, unref_waitable_teardown}
+import kcore.refs.{reap_unreferenced, unref_teardown, unref_waitable_teardown}
 import kcore.threads.{
     CURRENT_THREAD,
     LAST_PROT_PROCESS,
@@ -571,49 +562,50 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     }
     reprogram_timer()
 
-    // MEMORY REGIONS go back too (sawos design 2 D-2). A Memory is a sealed
-    // range and nothing else, so freeing one reclaims a slab slot and no
-    // hardware — the bytes it named belong to whoever the build said they
-    // belong to. This loop is the BACKSTOP now rather than the only path:
-    // unit 5's free-on-last-reference reclaims a region's slot the moment its
-    // last handle is released, so what is left here at teardown is whatever
-    // the process still held. Returning a RANGE to an owner is still not an
-    // operation anywhere — quotas count objects and not bytes in v1 (§2.5's
-    // narrowing), and it waits for a real allocator.
-    var m: Int = 0
-    while m < MAX_MEMORIES {
-        if MEMORIES[m].process == p {
-            match MEMORIES[m].state {
-                case Free -> {},
-                case Live -> {
-                    MEMORIES[m] = MemorySlot(state: SlotState.Free, process: 0,
-                                             base: 0, len: 0, refs: 0)
-                },
-            }
-        }
-        m = m + 1
-    }
-
-    // IO WINDOWS go back on the same terms, and the terms are worth stating
-    // because they read like the opposite of what they are (sawos design 6
-    // D-1). MMIO is PINNED — the registers were there before this process and
-    // will be there after it — so freeing an IoMemory reclaims a SLAB SLOT and
-    // touches no hardware whatsoever. What actually revokes the driver's reach
-    // is `clear_domain` below, which takes the protection rows away.
-    var io: Int = 0
-    while io < MAX_IOMEMORIES {
-        if IOMEMORIES[io].process == p {
-            match IOMEMORIES[io].state {
-                case Free -> {},
-                case Live -> {
-                    IOMEMORIES[io] = IoMemorySlot(state: SlotState.Free,
-                                                  process: 0, base: 0, len: 0,
-                                                  refs: 0)
-                },
-            }
-        }
-        io = io + 1
-    }
+    // **AND HERE THE TEARDOWN STOPS FORCE-FREEING COUNTED KINDS** (`designs/010`
+    // ruling 10, landed by sawos design 14 D-3). What stood in these lines were
+    // three sweeps — MEMORY REGIONS, IO WINDOWS and PIPE CONNECTIONS, each
+    // zeroing every slab slot whose `process` field named the dying process,
+    // whatever anybody else still held. They were pre-refcount survivors, from
+    // the units that had no count to consult, and design 13's finding 2 named the
+    // hazard they leave: a connection whose CREATOR dies while a peer still holds
+    // an end has its row freed under that holder, staged messages and all. A
+    // region a launcher gave a child has carried the same property since M3 unit
+    // 2, because a give does not move a slot's `process` field.
+    //
+    // **REFERENCES GOVERN LIFETIME.** A slot outlives its creator for exactly as
+    // long as anybody holds a reference — possession keeps alive, the capability
+    // model's own answer — and the ownership-transfer-at-`give` alternative was
+    // rejected for adding bookkeeping that goes incoherent the moment minted
+    // siblings span processes. What the dying process owed is dropped by the
+    // close-all at the top of this function; what it was CHARGED for is written
+    // off by `quota_clear` below (design 7 D-4's orphan vocabulary, landed as its
+    // degenerate case: an orphaned object is charged to NOBODY until it frees,
+    // and the machine stays bounded because quota <= wall).
+    //
+    // `reap_unreferenced` is what remains, and it is not a sweep by ownership: it
+    // gives back what NOBODY NAMES. It has to exist because the close-all above
+    // deliberately counts without freeing (design 7 D-5 — the sweeps that DO free
+    // are also what count for the report), so deleting these three outright would
+    // strand a slot whose last handle the dying process happened to hold. Same
+    // reclamation, no force-free, and the free goes through `free_object` so each
+    // kind's own quota CREDIT runs — which the old sweeps never did for a slot
+    // another process had been charged for.
+    //
+    // UNREACHABLE TODAY, and provably: with `MAX_PROCESSES` at two the only
+    // process that can outlive a peer is root, and root's death stops the
+    // machine. Written anyway, on the unit-5.5 principle the attachment sweep
+    // above records — an invariant that has quietly become false is worse than a
+    // branch nothing takes.
+    //
+    // THE OTHER FIVE SWEEPS STAY. Threads, Events, Waiters, Interrupts and Timers
+    // are COUNTED for the teardown line, and D-5 authorises no change to those
+    // numbers. Mapping stays too, and it is a counted kind: its sweep looks like
+    // these three and is not one, because `mapping_rights()` withholds `Transfer`
+    // — a Mapping handle cannot leave the process that owns it, so the hazard
+    // ruling 10 names cannot arise — and its second arm clears a row rather than
+    // freeing a slot.
+    reap_unreferenced()
 
     // **MAPPINGS COME APART FROM BOTH ENDS** (sawos design 6 D-3), which is why
     // this loop has two arms over one slab rather than one arm like every
@@ -648,42 +640,6 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
         mp = mp + 1
     }
 
-    // **PIPE CONNECTIONS GO BACK, BY CREATOR** (spec §2.1; sawos design 13
-    // D-1), on the Memory sweep's exact terms — and this loop is the BACKSTOP
-    // rather than the ordinary path, for the same reason that one is: a
-    // connection frees the moment BOTH of its reference columns reach zero, and
-    // the close-all at the top of this function is what drops the columns for
-    // every endpoint this process still held. What is left here is a connection
-    // whose creator died while some OTHER process still holds an end.
-    //
-    // **THAT LEAVES THE FAR END NAMING A FREED SLOT, and it is the existing
-    // shape rather than a new hazard**: a Memory a launcher gave a child has
-    // carried exactly this property since M3 unit 2 (a region's `process` field
-    // is who was CHARGED, and a give does not move it). It is unreachable today
-    // for the reason the attachment sweep records — with `MAX_PROCESSES` at two
-    // the only process that can outlive a peer is root, and root's death stops
-    // the machine — and the honest fix is per-object ownership transfer at
-    // `give`, which is a ruling no unit has asked for.
-    //
-    // NOTHING IS COUNTED FOR THE REPORT. The teardown line counts what a
-    // process owned of the kinds it has always counted; the three memory slabs
-    // are swept silently for the same reason, and adding a column would rewrite
-    // every teardown line in the suite for a number that is zero in all of them.
-    var pi: Int = 0
-    while pi < MAX_PIPES {
-        if PIPES[pi].process == p {
-            match PIPES[pi].state {
-                case Free -> {},
-                case Live -> {
-                    PIPES[pi] = PipeSlot(state: SlotState.Free, process: 0,
-                                         head: 0, count: 0, inlet_refs: 0,
-                                         outlet_refs: 0)
-                },
-            }
-        }
-        pi = pi + 1
-    }
-
     // The protection rows go with the slot, and `LAST_PROT_PROCESS` is
     // invalidated with them — a later process landing in this slot must not
     // compare equal to a domain that is no longer installed.
@@ -698,14 +654,22 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     clear_boot_handles(p)
 
     // **AND THE QUOTA LEDGER — CREDITS DIE WITH IT** (sawos design 7 D-4). This
-    // is the whole of the orphan write-off, and one line is the right size for
-    // it because the interesting case cannot yet occur: nothing gives handles
-    // UPWARD (a give targets a `Created` child), so no object outlives the
-    // process charged for it, and every row this slot carries is written off
-    // exactly as the slabs above returned what it named. The LIMITS go with the
-    // used counts, for `clear_boot_handles`' own reason: the slot is
-    // reclaimable, and the next occupant must not inherit a stranger's
-    // allowance.
+    // is the whole of the orphan write-off, and one line is still the right size
+    // for it — but the sentence under it changed at M4 unit 2 (`designs/010`
+    // ruling 10, sawos design 14 D-3). It used to say the interesting case could
+    // not occur, because the sweeps above freed everything this process was
+    // charged for and nothing outlived it. Now the sweeps are gone and this line
+    // is LOAD-BEARING: an object a peer still holds a reference to SURVIVES its
+    // creator, and its charge is written off here, so an orphan is charged to
+    // NOBODY until it frees. That is D-4's own vocabulary, arriving as the
+    // degenerate case it was landed in anticipation of.
+    //
+    // The books still balance and the machine stays bounded, because quota <=
+    // wall: the SLAB is what refuses the next allocation, and `quota_credit`'s
+    // zero test is what makes a credit onto this cleared row a no-op rather than
+    // an underflow. The LIMITS go with the used counts, for `clear_boot_handles`'
+    // own reason: the slot is reclaimable, and the next occupant must not inherit
+    // a stranger's allowance.
     //
     // The one charge that legitimately outlives its charger is a MAPPING ROW in
     // somebody else's domain — and it is not this process's row at all: it is

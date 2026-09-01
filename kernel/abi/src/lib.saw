@@ -169,6 +169,39 @@ public enum ObjType: UInt8 {
     /// than a rights mask somebody counts by — which is exactly what let D-1
     /// answer the writer-count question with the ledger it already had.
     case PipeOutlet = 13,
+    /// THE CLIENT'S CLAIM ON ONE REPLY — single-use, transferable (spec §2.1's
+    /// ratified `PipeReplyHandle`; sawos design 14 D-1).
+    ///
+    /// **IT IS RING-SLOT STATE, NOT A THIRD SLAB.** A one-shot pair exists for
+    /// exactly as long as one in-flight message does, and design 10 ruling 4's
+    /// rider already pins the reply body to the staging slot that carried the
+    /// request — so the claim lives WITH THE SLOT. `entry.target` for this kind
+    /// is an EXCHANGE index (`connection * PIPE_INFLIGHT + ring slot`), which is
+    /// the same flat arithmetic the bodies and lengths already use, one level
+    /// down from `PipeInlet`'s "two kinds, one slab".
+    ///
+    /// **TWO COLUMNS AGAIN, AND THEY ARE THE ABANDONMENT STATE** (D-2, design
+    /// 13's own property one level down): `PIPE_REPLY_REFS` counts the claims and
+    /// `PIPE_REQUEST_REFS` counts the obligations, each column only ever falls,
+    /// and which one a handle counts on is its KIND. The client dropping its
+    /// claim IS abandoned-by-client; the server dropping its request without
+    /// replying IS abandoned-by-server. No flag beside them says so.
+    ///
+    /// SINGLE-USE IS A PROPERTY OF THE EXCHANGE, NOT OF THE HANDLE: `Resolve`
+    /// consumes the caller's ENTRY, and the exchange's state is what makes a
+    /// second resolve impossible — one reply may be written and one resolve may
+    /// succeed however many siblings a `Mint` produced.
+    case PipeReply = 14,
+    /// THE SERVER'S OBLIGATION TO SEND ONE REPLY — single-use, transferable
+    /// (spec §2.1's ratified `PipeRequestHandle`; sawos design 14 D-1).
+    ///
+    /// The mirror of `PipeReply` in every respect except which column it counts
+    /// on and which op it carries: a claim resolves, an obligation replies. It is
+    /// minted at `PipeOutletOp.Take` into the TAKER's table, which is what makes
+    /// it the delegation primitive — §2.1's canonical zero-copy example is a
+    /// server GIVING this handle to a third party who replies straight to the
+    /// original client, and `Transfer` is minted for exactly that.
+    case PipeRequest = 15,
 }
 
 // WHICH KINDS ARE WAITABLE is deliberately NOT recorded here (§2.2). It cannot
@@ -284,6 +317,19 @@ public type PipeInletHandle = UInt
 /// an outlet, which is the whole reason each kind gets its own alias rather
 /// than a shared `PipeHandle` with a role field.
 public type PipeOutletHandle = UInt
+
+/// A handle naming a PipeReply (spec §2.1; sawos design 14) — the CLIENT's claim
+/// on one reply. Same discipline again.
+///
+/// **THE TYPED WRAPPER OVER IT IS `sos.pipe`'s `PipeReply`**, which is where
+/// §2.1's ratified name lands: the tree renders a §2 object name at the typed
+/// tier the way it renders `MemoryObject` as `Memory`, so the spec's
+/// `PipeReplyHandle` is this alias and the owning wrapper is the short name.
+public type PipeReplyHandle = UInt
+
+/// A handle naming a PipeRequest (spec §2.1; sawos design 14) — the SERVER's
+/// obligation to send one reply. Same discipline again.
+public type PipeRequestHandle = UInt
 
 /// A handle word the table can never hand out. Handle 0 names nothing, so a
 /// zeroed register is never authority (see `ObjType.Unbound`).
@@ -1059,6 +1105,61 @@ static_assert((PipeOutletRight.Mint as UInt32) == (1 << 1),
 static_assert((PipeOutletRight.Take as UInt32) >= (1 << 8),
               "kind-specific right Take must start at bit 8 or above")
 
+/// A right on a PipeReply — the CLIENT's claim on one reply (spec §2.1; sawos
+/// design 14).
+///
+/// **ONE KIND-SPECIFIC BIT, NAMED FOR ITS OP** (the Aug-29 doctrine): `Resolve`
+/// gates the one op a claim carries. A `Wait` bit — the reply-ready level §2.2
+/// owes — arrives with waitability in unit 3, and its absence here is a scope
+/// line rather than a decision: `waitable_slot` refuses this kind with
+/// `NotWaitable` today and says so at the arm.
+///
+/// `Transfer` is minted because a claim is a capability like any other and §2.1
+/// ratifies both one-shots as transferable. `Mint` is minted on the uniform lean
+/// the endpoint pair follows, and it composes with single-use rather than
+/// fighting it: a sibling is a second NAME on the reply column, the op consumes
+/// an ENTRY, and the EXCHANGE's own state is what allows exactly one successful
+/// resolve. A sibling that resolves second meets `PeerClosed`, not a second
+/// reply.
+public enum PipeReplyRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Mint = 1 << 1,
+    case Resolve = 1 << 8,
+}
+
+static_assert((PipeReplyRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((PipeReplyRight.Mint as UInt32) == (1 << 1),
+              "universal right Mint must be bit 1 in every kind's enum")
+static_assert((PipeReplyRight.Resolve as UInt32) >= (1 << 8),
+              "kind-specific right Resolve must start at bit 8 or above")
+
+/// A right on a PipeRequest — the SERVER's obligation to send one reply (spec
+/// §2.1; sawos design 14).
+///
+/// The mirror of `PipeReplyRight` with the verb changed, and the change of verb
+/// is the whole difference between the two halves of a pair: a claim resolves,
+/// an obligation replies. Everything `PipeReplyRight` says about the missing
+/// `Wait` bit (the request-abandoned level is unit 3's), about `Transfer` — here
+/// it is §2.1's DELEGATION PRIMITIVE rather than a convenience — and about
+/// `Mint` holds word for word.
+///
+/// The bits overlap `PipeReplyRight`'s and that is sound for the reason the
+/// endpoint pair's do: a rights word is only ever read against its handle's
+/// KIND, which §3's order establishes first.
+public enum PipeRequestRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Mint = 1 << 1,
+    case Reply = 1 << 8,
+}
+
+static_assert((PipeRequestRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((PipeRequestRight.Mint as UInt32) == (1 << 1),
+              "universal right Mint must be bit 1 in every kind's enum")
+static_assert((PipeRequestRight.Reply as UInt32) >= (1 << 8),
+              "kind-specific right Reply must start at bit 8 or above")
+
 /// Whether a rights word carries the UNIVERSAL `Transfer` bit (§3's low byte).
 ///
 /// **IT TAKES A PLAIN MASK RATHER THAN A TYPED RIGHT, and that is the point**
@@ -1246,6 +1347,32 @@ public func pipe_inlet_rights() -> UInt32 {
 public func pipe_outlet_rights() -> UInt32 {
     ((PipeOutletRight.Transfer as UInt32) | (PipeOutletRight.Mint as UInt32)
      | (PipeOutletRight.Take as UInt32))
+}
+
+/// What the kernel mints for a PipeReply at `PipeInletOp.Post` — the CLAIM the
+/// poster is handed (spec §2.1; sawos design 14 D-1).
+///
+/// **THE POSTER GETS EVERY BIT OF ITS OWN CLAIM**, on `pipe_inlet_rights`'
+/// reasoning exactly, and `Transfer` carries the same weight it does there: §2.1
+/// RATIFIES both one-shots as transferable, so a claim that could not travel
+/// would be a promise the spec makes and the kernel withholds. A client that
+/// wants to hand a narrower claim on mints an attenuated sibling and gives THAT.
+public func pipe_reply_rights() -> UInt32 {
+    ((PipeReplyRight.Transfer as UInt32) | (PipeReplyRight.Mint as UInt32)
+     | (PipeReplyRight.Resolve as UInt32))
+}
+
+/// What the kernel mints for a PipeRequest at `PipeOutletOp.Take` — the
+/// OBLIGATION the taker is handed. The mirror of `pipe_reply_rights`, with the
+/// verb changed.
+///
+/// **`Transfer` HERE IS §2.1's DELEGATION PRIMITIVE ITSELF**, not a convenience:
+/// the ratified zero-copy example is a filesystem forwarding this very handle to
+/// a flash driver, which replies with the hardware bytes straight to the original
+/// client. Withholding the bit would delete the example.
+public func pipe_request_rights() -> UInt32 {
+    ((PipeRequestRight.Transfer as UInt32) | (PipeRequestRight.Mint as UInt32)
+     | (PipeRequestRight.Reply as UInt32))
 }
 
 /// What the kernel mints for a Memory region — a boot RAM-pool root, and every
@@ -1918,12 +2045,14 @@ public enum MappingOp: UInt {
 /// what a timeout is, and there is no second submission door for this table to
 /// hold.
 ///
-/// **IT ANSWERS A PLAIN STATUS TODAY AND WILL GROW A RETURN VALUE**: the
-/// `PipeReplyHandle` a post mints is UNIT 2's, and an op growing a return
-/// between units is exactly what §5.7's renumberable-op discipline makes free —
-/// userspace names the case, this module supplies the number, and the two are
-/// compiled together. Said here so the shape is a stated slice rather than an
-/// omission a later reader has to reconstruct.
+/// **IT ANSWERS THE CLAIM SINCE M4 UNIT 2** (sawos design 14), which is exactly
+/// what unit 1 said at this table would happen: the value register carries a
+/// `PipeReply` handle minted into the poster's table, and an op growing a return
+/// between units cost nothing under §5.7's renumberable-op discipline —
+/// userspace names the case, this module supplies the number, the two compile
+/// together. A REFUSED post mints nothing, so `SosStatus.WouldBlock` and
+/// `SosStatus.PeerClosed` leave the value register meaningless and the typed tier
+/// answers `Ok(None)` for the first.
 ///
 /// ITS ARGUMENTS ARE (address, length), taken through the copy-IN funnel
 /// `Timer.Arm` opened: a body up to `PIPE_BODY_BYTES`, and a length of ZERO is
@@ -1939,12 +2068,51 @@ public enum PipeInletOp: UInt {
 /// `SosStatus.WouldBlock`, never a park, because unit 1 has no waitability and
 /// ruling 4's ladder has the proofs POLL until unit 3 lands it.
 ///
-/// Its arguments are (buffer, capacity), and the capacity must be at least
-/// `PIPE_BODY_BYTES` — the published-minimum rule `Waiter.Wait` set, running the
-/// same way: the size is published, so a caller that got it wrong could have
-/// checked.
+/// **IT ANSWERS TWO THINGS SINCE M4 UNIT 2** (sawos design 14): the message, and
+/// the `PipeRequest` that obliges its reply — minted into the TAKER's table at
+/// the take. One op answers one word, so the two travel in a copy-out RECORD
+/// (`PIPE_TAKE_RECORD_WORDS` below), exactly as `ProcessOp.PipeCreate`'s two ends
+/// do; growing an op's answer between units is what §5.7's renumberable-op
+/// discipline makes free, and unit 1 said at this very table that it would.
+///
+/// Its arguments are (record, record capacity, body). The BODY carries no
+/// capacity of its own any more: it is checked against `PIPE_BODY_BYTES` —
+/// still the published minimum — through the copy door and against the caller's
+/// REAL memory, which is a stronger test than the number the caller used to type.
 public enum PipeOutletOp: UInt {
     case Take = 0,
+}
+
+/// A METHOD ID on a PipeReply — the CLIENT's claim on one reply (spec §2.1;
+/// sawos design 14).
+///
+/// **ONE OP, NONBLOCKING, AND IT CONSUMES.** `resolve` answers the reply bytes if
+/// they are there — consuming the claim's entry with them — `SosStatus.WouldBlock`
+/// while the exchange is still pending, and `SosStatus.PeerClosed` when the server
+/// side abandoned it. The blocking `send(msg)` / `send(msg, timeout:)`
+/// compositions are unit 3's, when there is something to park on: ruling 4's
+/// ladder again, and the reason unit 2's proofs poll.
+///
+/// Its arguments are (buffer, capacity) and its value is the reply's LENGTH —
+/// `PipeOutletOp.Take`'s unit-1 shape, reused verbatim on the way back.
+public enum PipeReplyOp: UInt {
+    case Resolve = 0,
+}
+
+/// A METHOD ID on a PipeRequest — the SERVER's obligation (spec §2.1; sawos
+/// design 14).
+///
+/// **ONE OP, AND IT DISCHARGES THE OBLIGATION EITHER WAY.** `reply` copies the
+/// reply body in and CONSUMES the request. To an ABANDONED request — the client
+/// dropped its claim — it answers `SosStatus.PeerClosed` and the obligation is
+/// discharged all the same, which is §2.1's ratified sentence: never a silent
+/// success, ignorable with `let _ =` on the std-Channel close precedent.
+///
+/// Its arguments are (body, length), `PipeInletOp.Post`'s shape mirrored — a
+/// length of ZERO is legal here too, because a reply that carries no data is
+/// still an answer.
+public enum PipeRequestOp: UInt {
+    case Reply = 0,
 }
 
 // EVERY OP TABLE IS DENSE FROM ZERO, AND STAYS BELOW THE UNIVERSAL OPS (design
@@ -1981,6 +2149,10 @@ static_assert((MappingOp.Unmap as UInt) < MINT_OP,
 static_assert((PipeInletOp.Post as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
 static_assert((PipeOutletOp.Take as UInt) < MINT_OP,
+              "an op table must stay below the universal ops")
+static_assert((PipeReplyOp.Resolve as UInt) < MINT_OP,
+              "an op table must stay below the universal ops")
+static_assert((PipeRequestOp.Reply as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
 
 // ...and the two universal numbers are distinct and ordered, which is the fact
@@ -2441,6 +2613,16 @@ public enum BootHandleKind: UInt {
     /// unit 5's driver-as-service.
     case PipeInlet = 4,
     case PipeOutlet = 5,
+    /// **M4 UNIT 2's ONE-SHOTS, AND THIS PAIR IS THE ONE §2.1 ARGUED FOR BY
+    /// NAME** (sawos design 14). `pipe_reply_rights()` and
+    /// `pipe_request_rights()` mint `Transfer` because the ratified section says
+    /// both one-shots are transferable and calls it THE DELEGATION PRIMITIVE: a
+    /// server MOVES its obligation to a third party, who replies straight to the
+    /// original client, and the payload never transits the middle process. So a
+    /// give must be able to carry one, and a give's record must be able to spell
+    /// it.
+    case PipeReply = 6,
+    case PipeRequest = 7,
 }
 
 // THE DECODED RECORD IS NOT DECLARED HERE, and the asymmetry with `WaitResult`
@@ -2514,6 +2696,28 @@ public static PIPE_CREATE_OUTLET_WORD: Int = 1
 /// `sizeof<T>()` does not fold in a static initializer (DF-178f).
 public func pipe_create_record_bytes() -> Int {
     PIPE_CREATE_RECORD_WORDS * sizeof<UInt>()
+}
+
+/// Words in a `PipeOutlet.Take` answer: the message's LENGTH, then the
+/// `PipeRequest` handle that obliges its reply (spec §2.1; sawos design 14).
+///
+/// **A TAKE ANSWERS TWO THINGS NOW, SO IT ANSWERS IN MEMORY.** Unit 1's take put
+/// the length in the value register because that was all it had to say; unit 2
+/// mints the obligation at the take, and one op returns one word. The record is
+/// the door `ProcessOp.PipeCreate` already opened for exactly this reason, and
+/// the BODY stays a separate buffer because it is a separate thing — bytes the
+/// caller sized against `PIPE_BODY_BYTES`, not a word the kernel assembled.
+public static PIPE_TAKE_RECORD_WORDS: Int = 2
+
+/// Where each half of a take's answer lives. LENGTH first, because the message
+/// is what a take is FOR and the obligation is what comes with it.
+public static PIPE_TAKE_LEN_WORD: Int = 0
+public static PIPE_TAKE_REQUEST_WORD: Int = 1
+
+/// Bytes in a `PipeOutlet.Take` record — the minimum capacity a caller must give
+/// the op. A FUNCTION for `pipe_create_record_bytes`' reason (DF-178f).
+public func pipe_take_record_bytes() -> Int {
+    PIPE_TAKE_RECORD_WORDS * sizeof<UInt>()
 }
 
 // =============================================================================

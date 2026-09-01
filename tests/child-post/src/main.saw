@@ -23,8 +23,8 @@
 // The payload is `PIPE` in ASCII, and the launcher asserts all four bytes: a
 // status alone would not have shown that the copy funnel carried the data.
 
-import sos.{System, Process, PipeInlet, BootHandle, BootHandleKind, SosStatus,
-            PIPE_BODY_BYTES}
+import sos.{System, Process, PipeInlet, PipeReply, BootHandle, BootHandleKind,
+            SosStatus, PIPE_BODY_BYTES}
 
 /// What it ends with when the boot set was not what the config promised. A
 /// number the transcript's `code=` field distinguishes on sight.
@@ -63,7 +63,14 @@ func _start(boot_handle: UInt) {
                                 let _ = proc.exit(EXIT_NO_INLET)
                                 return
                             }
-                            if staged {
+                            // **THE TELL IDIOM** (§2.1; sawos design 14): the
+                            // claim on the reply is given up at once, because
+                            // this child has nothing to wait for and is about to
+                            // exit. The message is still owed to the server —
+                            // a staged body outlives its claim exactly as it
+                            // outlives its sender.
+                            if let claim = move staged {
+                                let _ = move claim
                                 posted = true
                             }
                         }

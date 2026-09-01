@@ -26,7 +26,8 @@ import sosabi.{SosStatus, SystemOp, ProcessOp, MemoryOp, IoMemoryOp, MINT_OP,
                SystemHandle, ProcessHandle, ThreadHandle, EventHandle,
                WaiterHandle, InterruptHandle, ClockHandle, MemoryHandle,
                IoMemoryHandle, MappingHandle,
-               PipeInletHandle, PipeOutletHandle,
+               PipeInletHandle, PipeOutletHandle, PipeReplyHandle,
+               PipeRequestHandle,
                NO_HANDLE, BootTagForm, EventMode, ClockType, BootHandleKind,
                BOOT_HANDLE_RECORD_WORDS, BOOT_HANDLE_TAG_WORD,
                BOOT_HANDLE_KIND_WORD, BOOT_HANDLE_HANDLE_WORD,
@@ -56,7 +57,7 @@ import sos.floor.{ALL_RIGHTS, call_value, checked, park_system_handle,
 import sos.memory.{Memory}
 import sos.iomemory.{IoMemory}
 import sos.mapping.{Mapping}
-import sos.pipe.{PipeInlet, PipeOutlet}
+import sos.pipe.{PipeInlet, PipeOutlet, PipeReply, PipeRequest}
 // QUALIFIED, ALONE AMONG THE NINE: `std.task` publishes a prelude
 // `Thread<T>`, and a bare imported `Thread` ties with it where a locally
 // DECLARED one used to win — which is what the split turned this name into.
@@ -666,6 +667,50 @@ extension Process {
         return checked(sos_process_give(self.handle, word, tag))
     }
 
+    /// Give a CLAIM ON A REPLY to this process under `tag`, consuming the
+    /// wrapper. Requires `ProcessRight.Give` here and `PipeReplyRight.Transfer`
+    /// on the claim.
+    ///
+    /// **§2.1 RATIFIES BOTH ONE-SHOTS AS TRANSFERABLE, AND THIS IS THE CLIENT
+    /// SIDE OF THAT.** It hands the right to READ one answer to somebody else: a
+    /// client that has asked a question and wants a third party to collect the
+    /// reply gives the claim away, and the exchange neither notices nor cares —
+    /// the obligation still names the same ring slot, and whoever holds the claim
+    /// when the reply is written is who gets it.
+    ///
+    /// The transfer-funnel contract is the same as the funnels above: by value,
+    /// disarm before the syscall, let the disarmed value drop.
+    public func give(&self, reply: PipeReply,
+                     tag: UInt) -> Result<Void, SosStatus> {
+        var claim = move reply
+        let word: UInt = claim.handle
+        claim.handle = PipeReplyHandle(NO_HANDLE)
+        return checked(sos_process_give(self.handle, word, tag))
+    }
+
+    /// Give an OBLIGATION TO REPLY to this process under `tag`, consuming the
+    /// wrapper. Requires `ProcessRight.Give` here and
+    /// `PipeRequestRight.Transfer` on the obligation.
+    ///
+    /// **THIS IS §2.1's DELEGATION PRIMITIVE, IN ONE CALL.** The ratified
+    /// zero-copy example is exactly this: a filesystem receives a read, forwards
+    /// the request handle to the flash driver, and the driver replies with the
+    /// hardware bytes STRAIGHT to the original client — the payload never transits
+    /// the middle process. Single use survives the transfer, because it is a
+    /// property of the exchange rather than of who holds the handle: one reply may
+    /// be written, wherever it is written from.
+    ///
+    /// `pipe-delegate` is that flow at its smallest, and unit 4 is where it stops
+    /// needing a `give` at all — a request handle travelling IN A MESSAGE is what
+    /// makes the example a protocol rather than a launch-time wiring.
+    public func give(&self, request: PipeRequest,
+                     tag: UInt) -> Result<Void, SosStatus> {
+        var obligation = move request
+        let word: UInt = obligation.handle
+        obligation.handle = PipeRequestHandle(NO_HANDLE)
+        return checked(sos_process_give(self.handle, word, tag))
+    }
+
     /// **MAKE A CONNECTION IN THIS PROCESS, and receive BOTH of its ends** (spec
     /// §2.1; sawos design 10 ruling 3, built by design 13). Requires
     /// `ProcessRight.PipeCreate`.
@@ -931,6 +976,16 @@ public struct BootHandle {
     /// entirely its launcher's config, so both spellings exist and a record
     /// carries at most one of them.
     outlet: PipeOutlet?,
+    /// A CLAIM ON ONE REPLY, on the same terms — `take_reply` is its one door.
+    /// M4 unit 2's slot (sawos design 14): §2.1 ratifies both one-shots as
+    /// transferable, so a launcher — or any holder — may hand one across, and a
+    /// child collects it exactly as it collects a region.
+    reply: PipeReply?,
+    /// AN OBLIGATION TO REPLY, on the same terms — `take_request` is its one
+    /// door. The eighth slot, and the one §2.1 calls THE DELEGATION PRIMITIVE:
+    /// a child that receives one answers a question it was never asked, and its
+    /// bytes go straight to whoever asked it.
+    request: PipeRequest?,
 }
 
 extension BootHandle: NoCopy {}
@@ -1000,6 +1055,24 @@ extension BootHandle {
     public func take_outlet(&var self) -> PipeOutlet? {
         self.outlet.take()
     }
+
+    /// Take a CLAIM ON A REPLY out of this record. Same terms as `take_memory`.
+    ///
+    /// A record left holding one RELEASES it when it drops, which for a claim is
+    /// not merely tidy: releasing the last claim on an exchange is what tells the
+    /// server its client has abandoned the question. A child that declines a
+    /// capability declines it out loud.
+    public func take_reply(&var self) -> PipeReply? {
+        self.reply.take()
+    }
+
+    /// Take an OBLIGATION TO REPLY out of this record. Same terms as
+    /// `take_memory`, and the same sentence as `take_reply` from the other side:
+    /// a record left holding one releases it, which tells the CLIENT that nobody
+    /// will answer.
+    public func take_request(&var self) -> PipeRequest? {
+        self.request.take()
+    }
 }
 
 /// Decode a record the kernel copied out into a `BootHandle`.
@@ -1018,27 +1091,42 @@ func decode_boot_handle(tag: UInt, kind: UInt, handle: UInt) -> BootHandle {
         case Memory -> BootHandle(tag: tag, kind: what,
                                   memory: Memory(handle: MemoryHandle(handle)),
                                   process: None, system: None, iomemory: None,
-                                  inlet: None, outlet: None),
+                                  inlet: None, outlet: None, reply: None,
+                                  request: None),
         case Process -> BootHandle(tag: tag, kind: what, memory: None,
                                    process: Process(handle: ProcessHandle(handle)),
                                    system: None, iomemory: None,
-                                   inlet: None, outlet: None),
+                                   inlet: None, outlet: None, reply: None,
+                                   request: None),
         case System -> BootHandle(tag: tag, kind: what, memory: None,
                                   process: None,
                                   system: System(handle: SystemHandle(handle)),
-                                  iomemory: None, inlet: None, outlet: None),
+                                  iomemory: None, inlet: None, outlet: None,
+                                  reply: None, request: None),
         case IoMemory -> BootHandle(tag: tag, kind: what, memory: None,
                                     process: None, system: None,
                                     iomemory: IoMemory(handle: IoMemoryHandle(handle)),
-                                    inlet: None, outlet: None),
+                                    inlet: None, outlet: None, reply: None,
+                                    request: None),
         case PipeInlet -> BootHandle(tag: tag, kind: what, memory: None,
                                      process: None, system: None, iomemory: None,
                                      inlet: PipeInlet(handle: PipeInletHandle(handle)),
-                                     outlet: None),
+                                     outlet: None, reply: None, request: None),
         case PipeOutlet -> BootHandle(tag: tag, kind: what, memory: None,
                                       process: None, system: None,
                                       iomemory: None, inlet: None,
-                                      outlet: PipeOutlet(handle: PipeOutletHandle(handle))),
+                                      outlet: PipeOutlet(handle: PipeOutletHandle(handle)),
+                                      reply: None, request: None),
+        case PipeReply -> BootHandle(tag: tag, kind: what, memory: None,
+                                     process: None, system: None, iomemory: None,
+                                     inlet: None, outlet: None,
+                                     reply: PipeReply(handle: PipeReplyHandle(handle)),
+                                     request: None),
+        case PipeRequest -> BootHandle(tag: tag, kind: what, memory: None,
+                                       process: None, system: None,
+                                       iomemory: None, inlet: None, outlet: None,
+                                       reply: None,
+                                       request: PipeRequest(handle: PipeRequestHandle(handle))),
     }
 }
 
