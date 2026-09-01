@@ -620,3 +620,46 @@ repo's first done file; sawos was born Aug 28 (sawlang#238).
   ruling 10 against the stranding case a pure deletion reaches). The
   Sep-1 rulings — 11(a)-(d), the ReplyRecv reply-then-wait amendment,
   and the API review gate — land in designs/010 with this integration.
+- **M4 unit 3 — waitability [#15 — designs/015-waitability.md]. CLOSED
+  Sep 1 2026, awaiting the lead's move to a done file.** What landed:
+  the four pipe arms (`designs/010` ruling 8's inlet room-to-post level
+  among them), so §2.2's ratified waitable list CLOSES and the four
+  `NotWaitable` refusal arms units 1 and 2 wrote by hand are gone; the
+  wait record grows a body region and a REPLY delivery carries the
+  answer's bytes (ruling 11(a)), so the wait IS the resolve and a
+  multiplexed RPC is post + attach + wait; `WaiterOp.Add` grows a flags
+  word for `AttachMode.OneShot` (ruling 9(b)) and the CONSUMING attach
+  `Waiter.give` (ruling 11(c)), which is eight typed overloads, one per
+  waitable kind; ruling 9(a)'s implicit detach at `Resolve`/`Reply`;
+  peer-gone terminal levels at all four zero-arms, so nothing parked is
+  silently doomed; and every piece §2.1's ratified blocking `send(msg)` /
+  `send(msg, timeout:)` compose out of — post + attach + wait plus a
+  Timer on the same Waiter. **THE COMPOSED-SEND SURFACE ITSELF IS STRUCK
+  BY A USER RULING AT LEAD REVIEW (Sep 1)**: no `PipeClient`, no
+  `SendOutcome`, because a wrapper type freezes a shape that cannot later
+  be refactored into a simple kernel call, the manual composition stays
+  user-writable with the shipped primitives, and a kernel-side timeout,
+  if ever genuinely needed, will be added to the kernel directly, then,
+  by ruling. §2.1's `send` surface therefore arrives with unit 3.5's
+  `Call`; `tests/pipe-send-manual` is the composition written out and is
+  what the "the primitives suffice" claim rests on. **ONE STRUCTURAL
+  CHANGE**: `kcore.wake` merged into
+  `kcore.refs` — a delivery now drops a counted reference and a dropped
+  reference now delivers, so the two are one act and a module boundary
+  between them would be the cycle DF-232e does not diagnose. Suite
+  196/196 (98 cases/arch) from 182/182, seven new cases across eight new
+  packages, no pre-existing case row moved. Docs: spec §2.1 (abandonment
+  re-worded to the LAST REFERENCE; the send surface NOT marked built —
+  the pieces are, the composition is the caller's, and the ratified
+  surface arrives with `Call`), §2.2
+  (the list closes, persistent-BY-DEFAULT, the record layout, the
+  consuming attach), §5.7 (the Add flags growth), §2's Pipe and Waiter
+  rows, the counted-kinds table's four attachment columns, §11's M4
+  progress and quota note. As-built in #15; SL-14 and SL-15 filed below.
+  INTEGRATED to main Sep 1 2026 (lead-reviewed, lead gate re-run twice
+  — 196/196 at ee0f8a6 and again at cae4286 after the user's
+  composed-send removal ruling — sawlang HEAD 87063387 unchanged
+  through both, fast-forward cae4286). The Settled-state correction
+  accepted (the brief's stale-entry sentence was unsound); the
+  PipeClient wrapper struck by user ruling at review, recorded in
+  designs/010 with this integration.

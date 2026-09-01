@@ -264,6 +264,20 @@ standing tail); the IOMMU driver (death-notification consumer 2).
    Usability of the whole pattern hangs on the spellings; the unit
    3/3.5/4 briefs carry their proposed surfaces to the user first
    and implementation waits on the nod.
+   **THE COMPOSED-SEND LIBRARY WRAPPERS ARE STRUCK (user, Sep 1, at
+   unit 3's review).** Unit 3 briefly landed `send`/`send(timeout:)`
+   on a `PipeClient` wrapper (inlet + caller-supplied waiter + two
+   keys); the user removed it: a wrapper TYPE freezes a shape that
+   cannot later be refactored into a simple kernel call, and the
+   manual composition (post; give/attach; wait; a Timer on the same
+   waiter for the deadline) remains user-writable with the shipped
+   primitives — the unit-3 proof case composes it inline to say so.
+   `send(msg)` arrives as the fused `Call`'s thin wrapper in unit
+   3.5. A TIMEOUT, if a consumer ever names itself, is added to the
+   KERNEL directly at that point — a ruled amendment to this rider's
+   no-timeout-in-the-kernel clause, taken then, not now.
+   `SendOutcome`/`TimedOut(pending:)` die with the wrapper; the
+   manual composition holds its claim naturally.
 5. **RULED: a staged handle stays the SENDER's counted entry until
    receive**, transferred exactly at rendezvous — the ledger never
    has an in-flight limbo state, and an abandoned send unwinds with

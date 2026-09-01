@@ -21,47 +21,13 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
-- (empty — unit 2 closed Sep 1; its entry is in [BACKLOG] below awaiting
-  the lead's move to a done file)
+- 1. process stats — ProcessOp.Stats + the trap-count assertions
+  [#16 — designs/016-process-stats.md; user-ruled Sep 1, dispatching]
+- 2. M4 unit 3.5 — the fused paths [#10 ruling 4 + the reply-then-wait
+  amendment; design 17 to author — Call, ReplyRecv, the ping-pong
+  trap-count proof over #16's stats; §API to the user before dispatch]
 
 ## [BACKLOG] — filed, not scheduled
-
-- **M4 unit 3 — waitability [#15 — designs/015-waitability.md]. CLOSED
-  Sep 1 2026, awaiting the lead's move to a done file.** What landed:
-  the four pipe arms (`designs/010` ruling 8's inlet room-to-post level
-  among them), so §2.2's ratified waitable list CLOSES and the four
-  `NotWaitable` refusal arms units 1 and 2 wrote by hand are gone; the
-  wait record grows a body region and a REPLY delivery carries the
-  answer's bytes (ruling 11(a)), so the wait IS the resolve and a
-  multiplexed RPC is post + attach + wait; `WaiterOp.Add` grows a flags
-  word for `AttachMode.OneShot` (ruling 9(b)) and the CONSUMING attach
-  `Waiter.give` (ruling 11(c)), which is eight typed overloads, one per
-  waitable kind; ruling 9(a)'s implicit detach at `Resolve`/`Reply`;
-  peer-gone terminal levels at all four zero-arms, so nothing parked is
-  silently doomed; and every piece §2.1's ratified blocking `send(msg)` /
-  `send(msg, timeout:)` compose out of — post + attach + wait plus a
-  Timer on the same Waiter. **THE COMPOSED-SEND SURFACE ITSELF IS STRUCK
-  BY A USER RULING AT LEAD REVIEW (Sep 1)**: no `PipeClient`, no
-  `SendOutcome`, because a wrapper type freezes a shape that cannot later
-  be refactored into a simple kernel call, the manual composition stays
-  user-writable with the shipped primitives, and a kernel-side timeout,
-  if ever genuinely needed, will be added to the kernel directly, then,
-  by ruling. §2.1's `send` surface therefore arrives with unit 3.5's
-  `Call`; `tests/pipe-send-manual` is the composition written out and is
-  what the "the primitives suffice" claim rests on. **ONE STRUCTURAL
-  CHANGE**: `kcore.wake` merged into
-  `kcore.refs` — a delivery now drops a counted reference and a dropped
-  reference now delivers, so the two are one act and a module boundary
-  between them would be the cycle DF-232e does not diagnose. Suite
-  196/196 (98 cases/arch) from 182/182, seven new cases across eight new
-  packages, no pre-existing case row moved. Docs: spec §2.1 (abandonment
-  re-worded to the LAST REFERENCE; the send surface NOT marked built —
-  the pieces are, the composition is the caller's, and the ratified
-  surface arrives with `Call`), §2.2
-  (the list closes, persistent-BY-DEFAULT, the record layout, the
-  consuming attach), §5.7 (the Add flags growth), §2's Pipe and Waiter
-  rows, the counted-kinds table's four attachment columns, §11's M4
-  progress and quota note. As-built in #15; SL-14 and SL-15 filed below.
 
 - M4 scoping — pipes [#10 — designs/010-m4-pipes.md, DRAFT Aug 30,
   awaiting user review]: §2.1 carried by reference; waiter revocation
