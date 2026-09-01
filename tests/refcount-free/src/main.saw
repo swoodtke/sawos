@@ -72,8 +72,16 @@ static WORD_B: UInt = 9
 /// The key arm two attaches under.
 static KEY: UInt = 77
 
-/// Words in a wait record: the attacher's key, a tag, the payload.
-static RECORD_WORDS: Int = 3
+/// Words this file gives `Waiter.Wait` to answer into.
+///
+/// **IT IS AN OVER-PROVISION, NOT THE RECORD'S SIZE** (sawos design 15, M4 unit
+/// 3). §2.2 checks a copy-out capacity for AT LEAST the record, and
+/// `designs/010` ruling 11(a) grew that minimum by a whole message body — four
+/// header words plus `PIPE_BODY_BYTES`. A caller at the C altitude cannot name
+/// either constant (both are `sosabi`'s, which this file neither imports nor
+/// could), so it says a number comfortably past both and reads only the three
+/// words it cares about.
+static RECORD_WORDS: Int = 48
 
 /// This process's own Process handle, or `0` — which names nothing.
 func ask_process(boot: UInt) unsafe -> UInt {
@@ -195,7 +203,10 @@ func _start(boot_handle: UInt) {
         return
     }
     let _ = sos_event_signal(watched, WORD_B)
-    if sos_waiter_add(waiter, watched, KEY) != STATUS_OK {
+    // The flags word is M4 unit 3's third argument (sawos design 15): zero is
+    // `AttachMode.Persistent` and a non-consuming attach, which is what this
+    // case has always done and what its reference arithmetic below counts.
+    if sos_waiter_add(waiter, watched, KEY, 0) != STATUS_OK {
         let _ = system.debug_print("SOS refcount: attach refused\n")
         let _ = system.shutdown(EXIT_FAILED)
         return

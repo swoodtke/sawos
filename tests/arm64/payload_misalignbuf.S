@@ -17,7 +17,9 @@
     .equ OP_WAITER_CREATE,  5       /* ProcessOp.WaiterCreate */
     .equ OP_WAITER_WAIT,    2       /* WaiterOp.Wait */
     .equ ODD_BUF,           1       /* not a multiple of any word size */
-    .equ BUF_CAP,           64
+    .equ BUF_CAP,           256     /* ample; see payload_badbuffer.S — the
+                                     * record's buffer grew a message body in
+                                     * M4 unit 3 (sawos design 15) */
 
     .section .payload, "ax", @progbits
     .balign 4

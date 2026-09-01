@@ -22,7 +22,11 @@
     .equ OP_WAITER_CREATE,  5       /* ProcessOp.WaiterCreate */
     .equ OP_WAITER_WAIT,    2       /* WaiterOp.Wait */
     .equ BAD_BUF,           0       /* word-aligned, and in nobody's grant */
-    .equ BUF_CAP,           64      /* ample — the capacity is not what fails */
+    .equ BUF_CAP,           256      /* ample — the capacity is not what fails.
+                                     * 256 since M4 unit 3 grew the record's
+                                     * BUFFER by a message body (design 15);
+                                     * a short cap would fault as BadArg
+                                     * before the door under test was reached. */
 
     .section .payload, "ax", @progbits
     .balign 4
