@@ -1,0 +1,208 @@
+// SOS M4 unit 3: THE REPLY ARM — the delivery that carries the answer (sawos
+// design 15; `designs/010` ruling 11(a); spec §2.2's waitable list).
+//
+// **THE WAIT IS THE RESOLVE.** Unit 2's client polled a claim with `resolve`
+// until the bytes were there; this one attaches the claim to a Waiter and the
+// BYTES ARRIVE IN THE WAIT RECORD. That is the whole of ruling 11(a), and the
+// transcript is a list of what falls out of it:
+//
+//   reply len=2 b=90,89        the record carried the reply's own bytes
+//   after delivery ...         the exchange was DISCHARGED by the copy-out, so
+//                              the claim the caller kept answers `PeerClosed` —
+//                              there is no second copy of an answer
+//   keyed a=11 b=22            two claims on ONE Waiter, and each key carried
+//                              ITS OWN reply
+//
+// **THE THIRD ROW IS WHAT MAKES IT A MULTIPLEXER.** A design that reported the
+// most recent reply to every waiter, or keyed answers by arrival, would print
+// the same digit twice or the two swapped; this asserts the correspondence by
+// KEY and never by order, so it does not depend on which end of the attachment
+// list the kernel happens to scan from.
+//
+// **NOTHING PARKS HERE, AND THAT IS DELIBERATE.** Root plays both sides, so
+// every level is already raised when it is waited on — which is
+// level-triggering doing its job (§2.2: a signal that lands before anyone waits
+// is still there when the wait arrives) and is what lets one thread prove the
+// record's CONTENTS. The genuine park is `pipe-send-blocking`'s, where a child
+// is the one that answers.
+//
+// **ONE PHASE PER FUNCTION** (design 14 finding 3): root's 16 KiB stack grant
+// does not hold every phase's `print` scratch at once, and the 64-bit profile
+// meets that first.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
+            Waiter, WaitResult, WaitPayload, ReplyDelivery, AttachMode,
+            SosStatus, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The keys the two-claim phase attaches under. Distinct words that appear
+/// nowhere else, so a record naming one names an attachment this case made.
+static KEY_A: UInt = 11
+static KEY_B: UInt = 22
+
+/// **WHAT A PHASE ANSWERS WHEN ITS OWN ARITHMETIC IS WRONG** — `pipe-oneshot`'s
+/// vocabulary, unchanged: a status that can never legitimately reach `_start`
+/// from any call these phases make, so a bug in the case is distinguishable
+/// from a claim about the kernel.
+static BUG: SosStatus = SosStatus.Revoked
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS waitreply: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let waiter = try proc.waiter_create() catch {
+        print("SOS waitreply: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let pair = try proc.pipe_create() catch {
+        print("SOS waitreply: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let (inlet, outlet) = move pair
+    let _ = system.debug_print("SOS waitreply: created\n")
+
+    try delivered(&inlet, &outlet, &waiter) catch {
+        print("SOS waitreply: delivery failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try two_claims(&inlet, &outlet, &waiter) catch {
+        print("SOS waitreply: two claims failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    print("SOS waitreply: done\n")
+    let _ = proc.exit(EXIT_OK)
+}
+
+/// **THE ANSWER ARRIVES IN THE RECORD, AND THE EXCHANGE IS SPENT BY IT.**
+///
+/// The reply is written BEFORE the attach, which is level-triggering doing
+/// exactly what §2.2 ratifies it for: readiness that landed first is still there
+/// when the wait arrives, so a one-threaded case can assert what a delivery
+/// CONTAINS without needing something else to be runnable.
+///
+/// The second half is ruling 11(a)'s consequence and it is the sharper claim: a
+/// claim whose answer was delivered through a wait has nothing left to resolve.
+/// A kernel that left the slot `Replied` would hand the same bytes out twice,
+/// which is the duplicate §2.2's consume rule exists to make impossible.
+func delivered(inlet: &PipeInlet, outlet: &PipeOutlet,
+               waiter: &Waiter) -> Result<Void, SosStatus> {
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 1
+
+    let staged = try inlet.post(body: &msg, len: 1)
+    guard var claim = move staged else { return BUG }
+    var obligation = try take_one(&outlet, &var buf)
+
+    msg[0] = 90
+    msg[1] = 89
+    try obligation.reply(body: &msg, len: 2)
+
+    try waiter.add(reply: &claim, key: KEY_A, mode: AttachMode.OneShot)
+    let woke = try waiter.wait()
+    print("SOS waitreply: reply len={} b={},{}\n", reply_len(&woke),
+          reply_byte(&woke, 0), reply_byte(&woke, 1))
+
+    // **AND THE CLAIM IS SPENT.** The caller kept its handle — this was `add`
+    // and not `give` — so the entry is still good and the kernel still answers
+    // it; what it answers is that this exchange is over.
+    match claim.resolve(into: &var buf) {
+        case Ok(_) -> { return BUG },
+        case Err(e) -> { print("SOS waitreply: after delivery {}\n", e) },
+    }
+    return
+}
+
+/// **TWO CLAIMS ON ONE WAITER, TOLD APART BY KEY.**
+///
+/// Both replies are written before either attach, so both levels are raised and
+/// the two waits return at once; what the case asserts is the CORRESPONDENCE —
+/// key 11 carried 11's answer and key 22 carried 22's — read out of whichever
+/// order the kernel's scan happens to deliver them in. That is the §2.2 property
+/// a multiplexed client rests on, and it is what a per-connection reply slot or
+/// a queue-position-keyed answer would break.
+func two_claims(inlet: &PipeInlet, outlet: &PipeOutlet,
+                waiter: &Waiter) -> Result<Void, SosStatus> {
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+
+    msg[0] = 1
+    let first = try inlet.post(body: &msg, len: 1)
+    msg[0] = 2
+    let second = try inlet.post(body: &msg, len: 1)
+    guard var ca = move first else { return BUG }
+    guard var cb = move second else { return BUG }
+
+    var ra = try take_one(&outlet, &var buf)
+    var rb = try take_one(&outlet, &var buf)
+    msg[0] = 11
+    try ra.reply(body: &msg, len: 1)
+    msg[0] = 22
+    try rb.reply(body: &msg, len: 1)
+
+    try waiter.add(reply: &ca, key: KEY_A, mode: AttachMode.OneShot)
+    try waiter.add(reply: &cb, key: KEY_B, mode: AttachMode.OneShot)
+
+    var a: UInt = 0
+    var b: UInt = 0
+    let one = try waiter.wait()
+    if one.key == KEY_A { a = reply_byte(&one, 0) } else { b = reply_byte(&one, 0) }
+    let two = try waiter.wait()
+    if two.key == KEY_A { a = reply_byte(&two, 0) } else { b = reply_byte(&two, 0) }
+
+    print("SOS waitreply: keyed a={} b={}\n", a, b)
+    return
+}
+
+/// How many bytes the reply in this record carries. A record that is not a
+/// reply, or a reply that says `PeerClosed`, answers zero — this case never
+/// produces either, and a zero in the transcript would say the arm was wrong.
+func reply_len(r: &WaitResult) -> UInt {
+    match r.what {
+        case Reply(outcome) -> {
+            match outcome {
+                case Data(msg) -> msg.len,
+                case PeerClosed -> 0,
+            }
+        },
+        case _ -> 0,
+    }
+}
+
+/// Byte `i` of the reply in this record.
+///
+/// **IT READS THE BYTES THROUGH A BORROW**, which is what makes `PipeMsg` being
+/// `NoCopy` cost nothing at a call site: the payload is matched WHERE IT SITS in
+/// the record, and only the one byte comes out as a value.
+func reply_byte(r: &WaitResult, i: Int) -> UInt {
+    match r.what {
+        case Reply(outcome) -> {
+            match outcome {
+                case Data(msg) -> msg.bytes[i] as UInt,
+                case PeerClosed -> 0,
+            }
+        },
+        case _ -> 0,
+    }
+}
+
+/// Take one message and hand its obligation back. Every take reached this way
+/// has a message waiting by construction, so an absence is a bug in the case.
+func take_one(outlet: &PipeOutlet,
+              buf: &var [UInt8; PIPE_BODY_BYTES]) -> Result<PipeRequest, SosStatus> {
+    let got = try outlet.take(into: &var buf)
+    guard let (_, request) = move got else { return BUG }
+    return move request
+}

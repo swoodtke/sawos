@@ -1,0 +1,119 @@
+// SOS CHILD: A SERVER THAT PARKS (sawos design 15, M4 unit 3; spec §2.1, §2.2,
+// §12).
+//
+// It bootstraps exactly as every other child does — a masked System handle in
+// its first argument register, its own Process object derived from it, its boot
+// set drained from there — and the ONE thing the set carries is a `PipeOutlet`:
+// the SERVER end of a connection its launcher created and wired to itself.
+//
+// **IT BLOCKS, AND THAT IS THE WHOLE POINT.** `child-post` polled its end with a
+// bounded retry loop because unit 1 had nothing to park on; this one attaches
+// the outlet to a Waiter of its own and WAITS. Its thread is `Blocked` until the
+// launcher's message is staged, which means the launcher's `post` is what wakes
+// it — spec §2.2's readable arm, proved across a process boundary and through
+// the kernel's own notify path rather than through a timer.
+//
+// **AND ITS ANSWER IS WHAT UNPARKS THE LAUNCHER**, whose composed `send` is
+// parked on the claim at the same moment. So the two halves of one round trip
+// are two blocked threads in two processes, and each wakes the other exactly
+// once: the transcript's ordering is the proof, since a poll anywhere in the
+// chain would have produced the same bytes with none of the parking.
+//
+// The reply is `PONG` in ASCII, and the launcher asserts all four bytes: a
+// status alone would not have shown that the record's body region carried the
+// data.
+
+import sos.{System, Process, PipeOutlet, PipeRequest, Waiter, WaitResult,
+            WaitPayload, OutletLevel, AttachMode, BootHandle, BootHandleKind,
+            SosStatus, PIPE_BODY_BYTES}
+
+/// What it ends with when the boot set was not what the config promised. A
+/// number the transcript's `code=` field distinguishes on sight.
+static EXIT_NO_OUTLET: UInt = 96
+
+/// The reply's length, and the exit code that says how many bytes went.
+static PAYLOAD_LEN: UInt = 4
+
+static KEY: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS childserver: no process handle: {}\n", error)
+        return
+    }
+
+    var outlet: PipeOutlet? = None
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                match rec.kind {
+                    case PipeOutlet -> { outlet = rec.take_outlet() },
+                    // A record of any other kind is a capability this child was
+                    // given and does not want: it drops at the end of this arm
+                    // and releases whatever it held.
+                    case _ -> {},
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+
+    guard let server = move outlet else {
+        let _ = system.debug_print("SOS childserver: no outlet in the boot set\n")
+        let _ = proc.exit(EXIT_NO_OUTLET)
+        return
+    }
+    let waiter = try proc.waiter_create() catch {
+        print("SOS childserver: no waiter: {}\n", error)
+        let _ = proc.exit(EXIT_NO_OUTLET)
+        return
+    }
+
+    try serve(&server, &waiter) catch {
+        print("SOS childserver: serve failed: {}\n", error)
+        let _ = proc.exit(EXIT_NO_OUTLET)
+        return
+    }
+
+    let _ = system.debug_print("SOS childserver: replied\n")
+    // THE EXIT CODE IS THE PAYLOAD'S LENGTH, so the kernel's account of this
+    // process and the launcher's reading of the reply say the same number from
+    // the two sides of the boundary.
+    let _ = proc.exit(PAYLOAD_LEN)
+}
+
+/// **PARK, TAKE, ANSWER.** The whole server loop, once.
+///
+/// The attach is ONE-SHOT: this child serves exactly one message and exits, so a
+/// persistent subscription would be a promise it has no second wait to keep. A
+/// real server leaves it `Persistent` and loops — which is what unit 5's
+/// driver-as-service does with the same three calls.
+func serve(outlet: &PipeOutlet, waiter: &Waiter) -> Result<Void, SosStatus> {
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+
+    try waiter.add(outlet: &outlet, key: KEY, mode: AttachMode.OneShot)
+    // THIS BLOCKS. Nothing else in this process is runnable, so the kernel has
+    // to find work elsewhere and the launcher's `post` is what comes back to it.
+    let woke = try waiter.wait()
+    match woke.what {
+        case Readable(_) -> {},
+        case _ -> { return SosStatus.Revoked },
+    }
+
+    let got = try outlet.take(into: &var buf)
+    guard let (_, request) = move got else { return SosStatus.Revoked }
+    var obligation = move request
+
+    msg[0] = 80
+    msg[1] = 79
+    msg[2] = 78
+    msg[3] = 71
+    try obligation.reply(body: &msg, len: PAYLOAD_LEN)
+    return
+}

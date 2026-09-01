@@ -371,6 +371,28 @@ PIPE_NO_REPLY_PKG = os.path.join(TESTS_DIR, "pipe-no-reply")
 PIPE_BIG_REPLY_PKG = os.path.join(TESTS_DIR, "pipe-big-reply")
 PIPE_DEAD_CLAIM_PKG = os.path.join(TESTS_DIR, "pipe-dead-claim")
 
+# sawos design 15 (M4 unit 3): waitability. FOUR root servers for the four arms,
+# ONE launcher-plus-child for the blocking sends, and TWO negative arms — and the
+# split is the same house rule the unit-1 and unit-2 blocks above state: a rights
+# refusal and a bad-argument refusal are FAULTS, a fault ends the process, so
+# neither can share an image with anything that has work left to do.
+#
+# **THE FOUR ARM CASES ARE ONE PROCESS EACH, AND NOTHING IN THEM PARKS.** Root
+# plays both sides of every connection, so each level is raised BEFORE it is
+# waited on — which is §2.2's level-triggering doing exactly what it is ratified
+# for, and is what lets one thread assert what a delivery CONTAINS. That is a
+# deliberate division of labour: the four cases prove the four arms' payloads and
+# their ordering rules, and `pipe_send_blocking` is the one that proves the WAKE,
+# because a genuine park needs something else to be runnable.
+PIPE_WAIT_REPLY_PKG = os.path.join(TESTS_DIR, "pipe-wait-reply")
+PIPE_WAIT_GIVE_PKG = os.path.join(TESTS_DIR, "pipe-wait-give")
+PIPE_WAIT_ROOM_PKG = os.path.join(TESTS_DIR, "pipe-wait-room")
+PIPE_WAIT_SERVER_PKG = os.path.join(TESTS_DIR, "pipe-wait-server")
+PIPE_SEND_BLOCKING_PKG = os.path.join(TESTS_DIR, "pipe-send-blocking")
+CHILD_SERVER_PKG = os.path.join(TESTS_DIR, "child-server")
+PIPE_NO_WAIT_PKG = os.path.join(TESTS_DIR, "pipe-no-wait")
+PIPE_BAD_MODE_PKG = os.path.join(TESTS_DIR, "pipe-bad-mode")
+
 CLOCK_BASICS_PKG = os.path.join(TESTS_DIR, "clock-basics")
 TIMER_ONESHOT_PKG = os.path.join(TESTS_DIR, "timer-oneshot")
 TIMER_INTERVAL_PKG = os.path.join(TESTS_DIR, "timer-interval")
@@ -3227,6 +3249,214 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS deadclaim: resolved len=1",
                        "SOS: process fault: bad handle process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    # =========================================================================
+    # M4 unit 3 — waitability (sawos design 15)
+    # =========================================================================
+    {
+        # **THE REPLY ARM: THE WAIT IS THE RESOLVE** (`designs/010` ruling
+        # 11(a)). Unit 2's client polled `resolve` until the bytes were there;
+        # this one attaches the claim and the BYTES ARRIVE IN THE WAIT RECORD.
+        #
+        # `reply len=2 b=90,89` is the record's body region carrying a reply out
+        # of the ring slot that held it — the second of the two copies
+        # `deliver_wait_record` makes, and the only one any kind but this makes
+        # at all.
+        #
+        # `after delivery ...` is ruling 11(a)'s consequence and the sharper
+        # claim: the exchange was DISCHARGED by the copy-out, so the claim the
+        # caller kept answers `PeerClosed`. A kernel that left the slot
+        # `Replied` would hand the same answer out twice, which is the duplicate
+        # §2.2's consume rule exists to make impossible.
+        #
+        # `keyed a=11 b=22` is TWO CLAIMS ON ONE WAITER, asserted BY KEY and
+        # never by arrival order. A design with one reply slot per connection
+        # would print one digit twice; one that keyed answers by queue position
+        # would print them swapped.
+        "name": "pipe_wait_reply",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_WAIT_REPLY_PKG,
+        "expect_out": ["{banner}",
+                       "SOS waitreply: created",
+                       "SOS waitreply: reply len=2 b=90,89",
+                       "SOS waitreply: after delivery the other end of this "
+                       "connection is gone",
+                       "SOS waitreply: keyed a=11 b=22",
+                       "SOS waitreply: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **THE CONSUMING ATTACH** (`designs/010` ruling 11(c)). `give` takes the
+        # wrapper by MOVE and the ATTACHMENT owns the exchange; the caller holds
+        # nothing at all while the answer is in flight.
+        #
+        # **`depth after delivery=16` IS THE ROW THAT COULD NOT BE FAKED.**
+        # `pipe_oneshot` showed a held exchange costing one ring slot (15) and
+        # settling giving it back (16); this counts the same ring after a
+        # delivery to a consuming attachment and gets the WHOLE depth — so the
+        # delivery ended the attachment, the entry and the exchange in one act,
+        # with no `resolve` anywhere in the program.
+        #
+        # `cancelled reply says ...` is §2.1's abandonment sentence in its
+        # re-worded form (ruling 11): with the claim given away there is no
+        # handle to drop, so cancelling IS destroying the subscription — and the
+        # server learns exactly what the ratified text says it learns.
+        "name": "pipe_wait_give",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_WAIT_GIVE_PKG,
+        "expect_out": ["{banner}",
+                       "SOS waitgive: created",
+                       "SOS waitgive: given reply len=1 b=7",
+                       "SOS waitgive: depth after delivery=16",
+                       "SOS waitgive: cancelled reply says the other end of "
+                       "this connection is gone",
+                       "SOS waitgive: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **THE INLET'S ROOM-TO-POST LEVEL** (`designs/010` ruling 8). `post` can
+        # never block, so a refused poster parks on the client end instead of
+        # polling — and the payload word is what says which readiness woke it.
+        #
+        # `filled=16 then room says there is space` counts the ring around
+        # itself: the fill runs until the kernel refuses (so the level is
+        # provably false), one exchange is settled, and the level is provably
+        # true. The program never names `PIPE_INFLIGHT` — what it asserts is the
+        # difference.
+        #
+        # `room says the peer is gone` is the other reading, and the ORDER is the
+        # claim: the ring is empty there, so a kernel that answered "space" would
+        # be telling a poster to write into a connection nobody can ever read.
+        # `PipeInletOp.Post` asks the same two questions in the same order.
+        "name": "pipe_wait_room",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_WAIT_ROOM_PKG,
+        "expect_out": ["{banner}",
+                       "SOS waitroom: created",
+                       "SOS waitroom: filled=16 then room says there is space",
+                       "SOS waitroom: room says the peer is gone",
+                       "SOS waitroom: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **THE SERVER'S TWO ARMS** (spec §2.2's readable level; §2.1's ratified
+        # request-abandoned early notice).
+        #
+        # **THE TWO `readable says` ROWS ARE ONE ORDERING CLAIM.** The message is
+        # staged and the WHOLE client end is then dropped, so both facts are true
+        # before either wait runs — and the level chooses the message. Only after
+        # the take empties the ring does the second wait say the peer is gone.
+        # That is design 230's close-drains-first rule at the wait door, and a
+        # kernel that reported the terminal level as soon as the sender's last
+        # handle went would lose a message that had already been sent.
+        #
+        # ONE PERSISTENT ATTACHMENT ANSWERS BOTH WAITS, which is also the
+        # one-shot footgun stated from the other side: a `OneShot` attachment
+        # would have detached at the first delivery and the second wait would
+        # have had an empty Waiter to park on forever.
+        #
+        # `abandoned` is the third arm and it carries NO payload — the fact is
+        # the notification — and it is TERMINAL, so the attach happens AFTER the
+        # client gave up and is still told at once.
+        "name": "pipe_wait_server",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_WAIT_SERVER_PKG,
+        "expect_out": ["{banner}",
+                       "SOS waitserver: created",
+                       "SOS waitserver: readable says a message",
+                       "SOS waitserver: readable says the peer is gone",
+                       "SOS waitserver: abandoned",
+                       "SOS waitserver: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **THE COMPOSED BLOCKING SENDS, AND THE ONLY CASE IN THIS UNIT WHOSE
+        # THREADS REALLY PARK** (spec §2.1's ratified client API; `designs/010`
+        # ruling 4). Two processes, two blocked threads, each waking the other
+        # exactly once.
+        #
+        # **THE ORDER IS THE PROOF.** `SOS childserver: replied`, the child's
+        # exit and its teardown all come BEFORE root reads the bytes — root's
+        # `send` posted, attached its claim and parked, which left the kernel
+        # nothing runnable but the child; the child parked on its OUTLET and was
+        # woken by the post; its reply is what woke root. A polling
+        # implementation of either half would print the same bytes with none of
+        # that interleaving.
+        #
+        # `send got len=4 b=80,79,78,71` is `PONG` in ASCII, arriving in the WAIT
+        # RECORD's body region: there is no `resolve` anywhere on this path,
+        # because ruling 11(a) deleted that leg.
+        #
+        # `timed out` is a second connection nobody serves — the Timer on the
+        # same Waiter is what ends the wait, which is the whole of what ruling 4
+        # says a timeout is, and the kernel still knows nothing about durations.
+        # `after cancel ...` is what the still-live claim being DROPPED means:
+        # §2.1's cancellation primitive, and the server told rather than left to
+        # succeed silently.
+        "name": "pipe_send_blocking",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_SEND_BLOCKING_PKG,
+        "children": [CHILD_SERVER_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS sendblock: gave the outlet",
+                       "SOS childserver: replied",
+                       "SOS: process exit: code={four} process={one}",
+                       "SOS: process teardown handles={four} threads={one} "
+                       "events={zero} waiters={one} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS sendblock: send got len=4 b=80,79,78,71",
+                       "SOS sendblock: timed out",
+                       "SOS sendblock: after cancel the other end of this "
+                       "connection is gone",
+                       "SOS sendblock: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **AN UNSPENT `Wait` RIGHT** (spec §3). `pipe_no_post`'s claim made once
+        # more at the door M4 unit 3 opened: all four pipe kinds gained a `Wait`
+        # bit in their default sets, because attenuation is monotonic and a bit
+        # not minted at creation could never appear later — so the narrowing is
+        # the holder's, written once at a `MINT_OP` keep mask.
+        #
+        # THE MASK IS THE POLICY. `Transfer | Mint | Take` with `Wait` absent
+        # describes a POLLING helper: a process handed work to drain and
+        # deliberately not handed the authority to park on somebody else's
+        # connection.
+        "name": "pipe_no_wait",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_NO_WAIT_PKG,
+        "expect_out": ["{banner}",
+                       "SOS nowait: minted without Wait",
+                       "SOS: process fault: access denied process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # **A FLAGS WORD OUTSIDE ITS DOMAIN** (spec §5.7's faults ruling).
+        # `WaiterOp.Add` grew a third argument in M4 unit 3 and published exactly
+        # two bits; a word carrying any other names a behaviour the kernel has no
+        # reading of, and the set is published, so it is a mistake the caller
+        # could have checked.
+        #
+        # **IT REACHES THE C ALTITUDE, AND THAT IS THE POINT RATHER THAN A
+        # WORKAROUND.** The typed surface cannot spell an invalid mode —
+        # `AttachMode` has two cases and consuming is a VERB — so the four legal
+        # combinations are the only things a Saw caller can ask for. The kernel's
+        # check is still real underneath, and this is the altitude at which a raw
+        # word legitimately exists to test it, exactly as `pipe_dead_claim`
+        # reaches for a spent value to show the generation check is real.
+        "name": "pipe_bad_mode",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_BAD_MODE_PKG,
+        "expect_out": ["{banner}",
+                       "SOS badmode: asking for flags 4",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}",
                        "SOS: process teardown handles="],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,

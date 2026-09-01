@@ -1,0 +1,197 @@
+// SOS M4 unit 3: THE INLET'S ROOM-TO-POST LEVEL (sawos design 15;
+// `designs/010` ruling 8; spec §2.2's waitable list, amended to include the
+// client end).
+//
+// **`post` CAN NEVER BLOCK, SO A REFUSED POSTER NEEDED SOMETHING BETTER THAN A
+// POLL LOOP.** Ruling 4 made post the one kernel primitive on the client side
+// and gave it no park; ruling 8 gives the client END a level instead, and the
+// payload word says WHICH of the two readinesses woke you:
+//
+//   room says there is space    the ring had a free slot again, because an
+//                               exchange settled
+//   room says the peer is gone  every outlet handle went, so posting is over —
+//                               and a waker learns that without a probe post,
+//                               which is what ruling 8 asks the payload for
+//
+// **THE FIRST ARM COUNTS THE RING AROUND ITSELF.** The ring is filled with TELLs
+// until the kernel refuses, so the level is provably FALSE; one exchange is then
+// settled and the level is provably TRUE. The program never names
+// `PIPE_INFLIGHT` — what it asserts is the DIFFERENCE, which is `pipe-oneshot`'s
+// own discipline applied to a waitable rather than to a count.
+//
+// **NOTHING PARKS, AND THE LEVEL IS WHAT IS UNDER TEST.** Root is alone, so the
+// readiness is arranged before the wait; that is level-triggering doing what
+// §2.2 ratifies it for, and the genuine park on this arm is
+// `pipe-send-blocking`'s composed `send`, whose backpressure leg is this level.
+//
+// ONE PHASE PER FUNCTION, on design 14 finding 3's stack ceiling.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
+            Waiter, WaitResult, WaitPayload, InletLevel, AttachMode, SosStatus,
+            PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static KEY_ROOM: UInt = 41
+static KEY_GONE: UInt = 42
+
+static MAX_ROUNDS: Int = 64
+
+static BUG: SosStatus = SosStatus.Revoked
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS waitroom: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let waiter = try proc.waiter_create() catch {
+        print("SOS waitroom: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS waitroom: created\n")
+
+    try room_returns(&proc, &waiter) catch {
+        print("SOS waitroom: room arm failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try peer_gone(&proc, &waiter) catch {
+        print("SOS waitroom: peer-gone arm failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    print("SOS waitroom: done\n")
+    let _ = proc.exit(EXIT_OK)
+}
+
+/// **FILL THE RING, SETTLE ONE EXCHANGE, AND THE LEVEL COMES BACK.**
+///
+/// The fill is TELLs, so every staged exchange is owed to the live outlet and
+/// none of them settles on its own; taking one and dropping the obligation
+/// settles that one and no other. So the free depth goes from zero to one, and
+/// the level's answer is `Room`.
+///
+/// The pair is created and dropped inside this phase, which keeps the two arms
+/// independent at a `DEFAULT_QUOTA_PIPES` of two.
+func room_returns(proc: &Process, waiter: &Waiter) -> Result<Void, SosStatus> {
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 5
+
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+
+    let depth = try fill(&inlet, &msg)
+    // The ring is now full: one more post would be refused, which is what makes
+    // the level FALSE at this instant.
+    let extra = try inlet.post(body: &msg, len: 1)
+    if let claim = move extra { return BUG }
+
+    // One exchange settles — taken, and its obligation dropped with nobody
+    // holding the claim — so exactly one slot comes back.
+    let took = try take_and_drop(&outlet, &var buf)
+    if not took { return BUG }
+
+    try waiter.add(inlet: &inlet, key: KEY_ROOM, mode: AttachMode.OneShot)
+    let woke = try waiter.wait()
+    print("SOS waitroom: filled={} then room says {}\n", depth,
+          level_name(&woke))
+
+    let back = try drain(&outlet, &var buf)
+    if back + 1 != depth { return BUG }
+    return
+}
+
+/// **THE SERVER END GOES, AND THE LEVEL SAYS SO RATHER THAN SAYING "SPACE".**
+///
+/// `PeerGone` wins over `Room` here even though the ring is empty, and the
+/// asymmetry with the outlet's drain-then-terminal order is the OPS' own:
+/// `PipeInletOp.Post` asks about the outlet column before it asks about the
+/// ring, because a free slot would be a place to put a message with no future.
+func peer_gone(proc: &Process, waiter: &Waiter) -> Result<Void, SosStatus> {
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+
+    // Drop the whole server end. Nobody can ever take again.
+    let _ = move outlet
+
+    try waiter.add(inlet: &inlet, key: KEY_GONE, mode: AttachMode.OneShot)
+    let woke = try waiter.wait()
+    print("SOS waitroom: room says {}\n", level_name(&woke))
+    return
+}
+
+/// Which of the inlet level's two readings this record carries. A record of any
+/// other kind answers with a word this case never expects to see, which is what
+/// makes the row an assertion rather than a label.
+func level_name(r: &WaitResult) -> String {
+    match r.what {
+        case Room(state) -> {
+            match state {
+                case Room -> "there is space",
+                case PeerGone -> "the peer is gone",
+            }
+        },
+        case _ -> "not a room record",
+    }
+}
+
+func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
+          len: UInt) -> Result<Bool, SosStatus> {
+    let staged = try inlet.post(body: &body, len: len)
+    if let claim = move staged {
+        let _ = move claim
+        return true
+    }
+    return false
+}
+
+func take_and_drop(outlet: &PipeOutlet,
+                   into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<Bool, SosStatus> {
+    let got = try outlet.take(into: &var into)
+    if let (_, request) = move got {
+        let _ = move request
+        return true
+    }
+    return false
+}
+
+func fill(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES]) -> Result<UInt, SosStatus> {
+    var depth: UInt = 0
+    var filling = true
+    var rounds: Int = 0
+    while filling && rounds < MAX_ROUNDS {
+        rounds = rounds + 1
+        let put = try tell(&inlet, &body, 1)
+        if put {
+            depth = depth + 1
+        } else {
+            filling = false
+        }
+    }
+    return depth
+}
+
+func drain(outlet: &PipeOutlet,
+           into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<UInt, SosStatus> {
+    var took: UInt = 0
+    var going = true
+    var rounds: Int = 0
+    while going && rounds < MAX_ROUNDS {
+        rounds = rounds + 1
+        let got = try take_and_drop(&outlet, &var into)
+        if got {
+            took = took + 1
+        } else {
+            going = false
+        }
+    }
+    return took
+}

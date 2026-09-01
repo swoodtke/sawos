@@ -1,0 +1,246 @@
+// SOS M4 unit 3: THE CONSUMING ATTACH (sawos design 15; `designs/010` ruling
+// 11(c); spec §2.1's abandonment, re-worded to the LAST REFERENCE).
+//
+// **`give` HANDS THE OBJECT TO THE SUBSCRIPTION.** `add` borrows and leaves the
+// caller holding a handle it has no further use for; `give` takes the wrapper by
+// MOVE, the kernel releases the entry as part of the attach, and the ATTACHMENT
+// owns the exchange from there. The transcript is two claims about that:
+//
+//   given reply len=1 b=7      the answer still arrives, through a subscription
+//                              that owns what it watches
+//   depth after delivery=16    and the delivery ended EVERYTHING — attachment,
+//                              entry and exchange — in one act, so the ring slot
+//                              came back with no `resolve` anywhere
+//   cancelled reply says ...   `remove(key)` on a GIVEN claim drops the LAST
+//                              reference, which is §2.1's cancellation primitive
+//                              reached through the Waiter
+//
+// **THE MIDDLE ROW IS THE ONE THAT COULD NOT BE FAKED.** `pipe-oneshot` showed
+// that a held exchange costs a ring slot (15) and that discharging it gives the
+// slot back (16); this counts the SAME ring after a delivery to a consuming
+// attachment and gets the whole depth — which a kernel that left the exchange
+// alive under an attachment nobody can name would not produce.
+//
+// **THE THIRD IS THE ABANDONMENT RE-WORDING, EXERCISED.** With the claim given
+// away there is no handle left to drop, so cancelling is destroying the
+// subscription — which is exactly what ruling 11 says destroying a subscription
+// should mean.
+//
+// ONE PHASE PER FUNCTION, on design 14 finding 3's stack ceiling.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
+            Waiter, WaitResult, WaitPayload, ReplyDelivery, AttachMode,
+            SosStatus, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static KEY_GIVEN: UInt = 31
+static KEY_CANCEL: UInt = 32
+
+/// The ceiling on every counting loop. Comfortably past any staging ring this
+/// kernel could have — the point is that the loop terminates whatever the
+/// kernel answers, not that the number is tight.
+static MAX_ROUNDS: Int = 64
+
+static BUG: SosStatus = SosStatus.Revoked
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS waitgive: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let waiter = try proc.waiter_create() catch {
+        print("SOS waitgive: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let pair = try proc.pipe_create() catch {
+        print("SOS waitgive: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let (inlet, outlet) = move pair
+    let _ = system.debug_print("SOS waitgive: created\n")
+
+    try given(&inlet, &outlet, &waiter) catch {
+        print("SOS waitgive: give failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try cancel_by_remove(&inlet, &outlet, &waiter) catch {
+        print("SOS waitgive: cancel failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    print("SOS waitgive: done\n")
+    let _ = proc.exit(EXIT_OK)
+}
+
+/// **GIVE THE CLAIM AWAY, AND STILL GET THE ANSWER** — and then count the ring
+/// to show that nothing is left holding a slot.
+///
+/// The wrapper is consumed by the `give`, so there is no `resolve` here and no
+/// handle to release: the record IS the answer and the delivery IS the end of
+/// the exchange. The count afterwards is what says so, because a full ring can
+/// only mean every exchange settled.
+func given(inlet: &PipeInlet, outlet: &PipeOutlet,
+           waiter: &Waiter) -> Result<Void, SosStatus> {
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 1
+
+    let staged = try inlet.post(body: &msg, len: 1)
+    guard var claim = move staged else { return BUG }
+    var obligation = try take_one(&outlet, &var buf)
+    msg[0] = 7
+    try obligation.reply(body: &msg, len: 1)
+
+    // THE MOVE IS THE POINT: `claim` cannot be named after this line, which is
+    // the typed layer saying what the kernel did.
+    match waiter.give(reply: move claim, key: KEY_GIVEN) {
+        case Ok(_) -> {},
+        // A refused give HANDS THE OBJECT BACK (user-ruled Sep 1) — the tuple's
+        // second element is the live claim, and dropping it here is this case
+        // declining to retry.
+        case Err(back) -> { return BUG },
+    }
+
+    let woke = try waiter.wait()
+    print("SOS waitgive: given reply len={} b={}\n", reply_len(&woke),
+          reply_byte(&woke, 0))
+
+    let depth = try fill(&inlet, &msg)
+    let back = try drain(&outlet, &var buf)
+    if back != depth { return BUG }
+    print("SOS waitgive: depth after delivery={}\n", depth)
+    return
+}
+
+/// **CANCELLING BY UNSUBSCRIBING** (§2.1's abandonment, re-worded to the last
+/// reference by `designs/010` ruling 11).
+///
+/// The claim was given away, so the client holds no handle onto it — a drop is
+/// not available and would not be the right verb anyway. Removing the
+/// ATTACHMENT is what drops the last reference, and the server learns of it the
+/// way §2.1 ratified: its `reply` answers `PeerClosed`, obligation discharged
+/// either way.
+func cancel_by_remove(inlet: &PipeInlet, outlet: &PipeOutlet,
+                      waiter: &Waiter) -> Result<Void, SosStatus> {
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 3
+
+    let staged = try inlet.post(body: &msg, len: 1)
+    guard var claim = move staged else { return BUG }
+    var obligation = try take_one(&outlet, &var buf)
+
+    match waiter.give(reply: move claim, key: KEY_CANCEL) {
+        case Ok(_) -> {},
+        case Err(_) -> { return BUG },
+    }
+    // The subscription was the only thing naming the claim. Destroying it is
+    // destroying the claim.
+    try waiter.remove(KEY_CANCEL)
+
+    match obligation.reply(body: &msg, len: 1) {
+        case Ok(_) -> { return BUG },
+        case Err(e) -> { print("SOS waitgive: cancelled reply says {}\n", e) },
+    }
+    return
+}
+
+func reply_len(r: &WaitResult) -> UInt {
+    match r.what {
+        case Reply(outcome) -> {
+            match outcome {
+                case Data(msg) -> msg.len,
+                case PeerClosed -> 0,
+            }
+        },
+        case _ -> 0,
+    }
+}
+
+func reply_byte(r: &WaitResult, i: Int) -> UInt {
+    match r.what {
+        case Reply(outcome) -> {
+            match outcome {
+                case Data(msg) -> msg.bytes[i] as UInt,
+                case PeerClosed -> 0,
+            }
+        },
+        case _ -> 0,
+    }
+}
+
+func take_one(outlet: &PipeOutlet,
+              buf: &var [UInt8; PIPE_BODY_BYTES]) -> Result<PipeRequest, SosStatus> {
+    let got = try outlet.take(into: &var buf)
+    guard let (_, request) = move got else { return BUG }
+    return move request
+}
+
+/// Post and give the claim up — §2.1's TELL idiom, which is what the counting
+/// loops use because they are about the RING and not about the pair.
+func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
+          len: UInt) -> Result<Bool, SosStatus> {
+    let staged = try inlet.post(body: &body, len: len)
+    if let claim = move staged {
+        let _ = move claim
+        return true
+    }
+    return false
+}
+
+/// Take, and discharge the obligation by dropping it — the mirror of `tell`.
+func take_and_drop(outlet: &PipeOutlet,
+                   into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<Bool, SosStatus> {
+    let got = try outlet.take(into: &var into)
+    if let (_, request) = move got {
+        let _ = move request
+        return true
+    }
+    return false
+}
+
+/// Post until the kernel refuses, and hand back how many went — the ring's FREE
+/// depth, counted rather than named.
+func fill(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES]) -> Result<UInt, SosStatus> {
+    var depth: UInt = 0
+    var filling = true
+    var rounds: Int = 0
+    while filling && rounds < MAX_ROUNDS {
+        rounds = rounds + 1
+        let put = try tell(&inlet, &body, 1)
+        if put {
+            depth = depth + 1
+        } else {
+            filling = false
+        }
+    }
+    return depth
+}
+
+/// Take everything staged, discharging as it goes.
+func drain(outlet: &PipeOutlet,
+           into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<UInt, SosStatus> {
+    var took: UInt = 0
+    var going = true
+    var rounds: Int = 0
+    while going && rounds < MAX_ROUNDS {
+        rounds = rounds + 1
+        let got = try take_and_drop(&outlet, &var into)
+        if got {
+            took = took + 1
+        } else {
+            going = false
+        }
+    }
+    return took
+}

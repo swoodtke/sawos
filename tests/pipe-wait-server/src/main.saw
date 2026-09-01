@@ -1,0 +1,179 @@
+// SOS M4 unit 3: THE OUTLET'S READABLE LEVEL AND THE REQUEST'S ABANDONED LEVEL
+// (sawos design 15; spec §2.2's waitable list, §2.1's ratified early notice).
+//
+// **THE TWO ARMS A SERVER USES.** One says there is work; the other says the
+// client that asked for it has gone. The transcript is the pair, plus the ORDER
+// the first one keeps:
+//
+//   readable says a message        something is staged
+//   readable says the peer is gone …and only once the ring is DRY, which is
+//                                  drain-then-terminal (design 230's
+//                                  close-drains-first rule) — the inlet was
+//                                  dropped BEFORE the message was taken, and
+//                                  the message still came out first
+//   abandoned                      the claim behind an obligation was dropped,
+//                                  which is §2.1's opt-in early notice
+//
+// **THE MIDDLE ROW IS THE ORDERING CLAIM AND IT IS THE ONE WORTH THE CASE.** A
+// kernel that reported the terminal level as soon as the sender's last handle
+// went would lose the message the sender had already staged — the exact silent
+// loss §2.1's bounded-IPC model exists to rule out — and the two waits here are
+// what tell that kernel apart from this one.
+//
+// **NOTHING PARKS.** Root is alone, so every level is raised before it is waited
+// on; the genuine cross-process park on the readable arm is `child-server`'s, in
+// `pipe-send-blocking`.
+//
+// ONE PHASE PER FUNCTION, on design 14 finding 3's stack ceiling.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
+            Waiter, WaitResult, WaitPayload, OutletLevel, AttachMode, SosStatus,
+            PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static KEY_READ: UInt = 51
+static KEY_ABANDON: UInt = 52
+
+static BUG: SosStatus = SosStatus.Revoked
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS waitserver: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let waiter = try proc.waiter_create() catch {
+        print("SOS waitserver: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS waitserver: created\n")
+
+    try drain_then_terminal(&proc, &waiter) catch {
+        print("SOS waitserver: readable arm failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try abandoned(&proc, &waiter) catch {
+        print("SOS waitserver: abandoned arm failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    print("SOS waitserver: done\n")
+    let _ = proc.exit(EXIT_OK)
+}
+
+/// **DRAIN-THEN-TERMINAL, AS TWO WAITS ON ONE ATTACHMENT.**
+///
+/// The message is staged, then the WHOLE client end is dropped, and only then is
+/// anything waited on. So both facts are true at once — there is a message, and
+/// no sender can ever appear again — and the level has to choose. It chooses the
+/// message, twice over: the first wait says `a message`, the take empties the
+/// ring, and only the second says `the peer is gone`.
+///
+/// The attachment is PERSISTENT, which is what lets one subscription answer both
+/// waits. A one-shot would have detached at the first delivery and the second
+/// wait would have had nothing attached at all — which is the footgun ruling
+/// 9(b) asks to have stated, and this phase is where it would have bitten.
+func drain_then_terminal(proc: &Process, waiter: &Waiter) -> Result<Void, SosStatus> {
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 9
+
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+
+    let staged = try inlet.post(body: &msg, len: 1)
+    guard let claim = move staged else { return BUG }
+    // §2.1's TELL: the client gives up the answer and then gives up the
+    // connection. What it staged is still owed to the live outlet.
+    let _ = move claim
+    let _ = move inlet
+
+    try waiter.add(outlet: &outlet, key: KEY_READ, mode: AttachMode.Persistent)
+
+    let first = try waiter.wait()
+    print("SOS waitserver: readable says {}\n", level_name(&first))
+
+    let took = try take_and_drop(&outlet, &var buf)
+    if not took { return BUG }
+
+    let second = try waiter.wait()
+    print("SOS waitserver: readable says {}\n", level_name(&second))
+
+    try waiter.remove(KEY_READ)
+    return
+}
+
+/// **THE SERVER'S CANCELLATION WATCHER** (§2.1: "the `PipeRequestHandle` is
+/// WAITABLE for abandoned", opt-in early notice).
+///
+/// The client posts, the server takes, and then the client DROPS its claim. Its
+/// obligation is still live and still discharge-able — abandonment is
+/// information, not an imperative — but the server can now learn about it before
+/// it does the work rather than afterwards, when its `reply` would have answered
+/// `PeerClosed`.
+///
+/// TERMINAL: a reply column that reached zero can never rise, so the attach here
+/// happens AFTER the drop and is still told at once.
+func abandoned(proc: &Process, waiter: &Waiter) -> Result<Void, SosStatus> {
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 4
+
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+
+    let staged = try inlet.post(body: &msg, len: 1)
+    guard let claim = move staged else { return BUG }
+    let got = try outlet.take(into: &var buf)
+    guard let (_, request) = move got else { return BUG }
+    var obligation = move request
+
+    // The cancellation itself: the client gives up.
+    let _ = move claim
+
+    try waiter.add(request: &obligation, key: KEY_ABANDON,
+                   mode: AttachMode.OneShot)
+    let woke = try waiter.wait()
+    print("SOS waitserver: {}\n", abandon_name(&woke))
+    return
+}
+
+/// Which of the outlet level's two readings this record carries.
+func level_name(r: &WaitResult) -> String {
+    match r.what {
+        case Readable(state) -> {
+            match state {
+                case Msg -> "a message",
+                case PeerGone -> "the peer is gone",
+            }
+        },
+        case _ -> "not a readable record",
+    }
+}
+
+/// The abandoned arm carries NO payload — the fact is the notification — so what
+/// this reads is the case itself.
+func abandon_name(r: &WaitResult) -> String {
+    match r.what {
+        case Abandoned -> "abandoned",
+        case _ -> "not an abandoned record",
+    }
+}
+
+func take_and_drop(outlet: &PipeOutlet,
+                   into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<Bool, SosStatus> {
+    let got = try outlet.take(into: &var into)
+    if let (_, request) = move got {
+        let _ = move request
+        return true
+    }
+    return false
+}

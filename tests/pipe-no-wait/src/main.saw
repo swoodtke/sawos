@@ -1,0 +1,85 @@
+// SOS M4 unit 3: AN UNSPENT `Wait` RIGHT ON A CONNECTION END (sawos design 15;
+// spec §3).
+//
+// **`pipe_no_post`'s CLAIM AT THE NEW DOOR.** M4 unit 3 gave all four pipe kinds
+// a `Wait` bit and put it in every default set, for the reason every
+// kind-specific bit is there: §3's attenuation is monotonic, so a bit not minted
+// at creation could never appear later. Which means the narrowing is the
+// HOLDER's, written once at a `MINT_OP` keep mask, and this program is that
+// sentence executed at the wait door:
+//
+//   SOS nowait: minted without Wait     a sibling that may TAKE and may travel
+//   SOS: process fault: access denied   ...and may not watch
+//
+// **THE MASK IS A REAL POLICY AND NOT A TEST FIXTURE.** `Transfer | Mint | Take`
+// with `Wait` absent by silence describes a POLLING helper — a process handed
+// work to drain and deliberately not handed the authority to park on the
+// connection, so it can never hold a Waiter slot open on somebody else's pipe.
+//
+// **IT IS A FAULT AND NOT A STATUS** (design 178's faults ruling): a process
+// knows which rights it holds, so spending one it was not given is a mistake it
+// could have checked. The kernel terminates it and stays up to say so.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, Waiter, AttachMode,
+            SosStatus, PipeOutletRight}
+
+static EXIT_FAILED: UInt = 1
+
+/// The key the refused attach would have used. It never reaches the kernel's
+/// key table — the rights check runs first, inside `waitable_slot`, which is
+/// where waitability and the right are one question.
+static KEY: UInt = 61
+
+/// **THE KEEP MASK, AND `Wait` IS ABSENT BY SILENCE.** Three bits: this end may
+/// be handed on, may be narrowed further, and may be read — and may not be
+/// watched.
+static NO_WAIT: UInt32 = (PipeOutletRight.Transfer | PipeOutletRight.Mint
+                          | PipeOutletRight.Take)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS nowait: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let waiter = try proc.waiter_create() catch {
+        print("SOS nowait: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let pair = try proc.pipe_create() catch {
+        print("SOS nowait: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let (inlet, outlet) = move pair
+
+    let narrowed = try outlet.mint(rights: NO_WAIT) catch {
+        print("SOS nowait: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS nowait: minted without Wait\n")
+
+    // A SECOND NAME IS A SECOND REFERENCE on this connection's outlet column, so
+    // the original could still be attached — what is refused is THIS handle,
+    // which is what makes attenuation per-capability rather than per-object.
+    match waiter.add(outlet: &narrowed, key: KEY, mode: AttachMode.Persistent) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS nowait: an unspent right attached\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        // UNREACHABLE: the line above does not return, because the kernel ends
+        // this process at the rights check. The arm is written so the refusal
+        // reads as a refusal rather than as a missing case.
+        case Err(e) -> {
+            print("SOS nowait: attach refused: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+}
