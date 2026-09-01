@@ -63,8 +63,11 @@ is legal since sawc 0.2.1 (SL-12 closed) — use the guard shape at
 every position. **The fold shape is ruled in too (user, Sep 1): a
 `match` whose Err arm just supplies a fallback value
 (`case Err(_) -> v`) is `try f() catch { v }`** — bind-or-default
-joins bind-or-bail. The 75 statement-position + 25 fold sites kept
-during the ICE era are a queued conversion pass. On
+joins bind-or-bail. The tree is FULLY CONVERTED (Sep 1, 95 sites);
+the 33 `match` sites that remain are by design — real-work arms,
+negative tests, and success predicates (`case Ok(_) -> true`, a
+shape try/catch cannot express since the catch yields the payload's
+replacement, not a second value for the Ok path). On
 this machine it is a user-level symlink
 (`~/.claude/skills/saw-lang -> <sawlang checkout>/.claude/skills/saw-lang`,
 sawlang#238 D-f) — one canonical copy, no drift. On a machine without a

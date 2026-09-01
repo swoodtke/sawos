@@ -442,3 +442,52 @@ repo's first done file; sawos was born Aug 28 (sawlang#238).
   the pin bump rides this integration). Findings: close-not-
   needed (§11 amended); the teardown force-free hazard -> RULED
   as #10 ruling 10 (references govern lifetime, unit-2 rider)
+- tests conversion pass — statement + fold try/catch [scheduled, queue
+  1]: the 75 statement-position `match` sites kept at the Aug-31 sweep
+  on SL-12's ICE become statement `try f() catch {…}` (legal since
+  sawc 0.2.1), AND the 25 fold-shaped sites (`case Err(_) -> value`)
+  become `try f() catch { value }` — the fold opt-in RULED IN by the
+  user Sep 1 ("this new form is nicer / more readable"), extending the
+  Aug-31 bind-or-bail idiom to bind-or-default. The 12 real-work + 4
+  negative-test matches stay by design. Model on the Aug-31 sweep.
+  Acceptance: per-case transcripts byte-identical except
+  `entry=`/`epc=` address rows + the thread_preempt / timer_interval
+  timing rows.
+  **CLOSED (Sep 1, branch `worktree-agent-a1da569722b01aee8`):** 95
+  sites converted across 33 test packages — 80 statement-position
+  (`try f() catch { <bail> }`, the arm's bound `e` becoming the
+  implicit `error`, every print string untouched) and 15 fold
+  (`try f() catch { <value> }`). Control-flow only: same call, same
+  order, same text. Census reconciled against the Aug-31 record, every
+  delta from M4 unit 1 (the only work to land between the sweep and
+  this pass): statement 75 -> 80, the five new ones all `pipe-child`;
+  real-work keeps 12 -> 14 (`child-post`'s drain arm, `pipe-child`'s
+  inlet give); negative-test keeps 4 -> 9 (`pipe-no-post`,
+  `pipe-oversized`, `pipe-peer-gone` x3).
+  **THE FOLD COUNT IS 15, NOT 25, AND THE 25 WAS AN OVER-COUNT.** The
+  Aug-31 census keyed on the ERR arm being a bare value; that finds 26
+  sites today (the extra one being `handle-drop-release`'s inner match,
+  nested in its outer site's Ok arm and evidently counted with it). But
+  the fold needs the OK arm too — the bound payload itself — and only
+  15 have it. Of the other 11, ten are success PREDICATES
+  (`case Ok(_) -> true, case Err(_) -> false`) whose Ok arm DISCARDS the
+  payload for a different value, which bind-or-default cannot express,
+  and one is `handle-drop-release`'s outer site, whose Ok arm is a block.
+  All eleven are KEEPS under this entry's own "if an arm does real
+  distinct work" clause. Keeps therefore total 33, not 16: 14 real-work,
+  9 negative-test, 10 predicate. Two comments describing the old shape
+  were retargeted (`event-basics`' "the arm exists to", `thread-basics`'
+  DF-178e note); no other comment moved.
+  Gate: `make sos-test` GREEN — `ALL SOS TESTS PASSED (170 passed across
+  riscv32 + arm64)`, exit 0, 85 cases per arch. The runner asserts every
+  transcript verbatim, so full green IS the byte-identical oracle this
+  entry asks for; no expectation was touched. sawlang HEAD `23ce9b21`
+  (the dispatch sha) at the gate.
+  **REMAINDER FOR THE LEAD:** CLAUDE.md's idiom paragraph still ends
+  "The 75 statement-position + 25 fold sites kept during the ICE era are
+  a queued conversion pass" — stale now, and its `25` is the over-count
+  above. One line, the lead's to write.
+  INTEGRATED to main Sep 1 2026 (lead-reviewed, lead gate re-run
+  170/170 under sawlang HEAD 87063387, fast-forward 721e2fe; the
+  lead remainder executed in the integration commit — CLAUDE.md now
+  records the tree as fully converted with 33 by-design keeps).
