@@ -1054,11 +1054,11 @@ static_assert((MappingRight.Unmap as UInt32) >= (1 << 8),
 /// send, timeout and TELL are all LIBRARY compositions over it, so there is no
 /// second door for a bit to gate.
 ///
-/// **A `Wait` BIT ARRIVES WITH WAITABILITY** (unit 3), and its absence here is a
-/// scope line rather than a decision: attaching an endpoint to a Waiter spends a
-/// right, and which right that is cannot be answered before there is a readiness
-/// to observe. `waitable_slot` refuses both kinds with `NotWaitable` today and
-/// says so at the arm.
+/// **THE `Wait` BIT ARRIVED WITH WAITABILITY** (M4 unit 3, sawos design 15). Its
+/// absence through units 1 and 2 was a scope line rather than a decision —
+/// attaching an endpoint to a Waiter spends a right, and which right that is
+/// could not be answered before there was a readiness to observe — and
+/// `waitable_slot`'s `NotWaitable` arms for both kinds are gone.
 ///
 /// `Transfer` is minted because handing a child one end of a connection is the
 /// whole point of the pair (design 13's `pipe-child` proof), and `Mint` on the
@@ -1129,10 +1129,10 @@ static_assert((PipeOutletRight.Wait as UInt32) >= (1 << 8),
 /// design 14).
 ///
 /// **ONE KIND-SPECIFIC BIT, NAMED FOR ITS OP** (the Aug-29 doctrine): `Resolve`
-/// gates the one op a claim carries. A `Wait` bit — the reply-ready level §2.2
-/// owes — arrives with waitability in unit 3, and its absence here is a scope
-/// line rather than a decision: `waitable_slot` refuses this kind with
-/// `NotWaitable` today and says so at the arm.
+/// gates the one op a claim carries. **THE `Wait` BIT — the reply-ready level
+/// §2.2 owed — ARRIVED WITH WAITABILITY** (M4 unit 3, sawos design 15), and it
+/// is the sharpest of the four: a claim's delivery carries the reply's own
+/// BYTES, so attaching one replaces resolving it.
 ///
 /// `Transfer` is minted because a claim is a capability like any other and §2.1
 /// ratifies both one-shots as transferable. `Mint` is minted on the uniform lean
@@ -1169,10 +1169,10 @@ static_assert((PipeReplyRight.Wait as UInt32) >= (1 << 8),
 ///
 /// The mirror of `PipeReplyRight` with the verb changed, and the change of verb
 /// is the whole difference between the two halves of a pair: a claim resolves,
-/// an obligation replies. Everything `PipeReplyRight` says about the missing
-/// `Wait` bit (the request-abandoned level is unit 3's), about `Transfer` — here
-/// it is §2.1's DELEGATION PRIMITIVE rather than a convenience — and about
-/// `Mint` holds word for word.
+/// an obligation replies. Everything `PipeReplyRight` says about the `Wait` bit
+/// (here it gates the request-abandoned level — §2.1's ratified early notice),
+/// about `Transfer` — here it is §2.1's DELEGATION PRIMITIVE rather than a
+/// convenience — and about `Mint` holds word for word.
 ///
 /// The bits overlap `PipeReplyRight`'s and that is sound for the reason the
 /// endpoint pair's do: a rights word is only ever read against its handle's
@@ -2155,9 +2155,12 @@ public enum PipeOutletOp: UInt {
 /// **ONE OP, NONBLOCKING, AND IT CONSUMES.** `resolve` answers the reply bytes if
 /// they are there — consuming the claim's entry with them — `SosStatus.WouldBlock`
 /// while the exchange is still pending, and `SosStatus.PeerClosed` when the server
-/// side abandoned it. The blocking `send(msg)` / `send(msg, timeout:)`
-/// compositions are unit 3's, when there is something to park on: ruling 4's
-/// ladder again, and the reason unit 2's proofs poll.
+/// side abandoned it. **THE BLOCKING `send(msg)` / `send(msg, timeout:)`
+/// COMPOSITIONS ARE BUILT ON TOP OF IT AND DO NOT USE IT** (M4 unit 3, sawos
+/// design 15): ruling 11(a) put the reply in the WAIT RECORD, so a client that
+/// attaches its claim never resolves at all, and this op is the polling door
+/// that remains for a caller that chose it. A claim whose answer was delivered
+/// through a wait answers `PeerClosed` here — there is no second copy.
 ///
 /// Its arguments are (buffer, capacity) and its value is the reply's LENGTH —
 /// `PipeOutletOp.Take`'s unit-1 shape, reused verbatim on the way back.
