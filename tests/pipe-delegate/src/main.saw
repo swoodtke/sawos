@@ -1,0 +1,223 @@
+// SOS M4 unit 2: THE DELEGATION PRIMITIVE, ACROSS A PROCESS BOUNDARY (sawos
+// design 14; spec §2.1's ratified zero-copy example, §12).
+//
+// **A SERVER MAY MOVE ITS OBLIGATION TO A THIRD PARTY WHO REPLIES DIRECTLY.**
+// That sentence has been ratified since Jul 29 and had nothing to be true of
+// until the one-shot pair existed. Here it is, at its smallest: root posts a
+// question, takes the obligation off its own outlet, and `give`s that obligation
+// to a child which holds NO END OF THE CONNECTION AT ALL. The child answers, and
+// the bytes land at root's claim.
+//
+//   SOS delegate: created          the pair, and a child to hand work to
+//   SOS delegate: gave the request the obligation crossed the boundary
+//   SOS childreply: replied        ...and was discharged over there
+//   SOS delegate: reply len=4 b=68,79,78,69   `DONE`, read at the client
+//
+// **WHAT THE CHILD CANNOT DO IS THE POINT.** It has no inlet, no outlet and no
+// way to name root's pipe; it cannot post, cannot take, and cannot answer any
+// question but this one. The obligation is the whole of its authority, and it
+// knows where the answer goes — which is why §2.1's filesystem can forward a read
+// to a flash driver without the payload ever transiting the filesystem.
+//
+// **THE ORDER IS THE CLAIM.** The child's reply, its exit and its teardown all
+// come BEFORE root reads the bytes: root's first resolve necessarily answered
+// `Ok(None)` (the child was runnable and had not run), so root parked on a timer
+// and the child ran to completion. A reply lives in the exchange's own ring slot,
+// so it outlives the process that wrote it exactly as a staged message outlives
+// its sender.
+//
+// `code={four}` and `len=4` are the SAME FACT from the two sides of the boundary.
+//
+// **THE POLL IS BOUNDED AND PARKS BETWEEN ROUNDS.** Unit 2 has no waitable claim
+// — that is unit 3 — so what root waits on is a TIMER, and a spin would be a hang
+// the deadlock report could not see.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
+            Clock, ClockType, Timer, Waiter, SosStatus, SystemRight,
+            PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The key root attaches its timer under. A number that appears nowhere else in
+/// the transcript.
+static KEY: UInt = 83
+
+/// Five milliseconds per poll round — long enough for the child to be scheduled,
+/// drain one record, reply and exit, and short enough that a broken run ends
+/// rather than hanging.
+static PARK_NS: UInt64 = 5_000_000
+
+/// The ceiling on the poll. A run that needs more than this has a bug, and
+/// printing a miss is a better failure than a spin.
+static POLL_ROUNDS: Int = 8
+
+/// ROOT'S CONFIG, and the whole of the contract with the child. `child-reply`
+/// expects exactly these words; the kernel supplies no meaning for either.
+static TAG_BOOT: UInt = 7
+static TAG_REQUEST: UInt = 11
+
+/// What a child of this launcher may ask its System object for: print, learn its
+/// own Process object, and pass a handle on. `Transfer` is in the mask for the
+/// reason `give-boot-drain` records — it is the ticket the give itself checks.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS delegate: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    var image = try proc.boot_handle_next() catch {
+        print("SOS delegate: no image region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var dest = try proc.boot_handle_next() catch {
+        print("SOS delegate: no destination region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let image_mem = image.take_memory()!
+    let dest_mem = dest.take_memory()!
+
+    let child = try system.process_create(image: &image_mem,
+                                          memory: &dest_mem) catch {
+        print("SOS delegate: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let pair = try proc.pipe_create() catch {
+        print("SOS delegate: pipe create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let (inlet, outlet) = move pair
+    let _ = system.debug_print("SOS delegate: created\n")
+
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 63
+
+    // ROOT ASKS ITS OWN QUESTION, and takes it off its own outlet. Both ends are
+    // root's; what crosses the boundary is neither of them.
+    let staged = try inlet.post(body: &msg, len: 1) catch {
+        print("SOS delegate: post failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard var claim = move staged else {
+        let _ = system.debug_print("SOS delegate: fresh ring refused a post\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let taken = try outlet.take(into: &var buf) catch {
+        print("SOS delegate: take failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let (_, request) = move taken else {
+        let _ = system.debug_print("SOS delegate: nothing staged\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM) catch {
+        print("SOS delegate: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        print("SOS delegate: give system failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    // THE GIVE CONSUMES THE WRAPPER, so root cannot answer its own question below
+    // this line — which is the whole of what delegation means. The exchange is
+    // untouched by the move: an obligation names a RING SLOT, and a give changes
+    // only which table names the obligation.
+    match child.give(request: move request, tag: TAG_REQUEST) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS delegate: gave the request\n")
+        },
+        case Err(e) -> {
+            print("SOS delegate: give request failed: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+
+    try child.start(boot_tag: TAG_BOOT) catch {
+        print("SOS delegate: start failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // The parking machinery. Unit 2 has no waitable claim — that is unit 3 — so
+    // what root waits on is a TIMER, and the poll is what stands in for the
+    // blocking `send` the ladder has not reached yet.
+    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
+        print("SOS delegate: no clock: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let waiter = try proc.waiter_create() catch {
+        print("SOS delegate: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let timer = try clock.timer_create() catch {
+        print("SOS delegate: no timer: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try waiter.add(&timer, KEY) catch {
+        print("SOS delegate: attach failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    var length: UInt = 0
+    var have = false
+    var rounds: Int = 0
+    while (not have) && rounds < POLL_ROUNDS {
+        rounds = rounds + 1
+        let got = try claim.resolve(into: &var buf) catch {
+            print("SOS delegate: resolve refused: {}\n", error)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        if let n = got {
+            length = n
+            have = true
+        } else {
+            try timer.arm(after_ns: PARK_NS) catch {
+                print("SOS delegate: arm failed: {}\n", error)
+                let _ = system.shutdown(EXIT_FAILED)
+                return
+            }
+            try waiter.wait() catch {
+                print("SOS delegate: wait failed: {}\n", error)
+                let _ = system.shutdown(EXIT_FAILED)
+                return
+            }
+        }
+    }
+
+    if not have {
+        let _ = system.debug_print("SOS delegate: nothing came back\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS delegate: reply len={} b={},{},{},{}\n", length,
+          buf[0] as UInt, buf[1] as UInt, buf[2] as UInt, buf[3] as UInt)
+
+    print("SOS delegate: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

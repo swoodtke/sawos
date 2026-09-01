@@ -1,0 +1,88 @@
+// SOS M4 unit 2: A REPLY BIGGER THAN THE SLOT (sawos design 14; spec §2.1).
+//
+// **THE REPLY RIDES THE REQUEST'S OWN SLOT**, which is design 10 ruling 4's rider
+// made mechanical ("ruling 6's fixed slots carry the reply") — so the answer's
+// maximum is the question's maximum, one number, `PIPE_BODY_BYTES`. A caller
+// cannot even declare the buffer without it, so a `len` above it is a mistake the
+// process could have checked, and design 178's faults ruling puts that outside
+// the status enum entirely. It is `pipe-oversized`'s line, running outward.
+//
+//   SOS bigreply: asking for 129
+//   SOS: process fault: argument outside its domain
+//
+// **THE CHECK IS BEFORE THE COPY AND BEFORE THE CONSUME**, which is what makes
+// the refusal safe rather than merely correct: nothing is read out of the
+// caller's memory, the staging slot is untouched, and the obligation is NOT
+// discharged — a hostile length is a diagnostic, never a partial write and never
+// an exchange quietly closed.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
+            SosStatus, PIPE_BODY_BYTES}
+
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS bigreply: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let pair = try proc.pipe_create() catch {
+        print("SOS bigreply: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let (inlet, outlet) = move pair
+
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 1
+
+    let staged = try inlet.post(body: &msg, len: 1) catch {
+        print("SOS bigreply: post failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let claim = move staged else {
+        let _ = system.debug_print("SOS bigreply: fresh ring refused a post\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let taken = try outlet.take(into: &var buf) catch {
+        print("SOS bigreply: take failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let (_, request) = move taken else {
+        let _ = system.debug_print("SOS bigreply: nothing staged\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var obligation = move request
+
+    // ONE BYTE PAST THE SLOT. The buffer this names is a whole slot wide, so
+    // nothing here is out of bounds in the caller's own memory — what is out of
+    // bounds is the ASK, which is the only thing the kernel is being told.
+    let too_much: UInt = (PIPE_BODY_BYTES as UInt) + 1
+    print("SOS bigreply: asking for {}\n", too_much)
+
+    match obligation.reply(body: &msg, len: too_much) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS bigreply: an oversized reply was sent\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        // UNREACHABLE: the kernel ends this process at the length check, so
+        // neither arm runs. Written so the refusal reads as a refusal.
+        case Err(e) -> {
+            print("SOS bigreply: reply refused: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+}

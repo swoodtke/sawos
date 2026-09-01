@@ -1,0 +1,178 @@
+// SOS M4 unit 2: ABANDONMENT, IN THREE DIRECTIONS (sawos design 14 D-2; spec
+// §2.1's ratified abandonment paragraph; `designs/010` ruling 2).
+//
+// **NOTHING IS SILENTLY DOOMED.** The peer-gone doctrine reaches the one-shot
+// pair here, and there are exactly three ways an exchange can end with nobody on
+// the other side. Each is a DELIVERED ANSWER — `SosStatus.PeerClosed`, the same
+// word the connection's own zero-arms use — and never a strand:
+//
+//   THE CLIENT DROPS ITS CLAIM. The server's `reply` is told, and its obligation
+//   is DISCHARGED EITHER WAY (§2.1: never a silent success, ignorable with
+//   `let _ =` on the std-Channel close precedent). That is the cancellation
+//   primitive: there is no `cancel()` verb, only a claim going out of scope, and
+//   whether it cancels anything is the protocol's decision rather than the
+//   kernel's.
+//
+//   THE SERVER DROPS ITS OBLIGATION. The client's `resolve` is told. No hung
+//   clients and no timeout hacks — the ratified sentence, executing.
+//
+//   THE SERVER END OF THE CONNECTION GOES while a message is still staged. Its
+//   obligation will never be minted, so the claim is abandoned by a server that
+//   never existed, and `resolve` says so.
+//
+// **EACH ANSWER SPENDS ITS CAPABILITY**, which is what makes "nothing un-closes"
+// read differently here than it does on a connection. A connection's
+// `PeerClosed` is a LEVEL a caller may re-read for ever; an exchange's is the end
+// of that exchange, so the one-shot is consumed with it and asking again is a
+// dead handle rather than a repeat. `pipe-dead-claim` is that fault, proved on
+// its own because it ends the process.
+//
+// THE STATUSES ARE NAMED, NOT NUMBERED — the program prints the ABI enum's own
+// `describe()`, so a case added without a describe arm would not compile and a
+// renumbering of the wire table would not move this transcript.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
+            SosStatus, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS abandon: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let pair = try proc.pipe_create() catch {
+        print("SOS abandon: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let (inlet, outlet) = move pair
+    let _ = system.debug_print("SOS abandon: created\n")
+
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+
+    // =========================================================================
+    // ARM ONE — THE CLIENT ABANDONS. Post, take, drop the claim, and the reply
+    // that follows is told there is nobody to receive it.
+    // =========================================================================
+    msg[0] = 1
+    let staged = try inlet.post(body: &msg, len: 1) catch {
+        print("SOS abandon: post failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let claim = move staged else {
+        let _ = system.debug_print("SOS abandon: fresh ring refused a post\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var obligation = try take_one(&outlet, &var buf) catch {
+        print("SOS abandon: take failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // **DROP IS THE CANCELLATION.** There is no `cancel()` verb: releasing the
+    // claim is the whole of saying "never mind", and deterministic destruction is
+    // what makes the timing of the signal deterministic too.
+    let _ = move claim
+
+    match obligation.reply(body: &msg, len: 1) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS abandon: a reply landed on nobody\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        case Err(e) -> { print("SOS abandon: reply says {}\n", e) },
+    }
+
+    // =========================================================================
+    // ARM TWO — THE SERVER ABANDONS. Post, take, drop the obligation, and the
+    // client is told rather than left waiting for an answer that cannot come.
+    // =========================================================================
+    msg[0] = 2
+    let second = try inlet.post(body: &msg, len: 1) catch {
+        print("SOS abandon: second post failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard var pending = move second else {
+        let _ = system.debug_print("SOS abandon: second post refused\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let dropped = try take_one(&outlet, &var buf) catch {
+        print("SOS abandon: second take failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = move dropped
+
+    match pending.resolve(into: &var buf) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS abandon: a reply arrived from nobody\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        case Err(e) -> { print("SOS abandon: resolve says {}\n", e) },
+    }
+
+    // =========================================================================
+    // ARM THREE — THE SERVER END GOES WHILE THE MESSAGE IS STILL STAGED. Its
+    // obligation was never minted and now never can be, so the claim is abandoned
+    // by a server that never existed. A second connection, because this one kills
+    // an end.
+    // =========================================================================
+    let other = try proc.pipe_create() catch {
+        print("SOS abandon: second create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let (client, server) = move other
+
+    msg[0] = 3
+    let never = try client.post(body: &msg, len: 1) catch {
+        print("SOS abandon: staged post failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard var orphan = move never else {
+        let _ = system.debug_print("SOS abandon: staged post refused\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // The last outlet handle goes, so nobody can ever take what is staged — and
+    // the claim on it is owed an answer it will never get. The kernel derives
+    // that from the connection's own outlet column rather than from a flag: a
+    // staged exchange with no server end IS an abandoned one.
+    let _ = move server
+
+    match orphan.resolve(into: &var buf) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS abandon: a dead outlet answered\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        case Err(e) -> { print("SOS abandon: staged claim says {}\n", e) },
+    }
+
+    print("SOS abandon: done\n")
+    let _ = proc.exit(EXIT_OK)
+}
+
+/// Take one message and hand its obligation back, refusing an empty ring as an
+/// error — every take here has a message waiting by construction.
+func take_one(outlet: &PipeOutlet,
+              buf: &var [UInt8; PIPE_BODY_BYTES]) -> Result<PipeRequest, SosStatus> {
+    let got = try outlet.take(into: &var buf)
+    guard let (_, request) = move got else { return SosStatus.WouldBlock }
+    return move request
+}

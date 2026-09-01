@@ -1,0 +1,101 @@
+// SOS M4 unit 2: AN UNSPENT RIGHT ON AN OBLIGATION (sawos design 14; spec §3).
+//
+// **THE ATTENUATION PROOF FOR THE ONE-SHOT KINDS.** `pipe_request_rights()` mints
+// `Transfer | Mint | Reply`, and it HAS TO be permissive — §3's attenuation is
+// monotonic, so a bit not minted at the take could never appear later by any
+// sequence of ops. Which means the narrowing is the HOLDER's, written once at a
+// `MINT_OP` keep mask, and this program is that sentence executed:
+//
+//   SOS noreply: minted without Reply    an obligation that may travel on
+//   SOS: process fault: access denied    ...and may not be discharged
+//
+// **THAT MASK IS THE DELEGATION POLICY.** §2.1's zero-copy example hands a
+// request handle to a third party who answers the original client; a server that
+// wants a courier rather than an answerer gives it exactly this sibling —
+// `Transfer` and nothing else — and the courier can pass the obligation along and
+// can never speak for it.
+//
+// **IT IS A FAULT AND NOT A STATUS** (design 178's faults ruling): a process
+// knows which rights it holds, so spending one it was not given is a mistake it
+// could have checked. The kernel terminates it and stays up to say so.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
+            SosStatus, PipeRequestRight, PIPE_BODY_BYTES}
+
+static EXIT_FAILED: UInt = 1
+
+/// **THE KEEP MASK, AND `Reply` IS ABSENT BY SILENCE.** Two bits, reading as the
+/// policy they are: this obligation may be handed on and may be narrowed further,
+/// and may not be discharged.
+static NO_REPLY: UInt32 = (PipeRequestRight.Transfer | PipeRequestRight.Mint)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS noreply: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let pair = try proc.pipe_create() catch {
+        print("SOS noreply: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let (inlet, outlet) = move pair
+
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 1
+
+    let staged = try inlet.post(body: &msg, len: 1) catch {
+        print("SOS noreply: post failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let claim = move staged else {
+        let _ = system.debug_print("SOS noreply: fresh ring refused a post\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let taken = try outlet.take(into: &var buf) catch {
+        print("SOS noreply: take failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let (_, request) = move taken else {
+        let _ = system.debug_print("SOS noreply: nothing staged\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    var narrowed = try request.mint(rights: NO_REPLY) catch {
+        print("SOS noreply: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS noreply: minted without Reply\n")
+
+    // A SECOND NAME IS A SECOND REFERENCE on this exchange's request column, so
+    // the original obligation is still perfectly able to answer — what is refused
+    // is THIS handle, which is what makes attenuation per-capability rather than
+    // per-object.
+    match narrowed.reply(body: &msg, len: 1) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS noreply: an unspent right replied\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        // UNREACHABLE: the line above does not return, because the kernel ends
+        // this process at the rights check. The arm is written so the refusal
+        // reads as a refusal rather than as a missing case.
+        case Err(e) -> {
+            print("SOS noreply: reply refused: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+}

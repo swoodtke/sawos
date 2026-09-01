@@ -351,6 +351,26 @@ CHILD_POST_PKG = os.path.join(TESTS_DIR, "child-post")
 PIPE_NO_POST_PKG = os.path.join(TESTS_DIR, "pipe-no-post")
 PIPE_OVERSIZED_PKG = os.path.join(TESTS_DIR, "pipe-oversized")
 
+# sawos design 14 (M4 unit 2): the one-shot pair. THREE root servers, ONE child
+# and THREE negative arms, and the split is the same house rule the unit-1 block
+# above states — a rights refusal, a bad-argument refusal and a dead-handle
+# refusal are all FAULTS, and a fault ends the process, so none of the three can
+# share an image with each other or with anything that has work left to do.
+#
+# **`pipe-oneshot` IS ONE PROCESS PLAYING BOTH SIDES, DELIBERATELY.** The whole
+# exchange — claim, obligation, would-block, reply, out-of-order replies, and the
+# ring counted around ONE unsettled exchange — is provable inside one address
+# space with both ends in one hand, exactly as unit 1's data path was. That is
+# what leaves `pipe-delegate` free to be a proof about the OBLIGATION CROSSING A
+# BOUNDARY rather than a second copy of the exchange.
+PIPE_ONESHOT_PKG = os.path.join(TESTS_DIR, "pipe-oneshot")
+PIPE_ABANDON_PKG = os.path.join(TESTS_DIR, "pipe-abandon")
+PIPE_DELEGATE_PKG = os.path.join(TESTS_DIR, "pipe-delegate")
+CHILD_REPLY_PKG = os.path.join(TESTS_DIR, "child-reply")
+PIPE_NO_REPLY_PKG = os.path.join(TESTS_DIR, "pipe-no-reply")
+PIPE_BIG_REPLY_PKG = os.path.join(TESTS_DIR, "pipe-big-reply")
+PIPE_DEAD_CLAIM_PKG = os.path.join(TESTS_DIR, "pipe-dead-claim")
+
 CLOCK_BASICS_PKG = os.path.join(TESTS_DIR, "clock-basics")
 TIMER_ONESHOT_PKG = os.path.join(TESTS_DIR, "timer-oneshot")
 TIMER_INTERVAL_PKG = os.path.join(TESTS_DIR, "timer-interval")
@@ -3019,6 +3039,194 @@ TEST_CASES = [
                        "SOS oversized: asking for 129",
                        "SOS: process fault: argument outside its domain "
                        "process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    # =========================================================================
+    # M4 unit 2 — the one-shot pair (sawos design 14)
+    # =========================================================================
+    {
+        # **THE WHOLE EXCHANGE, IN ONE PROCESS.** Root plays both sides, so every
+        # row below is about the PAIR rather than about scheduling — nothing
+        # parks, nothing is given.
+        #
+        # `request len=3 b=65,66,67` is the take answering TWO things: the bytes,
+        # and (invisibly here, provably below) the obligation to reply to them.
+        #
+        # `pending is none` is the typed tier's two channels at the reply end: a
+        # resolve before an answer exists is `Ok(None)` and consumes NOTHING, so
+        # the same claim polls again. A shape that reported it as an error would
+        # make the poll loop unwritable, and a shape that consumed the claim would
+        # make it impossible.
+        #
+        # `reply len=2 b=90,89` and `zero reply len=0` are the two halves of one
+        # distinction on the way back — a reply that carries no data is an ANSWER,
+        # not an absence — which is the request side's `empty message len=0`
+        # mirrored.
+        #
+        # `fifo replies a=11 b=22 c=33` is THREE EXCHANGES IN FLIGHT AT ONCE,
+        # answered OUT OF ORDER (2, 3, 1) and resolved in order. A kernel with one
+        # reply slot per connection rather than per exchange would print the same
+        # digit three times; one that keyed replies by queue position would print
+        # them permuted.
+        #
+        # **`depth with one in flight=15` AND `depth settled=16` ARE THE UNIT'S
+        # SHARPEST CLAIM** (design 14 D-1). A ring slot lives until its exchange
+        # SETTLES, not until its bytes are taken — so ONE unsettled exchange costs
+        # ONE slot, and discharging it gives the slot back. The program never
+        # names `PIPE_INFLIGHT`: it counts twice, around a held exchange, and the
+        # DIFFERENCE is what a kernel that freed at the take could not produce.
+        "name": "pipe_oneshot",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_ONESHOT_PKG,
+        "expect_out": ["{banner}",
+                       "SOS oneshot: created",
+                       "SOS oneshot: request len=3 b=65,66,67",
+                       "SOS oneshot: pending is none",
+                       "SOS oneshot: reply len=2 b=90,89",
+                       "SOS oneshot: zero reply len=0",
+                       "SOS oneshot: fifo replies a=11 b=22 c=33",
+                       "SOS oneshot: depth with one in flight=15",
+                       "SOS oneshot: depth settled=16",
+                       "SOS oneshot: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **ABANDONMENT IS INFORMATION, NOT AN IMPERATIVE** (spec §2.1, ratified;
+        # sawos design 14 D-2). Three ways an exchange ends with nobody on the
+        # other side, and every one of them is a DELIVERED ANSWER:
+        #
+        #   `reply says …`         the client dropped its claim, and the server's
+        #                          obligation is discharged all the same — §2.1's
+        #                          "never a silent success"
+        #   `resolve says …`       the server dropped its obligation, and the
+        #                          client is told rather than left waiting
+        #   `staged claim says …`  the connection's SERVER END went while the
+        #                          message was still staged, so the obligation
+        #                          could never be minted
+        #
+        # THE THIRD IS THE DERIVED ONE and is why the columns are the state: the
+        # kernel reads `Staged` plus an outlet column at zero, with no flag
+        # anywhere saying "abandoned".
+        #
+        # THE STATUSES ARE NAMED, NOT NUMBERED — the program prints the ABI enum's
+        # own `describe()`, so a renumbering of the wire table would not move this
+        # transcript and a case added without a describe arm would not compile.
+        "name": "pipe_abandon",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_ABANDON_PKG,
+        "expect_out": ["{banner}",
+                       "SOS abandon: created",
+                       "SOS abandon: reply says the other end of this "
+                       "connection is gone",
+                       "SOS abandon: resolve says the other end of this "
+                       "connection is gone",
+                       "SOS abandon: staged claim says the other end of this "
+                       "connection is gone",
+                       "SOS abandon: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **THE DELEGATION PRIMITIVE, ACROSS A REAL BOUNDARY** — §2.1's ratified
+        # zero-copy example, which had nothing to be true of until the one-shot
+        # pair existed (sawos design 14). Root asks its own question, takes the
+        # obligation off its own outlet, and GIVES that obligation to a child that
+        # holds no end of the connection at all.
+        #
+        # **WHAT THE CHILD CANNOT DO IS THE PROOF.** It cannot post, cannot take
+        # and cannot name root's pipe; the obligation is the whole of its
+        # authority, and it knows where the answer goes. That is the filesystem
+        # forwarding a read to the flash driver, at its smallest.
+        #
+        # **THE ORDER IS THE CLAIM.** `SOS childreply: replied`, the child's exit
+        # and its teardown all come BEFORE root reads the bytes — root's first
+        # resolve necessarily answered `Ok(None)` (the child was runnable and had
+        # not run), so root parked on a timer and the child ran to completion. So
+        # a reply outlives the process that wrote it, which is what putting it in
+        # the exchange's own ring slot buys.
+        #
+        # `code={four}` and `len=4` are the SAME FACT from the two sides of the
+        # boundary, and `b=68,79,78,69` is `DONE` in ASCII — the bytes, so that a
+        # status alone could not have passed this case.
+        "name": "pipe_delegate",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_DELEGATE_PKG,
+        "children": [CHILD_REPLY_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS delegate: created",
+                       "SOS delegate: gave the request",
+                       "SOS childreply: replied",
+                       "SOS: process exit: code={four} process={one}",
+                       "SOS: process teardown handles={two} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS delegate: reply len=4 b=68,79,78,69",
+                       "SOS delegate: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **AN UNSPENT RIGHT ON AN OBLIGATION** (spec §3). `pipe_no_post`'s claim
+        # made once more at the other end of the exchange: a one-shot's default
+        # set is permissive because attenuation is monotonic, so the narrowing is
+        # the holder's and it is written once at a `MINT_OP` keep mask.
+        #
+        # THE MASK IS THE DELEGATION POLICY. `Transfer | Mint` and nothing about
+        # `Reply` describes a COURIER — a delegate that may pass the obligation
+        # further along and may never speak for it — which is a thing §2.1's
+        # forwarding example genuinely wants to be able to say.
+        "name": "pipe_no_reply",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_NO_REPLY_PKG,
+        "expect_out": ["{banner}",
+                       "SOS noreply: minted without Reply",
+                       "SOS: process fault: access denied process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # **A REPLY BIGGER THAN THE SLOT** (spec §2.1's fixed body).
+        # `pipe_oversized`'s line running outward: the reply rides the SAME
+        # staging slot the request came in on (design 10 ruling 4's rider), so one
+        # published maximum governs both directions and overshooting it is a
+        # mistake the process could have checked.
+        #
+        # THE CHECK IS BEFORE THE COPY AND BEFORE THE CONSUME, which is the part
+        # worth a case of its own: a refused reply leaves the obligation
+        # UNDISCHARGED, so a hostile length cannot quietly close somebody's
+        # exchange.
+        "name": "pipe_big_reply",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_BIG_REPLY_PKG,
+        "expect_out": ["{banner}",
+                       "SOS bigreply: asking for 129",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # **CONSUMED IS CONSUMED** (spec §2.1's single-use; sawos design 14). A
+        # resolve that delivers destroys the caller's entry through the op —
+        # unbind, generation bump, unref, `RELEASE_OP`'s own two calls — so the
+        # word is stale the instant it returns and asking again is the ordinary
+        # `BadHandle` fault rather than a second answer.
+        #
+        # **THE TYPED LAYER MAKES THIS HARD TO REACH, WHICH IS WHY THE CASE
+        # EXISTS.** A `PipeReply` disarms itself when the kernel consumes it, so
+        # a spent claim drops to nothing and an ordinary program never meets this;
+        # the case asks a SECOND time through the same value to show the kernel's
+        # check is real underneath the wrapper's. Single use is a property of the
+        # LEDGER, and `NoCopy` is the ergonomics on top of it.
+        "name": "pipe_dead_claim",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_DEAD_CLAIM_PKG,
+        "expect_out": ["{banner}",
+                       "SOS deadclaim: resolved len=1",
+                       "SOS: process fault: bad handle process={zero}",
                        "SOS: process teardown handles="],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,

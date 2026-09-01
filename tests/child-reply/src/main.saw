@@ -1,0 +1,91 @@
+// SOS CHILD: THE FIRST PROCESS TO ANSWER A QUESTION IT WAS NEVER ASKED (sawos
+// design 14, M4 unit 2; spec §2.1, §12).
+//
+// It bootstraps exactly as every other child does — a masked System handle in
+// its first argument register, its own Process object derived from it, its boot
+// set drained from there — and the ONE new thing in it is what the set carries:
+// a `PipeRequest`, the OBLIGATION to send one reply.
+//
+// **IT HOLDS NO END OF ANY CONNECTION.** There is no inlet here and no outlet;
+// this process cannot post, cannot take, and cannot name the pipe the message
+// arrived on. What it has is the obligation, and the obligation knows where the
+// answer goes — which is exactly why §2.1 calls the one-shot pair THE DELEGATION
+// PRIMITIVE and why the canonical example (a filesystem forwarding a read to the
+// flash driver, whose bytes go straight to the client) needs nothing else.
+//
+// **AND THE ANSWER OUTLIVES IT.** The obligation is consumed by the reply, the
+// process exits, and the launcher resolves its claim AFTERWARDS — the transcript
+// shows the exit and the teardown before the bytes. A reply lives in the
+// exchange's own ring slot, so the replier's death takes nothing with it.
+//
+// The payload is `DONE` in ASCII, and the launcher asserts all four bytes: a
+// status alone would not have shown that the copy funnel carried the data.
+
+import sos.{System, Process, PipeRequest, BootHandle, BootHandleKind, SosStatus,
+            PIPE_BODY_BYTES}
+
+/// What it ends with when the boot set was not what the config promised. A
+/// number the transcript's `code=` field distinguishes on sight.
+static EXIT_NO_REQUEST: UInt = 97
+
+/// The reply, and the exit code that says how many bytes of it went.
+static PAYLOAD_LEN: UInt = 4
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS childreply: no process handle: {}\n", error)
+        return
+    }
+
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = 68
+    body[1] = 79
+    body[2] = 78
+    body[3] = 69
+
+    var replied = false
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                match rec.kind {
+                    case PipeRequest -> {
+                        if let request = rec.take_request() {
+                            var obligation = move request
+                            // **THE REPLY IS THE WHOLE OF THIS PROCESS.** It
+                            // consumes the obligation, so there is nothing left
+                            // to release afterwards and nothing to forget.
+                            try obligation.reply(body: &body,
+                                                 len: PAYLOAD_LEN) catch {
+                                print("SOS childreply: reply failed: {}\n", error)
+                                let _ = proc.exit(EXIT_NO_REQUEST)
+                                return
+                            }
+                            replied = true
+                        }
+                    },
+                    // A record of any other kind is a capability this child was
+                    // given and does not want: it drops at the end of this arm
+                    // and releases whatever it held.
+                    case _ -> {},
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+
+    if not replied {
+        let _ = system.debug_print("SOS childreply: no request in the boot set\n")
+        let _ = proc.exit(EXIT_NO_REQUEST)
+    }
+
+    let _ = system.debug_print("SOS childreply: replied\n")
+    // THE EXIT CODE IS THE PAYLOAD'S LENGTH, so the kernel's account of this
+    // process and the launcher's reading of the reply say the same number from
+    // the two sides of the boundary.
+    let _ = proc.exit(PAYLOAD_LEN)
+}
