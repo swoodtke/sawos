@@ -114,8 +114,10 @@ structural, not a rights mask to count by. Then:
   orphan write-off activates, references govern lifetime.
 - **Unit 3 — waitability.** The §2.2 arms — now FOUR with ruling 8
   (the inlet's room-to-post level joins the list) — plus ruling 9's
-  attachment pair (consume-detaches + `AttachMode.OneShot`, and the
-  two §2.2 amendments ride together): (server end
+  attachment pair (consume-detaches + `AttachMode.OneShot`), plus
+  ruling 11's delivery-payload record and
+  `AttachMode.OneShotConsuming` (the §2.2 and §2.1 amendments all
+  ride together): (server end
   readable, reply-ready, request-abandoned) + the peer-gone terminal
   levels through the notify machinery; the `send`/`send(timeout:)`
   LIBRARY compositions over post + wait + resolve become real here
@@ -127,7 +129,10 @@ structural, not a rights mask to count by. Then:
 - **Unit 4 — handles in messages.** Rendezvous transfer through the
   staged slot (a staged handle's refcount treatment is agenda ruling
   5), the delegation proof as transcript: request forwarded to a
-  third process, reply lands at the original client.
+  third process, reply lands at the original client. Plus ruling
+  11(d): the completion-queue server — persistent-consuming outlet
+  attach, delivery-as-take minting the request handle at the wait
+  (the same rendezvous census, including the quota-refusal arm).
 - **Unit 5 — the money shot.** The M3-unit-6 driver child grows a
   SERVER FACE: a sibling client child reads the UART through a pipe
   protocol instead of touching registers — driver-as-service, the
@@ -231,6 +236,34 @@ standing tail); the IOMMU driver (death-notification consumer 2).
    The proof is a ping-pong case that COUNTS TRAPS. Unit placement:
    unit-3 territory (wants the pair, the one-shots and the reply
    path); the unit brief places it.
+   **AMENDED (Sep 1, user, composing with ruling 11): `ReplyRecv` IS
+   REPLY-THEN-WAIT, not reply-then-receive-next.** The shape:
+   `ReplyRecv(request, reply_body, reply_handles[4], waiter)` —
+   discharge the request (consumed, ruling 9(a)), then park ON THE
+   WAITER exactly as a plain `wait` parks, resuming with ruling
+   11(d)'s delivery record (the next message, the minted request
+   handle). No direct park-on-outlet: the wake protocol stays
+   SINGULAR, the same property this rider already demanded of the
+   client side. `NO_HANDLE` for the request is the degenerate plain
+   wait, so the loop head is uniform — the first iteration and the
+   steady state are one call shape. TWO RETURN CHANNELS, kept
+   separate: the reply's status rides BESIDE the wait record, and a
+   `PeerClosed` reply (an abandoned client) does NOT abort the park —
+   obligation discharged, the loop continues; one dead client must
+   not stall the server. A single-connection server uses a
+   one-attachment waiter the sosrt wrapper owns (the client
+   composition's own precedent). PLACEMENT: the full form needs
+   handles-in-messages and delivery-minting, so it is UNIT 4's; a
+   data-only `ReplyRecv` may land with 3/3.5 and grow its handle
+   slots in unit 4 exactly as `Post` grew its claim return (§5.7).
+   Steady state: ONE TRAP PER MESSAGE — client `Call` and server
+   `ReplyRecv` symmetric at one trap each.
+   **REVIEW GATE (user, Sep 1): the proposed USER AND KERNEL APIs
+   for the fused paths, the consuming attach, and the delivery
+   record go to the user for review BEFORE they are committed.**
+   Usability of the whole pattern hangs on the spellings; the unit
+   3/3.5/4 briefs carry their proposed surfaces to the user first
+   and implementation waits on the nod.
 5. **RULED: a staged handle stays the SENDER's counted entry until
    receive**, transferred exactly at rendezvous — the ledger never
    has an in-flight limbo state, and an abandoned send unwinds with
@@ -340,6 +373,81 @@ standing tail); the IOMMU driver (death-notification consumer 2).
     a kernel allocation story — a Memory-backed slab-donation op is
     the capability-shaped candidate.
 
+11. **RULED (Sep 1, user): DELIVERY CARRIES THE PAYLOAD — the wait
+    record grows a body, and attach gains a CONSUMING mode.** The
+    pattern that motivated it: a client that attaches its
+    `PipeReplyHandle` to a Waiter and hands the claim over entirely —
+    the reply DATA arrives through the wait itself, so the handle is
+    functionally useless after the attach and holding it is pure
+    ceremony. Three parts, taken together:
+    (a) **The reply body rides the wait record.** `WaitResult` grows
+    from a word-sized record to a VARIABLE-SIZED one by kind, maxing
+    out at the message size (`PIPE_BODY_BYTES`, 128 — the user's own
+    sizing). The body is copied out during the winning `wait`'s
+    copy-out through the existing checked funnel — the kernel still
+    never touches another process's memory — and the ring slot
+    SETTLES AT DELIVERY (the resolve leg of the composition
+    disappears; `wait_record_bytes()` moves, which the vDSO
+    discipline makes free).
+    (b) **On a one-shot kind, delivery is inherently consuming** —
+    the claim settles, so the attachment detaches by 9(a)'s own
+    logic whatever mode was passed. Stated so nobody looks for a
+    persistent reading.
+    (c) **Consuming attach is a MOVE-TAKING `add` variant, not a
+    mode value** (amended same day, user's wrinkle): consuming is an
+    EFFECT change, and ruling 4's own mode-enum rejection applies —
+    a runtime flag can change neither a return type nor a Saw
+    function's effect — so the typed surface splits by signature:
+    the consuming `add` takes the wrapper BY MOVE (transfer-funnel
+    contract, sentinel disarm, the object provably dead at the call
+    site), while `AttachMode { Persistent, OneShot }` stays the
+    defaulted delivery-behavior parameter. The axes are ORTHOGONAL —
+    a 2x2, not a third mode value (`OneShotConsuming` as an enum
+    case is struck). Kernel-side one op with a flag bit is fine; the
+    split is a typed-surface requirement. The attach takes the
+    caller's handle entry through the transfer funnel and the
+    ATTACHMENT owns the object — kernel-side move, not a library
+    add+release, which would give the saved trap back. Legal on any
+    kind: on an Event it makes the attach-and-forget supervisor
+    deliberate (the attachment-owned husk becomes an opt-in state,
+    not an accident).
+    (d) **The OUTLET takes the same pattern — persistent + consuming
+    is the COMPLETION-QUEUE SERVER** (ruled Sep 1, the symmetry the
+    user named): a server attaches its `PipeOutlet` consuming and
+    persistent, and every incoming message flows out through `wait`
+    itself — the delivery IS the take, so the record carries the
+    message AND MINTS the `PipeRequestHandle` into the wait-caller's
+    table at delivery. The multiplexed server drops from
+    wait+take+reply (three traps per RPC) to wait+reply (two), holds
+    ZERO outlet handles for N connections, and hanging up IS
+    destroying the subscription: the attachment holds `outlet_refs`,
+    so waiter-death or removal drops the server end to zero and
+    clients answer `PeerClosed`. `ReplyRecv` keeps the
+    single-connection steady loop at one trap; the two serve
+    different shapes. PLACEMENT: delivery-minting is
+    rendezvous-at-receive (§2.1: handles enter the receiver's table
+    only at receive), so this half rides UNIT 4 with the rendezvous
+    census — including the stated arm for a wait-caller whose handle
+    quota cannot accept the mint at delivery — while unit 3 lands
+    the data-only reply delivery of (a). RECORD SIZING, the user's
+    own: `WaitResult` maxes at the reply's (128 body bytes + 4
+    message handles) plus the server delivery's one request handle —
+    variable-sized by kind, the few extra bytes accepted as the cost
+    of the symmetry.
+    Consequences pinned with it: the multiplexed client is post →
+    attach-consuming → wait, THREE traps and ZERO held reply handles
+    however many requests are outstanding (the fused `Call` still
+    wins at one trap for the plain blocking case — this serves the
+    select loop); and §2.1's abandonment sentence re-words to the
+    LAST REFERENCE — a handle drop with a live attachment is not
+    abandonment (the subscription is the interested party), while
+    removing the attachment or the Waiter dying before delivery
+    drops the last reference and signals cancellation, which is
+    exactly what destroying a subscription should mean. The
+    amendments ride units 3 and 4 beside ruling 8's and 9's. Parts
+    (a)-(c) land in UNIT 3 with the rest of waitability; part (d)
+    lands in UNIT 4 with rendezvous transfer.
+
 ## As ruled
 
 Aug 30 (user): ALL SEVEN ITEMS RULED — this sketch is the PLAN OF
@@ -353,5 +461,16 @@ deferred; 8 (Aug 31) the inlet's room-to-post waitable level; 9
 (Aug 31) one-shot attachments — consume-detaches mandatory,
 `AttachMode.OneShot` opt-in; 10 (Aug 31) references govern lifetime
 — teardown writes off, never force-frees a counted kind (rider on
-unit 2; growable-pool M5 seed parked). Unit briefs are authored per
-the M3 process; M4 started Aug 31.
+unit 2; growable-pool M5 seed parked); 11 (Sep 1) delivery carries
+the payload — `WaitResult` variable-sized by kind (max: 128 body
+bytes + 4 message handles + the server delivery's request handle),
+the ring slot settles at delivery, consuming attach is a MOVE-TAKING
+`add` variant orthogonal to `AttachMode { Persistent, OneShot }`,
+abandonment re-worded to the last reference, and the
+persistent-consuming outlet is the completion-queue server — (a)-(c)
+unit 3, (d) unit 4 with rendezvous. Ruling 4's rider amended Sep 1:
+`ReplyRecv` is REPLY-THEN-WAIT (one wake protocol, NO_HANDLE
+degenerate, two-channel return; full form unit 4). REVIEW GATE: the
+fused/attach/delivery API spellings — user and kernel both — go to
+the user before commit. Unit briefs are authored per the M3 process;
+M4 started Aug 31.

@@ -557,3 +557,66 @@ repo's first done file; sawos was born Aug 28 (sawlang#238).
   fast-forward b42ae85). The CLAUDE.md Testing addendum accepted as a
   necessary deviation: the gate's default mode changed, so the two
   timing-row cases are named where the transcript tradition is stated.
+- M4 unit 2 — the one-shot pair [#10 rulings 4/9(a)/10, §2.1 ratified,
+  #14 — designs/014-one-shot-pair.md, authored Sep 1]:
+  PipeReply/PipeRequest as two counted kinds over one RING SLOT (two
+  more ref columns, D-1's no-third-slab), Post grows its claim return
+  and Take grows the obligation beside the message, Resolve/Reply each
+  CONSUMING the caller's entry, abandonment derived from the columns in
+  both directions, transferable so §2.1's delegation example runs across
+  a process boundary. **Plus ruling 10's rider**: the teardown's
+  by-charged-process force-free arms for the counted kinds deleted and
+  D-4's write-off activated. Everything still polls; nothing parks.
+  **CLOSED Sep 1 — LANDED.** Suite 182/182 (91 cases/arch, both
+  profiles) from 170/170; whole-transcript diff bucketed in the design's
+  As-built, and every one of the 170 pre-existing case rows is
+  BYTE-IDENTICAL in mark, name AND index — the only movement in them is
+  the `[n/85]` -> `[n/91]` denominator, plus image SIZES (all 73 riscv32
+  images by +64..+1168, five arm64 images by one page and 68 not at
+  all). VALIDATED ON sawlang 0.3.0 at `87063387`, the pin's version, for
+  both the baseline and the gate. **`pipe-basics`' ring-depth rows did
+  NOT move** — the brief authorized a move with argument and none was
+  needed: that case tells and discharges at every step, so its exchanges
+  settle exactly where unit 1's slots freed. What landed: two `ObjType`
+  kinds targeting an EXCHANGE (`connection * PIPE_INFLIGHT + ring slot`)
+  with two reference columns, four `.bss` arrays beside `PIPE_LENS`, a
+  four-state `ExchangeState`, `PipeSlot` trading `head`/`count` for a
+  staged FIFO list (slots settle out of order, so occupancy is per-slot),
+  `PipeReplyOp.Resolve` / `PipeRequestOp.Reply` on new rights enums,
+  `Take` answering through a two-word record, give + boot drain for both
+  kinds, typed `NoCopy` wrappers that disarm on consume, and two more
+  `NotWaitable` arms unit 3 removes. SIX cases across seven packages:
+  `pipe-oneshot`, `pipe-abandon`, `pipe-delegate` (+ the `child-reply`
+  child package), `pipe-no-reply`, `pipe-big-reply`, `pipe-dead-claim`.
+  SIX DEVIATIONS, argued in the As-built, of which two matter to a
+  reader: `Take` answers through a copy-out record and the BODY buffer is
+  now checked against the caller's real memory rather than against a cap
+  argument (stricter, `BadBuffer` where it was `BadArg`); and the typed
+  `resolve` disarms by the ANSWER rather than before the syscall, because
+  a would-block consumes nothing.
+  FINDINGS carried forward, each written up in the As-built: (1)
+  **RULING 10 COULD NOT BE A PURE DELETION** — the close-all counts
+  without freeing by design (7 D-5, so the counted sweeps' report numbers
+  stay honest), so deleting the three silent sweeps outright would strand
+  a `Live` slot at `refs == 0` that nothing can ever free; the sweeps'
+  CONDITION changed from "charged to this process" to "named by nobody"
+  and the free now runs each kind's own quota credit, which the old
+  sweeps never did for another process's slot. (2) Mapping's sweep looks
+  like the three and is NOT one — its handles carry no `Transfer`, so the
+  hazard is structurally unreachable — left alone with the reason at the
+  site. (3) **ROOT'S 16 KiB STACK GRANT IS A CEILING ON A TEST'S
+  `_start`**, and the 64-bit profile meets it first: design 137 assembles
+  every format-argument message in stack scratch, so 47 `print` sites in
+  one function overflowed on arm64 and passed on riscv32. One phase per
+  function is the fix and the shape unit 3's longer cases should start
+  from. (4) SL-13 filed. (5) `MAX_HANDLES` (16), not `PIPE_INFLIGHT`
+  (16), is what bounds a client holding its claims — proving the
+  in-flight budget head-on will want two processes or a bigger table,
+  which is also exactly what ruling 4's fused `Call` exists to make
+  unnecessary. (6) The idiom held, fold shape included.
+  INTEGRATED to main Sep 1 2026 (lead-reviewed, lead gate re-run
+  182/182, sawlang HEAD 87063387 unchanged, fast-forward 2a522ba;
+  finding 1's reap_unreferenced accepted as the faithful execution of
+  ruling 10 against the stranding case a pure deletion reaches). The
+  Sep-1 rulings — 11(a)-(d), the ReplyRecv reply-then-wait amendment,
+  and the API review gate — land in designs/010 with this integration.
