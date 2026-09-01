@@ -45,6 +45,9 @@ import sosabi.{
     ThreadOp,
     EventOp,
     WaiterOp,
+    WAITER_ADD_CONSUMING,
+    WAITER_ADD_FLAGS,
+    WAITER_ADD_ONESHOT,
     InterruptOp,
     ClockOp,
     TimerOp,
@@ -189,7 +192,9 @@ import kcore.objects.{
     unbind_handle,
 }
 import kcore.diag.{fatal_kernel}
-import kcore.refs.{ref_object, ref_waitable, unref_object, unref_waitable}
+import kcore.refs.{deliver_attachment, notify_if_ready, notify_ready,
+                   ref_object, ref_waitable, signal_event, unref_object,
+                   unref_waitable, wake_one_waiter}
 import kcore.threads.{
     CURRENT_THREAD,
     NEED_RESCHED,
@@ -252,7 +257,7 @@ import kcore.loader.{
     place_image,
     validate_image,
 }
-import kcore.wake.{deliver_attachment, signal_event, wake_one_waiter}
+
 import kcore.irq.{service_irq}
 // The teardown and the two fault reports moved UP here with the scheduler when
 // a process's death became a scheduling event (sawos design 2 D-6). Every call
@@ -1688,50 +1693,70 @@ func waitable_slot(p: Int, handle: UInt) unsafe -> Waitable {
         case Memory -> fault_process(p, FaultReason.NotWaitable),
         case IoMemory -> fault_process(p, FaultReason.NotWaitable),
         case Mapping -> fault_process(p, FaultReason.NotWaitable),
-        // **NEITHER END IS WAITABLE IN UNIT 1, AND UNIT 3 REMOVES BOTH ARMS**
-        // (sawos design 13 D-1; the §8-thread-deferral pattern). Both kinds have
-        // a genuine readiness — an outlet is readable when its ring is not
-        // empty, an inlet is postable when its ring is not full — and §2.2 lists
-        // the pipe arms among the waitables owed. What unit 1 deliberately does
-        // NOT have is the parking, the wake dispatch or the `Wait` rights bit
-        // that attaching would spend, so everything in this unit POLLS and these
-        // two arms say so out loud rather than letting an attach half-work.
+        // **THE FOUR PIPE ARMS, AND EVERY ONE OF THEM REPLACES A `NotWaitable`
+        // REFUSAL** (sawos design 15, M4 unit 3; `designs/010` rulings 8 and 11;
+        // §2.2's ratified waitable list closes here). Units 1 and 2 wrote those
+        // four refusals out by hand and said at each that unit 3 removes it —
+        // which is the design-8 precedent collected a fifth, sixth, seventh and
+        // eighth time, and it is a shape a `_` arm would have hidden entirely.
+        // No new kind, no new op, no new slab: four objects that already existed
+        // grew a `Wait` bit and four matrix columns.
         //
-        // Written here rather than left to a `_` for the reason every arm in
-        // this function is: a kind moving from "not waitable" to "waitable" is
-        // not a new case at all, so a default would hide exactly the change unit
-        // 3 makes. The Process arm one screen up is that promise already
-        // collected once.
-        case PipeInlet -> fault_process(p, FaultReason.NotWaitable),
-        case PipeOutlet -> fault_process(p, FaultReason.NotWaitable),
-        // **NEITHER ONE-SHOT IS WAITABLE IN UNIT 2 EITHER, AND UNIT 3 REMOVES
-        // THESE TWO ARMS WITH THE FOUR ABOVE THEM** (sawos design 14; §2.2's
-        // ratified waitable list). Both have the genuine readiness §2.1 names —
-        // a claim is READY when its reply has been written, an obligation is
-        // ready when the claim behind it was ABANDONED (the early-notice level
-        // the ratified text asks for) — and unit 2 has no parking, no wake
-        // dispatch and no `Wait` bit in either rights enum to spend on an
-        // attach. So everything in this unit polls, and these arms say so out
-        // loud rather than letting an attach half-work.
+        // Each spends its own kind's `Wait` right, out of its own rights enum,
+        // which is the reason this function does waitability and the rights
+        // check in one match rather than in two.
         //
-        // Written out for the reason every arm in this function is: a kind
-        // moving from "not waitable" to "waitable" is not a new case, so a `_`
-        // would hide exactly the change unit 3 makes.
-        case PipeReply -> fault_process(p, FaultReason.NotWaitable),
-        case PipeRequest -> fault_process(p, FaultReason.NotWaitable),
+        // THE SLOT IS THE CONNECTION for the two endpoints and the EXCHANGE for
+        // the two one-shots, which is exactly what `entry.target` already
+        // carries: the wait machinery inherits the identity the handle table
+        // established, and neither level had to invent an index.
+        case PipeInlet -> {
+            let inlet = PipeInletObject(handle: PipeInletHandle(handle),
+                                        rights: entry.rights, slot: entry.target)
+            if not inlet.allows(PipeInletRight.Wait) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            Waitable(kind: WaitableKind.PipeInlet, slot: entry.target)
+        },
+        case PipeOutlet -> {
+            let outlet = PipeOutletObject(handle: PipeOutletHandle(handle),
+                                          rights: entry.rights,
+                                          slot: entry.target)
+            if not outlet.allows(PipeOutletRight.Wait) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            Waitable(kind: WaitableKind.PipeOutlet, slot: entry.target)
+        },
+        case PipeReply -> {
+            let claim = PipeReplyObject(handle: PipeReplyHandle(handle),
+                                        rights: entry.rights, slot: entry.target)
+            if not claim.allows(PipeReplyRight.Wait) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            Waitable(kind: WaitableKind.PipeReply, slot: entry.target)
+        },
+        case PipeRequest -> {
+            let obligation = PipeRequestObject(handle: PipeRequestHandle(handle),
+                                               rights: entry.rights,
+                                               slot: entry.target)
+            if not obligation.allows(PipeRequestRight.Wait) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            Waitable(kind: WaitableKind.PipeRequest, slot: entry.target)
+        },
     }
 }
 
 /// The Waiter object's ops (spec §2.2; design 178 D5).
-func waiter_op(raw_op: UInt, obj: &WaiterObject, arg0: UInt,
-               arg1: UInt) unsafe -> SyscallResult {
+func waiter_op(raw_op: UInt, obj: &WaiterObject, arg0: UInt, arg1: UInt,
+               arg2: UInt) unsafe -> SyscallResult {
     let p = calling_process()
     guard let op = WaiterOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
-    return waiter_op_decoded(op, &obj, arg0, arg1, p)
+    return waiter_op_decoded(op, &obj, arg0, arg1, arg2, p)
 }
 
 func waiter_op_decoded(op: WaiterOp, obj: &WaiterObject, arg0: UInt, arg1: UInt,
-                       p: Int) unsafe -> SyscallResult {
+                       arg2: UInt, p: Int) unsafe -> SyscallResult {
     let w = obj.slot
 
     match op {
@@ -1739,7 +1764,7 @@ func waiter_op_decoded(op: WaiterOp, obj: &WaiterObject, arg0: UInt, arg1: UInt,
             if not obj.allows(WaiterRight.Attach) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            waiter_add(p, w, arg0, arg1)
+            waiter_add(p, w, arg0, arg1, arg2)
         },
         case Remove -> {
             if not obj.allows(WaiterRight.Attach) {
@@ -1762,7 +1787,36 @@ func waiter_op_decoded(op: WaiterOp, obj: &WaiterObject, arg0: UInt, arg1: UInt,
 /// Attaching something already attached TERMINATES the process. It is the
 /// ratified one-Waiter rule, and it is caller-checkable in the strongest sense
 /// — the process is the only thing that attaches anything, so it knows.
-func waiter_add(p: Int, w: Int, handle: UInt, key: UInt) unsafe -> SyscallResult {
+/// **AND SINCE M4 UNIT 3 IT TAKES A FLAGS WORD** (`designs/010` rulings 9(b) and
+/// 11(c); sawos design 15). Two bits, two orthogonal axes:
+///
+///   - `WAITER_ADD_ONESHOT` — the attachment DETACHES AT DELIVERY (never at mere
+///     readiness). It is recorded on the attachment because it is the ATTACHER's
+///     choice, like the key, and nothing about the waitable changes.
+///   - `WAITER_ADD_CONSUMING` — the op RELEASES the caller's handle entry, and
+///     the attachment owns the object from here on. It is the transfer funnel's
+///     kernel half: one op rather than an add followed by a release, which would
+///     give back the very trap the pattern exists to save.
+///
+/// A word with any other bit set is a `BadArg` fault, on §5.7's line: the set is
+/// published, so the caller could have checked.
+///
+/// **THE ORDER OF THE LAST TWO STEPS IS THE DESIGN.** The attachment takes its
+/// reference BEFORE the consuming release drops the caller's, so the object can
+/// never pass through zero in the middle of its own attach; and the release
+/// happens BEFORE the level-triggered wake, so a delivery that fires immediately
+/// sees the final reference picture — which is what lets an already-ready
+/// consuming attach settle its exchange in one act instead of leaving a slot
+/// held by an entry that no longer exists.
+///
+/// **A REFUSAL CONSUMES NOTHING.** Every early return above the commit leaves
+/// the caller's handle exactly as it was, which is what the typed `Waiter.give`
+/// rests on when it hands the object back in its `Err`.
+func waiter_add(p: Int, w: Int, handle: UInt, key: UInt,
+                flags: UInt) unsafe -> SyscallResult {
+    if (flags & ~WAITER_ADD_FLAGS) != 0 {
+        fault_process(p, FaultReason.BadArg)
+    }
     let target = waitable_slot(p, handle)
     if waitable_attachment(target.kind, target.slot) != 0 {
         fault_process(p, FaultReason.BadState)
@@ -1781,6 +1835,7 @@ func waiter_add(p: Int, w: Int, handle: UInt, key: UInt) unsafe -> SyscallResult
     }
     ATTACHMENTS[a] = Attachment(state: SlotState.Live, kind: target.kind,
                                 target: target.slot, waiter: w, key: key,
+                                oneshot: (flags & WAITER_ADD_ONESHOT) != 0,
                                 link: WAITERS[w].attached)
     WAITERS[w].attached = a + 1
     set_waitable_attachment(target.kind, target.slot, a + 1)
@@ -1791,16 +1846,57 @@ func waiter_add(p: Int, w: Int, handle: UInt, key: UInt) unsafe -> SyscallResult
     // asymmetry is what makes the cascade terminate.
     ref_waitable(target.kind, target.slot)
 
+    // **THE CONSUMING HALF** (`designs/010` ruling 11(c)). The caller's entry is
+    // destroyed HERE, by the op, which is the transfer-funnel contract reached
+    // through an attach rather than through a `give` — `consume_entry`'s own two
+    // calls, in `release_handle`'s own order. The attachment took its reference
+    // one line up, so the object cannot pass through zero between the two; what
+    // is left afterwards is an object the ATTACHMENT owns and no handle names,
+    // which ruling 11(c) calls the attachment-owned husk and makes an opt-in
+    // state rather than an accident.
+    if (flags & WAITER_ADD_CONSUMING) != 0 {
+        unbind_handle(p, handle_word_index(handle))
+        unref_object(waitable_obj_of(target.kind), target.slot)
+    }
+
     // LEVEL-TRIGGERED, at the attach (§2.2). A waitable that is already ready
     // when it joins the set is ready NOW, and a thread parked on this Waiter
     // has to learn about it — otherwise the order "signal, then attach, then
     // wait" would lose the notification, which is the exact lost-edge this
     // semantics exists to rule out. It covers an Interrupt that fired before
     // anyone attached, which is the ordering a driver hits at bring-up.
+    //
+    // **IT RUNS AFTER THE CONSUMING RELEASE, AND THAT ORDER MATTERS SINCE UNIT
+    // 3**: a reply delivered here detaches (ruling 11(b)) and drops the
+    // attachment's reference, and only if the caller's entry is already gone
+    // does that take the claim's column to zero and settle the exchange. The
+    // other order would leave a settled-but-for-one-entry ring slot held by a
+    // handle the very next line destroys.
     if waitable_ready(target.kind, target.slot) {
         wake_one_waiter(w, a)
     }
     op_ok()
+}
+
+/// The wait machinery's kind, as the object kind the handle table speaks.
+///
+/// **A SECOND COPY OF `kcore.refs`' OWN TRANSLATION, and it is here because the
+/// consuming attach is the one site that needs it above that file.** `refs`
+/// keeps its version private to the reference matrix it serves; this one serves
+/// `waiter_add`'s release. Both are total, so a new waitable kind fails both to
+/// compile — which is the property that makes two spellings safe where a cast
+/// between two differently-numbered enums would not be.
+func waitable_obj_of(kind: WaitableKind) -> ObjType {
+    match kind {
+        case Event -> ObjType.Event,
+        case Interrupt -> ObjType.Interrupt,
+        case Timer -> ObjType.Timer,
+        case Process -> ObjType.Process,
+        case PipeOutlet -> ObjType.PipeOutlet,
+        case PipeInlet -> ObjType.PipeInlet,
+        case PipeReply -> ObjType.PipeReply,
+        case PipeRequest -> ObjType.PipeRequest,
+    }
 }
 
 /// §2.2's `remove(key)`. Removing a key this Waiter does not use is a caller
@@ -2613,6 +2709,7 @@ func pipe_create(owner: Int, caller: Int, dst: UInt, cap: UInt) unsafe -> Syscal
     // `event_create`'s all-or-nothing shape; the charge joins that rule, because
     // a process must not pay for an object it never got.
     PIPES[slot] = PipeSlot(state: SlotState.Live, process: owner, staged: 0,
+                           inlet_attachment: 0, outlet_attachment: 0,
                            inlet_refs: 1, outlet_refs: 1)
     quota_charge(owner, QuotaKind.Pipe)
 
@@ -2737,6 +2834,13 @@ func pipe_post(p: Int, slot: Int, src: UInt, len: UInt) unsafe -> SyscallResult 
     PIPE_REQUEST_REFS[x] = 0
     PIPE_EX_STATE[x] = ExchangeState.Staged
     stage_push(slot, x)
+    // **AND THE SERVER END IS NOW READABLE** (sawos design 15, M4 unit 3;
+    // §2.2's readable arm). A staged message is exactly what that level means,
+    // so a server parked on this connection's outlet is woken here — which is
+    // what turns unit 2's poll loop into a park. It is `notify_ready` and not
+    // `notify_if_ready` because this line KNOWS: the message it just staged is
+    // the readiness.
+    notify_ready(WaitableKind.PipeOutlet, slot)
     op_value(claim)
 }
 
@@ -2960,6 +3064,21 @@ func pipe_resolve(p: Int, word: UInt, x: Int, dst: UInt,
             }
             op_status(SosStatus.WouldBlock)
         },
+        // **THE ANSWER ALREADY WENT OUT THROUGH A WAIT** (sawos design 15, on
+        // `designs/010` ruling 11(a)/(b)). A `Waiter` delivery IS a resolve —
+        // the record carried the bytes — so there is nothing here for a second
+        // asker, and the word for "there is no longer anybody on the other side
+        // of THIS exchange" is the one an abandoned peer and a second-acting
+        // minted sibling both get. It CONSUMES the claim, exactly as the two
+        // arms above it do, which is what lets the ring slot go.
+        //
+        // A NON-CONSUMING attach is the shape that reaches this arm: the client
+        // kept its handle, the delivery discharged the exchange, and this is
+        // what its later `resolve` is told.
+        case Settled -> {
+            consume_entry(p, word, ObjType.PipeReply, x)
+            op_status(SosStatus.PeerClosed)
+        },
         // UNREACHABLE: a `Free` exchange has no reference columns, so no handle
         // can name one. Written rather than assumed — a kernel that reached it
         // would have recycled a slot under a live claim, which is precisely the
@@ -3036,10 +3155,33 @@ func pipe_reply(p: Int, word: UInt, x: Int, src: UInt,
             }
             PIPE_LENS[x] = len as UInt16
             PIPE_EX_STATE[x] = ExchangeState.Replied
+            // **AND THE CLAIM'S LEVEL IS NOW READY** (sawos design 15;
+            // `designs/010` ruling 11(a)). A client parked on this claim is
+            // woken HERE and its record carries the bytes just written — which
+            // is the whole of what "delivery carries the payload" buys, and it
+            // is what makes the composed blocking `send` a park rather than a
+            // poll.
+            //
+            // It runs BEFORE the consume rather than relying on it. The consume
+            // below drops the obligation column and would notify from
+            // `drop_reference` as a side effect — but only when this reply was
+            // the LAST name on the obligation, and a server holding a minted
+            // sibling would then leave its client parked on an answer that had
+            // already been written. Said once, at the site that knows.
+            notify_if_ready(WaitableKind.PipeReply, x)
             consume_entry(p, word, ObjType.PipeRequest, x)
             op_ok()
         },
         case Replied -> {
+            consume_entry(p, word, ObjType.PipeRequest, x)
+            op_status(SosStatus.PeerClosed)
+        },
+        // A DELIVERED reply, discharged through somebody's wait. It is
+        // `Replied`'s answer for `Replied`'s reason — there is no claim left
+        // waiting for THIS reply — and the arm exists separately because the
+        // two states are reached differently and a reader should be able to see
+        // which one happened.
+        case Settled -> {
             consume_entry(p, word, ObjType.PipeRequest, x)
             op_status(SosStatus.PeerClosed)
         },
@@ -3067,9 +3209,53 @@ func pipe_reply(p: Int, word: UInt, x: Int, src: UInt,
 /// generation bump comes with the unbind, so the word the caller used is stale
 /// the instant the op returns and using it again is the diagnosed `BadHandle`
 /// fault rather than an alias.
+///
+/// **AND SINCE M4 UNIT 3 IT DETACHES FIRST** (`designs/010` ruling 9(a), which
+/// is MANDATORY and was vacuous until the pipe kinds became waitable). An
+/// attachment is a counted reference, and `resolve` consuming the claim as
+/// `reply` discharges the obligation is exactly "an op that CONSUMES the object"
+/// — so without the implicit detach the op could not free the ring slot, and
+/// refusing while attached would wedge the op ordering instead. Unit 5.5's
+/// teardown taught the kernel to unhook an attachment's far end; this is that
+/// act reached by an op.
+///
+/// **THE ORDER IS DETACH, THEN UNBIND, THEN UNREF**, and it is the only safe
+/// one: the caller's ENTRY is still a reference while the detach runs, so
+/// dropping the attachment's cannot take the column to zero and cannot settle
+/// an exchange the two lines below still name. The entry's own drop is what
+/// reaches zero, and it is last.
 func consume_entry(p: Int, word: UInt, kind: ObjType, target: Int) unsafe {
+    detach_consumed(kind, target)
     unbind_handle(p, handle_word_index(word))
     unref_object(kind, target)
+}
+
+/// Ruling 9(a)'s implicit detach: drop any subscription on the object this op is
+/// about to consume.
+///
+/// The `_` arm is deliberate and is not the enumeration property being given up:
+/// this function is asked about an `ObjType` because that is what an op has, and
+/// the question it answers — "is this a SINGLE-USE object an op can consume?" —
+/// is true of exactly the two one-shot kinds and false of every other by
+/// construction. A kind that becomes consumable joins the list because its op
+/// has to be written, not because a match here changed shape.
+func detach_consumed(kind: ObjType, target: Int) unsafe {
+    match kind {
+        case PipeReply -> { detach_watcher(WaitableKind.PipeReply, target) },
+        case PipeRequest -> { detach_watcher(WaitableKind.PipeRequest, target) },
+        case _ -> {},
+    }
+}
+
+/// Take whatever is watching `target` off its Waiter, and drop the reference the
+/// attachment held. A no-op when nobody is watching, which is the common case.
+func detach_watcher(watched: WaitableKind, target: Int) unsafe {
+    let a = waitable_attachment(watched, target)
+    if a == 0 {
+        return
+    }
+    detach_attachment(ATTACHMENTS[a - 1].waiter, a - 1)
+    unref_waitable(watched, target)
 }
 
 /// Handle-table lookup -> object type -> op table -> rights check -> op.
@@ -3130,7 +3316,7 @@ func dispatch(handle: UInt, op: UInt,
         case Waiter -> {
             let obj = WaiterObject(handle: WaiterHandle(handle),
                                    rights: entry.rights, slot: entry.target)
-            waiter_op(op, &obj, arg0, arg1)
+            waiter_op(op, &obj, arg0, arg1, arg2)
         },
         case Interrupt -> {
             let obj = InterruptObject(handle: InterruptHandle(handle),

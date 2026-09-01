@@ -77,6 +77,7 @@ import kcore.limits.{
     NO_PIPE,
     PIPE_INFLIGHT,
 }
+import kcore.diag.{fatal_kernel}
 
 /// One handle-table entry: the object a handle names, the rights its holder has
 /// on it (§3), WHICH object of that kind it is, and which LIFE of this slot it
@@ -1064,15 +1065,24 @@ public(package) struct PipeSlot {
     /// The oldest STAGED (untaken) exchange's ring index, PLUS ONE. Zero is
     /// "nothing staged", which is the list-link idiom the thread queues use.
     public(package) staged: Int,
+    /// The attachment watching the CLIENT end's room-to-post level (slot + 1);
+    /// 0 = unattached. **ONE FIELD PER END, not one per connection** (sawos
+    /// design 15, M4 unit 3): the two ends are two waitables — a client waits
+    /// for room and a server waits for a message — so §2.2's at-most-one-Waiter
+    /// rule is per END, exactly as `inlet_refs` and `outlet_refs` are.
+    public(package) inlet_attachment: Int,
+    /// The attachment watching the SERVER end's readable level (slot + 1).
+    public(package) outlet_attachment: Int,
     /// How many handle entries name the CLIENT end (sawos design 7 D-1's
-    /// counting rule, one column per kind).
+    /// counting rule, one column per kind), PLUS its attachment.
     public(package) inlet_refs: UInt16,
-    /// How many handle entries name the SERVER end.
+    /// How many handle entries name the SERVER end, PLUS its attachment.
     public(package) outlet_refs: UInt16,
 }
 
 public(package) unsafe static var PIPES: [PipeSlot; MAX_PIPES] = [
     PipeSlot(state: SlotState.Free, process: 0, staged: 0,
+             inlet_attachment: 0, outlet_attachment: 0,
              inlet_refs: 0, outlet_refs: 0);
     MAX_PIPES]
 
@@ -1146,6 +1156,22 @@ public(package) enum ExchangeState: UInt8 {
     case Taken = 2,
     /// The reply body is in the slot and the claim may take it.
     case Replied = 3,
+    /// **THE EXCHANGE IS DISCHARGED, AND M4 UNIT 3 IS WHERE THAT BECAME A STATE**
+    /// (sawos design 15, on design 10 ruling 11(a)/(b)). A reply DELIVERED
+    /// through a `Waiter.wait` hands the bytes over exactly as a `Resolve` does
+    /// — the wait IS the delivery — but it does not travel through the claim's
+    /// handle ENTRY, so it cannot consume one. Without a state to move to, the
+    /// slot would stay `Replied` and a later `Resolve` through the very same
+    /// claim would copy the answer out a SECOND time, which is the duplicate
+    /// §2.2's consume rule exists to make impossible.
+    ///
+    /// So a delivered reply lands here, and it answers everything the way a
+    /// spent exchange should: a later `Resolve` is `PeerClosed` and consumes the
+    /// claim, a `Reply` through a minted sibling is `PeerClosed` too, and the
+    /// slot settles as soon as both columns are zero. It is the ONE state whose
+    /// arrival is not an op — which is exactly why the columns could not have
+    /// derived it.
+    case Settled = 4,
 }
 
 public(package) unsafe static var PIPE_EX_STATE: [ExchangeState; PIPE_EXCHANGES] = [
@@ -1157,6 +1183,22 @@ public(package) unsafe static var PIPE_REPLY_REFS: [UInt16; PIPE_EXCHANGES] = [
 
 /// How many name its OBLIGATION.
 public(package) unsafe static var PIPE_REQUEST_REFS: [UInt16; PIPE_EXCHANGES] = [
+    0; PIPE_EXCHANGES]
+
+/// The attachment watching each exchange's CLAIM (slot + 1); 0 = unattached.
+///
+/// **TWO ARRAYS, BECAUSE A CLAIM AND AN OBLIGATION ARE TWO WAITABLES** (sawos
+/// design 15). They are one exchange and two objects — the reply-ready level
+/// belongs to the client, the request-abandoned level to the server — so §2.2's
+/// at-most-one-Waiter rule holds per COLUMN, exactly as the reference count
+/// does, and the two may be watched from two different processes at once. It is
+/// the `PipeSlot` pair one level down, which is the shape design 14 already
+/// inherited from design 13.
+public(package) unsafe static var PIPE_REPLY_ATTACH: [Int; PIPE_EXCHANGES] = [
+    0; PIPE_EXCHANGES]
+
+/// The attachment watching each exchange's OBLIGATION (slot + 1).
+public(package) unsafe static var PIPE_REQUEST_ATTACH: [Int; PIPE_EXCHANGES] = [
     0; PIPE_EXCHANGES]
 
 /// The staged list's links — the next STAGED exchange in this connection, plus
@@ -1242,6 +1284,27 @@ public(package) func alloc_exchange(c: Int) unsafe -> Int {
     NO_EXCHANGE
 }
 
+/// **IS THERE ROOM TO POST — the inlet's waitable level** (design 10 ruling 8;
+/// sawos design 15, M4 unit 3).
+///
+/// It is `alloc_exchange`'s own scan asked as a QUESTION rather than as a
+/// reservation, and that is deliberate: readiness must reserve nothing, because
+/// a level that took a slot to answer would hand it to whoever asked instead of
+/// to whoever posts. So this is the same bounded walk with no side effect, which
+/// is §2.2's level-triggering implemented rather than maintained — the same
+/// argument `waiter_ready_attachment`'s scan makes.
+public(package) func pipe_has_room(c: Int) unsafe -> Bool {
+    var i: Int = 0
+    while i < PIPE_INFLIGHT {
+        match PIPE_EX_STATE[pipe_exchange_at(c, i)] {
+            case Free -> { return true },
+            case _ -> {},
+        }
+        i = i + 1
+    }
+    false
+}
+
 /// Append exchange `x` to its connection's STAGED list — the FIFO a take reads
 /// from.
 ///
@@ -1315,8 +1378,19 @@ public(package) func pipe_idle(c: Int) unsafe -> Bool {
 /// it and no exchange lives in it — so the ring slots are already `Free` and
 /// there is nothing to unwind here.
 public(package) func free_pipe(slot: Int) unsafe {
+    // **NEITHER END CAN BE ATTACHED HERE, and the test is the invariant written
+    // down** (sawos design 15, on the Event/Timer/Interrupt precedent in
+    // `free_object`). An attachment is a counted reference on the END it
+    // watches, so a connection whose columns are both zero has no watcher on
+    // either side; if this ever fired, the ledger and the wait machinery would
+    // have disagreed and a Waiter would be watching a recycled slot.
+    if PIPES[slot].inlet_attachment != 0 || PIPES[slot].outlet_attachment != 0 {
+        fatal_kernel("a pipe reached zero references while attached",
+                     slot as UInt)
+    }
     let owner = PIPES[slot].process
     PIPES[slot] = PipeSlot(state: SlotState.Free, process: 0, staged: 0,
+                           inlet_attachment: 0, outlet_attachment: 0,
                            inlet_refs: 0, outlet_refs: 0)
     quota_credit(owner, QuotaKind.Pipe)
 }
@@ -1340,6 +1414,11 @@ public(package) func exchange_can_settle(x: Int) unsafe -> Bool {
         case Staged -> PIPES[exchange_pipe(x)].outlet_refs == 0,
         case Taken -> true,
         case Replied -> true,
+        // A DISCHARGED EXCHANGE OWES NOTHING BY CONSTRUCTION (sawos design 15):
+        // the answer has already been handed to somebody through a wait record,
+        // so there is nothing left for either side and only the columns are
+        // holding the slot.
+        case Settled -> true,
     }
 }
 
@@ -1356,6 +1435,14 @@ public(package) func exchange_can_settle(x: Int) unsafe -> Bool {
 /// post writes it, and every read of one is bounded by the length that post
 /// recorded.
 public(package) func exchange_settle(x: Int) unsafe {
+    // **NEITHER HALF CAN BE ATTACHED HERE** — `free_pipe`'s assert one level
+    // down, and the same invariant: an attachment is a counted reference on the
+    // column it watches, so both columns at zero means nobody is watching
+    // either. If it ever fired, a Waiter would be holding a level on a ring slot
+    // the next `Post` is about to write.
+    if PIPE_REPLY_ATTACH[x] != 0 || PIPE_REQUEST_ATTACH[x] != 0 {
+        fatal_kernel("an exchange settled while attached", x as UInt)
+    }
     PIPE_EX_STATE[x] = ExchangeState.Free
     PIPE_REPLY_REFS[x] = 0
     PIPE_REQUEST_REFS[x] = 0

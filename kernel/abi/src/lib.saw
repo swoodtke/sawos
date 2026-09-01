@@ -1070,6 +1070,14 @@ public enum PipeInletRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
     case Post = 1 << 8,
+    /// **THE SECOND KIND-SPECIFIC BIT, AND M4 UNIT 3 IS WHERE IT ARRIVED**
+    /// (sawos design 15). It gates attaching this kind to a Waiter, on the
+    /// Timer precedent — the OUTLET's readable level and this end's own room-to-post level are two different waitables; this bit is the one that gates attaching THIS end (design 10 ruling 8). Its absence through unit 2 was a scope line and
+    /// this is that line being crossed, not a widening of anything: the bit is
+    /// in the default set for the reason every kind-specific bit is, which is
+    /// that attenuation is monotonic and a bit not minted at creation could
+    /// never appear later.
+    case Wait = 1 << 9,
 }
 
 static_assert((PipeInletRight.Transfer as UInt32) == (1 << 0),
@@ -1078,6 +1086,8 @@ static_assert((PipeInletRight.Mint as UInt32) == (1 << 1),
               "universal right Mint must be bit 1 in every kind's enum")
 static_assert((PipeInletRight.Post as UInt32) >= (1 << 8),
               "kind-specific right Post must start at bit 8 or above")
+static_assert((PipeInletRight.Wait as UInt32) >= (1 << 8),
+              "kind-specific right Wait must start at bit 8 or above")
 
 /// A right on a PipeOutlet — the SERVER end of a connection (spec §2.1; sawos
 /// design 13).
@@ -1096,6 +1106,14 @@ public enum PipeOutletRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
     case Take = 1 << 8,
+    /// **THE SECOND KIND-SPECIFIC BIT, AND M4 UNIT 3 IS WHERE IT ARRIVED**
+    /// (sawos design 15). It gates attaching this kind to a Waiter, on the
+    /// Timer precedent — attaching the SERVER end to a Waiter is what a multiplexed server does instead of polling `Take` (spec §2.2's waitable list). Its absence through unit 2 was a scope line and
+    /// this is that line being crossed, not a widening of anything: the bit is
+    /// in the default set for the reason every kind-specific bit is, which is
+    /// that attenuation is monotonic and a bit not minted at creation could
+    /// never appear later.
+    case Wait = 1 << 9,
 }
 
 static_assert((PipeOutletRight.Transfer as UInt32) == (1 << 0),
@@ -1104,6 +1122,8 @@ static_assert((PipeOutletRight.Mint as UInt32) == (1 << 1),
               "universal right Mint must be bit 1 in every kind's enum")
 static_assert((PipeOutletRight.Take as UInt32) >= (1 << 8),
               "kind-specific right Take must start at bit 8 or above")
+static_assert((PipeOutletRight.Wait as UInt32) >= (1 << 8),
+              "kind-specific right Wait must start at bit 8 or above")
 
 /// A right on a PipeReply — the CLIENT's claim on one reply (spec §2.1; sawos
 /// design 14).
@@ -1125,6 +1145,14 @@ public enum PipeReplyRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
     case Resolve = 1 << 8,
+    /// **THE SECOND KIND-SPECIFIC BIT, AND M4 UNIT 3 IS WHERE IT ARRIVED**
+    /// (sawos design 15). It gates attaching this kind to a Waiter, on the
+    /// Timer precedent — attaching a CLAIM is how a client waits for one answer among many — and since ruling 11(a) the delivery carries the answer itself, so the attach can replace the resolve entirely. Its absence through unit 2 was a scope line and
+    /// this is that line being crossed, not a widening of anything: the bit is
+    /// in the default set for the reason every kind-specific bit is, which is
+    /// that attenuation is monotonic and a bit not minted at creation could
+    /// never appear later.
+    case Wait = 1 << 9,
 }
 
 static_assert((PipeReplyRight.Transfer as UInt32) == (1 << 0),
@@ -1133,6 +1161,8 @@ static_assert((PipeReplyRight.Mint as UInt32) == (1 << 1),
               "universal right Mint must be bit 1 in every kind's enum")
 static_assert((PipeReplyRight.Resolve as UInt32) >= (1 << 8),
               "kind-specific right Resolve must start at bit 8 or above")
+static_assert((PipeReplyRight.Wait as UInt32) >= (1 << 8),
+              "kind-specific right Wait must start at bit 8 or above")
 
 /// A right on a PipeRequest — the SERVER's obligation to send one reply (spec
 /// §2.1; sawos design 14).
@@ -1151,6 +1181,14 @@ public enum PipeRequestRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
     case Reply = 1 << 8,
+    /// **THE SECOND KIND-SPECIFIC BIT, AND M4 UNIT 3 IS WHERE IT ARRIVED**
+    /// (sawos design 15). It gates attaching this kind to a Waiter, on the
+    /// Timer precedent — attaching an OBLIGATION is the server's cancellation watcher: §2.1's ratified "the `PipeRequestHandle` is WAITABLE for abandoned". Its absence through unit 2 was a scope line and
+    /// this is that line being crossed, not a widening of anything: the bit is
+    /// in the default set for the reason every kind-specific bit is, which is
+    /// that attenuation is monotonic and a bit not minted at creation could
+    /// never appear later.
+    case Wait = 1 << 9,
 }
 
 static_assert((PipeRequestRight.Transfer as UInt32) == (1 << 0),
@@ -1159,6 +1197,8 @@ static_assert((PipeRequestRight.Mint as UInt32) == (1 << 1),
               "universal right Mint must be bit 1 in every kind's enum")
 static_assert((PipeRequestRight.Reply as UInt32) >= (1 << 8),
               "kind-specific right Reply must start at bit 8 or above")
+static_assert((PipeRequestRight.Wait as UInt32) >= (1 << 8),
+              "kind-specific right Wait must start at bit 8 or above")
 
 /// Whether a rights word carries the UNIVERSAL `Transfer` bit (§3's low byte).
 ///
@@ -1339,14 +1379,14 @@ public func process_rights() -> UInt32 {
 /// which is not IPC.
 public func pipe_inlet_rights() -> UInt32 {
     ((PipeInletRight.Transfer as UInt32) | (PipeInletRight.Mint as UInt32)
-     | (PipeInletRight.Post as UInt32))
+     | (PipeInletRight.Post as UInt32) | (PipeInletRight.Wait as UInt32))
 }
 
 /// What the kernel mints for a PipeOutlet at `ProcessOp.PipeCreate`. The mirror
 /// of `pipe_inlet_rights`, with the verb changed and nothing else.
 public func pipe_outlet_rights() -> UInt32 {
     ((PipeOutletRight.Transfer as UInt32) | (PipeOutletRight.Mint as UInt32)
-     | (PipeOutletRight.Take as UInt32))
+     | (PipeOutletRight.Take as UInt32) | (PipeOutletRight.Wait as UInt32))
 }
 
 /// What the kernel mints for a PipeReply at `PipeInletOp.Post` — the CLAIM the
@@ -1359,7 +1399,7 @@ public func pipe_outlet_rights() -> UInt32 {
 /// wants to hand a narrower claim on mints an attenuated sibling and gives THAT.
 public func pipe_reply_rights() -> UInt32 {
     ((PipeReplyRight.Transfer as UInt32) | (PipeReplyRight.Mint as UInt32)
-     | (PipeReplyRight.Resolve as UInt32))
+     | (PipeReplyRight.Resolve as UInt32) | (PipeReplyRight.Wait as UInt32))
 }
 
 /// What the kernel mints for a PipeRequest at `PipeOutletOp.Take` — the
@@ -1372,7 +1412,7 @@ public func pipe_reply_rights() -> UInt32 {
 /// client. Withholding the bit would delete the example.
 public func pipe_request_rights() -> UInt32 {
     ((PipeRequestRight.Transfer as UInt32) | (PipeRequestRight.Mint as UInt32)
-     | (PipeRequestRight.Reply as UInt32))
+     | (PipeRequestRight.Reply as UInt32) | (PipeRequestRight.Wait as UInt32))
 }
 
 /// What the kernel mints for a Memory region — a boot RAM-pool root, and every
@@ -1854,6 +1894,32 @@ public enum WaiterOp: UInt {
     case Wait = 2,
 }
 
+/// **`Add`'s THIRD ARGUMENT: THE ATTACHMENT FLAGS** (design 10 rulings 9(b) and
+/// 11(c); sawos design 15, M4 unit 3).
+///
+/// TWO BITS, AND THEY ARE ORTHOGONAL AXES rather than three modes. Bit 0 says
+/// what happens AT DELIVERY (detach, or stay subscribed); bit 1 says what
+/// happens to the caller's HANDLE ENTRY at the attach (the op releases it, and
+/// the attachment owns the object from then on). A 2x2, which is exactly why
+/// ruling 11(c) struck `OneShotConsuming` as an enum case.
+///
+/// **THE TYPED SURFACE SPLITS THEM DIFFERENTLY, AND ON PURPOSE.** Consuming is
+/// an EFFECT change — the wrapper is taken BY MOVE and is provably dead at the
+/// call site — and ruling 4's own mode-enum rejection applies: a runtime flag
+/// can change neither a return type nor a Saw function's effect. So `sos` spells
+/// the consuming attach as a distinct verb (`Waiter.give`) while `AttachMode`
+/// stays a defaulted value parameter. Here, at the wire, both are bits: the
+/// kernel's job is one op, and which of the four combinations it was told is a
+/// number.
+///
+/// A word with any OTHER bit set is a `BadArg` fault — the set is published, so
+/// the caller could have checked, which is §5.7's own line.
+public static WAITER_ADD_ONESHOT: UInt = 1 << 0
+public static WAITER_ADD_CONSUMING: UInt = 1 << 1
+
+/// Every flag `Add` knows. Anything outside it is outside the op's domain.
+public static WAITER_ADD_FLAGS: UInt = WAITER_ADD_ONESHOT | WAITER_ADD_CONSUMING
+
 // =============================================================================
 // The Interrupt object's op table (spec §2 table, §9; design 178 D6)
 // =============================================================================
@@ -2277,8 +2343,40 @@ public enum EventMode: UInt {
     case SaturatingSum = 1,
 }
 
+/// **THE MESSAGE BODY'S MAXIMUM, AS A BUILD DEFINE** (spec §2.1's fixed body;
+/// sawos design 10 ruling 6).
+///
+/// It is the size of one staging slot, the largest `len` a `PipeInletOp.Post`
+/// may name, the smallest buffer a `PipeOutletOp.Take` may be handed, and —
+/// since M4 unit 3 — the size of the BODY REGION every wait record buffer
+/// carries. All four are one number because they are one fixed slot seen from
+/// four sides.
+///
+/// §2.1 ratifies a FIXED body maximum without fixing the number, so this is the
+/// tree's choice within it: large enough for a protocol header plus a small
+/// payload, small enough that `PIPE_INFLIGHT` slots per connection stay a
+/// zerofill array rather than a budget anybody has to think about. The assert
+/// below pins the range the ratified sentence implies — a body must hold at
+/// least a machine word, and must stay small enough that one bounded copy is
+/// still a bounded copy (see design 1's preemption-point audit).
+///
+/// **IT IS DECLARED HERE, ABOVE THE WAIT RECORD, BECAUSE THE RECORD NAMES IT**
+/// (sawos design 15, on design 10 ruling 11(a)). A statics initializer folds in
+/// DECLARATION ORDER, so a size an array length reads has to be above it; the
+/// number used to sit with the pipe records at the bottom of this file, and the
+/// pointer comment there is what is left of that placement.
+public static PIPE_BODY_BYTES: Int = 128
+
+static_assert(PIPE_BODY_BYTES >= 8,
+              "a message body must hold at least one 64-bit word")
+static_assert(PIPE_BODY_BYTES <= 1024,
+              "a message body is copied with interrupts masked — keep it bounded")
+static_assert(PIPE_BODY_BYTES % 8 == 0,
+              "a staging slot must be doubleword-sized on both profiles")
+
 // =============================================================================
-// The wait record (spec §2.2, as amended by design 178 M2 unit 3 rider 3)
+// The wait record (spec §2.2, as amended by design 178 M2 unit 3 rider 3, and
+// grown a BODY by design 10 ruling 11(a) — sawos design 15, M4 unit 3)
 // =============================================================================
 //
 // `Waiter.Wait` answers with a RECORD the kernel COPIES OUT into a buffer the
@@ -2318,6 +2416,10 @@ public enum EventMode: UInt {
 /// the three, and broke every exhaustive `WaitPayload` match in the tree until
 /// each said what it does about a death — which is the raw backing and the
 /// exhaustive match doing exactly what this docstring promised they would.
+/// **AND COLLECTED FOUR MORE TIMES BY M4 UNIT 3** (sawos design 15, on design 10
+/// rulings 8 and 11(a)): the four pipe arms took the next four numbers, moved
+/// none of the four above them, and broke every exhaustive `WaitPayload` match
+/// in the tree until each said what it does about a pipe.
 public enum WaitTag: UInt {
     case Event = 0,
     case Interrupt = 1,
@@ -2327,27 +2429,91 @@ public enum WaitTag: UInt {
     /// `Faulted` distinction rides vocabulary that already shipped rather than
     /// a second tag per ending.
     case Process = 3,
+    /// **A PipeOutlet IS READABLE** — the server end's level (spec §2.2's
+    /// waitable list; sawos design 15). The payload is an `OutletLevel`: `Msg`
+    /// while anything is staged, `PeerGone` when the ring is dry AND every
+    /// inlet handle is gone. Drain-then-terminal, so `Msg` wins while there is
+    /// anything left to hand over (design 230's close-drains-first rule).
+    case Readable = 4,
+    /// **A PipeInlet HAS ROOM TO POST** — the client end's level (design 10
+    /// ruling 8). The payload is an `InletLevel`: `Room` while the staging ring
+    /// has a free slot, `PeerGone` when every outlet handle is gone. A plain
+    /// level, not a terminal one — consume clears nothing, and the level's end
+    /// is the poster's own next post.
+    case Room = 5,
+    /// **A PipeReply's ANSWER HAS ARRIVED** — and this is the tag that made the
+    /// record grow (design 10 ruling 11(a)). The payload is a `ReplyLevel`, and
+    /// a `Data` delivery carries the reply BYTES in the record's body region:
+    /// the wait itself is the delivery, so the composed client never calls
+    /// `resolve` on the success path.
+    case Reply = 6,
+    /// **A PipeRequest's CLAIM WAS ABANDONED** — the server's cancellation
+    /// watcher (spec §2.1's "the `PipeRequestHandle` is WAITABLE for
+    /// abandoned"). No payload: the fact IS the notification, and it is
+    /// TERMINAL, because a reply column that reached zero can never rise.
+    case Abandoned = 7,
 }
 
-/// Words in a wait record: key, tag, payload.
-public static WAIT_RECORD_WORDS: Int = 3
+/// Words in a wait record's HEADER: key, tag, payload, body length.
+///
+/// **THE FOURTH WORD IS M4 UNIT 3's** (design 10 ruling 11(a)). A delivery may
+/// now carry BYTES — a reply body, up to `PIPE_BODY_BYTES` of it — and the
+/// header word is how many of the body region are real. It is zero for every
+/// word-payload kind, which is all of them but one.
+public static WAIT_HEADER_WORDS: Int = 4
 
 /// Where each lives. Named rather than written, on both sides of the boundary.
 public static WAIT_KEY_WORD: Int = 0
 public static WAIT_TAG_WORD: Int = 1
 public static WAIT_PAYLOAD_WORD: Int = 2
+public static WAIT_BODY_LEN_WORD: Int = 3
 
-/// Bytes in a wait record on THIS machine — the minimum capacity a caller must
-/// give `Waiter.Wait`, and what the kernel checks the buffer against.
+/// **THE BUFFER A `Waiter.Wait` CALLER MUST SUPPLY** — the header, then a body
+/// region big enough for the largest delivery there is (sawos design 15).
+///
+/// **IT IS MAX-SIZED AND THE COPY IS NOT** (ruled Sep 1, user). A parked waiter
+/// cannot predict which arm fires, so the BUFFER has to hold the biggest answer
+/// any of its attachments could give; the KERNEL copies only what the delivery
+/// needs — four header words for a word-payload kind, four words plus
+/// `body_len` for a reply carrying data. So the record's growth costs a
+/// non-pipe waiter buffer SPACE and never copy TIME.
+///
+/// A STRUCT RATHER THAN A WORD ARRAY, and the reason is the body's alignment.
+/// Declaration order IS the layout (design 58), so the header words put the
+/// struct at machine-word alignment — which `Waiter.Wait` requires — and the
+/// body region lands at exactly `wait_header_bytes()`, which is the offset the
+/// kernel writes it at. A `[UInt8; N]` beside a `[UInt; N]` in one array could
+/// not have said that.
+public struct WaitBuffer {
+    public header: [UInt; WAIT_HEADER_WORDS],
+    public body: [UInt8; PIPE_BODY_BYTES],
+}
+
+/// Bytes in a wait record's HEADER — where the body region starts, and exactly
+/// what a word-payload delivery writes.
 ///
 /// A FUNCTION AND NOT A `static`, which is a language limitation rather than a
 /// choice: `sizeof<UInt>()` does not fold in a static initializer, even though
 /// design 186's own diagnostic lists it among the things that do (DF-178f). The
 /// arithmetic folds perfectly well in an ordinary expression, so the constant is
 /// spelled where it is used and this is the one place it is written.
-public func wait_record_bytes() -> Int {
-    WAIT_RECORD_WORDS * sizeof<UInt>()
+public func wait_header_bytes() -> Int {
+    WAIT_HEADER_WORDS * sizeof<UInt>()
 }
+
+/// Bytes in a wait record BUFFER on THIS machine — the minimum capacity a caller
+/// must give `Waiter.Wait`, and what the kernel checks the buffer against.
+///
+/// **IT MOVED IN M4 UNIT 3, AND THE vDSO DISCIPLINE IS WHAT MADE THAT FREE**
+/// (design 10 ruling 11(a)): every caller's buffer comes out of `sos.waiter`'s
+/// own frame, so the number is written once here and read once there.
+public func wait_record_bytes() -> Int {
+    sizeof<WaitBuffer>()
+}
+
+static_assert(sizeof<WaitBuffer>() >= WAIT_HEADER_WORDS * sizeof<UInt>()
+                                      + PIPE_BODY_BYTES,
+              "a wait buffer must hold the header AND a whole message body")
 
 /// What became ready, decoded — one case per waitable kind.
 ///
@@ -2414,19 +2580,114 @@ public func wait_record_bytes() -> Int {
 /// once. That is the property supervision needs — there is no window in which a
 /// death can be missed — and it is why this case has nothing to say about
 /// draining.
+///
+/// **THE FOUR PIPE ARMS ARE M4 UNIT 3's** (sawos design 15), and one of them is
+/// unlike everything above it: `Reply` CARRIES THE ANSWER'S BYTES. The other
+/// three are word-shaped levels in the mould of the four that shipped — a
+/// readable outlet, a postable inlet, an abandoned claim — and the reply is
+/// design 10 ruling 11(a)'s whole point, which is that the wait IS the delivery
+/// and a composed client never has to call `resolve` at all.
 public enum WaitPayload {
     case Event(word: UInt),
     case Interrupt(line: UInt),
     case Timer(fires: UInt),
     case Process(status: UInt),
+    /// The SERVER end has something, or will never have anything again.
+    case Readable(state: OutletLevel),
+    /// The CLIENT end has room to post, or nobody is left to take.
+    case Room(state: InletLevel),
+    /// The answer to one exchange — the bytes, or the news that nobody will
+    /// ever write them.
+    case Reply(outcome: ReplyDelivery),
+    /// The claim behind this obligation was dropped. There is nothing to say
+    /// beyond the fact, which is why this case has no payload.
+    case Abandoned,
 }
 
+/// The tier the `Reply` payload carries upward (design 139's wrapper rule): an
+/// enum holding a NoCopy payload declares a policy exactly as a struct with such
+/// a field does, and this is the compiler asking for it.
+extension WaitPayload: NoCopy {}
+
+/// A `PipeOutlet`'s readable level, decoded (sawos design 15).
+///
+/// **DRAIN-THEN-TERMINAL IS THE ORDER, so `Msg` WINS while anything is staged**
+/// (design 230's close-drains-first rule, which `PipeOutletOp.Take` already
+/// follows): a sender exiting mid-conversation does not un-send what it sent, so
+/// a waiter is told `PeerGone` only once the ring is dry as well.
+public enum OutletLevel: UInt {
+    case Msg = 0,
+    case PeerGone = 1,
+}
+
+/// A `PipeInlet`'s room-to-post level, decoded (design 10 ruling 8).
+///
+/// **`PeerGone` WINS HERE, and the asymmetry with `OutletLevel` is the ops'**:
+/// `PipeInletOp.Post` asks about the outlet column BEFORE it asks about the
+/// ring, because nobody being able to take is the stronger fact — a free slot
+/// would be a place to put a message with no future. So a waiter learns which
+/// of the two it woke for without a probe post, which is what ruling 8 asks the
+/// payload word for.
+public enum InletLevel: UInt {
+    case Room = 0,
+    case PeerGone = 1,
+}
+
+/// Which of `ReplyDelivery`'s two shapes a reply record carries — the wire
+/// discriminator that its decoded form is built from.
+public enum ReplyLevel: UInt {
+    case Data = 0,
+    case PeerClosed = 1,
+}
+
+/// A message body, and how many of its bytes are real (sawos design 15).
+///
+/// **ONE STRUCT, DECLARED BY THE UNIT THAT NEEDED IT FIRST** (user-ruled Sep 1,
+/// over an inline array case): unit 4's message-carrying deliveries will hand
+/// over exactly this shape beside their handles, so a reply delivery and a
+/// message delivery grow ONE type rather than two that must be kept alike.
+///
+/// **`NoCopy`, AND THAT IS API DISCIPLINE RATHER THAN OWNERSHIP.** The bytes are
+/// plain data and would copy for free (design 159's automatic tier), which is
+/// exactly the problem: `PIPE_BODY_BYTES` of inline storage should not be
+/// duplicated by an accident of binding. Callers that only route the bytes take
+/// them by REFERENCE out of the payload.
+public struct PipeMsg {
+    public len: UInt,
+    public bytes: [UInt8; PIPE_BODY_BYTES],
+}
+
+extension PipeMsg: NoCopy {}
+
+/// What arrived for a claim: the answer, or the news that there will not be one.
+///
+/// **`PeerClosed` IS THE SAME FACT `PipeReplyOp.Resolve` REPORTS** and it means
+/// exactly what it means there — the server dropped its obligation, or the
+/// connection's server end went while the message was still staged. There is no
+/// third case, because a `Waiter` only ever delivers a level that is READY and
+/// "still pending" is what not-ready means.
+public enum ReplyDelivery {
+    case Data(msg: PipeMsg),
+    case PeerClosed,
+}
+
+extension ReplyDelivery: NoCopy {}
+
 /// `Waiter.Wait`'s answer: the attacher's key, and what fired.
+///
+/// **`NoCopy` SINCE M4 UNIT 3** (sawos design 15), by the wrapper-carries-tier
+/// rule and by API discipline together: the `Reply` payload owns
+/// `PIPE_BODY_BYTES` of inline storage, so a result that duplicated on a plain
+/// binding would copy a message body where nothing asked for one. Reading the
+/// answer is a `match` on the PLACE — `match result.what`, which borrows — so
+/// nothing about how the four shipped kinds are read changed.
 public struct WaitResult {
     /// The word supplied at `add`, handed back unread.
     public key: UInt,
     public what: WaitPayload,
 }
+
+extension WaitResult: NoCopy {}
 
 // =============================================================================
 // The Clock and Timer records (spec §2's Clock/Timer rows; design 232 unit 1)
@@ -2653,28 +2914,13 @@ public enum BootHandleKind: UInt {
 // caller that meets a full ring is told `WouldBlock` without ever having to know
 // the number.
 
-/// **THE MESSAGE BODY'S MAXIMUM, AS A BUILD DEFINE** (spec §2.1's fixed body;
-/// sawos design 10 ruling 6).
-///
-/// It is the size of one staging slot, the largest `len` a `PipeInletOp.Post`
-/// may name, and the smallest buffer a `PipeOutletOp.Take` may be handed. All
-/// three are one number because they are one fixed slot seen from three sides.
-///
-/// §2.1 ratifies a FIXED body maximum without fixing the number, so this is the
-/// tree's choice within it: large enough for a protocol header plus a small
-/// payload, small enough that `PIPE_INFLIGHT` slots per connection stay a
-/// zerofill array rather than a budget anybody has to think about. The assert
-/// below pins the range the ratified sentence implies — a body must hold at
-/// least a machine word, and must stay small enough that one bounded copy is
-/// still a bounded copy (see design 1's preemption-point audit).
-public static PIPE_BODY_BYTES: Int = 128
-
-static_assert(PIPE_BODY_BYTES >= 8,
-              "a message body must hold at least one 64-bit word")
-static_assert(PIPE_BODY_BYTES <= 1024,
-              "a message body is copied with interrupts masked — keep it bounded")
-static_assert(PIPE_BODY_BYTES % 8 == 0,
-              "a staging slot must be doubleword-sized on both profiles")
+// **`PIPE_BODY_BYTES` USED TO BE DECLARED HERE**, and it moved to just above the
+// wait record (sawos design 15, M4 unit 3). Nothing about it changed except its
+// line: ruling 11(a) put a BODY REGION of exactly that many bytes into every
+// wait-record buffer, an array length is a constant expression, and statics fold
+// in DECLARATION ORDER — so the number has to be above the first thing that
+// reads it. The reasoning for why it is in `sosabi` at all is unchanged and is
+// carried with it.
 
 /// Words in a `Process.PipeCreate` answer: the inlet handle, then the outlet.
 ///

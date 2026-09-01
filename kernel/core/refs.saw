@@ -46,6 +46,35 @@
 //! charged process. `reap_unreferenced` below is what took its place and the
 //! block above it carries the argument.
 //!
+//! # AND M4 UNIT 3 MOVED THE DELIVERY IN HERE (sawos design 15)
+//!
+//! `kcore.wake` used to be its own module, one line above this one: readiness
+//! becoming a woken thread. It is now the second half of this file, and the
+//! reason is that the two became MUTUALLY RECURSIVE and a module boundary
+//! cannot hold a cycle (DF-232e — an import cycle is not diagnosed, it silently
+//! empties a module's export table and blames a third file).
+//!
+//! Both directions arrived with `designs/010`'s M4 unit-3 rulings, and each is
+//! a sentence of one of them:
+//!
+//!   - **A DELIVERY NOW DROPS A REFERENCE.** Ruling 9(b)'s `AttachMode.OneShot`
+//!     detaches AT DELIVERY, and ruling 11(b) makes a REPLY delivery detach
+//!     whatever mode was passed — and an attachment is a counted reference
+//!     (design 7 D-1), so `deliver_attachment` unrefs. That is delivery
+//!     reaching into the ledger.
+//!   - **A DROPPED REFERENCE NOW DELIVERS.** The peer-gone terminal levels
+//!     (`designs/010` ruling 2's doctrine: nothing parked can be silently
+//!     doomed) fire exactly when a column reaches zero, and the only function
+//!     that observes a column reaching zero is `drop_reference` below. That is
+//!     the ledger reaching into delivery.
+//!
+//! What did NOT change is the rule `kcore`'s facade states about where a seam
+//! lives: the STATE of a thing sits below the process teardown and ACTING on it
+//! sits above. The wait TABLES are still `waitables`, one module down, and this
+//! file is still the acting half — it simply now does both kinds of acting,
+//! because they turned out to be one act. Its altitude is unchanged: it needs
+//! `process`'s copy door, which it sits above, and nothing above itself.
+//!
 //! # ZERO FREES, SYNCHRONOUSLY (D-1)
 //!
 //! The kernel is one context running to completion, so the count hits zero
@@ -82,10 +111,11 @@
 //! know — comes through here.
 
 import hal
-import sosabi.{EventMode, ObjType, SosStatus}
-import kcore.limits.{MAX_IOMEMORIES, MAX_MEMORIES, MAX_PIPES}
-import kcore.diag.{fatal_kernel}
-import kcore.result.{op_status, write_result}
+import sosabi.{EventMode, ObjType, SosStatus, WAIT_HEADER_WORDS, WaitTag,
+               wait_header_bytes}
+import kcore.limits.{MAX_IOMEMORIES, MAX_MEMORIES, MAX_PIPES, PIPE_INFLIGHT}
+import kcore.diag.{ExitCode, fatal, fatal_kernel}
+import kcore.result.{op_ok, op_status, write_result}
 import kcore.threads.{THREADS, ThreadState, frame_slot, ready_push}
 import kcore.objects.{
     IOMEMORIES,
@@ -97,14 +127,18 @@ import kcore.objects.{
     NO_ROW,
     PIPES,
     PIPE_EXCHANGES,
+    PIPE_REPLY_ATTACH,
     PIPE_REPLY_REFS,
+    PIPE_REQUEST_ATTACH,
     PIPE_REQUEST_REFS,
     QuotaKind,
     SlotState,
     exchange_can_settle,
+    exchange_pipe,
     exchange_settle,
     free_pipe,
     pipe_drop_staged,
+    pipe_exchange_at,
     pipe_idle,
     quota_credit,
 }
@@ -117,11 +151,18 @@ import kcore.waitables.{
     INTERRUPTS,
     InterruptSlot,
     WAITERS,
+    WaitAnswer,
     WaitableKind,
     WaiterSlot,
+    accumulate,
+    detach_attachment,
     set_waitable_attachment,
+    waitable_answer,
+    waitable_attachment,
+    waitable_consume,
+    waitable_ready,
 }
-import kcore.process.{PROCESSES, reclaim_process_slot}
+import kcore.process.{PROCESSES, copy_out, reclaim_process_slot}
 
 /// Something now names object `slot` of kind `kind`.
 ///
@@ -278,6 +319,21 @@ func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
             // may drop its inlet and still resolve every claim it holds — which
             // is what makes post-then-drop-the-inlet a legal shape rather than a
             // way to lose an answer.
+            //
+            // **WHAT IS NEW IN M4 UNIT 3 IS THAT SOMEBODY MAY BE PARKED ON THE
+            // FAR END** (sawos design 15; `designs/010` ruling 2's peer-gone
+            // doctrine). The OUTLET's readable level is drain-then-terminal, so
+            // an inlet column reaching zero raises it — `PeerGone` once the ring
+            // is dry — and a server waiting for a message that can never come
+            // has to be TOLD rather than left blocked. Reentrancy: the delivery
+            // can detach and unref the outlet's own attachment, which can take
+            // that column to zero and free the connection under us; the
+            // `pipe_frees_now` below is guarded on `PIPES[slot].state` for
+            // exactly that, and its docstring already says the test is not
+            // defensive.
+            if PIPES[slot].inlet_refs == 0 {
+                notify_if_ready(WaitableKind.PipeOutlet, slot)
+            }
             pipe_frees_now(slot)
         },
         case PipeOutlet -> {
@@ -291,7 +347,23 @@ func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
                 // server. `pipe_drop_staged` empties the list and gives back
                 // every exchange nobody names; the ones a live claim still names
                 // stay, holding the `PeerClosed` their `Resolve` is owed.
+                //
+                // **IT RUNS BEFORE THE NOTIFICATIONS, AND THE ORDER IS THE
+                // ITERATE-WHILE-REMOVING CARE THIS UNIT OWES** (sawos design 15,
+                // on `designs/010` ruling 9(a)'s census obligation). The drop
+                // walks a LIST threaded through `PIPE_NEXT`, and settling an
+                // exchange zeroes its link; a delivery inside that walk could
+                // settle a node the walk had not reached yet and truncate it.
+                // So the list walk finishes first, and the notifications go out
+                // afterwards as a bounded SCAN of the ring — which needs no list
+                // at all and therefore cannot be broken by what it delivers.
                 pipe_drop_staged(slot)
+                // The client's room-to-post level is now `PeerGone`: posting is
+                // over, which is a better thing to be woken for than space.
+                notify_if_ready(WaitableKind.PipeInlet, slot)
+                // ...and every claim still naming a staged message learns that
+                // its obligation can never be minted.
+                notify_claims(slot)
             }
             pipe_frees_now(slot)
         },
@@ -310,14 +382,37 @@ func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
         // `Resolve` at the moment they need an answer. Design 13's "the two
         // columns are the peer-gone state, and no flag beside them says so",
         // inherited exactly.
+        //
+        // **AND EACH ZERO IS NOW ALSO NEWS FOR THE OTHER HALF** (sawos design
+        // 15). §2.1 ratifies both directions and unit 2 could only answer them
+        // when somebody asked; a waitable pair means somebody may be PARKED, so
+        // the transition is delivered here. The claim column at zero raises the
+        // obligation's ABANDONED level (the server's cancellation watcher); the
+        // obligation column at zero on a `Taken` exchange raises the claim's
+        // reply-ready level, carrying `PeerClosed`.
+        //
+        // REENTRANCY, stated at the site: a reply delivery DETACHES whatever
+        // mode it was attached under (ruling 11(b)), so `notify_if_ready` below
+        // can re-enter this very function on the other column, settle the
+        // exchange and cascade into `free_pipe`. That is safe because the
+        // predicate this arm ends with reads the exchange AFTERWARDS —
+        // `exchange_can_settle` answers `false` for a `Free` slot, which is the
+        // honest answer for "should the caller free it" once somebody else
+        // already has.
         case PipeReply -> {
             if PIPE_REPLY_REFS[slot] == 0 { return false }
             PIPE_REPLY_REFS[slot] = PIPE_REPLY_REFS[slot] - 1
+            if PIPE_REPLY_REFS[slot] == 0 {
+                notify_if_ready(WaitableKind.PipeRequest, slot)
+            }
             exchange_can_settle(slot)
         },
         case PipeRequest -> {
             if PIPE_REQUEST_REFS[slot] == 0 { return false }
             PIPE_REQUEST_REFS[slot] = PIPE_REQUEST_REFS[slot] - 1
+            if PIPE_REQUEST_REFS[slot] == 0 {
+                notify_if_ready(WaitableKind.PipeReply, slot)
+            }
             exchange_can_settle(slot)
         },
         case Process -> {
@@ -329,6 +424,28 @@ func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
         case Clock -> false,
         case Thread -> false,
         case Unbound -> false,
+    }
+}
+
+/// Give exchange `x`'s ring slot back — **and tell whoever is waiting for room
+/// on the connection's client end** (design 10 ruling 8; sawos design 15).
+///
+/// **A SETTLE IS THE ONLY THING THAT MAKES A FULL RING NOT FULL**, so it is the
+/// only place the inlet's room level can rise, and design 10 ruling 8 exists
+/// precisely so a refused poster has something better than a poll loop to do
+/// about it. `exchange_settle` itself lives one module down with the storage it
+/// gives back, and this is the acting half wrapped around it — the same split
+/// this file's header describes for every other last rite.
+///
+/// The `Live` test after the settle is not defensive: settling the LAST exchange
+/// of a connection whose two endpoint columns are already zero frees the row
+/// (`exchange_settle`'s own cascade), and a freed row has no level to raise.
+func settle_exchange(x: Int) unsafe {
+    let c = exchange_pipe(x)
+    exchange_settle(x)
+    match PIPES[c].state {
+        case Free -> {},
+        case Live -> { notify_if_ready(WaitableKind.PipeInlet, c) },
     }
 }
 
@@ -475,7 +592,8 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
                 let target = ATTACHMENTS[a].target
                 ATTACHMENTS[a] = Attachment(state: SlotState.Free,
                                             kind: WaitableKind.Event, target: 0,
-                                            waiter: 0, key: 0, link: 0)
+                                            waiter: 0, key: 0, oneshot: false,
+                                            link: 0)
                 set_waitable_attachment(watched, target, 0)
                 unref_waitable(watched, target)
                 cur = next
@@ -645,8 +763,8 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
         // storage inside the `PIPES` row — and that cascade terminates because an
         // exchange references its connection and a connection references no
         // exchange.
-        case PipeReply -> { exchange_settle(slot) },
-        case PipeRequest -> { exchange_settle(slot) },
+        case PipeReply -> { settle_exchange(slot) },
+        case PipeRequest -> { settle_exchange(slot) },
         case System -> {
             fatal_kernel("free_object on the System singleton", slot as UInt)
         },
@@ -766,6 +884,15 @@ func waitable_obj_type(kind: WaitableKind) -> ObjType {
         case Interrupt -> ObjType.Interrupt,
         case Timer -> ObjType.Timer,
         case Process -> ObjType.Process,
+        // **AND THE FOUR PIPE KINDS COST IT FOUR LINES** (sawos design 15),
+        // which is what the translation being TOTAL is for: the two enums are
+        // numbered differently on purpose — `WaitableKind` names only what can
+        // be attached — and a cast between them would have been a coincidence
+        // that stopped being true at exactly this unit.
+        case PipeOutlet -> ObjType.PipeOutlet,
+        case PipeInlet -> ObjType.PipeInlet,
+        case PipeReply -> ObjType.PipeReply,
+        case PipeRequest -> ObjType.PipeRequest,
     }
 }
 
@@ -793,4 +920,258 @@ public(package) func unref_waitable(kind: WaitableKind, slot: Int) unsafe {
 /// doing the freeing they have always done.
 public(package) func unref_waitable_teardown(kind: WaitableKind, slot: Int) unsafe {
     unref_teardown(waitable_obj_type(kind), slot)
+}
+
+// =============================================================================
+// DELIVERY — readiness turning into a woken thread (spec §2.2), and the
+// attachment lifetimes that ride on it (`designs/010` rulings 9 and 11(b))
+// =============================================================================
+//
+// **THIS WAS `kcore.wake` UNTIL M4 UNIT 3** (sawos design 15), and the file
+// header carries the argument for why it is here instead: a delivery drops a
+// reference and a dropped reference delivers, so the two are one act and a
+// module boundary between them would be the cycle DF-232e does not diagnose.
+//
+// Three funnels, one act, exactly as before: `notify_ready` is the only place a
+// ready waitable reaches its Waiter, `wake_one_waiter` hands the answer to at
+// most one parked thread, and `deliver_attachment` is where the answer is READ,
+// the READINESS SPENT and — since ruling 9(b) — THE ATTACHMENT RELEASED, all in
+// one step, so no kind is drained on one path and not the other.
+
+/// The record `Waiter.Wait` answers with, in kernel memory (spec §2.2, as
+/// amended by design 178 unit 3 rider 3 and grown a fourth word by
+/// `designs/010` ruling 11(a)).
+///
+/// Declaration order IS the layout (design 58), so the field names here and the
+/// word indices `sosabi` publishes are one description — pinned by the assert
+/// below rather than by agreement. **THE BODY IS NOT A FIELD**: it is a separate
+/// copy at `wait_header_bytes()` into the same caller buffer, out of the ring
+/// slot it already lives in, which is what makes the copy sized to the DELIVERY
+/// instead of to the record.
+struct WaitRecord {
+    key: UInt,
+    tag: UInt,
+    payload: UInt,
+    body_len: UInt,
+}
+
+static_assert(sizeof<WaitRecord>() == WAIT_HEADER_WORDS * sizeof<UInt>(),
+              "the wait record header must be exactly the words sosabi publishes")
+
+/// Build one and hand it to a process. The only producer of the wire form.
+///
+/// A REFUSED DESTINATION HERE IS A KERNEL BUG, NOT A PROCESS ERROR, and that is
+/// why it stops the machine rather than terminating anybody. `Waiter.Wait`
+/// validates the buffer AT THE CALL — that is exactly what `copy_out_check`
+/// exists for and what `ThreadSlot.wait_buf`'s docstring records — and a
+/// process's writable window is fixed for its life, so a buffer that passed
+/// then cannot fail now. Reaching either arm means the two facts disagree, which
+/// is a kernel invariant broken and nothing a process could have done. **BOTH
+/// COPIES ARE INSIDE THE ONE CHECKED WINDOW**: the check was for
+/// `wait_record_bytes()`, which is the header plus a whole message body, and
+/// `body_len` can never exceed `PIPE_BODY_BYTES`.
+///
+/// It is also the shape this code's ALTITUDE forces (sawos design 2): the wake
+/// path runs below the scheduler — a timer expiry reaches here out of the IRQ
+/// path with no current thread of its own — so terminating a process from here
+/// would be terminating one with nowhere to go next. The door reports, and the
+/// callers that can kill are the ones above the switch point.
+func deliver_wait_record(p: Int, dst: UInt, key: UInt,
+                         answer: &WaitAnswer) unsafe {
+    var rec = WaitRecord(key: key, tag: answer.tag as UInt,
+                         payload: answer.payload, body_len: answer.body_len)
+    if let why = copy_out(p, dst, ((&var rec) as UnsafePointer<WaitRecord>) as UInt,
+                          wait_header_bytes() as UInt) {
+        fatal("wait record refused by the copy door", (why as UInt8) as UInt,
+              dst, p as UInt, ExitCode.ProcessFault)
+    }
+    // **THE SECOND COPY IS THE WHOLE OF RULING 11(a)** — and it does not happen
+    // at all for the seven kinds whose answer is a word. A delivery that carries
+    // bytes carries them out of the ring slot that already holds them, so the
+    // reply never transits a kernel buffer and the record's growth costs a
+    // Timer waiter nothing but address space.
+    if answer.body_len != 0 {
+        if let why = copy_out(p, dst + (wait_header_bytes() as UInt),
+                              answer.body_src, answer.body_len) {
+            fatal("wait record body refused by the copy door",
+                  (why as UInt8) as UInt, dst, p as UInt, ExitCode.ProcessFault)
+        }
+    }
+}
+
+/// **DOES A DELIVERY OF THIS KIND CONSUME THE SUBSCRIPTION, whatever mode it was
+/// attached under?** (`designs/010` ruling 11(b)).
+///
+/// ONE KIND SAYS YES, and it says yes because of what its delivery IS: a reply
+/// is a ONE-SHOT, the record carries the answer, and the exchange is discharged
+/// by the copy-out — so by ruling 9(a)'s own logic (an act that consumes the
+/// object detaches it) the attachment goes with it. A persistent reading would
+/// be a subscription to an event that has already happened for the last time.
+///
+/// Every other kind is the attacher's choice, which is `Attachment.oneshot`.
+/// Written as an exhaustive match rather than a `kind == PipeReply` so that the
+/// next one-shot waitable has to answer here too.
+func delivery_consumes(kind: WaitableKind) -> Bool {
+    match kind {
+        case Event -> false,
+        case Interrupt -> false,
+        case Timer -> false,
+        case Process -> false,
+        case PipeOutlet -> false,
+        case PipeInlet -> false,
+        case PipeReply -> true,
+        case PipeRequest -> false,
+    }
+}
+
+/// ANSWER ONE ATTACHMENT INTO A PROCESS'S MEMORY, spend what the answer spent,
+/// and release the subscription if this delivery ended it. Its entry points,
+/// both of them:
+///
+///   - `waiter_wait`, when something was ALREADY ready and nothing parks;
+///   - `wake_one_waiter`, handing a ready attachment to a thread that did.
+///
+/// A funnel rather than two call sites, because "read the answer" and "record
+/// that it was delivered" have to be one step: split apart, a kind whose
+/// readiness is CONSUMED by delivery — the Timer and, since Aug 17, the Event —
+/// would be drained on one path and not the other, and the bug would be a
+/// periodic timer that reports the same fire twice to whichever caller forgot.
+/// Both paths are equally "a record reached a thread", which is exactly the
+/// event `waitable_consume` is about.
+///
+/// THE READ AND THE CLEAR ARE ONE ACT, and this function's body is where that is
+/// true: `waitable_answer` takes the value, `waitable_consume` clears it, and
+/// nothing between them can run. The kernel takes no trap in kernel mode (design
+/// 178 D2 — interrupts are taken from user mode only), so a signal cannot land
+/// inside this window; one landing after it finds the object empty and re-arms
+/// readiness with its own bits alone, which is neither a loss nor a double
+/// count.
+///
+/// **AND THE DETACH IS THE THIRD PART, ADDED BY M4 UNIT 3** (`designs/010`
+/// rulings 9(b) and 11(b)). An attachment ends here when the attacher asked for
+/// one delivery (`AttachMode.OneShot`) or when the KIND's delivery is inherently
+/// consuming — and because an attachment is a counted reference, ending it drops
+/// one. **THAT DROP CAN CASCADE ALL THE WAY TO A FREED CONNECTION**: a reply
+/// delivered to a consuming attachment takes the exchange's claim column to
+/// zero, which settles the ring slot, which may free the `PIPES` row it lives
+/// in. Nothing above this line reads any of that afterwards — the answer, the
+/// key and the waiter were all taken before the detach, and `wake_one_waiter`
+/// below touches only the THREAD — which is the reentrancy argument this site
+/// owes.
+///
+/// It is also why the read of `ATTACHMENTS[a]` happens up front: after the
+/// detach that slot is `Free` and belongs to whoever allocates next.
+public(package) func deliver_attachment(p: Int, dst: UInt, a: Int) unsafe {
+    let kind = ATTACHMENTS[a].kind
+    let target = ATTACHMENTS[a].target
+    let key = ATTACHMENTS[a].key
+    let waiter = ATTACHMENTS[a].waiter
+    let ends = ATTACHMENTS[a].oneshot || delivery_consumes(kind)
+
+    let answer = waitable_answer(kind, target)
+    deliver_wait_record(p, dst, key, &answer)
+    waitable_consume(kind, target)
+
+    if ends {
+        detach_attachment(waiter, a)
+        unref_waitable(kind, target)
+    }
+}
+
+/// Hand attachment `a` to ONE thread parked on `w`, if any is (§2.2).
+///
+/// The record goes into the woken thread's own buffer and its STATUS into the
+/// woken thread's frame, both HERE and nowhere else — the same discipline
+/// `exit_thread` follows for a joiner: a thread that blocked in a syscall was
+/// answered by nobody when it blocked, so its waker is its single writer.
+///
+/// THE WRITER IS A DIFFERENT THREAD from the one being answered, which is sound
+/// today because M2 has one address space; `copy_out`'s docstring is where that
+/// stops being free. Since the Interrupt object landed the writer need not be a
+/// THREAD at all — the trap path and the idle poll both reach here — which
+/// changes nothing about the write and everything about why the check that
+/// validated the buffer had to happen back at the `Wait` call.
+///
+/// **THE THREAD LEAVES THE BLOCKED LIST BEFORE THE DELIVERY**, which is what
+/// keeps M4 unit 3's cascades away from that list: a delivery can now free
+/// objects and even a whole connection, and none of it can reach a walk this
+/// function has already finished.
+public(package) func wake_one_waiter(w: Int, a: Int) unsafe {
+    let head = WAITERS[w].blocked
+    if head == 0 {
+        return
+    }
+    let slot = head - 1
+    WAITERS[w].blocked = THREADS[slot].link
+    THREADS[slot].link = 0
+
+    deliver_attachment(THREADS[slot].process, THREADS[slot].wait_buf, a)
+    THREADS[slot].wait_buf = 0
+    write_result(frame_slot(slot), op_ok())
+    THREADS[slot].state = ThreadState.Runnable
+    ready_push(slot)
+}
+
+/// A waitable just became ready: tell its Waiter, if it has one.
+///
+/// THE ONE PLACE READINESS TURNS INTO A WAKE, reached from every producer there
+/// is — an Event's `Signal`, an Interrupt's line firing, a Timer's expiry, a
+/// process ending, and since M4 unit 3 a pipe's four levels. None of them knows
+/// anything about waiters beyond the attachment field the matrix reads.
+public(package) func notify_ready(kind: WaitableKind, slot: Int) unsafe {
+    let a = waitable_attachment(kind, slot)
+    if a == 0 {
+        return
+    }
+    wake_one_waiter(ATTACHMENTS[a - 1].waiter, a - 1)
+}
+
+/// `notify_ready` for a caller that has NOT established readiness — ask first.
+///
+/// **THE PEER-GONE SITES ARE WHY IT EXISTS** (sawos design 15). Every other
+/// producer knows it just made something ready: a signal wrote a word, a line
+/// fired, a deadline passed. A reference reaching zero is different — it raises
+/// a level that may ALREADY have been raised (a readable outlet with messages
+/// still staged), or may not be raised at all (an obligation column falling on
+/// an exchange whose reply was already delivered) — so the transition is asked
+/// about rather than asserted. Cheap: the attachment field is one load and
+/// answers "nobody is watching" for almost every call.
+public(package) func notify_if_ready(kind: WaitableKind, slot: Int) unsafe {
+    if waitable_attachment(kind, slot) == 0 {
+        return
+    }
+    if not waitable_ready(kind, slot) {
+        return
+    }
+    notify_ready(kind, slot)
+}
+
+/// Tell every watched CLAIM in connection `c` that its level just changed.
+///
+/// **A SCAN AND NOT A LIST WALK, deliberately** (`designs/010` ruling 9(a)'s
+/// iterate-while-removing census). It is called at the outlet's zero-arm, where
+/// each delivery it makes can settle the very exchange it just visited and can
+/// cascade into freeing the connection — so it must not be holding a position in
+/// any structure those acts edit. A bounded walk over the ring's fixed indices
+/// holds nothing: an exchange settled underneath it becomes `Free`, which is
+/// unattached, which the next iteration skips. `PIPE_INFLIGHT` is 16 and
+/// `kcore.limits`' audit note already covers a scan of it.
+func notify_claims(c: Int) unsafe {
+    var i: Int = 0
+    while i < PIPE_INFLIGHT {
+        notify_if_ready(WaitableKind.PipeReply, pipe_exchange_at(c, i))
+        i = i + 1
+    }
+}
+
+/// §2.4's signal: accumulate, NEVER block, and tell the Waiter if there is one.
+public(package) func signal_event(slot: Int, bits: UInt) unsafe {
+    accumulate(slot, bits)
+    // A signal of nothing is not a readiness. Both modes can produce it —
+    // `signal(0)` in either — and reporting it would wake a waiter for a word
+    // it would then read as empty.
+    if EVENTS[slot].word == 0 {
+        return
+    }
+    notify_ready(WaitableKind.Event, slot)
 }

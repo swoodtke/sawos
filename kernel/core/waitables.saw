@@ -19,7 +19,8 @@
 //! one now reaches down into the process table, and `process` reaches nothing
 //! here.
 
-import sosabi.{EventMode, WaitTag, process_status_word}
+import sosabi.{EventMode, InletLevel, OutletLevel, ReplyLevel, WaitTag,
+               process_status_word}
 import kcore.limits.{
     MAX_ATTACHMENTS,
     MAX_EVENTS,
@@ -30,7 +31,20 @@ import kcore.limits.{
     NO_INTERRUPT,
     NO_WAITER,
 }
-import kcore.objects.{SlotState}
+import kcore.objects.{
+    ExchangeState,
+    PIPES,
+    PIPE_EX_STATE,
+    PIPE_LENS,
+    PIPE_REPLY_ATTACH,
+    PIPE_REPLY_REFS,
+    PIPE_REQUEST_ATTACH,
+    PIPE_REQUEST_REFS,
+    SlotState,
+    exchange_body_addr,
+    exchange_pipe,
+    pipe_has_room,
+}
 import kcore.threads.{NEED_RESCHED, THREADS, ThreadState}
 import kcore.time.{TIMERS, saturating_add}
 // **THE ONE IMPORT M3 UNIT 5.5 ADDED, AND IT MOVED THIS MODULE'S ALTITUDE**
@@ -62,6 +76,12 @@ import kcore.process.{PROCESSES, ProcessState}
 /// **THE FOURTH KIND COLLECTED THAT PROMISE** (sawos design 8, M3 unit 5.5):
 /// adding `Process` here failed all five matrix arms and `waitable_obj_type`
 /// beside them, so the compiler enumerated the work rather than a reviewer.
+///
+/// **AND M4 UNIT 3 COLLECTED IT FOUR MORE TIMES AT ONCE** (sawos design 15, on
+/// design 10 rulings 8 and 11): the four pipe kinds moved from `NotWaitable` to
+/// waitable, which is not a new object anywhere — no slab, no op, no kind —
+/// and every one of the five matrix questions failed to compile until each of
+/// the four had an answer.
 public(package) enum WaitableKind: UInt8 {
     case Event = 0,
     case Interrupt = 1,
@@ -71,6 +91,23 @@ public(package) enum WaitableKind: UInt8 {
     /// waited on, it is the process itself, and what a supervisor attaches is
     /// the handle `process_create` already gave it.
     case Process = 3,
+    /// A `PipeOutlet` — the SERVER end, READABLE while a message is staged or
+    /// the client end is gone (spec §2.2's waitable list). `slot` is the
+    /// CONNECTION's.
+    case PipeOutlet = 4,
+    /// A `PipeInlet` — the CLIENT end, POSTABLE while the ring has a free slot
+    /// or the server end is gone (design 10 ruling 8). `slot` is the
+    /// connection's, so the two endpoint kinds index one table and differ only
+    /// in which column and which attachment field they read — design 13 D-1's
+    /// mechanism reaching the wait machinery.
+    case PipeInlet = 5,
+    /// A `PipeReply` — the CLIENT's claim, ready once the answer has been
+    /// written or can never be (design 10 ruling 11(a)). `slot` is an EXCHANGE,
+    /// and this is the one waitable whose delivery carries BYTES.
+    case PipeReply = 6,
+    /// A `PipeRequest` — the SERVER's obligation, ready once the claim behind it
+    /// has been abandoned (§2.1's ratified early notice). `slot` is an exchange.
+    case PipeRequest = 7,
 }
 
 /// A waitable the dispatch has resolved: which table, which slot.
@@ -207,6 +244,17 @@ public(package) struct Attachment {
     /// The word-sized key the attacher supplied (§2.2). The kernel stores it
     /// and hands it back; it never interprets it.
     public(package) key: UInt,
+    /// **DETACH AT DELIVERY** (design 10 ruling 9(b); sawos design 15). Set from
+    /// `WAITER_ADD_ONESHOT` at the attach, and read once — when a record for
+    /// this attachment's key is COPIED OUT, never at mere readiness. One-shot is
+    /// a property of the ATTACHMENT, the attacher's choice like the key, which
+    /// is why it is a field here and not a bit on the waitable.
+    ///
+    /// It is a `Bool` rather than the userspace `AttachMode` enum for the reason
+    /// `pending` is one on an `InterruptSlot`: the kernel's question is a yes/no
+    /// about this attachment, and the mode VALUE is the typed surface's
+    /// vocabulary. What crosses the boundary is a flag bit either way.
+    public(package) oneshot: Bool,
     /// Next attachment on that waiter's list (slot + 1).
     public(package) link: Int,
 }
@@ -225,7 +273,7 @@ public(package) unsafe static var INTERRUPTS: [InterruptSlot; MAX_INTERRUPTS] = 
 
 public(package) unsafe static var ATTACHMENTS: [Attachment; MAX_ATTACHMENTS] = [
     Attachment(state: SlotState.Free, kind: WaitableKind.Event, target: 0,
-               waiter: 0, key: 0, link: 0); MAX_ATTACHMENTS]
+               waiter: 0, key: 0, oneshot: false, link: 0); MAX_ATTACHMENTS]
 
 /// Take a free event slot, or `NO_EVENT` when the slab is empty.
 public(package) func alloc_event() unsafe -> Int {
@@ -368,6 +416,14 @@ public(package) func waitable_attachment(kind: WaitableKind, slot: Int) unsafe -
         case Interrupt -> INTERRUPTS[slot].attachment,
         case Timer -> TIMERS[slot].attachment,
         case Process -> PROCESSES[slot].attachment,
+        // TWO KINDS OVER ONE CONNECTION ROW, and the kind is what says which
+        // field — the same three-line mechanism `ref_object` uses for the two
+        // reference columns, one screen of a different file away.
+        case PipeOutlet -> PIPES[slot].outlet_attachment,
+        case PipeInlet -> PIPES[slot].inlet_attachment,
+        // ...and two kinds over one EXCHANGE, one level further down.
+        case PipeReply -> PIPE_REPLY_ATTACH[slot],
+        case PipeRequest -> PIPE_REQUEST_ATTACH[slot],
     }
 }
 
@@ -378,6 +434,10 @@ public(package) func set_waitable_attachment(kind: WaitableKind, slot: Int, a: I
         case Interrupt -> { INTERRUPTS[slot].attachment = a },
         case Timer -> { TIMERS[slot].attachment = a },
         case Process -> { PROCESSES[slot].attachment = a },
+        case PipeOutlet -> { PIPES[slot].outlet_attachment = a },
+        case PipeInlet -> { PIPES[slot].inlet_attachment = a },
+        case PipeReply -> { PIPE_REPLY_ATTACH[slot] = a },
+        case PipeRequest -> { PIPE_REQUEST_ATTACH[slot] = a },
     }
 }
 
@@ -410,6 +470,51 @@ public(package) func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Boo
                 case _ -> false,
             }
         },
+        // **DRAIN-THEN-TERMINAL, AS ONE `||`** (spec §2.2's readable arm; design
+        // 230's close-drains-first rule, which `pipe_take` already reads in this
+        // exact order). Anything staged is readable whatever became of the
+        // sender; an empty ring with no inlet left is readable too, and what
+        // the waiter is told there is `PeerGone`. Both halves can only ever be
+        // answered by the connection's own state, so the level is derived like
+        // every other one here and maintained nowhere.
+        case PipeOutlet -> PIPES[slot].staged != 0 || PIPES[slot].inlet_refs == 0,
+        // **ROOM OR NOBODY TO TAKE** (design 10 ruling 8). The mirror, and it
+        // reads in `pipe_post`'s order for `pipe_post`'s reason: the outlet
+        // column at zero is the stronger fact, so a poster woken by it learns
+        // that posting is over rather than that there is space.
+        case PipeInlet -> (PIPES[slot].outlet_refs == 0
+                           || pipe_has_room(slot)),
+        // **THE ANSWER IS HERE, OR IT NEVER WILL BE** (design 10 ruling 11(a)).
+        // Three of the five exchange states are ready and two are not, and the
+        // split is exactly `pipe_resolve`'s: `Replied` has the bytes; a `Taken`
+        // exchange whose obligation column fell was abandoned by the server; a
+        // `Staged` one whose connection lost its outlet can never be taken at
+        // all. `Settled` is NOT ready — the answer has already been delivered
+        // to somebody — and `Free` names no exchange a handle could hold.
+        case PipeReply -> {
+            match PIPE_EX_STATE[slot] {
+                case Replied -> true,
+                case Taken -> PIPE_REQUEST_REFS[slot] == 0,
+                case Staged -> PIPES[exchange_pipe(slot)].outlet_refs == 0,
+                case Settled -> false,
+                case Free -> false,
+            }
+        },
+        // **THE CLAIM WAS DROPPED — the server's cancellation watcher** (§2.1's
+        // ratified early notice). It is asked only of a `Taken` exchange,
+        // because that is the only state in which an obligation exists to be
+        // watching: a `Staged` one has not minted it, and `Replied` / `Settled`
+        // are past it. Terminal, because a reply column that reached zero can
+        // never rise — a mint needs a source handle there is none of.
+        case PipeRequest -> {
+            match PIPE_EX_STATE[slot] {
+                case Taken -> PIPE_REPLY_REFS[slot] == 0,
+                case Replied -> false,
+                case Settled -> false,
+                case Staged -> false,
+                case Free -> false,
+            }
+        },
     }
 }
 
@@ -421,17 +526,68 @@ public(package) func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Boo
 /// bits. Unit 5.5 adds a second DOOR onto §8's word rather than a second
 /// vocabulary for it — the `Exited`/`Faulted` distinction sharpening 2 asked
 /// for is the kind field that already shipped.
+/// **AND THE PIPE ARMS ARE WHERE THIS ANSWER GREW A BODY** (design 10 ruling
+/// 11(a); sawos design 15). Three of the four are word-shaped levels and answer
+/// with `body_len: 0`, exactly as every kind above them does; the fourth
+/// carries the reply's BYTES, and `body_src` is the kernel address the delivery
+/// copies them from. The copy is SIZED TO THE DELIVERY — a word-payload kind
+/// writes four header words and stops — so a Timer waiter pays for the record's
+/// growth in buffer space and never in copy time.
 public(package) func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> WaitAnswer {
     match kind {
-        case Event -> WaitAnswer(tag: WaitTag.Event, payload: EVENTS[slot].word),
+        case Event -> WaitAnswer(tag: WaitTag.Event, payload: EVENTS[slot].word,
+                                 body_len: 0, body_src: 0),
         case Interrupt -> WaitAnswer(tag: WaitTag.Interrupt,
-                                     payload: INTERRUPTS[slot].line),
+                                     payload: INTERRUPTS[slot].line,
+                                     body_len: 0, body_src: 0),
         case Timer -> WaitAnswer(tag: WaitTag.Timer,
-                                 payload: TIMERS[slot].fires),
+                                 payload: TIMERS[slot].fires,
+                                 body_len: 0, body_src: 0),
         case Process -> WaitAnswer(
             tag: WaitTag.Process,
             payload: process_status_word(PROCESSES[slot].exit_kind,
-                                         PROCESSES[slot].exit_code)),
+                                         PROCESSES[slot].exit_code),
+            body_len: 0, body_src: 0),
+        // Drain-first, so a staged message is `Msg` whatever became of the
+        // sender — the readiness test above and this answer read the connection
+        // in the same order, which is what keeps them from ever disagreeing.
+        case PipeOutlet -> {
+            var level = OutletLevel.PeerGone
+            if PIPES[slot].staged != 0 {
+                level = OutletLevel.Msg
+            }
+            WaitAnswer(tag: WaitTag.Readable, payload: level as UInt,
+                       body_len: 0, body_src: 0)
+        },
+        // PeerGone first, mirroring `pipe_post`'s own order of questions.
+        case PipeInlet -> {
+            var level = InletLevel.Room
+            if PIPES[slot].outlet_refs == 0 {
+                level = InletLevel.PeerGone
+            }
+            WaitAnswer(tag: WaitTag.Room, payload: level as UInt,
+                       body_len: 0, body_src: 0)
+        },
+        // **THE ONE DELIVERY THAT CARRIES BYTES.** `Replied` hands over the
+        // reply body out of the very ring slot that carried the request
+        // (design 10 ruling 4's rider); every other ready state is the
+        // abandonment `pipe_resolve` reports, and it has nothing to copy.
+        case PipeReply -> {
+            match PIPE_EX_STATE[slot] {
+                case Replied -> WaitAnswer(
+                    tag: WaitTag.Reply, payload: ReplyLevel.Data as UInt,
+                    body_len: PIPE_LENS[slot] as UInt,
+                    body_src: exchange_body_addr(slot)),
+                case _ -> WaitAnswer(tag: WaitTag.Reply,
+                                     payload: ReplyLevel.PeerClosed as UInt,
+                                     body_len: 0, body_src: 0),
+            }
+        },
+        // NO PAYLOAD AT ALL: the fact is the notification. A `payload` of zero
+        // is what the record carries, and `WaitPayload.Abandoned` is the
+        // decoded form that binds nothing.
+        case PipeRequest -> WaitAnswer(tag: WaitTag.Abandoned, payload: 0,
+                                       body_len: 0, body_src: 0),
     }
 }
 
@@ -480,18 +636,58 @@ public(package) func waitable_consume(kind: WaitableKind, slot: Int) unsafe {
         // the arm that would have to write something for a death to be
         // reportable once, and there is nothing it could honestly write.
         case Process -> {},
+        // **THREE OF THE FOUR PIPE ARMS SPEND NOTHING, AND FOR THREE DIFFERENT
+        // REASONS** (sawos design 15) — which is the matrix earning its keep a
+        // fifth time.
+        //
+        //   - a READABLE outlet's level ends when the server actually TAKES the
+        //     message, and a delivery is not a take (the record says "there is
+        //     something", not "here it is"). So this is the Interrupt's shape:
+        //     the readiness has an end the kernel does not own.
+        //   - a POSTABLE inlet's level ends at the poster's own next post —
+        //     design 10 ruling 8 says so in as many words, the Interrupt-shaped
+        //     emptiness — so consuming it would make a client that woke and
+        //     then chose not to post never hear about the room again.
+        //   - an ABANDONED claim is the TERMINAL level, on the Process arm's
+        //     terms exactly: nothing un-abandons, so there is nothing to end.
+        case PipeOutlet -> {},
+        case PipeInlet -> {},
+        case PipeRequest -> {},
+        // **AND THE FOURTH IS THE ONE THAT DISCHARGES AN EXCHANGE** (design 10
+        // ruling 11(a)/(b)). The delivery handed the reply's bytes to a process
+        // — the wait IS the resolve — so the answer is spent and the exchange
+        // moves to `Settled`. Without this the slot would stay `Replied` and a
+        // later `Resolve` through the very same claim would copy the answer out
+        // a second time, which is the duplicate §2.2's consume rule exists to
+        // make impossible; with it, a later `Resolve` is `PeerClosed` and the
+        // slot goes back when the columns fall.
+        //
+        // It runs for the ABANDONED deliveries too, and that is right: the
+        // claim has been told there will never be an answer, so there is
+        // nothing left for it either.
+        case PipeReply -> { PIPE_EX_STATE[slot] = ExchangeState.Settled },
     }
 }
 
-/// What `waitable_answer` produces: the two words that are not the key.
+/// What `waitable_answer` produces: everything in the record that is not the
+/// key.
 ///
-/// `public(package)`, like the function that hands it out: `kcore.wake` binds
-/// one and reads both words, so a private type here would be a value a sibling
+/// `public(package)`, like the function that hands it out: `kcore.refs` binds
+/// one and reads every field, so a private type here would be a value a sibling
 /// module holds and cannot name (refused since the Aug-21 signature-visibility
 /// rule).
+///
+/// **THE LAST TWO FIELDS ARE M4 UNIT 3's** (design 10 ruling 11(a)). `body_len`
+/// is how many bytes the delivery carries — zero for every kind but a reply
+/// with data — and `body_src` is the KERNEL address they are copied from, which
+/// is a ring slot's body and nothing else. Both zero is the word-payload case,
+/// and it is what makes the copy-out sized to the delivery rather than to the
+/// buffer.
 public(package) struct WaitAnswer {
     public(package) tag: WaitTag,
     public(package) payload: UInt,
+    public(package) body_len: UInt,
+    public(package) body_src: UInt,
 }
 
 /// The first attachment of `w` whose waitable is ready, or `NO_ATTACHMENT`.
@@ -562,7 +758,8 @@ public(package) func detach_attachment(w: Int, a: Int) unsafe {
             set_waitable_attachment(ATTACHMENTS[a].kind, ATTACHMENTS[a].target, 0)
             ATTACHMENTS[a] = Attachment(state: SlotState.Free,
                                         kind: WaitableKind.Event, target: 0,
-                                        waiter: 0, key: 0, link: 0)
+                                        waiter: 0, key: 0, oneshot: false,
+                                        link: 0)
             return
         }
         prev = cur

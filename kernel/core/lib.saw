@@ -40,9 +40,9 @@
 //!   `process`    the process slab, the grant record, the copy doors, the way
 //!                into user mode
 //!   `waitables`  the Event/Waiter/Interrupt slabs and the per-kind matrix
-//!   `refs`       the reference count, free-on-zero, and the per-kind last
-//!                rites (sawos design 7)
-//!   `wake`       delivery: readiness becoming a woken thread
+//!   `refs`       the reference count, free-on-zero, the per-kind last rites
+//!                (sawos design 7), AND the delivery that turns readiness into
+//!                a woken thread (`wake` merged in at M4 unit 3 — see below)
 //!   `irq`        the tick, expiry, device lines, the idle path, the point
 //!   `preempt`    the strided long-op movers that take that point
 //!   `loader`     the sosimg loader — validate, place, record
@@ -69,7 +69,7 @@
 //! `preempt` is where it is because of design 1's one structural finding: a
 //! preemption point DELIVERS, so it sits above `irq`, while the byte loops it
 //! drives sit at the bottom under `mem` — delivery reaches them through
-//! `wake` -> `process` -> `copy_out`. A point written inside the loop would be
+//! `refs` -> `process` -> `copy_out`. A point written inside the loop would be
 //! `mem` importing `irq`, which is the cycle this list exists to prevent. So the
 //! loop stays a primitive, the point stays beside the idle poll, and the cadence
 //! that joins them is its own module between them. `preempt.saw`'s header has
@@ -84,13 +84,25 @@
 //! the other way: `process` names nothing in `waitables`, which is what makes
 //! this a reordering rather than the cycle DF-232e diagnoses.
 //!
+//! AND ONE MODULE STOPPED EXISTING IN M4 UNIT 3 (sawos design 15), which is the
+//! same rule taken to its conclusion: `wake` — delivery — MERGED INTO `refs`,
+//! because the two became mutually recursive. `designs/010` ruling 9(b) makes a
+//! DELIVERY drop a counted reference (a one-shot attachment detaches when its
+//! record is copied out) and the peer-gone terminal levels make a DROPPED
+//! REFERENCE deliver (a column reaching zero is what raises them, and
+//! `drop_reference` is the only place that is observed). Two modules cannot
+//! hold that, and DF-232e does not diagnose the cycle — it empties an export
+//! table and blames a third file — so the two seams became one. `refs.saw`'s
+//! header carries the full argument.
+//!
 //! WHERE THE LINE FELL, when a seam of the sketch came in two: the STATE of a
 //! thing sits below the process teardown that frees it, and ACTING on it sits
 //! above — because ending a process touches every slab, and answering a wait
 //! goes through the copy door that can end one. That is why a thread's table
 //! (`threads`) is not its scheduler (`sched`), a timer's schedule (`time`) is
 //! not its expiry (`irq`), and the wait tables (`waitables`) are not the
-//! delivery (`wake`). The unit-5.5 move above does not bend that rule: the
+//! delivery (`refs`' second half, which was `wake` until M4 unit 3 and is the
+//! same altitude under a different file name). The unit-5.5 move above does not bend that rule: the
 //! process SLAB and the wait tables are both STATE, so their order relative to
 //! each other was never fixed by it — only their order relative to the
 //! teardown was, and both are still below it.
