@@ -54,9 +54,26 @@ checkout and nothing about running the harness changes; after design 238 unit 5
 the language lives in a different repository and the same call finds it there.
 
 `--arch <name>` runs one architecture, for development. The GATE is both.
+
+`-j N` runs N package builds, and then N cases, at a time. It DEFAULTS TO 4
+(user ruling, Sep 1): this host has four performance cores and six efficiency
+ones, and the parallelism tracks the P-cores rather than the core count, because
+a QEMU boot parked on an E-core is the slowest thing in the run. `-j 1` is the
+serial harness, unchanged and reachable, for when a transcript has to be read
+against the one the suite has always printed.
+
+WHAT PARALLELISM IS NOT ALLOWED TO MOVE (the acceptance the `-j` work was
+gated on): a case's transcript, its assertions, and the ORDER the report prints
+in. Workers return text and a verdict; the CALLER prints, walking the case list
+in definition order, so completion order never reaches the console and a
+parallel run's output is byte-identical to a serial one's. The isolation that
+makes the transcripts identical is stated at each of the three places it is
+bought — `_stitch_root_image`'s per-case staging directory, `_run_qemu`'s own
+stdin, and `main`'s eager `tc()`.
 """
 
 import argparse
+import concurrent.futures
 import os
 import shutil
 import subprocess
@@ -3029,6 +3046,44 @@ def _run(cmd, **kw):
     return proc
 
 
+def _map_ordered(jobs, items, work):
+    """`work(item)` over `items`, `jobs` at a time, YIELDING IN ITEM ORDER.
+
+    THE ORDERING IS THE WHOLE POINT. A parallel suite that reported in
+    completion order would print a different transcript every run, and the
+    harness's oracle tradition is to DIFF the transcript rather than read
+    "green" — so the report has to be a function of the case list and nothing
+    else. Submitting every item up front and then awaiting the futures IN
+    SUBMISSION ORDER gives exactly that: work overlaps, results arrive in the
+    order the caller asked for them, and each one prints the moment the head of
+    the queue is ready rather than at the end of the run.
+
+    Threads, not processes: every unit of work below is a `subprocess.run`, so
+    the GIL is released for the duration and a process pool would buy nothing
+    but a pickling constraint on the case dictionaries.
+
+    `jobs <= 1` runs INLINE, on this thread — not a one-worker pool. The serial
+    harness is the reference the parallel one is diffed against, so `-j 1` takes
+    no code path that `-j 4` introduced.
+
+    A consumer that breaks out early (the package phase does, on the first
+    failure) cancels whatever has not started; the pool's own shutdown then
+    waits only for what is already running.
+    """
+    if jobs <= 1 or len(items) <= 1:
+        for item in items:
+            yield work(item)
+        return
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+        futures = [pool.submit(work, item) for item in items]
+        try:
+            for fut in futures:
+                yield fut.result()
+        finally:
+            for fut in futures:
+                fut.cancel()
+
+
 def _find_clang(arches):
     """Return the first clang that can assemble EVERY target's boot code.
 
@@ -3235,20 +3290,31 @@ def _build_root_image(blade_bin, pkg_dir, arch, clang):
     return os.path.join(out_dir, images[0])
 
 
-def _stitch_root_image(image, arch, clang):
+def _stitch_root_image(image, arch, clang, name):
     """Assemble the `.incbin` stub that pulls `image` into `.payload`.
 
-    The stub names `root.sosimg` and is assembled with `-I` pointing at this
-    architecture's build directory, so one committed stub stitches whichever
-    root image the case asked for.
+    The stub names `root.sosimg` and is assembled with `-I` pointing at a
+    directory holding one, so one committed stub stitches whichever root image
+    the case asked for.
+
+    **THE STAGING DIRECTORY IS PER CASE**, which is what makes this step safe to
+    run concurrently. `kernel/rootimg.S` is committed and names a FIXED
+    filename, so the case cannot be distinguished by the file's name the way
+    every other artifact here is (`<case>.o`, `<case>.elf`, `<case>.regions.S`);
+    it has to be distinguished by the directory the `-I` points at. Staged into
+    one shared build directory, two cases running at once would each copy their
+    own root image over `root.sosimg` and one of them would boot the other's
+    image — a wrong-but-plausible transcript, which is the worst failure a test
+    harness can have.
     """
     dirs = arch_dirs(arch)
-    os.makedirs(dirs["build"], exist_ok=True)
-    staged = os.path.join(dirs["build"], "root.sosimg")
+    stage = os.path.join(dirs["build"], f"{name}.rootimg")
+    os.makedirs(stage, exist_ok=True)
+    staged = os.path.join(stage, "root.sosimg")
     shutil.copyfile(image, staged)
-    stub_o = os.path.join(dirs["build"], "rootimg.o")
+    stub_o = os.path.join(dirs["build"], f"{name}.rootimg.o")
     _run([clang, f"--target={arch['triple']}", *arch["cc_args"],
-          "-nostdlib", "-I", dirs["build"], "-c",
+          "-nostdlib", "-I", stage, "-c",
           os.path.join(KERNEL_DIR, "rootimg.S"), "-o", stub_o])
     return stub_o
 
@@ -3454,7 +3520,8 @@ def _build_elf(case, arch, shared_objs, lld, clang):
               "-nostdlib", "-c", payload_src, "-o", payload_o])
         objs.append(payload_o)
     if case.get("root_pkg"):
-        objs.append(_stitch_root_image(case["_root_image"][arch["name"]], arch, clang))
+        objs.append(_stitch_root_image(case["_root_image"][arch["name"]], arch,
+                                       clang, name))
     # sawos design 2 + 6: the child images and the BOOT REGION TABLE that names
     # them, the RAM pool and the device window. A case that asks for none of the
     # three links no `.regions` section, so `_region_table_start` and
@@ -3491,17 +3558,31 @@ def _run_qemu(qemu, arch, elf, feed=None):
     like a kernel that cannot wake, which is worth one comment to never debug
     twice.
 
-    A case with NO input keeps stdin inherited, exactly as before — the pipe is
-    opened only where it is used, so nothing about the other cases changes.
+    A case with NO input GETS A PORT OF ITS OWN ANYWAY — an empty pipe this
+    process holds the write end of, so the guest's console never sees a byte and
+    never sees an EOF either. It used to inherit the harness's stdin, which was
+    the same thing whenever that was a terminal nobody typed at, and is NOT the
+    same thing once cases run concurrently: `-nographic` on a TTY puts the
+    terminal in raw mode and restores what it found, so four QEMUs saving and
+    restoring each other's termios leave the operator's shell in whichever state
+    the last one to exit happened to have seen. An unwritten pipe is what an
+    idle console always was, without the shared device underneath it.
     """
     cmd = [qemu, *arch["qemu_args"], "-nographic", "-kernel", elf]
     if feed is None:
+        read_fd, write_fd = os.pipe()
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=QEMU_TIMEOUT_S)
+            proc = subprocess.run(cmd, stdin=read_fd, capture_output=True,
+                                  text=True, timeout=QEMU_TIMEOUT_S)
             return proc.returncode, proc.stdout, False
         except subprocess.TimeoutExpired as e:
             return None, (e.stdout or (e.stdout and e.stdout.decode()) or ""), True
+        finally:
+            # The write end is held OPEN for the child's whole life above and
+            # closed only here: closing it earlier would EOF the guest's console
+            # rather than leave it quiet.
+            os.close(read_fd)
+            os.close(write_fd)
 
     read_fd, write_fd = os.pipe()
     proc = subprocess.Popen(cmd, stdin=read_fd, stdout=subprocess.PIPE,
@@ -3571,8 +3652,18 @@ def _check(case, arch, status, out, timed_out):
     return True, ""
 
 
-def _run_arch(arch, qemu, lld, clang, blade_bin, selected_cases):
-    """Build and run every case for one architecture. Returns (passed, failed)."""
+def _run_arch(arch, qemu, lld, clang, blade_bin, selected_cases, jobs):
+    """Build and run every case for one architecture. Returns (passed, failed).
+
+    THE ARCHITECTURES STAY SEQUENTIAL, and that is a decision rather than an
+    oversight. Two of them at once would build the SAME Blade package for two
+    triples concurrently, and a package's `.build/` tree is per-package with the
+    target only one level down — the artifacts would not collide, but the stale
+    `.sosimg` sweep at the top of `_build_root_image` and the lock/stamp files
+    beside them are one directory for both. `jobs` buys its parallelism INSIDE
+    an architecture, where every unit of work already has a name of its own, and
+    an arch block's report stays the contiguous thing it has always been.
+    """
     dirs = arch_dirs(arch)
     print(f"{BOLD}{arch['name']}{RESET}  ({arch['triple']}, {os.path.basename(qemu)} `virt`)")
 
@@ -3612,42 +3703,69 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, selected_cases):
             if child not in root_pkgs:
                 root_pkgs.append(child)
     if root_pkgs:
-        try:
-            for pkg in root_pkgs:
+        # Each package is a separate directory and a separate Blade invocation,
+        # so the only thing the pool has to preserve is the ORDER these lines
+        # print in — which `_map_ordered` does. The failure arm keeps the serial
+        # shape too: the first package to fail IN LIST ORDER is the one
+        # reported, and the run gives up on this architecture there, exactly as
+        # the serial loop's first raise did.
+        def build_pkg(pkg):
+            try:
                 image = _build_root_image(blade_bin, pkg, arch, clang)
-                size = os.path.getsize(image)
-                print(f"  {os.path.relpath(image, REPO_ROOT)}  ({size} bytes)")
-            for case in cases:
-                if case.get("root_pkg"):
-                    holder = case.setdefault("_root_image", {})
-                    holder[arch["name"]] = _root_image_path(case["root_pkg"], arch)
-                if case.get("children"):
-                    holder = case.setdefault("_child_images", {})
-                    holder[arch["name"]] = [_root_image_path(c, arch)
-                                            for c in case["children"]]
-        except ToolError as e:
-            print(f"{CROSS} failed to build a {arch['name']} root image\n{e}",
-                  file=sys.stderr)
+                return (os.path.relpath(image, REPO_ROOT),
+                        os.path.getsize(image), None)
+            except ToolError as e:
+                return (None, None, e)
+
+        build_error = None
+        for rel, size, err in _map_ordered(jobs, root_pkgs, build_pkg):
+            if err is not None:
+                build_error = err
+                break
+            print(f"  {rel}  ({size} bytes)")
+        if build_error is not None:
+            print(f"{CROSS} failed to build a {arch['name']} root image"
+                  f"\n{build_error}", file=sys.stderr)
             return 0, len(cases)
-    passed = 0
-    failed = 0
-    for i, case in enumerate(cases, 1):
+        # ON THIS THREAD, before any case starts: the case dictionaries are the
+        # ONE table every worker reads, so the only writes into them happen
+        # here, where there is exactly one writer.
+        for case in cases:
+            if case.get("root_pkg"):
+                holder = case.setdefault("_root_image", {})
+                holder[arch["name"]] = _root_image_path(case["root_pkg"], arch)
+            if case.get("children"):
+                holder = case.setdefault("_child_images", {})
+                holder[arch["name"]] = [_root_image_path(c, arch)
+                                        for c in case["children"]]
+
+    # One case = one unit of work: compile it, link it, boot it, judge it. A
+    # worker RETURNS its verdict and the lines it owns and prints nothing, so
+    # the console is written by one thread walking `cases` in order and a
+    # parallel run's report is the serial run's report.
+    def run_case(case):
         name = case["name"]
         try:
             elf = _build_elf(case, arch, shared_objs, lld, clang)
         except ToolError as e:
-            print(f"[{i}/{len(cases)}] {CROSS} {name}  (build error)")
-            for line in str(e).splitlines():
-                print(f"    {line}")
-            failed += 1
-            continue
+            return (False, f"{CROSS} {name}  (build error)",
+                    [f"    {line}" for line in str(e).splitlines()])
         status, out, timed_out = _run_qemu(qemu, arch, elf, case.get("stdin"))
         ok, reason = _check(case, arch, status, out, timed_out)
         if ok:
-            print(f"[{i}/{len(cases)}] {CHECK} {name}")
+            return True, f"{CHECK} {name}", []
+        return False, f"{CROSS} {name}  ({reason})", []
+
+    passed = 0
+    failed = 0
+    for i, (ok, headline, detail) in enumerate(
+            _map_ordered(jobs, cases, run_case), 1):
+        print(f"[{i}/{len(cases)}] {headline}")
+        for line in detail:
+            print(line)
+        if ok:
             passed += 1
         else:
-            print(f"[{i}/{len(cases)}] {CROSS} {name}  ({reason})")
             failed += 1
     print()
     return passed, failed
@@ -3668,7 +3786,16 @@ def main():
                              "comma-separated list; hyphens and underscores are "
                              "interchangeable. A DEVELOPMENT convenience: the "
                              "GATE is every case on every architecture")
+    parser.add_argument("-j", "--jobs", metavar="N", type=int, default=4,
+                        help="run N package builds, and then N cases, at a "
+                             "time (default: 4 — this host's performance-core "
+                             "count; `-j 1` is the serial harness)")
     args = parser.parse_args()
+
+    if args.jobs < 1:
+        print(f"{RED}-j must be at least 1 (got {args.jobs}){RESET}",
+              file=sys.stderr)
+        sys.exit(2)
 
     arches = ARCHES
     if args.arch:
@@ -3728,11 +3855,18 @@ def main():
             sys.exit(1)
         print()
 
+    # Resolve the toolchain HERE, on this thread, whether or not the Blade build
+    # above already did it. `tc()` is a lazy global with a one-time print, and a
+    # lazy global first touched by four workers at once is two resolutions and a
+    # note printed into the middle of the report. After this line every worker
+    # reads a value that is already there.
+    tc()
+
     total_passed = 0
     total_failed = 0
     for arch in arches:
         passed, failed = _run_arch(arch, qemus[arch["name"]], lld, clang,
-                                   blade_bin, selected_cases)
+                                   blade_bin, selected_cases, args.jobs)
         total_passed += passed
         total_failed += failed
 

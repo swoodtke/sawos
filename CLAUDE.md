@@ -42,6 +42,16 @@ Every change gates on `make sos-test` before commit. The acceptance oracle
 tradition: diff the console transcript, don't just read "green"
 (sawlang#238 unit 0).
 
+The runner is PARALLEL BY DEFAULT — `-j 4`, a user ruling (Sep 1: four
+P-cores, six E-cores; the parallelism tracks the P-cores). The report is
+printed in case-definition order whatever the completion order, so a
+transcript diff reads the same as it always did. `-j 1` is the serial
+harness, kept reachable for exactly that comparison. TWO CASES CARRY
+TIMING-DEPENDENT ROWS that move run to run in EITHER mode and that no
+assertion reads: `thread_preempt`'s A/B interleave and its `timer tick`
+lines, and `timer_interval`'s `fires=` counters. Anything else moving in
+a transcript diff is a real finding.
+
 ## The suite lock (machine-wide, sawos's own)
 QEMU-suite invocations serialize through a mkdir lock at
 `/private/tmp/claude-<uid>/sawos-suite-lock` (uid = `id -u`) — a DIFFERENT
