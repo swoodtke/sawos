@@ -67,7 +67,7 @@ import sos.thread
 import sos.event.{Event}
 import sos.interrupt.{Interrupt}
 import sos.clock.{Clock}
-import sos.waiter.{Waiter}
+import sos.waiter.{AttachMode, Waiter, mode_flag}
 
 // =============================================================================
 // System (spec §12; sawos design 3 D-5)
@@ -900,8 +900,36 @@ extension Waiter {
     /// also a REFERENCE — a dead process's slot lives until BOTH its last
     /// handle and its attachment are gone, which is what keeps the status word
     /// readable for as long as anybody is watching.
-    public func add(&self, process: &Process, key: UInt) -> Result<Void, SosStatus> {
-        self.attach(process.handle, key)
+    public func add(&self, process: &Process, key: UInt,
+                    mode: AttachMode = AttachMode.Persistent) -> Result<Void, SosStatus> {
+        self.attach(process.handle, key, mode_flag(mode))
+    }
+
+    /// **HAND A PROCESS HANDLE TO THIS WAITER, AND STOP HOLDING IT** — `give`'s
+    /// fourth overload, declared here for the reason `add`'s fourth is (sawos
+    /// design 15, M4 unit 3; `designs/010` ruling 11(c)).
+    ///
+    /// Everything `Waiter.give(event:)` says holds word for word, and the
+    /// wait-once DEATH SUPERVISOR is the shape it was ruled for: a launcher that
+    /// only ever wants to be told a child ended gives the handle to its Waiter
+    /// and holds nothing — no `remove` to write, no handle to release, and the
+    /// process slot's last reader is the subscription, which is exactly what
+    /// keeps the §8 status word readable until it is delivered.
+    ///
+    /// **THE DEFAULT `OneShot` IS RIGHT HERE IN A WAY IT IS NOWHERE ELSE**:
+    /// nothing un-dies, so a persistent subscription to a death would be a
+    /// subscription that can never fire twice.
+    public func give(&self, process: Process, key: UInt,
+                     mode: AttachMode = AttachMode.OneShot
+    ) -> Result<Void, (SosStatus, Process)> {
+        var owned = move process
+        let word: UInt = owned.handle
+        owned.handle = ProcessHandle(NO_HANDLE)
+        try self.attach_consuming(word, key, mode) catch {
+            let back: (SosStatus, Process) = (error, Process(handle: ProcessHandle(word)))
+            return move back
+        }
+        return
     }
 }
 

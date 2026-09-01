@@ -18,14 +18,53 @@
 //! resolution; unit 5.5 shipped `Process.attach` in the interim).
 
 import sosabi.{SosStatus, WaiterHandle, NO_HANDLE, WaitTag, WaitResult,
-               WaitPayload, WAIT_RECORD_WORDS, WAIT_KEY_WORD, WAIT_TAG_WORD,
-               WAIT_PAYLOAD_WORD, wait_record_bytes}
+               WaitPayload, WaitBuffer, PipeMsg, ReplyDelivery, ReplyLevel,
+               InletLevel, OutletLevel, EventHandle, InterruptHandle,
+               TimerHandle, PIPE_BODY_BYTES,
+               WAIT_HEADER_WORDS, WAIT_KEY_WORD, WAIT_TAG_WORD,
+               WAIT_PAYLOAD_WORD, WAIT_BODY_LEN_WORD,
+               WAITER_ADD_CONSUMING, WAITER_ADD_ONESHOT, wait_record_bytes}
 
 import sos.floor.{checked, sos_handle_release, sos_waiter_add,
                   sos_waiter_remove, sos_waiter_wait}
 import sos.event.{Event}
 import sos.interrupt.{Interrupt}
 import sos.timer.{Timer}
+
+/// **WHAT AN ATTACHMENT DOES AT DELIVERY** (`designs/010` ruling 9(b); sawos
+/// design 15, M4 unit 3).
+///
+/// One-shot is a property of the ATTACHMENT — the attacher's choice, like the
+/// key — so it is a defaulted trailing parameter on every `add` rather than a
+/// second method per kind, which is the `EventMode` doctrine and is what keeps
+/// the existing call sites unchanged.
+///
+/// **IT IS NOT THE OTHER AXIS.** Whether the attach CONSUMES the caller's handle
+/// is spelled by a different VERB (`give`), not by a third case here: consuming
+/// changes what the call does to its argument, and ruling 4's own mode-enum
+/// rejection applies — a runtime flag can change neither a return type nor a Saw
+/// function's effect. The two are a 2x2, and ruling 11(c) struck
+/// `OneShotConsuming` for exactly that reason.
+public enum AttachMode: UInt {
+    /// Stay subscribed. The attachment lives until `remove(key)` or until the
+    /// Waiter does — §2.2's ratified default, now said out loud.
+    case Persistent = 0,
+    /// Detach when a record for this key is COPIED OUT — never at mere
+    /// readiness. What it buys: a blocked poster's room-wait, a
+    /// request-abandoned watcher and a wait-once death supervisor all stop
+    /// owing a trailing `remove`.
+    case OneShot = 1,
+}
+
+/// The flag bit `mode` becomes at the wire. A `match` rather than a cast: the
+/// enum's numbers are the typed surface's own and the wire's are `sosabi`'s, and
+/// the vDSO discipline is that the two are allowed to differ.
+public(package) func mode_flag(mode: AttachMode) -> UInt {
+    match mode {
+        case Persistent -> 0,
+        case OneShot -> WAITER_ADD_ONESHOT,
+    }
+}
 
 /// Decode a record the kernel copied out into `WaitResult`.
 ///
@@ -37,7 +76,20 @@ import sos.timer.{Timer}
 /// not a runtime condition — and the never-hide rule says a bug the caller
 /// cannot act on should stop the program where it happened rather than become
 /// an `Err` somebody maps to "unknown".
-func decode_wait(key: UInt, tag: UInt, payload: UInt) -> WaitResult {
+///
+/// **THE SAME RULE COVERS THE PAYLOAD'S OWN SUB-ENUMS** (sawos design 15). An
+/// `OutletLevel`, an `InletLevel` and a `ReplyLevel` all arrive in the payload
+/// word out of declarations the kernel wrote from, so a value that does not
+/// decode is the same kernel/`sos` skew a bad tag is, and it panics on the same
+/// terms rather than becoming a case somebody has to invent a meaning for.
+///
+/// **AND IT TAKES THE BUFFER RATHER THAN THREE WORDS SINCE M4 UNIT 3**: a reply
+/// delivery's body lives in the buffer's body region, so the decode has to be
+/// able to reach it. Everything else it reads is still the header's words.
+func decode_wait(buf: &WaitBuffer) -> WaitResult {
+    let key = buf.header[WAIT_KEY_WORD]
+    let tag = buf.header[WAIT_TAG_WORD]
+    let payload = buf.header[WAIT_PAYLOAD_WORD]
     guard let kind = WaitTag.from(raw: tag) else {
         panic("sos: kernel wrote wait tag {}, which this build cannot name", tag)
     }
@@ -52,6 +104,48 @@ func decode_wait(key: UInt, tag: UInt, payload: UInt) -> WaitResult {
         // answers with, so a supervisor parses one thing however it learned.
         case Process -> WaitResult(key: key,
                                    what: WaitPayload.Process(status: payload)),
+        // **THE FOUR PIPE TAGS ARE M4 UNIT 3's** (sawos design 15). Three decode
+        // a level word; the fourth is the one that reaches into the body.
+        case Readable -> {
+            guard let level = OutletLevel.from(raw: payload) else {
+                panic("sos: kernel wrote outlet level {}, which this build cannot name",
+                      payload)
+            }
+            WaitResult(key: key, what: WaitPayload.Readable(state: level))
+        },
+        case Room -> {
+            guard let level = InletLevel.from(raw: payload) else {
+                panic("sos: kernel wrote inlet level {}, which this build cannot name",
+                      payload)
+            }
+            WaitResult(key: key, what: WaitPayload.Room(state: level))
+        },
+        case Reply -> {
+            guard let level = ReplyLevel.from(raw: payload) else {
+                panic("sos: kernel wrote reply level {}, which this build cannot name",
+                      payload)
+            }
+            WaitResult(key: key, what: WaitPayload.Reply(outcome: reply_of(level, &buf)))
+        },
+        // NOTHING TO DECODE, and that is the case rather than an omission: the
+        // fact IS the notification, so the payload word carries no information
+        // and `WaitPayload.Abandoned` binds nothing.
+        case Abandoned -> WaitResult(key: key, what: WaitPayload.Abandoned),
+    }
+}
+
+/// The reply half of the decode, split out because it is the only arm that
+/// builds an owning value.
+///
+/// **THE BODY IS COPIED OUT OF THE FRAME BUFFER HERE, ONCE.** `PipeMsg` owns its
+/// bytes so that the delivery outlives the buffer it arrived in — which is what
+/// makes `wait()` an ordinary value-returning call rather than one that hands
+/// back a borrow of its own frame.
+func reply_of(level: ReplyLevel, buf: &WaitBuffer) -> ReplyDelivery {
+    match level {
+        case Data -> ReplyDelivery.Data(
+            msg: PipeMsg(len: buf.header[WAIT_BODY_LEN_WORD], bytes: buf.body)),
+        case PeerClosed -> ReplyDelivery.PeerClosed,
     }
 }
 
@@ -110,8 +204,9 @@ extension Waiter {
     /// The second kind is here now, and it is what the shape predicted: each
     /// overload is TWO LINES delegating to one internal, so the list grows by a
     /// method per kind and the wire call has one caller.
-    public func add(&self, event: &Event, key: UInt) -> Result<Void, SosStatus> {
-        self.attach(event.handle, key)
+    public func add(&self, event: &Event, key: UInt,
+                    mode: AttachMode = AttachMode.Persistent) -> Result<Void, SosStatus> {
+        self.attach(event.handle, key, mode_flag(mode))
     }
 
     /// Attach an Interrupt under `key`, which `wait` hands back with the line
@@ -123,8 +218,9 @@ extension Waiter {
     /// level-triggered — so an Interrupt that fired BEFORE it was attached is
     /// reported by this call, which is the ordering a driver hits when the
     /// device was already asserting at bring-up.
-    public func add(&self, interrupt: &Interrupt, key: UInt) -> Result<Void, SosStatus> {
-        self.attach(interrupt.handle, key)
+    public func add(&self, interrupt: &Interrupt, key: UInt,
+                    mode: AttachMode = AttachMode.Persistent) -> Result<Void, SosStatus> {
+        self.attach(interrupt.handle, key, mode_flag(mode))
     }
 
     /// Attach a Timer under `key`, which `wait` hands back with the FIRE COUNT
@@ -139,8 +235,9 @@ extension Waiter {
     /// A DISARMED Timer is simply never ready, so attaching one and waiting
     /// parks until somebody arms it. That is what makes "arm, then wait" and
     /// "attach, then arm" both work.
-    public func add(&self, timer: &Timer, key: UInt) -> Result<Void, SosStatus> {
-        self.attach(timer.handle, key)
+    public func add(&self, timer: &Timer, key: UInt,
+                    mode: AttachMode = AttachMode.Persistent) -> Result<Void, SosStatus> {
+        self.attach(timer.handle, key, mode_flag(mode))
     }
 
     // **THE FOURTH KIND IS NOT HERE, AND IT IS THE ONLY ONE THAT IS NOT**
@@ -161,8 +258,104 @@ extension Waiter {
     /// unreachable from USER code. Package width exists for exactly one
     /// caller: the fourth overload, in `sos.system`, whose receiver type
     /// cannot be named here (the header says why).
-    public(package) func attach(&self, target: UInt, key: UInt) -> Result<Void, SosStatus> {
-        checked(sos_waiter_add(self.handle, target, key))
+    public(package) func attach(&self, target: UInt, key: UInt,
+                                flags: UInt) -> Result<Void, SosStatus> {
+        checked(sos_waiter_add(self.handle, target, key, flags))
+    }
+
+    /// **THE CONSUMING ATTACH'S ONE CALL, shared by every `give` overload**
+    /// (`designs/010` ruling 11(c)). `attach` with the consuming bit set, which
+    /// is the whole difference at the wire; what makes `give` a different VERB
+    /// rather than a different argument is what it does to the caller's value,
+    /// and that is spelled in each overload's signature.
+    ///
+    /// `public(package)` for `attach`'s own reason: the `give` overloads for the
+    /// kinds declared above this file live beside those kinds, so they call in
+    /// from `sos.pipe` and `sos.system`.
+    public(package) func attach_consuming(&self, target: UInt, key: UInt,
+                                          mode: AttachMode) -> Result<Void, SosStatus> {
+        self.attach(target, key, mode_flag(mode) | WAITER_ADD_CONSUMING)
+    }
+
+    /// **HAND AN EVENT TO THIS WAITER, AND STOP HOLDING IT** (`designs/010`
+    /// ruling 11(c); sawos design 15, M4 unit 3).
+    ///
+    /// **`give` IS THE TREE'S ONE VERB FOR "OWNERSHIP LEAVES THROUGH THIS
+    /// RECEIVER"** (user-named, Sep 1). `Process.give` hands a handle to a
+    /// process; `Waiter.give` hands it to a SUBSCRIPTION. A distinct name rather
+    /// than a by-value overload of `add`, so the consuming semantic is visible
+    /// at the call site and overload resolution never hinges on a sigil.
+    ///
+    /// **SAME VERB, DIFFERENT GATE**, and it is worth saying at the op:
+    /// give-to-PROCESS crosses a process boundary and spends the `Transfer`
+    /// right; give-to-WAITER crosses none — the attachment lives in this
+    /// process's own Waiter — so it spends the `Wait` right alone, exactly as
+    /// `add` does.
+    ///
+    /// **THE REFUSAL HANDS THE OBJECT BACK** (user-ruled, Sep 1): a full
+    /// attachment table is a RESOURCE CONDITION, not a bug, so the caller keeps
+    /// what it had. It is `TimedOut(pending:)`'s shape — the error payload
+    /// carries the live thing — and the kernel's half is what makes it honest: a
+    /// refused add consumes nothing, so the wrapper's word is still good.
+    ///
+    /// **THE FUNNEL CONTRACT IS KEPT, AND THE REFUSAL RE-MINTS.** Every other
+    /// `give` in the tree disarms BEFORE the syscall because every failure of
+    /// such a syscall is a fault; this one has a STATUS outcome as well, so the
+    /// body disarms first (so no path can leave two owners of one word) and the
+    /// error arm builds a FRESH wrapper around the word the kernel provably did
+    /// not consume. That is stronger than a conditional disarm: the value handed
+    /// back is a new one, and the old husk is dead on every path.
+    ///
+    /// (`PipeReply.resolve`'s conditional disarm is the other shape and stays
+    /// the departure — it cannot re-mint, because on ITS would-block path the
+    /// caller's own binding is the thing that must survive.)
+    ///
+    /// It defaults to `OneShot` where `add` defaults to `Persistent`, and the
+    /// asymmetry is deliberate: a caller that has given the object away has no
+    /// handle left to `remove` with in the ordinary case, so the subscription
+    /// that ends itself is the one that reads right. Pass `Persistent`
+    /// explicitly for the attachment-owned supervisor ruling 11(c) names.
+    public func give(&self, event: Event, key: UInt,
+                     mode: AttachMode = AttachMode.OneShot
+    ) -> Result<Void, (SosStatus, Event)> {
+        var owned = move event
+        let word: UInt = owned.handle
+        owned.handle = EventHandle(NO_HANDLE)
+        try self.attach_consuming(word, key, mode) catch {
+            let back: (SosStatus, Event) = (error, Event(handle: EventHandle(word)))
+            return move back
+        }
+        return
+    }
+
+    /// Hand an Interrupt to this Waiter. Everything `give(event:)` says holds.
+    public func give(&self, interrupt: Interrupt, key: UInt,
+                     mode: AttachMode = AttachMode.OneShot
+    ) -> Result<Void, (SosStatus, Interrupt)> {
+        var owned = move interrupt
+        let word: UInt = owned.handle
+        owned.handle = InterruptHandle(NO_HANDLE)
+        try self.attach_consuming(word, key, mode) catch {
+            let back: (SosStatus, Interrupt) = (error, Interrupt(handle: InterruptHandle(word)))
+            return move back
+        }
+        return
+    }
+
+    /// Hand a Timer to this Waiter. Everything `give(event:)` says holds — and
+    /// note what `Persistent` means here: a periodic timer nobody holds a handle
+    /// to still fires, and its subscription ends when the Waiter does.
+    public func give(&self, timer: Timer, key: UInt,
+                     mode: AttachMode = AttachMode.OneShot
+    ) -> Result<Void, (SosStatus, Timer)> {
+        var owned = move timer
+        let word: UInt = owned.handle
+        owned.handle = TimerHandle(NO_HANDLE)
+        try self.attach_consuming(word, key, mode) catch {
+            let back: (SosStatus, Timer) = (error, Timer(handle: TimerHandle(word)))
+            return move back
+        }
+        return
     }
 
     /// Stop watching whatever is attached under `key`. A key this Waiter does
@@ -223,9 +416,10 @@ extension Waiter {
 /// The `unsafe` half of `wait`, confined to one small named helper (design 136).
 /// The buffer's address never leaves it.
 func wait_into_frame(handle: WaiterHandle) unsafe -> Result<WaitResult, SosStatus> {
-    var buf: [UInt; WAIT_RECORD_WORDS] = [0; WAIT_RECORD_WORDS]
-    try checked(sos_waiter_wait(handle, (&var buf) as UnsafePointer<UInt>,
+    var buf = WaitBuffer(header: [0; WAIT_HEADER_WORDS],
+                         body: [0; PIPE_BODY_BYTES])
+    try checked(sos_waiter_wait(handle,
+                                (&var buf.header) as UnsafePointer<UInt>,
                                 wait_record_bytes() as UInt))
-    return decode_wait(buf[WAIT_KEY_WORD], buf[WAIT_TAG_WORD],
-                       buf[WAIT_PAYLOAD_WORD])
+    return decode_wait(&buf)
 }

@@ -43,13 +43,16 @@
 import sosabi.{SosStatus, PipeInletHandle, PipeInletOp, PipeOutletHandle,
                PipeOutletOp, PipeReplyHandle, PipeRequestHandle, MINT_OP,
                NO_HANDLE, PIPE_BODY_BYTES, PIPE_TAKE_RECORD_WORDS,
-               PIPE_TAKE_LEN_WORD, PIPE_TAKE_REQUEST_WORD,
+               PIPE_TAKE_LEN_WORD, PIPE_TAKE_REQUEST_WORD, PipeMsg,
+               ReplyDelivery, WaitPayload, WaitResult,
                pipe_take_record_bytes}
 
 import sos.floor.{ALL_RIGHTS, call_value, checked, polled_ok, polled_value,
                   sos_handle_release, sos_pipe_inlet_post,
                   sos_pipe_outlet_take, sos_pipe_reply_resolve,
                   sos_pipe_request_reply}
+import sos.timer.{Timer}
+import sos.waiter.{AttachMode, Waiter, mode_flag}
 
 /// A handle to a PipeInlet — the CLIENT end of a connection, where requests flow
 /// IN (spec §2.1; the names are design 10 ruling 2's).
@@ -463,4 +466,424 @@ func reply_body(request: &var PipeRequest, body: &[UInt8; PIPE_BODY_BYTES],
     request.handle = PipeRequestHandle(NO_HANDLE)
     return checked(sos_pipe_request_reply(word,
                                           (&body) as UnsafePointer<UInt8>, len))
+}
+
+// =============================================================================
+// WAITABILITY — the four pipe arms, and the consuming attach (spec §2.2's
+// waitable list; `designs/010` rulings 8, 9 and 11; sawos design 15, M4 unit 3)
+// =============================================================================
+//
+// **THE EIGHT OVERLOADS LIVE HERE AND NOT IN `sos.waiter`, ON DESIGN 8's OWN
+// PRECEDENT.** `Waiter.add` reads its argument's handle field, so an overload
+// must sit where the argument's type is declared; `sos.waiter` is BELOW this
+// file (this file names `Waiter`, because the composed sends park on one), so
+// an overload naming `PipeInlet` written there would import downward into its
+// own importer — the cycle DF-232e does not diagnose. It is exactly the shape
+// `Waiter.add(process:)` has had in `sos.system` since M3 unit 5.5, and since
+// sawlang 0.2.0 extension lookup follows the facade's `public import`, so the
+// split is invisible at the call site: `waiter.add(outlet:, key:)` reads as one
+// more member of the one list.
+//
+// **THE 2x2 IS SPELLED BY THE VERB AND THE MODE** (ruling 11(c)): `add` borrows
+// and `give` consumes, `AttachMode.Persistent` stays subscribed and
+// `AttachMode.OneShot` detaches at delivery. Four combinations, two axes, and
+// no `OneShotConsuming` anywhere — the axes are orthogonal, and consuming is an
+// EFFECT change that a runtime flag may not make.
+
+extension Waiter {
+    /// **WATCH A CONNECTION'S SERVER END FOR TRAFFIC**: attach it under `key`,
+    /// which a `wait()` hands back with an `OutletLevel` when a message is
+    /// staged or the client end is gone (spec §2.2's readable arm). Requires
+    /// `PipeOutletRight.Wait` there and `WaiterRight.Attach` here.
+    ///
+    /// **THIS IS WHAT TURNS UNIT 2's POLL LOOP INTO A PARK.** A server holding
+    /// several outlets on one Waiter is §2.2's whole shape — the key says which
+    /// connection woke it, and `take` is what it does next.
+    ///
+    /// `OutletLevel.PeerGone` is DRAIN-THEN-TERMINAL and arrives only once the
+    /// ring is dry: everything the departed client staged is handed over first,
+    /// which is design 230's close-drains-first rule and the same order
+    /// `take`'s own `PeerClosed` follows. Nothing un-closes.
+    public func add(&self, outlet: &PipeOutlet, key: UInt,
+                    mode: AttachMode = AttachMode.Persistent) -> Result<Void, SosStatus> {
+        self.attach(outlet.handle, key, mode_flag(mode))
+    }
+
+    /// **WATCH A CONNECTION'S CLIENT END FOR ROOM**: attach it under `key`,
+    /// which a `wait()` hands back with an `InletLevel` while the staging ring
+    /// has a free slot or the server end is gone (`designs/010` ruling 8).
+    /// Requires `PipeInletRight.Wait` there.
+    ///
+    /// **IT EXISTS BECAUSE `post` CAN NEVER BLOCK.** Ruling 4 made post the one
+    /// kernel primitive on the client side and gave it no park, so a refused
+    /// poster needed something better than a poll loop — this is it, and it is
+    /// the missing leg of the composed blocking `send`.
+    ///
+    /// A PLAIN LEVEL, NOT A TERMINAL ONE: consuming it clears nothing, and the
+    /// level's end is the poster's own next post. So an attachment left
+    /// `Persistent` on a connection with room reports ready every time it is
+    /// asked, exactly as an Interrupt's emptiness does.
+    public func add(&self, inlet: &PipeInlet, key: UInt,
+                    mode: AttachMode = AttachMode.Persistent) -> Result<Void, SosStatus> {
+        self.attach(inlet.handle, key, mode_flag(mode))
+    }
+
+    /// **WATCH A CLAIM FOR ITS ANSWER**: attach it under `key`, which a `wait()`
+    /// hands back with a `ReplyDelivery` — THE REPLY BYTES THEMSELVES — when the
+    /// server answers, or `PeerClosed` when it never will. Requires
+    /// `PipeReplyRight.Wait` there.
+    ///
+    /// **THE DELIVERY CARRIES THE PAYLOAD** (`designs/010` ruling 11(a)), which
+    /// is what makes this attach different in kind from the three beside it: a
+    /// client that waits this way never calls `resolve` at all, because the
+    /// answer arrived in the wait record. The multiplexed client is post ->
+    /// attach -> wait, three traps, however many requests are outstanding.
+    ///
+    /// **A DELIVERY IS INHERENTLY CONSUMING HERE, WHATEVER `mode` SAYS** (ruling
+    /// 11(b)): a claim is a ONE-SHOT, the answer is spent by the copy-out, and a
+    /// persistent subscription to something that has happened for the last time
+    /// would be a promise nothing can keep. So the attachment ends at the
+    /// delivery and `mode` is inert on this kind — stated rather than refused,
+    /// because the parameter is uniform across the family and a per-kind
+    /// exception would be a rule to remember.
+    ///
+    /// THE HANDLE STAYS YOURS with `add`. What a later `resolve` on it answers
+    /// is `PeerClosed`: the exchange was discharged by the delivery, and there
+    /// is no second copy of an answer. Use `give` when the claim is genuinely
+    /// finished with — it is, on the success path, which is why the composed
+    /// `send` is the one caller that keeps it.
+    public func add(&self, reply: &PipeReply, key: UInt,
+                    mode: AttachMode = AttachMode.OneShot) -> Result<Void, SosStatus> {
+        self.attach(reply.handle, key, mode_flag(mode))
+    }
+
+    /// **WATCH AN OBLIGATION FOR ITS CANCELLATION**: attach it under `key`,
+    /// which a `wait()` hands back with `WaitPayload.Abandoned` once the client
+    /// has dropped the claim behind it (spec §2.1's ratified early notice).
+    /// Requires `PipeRequestRight.Wait` there.
+    ///
+    /// **ABANDONMENT IS INFORMATION, NOT AN IMPERATIVE** (§2.1). This is the
+    /// opt-in early notice the ratified text names, and what a server does with
+    /// it is the protocol's decision: a cancellable read stops working, a
+    /// tell-style message ignores it entirely. Without the attach, a server
+    /// learns the same fact when its `reply` answers `PeerClosed` — later, and
+    /// after the work.
+    ///
+    /// TERMINAL, on the Process arm's exact terms: a reply column that reached
+    /// zero can never rise, so a server attaching AFTER the client gave up is
+    /// told at once and nothing un-abandons.
+    public func add(&self, request: &PipeRequest, key: UInt,
+                    mode: AttachMode = AttachMode.Persistent) -> Result<Void, SosStatus> {
+        self.attach(request.handle, key, mode_flag(mode))
+    }
+
+    /// **HAND A CLAIM TO THIS WAITER, AND STOP HOLDING IT** (`designs/010`
+    /// ruling 11(c); the pattern that motivated the whole ruling).
+    ///
+    /// A client that attaches its claim and takes the answer out of the wait
+    /// record has no use for the handle afterwards — holding it is pure
+    /// ceremony, and a table row. `give` says so: the wrapper goes in by MOVE,
+    /// the kernel releases the entry as part of the attach, and the ATTACHMENT
+    /// owns the exchange from there. So a multiplexer holds ZERO reply handles
+    /// however many requests are outstanding, and its `MAX_HANDLES` stops being
+    /// the bound on its in-flight depth (design 14 finding 5, answered).
+    ///
+    /// **AND HANGING UP IS DESTROYING THE SUBSCRIPTION**: with no handle left,
+    /// `remove(key)` drops the last reference, which is §2.1's cancellation
+    /// primitive reached through the Waiter. That is the abandonment re-wording
+    /// this unit lands — a handle drop with a live attachment is not
+    /// abandonment, because the subscription is the interested party.
+    ///
+    /// Everything `Waiter.give(event:)` says about the verb, the gate and the
+    /// object-handed-back refusal holds word for word.
+    public func give(&self, reply: PipeReply, key: UInt,
+                     mode: AttachMode = AttachMode.OneShot
+    ) -> Result<Void, (SosStatus, PipeReply)> {
+        var owned = move reply
+        let word: UInt = owned.handle
+        owned.handle = PipeReplyHandle(NO_HANDLE)
+        try self.attach_consuming(word, key, mode) catch {
+            let back: (SosStatus, PipeReply) = (error, PipeReply(handle: PipeReplyHandle(word)))
+            return move back
+        }
+        return
+    }
+
+    /// Hand an OBLIGATION to this Waiter — the cancellation watcher that owns
+    /// what it watches. Everything `give(reply:)` says holds, with one
+    /// consequence worth naming: the obligation is now the attachment's, so
+    /// `remove(key)` DISCHARGES it and the client's `resolve` answers
+    /// `PeerClosed`. A server hangs up on a request by unsubscribing from it.
+    public func give(&self, request: PipeRequest, key: UInt,
+                     mode: AttachMode = AttachMode.OneShot
+    ) -> Result<Void, (SosStatus, PipeRequest)> {
+        var owned = move request
+        let word: UInt = owned.handle
+        owned.handle = PipeRequestHandle(NO_HANDLE)
+        try self.attach_consuming(word, key, mode) catch {
+            let back: (SosStatus, PipeRequest) = (error, PipeRequest(handle: PipeRequestHandle(word)))
+            return move back
+        }
+        return
+    }
+
+    /// Hand a connection's SERVER END to this Waiter. Everything
+    /// `give(reply:)` says holds — and this is the half `designs/010` ruling
+    /// 11(d) builds the completion-queue server on in unit 4, where the delivery
+    /// becomes the TAKE. Today it is the plainer thing: a subscription that owns
+    /// its end, so `remove(key)` drops the server end to zero and the
+    /// connection's clients answer `PeerClosed`.
+    public func give(&self, outlet: PipeOutlet, key: UInt,
+                     mode: AttachMode = AttachMode.Persistent
+    ) -> Result<Void, (SosStatus, PipeOutlet)> {
+        var owned = move outlet
+        let word: UInt = owned.handle
+        owned.handle = PipeOutletHandle(NO_HANDLE)
+        try self.attach_consuming(word, key, mode) catch {
+            let back: (SosStatus, PipeOutlet) = (error, PipeOutlet(handle: PipeOutletHandle(word)))
+            return move back
+        }
+        return
+    }
+
+    /// Hand a connection's CLIENT END to this Waiter. The mirror, and the least
+    /// useful of the eight — an end nobody holds cannot be posted through — so
+    /// it exists for uniformity and for the one shape that wants it: a watcher
+    /// that only cares whether the far side is still there.
+    public func give(&self, inlet: PipeInlet, key: UInt,
+                     mode: AttachMode = AttachMode.Persistent
+    ) -> Result<Void, (SosStatus, PipeInlet)> {
+        var owned = move inlet
+        let word: UInt = owned.handle
+        owned.handle = PipeInletHandle(NO_HANDLE)
+        try self.attach_consuming(word, key, mode) catch {
+            let back: (SosStatus, PipeInlet) = (error, PipeInlet(handle: PipeInletHandle(word)))
+            return move back
+        }
+        return
+    }
+}
+
+// =============================================================================
+// THE COMPOSED BLOCKING SENDS (spec §2.1's ratified client API; design 10
+// ruling 4, amended; sawos design 15, M4 unit 3)
+// =============================================================================
+//
+// **§2.1's `send(msg)` AND `send(msg, timeout:)` BECOME REAL HERE, AND THEY ARE
+// LIBRARY CODE.** Ruling 4 made `post` the ONE kernel primitive on the client
+// side and said so in as many words: blocking send is waiting on the claim,
+// timeout is the same wait with a Timer on the same Waiter, cancel is drop, and
+// THE KERNEL NEVER LEARNS WHAT A TIMEOUT IS — no duration argument, no 64-bit
+// copy-in funnel for one, no timeout code in any pipe path. Every line below is
+// ops that already shipped.
+//
+// **RULING 8's MISSING LEG IS HERE TOO**: a full ring used to surface as
+// `WouldBlock` and leave the caller polling. The inlet's room-to-post level is
+// what a blocked poster parks on, so the composition is wait-for-room, post,
+// wait-for-reply — and `WouldBlock` stays the honest answer for the caller that
+// chose `post` and wants it.
+//
+// **AND RULING 11(a) DELETED THE THIRD LEG.** The reply arrives IN THE WAIT
+// RECORD, so there is no `resolve` on the success path at all: a blocking round
+// trip is post + wait, and the claim is released by the ordinary drop.
+//
+// **WHY IT IS A TYPE AND NOT A METHOD ON `PipeInlet`.** Blocking a reply
+// requires a Waiter (ruling 4's own sentence) and a Waiter requires a `Process`
+// handle to create — which a `PipeInlet` has no way to reach, and could not be
+// given one without making every connection cost a Waiter whether or not
+// anybody ever blocks. So the WRAPPER OWNS THE WAITER, which is what the unit
+// brief asks for, and `PipeClient` is that wrapper: an inlet, a Waiter, and the
+// two attachment keys the composition needs a key space of its own for.
+
+/// **A CLIENT THAT CAN BLOCK** — a connection's inlet plus the Waiter the
+/// blocking compositions park on.
+///
+/// Build one out of an inlet you hold and a Waiter you made
+/// (`Process.waiter_create`); it owns both, and dropping it releases both, which
+/// is the ordinary RAII the rest of this module follows. The SPLIT-PHASE form is
+/// still there — `post` forwards to the inlet — so a caller may multiplex by
+/// hand through the same object it blocks with.
+///
+/// **THE TWO KEYS ARE ITS OWN**, and they are fields rather than constants
+/// because the Waiter may be shared: a caller that attaches other things to the
+/// same Waiter picks keys these two do not collide with. They default to 0 and
+/// 1, which is right for the common case of a Waiter this client is the only
+/// user of.
+public struct PipeClient {
+    public(package) inlet: PipeInlet,
+    public(package) waiter: Waiter,
+    /// The key the CLAIM and the room level attach under. They never overlap in
+    /// time — the room wait finishes before the claim exists — so one key
+    /// serves both, which is what keeps the client's footprint on a shared
+    /// Waiter to two words.
+    public(package) key: UInt,
+    /// The key the TIMEOUT's Timer attaches under. Only `send(timeout:)` uses
+    /// it.
+    public(package) timer_key: UInt,
+}
+
+extension PipeClient: NoCopy {}
+
+extension PipeClient {
+    /// Take ownership of an inlet and a Waiter. Both are released when this
+    /// client drops.
+    ///
+    /// **THE LABELS ARE `over:` AND `using:` RATHER THAN THE FIELD NAMES**, and
+    /// that is forced rather than chosen: an `init` whose parameters match the
+    /// fields is indistinguishable from the memberwise literal this body writes,
+    /// which the compiler refuses by name. Renaming reads better anyway — a
+    /// client is built OVER a connection USING a Waiter.
+    public init(over: PipeInlet, using: Waiter, key: UInt = 0,
+                timer_key: UInt = 1) -> PipeClient {
+        PipeClient(inlet: move over, waiter: move using, key: key,
+                   timer_key: timer_key)
+    }
+
+    /// The split-phase form, forwarded (spec §2.1's `post`). Everything
+    /// `PipeInlet.post` says holds — it never blocks, and it answers the claim.
+    public func post(&self, body: &[UInt8; PIPE_BODY_BYTES],
+                     len: UInt) -> Result<PipeReply?, SosStatus> {
+        self.inlet.post(body: &body, len: len)
+    }
+
+    /// **SEND, AND WAIT FOR THE ANSWER** (spec §2.1's ratified `send(msg)`).
+    ///
+    /// Three acts and two of them park: wait for room if the ring is full, post,
+    /// then wait for the reply — which ARRIVES IN THE WAIT RECORD, so there is
+    /// no third syscall to collect it.
+    ///
+    /// `Err(SosStatus.PeerClosed)` on the way OUT means nobody can ever take the
+    /// message; the `ReplyDelivery.PeerClosed` case on the way BACK means the
+    /// message was taken and the obligation was dropped without an answer. The
+    /// two are genuinely different facts, which is why one is an error and the
+    /// other is a delivery.
+    ///
+    /// **THE CLAIM IS ATTACHED NON-CONSUMING** even though this function has no
+    /// use for it afterwards, and that is deliberate: it is the same code path
+    /// `send(timeout:)` needs, and THAT one has to be able to hand the live
+    /// claim back. The consuming attach is the multiplexer's tool, not the
+    /// composition's (`designs/010` ruling 4, amended).
+    public func send(&self, body: &[UInt8; PIPE_BODY_BYTES],
+                     len: UInt) -> Result<ReplyDelivery, SosStatus> {
+        var claim = try self.stage(&body, len)
+        try self.waiter.add(reply: &claim, key: self.key,
+                            mode: AttachMode.OneShot)
+        let woke = try self.waiter.wait()
+        return delivery_of(&woke)
+    }
+
+    /// **SEND, AND GIVE UP AFTER `after_ns`** (spec §2.1's ratified
+    /// `send(msg, timeout:)`).
+    ///
+    /// The same composition with a Timer on the same Waiter, which is exactly
+    /// what ruling 4 said a timeout is. `timeout` is the caller's Timer — a
+    /// timeout is a schedule and a schedule is an object, so the client neither
+    /// creates one per call nor keeps one nobody asked for.
+    ///
+    /// **`TimedOut(pending:)` CARRIES THE STILL-LIVE CLAIM**, which is the whole
+    /// reason the surface is shaped this way (§2.1, ratified). The exchange has
+    /// not been cancelled — the server may still be working — so the caller
+    /// decides: wait again on the claim, hand it to somebody else, or DROP it,
+    /// which is §2.1's cancellation primitive and makes the server's later
+    /// `reply` answer `PeerClosed`.
+    ///
+    /// The ROOM wait is not covered by the timeout, and that is this v1
+    /// composition's one stated limit: backpressure parks until the server takes
+    /// something, and a caller that must bound that waits on the inlet itself.
+    public func send(&self, body: &[UInt8; PIPE_BODY_BYTES], len: UInt,
+                     timeout: &Timer,
+                     after_ns: UInt64) -> Result<SendOutcome, SosStatus> {
+        var claim = try self.stage(&body, len)
+        try self.waiter.add(reply: &claim, key: self.key,
+                            mode: AttachMode.OneShot)
+        try self.waiter.add(timer: &timeout, key: self.timer_key,
+                            mode: AttachMode.OneShot)
+        try timeout.arm(after_ns: after_ns)
+
+        let woke = try self.waiter.wait()
+        // **THE KEY IS WHAT SAYS WHICH WON**, which is what §2.2 gives a key
+        // for. Exactly one of the two attachments delivered, and a one-shot
+        // delivery DETACHES — so the loser is the one still attached, and it is
+        // the only one there is anything left to remove.
+        if woke.key == self.key {
+            try self.waiter.remove(self.timer_key)
+            try timeout.disarm()
+            var answer = delivery_of(&woke)
+            return SendOutcome.Replied(r: move answer)
+        }
+        try self.waiter.remove(self.key)
+        return SendOutcome.TimedOut(pending: move claim)
+    }
+
+    /// Post, parking on the inlet's ROOM level for as long as the ring is full
+    /// (`designs/010` ruling 8).
+    ///
+    /// The loop is not a poll: each turn either stages the message or PARKS, so
+    /// a client under backpressure costs nothing until the server takes
+    /// something. It ends when the level says `PeerGone`, which is the one way
+    /// posting can stop being possible.
+    func stage(&self, body: &[UInt8; PIPE_BODY_BYTES],
+               len: UInt) -> Result<PipeReply, SosStatus> {
+        var going = true
+        while going {
+            let staged = try self.inlet.post(body: &body, len: len)
+            if let got = move staged {
+                return move got
+            }
+            try self.waiter.add(inlet: &self.inlet, key: self.key,
+                                mode: AttachMode.OneShot)
+            let woke = try self.waiter.wait()
+            going = try room_of(&woke)
+        }
+        return SosStatus.PeerClosed
+    }
+}
+
+/// What a blocking `send(timeout:)` ended as (spec §2.1's ratified shape).
+///
+/// **`NoCopy`, on the wrapper-carries-tier rule**: one arm owns a reply body and
+/// the other owns a live capability, so neither may be duplicated by an accident
+/// of binding.
+public enum SendOutcome {
+    case Replied(r: ReplyDelivery),
+    /// The timer won. The claim is STILL LIVE and it is yours — the exchange was
+    /// not cancelled, and dropping this is what cancels it.
+    case TimedOut(pending: PipeReply),
+}
+
+extension SendOutcome: NoCopy {}
+
+/// Read a reply delivery out of a wait record.
+///
+/// **A RECORD OF ANOTHER KIND HERE IS A BUG IN THIS FILE, SO IT PANICS** — the
+/// same rule `decode_wait` states about an unknown tag, one altitude up. The
+/// composition attached the claim under this key itself and no other kind can
+/// answer to it, so a mismatch is this module disagreeing with itself rather
+/// than a condition a caller could handle, and never-hide says a bug the caller
+/// cannot act on should stop the program where it happened.
+func delivery_of(woke: &WaitResult) -> ReplyDelivery {
+    match woke.what {
+        case Reply(outcome) -> {
+            match outcome {
+                case Data(msg) -> ReplyDelivery.Data(
+                    msg: PipeMsg(len: msg.len, bytes: msg.bytes)),
+                case PeerClosed -> ReplyDelivery.PeerClosed,
+            }
+        },
+        case _ -> panic("sos: a pipe client's reply key answered with another kind"),
+    }
+}
+
+/// Read a room-level delivery: `true` there is space, `Err(PeerClosed)` there
+/// never will be again. The wrong kind panics on `delivery_of`'s reasoning.
+func room_of(woke: &WaitResult) -> Result<Bool, SosStatus> {
+    match woke.what {
+        case Room(state) -> {
+            match state {
+                case Room -> true,
+                case PeerGone -> SosStatus.PeerClosed,
+            }
+        },
+        case _ -> panic("sos: a pipe client's room key answered with another kind"),
+    }
 }
