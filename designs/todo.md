@@ -38,16 +38,26 @@ entry below or the brief that carries it, never restating either.
   `Waiter.give` (ruling 11(c)), which is eight typed overloads, one per
   waitable kind; ruling 9(a)'s implicit detach at `Resolve`/`Reply`;
   peer-gone terminal levels at all four zero-arms, so nothing parked is
-  silently doomed; and §2.1's ratified blocking `send(msg)` /
-  `send(msg, timeout:)` become real as LIBRARY compositions over post +
-  attach + wait plus a Timer, with `TimedOut(pending:)` carrying the
-  live claim. **ONE STRUCTURAL CHANGE**: `kcore.wake` merged into
+  silently doomed; and every piece §2.1's ratified blocking `send(msg)` /
+  `send(msg, timeout:)` compose out of — post + attach + wait plus a
+  Timer on the same Waiter. **THE COMPOSED-SEND SURFACE ITSELF IS STRUCK
+  BY A USER RULING AT LEAD REVIEW (Sep 1)**: no `PipeClient`, no
+  `SendOutcome`, because a wrapper type freezes a shape that cannot later
+  be refactored into a simple kernel call, the manual composition stays
+  user-writable with the shipped primitives, and a kernel-side timeout,
+  if ever genuinely needed, will be added to the kernel directly, then,
+  by ruling. §2.1's `send` surface therefore arrives with unit 3.5's
+  `Call`; `tests/pipe-send-manual` is the composition written out and is
+  what the "the primitives suffice" claim rests on. **ONE STRUCTURAL
+  CHANGE**: `kcore.wake` merged into
   `kcore.refs` — a delivery now drops a counted reference and a dropped
   reference now delivers, so the two are one act and a module boundary
   between them would be the cycle DF-232e does not diagnose. Suite
   196/196 (98 cases/arch) from 182/182, seven new cases across eight new
   packages, no pre-existing case row moved. Docs: spec §2.1 (abandonment
-  re-worded to the LAST REFERENCE, the send compositions BUILT), §2.2
+  re-worded to the LAST REFERENCE; the send surface NOT marked built —
+  the pieces are, the composition is the caller's, and the ratified
+  surface arrives with `Call`), §2.2
   (the list closes, persistent-BY-DEFAULT, the record layout, the
   consuming attach), §5.7 (the Add flags growth), §2's Pipe and Waiter
   rows, the counted-kinds table's four attachment columns, §11's M4

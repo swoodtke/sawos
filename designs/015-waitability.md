@@ -180,6 +180,13 @@ public enum SendOutcome {                        // NoCopy
 }
 ```
 
+**THIS BLOCK IS STRUCK — USER RULING AT LEAD REVIEW, Sep 1.** No library `send`
+ships: a wrapper type freezes a shape that cannot later be refactored into a
+simple kernel call, the manual composition stays user-writable with the shipped
+primitives, and a kernel-side timeout, if ever needed, will be added to the
+kernel directly, then, by ruling. Everything else in this §API landed. See the
+As-built's "The composed sends, as struck".
+
 `wait()` keeps its signature (`-> Result<WaitResult, SosStatus>`); the
 record buffer inside `wait_into_frame` grows to the new
 `wait_record_bytes()`.
@@ -231,6 +238,11 @@ finding 3: root's 16 KiB stack ceiling; arm64 meets it first)
    sibling-thread server (thread-basics' two-worker shape);
    `send(timeout:)` with no server → `TimedOut(pending:)`, then the
    pending claim dropped = cancel, server's later reply `PeerClosed`.
+   **REWORKED, per the Sep-1 ruling above: it is `pipe-send-manual`, the
+   composition written INLINE out of the primitives, against a CHILD server
+   (a sibling thread cannot be handed a typed endpoint, so the boundary is a
+   process); the room leg joins it, and `TimedOut(pending:)`'s substance is the
+   non-consuming attach leaving the claim in hand.**
 6. Negative arms where cheap: attach without the Wait right (refused);
    OneShot re-wait footgun stated (wait on now-empty waiter — the
    existing deadlock report, asserted); mode word out of range
@@ -265,6 +277,19 @@ money shot (unit 5).
 182/182; SEVEN new cases across eight new packages, and no pre-existing case
 row moved.
 
+**AMENDED AT LEAD REVIEW THE SAME DAY BY A USER RULING: THE COMPOSED-SEND
+SURFACE IS STRUCK.** `PipeClient` and `SendOutcome` are removed from
+`sos.pipe`; nothing kernel-side changes, because the primitives — post, the
+eight attaches, wait, resolve, the room level — WERE the surface all along. The
+rationale is recorded here rather than argued: a wrapper type freezes a shape
+that cannot later be refactored into a simple kernel call, the manual
+composition stays user-writable with what shipped, and if a timeout is ever
+genuinely needed it will be added to the kernel directly, then, by ruling. The
+proof case was reworked rather than deleted — see "The composed sends, as
+struck" below — and this is a RULING at review, not a deviation the unit
+argued. §API's `send` block is the one part of the reviewed surface that did
+not land; everything else did.
+
 **VALIDATED ON sawlang 0.3.0** (`SAWLANG_ROOT` at `87063387`, unchanged from
 dispatch to gate and re-checked at both ends — the tree's `sawlang.pin`
 version). The baseline and the gate were compiled by the SAME compiler, so the
@@ -284,6 +309,7 @@ rows `[n/m] MARK name`, image rows `path (N bytes)`, everything else):
 | authorized-with-cause | 52 image-size rows | every image that CALLS `Waiter.wait` grew: 27 riscv32 rows by +24 to +13000 bytes, 25 arm64 rows by +4096 to +12288 (page granularity on that profile). **THE CORRELATION IS EXACT AND WAS VERIFIED RATHER THAN ASSUMED**: every package with a grown image reaches the wait door, and NO package that does not reach it grew — 53 riscv32 and 55 arm64 images did not move at all. The cause is the decode: `decode_wait` now names the four new `WaitPayload` cases, so an image that waits links `sos.pipe`'s payload types and the composed sends with them, and an image that never waits links none of it |
 | authorized-with-cause | 2 image-size rows | `refcount-free` (+40 riscv32) and `waiter-revoked` (+24 riscv32) are the two C-altitude waiters, and they grew for a DIFFERENT reason: their hand-sized record buffers went from 3 and 4 words to 48, because the published minimum grew by a message body. They are inside the 52 above; named separately because the cause is the frame and not the link |
 | authorized-with-cause | 1 summary row | `182 passed` -> `196 passed` |
+| authorized-with-cause (SECOND PARK) | 2 case rows removed, 2 added | `pipe_send_blocking` -> `pipe_send_manual` at the user ruling above. A renamed case's rows are a removal and an addition, and its five text rows moved with it: three by prefix alone (`sendblock` -> `sendmanual`), one by name (`send got len=4` -> `reply len=4`, since there is no `send` to have got it), and ONE IS GENUINELY NEW — `filled=16 then room says there is space`, the room leg the wrapper hid and the manual composition has to take. The case count and every other row are unchanged, so the totals below are the same |
 | address-only | 0 | nothing printed an address that moved |
 | documented-nondeterministic | 0 | none met |
 | new | 14 case rows + 16 image rows | the seven cases and eight packages, on both profiles |
@@ -364,6 +390,46 @@ of which would then owe an unref, was the "collect-then-free shape" the brief
 sanctions and was REJECTED as seven chances to leak. The merge changes no
 altitude: the merged module still sits above `process` (it needs the copy door)
 and below `irq`, which is exactly where `refs` already was.
+
+### The composed sends, as struck
+
+**WHAT WAS REMOVED**: `PipeClient` (the struct, its `init`, its forwarded
+`post`, both `send` methods and the private `stage`), `SendOutcome`, and the two
+record-reading helpers `delivery_of` / `room_of` that only the composition used
+— together with the `sos.timer` import they needed and the facade's two
+re-exports. About 200 lines of `sos.pipe`, and nothing else in the tree
+referenced them.
+
+**WHAT DID NOT MOVE**: the eight `Waiter` overloads, `AttachMode`, the four
+matrix columns, the record's body region, the flags word — every primitive the
+composition was written over. `sos.pipe` still imports `sos.waiter` and still
+sits above it, because the four pipe `add`/`give` overloads are the reason for
+that ordering and they stay.
+
+**WHAT REPLACED THE PROOF.** `pipe-send-blocking` became `pipe-send-manual`,
+and the change is not a rename with the same body: the composition moved INTO
+the test, inline, as the four calls a caller makes — post, `add(reply:)` one-shot,
+`wait`, and a Timer on the same Waiter for the timeout leg, with the KEY the
+wait answers deciding which of the two won and the three lines of bookkeeping
+after it (remove the loser, keep the claim) written out. Two things improved by
+being written by hand rather than hidden:
+
+- **THE ROOM LEG IS NOW EXERCISED BY THIS CASE TOO** (ruling 8). The wrapper's
+  `stage` looped over it invisibly; the manual version fills the ring first, so
+  the post is genuinely REFUSED and the program has to park on the inlet's level
+  before it has a claim at all. `filled=16 then room says there is space` is the
+  new row, and it is the leg a library `send` would have concealed.
+- **`TimedOut(pending:)`'s SUBSTANCE SURVIVES WITHOUT THE TYPE.** The attach is
+  non-consuming, so the claim is the caller's the whole time and is simply still
+  in hand when the Timer's key comes back — which is what the enum case was
+  carrying. `after cancel …` is unchanged: dropping it is §2.1's cancellation
+  primitive and the server's later `reply` is told.
+
+The other three observable rows survive verbatim in substance and moved only in
+their prefix (`sendblock` -> `sendmanual`) and in one name (`send got len=4` ->
+`reply len=4`, because there is no `send` to have got it): the child's parked
+service, the `PONG` bytes arriving in the wait record, and the timeout. The
+case is still the only one in the unit whose threads really park.
 
 ### The cascade census (the brief's D-2 obligation)
 
@@ -456,16 +522,15 @@ soundness argument rather than a preference.**
    `resolve` gets the word an abandoned peer gets. The kernel cannot destroy a
    handle entry it did not travel through; that is what `give` exists for, and
    the composed `send` is the one caller that deliberately does not use it.
-2. **THE COMPOSED SENDS ARE METHODS ON A NEW `PipeClient` WRAPPER, NOT ON
-   `PipeInlet`.** §API shows `public func send(&self, body:, len:)` under the
-   heading "the wrapper owns a Waiter". A `PipeInlet` cannot own one: a Waiter is
-   made by `ProcessOp.WaiterCreate` and an inlet has no `Process` handle and no
-   way to reach one, and giving every connection a Waiter at `pipe_create` would
-   charge a `QuotaKind.Waiter` row to clients that never block. So the WRAPPER
-   that owns a Waiter is a type — `PipeClient(over: inlet, using: waiter)` — and
-   the two ruled signatures are then verbatim, `&self` included, with the two
-   attachment keys as fields so a shared Waiter stays usable. `post` forwards, so
-   the ratified split-phase form is still on the same object.
+2. ~~**THE COMPOSED SENDS ARE METHODS ON A NEW `PipeClient` WRAPPER**~~ —
+   SUPERSEDED, and the whole surface with it. This deviation existed because
+   §API's `send(&self, body:, len:)` is unwritable on a `PipeInlet` (a Waiter is
+   made by `ProcessOp.WaiterCreate`, an inlet has no `Process` handle and no way
+   to reach one, and giving every connection a Waiter at `pipe_create` would
+   charge a `QuotaKind.Waiter` row to clients that never block), so the wrapper
+   that owns a Waiter became a TYPE. The user's ruling at review struck the
+   surface rather than choosing between the two spellings, which retires the
+   question: see "The composed sends, as struck".
 3. **FIFTEEN TEST PACKAGES' `WaitPayload` MATCHES COLLAPSED TO ONE ARM PLUS A
    DEFAULT, RATHER THAN GAINING FOUR PANIC ARMS EACH.** Design 8's tradition is
    to write every arm out; at eight waitable kinds that is seven identical
@@ -550,6 +615,13 @@ soundness argument rather than a preference.**
    kernel/sysapi files is the inline `try … catch` guard form or a plain
    propagating `try`. The `match` sites that remain are the negative-test arms
    asserting a specific status (`pipe-wait-reply`'s one, `pipe-wait-give`'s two,
-   `pipe-send-blocking`'s two, the two refusal cases' one each) and the four
+   `pipe-send-manual`'s one, the two refusal cases' one each) and the four
    `give` bodies' success/failure split, which is a genuinely-different-arms
    match rather than a fold.
+8. **THE LEAD-REVIEW RULING COST THE UNIT NOTHING KERNEL-SIDE, WHICH IS WHAT
+   SAYS THE SLICE WAS DRAWN IN THE RIGHT PLACE.** Striking the composed sends
+   removed 200 lines of one sysapi file and reworked one test; no op, no right,
+   no matrix column, no record field and no test but that one moved. A unit
+   whose library layer could be deleted without disturbing what it built is a
+   unit whose library layer was a convenience — which is the ruling's own
+   argument, arriving as evidence rather than as a prediction.

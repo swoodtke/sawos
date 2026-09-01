@@ -1,0 +1,358 @@
+// SOS M4 unit 3: THE BLOCKING SEND, WRITTEN OUT OF THE PRIMITIVES (sawos design
+// 15; spec §2.1's ratified client API; `designs/010` ruling 4).
+//
+// **§2.1's `send(msg)` AND `send(msg, timeout:)` HAVE BEEN RATIFIED SINCE JULY
+// AND HAD NOTHING TO PARK ON UNTIL NOW — AND THEY ARE STILL NOT A LIBRARY CALL**
+// (user ruling, lead review Sep 1). Ruling 4 said blocking send is waiting on
+// the claim and a timeout is the same wait with a Timer on the same Waiter;
+// unit 3 shipped every piece of that, and the composition itself stays the
+// caller's. A wrapper type would freeze a shape unit 3.5's fused `Call` is meant
+// to replace, and a timeout the kernel ever genuinely needs will be an OP.
+//
+// So this program IS the composition, inline, and it is four calls:
+//
+//   post           stage the message, take the claim              (unit 2)
+//   add(reply:)    attach the claim, one-shot                     (unit 3)
+//   wait           park; the record carries the ANSWER'S BYTES    (ruling 11(a))
+//   — and for the timeout leg, a Timer on the SAME Waiter, with the KEY the
+//     wait answers with deciding which of the two won.
+//
+// **THE ORDER IS THE PROOF, AND IT IS THE ONLY CASE IN THE UNIT WHOSE THREADS
+// REALLY BLOCK.** Two processes, two parked threads, each waking the other
+// exactly once:
+//
+//   SOS childserver: replied         the child parked on its OUTLET, was woken
+//                                    by root's post, took, and answered
+//   SOS: process exit: code=4        ...and ended
+//   SOS sendmanual: reply len=4 b=80,79,78,71
+//                                    root parked on the CLAIM and woke with
+//                                    `PONG` IN THE WAIT RECORD — no `resolve`
+//                                    anywhere on this path, because ruling
+//                                    11(a) deleted that leg
+//   SOS sendmanual: timed out        a second connection nobody serves: the
+//                                    Timer's key came back, not the claim's
+//   SOS sendmanual: after cancel ...  ...and the claim was ours the whole time,
+//                                    so DROPPING it is §2.1's cancellation
+//                                    primitive, which the server's later
+//                                    `reply` is told about
+//
+// Root's first wait cannot complete before the child runs, and the child cannot
+// run before root parks, so the transcript's interleaving is what says the two
+// woke each other. A polling implementation of either half would print the same
+// bytes with none of it.
+//
+// **THE ROOM LEG IS EXERCISED TOO** (ruling 8), on the unserved connection: the
+// ring is filled first, so the poster is REFUSED and has to park on the inlet's
+// room-to-post level before it can post at all — which is the leg a library
+// `send` would have hidden and which a caller writing this by hand has to know
+// about. `post` answering `Ok(None)` is the honest surface underneath it.
+//
+// ONE PHASE PER FUNCTION, on design 14 finding 3's stack ceiling.
+
+import sos.{System, Process, Clock, ClockType, Timer, Waiter, PipeInlet,
+            PipeOutlet, PipeReply, PipeRequest, WaitResult, WaitPayload,
+            ReplyDelivery, InletLevel, AttachMode, SosStatus, SystemRight,
+            PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// ROOT'S CONFIG, and the whole of the contract with the child. `child-server`
+/// expects exactly these words; the kernel supplies no meaning for either.
+static TAG_BOOT: UInt = 7
+static TAG_OUTLET: UInt = 12
+
+/// What a child of this launcher may ask its System object for: print, learn its
+/// own Process object, and pass a handle on. `Transfer` is in the mask for the
+/// reason `give-boot-drain` records — it is the ticket the give itself checks.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// **THE COMPOSITION'S OWN KEYS.** A client that writes the composition inline
+/// owns its Waiter's key space, and these are the two words it spends: the CLAIM
+/// (and, on the unserved connection, the room level — they never overlap in
+/// time, so one key serves both) and the TIMER. Distinct words that appear
+/// nowhere else, so a record naming one names an attachment this program made.
+static KEY_CLAIM: UInt = 21
+static KEY_TIMER: UInt = 22
+
+/// The request's length and bytes: `PING`.
+static PING_LEN: UInt = 4
+
+/// The unserved connection's one-byte message length.
+static ONE: UInt = 1
+
+/// Five milliseconds. Long enough that a working machine never trips it on the
+/// SERVED connection, short enough that the unserved one gives up promptly.
+static TIMEOUT_NS: UInt64 = 5_000_000
+
+/// The ceiling on the fill loop. The point is that it terminates whatever the
+/// kernel answers, not that the number is tight.
+static MAX_ROUNDS: Int = 64
+
+static BUG: SosStatus = SosStatus.Revoked
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS sendmanual: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try round_trip(&system, &proc) catch {
+        print("SOS sendmanual: round trip failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try timed_out(&system, &proc) catch {
+        print("SOS sendmanual: timeout leg failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    print("SOS sendmanual: done\n")
+    let _ = proc.exit(EXIT_OK)
+}
+
+/// **THE BLOCKING ROUND TRIP, ACROSS A PROCESS BOUNDARY, IN THREE CALLS.**
+///
+/// Root creates the connection, GIVES the server end to a child, and then does
+/// the composition by hand: post, attach the claim one-shot, wait. Nothing else
+/// in root is runnable at the wait, so the kernel runs the child; the child
+/// parks on its outlet, is woken by the post that already happened
+/// (level-triggered, so the order does not matter), takes, and replies. That
+/// reply is what wakes root, and the bytes are in the record it wakes with.
+///
+/// **THE ATTACH IS NON-CONSUMING**, which is what a library `send` would also
+/// have had to do: the timeout leg below must be able to keep the claim, so both
+/// legs use the same shape. `give` is the multiplexer's tool, not this one's.
+func round_trip(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var image = try proc.boot_handle_next()
+    var dest = try proc.boot_handle_next()
+    let image_mem = image.take_memory()!
+    let dest_mem = dest.take_memory()!
+
+    let child = try system.process_create(image: &image_mem, memory: &dest_mem)
+
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    let waiter = try proc.waiter_create()
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT)
+    // THE SERVER END LEAVES ROOT ENTIRELY. Root keeps the inlet and nothing
+    // else, so the only way it can learn anything is from the child's reply.
+    try child.give(outlet: move outlet, tag: TAG_OUTLET)
+    let _ = system.debug_print("SOS sendmanual: gave the outlet\n")
+
+    try child.start(boot_tag: TAG_BOOT)
+
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 80
+    msg[1] = 73
+    msg[2] = 78
+    msg[3] = 71
+
+    // 1. POST. The ring is fresh, so it cannot refuse; the room leg is exercised
+    //    on the unserved connection below, where a refusal is arranged.
+    let staged = try inlet.post(body: &msg, len: PING_LEN)
+    guard var claim = move staged else { return BUG }
+
+    // 2. ATTACH the claim, one-shot — a reply happens once.
+    try waiter.add(reply: &claim, key: KEY_CLAIM, mode: AttachMode.OneShot)
+
+    // 3. WAIT. THIS BLOCKS, and what comes back is the answer itself.
+    let woke = try waiter.wait()
+    if woke.key != KEY_CLAIM { return BUG }
+    print("SOS sendmanual: reply len={} b={},{},{},{}\n", reply_len(&woke),
+          reply_byte(&woke, 0), reply_byte(&woke, 1), reply_byte(&woke, 2),
+          reply_byte(&woke, 3))
+    return
+}
+
+/// **NOBODY SERVES THIS CONNECTION, SO THE TIMER WINS** — and the claim was the
+/// caller's the whole time.
+///
+/// This is the timeout leg written out, and it is what ruling 4 says a timeout
+/// IS: the same wait, with a Timer attached to the same Waiter. The kernel
+/// learns nothing about durations — `Timer.arm` is the op that knows, and it
+/// shipped in M3.
+///
+/// **THE KEY IS WHAT RESOLVES THE RACE**, which is what §2.2 gives a key for.
+/// Exactly one of the two attachments delivered, and a one-shot delivery
+/// DETACHES — so the loser is the one still attached, and it is the only one
+/// there is anything left to remove. That bookkeeping is the caller's here, and
+/// it is three lines.
+///
+/// **THE ROOM LEG RUNS FIRST.** The ring is filled with TELLs before the real
+/// post, so the post is REFUSED and the composition has to park on the inlet's
+/// room-to-post level (ruling 8) before it has a claim at all. A library `send`
+/// would have hidden that leg; written by hand, it is where a caller learns that
+/// `Ok(None)` is a level to wait on and not a failure.
+func timed_out(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    let waiter = try proc.waiter_create()
+    let clock = try system.clock_get(type: ClockType.Monotonic)
+    let timer = try clock.timer_create()
+
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 1
+
+    // 0. THE ROOM LEG. Fill the ring so the post below is refused, take one
+    //    message and drop its obligation so a slot settles, then park on the
+    //    inlet's level to be told there is space again.
+    let filled = try fill(&inlet, &msg)
+    let refused = try inlet.post(body: &msg, len: ONE)
+    if let claim = move refused { return BUG }
+    let took = try take_and_drop(&outlet, &var buf)
+    if not took { return BUG }
+    try waiter.add(inlet: &inlet, key: KEY_CLAIM, mode: AttachMode.OneShot)
+    let room = try waiter.wait()
+    print("SOS sendmanual: filled={} then room says {}\n", filled,
+          level_name(&room))
+
+    // 1. POST — now that the level said there is space.
+    let staged = try inlet.post(body: &msg, len: ONE)
+    guard var claim = move staged else { return BUG }
+
+    // 2. ATTACH both: the claim, and the Timer that bounds the wait.
+    try waiter.add(reply: &claim, key: KEY_CLAIM, mode: AttachMode.OneShot)
+    try waiter.add(timer: &timer, key: KEY_TIMER, mode: AttachMode.OneShot)
+    try timer.arm(after_ns: TIMEOUT_NS)
+
+    // 3. WAIT, and let the KEY say which won.
+    let woke = try waiter.wait()
+    if woke.key == KEY_CLAIM {
+        let _ = system.debug_print("SOS sendmanual: an unserved pipe replied\n")
+        return BUG
+    }
+    // The Timer won. Its own attachment detached at the delivery; the claim's is
+    // still live, so the caller removes it — and the CLAIM ITSELF IS STILL OURS,
+    // which is exactly what §2.1's `TimedOut(pending:)` shape exists to say.
+    try waiter.remove(KEY_CLAIM)
+    let _ = system.debug_print("SOS sendmanual: timed out\n")
+
+    // **THE CANCELLATION.** Dropping the live claim is how §2.1 says a client
+    // gives up, and it needs no verb.
+    let _ = move claim
+
+    // Now play the server on the connection the client gave up on. The message
+    // is still staged — abandoning a claim does not un-send what was sent — so
+    // the take succeeds and the reply is what carries the news.
+    let got = try outlet.take(into: &var buf)
+    guard let (_, request) = move got else { return BUG }
+    var obligation = move request
+    match obligation.reply(body: &msg, len: ONE) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS sendmanual: a cancelled claim took a reply\n")
+            return BUG
+        },
+        case Err(e) -> { print("SOS sendmanual: after cancel {}\n", e) },
+    }
+
+    let _ = try drain(&outlet, &var buf)
+    return
+}
+
+/// How many bytes the reply in this record carries.
+func reply_len(r: &WaitResult) -> UInt {
+    match r.what {
+        case Reply(outcome) -> {
+            match outcome {
+                case Data(msg) -> msg.len,
+                case PeerClosed -> 0,
+            }
+        },
+        case _ -> 0,
+    }
+}
+
+/// Byte `i` of it, read THROUGH A BORROW — which is what makes `PipeMsg` being
+/// `NoCopy` cost a caller nothing.
+func reply_byte(r: &WaitResult, i: Int) -> UInt {
+    match r.what {
+        case Reply(outcome) -> {
+            match outcome {
+                case Data(msg) -> msg.bytes[i] as UInt,
+                case PeerClosed -> 0,
+            }
+        },
+        case _ -> 0,
+    }
+}
+
+/// Which of the inlet level's two readings this record carries.
+func level_name(r: &WaitResult) -> String {
+    match r.what {
+        case Room(state) -> {
+            match state {
+                case Room -> "there is space",
+                case PeerGone -> "the peer is gone",
+            }
+        },
+        case _ -> "not a room record",
+    }
+}
+
+/// Post and give the claim up — §2.1's TELL idiom, which is what the fill loop
+/// uses because it is about the RING and not about the pair.
+func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
+          len: UInt) -> Result<Bool, SosStatus> {
+    let staged = try inlet.post(body: &body, len: len)
+    if let claim = move staged {
+        let _ = move claim
+        return true
+    }
+    return false
+}
+
+/// Take, and discharge the obligation by dropping it — the mirror of `tell`.
+func take_and_drop(outlet: &PipeOutlet,
+                   into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<Bool, SosStatus> {
+    let got = try outlet.take(into: &var into)
+    if let (_, request) = move got {
+        let _ = move request
+        return true
+    }
+    return false
+}
+
+/// Post until the kernel refuses, and hand back how many went.
+func fill(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES]) -> Result<UInt, SosStatus> {
+    var depth: UInt = 0
+    var filling = true
+    var rounds: Int = 0
+    while filling && rounds < MAX_ROUNDS {
+        rounds = rounds + 1
+        let put = try tell(&inlet, &body, ONE)
+        if put {
+            depth = depth + 1
+        } else {
+            filling = false
+        }
+    }
+    return depth
+}
+
+/// Take everything staged, discharging as it goes.
+func drain(outlet: &PipeOutlet,
+           into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<UInt, SosStatus> {
+    var took: UInt = 0
+    var going = true
+    var rounds: Int = 0
+    while going && rounds < MAX_ROUNDS {
+        rounds = rounds + 1
+        let got = try take_and_drop(&outlet, &var into)
+        if got {
+            took = took + 1
+        } else {
+            going = false
+        }
+    }
+    return took
+}

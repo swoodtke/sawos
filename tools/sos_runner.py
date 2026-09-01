@@ -382,13 +382,15 @@ PIPE_DEAD_CLAIM_PKG = os.path.join(TESTS_DIR, "pipe-dead-claim")
 # waited on — which is §2.2's level-triggering doing exactly what it is ratified
 # for, and is what lets one thread assert what a delivery CONTAINS. That is a
 # deliberate division of labour: the four cases prove the four arms' payloads and
-# their ordering rules, and `pipe_send_blocking` is the one that proves the WAKE,
-# because a genuine park needs something else to be runnable.
+# their ordering rules, and `pipe_send_manual` is the one that proves the WAKE,
+# because a genuine park needs something else to be runnable — and it proves it
+# with the composition a CALLER writes, since the ruled surface is the primitives
+# and not a library `send` (user, lead review Sep 1).
 PIPE_WAIT_REPLY_PKG = os.path.join(TESTS_DIR, "pipe-wait-reply")
 PIPE_WAIT_GIVE_PKG = os.path.join(TESTS_DIR, "pipe-wait-give")
 PIPE_WAIT_ROOM_PKG = os.path.join(TESTS_DIR, "pipe-wait-room")
 PIPE_WAIT_SERVER_PKG = os.path.join(TESTS_DIR, "pipe-wait-server")
-PIPE_SEND_BLOCKING_PKG = os.path.join(TESTS_DIR, "pipe-send-blocking")
+PIPE_SEND_MANUAL_PKG = os.path.join(TESTS_DIR, "pipe-send-manual")
 CHILD_SERVER_PKG = os.path.join(TESTS_DIR, "child-server")
 PIPE_NO_WAIT_PKG = os.path.join(TESTS_DIR, "pipe-no-wait")
 PIPE_BAD_MODE_PKG = os.path.join(TESTS_DIR, "pipe-bad-mode")
@@ -3373,46 +3375,63 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
-        # **THE COMPOSED BLOCKING SENDS, AND THE ONLY CASE IN THIS UNIT WHOSE
-        # THREADS REALLY PARK** (spec §2.1's ratified client API; `designs/010`
-        # ruling 4). Two processes, two blocked threads, each waking the other
-        # exactly once.
+        # **THE BLOCKING SEND WRITTEN OUT OF THE PRIMITIVES, AND THE ONLY CASE
+        # IN THIS UNIT WHOSE THREADS REALLY PARK** (spec §2.1's ratified client
+        # API; `designs/010` ruling 4). Two processes, two blocked threads, each
+        # waking the other exactly once.
+        #
+        # **THERE IS NO LIBRARY `send`, AND THAT IS THE RULING THIS CASE
+        # CARRIES** (user, lead review Sep 1). The composition is four calls this
+        # program makes itself — post, attach, wait, and a Timer on the same
+        # Waiter for the timeout leg — because a wrapper type would freeze a
+        # shape unit 3.5's fused `Call` is meant to replace, and a timeout the
+        # kernel ever genuinely needs arrives as an OP. What the case proves is
+        # therefore that the PRIMITIVES suffice, which is a stronger claim than
+        # that a wrapper works.
         #
         # **THE ORDER IS THE PROOF.** `SOS childserver: replied`, the child's
-        # exit and its teardown all come BEFORE root reads the bytes — root's
-        # `send` posted, attached its claim and parked, which left the kernel
-        # nothing runnable but the child; the child parked on its OUTLET and was
-        # woken by the post; its reply is what woke root. A polling
-        # implementation of either half would print the same bytes with none of
-        # that interleaving.
+        # exit and its teardown all come BEFORE root reads the bytes — root
+        # posted, attached its claim and parked, which left the kernel nothing
+        # runnable but the child; the child parked on its OUTLET and was woken by
+        # the post; its reply is what woke root. A polling implementation of
+        # either half would print the same bytes with none of that interleaving.
         #
-        # `send got len=4 b=80,79,78,71` is `PONG` in ASCII, arriving in the WAIT
+        # `reply len=4 b=80,79,78,71` is `PONG` in ASCII, arriving in the WAIT
         # RECORD's body region: there is no `resolve` anywhere on this path,
         # because ruling 11(a) deleted that leg.
         #
-        # `timed out` is a second connection nobody serves — the Timer on the
-        # same Waiter is what ends the wait, which is the whole of what ruling 4
-        # says a timeout is, and the kernel still knows nothing about durations.
+        # `filled=16 then room says there is space` is the ROOM LEG (ruling 8),
+        # which a library `send` would have hidden: the ring is filled first, so
+        # the poster is REFUSED and has to park on the inlet's level before it
+        # has a claim at all. `pipe_wait_room` proves the level exists; this
+        # proves a caller composing a blocking send has to use it.
+        #
+        # `timed out` is the same connection with nobody serving it — the Timer
+        # on the same Waiter is what ends the wait, which is the whole of what
+        # ruling 4 says a timeout is, and the kernel still knows nothing about
+        # durations. THE KEY IS WHAT RESOLVES THE RACE, and the bookkeeping after
+        # it (remove the loser, keep the claim) is the caller's three lines.
         # `after cancel ...` is what the still-live claim being DROPPED means:
         # §2.1's cancellation primitive, and the server told rather than left to
         # succeed silently.
-        "name": "pipe_send_blocking",
+        "name": "pipe_send_manual",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
-        "root_pkg": PIPE_SEND_BLOCKING_PKG,
+        "root_pkg": PIPE_SEND_MANUAL_PKG,
         "children": [CHILD_SERVER_PKG],
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
-                       "SOS sendblock: gave the outlet",
+                       "SOS sendmanual: gave the outlet",
                        "SOS childserver: replied",
                        "SOS: process exit: code={four} process={one}",
                        "SOS: process teardown handles={four} threads={one} "
                        "events={zero} waiters={one} interrupts={zero} "
                        "timers={zero} process={one}",
-                       "SOS sendblock: send got len=4 b=80,79,78,71",
-                       "SOS sendblock: timed out",
-                       "SOS sendblock: after cancel the other end of this "
+                       "SOS sendmanual: reply len=4 b=80,79,78,71",
+                       "SOS sendmanual: filled=16 then room says there is space",
+                       "SOS sendmanual: timed out",
+                       "SOS sendmanual: after cancel the other end of this "
                        "connection is gone",
-                       "SOS sendblock: done"],
+                       "SOS sendmanual: done"],
         "expect_clean_exit": True,
     },
     {
