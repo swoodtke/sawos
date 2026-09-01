@@ -11,8 +11,8 @@
 //                              error, and it consumes nothing
 //   reply len=2 b=90,89        the reply BYTES came back through the same slot
 //   zero reply len=0           a reply that carries no data is still an answer
-//   fifo replies a=11 b=22 c=33  three exchanges in flight at once, and each
-//                              claim resolved to ITS OWN reply
+//   fifo replies a=11 b=22 c=33  three exchanges in flight at once, answered out
+//                              of order, and each claim got ITS OWN reply
 //   depth with one in flight=15  ONE unsettled exchange costs ONE ring slot
 //   depth settled=16           ...and settling it gives the slot back
 //
@@ -30,6 +30,16 @@
 // the other side — so they arrive in the OK channel with a distinguishable
 // absence (design 234 §4). `pipe-abandon` is where the error channel is proved.
 //
+// **ONE PHASE PER FUNCTION, AND THE FRAME IS WHY.** Root's stack grant is
+// `hal.ROOT_STACK_LEN` — 16 KiB, one page-pair on both profiles — and every
+// `print` with format arguments reserves message scratch in ITS OWN frame
+// (design 137: the message is assembled in stack scratch so a panic survives an
+// exhausted allocator). A `_start` holding every phase of this case therefore
+// holds every phase's scratch at once, which overflowed the grant on the 64-bit
+// profile and not on the 32-bit one. So each phase is a function that reports by
+// RETURNING a status and `_start` prints once. That is also how it reads best:
+// each function is one claim.
+//
 // EVERY LOOP IS BOUNDED. A poll loop with no ceiling is a hang the deadlock
 // report cannot see.
 
@@ -44,10 +54,199 @@ static EXIT_FAILED: UInt = 1
 /// answers, not that the number is tight.
 static MAX_ROUNDS: Int = 64
 
+/// **WHAT A PHASE ANSWERS WHEN ITS OWN ARITHMETIC IS WRONG.** Every refusal in
+/// this case that is NOT the kernel's is a bug in the case, and it needs a value
+/// to carry out of a `Result` — so it borrows the one status that can never
+/// legitimately reach `_start` from any call these phases make, and `_start`
+/// prints it. It is a test's internal assertion vocabulary, not a claim about the
+/// kernel.
+static BUG: SosStatus = SosStatus.Revoked
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS oneshot: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let pair = try proc.pipe_create() catch {
+        print("SOS oneshot: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let (inlet, outlet) = move pair
+    let _ = system.debug_print("SOS oneshot: created\n")
+
+    try round_trip(&inlet, &outlet) catch {
+        print("SOS oneshot: round trip failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try zero_reply(&inlet, &outlet) catch {
+        print("SOS oneshot: zero reply failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try three_in_flight(&inlet, &outlet) catch {
+        print("SOS oneshot: three in flight failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try ring_around_one(&inlet, &outlet) catch {
+        print("SOS oneshot: ring count failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    print("SOS oneshot: done\n")
+    let _ = proc.exit(EXIT_OK)
+}
+
+/// **THE ROUND TRIP, BOTH WAYS** — and the pending answer in the middle of it.
+///
+/// A post answers a CLAIM; a take answers the message AND the obligation to
+/// reply to it; a resolve before the reply is `Ok(None)` and consumes nothing,
+/// which is what makes polling with the same claim legal; a reply lands where
+/// that claim is waiting. The bytes are what is asserted at each end, because a
+/// status alone would not show that either copy funnel carried anything.
+func round_trip(inlet: &PipeInlet, outlet: &PipeOutlet) -> Result<Void, SosStatus> {
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 65
+    msg[1] = 66
+    msg[2] = 67
+
+    let staged = try inlet.post(body: &msg, len: 3)
+    guard var claim = move staged else { return BUG }
+
+    let taken = try outlet.take(into: &var buf)
+    guard let (n, request) = move taken else { return BUG }
+    var obligation = move request
+    print("SOS oneshot: request len={} b={},{},{}\n", n,
+          buf[0] as UInt, buf[1] as UInt, buf[2] as UInt)
+
+    // **A RESOLVE BEFORE THE REPLY IS `Ok(None)` AND CONSUMES NOTHING.** The
+    // exchange is taken and the server has not answered, which is the pending
+    // state a poll loop lives in — and the claim below this line is the SAME
+    // claim, which is what makes the poll writable at all.
+    let pending = try claim.resolve(into: &var buf)
+    if let _ = pending { return BUG }
+    let _ = write_line("SOS oneshot: pending is none\n")
+
+    msg[0] = 90
+    msg[1] = 89
+    try obligation.reply(body: &msg, len: 2)
+
+    let answered = try claim.resolve(into: &var buf)
+    guard let got = answered else { return BUG }
+    print("SOS oneshot: reply len={} b={},{}\n", got,
+          buf[0] as UInt, buf[1] as UInt)
+    return
+}
+
+/// **A REPLY OF ZERO BYTES IS STILL AN ANSWER** — the `Optional` is what keeps it
+/// apart from "no reply yet", exactly as it keeps a zero-length MESSAGE apart
+/// from an empty ring on the request side (§2.1's data-free option, both ways).
+func zero_reply(inlet: &PipeInlet, outlet: &PipeOutlet) -> Result<Void, SosStatus> {
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 5
+
+    let staged = try inlet.post(body: &msg, len: 1)
+    guard var claim = move staged else { return BUG }
+    var obligation = try take_one(&outlet, &var buf)
+    try obligation.reply(body: &msg, len: 0)
+
+    let answered = try claim.resolve(into: &var buf)
+    guard let zero = answered else { return BUG }
+    print("SOS oneshot: zero reply len={}\n", zero)
+    return
+}
+
+/// **THREE EXCHANGES IN FLIGHT AT ONCE, ANSWERED OUT OF ORDER**, and each claim
+/// resolves to ITS OWN reply.
+///
+/// A design that kept one reply slot per CONNECTION rather than per exchange
+/// would print the same digit three times here; one that keyed replies by queue
+/// position would print them permuted, because the obligations are discharged
+/// 2, 3, 1. An exchange is not a queue position.
+func three_in_flight(inlet: &PipeInlet,
+                     outlet: &PipeOutlet) -> Result<Void, SosStatus> {
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+
+    msg[0] = 1
+    let first = try inlet.post(body: &msg, len: 1)
+    msg[0] = 2
+    let second = try inlet.post(body: &msg, len: 1)
+    msg[0] = 3
+    let third = try inlet.post(body: &msg, len: 1)
+    guard var c1 = move first else { return BUG }
+    guard var c2 = move second else { return BUG }
+    guard var c3 = move third else { return BUG }
+
+    // The obligations come out in the order the messages went in.
+    var r1 = try take_one(&outlet, &var buf)
+    var r2 = try take_one(&outlet, &var buf)
+    var r3 = try take_one(&outlet, &var buf)
+
+    msg[0] = 22
+    try r2.reply(body: &msg, len: 1)
+    msg[0] = 33
+    try r3.reply(body: &msg, len: 1)
+    msg[0] = 11
+    try r1.reply(body: &msg, len: 1)
+
+    let a = try resolve_one(&var c1, &var buf)
+    let b = try resolve_one(&var c2, &var buf)
+    let c = try resolve_one(&var c3, &var buf)
+    print("SOS oneshot: fifo replies a={} b={} c={}\n", a, b, c)
+    return
+}
+
+/// **THE RING, COUNTED AROUND ONE UNSETTLED EXCHANGE** — the lifecycle change
+/// made visible.
+///
+/// The held message is TAKEN, so its bytes are already in this process's buffer
+/// and unit 1 would have given the slot back; unit 2's slot is still spent,
+/// because the reply has nowhere else to live. So the free depth is one short,
+/// and discharging the exchange restores it. The program never names
+/// `PIPE_INFLIGHT`: what it asserts is the DIFFERENCE.
+func ring_around_one(inlet: &PipeInlet,
+                     outlet: &PipeOutlet) -> Result<Void, SosStatus> {
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 7
+
+    let held = try inlet.post(body: &msg, len: 1)
+    guard var claim = move held else { return BUG }
+    var obligation = try take_one(&outlet, &var buf)
+
+    let busy = try fill(&inlet, &msg)
+    print("SOS oneshot: depth with one in flight={}\n", busy)
+
+    let back = try drain(&outlet, &var buf)
+    if back != busy { return BUG }
+
+    // ...and now the held exchange settles: the obligation is discharged and the
+    // claim takes its answer, so the slot goes back and the ring is whole again.
+    msg[0] = 8
+    try obligation.reply(body: &msg, len: 1)
+    let settled = try claim.resolve(into: &var buf)
+    guard let _ = settled else { return BUG }
+
+    let whole = try fill(&inlet, &msg)
+    print("SOS oneshot: depth settled={}\n", whole)
+    return
+}
+
 /// **POST AND GIVE THE CLAIM UP — §2.1's TELL IDIOM.** The message is staged and
 /// the client says at once that it does not want the answer, so the exchange
-/// settles as soon as the server discharges. It is what the counting loops below
-/// use, because they are about the RING and not about the pair.
+/// settles as soon as the server discharges. It is what the counting loops use,
+/// because they are about the RING and not about the pair.
 func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
           len: UInt) -> Result<Bool, SosStatus> {
     let staged = try inlet.post(body: &body, len: len)
@@ -69,9 +268,9 @@ func take_and_drop(outlet: &PipeOutlet,
     return false
 }
 
-/// Post until the kernel refuses, then hand back how many went — the ring's FREE
+/// Post until the kernel refuses, and hand back how many went — the ring's FREE
 /// depth, counted rather than named. The messages are tells, so nothing this
-/// leaves behind holds a slot for a reply.
+/// leaves behind holds a slot waiting for a reply.
 func fill(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES]) -> Result<UInt, SosStatus> {
     var depth: UInt = 0
     var filling = true
@@ -106,317 +305,33 @@ func drain(outlet: &PipeOutlet,
     return took
 }
 
-@export("_start")
-func _start(boot_handle: UInt) {
-    let system = System(boot_handle: boot_handle)
-
-    let proc = try system.process_self() catch {
-        let _ = system.debug_print("SOS oneshot: no process handle\n")
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-
-    let pair = try proc.pipe_create() catch {
-        print("SOS oneshot: create failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    let (inlet, outlet) = move pair
-    let _ = system.debug_print("SOS oneshot: created\n")
-
-    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
-    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
-
-    // =========================================================================
-    // THE ROUND TRIP, BOTH WAYS. The bytes are what is asserted at each end.
-    // =========================================================================
-    msg[0] = 65
-    msg[1] = 66
-    msg[2] = 67
-    let staged = try inlet.post(body: &msg, len: 3) catch {
-        print("SOS oneshot: post failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    guard var claim = move staged else {
-        let _ = system.debug_print("SOS oneshot: fresh ring refused a post\n")
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-
-    let taken = try outlet.take(into: &var buf) catch {
-        print("SOS oneshot: take failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    guard let (n, request) = move taken else {
-        let _ = system.debug_print("SOS oneshot: nothing staged\n")
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    var obligation = move request
-    print("SOS oneshot: request len={} b={},{},{}\n", n,
-          buf[0] as UInt, buf[1] as UInt, buf[2] as UInt)
-
-    // **A RESOLVE BEFORE THE REPLY IS `Ok(None)` AND CONSUMES NOTHING.** The
-    // exchange is taken and the server has not answered, which is the pending
-    // state a poll loop lives in — and the claim below this line is still the
-    // same claim, which is what makes polling with it legal at all.
-    let pending = try claim.resolve(into: &var buf) catch {
-        print("SOS oneshot: pending resolve is an error: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    if let _ = pending {
-        let _ = system.debug_print("SOS oneshot: a reply arrived before one was sent\n")
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    let _ = system.debug_print("SOS oneshot: pending is none\n")
-
-    msg[0] = 90
-    msg[1] = 89
-    try obligation.reply(body: &msg, len: 2) catch {
-        print("SOS oneshot: reply failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    let answered = try claim.resolve(into: &var buf) catch {
-        print("SOS oneshot: resolve failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    guard let got = answered else {
-        let _ = system.debug_print("SOS oneshot: the reply went missing\n")
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    print("SOS oneshot: reply len={} b={},{}\n", got,
-          buf[0] as UInt, buf[1] as UInt)
-
-    // =========================================================================
-    // A REPLY OF ZERO BYTES IS STILL AN ANSWER — the `Optional` is what keeps it
-    // apart from "no reply yet", exactly as it does on the request side.
-    // =========================================================================
-    msg[0] = 5
-    let quiet = try exchange(&inlet, &outlet, &msg, &var buf, 1, 0) catch {
-        print("SOS oneshot: zero exchange failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    guard let zero = quiet else {
-        let _ = system.debug_print("SOS oneshot: the zero reply went missing\n")
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    print("SOS oneshot: zero reply len={}\n", zero)
-
-    // =========================================================================
-    // THREE EXCHANGES IN FLIGHT AT ONCE, and each claim resolves to ITS OWN
-    // reply. A design that kept one reply slot per CONNECTION rather than per
-    // exchange would print the same byte three times here.
-    // =========================================================================
-    msg[0] = 1
-    let one = try post_one(&inlet, &msg) catch {
-        print("SOS oneshot: fifo post 1 failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    msg[0] = 2
-    let two = try post_one(&inlet, &msg) catch {
-        print("SOS oneshot: fifo post 2 failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    msg[0] = 3
-    let three = try post_one(&inlet, &msg) catch {
-        print("SOS oneshot: fifo post 3 failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    guard var c1 = move one else {
-        let _ = system.debug_print("SOS oneshot: fifo post 1 refused\n")
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    guard var c2 = move two else {
-        let _ = system.debug_print("SOS oneshot: fifo post 2 refused\n")
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    guard var c3 = move three else {
-        let _ = system.debug_print("SOS oneshot: fifo post 3 refused\n")
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-
-    // The obligations come out in the order the messages went in, and each is
-    // answered with the byte its request carried times eleven — so a reply that
-    // landed on the wrong claim is visible as a digit, not as a status.
-    var r1 = try take_one(&outlet, &var buf) catch {
-        print("SOS oneshot: fifo take 1 failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    var r2 = try take_one(&outlet, &var buf) catch {
-        print("SOS oneshot: fifo take 2 failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    var r3 = try take_one(&outlet, &var buf) catch {
-        print("SOS oneshot: fifo take 3 failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-
-    // REPLIED OUT OF ORDER, deliberately: an exchange is not a queue position,
-    // so the second obligation is discharged first and every claim still gets
-    // exactly its own answer.
-    msg[0] = 22
-    try r2.reply(body: &msg, len: 1) catch {
-        print("SOS oneshot: fifo reply 2 failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    msg[0] = 33
-    try r3.reply(body: &msg, len: 1) catch {
-        print("SOS oneshot: fifo reply 3 failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    msg[0] = 11
-    try r1.reply(body: &msg, len: 1) catch {
-        print("SOS oneshot: fifo reply 1 failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-
-    let a = try resolve_one(&var c1, &var buf) catch {
-        print("SOS oneshot: fifo resolve 1 failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    let b = try resolve_one(&var c2, &var buf) catch {
-        print("SOS oneshot: fifo resolve 2 failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    let c = try resolve_one(&var c3, &var buf) catch {
-        print("SOS oneshot: fifo resolve 3 failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    print("SOS oneshot: fifo replies a={} b={} c={}\n", a, b, c)
-
-    // =========================================================================
-    // THE RING, COUNTED AROUND ONE UNSETTLED EXCHANGE. This is the lifecycle
-    // change made visible: the message below is TAKEN — its bytes are already in
-    // this process's buffer — and its slot is still spent, because the reply has
-    // nowhere else to live.
-    // =========================================================================
-    msg[0] = 7
-    let held_post = try inlet.post(body: &msg, len: 1) catch {
-        print("SOS oneshot: held post failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    guard var held_claim = move held_post else {
-        let _ = system.debug_print("SOS oneshot: held post refused\n")
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    var held_request = try take_one(&outlet, &var buf) catch {
-        print("SOS oneshot: held take failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-
-    let busy = try fill(&inlet, &msg) catch {
-        print("SOS oneshot: busy fill failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    print("SOS oneshot: depth with one in flight={}\n", busy)
-
-    let back = try drain(&outlet, &var buf) catch {
-        print("SOS oneshot: busy drain failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    if back != busy {
-        print("SOS oneshot: staged {} and drained {}\n", busy, back)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-
-    // ...and now the held exchange settles: the obligation is discharged and the
-    // claim takes its answer, so the slot goes back and the ring is whole again.
-    msg[0] = 8
-    try held_request.reply(body: &msg, len: 1) catch {
-        print("SOS oneshot: held reply failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    let settled = try held_claim.resolve(into: &var buf) catch {
-        print("SOS oneshot: held resolve failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    guard let _ = settled else {
-        let _ = system.debug_print("SOS oneshot: the held reply went missing\n")
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-
-    let whole = try fill(&inlet, &msg) catch {
-        print("SOS oneshot: settled fill failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    print("SOS oneshot: depth settled={}\n", whole)
-
-    print("SOS oneshot: done\n")
-    let _ = proc.exit(EXIT_OK)
-}
-
-/// One whole exchange with a reply of `reply_len` bytes: post, take, reply,
-/// resolve. Answers the reply's length, or `None` if the ring refused the post.
-///
-/// It exists so the zero-length case reads as the one claim it is making rather
-/// than as twenty lines of the same four calls.
-func exchange(inlet: &PipeInlet, outlet: &PipeOutlet,
-              msg: &[UInt8; PIPE_BODY_BYTES],
-              buf: &var [UInt8; PIPE_BODY_BYTES],
-              len: UInt, reply_len: UInt) -> Result<UInt?, SosStatus> {
-    let staged = try inlet.post(body: &msg, len: len)
-    guard var claim = move staged else { return None }
-    var obligation = try take_one(&outlet, &var buf)
-    try obligation.reply(body: &msg, len: reply_len)
-    return claim.resolve(into: &var buf)
-}
-
-/// Post one message and hand its claim back. A named helper only because a
-/// `guard let` over a NoCopy optional reads better one call at a time.
-func post_one(inlet: &PipeInlet,
-              msg: &[UInt8; PIPE_BODY_BYTES]) -> Result<PipeReply?, SosStatus> {
-    inlet.post(body: &msg, len: 1)
-}
-
 /// Take one message and hand its obligation back, refusing an empty ring as an
-/// error — every take in this case has a message waiting by construction, so an
-/// absence here is a bug rather than a poll.
+/// error — every take reached this way has a message waiting by construction, so
+/// an absence is a bug in the case rather than a poll.
 func take_one(outlet: &PipeOutlet,
               buf: &var [UInt8; PIPE_BODY_BYTES]) -> Result<PipeRequest, SosStatus> {
     let got = try outlet.take(into: &var buf)
-    guard let (_, request) = move got else { return SosStatus.WouldBlock }
+    guard let (_, request) = move got else { return BUG }
     return move request
 }
 
 /// Resolve one claim and answer the first byte of its reply — which is what the
-/// FIFO row asserts, one digit per exchange.
+/// three-in-flight row asserts, one digit per exchange.
 func resolve_one(claim: &var PipeReply,
                  buf: &var [UInt8; PIPE_BODY_BYTES]) -> Result<UInt, SosStatus> {
     let got = try claim.resolve(into: &var buf)
-    guard let _ = got else { return SosStatus.WouldBlock }
+    guard let _ = got else { return BUG }
     return buf[0] as UInt
+}
+
+/// One line to the console, out of a phase that holds no `System`.
+///
+/// A phase gets the two connection ends and nothing else, because that is all
+/// any of them is about — so the one line that carries no format arguments goes
+/// through the runtime's own writer rather than through a `System` handle
+/// threaded down for it. `print` of a literal writes the bytes and reserves no
+/// message scratch, which is the property this whole file is arranged around.
+func write_line(text: String) -> Int {
+    print("{}", text)
+    0
 }
