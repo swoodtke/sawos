@@ -245,12 +245,25 @@ standing tail); the IOMMU driver (death-notification consumer 2).
    handle). No direct park-on-outlet: the wake protocol stays
    SINGULAR, the same property this rider already demanded of the
    client side. `NO_HANDLE` for the request is the degenerate plain
-   wait, so the loop head is uniform — the first iteration and the
-   steady state are one call shape. TWO RETURN CHANNELS, kept
-   separate: the reply's status rides BESIDE the wait record, and a
-   `PeerClosed` reply (an abandoned client) does NOT abort the park —
-   obligation discharged, the loop continues; one dead client must
-   not stall the server. A single-connection server uses a
+   wait. REFINED TWICE AT DESIGN 17'S REVIEW (user, Sep 1), and the
+   refinements compose: (i) THE OP LIVES ON THE REQUEST —
+   `PipeRequestOp.ReplyWait`, typed `request.reply_wait(body:, len:,
+   waiter: &Waiter)` — a reply with a built-in wait, the reply being
+   the act that consumes the receiver. The degenerate first turn and
+   the dead-client recovery are the EXISTING `waiter.wait()`, and
+   reply-without-wait is the EXISTING `reply()` — no `NO_HANDLE`
+   sentinel, no optional waiter (an optional would change the return
+   type on a runtime value, the exact shape this ruling's own
+   mode-enum rejection and 11(c) refused); every signature total,
+   `WaiterOp` untouched. (ii) THE RETURN IS THE DELIVERY OR A
+   LEG-TAGGED ERROR: `Result<WaitResult, ReplyWaitError {
+   Reply(SosStatus), Wait(SosStatus) }>` — a failed or abandoned
+   reply returns `Err(Reply(...))` WITHOUT parking; `Wait(_)` says
+   the reply landed. The request is CONSUMED on every path
+   (obligation discharged either way, the ratified sentence). One
+   extra trap on a rare path, and the principle stands: one dead
+   client cannot stall the server — the loop never wedges, and the
+   shape matches `reply()`'s own `Err(PeerClosed)` convention. A single-connection server uses a
    one-attachment waiter the sosrt wrapper owns (the client
    composition's own precedent). PLACEMENT: the full form needs
    handles-in-messages and delivery-minting, so it is UNIT 4's; a

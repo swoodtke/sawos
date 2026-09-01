@@ -21,75 +21,21 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
-- 1. process stats — ProcessOp.Stats + the trap-count assertions
-  [#16 — designs/016-process-stats.md; CLOSED Sep 1, entry in BACKLOG
-  below awaiting the lead's move to a done file]
-- 2. M4 unit 3.5 — the fused paths [#10 ruling 4 + the reply-then-wait
-  amendment; design 17 to author — Call, ReplyRecv, the ping-pong
-  trap-count proof over #16's stats; §API to the user before dispatch]
+- 1. M4 unit 3.5 — the fused paths [#17 —
+  designs/017-fused-paths.md, §API user-reviewed in three rounds;
+  DISPATCHED Sep 1 per the standing instruction]
 
 ## [BACKLOG] — filed, not scheduled
 
-- **process stats [#16 — designs/016-process-stats.md]. CLOSED Sep 1
-  2026, awaiting the lead's move to a done file.** What landed:
-  `ProcessOp.Stats` on `ProcessRight.Stats` (a per-kind right named for
-  its op, in the ONE default set, so self-inspection composes free),
-  answering three `UInt64` columns through the copy-out funnel
-  `Clock.Now` opened — DOUBLEWORD-indexed, because a count is a property
-  of the quantity and not of the machine. The columns are split by the
-  CAUSE CLASS `ktrap` already decides on, which is what makes any of
-  them usable: `syscalls` is EXACT for a given program path, `interrupts`
-  moves with the host and is printed, `faults` is exact where a test
-  provokes one. **THE COUNTING SITE IS `ktrap`'s OWN THREE-WAY HEAD AND
-  IT IS ARCH-FREE** — riscv32's one vector and arm64's two both land
-  there, so no HAL file was touched, one increment per trap sits ahead of
-  every dispatch, and there is no second site to keep in step. A BAD
-  SYSCALL COUNTS AS A SYSCALL (the columns are keyed by how the machine
-  entered the kernel, not by how the kernel felt about it — keying on the
-  outcome would make the assertable column unpredictable); boot-door
-  traps are unattributed and an interrupt taken at the idle poll or a
-  preemption point is not a trap at all, both said at the site. Columns
-  zero at BOTH creation doors, so a reclaimed slot inherits nothing, and
-  they SURVIVE the death — which is the only shape in which the fault
-  column is observable, since a faulting process cannot ask about
-  itself. **ONE ADDITION BEYOND THE BRIEF, ARGUED**:
-  `Process.mint(rights:)`, the one kind that had no typed mint, because
-  the new bit exists to be WITHHELD and without the funnel it would be
-  dead surface (`ProcessRight` joined the facade's re-export line with
-  it, under the rule that line already states). PER-PROCESS ONLY as
-  ruled; the shared-region future is recorded in the brief and NOT built.
-  **THE SWEEP, five cases, every existing row byte-identical and the
-  runner diff purely additive (zero removed lines)**: `pipe_send_manual`
-  asserts the manual composition at 4 traps — post + attach + wait plus
-  the closing read — which says a cross-process BLOCKING round trip
-  costs three and a park is one `ecall` however long it parks;
-  `pipe_oneshot` asserts the smallest complete exchange at 5;
-  `process_isolation` and `death_fault` assert a dead child's columns as
-  exact mirrors (`syscalls=0 faults=1` from the hardware,
-  `syscalls=1 faults=0` from the syscall door); `thread_preempt` PRINTS
-  the interrupt column and does not assert it. Every one of the five
-  numbers was predicted from the counting rule before the case was run
-  and every one was right first time. Dedicated proof `process-stats` +
-  the silent `child-stats` (a talking child's count is a hash of its own
-  prose): an exact self delta over a print-free window, a dead child's
-  columns, the interrupt row, and a sibling minted without `Stats`
-  faulting when it asks. Suite 198/198 (99 cases/arch) from 196/196; one
-  new case, two new packages, no pre-existing case row moved — 196
-  denominators changed and zero indices did. Docs: spec §2's Process row
-  (op, right, record, counting and attribution rules, the per-process
-  ruling and the recorded region future) and a §8-adjacent note on the
-  status word's new neighbour; CLAUDE.md's timing-rows list names
-  `process_stats`' `interrupts=` row beside `thread_preempt`'s and
-  `timer_interval`'s; As-built in `designs/016-process-stats.md` with the
-  census, the five deltas, the bucketed transcript accounting and four
-  findings. **NO SL-N FILED** — nothing here met a sawlang deficiency.
-  **ONE FINDING WORTH THE LEAD'S EYE AND DELIBERATELY NOT ACTED ON**:
-  `debug_print` traps once per BYTE, so a root server's console prose
-  outweighs its object ops roughly ten to one (`pipe_oneshot` spends ~5
-  traps on the exchange it proves and ~300 describing it). A buffered
-  `debug_print` taking a length is the obvious answer and is an ABI
-  change with no consumer yet; unit 3.5's `Call` is the next thing that
-  will want that argument made properly
+- buffered `debug_print` — a length-taking form [#16 As-built finding,
+  Sep 1]: today the seam traps once per BYTE, so a test's prose
+  outweighs its object ops ~10:1 in the syscall column
+  (`pipe_oneshot`: ~5 traps of exchange, ~300 of description). A
+  buffered form taking (addr, len) is the obvious answer and an ABI
+  change with no consumer yet; filed for the unit that first wants
+  the column quiet. The interrupt column measures preemption pressure
+  on ONE process, not machine load — restate wherever the
+  shared-region `top` seed (#16) gets built.
 
 - M4 scoping — pipes [#10 — designs/010-m4-pipes.md, DRAFT Aug 30,
   awaiting user review]: §2.1 carried by reference; waiter revocation

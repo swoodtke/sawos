@@ -663,3 +663,68 @@ repo's first done file; sawos was born Aug 28 (sawlang#238).
   accepted (the brief's stale-entry sentence was unsound); the
   PipeClient wrapper struck by user ruling at review, recorded in
   designs/010 with this integration.
+- **process stats [#16 — designs/016-process-stats.md]. CLOSED Sep 1
+  2026, awaiting the lead's move to a done file.** What landed:
+  `ProcessOp.Stats` on `ProcessRight.Stats` (a per-kind right named for
+  its op, in the ONE default set, so self-inspection composes free),
+  answering three `UInt64` columns through the copy-out funnel
+  `Clock.Now` opened — DOUBLEWORD-indexed, because a count is a property
+  of the quantity and not of the machine. The columns are split by the
+  CAUSE CLASS `ktrap` already decides on, which is what makes any of
+  them usable: `syscalls` is EXACT for a given program path, `interrupts`
+  moves with the host and is printed, `faults` is exact where a test
+  provokes one. **THE COUNTING SITE IS `ktrap`'s OWN THREE-WAY HEAD AND
+  IT IS ARCH-FREE** — riscv32's one vector and arm64's two both land
+  there, so no HAL file was touched, one increment per trap sits ahead of
+  every dispatch, and there is no second site to keep in step. A BAD
+  SYSCALL COUNTS AS A SYSCALL (the columns are keyed by how the machine
+  entered the kernel, not by how the kernel felt about it — keying on the
+  outcome would make the assertable column unpredictable); boot-door
+  traps are unattributed and an interrupt taken at the idle poll or a
+  preemption point is not a trap at all, both said at the site. Columns
+  zero at BOTH creation doors, so a reclaimed slot inherits nothing, and
+  they SURVIVE the death — which is the only shape in which the fault
+  column is observable, since a faulting process cannot ask about
+  itself. **ONE ADDITION BEYOND THE BRIEF, ARGUED**:
+  `Process.mint(rights:)`, the one kind that had no typed mint, because
+  the new bit exists to be WITHHELD and without the funnel it would be
+  dead surface (`ProcessRight` joined the facade's re-export line with
+  it, under the rule that line already states). PER-PROCESS ONLY as
+  ruled; the shared-region future is recorded in the brief and NOT built.
+  **THE SWEEP, five cases, every existing row byte-identical and the
+  runner diff purely additive (zero removed lines)**: `pipe_send_manual`
+  asserts the manual composition at 4 traps — post + attach + wait plus
+  the closing read — which says a cross-process BLOCKING round trip
+  costs three and a park is one `ecall` however long it parks;
+  `pipe_oneshot` asserts the smallest complete exchange at 5;
+  `process_isolation` and `death_fault` assert a dead child's columns as
+  exact mirrors (`syscalls=0 faults=1` from the hardware,
+  `syscalls=1 faults=0` from the syscall door); `thread_preempt` PRINTS
+  the interrupt column and does not assert it. Every one of the five
+  numbers was predicted from the counting rule before the case was run
+  and every one was right first time. Dedicated proof `process-stats` +
+  the silent `child-stats` (a talking child's count is a hash of its own
+  prose): an exact self delta over a print-free window, a dead child's
+  columns, the interrupt row, and a sibling minted without `Stats`
+  faulting when it asks. Suite 198/198 (99 cases/arch) from 196/196; one
+  new case, two new packages, no pre-existing case row moved — 196
+  denominators changed and zero indices did. Docs: spec §2's Process row
+  (op, right, record, counting and attribution rules, the per-process
+  ruling and the recorded region future) and a §8-adjacent note on the
+  status word's new neighbour; CLAUDE.md's timing-rows list names
+  `process_stats`' `interrupts=` row beside `thread_preempt`'s and
+  `timer_interval`'s; As-built in `designs/016-process-stats.md` with the
+  census, the five deltas, the bucketed transcript accounting and four
+  findings. **NO SL-N FILED** — nothing here met a sawlang deficiency.
+  **ONE FINDING WORTH THE LEAD'S EYE AND DELIBERATELY NOT ACTED ON**:
+  `debug_print` traps once per BYTE, so a root server's console prose
+  outweighs its object ops roughly ten to one (`pipe_oneshot` spends ~5
+  traps on the exchange it proves and ~300 describing it). A buffered
+  `debug_print` taking a length is the obvious answer and is an ABI
+  change with no consumer yet; unit 3.5's `Call` is the next thing that
+  will want that argument made properly
+  INTEGRATED to main Sep 1 2026 (lead-reviewed, lead gate re-run
+  198/198, sawlang HEAD 87063387 unchanged, fast-forward fc9fd82).
+  The Process.mint(rights:) addition accepted as the per-kind-on-
+  demand answer the unit-1 parked mint finding anticipated; the
+  buffered-debug_print finding seeded in the backlog.
