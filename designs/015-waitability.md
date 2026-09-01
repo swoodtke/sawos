@@ -309,7 +309,7 @@ rows `[n/m] MARK name`, image rows `path (N bytes)`, everything else):
 | authorized-with-cause | 52 image-size rows | every image that CALLS `Waiter.wait` grew: 27 riscv32 rows by +24 to +13000 bytes, 25 arm64 rows by +4096 to +12288 (page granularity on that profile). **THE CORRELATION IS EXACT AND WAS VERIFIED RATHER THAN ASSUMED**: every package with a grown image reaches the wait door, and NO package that does not reach it grew — 53 riscv32 and 55 arm64 images did not move at all. The cause is the decode: `decode_wait` now names the four new `WaitPayload` cases, so an image that waits links `sos.pipe`'s payload types and the composed sends with them, and an image that never waits links none of it |
 | authorized-with-cause | 2 image-size rows | `refcount-free` (+40 riscv32) and `waiter-revoked` (+24 riscv32) are the two C-altitude waiters, and they grew for a DIFFERENT reason: their hand-sized record buffers went from 3 and 4 words to 48, because the published minimum grew by a message body. They are inside the 52 above; named separately because the cause is the frame and not the link |
 | authorized-with-cause | 1 summary row | `182 passed` -> `196 passed` |
-| authorized-with-cause (SECOND PARK) | 2 case rows removed, 2 added | `pipe_send_blocking` -> `pipe_send_manual` at the user ruling above. A renamed case's rows are a removal and an addition, and its five text rows moved with it: three by prefix alone (`sendblock` -> `sendmanual`), one by name (`send got len=4` -> `reply len=4`, since there is no `send` to have got it), and ONE IS GENUINELY NEW — `filled=16 then room says there is space`, the room leg the wrapper hid and the manual composition has to take. The case count and every other row are unchanged, so the totals below are the same |
+| authorized-with-cause (SECOND PARK) | 2 case rows removed, 2 added; 2 image rows removed, 2 added | `pipe_send_blocking` -> `pipe_send_manual` at the user ruling above. A renamed case's rows are a removal and an addition, and the new one takes the SAME INDEX (`[96/98]`, both arches) with the same mark, so nothing else in the ordering moved. Its five text rows moved with it: three by prefix alone (`sendblock` -> `sendmanual`), one by name (`send got len=4` -> `reply len=4`, since there is no `send` to have got it), and ONE IS GENUINELY NEW — `filled=16 then room says there is space`, the room leg the wrapper hid and the manual composition has to take. The two image rows are the renamed package's, and they SHRANK: -9432 bytes riscv32, -12288 arm64 |
 | address-only | 0 | nothing printed an address that moved |
 | documented-nondeterministic | 0 | none met |
 | new | 14 case rows + 16 image rows | the seven cases and eight packages, on both profiles |
@@ -405,6 +405,15 @@ matrix columns, the record's body region, the flags word — every primitive the
 composition was written over. `sos.pipe` still imports `sos.waiter` and still
 sits above it, because the four pipe `add`/`give` overloads are the reason for
 that ordering and they stay.
+
+**AND NO OTHER IMAGE IN THE SUITE CHANGED BY A BYTE**, which is the removal's
+own receipt: 174 of the 176 image rows are identical across the two parks, so
+the composed sends were code the linker was already dropping everywhere except
+the one case that called them. The two that did change are that case's, and they
+got SMALLER — -9432 bytes on riscv32 and -12288 on arm64 — because a
+composition written once inline costs less than a wrapper's generic machinery.
+A library layer that measured as dead weight in every image but one is a library
+layer the ruling was right about.
 
 **WHAT REPLACED THE PROOF.** `pipe-send-blocking` became `pipe-send-manual`,
 and the change is not a rename with the same body: the composition moved INTO
