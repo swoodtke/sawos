@@ -363,6 +363,16 @@ variants: `PipeReply` `` anchored at the `match`, and the arm was restored.
    by-charged-process force-free — the hazard the ruling names — and what stands
    is a reap of what nobody names, which is the ruling's own sentence made
    mechanical.
+7. **THE CONSUMED-HANDLE FAULT IS PROVED ON THE RESOLVE SIDE, NOT THE REPLY
+   SIDE.** The brief names it twice — "a second reply is the consumed-handle
+   fault" in proof 2 and "double-resolve" in proof 4 — and they are ONE
+   mechanism: an op that consumes destroys the caller's entry, so the second use
+   of the word is `BadHandle`. `pipe-dead-claim` is that case, and it takes the
+   resolve side because a fault ends the process and one case can only meet one.
+   Reaching it at all takes deliberate effort, which is itself the finding: the
+   typed wrappers disarm on consume, so an ordinary program never meets either
+   fault and the case has to ask a SECOND time through a spent value to show that
+   the kernel's check is real underneath the wrapper's.
 
 ### Findings
 
