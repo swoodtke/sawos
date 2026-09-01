@@ -1,6 +1,6 @@
 # SawOS design 15 — waitability: the pipe arms, delivery-carries-payload, and the attach modes (M4 unit 3)
 
-Status: AUTHORED Sep 1 2026 (lead); **§API USER-REVIEWED SAME DAY (the
+Status: **LANDED Sep 1 2026** (was AUTHORED Sep 1, lead); **§API USER-REVIEWED SAME DAY (the
 Sep-1 review gate, discharged): `give` as the consuming attach's name,
 copy-out sized to the delivery, `PipeMsg` as the shared bytes struct,
 and give's Err carrying the object back — all user-ruled.**
@@ -258,3 +258,298 @@ arm rides it); ruling 11(d) delivery-as-take + delivery-minting +
 handle-carrying records (unit 4); the keep-mask rider (unit 4);
 `select`-shaped composition sugar beyond the two ruled sends; the
 money shot (unit 5).
+
+## As built
+
+**LANDED Sep 1 2026.** Suite 196/196 (98 cases/arch, riscv32 + arm64) from
+182/182; SEVEN new cases across eight new packages, and no pre-existing case
+row moved.
+
+**VALIDATED ON sawlang 0.3.0** (`SAWLANG_ROOT` at `87063387`, unchanged from
+dispatch to gate and re-checked at both ends — the tree's `sawlang.pin`
+version). The baseline and the gate were compiled by the SAME compiler, so the
+transcript diff below is attributable to this change alone. Nothing here leans
+on anything 0.3.0 added.
+
+### Transcript accounting
+
+Whole-transcript diff, base `1ceb2d4` (the baseline captured before the first
+edit) vs the gate, ANSI stripped and bucketed. The parse is mechanical (case
+rows `[n/m] MARK name`, image rows `path (N bytes)`, everything else):
+
+| bucket | rows | what |
+|---|---|---|
+| byte-identical | 182 case-row MARKS + names + INDICES | every pre-existing case, same mark, same name, and the same index within its arch. `thread_preempt` and `timer_interval` — the two known timing rows — included, so the documented-nondeterministic bucket is EMPTY this run |
+| authorized-with-cause | 182 case-row denominators | `[n/91]` -> `[n/98]`, the DENOMINATOR alone, because seven cases were appended. Zero indices moved, which is what says they were appended rather than inserted |
+| authorized-with-cause | 52 image-size rows | every image that CALLS `Waiter.wait` grew: 27 riscv32 rows by +24 to +13000 bytes, 25 arm64 rows by +4096 to +12288 (page granularity on that profile). **THE CORRELATION IS EXACT AND WAS VERIFIED RATHER THAN ASSUMED**: every package with a grown image reaches the wait door, and NO package that does not reach it grew — 53 riscv32 and 55 arm64 images did not move at all. The cause is the decode: `decode_wait` now names the four new `WaitPayload` cases, so an image that waits links `sos.pipe`'s payload types and the composed sends with them, and an image that never waits links none of it |
+| authorized-with-cause | 2 image-size rows | `refcount-free` (+40 riscv32) and `waiter-revoked` (+24 riscv32) are the two C-altitude waiters, and they grew for a DIFFERENT reason: their hand-sized record buffers went from 3 and 4 words to 48, because the published minimum grew by a message body. They are inside the 52 above; named separately because the cause is the frame and not the link |
+| authorized-with-cause | 1 summary row | `182 passed` -> `196 passed` |
+| address-only | 0 | nothing printed an address that moved |
+| documented-nondeterministic | 0 | none met |
+| new | 14 case rows + 16 image rows | the seven cases and eight packages, on both profiles |
+
+No row is unaccounted for, and **NO IMAGE SHRANK on either profile.**
+
+**THE MOST INTERESTING THING THE DIFF DOES NOT SHOW IS `pipe-basics`' AND
+`pipe-oneshot`' RING-DEPTH ROWS, WHICH DID NOT MOVE.** This unit added an
+`ExchangeState` case, two attachment arrays, two `PipeSlot` fields and a notify
+at four zero-arms; `ring depth=16`, `drained=16`, `depth with one in flight=15`
+and `depth settled=16` all still say what they said, byte for byte, which is
+what says the lifecycle those numbers describe is untouched by the wait
+machinery bolted onto it.
+
+### The four arms, as landed
+
+`WaitableKind` grew from four cases to eight, and the four new ones are the
+four kinds units 1 and 2 wrote `NotWaitable` arms for. What each answers:
+
+| kind | slot | ready when | delivery spends |
+|---|---|---|---|
+| `PipeOutlet` | the CONNECTION | anything staged **or** the inlet column is zero | nothing — the level ends at a `Take` |
+| `PipeInlet` | the CONNECTION | the outlet column is zero **or** a ring slot is free | nothing — the level ends at the poster's next `Post` |
+| `PipeReply` | an EXCHANGE | `Replied`, or abandoned-by-server | **the exchange**: it moves to `Settled` |
+| `PipeRequest` | an EXCHANGE | `Taken` with the claim column at zero | nothing — terminal |
+
+Four things about that are worth reading:
+
+- **THE TWO ENDPOINT ARMS INDEX THE CONNECTION AND THE TWO ONE-SHOT ARMS INDEX
+  AN EXCHANGE, WHICH IS THE IDENTITY THE HANDLE TABLE ALREADY CARRIED.**
+  `entry.target` means the connection for an endpoint kind and the exchange for
+  a one-shot, because designs 13 and 14 made it mean that; the wait machinery
+  inherited both and invented no index of its own. What it DID add is one
+  attachment field per column — two on `PipeSlot`, two parallel arrays beside
+  `PIPE_LENS` — because §2.2's at-most-one-Waiter rule holds per WAITABLE, and a
+  claim and its obligation are two waitables that two different processes may
+  watch at once.
+- **THE TWO `PeerGone` ORDERINGS ARE OPPOSITE, AND EACH MIRRORS ITS OWN OP.**
+  The outlet is drain-then-terminal (`Msg` wins while anything is staged, design
+  230's rule, `pipe_take`'s own order); the inlet is peer-first (`PeerGone` wins
+  even with room, because `pipe_post` asks about the outlet column before it
+  asks about the ring). Writing each level to read in its op's order is what
+  makes the two impossible to disagree — a waiter and a caller ask the same two
+  questions in the same sequence.
+- **`ExchangeState` GREW A FIFTH CASE, AND IT IS THE ONLY THING THIS UNIT ADDED
+  TO THE UNIT-2 STATE MACHINE.** `Settled` means "the answer went out through a
+  wait". It has to exist: a delivery hands the bytes over exactly as `Resolve`
+  does, but it does not travel through the claim's handle ENTRY, so it cannot
+  consume one — and without a state to move to, a claim the caller KEPT would
+  resolve afterwards and get the same answer a second time. That is the
+  duplicate §2.2's consume rule exists to make impossible, and it is the one
+  place the columns genuinely could not derive the state (see deviation 1).
+- **NOTHING NEW IS ALLOCATED ANYWHERE.** The two attachment arrays are
+  zero-initialized `.bss` (design 149), the two `PipeSlot` fields are two words,
+  and the record's body region is the caller's frame. `MAX_ATTACHMENTS` was
+  already sized as `MAX_EVENTS + MAX_INTERRUPTS + …` and needed no change,
+  because the four new kinds attach through handles that already existed.
+
+### The delivery, and where it moved
+
+**`kcore.wake` STOPPED EXISTING.** Its four functions are the second half of
+`kcore.refs` now, and the module list in `kcore/lib.saw` is one seam shorter.
+The reason is a genuine cycle rather than a preference, and both directions
+arrived with this unit's own rulings:
+
+- ruling 9(b) makes a DELIVERY drop a counted reference (a one-shot attachment
+  detaches when its record is copied out, and an attachment is a reference), so
+  `deliver_attachment` has to reach `unref_waitable`;
+- the peer-gone terminal levels make a DROPPED REFERENCE deliver (a column
+  reaching zero is what raises them), and the only function that observes a
+  column reaching zero is `drop_reference`.
+
+Two modules cannot hold that, and DF-232e does not diagnose the cycle — it
+empties an export table and blames a third file. The alternatives were weighed:
+threading the released attachment back up through `deliver_attachment` ->
+`wake_one_waiter` -> `notify_ready` -> `signal_event` to seven call sites, each
+of which would then owe an unref, was the "collect-then-free shape" the brief
+sanctions and was REJECTED as seven chances to leak. The merge changes no
+altitude: the merged module still sits above `process` (it needs the copy door)
+and below `irq`, which is exactly where `refs` already was.
+
+### The cascade census (the brief's D-2 obligation)
+
+Every site where this unit drops a reference inside something that is being
+walked, and what makes each safe. **All four are safe by a guard that already
+existed**, which is the census's actual finding — the reference model was
+already doing this work for units 1 and 2's cascades:
+
+1. **`deliver_attachment`'s detach** (9(b) + 11(b)). It reads the kind, target,
+   key and waiter UP FRONT and then detaches, so the attachment slot being
+   recycled underneath it is reachable by nothing. The unref can settle an
+   exchange and cascade into `free_pipe`; nothing after the detach reads either.
+   `wake_one_waiter` above it has already taken its thread OFF the blocked list
+   before calling in, so no list walk is open.
+2. **`drop_reference`'s `PipeOutlet` arm.** `pipe_drop_staged` walks a LIST
+   threaded through `PIPE_NEXT`, and settling an exchange zeroes its link — so a
+   delivery inside that walk could truncate it. **RESTRUCTURED**: the list walk
+   finishes first, and the notifications go out afterwards as `notify_claims`, a
+   bounded SCAN over the ring's fixed indices that holds no position in anything.
+   An exchange settled underneath the scan becomes `Free`, which is unattached,
+   which the next iteration skips.
+3. **`drop_reference`'s two one-shot arms.** Each notifies the OTHER column,
+   whose delivery can re-enter `drop_reference` on this very exchange and settle
+   it. Safe because the arm's own predicate is evaluated AFTERWARDS:
+   `exchange_can_settle` answers `false` for a `Free` slot, which is the honest
+   answer for "should the caller free it" once somebody else already has.
+4. **`drop_reference`'s two endpoint arms.** A delivery can free the connection
+   under them; `pipe_frees_now` is guarded on `PIPES[slot].state`, and design
+   14's As-built already recorded that the test is not defensive.
+
+Two INVARIANTS were added rather than argued: `free_pipe` and `exchange_settle`
+now `fatal_kernel` if either of their attachment fields is non-zero. Both are
+unreachable by the reference model (an attachment is a reference on the column
+being tested), which is exactly why they are worth asserting — if either fired,
+the ledger and the wait machinery would have disagreed.
+
+### What the compiler enumerated
+
+1. `kcore.waitables` — the per-kind matrix, all FIVE questions, 4 arms each:
+   `waitable_attachment`, `set_waitable_attachment`, `waitable_ready`,
+   `waitable_answer`, `waitable_consume`. **THIS IS WHERE THE DESIGN GOT
+   DECIDED**, exactly as `drop_reference` was in units 1 and 2: being made to
+   answer "what does a delivery of this kind SPEND" for a reply is what produced
+   `ExchangeState.Settled`, and being made to answer it for the two levels is
+   what surfaced that they spend nothing for two DIFFERENT reasons.
+2. `kcore.refs.waitable_obj_type` — 4 arms, and a second copy of the same
+   translation in `dispatch.waitable_obj_of` for the consuming attach's release.
+3. `kcore.dispatch.waitable_slot` — the 4 `NotWaitable` arms REPLACED. The
+   design-8 precedent collected a fifth, sixth, seventh and eighth time, and
+   this is the shape a `_` arm would have hidden entirely.
+4. `sos.waiter.decode_wait` — 4 arms from the four new `WaitTag` cases.
+5. `ExchangeState.Settled` enumerated itself at THREE sites —
+   `exchange_can_settle`, `pipe_resolve` and `pipe_reply` — which is what turned
+   "a delivered reply is discharged" from a sentence into three answers.
+6. **AND IT REACHED INTO FIFTEEN TEST PACKAGES**, which is the property working
+   at its widest: adding four `WaitPayload` cases broke every exhaustive match
+   on a wait answer in the tree. See deviation 3 for what was done about it.
+7. `Attachment` grew `oneshot` and `PipeSlot` grew two fields, so every literal
+   of each failed until updated — 3 and 2 sites, in `waitables`, `refs`, `sched`
+   and `dispatch`.
+8. The raw-altitude callers failed at the LINK rather than at a match:
+   `sos_waiter_add` grew an argument (1 site, `tests/refcount-free`), and the
+   record's published minimum grew past four hand-written buffers (2 asm
+   payloads × 2 arches) and two Saw ones.
+
+`SosStatus` needed NOTHING — `PeerClosed` says here exactly what its unit-1
+docstring says it says — and `QuotaKind` needed nothing either, which is the
+quota note in spec §11 holding.
+
+### Deviations from the brief, argued
+
+**The user-reviewed §API landed as written except where noted; the two
+departures below are both in D-1's PROSE rather than in §API, and each is a
+soundness argument rather than a preference.**
+
+1. **A NON-CONSUMING DELIVERY DOES NOT FORCE-SETTLE THE EXCHANGE; IT DISCHARGES
+   IT, AND A LATER `resolve` IS `PeerClosed` RATHER THAN A DEAD-HANDLE FAULT.**
+   D-1 says "a non-consuming attachment's delivery still settles the exchange
+   and the client's kept entry goes stale — generation-checked". Taken
+   literally that is unsound: a settled ring slot returns to the ring, and a
+   handle ENTRY still naming it is not caught by any generation — handle
+   generations live on the handle-table ROW, which is still bound, so the entry
+   would resolve cleanly onto whatever exchange the next `Post` puts there.
+   (Concretely: the stale holder's own drop would decrement somebody else's
+   claim column and settle their exchange.) What landed instead keeps the
+   reference rule intact — the exchange settles when its columns fall, which for
+   a CONSUMING attach is at the delivery and for a non-consuming one is at the
+   client's own drop or resolve — and adds `ExchangeState.Settled` so the
+   observable half of D-1's sentence is true: the answer is spent, and a later
+   `resolve` gets the word an abandoned peer gets. The kernel cannot destroy a
+   handle entry it did not travel through; that is what `give` exists for, and
+   the composed `send` is the one caller that deliberately does not use it.
+2. **THE COMPOSED SENDS ARE METHODS ON A NEW `PipeClient` WRAPPER, NOT ON
+   `PipeInlet`.** §API shows `public func send(&self, body:, len:)` under the
+   heading "the wrapper owns a Waiter". A `PipeInlet` cannot own one: a Waiter is
+   made by `ProcessOp.WaiterCreate` and an inlet has no `Process` handle and no
+   way to reach one, and giving every connection a Waiter at `pipe_create` would
+   charge a `QuotaKind.Waiter` row to clients that never block. So the WRAPPER
+   that owns a Waiter is a type — `PipeClient(over: inlet, using: waiter)` — and
+   the two ruled signatures are then verbatim, `&self` included, with the two
+   attachment keys as fields so a shared Waiter stays usable. `post` forwards, so
+   the ratified split-phase form is still on the same object.
+3. **FIFTEEN TEST PACKAGES' `WaitPayload` MATCHES COLLAPSED TO ONE ARM PLUS A
+   DEFAULT, RATHER THAN GAINING FOUR PANIC ARMS EACH.** Design 8's tradition is
+   to write every arm out; at eight waitable kinds that is seven identical
+   panics per program, 105 lines across the tree, in code whose whole content is
+   "this program attached only an Event". The enumeration property is what
+   FOUND these (the compiler broke all fifteen), and it is a property the KERNEL
+   wants and a test program does not: a case that does not use a kind should
+   keep compiling when the kernel grows one. So each is now
+   `case Event(word) -> word,` plus `case _ -> panic("this program attached only
+   an Event")`, which says the same thing in one line. The kernel's own matrix
+   keeps every arm.
+4. **`AttachMode` IS DECLARED IN `sos.waiter`, AS §API SHOWS, AND THE FLAG BITS
+   ARE IN `sosabi`.** The enum's numbers are the typed surface's own and the
+   wire's are the ABI's, converted by a `match` — which is the vDSO discipline
+   said out loud, and is why the kernel carries a `Bool` on the attachment
+   rather than the enum.
+5. **THE `give` FAMILY IS EIGHT OVERLOADS, ONE PER WAITABLE KIND**, as §API's
+   parenthesis asks. Four live in `sos.pipe`, three in `sos.waiter` and one in
+   `sos.system`, and the placement is design 8's rule rather than a choice: an
+   overload reads its argument's handle field, so it sits where the argument's
+   type is declared. `sos.pipe` moved ABOVE `sos.waiter` for it (it names
+   `Waiter` now, because the composed sends park on one), which is the first
+   time that ordering has had a reason other than the facade's convenience.
+6. **A REFUSED `give` RE-MINTS THE WRAPPER RATHER THAN HANDING THE ORIGINAL
+   BACK.** §API's `Result<Void, (SosStatus, T)>` is exact; what differs is the
+   body. The natural spelling — disarm on success, `move owned` into the error
+   tuple — is refused by sawc even though the catch DIVERGES (filed as SL-14).
+   The landed shape is stronger anyway: disarm BEFORE the syscall, which is the
+   transfer-funnel contract verbatim, and build a FRESH wrapper around the word
+   on the one answer that provably consumed nothing. No path can leave two
+   owners of one word.
+
+### Findings
+
+1. **THE CENSUS'S REAL RESULT IS THAT THE REFERENCE MODEL HAD ALREADY DONE THE
+   WORK.** Every one of the four new cascade sites is safe by a guard units 1
+   and 2 wrote for their own reasons — `pipe_frees_now`'s state test,
+   `exchange_can_settle`'s `Free` arm — and the one site that genuinely needed
+   restructuring (`pipe_drop_staged` beside the staged-claim notifications) was
+   fixed by not walking a list at all. That is worth recording because the
+   brief's obligation was framed as new-hazard-hunting and what it found was an
+   invariant holding one level further out than it was written for.
+2. **THE MODULE MERGE IS THE UNIT'S ONE STRUCTURAL CHANGE, AND IT WAS FORCED BY
+   A RULING RATHER THAN BY CODE VOLUME.** `kcore`'s facade has a paragraph about
+   where a seam lives — state below the teardown, acting above it — and this
+   does not bend it: `wake` and `refs` were both the acting half, and 9(b) plus
+   the peer-gone levels made them one act. A reader looking for the delivery now
+   finds it in the file that owns the ledger, which reads correctly once the
+   header's two-directions paragraph is read.
+3. **A `NoCopy` PAYLOAD IS READ THROUGH A BORROW AND THAT COSTS A CALLER
+   NOTHING.** The reviewed API makes `PipeMsg`, `ReplyDelivery`, `WaitPayload`
+   and `WaitResult` all `NoCopy`, which was the one thing about the surface that
+   looked risky to land: a `match` binding a move-only payload out of a place is
+   normally refused. It is not, because a `match` on a PLACE matches where the
+   value sits — `match r.what { case Reply(outcome) -> match outcome { case
+   Data(msg) -> msg.bytes[i] } }` compiles and reads one byte. So the discipline
+   is free: 128 inline bytes cannot be duplicated by an accident of binding, and
+   nothing at a call site pays for that.
+4. **ROOT'S 16 KiB STACK CEILING HELD WITH NO INCIDENT, BECAUSE THE PHASE SPLIT
+   WAS WRITTEN FIRST.** Design 14 finding 3 said unit 3's cases would be longer;
+   they are (four phases in the largest), and one-phase-per-function was applied
+   from the first line rather than after an arm64 fault. The record's body region
+   is a further 128 bytes in `wait_into_frame`'s frame and 192-384 in the two
+   C-altitude cases' — neither is close to the grant.
+5. **THE HANDLE TABLE STOPS BOUNDING A MULTIPLEXING CLIENT.** Design 14 finding
+   5 recorded that `MAX_HANDLES` (16) rather than `PIPE_INFLIGHT` (16) is what a
+   client that holds its claims meets first, and named the fused `Call` as the
+   answer. `Waiter.give` is a SECOND answer and it arrived first: a client that
+   gives its claims to a subscription holds zero handles for them, so the
+   in-flight budget becomes reachable from one process. Nothing in this unit
+   proves it at depth (`pipe-wait-give` gives one claim at a time), and a case
+   that fills the ring through given claims is a cheap addition whenever a unit
+   wants it.
+6. **TWO NEW sawlang DEFICIENCIES, BOTH MINIMALLY REPRODUCED**: SL-14 (a `move`
+   inside a DIVERGING inline catch retires the binding on the fall-through path
+   too) and SL-15 (a bare integer literal does not adopt a `UInt` parameter when
+   the method is OVERLOADED, though the same call on a single-candidate function
+   adopts). Both have in-tree workarounds that read fine — the re-mint in
+   deviation 6, and a named `static` at the one call site — so neither blocked
+   anything.
+7. **THE IDIOM HELD.** Every bind-or-bail in the eight new packages and the six
+   kernel/sysapi files is the inline `try … catch` guard form or a plain
+   propagating `try`. The `match` sites that remain are the negative-test arms
+   asserting a specific status (`pipe-wait-reply`'s one, `pipe-wait-give`'s two,
+   `pipe-send-blocking`'s two, the two refusal cases' one each) and the four
+   `give` bodies' success/failure split, which is a genuinely-different-arms
+   match rather than a fold.

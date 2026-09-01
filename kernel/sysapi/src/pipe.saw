@@ -23,14 +23,19 @@
 //! `PipeRequestHandle` under the tree's own convention — a §2 object name renders
 //! short at the typed tier, exactly as `MemoryObject` renders as `Memory`.
 //!
-//! **EVERYTHING POLLS.** Unit 2 still has no waitability and nothing parks, so a
-//! full ring, an empty one and a reply that has not been written yet are all "not
-//! right now" — and at THIS tier that is not an error: `post` answers
-//! `Ok(Some(claim))` or `Ok(None)`, `take` answers `Ok(Some((len, request)))` or
-//! `Ok(None)`, and `resolve` answers `Ok(Some(len))` or `Ok(None)`, on design 234
-//! §4's two-channel shape, so a poll loop never matches an error case for a
-//! condition that clears itself. What IS an error is a peer that is gone, and it
-//! is terminal.
+//! **THE THREE OPS POLL, AND SINCE M4 UNIT 3 THEY ARE NOT THE ONLY DOOR** (sawos
+//! design 15). A full ring, an empty one and a reply that has not been written
+//! yet are all "not right now" — and at THIS tier that is not an error: `post`
+//! answers `Ok(Some(claim))` or `Ok(None)`, `take` answers
+//! `Ok(Some((len, request)))` or `Ok(None)`, and `resolve` answers
+//! `Ok(Some(len))` or `Ok(None)`, on design 234 §4's two-channel shape, so a
+//! poll loop never matches an error case for a condition that clears itself.
+//! What IS an error is a peer that is gone, and it is terminal.
+//!
+//! What unit 3 added beside them is the PARK: all four kinds are §2.2 waitables,
+//! the eight `Waiter` overloads at the bottom of this file are how they attach,
+//! and `PipeClient` is the composed blocking `send` §2.1 ratified. A caller
+//! chooses the door by whether it wants to wait, never by what it will be told.
 //!
 //! **SINGLE USE IS RAII HERE AND A LEDGER IN THE KERNEL.** `resolve` and `reply`
 //! CONSUME the capability they are called through, and the wrappers say so by
@@ -100,8 +105,10 @@ extension PipeInlet {
     /// ONE kernel primitive on the client side, and blocking send,
     /// `send(timeout:)`, TELL and cancel are all compositions over it plus the
     /// Timer and Waiter machinery — which is what keeps the kernel from ever
-    /// learning what a timeout is. Those compositions arrive with waitability in
-    /// unit 3; until then this is the whole client surface.
+    /// learning what a timeout is. **THOSE COMPOSITIONS ARE BUILT** (M4 unit 3,
+    /// sawos design 15) and live on `PipeClient` at the bottom of this file;
+    /// `post` remains the split-phase form, for a client that multiplexes by
+    /// hand rather than blocking.
     ///
     /// `len` may be ZERO — a data-free message is §2.1's own option — and a
     /// zero-length post reads no buffer at all. A `len` above `PIPE_BODY_BYTES`
@@ -230,9 +237,10 @@ extension PipeOutlet {
     /// length it has not been told yet, which is the same published-minimum rule
     /// `Waiter.wait`'s record follows.
     ///
-    /// **IT NEVER PARKS**, and unit 2 has no waitability to park with; unit 3 is
-    /// where an outlet becomes attachable and a blocking receive becomes a
-    /// composition over this call plus a wait.
+    /// **IT NEVER PARKS**, and it does not have to since M4 unit 3: an outlet is
+    /// a §2.2 waitable now, so a server attaches it (`Waiter.add(outlet:)`),
+    /// waits for the readable level, and calls this once it knows there is
+    /// something — which is a blocking receive composed out of two shipped ops.
     ///
     /// `Err(SosStatus.PeerClosed)` means the ring is EMPTY *and* every inlet
     /// handle is gone. **THE ORDER IS THE CONTRACT AND IT IS DRAIN-FIRST**
@@ -331,10 +339,13 @@ extension PipeReply {
     /// untouched, ask again. `n` may be ZERO, which is a reply that carries no
     /// data rather than an absence.
     ///
-    /// **IT NEVER PARKS.** The blocking `send(msg)` and `send(msg, timeout:)`
-    /// §2.1 ratifies are LIBRARY compositions over post + wait + resolve (design
-    /// 10 ruling 4), and they arrive with waitability in unit 3; until then this
-    /// is the whole of the client's back half and a caller polls.
+    /// **IT NEVER PARKS, AND SINCE M4 UNIT 3 IT IS THE POLLING DOOR RATHER THAN
+    /// THE ONLY ONE.** The blocking `send(msg)` and `send(msg, timeout:)` §2.1
+    /// ratifies are LIBRARY compositions over post + attach + wait (design 10
+    /// ruling 4, and ruling 11(a) deleted the resolve leg — the answer arrives
+    /// IN the wait record), and they are built, on `PipeClient` below. A claim
+    /// whose answer was delivered through a wait answers `PeerClosed` here:
+    /// there is no second copy of an answer.
     ///
     /// `Err(SosStatus.PeerClosed)` means the server side abandoned it — the
     /// obligation was dropped without a reply, or the connection's server end went

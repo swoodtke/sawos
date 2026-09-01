@@ -26,6 +26,33 @@ entry below or the brief that carries it, never restating either.
 
 ## [BACKLOG] — filed, not scheduled
 
+- **M4 unit 3 — waitability [#15 — designs/015-waitability.md]. CLOSED
+  Sep 1 2026, awaiting the lead's move to a done file.** What landed:
+  the four pipe arms (`designs/010` ruling 8's inlet room-to-post level
+  among them), so §2.2's ratified waitable list CLOSES and the four
+  `NotWaitable` refusal arms units 1 and 2 wrote by hand are gone; the
+  wait record grows a body region and a REPLY delivery carries the
+  answer's bytes (ruling 11(a)), so the wait IS the resolve and a
+  multiplexed RPC is post + attach + wait; `WaiterOp.Add` grows a flags
+  word for `AttachMode.OneShot` (ruling 9(b)) and the CONSUMING attach
+  `Waiter.give` (ruling 11(c)), which is eight typed overloads, one per
+  waitable kind; ruling 9(a)'s implicit detach at `Resolve`/`Reply`;
+  peer-gone terminal levels at all four zero-arms, so nothing parked is
+  silently doomed; and §2.1's ratified blocking `send(msg)` /
+  `send(msg, timeout:)` become real as LIBRARY compositions over post +
+  attach + wait plus a Timer, with `TimedOut(pending:)` carrying the
+  live claim. **ONE STRUCTURAL CHANGE**: `kcore.wake` merged into
+  `kcore.refs` — a delivery now drops a counted reference and a dropped
+  reference now delivers, so the two are one act and a module boundary
+  between them would be the cycle DF-232e does not diagnose. Suite
+  196/196 (98 cases/arch) from 182/182, seven new cases across eight new
+  packages, no pre-existing case row moved. Docs: spec §2.1 (abandonment
+  re-worded to the LAST REFERENCE, the send compositions BUILT), §2.2
+  (the list closes, persistent-BY-DEFAULT, the record layout, the
+  consuming attach), §5.7 (the Add flags growth), §2's Pipe and Waiter
+  rows, the counted-kinds table's four attachment columns, §11's M4
+  progress and quota note. As-built in #15; SL-14 and SL-15 filed below.
+
 - M4 scoping — pipes [#10 — designs/010-m4-pipes.md, DRAFT Aug 30,
   awaiting user review]: §2.1 carried by reference; waiter revocation
   as unit 0 (the Aug-30 ruling — the free arm wakes parked threads,
@@ -122,3 +149,40 @@ One entry per issue, resolution-sufficient: the symptom verbatim, the probe/site
   ```
   Workaround in-tree: the array is not lent mutably at all — a message buffer is filled by the CALLER and passed `&`, and the two helpers that wanted to write one take the byte as a parameter instead (`tests/pipe-oneshot`). That is livable here because the arrays are small and caller-owned; a helper that genuinely fills a caller's buffer (the shape `read_into` has) has no spelling today short of wrapping the array in a one-field struct. Resolution: make an indexed write through a `&var [T; N]` legal, exactly as it is through a `&var` struct field — or, if the restriction is deliberate, say so in LANGUAGE_SPEC beside DF-232a's list and give the diagnostic a hint that names the wrapper-struct workaround instead of a `let` the program does not have.
 - SL-12 — STATEMENT-POSITION `try ... catch` ON A `Result<Void, E>` CALL IS AN INTERNAL COMPILER ERROR: ``internal compiler error at src/main.saw:257:5 (TryExpr): 'NoneType' object has no attribute 'type'`` (the Aug-31 idiom sweep, sawlang 0.2.0 @ `3f15d2ee`). `try give(...) catch { ... }` as a bare STATEMENT — and the `let _ =` spelling identically — dies in sawc when the callee's Ok type is `Void`; the same catch with a non-Void Ok compiles and runs, so it is the Void, not the discard. Probe: any `Result<Void, SosStatus>` op (`give`/`start`/`waiter.add`/`timer.arm`/`interrupt.ack`/`waiter.remove`/`mapping.unmap`) under a statement-position inline catch. In-tree workaround: statement-position checks stay `match { case Ok(_) -> {}, case Err(e) -> ... }` — 75 such sites deliberately kept at the Aug-31 sweep, and CLAUDE.md's idiom ruling carries the caveat until the fix ships in a pin. Resolution: the inline catch's lowering handles a Void Ok payload (nothing to bind is not nothing to type); the guard form should be legal at statement position exactly as the binding form is. **CLOSED (second pin bump, sawlang 0.2.1 @ `8ffc5809`, Aug 31):** DF-281a fixed it fix-on-discovery; the statement-position guard form is legal, CLAUDE.md's caveat is lifted, and the 75 kept `match` sites are a queued conversion pass.
+- SL-14 — A `move` INSIDE A **DIVERGING** INLINE CATCH RETIRES THE BINDING ON THE FALL-THROUGH PATH TOO: ``error: use of moved variable `owned` `` with ``hint: value was moved at line 14 and can no longer be used`` (design 15, `kernel/sysapi/src/waiter.saw`, sawc 0.3.0 @ `87063387`). The catch block ENDS IN A `return`, so its `move` runs only on the error path and the binding is provably still live below the `try` — but the move checker records the move unconditionally and refuses the next use. It is the exact shape ruling 11(c)'s "a refused give HANDS THE OBJECT BACK" wants: consume on the error path, disarm on the success path. Minimal repro, one file, hosted:
+  ```saw
+  struct Res { n: Int }
+  extension Res: NoCopy {}
+
+  func might(x: Int) -> Result<Void, Int> {
+      if x == 0 { return 1 }
+      return
+  }
+
+  func hand(r: Res, x: Int) -> Result<Void, (Int, Res)> {
+      var owned = move r
+      try might(x) catch {
+          let back: (Int, Res) = (error, move owned)
+          return move back          // the catch DIVERGES
+      }
+      owned.n = 0                   // error: use of moved variable `owned`
+      return
+  }
+  ```
+  Workaround in-tree: the eight `Waiter.give` overloads disarm BEFORE the syscall (the transfer-funnel contract verbatim) and RE-MINT a fresh wrapper around the same word on the error path, which the kernel's own rule licenses — a refused add consumes nothing. That reads well enough that it is what shipped, and it is arguably stronger (no path can leave two owners of one word), so this is filed for the language rather than as a blocker. Resolution: the move checker should follow the catch block's divergence, exactly as design 228 makes a diverging catch satisfy any expected type — the two halves of "a diverging catch is an exit" should agree. Failing that, a diagnostic that says the move is on a path that cannot reach the use, rather than one that points at a line the fall-through never executes.
+- SL-15 — A BARE INTEGER LITERAL DOES NOT ADOPT A `UInt` PARAMETER WHEN THE METHOD IS OVERLOADED, THOUGH THE SAME CALL ON A SINGLE-CANDIDATE FUNCTION ADOPTS: ``error: argument 1 expects `UInt` but got `Int` `` with the three-conversion hint (design 15, `tests/pipe-send-blocking`, sawc 0.3.0 @ `87063387`). Every candidate in the set declares the parameter `UInt` and the candidates differ by ARITY, so there is exactly one that could match and nothing about the literal is ambiguous — but adoption does not run and the call is refused. LANGUAGE_SPEC's rule is that a bare literal adopts a fixed-width or platform EXPECTED type at a parameter, and its documented ambiguity carve-out is about two candidates of DIFFERENT integer types (`h(Int)` vs `h(Int8)`), which is not this. Minimal repro, one file, hosted:
+  ```saw
+  struct Bag { n: Int }
+  extension Bag {
+      func put(&self, len: UInt) -> UInt { len }
+      func put(&self, len: UInt, extra: Int) -> UInt { len + (extra as UInt) }
+  }
+  func solo(len: UInt) -> UInt { len }
+
+  func main() {
+      let b = Bag(n: 1)
+      print("{}", solo(len: 1))     // adopts: one candidate
+      print("{}", b.put(len: 1))    // error: argument 1 expects `UInt` but got `Int`
+  }
+  ```
+  It bites wherever a ratified surface is overloaded on presence rather than on type — §2.1's `send(msg)` beside `send(msg, timeout:)` is exactly that shape, and the two differ only in trailing arguments. Workaround in-tree: name the number (`static TIMEOUT_MSG_LEN: UInt = 1`), with the reason written at the declaration; a suffix is not available for platform `UInt`, which is what makes the workaround a static rather than a one-character fix. Resolution: run literal adoption per CANDIDATE during overload resolution and let a set whose members agree on the parameter's type resolve it, keeping the refusal for the genuinely ambiguous case the spec already documents.

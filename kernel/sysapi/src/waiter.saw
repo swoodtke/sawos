@@ -16,6 +16,15 @@
 //! same rules — which callers see because extension lookup follows the
 //! facade's `public import` since sawlang 0.2.0 (the first pin bump; SL-7's
 //! resolution; unit 5.5 shipped `Process.attach` in the interim).
+//!
+//! **AND M4 UNIT 3 SENT FOUR MORE THE SAME WAY** (sawos design 15). The four
+//! PIPE kinds are §2.2 waitables now, and their `add`/`give` overloads are
+//! declared in `sos.pipe` for the same reason the Process one is declared in
+//! `sos.system`: that file names `Waiter` (its composed blocking sends park on
+//! one), so it sits ABOVE this one and an overload written here would be the
+//! cycle again. What this file still declares is `AttachMode`, the three
+//! overloads whose types it names, and the DECODE — which is where the four new
+//! payload cases land, because the record is one thing whatever wrote it.
 
 import sosabi.{SosStatus, WaiterHandle, NO_HANDLE, WaitTag, WaitResult,
                WaitPayload, WaitBuffer, PipeMsg, ReplyDelivery, ReplyLevel,
@@ -151,10 +160,17 @@ func reply_of(level: ReplyLevel, buf: &WaitBuffer) -> ReplyDelivery {
 
 /// A handle to a Waiter — §2.2's generic wait aggregator, epoll/Port-style.
 ///
-/// Attachments are PERSISTENT subscriptions: `add` once, and the handle stays
-/// watched until `remove`. There is no one-shot mode, and readiness is
-/// LEVEL-TRIGGERED, so a signal that lands before anyone waits is still there
-/// when the wait arrives.
+/// Attachments are PERSISTENT BY DEFAULT: `add` once, and the handle stays
+/// watched until `remove`. `AttachMode.OneShot` is the opt-in that detaches at
+/// the delivery instead (M4 unit 3, `designs/010` ruling 9(b)), and readiness is
+/// LEVEL-TRIGGERED either way, so a signal that lands before anyone waits is
+/// still there when the wait arrives.
+///
+/// **THE ONE-SHOT FOOTGUN IS STATED RATHER THAN GUARDED**: attach one-shot, take
+/// the delivery, and `wait()` again on a Waiter with nothing left attached, and
+/// the thread parks forever — which the kernel's deadlock report names, exactly
+/// as it always has for an empty Waiter. A subscription that ends itself is a
+/// subscription you have to re-arm.
 ///
 /// Several threads may park on one Waiter (§2.2), and a ready handle wakes one
 /// of them; a handle attaches to at most one Waiter, and attaching it twice
@@ -406,8 +422,13 @@ extension Waiter {
     /// somebody has to supply the bytes; supplying them HERE is what keeps a
     /// raw address out of the typed surface, exactly as the handle rule keeps
     /// raw handle words out. The stack is the right place for them: the record
-    /// is three words and the frame outlives the park, since the frame is the
-    /// parked thread's own stack.
+    /// is four header words plus a message-sized body region since M4 unit 3, and
+    /// the frame outlives the park, since the frame is the parked thread's own
+    /// stack. **THE BUFFER IS MAX-SIZED AND THE COPY IS NOT** (`designs/010`
+    /// ruling 11(a)): a parked waiter cannot predict which arm fires, so the
+    /// buffer holds the biggest answer its attachments could give, while the
+    /// kernel writes only what the delivery needs. A Timer waiter pays for the
+    /// growth in frame bytes and never in copy time.
     public func wait(&self) -> Result<WaitResult, SosStatus> {
         wait_into_frame(self.handle)
     }
