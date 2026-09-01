@@ -491,3 +491,69 @@ repo's first done file; sawos was born Aug 28 (sawlang#238).
   170/170 under sawlang HEAD 87063387, fast-forward 721e2fe; the
   lead remainder executed in the integration commit — CLAUDE.md now
   records the tree as fully converted with 33 by-design keeps).
+- sos_runner parallel `-j N` [scheduled, queue 1; user-acked Aug 31]:
+  parallel builds + QEMU per case (**default 4 — user ruling Sep 1:
+  the host has 4 performance cores vs 6 efficiency cores, and the
+  parallelism tracks the P-cores**), per-case transcripts unchanged,
+  deterministic report order. Measured ~33-45 MB RSS per QEMU, so
+  memory is a non-issue on the 24GB host; cores are the constraint
+  (a UTM VM + the sawlang-db peer session share them).
+  Acceptance: per-case transcripts byte-identical vs a serial run.
+  **CLOSED (Sep 1, branch `worktree-agent-afb1061980c6f31b7`):** `-j N`
+  landed on `tools/sos_runner.py`, DEFAULT 4, so `make sos-test` is
+  parallel with no argument written anywhere.
+  SHAPE. The ARCHITECTURES STAY SEQUENTIAL — two at once would build one
+  Blade package for two triples into one `.build/` tree, whose stale-image
+  sweep and build stamp are shared even though the artifacts are not — and
+  the pool runs INSIDE an arch: first the root/child package builds, then
+  the per-case build+boot+judge, `jobs` at a time each. `_map_ordered`
+  submits every item and awaits the futures in SUBMISSION order, so results
+  stream out in case-definition order whatever the completion order; a
+  worker returns its verdict and the lines it owns and prints NOTHING, and
+  one thread walks the list. `-j 1` runs inline on the calling thread
+  rather than through a one-worker pool, so the serial harness — the thing
+  the parallel one is diffed against — takes no path the parallel one
+  introduced. Threads, not processes: every unit of work is a
+  `subprocess.run`, so the GIL is released throughout and a process pool
+  would buy only a pickling constraint on the case table.
+  THREE ISOLATION HAZARDS FOUND, ONE OF THEM REAL. (1) `_stitch_root_image`
+  staged EVERY case's image over one `<build>/root.sosimg` and assembled one
+  `rootimg.o`, because the committed `kernel/rootimg.S` names a fixed
+  filename and so is the one artifact here a case cannot distinguish by
+  name — two concurrent root-image cases would have booted each other's
+  image, which is a wrong-but-PLAUSIBLE transcript and the worst failure a
+  harness can have. Now a per-case staging directory the `-I` points at,
+  plus a per-case `.rootimg.o`. (2) `_run_qemu`'s no-input path INHERITED
+  the harness's stdin, and `-nographic` on a TTY sets raw mode and restores
+  whatever it found — four QEMUs saving and restoring each other's termios
+  leave the operator's shell in whichever state the last one to exit saw.
+  Each boot now gets an empty pipe this process holds the write end of: no
+  byte, no EOF, which is what an idle console always was, and the same in
+  both modes. (3) `tc()` is a lazy global with a one-time note print, so it
+  is resolved eagerly in `main` before any pool starts.
+  AUDITED CLEAN: every other per-case artifact is already `<case>`-named;
+  `_root_image`/`_child_images` are written on the main thread in the
+  package phase, the table's only writer; nothing calls `os.chdir` or
+  mutates `os.environ` (Blade's cwd and env are per-`subprocess` already);
+  and the sawlang side is race-safe by construction and says so —
+  `sawc/stdcache.py` publishes pid-temp + `os.replace` with a prune
+  documented "safe to race", `rt_build.py` holds an `flock`.
+  MEASURED, full suite, both arches, back to back on one machine under the
+  suite lock: `-j 1` 1195s vs `-j 4` 457s — **2.6x**, 19m55s -> 7m37s.
+  ACCEPTANCE MET. 170/170 green in BOTH modes (exit 0 both); the console
+  report BYTE-IDENTICAL between them; the pairwise transcript diff 166
+  identical / 4 differing, and the 4 are exactly the two known timing
+  cases on both arches — `thread_preempt`'s A/B interleave and its
+  `SOS: timer tick` rows, `timer_interval`'s `fires=` counters. No
+  assertion reads either bucket: `thread_preempt` asserts `AB`/`BA`/`AB`
+  and the join line, and `timer_interval`'s own comment states the
+  periodic counts are deliberately unpinned because coalescing makes 1, 2
+  or 3 all correct. Shown INHERENT rather than parallel-induced: two
+  independent `-j 1` runs of riscv32 `thread_preempt` differ in the same
+  row class. CLAUDE.md's Testing section records the default, `-j 1`, and
+  the one row that moves in either mode.
+  INTEGRATED to main Sep 1 2026 (lead-reviewed, lead gate re-run
+  170/170 under the parallel default, sawlang HEAD 87063387 unchanged,
+  fast-forward b42ae85). The CLAUDE.md Testing addendum accepted as a
+  necessary deviation: the gate's default mode changed, so the two
+  timing-row cases are named where the transcript tradition is stated.
