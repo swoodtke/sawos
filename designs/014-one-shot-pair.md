@@ -1,6 +1,6 @@
 # SawOS design 14 — the one-shot pair: PipeReplyHandle / PipeRequestHandle (M4 unit 2)
 
-Status: DRAFT Sep 1 2026 (lead). Ladder unit 2 of the ruled plan of
+Status: **LANDED Sep 1 2026** (was DRAFT Sep 1, lead). Ladder unit 2 of the ruled plan of
 record (designs/010): **the request/reply obligation becomes a pair of
 counted, transferable, single-use objects, and `Post` grows its
 reply-claim return.** No waitability and no parking (unit 3's — the
@@ -179,3 +179,244 @@ room — unit 3); ruling 9 both halves (unit 3 — 9(a) vacuous here, see
 the note); `Call`/`ReplyRecv` (unit 3/3.5); handles in messages and
 the keep-mask rider (unit 4/2.5); the money shot (unit 5); kill;
 namespaces; the growable-pool M5 seed.
+
+## As built
+
+**LANDED Sep 1 2026.** Suite 182/182 (91 cases/arch, riscv32 + arm64)
+from 170/170; SIX new cases across seven new packages, and no
+pre-existing case row moved.
+
+**VALIDATED ON sawlang 0.3.0** (`SAWLANG_ROOT` at `87063387`, the tree's
+`sawlang.pin` version). The baseline and the gate were compiled by the SAME
+compiler, so the transcript diff below is attributable to this change alone.
+Nothing here leans on anything 0.3.0 added.
+
+### Transcript accounting
+
+Whole-transcript diff, base `cce59da` vs the gate, ANSI stripped and bucketed.
+The parse is mechanical (case rows `[n/m] MARK name`, image rows
+`path (N bytes)`, everything else):
+
+| bucket | rows | what |
+|---|---|---|
+| byte-identical | 170 case-row MARKS + names | every pre-existing case, same mark, same name, and the same INDEX within its arch. `thread_preempt` and `timer_interval` — the two known timing rows — included, so the documented-nondeterministic bucket is EMPTY this run |
+| authorized-with-cause | 170 case-row denominators | `[n/85]` -> `[n/91]`, the DENOMINATOR alone, because six cases were appended. Zero indices moved, which is what says they were appended rather than inserted |
+| authorized-with-cause | 73 riscv32 image-size rows | every `.sosimg` grew, by +64 to +1168 bytes (27 of them by exactly 64). The `sos` facade compiles two more wrapper types and four more C seams into every image, and `sosabi` carries two more kinds, two more rights enums and two more op tables |
+| authorized-with-cause | 5 arm64 image-size rows | +4096 each, and 68 arm64 images did not move AT ALL — page granularity on that profile, so the same code growth crosses a page boundary in five images and is invisible in the rest |
+| authorized-with-cause | 1 summary row | `170 passed` -> `182 passed` |
+| address-only | 0 | nothing printed an address that moved |
+| documented-nondeterministic | 0 | none met |
+| new | 12 case rows + 14 image rows | the six cases and seven packages, on both profiles |
+
+No row is unaccounted for, and no image SHRANK on either profile.
+
+**`pipe-basics`' RING-DEPTH ROWS DID NOT MOVE, and the brief was right to make
+us check.** The lifecycle change reaches them — a ring slot now lives until its
+exchange SETTLES — but that case posts and takes with §2.1's TELL idiom at every
+step (the claim is given up at the post, the obligation dropped at the take), so
+both columns of every exchange fall before the next line runs and each slot
+recycles exactly where unit 1's did. `ring depth=16` and `drained=16` therefore
+mean what they always meant, byte for byte. What would have moved them is a case
+that HOLDS an exchange, and `pipe-oneshot` is that case, written new: it counts
+the ring around one unsettled exchange (15) and again after settling it (16),
+which is the same claim stated as a difference rather than as an absolute.
+
+### The exchange, as landed
+
+`kcore.objects` gains four parallel per-ring-slot arrays beside `PIPE_LENS`, all
+zero-initialized and therefore `.bss` at no image cost (design 149):
+
+```saw
+PIPE_EX_STATE   [ExchangeState; MAX_PIPES * PIPE_INFLIGHT]   Free/Staged/Taken/Replied
+PIPE_REPLY_REFS [UInt16; ...]                                the CLAIM column
+PIPE_REQUEST_REFS [UInt16; ...]                              the OBLIGATION column
+PIPE_NEXT       [Int; ...]                                   the staged FIFO's links
+```
+
+and `PipeSlot` LOSES `head` and `count`, gaining `staged` (a 1-based list head).
+Four things about that are worth reading:
+
+- **THE RING STOPPED BEING A QUEUE OF BYTES AND BECAME A TABLE OF EXCHANGES.**
+  Unit 1's slots were contiguous because a slot lived exactly from its post to
+  its take, so a head plus a count described them. Unit 2's settle in whatever
+  order their two holders act — a server may answer the third request first, a
+  client may resolve out of order — so occupancy is PER SLOT and the free ones
+  are not contiguous. `alloc_exchange` scans (bounded by `PIPE_INFLIGHT` = 16,
+  which `kcore.limits`' audit note already covers), and the staged messages are
+  a LIST threaded through `PIPE_NEXT`. The list is a strict FIFO by
+  construction: appended at the tail, removed at the head, or cleared whole at
+  the outlet's zero-arm — never removed from the middle — which is why it needs
+  no removal path and no tail index (design 13's own argument against a second
+  index to keep in step, applied again).
+- **THE TWO COLUMNS ARE THE ABANDONMENT STATE, exactly as design 13's two are
+  the peer-gone state.** Abandoned-by-client IS `reply_refs == 0`;
+  abandoned-by-server IS `Taken` with `request_refs == 0`, or `Staged` with the
+  CONNECTION's `outlet_refs == 0`. No flag anywhere says it. The one thing the
+  columns cannot say on their own is why a request column is zero — not minted
+  yet, or minted and dropped — and that is the whole of why `ExchangeState`
+  exists as a recorded state rather than being derived too.
+- **THE SETTLE RULE IS THE COUNTED-OBJECT RULE PLUS ONE CLAUSE.** A slot goes
+  back when both columns are zero AND nothing is owed, where "owed" is a
+  `Staged` message with a live outlet — §2.1's TELL idiom, which requires that
+  post-then-drop-the-claim still delivers. Without the clause the TELL idiom
+  would recycle the slot under the message.
+- **A CONNECTION CANNOT FREE WHILE AN EXCHANGE LIVES IN IT** (`pipe_idle`, a
+  third clause on `drop_reference`'s both-zero test). A claim is a reference on
+  a RING SLOT and the ring slots live inside the `PIPES` row, so freeing the row
+  under a live claim would hand it a recycled connection. This is ruling 10's
+  "references govern lifetime" one level down, and it is the one place the two
+  levels of the design are not independent.
+
+Numbers: `MAX_PIPES = 4` × `PIPE_INFLIGHT = 16` = 64 exchanges machine-wide,
+costing 64 × (1 + 2 + 2 + 4) bytes of `.bss` at the two profiles' widths.
+
+### What the compiler enumerated
+
+Adding two `ObjType` cases broke, and would not build until answered:
+
+1. `kcore.refs.ref_object` — 2 arms (which column a bind counts on).
+2. `kcore.refs.drop_reference` — 2 arms. **This is where the design got decided
+   a second time**, exactly as it was in unit 1: the matrix demanded an answer
+   to "was that the last" for an object with two names, and writing
+   `exchange_can_settle` is what turned D-2's drop semantics from four bullet
+   points into one predicate the ledger evaluates.
+3. `kcore.refs.free_object` — 2 arms.
+4. `kcore.dispatch.dispatch` — 2 arms (the kind -> op-table match).
+5. `kcore.dispatch.waitable_slot` — 2 arms. The design-8 precedent collected a
+   FOURTH time; the `NotWaitable` refusals are written out with the note that
+   unit 3 removes them beside unit 1's two.
+6. `sos.system.decode_boot_handle` — 2 arms from the two new `BootHandleKind`
+   cases, and `BootHandle`'s literal grew two fields at all EIGHT arms, which is
+   the compiler asking the same question eight more times.
+7. `kcore.dispatch.boot_kind_of` — reached through its `_` arm, so the compiler
+   did NOT ask; the two arms were added because `pipe_reply_rights()` and
+   `pipe_request_rights()` mint `Transfer` and a givable kind with no record
+   spelling would arrive mis-tagged. Unit 1 recorded the same gap and it is
+   still the one place in this blast radius where the enumeration property is
+   off, deliberately.
+8. The new `ExchangeState` enum enumerated ITSELF at five sites —
+   `alloc_exchange`, `pipe_idle`, `exchange_can_settle`, `pipe_resolve` and
+   `pipe_reply` — which is what made the two op bodies read as answer TABLES
+   rather than as chains of `if`s, and what forced the two `fatal_kernel` arms
+   for the states a handle cannot name.
+
+`SosStatus` needed NOTHING: `PeerClosed` and `WouldBlock` both existed and both
+say here exactly what their unit-1 docstrings say they say. `QuotaKind` needed
+nothing either, which is D-1's "a claim mints no quota row" holding.
+
+**THE ENUMERATION PROPERTY WAS VERIFIED RATHER THAN ASSUMED** (the design-8
+tradition, run as a probe): deleting `ref_object`'s `case PipeReply` and
+compiling the kernel alone gives ``error: match is not exhaustive, missing
+variants: `PipeReply` `` anchored at the `match`, and the arm was restored.
+
+### Deviations from the brief, argued
+
+1. **`Take` ANSWERS THROUGH A RECORD, and `PIPE_BODY_BYTES` IS CHECKED AGAINST
+   THE CALLER'S MEMORY RATHER THAN AGAINST A CAP ARGUMENT.** The brief says the
+   take grows the request return and does not say how. A take now answers TWO
+   things (the length and the obligation) and one op answers one word, so the
+   two ride the copy-out record `ProcessOp.PipeCreate` already opened —
+   `PIPE_TAKE_RECORD_WORDS = 2` in `sosabi`, `{len, request}`. That spends the
+   third argument register on the record's capacity, which left none for the
+   BODY buffer's; so the body is checked with `copy_out_check(p, body,
+   PIPE_BODY_BYTES)` instead. That is STRICTER than what it replaced, not
+   looser: unit 1 faulted a caller whose CAP NUMBER was under the published
+   minimum, and this faults a caller whose actual memory is not writable for a
+   whole slot — the number a caller types is no longer the thing trusted. The
+   fault tag changes from `BadArg` to `BadBuffer` on that path, which no
+   shipped transcript asserts. The alternative was a `sos_syscall4` (the floor's
+   own sanctioned move for a wider op), and it was not taken: it is a HAL change
+   on both profiles for one argument, where the record was already a door.
+2. **THE TYPED `resolve` DISARMS BY THE ANSWER, NOT BEFORE THE SYSCALL.** The
+   transfer-funnel contract (design 3 D-5) says disarm BEFORE, because every
+   failure of such a syscall is a fault. A resolve has a third outcome the
+   funnels do not — `Ok(None)`, which consumes nothing — so disarming first
+   would throw away a live claim on every poll. The rule is exact and it is the
+   kernel's: the entry is consumed unless the answer is a would-block. `reply`
+   keeps the contract verbatim (it consumes on every answer it can give), so the
+   two sit side by side in one file with the difference written at the site.
+3. **THE WRAPPERS ARE `PipeReply` / `PipeRequest`, NOT `PipeReplyHandle` /
+   `PipeRequestHandle`.** The tree renders a §2 object name short at the typed
+   tier (`MemoryObject` -> `Memory`, `PipeInlet` beside `PipeInletHandle`), so
+   §2.1's ratified names are the `sosabi` ALIASES and the owning wrappers are the
+   short ones. That takes the name §2.1's client-API paragraph uses for the
+   RESOLVED reply VALUE — a type that does not exist yet and whose only producer
+   is unit 3's suspending `send`. Recorded in §2.1's built-so-far block as a
+   notice to that unit rather than resolved here, because naming a type nothing
+   builds is how dead surface starts.
+4. **`Mint` IS IN BOTH DEFAULT SETS**, which the brief's rights enums imply and
+   its D-2 paragraph reasons about. It costs one answer the brief did not have to
+   give: a SIBLING that acts second. A second `reply` (the exchange is already
+   `Replied`) and a second `resolve` (the reply is already taken) are both
+   `PeerClosed` — the same word an abandoned peer gets, and for the same reason,
+   which is that there is no longer anybody on the other side of THIS exchange.
+   `AccessDenied`-style faults were rejected: two holders of sibling handles
+   racing is precisely what a caller could not have checked.
+5. **NO `pipe-not-waitable` CASE, again.** Unit 1's deviation 2 holds word for
+   word for the one-shots: the typed `Waiter.add` has no overload for either kind
+   and the wrappers' handle fields are `public(package)`, so the refusal is a
+   COMPILE error, which is strictly stronger than a runtime fault. `NotWaitable`
+   now has NINE arms and no test in the tree exercises any of them.
+6. **A `reap_unreferenced` STANDS WHERE THE THREE DELETED SWEEPS WERE.** Ruling
+   10 advertises deleting code; deleting those three loops outright would have
+   LEAKED, and finding 1 below carries the argument. What went is the
+   by-charged-process force-free — the hazard the ruling names — and what stands
+   is a reap of what nobody names, which is the ruling's own sentence made
+   mechanical.
+
+### Findings
+
+1. **THE CLOSE-ALL'S DESIGN-7 D-5 ASYMMETRY IS WHY RULING 10 CANNOT BE A PURE
+   DELETION.** The teardown's close-all counts WITHOUT freeing
+   (`unref_teardown`), and it does that deliberately: the per-slab sweeps that DO
+   free are also what COUNT for the teardown report, so a close-all that freed by
+   reference would collapse every `events=`/`waiters=`/`timers=`/`interrupts=`
+   number in the suite. Delete the three silent sweeps and a slot whose LAST
+   handle the dying process happened to hold reaches zero references with nothing
+   left to free it — a `Live` slab row with `refs == 0` that no later op can
+   ever reach. That is a leak, not a write-off, and it is reachable today (a
+   child that splits a Memory and exits). So the sweeps' CONDITION changed from
+   "charged to this process" to "named by nobody", and the free goes through
+   `free_object` so each kind's quota CREDIT runs — which the old sweeps never
+   did for a slot another process had been charged for. Recorded here because
+   the next unit that revisits ruling 10 should know the deletion was not free.
+2. **MAPPING IS A COUNTED KIND WHOSE SWEEP IS NOT ONE OF THE THREE.** It looks
+   like them and is not: `mapping_rights()` withholds `Transfer`, so a Mapping
+   handle cannot leave the process that owns it and a sibling cannot outlive its
+   owner — the hazard ruling 10 names is structurally unreachable — and the
+   loop's second arm clears a ROW for a dead target rather than freeing a slot.
+   Left alone, with the reason written at the site.
+3. **ROOT'S 16 KiB STACK GRANT IS A REAL CEILING ON A TEST'S `_start`, AND THE
+   64-BIT PROFILE MEETS IT FIRST.** `pipe-oneshot` was first written as one long
+   `_start` and died on arm64 with `store-access-fault … tval=0x4023bd20` — four
+   pages below the stack grant's base — while passing on riscv32. The cause is
+   design 137's own guarantee: every `print` with format arguments assembles its
+   message in STACK SCRATCH so that a panic survives an exhausted allocator, and
+   a function with forty-seven such call sites reserves that scratch for all of
+   them in one frame. The fix is structural and reads better anyway — one phase
+   per function, each reporting by RETURNING a status, `_start` printing once —
+   and it is worth knowing before unit 3's cases, which will be longer. The
+   kernel is not implicated: the fault is a userspace stack overflow, correctly
+   diagnosed and correctly fatal.
+4. **A `&var [T; N]` PARAMETER'S ELEMENTS ARE NOT ASSIGNABLE** — filed as SL-13.
+   Probed minimally: `func bump(a: &var [UInt8; 4]) { a[0] = 9 }` is ``cannot
+   assign to element of immutable array `a` ``, while the same element reached
+   through a `&var STRUCT` (`b.xs[0] = 9`) compiles and runs. It shaped two test
+   helpers (a message buffer is filled by the caller and passed `&`), and nothing
+   in the kernel wanted it.
+5. **THE HANDLE TABLE, NOT THE RING, IS WHAT BOUNDS A CLIENT THAT HOLDS ITS
+   CLAIMS.** `MAX_HANDLES` is 16 and `PIPE_INFLIGHT` is 16, so a process that
+   posts without resolving meets its own table before it meets the ring: sixteen
+   claims plus a System, a Process and two ends cannot coexist. That is not
+   wrong — a capability costs a table row, and design 10 ruling 4's fused `Call`
+   is precisely the answer for a client that does not want the row — but it means
+   the in-flight budget is not independently reachable from one process, and it
+   is why `pipe-oneshot` counts the ring with TELLs and holds exactly one
+   exchange. A unit that wants to prove `PIPE_INFLIGHT` head-on will need two
+   processes or a bigger table.
+6. **THE IDIOM HELD, INCLUDING THE FOLD SHAPE.** Every bind-or-bail in the seven
+   new packages and the four kernel files is the inline `try … catch` guard form
+   or a plain propagating `try`; the `match` sites that remain are the four
+   negative-test arms asserting a specific error value (`pipe-abandon`'s three
+   and each fault case's one) plus the two `give`/`post` status checks that print
+   different text per arm. No new sawlang deficiency was met beyond SL-13.

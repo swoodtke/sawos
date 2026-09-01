@@ -21,10 +21,68 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
-- 1. M4 unit 2 — the one-shot pair [#14 — designs/014-one-shot-pair.md]
+- (empty — unit 2 closed Sep 1; its entry is in [BACKLOG] below awaiting
+  the lead's move to a done file)
 
 ## [BACKLOG] — filed, not scheduled
 
+- M4 unit 2 — the one-shot pair [#10 rulings 4/9(a)/10, §2.1 ratified,
+  #14 — designs/014-one-shot-pair.md, authored Sep 1]:
+  PipeReply/PipeRequest as two counted kinds over one RING SLOT (two
+  more ref columns, D-1's no-third-slab), Post grows its claim return
+  and Take grows the obligation beside the message, Resolve/Reply each
+  CONSUMING the caller's entry, abandonment derived from the columns in
+  both directions, transferable so §2.1's delegation example runs across
+  a process boundary. **Plus ruling 10's rider**: the teardown's
+  by-charged-process force-free arms for the counted kinds deleted and
+  D-4's write-off activated. Everything still polls; nothing parks.
+  **CLOSED Sep 1 — LANDED.** Suite 182/182 (91 cases/arch, both
+  profiles) from 170/170; whole-transcript diff bucketed in the design's
+  As-built, and every one of the 170 pre-existing case rows is
+  BYTE-IDENTICAL in mark, name AND index — the only movement in them is
+  the `[n/85]` -> `[n/91]` denominator, plus image SIZES (all 73 riscv32
+  images by +64..+1168, five arm64 images by one page and 68 not at
+  all). VALIDATED ON sawlang 0.3.0 at `87063387`, the pin's version, for
+  both the baseline and the gate. **`pipe-basics`' ring-depth rows did
+  NOT move** — the brief authorized a move with argument and none was
+  needed: that case tells and discharges at every step, so its exchanges
+  settle exactly where unit 1's slots freed. What landed: two `ObjType`
+  kinds targeting an EXCHANGE (`connection * PIPE_INFLIGHT + ring slot`)
+  with two reference columns, four `.bss` arrays beside `PIPE_LENS`, a
+  four-state `ExchangeState`, `PipeSlot` trading `head`/`count` for a
+  staged FIFO list (slots settle out of order, so occupancy is per-slot),
+  `PipeReplyOp.Resolve` / `PipeRequestOp.Reply` on new rights enums,
+  `Take` answering through a two-word record, give + boot drain for both
+  kinds, typed `NoCopy` wrappers that disarm on consume, and two more
+  `NotWaitable` arms unit 3 removes. SIX cases across seven packages:
+  `pipe-oneshot`, `pipe-abandon`, `pipe-delegate` (+ the `child-reply`
+  child package), `pipe-no-reply`, `pipe-big-reply`, `pipe-dead-claim`.
+  SIX DEVIATIONS, argued in the As-built, of which two matter to a
+  reader: `Take` answers through a copy-out record and the BODY buffer is
+  now checked against the caller's real memory rather than against a cap
+  argument (stricter, `BadBuffer` where it was `BadArg`); and the typed
+  `resolve` disarms by the ANSWER rather than before the syscall, because
+  a would-block consumes nothing.
+  FINDINGS carried forward, each written up in the As-built: (1)
+  **RULING 10 COULD NOT BE A PURE DELETION** — the close-all counts
+  without freeing by design (7 D-5, so the counted sweeps' report numbers
+  stay honest), so deleting the three silent sweeps outright would strand
+  a `Live` slot at `refs == 0` that nothing can ever free; the sweeps'
+  CONDITION changed from "charged to this process" to "named by nobody"
+  and the free now runs each kind's own quota credit, which the old
+  sweeps never did for another process's slot. (2) Mapping's sweep looks
+  like the three and is NOT one — its handles carry no `Transfer`, so the
+  hazard is structurally unreachable — left alone with the reason at the
+  site. (3) **ROOT'S 16 KiB STACK GRANT IS A CEILING ON A TEST'S
+  `_start`**, and the 64-bit profile meets it first: design 137 assembles
+  every format-argument message in stack scratch, so 47 `print` sites in
+  one function overflowed on arm64 and passed on riscv32. One phase per
+  function is the fix and the shape unit 3's longer cases should start
+  from. (4) SL-13 filed. (5) `MAX_HANDLES` (16), not `PIPE_INFLIGHT`
+  (16), is what bounds a client holding its claims — proving the
+  in-flight budget head-on will want two processes or a bigger table,
+  which is also exactly what ruling 4's fused `Call` exists to make
+  unnecessary. (6) The idiom held, fold shape included.
 - M4 scoping — pipes [#10 — designs/010-m4-pipes.md, DRAFT Aug 30,
   awaiting user review]: §2.1 carried by reference; waiter revocation
   as unit 0 (the Aug-30 ruling — the free arm wakes parked threads,
@@ -108,4 +166,16 @@ One entry per issue, resolution-sufficient: the symptom verbatim, the probe/site
   func main() { let c = hand()  print("{}", c.make(top: 1)) }
   ```
   Workaround in-tree: import the receiver type by name, with the reason written at the import (`tests/waiter-revoked/src/main.saw`). The tree had not met this before because every other root server imports `Process` and `Thread` anyway — a program that only ever HOLDS a value of a type, never names it, is the shape that hits it. Resolution: bind the whole overload set for an extension method exactly as design 249 binds one for a free function, keyed on the receiver type rather than on which of its names an import happened to mention; failing that, a diagnostic that names the unbound sibling and the import that would bind it, since the current one sends the reader to the argument list. **FIX IN FLIGHT (user, sawlang design 256 / DF-280a, Aug 31): closes at the NEXT pin bump (0.3.0). At closure, drop the ceremony `Process` import in `tests/waiter-revoked` and re-verify the three-file repro resolves.** **CLOSED (third pin bump, sawlang 0.3.0 @ `66e353da`, Sep 1):** design 256's identity-keyed resolver binds the whole overload set for a resolved receiver; the ceremony `Process` import and its comment are dropped from `tests/waiter-revoked`, and the minimal repro re-verified under sawc 0.3.0 — `import dep.{hand}` alone compiles and prints 8.
+- SL-13 — A `&var [T; N]` PARAMETER'S ELEMENTS ARE NOT ASSIGNABLE, THOUGH THE SAME ARRAY REACHED THROUGH A `&var STRUCT` IS: ``error: cannot assign to element of immutable array `a` `` with ``hint: consider using `var` instead of `let` to make it mutable`` (design 14, `tests/pipe-oneshot`, sawc 0.3.0 @ `87063387`). A fixed-size array borrowed DIRECTLY is treated as immutable at an indexed write; borrowed as a field of a struct it is mutable, so the referent's mutability is being decided by how it was reached rather than by the sigil. The hint compounds it — there is no `let` anywhere in the program, and the parameter already says `&var`, so it sends the reader to a declaration that does not exist. LANGUAGE_SPEC's own DF-232a list puts "a `&var`/`self` referent" among the assignment targets, which is what made this look like a bug rather than a rule. Minimal repro, one file, hosted:
+  ```saw
+  func bump(a: &var [UInt8; 4]) {
+      a[0] = 9                       // error: cannot assign to element of
+  }                                  //        immutable array `a`
+
+  struct Crate { n: Int, xs: [UInt8; 4] }
+  func set_nested(b: &var Crate) {
+      b.xs[0] = 9                    // compiles, and runs
+  }
+  ```
+  Workaround in-tree: the array is not lent mutably at all — a message buffer is filled by the CALLER and passed `&`, and the two helpers that wanted to write one take the byte as a parameter instead (`tests/pipe-oneshot`). That is livable here because the arrays are small and caller-owned; a helper that genuinely fills a caller's buffer (the shape `read_into` has) has no spelling today short of wrapping the array in a one-field struct. Resolution: make an indexed write through a `&var [T; N]` legal, exactly as it is through a `&var` struct field — or, if the restriction is deliberate, say so in LANGUAGE_SPEC beside DF-232a's list and give the diagnostic a hint that names the wrapper-struct workaround instead of a `let` the program does not have.
 - SL-12 — STATEMENT-POSITION `try ... catch` ON A `Result<Void, E>` CALL IS AN INTERNAL COMPILER ERROR: ``internal compiler error at src/main.saw:257:5 (TryExpr): 'NoneType' object has no attribute 'type'`` (the Aug-31 idiom sweep, sawlang 0.2.0 @ `3f15d2ee`). `try give(...) catch { ... }` as a bare STATEMENT — and the `let _ =` spelling identically — dies in sawc when the callee's Ok type is `Void`; the same catch with a non-Void Ok compiles and runs, so it is the Void, not the discard. Probe: any `Result<Void, SosStatus>` op (`give`/`start`/`waiter.add`/`timer.arm`/`interrupt.ack`/`waiter.remove`/`mapping.unmap`) under a statement-position inline catch. In-tree workaround: statement-position checks stay `match { case Ok(_) -> {}, case Err(e) -> ... }` — 75 such sites deliberately kept at the Aug-31 sweep, and CLAUDE.md's idiom ruling carries the caveat until the fix ships in a pin. Resolution: the inline catch's lowering handles a Void Ok payload (nothing to bind is not nothing to type); the guard form should be legal at statement position exactly as the binding form is. **CLOSED (second pin bump, sawlang 0.2.1 @ `8ffc5809`, Aug 31):** DF-281a fixed it fix-on-discovery; the statement-position guard form is legal, CLAUDE.md's caveat is lifted, and the 75 kept `match` sites are a queued conversion pass.
