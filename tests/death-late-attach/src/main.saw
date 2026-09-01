@@ -132,21 +132,15 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    match child.give(system: move for_child, tag: TAG_BOOT) {
-        case Ok(_) -> {},
-        case Err(e) -> {
-            print("SOS deathlate: give failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        print("SOS deathlate: give failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    match child.start(boot_tag: TAG_BOOT) {
-        case Ok(_) -> {},
-        case Err(e) -> {
-            print("SOS deathlate: start failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    try child.start(boot_tag: TAG_BOOT) catch {
+        print("SOS deathlate: start failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let _ = system.debug_print("SOS deathlate: started\n")
 
@@ -169,23 +163,17 @@ func _start(boot_handle: UInt) {
     }
     let _ = waiter.add(&timer, KEY_TIMER)
     let _ = timer.arm(after_ns: PARK_NS)
-    match waiter.wait() {
-        case Ok(_) -> {},
-        case Err(e) -> {
-            print("SOS deathlate: park failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    try waiter.wait() catch {
+        print("SOS deathlate: park failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     // **THE LATE ATTACH.** The child has been dead for milliseconds.
-    match waiter.add(process: &child, key: KEY_DEATH) {
-        case Ok(_) -> {},
-        case Err(e) -> {
-            print("SOS deathlate: attach failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    try waiter.add(process: &child, key: KEY_DEATH) catch {
+        print("SOS deathlate: attach failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     let first = match waiter.wait() {
@@ -220,13 +208,10 @@ func _start(boot_handle: UInt) {
     // AND THE SECOND. A `remove` names the attachment by KEY and never touches
     // the waitable — but the reference it drops is the waitable's, and here
     // that reference is the last one.
-    match waiter.remove(KEY_DEATH) {
-        case Ok(_) -> {},
-        case Err(e) -> {
-            print("SOS deathlate: remove failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    try waiter.remove(KEY_DEATH) catch {
+        print("SOS deathlate: remove failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     let freed = match system.process_create(image: &image_mem,

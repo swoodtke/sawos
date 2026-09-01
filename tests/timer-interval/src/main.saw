@@ -76,10 +76,7 @@ func fires_of(r: &WaitResult) -> UInt {
 }
 
 func now_of(clock: &Clock) -> UInt64 {
-    match clock.now() {
-        case Ok(t) -> t,
-        case Err(_) -> 0u64,
-    }
+    try clock.now() catch { 0u64 }
 }
 
 /// Spin on the clock until it reads `deadline`. Timer fires land during this —
@@ -119,23 +116,17 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    match waiter.add(&timer, KEY) {
-        case Ok(_) -> {},
-        case Err(e) -> {
-            print("SOS interval: attach failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    try waiter.add(&timer, KEY) catch {
+        print("SOS interval: attach failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     // A REPEATING schedule: first fire one period out, then every period.
-    match timer.arm(after_ns: PERIOD_NS, interval_ns: PERIOD_NS) {
-        case Ok(_) -> {},
-        case Err(e) -> {
-            print("SOS interval: arm failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    try timer.arm(after_ns: PERIOD_NS, interval_ns: PERIOD_NS) catch {
+        print("SOS interval: arm failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     let one = try waiter.wait() catch {
@@ -172,13 +163,10 @@ func _start(boot_handle: UInt) {
     // coalesced total again here, and a `disarm` that left the fires behind
     // would report them too, so the single line covers both.
     let _ = timer.disarm()
-    match timer.arm(after_ns: PERIOD_NS) {
-        case Ok(_) -> {},
-        case Err(e) -> {
-            print("SOS interval: rearm failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    try timer.arm(after_ns: PERIOD_NS) catch {
+        print("SOS interval: rearm failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let fresh = try waiter.wait() catch {
         print("SOS interval: fourth wait failed: {}\n", error)

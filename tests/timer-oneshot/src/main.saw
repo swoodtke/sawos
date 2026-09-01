@@ -64,10 +64,7 @@ func fires_of(r: &WaitResult) -> UInt {
 }
 
 func now_of(clock: &Clock) -> UInt64 {
-    match clock.now() {
-        case Ok(t) -> t,
-        case Err(_) -> 0u64,
-    }
+    try clock.now() catch { 0u64 }
 }
 
 @export("_start")
@@ -99,13 +96,10 @@ func _start(boot_handle: UInt) {
     // this attach reports nothing and the wait below is reached with an empty
     // wait set that only the arm can fill — which is the ordering a dispatcher
     // uses (build the set once, arm timeouts as they come up).
-    match waiter.add(&timer, KEY) {
-        case Ok(_) -> {},
-        case Err(e) -> {
-            print("SOS oneshot: attach failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    try waiter.add(&timer, KEY) catch {
+        print("SOS oneshot: attach failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     // READ THE CLOCK BEFORE ARMING, not after. The deadline is set relative to
@@ -115,13 +109,10 @@ func _start(boot_handle: UInt) {
     let before = now_of(&clock)
 
     // No `interval_ns`, so this is a ONE-SHOT: it fires once and disarms itself.
-    match timer.arm(after_ns: DELAY_NS) {
-        case Ok(_) -> {},
-        case Err(e) -> {
-            print("SOS oneshot: arm failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    try timer.arm(after_ns: DELAY_NS) catch {
+        print("SOS oneshot: arm failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     let _ = system.debug_print("SOS oneshot: parking on a timer\n")
@@ -138,13 +129,10 @@ func _start(boot_handle: UInt) {
     // The one-shot disarmed itself, so the attachment is still in the wait set
     // and still not ready. Arming again is the whole of what it takes to use
     // the same Timer a second time — no detach, no re-attach, no ack.
-    match timer.arm(after_ns: DELAY_NS) {
-        case Ok(_) -> {},
-        case Err(e) -> {
-            print("SOS oneshot: rearm failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    try timer.arm(after_ns: DELAY_NS) catch {
+        print("SOS oneshot: rearm failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let second = try waiter.wait() catch {
         print("SOS oneshot: second wait failed: {}\n", error)

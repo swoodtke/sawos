@@ -109,13 +109,10 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    match child.give(system: move for_child, tag: TAG_BOOT) {
-        case Ok(_) -> {},
-        case Err(e) -> {
-            print("SOS pipechild: give system failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        print("SOS pipechild: give system failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     // THE GIVE CONSUMES THE WRAPPER, so there is no way to post through this end
     // below this line — the funnel disarms the value before the syscall and lets
@@ -131,13 +128,10 @@ func _start(boot_handle: UInt) {
         },
     }
 
-    match child.start(boot_tag: TAG_BOOT) {
-        case Ok(_) -> {},
-        case Err(e) -> {
-            print("SOS pipechild: start failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    try child.start(boot_tag: TAG_BOOT) catch {
+        print("SOS pipechild: start failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let _ = system.debug_print("SOS pipechild: started\n")
 
@@ -159,13 +153,10 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    match waiter.add(&timer, KEY) {
-        case Ok(_) -> {},
-        case Err(e) -> {
-            print("SOS pipechild: attach failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    try waiter.add(&timer, KEY) catch {
+        print("SOS pipechild: attach failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
@@ -183,21 +174,15 @@ func _start(boot_handle: UInt) {
             length = n
             have = true
         } else {
-            match timer.arm(after_ns: PARK_NS) {
-                case Ok(_) -> {},
-                case Err(e) -> {
-                    print("SOS pipechild: arm failed: {}\n", e)
-                    let _ = system.shutdown(EXIT_FAILED)
-                    return
-                },
+            try timer.arm(after_ns: PARK_NS) catch {
+                print("SOS pipechild: arm failed: {}\n", error)
+                let _ = system.shutdown(EXIT_FAILED)
+                return
             }
-            match waiter.wait() {
-                case Ok(_) -> {},
-                case Err(e) -> {
-                    print("SOS pipechild: wait failed: {}\n", e)
-                    let _ = system.shutdown(EXIT_FAILED)
-                    return
-                },
+            try waiter.wait() catch {
+                print("SOS pipechild: wait failed: {}\n", error)
+                let _ = system.shutdown(EXIT_FAILED)
+                return
             }
         }
     }

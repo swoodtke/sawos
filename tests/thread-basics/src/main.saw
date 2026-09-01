@@ -52,8 +52,8 @@ static EXIT_A: UInt = 11
 static EXIT_B: UInt = 22
 
 /// What a failed read reports. Named `UInt` constants rather than bare literals
-/// in the `Err` arms because a bare literal does not adopt the annotated type
-/// through a `match` — see DF-178e.
+/// in the failure defaults, because a bare literal did not adopt the annotated
+/// type through the `match` these reads used to be — see DF-178e.
 static NO_VALUE: UInt = 0
 static NO_STATUS: UInt = 0xFFFF
 
@@ -133,10 +133,7 @@ func initial(boot_handle: UInt) {
 
     // §8's status word, read from inside the process it describes: kind in the
     // high bits, code in the low ones, and a running process reads Running/0.
-    let status: UInt = match proc.get_status() {
-        case Ok(w) -> w,
-        case Err(_) -> NO_STATUS,
-    }
+    let status: UInt = try proc.get_status() catch { NO_STATUS }
     print("SOS threads: two workers, status word {}\n", status)
 
     let _ = a.start()
@@ -144,14 +141,8 @@ func initial(boot_handle: UInt) {
 
     // Both joins: the first parks this thread until A exits, and the second
     // finds B already gone and answers out of its slot.
-    let ra: UInt = match a.join() {
-        case Ok(v) -> v,
-        case Err(_) -> NO_VALUE,
-    }
-    let rb: UInt = match b.join() {
-        case Ok(v) -> v,
-        case Err(_) -> NO_VALUE,
-    }
+    let ra: UInt = try a.join() catch { NO_VALUE }
+    let rb: UInt = try b.join() catch { NO_VALUE }
     print("\nSOS threads: joined a={} b={}\n", ra, rb)
 
     // Process exit, not System shutdown: this is the object the op belongs to

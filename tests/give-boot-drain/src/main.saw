@@ -145,33 +145,24 @@ func _start(boot_handle: UInt) {
     // (design 3 D-5) — so there is no way to touch any of the three below this
     // point: the funnel disarms the value before the syscall and lets it drop.
     // What root gives away it cannot keep.
-    match child.give(system: move for_child, tag: TAG_BOOT) {
-        case Ok(_) -> {},
-        case Err(e) -> {
-            print("SOS givedrain: give system failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        print("SOS givedrain: give system failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     // The two regions the child does not actually need — its image was copied
     // into its RAM at create, and it declines both at the drain. They are here
     // because they are CAPABILITIES: what a launcher furnishes is a matter of
     // config rather than of mechanism, and the drain is what proves the order.
-    match child.give(memory: move image_mem, tag: TAG_IMAGE) {
-        case Ok(_) -> {},
-        case Err(e) -> {
-            print("SOS givedrain: give image failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    try child.give(memory: move image_mem, tag: TAG_IMAGE) catch {
+        print("SOS givedrain: give image failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    match child.give(memory: move dest_mem, tag: TAG_RAM) {
-        case Ok(_) -> {},
-        case Err(e) -> {
-            print("SOS givedrain: give ram failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    try child.give(memory: move dest_mem, tag: TAG_RAM) catch {
+        print("SOS givedrain: give ram failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     print("SOS givedrain: gave {} {} {}\n", TAG_BOOT, TAG_IMAGE, TAG_RAM)
 
@@ -179,13 +170,10 @@ func _start(boot_handle: UInt) {
     // child-side word, puts it in the child's first argument register, and marks
     // that record delivered — so root never sees a child-relative word at any
     // point and the child never meets one twice.
-    match child.start(boot_tag: TAG_BOOT) {
-        case Ok(_) -> {},
-        case Err(e) -> {
-            print("SOS givedrain: start failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    try child.start(boot_tag: TAG_BOOT) catch {
+        print("SOS givedrain: start failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let _ = system.debug_print("SOS givedrain: started\n")
 
@@ -206,29 +194,20 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    match waiter.add(&timer, KEY) {
-        case Ok(_) -> {},
-        case Err(e) -> {
-            print("SOS givedrain: attach failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    try waiter.add(&timer, KEY) catch {
+        print("SOS givedrain: attach failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    match timer.arm(after_ns: PARK_NS) {
-        case Ok(_) -> {},
-        case Err(e) -> {
-            print("SOS givedrain: arm failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    try timer.arm(after_ns: PARK_NS) catch {
+        print("SOS givedrain: arm failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-    match waiter.wait() {
-        case Ok(_) -> {},
-        case Err(e) -> {
-            print("SOS givedrain: wait failed: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+    try waiter.wait() catch {
+        print("SOS givedrain: wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
 
     // **AND ROOT ASKS.** The Process handle root kept is what makes this line
