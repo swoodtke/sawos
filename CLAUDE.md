@@ -46,11 +46,15 @@ The runner is PARALLEL BY DEFAULT — `-j 4`, a user ruling (Sep 1: four
 P-cores, six E-cores; the parallelism tracks the P-cores). The report is
 printed in case-definition order whatever the completion order, so a
 transcript diff reads the same as it always did. `-j 1` is the serial
-harness, kept reachable for exactly that comparison. TWO CASES CARRY
+harness, kept reachable for exactly that comparison. THREE CASES CARRY
 TIMING-DEPENDENT ROWS that move run to run in EITHER mode and that no
-assertion reads: `thread_preempt`'s A/B interleave and its `timer tick`
-lines, and `timer_interval`'s `fires=` counters. Anything else moving in
-a transcript diff is a real finding.
+assertion reads: `thread_preempt`'s A/B interleave, its `timer tick`
+lines and its `interrupts=` count; `timer_interval`'s `fires=` counters;
+and `process_stats`' `interrupts=` count (design 16 — the column is
+printed and never asserted, because a tick lands where the host puts it;
+it happens to read 0 there today, since root takes no tick in user mode
+over so short a run, and a value that is not 0 is not a finding).
+Anything else moving in a transcript diff is a real finding.
 
 ## The suite lock (machine-wide, sawos's own)
 QEMU-suite invocations serialize through a mkdir lock at

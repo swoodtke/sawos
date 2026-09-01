@@ -124,6 +124,27 @@ func _start(boot_handle: UInt) {
     }
     print("SOS isolation: root survived child status={}\n", status)
 
+    // **AND THE SAME HANDLE ANSWERS HOW THE CHILD SPENT ITS LIFE** (sawos design
+    // 16). `syscalls=0 faults=1` is `child-poke`'s whole biography in two
+    // numbers: it holds no handles, so it never reached the kernel through the
+    // syscall door at all, and the ONE trap it took was the store into its
+    // neighbour's memory that the hardware refused. That is the only shape in
+    // which the fault column is ever observable — a faulting process is not
+    // around to ask about itself, so the reader has to be the supervisor whose
+    // handle held the slot open (design 3 D-3).
+    //
+    // It is also the sharp end of the counting rule: a bad SYSCALL is charged to
+    // the syscall column even though it ends the process, because the columns are
+    // keyed by how the machine entered the kernel. `death_fault`'s child asserts
+    // that other half — `syscalls=1 faults=0`, the exact mirror of this line.
+    let cost = try child.stats() catch {
+        print("SOS isolation: stats failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS isolation: child syscalls={} faults={}\n",
+          cost.syscalls, cost.faults)
+
     print("SOS isolation: done\n")
     let _ = proc.exit(EXIT_OK)
 }

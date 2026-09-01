@@ -85,7 +85,7 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    try zero_reply(&inlet, &outlet) catch {
+    try zero_reply(&proc, &inlet, &outlet) catch {
         print("SOS oneshot: zero reply failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
@@ -150,19 +150,38 @@ func round_trip(inlet: &PipeInlet, outlet: &PipeOutlet) -> Result<Void, SosStatu
 /// **A REPLY OF ZERO BYTES IS STILL AN ANSWER** — the `Optional` is what keeps it
 /// apart from "no reply yet", exactly as it keeps a zero-length MESSAGE apart
 /// from an empty ring on the request side (§2.1's data-free option, both ways).
-func zero_reply(inlet: &PipeInlet, outlet: &PipeOutlet) -> Result<Void, SosStatus> {
+/// **AND IT IS THE PHASE THE TRAP COUNT IS TAKEN OVER** (sawos design 16),
+/// because it is the smallest complete exchange in the file: post, take, reply,
+/// resolve, and not one printed byte between the brackets. Every printed byte is
+/// an `ecall`, so a measured window containing a `print` counts the prose.
+func zero_reply(proc: &Process, inlet: &PipeInlet,
+                outlet: &PipeOutlet) -> Result<Void, SosStatus> {
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     msg[0] = 5
 
+    let before = try proc.stats()
     let staged = try inlet.post(body: &msg, len: 1)
     guard var claim = move staged else { return BUG }
     var obligation = try take_one(&outlet, &var buf)
     try obligation.reply(body: &msg, len: 0)
-
     let answered = try claim.resolve(into: &var buf)
+    // The closing read is charged at trap entry like any other, so:
+    //
+    //     delta = post + take + reply + resolve + this read = 4 + 1 = 5
+    //
+    // **NOTHING RELEASES INSIDE THE BRACKET**, which is the other half of the
+    // arithmetic and is why the read sits HERE rather than at the end of the
+    // function: `claim` and `obligation` are owning wrappers, and a wrapper
+    // still holding a live word issues a release when it falls out of scope.
+    // Those releases are traps too — they are just this phase's epilogue rather
+    // than its exchange.
+    let after = try proc.stats()
+
     guard let zero = answered else { return BUG }
     print("SOS oneshot: zero reply len={}\n", zero)
+    print("SOS oneshot: the exchange cost {} traps\n",
+          after.syscalls - before.syscalls)
     return
 }
 

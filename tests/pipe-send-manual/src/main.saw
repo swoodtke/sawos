@@ -156,6 +156,14 @@ func round_trip(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     msg[2] = 78
     msg[3] = 71
 
+    // **THE MEASURED WINDOW OPENS HERE** (sawos design 16). The three calls
+    // below are the whole composition and there is NOTHING else inside the
+    // bracket — no print, no mint, no wrapper falling out of scope — which is
+    // what makes the number arithmetic rather than observation. Every printed
+    // byte is one `ecall`, so a window with a `print` in it would count the
+    // prose instead of the composition.
+    let before = try proc.stats()
+
     // 1. POST. The ring is fresh, so it cannot refuse; the room leg is exercised
     //    on the unserved connection below, where a refusal is arranged.
     let staged = try inlet.post(body: &msg, len: PING_LEN)
@@ -166,10 +174,28 @@ func round_trip(system: &System, proc: &Process) -> Result<Void, SosStatus> {
 
     // 3. WAIT. THIS BLOCKS, and what comes back is the answer itself.
     let woke = try waiter.wait()
+
+    // **AND CLOSES HERE, WITH ITS OWN TRAP INSIDE THE COUNT.** `ktrap` charges
+    // the syscall column at trap entry, ahead of the dispatch, so this reading
+    // includes the call that took it:
+    //
+    //     delta = post + attach + wait + this read = 3 + 1 = 4
+    //
+    // **THE THIRD OF THOSE PARKED, AND THAT IS THE CLAIM.** Root blocked here
+    // while the child was scheduled, woke on its outlet, took the message,
+    // replied, and died — a whole cross-process round trip — and root paid ONE
+    // trap for all of it, because a park is one `ecall` however long it parks
+    // (the wake writes the answer into root's frame; it does not re-enter the
+    // kernel through the door). Until design 16 that was a sentence about the
+    // kernel's source; it is now a number the machine states.
+    let after = try proc.stats()
+
     if woke.key != KEY_CLAIM { return BUG }
     print("SOS sendmanual: reply len={} b={},{},{},{}\n", reply_len(&woke),
           reply_byte(&woke, 0), reply_byte(&woke, 1), reply_byte(&woke, 2),
           reply_byte(&woke, 3))
+    print("SOS sendmanual: the round trip cost {} traps\n",
+          after.syscalls - before.syscalls)
     return
 }
 

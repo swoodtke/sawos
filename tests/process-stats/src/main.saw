@@ -1,0 +1,253 @@
+// SOS design 16: PROCESS STATS — EXACT TRAP INTROSPECTION (sawos design 16,
+// user-ruled Sep 1; spec §2's Process row).
+//
+// **THE MACHINE SAYS THE NUMBER.** Until this unit, "how many traps does this
+// cost" was a question answered by reading kernel source and counting call
+// sites; `ProcessOp.Stats` makes it a value a program can read about itself and
+// about a child. This case is the four claims the ruling asks for, in order:
+//
+//   SOS stats: self delta=9 over 8 probes    an EXACT count, self-inspection
+//   SOS stats: child syscalls=8 faults=0     a DEAD child's, through its handle
+//   SOS stats: interrupts=N                  printed, never asserted
+//   SOS stats: minted without Stats          the right is real
+//   SOS: process fault: access denied        ...and spending it unheld ends you
+//
+// # THE ARITHMETIC, STATED — because every assertion here depends on it
+//
+// **A `stats()` CALL IS ITSELF A SYSCALL, AND IT IS CHARGED BEFORE IT ANSWERS.**
+// `ktrap` counts at trap entry, ahead of the dispatch, so a reading a process
+// takes of itself ALREADY INCLUDES the trap that took it. That is the honest
+// arrangement — a column that excluded its own observer would be wrong by one at
+// exactly the moment anybody looked — and it means a DELTA between two readings
+// carries the second reading's own trap. So:
+//
+//     delta = (work inside the window) + 1
+//
+// and phase 1 below is that equation with the work chosen to be exactly
+// `SELF_PROBES` traps. The `+ 1` is not slack; it is the second `stats()`.
+//
+// **THE WINDOW CONTAINS NO PRINTING, AND THAT IS NOT AN OPTIMIZATION.** Every
+// printed byte is one `ecall` — `System.debug_print` writes a byte per character
+// and freestanding `print` reaches the same seam — so a measured window with a
+// `print` in it counts the prose. The readings BRACKET the window and every
+// report happens outside it, which is design 16's own instruction and the only
+// arithmetic that survives an edit to this file's wording.
+//
+// # WHY THE INTERRUPT ROW IS PRINTED AND NOT ASSERTED
+//
+// A tick lands where the machine puts it. The column is real and worth showing —
+// it is what a userspace `top` would read — but its value is a fact about the
+// host's speed, so asserting it would be asserting the weather. This case
+// therefore carries ONE timing-dependent row by construction, named here, in the
+// runner's case comment and in CLAUDE.md's list beside `thread_preempt`'s and
+// `timer_interval`'s.
+//
+// **AND THE VALUE IS SMALLER THAN A READER EXPECTS, FOR A REASON WORTH KNOWING**:
+// an interrupt taken while the kernel is IDLE never reaches `ktrap` at all. A
+// parked root idles inside `idle_until_runnable`, which POLLS the controller
+// (design 1's preemption machinery) rather than taking a vector — so the column
+// counts interrupts that preempted this process while it was RUNNING, which is
+// exactly what "taken while this process was current" was ruled to mean.
+//
+// # ONE PHASE PER FUNCTION
+//
+// Root's stack grant is 16 KiB and every `print` with format arguments reserves
+// message scratch in ITS OWN frame (design 137), so a `_start` holding every
+// phase holds every phase's scratch at once — which overflowed the grant on the
+// 64-bit profile in design 14 (finding 3). Each phase returns its number and the
+// reports print, one claim per function.
+
+import sos.{System, Process, ProcessStats, ProcessRight, Memory, BootHandle,
+            Waiter, WaitResult, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status the kernel can never hand this program, so meeting it in the error
+/// channel means an assertion in THIS file failed rather than a call did
+/// (`pipe_oneshot`'s vocabulary).
+static BUG: SosStatus = SosStatus.Revoked
+
+/// How many probe traps phase 1 takes inside its measured window.
+///
+/// `get_status` IS THE PROBE because it makes no object, mints no handle,
+/// charges no quota and prints nothing: repeating it moves exactly one number in
+/// the machine, which is the property a measured window needs.
+static SELF_PROBES: Int = 8
+
+/// What phase 1's delta MUST be — the probes above, PLUS ONE for the closing
+/// `stats()` call's own trap. See the header's equation.
+static SELF_DELTA: UInt64 = 9
+
+static_assert(SELF_PROBES + 1 == 9,
+              "the self delta is the probe count plus the closing read's own trap")
+
+/// What `child-stats` costs, exactly: one `process_self`, its own six probes,
+/// one `exit`. Its source states the same sum from the other side.
+static CHILD_SYSCALLS: UInt64 = 8
+
+/// A child that exits on purpose faults zero times, and saying so is the
+/// negative half of the fault column's claim.
+static CHILD_FAULTS: UInt64 = 0
+
+/// The key the child's Process handle is attached under — a number that appears
+/// nowhere else in this transcript.
+static KEY: UInt = 61
+
+/// The tag the child's System handle travels under.
+static TAG_BOOT: UInt = 21
+
+/// What a child of this launcher may ask its System object for. `Transfer` is
+/// the bit `give` checks on the thing being given; everything else is absent BY
+/// SILENCE.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// **THE KEEP MASK FOR THE NEGATIVE ARM, AND `Stats` IS ABSENT BY SILENCE.**
+/// Three bits, reading as the policy design 16 says the right exists to express:
+/// this handle may be handed on, may be narrowed further, and may learn WHETHER
+/// its process is alive — and may not watch it work.
+static NO_STATS: UInt32 = (ProcessRight.Transfer | ProcessRight.Mint
+                           | ProcessRight.Wait)
+
+/// The §8 status word out of a wait record. The other arms panic because this
+/// program attached exactly one thing, so any other kind would mean the kernel
+/// reported an attachment nobody made.
+func status_of(r: &WaitResult) -> UInt {
+    match r.what {
+        case Process(status) -> status,
+        case _ -> panic("this program attached only a Process"),
+    }
+}
+
+/// PHASE 1 — SELF-INSPECTION WITH AN EXACT DELTA.
+///
+/// The two readings bracket a window containing `SELF_PROBES` traps and nothing
+/// else: no print, no allocation, no handle minted or released. So the answer is
+/// arithmetic rather than observation, and a wrong one is a kernel bug rather
+/// than a flaky number.
+func phase_self(proc: &Process) -> Result<UInt64, SosStatus> {
+    let before = try proc.stats()
+
+    var i: Int = 0
+    while i < SELF_PROBES {
+        let _ = try proc.get_status()
+        i = i + 1
+    }
+
+    let after = try proc.stats()
+    // A column that went BACKWARDS would mean the counter was reset under a live
+    // process, which nothing in the kernel does — so it is an assertion, not a
+    // condition.
+    if after.syscalls < before.syscalls {
+        return BUG
+    }
+    return after.syscalls - before.syscalls
+}
+
+/// PHASE 2 — A DEAD CHILD'S COLUMNS, THROUGH THE HANDLE THAT OUTLIVED IT.
+///
+/// The launch is the ordinary one: drain the two boot regions, create, attach
+/// the child's own Process handle to a Waiter, give it a masked System handle,
+/// start it, and park. Nothing else in this machine is armed, so the child's
+/// death is the only thing that can end the wait — which is what makes the plain
+/// `wait()` an assertion in its own right (`death_notify`'s claim, reused).
+///
+/// **THE READ HAPPENS AFTER THE DEATH AND THAT IS THE INTERESTING PART.** A
+/// dead process's slot is held open by whoever still holds a handle onto it
+/// (design 3 D-3), so the counters are still there to read — which is the only
+/// way the `faults` column is ever observable at all, since a faulting process is
+/// not around to ask about itself.
+func phase_child(system: &System, proc: &Process) -> Result<ProcessStats, SosStatus> {
+    var image = try proc.boot_handle_next()
+    var dest = try proc.boot_handle_next()
+    guard let image_mem = image.take_memory() else { return BUG }
+    guard let dest_mem = dest.take_memory() else { return BUG }
+
+    let child = try system.process_create(image: &image_mem, memory: &dest_mem)
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY)
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT)
+    try child.start(boot_tag: TAG_BOOT)
+
+    let record = try waiter.wait()
+    // `Exited`(1) << 16 | 7 — the child's own code, so the wake could not have
+    // come from a fault or from a child that never reached `exit`.
+    if status_of(&record) != 65543 {
+        return BUG
+    }
+
+    // THE COUNTERS OF A PROCESS THAT NO LONGER EXISTS.
+    proc_stats_of(&child)
+}
+
+/// The read, on its own so `phase_child`'s frame does not also hold it.
+func proc_stats_of(child: &Process) -> Result<ProcessStats, SosStatus> {
+    child.stats()
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS stats: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let delta = try phase_self(&proc) catch {
+        print("SOS stats: self phase failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    if delta != SELF_DELTA {
+        print("SOS stats: self delta={} wanted {}\n", delta, SELF_DELTA)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS stats: self delta={} over {} probes\n", delta, SELF_PROBES)
+
+    let child = try phase_child(&system, &proc) catch {
+        print("SOS stats: child phase failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    if child.syscalls != CHILD_SYSCALLS || child.faults != CHILD_FAULTS {
+        print("SOS stats: child syscalls={} faults={} wanted {} and {}\n",
+              child.syscalls, child.faults, CHILD_SYSCALLS, CHILD_FAULTS)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS stats: child syscalls={} faults={}\n",
+          child.syscalls, child.faults)
+
+    // THE TIMING ROW. Printed because the column is real and a reader wants to
+    // see it move; never asserted, because its value is a fact about the host.
+    let seen = try proc.stats() catch {
+        print("SOS stats: final read failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS stats: interrupts={}\n", seen.interrupts)
+
+    // THE NEGATIVE ARM, LAST, because it does not come back. A sibling of root's
+    // own Process handle minted through a mask that never names `Stats` — and
+    // spending a right you were not given is a mistake you could have checked,
+    // which design 178's faults ruling puts outside the status enum entirely.
+    let narrowed = try proc.mint(rights: NO_STATS) catch {
+        print("SOS stats: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS stats: minted without Stats\n")
+    let _ = narrowed.stats()
+
+    // UNREACHABLE: the line above does not return, because the kernel ends this
+    // process at the rights check. Written so the refusal reads as a refusal
+    // rather than as a missing case.
+    let _ = system.debug_print("SOS stats: an unspent right read the counters\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

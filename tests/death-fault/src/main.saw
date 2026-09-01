@@ -113,6 +113,26 @@ func _start(boot_handle: UInt) {
 
     print("SOS deathfault: woke key={} status={}\n",
           record.key, status_of(&record))
+
+    // **AND THE COLUMNS SAY WHICH DOOR THE DEATH CAME THROUGH** (sawos design
+    // 16). `syscalls=1 faults=0` is `child-fault`'s whole life: one `ecall`,
+    // naming handle zero, which the kernel answered by ending it. The trap is
+    // charged to the SYSCALL column even though it killed the process, because
+    // the columns are keyed by how the machine entered the kernel and not by how
+    // the kernel felt about it — which is what keeps `syscalls` predictable at
+    // all, since a caller cannot know in advance which call will be refused.
+    //
+    // `process_isolation` asserts the exact mirror — `syscalls=0 faults=1`, a
+    // child that never reached the syscall door and was stopped by the hardware
+    // — and the two lines together are the whole of the split.
+    let cost = try child.stats() catch {
+        print("SOS deathfault: stats failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS deathfault: child syscalls={} faults={}\n",
+          cost.syscalls, cost.faults)
+
     print("SOS deathfault: done\n")
     let _ = proc.exit(EXIT_OK)
 }

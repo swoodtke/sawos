@@ -400,6 +400,33 @@ public func sos_process_boot_handle_next(handle: UInt, buf: UnsafePointer<UInt>,
                  (&var ignored) as UnsafePointer<UInt>)
 }
 
+/// **READ THIS PROCESS'S TRAP COUNTERS** into `buf` — a copy-out record, because
+/// three 64-bit columns fit no value register on either profile (sawos design
+/// 16). Requires `ProcessRight.Stats`.
+///
+/// `cap` is the buffer's size in BYTES and must be at least
+/// `process_stats_record_bytes()`. The buffer must be doubleword-aligned and
+/// inside this process's writable memory; a buffer that is not TERMINATES the
+/// process, because it is a mistake only the caller could have made.
+///
+/// The record's layout is public: doubleword 0 the SYSCALL count, doubleword 1
+/// the INTERRUPT count, doubleword 2 the FAULT count. Which one is worth
+/// asserting on is `sosabi`'s to say and the short version is: the first is
+/// exact for a given program path, the second moves with the machine, the third
+/// is exact where a fault was provoked on purpose.
+///
+/// **THE COUNTERS BELONG TO THE HANDLE'S PROCESS, NOT TO THE CALLER.** Asking
+/// your own Process handle reads your own; asking a child's reads the child's,
+/// alive or dead. THE CALL ITSELF IS COUNTED before the answer is assembled, so
+/// a self-reading already includes the trap that took it.
+@export("sos_process_stats")
+public func sos_process_stats(handle: UInt, buf: UnsafePointer<UInt64>,
+                              cap: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, ProcessOp.Stats as UInt, buf as UInt, cap, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
+}
+
 /// Accumulate `bits` into an Event. Never blocks. Requires `EventRight.Signal`.
 @export("sos_event_signal")
 public func sos_event_signal(handle: UInt, bits: UInt) -> UInt {

@@ -33,7 +33,10 @@ import sosabi.{SosStatus, SystemOp, ProcessOp, MemoryOp, IoMemoryOp, MINT_OP,
                BOOT_HANDLE_KIND_WORD, BOOT_HANDLE_HANDLE_WORD,
                boot_handle_record_bytes,
                PIPE_CREATE_RECORD_WORDS, PIPE_CREATE_INLET_WORD,
-               PIPE_CREATE_OUTLET_WORD, pipe_create_record_bytes}
+               PIPE_CREATE_OUTLET_WORD, pipe_create_record_bytes,
+               PROCESS_STATS_RECORD_DOUBLEWORDS, PROCESS_STATS_SYSCALLS_SLOT,
+               PROCESS_STATS_INTERRUPTS_SLOT, PROCESS_STATS_FAULTS_SLOT,
+               process_stats_record_bytes}
 
 // And the `sosabi.` qualifier, for the one encoding this module names WITHOUT
 // binding bare: `sosabi.ENTRY_IMAGE`, the sentinel a process passes when it has
@@ -52,7 +55,7 @@ import sosrt.{ascii_byte}
 import sos.floor.{ALL_RIGHTS, call_value, checked, park_system_handle,
                   sos_handle_release, sos_process_boot_handle_next,
                   sos_process_exit, sos_process_give, sos_process_pipe_create,
-                  sos_process_start,
+                  sos_process_start, sos_process_stats,
                   sos_system_debug_print, sos_system_shutdown, sos_waiter_add}
 import sos.memory.{Memory}
 import sos.iomemory.{IoMemory}
@@ -304,6 +307,53 @@ extension System {
 // =============================================================================
 // Process (spec §2, §7, §8; design 178 D4)
 // =============================================================================
+
+/// **WHAT A PROCESS HAS COST THE MACHINE, IN TRAPS** — the answer
+/// `Process.stats()` gives (sawos design 16, user-ruled Sep 1).
+///
+/// THREE COLUMNS AND NOT ONE NUMBER, because the split is what makes any of it
+/// usable. A single total would mix a quantity a program determines with one the
+/// machine determines, so nothing could ever be asserted about it:
+///
+///   `syscalls`    every trap this process took through the syscall
+///                 instruction — one per call, whatever the op, whatever the
+///                 answer, and ONE for a call that parked for a millisecond.
+///                 DETERMINISTIC for a given program path, so this is the column
+///                 a test asserts on.
+///   `interrupts`  every timer or device interrupt taken while this process was
+///                 the running one. It moves with the machine, so PRINT it and
+///                 never assert it.
+///   `faults`      every other exception — an access fault, a misaligned
+///                 access, an illegal instruction. Normally zero, because a
+///                 fault ends the process; the interesting reader is a
+///                 SUPERVISOR holding the dead child's handle.
+///
+/// **A BAD SYSCALL IS A SYSCALL.** Spending a right you were not given ends the
+/// process (design 178's faults ruling), but the trap arrived through the
+/// syscall instruction and the columns are keyed by how the machine entered the
+/// kernel. Keying on the outcome would make `syscalls` unpredictable, since a
+/// caller cannot know in advance which call the kernel will refuse.
+///
+/// **THE READING INCLUDES THE CALL THAT TOOK IT.** `syscalls` is charged at trap
+/// entry, before the op runs, so a process reading its own stats sees the
+/// `stats()` call already counted. That is the honest arrangement — a column
+/// that excluded the observer would be wrong by one at exactly the moment anyone
+/// looked — and it means a DELTA between two readings includes the second
+/// reading's own trap. Subtract the boundary where the window is what you are
+/// measuring, and say so.
+///
+/// PLAIN DATA: three integers, no handle, nothing owned. So it is on the
+/// automatic `Copy` tier and needs no policy — a reading is a fact you took, not
+/// a capability you hold.
+///
+/// `UInt64` ON BOTH PROFILES: a count is a property of the quantity rather than
+/// of the machine, so riscv32 and arm64 answer with the same width. It is the
+/// same rule a nanosecond reading follows.
+public struct ProcessStats {
+    public syscalls: UInt64,
+    public interrupts: UInt64,
+    public faults: UInt64,
+}
 
 /// A handle to a Process — an address-space domain, a handle table and threads.
 ///
@@ -865,6 +915,58 @@ extension Process {
     public func boot_handle_next(&self) -> Result<BootHandle, SosStatus> {
         boot_handle_into_frame(self.handle)
     }
+
+    /// **MINT A SIBLING of this Process handle, narrowed by a KEEP MASK** — the
+    /// universal `MINT_OP`, on `System.mint`'s terms exactly (see it for the
+    /// polarity ruling and the maskable `Mint` bit). Requires
+    /// `ProcessRight.Mint` on THIS handle.
+    ///
+    /// **THE ONE KIND THAT DID NOT HAVE THIS, AND DESIGN 16 IS WHAT NEEDED IT.**
+    /// System, Memory and the four pipe ends each grew a typed `mint` with the
+    /// funnel that wanted one; a Process handle had none because nothing had
+    /// asked to hand out a NARROWED one. `ProcessRight.Stats` is that ask: the
+    /// bit exists to be withheld — "you may learn my child died, and not watch
+    /// it work" — and without this method the withholding would be unwritable at
+    /// the typed tier, which is dead surface by another name.
+    ///
+    /// A launcher supervising a child through a sibling minted here holds
+    /// exactly the authority its mask names, and it is worth noting what the
+    /// mask CANNOT reach: a child derives its OWN Process handle from its System
+    /// handle through `process_self()`, which mints the one default set (see
+    /// `sosabi`'s `process_rights`). So this narrows what a SUPERVISOR may ask
+    /// about a child, not what the child may ask about itself.
+    ///
+    /// A full handle table is `SosStatus.NoResource`. A handle without `Mint`
+    /// TERMINATES the caller.
+    public func mint(&self,
+                     rights: UInt32 = ALL_RIGHTS) -> Result<Process, SosStatus> {
+        let raw = try call_value(self.handle, MINT_OP, rights as UInt, 0, 0)
+        return Process(handle: ProcessHandle(raw))
+    }
+
+    /// **HOW MANY TRAPS THIS PROCESS HAS TAKEN**, split by kind (sawos design
+    /// 16). Requires `ProcessRight.Stats`.
+    ///
+    /// Read `ProcessStats` for what each column counts and which one is worth
+    /// asserting on. The two things to hold in mind at a call site:
+    ///
+    ///   - **The receiver is whose counters come back.** `process_self()` then
+    ///     `stats()` is self-inspection; the same call on a child's handle is
+    ///     supervision, and it reads a DEAD child's columns perfectly well —
+    ///     which is the only way to see the `faults` column move, since a
+    ///     faulting process is not there to ask.
+    ///   - **This call is itself a syscall and is counted before it answers.**
+    ///     A delta between two readings therefore includes the second reading's
+    ///     own trap; subtract that one where the measured window is what
+    ///     matters.
+    ///
+    /// The answer rides the copy-out funnel (`Clock.now`'s) because three 64-bit
+    /// columns fit no value register on either profile. It allocates nothing and
+    /// charges no quota, so there is no `NoResource` path: a correct caller
+    /// meets no failure here at all.
+    public func stats(&self) -> Result<ProcessStats, SosStatus> {
+        process_stats_into_frame(self.handle)
+    }
 }
 
 // **THE FOURTH `Waiter.add` OVERLOAD LIVES HERE, NOT IN `sos.waiter`** — and
@@ -1177,6 +1279,23 @@ func pipe_create_into_frame(handle: ProcessHandle) unsafe -> Result<(PipeInlet, 
     let inlet = PipeInlet(handle: PipeInletHandle(buf[PIPE_CREATE_INLET_WORD]))
     let outlet = PipeOutlet(handle: PipeOutletHandle(buf[PIPE_CREATE_OUTLET_WORD]))
     return (move inlet, move outlet)
+}
+
+/// The `unsafe` half of `Process.stats`, confined to one small named helper
+/// (design 136). The record buffer's address never leaves it.
+///
+/// THE BUFFER IS `[UInt64; N]` AND NOT `[UInt; N]`, which is the one thing that
+/// differs from the two helpers beside it: the columns are counts and a count is
+/// sixty-four bits on both profiles, so the slots `sosabi` publishes are
+/// DOUBLEWORD indices. `sos.clock`'s reading buffer is the precedent, one
+/// doubleword wide.
+func process_stats_into_frame(handle: ProcessHandle) unsafe -> Result<ProcessStats, SosStatus> {
+    var buf: [UInt64; PROCESS_STATS_RECORD_DOUBLEWORDS] = [0; PROCESS_STATS_RECORD_DOUBLEWORDS]
+    try checked(sos_process_stats(handle, (&var buf) as UnsafePointer<UInt64>,
+                                  process_stats_record_bytes() as UInt))
+    return ProcessStats(syscalls: buf[PROCESS_STATS_SYSCALLS_SLOT],
+                        interrupts: buf[PROCESS_STATS_INTERRUPTS_SLOT],
+                        faults: buf[PROCESS_STATS_FAULTS_SLOT])
 }
 
 /// The `unsafe` half of `Process.boot_handle_next`, confined to one small named

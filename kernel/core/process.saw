@@ -209,6 +209,26 @@ public(package) struct ProcessSlot {
     /// now sits ABOVE this module: a Process's readiness and payload are read
     /// out of this table. See `kcore`'s module-order list.
     public(package) attachment: Int,
+    /// **THE THREE TRAP COLUMNS** (sawos design 16), split by the cause class
+    /// `ktrap` decides on: syscall traps, interrupts taken while this process
+    /// was current, and every other exception. `sosabi`'s
+    /// `PROCESS_STATS_RECORD_DOUBLEWORDS` block is the full description of what
+    /// each counts and which one an assertion may read.
+    ///
+    /// **`UInt64` ON BOTH PROFILES, AND THAT IS THE POINT.** A count is a
+    /// property of the quantity rather than of the machine: a `UInt` column
+    /// would be register-wide, so the same program would answer two different
+    /// things about itself depending on which profile it was built for. It is
+    /// the same rule the Clock record follows for a nanosecond count.
+    ///
+    /// THEY LIVE ON THE PROCESS SLOT AND NOT ON THE THREAD SLOT because the
+    /// ruled surface is PER-PROCESS (design 16, user, Sep 1) — per-thread waits
+    /// for a consumer that names it. A thread's traps are its process's, which
+    /// is what makes the count survive the thread and makes a multi-threaded
+    /// process's total the one number a supervisor asked for.
+    public(package) syscalls: UInt64,
+    public(package) interrupts: UInt64,
+    public(package) faults: UInt64,
 }
 
 public(package) unsafe static var PROCESSES: [ProcessSlot; MAX_PROCESSES] = [
@@ -218,7 +238,8 @@ public(package) unsafe static var PROCESSES: [ProcessSlot; MAX_PROCESSES] = [
              grants: [GrantRow(base: 0, top: 0, perms: 0, device: false);
                       MAX_GRANT_ROWS],
              exit_kind: ProcessStatusKind.Running, exit_code: 0,
-             refs: 0, attachment: 0); MAX_PROCESSES]
+             refs: 0, attachment: 0,
+             syscalls: 0, interrupts: 0, faults: 0); MAX_PROCESSES]
 
 /// Take a free process slot, or `NO_PROCESS` when the table is full.
 ///
@@ -926,6 +947,15 @@ public func start_process(entry: UInt, stack_top: UInt,
     PROCESSES[p].exit_kind = ProcessStatusKind.Running
     PROCESSES[p].exit_code = 0
     PROCESSES[p].refs = 0
+    // **THE COLUMNS OPEN AT ZERO** (sawos design 16). Root is reified HERE
+    // rather than through `process_create`, so its columns are zeroed here too —
+    // and the number that matters is what the zero MEANS: the boot-door traps a
+    // harness kernel takes before this line are unattributed by `ktrap`, so
+    // nothing has been counted against slot 0 yet and this is a statement rather
+    // than a discard.
+    PROCESSES[p].syscalls = 0
+    PROCESSES[p].interrupts = 0
+    PROCESSES[p].faults = 0
 
     // **THE LEDGER OPENS BEFORE THE FIRST MINT** (sawos design 7 D-3), because
     // `mint_handle` consults the handle row and a slot with no limits installed

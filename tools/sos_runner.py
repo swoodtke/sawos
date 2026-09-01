@@ -395,6 +395,13 @@ CHILD_SERVER_PKG = os.path.join(TESTS_DIR, "child-server")
 PIPE_NO_WAIT_PKG = os.path.join(TESTS_DIR, "pipe-no-wait")
 PIPE_BAD_MODE_PKG = os.path.join(TESTS_DIR, "pipe-bad-mode")
 
+# sawos design 16: EXACT TRAP INTROSPECTION. One root and one child, and the
+# child is the unusual one — it prints NOTHING. Every printed byte is an `ecall`,
+# so a talking child has a syscall count that is a hash of its own prose, and the
+# whole point of the case is that its launcher asserts the exact number.
+PROCESS_STATS_PKG = os.path.join(TESTS_DIR, "process-stats")
+CHILD_STATS_PKG = os.path.join(TESTS_DIR, "child-stats")
+
 CLOCK_BASICS_PKG = os.path.join(TESTS_DIR, "clock-basics")
 TIMER_ONESHOT_PKG = os.path.join(TESTS_DIR, "timer-oneshot")
 TIMER_INTERVAL_PKG = os.path.join(TESTS_DIR, "timer-interval")
@@ -1032,6 +1039,14 @@ TEST_CASES = [
         # the two threads at least three times, whoever went first — and a run
         # with no preemption at all reads `AAAAAAAABBBBBBBB`, which has one `AB`
         # in it and no `BA` after it.
+        #
+        # **AND IT PRINTS THE INTERRUPT COLUMN, UNASSERTED** (sawos design 16).
+        # This is the one case in the tree whose whole point is that ticks land
+        # in user mode, so it is the one place the column has something to show —
+        # every alternation above is one of them. The row is NOT in the list
+        # below, deliberately: a tick lands where the host puts it, so asserting
+        # the number would be asserting the weather. It joins the two
+        # timing-dependent rows this case already carries.
         "expect_out": ["SOS M2: preemptive kernel up on",
                        "AB", "BA", "AB",
                        "SOS preempt: joined a=33 b=44"],
@@ -1697,6 +1712,16 @@ TEST_CASES = [
                        "events={zero} waiters={zero} interrupts={zero} "
                        "timers={zero} process={one}",
                        "SOS isolation: root survived child status=131072",
+                       # **THE SWEEP ROW** (sawos design 16), and it is
+                       # `child-poke`'s whole biography in two numbers: it holds
+                       # no handles, so it never reached the kernel through the
+                       # syscall door at all, and the ONE trap it took was the
+                       # store the hardware refused. This is the only shape in
+                       # which the fault column is observable — a faulting
+                       # process cannot ask about itself, so the reader is the
+                       # supervisor whose handle held the slot open (design 3
+                       # D-3). `death_fault` asserts the exact mirror.
+                       "SOS isolation: child syscalls=0 faults=1",
                        "SOS isolation: done"],
         "expect_clean_exit": True,
     },
@@ -2566,6 +2591,15 @@ TEST_CASES = [
                        "events={zero} waiters={zero} interrupts={zero} "
                        "timers={zero} process={one}",
                        "SOS deathfault: woke key=45 status=131073",
+                       # **THE SWEEP ROW** (sawos design 16), and it is the
+                       # mirror of `process_isolation`'s. `child-fault` made ONE
+                       # `ecall`, naming handle zero, and the kernel ended it —
+                       # so the trap is charged to the SYSCALL column even though
+                       # it killed the process. The columns are keyed by how the
+                       # machine entered the kernel, not by how the kernel felt
+                       # about it, which is what keeps `syscalls` predictable: a
+                       # caller cannot know in advance which call gets refused.
+                       "SOS deathfault: child syscalls=1 faults=0",
                        "SOS deathfault: done"],
         "expect_clean_exit": True,
     },
@@ -3110,6 +3144,15 @@ TEST_CASES = [
                        "SOS oneshot: pending is none",
                        "SOS oneshot: reply len=2 b=90,89",
                        "SOS oneshot: zero reply len=0",
+                       # **THE SWEEP ROW** (sawos design 16): the smallest
+                       # complete exchange in the file, counted. Post, take,
+                       # reply, resolve — four ops — plus ONE for the closing
+                       # `stats()` call, which `ktrap` charges at trap entry
+                       # before the op answers. The bracket contains no printing
+                       # (a printed byte is an `ecall`) and no wrapper falling
+                       # out of scope (a release is an `ecall` too), which is
+                       # what makes five arithmetic rather than observation.
+                       "SOS oneshot: the exchange cost 5 traps",
                        "SOS oneshot: fifo replies a=11 b=22 c=33",
                        "SOS oneshot: depth with one in flight=15",
                        "SOS oneshot: depth settled=16",
@@ -3427,6 +3470,19 @@ TEST_CASES = [
                        "events={zero} waiters={one} interrupts={zero} "
                        "timers={zero} process={one}",
                        "SOS sendmanual: reply len=4 b=80,79,78,71",
+                       # **THE SWEEP'S HEADLINE ROW** (sawos design 16). The
+                       # composition a caller writes by hand is post, attach,
+                       # wait — THREE ops — and the fourth trap is the closing
+                       # `stats()` call, charged at trap entry before it answers.
+                       # What the number says is the thing the ruled surface has
+                       # always claimed and could never demonstrate: the WAIT
+                       # parked, a whole cross-process round trip happened
+                       # underneath it (the child was scheduled, woke on its
+                       # outlet, took, replied and died), and root paid ONE trap
+                       # for all of it — a park is one `ecall` however long it
+                       # parks, because the wake writes the answer into the
+                       # parked frame rather than re-entering through the door.
+                       "SOS sendmanual: the round trip cost 4 traps",
                        "SOS sendmanual: filled=16 then room says there is space",
                        "SOS sendmanual: timed out",
                        "SOS sendmanual: after cancel the other end of this "
@@ -3476,6 +3532,64 @@ TEST_CASES = [
                        "SOS badmode: asking for flags 4",
                        "SOS: process fault: argument outside its domain "
                        "process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # **EXACT TRAP INTROSPECTION** (sawos design 16, user-ruled Sep 1). The
+        # design's dedicated proof, and the four rows below are its four claims.
+        #
+        # **`self delta=9 over 8 probes` IS ARITHMETIC, NOT OBSERVATION.** Root
+        # brackets a window containing exactly eight `get_status` traps and
+        # NOTHING else — no print, no mint, no allocation — and the delta is nine
+        # because the closing `stats()` is itself a syscall and `ktrap` charges it
+        # at trap entry, ahead of the dispatch. The `+ 1` is that call. The window
+        # is print-free on purpose: every printed byte is one `ecall`, so a
+        # measured window containing a `print` counts the prose and the assertion
+        # would break on a wording change rather than on a kernel change.
+        #
+        # **`child syscalls=8 faults=0` IS READ AFTER THE CHILD IS DEAD.** The
+        # handle root created the child with outlives it (design 3 D-3 holds the
+        # slot open while anything names it), so the columns are still there —
+        # which is the only way the fault column is ever observable at all, since
+        # a faulting process is not around to ask about itself. Eight is
+        # `child-stats`' whole life: one `process_self`, six probes, one `exit`,
+        # and that child prints NOTHING precisely so the number is not a hash of
+        # its own prose. Zero faults is the negative half of the same claim.
+        #
+        # **`interrupts=` IS THE ONE TIMING-DEPENDENT ROW IN THIS CASE and it is
+        # deliberately NOT asserted** — a tick lands where the host puts it, so
+        # asserting the value would be asserting the weather. It is printed
+        # because the column is real and a reader wants to see what a userspace
+        # `top` would read. The value is smaller than a reader expects, and the
+        # reason is worth knowing: an interrupt taken while the kernel is IDLE
+        # never reaches `ktrap`, because a parked root idles in `idle_until_
+        # runnable`, which POLLS the controller rather than taking a vector. The
+        # column counts interrupts that preempted this process while it was
+        # RUNNING, which is what the ruling's "taken while this process was
+        # current" means.
+        #
+        # **AND THE LAST TWO ROWS ARE THE RIGHT BEING REAL.** Root mints a
+        # sibling of its own Process handle through a mask naming `Transfer |
+        # Mint | Wait` and never `Stats` — "you may learn whether this process is
+        # alive, and you may not watch it work", which is the whole reason the
+        # authority is a bit of its own rather than a second use of `Wait`. The
+        # read through it is `AccessDenied`, and it is a FAULT rather than a
+        # status because a process knows which rights it holds (design 178's
+        # faults ruling). So this case ends the way `pipe_no_post` and
+        # `pipe_no_wait` end.
+        "name": "process_stats",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PROCESS_STATS_PKG,
+        "children": [CHILD_STATS_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS stats: self delta=9 over 8 probes",
+                       "SOS: process exit: code={seven} process={one}",
+                       "SOS stats: child syscalls=8 faults=0",
+                       "SOS stats: minted without Stats",
+                       "SOS: process fault: access denied process={zero}",
                        "SOS: process teardown handles="],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,

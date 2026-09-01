@@ -1,0 +1,61 @@
+// SOS CHILD: A PROCESS WHOSE TRAP COUNT IS KNOWN IN ADVANCE (sawos design 16).
+//
+// **IT SAYS NOTHING, AND THE SILENCE IS THE POINT.** Every printed byte is one
+// `ecall` — `System.debug_print` writes a byte per character and freestanding
+// `print` goes to the same seam — so a child that talks has a syscall count that
+// is a hash of its own prose. Its launcher asserts the exact number, and an
+// assertion that a future wording change would break is not an assertion; it is
+// a trap. So this program prints not one byte, and what it is doing is visible
+// instead in the two facts its launcher reads back: the §8 exit code it chose,
+// and the trap count that could only have come from the sequence below.
+//
+// THE SEQUENCE, AND THE ARITHMETIC ITS LAUNCHER STATES:
+//
+//   1                 `process_self` — the derive every process starts with
+//   PROBES            `get_status` calls, each exactly one trap and nothing else
+//   1                 `exit`, which is charged at trap entry and never returns
+//   ------
+//   PROBES + 2        = `CHILD_SYSCALLS` in the launcher, and it is asserted
+//
+// `get_status` IS THE PROBE FOR A REASON: it makes no object, mints no handle,
+// charges no quota and writes nothing, so repeating it changes exactly one
+// number in the machine. An `event_create` loop would have counted the same and
+// would also have moved the teardown row the launcher's transcript asserts.
+//
+// **NOTHING HERE COUNTS THE FAULT COLUMN**, because this child dies on purpose
+// and cleanly: `faults` stays zero and the launcher asserts that too, which is
+// the negative half of the same claim. The case that moves that column is
+// `process_isolation`, where a child stores into its neighbour's memory and the
+// hardware answers.
+
+import sos.{System}
+
+/// How many probe traps to take between the derive and the exit. The value is
+/// arbitrary; what matters is that it is FIXED and that the launcher's
+/// `CHILD_SYSCALLS` is this plus two.
+static PROBES: Int = 6
+
+/// The code this child ends with — distinctive, so the launcher's status word
+/// could not have been produced by any other ending in this tree.
+static EXIT_CODE: UInt = 7
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        // There is nothing to exit WITH and nothing to say it on. Returning
+        // from the entry faults this process, so the launcher reads `Faulted`
+        // where it expected `Exited` — a wrong answer that says so.
+        return
+    }
+
+    // THE MEASURED SEQUENCE. Every line below is exactly one trap.
+    var i: Int = 0
+    while i < PROBES {
+        let _ = proc.get_status()
+        i = i + 1
+    }
+
+    let _ = proc.exit(EXIT_CODE)
+}

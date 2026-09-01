@@ -78,6 +78,8 @@ import sosabi.{
     pipe_create_record_bytes,
     PIPE_TAKE_RECORD_WORDS,
     pipe_take_record_bytes,
+    PROCESS_STATS_RECORD_DOUBLEWORDS,
+    process_stats_record_bytes,
     SosStatus,
     FaultReason,
     ProcessStatusKind,
@@ -594,6 +596,26 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             }
             pipe_create(obj.slot, p, arg0, arg1)
         },
+        // **THE INTROSPECTION OP** (sawos design 16). It is asked of the process
+        // being OBSERVED — `obj.slot` is whose columns come back, and the caller
+        // `p` is only whose buffer they are written into — so self-inspection is
+        // `ProcessSelf` followed by this call and supervision is the same call
+        // on a child's handle, with nothing said twice.
+        //
+        // `arg0` is the answer buffer and `arg1` its capacity: three 64-bit
+        // columns do not fit a value register on either profile, so the answer
+        // rides the copy-out funnel `Clock.Now` opened.
+        //
+        // **IT READS A `Gone` SLOT PERFECTLY WELL, AND THAT IS THE POINT OF THE
+        // `faults` COLUMN.** A process that faulted is dead and cannot ask; its
+        // slot survives while a handle names it (design 3 D-3), so the
+        // supervisor holding that handle is who reads the one that moved.
+        case Stats -> {
+            if not obj.allows(ProcessRight.Stats) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            process_stats(p, obj.slot, arg0, arg1)
+        },
     }
 }
 
@@ -741,6 +763,13 @@ func process_create(p: Int, image_handle: UInt,
     // zero and never reclaims — but the reset is where a reader looks to find
     // that out.
     PROCESSES[slot].attachment = 0
+    // **THE COLUMNS OPEN AT ZERO** (sawos design 16), and this slot may be a
+    // RECLAIMED one (design 3 D-3) — so this is the line that keeps a child from
+    // inheriting its predecessor's traffic and reading a first `stats()` that
+    // describes a program it never was.
+    PROCESSES[slot].syscalls = 0
+    PROCESSES[slot].interrupts = 0
+    PROCESSES[slot].faults = 0
 
     // **THE CHILD'S LEDGER OPENS HERE, AFTER `place_image`** (sawos design 7
     // D-3), and the order is what the mapping row needs: `free_rows` is what
@@ -1092,6 +1121,62 @@ func boot_handle_next(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
         fault_process(p, why)
     }
     BOOT_HANDLE_NEXT[p] = cursor + 1
+    op_ok()
+}
+
+/// The record `Process.Stats` answers with, in kernel memory (sawos design 16).
+///
+/// Declaration order IS the layout (design 58), so the fields here and the
+/// doubleword indices `sosabi` publishes are one description — pinned by the
+/// assert below rather than by agreement, exactly as the clock reading is.
+struct ProcessStatsRecord {
+    syscalls: UInt64,
+    interrupts: UInt64,
+    faults: UInt64,
+}
+
+static_assert(sizeof<ProcessStatsRecord>()
+              == PROCESS_STATS_RECORD_DOUBLEWORDS * sizeof<UInt64>(),
+              "the stats record must be exactly the doublewords sosabi publishes")
+
+/// Copy `target`'s three trap columns into `p`'s buffer (sawos design 16).
+///
+/// **TWO PROCESSES, AND THE ASYMMETRY IS THE WHOLE OP.** `target` is whose
+/// counters are read — the handle's slot, so a supervisor asking about a child
+/// names the child — and `p` is whose memory the answer lands in, which is
+/// always the caller. Nothing but the copy door consults `p`, which is what
+/// makes the self case and the supervision case one function.
+///
+/// **IT COSTS NOTHING TO ANSWER AND ALLOCATES NOTHING**, which is why no quota
+/// row is charged and no `NoResource` path exists: the columns are already on
+/// the slot, and the record is built on the kernel's own stack. So the only
+/// failures a correct caller can meet are the copy door's, and those terminate
+/// (a buffer outside your own writable memory is a mistake only you could have
+/// made).
+///
+/// **THE CALL ITSELF IS COUNTED, AND IT IS COUNTED BEFORE THIS RUNS.** `ktrap`
+/// charges the syscall column at trap entry, so a reading taken by the process
+/// it describes ALREADY INCLUDES the trap that took it. That is the honest
+/// arrangement — the alternative would be a column that undercounts by one at
+/// exactly the moment anyone looks — and it is why every assertion in the suite
+/// states its arithmetic: a delta measured between two `stats()` calls counts
+/// the second call itself, so the boundary is subtracted where the window is
+/// what is being measured.
+func process_stats(p: Int, target: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
+    // A capacity below the record's size is an argument outside its domain —
+    // the size is published, so the caller could have checked. `Clock.Now`'s
+    // rule, and the same diagnostic.
+    if cap < (process_stats_record_bytes() as UInt) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    var rec = ProcessStatsRecord(syscalls: PROCESSES[target].syscalls,
+                                 interrupts: PROCESSES[target].interrupts,
+                                 faults: PROCESSES[target].faults)
+    if let why = copy_out(p, dst,
+                          ((&var rec) as UnsafePointer<ProcessStatsRecord>) as UInt,
+                          process_stats_record_bytes() as UInt) {
+        fault_process(p, why)
+    }
     op_ok()
 }
 
@@ -3390,6 +3475,62 @@ func dispatch(handle: UInt, op: UInt,
 // The trap handler
 // =============================================================================
 
+/// Which stats column a trap lands in — the cause class `ktrap` decides on,
+/// named (sawos design 16).
+///
+/// AN ENUM RATHER THAN THREE COUNTER FUNCTIONS, and the reason is the
+/// attribution rather than the tidiness: the "which process, and is there one"
+/// question below must have exactly one answer in the kernel, and three bodies
+/// would be three places to get the boot-door case wrong. The house rule points
+/// the same way (design 145/153: a closed named set of values is an enum).
+///
+/// NOT BACKED, because these numbers cross nothing: the column INDICES that do
+/// cross are `sosabi`'s `PROCESS_STATS_*_SLOT`, and this enum never meets them.
+enum TrapKind {
+    case Syscall,
+    case Interrupt,
+    case Fault,
+}
+
+/// Charge one trap to the process that was running when it arrived (sawos
+/// design 16).
+///
+/// **THE ATTRIBUTION IS `CURRENT_THREAD`'s PROCESS, READ AT TRAP ENTRY**, which
+/// is what makes every column mean the same thing: a syscall is charged to the
+/// process that issued it even when the op switches to another, and an interrupt
+/// is charged to the process it preempted rather than to whoever the reschedule
+/// picks.
+///
+/// **A TRAP WITH NO CURRENT THREAD IS UNATTRIBUTED, AND THAT IS THE BOOT DOOR.**
+/// `calling_process()` answers `ROOT_PROCESS` for that case — the right answer
+/// for a syscall's dispatch, where the harness kernels that enter user mode with
+/// no object model still have to be served — and the WRONG one here, because
+/// charging root for traps taken before root was reified would make its opening
+/// count a number nobody could predict. So this reads the thread word itself and
+/// counts nothing when there is none. Nothing is lost: `start_process` is the
+/// only door into user mode and it installs a thread before it opens, so the
+/// unattributed set is empty in every image the suite builds — the guard is what
+/// keeps it empty rather than what compensates for it.
+///
+/// **AN INTERRUPT TAKEN AT THE IDLE POLL OR A PREEMPTION POINT IS NOT A TRAP AND
+/// IS NOT COUNTED.** Those arrive through `irq_poll` inside the kernel (design 1
+/// D-1), never through a vector, so they never reach this function — which is
+/// exactly right for a column that means "interrupts taken while this process
+/// was current", since at both of those sites no process was.
+func count_trap(kind: TrapKind) unsafe {
+    if CURRENT_THREAD == NO_THREAD {
+        return
+    }
+    let p = THREADS[CURRENT_THREAD].process
+    match kind {
+        case Syscall -> { PROCESSES[p].syscalls = PROCESSES[p].syscalls + 1 },
+        case Interrupt -> {
+            PROCESSES[p].interrupts = PROCESSES[p].interrupts + 1
+        },
+        case Fault -> { PROCESSES[p].faults = PROCESSES[p].faults + 1 },
+    }
+}
+
 /// The HAL's landing point for every trap taken from user mode. `frame_addr`
 /// addresses the saved context, which this handler may rewrite: a returning
 /// syscall leaves its (status, value) pair where the caller reads them and
@@ -3414,16 +3555,39 @@ func dispatch(handle: UInt, op: UInt,
 /// it ends the process rather than handing back a word to branch on. What is
 /// left as a STATUS is what the caller could not have known — a full slab, and
 /// later a dead peer.
+///
+/// **AND THAT THREE-WAY ORDER IS WHY THE STATS COLUMNS ARE COUNTED HERE**
+/// (sawos design 16). The cause class is decided exactly once in the system, at
+/// this function's head, before anything is dispatched — so the column is a
+/// by-product of a decision the handler was already making, and there is no
+/// second site to keep in step. One increment per trap, never two: the three
+/// branches below are mutually exclusive and each charges before it commits to
+/// its path.
 @export("ktrap")
 public func ktrap(frame_addr: UInt, cause: UInt, tval: UInt) unsafe -> UInt {
     if hal.is_interrupt(cause) {
+        count_trap(TrapKind.Interrupt)
         service_irq(frame_addr, cause)
         return pick_next(frame_addr)
     }
 
     if not hal.is_syscall(cause) {
+        // CHARGED BEFORE THE REPORT, because the report does not return: the
+        // process is ended by `fault_trap` and its slot lives on as `Gone` for
+        // whoever holds a handle onto it, so this increment is exactly what
+        // lets a supervisor read how its child died AND that it faulted once.
+        count_trap(TrapKind.Fault)
         fault_trap(hal.cause_tag(cause), cause, hal.trap_pc(frame_addr), tval)
     }
+
+    // CHARGED BEFORE THE DISPATCH, so a call that never comes back is counted
+    // the same as one that does. That covers the three interesting cases at
+    // once: an op that PARKS is one syscall however long it parks (the wake
+    // writes the pair, it does not re-enter here), an op that ENDS the process
+    // (`Exit`, and every caller-checkable refusal the faults ruling terminates
+    // on) is counted against the process that made it, and an op that switches
+    // to a different process is charged to the one that asked.
+    count_trap(TrapKind.Syscall)
 
     let result = dispatch(hal.syscall_handle(frame_addr),
                           hal.syscall_op(frame_addr),

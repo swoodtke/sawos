@@ -660,6 +660,20 @@ static_assert((SystemRight.ProcessSelf as UInt32) >= (1 << 8),
 /// handle entries, its quota row), so the authority to make one flows through
 /// the handle that is charged — §3's derivation rule rather than a new mechanism
 /// beside it.
+///
+/// **`Stats` IS DESIGN 16's BIT, AND IT IS AN AUTHORITY TO OBSERVE** (sawos
+/// design 16, user-ruled Sep 1). It gates `ProcessOp.Stats` — a per-kind right
+/// named for its op, the Aug-29 doctrine — and it is worth saying what makes
+/// reading three counters worth a bit of its own rather than riding `Wait`, the
+/// other observation bit. `Wait` answers §8's status word, which is a fact about
+/// whether the process is ALIVE; this answers how many traps it has taken, which
+/// is a fact about what it has been DOING. A supervisor that may learn a child
+/// died need not be able to watch it work, and the separation costs one bit.
+///
+/// It joins the ONE default set below on the terms every other kind-specific bit
+/// joined it on: self-inspection has to compose for free (`ProcessSelf` ->
+/// `proc.stats()`, which is the whole point of the op), and attenuating it away
+/// from a child is a launcher's keep mask rather than a second default list.
 public enum ProcessRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
@@ -675,6 +689,7 @@ public enum ProcessRight: UInt32 {
     case Give = 1 << 17,
     case Map = 1 << 18,
     case PipeCreate = 1 << 19,
+    case Stats = 1 << 20,
 }
 
 static_assert((ProcessRight.Transfer as UInt32) == (1 << 0),
@@ -705,6 +720,8 @@ static_assert((ProcessRight.Map as UInt32) >= (1 << 8),
               "kind-specific right Map must start at bit 8 or above")
 static_assert((ProcessRight.PipeCreate as UInt32) >= (1 << 8),
               "kind-specific right PipeCreate must start at bit 8 or above")
+static_assert((ProcessRight.Stats as UInt32) >= (1 << 8),
+              "kind-specific right Stats must start at bit 8 or above")
 
 /// A right on a Thread object (§2 table row; design 178 D4).
 ///
@@ -1327,8 +1344,8 @@ public func root_system_rights() -> UInt32 {
 ///
 /// WHAT IS IN IT, all of it named for the op it gates: `ThreadCreate`,
 /// `ThreadSelf`, `Exit`, `Wait`, `EventCreate`, `WaiterCreate`, `InterruptBind`,
-/// `Start`, `BootHandles`, `Give`, `Map` (M3 unit 4), plus the two universal
-/// bits `Transfer` and `Mint`.
+/// `Start`, `BootHandles`, `Give`, `Map` (M3 unit 4), `PipeCreate` (M4 unit 1),
+/// `Stats` (design 16), plus the two universal bits `Transfer` and `Mint`.
 ///
 /// TWO BITS READ ODDLY ON ROOT'S OWN HANDLE and are harmless there, which is the
 /// price of one list. `Start` on a process that is already `Running` is the
@@ -1360,6 +1377,7 @@ public func process_rights() -> UInt32 {
      | (ProcessRight.BootHandles as UInt32) | (ProcessRight.Give as UInt32)
      | (ProcessRight.Map as UInt32)
      | (ProcessRight.PipeCreate as UInt32)
+     | (ProcessRight.Stats as UInt32)
      | (ProcessRight.Transfer as UInt32) | (ProcessRight.Mint as UInt32))
 }
 
@@ -1752,6 +1770,21 @@ public enum SystemOp: UInt {
 /// which is what makes a launcher able to hand the inlet to one child and the
 /// outlet to another with the launch flow unchanged.
 ///
+/// **`Stats` IS THE INTROSPECTION OP** (sawos design 16, user-ruled Sep 1), and
+/// it takes the next number rather than displacing one — §5.7's renumberable-op
+/// discipline says it may, and appending is what keeps every existing table row
+/// where it was. It answers through a COPY-OUT record for the reason `PipeCreate`
+/// and `Clock.Now` do: one op returns one word and the answer is three 64-bit
+/// columns.
+///
+/// **THE THREE COLUMNS ARE SPLIT BY TRAP KIND BECAUSE THE SPLIT IS WHAT MAKES
+/// ASSERTIONS POSSIBLE.** A single "traps" number would be the sum of a
+/// deterministic quantity and a timing-dependent one, so no test could ever
+/// assert it; separated, `syscalls` is exact for a given program path (a park is
+/// ONE ecall however long it parks) and `interrupts` is the one that moves.
+/// `faults` is exact where a test provokes one on purpose. See
+/// `PROCESS_STATS_RECORD_DOUBLEWORDS` for the layout and the attribution rule.
+///
 /// Absent, with reasons: `Kill` (see `ProcessRight`).
 public enum ProcessOp: UInt {
     case ThreadCreate = 0,
@@ -1765,6 +1798,7 @@ public enum ProcessOp: UInt {
     case BootHandleNext = 8,
     case Give = 9,
     case PipeCreate = 10,
+    case Stats = 11,
 }
 
 /// Whether `ProcessOp.Start`'s SECOND argument carries a boot tag — the op's
@@ -2195,7 +2229,7 @@ public enum PipeRequestOp: UInt {
 // failing as a release or a mint that quietly ran somebody's op.
 static_assert((SystemOp.ProcessCreate as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
-static_assert((ProcessOp.PipeCreate as UInt) < MINT_OP,
+static_assert((ProcessOp.Stats as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
 static_assert((ThreadOp.Yield as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
@@ -2967,6 +3001,75 @@ public static PIPE_TAKE_REQUEST_WORD: Int = 1
 /// the op. A FUNCTION for `pipe_create_record_bytes`' reason (DF-178f).
 public func pipe_take_record_bytes() -> Int {
     PIPE_TAKE_RECORD_WORDS * sizeof<UInt>()
+}
+
+// =============================================================================
+// The process-stats record (spec §2's Process row; sawos design 16)
+// =============================================================================
+//
+// **DOUBLEWORDS, NOT MACHINE WORDS, AND THE CLOCK RECORD'S REASON IS THIS
+// RECORD'S REASON**: a COUNT is a property of the quantity, not of the machine.
+// A 32-bit column on riscv32 would wrap after four billion traps and a 64-bit
+// one on arm64 would not, so the same program would answer two different things
+// about itself depending on which profile it was built for. Sixty-four bits on
+// both, exactly as a nanosecond count is.
+//
+// **WHAT EACH COLUMN COUNTS, AND WHICH ONE A TEST MAY ASSERT.** The split is by
+// the CAUSE CLASS the trap entry decides on (`ktrap`'s own three-way order),
+// which is why it is the split that makes the numbers useful:
+//
+//   `syscalls`    every trap the process took through the syscall instruction —
+//                 one per `ecall`/`svc`, whatever the op, whatever the answer,
+//                 and ONE for a call that parked for a millisecond. So it is
+//                 EXACT for a given program path and it is the column an
+//                 assertion should read.
+//   `interrupts`  every timer or device interrupt taken while this process was
+//                 the current one. NONDETERMINISTIC by construction — the tick
+//                 lands where it lands — so it is printed and never asserted,
+//                 the timing-rows doctrine at a smaller scale.
+//   `faults`      every other exception: an access fault, a misaligned access,
+//                 an illegal instruction. Exact where a test provokes one on
+//                 purpose, and normally zero, because a fault ends the process
+//                 (§8) — so the interesting reader is a SUPERVISOR holding the
+//                 dead child's handle, not the process itself.
+//
+// **A BAD SYSCALL COUNTS AS A SYSCALL AND NOT AS A FAULT.** A word naming no
+// handle, an op the object does not have, a right that was not given: each of
+// those ENDS the process (design 178's faults ruling), but the trap that carried
+// it arrived through the syscall instruction, and this record's columns are keyed
+// by how the machine entered the kernel rather than by how the kernel felt about
+// it. Keying on the outcome instead would make `syscalls` un-assertable, because
+// a caller cannot know in advance which of its calls the kernel will refuse.
+//
+// **ATTRIBUTION IS TO THE PROCESS CURRENT AT TRAP ENTRY**, decided before
+// anything is dispatched, so a syscall that switches processes is charged to the
+// one that made it and an interrupt that preempts is charged to the one that was
+// running. Traps taken through the BOOT DOOR, before any process exists, are
+// UNATTRIBUTED — the harness kernels that enter user mode with no object model
+// have a running program and no process slot, and there is nowhere honest to put
+// their count. `ktrap` says so at the site.
+//
+// **THE COLUMNS ZERO AT PROCESS CREATE**, both at root's boot-time reification
+// and at `SystemOp.ProcessCreate`, so a reused slot never inherits its
+// predecessor's traffic.
+
+/// Doublewords in a `Process.Stats` answer: syscalls, interrupts, faults.
+public static PROCESS_STATS_RECORD_DOUBLEWORDS: Int = 3
+
+/// Where each column sits. Named rather than written, on both sides of the
+/// boundary. The ORDER is the order the paragraph above reads them in, which is
+/// also assertable-first.
+public static PROCESS_STATS_SYSCALLS_SLOT: Int = 0
+public static PROCESS_STATS_INTERRUPTS_SLOT: Int = 1
+public static PROCESS_STATS_FAULTS_SLOT: Int = 2
+
+/// Bytes in a `Process.Stats` record — the minimum capacity a caller must give
+/// the op, and what the kernel checks the buffer against.
+///
+/// A FUNCTION AND NOT A `static` for the reason `wait_record_bytes` gives:
+/// `sizeof<T>()` does not fold in a static initializer (DF-178f).
+public func process_stats_record_bytes() -> Int {
+    PROCESS_STATS_RECORD_DOUBLEWORDS * sizeof<UInt64>()
 }
 
 // =============================================================================
