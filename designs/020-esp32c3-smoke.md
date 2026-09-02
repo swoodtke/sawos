@@ -489,6 +489,29 @@ VERDICT: ecall from U-mode (region was reachable)
 C3PROBE6 end
 ```
 
+## The gate
+
+`make sos-test` at the base commit (`ca60dd2`) and again on this
+branch's commit, both under the machine-wide suite lock:
+
+```
+ALL SOS TESTS PASSED (222 passed across riscv32 + arm64)
+```
+
+111 cases per architecture, both runs, exit 0. **The two transcripts
+are BYTE-IDENTICAL — `diff` reports nothing at all**, including the
+three cases whose timing-dependent rows are licensed to move
+(`thread_preempt`'s A/B interleave, `timer` tick lines and
+`interrupts=`; `timer_interval`'s `fires=`; `process_stats`'
+`interrupts=`). They were free to move and happened not to; the
+requirement was only that nothing ELSE move, and nothing did.
+
+That is the expected result and the reason it is worth stating: this
+branch adds two files and edits two more, all of them documentation,
+and touches no code the gate compiles. The smoke target itself never
+ran — there is no case for it to run — so it could not have moved the
+gate even had it been built.
+
 ## Deviations
 
 None. The unit stopped at the first reviewed point it could not
