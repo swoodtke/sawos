@@ -107,7 +107,9 @@ func _start(boot_handle: UInt) {
 ///
 /// **IT SAYS `replied` AFTER THE FIRST TURN AND NOTHING AFTER THE SECOND**, so
 /// this child's line lands exactly where it always did in the transcript. The
-/// launcher's own rows are what moved.
+/// launcher's own rows are what moved: root's report of the first round now
+/// precedes the child's death instead of following it, because the child no
+/// longer DIES at the first reply.
 func serve(outlet: &PipeOutlet, waiter: &Waiter) -> Result<Void, SosStatus> {
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
@@ -134,17 +136,15 @@ func serve(outlet: &PipeOutlet, waiter: &Waiter) -> Result<Void, SosStatus> {
         var obligation = move request
         try obligation.reply(body: &msg, len: PAYLOAD_LEN)
         served = served + 1
+        // **THE ONE LINE THIS CHILD PRINTS, AND IT GOES OUT AFTER THE FIRST
+        // TURN** so that its position in the transcript is exactly what it was
+        // when this child served one message. It is freestanding `print` rather
+        // than `System.debug_print` — `serve` holds no System handle, and the
+        // swap is worth 736 bytes of riscv32 image, which is design 16 finding
+        // 1's print-seam observation showing up as SIZE rather than as traps.
         if served == 1 {
-            let _ = report_first()
+            print("SOS childserver: replied\n")
         }
     }
     return
-}
-
-/// The one line this child prints, and it goes out after the FIRST turn so that
-/// its position in the transcript is exactly what it was when this child served
-/// one message.
-func report_first() -> Bool {
-    print("SOS childserver: replied\n")
-    true
 }
