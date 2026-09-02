@@ -1,0 +1,197 @@
+// SOS M4 unit 4: A CAPABILITY OUTLIVES THE PROCESS THAT SENT IT (sawos design
+// 18; `designs/010` ruling 5 AS RE-RULED Sep 2 — TAKE-AT-POST).
+//
+// **THIS CASE IS THE RE-RULE'S GUARANTEE, WRITTEN AS A TRANSCRIPT.** The Aug-30
+// ruling left a staged handle bound in the SENDER's table and re-validated it at
+// the rendezvous, so a sender that let the entry go — by releasing it, or simply
+// by exiting — delivered an EMPTY slot. That was sound and it made a
+// fire-and-forget hand-off of a capability race the sender's own lifetime, which
+// contradicted the typed tier's own move story: `post_with` CONSUMES the wrapper,
+// and a consumed wrapper does not come back. Take-at-post moves the entry at the
+// POST, so the message owns what it carries and the guarantee is:
+//
+//   A MESSAGE THE KERNEL ACCEPTED WILL DELIVER WHAT IT WAS CARRYING, WHATEVER
+//   BECOMES OF THE SENDER.
+//
+// THE ORDER IS THE PROOF, and every step of it is a synchronisation rather than a
+// hope:
+//
+//   1. the child posts a message carrying a live connection END, and EXITS —
+//      it never waits for anybody to take
+//   2. root parks on the child's DEATH (§8's Process waitable), so it does not
+//      resume until the sender's table has been closed and its slot is `Gone`
+//   3. root takes the message, and finds a handle in it
+//   4. root POSTS THROUGH THE HANDLE and takes its own byte back off the other
+//      end, which is the only way to tell a live capability from a number
+//
+// **AND THE SENDER'S TEARDOWN COUNT IS THE OTHER HALF.** The kernel prints how
+// many handles it closed for the dying child: TWO — its boot System and the
+// Process it derived. The gift is not among them, because it stopped being the
+// child's at the post. Under sender-keeps the same program would have printed
+// THREE, and the entry that teardown closed would have been the very one root is
+// about to be handed — which is why step 4 could not have happened at all.
+//
+// ONE PHASE PER FUNCTION, per design 14 finding 3: root's stack grant is 16 KiB
+// and a `PipeMsg` is a message-sized value, so the phases are split rather than
+// held in one frame.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, PipeHandle, PipeMsg,
+            Waiter, WaitResult, WaitPayload, SystemRight, SosStatus,
+            PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// ROOT'S CONFIG, and the whole of the contract with `child-sender`.
+static TAG_BOOT: UInt = 7
+static TAG_CARRIER: UInt = 21
+static TAG_GIFT: UInt = 22
+
+/// The key root's death watch is attached under.
+static KEY_DEATH: UInt = 51
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The byte `child-sender` marks its message with, and the byte root writes
+/// through the inlet that message carried.
+static BYTE_MARK: UInt8 = 77
+static BYTE_ROOT: UInt8 = 33
+
+/// `child-sender`'s "the message went" exit code, and the §8 status word it
+/// arrives in: the KIND in the high half (`Exited` = 1), the code in the low one
+/// (§8; design 8 D-1's own arithmetic, which `death-notify` records).
+static CHILD_SENT: UInt = 43
+static EXITED: UInt = 1 << 16
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS sendexit: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS sendexit: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// Launch the sender, outlive it, and spend what it sent.
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var image = try proc.boot_handle_next()
+    var dest = try proc.boot_handle_next()
+    guard let image_mem = image.take_memory() else { return BUG }
+    guard let dest_mem = dest.take_memory() else { return BUG }
+
+    let child = try system.process_create(image: &image_mem, memory: &dest_mem)
+
+    // CONNECTION A: the CARRIER. The child posts, root takes.
+    let a = try proc.pipe_create()
+    let (a_in, a_out) = move a
+    // CONNECTION B: the GIFT. Its inlet travels in the child's message; root
+    // keeps the outlet, so a message posted through the travelled inlet comes
+    // back here and nowhere else.
+    let b = try proc.pipe_create()
+    let (b_in, b_out) = move b
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let _ = system.debug_print("SOS sendexit: created\n")
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT)
+    try child.give(inlet: move a_in, tag: TAG_CARRIER)
+    try child.give(inlet: move b_in, tag: TAG_GIFT)
+    try child.start(boot_tag: TAG_BOOT)
+
+    try outlive(&system, &waiter)
+    try spend(&system, &a_out, &b_out)
+
+    let _ = move a_out
+    let _ = move b_out
+    let _ = move waiter
+    let _ = move child
+    return
+}
+
+/// **PARK UNTIL THE SENDER IS GONE.** §8's status word arrives in the wait
+/// record, so this is also the check that the child took the arm it was written
+/// for — a sender that failed before the post would report a different code and
+/// this case would stop here rather than fail confusingly further down.
+func outlive(system: &System, waiter: &Waiter) -> Result<Void, SosStatus> {
+    let woke = try waiter.wait()
+    if woke.key != KEY_DEATH {
+        return BUG
+    }
+    match woke.what {
+        case Process(status) -> {
+            if status != EXITED + CHILD_SENT {
+                print("SOS sendexit: the sender exited {}\n", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    let _ = system.debug_print("SOS sendexit: the sender is gone\n")
+    return
+}
+
+/// **TAKE THE DEAD PROCESS'S MESSAGE, AND SPEND WHAT IT CARRIED.**
+///
+/// Every capability in this frame belongs to a process that no longer exists.
+/// The take is ordinary — close-drains-first means a staged message survives its
+/// client's departure, which units 1 and 2 already proved for BYTES — and what is
+/// new is that the HANDLE survives it too, minted into this table out of a
+/// reference the kernel has been holding since the post.
+func spend(system: &System, a_out: &PipeOutlet,
+           b_out: &PipeOutlet) -> Result<Void, SosStatus> {
+    let got = try a_out.take()
+    guard let (arrived, request) = move got else { return BUG }
+    var msg = move arrived
+    let _ = move request
+    if msg.bytes[0] != BYTE_MARK {
+        return BUG
+    }
+
+    // Out of its slot before matching it: a `match` on an owned value consumes
+    // it, which is what lets the arm move the wrapper into a post.
+    guard let carried = msg.handles[0].take() else {
+        let _ = system.debug_print("SOS sendexit: the slot arrived empty\n")
+        return BUG
+    }
+    match carried {
+        case Inlet(i) -> {
+            var inherited = move i
+            var out: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+            out[0] = BYTE_ROOT
+            let staged = try inherited.post(body: &out, len: 1)
+            guard let claim = move staged else { return BUG }
+            let _ = move claim
+            let echoed = try b_out.take()
+            guard let (back, obligation) = move echoed else { return BUG }
+            let byte = back.bytes[0]
+            let _ = move back
+            let _ = move obligation
+            let _ = move inherited
+            if byte != BYTE_ROOT {
+                return BUG
+            }
+            let _ = system.debug_print("SOS sendexit: the dead sender's capability still works\n")
+            return
+        },
+        case _ -> {
+            let _ = system.debug_print("SOS sendexit: the wrong kind arrived\n")
+            return BUG
+        },
+    }
+}

@@ -215,10 +215,15 @@ func serve(waiter: &Waiter, proc: &Process) -> Result<Served, SosStatus> {
     var serving = true
     while serving {
         var more = false
+        // **LOOK FIRST, THEN TAKE.** Matching through the place BORROWS, which
+        // is all a decision needs and costs nothing; the arm that goes on to
+        // MOVE the payloads out opens the record instead (SL-17's discipline,
+        // written at `WaitResult.open`).
         match wake.what {
             // **THE DELIVERY-AS-TAKE.** A message arrived and the obligation to
-            // answer it is in this very record.
-            case Message -> { more = true },
+            // answer it is in this very record — the type says so, which is why
+            // the arm below need not ask whether either is there.
+            case Message(_, _) -> { more = true },
             // The terminal level: the client is gone and nothing is staged, so
             // there will never be another message. It is a `Readable` because
             // that is what the LEVEL is; only a delivery that hands something
@@ -234,33 +239,46 @@ func serve(waiter: &Waiter, proc: &Process) -> Result<Served, SosStatus> {
         if not more {
             serving = false
         } else {
-            var record = move wake
-            guard let carried = record.message.take() else { return BUG }
-            guard let obligation = record.request.take() else { return BUG }
-            var msg = move carried
-            if msg.len != PAYLOAD_LEN {
-                return BUG
-            }
-            last0 = msg.bytes[0]
-            last1 = msg.bytes[1]
-            last2 = msg.bytes[2]
-            last3 = msg.bytes[3]
-            // The answer is the request's sequence number plus one, which is
-            // what makes the child able to tell a matching reply from a stale
-            // one. `&+` is the wrapping add: Saw's overflow checks are always on
-            // and the arithmetic is a byte's.
-            out[0] = msg.bytes[0] &+ 1
-            count = count + 1
-            let _ = move msg
-            let answering = move obligation
-            wake = try (move answering).reply_wait(body: &out, len: PAYLOAD_LEN,
-                                                  waiter: &waiter) catch {
-                // A dead client cannot stall the loop: the reply leg answers
-                // without parking and the recovery is the first turn's own op.
-                match error {
-                    case Reply(_) -> { return BUG },
-                    case Wait(s) -> { return s },
-                }
+            // **OPEN THE RECORD, THEN MATCH THE OWNED PAYLOAD.** `open`
+            // consumes the wake and hands back its key and its payload BY
+            // VALUE, which is the form an arm may move out of — a `match` on an
+            // owned scrutinee consumes it, so the two wrappers below leave the
+            // enum exactly once each.
+            let (_, what) = (move wake).open()
+            match what {
+                case Message(m, r) -> {
+                    var msg = move m
+                    let obligation = move r
+                    if msg.len != PAYLOAD_LEN {
+                        return BUG
+                    }
+                    last0 = msg.bytes[0]
+                    last1 = msg.bytes[1]
+                    last2 = msg.bytes[2]
+                    last3 = msg.bytes[3]
+                    // The answer is the request's sequence number plus one,
+                    // which is what makes the child able to tell a matching
+                    // reply from a stale one. `&+` is the wrapping add: Saw's
+                    // overflow checks are always on and the arithmetic is a
+                    // byte's.
+                    out[0] = msg.bytes[0] &+ 1
+                    count = count + 1
+                    let _ = move msg
+                    wake = try (move obligation).reply_wait(body: &out,
+                                                            len: PAYLOAD_LEN,
+                                                            waiter: &waiter) catch {
+                        // A dead client cannot stall the loop: the reply leg
+                        // answers without parking and the recovery is the first
+                        // turn's own op.
+                        match error {
+                            case Reply(_) -> { return BUG },
+                            case Wait(s) -> { return s },
+                        }
+                    }
+                },
+                // UNREACHABLE: the borrowing look one branch up established the
+                // tag and nothing runs between the two.
+                case _ -> { return BUG },
             }
         }
     }

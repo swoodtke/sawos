@@ -1370,69 +1370,143 @@ public(package) unsafe static var PIPE_NEXT: [Int; PIPE_EXCHANGES] = [
 
 // =============================================================================
 // THE STAGED HANDLE LEDGER (spec §2.1's rendezvous transfer; `designs/010`
-// ruling 5, built by sawos design 18)
+// ruling 5 AS RE-RULED Sep 2 — TAKE-AT-POST; sawos design 18)
 // =============================================================================
 //
-// **A STAGED HANDLE STAYS THE SENDER'S COUNTED ENTRY UNTIL RENDEZVOUS.** Ruling
-// 5 in one sentence, and these two arrays are the whole of its mechanism: what a
-// post records is the sender's own handle WORDS, not copies of anything, and the
-// entries they name stay bound in the sender's table — counted on the object's
-// column, charged to the sender's handle quota — until a take or a delivery
-// MOVES them. So the ledger never has an in-flight limbo state to reconcile, and
-// nothing anywhere has to unwind a send that was abandoned.
+// **A HANDLE LEAVES THE SENDER AT THE POST, AND THE KERNEL HOLDS IT UNTIL THE
+// RECEIVER TAKES IT.** That is the re-ruled ruling 5 in one sentence, and this
+// array is the whole of its mechanism: a validated send UNBINDS each of its
+// handle entries and parks the REFERENCE those entries were holding in the ring
+// note, so a staged message owns what it is carrying and nothing about it can
+// go stale.
 //
-// **THE SENDER IS RECORDED BESIDE THE WORDS, AND IT HAS TO BE**: a handle word
-// means nothing without the table it indexes, and the rendezvous happens in the
-// TAKER's context, which is a different process. `PIPE_MSG_SENDER` is the one
-// thing that makes a staged word resolvable later, and it is what ruling 5's
-// re-validation reads through.
+// **THE NOTE IS TYPED REFS, NOT WORDS, AND THE SHAPE IS THE RULING.** A handle
+// word is an index into a table the entry no longer occupies, so once the entry
+// is unbound the word means nothing — what survives is the OBJECT the reference
+// names and the RIGHTS the sender was holding it with. `StagedRef` is exactly
+// that: a handle entry with its table slot and its generation left off, which is
+// all a later mint needs and all a later release needs.
 //
-// **RE-VALIDATION AT RENDEZVOUS IS WHY THIS IS SOUND WITHOUT A REFERENCE.** A
-// staged word is not a claim on anything: the sender may release the entry, and
-// the ordinary generation check then answers `Unbound` at the take, which
-// delivers that slot as EMPTY. Nothing leaked, nothing was forged, and the
-// receiver is told the truth — which is the alternative to counting a reference
-// nobody could later be sure to drop.
+// **WHY THIS REPLACED SENDER-KEEPS** (the Sep-2 re-rule, recorded here because
+// this array is where the two designs differ). Under sender-keeps the note was a
+// process index plus four handle words, re-validated at the rendezvous, and a
+// released entry arrived as an empty slot; that was sound but it made a
+// capability send RACE THE SENDER'S OWN EXIT, and it contradicted the typed
+// tier's move story, where `post_with(handles:)` consumes the wrapper and a
+// consumed wrapper does not come back. Design 260's `consumes` and ruling 10's
+// orphan accounting both post-date the Aug-30 ruling and both point the other
+// way. Take-at-post turns the old first consequence into a GUARANTEE: a message
+// that was accepted will deliver what it was carrying, whatever becomes of the
+// sender.
 //
-// Both arrays are zero-initialized and therefore `.bss` (design 149), costing no
-// image bytes: `PIPE_EXCHANGES * PIPE_MSG_HANDLES` words and `PIPE_EXCHANGES`
-// small integers, which at the tree's numbers is 64 × 4 words and 64 ints.
+// **NOBODY IS CHARGED FOR A STAGED HANDLE, AND THE BOUND IS WHY THAT IS SAFE.**
+// The unbind credits the sender's `QuotaKind.Handle` row at the one place a
+// binding is destroyed, and the taker is charged at the mint — so between the
+// two the entry is charged to NOBODY, which is design 14 D-4's orphan vocabulary
+// arriving at a second kind. It cannot be exploited into an unbounded hole: a
+// connection can hold at most `PIPE_INFLIGHT * PIPE_MSG_HANDLES` staged handles
+// (the ring is fixed and every slot's note is fixed), the connection itself cost
+// a `QuotaKind.Pipe` row, and the objects the refs name already occupy the slab
+// slots they were charged for. Quota <= wall therefore still holds: the SLAB is
+// what refuses the next allocation, and no staged handle can conjure one.
+//
+// The array is zero-initialized and therefore `.bss` (design 149), costing no
+// image bytes: `PIPE_EXCHANGES * PIPE_MSG_HANDLES` entries, which at the tree's
+// numbers is 64 × 4.
 
-/// The handle WORDS a post or a reply staged for each exchange — the sender's
-/// own, `NO_HANDLE` for an empty slot. Indexed `x * PIPE_MSG_HANDLES + slot`,
-/// which is the flat arithmetic the bodies and lengths already use.
+/// ONE HANDLE A MESSAGE IS CARRYING, held by the kernel between the post and the
+/// rendezvous — a `HandleEntry` with the two table-only fields left off.
+///
+/// **THE RIGHTS TRAVEL WITH THE REFERENCE, and they have to.** A reference names
+/// an OBJECT; a capability is an object AND a rights word, and the receiver is
+/// owed the sender's rights verbatim (design 4 D-1, reached through a second
+/// door). Carrying only `(obj_type, target)` would make the taker's mint consult
+/// a default set, which is precisely the amplification a transfer must not do.
+///
+/// `obj_type == Unbound` is the empty slot, which is what zero-init means and
+/// why this array needs no separate occupancy word.
+public(package) struct StagedRef {
+    public(package) obj_type: ObjType,
+    public(package) rights: UInt32,
+    public(package) target: Int,
+}
+
+/// A whole message's worth of them, COLLECTED OUT OF THE LEDGER — the value
+/// `take_staged` answers with and the only thing a release or a mint reads.
+///
+/// It exists because of the module order, and the module order is enforcing the
+/// right discipline: releasing a reference lives in `kcore.refs`, which is ABOVE
+/// this file, so an unwind arm down here cannot release and must hand the batch
+/// upward instead. That is COLLECT-THEN-FREE spelled across a module boundary —
+/// the ledger is left consistent before any release runs, so a cascade that
+/// re-enters this file can never find a half-emptied exchange.
+public(package) struct StagedRefs {
+    public(package) slots: [StagedRef; PIPE_MSG_HANDLES],
+}
+
+/// The empty slot, written once so the zero value has a name.
+public(package) func no_staged_ref() -> StagedRef {
+    StagedRef(obj_type: ObjType.Unbound, rights: 0, target: 0)
+}
+
+/// The references a post or a reply staged, per exchange. Indexed
+/// `x * PIPE_MSG_HANDLES + slot`, which is the flat arithmetic the bodies and
+/// lengths already use.
 ///
 /// ONE ARRAY SERVES BOTH DIRECTIONS, and it can because an exchange only ever
-/// has one message in flight: the request's handles are moved out at the take,
-/// which is the same moment the slot stops holding a request and starts being
-/// able to hold a reply. `pipe_take` clears what it moved, so a reply stages into
-/// slots that are provably empty.
-public(package) unsafe static var PIPE_MSG_WORDS: [UInt; PIPE_EXCHANGES * PIPE_MSG_HANDLES] = [
-    0; PIPE_EXCHANGES * PIPE_MSG_HANDLES]
-
-/// Whose table the words above index, PLUS ONE; zero is "nothing staged". The
-/// plus-one is the list-link idiom the rest of this file uses, and it is what
-/// lets `ROOT_PROCESS` (slot 0) be a legitimate sender.
-public(package) unsafe static var PIPE_MSG_SENDER: [Int; PIPE_EXCHANGES] = [
-    0; PIPE_EXCHANGES]
+/// has one message in flight: the request's handles leave at the take, which is
+/// the same moment the slot stops holding a request and starts being able to
+/// hold a reply. The take COLLECTS what it minted, so a reply stages into slots
+/// that are provably empty.
+public(package) unsafe static var PIPE_MSG_HELD: [StagedRef; PIPE_EXCHANGES * PIPE_MSG_HANDLES] = [
+    StagedRef(obj_type: ObjType.Unbound, rights: 0, target: 0);
+    PIPE_EXCHANGES * PIPE_MSG_HANDLES]
 
 /// Where exchange `x`'s handle slot `i` lives.
 public(package) func msg_word_at(x: Int, i: Int) -> Int {
     x * PIPE_MSG_HANDLES + i
 }
 
-/// Forget every handle exchange `x` staged. **NOTHING IS UNWOUND, and that is
-/// ruling 5's third consequence** (the unwind-free staged drop): the entries
-/// never left the sender, so there is nothing to give back — the sender still
-/// holds exactly what it always held, and these words were only ever a note
-/// saying where to look.
-public(package) func clear_staged_handles(x: Int) unsafe {
+/// How many references exchange `x` is holding.
+///
+/// **IT IS A COUNT AND NOT A RE-VALIDATION** (the Sep-2 re-rule). Under
+/// sender-keeps this had to resolve four handle words against a table that might
+/// have moved on; now the refs are the kernel's own and staleness cannot exist,
+/// so the answer is a scan of four tags. It is what the rendezvous pre-flights
+/// the taker's table against.
+public(package) func staged_count(x: Int) unsafe -> Int {
+    var live: Int = 0
     var i: Int = 0
     while i < PIPE_MSG_HANDLES {
-        PIPE_MSG_WORDS[msg_word_at(x, i)] = NO_HANDLE
+        match PIPE_MSG_HELD[msg_word_at(x, i)].obj_type {
+            case Unbound -> {},
+            case _ -> { live = live + 1 },
+        }
         i = i + 1
     }
-    PIPE_MSG_SENDER[x] = 0
+    live
+}
+
+/// **TAKE EXCHANGE `x`'s HELD REFERENCES OUT OF THE LEDGER**, leaving it empty.
+///
+/// The one way anything leaves this array, so every consumer — the rendezvous
+/// that mints them onward and every unwind arm that drops them — goes through
+/// one door and the ledger is consistent the instant the door returns. What the
+/// caller does with the batch is the caller's obligation, and there are exactly
+/// two things it may be: mint each ref into a table, or release each ref. Doing
+/// NEITHER leaks a reference, which is why every call site is named in
+/// `kcore.refs`' rendezvous header.
+public(package) func take_staged(x: Int) unsafe -> StagedRefs {
+    var out = StagedRefs(slots: [StagedRef(obj_type: ObjType.Unbound,
+                                           rights: 0, target: 0);
+                                 PIPE_MSG_HANDLES])
+    var i: Int = 0
+    while i < PIPE_MSG_HANDLES {
+        out.slots[i] = PIPE_MSG_HELD[msg_word_at(x, i)]
+        PIPE_MSG_HELD[msg_word_at(x, i)] = no_staged_ref()
+        i = i + 1
+    }
+    out
 }
 
 /// "No exchange" — the sentinel a full ring answers with.
@@ -1661,7 +1735,18 @@ public(package) func exchange_can_settle(x: Int) unsafe -> Bool {
 /// replied body is bytes that were COPIED, the slot is unreachable until a later
 /// post writes it, and every read of one is bounded by the length that post
 /// recorded.
-public(package) func exchange_settle(x: Int) unsafe {
+///
+/// **IT ANSWERS WITH THE HANDLE REFERENCES THE EXCHANGE WAS STILL HOLDING, AND
+/// THE CALLER MUST RELEASE THEM** (the Sep-2 re-rule of ruling 5). A settling
+/// exchange may still be carrying a message nobody took, and under take-at-post
+/// those handles are the KERNEL's references rather than notes about somebody
+/// else's table — so forgetting them would leak the objects. Releasing them is
+/// `kcore.refs`' job and this file sits below it, so the batch travels UP: the
+/// ledger is emptied here, every other line of the settle runs, and the release
+/// happens at the call site with the exchange already `Free`. That ordering is
+/// not incidental — a release can take a pipe endpoint to zero and cascade back
+/// into this very function, and by then there is nothing left here to corrupt.
+public(package) func exchange_settle(x: Int) unsafe -> StagedRefs {
     // **NEITHER HALF CAN BE ATTACHED HERE** — `free_pipe`'s assert one level
     // down, and the same invariant: an attachment is a counted reference on the
     // column it watches, so both columns at zero means nobody is watching
@@ -1680,17 +1765,15 @@ public(package) func exchange_settle(x: Int) unsafe {
     if PIPE_CALLER[x] != 0 {
         fatal_kernel("an exchange settled with a caller parked on it", x as UInt)
     }
+    // **THE HELD REFERENCES COME OUT FIRST AND ARE RELEASED LAST** — collected
+    // here so the ledger is already empty for anything the caller's release
+    // cascades into, handed back so the release happens where releases live.
+    let held = take_staged(x)
     PIPE_EX_STATE[x] = ExchangeState.Free
     PIPE_REPLY_REFS[x] = 0
     PIPE_REQUEST_REFS[x] = 0
     PIPE_LENS[x] = 0
     PIPE_NEXT[x] = 0
-    // **AND THE STAGED HANDLE WORDS GO, WHICH COSTS NOTHING TO ANYBODY**
-    // (`designs/010` ruling 5's unwind-free staged drop). A settling exchange
-    // may still be carrying words a post or a reply staged and nobody ever
-    // took; they name entries the SENDER still holds, so forgetting them is the
-    // whole of the cleanup and no reference moves.
-    clear_staged_handles(x)
 
     let c = exchange_pipe(x)
     match PIPES[c].state {
@@ -1702,36 +1785,15 @@ public(package) func exchange_settle(x: Int) unsafe {
             }
         },
     }
+    held
 }
 
-/// **THE OUTLET'S ZERO-ARM: NOTHING STAGED CAN EVER BE TAKEN AGAIN** (sawos
-/// design 13 D-2, as amended by design 14 D-2).
-///
-/// It is called at the moment the OUTLET column reaches zero, because from that
-/// moment nobody can ever take: a take needs an outlet handle, a mint needs a
-/// source, and a column at zero has neither.
-///
-/// **UNIT 1 DROPPED THE MESSAGES AND UNIT 2 SETTLES THE CLAIMS** — which is the
-/// same act now that a staged message carries one. Each staged exchange's claim
-/// becomes ABANDONED-BY-SERVER (its obligation will never be minted), and D-2
-/// says what that means: a later `Resolve` answers `PeerClosed` and consumes the
-/// claim. So the list is emptied — nothing will ever read it again — and each
-/// exchange that NOBODY NAMES is given back on the spot. The rest stay exactly
-/// where they are, holding the answer their claims are owed, and `Resolve` reads
-/// `outlet_refs == 0` to know what to say. That is the derivation D-2 asks for:
-/// abandonment is the columns, not a flag beside them.
-public(package) func pipe_drop_staged(c: Int) unsafe {
-    var cur = PIPES[c].staged
-    PIPES[c].staged = 0
-    while cur != 0 {
-        let x = cur - 1
-        cur = PIPE_NEXT[x]
-        PIPE_NEXT[x] = 0
-        if exchange_can_settle(x) {
-            exchange_settle(x)
-        }
-    }
-}
+// **`pipe_drop_staged` MOVED TO `kcore.refs` IN M4 UNIT 4** (the Sep-2 re-rule
+// of ruling 5). The outlet's zero-arm used to be pure bookkeeping — it forgot
+// notes about somebody else's table — and take-at-post made it a RELEASE SITE:
+// every staged message it drops is holding kernel references that have to go
+// back. Releasing lives one module up, so the function went with it, beside the
+// other last rites that unref. Its one caller was already there.
 
 // =============================================================================
 // The boot-handle queues, ONE PER PROCESS (spec §12; sawos design 2 D-3, as

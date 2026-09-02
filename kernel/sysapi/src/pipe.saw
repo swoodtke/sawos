@@ -300,9 +300,11 @@ extension PipeHandles {
 /// process holds exactly once.
 ///
 /// Take a handle out with `msg.handles[i].take()`, which needs a `var` binding
-/// of the message and hands back an owned `PipeHandle?`. A slot the sender left
-/// empty, and one whose sender released its entry before the rendezvous, are
-/// both `None` — `designs/010` ruling 5's honest absence.
+/// of the message and hands back an owned `PipeHandle?`. **`None` MEANS THE
+/// SENDER LEFT THE SLOT EMPTY, AND NOTHING ELSE** (`designs/010` ruling 5 as
+/// re-ruled Sep 2 — take-at-post): a handle put into a message leaves the
+/// sender's table at the POST, so there is no window in which one can go stale
+/// and no way for a slot to arrive empty that the sender did not choose.
 public struct PipeMsg {
     public len: UInt,
     public handles: [PipeHandle?; PIPE_MSG_HANDLES],
@@ -311,18 +313,77 @@ public struct PipeMsg {
 
 extension PipeMsg: NoCopy {}
 
+/// The answer to one exchange, as a reply-ready delivery hands it over (sawos
+/// design 15; `designs/010` ruling 11(a)).
+///
+/// **THE BYTES ARRIVE WITH THE NEWS**, which is what makes a multiplexed RPC
+/// post + attach + wait: the wait IS the resolve, and a client that takes this
+/// door never calls `resolve` at all. `PeerClosed` is the peer-gone doctrine's
+/// answer on this arm — the obligation was dropped, so no answer is coming — and
+/// it carries nothing because there is nothing to carry.
+public enum ReplyDelivery {
+    case Data(msg: PipeMsg),
+    case PeerClosed,
+}
+
+extension ReplyDelivery: NoCopy {}
+
+extension ReplyDelivery {
+    /// Whether an answer actually arrived.
+    public func arrived(&self) -> Bool {
+        match self {
+            case Data(_) -> true,
+            case PeerClosed -> false,
+        }
+    }
+
+    /// How many of the answer's bytes are real; zero when no answer came.
+    ///
+    /// **THESE THREE READERS EXIST SO A CALLER NEED NOT NEST A `match`**, and
+    /// that is a soundness matter rather than an ergonomic one (SL-17, second
+    /// face): a place-match arm binding may be BORROWED onward — passed as a
+    /// `&` argument, or used as a `&self` receiver, which is what these are —
+    /// but making it the scrutinee of a SECOND match materializes it and drops
+    /// it at the arm's end, releasing whatever it owns while the record still
+    /// owns it too. Inside these bodies `self` is a reference and the match is
+    /// single-level, so the payload is reached where it sits.
+    public func len(&self) -> UInt {
+        match self {
+            case Data(msg) -> msg.len,
+            case PeerClosed -> 0,
+        }
+    }
+
+    /// Byte `i` of the answer; zero when no answer came.
+    public func byte(&self, i: Int) -> UInt8 {
+        match self {
+            case Data(msg) -> msg.bytes[i],
+            case PeerClosed -> 0,
+        }
+    }
+}
+
 /// What became ready, decoded — one case per waitable kind, plus the one M4
 /// unit 4 added.
 ///
-/// **IT CARRIES NO OWNED VALUE ANY MORE, AND THAT IS FORCED** (sawos design 18).
-/// Unit 3's `Reply` case carried the reply's bytes inside the payload, which
-/// worked because bytes are read through a borrow; a delivery carries HANDLES
-/// now, and a handle has to be MOVED out to be used. A `move` out of a
-/// place-match arm is a sawc soundness hole (SL-17 — it compiles and drops the
-/// value twice), so an owned delivery cannot live inside this enum at all. It
-/// lives in `WaitResult`'s own fields, where a `.take()` reaches it, and what
-/// stays here is the LEVEL — which is what a tag-shaped enum should have been
-/// carrying all along.
+/// **THE OWNING PAYLOADS ARE BACK, AND THE TYPE PROVES WHAT THE DOCSTRING USED
+/// TO PROMISE** (user-ruled Sep 2, restoring design 18's reviewed §API). A
+/// `Message` delivery carries a message AND the obligation to answer it, and
+/// saying so IN THE CASE means a server cannot reach one without the other and
+/// cannot reach either on an arm where neither exists. The unit shipped its
+/// first cut with these as `Optional` FIELDS of `WaitResult` because moving a
+/// value out of a place-match arm is a sawc soundness hole (SL-17); what that
+/// hole actually forbids is the INVALID construction, and the valid one —
+/// design 260's `consumes` accessor plus a match on an OWNED scrutinee — was
+/// available all along.
+///
+/// **SO EXTRACTION GOES THROUGH `WaitResult.open`**, and a reader that only
+/// LOOKS may still match through the place: a presence test, a word payload,
+/// and a `&self` accessor called on an arm binding are all borrows and cost no
+/// ceremony. **WHAT A LOOKING READER MAY NOT DO IS RE-MATCH THE BINDING** —
+/// SL-17's second face: making a place-match arm binding the scrutinee of a
+/// SECOND match materializes it and drops it at the arm's end, with no `move`
+/// written anywhere. That is what `ReplyDelivery`'s accessors exist for.
 public enum WaitPayload {
     case Event(word: UInt),
     case Interrupt(line: UInt),
@@ -332,42 +393,57 @@ public enum WaitPayload {
     case Readable(state: OutletLevel),
     /// The CLIENT end has room to post, or nobody is left to take.
     case Room(state: InletLevel),
-    /// The answer to one exchange arrived, or never will. `Data` means
-    /// `WaitResult.message` is populated.
-    case Reply(state: ReplyLevel),
+    /// The answer to one exchange arrived, or never will — and when it arrived,
+    /// the message itself is HERE.
+    case Reply(outcome: ReplyDelivery),
     /// The claim behind this obligation was dropped. There is nothing to say
     /// beyond the fact, which is why this case has no payload.
     case Abandoned,
     /// **THE DELIVERY WAS THE TAKE** (`designs/010` ruling 11(d)) — a
     /// persistent-consuming outlet attachment handing over a message and the
-    /// obligation to answer it. `WaitResult.message` and `WaitResult.request`
-    /// are both populated, and the server never called `take` at all.
-    case Message,
+    /// obligation to answer it, in one record, with the server never having
+    /// called `take` at all. Both are payloads because a `Message` delivery
+    /// always carries both: the kernel mints the obligation as part of the
+    /// delivery, so a record with one and not the other is a kernel/`sos` skew
+    /// and `decode_wait` panics on it rather than handing back a `None`.
+    case Message(msg: PipeMsg, request: PipeRequest),
 }
 
-/// `Waiter.wait`'s answer: the attacher's key, what fired, and whatever the
-/// delivery HANDED OVER.
+extension WaitPayload: NoCopy {}
+
+/// `Waiter.wait`'s answer: the attacher's key and what fired.
 ///
-/// **THE TWO OWNING FIELDS ARE M4 UNIT 4's** (sawos design 18). They are
-/// `Optional`s rather than payloads for the reason `WaitPayload`'s docstring
-/// gives — a `.take()` reaches a field and cannot reach a match arm — and they
-/// are the reason this type is `NoCopy`. Which of them is populated is decided
-/// by `what` and never has to be guessed:
-///
-///   `Reply(Data)`  -> `message`
-///   `Message`      -> `message` AND `request`
-///   anything else  -> neither
+/// **IT IS TWO FIELDS AGAIN** (user-ruled Sep 2). Everything a delivery hands
+/// over lives in `what`'s payload, where the case that names it is the proof it
+/// is there — see `WaitPayload`.
 public struct WaitResult {
-    /// The word supplied at `add`, handed back unread.
+    /// The word supplied at `add`, handed back unread. A plain read: it is a
+    /// word, so looking at it borrows and consumes nothing.
     public key: UInt,
     public what: WaitPayload,
-    /// The message a `Reply(Data)` or a `Message` delivery carried.
-    public message: PipeMsg?,
-    /// The obligation a `Message` delivery minted into this process's table.
-    public request: PipeRequest?,
 }
 
 extension WaitResult: NoCopy {}
+
+extension WaitResult {
+    /// **TAKE THE ANSWER APART.** Consumes the record and hands back its key and
+    /// its OWNED payload, which is the form a `match` may move out of.
+    ///
+    /// It exists because a match arm may not move a payload out of a BORROWED
+    /// scrutinee — a rule sawc does not yet enforce (SL-17) and which the
+    /// language means to enforce by refusal, so writing the licensed spelling
+    /// now costs nothing and will keep costing nothing. The licensed spelling is
+    /// design 260's: a `consumes` method may move its own fields out, on an
+    /// every-path-or-no-path rule, and both of these move unconditionally.
+    ///
+    /// Callers write `let (key, what) = (move wake).open()` and match `what`.
+    /// A reader that only INSPECTS need not open at all — matching through the
+    /// place borrows, which is exactly what a presence test or a word payload
+    /// wants.
+    public func open(&var self) consumes -> (UInt, WaitPayload) {
+        (move self.key, move self.what)
+    }
+}
 
 /// One handle slot of a delivered record, typed.
 ///
@@ -449,20 +525,16 @@ public(package) func decode_wait(buf: &WaitBuffer) -> WaitResult {
         panic("sos: kernel wrote wait tag {}, which this build cannot name", tag)
     }
     match kind {
-        case Event -> WaitResult(key: key, what: WaitPayload.Event(word: payload),
-                                 message: None, request: None),
+        case Event -> WaitResult(key: key, what: WaitPayload.Event(word: payload)),
         case Interrupt -> WaitResult(key: key,
-                                     what: WaitPayload.Interrupt(line: payload),
-                                     message: None, request: None),
+                                     what: WaitPayload.Interrupt(line: payload)),
         case Timer -> WaitResult(key: key,
-                                 what: WaitPayload.Timer(fires: payload),
-                                 message: None, request: None),
+                                 what: WaitPayload.Timer(fires: payload)),
         // THE FOURTH TAG (sawos design 8, M3 unit 5.5): a process ended, and
         // the payload is §8's status word — the same bits `Process.get_status`
         // answers with, so a supervisor parses one thing however it learned.
         case Process -> WaitResult(key: key,
-                                   what: WaitPayload.Process(status: payload),
-                                   message: None, request: None),
+                                   what: WaitPayload.Process(status: payload)),
         // **THE FOUR PIPE TAGS ARE M4 UNIT 3's** (sawos design 15) and the fifth
         // is unit 4's.
         case Readable -> {
@@ -470,48 +542,55 @@ public(package) func decode_wait(buf: &WaitBuffer) -> WaitResult {
                 panic("sos: kernel wrote outlet level {}, which this build cannot name",
                       payload)
             }
-            WaitResult(key: key, what: WaitPayload.Readable(state: level),
-                       message: None, request: None)
+            WaitResult(key: key, what: WaitPayload.Readable(state: level))
         },
         case Room -> {
             guard let level = InletLevel.from(raw: payload) else {
                 panic("sos: kernel wrote inlet level {}, which this build cannot name",
                       payload)
             }
-            WaitResult(key: key, what: WaitPayload.Room(state: level),
-                       message: None, request: None)
+            WaitResult(key: key, what: WaitPayload.Room(state: level))
         },
         case Reply -> {
             guard let level = ReplyLevel.from(raw: payload) else {
                 panic("sos: kernel wrote reply level {}, which this build cannot name",
                       payload)
             }
-            var got: PipeMsg? = None
             match level {
                 case Data -> {
-                    got = wait_message(&buf)
+                    let got = wait_message(&buf)
+                    WaitResult(key: key,
+                               what: WaitPayload.Reply(outcome: ReplyDelivery.Data(msg: move got)))
                 },
-                case PeerClosed -> {},
+                case PeerClosed -> {
+                    WaitResult(key: key,
+                               what: WaitPayload.Reply(outcome: ReplyDelivery.PeerClosed))
+                },
             }
-            WaitResult(key: key, what: WaitPayload.Reply(state: level),
-                       message: move got, request: None)
         },
         // NOTHING TO DECODE, and that is the case rather than an omission: the
         // fact IS the notification, so the payload word carries no information
         // and `WaitPayload.Abandoned` binds nothing.
-        case Abandoned -> WaitResult(key: key, what: WaitPayload.Abandoned,
-                                     message: None, request: None),
+        case Abandoned -> WaitResult(key: key, what: WaitPayload.Abandoned),
         // **RULING 11(d)'s DELIVERY-AS-TAKE.** The record carries the message
         // AND the obligation the kernel minted at the delivery, so the server
         // never reaches for `take` at all.
+        //
+        // A MISSING OBLIGATION IS A SKEW, NOT A CONDITION, and it panics on this
+        // function's own terms: the kernel mints the request as PART of the
+        // delivery — a `Message` record it could not mint into is never written
+        // at all, the whole batch being refused instead — so an empty slot here
+        // means the two halves disagree about what this tag carries.
         case Message -> {
             let word = buf.handles[WAIT_REQUEST_SLOT]
-            var obligation: PipeRequest? = None
-            if word != NO_HANDLE {
-                obligation = PipeRequest(handle: PipeRequestHandle(word))
+            if word == NO_HANDLE {
+                panic("sos: kernel wrote a Message delivery with no obligation")
             }
-            WaitResult(key: key, what: WaitPayload.Message,
-                       message: wait_message(&buf), request: move obligation)
+            let got = wait_message(&buf)
+            let obligation = PipeRequest(handle: PipeRequestHandle(word))
+            WaitResult(key: key,
+                       what: WaitPayload.Message(msg: move got,
+                                                 request: move obligation))
         },
     }
 }
@@ -519,15 +598,14 @@ public(package) func decode_wait(buf: &WaitBuffer) -> WaitResult {
 /// The message half of a delivered wait record. Split out because two tags reach
 /// it and the handle region is at one offset for both — which is what the
 /// fixed-prefix rule bought.
-func wait_message(buf: &WaitBuffer) -> PipeMsg? {
+func wait_message(buf: &WaitBuffer) -> PipeMsg {
     var words: [UInt; PIPE_MSG_HANDLES] = [NO_HANDLE; PIPE_MSG_HANDLES]
     var i: Int = 0
     while i < PIPE_MSG_HANDLES {
         words[i] = buf.handles[WAIT_MSG_SLOT_0 + i]
         i = i + 1
     }
-    let got: PipeMsg? = msg_of(&buf.meta, &words, &buf.body)
-    move got
+    msg_of(&buf.meta, &words, &buf.body)
 }
 
 extension Waiter {

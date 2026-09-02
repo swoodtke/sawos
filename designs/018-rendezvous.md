@@ -310,6 +310,11 @@ is one line in `msg_kind_of` when it comes.
 
 ### 4. The ledger, and the refusal arm (design mine — argued)
 
+**THE LEDGER HALF OF THIS SECTION WAS SUPERSEDED ON THE DAY IT SHIPPED** — see
+§13, the Sep-2 re-rule to TAKE-AT-POST. It is kept verbatim because the re-rule
+is stated as a delta against it and because the REFUSAL ARM below survived the
+change unaltered.
+
 Ruling 5 made mechanical: `PIPE_MSG_WORDS` (four words per exchange)
 beside `PIPE_MSG_SENDER` (process + 1, so zero means "nothing staged").
 The words are the SENDER's handle words — notes, not references — and
@@ -504,23 +509,24 @@ compiler wrote the work list rather than a reviewer:
    16-frame recursion for a 16-slot array. Root's 16 KiB grant is
    getting tight for cases that hold two message-sized values and format
    numbers, and unit 5 should expect to pay it.
-4. **A staged sender's handle word is STALE after the rendezvous**, and
-   a raw-altitude case must not release it. `pipe-stale-attach` faulted
-   on exactly that; the release is gone and the reason is written at the
-   line. It is ruling 5 working — the entry MOVED, so the sender's word
-   is a `BadHandle` — and it is worth knowing that the C altitude feels
-   it where the typed one does not, the wrapper there having been
-   consumed by the send.
-5. **A reply carrying a handle needs the client PARKED, not merely
-   alive.** The first spelling of that proof lived in `pipe-handles`,
-   where the child replied and exited before root's rendezvous — so
-   ruling 5 delivered an empty slot, correctly, and the case failed for
-   a right reason. It moved to `pipe-delegate-msg`, where root is parked
-   on the claim, so the delivery runs INSIDE the child's own
-   `reply_with` syscall while the entry it staged is still bound. This
-   is a real property of ruling 5 and belongs in any protocol built on
-   it: **a fire-and-forget send of a capability races the sender's own
-   exit.**
+4. ~~**A staged sender's handle word is STALE after the rendezvous**~~ —
+   **STALE AFTER THE POST**, under the re-rule (§13), which is the same
+   finding with a wider window: the entry is unbound in the sender's own
+   syscall now, so the word is a diagnosed `BadHandle` from the moment
+   the post returns. The C altitude feels it where the typed one does
+   not, the wrapper there having been consumed by the send.
+5. ~~**A reply carrying a handle needs the client PARKED, not merely
+   alive**~~ — **AND THIS FINDING IS WHAT GOT RULING 5 RE-RULED.** Under
+   sender-keeps it was true and it was the sharpest thing this unit
+   learned: a fire-and-forget send of a capability RACED THE SENDER'S OWN
+   EXIT, so `pipe-handles`' first spelling of the reply-carries-a-handle
+   proof failed for a right reason and had to move to
+   `pipe-delegate-msg`, where root is parked on the claim and the
+   delivery runs inside the child's own `reply_with` syscall. The lead
+   review took that as the argument against the ruling rather than as a
+   property to document; §13 is the re-rule, and the finding inverts into
+   a GUARANTEE — an accepted message delivers what it carried whatever
+   becomes of the sender — with `pipe-send-exit` as its case.
 
 ### 10. The riders
 
@@ -536,17 +542,17 @@ compiler wrote the work list rather than a reviewer:
 
 ### 11. Harness
 
-Six new cases, appended so no existing index moved: `pipe_stale_attach`,
+Six new cases, appended so no existing index moved: `pipe_send_exit`,
 `pipe_table_full`, `pipe_handles`, `pipe_delegate_msg`, `pipe_cq`,
-`give_keep_mask`. Two new child packages (`child-handles`,
-`child-narrow`); `pipe-cq` reuses `child-pingpong` UNCHANGED.
-`pipe-stale-attach` is written at the C altitude, because the typed
-funnel disarms the wrapper it takes and a Saw program cannot reach the
-released-staged-entry state at all.
+`give_keep_mask`. Three new child packages (`child-handles`,
+`child-narrow`, `child-sender`); `pipe-cq` reuses `child-pingpong`
+UNCHANGED. The first case shipped as `pipe_stale_attach`, a C-altitude
+proof that a released staged entry arrived empty; the re-rule made that
+state unreachable and §13 records what replaced it.
 
 **105 → 111 cases per architecture, 210 → 222 total.**
 
-### 12. Transcript accounting
+### 12. Transcript accounting (FIRST PARK — superseded by §13's re-gate)
 
 Baseline captured at `7362a3f` before any edit; gated at `98e503e`. Every
 row of the runner's transcript falls in one of five buckets, and no row
@@ -602,3 +608,217 @@ construct a `PipeHandle` only when the receiver asks for a slot
 It is a sysapi-shaped change with no kernel or ABI consequence, and it
 is filed in the tracker's BACKLOG rather than built here, because it
 would rewrite the receiving vocabulary this unit's §API was reviewed on.
+
+---
+
+## §13 — THE Sep-2 RE-RULE: TAKE-AT-POST (user, at lead review)
+
+**RULING 5 FLIPPED, AND THE UNIT WAS REWORKED ON THE BRANCH BEFORE MERGE.** A
+staged handle no longer stays the sender's until the rendezvous: it LEAVES AT
+THE POST. Everything above stands except where this section says otherwise;
+`designs/010` carries the ruling itself (the lead's, not mine — I did not touch
+that file).
+
+### 13.1 Why it flipped, in the lead's terms
+
+Three arguments, each of which post-dates the Aug-30 ruling:
+
+1. **Ruling 10's ORPHAN ACCOUNTING** (landed by design 14 D-3) made "charged to
+   nobody, bounded, and reaped when nobody names it" an established shape in
+   this kernel. Sender-keeps existed partly because there was no vocabulary for
+   a thing in between two owners; there is one now.
+2. **Design 260's `consumes`** (sawc 0.4.0, this unit's own dependency) made the
+   typed tier say the opposite of what the kernel did. `post_with` CONSUMES the
+   wrapper — the sender's binding is dead at the call — while sender-keeps left
+   the ENTRY bound and re-validated it later. Two stories about one act.
+3. **My own finding 5.** A fire-and-forget send of a capability raced the
+   sender's exit, which is a footnote if you write it down and a trap if you do
+   not. The lead read it as the argument rather than as the documentation.
+
+### 13.2 What changed, mechanically
+
+- **THE RING NOTE IS TYPED REFS, NOT WORDS.** `PIPE_MSG_WORDS` (handle words) +
+  `PIPE_MSG_SENDER` (a process index) became `PIPE_MSG_HELD`, one `StagedRef`
+  per slot: `{obj_type, rights, target}`. **THE RIGHTS HAD TO COME WITH IT** and
+  that is worth saying, because the ruling names "obj_type + target": a
+  reference names an OBJECT, but a capability is an object AND a rights word,
+  and the receiver is owed the sender's rights verbatim. Carrying only the
+  object would make the taker's mint consult a default set, which is the one
+  thing a transfer must not do.
+- **`stage_handles` → `hold_staged`**: per slot, `ref_object` → `unbind_handle`
+  → `unref_object`, which is `move_entry`'s body minus the mint. The pair of
+  arithmetic is deliberate: keeping "every bind refs, every unbind unrefs" a
+  rule with no exceptions is worth more than the two instructions, and it means
+  no object transiently reaches zero.
+- **`live_staged` → `staged_count`**: a scan of four tags rather than four
+  table lookups. **The stale-revalidation path is DELETED** — staleness cannot
+  exist — and `None` in a received slot now means one thing only: the sender
+  left it empty.
+- **`move_staged` → `mint_staged`**: collect the batch, mint each ref into the
+  taker (rights verbatim), release each held ref. Same up-before-down ordering
+  at this half too.
+- **`release_staged` is new**, and it is the price of the guarantee.
+- **`exchange_settle` ANSWERS WITH THE BATCH.** It cannot release: releasing
+  lives in `kcore.refs` and settling lives in `kcore.objects`, one module below.
+  So the ledger is emptied there and the batch travels UP to be released at the
+  call site — which is COLLECT-THEN-FREE spelled across a module boundary, and
+  the module order enforcing exactly the discipline this needed. Three callers,
+  each named.
+- **`pipe_drop_staged` MOVED to `kcore.refs`** for the same reason: the outlet's
+  zero-arm is a release site now.
+
+### 13.3 The unwind arms, and the reentrancy argument
+
+Three arms, and the third is the one that must NOT release:
+
+| arm | what it does |
+|---|---|
+| outlet zero (`pipe_drop_staged`) | settles each staged exchange and RELEASES its held refs — nobody can ever take |
+| `exchange_settle`, anywhere | collects the batch and hands it up; all three callers release |
+| **inlet zero** | **nothing.** Close-drains-first (§2.1; design 230's rule one level down) says a staged message is still owed to a live outlet, so its handles stay held and arrive at the take exactly as they would have |
+
+**REENTRANCY, ARGUED RATHER THAN CHECKED.** A release can take an object to zero
+and that object can be a pipe endpoint or a one-shot pair, so a release out of
+an unwind arm can re-enter `pipe_drop_staged` and `exchange_settle` on ANOTHER
+exchange. Two things make that safe. The batch is COLLECTED before any release
+runs, so the ledger a re-entry reads is already consistent and
+`exchange_can_settle` answers `false` for the `Free` slot the outer call left
+behind. And the recursion CANNOT CYCLE: a reference held by exchange x's message
+keeps y's column non-zero, so y cannot be the one settling while x holds it —
+the same forest argument design 7's header makes about the Waiter cascade, one
+kind further along. Depth is bounded by `PIPE_EXCHANGES`, a fixed slab
+dimension.
+
+### 13.4 The quota, restated
+
+The unbind credits the sender and the mint charges the taker, so a staged handle
+is charged to NOBODY — D-4's write-off, at a second kind. The bound is stated at
+the ledger's declaration: at most `PIPE_INFLIGHT * PIPE_MSG_HANDLES` uncharged
+rows per connection, the connection itself cost a `QuotaKind.Pipe` row, and
+every object a held ref names already occupies the slab slot it was charged for.
+Quota <= wall holds; the SLAB is still what refuses.
+
+### 13.5 The refusal arm survived — with ONE new consequence
+
+Everything §4 says about the atomic refusal is unchanged: nothing minted, the
+message left staged, the level left raised, the waiter woken with a status and
+no record. What take-at-post adds is that **ONE refusal is now TERMINAL**, and
+the asymmetry is worth stating because it is a real cost:
+
+- a refused `Take` and a refused delivery-as-take leave the message STAGED, so
+  freeing a slot and asking again is handed the same message, handles and all;
+- a refused FUSED-CALL REPLY destroys them. The claim there is a PARKED THREAD,
+  which cannot ask again without returning and returning is the thing a fused op
+  does not do — so the reply's handles go back to their slabs when the exchange
+  settles, because the replier gave them up at the reply and there is nobody
+  left to hand them to.
+
+Under sender-keeps the replier simply kept them. This is documented at the site
+(`wake_call_reply`); a client that must not lose a capability that way makes
+room before it calls, or uses the composed path, whose claim is a handle.
+
+### 13.6 A finding the rework turned up: the room-park re-read
+
+`PipeInletOp.Call` that meets a full ring parks with its argument record still
+in the CALLER's memory and re-reads it at the resume. A sibling thread may have
+rewritten that record since `check_send` blessed it — so the resume cannot
+trust it, and under the old code it would have reached `msg_kind_of` with an
+arbitrary handle word and `fatal_kernel`'d on a kind it could not spell. That
+was a latent kernel-panic-from-userspace in my own first cut.
+
+The fix is in `hold_staged`, which now asks the three questions itself —
+resolves the word, checks `Transfer`, checks `msg_kind_of` — and simply leaves a
+slot empty when one fails. It is not a duplicated check: `check_send` decides
+whether to END THE CALLER (and can, because the caller is running), while this
+decides what a message is CARRYING (and cannot fault, because at a resume the
+caller is blocked). It is the ONE place a slot can arrive empty for a reason the
+sender did not choose, and it needs a C-altitude race to reach.
+
+### 13.7 The tests
+
+- **`pipe-stale-attach` is GONE**, and it had to be: the state it proved —
+  a released staged entry arriving as an empty slot — is now unreachable.
+- **`pipe-send-exit` replaces it**, and it is the guarantee as a transcript.
+  `child-sender` posts a message carrying a live connection END and EXITS at
+  once, never waiting for anybody to take; root parks on the DEATH (§8's Process
+  waitable, so the take provably happens after the sender's table is closed and
+  its slot is `Gone`), takes, posts through what arrived, and reads its own byte
+  back off the far end. Every capability root spends there belongs to a process
+  that no longer exists.
+  **THE SENDER'S TEARDOWN COUNT IS THE WRITE-OFF HALF** and is asserted: TWO
+  handles closed — the boot System and the Process it derived. Under
+  sender-keeps it would have read THREE, and the entry that teardown closed
+  would have been the very one root was about to be handed.
+- **`pipe-handles`' ledger rows INVERT, which is the sharpest single artifact of
+  the re-rule.** The case measures root's free table slots at three moments:
+  - before → after post: **+1 now** (was unchanged) — the post unbound the entry;
+  - after post → after take: **unchanged now** (was +1) — the mint was the
+    CHILD's, in a table root cannot see.
+  Its assertion and its printed line moved with it: "the post moved the entry
+  and the take was the child's". No other design produces that sequence.
+- `pipe-delegate-msg`'s "the replier was alive when the rendezvous ran" note
+  becomes "and it does not matter whether it was".
+
+### 13.8 The SECOND user ruling of the day: `WaitPayload`'s owning payloads
+
+The §API shape the review gate blessed is RESTORED — no pin bump needed, because
+the thing SL-17 makes unsound is the INVALID construction and the licensed one
+was available all along.
+
+```saw
+public enum ReplyDelivery { case Data(msg: PipeMsg), case PeerClosed }
+
+public enum WaitPayload {
+    …
+    case Reply(outcome: ReplyDelivery),
+    case Message(msg: PipeMsg, request: PipeRequest),
+}
+
+public struct WaitResult { public key: UInt, public what: WaitPayload }
+
+extension WaitResult {
+    public func open(&var self) consumes -> (UInt, WaitPayload) {
+        (move self.key, move self.what)
+    }
+}
+```
+
+**THE TYPE PROVES WHAT THE DOCSTRING USED TO PROMISE**: a `Message` delivery
+carries a message AND the obligation to answer it, so a server cannot reach one
+without the other and cannot reach either on an arm where neither exists. The
+`message`/`request` optional fields are gone.
+
+**THE PRIMARY CONSTRUCTION WAS PROBED FIRST AND WORKS.** A `consumes` accessor
+returning a TUPLE of moved-out fields compiles under sawc 0.4.0, and a match on
+the owned payload drops each wrapper exactly once (drop-counter probe: two
+`NoCopy` payloads, two drops). The ruled FALLBACK — optionals inside the case,
+extracted with `Optional.take()` — was therefore not needed, and the type
+invariant is kept rather than traded away.
+
+**AND THE PROBE FOUND A SECOND FACE OF SL-17, which changed the sweep.** A
+place-match arm binding may be BORROWED onward — passed as a `&` argument, or
+used as a `&self` receiver — and neither materializes it. But making it the
+scrutinee of a SECOND match DOES: the inner binding is dropped at the arm's end
+while the outer place still owns it, so a purely READ-ONLY nested place-match
+double-drops. It is not a `move` problem at all. I hit it live: the first sweep
+of `reply_len`/`reply_byte` used a nested `match r.what { case Reply(outcome) ->
+match outcome { case Data(msg) -> msg.len … } }`, and `pipe-delegate-msg` faulted
+with `bad handle` — the intermediate binding's drop had released the outlet the
+reply was carrying. The drop-counter probe confirms it: one peek, one spurious
+drop.
+
+The answer is `ReplyDelivery.len()` / `.byte(i)` / `.arrived()` — `&self`
+accessors, single-level match inside — so a caller reads through ONE level and
+borrows onward instead of nesting. That is better API anyway, and it is written
+at the accessors as a soundness note rather than an ergonomic one.
+
+**THE SWEEP'S DISCIPLINE, stated once**: match through the place to LOOK, open
+the record to SPEND. `pipe-cq`'s serve loop is the worked example — a borrowing
+`case Message(_, _)` decides whether to go on, and the arm that goes on writes
+`let (_, what) = (move wake).open()` and matches the owned payload, moving both
+wrappers out of one arm.
+
+### 13.9 Re-gate
+
+See the parked report; the accounting in §12 is the FIRST park's and the re-gate
+supersedes it.

@@ -1,0 +1,105 @@
+// SOS CHILD: THE PROCESS THAT SENDS A CAPABILITY AND THEN DIES (sawos design 18,
+// M4 unit 4; `designs/010` ruling 5 as re-ruled Sep 2 — TAKE-AT-POST).
+//
+// **IT POSTS AND EXITS, AND NOBODY HAS TAKEN.** That is the whole program, and
+// every line of it exists to make the window as wide as it can be: the message
+// carries a live connection END, the claim is dropped rather than waited on, and
+// the process ends immediately — so by the time its launcher takes, the sender's
+// handle table has been closed, its threads are gone and its slot is `Gone`.
+//
+// **UNDER SENDER-KEEPS THIS PROGRAM COULD NOT HAVE WORKED**, which is why it is
+// the re-rule's own case. The Aug-30 ruling left a staged handle bound in the
+// sender's table and re-validated it at the rendezvous; this process's teardown
+// would have unbound the entry, and the launcher's take would have delivered an
+// EMPTY slot — correctly, by that ruling, and uselessly. Take-at-post makes the
+// send the moment of transfer, so the capability outlives the sender by
+// construction and a fire-and-forget hand-off is a thing a program may write.
+//
+// **THE TEARDOWN COUNT IS THE OTHER HALF OF THE PROOF.** This process exits
+// holding exactly TWO handles — its boot System and the Process it derived — and
+// the kernel prints that number. The carrier is released by the ordinary scope
+// exit of the phase that posted through it; the GIFT is not there to release,
+// because it stopped being this process's at the post. Under sender-keeps the
+// same program would have printed THREE, and the entry the teardown closed would
+// have been the one its launcher was about to be handed.
+
+import sos.{System, Process, PipeInlet, PipeHandles, BootHandle, SosStatus,
+            PIPE_BODY_BYTES}
+
+/// The launcher's tags. The two boot records are both `PipeInlet`, so the KIND
+/// cannot tell them apart and the TAG is what does — which is what a tag is for
+/// (§12: the tag IS the identity).
+static TAG_CARRIER: UInt = 21
+static TAG_GIFT: UInt = 22
+
+/// A boot set that did not carry both inlets.
+static EXIT_NO_CARRIER: UInt = 91
+static EXIT_NO_GIFT: UInt = 92
+/// The post was refused, which this program's launcher makes impossible.
+static EXIT_REFUSED: UInt = 94
+/// The message went. The launcher reads this in the §8 status word.
+static EXIT_SENT: UInt = 43
+
+/// The byte the message carries, so the launcher's take proves WHICH message.
+static BYTE_MARK: UInt8 = 77
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS childsender: no process handle: {}\n", error)
+        return
+    }
+
+    let code = try send(&proc) catch {
+        print("SOS childsender: refused: {}\n", error)
+        let _ = proc.exit(EXIT_REFUSED)
+        return
+    }
+    // **NO CLEANUP, ON PURPOSE.** `exit` does not return, so nothing unwinds and
+    // no wrapper's deinit runs — the handle count the kernel prints is exactly
+    // what this process still held, which is the number the launcher asserts.
+    let _ = proc.exit(code)
+}
+
+/// Drain the two inlets, post one through the other, and go.
+func send(proc: &Process) -> Result<UInt, SosStatus> {
+    var carrier: PipeInlet? = None
+    var gift: PipeInlet? = None
+
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                let tag = rec.tag
+                if let got = rec.take_inlet() {
+                    if tag == TAG_CARRIER {
+                        carrier = move got
+                    } else {
+                        gift = move got
+                    }
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+
+    guard let sending = carrier.take() else { return EXIT_NO_CARRIER }
+    guard let travelling = gift.take() else { return EXIT_NO_GIFT }
+    var out = move sending
+
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = BYTE_MARK
+    var carrying = PipeHandles.none()
+    carrying.put(0, inlet: move travelling)
+    let staged = try out.post_with(body: &body, len: 1, handles: &var carrying)
+    // A TELL: nothing here wants an answer, so the claim is dropped at once and
+    // its entry released. The carrier goes the same way at this frame's end.
+    // What is left when this process exits is exactly TWO handles — the boot
+    // System and the Process it derived — and the GIFT is not one of them.
+    // That absence is the write-off the launcher asserts.
+    guard let _ = move staged else { return EXIT_REFUSED }
+    return EXIT_SENT
+}

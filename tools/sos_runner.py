@@ -422,7 +422,8 @@ PIPE_REPLY_WAIT_DEAD_PKG = os.path.join(TESTS_DIR, "pipe-reply-wait-dead")
 PIPE_HANDLES_PKG = os.path.join(TESTS_DIR, "pipe-handles")
 PIPE_DELEGATE_MSG_PKG = os.path.join(TESTS_DIR, "pipe-delegate-msg")
 CHILD_HANDLES_PKG = os.path.join(TESTS_DIR, "child-handles")
-PIPE_STALE_ATTACH_PKG = os.path.join(TESTS_DIR, "pipe-stale-attach")
+CHILD_SENDER_PKG = os.path.join(TESTS_DIR, "child-sender")
+PIPE_SEND_EXIT_PKG = os.path.join(TESTS_DIR, "pipe-send-exit")
 PIPE_TABLE_FULL_PKG = os.path.join(TESTS_DIR, "pipe-table-full")
 PIPE_CQ_PKG = os.path.join(TESTS_DIR, "pipe-cq")
 GIVE_KEEP_MASK_PKG = os.path.join(TESTS_DIR, "give-keep-mask")
@@ -3862,18 +3863,31 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
-        # **A STAGED HANDLE STAYS THE SENDER'S, AND A SENDER MAY LET IT GO**
-        # (sawos design 18, M4 unit 4; `designs/010` ruling 5's first
-        # consequence). Two rounds identical but for one release, so the
-        # transcript carries the difference rather than an assertion about it.
-        # Written at the C altitude because the typed funnel disarms the wrapper
-        # it takes and a Saw program cannot reach this state at all.
-        "name": "pipe_stale_attach",
+        # **A CAPABILITY OUTLIVES THE PROCESS THAT SENT IT** (sawos design 18,
+        # M4 unit 4; `designs/010` ruling 5 as re-ruled Sep 2 -- take-at-post).
+        # The child posts a live connection END and exits at once; root parks on
+        # the DEATH, then takes, then posts through what arrived and reads its
+        # own byte back off the far end. Every capability root spends there
+        # belongs to a process that no longer exists.
+        #
+        # THE SENDER'S TEARDOWN COUNT IS ASSERTED and is the write-off half of
+        # the proof: TWO handles closed -- its boot System and the Process it
+        # derived. The gift is not among them, because it stopped being the
+        # child's at the post; under sender-keeps this row would read three and
+        # the entry it closed would have been the one root is about to be
+        # handed, so the case could not have finished at all.
+        "name": "pipe_send_exit",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
-        "root_pkg": PIPE_STALE_ATTACH_PKG,
+        "root_pkg": PIPE_SEND_EXIT_PKG,
+        "children": [CHILD_SENDER_PKG],
         "expect_out": ["{banner}",
-                       "SOS staleattach: a released staged handle arrives as "
-                       "an empty slot"],
+                       "SOS: boot regions={two}",
+                       "SOS sendexit: created",
+                       "SOS: process teardown handles={two} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS sendexit: the sender is gone",
+                       "SOS sendexit: the dead sender's capability still works"],
         "expect_clean_exit": True,
     },
     {
@@ -3902,8 +3916,8 @@ TEST_CASES = [
         "children": [CHILD_HANDLES_PKG],
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
-                       "SOS handles: the post kept the entry and the take moved "
-                       "it",
+                       "SOS handles: the post moved the entry and the take was "
+                       "the child's",
                        "SOS handles: the answer came back through the "
                        "subscription"],
         "expect_clean_exit": True,

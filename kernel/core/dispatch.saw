@@ -182,18 +182,13 @@ import kcore.objects.{
     alloc_memory,
     alloc_exchange,
     alloc_pipe,
-    PIPE_MSG_SENDER,
-    PIPE_MSG_WORDS,
-    clear_staged_handles,
-    msg_word_at,
+    staged_count,
     table_room,
     boot_handle_cursor,
     boot_kind_of,
     msg_kind_of,
     exchange_body_addr,
-    exchange_can_settle,
     exchange_pipe,
-    exchange_settle,
     stage_peek,
     stage_pop,
     stage_push,
@@ -214,8 +209,8 @@ import kcore.objects.{
 }
 import kcore.diag.{fatal_kernel}
 import kcore.refs.{PipeMsgPrefix, PipeTakePrefix, deliver_attachment,
-                   live_staged, move_entry, move_staged, msg_prefix,
-                   notify_claim, notify_if_ready, stage_handles,
+                   hold_staged, mint_staged, move_entry, msg_prefix,
+                   notify_claim, notify_if_ready,
                    notify_ready, ref_object, ref_waitable, signal_event,
                    unref_object, unref_waitable, wake_one_waiter}
 import kcore.threads.{
@@ -2897,10 +2892,12 @@ func pipe_inlet_op_decoded(op: PipeInletOp, obj: &PipeInletObject, arg0: UInt,
 /// above every mint — is what makes §API's "refuses the WHOLE post, atomic,
 /// nothing staged" true by construction rather than by an unwind.
 ///
-/// **IT VALIDATES AND DOES NOT RESERVE.** Nothing about a staged handle takes a
-/// reference (`designs/010` ruling 5: the entry stays the sender's), so there is
-/// nothing here to give back on the paths that go on to fail for other reasons —
-/// a full ring, a peer that is gone, a table with no room for the claim.
+/// **IT VALIDATES AND DOES NOT UNBIND.** Under take-at-post (`designs/010`
+/// ruling 5, re-ruled Sep 2) the entries DO leave the sender — but not here, and
+/// that is what keeps every later refusal free of an unwind: a full ring, a
+/// departed peer and a table with no room for the claim are all answered while
+/// the caller still holds everything it held, because `hold_staged` runs after
+/// the last of them.
 func send_args(p: Int, src: UInt, bytes: UInt) unsafe -> PipeSendRecord {
     // EXACTLY the published size, `timer_arm`'s rule: the record is the whole
     // argument list and a caller that hands over a different number of words has
@@ -2990,7 +2987,12 @@ func pipe_post(p: Int, slot: Int, args_src: UInt, args_bytes: UInt) unsafe -> Sy
     // inside the width. An out-of-range value here would be a kernel bug, which
     // is precisely when design 170 says to write `as`.
     PIPE_LENS[x] = len as UInt16
-    stage_handles(p, x, &args)
+    // **AND THE HANDLES LEAVE THE SENDER HERE** (`designs/010` ruling 5 as
+    // re-ruled Sep 2 — take-at-post). It is the last line that can change
+    // anything the caller owns and every refusal is already behind it, so the
+    // message is committed from this point and nothing the sender does
+    // afterwards — releasing, exiting — can make it arrive empty.
+    hold_staged(p, x, &args)
     // ONE COLUMN STARTS AT ONE AND THE OTHER AT ZERO, and the asymmetry is the
     // state machine: the claim exists from the post, the obligation does not
     // exist until somebody takes the message. That is exactly why `Staged` has to
@@ -3098,7 +3100,7 @@ func pipe_call(p: Int, slot: Int, args_src: UInt, args_bytes: UInt,
         }
     }
     PIPE_LENS[x] = len as UInt16
-    stage_handles(p, x, &args)
+    hold_staged(p, x, &args)
     // **ONE COLUMN AT ONE FOR A THREAD RATHER THAN FOR A HANDLE**, which is the
     // only line in this function that is not `pipe_post`'s. The asymmetry with
     // the request column is unchanged and means what it means there: the claim
@@ -3195,14 +3197,15 @@ func pipe_take(p: Int, slot: Int, rec_dst: UInt, rec_cap: UInt) unsafe -> Syscal
     }
 
     // **THE WHOLE BATCH IS PRE-FLIGHTED, AND THE REFUSAL IS ATOMIC**
-    // (`designs/010` ruling 5). A take mints the obligation AND every live
-    // handle the message carried, and a table with room for some of them must
-    // refuse ALL of them — otherwise a half-delivered message would leave a
-    // sender's capabilities in a table its receiver never learned about. One
-    // question about `live_staged(x) + 1`, asked before anything exists: the
-    // message stays staged, the readable level stays raised, and freeing a slot
-    // and taking again is handed the very same message.
-    if not table_room(p, live_staged(x) + 1) {
+    // (`designs/010` ruling 5). A take mints the obligation AND every handle the
+    // message is carrying, and a table with room for some of them must refuse
+    // ALL of them — otherwise a half-delivered message would strand capabilities
+    // in a table its receiver never learned about. One question about
+    // `staged_count(x) + 1`, asked before anything exists: the message stays
+    // staged with its references still held, the readable level stays raised,
+    // and freeing a slot and taking again is handed the very same message,
+    // carrying the very same handles.
+    if not table_room(p, staged_count(x) + 1) {
         return op_status(mint_refusal(p))
     }
     let request = mint_handle(p, ObjType.PipeRequest, pipe_request_rights(), x)
@@ -3214,11 +3217,12 @@ func pipe_take(p: Int, slot: Int, rec_dst: UInt, rec_cap: UInt) unsafe -> Syscal
         return op_status(SosStatus.NoResource)
     }
     // **AND HERE IS THE RENDEZVOUS** (spec §2.1: attached handles enter the
-    // receiver's table only at receive). Every live staged entry moves from the
-    // sender's table into this one — unbound there, bound here, the quota row
-    // moving with it — and a slot whose sender released its entry arrives empty,
-    // which is ruling 5's honest `None`.
-    let moved = move_staged(x, p)
+    // receiver's table only at receive). Every reference the message has been
+    // holding since the post is minted into THIS table, rights verbatim, and the
+    // taker is charged for each — the second half of a move whose first half ran
+    // in the sender's own syscall. A slot arrives empty only if the sender left
+    // it empty: staleness cannot exist under take-at-post.
+    let moved = mint_staged(x, p)
 
     let len = PIPE_LENS[x] as UInt
     var rec = PipeTakePrefix(request: request, msg: msg_prefix(len, &moved))
@@ -3342,10 +3346,10 @@ func pipe_resolve(p: Int, word: UInt, x: Int, dst: UInt,
             // caller frees a slot and resolves again. Everything below this line
             // is the delivery, and none of it can fail for a reason a caller
             // could act on.
-            if not table_room(p, live_staged(x)) {
+            if not table_room(p, staged_count(x)) {
                 return op_status(mint_refusal(p))
             }
-            let moved = move_staged(x, p)
+            let moved = mint_staged(x, p)
             var rec = msg_prefix(len, &moved)
             if let why = copy_out(p, dst,
                                   ((&var rec) as UnsafePointer<PipeMsgPrefix>) as UInt,
@@ -3495,7 +3499,7 @@ func pipe_reply_status(p: Int, word: UInt, x: Int,
             // that produced this obligation moved every handle the request
             // carried and cleared the note. §2.1's `send(data?, handles?)` is
             // symmetric, so this is the identical act one direction over.
-            stage_handles(p, x, &args)
+            hold_staged(p, x, &args)
             PIPE_EX_STATE[x] = ExchangeState.Replied
             // **AND THE CLAIM'S LEVEL IS NOW READY** (sawos design 15;
             // `designs/010` ruling 11(a)). A client parked on this claim is

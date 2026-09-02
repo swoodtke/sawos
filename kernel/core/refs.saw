@@ -116,8 +116,8 @@ import sosabi.{EventMode, NO_HANDLE, ObjType, OutletLevel, PIPE_BODY_BYTES,
                WAIT_HANDLE_SLOTS, WAIT_MSG_SLOT_0, WAIT_REQUEST_SLOT,
                PipeMsgRecord, PipeSendRecord, PipeTakeRecord, WaitBuffer,
                WaitTag,
-               pipe_msg_body_offset, pipe_request_rights, wait_meta_end_bytes,
-               wait_prefix_bytes}
+               pipe_msg_body_offset, pipe_request_rights, rights_allow_transfer,
+               wait_meta_end_bytes, wait_prefix_bytes}
 import kcore.limits.{MAX_IOMEMORIES, MAX_MEMORIES, MAX_PIPES, MAX_THREADS,
                      NO_THREAD, PIPE_INFLIGHT}
 import kcore.diag.{ExitCode, fatal, fatal_kernel}
@@ -126,8 +126,10 @@ import kcore.threads.{THREADS, ThreadState, frame_slot, ready_push}
 import kcore.objects.{
     ExchangeState,
     HandleEntry,
-    PIPE_MSG_SENDER,
-    PIPE_MSG_WORDS,
+    PIPE_MSG_HELD,
+    PIPE_NEXT,
+    StagedRef,
+    StagedRefs,
     IOMEMORIES,
     IoMemorySlot,
     MAPPINGS,
@@ -153,11 +155,12 @@ import kcore.objects.{
     exchange_pipe,
     exchange_settle,
     free_pipe,
-    pipe_drop_staged,
     pipe_exchange_at,
     pipe_idle,
     msg_kind_of,
-    clear_staged_handles,
+    no_staged_ref,
+    staged_count,
+    take_staged,
     handle_word_index,
     lookup_handle,
     mint_handle,
@@ -477,9 +480,16 @@ func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
 /// The `Live` test after the settle is not defensive: settling the LAST exchange
 /// of a connection whose two endpoint columns are already zero frees the row
 /// (`exchange_settle`'s own cascade), and a freed row has no level to raise.
+///
+/// **THE HELD HANDLES ARE RELEASED BEFORE THE LEVEL IS RAISED** (design 18's
+/// Sep-2 re-rule). A settling exchange may still be carrying a message nobody
+/// took, and the release is what gives those objects back; it runs first because
+/// it can itself free the connection, and asking `PIPES[c].state` afterwards is
+/// then the same honest question it already was.
 func settle_exchange(x: Int) unsafe {
     let c = exchange_pipe(x)
-    exchange_settle(x)
+    var held = exchange_settle(x)
+    release_staged(&held)
     match PIPES[c].state {
         case Free -> {},
         case Live -> { notify_room(c) },
@@ -893,7 +903,14 @@ public(package) func reap_unreferenced() unsafe {
 
     var x: Int = 0
     while x < PIPE_EXCHANGES {
-        if exchange_can_settle(x) { exchange_settle(x) }
+        if exchange_can_settle(x) {
+            // AND ITS HELD HANDLES GO BACK WITH IT (design 18's Sep-2 re-rule).
+            // A reap can free the very objects a LATER row of this scan is
+            // about, which is why the scan is a scan and not a list: it reads
+            // each slot's own state at the moment it reaches it.
+            var held = exchange_settle(x)
+            release_staged(&held)
+        }
         x = x + 1
     }
 
@@ -977,22 +994,52 @@ public(package) func unref_waitable_teardown(kind: WaitableKind, slot: Int) unsa
 
 // =============================================================================
 // THE RENDEZVOUS (spec §2.1's "handles enter the receiver's table only at
-// receive"; `designs/010` ruling 5, built by sawos design 18)
+// receive"; `designs/010` ruling 5 AS RE-RULED Sep 2 — TAKE-AT-POST; sawos
+// design 18)
 // =============================================================================
 //
-// **THE MOVE IS `give`'s MACHINERY WITH THE BOOT RECORD LEFT OFF**, which is
-// what ruling 5 means by transferring at rendezvous: unbind the sender's entry,
-// bind the taker's, and let the object's reference column see an increment and a
-// decrement in that order. `move_entry` below is that act, shared by the courier
-// op and by every message that carries a handle, so there is ONE place in the
-// kernel where a capability changes tables.
+// **A SEND IS A HALF-MOVE AND A RECEIVE IS THE OTHER HALF.** `move_entry` below
+// is still the courier op's one act — unbind here, bind there, in one call — and
+// a message now performs the same act in TWO STEPS with the kernel holding the
+// reference in between: `hold_staged` unbinds the sender's entries at the post,
+// and `mint_staged` binds the receiver's at the take or the delivery. Every rule
+// the courier obeys is obeyed twice over, including the one that matters:
+// **THE COUNT GOES UP BEFORE IT GOES DOWN**, per handle, at both halves.
 //
-// **THE QUOTA CHARGE MOVES WITH IT, AND IT MOVES HERE.** A staged handle is
-// charged to the SENDER for as long as it is staged (its entry is still bound in
-// the sender's table, which is where `mint_handle` charged it), and the taker
-// pays from the moment the entry lands. So the ledger has no in-flight state and
-// nobody is charged twice — which is ruling 5's whole point restated as
-// bookkeeping.
+// **THE CHARGE MOVES AT THE POST, AND NOBODY PAYS IN BETWEEN.** The unbind
+// credits the sender's `QuotaKind.Handle` row (that is what `unbind_handle` does
+// at the one place a binding is destroyed) and the mint charges the taker's. So
+// a staged handle is charged to nobody — design 14 D-4's orphan accounting at a
+// second kind — and `kcore.objects`' ledger header carries the bound that makes
+// that safe.
+//
+// **THREE UNWIND ARMS, AND ALL THREE ARE RELEASES NOW.** Under sender-keeps
+// there was nothing to unwind, which was the old ruling's third consequence;
+// take-at-post trades that sentence for a guarantee and pays for it with three
+// sites, every one of which routes through `take_staged` + `release_staged`:
+//
+//   - **the outlet's zero-arm** (`pipe_drop_staged`, which moved into this file
+//     for exactly that reason): nobody can ever take, so what is staged is
+//     dropped and its references go back;
+//   - **`exchange_settle`**, wherever it is reached from — it collects the batch
+//     and answers with it, and each of its three callers releases;
+//   - and NOT the inlet's zero-arm, which is the one that must NOT release:
+//     close-drains-first (§2.1, design 230's rule one level down) says a staged
+//     message survives the client's departure and is still owed to a live
+//     outlet, so its handles stay held and arrive at the take exactly as they
+//     would have. A dead sender changes nothing about a message it already
+//     handed over.
+//
+// **REENTRANCY, STATED AT THE SITE.** A release can take an object to zero, and
+// that object can be a pipe endpoint or a one-shot pair — so a release out of an
+// unwind arm can re-enter `pipe_drop_staged` and `exchange_settle` on ANOTHER
+// exchange. Two things make that safe and neither is a check: the batch is
+// COLLECTED before any release runs (so the ledger a re-entry reads is already
+// consistent, and `exchange_can_settle` answers `false` for the `Free` slot the
+// outer call left behind), and the recursion cannot cycle, because a reference
+// held by exchange x's message keeps y's column NON-ZERO — so y cannot be the
+// one settling while x holds it. Depth is bounded by the exchange count, which
+// is a fixed slab dimension.
 
 /// The handle slots a rendezvous produced in the TAKER's table: one kind byte
 /// and one word per message slot, both zero for an empty or a dead one.
@@ -1067,9 +1114,13 @@ public(package) func msg_record_span(len: UInt) -> UInt {
 /// `keep` is `MINT_OP`'s mask and it composes for free: the receiving entry
 /// carries `source & keep`, so all-ones is design 4 D-1's "rights verbatim" and
 /// anything narrower is the attenuate-at-give the courier op grew in M4 unit 4.
-/// A rendezvous passes all-ones — §API rules that a message-attach takes no
-/// mask, because a sender that wants to hand over less mints the narrower
-/// sibling and attaches THAT.
+///
+/// **ITS ONE CALLER IS `ProcessOp.Give`.** A message performs the same move in
+/// two halves with the kernel holding the reference in between — `hold_staged`
+/// and `mint_staged` below — because a send and a receive are separated in time
+/// and `Give` is one op. The two share this function's RULES rather than its
+/// body, which is the honest amount of sharing between a transfer that happens
+/// at once and one that happens across a park.
 public(package) func move_entry(from: Int, to: Int, word: UInt,
                                 entry: HandleEntry, keep: UInt32) unsafe -> UInt {
     let given = mint_handle(to, entry.obj_type, entry.rights & keep, entry.target)
@@ -1082,119 +1133,189 @@ public(package) func move_entry(from: Int, to: Int, word: UInt,
     given
 }
 
-/// **HOW MANY OF EXCHANGE `x`'s STAGED SLOTS STILL RESOLVE** — ruling 5's
-/// re-validation, asked as a count.
+/// **TAKE `p`'s HANDLE ENTRIES AND HOLD THEM AGAINST EXCHANGE `x`** — the FIRST
+/// half of the rendezvous move (the Sep-2 re-rule of ruling 5).
 ///
-/// **THE SENDER MAY RELEASE A STAGED ENTRY AND THAT IS LEGAL** (ruling 5's first
-/// consequence; fire-and-forget is a shape §2.1 blesses). Nothing about staging
-/// took a reference — the note says where to look, not that the thing must stay
-/// — so a word whose entry is gone simply fails the ordinary generation check
-/// here, and the slot is delivered EMPTY. Nothing leaked, nothing was forged,
-/// and the receiver is told the truth.
+/// Every non-empty slot of the record is unbound from the sender's table and its
+/// reference parked in the ledger, so from this line the message OWNS what it is
+/// carrying: the sender's words are stale (a diagnosed `BadHandle`, exactly as
+/// after a `give`), the sender's quota row is credited, and nothing anybody does
+/// afterwards can make the delivery arrive empty.
 ///
-/// It is called before anything is minted, because the number it answers is what
-/// the atomic table pre-flight is about.
-public(package) func live_staged(x: Int) unsafe -> Int {
-    let sender = PIPE_MSG_SENDER[x]
-    if sender == 0 {
-        return 0
-    }
-    var live: Int = 0
+/// **THE COUNT GOES UP BEFORE IT GOES DOWN, PER HANDLE**, which is `move_entry`'s
+/// rule at the half-move: the kernel's own reference is taken, the entry is
+/// unbound, and the entry's reference is dropped. Writing it as ref-then-unref
+/// rather than as "keep the one that is already there" costs a pair of
+/// arithmetic and keeps "every bind refs, every unbind unrefs" a rule with no
+/// exceptions — and it means no object can transiently reach zero and be freed
+/// between two lines of one op.
+///
+/// **THE BATCH IS ATOMIC BECAUSE EVERY STEP OF IT IS INFALLIBLE, NOT BECAUSE
+/// THERE IS AN UNWIND.** A lookup, a ref, an unbind and a store: none of them
+/// can be refused, so a partly-staged message is unrepresentable and the unwind
+/// arm this function would otherwise need is EMPTY. The caller completes the
+/// exchange with no further failure point either — the ring slot, the body copy
+/// and the claim mint all happen AHEAD of this call, precisely so that nothing
+/// after the first unbind can go wrong.
+///
+/// **IT STAGES WHAT IS STAGEABLE AND SKIPS WHAT IS NOT, AND THE FAULT IS
+/// SOMEBODY ELSE'S JOB.** A word that names nothing, an entry without
+/// `Transfer`, a kind the record cannot spell: `check_send` raises each of those
+/// as a FAULT on the two paths where the caller is the running process and a
+/// fault is a thing that can be raised. This function is also reached from
+/// `resume_call_room`, where the caller is BLOCKED and there is no honest fault
+/// to raise, so the same three questions are asked here and a slot that fails
+/// one is simply left empty. The two are not a duplicated check: one decides
+/// whether to END THE CALLER, the other decides what a message is CARRYING.
+///
+/// **THE ROOM-PARK IS WHY THE SECOND ASKING IS LOAD-BEARING** (design 18's Sep-2
+/// re-rule, finding). A `Call` that met a full ring parks with its args record
+/// still in the caller's memory and the record is RE-READ at the resume — so a
+/// sibling thread may have rewritten it, and the words that arrive here need not
+/// be the words `check_send` blessed. Asking again is what keeps a rewritten
+/// record from staging a handle its process no longer holds or was never allowed
+/// to send.
+public(package) func hold_staged(p: Int, x: Int,
+                                 args: &PipeSendRecord) unsafe {
     var i: Int = 0
     while i < PIPE_MSG_HANDLES {
-        let word = PIPE_MSG_WORDS[msg_word_at(x, i)]
+        let word = args.handles[i]
         if word != NO_HANDLE {
-            match lookup_handle(sender - 1, word).obj_type {
-                case Unbound -> {},
-                case _ -> { live = live + 1 },
-            }
-        }
-        i = i + 1
-    }
-    live
-}
-
-/// **MOVE EVERY LIVE STAGED ENTRY OF `x` INTO `p`'s TABLE** — the rendezvous
-/// itself, and the one place §2.1's "attached handles enter the receiver's table
-/// only at receive" happens.
-///
-/// ITS PRECONDITION IS `table_room(p, live_staged(x))`, established by the caller
-/// before anything was spent, which is what makes the refusal atomic and makes
-/// every mint here provably succeed. A `NO_HANDLE` answer from `move_entry`
-/// would mean the pre-flight and the table disagreed, and that is a kernel bug
-/// rather than a condition — `fatal_kernel` says so.
-///
-/// THE STAGED WORDS ARE CLEARED AT THE END, all of them: what moved is in the
-/// taker's table now and what did not move was already dead, so the exchange's
-/// slots are free for the REPLY direction to stage into.
-public(package) func move_staged(x: Int, p: Int) unsafe -> StagedHandles {
-    var out = StagedHandles(kinds: [0; PIPE_MSG_HANDLES],
-                            words: [NO_HANDLE; PIPE_MSG_HANDLES])
-    let sender = PIPE_MSG_SENDER[x]
-    if sender == 0 {
-        return move out
-    }
-    var i: Int = 0
-    while i < PIPE_MSG_HANDLES {
-        let word = PIPE_MSG_WORDS[msg_word_at(x, i)]
-        if word != NO_HANDLE {
-            let entry = lookup_handle(sender - 1, word)
+            let entry = lookup_handle(p, word)
             match entry.obj_type {
-                // RULING 5's HONEST `None`: the sender let this one go between
-                // the post and the take, so the slot arrives empty.
                 case Unbound -> {},
                 case _ -> {
-                    let given = move_entry(sender - 1, p, word, entry,
-                                           UInt32.max)
-                    if given == NO_HANDLE {
-                        fatal_kernel("a rendezvous mint was refused after its pre-flight",
-                                     x as UInt)
+                    let may_send = rights_allow_transfer(entry.rights)
+                    let spellable = msg_kind_of(entry.obj_type).is_some()
+                    if may_send && spellable {
+                        // Up before down, per handle: the kernel's own
+                        // reference is taken before the entry's is dropped, so
+                        // nothing can reach zero between two lines of one op.
+                        ref_object(entry.obj_type, entry.target)
+                        unbind_handle(p, handle_word_index(word))
+                        unref_object(entry.obj_type, entry.target)
+                        let held = StagedRef(obj_type: entry.obj_type,
+                                             rights: entry.rights,
+                                             target: entry.target)
+                        PIPE_MSG_HELD[msg_word_at(x, i)] = held
                     }
-                    // The kind was validated at the post and an entry cannot
-                    // change kind, so this cannot be `None` — but it is a
-                    // partial translation and never-hide says the arm reports.
-                    guard let kind = msg_kind_of(entry.obj_type) else {
-                        fatal_kernel("a staged handle named a kind the record cannot spell",
-                                     x as UInt)
-                        return move out
-                    }
-                    out.kinds[i] = kind as UInt8
-                    out.words[i] = given
                 },
             }
         }
         i = i + 1
     }
-    clear_staged_handles(x)
-    move out
 }
 
-/// Record a validated message's handle WORDS against exchange `x`, on behalf of
-/// `p` (`designs/010` ruling 5).
+/// **MINT EVERY HELD REFERENCE OF `x` INTO `p`'s TABLE** — the SECOND half, and
+/// the one place §2.1's "attached handles enter the receiver's table only at
+/// receive" happens.
 ///
-/// **IT COPIES NOTHING AND REFERENCES NOTHING** — that is the whole of the
-/// ledger rule. What is written is a note saying which table to look in and
-/// which words to look for, and the entries themselves stay bound in the
-/// sender's table, counted on their objects' columns and charged to the sender's
-/// handle quota, until a take or a delivery moves them.
-public(package) func stage_handles(p: Int, x: Int,
-                                   args: &PipeSendRecord) unsafe {
-    var any = false
+/// ITS PRECONDITION IS `table_room(p, staged_count(x))`, established by the
+/// caller before anything was spent, which is what makes the refusal atomic and
+/// makes every mint here provably succeed. A `NO_HANDLE` answer would mean the
+/// pre-flight and the table disagreed, and that is a kernel bug rather than a
+/// condition — `fatal_kernel` says so.
+///
+/// **RIGHTS VERBATIM.** The held ref carries the rights the sender was holding
+/// the entry with and the mint installs exactly those, so a transfer through a
+/// message amplifies nothing and consults no default set — design 4 D-1's
+/// sentence reached through a second door. A sender that wants to hand over less
+/// mints the narrower sibling and attaches THAT (§API's rule that a
+/// message-attach takes no keep mask).
+///
+/// THE BATCH IS COLLECTED FIRST, so the ledger is empty before the first mint:
+/// what lands in the taker's table is accounted for by the taker from that
+/// moment, and the exchange's slots are free for the REPLY direction to stage
+/// into.
+public(package) func mint_staged(x: Int, p: Int) unsafe -> StagedHandles {
+    var out = StagedHandles(kinds: [0; PIPE_MSG_HANDLES],
+                            words: [NO_HANDLE; PIPE_MSG_HANDLES])
+    let held = take_staged(x)
     var i: Int = 0
     while i < PIPE_MSG_HANDLES {
-        PIPE_MSG_WORDS[msg_word_at(x, i)] = args.handles[i]
-        if args.handles[i] != NO_HANDLE {
-            any = true
+        let ref = held.slots[i]
+        match ref.obj_type {
+            case Unbound -> {},
+            case _ -> {
+                let given = mint_handle(p, ref.obj_type, ref.rights, ref.target)
+                if given == NO_HANDLE {
+                    fatal_kernel("a rendezvous mint was refused after its pre-flight",
+                                 x as UInt)
+                }
+                // Up before down, the second half's own instance of the rule:
+                // the new binding's reference is taken before the kernel's
+                // held one is dropped.
+                ref_object(ref.obj_type, ref.target)
+                unref_object(ref.obj_type, ref.target)
+                // The kind was validated at the post and an object cannot
+                // change kind, so this cannot be `None` — but it is a partial
+                // translation and never-hide says the arm reports.
+                guard let kind = msg_kind_of(ref.obj_type) else {
+                    fatal_kernel("a staged handle named a kind the record cannot spell",
+                                 x as UInt)
+                    return move out
+                }
+                out.kinds[i] = kind as UInt8
+                out.words[i] = given
+            },
         }
         i = i + 1
     }
-    // The sender is recorded only when there is something to look up, so an
-    // ordinary data-only message leaves the exchange exactly as it was and
-    // `live_staged` answers zero on one load.
-    if any {
-        PIPE_MSG_SENDER[x] = p + 1
-    } else {
-        PIPE_MSG_SENDER[x] = 0
+    move out
+}
+
+/// **RELEASE A COLLECTED BATCH** — the unwind half of the rendezvous, and what
+/// every arm that drops a staged message ends with.
+///
+/// It is a plain loop of `unref_object` and it is the ONLY thing that makes
+/// take-at-post whole: a message that never arrives was still holding real
+/// references, and dropping them is how the objects it was carrying reach zero
+/// and free. Each release can cascade — see this block's reentrancy note — which
+/// is why the batch is COLLECTED before the first line of it runs.
+public(package) func release_staged(held: &StagedRefs) unsafe {
+    var i: Int = 0
+    while i < PIPE_MSG_HANDLES {
+        let ref = held.slots[i]
+        match ref.obj_type {
+            case Unbound -> {},
+            case _ -> { unref_object(ref.obj_type, ref.target) },
+        }
+        i = i + 1
+    }
+}
+
+/// **THE OUTLET'S ZERO-ARM: NOTHING STAGED CAN EVER BE TAKEN AGAIN** (sawos
+/// design 13 D-2, as amended by design 14 D-2, and MOVED HERE by design 18's
+/// Sep-2 re-rule — it releases references now, so it belongs with the releases).
+///
+/// It is called at the moment the OUTLET column reaches zero, because from that
+/// moment nobody can ever take: a take needs an outlet handle, a mint needs a
+/// source, and a column at zero has neither.
+///
+/// **UNIT 1 DROPPED THE MESSAGES, UNIT 2 SETTLES THE CLAIMS, AND UNIT 4 GIVES
+/// THE HANDLES BACK** — one act with three parts now. Each staged exchange's
+/// claim becomes ABANDONED-BY-SERVER (its obligation will never be minted), and
+/// D-2 says what that means: a later `Resolve` answers `PeerClosed` and consumes
+/// the claim. So the list is emptied — nothing will ever read it again — and each
+/// exchange that NOBODY NAMES is given back on the spot, its held references
+/// released with it. The rest stay exactly where they are, holding the answer
+/// their claims are owed AND the handles that answer carries, and `Resolve` reads
+/// `outlet_refs == 0` to know what to say. That is the derivation D-2 asks for:
+/// abandonment is the columns, not a flag beside them.
+public(package) func pipe_drop_staged(c: Int) unsafe {
+    var cur = PIPES[c].staged
+    PIPES[c].staged = 0
+    while cur != 0 {
+        let x = cur - 1
+        cur = PIPE_NEXT[x]
+        PIPE_NEXT[x] = 0
+        if exchange_can_settle(x) {
+            // THE LINK IS READ BEFORE THE SETTLE and the release runs after
+            // it, so the walk holds nothing a cascade could invalidate: `cur`
+            // is already the next node and `x` is already off the list.
+            var held = exchange_settle(x)
+            release_staged(&held)
+        }
     }
 }
 
@@ -1440,13 +1561,13 @@ public(package) func deliver_attachment(p: Int, dst: UInt, a: Int) unsafe -> Sos
                          handles: [NO_HANDLE; WAIT_HANDLE_SLOTS])
 
     if reply_carries_handles(kind, &answer) {
-        // THE PRE-FLIGHT, BEFORE ANYTHING IS SPENT. `live_staged` re-validates
-        // through the sender's table, so a claim whose replier released a staged
-        // entry asks for room it no longer needs.
-        if not table_room(p, live_staged(target)) {
+        // THE PRE-FLIGHT, BEFORE ANYTHING IS SPENT. `staged_count` is exact —
+        // the refs are the kernel's own, so what the reply is carrying is what
+        // the claimant will be handed and there is nothing to re-validate.
+        if not table_room(p, staged_count(target)) {
             return mint_refusal(p)
         }
-        let moved = move_staged(target, p)
+        let moved = mint_staged(target, p)
         var i: Int = 0
         while i < PIPE_MSG_HANDLES {
             rec.meta.kinds[i] = moved.kinds[i]
@@ -1495,7 +1616,7 @@ func deliver_take(p: Int, dst: UInt, key: UInt, waiter: Int, a: Int, c: Int,
         fatal_kernel("a completion-queue delivery found nothing staged", c as UInt)
         return SosStatus.NoResource
     }
-    if not table_room(p, live_staged(x) + 1) {
+    if not table_room(p, staged_count(x) + 1) {
         return mint_refusal(p)
     }
     let request = mint_handle(p, ObjType.PipeRequest, pipe_request_rights(), x)
@@ -1504,7 +1625,7 @@ func deliver_take(p: Int, dst: UInt, key: UInt, waiter: Int, a: Int, c: Int,
                      x as UInt)
         return SosStatus.NoResource
     }
-    let moved = move_staged(x, p)
+    let moved = mint_staged(x, p)
 
     var rec = WaitPrefix(key: key, tag: WaitTag.Message as UInt,
                          payload: OutletLevel.Msg as UInt,
@@ -1706,18 +1827,28 @@ func wake_call_reply(t: Int, x: Int) unsafe {
         // handles the server attached to its answer, and those are the server's
         // choice rather than the fusion's cost.
         //
-        // **A FULL TABLE REFUSES THE HANDLES AND NOT THE EXCHANGE.** The caller
-        // is PARKED INSIDE its own syscall, so there is no "try again" for it to
-        // take — the reply has been written and the claim is about to be spent
-        // either way. So it is answered with the table-full status, the staged
-        // words stay where they are, and the REPLIER keeps every handle it
-        // attached: the exchange settles and `clear_staged_handles` forgets the
-        // note, which is ruling 5's unwind-free drop doing the work. Nothing
-        // half-moves and nothing leaks.
-        if not table_room(p, live_staged(x)) {
+        // **A FULL TABLE REFUSES THE HANDLES AND NOT THE EXCHANGE, AND UNDER
+        // TAKE-AT-POST THAT REFUSAL DESTROYS THEM** (design 18's Sep-2
+        // re-rule). The caller is PARKED INSIDE its own syscall, so there is no
+        // "try again" for it to take — the reply has been written and the claim
+        // is about to be spent either way. So it is answered with the
+        // table-full status, and the handles the replier attached go back to
+        // their slabs when the exchange settles, because the replier gave them
+        // up at the reply and there is nobody left to hand them to.
+        //
+        // **THIS IS THE ONE PLACE A REFUSAL IS TERMINAL, and the asymmetry is
+        // the claim's shape rather than a choice.** A refused `Take` and a
+        // refused delivery-as-take both leave the message STAGED with its level
+        // raised, so freeing a slot and asking again is handed the same
+        // message; a fused `Call`'s claim is a PARKED THREAD, which cannot ask
+        // again without returning, and returning is the thing a fused op does
+        // not do. A client that must not lose a capability this way makes room
+        // before it calls — or uses the composed path, whose claim is a handle.
+        // Nothing half-moves and nothing leaks either way.
+        if not table_room(p, staged_count(x)) {
             result = op_status(mint_refusal(p))
         } else {
-            let moved = move_staged(x, p)
+            let moved = mint_staged(x, p)
             var rec = msg_prefix(answer.body_len, &moved)
             if let why = copy_out(p, dst,
                                   ((&var rec) as UnsafePointer<PipeMsgPrefix>) as UInt,
@@ -1824,13 +1955,15 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
         }
     }
     PIPE_LENS[x] = len as UInt16
-    // THE HANDLE WORDS ARE STAGED WITHOUT RE-VALIDATION, and that is ruling 5's
-    // own answer rather than a shortcut: they were validated at the call, an
-    // entry cannot change kind or rights, and the one thing that CAN have
-    // happened — the caller's sibling released one — is exactly what the
-    // rendezvous re-validation turns into an empty slot. There is no honest
-    // fault to raise from here anyway: the caller is not the running process.
-    stage_handles(p, x, &args)
+    // **THE HANDLE WORDS ARE RE-VALIDATED HERE, AND THEY HAVE TO BE** (design
+    // 18's Sep-2 re-rule). The record was re-read out of the caller's memory
+    // one line above, so a SIBLING THREAD may have rewritten it since
+    // `check_send` blessed it — which is exactly why `hold_staged` asks the
+    // three questions again rather than trusting the call. There is no honest
+    // fault to raise from here: the caller is not the running process, so a slot
+    // that fails simply arrives empty, and nothing a rewritten record can say
+    // will stage a handle its process does not hold or may not send.
+    hold_staged(p, x, &args)
     PIPE_REPLY_REFS[x] = 1
     PIPE_REQUEST_REFS[x] = 0
     PIPE_EX_STATE[x] = ExchangeState.Staged

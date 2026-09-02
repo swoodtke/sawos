@@ -63,7 +63,34 @@ entry below or the brief that carries it, never restating either.
   value rather than the wire record, filed in BACKLOG with its
   lazy-decode lever. Deviations and findings are in design 18's
   As-built; SL-17 filed below; `Process`/`System` in messages is the
-  named follow-up, filed in BACKLOG
+  named follow-up, filed in BACKLOG.
+  **RE-RULED AND REWORKED ON THE BRANCH BEFORE MERGE (user, Sep 2, at lead
+  review): RULING 5 FLIPS TO TAKE-AT-POST.** A staged handle leaves the
+  sender at the POST — each entry unbound, its reference held by the
+  kernel in the ring note as a typed ref, the sender's quota row written
+  off — and is minted into the receiver at the take or the delivery. The
+  rationale, recorded because it post-dates the Aug-30 ruling: ruling
+  10's orphan accounting and design 260's move-at-post semantics eroded
+  it, sender-keeps contradicted the typed tier's own move story
+  (`post_with` CONSUMES the wrapper), and the unit's own finding 5 — a
+  fire-and-forget capability send racing the sender's exit — inverts into
+  a GUARANTEE. What that cost: the stale-revalidation path is deleted
+  (`None` in a slot means the sender left it empty and nothing else),
+  three unwind arms became RELEASES (with `pipe_drop_staged` moving to
+  `kcore.refs` and `exchange_settle` answering with its collected batch,
+  which is collect-then-free spelled across a module boundary), and ONE
+  refusal became terminal — a fused call's reply-handles are destroyed by
+  a full table, because its claim is a parked thread with no second
+  chance. `pipe-stale-attach` retargeted to **`pipe-send-exit`** (the
+  child posts a capability and exits; root parks on the death, takes, and
+  posts through what arrived — plus the sender's teardown count as the
+  write-off), and `pipe-handles`' ledger rows INVERT. **AND A SECOND
+  RULING THE SAME DAY: `WaitPayload`'s owning payloads are RESTORED** —
+  `Reply(outcome: ReplyDelivery)` and `Message(msg:, request:)`, with
+  extraction through a `consumes` accessor (`WaitResult.open`) and an
+  owned match; the optional-field design-around is gone and the type
+  proves what its docstring used to promise. Both re-rules are in design
+  18's As-built §13; SL-17's entry below carries both amendments
 
 ## [BACKLOG] — filed, not scheduled
 
@@ -306,4 +333,7 @@ One entry per issue, resolution-sufficient: the symptom verbatim, the probe/site
       let _ = move s                         // drops=2  <-- the double drop
   }
   ```
-  Control (`case Full(o) -> { o.w }`, no move): drops=1. Design-around (take the whole enum BY VALUE — `func take_it(s: Slot)`, `var owned = move s`, then match the OWNED LOCAL): drops=1, so an owned-local match consumes its payload correctly and only the PLACE form is unsound. Either the arm's `move` should be REFUSED — a place a caller still owns cannot give up a payload — or it should mark the payload moved-from so the enclosing drop skips it, which is what a partial move means everywhere else in the language. Silently compiling to a double free is the one outcome that should not be available. Workaround in-tree, and it cost a type: `WaitResult` holds its `PipeMsg` and its `PipeRequest` as OPTIONAL FIELDS rather than as `WaitPayload` enum payloads, so a caller writes `record.message.take()` into an owned local and matches that — `WaitPayload.Message` then says "both fields are populated" instead of carrying them. The shape design 18's §API wanted (a payload enum owning its wrappers) is unwritable until this is ruled.
+  Control (`case Full(o) -> { o.w }`, no move): drops=1. Design-around (take the whole enum BY VALUE — `func take_it(s: Slot)`, `var owned = move s`, then match the OWNED LOCAL): drops=1, so an owned-local match consumes its payload correctly and only the PLACE form is unsound.
+  **A SECOND FACE, FOUND IN THE SAME UNIT'S REWORK (Sep 2) AND NOT A `move` PROBLEM AT ALL: a NESTED place-match double-drops with no `move` written anywhere.** Match a place, bind a NoCopy payload, then make THAT BINDING the scrutinee of a second match and read a plain field of the inner payload — the intermediate binding is materialized and dropped at the arm's end while the outer place still owns it. Probed with the same drop counter: one read-only `peek` costs one spurious drop, two peeks cost two. It bites for real: `reply_len(r: &WaitResult)` written as ``match r.what { case Reply(outcome) -> match outcome { case Data(msg) -> msg.len, … } }`` released the outlet a reply was carrying, and the case that then spent it faulted `bad handle`. What does NOT materialize, probed alongside: BORROWING the arm binding onward — passing it as a `&` argument (`inner_w(&inner)`) or using it as a `&self` receiver (`inner.w()`) — both cost zero drops. So the in-tree discipline is: a place-match arm binding may be borrowed onward, never re-matched; where a nested read is wanted, the inner type publishes a `&self` accessor (`ReplyDelivery.len()`/`.byte(i)`/`.arrived()` exist for exactly that, and say so).
+  **RESOLUTION: REFUSAL, RULED (user, Sep 2).** Option (a) — you cannot move a field or payload out of a BORROWED reference, uniformly; the place-match arm was a missing check rather than a missing semantics. The partial-move-tracking alternative was weighed and REJECTED: partial-move-through-a-borrow stays banned everywhere, so marking the payload moved-from and skipping the enclosing drop would carve out a special case the rest of the language does not have. `take()`, `swap_out` and the owned-local match remain the outs. ONE BOUNDARY, because the two rules meet: design 260's `consumes` carve-out is the licensed exception — a `consumes` body moves its own fields out because the effect marks the receiver DYING-OWNED rather than borrowed — so the refusal and the carve-out compose rather than conflict. The nested-place face wants its own answer in the same ruling: an arm binding is a borrow, so re-matching it must borrow too rather than materialize.
+  **AND THE DESIGN-AROUND IS RETIRED, BY A SECOND USER RULING THE SAME DAY.** The paragraph that used to sit here said design 18's §API shape — a payload enum owning its wrappers — was unwritable; it was not. What SL-17 forbids is the INVALID construction, and the LICENSED one already exists: `WaitPayload` carries `Reply(outcome: ReplyDelivery)` and `Message(msg: PipeMsg, request: PipeRequest)`, `WaitResult` is `{key, what}` again, and extraction goes through a `consumes` accessor (`WaitResult.open(&var self) consumes -> (UInt, WaitPayload)`, an unconditional multi-field move-out) whose result is matched OWNED — the path this entry's own probe verified sound. The `message`/`request` optional fields are gone. Probed before it was written: the tuple-of-moved-fields return compiles under sawc 0.4.0 and drops each payload exactly once, so the ruled fallback (optionals inside the case, extracted with `Optional.take()`) was not needed and the type invariant is kept rather than traded away.

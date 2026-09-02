@@ -3,20 +3,24 @@
 //
 // **THE LEDGER IS THE HALF THIS CASE EXISTS FOR.** That a capability can travel
 // in a message is proved by the child using what it was sent; that the SENDER
-// keeps it until the rendezvous is a claim about the handle table, and a claim
-// about a table needs a way to look at one. Root's is looked at by MINTING
-// SIBLINGS UNTIL IT REFUSES: the depth of that recursion is exactly how many
-// slots were free, and reading it at three moments is ruling 5 written as a
-// number.
+// GIVES IT UP AT THE POST is a claim about the handle table, and a claim about a
+// table needs a way to look at one. Root's is looked at by MINTING SIBLINGS
+// UNTIL IT REFUSES: the depth of that recursion is exactly how many slots were
+// free, and reading it at three moments is ruling 5 written as a number.
 //
 //   free BEFORE the post          the entry is root's, bound, counted
-//   free AFTER the post           THE SAME NUMBER — staging took nothing
-//   free after the child TAKES    ONE MORE — the rendezvous unbound it
+//   free AFTER the post           ONE MORE — the post unbound it
+//   free after the child TAKES    THE SAME NUMBER — the mint was the CHILD's
 //
-// A design that copied the handle at the post would move the first number; one
-// that counted a reference for the message would move it the other way; one that
-// never unbound the sender's entry would leave the third unchanged. Only ruling
-// 5's shape produces this sequence.
+// **THAT SEQUENCE IS TAKE-AT-POST AND NOTHING ELSE PRODUCES IT** (`designs/010`
+// ruling 5 as re-ruled Sep 2). A design that left the entry with the sender
+// until the rendezvous — which is what this case measured before the re-rule —
+// would hold the second number level and raise the THIRD; one that copied the
+// handle at the post would move neither; one that counted a reference for the
+// message without unbinding would move the second the other way. The entry
+// leaves at the post, the kernel holds the reference in between, and the mint
+// happens in a table root cannot see, which is why the third reading is a
+// non-event and is asserted to be one.
 //
 // **EVERY OTHER HANDLE MOVE IS KEPT OUTSIDE THE READINGS.** A mint, a give and a
 // take each move this table too, so the launch happens before the first reading
@@ -151,19 +155,19 @@ func verdict(system: &System, before: UInt, after_post: UInt, after_take: UInt,
              via: UInt8) -> Result<Void, SosStatus> {
     print("SOS handles: free before={} after post={} after take={}\n",
           before, after_post, after_take)
-    if after_post != before {
-        let _ = system.debug_print("SOS handles: staging moved the ledger\n")
+    if after_post != before + 1 {
+        let _ = system.debug_print("SOS handles: the post did not unbind the entry\n")
         return BUG
     }
-    if after_take != before + 1 {
-        let _ = system.debug_print("SOS handles: the rendezvous did not move the entry\n")
+    if after_take != after_post {
+        let _ = system.debug_print("SOS handles: the take moved root's table\n")
         return BUG
     }
     if via != BYTE_VIA {
         let _ = system.debug_print("SOS handles: the child posted the wrong byte\n")
         return BUG
     }
-    let _ = system.debug_print("SOS handles: the post kept the entry and the take moved it\n")
+    let _ = system.debug_print("SOS handles: the post moved the entry and the take was the child's\n")
     return
 }
 
@@ -188,21 +192,27 @@ func hear_post(waiter: &Waiter, b_out: &PipeOutlet) -> Result<UInt8, SosStatus> 
 /// and the claim's own entry went at the `give`.
 ///
 /// The reply carries DATA and no handle, deliberately — see `child-handles`. A
-/// capability coming back here would land in this table at the delivery and net
-/// out against the one the rendezvous freed, which would make the third ledger
-/// reading say nothing at all. The reply direction's handles are
+/// capability coming back here would land in this table at the delivery and
+/// disturb the readings this case is about. The reply direction's handles are
 /// `pipe-delegate-msg`'s proof, where nothing is counting slots.
+///
+/// **NOTHING IS SPENT HERE, SO NOTHING IS OPENED.** The length is read through
+/// the place the delivery put it in — a single-level match plus a `&self`
+/// accessor, which borrows — and the record drops at this frame's end with its
+/// payload still inside it.
 func hear_reply(system: &System, waiter: &Waiter) -> Result<Void, SosStatus> {
-    var back = try waiter.wait()
+    let back = try waiter.wait()
     if back.key != KEY_REPLY {
         return BUG
     }
-    guard let payload = back.message.take() else { return BUG }
-    let reply = move payload
-    if reply.len != REPLY_LEN {
+    var len: UInt = 0
+    match back.what {
+        case Reply(outcome) -> { len = outcome.len() },
+        case _ -> { return BUG },
+    }
+    if len != REPLY_LEN {
         return BUG
     }
-    let _ = move reply
     let _ = system.debug_print("SOS handles: the answer came back through the subscription\n")
     return
 }

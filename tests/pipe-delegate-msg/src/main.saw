@@ -172,17 +172,19 @@ func report(woke: &WaitResult) -> Result<Void, SosStatus> {
 /// through the outlet that came back in a message. A word that was not a live
 /// capability could not do that.
 ///
-/// **THE REPLIER WAS ALIVE WHEN THE RENDEZVOUS RAN**, which is why this arm has
-/// something to spend at all: root was PARKED on its claim, so the delivery
-/// happened inside the child's own `reply_with` syscall and the entry moved
-/// while its owner was executing. A replier that exited first would have
-/// released the entry, and ruling 5 would have delivered the slot empty —
-/// correctly, and `pipe-stale-attach` is where that is the point.
+/// **AND IT DOES NOT MATTER WHETHER THE REPLIER IS STILL ALIVE** (`designs/010`
+/// ruling 5 as re-ruled Sep 2 — take-at-post). The child's handle left its table
+/// at the `reply_with`, so what arrives here is a reference the kernel has been
+/// holding since; whether the child was still executing when root's delivery ran
+/// is not a question this arm's correctness depends on. `pipe-send-exit` is
+/// where that independence is the point rather than a footnote.
 func use_returned_end(system: &System, b_in: &PipeInlet,
                       answered: WaitResult) -> Result<Void, SosStatus> {
-    var woke = move answered
-    guard let payload = woke.message.take() else { return SosStatus.BadImage }
-    var reply = move payload
+    // OPEN THE RECORD: this phase SPENDS what arrived, so it takes the payload
+    // by value and matches it owned (`WaitResult.open`).
+    let (_, what) = (move answered).open()
+    guard let reply_msg = reply_of(move what) else { return SosStatus.BadImage }
+    var reply = move reply_msg
     guard let carried = reply.handles[0].take() else { return SosStatus.BadImage }
     match carried {
         case Outlet(o) -> {
@@ -210,6 +212,25 @@ func use_returned_end(system: &System, b_in: &PipeInlet,
     }
 }
 
+/// **THE MESSAGE OUT OF AN OWNED PAYLOAD.** Two nested owned matches, each
+/// consuming its scrutinee, so the `PipeMsg` comes out of `Reply(Data(msg))`
+/// exactly once — the licensed spelling of what SL-17 makes unsound through a
+/// borrow.
+func reply_of(what: WaitPayload) -> PipeMsg? {
+    match what {
+        case Reply(outcome) -> {
+            match outcome {
+                case Data(msg) -> {
+                    let got: PipeMsg? = move msg
+                    move got
+                },
+                case PeerClosed -> None,
+            }
+        },
+        case _ -> None,
+    }
+}
+
 /// How many bytes the reply in this record carries.
 ///
 /// **IT READS A FIELD RATHER THAN A PAYLOAD**, which is M4 unit 4's shape: a
@@ -217,12 +238,16 @@ func use_returned_end(system: &System, b_in: &PipeInlet,
 /// used, so the message lives in `WaitResult`'s own optional field where a
 /// `take()` reaches it. Reading its length is an ordinary borrow.
 func reply_len(r: &WaitResult) -> UInt {
-    if let _ = r.message { return r.message!.len }
-    0
+    match r.what {
+        case Reply(outcome) -> outcome.len(),
+        case _ -> 0,
+    }
 }
 
 /// Byte `i` of it.
 func reply_byte(r: &WaitResult, i: Int) -> UInt {
-    if let _ = r.message { return r.message!.bytes[i] as UInt }
-    0
+    match r.what {
+        case Reply(outcome) -> outcome.byte(i) as UInt,
+        case _ -> 0,
+    }
 }

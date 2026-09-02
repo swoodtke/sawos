@@ -170,20 +170,25 @@ func two_claims(inlet: &PipeInlet, outlet: &PipeOutlet,
 /// reply, or a reply that says `PeerClosed`, answers zero — this case never
 /// produces either, and a zero in the transcript would say the arm was wrong.
 func reply_len(r: &WaitResult) -> UInt {
-    if let _ = r.message { return r.message!.len }
-    0
+    match r.what {
+        case Reply(outcome) -> outcome.len(),
+        case _ -> 0,
+    }
 }
 
 /// Byte `i` of the reply in this record.
 ///
 /// **IT READS THE BYTES THROUGH A BORROW**, which is what makes `PipeMsg` being
-/// `NoCopy` cost nothing at a call site: the message sits in the record's own
-/// field and only the one byte comes out as a value. Since M4 unit 4 the
-/// delivery is a FIELD rather than a payload, because a message that carries
-/// handles has to be movable out and a match arm's binding never is.
+/// `NoCopy` cost nothing at a call site: the message sits inside the payload
+/// where the delivery put it and only the one byte comes out as a value. A
+/// nested place-match binds the message where it sits and moves nothing, which
+/// is exactly the reading SL-17 does not touch — `WaitResult.open` is for the
+/// callers that go on to SPEND what arrived.
 func reply_byte(r: &WaitResult, i: Int) -> UInt {
-    if let _ = r.message { return r.message!.bytes[i] as UInt }
-    0
+    match r.what {
+        case Reply(outcome) -> outcome.byte(i) as UInt,
+        case _ -> 0,
+    }
 }
 
 /// Take one message and hand its obligation back. Every take reached this way
