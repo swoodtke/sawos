@@ -4,7 +4,22 @@ Status: AUTHORED Sep 2 2026 (lead); **§API USER-REVIEWED SAME DAY
 (the review gate, discharged): the `PipeHandle` enum, the three
 rendezvous-ledger rules, `give(keep:)` with no mask on message-attach,
 and HANDLES-BEFORE-BYTES in the record (the fixed-prefix rule) — all
-user-ruled. Dispatched Sep 2.** Ladder unit 4 of the ruled
+user-ruled. Dispatched Sep 2. **AMENDED SAME DAY at the agent's
+clean STOP (three §API flaws caught against the tree; user-ruled
+fixes): (1) the handle region carries KINDS — one byte per slot
+(request + 4 message slots, BootHandleKind values, 0 = empty), and
+`len` shrinks to a u8 PACKED WITH THEM (128-byte max needs no word);
+the standalone body_len word dies; the agent lays out the exact
+per-profile meta words inside the fixed-prefix rule and argues the
+offsets. (2) The decoded vocabulary (PipeMsg, ReplyDelivery,
+WaitPayload, WaitResult, decode_wait, Waiter.wait) moves from sosabi
+to sos.pipe via extension Waiter; wire enums + offsets stay in
+sosabi. (3) PipeHandle is SIX cases — Memory, IoMemory, Inlet,
+Outlet, Reply, Request (givable AND declarable; the four
+Transfer-less kinds were dead surface, System/Process are the
+DF-232e cycle) — with Process/System-in-messages a NAMED FOLLOW-UP
+wanting a module-split ruling. PIPE_MSG_HANDLES lands in sosabi
+beside PIPE_BODY_BYTES (design 13 deviation 1 verbatim).** Ladder unit 4 of the ruled
 plan of record (designs/010): ruling 5 (the staged handle's ledger),
 ruling 11(d) (the completion-queue outlet), and the keep-mask rider
 (agenda 7b — the ladder left the placement to this brief; folded here,
