@@ -1,7 +1,10 @@
 # SawOS design 18 — rendezvous: handles in messages, delivery-as-take, the keep-mask (M4 unit 4)
 
-Status: DRAFT Sep 2 2026 (lead) — **§API below is under the review
-gate: the user rules before dispatch.** Ladder unit 4 of the ruled
+Status: AUTHORED Sep 2 2026 (lead); **§API USER-REVIEWED SAME DAY
+(the review gate, discharged): the `PipeHandle` enum, the three
+rendezvous-ledger rules, `give(keep:)` with no mask on message-attach,
+and HANDLES-BEFORE-BYTES in the record (the fixed-prefix rule) — all
+user-ruled. Dispatched Sep 2.** Ladder unit 4 of the ruled
 plan of record (designs/010): ruling 5 (the staged handle's ledger),
 ruling 11(d) (the completion-queue outlet), and the keep-mask rider
 (agenda 7b — the ladder left the placement to this brief; folded here,
@@ -60,10 +63,19 @@ receiver matches it out. Four slots per message:
 ```saw
 public struct PipeMsg {               // GROWN, not new (unit 3's type)
     public len: UInt,
-    public bytes: [UInt8; PIPE_BODY_BYTES],
     public handles: [PipeHandle?; PIPE_MSG_HANDLES],   // None = empty slot
+    public bytes: [UInt8; PIPE_BODY_BYTES],
 }
 ```
+
+**HANDLES BEFORE BYTES (user, Sep 2)** — the fixed-prefix/
+variable-tail rule, composing with unit 3's copy-out-sized-to-the-
+delivery: the record is 4 header words, then the FIXED handle region
+(the request slot + `PIPE_MSG_HANDLES` message slots, 5 words), then
+the body — so every copy-out is a contiguous prefix ending at
+`body_len`, a handles-only message never pays a 128-byte hole, and
+every handle word sits at a fixed offset for the decode. The Saw
+struct mirrors the record's order (declaration-order ABI).
 
 ### The grown ops (kernel/abi — §5.7 growths, no new ops)
 
