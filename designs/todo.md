@@ -21,40 +21,13 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
-- (empty — unit 3.5 closed below; unit 4 is the next rung of #10's ladder
-  and is not yet briefed)
+- 1. M4 unit 4 — rendezvous + delivery-as-take [#10 rulings 5/11(d) +
+  the keep-mask rider; design 18 to author]. PENDS THE FOURTH PIN BUMP
+  (user, Sep 1): sawlang grows `consumes` to resolve SL-16, the
+  consuming surfaces convert at closure, and unit 4's brief writes the
+  FINAL spellings — the APIs complete before the ladder continues.
 
 ## [BACKLOG] — filed, not scheduled
-
-- **CLOSED — M4 unit 3.5, the fused paths [#17 —
-  designs/017-fused-paths.md; dispatched and landed Sep 1].** Built as
-  briefed. `PipeInletOp.Call` (post-park-resolve behind one trap, gated
-  by the existing `PipeInletRight.Post`, parks on the inlet's room level
-  and never answers `WouldBlock`, no duration argument, mints no
-  `PipeReplyHandle`) and `PipeRequestOp.ReplyWait` (on the REQUEST, the
-  waiter REQUIRED, leg-tagged answer with `Wait` = 0, the request
-  consumed on every path). The claim of a parked call is THREAD-TIED —
-  `PIPE_CALLER` forward, `ThreadSlot.call_claim` back — and the wake
-  dispatch grew ONE arm (`kcore.refs.notify_claim`), with the room level's
-  own arm beside it because ruling 8's park has two states.
-  `end_process` grew the orphaned-claim pass, ahead of the close-all.
-  Typed surface: `PipeInlet.send(body:len:) -> Result<PipeMsg,
-  SosStatus>` and `PipeRequest.reply_wait(body:len:waiter:) ->
-  Result<WaitResult, ReplyWaitError>`. Suite 198/198 -> 210/210 (105
-  cases/arch); six new cases, nine new packages.
-  **ONE FORCED DEVIATION FROM THE REVIEWED §API, FOR THE USER TO
-  RATIFY**: `reply_wait`'s reviewed CONSUMING RECEIVER (`self` by value)
-  is not expressible — sawc 0.3.0 answers ``Parse error: 'self' must be
-  a reference: use '&self' or '&var self'`` — so it landed as `&var self`
-  + disarm-before-the-syscall, which is `PipeRequest.reply`'s own
-  spelling of the same contract one method up and is observably
-  identical (the request is consumed on every path, and a second use is
-  the diagnosed `BadHandle` fault). Filed as SL-16. The alternative that
-  would have kept a true by-value consume — moving the op off the request
-  onto the Waiter, `Waiter.give`'s shape — was NOT taken, because the
-  op's PLACEMENT is the more strongly ruled of the two ("THE OP LIVES ON
-  THE REQUEST", user, Sep 1, restated three times in #10 ruling 4's
-  amendment).
 
 - buffered `debug_print` — a length-taking form [#16 As-built finding,
   Sep 1]: today the seam traps once per BYTE, so a test's prose
@@ -211,4 +184,4 @@ One entry per issue, resolution-sufficient: the symptom verbatim, the probe/site
       }
   }
   ```
-  LANGUAGE_SPEC is ambivalent about it, which is what made this look like a spelling problem rather than a rule: the Gotchas section says "a bare `self` is likewise rejected", while the concurrency section's capture rules say "A CONSUMING `self` receiver (no `&`) is an owned binding and captures by value as usual" — a sentence about a form the parser does not accept. It bit design 17 because the unit's reviewed §API spells `reply_wait(self, …)`, and the two things the user ruled — the op lives ON THE REQUEST, and the receiver is consumed — are jointly unwritable today; the placement won, and the consume is the sentinel discipline. Workaround in-tree: `&var self` + disarm before the syscall, which is the transfer-funnel contract this tree already documents at `sos.floor`. Resolution: either allow a by-value receiver (which would make single-use a COMPILE error at every funnel in this kernel, rather than a runtime fault the generations diagnose), or strike the concurrency section's sentence and say once, in one place, that a consuming receiver is spelled as a by-value PARAMETER on another type.
+  LANGUAGE_SPEC is ambivalent about it, which is what made this look like a spelling problem rather than a rule: the Gotchas section says "a bare `self` is likewise rejected", while the concurrency section's capture rules say "A CONSUMING `self` receiver (no `&`) is an owned binding and captures by value as usual" — a sentence about a form the parser does not accept. It bit design 17 because the unit's reviewed §API spells `reply_wait(self, …)`, and the two things the user ruled — the op lives ON THE REQUEST, and the receiver is consumed — are jointly unwritable today; the placement won, and the consume is the sentinel discipline. Workaround in-tree: `&var self` + disarm before the syscall, which is the transfer-funnel contract this tree already documents at `sos.floor`. Resolution: either allow a by-value receiver (which would make single-use a COMPILE error at every funnel in this kernel, rather than a runtime fault the generations diagnose), or strike the concurrency section's sentence and say once, in one place, that a consuming receiver is spelled as a by-value PARAMETER on another type. **FIX IN FLIGHT (user, Sep 1): sawlang grows a `consumes` effect — closes at the FOURTH pin bump.** The ruled syntax: `func f(&var self, ...) consumes { ... }` on the definition (the effect slot, receiver unchanged — exclusivity is the entry requirement, consumption the exit); call sites spell `(move obj).f(...)` (moves stay written — stronger than Rust's invisible-at-the-call consumption); inside a `consumes` body ONE NoCopy field may be moved out (`return move self.items` — the into_inner carve-out; partial moves stay banned everywhere else, multi-field splits a named v1 limit). TWO QUESTIONS SENT UPSTREAM WITH IT: whether a `consumes` body suppresses the synthesized deinit (decides if the NO_HANDLE sentinel retires or survives internally), and the hand-written-deinit interaction with the field move-out. At closure: `reply`/`resolve`/`reply_wait` definitions gain `consumes`, their call sites gain `(move ...)`, the sentinel logic tightens to whatever the deinit ruling permits, and the compile-time use-after-consume error this entry names becomes real. `Waiter.give` is untouched (by-value PARAMETERS were always legal; the gap was receiver-position only).

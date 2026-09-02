@@ -728,3 +728,40 @@ repo's first done file; sawos was born Aug 28 (sawlang#238).
   The Process.mint(rights:) addition accepted as the per-kind-on-
   demand answer the unit-1 parked mint finding anticipated; the
   buffered-debug_print finding seeded in the backlog.
+- **CLOSED — M4 unit 3.5, the fused paths [#17 —
+  designs/017-fused-paths.md; dispatched and landed Sep 1].** Built as
+  briefed. `PipeInletOp.Call` (post-park-resolve behind one trap, gated
+  by the existing `PipeInletRight.Post`, parks on the inlet's room level
+  and never answers `WouldBlock`, no duration argument, mints no
+  `PipeReplyHandle`) and `PipeRequestOp.ReplyWait` (on the REQUEST, the
+  waiter REQUIRED, leg-tagged answer with `Wait` = 0, the request
+  consumed on every path). The claim of a parked call is THREAD-TIED —
+  `PIPE_CALLER` forward, `ThreadSlot.call_claim` back — and the wake
+  dispatch grew ONE arm (`kcore.refs.notify_claim`), with the room level's
+  own arm beside it because ruling 8's park has two states.
+  `end_process` grew the orphaned-claim pass, ahead of the close-all.
+  Typed surface: `PipeInlet.send(body:len:) -> Result<PipeMsg,
+  SosStatus>` and `PipeRequest.reply_wait(body:len:waiter:) ->
+  Result<WaitResult, ReplyWaitError>`. Suite 198/198 -> 210/210 (105
+  cases/arch); six new cases, nine new packages.
+  **ONE FORCED DEVIATION FROM THE REVIEWED §API, FOR THE USER TO
+  RATIFY**: `reply_wait`'s reviewed CONSUMING RECEIVER (`self` by value)
+  is not expressible — sawc 0.3.0 answers ``Parse error: 'self' must be
+  a reference: use '&self' or '&var self'`` — so it landed as `&var self`
+  + disarm-before-the-syscall, which is `PipeRequest.reply`'s own
+  spelling of the same contract one method up and is observably
+  identical (the request is consumed on every path, and a second use is
+  the diagnosed `BadHandle` fault). Filed as SL-16. The alternative that
+  would have kept a true by-value consume — moving the op off the request
+  onto the Waiter, `Waiter.give`'s shape — was NOT taken, because the
+  op's PLACEMENT is the more strongly ruled of the two ("THE OP LIVES ON
+  THE REQUEST", user, Sep 1, restated three times in #10 ruling 4's
+  amendment).
+  INTEGRATED to main Sep 1 2026 (lead-reviewed, lead gate re-run
+  210/210, sawlang HEAD 87063387 unchanged, fast-forward 5cda754).
+  The receiver-spelling judgment RATIFIED BY EVENTS: the user is
+  resolving SL-16 upstream with a `consumes` effect (fourth pin bump),
+  so the landed `&var self` + disarm spelling is the ruled interim and
+  converts at closure. The server arithmetic correction (3->2, unit
+  4's delivery-as-take completes to 1) accepted — the brief's claim
+  was the lead's error; the measured baseline stands.
