@@ -592,3 +592,54 @@ forced it at. What the closure adds to the record is that the gap had a THIRD
 shape nobody had priced: a funnel whose consumption is CONDITIONAL. `consumes`
 does not reach it, and after the sweep `resolve` is the one op in this file
 that still spells single use in a value rather than in a type.
+
+### Transcript accounting (the closure's own)
+
+Baseline captured at `d7a74c0` before any edit; gate re-run at `3412be3`.
+210/210 both times. **The two transcripts differ in image sizes and in
+NOTHING else** — no case's verdict moved, no ordering moved, and none of the
+three timing-dependent cases (`thread_preempt`, `timer_interval`,
+`process_stats`) wobbled in this pair.
+
+| riscv32 image | before | after | delta | why |
+|---|---|---|---|---|
+| `pipe-oneshot` | 24256 | 23648 | −608 | 6 sites, sentinel gone |
+| `pipe-wait-reply` | 31552 | 31136 | −416 | 3 sites |
+| `pipe-abandon` | 16984 | 16808 | −176 | 1 site |
+| `pipe-big-reply` | 13952 | 13840 | −112 | 1 site |
+| `pipe-no-reply` | 14376 | 14312 | −64 | 1 site |
+| `pipe-send-manual` | 45760 | 45696 | −64 | 1 site |
+| `pipe-call-orphan` | 32752 | 32688 | −64 | 2 sites |
+| `pipe-dead-claim` | 14688 | 14640 | −48 | 1 site |
+| `pipe-wait-give` | 25272 | 25240 | −32 | 2 sites |
+| `pipe-reply-wait-dead` | 19192 | 22120 | **+2928** | the retarget, not the sweep |
+
+**EVERY CONVERTED IMAGE SHRANK**, which is the retired sentinel showing up as
+bytes: a disarm is a store plus the by-reference plumbing that carried the
+wrapper into the `unsafe` helper, and taking the WORD instead removes both.
+The one growth is `pipe-reply-wait-dead`, and it is the rework rather than the
+conversion — the retargeted case renders a `ReplyWaitError` through the
+`Printable` chain (leg describe + status describe) where the old one printed
+two fixed strings and faulted.
+
+`child-reply` and `child-server` each converted one site and did NOT move
+(13984 and 21016 both runs, rebuilt in the gate). Both images are byte-exact
+— neither segment is page-rounded — so the removed store was absorbed by
+instruction alignment. **NO arm64 IMAGE MOVED AT ALL, and that is an artifact
+worth writing down**: an arm64 sosimg's RX segment is rounded to a 4096-byte
+page and its RW segment is entirely bss, so the whole file size is
+`72 + round_up(text, 4096)` and any change smaller than a page is invisible.
+riscv32 rounds neither, so it is the arch whose numbers are a measurement.
+Currency was confirmed independently — the arm64 `pipe-reply-wait-dead` image
+carries the new console strings.
+
+**THE ROWS THAT MOVED ARE ONE CASE'S, AND THEY ARE IN THE RUNNER**, since the
+harness asserts console lines rather than printing them. `pipe_reply_wait_dead`
+lost `SOS replywaitdead: discharged the obligation` and
+`SOS: process fault: bad handle process={zero}`, gained
+`SOS replywaitdead: the client let its claim go`,
+`SOS replywaitdead: reply_wait says the reply did not land: the other end of
+this connection is gone` and `SOS replywaitdead: done`, and its
+`expect_clean_exit` went `False` -> `True` with `expect_status` dropped. The
+argument is the rider's fourth bullet: the proof it used to make is a compile
+error now, and no Saw program can witness it.
