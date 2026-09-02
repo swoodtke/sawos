@@ -4752,7 +4752,36 @@ def main():
                         help="run N package builds, and then N cases, at a "
                              "time (default: 4 — this host's performance-core "
                              "count; `-j 1` is the serial harness)")
+    parser.add_argument("--board", metavar="NAME", default="virt",
+                        help="board profile (default: virt — the GATE's, and "
+                             "the only implemented one). `esp32c3` is design "
+                             "20's NON-GATING smoke target: Espressif QEMU, "
+                             "machine-local, never CI")
     args = parser.parse_args()
+
+    if args.board != "virt":
+        # ------------------------------------------------------------------
+        # BOARD SECTION: esp32c3 — STUB, filled by design 20's agent.
+        # Everything board-specific lands HERE and only here, so the virt
+        # tables above stay another unit's to edit (the Sep-2 stub-pass
+        # ruling: pre-carved regions instead of rebase conflicts). To fill:
+        #   - resolve the Espressif QEMU binary (~/.espressif/tools/
+        #     qemu-riscv32/<ver>/qemu/bin/qemu-system-riscv32; see the
+        #     espressif-qemu-tools memory / design 19 addenda)
+        #   - `-machine esp32c3`, direct-boot flash image (magic words at
+        #     offset 0; the bundled ROM jumps in)
+        #   - the SMOKE list only: bringup (boot->transcript, trap entry,
+        #     timer tick) + memory config (PMP over the real C3 map,
+        #     isolation smoke). NON-GATING by ruling — never sos-test.
+        # ------------------------------------------------------------------
+        if args.board == "esp32c3":
+            print(f"{RED}--board esp32c3 is a stub: design 20 fills this "
+                  f"section (the smoke harness is not built yet){RESET}",
+                  file=sys.stderr)
+        else:
+            print(f"{RED}unknown --board {args.board!r}; known: virt, "
+                  f"esp32c3 (stub){RESET}", file=sys.stderr)
+        sys.exit(2)
 
     if args.jobs < 1:
         print(f"{RED}-j must be at least 1 (got {args.jobs}){RESET}",

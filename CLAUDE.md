@@ -42,6 +42,10 @@ Every change gates on `make sos-test` before commit. The acceptance oracle
 tradition: diff the console transcript, don't just read "green"
 (sawlang#238 unit 0).
 
+`make sos-smoke-esp32c3` (design 20, stubbed) is NON-GATING board
+smoke against the machine-local Espressif QEMU — never part of
+sos-test, never CI.
+
 The runner is PARALLEL BY DEFAULT — `-j 4`, a user ruling (Sep 1: four
 P-cores, six E-cores; the parallelism tracks the P-cores). The report is
 printed in case-definition order whatever the completion order, so a
