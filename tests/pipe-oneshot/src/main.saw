@@ -118,38 +118,44 @@ func round_trip(inlet: &PipeInlet, outlet: &PipeOutlet) -> Result<Void, SosStatu
     msg[1] = 66
     msg[2] = 67
 
-    let staged = try inlet.post(body: &msg, len: 3)
-    guard var claim = move staged else { return BUG }
+    var claim = try inlet.post(body: &msg, len: 3)
 
     let taken = try outlet.take()
-    guard let (arrived, request) = move taken else { return BUG }
+    let (arrived, request) = move taken
     let obligation = move request
     print("SOS oneshot: request len={} b={},{},{}\n", arrived.len,
           arrived.bytes[0] as UInt, arrived.bytes[1] as UInt,
           arrived.bytes[2] as UInt)
 
-    // **A RESOLVE BEFORE THE REPLY IS `Ok(None)` AND CONSUMES NOTHING.** The
-    // exchange is taken and the server has not answered, which is the pending
-    // state a poll loop lives in — and the claim below this line is the SAME
-    // claim, which is what makes the poll writable at all.
-    let pending = try claim.resolve()
-    if let _ = pending { return BUG }
-    let _ = write_line("SOS oneshot: pending is none\n")
+    // **THE PENDING QUESTION IS `ready()` NOW, AND IT IS `Ok(false)`**
+    // (`designs/010` ruling 12(b)). Through unit 4 this line was a `resolve`
+    // answering `Ok(None)`; a resolve would PARK here, because the exchange is
+    // taken and the server has not answered — which is exactly the state the
+    // question exists for. It consumes nothing, so the claim below this line is
+    // the SAME claim, and readiness is monotonic, so a `false` here can only
+    // become a `true`.
+    let ready = try claim.ready()
+    if ready { return BUG }
+    let _ = write_line("SOS oneshot: pending is not ready\n")
 
     msg[0] = 90
     msg[1] = 89
     try (move obligation).reply(body: &msg, len: 2)
 
-    let answered = try claim.resolve()
-    guard let got = move answered else { return BUG }
+    // ...and now the level is up, so the resolve returns WITHOUT parking. The
+    // move is the typed tier's half of ruling 12(b): the claim is spent, and a
+    // second use of this binding is a compile error.
+    let got = try (move claim).resolve()
     print("SOS oneshot: reply len={} b={},{}\n", got.len,
           got.bytes[0] as UInt, got.bytes[1] as UInt)
     return
 }
 
-/// **A REPLY OF ZERO BYTES IS STILL AN ANSWER** — the `Optional` is what keeps it
-/// apart from "no reply yet", exactly as it keeps a zero-length MESSAGE apart
-/// from an empty ring on the request side (§2.1's data-free option, both ways).
+/// **A REPLY OF ZERO BYTES IS STILL AN ANSWER** — and since M4 unit 4.5 nothing
+/// has to keep it apart from "no reply yet", because "no reply yet" is not an
+/// answer this op can give: a pending resolve PARKS (`designs/010` ruling
+/// 12(b)). The same simplification on the request side is `take`'s: a
+/// zero-length message is `Ok`, an empty ring is `Err(WouldBlock)`.
 /// **AND IT IS THE PHASE THE TRAP COUNT IS TAKEN OVER** (sawos design 16),
 /// because it is the smallest complete exchange in the file: post, take, reply,
 /// resolve, and not one printed byte between the brackets. Every printed byte is
@@ -160,11 +166,10 @@ func zero_reply(proc: &Process, inlet: &PipeInlet,
     msg[0] = 5
 
     let before = try proc.stats()
-    let staged = try inlet.post(body: &msg, len: 1)
-    guard var claim = move staged else { return BUG }
+    let claim = try inlet.post(body: &msg, len: 1)
     let obligation = try take_one(&outlet)
     try (move obligation).reply(body: &msg, len: 0)
-    let answered = try claim.resolve()
+    let zero = try (move claim).resolve()
     // The closing read is charged at trap entry like any other, so:
     //
     //     delta = post + take + reply + resolve + this read = 4 + 1 = 5
@@ -174,10 +179,11 @@ func zero_reply(proc: &Process, inlet: &PipeInlet,
     // function: `claim` and `obligation` are owning wrappers, and a wrapper
     // still holding a live word issues a release when it falls out of scope.
     // Those releases are traps too — they are just this phase's epilogue rather
-    // than its exchange.
+    // than its exchange. Since M4 unit 4.5 both of them are spent by CONSUMING
+    // ops instead, so this phase's epilogue is empty and the arithmetic is the
+    // exchange alone.
     let after = try proc.stats()
 
-    guard let zero = move answered else { return BUG }
     print("SOS oneshot: zero reply len={}\n", zero.len)
     print("SOS oneshot: the exchange cost {} traps\n",
           after.syscalls - before.syscalls)
@@ -196,14 +202,11 @@ func three_in_flight(inlet: &PipeInlet,
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
 
     msg[0] = 1
-    let first = try inlet.post(body: &msg, len: 1)
+    let c1 = try inlet.post(body: &msg, len: 1)
     msg[0] = 2
-    let second = try inlet.post(body: &msg, len: 1)
+    let c2 = try inlet.post(body: &msg, len: 1)
     msg[0] = 3
-    let third = try inlet.post(body: &msg, len: 1)
-    guard var c1 = move first else { return BUG }
-    guard var c2 = move second else { return BUG }
-    guard var c3 = move third else { return BUG }
+    let c3 = try inlet.post(body: &msg, len: 1)
 
     // The obligations come out in the order the messages went in.
     let r1 = try take_one(&outlet)
@@ -217,9 +220,9 @@ func three_in_flight(inlet: &PipeInlet,
     msg[0] = 11
     try (move r1).reply(body: &msg, len: 1)
 
-    let a = try resolve_one(&var c1)
-    let b = try resolve_one(&var c2)
-    let c = try resolve_one(&var c3)
+    let a = try resolve_one(move c1)
+    let b = try resolve_one(move c2)
+    let c = try resolve_one(move c3)
     print("SOS oneshot: fifo replies a={} b={} c={}\n", a, b, c)
     return
 }
@@ -237,8 +240,7 @@ func ring_around_one(inlet: &PipeInlet,
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     msg[0] = 7
 
-    let held = try inlet.post(body: &msg, len: 1)
-    guard var claim = move held else { return BUG }
+    let claim = try inlet.post(body: &msg, len: 1)
     let obligation = try take_one(&outlet)
 
     let busy = try fill(&inlet, &msg)
@@ -251,8 +253,7 @@ func ring_around_one(inlet: &PipeInlet,
     // claim takes its answer, so the slot goes back and the ring is whole again.
     msg[0] = 8
     try (move obligation).reply(body: &msg, len: 1)
-    let settled = try claim.resolve()
-    guard let _ = settled else { return BUG }
+    let _ = try (move claim).resolve()
 
     let whole = try fill(&inlet, &msg)
     print("SOS oneshot: depth settled={}\n", whole)
@@ -265,22 +266,27 @@ func ring_around_one(inlet: &PipeInlet,
 /// because they are about the RING and not about the pair.
 func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
           len: UInt) -> Result<Bool, SosStatus> {
-    let staged = try inlet.post(body: &body, len: len)
-    if let claim = move staged {
-        let _ = move claim
-        return true
+    let claim = try inlet.post(body: &body, len: len) catch {
+        match error {
+            case WouldBlock -> { return false },
+            case _ -> { return error },
+        }
     }
-    return false
+    let _ = move claim
+    return true
 }
 
 /// Take, and discharge the obligation by dropping it — the mirror of `tell`.
 func take_and_drop(outlet: &PipeOutlet) -> Result<Bool, SosStatus> {
-    let got = try outlet.take()
-    if let (_, request) = move got {
-        let _ = move request
-        return true
+    let got = try outlet.take() catch {
+        match error {
+            case WouldBlock -> { return false },
+            case _ -> { return error },
+        }
     }
-    return false
+    let (_, request) = move got
+    let _ = move request
+    return true
 }
 
 /// Post until the kernel refuses, and hand back how many went — the ring's FREE
@@ -324,15 +330,19 @@ func drain(outlet: &PipeOutlet) -> Result<UInt, SosStatus> {
 /// an absence is a bug in the case rather than a poll.
 func take_one(outlet: &PipeOutlet) -> Result<PipeRequest, SosStatus> {
     let got = try outlet.take()
-    guard let (_, request) = move got else { return BUG }
+    let (_, request) = move got
     return move request
 }
 
 /// Resolve one claim and answer the first byte of its reply — which is what the
 /// three-in-flight row asserts, one digit per exchange.
-func resolve_one(claim: &var PipeReply) -> Result<UInt, SosStatus> {
-    let got = try claim.resolve()
-    guard let answer = move got else { return BUG }
+///
+/// **IT TAKES THE CLAIM BY VALUE**, because `resolve` consumes it (`designs/010`
+/// ruling 12(b)): a `&var` parameter could not be moved out of, so the helper's
+/// signature carries the same single-use the op does and the call sites spell
+/// `resolve_one(move c1)`.
+func resolve_one(claim: PipeReply) -> Result<UInt, SosStatus> {
+    let answer = try (move claim).resolve()
     return answer.bytes[0] as UInt
 }
 

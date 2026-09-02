@@ -92,8 +92,21 @@ func room_returns(proc: &Process, waiter: &Waiter) -> Result<Void, SosStatus> {
     let depth = try fill(&inlet, &msg)
     // The ring is now full: one more post would be refused, which is what makes
     // the level FALSE at this instant.
-    let extra = try inlet.post(body: &msg, len: 1)
-    if let claim = move extra { return BUG }
+    // The refusal is on the ERROR channel since M4 unit 4.5 (`designs/010`
+    // ruling 12(a)), so the full ring is a `WouldBlock` arm rather than a
+    // `None` — this case is a poller and says so.
+    match inlet.post(body: &msg, len: 1) {
+        case Ok(claim) -> {
+            let _ = move claim
+            return BUG
+        },
+        case Err(e) -> {
+            match e {
+                case WouldBlock -> {},
+                case _ -> { return e },
+            }
+        },
+    }
 
     // One exchange settles — taken, and its obligation dropped with nobody
     // holding the claim — so exactly one slot comes back.
@@ -146,22 +159,27 @@ func level_name(r: &WaitResult) -> String {
 
 func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
           len: UInt) -> Result<Bool, SosStatus> {
-    let staged = try inlet.post(body: &body, len: len)
-    if let claim = move staged {
-        let _ = move claim
-        return true
+    let claim = try inlet.post(body: &body, len: len) catch {
+        match error {
+            case WouldBlock -> { return false },
+            case _ -> { return error },
+        }
     }
-    return false
+    let _ = move claim
+    return true
 }
 
 func take_and_drop(outlet: &PipeOutlet,
                    into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<Bool, SosStatus> {
-    let got = try outlet.take()
-    if let (_, request) = move got {
-        let _ = move request
-        return true
+    let got = try outlet.take() catch {
+        match error {
+            case WouldBlock -> { return false },
+            case _ -> { return error },
+        }
     }
-    return false
+    let (_, request) = move got
+    let _ = move request
+    return true
 }
 
 func fill(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES]) -> Result<UInt, SosStatus> {

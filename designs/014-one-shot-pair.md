@@ -45,6 +45,17 @@ the pull-forward is seen to be considered, not missed.
   `PeerClosed` if the server side abandoned. The blocking
   `send(msg)`/`send(msg, timeout:)` library compositions stay unit
   3's, when there is something to park on.
+  > **RE-RULED Sep 2 by `designs/010` ruling 12(b), landed as sawos
+  > design 22 (M4 unit 4.5): `WouldBlock` LEFT THIS OP ENTIRELY.** A
+  > pending exchange PARKS the calling thread on the claim's ready
+  > level, so every path `Resolve` can return through consumes the
+  > caller's entry — `Ok(msg)` or `PeerClosed` — which is what lets
+  > `PipeReply.resolve` carry `consumes` and makes a second resolve a
+  > compile error rather than the `BadHandle` this unit's
+  > `pipe-dead-claim` used to prove. The level question moved to the new
+  > `PipeReplyOp.Ready`, gated on `PipeReplyRight.Wait`. Everything else
+  > this section says still holds, including the `PeerClosed` arm and its
+  > consume.
 - **Abandonment is information, not an imperative** [§2.1 ratified]:
   server drops its request → the claim answers `PeerClosed`; client
   drops its claim → a cancellation signal the server MAY honor or
@@ -352,6 +363,14 @@ variants: `PipeReply` `` anchored at the `match`, and the arm was restored.
    which is that there is no longer anybody on the other side of THIS exchange.
    `AccessDenied`-style faults were rejected: two holders of sibling handles
    racing is precisely what a caller could not have checked.
+   > **REVERSED Sep 2 by `designs/010` ruling 12(c), landed as sawos design
+   > 22 (M4 unit 4.5): `Mint` LEAVES BOTH DEFAULT SETS.** The answer this
+   > finding gives is exactly the reason — a sibling on a one-shot can only
+   > ever be told `PeerClosed`, so it is a name that buys nothing and
+   > undermines the compile-time single use ruling 12(b) then made
+   > structural. The enum BITS stay (universal bit 1 is pinned by assert in
+   > every kind's enum); the default sets simply do not hand them out, and
+   > attenuation being monotonic makes the absence permanent.
 5. **NO `pipe-not-waitable` CASE, again.** Unit 1's deviation 2 holds word for
    word for the one-shots: the typed `Waiter.add` has no overload for either kind
    and the wrappers' handle fields are `public(package)`, so the refusal is a
@@ -373,6 +392,15 @@ variants: `PipeReply` `` anchored at the `match`, and the arm was restored.
    typed wrappers disarm on consume, so an ordinary program never meets either
    fault and the case has to ask a SECOND time through a spent value to show that
    the kernel's check is real underneath the wrapper's.
+   > **AND IT IS OUT OF SAW'S REACH SINCE M4 UNIT 4.5** (`designs/010` ruling
+   > 12(b); sawos design 22). `resolve` carries `consumes` now, so the second
+   > ask is a COMPILE error and the suite's last Saw-visible ledger
+   > `BadHandle` retires with it — the same thing SL-16 did to the reply side
+   > at unit 3.5, which is what retargeted `pipe-reply-wait-dead`.
+   > `pipe-dead-claim` retargets to the ruled flow (obligation dropped,
+   > `ready()` answers the terminal, claim DROPPED unresolved) plus a mint
+   > probe. The kernel's check is unchanged and still stands for a
+   > raw-altitude caller holding a word.
 
 ### Findings
 

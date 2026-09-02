@@ -39,10 +39,13 @@ import sos.{System, Process, PipeInlet, PipeOutlet, PipeRequest, PipeHandle,
 /// The boot set carries exactly one thing this child wants: the SERVER end of
 /// the connection its launcher posts through.
 static EXIT_NO_OUTLET: UInt = 91
-/// The take answered nothing, which cannot happen — the launcher posts before it
-/// starts this process, and the message survives its sender.
-static EXIT_NO_MESSAGE: UInt = 92
 /// The message carried no handle, or one of a kind neither arm expects.
+///
+/// **THE "TAKE ANSWERED NOTHING" AND "POST WAS REFUSED" CODES ARE GONE**, and
+/// their absence is `designs/010` ruling 12(a) at a call site: an empty ring and
+/// a full one ride the ERROR channel now, so the `try` that already carried
+/// every other failure carries those too and there is nothing left for a
+/// hand-written code to say.
 static EXIT_NO_HANDLE: UInt = 93
 /// A call that should not have been refused was.
 static EXIT_REFUSED: UInt = 94
@@ -117,7 +120,7 @@ func drain_outlet(proc: &Process) -> PipeOutlet? {
 /// Take the one message, and do whatever the handle it carried says.
 func serve(outlet: &PipeOutlet) -> Result<UInt, SosStatus> {
     let got = try outlet.take()
-    guard let (arrived, request) = move got else { return EXIT_NO_MESSAGE }
+    let (arrived, request) = move got
     var msg = move arrived
     let own = move request
 
@@ -172,8 +175,7 @@ func serve(outlet: &PipeOutlet) -> Result<UInt, SosStatus> {
             var received = move i
             var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
             body[0] = BYTE_VIA
-            let staged = try received.post(body: &body, len: 1)
-            guard let claim = move staged else { return EXIT_REFUSED }
+            let claim = try received.post(body: &body, len: 1)
             // A TELL: the launcher is the one that takes, and nothing here wants
             // an answer.
             let _ = move claim

@@ -27,14 +27,32 @@ entry below or the brief that carries it, never restating either.
   stub, hal/riscv32-esp32c3/ placeholder (SIBLING-COPY rule: no
   hal/riscv32 restructure — unit 5 owns it), CLAUDE.md non-gating
   note, both queue entries below pre-written.
-- 2. design 22 — the one-shot discipline (M4 unit 4.5) [#10 ruling
-  12, Sep 2; brief AUTHORED, awaiting user §API review]: poll split
-  retired (`WouldBlock` back to the error channel, Optionals struck
-  from take/post), `resolve` consumes + parks with `ready()` the
-  poll, one-shots lose `Mint`. Lands BEFORE unit 5 dispatches (its
-  servers build on this surface); may fly CONCURRENT with design 20
-  (disjoint files — HAL vs pipe surface), the lead decides at
-  dispatch.
+- 2. ~~design 22 — the one-shot discipline (M4 unit 4.5)~~ **CLOSED
+  Sep 2 — all three parts of #10 ruling 12 landed, gate green on both
+  arches (114 cases, 228 assertions).** (a) THE POLL SPLIT IS RETIRED:
+  `take -> Result<(PipeMsg, PipeRequest), _>` and
+  `post`/`post_with -> Result<PipeReply, _>`, `polled_value` retired,
+  `polled_ok` survives as `ready()`'s decode, floor banner rewritten
+  with the `Channel.try_receive` divergence recorded at the seam; ~60
+  call sites swept, three genuine pollers keep a `WouldBlock` arm.
+  (b) `PipeReplyOp.Resolve` PARKS when pending and consumes on every
+  path, so `PipeReply.resolve` carries `consumes` and call sites spell
+  `(move claim).resolve()`; new `PipeReplyOp.Ready = 1` gated on
+  `PipeReplyRight.Wait`, typed `PipeReply.ready(&self)`. The park
+  needed NO new wake or teardown machinery — `park_resolve` is
+  `consume_entry` minus the unref, so `notify_claim`,
+  `wake_call_reply` and `release_pending_calls` serve both parked
+  shapes unchanged. (c) `Mint` left `pipe_reply_rights()` and
+  `pipe_request_rights()`; enum bits and static_asserts untouched.
+  New cases `pipe_resolve_park` (post+resolve = 2 traps against
+  `Call`'s 1) and `pipe_resolve_orphan` (the `end_process` mirror at a
+  handle-backed claim); `pipe_dead_claim` and `pipe_no_reply`
+  retargeted. Docs: spec.md §2's Pipe row, §2.1's resolve line, the
+  §5-era row and the `consumes`-funnel paragraph; design 13 D-2 and
+  design 14's `Resolve`, `Mint` and consumed-handle notes carry
+  re-rule pointers. As-built in `designs/022-one-shot-discipline.md`.
+  ONE ITEM OPENED, filed in [BACKLOG] below: the `PipeRequestRight.Reply`
+  gate lost its only test.
 - 3. design 20 — ESP32-C3 board HAL, SMOKE ONLY (bringup + memory
   config; direct boot; RV32IMC no-A; non-gating, machine-local QEMU)
   [to author; §API review to user]. CONCURRENT WITH:
@@ -42,6 +60,24 @@ entry below or the brief that carries it, never restating either.
   carries the MAX_PROCESSES/PMP-budget question to the user; AFTER
   design 22 lands].
 ## [BACKLOG] — filed, not scheduled
+
+- **`PipeRequestRight.Reply` HAS NO TEST ANY MORE** [#22 As-built
+  finding 1, Sep 2]. Ruling 12(c) took `Mint` out of
+  `pipe_request_rights()`, and the only way this tree ever produced a
+  `PipeRequest` handle WITHOUT `Reply` was `pipe-no-reply` minting an
+  attenuated sibling — so that spelling died with the bit and the case
+  retargeted to the one-name rule instead. The gate itself is still in
+  `pipe_request_op_decoded` and is now reachable ONLY through a `give`
+  keep mask into another process (`Take` mints the full set; a
+  message-carried handle carries the sender's entry rights verbatim),
+  which is a two-process case: root posts, takes the obligation, gives
+  it to a child with `keep = Transfer | Wait`, and the child's `reply`
+  faults with `AccessDenied`. It wants a new child package (~60 lines,
+  `child-narrow`'s shape) and one runner entry. THE SAME HOLE EXISTS AT
+  `PipeReplyRight.Resolve` for the same reason and would be covered by
+  the same case shape at the other end. Filed rather than done because
+  design 22's scope was the discipline, not the coverage the discipline
+  displaced.
 
 - `Process` and `System` in messages — a sysapi MODULE-SPLIT ruling
   [#18 As-built finding 1, Sep 2]: `PipeHandle` ships six cases

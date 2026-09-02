@@ -102,8 +102,7 @@ func delivered(inlet: &PipeInlet, outlet: &PipeOutlet,
     var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     msg[0] = 1
 
-    let staged = try inlet.post(body: &msg, len: 1)
-    guard var claim = move staged else { return BUG }
+    var claim = try inlet.post(body: &msg, len: 1)
     var obligation = try take_one(&outlet, &var buf)
 
     msg[0] = 90
@@ -117,11 +116,19 @@ func delivered(inlet: &PipeInlet, outlet: &PipeOutlet,
 
     // **AND THE CLAIM IS SPENT.** The caller kept its handle — this was `add`
     // and not `give` — so the entry is still good and the kernel still answers
-    // it; what it answers is that this exchange is over.
-    match claim.resolve() {
+    // it; what it answers is that this exchange is over. The ASKING is `ready()`
+    // now (`designs/010` ruling 12(b)): a settled exchange puts its terminal on
+    // the error channel, and a resolve here would have PARKED on an answer that
+    // already went somewhere else if the level had lied. It does not: readiness
+    // is monotonic, and `Settled` is terminal.
+    match claim.ready() {
         case Ok(_) -> { return BUG },
         case Err(e) -> { print("SOS waitreply: after delivery {}\n", e) },
     }
+    // The claim is DROPPED rather than resolved, which is what a terminal
+    // `ready()` asks for — there is no answer to fetch, so spending a resolve on
+    // it would be spending a syscall to be told the same thing.
+    let _ = move claim
     return
 }
 
@@ -139,11 +146,9 @@ func two_claims(inlet: &PipeInlet, outlet: &PipeOutlet,
     var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
 
     msg[0] = 1
-    let first = try inlet.post(body: &msg, len: 1)
+    var ca = try inlet.post(body: &msg, len: 1)
     msg[0] = 2
-    let second = try inlet.post(body: &msg, len: 1)
-    guard var ca = move first else { return BUG }
-    guard var cb = move second else { return BUG }
+    var cb = try inlet.post(body: &msg, len: 1)
 
     var ra = try take_one(&outlet, &var buf)
     var rb = try take_one(&outlet, &var buf)
@@ -196,6 +201,6 @@ func reply_byte(r: &WaitResult, i: Int) -> UInt {
 func take_one(outlet: &PipeOutlet,
               buf: &var [UInt8; PIPE_BODY_BYTES]) -> Result<PipeRequest, SosStatus> {
     let got = try outlet.take()
-    guard let (_, request) = move got else { return BUG }
+    let (_, request) = move got
     return move request
 }

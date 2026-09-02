@@ -45,29 +45,33 @@ static SECOND_BYTE: UInt8 = 8
 /// `pipe-abandon` is where the pair's own abandonment arms are proved.
 func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
           len: UInt) -> Result<Bool, SosStatus> {
-    let staged = try inlet.post(body: &body, len: len)
-    if let claim = move staged {
-        let _ = move claim
-        return true
+    let claim = try inlet.post(body: &body, len: len) catch {
+        match error {
+            case WouldBlock -> { return false },
+            case _ -> { return error },
+        }
     }
-    return false
+    let _ = move claim
+    return true
 }
 
 /// Take, and discharge the obligation by dropping it. Nobody is listening — the
 /// claims went at the posts — so each exchange settles and its ring slot goes
 /// back.
 func take_message(outlet: &PipeOutlet) -> Result<UInt?, SosStatus> {
-    let got = try outlet.take()
-    if let (msg, request) = move got {
-        let _ = move request
-        // The FIRST BYTE rather than the length, since M4 unit 4 moved the
-        // message's bytes into the record the take answers with: what this arm
-        // proves is WHICH message drained, and the length of every one of them
-        // is 1.
-        let some: UInt? = msg.bytes[0] as UInt
-        return move some
+    let got = try outlet.take() catch {
+        match error {
+            case WouldBlock -> { return None },
+            case _ -> { return error },
+        }
     }
-    return None
+    let (msg, request) = move got
+    let _ = move request
+    // The FIRST BYTE rather than the length, since M4 unit 4 moved the
+    // message's bytes into the record the take answers with: what this proves is
+    // WHICH message drained, and the length of every one of them is 1.
+    let some: UInt? = msg.bytes[0] as UInt
+    return move some
 }
 
 @export("_start")

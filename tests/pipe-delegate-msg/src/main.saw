@@ -103,10 +103,9 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     msg[0] = 63
 
-    let staged = try a_in.post(body: &msg, len: 1)
-    guard let claim = move staged else { return SosStatus.WouldBlock }
+    let claim = try a_in.post(body: &msg, len: 1)
     let taken = try a_out.take()
-    guard let (asked, request) = move taken else { return SosStatus.WouldBlock }
+    let (asked, request) = move taken
     let _ = move asked
 
     // **THE FORWARD.** The obligation goes into a message's handle slot, and the
@@ -117,8 +116,7 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     var carrying = PipeHandles.none()
     carrying.put(0, request: move request)
     msg[0] = 1
-    let forwarded = try b_in.post_with(body: &msg, len: 1, handles: &var carrying)
-    guard let courier = move forwarded else { return SosStatus.WouldBlock }
+    let courier = try b_in.post_with(body: &msg, len: 1, handles: &var carrying)
     // A TELL: root wants no answer on B -- the answer it is waiting for comes
     // back on A, through the claim it kept.
     let _ = move courier
@@ -191,13 +189,10 @@ func use_returned_end(system: &System, b_in: &PipeInlet,
             var returned = move o
             var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
             msg[0] = 2
-            let staged = try b_in.post(body: &msg, len: 1)
-            guard let claim = move staged else { return SosStatus.BadImage }
+            let claim = try b_in.post(body: &msg, len: 1)
             let _ = move claim
             let got = try returned.take()
-            guard let (arrived, request) = move got else {
-                return SosStatus.BadImage
-            }
+            let (arrived, request) = move got
             let echoed = arrived.bytes[0]
             let _ = move arrived
             let _ = move request

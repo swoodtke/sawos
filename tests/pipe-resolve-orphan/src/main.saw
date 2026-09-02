@@ -1,49 +1,39 @@
-// SOS M4 unit 3.5: THE ORPHANED-CLAIM ARM (sawos design 17 D-2; `designs/010`
-// ruling 4's rider, which names it and says the unit brief must).
+// SOS M4 unit 4.5: THE ORPHANED-CLAIM ARM, AT A HANDLE-BACKED CLAIM (sawos
+// design 22; `designs/010` ruling 12(b)'s `end_process` mirror).
 //
-// **A FUSED CALL'S CLAIM IS THE ONE REFERENCE IN THE SYSTEM THAT NO HANDLE
-// TABLE HOLDS.** That is what the fused path buys — no `PipeReply` is minted,
-// so a blocking client spends no table row and no quota — and it is exactly why
-// the teardown needed a new arm: `end_process`'s close-all walks HANDLES, and a
-// parked caller has none to walk. Without the arm the ring slot would be pinned
-// for ever and `PIPE_CALLER` would be left naming a thread slot the sweep below
-// it is about to recycle.
+// **`pipe-call-orphan` WITH THE OTHER SPELLING, AND THAT IS THE WHOLE CLAIM.**
+// A fused `Call`'s claim is a reference no handle table holds, which is what
+// made design 17 D-2's teardown arm necessary. A parked `resolve`'s claim WAS a
+// table row until the op took it — `park_resolve` unbinds the caller's entry and
+// KEEPS its reference, which is `consume_entry` with the unref left out — so
+// from the moment it parks the two shapes are indistinguishable: one reference
+// on the claim column, `PIPE_CALLER` naming the thread, and nothing on any list.
 //
-//   SOS callorphan: two calls in flight
-//   SOS callorphan: answered one
-//   SOS: process exit: code=0x…3d process=0x…01
-//   SOS callorphan: the orphaned claim answers the other end of this
-//                   connection is gone
+//   SOS resolveorphan: two resolves in flight
+//   SOS resolveorphan: answered one
+//   SOS: process exit: code=0x…47 process=0x…01
+//   SOS resolveorphan: the orphaned claim answers the other end of this
+//                      connection is gone
 //
-// The last row is the arm: root still holds the SECOND obligation when the
-// child dies, and its `reply` is told `PeerClosed`. That is §2.1's ratified
-// abandoned-by-client answer arriving with NO NEW VOCABULARY — the teardown
-// dropped the claim, the column reached zero, and `pipe_reply` read the columns
-// exactly as it has since unit 2.
+// The last row is the arm, and the point of the case is that reaching it needed
+// NO KERNEL CODE: `release_pending_calls` walks threads with a claim tie and
+// drops the reference, and it never asks which op put it there. A kernel that
+// had grown a second teardown path for the second park would pass this case too;
+// what it would not have is the ONE arm the census argues for.
 //
-// # HOW A PROCESS IS MADE TO DIE WITH A THREAD PARKED
+// # WHY A SIBLING CASE RATHER THAN AN ARM ON `pipe-call-orphan`
 //
-// Nothing in SOS can kill a thread from outside, so the child has to end itself
-// while one of its own threads is parked. `child-orphan` is two threads doing
-// the SAME thing — one fused call each, and `ProcessOp.Exit` if it is answered
-// — so root answering exactly one of the two messages is what ends the process
-// with the other still inside its call. Symmetry is what makes that
-// deterministic: root does not have to know which thread it is talking to,
-// because the two are interchangeable.
+// The proof requires the ORPHANED thread to be the shape under test, and one
+// two-thread child can orphan only one shape: whichever thread the launcher
+// answers exits the process and the other is the orphan. `child-orphan`'s two
+// threads are interchangeable ON PURPOSE — that symmetry is what makes the case
+// deterministic without the launcher knowing which thread it is talking to — so
+// making them differ would have traded a fact for a scan order. Two cases, one
+// spelling each, keeps both proofs and both symmetries.
 //
-// # WHY ROOT NEVER POLLS
-//
-// Root waits for the first message, takes it, and waits again — and the second
-// wait PARKS, because nothing is staged until the child's other thread runs.
-// So the two takes are separated by a park rather than by a poll loop, and the
-// transcript's ordering says the kernel scheduled the sibling because root had
-// nothing left to do.
-//
-// **THE OUTLET IS DETACHED BEFORE THE DEATH WAIT**, and that is not tidiness: a
-// dying child drops its inlets, which turns the readable level terminal, so with
-// both attachments live the wait would have TWO ready things and would answer
-// whichever the scan reached first. Removing the one root is finished with makes
-// the answer a fact rather than a scan order.
+// Everything else — how a process is made to die with a thread parked, why root
+// never polls, and why the outlet is detached before the death wait — is
+// `pipe-call-orphan`'s and is written out there.
 //
 // ONE PHASE PER FUNCTION, on design 14 finding 3's 16 KiB stack ceiling.
 
@@ -58,10 +48,11 @@ static EXIT_FAILED: UInt = 1
 /// channel means an assertion in THIS file failed rather than a call did.
 static BUG: SosStatus = SosStatus.Revoked
 
-/// `Exited`(1) << 16 | 61 — the code `child-orphan`'s answered thread ends with.
-static CHILD_STATUS: UInt = 65597
+/// `Exited`(1) << 16 | 71 — the code `child-resolver`'s answered thread ends
+/// with.
+static CHILD_STATUS: UInt = 65607
 
-static_assert((1 * 65536) + 61 == 65597,
+static_assert((1 * 65536) + 71 == 65607,
               "the child's status word is Exited in the high bits and its code")
 
 /// One byte each way.
@@ -83,11 +74,9 @@ static TAG_BOOT: UInt = 17
 static CHILD_SYSTEM: UInt32 = (SystemRight.ProcessSelf | SystemRight.Transfer)
 
 /// **WHAT THE SECOND CLIENT END MAY DO.** A sibling minted through this mask can
-/// post (which is what `send` spends) and nothing else — it may not be handed
-/// on again and may not mint a third. It is here to make the point that the
-/// second end is an ATTENUATED name on one connection rather than a second
-/// connection: `Transfer` IS present, because `give` checks that bit on the
-/// thing being given and the whole purpose of this handle is to be given.
+/// post and nothing else — it may not be handed on again and may not mint a
+/// third. `Transfer` IS present, because `give` checks that bit on the thing
+/// being given and the whole purpose of this handle is to be given.
 static SECOND_INLET: UInt32 = (PipeInletRight.Transfer | PipeInletRight.Post)
 
 @export("_start")
@@ -95,13 +84,13 @@ func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
     let proc = try system.process_self() catch {
-        let _ = system.debug_print("SOS callorphan: no process handle\n")
+        let _ = system.debug_print("SOS resolveorphan: no process handle\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
 
     try run(&system, &proc) catch {
-        print("SOS callorphan: failed: {}\n", error)
+        print("SOS resolveorphan: failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
@@ -117,10 +106,9 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
 
     let child = try system.process_create(image: &image_mem, memory: &dest_mem)
 
-    // ONE CONNECTION, TWO CLIENT ENDS. The sibling is a second NAME on the same
-    // connection (design 13 D-1's `dup` precedent), which is what lets two
-    // threads of one process each hold an end without either handing the other
-    // a handle word — a thing the typed surface deliberately cannot do.
+    // ONE CONNECTION, TWO CLIENT ENDS — design 13 D-1's `dup` precedent, which
+    // is what lets two threads of one process each hold an end without either
+    // handing the other a handle word.
     let pair = try proc.pipe_create()
     let (inlet, outlet) = move pair
     let second = try inlet.mint(rights: SECOND_INLET)
@@ -142,16 +130,15 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
 /// **TAKE BOTH MESSAGES, ANSWER ONE, AND ASK THE OTHER AFTERWARDS.**
 ///
 /// The two obligations are held together across the child's death, which is the
-/// only arrangement in which the arm is observable at all: the second one has
-/// to still exist when the teardown runs, so that root can ask it a question
+/// only arrangement in which the arm is observable at all: the second one has to
+/// still exist when the teardown runs, so that root can ask it a question
 /// afterwards and be told what the teardown decided.
 func collect_and_orphan(outlet: &PipeOutlet,
                         waiter: &Waiter) -> Result<Void, SosStatus> {
-    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     var out: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     out[0] = 2
 
-    // THE FIRST THREAD'S CALL.
+    // THE FIRST THREAD'S EXCHANGE.
     let first = try waiter.wait()
     if first.key != KEY_OUTLET || not readable_msg(&first) {
         return BUG
@@ -160,8 +147,8 @@ func collect_and_orphan(outlet: &PipeOutlet,
     let (_, request_a) = move got_a
     let answered = move request_a
 
-    // THE SECOND THREAD'S. This wait PARKS — nothing is staged until the
-    // sibling runs — so the interleaving is the kernel's rather than a poll's.
+    // THE SECOND THREAD'S. This wait PARKS — nothing is staged until the sibling
+    // runs — so the interleaving is the kernel's rather than a poll's.
     let second = try waiter.wait()
     if second.key != KEY_OUTLET || not readable_msg(&second) {
         return BUG
@@ -170,16 +157,19 @@ func collect_and_orphan(outlet: &PipeOutlet,
     let (_, request_b) = move got_b
     let orphaned = move request_b
 
-    print("SOS callorphan: two calls in flight\n")
+    print("SOS resolveorphan: two resolves in flight\n")
 
     // Detached BEFORE the death, so the wait below has exactly one thing that
-    // can answer it. See the header.
+    // can answer it — `pipe-call-orphan`'s own reasoning.
     try waiter.remove(KEY_OUTLET)
 
-    // ANSWER ONE. Whichever thread this reaches wakes up inside its own `send`,
-    // takes the reply, and ends the process — leaving the other one parked.
+    // ANSWER ONE. Whichever thread this reaches wakes up inside its own
+    // `resolve`, takes the reply, and ends the process — leaving the other one
+    // parked. That wake is `wake_call_reply`, unchanged: the answer is the
+    // reply's length in the value register with the record copied into the
+    // caller's buffer, which is what a fused `Call` gets too.
     try (move answered).reply(body: &out, len: PAYLOAD_LEN)
-    print("SOS callorphan: answered one\n")
+    print("SOS resolveorphan: answered one\n")
 
     let ended = try waiter.wait()
     if ended.key != KEY_DEATH {
@@ -190,17 +180,16 @@ func collect_and_orphan(outlet: &PipeOutlet,
     }
 
     // **THE ARM.** The orphaned claim was abandoned by the teardown, so this
-    // discharges the obligation and is told there is nobody left to hear it.
-    // A `match` rather than the tree's guard shape, deliberately: this is a
-    // negative assertion on a SPECIFIC status, which is one of the two things
-    // CLAUDE.md's idiom ruling keeps `match` for.
+    // discharges the obligation and is told there is nobody left to hear it. A
+    // `match` rather than the tree's guard shape, deliberately: this is a
+    // negative assertion on a SPECIFIC status.
     match (move orphaned).reply(body: &out, len: PAYLOAD_LEN) {
         case Ok(_) -> {
-            print("SOS callorphan: the orphaned claim took a reply\n")
+            print("SOS resolveorphan: the orphaned claim took a reply\n")
             return BUG
         },
         case Err(status) -> {
-            print("SOS callorphan: the orphaned claim answers {}\n", status)
+            print("SOS resolveorphan: the orphaned claim answers {}\n", status)
         },
     }
     return

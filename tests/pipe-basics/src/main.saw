@@ -65,14 +65,22 @@ static MAX_ROUNDS: Int = 64
 /// the exchange's ring slot is released the moment the server's obligation goes
 /// too. Answers "was it staged", which is the `Bool` unit 1's `post` used to
 /// return and is all this case ever needed.
+///
+/// **THIS IS A POLLER, AND IT SAYS SO** (`designs/010` ruling 12(a)): `post`
+/// puts a full ring on the ERROR channel now, so the one caller in this tree
+/// that genuinely fills a ring until it is refused writes the `WouldBlock` arm
+/// out — the idiom ruling's licensed real-work catch — and hands its own callers
+/// the `Bool` they were always reading.
 func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
           len: UInt) -> Result<Bool, SosStatus> {
-    let staged = try inlet.post(body: &body, len: len)
-    if let claim = move staged {
-        let _ = move claim
-        return true
+    let claim = try inlet.post(body: &body, len: len) catch {
+        match error {
+            case WouldBlock -> { return false },
+            case _ -> { return error },
+        }
     }
-    return false
+    let _ = move claim
+    return true
 }
 
 /// **TAKE AND DISCHARGE BY DROPPING.** The obligation this hands back is answered
@@ -80,14 +88,21 @@ func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
 /// which tells a client that is still listening `PeerClosed`. Here nobody is
 /// listening (the claim went at the post), so the exchange simply settles and its
 /// ring slot goes back.
+///
+/// The drain half of the same poller, and the same `WouldBlock` arm: an empty
+/// ring is `Err(WouldBlock)` at the op and `Ok(None)` here, which is this
+/// program's own vocabulary for "the drain is finished".
 func take_message(outlet: &PipeOutlet) -> Result<PipeMsg?, SosStatus> {
-    let got = try outlet.take()
-    if let (msg, request) = move got {
-        let _ = move request
-        let some: PipeMsg? = move msg
-        return move some
+    let got = try outlet.take() catch {
+        match error {
+            case WouldBlock -> { return None },
+            case _ -> { return error },
+        }
     }
-    return None
+    let (msg, request) = move got
+    let _ = move request
+    let some: PipeMsg? = move msg
+    return move some
 }
 
 @export("_start")
@@ -186,10 +201,10 @@ func _start(boot_handle: UInt) {
     }
     print("SOS pipebasics: fifo order={}\n", order)
 
-    // ---- THE EMPTY MESSAGE. §2.1 makes a data-free body an option, and the
-    // Optional is what keeps "a message of length 0" apart from "no message":
-    // this take answers `Ok(Some(0))`, where the one after the drain below
-    // answers `Ok(None)`.
+    // ---- THE EMPTY MESSAGE. §2.1 makes a data-free body an option, and the two
+    // CHANNELS are what keep "a message of length 0" apart from "no message":
+    // this take answers `Ok(msg)` with `len` 0, where the one after the drain
+    // below answers `Err(WouldBlock)`.
     let empty_staged = try tell(&inlet, &msg, 0) catch {
         print("SOS pipebasics: empty post failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -252,10 +267,11 @@ func _start(boot_handle: UInt) {
     }
     print("SOS pipebasics: drained={}\n", drained)
 
-    // ---- AND AN EMPTY RING IS `Ok(None)`, NOT AN ERROR. The loop above already
-    // met it once; asking again says it is stable, and says it through the
-    // typed tier's two channels rather than through a status a caller would
-    // have had to match as a failure.
+    // ---- AND AN EMPTY RING IS `Err(WouldBlock)`, WHICH THE POLLER READS AS ITS
+    // OWN `None`. The loop above already met it once; asking again says it is
+    // stable, and says it through the arm `take_message` writes out rather than
+    // through an Optional every non-polling caller would have had to unwrap
+    // (`designs/010` ruling 12(a)).
     let nothing = try take_message(&outlet) catch {
         print("SOS pipebasics: empty ring is an error: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)

@@ -45,7 +45,9 @@
 // ring is filled first, so the poster is REFUSED and has to park on the inlet's
 // room-to-post level before it can post at all — which is the leg a library
 // `send` would have hidden and which a caller writing this by hand has to know
-// about. `post` answering `Ok(None)` is the honest surface underneath it.
+// about. `post` answering `Err(WouldBlock)` is the honest surface underneath it
+// — the transient moved to the error channel at unit 4.5 (`designs/010` ruling
+// 12(a)) and this is the one program in the tree that acts on it.
 //
 // ONE PHASE PER FUNCTION, on design 14 finding 3's stack ceiling.
 
@@ -166,8 +168,7 @@ func round_trip(system: &System, proc: &Process) -> Result<Void, SosStatus> {
 
     // 1. POST. The ring is fresh, so it cannot refuse; the room leg is exercised
     //    on the unserved connection below, where a refusal is arranged.
-    let staged = try inlet.post(body: &msg, len: PING_LEN)
-    guard var claim = move staged else { return BUG }
+    var claim = try inlet.post(body: &msg, len: PING_LEN)
 
     // 2. ATTACH the claim, one-shot — a reply happens once.
     try waiter.add(reply: &claim, key: KEY_CLAIM, mode: AttachMode.OneShot)
@@ -248,7 +249,9 @@ func round_trip(system: &System, proc: &Process) -> Result<Void, SosStatus> {
 /// post, so the post is REFUSED and the composition has to park on the inlet's
 /// room-to-post level (ruling 8) before it has a claim at all. A library `send`
 /// would have hidden that leg; written by hand, it is where a caller learns that
-/// `Ok(None)` is a level to wait on and not a failure.
+/// `Err(WouldBlock)` is a level to wait on rather than a failure to give up on
+/// (`designs/010` ruling 12(a) moved that answer to the error channel; which
+/// channel it rides changes nothing about what it means).
 func timed_out(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     let pair = try proc.pipe_create()
     let (inlet, outlet) = move pair
@@ -264,8 +267,22 @@ func timed_out(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     //    message and drop its obligation so a slot settles, then park on the
     //    inlet's level to be told there is space again.
     let filled = try fill(&inlet, &msg)
-    let refused = try inlet.post(body: &msg, len: ONE)
-    if let claim = move refused { return BUG }
+    // **THE REFUSAL IS ON THE ERROR CHANNEL NOW** (`designs/010` ruling 12(a)),
+    // so the arm that proves the ring is full is a `WouldBlock` match rather
+    // than a `None` — which is the poll declaring itself, exactly as the fill
+    // loop's own `tell` does.
+    match inlet.post(body: &msg, len: ONE) {
+        case Ok(claim) -> {
+            let _ = move claim
+            return BUG
+        },
+        case Err(e) -> {
+            match e {
+                case WouldBlock -> {},
+                case _ -> { return e },
+            }
+        },
+    }
     let took = try take_and_drop(&outlet, &var buf)
     if not took { return BUG }
     try waiter.add(inlet: &inlet, key: KEY_CLAIM, mode: AttachMode.OneShot)
@@ -274,8 +291,7 @@ func timed_out(system: &System, proc: &Process) -> Result<Void, SosStatus> {
           level_name(&room))
 
     // 1. POST — now that the level said there is space.
-    let staged = try inlet.post(body: &msg, len: ONE)
-    guard var claim = move staged else { return BUG }
+    var claim = try inlet.post(body: &msg, len: ONE)
 
     // 2. ATTACH both: the claim, and the Timer that bounds the wait.
     try waiter.add(reply: &claim, key: KEY_CLAIM, mode: AttachMode.OneShot)
@@ -302,7 +318,7 @@ func timed_out(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     // is still staged — abandoning a claim does not un-send what was sent — so
     // the take succeeds and the reply is what carries the news.
     let got = try outlet.take()
-    guard let (_, request) = move got else { return BUG }
+    let (_, request) = move got
     let obligation = move request
     match (move obligation).reply(body: &msg, len: ONE) {
         case Ok(_) -> {
@@ -350,23 +366,28 @@ func level_name(r: &WaitResult) -> String {
 /// uses because it is about the RING and not about the pair.
 func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
           len: UInt) -> Result<Bool, SosStatus> {
-    let staged = try inlet.post(body: &body, len: len)
-    if let claim = move staged {
-        let _ = move claim
-        return true
+    let claim = try inlet.post(body: &body, len: len) catch {
+        match error {
+            case WouldBlock -> { return false },
+            case _ -> { return error },
+        }
     }
-    return false
+    let _ = move claim
+    return true
 }
 
 /// Take, and discharge the obligation by dropping it — the mirror of `tell`.
 func take_and_drop(outlet: &PipeOutlet,
                    into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<Bool, SosStatus> {
-    let got = try outlet.take()
-    if let (_, request) = move got {
-        let _ = move request
-        return true
+    let got = try outlet.take() catch {
+        match error {
+            case WouldBlock -> { return false },
+            case _ -> { return error },
+        }
     }
-    return false
+    let (_, request) = move got
+    let _ = move request
+    return true
 }
 
 /// Post until the kernel refuses, and hand back how many went.

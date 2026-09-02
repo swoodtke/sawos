@@ -1,38 +1,38 @@
-// SOS M4 unit 2: CONSUMED IS CONSUMED (sawos design 14; spec §2.1's single-use,
-// §3's generations).
+// SOS M4 unit 4.5: A CLAIM THAT CAN NEVER BE ANSWERED (sawos design 22;
+// `designs/010` ruling 12(b)/(c); spec §2.1's single-use, §3's rights).
 //
-// **A ONE-SHOT IS SPENT BY THE OP THAT DISCHARGES IT.** `resolve` destroys the
-// caller's handle ENTRY the way `RELEASE_OP` does — unbind, generation bump,
-// unref — so the word it was called through is stale the instant it returns.
-// Asking again is not a second answer and not a status: it is the ordinary
-// `BadHandle` fault, which is design 3's diagnosis of a released word rather than
-// anything this unit invented.
+// **THE RULED FLOW, EXECUTED.** The server drops its obligation, so the client's
+// exchange is over before it began; the client ASKS with `ready()`, is told the
+// terminal on the ERROR channel, and DROPS the claim rather than resolving it.
+// That last step is the whole of ruling 12(b)'s amendment: a reply that can
+// never come needs no second call, so the terminal does not live where a
+// caller's instinct is to ask once more.
 //
-//   SOS deadclaim: resolved len=1
-//   SOS: process fault: bad handle
+//   SOS deadclaim: the server let its obligation go
+//   SOS deadclaim: ready says peer closed
+//   SOS deadclaim: claim dropped unresolved
 //
-// **THE TYPED LAYER MAKES THAT HARD TO REACH, WHICH IS THE POINT.** A
-// `PipeReply` disarms itself when the kernel consumes it, so a spent claim
-// carries the `NO_HANDLE` sentinel and dropping it is a no-op; this program has
-// to ask a SECOND time through the same value to meet the fault at all. What it
-// proves is that the kernel's own check is real underneath the wrapper's — single
-// use is a property of the LEDGER, and the `NoCopy` value is the ergonomics on
-// top of it.
+// **THE DOUBLE RESOLVE THIS CASE USED TO PROVE IS A COMPILE ERROR NOW.** Through
+// unit 4 the program resolved a spent claim a second time to meet the kernel's
+// `BadHandle` — the ledger showing through the wrapper. `resolve` became a
+// `consumes` method at unit 4.5 (it can, now that every path consumes), so the
+// second use is refused by the compiler and the suite's last Saw-visible ledger
+// `BadHandle` retires with it. The kernel's check still stands for a raw-altitude
+// caller holding a word; `pipe-reply-wait-dead` is the precedent for a case whose
+// fault moved out of Saw's reach the same way.
 //
-// It is also why `pipe-abandon` cannot show "nothing un-closes" the way
-// `pipe-peer-gone` does: a connection's `PeerClosed` is a LEVEL a caller may
-// re-read for ever, and an exchange's is the end of that exchange.
+// **AND A MINT PROBE RIDES IT** (ruling 12(c)). A one-shot has ONE NAME:
+// `pipe_reply_rights()` withholds the universal `Mint` bit, so a sibling of a
+// claim cannot be made — and asking for one is a fault rather than a status,
+// because a process knows which rights it holds. That refusal is what ends this
+// program, exactly as `pipe-no-post`'s and `pipe-no-reply`'s do:
 //
-// **AND SINCE SL-16 THIS IS THE ONLY PLACE IN THE SUITE THAT CAN SHOW THE FAULT
-// FROM SAW.** `reply` and `reply_wait` became `consumes` methods at sawc 0.4.0,
-// so a second use through either is refused by the compiler and
-// `pipe-reply-wait-dead`, which used to prove the same fault on the server side,
-// had to be retargeted. `resolve` could not follow them: an `Ok(None)` poll
-// consumes nothing, and an effect that consumes on every path would spend a live
-// claim the first time the answer had not arrived yet. So the claim side keeps
-// its `&var self` receiver, keeps its answer-decided disarm, and keeps this
-// case — which is now carrying the whole demonstration that the ledger is real
-// underneath the wrapper.
+//   SOS deadclaim: minting a sibling of a one-shot
+//   SOS: process fault: access denied
+//
+// It is the last act rather than the first because everything above it is the
+// ruled flow, and the flow reaches its own end cleanly before the probe spends
+// the process.
 
 import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
             SosStatus, PIPE_BODY_BYTES}
@@ -59,13 +59,8 @@ func _start(boot_handle: UInt) {
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     msg[0] = 42
 
-    let staged = try inlet.post(body: &msg, len: 1) catch {
+    let claim = try inlet.post(body: &msg, len: 1) catch {
         print("SOS deadclaim: post failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    guard var claim = move staged else {
-        let _ = system.debug_print("SOS deadclaim: fresh ring refused a post\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
@@ -75,45 +70,50 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    guard let (_, request) = move taken else {
-        let _ = system.debug_print("SOS deadclaim: nothing staged\n")
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    let obligation = move request
+    let (_, request) = move taken
 
-    msg[0] = 43
-    try (move obligation).reply(body: &msg, len: 1) catch {
-        print("SOS deadclaim: reply failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
+    // **THE SERVER GIVES UP.** Dropping the obligation is the whole of it —
+    // there is no `abandon()` verb — and the exchange's request column reaching
+    // zero is what the claim's level reads as terminal.
+    let _ = move request
+    let _ = system.debug_print("SOS deadclaim: the server let its obligation go\n")
 
-    let answered = try claim.resolve() catch {
-        print("SOS deadclaim: resolve failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    guard let got = move answered else {
-        let _ = system.debug_print("SOS deadclaim: the reply went missing\n")
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    print("SOS deadclaim: resolved len={}\n", got.len)
-
-    // AND AGAIN, THROUGH THE SPENT CLAIM. The value disarmed itself above, so
-    // this reaches the kernel with a word that names nothing and the process
-    // ends. Neither arm below runs.
-    match claim.resolve() {
+    // **THE TERMINAL IS ON THE ERROR CHANNEL** (ruling 12(b)). `Ok(false)` would
+    // mean "not yet, and the connection is still good", which would be a lie
+    // here and would send this caller round a loop that can never end. Nothing
+    // is consumed by the asking: the claim below this line is the same claim.
+    match claim.ready() {
         case Ok(_) -> {
-            let _ = system.debug_print("SOS deadclaim: a spent claim answered twice\n")
+            let _ = system.debug_print("SOS deadclaim: a dead exchange looked alive\n")
             let _ = system.shutdown(EXIT_FAILED)
             return
         },
-        case Err(e) -> {
-            print("SOS deadclaim: second resolve refused: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
+        case Err(e) -> { print("SOS deadclaim: ready says {}\n", e) },
     }
+
+    // **AND SO IT IS DROPPED, NOT RESOLVED.** The wrapper's ordinary release is
+    // the right end for a claim with nothing to fetch — a resolve would spend a
+    // trap to be told what `ready()` already said, and the whole reason the
+    // terminal rides the error channel is that there is no second call to make.
+    let _ = move claim
+    let _ = system.debug_print("SOS deadclaim: claim dropped unresolved\n")
+
+    // **THE ONE-NAME PROBE** (ruling 12(c)), on a fresh claim, and it ENDS THE
+    // PROCESS. `pipe_reply_rights()` does not carry `Mint`, attenuation is
+    // monotonic, and a missing right is a fault rather than a status: the caller
+    // holds the handle and could have known.
+    msg[0] = 44
+    let second = try inlet.post(body: &msg, len: 1) catch {
+        print("SOS deadclaim: second post failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS deadclaim: minting a sibling of a one-shot\n")
+    let _ = second.mint()
+
+    // UNREACHABLE: the line above does not return, because the kernel ends this
+    // process at the rights check. Written so the refusal reads as a refusal
+    // rather than as a missing case.
+    let _ = system.debug_print("SOS deadclaim: a one-shot minted a sibling\n")
+    let _ = system.shutdown(EXIT_FAILED)
 }

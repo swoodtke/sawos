@@ -3300,13 +3300,38 @@ func pipe_reply_op_decoded(op: PipeReplyOp, obj: &PipeReplyObject, arg0: UInt,
             }
             pipe_resolve(p, obj.handle, obj.slot, arg0, arg1)
         },
+        // **THE LEVEL QUESTION SPENDS `Wait`, NOT `Resolve`** (`designs/010`
+        // ruling 12(b)). Asking whether the answer has arrived is the same
+        // question attaching this claim to a Waiter asks, so it is gated by the
+        // same bit; `Resolve` above stays the CONSUMING act's authority. A claim
+        // narrowed to `Wait` alone can be watched and polled and never spent,
+        // which is a coherent thing to hand somebody and was not expressible
+        // before this op existed.
+        case Ready -> {
+            if not obj.allows(PipeReplyRight.Wait) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            pipe_ready(obj.slot)
+        },
     }
 }
 
-/// **TAKE THE REPLY IF IT IS THERE, AND NEVER PARK** (spec §2.1; design 10
-/// ruling 4's polling ladder; the blocking `send` compositions are M4 unit 3's
-/// and they attach the claim instead — ruling 11(a) put the reply in the wait
-/// record, so this op is the polling door and not the only one).
+/// **TAKE THE REPLY, PARKING UNTIL IT IS THERE — AND CONSUME THE CLAIM ON EVERY
+/// PATH** (spec §2.1; `designs/010` ruling 12(b), M4 unit 4.5, sawos design 22).
+///
+/// **THE CONTRACT CHANGED AT UNIT 4.5 AND `WouldBlock` LEFT THE OP.** Through
+/// unit 4 this was the polling door: a pending exchange answered `WouldBlock`
+/// and consumed nothing, so the claim survived to be asked again. It now PARKS
+/// the calling thread on the claim's ready level and finishes, on the wake,
+/// whichever of the two remaining arms the level turned out to be. What that
+/// buys is upstairs: an op that consumes on every path can be a `consumes`
+/// method, so a second resolve is a COMPILE error rather than a `BadHandle`
+/// fault — and a consumed wrapper whose kernel entry survived a `WouldBlock`
+/// would have been a leaked reference, which is why the effect could not be
+/// typed-tier only. The poll that was here is `PipeReplyOp.Ready`.
+///
+/// **A PARK IS MECHANICS, NOT AUTHORITY** (ruling 8's own sentence), so the op
+/// spends the `Resolve` bit it always spent and asks for nothing new.
 ///
 /// THREE ANSWERS, and which one it is depends only on the exchange's state and
 /// its two columns:
@@ -3314,9 +3339,10 @@ func pipe_reply_op_decoded(op: PipeReplyOp, obj: &PipeReplyObject, arg0: UInt,
 ///   - `Replied` — the bytes are copied out, the CLAIM IS CONSUMED, and the
 ///     length is the value. That consume is what frees the ring slot when the
 ///     obligation has already gone, which is the ordinary end of an exchange.
-///   - PENDING — the message is staged or taken and no reply has been written, so
-///     the answer is `WouldBlock` and NOTHING is consumed. The claim is still
-///     yours; ask again.
+///   - PENDING — the message is staged or taken and no reply has been written,
+///     so the caller PARKS. `park_resolve` takes its entry on the way down, so
+///     the claim is spent from that moment and the reference it held is the
+///     parked thread's; the wake arm is the fused call's, unchanged.
 ///   - ABANDONED BY THE SERVER — `Taken` with no obligation left, or `Staged`
 ///     with no outlet left — is `PeerClosed`, and it CONSUMES the claim exactly
 ///     as a delivered reply does. There is nothing left to wait for, and design 8
@@ -3325,8 +3351,8 @@ func pipe_reply_op_decoded(op: PipeReplyOp, obj: &PipeReplyObject, arg0: UInt,
 /// The caller's ENTRY is what the consume destroys (`unbind_handle` +
 /// `unref_object`, the same two calls `RELEASE_OP` makes), so a second resolve
 /// through the same word is the ordinary `BadHandle` fault — consumed is
-/// consumed — and a resolve through a minted SIBLING finds the exchange
-/// discharged and is told `PeerClosed`.
+/// consumed. Since ruling 12(c) there is no minted SIBLING to reach that fault
+/// from either: a one-shot has one name.
 func pipe_resolve(p: Int, word: UInt, x: Int, dst: UInt,
                   cap: UInt) unsafe -> SyscallResult {
     if cap < (pipe_msg_record_bytes() as UInt) {
@@ -3339,15 +3365,24 @@ func pipe_resolve(p: Int, word: UInt, x: Int, dst: UInt,
     match PIPE_EX_STATE[x] {
         case Replied -> {
             let len = PIPE_LENS[x] as UInt
-            // **THE PRE-FLIGHT COMES BEFORE THE CONSUME, WHICH IS WHAT MAKES A
-            // REFUSED RESOLVE RETRYABLE** (`designs/010` ruling 5). A reply may
-            // carry handles, so this op mints too; a table with no room for them
-            // must leave the claim ALIVE and the answer where it is, and the
-            // caller frees a slot and resolves again. Everything below this line
-            // is the delivery, and none of it can fail for a reason a caller
-            // could act on.
+            // **THE PRE-FLIGHT COMES BEFORE THE DELIVERY, AND SINCE UNIT 4.5 A
+            // REFUSAL IS TERMINAL** (`designs/010` ruling 5, met by ruling
+            // 12(b)). A reply may carry handles, so this op mints too — and a
+            // table with no room for them used to leave the claim ALIVE so the
+            // caller could free a slot and resolve again. It cannot any more:
+            // this op consumes on every path, so the wrapper upstairs is already
+            // dead and there is no second ask to keep the claim for. So the
+            // refusal CONSUMES, exactly as `wake_call_reply`'s does and for the
+            // identical reason — the handles the replier attached go back to
+            // their slabs when the exchange settles, because the replier gave
+            // them up at the reply and there is nobody left to hand them to. A
+            // client that must not lose a capability this way makes room before
+            // it resolves. Everything below the pre-flight is the delivery, and
+            // none of it can fail for a reason a caller could act on.
             if not table_room(p, staged_count(x)) {
-                return op_status(mint_refusal(p))
+                let why = mint_refusal(p)
+                consume_entry(p, word, ObjType.PipeReply, x)
+                return op_status(why)
             }
             let moved = mint_staged(x, p)
             var rec = msg_prefix(len, &moved)
@@ -3370,14 +3405,14 @@ func pipe_resolve(p: Int, word: UInt, x: Int, dst: UInt,
                 consume_entry(p, word, ObjType.PipeReply, x)
                 return op_status(SosStatus.PeerClosed)
             }
-            op_status(SosStatus.WouldBlock)
+            park_resolve(p, word, x, dst)
         },
         case Staged -> {
             if PIPES[exchange_pipe(x)].outlet_refs == 0 {
                 consume_entry(p, word, ObjType.PipeReply, x)
                 return op_status(SosStatus.PeerClosed)
             }
-            op_status(SosStatus.WouldBlock)
+            park_resolve(p, word, x, dst)
         },
         // **THE ANSWER ALREADY WENT OUT THROUGH A WAIT** (sawos design 15, on
         // `designs/010` ruling 11(a)/(b)). A `Waiter` delivery IS a resolve —
@@ -3389,7 +3424,10 @@ func pipe_resolve(p: Int, word: UInt, x: Int, dst: UInt,
         //
         // A NON-CONSUMING attach is the shape that reaches this arm: the client
         // kept its handle, the delivery discharged the exchange, and this is
-        // what its later `resolve` is told.
+        // what its later `resolve` is told. **IT IS ALSO THE COMPOSITION RULING
+        // 12(b) NAMES** — a subscription delivery that settled the slot first —
+        // and it needs no new mechanism because a settled exchange is never
+        // pending, so the resolve reaching it does not park.
         case Settled -> {
             consume_entry(p, word, ObjType.PipeReply, x)
             op_status(SosStatus.PeerClosed)
@@ -3400,6 +3438,89 @@ func pipe_resolve(p: Int, word: UInt, x: Int, dst: UInt,
         // invariant `pipe_idle` exists to keep. `fatal_kernel` stops the machine
         // and is not declared `-> Never` (design 6's finding 4), so the arm has
         // to yield something; nothing reaches the line that does.
+        case Free -> {
+            fatal_kernel("a pipe claim named a free exchange", x as UInt)
+            op_status(SosStatus.NoResource)
+        },
+    }
+}
+
+/// **SPEND THE CLAIM AND PARK ON IT** — the pending arm of `Resolve` since M4
+/// unit 4.5 (`designs/010` ruling 12(b); sawos design 22).
+///
+/// **THE ENTRY IS TAKEN HERE AND ITS REFERENCE IS NOT DROPPED**, which is the
+/// whole of why this needs no new wake protocol. `consume_entry` is
+/// detach-then-unbind-then-unref; this is the same act with the last step left
+/// out, so the reference the handle row held becomes the PARKED THREAD's — which
+/// is exactly the invariant a fused `Call` establishes when it starts
+/// `PIPE_REPLY_REFS` at one for a thread rather than for a row. From this line
+/// the two shapes of parked client are indistinguishable to everything
+/// downstream: `notify_claim` asks one question, `wake_call_reply` writes the
+/// same record and the same value register, `release_pending_calls` drops the
+/// same reference, and `exchange_settle`'s no-caller-parked assert covers both.
+/// The record does not care which op parked the thread, and nothing reads back
+/// to find out.
+///
+/// **THE DETACH IS RULING 9(a) VERBATIM.** A consuming op detaches the object's
+/// subscription implicitly, and this op is consuming from here on — so a claim
+/// that was attached to a Waiter AND resolved loses the attachment at the park,
+/// which is also what keeps `PIPE_REPLY_ATTACH[x]` and `PIPE_CALLER[x]`
+/// alternatives rather than a pair (the invariant `kcore.refs`' wake-arm banner
+/// states, and `exchange_settle` asserts).
+///
+/// AN OP THAT PARKS NEEDS A THREAD TO PARK, which is `pipe_call`'s own guard for
+/// its own reason: the harness kernels that enter user mode with no object model
+/// have none. It is asked HERE rather than at the top of `pipe_resolve` because
+/// the arms that return without parking are perfectly answerable without one.
+///
+/// `dst` went through `copy_out_check` at the top of `pipe_resolve`, while the
+/// caller was the running process — so the wake's copy-out cannot fail for a
+/// reason anybody could act on, which is the same standing `pipe_call` gives it.
+func park_resolve(p: Int, word: UInt, x: Int, dst: UInt) unsafe -> SyscallResult {
+    if CURRENT_THREAD == NO_THREAD {
+        fault_process(p, FaultReason.BadState)
+    }
+    detach_consumed(ObjType.PipeReply, x)
+    unbind_handle(p, handle_word_index(word))
+    block_on_call_reply(CURRENT_THREAD, x, dst)
+    op_blocked()
+}
+
+/// **HAS THE ANSWER ARRIVED? — the claim's level, asked without spending
+/// anything** (`designs/010` ruling 12(b); sawos design 22).
+///
+/// Status-only, and the three answers are the user's own words: `Ok` the reply
+/// is THERE and a `Resolve` will return it without parking, `WouldBlock` not yet
+/// and the exchange is still live, `PeerClosed` it can NEVER arrive — so the
+/// holder drops the claim instead of spending a resolve on a dead exchange.
+/// Readiness is MONOTONIC (pending goes to settled and never back), so
+/// ready-then-resolve has no check-then-act race.
+///
+/// **IT IS `pipe_resolve`'s OWN STATE SPLIT WITH THE ACT REMOVED**, written out
+/// rather than routed through `waitable_ready`, and the arm that decides it is
+/// `Settled`: the level matrix reports a settled exchange as NOT READY, which is
+/// true of a Waiter's level and would be a lie to a poller — the answer went to
+/// somebody else and no amount of asking again will produce another. So this
+/// function reads the states directly and reports the terminal where the matrix
+/// reports a false level.
+func pipe_ready(x: Int) unsafe -> SyscallResult {
+    match PIPE_EX_STATE[x] {
+        case Replied -> op_ok(),
+        case Taken -> {
+            if PIPE_REQUEST_REFS[x] == 0 {
+                return op_status(SosStatus.PeerClosed)
+            }
+            op_status(SosStatus.WouldBlock)
+        },
+        case Staged -> {
+            if PIPES[exchange_pipe(x)].outlet_refs == 0 {
+                return op_status(SosStatus.PeerClosed)
+            }
+            op_status(SosStatus.WouldBlock)
+        },
+        case Settled -> op_status(SosStatus.PeerClosed),
+        // UNREACHABLE for `pipe_resolve`'s reason exactly: a `Free` exchange has
+        // no reference columns, so no handle can name one.
         case Free -> {
             fatal_kernel("a pipe claim named a free exchange", x as UInt)
             op_status(SosStatus.NoResource)

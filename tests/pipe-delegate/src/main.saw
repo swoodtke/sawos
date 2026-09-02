@@ -106,13 +106,8 @@ func _start(boot_handle: UInt) {
 
     // ROOT ASKS ITS OWN QUESTION, and takes it off its own outlet. Both ends are
     // root's; what crosses the boundary is neither of them.
-    let staged = try inlet.post(body: &msg, len: 1) catch {
+    var claim = try inlet.post(body: &msg, len: 1) catch {
         print("SOS delegate: post failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    guard var claim = move staged else {
-        let _ = system.debug_print("SOS delegate: fresh ring refused a post\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
@@ -121,11 +116,7 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    guard let (_, request) = move taken else {
-        let _ = system.debug_print("SOS delegate: nothing staged\n")
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
+    let (_, request) = move taken
 
     let for_child = try system.mint(rights: CHILD_SYSTEM) catch {
         print("SOS delegate: mint failed: {}\n", error)
@@ -182,7 +173,7 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    let answer = try poll_reply(&var claim, &timer, &waiter) catch {
+    let answer = try poll_reply(move claim, &timer, &waiter) catch {
         print("SOS delegate: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
@@ -213,21 +204,38 @@ struct Answer {
 /// than a block because a `PipeMsg` is a message-sized value and every `print`
 /// with format arguments reserves its own scratch, so a `_start` holding both
 /// meets root's 16 KiB stack grant on the 64-bit profile.
-func poll_reply(claim: &var PipeReply, timer: &Timer,
+///
+/// **IT IS A `ready()` LOOP WITH ONE RESOLVE AT THE END** (`designs/010` ruling
+/// 12(b); sawos design 22). Through unit 4 the loop body WAS the resolve, which
+/// worked because a pending answer was `Ok(None)` and cost nothing; a resolve
+/// would PARK now, which would make this a blocking receive with a timer
+/// attached to nothing. So the LEVEL is what the loop asks — non-consuming, as
+/// many times as it likes — and the single consuming act happens once, after the
+/// loop has established the answer is there. The claim is taken BY VALUE for
+/// exactly that reason: a `&var` parameter could not be moved into a consuming
+/// method, so the signature carries the single use the op does.
+func poll_reply(claim: PipeReply, timer: &Timer,
                 waiter: &Waiter) -> Result<Answer, SosStatus> {
     var rounds: Int = 0
-    while rounds < POLL_ROUNDS {
+    var arrived = false
+    while rounds < POLL_ROUNDS && not arrived {
         rounds = rounds + 1
-        let got = try claim.resolve()
-        if let answer = move got {
-            return Answer(have: true, length: answer.len,
-                          b0: answer.bytes[0] as UInt,
-                          b1: answer.bytes[1] as UInt,
-                          b2: answer.bytes[2] as UInt,
-                          b3: answer.bytes[3] as UInt)
+        arrived = try claim.ready()
+        if not arrived {
+            try timer.arm(after_ns: PARK_NS)
+            try waiter.wait()
         }
-        try timer.arm(after_ns: PARK_NS)
-        try waiter.wait()
     }
-    return Answer(have: false, length: 0, b0: 0, b1: 0, b2: 0, b3: 0)
+    if not arrived {
+        // The claim is DROPPED rather than resolved — resolving would park on an
+        // answer this loop has just spent its whole budget not seeing.
+        let _ = move claim
+        return Answer(have: false, length: 0, b0: 0, b1: 0, b2: 0, b3: 0)
+    }
+    let answer = try (move claim).resolve()
+    return Answer(have: true, length: answer.len,
+                  b0: answer.bytes[0] as UInt,
+                  b1: answer.bytes[1] as UInt,
+                  b2: answer.bytes[2] as UInt,
+                  b3: answer.bytes[3] as UInt)
 }

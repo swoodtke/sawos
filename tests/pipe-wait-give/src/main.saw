@@ -95,8 +95,7 @@ func given(inlet: &PipeInlet, outlet: &PipeOutlet,
     var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     msg[0] = 1
 
-    let staged = try inlet.post(body: &msg, len: 1)
-    guard var claim = move staged else { return BUG }
+    var claim = try inlet.post(body: &msg, len: 1)
     var obligation = try take_one(&outlet, &var buf)
     msg[0] = 7
     try (move obligation).reply(body: &msg, len: 1)
@@ -136,8 +135,7 @@ func cancel_by_remove(inlet: &PipeInlet, outlet: &PipeOutlet,
     var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     msg[0] = 3
 
-    let staged = try inlet.post(body: &msg, len: 1)
-    guard var claim = move staged else { return BUG }
+    var claim = try inlet.post(body: &msg, len: 1)
     var obligation = try take_one(&outlet, &var buf)
 
     match waiter.give(reply: move claim, key: KEY_CANCEL) {
@@ -172,7 +170,7 @@ func reply_byte(r: &WaitResult, i: Int) -> UInt {
 func take_one(outlet: &PipeOutlet,
               buf: &var [UInt8; PIPE_BODY_BYTES]) -> Result<PipeRequest, SosStatus> {
     let got = try outlet.take()
-    guard let (_, request) = move got else { return BUG }
+    let (_, request) = move got
     return move request
 }
 
@@ -180,23 +178,28 @@ func take_one(outlet: &PipeOutlet,
 /// loops use because they are about the RING and not about the pair.
 func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
           len: UInt) -> Result<Bool, SosStatus> {
-    let staged = try inlet.post(body: &body, len: len)
-    if let claim = move staged {
-        let _ = move claim
-        return true
+    let claim = try inlet.post(body: &body, len: len) catch {
+        match error {
+            case WouldBlock -> { return false },
+            case _ -> { return error },
+        }
     }
-    return false
+    let _ = move claim
+    return true
 }
 
 /// Take, and discharge the obligation by dropping it — the mirror of `tell`.
 func take_and_drop(outlet: &PipeOutlet,
                    into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<Bool, SosStatus> {
-    let got = try outlet.take()
-    if let (_, request) = move got {
-        let _ = move request
-        return true
+    let got = try outlet.take() catch {
+        match error {
+            case WouldBlock -> { return false },
+            case _ -> { return error },
+        }
     }
-    return false
+    let (_, request) = move got
+    let _ = move request
+    return true
 }
 
 /// Post until the kernel refuses, and hand back how many went — the ring's FREE

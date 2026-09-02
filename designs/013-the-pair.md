@@ -55,6 +55,31 @@ before anything else (§3 order).
 
 ## D-2: the two data ops, and the two new statuses
 
+> **RE-RULED Sep 2 by `designs/010` ruling 12(a), landed as sawos design
+> 22 (M4 unit 4.5). THE POLL SPLIT BELOW IS RETIRED**: `WouldBlock` is an
+> ERROR again at the typed tier, so `take` and `post` lose their
+> `Optional`s and a caller that genuinely polls declares itself with a
+> `match` carrying a `WouldBlock` arm. Nothing about the WIRE changed —
+> the statuses this section adds are the statuses the kernel still
+> answers — only which channel the typed wrapper puts the transient on.
+>
+> The reason D-2 was right when it was written and wrong afterwards is
+> the CALLER POPULATION. At unit 1 every caller of these ops was a poll
+> loop, and design 234 §4's `Channel.try_receive` argument applied
+> exactly: a loop that cannot tell "nothing yet" from "this is broken"
+> waits for ever. Units 3 and 3.5 inverted that — a caller waits with a
+> `Waiter` or calls `send`, and reaches `take`/`post` already knowing the
+> answer — and the tree showed it: ZERO `case None` arms across `tests/`
+> and `root/`, every site paying a `try` for the errors and then a guard
+> that treated the `None` as a bug. The general principle is CLAUDE.md's
+> now: an Optional in a signature is an antipattern unless the absence is
+> a real domain value.
+>
+> The divergence from `Channel.try_receive` is deliberate and recorded at
+> `kernel/sysapi/src/floor.saw`'s level-decode banner: a channel has ONE
+> non-blocking door, so its caller is a poll loop by construction; a pipe
+> has four, so its caller chose to poll by picking the door.
+
 - **`PipeInletOp.Post`** (`PipeInletRight.Post`): copy the caller's
   body (addr + len, len ≤ `PIPE_BODY_BYTES`, len 0 LEGAL — a
   data-free message is §2.1's option) IN through the one funnel,

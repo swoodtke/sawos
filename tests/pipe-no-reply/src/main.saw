@@ -1,33 +1,42 @@
-// SOS M4 unit 2: AN UNSPENT RIGHT ON AN OBLIGATION (sawos design 14; spec §3).
+// SOS M4 unit 4.5: AN OBLIGATION HAS ONE NAME (sawos design 22; `designs/010`
+// ruling 12(c); spec §3).
 //
-// **THE ATTENUATION PROOF FOR THE ONE-SHOT KINDS.** `pipe_request_rights()` mints
-// `Transfer | Mint | Reply`, and it HAS TO be permissive — §3's attenuation is
-// monotonic, so a bit not minted at the take could never appear later by any
-// sequence of ops. Which means the narrowing is the HOLDER's, written once at a
-// `MINT_OP` keep mask, and this program is that sentence executed:
+// **THE ONE-NAME PROOF ON THE SERVER HALF**, and `pipe-dead-claim` is its mirror
+// on the client half. `pipe_request_rights()` withholds the universal `Mint`
+// bit, so an obligation cannot be given a second name — and §3's attenuation is
+// monotonic, so no sequence of ops can put the bit back:
 //
-//   SOS noreply: minted without Reply    an obligation that may travel on
-//   SOS: process fault: access denied    ...and may not be discharged
+//   SOS noreply: minting a sibling of an obligation
+//   SOS: process fault: access denied
 //
-// **THAT MASK IS THE DELEGATION POLICY.** §2.1's zero-copy example hands a
-// request handle to a third party who answers the original client; a server that
-// wants a courier rather than an answerer gives it exactly this sibling —
-// `Transfer` and nothing else — and the courier can pass the obligation along and
-// can never speak for it.
+// **WHY A ONE-SHOT IS THE EXCEPTION TO THE UNIFORM LEAN.** Every other kind
+// mints, because a second NAME for an object that outlives one act is a
+// perfectly ordinary thing to want. A one-shot is spent by ONE op, so its
+// sibling is not a second way to use the object: it is a handle whose only
+// possible answer is `PeerClosed`, and it undermines the compile-time single use
+// that `consumes` on `reply`/`reply_wait`/`resolve` now delivers.
+//
+// **DELEGATION IS UNTOUCHED, WHICH IS THE DISTINCTION THE RULE RESTS ON.**
+// §2.1's zero-copy example hands a request handle to a third party who answers
+// the original client — that is `Transfer` MOVING the one name, which
+// `pipe-delegate` and `pipe-delegate-msg` both prove, and which needs no sibling
+// at all. Narrowing what a delegate may do is `give`'s KEEP MASK
+// (`tests/give-keep-mask`), applied to the name being handed over.
 //
 // **IT IS A FAULT AND NOT A STATUS** (design 178's faults ruling): a process
 // knows which rights it holds, so spending one it was not given is a mistake it
 // could have checked. The kernel terminates it and stays up to say so.
+//
+// WHAT THIS CASE USED TO PROVE was the `Reply` bit itself, through a sibling
+// minted without it. That spelling died with the `Mint` bit; the `Reply` gate is
+// now reachable only through a `give` keep mask into another process, which is a
+// two-process case this unit did not take on — recorded as a follow-up in
+// `designs/todo.md` rather than left silent.
 
 import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
-            SosStatus, PipeRequestRight, PIPE_BODY_BYTES}
+            SosStatus, PIPE_BODY_BYTES}
 
 static EXIT_FAILED: UInt = 1
-
-/// **THE KEEP MASK, AND `Reply` IS ABSENT BY SILENCE.** Two bits, reading as the
-/// policy they are: this obligation may be handed on and may be narrowed further,
-/// and may not be discharged.
-static NO_REPLY: UInt32 = (PipeRequestRight.Transfer | PipeRequestRight.Mint)
 
 @export("_start")
 func _start(boot_handle: UInt) {
@@ -49,13 +58,8 @@ func _start(boot_handle: UInt) {
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     msg[0] = 1
 
-    let staged = try inlet.post(body: &msg, len: 1) catch {
+    let claim = try inlet.post(body: &msg, len: 1) catch {
         print("SOS noreply: post failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    guard let claim = move staged else {
-        let _ = system.debug_print("SOS noreply: fresh ring refused a post\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
@@ -65,36 +69,17 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    guard let (_, request) = move taken else {
-        let _ = system.debug_print("SOS noreply: nothing staged\n")
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
+    let (_, request) = move taken
 
-    var narrowed = try request.mint(rights: NO_REPLY) catch {
-        print("SOS noreply: mint failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    let _ = system.debug_print("SOS noreply: minted without Reply\n")
+    // **AND THIS ENDS THE PROCESS.** The obligation's rights word came out of
+    // `pipe_request_rights()`, which does not carry `Mint`; asking for a sibling
+    // spends a bit that was never granted and never could be.
+    let _ = system.debug_print("SOS noreply: minting a sibling of an obligation\n")
+    let _ = request.mint()
 
-    // A SECOND NAME IS A SECOND REFERENCE on this exchange's request column, so
-    // the original obligation is still perfectly able to answer — what is refused
-    // is THIS handle, which is what makes attenuation per-capability rather than
-    // per-object.
-    match (move narrowed).reply(body: &msg, len: 1) {
-        case Ok(_) -> {
-            let _ = system.debug_print("SOS noreply: an unspent right replied\n")
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
-        // UNREACHABLE: the line above does not return, because the kernel ends
-        // this process at the rights check. The arm is written so the refusal
-        // reads as a refusal rather than as a missing case.
-        case Err(e) -> {
-            print("SOS noreply: reply refused: {}\n", e)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        },
-    }
+    // UNREACHABLE: the line above does not return, because the kernel ends this
+    // process at the rights check. Written so the refusal reads as a refusal
+    // rather than as a missing case.
+    let _ = system.debug_print("SOS noreply: an obligation minted a sibling\n")
+    let _ = system.shutdown(EXIT_FAILED)
 }

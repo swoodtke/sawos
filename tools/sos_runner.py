@@ -413,6 +413,8 @@ PIPE_CALL_ABANDON_PKG = os.path.join(TESTS_DIR, "pipe-call-abandon")
 CHILD_CALLER_PKG = os.path.join(TESTS_DIR, "child-caller")
 PIPE_CALL_ORPHAN_PKG = os.path.join(TESTS_DIR, "pipe-call-orphan")
 CHILD_ORPHAN_PKG = os.path.join(TESTS_DIR, "child-orphan")
+PIPE_RESOLVE_ORPHAN_PKG = os.path.join(TESTS_DIR, "pipe-resolve-orphan")
+CHILD_RESOLVER_PKG = os.path.join(TESTS_DIR, "child-resolver")
 PIPE_NO_CALL_PKG = os.path.join(TESTS_DIR, "pipe-no-call")
 PIPE_CALL_OVERSIZED_PKG = os.path.join(TESTS_DIR, "pipe-call-oversized")
 PIPE_REPLY_WAIT_DEAD_PKG = os.path.join(TESTS_DIR, "pipe-reply-wait-dead")
@@ -426,6 +428,7 @@ CHILD_SENDER_PKG = os.path.join(TESTS_DIR, "child-sender")
 PIPE_SEND_EXIT_PKG = os.path.join(TESTS_DIR, "pipe-send-exit")
 PIPE_TABLE_FULL_PKG = os.path.join(TESTS_DIR, "pipe-table-full")
 PIPE_CQ_PKG = os.path.join(TESTS_DIR, "pipe-cq")
+PIPE_RESOLVE_PARK_PKG = os.path.join(TESTS_DIR, "pipe-resolve-park")
 GIVE_KEEP_MASK_PKG = os.path.join(TESTS_DIR, "give-keep-mask")
 CHILD_NARROW_PKG = os.path.join(TESTS_DIR, "child-narrow")
 
@@ -651,6 +654,10 @@ def expectations(arch):
         "pingpong_mark": f"0x{0x21:0{width}x}",
         "caller_mark": f"0x{0x33:0{width}x}",
         "orphan_mark": f"0x{0x3D:0{width}x}",
+        # sawos design 22: the same shape one spelling over — the thread whose
+        # RESOLVE was answered ended the process, leaving its sibling parked in
+        # one. A number that appears nowhere else, on `orphan_mark`'s reasoning.
+        "resolve_orphan_mark": f"0x{0x47:0{width}x}",
         # M3 unit 6: the byte ROOT writes into the shared page, which is also
         # `child-share`'s exit code — so `share_double_map` asserts the first
         # direction of the round trip through the kernel's exit line as well as
@@ -3150,11 +3157,13 @@ TEST_CASES = [
         # `request len=3 b=65,66,67` is the take answering TWO things: the bytes,
         # and (invisibly here, provably below) the obligation to reply to them.
         #
-        # `pending is none` is the typed tier's two channels at the reply end: a
-        # resolve before an answer exists is `Ok(None)` and consumes NOTHING, so
-        # the same claim polls again. A shape that reported it as an error would
-        # make the poll loop unwritable, and a shape that consumed the claim would
-        # make it impossible.
+        # `pending is not ready` is `PipeReply.ready()` — M4 unit 4.5's
+        # non-consuming level question (`designs/010` ruling 12(b)). Through unit
+        # 4 this row read `pending is none` and came from a `resolve` answering
+        # `Ok(None)`; a resolve here would PARK now, which is the whole of what
+        # the ruling changed. `ready()` consumes NOTHING, so the same claim asks
+        # again and resolves afterwards — and readiness is monotonic, so the
+        # `false` this row prints can only ever become a `true`.
         #
         # `reply len=2 b=90,89` and `zero reply len=0` are the two halves of one
         # distinction on the way back — a reply that carries no data is an ANSWER,
@@ -3179,7 +3188,7 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS oneshot: created",
                        "SOS oneshot: request len=3 b=65,66,67",
-                       "SOS oneshot: pending is none",
+                       "SOS oneshot: pending is not ready",
                        "SOS oneshot: reply len=2 b=90,89",
                        "SOS oneshot: zero reply len=0",
                        # **THE SWEEP ROW** (sawos design 16): the smallest
@@ -3272,20 +3281,34 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
-        # **AN UNSPENT RIGHT ON AN OBLIGATION** (spec §3). `pipe_no_post`'s claim
-        # made once more at the other end of the exchange: a one-shot's default
-        # set is permissive because attenuation is monotonic, so the narrowing is
-        # the holder's and it is written once at a `MINT_OP` keep mask.
+        # **AN OBLIGATION HAS ONE NAME** — RETARGETED at M4 unit 4.5
+        # (`designs/010` ruling 12(c); sawos design 22), and the mirror of
+        # `pipe_dead_claim`'s probe on the server half. `pipe_request_rights()`
+        # withholds the universal `Mint` bit, so a sibling of an obligation cannot
+        # be made and asking for one is `pipe_no_post`'s fault at a different
+        # kind.
         #
-        # THE MASK IS THE DELEGATION POLICY. `Transfer | Mint` and nothing about
-        # `Reply` describes a COURIER — a delegate that may pass the obligation
-        # further along and may never speak for it — which is a thing §2.1's
-        # forwarding example genuinely wants to be able to say.
+        # A ONE-SHOT IS THE EXCEPTION TO THE UNIFORM LEAN, and only because it is
+        # spent by ONE op: a second name is not a second way to use the object,
+        # it is a handle whose only possible answer is `PeerClosed`, and it
+        # undermines the compile-time single use `consumes` now delivers on all
+        # three one-shot ops.
+        #
+        # DELEGATION IS UNTOUCHED — §2.1's forwarding primitive is `Transfer`
+        # MOVING the one name (`pipe_delegate`, `pipe_delegate_msg`), and
+        # narrowing what a delegate may do is `give`'s keep mask
+        # (`give_keep_mask`).
+        #
+        # WHAT THIS CASE USED TO PROVE was the `Reply` bit through a sibling
+        # minted without it. That spelling died with the bit; the `Reply` gate is
+        # now reachable only through a `give` keep mask into another process,
+        # which is a two-process case tracked as a follow-up rather than left
+        # silent.
         "name": "pipe_no_reply",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": PIPE_NO_REPLY_PKG,
         "expect_out": ["{banner}",
-                       "SOS noreply: minted without Reply",
+                       "SOS noreply: minting a sibling of an obligation",
                        "SOS: process fault: access denied process={zero}",
                        "SOS: process teardown handles="],
         "expect_clean_exit": False,
@@ -3314,24 +3337,37 @@ TEST_CASES = [
         "expect_status": EXIT_PROCESS_FAULT,
     },
     {
-        # **CONSUMED IS CONSUMED** (spec §2.1's single-use; sawos design 14). A
-        # resolve that delivers destroys the caller's entry through the op —
-        # unbind, generation bump, unref, `RELEASE_OP`'s own two calls — so the
-        # word is stale the instant it returns and asking again is the ordinary
-        # `BadHandle` fault rather than a second answer.
+        # **A CLAIM THAT CAN NEVER BE ANSWERED** — RETARGETED at M4 unit 4.5
+        # (`designs/010` ruling 12(b)/(c); sawos design 22). Through unit 4 this
+        # case resolved a spent claim twice to meet the kernel's `BadHandle`; that
+        # second call is a COMPILE error now, because `resolve` consumes on every
+        # path and says so in its effect slot. The suite's last Saw-visible ledger
+        # `BadHandle` retires with it, and the kernel's check stands for a
+        # raw-altitude caller — `pipe_reply_wait_dead`'s precedent for a fault
+        # that moved out of Saw's reach.
         #
-        # **THE TYPED LAYER MAKES THIS HARD TO REACH, WHICH IS WHY THE CASE
-        # EXISTS.** A `PipeReply` disarms itself when the kernel consumes it, so
-        # a spent claim drops to nothing and an ordinary program never meets this;
-        # the case asks a SECOND time through the same value to show the kernel's
-        # check is real underneath the wrapper's. Single use is a property of the
-        # LEDGER, and `NoCopy` is the ergonomics on top of it.
+        # What the case proves instead is the RULED FLOW, three rows of it: the
+        # server drops its obligation, the client's `ready()` answers the terminal
+        # ON THE ERROR CHANNEL, and the claim is DROPPED rather than resolved.
+        # That last row is ruling 12(b)'s amendment executed — a reply that can
+        # never come needs no second call, so the terminal does not sit where a
+        # caller's instinct is to ask once more.
+        #
+        # **AND THE MINT PROBE ENDS IT** (ruling 12(c)): a one-shot has ONE NAME,
+        # so `pipe_reply_rights()` withholds the universal `Mint` bit and asking
+        # for a sibling is `pipe_no_post`'s fault at a different kind. It is the
+        # LAST act deliberately — everything above it is the flow, and the flow
+        # reaches its own end before the probe spends the process.
         "name": "pipe_dead_claim",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": PIPE_DEAD_CLAIM_PKG,
         "expect_out": ["{banner}",
-                       "SOS deadclaim: resolved len=1",
-                       "SOS: process fault: bad handle process={zero}",
+                       "SOS deadclaim: the server let its obligation go",
+                       "SOS deadclaim: ready says the other end of this "
+                       "connection is gone",
+                       "SOS deadclaim: claim dropped unresolved",
+                       "SOS deadclaim: minting a sibling of a one-shot",
+                       "SOS: process fault: access denied process={zero}",
                        "SOS: process teardown handles="],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
@@ -3984,6 +4020,84 @@ TEST_CASES = [
                        "SOS: process fault: access denied process={zero}"],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
+    },
+    # =========================================================================
+    # M4 unit 4.5 — the one-shot discipline (sawos design 22)
+    # =========================================================================
+    {
+        # **RESOLVE PARKS** (`designs/010` ruling 12(b)). Root posts and then
+        # RESOLVES, with NO Waiter anywhere in the process and no attachment at
+        # all: the resolve finds the exchange pending and blocks the calling
+        # thread on the claim's own ready level, and a child server's reply is
+        # what wakes it, inside its own syscall, with the bytes in its own
+        # buffer.
+        #
+        # **REACHING THE END IS THE PROOF.** Through unit 4 a pending resolve
+        # answered `WouldBlock` and consumed nothing, so this exact program would
+        # have fallen through with no reply and failed its own length check.
+        # There is nothing else in root that could have produced the answer.
+        #
+        # **THE ORDER IS THE SECOND HALF OF IT**, and it is `pipe_send_manual`'s:
+        # `SOS childserver: replied` comes BEFORE root's row, because root parked
+        # with nothing else runnable and the kernel had to go find the child; the
+        # child parked on its OUTLET and was woken by root's post.
+        #
+        # `ops resolve=2 fused=1` is the sweep row (sawos design 16's bracket).
+        # Post plus resolve against the fused `send`, measured by the same
+        # process against the same server in the same boot, each delta less its
+        # own closing `stats()` trap. Unit 3's composition was THREE for the same
+        # answer — post, attach, wait — which is what ruling 12(b) took a trap
+        # out of for a client that wants a HANDLE on its exchange.
+        "name": "pipe_resolve_park",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_RESOLVE_PARK_PKG,
+        "children": [CHILD_SERVER_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS resolvepark: gave the outlet",
+                       "SOS childserver: replied",
+                       "SOS resolvepark: reply len=4 b=80,79,78,71",
+                       "SOS resolvepark: fused reply len=4 b=80,79,78,71",
+                       "SOS resolvepark: ops resolve=2 fused=1",
+                       "SOS resolvepark: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **THE ORPHANED-CLAIM ARM AT A HANDLE-BACKED CLAIM** (`designs/010`
+        # ruling 12(b)'s `end_process` mirror; sawos design 22).
+        # `pipe_call_orphan` with the other spelling: the child's threads park
+        # inside a `resolve` rather than inside a fused `send`, and the launcher
+        # answers one, watches the process die, and asks the ORPHANED obligation
+        # what the teardown decided.
+        #
+        # **WHAT THE ROW PROVES IS THAT NOTHING WAS ADDED.** `park_resolve`
+        # unbinds the caller's entry and KEEPS its reference, so from the park
+        # onward a parked resolver and a parked fused caller are the same thing:
+        # one reference on the claim column, `PIPE_CALLER` naming the thread.
+        # `release_pending_calls` walks threads with a claim tie and never asks
+        # which op put it there, so this case reaches the arm through code
+        # written for unit 3.5.
+        #
+        # **WHY A SIBLING CASE AND NOT AN ARM ON `pipe_call_orphan`.** The proof
+        # needs the ORPHANED thread to be the shape under test, and one
+        # two-thread child can orphan only one shape — whichever thread the
+        # launcher answers is the one that exits. `child-orphan`'s two threads
+        # are interchangeable ON PURPOSE, which is what makes that case
+        # deterministic; making them differ would have traded a fact for a scan
+        # order. Two cases, one spelling each, keeps both proofs.
+        "name": "pipe_resolve_orphan",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_RESOLVE_ORPHAN_PKG,
+        "children": [CHILD_RESOLVER_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS resolveorphan: two resolves in flight",
+                       "SOS resolveorphan: answered one",
+                       "SOS: process exit: code={resolve_orphan_mark} "
+                       "process={one}",
+                       "SOS resolveorphan: the orphaned claim answers the other "
+                       "end of this connection is gone"],
+        "expect_clean_exit": True,
     },
 ]
 

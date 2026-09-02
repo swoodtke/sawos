@@ -23,19 +23,32 @@
 //! `PipeRequestHandle` under the tree's own convention — a §2 object name renders
 //! short at the typed tier, exactly as `MemoryObject` renders as `Memory`.
 //!
-//! **THE THREE OPS POLL, AND SINCE M4 UNIT 3 THEY ARE NOT THE ONLY DOOR** (sawos
-//! design 15). A full ring, an empty one and a reply that has not been written
-//! yet are all "not right now" — and at THIS tier that is not an error: `post`
-//! answers `Ok(Some(claim))` or `Ok(None)`, `take` answers
-//! `Ok(Some((len, request)))` or `Ok(None)`, and `resolve` answers
-//! `Ok(Some(len))` or `Ok(None)`, on design 234 §4's two-channel shape, so a
-//! poll loop never matches an error case for a condition that clears itself.
-//! What IS an error is a peer that is gone, and it is terminal.
+//! **`WouldBlock` IS AN ERROR HERE, AND THE OPTIONALS ARE GONE** (`designs/010`
+//! ruling 12(a), M4 unit 4.5 — which RE-RULES design 13 D-2). Through unit 4 a
+//! full ring, an empty one and an unwritten reply were `Ok(None)` on design 234
+//! §4's two-channel shape, because at unit 1 every caller of these ops WAS a
+//! poll loop. Units 3 and 3.5 inverted that population — a caller waits with a
+//! `Waiter` or calls `send`, and reaches `post`/`take` already knowing the
+//! answer — and the tree showed it: ZERO `case None` arms, every site paying a
+//! `try` for the errors and then a guard treating the `None` as a bug. So `post`
+//! answers `Ok(claim)`, `take` answers `Ok((msg, request))`, and a transient
+//! refusal rides the ERROR channel as `Err(SosStatus.WouldBlock)`. A caller that
+//! genuinely polls declares itself with a `match` carrying a `WouldBlock` arm,
+//! which is the idiom ruling's licensed real-work-arms case. The general rule is
+//! CLAUDE.md's: an Optional in a signature is an antipattern unless the absence
+//! is a real domain value. See `floor`'s level-decode banner for the seam where
+//! the divergence from `Channel.try_receive` is recorded.
 //!
-//! What unit 3 added beside them is the PARK: all four kinds are §2.2 waitables,
-//! and the eight `Waiter` overloads at the bottom of this file are how they
-//! attach. A caller chooses the door by whether it wants to wait, never by what
-//! it will be told.
+//! **AND `resolve` NO LONGER POLLS AT ALL** (ruling 12(b)). It CONSUMES the
+//! claim and PARKS when the answer has not arrived, so it is the waiter-free
+//! blocking receive; the question it used to answer is `ready()`, which spends
+//! nothing and puts the terminal on the error channel — `Err(PeerClosed)` means
+//! the reply can never come, so the claim is DROPPED rather than resolved.
+//!
+//! What unit 3 added beside all of them is the PARK: all four kinds are §2.2
+//! waitables, and the eight `Waiter` overloads at the bottom of this file are how
+//! they attach. A caller chooses the door by whether it wants to wait, never by
+//! what it will be told.
 //!
 //! **THE BLOCKING SEND IS THE CALLER'S OWN COMPOSITION, and there is no wrapper
 //! type for it** (user ruling, lead review Sep 1). §2.1's ratified `send(msg)`
@@ -58,14 +71,18 @@
 //! `deinit` body, so the husk that used to carry `NO_HANDLE` does not exist, the
 //! handle word's synthesized drop is a no-op, and no release fires.
 //!
-//! **`resolve` IS DELIBERATELY NOT ONE, and the reason is the documented
-//! difference it always had**: a `resolve` that answers `Ok(None)` consumed
-//! NOTHING. `consumes` consumes on every path — the empty poll included — so
-//! spelling it that way would spend a live claim the first time the answer had not
-//! arrived yet. Its contract is consume-on-success-or-terminal-failure, which the
-//! effect cannot express, so it keeps its `&var self` receiver and its disarm
-//! decided by the ANSWER. What stands behind it is what always did: the kernel's
-//! ledger, and `pipe-dead-claim` is that fault, still reachable and still proved.
+//! **AND `resolve` IS ONE TOO SINCE M4 UNIT 4.5** (`designs/010` ruling 12(b)).
+//! It used to be the exception, and the reason was real while it lasted: a
+//! `resolve` that answered `Ok(None)` consumed NOTHING, and `consumes` consumes
+//! on every path, so spelling it that way would have spent a live claim at the
+//! first empty poll. Ruling 12(b) removed the empty poll instead of working
+//! around it — a pending exchange PARKS the calling thread inside the op — so
+//! every path a `resolve` can return through ends the exchange for this caller
+//! and the effect fits exactly. The kernel's ledger still stands behind it for a
+//! raw-altitude caller holding a word (`pipe-reply-wait-dead`'s precedent); what
+//! changed is that a Saw caller can no longer get there, so the double-resolve
+//! `pipe-dead-claim` used to prove is a COMPILE error now and that case proves
+//! the ruled flow instead.
 //!
 //! The transfer funnels that are NOT receivers — the four `Waiter.give` overloads
 //! below — keep the disarm, because `consumes` is a receiver-position effect and
@@ -88,9 +105,10 @@ import sosabi.{SosStatus, PipeInletHandle, PipeInletOp, PipeOutletHandle,
                pipe_send_record_bytes, pipe_take_record_bytes,
                wait_record_bytes}
 
-import sos.floor.{ALL_RIGHTS, call_value, checked, polled_ok, polled_value,
+import sos.floor.{ALL_RIGHTS, call_value, checked, polled_ok,
                   sos_handle_release, sos_pipe_inlet_call, sos_pipe_inlet_post,
-                  sos_pipe_outlet_take, sos_pipe_reply_resolve,
+                  sos_pipe_outlet_take, sos_pipe_reply_ready,
+                  sos_pipe_reply_resolve,
                   sos_pipe_request_reply, sos_pipe_request_reply_wait,
                   sos_waiter_wait}
 import sos.waiter.{AttachMode, Waiter, mode_flag}
@@ -705,11 +723,13 @@ extension PipeInlet: NoCopy {
 extension PipeInlet {
     /// **STAGE A MESSAGE FOR THE FAR END.** Requires `PipeInletRight.Post`.
     ///
-    /// `Ok(Some(claim))` the message is staged; `Ok(None)` THE RING IS FULL and
-    /// nothing was staged — call again once an exchange has settled. The absence
-    /// is not a failure and does not belong in the error channel: design 234 §4's
-    /// rule, that a poll loop must be able to tell "not yet" from "broken", read
-    /// at the sending end.
+    /// `Ok(claim)` the message is staged; `Err(SosStatus.WouldBlock)` THE RING IS
+    /// FULL and nothing was staged — call again once an exchange has settled.
+    /// **THE TRANSIENT RIDES THE ERROR CHANNEL SINCE M4 UNIT 4.5**
+    /// (`designs/010` ruling 12(a)): a poll loop must be able to tell "not yet"
+    /// from "broken", and a `match` with a `WouldBlock` arm tells them apart
+    /// perfectly well while costing nothing to the callers — the great majority —
+    /// that reach this op knowing there is room.
     ///
     /// **IT NEVER BLOCKS AND NEVER WILL** (design 10 ruling 4): `post` is the
     /// ONE kernel primitive on the client side, and blocking send,
@@ -731,18 +751,18 @@ extension PipeInlet {
     /// TERMINAL — nothing un-closes — so a caller may stop rather than retry.
     ///
     /// **AND IT ANSWERS THE CLAIM** (sawos design 14; §2.1's `send` yields a
-    /// `PipeReplyHandle`, and this is it). `Ok(Some(claim))` is a staged message
-    /// AND the client's claim on the one reply it is owed; hold it and `resolve`
-    /// it, hand it on with `give`, or DROP it — dropping is §2.1's cancellation
+    /// `PipeReplyHandle`, and this is it). `Ok(claim)` is a staged message AND
+    /// the client's claim on the one reply it is owed; hold it and `resolve` it,
+    /// hand it on with `give`, or DROP it — dropping is §2.1's cancellation
     /// primitive and the TELL idiom's second half, and the server is told by its
     /// `reply` answering `PeerClosed`.
     ///
     /// **A CLAIM HOLDS A RING SLOT UNTIL THE EXCHANGE SETTLES**, which is what
-    /// makes `Ok(None)` mean more than it did in unit 1: a full ring counts
-    /// AWAITING-REPLY exchanges now, not merely untaken messages, so a client
-    /// that never resolves will meet its own in-flight budget.
+    /// makes `Err(WouldBlock)` mean more than it did in unit 1: a full ring
+    /// counts AWAITING-REPLY exchanges now, not merely untaken messages, so a
+    /// client that never resolves will meet its own in-flight budget.
     public func post(&self, body: &[UInt8; PIPE_BODY_BYTES],
-                     len: UInt) -> Result<PipeReply?, SosStatus> {
+                     len: UInt) -> Result<PipeReply, SosStatus> {
         var none = PipeHandles.none()
         return post_body(self.handle, &body, len, &var none)
     }
@@ -759,17 +779,17 @@ extension PipeInlet {
     ///
     /// **A SECOND OVERLOAD RATHER THAN A DEFAULTED PARAMETER**, and the carrier
     /// is by `&var` rather than by value, because a refused post MUST NOT COST A
-    /// CALLER ITS CAPABILITIES: `Ok(None)` is a full ring and the ordinary thing
-    /// a poll loop meets, so the handles have to still be there to try again
-    /// with. On the staged path the carrier is emptied — the kernel holds the
-    /// words now — and on every refusal it is untouched.
+    /// CALLER ITS CAPABILITIES: `Err(WouldBlock)` is a full ring and the ordinary
+    /// thing a poll loop meets, so the handles have to still be there to try
+    /// again with. On the staged path the carrier is emptied — the kernel holds
+    /// the words now — and on every refusal it is untouched.
     ///
     /// **THE ENTRIES STAY YOURS UNTIL THE RENDEZVOUS** (ruling 5), which has one
     /// consequence worth reading: releasing one afterwards is legal and makes
     /// that slot arrive EMPTY at the receiver. Fire-and-forget is a shape §2.1
     /// blesses, so the ledger never has an in-flight limbo state.
     public func post_with(&self, body: &[UInt8; PIPE_BODY_BYTES], len: UInt,
-                          handles: &var PipeHandles) -> Result<PipeReply?, SosStatus> {
+                          handles: &var PipeHandles) -> Result<PipeReply, SosStatus> {
         post_body(self.handle, &body, len, &var handles)
     }
 
@@ -866,22 +886,24 @@ extension PipeInlet {
 /// line owns a `PipeReply` instead.
 func post_body(handle: PipeInletHandle, body: &[UInt8; PIPE_BODY_BYTES],
                len: UInt,
-               handles: &var PipeHandles) unsafe -> Result<PipeReply?, SosStatus> {
+               handles: &var PipeHandles) unsafe -> Result<PipeReply, SosStatus> {
     var args = send_record(&body, len, &handles)
     var value: UInt = 0
     let raw = sos_pipe_inlet_post(handle,
                                   (&var args) as UnsafePointer<UInt>,
                                   pipe_send_record_bytes() as UInt,
                                   (&var value) as UnsafePointer<UInt>)
-    let word = try polled_value(raw, value)
-    guard let staged = word else { return None }
+    // **`checked` RATHER THAN A POLL DECODE SINCE M4 UNIT 4.5** (`designs/010`
+    // ruling 12(a)): the WIRE still says `WouldBlock` and this function still
+    // reads the same word — what moved is which channel the typed answer puts it
+    // on, which is why the ruling costs no ABI change at all.
+    try checked(raw)
     // **THE CARRIER IS EMPTIED ONLY ON THE STAGED PATH.** The kernel holds the
     // words now and the entries stay bound until the rendezvous moves them, so
     // a release here would deliver every slot as `None`; a refusal never
     // reaches this line, so the caller keeps everything it had.
     handles.handed_over()
-    let claim: PipeReply? = PipeReply(handle: PipeReplyHandle(staged))
-    return move claim
+    return PipeReply(handle: PipeReplyHandle(value))
 }
 
 /// Assemble the argument record every sending op takes — a body address, a
@@ -915,9 +937,10 @@ func send_record(body: &[UInt8; PIPE_BODY_BYTES], len: UInt,
 /// because a caller cannot size a buffer against a length it has not been told
 /// yet — the published-minimum rule, one more time.
 ///
-/// There is no `polled_value` here and there could not be: a fused call has no
-/// would-block outcome to keep out of the error channel, which is the whole
-/// difference between this and `post` beside it.
+/// A fused call has no would-block outcome AT ALL — a full ring parks it —
+/// which is what still distinguishes it from `post` beside it now that both
+/// decode through `checked` (`designs/010` ruling 12(a) put `post`'s transient
+/// back on the error channel; this op has none to put anywhere).
 func call_body(handle: PipeInletHandle, body: &[UInt8; PIPE_BODY_BYTES],
                len: UInt,
                handles: &var PipeHandles) unsafe -> Result<PipeMsg, SosStatus> {
@@ -971,13 +994,14 @@ extension PipeOutlet {
     /// of it are real **AND THE OBLIGATION TO REPLY TO IT**. Requires
     /// `PipeOutletRight.Take`.
     ///
-    /// `Ok(Some((n, request)))` a message arrived, its first `n` bytes are yours,
-    /// and `request` is the server's obligation to send exactly one reply;
-    /// `Ok(None)` NOTHING IS STAGED — call again. The `None` is design 234 §4's
-    /// two-channel shape, and the reason it is not an error is that reason
-    /// exactly: a server polling an idle connection is not a server meeting a
-    /// failure, and a shape that could not tell those apart would make the poll
-    /// loop unwritable.
+    /// `Ok((msg, request))` a message arrived and `request` is the server's
+    /// obligation to send exactly one reply; `Err(SosStatus.WouldBlock)` NOTHING
+    /// IS STAGED — call again. **THE TRANSIENT RIDES THE ERROR CHANNEL SINCE M4
+    /// UNIT 4.5** (`designs/010` ruling 12(a)): a server polling an idle
+    /// connection is still not a server meeting a failure, and the way it says so
+    /// is a `match` with a `WouldBlock` arm — which is what a poll loop wants
+    /// declared out loud, and what every other caller of this op (one that
+    /// waited on the readable level first) should not have to unwrap.
     ///
     /// **THE OBLIGATION IS THE HALF M4 UNIT 2 ADDED** (sawos design 14): discharge
     /// it with `reply`, hand it on with `give` — §2.1's delegation primitive, and
@@ -986,9 +1010,9 @@ extension PipeOutlet {
     /// legitimate answer; what is not available is forgetting it, because the ring
     /// slot behind it is held until the exchange settles.
     ///
-    /// `n` MAY BE ZERO, and that is a message rather than an absence — §2.1
-    /// makes a data-free message an option, so the two are genuinely different
-    /// answers and the `Optional` is what keeps them apart.
+    /// `msg.len` MAY BE ZERO, and that is a message rather than an absence —
+    /// §2.1 makes a data-free message an option, so the two are genuinely
+    /// different answers and the two CHANNELS are what keep them apart.
     ///
     /// **THE BUFFER IS A WHOLE SLOT, NOT A MESSAGE.** It is
     /// `PIPE_BODY_BYTES` wide because a caller cannot size a buffer against a
@@ -1007,7 +1031,7 @@ extension PipeOutlet {
     /// mid-conversation loses nothing. Afterwards it is TERMINAL — no new sender
     /// can appear, because attenuation is monotonic and a column at zero has no
     /// handle left to mint from — so every later take answers the same.
-    public func take(&self) -> Result<(PipeMsg, PipeRequest)?, SosStatus> {
+    public func take(&self) -> Result<(PipeMsg, PipeRequest), SosStatus> {
         take_into_frame(self.handle)
     }
 
@@ -1029,13 +1053,13 @@ extension PipeOutlet {
 ///
 /// **THE TUPLE IS THE ANSWER, on `Process.pipe_create`'s own reasoning** (design
 /// 13 finding 4): a take that succeeds always carries EXACTLY TWO things and the
-/// caller always wants both, so a destructuring `if let (n, request) = got` moves
-/// each into its own binding with no husk left behind — where a `BootHandle`
-/// needed an `Optional` per slot because it carries at most one of several kinds
-/// and asking the wrong question must be harmless.
+/// caller always wants both, so a destructuring `let (msg, request) = try ...`
+/// moves each into its own binding with no husk left behind — where a
+/// `BootHandle` needed an `Optional` per slot because it carries at most one of
+/// several kinds and asking the wrong question must be harmless.
 func take_into_frame(
     handle: PipeOutletHandle
-) unsafe -> Result<(PipeMsg, PipeRequest)?, SosStatus> {
+) unsafe -> Result<(PipeMsg, PipeRequest), SosStatus> {
     var rec = PipeTakeRecord(
         request: NO_HANDLE,
         msg: PipeMsgRecord(meta: PipeMsgMeta(len: 0,
@@ -1045,14 +1069,13 @@ func take_into_frame(
     let raw = sos_pipe_outlet_take(handle,
                                    (&var rec) as UnsafePointer<UInt>,
                                    pipe_take_record_bytes() as UInt)
-    let staged = try polled_ok(raw)
-    if not staged {
-        return None
-    }
+    // `checked` since M4 unit 4.5 (`designs/010` ruling 12(a)) — the wire word is
+    // the same one `polled_ok` used to read, and only the channel moved.
+    try checked(raw)
     let request = PipeRequest(handle: PipeRequestHandle(rec.request))
-    let got: (PipeMsg, PipeRequest)? = (msg_of(&rec.msg.meta, &rec.msg.handles,
-                                               &rec.msg.bytes),
-                                        move request)
+    let got: (PipeMsg, PipeRequest) = (msg_of(&rec.msg.meta, &rec.msg.handles,
+                                              &rec.msg.bytes),
+                                       move request)
     return move got
 }
 
@@ -1071,6 +1094,11 @@ func take_into_frame(
 /// decision, and a tell-style message ignores the signal entirely. Deterministic
 /// destruction is what makes the timing of the signal deterministic too.
 ///
+/// **DROPPING IT IS ALSO WHAT `ready()`'s TERMINAL ASKS FOR** (`designs/010`
+/// ruling 12(b)): a claim whose exchange can never be answered is released, not
+/// resolved — the ordinary drop, which is why the terminal is on the error
+/// channel where no second call suggests itself.
+///
 /// Built by `PipeInlet.post`, by `PipeReply.mint` and by `BootHandle.take_reply`,
 /// and by nothing else — no word constructor, no word extractor.
 public struct PipeReply {
@@ -1079,8 +1107,10 @@ public struct PipeReply {
 
 extension PipeReply: NoCopy {
     /// Drop is release; see `System`'s deinit for the sentinel and the discard.
-    /// A claim that has already been resolved holds the sentinel, so this is a
-    /// no-op on it — single use, spelled in the value rather than checked.
+    /// **A RESOLVED CLAIM NEVER REACHES THIS BODY** since `resolve` became a
+    /// `consumes` method (SL-16's shape): the consuming body stands in for this
+    /// one on that path, so there is no husk and no sentinel to check. What is
+    /// left here is the honest drop — a claim the holder chose not to spend.
     func deinit(&var self) {
         if self.handle != NO_HANDLE {
             let _ = sos_handle_release(self.handle)
@@ -1089,55 +1119,89 @@ extension PipeReply: NoCopy {
 }
 
 extension PipeReply {
-    /// **TAKE THE REPLY, IF IT HAS BEEN WRITTEN.** Requires
+    /// **HAS THE ANSWER ARRIVED? — the level, asked without spending anything**
+    /// (`designs/010` ruling 12(b); sawos design 22). Requires
+    /// `PipeReplyRight.Wait`, which is the bit that gates ATTACHING this claim,
+    /// because it is the same question asked two ways; `Resolve` stays the
+    /// consuming act's authority.
+    ///
+    /// The three answers are the user's own words:
+    ///
+    ///   - `Ok(true)` — THE REPLY HAS ARRIVED. `(move claim).resolve()` will
+    ///     return it without parking.
+    ///   - `Ok(false)` — not yet, AND THE CONNECTION IS STILL GOOD. Ask again,
+    ///     or resolve and park, or attach and wait.
+    ///   - `Err(SosStatus.PeerClosed)` — the reply can NEVER come. **THE
+    ///     TERMINAL IS ON THE ERROR CHANNEL SO THAT THERE IS NO SECOND CALL TO
+    ///     MAKE**: the caller simply DROPS the claim (the wrapper's ordinary
+    ///     release) rather than spending a resolve on a dead exchange.
+    ///
+    /// **READINESS IS MONOTONIC**, so ready-then-resolve has no check-then-act
+    /// race: an exchange goes from pending to settled and never back, and the
+    /// only way a `true` can become anything else is somebody else settling the
+    /// slot — which cannot happen, because a claim has ONE NAME (ruling 12(c))
+    /// and this one is yours.
+    ///
+    /// It borrows rather than consuming, which is what lets a poll loop call it
+    /// as many times as it likes and then move the claim into the resolve.
+    public func ready(&self) -> Result<Bool, SosStatus> {
+        polled_ok(sos_pipe_reply_ready(self.handle))
+    }
+
+    /// **TAKE THE REPLY, PARKING UNTIL IT IS THERE — AND SPEND THE CLAIM**
+    /// (`designs/010` ruling 12(b); sawos design 22). Requires
     /// `PipeReplyRight.Resolve`.
     ///
-    /// `Ok(Some(n))` the reply is here and its first `n` bytes are yours — and
-    /// THE CLAIM IS SPENT: this value disarms itself, so dropping it does nothing
-    /// and calling `resolve` again is the ordinary `BadHandle` fault. `Ok(None)`
-    /// the exchange is still pending — nobody has replied yet, the claim is
-    /// untouched, ask again. `n` may be ZERO, which is a reply that carries no
-    /// data rather than an absence.
+    /// `Ok(msg)` the reply is here and its bytes and handles are yours;
+    /// `msg.len` may be ZERO, which is a reply that carries no data rather than
+    /// an absence.
     ///
-    /// **IT NEVER PARKS, AND SINCE M4 UNIT 3 IT IS THE POLLING DOOR RATHER THAN
-    /// THE ONLY ONE.** The blocking `send(msg)` and `send(msg, timeout:)` §2.1
-    /// ratifies are LIBRARY compositions over post + attach + wait (design 10
-    /// ruling 4, and ruling 11(a) deleted the resolve leg — the answer arrives
-    /// IN the wait record), and every piece they need is shipped — the
-    /// composition is the caller's own four calls. A claim whose answer was
-    /// delivered through a wait answers `PeerClosed` here: there is no second
-    /// copy of an answer.
+    /// **IT PARKS, AND IT IS THE WAITER-FREE BLOCKING RECEIVE.** A pending
+    /// exchange blocks the calling thread on the claim's ready level inside the
+    /// kernel and resumes with one of the two answers below — so a client that
+    /// wants exactly one answer needs no Waiter, no attachment and no poll loop,
+    /// and `PipeInlet.send` remains the one-trap form for the whole round trip.
+    /// The non-blocking question is `ready()`. The `send(msg)` /
+    /// `send(msg, timeout:)` compositions §2.1 ratifies are a THIRD door and use
+    /// neither — they attach the claim, and ruling 11(a) put the answer IN the
+    /// wait record. A claim whose answer was delivered that way answers
+    /// `PeerClosed` here: there is no second copy of an answer.
     ///
     /// `Err(SosStatus.PeerClosed)` means the server side abandoned it — the
-    /// obligation was dropped without a reply, or the connection's server end went
-    /// away before the message could ever be taken. It SPENDS the claim too:
-    /// there is nothing left to wait for, so holding it would be holding a ring
-    /// slot for an answer that can never come.
+    /// obligation was dropped without a reply, or the connection's server end
+    /// went away before the message could ever be taken.
     ///
-    /// **IT IS NOT A `consumes` METHOD, AND THAT IS THE POLL SEMANTICS SPEAKING**
-    /// (SL-16). Its two siblings on the obligation side — `reply` and
-    /// `reply_wait` — consume on every path and say so in the effect slot. This
-    /// one consumes on two paths out of three: `Ok(Some(n))` and
-    /// `Err(PeerClosed)` both end the exchange, and `Ok(None)` is the answer that
-    /// has not arrived yet and spends NOTHING. `consumes` cannot express
-    /// consume-on-some-paths — it would kill the claim at the first empty poll,
-    /// which is the one thing a poll loop must survive — so the receiver stays
-    /// `&var self`, the disarm stays decided by the ANSWER, and a second resolve
-    /// through a spent claim stays what it always was: the kernel's `BadHandle`,
-    /// which `pipe-dead-claim` proves.
-    public func resolve(&var self) -> Result<PipeMsg?, SosStatus> {
-        resolve_into_frame(&var self)
+    /// **IT IS A `consumes` METHOD, AND EVERY PATH SPENDS THE CLAIM** (SL-16's
+    /// shape, reaching the third one-shot op). The call spells the move —
+    /// `(move claim).resolve()` — so the binding is dead past that expression and
+    /// a second resolve is a COMPILE error rather than the kernel's `BadHandle`.
+    /// Nothing is disarmed and nothing is released: the consuming body stands in
+    /// for this type's `deinit` on this path, exactly as `reply`'s does. The
+    /// kernel's ledger still stands behind the word for a raw-altitude caller.
+    ///
+    /// **A REFUSED HANDLE MINT SPENDS IT TOO.** A reply may carry capabilities,
+    /// and a caller whose table has no room for them is answered
+    /// `Err(NoResource)` / `Err(QuotaExceeded)` — with the claim gone, because a
+    /// consuming op leaves nothing to retry with. Make table room BEFORE
+    /// resolving a reply you expect handles on; it is the same trade the fused
+    /// `PipeInlet.send` makes, and for the same reason.
+    public func resolve(&var self) consumes -> Result<PipeMsg, SosStatus> {
+        resolve_into_frame(self.handle)
     }
 
     /// **MINT A SIBLING of this claim, narrowed by a KEEP MASK** — the universal
-    /// `MINT_OP`, on `PipeInlet.mint`'s exact terms.
+    /// `MINT_OP`, on `PipeInlet.mint`'s exact terms, except that here it CANNOT
+    /// SUCCEED.
     ///
-    /// A sibling is a second NAME and therefore a second reference on the
-    /// exchange's reply column, and single use survives it: the op consumes an
-    /// ENTRY, and the exchange's own state is what allows exactly one successful
-    /// resolve. The sibling that asks second is told `PeerClosed`, which is the
-    /// same answer an abandoned peer gets and for the same reason — there is no
-    /// reply left for it.
+    /// **A ONE-SHOT HAS ONE NAME** (`designs/010` ruling 12(c)):
+    /// `pipe_reply_rights()` withholds the universal `Mint` bit, and attenuation
+    /// is monotonic, so no `PipeReply` this kernel ever mints carries it and
+    /// calling this TERMINATES the caller with `AccessDenied`. The method is kept
+    /// rather than deleted because that refusal is the rule's witness — a sibling
+    /// would be a second claim on an exchange only one act may spend, resolving
+    /// into `PeerClosed` at best — and because the tree proves rules by executing
+    /// them (`tests/pipe-dead-claim`). Attenuate-then-give is `give`'s KEEP MASK,
+    /// which needs no sibling at all.
     public func mint(&self,
                      rights: UInt32 = ALL_RIGHTS) -> Result<PipeReply, SosStatus> {
         let raw = try call_value(self.handle, MINT_OP, rights as UInt, 0, 0)
@@ -1148,31 +1212,27 @@ extension PipeReply {
 /// The `unsafe` half of `PipeReply.resolve`, confined to one small named helper
 /// (design 136). The buffer's address never leaves it.
 ///
-/// **THE DISARM IS DECIDED BY THE ANSWER, and that is this file's one departure
-/// from the transfer-funnel contract** (`floor`'s block: disarm BEFORE the
-/// syscall, because every failure of such a syscall is a fault). A resolve has a
-/// third outcome the funnels do not — `Ok(None)`, which consumed nothing — so
-/// disarming first would throw away a live claim on every poll. The rule is exact
-/// and it is the kernel's: the caller's entry is consumed unless the answer is a
-/// would-block.
-func resolve_into_frame(claim: &var PipeReply) unsafe -> Result<PipeMsg?, SosStatus> {
+/// **THERE IS NO DISARM ANY MORE, AND NOTHING TAKES ITS PLACE** — `reply_body`'s
+/// sentence, now true here too (`designs/010` ruling 12(b), closing this file's
+/// one departure from the transfer-funnel contract). Through unit 4 the disarm
+/// was decided by the ANSWER, because a resolve had a third outcome the funnels
+/// do not: an `Ok(None)` that consumed nothing, which a disarm-first would have
+/// thrown away on every poll. That outcome is gone — the op parks instead — so
+/// the caller is a `consumes` method whose body IS the wrapper's teardown on this
+/// path, the handle word is swept by a synthesized drop that does nothing, and
+/// this helper takes the word like every other one in the file.
+func resolve_into_frame(handle: PipeReplyHandle) unsafe -> Result<PipeMsg, SosStatus> {
     var rec = PipeMsgRecord(meta: PipeMsgMeta(len: 0,
                                               kinds: [0; PIPE_MSG_HANDLES]),
                             handles: [NO_HANDLE; PIPE_MSG_HANDLES],
                             bytes: [0; PIPE_BODY_BYTES])
     var value: UInt = 0
-    let raw = sos_pipe_reply_resolve(claim.handle,
+    let raw = sos_pipe_reply_resolve(handle,
                                      (&var rec) as UnsafePointer<UInt>,
                                      pipe_msg_record_bytes() as UInt,
                                      (&var value) as UnsafePointer<UInt>)
-    let got = try polled_value(raw, value) catch {
-        claim.handle = PipeReplyHandle(NO_HANDLE)
-        return error
-    }
-    guard let _ = got else { return None }
-    claim.handle = PipeReplyHandle(NO_HANDLE)
-    let answer: PipeMsg? = msg_of(&rec.meta, &rec.handles, &rec.bytes)
-    return move answer
+    try checked(raw)
+    return msg_of(&rec.meta, &rec.handles, &rec.bytes)
 }
 
 /// A handle to a PipeRequest — the SERVER's obligation to send ONE reply (spec
@@ -1315,9 +1375,16 @@ extension PipeRequest {
     }
 
     /// **MINT A SIBLING of this obligation, narrowed by a KEEP MASK.** Everything
-    /// `PipeReply.mint` says holds here with `Reply` in `Resolve`'s place: one
-    /// reply may be written however many names the obligation has, and the sibling
-    /// that writes second is told `PeerClosed`.
+    /// `PipeReply.mint` says holds here with `Reply` in `Resolve`'s place,
+    /// including the part that matters: `pipe_request_rights()` withholds the
+    /// universal `Mint` bit since ruling 12(c), so this CANNOT SUCCEED and
+    /// calling it terminates the caller with `AccessDenied` — the one-name rule
+    /// on the obligation half, which `tests/pipe-no-reply` executes.
+    ///
+    /// **DELEGATION IS UNTOUCHED**, and that is the distinction the rule rests
+    /// on: §2.1's forwarding primitive is `Transfer` MOVING the one name to a
+    /// third party (`tests/pipe-delegate`, `tests/pipe-delegate-msg`), never a
+    /// second name being made.
     public func mint(&self,
                      rights: UInt32 = ALL_RIGHTS) -> Result<PipeRequest, SosStatus> {
         let raw = try call_value(self.handle, MINT_OP, rights as UInt, 0, 0)

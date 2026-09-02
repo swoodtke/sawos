@@ -62,13 +62,8 @@ func _start(boot_handle: UInt) {
     // that follows is told there is nobody to receive it.
     // =========================================================================
     msg[0] = 1
-    let staged = try inlet.post(body: &msg, len: 1) catch {
+    let claim = try inlet.post(body: &msg, len: 1) catch {
         print("SOS abandon: post failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    guard let claim = move staged else {
-        let _ = system.debug_print("SOS abandon: fresh ring refused a post\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
@@ -97,13 +92,8 @@ func _start(boot_handle: UInt) {
     // client is told rather than left waiting for an answer that cannot come.
     // =========================================================================
     msg[0] = 2
-    let second = try inlet.post(body: &msg, len: 1) catch {
+    var pending = try inlet.post(body: &msg, len: 1) catch {
         print("SOS abandon: second post failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    guard var pending = move second else {
-        let _ = system.debug_print("SOS abandon: second post refused\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
@@ -114,7 +104,11 @@ func _start(boot_handle: UInt) {
     }
     let _ = move dropped
 
-    match pending.resolve() {
+    // **THE RESOLVE DOES NOT PARK HERE, AND THAT IS THE ARM'S POINT**
+    // (`designs/010` ruling 12(b)): a claim whose obligation was dropped is
+    // terminal, not pending, so the op finishes with `PeerClosed` instead of
+    // blocking on an answer nobody can write. The move is the consume.
+    match (move pending).resolve() {
         case Ok(_) -> {
             let _ = system.debug_print("SOS abandon: a reply arrived from nobody\n")
             let _ = system.shutdown(EXIT_FAILED)
@@ -137,13 +131,8 @@ func _start(boot_handle: UInt) {
     let (client, server) = move other
 
     msg[0] = 3
-    let never = try client.post(body: &msg, len: 1) catch {
+    var orphan = try client.post(body: &msg, len: 1) catch {
         print("SOS abandon: staged post failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    guard var orphan = move never else {
-        let _ = system.debug_print("SOS abandon: staged post refused\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
@@ -154,7 +143,7 @@ func _start(boot_handle: UInt) {
     // staged exchange with no server end IS an abandoned one.
     let _ = move server
 
-    match orphan.resolve() {
+    match (move orphan).resolve() {
         case Ok(_) -> {
             let _ = system.debug_print("SOS abandon: a dead outlet answered\n")
             let _ = system.shutdown(EXIT_FAILED)
@@ -171,6 +160,6 @@ func _start(boot_handle: UInt) {
 /// error — every take here has a message waiting by construction.
 func take_one(outlet: &PipeOutlet) -> Result<PipeRequest, SosStatus> {
     let got = try outlet.take()
-    guard let (_, request) = move got else { return SosStatus.WouldBlock }
+    let (_, request) = move got
     return move request
 }

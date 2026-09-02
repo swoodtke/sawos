@@ -89,8 +89,7 @@ func drain_then_terminal(proc: &Process, waiter: &Waiter) -> Result<Void, SosSta
     let pair = try proc.pipe_create()
     let (inlet, outlet) = move pair
 
-    let staged = try inlet.post(body: &msg, len: 1)
-    guard let claim = move staged else { return BUG }
+    let claim = try inlet.post(body: &msg, len: 1)
     // §2.1's TELL: the client gives up the answer and then gives up the
     // connection. What it staged is still owed to the live outlet.
     let _ = move claim
@@ -130,10 +129,9 @@ func abandoned(proc: &Process, waiter: &Waiter) -> Result<Void, SosStatus> {
     let pair = try proc.pipe_create()
     let (inlet, outlet) = move pair
 
-    let staged = try inlet.post(body: &msg, len: 1)
-    guard let claim = move staged else { return BUG }
+    let claim = try inlet.post(body: &msg, len: 1)
     let got = try outlet.take()
-    guard let (_, request) = move got else { return BUG }
+    let (_, request) = move got
     var obligation = move request
 
     // The cancellation itself: the client gives up.
@@ -170,10 +168,13 @@ func abandon_name(r: &WaitResult) -> String {
 
 func take_and_drop(outlet: &PipeOutlet,
                    into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<Bool, SosStatus> {
-    let got = try outlet.take()
-    if let (_, request) = move got {
-        let _ = move request
-        return true
+    let got = try outlet.take() catch {
+        match error {
+            case WouldBlock -> { return false },
+            case _ -> { return error },
+        }
     }
-    return false
+    let (_, request) = move got
+    let _ = move request
+    return true
 }

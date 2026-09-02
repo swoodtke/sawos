@@ -1,0 +1,142 @@
+// SOS CHILD: A PROCESS THAT DIES WITH A THREAD PARKED IN A `resolve` (sawos
+// design 22, M4 unit 4.5; `designs/010` ruling 12(b)'s `end_process` mirror).
+//
+// **`child-orphan`'s SHAPE WITH THE OTHER SPELLING.** That child parks its
+// threads inside a fused `PipeInlet.send`, whose claim is a reference NO HANDLE
+// TABLE HOLDS; this one parks them inside `PipeReply.resolve`, whose claim WAS a
+// handle table row until the op took it. The two arrive at the same place —
+// `PIPE_CALLER` naming a thread, one reference on the claim column, nothing on
+// any list — because `park_resolve` unbinds the caller's entry and keeps its
+// reference rather than dropping it. So the teardown arm that abandons one
+// abandons the other, with no branch anywhere that asks which op parked the
+// thread.
+//
+// **TWO THREADS, ONE CONNECTION, SYMMETRIC ON PURPOSE.** Both threads do the
+// same thing — take an inlet out of the boot set, post ONE message, resolve it,
+// and END THE WHOLE PROCESS if the resolve returns — so the launcher does not
+// have to know, and cannot get wrong, which of the two it is talking to. It
+// answers ONE of the two messages; that thread exits the process; the other is
+// still parked when the teardown runs.
+//
+// The launcher's later `reply` to the second obligation is what proves the arm:
+// `Err(PeerClosed)`, because the claim column reached zero in the teardown.
+//
+// Everything about how both threads reach the pipe without passing a handle
+// word, and about why every thread enters at `_start`, is `child-orphan`'s and
+// is written out there.
+
+import sos.{System, Process, PIPE_BODY_BYTES}
+
+/// The boot handle, parked by the initial thread for the sibling — and the
+/// "have I run yet" witness. Handle 0 names nothing, so a parked boot handle is
+/// never 0 and an unparked slot is never a handle.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+/// The sibling's stack, in this process's own zero-init data (spec §8).
+static STACK_WORDS: Int = 512
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+static BYTES_PER_WORD: UInt = 8
+/// Every profile wants a 16-byte-aligned stack pointer; one of them checks.
+static STACK_ALIGN: UInt = 16
+
+/// The sibling's argument. It is never read — both threads do the same thing —
+/// and it is here because `thread_create` takes one.
+static ROLE_SIBLING: UInt = 2
+
+/// One byte, which is a message rather than an absence.
+static PAYLOAD_LEN: UInt = 1
+
+/// The resolve returned, so this thread ends the process — with the OTHER thread
+/// still parked in its own resolve, which is the whole point.
+static EXIT_ANSWERED: UInt = 71
+
+/// Something went wrong before the exchange could be made, or it was refused.
+/// Either way the launcher reads a code it did not expect.
+static EXIT_REFUSED: UInt = 72
+
+func park(word: UInt) unsafe {
+    BOOT_HANDLE = word
+}
+
+func parked() unsafe -> UInt {
+    BOOT_HANDLE
+}
+
+/// The highest 16-aligned address inside the sibling's stack reservation.
+/// Stacks grow down, so this is where the thread starts.
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked() == 0 {
+        initial(arg)
+        return
+    }
+    sibling()
+}
+
+/// The initial thread: park the seed, make the sibling, start it, and then do
+/// exactly what the sibling does.
+func initial(boot_handle: UInt) {
+    park(boot_handle)
+
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch { return }
+
+    let helper = try proc.thread_create(stack_top: stack_top(),
+                                        arg: ROLE_SIBLING) catch {
+        let _ = proc.exit(EXIT_REFUSED)
+        return
+    }
+    let _ = helper.start()
+
+    exchange_and_exit(&proc)
+}
+
+/// The sibling: derive everything from the parked seed, then the same exchange.
+func sibling() {
+    let system = System(boot_handle: parked())
+    let proc = try system.process_self() catch { return }
+    exchange_and_exit(&proc)
+}
+
+/// **POST, RESOLVE, AND END THE WHOLE PROCESS IF THE RESOLVE RETURNS.**
+///
+/// `exit` is `ProcessOp.Exit`, not `ThreadOp.Exit`: this ends the PROCESS, so
+/// the sibling still parked inside its own `resolve` goes down with it — which
+/// is the state the `end_process` mirror exists for and the only way to reach
+/// it, since nothing in SOS can kill a thread from outside.
+///
+/// There is no Waiter in this process at all, which is what makes the park the
+/// resolve's own.
+func exchange_and_exit(proc: &Process) {
+    var record = try proc.boot_handle_next() catch {
+        let _ = proc.exit(EXIT_REFUSED)
+        return
+    }
+    guard let inlet = record.take_inlet() else {
+        let _ = proc.exit(EXIT_REFUSED)
+        return
+    }
+
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 1
+
+    let claim = try inlet.post(body: &msg, len: PAYLOAD_LEN) catch {
+        let _ = proc.exit(EXIT_REFUSED)
+        return
+    }
+
+    // THIS PARKS. Exactly one of the two threads is ever woken from it.
+    let _ = try (move claim).resolve() catch {
+        let _ = proc.exit(EXIT_REFUSED)
+        return
+    }
+
+    let _ = proc.exit(EXIT_ANSWERED)
+}

@@ -88,26 +88,44 @@ func checked_value(raw: UInt, value: UInt) -> Result<UInt, SosStatus> {
 }
 
 // -----------------------------------------------------------------------------
-// THE POLL SPLIT — where `WouldBlock` stops being an error (sawos design 13 D-2;
-// design 234 §4's two-channel shape)
+// THE LEVEL DECODE — one function, and `WouldBlock` is an ERROR again everywhere
+// else (`designs/010` ruling 12(a), which RE-RULES sawos design 13 D-2; sawos
+// design 22)
 // -----------------------------------------------------------------------------
 //
-// **A WOULD-BLOCK IS NOT AN ERROR AT THE TYPED TIER.** `Channel.try_receive` is
-// the precedent design 234 §4 set and the reason it gives is exactly the pipe's:
-// a poll loop that cannot tell "nothing yet" from "this is broken" waits for
-// ever. So the transient gets the OK channel and a distinguishable absence, and
-// only the genuine refusals — a peer that is gone, a full table, a build skew —
-// reach the error channel.
+// **THE POLL SPLIT IS RETIRED.** D-2 put `WouldBlock` on the OK channel at the
+// typed tier, on `Channel.try_receive`'s precedent (design 234 §4): a poll loop
+// that cannot tell "nothing yet" from "this is broken" waits for ever. It was
+// written at M4 unit 1, when every pipe caller WAS a poll loop. Units 3 and 3.5
+// inverted that population — waitability and the fused paths mean a caller waits
+// with a `Waiter` or a `Call` and reaches these ops already knowing the answer —
+// and the tree's own evidence closed it: ZERO `case None` arms across `tests/`
+// and `root/`, every site paying a `try` for the errors and then a guard that
+// treats the `None` as a bug. So the general rule applies here as everywhere
+// (CLAUDE.md's Optional discipline): an Optional in a signature is an
+// antipattern unless the absence is a real domain value, and a transient rides
+// the ERROR channel — error plus retry.
 //
-// TWO FUNCTIONS BECAUSE THE TWO DIRECTIONS ANSWER DIFFERENT SHAPES. A take
-// yields a LENGTH, so its absence is an `Optional`; a post yields nothing, so
-// its absence is a `Bool` — `Result<Void?, _>` is not a type worth writing, and
-// "was it staged" is a question a caller can act on directly. Both keep the
-// property that matters: the caller never matches an error case for a condition
-// that will clear itself.
+// **THE DIVERGENCE FROM `Channel.try_receive` IS DELIBERATE, AND THIS IS THE
+// SEAM IT IS RECORDED AT.** A Saw channel's `try_receive` is the ONLY door onto
+// a channel that does not block, so its caller is a poll loop by construction; a
+// pipe has four doors — attach and wait, the fused `Call`, the parking
+// `Resolve`, and these polls — so its caller has already chosen to poll by
+// picking the door, and does not need the shape to keep reminding it. Same rule,
+// different population.
+//
+// **ONE FUNCTION SURVIVES, AND ITS JOB IS A LEVEL RATHER THAN A POLL.**
+// `PipeReplyOp.Ready` asks whether a reply has arrived and answers a `Bool` on
+// the OK channel with the terminal on the error channel — which is exactly this
+// decode, and is a real domain answer rather than a transient absence: "not yet"
+// is the question's whole point. `polled_value`, its `Optional`-shaped twin, is
+// GONE with the split; `take` and `post` use `checked` and `call_value` like
+// every other op.
 
-/// Decode a status word for an op whose refusal may be transient and whose
-/// success carries NO value: `Ok(true)` it happened, `Ok(false)` not right now.
+/// Decode a status word for an op that asks a LEVEL: `Ok(true)` the level is up,
+/// `Ok(false)` it is not, and every other status is the error channel — which is
+/// where a terminal lives (`PipeReply.ready`'s `Err(PeerClosed)`: the answer can
+/// never arrive, so there is no second call to make).
 public(package) func polled_ok(raw: UInt) -> Result<Bool, SosStatus> {
     // The same guarded narrowing `checked` writes, and for the same reason: `a0`
     // is register-wide and the enum is byte-wide, so an `as UInt8` on a word a
@@ -122,27 +140,6 @@ public(package) func polled_ok(raw: UInt) -> Result<Bool, SosStatus> {
     match status {
         case Ok -> { return true },
         case WouldBlock -> { return false },
-        case _ -> {},
-    }
-    return status
-}
-
-/// Decode a status word for an op whose refusal may be transient and whose
-/// success carries a VALUE: `Ok(Some(v))` here it is, `Ok(None)` not right now.
-public(package) func polled_value(raw: UInt,
-                                  value: UInt) -> Result<UInt?, SosStatus> {
-    if raw > (UInt8.max as UInt) {
-        return SosStatus.Unknown
-    }
-    guard let status = SosStatus.from(raw: raw as UInt8) else {
-        return SosStatus.Unknown
-    }
-    match status {
-        case Ok -> {
-            let got: UInt? = value
-            return got
-        },
-        case WouldBlock -> { return None },
         case _ -> {},
     }
     return status
@@ -829,22 +826,27 @@ public func sos_pipe_outlet_take(handle: UInt, rec: UnsafePointer<UInt>,
                  (&var ignored) as UnsafePointer<UInt>)
 }
 
-/// **RESOLVE — take the reply if it has been written, and answer its length**
-/// through `value_out`. Requires `PipeReplyRight.Resolve`.
+/// **RESOLVE — take the reply, PARKING until it is written, and answer its
+/// length** through `value_out`. Requires `PipeReplyRight.Resolve`.
 ///
-/// IT NEVER PARKS, and since M4 unit 3 it is the POLLING door rather than the
-/// only one: the blocking `send(msg)` / `send(msg, timeout:)` compositions are
-/// built, and they attach the claim instead — the reply arrives IN THE WAIT
-/// RECORD, so a claim whose answer was delivered that way answers `PeerClosed`
-/// here. `cap` is the
-/// buffer's size in BYTES and must be at least `PIPE_BODY_BYTES` — the whole
-/// slot's size, because a caller cannot size a buffer against a length it has not
-/// been told yet.
+/// **IT PARKS SINCE M4 UNIT 4.5, AND IT NEVER ANSWERS `WouldBlock`**
+/// (`designs/010` ruling 12(b)). A pending exchange blocks the calling thread on
+/// the claim's ready level and resumes with one of the two answers below; the
+/// non-blocking question is `sos_pipe_reply_ready` beside it. The blocking
+/// `send(msg)` / `send(msg, timeout:)` compositions are a THIRD door and use
+/// neither — they attach the claim, and the reply arrives IN THE WAIT RECORD, so
+/// a claim whose answer was delivered that way answers `PeerClosed` here.
 ///
-/// **IT CONSUMES THE CLAIM UNLESS IT ANSWERS `WouldBlock`.** A delivered reply
-/// and a `SosStatus.PeerClosed` both end the exchange, so the caller's handle is
-/// destroyed with them and using the word again is the ordinary `BadHandle`
-/// fault; a would-block consumes nothing and the claim is still yours.
+/// `cap` is the buffer's size in BYTES and must be at least `PIPE_BODY_BYTES` —
+/// the whole slot's size, because a caller cannot size a buffer against a length
+/// it has not been told yet.
+///
+/// **IT CONSUMES THE CLAIM ON EVERY PATH.** A delivered reply, a
+/// `SosStatus.PeerClosed` and a refused handle mint all end the exchange for
+/// this caller, so the handle is destroyed with them and using the word again is
+/// the ordinary `BadHandle` fault. A C caller that must not lose the handles a
+/// reply carries makes table room BEFORE it resolves; a Saw caller cannot reach
+/// the word at all, because the wrapper is a `consumes` method.
 ///
 /// `SosStatus.PeerClosed` means the server side abandoned it — the obligation was
 /// dropped without a reply, or the connection's server end went away before the
@@ -855,6 +857,20 @@ public func sos_pipe_reply_resolve(handle: UInt, rec: UnsafePointer<UInt>,
                                    value_out: UnsafePointer<UInt>) unsafe -> UInt {
     sos_syscall3(handle, PipeReplyOp.Resolve as UInt, rec as UInt, cap, 0,
                  value_out)
+}
+
+/// **READY — has the answer arrived?** Requires `PipeReplyRight.Wait` (the level
+/// question's bit; `Resolve` stays the consuming act's).
+///
+/// Status-only and it SPENDS NOTHING: `0` (`SosStatus.Ok`) the reply is written
+/// and a resolve will return it without parking, `SosStatus.WouldBlock` not yet
+/// and the exchange is still live, `SosStatus.PeerClosed` it can never arrive —
+/// at which point the holder RELEASES the claim rather than resolving it, since
+/// there is no answer to fetch. Readiness is monotonic, so asking and then
+/// resolving has no check-then-act race.
+@export("sos_pipe_reply_ready")
+public func sos_pipe_reply_ready(handle: UInt) -> UInt {
+    sos_syscall1(handle, PipeReplyOp.Ready as UInt, 0)
 }
 
 /// **REPLY — copy `len` bytes from `body` back to the client, and DISCHARGE the

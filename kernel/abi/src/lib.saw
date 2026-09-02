@@ -1152,12 +1152,21 @@ static_assert((PipeOutletRight.Wait as UInt32) >= (1 << 8),
 /// BYTES, so attaching one replaces resolving it.
 ///
 /// `Transfer` is minted because a claim is a capability like any other and §2.1
-/// ratifies both one-shots as transferable. `Mint` is minted on the uniform lean
-/// the endpoint pair follows, and it composes with single-use rather than
-/// fighting it: a sibling is a second NAME on the reply column, the op consumes
-/// an ENTRY, and the EXCHANGE's own state is what allows exactly one successful
-/// resolve. A sibling that resolves second meets `PeerClosed`, not a second
-/// reply.
+/// ratifies both one-shots as transferable.
+///
+/// **`Mint` IS NOT MINTED, AND A ONE-SHOT IS THE ONE PLACE THE UNIFORM LEAN
+/// BREAKS** (`designs/010` ruling 12(c), Sep 2; sawos design 22). The bit is
+/// DECLARED here — universal bit 1 belongs in every kind's enum whatever any
+/// default set does with it, which is what the `static_assert` below pins — and
+/// `pipe_reply_rights()` simply does not hand it out. Two things decided it. The
+/// use-case audit came up empty: attenuate-then-give is `give`'s keep mask
+/// (`tests/give-keep-mask`), a claim has two meaningful bits to attenuate
+/// between, and no caller in this tree mints a one-shot sibling. And a sibling
+/// UNDERMINES the single-use `Resolve` now carries: `resolve` consumes on every
+/// path and PARKS when pending (ruling 12(b)), so a second name is a second
+/// claim that can only ever be told `PeerClosed` — a nuisance dressed as
+/// authority. Attenuation is monotonic, so the absence is permanent: `Post`
+/// mints the one name and `Transfer` moves it.
 public enum PipeReplyRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
@@ -1189,7 +1198,8 @@ static_assert((PipeReplyRight.Wait as UInt32) >= (1 << 8),
 /// an obligation replies. Everything `PipeReplyRight` says about the `Wait` bit
 /// (here it gates the request-abandoned level — §2.1's ratified early notice),
 /// about `Transfer` — here it is §2.1's DELEGATION PRIMITIVE rather than a
-/// convenience — and about `Mint` holds word for word.
+/// convenience — and about `Mint` — declared, not minted, on ruling 12(c)'s
+/// one-shot-has-one-name rule — holds word for word.
 ///
 /// The bits overlap `PipeReplyRight`'s and that is sound for the reason the
 /// endpoint pair's do: a rights word is only ever read against its handle's
@@ -1250,12 +1260,22 @@ public func rights_allow_mint(rights: UInt32) -> Bool {
 // WHAT EVERY DEFAULT SET MINTS (spec §3)
 // =============================================================================
 //
-// **`Mint` IS IN EVERY ONE OF THEM, UNIFORMLY** (the Aug-29 user rulings on
-// design 4, ruling 3 — recorded as the LEAD's lean, which the user may veto at
-// integration). The argument for uniformity is that the alternative is a
-// per-kind table nobody can predict from the outside: a handle either can name
-// its object twice or cannot, and making that vary by kind would mean a launcher
-// has to know which kinds are mintable before it can write a policy.
+// **`Mint` IS IN EVERY ONE OF THEM BUT THE TWO ONE-SHOTS** (the Aug-29 user
+// rulings on design 4, ruling 3, as amended by `designs/010` ruling 12(c) on
+// Sep 2). The lean was uniformity and the argument for it still holds for every
+// kind that outlives one act: the alternative is a per-kind table nobody can
+// predict from the outside, so a handle either can name its object twice or
+// cannot, and making that vary by kind means a launcher has to know which kinds
+// are mintable before it can write a policy.
+//
+// **WHAT BREAKS THE UNIFORMITY IS SINGLE USE, AND ONLY THAT** (sawos design 22).
+// `pipe_reply_rights()` and `pipe_request_rights()` withhold the bit because a
+// second name on a one-shot cannot mean what a second name means anywhere else:
+// the object is spent by ONE op, so the sibling is not a second way to use the
+// object but a handle whose only possible answer is `PeerClosed`. That is the
+// per-kind ruling the last paragraph below said nothing had needed yet; it is
+// needed now, it is exactly two kinds wide, and the enum bits stay declared so
+// the universal-bit-1 doctrine is untouched.
 //
 // **WHAT IT COSTS IS NOTHING, AND THAT IS THE POINT.** A mint AMPLIFIES NOTHING
 // (§3): the rights it produces are the source's INTERSECTED with a keep mask, so
@@ -1266,8 +1286,8 @@ public func rights_allow_mint(rights: UInt32) -> Bool {
 // alternative to minting an attenuated sibling is handing over the full-rights
 // original.
 //
-// Whether `Mint` should be withheld anywhere is therefore a per-kind ruling that
-// nothing has needed yet, exactly as `Transfer`'s placement is.
+// Where `Mint` IS withheld is therefore a per-kind ruling, exactly as
+// `Transfer`'s placement is — and the two one-shots are the whole of the list.
 
 /// What the kernel mints for root's System handle at boot (§12).
 ///
@@ -1410,26 +1430,36 @@ public func pipe_outlet_rights() -> UInt32 {
 /// What the kernel mints for a PipeReply at `PipeInletOp.Post` — the CLAIM the
 /// poster is handed (spec §2.1; sawos design 14 D-1).
 ///
-/// **THE POSTER GETS EVERY BIT OF ITS OWN CLAIM**, on `pipe_inlet_rights`'
-/// reasoning exactly, and `Transfer` carries the same weight it does there: §2.1
-/// RATIFIES both one-shots as transferable, so a claim that could not travel
-/// would be a promise the spec makes and the kernel withholds. A client that
-/// wants to hand a narrower claim on mints an attenuated sibling and gives THAT.
+/// **THE POSTER GETS EVERY BIT OF ITS OWN CLAIM BUT ONE**, on
+/// `pipe_inlet_rights`' reasoning as far as it goes, and `Transfer` carries the
+/// same weight it does there: §2.1 RATIFIES both one-shots as transferable, so a
+/// claim that could not travel would be a promise the spec makes and the kernel
+/// withholds.
+///
+/// **THE ONE IS `Mint`, AND A ONE-SHOT HAS ONE NAME** (`designs/010` ruling
+/// 12(c); sawos design 22). Handing a narrower claim ON is `give`'s KEEP MASK,
+/// which needs no sibling — that is what `tests/give-keep-mask` proves — and the
+/// sibling a mint would produce could never be anything but a second claim on an
+/// exchange only one act may spend. The bit is declared in `PipeReplyRight` and
+/// simply not handed out here; attenuation is monotonic, so no sequence of ops
+/// puts it back.
 public func pipe_reply_rights() -> UInt32 {
-    ((PipeReplyRight.Transfer as UInt32) | (PipeReplyRight.Mint as UInt32)
+    ((PipeReplyRight.Transfer as UInt32)
      | (PipeReplyRight.Resolve as UInt32) | (PipeReplyRight.Wait as UInt32))
 }
 
 /// What the kernel mints for a PipeRequest at `PipeOutletOp.Take` — the
 /// OBLIGATION the taker is handed. The mirror of `pipe_reply_rights`, with the
-/// verb changed.
+/// verb changed — `Mint` withheld here for the same one-name reason, and
+/// delegation untouched because delegation is `Transfer` MOVING the one name
+/// rather than a second one being made (`tests/pipe-delegate-msg`).
 ///
 /// **`Transfer` HERE IS §2.1's DELEGATION PRIMITIVE ITSELF**, not a convenience:
 /// the ratified zero-copy example is a filesystem forwarding this very handle to
 /// a flash driver, which replies with the hardware bytes straight to the original
 /// client. Withholding the bit would delete the example.
 public func pipe_request_rights() -> UInt32 {
-    ((PipeRequestRight.Transfer as UInt32) | (PipeRequestRight.Mint as UInt32)
+    ((PipeRequestRight.Transfer as UInt32)
      | (PipeRequestRight.Reply as UInt32) | (PipeRequestRight.Wait as UInt32))
 }
 
@@ -2264,23 +2294,58 @@ public enum PipeOutletOp: UInt {
 /// A METHOD ID on a PipeReply — the CLIENT's claim on one reply (spec §2.1;
 /// sawos design 14).
 ///
-/// **ONE OP, NONBLOCKING, AND IT CONSUMES.** `resolve` answers the reply bytes if
-/// they are there — consuming the claim's entry with them — `SosStatus.WouldBlock`
-/// while the exchange is still pending, and `SosStatus.PeerClosed` when the server
-/// side abandoned it. **THE BLOCKING `send(msg)` / `send(msg, timeout:)`
-/// COMPOSITIONS ARE BUILT ON TOP OF IT AND DO NOT USE IT** (M4 unit 3, sawos
-/// design 15): ruling 11(a) put the reply in the WAIT RECORD, so a client that
-/// attaches its claim never resolves at all, and this op is the polling door
-/// that remains for a caller that chose it. A claim whose answer was delivered
-/// through a wait answers `PeerClosed` here — there is no second copy.
+/// **TWO OPS SINCE M4 UNIT 4.5, AND THEY SPLIT THE ACT FROM THE QUESTION**
+/// (`designs/010` ruling 12(b); sawos design 22). `Resolve` is the ACT — it
+/// consumes the claim's entry on every path it can return through, and PARKS the
+/// calling thread when the answer has not been written yet. `Ready` is the
+/// QUESTION — the same level asked non-blockingly, consuming nothing.
 ///
-/// Its arguments are (record, capacity) and its value is the reply's LENGTH.
-/// **THE RECORD IS A `PipeMsgRecord` SINCE M4 UNIT 4** (sawos design 18) —
-/// `PipeOutletOp.Take`'s own shape reused on the way back, which is what §2.1's
+/// **`Resolve` NO LONGER ANSWERS `WouldBlock`, AND THAT IS THE CONTRACT CHANGE.**
+/// It answers the reply bytes (consuming the entry with them) or
+/// `SosStatus.PeerClosed` (consuming it too), and where it used to say "not yet"
+/// it now parks on the claim's ready level and finishes one of those two arms on
+/// the wake. A park is MECHANICS rather than authority, so the op spends the
+/// existing `PipeReplyRight.Resolve` bit and nothing new: ruling 8's own
+/// sentence, reached from a handle-backed claim instead of from inside a fused
+/// `Call`. What the change buys at the typed tier is `consumes` — a claim spent
+/// on every path can be a move-taking method, so a second use is a compile error
+/// rather than a `BadHandle` fault.
+///
+/// **THE BLOCKING `send(msg)` / `send(msg, timeout:)` COMPOSITIONS ARE BUILT ON
+/// TOP OF IT AND DO NOT USE IT** (M4 unit 3, sawos design 15): ruling 11(a) put
+/// the reply in the WAIT RECORD, so a client that attaches its claim never
+/// resolves at all. A claim whose answer was delivered through a wait answers
+/// `PeerClosed` here — there is no second copy.
+///
+/// `Resolve`'s arguments are (record, capacity) and its value is the reply's
+/// LENGTH. **THE RECORD IS A `PipeMsgRecord` SINCE M4 UNIT 4** (sawos design 18)
+/// — `PipeOutletOp.Take`'s own shape reused on the way back, which is what §2.1's
 /// symmetric `send(data?, handles?)` asks for: a reply may carry handles, so the
-/// polling door has to be able to hand them over too.
+/// consuming door has to be able to hand them over too.
 public enum PipeReplyOp: UInt {
     case Resolve = 0,
+    /// **HAS THE ANSWER ARRIVED? — the level, asked without spending anything**
+    /// (`designs/010` ruling 12(b)).
+    ///
+    /// Status-only: no record, no copy-out, no value. `Ok` the answer is
+    /// WRITTEN and a `Resolve` will return it without parking;
+    /// `SosStatus.WouldBlock` not yet AND the exchange is still live;
+    /// `SosStatus.PeerClosed` it can NEVER arrive, so the holder drops the claim
+    /// rather than spending a resolve on a dead exchange. Readiness is monotonic
+    /// — pending goes to settled and never back — so ready-then-resolve has no
+    /// check-then-act race.
+    ///
+    /// **IT IS GATED ON `PipeReplyRight.Wait`, NOT ON `Resolve`.** The bit that
+    /// gates the level question is the bit that gates attaching the claim to a
+    /// Waiter, because they ARE the same question asked two ways; `Resolve` stays
+    /// the CONSUMING act's authority, so a claim narrowed to `Wait` alone can be
+    /// watched and never spent.
+    ///
+    /// **IT CONSUMES NOTHING, INCLUDING ON THE TERMINAL ARM.** A `PeerClosed`
+    /// here leaves the claim alive and the caller drops it — which is the whole
+    /// point of putting the terminal on the error channel: no second call for a
+    /// reply that is never coming.
+    case Ready = 1,
 }
 
 /// A METHOD ID on a PipeRequest — the SERVER's obligation (spec §2.1; sawos
@@ -2392,7 +2457,7 @@ static_assert((PipeInletOp.Call as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
 static_assert((PipeOutletOp.Take as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
-static_assert((PipeReplyOp.Resolve as UInt) < MINT_OP,
+static_assert((PipeReplyOp.Ready as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
 static_assert((PipeRequestOp.ReplyWait as UInt) < MINT_OP,
               "an op table must stay below the universal ops")

@@ -1757,8 +1757,9 @@ func notify_claims(c: Int) unsafe {
 }
 
 // =============================================================================
-// THE FUSED CALL'S WAKE ARM (sawos design 17, M4 unit 3.5; `designs/010` ruling
-// 4's Aug-31 rider)
+// THE PARKED CLAIM'S WAKE ARM (sawos design 17, M4 unit 3.5, GENERALIZED by
+// sawos design 22, M4 unit 4.5; `designs/010` ruling 4's Aug-31 rider and
+// ruling 12(b))
 // =============================================================================
 //
 // **ONE ARM, ASKED AT ONE QUESTION: is this claim a PARKED THREAD's, or a
@@ -1769,6 +1770,25 @@ func notify_claims(c: Int) unsafe {
 // calls it instead of `notify_if_ready(PipeReply, …)`, so there is exactly one
 // place in the kernel where the two shapes of client are told apart.
 //
+// **AND THE ARM DOES NOT CARE WHICH OP PARKED THE THREAD** (ruling 12(b)). Unit
+// 4.5 gave `PipeReplyOp.Resolve` a park of its own, and it needed not one line
+// here: a parked resolver is a thread with a reference on the claim column and a
+// buffer to write into, which is precisely what a fused `Call` is. `park_resolve`
+// gets there by taking the caller's handle ENTRY and keeping its reference — the
+// unbind without the unref — so the two arrive at `PIPE_CALLER[x]` in the same
+// state and nothing downstream reads back to find out which. What generalizes is
+// the RECORD, not the protocol: one park shape, one wake shape, one teardown
+// arm.
+
+// WHAT A THREAD-TIED CLAIM CANNOT BE IS ATTACHED — and now for two reasons
+// rather than one. A fused call mints no `PipeReply` handle at all, so there is
+// no word anybody could pass to `Waiter.Add`; a parked resolver may have had an
+// attachment, and `park_resolve` detaches it on the way down (ruling 9(a)'s
+// implicit detach, which a consuming op owes). Either way
+// `PIPE_REPLY_ATTACH[x]` is provably zero for as long as `PIPE_CALLER[x]` is
+// not, which is why the two arms are alternatives rather than two things to do
+// in sequence.
+//
 // **THE SECOND ARM IS THE ROOM LEVEL'S, AND IT IS THE SAME SHAPE.** `Call` never
 // answers `WouldBlock` (design 10 ruling 8, reached from inside the op), so a
 // full ring parks the caller — and the level that ends that park is the inlet's
@@ -1776,12 +1796,6 @@ func notify_claims(c: Int) unsafe {
 // replaces `notify_if_ready(PipeInlet, …)` at both of them, asks the same
 // question, and routes into the same resume.
 //
-// WHAT A THREAD-TIED CLAIM CANNOT BE IS ATTACHED. A fused call mints no
-// `PipeReply` handle at all, so there is no word anybody could pass to
-// `Waiter.Add` — `PIPE_REPLY_ATTACH[x]` is provably zero for as long as
-// `PIPE_CALLER[x]` is not, which is why the two arms are alternatives rather
-// than two things to do in sequence.
-
 /// **A CLAIM'S LEVEL CHANGED — tell whoever holds it, whichever kind of holder
 /// that is.** The one arm.
 public(package) func notify_claim(x: Int) unsafe {
@@ -1796,13 +1810,18 @@ public(package) func notify_claim(x: Int) unsafe {
     wake_call_reply(parked - 1, x)
 }
 
-/// **ANSWER A THREAD PARKED IN A FUSED `Call`** — `deliver_attachment`'s
-/// opposite number, and deliberately its mirror image.
+/// **ANSWER A THREAD PARKED ON A CLAIM** — in a fused `Call` or in a `Resolve`,
+/// which since M4 unit 4.5 are one thing from here (sawos design 22). It is
+/// `deliver_attachment`'s opposite number, and deliberately its mirror image.
 ///
 /// The two do the same three things in the same order and differ only in where
-/// the answer goes: a delivery writes a wait RECORD and a fused call writes the
-/// reply BYTES and a value register, because a `Call` resumes inside its own
-/// syscall rather than inside a `Wait`. So the readiness is read through
+/// the answer goes: a delivery writes a wait RECORD and a parked claim writes the
+/// reply BYTES and a value register, because both of these ops resume inside
+/// their own syscall rather than inside a `Wait`. **AND THE TWO PARKED SHAPES
+/// AGREE DOWN TO THE REGISTER** — a `Resolve`'s success is the reply's length in
+/// the value register with the record copied to `wait_buf`, and so is a `Call`'s;
+/// its `PeerClosed` is a bare status, and so is a `Call`'s — which is why this
+/// function needed no arm for the second op. So the readiness is read through
 /// `waitable_answer` — the same matrix arm the split-phase path reads — the
 /// exchange is spent through `waitable_consume`, and the claim's reference is
 /// dropped last.
@@ -1973,8 +1992,9 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
     true
 }
 
-/// **THE ORPHANED-CLAIM ARM: a process dying with threads parked in fused
-/// calls** (design 10 ruling 4's rider names it; sawos design 17 D-2).
+/// **THE ORPHANED-CLAIM ARM: a process dying with threads parked ON A CLAIM**
+/// (design 10 ruling 4's rider names it; sawos design 17 D-2, widened by sawos
+/// design 22).
 ///
 /// A parked caller's claim is a reference NO HANDLE TABLE HOLDS, so the
 /// teardown's close-all cannot reach it and it would otherwise pin a ring slot
@@ -1983,6 +2003,14 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
 /// column falls to zero, which is what `pipe_reply` already reads as
 /// abandoned-by-client, so the server's later reply answers `Err(PeerClosed)`
 /// with no new vocabulary anywhere.
+///
+/// **IT COVERS A THREAD PARKED IN `Resolve` WITH NO ARM OF ITS OWN** (ruling
+/// 12(b)'s `end_process` mirror). That is the teardown half of `park_resolve`'s
+/// unbind-without-unref: a parked resolver's entry is already gone from the
+/// table, so the close-all has nothing to find, and the reference it used to
+/// hold is on the claim column exactly where a fused caller's is. The claim is
+/// ABANDONED, the server's later `reply()` answers `PeerClosed`, and the loop
+/// below did not have to learn a second question to make it so.
 ///
 /// **IT RUNS BEFORE THE CLOSE-ALL, AND IN TWO PASSES.** Before, because the
 /// close-all drops endpoint columns and every one of those transitions notifies
