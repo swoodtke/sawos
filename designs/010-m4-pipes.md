@@ -494,6 +494,67 @@ standing tail); the IOMMU driver (death-notification consumer 2).
     (a)-(c) land in UNIT 3 with the rest of waitability; part (d)
     lands in UNIT 4 with rendezvous transfer.
 
+12. **RULED (Sep 2, user, in session): THE ONE-SHOT DISCIPLINE —
+    three parts taken together.** Brief: design 22; lands as UNIT
+    4.5, BEFORE unit 5 dispatches (its servers build on this
+    surface).
+    (a) **THE POLL SPLIT IS RETIRED — `WouldBlock` returns to the
+    error channel at the typed tier** (re-rules sawos design 13
+    D-2). D-2 was written at unit 1, when every caller was a poll
+    loop; waitability and the fused paths inverted the population,
+    and the tree's own evidence closed it: ZERO `case None` arms
+    across tests/ and root/ — every take/resolve site pays `try`
+    for the errors and then a guard that treats `None` as a bug
+    anyway, because it sits after a `wait` said readable. So `take`
+    and `post` lose their Optionals (`take -> Result<(PipeMsg,
+    PipeRequest), _>`, `post -> Result<PipeReply, _>`), a poll loop
+    declares itself with a `match` carrying a `WouldBlock` arm (the
+    idiom ruling's real-work-arms case), and `polled_value` retires
+    from the floor. The divergence from design 234 §4's
+    `Channel.try_receive` precedent is deliberate and recorded at
+    the seam. No ABI change — statuses on the wire identical.
+    (b) **`resolve` CARRIES `consumes` AND PARKS WHEN PENDING; the
+    poll moves to a new `ready()`.** The effect cannot be
+    typed-tier only — a consumed wrapper whose kernel entry
+    survived a `WouldBlock` answer is a leaked reference — so the
+    kernel `Resolve` changes contract: pending PARKS the calling
+    thread on the claim's ready level (ruling 8's own logic — a
+    park is mechanics, not authority — and the wake arm is the
+    fused call's parked-thread arm generalized, one wake protocol)
+    and EVERY path consumes: `Ok(msg)` or `Err(PeerClosed)`,
+    `WouldBlock` leaves the op entirely. `resolve` becomes the
+    waiter-free blocking receive, and compile-time single use
+    arrives on the claim side exactly as SL-16 delivered it on the
+    request side. The poll is `PipeReplyOp.Ready` (renumberable,
+    §5.7), gated on `Wait` — the level question asked
+    non-blockingly; `Resolve` stays the consuming act's authority —
+    typed `ready(&self) -> Result<Bool, SosStatus>`: `Ok(true)` the
+    answer is THERE (resolve returns without parking; readiness is
+    monotonic, so check-then-act has no race), `Ok(false)` not yet,
+    and A TERMINAL RIDES THE ERROR CHANNEL — `Err(PeerClosed)` for
+    a reply that can never come (the user's amendment: no second
+    call for a reply that is never coming — the claim is then
+    simply DROPPED, the wrapper's ordinary release, never
+    resolved). `polled_ok` survives as exactly this decode.
+    (c) **A ONE-SHOT HAS ONE NAME — `Mint` leaves
+    `pipe_reply_rights()` and `pipe_request_rights()`.** The
+    use-case audit came up empty: attenuate-then-give is `give`'s
+    keep mask (tests/give-keep-mask), a one-shot has two meaningful
+    bits, and NO in-tree caller mints a one-shot sibling; what the
+    sibling DOES do is undermine (b)'s invariant — a second name on
+    one reply, resolving into `PeerClosed` at best (SL-16's closure
+    met it as a nuisance). The enum bit STAYS (universal-bit-1
+    doctrine, static_asserts untouched); monotonic attenuation
+    makes the absence permanent — `Post`/`Take` mint the one name
+    and `Transfer` moves it, so delegation is untouched.
+    Consequences pinned: `pipe-dead-claim` retargets (the
+    double-resolve becomes a compile error, retiring the suite's
+    last Saw-visible ledger `BadHandle`; the kernel check stands
+    for raw callers — `pipe-reply-wait-dead`'s situation);
+    `pipe-delegate`'s poll_reply rewrites to a `ready()` loop; the
+    request side needs nothing beyond the Mint drop. The API REVIEW
+    GATE applies to the brief's §API as everywhere.
+
 ## As ruled
 
 Aug 30 (user): ALL SEVEN ITEMS RULED — this sketch is the PLAN OF
@@ -516,7 +577,14 @@ abandonment re-worded to the last reference, and the
 persistent-consuming outlet is the completion-queue server — (a)-(c)
 unit 3, (d) unit 4 with rendezvous. Ruling 4's rider amended Sep 1:
 `ReplyRecv` is REPLY-THEN-WAIT (one wake protocol, NO_HANDLE
-degenerate, two-channel return; full form unit 4). REVIEW GATE: the
+degenerate, two-channel return; full form unit 4); 12 (Sep 2) the
+one-shot discipline — the poll split retired (`WouldBlock` back to
+the error channel, design 13 D-2 re-ruled, Optionals struck from
+`take`/`post`), `resolve` carries `consumes` and PARKS when pending
+with `ready()` the non-consuming poll (true = reply arrived, false
+= not yet + exchange live, terminals on the error channel), and
+one-shots lose `Mint` from their default sets — design 22, unit
+4.5, lands before unit 5 dispatches. REVIEW GATE: the
 fused/attach/delivery API spellings — user and kernel both — go to
 the user before commit. Unit briefs are authored per the M3 process;
 M4 started Aug 31.

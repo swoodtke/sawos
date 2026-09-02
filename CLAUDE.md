@@ -85,8 +85,15 @@ joins bind-or-bail. The tree is FULLY CONVERTED (Sep 1, 95 sites);
 the 33 `match` sites that remain are by design — real-work arms,
 negative tests, and success predicates (`case Ok(_) -> true`, a
 shape try/catch cannot express since the catch yields the payload's
-replacement, not a second value for the Ok path). On
-this machine it is a user-level symlink
+replacement, not a second value for the Ok path).
+**Optional discipline (user, Sep 2): an Optional in an API signature
+is an ANTIPATTERN unless the absence is a real domain value. A
+transient condition ("not yet", "try again") rides the ERROR channel
+— error + retry — never `Ok(None)`/`Ok(false)`:** making every
+common-path caller unwrap an Optional for a case that rarely happens
+is the wrong trade (designs/010 ruling 12 re-ruled design 13 D-2's
+poll split on exactly this; the tree had ZERO `case None` arms). On
+this machine the saw-lang skill is a user-level symlink
 (`~/.claude/skills/saw-lang -> <sawlang checkout>/.claude/skills/saw-lang`,
 sawlang#238 D-f) — one canonical copy, no drift. On a machine without a
 sawlang checkout, re-create the symlink against one or copy the skill in.

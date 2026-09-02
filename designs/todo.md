@@ -27,11 +27,20 @@ entry below or the brief that carries it, never restating either.
   stub, hal/riscv32-esp32c3/ placeholder (SIBLING-COPY rule: no
   hal/riscv32 restructure — unit 5 owns it), CLAUDE.md non-gating
   note, both queue entries below pre-written.
-- 2. design 20 — ESP32-C3 board HAL, SMOKE ONLY (bringup + memory
+- 2. design 22 — the one-shot discipline (M4 unit 4.5) [#10 ruling
+  12, Sep 2; brief AUTHORED, awaiting user §API review]: poll split
+  retired (`WouldBlock` back to the error channel, Optionals struck
+  from take/post), `resolve` consumes + parks with `ready()` the
+  poll, one-shots lose `Mint`. Lands BEFORE unit 5 dispatches (its
+  servers build on this surface); may fly CONCURRENT with design 20
+  (disjoint files — HAL vs pipe surface), the lead decides at
+  dispatch.
+- 3. design 20 — ESP32-C3 board HAL, SMOKE ONLY (bringup + memory
   config; direct boot; RV32IMC no-A; non-gating, machine-local QEMU)
   [to author; §API review to user]. CONCURRENT WITH:
-- 3. M4 unit 5 — the money shot [#10 agenda 7a; design 21 to author;
-  carries the MAX_PROCESSES/PMP-budget question to the user].
+- 4. M4 unit 5 — the money shot [#10 agenda 7a; design 21 to author;
+  carries the MAX_PROCESSES/PMP-budget question to the user; AFTER
+  design 22 lands].
 ## [BACKLOG] — filed, not scheduled
 
 - `Process` and `System` in messages — a sysapi MODULE-SPLIT ruling
