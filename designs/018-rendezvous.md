@@ -545,3 +545,60 @@ funnel disarms the wrapper it takes and a Saw program cannot reach the
 released-staged-entry state at all.
 
 **105 → 111 cases per architecture, 210 → 222 total.**
+
+### 12. Transcript accounting
+
+Baseline captured at `7362a3f` before any edit; gated at `98e503e`. Every
+row of the runner's transcript falls in one of five buckets, and no row
+falls outside them.
+
+| bucket | riscv32 | arm64 | argued |
+|---|---|---|---|
+| new image rows | 8 | 8 | the eight new packages |
+| image rows GROWN | 49 | 48 | the pipe/wait surface — below |
+| image rows SHRUNK | 3 | 0 | the send path's marshalling — below |
+| image rows UNCHANGED | 47 | 51 | every package that names none of it |
+| new case rows | 6 | 6 | the six new cases, appended |
+
+Plus one summary row: `210 passed` → `222 passed`. No case row was
+removed, no case row carries a mark other than `✓`, and the shared case
+rows appear in an IDENTICAL ORDER — the six new cases are appended, so
+not one existing index moved.
+
+**THE GROWN ROWS HAVE ONE CAUSE AND IT IS EXACT.** Cross-tabulated
+mechanically: all 100 moved rows belong to packages that name the
+pipe/wait surface, and every package that names none of it is unchanged
+in both columns. The five arm64 rows that name it and did NOT move are
+the ones whose riscv32 twins moved by less than 4 KiB — arm64 images are
+page-rounded, which is design 17's own finding about this transcript.
+
+The cause is the TYPED MESSAGE VALUE, not the wire record. The record
+grew 24 B / 40 B; `PipeMsg` grew from `{len, [UInt8; 128]}` to
+`{len, [PipeHandle?; 4], [UInt8; 128]}`, and a `PipeHandle` is an enum
+of six `NoCopy` wrappers — so every `take`, `resolve` and `wait` caller
+now moves a bigger value and links the drop glue for four optional
+six-way enums. Totals over the 99 shared rows: riscv32
+1,717,380 → 2,176,068 B (**+26.7%**), arm64
+2,051,032 → 2,513,880 B (**+22.6%**).
+
+**THE SHRUNK ROWS ARE THE SEND PATH, AND THEY SHRANK FOR A REASON.**
+`pipe-no-post` −128, `pipe-oversized` −96, `child-post` −80, all
+riscv32, all pure posters: a post's arguments now travel as ONE record
+the caller fills in, so the call site stopped marshalling three
+registers. `child-reply` moved the other way by +48 for the mirror
+reason on the reply side. Four rows, all under 128 bytes, all at the
+argument seam the unit changed on purpose.
+
+**AND THAT IS A FINDING, RECORDED, WITH A NAMED MITIGATION.** The cost
+lands hardest where it is least deserved: `tests/event-wake` waits on an
+Event, touches no pipe at all, and grew 5,584 B / 8,192 B — because
+`decode_wait` (4,934 B on riscv32) plus `wait_message` (962 B) plus
+`decode_handle` (568 B) link into every image that calls `wait`, whether
+or not any of its attachments could produce a message. The lever is
+LAZY DECODE: keep the kind bytes and the handle WORDS in `PipeMsg` and
+construct a `PipeHandle` only when the receiver asks for a slot
+(`msg.take_handle(0)`), which moves the six-way construction out of
+`decode_wait` and into a function only a handle-reading program links.
+It is a sysapi-shaped change with no kernel or ABI consequence, and it
+is filed in the tracker's BACKLOG rather than built here, because it
+would rewrite the receiving vocabulary this unit's §API was reviewed on.

@@ -55,7 +55,13 @@ entry below or the brief that carries it, never restating either.
   ONE trap per message, the ladder complete. Riders done: the two
   missing floor re-export seams, the `var`→`let` tidy in the touched
   files, `MAX_PROCESSES` unchanged at 2 with the two-pipe topology
-  argued in the case header. Deviations and findings are in design 18's
+  argued in the case header. TRANSCRIPT ACCOUNTING: 222/222 green on
+  both arches, five buckets and no row outside them — all 100 moved
+  image rows belong to packages that name the pipe or wait surface and
+  every package that names none of it is unchanged, which is the whole
+  argument; the growth is +26.7% / +22.6% and it is the TYPED message
+  value rather than the wire record, filed in BACKLOG with its
+  lazy-decode lever. Deviations and findings are in design 18's
   As-built; SL-17 filed below; `Process`/`System` in messages is the
   named follow-up, filed in BACKLOG
 
@@ -77,6 +83,30 @@ entry below or the brief that carries it, never restating either.
   hand a child a Process or System handle AFTER `start`, which no
   in-tree program needs today. The kernel side is one line in
   `msg_kind_of` when it comes
+
+- LAZY HANDLE DECODE in `PipeMsg` — the message vocabulary's image cost
+  [#18 As-built §12, Sep 2]: unit 4's transcript accounting measured
+  +26.7% (riscv32) / +22.6% (arm64) across every image that names the
+  pipe or wait surface, and the cause is the TYPED value rather than the
+  wire record — `PipeMsg` grew from `{len, bytes}` to
+  `{len, [PipeHandle?; 4], bytes}`, and a `PipeHandle` is an enum of six
+  `NoCopy` wrappers, so every take/resolve/wait caller moves a bigger
+  value and links drop glue for four optional six-way enums. It lands
+  hardest where it is least deserved: `tests/event-wake` waits on an
+  Event, touches no pipe, and grew 5,584 B / 8,192 B, because
+  `decode_wait` (4,934 B on riscv32), `wait_message` (962 B) and
+  `decode_handle` (568 B) link into EVERY image that calls `wait`
+  whether or not its attachments could produce a message. The lever:
+  keep the kind bytes and the handle WORDS in `PipeMsg` and construct a
+  wrapper only when the receiver asks for a slot
+  (`msg.take_handle(0) -> PipeHandle?`), which moves the six-way
+  construction out of `decode_wait` into a function only a
+  handle-reading program links; the drop then walks words rather than
+  matching enums. No kernel and no ABI consequence — it is entirely
+  inside `sos.pipe`. NOT done in unit 4 because it rewrites the
+  RECEIVING VOCABULARY that unit's §API was user-reviewed on, and the
+  ergonomics trade (a match on an optional field becomes a call then a
+  match) is a taste question the lead should answer
 
 - buffered `debug_print` — a length-taking form [#16 As-built finding,
   Sep 1]: today the seam traps once per BYTE, so a test's prose
