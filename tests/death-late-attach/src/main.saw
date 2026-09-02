@@ -32,11 +32,16 @@
 // things. So root drops the two references ONE AT A TIME and asks the machine
 // which was load-bearing:
 //
-//   - release the Process HANDLE, leaving only the attachment: a second
-//     `process_create` is still refused, because `MAX_PROCESSES` is two and
-//     slot 1 is still `Gone`. That is `held=1` — the attachment alone kept it.
+//   - release the Process HANDLE, leaving only the attachment: with the table
+//     otherwise full, a `process_create` is still refused, because slot 1 is
+//     still `Gone`. That is `held=1` — the attachment alone kept it.
 //   - remove the ATTACHMENT: the count reaches zero, the slot frees inside that
 //     very syscall, and the same create now succeeds. That is `freed=1`.
+//
+// "THE TABLE OTHERWISE FULL" IS ARRANGED BY AN UNSTARTED FILLER PROCESS since
+// M4 unit 5 raised `MAX_PROCESSES` to three (sawos design 21) — see the create
+// below the release, and `process-reclaim`, which needed the same thing for the
+// same reason.
 //
 // A kernel that did not count the attachment would free the slot at the release
 // and print `held=0` — and the second wait above would have been reading a slot
@@ -197,6 +202,20 @@ func _start(boot_handle: UInt) {
     // the spelling (design 3 D-5). The attachment is what is left.
     let _ = move child
 
+    // **THE FILLER, AND IT EXISTS BECAUSE M4 UNIT 5 RAISED `MAX_PROCESSES` TO
+    // THREE** (sawos design 21, user-ruled Sep 2). Both probes below ask
+    // whether a slot is AVAILABLE, and that question only has a load-bearing
+    // answer when the table has nothing else to give. One create, never
+    // started, spends the slot the bump added; `process-reclaim` does the same
+    // thing for the same reason, and both are written against "the table is
+    // full" rather than against a number so the next bump is one more filler.
+    let filler = try system.process_create(image: &image_mem,
+                                           memory: &dest_mem) catch {
+        print("SOS deathlate: filler create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
     let held = match system.process_create(image: &image_mem,
                                            memory: &dest_mem) {
         case Ok(_) -> false,
@@ -219,6 +238,9 @@ func _start(boot_handle: UInt) {
     }
 
     print("SOS deathlate: held={} freed={}\n", flag(held), flag(freed))
+    // The filler's handle is kept to the end, on `process-reclaim`'s reasoning:
+    // releasing it would leave a `Created` slot nothing names, and only a
+    // `Gone` slot is reclaimable.
     print("SOS deathlate: done\n")
     let _ = proc.exit(EXIT_OK)
 }

@@ -26,23 +26,47 @@
 import hal
 import sosabi.{ClockType}
 
-/// Processes the kernel can hold. TWO since M3 unit 2 (sawos design 2 D-6):
-/// root, and the one child a `process_create` proof needs.
+/// Processes the kernel can hold. THREE since M4 unit 5 (sawos design 21,
+/// user-ruled Sep 2): root, and the two children driver-as-service needs — a
+/// driver child that owns the UART and a client child that reads it through a
+/// pipe. It was TWO from M3 unit 2 (sawos design 2 D-6) to there.
 ///
-/// **"RAISING THIS NUMBER IS THE ONLY EDIT" GETS ITS FIRST EXERCISE, and it
-/// held.** Every table that is per-process was already indexed rather than
-/// assumed — the handle table is a slice of `HANDLES` at `p * MAX_HANDLES`, the
-/// thread/event/waiter/interrupt/timer slabs carry a `process` field their
-/// teardown scans by — so the one-to-two step is this line and the `ProcessSlot`
-/// arithmetic that follows from it. What did NOT come for free is what design 2
-/// is about: the protection domain, which one process could leave installed and
-/// two cannot (D-5), and the end of a process, which with one was the end of the
-/// machine (D-6).
+/// **"RAISING THIS NUMBER IS THE ONLY EDIT" HAS NOW BEEN EXERCISED TWICE, and
+/// it held both times.** Every table that is per-process was already indexed
+/// rather than assumed — the handle table is a slice of `HANDLES` at
+/// `p * MAX_HANDLES`, the thread/event/waiter/interrupt/timer slabs carry a
+/// `process` field their teardown scans by — so the one-to-two step was this
+/// line and the `ProcessSlot` arithmetic that follows from it, and the
+/// two-to-three step was this line and NOTHING ELSE in the kernel. What did NOT
+/// come for free at the first step is what design 2 is about: the protection
+/// domain, which one process could leave installed and two cannot (D-5), and
+/// the end of a process, which with one was the end of the machine (D-6).
 ///
-/// Two rather than eight because a slot is not free: it costs `MAX_HANDLES`
-/// handle entries and a grant record, and nothing above unit 2 needs a third
-/// yet. Quotas (unit 5) are where the number stops being the whole policy.
-public(package) static MAX_PROCESSES: Int = 2
+/// **THE CENSUS THE SECOND BUMP OWES, since a slot is not free** (design 21's
+/// forcing question, answered by measurement rather than by assertion):
+///
+///   - `MAX_HANDLES` handle entries — `HANDLES` grows 32 -> 48 rows, and
+///     `BOOT_HANDLES` with it. Zero-initialised, so it is .bss and no image
+///     byte is spent on it (design 149).
+///   - one `MAX_GRANT_ROWS`-row grant record, one `ProcessSlot`, one
+///     `QUOTA_KINDS`-wide pair of quota rows.
+///   - one term in `MAX_ATTACHMENTS` below (22 -> 23), because a Process handle
+///     is a waitable and one attachment per slot is the honest bound.
+///   - **NOT the protection-row budget.** Protection rows are PER DOMAIN and
+///     reprogrammed at `load_domain`, so `hal.GRANT_ROW_BUDGET` is what ONE
+///     process may hold installed and a third process adds nothing to it.
+///     Root's own record is the one to watch, and it does not move: root spends
+///     `IMAGE_GRANT_ROWS` = 3 (its two loadable segments plus the kernel's
+///     stack grant) whatever a launch wires up, because a launcher hands out
+///     CAPABILITIES and maps nothing — `process_create` reads a child's image
+///     with kernel privilege and a driver child maps its own window. Design 21
+///     measured a two-child launch at 3 rows used, leaving every profile's
+///     budget five or more rows to spare.
+///
+/// Three rather than eight for the same reason it was two rather than eight:
+/// the number is the smallest that serves the workload of record. A fourth is
+/// an edit to this line when a unit argues for one.
+public(package) static MAX_PROCESSES: Int = 3
 
 /// Root's slot. The kernel loads exactly one image (§12) and it lands here, so
 /// "process 0" and "root" are the same statement — which is what lets
@@ -187,7 +211,17 @@ public(package) static MAX_TIMERS: Int = 8
 /// A Process handle is a waitable now, one attachment per process slot at
 /// most, so the sum grows by the process table's own size and by exactly that.
 /// A THREAD is still not waitable, which is why `MAX_THREADS` is absent — the
-/// same reason the Clock is.
+/// same reason the Clock is. The M4-unit-5 process bump therefore moved this
+/// number too, 22 -> 23, by the arithmetic and not by an edit — which is what
+/// the derived spelling is for.
+///
+/// **THE PIPE WAITABLES ARE DELIBERATELY NOT TERMS**, and the omission is a
+/// judgement rather than an oversight: an outlet, an inlet, a claim and an
+/// obligation are all attachable since M4 unit 3, and sizing this sum to cover
+/// every one of them at once would multiply the table by the in-flight budget
+/// for a shape no program in the tree has. `NoResource` at `add` is what says
+/// so when a program finds the wall — design 21's driver holds at most six
+/// attachments at once (its outlet, its IRQ line, and up to four held reads).
 public(package) static MAX_ATTACHMENTS: Int = (MAX_EVENTS + MAX_INTERRUPTS
                                                + MAX_TIMERS + MAX_PROCESSES)
 
@@ -202,8 +236,15 @@ public(package) static MAX_ATTACHMENTS: Int = (MAX_EVENTS + MAX_INTERRUPTS
 /// `PIPE_INFLIGHT` staging slots of `PIPE_BODY_BYTES` each, which is the only
 /// per-object storage in the kernel that is measured in kilobytes. Sized like
 /// `MAX_WAITERS` and for a related reason — a connection is a per-CLIENT
-/// relationship, and a hand-written system has a handful — and unit 5's
-/// driver-as-service is the first workload that will argue for more.
+/// relationship, and a hand-written system has a handful.
+///
+/// **UNIT 5 WAS EXPECTED TO ARGUE FOR MORE AND DID NOT** (sawos design 21).
+/// Driver-as-service serves TWO clients over ONE connection — sibling inlets
+/// are per-client authority, which is exactly why an endpoint kept `Mint` when
+/// the one-shots lost it (`designs/010` ruling 12(c)) — so a service's
+/// connection count tracks its number of SESSIONS and not its number of
+/// clients. The three-process delegation beside it spends two, which is the
+/// largest a case in this tree has wanted.
 public(package) static MAX_PIPES: Int = 4
 
 /// The same sentinel for the Pipe slab.

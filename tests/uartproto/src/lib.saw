@@ -1,0 +1,187 @@
+//! **THE /dev/uart0 PROTOCOL** (sawos design 21, M4 unit 5 — the money shot).
+//!
+//! A UART driver that serves its device over a pipe needs a WIRE, and this is
+//! it: one op byte, then payload. Nothing here is kernel surface — the brief
+//! forbids growing `kernel/abi` or `sos` for this unit, and the reason is the
+//! design rather than the scope. A device protocol belongs to the device's
+//! driver and its clients; what the KERNEL supplies is the connection, the
+//! message and the one-shot reply pair, and it supplies exactly those to every
+//! protocol equally. M5's namespace is what will let a client find this service
+//! by a PATH instead of by a boot tag.
+//!
+//! **WHY IT IS A PACKAGE AND NOT A COMMENT.** Three programs compile against
+//! these numbers — the driver, the client child, and each root launcher acting
+//! as a client of its own — and the whole claim of the unit is that they AGREE.
+//! A copy per program is a copy that can drift, and the drift would show up as
+//! a wrong byte rather than as a compile error. This is `PIPE_BODY_BYTES`'
+//! argument at one altitude down: the two halves that must agree compile
+//! against one declaration. It sits in `tests/` because it is harness
+//! vocabulary, and NOT in `sosrt` because that package is the SOS runtime —
+//! arch-free and role-free code every image links — and a device protocol is
+//! neither.
+//!
+//! # The wire
+//!
+//! ```text
+//! byte 0      the op                    (UartOp, a raw-backed enum)
+//! bytes 1..   the payload               (`len - 1` of them)
+//! ```
+//!
+//! and the four ops, each with its OWN kernel-level shape:
+//!
+//!   - `Read`  — a CALL. The reply carries the next input byte, and the reply's
+//!               own `len` is what says how many. If no input is pending the
+//!               driver HOLDS the obligation and answers when its IRQ delivers
+//!               one; a fused `send` PARKS meanwhile, so a blocking read is
+//!               composed entirely out of shipped parts and the kernel learns
+//!               nothing about UARTs.
+//!   - `Write` — a TELL: post, drop the claim, never look back (`designs/010`
+//!               ruling 4). The driver writes the payload out its window.
+//!   - `Sync`  — a CALL with an empty reply. A connection's ring is FIFO, so an
+//!               answered `Sync` proves every message posted BEFORE it has been
+//!               served — which is how a client that only TELLs learns when its
+//!               writes reached the device.
+//!   - `Mark`  — a CALL with an empty reply, and the one op here that is pure
+//!               instrumentation: it tells the driver to take a trap reading, so
+//!               the serve loop's cost can be measured over a window the case
+//!               controls. It carries no authority and reads no device.
+//!
+//! # Cancellation is not an op
+//!
+//! There is no `Cancel` byte, deliberately. A client that gives up a `Read`
+//! DROPS ITS CLAIM — §2.1's ratified cancellation primitive — and the driver
+//! learns about it through the request's own ABANDONED level, which it is
+//! already watching because it is holding the obligation. Putting a cancel on
+//! the wire would need the driver to correlate two messages and would race the
+//! reply it is trying to cancel; the reference count does not.
+
+import sos.{PipeMsg, PIPE_BODY_BYTES}
+import sosrt.{ascii_byte}
+
+/// The op byte. RAW-BACKED because it crosses a wire (design 145 B2, and the
+/// house rule that a closed named set of values is a backed enum rather than a
+/// family of statics): the values are ABI between the driver and its clients,
+/// so every case states its own and a reorder cannot renumber them.
+public enum UartOp: UInt8 {
+    case Read = 1,
+    case Write = 2,
+    case Sync = 3,
+    case Mark = 4,
+}
+
+extension UartOp {
+    /// What a transcript should call this op.
+    public func describe(&self) -> String {
+        match self {
+            case Read -> "read",
+            case Write -> "write",
+            case Sync -> "sync",
+            case Mark -> "mark",
+        }
+    }
+}
+
+/// Where the op byte sits, and where the payload starts.
+public static OP_BYTE: Int = 0
+public static PAYLOAD_BYTE: Int = 1
+
+/// The most payload one message can carry: the body minus the op byte.
+public static MAX_PAYLOAD: Int = PIPE_BODY_BYTES - 1
+
+static_assert(MAX_PAYLOAD > 0, "a message must have room for an op and a byte")
+
+/// **THE REQUEST BUFFER, AND IT IS A STRUCT FOR A LANGUAGE REASON.** The body
+/// every send takes is a `&[UInt8; PIPE_BODY_BYTES]`, so a builder wants to
+/// write one through a `&var` — and a `&var [T; N]` PARAMETER's elements are not
+/// assignable in sawc today (SL-13), while the same array reached as a field of
+/// a `&var` struct is. One field, no ceremony, and `&buf.bytes` is what goes to
+/// the wire.
+public struct UartBody {
+    public bytes: [UInt8; PIPE_BODY_BYTES],
+}
+
+extension UartBody {
+    /// A zeroed body.
+    public static func empty() -> UartBody {
+        UartBody(bytes: [0; PIPE_BODY_BYTES])
+    }
+
+    /// An op and nothing else. Answers the message's `len`.
+    public func bare(&var self, op: UartOp) -> UInt {
+        self.bytes[OP_BYTE] = op as UInt8
+        1
+    }
+
+    /// An op and one payload byte. Answers the message's `len`.
+    public func one(&var self, op: UartOp, b: UInt8) -> UInt {
+        self.bytes[OP_BYTE] = op as UInt8
+        self.bytes[PAYLOAD_BYTE] = b
+        2
+    }
+
+    /// **A REPLY carrying one byte.** Answers the reply's `len`.
+    ///
+    /// A REPLY HAS NO OP BYTE, and that is the protocol rather than an
+    /// omission: a reply answers exactly one request, so the request's op is
+    /// what says how to read it, and the reply's own `len` is the length prefix
+    /// §2.1 already gives every message. A second framing would be a second
+    /// thing to keep in step.
+    public func answer(&var self, b: UInt8) -> UInt {
+        self.bytes[0] = b
+        1
+    }
+
+    /// **A REPLY carrying nothing.** Answers `0`, which §2.1 allows and which
+    /// reads no buffer at all — the acknowledgement `Sync` and `Mark` want.
+    public func nothing(&self) -> UInt { 0 }
+
+    /// An op and a line of ASCII. Answers the message's `len`.
+    ///
+    /// A scalar that is not ASCII becomes `?`, which is `ascii_byte`'s rule and
+    /// the kernel console's — so a line written through a driver's window reads
+    /// the same as one written through a System op. Text longer than
+    /// `MAX_PAYLOAD` is CUT rather than wrapped: the maximum is published, the
+    /// caller chose the string, and a silently split message would be two
+    /// requests where the caller wrote one.
+    public func text(&var self, op: UartOp, s: String) -> UInt {
+        self.bytes[OP_BYTE] = op as UInt8
+        var n: Int = 0
+        for scalar in s.chars() {
+            if n < MAX_PAYLOAD {
+                self.bytes[PAYLOAD_BYTE + n] = ascii_byte(scalar)
+                n = n + 1
+            }
+        }
+        (n + 1) as UInt
+    }
+}
+
+/// **THE OP A RECEIVED MESSAGE NAMES, OR `None` FOR A BYTE THAT NAMES NO OP.**
+///
+/// The Optional is load-bearing rather than a transient (the Sep-2 discipline):
+/// a request arrives from a process the driver does not trust, so "this byte is
+/// not one of my ops" is a REAL DOMAIN VALUE at a protocol boundary, and it is
+/// what `from(raw:)` exists for — an unrecognized wire byte is data, never a
+/// trap. There is no error channel to put it on: this is a decode, not an
+/// operation that can fail.
+///
+/// A message with no bytes at all (`len == 0`, which §2.1 allows) names no op
+/// either, and the same `None` says so.
+public func op_of(msg: &PipeMsg) -> UartOp? {
+    if msg.len == 0 { return None }
+    UartOp.from(raw: msg.bytes[OP_BYTE])
+}
+
+/// How many payload bytes a received message carries.
+public func payload_len(msg: &PipeMsg) -> UInt {
+    if msg.len == 0 { return 0 }
+    msg.len - 1
+}
+
+/// Payload byte `i` of a received message. Out of range answers zero rather
+/// than panicking: the sender chose the length and the receiver is a SERVER,
+/// which must not be endable by a client's arithmetic.
+public func payload_byte(msg: &PipeMsg, i: Int) -> UInt8 {
+    if i < 0 || (i as UInt) >= payload_len(&msg) { return 0 }
+    msg.bytes[PAYLOAD_BYTE + i]
+}

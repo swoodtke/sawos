@@ -1,0 +1,117 @@
+// SOS CHILD: THE MIDDLE OF A THREE-PROCESS DELEGATION (sawos design 21, M4
+// unit 5; spec §2.1's ratified zero-copy example).
+//
+// **THE FILESYSTEM IN §2.1's OWN EXAMPLE.** It receives a request from a client
+// it has never heard of, decides at run time that somebody else should answer
+// it, and FORWARDS THE OBLIGATION rather than the data — so the answer travels
+// straight from the far process to the original client and never transits this
+// one. That is what makes it zero-copy, and it is the whole reason a one-shot
+// reply pair is TRANSFERABLE.
+//
+// **WHAT THIS PROCESS NEVER LEARNS.** It cannot name the client, it holds no end
+// of the connection the client is waiting on, and after the forward it cannot
+// answer the request even if it wanted to — the post CONSUMED the wrapper. What
+// it holds is one server end and one client end of two unrelated connections.
+//
+// **IT WAITS RATHER THAN POLLS**, with a consuming persistent attach, so its
+// launcher may start the three processes in any order it likes: the delivery IS
+// the take (`designs/010` ruling 11(d)), and a message that has not arrived is a
+// park rather than a `WouldBlock` to loop on.
+//
+// The verdict travels in the §8 exit code; this child prints nothing, because
+// its launcher asserts a transcript whose ordering is the protocol's.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, PipeRequest, PipeHandles,
+            PipeMsg, Waiter, WaitResult, WaitPayload, AttachMode, BootHandle,
+            SosStatus, PIPE_BODY_BYTES}
+
+/// The obligation was forwarded and this process is done with it.
+static EXIT_FORWARDED: UInt = 71
+/// The boot set held no outlet, or no inlet, where its launcher's config says.
+static EXIT_NO_ENDS: UInt = 72
+/// A call that should not have been refused was.
+static EXIT_REFUSED: UInt = 73
+/// The delivery was not a message, which would mean the kernel reported an
+/// attachment this process never made.
+static EXIT_NOT_A_MESSAGE: UInt = 74
+
+/// The key the subscription is registered under.
+static KEY_OUTLET: UInt = 5
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS childforward: no process handle: {}\n", error)
+        return
+    }
+
+    let code = try forward(&proc) catch {
+        print("SOS childforward: refused: {}\n", error)
+        let _ = proc.exit(EXIT_REFUSED)
+        return
+    }
+    let _ = proc.exit(code)
+}
+
+/// Receive one request, hand its obligation on, and stop.
+func forward(proc: &Process) -> Result<UInt, SosStatus> {
+    var in_rec = try proc.boot_handle_next()
+    var out_rec = try proc.boot_handle_next()
+    guard let outlet = in_rec.take_outlet() else { return EXIT_NO_ENDS }
+    guard let onward = out_rec.take_inlet() else { return EXIT_NO_ENDS }
+
+    let waiter = try proc.waiter_create()
+    try waiter.give(outlet: move outlet, key: KEY_OUTLET,
+                    mode: AttachMode.Persistent) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+
+    let wake = try waiter.wait()
+    var relayed = false
+    match wake.what {
+        case Message(_, _) -> { relayed = true },
+        case _ -> {},
+    }
+    if not relayed {
+        let _ = move wake
+        return EXIT_NOT_A_MESSAGE
+    }
+
+    // **OPEN THE RECORD, THEN MATCH THE OWNED PAYLOAD** (SL-17's discipline).
+    // The delivery carried the message AND the obligation to answer it, which is
+    // what a completion-queue attach means — and the obligation is the thing
+    // this process is about to give away.
+    let (_, what) = (move wake).open()
+    match what {
+        case Message(m, r) -> {
+            var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+            body[0] = m.bytes[0]
+            let _ = move m
+
+            // **THE FORWARD.** The obligation goes into a message's handle slot
+            // and the post CONSUMES the wrapper, so this process cannot answer
+            // the request below this line — which is what delegation MEANS. The
+            // exchange itself is untouched by the move: an obligation names a
+            // ring slot, and this changes only which table will name it.
+            var carrying = PipeHandles.none()
+            carrying.put(0, request: move r)
+            let onward_claim = try onward.post_with(body: &body, len: 1,
+                                                    handles: &var carrying)
+            // A TELL: this process wants no answer of its own. The answer the
+            // ORIGINAL client is waiting for comes back on a connection this
+            // process holds no end of.
+            let _ = move onward_claim
+            let _ = move onward
+            return EXIT_FORWARDED
+        },
+        // UNREACHABLE: the borrowing look above established the tag.
+        case _ -> {
+            let _ = move onward
+            return EXIT_NOT_A_MESSAGE
+        },
+    }
+}

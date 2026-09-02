@@ -1,0 +1,33 @@
+[package]
+name = "svc-client"
+version = "0.1.0"
+
+# Same reason as sos/root's: this image carries its own `__saw_rt_*` seams, out
+# of the `sosrt` module its `sos` dependency pulls in. See that manifest.
+runtime = true
+
+# **THE PROCESS WITH NO DEVICE AUTHORITY** (sawos design 21, M4 unit 5). It
+# reads and writes the console over a pipe, through `uartproto`, and holds no
+# `IoMemory`, no `Mapping` and no `Interrupt` — the asymmetry with its sibling
+# driver IS the money shot.
+#
+# **IT IS LINKED AT THE SECOND CHILD BASE** (`child2.ld`), and that is a
+# CONTRACT WITH THE CASE rather than a property of the program: the runner's
+# `_region_rows` assigns destination regions BY INDEX, so a package linked here
+# is a package its case must list SECOND. Unit 5 is the first case in this tree
+# with two children alive at once, which is why that script exists at all.
+[dependencies]
+sos = { path = "../../kernel/sysapi" }
+uartproto = { path = "../uartproto" }
+
+[sos]
+emit = "sosimg"
+priorities = { background = 0, low = 1, normal = 1, high = 1 }
+
+[sos.riscv32-unknown-none-elf]
+linker-script = "../../hal/riscv32/user/child2.ld"
+native = "../../hal/riscv32/user/syscall.c ../../rt/common_c/support.c"
+
+[sos.aarch64-unknown-none-elf]
+linker-script = "../../hal/arm64/user/child2.ld"
+native = "../../hal/arm64/user/syscall.c ../../rt/common_c/support.c"

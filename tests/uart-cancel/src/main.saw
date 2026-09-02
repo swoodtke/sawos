@@ -1,0 +1,206 @@
+// SOS M4 unit 5: A DEAD READ CANNOT WEDGE A DRIVER (sawos design 21; §2.1's
+// ratified abandonment, `designs/010` ruling 4's cancellation half).
+//
+// **CANCELLATION HAS NO OP, AND THIS IS WHAT IT LOOKS LIKE WHEN IT IS REAL.**
+// Root asks the UART service for a byte on a console nobody is typing at. The
+// driver cannot answer — so it HOLDS the obligation, which is what a driver
+// should do — and root gives up: a Timer on its own Waiter fires first, root
+// DROPS ITS CLAIM, and that release is the entire cancellation. The kernel
+// never learned what a timeout is; the driver never learned that one happened.
+// What it learns is that the request was ABANDONED, through the level it was
+// already watching because it was already holding the obligation.
+//
+//   SOS uartcancel: read posted        <- a read with no input behind it
+//   SOS uartcancel: timed out          <- the Timer, not the claim: root's own
+//                                         deadline, composed out of a Waiter
+//                                         and a clock the kernel already had
+//   SOS uartcancel: claim dropped      <- the cancellation, spelled as a drop
+//   SOS uartcancel: root wrote this line through the driver
+//                                      <- and the loop SERVED THE NEXT REQUEST
+//   SOS uartsvc drv: served=5 abandoned=1
+//
+// **THE ORDER IS FORCED RATHER THAN RACED.** When root's timer fires the driver
+// is parked in `wait` with nothing else to do — it has been since it attached
+// root's obligation, microseconds after start — so the release that abandons
+// the claim WAKES IT THERE, with that record, before anything else is posted.
+// Root's next message cannot overtake a delivery that has already happened.
+// The twenty-millisecond deadline is three orders of magnitude more than the
+// driver needs to reach its park, which is `process-lifecycle`'s own argument.
+//
+// **THERE IS NO STDIN IN THIS CASE**, which is what makes it airtight in a
+// second way: the device never raises its line, so the transcript contains no
+// interrupt at all and the driver's trap accounting is exact arithmetic rather
+// than a measurement.
+
+import sos.{System, Process, Memory, IoMemory, PipeInlet, PipeOutlet, PipeReply,
+            PipeMsg, Clock, ClockType, Timer, Waiter, WaitResult, WaitPayload,
+            SystemRight, SosStatus, PIPE_BODY_BYTES}
+import uartproto.{UartOp, UartBody}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Revoked
+
+/// ROOT'S CONFIG — the driver's boot set, in the order it drains.
+static TAG_BOOT: UInt = 21
+static TAG_WINDOW: UInt = 22
+static TAG_OUTLET: UInt = 23
+
+/// The keys. Three distinct words on one Waiter, which is what §2.2's key
+/// uniqueness is for.
+static KEY_CLAIM: UInt = 81
+static KEY_TIMER: UInt = 82
+static KEY_DRIVER: UInt = 83
+
+/// Twenty milliseconds — three orders of magnitude more than the driver needs to
+/// reach its park. See `process-lifecycle`.
+static PARK_NS: UInt64 = 20_000_000
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.ClockGet | SystemRight.Transfer)
+
+/// `Exited`(1) << 16 | 0 — the driver's clean ending.
+static DRIVER_STATUS: UInt = 65536
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS uartcancel: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS uartcancel: failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS uartcancel: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// Launch the service, ask it something it cannot answer, give up, and prove the
+/// next request is served.
+///
+/// ONE PHASE PER FUNCTION, per design 14 finding 3's stack ceiling.
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    var window_rec = try proc.boot_handle_next()
+    guard let img = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    guard let window = window_rec.take_iomemory() else { return BUG }
+
+    let driver = try system.process_create(image: &img, memory: &ram)
+    let _ = move img
+    let _ = move ram
+
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try driver.give(system: move for_child, tag: TAG_BOOT)
+    try driver.give(iomemory: move window, tag: TAG_WINDOW)
+    try driver.give(outlet: move outlet, tag: TAG_OUTLET)
+    try driver.start(boot_tag: TAG_BOOT)
+    let _ = system.debug_print("SOS uartcancel: driver started\n")
+
+    // **THE READ NOBODY CAN ANSWER.** This case feeds the guest no serial input
+    // at all, so the device will never raise its line and the driver will hold
+    // this obligation for as long as root leaves it holding one.
+    var req = UartBody.empty()
+    let n = req.bare(UartOp.Read)
+    let claim = try inlet.post(body: &req.bytes, len: n)
+    let _ = system.debug_print("SOS uartcancel: read posted\n")
+
+    // **THE DEADLINE IS ROOT'S OWN, AND THE KERNEL STILL DOES NOT KNOW WHAT ONE
+    // IS** (`designs/010` ruling 4). A Waiter with two things on it — the claim
+    // and a Timer — and whichever is ready first is the answer. There is no
+    // duration argument anywhere in the pipe surface and there never will be:
+    // this composition is what it would have been for.
+    let clock = try system.clock_get(type: ClockType.Monotonic)
+    let waiter = try proc.waiter_create()
+    let timer = try clock.timer_create()
+    try waiter.add(&claim, KEY_CLAIM)
+    try waiter.add(&timer, KEY_TIMER)
+    try timer.arm(after_ns: PARK_NS)
+
+    let woke = try waiter.wait()
+    if woke.key != KEY_TIMER {
+        // The claim answered, which on a console nobody is typing at would mean
+        // the driver invented a byte.
+        print("SOS uartcancel: woke on key {}, not the timer\n", woke.key)
+        return BUG
+    }
+    let _ = move woke
+    let _ = system.debug_print("SOS uartcancel: timed out\n")
+
+    // **THE CANCELLATION, SPELLED AS A DROP.** There is no `cancel()` verb: the
+    // claim's last reference going is the whole of saying "never mind", and
+    // deterministic destruction is what makes the timing of the signal
+    // deterministic too. The subscription is a reference like any other, so it
+    // has to go first — hanging up means destroying the subscription as well as
+    // the handle (§2.1 as re-worded by `designs/010` ruling 11).
+    try waiter.remove(KEY_CLAIM)
+    let _ = move claim
+    let _ = system.debug_print("SOS uartcancel: claim dropped\n")
+
+    // **AND THE LOOP SERVES THE NEXT REQUEST.** Everything below is an ordinary
+    // round with the ordinary driver: the two lines come out of a transmitter
+    // root does not own, and the `Sync` that follows them is answered — which
+    // it could not be if one dead read had wedged the server.
+    try own_round(&inlet, &var req)
+
+    try waiter.add(process: &driver, key: KEY_DRIVER)
+    let _ = move inlet
+    let gone = try waiter.wait()
+    if gone.key != KEY_DRIVER { return BUG }
+    let status = status_of(&gone)
+    let _ = move gone
+    if status != DRIVER_STATUS {
+        print("SOS uartcancel: driver status={} wanted {}\n", status,
+              DRIVER_STATUS)
+        return BUG
+    }
+    let _ = move timer
+    let _ = move driver
+    return
+}
+
+/// `Mark`, two `Write` TELLs and a `Sync` — the same round `uart-service` runs,
+/// and the same measured window on the driver's side.
+func own_round(inlet: &PipeInlet, req: &var UartBody) -> Result<Void, SosStatus> {
+    let mark = req.bare(UartOp.Mark)
+    let ack = try inlet.send(body: &req.bytes, len: mark)
+    if ack.len != 0 { return BUG }
+    let _ = move ack
+
+    let a = req.text(UartOp.Write,
+                     "SOS uartcancel: root wrote this line through the driver\n")
+    let first = try inlet.post(body: &req.bytes, len: a)
+    let _ = move first
+
+    let b = req.text(UartOp.Write,
+                     "SOS uartcancel: one dead read did not wedge it\n")
+    let second = try inlet.post(body: &req.bytes, len: b)
+    let _ = move second
+
+    let sync = req.bare(UartOp.Sync)
+    let settled = try inlet.send(body: &req.bytes, len: sync)
+    if settled.len != 0 { return BUG }
+    let _ = move settled
+    return
+}
+
+/// The §8 status word out of a wait record.
+func status_of(r: &WaitResult) -> UInt {
+    match r.what {
+        case Process(status) -> status,
+        case _ -> panic("this record was supposed to be the driver's"),
+    }
+}

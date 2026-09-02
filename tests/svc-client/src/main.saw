@@ -1,0 +1,139 @@
+// SOS CHILD: A PROCESS THAT READS A UART IT CANNOT REACH (sawos design 21, M4
+// unit 5 — the money shot's other half).
+//
+// **THE ASYMMETRY IS THE DEMONSTRATION.** Its sibling holds the console's
+// register page, its interrupt line and a mapping onto both. This process holds
+// ONE PIPE INLET and a masked System handle, and that is the whole of its
+// estate: no `IoMemory`, no `Mapping`, no `Interrupt`, no address it could
+// dereference if it wanted to. Every byte it reads and every byte it writes
+// crosses a process boundary through `uartproto` — which is what `/dev/uart0`
+// means before there are paths to say it with.
+//
+// **IT IS A SIBLING INLET, NOT THE INLET.** Root minted this one off the
+// connection it created and kept the other, so two processes are clients of one
+// service over one connection at the same time. Sibling inlets are per-client
+// authority — exactly why an endpoint kept `Mint` when the one-shots lost it
+// (`designs/010` ruling 12(c)) — and each request carries its own reply
+// obligation, so the driver's completion-queue loop routes every answer to the
+// right claim with no correlation on the wire.
+//
+// THE LOOP, `ROUNDS` times:
+//
+//   READ   a fused `Call` — ONE TRAP — that PARKS until a byte exists. There is
+//          no timeout, no poll and no retry: the driver holds the obligation
+//          until its interrupt delivers something, and this thread is asleep on
+//          the kernel's own reply path meanwhile.
+//   WRITE  a TELL: post the byte back, drop the claim, never look. The echo the
+//          harness sees is this process's writes coming out of its sibling's
+//          transmitter.
+//
+// **IT PRINTS NOTHING.** Its launcher asserts a transcript whose ordering
+// depends on which process wrote which byte, so a line from here would be one
+// more thing to order. The verdict travels in the §8 exit code, which is
+// `child-pingpong`'s discipline and for the same reason.
+
+import sos.{System, Process, PipeInlet, PipeMsg, SosStatus, PIPE_BODY_BYTES}
+import uartproto.{UartOp, UartBody}
+
+/// How many bytes this client echoes. THE HARNESS FEEDS ONE MORE THAN THIS:
+/// root takes the first byte through its own retained inlet and this process
+/// takes the rest, which is what makes the routing observable — two claims, two
+/// processes, one connection.
+static ROUNDS: Int = 3
+
+/// Every round read a byte and wrote it back.
+static EXIT_ECHOED: UInt = 61
+/// A call was refused, or answered a length no read can produce.
+static EXIT_MISMATCH: UInt = 62
+/// The boot set held no inlet where its launcher's config says one is.
+static EXIT_NO_INLET: UInt = 63
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        // Nothing to exit WITH and nothing to say it on. Returning from the
+        // entry faults this process, so the launcher reads `Faulted` where it
+        // expected `Exited` — a wrong answer that says so.
+        return
+    }
+
+    var record = try proc.boot_handle_next() catch {
+        let _ = proc.exit(EXIT_NO_INLET)
+        return
+    }
+    guard let inlet = record.take_inlet() else {
+        let _ = proc.exit(EXIT_NO_INLET)
+        return
+    }
+
+    let verdict = echo(&inlet)
+    let _ = proc.exit(verdict)
+}
+
+/// **THE LOOP, IN ITS OWN FRAME.** One phase per function on design 14 finding
+/// 3's stack ceiling, and here the reason is sharper than a frame budget: this
+/// body must contain no print, and keeping it apart from the entry is what makes
+/// that visible at a glance.
+func echo(inlet: &PipeInlet) -> UInt {
+    var req = UartBody.empty()
+
+    var round: Int = 0
+    while round < ROUNDS {
+        // **THE BLOCKING READ, COMPOSED OUT OF SHIPPED PARTS.** `send` is the
+        // fused `Call`: it stages the request and parks this thread on a claim
+        // the kernel keeps internally, so no handle is minted and no table row
+        // is spent however long the wait is. What it is waiting for is a driver
+        // holding this very obligation until a device interrupt makes an answer
+        // possible — and the kernel, which routes all of it, has never heard of
+        // a UART.
+        let n = req.bare(UartOp.Read)
+        let answer = try inlet.send(body: &req.bytes, len: n) catch {
+            return EXIT_MISMATCH
+        }
+        // A read answers exactly one byte: the reply's own `len` is the length
+        // prefix, so a wrong length is a protocol violation rather than a short
+        // read to loop over.
+        if answer.len != 1 {
+            return EXIT_MISMATCH
+        }
+        let b = answer.bytes[0]
+        let _ = move answer
+
+        // **THE TELL.** Post and drop the claim — §2.1's payload-carrying
+        // one-way, and `designs/010` ruling 4's second half. Nothing comes back
+        // and nothing is waited for; the proof it arrived is the byte appearing
+        // on the console, written by a process that is not this one.
+        let m = req.one(UartOp.Write, b)
+        let claim = try inlet.post(body: &req.bytes, len: m) catch {
+            return EXIT_MISMATCH
+        }
+        let _ = move claim
+
+        round = round + 1
+    }
+
+    // **FLUSH BEFORE EXITING, AND IT IS THE PROTOCOL THAT SAYS SO.** A `Write`
+    // is a TELL: it returns as soon as the message is STAGED, so this process
+    // can reach `exit` with its last byte still sitting in a ring slot — and it
+    // will still be written (take-at-post makes a staged message outlive its
+    // sender, `designs/010` ruling 5 as re-ruled Sep 2), just LATER than the
+    // kernel's own exit line. Measured: without this the console reads `Zq7`,
+    // then two teardown rows, then `#`.
+    //
+    // `Sync` is the barrier that fixes it, and it needs nothing new: a
+    // connection's ring is FIFO, so an answered `Sync` proves every message
+    // posted before it has been served. One trap, and the phrase comes out
+    // whole.
+    let s = req.bare(UartOp.Sync)
+    let settled = try inlet.send(body: &req.bytes, len: s) catch {
+        return EXIT_MISMATCH
+    }
+    if settled.len != 0 {
+        return EXIT_MISMATCH
+    }
+    let _ = move settled
+
+    EXIT_ECHOED
+}

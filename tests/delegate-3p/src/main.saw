@@ -1,0 +1,205 @@
+// SOS M4 unit 5: DELEGATION, ACROSS THREE PROCESSES (sawos design 21; spec
+// §2.1's ratified zero-copy example; `designs/010` ruling 5).
+//
+// **THE SPELLING UNIT 4 DEFERRED, AND WHAT IT WAS DEFERRED ON.**
+// `pipe-delegate-msg`'s header says: *"`MAX_PROCESSES` is 2, so the round trip
+// goes through two pipes rather than three processes ... the three-process
+// spelling waits on unit 5's topology and the `MAX_PROCESSES` bump it forces."*
+// The bump is here (`MAX_PROCESSES` is three since design 21), so here is the
+// spelling.
+//
+// THE TOPOLOGY, and it is §2.1's example with the names filled in:
+//
+//   root    --A-->  middle       root asks. It holds the CLAIM and nothing else
+//                                on this exchange.
+//   middle  --B-->  far          the middle forwards the OBLIGATION in a
+//                                message and drops its own claim on B. It is
+//                                the filesystem in §2.1's example.
+//   far     --A-->  root         the far process replies to the obligation it
+//                                was sent, and the bytes land at ROOT's claim
+//                                on a connection the far process holds no end
+//                                of. It is the flash driver.
+//
+// **THE PAYLOAD NEVER TRANSITS THE MIDDLE**, which is the whole of the zero-copy
+// claim: root posts one byte and reads back four it never wrote, and the process
+// that made the routing decision saw neither. Unit 4 proved the MECHANISM — a
+// one-shot crossing a process boundary in a message — with two pipes and one
+// child; what three processes add is that the middle is a genuinely different
+// principal from both ends, with its own table, its own quota and its own death.
+//
+// **AND THE MIDDLE IS USUALLY DEAD BY THE TIME THE ANSWER LANDS.** It exits
+// immediately after forwarding, which take-at-post makes irrelevant (ruling 5 as
+// re-ruled Sep 2): the obligation left its table AT THE POST, so the far
+// process's reply is written into an exchange nobody in the middle still names.
+// Under the old sender-keeps rule this ordering would have been a race.
+//
+// THE TRANSCRIPT, read as an order:
+//
+//   SOS delegate3p: created                 <- two children, two connections
+//   SOS delegate3p: started far and middle
+//   SOS delegate3p: reply len=4 b=68,79,78,69
+//   SOS delegate3p: the answer crossed three processes
+//   SOS delegate3p: middle=... far=...      <- both §8 status words
+//   SOS delegate3p: done
+
+import sos.{System, Process, Memory, PipeInlet, PipeOutlet, PipeReply, PipeMsg,
+            Waiter, WaitResult, WaitPayload, SystemRight, SosStatus,
+            PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Revoked
+
+/// ROOT'S CONFIG. The middle drains its OUTLET first and its INLET second; the
+/// far process drains one outlet. The kernel supplies no meaning for any of it.
+static TAG_MID_BOOT: UInt = 41
+static TAG_MID_OUTLET: UInt = 42
+static TAG_MID_INLET: UInt = 43
+static TAG_FAR_BOOT: UInt = 51
+static TAG_FAR_OUTLET: UInt = 52
+
+/// The keys the two deaths are watched under.
+static KEY_MIDDLE: UInt = 91
+static KEY_FAR: UInt = 92
+
+/// What a child of this launcher may ask its System object for. `Transfer` is
+/// the bit `give` checks on the thing being given.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The four bytes the far process answers with, and the two exit codes.
+static REPLY_LEN: UInt = 4
+static MIDDLE_STATUS: UInt = 65607        // Exited(1) << 16 | 71
+static FAR_STATUS: UInt = 65617           // Exited(1) << 16 | 81
+
+static_assert((1 * 65536) + 71 == 65607,
+              "the middle's status word is Exited in the high bits and its code")
+static_assert((1 * 65536) + 81 == 65617,
+              "the far process's status word is Exited and its code")
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS delegate3p: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS delegate3p: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS delegate3p: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// Wire two connections across three processes, ask once, and park on the claim.
+///
+/// ONE PHASE PER FUNCTION, per design 14 finding 3's stack ceiling.
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var mid_img_rec = try proc.boot_handle_next()
+    var far_img_rec = try proc.boot_handle_next()
+    var mid_ram_rec = try proc.boot_handle_next()
+    var far_ram_rec = try proc.boot_handle_next()
+    guard let mid_img = mid_img_rec.take_memory() else { return BUG }
+    guard let far_img = far_img_rec.take_memory() else { return BUG }
+    guard let mid_ram = mid_ram_rec.take_memory() else { return BUG }
+    guard let far_ram = far_ram_rec.take_memory() else { return BUG }
+
+    let middle = try system.process_create(image: &mid_img, memory: &mid_ram)
+    let far = try system.process_create(image: &far_img, memory: &far_ram)
+    // Spent, so released — see `uart-service` for why this launcher's table
+    // hygiene is worth writing down.
+    let _ = move mid_img
+    let _ = move far_img
+    let _ = move mid_ram
+    let _ = move far_ram
+
+    // CONNECTION A: root asks, the middle serves.
+    let a = try proc.pipe_create()
+    let (a_in, a_out) = move a
+    // CONNECTION B: the middle asks, the far process serves. Root creates it and
+    // keeps NEITHER end — creator-pays means root is charged for both, and a
+    // launcher wiring two children together is exactly the shape that makes
+    // that rule visible.
+    let b = try proc.pipe_create()
+    let (b_in, b_out) = move b
+    let _ = system.debug_print("SOS delegate3p: created\n")
+
+    let far_system = try system.mint(rights: CHILD_SYSTEM)
+    try far.give(system: move far_system, tag: TAG_FAR_BOOT)
+    try far.give(outlet: move b_out, tag: TAG_FAR_OUTLET)
+    try far.start(boot_tag: TAG_FAR_BOOT)
+
+    let mid_system = try system.mint(rights: CHILD_SYSTEM)
+    try middle.give(system: move mid_system, tag: TAG_MID_BOOT)
+    try middle.give(outlet: move a_out, tag: TAG_MID_OUTLET)
+    try middle.give(inlet: move b_in, tag: TAG_MID_INLET)
+    try middle.start(boot_tag: TAG_MID_BOOT)
+    let _ = system.debug_print("SOS delegate3p: started far and middle\n")
+
+    // **BOTH CHILDREN PARK BEFORE THIS POST, AND NEITHER HAD TO BE STARTED IN
+    // A PARTICULAR ORDER.** Each attaches its outlet CONSUMING and waits, so a
+    // message that has not arrived is a park rather than a `WouldBlock` to loop
+    // on — which is what makes a three-process chain writable without a
+    // launcher choreographing it.
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 63
+    let claim = try a_in.post(body: &msg, len: 1)
+
+    // **ROOT PARKS ON ITS OWN CLAIM, WITH NO WAITER AT ALL** (`designs/010`
+    // ruling 12(b)): `resolve` consumes the claim and parks when the answer has
+    // not arrived. What eventually resumes it is a `reply` made by a process
+    // two hops away, on a connection root created and gave both ends of away.
+    let answer = try (move claim).resolve()
+    if answer.len != REPLY_LEN { return BUG }
+    try report(&answer)
+    let _ = move answer
+    let _ = system.debug_print("SOS delegate3p: the answer crossed three processes\n")
+
+    // Both children are done. A death is a TERMINAL level, so attaching after
+    // the fact still wakes — which is why these two waits need no ordering.
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &middle, key: KEY_MIDDLE)
+    let mid_gone = try waiter.wait()
+    if mid_gone.key != KEY_MIDDLE { return BUG }
+    let mid_status = status_of(&mid_gone)
+    let _ = move mid_gone
+    try waiter.remove(KEY_MIDDLE)
+
+    try waiter.add(process: &far, key: KEY_FAR)
+    let far_gone = try waiter.wait()
+    if far_gone.key != KEY_FAR { return BUG }
+    let far_status = status_of(&far_gone)
+    let _ = move far_gone
+
+    print("SOS delegate3p: middle={} far={}\n", mid_status, far_status)
+    if mid_status != MIDDLE_STATUS { return BUG }
+    if far_status != FAR_STATUS { return BUG }
+
+    let _ = move a_in
+    let _ = move middle
+    let _ = move far
+    return
+}
+
+/// The four bytes, in their own frame — the one place this file formats a
+/// message.
+func report(answer: &PipeMsg) -> Result<Void, SosStatus> {
+    print("SOS delegate3p: reply len={} b={},{},{},{}\n", answer.len,
+          answer.bytes[0], answer.bytes[1], answer.bytes[2], answer.bytes[3])
+    return
+}
+
+/// The §8 status word out of a wait record.
+func status_of(r: &WaitResult) -> UInt {
+    match r.what {
+        case Process(status) -> status,
+        case _ -> panic("this launcher attached only a Process"),
+    }
+}

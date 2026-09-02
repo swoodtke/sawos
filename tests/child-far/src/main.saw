@@ -1,0 +1,136 @@
+// SOS CHILD: THE FAR END OF A THREE-PROCESS DELEGATION (sawos design 21, M4
+// unit 5; spec §2.1's ratified zero-copy example).
+//
+// **THE FLASH DRIVER IN §2.1's OWN EXAMPLE.** It is sent an obligation, in a
+// message, over a connection whose other end belongs to a process it was never
+// told about — and answering it puts bytes into a THIRD process's parked call.
+// Everything about that is unremarkable from here, which is the point: an
+// obligation is a capability, and this program spends it exactly the way it
+// would spend one it had taken itself.
+//
+// WHAT IT CANNOT DO, and each is a fact about the object model rather than about
+// this program's manners:
+//
+//   - name the client. It holds no end of that connection and no handle onto
+//     the process. The reply lands because the OBLIGATION names the exchange.
+//   - name the process that forwarded it. That process is gone by the time this
+//     reply is written, and it does not matter (take-at-post, `designs/010`
+//     ruling 5 as re-ruled Sep 2): the obligation left the middle's table AT THE
+//     POST, so what arrives here is a reference the kernel has been holding
+//     since.
+//   - answer twice. `reply` CONSUMES the wrapper (design 260's effect, SL-16's
+//     closure), so a second use is a compile error rather than a fault.
+//
+// It waits rather than polls, with a consuming persistent attach, so its
+// launcher may start the three processes in any order. It prints nothing; the
+// verdict travels in the §8 exit code.
+
+import sos.{System, Process, PipeOutlet, PipeRequest, PipeHandle, PipeMsg,
+            Waiter, WaitResult, WaitPayload, AttachMode, BootHandle, SosStatus,
+            PIPE_BODY_BYTES}
+
+/// A forwarded obligation was answered.
+static EXIT_ANSWERED: UInt = 81
+/// The boot set held no outlet where its launcher's config says one is.
+static EXIT_NO_OUTLET: UInt = 82
+/// A call that should not have been refused was.
+static EXIT_REFUSED: UInt = 83
+/// The message carried no handle, or one of a kind this arm does not expect.
+static EXIT_NO_HANDLE: UInt = 84
+
+/// The key the subscription is registered under.
+static KEY_OUTLET: UInt = 6
+
+/// Four bytes back: `D`, `O`, `N`, `E`.
+static REPLY_LEN: UInt = 4
+static BYTE_D: UInt8 = 68
+static BYTE_O: UInt8 = 79
+static BYTE_N: UInt8 = 78
+static BYTE_E: UInt8 = 69
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS childfar: no process handle: {}\n", error)
+        return
+    }
+
+    let code = try answer(&proc) catch {
+        print("SOS childfar: refused: {}\n", error)
+        let _ = proc.exit(EXIT_REFUSED)
+        return
+    }
+    let _ = proc.exit(code)
+}
+
+/// Take one message, and answer the obligation it carried.
+func answer(proc: &Process) -> Result<UInt, SosStatus> {
+    var rec = try proc.boot_handle_next()
+    guard let outlet = rec.take_outlet() else { return EXIT_NO_OUTLET }
+
+    let waiter = try proc.waiter_create()
+    try waiter.give(outlet: move outlet, key: KEY_OUTLET,
+                    mode: AttachMode.Persistent) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+
+    let wake = try waiter.wait()
+    var arrived = false
+    match wake.what {
+        case Message(_, _) -> { arrived = true },
+        case _ -> {},
+    }
+    if not arrived {
+        let _ = move wake
+        return EXIT_NO_HANDLE
+    }
+
+    let (_, what) = (move wake).open()
+    match what {
+        case Message(m, r) -> {
+            var msg = move m
+            let own = move r
+            // **TAKE IT OUT OF ITS SLOT BEFORE MATCHING IT.** `msg.handles[i]`
+            // is a place; `take()` hands over an OWNED value, and a `match` on
+            // an owned value consumes it — which is what lets an arm move the
+            // wrapper into a consuming op (SL-17).
+            guard let carried = msg.handles[0].take() else {
+                let _ = move own
+                let _ = move msg
+                return EXIT_NO_HANDLE
+            }
+            let _ = move msg
+            match carried {
+                case Request(rq) -> {
+                    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+                    body[0] = BYTE_D
+                    body[1] = BYTE_O
+                    body[2] = BYTE_N
+                    body[3] = BYTE_E
+                    // **THE BYTES GO STRAIGHT TO A PROCESS THIS ONE CANNOT
+                    // NAME.** They are written into the exchange's own ring slot
+                    // and copied out through the original client's checked
+                    // funnel while it resumes inside its own syscall — so the
+                    // payload never transits the process that forwarded it,
+                    // which is the whole of §2.1's zero-copy claim.
+                    let forwarded = move rq
+                    try (move forwarded).reply(body: &body, len: REPLY_LEN)
+                    // ITS OWN obligation is dropped rather than answered: the
+                    // middle gave its claim up at the post (§2.1's TELL idiom),
+                    // so there is nobody waiting for this one.
+                    let _ = move own
+                    return EXIT_ANSWERED
+                },
+                case _ -> {
+                    let _ = move own
+                    return EXIT_NO_HANDLE
+                },
+            }
+        },
+        case _ -> { return EXIT_NO_HANDLE },
+    }
+}

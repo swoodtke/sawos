@@ -1,0 +1,32 @@
+[package]
+name = "uart-cancel"
+version = "0.1.0"
+
+# Same reason as sos/root's: this image carries its own `__saw_rt_*` seams, out
+# of the `sosrt` module its `sos` dependency pulls in. See that manifest.
+runtime = true
+
+# **A DEAD READ CANNOT WEDGE A DRIVER** (sawos design 21, M4 unit 5). Root asks
+# the UART service for a byte on a console nobody is typing at, times out on its
+# OWN Waiter with its OWN Timer, drops the claim — the whole of §2.1's
+# cancellation primitive — and the driver's request-abandoned level is what
+# tells the server to let the obligation go. It then serves root's next request,
+# which is the claim.
+#
+# It reuses the `svc-uart-*` driver children unchanged, which is what makes the
+# proof about the LOOP rather than about a program written to pass it.
+[dependencies]
+sos = { path = "../../kernel/sysapi" }
+uartproto = { path = "../uartproto" }
+
+[sos]
+emit = "sosimg"
+priorities = { background = 0, low = 1, normal = 1, high = 1 }
+
+[sos.riscv32-unknown-none-elf]
+linker-script = "../../hal/riscv32/user/root.ld"
+native = "../../hal/riscv32/user/syscall.c ../../rt/common_c/support.c"
+
+[sos.aarch64-unknown-none-elf]
+linker-script = "../../hal/arm64/user/root.ld"
+native = "../../hal/arm64/user/syscall.c ../../rt/common_c/support.c"

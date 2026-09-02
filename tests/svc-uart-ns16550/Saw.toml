@@ -1,0 +1,30 @@
+[package]
+name = "svc-uart-ns16550"
+version = "0.1.0"
+
+# Same reason as sos/root's: this image carries its own `__saw_rt_*` seams, out
+# of the `sosrt` module its `sos` dependency pulls in. See that manifest.
+runtime = true
+
+# **THE UART AS A SERVICE** (sawos design 21, M4 unit 5 — the money shot), for
+# the board whose console is an NS16550A. It is `child-echo-ns16550` beside it
+# with a SERVER FACE: the same window arriving by `give` and mapped by the
+# driver into itself, the same register block, and a pipe OUTLET given to its
+# Waiter so every request arrives through `wait` itself (`designs/010` ruling
+# 11(d) — the completion-queue server).
+#
+# IT IS PER-DEVICE, not per-architecture: a driver names its device, and the two
+# SOS profiles happen to have different UARTs. The pl011 package beside this one
+# is the same program for the other one — same protocol, same loop, same
+# accounting, a different datasheet.
+[dependencies]
+sos = { path = "../../kernel/sysapi" }
+uartproto = { path = "../uartproto" }
+
+[sos]
+emit = "sosimg"
+priorities = { background = 0, low = 1, normal = 1, high = 1 }
+
+[sos.riscv32-unknown-none-elf]
+linker-script = "../../hal/riscv32/user/child.ld"
+native = "../../hal/riscv32/user/syscall.c ../../rt/common_c/support.c"

@@ -207,9 +207,11 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
 /// because it differs from `pick_next`'s. There, a CURRENT process exists and is
 /// the one that blocked. Here the process that was current is already gone, so
 /// there is nobody to blame — what is left is a machine whose surviving
-/// processes are all blocked on something no thread can now deliver. Today that
-/// set is exactly {root} (`MAX_PROCESSES` is 2), so the report ends root, which
-/// produces the same stop M2 always did.
+/// processes are all blocked on something no thread can now deliver. The report
+/// ends ROOT whoever else is in that set, which produces the same stop M2
+/// always did — and since M4 unit 5 raised `MAX_PROCESSES` to 3 the set can
+/// genuinely hold a peer, so "ends root" is a POLICY (init is what a machine
+/// stops by ending) rather than the arithmetic it used to be.
 ///
 /// **AND M3 UNIT 5.5 IS WHY THIS ARM IS NOW THE UNUSUAL PATH RATHER THAN THE
 /// SUPERVISORY ONE** (sawos design 8), which is what the sentence that used to
@@ -488,11 +490,16 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     //     an object some OTHER process owns must see the reference go, and the
     //     freeing is the per-slab sweeps' job.
     //
-    // Reachable only when a supervisor dies before what it watches, which with
-    // `MAX_PROCESSES` at two means root — and root's death stops the machine.
-    // Written anyway: the sweep's stated invariant is what changed, and an
-    // invariant that has quietly become false is worse than a branch nothing
-    // takes.
+    // Reachable only when a supervisor dies before what it watches. **THE
+    // ARITHMETIC THAT USED TO MAKE THAT IMPOSSIBLE IS GONE** (sawos design 21,
+    // M4 unit 5): with `MAX_PROCESSES` at two the only supervisor was root and
+    // root's death stops the machine; at three a CHILD may supervise a sibling
+    // and die first. No case in this tree wires that up — every launcher in
+    // `tests/` is root — so the arm stays untaken, but it is now untaken by
+    // topology rather than by the table's size, which is the difference between
+    // a branch nothing takes and a branch nothing can reach. Written anyway,
+    // for the reason it always was: an invariant that has quietly become false
+    // is worse than a branch nothing takes.
     var a: Int = 0
     while a < MAX_ATTACHMENTS {
         match ATTACHMENTS[a].state {
@@ -613,11 +620,17 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // kind's own quota CREDIT runs — which the old sweeps never did for a slot
     // another process had been charged for.
     //
-    // UNREACHABLE TODAY, and provably: with `MAX_PROCESSES` at two the only
-    // process that can outlive a peer is root, and root's death stops the
-    // machine. Written anyway, on the unit-5.5 principle the attachment sweep
-    // above records — an invariant that has quietly become false is worse than a
-    // branch nothing takes.
+    // UNREACHABLE IN THIS TREE, and no longer provably so — which is the change
+    // M4 unit 5 made here (sawos design 21). With `MAX_PROCESSES` at two the
+    // only process that could outlive a peer was root and root's death stops
+    // the machine; at three, unit 5's own topology has a client child dying
+    // while its sibling driver keeps serving. What still keeps this arm untaken
+    // is that ROOT creates every object those two share and outlives both, so
+    // no dying process is ever the last namer of somebody else's slot. That is
+    // a property of the wiring rather than of the table, and it is exactly why
+    // ruling 10 deleted the force-free arms instead of leaving them: the branch
+    // is here for the day a launcher is not root. Written on the unit-5.5
+    // principle the attachment sweep above records.
     //
     // THE OTHER FIVE SWEEPS STAY. Threads, Events, Waiters, Interrupts and Timers
     // are COUNTED for the teardown line, and D-5 authorises no change to those

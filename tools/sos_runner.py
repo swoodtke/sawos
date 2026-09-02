@@ -432,6 +432,30 @@ PIPE_RESOLVE_PARK_PKG = os.path.join(TESTS_DIR, "pipe-resolve-park")
 GIVE_KEEP_MASK_PKG = os.path.join(TESTS_DIR, "give-keep-mask")
 CHILD_NARROW_PKG = os.path.join(TESTS_DIR, "child-narrow")
 
+# M4 unit 5 — DRIVER-AS-SERVICE (sawos design 21), the money shot.
+#
+# `uartproto` is a LIBRARY package rather than an image: the protocol is ONE
+# declaration the driver, the client and both launchers compile against, which
+# is `PIPE_BODY_BYTES`' argument one altitude down. It has no constant here
+# because nothing builds it directly — Blade pulls it in as a path dependency.
+#
+# The driver is PER-CHIP and the client and launchers are arch-free, which is
+# the M3 driver-child split unchanged: a driver names its device, a launcher
+# moves a capability, and a capability has no datasheet.
+#
+# **`svc-client` IS LINKED AT THE SECOND CHILD BASE.** Unit 5 is the first case
+# in this tree with two children alive at once, so `hal/*/user/child2.ld` came
+# with it — and because `_region_rows` assigns destinations BY INDEX, a package
+# linked there is a package its case must list SECOND.
+UART_SERVICE_PKG = os.path.join(TESTS_DIR, "uart-service")
+UART_CANCEL_PKG = os.path.join(TESTS_DIR, "uart-cancel")
+SVC_UART_NS16550_PKG = os.path.join(TESTS_DIR, "svc-uart-ns16550")
+SVC_UART_PL011_PKG = os.path.join(TESTS_DIR, "svc-uart-pl011")
+SVC_CLIENT_PKG = os.path.join(TESTS_DIR, "svc-client")
+DELEGATE_3P_PKG = os.path.join(TESTS_DIR, "delegate-3p")
+CHILD_FORWARD_PKG = os.path.join(TESTS_DIR, "child-forward")
+CHILD_FAR_PKG = os.path.join(TESTS_DIR, "child-far")
+
 CLOCK_BASICS_PKG = os.path.join(TESTS_DIR, "clock-basics")
 TIMER_ONESHOT_PKG = os.path.join(TESTS_DIR, "timer-oneshot")
 TIMER_INTERVAL_PKG = os.path.join(TESTS_DIR, "timer-interval")
@@ -1981,9 +2005,15 @@ TEST_CASES = [
         # zero. A kernel that reclaimed eagerly would pass the second and fail
         # the first, and lose the supervision story with it.
         #
-        # It reuses the child-fault package, and both creates load the same
+        # It reuses the child-fault package, and every create loads the same
         # image into the same RAM — the first child's remains are nothing the
         # kernel tracks.
+        #
+        # **THE CASE ARRANGES A FULL TABLE SINCE M4 UNIT 5** (sawos design 21):
+        # `MAX_PROCESSES` is THREE now, so root plus a dead child leaves a slot
+        # free and `refused_before` would simply not happen. One unstarted
+        # FILLER process spends it. THE ASSERTED ROW IS UNCHANGED, which is what
+        # says the proof survived the bump rather than being re-aimed by it.
         "name": "process_reclaim",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": PROCESS_RECLAIM_PKG,
@@ -2662,13 +2692,18 @@ TEST_CASES = [
         # that reports it.
         #
         # `held=1 freed=1` is which reference was load-bearing, asked one at a
-        # time. With the Process HANDLE released and only the attachment left, a
-        # second `process_create` is still refused (`MAX_PROCESSES` is two and
-        # slot 1 is still `Gone`); remove the attachment and the count reaches
+        # time. With the Process HANDLE released and only the attachment left,
+        # a `process_create` against an otherwise-full table is still refused
+        # (slot 1 is still `Gone`); remove the attachment and the count reaches
         # zero, the slot frees inside that very syscall, and the same create
         # succeeds. A kernel that did not count the attachment would print
         # `held=0` — and the second wait above would have been reading a slot
         # the kernel had already given away.
+        #
+        # **"OTHERWISE FULL" IS ARRANGED BY AN UNSTARTED FILLER PROCESS SINCE
+        # M4 UNIT 5** (sawos design 21, `MAX_PROCESSES` = 3), exactly as in
+        # `process_reclaim` and for the same reason. Both asserted rows are
+        # unchanged.
         "name": "death_late_attach",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": DEATH_LATE_ATTACH_PKG,
@@ -3964,12 +3999,15 @@ TEST_CASES = [
         # answered by a process that holds no end of the connection it was asked
         # on, and the four bytes prove the payload never transited the middle.
         #
-        # MAX_PROCESSES IS 2, so the round trip goes through two pipes rather
-        # than three processes: the mechanism under test is a one-shot crossing a
-        # process boundary INSIDE A MESSAGE, and the third party in 2.1's
-        # example differs from this child in nothing the kernel can see. The
-        # three-process spelling waits on unit 5's topology and the
-        # MAX_PROCESSES bump it forces.
+        # THE ROUND TRIP GOES THROUGH TWO PIPES RATHER THAN THREE PROCESSES:
+        # the mechanism under test is a one-shot crossing a process boundary
+        # INSIDE A MESSAGE, and the third party in 2.1's example differs from
+        # this child in nothing the kernel can see. It was written that way
+        # because MAX_PROCESSES was 2; **the three-process spelling landed with
+        # M4 unit 5 as `pipe_delegate_3p` below** (sawos design 21), and THIS
+        # CASE STAYS UNMOVED beside it, because the two prove different things:
+        # this one that the mechanism is the message, that one that the middle
+        # is a different principal.
         "name": "pipe_delegate_msg",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": PIPE_DELEGATE_MSG_PKG,
@@ -4097,6 +4135,241 @@ TEST_CASES = [
                        "process={one}",
                        "SOS resolveorphan: the orphaned claim answers the other "
                        "end of this connection is gone"],
+        "expect_clean_exit": True,
+    },
+    # =========================================================================
+    # M4 unit 5 — DRIVER-AS-SERVICE, THE MONEY SHOT (sawos design 21)
+    # =========================================================================
+    #
+    # FIVE CASES ACROSS THE TWO PROFILES, and the first pair is what the whole
+    # M4 ladder was for. M2 put a driver in userspace; M3 unit 4 made its window
+    # a capability and unit 6 handed that capability to a CHILD; M4 built the
+    # connection, the message, the one-shot pair, the waitable levels and the
+    # fused paths. Here they meet: one process owns the UART and TWO OTHERS read
+    # it through a pipe, over a protocol none of them got from the kernel.
+    #
+    # **THE M3 TWINS AND THE M2 ANCESTORS ALL STAY, UNMOVED.** `uart_echo_*`
+    # (root as driver), `child_echo_*` (driver as a child) and these — the same
+    # device, the same four bytes, three transcripts — say what changed each
+    # time, which is never the driver's device half.
+    #
+    # **THESE ARE THE FIRST CASES IN THE TREE WITH TWO CHILDREN AT ONCE**, which
+    # is what `MAX_PROCESSES = 3` bought and what `hal/*/user/child2.ld` came
+    # with. `_region_rows` assigns destinations BY INDEX, so a package's linker
+    # script is a contract with the order it is listed in here.
+    {
+        # **THE MONEY SHOT ON RISCV32.** Read the transcript as an order:
+        #
+        #   read posted      root's `Read` is staged BEFORE the client process
+        #                    exists, so it is first in the connection's FIFO
+        #                    ring by construction rather than by timing — which
+        #                    is what pins the ORDER of the two outstanding reads
+        #                    before a single input byte has arrived.
+        #   client started   and now there are two, on one connection, from two
+        #                    processes, through two sibling inlets.
+        #   Zq7#             the harness's phrase, echoed — the FIRST byte by
+        #                    root through its own claim and the rest by the
+        #                    client through its own. Two claims, two tables, one
+        #                    driver, and each reply landed at the claim that
+        #                    asked for it.
+        #   root wrote ...   root's own round, after the client is dead: two
+        #                    TELLs and a `Sync`, so a launcher's prose comes out
+        #                    of a transmitter it does not own.
+        #   served=12 ...    the driver's own accounting, and every number in it
+        #                    is deterministic: twelve messages (root's read and
+        #                    echo, the client's three reads and three writes, and
+        #                    root's four-message closing round), nothing
+        #                    abandoned, nothing dropped.
+        #   messages=4 ...   the MEASURED WINDOW — `Mark` opens it and the loop's
+        #                    end closes it, and there is no input left by then so
+        #                    no interrupt can fall inside it. Four messages, five
+        #                    traps: ONE TRAP PER MESSAGE plus the closing
+        #                    `stats()` read. That is `pipe-cq`'s ladder end state
+        #                    measured in a real driver rather than in a bench.
+        #
+        # **WHAT `Zq7#` RULES OUT** is everything at once: the give, the map, the
+        # bind, an IRQ waking a process that is not root, a request crossing a
+        # process boundary, a one-shot reply pair carrying the answer back, and
+        # the whole thing again through a SECOND client's inlet. There is no way
+        # to fake it on a machine with no translation and no driver in the
+        # kernel.
+        "name": "uart_service_ns16550",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": UART_SERVICE_PKG,
+        "children": [SVC_UART_NS16550_PKG, SVC_CLIENT_PKG],
+        "device": True,
+        "stdin": ECHO_INPUT,
+        "expect_out": ["{banner}",
+                       "root image ok segments={two}",
+                       # FIVE rows: two image blobs, two destinations, the
+                       # device window. The first case in the tree to publish
+                       # more than three.
+                       "SOS: boot regions={five}",
+                       "SOS: console handover",
+                       "SOS uartsvc: created",
+                       "SOS uartsvc: driver started",
+                       "SOS uartsvc: read posted",
+                       "SOS uartsvc: client started",
+                       ECHO_INPUT,
+                       "SOS uartsvc: root wrote this line through the driver",
+                       "SOS uartsvc: and root does not hold the device",
+                       # 0x5A — 'Z', the first byte of the phrase, which is the
+                       # one root's own claim was answered with.
+                       "SOS uartsvc: root's claim answered byte 90",
+                       "SOS uartsvc: client echoed 3 more and exited clean",
+                       "SOS uartsvc drv: served=13 abandoned=0 dropped=0",
+                       "SOS uartsvc drv: after the mark answered=2 discarded=2 "
+                       "traps=7",
+                       "SOS uartsvc drv: one trap per answered message, two "
+                       "per discarded",
+                       "SOS uartsvc: the driver served two clients and ended "
+                       "clean",
+                       "SOS uartsvc: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The same money shot on the other machine and the other chip. The
+        # launcher, the client and the protocol are byte-identical packages;
+        # what differs between the two driver children is a datasheet.
+        "name": "uart_service_pl011",
+        "arches": ["arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": UART_SERVICE_PKG,
+        "children": [SVC_UART_PL011_PKG, SVC_CLIENT_PKG],
+        "device": True,
+        "stdin": ECHO_INPUT,
+        "expect_out": ["{banner}",
+                       "root image ok segments={two}",
+                       "SOS: boot regions={five}",
+                       "SOS: console handover",
+                       "SOS uartsvc: created",
+                       "SOS uartsvc: driver started",
+                       "SOS uartsvc: read posted",
+                       "SOS uartsvc: client started",
+                       ECHO_INPUT,
+                       "SOS uartsvc: root wrote this line through the driver",
+                       "SOS uartsvc: and root does not hold the device",
+                       "SOS uartsvc: root's claim answered byte 90",
+                       "SOS uartsvc: client echoed 3 more and exited clean",
+                       "SOS uartsvc drv: served=13 abandoned=0 dropped=0",
+                       "SOS uartsvc drv: after the mark answered=2 discarded=2 "
+                       "traps=7",
+                       "SOS uartsvc drv: one trap per answered message, two "
+                       "per discarded",
+                       "SOS uartsvc: the driver served two clients and ended "
+                       "clean",
+                       "SOS uartsvc: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **ONE DEAD READ CANNOT WEDGE A DRIVER**, and there is NO STDIN in this
+        # case, which is what makes it exact. The device never raises its line,
+        # so the whole run contains no interrupt and the driver's trap
+        # accounting is arithmetic rather than a measurement.
+        #
+        # Root asks for a byte nobody will type, times out on its OWN Waiter
+        # with its OWN Timer — the kernel still does not know what a timeout is
+        # (`designs/010` ruling 4) — and DROPS ITS CLAIM. That release is the
+        # entire cancellation: no op, no message, no correlation. The driver
+        # learns through the request-abandoned level it was already watching
+        # because it was already holding the obligation, and `abandoned=1` is
+        # that arm firing.
+        #
+        # **THE ORDER IS FORCED.** When the timer fires the driver has been
+        # parked in `wait` for twenty milliseconds, so root's release wakes it
+        # THERE with that record, before root's next message is even posted.
+        # Twenty milliseconds is three orders of magnitude more than the driver
+        # needs to reach its park, which is `process-lifecycle`'s own argument.
+        #
+        # `served=5` is the read, the mark, two writes and the sync — and the
+        # window numbers are the SAME 4/5 the money shot prints, from the same
+        # driver program, which is what makes them about the loop rather than
+        # about a case.
+        "name": "uart_cancel_ns16550",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": UART_CANCEL_PKG,
+        "children": [SVC_UART_NS16550_PKG],
+        "device": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS: console handover",
+                       "SOS uartcancel: driver started",
+                       "SOS uartcancel: read posted",
+                       # THE TIMER, not the claim: on a console nobody is typing
+                       # at, a claim that answered would mean the driver
+                       # invented a byte.
+                       "SOS uartcancel: timed out",
+                       "SOS uartcancel: claim dropped",
+                       "SOS uartcancel: root wrote this line through the driver",
+                       "SOS uartcancel: one dead read did not wedge it",
+                       "SOS uartsvc drv: served=5 abandoned=1 dropped=0",
+                       "SOS uartsvc drv: after the mark answered=2 discarded=2 "
+                       "traps=7",
+                       "SOS uartsvc drv: one trap per answered message, two "
+                       "per discarded",
+                       "SOS uartcancel: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The same cancellation against the other chip's driver.
+        "name": "uart_cancel_pl011",
+        "arches": ["arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": UART_CANCEL_PKG,
+        "children": [SVC_UART_PL011_PKG],
+        "device": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS: console handover",
+                       "SOS uartcancel: driver started",
+                       "SOS uartcancel: read posted",
+                       "SOS uartcancel: timed out",
+                       "SOS uartcancel: claim dropped",
+                       "SOS uartcancel: root wrote this line through the driver",
+                       "SOS uartcancel: one dead read did not wedge it",
+                       "SOS uartsvc drv: served=5 abandoned=1 dropped=0",
+                       "SOS uartsvc drv: after the mark answered=2 discarded=2 "
+                       "traps=7",
+                       "SOS uartsvc drv: one trap per answered message, two "
+                       "per discarded",
+                       "SOS uartcancel: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **DELEGATION ACROSS THREE PROCESSES** — the spelling unit 4 deferred
+        # on exactly the `MAX_PROCESSES` bump this unit makes.
+        # `pipe_delegate_msg` proved the MECHANISM with two pipes and one child
+        # and said so in as many words; what three processes add is that the
+        # middle is a genuinely different principal from both ends, with its own
+        # table, its own quota and its own death.
+        #
+        #   reply len=4 b=68,79,78,69   `DONE`, written by a process that holds
+        #                               no end of the connection root is parked
+        #                               on, into a ring slot root owns both ends
+        #                               of — and the byte root posted never
+        #                               reached it.
+        #   middle=65607 far=65617      both §8 status words: `Exited` in the
+        #                               high half, and codes that appear nowhere
+        #                               else in any transcript.
+        #
+        # **THE MIDDLE IS USUALLY DEAD BY THE TIME THE ANSWER LANDS**, which
+        # take-at-post makes irrelevant (ruling 5 as re-ruled Sep 2). Under
+        # sender-keeps this ordering would have been a race; `pipe_send_exit` is
+        # where that independence is the point rather than a footnote.
+        "name": "pipe_delegate_3p",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DELEGATE_3P_PKG,
+        "children": [CHILD_FORWARD_PKG, CHILD_FAR_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS delegate3p: created",
+                       "SOS delegate3p: started far and middle",
+                       "SOS delegate3p: reply len=4 b=68,79,78,69",
+                       "SOS delegate3p: the answer crossed three processes",
+                       "SOS delegate3p: middle=65607 far=65617",
+                       "SOS delegate3p: done"],
         "expect_clean_exit": True,
     },
 ]
@@ -4445,6 +4718,18 @@ def _region_rows(case, arch):
     work at all, since the address is whatever `ld.lld` decides.
     """
     children = case.get("children", ())
+    # **TWO CHILDREN AND A POOL CANNOT COEXIST**, and the refusal is here rather
+    # than in a comment because the collision is silent otherwise. The pool base
+    # was chosen as "one region above the one child region above root", so with
+    # two children the second one's destination IS the pool's window — and the
+    # table would publish two rows naming the same bytes under two kinds. M4
+    # unit 5 is the first case with two children; the day one wants a pool too,
+    # widening the layout is a decision for this file to make out loud.
+    if len(children) > 1 and case.get("pool"):
+        raise ToolError(
+            f"case {case['name']!r}: a case with two children cannot also ask "
+            f"for a pool — the second child's destination region and the pool "
+            f"share a base (see hal/*/user/child2.ld)")
     rows = []
     for i, _pkg in enumerate(children):
         rows.append((f"child {i}'s image blob (linker-resolved)",

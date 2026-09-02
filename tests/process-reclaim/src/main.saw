@@ -12,11 +12,19 @@
 //   SOS reclaim: done
 //
 // **`refused_before=1` IS THE HALF THAT IS EASY TO LOSE.** With the child dead
-// but root still holding its Process handle, a second create must be refused —
-// `MAX_PROCESSES` is two and the dead slot is `Gone`, not `Free`, because the §8
+// but root still holding its Process handle, a create with the table otherwise
+// full must be refused — the dead slot is `Gone`, not `Free`, because the §8
 // status word in it still has a possible reader. That refusal is the behaviour
 // unit 2 shipped, and asserting it here is what stops this case from passing on
 // a kernel that simply reclaimed slots eagerly and lost the supervision story.
+//
+// **"THE TABLE OTHERWISE FULL" IS NOW A THING THIS CASE HAS TO ARRANGE**
+// (sawos design 21, M4 unit 5): `MAX_PROCESSES` is THREE since driver-as-
+// service, so root plus a dead child leaves a slot free and the refusal would
+// simply not happen. The case creates one unstarted FILLER process to spend it.
+// That is the shape every `MAX_PROCESSES` bump will want here, and it is why
+// the proof is written against "the table is full" rather than against a
+// number.
 //
 // **`reclaimed_after=1` IS THE UNIT.** Root drops the child's handle — no method
 // call, just a value going out of scope, which is what `NoCopy` + `deinit` makes
@@ -132,11 +140,30 @@ func _start(boot_handle: UInt) {
         return
     }
 
+    // **THE FILLER, AND IT EXISTS BECAUSE M4 UNIT 5 RAISED `MAX_PROCESSES` TO
+    // THREE** (sawos design 21, user-ruled Sep 2). This case's claim is about a
+    // `Gone` slot being unavailable while a reader can still name it, and that
+    // claim is only observable when the table has NOTHING ELSE to give — so the
+    // proof needs as many live processes as the bump added. One create, never
+    // started, occupying the slot the third process would otherwise take.
+    //
+    // It is the same image into the same RAM as the child that has already
+    // died, which is the reason those two regions were taken into locals in the
+    // first place: the first child's remains are nothing the kernel tracks.
+    // Nothing runs in this process — a created-and-unstarted slot holds a
+    // domain and no thread, which is exactly the resource this case is about.
+    let filler = try system.process_create(image: &image_mem,
+                                           memory: &dest_mem) catch {
+        print("SOS reclaim: filler create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
     // BEFORE THE RELEASE: the slot is `Gone`, not `Free`, because root's handle
-    // onto it keeps the §8 status word readable. `MAX_PROCESSES` is two and root
-    // is one of them, so this create has nowhere to go and is refused with a
-    // STATUS — the caller could not have known the table was full, which is what
-    // keeps this out of the faults ruling.
+    // onto it keeps the §8 status word readable. With root, the filler and the
+    // dead child's slot there is nowhere for this create to go, so it is refused
+    // with a STATUS — the caller could not have known the table was full, which
+    // is what keeps this out of the faults ruling.
     let refused_before = match system.process_create(image: &image_mem,
                                                      memory: &dest_mem) {
         case Ok(_) -> false,
@@ -158,6 +185,11 @@ func _start(boot_handle: UInt) {
 
     print("SOS reclaim: refused_before={} reclaimed_after={}\n",
           flag(refused_before), flag(reclaimed_after))
+    // **THE FILLER'S HANDLE IS KEPT TO THE END ON PURPOSE.** Releasing it would
+    // leave a `Created` slot nothing names — and `reclaim_process_slot` frees
+    // only `Gone` slots, because a slot that never ran has no §8 status word to
+    // decide readability by. Holding the handle is what keeps this case's own
+    // arithmetic honest and does not provoke a state no unit has ruled on.
     print("SOS reclaim: done\n")
     let _ = proc.exit(EXIT_OK)
 }
