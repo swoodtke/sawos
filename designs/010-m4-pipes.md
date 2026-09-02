@@ -295,6 +295,25 @@ standing tail); the IOMMU driver (death-notification consumer 2).
    receive**, transferred exactly at rendezvous — the ledger never
    has an in-flight limbo state, and an abandoned send unwinds with
    nothing leaked (the ratified no-orphans rule made mechanical).
+   **RE-RULED (user, Sep 2, at unit 4's review): TAKE-AT-POST.** The
+   staged entries LEAVE the sender at post: the staged message holds
+   KERNEL references (typed refs in the ring note — the entry words
+   die with the unbind), the sender's quota charge is WRITTEN OFF at
+   post (D-4's orphan vocabulary, bounded by PIPE_INFLIGHT x
+   PIPE_MSG_HANDLES per connection, so quota <= wall holds), and the
+   taker is charged at the rendezvous mint exactly as before. What
+   re-opened the Aug-30 ruling: ruling 10's orphan accounting and
+   design 260's move-at-post typed semantics both post-date it and
+   eroded its rationale — the landed sender-keeps model contradicted
+   the typed tier's own move story, and a fire-and-forget CAPABILITY
+   send raced the sender's exit (unit 4 finding 5). Under
+   take-at-post the capability survives the sender unconditionally —
+   the hazard becomes a GUARANTEE; staleness-None dies (a receiver
+   sees None only for genuinely-empty slots); send-revocation-by-
+   release is knowingly given up. The unwind arms (outlet-death
+   staged-drop; the atomic delivery refusal keeps the message staged
+   unchanged) RELEASE the held references, with the cascade census
+   that new unref sites owe.
 6. **RULED: body 128 bytes, 4 handles per message, in-flight
    messages per client 2 × MAX_THREADS — all BUILD DEFINES** (named
    statics in `kcore.limits`, the tree's build-define mechanism, so

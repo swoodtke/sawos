@@ -91,3 +91,21 @@ stats region (design 16's seed — wants tier-aware mapping); the
 MAX_PROCESSES/PMP-budget question unit 5 forces; design 11's pending
 §11 rescope. The M5 sketch takes all of these plus this document as
 its agenda.
+
+## Addenda (Sep 2, at unit-4 integration)
+
+- **The toolchain is local and verified** (memory:
+  espressif-qemu-tools.md): Espressif QEMU 9.2.2 with the `esp32c3`
+  machine (riscv32) and `qemu-system-xtensa`; esp-clang 20.1.1 with
+  riscv32 (its DEFAULT triple) and xtensa targets — so an ESP32-S3
+  sawc target is `--target` + this clang + a HAL port (start call0
+  ABI), NOT a new backend. The P4 has NO QEMU machine yet: the C3 is
+  the family proxy (design 20), the P4 a later board variant.
+- **XIP is the family's execution model**: all ESP32 variants run
+  cached XIP from SPI flash (IRAM for hot paths; S2/S3 can fetch from
+  PSRAM). Consequences: the code-size tax lands on FLASH, not SRAM
+  (the lazy-decode trigger recedes further); W^X for text is enforced
+  by construction; and the sosimg loader wants an XIP placement mode
+  (text-in-place at the flash-mapped address, data/bss copied to
+  SRAM) — a P4/C3-port consideration, filed here so it is not
+  discovered late.

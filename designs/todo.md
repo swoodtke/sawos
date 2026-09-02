@@ -21,77 +21,17 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
-- 1. M4 unit 4 — rendezvous + delivery-as-take [#10 rulings 5/11(d) +
-  the keep-mask rider; design 18 to author]. THE PIN-BUMP DEPENDENCY IS
-  DISCHARGED (Sep 2): the fourth bump landed `consumes` (sawlang 0.4.0 @
-  `46eebb36`) and SL-16's conversion sweep closed with it, so the
-  consuming surfaces are FINAL and unit 4's brief writes them as they
-  now read — `(move request).reply(...)` and
-  `(move request).reply_wait(...)` consume; `claim.resolve(...)` does
-  not, by the argued exception in SL-16's closure. The APIs are
-  complete; the ladder continues.
-  **CLOSED Sep 2 (design 18 authored, §API user-reviewed, AMENDED at the
-  implementing agent's STOP, and built; As-built in the brief).** What
-  landed: handles in messages on all four submission ops through
-  ARGUMENT RECORDS (six things do not fit three registers), with
-  `PIPE_MSG_HANDLES = 4` in `sosabi` beside `PIPE_BODY_BYTES`; ruling
-  5's rendezvous ledger — the staged word is a NOTE, the entry stays the
-  sender's, `move_entry` moves it at the take or the delivery with the
-  quota charge, and the batch is pre-flighted so a taker that cannot
-  afford it refuses ATOMICALLY; ruling 11(d)'s delivery-as-take under
-  its own `WaitTag.Message`, whose REFUSAL ARM (my design, argued in the
-  As-built) is a wake with a status and no record — revocation's own
-  shape — leaving the message staged and its level raised; the wait
-  record's final layout (3 header words, the PACKED meta of one length
-  byte plus four kind bytes, five handle words, then the body), which is
-  SMALLER than unit 3's despite gaining handles because the standalone
-  body-length word died; and agenda 7b's keep mask on `Give` AND on
-  `SystemOp.ProcessSelf`, the latter closing spec §9's recorded finding.
-  The decoded vocabulary moved to `sos.pipe`. Six new cases
-  (`pipe_stale_attach`, `pipe_table_full`, `pipe_handles`,
-  `pipe_delegate_msg`, `pipe_cq`, `give_keep_mask`), 105 → 111 per
-  architecture. MEASURED: the completion-queue server serves eight round
-  trips in 10 traps against `pipe-pingpong`'s 18, same client program —
-  ONE trap per message, the ladder complete. Riders done: the two
-  missing floor re-export seams, the `var`→`let` tidy in the touched
-  files, `MAX_PROCESSES` unchanged at 2 with the two-pipe topology
-  argued in the case header. TRANSCRIPT ACCOUNTING: 222/222 green on
-  both arches, five buckets and no row outside them — all 100 moved
-  image rows belong to packages that name the pipe or wait surface and
-  every package that names none of it is unchanged, which is the whole
-  argument; the growth is +26.7% / +22.6% and it is the TYPED message
-  value rather than the wire record, filed in BACKLOG with its
-  lazy-decode lever. Deviations and findings are in design 18's
-  As-built; SL-17 filed below; `Process`/`System` in messages is the
-  named follow-up, filed in BACKLOG.
-  **RE-RULED AND REWORKED ON THE BRANCH BEFORE MERGE (user, Sep 2, at lead
-  review): RULING 5 FLIPS TO TAKE-AT-POST.** A staged handle leaves the
-  sender at the POST — each entry unbound, its reference held by the
-  kernel in the ring note as a typed ref, the sender's quota row written
-  off — and is minted into the receiver at the take or the delivery. The
-  rationale, recorded because it post-dates the Aug-30 ruling: ruling
-  10's orphan accounting and design 260's move-at-post semantics eroded
-  it, sender-keeps contradicted the typed tier's own move story
-  (`post_with` CONSUMES the wrapper), and the unit's own finding 5 — a
-  fire-and-forget capability send racing the sender's exit — inverts into
-  a GUARANTEE. What that cost: the stale-revalidation path is deleted
-  (`None` in a slot means the sender left it empty and nothing else),
-  three unwind arms became RELEASES (with `pipe_drop_staged` moving to
-  `kcore.refs` and `exchange_settle` answering with its collected batch,
-  which is collect-then-free spelled across a module boundary), and ONE
-  refusal became terminal — a fused call's reply-handles are destroyed by
-  a full table, because its claim is a parked thread with no second
-  chance. `pipe-stale-attach` retargeted to **`pipe-send-exit`** (the
-  child posts a capability and exits; root parks on the death, takes, and
-  posts through what arrived — plus the sender's teardown count as the
-  write-off), and `pipe-handles`' ledger rows INVERT. **AND A SECOND
-  RULING THE SAME DAY: `WaitPayload`'s owning payloads are RESTORED** —
-  `Reply(outcome: ReplyDelivery)` and `Message(msg:, request:)`, with
-  extraction through a `consumes` accessor (`WaitResult.open`) and an
-  owned match; the optional-field design-around is gone and the type
-  proves what its docstring used to promise. Both re-rules are in design
-  18's As-built §13; SL-17's entry below carries both amendments
-
+- 1. the stub pass — pre-carve the shared files for the concurrent
+  pair [user-ruled Sep 2; lead's own, small, gated]: sos_runner
+  `--board` arg + empty marked esp32c3 section, Makefile smoke-target
+  stub, hal/riscv32-esp32c3/ placeholder (SIBLING-COPY rule: no
+  hal/riscv32 restructure — unit 5 owns it), CLAUDE.md non-gating
+  note, both queue entries below pre-written.
+- 2. design 20 — ESP32-C3 board HAL, SMOKE ONLY (bringup + memory
+  config; direct boot; RV32IMC no-A; non-gating, machine-local QEMU)
+  [to author; §API review to user]. CONCURRENT WITH:
+- 3. M4 unit 5 — the money shot [#10 agenda 7a; design 21 to author;
+  carries the MAX_PROCESSES/PMP-budget question to the user].
 ## [BACKLOG] — filed, not scheduled
 
 - `Process` and `System` in messages — a sysapi MODULE-SPLIT ruling
@@ -135,6 +75,12 @@ entry below or the brief that carries it, never restating either.
   ergonomics trade (a match on an optional field becomes a call then a
   match) is a taste question the lead should answer
 
+  **DISPOSITION (user, Sep 2): deliberately UNSCHEDULED** — the M5
+  namespace makes handle-receipt universal (open() answers
+  capabilities in messages), and XIP on ESP32-class parts lands the
+  code tax on flash, not SRAM. Revisit trigger: a genuinely
+  tight-SRAM tier target; if it fires, prefer sawc-side drop-glue
+  dedup BEFORE this API rewrite.
 - buffered `debug_print` — a length-taking form [#16 As-built finding,
   Sep 1]: today the seam traps once per BYTE, so a test's prose
   outweighs its object ops ~10:1 in the syscall column
