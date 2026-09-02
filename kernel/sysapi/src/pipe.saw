@@ -59,13 +59,18 @@ import sosabi.{SosStatus, PipeInletHandle, PipeInletOp, PipeOutletHandle,
                PipeOutletOp, PipeReplyHandle, PipeRequestHandle, MINT_OP,
                NO_HANDLE, PIPE_BODY_BYTES, PIPE_TAKE_RECORD_WORDS,
                PIPE_TAKE_LEN_WORD, PIPE_TAKE_REQUEST_WORD,
-               pipe_take_record_bytes}
+               PIPE_REPLY_WAIT_RECORD_WORDS, PIPE_REPLY_WAIT_WAITER_WORD,
+               PIPE_REPLY_WAIT_BODY_WORD, PIPE_REPLY_WAIT_LEN_WORD,
+               PipeMsg, ReplyWaitLeg, WaitBuffer, WaitResult, WaiterHandle,
+               WAIT_HEADER_WORDS,
+               pipe_reply_wait_record_bytes, pipe_take_record_bytes,
+               wait_record_bytes}
 
 import sos.floor.{ALL_RIGHTS, call_value, checked, polled_ok, polled_value,
-                  sos_handle_release, sos_pipe_inlet_post,
+                  sos_handle_release, sos_pipe_inlet_call, sos_pipe_inlet_post,
                   sos_pipe_outlet_take, sos_pipe_reply_resolve,
-                  sos_pipe_request_reply}
-import sos.waiter.{AttachMode, Waiter, mode_flag}
+                  sos_pipe_request_reply, sos_pipe_request_reply_wait}
+import sos.waiter.{AttachMode, Waiter, decode_wait, mode_flag}
 
 /// A handle to a PipeInlet — the CLIENT end of a connection, where requests flow
 /// IN (spec §2.1; the names are design 10 ruling 2's).
@@ -144,6 +149,48 @@ extension PipeInlet {
         post_body(self.handle, &body, len)
     }
 
+    /// **SEND A MESSAGE AND WAIT FOR ITS ANSWER — one trap, and §2.1's ratified
+    /// `send` arriving at last** (sawos design 17, on design 10 ruling 4's
+    /// Aug-31 rider). Requires `PipeInletRight.Post`, the same bit `post`
+    /// spends.
+    ///
+    /// **IT IS THE FUSED `Call`, AND THAT IS WHY IT IS A METHOD AT ALL.** Unit
+    /// 3 landed a library `send` written over post + attach + wait and the user
+    /// struck it at review, for a reason this method is the other half of: a
+    /// wrapper TYPE freezes a shape that cannot later be refactored into a
+    /// simple kernel call. This one IS the simple kernel call — one op, no
+    /// Waiter, no attachment, no claim handle — so there is nothing to freeze
+    /// and nothing to refactor into later.
+    ///
+    /// **NOTHING IS MINTED, AND THAT IS THE POINT.** A fused call's claim is
+    /// kernel-internal and tied to this thread, so a blocking client holds no
+    /// `PipeReply` at all: no table row, no quota, no RAII to get right. Design
+    /// 14 finding 5 named this as the answer for a client whose `MAX_HANDLES`
+    /// bounded its in-flight depth before its ring did.
+    ///
+    /// **IT BLOCKS, AND A FULL RING BLOCKS TOO** — never `WouldBlock`. The
+    /// caller parks on the connection's room-to-post level and resumes when an
+    /// exchange settles, so backpressure is a wait rather than a poll loop
+    /// (`designs/010` ruling 8, reached from inside the op).
+    ///
+    /// **THERE IS NO TIMEOUT ARGUMENT AND THERE WILL NOT BE ONE HERE** (ruling
+    /// 4): the kernel does not know what a timeout is. A caller that needs a
+    /// deadline composes `post` + `add(reply:)` + a Timer on one Waiter, which
+    /// is what `tests/pipe-send-manual` writes out.
+    ///
+    /// `len` may be ZERO — a data-free message is §2.1's own option. A `len`
+    /// above `PIPE_BODY_BYTES` TERMINATES the caller, exactly as at a post.
+    ///
+    /// `Err(SosStatus.PeerClosed)` is `resolve`'s own convention and covers
+    /// every way an answer can fail to arrive: the server end was already gone,
+    /// the server dropped the obligation, or the server end went while this
+    /// thread was parked. It is terminal for THIS exchange; whether the
+    /// connection has a future is what a later call finds out.
+    public func send(&self, body: &[UInt8; PIPE_BODY_BYTES],
+                     len: UInt) -> Result<PipeMsg, SosStatus> {
+        call_body(self.handle, &body, len)
+    }
+
     /// **MINT A SIBLING of this inlet, narrowed by a KEEP MASK** — the universal
     /// `MINT_OP`, on `Memory.mint`'s exact terms. Requires the universal
     /// `PipeInletRight.Mint` on THIS handle.
@@ -190,6 +237,30 @@ func post_body(handle: PipeInletHandle, body: &[UInt8; PIPE_BODY_BYTES],
     guard let staged = word else { return None }
     let claim: PipeReply? = PipeReply(handle: PipeReplyHandle(staged))
     return move claim
+}
+
+/// The `unsafe` half of `PipeInlet.send`, confined to one small named helper
+/// (design 136). Neither address leaves it.
+///
+/// **THE REPLY BUFFER IS THIS FRAME'S**, exactly as `Waiter.wait`'s record
+/// buffer is and for the same reason: the kernel answers into the caller's own
+/// memory, so somebody has to supply the bytes, and supplying them here is what
+/// keeps a raw address out of the typed surface. It is a whole slot wide
+/// because a caller cannot size a buffer against a length it has not been told
+/// yet — the published-minimum rule, one more time.
+///
+/// There is no `polled_value` here and there could not be: a fused call has no
+/// would-block outcome to keep out of the error channel, which is the whole
+/// difference between this and `post` beside it.
+func call_body(handle: PipeInletHandle, body: &[UInt8; PIPE_BODY_BYTES],
+               len: UInt) unsafe -> Result<PipeMsg, SosStatus> {
+    var reply: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var value: UInt = 0
+    let raw = sos_pipe_inlet_call(handle, (&body) as UnsafePointer<UInt8>, len,
+                                  (&var reply) as UnsafePointer<UInt8>,
+                                  (&var value) as UnsafePointer<UInt>)
+    try checked(raw)
+    return PipeMsg(len: value, bytes: reply)
 }
 
 /// A handle to a PipeOutlet — the SERVER end of a connection, where requests
@@ -462,6 +533,52 @@ extension PipeRequest {
         reply_body(&var self, &body, len)
     }
 
+    /// **SEND THE REPLY AND WAIT FOR THE NEXT THING — one trap** (sawos design
+    /// 17; design 10 ruling 4's rider as amended Sep 1). Requires
+    /// `PipeRequestRight.Reply` here and `WaiterRight.Wait` on `waiter`.
+    ///
+    /// **A REPLY WITH A BUILT-IN WAIT, WHICH IS WHY IT LIVES ON THE REQUEST**
+    /// (user-ruled, Sep 1): the reply is the primary act and it is what consumes
+    /// this capability, so the op belongs to the object being consumed and the
+    /// wait is the fused tail. It halves the steady-state server loop — one trap
+    /// per message instead of a `reply` and a `wait` — and it is the exact
+    /// mirror of `PipeInlet.send` on the client side.
+    ///
+    /// **THE WAITER IS REQUIRED, AND THERE IS NO DEGENERATE FORM.** The FIRST
+    /// turn of a server loop is `waiter.wait()`, which already exists;
+    /// reply-without-wait is `reply()`, which already exists; and the recovery
+    /// from a dead client is that same first turn. An optional waiter would
+    /// change the return type on a runtime value, which is the shape
+    /// `designs/010` ruling 4 and ruling 11(c) both refused.
+    ///
+    /// **THE ERROR NAMES ITS LEG, and `Wait(_)` MEANS THE REPLY LANDED**
+    /// (user-ruled, Sep 1). `Err(Reply(s))` is a reply that did not land — the
+    /// client abandoned its claim — and the op returned WITHOUT PARKING, so one
+    /// dead client can never stall the loop; the caller recovers by waiting
+    /// afresh. `Err(Wait(s))` is an exchange that completed and a wait that
+    /// broke (`SosStatus.Revoked` is the one that exists today).
+    ///
+    /// **THE OBLIGATION IS DISCHARGED ON EVERY PATH**, §2.1's ratified sentence:
+    /// this value disarms itself before the trap, exactly as `reply` does, so
+    /// reaching for it again is the ordinary `BadHandle` fault design 3's
+    /// generations exist to draw.
+    ///
+    /// The loop it is written for:
+    ///
+    /// ```saw
+    /// var wake = try waiter.wait() catch { return }
+    /// while serving {
+    ///     var request = decode(move wake)
+    ///     let n = handle(&var out)
+    ///     wake = try request.reply_wait(body: &out, len: n, waiter: &waiter)
+    ///           catch { ... }
+    /// }
+    /// ```
+    public func reply_wait(&var self, body: &[UInt8; PIPE_BODY_BYTES], len: UInt,
+                           waiter: &Waiter) -> Result<WaitResult, ReplyWaitError> {
+        reply_wait_body(&var self, &body, len, waiter.handle)
+    }
+
     /// **MINT A SIBLING of this obligation, narrowed by a KEEP MASK.** Everything
     /// `PipeReply.mint` says holds here with `Reply` in `Resolve`'s place: one
     /// reply may be written however many names the obligation has, and the sibling
@@ -487,6 +604,112 @@ func reply_body(request: &var PipeRequest, body: &[UInt8; PIPE_BODY_BYTES],
     request.handle = PipeRequestHandle(NO_HANDLE)
     return checked(sos_pipe_request_reply(word,
                                           (&body) as UnsafePointer<UInt8>, len))
+}
+
+/// **WHICH HALF OF A `reply_wait` FAILED** (sawos design 17; user-ruled Sep 1 as
+/// the leg-tagged error).
+///
+/// A design-234 tier-2 domain enum: two cases that CARRY the leaf status rather
+/// than restating its vocabulary, because the thing a caller needs to know is
+/// not a new failure mode but WHICH OF TWO OPS produced a familiar one. There is
+/// no `TimedOut`, no `Alloc` and no catch-all, because this domain cannot
+/// produce them.
+///
+/// **`Wait` MEANS THE REPLY LANDED**, which is the whole reason the two cases
+/// exist. A server loop reads them as two different instructions: `Reply` says
+/// this client is gone, recover by waiting afresh; `Wait` says the exchange
+/// completed and the WAITER is what broke, which is not something waiting again
+/// can fix.
+public enum ReplyWaitError {
+    /// The reply did not land — the client abandoned its claim. The obligation
+    /// is discharged all the same and NOTHING PARKED, so the loop's next act is
+    /// its own `waiter.wait()`.
+    case Reply(status: SosStatus),
+    /// The reply LANDED and the wait that followed it did not.
+    /// `SosStatus.Revoked` is the one this can be today: the Waiter's last
+    /// handle went while this thread was parked on it.
+    case Wait(status: SosStatus),
+}
+
+extension ReplyWaitError {
+    /// Which leg, in words. The status renders itself.
+    public func describe(&self) -> String {
+        match self {
+            case Reply(_) -> "the reply did not land",
+            case Wait(_) -> "the reply landed and the wait failed",
+        }
+    }
+}
+
+extension ReplyWaitError: Printable {
+    /// Written out of `append` calls rather than interpolation, which is what
+    /// keeps it alloc-free and therefore usable from a freestanding process
+    /// (design 135/137). The status forwards to its own `format`.
+    func format(&self, into: &var StringBuilder) {
+        try! into.append(self.describe())
+        try! into.append(": ")
+        match self {
+            case Reply(status) -> { status.format(into: &var into) },
+            case Wait(status) -> { status.format(into: &var into) },
+        }
+    }
+}
+
+extension ReplyWaitError: Error {}
+
+/// The `unsafe` half of `PipeRequest.reply_wait`, confined to one small named
+/// helper (design 136). Three addresses cross here and none of them leaves.
+///
+/// **DISARM BEFORE THE SYSCALL**, the transfer-funnel contract verbatim and for
+/// `reply_body`'s exact reason: a reply-wait discharges the obligation on every
+/// answer it can give, and its only other outcome is a fault that ends the
+/// process.
+///
+/// **THE SMALL ARGUMENTS TRAVEL IN A RECORD AND THE BODY DOES NOT.** §5.7 gives
+/// an op three argument registers and this one has four things to say, so the
+/// waiter, the body's ADDRESS and its length ride the copy-in funnel
+/// `Timer.arm` opened while the wait buffer keeps the register that is left.
+/// Putting the body itself in the record would have made every call copy
+/// `PIPE_BODY_BYTES` in userspace before the trap, which is a cost the fused
+/// path exists to avoid.
+func reply_wait_body(request: &var PipeRequest, body: &[UInt8; PIPE_BODY_BYTES],
+                     len: UInt,
+                     waiter: WaiterHandle) unsafe -> Result<WaitResult, ReplyWaitError> {
+    let word: UInt = request.handle
+    request.handle = PipeRequestHandle(NO_HANDLE)
+
+    var args: [UInt; PIPE_REPLY_WAIT_RECORD_WORDS] = [0; PIPE_REPLY_WAIT_RECORD_WORDS]
+    args[PIPE_REPLY_WAIT_WAITER_WORD] = waiter
+    args[PIPE_REPLY_WAIT_BODY_WORD] = ((&body) as UnsafePointer<UInt8>) as UInt
+    args[PIPE_REPLY_WAIT_LEN_WORD] = len
+    var buf = WaitBuffer(header: [0; WAIT_HEADER_WORDS],
+                         body: [0; PIPE_BODY_BYTES])
+    var leg: UInt = 0
+    let raw = sos_pipe_request_reply_wait(word,
+                                          (&var args) as UnsafePointer<UInt>,
+                                          pipe_reply_wait_record_bytes() as UInt,
+                                          (&var buf.header) as UnsafePointer<UInt>,
+                                          (&var leg) as UnsafePointer<UInt>)
+    try checked(raw) catch { return leg_error(error, leg) }
+    return decode_wait(&buf)
+}
+
+/// Pair a status with the leg the kernel stamped beside it.
+///
+/// AN UNKNOWN LEG PANICS, on `decode_wait`'s exact terms: the kernel wrote it
+/// out of the same `ReplyWaitLeg` declaration this function reads, so a value
+/// that does not decode is a kernel/`sos` skew rather than data from an
+/// untrusted source, and the never-hide rule says a bug the caller cannot act on
+/// should stop the program where it happened.
+func leg_error(status: SosStatus, leg: UInt) -> ReplyWaitError {
+    guard let which = ReplyWaitLeg.from(raw: leg) else {
+        panic("sos: kernel wrote reply-wait leg {}, which this build cannot name",
+              leg)
+    }
+    match which {
+        case Reply -> ReplyWaitError.Reply(status: status),
+        case Wait -> ReplyWaitError.Wait(status: status),
+    }
 }
 
 // =============================================================================

@@ -78,6 +78,9 @@ import sosabi.{
     pipe_create_record_bytes,
     PIPE_TAKE_RECORD_WORDS,
     pipe_take_record_bytes,
+    PIPE_REPLY_WAIT_RECORD_WORDS,
+    pipe_reply_wait_record_bytes,
+    ReplyWaitLeg,
     PROCESS_STATS_RECORD_DOUBLEWORDS,
     process_stats_record_bytes,
     SosStatus,
@@ -125,6 +128,7 @@ import kcore.result.{
     op_blocked,
     op_ok,
     op_status,
+    op_status_value,
     op_value,
     write_result,
 }
@@ -148,6 +152,7 @@ import kcore.objects.{
     NO_ROW,
     NO_EXCHANGE,
     PIPES,
+    PIPE_CALLER,
     PIPE_EX_STATE,
     PIPE_LENS,
     PIPE_REPLY_REFS,
@@ -194,9 +199,9 @@ import kcore.objects.{
     unbind_handle,
 }
 import kcore.diag.{fatal_kernel}
-import kcore.refs.{deliver_attachment, notify_if_ready, notify_ready,
-                   ref_object, ref_waitable, signal_event, unref_object,
-                   unref_waitable, wake_one_waiter}
+import kcore.refs.{deliver_attachment, notify_claim, notify_if_ready,
+                   notify_ready, ref_object, ref_waitable, signal_event,
+                   unref_object, unref_waitable, wake_one_waiter}
 import kcore.threads.{
     CURRENT_THREAD,
     NEED_RESCHED,
@@ -234,6 +239,8 @@ import kcore.waitables.{
     alloc_interrupt,
     alloc_waiter,
     attached_by_key,
+    block_on_call_reply,
+    block_on_call_room,
     block_on_wait,
     detach_attachment,
     interrupt_by_line,
@@ -247,6 +254,7 @@ import kcore.process.{
     ProcessState,
     alloc_process,
     copy_in,
+    copy_in_check,
     copy_out,
     copy_out_check,
     domain_changed,
@@ -886,7 +894,9 @@ func process_start(caller: Int, child: Int,
                    PROCESSES[child].stack_top, boot_word)
     THREADS[slot] = ThreadSlot(state: ThreadState.Runnable, process: child,
                                exit_code: 0,
-                               joiners: 0, link: 0, wait_buf: 0)
+                               joiners: 0, link: 0, wait_buf: 0,
+                               call_pipe: 0, call_claim: 0, call_src: 0,
+                               call_len: 0)
     quota_charge(child, QuotaKind.Thread)
     ready_push(slot)
     PROCESSES[child].state = ProcessState.Running
@@ -1322,7 +1332,9 @@ func thread_create(p: Int, entry: UInt, stack_top: UInt, arg: UInt) unsafe -> Sy
     hal.frame_init(frame_slot(slot), start, stack_top, arg)
     THREADS[slot] = ThreadSlot(state: ThreadState.Created, process: p,
                                exit_code: 0,
-                               joiners: 0, link: 0, wait_buf: 0)
+                               joiners: 0, link: 0, wait_buf: 0,
+                               call_pipe: 0, call_claim: 0, call_src: 0,
+                               call_len: 0)
     quota_charge(p, QuotaKind.Thread)
     op_value(handle)
 }
@@ -2811,22 +2823,37 @@ func pipe_create(owner: Int, caller: Int, dst: UInt, cap: UInt) unsafe -> Syscal
     op_ok()
 }
 
-/// The PipeInlet's ops (spec §2.1; sawos design 13 D-2).
+/// The PipeInlet's ops (spec §2.1; sawos design 13 D-2, grown a second op by
+/// sawos design 17).
 func pipe_inlet_op(raw_op: UInt, obj: &PipeInletObject, arg0: UInt,
-                   arg1: UInt) unsafe -> SyscallResult {
+                   arg1: UInt, arg2: UInt) unsafe -> SyscallResult {
     let p = calling_process()
     guard let op = PipeInletOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
-    return pipe_inlet_op_decoded(op, &obj, arg0, arg1, p)
+    return pipe_inlet_op_decoded(op, &obj, arg0, arg1, arg2, p)
 }
 
 func pipe_inlet_op_decoded(op: PipeInletOp, obj: &PipeInletObject, arg0: UInt,
-                           arg1: UInt, p: Int) unsafe -> SyscallResult {
+                           arg1: UInt, arg2: UInt, p: Int) unsafe -> SyscallResult {
     match op {
         case Post -> {
             if not obj.allows(PipeInletRight.Post) {
                 fault_process(p, FaultReason.AccessDenied)
             }
             pipe_post(p, obj.slot, arg0, arg1)
+        },
+        // **THE SAME BIT GATES BOTH, AND THAT IS THE RULING RATHER THAN A
+        // SHORTCUT** (design 10 ruling 4's rider; sawos design 17's reviewed
+        // §API). A `Call` submits a message exactly as a `post` does — same
+        // ring, same body maximum, same peer-gone answer — and the fusion is
+        // MECHANICS, not authority: what it adds is a park, and the park needs
+        // no `Wait` right because no Waiter is involved. A second bit would
+        // let a launcher hand out an endpoint that may post and may not do the
+        // cheap thing, which is a distinction with no security content.
+        case Call -> {
+            if not obj.allows(PipeInletRight.Post) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            pipe_call(p, obj.slot, arg0, arg1, arg2)
         },
     }
 }
@@ -2927,6 +2954,94 @@ func pipe_post(p: Int, slot: Int, src: UInt, len: UInt) unsafe -> SyscallResult 
     // the readiness.
     notify_ready(WaitableKind.PipeOutlet, slot)
     op_value(claim)
+}
+
+/// **POST, PARK, AND RESOLVE BEHIND ONE TRAP** — the fused client path (design
+/// 10 ruling 4's Aug-31 rider; sawos design 17).
+///
+/// **IT IS `pipe_post` PLUS A PARK, AND EVERY RULE THE COMPOSED PATH OBEYS
+/// APPLIES VERBATIM** — the rider's own sentence, and the reason this function
+/// is short: a fused op is the composition run without returning to userspace,
+/// so it asks `pipe_post`'s questions in `pipe_post`'s order, stages through
+/// `pipe_post`'s door, and then does what a client would have done next.
+///
+/// THE THREE DIFFERENCES, all of them consequences of not returning:
+///
+///   - **NO CLAIM IS MINTED.** The exchange's reply column starts at one for the
+///     PARKED THREAD, not for a handle entry, so a fused RPC spends no table row
+///     and no handle traffic at all — which is what design 14 finding 5 named
+///     as the answer for a client that meets `MAX_HANDLES` before it meets the
+///     ring. `PIPE_CALLER` is the tie; `kcore.refs`' one wake arm is what reads
+///     it.
+///   - **A FULL RING PARKS RATHER THAN ANSWERING `WouldBlock`** (ruling 8's
+///     level, reached from inside). `post` had to surface the refusal because it
+///     never suspends; this op does, so it waits for the room a settle makes,
+///     which is exactly what the composed send's room leg does with two more
+///     traps.
+///   - **THE BUFFERS ARE CHECKED BEFORE ANYTHING IS STAGED, BOTH OF THEM.** The
+///     reply lands from another thread's context and the request body may be
+///     copied from one, so each address is validated here — while the caller is
+///     the running process and a refusal can still terminate it, which is
+///     `Waiter.Wait`'s own rule reaching a second door (`copy_in_check`).
+///
+/// The reply buffer takes no capacity argument, on `pipe_take`'s precedent
+/// (design 14 deviation 1): the three argument registers are spent, so the
+/// buffer is checked against `PIPE_BODY_BYTES` of the caller's REAL memory,
+/// which is stricter than a number the caller types.
+func pipe_call(p: Int, slot: Int, src: UInt, len: UInt,
+               reply_dst: UInt) unsafe -> SyscallResult {
+    if len > (PIPE_BODY_BYTES as UInt) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    if let why = copy_out_check(p, reply_dst, PIPE_BODY_BYTES as UInt) {
+        fault_process(p, why)
+    }
+    // A ZERO-LENGTH CALL READS NO BUFFER AT ALL, exactly as a zero-length post
+    // does: there is nothing to copy, so no address is touched and none is
+    // validated. A caller with no data has no buffer to name.
+    if len != 0 {
+        if let why = copy_in_check(p, src, len) {
+            fault_process(p, why)
+        }
+    }
+    // AN OP THAT PARKS NEEDS A THREAD TO PARK, and the harness kernels that
+    // enter user mode with no object model have none — `waiter_wait`'s own
+    // guard, for its own reason.
+    if CURRENT_THREAD == NO_THREAD {
+        fault_process(p, FaultReason.BadState)
+    }
+
+    if PIPES[slot].outlet_refs == 0 {
+        return op_status(SosStatus.PeerClosed)
+    }
+    let x = alloc_exchange(slot)
+    if x == NO_EXCHANGE {
+        block_on_call_room(CURRENT_THREAD, slot, src, len, reply_dst)
+        return op_blocked()
+    }
+    if len != 0 {
+        if let why = copy_in(p, exchange_body_addr(x), src, len) {
+            // UNREACHABLE: the same source passed `copy_in_check` above and a
+            // process's granted region is fixed for its life. Written rather
+            // than assumed, which is what the door's `FaultReason?` is for.
+            fault_process(p, why)
+        }
+    }
+    PIPE_LENS[x] = len as UInt16
+    // **ONE COLUMN AT ONE FOR A THREAD RATHER THAN FOR A HANDLE**, which is the
+    // only line in this function that is not `pipe_post`'s. The asymmetry with
+    // the request column is unchanged and means what it means there: the claim
+    // exists from the call, the obligation does not exist until somebody takes.
+    PIPE_REPLY_REFS[x] = 1
+    PIPE_REQUEST_REFS[x] = 0
+    PIPE_EX_STATE[x] = ExchangeState.Staged
+    stage_push(slot, x)
+    // PARK BEFORE NOTIFYING, so a server woken by the staging can never find
+    // this thread runnable with its answer already owed. The wake only queues,
+    // so the order costs nothing and buys the invariant.
+    block_on_call_reply(CURRENT_THREAD, x, reply_dst)
+    notify_ready(WaitableKind.PipeOutlet, slot)
+    op_blocked()
 }
 
 /// The PipeOutlet's ops (spec §2.1; sawos design 13 D-2, grown by design 14).
@@ -3179,22 +3294,37 @@ func pipe_resolve(p: Int, word: UInt, x: Int, dst: UInt,
     }
 }
 
-/// The PipeRequest's ops — the SERVER's obligation (spec §2.1; sawos design 14).
+/// The PipeRequest's ops — the SERVER's obligation (spec §2.1; sawos design 14,
+/// grown a second op by sawos design 17).
 func pipe_request_op(raw_op: UInt, obj: &PipeRequestObject, arg0: UInt,
-                     arg1: UInt) unsafe -> SyscallResult {
+                     arg1: UInt, arg2: UInt) unsafe -> SyscallResult {
     let p = calling_process()
     guard let op = PipeRequestOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
-    return pipe_request_op_decoded(op, &obj, arg0, arg1, p)
+    return pipe_request_op_decoded(op, &obj, arg0, arg1, arg2, p)
 }
 
 func pipe_request_op_decoded(op: PipeRequestOp, obj: &PipeRequestObject,
-                             arg0: UInt, arg1: UInt, p: Int) unsafe -> SyscallResult {
+                             arg0: UInt, arg1: UInt, arg2: UInt,
+                             p: Int) unsafe -> SyscallResult {
     match op {
         case Reply -> {
             if not obj.allows(PipeRequestRight.Reply) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            pipe_reply(p, obj.handle, obj.slot, arg0, arg1)
+            op_status(pipe_reply_status(p, obj.handle, obj.slot, arg0, arg1))
+        },
+        // **`Reply` GATES THE REPLY LEG AND THE WAITER GATES ITS OWN** (sawos
+        // design 17's reviewed §API): the op does two things, so it spends two
+        // rights on two objects — this bit here, and `WaiterRight.Wait` inside,
+        // read off the waiter handle the args record names. That is the same
+        // two-rights-two-objects shape `MemoryOp.Map` has, and for the same
+        // reason: holding an obligation must not imply authority over somebody
+        // else's Waiter.
+        case ReplyWait -> {
+            if not obj.allows(PipeRequestRight.Reply) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            pipe_reply_wait(p, obj.handle, obj.slot, arg0, arg1, arg2)
         },
     }
 }
@@ -3220,8 +3350,16 @@ func pipe_request_op_decoded(op: PipeRequestOp, obj: &PipeRequestObject,
 /// reply, which is the same fact the abandoned case reports. One reply may be
 /// written, however many names the obligation has — single-use is a property of
 /// the exchange, not of the handle.
-func pipe_reply(p: Int, word: UInt, x: Int, src: UInt,
-                len: UInt) unsafe -> SyscallResult {
+///
+/// **IT ANSWERS A `SosStatus` RATHER THAN A `SyscallResult` SINCE M4 UNIT 3.5**
+/// (sawos design 17), because it has two callers now and the second one has to
+/// look at the answer rather than return it: `PipeRequestOp.ReplyWait` runs this
+/// leg, and a failure there is reported with a LEG TAG in the value register and
+/// no park. `Reply` itself is `op_status` wrapped around it, which is
+/// byte-identical to what it returned before — `op_status(SosStatus.Ok)` and
+/// `op_ok()` are the same pair.
+func pipe_reply_status(p: Int, word: UInt, x: Int, src: UInt,
+                       len: UInt) unsafe -> SosStatus {
     if len > (PIPE_BODY_BYTES as UInt) {
         fault_process(p, FaultReason.BadArg)
     }
@@ -3233,7 +3371,7 @@ func pipe_reply(p: Int, word: UInt, x: Int, src: UInt,
                 // to copy it FOR — and the obligation is discharged, which is
                 // what settles the slot.
                 consume_entry(p, word, ObjType.PipeRequest, x)
-                return op_status(SosStatus.PeerClosed)
+                return SosStatus.PeerClosed
             }
             if len != 0 {
                 if let why = copy_in(p, exchange_body_addr(x), src, len) {
@@ -3255,13 +3393,19 @@ func pipe_reply(p: Int, word: UInt, x: Int, src: UInt,
             // the LAST name on the obligation, and a server holding a minted
             // sibling would then leave its client parked on an answer that had
             // already been written. Said once, at the site that knows.
-            notify_if_ready(WaitableKind.PipeReply, x)
+            //
+            // **AND IT GOES THROUGH `notify_claim` SINCE M4 UNIT 3.5** (sawos
+            // design 17): a claim is either a subscription's or a PARKED
+            // THREAD's, and that one function is the only place in the kernel
+            // that tells the two apart. A fused caller is woken from here with
+            // the bytes this line just wrote, inside its own syscall.
+            notify_claim(x)
             consume_entry(p, word, ObjType.PipeRequest, x)
-            op_ok()
+            SosStatus.Ok
         },
         case Replied -> {
             consume_entry(p, word, ObjType.PipeRequest, x)
-            op_status(SosStatus.PeerClosed)
+            SosStatus.PeerClosed
         },
         // A DELIVERED reply, discharged through somebody's wait. It is
         // `Replied`'s answer for `Replied`'s reason — there is no claim left
@@ -3270,7 +3414,7 @@ func pipe_reply(p: Int, word: UInt, x: Int, src: UInt,
         // which one happened.
         case Settled -> {
             consume_entry(p, word, ObjType.PipeRequest, x)
-            op_status(SosStatus.PeerClosed)
+            SosStatus.PeerClosed
         },
         // UNREACHABLE: an obligation is minted at the take, which is the same
         // moment the exchange leaves `Staged`, and a `Free` exchange has no
@@ -3278,13 +3422,127 @@ func pipe_reply(p: Int, word: UInt, x: Int, src: UInt,
         // for why each of these yields a status nothing reaches.
         case Staged -> {
             fatal_kernel("a pipe obligation named a staged exchange", x as UInt)
-            op_status(SosStatus.NoResource)
+            SosStatus.NoResource
         },
         case Free -> {
             fatal_kernel("a pipe obligation named a free exchange", x as UInt)
-            op_status(SosStatus.NoResource)
+            SosStatus.NoResource
         },
     }
+}
+
+/// The argument record `PipeRequest.ReplyWait` is handed, in kernel memory
+/// (sawos design 17). Declaration order IS the layout (design 58), pinned by the
+/// assert below against the word indices `sosabi` publishes — `TimerArmRecord`'s
+/// discipline, on the copy-IN side where it belongs.
+struct PipeReplyWaitRecord {
+    waiter: UInt,
+    body: UInt,
+    len: UInt,
+}
+
+static_assert(sizeof<PipeReplyWaitRecord>()
+              == PIPE_REPLY_WAIT_RECORD_WORDS * sizeof<UInt>(),
+              "a reply-wait record must be exactly the words sosabi publishes")
+
+/// Resolve a raw word as a WAITER this process may park on — the second half of
+/// `ReplyWait`'s authority.
+///
+/// `memory_arg`'s shape at a different kind and with a right to spend: the word
+/// arrives in an argument record rather than in the handle register, so the
+/// dispatch's §3 order has not run on it and this is where it does. A word that
+/// names nothing, or names something that is not a Waiter, is the ordinary
+/// `BadHandle` fault — the caller chose which handle to put in the record.
+func reply_wait_waiter(p: Int, handle: UInt) unsafe -> Int {
+    let entry = lookup_handle(p, handle)
+    match entry.obj_type {
+        case Waiter -> {
+            let w = WaiterObject(handle: WaiterHandle(handle),
+                                 rights: entry.rights, slot: entry.target)
+            if not w.allows(WaiterRight.Wait) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            w.slot
+        },
+        case Unbound -> fault_process(p, FaultReason.BadHandle),
+        case _ -> fault_process(p, FaultReason.BadHandle),
+    }
+}
+
+/// **DISCHARGE THE OBLIGATION, THEN PARK ON THE WAITER — BEHIND ONE TRAP**
+/// (design 10 ruling 4's rider as amended Sep 1; sawos design 17).
+///
+/// **IT IS `pipe_reply` FOLLOWED BY `waiter_wait`, AND NOTHING ELSE**, which is
+/// what the rider means by a fused op being the composition run without
+/// returning to userspace: both legs are the existing functions, in the existing
+/// order, and every rule either obeys applies verbatim. The steady-state server
+/// loop is one trap per message because of exactly that and nothing more.
+///
+/// **EVERY FAULT IS RAISED BEFORE THE OBLIGATION IS DISCHARGED**, which is this
+/// function's one real ordering decision. A bad args record, a waiter handle
+/// that names nothing or lacks `Wait`, an oversized body, a record buffer
+/// outside the caller's memory — all of them end the process, and all of them
+/// are asked while the request is still live, so a caller that faults leaves an
+/// exchange its client can still be told about rather than one discharged into
+/// a process that no longer exists.
+///
+/// **A REFUSED REPLY RETURNS WITHOUT PARKING** (user-ruled Sep 1, and the whole
+/// point of the leg tag): the request is CONSUMED either way — §2.1's ratified
+/// sentence, unchanged — but a `PeerClosed` comes straight back with
+/// `ReplyWaitLeg.Reply` in the value register, so one dead client can never
+/// stall a server loop. The recovery is the caller's own next `WaiterOp.Wait`,
+/// which is why the degenerate form this op does NOT have was not needed.
+func pipe_reply_wait(p: Int, word: UInt, x: Int, args_src: UInt,
+                     args_bytes: UInt, rec_dst: UInt) unsafe -> SyscallResult {
+    // EXACTLY the published size, `timer_arm`'s rule: the record is the whole
+    // argument list and a caller that hands over a different number of words has
+    // built something else.
+    if args_bytes != (pipe_reply_wait_record_bytes() as UInt) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    var args = PipeReplyWaitRecord(waiter: 0, body: 0, len: 0)
+    if let why = copy_in(p, ((&var args) as UnsafePointer<PipeReplyWaitRecord>) as UInt,
+                         args_src, args_bytes) {
+        fault_process(p, why)
+    }
+    if args.len > (PIPE_BODY_BYTES as UInt) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    let w = reply_wait_waiter(p, args.waiter)
+    // THE WAIT LEG'S BUFFER IS VALIDATED HERE, ON THE CALL, exactly as
+    // `waiter_wait` validates its own and for its reason: a bad buffer is the
+    // calling process's mistake and terminating it while it is the running
+    // process is both the better diagnostic and the simpler thing to reason
+    // about. Asking now also means the reply below cannot be discharged into a
+    // call that is about to fault. There is no capacity argument left to check
+    // it against, so the published size is the number the door is asked about —
+    // `pipe_take`'s body buffer, one op over.
+    if let why = copy_out_check(p, rec_dst, wait_record_bytes() as UInt) {
+        fault_process(p, why)
+    }
+
+    let answered = pipe_reply_status(p, word, x, args.body, args.len)
+    match answered {
+        case Ok -> {},
+        case _ -> {
+            return op_status_value(answered, ReplyWaitLeg.Reply as UInt)
+        },
+    }
+
+    // `waiter_wait`'s tail, verbatim: the scan first, because the
+    // level-triggered guarantee means a readiness that arrived before this call
+    // — including one this very reply just raised on a claim of ANOTHER
+    // connection — is still there, and only an empty set parks.
+    let ready = waiter_ready_attachment(w)
+    if ready != NO_ATTACHMENT {
+        deliver_attachment(p, rec_dst, ready)
+        return op_ok()
+    }
+    if CURRENT_THREAD == NO_THREAD {
+        fault_process(p, FaultReason.BadState)
+    }
+    block_on_wait(CURRENT_THREAD, w, rec_dst)
+    op_blocked()
 }
 
 /// **CONSUME THE CALLER'S ENTRY THROUGH THE OP** — the transfer-funnel contract
@@ -3446,7 +3704,7 @@ func dispatch(handle: UInt, op: UInt,
         case PipeInlet -> {
             let obj = PipeInletObject(handle: PipeInletHandle(handle),
                                       rights: entry.rights, slot: entry.target)
-            pipe_inlet_op(op, &obj, arg0, arg1)
+            pipe_inlet_op(op, &obj, arg0, arg1, arg2)
         },
         case PipeOutlet -> {
             let obj = PipeOutletObject(handle: PipeOutletHandle(handle),
@@ -3466,7 +3724,7 @@ func dispatch(handle: UInt, op: UInt,
         case PipeRequest -> {
             let obj = PipeRequestObject(handle: PipeRequestHandle(handle),
                                         rights: entry.rights, slot: entry.target)
-            pipe_request_op(op, &obj, arg0, arg1)
+            pipe_request_op(op, &obj, arg0, arg1, arg2)
         },
     }
 }

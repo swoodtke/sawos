@@ -25,15 +25,18 @@ import kcore.limits.{
     MAX_ATTACHMENTS,
     MAX_EVENTS,
     MAX_INTERRUPTS,
+    MAX_THREADS,
     MAX_WAITERS,
     NO_ATTACHMENT,
     NO_EVENT,
     NO_INTERRUPT,
+    NO_THREAD,
     NO_WAITER,
 }
 import kcore.objects.{
     ExchangeState,
     PIPES,
+    PIPE_CALLER,
     PIPE_EX_STATE,
     PIPE_LENS,
     PIPE_REPLY_ATTACH,
@@ -720,6 +723,102 @@ public(package) func block_on_wait(slot: Int, w: Int, dst: UInt) unsafe {
     THREADS[slot].link = WAITERS[w].blocked
     WAITERS[w].blocked = slot + 1
     NEED_RESCHED = true
+}
+
+// -----------------------------------------------------------------------------
+// THE FUSED CALL'S TWO PARKS (sawos design 17, M4 unit 3.5)
+// -----------------------------------------------------------------------------
+//
+// **NEITHER OF THEM PUTS THE THREAD ON A LIST, and that is the whole structural
+// difference from `block_on_wait` above.** A `Waiter.Wait` parks on an object
+// several threads may share, so the Waiter keeps a chain of them; a fused
+// `PipeInlet.Call` parks on something at most one thread can be waiting for —
+// the exchange it just staged — so the back pointer IS the list, of one, and it
+// lives in `PIPE_CALLER` where a settling reply already has the index.
+//
+// THE ROOM PARK IS THE ONE WITHOUT A BACK POINTER, and it is a SCAN at the wake
+// for a reason rather than an omission: several threads of one process may be
+// waiting for room on one connection at once, so the connection would need a
+// chain — and `ThreadSlot.link` is already spoken for by the ready queue the
+// resumed thread goes straight onto. A bounded walk of `MAX_THREADS` at the one
+// moment a ring stops being full is the cheaper answer, and it is the same
+// bounded-scan trade `alloc_thread`, `live_threads` and `ready_remove_process`
+// all take one file down.
+
+/// Park the running thread until connection `c` has room to stage — the fused
+/// `Call`'s FIRST park (design 10 ruling 8's level, reached from inside the op).
+///
+/// `src`/`len` are the message the caller has not staged yet, and `dst` is where
+/// its reply will go. Both addresses were validated at the call, while the
+/// caller was the running process.
+public(package) func block_on_call_room(slot: Int, c: Int, src: UInt, len: UInt,
+                                        dst: UInt) unsafe {
+    THREADS[slot].state = ThreadState.Blocked
+    THREADS[slot].wait_buf = dst
+    THREADS[slot].call_pipe = c + 1
+    THREADS[slot].call_claim = 0
+    THREADS[slot].call_src = src
+    THREADS[slot].call_len = len
+    NEED_RESCHED = true
+}
+
+/// Tie thread `slot` to exchange `x` and stop it — the fused `Call`'s SECOND
+/// park, and the one that holds the claim.
+///
+/// The caller has already taken the exchange's reply reference; this records the
+/// tie in BOTH directions and marks the thread blocked.
+///
+/// **IT DOES NOT ASK FOR A RESCHEDULE, and that is why it is split from
+/// `block_on_call_reply` below.** Two callers reach it: the op, which is the
+/// thread being parked and does want one, and the ROOM RESUME, which runs in
+/// whichever thread freed the slot and must not preempt itself for somebody
+/// else's park. The re-tie is the same act either way; only who is running
+/// differs, so the request for a switch belongs to the caller that is it.
+public(package) func tie_call_reply(slot: Int, x: Int, dst: UInt) unsafe {
+    THREADS[slot].state = ThreadState.Blocked
+    THREADS[slot].wait_buf = dst
+    THREADS[slot].call_pipe = 0
+    THREADS[slot].call_claim = x + 1
+    THREADS[slot].call_src = 0
+    THREADS[slot].call_len = 0
+    PIPE_CALLER[x] = slot + 1
+}
+
+/// The RUNNING thread's version: tie, and ask for the switch it now needs.
+public(package) func block_on_call_reply(slot: Int, x: Int, dst: UInt) unsafe {
+    tie_call_reply(slot, x, dst)
+    NEED_RESCHED = true
+}
+
+/// Forget everything about a thread's fused call — the state, both directions of
+/// the tie, and the buffer. It does NOT touch the reference the claim held; the
+/// three callers each own that decision.
+public(package) func clear_pending_call(slot: Int) unsafe {
+    if THREADS[slot].call_claim != 0 {
+        PIPE_CALLER[THREADS[slot].call_claim - 1] = 0
+    }
+    THREADS[slot].call_pipe = 0
+    THREADS[slot].call_claim = 0
+    THREADS[slot].call_src = 0
+    THREADS[slot].call_len = 0
+    THREADS[slot].wait_buf = 0
+}
+
+/// The thread waiting for ROOM on connection `c`, or `NO_THREAD`.
+///
+/// The scan the block above argues for. It answers the OLDEST-INDEXED waiter
+/// rather than the longest-waiting one, which is the same fairness the ready
+/// queue's own slot ordering has and is what a bounded table buys instead of a
+/// chain.
+public(package) func call_room_waiter(c: Int) unsafe -> Int {
+    var t: Int = 0
+    while t < MAX_THREADS {
+        if THREADS[t].call_pipe == c + 1 {
+            return t
+        }
+        t = t + 1
+    }
+    NO_THREAD
 }
 
 /// The attachment on `w` under `key`, or `NO_ATTACHMENT`.

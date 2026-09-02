@@ -1,0 +1,341 @@
+// SOS M4 unit 3.5: THE FUSED PATHS, COUNTED (sawos design 17; `designs/010`
+// ruling 4's Aug-31 rider, amended Sep 1).
+//
+// **THE LADDER'S PERFORMANCE CLAIM, AS A TRANSCRIPT ROW.** Ruling 4 said a
+// composed RPC is three traps where a fused call could be fewer, and said the
+// proof would be "a ping-pong case that COUNTS TRAPS". This is that case, and
+// design 16's `ProcessOp.Stats` is what lets the machine state the number
+// instead of a reader inferring it from kernel source.
+//
+//   SOS pingpong: served=8 last request b=7,80,73,78
+//   SOS pingpong: client traps=11 for 8 round trips
+//   SOS pingpong: server traps=18 for 8 messages
+//   SOS pingpong: per RPC client=1 server=2
+//
+// # THE TOPOLOGY, AND WHY IT IS THIS WAY ROUND
+//
+// **ROOT SERVES AND THE CHILD CLIENTS.** With `MAX_PROCESSES` at two the choice
+// is real, and three things decide it:
+//
+//   - **THE CLIENT'S WINDOW IS ITS WHOLE LIFE, so the client must be silent.**
+//     Every printed byte is one `ecall`, so an exactly-asserted count and a
+//     `print` cannot share a process. `child-pingpong` prints nothing and its
+//     launcher reads its columns through the handle that outlives it — design
+//     16's own arrangement, and the only one in which the CLIENT's per-RPC cost
+//     is a measured number rather than a claim.
+//   - **THE SERVER'S WINDOW HAS TO CLOSE BY ITSELF.** Root's loop ends when the
+//     child dies: the last inlet handle goes with it, the outlet's readable
+//     level turns terminal, and the wait root is already parked in delivers
+//     `PeerGone`. So the loop needs no counter to stop on, no timer and no
+//     sentinel message — the peer-gone doctrine terminates it, and that costs
+//     ZERO extra traps, which is what keeps the server's arithmetic clean.
+//   - Reversed, root would be the one running a counted `send` loop and the
+//     child would need a termination protocol root could not observe without
+//     printing inside its own window.
+//
+// # THE ARITHMETIC, STATED — every assertion here depends on it
+//
+// **A `stats()` CALL IS ITSELF A SYSCALL AND IS CHARGED BEFORE IT ANSWERS**
+// (design 16): `ktrap` counts at trap entry, ahead of the dispatch, so a delta
+// between two readings carries the second reading's own trap.
+//
+//     delta = (traps inside the window) + 1
+//
+// THE CLIENT, whose whole life is the window (its launcher reads the total):
+//
+//     process_self 1 + boot_handle_next 1 + ROUNDS sends + exit 1  =  ROUNDS + 3
+//
+// THE SERVER, bracketed around a print-free loop:
+//
+//     wait 1  +  ROUNDS x (take 1 + reply_wait 1)  +  the closing read 1
+//       =  2 x ROUNDS + 2
+//
+// **THE SERVER IS TWO TRAPS PER MESSAGE AND NOT ONE, AND THE SECOND ONE IS THE
+// `take`.** `reply_wait` fuses the reply and the next WAIT — the readable level
+// says "there is something", never "here it is" — so the take remains its own
+// op until `designs/010` ruling 11(d)'s delivery-as-take lands in unit 4. What
+// the fusion removed is exactly one trap per message: the composed loop is
+// wait + take + reply, THREE, and this one is take + reply_wait, TWO. The
+// client's saving is the bigger one and is the headline: post + attach + wait,
+// three, becomes `send`, ONE.
+//
+// # WHAT THE PAYLOAD PROVES
+//
+// Each round carries a SEQUENCE NUMBER both ways — request `[n, P, I, N]`,
+// reply `[n + 1, P, O, N]` — and the child refuses any answer whose number is
+// not its own plus one. So the transcript's `code=33` is not "eight replies
+// arrived": it is "eight replies arrived, each matching its own request, in
+// order". Root prints the LAST request's bytes, which is the same claim seen
+// from the other end of the connection.
+//
+// ONE PHASE PER FUNCTION, on design 14 finding 3's 16 KiB stack ceiling.
+
+import sos.{System, Process, ProcessStats, Waiter, WaitResult, WaitPayload,
+            PipeOutlet, PipeRequest, OutletLevel, ReplyWaitError, SosStatus,
+            SystemRight, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status the kernel can never hand this program, so meeting it in the error
+/// channel means an assertion in THIS file failed rather than a call did
+/// (`pipe_oneshot`'s vocabulary).
+static BUG: SosStatus = SosStatus.Revoked
+
+/// How many round trips. `child-pingpong` states the same number.
+static ROUNDS: Int = 8
+
+/// The message length both ways.
+static PAYLOAD_LEN: UInt = 4
+
+static BYTE_P: UInt8 = 80
+static BYTE_O: UInt8 = 79
+static BYTE_N: UInt8 = 78
+
+/// What the child's whole life costs: `process_self`, one `boot_handle_next`,
+/// `ROUNDS` sends, `exit`. Its source states the same sum from the other side.
+static CLIENT_SYSCALLS: UInt64 = 11
+
+static_assert(8 + 3 == 11,
+              "the client's total is its round trips plus its three bracket traps")
+
+/// What root's measured window costs: the opening `wait`, then a `take` and a
+/// `reply_wait` per message, plus the closing read's own trap.
+static SERVER_TRAPS: UInt64 = 18
+
+static_assert(1 + 2 * 8 + 1 == 18,
+              "the server's delta is one wait, two traps a message, and the read")
+
+/// The child's verdict when every round matched. `child-pingpong` picks it.
+static CHILD_MATCHED: UInt = 33
+
+/// `Exited`(1) << 16 | 33 — the §8 status word root requires of the child, so
+/// the wake could not have come from a fault or from a child that gave up.
+static CHILD_STATUS: UInt = 65569
+
+static_assert((1 * 65536) + 33 == 65569,
+              "the child's status word is Exited in the high bits and its code")
+
+/// The key root's outlet is attached under — a number that appears nowhere else
+/// in this transcript.
+static KEY_OUTLET: UInt = 71
+
+/// The tags root's two gives travel under. **THE INLET GOES FIRST**, which is
+/// the contract `child-pingpong` reads: the boot set is a FIFO, so giving the
+/// inlet first makes it record 0 and buys the child a `boot_handle_next` it
+/// would otherwise have to spend on the System record ahead of it.
+static TAG_INLET: UInt = 5
+static TAG_BOOT: UInt = 6
+
+/// What a child of this launcher may ask its System object for. `Transfer` is
+/// the bit `give` checks on the thing being given; everything else is absent BY
+/// SILENCE — and note what is NOT here: this child never prints, so it never
+/// needs `Debug`.
+static CHILD_SYSTEM: UInt32 = (SystemRight.ProcessSelf | SystemRight.Transfer)
+
+/// What one turn of the server loop answered, carried out of the measured
+/// window so the reporting can happen outside it.
+struct Served {
+    count: Int,
+    last0: UInt8,
+    last1: UInt8,
+    last2: UInt8,
+    last3: UInt8,
+    /// Root's own delta over the print-free serving window.
+    traps: UInt64,
+    /// The child's WHOLE syscall column, read after it died through the handle
+    /// root created it with — design 3 D-3 holds the slot open for exactly as
+    /// long as anything names it, which is what makes a dead process's cost
+    /// readable at all.
+    client: UInt64,
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS pingpong: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let done = try run(&system, &proc) catch {
+        print("SOS pingpong: server failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    if done.count != ROUNDS {
+        print("SOS pingpong: served={} wanted {}\n", done.count, ROUNDS)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS pingpong: served={} last request b={},{},{},{}\n", done.count,
+          done.last0, done.last1, done.last2, done.last3)
+
+    if done.traps != SERVER_TRAPS {
+        print("SOS pingpong: server traps={} wanted {}\n", done.traps,
+              SERVER_TRAPS)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    if done.client != CLIENT_SYSCALLS {
+        print("SOS pingpong: client traps={} wanted {}\n", done.client,
+              CLIENT_SYSCALLS)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS pingpong: client traps={} for {} round trips\n",
+          done.client, ROUNDS)
+    print("SOS pingpong: server traps={} for {} messages\n", done.traps, ROUNDS)
+
+    // **THE PER-RPC ROW, WHICH IS THE UNIT'S WHOLE CLAIM IN TWO NUMBERS.** The
+    // brackets are subtracted here rather than inside the window, so the
+    // division is over the loop and nothing else: the client's three setup
+    // traps and the server's opening wait plus closing read.
+    print("SOS pingpong: per RPC client={} server={}\n",
+          (done.client - 3) / (ROUNDS as UInt64),
+          (done.traps - 2) / (ROUNDS as UInt64))
+
+    let _ = proc.exit(EXIT_OK)
+}
+
+/// **LAUNCH, THEN SERVE, AND MEASURE ONLY THE SERVING.**
+///
+/// The launch is the ordinary one — drain the two boot regions, create, wire,
+/// start — and it happens entirely OUTSIDE the bracket, because every line of it
+/// is a trap and none of it is what this case is about.
+///
+/// **ROOT PARKS AS ITS FIRST MEASURED ACT**, and nothing else in root is
+/// runnable, so the child is what the kernel finds to run. From then on the two
+/// processes hand the processor back and forth exactly once per message: the
+/// child's `send` stages and parks, which wakes root; root's `reply_wait`
+/// answers and parks, which wakes the child. Both threads are genuinely
+/// `Blocked` in between, which is what makes the trap counts mean what they say
+/// — a poll loop anywhere would have produced the same bytes and a different
+/// number.
+func run(system: &System, proc: &Process) -> Result<Served, SosStatus> {
+    var image = try proc.boot_handle_next()
+    var dest = try proc.boot_handle_next()
+    guard let image_mem = image.take_memory() else { return BUG }
+    guard let dest_mem = dest.take_memory() else { return BUG }
+
+    let child = try system.process_create(image: &image_mem, memory: &dest_mem)
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    let waiter = try proc.waiter_create()
+
+    // PERSISTENT, because this attachment has to survive `ROUNDS` deliveries
+    // and one terminal one. A one-shot would detach at the first message and
+    // the second `reply_wait` would park on an empty Waiter for ever — which is
+    // the footgun `sos.waiter`'s own docstring states.
+    try waiter.add(outlet: &outlet, key: KEY_OUTLET)
+
+    // THE INLET FIRST — see `TAG_INLET`. The child spends one
+    // `boot_handle_next` because of this line.
+    try child.give(inlet: move inlet, tag: TAG_INLET)
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT)
+    try child.start(boot_tag: TAG_BOOT)
+
+    var served = try serve(&outlet, &waiter, &proc)
+
+    // The child is dead by now — its exit is what ended the loop — so its
+    // status word is there to be read, and requiring it is what rules out a
+    // child that faulted or gave up mid-round.
+    let status = try child.get_status()
+    if status != CHILD_STATUS {
+        return BUG
+    }
+    // THE DEAD CHILD'S COLUMNS. Read here, outside every measured window, and
+    // through a handle whose object no longer has a process behind it.
+    let client = try child.stats()
+    var answer = move served
+    answer.client = client.syscalls
+    return move answer
+}
+
+/// **THE MEASURED WINDOW: ONE `wait`, THEN `take` AND `reply_wait` FOREVER.**
+///
+/// There is NOTHING else inside the bracket — no print, no mint, no wrapper
+/// falling out of scope — which is what makes the number arithmetic rather than
+/// observation. Every printed byte is one `ecall`, so a window with a `print` in
+/// it would be counting this file's prose.
+///
+/// **THE FIRST TURN IS A PLAIN `wait`, AND THAT IS THE DESIGN RATHER THAN A
+/// WART** (user-ruled Sep 1): `reply_wait` needs a request to consume, and the
+/// first turn has none — so the degenerate form the op deliberately does not
+/// have is spelled with the op that already existed. The same call is the
+/// recovery from a dead client, which is why `Err(Reply(_))` below loops back
+/// into it rather than giving up.
+func serve(outlet: &PipeOutlet, waiter: &Waiter,
+           proc: &Process) -> Result<Served, SosStatus> {
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var out: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    out[1] = BYTE_P
+    out[2] = BYTE_O
+    out[3] = BYTE_N
+
+    var count: Int = 0
+    var last0: UInt8 = 0
+    var last1: UInt8 = 0
+    var last2: UInt8 = 0
+    var last3: UInt8 = 0
+
+    let before = try proc.stats()
+
+    var wake = try waiter.wait()
+    var serving = true
+    while serving {
+        // **THE TERMINAL LEVEL IS THE LOOP'S EXIT CONDITION** — see below.
+        var more = false
+        match wake.what {
+            case Readable(level) -> {
+                match level {
+                    case Msg -> { more = true },
+                    case PeerGone -> { more = false },
+                }
+            },
+            // The kernel reported an attachment this program never made.
+            case _ -> { return BUG },
+        }
+        if not more {
+            serving = false
+        } else {
+            let got = try outlet.take(into: &var msg)
+            guard let (n, request) = move got else { return BUG }
+            var obligation = move request
+            if n != PAYLOAD_LEN {
+                return BUG
+            }
+            last0 = msg[0]
+            last1 = msg[1]
+            last2 = msg[2]
+            last3 = msg[3]
+            // THE ANSWER IS THE REQUEST'S SEQUENCE NUMBER PLUS ONE, which is
+            // what makes the child able to tell a matching reply from a stale
+            // one. `&+` is the wrapping add: Saw's overflow checks are always
+            // on and the arithmetic is a byte's.
+            out[0] = msg[0] &+ 1
+            count = count + 1
+            wake = try obligation.reply_wait(body: &out, len: PAYLOAD_LEN,
+                                             waiter: &waiter) catch {
+                // BOTH LEGS END THIS SERVER, and only because it is a test with
+                // exactly one client: a real loop answers `Reply(_)` by going
+                // back to `waiter.wait()` — the obligation is discharged either
+                // way, so one dead client cannot stall it.
+                return BUG
+            }
+        }
+    }
+
+    let after = try proc.stats()
+    if after.syscalls < before.syscalls {
+        return BUG
+    }
+    return Served(count: count, last0: last0, last1: last1, last2: last2,
+                  last3: last3, traps: after.syscalls - before.syscalls,
+                  client: 0)
+}

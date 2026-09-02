@@ -34,6 +34,11 @@ static EXIT_NO_OUTLET: UInt = 96
 /// The reply's length, and the exit code that says how many bytes went.
 static PAYLOAD_LEN: UInt = 4
 
+/// **HOW MANY MESSAGES THIS CHILD ANSWERS** (sawos design 17). Two, because its
+/// launcher does the same exchange twice — once as the composition written out
+/// of the primitives, once as the fused `send` — and measures both.
+static ROUNDS: Int = 2
+
 static KEY: UInt = 1
 
 @export("_start")
@@ -80,40 +85,66 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    let _ = system.debug_print("SOS childserver: replied\n")
     // THE EXIT CODE IS THE PAYLOAD'S LENGTH, so the kernel's account of this
     // process and the launcher's reading of the reply say the same number from
     // the two sides of the boundary.
     let _ = proc.exit(PAYLOAD_LEN)
 }
 
-/// **PARK, TAKE, ANSWER.** The whole server loop, once.
+/// **PARK, TAKE, ANSWER — TWICE** (the second turn is sawos design 17's).
 ///
-/// The attach is ONE-SHOT: this child serves exactly one message and exits, so a
-/// persistent subscription would be a promise it has no second wait to keep. A
-/// real server leaves it `Persistent` and loops — which is what unit 5's
-/// driver-as-service does with the same three calls.
+/// The attach is PERSISTENT, which is what a server loop wants and what unit
+/// 5's driver-as-service will keep: a `OneShot` attachment would detach at the
+/// first delivery and the second wait would park on an empty Waiter for ever,
+/// which is the footgun `sos.waiter`'s own docstring states.
+///
+/// **WHY TWO AND NOT ONE.** M4 unit 3.5 gave this connection's client a SECOND
+/// spelling of the same exchange — the fused `PipeInlet.send`, one trap where
+/// the composition is three — and the launcher measures both. So the same
+/// server answers the same message twice, once for each spelling, which is what
+/// makes the two trap counts comparable: nothing about the SERVER differs
+/// between them.
+///
+/// **IT SAYS `replied` AFTER THE FIRST TURN AND NOTHING AFTER THE SECOND**, so
+/// this child's line lands exactly where it always did in the transcript. The
+/// launcher's own rows are what moved.
 func serve(outlet: &PipeOutlet, waiter: &Waiter) -> Result<Void, SosStatus> {
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
-
-    try waiter.add(outlet: &outlet, key: KEY, mode: AttachMode.OneShot)
-    // THIS BLOCKS. Nothing else in this process is runnable, so the kernel has
-    // to find work elsewhere and the launcher's `post` is what comes back to it.
-    let woke = try waiter.wait()
-    match woke.what {
-        case Readable(_) -> {},
-        case _ -> { return SosStatus.Revoked },
-    }
-
-    let got = try outlet.take(into: &var buf)
-    guard let (_, request) = move got else { return SosStatus.Revoked }
-    var obligation = move request
-
     msg[0] = 80
     msg[1] = 79
     msg[2] = 78
     msg[3] = 71
-    try obligation.reply(body: &msg, len: PAYLOAD_LEN)
+
+    try waiter.add(outlet: &outlet, key: KEY)
+
+    var served: Int = 0
+    while served < ROUNDS {
+        // THIS BLOCKS. Nothing else in this process is runnable, so the kernel
+        // has to find work elsewhere and the launcher's message is what comes
+        // back to it.
+        let woke = try waiter.wait()
+        match woke.what {
+            case Readable(_) -> {},
+            case _ -> { return SosStatus.Revoked },
+        }
+
+        let got = try outlet.take(into: &var buf)
+        guard let (_, request) = move got else { return SosStatus.Revoked }
+        var obligation = move request
+        try obligation.reply(body: &msg, len: PAYLOAD_LEN)
+        served = served + 1
+        if served == 1 {
+            let _ = report_first()
+        }
+    }
     return
+}
+
+/// The one line this child prints, and it goes out after the FIRST turn so that
+/// its position in the transcript is exactly what it was when this child served
+/// one message.
+func report_first() -> Bool {
+    print("SOS childserver: replied\n")
+    true
 }

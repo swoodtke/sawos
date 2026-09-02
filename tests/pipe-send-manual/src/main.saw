@@ -196,6 +196,37 @@ func round_trip(system: &System, proc: &Process) -> Result<Void, SosStatus> {
           reply_byte(&woke, 3))
     print("SOS sendmanual: the round trip cost {} traps\n",
           after.syscalls - before.syscalls)
+
+    // **AND NOW THE SAME EXCHANGE THE OTHER WAY** (sawos design 17, M4 unit
+    // 3.5). Same connection, same server, same four bytes each way — the only
+    // thing that differs is the spelling, which is the whole point of measuring
+    // both from one process. `child-server` answers twice for exactly this
+    // reason and nothing about the server side differs between the two turns.
+    //
+    // THE SECOND WINDOW IS AS EMPTY AS THE FIRST: one call, one closing read,
+    // and no print between them.
+    let fused_before = try proc.stats()
+    let answer = try inlet.send(body: &msg, len: PING_LEN)
+    let fused_after = try proc.stats()
+
+    if answer.len != PING_LEN { return BUG }
+    print("SOS sendmanual: fused reply len={} b={},{},{},{}\n", answer.len,
+          answer.bytes[0], answer.bytes[1], answer.bytes[2], answer.bytes[3])
+
+    // **THE COMPANION ROW, AND IT IS THE UNIT'S WHOLE STORY IN TWO NUMBERS.**
+    // Each delta carries its own closing `stats()` trap — `ktrap` charges at
+    // trap entry, ahead of the dispatch — so subtracting one from each leaves
+    // the OPS the caller wrote: post + attach + wait against `send`. Three
+    // against one, measured by the same process against the same server in the
+    // same boot, which is the refactor-into-a-kernel-call story proved rather
+    // than asserted.
+    //
+    // The fused call also mints NOTHING: the composition holds a `PipeReply`
+    // handle for the length of the exchange and the fused path holds no table
+    // row at all, which is the saving the trap count does not show.
+    print("SOS sendmanual: ops manual={} fused={}\n",
+          (after.syscalls - before.syscalls) - 1,
+          (fused_after.syscalls - fused_before.syscalls) - 1)
     return
 }
 

@@ -1,0 +1,71 @@
+// SOS M4 unit 3.5: A `send` LONGER THAN THE PUBLISHED BODY IS A FAULT (sawos
+// design 17; design 178's faults ruling).
+//
+//   SOS calloversized: calling with 129 bytes
+//   SOS: process fault: argument outside its domain
+//
+// **THE MAXIMUM IS PUBLISHED AND THE CALLER CHOSE THE NUMBER**, which is
+// design 178's line for what belongs outside the status enum entirely:
+// `PIPE_BODY_BYTES` is a `sosabi` constant this very program imports, so a
+// length above it is not a condition to report — it is a mistake the caller
+// could have checked before making it. `pipe_oversized` says the same thing
+// about `post`, and the pair is what says the fused op did not quietly acquire
+// a looser domain when it acquired a park.
+//
+// **THE CHECK IS THE FIRST THING `pipe_call` DOES**, ahead of the reply
+// buffer's, ahead of the peer-gone question and ahead of the ring — so nothing
+// is staged, no thread is tied to an exchange, and the process ends while it is
+// still the running one. A blocking op that validated after it parked would
+// have to fault a process from another thread's context, which is exactly the
+// arrangement `copy_out_check` and `copy_in_check` exist to avoid.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, SosStatus,
+            PIPE_BODY_BYTES}
+
+static EXIT_FAILED: UInt = 1
+
+/// One byte past the published maximum. Written as the constant plus one rather
+/// than as 129, so the case follows the build define if it ever moves.
+static TOO_LONG: UInt = (PIPE_BODY_BYTES as UInt) + 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS calloversized: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let pair = try proc.pipe_create() catch {
+        print("SOS calloversized: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    // BOTH ENDS ARE HELD, so the connection's server end is alive and
+    // `PeerClosed` is not the answer this could have got by accident. The
+    // length is refused before either question is asked, and holding the outlet
+    // is what makes that visible rather than assumed.
+    let (inlet, outlet) = move pair
+
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 1
+    print("SOS calloversized: calling with {} bytes\n", TOO_LONG)
+
+    match inlet.send(body: &msg, len: TOO_LONG) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS calloversized: an oversized call was staged\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        // UNREACHABLE: the line above does not return, because the kernel ends
+        // this process at the domain check. Written so the refusal reads as a
+        // refusal rather than as a missing case.
+        case Err(e) -> {
+            print("SOS calloversized: refused: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+}

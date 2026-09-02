@@ -1,0 +1,230 @@
+// SOS M4 unit 3.5: THE ORPHANED-CLAIM ARM (sawos design 17 D-2; `designs/010`
+// ruling 4's rider, which names it and says the unit brief must).
+//
+// **A FUSED CALL'S CLAIM IS THE ONE REFERENCE IN THE SYSTEM THAT NO HANDLE
+// TABLE HOLDS.** That is what the fused path buys — no `PipeReply` is minted,
+// so a blocking client spends no table row and no quota — and it is exactly why
+// the teardown needed a new arm: `end_process`'s close-all walks HANDLES, and a
+// parked caller has none to walk. Without the arm the ring slot would be pinned
+// for ever and `PIPE_CALLER` would be left naming a thread slot the sweep below
+// it is about to recycle.
+//
+//   SOS callorphan: two calls in flight
+//   SOS callorphan: answered one
+//   SOS: process exit: code=0x…3d process=0x…01
+//   SOS callorphan: the orphaned claim answers the other end of this
+//                   connection is gone
+//
+// The last row is the arm: root still holds the SECOND obligation when the
+// child dies, and its `reply` is told `PeerClosed`. That is §2.1's ratified
+// abandoned-by-client answer arriving with NO NEW VOCABULARY — the teardown
+// dropped the claim, the column reached zero, and `pipe_reply` read the columns
+// exactly as it has since unit 2.
+//
+// # HOW A PROCESS IS MADE TO DIE WITH A THREAD PARKED
+//
+// Nothing in SOS can kill a thread from outside, so the child has to end itself
+// while one of its own threads is parked. `child-orphan` is two threads doing
+// the SAME thing — one fused call each, and `ProcessOp.Exit` if it is answered
+// — so root answering exactly one of the two messages is what ends the process
+// with the other still inside its call. Symmetry is what makes that
+// deterministic: root does not have to know which thread it is talking to,
+// because the two are interchangeable.
+//
+// # WHY ROOT NEVER POLLS
+//
+// Root waits for the first message, takes it, and waits again — and the second
+// wait PARKS, because nothing is staged until the child's other thread runs.
+// So the two takes are separated by a park rather than by a poll loop, and the
+// transcript's ordering says the kernel scheduled the sibling because root had
+// nothing left to do.
+//
+// **THE OUTLET IS DETACHED BEFORE THE DEATH WAIT**, and that is not tidiness: a
+// dying child drops its inlets, which turns the readable level terminal, so with
+// both attachments live the wait would have TWO ready things and would answer
+// whichever the scan reached first. Removing the one root is finished with makes
+// the answer a fact rather than a scan order.
+//
+// ONE PHASE PER FUNCTION, on design 14 finding 3's 16 KiB stack ceiling.
+
+import sos.{System, Process, Waiter, WaitResult, WaitPayload, PipeInlet,
+            PipeOutlet, PipeRequest, PipeInletRight, OutletLevel, SosStatus,
+            SystemRight, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status the kernel can never hand this program, so meeting it in the error
+/// channel means an assertion in THIS file failed rather than a call did.
+static BUG: SosStatus = SosStatus.Revoked
+
+/// `Exited`(1) << 16 | 61 — the code `child-orphan`'s answered thread ends with.
+static CHILD_STATUS: UInt = 65597
+
+static_assert((1 * 65536) + 61 == 65597,
+              "the child's status word is Exited in the high bits and its code")
+
+/// One byte each way.
+static PAYLOAD_LEN: UInt = 1
+
+static KEY_OUTLET: UInt = 91
+static KEY_DEATH: UInt = 92
+
+/// The three tags. **THE TWO INLETS GO FIRST**: the boot set is a FIFO, so
+/// records 0 and 1 are the two client ends and each of the child's threads
+/// drains one for itself.
+static TAG_INLET_A: UInt = 15
+static TAG_INLET_B: UInt = 16
+static TAG_BOOT: UInt = 17
+
+/// What a child of this launcher may ask its System object for. This child
+/// prints nothing, so no `Debug`; it makes a thread, which is a `Process` right
+/// on a handle it derives for itself and costs nothing here.
+static CHILD_SYSTEM: UInt32 = (SystemRight.ProcessSelf | SystemRight.Transfer)
+
+/// **WHAT THE SECOND CLIENT END MAY DO.** A sibling minted through this mask can
+/// post (which is what `send` spends) and nothing else — it may not be handed
+/// on again and may not mint a third. It is here to make the point that the
+/// second end is an ATTENUATED name on one connection rather than a second
+/// connection: `Transfer` IS present, because `give` checks that bit on the
+/// thing being given and the whole purpose of this handle is to be given.
+static SECOND_INLET: UInt32 = (PipeInletRight.Transfer | PipeInletRight.Post)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS callorphan: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS callorphan: failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let _ = proc.exit(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var image = try proc.boot_handle_next()
+    var dest = try proc.boot_handle_next()
+    guard let image_mem = image.take_memory() else { return BUG }
+    guard let dest_mem = dest.take_memory() else { return BUG }
+
+    let child = try system.process_create(image: &image_mem, memory: &dest_mem)
+
+    // ONE CONNECTION, TWO CLIENT ENDS. The sibling is a second NAME on the same
+    // connection (design 13 D-1's `dup` precedent), which is what lets two
+    // threads of one process each hold an end without either handing the other
+    // a handle word — a thing the typed surface deliberately cannot do.
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    let second = try inlet.mint(rights: SECOND_INLET)
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(outlet: &outlet, key: KEY_OUTLET)
+    try waiter.add(process: &child, key: KEY_DEATH)
+
+    try child.give(inlet: move inlet, tag: TAG_INLET_A)
+    try child.give(inlet: move second, tag: TAG_INLET_B)
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT)
+    try child.start(boot_tag: TAG_BOOT)
+
+    try collect_and_orphan(&outlet, &waiter)
+    return
+}
+
+/// **TAKE BOTH MESSAGES, ANSWER ONE, AND ASK THE OTHER AFTERWARDS.**
+///
+/// The two obligations are held together across the child's death, which is the
+/// only arrangement in which the arm is observable at all: the second one has
+/// to still exist when the teardown runs, so that root can ask it a question
+/// afterwards and be told what the teardown decided.
+func collect_and_orphan(outlet: &PipeOutlet,
+                        waiter: &Waiter) -> Result<Void, SosStatus> {
+    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var out: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    out[0] = 2
+
+    // THE FIRST THREAD'S CALL.
+    let first = try waiter.wait()
+    if first.key != KEY_OUTLET || not readable_msg(&first) {
+        return BUG
+    }
+    let got_a = try outlet.take(into: &var buf)
+    guard let (_, request_a) = move got_a else { return BUG }
+    var answered = move request_a
+
+    // THE SECOND THREAD'S. This wait PARKS — nothing is staged until the
+    // sibling runs — so the interleaving is the kernel's rather than a poll's.
+    let second = try waiter.wait()
+    if second.key != KEY_OUTLET || not readable_msg(&second) {
+        return BUG
+    }
+    let got_b = try outlet.take(into: &var buf)
+    guard let (_, request_b) = move got_b else { return BUG }
+    var orphaned = move request_b
+
+    print("SOS callorphan: two calls in flight\n")
+
+    // Detached BEFORE the death, so the wait below has exactly one thing that
+    // can answer it. See the header.
+    try waiter.remove(KEY_OUTLET)
+
+    // ANSWER ONE. Whichever thread this reaches wakes up inside its own `send`,
+    // takes the reply, and ends the process — leaving the other one parked.
+    try answered.reply(body: &out, len: PAYLOAD_LEN)
+    print("SOS callorphan: answered one\n")
+
+    let ended = try waiter.wait()
+    if ended.key != KEY_DEATH {
+        return BUG
+    }
+    if process_status(&ended) != CHILD_STATUS {
+        return BUG
+    }
+
+    // **THE ARM.** The orphaned claim was abandoned by the teardown, so this
+    // discharges the obligation and is told there is nobody left to hear it.
+    // A `match` rather than the tree's guard shape, deliberately: this is a
+    // negative assertion on a SPECIFIC status, which is one of the two things
+    // CLAUDE.md's idiom ruling keeps `match` for.
+    match orphaned.reply(body: &out, len: PAYLOAD_LEN) {
+        case Ok(_) -> {
+            print("SOS callorphan: the orphaned claim took a reply\n")
+            return BUG
+        },
+        case Err(status) -> {
+            print("SOS callorphan: the orphaned claim answers {}\n", status)
+        },
+    }
+    return
+}
+
+/// Whether a record says a message is STAGED. The other arms panic because this
+/// program checks the KEY first, so any other shape would mean the kernel
+/// reported an attachment nobody made.
+func readable_msg(r: &WaitResult) -> Bool {
+    match r.what {
+        case Readable(level) -> {
+            match level {
+                case Msg -> true,
+                case PeerGone -> false,
+            }
+        },
+        case _ -> panic("this record was supposed to be the outlet's"),
+    }
+}
+
+/// The §8 status word out of a wait record.
+func process_status(r: &WaitResult) -> UInt {
+    match r.what {
+        case Process(status) -> status,
+        case _ -> panic("this record was supposed to be the child's"),
+    }
+}

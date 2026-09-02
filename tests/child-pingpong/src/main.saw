@@ -1,0 +1,133 @@
+// SOS CHILD: THE FUSED CLIENT (sawos design 17, M4 unit 3.5; spec §2.1's
+// ratified `send`).
+//
+// **ONE TRAP PER RPC, AND THE SILENCE IS WHAT MAKES THAT PROVABLE.** Every
+// printed byte is one `ecall` — `System.debug_print` writes a byte per character
+// and freestanding `print` reaches the same seam — so a child that talks has a
+// syscall count that is a hash of its own prose. Its launcher asserts the exact
+// number, so this program prints not one byte (design 16's rule, and the reason
+// `child-stats` was written the same way).
+//
+// THE SEQUENCE, AND THE ARITHMETIC ITS LAUNCHER STATES:
+//
+//   1                 `process_self` — the derive every process starts with
+//   1                 ONE `boot_handle_next`, because the inlet is record 0
+//   ROUNDS            `send` calls — ONE TRAP EACH, and that is the claim
+//   1                 `exit`, charged at trap entry and never returning
+//   ------
+//   ROUNDS + 3        = `CLIENT_SYSCALLS` in the launcher, and it is asserted
+//
+// **THE INLET IS RECORD 0 BECAUSE THE LAUNCHER GIVES IT FIRST**, which is a
+// contract between the two files and nothing the kernel supplies: the boot set
+// is a FIFO, so one `boot_handle_next` is all this child needs and the System
+// handle it never drains stays behind it. `start(boot_tag:)` resolves its tag
+// against the whole set rather than the cursor, so the ordering costs the
+// launcher nothing.
+//
+// **WHAT A `send` IS, AND WHY THERE IS NO CLAIM HERE.** The composed spelling of
+// this exchange is post + attach + wait, three traps, and it leaves a
+// `PipeReply` handle in this process's table for the duration. The fused `Call`
+// under `send` is one trap and mints NOTHING: the claim is kernel-internal and
+// tied to this parked thread (`designs/010` ruling 4's rider), so a blocking
+// client spends no table row at all. `tests/pipe-send-manual` prints both costs
+// side by side.
+//
+// **THE PAYLOAD IS CHECKED HERE, BYTE BY BYTE**, because the launcher can only
+// see the requests. Each round sends `[seq, 'P', 'I', 'N']` and requires
+// `[seq + 1, 'P', 'O', 'N']` back — a per-round sequence number, so a server
+// that answered the same message twice, or answered out of order, could not
+// pass. The verdict travels in the §8 exit code, which is the only thing this
+// child says at all.
+
+import sos.{System, PipeInlet, PIPE_BODY_BYTES}
+
+/// How many round trips. Fixed, because the launcher's `CLIENT_SYSCALLS` is
+/// this plus three and its `SERVER_TRAPS` is twice this plus two.
+static ROUNDS: Int = 8
+
+/// Four bytes each way: a sequence number and three letters.
+static PAYLOAD_LEN: UInt = 4
+
+/// `P`, `I`, `N`, `O` — the request is `PIN` and the answer is `PON`, so the
+/// two directions are distinguishable in a transcript at a glance.
+static BYTE_P: UInt8 = 80
+static BYTE_I: UInt8 = 73
+static BYTE_N: UInt8 = 78
+static BYTE_O: UInt8 = 79
+
+/// Every round matched. A distinctive number, so the launcher's status word
+/// could not have been produced by any other ending in this tree.
+static EXIT_MATCHED: UInt = 33
+
+/// Something did not: a call was refused, a length was wrong, or a byte was.
+static EXIT_MISMATCH: UInt = 34
+
+/// The boot set held no inlet where the launcher's config says one is.
+static EXIT_NO_INLET: UInt = 35
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        // Nothing to exit WITH and nothing to say it on. Returning from the
+        // entry faults this process, so the launcher reads `Faulted` where it
+        // expected `Exited` — a wrong answer that says so.
+        return
+    }
+
+    var record = try proc.boot_handle_next() catch {
+        let _ = proc.exit(EXIT_NO_INLET)
+        return
+    }
+    guard let inlet = record.take_inlet() else {
+        let _ = proc.exit(EXIT_NO_INLET)
+        return
+    }
+
+    let verdict = ping_pong(&inlet)
+    let _ = proc.exit(verdict)
+}
+
+/// **THE MEASURED LOOP: `ROUNDS` ROUND TRIPS, `ROUNDS` TRAPS.**
+///
+/// It is its own function on design 14 finding 3's stack ceiling — but here the
+/// reason is sharper than a frame budget: this body must contain NO print, and
+/// keeping it apart from the entry is what makes that visible at a glance.
+///
+/// Each `send` PARKS. The reply that unparks it is written by the launcher into
+/// the very ring slot this message travelled in, and copied out through this
+/// process's own checked funnel while it resumes inside its own syscall — so
+/// the kernel never dereferences another process's memory, and the whole round
+/// trip is one `ecall`.
+func ping_pong(inlet: &PipeInlet) -> UInt {
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[1] = BYTE_P
+    msg[2] = BYTE_I
+    msg[3] = BYTE_N
+
+    var round: Int = 0
+    while round < ROUNDS {
+        msg[0] = round as UInt8
+        let answer = try inlet.send(body: &msg, len: PAYLOAD_LEN) catch {
+            return EXIT_MISMATCH
+        }
+        if answer.len != PAYLOAD_LEN {
+            return EXIT_MISMATCH
+        }
+        // THE SEQUENCE NUMBER IS THE ORDERING PROOF: a server that answered a
+        // stale exchange, or the same one twice, fails here rather than looking
+        // correct.
+        if answer.bytes[0] != ((round + 1) as UInt8) {
+            return EXIT_MISMATCH
+        }
+        if answer.bytes[1] != BYTE_P || answer.bytes[2] != BYTE_O {
+            return EXIT_MISMATCH
+        }
+        if answer.bytes[3] != BYTE_N {
+            return EXIT_MISMATCH
+        }
+        round = round + 1
+    }
+    EXIT_MATCHED
+}

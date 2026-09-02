@@ -1,0 +1,102 @@
+// SOS M4 unit 3.5: A SPENT OBLIGATION IS SPENT FOR `reply_wait` TOO (sawos
+// design 17; design 3 D-1's generations).
+//
+//   SOS replywaitdead: discharged the obligation
+//   SOS: process fault: bad handle
+//
+// **SINGLE USE IS THE LEDGER'S, AND THE WRAPPER IS ONLY THE POLITE VERSION OF
+// IT.** `PipeRequest.reply` and `PipeRequest.reply_wait` both consume the
+// capability they are called through — each disarms its own wrapper before the
+// trap, which is the transfer-funnel contract — so an ordinary program can
+// never meet this fault: the husk holds `NO_HANDLE` and dropping it does
+// nothing. Reaching the fault at all takes deliberate effort, and THAT IS THE
+// FINDING (design 14 deviation 7 says the same about `pipe_dead_claim`): this
+// case asks a SECOND time through a spent value to show that the kernel's own
+// check is real underneath the wrapper's.
+//
+// **THE FAULT IS RAISED IN THE DISPATCH, ABOVE THE OP.** A word that resolves
+// to nothing names no kind either, so there is no op table to ask — which is why
+// this is `BadHandle` and not something `PipeRequestOp.ReplyWait` decided. The
+// new op inherits that for free, which is the claim: growing an object's op
+// table does not grow the ways a stale handle can be used.
+//
+// Root plays both sides — post, take, reply — so nothing here parks and the
+// whole case is one thread.
+
+import sos.{System, Process, Waiter, PipeInlet, PipeOutlet, PipeReply,
+            PipeRequest, SosStatus, PIPE_BODY_BYTES}
+
+static EXIT_FAILED: UInt = 1
+
+/// One byte each way.
+static PAYLOAD_LEN: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS replywaitdead: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let waiter = try proc.waiter_create() catch {
+        print("SOS replywaitdead: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let pair = try proc.pipe_create() catch {
+        print("SOS replywaitdead: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let (inlet, outlet) = move pair
+
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 1
+
+    let staged = try inlet.post(body: &msg, len: PAYLOAD_LEN) catch {
+        print("SOS replywaitdead: post failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let claim = move staged else {
+        let _ = system.debug_print("SOS replywaitdead: the fresh ring refused\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let got = try outlet.take(into: &var buf) catch {
+        print("SOS replywaitdead: take failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let (_, request) = move got else {
+        let _ = system.debug_print("SOS replywaitdead: nothing was staged\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var obligation = move request
+
+    // THE FIRST USE. It consumes the entry, and the wrapper disarms itself
+    // before the trap, so `obligation` is a husk from here on.
+    try obligation.reply(body: &msg, len: PAYLOAD_LEN) catch {
+        print("SOS replywaitdead: reply failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS replywaitdead: discharged the obligation\n")
+
+    // THE SECOND USE, through the spent value. `reply_wait` reads the husk's
+    // `NO_HANDLE` and hands it to the kernel, which resolves it to nothing and
+    // ends this process — the ordinary `BadHandle` fault, raised in the
+    // dispatch before any pipe op runs.
+    let _ = obligation.reply_wait(body: &msg, len: PAYLOAD_LEN, waiter: &waiter)
+
+    // UNREACHABLE: the line above does not return.
+    let _ = system.debug_print("SOS replywaitdead: a spent obligation waited\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

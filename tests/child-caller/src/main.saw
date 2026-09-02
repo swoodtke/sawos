@@ -1,0 +1,104 @@
+// SOS CHILD: A FUSED CALLER THAT IS REFUSED TWICE (sawos design 17, M4 unit
+// 3.5; `designs/010` ruling 2's peer-gone doctrine).
+//
+// **NOTHING PARKED CAN BE SILENTLY DOOMED**, and a thread inside
+// `PipeInlet.send` is the hardest case that rule has met: it is on NO LIST — not
+// a Waiter's blocked chain, because a fused call involves no Waiter at all — so
+// the only thing that can ever reach it is the exchange it is tied to. This
+// child parks in two such calls, on two connections, and its launcher kills each
+// one a different way:
+//
+//   connection A   the server TAKES the message and then drops the obligation
+//   connection B   the server end itself goes away with the message still staged
+//
+// Both must come back `SosStatus.PeerClosed` — the same word `resolve` answers
+// with, which is what says the fused path and the composed one report one fact.
+//
+// **THE VERDICT IS THE EXIT CODE**, because a child cannot assert on its
+// launcher's behalf: `EXIT_BOTH_CLOSED` is reachable only if BOTH calls came
+// back with that exact status, so the launcher reading it out of the §8 status
+// word is reading a conjunction it could not have observed itself.
+//
+// The two inlets are boot records 0 and 1 — the launcher gives them before the
+// System handle, and the boot set is a FIFO.
+
+import sos.{System, PipeInlet, SosStatus, PIPE_BODY_BYTES}
+
+/// Two bytes, which is a message rather than an absence. Their values do not
+/// matter: nobody ever answers either call.
+static PAYLOAD_LEN: UInt = 2
+
+/// Both calls came back `PeerClosed`. The launcher asserts this exact code.
+static EXIT_BOTH_CLOSED: UInt = 51
+
+/// At least one call answered something else — including succeeding, which
+/// would mean a reply arrived from a server that had given up.
+static EXIT_WRONG: UInt = 52
+
+/// The boot set held fewer than two inlets where the launcher's config says two.
+static EXIT_NO_INLETS: UInt = 53
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        // Returning from the entry faults this process, so the launcher reads
+        // `Faulted` where it expected `Exited` — a wrong answer that says so.
+        return
+    }
+
+    var first = try proc.boot_handle_next() catch {
+        let _ = proc.exit(EXIT_NO_INLETS)
+        return
+    }
+    guard let dropped = first.take_inlet() else {
+        let _ = proc.exit(EXIT_NO_INLETS)
+        return
+    }
+    var second = try proc.boot_handle_next() catch {
+        let _ = proc.exit(EXIT_NO_INLETS)
+        return
+    }
+    guard let closing = second.take_inlet() else {
+        let _ = proc.exit(EXIT_NO_INLETS)
+        return
+    }
+
+    // The launcher waits for this line before it does anything, so the
+    // transcript's ordering says which side acted first.
+    let _ = system.debug_print("SOS childcaller: calling\n")
+
+    // THE FIRST CALL PARKS UNTIL THE SERVER DROPS THE OBLIGATION IT TOOK.
+    let one = refused(&dropped)
+    // THE SECOND PARKS UNTIL THE SERVER END ITSELF GOES, with this message
+    // still staged and never taken at all.
+    let two = refused(&closing)
+
+    if one && two {
+        let _ = proc.exit(EXIT_BOTH_CLOSED)
+        return
+    }
+    let _ = proc.exit(EXIT_WRONG)
+}
+
+/// One fused call that must come back `PeerClosed`.
+///
+/// A `match` rather than the tree's `try … catch` guard shape, deliberately:
+/// this is a NEGATIVE test asserting a SPECIFIC error value, which is one of
+/// the two things CLAUDE.md's idiom ruling keeps `match` for. An `Ok` here is a
+/// failure of the case, not of the call.
+func refused(inlet: &PipeInlet) -> Bool {
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 1
+    msg[1] = 2
+    match inlet.send(body: &msg, len: PAYLOAD_LEN) {
+        case Ok(_) -> false,
+        case Err(status) -> {
+            match status {
+                case PeerClosed -> true,
+                case _ -> false,
+            }
+        },
+    }
+}

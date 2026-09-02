@@ -119,17 +119,54 @@ public(package) struct ThreadSlot {
     /// `public(package)`: the list a parked thread is on may be a Waiter's,
     /// which `waitables` owns.
     public(package) link: Int,
-    /// Where a thread parked in `Waiter.Wait` wants its record written — a user
-    /// address, ALREADY VALIDATED by `copy_out_check` at the call. Validating at
-    /// the call rather than at the wake is what makes a bad buffer terminate the
-    /// process that supplied it, while it is still the running one.
+    /// Where a PARKED THREAD wants its answer written — a user address, ALREADY
+    /// VALIDATED by `copy_out_check` at the call. Validating at the call rather
+    /// than at the wake is what makes a bad buffer terminate the process that
+    /// supplied it, while it is still the running one.
     /// `public(package)` because the wait side is what sets it, at the park.
+    ///
+    /// **TWO PARKS USE IT SINCE M4 UNIT 3.5** (sawos design 17) and the field is
+    /// still one field, because a thread is inside at most one syscall: a
+    /// `Waiter.Wait` writes a wait RECORD here, and a fused `PipeInlet.Call`
+    /// writes the REPLY BODY here. Both are "the buffer this park will answer
+    /// into", both were checked while the caller was running, and which one it
+    /// is is said by the two fields below rather than by a second address.
     public(package) wait_buf: UInt,
+    /// **THE FUSED CALL'S ROOM PARK: which connection this thread is waiting
+    /// for space on** (slot + 1; 0 = it is not), sawos design 17.
+    ///
+    /// `PipeInletOp.Call` never answers `WouldBlock` — design 10 ruling 8's
+    /// level, reached from inside the op — so a full ring parks the caller
+    /// here, and the room the next settle makes is what resumes it. EXACTLY ONE
+    /// of this field and `call_claim` is non-zero while a thread is inside a
+    /// `Call`, and the pair names which of the two things it is waiting for.
+    public(package) call_pipe: Int,
+    /// **THE FUSED CALL'S REPLY PARK: which exchange this thread's answer is
+    /// coming from** (exchange + 1; 0 = it is not waiting for one).
+    ///
+    /// **IT IS THE CLAIM ITSELF, NOT A NOTE ABOUT ONE.** A fused call mints no
+    /// `PipeReply` handle (design 10 ruling 4's rider: zero handle traffic on
+    /// the fast path), so the parked THREAD is what holds the exchange's reply
+    /// column open — one reference, taken at the stage and dropped at the wake.
+    /// `PIPE_CALLER` is the same fact indexed the other way, which is what lets
+    /// a settling exchange find the thread without a scan.
+    public(package) call_claim: Int,
+    /// The request body's address in the caller's memory, and its length —
+    /// live only while `call_pipe` is set.
+    ///
+    /// A ROOM-PARKED CALL HAS NOT STAGED ANYTHING YET, so the message is still
+    /// where the caller put it and the resume has to copy it then. The address
+    /// went through `copy_in_check` at the call, while the caller was running,
+    /// which is what makes the later copy unable to fail.
+    public(package) call_src: UInt,
+    public(package) call_len: UInt,
 }
 
 public(package) unsafe static var THREADS: [ThreadSlot; MAX_THREADS] = [
     ThreadSlot(state: ThreadState.Free, process: 0,
-               exit_code: 0, joiners: 0, link: 0, wait_buf: 0); MAX_THREADS]
+               exit_code: 0, joiners: 0, link: 0, wait_buf: 0,
+               call_pipe: 0, call_claim: 0, call_src: 0,
+               call_len: 0); MAX_THREADS]
 
 /// The running thread's slot, or `NO_THREAD`.
 ///

@@ -402,6 +402,21 @@ PIPE_BAD_MODE_PKG = os.path.join(TESTS_DIR, "pipe-bad-mode")
 PROCESS_STATS_PKG = os.path.join(TESTS_DIR, "process-stats")
 CHILD_STATS_PKG = os.path.join(TESTS_DIR, "child-stats")
 
+# sawos design 17: THE FUSED PATHS. `pipe-pingpong` is the ladder's performance
+# claim as a transcript row — root serves with `reply_wait`, a silent child
+# clients with `send`, and BOTH trap counts are asserted exactly. The three
+# abandonment cases are the peer-gone doctrine reaching the one park that is on
+# no list, and the three negative arms are the two new ops' refusals.
+PIPE_PINGPONG_PKG = os.path.join(TESTS_DIR, "pipe-pingpong")
+CHILD_PINGPONG_PKG = os.path.join(TESTS_DIR, "child-pingpong")
+PIPE_CALL_ABANDON_PKG = os.path.join(TESTS_DIR, "pipe-call-abandon")
+CHILD_CALLER_PKG = os.path.join(TESTS_DIR, "child-caller")
+PIPE_CALL_ORPHAN_PKG = os.path.join(TESTS_DIR, "pipe-call-orphan")
+CHILD_ORPHAN_PKG = os.path.join(TESTS_DIR, "child-orphan")
+PIPE_NO_CALL_PKG = os.path.join(TESTS_DIR, "pipe-no-call")
+PIPE_CALL_OVERSIZED_PKG = os.path.join(TESTS_DIR, "pipe-call-oversized")
+PIPE_REPLY_WAIT_DEAD_PKG = os.path.join(TESTS_DIR, "pipe-reply-wait-dead")
+
 CLOCK_BASICS_PKG = os.path.join(TESTS_DIR, "clock-basics")
 TIMER_ONESHOT_PKG = os.path.join(TESTS_DIR, "timer-oneshot")
 TIMER_INTERVAL_PKG = os.path.join(TESTS_DIR, "timer-interval")
@@ -613,6 +628,17 @@ def expectations(arch):
         # line as well as through the child's own console line and root's §8
         # status word. A number that appears nowhere else in any transcript.
         "touch_mark": f"0x{0x3C:0{width}x}",
+        # sawos design 17: the three exit codes the fused-path cases assert.
+        # Each is a number that appears nowhere else in any transcript, on
+        # `touch_mark`'s own reasoning — a code a launcher asserts should not be
+        # producible by any other ending in the tree.
+        #
+        #   pingpong_mark  every round trip's reply matched its own request
+        #   caller_mark    BOTH parked fused calls came back `PeerClosed`
+        #   orphan_mark    the thread whose call was answered ended the process
+        "pingpong_mark": f"0x{0x21:0{width}x}",
+        "caller_mark": f"0x{0x33:0{width}x}",
+        "orphan_mark": f"0x{0x3D:0{width}x}",
         # M3 unit 6: the byte ROOT writes into the shared page, which is also
         # `child-share`'s exit code — so `share_double_map` asserts the first
         # direction of the round trip through the kernel's exit line as well as
@@ -3461,14 +3487,18 @@ TEST_CASES = [
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": PIPE_SEND_MANUAL_PKG,
         "children": [CHILD_SERVER_PKG],
+        # **THE CHILD SERVES TWO MESSAGES SINCE M4 UNIT 3.5** (sawos design
+        # 17), which is what moved two of the rows below. `child-server` still
+        # prints `replied` after its FIRST turn and still exits with `code=4`,
+        # so its own lines are where they always were; what changed is that it
+        # no longer DIES at the first reply, so root's report of the first round
+        # now precedes the child's death instead of following it. Every string
+        # in this list is byte-identical to what it was; two of them moved up
+        # two places, and two are new.
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
                        "SOS sendmanual: gave the outlet",
                        "SOS childserver: replied",
-                       "SOS: process exit: code={four} process={one}",
-                       "SOS: process teardown handles={four} threads={one} "
-                       "events={zero} waiters={one} interrupts={zero} "
-                       "timers={zero} process={one}",
                        "SOS sendmanual: reply len=4 b=80,79,78,71",
                        # **THE SWEEP'S HEADLINE ROW** (sawos design 16). The
                        # composition a caller writes by hand is post, attach,
@@ -3478,11 +3508,30 @@ TEST_CASES = [
                        # always claimed and could never demonstrate: the WAIT
                        # parked, a whole cross-process round trip happened
                        # underneath it (the child was scheduled, woke on its
-                       # outlet, took, replied and died), and root paid ONE trap
-                       # for all of it — a park is one `ecall` however long it
+                       # outlet, took and replied), and root paid ONE trap for
+                       # all of it — a park is one `ecall` however long it
                        # parks, because the wake writes the answer into the
                        # parked frame rather than re-entering through the door.
+                       # (The child no longer DIES there: since design 17 it
+                       # serves the fused turn below as well, which is why this
+                       # row now precedes its exit instead of following it.)
                        "SOS sendmanual: the round trip cost 4 traps",
+                       "SOS: process exit: code={four} process={one}",
+                       "SOS: process teardown handles={four} threads={one} "
+                       "events={zero} waiters={one} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       # **THE COMPANION ROWS** (sawos design 17's proof 4). The
+                       # SAME exchange, the same server, the same four bytes —
+                       # done the other way and measured in the same boot by the
+                       # same process. `ops manual=3 fused=1` is the ladder's
+                       # refactor-into-a-kernel-call story stated as a
+                       # measurement rather than as a claim: post + attach +
+                       # wait against `send`. The fused call also mints NOTHING,
+                       # which the numbers do not show — the composition holds a
+                       # `PipeReply` handle for the length of the exchange and
+                       # the fused path holds no table row at all.
+                       "SOS sendmanual: fused reply len=4 b=80,79,78,71",
+                       "SOS sendmanual: ops manual=3 fused=1",
                        "SOS sendmanual: filled=16 then room says there is space",
                        "SOS sendmanual: timed out",
                        "SOS sendmanual: after cancel the other end of this "
@@ -3591,6 +3640,203 @@ TEST_CASES = [
                        "SOS stats: minted without Stats",
                        "SOS: process fault: access denied process={zero}",
                        "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # **THE LADDER'S PERFORMANCE CLAIM, AS A TRANSCRIPT ROW** (sawos design
+        # 17; `designs/010` ruling 4's Aug-31 rider said the proof would be "a
+        # ping-pong case that COUNTS TRAPS"). Design 16 built the instrument;
+        # this is what it was built for.
+        #
+        # **ROOT SERVES AND THE CHILD CLIENTS, and the topology is a decision.**
+        # The client's measured window is its WHOLE LIFE, so the client has to be
+        # silent — every printed byte is one `ecall` — and a silent process
+        # cannot report its own number, so its launcher reads the column through
+        # the handle that outlives it. Reversed, the exactly-asserted count would
+        # have belonged to the process that also has to print the report.
+        #
+        # **THE LOOP ENDS BY ITSELF AND THAT IS WHY THE ARITHMETIC IS CLEAN.**
+        # The child's exit takes the last inlet handle with it, the outlet's
+        # readable level turns terminal, and root is ALREADY PARKED in the wait
+        # that delivers `PeerGone` — so termination costs zero extra traps and
+        # needs no counter, no timer and no sentinel message. The peer-gone
+        # doctrine is the loop's exit condition.
+        #
+        # `client traps=11 for 8 round trips` is `process_self` + one
+        # `boot_handle_next` + EIGHT `send` calls + `exit`. **ONE TRAP PER RPC**,
+        # where the composed spelling `pipe_send_manual` writes out is THREE
+        # (post, attach, wait) — and the fused client also holds ZERO handles for
+        # its claims, which is design 14 finding 5 answered.
+        #
+        # `server traps=18 for 8 messages` is one opening `wait`, then a `take`
+        # and a `reply_wait` per message, plus the closing read's own trap.
+        # **THE SERVER IS TWO PER MESSAGE AND NOT ONE, AND THE SECOND IS THE
+        # `take`**: the readable level says "there is something", never "here it
+        # is", so the take stays its own op until ruling 11(d)'s delivery-as-take
+        # lands in unit 4. What the fusion removed is exactly one — the composed
+        # loop is wait + take + reply, three.
+        #
+        # `last request b=7,80,73,78` is round 7's `PIN` with its sequence
+        # number, and `code=0x...21` is the child's verdict that every one of the
+        # eight replies carried ITS OWN number plus one. The two together are the
+        # payload round trip proved from both ends.
+        "name": "pipe_pingpong",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_PINGPONG_PKG,
+        "children": [CHILD_PINGPONG_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS: process exit: code={pingpong_mark} process={one}",
+                       "SOS pingpong: served=8 last request b=7,80,73,78",
+                       "SOS pingpong: client traps=11 for 8 round trips",
+                       "SOS pingpong: server traps=18 for 8 messages",
+                       "SOS pingpong: per RPC client=1 server=2"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **NOTHING PARKED CAN BE SILENTLY DOOMED, AND A FUSED CALL IS THE
+        # HARDEST CASE THAT RULE HAS MET** (sawos design 17; `designs/010`
+        # ruling 2). A thread inside `PipeInlet.send` is on NO LIST — no Waiter,
+        # no joiner chain — so the only thing that can reach it is the exchange
+        # it is tied to, which is what `PIPE_CALLER` and the one wake arm exist
+        # for.
+        #
+        # TWO ARMS, TWO WAYS TO KILL AN EXCHANGE, ONE ANSWER:
+        #
+        #   `dropped the obligation`   the server TOOK the message and then let
+        #                              the request fall out of scope. The
+        #                              exchange is `Taken` and the REQUEST
+        #                              column reaches zero.
+        #   `closed the server end`    the server end went away with the message
+        #                              still STAGED and never taken at all. The
+        #                              exchange is `Staged` and the CONNECTION's
+        #                              outlet column reaches zero.
+        #
+        # Different states, different columns, and both have to produce
+        # `PeerClosed` at the client — the same word `resolve` answers with,
+        # which is what says the fused and composed paths report one fact.
+        #
+        # **THE SECOND ARM TAKES TWO STEPS, AND THE FIRST IS NOT TIDINESS**: an
+        # attachment is a counted reference on the end it watches, so root's own
+        # subscription holds the server end open and the handle going is not the
+        # column reaching zero. `remove` then drop. That is ruling 11's
+        # abandonment re-wording seen from the server's side — hanging up means
+        # destroying the subscription too.
+        #
+        # `child said both were closed` is read out of the §8 status word:
+        # `code=0x...33` is reachable only if BOTH calls came back with that
+        # exact status, so root asserts a conjunction it could not have observed
+        # itself.
+        "name": "pipe_call_abandon",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_CALL_ABANDON_PKG,
+        "children": [CHILD_CALLER_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS childcaller: calling",
+                       "SOS callabandon: dropped the obligation",
+                       "SOS callabandon: closed the server end",
+                       "SOS: process exit: code={caller_mark} process={one}",
+                       "SOS callabandon: child said both were closed"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **THE ORPHANED-CLAIM ARM** (sawos design 17 D-2; `designs/010` ruling
+        # 4's rider names it and says the unit brief must). A fused call's claim
+        # is the ONE reference in the system no handle table holds — that is the
+        # saving — so `end_process`'s close-all cannot reach it and the teardown
+        # needed an arm of its own.
+        #
+        # **A PROCESS IS MADE TO DIE WITH A THREAD PARKED, which nothing outside
+        # it can arrange.** SOS cannot kill a thread, so `child-orphan` is two
+        # threads doing the SAME thing: one fused call each, and
+        # `ProcessOp.Exit` if it is answered. Root answers exactly one, and the
+        # symmetry is what makes that deterministic — root never has to know
+        # which thread it is talking to.
+        #
+        # `two calls in flight` is both messages taken, which means both threads
+        # are parked; the second take is separated from the first by a PARK
+        # rather than a poll, because nothing is staged until the sibling runs.
+        # `answered one` ends the process. `the orphaned claim answers ...` is
+        # the arm: root still holds the second obligation, and its `reply` is
+        # told `PeerClosed` — §2.1's ratified abandoned-by-client answer, reached
+        # with NO NEW VOCABULARY, because the teardown dropped the claim and
+        # `pipe_reply` read the columns exactly as it has since unit 2.
+        "name": "pipe_call_orphan",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_CALL_ORPHAN_PKG,
+        "children": [CHILD_ORPHAN_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS callorphan: two calls in flight",
+                       "SOS callorphan: answered one",
+                       "SOS: process exit: code={orphan_mark} process={one}",
+                       "SOS callorphan: the orphaned claim answers the other "
+                       "end of this connection is gone"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **THE FUSED CALL SPENDS `PipeInletRight.Post`** (sawos design 17's
+        # reviewed API), which is `pipe_no_post`'s case at the second op on the
+        # same object — and the pair is what says the two ops share one gate. A
+        # right of its own was refused deliberately: `Call` submits a message
+        # exactly as `post` does and what it adds is a park, which needs no
+        # authority because no Waiter is involved.
+        #
+        # **IT FAULTS BEFORE IT COULD EVER PARK**, and that is worth a case of
+        # its own for a blocking op: the check is in `pipe_inlet_op_decoded`,
+        # above `pipe_call`, so nothing is staged and no thread is tied to an
+        # exchange. A call that got past the gate here would park for ever —
+        # nobody serves this connection — and the deadlock report would be the
+        # answer instead of a fault.
+        "name": "pipe_no_call",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_NO_CALL_PKG,
+        "expect_out": ["{banner}",
+                       "SOS nocall: minted without Post",
+                       "SOS: process fault: access denied process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # **A `send` LONGER THAN THE PUBLISHED BODY IS A FAULT** (sawos design
+        # 17), which is `pipe_oversized`'s claim at the fused op. The maximum is
+        # a `sosabi` constant the caller imports, so a length above it is a
+        # mistake it could have checked — design 178's line for what stays
+        # outside the status enum entirely.
+        #
+        # BOTH ENDS ARE HELD, so `PeerClosed` is not an answer this could have
+        # got by accident: the length is refused ahead of the peer question and
+        # ahead of the ring, which is the order `pipe_call` states.
+        "name": "pipe_call_oversized",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_CALL_OVERSIZED_PKG,
+        "expect_out": ["{banner}",
+                       "SOS calloversized: calling with 129 bytes",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # **A SPENT OBLIGATION IS SPENT FOR `reply_wait` TOO** (sawos design
+        # 17), which is `pipe_dead_claim`'s case on the server side. Both
+        # `reply` and `reply_wait` disarm their wrapper before the trap, so an
+        # ordinary program can never meet this: reaching it takes asking a
+        # SECOND time through a husk, which is exactly what design 14 deviation
+        # 7 says such a case has to do.
+        #
+        # **THE FAULT IS RAISED IN THE DISPATCH, ABOVE THE OP TABLE.** A word
+        # that resolves to nothing names no kind, so there is no op to ask — and
+        # the new op inherits that for free, which is the claim: growing an
+        # object's op table does not grow the ways a stale handle can be used.
+        "name": "pipe_reply_wait_dead",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_REPLY_WAIT_DEAD_PKG,
+        "expect_out": ["{banner}",
+                       "SOS replywaitdead: discharged the obligation",
+                       "SOS: process fault: bad handle process={zero}"],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
     },

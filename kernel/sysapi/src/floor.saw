@@ -723,6 +723,80 @@ public func sos_pipe_inlet_post(handle: UInt, body: UnsafePointer<UInt8>,
                  value_out)
 }
 
+/// **CALL — post `len` bytes from `body`, PARK, and answer the REPLY's length**
+/// through `value_out`, with the reply's bytes in `reply` (sawos design 17; the
+/// fused client path of design 10 ruling 4's rider). Requires
+/// `PipeInletRight.Post` — the SAME bit `sos_pipe_inlet_post` spends, because a
+/// call submits a message exactly as a post does and the fusion is mechanics
+/// rather than authority.
+///
+/// **IT IS THE WHOLE RPC IN ONE TRAP**: post, wait for the answer, copy it out.
+/// The composed spelling — post, attach the claim to a Waiter, wait — is three,
+/// and both remain available; a caller picks by whether it wants to multiplex.
+///
+/// **IT NEVER ANSWERS `WouldBlock`.** A full staging ring PARKS the caller on
+/// the connection's room-to-post level and resumes it when an exchange settles,
+/// which is the leg the composed send has to write by hand.
+///
+/// `reply` takes no capacity of its own, on `sos_pipe_outlet_take`'s precedent:
+/// it is checked against `PIPE_BODY_BYTES` of the caller's REAL memory rather
+/// than against a number the caller typed. `len` may be 0. A `len` above
+/// `PIPE_BODY_BYTES`, a body outside this process's memory and a reply buffer
+/// that is not writable for a whole slot all TERMINATE the caller.
+///
+/// `SosStatus.PeerClosed` is the one refusal and it covers every way the answer
+/// can fail to arrive: the server end was already gone, the server dropped the
+/// obligation, the server end went while the caller was parked, or the caller's
+/// message was still staged when the last outlet handle went. It is `resolve`'s
+/// own convention, which is what makes the fused and composed paths report the
+/// same fact with the same word.
+///
+/// NO HANDLE IS MINTED, either way. That is the fused path's other saving: a
+/// blocking client spends no table row on a claim, so its in-flight depth stops
+/// being bounded by `MAX_HANDLES`.
+@export("sos_pipe_inlet_call")
+public func sos_pipe_inlet_call(handle: UInt, body: UnsafePointer<UInt8>,
+                                len: UInt, reply: UnsafePointer<UInt8>,
+                                value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, PipeInletOp.Call as UInt, body as UInt, len,
+                 reply as UInt, value_out)
+}
+
+/// **REPLY-WAIT — discharge this obligation, then park on a Waiter, in one
+/// trap** (sawos design 17; the fused server path). Requires
+/// `PipeRequestRight.Reply` here AND `WaiterRight.Wait` on the waiter the args
+/// record names — two rights on two objects, because the op does two things.
+///
+/// `args` is a `pipe_reply_wait_record_bytes()` copy-IN record: word 0 the
+/// Waiter handle, word 1 the reply body's address, word 2 its length. It goes
+/// through a record rather than through registers because the op has four
+/// things to say and §5.7 gives it three — `sos_timer_arm`'s door, used for the
+/// same reason. `args_bytes` must be EXACTLY that size.
+///
+/// `record` is where the delivery lands and is the same buffer
+/// `sos_waiter_wait` takes, checked against `wait_record_bytes()` of the
+/// caller's real memory.
+///
+/// **THE OBLIGATION IS DISCHARGED ON EVERY PATH**, so the caller's handle word
+/// is dead whatever comes back — §2.1's ratified sentence, and the reason the
+/// typed wrapper disarms before the trap.
+///
+/// **THE ANSWER HAS TWO CHANNELS.** `Ok` means the reply landed AND a delivery
+/// is in `record`. Any other status comes with a `ReplyWaitLeg` in `value_out`
+/// saying which half produced it: `Reply` (the client had abandoned its claim —
+/// the op returned WITHOUT parking, so one dead client cannot stall a server
+/// loop) or `Wait` (the reply LANDED and the wait itself broke, e.g.
+/// `SosStatus.Revoked`). `Wait` is zero, which is what every waker in the
+/// kernel writes anyway.
+@export("sos_pipe_request_reply_wait")
+public func sos_pipe_request_reply_wait(handle: UInt, args: UnsafePointer<UInt>,
+                                        args_bytes: UInt,
+                                        record: UnsafePointer<UInt>,
+                                        value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, PipeRequestOp.ReplyWait as UInt, args as UInt,
+                 args_bytes, record as UInt, value_out)
+}
+
 /// **TAKE — copy the OLDEST staged message into `body`, and answer a RECORD
 /// naming its length and the obligation to reply to it.** Requires
 /// `PipeOutletRight.Take`.

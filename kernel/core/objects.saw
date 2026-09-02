@@ -1201,6 +1201,30 @@ public(package) unsafe static var PIPE_REPLY_ATTACH: [Int; PIPE_EXCHANGES] = [
 public(package) unsafe static var PIPE_REQUEST_ATTACH: [Int; PIPE_EXCHANGES] = [
     0; PIPE_EXCHANGES]
 
+/// **THE THREAD PARKED IN A FUSED `Call` ON THIS EXCHANGE** (thread slot + 1;
+/// 0 = none), sawos design 17.
+///
+/// **IT IS A THIRD WAY TO NAME A CLAIM, AND THE ONLY ONE THAT IS NOT A HANDLE.**
+/// Design 10 ruling 4's rider says a fused call mints no `PipeReply` into the
+/// caller's table — zero handle traffic and zero table rows on the fast path —
+/// so the claim it holds is KERNEL-INTERNAL and tied to the parked thread. This
+/// array is that tie, and the reference model is unchanged underneath it: a
+/// parked caller counts ONE on `PIPE_REPLY_REFS`, exactly as a handle entry or
+/// an attachment would, so nothing can settle the ring slot out from under it.
+///
+/// **TWO DIRECTIONS, TWO FIELDS, AND EACH EARNS ITS PLACE.** This one answers
+/// "who is waiting for this exchange", which is what a settling reply has to
+/// know and what makes the wake arm a load rather than a scan of the thread
+/// table; `ThreadSlot.call_claim` answers "what is this thread waiting for",
+/// which is what the teardown has to know when a process dies parked. Neither
+/// question can be answered from the other side without a walk.
+///
+/// A parked caller is on NO LIST — it is not on a Waiter's `blocked` chain,
+/// because a fused call involves no Waiter at all — so this field is the whole
+/// of how it is reachable. That is why `exchange_settle` asserts it is clear.
+public(package) unsafe static var PIPE_CALLER: [Int; PIPE_EXCHANGES] = [
+    0; PIPE_EXCHANGES]
+
 /// The staged list's links — the next STAGED exchange in this connection, plus
 /// one, or zero at the end. Only ever appended at the tail and removed at the
 /// head (a take), or cleared whole (the outlet's zero-arm), so it is a strict
@@ -1442,6 +1466,16 @@ public(package) func exchange_settle(x: Int) unsafe {
     // the next `Post` is about to write.
     if PIPE_REPLY_ATTACH[x] != 0 || PIPE_REQUEST_ATTACH[x] != 0 {
         fatal_kernel("an exchange settled while attached", x as UInt)
+    }
+    // **AND NO THREAD CAN BE PARKED ON IT EITHER** (sawos design 17), which is
+    // the same invariant one kind of reference further along: a fused caller
+    // counts on the CLAIM column, so both columns at zero means nobody is
+    // parked. It is worth asserting for a sharper reason than the attachment
+    // pair's — a parked caller is on no list at all, so a settle that lost one
+    // would strand a thread nothing could ever reach again, which is precisely
+    // what design 10 ruling 2 forbids.
+    if PIPE_CALLER[x] != 0 {
+        fatal_kernel("an exchange settled with a caller parked on it", x as UInt)
     }
     PIPE_EX_STATE[x] = ExchangeState.Free
     PIPE_REPLY_REFS[x] = 0

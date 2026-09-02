@@ -58,8 +58,8 @@ import kcore.objects.{
     quota_clear,
     unbind_handle,
 }
-import kcore.refs.{notify_ready, reap_unreferenced, unref_teardown,
-                   unref_waitable_teardown}
+import kcore.refs.{notify_ready, reap_unreferenced, release_pending_calls,
+                   unref_teardown, unref_waitable_teardown}
 import kcore.threads.{
     CURRENT_THREAD,
     LAST_PROT_PROCESS,
@@ -357,6 +357,23 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
         }
     }
 
+    // **THE ORPHANED CLAIMS GO FIRST** (`designs/010` ruling 4's rider; sawos
+    // design 17 D-2). A thread parked in a fused `PipeInletOp.Call` holds its
+    // exchange's claim column open WITHOUT A HANDLE ENTRY — that is what the
+    // fused path buys — so the close-all below cannot reach it, and the thread
+    // sweep further down would recycle the slot while `PIPE_CALLER` still named
+    // it. Dropping the claim IS the abandonment the ratified rule describes:
+    // the column falls to zero, and the server's later `reply` reads that as
+    // abandoned-by-client and answers `Err(PeerClosed)` — no new vocabulary
+    // anywhere, which is what says the fused path is the composed one run
+    // differently.
+    //
+    // IT RUNS BEFORE THE CLOSE-ALL because the close-all drops endpoint columns
+    // and every one of those transitions NOTIFIES, and a notification must
+    // never find a thread of the process being torn down. `release_pending_calls`
+    // carries the two-pass argument for why its own unrefs cannot either.
+    release_pending_calls(p)
+
     // THE CLOSE-ALL GOES THROUGH `unbind_handle` (sawos design 3 D-1), which is
     // what makes a teardown and a release do the SAME thing to a slot: zero the
     // binding, BUMP the generation. It matters even though the whole table is
@@ -409,7 +426,9 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
                 case _ -> {
                     THREADS[t] = ThreadSlot(state: ThreadState.Free, process: 0,
                                             exit_code: 0,
-                                            joiners: 0, link: 0, wait_buf: 0)
+                                            joiners: 0, link: 0, wait_buf: 0,
+                                            call_pipe: 0, call_claim: 0,
+                                            call_src: 0, call_len: 0)
                     freed = freed + 1
                 },
             }

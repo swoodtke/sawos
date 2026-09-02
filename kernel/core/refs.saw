@@ -111,28 +111,36 @@
 //! know — comes through here.
 
 import hal
-import sosabi.{EventMode, ObjType, SosStatus, WAIT_HEADER_WORDS, WaitTag,
-               wait_header_bytes}
-import kcore.limits.{MAX_IOMEMORIES, MAX_MEMORIES, MAX_PIPES, PIPE_INFLIGHT}
+import sosabi.{EventMode, ObjType, PIPE_BODY_BYTES, ReplyLevel, SosStatus,
+               WAIT_HEADER_WORDS, WaitTag, wait_header_bytes}
+import kcore.limits.{MAX_IOMEMORIES, MAX_MEMORIES, MAX_PIPES, MAX_THREADS,
+                     NO_THREAD, PIPE_INFLIGHT}
 import kcore.diag.{ExitCode, fatal, fatal_kernel}
-import kcore.result.{op_ok, op_status, write_result}
+import kcore.result.{op_ok, op_status, op_value, write_result}
 import kcore.threads.{THREADS, ThreadState, frame_slot, ready_push}
 import kcore.objects.{
+    ExchangeState,
     IOMEMORIES,
     IoMemorySlot,
     MAPPINGS,
     MEMORIES,
     MappingSlot,
     MemorySlot,
+    NO_EXCHANGE,
     NO_ROW,
     PIPES,
+    PIPE_CALLER,
     PIPE_EXCHANGES,
+    PIPE_EX_STATE,
+    PIPE_LENS,
     PIPE_REPLY_ATTACH,
     PIPE_REPLY_REFS,
     PIPE_REQUEST_ATTACH,
     PIPE_REQUEST_REFS,
     QuotaKind,
     SlotState,
+    alloc_exchange,
+    exchange_body_addr,
     exchange_can_settle,
     exchange_pipe,
     exchange_settle,
@@ -141,6 +149,7 @@ import kcore.objects.{
     pipe_exchange_at,
     pipe_idle,
     quota_credit,
+    stage_push,
 }
 import kcore.time.{TIMERS, TimerSlot, reprogram_timer}
 import kcore.waitables.{
@@ -155,6 +164,9 @@ import kcore.waitables.{
     WaitableKind,
     WaiterSlot,
     accumulate,
+    call_room_waiter,
+    clear_pending_call,
+    tie_call_reply,
     detach_attachment,
     set_waitable_attachment,
     waitable_answer,
@@ -162,7 +174,7 @@ import kcore.waitables.{
     waitable_consume,
     waitable_ready,
 }
-import kcore.process.{PROCESSES, copy_out, reclaim_process_slot}
+import kcore.process.{PROCESSES, copy_in, copy_out, reclaim_process_slot}
 
 /// Something now names object `slot` of kind `kind`.
 ///
@@ -360,7 +372,13 @@ func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
                 pipe_drop_staged(slot)
                 // The client's room-to-post level is now `PeerGone`: posting is
                 // over, which is a better thing to be woken for than space.
-                notify_if_ready(WaitableKind.PipeInlet, slot)
+                // **AND EVERY THREAD PARKED IN A FUSED `Call` FOR ROOM IS TOLD
+                // HERE** (sawos design 17): `notify_room` serves the parked
+                // callers before the subscription, and on this transition it
+                // serves ALL of them, because a poster whose server end has gone
+                // is waiting for something that can never happen — design 10
+                // ruling 2's doctrine, reaching the one park that is on no list.
+                notify_room(slot)
                 // ...and every claim still naming a staged message learns that
                 // its obligation can never be minted.
                 notify_claims(slot)
@@ -411,7 +429,7 @@ func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
             if PIPE_REQUEST_REFS[slot] == 0 { return false }
             PIPE_REQUEST_REFS[slot] = PIPE_REQUEST_REFS[slot] - 1
             if PIPE_REQUEST_REFS[slot] == 0 {
-                notify_if_ready(WaitableKind.PipeReply, slot)
+                notify_claim(slot)
             }
             exchange_can_settle(slot)
         },
@@ -445,7 +463,7 @@ func settle_exchange(x: Int) unsafe {
     exchange_settle(x)
     match PIPES[c].state {
         case Free -> {},
-        case Live -> { notify_if_ready(WaitableKind.PipeInlet, c) },
+        case Live -> { notify_room(c) },
     }
 }
 
@@ -1159,8 +1177,202 @@ public(package) func notify_if_ready(kind: WaitableKind, slot: Int) unsafe {
 func notify_claims(c: Int) unsafe {
     var i: Int = 0
     while i < PIPE_INFLIGHT {
-        notify_if_ready(WaitableKind.PipeReply, pipe_exchange_at(c, i))
+        notify_claim(pipe_exchange_at(c, i))
         i = i + 1
+    }
+}
+
+// =============================================================================
+// THE FUSED CALL'S WAKE ARM (sawos design 17, M4 unit 3.5; `designs/010` ruling
+// 4's Aug-31 rider)
+// =============================================================================
+//
+// **ONE ARM, ASKED AT ONE QUESTION: is this claim a PARKED THREAD's, or a
+// SUBSCRIPTION's?** The rider says it in as many words — "the wake dispatch
+// grows ONE arm (a claim is a parked fused call -> wake the thread, or a
+// split-phase claim -> notify the Waiter — not a second wake protocol)" — and
+// `notify_claim` below is that sentence. Every producer of reply-readiness now
+// calls it instead of `notify_if_ready(PipeReply, …)`, so there is exactly one
+// place in the kernel where the two shapes of client are told apart.
+//
+// **THE SECOND ARM IS THE ROOM LEVEL'S, AND IT IS THE SAME SHAPE.** `Call` never
+// answers `WouldBlock` (design 10 ruling 8, reached from inside the op), so a
+// full ring parks the caller — and the level that ends that park is the inlet's
+// room-to-post one, which already had exactly two producers. `notify_room`
+// replaces `notify_if_ready(PipeInlet, …)` at both of them, asks the same
+// question, and routes into the same resume.
+//
+// WHAT A THREAD-TIED CLAIM CANNOT BE IS ATTACHED. A fused call mints no
+// `PipeReply` handle at all, so there is no word anybody could pass to
+// `Waiter.Add` — `PIPE_REPLY_ATTACH[x]` is provably zero for as long as
+// `PIPE_CALLER[x]` is not, which is why the two arms are alternatives rather
+// than two things to do in sequence.
+
+/// **A CLAIM'S LEVEL CHANGED — tell whoever holds it, whichever kind of holder
+/// that is.** The one arm.
+public(package) func notify_claim(x: Int) unsafe {
+    let parked = PIPE_CALLER[x]
+    if parked == 0 {
+        notify_if_ready(WaitableKind.PipeReply, x)
+        return
+    }
+    if not waitable_ready(WaitableKind.PipeReply, x) {
+        return
+    }
+    wake_call_reply(parked - 1, x)
+}
+
+/// **ANSWER A THREAD PARKED IN A FUSED `Call`** — `deliver_attachment`'s
+/// opposite number, and deliberately its mirror image.
+///
+/// The two do the same three things in the same order and differ only in where
+/// the answer goes: a delivery writes a wait RECORD and a fused call writes the
+/// reply BYTES and a value register, because a `Call` resumes inside its own
+/// syscall rather than inside a `Wait`. So the readiness is read through
+/// `waitable_answer` — the same matrix arm the split-phase path reads — the
+/// exchange is spent through `waitable_consume`, and the claim's reference is
+/// dropped last.
+///
+/// **THE UNREF IS LAST, AND THAT ORDER IS THE ONE SAFE ONE.** It can settle the
+/// ring slot and cascade all the way to a freed connection, and `exchange_settle`
+/// asserts that nobody is parked — so the tie has to be gone before the
+/// reference is. Nothing after the unref reads the exchange.
+///
+/// A REFUSED COPY-OUT IS A KERNEL BUG, on `deliver_wait_record`'s exact terms:
+/// `pipe_call` validated the reply buffer while the caller was running, and a
+/// process's window is fixed for its life.
+func wake_call_reply(t: Int, x: Int) unsafe {
+    let p = THREADS[t].process
+    let dst = THREADS[t].wait_buf
+    let answer = waitable_answer(WaitableKind.PipeReply, x)
+    var result = op_status(SosStatus.PeerClosed)
+    if answer.payload == (ReplyLevel.Data as UInt) {
+        if answer.body_len != 0 {
+            if let why = copy_out(p, dst, answer.body_src, answer.body_len) {
+                fatal("fused call reply refused by the copy door",
+                      (why as UInt8) as UInt, dst, p as UInt,
+                      ExitCode.ProcessFault)
+            }
+        }
+        result = op_value(answer.body_len)
+    }
+    waitable_consume(WaitableKind.PipeReply, x)
+    clear_pending_call(t)
+    write_result(frame_slot(t), result)
+    THREADS[t].state = ThreadState.Runnable
+    ready_push(t)
+    unref_waitable(WaitableKind.PipeReply, x)
+}
+
+/// **A CONNECTION'S ROOM LEVEL CHANGED — serve the parked callers, then the
+/// subscription.** The second arm.
+///
+/// It LOOPS where `notify_claim` does not, and the asymmetry is the two levels'
+/// own: a claim is one exchange with at most one holder, while room is a
+/// connection-wide level several threads may be waiting on at once. A settle
+/// frees ONE slot, so the ordinary pass serves one caller and the next finds no
+/// room and stops; a PEER-GONE transition serves every one of them, which is
+/// design 10 ruling 2's doctrine — nothing parked can be silently doomed, and a
+/// poster whose server end has died is exactly a thread waiting for something
+/// that can no longer happen.
+///
+/// The subscription is told afterwards and asks its own question: if a resumed
+/// caller took the freed slot, `notify_if_ready` finds the level false and says
+/// nothing, which is the honest answer rather than a special case.
+public(package) func notify_room(c: Int) unsafe {
+    var t = call_room_waiter(c)
+    while t != NO_THREAD {
+        if not resume_call_room(t, c) {
+            break
+        }
+        t = call_room_waiter(c)
+    }
+    notify_if_ready(WaitableKind.PipeInlet, c)
+}
+
+/// Stage a room-parked call's message now that there may be somewhere to put it,
+/// and re-park it on its exchange. Answers whether the thread stopped waiting
+/// for room — `false` means the ring is still full and it is still parked, which
+/// is what stops `notify_room`'s loop.
+///
+/// **IT IS `pipe_post`'s BODY, RUN IN SOMEBODY ELSE'S CONTEXT**, and the two
+/// differences are both consequences of that. The questions are asked in
+/// `pipe_post`'s own order (the outlet column before the ring, because nobody
+/// being able to take is the stronger fact), and the copy-in cannot be allowed
+/// to fault a process that is not running — so the address was checked at the
+/// call by `copy_in_check` and a refusal here stops the machine instead.
+///
+/// It mints nothing, which is the whole of what a fused call buys: the claim is
+/// the parked thread, `PIPE_REPLY_REFS` starts at one for it, and no handle row
+/// is spent.
+func resume_call_room(t: Int, c: Int) unsafe -> Bool {
+    let p = THREADS[t].process
+    if PIPES[c].outlet_refs == 0 {
+        clear_pending_call(t)
+        write_result(frame_slot(t), op_status(SosStatus.PeerClosed))
+        THREADS[t].state = ThreadState.Runnable
+        ready_push(t)
+        return true
+    }
+    let x = alloc_exchange(c)
+    if x == NO_EXCHANGE {
+        return false
+    }
+    let src = THREADS[t].call_src
+    let len = THREADS[t].call_len
+    let dst = THREADS[t].wait_buf
+    if len != 0 {
+        if let why = copy_in(p, exchange_body_addr(x), src, len) {
+            fatal("parked call body refused by the copy door",
+                  (why as UInt8) as UInt, src, p as UInt, ExitCode.ProcessFault)
+        }
+    }
+    PIPE_LENS[x] = len as UInt16
+    PIPE_REPLY_REFS[x] = 1
+    PIPE_REQUEST_REFS[x] = 0
+    PIPE_EX_STATE[x] = ExchangeState.Staged
+    stage_push(c, x)
+    tie_call_reply(t, x, dst)
+    notify_ready(WaitableKind.PipeOutlet, c)
+    true
+}
+
+/// **THE ORPHANED-CLAIM ARM: a process dying with threads parked in fused
+/// calls** (design 10 ruling 4's rider names it; sawos design 17 D-2).
+///
+/// A parked caller's claim is a reference NO HANDLE TABLE HOLDS, so the
+/// teardown's close-all cannot reach it and it would otherwise pin a ring slot
+/// — and, worse, leave `PIPE_CALLER` naming a thread slot about to be recycled.
+/// This is the arm that drops it, and dropping it IS the abandonment: the claim
+/// column falls to zero, which is what `pipe_reply` already reads as
+/// abandoned-by-client, so the server's later reply answers `Err(PeerClosed)`
+/// with no new vocabulary anywhere.
+///
+/// **IT RUNS BEFORE THE CLOSE-ALL, AND IN TWO PASSES.** Before, because the
+/// close-all drops endpoint columns and every one of those transitions notifies
+/// — and a notification must never find a thread of the process that is being
+/// torn down. Two passes, because the second one's unrefs CAN deliver: settling
+/// an exchange raises the room level, and serving a room waiter of this same
+/// dying process would be resuming a thread into a process that no longer has
+/// one. So the room waiters go first, which costs nothing at all (a room-parked
+/// call holds no exchange and therefore no reference), and by the time any
+/// reference is dropped this process has none left for a delivery to find.
+public(package) func release_pending_calls(p: Int) unsafe {
+    var t: Int = 0
+    while t < MAX_THREADS {
+        if THREADS[t].process == p && THREADS[t].call_pipe != 0 {
+            clear_pending_call(t)
+        }
+        t = t + 1
+    }
+    var u: Int = 0
+    while u < MAX_THREADS {
+        if THREADS[u].process == p && THREADS[u].call_claim != 0 {
+            let x = THREADS[u].call_claim - 1
+            clear_pending_call(u)
+            unref_waitable(WaitableKind.PipeReply, x)
+        }
+        u = u + 1
     }
 }
 

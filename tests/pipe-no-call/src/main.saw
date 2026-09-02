@@ -1,0 +1,75 @@
+// SOS M4 unit 3.5: THE FUSED CALL SPENDS `PipeInletRight.Post` (sawos design
+// 17's reviewed §API; spec §3).
+//
+// **THE SAME BIT, AND THAT IS THE RULING RATHER THAN A SHORTCUT.** `Call` was
+// deliberately NOT given a right of its own: it submits a message exactly as a
+// `post` does — same ring, same body maximum, same peer-gone answer — and what
+// it adds is a PARK, which needs no authority because no Waiter is involved and
+// the claim is kernel-internal. A second bit would let a launcher hand out an
+// endpoint that may post and may not do the cheap thing, which is a distinction
+// with no security content.
+//
+//   SOS nocall: minted without Post     a sibling that may travel and may mint
+//   SOS: process fault: access denied   ...and may not call either
+//
+// This is `pipe_no_post`'s case at the second op on the same object, and the
+// pair of them is what says the two ops share one gate.
+//
+// **IT FAULTS BEFORE IT COULD EVER PARK**, which is worth knowing about a
+// blocking op: the rights check runs in `pipe_inlet_op_decoded`, above
+// `pipe_call`, so nothing is staged, no thread is tied to an exchange, and the
+// refusal is the ordinary immediate one. A `Call` that got past the gate on this
+// connection would park for ever — nobody serves it — and the kernel's deadlock
+// report would be the answer instead.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, SosStatus, PipeInletRight,
+            PIPE_BODY_BYTES}
+
+static EXIT_FAILED: UInt = 1
+
+/// **THE KEEP MASK, AND `Post` IS ABSENT BY SILENCE** — `pipe_no_post`'s mask
+/// verbatim, which is the point: one mask, both ops.
+static NO_POST: UInt32 = (PipeInletRight.Transfer | PipeInletRight.Mint)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS nocall: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let pair = try proc.pipe_create() catch {
+        print("SOS nocall: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let (inlet, outlet) = move pair
+
+    let narrowed = try inlet.mint(rights: NO_POST) catch {
+        print("SOS nocall: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS nocall: minted without Post\n")
+
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 1
+    match narrowed.send(body: &msg, len: 1) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS nocall: an unspent right called\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        // UNREACHABLE: the line above does not return, because the kernel ends
+        // this process at the rights check. The arm is written so the refusal
+        // reads as a refusal rather than as a missing case.
+        case Err(e) -> {
+            print("SOS nocall: call refused: {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+    }
+}

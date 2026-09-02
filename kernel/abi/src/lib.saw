@@ -2157,8 +2157,43 @@ public enum MappingOp: UInt {
 /// ITS ARGUMENTS ARE (address, length), taken through the copy-IN funnel
 /// `Timer.Arm` opened: a body up to `PIPE_BODY_BYTES`, and a length of ZERO is
 /// legal because §2.1 makes a data-free message an option.
+/// **AND A SECOND OP SINCE M4 UNIT 3.5** (sawos design 17, on design 10 ruling
+/// 4's Aug-31 rider): `Call` is `post`, the park and the resolve run WITHOUT
+/// RETURNING TO USERSPACE. It is a performance amendment and not a semantic
+/// one — every rule the composed path obeys applies verbatim — so the two ops
+/// sit in one table rather than one replacing the other: `post` is still the
+/// primitive a multiplexer builds on, and `Call` is the fused shape of the
+/// blocking RPC that dominates.
 public enum PipeInletOp: UInt {
     case Post = 0,
+    /// **POST, PARK, AND RESOLVE BEHIND ONE TRAP** (design 10 ruling 4's rider;
+    /// sawos design 17).
+    ///
+    /// Its arguments are (body, length, reply buffer) and its value is the
+    /// REPLY's length. It is gated by `PipeInletRight.Post` and by nothing else
+    /// — a `Call` submits a message exactly as a `post` does, and the fusion is
+    /// mechanics rather than authority. The park needs no `Wait` right because
+    /// no Waiter is involved: the claim is KERNEL-INTERNAL, tied to the parked
+    /// thread, consumed at the reply, so a fused call mints no `PipeReply` into
+    /// the caller's table and spends no handle row.
+    ///
+    /// **IT NEVER ANSWERS `WouldBlock`** (ruling 8's level, reached from
+    /// inside): a full ring parks on the inlet's room-to-post level exactly as
+    /// the composed send does, and the poster resumes when an exchange settles.
+    /// `PeerClosed` is the one refusal, before or during, and it is what a
+    /// dropped obligation, a dead server end and an abandoned claim all come
+    /// back as.
+    ///
+    /// **NO DURATION ARGUMENT**: the kernel still never learns what a timeout
+    /// is (ruling 4). A caller that wants one composes `post` + `wait` + a
+    /// Timer, exactly as before.
+    ///
+    /// **THE REPLY BUFFER CARRIES NO CAPACITY**, on `PipeOutletOp.Take`'s own
+    /// precedent (design 14 deviation 1): the third argument register is spent
+    /// on the buffer's ADDRESS, so the buffer is checked against
+    /// `PIPE_BODY_BYTES` through the copy door and against the caller's REAL
+    /// memory — a stronger test than a number the caller typed.
+    case Call = 1,
 }
 
 /// A METHOD ID on a PipeOutlet — the SERVER end.
@@ -2214,8 +2249,64 @@ public enum PipeReplyOp: UInt {
 /// Its arguments are (body, length), `PipeInletOp.Post`'s shape mirrored — a
 /// length of ZERO is legal here too, because a reply that carries no data is
 /// still an answer.
+/// **AND A SECOND OP SINCE M4 UNIT 3.5** (sawos design 17, on design 10 ruling
+/// 4's rider as amended Sep 1): `ReplyWait` is a reply with a BUILT-IN WAIT —
+/// the server's half of the fused pair, and the mirror of `PipeInletOp.Call`.
+///
+/// **IT LIVES ON THE REQUEST, WHICH IS THE USER'S OWN PLACEMENT** (Sep 1): the
+/// reply is the primary act and it is what consumes the receiver, so the op
+/// belongs to the object being consumed and the wait is the fused tail. There
+/// is NO degenerate form and NO optional waiter — the first turn of a server
+/// loop is the existing `WaiterOp.Wait`, the dead-client recovery is that same
+/// call, and reply-without-wait is `Reply` above. An optional waiter would
+/// change the return type on a runtime value, which is the exact shape ruling 4
+/// and ruling 11(c) both refused.
 public enum PipeRequestOp: UInt {
     case Reply = 0,
+    /// **DISCHARGE THIS OBLIGATION, THEN PARK ON A WAITER, BEHIND ONE TRAP**
+    /// (sawos design 17).
+    ///
+    /// Its arguments are (args record, args record bytes, wait record buffer)
+    /// and it is gated by `PipeRequestRight.Reply` here PLUS the waiter's own
+    /// `WaiterRight.Wait` — both checked, because the op does both things. The
+    /// args record is `PIPE_REPLY_WAIT_RECORD_WORDS` long and carries the
+    /// waiter handle, the reply body's address and its length; the reply body
+    /// could not ride the registers beside a wait buffer, so the SMALL words
+    /// travel through the copy-IN funnel `TimerOp.Arm` opened and the body
+    /// stays an address, which is what keeps the wrapper from copying 128 bytes
+    /// of its own.
+    ///
+    /// **THE REQUEST IS CONSUMED ON EVERY PATH** (§2.1's ratified sentence, and
+    /// the transfer-funnel contract): a refused reply discharges the obligation
+    /// exactly as `Reply` does, and the op then returns WITHOUT PARKING so that
+    /// one dead client can never stall a server loop.
+    ///
+    /// **THE ANSWER HAS TWO CHANNELS AND THE VALUE REGISTER IS THE LEG**
+    /// (`ReplyWaitLeg`): `Ok` is a delivered wait record, and a failure carries
+    /// the status plus which half of the op produced it. `Wait` is ZERO for the
+    /// reason that makes the encoding free — every outcome after the park is a
+    /// wait-leg outcome, and every waker in the kernel already writes a zero
+    /// value register — so only the reply leg has to say anything at all.
+    case ReplyWait = 1,
+}
+
+/// **WHICH HALF OF A `PipeRequestOp.ReplyWait` PRODUCED THE ANSWER** (sawos
+/// design 17; user-ruled Sep 1 as the leg-tagged error).
+///
+/// It rides the VALUE register beside the status, and `Wait = 0` is
+/// load-bearing rather than arbitrary: a `ReplyWait` that gets past its reply
+/// leg PARKS, and every path that answers a parked thread — a delivery, a
+/// revocation, a teardown — writes a zero value register already. So the wait
+/// leg needs no cooperation from any waker, and the reply leg, which is the
+/// only outcome that returns without parking, is the one that stamps a number.
+///
+/// `Wait(_)` therefore says THE REPLY LANDED, which is the distinction the
+/// server loop is written against: a `Reply` leg failure means recover by
+/// waiting afresh, and a `Wait` leg failure means the exchange is complete and
+/// the WAITER is what broke.
+public enum ReplyWaitLeg: UInt {
+    case Wait = 0,
+    case Reply = 1,
 }
 
 // EVERY OP TABLE IS DENSE FROM ZERO, AND STAYS BELOW THE UNIVERSAL OPS (design
@@ -2249,13 +2340,13 @@ static_assert((IoMemoryOp.Map as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
 static_assert((MappingOp.Unmap as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
-static_assert((PipeInletOp.Post as UInt) < MINT_OP,
+static_assert((PipeInletOp.Call as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
 static_assert((PipeOutletOp.Take as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
 static_assert((PipeReplyOp.Resolve as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
-static_assert((PipeRequestOp.Reply as UInt) < MINT_OP,
+static_assert((PipeRequestOp.ReplyWait as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
 
 // ...and the two universal numbers are distinct and ordered, which is the fact
@@ -3001,6 +3092,36 @@ public static PIPE_TAKE_REQUEST_WORD: Int = 1
 /// the op. A FUNCTION for `pipe_create_record_bytes`' reason (DF-178f).
 public func pipe_take_record_bytes() -> Int {
     PIPE_TAKE_RECORD_WORDS * sizeof<UInt>()
+}
+
+/// Words in a `PipeRequest.ReplyWait` ARGUMENT record: the waiter handle, the
+/// reply body's address, the reply body's length (sawos design 17).
+///
+/// **IT GOES THE OTHER WAY — THIS IS A COPY-IN RECORD**, `TimerOp.Arm`'s door
+/// rather than `PipeOutletOp.Take`'s, and it exists for the plainest reason
+/// §5.7 gives: the op has FOUR things to say and three argument registers. A
+/// reply body, its length, a waiter and a destination for the delivery do not
+/// fit, so the three SMALL words ride the funnel and the register that is left
+/// carries the wait buffer.
+///
+/// **THE BODY STAYS AN ADDRESS RATHER THAN JOINING THE RECORD**, which is the
+/// one design decision in the layout: a record holding the body itself would
+/// make every `reply_wait` copy `PIPE_BODY_BYTES` in userspace before the trap,
+/// where an address costs one word and the kernel's own copy-in is the only
+/// copy there is. The address is checked by the copy door like any other.
+public static PIPE_REPLY_WAIT_RECORD_WORDS: Int = 3
+
+/// Where each argument lives. Named rather than written, on both sides of the
+/// boundary. The WAITER comes first because it is what makes this op different
+/// from the `Reply` it is otherwise a copy of.
+public static PIPE_REPLY_WAIT_WAITER_WORD: Int = 0
+public static PIPE_REPLY_WAIT_BODY_WORD: Int = 1
+public static PIPE_REPLY_WAIT_LEN_WORD: Int = 2
+
+/// Bytes in a `PipeRequest.ReplyWait` argument record — EXACTLY what the op
+/// must be handed. A FUNCTION for `pipe_create_record_bytes`' reason (DF-178f).
+public func pipe_reply_wait_record_bytes() -> Int {
+    PIPE_REPLY_WAIT_RECORD_WORDS * sizeof<UInt>()
 }
 
 // =============================================================================

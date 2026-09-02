@@ -599,13 +599,29 @@ public(package) func copy_out(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe 
 /// is the whole rule, and it is one function long so it stays checkable by
 /// reading.
 ///
-/// There is deliberately no `copy_in_check` split beside `copy_out_check`. That
-/// split exists for exactly one caller — `Waiter.Wait`, which validates a
-/// destination when it PARKS and writes it much later — and no inbound op can
-/// have that shape: a copy-in happens while the calling process is still the
-/// running one, by construction, because its arguments are what the op is
-/// about. A door that cannot be used late needs no early check.
-public(package) func copy_in(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe -> FaultReason? {
+/// **THE INBOUND DOOR'S CHECK, WITHOUT THE COPY** — `copy_out_check`'s twin, and
+/// M4 unit 3.5 is what it exists for (sawos design 17).
+///
+/// The paragraph that used to stand here said no `copy_in_check` was owed,
+/// because the split exists for a caller that validates when it PARKS and reads
+/// much later, and "no inbound op can have that shape: a copy-in happens while
+/// the calling process is still the running one, by construction". THE FUSED
+/// `PipeInletOp.Call` IS THE OP THAT BROKE THAT SENTENCE. A `Call` that meets a
+/// full ring parks on the inlet's room level (design 10 ruling 8, reached from
+/// inside), and the message it has not staged yet is still sitting in the
+/// caller's memory — so the copy happens at the RESUME, in whichever context
+/// freed the slot, exactly as a wait record's copy-out happens in the waker's.
+///
+/// So the rule generalizes rather than bending: A DOOR THAT CAN BE USED LATE
+/// OWES AN EARLY CHECK, both directions, and the reason is the same one
+/// `Waiter.Wait` gives — a bad buffer is the calling process's mistake and
+/// terminating it while it is still the running process is both the better
+/// diagnostic and the simpler thing to reason about.
+///
+/// A process's granted region is fixed for its life, so a source that passes
+/// here cannot fail later; `pipe_call`'s resume treats a refusal as a kernel
+/// invariant broken, exactly as `deliver_wait_record` treats its own.
+public(package) func copy_in_check(p: Int, src: UInt, bytes: UInt) unsafe -> FaultReason? {
     if (src % word_bytes()) != 0 {
         return FaultReason.BadAlign
     }
@@ -621,6 +637,13 @@ public(package) func copy_in(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe -
     }
     if bytes > PROCESSES[p].region_top - src {
         return FaultReason.BadBuffer
+    }
+    None
+}
+
+public(package) func copy_in(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe -> FaultReason? {
+    if let why = copy_in_check(p, src, bytes) {
+        return why
     }
     copy_bytes(dst, src, bytes)
     None
@@ -989,7 +1012,9 @@ public func start_process(entry: UInt, stack_top: UInt,
     let _ = mint_handle(p, ObjType.Thread, thread_rights(), main)
     THREADS[main] = ThreadSlot(state: ThreadState.Running, process: p,
                                exit_code: 0,
-                               joiners: 0, link: 0, wait_buf: 0)
+                               joiners: 0, link: 0, wait_buf: 0,
+                               call_pipe: 0, call_claim: 0, call_src: 0,
+                               call_len: 0)
     quota_charge(p, QuotaKind.Thread)
     CURRENT_THREAD = main
     SLICE_LEFT = SLICE_TICKS
