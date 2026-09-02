@@ -818,7 +818,54 @@ the record to SPEND. `pipe-cq`'s serve loop is the worked example — a borrowin
 `let (_, what) = (move wake).open()` and matches the owned payload, moving both
 wrappers out of one arm.
 
-### 13.9 Re-gate
+### 13.9 Re-gate, and the accounting
 
-See the parked report; the accounting in §12 is the FIRST park's and the re-gate
-supersedes it.
+**222/222 on both architectures**, gated at `8b1d43b` against the SAME baseline
+`7362a3f` §12 used. The buckets are unchanged in shape and the delta chain is
+worth reading in two steps.
+
+**AGAINST THE BASELINE**, the picture is §12's with two rows renamed:
+
+| bucket | riscv32 | arm64 |
+|---|---|---|
+| new image rows | 9 | 9 |
+| image rows GROWN | 49 | 48 |
+| image rows SHRUNK | 3 | 0 |
+| image rows UNCHANGED | 47 | 51 |
+| new case rows | 6 | 6 |
+
+Nine new packages rather than eight — `pipe-stale-attach` left and
+`pipe-send-exit` + `child-sender` arrived. The case count is the same six, with
+`pipe_send_exit` where `pipe_stale_attach` was, appended in the same position so
+no existing index moved; no case row was removed, none carries a mark other than
+`✓`, and the shared rows are in an IDENTICAL ORDER. Summary `210` → `222`.
+Totals: riscv32 1,717,380 → 2,192,132 B (+27.6%), arm64 2,051,032 → 2,509,784 B
+(+22.4%) — the same cause §12 names, cross-tabulated the same way: all 100 moved
+rows belong to packages that name the pipe/wait surface, and every package that
+names none of it is unchanged.
+
+**AGAINST THE FIRST PARK**, which is what the re-rule and the payload
+restoration actually cost, the answer is: almost nothing.
+
+| | riscv32 | arm64 |
+|---|---|---|
+| shared rows | 106 | 106 |
+| moved | 40 | 2 |
+| total | +19,528 B (**+0.80%**) | **+0 B** (page rounding absorbs it) |
+
+Every moved row is argued and they fall in four groups:
+
+- **`pipe-delegate-msg` +5,848 / +4,096** — the largest by far, and it is the
+  owned-match sweep: the case gained `reply_of`, a nested owned match that
+  consumes its scrutinee twice, where it used to read two optional fields.
+- **Five SHRANK on riscv32** — `pipe-handles` −1,864, `pipe-cq` −800,
+  `pipe-wait-server` −760, `pipe-delegate` −232, `pipe-wait-reply` −96. These
+  are the cases that stopped carrying `WaitResult`'s two optional fields, or
+  (the first two) whose bodies got simpler under the re-rule.
+- **A ~+600 B floor across every waiter-using image** — the decode grew a
+  `ReplyDelivery` construction and the three `&self` accessors.
+- **`timer-interval` −4,096 on arm64** is the same shrink, quantized: the
+  wait record's decoded form lost two optional fields.
+
+That the re-rule itself is nearly free in image terms is expected and worth
+stating: it moved WHEN a handle changes hands, not how much code says so.
