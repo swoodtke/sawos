@@ -1,0 +1,227 @@
+// SOS M4 unit 4: HANDLES IN MESSAGES, BOTH DIRECTIONS, WITH THE LEDGER OBSERVED
+// (sawos design 18; spec §2.1's `send(data?, handles?)`; `designs/010` ruling 5).
+//
+// **THE LEDGER IS THE HALF THIS CASE EXISTS FOR.** That a capability can travel
+// in a message is proved by the child using what it was sent; that the SENDER
+// keeps it until the rendezvous is a claim about the handle table, and a claim
+// about a table needs a way to look at one. Root's is looked at by MINTING
+// SIBLINGS UNTIL IT REFUSES: the depth of that recursion is exactly how many
+// slots were free, and reading it at three moments is ruling 5 written as a
+// number.
+//
+//   free BEFORE the post          the entry is root's, bound, counted
+//   free AFTER the post           THE SAME NUMBER — staging took nothing
+//   free after the child TAKES    ONE MORE — the rendezvous unbound it
+//
+// A design that copied the handle at the post would move the first number; one
+// that counted a reference for the message would move it the other way; one that
+// never unbound the sender's entry would leave the third unchanged. Only ruling
+// 5's shape produces this sequence.
+//
+// **EVERY OTHER HANDLE MOVE IS KEPT OUTSIDE THE READINGS.** A mint, a give and a
+// take each move this table too, so the launch happens before the first reading
+// and the claim the post mints is GIVEN to the Waiter rather than added — which
+// releases its entry as part of the attach and leaves the staged handle as the
+// only thing the comparison is about.
+//
+// **THE REPLY DIRECTION IS DELIBERATELY NOT PROVED HERE.** §2.1's
+// `send(data?, handles?)` means both directions and `pipe-delegate-msg` is where
+// the answering half is shown: a capability coming back on THIS reply would land
+// in root's table at the delivery and net out against the entry the rendezvous
+// freed, which would make the third reading say nothing at all. One case
+// measures the ledger and the other exercises the symmetry.
+//
+// **HOW ROOT KNOWS THE CHILD HAS TAKEN**, which is what makes the third reading
+// well-defined: the child posts through the inlet it was handed, and root waits
+// on the far end of THAT connection. The message cannot exist unless the take
+// happened, so the wait is the synchronisation and no poll is involved.
+//
+// ONE PHASE PER FUNCTION, per design 14 finding 3: every `print` with format
+// arguments reserves message scratch in its own frame, so a single long `_start`
+// meets root's 16 KiB stack grant on the 64-bit profile before it meets anything
+// else.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
+            PipeHandle, PipeHandles, PipeMsg, Waiter, WaitResult, WaitPayload,
+            OutletLevel, SystemRight, SosStatus, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// ROOT'S CONFIG, and the whole of the contract with the child.
+static TAG_BOOT: UInt = 7
+static TAG_OUTLET: UInt = 11
+
+/// The keys root attaches under. Two attachments on one Waiter, so the key is
+/// what says which of them woke it.
+static KEY_READABLE: UInt = 31
+static KEY_REPLY: UInt = 32
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The byte `child-handles` posts through an inlet it was handed, and the length
+/// of the reply it sends back.
+static BYTE_VIA: UInt8 = 86
+static REPLY_LEN: UInt = 4
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS handles: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS handles: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// Launch, send the capability, and hand off to the two observing phases.
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var image = try proc.boot_handle_next()
+    var dest = try proc.boot_handle_next()
+    guard let image_mem = image.take_memory() else { return BUG }
+    guard let dest_mem = dest.take_memory() else { return BUG }
+
+    let child = try system.process_create(image: &image_mem, memory: &dest_mem)
+
+    // CONNECTION A: root posts, the child takes. CONNECTION B: the capability
+    // that travels, and the one root listens on afterwards.
+    let a = try proc.pipe_create()
+    let (a_in, a_out) = move a
+    let b = try proc.pipe_create()
+    let (b_in, b_out) = move b
+    let waiter = try proc.waiter_create()
+    try waiter.add(outlet: &b_out, key: KEY_READABLE)
+    let _ = system.debug_print("SOS handles: created\n")
+
+    // EVERY HANDLE MOVE THAT IS NOT THE ONE UNDER TEST HAPPENS HERE, ahead of
+    // the first reading.
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT)
+    try child.give(outlet: move a_out, tag: TAG_OUTLET)
+
+    let before = free_slots(&system)
+
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 1
+    var carrying = PipeHandles.none()
+    carrying.put(0, inlet: move b_in)
+    let staged = try a_in.post_with(body: &msg, len: 1, handles: &var carrying)
+    guard let claim = move staged else { return BUG }
+    // **GIVEN, NOT ADDED.** A post mints a claim into this table; handing it to
+    // the subscription releases that entry as part of the attach (`designs/010`
+    // ruling 11(c)), so the second reading is about the staged handle alone.
+    try waiter.give(reply: move claim, key: KEY_REPLY) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+
+    let after_post = free_slots(&system)
+
+    try child.start(boot_tag: TAG_BOOT)
+
+    let via = try hear_post(&waiter, &b_out)
+    let after_take = free_slots(&system)
+
+    try verdict(&system, before, after_post, after_take, via)
+    try hear_reply(&system, &waiter)
+    return
+}
+
+/// The three readings, checked and printed.
+///
+/// **THE NUMBERS ARE PRINTED AND THE VERDICT IS ASSERTED**, which is design 16's
+/// own arrangement: how many slots root's table happens to have free is a
+/// property of this program's other handles, while the RELATIONS between the
+/// three are what ruling 5 claims.
+func verdict(system: &System, before: UInt, after_post: UInt, after_take: UInt,
+             via: UInt8) -> Result<Void, SosStatus> {
+    print("SOS handles: free before={} after post={} after take={}\n",
+          before, after_post, after_take)
+    if after_post != before {
+        let _ = system.debug_print("SOS handles: staging moved the ledger\n")
+        return BUG
+    }
+    if after_take != before + 1 {
+        let _ = system.debug_print("SOS handles: the rendezvous did not move the entry\n")
+        return BUG
+    }
+    if via != BYTE_VIA {
+        let _ = system.debug_print("SOS handles: the child posted the wrong byte\n")
+        return BUG
+    }
+    let _ = system.debug_print("SOS handles: the post kept the entry and the take moved it\n")
+    return
+}
+
+/// **THE CHILD'S POST, WHICH IS THE PROOF THE HANDLE WORKS** — and, because root
+/// cannot be woken here unless the take happened, the synchronisation the third
+/// ledger reading needs. Answers the byte the child wrote.
+func hear_post(waiter: &Waiter, b_out: &PipeOutlet) -> Result<UInt8, SosStatus> {
+    let heard = try waiter.wait()
+    if heard.key != KEY_READABLE {
+        return BUG
+    }
+    let arrived = try b_out.take()
+    guard let (from_child, their_request) = move arrived else { return BUG }
+    let via = from_child.bytes[0]
+    let _ = move from_child
+    let _ = move their_request
+    return via
+}
+
+/// **THE ANSWER, THROUGH THE SUBSCRIPTION THAT OWNS THE CLAIM.** Root never
+/// resolves: the bytes arrive IN the wait record (`designs/010` ruling 11(a)),
+/// and the claim's own entry went at the `give`.
+///
+/// The reply carries DATA and no handle, deliberately — see `child-handles`. A
+/// capability coming back here would land in this table at the delivery and net
+/// out against the one the rendezvous freed, which would make the third ledger
+/// reading say nothing at all. The reply direction's handles are
+/// `pipe-delegate-msg`'s proof, where nothing is counting slots.
+func hear_reply(system: &System, waiter: &Waiter) -> Result<Void, SosStatus> {
+    var back = try waiter.wait()
+    if back.key != KEY_REPLY {
+        return BUG
+    }
+    guard let payload = back.message.take() else { return BUG }
+    let reply = move payload
+    if reply.len != REPLY_LEN {
+        return BUG
+    }
+    let _ = move reply
+    let _ = system.debug_print("SOS handles: the answer came back through the subscription\n")
+    return
+}
+
+/// **HOW MANY FREE SLOTS THIS PROCESS'S HANDLE TABLE HAS**, counted by filling it
+/// and letting go.
+///
+/// There is no introspection op — a process cannot ask what it holds, which is
+/// §3's own shape — so the table is measured the only way a capability system
+/// allows: by asking for one more until the answer is no. Each frame holds its
+/// sibling across the recursion, so the depth IS the occupancy, and the unwind
+/// gives every slot back before the caller sees the number.
+///
+/// It is exact rather than approximate: root's handle quota is unlimited, so the
+/// wall this meets is the TABLE and nothing else.
+func free_slots(system: &System) -> UInt {
+    let got = try? system.mint()
+    guard let held = move got else { return 0 }
+    let deeper = free_slots(&system)
+    let _ = move held
+    deeper + 1
+}

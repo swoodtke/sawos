@@ -56,12 +56,15 @@ func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
 /// Take, and discharge the obligation by dropping it. Nobody is listening — the
 /// claims went at the posts — so each exchange settles and its ring slot goes
 /// back.
-func take_message(outlet: &PipeOutlet,
-                  into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<UInt?, SosStatus> {
-    let got = try outlet.take(into: &var into)
-    if let (n, request) = move got {
+func take_message(outlet: &PipeOutlet) -> Result<UInt?, SosStatus> {
+    let got = try outlet.take()
+    if let (msg, request) = move got {
         let _ = move request
-        let some: UInt? = n
+        // The FIRST BYTE rather than the length, since M4 unit 4 moved the
+        // message's bytes into the record the take answers with: what this arm
+        // proves is WHICH message drained, and the length of every one of them
+        // is 1.
+        let some: UInt? = msg.bytes[0] as UInt
         return move some
     }
     return None
@@ -78,7 +81,6 @@ func _start(boot_handle: UInt) {
     }
 
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
-    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
 
     // =========================================================================
     // ARM ONE — the SERVER end goes, and the client is told.
@@ -142,32 +144,31 @@ func _start(boot_handle: UInt) {
     let _ = move sender
     let _ = system.debug_print("SOS peergone: inlet dropped\n")
 
-    let first = try take_message(&receiver, &var buf) catch {
+    let first = try take_message(&receiver) catch {
         print("SOS peergone: first take was refused: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    guard let _ = first else {
+    guard let a = first else {
         let _ = system.debug_print("SOS peergone: first message vanished\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let a = buf[0] as UInt
-    let second = try take_message(&receiver, &var buf) catch {
+    let second = try take_message(&receiver) catch {
         print("SOS peergone: second take was refused: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    guard let _ = second else {
+    guard let b = second else {
         let _ = system.debug_print("SOS peergone: second message vanished\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    print("SOS peergone: drained a={} b={}\n", a, buf[0] as UInt)
+    print("SOS peergone: drained a={} b={}\n", a, b)
 
     // ...and ONLY NOW is the server told. The ring is empty and no sender can
     // ever appear, so this is the terminal answer rather than a would-block.
-    match take_message(&receiver, &var buf) {
+    match take_message(&receiver) {
         case Ok(_) -> {
             let _ = system.debug_print("SOS peergone: drained ring still had one\n")
             let _ = system.shutdown(EXIT_FAILED)
@@ -178,7 +179,7 @@ func _start(boot_handle: UInt) {
 
     // NOTHING UN-CLOSES. Asking again answers the same word, which is what makes
     // this a level a caller can act on rather than an edge it might miss.
-    match take_message(&receiver, &var buf) {
+    match take_message(&receiver) {
         case Ok(_) -> {
             let _ = system.debug_print("SOS peergone: a closed pipe re-opened\n")
             let _ = system.shutdown(EXIT_FAILED)

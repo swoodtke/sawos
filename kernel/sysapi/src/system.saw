@@ -223,8 +223,23 @@ extension System {
     ///
     /// It can therefore FAIL, where reading a cached word could not: a full
     /// handle table is `SosStatus.NoResource`.
-    public func process_self(&self) -> Result<Process, SosStatus> {
-        let raw = try call_value(self.handle, SystemOp.ProcessSelf as UInt, 0, 0, 0)
+    /// **AND IT TAKES A KEEP MASK SINCE M4 UNIT 4** (`designs/010` agenda 7b;
+    /// sawos design 18), which closes the M3-unit-6 finding spec §9 records.
+    /// `process_rights()` is ONE default set, so a child used to derive its own
+    /// Process handle carrying `InterruptBind` and `Map` whatever its SYSTEM
+    /// handle had been narrowed to — a launcher's mask reached the sibling it
+    /// gave and not the handle the child derived from it. The mask is
+    /// `mint(rights:)`'s in every respect: an intersection, total, fail-closed,
+    /// and all-ones by default so no existing caller changed.
+    ///
+    /// ```saw
+    /// let proc = try system.process_self(keep: ProcessRight.ThreadCreate
+    ///                                          | ProcessRight.Exit)
+    /// ```
+    public func process_self(&self,
+                             keep: UInt32 = ALL_RIGHTS) -> Result<Process, SosStatus> {
+        let raw = try call_value(self.handle, SystemOp.ProcessSelf as UInt,
+                                 keep as UInt, 0, 0)
         return Process(handle: ProcessHandle(raw))
     }
 
@@ -605,11 +620,12 @@ extension Process {
     /// Give a memory REGION to this process under `tag`, consuming the wrapper.
     /// Requires `ProcessRight.Give` here and `MemoryRight.Transfer` on the
     /// region — which every boot region carries.
-    public func give(&self, memory: Memory, tag: UInt) -> Result<Void, SosStatus> {
+    public func give(&self, memory: Memory, tag: UInt,
+                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, SosStatus> {
         var region = move memory
         let word: UInt = region.handle
         region.handle = MemoryHandle(NO_HANDLE)
-        return checked(sos_process_give(self.handle, word, tag))
+        return checked(sos_process_give(self.handle, word, tag, keep as UInt))
     }
 
     /// Give a DEVICE WINDOW to this process under `tag`, consuming the wrapper.
@@ -635,11 +651,12 @@ extension Process {
     /// one: by value, disarm before the syscall, let the disarmed value drop.
     /// What root gives away it cannot map anywhere.
     public func give(&self, iomemory: IoMemory,
-                     tag: UInt) -> Result<Void, SosStatus> {
+                     tag: UInt,
+                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, SosStatus> {
         var window = move iomemory
         let word: UInt = window.handle
         window.handle = IoMemoryHandle(NO_HANDLE)
-        return checked(sos_process_give(self.handle, word, tag))
+        return checked(sos_process_give(self.handle, word, tag, keep as UInt))
     }
 
     /// Give a SYSTEM handle to this process under `tag`, consuming the wrapper.
@@ -663,11 +680,12 @@ extension Process {
     /// lets the narrowed handle arrive. So a child holds `Transfer` too, which is
     /// inert today (nothing it can reach is a receiver) and is a recorded finding
     /// for the unit that gives a child a pipe.
-    public func give(&self, system: System, tag: UInt) -> Result<Void, SosStatus> {
+    public func give(&self, system: System, tag: UInt,
+                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, SosStatus> {
         var authority = move system
         let word: UInt = authority.handle
         authority.handle = SystemHandle(NO_HANDLE)
-        return checked(sos_process_give(self.handle, word, tag))
+        return checked(sos_process_give(self.handle, word, tag, keep as UInt))
     }
 
     /// Give the CLIENT END of a connection to this process under `tag`,
@@ -694,11 +712,12 @@ extension Process {
     /// value, disarm before the syscall, let the disarmed value drop. What you
     /// give away you cannot post through.
     public func give(&self, inlet: PipeInlet,
-                     tag: UInt) -> Result<Void, SosStatus> {
+                     tag: UInt,
+                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, SosStatus> {
         var client = move inlet
         let word: UInt = client.handle
         client.handle = PipeInletHandle(NO_HANDLE)
-        return checked(sos_process_give(self.handle, word, tag))
+        return checked(sos_process_give(self.handle, word, tag, keep as UInt))
     }
 
     /// Give the SERVER END of a connection to this process under `tag`,
@@ -710,11 +729,12 @@ extension Process {
     /// and keeps the inlet, and the child's loop is a `take` poll. Unit 5's
     /// driver-as-service is that shape with a protocol on top.
     public func give(&self, outlet: PipeOutlet,
-                     tag: UInt) -> Result<Void, SosStatus> {
+                     tag: UInt,
+                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, SosStatus> {
         var server = move outlet
         let word: UInt = server.handle
         server.handle = PipeOutletHandle(NO_HANDLE)
-        return checked(sos_process_give(self.handle, word, tag))
+        return checked(sos_process_give(self.handle, word, tag, keep as UInt))
     }
 
     /// Give a CLAIM ON A REPLY to this process under `tag`, consuming the
@@ -731,11 +751,12 @@ extension Process {
     /// The transfer-funnel contract is the same as the funnels above: by value,
     /// disarm before the syscall, let the disarmed value drop.
     public func give(&self, reply: PipeReply,
-                     tag: UInt) -> Result<Void, SosStatus> {
+                     tag: UInt,
+                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, SosStatus> {
         var claim = move reply
         let word: UInt = claim.handle
         claim.handle = PipeReplyHandle(NO_HANDLE)
-        return checked(sos_process_give(self.handle, word, tag))
+        return checked(sos_process_give(self.handle, word, tag, keep as UInt))
     }
 
     /// Give an OBLIGATION TO REPLY to this process under `tag`, consuming the
@@ -754,11 +775,12 @@ extension Process {
     /// needing a `give` at all — a request handle travelling IN A MESSAGE is what
     /// makes the example a protocol rather than a launch-time wiring.
     public func give(&self, request: PipeRequest,
-                     tag: UInt) -> Result<Void, SosStatus> {
+                     tag: UInt,
+                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, SosStatus> {
         var obligation = move request
         let word: UInt = obligation.handle
         obligation.handle = PipeRequestHandle(NO_HANDLE)
-        return checked(sos_process_give(self.handle, word, tag))
+        return checked(sos_process_give(self.handle, word, tag, keep as UInt))
     }
 
     /// **MAKE A CONNECTION IN THIS PROCESS, and receive BOTH of its ends** (spec

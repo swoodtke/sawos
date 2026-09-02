@@ -1678,6 +1678,19 @@ public static MINT_OP: UInt = 0xFFFE
 /// every number that is not an op, which is also what retired `OP_SYSTEM_MAX`:
 /// the range check and the decode are now one operation instead of two that
 /// could disagree.
+/// `ProcessSelf` TAKES A KEEP MASK SINCE M4 UNIT 4, and it closes a finding M3
+/// unit 6 recorded and could not fix (spec §9; `designs/010` agenda 7b, landed by
+/// sawos design 18). `process_rights()` is ONE default set, so a child derived
+/// its own Process handle with `InterruptBind` and `Map` on it whatever its
+/// SYSTEM handle had been narrowed to — a launcher's mask reached the System
+/// sibling it gave and not the Process handle the child derived from it, which
+/// is the one place in the system where attenuation was not monotonic in
+/// practice. The mask is `MINT_OP`'s, on `MINT_OP`'s terms: `process_rights() &
+/// keep`, all-ones is the old behaviour, and a bit the default set does not hold
+/// is a no-op. A process narrowing its OWN derivation is the shape that makes it
+/// useful — a launcher that means to hand a child a Process handle without
+/// `Stats` gives the child a System sibling and the child derives what it needs.
+///
 /// `ClockGet` is the fourth, and it is a GETTER rather than a factory: the
 /// object already exists — one kernel-eternal Clock per domain — so the op only
 /// ever hands out a HANDLE onto it. **EVERY ASK MINTS A FRESH ONE** (sawos
@@ -1754,6 +1767,24 @@ public enum SystemOp: UInt {
 /// unread at the child's drain, the `Waiter.add` key precedent exactly. The
 /// kernel is a courier, never an interpreter; root and child agree on meaning
 /// through config and manifest.
+///
+/// **AND IT TAKES A KEEP MASK SINCE M4 UNIT 4 — ATTENUATE AT GIVE**
+/// (`designs/010` agenda 7b, landed by sawos design 18). A third argument, on
+/// `MINT_OP`'s exact terms: the entry the child receives carries
+/// `source & keep`, all-ones is "the rights the giver held" and is what the
+/// no-argument spelling means, and a bit the source does not hold is a no-op.
+/// The polarity is `MINT_OP`'s ruling and the reason is the same one: A KEEP
+/// MASK FAILS CLOSED when a kind gains a right in a later unit, where a removal
+/// mask would hand every future authority to every child a launcher had ever
+/// configured.
+///
+/// **IT AMENDS design 4 D-1's "RIGHTS VERBATIM", AND WHAT IT SAVES IS A HANDLE
+/// ROW.** Attenuating before a give was always possible — mint a masked sibling
+/// and give THAT, which is the flow the launch path runs today — but it costs a
+/// table row and a trap for a handle whose only purpose is to be moved out
+/// immediately. Naming the mask AT the give says the same thing in one op. The
+/// two-step spelling is unchanged and still works; nothing about no-amplification
+/// moves, because an intersection is an intersection wherever it is written.
 ///
 /// **`PipeCreate` IS THE FACTORY FOR A CONNECTION** (sawos design 10 ruling 3,
 /// built by design 13), and it sits here rather than on System because pipes are
@@ -2154,9 +2185,13 @@ public enum MappingOp: UInt {
 /// `SosStatus.PeerClosed` leave the value register meaningless and the typed tier
 /// answers `Ok(None)` for the first.
 ///
-/// ITS ARGUMENTS ARE (address, length), taken through the copy-IN funnel
-/// `Timer.Arm` opened: a body up to `PIPE_BODY_BYTES`, and a length of ZERO is
-/// legal because §2.1 makes a data-free message an option.
+/// **ITS ARGUMENTS ARE A `PipeSendRecord` SINCE M4 UNIT 4** (sawos design 18) —
+/// (record address, record bytes) through the copy-IN funnel `Timer.Arm`
+/// opened. Unit 1's (address, length) fitted two registers; a message carries
+/// HANDLES now, so the body's address, its length and four handle words travel
+/// together in one record. A length of ZERO is still legal, because §2.1 makes a
+/// data-free message an option — and so is a record whose four handle slots are
+/// all `NO_HANDLE`, which is what an ordinary data-only post looks like.
 /// **AND A SECOND OP SINCE M4 UNIT 3.5** (sawos design 17, on design 10 ruling
 /// 4's Aug-31 rider): `Call` is `post`, the park and the resolve run WITHOUT
 /// RETURNING TO USERSPACE. It is a performance amendment and not a semantic
@@ -2169,8 +2204,12 @@ public enum PipeInletOp: UInt {
     /// **POST, PARK, AND RESOLVE BEHIND ONE TRAP** (design 10 ruling 4's rider;
     /// sawos design 17).
     ///
-    /// Its arguments are (body, length, reply buffer) and its value is the
-    /// REPLY's length. It is gated by `PipeInletRight.Post` and by nothing else
+    /// Its arguments are (send record, record bytes, reply record buffer) and
+    /// its value is the REPLY's length. **THE REPLY IS A `PipeMsgRecord` SINCE
+    /// M4 UNIT 4** (sawos design 18), because a reply carries handles on exactly
+    /// the terms a request does — §2.1's `send(data?, handles?)` is symmetric —
+    /// so the destination is the same delivered-message layout a `Take` writes.
+    /// It is gated by `PipeInletRight.Post` and by nothing else
     /// — a `Call` submits a message exactly as a `post` does, and the fusion is
     /// mechanics rather than authority. The park needs no `Wait` right because
     /// no Waiter is involved: the claim is KERNEL-INTERNAL, tied to the parked
@@ -2210,10 +2249,14 @@ public enum PipeInletOp: UInt {
 /// do; growing an op's answer between units is what §5.7's renumberable-op
 /// discipline makes free, and unit 1 said at this very table that it would.
 ///
-/// Its arguments are (record, record capacity, body). The BODY carries no
-/// capacity of its own any more: it is checked against `PIPE_BODY_BYTES` —
-/// still the published minimum — through the copy door and against the caller's
-/// REAL memory, which is a stronger test than the number the caller used to type.
+/// **AND THE MESSAGE MOVED INTO THAT RECORD IN M4 UNIT 4** (sawos design 18).
+/// Its arguments are (record, record capacity) and nothing else: a message
+/// carries HANDLES now, so a separate body buffer would have become a body
+/// buffer plus a handle buffer plus a kind buffer. `PipeTakeRecord` is the
+/// obligation, the packed meta, the handle words and the body in one
+/// fixed-prefix layout, copied out as ONE contiguous prefix ending at the
+/// message's length — so a short message still pays for no part of the 128-byte
+/// body region.
 public enum PipeOutletOp: UInt {
     case Take = 0,
 }
@@ -2231,8 +2274,11 @@ public enum PipeOutletOp: UInt {
 /// that remains for a caller that chose it. A claim whose answer was delivered
 /// through a wait answers `PeerClosed` here — there is no second copy.
 ///
-/// Its arguments are (buffer, capacity) and its value is the reply's LENGTH —
-/// `PipeOutletOp.Take`'s unit-1 shape, reused verbatim on the way back.
+/// Its arguments are (record, capacity) and its value is the reply's LENGTH.
+/// **THE RECORD IS A `PipeMsgRecord` SINCE M4 UNIT 4** (sawos design 18) —
+/// `PipeOutletOp.Take`'s own shape reused on the way back, which is what §2.1's
+/// symmetric `send(data?, handles?)` asks for: a reply may carry handles, so the
+/// polling door has to be able to hand them over too.
 public enum PipeReplyOp: UInt {
     case Resolve = 0,
 }
@@ -2246,9 +2292,11 @@ public enum PipeReplyOp: UInt {
 /// discharged all the same, which is §2.1's ratified sentence: never a silent
 /// success, ignorable with `let _ =` on the std-Channel close precedent.
 ///
-/// Its arguments are (body, length), `PipeInletOp.Post`'s shape mirrored — a
-/// length of ZERO is legal here too, because a reply that carries no data is
-/// still an answer.
+/// Its arguments are a `PipeSendRecord` — (record address, record bytes),
+/// `PipeInletOp.Post`'s shape mirrored, and mirrored again in M4 unit 4 when a
+/// message grew handles (sawos design 18). A length of ZERO is legal here too,
+/// because a reply that carries no data is still an answer, and so is a reply
+/// that carries nothing but handles.
 /// **AND A SECOND OP SINCE M4 UNIT 3.5** (sawos design 17, on design 10 ruling
 /// 4's rider as amended Sep 1): `ReplyWait` is a reply with a BUILT-IN WAIT —
 /// the server's half of the fused pair, and the mirror of `PipeInletOp.Call`.
@@ -2269,12 +2317,12 @@ public enum PipeRequestOp: UInt {
     /// Its arguments are (args record, args record bytes, wait record buffer)
     /// and it is gated by `PipeRequestRight.Reply` here PLUS the waiter's own
     /// `WaiterRight.Wait` — both checked, because the op does both things. The
-    /// args record is `PIPE_REPLY_WAIT_RECORD_WORDS` long and carries the
-    /// waiter handle, the reply body's address and its length; the reply body
-    /// could not ride the registers beside a wait buffer, so the SMALL words
-    /// travel through the copy-IN funnel `TimerOp.Arm` opened and the body
-    /// stays an address, which is what keeps the wrapper from copying 128 bytes
-    /// of its own.
+    /// args record is a `PipeReplyWaitRecord`: a waiter handle in front of the
+    /// same `PipeSendRecord` every other sending op takes. The reply body could
+    /// not ride the registers beside a wait buffer, so the SMALL words travel
+    /// through the copy-IN funnel `TimerOp.Arm` opened and the body stays an
+    /// address, which is what keeps the wrapper from copying 128 bytes of its
+    /// own.
     ///
     /// **THE REQUEST IS CONSUMED ON EVERY PATH** (§2.1's ratified sentence, and
     /// the transfer-funnel contract): a refused reply discharges the obligation
@@ -2502,6 +2550,84 @@ static_assert(PIPE_BODY_BYTES <= 1024,
 static_assert(PIPE_BODY_BYTES % 8 == 0,
               "a staging slot must be doubleword-sized on both profiles")
 
+/// **HANDLES ONE MESSAGE MAY CARRY, AS A BUILD DEFINE** (spec §2.1's
+/// `send(data?, handles?)`; sawos design 10 ruling 6, landed by design 18).
+///
+/// **IT IS HERE AND NOT IN `kcore.limits`, WHICH IS DESIGN 13 DEVIATION 1
+/// VERBATIM.** Ruling 6 names three build defines and asks for them as
+/// `kcore.limits` statics; unit 1 moved `PIPE_BODY_BYTES` here and left
+/// `PIPE_INFLIGHT` there, on a cut this number falls the same side of. A ring's
+/// DEPTH is a slab dimension nothing outside the kernel needs — a caller meeting
+/// a full ring is told `WouldBlock` and never has to know the number — while
+/// this is A SIZE THE TWO HALVES MUST AGREE ON: the number of handle words a
+/// `Post` may name, the number of slots a delivery record carries, and the
+/// length of the `[PipeHandle?; PIPE_MSG_HANDLES]` a typed caller declares. A
+/// caller cannot even spell the array without it. One declaration, in the module
+/// both halves compile against.
+///
+/// Four, which is ruling 6's own number. The asserts pin the range §2.1 implies:
+/// a message that could carry no handle at all would delete the delegation
+/// primitive, and the slots are copied inside one bounded rendezvous, so the
+/// count stays small enough that the copy is still a bounded copy.
+public static PIPE_MSG_HANDLES: Int = 4
+
+static_assert(PIPE_MSG_HANDLES >= 1,
+              "a message must be able to carry at least one handle")
+static_assert(PIPE_MSG_HANDLES <= 8,
+              "a message's handles move inside one rendezvous — keep the count bounded")
+
+// **AND THE ONE RANGE THE PACKED META WORD RESTS ON** (design 18's amended
+// layout). A delivery's body LENGTH rides a single byte beside the kind bytes
+// rather than spending a machine word of its own, which is only honest while the
+// longest body a message can carry still fits one — 128 does, 256 would not.
+static_assert(PIPE_BODY_BYTES <= (UInt8.max as Int),
+              "a message body's length rides one byte of the packed meta word")
+
+/// **WHAT A MESSAGE'S HANDLE SLOTS CARRY BESIDE THEIR WORDS** — the packed meta
+/// (design 18, amended at the STOP; user-ruled Sep 2).
+///
+/// **A HANDLE WORD DOES NOT SAY WHAT IT NAMES, AND THE RECEIVER HAS TO KNOW.** A
+/// word is `(generation << HANDLE_INDEX_BITS) | (index + 1)` and carries no
+/// kind; every OTHER handle crossing in the system either implies the kind from
+/// the op (`Post` answers a claim, `Take` answers an obligation, `mint` answers
+/// its source's kind) or transmits it — and the transmitting precedent is the
+/// boot-handle record, which is three words because the middle one is a
+/// `BootHandleKind`. A message's slots are the first place the kind is genuinely
+/// variable, so the kinds travel, exactly as they do there.
+///
+/// **THEY ARE BYTES, AND THE LENGTH PACKS IN WITH THEM** (the user's own
+/// amendment). A `BootHandleKind` is a small closed set and a body length is at
+/// most `PIPE_BODY_BYTES`, so five of the six things a delivery has to say about
+/// its variable tail fit in five bytes — and a standalone `body_len` WORD would
+/// have spent four or eight bytes to carry a number that fits in one. Packing
+/// them is what makes the fixed prefix cost two machine words on riscv32 and ONE
+/// on arm64 rather than two and two.
+///
+/// ZERO IS THE EMPTY SLOT, at every position: `BootHandleKind` has no zero-valued
+/// spelling for "nothing" and does not need one, because a slot's kind byte and
+/// its handle word are zero together — which is the same `NO_HANDLE`-is-not-an-
+/// index rule the handle table already runs on. The KINDS are what a decode reads
+/// first: a slot whose kind byte is zero is `None` and its word is never looked
+/// at, which is what lets a delivery that carries no handles leave those words
+/// unwritten.
+///
+/// A STRUCT RATHER THAN A PACKED INTEGER, and for `WaitBuffer`'s own reason:
+/// declaration order IS the layout (design 58), so the field names here are the
+/// wire description and there is no shift-and-mask arithmetic for the two halves
+/// to disagree about. It is five bytes with alignment one, so it sits inside
+/// whatever padding the word-aligned region after it needs.
+public struct PipeMsgMeta {
+    /// How many of the body's bytes are real. Zero is a data-free message,
+    /// which §2.1 makes an option rather than an absence.
+    public len: UInt8,
+    /// What each message slot names — a `BootHandleKind` raw value, or 0 for an
+    /// empty slot.
+    public kinds: [UInt8; PIPE_MSG_HANDLES],
+}
+
+static_assert(sizeof<PipeMsgMeta>() == 1 + PIPE_MSG_HANDLES,
+              "the packed meta is one length byte and one kind byte per slot")
+
 // =============================================================================
 // The wait record (spec §2.2, as amended by design 178 M2 unit 3 rider 3, and
 // grown a BODY by design 10 ruling 11(a) — sawos design 15, M4 unit 3)
@@ -2580,45 +2706,92 @@ public enum WaitTag: UInt {
     /// abandoned"). No payload: the fact IS the notification, and it is
     /// TERMINAL, because a reply column that reached zero can never rise.
     case Abandoned = 7,
+    /// **THE DELIVERY WAS THE TAKE** (`designs/010` ruling 11(d); sawos design
+    /// 18) — a persistent-consuming outlet attachment being HANDED a message
+    /// rather than told there is one. The record carries the packed meta, the
+    /// obligation the kernel minted at the delivery, the message's handles and
+    /// its bytes.
+    ///
+    /// **IT IS A SEPARATE TAG FROM `Readable`, AND THE SPLIT IS WHAT A TAG IS
+    /// FOR**: the two say different things about the RECORD's shape, so a decode
+    /// telling them apart by looking at a handle slot would be reading the
+    /// payload to find out what the payload is. `Readable` still means there is
+    /// something to take, which is what a borrowing `add(outlet:)` delivers.
+    case Message = 8,
 }
 
-/// Words in a wait record's HEADER: key, tag, payload, body length.
+/// Words in a wait record's HEADER: key, tag, payload.
 ///
-/// **THE FOURTH WORD IS M4 UNIT 3's** (design 10 ruling 11(a)). A delivery may
-/// now carry BYTES — a reply body, up to `PIPE_BODY_BYTES` of it — and the
-/// header word is how many of the body region are real. It is zero for every
-/// word-payload kind, which is all of them but one.
-public static WAIT_HEADER_WORDS: Int = 4
+/// **IT WENT BACK TO THREE IN M4 UNIT 4** (design 18, amended at the STOP). Unit
+/// 3 added a fourth word for the body's LENGTH; the packed meta carries that
+/// number in a BYTE now, beside the kind bytes it has to travel with anyway, so
+/// the word is gone and the record is smaller than it was between the two units.
+/// A length that fits in a byte should not spend a machine word.
+public static WAIT_HEADER_WORDS: Int = 3
 
 /// Where each lives. Named rather than written, on both sides of the boundary.
 public static WAIT_KEY_WORD: Int = 0
 public static WAIT_TAG_WORD: Int = 1
 public static WAIT_PAYLOAD_WORD: Int = 2
-public static WAIT_BODY_LEN_WORD: Int = 3
 
-/// **THE BUFFER A `Waiter.Wait` CALLER MUST SUPPLY** — the header, then a body
-/// region big enough for the largest delivery there is (sawos design 15).
+/// Handle words in a wait record: one REQUEST slot, then one per message slot
+/// (design 18; `designs/010` ruling 11(d)'s delivery-as-take needs the first and
+/// ruling 5's rendezvous needs the rest).
 ///
-/// **IT IS MAX-SIZED AND THE COPY IS NOT** (ruled Sep 1, user). A parked waiter
-/// cannot predict which arm fires, so the BUFFER has to hold the biggest answer
-/// any of its attachments could give; the KERNEL copies only what the delivery
-/// needs — four header words for a word-payload kind, four words plus
-/// `body_len` for a reply carrying data. So the record's growth costs a
-/// non-pipe waiter buffer SPACE and never copy TIME.
+/// The request slot is FIRST and is the one whose kind needs no byte: a wait
+/// record's request slot is a `PipeRequest` or it is empty, so the word being
+/// non-zero is the whole of what a decode has to ask. `PipeMsgMeta`'s kind bytes
+/// describe the four that follow it, where the kind genuinely varies.
+public static WAIT_HANDLE_SLOTS: Int = 1 + PIPE_MSG_HANDLES
+
+/// Where each handle slot sits inside the record's handle region.
+public static WAIT_REQUEST_SLOT: Int = 0
+public static WAIT_MSG_SLOT_0: Int = 1
+
+/// **THE BUFFER A `Waiter.Wait` CALLER MUST SUPPLY** — the header, the packed
+/// meta, the handle region, then a body region big enough for the largest
+/// delivery there is (sawos design 15, grown by design 18).
 ///
-/// A STRUCT RATHER THAN A WORD ARRAY, and the reason is the body's alignment.
-/// Declaration order IS the layout (design 58), so the header words put the
-/// struct at machine-word alignment — which `Waiter.Wait` requires — and the
-/// body region lands at exactly `wait_header_bytes()`, which is the offset the
-/// kernel writes it at. A `[UInt8; N]` beside a `[UInt; N]` in one array could
-/// not have said that.
+/// **HANDLES BEFORE BYTES — THE FIXED-PREFIX / VARIABLE-TAIL RULE** (user-ruled
+/// Sep 2). Everything whose size is fixed comes first and the body is the tail,
+/// so EVERY copy-out is a CONTIGUOUS PREFIX: a delivery that carries handles and
+/// no data writes the prefix and stops, and never pays for a 128-byte hole it
+/// would have had to skip over if the body sat in the middle. Every handle word
+/// and every kind byte therefore sits at an offset the decode knows without
+/// reading anything first.
+///
+/// **AND THE COPY IS STILL SIZED TO THE DELIVERY** (ruled Sep 1, user, and
+/// unchanged by the growth). A parked waiter cannot predict which arm fires, so
+/// the BUFFER holds the biggest answer any of its attachments could give; the
+/// KERNEL writes only what the delivery needs. Two prefix lengths, and the meta
+/// is what tells them apart:
+///
+///   - a WORD-PAYLOAD delivery — an Event, an Interrupt, a Timer, a death, a
+///     room level, an abandoned claim, a readable outlet nobody is taking
+///     through — writes `wait_meta_end_bytes()` and stops. All five meta bytes
+///     are zero, so a decode reads no handle word and no body byte.
+///   - a MESSAGE delivery — a reply carrying data or handles, and ruling 11(d)'s
+///     delivery-as-take — writes `wait_prefix_bytes()` plus the meta's `len`.
+///
+/// So a Timer waiter pays for the growth in buffer space and never in copy time,
+/// which is the sentence unit 3 wrote here and unit 4 keeps.
+///
+/// A STRUCT RATHER THAN A WORD ARRAY, and the reason is alignment — now twice
+/// over. Declaration order IS the layout (design 58), so the header words put the
+/// struct at machine-word alignment, the five meta BYTES sit in the padding the
+/// word-aligned handle region needs anyway, and the body lands at exactly
+/// `wait_body_offset()`. **THAT PADDING IS WHERE THE PER-PROFILE ANSWER LIVES**:
+/// the meta occupies one machine word on the 64-bit profile and two on the
+/// 32-bit one, and it is the natural ABI that says so rather than a number
+/// anybody computed.
 public struct WaitBuffer {
     public header: [UInt; WAIT_HEADER_WORDS],
+    public meta: PipeMsgMeta,
+    public handles: [UInt; WAIT_HANDLE_SLOTS],
     public body: [UInt8; PIPE_BODY_BYTES],
 }
 
-/// Bytes in a wait record's HEADER — where the body region starts, and exactly
-/// what a word-payload delivery writes.
+/// Bytes in a wait record's HEADER — where the packed meta starts.
 ///
 /// A FUNCTION AND NOT A `static`, which is a language limitation rather than a
 /// choice: `sizeof<UInt>()` does not fold in a static initializer, even though
@@ -2629,113 +2802,76 @@ public func wait_header_bytes() -> Int {
     WAIT_HEADER_WORDS * sizeof<UInt>()
 }
 
+/// Bytes a WORD-PAYLOAD delivery writes: the header and the packed meta, with
+/// whatever padding the handle region's alignment adds.
+///
+/// **IT IS THE SHORT PREFIX, AND IT INCLUDES THE PADDING ON PURPOSE.** The
+/// alternative — stopping at the meta's last real byte — would leave a copy
+/// length that differs from an offset the caller can compute, and would buy back
+/// at most seven bytes on a path that is already the cheapest one. Ending at the
+/// handle region's start keeps one arithmetic for both halves.
+public func wait_meta_end_bytes() -> Int {
+    // THE PARENTHESES ARE LOAD-BEARING: a binary expression does not wrap in
+    // Saw unless brackets already enclose it, and a newline ends a statement —
+    // so the un-bracketed spelling parses as a discarded subtraction followed
+    // by a NEGATED tail, which is a silently wrong answer rather than an error.
+    (sizeof<WaitBuffer>() - PIPE_BODY_BYTES
+     - WAIT_HANDLE_SLOTS * sizeof<UInt>())
+}
+
+/// Bytes a MESSAGE delivery writes before its body — the whole fixed prefix, and
+/// the offset the body region starts at.
+public func wait_prefix_bytes() -> Int {
+    sizeof<WaitBuffer>() - PIPE_BODY_BYTES
+}
+
 /// Bytes in a wait record BUFFER on THIS machine — the minimum capacity a caller
 /// must give `Waiter.Wait`, and what the kernel checks the buffer against.
 ///
-/// **IT MOVED IN M4 UNIT 3, AND THE vDSO DISCIPLINE IS WHAT MADE THAT FREE**
-/// (design 10 ruling 11(a)): every caller's buffer comes out of `sos.waiter`'s
-/// own frame, so the number is written once here and read once there.
+/// **IT MOVED IN M4 UNIT 3 AND AGAIN IN UNIT 4, AND THE vDSO DISCIPLINE IS WHAT
+/// MAKES THAT FREE** (design 10 ruling 11(a), then design 18): every caller's
+/// buffer comes out of `sos.pipe`'s own frame, so the number is written once here
+/// and read once there. The two raw-altitude waiters in the suite over-provision
+/// deliberately and are checked against this number rather than tracking it.
 public func wait_record_bytes() -> Int {
     sizeof<WaitBuffer>()
 }
 
 static_assert(sizeof<WaitBuffer>() >= WAIT_HEADER_WORDS * sizeof<UInt>()
+                                      + sizeof<PipeMsgMeta>()
+                                      + WAIT_HANDLE_SLOTS * sizeof<UInt>()
                                       + PIPE_BODY_BYTES,
-              "a wait buffer must hold the header AND a whole message body")
+              "a wait buffer must hold the header, the meta, every handle slot AND a whole message body")
 
-/// What became ready, decoded — one case per waitable kind.
-///
-/// The Event's payload is its ACCUMULATED WORD, and carrying it here is what
-/// makes the common wait one syscall instead of two: a dispatcher that only
-/// needs to know how many times something happened never has to follow up with
-/// a `receive`.
-///
-/// **THE DELIVERY CONSUMES THE WORD** (ruled Aug 17, user). This record is not a
-/// copy left beside the object — the kernel reads the word and clears it in one
-/// masked-interrupts step, so the bits in the record are bits nothing else will
-/// ever be told about. A `receive` right after a wake therefore answers ZERO
-/// unless somebody signalled in between, and a signal that lands after the take
-/// re-arms readiness with its own bits alone.
-///
-/// TWO DOORS ONTO ONE VALUE, and that is the whole model: §2.4's `receive` is
-/// the non-blocking poll and this record is the blocking one. A process picks
-/// the door by whether it wants to park, never by what it will be told. The
-/// alternative — a snapshot the wait leaves behind — would report the same bits
-/// to the next wait as well, and a recipient cannot tell that duplicate from a
-/// real second signal.
-/// THE INTERRUPT'S PAYLOAD IS ITS LINE, and that is the whole answer a driver
-/// needs: it woke because a device asserted, and the line says which. There is
-/// no count and no timestamp, because §9 ratifies AT MOST ONE UNACKED FIRE per
-/// Interrupt — a second assertion while the first is unacked cannot happen, the
-/// line being masked — so "how many" is always one and would be a field that
-/// only ever held the same number.
-///
-/// A driver that owns exactly one line already knows which it is, so the field
-/// looks redundant there; it is not, because the shape §2.2 exists for is a
-/// dispatcher parked on SEVERAL. Such a dispatcher gets the line without a
-/// side-table, exactly as it gets the key.
-/// THE TIMER'S PAYLOAD IS ITS FIRE COUNT, and it is a count where the
-/// Interrupt's deliberately is not (design 232 unit 1). The two differ because
-/// their invariants do: §9 masks a line on fire, so an Interrupt can never have
-/// two outstanding and "how many" would always read one — while a Timer has no
-/// mask and nothing to hold it back, so a periodic one whose consumer was
-/// descheduled genuinely expired several times. COALESCING those into a number
-/// is what stops a slow consumer from either falling permanently behind a queue
-/// of fires or silently losing them.
-///
-/// It SATURATES rather than wrapping, on §2.4's counting-Event reasoning
-/// exactly: zero is what "not ready" means, so a count that rolled through it
-/// would make a busy timer go quiet.
-///
-/// THE WAIT CONSUMES IT, exactly as it consumes an Event's word: the count is
-/// drained by the wait that reports it, because a Timer has no second op to
-/// drain with and needs none — the fire was delivered to somebody, so it is
-/// spent. That is the ack-free half of the timerfd model. The Interrupt is the
-/// kind that differs, and §9 says why: its readiness ends at the driver's `ack`,
-/// because the line stays masked until the DEVICE has been serviced.
-///
-/// **THE PROCESS PAYLOAD IS §8's STATUS WORD, AND THAT IS THE WHOLE OF WHAT
-/// UNIT 5.5 ADDED TO THIS ENUM** (sawos design 8). Kind in the high bits,
-/// code in the low ones — read it with the same arithmetic `get_status`
-/// answers with, because it IS that answer: attaching a Process handle and
-/// polling one are two doors onto one word, exactly as `receive` and a wait
-/// are two doors onto an Event's.
-///
-/// **NOTHING UN-DIES, so the wait does NOT consume it.** An Event's word and a
-/// Timer's fire count are spent by the delivery that reports them; a death is
-/// the TERMINAL LEVEL, so the second wait on one attachment answers the same
-/// word as the first, and a waiter that attaches after the death is told at
-/// once. That is the property supervision needs — there is no window in which a
-/// death can be missed — and it is why this case has nothing to say about
-/// draining.
-///
-/// **THE FOUR PIPE ARMS ARE M4 UNIT 3's** (sawos design 15), and one of them is
-/// unlike everything above it: `Reply` CARRIES THE ANSWER'S BYTES. The other
-/// three are word-shaped levels in the mould of the four that shipped — a
-/// readable outlet, a postable inlet, an abandoned claim — and the reply is
-/// design 10 ruling 11(a)'s whole point, which is that the wait IS the delivery
-/// and a composed client never has to call `resolve` at all.
-public enum WaitPayload {
-    case Event(word: UInt),
-    case Interrupt(line: UInt),
-    case Timer(fires: UInt),
-    case Process(status: UInt),
-    /// The SERVER end has something, or will never have anything again.
-    case Readable(state: OutletLevel),
-    /// The CLIENT end has room to post, or nobody is left to take.
-    case Room(state: InletLevel),
-    /// The answer to one exchange — the bytes, or the news that nobody will
-    /// ever write them.
-    case Reply(outcome: ReplyDelivery),
-    /// The claim behind this obligation was dropped. There is nothing to say
-    /// beyond the fact, which is why this case has no payload.
-    case Abandoned,
-}
+// THE FIXED PREFIX IS A WHOLE NUMBER OF MACHINE WORDS, which is what makes "a
+// contiguous prefix ending at the body's length" an arithmetic rather than a
+// hope: the handle region is word-aligned and word-sized, so everything ahead of
+// the body is too, and the two profiles differ only in how many words the meta's
+// five bytes occupy — TWO on riscv32, ONE on arm64.
+static_assert((sizeof<WaitBuffer>() - PIPE_BODY_BYTES) % sizeof<UInt>() == 0,
+              "a wait record's fixed prefix must be a whole number of machine words")
 
-/// The tier the `Reply` payload carries upward (design 139's wrapper rule): an
-/// enum holding a NoCopy payload declares a policy exactly as a struct with such
-/// a field does, and this is the compiler asking for it.
-extension WaitPayload: NoCopy {}
+// AND THE META REALLY FITS THE REGION THE SHORT PREFIX ENDS AT. This is the one
+// that would catch a `PIPE_MSG_HANDLES` raised past what the padding absorbs.
+static_assert(sizeof<WaitBuffer>() - PIPE_BODY_BYTES
+                  - WAIT_HANDLE_SLOTS * sizeof<UInt>()
+              >= WAIT_HEADER_WORDS * sizeof<UInt>() + sizeof<PipeMsgMeta>(),
+              "the packed meta must fit between the header and the handle region")
+
+// **THE DECODED FORMS ARE NOT HERE ANY MORE — THEY LIVE IN `sos.pipe`** (design
+// 18, amended at the STOP; user-ruled Sep 2). `WaitPayload`, `WaitResult`,
+// `PipeMsg` and `ReplyDelivery` were declared in this module by unit 3, which
+// was right for as long as a delivery carried only WORDS AND BYTES. Unit 4 puts
+// HANDLES in a message, and a handle at the typed tier is an owning `sos`
+// wrapper — an `Event`, a `PipeReply`, a `Memory` — which THIS module can never
+// name: `sos` depends on `sosabi` and nothing depends the other way, which is
+// the whole of why the numbers can be kernel-internal.
+//
+// So the four moved up and `decode_wait` and `Waiter.wait` moved with them, to
+// the one module that can name every wrapper a message may carry. WHAT STAYS
+// HERE IS THE WIRE: the tag, the three level enums, the record's word offsets
+// and `WaitBuffer` itself — everything the KERNEL writes, which is exactly the
+// half this module exists to keep the two sides agreeing about.
 
 /// A `PipeOutlet`'s readable level, decoded (sawos design 15).
 ///
@@ -2768,54 +2904,6 @@ public enum ReplyLevel: UInt {
     case PeerClosed = 1,
 }
 
-/// A message body, and how many of its bytes are real (sawos design 15).
-///
-/// **ONE STRUCT, DECLARED BY THE UNIT THAT NEEDED IT FIRST** (user-ruled Sep 1,
-/// over an inline array case): unit 4's message-carrying deliveries will hand
-/// over exactly this shape beside their handles, so a reply delivery and a
-/// message delivery grow ONE type rather than two that must be kept alike.
-///
-/// **`NoCopy`, AND THAT IS API DISCIPLINE RATHER THAN OWNERSHIP.** The bytes are
-/// plain data and would copy for free (design 159's automatic tier), which is
-/// exactly the problem: `PIPE_BODY_BYTES` of inline storage should not be
-/// duplicated by an accident of binding. Callers that only route the bytes take
-/// them by REFERENCE out of the payload.
-public struct PipeMsg {
-    public len: UInt,
-    public bytes: [UInt8; PIPE_BODY_BYTES],
-}
-
-extension PipeMsg: NoCopy {}
-
-/// What arrived for a claim: the answer, or the news that there will not be one.
-///
-/// **`PeerClosed` IS THE SAME FACT `PipeReplyOp.Resolve` REPORTS** and it means
-/// exactly what it means there — the server dropped its obligation, or the
-/// connection's server end went while the message was still staged. There is no
-/// third case, because a `Waiter` only ever delivers a level that is READY and
-/// "still pending" is what not-ready means.
-public enum ReplyDelivery {
-    case Data(msg: PipeMsg),
-    case PeerClosed,
-}
-
-extension ReplyDelivery: NoCopy {}
-
-/// `Waiter.Wait`'s answer: the attacher's key, and what fired.
-///
-/// **`NoCopy` SINCE M4 UNIT 3** (sawos design 15), by the wrapper-carries-tier
-/// rule and by API discipline together: the `Reply` payload owns
-/// `PIPE_BODY_BYTES` of inline storage, so a result that duplicated on a plain
-/// binding would copy a message body where nothing asked for one. Reading the
-/// answer is a `match` on the PLACE — `match result.what`, which borrows — so
-/// nothing about how the four shipped kinds are read changed.
-public struct WaitResult {
-    /// The word supplied at `add`, handed back unread.
-    public key: UInt,
-    public what: WaitPayload,
-}
-
-extension WaitResult: NoCopy {}
 
 // =============================================================================
 // The Clock and Timer records (spec §2's Clock/Timer rows; design 232 unit 1)
@@ -3072,56 +3160,128 @@ public func pipe_create_record_bytes() -> Int {
     PIPE_CREATE_RECORD_WORDS * sizeof<UInt>()
 }
 
-/// Words in a `PipeOutlet.Take` answer: the message's LENGTH, then the
-/// `PipeRequest` handle that obliges its reply (spec §2.1; sawos design 14).
+/// **A DELIVERED MESSAGE** — what a `Take`, a fused `Call`'s reply and a
+/// `Resolve` all copy out (spec §2.1's `send(data?, handles?)`, both directions;
+/// sawos design 18).
 ///
-/// **A TAKE ANSWERS TWO THINGS NOW, SO IT ANSWERS IN MEMORY.** Unit 1's take put
-/// the length in the value register because that was all it had to say; unit 2
-/// mints the obligation at the take, and one op returns one word. The record is
-/// the door `ProcessOp.PipeCreate` already opened for exactly this reason, and
-/// the BODY stays a separate buffer because it is a separate thing — bytes the
-/// caller sized against `PIPE_BODY_BYTES`, not a word the kernel assembled.
-public static PIPE_TAKE_RECORD_WORDS: Int = 2
-
-/// Where each half of a take's answer lives. LENGTH first, because the message
-/// is what a take is FOR and the obligation is what comes with it.
-public static PIPE_TAKE_LEN_WORD: Int = 0
-public static PIPE_TAKE_REQUEST_WORD: Int = 1
-
-/// Bytes in a `PipeOutlet.Take` record — the minimum capacity a caller must give
-/// the op. A FUNCTION for `pipe_create_record_bytes`' reason (DF-178f).
-public func pipe_take_record_bytes() -> Int {
-    PIPE_TAKE_RECORD_WORDS * sizeof<UInt>()
+/// **ONE SHAPE FOR EVERY DELIVERED MESSAGE, AND IT READS LIKE THE WAIT RECORD'S
+/// TAIL.** Unit 2's take answered `{len, request}` in one record and the BODY in
+/// a second buffer; a message carries HANDLES now, so the two buffers would have
+/// become three. Instead the delivery is one record in the wait record's own
+/// order — the packed meta, then the handle words, then the body — so a caller
+/// reading a message out of a `take` and a caller reading one out of a `wait`
+/// are reading the same layout, and the kernel writes it with the same
+/// arithmetic.
+///
+/// **HANDLES BEFORE BYTES**, so every copy-out is a contiguous prefix ending at
+/// `meta.len` (user-ruled Sep 2). A handles-only message pays for no part of the
+/// 128-byte body region, and a data-only message writes four zero kind bytes and
+/// the handle words it does not use are simply not written — `meta.kinds` is
+/// what says so.
+public struct PipeMsgRecord {
+    public meta: PipeMsgMeta,
+    public handles: [UInt; PIPE_MSG_HANDLES],
+    public bytes: [UInt8; PIPE_BODY_BYTES],
 }
 
-/// Words in a `PipeRequest.ReplyWait` ARGUMENT record: the waiter handle, the
-/// reply body's address, the reply body's length (sawos design 17).
+/// **A DELIVERED MESSAGE PLUS THE OBLIGATION TO ANSWER IT** — `PipeOutlet.Take`'s
+/// record (spec §2.1; sawos design 14, reshaped by design 18).
 ///
-/// **IT GOES THE OTHER WAY — THIS IS A COPY-IN RECORD**, `TimerOp.Arm`'s door
-/// rather than `PipeOutletOp.Take`'s, and it exists for the plainest reason
-/// §5.7 gives: the op has FOUR things to say and three argument registers. A
-/// reply body, its length, a waiter and a destination for the delivery do not
-/// fit, so the three SMALL words ride the funnel and the register that is left
-/// carries the wait buffer.
-///
-/// **THE BODY STAYS AN ADDRESS RATHER THAN JOINING THE RECORD**, which is the
-/// one design decision in the layout: a record holding the body itself would
-/// make every `reply_wait` copy `PIPE_BODY_BYTES` in userspace before the trap,
-/// where an address costs one word and the kernel's own copy-in is the only
-/// copy there is. The address is checked by the copy door like any other.
-public static PIPE_REPLY_WAIT_RECORD_WORDS: Int = 3
+/// The request handle comes FIRST because it is the one word whose kind never
+/// varies: a take's obligation is a `PipeRequest` or the take did not happen, so
+/// it needs no kind byte and it reads best beside the length that follows it.
+/// Everything after it is an ordinary `PipeMsgRecord`, which is what makes a
+/// server able to hand the message half onward without repacking it.
+public struct PipeTakeRecord {
+    public request: UInt,
+    public msg: PipeMsgRecord,
+}
 
-/// Where each argument lives. Named rather than written, on both sides of the
-/// boundary. The WAITER comes first because it is what makes this op different
-/// from the `Reply` it is otherwise a copy of.
-public static PIPE_REPLY_WAIT_WAITER_WORD: Int = 0
-public static PIPE_REPLY_WAIT_BODY_WORD: Int = 1
-public static PIPE_REPLY_WAIT_LEN_WORD: Int = 2
+/// Bytes in a delivered-message record, and where its body region starts.
+///
+/// FUNCTIONS AND NOT `static`s for `pipe_create_record_bytes`' reason (DF-178f):
+/// `sizeof<T>()` does not fold in a static initializer and folds perfectly well
+/// in an ordinary expression — and in a `static_assert`, which is what pins the
+/// kernel's prefix-only twins against these.
+public func pipe_msg_record_bytes() -> Int {
+    sizeof<PipeMsgRecord>()
+}
+
+public func pipe_msg_body_offset() -> Int {
+    sizeof<PipeMsgRecord>() - PIPE_BODY_BYTES
+}
+
+/// Bytes in a `PipeOutlet.Take` record — the minimum capacity a caller must give
+/// the op — and where ITS body region starts.
+public func pipe_take_record_bytes() -> Int {
+    sizeof<PipeTakeRecord>()
+}
+
+public func pipe_take_body_offset() -> Int {
+    sizeof<PipeTakeRecord>() - PIPE_BODY_BYTES
+}
+
+// The two prefixes are whole numbers of machine words for `WaitBuffer`'s reason,
+// which is what makes the contiguous-prefix copy an arithmetic on both profiles.
+// The expressions are written out rather than reaching for the two functions
+// above: a `sizeof` folds in a `static_assert` and a CALL does not.
+static_assert((sizeof<PipeMsgRecord>() - PIPE_BODY_BYTES) % sizeof<UInt>() == 0,
+              "a message record's fixed prefix must be a whole number of machine words")
+static_assert((sizeof<PipeTakeRecord>() - PIPE_BODY_BYTES) % sizeof<UInt>() == 0,
+              "a take record's fixed prefix must be a whole number of machine words")
+
+/// **A MESSAGE TO SEND** — the argument record `Post`, `Call` and `Reply` are
+/// handed (spec §2.1's `send(data?, handles?)`; sawos design 18).
+///
+/// **IT GOES THE OTHER WAY — THIS IS A COPY-IN RECORD**, `TimerOp.Arm`'s door,
+/// and it exists for the plainest reason §5.7 gives: a message has THREE things
+/// to say now — a body, its length, and up to `PIPE_MSG_HANDLES` handle words —
+/// and a fused `Call` needs a fourth register for the reply's destination. Unit
+/// 2's `post(body, len)` fitted the registers; `post(body, len, handles…)` does
+/// not, on any of the three ops, so all three take the same record and the shape
+/// is uniform rather than one-per-op.
+///
+/// **THE BODY STAYS AN ADDRESS RATHER THAN JOINING THE RECORD**, which is design
+/// 17 deviation 3's decision inherited whole: a record holding the body itself
+/// would make every send copy `PIPE_BODY_BYTES` in userspace before the trap,
+/// where an address costs one word and the kernel's own copy-in is then the only
+/// copy there is. The handle WORDS are different — there are four of them, they
+/// are words, and there is nowhere else for them to ride.
+///
+/// A slot holding `NO_HANDLE` is an EMPTY slot. The kernel reads each non-empty
+/// one out of the sender's own table, so a word naming nothing, a word without
+/// the universal `Transfer` right and a word naming a kind no `BootHandleKind`
+/// spells all TERMINATE the sender — each is a mistake only the caller could
+/// have made — and the refusal happens before anything is staged.
+public struct PipeSendRecord {
+    public body: UInt,
+    public len: UInt,
+    public handles: [UInt; PIPE_MSG_HANDLES],
+}
+
+/// Bytes in a send record — EXACTLY what the three ops must be handed. A
+/// FUNCTION for `pipe_create_record_bytes`' reason (DF-178f).
+public func pipe_send_record_bytes() -> Int {
+    sizeof<PipeSendRecord>()
+}
+
+/// **`PipeRequest.ReplyWait`'s ARGUMENT record**: the waiter handle, then an
+/// ordinary send record (sawos design 17, grown by design 18).
+///
+/// It is a send record with a WAITER in front of it, which is what the op is: a
+/// reply with a built-in wait. Unit 3.5 spelled the three words out; unit 4 gave
+/// a reply handles to carry, and rather than restate the four new words this
+/// record now NESTS the one every other sending op takes — so `reply` and
+/// `reply_wait` cannot drift about what a message is.
+public struct PipeReplyWaitRecord {
+    public waiter: UInt,
+    public msg: PipeSendRecord,
+}
 
 /// Bytes in a `PipeRequest.ReplyWait` argument record — EXACTLY what the op
 /// must be handed. A FUNCTION for `pipe_create_record_bytes`' reason (DF-178f).
 public func pipe_reply_wait_record_bytes() -> Int {
-    PIPE_REPLY_WAIT_RECORD_WORDS * sizeof<UInt>()
+    sizeof<PipeReplyWaitRecord>()
 }
 
 // =============================================================================

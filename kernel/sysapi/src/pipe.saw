@@ -75,20 +75,521 @@
 
 import sosabi.{SosStatus, PipeInletHandle, PipeInletOp, PipeOutletHandle,
                PipeOutletOp, PipeReplyHandle, PipeRequestHandle, MINT_OP,
-               NO_HANDLE, PIPE_BODY_BYTES, PIPE_TAKE_RECORD_WORDS,
-               PIPE_TAKE_LEN_WORD, PIPE_TAKE_REQUEST_WORD,
-               PIPE_REPLY_WAIT_RECORD_WORDS, PIPE_REPLY_WAIT_WAITER_WORD,
-               PIPE_REPLY_WAIT_BODY_WORD, PIPE_REPLY_WAIT_LEN_WORD,
-               PipeMsg, ReplyWaitLeg, WaitBuffer, WaitResult, WaiterHandle,
-               WAIT_HEADER_WORDS,
-               pipe_reply_wait_record_bytes, pipe_take_record_bytes,
+               NO_HANDLE, PIPE_BODY_BYTES, PIPE_MSG_HANDLES,
+               BootHandleKind, InletLevel, OutletLevel, ReplyLevel,
+               MemoryHandle, IoMemoryHandle,
+               PipeMsgMeta, PipeMsgRecord, PipeSendRecord, PipeReplyWaitRecord,
+               PipeTakeRecord,
+               ReplyWaitLeg, WaitBuffer, WaitTag, WaiterHandle,
+               WAIT_HEADER_WORDS, WAIT_KEY_WORD, WAIT_TAG_WORD,
+               WAIT_PAYLOAD_WORD, WAIT_HANDLE_SLOTS, WAIT_REQUEST_SLOT,
+               WAIT_MSG_SLOT_0,
+               pipe_msg_record_bytes, pipe_reply_wait_record_bytes,
+               pipe_send_record_bytes, pipe_take_record_bytes,
                wait_record_bytes}
 
 import sos.floor.{ALL_RIGHTS, call_value, checked, polled_ok, polled_value,
                   sos_handle_release, sos_pipe_inlet_call, sos_pipe_inlet_post,
                   sos_pipe_outlet_take, sos_pipe_reply_resolve,
-                  sos_pipe_request_reply, sos_pipe_request_reply_wait}
-import sos.waiter.{AttachMode, Waiter, decode_wait, mode_flag}
+                  sos_pipe_request_reply, sos_pipe_request_reply_wait,
+                  sos_waiter_wait}
+import sos.waiter.{AttachMode, Waiter, mode_flag}
+import sos.memory.{Memory}
+import sos.iomemory.{IoMemory}
+
+// =============================================================================
+// THE MESSAGE VOCABULARY (spec §2.1's `send(data?, handles?)`; sawos design 18,
+// amended at the STOP and user-ruled Sep 2)
+// =============================================================================
+//
+// **IT LIVES HERE BECAUSE A MESSAGE CAN CARRY A CAPABILITY, AND A CAPABILITY AT
+// THIS TIER IS AN OWNING WRAPPER.** Unit 3 declared `PipeMsg`, `WaitResult` and
+// `WaitPayload` in `sosabi`, which was right for as long as a delivery was words
+// and bytes: one declaration served the kernel that writes the record and the
+// process that reads it. Handles broke that — `sos` depends on `sosabi` and
+// nothing depends the other way, which is the whole of why op numbers can be
+// kernel-internal — so the decoded forms moved to the highest module that can
+// name every wrapper a message may carry, and `decode_wait` and `Waiter.wait`
+// came with them.
+//
+// WHAT STAYED IN `sosabi` IS THE WIRE: the tag, the three level enums, the
+// record layouts and their offsets. The rule is unchanged and the altitude
+// moved, which is design 8's own sentence about `kcore.waitables` seen from the
+// userspace side.
+
+/// **A HANDLE THAT ARRIVED IN A MESSAGE, TYPED AT THE BOUNDARY** — the
+/// `decode_boot_handle` precedent generalized (§API, user-ruled Sep 2).
+///
+/// **EACH CASE OWNS A WRAPPER**, which is what makes a delivered capability the
+/// same kind of thing as one that arrived any other way: it is `NoCopy`, its
+/// drop is a release, and the module's no-forged-handles rule holds — a sender
+/// builds one by MOVING a wrapper in and a receiver matches it out.
+///
+/// **SIX CASES, AND THE SET IS "GIVABLE AND DECLARABLE"** (user-ruled at the
+/// STOP). Givable, because staging validates the universal `Transfer` bit and
+/// only six kinds mint it: a Thread, Event, Waiter, Interrupt, Clock or Timer
+/// handle cannot be attached at all, so a case for one would be dead surface on
+/// the rule that has `ClockType` declare one domain. Declarable, because a
+/// `Process` and a `System` are declared in `sos.system`, which imports THIS
+/// module — a case for either would be the import cycle DF-232e does not
+/// diagnose. The kernel refuses to stage those two rather than delivering
+/// something the receiver could not be told the name of; see `msg_kind_of`.
+/// Lifting that is a NAMED FOLLOW-UP and it wants a ruling, not a workaround.
+///
+/// **TAKE IT OUT OF ITS SLOT BEFORE YOU MATCH IT.** `msg.handles[i].take()`
+/// hands over an owned local, and a `match` on an owned local CONSUMES it, which
+/// is what lets an arm move the wrapper into a consuming op. Matching the SLOT
+/// in place is a borrow, and a `move` out of a borrowing arm is a sawc soundness
+/// hole this unit met and filed (SL-17) — so the idiom is take-then-match, which
+/// is the shape that reads best anyway.
+public enum PipeHandle {
+    case Memory(m: Memory),
+    case IoMemory(io: IoMemory),
+    case Inlet(i: PipeInlet),
+    case Outlet(o: PipeOutlet),
+    case Reply(r: PipeReply),
+    case Request(rq: PipeRequest),
+}
+
+extension PipeHandle: NoCopy {}
+
+/// **THE HANDLES A MESSAGE IS BEING SENT WITH** — the send side's owning
+/// carrier (sawos design 18).
+///
+/// **IT IS NOT `PipeHandle`, AND THE REASON IS A LANGUAGE FACT.** A wrapper held
+/// inside an enum payload can never be DISARMED: a match-arm binding is
+/// immutable under every spelling (probed — `&var self` included), so there is
+/// no way to write the transfer-funnel contract `Process.give` runs on. So the
+/// send side takes the wrapper at the DOOR, disarms it there, and keeps the kind
+/// and the word — which is exactly what `Process.give`'s three funnels do, one
+/// overload per givable kind.
+///
+/// **IT IS `NoCopy` AND ITS DROP RELEASES WHAT IT STILL HOLDS**, which is what
+/// makes every path honest. A carrier that is built and never posted releases
+/// its handles, exactly as the wrappers would have; a post that SUCCEEDS clears
+/// the slots, so the entries stay bound for the rendezvous and the drop is a
+/// no-op; and a post that is REFUSED leaves the slots alone, so the caller may
+/// retry with the very same carrier or drop it. That is the property a poll
+/// loop needs: `Ok(None)` must not cost a caller its capabilities.
+public struct PipeHandles {
+    public(package) kinds: [UInt8; PIPE_MSG_HANDLES],
+    public(package) words: [UInt; PIPE_MSG_HANDLES],
+}
+
+extension PipeHandles: NoCopy {
+    /// Release whatever is still here. A posted carrier is empty by then, which
+    /// is what makes this the un-posted path's cleanup and nothing else.
+    func deinit(&var self) {
+        var i: Int = 0
+        while i < PIPE_MSG_HANDLES {
+            if self.words[i] != NO_HANDLE {
+                let _ = sos_handle_release(self.words[i])
+            }
+            i = i + 1
+        }
+    }
+}
+
+extension PipeHandles {
+    /// A carrier with every slot empty — what a message with no handles sends,
+    /// and the default every sending method takes.
+    public static func none() -> PipeHandles {
+        PipeHandles(kinds: [0; PIPE_MSG_HANDLES],
+                    words: [NO_HANDLE; PIPE_MSG_HANDLES])
+    }
+
+    /// How many slots there are. Published so a caller can loop rather than
+    /// spell `PIPE_MSG_HANDLES` (which it may, it is on the facade).
+    public func slots(&self) -> Int { PIPE_MSG_HANDLES }
+
+    /// **PUT A HANDLE IN SLOT `at`, CONSUMING THE WRAPPER** — one overload per
+    /// givable kind, which is `Process.give`'s own shape and for its own reason:
+    /// the funnel reads the wrapper's handle field and disarms it, and that is
+    /// only writable where the wrapper is a struct rather than an enum payload.
+    ///
+    /// An occupied slot is OVERWRITTEN and the handle that was there is released
+    /// — the same thing that would have happened to a wrapper the caller
+    /// dropped, said at the one place that can say it. `at` outside the slot
+    /// range PANICS, on the house accessor rule (design 130): the count is
+    /// published, so the caller could have checked.
+    public func put(&var self, at: Int, memory: Memory) {
+        self.free_slot(at)
+        var owned = move memory
+        self.kinds[at] = BootHandleKind.Memory as UInt8
+        self.words[at] = owned.handle
+        owned.handle = MemoryHandle(NO_HANDLE)
+    }
+
+    public func put(&var self, at: Int, iomemory: IoMemory) {
+        self.free_slot(at)
+        var owned = move iomemory
+        self.kinds[at] = BootHandleKind.IoMemory as UInt8
+        self.words[at] = owned.handle
+        owned.handle = IoMemoryHandle(NO_HANDLE)
+    }
+
+    public func put(&var self, at: Int, inlet: PipeInlet) {
+        self.free_slot(at)
+        var owned = move inlet
+        self.kinds[at] = BootHandleKind.PipeInlet as UInt8
+        self.words[at] = owned.handle
+        owned.handle = PipeInletHandle(NO_HANDLE)
+    }
+
+    public func put(&var self, at: Int, outlet: PipeOutlet) {
+        self.free_slot(at)
+        var owned = move outlet
+        self.kinds[at] = BootHandleKind.PipeOutlet as UInt8
+        self.words[at] = owned.handle
+        owned.handle = PipeOutletHandle(NO_HANDLE)
+    }
+
+    public func put(&var self, at: Int, reply: PipeReply) {
+        self.free_slot(at)
+        var owned = move reply
+        self.kinds[at] = BootHandleKind.PipeReply as UInt8
+        self.words[at] = owned.handle
+        owned.handle = PipeReplyHandle(NO_HANDLE)
+    }
+
+    public func put(&var self, at: Int, request: PipeRequest) {
+        self.free_slot(at)
+        var owned = move request
+        self.kinds[at] = BootHandleKind.PipeRequest as UInt8
+        self.words[at] = owned.handle
+        owned.handle = PipeRequestHandle(NO_HANDLE)
+    }
+
+    /// Empty slot `at`, releasing whatever was in it. The bounds check lives
+    /// here, so the six funnels above read as one line of intent each.
+    func free_slot(&var self, at: Int) {
+        if at < 0 || at >= PIPE_MSG_HANDLES {
+            panic("PipeHandles.put: slot out of range: {} (slots {})", at,
+                  PIPE_MSG_HANDLES)
+        }
+        if self.words[at] != NO_HANDLE {
+            let _ = sos_handle_release(self.words[at])
+            self.words[at] = NO_HANDLE
+            self.kinds[at] = 0
+        }
+    }
+
+    /// Forget every slot WITHOUT releasing — what a successful send calls, once
+    /// the kernel has taken the words. The entries stay bound in this process's
+    /// table until the rendezvous moves them, which is `designs/010` ruling 5.
+    func handed_over(&var self) {
+        var i: Int = 0
+        while i < PIPE_MSG_HANDLES {
+            self.kinds[i] = 0
+            self.words[i] = NO_HANDLE
+            i = i + 1
+        }
+    }
+}
+
+/// A message: how many of its bytes are real, the handles it carried, and the
+/// bytes (sawos design 15, GROWN by design 18 — §API, user-ruled Sep 2).
+///
+/// **HANDLES BEFORE BYTES, and the Saw struct mirrors the record's order**
+/// (declaration-order ABI, design 58). It is the same layout the kernel writes,
+/// read from the other side.
+///
+/// **`NoCopy`, AND NOW FOR TWO REASONS.** The bytes were always API discipline —
+/// `PIPE_BODY_BYTES` of inline storage should not be duplicated by an accident
+/// of binding — and the handles are ownership proper: each is a capability this
+/// process holds exactly once.
+///
+/// Take a handle out with `msg.handles[i].take()`, which needs a `var` binding
+/// of the message and hands back an owned `PipeHandle?`. A slot the sender left
+/// empty, and one whose sender released its entry before the rendezvous, are
+/// both `None` — `designs/010` ruling 5's honest absence.
+public struct PipeMsg {
+    public len: UInt,
+    public handles: [PipeHandle?; PIPE_MSG_HANDLES],
+    public bytes: [UInt8; PIPE_BODY_BYTES],
+}
+
+extension PipeMsg: NoCopy {}
+
+/// What became ready, decoded — one case per waitable kind, plus the one M4
+/// unit 4 added.
+///
+/// **IT CARRIES NO OWNED VALUE ANY MORE, AND THAT IS FORCED** (sawos design 18).
+/// Unit 3's `Reply` case carried the reply's bytes inside the payload, which
+/// worked because bytes are read through a borrow; a delivery carries HANDLES
+/// now, and a handle has to be MOVED out to be used. A `move` out of a
+/// place-match arm is a sawc soundness hole (SL-17 — it compiles and drops the
+/// value twice), so an owned delivery cannot live inside this enum at all. It
+/// lives in `WaitResult`'s own fields, where a `.take()` reaches it, and what
+/// stays here is the LEVEL — which is what a tag-shaped enum should have been
+/// carrying all along.
+public enum WaitPayload {
+    case Event(word: UInt),
+    case Interrupt(line: UInt),
+    case Timer(fires: UInt),
+    case Process(status: UInt),
+    /// The SERVER end has something to take, or will never have anything again.
+    case Readable(state: OutletLevel),
+    /// The CLIENT end has room to post, or nobody is left to take.
+    case Room(state: InletLevel),
+    /// The answer to one exchange arrived, or never will. `Data` means
+    /// `WaitResult.message` is populated.
+    case Reply(state: ReplyLevel),
+    /// The claim behind this obligation was dropped. There is nothing to say
+    /// beyond the fact, which is why this case has no payload.
+    case Abandoned,
+    /// **THE DELIVERY WAS THE TAKE** (`designs/010` ruling 11(d)) — a
+    /// persistent-consuming outlet attachment handing over a message and the
+    /// obligation to answer it. `WaitResult.message` and `WaitResult.request`
+    /// are both populated, and the server never called `take` at all.
+    case Message,
+}
+
+/// `Waiter.wait`'s answer: the attacher's key, what fired, and whatever the
+/// delivery HANDED OVER.
+///
+/// **THE TWO OWNING FIELDS ARE M4 UNIT 4's** (sawos design 18). They are
+/// `Optional`s rather than payloads for the reason `WaitPayload`'s docstring
+/// gives — a `.take()` reaches a field and cannot reach a match arm — and they
+/// are the reason this type is `NoCopy`. Which of them is populated is decided
+/// by `what` and never has to be guessed:
+///
+///   `Reply(Data)`  -> `message`
+///   `Message`      -> `message` AND `request`
+///   anything else  -> neither
+public struct WaitResult {
+    /// The word supplied at `add`, handed back unread.
+    public key: UInt,
+    public what: WaitPayload,
+    /// The message a `Reply(Data)` or a `Message` delivery carried.
+    public message: PipeMsg?,
+    /// The obligation a `Message` delivery minted into this process's table.
+    public request: PipeRequest?,
+}
+
+extension WaitResult: NoCopy {}
+
+/// One handle slot of a delivered record, typed.
+///
+/// AN UNKNOWN KIND PANICS, on `decode_wait`'s exact terms: the KERNEL wrote the
+/// byte out of the same `BootHandleKind` declaration this function reads, so a
+/// value that does not decode is a kernel/`sos` skew rather than data from an
+/// untrusted source. `Process` and `System` panic for a sharper reason — the
+/// kernel refuses to stage either, so a message carrying one means the two
+/// halves disagree about which kinds a message may carry.
+func decode_handle(kind: UInt8, word: UInt) -> PipeHandle? {
+    if word == NO_HANDLE {
+        return None
+    }
+    guard let what = BootHandleKind.from(raw: kind as UInt) else {
+        panic("sos: kernel wrote message handle kind {}, which this build cannot name",
+              kind as UInt)
+    }
+    match what {
+        case Memory -> PipeHandle.Memory(m: Memory(handle: MemoryHandle(word))),
+        case IoMemory -> PipeHandle.IoMemory(io: IoMemory(handle: IoMemoryHandle(word))),
+        case PipeInlet -> PipeHandle.Inlet(i: PipeInlet(handle: PipeInletHandle(word))),
+        case PipeOutlet -> PipeHandle.Outlet(o: PipeOutlet(handle: PipeOutletHandle(word))),
+        case PipeReply -> PipeHandle.Reply(r: PipeReply(handle: PipeReplyHandle(word))),
+        case PipeRequest -> PipeHandle.Request(rq: PipeRequest(handle: PipeRequestHandle(word))),
+        case Process -> {
+            panic("sos: a message carried a Process handle, which the kernel refuses to stage")
+        },
+        case System -> {
+            panic("sos: a message carried a System handle, which the kernel refuses to stage")
+        },
+    }
+}
+
+/// Build a `PipeMsg` out of a delivered record's meta, handle words and bytes.
+/// The one place a message crosses from words into wrappers.
+func msg_of(meta: &PipeMsgMeta, words: &[UInt; PIPE_MSG_HANDLES],
+            bytes: &[UInt8; PIPE_BODY_BYTES]) -> PipeMsg {
+    var msg = PipeMsg(len: meta.len as UInt,
+                      handles: [None, None, None, None],
+                      bytes: bytes)
+    var i: Int = 0
+    while i < PIPE_MSG_HANDLES {
+        msg.handles[i] = decode_handle(meta.kinds[i], words[i])
+        i = i + 1
+    }
+    move msg
+}
+
+// `msg_of` spells its empty-slot array out element by element, because a REPEAT
+// literal cannot build a NoCopy optional — `[v; N]` needs an element that copies
+// for free and a `PipeHandle?` is move-only. So that one literal tracks this
+// number by hand, and this is what catches it if the number moves.
+static_assert(PIPE_MSG_HANDLES == 4,
+              "msg_of's empty-slot literal is spelled out and tracks PIPE_MSG_HANDLES by hand")
+
+/// Decode a record the kernel copied out into `WaitResult`.
+///
+/// AN UNKNOWN TAG PANICS, loudly, and that is deliberate. Every other decode in
+/// this package treats its input as data a process might legitimately be handed;
+/// this one does not, because the KERNEL wrote it out of the same `WaitTag`
+/// declaration this function reads. A tag that does not decode is therefore a
+/// skew between the kernel and the `sos` module it exports — a bug in the pair,
+/// not a runtime condition — and the never-hide rule says a bug the caller
+/// cannot act on should stop the program where it happened rather than become
+/// an `Err` somebody maps to "unknown".
+///
+/// **THE SAME RULE COVERS THE PAYLOAD'S OWN SUB-ENUMS** (sawos design 15) and
+/// the handle kinds beside them (design 18). All of them arrive out of
+/// declarations the kernel wrote from.
+///
+/// `public(package)` since M4 unit 3.5 (sawos design 17): `PipeRequest.reply_wait`
+/// is a SECOND door onto the same delivery. One record, one decode — a second
+/// copy of this match would be the one place a kernel/`sos` skew could hide.
+public(package) func decode_wait(buf: &WaitBuffer) -> WaitResult {
+    let key = buf.header[WAIT_KEY_WORD]
+    let tag = buf.header[WAIT_TAG_WORD]
+    let payload = buf.header[WAIT_PAYLOAD_WORD]
+    guard let kind = WaitTag.from(raw: tag) else {
+        panic("sos: kernel wrote wait tag {}, which this build cannot name", tag)
+    }
+    match kind {
+        case Event -> WaitResult(key: key, what: WaitPayload.Event(word: payload),
+                                 message: None, request: None),
+        case Interrupt -> WaitResult(key: key,
+                                     what: WaitPayload.Interrupt(line: payload),
+                                     message: None, request: None),
+        case Timer -> WaitResult(key: key,
+                                 what: WaitPayload.Timer(fires: payload),
+                                 message: None, request: None),
+        // THE FOURTH TAG (sawos design 8, M3 unit 5.5): a process ended, and
+        // the payload is §8's status word — the same bits `Process.get_status`
+        // answers with, so a supervisor parses one thing however it learned.
+        case Process -> WaitResult(key: key,
+                                   what: WaitPayload.Process(status: payload),
+                                   message: None, request: None),
+        // **THE FOUR PIPE TAGS ARE M4 UNIT 3's** (sawos design 15) and the fifth
+        // is unit 4's.
+        case Readable -> {
+            guard let level = OutletLevel.from(raw: payload) else {
+                panic("sos: kernel wrote outlet level {}, which this build cannot name",
+                      payload)
+            }
+            WaitResult(key: key, what: WaitPayload.Readable(state: level),
+                       message: None, request: None)
+        },
+        case Room -> {
+            guard let level = InletLevel.from(raw: payload) else {
+                panic("sos: kernel wrote inlet level {}, which this build cannot name",
+                      payload)
+            }
+            WaitResult(key: key, what: WaitPayload.Room(state: level),
+                       message: None, request: None)
+        },
+        case Reply -> {
+            guard let level = ReplyLevel.from(raw: payload) else {
+                panic("sos: kernel wrote reply level {}, which this build cannot name",
+                      payload)
+            }
+            var got: PipeMsg? = None
+            match level {
+                case Data -> {
+                    got = wait_message(&buf)
+                },
+                case PeerClosed -> {},
+            }
+            WaitResult(key: key, what: WaitPayload.Reply(state: level),
+                       message: move got, request: None)
+        },
+        // NOTHING TO DECODE, and that is the case rather than an omission: the
+        // fact IS the notification, so the payload word carries no information
+        // and `WaitPayload.Abandoned` binds nothing.
+        case Abandoned -> WaitResult(key: key, what: WaitPayload.Abandoned,
+                                     message: None, request: None),
+        // **RULING 11(d)'s DELIVERY-AS-TAKE.** The record carries the message
+        // AND the obligation the kernel minted at the delivery, so the server
+        // never reaches for `take` at all.
+        case Message -> {
+            let word = buf.handles[WAIT_REQUEST_SLOT]
+            var obligation: PipeRequest? = None
+            if word != NO_HANDLE {
+                obligation = PipeRequest(handle: PipeRequestHandle(word))
+            }
+            WaitResult(key: key, what: WaitPayload.Message,
+                       message: wait_message(&buf), request: move obligation)
+        },
+    }
+}
+
+/// The message half of a delivered wait record. Split out because two tags reach
+/// it and the handle region is at one offset for both — which is what the
+/// fixed-prefix rule bought.
+func wait_message(buf: &WaitBuffer) -> PipeMsg? {
+    var words: [UInt; PIPE_MSG_HANDLES] = [NO_HANDLE; PIPE_MSG_HANDLES]
+    var i: Int = 0
+    while i < PIPE_MSG_HANDLES {
+        words[i] = buf.handles[WAIT_MSG_SLOT_0 + i]
+        i = i + 1
+    }
+    let got: PipeMsg? = msg_of(&buf.meta, &words, &buf.body)
+    move got
+}
+
+extension Waiter {
+    /// Block until an attached handle is ready, and answer with the attacher's
+    /// key and what fired. Requires `WaiterRight.Wait`.
+    ///
+    /// **IT IS DECLARED HERE RATHER THAN IN `sos.waiter`** (sawos design 18),
+    /// and the reason is its RETURN TYPE: a delivery may hand over a message
+    /// full of capabilities, so `WaitResult` names every wrapper a message can
+    /// carry and therefore sits in this module. `Waiter.add(outlet:)` and
+    /// `Waiter.add(process:)` are the same shape for the same kind of reason,
+    /// and the facade's `public import` makes all of it one list at the call
+    /// site.
+    ///
+    /// Returns IMMEDIATELY when something is already ready, which is what
+    /// level-triggering buys: the readiness a signal left behind is still
+    /// there, so "signal then wait" and "wait then signal" have the same
+    /// outcome and only the second one parks.
+    ///
+    /// THE ANSWER CONSUMES WHAT IT REPORTS, for an Event and a Timer alike: the
+    /// record carries the accumulated word (or the fire count) and the object is
+    /// emptied in the same step, so nothing is reported twice. An Interrupt is
+    /// the exception and §9 is why — its readiness ends at `ack`.
+    ///
+    /// SEVERAL THREADS ON ONE WAITER IS A DISTRIBUTION: a ready handle wakes one
+    /// of them and that thread's record carries the value, so a worker pool
+    /// shares a stream of notifications with no coordination.
+    ///
+    /// **A PARK CAN END IN `Err(SosStatus.Revoked)`** (sawos design 12, M4 unit
+    /// 0): if this Waiter's last handle is released while you are parked on it,
+    /// the kernel WAKES you with that status rather than leaving you blocked
+    /// forever. No record is written on that path.
+    ///
+    /// **AND IN `Err(NoResource)` / `Err(QuotaExceeded)` SINCE M4 UNIT 4**
+    /// (`designs/010` ruling 5's atomic refusal). A delivery that hands over
+    /// handles has to mint them into this process's table, and a full table
+    /// delivers NOTHING — the message stays staged, its level stays raised, and
+    /// waiting again after freeing a slot is handed the very same message. It is
+    /// a resource condition rather than a bug, which is why it is a status.
+    ///
+    /// THE BUFFER IS THIS FRAME'S, and a caller never sees it. **IT IS
+    /// MAX-SIZED AND THE COPY IS NOT** (`designs/010` ruling 11(a)): a parked
+    /// waiter cannot predict which arm fires, so the buffer holds the biggest
+    /// answer its attachments could give, while the kernel writes only what the
+    /// delivery needs.
+    public func wait(&self) -> Result<WaitResult, SosStatus> {
+        wait_into_frame(self.handle)
+    }
+}
+
+/// The `unsafe` half of `wait`, confined to one small named helper (design 136).
+/// The buffer's address never leaves it.
+func wait_into_frame(handle: WaiterHandle) unsafe -> Result<WaitResult, SosStatus> {
+    var buf = WaitBuffer(header: [0; WAIT_HEADER_WORDS],
+                         meta: PipeMsgMeta(len: 0, kinds: [0; PIPE_MSG_HANDLES]),
+                         handles: [NO_HANDLE; WAIT_HANDLE_SLOTS],
+                         body: [0; PIPE_BODY_BYTES])
+    try checked(sos_waiter_wait(handle,
+                                (&var buf.header) as UnsafePointer<UInt>,
+                                wait_record_bytes() as UInt))
+    return decode_wait(&buf)
+}
 
 /// A handle to a PipeInlet — the CLIENT end of a connection, where requests flow
 /// IN (spec §2.1; the names are design 10 ruling 2's).
@@ -164,7 +665,34 @@ extension PipeInlet {
     /// that never resolves will meet its own in-flight budget.
     public func post(&self, body: &[UInt8; PIPE_BODY_BYTES],
                      len: UInt) -> Result<PipeReply?, SosStatus> {
-        post_body(self.handle, &body, len)
+        var none = PipeHandles.none()
+        return post_body(self.handle, &body, len, &var none)
+    }
+
+    /// **THE SAME POST, CARRYING HANDLES** (spec §2.1's `send(data?, handles?)`;
+    /// `designs/010` ruling 5, built by sawos design 18).
+    ///
+    /// **IT IS A SECOND NAME RATHER THAN A SECOND OVERLOAD, AND SL-15 IS WHY.**
+    /// A bare integer literal stops adopting a `UInt` parameter the moment a
+    /// method has two candidates, so `post(body:, len: 1)` would have needed an
+    /// `as UInt` at every one of the thirty-eight call sites in this tree. The
+    /// four `_with` verbs are the workaround, and they collapse into overloads
+    /// with no call-site change on the day that deficiency closes.
+    ///
+    /// **A SECOND OVERLOAD RATHER THAN A DEFAULTED PARAMETER**, and the carrier
+    /// is by `&var` rather than by value, because a refused post MUST NOT COST A
+    /// CALLER ITS CAPABILITIES: `Ok(None)` is a full ring and the ordinary thing
+    /// a poll loop meets, so the handles have to still be there to try again
+    /// with. On the staged path the carrier is emptied — the kernel holds the
+    /// words now — and on every refusal it is untouched.
+    ///
+    /// **THE ENTRIES STAY YOURS UNTIL THE RENDEZVOUS** (ruling 5), which has one
+    /// consequence worth reading: releasing one afterwards is legal and makes
+    /// that slot arrive EMPTY at the receiver. Fire-and-forget is a shape §2.1
+    /// blesses, so the ledger never has an in-flight limbo state.
+    public func post_with(&self, body: &[UInt8; PIPE_BODY_BYTES], len: UInt,
+                          handles: &var PipeHandles) -> Result<PipeReply?, SosStatus> {
+        post_body(self.handle, &body, len, &var handles)
     }
 
     /// **SEND A MESSAGE AND WAIT FOR ITS ANSWER — one trap, and §2.1's ratified
@@ -206,7 +734,19 @@ extension PipeInlet {
     /// connection has a future is what a later call finds out.
     public func send(&self, body: &[UInt8; PIPE_BODY_BYTES],
                      len: UInt) -> Result<PipeMsg, SosStatus> {
-        call_body(self.handle, &body, len)
+        var none = PipeHandles.none()
+        return call_body(self.handle, &body, len, &var none)
+    }
+
+    /// **THE SAME CALL, CARRYING HANDLES** — everything `post(handles:)` says
+    /// about the carrier holds, with one difference the fused path makes: a
+    /// `Call` never answers a transient refusal, so the carrier is emptied on
+    /// every path but a fault. And the ANSWER may carry handles too, because
+    /// §2.1's `send(data?, handles?)` is symmetric — the `PipeMsg` that comes
+    /// back has slots of its own.
+    public func send_with(&self, body: &[UInt8; PIPE_BODY_BYTES], len: UInt,
+                          handles: &var PipeHandles) -> Result<PipeMsg, SosStatus> {
+        call_body(self.handle, &body, len, &var handles)
     }
 
     /// **MINT A SIBLING of this inlet, narrowed by a KEEP MASK** — the universal
@@ -247,14 +787,44 @@ extension PipeInlet {
 /// ever seen as a number: the wrapper is built here and everything above this
 /// line owns a `PipeReply` instead.
 func post_body(handle: PipeInletHandle, body: &[UInt8; PIPE_BODY_BYTES],
-               len: UInt) unsafe -> Result<PipeReply?, SosStatus> {
+               len: UInt,
+               handles: &var PipeHandles) unsafe -> Result<PipeReply?, SosStatus> {
+    var args = send_record(&body, len, &handles)
     var value: UInt = 0
-    let raw = sos_pipe_inlet_post(handle, (&body) as UnsafePointer<UInt8>, len,
+    let raw = sos_pipe_inlet_post(handle,
+                                  (&var args) as UnsafePointer<UInt>,
+                                  pipe_send_record_bytes() as UInt,
                                   (&var value) as UnsafePointer<UInt>)
     let word = try polled_value(raw, value)
     guard let staged = word else { return None }
+    // **THE CARRIER IS EMPTIED ONLY ON THE STAGED PATH.** The kernel holds the
+    // words now and the entries stay bound until the rendezvous moves them, so
+    // a release here would deliver every slot as `None`; a refusal never
+    // reaches this line, so the caller keeps everything it had.
+    handles.handed_over()
     let claim: PipeReply? = PipeReply(handle: PipeReplyHandle(staged))
     return move claim
+}
+
+/// Assemble the argument record every sending op takes — a body address, a
+/// length and the handle words (sawos design 18).
+///
+/// **IT READS THE CARRIER AND DOES NOT EMPTY IT**, which is what lets the three
+/// callers decide per answer whether the handles were handed over. The kinds are
+/// NOT sent: the kernel reads each word out of this process's own table, so it
+/// knows the kind better than the caller could tell it, and a kind argument
+/// would be a second description of one fact.
+func send_record(body: &[UInt8; PIPE_BODY_BYTES], len: UInt,
+                 handles: &PipeHandles) unsafe -> PipeSendRecord {
+    var args = PipeSendRecord(body: ((&body) as UnsafePointer<UInt8>) as UInt,
+                              len: len,
+                              handles: [NO_HANDLE; PIPE_MSG_HANDLES])
+    var i: Int = 0
+    while i < PIPE_MSG_HANDLES {
+        args.handles[i] = handles.words[i]
+        i = i + 1
+    }
+    args
 }
 
 /// The `unsafe` half of `PipeInlet.send`, confined to one small named helper
@@ -271,14 +841,26 @@ func post_body(handle: PipeInletHandle, body: &[UInt8; PIPE_BODY_BYTES],
 /// would-block outcome to keep out of the error channel, which is the whole
 /// difference between this and `post` beside it.
 func call_body(handle: PipeInletHandle, body: &[UInt8; PIPE_BODY_BYTES],
-               len: UInt) unsafe -> Result<PipeMsg, SosStatus> {
-    var reply: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+               len: UInt,
+               handles: &var PipeHandles) unsafe -> Result<PipeMsg, SosStatus> {
+    var args = send_record(&body, len, &handles)
+    var reply = PipeMsgRecord(meta: PipeMsgMeta(len: 0,
+                                                kinds: [0; PIPE_MSG_HANDLES]),
+                              handles: [NO_HANDLE; PIPE_MSG_HANDLES],
+                              bytes: [0; PIPE_BODY_BYTES])
     var value: UInt = 0
-    let raw = sos_pipe_inlet_call(handle, (&body) as UnsafePointer<UInt8>, len,
-                                  (&var reply) as UnsafePointer<UInt8>,
+    let raw = sos_pipe_inlet_call(handle,
+                                  (&var args) as UnsafePointer<UInt>,
+                                  pipe_send_record_bytes() as UInt,
+                                  (&var reply) as UnsafePointer<UInt>,
                                   (&var value) as UnsafePointer<UInt>)
+    // THE CARRIER IS EMPTIED BEFORE THE ANSWER IS READ, and that is right for
+    // this op and wrong for `post`: a `Call` that reaches the kernel STAGES —
+    // it parks rather than refusing — so the only paths that do not are faults,
+    // which never come back.
+    handles.handed_over()
     try checked(raw)
-    return PipeMsg(len: value, bytes: reply)
+    return msg_of(&reply.meta, &reply.handles, &reply.bytes)
 }
 
 /// A handle to a PipeOutlet — the SERVER end of a connection, where requests
@@ -347,11 +929,8 @@ extension PipeOutlet {
     /// mid-conversation loses nothing. Afterwards it is TERMINAL — no new sender
     /// can appear, because attenuation is monotonic and a column at zero has no
     /// handle left to mint from — so every later take answers the same.
-    public func take(
-        &self,
-        into: &var [UInt8; PIPE_BODY_BYTES]
-    ) -> Result<(UInt, PipeRequest)?, SosStatus> {
-        take_into(self.handle, &var into)
+    public func take(&self) -> Result<(PipeMsg, PipeRequest)?, SosStatus> {
+        take_into_frame(self.handle)
     }
 
     /// **MINT A SIBLING of this outlet, narrowed by a KEEP MASK.** Everything
@@ -376,21 +955,26 @@ extension PipeOutlet {
 /// each into its own binding with no husk left behind — where a `BootHandle`
 /// needed an `Optional` per slot because it carries at most one of several kinds
 /// and asking the wrong question must be harmless.
-func take_into(
-    handle: PipeOutletHandle,
-    into: &var [UInt8; PIPE_BODY_BYTES]
-) unsafe -> Result<(UInt, PipeRequest)?, SosStatus> {
-    var rec: [UInt; PIPE_TAKE_RECORD_WORDS] = [0; PIPE_TAKE_RECORD_WORDS]
+func take_into_frame(
+    handle: PipeOutletHandle
+) unsafe -> Result<(PipeMsg, PipeRequest)?, SosStatus> {
+    var rec = PipeTakeRecord(
+        request: NO_HANDLE,
+        msg: PipeMsgRecord(meta: PipeMsgMeta(len: 0,
+                                             kinds: [0; PIPE_MSG_HANDLES]),
+                           handles: [NO_HANDLE; PIPE_MSG_HANDLES],
+                           bytes: [0; PIPE_BODY_BYTES]))
     let raw = sos_pipe_outlet_take(handle,
                                    (&var rec) as UnsafePointer<UInt>,
-                                   pipe_take_record_bytes() as UInt,
-                                   (&var into) as UnsafePointer<UInt8>)
+                                   pipe_take_record_bytes() as UInt)
     let staged = try polled_ok(raw)
     if not staged {
         return None
     }
-    let request = PipeRequest(handle: PipeRequestHandle(rec[PIPE_TAKE_REQUEST_WORD]))
-    let got: (UInt, PipeRequest)? = (rec[PIPE_TAKE_LEN_WORD], move request)
+    let request = PipeRequest(handle: PipeRequestHandle(rec.request))
+    let got: (PipeMsg, PipeRequest)? = (msg_of(&rec.msg.meta, &rec.msg.handles,
+                                               &rec.msg.bytes),
+                                        move request)
     return move got
 }
 
@@ -463,9 +1047,8 @@ extension PipeReply {
     /// `&var self`, the disarm stays decided by the ANSWER, and a second resolve
     /// through a spent claim stays what it always was: the kernel's `BadHandle`,
     /// which `pipe-dead-claim` proves.
-    public func resolve(&var self,
-                        into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<UInt?, SosStatus> {
-        resolve_into(&var self, &var into)
+    public func resolve(&var self) -> Result<PipeMsg?, SosStatus> {
+        resolve_into_frame(&var self)
     }
 
     /// **MINT A SIBLING of this claim, narrowed by a KEEP MASK** — the universal
@@ -494,21 +1077,24 @@ extension PipeReply {
 /// disarming first would throw away a live claim on every poll. The rule is exact
 /// and it is the kernel's: the caller's entry is consumed unless the answer is a
 /// would-block.
-func resolve_into(claim: &var PipeReply,
-                  into: &var [UInt8; PIPE_BODY_BYTES]) unsafe -> Result<UInt?, SosStatus> {
+func resolve_into_frame(claim: &var PipeReply) unsafe -> Result<PipeMsg?, SosStatus> {
+    var rec = PipeMsgRecord(meta: PipeMsgMeta(len: 0,
+                                              kinds: [0; PIPE_MSG_HANDLES]),
+                            handles: [NO_HANDLE; PIPE_MSG_HANDLES],
+                            bytes: [0; PIPE_BODY_BYTES])
     var value: UInt = 0
     let raw = sos_pipe_reply_resolve(claim.handle,
-                                     (&var into) as UnsafePointer<UInt8>,
-                                     PIPE_BODY_BYTES as UInt,
+                                     (&var rec) as UnsafePointer<UInt>,
+                                     pipe_msg_record_bytes() as UInt,
                                      (&var value) as UnsafePointer<UInt>)
     let got = try polled_value(raw, value) catch {
         claim.handle = PipeReplyHandle(NO_HANDLE)
         return error
     }
-    if let _ = got {
-        claim.handle = PipeReplyHandle(NO_HANDLE)
-    }
-    return got
+    guard let _ = got else { return None }
+    claim.handle = PipeReplyHandle(NO_HANDLE)
+    let answer: PipeMsg? = msg_of(&rec.meta, &rec.handles, &rec.bytes)
+    return move answer
 }
 
 /// A handle to a PipeRequest — the SERVER's obligation to send ONE reply (spec
@@ -570,7 +1156,23 @@ extension PipeRequest {
     /// consumes on the Err path too, the exact effect for it.
     public func reply(&var self, body: &[UInt8; PIPE_BODY_BYTES],
                       len: UInt) consumes -> Result<Void, SosStatus> {
-        reply_body(self.handle, &body, len)
+        var none = PipeHandles.none()
+        return reply_body(self.handle, &body, len, &var none)
+    }
+
+    /// **THE SAME REPLY, CARRYING HANDLES** — §2.1's `send(data?, handles?)` in
+    /// the answering direction (sawos design 18).
+    ///
+    /// The carrier is emptied on every path this method can return through: a
+    /// reply is discharged whatever it answers, so there is no retry to keep
+    /// handles for. **`Err(PeerClosed)` IS THE ONE THAT COSTS THEM** — the
+    /// client abandoned its claim, nothing was staged, and the words the carrier
+    /// held name entries this process still owns with no typed name left for
+    /// them. It is the same trade `Process.give` makes at its own funnel, and it
+    /// is stated rather than hidden.
+    public func reply_with(&var self, body: &[UInt8; PIPE_BODY_BYTES], len: UInt,
+                           handles: &var PipeHandles) consumes -> Result<Void, SosStatus> {
+        reply_body(self.handle, &body, len, &var handles)
     }
 
     /// **SEND THE REPLY AND WAIT FOR THE NEXT THING — one trap** (sawos design
@@ -620,7 +1222,18 @@ extension PipeRequest {
     public func reply_wait(&var self, body: &[UInt8; PIPE_BODY_BYTES], len: UInt,
                            waiter: &Waiter
     ) consumes -> Result<WaitResult, ReplyWaitError> {
-        reply_wait_body(self.handle, &body, len, waiter.handle)
+        var none = PipeHandles.none()
+        return reply_wait_body(self.handle, &body, len, waiter.handle, &var none)
+    }
+
+    /// **THE SAME FUSED REPLY, CARRYING HANDLES.** Everything
+    /// `reply(handles:)` says about the carrier holds here too — the obligation
+    /// is discharged on every path, so the handles go with it.
+    public func reply_wait_with(&var self, body: &[UInt8; PIPE_BODY_BYTES],
+                                len: UInt, waiter: &Waiter,
+                                handles: &var PipeHandles
+    ) consumes -> Result<WaitResult, ReplyWaitError> {
+        reply_wait_body(self.handle, &body, len, waiter.handle, &var handles)
     }
 
     /// **MINT A SIBLING of this obligation, narrowed by a KEEP MASK.** Everything
@@ -645,9 +1258,14 @@ extension PipeRequest {
 /// takes the word, exactly as `post_body`, `call_body` and `take_into` do, and
 /// the file's three-argument shape is uniform again.
 func reply_body(handle: PipeRequestHandle, body: &[UInt8; PIPE_BODY_BYTES],
-                len: UInt) unsafe -> Result<Void, SosStatus> {
-    return checked(sos_pipe_request_reply(handle,
-                                          (&body) as UnsafePointer<UInt8>, len))
+                len: UInt,
+                handles: &var PipeHandles) unsafe -> Result<Void, SosStatus> {
+    var args = send_record(&body, len, &handles)
+    let raw = sos_pipe_request_reply(handle,
+                                     (&var args) as UnsafePointer<UInt>,
+                                     pipe_send_record_bytes() as UInt)
+    handles.handed_over()
+    return checked(raw)
 }
 
 /// **WHICH HALF OF A `reply_wait` FAILED** (sawos design 17; user-ruled Sep 1 as
@@ -716,13 +1334,13 @@ extension ReplyWaitError: Error {}
 /// `PIPE_BODY_BYTES` in userspace before the trap, which is a cost the fused
 /// path exists to avoid.
 func reply_wait_body(handle: PipeRequestHandle, body: &[UInt8; PIPE_BODY_BYTES],
-                     len: UInt,
-                     waiter: WaiterHandle) unsafe -> Result<WaitResult, ReplyWaitError> {
-    var args: [UInt; PIPE_REPLY_WAIT_RECORD_WORDS] = [0; PIPE_REPLY_WAIT_RECORD_WORDS]
-    args[PIPE_REPLY_WAIT_WAITER_WORD] = waiter
-    args[PIPE_REPLY_WAIT_BODY_WORD] = ((&body) as UnsafePointer<UInt8>) as UInt
-    args[PIPE_REPLY_WAIT_LEN_WORD] = len
+                     len: UInt, waiter: WaiterHandle,
+                     handles: &var PipeHandles) unsafe -> Result<WaitResult, ReplyWaitError> {
+    var args = PipeReplyWaitRecord(waiter: waiter,
+                                   msg: send_record(&body, len, &handles))
     var buf = WaitBuffer(header: [0; WAIT_HEADER_WORDS],
+                         meta: PipeMsgMeta(len: 0, kinds: [0; PIPE_MSG_HANDLES]),
+                         handles: [NO_HANDLE; WAIT_HANDLE_SLOTS],
                          body: [0; PIPE_BODY_BYTES])
     var leg: UInt = 0
     let raw = sos_pipe_request_reply_wait(handle,
@@ -730,6 +1348,7 @@ func reply_wait_body(handle: PipeRequestHandle, body: &[UInt8; PIPE_BODY_BYTES],
                                           pipe_reply_wait_record_bytes() as UInt,
                                           (&var buf.header) as UnsafePointer<UInt>,
                                           (&var leg) as UnsafePointer<UInt>)
+    handles.handed_over()
     try checked(raw) catch { return leg_error(error, leg) }
     return decode_wait(&buf)
 }

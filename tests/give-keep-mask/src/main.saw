@@ -1,0 +1,240 @@
+// SOS M4 unit 4: ATTENUATE AT GIVE, AND AT THE DERIVE (sawos design 18;
+// `designs/010` agenda 7b; spec §3, §9).
+//
+// **A LAUNCHER COULD ALWAYS NARROW BEFORE IT GAVE, AND IT COST A TABLE ROW AND A
+// TRAP.** `MINT_OP` produces an attenuated sibling and `give` moves it, which is
+// the flow every launch in this tree runs; what the two-step spelling costs is a
+// handle whose only purpose is to be moved out immediately. The keep mask says
+// the same thing at the give, and the rules are `MINT_OP`'s unchanged: the
+// entry the child receives carries `source & keep`, all-ones is what the
+// no-argument spelling always meant, and naming a right the source does not hold
+// is a NO-OP rather than an error.
+//
+// **THE POLARITY IS THE RULING AND THE REASON IS EVOLUTION.** A keep mask FAILS
+// CLOSED when a kind gains a right in a later unit: a mask written before that
+// right existed has never heard of it and therefore denies it. A removal mask
+// would have handed every future authority to every child a launcher had ever
+// configured, which is the quiet escalation nobody is looking for.
+//
+// TWO HALVES, AND THE SECOND ONE ENDS THE CASE:
+//
+//   THE GIVE. A child is handed the same connection end TWICE — once through a
+//   mask naming `Post` and a right the end does not carry, and once through a
+//   mask that leaves `Post` out. It posts through the first (so the ignored bit
+//   is proved ignored rather than fatal) and faults on the second.
+//
+//   THE DERIVE. `SystemOp.ProcessSelf` mints ONE default set and took no mask
+//   until this unit, so a child derived its own Process handle with
+//   `InterruptBind` and `Map` on it whatever its SYSTEM handle had been narrowed
+//   to — the one place in the system where attenuation was not monotonic in
+//   practice, recorded as a finding by M3 unit 6 (spec §9) and closed here. Root
+//   derives a handle without `Stats` and reads them, which is the last thing it
+//   does.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
+            PipeMsg, Waiter, WaitResult, WaitPayload,
+            PipeInletRight, ProcessRight, SystemRight, SosStatus,
+            PIPE_BODY_BYTES}
+
+static EXIT_FAILED: UInt = 1
+
+/// ROOT'S CONFIG. `child-narrow` drains the two inlets in the order they are
+/// given, so the tags only have to be distinct.
+static TAG_BOOT: UInt = 7
+static TAG_WIDE: UInt = 11
+static TAG_NARROW: UInt = 12
+
+/// The key root's outlet is attached under.
+static KEY_READABLE: UInt = 5
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// **THE WIDE MASK NAMES A RIGHT A `PipeInlet` DOES NOT HAVE**, deliberately:
+/// `MemoryRight.Split` is a Memory's bit, and an inlet's rights word has nothing
+/// at that position. The intersection drops it silently, which is what "total,
+/// so there is nothing to fault on" means — and it is why one policy mask can be
+/// written for handles of several kinds without a launcher knowing which bits
+/// each carries.
+static WIDE_KEEP: UInt32 = (PipeInletRight.Transfer | PipeInletRight.Post
+                            | PipeInletRight.Wait | 0x8000_0000)
+
+/// **THE NARROW MASK LEAVES `Post` OUT BY SILENCE**, which is the whole of the
+/// policy: this child may hold the end and hand it on, and may not send through
+/// it.
+static NARROW_KEEP: UInt32 = (PipeInletRight.Transfer | PipeInletRight.Wait)
+
+/// The byte `child-narrow` posts through the wide end.
+static BYTE_WIDE: UInt8 = 77
+
+/// §8's word for a process the kernel terminated with `FaultReason.AccessDenied`
+/// — kind 2 in the high half, reason 3 in the low one.
+static CHILD_FAULTED: UInt = 131075
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS keepmask: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    var image = try proc.boot_handle_next() catch {
+        print("SOS keepmask: no image region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var dest = try proc.boot_handle_next() catch {
+        print("SOS keepmask: no destination region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let image_mem = image.take_memory()!
+    let dest_mem = dest.take_memory()!
+
+    let child = try system.process_create(image: &image_mem,
+                                          memory: &dest_mem) catch {
+        print("SOS keepmask: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let pair = try proc.pipe_create() catch {
+        print("SOS keepmask: pipe create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let (inlet, outlet) = move pair
+    let _ = system.debug_print("SOS keepmask: created\n")
+
+    // TWO NAMES FOR ONE END. A sibling is a second reference on the same
+    // connection's inlet column, so the child holding both keeps the end open
+    // exactly as one handle would — and the two travel through two different
+    // masks, which is the only difference between them.
+    let sibling = try inlet.mint() catch {
+        print("SOS keepmask: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM) catch {
+        print("SOS keepmask: system mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        print("SOS keepmask: give system failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try child.give(inlet: move inlet, tag: TAG_WIDE, keep: WIDE_KEEP) catch {
+        print("SOS keepmask: give wide failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try child.give(inlet: move sibling, tag: TAG_NARROW,
+                   keep: NARROW_KEEP) catch {
+        print("SOS keepmask: give narrow failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try child.start(boot_tag: TAG_BOOT) catch {
+        print("SOS keepmask: start failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // **ROOT PARKS, WHICH IS WHAT MAKES THE CHILD RUNNABLE.** `start` makes a
+    // process runnable and does not yield, so a take on this line would find an
+    // empty ring; the wait is both the synchronisation and the proof that the
+    // wide post really happened rather than the take merely being late.
+    let waiter = try proc.waiter_create() catch {
+        print("SOS keepmask: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try waiter.add(outlet: &outlet, key: KEY_READABLE) catch {
+        print("SOS keepmask: attach failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let heard = try waiter.wait() catch {
+        print("SOS keepmask: wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    if heard.key != KEY_READABLE {
+        let _ = system.debug_print("SOS keepmask: woke for the wrong thing\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let arrived = try outlet.take() catch {
+        print("SOS keepmask: take failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let (got, request) = move arrived else {
+        let _ = system.debug_print("SOS keepmask: the wide end sent nothing\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let wrote = got.bytes[0]
+    let _ = move got
+    let _ = move request
+    if wrote != BYTE_WIDE {
+        let _ = system.debug_print("SOS keepmask: the wide end wrote the wrong byte\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS keepmask: a bit the source lacks was ignored, not refused\n")
+
+    let status = try child.get_status() catch {
+        print("SOS keepmask: status failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    if status != CHILD_FAULTED {
+        print("SOS keepmask: child status={} wanted {}\n", status,
+              CHILD_FAULTED)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS keepmask: the narrowed end could not post\n")
+
+    // ---- THE DERIVE, and it is the last thing root does.
+    //
+    // **`ProcessSelf` MINTS ONE DEFAULT SET, AND UNTIL THIS UNIT IT TOOK NO
+    // MASK** (spec §9's unit-6 finding). A handle derived through a mask that
+    // omits `Stats` is a Process handle that can do everything else and cannot
+    // read its own columns — which is exactly the attenuation the finding said
+    // was unreachable.
+    let watched = try system.process_self(keep: PROCESS_KEEP) catch {
+        print("SOS keepmask: masked derive failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS keepmask: derived a Process handle without Stats\n")
+    // AND THIS ENDS THE CASE. A missing right is a fault, so there is no arm
+    // below this line and nothing after it runs.
+    let _ = watched.stats()
+
+    let _ = system.debug_print("SOS keepmask: a masked derive read its stats anyway\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+/// **EVERYTHING ROOT'S OWN PROCESS HANDLE NEEDS, AND NOT `Stats`.** Written as a
+/// list rather than as a complement, which is the keep mask's own polarity
+/// applied by hand: a complement would silently start granting the day a right
+/// is added, and this case is about the bit that is absent.
+static PROCESS_KEEP: UInt32 = (ProcessRight.Transfer | ProcessRight.Mint
+                               | ProcessRight.ThreadCreate
+                               | ProcessRight.ThreadSelf | ProcessRight.Exit
+                               | ProcessRight.Wait | ProcessRight.EventCreate
+                               | ProcessRight.WaiterCreate
+                               | ProcessRight.Start | ProcessRight.BootHandles
+                               | ProcessRight.Give | ProcessRight.Map
+                               | ProcessRight.PipeCreate)

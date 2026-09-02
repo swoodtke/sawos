@@ -26,16 +26,12 @@
 //! overloads whose types it names, and the DECODE — which is where the four new
 //! payload cases land, because the record is one thing whatever wrote it.
 
-import sosabi.{SosStatus, WaiterHandle, NO_HANDLE, WaitTag, WaitResult,
-               WaitPayload, WaitBuffer, PipeMsg, ReplyDelivery, ReplyLevel,
-               InletLevel, OutletLevel, EventHandle, InterruptHandle,
-               TimerHandle, PIPE_BODY_BYTES,
-               WAIT_HEADER_WORDS, WAIT_KEY_WORD, WAIT_TAG_WORD,
-               WAIT_PAYLOAD_WORD, WAIT_BODY_LEN_WORD,
-               WAITER_ADD_CONSUMING, WAITER_ADD_ONESHOT, wait_record_bytes}
+import sosabi.{SosStatus, WaiterHandle, NO_HANDLE, EventHandle,
+               InterruptHandle, TimerHandle,
+               WAITER_ADD_CONSUMING, WAITER_ADD_ONESHOT}
 
 import sos.floor.{checked, sos_handle_release, sos_waiter_add,
-                  sos_waiter_remove, sos_waiter_wait}
+                  sos_waiter_remove}
 import sos.event.{Event}
 import sos.interrupt.{Interrupt}
 import sos.timer.{Timer}
@@ -75,94 +71,18 @@ public(package) func mode_flag(mode: AttachMode) -> UInt {
     }
 }
 
-/// Decode a record the kernel copied out into `WaitResult`.
-///
-/// AN UNKNOWN TAG PANICS, loudly, and that is deliberate. Every other decode in
-/// this package treats its input as data a process might legitimately be handed;
-/// this one does not, because the KERNEL wrote it out of the same `WaitTag`
-/// declaration this function reads. A tag that does not decode is therefore a
-/// skew between the kernel and the `sos` module it exports — a bug in the pair,
-/// not a runtime condition — and the never-hide rule says a bug the caller
-/// cannot act on should stop the program where it happened rather than become
-/// an `Err` somebody maps to "unknown".
-///
-/// **THE SAME RULE COVERS THE PAYLOAD'S OWN SUB-ENUMS** (sawos design 15). An
-/// `OutletLevel`, an `InletLevel` and a `ReplyLevel` all arrive in the payload
-/// word out of declarations the kernel wrote from, so a value that does not
-/// decode is the same kernel/`sos` skew a bad tag is, and it panics on the same
-/// terms rather than becoming a case somebody has to invent a meaning for.
-///
-/// **AND IT TAKES THE BUFFER RATHER THAN THREE WORDS SINCE M4 UNIT 3**: a reply
-/// delivery's body lives in the buffer's body region, so the decode has to be
-/// able to reach it. Everything else it reads is still the header's words.
-///
-/// `public(package)` since M4 unit 3.5 (sawos design 17), for `attach`'s own
-/// reason: `PipeRequest.reply_wait` is a SECOND door onto the same delivery, and
-/// it is declared in `sos.pipe` because that is where its receiver's type lives.
-/// One record, one decode — a second copy of this match would be the one place
-/// a kernel/`sos` skew could hide.
-public(package) func decode_wait(buf: &WaitBuffer) -> WaitResult {
-    let key = buf.header[WAIT_KEY_WORD]
-    let tag = buf.header[WAIT_TAG_WORD]
-    let payload = buf.header[WAIT_PAYLOAD_WORD]
-    guard let kind = WaitTag.from(raw: tag) else {
-        panic("sos: kernel wrote wait tag {}, which this build cannot name", tag)
-    }
-    match kind {
-        case Event -> WaitResult(key: key, what: WaitPayload.Event(word: payload)),
-        case Interrupt -> WaitResult(key: key,
-                                     what: WaitPayload.Interrupt(line: payload)),
-        case Timer -> WaitResult(key: key,
-                                 what: WaitPayload.Timer(fires: payload)),
-        // THE FOURTH TAG (sawos design 8, M3 unit 5.5): a process ended, and
-        // the payload is §8's status word — the same bits `Process.get_status`
-        // answers with, so a supervisor parses one thing however it learned.
-        case Process -> WaitResult(key: key,
-                                   what: WaitPayload.Process(status: payload)),
-        // **THE FOUR PIPE TAGS ARE M4 UNIT 3's** (sawos design 15). Three decode
-        // a level word; the fourth is the one that reaches into the body.
-        case Readable -> {
-            guard let level = OutletLevel.from(raw: payload) else {
-                panic("sos: kernel wrote outlet level {}, which this build cannot name",
-                      payload)
-            }
-            WaitResult(key: key, what: WaitPayload.Readable(state: level))
-        },
-        case Room -> {
-            guard let level = InletLevel.from(raw: payload) else {
-                panic("sos: kernel wrote inlet level {}, which this build cannot name",
-                      payload)
-            }
-            WaitResult(key: key, what: WaitPayload.Room(state: level))
-        },
-        case Reply -> {
-            guard let level = ReplyLevel.from(raw: payload) else {
-                panic("sos: kernel wrote reply level {}, which this build cannot name",
-                      payload)
-            }
-            WaitResult(key: key, what: WaitPayload.Reply(outcome: reply_of(level, &buf)))
-        },
-        // NOTHING TO DECODE, and that is the case rather than an omission: the
-        // fact IS the notification, so the payload word carries no information
-        // and `WaitPayload.Abandoned` binds nothing.
-        case Abandoned -> WaitResult(key: key, what: WaitPayload.Abandoned),
-    }
-}
-
-/// The reply half of the decode, split out because it is the only arm that
-/// builds an owning value.
-///
-/// **THE BODY IS COPIED OUT OF THE FRAME BUFFER HERE, ONCE.** `PipeMsg` owns its
-/// bytes so that the delivery outlives the buffer it arrived in — which is what
-/// makes `wait()` an ordinary value-returning call rather than one that hands
-/// back a borrow of its own frame.
-func reply_of(level: ReplyLevel, buf: &WaitBuffer) -> ReplyDelivery {
-    match level {
-        case Data -> ReplyDelivery.Data(
-            msg: PipeMsg(len: buf.header[WAIT_BODY_LEN_WORD], bytes: buf.body)),
-        case PeerClosed -> ReplyDelivery.PeerClosed,
-    }
-}
+// **THE DECODE IS NOT HERE ANY MORE, AND NEITHER IS `wait` ITSELF** (sawos
+// design 18, amended at the STOP). A delivery may carry HANDLES now, and a
+// handle at the typed tier is an owning wrapper — a `PipeReply`, a `Memory` —
+// so `WaitResult` names types this module sits BELOW. `decode_wait`,
+// `Waiter.wait` and the whole decoded vocabulary moved to `sos.pipe`, where
+// every wrapper a message can carry is nameable; `wait` went as an
+// `extension Waiter`, which is the same shape `add(outlet:)` and
+// `add(process:)` already have and which the facade's `public import` makes
+// invisible at the call site.
+//
+// What stays here is what a Waiter IS: the object, the attach modes, the eight
+// subscription verbs and the one wire call under them.
 
 /// A handle to a Waiter — §2.2's generic wait aggregator, epoll/Port-style.
 ///
@@ -392,61 +312,4 @@ extension Waiter {
         checked(sos_waiter_remove(self.handle, key))
     }
 
-    /// Block until an attached handle is ready, and answer with the attacher's
-    /// key and what fired. Requires `WaiterRight.Wait`.
-    ///
-    /// Returns IMMEDIATELY when something is already ready, which is what
-    /// level-triggering buys: the readiness a signal left behind is still
-    /// there, so "signal then wait" and "wait then signal" have the same
-    /// outcome and only the second one parks.
-    ///
-    /// THE ANSWER CONSUMES WHAT IT REPORTS, for an Event and a Timer alike: the
-    /// record carries the accumulated word (or the fire count) and the object is
-    /// emptied in the same step, so nothing is reported twice. An Interrupt is
-    /// the exception and §9 is why — its readiness ends at `ack`, because the
-    /// line stays masked until the device has been serviced.
-    ///
-    /// SEVERAL THREADS ON ONE WAITER IS A DISTRIBUTION: a ready handle wakes one
-    /// of them and that thread's record carries the value, so a worker pool
-    /// shares a stream of notifications with no coordination. Ownership is the
-    /// other axis and it is structural — a waitable attaches to at most one
-    /// Waiter, so nobody else can be watching the object you are waiting on.
-    ///
-    /// **A PARK CAN END IN `Err(SosStatus.Revoked)`** (sawos design 12, M4 unit
-    /// 0): if this Waiter's last handle is released while you are parked on it,
-    /// the kernel WAKES you with that status rather than leaving you blocked
-    /// forever — nothing parked is silently doomed. No record is written on
-    /// that path, so the buffer is untouched and there is nothing to decode;
-    /// the handle you called through is stale from that moment, because the
-    /// object it named is gone. It needs no new surface here: a revocation is a
-    /// status like any other, and `checked` turns it into the error channel
-    /// this method already answers with.
-    ///
-    /// THE BUFFER IS THIS FRAME'S, and a caller never sees it. The kernel
-    /// answers a wait by copying a record into the caller's own memory (it has
-    /// no allocator and nowhere to put one that would outlive the call), so
-    /// somebody has to supply the bytes; supplying them HERE is what keeps a
-    /// raw address out of the typed surface, exactly as the handle rule keeps
-    /// raw handle words out. The stack is the right place for them: the record
-    /// is four header words plus a message-sized body region since M4 unit 3, and
-    /// the frame outlives the park, since the frame is the parked thread's own
-    /// stack. **THE BUFFER IS MAX-SIZED AND THE COPY IS NOT** (`designs/010`
-    /// ruling 11(a)): a parked waiter cannot predict which arm fires, so the
-    /// buffer holds the biggest answer its attachments could give, while the
-    /// kernel writes only what the delivery needs. A Timer waiter pays for the
-    /// growth in frame bytes and never in copy time.
-    public func wait(&self) -> Result<WaitResult, SosStatus> {
-        wait_into_frame(self.handle)
-    }
-}
-
-/// The `unsafe` half of `wait`, confined to one small named helper (design 136).
-/// The buffer's address never leaves it.
-func wait_into_frame(handle: WaiterHandle) unsafe -> Result<WaitResult, SosStatus> {
-    var buf = WaitBuffer(header: [0; WAIT_HEADER_WORDS],
-                         body: [0; PIPE_BODY_BYTES])
-    try checked(sos_waiter_wait(handle,
-                                (&var buf.header) as UnsafePointer<UInt>,
-                                wait_record_bytes() as UInt))
-    return decode_wait(&buf)
 }

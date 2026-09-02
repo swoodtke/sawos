@@ -184,3 +184,364 @@ The money shot (unit 5 — driver-as-service, and the MAX_PROCESSES
 bump with the three-process delegation); the M4 docs sweep (unit 6);
 the dissolve-helper backlog item (SL-3's remainder); the shared stats
 region; namespaces, kill, priorities (the standing tail).
+
+---
+
+## As-built (M4 unit 4, Sep 2 2026) — SHIPPED
+
+Base `c2a31ef` (the amendment above). The suite baseline for transcript
+accounting was captured at `7362a3f`, which is the same tree for build
+purposes — `c2a31ef` touches `designs/` only.
+
+**EVERYTHING §API ASKED FOR LANDED, IN THE AMENDED SPELLING**, plus the
+three riders. No new object, no new kind, no new slab and NOT ONE NEW
+OP — §5.7's renumberable discipline paid for the whole unit on the
+ARGUMENT side, exactly as unit 3 spent it on the flags word.
+
+### 1. The record, and the argument the layout deserves
+
+The wait record's final shape, in declaration order (declaration order
+IS the layout, design 58):
+
+```saw
+public struct WaitBuffer {
+    public header: [UInt; WAIT_HEADER_WORDS],   // key, tag, payload
+    public meta: PipeMsgMeta,                   // len: UInt8, kinds: [UInt8; 4]
+    public handles: [UInt; WAIT_HANDLE_SLOTS],  // request, then 4 message slots
+    public body: [UInt8; PIPE_BODY_BYTES],
+}
+```
+
+**THE PER-PROFILE ANSWER IS THE NATURAL ABI'S, AND NOBODY COMPUTED IT.**
+`PipeMsgMeta` is five bytes at alignment 1; the handle region that
+follows wants machine-word alignment, so the meta lives in padding the
+struct needed anyway. Measured, both profiles:
+
+| region | riscv32 | arm64 |
+|---|---|---|
+| header | 12 B (3 words) | 24 B (3 words) |
+| meta | 8 B = **2 words** | 8 B = **1 word** |
+| handles | 20 B (5 words) | 40 B (5 words) |
+| body | 128 B | 128 B |
+| `wait_record_bytes()` | **168** | **200** |
+| `wait_prefix_bytes()` | 40 | 72 |
+| `wait_meta_end_bytes()` | 20 | 32 |
+
+The meta occupies two words on the 32-bit profile and one on the 64-bit
+one, and it costs NOTHING on either: three header words plus five meta
+bytes round to 20 on riscv32, which is where a word-aligned handle
+region would have started regardless. Three `static_assert`s pin it —
+the buffer holds every region; the fixed prefix is a whole number of
+machine words (which is what makes "a contiguous prefix ending at `len`"
+an arithmetic rather than a hope); and the meta fits between the header
+and the handle region, which is the assert that would catch a raised
+`PIPE_MSG_HANDLES`.
+
+**THE RECORD GOT SMALLER, WHICH IS THE USER'S ADDITION PAYING OUT.**
+Unit 3 left it at 4 header words + 128 body = 144 B / 160 B. Unit 4
+added five handle words and a kind byte apiece and lands at 168 / 200 —
+but the standalone length word DIED, so the growth is 24 B / 40 B rather
+than 28 B / 48 B, and the SHORT prefix a Timer delivery writes went from
+16 B / 32 B to **20 B / 32 B**: one word more on riscv32, IDENTICAL on
+arm64. A Timer waiter pays for handles in buffer space and, on the
+64-bit profile, in nothing at all.
+
+**THE RAW-ALTITUDE BUFFERS STILL CLEAR IT**, re-verified as instructed:
+`tests/waiter-revoked` over-provisions 48 words = 192 B / 384 B against
+168 / 200, and the hand-assembled payloads' 256 B clears both. Neither
+moved and neither had to.
+
+Offsets are published in `sosabi` — `WAIT_KEY_WORD` / `WAIT_TAG_WORD` /
+`WAIT_PAYLOAD_WORD`, `WAIT_HANDLE_SLOTS`, `WAIT_REQUEST_SLOT`,
+`WAIT_MSG_SLOT_0`, and the three byte functions — and read once, in
+`sos.pipe`'s decode.
+
+**THE REQUEST SLOT CARRIES NO KIND BYTE, ON PURPOSE.** A wait record's
+request slot is a `PipeRequest` or it is empty, so a non-zero word is the
+whole of what a decode has to ask; the kind bytes describe the four
+slots where the kind genuinely varies. Five slots, four kind bytes, one
+length byte — which is exactly the five that fit the padding.
+
+### 2. The vocabulary move
+
+`PipeMsg`, `WaitPayload`, `WaitResult`, `decode_wait` and `Waiter.wait`
+now live in `sos.pipe`, reached through `extension Waiter` (the tree's
+own precedent). `ReplyDelivery` did not move — it DISSOLVED: a reply
+delivery is a `PipeMsg` in the same optional field a delivery-as-take
+fills, so the two producers of a message-shaped record answer with one
+type. `sosabi` keeps the wire enums, the record layouts and the offsets;
+`PIPE_MSG_HANDLES` landed there beside `PIPE_BODY_BYTES` — design 13
+deviation 1 verbatim, since the two numbers the halves must AGREE on
+live where both can see them, while the ring's DEPTH stays a slab
+dimension in `kcore.limits`.
+
+`kernel/sysapi/src/waiter.saw` keeps a comment block where the decode
+used to be, naming where it went and why, so a reader who knows the old
+shape is not left searching.
+
+### 3. `PipeHandle` — the six cases, and the follow-up
+
+```saw
+public enum PipeHandle {
+    case Memory(m: Memory),   case IoMemory(io: IoMemory),
+    case Inlet(i: PipeInlet), case Outlet(o: PipeOutlet),
+    case Reply(r: PipeReply), case Request(rq: PipeRequest),
+}
+```
+
+Enforced kernel-side by `msg_kind_of`, which is `boot_kind_of` minus
+`Process` and `System`, written as a `match` with named arms so a future
+givable kind fails to compile until somebody says which side of the line
+it is on.
+
+**NAMED FOLLOW-UP, NOT BUILT: `Process` and `System` in messages.** The
+obstacle is module ORDER, not doctrine. `sos.pipe` sits below
+`sos.system` and `sos.process` in the package's dependency order (both
+of those name pipe types in their `give` and factory surfaces), so a
+`PipeHandle` case holding a `Process` wrapper is a cycle — DF-232e's
+shape. The path I scouted and did not take: split the wrapper STRUCTS
+into a leaf module both layers import, leaving the METHODS where they
+are, which Saw's extensions make mechanical since a type's declaration
+and its methods need not share a file. It is a sysapi refactor with a
+real review surface — it moves every handle wrapper in the package — and
+it buys one thing: a launcher able to hand a child a Process or System
+handle AFTER `start`. Filed for the unit that wants it; the kernel side
+is one line in `msg_kind_of` when it comes.
+
+### 4. The ledger, and the refusal arm (design mine — argued)
+
+Ruling 5 made mechanical: `PIPE_MSG_WORDS` (four words per exchange)
+beside `PIPE_MSG_SENDER` (process + 1, so zero means "nothing staged").
+The words are the SENDER's handle words — notes, not references — and
+`stage_handles` writes them only after `check_send` has resolved every
+one, checked `Transfer`, and checked `msg_kind_of`. A refused send
+therefore stages nothing, and the validation happens before the ring
+slot is touched at all.
+
+At the rendezvous `move_staged` walks the row and calls `move_entry` per
+live slot:
+
+```saw
+public(package) func move_entry(from: Int, to: Int, word: UInt,
+                                entry: HandleEntry, keep: UInt32) unsafe -> UInt {
+    let given = mint_handle(to, entry.obj_type, entry.rights & keep, entry.target)
+    if given == NO_HANDLE { return NO_HANDLE }
+    ref_object(entry.obj_type, entry.target)
+    unbind_handle(from, handle_word_index(word))
+    unref_object(entry.obj_type, entry.target)
+    ...
+}
+```
+
+**REF BEFORE UNBIND IS THE WHOLE OF THE SAFETY.** The count goes up
+before it comes down, so moving the LAST handle onto an object cannot
+transiently reach zero and free the slot the receiver is about to be
+handed. `move_entry` is also what `Give`'s keep mask uses — one
+function, two doors — which is why agenda 7b rode this unit rather than
+standing on its own.
+
+`live_staged(x)` counts the slots whose word still resolves (the
+generation check is what turns a released staged entry into an EMPTY
+slot rather than a dangling one), and every delivery pre-flights
+`table_room(p, n)` AND `quota_room_for(p, QuotaKind.Handle, n)` for the
+whole batch before anything moves.
+
+**THE REFUSAL ARM IS THE PIECE THE BRIEF LEFT TO ME, AND HERE IS THE
+ARGUMENT.** Ruling 11(d) says the stated arm exists; it does not say
+what shape. Three were available:
+
+1. **Fault the waiter.** Rejected: a full handle table is a RESOURCE
+   condition, and §5.7's faults ruling is for things the caller could
+   have checked. A server cannot know how full its table will be when a
+   message it did not ask for arrives.
+2. **Drop the delivery and leave the thread parked.** Rejected outright
+   by §2.2's "nothing parked can be silently doomed": the level is still
+   raised, so the thread would re-park on a readiness it can never
+   consume — a livelock the kernel built.
+3. **Wake with a status and no record.** Taken.
+
+So `deliver_attachment` returns a `SosStatus` (it returned nothing
+before), and on `NoResource` / `QuotaExceeded` NOTHING is copied,
+consumed or detached: the message stays staged, the readable level stays
+raised, the attachment survives, and the parked thread is woken with the
+status in its answer register and a record it must not read. **THAT IS
+EXACTLY REVOCATION'S SHAPE** — design 12's `Revoked` wake writes no
+record for the same reason (nothing became ready, so there is no key,
+tag or payload) — which is why it needed no new protocol anywhere: one
+wake path already knew how to answer a parked thread with a status and
+nothing else. The server frees a slot and waits again; the message is
+still there. `tests/pipe-table-full` probes three table states, and the
+middle one — ONE free slot, still refused — is the row that separates an
+atomic refusal from a partial delivery.
+
+Both wait doors return `op_status(deliver_attachment(...))`, so
+`WaiterOp.Wait` and `PipeRequestOp.ReplyWait` refuse identically: the
+singular wake protocol unit 3.5 established, kept.
+
+### 5. Delivery-as-take
+
+`WaitTag.Message = 8`, a tag of its own rather than a `Readable` with a
+populated handle slot. The reason is a decode one: telling the two apart
+by inspecting a handle word would be READING THE PAYLOAD TO FIND OUT
+WHAT THE PAYLOAD IS. `Readable` still means "there is something", which
+is what a BORROWING attach delivers; `Message` means "here it is".
+
+The fifth matrix question (the ack-free drain) now reads the ATTACHMENT
+and not only the kind — the first time it has had to — because a
+readable outlet spends nothing under `add` and spends the message under
+`give`. One funnel still does the draining.
+
+**MEASURED, VERBATIM FROM `tests/pipe-cq`'s TRANSCRIPT:**
+
+```
+SOS cq: served=8 last request b=7,80,73,78
+SOS cq: server traps=10 for 8 messages
+SOS cq: per RPC client=1 server=1
+SOS cq: the delivery was the take
+```
+
+against `tests/pipe-pingpong`'s 18 for the same eight round trips with
+the SAME CLIENT PROGRAM — `child-pingpong`, unchanged — which is what
+makes the comparison exact rather than analogous. The ladder is
+complete: manual 3 → fused 2 → completion queue **1**. The two bracket
+traps are the opening `wait` (the degenerate first turn: `reply_wait`
+needs a request to consume) and the closing `stats()`.
+
+The server holds ZERO endpoint handles: it GIVES the outlet to its
+Waiter, so there is no handle left to call `take` through even if the
+loop wanted one.
+
+### 6. The keep mask
+
+`ProcessOp.Give` reads it from arg2; `SystemOp.ProcessSelf` reads it
+from arg0 and intersects with `process_rights()`. Sysapi: all seven
+`give(...)` overloads and `process_self` gained
+`keep: UInt32 = ALL_RIGHTS`, so not one call site moved. Fail-closed in
+both places — a bit the source lacks is IGNORED rather than an error,
+proved in `give-keep-mask` — because a request for authority that does
+not exist is answered by not granting it, and erroring would turn a mask
+written before a kind gained a right into a hard failure instead of a
+narrower handle.
+
+`ProcessSelf`'s mask closes spec §9's recorded finding (the two rights a
+driver spends on itself). Note what it does NOT do: it gives the DERIVER
+the verb, not the launcher reach. A launcher still cannot narrow the
+Process handle its child derives — that would want a per-process policy
+the kernel has no place for — and the finding closes by the child being
+able to drop its OWN authority, which is the privilege-drop shape a
+capability system should have.
+
+### 7. Deviations from §API, argued
+
+1. **`Post` / `Call` / `Reply` / `ReplyWait` take an ARGUMENT RECORD,
+   not four handle-word arguments.** §API said "grow 4 handle-word
+   args"; a body address, a length and four handle words is six things
+   and an op has three argument registers after the handle and the op
+   number. The record goes through the copy-in funnel the fused ops
+   already use, so the convention did not move a millimetre.
+   `PipeReplyWaitRecord` NESTS `PipeSendRecord` — the fused op's
+   arguments are the composed ones, one layout read at two arities.
+2. **`Take` and `Resolve` answer through a record too.** The same
+   arithmetic on the way out, and it makes `PipeMsgRecord` one type both
+   directions share.
+3. **`post_with` / `send_with` / `reply_with` / `reply_wait_with` are
+   NAMED rather than overloads of `post` / `reply` / …** — forced by
+   SL-15 (a bare integer literal does not adopt `UInt` when the method
+   is overloaded). Adding a handle-carrying overload broke 38
+   `len: <literal>` call sites across the suite that had compiled for
+   three units. The names are honest, the cost is recorded at the
+   definition, and collapsing them is a mechanical sweep when SL-15
+   closes.
+4. **`WaitResult` holds `message` and `request` as optional FIELDS, not
+   as enum payloads** — forced by SL-17 (below): `move` out of a
+   place-match arm double-drops, so a caller spells
+   `record.message.take()` and matches the owned local.
+   `WaitPayload.Message` says both fields are populated, which reads
+   well enough, and it is the shape a `NoCopy` payload can be got out of
+   today.
+5. **`PipeHandles` (parallel kind and word arrays) is the SEND-side
+   carrier**, rather than an array of `PipeHandle`. Match-arm bindings
+   are never mutable in Saw — probed, including under `&var self` — so a
+   sender cannot destructure an enum of wrappers to reach the words. The
+   send side wants words and kinds, the receive side wants wrappers; two
+   types is the honest answer, and `PipeHandles.put(0, request: move rq)`
+   reads fine.
+
+### 8. What the compiler enumerated
+
+The exhaustive-match discipline paid out four times, and each time the
+compiler wrote the work list rather than a reviewer:
+
+- adding `WaitTag.Message` failed every userspace `match` on a wait
+  answer (six test packages);
+- `Attachment.owns` failed all five `Attachment(...)` literal sites
+  across `waitables` / `refs` / `sched` / `dispatch`;
+- `deliver_attachment` changing to `-> SosStatus` failed both wait
+  doors, which is exactly the two places that had to learn the refusal;
+- `msg_kind_of`'s `match` over `BootHandleKind` is what will fail when a
+  future kind becomes givable.
+
+### 9. Findings
+
+1. **`Process` / `System` in messages is a module-split ruling** (§3
+   above) — the largest thing this unit deliberately did not build.
+2. **A WRAPPED BINARY EXPRESSION IS TWO STATEMENTS IN SAW, and it can be
+   silently wrong rather than an error.** `wait_meta_end_bytes()`
+   written as `sizeof<WaitBuffer>() - PIPE_BODY_BYTES` then a newline
+   then `- WAIT_HANDLE_SLOTS * sizeof<UInt>()` parses as a DISCARDED
+   subtraction followed by a NEGATED tail; the symptom was
+   `panic at refs.saw:1259: cast to UInt out of range: -20` at boot.
+   Parenthesised, with the hazard recorded at the site. NOT filed as an
+   SL-N: it is LANGUAGE_SPEC's stated statement rule working as
+   designed, and the deficiency — if there is one — is that a discarded
+   arithmetic expression draws no warning, which is a lint question for
+   sawlang rather than a defect this tree met.
+3. **Design 14 finding 3's stack ceiling bit three more times**, all on
+   arm64: `pipe_delegate` (a PRE-EXISTING case, which grew a
+   message-sized value when the take's answer changed shape),
+   `pipe_table_full` and `pipe_delegate_msg`. One phase per function is
+   the standing answer; `pipe-table-full` additionally traded a
+   16-frame recursion for a 16-slot array. Root's 16 KiB grant is
+   getting tight for cases that hold two message-sized values and format
+   numbers, and unit 5 should expect to pay it.
+4. **A staged sender's handle word is STALE after the rendezvous**, and
+   a raw-altitude case must not release it. `pipe-stale-attach` faulted
+   on exactly that; the release is gone and the reason is written at the
+   line. It is ruling 5 working — the entry MOVED, so the sender's word
+   is a `BadHandle` — and it is worth knowing that the C altitude feels
+   it where the typed one does not, the wrapper there having been
+   consumed by the send.
+5. **A reply carrying a handle needs the client PARKED, not merely
+   alive.** The first spelling of that proof lived in `pipe-handles`,
+   where the child replied and exited before root's rendezvous — so
+   ruling 5 delivered an empty slot, correctly, and the case failed for
+   a right reason. It moved to `pipe-delegate-msg`, where root is parked
+   on the claim, so the delivery runs INSIDE the child's own
+   `reply_with` syscall while the entry it staged is still bound. This
+   is a real property of ruling 5 and belongs in any protocol built on
+   it: **a fire-and-forget send of a capability races the sender's own
+   exit.**
+
+### 10. The riders
+
+- The facade's floor re-export gained `sos_pipe_inlet_call` and
+  `sos_pipe_request_reply_wait` (unit 3.5's omission), plus the five new
+  `sos.pipe` types and `PIPE_MSG_HANDLES`.
+- The `var`→`let` tidy ran at the `consumes` call sites in the files
+  this unit touched: a `move` retires the binding, so a local that feeds
+  exactly one does not need to be mutable.
+- `MAX_PROCESSES` stays 2, and `pipe-delegate-msg`'s case header says in
+  as many words why a two-pipe round trip proves the mechanism the
+  three-process spelling would.
+
+### 11. Harness
+
+Six new cases, appended so no existing index moved: `pipe_stale_attach`,
+`pipe_table_full`, `pipe_handles`, `pipe_delegate_msg`, `pipe_cq`,
+`give_keep_mask`. Two new child packages (`child-handles`,
+`child-narrow`); `pipe-cq` reuses `child-pingpong` UNCHANGED.
+`pipe-stale-attach` is written at the C altitude, because the typed
+funnel disarms the wrapper it takes and a Saw program cannot reach the
+released-staged-entry state at all.
+
+**105 → 111 cases per architecture, 210 → 222 total.**

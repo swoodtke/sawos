@@ -30,8 +30,53 @@ entry below or the brief that carries it, never restating either.
   `(move request).reply_wait(...)` consume; `claim.resolve(...)` does
   not, by the argued exception in SL-16's closure. The APIs are
   complete; the ladder continues.
+  **CLOSED Sep 2 (design 18 authored, §API user-reviewed, AMENDED at the
+  implementing agent's STOP, and built; As-built in the brief).** What
+  landed: handles in messages on all four submission ops through
+  ARGUMENT RECORDS (six things do not fit three registers), with
+  `PIPE_MSG_HANDLES = 4` in `sosabi` beside `PIPE_BODY_BYTES`; ruling
+  5's rendezvous ledger — the staged word is a NOTE, the entry stays the
+  sender's, `move_entry` moves it at the take or the delivery with the
+  quota charge, and the batch is pre-flighted so a taker that cannot
+  afford it refuses ATOMICALLY; ruling 11(d)'s delivery-as-take under
+  its own `WaitTag.Message`, whose REFUSAL ARM (my design, argued in the
+  As-built) is a wake with a status and no record — revocation's own
+  shape — leaving the message staged and its level raised; the wait
+  record's final layout (3 header words, the PACKED meta of one length
+  byte plus four kind bytes, five handle words, then the body), which is
+  SMALLER than unit 3's despite gaining handles because the standalone
+  body-length word died; and agenda 7b's keep mask on `Give` AND on
+  `SystemOp.ProcessSelf`, the latter closing spec §9's recorded finding.
+  The decoded vocabulary moved to `sos.pipe`. Six new cases
+  (`pipe_stale_attach`, `pipe_table_full`, `pipe_handles`,
+  `pipe_delegate_msg`, `pipe_cq`, `give_keep_mask`), 105 → 111 per
+  architecture. MEASURED: the completion-queue server serves eight round
+  trips in 10 traps against `pipe-pingpong`'s 18, same client program —
+  ONE trap per message, the ladder complete. Riders done: the two
+  missing floor re-export seams, the `var`→`let` tidy in the touched
+  files, `MAX_PROCESSES` unchanged at 2 with the two-pipe topology
+  argued in the case header. Deviations and findings are in design 18's
+  As-built; SL-17 filed below; `Process`/`System` in messages is the
+  named follow-up, filed in BACKLOG
 
 ## [BACKLOG] — filed, not scheduled
+
+- `Process` and `System` in messages — a sysapi MODULE-SPLIT ruling
+  [#18 As-built finding 1, Sep 2]: `PipeHandle` ships six cases
+  (`Memory`, `IoMemory`, `PipeInlet`, `PipeOutlet`, `PipeReply`,
+  `PipeRequest`) and the kernel refuses the other two AT THE SENDER in
+  `msg_kind_of`. The obstacle is module ORDER and not doctrine —
+  `sos.pipe` sits below `sos.system` and `sos.process` (both name pipe
+  types in their `give` and factory surfaces), so a case holding a
+  `Process` wrapper is a cycle, DF-232e's shape. The scouted path: split
+  the wrapper STRUCTS into a leaf module both layers import and leave
+  the METHODS where they are, which Saw's extensions make mechanical
+  since a type's declaration and its methods need not share a file. It
+  moves every handle wrapper in the package, which is why it wants a
+  lead ruling before it is written; what it buys is a launcher able to
+  hand a child a Process or System handle AFTER `start`, which no
+  in-tree program needs today. The kernel side is one line in
+  `msg_kind_of` when it comes
 
 - buffered `debug_print` — a length-taking form [#16 As-built finding,
   Sep 1]: today the seam traps once per BYTE, so a test's prose
@@ -195,7 +240,7 @@ One entry per issue, resolution-sufficient: the symptom verbatim, the probe/site
       print("{}", b.put(len: 1))    // error: argument 1 expects `UInt` but got `Int`
   }
   ```
-  It bites wherever a ratified surface is overloaded on presence rather than on type — §2.1's `send(msg)` beside `send(msg, timeout:)` is exactly that shape, and the two differ only in trailing arguments. Workaround in-tree: name the number (`static TIMEOUT_MSG_LEN: UInt = 1`), with the reason written at the declaration; a suffix is not available for platform `UInt`, which is what makes the workaround a static rather than a one-character fix. Resolution: run literal adoption per CANDIDATE during overload resolution and let a set whose members agree on the parameter's type resolve it, keeping the refusal for the genuinely ambiguous case the spec already documents.
+  It bites wherever a ratified surface is overloaded on presence rather than on type — §2.1's `send(msg)` beside `send(msg, timeout:)` is exactly that shape, and the two differ only in trailing arguments. Workaround in-tree: name the number (`static TIMEOUT_MSG_LEN: UInt = 1`), with the reason written at the declaration; a suffix is not available for platform `UInt`, which is what makes the workaround a static rather than a one-character fix. Resolution: run literal adoption per CANDIDATE during overload resolution and let a set whose members agree on the parameter's type resolve it, keeping the refusal for the genuinely ambiguous case the spec already documents. **IT COST A NAMING IN M4 UNIT 4 (design 18, Sep 2), which is worth recording because the cost is now shipped surface.** Adding a handle-carrying `post(body:len:handles:)` beside `post(body:len:)` broke 38 `len: <literal>` call sites across the suite that had compiled for three units — every one of them a candidate set agreeing on `UInt` and differing by arity, this entry's exact shape. Rather than name 38 numbers, the handle-carrying variants ship as DISTINCT NAMES: `post_with`, `send_with`, `reply_with`, `reply_wait_with`, with the reason written at the definitions. They read honestly enough that this is not urgent, but collapsing them into overloads is a mechanical sweep the day this closes, and until then a ratified surface is being named around a resolution bug.
 
 - SL-16 — THERE IS NO CONSUMING (`self`) METHOD RECEIVER, SO A TRANSFER FUNNEL CANNOT BE A METHOD ON THE THING IT CONSUMES: ``Parse error at 8:20: 'self' must be a reference: use '&self' or '&var self'`` (design 17, `kernel/sysapi/src/pipe.saw`, sawc 0.3.0 @ `87063387`). Saw has `&self` and `&var self` and nothing else — a by-value receiver is refused AT THE PARSER, before any ownership question is asked — so an op whose whole contract is "this call consumes the receiver" has to be spelled either as a `&var self` method that disarms a sentinel (what the tree does, and what `PipeRequest.reply`, `PipeReply.resolve` and every other funnel already do) or as a method on some OTHER receiver taking the value by move (`Waiter.give`, `Process.give`). Neither spelling can be checked at compile time: a caller may call a disarmed wrapper again, and only the kernel's handle generations catch it. Minimal repro, one file, hosted:
   ```saw
@@ -209,3 +254,26 @@ One entry per issue, resolution-sufficient: the symptom verbatim, the probe/site
   }
   ```
   LANGUAGE_SPEC is ambivalent about it, which is what made this look like a spelling problem rather than a rule: the Gotchas section says "a bare `self` is likewise rejected", while the concurrency section's capture rules say "A CONSUMING `self` receiver (no `&`) is an owned binding and captures by value as usual" — a sentence about a form the parser does not accept. It bit design 17 because the unit's reviewed §API spells `reply_wait(self, …)`, and the two things the user ruled — the op lives ON THE REQUEST, and the receiver is consumed — are jointly unwritable today; the placement won, and the consume is the sentinel discipline. Workaround in-tree: `&var self` + disarm before the syscall, which is the transfer-funnel contract this tree already documents at `sos.floor`. Resolution: either allow a by-value receiver (which would make single-use a COMPILE error at every funnel in this kernel, rather than a runtime fault the generations diagnose), or strike the concurrency section's sentence and say once, in one place, that a consuming receiver is spelled as a by-value PARAMETER on another type. **FIX IN FLIGHT (user, Sep 1): sawlang grows a `consumes` effect — closes at the FOURTH pin bump.** The ruled syntax: `func f(&var self, ...) consumes { ... }` on the definition (the effect slot, receiver unchanged — exclusivity is the entry requirement, consumption the exit); call sites spell `(move obj).f(...)` (moves stay written — stronger than Rust's invisible-at-the-call consumption). THE SEMANTICS, RULED (user, Sep 1, second round): a `consumes` body SUBSTITUTES for the custom deinit body — the teardown pipeline today is custom-deinit-body -> synthesized member drops, and a consumed path is consumes-body -> synthesized drops FOR THE NON-MOVED MEMBERS; the custom deinit body never runs on that path. MULTIPLE fields may be moved out (partial moves stay banned everywhere outside a consumes body); no restriction on hand-written-deinit types is needed, because the substitution model IS the answer — the custom body is simply not on the consumed path. One note left open upstream: the foreign-module fence (a consumes method on a type with a custom deinit suppresses teardown the author wrote — declaring-module-only, or lean on field privacy). At closure: `reply`/`resolve`/`reply_wait` definitions gain `consumes`, their call sites gain `(move ...)`, THE NO_HANDLE SENTINEL RETIRES AT CONVERTED SITES (the consumes body makes the syscall; the handle word's synthesized drop is a no-op; no release fires), and the compile-time use-after-consume error this entry names becomes real. `Waiter.give` is untouched (by-value PARAMETERS were always legal; the gap was receiver-position only). **CLOSED (fourth pin bump, sawlang 0.4.0 @ `46eebb36`, Sep 2):** design 260 landed `consumes` and the conversion sweep executed. WHAT CONVERTED: `PipeRequest.reply` and `PipeRequest.reply_wait` — the two ops that consume the obligation on EVERY path they can take (`reply` on `Ok` and on `PeerClosed`; `reply_wait` on `Ok` and on both legs of `ReplyWaitError`) — now carry `consumes` in the effect slot beside an unchanged `&var self`, and their 22 call sites across 13 test packages — 20 `reply`, 2 `reply_wait` — spell `(move obligation).reply(...)`. There are no sysapi-internal callers of either: a tree grep found every one of the 22 in `tests/`, so the sweep never touched `kernel/`, `root/` or `rt/`. THE SENTINEL RETIRED AT BOTH: `reply_body` and `reply_wait_body` no longer take the wrapper by reference and no longer write `PipeRequestHandle(NO_HANDLE)` — they take the WORD, which is the shape `post_body`/`call_body`/`take_into` beside them already had, so the file's helper surface is uniform again. The consuming body substitutes for the custom `deinit` body on the consumed path, the handle field's synthesized drop is a no-op, and no release fires; the custom `deinit` STAYS, because an unconsumed obligation still has to release. WHAT THE COMPILE ERROR NOW CATCHES, both witnessed by probe against the pinned sawc: a second use is ``error: use of moved variable `obligation` `` + ``hint: value was already moved at line 76``, and a bare call is ``error: `reply` consumes its receiver — write `(move obligation).reply()` `` + a hint naming the moved-from binding and the `var` revival. `resolve` DID NOT CONVERT, and the argument is this file's own documented departure read forward: a `resolve` that answers `Ok(None)` consumed NOTHING, so it consumes on two paths out of three, and `consumes` consumes on every path — spelling it that way would spend a live claim at the first empty poll, which is the one thing a poll loop must survive. Its contract is consume-on-success-or-terminal-failure and the effect cannot express it, so `PipeReply.resolve` keeps `&var self` and the disarm decided by the ANSWER. Splitting it into a non-consuming poll plus a consuming resolve was considered and DECLINED: it gives one op two typed doors for a distinction the kernel already draws in the status, and §2.1's ratified surface is one `resolve`. NEGATIVE-TEST CONSEQUENCE, one case and not the two the sweep expected: `pipe-no-reply` uses its receiver ONCE (its fault is a RIGHTS refusal, not a double use) and needed only the `(move ...)`; `pipe-dead-claim` double-uses `resolve`, which did not convert, so its proof is untouched and it is now the ONLY place in the suite that can show the ledger's `BadHandle` from Saw. The case that broke is `pipe-reply-wait-dead`, which used `reply` and then `reply_wait` through one binding — a use-after-move now. A minted sibling cannot restore that proof (a sibling's entry SURVIVES the original's consume, so it answers `PeerClosed`, not `BadHandle`) and the raw altitude cannot be reached from a test without either widening the facade's floor re-export or giving a userspace package a `sosabi` dependency for the record layouts, which is the vDSO wall. So the case was RETARGETED to the property its own error enum owes and nothing in the suite exercised: the REPLY LEG firing — a client that abandoned its claim, answered through the fused op, against a Waiter with NOTHING attached, so a park would have been `every thread blocked` and reaching `done` is the proof that no park happened. That is design 17's "one dead client cannot stall a server loop" sentence, executed. Its three transcript rows moved and the case went from a fault case to a clean-exit one; the kernel-side `BadHandle` is untouched and still stands for a raw-altitude caller. GIVE-INTERNALS NOTE (recorded, deliberately not built): the four `Waiter.give` overloads and the other transfer funnels still disarm by hand, because `consumes` is a RECEIVER-position effect and they take their wrapper as a by-value PARAMETER. A private `consumes` dissolve helper on each wrapper (`(move owned).dissolve()` answering the word) would retire those too — SL-3's remainder, filed as a backlog item above.
+- SL-17 — `move` OUT OF A **PLACE**-MATCH ARM COMPILES AND DOUBLE-DROPS: no diagnostic at all, and the moved-from payload's `deinit` RUNS A SECOND TIME when the matched-on value dies (design 18, `kernel/sysapi/src/pipe.saw`, sawc 0.4.0 @ `46eebb36`). Matching a `&var` place and writing `move o` in an arm yields a working value AND leaves the enum believing it still owns the payload; for a handle wrapper that is a DOUBLE RELEASE of a live capability, which the kernel's generations turn into a `BadHandle` fault in whichever unrelated code next holds that table slot. Probed with a drop counter, hosted, three files — the move variant drops TWICE, the same arm without the move drops ONCE, and the design-around drops once:
+  ```saw
+  unsafe static var DROPS: Int = 0
+  struct Owned { w: Int }
+  extension Owned: NoCopy { func deinit(&var self) unsafe { DROPS = DROPS + 1 } }
+  enum Slot { case Empty, case Full(o: Owned) }
+  extension Slot: NoCopy {}
+
+  func take_it(s: &var Slot) -> Owned {      // compiles clean
+      match s {
+          case Empty -> { Owned(w: 0) },
+          case Full(o) -> { move o },        // <-- the payload is NOT retired
+      }
+  }
+
+  func main() unsafe {
+      var s = Slot.Full(o: Owned(w: 7))
+      var got = take_it(&var s)
+      let _ = move got                       // drops=1  (correct so far)
+      let _ = move s                         // drops=2  <-- the double drop
+  }
+  ```
+  Control (`case Full(o) -> { o.w }`, no move): drops=1. Design-around (take the whole enum BY VALUE — `func take_it(s: Slot)`, `var owned = move s`, then match the OWNED LOCAL): drops=1, so an owned-local match consumes its payload correctly and only the PLACE form is unsound. Either the arm's `move` should be REFUSED — a place a caller still owns cannot give up a payload — or it should mark the payload moved-from so the enclosing drop skips it, which is what a partial move means everywhere else in the language. Silently compiling to a double free is the one outcome that should not be available. Workaround in-tree, and it cost a type: `WaitResult` holds its `PipeMsg` and its `PipeRequest` as OPTIONAL FIELDS rather than as `WaitPayload` enum payloads, so a caller writes `record.message.take()` into an owned local and matches that — `WaitPayload.Message` then says "both fields are populated" instead of carrying them. The shape design 18's §API wanted (a payload enum owning its wrappers) is unwritable until this is ruled.

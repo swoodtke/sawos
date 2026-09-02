@@ -102,7 +102,6 @@ func _start(boot_handle: UInt) {
     let _ = system.debug_print("SOS delegate: created\n")
 
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
-    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     msg[0] = 63
 
     // ROOT ASKS ITS OWN QUESTION, and takes it off its own outlet. Both ends are
@@ -117,7 +116,7 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let taken = try outlet.take(into: &var buf) catch {
+    let taken = try outlet.take() catch {
         print("SOS delegate: take failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
@@ -183,41 +182,52 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    var length: UInt = 0
-    var have = false
-    var rounds: Int = 0
-    while (not have) && rounds < POLL_ROUNDS {
-        rounds = rounds + 1
-        let got = try claim.resolve(into: &var buf) catch {
-            print("SOS delegate: resolve refused: {}\n", error)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        }
-        if let n = got {
-            length = n
-            have = true
-        } else {
-            try timer.arm(after_ns: PARK_NS) catch {
-                print("SOS delegate: arm failed: {}\n", error)
-                let _ = system.shutdown(EXIT_FAILED)
-                return
-            }
-            try waiter.wait() catch {
-                print("SOS delegate: wait failed: {}\n", error)
-                let _ = system.shutdown(EXIT_FAILED)
-                return
-            }
-        }
+    let answer = try poll_reply(&var claim, &timer, &waiter) catch {
+        print("SOS delegate: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
-
-    if not have {
+    if not answer.have {
         let _ = system.debug_print("SOS delegate: nothing came back\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    print("SOS delegate: reply len={} b={},{},{},{}\n", length,
-          buf[0] as UInt, buf[1] as UInt, buf[2] as UInt, buf[3] as UInt)
+    print("SOS delegate: reply len={} b={},{},{},{}\n", answer.length,
+          answer.b0, answer.b1, answer.b2, answer.b3)
 
     print("SOS delegate: done\n")
     let _ = proc.exit(EXIT_OK)
+}
+
+/// What the poll below found, flattened out of the message it came in.
+struct Answer {
+    have: Bool,
+    length: UInt,
+    b0: UInt,
+    b1: UInt,
+    b2: UInt,
+    b3: UInt,
+}
+
+/// **THE POLL, IN ITS OWN FRAME** (design 14 finding 3). It is a phase rather
+/// than a block because a `PipeMsg` is a message-sized value and every `print`
+/// with format arguments reserves its own scratch, so a `_start` holding both
+/// meets root's 16 KiB stack grant on the 64-bit profile.
+func poll_reply(claim: &var PipeReply, timer: &Timer,
+                waiter: &Waiter) -> Result<Answer, SosStatus> {
+    var rounds: Int = 0
+    while rounds < POLL_ROUNDS {
+        rounds = rounds + 1
+        let got = try claim.resolve()
+        if let answer = move got {
+            return Answer(have: true, length: answer.len,
+                          b0: answer.bytes[0] as UInt,
+                          b1: answer.bytes[1] as UInt,
+                          b2: answer.bytes[2] as UInt,
+                          b3: answer.bytes[3] as UInt)
+        }
+        try timer.arm(after_ns: PARK_NS)
+        try waiter.wait()
+    }
+    return Answer(have: false, length: 0, b0: 0, b1: 0, b2: 0, b3: 0)
 }

@@ -51,7 +51,7 @@
 
 import sos.{System, Process, Clock, ClockType, Timer, Waiter, PipeInlet,
             PipeOutlet, PipeReply, PipeRequest, WaitResult, WaitPayload,
-            ReplyDelivery, InletLevel, AttachMode, SosStatus, SystemRight,
+            InletLevel, AttachMode, SosStatus, SystemRight,
             PIPE_BODY_BYTES}
 
 static EXIT_OK: UInt = 0
@@ -301,9 +301,9 @@ func timed_out(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     // Now play the server on the connection the client gave up on. The message
     // is still staged — abandoning a claim does not un-send what was sent — so
     // the take succeeds and the reply is what carries the news.
-    let got = try outlet.take(into: &var buf)
+    let got = try outlet.take()
     guard let (_, request) = move got else { return BUG }
-    var obligation = move request
+    let obligation = move request
     match (move obligation).reply(body: &msg, len: ONE) {
         case Ok(_) -> {
             let _ = system.debug_print("SOS sendmanual: a cancelled claim took a reply\n")
@@ -318,29 +318,15 @@ func timed_out(system: &System, proc: &Process) -> Result<Void, SosStatus> {
 
 /// How many bytes the reply in this record carries.
 func reply_len(r: &WaitResult) -> UInt {
-    match r.what {
-        case Reply(outcome) -> {
-            match outcome {
-                case Data(msg) -> msg.len,
-                case PeerClosed -> 0,
-            }
-        },
-        case _ -> 0,
-    }
+    if let _ = r.message { return r.message!.len }
+    0
 }
 
 /// Byte `i` of it, read THROUGH A BORROW — which is what makes `PipeMsg` being
 /// `NoCopy` cost a caller nothing.
 func reply_byte(r: &WaitResult, i: Int) -> UInt {
-    match r.what {
-        case Reply(outcome) -> {
-            match outcome {
-                case Data(msg) -> msg.bytes[i] as UInt,
-                case PeerClosed -> 0,
-            }
-        },
-        case _ -> 0,
-    }
+    if let _ = r.message { return r.message!.bytes[i] as UInt }
+    0
 }
 
 /// Which of the inlet level's two readings this record carries.
@@ -371,7 +357,7 @@ func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
 /// Take, and discharge the obligation by dropping it — the mirror of `tell`.
 func take_and_drop(outlet: &PipeOutlet,
                    into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<Bool, SosStatus> {
-    let got = try outlet.take(into: &var into)
+    let got = try outlet.take()
     if let (_, request) = move got {
         let _ = move request
         return true

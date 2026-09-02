@@ -1,0 +1,220 @@
+// SOS M4 unit 4: THE RENDEZVOUS REFUSES ATOMICALLY (sawos design 18;
+// `designs/010` ruling 5, the second of its three consequences; spec §2.1).
+//
+// **HANDLES AND BODY MOVE TOGETHER OR NOT AT ALL.** A take that carries handles
+// mints SEVERAL entries at once — the obligation, and one per live staged slot —
+// and a table with room for SOME of them must refuse ALL of them. The
+// alternative is a half-delivered message: a sender's capabilities landing in a
+// table whose owner was never told they arrived, with no way to ask and no way
+// to give them back.
+//
+// So the kernel asks ONE question about the whole batch before any of it exists,
+// and on a refusal NOTHING happened: the message stays staged, the readable
+// level stays raised, and the exchange stays exactly where it was. Free a slot,
+// ask again, and the SAME message arrives.
+//
+// **THE PROOF IS THE MIDDLE ROW, AND IT IS WHY THIS CASE COUNTS TO TWO.** One
+// free slot is enough for the obligation alone; a kernel that minted what it
+// could and dropped the rest would succeed there, hand over a message with an
+// empty slot where a capability had been, and lose it. This case therefore
+// probes at THREE table states — none free, one free, two free — and only the
+// last may deliver.
+//
+// **THE TABLE IS FILLED BY MINTING SIBLINGS UNTIL IT REFUSES**, which is the
+// only way a capability system lets a process look at its own table: there is no
+// introspection op, so the answer to "how full is it" is asked by asking for one
+// more. The holder is an array rather than a recursion because sixteen frames
+// each able to call a take that answers a message-sized record is exactly design
+// 14 finding 3's stack ceiling on the 64-bit profile.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
+            PipeHandle, PipeHandles, PipeMsg, SosStatus, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The three things this case has to see, one bit each, so a partial result
+/// names WHICH probe went wrong rather than merely that one did.
+static SAW_FULL_REFUSED: UInt = 1
+static SAW_ONE_REFUSED: UInt = 2
+static SAW_TWO_DELIVERED: UInt = 4
+static SAW_ALL: UInt = 7
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS tablefull: no process handle: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let seen = try run(&system, &proc) catch {
+        print("SOS tablefull: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS tablefull: probes={} of {}\n", seen, SAW_ALL)
+    if seen != SAW_ALL {
+        let _ = system.debug_print("SOS tablefull: the refusal was not atomic\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS tablefull: one free slot is not enough, two deliver both\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// Stage one message with a handle, then probe the take at three table states.
+///
+/// ONE PHASE PER FUNCTION, per design 14 finding 3: a `PipeMsg` is a
+/// message-sized value and every `print` with format arguments reserves its own
+/// scratch, so a `_start` holding all of it meets root's 16 KiB stack grant on
+/// the 64-bit profile before it meets anything else.
+func run(system: &System, proc: &Process) -> Result<UInt, SosStatus> {
+    // TWO CONNECTIONS: one to send THROUGH, and one whose client end is the
+    // capability being sent. The second carries no traffic.
+    let carrier = try proc.pipe_create()
+    let (inlet, outlet) = move carrier
+    let cargo = try proc.pipe_create()
+    let (spare_in, spare_out) = move cargo
+
+    // ONE MESSAGE, STAGED AND LEFT THERE. The claim is given up at once (§2.1's
+    // TELL idiom), so the only thing holding this exchange is the message
+    // itself -- which is exactly what a refused take must leave alone.
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = 1
+    var carrying = PipeHandles.none()
+    carrying.put(0, inlet: move spare_in)
+    let staged = try inlet.post_with(body: &body, len: 1, handles: &var carrying)
+    guard let claim = move staged else { return SosStatus.WouldBlock }
+    let _ = move claim
+
+    let seen = try fill_and_probe(&system, &outlet)
+
+    let _ = move spare_out
+    let _ = move outlet
+    let _ = move inlet
+    return seen
+}
+
+/// **THE SLOTS THIS CASE FILLS THE TABLE WITH.** A process's table is
+/// `MAX_HANDLES` deep and the kernel does not publish that number — a caller
+/// meeting a full table is told `NoResource` and never has to know how deep it
+/// was — so this holds a comfortable upper bound and stops at the refusal.
+static FILL_SLOTS: Int = 16
+
+/// **THE HOLDER, AND IT IS AN ARRAY RATHER THAN A RECURSION.** The first cut of
+/// this case filled the table by recursing one frame per mint, which read
+/// beautifully and met root's 16 KiB stack grant on the 64-bit profile: sixteen
+/// frames, each big enough to call a take that answers a message-sized record.
+/// One frame and an array says the same thing and fits (design 14 finding 3).
+///
+/// It is `NoCopy` because it holds `System` wrappers, and its drop releases
+/// whatever is left — which is what makes an early return safe.
+struct Filler {
+    slots: [System?; FILL_SLOTS],
+}
+
+extension Filler: NoCopy {}
+
+extension Filler {
+    /// Every slot empty. Spelled out because a REPEAT literal cannot build a
+    /// `NoCopy` optional — `[v; N]` needs an element that copies for free — so
+    /// this literal tracks `FILL_SLOTS` by hand and the assert below is what
+    /// catches it if the number moves.
+    static func empty() -> Filler {
+        Filler(slots: [None, None, None, None, None, None, None, None,
+                       None, None, None, None, None, None, None, None])
+    }
+}
+
+static_assert(FILL_SLOTS == 16,
+              "Filler.empty spells its slots out and tracks FILL_SLOTS by hand")
+
+/// Fill the handle table by minting siblings into `held`, and probe the take at
+/// three table states on the way back down.
+///
+/// **THE OCCUPANCY IS THE FILL AND THE UNWIND IS THE FREEING**, which is what
+/// makes this readable as a proof rather than as bookkeeping: after the fill the
+/// table is full, and each release gives back exactly one slot, in the order the
+/// three probes want to ask about.
+func fill_and_probe(system: &System, outlet: &PipeOutlet) -> Result<UInt, SosStatus> {
+    var held = Filler.empty()
+    var depth: Int = 0
+    var filling = true
+    while filling && depth < FILL_SLOTS {
+        let got = try? system.mint()
+        if let one = move got {
+            held.slots[depth] = move one
+            depth = depth + 1
+        } else {
+            filling = false
+        }
+    }
+    if filling {
+        // The table was deeper than this holder, so the fill never reached the
+        // refusal and the probes below would be measuring nothing.
+        return SosStatus.NoResource
+    }
+
+    var seen: UInt = 0
+    // NONE FREE: a take that has to mint two things must refuse.
+    if try take_refuses(&outlet) {
+        seen = seen | SAW_FULL_REFUSED
+    }
+
+    // **ONE FREE, AND THIS IS THE ROW THE CASE EXISTS FOR.** One slot is enough
+    // for the obligation on its own; a kernel that delivered here would have
+    // dropped the handle the message carried.
+    let _ = held.slots[depth - 1].take()
+    if try take_refuses(&outlet) {
+        seen = seen | SAW_ONE_REFUSED
+    }
+
+    // TWO FREE: the batch the refusals were about arrives whole.
+    let _ = held.slots[depth - 2].take()
+    if try take_delivers(&outlet) {
+        seen = seen | SAW_TWO_DELIVERED
+    }
+    return seen
+}
+
+/// Did the take refuse — and leave the message where it was?
+///
+/// A refusal is a STATUS and not a fault, because a full table is a resource
+/// condition the caller could not have known about from the other side of the
+/// connection. Both of the two it can be are accepted: the machine's edge
+/// (`NoResource`) and the process's own budget (`QuotaExceeded`) are the same
+/// answer to this question.
+func take_refuses(outlet: &PipeOutlet) -> Result<Bool, SosStatus> {
+    match outlet.take() {
+        case Ok(got) -> {
+            // A delivery here is the bug this case is looking for, so whatever
+            // arrived is dropped and the answer is no.
+            let _ = move got
+            false
+        },
+        case Err(_) -> true,
+    }
+}
+
+/// Did the take deliver — the message, its obligation AND the handle it carried?
+///
+/// All three are checked, because "it succeeded" is not the claim: the claim is
+/// that the batch the refusals were about arrives WHOLE the moment there is room
+/// for it.
+func take_delivers(outlet: &PipeOutlet) -> Result<Bool, SosStatus> {
+    let got = try outlet.take()
+    guard let (arrived, request) = move got else { return false }
+    var msg = move arrived
+    let _ = move request
+    guard let carried = msg.handles[0].take() else { return false }
+    match carried {
+        case Inlet(i) -> {
+            let _ = move i
+            return true
+        },
+        case _ -> { return false },
+    }
+}

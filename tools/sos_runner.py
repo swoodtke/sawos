@@ -417,6 +417,17 @@ PIPE_NO_CALL_PKG = os.path.join(TESTS_DIR, "pipe-no-call")
 PIPE_CALL_OVERSIZED_PKG = os.path.join(TESTS_DIR, "pipe-call-oversized")
 PIPE_REPLY_WAIT_DEAD_PKG = os.path.join(TESTS_DIR, "pipe-reply-wait-dead")
 
+# M4 unit 4 — handles in messages, the rendezvous ledger, the completion queue
+# and the keep mask (sawos design 18).
+PIPE_HANDLES_PKG = os.path.join(TESTS_DIR, "pipe-handles")
+PIPE_DELEGATE_MSG_PKG = os.path.join(TESTS_DIR, "pipe-delegate-msg")
+CHILD_HANDLES_PKG = os.path.join(TESTS_DIR, "child-handles")
+PIPE_STALE_ATTACH_PKG = os.path.join(TESTS_DIR, "pipe-stale-attach")
+PIPE_TABLE_FULL_PKG = os.path.join(TESTS_DIR, "pipe-table-full")
+PIPE_CQ_PKG = os.path.join(TESTS_DIR, "pipe-cq")
+GIVE_KEEP_MASK_PKG = os.path.join(TESTS_DIR, "give-keep-mask")
+CHILD_NARROW_PKG = os.path.join(TESTS_DIR, "child-narrow")
+
 CLOCK_BASICS_PKG = os.path.join(TESTS_DIR, "clock-basics")
 TIMER_ONESHOT_PKG = os.path.join(TESTS_DIR, "timer-oneshot")
 TIMER_INTERVAL_PKG = os.path.join(TESTS_DIR, "timer-interval")
@@ -3849,6 +3860,116 @@ TEST_CASES = [
                        "land: the other end of this connection is gone",
                        "SOS replywaitdead: done"],
         "expect_clean_exit": True,
+    },
+    {
+        # **A STAGED HANDLE STAYS THE SENDER'S, AND A SENDER MAY LET IT GO**
+        # (sawos design 18, M4 unit 4; `designs/010` ruling 5's first
+        # consequence). Two rounds identical but for one release, so the
+        # transcript carries the difference rather than an assertion about it.
+        # Written at the C altitude because the typed funnel disarms the wrapper
+        # it takes and a Saw program cannot reach this state at all.
+        "name": "pipe_stale_attach",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_STALE_ATTACH_PKG,
+        "expect_out": ["{banner}",
+                       "SOS staleattach: a released staged handle arrives as "
+                       "an empty slot"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **THE RENDEZVOUS REFUSES ATOMICALLY** (sawos design 18; `designs/010`
+        # ruling 5's second consequence). Three table states, and the middle one
+        # -- one free slot, still refused -- is the row that separates an atomic
+        # refusal from a partial delivery.
+        "name": "pipe_table_full",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_TABLE_FULL_PKG,
+        "expect_out": ["{banner}",
+                       "SOS tablefull: probes=7 of 7",
+                       "SOS tablefull: one free slot is not enough, two deliver "
+                       "both"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **HANDLES IN MESSAGES, BOTH DIRECTIONS, WITH THE LEDGER OBSERVED**
+        # (sawos design 18; spec 2.1's send(data?, handles?)). The three
+        # free-slot readings are printed and NOT asserted -- they are a property
+        # of root's own table at three moments -- while the VERDICT the case
+        # computes from them is.
+        "name": "pipe_handles",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_HANDLES_PKG,
+        "children": [CHILD_HANDLES_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS handles: the post kept the entry and the take moved "
+                       "it",
+                       "SOS handles: the answer came back through the "
+                       "subscription"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **THE DELEGATION PRIMITIVE, ARRIVING AS A MESSAGE** (sawos design 18;
+        # spec 2.1's ratified zero-copy example). Root's own question is
+        # answered by a process that holds no end of the connection it was asked
+        # on, and the four bytes prove the payload never transited the middle.
+        #
+        # MAX_PROCESSES IS 2, so the round trip goes through two pipes rather
+        # than three processes: the mechanism under test is a one-shot crossing a
+        # process boundary INSIDE A MESSAGE, and the third party in 2.1's
+        # example differs from this child in nothing the kernel can see. The
+        # three-process spelling waits on unit 5's topology and the
+        # MAX_PROCESSES bump it forces.
+        "name": "pipe_delegate_msg",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_DELEGATE_MSG_PKG,
+        "children": [CHILD_HANDLES_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS delegatemsg: forwarded the obligation",
+                       "SOS delegatemsg: reply len=4 b=68,79,78,69",
+                       "SOS delegatemsg: the answer came from a process root "
+                       "never told about the pipe",
+                       "SOS delegatemsg: the reply carried an end back"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **THE COMPLETION-QUEUE SERVER: ONE TRAP PER MESSAGE** (sawos design
+        # 18; `designs/010` ruling 11(d)). The client is `child-pingpong`,
+        # UNCHANGED from unit 3.5, so the two server numbers are measured over
+        # identical work: 18 traps for eight messages there, 10 here.
+        "name": "pipe_cq",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_CQ_PKG,
+        "children": [CHILD_PINGPONG_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS cq: served=8 last request b=7,80,73,78",
+                       "SOS cq: server traps=10 for 8 messages",
+                       "SOS cq: per RPC client=1 server=1",
+                       "SOS cq: the delivery was the take"],
+        "expect_clean_exit": True,
+    },
+    {
+        # **ATTENUATE AT GIVE, AND AT THE DERIVE** (sawos design 18;
+        # `designs/010` agenda 7b). The case ends on its own negative arm --
+        # root reads stats through a handle it derived without `Stats` -- which
+        # is pipe_no_post's shape and the only one available when the fault
+        # kills the reader.
+        "name": "give_keep_mask",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": GIVE_KEEP_MASK_PKG,
+        "children": [CHILD_NARROW_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS childnarrow: posted through the wide end",
+                       "SOS keepmask: a bit the source lacks was ignored, not "
+                       "refused",
+                       "SOS keepmask: the narrowed end could not post",
+                       "SOS keepmask: derived a Process handle without Stats",
+                       "SOS: process fault: access denied process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
     },
 ]
 

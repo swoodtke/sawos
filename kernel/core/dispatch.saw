@@ -74,11 +74,18 @@ import sosabi.{
     BOOT_HANDLE_RECORD_WORDS,
     boot_handle_record_bytes,
     PIPE_BODY_BYTES,
+    PIPE_MSG_HANDLES,
     PIPE_CREATE_RECORD_WORDS,
     pipe_create_record_bytes,
-    PIPE_TAKE_RECORD_WORDS,
+    PipeMsgRecord,
+    PipeSendRecord,
+    PipeReplyWaitRecord,
+    PipeTakeRecord,
+    pipe_msg_body_offset,
+    pipe_msg_record_bytes,
+    pipe_send_record_bytes,
+    pipe_take_body_offset,
     pipe_take_record_bytes,
-    PIPE_REPLY_WAIT_RECORD_WORDS,
     pipe_reply_wait_record_bytes,
     ReplyWaitLeg,
     PROCESS_STATS_RECORD_DOUBLEWORDS,
@@ -175,7 +182,14 @@ import kcore.objects.{
     alloc_memory,
     alloc_exchange,
     alloc_pipe,
+    PIPE_MSG_SENDER,
+    PIPE_MSG_WORDS,
+    clear_staged_handles,
+    msg_word_at,
+    table_room,
     boot_handle_cursor,
+    boot_kind_of,
+    msg_kind_of,
     exchange_body_addr,
     exchange_can_settle,
     exchange_pipe,
@@ -199,7 +213,9 @@ import kcore.objects.{
     unbind_handle,
 }
 import kcore.diag.{fatal_kernel}
-import kcore.refs.{deliver_attachment, notify_claim, notify_if_ready,
+import kcore.refs.{PipeMsgPrefix, PipeTakePrefix, deliver_attachment,
+                   live_staged, move_entry, move_staged, msg_prefix,
+                   notify_claim, notify_if_ready, stage_handles,
                    notify_ready, ref_object, ref_waitable, signal_event,
                    unref_object, unref_waitable, wake_one_waiter}
 import kcore.threads.{
@@ -358,7 +374,17 @@ func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt, arg1: UInt,
             if not obj.allows(SystemRight.ProcessSelf) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            let handle = mint_handle(p, ObjType.Process, process_rights(), p)
+            // **`arg0` IS A KEEP MASK SINCE M4 UNIT 4** (`designs/010` agenda
+            // 7b; sawos design 18), and it closes the M3-unit-6 finding this
+            // op's own docstring records: `process_rights()` is ONE default set,
+            // so a derived Process handle used to carry `InterruptBind` and
+            // `Map` whatever the SYSTEM handle it came through had been narrowed
+            // to. Intersecting here is `MINT_OP`'s rule at the one derivation
+            // that had no mask, truncating for `mint_sibling`'s reason.
+            let handle = mint_handle(p, ObjType.Process,
+                                     process_rights()
+                                         & UInt32.from(truncating: arg0),
+                                     p)
             if handle == NO_HANDLE {
                 return op_status(mint_refusal(p))
             }
@@ -585,7 +611,7 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             if not obj.allows(ProcessRight.Give) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            process_give(p, obj.slot, arg0, arg1)
+            process_give(p, obj.slot, arg0, arg1, arg2)
         },
         // **THE FACTORY FOR A CONNECTION** (sawos design 10 ruling 3, built by
         // design 13). It sits on the Process object beside `EventCreate` and
@@ -903,52 +929,6 @@ func process_start(caller: Int, child: Int,
     op_ok()
 }
 
-/// Which `BootHandleKind` a given handle's `ObjType` is delivered as, or `None`
-/// when the boot record has no spelling for it.
-///
-/// **THE ONE PLACE THE KERNEL-INTERNAL KIND AND THE PUBLIC ONE MEET** (sawos
-/// design 4). `ObjType` is renumberable bookkeeping and `BootHandleKind` crosses
-/// the trap boundary, so neither is a cast of the other; this function is the
-/// translation, written out, and it is deliberately PARTIAL. The kinds it cannot
-/// spell are exactly the kinds nothing mints `Transfer` on today — a Thread,
-/// Event, Waiter, Interrupt, Clock or Timer handle never reaches here, because
-/// the `Transfer` check above refuses it first. The arm exists so that the day a
-/// kind becomes givable, the compiler asks for its record spelling instead of
-/// letting it arrive mis-tagged.
-func boot_kind_of(kind: ObjType) -> BootHandleKind? {
-    match kind {
-        case Memory -> BootHandleKind.Memory,
-        case Process -> BootHandleKind.Process,
-        case System -> BootHandleKind.System,
-        // **UNIT 4'S ARM, AND IT IS THE ARM THE COMMENT ABOVE PREDICTED**
-        // (sawos design 6 D-1): `iomemory_rights()` mints `Transfer`, so a
-        // window can travel, so the record needs a spelling for one. A Mapping
-        // stays in the `None` arm on purpose — `mapping_rights()` withholds
-        // `Transfer`, so the `Transfer` check above refuses one first and this
-        // spelling would be dead surface.
-        case IoMemory -> BootHandleKind.IoMemory,
-        // **M4 UNIT 1's TWO ARMS, AND THEY ARE THE SAME PREDICTION COLLECTED A
-        // SECOND TIME** (sawos design 13 D-3): `pipe_inlet_rights()` and
-        // `pipe_outlet_rights()` mint `Transfer`, because handing a child ONE
-        // END of a connection is what the pair is FOR — a launcher creates the
-        // pair, gives the inlet to the client and the outlet to the server, and
-        // the launch flow is unchanged.
-        case PipeInlet -> BootHandleKind.PipeInlet,
-        case PipeOutlet -> BootHandleKind.PipeOutlet,
-        // **M4 UNIT 2's TWO ARMS, AND THIS PAIR IS THE ONE §2.1 ARGUED FOR BY
-        // NAME** (sawos design 14). `pipe_reply_rights()` and
-        // `pipe_request_rights()` mint `Transfer` because the ratified section
-        // calls the one-shots THE DELEGATION PRIMITIVE: a server MOVES its
-        // obligation to a third party, who replies straight to the original
-        // client and the payload never transits the middle process. So a give
-        // must carry one, and its record must be able to spell it —
-        // `pipe-delegate` is that flow at its smallest.
-        case PipeReply -> BootHandleKind.PipeReply,
-        case PipeRequest -> BootHandleKind.PipeRequest,
-        case _ -> None,
-    }
-}
-
 /// §2's `give(handle, tag:)` — **UNBIND AND REBIND, RIGHTS VERBATIM** (sawos
 /// design 4 D-1), and the whole of the launch flow's furnishing half.
 ///
@@ -991,13 +971,14 @@ func boot_kind_of(kind: ObjType) -> BootHandleKind? {
 /// GIVING TO YOURSELF NEEDS NO SPECIAL CASE and is refused by the state check: a
 /// running process is not `Created`, so `give` through your own Process handle is
 /// the same `BadState` a give after start is.
-func process_give(p: Int, child: Int, word: UInt, tag: UInt) unsafe -> SyscallResult {
+func process_give(p: Int, child: Int, word: UInt, tag: UInt,
+                  keep: UInt) unsafe -> SyscallResult {
     let entry = lookup_handle(p, word)
     let kind = give_faults(p, child, entry, tag)
     if not boot_handle_room(child) {
         return op_status(SosStatus.NoResource)
     }
-    let given = move_handle(p, child, word, entry, kind, tag)
+    let given = move_handle(p, child, word, entry, kind, tag, keep)
     if given == NO_HANDLE {
         // The child's table refused it — either because it is full, or because
         // the CHILD is at its handle budget, which is the answer a launcher
@@ -1059,14 +1040,16 @@ func give_faults(p: Int, child: Int, entry: HandleEntry,
 /// in the other order would take the count to zero between two lines of one op
 /// and FREE the object the give was about to hand over.
 func move_handle(p: Int, child: Int, word: UInt, entry: HandleEntry,
-                 kind: BootHandleKind, tag: UInt) unsafe -> UInt {
-    let given = mint_handle(child, entry.obj_type, entry.rights, entry.target)
+                 kind: BootHandleKind, tag: UInt, keep: UInt) unsafe -> UInt {
+    // **THE NARROWING IS TRUNCATING AND NOT `as`**, on `mint_sibling`'s exact
+    // reasoning: `keep` is a register-wide word a PROCESS chose, and an
+    // `as UInt32` on a 64-bit profile would PANIC INSIDE THE KERNEL over a
+    // number userspace picked. Rights are a 32-bit word, so the bits above the
+    // budget name no right and dropping them changes no answer.
+    let given = move_entry(p, child, word, entry, UInt32.from(truncating: keep))
     if given == NO_HANDLE {
         return NO_HANDLE
     }
-    ref_object(entry.obj_type, entry.target)
-    unbind_handle(p, handle_word_index(word))
-    unref_object(entry.obj_type, entry.target)
     queue_boot_handle(child, tag, kind, given)
     given
 }
@@ -1933,6 +1916,7 @@ func waiter_add(p: Int, w: Int, handle: UInt, key: UInt,
     ATTACHMENTS[a] = Attachment(state: SlotState.Live, kind: target.kind,
                                 target: target.slot, waiter: w, key: key,
                                 oneshot: (flags & WAITER_ADD_ONESHOT) != 0,
+                                owns: (flags & WAITER_ADD_CONSUMING) != 0,
                                 link: WAITERS[w].attached)
     WAITERS[w].attached = a + 1
     set_waitable_attachment(target.kind, target.slot, a + 1)
@@ -2053,8 +2037,13 @@ func waiter_wait(p: Int, w: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
 
     let ready = waiter_ready_attachment(w)
     if ready != NO_ATTACHMENT {
-        deliver_attachment(p, dst, ready)
-        return op_ok()
+        // **A DELIVERY CAN REFUSE SINCE M4 UNIT 4** (`designs/010` ruling 5).
+        // Ruling 11(d)'s completion queue makes a delivery MINT — the
+        // obligation, and every handle the message carried — so a table with no
+        // room answers the table-full status and delivers nothing at all: the
+        // message stays staged, its level stays raised, and a caller that frees
+        // a slot and waits again is handed the very same message.
+        return op_status(deliver_attachment(p, dst, ready))
     }
     if CURRENT_THREAD == NO_THREAD {
         fault_process(p, FaultReason.BadState)
@@ -2720,18 +2709,6 @@ static_assert(sizeof<PipeCreateRecord>()
               == PIPE_CREATE_RECORD_WORDS * sizeof<UInt>(),
               "a pipe-create record must be exactly the words sosabi publishes")
 
-/// The record `PipeOutlet.Take` answers with, in kernel memory (sawos design 14
-/// D-1). Same discipline as the one above it: declaration order IS the layout,
-/// pinned by an assert against the word indices `sosabi` publishes.
-struct PipeTakeRecord {
-    len: UInt,
-    request: UInt,
-}
-
-static_assert(sizeof<PipeTakeRecord>()
-              == PIPE_TAKE_RECORD_WORDS * sizeof<UInt>(),
-              "a pipe-take record must be exactly the words sosabi publishes")
-
 /// **MAKE A CONNECTION AND HAND BACK BOTH OF ITS ENDS** (spec §2.1; sawos design
 /// 13 D-3).
 ///
@@ -2841,6 +2818,9 @@ func pipe_inlet_op_decoded(op: PipeInletOp, obj: &PipeInletObject, arg0: UInt,
             }
             pipe_post(p, obj.slot, arg0, arg1)
         },
+        // (the two arms below are one op each; `arg0`/`arg1` are the send
+        //  record and its size on both, which is what makes the two paths
+        //  read as one message with and without a park)
         // **THE SAME BIT GATES BOTH, AND THAT IS THE RULING RATHER THAN A
         // SHORTCUT** (design 10 ruling 4's rider; sawos design 17's reviewed
         // §API). A `Call` submits a message exactly as a `post` does — same
@@ -2898,10 +2878,84 @@ func pipe_inlet_op_decoded(op: PipeInletOp, obj: &PipeInletObject, arg0: UInt,
 /// its exchange SETTLES rather than until its bytes are taken, so
 /// `PIPE_INFLIGHT` bounds awaiting-reply exchanges — design 10 ruling 6's
 /// "in-flight messages per client", read literally.
-func pipe_post(p: Int, slot: Int, src: UInt, len: UInt) unsafe -> SyscallResult {
-    if len > (PIPE_BODY_BYTES as UInt) {
+/// **READ A SEND RECORD, AND REFUSE THE WHOLE MESSAGE IF ANY PART OF IT IS
+/// WRONG** — the copy-in and the staging validation, in one place (spec §2.1's
+/// `send(data?, handles?)`; `designs/010` ruling 5; sawos design 18).
+///
+/// Its three callers are the three sending ops — `Post`, `Call` and `Reply` —
+/// and it is a funnel for the reason `checked` is one at the other tier: the
+/// domain questions a message poses are the same whichever direction it is
+/// going, and a second copy of them is a second place to be wrong about which
+/// handle a caller may attach.
+///
+/// **EVERY REFUSAL HERE IS A FAULT, AND IT HAPPENS BEFORE ANYTHING IS STAGED.**
+/// A record of the wrong size, a body longer than `PIPE_BODY_BYTES`, a handle
+/// word that names nothing, one whose entry lacks the universal `Transfer` right
+/// and one naming a kind no `BootHandleKind` spells are all mistakes only the
+/// caller could have made (design 178's faults line), and the caller chose every
+/// one of those numbers. Raising them here — above the ring, above the exchange,
+/// above every mint — is what makes §API's "refuses the WHOLE post, atomic,
+/// nothing staged" true by construction rather than by an unwind.
+///
+/// **IT VALIDATES AND DOES NOT RESERVE.** Nothing about a staged handle takes a
+/// reference (`designs/010` ruling 5: the entry stays the sender's), so there is
+/// nothing here to give back on the paths that go on to fail for other reasons —
+/// a full ring, a peer that is gone, a table with no room for the claim.
+func send_args(p: Int, src: UInt, bytes: UInt) unsafe -> PipeSendRecord {
+    // EXACTLY the published size, `timer_arm`'s rule: the record is the whole
+    // argument list and a caller that hands over a different number of words has
+    // built something else.
+    if bytes != (pipe_send_record_bytes() as UInt) {
         fault_process(p, FaultReason.BadArg)
     }
+    var args = PipeSendRecord(body: 0, len: 0, handles: [NO_HANDLE; PIPE_MSG_HANDLES])
+    if let why = copy_in(p, ((&var args) as UnsafePointer<PipeSendRecord>) as UInt,
+                         src, bytes) {
+        fault_process(p, why)
+    }
+    check_send(p, &args)
+    args
+}
+
+/// The DOMAIN half of `send_args`, split out for the one op whose record arrives
+/// nested inside another: `PipeRequestOp.ReplyWait` copies in a waiter and a
+/// message together, so it has the message already and needs only the checks.
+func check_send(p: Int, args: &PipeSendRecord) unsafe {
+    if args.len > (PIPE_BODY_BYTES as UInt) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    var i: Int = 0
+    while i < PIPE_MSG_HANDLES {
+        let word = args.handles[i]
+        if word != NO_HANDLE {
+            let entry = lookup_handle(p, word)
+            match entry.obj_type {
+                case Unbound -> fault_process(p, FaultReason.BadHandle),
+                case _ -> {},
+            }
+            // THE SAME BIT `give` SPENDS, CHECKED AT THE SAME ALTITUDE — the
+            // entry is known and the kind is not, which is where §3's universal
+            // low byte is read (`rights_allow_transfer`'s own docstring). A
+            // message is a transfer, so it spends the transfer right.
+            if not rights_allow_transfer(entry.rights) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            // ...and it must be a kind the delivery record can SPELL, which is
+            // the same partial translation `give` consults. The two checks
+            // overlap today and are not the same question: `Transfer` is an
+            // authority the holder was granted, and this is whether the receiver
+            // could be told what arrived.
+            guard let _ = msg_kind_of(entry.obj_type) else {
+                fault_process(p, FaultReason.BadArg)
+            }
+        }
+        i = i + 1
+    }
+}
+
+func pipe_post(p: Int, slot: Int, args_src: UInt, args_bytes: UInt) unsafe -> SyscallResult {
+    let args = send_args(p, args_src, args_bytes)
+    let len = args.len
     if PIPES[slot].outlet_refs == 0 {
         return op_status(SosStatus.PeerClosed)
     }
@@ -2917,7 +2971,7 @@ func pipe_post(p: Int, slot: Int, src: UInt, len: UInt) unsafe -> SyscallResult 
         // could have made. It runs BEFORE the mint so that the fault path has no
         // handle to account for; the slot it writes is still `Free`, and a
         // `Free` slot's bytes are read by nothing.
-        if let why = copy_in(p, exchange_body_addr(x), src, len) {
+        if let why = copy_in(p, exchange_body_addr(x), args.body, len) {
             fault_process(p, why)
         }
     }
@@ -2936,6 +2990,7 @@ func pipe_post(p: Int, slot: Int, src: UInt, len: UInt) unsafe -> SyscallResult 
     // inside the width. An out-of-range value here would be a kernel bug, which
     // is precisely when design 170 says to write `as`.
     PIPE_LENS[x] = len as UInt16
+    stage_handles(p, x, &args)
     // ONE COLUMN STARTS AT ONE AND THE OTHER AT ZERO, and the asymmetry is the
     // state machine: the claim exists from the post, the obligation does not
     // exist until somebody takes the message. That is exactly why `Staged` has to
@@ -2988,21 +3043,30 @@ func pipe_post(p: Int, slot: Int, src: UInt, len: UInt) unsafe -> SyscallResult 
 /// (design 14 deviation 1): the three argument registers are spent, so the
 /// buffer is checked against `PIPE_BODY_BYTES` of the caller's REAL memory,
 /// which is stricter than a number the caller types.
-func pipe_call(p: Int, slot: Int, src: UInt, len: UInt,
+func pipe_call(p: Int, slot: Int, args_src: UInt, args_bytes: UInt,
                reply_dst: UInt) unsafe -> SyscallResult {
-    if len > (PIPE_BODY_BYTES as UInt) {
-        fault_process(p, FaultReason.BadArg)
-    }
-    if let why = copy_out_check(p, reply_dst, PIPE_BODY_BYTES as UInt) {
+    let args = send_args(p, args_src, args_bytes)
+    let len = args.len
+    if let why = copy_out_check(p, reply_dst, pipe_msg_record_bytes() as UInt) {
         fault_process(p, why)
     }
     // A ZERO-LENGTH CALL READS NO BUFFER AT ALL, exactly as a zero-length post
     // does: there is nothing to copy, so no address is touched and none is
     // validated. A caller with no data has no buffer to name.
     if len != 0 {
-        if let why = copy_in_check(p, src, len) {
+        if let why = copy_in_check(p, args.body, len) {
             fault_process(p, why)
         }
+    }
+    // **AND THE ARGS RECORD ITSELF IS RE-CHECKED FOR THE ROOM PARK** (sawos
+    // design 18). A full ring parks this call with its message still in the
+    // caller's memory, and `resume_call_room` re-reads the RECORD as well as the
+    // body — the handle words are in it — so both addresses have to survive
+    // until the resume, and both are checked here while the caller is still the
+    // running process. `copy_in_check` exists for exactly this shape (design 17
+    // deviation 4).
+    if let why = copy_in_check(p, args_src, args_bytes) {
+        fault_process(p, why)
     }
     // AN OP THAT PARKS NEEDS A THREAD TO PARK, and the harness kernels that
     // enter user mode with no object model have none — `waiter_wait`'s own
@@ -3016,11 +3080,17 @@ func pipe_call(p: Int, slot: Int, src: UInt, len: UInt,
     }
     let x = alloc_exchange(slot)
     if x == NO_EXCHANGE {
-        block_on_call_room(CURRENT_THREAD, slot, src, len, reply_dst)
+        // **THE PARK REMEMBERS THE ARGS RECORD, NOT THE BODY**, which is what
+        // keeps `ThreadSlot` the size unit 3.5 made it: a message is four handle
+        // words plus a body address plus a length now, and re-reading the one
+        // record the caller already built is cheaper than four more thread
+        // fields to keep in step. The caller is BLOCKED, so nothing it owns can
+        // change under the re-read.
+        block_on_call_room(CURRENT_THREAD, slot, args_src, args_bytes, reply_dst)
         return op_blocked()
     }
     if len != 0 {
-        if let why = copy_in(p, exchange_body_addr(x), src, len) {
+        if let why = copy_in(p, exchange_body_addr(x), args.body, len) {
             // UNREACHABLE: the same source passed `copy_in_check` above and a
             // process's granted region is fixed for its life. Written rather
             // than assumed, which is what the door's `FaultReason?` is for.
@@ -3028,6 +3098,7 @@ func pipe_call(p: Int, slot: Int, src: UInt, len: UInt,
         }
     }
     PIPE_LENS[x] = len as UInt16
+    stage_handles(p, x, &args)
     // **ONE COLUMN AT ONE FOR A THREAD RATHER THAN FOR A HANDLE**, which is the
     // only line in this function that is not `pipe_post`'s. The asymmetry with
     // the request column is unchanged and means what it means there: the claim
@@ -3059,7 +3130,7 @@ func pipe_outlet_op_decoded(op: PipeOutletOp, obj: &PipeOutletObject, arg0: UInt
             if not obj.allows(PipeOutletRight.Take) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            pipe_take(p, obj.slot, arg0, arg1, arg2)
+            pipe_take(p, obj.slot, arg0, arg1)
         },
     }
 }
@@ -3096,25 +3167,22 @@ func pipe_outlet_op_decoded(op: PipeOutletOp, obj: &PipeOutletObject, arg0: UInt
 /// take moves the exchange from `Staged` to `Taken` and the slot recycles only
 /// when the exchange settles. Ring-full therefore counts awaiting-reply
 /// exchanges, which is what `pipe_post`'s own docstring says from the other side.
-func pipe_take(p: Int, slot: Int, rec_dst: UInt, rec_cap: UInt,
-               body_dst: UInt) unsafe -> SyscallResult {
+func pipe_take(p: Int, slot: Int, rec_dst: UInt, rec_cap: UInt) unsafe -> SyscallResult {
     // The published minimum, checked before the ring is consulted — the capacity
     // is a domain question about the call, and it is wrong or right whether or
     // not there is anything to hand over. `boot_handle_next`'s ordering exactly.
+    //
+    // **IT COVERS THE BODY NOW** (sawos design 18): unit 2 took a record and a
+    // separate body buffer, and a message that carries handles would have made
+    // that two buffers plus a third for the kinds. One record holds the
+    // obligation, the meta, the handle words and the body, and the door is asked
+    // about the whole of it — which is unit 2's "the buffer is checked against
+    // the caller's REAL memory rather than a number it typed" reaching one
+    // buffer further.
     if rec_cap < (pipe_take_record_bytes() as UInt) {
         fault_process(p, FaultReason.BadArg)
     }
     if let why = copy_out_check(p, rec_dst, pipe_take_record_bytes() as UInt) {
-        fault_process(p, why)
-    }
-    // **THE BODY BUFFER IS CHECKED AGAINST THE PUBLISHED SLOT SIZE, NOT AGAINST A
-    // NUMBER THE CALLER TYPED.** Unit 1 took a capacity argument and faulted a
-    // caller whose number was under `PIPE_BODY_BYTES`; the record left no
-    // register for it, and asking the copy door whether a WHOLE SLOT of the
-    // caller's memory is writable at that address turned out to be the stronger
-    // test — it catches the buffer that is genuinely too short, where a cap
-    // argument only ever caught a caller that admitted it.
-    if let why = copy_out_check(p, body_dst, PIPE_BODY_BYTES as UInt) {
         fault_process(p, why)
     }
 
@@ -3126,31 +3194,51 @@ func pipe_take(p: Int, slot: Int, rec_dst: UInt, rec_cap: UInt,
         return op_status(SosStatus.WouldBlock)
     }
 
-    // **THE OBLIGATION IS MINTED BEFORE THE MESSAGE IS CONSUMED**, which is
-    // `pipe_post`'s all-or-nothing shape mirrored: a full table or a spent handle
-    // budget must leave the staged message exactly where it was, for whoever
-    // takes it next.
-    let request = mint_handle(p, ObjType.PipeRequest, pipe_request_rights(), x)
-    if request == NO_HANDLE {
+    // **THE WHOLE BATCH IS PRE-FLIGHTED, AND THE REFUSAL IS ATOMIC**
+    // (`designs/010` ruling 5). A take mints the obligation AND every live
+    // handle the message carried, and a table with room for some of them must
+    // refuse ALL of them — otherwise a half-delivered message would leave a
+    // sender's capabilities in a table its receiver never learned about. One
+    // question about `live_staged(x) + 1`, asked before anything exists: the
+    // message stays staged, the readable level stays raised, and freeing a slot
+    // and taking again is handed the very same message.
+    if not table_room(p, live_staged(x) + 1) {
         return op_status(mint_refusal(p))
     }
+    let request = mint_handle(p, ObjType.PipeRequest, pipe_request_rights(), x)
+    if request == NO_HANDLE {
+        // UNREACHABLE: `table_room` established the room one line up and
+        // nothing between the two can spend it. Written rather than assumed.
+        fatal_kernel("a take's obligation was refused after its pre-flight",
+                     x as UInt)
+        return op_status(SosStatus.NoResource)
+    }
+    // **AND HERE IS THE RENDEZVOUS** (spec §2.1: attached handles enter the
+    // receiver's table only at receive). Every live staged entry moves from the
+    // sender's table into this one — unbound there, bound here, the quota row
+    // moving with it — and a slot whose sender released its entry arrives empty,
+    // which is ruling 5's honest `None`.
+    let moved = move_staged(x, p)
 
     let len = PIPE_LENS[x] as UInt
-    if len != 0 {
-        // THE ONE DOOR OUTWARD. It checks the destination and reports a refusal
-        // the caller terminates on, exactly as `Clock.Now` does.
-        if let why = copy_out(p, body_dst, exchange_body_addr(x), len) {
-            fault_process(p, why)
-        }
-    }
-    var rec = PipeTakeRecord(len: len, request: request)
+    var rec = PipeTakePrefix(request: request, msg: msg_prefix(len, &moved))
+    // THE ONE DOOR OUTWARD, twice, as one contiguous prefix ending at the
+    // message's length: the fixed part, then the bytes straight out of the ring
+    // slot. A short message pays for no part of the body region, which is what
+    // handles-before-bytes bought.
     if let why = copy_out(p, rec_dst,
-                          ((&var rec) as UnsafePointer<PipeTakeRecord>) as UInt,
-                          pipe_take_record_bytes() as UInt) {
+                          ((&var rec) as UnsafePointer<PipeTakePrefix>) as UInt,
+                          sizeof<PipeTakePrefix>() as UInt) {
         // UNREACHABLE, and deliberately still written: the same destination
         // passed `copy_out_check` above and nothing since can move a process's
         // window. Never-hide says the arm reports rather than assumes.
         fault_process(p, why)
+    }
+    if len != 0 {
+        if let why = copy_out(p, rec_dst + (pipe_take_body_offset() as UInt),
+                              exchange_body_addr(x), len) {
+            fault_process(p, why)
+        }
     }
 
     // CONSUMED BY DELIVERY, and only after the copies SUCCEEDED — the
@@ -3237,15 +3325,36 @@ func pipe_reply_op_decoded(op: PipeReplyOp, obj: &PipeReplyObject, arg0: UInt,
 /// discharged and is told `PeerClosed`.
 func pipe_resolve(p: Int, word: UInt, x: Int, dst: UInt,
                   cap: UInt) unsafe -> SyscallResult {
-    if cap < (PIPE_BODY_BYTES as UInt) {
+    if cap < (pipe_msg_record_bytes() as UInt) {
         fault_process(p, FaultReason.BadArg)
+    }
+    if let why = copy_out_check(p, dst, pipe_msg_record_bytes() as UInt) {
+        fault_process(p, why)
     }
 
     match PIPE_EX_STATE[x] {
         case Replied -> {
             let len = PIPE_LENS[x] as UInt
+            // **THE PRE-FLIGHT COMES BEFORE THE CONSUME, WHICH IS WHAT MAKES A
+            // REFUSED RESOLVE RETRYABLE** (`designs/010` ruling 5). A reply may
+            // carry handles, so this op mints too; a table with no room for them
+            // must leave the claim ALIVE and the answer where it is, and the
+            // caller frees a slot and resolves again. Everything below this line
+            // is the delivery, and none of it can fail for a reason a caller
+            // could act on.
+            if not table_room(p, live_staged(x)) {
+                return op_status(mint_refusal(p))
+            }
+            let moved = move_staged(x, p)
+            var rec = msg_prefix(len, &moved)
+            if let why = copy_out(p, dst,
+                                  ((&var rec) as UnsafePointer<PipeMsgPrefix>) as UInt,
+                                  sizeof<PipeMsgPrefix>() as UInt) {
+                fault_process(p, why)
+            }
             if len != 0 {
-                if let why = copy_out(p, dst, exchange_body_addr(x), len) {
+                if let why = copy_out(p, dst + (pipe_msg_body_offset() as UInt),
+                                      exchange_body_addr(x), len) {
                     fault_process(p, why)
                 }
             }
@@ -3311,7 +3420,8 @@ func pipe_request_op_decoded(op: PipeRequestOp, obj: &PipeRequestObject,
             if not obj.allows(PipeRequestRight.Reply) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            op_status(pipe_reply_status(p, obj.handle, obj.slot, arg0, arg1))
+            let args = send_args(p, arg0, arg1)
+            op_status(pipe_reply_status(p, obj.handle, obj.slot, &args))
         },
         // **`Reply` GATES THE REPLY LEG AND THE WAITER GATES ITS OWN** (sawos
         // design 17's reviewed §API): the op does two things, so it spends two
@@ -3358,27 +3468,34 @@ func pipe_request_op_decoded(op: PipeRequestOp, obj: &PipeRequestObject,
 /// no park. `Reply` itself is `op_status` wrapped around it, which is
 /// byte-identical to what it returned before — `op_status(SosStatus.Ok)` and
 /// `op_ok()` are the same pair.
-func pipe_reply_status(p: Int, word: UInt, x: Int, src: UInt,
-                       len: UInt) unsafe -> SosStatus {
-    if len > (PIPE_BODY_BYTES as UInt) {
-        fault_process(p, FaultReason.BadArg)
-    }
+func pipe_reply_status(p: Int, word: UInt, x: Int,
+                       args: &PipeSendRecord) unsafe -> SosStatus {
+    let len = args.len
 
     match PIPE_EX_STATE[x] {
         case Taken -> {
             if PIPE_REPLY_REFS[x] == 0 {
                 // ABANDONED BY THE CLIENT. Nothing is copied — there is nobody
                 // to copy it FOR — and the obligation is discharged, which is
-                // what settles the slot.
+                // what settles the slot. **NOTHING IS STAGED EITHER**, which is
+                // the honest answer for handles a reply meant to carry: the
+                // replier keeps every one of them, exactly as it keeps them when
+                // its client dies mid-exchange.
                 consume_entry(p, word, ObjType.PipeRequest, x)
                 return SosStatus.PeerClosed
             }
             if len != 0 {
-                if let why = copy_in(p, exchange_body_addr(x), src, len) {
+                if let why = copy_in(p, exchange_body_addr(x), args.body, len) {
                     fault_process(p, why)
                 }
             }
             PIPE_LENS[x] = len as UInt16
+            // **THE REPLY DIRECTION STAGES INTO THE SAME SLOTS THE REQUEST
+            // USED** (sawos design 18), and they are provably empty: the take
+            // that produced this obligation moved every handle the request
+            // carried and cleared the note. §2.1's `send(data?, handles?)` is
+            // symmetric, so this is the identical act one direction over.
+            stage_handles(p, x, &args)
             PIPE_EX_STATE[x] = ExchangeState.Replied
             // **AND THE CLAIM'S LEVEL IS NOW READY** (sawos design 15;
             // `designs/010` ruling 11(a)). A client parked on this claim is
@@ -3430,20 +3547,6 @@ func pipe_reply_status(p: Int, word: UInt, x: Int, src: UInt,
         },
     }
 }
-
-/// The argument record `PipeRequest.ReplyWait` is handed, in kernel memory
-/// (sawos design 17). Declaration order IS the layout (design 58), pinned by the
-/// assert below against the word indices `sosabi` publishes — `TimerArmRecord`'s
-/// discipline, on the copy-IN side where it belongs.
-struct PipeReplyWaitRecord {
-    waiter: UInt,
-    body: UInt,
-    len: UInt,
-}
-
-static_assert(sizeof<PipeReplyWaitRecord>()
-              == PIPE_REPLY_WAIT_RECORD_WORDS * sizeof<UInt>(),
-              "a reply-wait record must be exactly the words sosabi publishes")
 
 /// Resolve a raw word as a WAITER this process may park on — the second half of
 /// `ReplyWait`'s authority.
@@ -3500,14 +3603,20 @@ func pipe_reply_wait(p: Int, word: UInt, x: Int, args_src: UInt,
     if args_bytes != (pipe_reply_wait_record_bytes() as UInt) {
         fault_process(p, FaultReason.BadArg)
     }
-    var args = PipeReplyWaitRecord(waiter: 0, body: 0, len: 0)
+    var args = PipeReplyWaitRecord(
+        waiter: 0,
+        msg: PipeSendRecord(body: 0, len: 0, handles: [NO_HANDLE; PIPE_MSG_HANDLES]))
     if let why = copy_in(p, ((&var args) as UnsafePointer<PipeReplyWaitRecord>) as UInt,
                          args_src, args_bytes) {
         fault_process(p, why)
     }
-    if args.len > (PIPE_BODY_BYTES as UInt) {
-        fault_process(p, FaultReason.BadArg)
-    }
+    // **THE MESSAGE HALF IS VALIDATED BY THE FUNNEL EVERY SENDING OP USES**
+    // (sawos design 18). It arrived in this record rather than in one of its
+    // own, so it is handed to `send_args`' checks through the address of the
+    // nested field — the length bound and the four handle words, on identical
+    // terms to a `Reply`. Every one of those refusals is a fault, and every one
+    // of them happens while the obligation is still live.
+    check_send(p, &args.msg)
     let w = reply_wait_waiter(p, args.waiter)
     // THE WAIT LEG'S BUFFER IS VALIDATED HERE, ON THE CALL, exactly as
     // `waiter_wait` validates its own and for its reason: a bad buffer is the
@@ -3521,7 +3630,7 @@ func pipe_reply_wait(p: Int, word: UInt, x: Int, args_src: UInt,
         fault_process(p, why)
     }
 
-    let answered = pipe_reply_status(p, word, x, args.body, args.len)
+    let answered = pipe_reply_status(p, word, x, &args.msg)
     match answered {
         case Ok -> {},
         case _ -> {
@@ -3535,8 +3644,12 @@ func pipe_reply_wait(p: Int, word: UInt, x: Int, args_src: UInt,
     // connection — is still there, and only an empty set parks.
     let ready = waiter_ready_attachment(w)
     if ready != NO_ATTACHMENT {
-        deliver_attachment(p, rec_dst, ready)
-        return op_ok()
+        // A DELIVERY CAN REFUSE SINCE M4 UNIT 4 (`designs/010` ruling 5): a
+        // message carrying handles needs room in this table for them, and a
+        // full one answers the table-full status having delivered nothing. The
+        // value register stays zero, which is `ReplyWaitLeg.Wait` — the reply
+        // LANDED, and it is the wait that could not be served.
+        return op_status(deliver_attachment(p, rec_dst, ready))
     }
     if CURRENT_THREAD == NO_THREAD {
         fault_process(p, FaultReason.BadState)

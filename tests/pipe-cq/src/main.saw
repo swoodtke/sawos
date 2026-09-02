@@ -1,0 +1,275 @@
+// SOS M4 unit 4: THE COMPLETION-QUEUE SERVER — ONE TRAP PER MESSAGE (sawos
+// design 18; `designs/010` ruling 11(d)).
+//
+// **THE LADDER'S LAST RUNG, AND IT IS MEASURED AGAINST THE ONE BELOW IT.**
+// Design 17 counted the multiplexed server at TWO traps a message and named the
+// missing one exactly: "a readable delivery says there is something, not here it
+// is" — the `take` neither shape could avoid. Ruling 11(d) removes it by making
+// the DELIVERY the take, and this case is that claim as a number:
+//
+//     manual (unit 3)          wait + take + reply           3 per message
+//     fused  (unit 3.5)        take + reply_wait             2 per message
+//     completion queue (4)     reply_wait                    1 per message
+//
+// **THE CLIENT IS `child-pingpong`, UNCHANGED**, which is what makes the
+// comparison exact rather than analogous: the same program, the same eight round
+// trips, the same payload check — `tests/pipe-pingpong` measured the server at
+// 18 traps and this one measures it at 10, over identical work.
+//
+// **THE SERVER HOLDS NO OUTLET HANDLE AT ALL.** It GIVES the connection's server
+// end to its Waiter — a consuming, persistent attach — so the subscription owns
+// the end and there is no handle left to call `take` through even if the loop
+// wanted to. That is ruling 11(d)'s other half: a multiplexer holds zero
+// endpoint handles for however many connections it serves, and hanging up IS
+// destroying the subscription.
+//
+// **AND THE TERMINAL DELIVERY STILL ARRIVES.** When the child exits, the last
+// inlet handle goes with it and the readable level turns `PeerGone` — which this
+// loop is already parked on, so it ends with no counter, no timer and no
+// sentinel message. A delivery that carries a message and one that says there
+// will never be another are two TAGS of one record, which is why the loop reads
+// them in one `match`.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, PipeRequest, PipeMsg,
+            Waiter, WaitResult, WaitPayload, OutletLevel, AttachMode,
+            ProcessStats, SystemRight, SosStatus, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// ROOT'S CONFIG. `child-pingpong` expects the inlet as boot record 0 and its
+/// System under this tag.
+static TAG_BOOT: UInt = 7
+static TAG_INLET: UInt = 9
+
+/// The key the subscription is registered under. One attachment, and the key is
+/// what a delivery hands back.
+static KEY_OUTLET: UInt = 5
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// How many round trips `child-pingpong` makes. Fixed there, restated here, and
+/// the two are pinned by the assertions below.
+static ROUNDS: Int = 8
+
+/// Four bytes each way, and the letters the child sends and expects back.
+static PAYLOAD_LEN: UInt = 4
+static BYTE_P: UInt8 = 80
+static BYTE_O: UInt8 = 79
+static BYTE_N: UInt8 = 78
+
+/// **THE SERVER'S TRAP COUNT, PREDICTED FROM THE COUNTING RULE.**
+///
+///     1           the opening `wait` — the degenerate first turn, which is the
+///                 existing op because `reply_wait` needs a request to consume
+///     ROUNDS      one `reply_wait` per message: it answers the request it holds
+///                 AND parks, and the park's delivery IS the next take
+///     1           the closing `stats()`, charged at trap entry before it answers
+///     ------
+///     ROUNDS + 2  = 10, against `pipe-pingpong`'s 18 for the same eight messages
+static SERVER_TRAPS: UInt64 = 10
+
+/// The client's, unchanged from `pipe-pingpong`: `process_self`, one
+/// `boot_handle_next`, ROUNDS sends, `exit`.
+static CLIENT_SYSCALLS: UInt64 = 11
+
+/// `child-pingpong` exits 33 when every round matched, and §8's word carries the
+/// kind in its high half.
+static CHILD_STATUS: UInt = 65569
+
+/// A number no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// What one serving run answers with.
+struct Served {
+    count: Int,
+    last0: UInt8,
+    last1: UInt8,
+    last2: UInt8,
+    last3: UInt8,
+    traps: UInt64,
+    client: UInt64,
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS cq: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let done = try run(&system, &proc) catch {
+        print("SOS cq: server failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    if done.count != ROUNDS {
+        print("SOS cq: served={} wanted {}\n", done.count, ROUNDS)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS cq: served={} last request b={},{},{},{}\n", done.count,
+          done.last0, done.last1, done.last2, done.last3)
+
+    if done.traps != SERVER_TRAPS {
+        print("SOS cq: server traps={} wanted {}\n", done.traps, SERVER_TRAPS)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    if done.client != CLIENT_SYSCALLS {
+        print("SOS cq: client traps={} wanted {}\n", done.client,
+              CLIENT_SYSCALLS)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS cq: server traps={} for {} messages\n", done.traps, ROUNDS)
+
+    // **THE LADDER, IN ONE ROW.** The brackets come off outside the window, so
+    // the division is over the loop and nothing else — the opening wait and the
+    // closing read on this side, the client's three setup traps on the other.
+    print("SOS cq: per RPC client={} server={}\n",
+          (done.client - 3) / (ROUNDS as UInt64),
+          (done.traps - 2) / (ROUNDS as UInt64))
+    let _ = system.debug_print("SOS cq: the delivery was the take\n")
+
+    let _ = proc.exit(EXIT_OK)
+}
+
+/// Launch, then serve, and measure only the serving.
+func run(system: &System, proc: &Process) -> Result<Served, SosStatus> {
+    var image = try proc.boot_handle_next()
+    var dest = try proc.boot_handle_next()
+    guard let image_mem = image.take_memory() else { return BUG }
+    guard let dest_mem = dest.take_memory() else { return BUG }
+
+    let child = try system.process_create(image: &image_mem, memory: &dest_mem)
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    let waiter = try proc.waiter_create()
+
+    // **THE CONSUMING, PERSISTENT ATTACH — THE WHOLE OF RULING 11(d).** `give`
+    // rather than `add`: the wrapper goes in by MOVE, the kernel releases the
+    // entry as part of the attach, and the ATTACHMENT owns the server end from
+    // here on. PERSISTENT because this subscription has to survive `ROUNDS`
+    // deliveries and one terminal one — a one-shot would detach at the first
+    // message and the next park would be on an empty Waiter.
+    try waiter.give(outlet: move outlet, key: KEY_OUTLET,
+                    mode: AttachMode.Persistent) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+
+    // THE INLET FIRST, because `child-pingpong` spends exactly one
+    // `boot_handle_next` and expects it at record 0.
+    try child.give(inlet: move inlet, tag: TAG_INLET)
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT)
+    try child.start(boot_tag: TAG_BOOT)
+
+    var served = try serve(&waiter, &proc)
+
+    let status = try child.get_status()
+    if status != CHILD_STATUS {
+        return BUG
+    }
+    let client = try child.stats()
+    var answer = move served
+    answer.client = client.syscalls
+    return move answer
+}
+
+/// **THE MEASURED WINDOW: ONE `wait`, THEN `reply_wait` FOREVER.**
+///
+/// There is NOTHING else inside the bracket — no print, no take, no mint, no
+/// wrapper falling out of scope — which is what makes the number arithmetic
+/// rather than observation.
+///
+/// **THE DELIVERY CARRIES THE MESSAGE AND THE OBLIGATION**, so the loop's body
+/// reaches for neither: `WaitPayload.Message` says both fields of the record are
+/// populated, and the request the kernel minted at the delivery is what the
+/// `reply_wait` at the bottom consumes. The `take` unit 3.5 could not avoid is
+/// simply not written here, which is the one difference between this loop and
+/// `pipe-pingpong`'s.
+func serve(waiter: &Waiter, proc: &Process) -> Result<Served, SosStatus> {
+    var out: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    out[1] = BYTE_P
+    out[2] = BYTE_O
+    out[3] = BYTE_N
+
+    var count: Int = 0
+    var last0: UInt8 = 0
+    var last1: UInt8 = 0
+    var last2: UInt8 = 0
+    var last3: UInt8 = 0
+
+    let before = try proc.stats()
+
+    var wake = try waiter.wait()
+    var serving = true
+    while serving {
+        var more = false
+        match wake.what {
+            // **THE DELIVERY-AS-TAKE.** A message arrived and the obligation to
+            // answer it is in this very record.
+            case Message -> { more = true },
+            // The terminal level: the client is gone and nothing is staged, so
+            // there will never be another message. It is a `Readable` because
+            // that is what the LEVEL is; only a delivery that hands something
+            // over is tagged `Message`.
+            case Readable(level) -> {
+                match level {
+                    case Msg -> { more = false },
+                    case PeerGone -> { more = false },
+                }
+            },
+            case _ -> { return BUG },
+        }
+        if not more {
+            serving = false
+        } else {
+            var record = move wake
+            guard let carried = record.message.take() else { return BUG }
+            guard let obligation = record.request.take() else { return BUG }
+            var msg = move carried
+            if msg.len != PAYLOAD_LEN {
+                return BUG
+            }
+            last0 = msg.bytes[0]
+            last1 = msg.bytes[1]
+            last2 = msg.bytes[2]
+            last3 = msg.bytes[3]
+            // The answer is the request's sequence number plus one, which is
+            // what makes the child able to tell a matching reply from a stale
+            // one. `&+` is the wrapping add: Saw's overflow checks are always on
+            // and the arithmetic is a byte's.
+            out[0] = msg.bytes[0] &+ 1
+            count = count + 1
+            let _ = move msg
+            let answering = move obligation
+            wake = try (move answering).reply_wait(body: &out, len: PAYLOAD_LEN,
+                                                  waiter: &waiter) catch {
+                // A dead client cannot stall the loop: the reply leg answers
+                // without parking and the recovery is the first turn's own op.
+                match error {
+                    case Reply(_) -> { return BUG },
+                    case Wait(s) -> { return s },
+                }
+            }
+        }
+    }
+
+    let after = try proc.stats()
+    if after.syscalls < before.syscalls {
+        return BUG
+    }
+    return Served(count: count, last0: last0, last1: last1, last2: last2,
+                  last3: last3, traps: after.syscalls - before.syscalls,
+                  client: 0)
+}

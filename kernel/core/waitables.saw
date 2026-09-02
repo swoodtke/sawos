@@ -258,6 +258,21 @@ public(package) struct Attachment {
     /// about this attachment, and the mode VALUE is the typed surface's
     /// vocabulary. What crosses the boundary is a flag bit either way.
     public(package) oneshot: Bool,
+    /// **THE ATTACHMENT OWNS THE OBJECT** — set from `WAITER_ADD_CONSUMING` at
+    /// the attach (`designs/010` ruling 11(c); sawos design 18).
+    ///
+    /// Unit 3 read the consuming bit, released the caller's entry and threw the
+    /// bit away, because nothing downstream needed to know afterwards. Ruling
+    /// 11(d) is what needs it: a PERSISTENT-CONSUMING attachment on a
+    /// `PipeOutlet` is the COMPLETION-QUEUE SERVER, and its delivery is THE
+    /// TAKE rather than a report that there is something to take. That is a
+    /// different act, so the attachment has to remember which kind of
+    /// subscription it is.
+    ///
+    /// It is the second axis of ruling 11(c)'s 2x2 recorded beside the first:
+    /// `oneshot` says what happens to the ATTACHMENT at delivery, this says who
+    /// owns the OBJECT while it lives.
+    public(package) owns: Bool,
     /// Next attachment on that waiter's list (slot + 1).
     public(package) link: Int,
 }
@@ -276,7 +291,8 @@ public(package) unsafe static var INTERRUPTS: [InterruptSlot; MAX_INTERRUPTS] = 
 
 public(package) unsafe static var ATTACHMENTS: [Attachment; MAX_ATTACHMENTS] = [
     Attachment(state: SlotState.Free, kind: WaitableKind.Event, target: 0,
-               waiter: 0, key: 0, oneshot: false, link: 0); MAX_ATTACHMENTS]
+               waiter: 0, key: 0, oneshot: false, owns: false,
+               link: 0); MAX_ATTACHMENTS]
 
 /// Take a free event slot, or `NO_EVENT` when the slab is empty.
 public(package) func alloc_event() unsafe -> Int {
@@ -858,7 +874,7 @@ public(package) func detach_attachment(w: Int, a: Int) unsafe {
             ATTACHMENTS[a] = Attachment(state: SlotState.Free,
                                         kind: WaitableKind.Event, target: 0,
                                         waiter: 0, key: 0, oneshot: false,
-                                        link: 0)
+                                        owns: false, link: 0)
             return
         }
         prev = cur

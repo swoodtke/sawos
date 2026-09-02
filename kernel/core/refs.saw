@@ -111,8 +111,13 @@
 //! know — comes through here.
 
 import hal
-import sosabi.{EventMode, ObjType, PIPE_BODY_BYTES, ReplyLevel, SosStatus,
-               WAIT_HEADER_WORDS, WaitTag, wait_header_bytes}
+import sosabi.{EventMode, NO_HANDLE, ObjType, OutletLevel, PIPE_BODY_BYTES,
+               PIPE_MSG_HANDLES, PipeMsgMeta, ReplyLevel, SosStatus,
+               WAIT_HANDLE_SLOTS, WAIT_MSG_SLOT_0, WAIT_REQUEST_SLOT,
+               PipeMsgRecord, PipeSendRecord, PipeTakeRecord, WaitBuffer,
+               WaitTag,
+               pipe_msg_body_offset, pipe_request_rights, wait_meta_end_bytes,
+               wait_prefix_bytes}
 import kcore.limits.{MAX_IOMEMORIES, MAX_MEMORIES, MAX_PIPES, MAX_THREADS,
                      NO_THREAD, PIPE_INFLIGHT}
 import kcore.diag.{ExitCode, fatal, fatal_kernel}
@@ -120,6 +125,9 @@ import kcore.result.{op_ok, op_status, op_value, write_result}
 import kcore.threads.{THREADS, ThreadState, frame_slot, ready_push}
 import kcore.objects.{
     ExchangeState,
+    HandleEntry,
+    PIPE_MSG_SENDER,
+    PIPE_MSG_WORDS,
     IOMEMORIES,
     IoMemorySlot,
     MAPPINGS,
@@ -148,8 +156,19 @@ import kcore.objects.{
     pipe_drop_staged,
     pipe_exchange_at,
     pipe_idle,
+    msg_kind_of,
+    clear_staged_handles,
+    handle_word_index,
+    lookup_handle,
+    mint_handle,
+    mint_refusal,
+    msg_word_at,
     quota_credit,
+    stage_peek,
+    stage_pop,
     stage_push,
+    table_room,
+    unbind_handle,
 }
 import kcore.time.{TIMERS, TimerSlot, reprogram_timer}
 import kcore.waitables.{
@@ -611,7 +630,7 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
                 ATTACHMENTS[a] = Attachment(state: SlotState.Free,
                                             kind: WaitableKind.Event, target: 0,
                                             waiter: 0, key: 0, oneshot: false,
-                                            link: 0)
+                                            owns: false, link: 0)
                 set_waitable_attachment(watched, target, 0)
                 unref_waitable(watched, target)
                 cur = next
@@ -956,25 +975,249 @@ public(package) func unref_waitable_teardown(kind: WaitableKind, slot: Int) unsa
 // the READINESS SPENT and — since ruling 9(b) — THE ATTACHMENT RELEASED, all in
 // one step, so no kind is drained on one path and not the other.
 
-/// The record `Waiter.Wait` answers with, in kernel memory (spec §2.2, as
-/// amended by design 178 unit 3 rider 3 and grown a fourth word by
-/// `designs/010` ruling 11(a)).
+// =============================================================================
+// THE RENDEZVOUS (spec §2.1's "handles enter the receiver's table only at
+// receive"; `designs/010` ruling 5, built by sawos design 18)
+// =============================================================================
+//
+// **THE MOVE IS `give`'s MACHINERY WITH THE BOOT RECORD LEFT OFF**, which is
+// what ruling 5 means by transferring at rendezvous: unbind the sender's entry,
+// bind the taker's, and let the object's reference column see an increment and a
+// decrement in that order. `move_entry` below is that act, shared by the courier
+// op and by every message that carries a handle, so there is ONE place in the
+// kernel where a capability changes tables.
+//
+// **THE QUOTA CHARGE MOVES WITH IT, AND IT MOVES HERE.** A staged handle is
+// charged to the SENDER for as long as it is staged (its entry is still bound in
+// the sender's table, which is where `mint_handle` charged it), and the taker
+// pays from the moment the entry lands. So the ledger has no in-flight state and
+// nobody is charged twice — which is ruling 5's whole point restated as
+// bookkeeping.
+
+/// The handle slots a rendezvous produced in the TAKER's table: one kind byte
+/// and one word per message slot, both zero for an empty or a dead one.
+public(package) struct StagedHandles {
+    public(package) kinds: [UInt8; PIPE_MSG_HANDLES],
+    public(package) words: [UInt; PIPE_MSG_HANDLES],
+}
+
+/// The FIXED PREFIX of a delivered-message record, in kernel memory — everything
+/// `sosabi`'s `PipeMsgRecord` holds except the body.
+///
+/// It exists for `WaitPrefix`'s reason and is pinned the same way: the kernel
+/// builds the prefix on its own stack and the body is a SECOND copy straight out
+/// of the ring slot, so a short message never costs a 128-byte memset in the
+/// kernel or a 128-byte copy into the caller. Declaration order IS the layout
+/// (design 58), and the assert is what says this description and `sosabi`'s are
+/// one.
+public(package) struct PipeMsgPrefix {
+    public(package) meta: PipeMsgMeta,
+    public(package) handles: [UInt; PIPE_MSG_HANDLES],
+}
+
+static_assert(sizeof<PipeMsgPrefix>() == sizeof<PipeMsgRecord>() - PIPE_BODY_BYTES,
+              "the kernel's message prefix must be exactly the record sosabi publishes, less its body")
+
+/// The same, for a `Take` — an obligation in front of a message.
+public(package) struct PipeTakePrefix {
+    public(package) request: UInt,
+    public(package) msg: PipeMsgPrefix,
+}
+
+static_assert(sizeof<PipeTakePrefix>() == sizeof<PipeTakeRecord>() - PIPE_BODY_BYTES,
+              "the kernel's take prefix must be exactly the record sosabi publishes, less its body")
+
+/// Assemble a message prefix out of a length and a completed rendezvous. The one
+/// place the two halves of a delivered message are put together, so a take, a
+/// resolve and a fused call's reply cannot disagree about the layout.
+public(package) func msg_prefix(len: UInt, moved: &StagedHandles) -> PipeMsgPrefix {
+    var rec = PipeMsgPrefix(meta: PipeMsgMeta(len: len as UInt8,
+                                              kinds: [0; PIPE_MSG_HANDLES]),
+                            handles: [NO_HANDLE; PIPE_MSG_HANDLES])
+    var i: Int = 0
+    while i < PIPE_MSG_HANDLES {
+        rec.meta.kinds[i] = moved.kinds[i]
+        rec.handles[i] = moved.words[i]
+        i = i + 1
+    }
+    rec
+}
+
+/// How many bytes of a message record a delivery of this shape writes — the
+/// contiguous prefix ending at the body's length.
+///
+/// **A HANDLES-ONLY MESSAGE PAYS FOR NO PART OF THE BODY REGION**, which is what
+/// handles-before-bytes bought (user-ruled Sep 2): the variable part is the TAIL,
+/// so stopping early is an arithmetic rather than a hole to skip over.
+public(package) func msg_record_span(len: UInt) -> UInt {
+    (pipe_msg_body_offset() as UInt) + len
+}
+
+/// **MOVE ONE HANDLE ENTRY FROM `from`'s TABLE TO `to`'s**, narrowed by `keep`.
+/// Answers the receiver-side word, or `NO_HANDLE` when the receiving table had
+/// no room — in which case NOTHING happened and the giver's entry is untouched.
+///
+/// **THE COUNT GOES UP BEFORE IT GOES DOWN, AND THE ORDER IS LOAD-BEARING**
+/// (sawos design 7 D-1). A move leaves the object's reference count exactly as
+/// it was, but it is written as an increment and then a decrement rather than as
+/// nothing at all, because "every bind refs, every unbind unrefs" is a rule with
+/// no exceptions or it is not a rule. The other order would take the count to
+/// zero between two lines of one op and FREE the object being handed over.
+///
+/// `keep` is `MINT_OP`'s mask and it composes for free: the receiving entry
+/// carries `source & keep`, so all-ones is design 4 D-1's "rights verbatim" and
+/// anything narrower is the attenuate-at-give the courier op grew in M4 unit 4.
+/// A rendezvous passes all-ones — §API rules that a message-attach takes no
+/// mask, because a sender that wants to hand over less mints the narrower
+/// sibling and attaches THAT.
+public(package) func move_entry(from: Int, to: Int, word: UInt,
+                                entry: HandleEntry, keep: UInt32) unsafe -> UInt {
+    let given = mint_handle(to, entry.obj_type, entry.rights & keep, entry.target)
+    if given == NO_HANDLE {
+        return NO_HANDLE
+    }
+    ref_object(entry.obj_type, entry.target)
+    unbind_handle(from, handle_word_index(word))
+    unref_object(entry.obj_type, entry.target)
+    given
+}
+
+/// **HOW MANY OF EXCHANGE `x`'s STAGED SLOTS STILL RESOLVE** — ruling 5's
+/// re-validation, asked as a count.
+///
+/// **THE SENDER MAY RELEASE A STAGED ENTRY AND THAT IS LEGAL** (ruling 5's first
+/// consequence; fire-and-forget is a shape §2.1 blesses). Nothing about staging
+/// took a reference — the note says where to look, not that the thing must stay
+/// — so a word whose entry is gone simply fails the ordinary generation check
+/// here, and the slot is delivered EMPTY. Nothing leaked, nothing was forged,
+/// and the receiver is told the truth.
+///
+/// It is called before anything is minted, because the number it answers is what
+/// the atomic table pre-flight is about.
+public(package) func live_staged(x: Int) unsafe -> Int {
+    let sender = PIPE_MSG_SENDER[x]
+    if sender == 0 {
+        return 0
+    }
+    var live: Int = 0
+    var i: Int = 0
+    while i < PIPE_MSG_HANDLES {
+        let word = PIPE_MSG_WORDS[msg_word_at(x, i)]
+        if word != NO_HANDLE {
+            match lookup_handle(sender - 1, word).obj_type {
+                case Unbound -> {},
+                case _ -> { live = live + 1 },
+            }
+        }
+        i = i + 1
+    }
+    live
+}
+
+/// **MOVE EVERY LIVE STAGED ENTRY OF `x` INTO `p`'s TABLE** — the rendezvous
+/// itself, and the one place §2.1's "attached handles enter the receiver's table
+/// only at receive" happens.
+///
+/// ITS PRECONDITION IS `table_room(p, live_staged(x))`, established by the caller
+/// before anything was spent, which is what makes the refusal atomic and makes
+/// every mint here provably succeed. A `NO_HANDLE` answer from `move_entry`
+/// would mean the pre-flight and the table disagreed, and that is a kernel bug
+/// rather than a condition — `fatal_kernel` says so.
+///
+/// THE STAGED WORDS ARE CLEARED AT THE END, all of them: what moved is in the
+/// taker's table now and what did not move was already dead, so the exchange's
+/// slots are free for the REPLY direction to stage into.
+public(package) func move_staged(x: Int, p: Int) unsafe -> StagedHandles {
+    var out = StagedHandles(kinds: [0; PIPE_MSG_HANDLES],
+                            words: [NO_HANDLE; PIPE_MSG_HANDLES])
+    let sender = PIPE_MSG_SENDER[x]
+    if sender == 0 {
+        return move out
+    }
+    var i: Int = 0
+    while i < PIPE_MSG_HANDLES {
+        let word = PIPE_MSG_WORDS[msg_word_at(x, i)]
+        if word != NO_HANDLE {
+            let entry = lookup_handle(sender - 1, word)
+            match entry.obj_type {
+                // RULING 5's HONEST `None`: the sender let this one go between
+                // the post and the take, so the slot arrives empty.
+                case Unbound -> {},
+                case _ -> {
+                    let given = move_entry(sender - 1, p, word, entry,
+                                           UInt32.max)
+                    if given == NO_HANDLE {
+                        fatal_kernel("a rendezvous mint was refused after its pre-flight",
+                                     x as UInt)
+                    }
+                    // The kind was validated at the post and an entry cannot
+                    // change kind, so this cannot be `None` — but it is a
+                    // partial translation and never-hide says the arm reports.
+                    guard let kind = msg_kind_of(entry.obj_type) else {
+                        fatal_kernel("a staged handle named a kind the record cannot spell",
+                                     x as UInt)
+                        return move out
+                    }
+                    out.kinds[i] = kind as UInt8
+                    out.words[i] = given
+                },
+            }
+        }
+        i = i + 1
+    }
+    clear_staged_handles(x)
+    move out
+}
+
+/// Record a validated message's handle WORDS against exchange `x`, on behalf of
+/// `p` (`designs/010` ruling 5).
+///
+/// **IT COPIES NOTHING AND REFERENCES NOTHING** — that is the whole of the
+/// ledger rule. What is written is a note saying which table to look in and
+/// which words to look for, and the entries themselves stay bound in the
+/// sender's table, counted on their objects' columns and charged to the sender's
+/// handle quota, until a take or a delivery moves them.
+public(package) func stage_handles(p: Int, x: Int,
+                                   args: &PipeSendRecord) unsafe {
+    var any = false
+    var i: Int = 0
+    while i < PIPE_MSG_HANDLES {
+        PIPE_MSG_WORDS[msg_word_at(x, i)] = args.handles[i]
+        if args.handles[i] != NO_HANDLE {
+            any = true
+        }
+        i = i + 1
+    }
+    // The sender is recorded only when there is something to look up, so an
+    // ordinary data-only message leaves the exchange exactly as it was and
+    // `live_staged` answers zero on one load.
+    if any {
+        PIPE_MSG_SENDER[x] = p + 1
+    } else {
+        PIPE_MSG_SENDER[x] = 0
+    }
+}
+
+/// The FIXED PREFIX of the record `Waiter.Wait` answers with, in kernel memory
+/// (spec §2.2, as amended by design 178 unit 3 rider 3, grown a body by
+/// `designs/010` ruling 11(a) and handles by design 18).
 ///
 /// Declaration order IS the layout (design 58), so the field names here and the
-/// word indices `sosabi` publishes are one description — pinned by the assert
-/// below rather than by agreement. **THE BODY IS NOT A FIELD**: it is a separate
-/// copy at `wait_header_bytes()` into the same caller buffer, out of the ring
-/// slot it already lives in, which is what makes the copy sized to the DELIVERY
-/// instead of to the record.
-struct WaitRecord {
+/// buffer `sosabi` publishes are one description — pinned by the assert below
+/// rather than by agreement. **THE BODY IS NOT A FIELD**: it is a separate copy
+/// at `wait_prefix_bytes()` into the same caller buffer, out of the ring slot it
+/// already lives in, which is what makes the copy sized to the DELIVERY instead
+/// of to the record.
+struct WaitPrefix {
     key: UInt,
     tag: UInt,
     payload: UInt,
-    body_len: UInt,
+    meta: PipeMsgMeta,
+    handles: [UInt; WAIT_HANDLE_SLOTS],
 }
 
-static_assert(sizeof<WaitRecord>() == WAIT_HEADER_WORDS * sizeof<UInt>(),
-              "the wait record header must be exactly the words sosabi publishes")
+static_assert(sizeof<WaitPrefix>() == sizeof<WaitBuffer>() - PIPE_BODY_BYTES,
+              "the kernel's wait prefix must be exactly the buffer sosabi publishes, less its body")
 
 /// Build one and hand it to a process. The only producer of the wire form.
 ///
@@ -986,31 +1229,50 @@ static_assert(sizeof<WaitRecord>() == WAIT_HEADER_WORDS * sizeof<UInt>(),
 /// then cannot fail now. Reaching either arm means the two facts disagree, which
 /// is a kernel invariant broken and nothing a process could have done. **BOTH
 /// COPIES ARE INSIDE THE ONE CHECKED WINDOW**: the check was for
-/// `wait_record_bytes()`, which is the header plus a whole message body, and
-/// `body_len` can never exceed `PIPE_BODY_BYTES`.
+/// `wait_record_bytes()`, which is the whole prefix plus a whole message body,
+/// and `meta.len` can never exceed `PIPE_BODY_BYTES`.
 ///
 /// It is also the shape this code's ALTITUDE forces (sawos design 2): the wake
 /// path runs below the scheduler — a timer expiry reaches here out of the IRQ
 /// path with no current thread of its own — so terminating a process from here
 /// would be terminating one with nowhere to go next. The door reports, and the
 /// callers that can kill are the ones above the switch point.
-func deliver_wait_record(p: Int, dst: UInt, key: UInt,
-                         answer: &WaitAnswer) unsafe {
-    var rec = WaitRecord(key: key, tag: answer.tag as UInt,
-                         payload: answer.payload, body_len: answer.body_len)
-    if let why = copy_out(p, dst, ((&var rec) as UnsafePointer<WaitRecord>) as UInt,
-                          wait_header_bytes() as UInt) {
+///
+/// **THE COPY IS SIZED TO THE DELIVERY, IN TWO LENGTHS** (ruled Sep 1, user;
+/// preserved through design 18's growth). A delivery that carries neither
+/// handles nor bytes writes `wait_meta_end_bytes()` and stops — which is every
+/// Event, Interrupt, Timer, death, room level, abandoned claim and plain
+/// readable outlet, so it is almost every delivery there is. Only a MESSAGE
+/// writes the handle words, and only a message with data writes any body. The
+/// meta is what tells a decode which happened, and it is inside the short length,
+/// which is why the short length can be short.
+func deliver_wait_record(p: Int, dst: UInt, rec: &var WaitPrefix,
+                         body_src: UInt) unsafe {
+    var carries = rec.meta.len != 0
+    var i: Int = 0
+    while i < WAIT_HANDLE_SLOTS {
+        if rec.handles[i] != NO_HANDLE {
+            carries = true
+        }
+        i = i + 1
+    }
+    var bytes = wait_meta_end_bytes() as UInt
+    if carries {
+        bytes = wait_prefix_bytes() as UInt
+    }
+    if let why = copy_out(p, dst, ((&var rec) as UnsafePointer<WaitPrefix>) as UInt,
+                          bytes) {
         fatal("wait record refused by the copy door", (why as UInt8) as UInt,
               dst, p as UInt, ExitCode.ProcessFault)
     }
     // **THE SECOND COPY IS THE WHOLE OF RULING 11(a)** — and it does not happen
-    // at all for the seven kinds whose answer is a word. A delivery that carries
+    // at all for the kinds whose answer is a word. A delivery that carries
     // bytes carries them out of the ring slot that already holds them, so the
     // reply never transits a kernel buffer and the record's growth costs a
     // Timer waiter nothing but address space.
-    if answer.body_len != 0 {
-        if let why = copy_out(p, dst + (wait_header_bytes() as UInt),
-                              answer.body_src, answer.body_len) {
+    if rec.meta.len != 0 {
+        if let why = copy_out(p, dst + (wait_prefix_bytes() as UInt), body_src,
+                              rec.meta.len as UInt) {
             fatal("wait record body refused by the copy door",
                   (why as UInt8) as UInt, dst, p as UInt, ExitCode.ProcessFault)
         }
@@ -1079,21 +1341,205 @@ func delivery_consumes(kind: WaitableKind) -> Bool {
 ///
 /// It is also why the read of `ATTACHMENTS[a]` happens up front: after the
 /// detach that slot is `Free` and belongs to whoever allocates next.
-public(package) func deliver_attachment(p: Int, dst: UInt, a: Int) unsafe {
+/// **IS THIS ATTACHMENT THE COMPLETION-QUEUE SERVER'S?** (`designs/010` ruling
+/// 11(d); sawos design 18).
+///
+/// Three conditions, and each is load-bearing. The kind is a `PipeOutlet`,
+/// because a connection's server end is the only waitable whose readiness names
+/// a message somebody has to TAKE. The attachment OWNS the outlet, because
+/// ruling 11(d)'s server hands its end over entirely — a borrowing `add` leaves
+/// the caller holding a handle it is expected to `take` through, and turning its
+/// delivery into a take would consume a message the caller was told about rather
+/// than handed. And something is actually STAGED, because the same level is
+/// raised by a dead inlet with a dry ring, where there is nothing to take and
+/// `PeerGone` is the honest answer.
+func outlet_take_delivery(kind: WaitableKind, target: Int, owns: Bool) unsafe -> Bool {
+    match kind {
+        case PipeOutlet -> owns && PIPES[target].staged != 0,
+        case _ -> false,
+    }
+}
+
+/// **DOES THIS DELIVERY CARRY A MESSAGE'S HANDLES?** — the reply direction's
+/// half of the rendezvous.
+///
+/// Only a claim's delivery can, and only when the answer is DATA: an abandoned
+/// claim's `PeerClosed` carries nothing, and the three level kinds carry nothing
+/// by construction. §2.1's `send(data?, handles?)` is symmetric, so a reply
+/// staged handles exactly as a request did and they move at exactly the same
+/// moment — the delivery that hands the bytes over.
+func reply_carries_handles(kind: WaitableKind, answer: &WaitAnswer) -> Bool {
+    match kind {
+        case PipeReply -> answer.payload == (ReplyLevel.Data as UInt),
+        case _ -> false,
+    }
+}
+
+/// **ANSWER ONE ATTACHMENT INTO A PROCESS'S MEMORY, MOVE WHATEVER THE MESSAGE
+/// CARRIED, spend what the answer spent, and release the subscription if this
+/// delivery ended it.** Its entry points, both of them:
+///
+///   - `waiter_wait` (and `pipe_reply_wait`'s tail), when something was ALREADY
+///     ready and nothing parks;
+///   - `wake_one_waiter`, handing a ready attachment to a thread that did.
+///
+/// A funnel rather than two call sites, because "read the answer" and "record
+/// that it was delivered" have to be one step: split apart, a kind whose
+/// readiness is CONSUMED by delivery — the Timer and, since Aug 17, the Event —
+/// would be drained on one path and not the other, and the bug would be a
+/// periodic timer that reports the same fire twice to whichever caller forgot.
+/// Both paths are equally "a record reached a thread", which is exactly the
+/// event `waitable_consume` is about.
+///
+/// THE READ AND THE CLEAR ARE ONE ACT, and this function's body is where that is
+/// true: `waitable_answer` takes the value, `waitable_consume` clears it, and
+/// nothing between them can run. The kernel takes no trap in kernel mode (design
+/// 178 D2 — interrupts are taken from user mode only), so a signal cannot land
+/// inside this window; one landing after it finds the object empty and re-arms
+/// readiness with its own bits alone.
+///
+/// **AND THE DETACH IS THE THIRD PART, ADDED BY M4 UNIT 3** (`designs/010`
+/// rulings 9(b) and 11(b)). An attachment ends here when the attacher asked for
+/// one delivery (`AttachMode.OneShot`) or when the KIND's delivery is inherently
+/// consuming — and because an attachment is a counted reference, ending it drops
+/// one. **THAT DROP CAN CASCADE ALL THE WAY TO A FREED CONNECTION**: a reply
+/// delivered to a consuming attachment takes the exchange's claim column to
+/// zero, which settles the ring slot, which may free the `PIPES` row it lives
+/// in. Nothing above this line reads any of that afterwards — the answer, the
+/// key and the waiter were all taken before the detach — which is the reentrancy
+/// argument this site owes.
+///
+/// **IT CAN NOW REFUSE, AND M4 UNIT 4 IS WHY** (`designs/010` ruling 5's atomic
+/// table-full refusal; sawos design 18). A delivery that carries handles has to
+/// MINT them into the waiting process's table, and a table with no room is a
+/// condition rather than a bug — so this answers a `SosStatus`, and on anything
+/// but `Ok` NOTHING HAPPENED: no record was copied, no readiness was spent, no
+/// attachment was detached and the message is still staged with its level still
+/// raised. The caller writes the status where it would have written `Ok`, and a
+/// waiter that frees a slot and waits again is handed the very same message.
+/// That is `revoke_blocked`'s own shape — a delivered wake with a
+/// distinguishable status and no record — which is what `designs/010` ruling 2
+/// requires of every "this cannot happen for you right now".
+public(package) func deliver_attachment(p: Int, dst: UInt, a: Int) unsafe -> SosStatus {
     let kind = ATTACHMENTS[a].kind
     let target = ATTACHMENTS[a].target
     let key = ATTACHMENTS[a].key
     let waiter = ATTACHMENTS[a].waiter
+    let owns = ATTACHMENTS[a].owns
     let ends = ATTACHMENTS[a].oneshot || delivery_consumes(kind)
 
+    if outlet_take_delivery(kind, target, owns) {
+        return deliver_take(p, dst, key, waiter, a, target, ends)
+    }
+
     let answer = waitable_answer(kind, target)
-    deliver_wait_record(p, dst, key, &answer)
+    var rec = WaitPrefix(key: key, tag: answer.tag as UInt,
+                         payload: answer.payload,
+                         meta: PipeMsgMeta(len: answer.body_len as UInt8,
+                                           kinds: [0; PIPE_MSG_HANDLES]),
+                         handles: [NO_HANDLE; WAIT_HANDLE_SLOTS])
+
+    if reply_carries_handles(kind, &answer) {
+        // THE PRE-FLIGHT, BEFORE ANYTHING IS SPENT. `live_staged` re-validates
+        // through the sender's table, so a claim whose replier released a staged
+        // entry asks for room it no longer needs.
+        if not table_room(p, live_staged(target)) {
+            return mint_refusal(p)
+        }
+        let moved = move_staged(target, p)
+        var i: Int = 0
+        while i < PIPE_MSG_HANDLES {
+            rec.meta.kinds[i] = moved.kinds[i]
+            rec.handles[WAIT_MSG_SLOT_0 + i] = moved.words[i]
+            i = i + 1
+        }
+    }
+
+    deliver_wait_record(p, dst, &var rec, answer.body_src)
     waitable_consume(kind, target)
 
     if ends {
         detach_attachment(waiter, a)
         unref_waitable(kind, target)
     }
+    SosStatus.Ok
+}
+
+/// **THE DELIVERY *IS* THE TAKE** — ruling 11(d)'s completion-queue server, and
+/// the op that takes the multiplexed server from two traps a message to ONE.
+///
+/// **IT IS `pipe_take`'s BODY RUN INSIDE A WAIT**, and the two are deliberately
+/// the same three acts in the same order: mint the obligation, move the message's
+/// handles, hand the bytes over. What differs is only where the answer goes — a
+/// `Take` writes its own record and this writes a wait record — and that the
+/// server never held an outlet handle to call `Take` through, because the
+/// attachment owns the end.
+///
+/// **THE REFUSAL IS ATOMIC AND IT IS THE ONLY WAY THIS CAN FAIL** (ruling 5).
+/// The obligation and every live staged handle are ONE batch: `table_room` asks
+/// about all of them before any of them exists, so a full table leaves the
+/// message staged, the readable level raised and the exchange in `Staged` — the
+/// server frees a slot, waits again, and is handed the same message. There is no
+/// partial delivery, because there is no point at which half the batch has been
+/// minted.
+///
+/// The staged message leaves the LIST and stays in the ring, exactly as a `Take`
+/// leaves it: the exchange is `Taken`, its slot is held by the obligation this
+/// just minted, and the reply will travel back through the same slot.
+func deliver_take(p: Int, dst: UInt, key: UInt, waiter: Int, a: Int, c: Int,
+                  ends: Bool) unsafe -> SosStatus {
+    let x = stage_peek(c)
+    if x == NO_EXCHANGE {
+        // UNREACHABLE: `outlet_take_delivery` established that something is
+        // staged, and nothing runs between the two. Written rather than assumed.
+        fatal_kernel("a completion-queue delivery found nothing staged", c as UInt)
+        return SosStatus.NoResource
+    }
+    if not table_room(p, live_staged(x) + 1) {
+        return mint_refusal(p)
+    }
+    let request = mint_handle(p, ObjType.PipeRequest, pipe_request_rights(), x)
+    if request == NO_HANDLE {
+        fatal_kernel("a delivery-as-take mint was refused after its pre-flight",
+                     x as UInt)
+        return SosStatus.NoResource
+    }
+    let moved = move_staged(x, p)
+
+    var rec = WaitPrefix(key: key, tag: WaitTag.Message as UInt,
+                         payload: OutletLevel.Msg as UInt,
+                         meta: PipeMsgMeta(len: PIPE_LENS[x] as UInt8,
+                                           kinds: [0; PIPE_MSG_HANDLES]),
+                         handles: [NO_HANDLE; WAIT_HANDLE_SLOTS])
+    rec.handles[WAIT_REQUEST_SLOT] = request
+    var i: Int = 0
+    while i < PIPE_MSG_HANDLES {
+        rec.meta.kinds[i] = moved.kinds[i]
+        rec.handles[WAIT_MSG_SLOT_0 + i] = moved.words[i]
+        i = i + 1
+    }
+    deliver_wait_record(p, dst, &var rec, exchange_body_addr(x))
+
+    // CONSUMED BY DELIVERY, and only after the copy SUCCEEDED — `pipe_take`'s
+    // own ordering, and what makes "a staged message is handed over exactly
+    // once" true rather than nearly true.
+    stage_pop(c)
+    PIPE_REQUEST_REFS[x] = 1
+    PIPE_EX_STATE[x] = ExchangeState.Taken
+
+    // The readable level is not CONSUMED by this delivery and does not have to
+    // be: taking the message off the staged list is what lowers it, which is
+    // `waitable_consume`'s `PipeOutlet` arm saying "the level ends when the
+    // server actually TAKES" and this being that take.
+    //
+    // The detach is last for `deliver_attachment`'s reason: it can cascade into
+    // a freed connection, and nothing above reads `c` afterwards. A persistent
+    // completion queue never reaches it, which is the shape ruling 11(d) is for.
+    if ends {
+        detach_attachment(waiter, a)
+        unref_waitable(WaitableKind.PipeOutlet, c)
+    }
+    SosStatus.Ok
 }
 
 /// Hand attachment `a` to ONE thread parked on `w`, if any is (§2.2).
@@ -1123,9 +1569,16 @@ public(package) func wake_one_waiter(w: Int, a: Int) unsafe {
     WAITERS[w].blocked = THREADS[slot].link
     THREADS[slot].link = 0
 
-    deliver_attachment(THREADS[slot].process, THREADS[slot].wait_buf, a)
+    // **THE ANSWER IS WHATEVER THE DELIVERY SAID** (sawos design 18). A
+    // delivery that carries handles can be refused by a full table, and a
+    // refusal here is a woken thread with a status and an untouched buffer —
+    // `revoke_blocked`'s shape, and design 10 ruling 2's doctrine: the wake is
+    // DELIVERED either way, never a strand. The message stays staged and its
+    // level stays raised, so the same thread waiting again is handed it.
+    let answered = deliver_attachment(THREADS[slot].process,
+                                      THREADS[slot].wait_buf, a)
     THREADS[slot].wait_buf = 0
-    write_result(frame_slot(slot), op_ok())
+    write_result(frame_slot(slot), op_status(answered))
     THREADS[slot].state = ThreadState.Runnable
     ready_push(slot)
 }
@@ -1247,14 +1700,42 @@ func wake_call_reply(t: Int, x: Int) unsafe {
     let answer = waitable_answer(WaitableKind.PipeReply, x)
     var result = op_status(SosStatus.PeerClosed)
     if answer.payload == (ReplyLevel.Data as UInt) {
-        if answer.body_len != 0 {
-            if let why = copy_out(p, dst, answer.body_src, answer.body_len) {
+        // **THE FUSED PATH MINTS AFTER ALL — BUT ONLY WHAT THE REPLY CARRIED**
+        // (sawos design 18). A `Call` still mints no CLAIM, which is the saving
+        // design 10 ruling 4's rider is about; what it may have to mint is the
+        // handles the server attached to its answer, and those are the server's
+        // choice rather than the fusion's cost.
+        //
+        // **A FULL TABLE REFUSES THE HANDLES AND NOT THE EXCHANGE.** The caller
+        // is PARKED INSIDE its own syscall, so there is no "try again" for it to
+        // take — the reply has been written and the claim is about to be spent
+        // either way. So it is answered with the table-full status, the staged
+        // words stay where they are, and the REPLIER keeps every handle it
+        // attached: the exchange settles and `clear_staged_handles` forgets the
+        // note, which is ruling 5's unwind-free drop doing the work. Nothing
+        // half-moves and nothing leaks.
+        if not table_room(p, live_staged(x)) {
+            result = op_status(mint_refusal(p))
+        } else {
+            let moved = move_staged(x, p)
+            var rec = msg_prefix(answer.body_len, &moved)
+            if let why = copy_out(p, dst,
+                                  ((&var rec) as UnsafePointer<PipeMsgPrefix>) as UInt,
+                                  sizeof<PipeMsgPrefix>() as UInt) {
                 fatal("fused call reply refused by the copy door",
                       (why as UInt8) as UInt, dst, p as UInt,
                       ExitCode.ProcessFault)
             }
+            if answer.body_len != 0 {
+                if let why = copy_out(p, dst + (pipe_msg_body_offset() as UInt),
+                                      answer.body_src, answer.body_len) {
+                    fatal("fused call reply body refused by the copy door",
+                          (why as UInt8) as UInt, dst, p as UInt,
+                          ExitCode.ProcessFault)
+                }
+            }
+            result = op_value(answer.body_len)
         }
-        result = op_value(answer.body_len)
     }
     waitable_consume(WaitableKind.PipeReply, x)
     clear_pending_call(t)
@@ -1319,15 +1800,37 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
         return false
     }
     let src = THREADS[t].call_src
-    let len = THREADS[t].call_len
     let dst = THREADS[t].wait_buf
+    // **THE PARKED CALL'S MESSAGE IS RE-READ OUT OF ITS ARGS RECORD** (sawos
+    // design 18). `call_src`/`call_len` name the record rather than the body
+    // since a message grew handles, so the four words and the body's address
+    // come back together — and the caller is BLOCKED, so nothing it owns can
+    // have changed since `pipe_call` validated both addresses. A refusal here
+    // is a kernel bug for `copy_in_check`'s reason: the door already said yes
+    // while the caller was running, and a process's window is fixed for its
+    // life.
+    var args = PipeSendRecord(body: 0, len: 0, handles: [NO_HANDLE; PIPE_MSG_HANDLES])
+    if let why = copy_in(p, ((&var args) as UnsafePointer<PipeSendRecord>) as UInt,
+                         src, THREADS[t].call_len) {
+        fatal("parked call record refused by the copy door",
+              (why as UInt8) as UInt, src, p as UInt, ExitCode.ProcessFault)
+    }
+    let len = args.len
     if len != 0 {
-        if let why = copy_in(p, exchange_body_addr(x), src, len) {
+        if let why = copy_in(p, exchange_body_addr(x), args.body, len) {
             fatal("parked call body refused by the copy door",
-                  (why as UInt8) as UInt, src, p as UInt, ExitCode.ProcessFault)
+                  (why as UInt8) as UInt, args.body, p as UInt,
+                  ExitCode.ProcessFault)
         }
     }
     PIPE_LENS[x] = len as UInt16
+    // THE HANDLE WORDS ARE STAGED WITHOUT RE-VALIDATION, and that is ruling 5's
+    // own answer rather than a shortcut: they were validated at the call, an
+    // entry cannot change kind or rights, and the one thing that CAN have
+    // happened — the caller's sibling released one — is exactly what the
+    // rendezvous re-validation turns into an empty slot. There is no honest
+    // fault to raise from here anyway: the caller is not the running process.
+    stage_handles(p, x, &args)
     PIPE_REPLY_REFS[x] = 1
     PIPE_REQUEST_REFS[x] = 0
     PIPE_EX_STATE[x] = ExchangeState.Staged

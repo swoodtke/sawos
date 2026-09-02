@@ -114,7 +114,6 @@ func _start(boot_handle: UInt) {
 /// status alone would not show that either copy funnel carried anything.
 func round_trip(inlet: &PipeInlet, outlet: &PipeOutlet) -> Result<Void, SosStatus> {
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
-    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     msg[0] = 65
     msg[1] = 66
     msg[2] = 67
@@ -122,17 +121,18 @@ func round_trip(inlet: &PipeInlet, outlet: &PipeOutlet) -> Result<Void, SosStatu
     let staged = try inlet.post(body: &msg, len: 3)
     guard var claim = move staged else { return BUG }
 
-    let taken = try outlet.take(into: &var buf)
-    guard let (n, request) = move taken else { return BUG }
-    var obligation = move request
-    print("SOS oneshot: request len={} b={},{},{}\n", n,
-          buf[0] as UInt, buf[1] as UInt, buf[2] as UInt)
+    let taken = try outlet.take()
+    guard let (arrived, request) = move taken else { return BUG }
+    let obligation = move request
+    print("SOS oneshot: request len={} b={},{},{}\n", arrived.len,
+          arrived.bytes[0] as UInt, arrived.bytes[1] as UInt,
+          arrived.bytes[2] as UInt)
 
     // **A RESOLVE BEFORE THE REPLY IS `Ok(None)` AND CONSUMES NOTHING.** The
     // exchange is taken and the server has not answered, which is the pending
     // state a poll loop lives in — and the claim below this line is the SAME
     // claim, which is what makes the poll writable at all.
-    let pending = try claim.resolve(into: &var buf)
+    let pending = try claim.resolve()
     if let _ = pending { return BUG }
     let _ = write_line("SOS oneshot: pending is none\n")
 
@@ -140,10 +140,10 @@ func round_trip(inlet: &PipeInlet, outlet: &PipeOutlet) -> Result<Void, SosStatu
     msg[1] = 89
     try (move obligation).reply(body: &msg, len: 2)
 
-    let answered = try claim.resolve(into: &var buf)
-    guard let got = answered else { return BUG }
-    print("SOS oneshot: reply len={} b={},{}\n", got,
-          buf[0] as UInt, buf[1] as UInt)
+    let answered = try claim.resolve()
+    guard let got = move answered else { return BUG }
+    print("SOS oneshot: reply len={} b={},{}\n", got.len,
+          got.bytes[0] as UInt, got.bytes[1] as UInt)
     return
 }
 
@@ -157,15 +157,14 @@ func round_trip(inlet: &PipeInlet, outlet: &PipeOutlet) -> Result<Void, SosStatu
 func zero_reply(proc: &Process, inlet: &PipeInlet,
                 outlet: &PipeOutlet) -> Result<Void, SosStatus> {
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
-    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     msg[0] = 5
 
     let before = try proc.stats()
     let staged = try inlet.post(body: &msg, len: 1)
     guard var claim = move staged else { return BUG }
-    var obligation = try take_one(&outlet, &var buf)
+    let obligation = try take_one(&outlet)
     try (move obligation).reply(body: &msg, len: 0)
-    let answered = try claim.resolve(into: &var buf)
+    let answered = try claim.resolve()
     // The closing read is charged at trap entry like any other, so:
     //
     //     delta = post + take + reply + resolve + this read = 4 + 1 = 5
@@ -178,8 +177,8 @@ func zero_reply(proc: &Process, inlet: &PipeInlet,
     // than its exchange.
     let after = try proc.stats()
 
-    guard let zero = answered else { return BUG }
-    print("SOS oneshot: zero reply len={}\n", zero)
+    guard let zero = move answered else { return BUG }
+    print("SOS oneshot: zero reply len={}\n", zero.len)
     print("SOS oneshot: the exchange cost {} traps\n",
           after.syscalls - before.syscalls)
     return
@@ -195,7 +194,6 @@ func zero_reply(proc: &Process, inlet: &PipeInlet,
 func three_in_flight(inlet: &PipeInlet,
                      outlet: &PipeOutlet) -> Result<Void, SosStatus> {
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
-    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
 
     msg[0] = 1
     let first = try inlet.post(body: &msg, len: 1)
@@ -208,9 +206,9 @@ func three_in_flight(inlet: &PipeInlet,
     guard var c3 = move third else { return BUG }
 
     // The obligations come out in the order the messages went in.
-    var r1 = try take_one(&outlet, &var buf)
-    var r2 = try take_one(&outlet, &var buf)
-    var r3 = try take_one(&outlet, &var buf)
+    let r1 = try take_one(&outlet)
+    let r2 = try take_one(&outlet)
+    let r3 = try take_one(&outlet)
 
     msg[0] = 22
     try (move r2).reply(body: &msg, len: 1)
@@ -219,9 +217,9 @@ func three_in_flight(inlet: &PipeInlet,
     msg[0] = 11
     try (move r1).reply(body: &msg, len: 1)
 
-    let a = try resolve_one(&var c1, &var buf)
-    let b = try resolve_one(&var c2, &var buf)
-    let c = try resolve_one(&var c3, &var buf)
+    let a = try resolve_one(&var c1)
+    let b = try resolve_one(&var c2)
+    let c = try resolve_one(&var c3)
     print("SOS oneshot: fifo replies a={} b={} c={}\n", a, b, c)
     return
 }
@@ -237,24 +235,23 @@ func three_in_flight(inlet: &PipeInlet,
 func ring_around_one(inlet: &PipeInlet,
                      outlet: &PipeOutlet) -> Result<Void, SosStatus> {
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
-    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     msg[0] = 7
 
     let held = try inlet.post(body: &msg, len: 1)
     guard var claim = move held else { return BUG }
-    var obligation = try take_one(&outlet, &var buf)
+    let obligation = try take_one(&outlet)
 
     let busy = try fill(&inlet, &msg)
     print("SOS oneshot: depth with one in flight={}\n", busy)
 
-    let back = try drain(&outlet, &var buf)
+    let back = try drain(&outlet)
     if back != busy { return BUG }
 
     // ...and now the held exchange settles: the obligation is discharged and the
     // claim takes its answer, so the slot goes back and the ring is whole again.
     msg[0] = 8
     try (move obligation).reply(body: &msg, len: 1)
-    let settled = try claim.resolve(into: &var buf)
+    let settled = try claim.resolve()
     guard let _ = settled else { return BUG }
 
     let whole = try fill(&inlet, &msg)
@@ -277,9 +274,8 @@ func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
 }
 
 /// Take, and discharge the obligation by dropping it — the mirror of `tell`.
-func take_and_drop(outlet: &PipeOutlet,
-                   into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<Bool, SosStatus> {
-    let got = try outlet.take(into: &var into)
+func take_and_drop(outlet: &PipeOutlet) -> Result<Bool, SosStatus> {
+    let got = try outlet.take()
     if let (_, request) = move got {
         let _ = move request
         return true
@@ -307,14 +303,13 @@ func fill(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES]) -> Result<UInt, So
 }
 
 /// Take everything staged, discharging as it goes.
-func drain(outlet: &PipeOutlet,
-           into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<UInt, SosStatus> {
+func drain(outlet: &PipeOutlet) -> Result<UInt, SosStatus> {
     var took: UInt = 0
     var going = true
     var rounds: Int = 0
     while going && rounds < MAX_ROUNDS {
         rounds = rounds + 1
-        let got = try take_and_drop(&outlet, &var into)
+        let got = try take_and_drop(&outlet)
         if got {
             took = took + 1
         } else {
@@ -327,20 +322,18 @@ func drain(outlet: &PipeOutlet,
 /// Take one message and hand its obligation back, refusing an empty ring as an
 /// error — every take reached this way has a message waiting by construction, so
 /// an absence is a bug in the case rather than a poll.
-func take_one(outlet: &PipeOutlet,
-              buf: &var [UInt8; PIPE_BODY_BYTES]) -> Result<PipeRequest, SosStatus> {
-    let got = try outlet.take(into: &var buf)
+func take_one(outlet: &PipeOutlet) -> Result<PipeRequest, SosStatus> {
+    let got = try outlet.take()
     guard let (_, request) = move got else { return BUG }
     return move request
 }
 
 /// Resolve one claim and answer the first byte of its reply — which is what the
 /// three-in-flight row asserts, one digit per exchange.
-func resolve_one(claim: &var PipeReply,
-                 buf: &var [UInt8; PIPE_BODY_BYTES]) -> Result<UInt, SosStatus> {
-    let got = try claim.resolve(into: &var buf)
-    guard let _ = got else { return BUG }
-    return buf[0] as UInt
+func resolve_one(claim: &var PipeReply) -> Result<UInt, SosStatus> {
+    let got = try claim.resolve()
+    guard let answer = move got else { return BUG }
+    return answer.bytes[0] as UInt
 }
 
 /// One line to the console, out of a phase that holds no `System`.

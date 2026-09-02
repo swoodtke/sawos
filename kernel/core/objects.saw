@@ -42,6 +42,7 @@ import sosabi.{
     PipeRequestHandle,
     PipeRequestRight,
     PIPE_BODY_BYTES,
+    PIPE_MSG_HANDLES,
     BootHandleKind,
     SosStatus,
     NO_HANDLE,
@@ -545,6 +546,37 @@ public(package) func mint_handle(p: Int, kind: ObjType, rights: UInt32, target: 
     NO_HANDLE
 }
 
+/// **CAN `p`'s TABLE ACCEPT `n` MORE ENTRIES, BOTH BY POLICY AND BY THE
+/// TABLE?** — the rendezvous's atomic pre-flight (`designs/010` ruling 5; sawos
+/// design 18).
+///
+/// It asks `mint_handle`'s two questions `n` times over, without answering
+/// either: the quota first (policy before the table, the check order every
+/// allocation site follows) and then a bounded count of the free slots. A take
+/// or a delivery that carries handles calls this ONCE, before it moves anything,
+/// so a refusal leaves the staged message exactly where it was and the level it
+/// raised still raised — free a slot, ask again, and the same message arrives.
+///
+/// **IT COUNTS RATHER THAN RESERVING**, which is `pipe_has_room`'s own argument
+/// one table over: a reservation would have to be given back on every path that
+/// does not use it, and the caller is inside a single syscall with interrupts
+/// masked, so nothing can take a slot between the count and the mints.
+public(package) func table_room(p: Int, n: Int) unsafe -> Bool {
+    if not quota_room_for(p, QuotaKind.Handle, n) {
+        return false
+    }
+    var free: Int = 0
+    var h: Int = 0
+    while h < MAX_HANDLES {
+        match HANDLES[p * MAX_HANDLES + h].obj_type {
+            case Unbound -> { free = free + 1 },
+            case _ -> {},
+        }
+        h = h + 1
+    }
+    free >= n
+}
+
 /// Unbind the entry at index `i` of process `p`'s table and BUMP its generation.
 ///
 /// THE ONE PLACE A BINDING IS DESTROYED — the release op and the teardown's
@@ -690,6 +722,26 @@ public(package) func quota_room(p: Int, kind: QuotaKind) unsafe -> Bool {
         return true
     }
     QUOTA_USED[at] < QUOTA_LIMIT[at]
+}
+
+/// Has `p` room for `n` more of `kind`?
+///
+/// **THE RENDEZVOUS IS WHY THIS EXISTS** (`designs/010` ruling 5, built by sawos
+/// design 18). Every other allocation site takes one thing and can ask about
+/// one; a take that carries handles mints SEVERAL entries at once and must
+/// refuse ATOMICALLY — the message stays staged, the level stays ready, and the
+/// answer is the table-full status — so the question has to be asked about the
+/// whole batch before any of it happens. Asking one at a time and unwinding
+/// would be the same answer reached by a path that can fail halfway.
+///
+/// `n == 0` is legal and answers true, which is what a message with no handles
+/// asks.
+public(package) func quota_room_for(p: Int, kind: QuotaKind, n: Int) unsafe -> Bool {
+    let at = quota_at(p, kind)
+    if QUOTA_LIMIT[at] == QUOTA_UNLIMITED {
+        return true
+    }
+    ((QUOTA_USED[at] as Int) + n) <= (QUOTA_LIMIT[at] as Int)
 }
 
 /// Spend one of `kind` against `p`.
@@ -1031,6 +1083,90 @@ public(package) func compact_mapping_rows(target: Int, removed: Int) unsafe {
 // It sits BELOW `process` for the reason every other slab does: ending a process
 // frees what it owned, so the storage has to be reachable from the teardown.
 
+/// Which `BootHandleKind` a given handle's `ObjType` is delivered as, or `None`
+/// when the boot record has no spelling for it.
+///
+/// **THE ONE PLACE THE KERNEL-INTERNAL KIND AND THE PUBLIC ONE MEET** (sawos
+/// design 4). `ObjType` is renumberable bookkeeping and `BootHandleKind` crosses
+/// the trap boundary, so neither is a cast of the other; this function is the
+/// translation, written out, and it is deliberately PARTIAL. The kinds it cannot
+/// spell are exactly the kinds nothing mints `Transfer` on today — a Thread,
+/// Event, Waiter, Interrupt, Clock or Timer handle never reaches here, because
+/// the `Transfer` check above refuses it first. The arm exists so that the day a
+/// kind becomes givable, the compiler asks for its record spelling instead of
+/// letting it arrive mis-tagged.
+///
+/// **IT MOVED DOWN HERE IN M4 UNIT 4** (sawos design 18), and the reason is a
+/// SECOND caller that could not reach it where it was: a message's handle slots
+/// carry their kinds, so `kcore.refs` has to translate one at every rendezvous —
+/// and `refs` sits BELOW `dispatch`, which is what makes reaching upward the
+/// cycle DF-232e does not diagnose. It belongs here on the ordinary rule: a
+/// translation between two `sosabi` enums names nothing this module does not
+/// already import, so the lowest module that needs it is where it goes.
+public(package) func boot_kind_of(kind: ObjType) -> BootHandleKind? {
+    match kind {
+        case Memory -> BootHandleKind.Memory,
+        case Process -> BootHandleKind.Process,
+        case System -> BootHandleKind.System,
+        // **UNIT 4'S ARM, AND IT IS THE ARM THE COMMENT ABOVE PREDICTED**
+        // (sawos design 6 D-1): `iomemory_rights()` mints `Transfer`, so a
+        // window can travel, so the record needs a spelling for one. A Mapping
+        // stays in the `None` arm on purpose — `mapping_rights()` withholds
+        // `Transfer`, so the `Transfer` check above refuses one first and this
+        // spelling would be dead surface.
+        case IoMemory -> BootHandleKind.IoMemory,
+        // **M4 UNIT 1's TWO ARMS, AND THEY ARE THE SAME PREDICTION COLLECTED A
+        // SECOND TIME** (sawos design 13 D-3): `pipe_inlet_rights()` and
+        // `pipe_outlet_rights()` mint `Transfer`, because handing a child ONE
+        // END of a connection is what the pair is FOR — a launcher creates the
+        // pair, gives the inlet to the client and the outlet to the server, and
+        // the launch flow is unchanged.
+        case PipeInlet -> BootHandleKind.PipeInlet,
+        case PipeOutlet -> BootHandleKind.PipeOutlet,
+        // **M4 UNIT 2's TWO ARMS, AND THIS PAIR IS THE ONE §2.1 ARGUED FOR BY
+        // NAME** (sawos design 14). `pipe_reply_rights()` and
+        // `pipe_request_rights()` mint `Transfer` because the ratified section
+        // calls the one-shots THE DELEGATION PRIMITIVE: a server MOVES its
+        // obligation to a third party, who replies straight to the original
+        // client and the payload never transits the middle process. So a give
+        // must carry one, and its record must be able to spell it —
+        // `pipe-delegate` is that flow at its smallest.
+        case PipeReply -> BootHandleKind.PipeReply,
+        case PipeRequest -> BootHandleKind.PipeRequest,
+        case _ -> None,
+    }
+}
+
+/// Which `BootHandleKind` a handle may be delivered as IN A MESSAGE, or `None`
+/// when a message cannot carry that kind at all (sawos design 18).
+///
+/// **IT IS `boot_kind_of` MINUS TWO, AND THE TWO ARE A TYPED-SURFACE FACT
+/// RATHER THAN A CAPABILITY ONE.** A `Process` and a `System` handle are both
+/// givable — `process_rights()` and `root_system_rights()` mint `Transfer`, and
+/// the boot record spells both — so a launcher hands either across at start-up
+/// today. What a MESSAGE cannot do with one is TELL THE RECEIVER WHAT ARRIVED:
+/// the receiving vocabulary is `sos.pipe`'s `PipeHandle`, and `Process` and
+/// `System` are declared in `sos.system`, which imports `sos.pipe` — so a case
+/// for either would be the import cycle DF-232e does not diagnose.
+///
+/// **REFUSING AT THE SENDER IS THE HONEST PLACE.** The alternative is delivering
+/// a word the receiver's decode would have to panic on, which turns one
+/// process's mistake into another's crash; this way the sender is told
+/// `BadArg` — a caller-checkable fault, since it chose the handle — and nothing
+/// crosses. It is `boot_kind_of`'s own partiality one door over, and the arm
+/// exists so the day the two wrappers are declarable below the message layer,
+/// the compiler asks here.
+public(package) func msg_kind_of(kind: ObjType) -> BootHandleKind? {
+    guard let spelled = boot_kind_of(kind) else {
+        return None
+    }
+    match spelled {
+        case Process -> None,
+        case System -> None,
+        case _ -> spelled,
+    }
+}
+
 /// One Pipe CONNECTION: whose it is, what is staged, and how many handles name
 /// each of its two ends.
 ///
@@ -1231,6 +1367,73 @@ public(package) unsafe static var PIPE_CALLER: [Int; PIPE_EXCHANGES] = [
 /// FIFO and never needs a removal from the middle.
 public(package) unsafe static var PIPE_NEXT: [Int; PIPE_EXCHANGES] = [
     0; PIPE_EXCHANGES]
+
+// =============================================================================
+// THE STAGED HANDLE LEDGER (spec §2.1's rendezvous transfer; `designs/010`
+// ruling 5, built by sawos design 18)
+// =============================================================================
+//
+// **A STAGED HANDLE STAYS THE SENDER'S COUNTED ENTRY UNTIL RENDEZVOUS.** Ruling
+// 5 in one sentence, and these two arrays are the whole of its mechanism: what a
+// post records is the sender's own handle WORDS, not copies of anything, and the
+// entries they name stay bound in the sender's table — counted on the object's
+// column, charged to the sender's handle quota — until a take or a delivery
+// MOVES them. So the ledger never has an in-flight limbo state to reconcile, and
+// nothing anywhere has to unwind a send that was abandoned.
+//
+// **THE SENDER IS RECORDED BESIDE THE WORDS, AND IT HAS TO BE**: a handle word
+// means nothing without the table it indexes, and the rendezvous happens in the
+// TAKER's context, which is a different process. `PIPE_MSG_SENDER` is the one
+// thing that makes a staged word resolvable later, and it is what ruling 5's
+// re-validation reads through.
+//
+// **RE-VALIDATION AT RENDEZVOUS IS WHY THIS IS SOUND WITHOUT A REFERENCE.** A
+// staged word is not a claim on anything: the sender may release the entry, and
+// the ordinary generation check then answers `Unbound` at the take, which
+// delivers that slot as EMPTY. Nothing leaked, nothing was forged, and the
+// receiver is told the truth — which is the alternative to counting a reference
+// nobody could later be sure to drop.
+//
+// Both arrays are zero-initialized and therefore `.bss` (design 149), costing no
+// image bytes: `PIPE_EXCHANGES * PIPE_MSG_HANDLES` words and `PIPE_EXCHANGES`
+// small integers, which at the tree's numbers is 64 × 4 words and 64 ints.
+
+/// The handle WORDS a post or a reply staged for each exchange — the sender's
+/// own, `NO_HANDLE` for an empty slot. Indexed `x * PIPE_MSG_HANDLES + slot`,
+/// which is the flat arithmetic the bodies and lengths already use.
+///
+/// ONE ARRAY SERVES BOTH DIRECTIONS, and it can because an exchange only ever
+/// has one message in flight: the request's handles are moved out at the take,
+/// which is the same moment the slot stops holding a request and starts being
+/// able to hold a reply. `pipe_take` clears what it moved, so a reply stages into
+/// slots that are provably empty.
+public(package) unsafe static var PIPE_MSG_WORDS: [UInt; PIPE_EXCHANGES * PIPE_MSG_HANDLES] = [
+    0; PIPE_EXCHANGES * PIPE_MSG_HANDLES]
+
+/// Whose table the words above index, PLUS ONE; zero is "nothing staged". The
+/// plus-one is the list-link idiom the rest of this file uses, and it is what
+/// lets `ROOT_PROCESS` (slot 0) be a legitimate sender.
+public(package) unsafe static var PIPE_MSG_SENDER: [Int; PIPE_EXCHANGES] = [
+    0; PIPE_EXCHANGES]
+
+/// Where exchange `x`'s handle slot `i` lives.
+public(package) func msg_word_at(x: Int, i: Int) -> Int {
+    x * PIPE_MSG_HANDLES + i
+}
+
+/// Forget every handle exchange `x` staged. **NOTHING IS UNWOUND, and that is
+/// ruling 5's third consequence** (the unwind-free staged drop): the entries
+/// never left the sender, so there is nothing to give back — the sender still
+/// holds exactly what it always held, and these words were only ever a note
+/// saying where to look.
+public(package) func clear_staged_handles(x: Int) unsafe {
+    var i: Int = 0
+    while i < PIPE_MSG_HANDLES {
+        PIPE_MSG_WORDS[msg_word_at(x, i)] = NO_HANDLE
+        i = i + 1
+    }
+    PIPE_MSG_SENDER[x] = 0
+}
 
 /// "No exchange" — the sentinel a full ring answers with.
 public(package) static NO_EXCHANGE: Int = -1
@@ -1482,6 +1685,12 @@ public(package) func exchange_settle(x: Int) unsafe {
     PIPE_REQUEST_REFS[x] = 0
     PIPE_LENS[x] = 0
     PIPE_NEXT[x] = 0
+    // **AND THE STAGED HANDLE WORDS GO, WHICH COSTS NOTHING TO ANYBODY**
+    // (`designs/010` ruling 5's unwind-free staged drop). A settling exchange
+    // may still be carrying words a post or a reply staged and nobody ever
+    // took; they name entries the SENDER still holds, so forgetting them is the
+    // whole of the cleanup and no reference moves.
+    clear_staged_handles(x)
 
     let c = exchange_pipe(x)
     match PIPES[c].state {

@@ -29,7 +29,7 @@
 // ONE PHASE PER FUNCTION, on design 14 finding 3's stack ceiling.
 
 import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
-            Waiter, WaitResult, WaitPayload, ReplyDelivery, AttachMode,
+            Waiter, WaitResult, WaitPayload, AttachMode,
             SosStatus, PIPE_BODY_BYTES}
 
 static EXIT_OK: UInt = 0
@@ -156,32 +156,18 @@ func cancel_by_remove(inlet: &PipeInlet, outlet: &PipeOutlet,
 }
 
 func reply_len(r: &WaitResult) -> UInt {
-    match r.what {
-        case Reply(outcome) -> {
-            match outcome {
-                case Data(msg) -> msg.len,
-                case PeerClosed -> 0,
-            }
-        },
-        case _ -> 0,
-    }
+    if let _ = r.message { return r.message!.len }
+    0
 }
 
 func reply_byte(r: &WaitResult, i: Int) -> UInt {
-    match r.what {
-        case Reply(outcome) -> {
-            match outcome {
-                case Data(msg) -> msg.bytes[i] as UInt,
-                case PeerClosed -> 0,
-            }
-        },
-        case _ -> 0,
-    }
+    if let _ = r.message { return r.message!.bytes[i] as UInt }
+    0
 }
 
 func take_one(outlet: &PipeOutlet,
               buf: &var [UInt8; PIPE_BODY_BYTES]) -> Result<PipeRequest, SosStatus> {
-    let got = try outlet.take(into: &var buf)
+    let got = try outlet.take()
     guard let (_, request) = move got else { return BUG }
     return move request
 }
@@ -201,7 +187,7 @@ func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
 /// Take, and discharge the obligation by dropping it — the mirror of `tell`.
 func take_and_drop(outlet: &PipeOutlet,
                    into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<Bool, SosStatus> {
-    let got = try outlet.take(into: &var into)
+    let got = try outlet.take()
     if let (_, request) = move got {
         let _ = move request
         return true

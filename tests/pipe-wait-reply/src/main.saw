@@ -31,7 +31,7 @@
 // meets that first.
 
 import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
-            Waiter, WaitResult, WaitPayload, ReplyDelivery, AttachMode,
+            Waiter, WaitResult, WaitPayload, AttachMode,
             SosStatus, PIPE_BODY_BYTES}
 
 static EXIT_OK: UInt = 0
@@ -118,7 +118,7 @@ func delivered(inlet: &PipeInlet, outlet: &PipeOutlet,
     // **AND THE CLAIM IS SPENT.** The caller kept its handle — this was `add`
     // and not `give` — so the entry is still good and the kernel still answers
     // it; what it answers is that this exchange is over.
-    match claim.resolve(into: &var buf) {
+    match claim.resolve() {
         case Ok(_) -> { return BUG },
         case Err(e) -> { print("SOS waitreply: after delivery {}\n", e) },
     }
@@ -170,39 +170,27 @@ func two_claims(inlet: &PipeInlet, outlet: &PipeOutlet,
 /// reply, or a reply that says `PeerClosed`, answers zero — this case never
 /// produces either, and a zero in the transcript would say the arm was wrong.
 func reply_len(r: &WaitResult) -> UInt {
-    match r.what {
-        case Reply(outcome) -> {
-            match outcome {
-                case Data(msg) -> msg.len,
-                case PeerClosed -> 0,
-            }
-        },
-        case _ -> 0,
-    }
+    if let _ = r.message { return r.message!.len }
+    0
 }
 
 /// Byte `i` of the reply in this record.
 ///
 /// **IT READS THE BYTES THROUGH A BORROW**, which is what makes `PipeMsg` being
-/// `NoCopy` cost nothing at a call site: the payload is matched WHERE IT SITS in
-/// the record, and only the one byte comes out as a value.
+/// `NoCopy` cost nothing at a call site: the message sits in the record's own
+/// field and only the one byte comes out as a value. Since M4 unit 4 the
+/// delivery is a FIELD rather than a payload, because a message that carries
+/// handles has to be movable out and a match arm's binding never is.
 func reply_byte(r: &WaitResult, i: Int) -> UInt {
-    match r.what {
-        case Reply(outcome) -> {
-            match outcome {
-                case Data(msg) -> msg.bytes[i] as UInt,
-                case PeerClosed -> 0,
-            }
-        },
-        case _ -> 0,
-    }
+    if let _ = r.message { return r.message!.bytes[i] as UInt }
+    0
 }
 
 /// Take one message and hand its obligation back. Every take reached this way
 /// has a message waiting by construction, so an absence is a bug in the case.
 func take_one(outlet: &PipeOutlet,
               buf: &var [UInt8; PIPE_BODY_BYTES]) -> Result<PipeRequest, SosStatus> {
-    let got = try outlet.take(into: &var buf)
+    let got = try outlet.take()
     guard let (_, request) = move got else { return BUG }
     return move request
 }

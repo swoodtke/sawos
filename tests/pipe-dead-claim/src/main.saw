@@ -57,7 +57,6 @@ func _start(boot_handle: UInt) {
     let (inlet, outlet) = move pair
 
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
-    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     msg[0] = 42
 
     let staged = try inlet.post(body: &msg, len: 1) catch {
@@ -71,7 +70,7 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    let taken = try outlet.take(into: &var buf) catch {
+    let taken = try outlet.take() catch {
         print("SOS deadclaim: take failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
@@ -81,7 +80,7 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    var obligation = move request
+    let obligation = move request
 
     msg[0] = 43
     try (move obligation).reply(body: &msg, len: 1) catch {
@@ -90,22 +89,22 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    let answered = try claim.resolve(into: &var buf) catch {
+    let answered = try claim.resolve() catch {
         print("SOS deadclaim: resolve failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    guard let got = answered else {
+    guard let got = move answered else {
         let _ = system.debug_print("SOS deadclaim: the reply went missing\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    print("SOS deadclaim: resolved len={}\n", got)
+    print("SOS deadclaim: resolved len={}\n", got.len)
 
     // AND AGAIN, THROUGH THE SPENT CLAIM. The value disarmed itself above, so
     // this reaches the kernel with a word that names nothing and the process
     // ends. Neither arm below runs.
-    match claim.resolve(into: &var buf) {
+    match claim.resolve() {
         case Ok(_) -> {
             let _ = system.debug_print("SOS deadclaim: a spent claim answered twice\n")
             let _ = system.shutdown(EXIT_FAILED)

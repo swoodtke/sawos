@@ -1,0 +1,94 @@
+// SOS CHILD: A CONNECTION END IT MAY HOLD AND MAY NOT POST THROUGH (sawos design
+// 18, M4 unit 4; `designs/010` agenda 7b).
+//
+// **IT IS HANDED THE SAME KIND OF THING TWICE AND CAN DO DIFFERENT THINGS WITH
+// THEM**, which is the whole of what attenuate-at-give buys. Both boot records
+// are `PipeInlet`s onto the same connection; one arrived through a keep mask
+// that named `Post` and one through a mask that did not, and nothing about the
+// two handles differs except the rights word its giver chose.
+//
+// So this child posts through the WIDE one — which proves a masked give still
+// hands over a working capability, and that a keep bit the source never held was
+// simply ignored rather than refused — and then posts through the NARROW one,
+// which ends it. A missing right is `AccessDenied` and a caller-checkable
+// mistake (design 178's faults ruling), so the process is TERMINATED rather than
+// told, and its launcher reads the fault out of §8's status word.
+//
+// **THE ORDER IS THE PROOF.** A child that faulted on the first post would say
+// nothing about the mask — it could simply have been given a broken handle — so
+// the wide post has to succeed first and be visible in the transcript before the
+// narrow one is attempted.
+
+import sos.{System, Process, PipeInlet, BootHandle, BootHandleKind, SosStatus,
+            PIPE_BODY_BYTES}
+
+/// The boot set did not hold the two inlets its launcher promised.
+static EXIT_NO_INLETS: UInt = 96
+/// The WIDE inlet refused a post, which would mean the mask narrowed something
+/// it was told to keep.
+static EXIT_WIDE_REFUSED: UInt = 95
+
+/// The byte the wide post carries, so the launcher's take proves WHICH handle
+/// wrote it.
+static BYTE_WIDE: UInt8 = 77
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS childnarrow: no process handle: {}\n", error)
+        return
+    }
+
+    // TWO RECORDS, IN THE ORDER THE LAUNCHER GAVE THEM: the wide inlet first,
+    // the narrow one second. The boot set is a FIFO, so the drain order is the
+    // give order and nothing about the handles themselves says which is which.
+    var first = try proc.boot_handle_next() catch {
+        let _ = system.debug_print("SOS childnarrow: no first inlet\n")
+        let _ = proc.exit(EXIT_NO_INLETS)
+        return
+    }
+    var second = try proc.boot_handle_next() catch {
+        let _ = system.debug_print("SOS childnarrow: no second inlet\n")
+        let _ = proc.exit(EXIT_NO_INLETS)
+        return
+    }
+    guard let wide = first.take_inlet() else {
+        let _ = system.debug_print("SOS childnarrow: first record is not an inlet\n")
+        let _ = proc.exit(EXIT_NO_INLETS)
+        return
+    }
+    guard let narrow = second.take_inlet() else {
+        let _ = system.debug_print("SOS childnarrow: second record is not an inlet\n")
+        let _ = proc.exit(EXIT_NO_INLETS)
+        return
+    }
+
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = BYTE_WIDE
+    let staged = try wide.post(body: &body, len: 1) catch {
+        print("SOS childnarrow: the wide inlet refused: {}\n", error)
+        let _ = proc.exit(EXIT_WIDE_REFUSED)
+        return
+    }
+    guard let claim = move staged else {
+        let _ = system.debug_print("SOS childnarrow: the wide inlet had no room\n")
+        let _ = proc.exit(EXIT_WIDE_REFUSED)
+        return
+    }
+    // A TELL: the launcher takes, and nothing here wants an answer.
+    let _ = move claim
+    let _ = system.debug_print("SOS childnarrow: posted through the wide end\n")
+
+    // **AND THIS ENDS THE PROCESS.** The narrow inlet's rights word came out of
+    // an intersection its giver chose, so the kernel refuses the op the mask
+    // left out — and a missing right is a fault rather than a status, because
+    // the caller holds the handle and could have known.
+    let _ = system.debug_print("SOS childnarrow: now posting through the narrow end\n")
+    let _ = narrow.post(body: &body, len: 1)
+
+    // UNREACHABLE: the line above does not return.
+    let _ = system.debug_print("SOS childnarrow: the narrow end posted anyway\n")
+    let _ = proc.exit(EXIT_WIDE_REFUSED)
+}

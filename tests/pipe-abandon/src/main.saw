@@ -56,7 +56,6 @@ func _start(boot_handle: UInt) {
     let _ = system.debug_print("SOS abandon: created\n")
 
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
-    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
 
     // =========================================================================
     // ARM ONE — THE CLIENT ABANDONS. Post, take, drop the claim, and the reply
@@ -73,7 +72,7 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    var obligation = try take_one(&outlet, &var buf) catch {
+    var obligation = try take_one(&outlet) catch {
         print("SOS abandon: take failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
@@ -108,14 +107,14 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let dropped = try take_one(&outlet, &var buf) catch {
+    let dropped = try take_one(&outlet) catch {
         print("SOS abandon: second take failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
     let _ = move dropped
 
-    match pending.resolve(into: &var buf) {
+    match pending.resolve() {
         case Ok(_) -> {
             let _ = system.debug_print("SOS abandon: a reply arrived from nobody\n")
             let _ = system.shutdown(EXIT_FAILED)
@@ -155,7 +154,7 @@ func _start(boot_handle: UInt) {
     // staged exchange with no server end IS an abandoned one.
     let _ = move server
 
-    match orphan.resolve(into: &var buf) {
+    match orphan.resolve() {
         case Ok(_) -> {
             let _ = system.debug_print("SOS abandon: a dead outlet answered\n")
             let _ = system.shutdown(EXIT_FAILED)
@@ -170,9 +169,8 @@ func _start(boot_handle: UInt) {
 
 /// Take one message and hand its obligation back, refusing an empty ring as an
 /// error — every take here has a message waiting by construction.
-func take_one(outlet: &PipeOutlet,
-              buf: &var [UInt8; PIPE_BODY_BYTES]) -> Result<PipeRequest, SosStatus> {
-    let got = try outlet.take(into: &var buf)
+func take_one(outlet: &PipeOutlet) -> Result<PipeRequest, SosStatus> {
+    let got = try outlet.take()
     guard let (_, request) = move got else { return SosStatus.WouldBlock }
     return move request
 }

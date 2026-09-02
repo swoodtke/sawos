@@ -1,0 +1,202 @@
+// SOS CHILD: THE FIRST PROCESS TO RECEIVE A CAPABILITY IN A MESSAGE (sawos
+// design 18, M4 unit 4; spec §2.1's `send(data?, handles?)`).
+//
+// **IT DOES NOT KNOW WHAT IT IS GOING TO BE GIVEN, AND THAT IS THE POINT.** Every
+// capability this process has held until now arrived through its BOOT SET, which
+// its launcher wrote before it ran and froze at `start`. A message's handle slot
+// is the other door: it opens at run time, the sender chooses what goes through
+// it, and the receiver finds out by MATCHING — which is what `PipeHandle` is for.
+//
+// So this child branches on the KIND of the handle it was sent, and the two arms
+// are two different proofs its two launchers each want:
+//
+//   `Request` — §2.1's DELEGATION PRIMITIVE, arriving as a MESSAGE rather than as
+//               a launch-time `give`. The obligation belongs to an exchange on a
+//               connection this process cannot name, whose client it has never
+//               heard of; it replies, and the bytes land at the original claim —
+//               WITH A CAPABILITY OF ITS OWN attached, which is §2.1's symmetry
+//               in the direction that is easiest to forget.
+//               `pipe-delegate-msg` is that launcher.
+//   `Inlet`   — a live connection END. It posts through it, which is the proof
+//               the word it was handed is a working capability and not a number,
+//               and then MINTS A SIBLING AND SENDS IT BACK on its own reply —
+//               §2.1's symmetry, handles in both directions. `pipe-handles` is
+//               that launcher.
+//
+// **THE OBLIGATION IT TAKES IS ITS OWN, AND IT IS NOT THE ONE IT MAY REPLY TO.**
+// A take always mints one; on the delegation arm this child drops it (its own
+// client asked nothing and gave the claim up), and on the inlet arm it discharges
+// it with a handle attached. Keeping those two straight is the whole of what
+// makes "a message carries handles" different from "a give".
+//
+// The verdict travels in the §8 exit code, so a launcher reads which arm ran
+// without this child printing a word about it.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, PipeRequest, PipeHandle,
+            PipeHandles, PipeMsg, BootHandle, BootHandleKind, SosStatus,
+            PIPE_BODY_BYTES}
+
+/// The boot set carries exactly one thing this child wants: the SERVER end of
+/// the connection its launcher posts through.
+static EXIT_NO_OUTLET: UInt = 91
+/// The take answered nothing, which cannot happen — the launcher posts before it
+/// starts this process, and the message survives its sender.
+static EXIT_NO_MESSAGE: UInt = 92
+/// The message carried no handle, or one of a kind neither arm expects.
+static EXIT_NO_HANDLE: UInt = 93
+/// A call that should not have been refused was.
+static EXIT_REFUSED: UInt = 94
+
+/// The delegation arm ran: a forwarded obligation was answered.
+static EXIT_FORWARDED: UInt = 41
+/// The endpoint arm ran: a received inlet was posted through.
+static EXIT_ENDPOINT: UInt = 42
+
+/// Four bytes each way, so a launcher's assertion is about the DATA and not only
+/// about the status.
+static PAYLOAD_LEN: UInt = 4
+
+/// `D`, `O`, `N`, `E` — what the forwarded obligation answers with.
+static BYTE_D: UInt8 = 68
+static BYTE_O: UInt8 = 79
+static BYTE_N: UInt8 = 78
+static BYTE_E: UInt8 = 69
+
+/// The byte this child posts through an inlet it was handed. Distinctive, so the
+/// launcher's take proves WHICH process wrote it.
+static BYTE_VIA: UInt8 = 86
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS childhandles: no process handle: {}\n", error)
+        return
+    }
+
+    guard let outlet = drain_outlet(&proc) else {
+        let _ = system.debug_print("SOS childhandles: no outlet in the boot set\n")
+        let _ = proc.exit(EXIT_NO_OUTLET)
+        return
+    }
+
+    let code = try serve(&outlet) catch {
+        print("SOS childhandles: refused: {}\n", error)
+        let _ = proc.exit(EXIT_REFUSED)
+        return
+    }
+    let _ = proc.exit(code)
+}
+
+/// The one thing this child's boot set is expected to hold.
+func drain_outlet(proc: &Process) -> PipeOutlet? {
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                match rec.kind {
+                    case PipeOutlet -> {
+                        if let got = rec.take_outlet() {
+                            let some: PipeOutlet? = move got
+                            return move some
+                        }
+                    },
+                    // Anything else is a capability this child was given and does
+                    // not want: it drops at the end of this arm.
+                    case _ -> {},
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+    None
+}
+
+/// Take the one message, and do whatever the handle it carried says.
+func serve(outlet: &PipeOutlet) -> Result<UInt, SosStatus> {
+    let got = try outlet.take()
+    guard let (arrived, request) = move got else { return EXIT_NO_MESSAGE }
+    var msg = move arrived
+    let own = move request
+
+    // **TAKE IT OUT OF ITS SLOT BEFORE MATCHING IT.** `msg.handles[i]` is a
+    // place; `take()` hands over an OWNED value, and a `match` on an owned value
+    // consumes it — which is what lets an arm move the wrapper into a consuming
+    // op. Matching the slot where it sits would be a borrow, and a `move` out of
+    // a borrowing arm is unsound in sawc today (SL-17).
+    guard let carried = msg.handles[0].take() else { return EXIT_NO_HANDLE }
+
+    match carried {
+        // **THE DELEGATION ARM.** The obligation is somebody else's exchange, on
+        // a connection this process holds no end of. Replying to it sends the
+        // bytes STRAIGHT to the original client — the payload never transits the
+        // process that forwarded it, which is §2.1's ratified zero-copy example
+        // with a message where the example says "forwards".
+        case Request(rq) -> {
+            var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+            body[0] = BYTE_D
+            body[1] = BYTE_O
+            body[2] = BYTE_N
+            body[3] = BYTE_E
+            // **AND THE ANSWER CARRIES A CAPABILITY OF ITS OWN** — §2.1's
+            // `send(data?, handles?)` is written once and means both
+            // directions, so a reply's handle slots are the request's. What
+            // goes back is a sibling of THIS child's own server end, which is
+            // the shape a service uses to hand a client a second channel.
+            //
+            // **THE REPLIER IS STILL ALIVE WHEN THE RENDEZVOUS HAPPENS**, and
+            // that is not an accident: the launcher is PARKED on its claim, so
+            // the delivery runs inside this very syscall and the entry moves
+            // while its owner is executing. A replier that exited first would
+            // have released the entry, and `designs/010` ruling 5 would deliver
+            // the slot EMPTY — correctly, and not what this proof wants.
+            let sibling = try outlet.mint()
+            var back = PipeHandles.none()
+            back.put(0, outlet: move sibling)
+            let forwarded = move rq
+            try (move forwarded).reply_with(body: &body, len: PAYLOAD_LEN,
+                                            handles: &var back)
+            // ITS OWN obligation is dropped rather than answered: the launcher
+            // gave the claim up at the post (§2.1's TELL idiom), so there is
+            // nobody waiting for this one.
+            let _ = move own
+            return EXIT_FORWARDED
+        },
+        // **THE ENDPOINT ARM.** A connection end that arrived in a message is a
+        // connection end: posting through it is the proof, and a sibling of it
+        // going back on the reply is §2.1's symmetry — `send(data?, handles?)`
+        // in both directions.
+        case Inlet(i) -> {
+            var received = move i
+            var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+            body[0] = BYTE_VIA
+            let staged = try received.post(body: &body, len: 1)
+            guard let claim = move staged else { return EXIT_REFUSED }
+            // A TELL: the launcher is the one that takes, and nothing here wants
+            // an answer.
+            let _ = move claim
+
+            // **THIS REPLY CARRIES NO HANDLE, AND THE REASON IS THE LEDGER
+            // ITS LAUNCHER IS MEASURING.** A handle sent back here would land
+            // in the launcher's table at the delivery and net out against the
+            // entry the rendezvous freed, which would make the third reading
+            // say nothing. The reply DIRECTION's handles are proved by the
+            // other arm, where nobody is counting slots.
+            body[0] = BYTE_D
+            body[1] = BYTE_O
+            body[2] = BYTE_N
+            body[3] = BYTE_E
+            try (move own).reply(body: &body, len: PAYLOAD_LEN)
+            let _ = move received
+            return EXIT_ENDPOINT
+        },
+        // Nothing else is expected, and a capability this child cannot use is one
+        // it drops rather than one it hides.
+        case _ -> {
+            let _ = move own
+            return EXIT_NO_HANDLE
+        },
+    }
+}

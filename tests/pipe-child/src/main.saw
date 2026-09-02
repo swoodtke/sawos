@@ -33,6 +33,7 @@
 // across a real process boundary rather than inside one program.
 
 import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
+            PipeMsg,
             Clock, ClockType, Timer, Waiter, SosStatus, SystemRight,
             PIPE_BODY_BYTES}
 
@@ -66,12 +67,11 @@ static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
 /// Take, and discharge the obligation by dropping it. The child posted with the
 /// TELL idiom — it gave its claim up at once — so nobody is listening and the
 /// exchange settles here (sawos design 14).
-func take_message(outlet: &PipeOutlet,
-                  into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<UInt?, SosStatus> {
-    let got = try outlet.take(into: &var into)
-    if let (n, request) = move got {
+func take_message(outlet: &PipeOutlet) -> Result<PipeMsg?, SosStatus> {
+    let got = try outlet.take()
+    if let (msg, request) = move got {
         let _ = move request
-        let some: UInt? = n
+        let some: PipeMsg? = move msg
         return move some
     }
     return None
@@ -174,19 +174,26 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     var length: UInt = 0
+    var b0: UInt = 0
+    var b1: UInt = 0
+    var b2: UInt = 0
+    var b3: UInt = 0
     var have = false
     var rounds: Int = 0
     while (not have) && rounds < POLL_ROUNDS {
         rounds = rounds + 1
-        let got = try take_message(&outlet, &var buf) catch {
+        let got = try take_message(&outlet) catch {
             print("SOS pipechild: take refused: {}\n", error)
             let _ = system.shutdown(EXIT_FAILED)
             return
         }
-        if let n = got {
-            length = n
+        if let arrived = move got {
+            length = arrived.len
+            b0 = arrived.bytes[0] as UInt
+            b1 = arrived.bytes[1] as UInt
+            b2 = arrived.bytes[2] as UInt
+            b3 = arrived.bytes[3] as UInt
             have = true
         } else {
             try timer.arm(after_ns: PARK_NS) catch {
@@ -208,7 +215,7 @@ func _start(boot_handle: UInt) {
         return
     }
     print("SOS pipechild: received len={} b={},{},{},{}\n", length,
-          buf[0] as UInt, buf[1] as UInt, buf[2] as UInt, buf[3] as UInt)
+          b0, b1, b2, b3)
 
     print("SOS pipechild: done\n")
     let _ = proc.exit(EXIT_OK)

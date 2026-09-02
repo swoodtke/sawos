@@ -46,6 +46,7 @@
 // expectation does not match.
 
 import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
+            PipeMsg,
             SosStatus, PIPE_BODY_BYTES}
 
 static EXIT_OK: UInt = 0
@@ -79,12 +80,11 @@ func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
 /// which tells a client that is still listening `PeerClosed`. Here nobody is
 /// listening (the claim went at the post), so the exchange simply settles and its
 /// ring slot goes back.
-func take_message(outlet: &PipeOutlet,
-                  into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<UInt?, SosStatus> {
-    let got = try outlet.take(into: &var into)
-    if let (n, request) = move got {
+func take_message(outlet: &PipeOutlet) -> Result<PipeMsg?, SosStatus> {
+    let got = try outlet.take()
+    if let (msg, request) = move got {
         let _ = move request
-        let some: UInt? = n
+        let some: PipeMsg? = move msg
         return move some
     }
     return None
@@ -113,7 +113,6 @@ func _start(boot_handle: UInt) {
     let _ = system.debug_print("SOS pipebasics: created\n")
 
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
-    var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
 
     // ---- THE ROUND TRIP. The bytes are what is asserted, not the status.
     msg[0] = 65
@@ -129,18 +128,18 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let first = try take_message(&outlet, &var buf) catch {
+    let first = try take_message(&outlet) catch {
         print("SOS pipebasics: take failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    guard let n = first else {
+    guard let one = move first else {
         let _ = system.debug_print("SOS pipebasics: nothing staged\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    print("SOS pipebasics: round trip len={} b={},{},{}\n", n,
-          buf[0] as UInt, buf[1] as UInt, buf[2] as UInt)
+    print("SOS pipebasics: round trip len={} b={},{},{}\n", one.len,
+          one.bytes[0] as UInt, one.bytes[1] as UInt, one.bytes[2] as UInt)
 
     // ---- FIFO. Three messages in, three out, and the ORDER is the claim: a
     // ring that handed back the newest first would print 3,2,1 here.
@@ -170,19 +169,19 @@ func _start(boot_handle: UInt) {
     var order: UInt = 0
     var seen: Int = 0
     while seen < 3 {
-        let got = try take_message(&outlet, &var buf) catch {
+        let got = try take_message(&outlet) catch {
             print("SOS pipebasics: fifo take failed: {}\n", error)
             let _ = system.shutdown(EXIT_FAILED)
             return
         }
-        guard let _ = got else {
+        guard let each = move got else {
             let _ = system.debug_print("SOS pipebasics: fifo ran dry\n")
             let _ = system.shutdown(EXIT_FAILED)
             return
         }
         // The three first-bytes accumulated as DIGITS, so ONE number carries the
         // order and not only the set — `child-drain`'s `tags=35` idiom.
-        order = order * 10 + (buf[0] as UInt)
+        order = order * 10 + (each.bytes[0] as UInt)
         seen = seen + 1
     }
     print("SOS pipebasics: fifo order={}\n", order)
@@ -201,17 +200,17 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let empty = try take_message(&outlet, &var buf) catch {
+    let empty = try take_message(&outlet) catch {
         print("SOS pipebasics: empty take failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    guard let zero = empty else {
+    guard let zero = move empty else {
         let _ = system.debug_print("SOS pipebasics: empty message vanished\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    print("SOS pipebasics: empty message len={}\n", zero)
+    print("SOS pipebasics: empty message len={}\n", zero.len)
 
     // ---- THE RING'S DEPTH, COUNTED. Post until the kernel refuses; the count
     // is `PIPE_INFLIGHT`, which this program has no way to name.
@@ -240,7 +239,7 @@ func _start(boot_handle: UInt) {
     var passes: Int = 0
     while draining && passes < MAX_ROUNDS {
         passes = passes + 1
-        let got = try take_message(&outlet, &var buf) catch {
+        let got = try take_message(&outlet) catch {
             print("SOS pipebasics: drain failed: {}\n", error)
             let _ = system.shutdown(EXIT_FAILED)
             return
@@ -257,7 +256,7 @@ func _start(boot_handle: UInt) {
     // met it once; asking again says it is stable, and says it through the
     // typed tier's two channels rather than through a status a caller would
     // have had to match as a failure.
-    let nothing = try take_message(&outlet, &var buf) catch {
+    let nothing = try take_message(&outlet) catch {
         print("SOS pipebasics: empty ring is an error: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
