@@ -541,3 +541,54 @@ Every string in that list is byte-identical; two moved and two are new.
    the three refusal cases' one each) and the two `readable_msg` /
    `process_status` record decoders, which are genuinely-different-arms matches
    with a panic default rather than folds.
+
+## Rider — SL-16 closed post-integration (Sep 2 2026)
+
+The unit shipped with the sentinel discipline because the language had no
+consuming receiver; finding 7 filed that as SL-16 and the tracker marked it
+fix-in-flight. sawlang grew `consumes` at the FOURTH pin bump (design 260,
+sawc 0.4.0 @ `46eebb36`) and the conversion landed here as its own change,
+against this unit's shipped surface. What moved:
+
+- **`PipeRequest.reply` and `PipeRequest.reply_wait` are `consumes` methods.**
+  The declaration keeps `&var self` and adds the word in the effect slot; every
+  caller spells `(move obligation).reply(...)`. Both consume on EVERY path they
+  can take — `reply` on `Ok` and on `PeerClosed`, `reply_wait` on `Ok` and on
+  both legs of `ReplyWaitError` — which is exactly the contract the effect
+  expresses, so the conversion is a spelling change and not a semantic one.
+- **The sentinel retired at those two ops.** `reply_body` and `reply_wait_body`
+  no longer take the wrapper by reference and no longer write
+  `PipeRequestHandle(NO_HANDLE)`; they take the WORD, like `post_body`,
+  `call_body` and `take_into` beside them. A consuming body substitutes for the
+  type's `deinit` body on the consumed path, so the husk that used to carry the
+  sentinel does not exist, the handle field's synthesized drop is a no-op, and
+  no release fires. The custom `deinit` stays — it still serves the ordinary
+  drop path, which is what an unconsumed obligation takes.
+- **`PipeReply.resolve` DID NOT convert, and the reason is this unit's own
+  documented departure read forward.** §2.1's poll shape means an `Ok(None)`
+  resolve consumed NOTHING; `consumes` consumes on every path, so spelling it
+  that way would spend a live claim at the first empty poll. Its contract is
+  consume-on-success-or-terminal-failure, which the effect cannot express, so
+  it keeps `&var self` and the disarm decided by the ANSWER. Split into a
+  non-consuming poll plus a consuming resolve was considered and declined: it
+  would give one op two typed doors for a distinction the kernel already draws
+  in the status, and §2.1's surface is one `resolve`.
+- **`pipe-reply-wait-dead` was retargeted, and its rows moved.** The case
+  proved that a spent obligation asked a SECOND time is the dispatch's
+  `BadHandle`; with `reply` and `reply_wait` both consuming, that program is a
+  use-after-move the compiler refuses, so the proof cannot be written in Saw at
+  all. Its replacement proves the other property this unit's `ReplyWaitError`
+  owes and nothing in the suite exercised: the REPLY LEG firing, against a
+  Waiter with nothing attached, so a park would have been `every thread
+  blocked` and reaching the `done` line is the proof that no park happened —
+  the "one dead client cannot stall a server loop" sentence, executed. The
+  kernel-side `BadHandle` is untouched and still stands for a raw-altitude
+  caller; `pipe-dead-claim` still draws it through `resolve`, which is now the
+  only place in the suite that can.
+
+Finding 7's own claim survives the closure intact — it named a real gap, the
+gap is closed upstream, and the sentinel it forced is gone from the two ops it
+forced it at. What the closure adds to the record is that the gap had a THIRD
+shape nobody had priced: a funnel whose consumption is CONDITIONAL. `consumes`
+does not reach it, and after the sweep `resolve` is the one op in this file
+that still spells single use in a value rather than in a type.

@@ -47,13 +47,31 @@
 //! as a method on a wrapper. `tests/pipe-send-manual` is the composition
 //! written out.
 //!
-//! **SINGLE USE IS RAII HERE AND A LEDGER IN THE KERNEL.** `resolve` and `reply`
-//! CONSUME the capability they are called through, and the wrappers say so by
-//! disarming their own word — so a used-up one-shot drops to nothing, and reaching
-//! for it again is the ordinary `BadHandle` fault design 3's generations exist to
-//! draw. The disarm is the transfer-funnel contract (`floor`'s own block) with one
-//! documented difference: a `resolve` that answers `Ok(None)` consumed NOTHING, so
-//! the disarm is decided by the ANSWER rather than written before the syscall.
+//! **SINGLE USE IS RAII HERE AND A LEDGER IN THE KERNEL — AND AT THE TWO REPLY
+//! OPS IT IS NOW A COMPILE ERROR** (SL-16, closed against sawlang design 260 at
+//! sawc 0.4.0). `reply` and `reply_wait` consume the obligation on EVERY path they
+//! can take, so they are `consumes` methods: the declaration carries the word in
+//! its effect slot beside `&var self`, the call site spells
+//! `(move obligation).reply(...)`, and a second use through the same binding is
+//! refused by the compiler rather than diagnosed by the kernel. NO SENTINEL IS
+//! WRITTEN AT EITHER OP any more — a consuming body substitutes for the custom
+//! `deinit` body, so the husk that used to carry `NO_HANDLE` does not exist, the
+//! handle word's synthesized drop is a no-op, and no release fires.
+//!
+//! **`resolve` IS DELIBERATELY NOT ONE, and the reason is the documented
+//! difference it always had**: a `resolve` that answers `Ok(None)` consumed
+//! NOTHING. `consumes` consumes on every path — the empty poll included — so
+//! spelling it that way would spend a live claim the first time the answer had not
+//! arrived yet. Its contract is consume-on-success-or-terminal-failure, which the
+//! effect cannot express, so it keeps its `&var self` receiver and its disarm
+//! decided by the ANSWER. What stands behind it is what always did: the kernel's
+//! ledger, and `pipe-dead-claim` is that fault, still reachable and still proved.
+//!
+//! The transfer funnels that are NOT receivers — the four `Waiter.give` overloads
+//! below — keep the disarm, because `consumes` is a receiver-position effect and
+//! they take their value as a by-value PARAMETER. A private `consumes` dissolve
+//! helper on each wrapper would retire those too; that is SL-3's remainder and it
+//! sits in the tracker's backlog, deliberately not done here.
 
 import sosabi.{SosStatus, PipeInletHandle, PipeInletOp, PipeOutletHandle,
                PipeOutletOp, PipeReplyHandle, PipeRequestHandle, MINT_OP,
@@ -433,6 +451,18 @@ extension PipeReply {
     /// away before the message could ever be taken. It SPENDS the claim too:
     /// there is nothing left to wait for, so holding it would be holding a ring
     /// slot for an answer that can never come.
+    ///
+    /// **IT IS NOT A `consumes` METHOD, AND THAT IS THE POLL SEMANTICS SPEAKING**
+    /// (SL-16). Its two siblings on the obligation side — `reply` and
+    /// `reply_wait` — consume on every path and say so in the effect slot. This
+    /// one consumes on two paths out of three: `Ok(Some(n))` and
+    /// `Err(PeerClosed)` both end the exchange, and `Ok(None)` is the answer that
+    /// has not arrived yet and spends NOTHING. `consumes` cannot express
+    /// consume-on-some-paths — it would kill the claim at the first empty poll,
+    /// which is the one thing a poll loop must survive — so the receiver stays
+    /// `&var self`, the disarm stays decided by the ANSWER, and a second resolve
+    /// through a spent claim stays what it always was: the kernel's `BadHandle`,
+    /// which `pipe-dead-claim` proves.
     public func resolve(&var self,
                         into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<UInt?, SosStatus> {
         resolve_into(&var self, &var into)
@@ -517,20 +547,30 @@ extension PipeRequest {
     /// **SEND THE REPLY, AND DISCHARGE THE OBLIGATION.** Requires
     /// `PipeRequestRight.Reply`.
     ///
-    /// It CONSUMES this capability whatever it answers — the value disarms itself
-    /// before the syscall, which is the transfer-funnel contract exactly — so a
-    /// second reply through the same wrapper is the ordinary `BadHandle` fault.
+    /// **IT CONSUMES THIS CAPABILITY WHATEVER IT ANSWERS, AND THE TYPE SAYS SO**
+    /// (SL-16, sawlang design 260). The declaration carries `consumes` and the
+    /// call spells the move — `(move request).reply(body: &msg, len: n)` — so
+    /// `request` is dead past that expression and a second reply through the same
+    /// binding is a COMPILE error, not the `BadHandle` fault it used to be. The
+    /// kernel's ledger still draws that fault for a raw-altitude caller holding a
+    /// word; what changed is that a Saw caller can no longer get there.
+    ///
+    /// Nothing is disarmed and nothing is released: the consuming body stands in
+    /// for this type's `deinit` body on this path, and the handle word it leaves
+    /// behind is swept by a synthesized drop that does nothing.
+    ///
     /// `len` may be ZERO: a reply that carries no data is still an answer, and it
     /// is how the TELL idiom's server side discharges
-    /// (`let _ = request.reply(...)`).
+    /// (`let _ = (move request).reply(...)`).
     ///
     /// `Err(SosStatus.PeerClosed)` means the client abandoned its claim and the
     /// reply went nowhere — §2.1's ratified answer, never a silent success. THE
     /// OBLIGATION IS DISCHARGED EITHER WAY, which is what makes ignoring it with
-    /// `let _ =` correct rather than careless.
+    /// `let _ =` correct rather than careless — and what makes `consumes`, which
+    /// consumes on the Err path too, the exact effect for it.
     public func reply(&var self, body: &[UInt8; PIPE_BODY_BYTES],
-                      len: UInt) -> Result<Void, SosStatus> {
-        reply_body(&var self, &body, len)
+                      len: UInt) consumes -> Result<Void, SosStatus> {
+        reply_body(self.handle, &body, len)
     }
 
     /// **SEND THE REPLY AND WAIT FOR THE NEXT THING — one trap** (sawos design
@@ -558,25 +598,29 @@ extension PipeRequest {
     /// afresh. `Err(Wait(s))` is an exchange that completed and a wait that
     /// broke (`SosStatus.Revoked` is the one that exists today).
     ///
-    /// **THE OBLIGATION IS DISCHARGED ON EVERY PATH**, §2.1's ratified sentence:
-    /// this value disarms itself before the trap, exactly as `reply` does, so
-    /// reaching for it again is the ordinary `BadHandle` fault design 3's
-    /// generations exist to draw.
+    /// **THE OBLIGATION IS DISCHARGED ON EVERY PATH**, §2.1's ratified sentence —
+    /// which is why this is a `consumes` method exactly as `reply` is (SL-16,
+    /// sawlang design 260). The call spells the move, the binding is dead after
+    /// it, and reaching for it again is a COMPILE error. Both legs of the error
+    /// consume: `Err(Reply(_))` did not deliver the reply and `Err(Wait(_))` did,
+    /// and neither leaves an obligation anyone still holds.
     ///
     /// The loop it is written for:
     ///
     /// ```saw
     /// var wake = try waiter.wait() catch { return }
     /// while serving {
-    ///     var request = decode(move wake)
+    ///     let request = decode(move wake)
     ///     let n = handle(&var out)
-    ///     wake = try request.reply_wait(body: &out, len: n, waiter: &waiter)
+    ///     wake = try (move request).reply_wait(body: &out, len: n,
+    ///                                          waiter: &waiter)
     ///           catch { ... }
     /// }
     /// ```
     public func reply_wait(&var self, body: &[UInt8; PIPE_BODY_BYTES], len: UInt,
-                           waiter: &Waiter) -> Result<WaitResult, ReplyWaitError> {
-        reply_wait_body(&var self, &body, len, waiter.handle)
+                           waiter: &Waiter
+    ) consumes -> Result<WaitResult, ReplyWaitError> {
+        reply_wait_body(self.handle, &body, len, waiter.handle)
     }
 
     /// **MINT A SIBLING of this obligation, narrowed by a KEEP MASK.** Everything
@@ -593,16 +637,16 @@ extension PipeRequest {
 /// The `unsafe` half of `PipeRequest.reply`, confined to one small named helper
 /// (design 136). The body's address never leaves it.
 ///
-/// **DISARM BEFORE THE SYSCALL**, the transfer-funnel contract verbatim: a reply
-/// consumes the caller's entry on every answer it can give, and its only other
-/// outcome is a fault that ends the process. So there is no path on which a
-/// disarmed-but-unspent word leaks, and `PipeReply.resolve`'s conditional disarm
-/// is the departure rather than this.
-func reply_body(request: &var PipeRequest, body: &[UInt8; PIPE_BODY_BYTES],
+/// **THERE IS NO DISARM ANY MORE, AND NOTHING TAKES ITS PLACE** (SL-16). The
+/// caller is a `consumes` method, so its body IS the wrapper's teardown on this
+/// path: the custom `deinit` never runs, the handle word is swept by a
+/// synthesized drop that does nothing, and the binding the caller moved from
+/// releases nothing on any path. So this helper needs no wrapper at all — it
+/// takes the word, exactly as `post_body`, `call_body` and `take_into` do, and
+/// the file's three-argument shape is uniform again.
+func reply_body(handle: PipeRequestHandle, body: &[UInt8; PIPE_BODY_BYTES],
                 len: UInt) unsafe -> Result<Void, SosStatus> {
-    let word: UInt = request.handle
-    request.handle = PipeRequestHandle(NO_HANDLE)
-    return checked(sos_pipe_request_reply(word,
+    return checked(sos_pipe_request_reply(handle,
                                           (&body) as UnsafePointer<UInt8>, len))
 }
 
@@ -660,10 +704,9 @@ extension ReplyWaitError: Error {}
 /// The `unsafe` half of `PipeRequest.reply_wait`, confined to one small named
 /// helper (design 136). Three addresses cross here and none of them leaves.
 ///
-/// **DISARM BEFORE THE SYSCALL**, the transfer-funnel contract verbatim and for
-/// `reply_body`'s exact reason: a reply-wait discharges the obligation on every
-/// answer it can give, and its only other outcome is a fault that ends the
-/// process.
+/// **NO DISARM, for `reply_body`'s exact reason** (SL-16): the caller is a
+/// `consumes` method whose body stands in for the wrapper's teardown, so there is
+/// no sentinel to write and no release to suppress. It takes the word.
 ///
 /// **THE SMALL ARGUMENTS TRAVEL IN A RECORD AND THE BODY DOES NOT.** §5.7 gives
 /// an op three argument registers and this one has four things to say, so the
@@ -672,12 +715,9 @@ extension ReplyWaitError: Error {}
 /// Putting the body itself in the record would have made every call copy
 /// `PIPE_BODY_BYTES` in userspace before the trap, which is a cost the fused
 /// path exists to avoid.
-func reply_wait_body(request: &var PipeRequest, body: &[UInt8; PIPE_BODY_BYTES],
+func reply_wait_body(handle: PipeRequestHandle, body: &[UInt8; PIPE_BODY_BYTES],
                      len: UInt,
                      waiter: WaiterHandle) unsafe -> Result<WaitResult, ReplyWaitError> {
-    let word: UInt = request.handle
-    request.handle = PipeRequestHandle(NO_HANDLE)
-
     var args: [UInt; PIPE_REPLY_WAIT_RECORD_WORDS] = [0; PIPE_REPLY_WAIT_RECORD_WORDS]
     args[PIPE_REPLY_WAIT_WAITER_WORD] = waiter
     args[PIPE_REPLY_WAIT_BODY_WORD] = ((&body) as UnsafePointer<UInt8>) as UInt
@@ -685,7 +725,7 @@ func reply_wait_body(request: &var PipeRequest, body: &[UInt8; PIPE_BODY_BYTES],
     var buf = WaitBuffer(header: [0; WAIT_HEADER_WORDS],
                          body: [0; PIPE_BODY_BYTES])
     var leg: UInt = 0
-    let raw = sos_pipe_request_reply_wait(word,
+    let raw = sos_pipe_request_reply_wait(handle,
                                           (&var args) as UnsafePointer<UInt>,
                                           pipe_reply_wait_record_bytes() as UInt,
                                           (&var buf.header) as UnsafePointer<UInt>,

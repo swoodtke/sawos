@@ -3820,25 +3820,35 @@ TEST_CASES = [
         "expect_status": EXIT_PROCESS_FAULT,
     },
     {
-        # **A SPENT OBLIGATION IS SPENT FOR `reply_wait` TOO** (sawos design
-        # 17), which is `pipe_dead_claim`'s case on the server side. Both
-        # `reply` and `reply_wait` disarm their wrapper before the trap, so an
-        # ordinary program can never meet this: reaching it takes asking a
-        # SECOND time through a husk, which is exactly what design 14 deviation
-        # 7 says such a case has to do.
+        # **THE REPLY LEG FIRES, AND IT DOES NOT PARK** (sawos design 17; §2.1's
+        # abandonment paragraph). `reply_wait` does two things in one trap, so
+        # the ORDER of its failures is a contract: a reply that cannot land
+        # returns AT ONCE and the wait leg never runs, which is what keeps one
+        # abandoned exchange from taking a server loop down with it.
         #
-        # **THE FAULT IS RAISED IN THE DISPATCH, ABOVE THE OP TABLE.** A word
-        # that resolves to nothing names no kind, so there is no op to ask — and
-        # the new op inherits that for free, which is the claim: growing an
-        # object's op table does not grow the ways a stale handle can be used.
+        # **THE EMPTY WAITER IS THE ASSERTION.** Nothing is attached to the
+        # Waiter the op is handed, so a park would have nothing to wake it and
+        # the case would end `every thread blocked` — `wait_deadlock`'s own
+        # report. Reaching `done` is the proof that no park happened.
+        #
+        # **IT USED TO PROVE A SPENT OBLIGATION IS `BadHandle`, AND THAT PROOF
+        # IS NOW A COMPILE ERROR** (SL-16, sawc 0.4.0). `reply` and `reply_wait`
+        # are `consumes` methods, so the second use through a spent wrapper —
+        # which is how this case reached the fault — no longer compiles. The
+        # kernel check is untouched and still stands for a raw-altitude caller;
+        # a Saw program simply has no spelling for the mistake any more, and
+        # `pipe_dead_claim` still draws the same fault through `resolve`, which
+        # stays pollable and therefore stays non-consuming. The rows below moved
+        # for that reason and no other.
         "name": "pipe_reply_wait_dead",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": PIPE_REPLY_WAIT_DEAD_PKG,
         "expect_out": ["{banner}",
-                       "SOS replywaitdead: discharged the obligation",
-                       "SOS: process fault: bad handle process={zero}"],
-        "expect_clean_exit": False,
-        "expect_status": EXIT_PROCESS_FAULT,
+                       "SOS replywaitdead: the client let its claim go",
+                       "SOS replywaitdead: reply_wait says the reply did not "
+                       "land: the other end of this connection is gone",
+                       "SOS replywaitdead: done"],
+        "expect_clean_exit": True,
     },
 ]
 

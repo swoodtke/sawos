@@ -1,31 +1,53 @@
-// SOS M4 unit 3.5: A SPENT OBLIGATION IS SPENT FOR `reply_wait` TOO (sawos
-// design 17; design 3 D-1's generations).
+// SOS M4 unit 3.5: THE REPLY LEG FIRES, AND IT DOES NOT PARK (sawos design 17;
+// spec §2.1's abandonment paragraph; `designs/010` ruling 4's rider).
 //
-//   SOS replywaitdead: discharged the obligation
-//   SOS: process fault: bad handle
+//   SOS replywaitdead: the client let its claim go
+//   SOS replywaitdead: reply_wait says the reply did not land: the other end of
+//                      this connection is gone
+//   SOS replywaitdead: done
 //
-// **SINGLE USE IS THE LEDGER'S, AND THE WRAPPER IS ONLY THE POLITE VERSION OF
-// IT.** `PipeRequest.reply` and `PipeRequest.reply_wait` both consume the
-// capability they are called through — each disarms its own wrapper before the
-// trap, which is the transfer-funnel contract — so an ordinary program can
-// never meet this fault: the husk holds `NO_HANDLE` and dropping it does
-// nothing. Reaching the fault at all takes deliberate effort, and THAT IS THE
-// FINDING (design 14 deviation 7 says the same about `pipe_dead_claim`): this
-// case asks a SECOND time through a spent value to show that the kernel's own
-// check is real underneath the wrapper's.
+// **A DEAD CLIENT MUST NOT STALL A SERVER LOOP**, which is the one claim the
+// fused path owes that the composed path does not. `reply_wait` does two things
+// in one trap, so it has two ways to fail, and the order matters: if the REPLY
+// leg fails the op returns AT ONCE, without ever reaching the wait — otherwise a
+// server whose client had already given up would park on a Waiter it entered by
+// accident, and one abandoned exchange would take the loop down with it.
 //
-// **THE FAULT IS RAISED IN THE DISPATCH, ABOVE THE OP.** A word that resolves
-// to nothing names no kind either, so there is no op table to ask — which is why
-// this is `BadHandle` and not something `PipeRequestOp.ReplyWait` decided. The
-// new op inherits that for free, which is the claim: growing an object's op
-// table does not grow the ways a stale handle can be used.
+// **THE EMPTY WAITER IS THE ASSERTION.** Nothing is attached to the Waiter this
+// program hands the op, so a park here has nothing that could ever wake it: the
+// case would end `SOS: process fault: every thread blocked`, the same report
+// `wait-deadlock` pins. Reaching the `done` line is therefore not merely a
+// status check — it is the proof that no park happened, written as the thing
+// that would have gone wrong.
 //
-// Root plays both sides — post, take, reply — so nothing here parks and the
-// whole case is one thread.
+// **AND THE ERROR NAMES ITS LEG** (user-ruled Sep 1). `Err(Reply(s))` says the
+// reply did not land and the obligation is discharged all the same, so the
+// loop's next act is its own `waiter.wait()`; `Err(Wait(s))` would mean the
+// exchange COMPLETED and the wait broke, which is not something waiting again
+// can fix. This case asserts the first and refuses the second by name — a
+// `match`, because a negative test that asserts a specific error value is what
+// `match` is still for.
+//
+// **WHAT THIS CASE USED TO PROVE, AND WHY IT NO LONGER CAN** (SL-16, closed at
+// sawc 0.4.0). Until the `consumes` conversion it discharged the obligation with
+// `reply` and then asked a SECOND time through the spent wrapper, to show that
+// the kernel's own `BadHandle` sits underneath the wrapper's discipline. That
+// program does not compile any more: `reply` and `reply_wait` both consume their
+// receiver, so the second use is a use-after-move the compiler refuses — a
+// stronger guarantee than the fault it used to demonstrate, and one no test can
+// witness at run time. The kernel-side check is untouched and still stands for a
+// raw-altitude caller holding a word; what it cannot be shown by is a Saw
+// program, because the typed layer no longer has a spelling for the mistake.
+// `pipe-dead-claim` still draws that fault through `resolve`, which stays
+// pollable and therefore stays non-consuming.
+//
+// Root plays both sides — post, take, abandon, answer — so nothing here parks
+// and the whole case is one thread.
 
 import sos.{System, Process, Waiter, PipeInlet, PipeOutlet, PipeReply,
-            PipeRequest, SosStatus, PIPE_BODY_BYTES}
+            PipeRequest, ReplyWaitError, SosStatus, PIPE_BODY_BYTES}
 
+static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
 /// One byte each way.
@@ -41,6 +63,8 @@ func _start(boot_handle: UInt) {
         return
     }
 
+    // EMPTY, AND IT STAYS EMPTY. Nothing is ever attached to it — see the
+    // header: a park on this Waiter is the failure this case is shaped to catch.
     let waiter = try proc.waiter_create() catch {
         print("SOS replywaitdead: no waiter: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -81,22 +105,45 @@ func _start(boot_handle: UInt) {
     }
     var obligation = move request
 
-    // THE FIRST USE. It consumes the entry, and the wrapper disarms itself
-    // before the trap, so `obligation` is a husk from here on.
-    try obligation.reply(body: &msg, len: PAYLOAD_LEN) catch {
-        print("SOS replywaitdead: reply failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
+    // **DROP IS THE CANCELLATION.** There is no `cancel()` verb: releasing the
+    // claim is the whole of saying "never mind", and deterministic destruction is
+    // what makes the timing of the signal deterministic too. The server has
+    // already taken the message, so this is a client that gave up mid-exchange.
+    let _ = move claim
+    let _ = system.debug_print("SOS replywaitdead: the client let its claim go\n")
+
+    // THE FUSED ANSWER, INTO NOBODY. The reply leg cannot land, so the op comes
+    // straight back and the wait leg never runs — which is why the empty Waiter
+    // above is harmless and why an abandoned exchange cannot stall a loop.
+    match (move obligation).reply_wait(body: &msg, len: PAYLOAD_LEN,
+                                       waiter: &waiter) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS replywaitdead: a reply landed on nobody\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        case Err(e) -> {
+            // THE ERROR RENDERS ITSELF, leg and status both, out of the two
+            // enums' own `describe` arms — so a case added to either without a
+            // describe would not compile, and a renumbering of the wire table
+            // would not move this transcript. The `match` is here to ASSERT
+            // WHICH LEG, not to build the words.
+            match e {
+                case Reply(_) -> {
+                    print("SOS replywaitdead: reply_wait says {}\n", e)
+                },
+                // THE WRONG LEG WOULD MEAN THE REPLY LANDED, which is the one
+                // thing an abandoned claim rules out — so it is a failure and
+                // not another arm of the same story.
+                case Wait(_) -> {
+                    print("SOS replywaitdead: the WAIT leg answered: {}\n", e)
+                    let _ = system.shutdown(EXIT_FAILED)
+                    return
+                },
+            }
+        },
     }
-    let _ = system.debug_print("SOS replywaitdead: discharged the obligation\n")
 
-    // THE SECOND USE, through the spent value. `reply_wait` reads the husk's
-    // `NO_HANDLE` and hands it to the kernel, which resolves it to nothing and
-    // ends this process — the ordinary `BadHandle` fault, raised in the
-    // dispatch before any pipe op runs.
-    let _ = obligation.reply_wait(body: &msg, len: PAYLOAD_LEN, waiter: &waiter)
-
-    // UNREACHABLE: the line above does not return.
-    let _ = system.debug_print("SOS replywaitdead: a spent obligation waited\n")
-    let _ = system.shutdown(EXIT_FAILED)
+    let _ = system.debug_print("SOS replywaitdead: done\n")
+    let _ = system.shutdown(EXIT_OK)
 }

@@ -22,6 +22,17 @@
 // It is also why `pipe-abandon` cannot show "nothing un-closes" the way
 // `pipe-peer-gone` does: a connection's `PeerClosed` is a LEVEL a caller may
 // re-read for ever, and an exchange's is the end of that exchange.
+//
+// **AND SINCE SL-16 THIS IS THE ONLY PLACE IN THE SUITE THAT CAN SHOW THE FAULT
+// FROM SAW.** `reply` and `reply_wait` became `consumes` methods at sawc 0.4.0,
+// so a second use through either is refused by the compiler and
+// `pipe-reply-wait-dead`, which used to prove the same fault on the server side,
+// had to be retargeted. `resolve` could not follow them: an `Ok(None)` poll
+// consumes nothing, and an effect that consumes on every path would spend a live
+// claim the first time the answer had not arrived yet. So the claim side keeps
+// its `&var self` receiver, keeps its answer-decided disarm, and keeps this
+// case — which is now carrying the whole demonstration that the ledger is real
+// underneath the wrapper.
 
 import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
             SosStatus, PIPE_BODY_BYTES}
@@ -73,7 +84,7 @@ func _start(boot_handle: UInt) {
     var obligation = move request
 
     msg[0] = 43
-    try obligation.reply(body: &msg, len: 1) catch {
+    try (move obligation).reply(body: &msg, len: 1) catch {
         print("SOS deadclaim: reply failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
