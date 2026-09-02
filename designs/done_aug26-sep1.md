@@ -845,3 +845,37 @@ repo's first done file; sawos was born Aug 28 (sawlang#238).
   the ruled refusal AND the moveless second face; pipe-send-exit
   proves the capability-survives-sender guarantee with an asserted
   teardown count.
+
+- 2. ~~design 22 — the one-shot discipline (M4 unit 4.5)~~ **CLOSED
+  Sep 2 — all three parts of #10 ruling 12 landed, gate green on both
+  arches (113 cases per arch, 226 passed).** (a) THE POLL SPLIT IS RETIRED:
+  `take -> Result<(PipeMsg, PipeRequest), _>` and
+  `post`/`post_with -> Result<PipeReply, _>`, `polled_value` retired,
+  `polled_ok` survives as `ready()`'s decode, floor banner rewritten
+  with the `Channel.try_receive` divergence recorded at the seam; ~60
+  call sites swept, three genuine pollers keep a `WouldBlock` arm.
+  (b) `PipeReplyOp.Resolve` PARKS when pending and consumes on every
+  path, so `PipeReply.resolve` carries `consumes` and call sites spell
+  `(move claim).resolve()`; new `PipeReplyOp.Ready = 1` gated on
+  `PipeReplyRight.Wait`, typed `PipeReply.ready(&self)`. The park
+  needed NO new wake or teardown machinery — `park_resolve` is
+  `consume_entry` minus the unref, so `notify_claim`,
+  `wake_call_reply` and `release_pending_calls` serve both parked
+  shapes unchanged. (c) `Mint` left `pipe_reply_rights()` and
+  `pipe_request_rights()`; enum bits and static_asserts untouched.
+  New cases `pipe_resolve_park` (post+resolve = 2 traps against
+  `Call`'s 1) and `pipe_resolve_orphan` (the `end_process` mirror at a
+  handle-backed claim); `pipe_dead_claim` and `pipe_no_reply`
+  retargeted. Docs: spec.md §2's Pipe row, §2.1's resolve line, the
+  §5-era row and the `consumes`-funnel paragraph; design 13 D-2 and
+  design 14's `Resolve`, `Mint` and consumed-handle notes carry
+  re-rule pointers. As-built in `designs/022-one-shot-discipline.md`.
+  ONE ITEM OPENED, filed in [BACKLOG]: the `PipeRequestRight.Reply`
+  gate lost its only test.
+  INTEGRATED to main Sep 2 2026 (lead-reviewed; the one deviation —
+  mint-refusal at resolve consumes, on wake_call_reply's precedent —
+  accepted on merits; lead gate re-run green 226/113-per-arch at
+  3f664d7, sawlang HEAD 46eebb36 unchanged both ends; fast-forward
+  3f664d7; the entry's gate line corrected by the lead from the
+  agent's "114 cases, 228 assertions" overclaim to the gate's
+  printed 113/226).
