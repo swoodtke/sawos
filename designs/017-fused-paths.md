@@ -459,7 +459,7 @@ vs the gate, ANSI stripped and bucketed mechanically (case rows
 | authorized-with-cause | 88 image rows, riscv32, **+48 or +64 each** | every riscv32 image that links `sos`: 46 by +48 and 42 by +64. The cause is the two new `@export`ed seams (`sos_pipe_inlet_call`, `sos_pipe_request_reply_wait`) — an exported symbol cannot be dead-stripped, so a package that never calls either still carries the stubs — plus `sosabi`'s two new op cases and the reply-wait record. The two-valued split tracks alignment, not two causes: every image took the same code and landed on one of two padding boundaries |
 | authorized-with-cause | 2 image rows, arm64, +4096 | `pipe-send-manual` and `process-stats`, one page each. The same growth lands on every arm64 image and is absorbed by 4 KiB granularity everywhere else; these two are the packages whose growth crossed a boundary |
 | authorized-with-cause | 1 image row, riscv32, +6160 | `pipe-send-manual`'s own code: the second measured window, the fused call, the two new prints |
-| authorized-with-cause | 1 image row, riscv32, **-760** — THE ONLY SHRINK | `child-server`, and it was DECOMPOSED rather than assumed. Three controlled builds against the same kernel: the baseline source is 21808, the loop change alone gives 21736 (**-72** — persistent attach and a two-turn loop), and moving the one `replied` line from `System.debug_print(String)` to freestanding `print` gives 21000 (**-736**). So the row moved for the child's own source and the kernel growth contributed the same **+48** every other riscv32 image took. See finding 3 |
+| authorized-with-cause | 1 image row, riscv32, **-744** — THE ONLY SHRINK | `child-server`, and it was DECOMPOSED rather than assumed. Controlled builds against the SAME kernel: baseline source 21808, the loop change alone 21736 (**-72** — persistent attach and a two-turn loop), the landed source 21016 (**-720** — moving the one `replied` line from `System.debug_print(String)` to freestanding `print`). Baseline was 21760, so the kernel growth contributed the same **+48** every other riscv32 image took and the child's own source is worth **-792**. See finding 3 |
 | address-only | 0 | nothing printed an address that moved |
 | documented-nondeterministic | 0 | none met |
 | new | 12 case rows + 18 image rows | the six cases and nine packages, on both profiles |
@@ -496,7 +496,7 @@ Every string in that list is byte-identical; two moved and two are new.
    treatment. Both are the same shape and route into one resume, so the
    property the rider wanted (not a second wake protocol) holds; what grew is
    the number of levels a thread can be tied to, from one to two.
-3. **A CONSOLE LINE COSTS 736 BYTES MORE THROUGH `System.debug_print` THAN
+3. **A CONSOLE LINE COSTS 720 BYTES MORE THROUGH `System.debug_print` THAN
    THROUGH `print`, ON RISCV32.** Measured, not inferred (see the accounting's
    shrink row). Design 16 finding 1 recorded the print seam as the dominant
    SYSCALL cost; this is the same seam showing up as IMAGE SIZE, and in the
