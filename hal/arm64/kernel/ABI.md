@@ -1,10 +1,10 @@
 # arm64 kernel HAL — the seam
 
 What the SOS kernel needs from its architecture, and nothing more. This
-directory implements the same list `sos/hal/riscv32/kernel/ABI.md` states, for
+directory implements the same list `hal/riscv32/kernel/ABI.md` states, for
 Profile B (spec §5b): kernel at EL1, processes at EL0, QEMU `virt` with
 `-cpu cortex-a53`. The kernel above it does not change, and
-`tools/sos_runner.py` proves that by scanning `sos/kernel/core/` for
+`tools/sos_runner.py` proves that by scanning `kernel/core/` for
 architecture names and failing the run if it finds one.
 
 The seam has two halves. The SAW half (`lib.saw`) is the module the kernel
@@ -159,7 +159,7 @@ built in assembly, entered once, with no storage a second thread could have had.
   table-filling loop faulted before this line existed. Design 172 unit 7 made
   the freestanding profile imply `-neon,-fp-armv8` on aarch64, which took the
   Saw half from five SIMD instructions to zero — so the boot line is no longer
-  there for Saw's sake. It stays because `sos/rt/common_c/support.c` is
+  there for Saw's sake. It stays because `rt/common_c/support.c` is
   PERMANENTLY C (its `memcpy` is the loop-idiom self-recursion case) and
   compiles to 16 SIMD references at `-O2`. Removing it needs
   `-mgeneral-regs-only` on every aarch64 C compile, which means a Blade manifest
@@ -221,7 +221,7 @@ built in assembly, entered once, with no storage a second thread could have had.
   tick and the Timer objects share `cntp_cval_el0`, and the sharing is the
   KERNEL's arithmetic, not this HAL's: the seam is `timer_now_ns()` +
   `timer_set_deadline_ns(at)` — a counter read and an absolute deadline — and
-  `sos/kernel/core/` programs the earliest deadline it owes anybody. What this
+  `kernel/core/` programs the earliest deadline it owes anybody. What this
   machine does with such a deadline: converts nanoseconds to counter units at
   `cntfrq_el0` (62.5 MHz under QEMU, so 16 ns a unit), rounding UP so a deadline
   never fires early; writes `cntp_cval_el0` BEFORE enabling, so a stale compare

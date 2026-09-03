@@ -1,13 +1,16 @@
 # SawOS
 
 SawOS (SOS) is a capability-based microkernel for embedded systems. It runs
-on riscv32 and arm64, today on QEMU's `virt` boards, with real hardware as
-the goal.
+on riscv32 and arm64 — the gate is QEMU's `virt` boards for both, and there
+is a non-gating smoke target for the ESP32-C3 — with real hardware as the
+goal.
 
 Every kernel resource is an object reached through a handle that carries
-rights: processes, threads, events, IRQ lines, clocks, and timers. A process
-holds handles, not addresses; the kernel checks the rights on every
-operation. Userspace enters through a typed `sos` module rather than raw
+rights: processes, threads, memory regions and their mappings, events, IRQ
+lines, clocks, timers, and the two ends of a pipe. A process holds handles,
+not addresses; the kernel checks the rights on every operation. Processes
+talk over pipes — bounded synchronous messages with request/reply built in,
+carrying handles as well as bytes, so a capability can be sent. Userspace enters through a typed `sos` module rather than raw
 syscall numbers, so the numbers are not ABI and can change without breaking
 programs (`spec.md` §5.7).
 
@@ -35,7 +38,7 @@ SAWLANG_ROOT=/path/to/sawlang make sos-test
 
 This builds the kernel and the root server, stitches the boot image, and
 boots both architectures under QEMU, asserting each console transcript and
-exit status. 40 cases per architecture.
+exit status. 116 cases per architecture, 232 runs.
 
 ## Layout
 
@@ -43,7 +46,10 @@ exit status. 40 cases per architecture.
 kernel/     the arch-free kernel: drivers, trap handling, object dispatch
 kernel/abi/     op numbers, rights, statuses (kernel-internal)
 kernel/sysapi/  the public `sos` module userspace compiles against
-hal/riscv32/, hal/arm64/   per-architecture boot, trap entry, linking
+hal/arm64/      the arm64 architecture and board: boot, trap entry, linking
+hal/riscv32-common/  the riscv32 architecture, shared by its boards
+hal/riscv32/         the riscv32 `virt` board
+hal/riscv32-esp32c3/ the ESP32-C3 board (smoke target, not part of sos-test)
 rt/         the runtime the kernel and every process share
 root/       the root server, a normal package emitting a boot image
 tests/      kernel test entries and hand-assembled payloads

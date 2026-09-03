@@ -16,12 +16,12 @@
 // moved them: they name no architecture — a byte reaches the console through a
 // System op, which is the same op on both profiles — so two per-arch C copies
 // were two copies of one thing. They are one arch-free Saw module now, in
-// `sos/kernel/sysapi/`, beside the System object whose authority they use.
+// `kernel/sysapi/`, beside the System object whose authority they use.
 //
-// `sos/hal/arm64/kernel/` is the kernel's counterpart; `sos/hal/riscv32/user/`
+// `hal/arm64/kernel/` is the kernel's counterpart; `hal/riscv32/user/`
 // is this file for Profile A, and is now the same six lines.
 //
-// ABI (sos/spec.md §5.7): x0 = HANDLE, x8 = OP, args x1-x5, `svc #0`; returns
+// ABI (spec.md §5.7): x0 = HANDLE, x8 = OP, args x1-x5, `svc #0`; returns
 // x0 = status word, x1 = value. Every syscall is an object op, so there is no
 // form of this that does not take a handle.
 //

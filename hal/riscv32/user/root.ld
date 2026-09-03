@@ -2,7 +2,7 @@
  *
  * Root is loaded by the kernel at a FIXED address: there is no relocation and
  * no MMU on this profile, so the addresses here and the root-region constants
- * in sos/kernel/core/lib.saw are one decision recorded twice. The kernel
+ * in kernel/core/lib.saw are one decision recorded twice. The kernel
  * validates every segment against the region and rejects an image that does
  * not fit, so a mismatch is a clean diagnostic rather than a corrupted kernel.
  *

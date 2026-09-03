@@ -3,7 +3,7 @@
 // EVERY LINE IN THIS FILE IS C FOR ONE OF TWO REASONS, and both are PERMANENT.
 // Nothing here is waiting on a language feature; when this file was written it
 // also held a bump arena and the four `__saw_rt_*` seams, and design 172 part 2
-// moved those to Saw (`sos/rt/common/src/lib.saw`), which is what leaves the
+// moved those to Saw (`rt/common/src/lib.saw`), which is what leaves the
 // two reasons below as the whole story.
 //
 //  1. mem* : a byte-copy loop written in Saw is exactly the pattern LLVM's
@@ -22,7 +22,7 @@
 // per-side hooks it used to be written against — `sos_rt_write` and
 // `sos_rt_abort`, where a byte goes and how the machine stops — are still the
 // system's one runtime seam; they are just Saw on both ends now. See
-// `sos/rt/common/src/lib.saw` for that contract, and `sos/spec.md` §5c for the
+// `rt/common/src/lib.saw` for that contract, and `spec.md` §5c for the
 // C floor as a whole.
 //
 // What design 172 moved out of the SOS C layer over its two parts: the board

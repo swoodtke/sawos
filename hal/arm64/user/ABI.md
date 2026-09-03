@@ -1,21 +1,21 @@
 # arm64 user HAL — the seam
 
 The entire architecture-dependent surface of an SOS process on Profile B: ONE
-symbol. `sos/root/src/` builds for both profiles with only its manifest changing
+symbol. `root/src/` builds for both profiles with only its manifest changing
 — design 162 is the milestone that proved it rather than claiming it.
 
 Design 172 part 2 shrank this from four symbols to one, for the reason set out
-in `sos/hal/riscv32/user/ABI.md`: the three that left named no architecture, so
+in `hal/riscv32/user/ABI.md`: the three that left named no architecture, so
 two per-arch C copies were two copies of one thing. They are Saw now, once, in
-`sos/kernel/sysapi/`.
+`kernel/sysapi/`.
 
 ## Which altitude is supported for whom
 
-Unchanged from `sos/hal/riscv32/user/ABI.md`: typed Saw (`system.shutdown(0)`)
+Unchanged from `hal/riscv32/user/ABI.md`: typed Saw (`system.shutdown(0)`)
 for Saw processes, typed C (`sos_system_shutdown(h, 0)`) for other languages,
 and the raw `sos_syscall1` / `sos_syscall3` for the HAL and the kernel package
 only.
-The first two are the kernel package's (`sos/kernel/sysapi/`), not this
+The first two are the kernel package's (`kernel/sysapi/`), not this
 directory's; this directory supplies only the bottom of the chain. The typed C
 row's in-tree caller went away with the C sinks — see DF-172i, recorded there.
 
@@ -34,7 +34,7 @@ contract as the riscv32 twin, which states the reasoning.
 
 The runtime's two hooks (`sos_rt_write`, `sos_rt_abort`) and the parked boot
 handle are still part of a process's contract; they are just not this
-directory's any more. See `sos/kernel/sysapi/src/lib.saw`.
+directory's any more. See `kernel/sysapi/src/lib.saw`.
 
 ## Required of a process
 
@@ -42,7 +42,7 @@ directory's any more. See `sos/kernel/sysapi/src/lib.saw`.
   it in x0 before `eret`ing to EL0, so a Saw
   `@export("_start") func _start(boot_handle: UInt)` receives it directly.
 
-## The syscall ABI (sos/spec.md §5.7)
+## The syscall ABI (spec.md §5.7)
 
 Every syscall is an object op — there are no bare numbered syscalls.
 
@@ -64,7 +64,7 @@ A DRIVER PROCESS REACHES ITS DEVICE DIRECTLY, through no stub in this directory
 and no op in the kernel's fast path. From then on the register block is ordinary
 memory to that process, and the driver is the design-112 MMIO idiom in plain
 process Saw (`UnsafeMemory<Regs, Device>` over a register-block struct).
-`sos/tests/uart-echo-pl011/` is the worked example. **WHAT CHANGED IN M3 unit 4
+`tests/uart-echo-pl011/` is the worked example. **WHAT CHANGED IN M3 unit 4
 IS HOW THE WINDOW ARRIVES** (sawos design 6 D-6).
 
 **NOW — OBTAINED.** The build publishes a DEVICE row in the boot region table,

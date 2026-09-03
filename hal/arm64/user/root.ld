@@ -2,7 +2,7 @@
  *
  * Root is loaded by the kernel at a FIXED address: the kernel's map is a static
  * identity map, so the addresses here and the root-region constants in
- * `sos/hal/arm64/kernel/lib.saw` are one decision recorded twice. The kernel
+ * `hal/arm64/kernel/lib.saw` are one decision recorded twice. The kernel
  * validates every segment against the region and rejects an image that does not
  * fit, so a mismatch is a clean diagnostic rather than a corrupted kernel.
  *

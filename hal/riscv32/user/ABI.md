@@ -1,7 +1,7 @@
 # riscv32 user HAL — the seam
 
 The entire architecture-dependent surface of an SOS process: ONE symbol.
-`sos/root/src/` builds for arm64 with only the manifest's `[sos] native` line
+`root/src/` builds for arm64 with only the manifest's `[sos] native` line
 changing, and that line names one C file holding one function.
 
 **WHERE THAT FILE LIVES, SINCE DESIGN 23: `hal/riscv32-common/user/syscall.c`.**
@@ -16,14 +16,14 @@ Design 172 part 2 shrank this from four symbols to one. The three that left —
 `sos_set_system_handle`, `sos_rt_write` and `sos_rt_abort` — named no
 architecture: a byte reaches the console through a System op, which is the same
 op on both profiles, so two per-arch C copies were two copies of one thing. They
-are Saw now, once, in `sos/kernel/sysapi/`, beside the System object whose
+are Saw now, once, in `kernel/sysapi/`, beside the System object whose
 authority they use. What kept them here was DF-172e (a `noreturn` panic sink Saw
 could not type), which design 177 closed.
 
 ## Which altitude is supported for whom
 
 There are three ways to reach the kernel and they are ONE implementation chain,
-not three (sos/spec.md §5.7):
+not three (spec.md §5.7):
 
 | Altitude | Spelling | For |
 |---|---|---|
@@ -31,7 +31,7 @@ not three (sos/spec.md §5.7):
 | typed C | `sos_system_shutdown(h, 0)` | **Non-Saw languages.** One `@export`ed function per op, named for the op; still no number. |
 | raw | `sos_syscall1(h, op, a)` / `sos_syscall3(h, op, a, b, c, &v)` | **The HAL and the kernel package only.** They take an op NUMBER, which is the thing the arrangement above exists to keep out of callers. Not a supported application interface. |
 
-The first two are the kernel package's (`sos/kernel/sysapi/`), not this
+The first two are the kernel package's (`kernel/sysapi/`), not this
 directory's. This directory supplies only the bottom of the chain: the one
 instruction that crosses the trap boundary. No op number appears in this HAL.
 
@@ -59,8 +59,8 @@ made this file grow with the object model.
 
 The runtime's two hooks (`sos_rt_write`, `sos_rt_abort`) and the parked boot
 handle are still part of a process's contract; they are just not this
-directory's any more. See `sos/kernel/sysapi/src/lib.saw`, and
-`sos/rt/common/src/lib.saw` for what calls them.
+directory's any more. See `kernel/sysapi/src/lib.saw`, and
+`rt/common/src/lib.saw` for what calls them.
 
 ## Required of a process
 
@@ -68,7 +68,7 @@ directory's any more. See `sos/kernel/sysapi/src/lib.saw`, and
   it in the first argument register before entering user mode, so a Saw
   `@export("_start") func _start(boot_handle: UInt)` receives it directly.
 
-## The syscall ABI (sos/spec.md §5.7)
+## The syscall ABI (spec.md §5.7)
 
 Every syscall is an object op — there are no bare numbered syscalls.
 
@@ -90,7 +90,7 @@ A DRIVER PROCESS REACHES ITS DEVICE DIRECTLY, through no stub in this directory
 and no op in the kernel's fast path. From the driver's side the device is
 ordinary memory and the code is the design-112 MMIO idiom in plain process Saw
 (`UnsafeMemory<Regs, Device>` over a register-block struct);
-`sos/tests/uart-echo-ns16550/` is the worked example. **WHAT CHANGED IN M3 unit
+`tests/uart-echo-ns16550/` is the worked example. **WHAT CHANGED IN M3 unit
 4 IS HOW THE WINDOW ARRIVES** (sawos design 6 D-6).
 
 **NOW — OBTAINED.** The build publishes a DEVICE row in the boot region table,

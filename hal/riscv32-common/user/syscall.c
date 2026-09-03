@@ -22,13 +22,13 @@
 // moved them: they name no architecture — a byte reaches the console through a
 // System op, which is the same op on both profiles — so two per-arch C copies
 // were two copies of one thing. They are one arch-free Saw module now, in
-// `sos/kernel/sysapi/`, beside the System object whose authority they use.
+// `kernel/sysapi/`, beside the System object whose authority they use.
 //
 // `../kernel/sink.c` beside this file is the kernel's counterpart, shared the
-// same way; `sos/hal/arm64/user/` is this file for Profile B, and is now the
+// same way; `hal/arm64/user/` is this file for Profile B, and is now the
 // same six lines.
 //
-// ABI (sos/spec.md §5.7): a0 = HANDLE, a7 = OP, args a1-a5, `ecall`; returns
+// ABI (spec.md §5.7): a0 = HANDLE, a7 = OP, args a1-a5, `ecall`; returns
 // a0 = status word, a1 = value. Every syscall is an object op, so there is no
 // form of this that does not take a handle.
 

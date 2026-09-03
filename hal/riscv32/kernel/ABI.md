@@ -1,9 +1,9 @@
 # riscv32 kernel HAL — the seam
 
 What the SOS kernel needs from its architecture, and nothing more.
-`sos/hal/arm64/kernel/` implements the same list for Profile B; the kernel
+`hal/arm64/kernel/` implements the same list for Profile B; the kernel
 above it does not change, and `tools/sos_runner.py` proves that by scanning
-`sos/kernel/core/` for architecture names and failing the run if it finds one.
+`kernel/core/` for architecture names and failing the run if it finds one.
 
 The seam has two halves. The SAW half (`lib.saw`) is the module the kernel
 imports as `hal` — it is the surface, and it is where the arch-free vocabulary
@@ -103,7 +103,7 @@ Thread and resumes its frame.
 ## Interrupts (design 178 M2 unit 1)
 
 The same list again, for the half of the seam that arrived with M2. It is stated
-separately only because it is new; `sos/hal/arm64/kernel/` implements every row.
+separately only because it is new; `hal/arm64/kernel/` implements every row.
 
 | Name | Contract |
 |---|---|
@@ -188,10 +188,10 @@ now check-free by construction so the panic path cannot re-enter it),
 Nothing in this directory is an application interface. It is the kernel's own
 platform layer: the kernel calls it, and a process never can (every symbol here
 lives in M-mode code a process holds no grant for). The three-altitude question
-belongs to the USER seam — see `sos/hal/riscv32/user/ABI.md`.
+belongs to the USER seam — see `hal/riscv32/user/ABI.md`.
 
 The one thing worth stating in both places: the op NUMBERS the trap handler
-dispatches on come from `sos/kernel/abi/`, which the exported `sos` module
+dispatches on come from `kernel/abi/`, which the exported `sos` module
 imports too. The dispatch and the wrappers are the two halves of one contract,
 and they are compiled from one definition so they cannot skew.
 
@@ -264,7 +264,7 @@ and they are compiled from one definition so they cannot skew.
   the Timer objects share `mtimecmp`, and the sharing is the KERNEL's
   arithmetic, not this HAL's: the seam is `timer_now_ns()` +
   `timer_set_deadline_ns(at)` — a counter read and an absolute deadline — and
-  `sos/kernel/core/` programs the earliest deadline it owes anybody. What this
+  `kernel/core/` programs the earliest deadline it owes anybody. What this
   machine does with such a deadline: converts nanoseconds to counter units at
   the board's 10 MHz timebase (100 ns a unit, which divides exactly), rounding
   UP so a deadline never fires early, and writes the comparator through the

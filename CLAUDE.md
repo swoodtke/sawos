@@ -12,8 +12,18 @@ kernel/            # main.saw + core/lib.saw — the module every kernel image
 kernel/abi/        # KERNEL-INTERNAL: every op number/right/status, one place
 kernel/sysapi/     # the PUBLIC `sos` module exported to userspace (vDSO
                    # discipline: numbers are not ABI)
-hal/riscv32/       # per-arch: kernel/ (boot.S, trap entry, board sinks, PMP,
-hal/arm64/         # virt.ld) + user/ (the ecall stub + root.ld), ABI.md each
+hal/arm64/         # one directory, arch + board: kernel/ (boot.S with the
+                   # vectors, sink.c, lib.saw, virt.ld) + user/ (the svc stub
+                   # + root.ld/child*.ld), ABI.md each
+hal/riscv32-common/  # SPLIT ARCH/BOARD since design 23 — the ARCH half both
+                   # riscv32 boards import as the `rv32core` module: kernel/
+                   # (trap.S, sink.c, lib.saw = trap frame, PMP, ktrap seam)
+                   # + user/ (the ecall stub); see its README.md
+hal/riscv32/       # the riscv32 `virt` BOARD: kernel/ (boot.S, lib.saw =
+                   # the `hal` facade re-exporting rv32core, virt.ld, ABI.md)
+                   # + user/ (root.ld, child*.ld, ABI.md)
+hal/riscv32-esp32c3/ # the ESP32-C3 BOARD, same shape (design 20) — reached
+                   # only by `make sos-smoke-esp32c3`, never by sos-test
 rt/common/         # `sosrt`: the SOS runtime, arch-free + role-free Saw
 rt/common_c/       # support.c — mem* + atomic libcalls, ONE copy
 root/              # the root server: a real Blade package, sosimg emit

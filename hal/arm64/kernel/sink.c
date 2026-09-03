@@ -17,7 +17,7 @@
 // hex formatting. `boot.S` beside this file is the vectors and the privilege
 // transitions; `lib.saw` is the Saw surface the kernel imports.
 //
-// `sos/hal/arm64/user/` is the process-side counterpart.
+// `hal/arm64/user/` is the process-side counterpart.
 
 typedef unsigned long u64;
 typedef unsigned int  u32;
