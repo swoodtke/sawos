@@ -31,46 +31,6 @@ entry below or the brief that carries it, never restating either.
   config; direct boot; RV32IMC no-A; non-gating, machine-local QEMU)
   [brief user-reviewed Sep 2; agent IN FLIGHT (worktree off ca60dd2
   — second-lander, rebases onto new main at its integration)]. AND:
-- 4. M4 unit 5 — the money shot [#10 agenda 7a; design 21
-  (021-uart-service.md) USER-REVIEWED Sep 2 with the multi-client
-  amendment (root retains a sibling inlet, two clients in
-  deterministic phases) and MAX_PROCESSES RULED to 3].
-  **CLOSED Sep 2 — BUILT AS BRIEFED, no deviation from the ruled
-  surface.** Gate green on both arches: 116 cases each, 232 assertions.
-  WHAT LANDED: `MAX_PROCESSES` 2 -> 3 (the whole kernel delta — one
-  line, plus doc-block sweeps at `limits.saw`, three `sched.saw`
-  invariant notes and spec §2's Process row); `tests/uartproto`, a
-  LIBRARY package holding the /dev/uart0 protocol one declaration both
-  halves compile against; `svc-uart-ns16550` / `svc-uart-pl011`, the
-  M3 driver child grown a completion-queue server face (outlet given
-  to its Waiter, IRQ beside it on the same Waiter, held obligations
-  watched for abandonment); `svc-client`, a process that reads the
-  console holding no device authority at all; `uart-service` (root
-  wires both children and is a THIRD client through a minted sibling
-  inlet), `uart-cancel`, `delegate-3p` + `child-forward` +
-  `child-far`; `hal/{riscv32,arm64}/user/child2.ld`, because unit 5 is
-  the first case in the tree with two children alive at once. FIVE new
-  case entries, three reaching each arch (113 -> 116 per arch, 226 ->
-  232). ROW CENSUS AT PEAK WIRING: root spends 3 protection rows and
-  needs no more — `process_create` reads a child's image with kernel
-  privilege and a launcher maps nothing — so the squeeze is the HANDLE
-  table rather than the grant record; counted call by call, peak 11 of
-  16 with the boot Memory wrappers released after the creates, 15
-  without them. TRAP ACCOUNTING, measured at both ends and it moved the
-  ladder's headline: one trap per message the server ANSWERS and TWO
-  per message it DISCARDS, because a TELL owes no reply and the
-  obligation it minted must still be released — the client pays the
-  same two for the same reason, so a one-way message buys latency
-  rather than syscalls. TWO EXISTING CASES ADAPTED, asserted rows
-  unchanged: `process-reclaim` and `death-late-attach` each create one
-  unstarted FILLER process, because both ask whether a slot is
-  available and that question needs a full table. As-built in
-  `designs/021-uart-service.md`. NO NEW SAWLANG DEFICIENCY: the two
-  walls this unit met are SECOND SITES of SL-13 (a `&var [T; N]`
-  parameter's elements are not assignable — the protocol's request
-  buffer is a one-field struct because of it) and SL-8/DF-172d (a
-  wrapped binary expression is two statements), both noted at their
-  entries below.
 ## [BACKLOG] — filed, not scheduled
 
 - **`PipeRequestRight.Reply` HAS NO TEST ANY MORE** [#22 As-built
