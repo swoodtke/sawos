@@ -88,6 +88,29 @@ alone before the semantics move:
   shared regions may sit at per-process VAs, amending §2.5's
   "shared at its own address" sentence to tier vocabulary. This is
   also the step vDSO true-mapping actually wants.
+  **RULED IN AS UNIT 1.5 (user, Sep 3): the HIGHER-HALF KERNEL +
+  THE LINMAP SEAM.** Relink the arm64 kernel high under TTBR1 so
+  TTBR0 is purely the user's, with a LINEAR MAP of all RAM (Normal)
+  and the board's usable MMIO (Device) at a fixed offset — both
+  halves of the user's proposal, taken together. The discipline
+  that makes it cheap: **addresses-as-data stay PHYSICAL
+  everywhere** (GrantRows, sosimg records, boot-handle records,
+  Memory capabilities unchanged); only the moment of kernel
+  DEREFERENCE converts, through one seam pair —
+  `hal.phys_to_virt`/`virt_to_phys`, an OR/AND on MMU machines and
+  the bare address on MPU machines (compiles to nothing).
+  `kernel/core` stays arch-free. What it buys: unit 2 starts with
+  the whole low half belonging to userspace (today kernel text sits
+  inside the grant window, EL0-denied); the copy funnels' unit-2
+  shape (resolve user VA to PA via grant records, deref via linmap)
+  exists ahead of need; kernel tables exist once; the linmap goes
+  down PXN — a free W^X improvement. Sv32 (unit 3) inherits it
+  NEAR-FREE: riscv virt's RAM at 0x8000_0000 already sits in the
+  upper 2 GiB, so the kernel does not move and the seam is identity
+  there too. Remaining cost, contained: the boot.S MMU-off→jump-high
+  dance, the linker script, and a bounded sweep of kernel
+  UnsafeMemory-construction sites through the seam. Byte-identical
+  gate ambition — no user-visible address is a kernel address.
 
 **Proposed ruling: take both, in that order, as separate units.**
 Open sub-questions for the session: (a) does step two land in M5 or
@@ -228,7 +251,7 @@ it can ever be built. 010 ruling 10's seed graduates to a unit:
 | target | tier | slots/pages | RAM | notes |
 |---|---|---|---|---|
 | arm64 virt | 1 (MMU) | pages (4 MiB window today) | plenty | the first climb, in-tree |
-| riscv32 virt | 1 (Sv32) | pages | 128 MiB | the second climb, in-tree |
+| riscv32 virt | 2-shaped (PMP replay) | numbered regions | 128 MiB | Sv32 climb PUNTED (ruling 11) — stays the MPU-tier demonstration |
 | ESP32-P4 | 2 (MPU) | 32 PMP + 16 PMA, 128 B gran | 768 KB | first real tier-2 part; NO QEMU machine yet — a later board |
 | ESP32-C3 | 2, AT the floor twice | 16 PMP exactly | 400 KB < 445 KB image | XIP is the ENTRY PRICE, not a preference (design 20) |
 | ESP32-S3-class | 3 (flat) | WORLD0/1 only | — | Xtensa target = `--target` + esp-clang, not a new backend |
@@ -281,14 +304,26 @@ believes.
   Gate ambition: transcripts BYTE-IDENTICAL (the design-23 tradition
   — a mechanism swap the diff cannot see), plus the isolation proofs
   re-witnessed under the new mechanism.
+- **Unit 1.5 — the higher-half kernel + the linmap seam** (ruled in
+  Sep 3): arm64 relinks high under TTBR1; the linmap (RAM Normal +
+  MMIO Device, PXN) lands at a fixed offset; the
+  `phys_to_virt`/`virt_to_phys` seam pair arrives with identity
+  bodies on every other HAL; kernel UnsafeMemory sites sweep through
+  it. Byte-identical ambition. After unit 1 (it edits the same
+  tables), before unit 2 (which spends the freed low half).
 - **Unit 2 — placement.** D-1 step two on arm64: `map` answers, one
   link base, `child*.ld` and the runner arithmetic collapse, §5.5 +
   §2.5 amended to tier vocabulary. Transcript rows may move
-  (authorized by name here).
-- **Unit 3 — riscv32 Sv32.** Both steps at the other arch, `rv32core`
-  growing the paging half beside PMP (the C3 board keeps PMP —
-  design 23's split is what makes this a board-family fork rather
-  than a rewrite).
+  (authorized by name here). Starts from unit 1.5's clean low half;
+  the copy funnels resolve user VA→PA through grant records and
+  dereference through the linmap.
+- **Unit 3 — riscv32 Sv32: PUNTED TO BACKLOG (user, Sep 3 — ruling
+  11, superseding the Sep-2 "riscv Sv32 follows" clause).** The rung
+  vacates; numbering stands. riscv32-virt stays the MPU-tier
+  demonstration it already is, exercising the same seam every gate
+  run — the cross-check the doctrine needs, without a second MMU
+  arch. Unit 2's link-base collapse is arm64-only; riscv32 keeps
+  `child*.ld`, a living "identity is the tier-2 answer".
 - **Unit 4 — the tier word + the flat profile.** D-4's surface; a
   flat build profile of one virt board; the runner learns TIER-SORTED
   case lists (isolation proofs Isolated-only — design 19's "one
@@ -355,3 +390,22 @@ session pulls it in.
 9. **Unit 2's transcript moves: AUTHORIZED NOW, BY NAME** — this
    ruling is the authorization; unit 2's brief lists the exact rows
    before dispatch and the As-built diffs them.
+10. **Unit 1.5 RULED IN (user, Sep 3, post-session): the higher-half
+   kernel + the linmap seam** — the user's own proposal (map all RAM
+   and usable IO into the kernel at a fixed offset; phys↔virt is
+   bit arithmetic behind a HAL seam, bare on MPU machines). Slots
+   between isolation and placement; byte-identical ambition. Two
+   post-session seam rulings ride with it in this document: the
+   edit-pair collapse to `prot_switch`/`prot_update`/`prot_clear`
+   (perms 0 = revoke; clear kept as fail-closed domain retirement),
+   ruled the same day during unit 1's review.
+11. **Unit 3 (riscv32 Sv32) PUNTED TO BACKLOG (user, Sep 3),
+   superseding the Sep-2 seed ruling's "riscv Sv32 follows" clause.**
+   The reasoning, recorded: 32-bit VA scarcity makes placement a
+   genuinely different design (careful fitting vs 64-bit's
+   space-for-tables trade); no in-tree hardware target wants Sv32
+   (C3/P4 are M+U); a future riscv MMU target is likelier
+   rv64/Sv39, which inherits the 64-bit shape. Revisit trigger: a
+   real S-mode riscv target earning a HAL. The seam's cross-tier
+   honesty check stays live — riscv32-virt exercises it as the MPU
+   tier every gate run.

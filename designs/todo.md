@@ -22,10 +22,13 @@ entry below or the brief that carries it, never restating either.
 ## [QUEUE] — scheduled, in order (user-approved)
 
 - M5: the memory milestone — `designs/025` (RULED Sep 3, the plan of
-  record): tier climbs units 1→4 in order; allocator track 5→6→6b
-  arch-free, may pipeline in a parallel worktree; stats region 7;
-  docs sweep 8 closes; arena+kernel-stack unit slots at convenience.
-  Unit briefs dispatch from the sketch.
+  record; amended same day: unit 1.5 higher-half+linmap ruled IN,
+  unit 3 Sv32 punted to backlog): tier climbs 1→1.5→2→4 in order;
+  allocator track 5→6→6b arch-free, may pipeline in a parallel
+  worktree; stats region 7; docs sweep 8 closes; arena+kernel-stack
+  unit slots at convenience. Unit briefs dispatch from the sketch
+  (027 unit 1 MERGED; 028 unit 5 MERGED; 029 unit 1.5 + 032 unit 6
+  next to dispatch).
   **UNIT 1 BUILT (`designs/027`, Sep 3):** arm64 translation-as-isolation
   — per-process persistent table sets from a static HAL pool
   (`PROT_DOMAIN_SLOTS` 3 × 24 KiB, `.bss` +48 KiB measured), the switch
@@ -53,11 +56,31 @@ entry below or the brief that carries it, never restating either.
   consumers share that read, and the hardware revoke precedes
   `unref_region_row` because 028's "stopped granting before the range
   can be freed" argument rests on the row leaving the RECORD, which
-  stops nothing once the tables persist. Units 2→4 still open, so this
-  entry stays whole; its As-built findings ride there, one a warning for
+  stops nothing once the tables persist. INTEGRATED (lead, Sep 3, `215ba09`,
+  after design 28's `8f080c3`). Units 1.5→2→4 and 6→6b→7→8 still
+  open, so this entry stays whole; its As-built findings ride there, one a warning for
   unit 3 (the gate does not witness fault CLASS — see 027).
 
+- M6 (after M5): the storage milestone — seed `designs/030` (user-
+  ruled Sep 3): flash-first block driver, RO archive fs + a simple
+  tmpfs (the write path, same protocol), userspace loader, the
+  namespace as the protocol, and a simple UART shell (ls/read/write
+  builtins — poke at a running system). Scoping session at M5's
+  close.
+- M7 (after M6): the POSIX compatibility layer, toybox first — seed
+  `designs/031` (user-ruled Sep 3; the posix_spawn hinge). Scoping
+  session at M6's close.
+
 ## [BACKLOG] — filed, not scheduled
+
+- riscv32 Sv32 tier-1 climb — PUNTED from M5 [`designs/025` ruling
+  11, user, Sep 3]: 32-bit VA scarcity makes placement a genuinely
+  different design (careful fitting vs 64-bit's space-for-tables
+  trade); no in-tree hardware target wants Sv32 (C3/P4 are M+U); a
+  future riscv MMU target is likelier rv64/Sv39, inheriting the
+  64-bit shape. Revisit trigger: a real S-mode riscv target earning
+  a HAL. Design 029 carries the Sv32-stays-identity linmap note for
+  whoever picks it up.
 
 - **`PipeRequestRight.Reply` HAS NO TEST ANY MORE** [#22 As-built
   finding 1, Sep 2]. Ruling 12(c) took `Mint` out of
