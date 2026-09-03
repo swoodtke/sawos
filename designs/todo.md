@@ -45,9 +45,17 @@ entry below or the brief that carries it, never restating either.
   gain). Gate 232/232 both arches and RE-GATED 232/232 after the rework,
   transcript BYTE-IDENTICAL both times and hashing to the same
   `3f6dde15` design 24 recorded. riscv32 unchanged (two no-op bodies).
-  No SL entry owed. Units 2→4 still open, so this entry stays whole; its
-  As-built findings ride there, one a warning for unit 3 (the gate does
-  not witness fault CLASS — see 027).
+  No SL entry owed. **REBASED onto design 28 (`8f080c3`) and re-gated:
+  117 cases, 234/234, transcript hashing to `d37d2db` — the same hash
+  028's As-built records for main's own run, so the combined state adds
+  no rows.** The contact zone (`record_grant`/`remove_grant`/
+  `clear_domain`) resolved on ORDER: the row is read once and both
+  consumers share that read, and the hardware revoke precedes
+  `unref_region_row` because 028's "stopped granting before the range
+  can be freed" argument rests on the row leaving the RECORD, which
+  stops nothing once the tables persist. Units 2→4 still open, so this
+  entry stays whole; its As-built findings ride there, one a warning for
+  unit 3 (the gate does not witness fault CLASS — see 027).
 
 ## [BACKLOG] — filed, not scheduled
 

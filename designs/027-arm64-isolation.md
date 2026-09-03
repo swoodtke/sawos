@@ -360,6 +360,50 @@ the edit, instead of once per switch.
   `map_unmap` / `iomemory_carve` witness the revoke direction and the
   device window through the collapsed call.
 
+### Rebase onto design 28 (the allocator), Sep 3
+
+Design 28 merged to main (`8f080c3`) while this unit was in review, and
+its edits land in the same three functions. **One conflicting file,
+`kernel/core/process.saw`, three hunks** (`limits.saw` auto-merged; no
+other contact).
+
+What the contact zone actually required was ORDERING, and it turned up
+one thing worth recording rather than a mechanical merge:
+
+- **`remove_grant` — the row is now read ONCE.** Design 28 read
+  `grants[row].region` and this unit read the row for its bounds; the
+  merged body binds `let gone = PROCESSES[p].grants[row]` and both
+  consumers use that single read. The compaction underneath moves that
+  storage, so two reads would have been two reads of a row in motion.
+- **AND DESIGN 28'S OWN ORDERING ARGUMENT NEEDED THIS UNIT TO STAY
+  TRUE.** Its doc says the domain "has already stopped granting these
+  bytes at the moment they may go back on the pool's free list", and it
+  earns that by taking the ROW OUT OF THE RECORD before dropping the
+  count — which is sufficient exactly where the hardware image is
+  rebuilt from the record at the next switch. **On a tier whose tables
+  persist, the record no longer speaks for the hardware**, so the row
+  leaving it stops nothing; `prot_update(..., 0)` is what stops the
+  grant. It therefore had to precede `unref_region_row` rather than
+  merely the compaction — otherwise a `Split` could hand a freed range
+  to a new owner while the old owner's page table still reached it. The
+  same reasoning put `prot_clear` ahead of `clear_domain`'s unref walk.
+  Both call sites say so. This is the one place the two units are
+  genuinely load-bearing on each other, and it is a correctness
+  composition, not a merge artifact.
+- `record_grant` takes `ref_region_row(region)` before the hardware
+  edit, so the region is held before anything can reach the bytes.
+
+**Re-gate on the combined state: 117 cases, 234 passed across riscv32 +
+arm64**, transcript 487 lines hashing to
+`d37d2dbdd686fd573c6c57550f71c107eddcd3e4d8bffc75835f3665f764c8b2` —
+**exactly the hash design 28's own As-built records for main's 234-run**,
+so the rebased state reproduces main's transcript byte for byte and this
+unit adds no rows. Cross-checked the other way too: diffed against this
+unit's pre-rebase 232-run, and the only differences are the eight
+authorized allocator lines (two `memory_recycle` case rows, its two
+image sizes, `mapping-slot-free`'s two sizes, the total) plus the
+mechanical 116→117 renumbering. Nothing unexplained.
+
 ### Findings
 
 1. **No SL entry owed.** The language did not bite once in this unit —
