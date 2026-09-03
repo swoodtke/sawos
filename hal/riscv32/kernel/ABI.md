@@ -7,9 +7,20 @@ above it does not change, and `tools/sos_runner.py` proves that by scanning
 
 The seam has two halves. The SAW half (`lib.saw`) is the module the kernel
 imports as `hal` — it is the surface, and it is where the arch-free vocabulary
-above meets this machine's. The NATIVE half (`boot.S`, `sink.c`) is what Saw
-cannot express: a trap vector, a privilege transition, a CSR write whose
-operand must be an assembly-time immediate, and a linker symbol.
+above meets this machine's. The NATIVE half (`boot.S`, `trap.S`, `sink.c`) is
+what Saw cannot express: a trap vector, a privilege transition, a CSR write
+whose operand must be an assembly-time immediate, and a linker symbol.
+
+**DESIGN 23 SPLIT EACH HALF AGAIN, ALONG THE BOARD LINE, AND THIS DOCUMENT
+DESCRIBES THE SEAM RATHER THAN THE FILES.** The surface below is unchanged and
+is still reached as `hal.<name>`; what moved is where a declaration is written.
+Everything true of riscv32 rather than of QEMU `virt` — the trap frame, PMP, the
+cause decoding, the syscall accessors, the linker seams, the trap entry, the
+`ecall` stub — lives once in `hal/riscv32-common/` and is shared with
+`hal/riscv32-esp32c3`; `lib.saw` here re-exports it with a `public import`, so
+`kcore`'s view of `hal` is byte-for-byte what it was. The **Where** column of
+each table below says which file a name actually lives in. See
+`../../riscv32-common/README.md` for the rule that decides.
 
 Design 172 moved the line between them. `sink.c` was 135 lines and is 65: the
 NS16550A write loop, the finisher write that stops the machine, and all of the
@@ -135,21 +146,25 @@ and the exit-status promotion (`abort_status`) live there, once, for both
 profiles. What stays here is the DEVICE — `can_write` reads LSR bit 5, `put`
 stores to THR — and the mechanism that stops the machine.
 
-## The native half (`boot.S`, `sink.c`)
+## The native half (`boot.S`, `trap.S`, `sink.c`)
+
+The **Where** column names the file since design 23: `boot.S` is THIS
+board's, `trap.S` and `sink.c` are the shared riscv32 ones in
+`hal/riscv32-common/kernel/`.
 
 | Symbol | Where | Contract | Why not Saw |
 |---|---|---|---|
-| `_start` | boot.S | Reset entry. Sets up the stack, clears the mode witness, installs the trap vector, zeroes `.bss`, calls `kmain`. Never returns. | `csrw`, and a stack pointer before any compiled code can run. |
-| `trap_entry` | boot.S | Machine trap vector. Saves the U-mode context into the RUNNING THREAD'S 32-word frame, calls `ktrap(frame, cause, tval)` on the kernel stack, and resumes the frame `ktrap` RETURNS — which need not be the one it was called with, and that is the context switch. A trap taken in kernel mode goes to `kernel_fault` instead. | `csrrw` on `mscratch` as the mode witness, register saves, `mret`. |
-| `kernel_fault` | boot.S | A trap the kernel itself took. Writes the finisher with `mcause` in the code bits and stops the machine. Never returns, never hangs. | `csrr mcause` plus the finisher store, in the one path that must work with no assumptions about kernel state. |
-| `sos_resume_frame(frame)` | boot.S | Enter user mode in a saved context, behind `resume_frame`. Selects U-mode as the `mret` target with the global interrupt enable left clear (D2), then branches into the restore path above rather than repeating it. | `csrc` on `mstatus`, and a `mret` the restore path owns. |
-| `sos_pmpaddr_write(index, value)` | sink.c | Place a word in `pmpaddr<index>`, `index` 0..15. | The CSR NUMBER is an assembly-time immediate, so an indexed write is a switch. **SIXTEEN ARMS since M3 unit 4** (sawos design 6 D-4), which is every entry the part implements — so the budget above it is `lib.saw`'s decision alone and this is the last widening available. What a region MEANS is Saw (design 172 unit 1). |
-| `sos_mie_write(mask)` | sink.c | Place a word in `mie` — which CLASSES of interrupt may reach this hart. | `csrw` names its CSR. WHICH classes, and the shadow the mask is staged in, are Saw. Note what is absent: nothing here writes the GLOBAL enable, and that absence is design 178's D2. |
-| `sos_pmpcfg_write(w0, w1, w2, w3)` | sink.c | Publish all FOUR config registers together — entries 0-3, 4-7, 8-11, 12-15 (widened from two by sawos design 6 D-4). | Same: `csrw pmpcfg0` names its register. The config words are STAGED in Saw, in four shadow variables rather than an array, because a `static` is not an array element. |
-| `sos_payload_start()` / `sos_payload_end()` | sink.c | Bounds of the appended payload. | A linker symbol's ADDRESS, which Saw cannot name — DF-172a. |
-| `sos_region_table_start()` / `sos_region_table_end()` | sink.c | Bounds of the `.regions` section — the boot region table (sawos design 2 D-2). | Same reason, DF-172a. It is the ONE new fixed symbol pair that unit brought: the table's blob rows carry bases the LINKER resolved when it placed the generated stub, so no per-child symbol has to be nameable here. |
-| `sos_wait_for_irq()` | sink.c | Park the core until an interrupt is pending, behind `wait_for_irq`. | `wfi` is an INSTRUCTION. One line, and it is the whole of design 178 M2 unit 4's native delta on this profile. |
-| `virt.ld` | — | Places the image at this board's RAM base, first section first, and bounds the appended payload — on PAGE boundaries at both ends since design 178, which is a speed property under emulation rather than a protection one (DF-178b: a PMP region covering part of a page defeats the emulator's per-page translation cache, and the same user-mode loop measured 62.6s before the round-up and 0.03s after). | Not a program. |
+| `_start` | boot.S (this board) | Reset entry. Sets up the stack, clears the mode witness, installs the trap vector, zeroes `.bss`, calls `kmain`. Never returns. | `csrw`, and a stack pointer before any compiled code can run. |
+| `trap_entry` | trap.S (shared) | Machine trap vector. Saves the U-mode context into the RUNNING THREAD'S 32-word frame, calls `ktrap(frame, cause, tval)` on the kernel stack, and resumes the frame `ktrap` RETURNS — which need not be the one it was called with, and that is the context switch. A trap taken in kernel mode goes to `kernel_fault` instead. | `csrrw` on `mscratch` as the mode witness, register saves, `mret`. |
+| `kernel_fault` | boot.S (this board) | A trap the kernel itself took. Writes the finisher with `mcause` in the code bits and stops the machine. Never returns, never hangs. | `csrr mcause` plus the finisher store, in the one path that must work with no assumptions about kernel state. |
+| `sos_resume_frame(frame)` | trap.S (shared) | Enter user mode in a saved context, behind `resume_frame`. Selects U-mode as the `mret` target with the global interrupt enable left clear (D2), then branches into the restore path above rather than repeating it. | `csrc` on `mstatus`, and a `mret` the restore path owns. |
+| `sos_pmpaddr_write(index, value)` | sink.c (shared) | Place a word in `pmpaddr<index>`, `index` 0..15. | The CSR NUMBER is an assembly-time immediate, so an indexed write is a switch. **SIXTEEN ARMS since M3 unit 4** (sawos design 6 D-4), which is every entry the part implements — so the budget above it is `lib.saw`'s decision alone and this is the last widening available. What a region MEANS is Saw (design 172 unit 1). |
+| `sos_mie_write(mask)` | sink.c (shared) | Place a word in `mie` — which CLASSES of interrupt may reach this hart. | `csrw` names its CSR. WHICH classes, and the shadow the mask is staged in, are Saw. Note what is absent: nothing here writes the GLOBAL enable, and that absence is design 178's D2. |
+| `sos_pmpcfg_write(w0, w1, w2, w3)` | sink.c (shared) | Publish all FOUR config registers together — entries 0-3, 4-7, 8-11, 12-15 (widened from two by sawos design 6 D-4). | Same: `csrw pmpcfg0` names its register. The config words are STAGED in Saw, in four shadow variables rather than an array, because a `static` is not an array element. |
+| `sos_payload_start()` / `sos_payload_end()` | sink.c (shared) | Bounds of the appended payload. | A linker symbol's ADDRESS, which Saw cannot name — DF-172a. |
+| `sos_region_table_start()` / `sos_region_table_end()` | sink.c (shared) | Bounds of the `.regions` section — the boot region table (sawos design 2 D-2). | Same reason, DF-172a. It is the ONE new fixed symbol pair that unit brought: the table's blob rows carry bases the LINKER resolved when it placed the generated stub, so no per-child symbol has to be nameable here. |
+| `sos_wait_for_irq()` | sink.c (shared) | Park the core until an interrupt is pending, behind `wait_for_irq`. | `wfi` is an INSTRUCTION. One line, and it is the whole of design 178 M2 unit 4's native delta on this profile. |
+| `virt.ld` | this board | Places the image at this board's RAM base, first section first, and bounds the appended payload — on PAGE boundaries at both ends since design 178, which is a speed property under emulation rather than a protection one (DF-178b: a PMP region covering part of a page defeats the emulator's per-page translation cache, and the same user-mode loop measured 62.6s before the round-up and 0.03s after). | Not a program. |
 
 Moved to `lib.saw` by design 172, and no longer C: `sos_rt_write` (unit 4, and
 now check-free by construction so the panic path cannot re-enter it),

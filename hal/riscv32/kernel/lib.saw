@@ -1,30 +1,60 @@
-//! The riscv32 kernel HAL, Saw half (designs 112, 140, 162) — QEMU `virt`, M-mode.
+//! The QEMU `virt` board HAL, Saw half (designs 112, 140, 162, 23) — riscv32,
+//! M-mode.
+//!
+//! THE BOARD HALF ONLY, SINCE DESIGN 23. Everything architectural — the trap
+//! frame, the cause decoding, the syscall accessors, the whole PMP staging
+//! apparatus, the payload/region linker seams and the protection budget — lives
+//! in `rv32core` (`hal/riscv32-common/kernel/`), shared with every riscv32
+//! board, and is re-exported below so that `kcore`'s view of `hal` is exactly
+//! what it always was. What is left here is what makes this machine THIS
+//! machine: an NS16550A console, the SiFive test finisher, the CLINT, the PLIC,
+//! and where RAM is.
 //!
 //! Everything the SOS kernel needs from THIS machine, and nothing more. The
 //! kernel core above it (`sos/kernel/core/`) names no architecture at all: it
 //! reaches the board, the privilege transition and the memory-protection
 //! hardware only through the surface below, which `sos/hal/arm64/kernel/`
 //! implements the same way for Profile B. `ABI.md` beside this file is the
-//! contract; `boot.S` and `sink.c` are the parts of it that cannot be Saw.
+//! contract; `boot.S` is the part of it that cannot be Saw, and `sink.c` is now
+//! one copy in the common directory.
 //!
 //! Addresses and machine words are `UInt` throughout, never `Int`. On this
 //! target `Int` is 32-bit SIGNED, so a RAM address like 0x8020_0000 lands in
 //! its negative half — and would mean a different number again on the 64-bit
 //! profile. See DF-140a in designs/todo.md.
 
-// The image-format registry, for this profile's arch tag. The format is shared
-// with everyone who touches an image; the tag a HAL claims comes out of it
-// rather than being spelled again here.
-// Only the arch tag: this profile installs a segment's permission mask
-// UNTRANSLATED (the format numbers its bits to match a PMP config, which is
-// the whole reason it numbers them that way), so unlike the arm64 HAL there is
-// no `SegFlag` case to name in code.
-import imgformat.{SosimgArch}
-
 // The arch-free half of the console and the stop: the sink trait this file's
 // UART conforms to, the one write loop over it, and the exit-status promotion
 // both HALs used to spell out for themselves (design 172 review round).
 import sosrt.{ConsoleSink, console_write, abort_status}
+
+// THE `hal` SEAM, RE-EXPORTED (design 23). `kernel/core` imports the module
+// named `hal` and reaches every one of these through it; they live in
+// `rv32core` because they are facts about riscv32 rather than about this board,
+// and this line is what keeps that invisible from above.
+public import rv32core.{
+    arch_tag, cause_tag, device_window_ok, FRAME_BYTES, frame_init,
+    GRANT_ROW_BUDGET, IRQ_NONE, IRQ_TIMER, is_interrupt, is_syscall,
+    MAX_ROOT_SEGMENTS, payload_end, payload_start, prot_commit, prot_device,
+    PROT_GRAIN, prot_region, prot_reset, region_table_end, region_table_start,
+    resume_frame, syscall_arg0, syscall_arg1, syscall_arg2, syscall_handle,
+    syscall_op, syscall_return, trap_pc,
+}
+
+// What THIS FILE needs from the shared core and `kcore` does not: the cause
+// word's interrupt flag and its architectural codes, which this board's
+// `irq_claim` decodes against the PLIC, and the machine word width its split
+// 64-bit timer registers are halves of.
+import rv32core.{INTERRUPT_FLAG, InterruptCause, WORD_BITS}
+
+// The two C leaves this BOARD calls. The rest of `sink.c`'s surface is declared
+// in `rv32core`, which calls it; an `extern` carries no visibility and cannot be
+// re-exported (SL-6), so the block is split by CALLER and the two halves name
+// disjoint symbols.
+extern "C" {
+    func sos_mie_write(mask: UInt)
+    func sos_wait_for_irq()
+}
 
 // =============================================================================
 // NS16550A UART (design 112's blessed MMIO idiom: register block + driver)
@@ -96,66 +126,6 @@ extension SifiveTest {
 }
 
 // =============================================================================
-// The trap frame
-// =============================================================================
-
-/// The context `boot.S` saves on a trap from U-mode: 32 words, where word `i`
-/// holds register `x<i>` and word 0 — the slot `x0` would occupy — holds
-/// `mepc`. Declaration order IS the layout (design 58), so the field offsets
-/// here and the `sw x<i>, i*4(sp)` stores in boot.S are one description.
-struct TrapFrame {
-    mepc: UInt,             // word 0  (x0 never needs saving)
-    ra: UInt,               // x1
-    sp: UInt,               // x2
-    gp: UInt,               // x3
-    tp: UInt,               // x4
-    t0: UInt,               // x5
-    t1: UInt,               // x6
-    t2: UInt,               // x7
-    s0: UInt,               // x8
-    s1: UInt,               // x9
-    a0: UInt,               // x10  syscall arg 0 / status out
-    a1: UInt,               // x11  syscall arg 1 / value out
-    a2: UInt,               // x12
-    a3: UInt,               // x13
-    a4: UInt,               // x14
-    a5: UInt,               // x15  syscall arg 5 (the last, per §5.7)
-    a6: UInt,               // x16
-    a7: UInt,               // x17  syscall op
-    s2: UInt,               // x18
-    s3: UInt,               // x19
-    s4: UInt,               // x20
-    s5: UInt,               // x21
-    s6: UInt,               // x22
-    s7: UInt,               // x23
-    s8: UInt,               // x24
-    s9: UInt,               // x25
-    s10: UInt,              // x26
-    s11: UInt,              // x27
-    t3: UInt,               // x28
-    t4: UInt,               // x29
-    t5: UInt,               // x30
-    t6: UInt,               // x31
-}
-
-/// Bytes in one saved context.
-///
-/// Public because the KERNEL reserves a slot per thread and has to know this
-/// fits (design 178 M2 unit 2): a trap frame is a thread's context, so the
-/// kernel owns the storage and the HAL owns the layout. The assert below is
-/// what keeps the number honest on this side; the kernel's own assert is what
-/// keeps its stride honest on that side.
-public static FRAME_BYTES: Int = 128
-
-/// Words in a frame, for `frame_init`'s zeroing loop.
-static FRAME_WORDS: UInt = 32
-
-// The frame boot.S writes must be the frame this file describes. A field added
-// on one side and not the other would misread every register after it. (The
-// stores there are `sw x<i>, i*4(sp)`; the arm64 HAL pins its own the same way.)
-static_assert(sizeof<TrapFrame>() == FRAME_BYTES, "the riscv32 trap frame is 32 words")
-
-// =============================================================================
 // Board constants
 // =============================================================================
 
@@ -202,16 +172,6 @@ static CONSOLE_IRQ: UInt = 10
 /// What this kernel says it is booting on, for the banner.
 public func arch_name() -> String {
     "riscv32 (QEMU virt)"
-}
-
-/// This profile's `sosimg` arch tag. A process image built for the other
-/// profile is refused by the loader rather than jumped into.
-///
-/// It reads the tag out of `imgformat`'s registry rather than repeating the
-/// number, so the two cannot drift — a HAL claiming a tag the format does not
-/// define is not expressible.
-public func arch_tag() -> UInt8 {
-    SosimgArch.Riscv32.tag()
 }
 
 // =============================================================================
@@ -273,7 +233,8 @@ public func exit_fail(code: UInt) unsafe {
 // over exactly two per-side hooks: where a byte goes, and how the machine
 // stops. The kernel HAL answers "the UART" and "the test finisher". Both hooks
 // were C; both are Saw now, and since design 172 part 2 so is everything above
-// them.
+// them. They stay on the BOARD side of design 23's split, because both of them
+// name the board's own device.
 
 /// Stop the machine with a non-zero status, for the common runtime.
 ///
@@ -312,63 +273,8 @@ public func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
 }
 
 // =============================================================================
-// Privilege, protection and payload seams (boot.S / sink.c)
+// This board's memory map
 // =============================================================================
-
-// The C half of this HAL, and since design 172 unit 1 the whole of it: a
-// privilege transition, two CSR writers, and two linker symbols. What a PMP
-// region MEANS is staged in Saw below; C only places a word in a numbered
-// register, because a `csrw` names its CSR in the INSTRUCTION. See `sink.c`'s
-// header for the reason each survivor carries.
-extern "C" {
-    func sos_resume_frame(frame_addr: UInt)
-    func sos_pmpaddr_write(index: UInt, value: UInt)
-    func sos_pmpcfg_write(w0: UInt, w1: UInt, w2: UInt, w3: UInt)
-    func sos_payload_start() -> UInt
-    func sos_payload_end() -> UInt
-    func sos_region_table_start() -> UInt
-    func sos_region_table_end() -> UInt
-    func sos_mie_write(mask: UInt)
-    func sos_wait_for_irq()
-}
-
-/// This target's protection granularity. PMP stores its bounds shifted right by
-/// two, so a region bound is rounded to four bytes.
-public static PROT_GRAIN: UInt = 4
-
-/// How many segments a root image may ask for. One PMP region per segment plus
-/// one for the stack, out of the `PMP_REGIONS` this HAL programs — which is
-/// where that budget is decided (below in this file; `sink.c` only places words
-/// in numbered registers, and the stale cross-reference this comment used to
-/// carry is corrected here).
-///
-/// SEVEN SINCE M3 UNIT 4 (sawos design 6 D-4), because the budget doubled. What
-/// it buys is not seven-segment images — no image has more than three — but the
-/// HEADROOM `map()` draws on: an image using fewer segments than this leaves
-/// the rest of the budget for rows installed at run time.
-public static MAX_ROOT_SEGMENTS: UInt = 7
-
-/// **HOW MANY PROTECTION ROWS ONE PROCESS'S DOMAIN MAY HOLD ON THIS PROFILE**
-/// — the number `MemoryOp.Map` checks a target's `grant_count` against (sawos
-/// design 6 D-3/D-4).
-///
-/// **ON THIS PROFILE IT IS THE PHYSICAL WALL.** A row is a numbered hardware
-/// region and there are exactly this many, so a map that meets it is a map the
-/// machine cannot install — `NoResource`, a thing the caller could not have
-/// known. The other profile's budget is a POLICY number of the same name and
-/// the same meaning to the caller, which is why the kernel reads the HAL's
-/// number rather than a shared constant.
-///
-/// **THE QUOTA IS THE POLICY CAP LAYERED ABOVE THIS ONE, AND IT IS BUILT** (M3
-/// unit 5, sawos design 7 D-3), so the sentence this note used to promise is
-/// now law and is worth reading where the number is: **a `map()` meeting the
-/// physical wall with quota headroom left is a kernel bug to assert against.**
-/// What makes it unreachable rather than merely unlikely is that every
-/// process's mapping row is clamped to the rows it may actually install —
-/// root's included, which is the one exception to root's unlimited rows — so a
-/// caller runs out of QUOTA first and `install_row`'s `fatal` never fires.
-/// `quota_vs_wall` is the case that holds the two numbers against each other.
-public static GRANT_ROW_BUDGET: UInt = 8
 
 /// Where RAM is on this board, and how much of it there is — the window
 /// `map_target_ok` judges a RAM mapping against.
@@ -394,28 +300,11 @@ public static RAM_TOP: UInt = 0x8800_0000
 /// On this profile a PMP entry can name any address, so the predicate accepts
 /// everything in RAM — which is not vacuous: it is what refuses a map of a
 /// DEVICE window through the RAM door, and a region whose bounds have wrapped.
+///
+/// BOARD-SIDE, unlike its `device_window_ok` sibling: the granularity rule is
+/// PMP's and is shared, but WHERE RAM IS is this machine's alone.
 public func map_target_ok(base: UInt, top: UInt) -> Bool {
     base < top && base >= RAM_BASE && top <= RAM_TOP
-}
-
-/// **MAY `[base, base + len)` BE INSTALLED AS A DEVICE ROW?** — this profile's
-/// granularity rule, checked on caller-chosen numbers (sawos design 6 D-2).
-///
-/// A device window costs ONE naturally-aligned power-of-two entry here rather
-/// than a TOR pair, which is what makes it affordable at all — so the shape the
-/// static asserts below pin for the BOARD's window is the same shape a carved
-/// sub-window must have, and this is that rule as a runtime test. A violation
-/// is a `BadArg` fault at the carve: the caller chose the offset and the
-/// length.
-public func device_window_ok(base: UInt, len: UInt) -> Bool {
-    if len < PROT_GRAIN {
-        return false
-    }
-    // A power of two, tested without a loop: exactly one bit set.
-    if (len & (len - 1)) != 0 {
-        return false
-    }
-    (base % len) == 0
 }
 
 /// Root's region on this board (design 140 pin; mirrored by the root linker
@@ -456,371 +345,6 @@ static_assert((DEVICE_GRANT_BASE % DEVICE_GRANT_LEN) == 0,
 public static UNMAPPED_PROBE: UInt = 0x0000_0000
 
 // =============================================================================
-// PMP: the Profile A isolation primitive
-// =============================================================================
-//
-// Spec §5.5: on Profile A an AddressSpace IS a PMP region set. RISC-V gives us
-// default-deny for free — "if no PMP entry matches a U-mode access, and at
-// least one entry is implemented, the access fails" — so the kernel, the UART
-// and the finisher are locked away from root by SAYING NOTHING about them. The
-// kernel grants root exactly its own ranges. M-mode is unconstrained because
-// SOS never sets an entry's L (lock) bit.
-//
-// A region is a TOR pair: entry 2*idx holds the lower bound with A=OFF (a bound
-// only, never matched), entry 2*idx+1 holds the upper bound with A=TOR plus the
-// R/W/X bits. Bounds are stored shifted right by two — PMP's 4-byte grain. The
-// budget is `PMP_REGIONS` regions out of the SIXTEEN entries `sink.c`'s switch
-// covers; the layout is recorded in virt.ld.
-//
-// **THE BUDGET DOUBLED IN M3 UNIT 4 (sawos design 6 D-4), and the reason is
-// arithmetic.** Four TOR regions were enough exactly as long as every row was
-// installed at load time: a driver-shaped root spends two on its segments, one
-// on its stack and one on its device window, which is all four before the first
-// `map()` has a slot to take. Eight regions is sixteen entries, which is every
-// entry the part implements — so this is the last widening available and the
-// budget is now the hardware's own.
-//
-// DESIGN 172 UNIT 1: all of that is arithmetic, so it is Saw. What stays native
-// is placing a word in a NUMBERED CSR, because `csrw pmpaddr3, x` names the
-// register in the instruction and an indexed write therefore has to be a switch
-// in assembly. Profile B makes the same split at the same seam: descriptors in
-// Saw, the activation instructions in C.
-
-/// Regions the board budget programs, as TOR pairs out of the sixteen entries
-/// `sink.c` can reach. It IS `GRANT_ROW_BUDGET` — one installed protection row
-/// is one numbered region here — and the name above is what the arch-free
-/// kernel reads, since `pmp` is a word that may not appear in `kernel/core`.
-static PMP_REGIONS: UInt = GRANT_ROW_BUDGET
-static PMP_A_TOR: UInt = 0x8              // cfg bits 4:3 = 1 (top-of-range)
-static PMP_A_NAPOT: UInt = 0x18           // cfg bits 4:3 = 3 (naturally aligned)
-static PMP_PERM_MASK: UInt = 0x7          // cfg bits 2:0 — R, W, X
-static PMP_PERM_RW: UInt = 0x3            // R | W, with X deliberately clear
-static PMP_GRAIN_SHIFT: Int = 2           // bounds are stored >> 2
-static PMP_CFGS_PER_WORD: UInt = 4
-static BITS_PER_PMP_CFG: Int = 8
-
-// The region budget has to cover a root image's segments, its stack, AND its
-// device window — which is what makes `MAX_ROOT_SEGMENTS` one less than the
-// budget, since a device window arrives AS a segment record and the stack is
-// the kernel's own grant on top.
-static_assert(MAX_ROOT_SEGMENTS + 1 <= PMP_REGIONS,
-              "a root image's segments plus its stack must fit the region budget")
-
-/// The FOUR `pmpcfg` shadow words — entries 0-3, 4-7, 8-11 and 12-15.
-///
-/// Compound global state: staged across several `prot_region` calls and
-/// published by one `prot_commit`, with no cheap way to read the hardware back.
-/// That is the shape design 149's `unsafe static var` exists for, and the
-/// serialization argument is spec §7's — uniprocessor, and the whole staged
-/// sequence runs with no preemption point in it (see `prot_reset`).
-///
-/// FOUR RATHER THAN TWO SINCE M3 UNIT 4 (sawos design 6 D-4): eight TOR regions
-/// are sixteen entries, and four entries' config bytes fit one RV32 word.
-unsafe static var PMPCFG0: UInt = 0
-unsafe static var PMPCFG1: UInt = 0
-unsafe static var PMPCFG2: UInt = 0
-unsafe static var PMPCFG3: UInt = 0
-
-/// Revoke every grant. User mode then reaches nothing at all — the default-deny
-/// the grants below carve out of.
-///
-/// AUDIT (design 1): NO PREEMPTION POINT. Twenty register writes, and a
-/// half-rewritten grant table is exactly an in-flight invariant — the whole
-/// staged `prot_*` sequence is one edit, published by `prot_commit`.
-public func prot_reset() unsafe {
-    PMPCFG0 = 0
-    PMPCFG1 = 0
-    PMPCFG2 = 0
-    PMPCFG3 = 0
-    sos_pmpcfg_write(0, 0, 0, 0)
-    var i: UInt = 0
-    while i < PMP_REGIONS * 2 {
-        sos_pmpaddr_write(i, 0)
-        i = i + 1
-    }
-}
-
-/// Stage grant `idx` as [base, top) with `perms`, a mask in the `SegFlag`
-/// vocabulary. On this target those bits ARE a PMP config's low three bits
-/// (`imgformat` says why the format numbers them that way), so the mask
-/// installs untranslated.
-///
-/// An out-of-budget index is ignored here and rejected by the caller, which
-/// owns the diagnostic.
-public func prot_region(idx: UInt, base: UInt, top: UInt, perms: UInt8) unsafe {
-    if idx >= PMP_REGIONS {
-        return
-    }
-    let lo = idx * 2
-    let hi = lo + 1
-    sos_pmpaddr_write(lo, base >> PMP_GRAIN_SHIFT)
-    sos_pmpaddr_write(hi, top >> PMP_GRAIN_SHIFT)
-    stage_cfg(hi, ((perms as UInt) & PMP_PERM_MASK) | PMP_A_TOR)
-}
-
-/// Put one entry's config byte into the shadow word that holds it.
-///
-/// Shared by the TOR and NAPOT stagers so there is ONE place that knows which
-/// shadow word an entry's byte lives in — the arithmetic is small and getting
-/// it wrong in one of two copies would install a grant at the wrong index.
-///
-/// FOUR-WAY SINCE M3 UNIT 4, and written as a chain rather than as an indexed
-/// store because a `static` is not an array element: Saw has no way to name
-/// "the nth of these four", and four arms is what the language spells today.
-func stage_cfg(entry: UInt, cfg: UInt) unsafe {
-    let word = entry / PMP_CFGS_PER_WORD
-    let shift = BITS_PER_PMP_CFG * ((entry % PMP_CFGS_PER_WORD) as Int)
-    if word == 0 {
-        PMPCFG0 = PMPCFG0 | (cfg << shift)
-    } else if word == 1 {
-        PMPCFG1 = PMPCFG1 | (cfg << shift)
-    } else if word == 2 {
-        PMPCFG2 = PMPCFG2 | (cfg << shift)
-    } else {
-        PMPCFG3 = PMPCFG3 | (cfg << shift)
-    }
-}
-
-/// The NAPOT encoding of `[base, base + len)`: the base with the low bits of
-/// the size set, shifted into a PMP address.
-///
-/// A NAPOT entry encodes a naturally aligned power-of-two region as ONE address
-/// word — the trailing ones say how big it is — which is why a device window
-/// costs one entry where a TOR region costs two. `len` is a power of two and
-/// `base` is aligned to it; the loader's own asserts pin both, so there is
-/// nothing to validate here.
-func napot_bound(base: UInt, len: UInt) -> UInt {
-    (base | (len / 2 - 1)) >> PMP_GRAIN_SHIFT
-}
-
-/// Stage grant `idx` as a DEVICE WINDOW over `[base, base + len)` (design 178's
-/// finale constraint 2).
-///
-/// ONE ENTRY, NOT A PAIR, and read/write with EXECUTE DELIBERATELY CLEAR —
-/// registers are not instructions. A device window is otherwise an ordinary
-/// grant on this profile: PMP has no memory-type field, and this machine's
-/// device space is uncached because of where it IS, not because of how it is
-/// granted. (Profile B has to say so in the descriptor, which is why the seam
-/// carries a device call at all rather than reusing `prot_region`.)
-///
-/// It spends the same numbered region slot a segment would, so the budget
-/// arithmetic above covers it with nothing extra: the entry it programs is the
-/// pair's HIGH one, whose config byte is where `prot_region` puts a TOR
-/// region's permissions, and the pair's low entry stays disabled.
-public func prot_device(idx: UInt, base: UInt, len: UInt) unsafe {
-    if idx >= PMP_REGIONS {
-        return
-    }
-    let entry = idx * 2 + 1
-    sos_pmpaddr_write(entry, napot_bound(base, len))
-    stage_cfg(entry, PMP_PERM_RW | PMP_A_NAPOT)
-}
-
-/// Publish the staged grant set. Separate from `prot_region` so a partially
-/// programmed set is never live.
-public func prot_commit() unsafe {
-    sos_pmpcfg_write(PMPCFG0, PMPCFG1, PMPCFG2, PMPCFG3)
-}
-
-/// Build a fresh user context in `frame_addr`: `entry` as the resume address,
-/// `stack_top` as the stack pointer, `arg0` in the first argument register.
-///
-/// EVERY OTHER WORD IS ZEROED, which is the same promise the register-clearing
-/// `sos_enter_user` used to make in assembly and is now made by a loop the
-/// compiler can see: nothing of the kernel's, and nothing of another thread's,
-/// crosses into a context this builds. The return-address register is among the
-/// zeroed ones on purpose — a thread entry that RETURNS jumps to zero and takes
-/// an instruction-access fault, which spec §8 turns into the death of its
-/// process. That is a diagnosed stop rather than a run into whatever follows.
-///
-/// AUDIT (design 1): NO PREEMPTION POINT. 32 word stores, and a half-built
-/// context is an in-flight invariant the trap path can reach.
-public func frame_init(frame_addr: UInt, entry: UInt, stack_top: UInt,
-                       arg0: UInt) unsafe {
-    var w: UInt = 0
-    while w < FRAME_WORDS {
-        UnsafeMemory<UInt, Normal>(frame_addr + w * WORD_BYTES).write(0)
-        w = w + 1
-    }
-    let frame = frame_at(frame_addr)
-    frame.mepc.write(entry)
-    frame.sp.write(stack_top)
-    frame.a0.write(arg0)
-}
-
-static WORD_BYTES: UInt = 4
-
-/// Resume the context saved in `frame_addr`, in user mode. Never returns.
-///
-/// The FIRST entry to user mode, and the only one that is not `ktrap` handing a
-/// frame back to the trap entry — which is why the assembly behind it is a
-/// privilege-mode select and a branch into the trap entry's own restore path
-/// rather than a second copy of it.
-public func resume_frame(frame_addr: UInt) -> Never {
-    sos_resume_frame(frame_addr)
-    while { }
-}
-
-/// First byte of the appended payload — the `.payload` section `virt.ld`
-/// bounds. Saw cannot name a linker symbol, so the bounds arrive through C.
-public func payload_start() -> UInt {
-    sos_payload_start()
-}
-
-/// One past the last byte of the appended payload. Equal to `payload_start()`
-/// in an image built without one.
-public func payload_end() -> UInt {
-    sos_payload_end()
-}
-
-/// First byte of the BOOT REGION TABLE — the `.regions` section `virt.ld`
-/// bounds (sawos design 2 D-2). Saw cannot name a linker symbol, so the bounds
-/// arrive through C, exactly as the payload's do.
-///
-/// THE SECOND FIXED SYMBOL PAIR IN THE SYSTEM, and the only one this unit adds.
-/// The table's own rows point at blob sections whose bases the LINKER resolves,
-/// so those need no symbol the kernel can name — which is what keeps "one new
-/// pair" true however many child images a build appends.
-public func region_table_start() -> UInt {
-    sos_region_table_start()
-}
-
-/// One past the last byte of the region table. Equal to
-/// `region_table_start()` in an image built without one, which is ZERO REGIONS
-/// and not an error — the ordinary state of every image that appends no
-/// children.
-public func region_table_end() -> UInt {
-    sos_region_table_end()
-}
-
-// =============================================================================
-// Traps
-// =============================================================================
-
-/// The `mcause` exception codes M1 can take (interrupt bit clear).
-///
-/// Backed by `UInt` — the width of the CSR the value arrives in. The numbers are
-/// RISC-V's, not ours, which is exactly why they are pinned per case: a reorder
-/// here must never renumber them.
-enum TrapCause: UInt {
-    case InsnMisaligned = 0,
-    case InsnAccessFault = 1,
-    case IllegalInsn = 2,
-    case Breakpoint = 3,
-    case LoadMisaligned = 4,
-    case LoadAccessFault = 5,
-    case StoreMisaligned = 6,
-    case StoreAccessFault = 7,
-    case EcallFromU = 8,
-}
-
-extension TrapCause {
-    /// The short symbolic name a fault line reports.
-    func describe(&self) -> String {
-        match self {
-            case InsnMisaligned -> "instruction-address-misaligned",
-            case InsnAccessFault -> "instruction-access-fault",
-            case IllegalInsn -> "illegal-instruction",
-            case Breakpoint -> "breakpoint",
-            case LoadMisaligned -> "load-address-misaligned",
-            case LoadAccessFault -> "load-access-fault",
-            case StoreMisaligned -> "store-address-misaligned",
-            case StoreAccessFault -> "store-access-fault",
-            case EcallFromU -> "ecall-from-u-mode",
-        }
-    }
-}
-
-/// `ecall` is a 4-byte instruction — `mepc` points AT it, so a returning
-/// syscall must step past it or the trap repeats forever. (Profile B's `svc`
-/// leaves `ELR` already past, which is why advancing belongs to the HAL.)
-static SYSCALL_INSN_LEN: UInt = 4
-
-/// Did this trap come from a syscall instruction, or is it a fault?
-public func is_syscall(cause: UInt) -> Bool {
-    cause == (TrapCause.EcallFromU as UInt)
-}
-
-/// The high bit of a cause word says "this is an interrupt, not an exception",
-/// and the rest of the word is then an INTERRUPT code with its own numbering —
-/// a 7 with the flag set has nothing to do with a 7 without it.
-static INTERRUPT_FLAG: UInt = 0x8000_0000
-
-/// The interrupt codes this kernel can take. Numbered by the architecture, not
-/// by us, so each is pinned per case; the flag above is stripped before the
-/// decode, which is why these are small numbers and not high ones.
-enum InterruptCause: UInt {
-    case MachineTimer = 7,
-    case MachineExternal = 11,
-}
-
-/// Is this trap an interrupt rather than a syscall or a fault?
-///
-/// Interrupts only ever arrive from USER mode (design 178 D2): this hart takes
-/// them in kernel mode only with the global enable set, which SOS never sets,
-/// and a trap taken in kernel mode goes to `boot.S`'s kernel-bug path anyway.
-public func is_interrupt(cause: UInt) -> Bool {
-    (cause & INTERRUPT_FLAG) != 0
-}
-
-/// A short symbolic name for a raw trap cause.
-///
-/// The decode is where an unknown code stops being a number: `from(raw:)` is
-/// total, and the hardware may raise a cause this kernel does not model, so the
-/// miss has its own name rather than an arm. Everything it DOES model is an
-/// exhaustive `match` in `describe`, so a cause added to the enum fails to
-/// compile until it is given a name.
-public func cause_tag(cause: UInt) -> String {
-    guard let decoded = TrapCause.from(raw: cause) else {
-        return "unexpected-trap"
-    }
-    decoded.describe()
-}
-
-/// Overlay the saved context. One view construction, then ordinary field names.
-func frame_at(frame_addr: UInt) unsafe -> UnsafeMemory<TrapFrame, Normal> {
-    UnsafeMemory<TrapFrame, Normal>(frame_addr)
-}
-
-/// Where the trapped context resumes — the faulting instruction on a fault, the
-/// interrupted one on an interrupt. (It was `fault_pc` until interrupts had a
-/// use for it too; the value never was fault-specific.)
-public func trap_pc(frame_addr: UInt) unsafe -> UInt {
-    frame_at(frame_addr).mepc.read()
-}
-
-/// §5.7: a0 = handle, a7 = op, args a1-a5.
-public func syscall_handle(frame_addr: UInt) unsafe -> UInt {
-    frame_at(frame_addr).a0.read()
-}
-
-public func syscall_op(frame_addr: UInt) unsafe -> UInt {
-    frame_at(frame_addr).a7.read()
-}
-
-public func syscall_arg0(frame_addr: UInt) unsafe -> UInt {
-    frame_at(frame_addr).a1.read()
-}
-
-public func syscall_arg1(frame_addr: UInt) unsafe -> UInt {
-    frame_at(frame_addr).a2.read()
-}
-
-public func syscall_arg2(frame_addr: UInt) unsafe -> UInt {
-    frame_at(frame_addr).a3.read()
-}
-
-/// Place a syscall's (status, value) pair where the caller will find it and
-/// step the saved PC past the trapping instruction. Resuming is the assembly's
-/// job; deciding what "past" means is this file's.
-public func syscall_return(frame_addr: UInt, status: UInt, value: UInt) unsafe {
-    let frame = frame_at(frame_addr)
-    frame.a0.write(status)
-    frame.a1.write(value)
-    frame.mepc.write(frame.mepc.read() + SYSCALL_INSN_LEN)
-}
-
-// =============================================================================
 // Which sources may interrupt this hart (design 178 M2 unit 1)
 // =============================================================================
 //
@@ -836,6 +360,11 @@ public func syscall_return(frame_addr: UInt, status: UInt, value: UInt) unsafe {
 // kernel needs no critical sections and the trap path needs no epilogue; a
 // wrongly-arrived interrupt lands on `boot.S`'s kernel-bug path, which is a
 // diagnosed stop rather than a silent reentry.
+//
+// BOARD-SIDE, and it is the reason the class shadow could not be shared: on
+// this board the tags below ARE `mie` bit positions and the shadow is literally
+// what gets written, while the C3's matrix gates everything through one bit and
+// makes them software tags. Same names, two different registers.
 
 /// The class mask, staged here because the register it mirrors is written
 /// through a C leaf and reading it back would cost a second one. Compound
@@ -948,8 +477,6 @@ extension MachineTimer {
         self.now() >= self.deadline()
     }
 }
-
-static WORD_BITS: Int = 32
 
 /// Round a nanosecond time UP to a whole counter unit.
 ///
@@ -1103,17 +630,6 @@ extension Plic {
         self.context.claim.write(line as UInt32)
     }
 }
-
-/// The controller had nothing to give. Both profiles report a spurious
-/// interrupt as this value, and neither ever uses it as a real line.
-public static IRQ_NONE: UInt = 0
-
-/// The line the periodic timer arrives on.
-///
-/// The timer is NOT one of this controller's sources here — it is a class of
-/// its own at the hart — so the seam needs a number the controller can never
-/// produce, and one past its last source is that number.
-public static IRQ_TIMER: UInt = 1024
 
 static_assert(IRQ_TIMER > PLIC_MAX_SOURCE,
               "the timer's line must not collide with a real interrupt source")

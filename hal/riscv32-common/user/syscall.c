@@ -1,9 +1,15 @@
-// SOS riscv32 user-side HAL: the syscall instruction (designs 140, 172).
+// SOS riscv32 user-side HAL: the syscall instruction (designs 140, 172, 23).
 //
 // This is the ENTIRE architecture-dependent surface of an SOS process. An
 // `ecall` is not expressible in Saw, and neither is naming the registers the
 // ABI puts arguments in, so this one file exists — and nothing else in a
 // process needs to know it is riscv32.
+//
+// ONE COPY, SHARED BY EVERY riscv32 BOARD (design 23). It names the ISA's
+// syscall instruction and the ABI's registers and nothing about a board, so
+// there was never a second thing for a per-board copy to say — and every root
+// and child manifest, whichever board it targets, names THIS path in its
+// `[sos.riscv32-unknown-none-elf] native` line.
 //
 // WHY THIS IS C, and it is the only reason left (design 172's reason sweep):
 // the `ecall` INSTRUCTION plus the register pinning the ABI requires. Neither
@@ -18,8 +24,9 @@
 // were two copies of one thing. They are one arch-free Saw module now, in
 // `sos/kernel/sysapi/`, beside the System object whose authority they use.
 //
-// `sos/hal/riscv32/kernel/` is the kernel's counterpart; `sos/hal/arm64/user/`
-// is this file for Profile B, and is now the same six lines.
+// `../kernel/sink.c` beside this file is the kernel's counterpart, shared the
+// same way; `sos/hal/arm64/user/` is this file for Profile B, and is now the
+// same six lines.
 //
 // ABI (sos/spec.md §5.7): a0 = HANDLE, a7 = OP, args a1-a5, `ecall`; returns
 // a0 = status word, a1 = value. Every syscall is an object op, so there is no

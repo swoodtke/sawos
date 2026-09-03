@@ -134,6 +134,21 @@ SOSABI_MODULE = f"sosabi={SOSABI_DIR}"
 
 RT_COMMON_C_DIR = os.path.join(REPO_ROOT, "rt", "common_c")
 
+# THE SHARED riscv32 HAL (design 23). `kernel/sink.c` and `user/syscall.c` were
+# byte-identical between the two riscv32 boards, and `kernel/lib.saw`'s
+# ARCHITECTURAL half — the trap frame, the cause decoding, the syscall
+# accessors, the PMP staging, the payload/region seams — was very nearly so. All
+# three live here in ONE copy now, and both boards' build entries point at them:
+# the C files by path (`hal_native` below, and every root/child manifest's
+# `native` line), the Saw half as one more `--module-path` beside the board's
+# own `hal=`.
+#
+# THE `hal` SEAM DID NOT MOVE. `kernel/core` still imports the module named
+# `hal` and the runner still maps `hal=<board>/kernel`; the board's `hal` module
+# `public import`s from `rv32core` and re-exports what `kcore` consumes.
+RV32_COMMON_DIR = os.path.join(HAL_DIR, "riscv32-common")
+RV32_CORE_MODULE = f"rv32core={os.path.join(RV32_COMMON_DIR, 'kernel')}"
+
 # `ExitCode.ProcessFault` in sos/kernel/core/lib.saw: what the machine exits
 # with when the kernel TERMINATES a process for a caller error it could have
 # checked (design 178's faults ruling). Kept in step with that enum.
@@ -517,6 +532,12 @@ ARCHES = [
         # The C half gets the same set through `-march`.
         "cc_args": ["-march=rv32imac_zicsr", "-mabi=ilp32"],
         "features": "+m,+a,+c",
+        # design 23: this board's `sink.c` and the architectural half of its
+        # `hal` module are the SHARED riscv32 ones, so both are named here
+        # rather than under `hal/riscv32/`.
+        "hal_native": os.path.join("riscv32-common", "kernel"),
+        "hal_modules": [RV32_CORE_MODULE],
+        "hal_asm": [os.path.join("riscv32-common", "kernel", "trap.S")],
         "hex_width": 8,
         "root_entry": 0x80200000,
         # Where a CHILD process's memory is (sawos design 2). This is the
@@ -568,6 +589,12 @@ ARCHES = [
         # there is no ABI variant to select.
         "cc_args": [],
         "features": None,
+        # There is one arm64 board in this tree, so its HAL is whole: its own
+        # `sink.c`, and no shared module beside its `hal`. Design 23 consolidated
+        # the riscv32 pair and deliberately left this profile alone.
+        "hal_native": os.path.join("arm64", "kernel"),
+        "hal_modules": [],
+        "hal_asm": [],
         "hex_width": 16,
         "root_entry": 0x40200000,
         # One region above root's top, as on Profile A — and here the choice is
@@ -626,9 +653,16 @@ REGION_KIND_DEVICE = 1
 
 
 def arch_dirs(arch):
-    """The per-architecture directories a build reaches into."""
+    """The per-architecture directories a build reaches into.
+
+    `hal_kernel` is the BOARD's own directory — `boot.S`, the linker script and
+    the `hal` module. `hal_native` is where this architecture's `sink.c` lives,
+    which is the same directory for arm64 and the SHARED `riscv32-common` one
+    for riscv32 (design 23).
+    """
     return {
         "hal_kernel": os.path.join(HAL_DIR, arch["name"], "kernel"),
+        "hal_native": os.path.join(HAL_DIR, arch["hal_native"]),
         "tests": os.path.join(TESTS_DIR, arch["name"]),
         "build": os.path.join(REPO_ROOT, ".build", arch["triple"], "sos"),
     }
@@ -4564,14 +4598,25 @@ def _build_shared(arch, clang):
     _run([clang, f"--target={arch['triple']}", *arch["cc_args"],
           "-nostdlib", "-c", os.path.join(dirs["hal_kernel"], "boot.S"),
           "-o", boot_o])
-    for src, obj in ((os.path.join(dirs["hal_kernel"], "sink.c"), sink_o),
+    # design 23: any SHARED assembly this architecture's HAL splits out of its
+    # board `boot.S` — the riscv32 trap entry and M -> U transition, which are
+    # the ISA's rather than the board's. arm64 brings none.
+    asm_objs = []
+    for rel in arch["hal_asm"]:
+        obj = os.path.join(build, os.path.basename(rel).replace(".S", ".o"))
+        _run([clang, f"--target={arch['triple']}", *arch["cc_args"],
+              "-nostdlib", "-c", os.path.join(HAL_DIR, rel), "-o", obj])
+        asm_objs.append(obj)
+    # `sink.c` comes from `hal_native`, which is this board's own directory on
+    # arm64 and the shared `riscv32-common` one on riscv32 (design 23).
+    for src, obj in ((os.path.join(dirs["hal_native"], "sink.c"), sink_o),
                      (os.path.join(RT_COMMON_C_DIR, "support.c"), support_o)):
         # -fno-builtin: support.c DEFINES memcpy, and without it LLVM may
         # rewrite its byte loop into a call to itself.
         _run([clang, f"--target={arch['triple']}", *arch["cc_args"],
               "-ffreestanding", "-fno-builtin", "-ffunction-sections",
               "-fdata-sections", "-nostdlib", "-O2", "-c", src, "-o", obj])
-    return [boot_o, sink_o, support_o]
+    return [boot_o, *asm_objs, sink_o, support_o]
 
 
 def _build_blade(build_dir):
@@ -4860,6 +4905,11 @@ def _build_elf(case, arch, shared_objs, lld, clang):
             "--module-path", tc().module_path_arg("imgformat"),
             "--module-path", SOSRT_MODULE,
             "--module-path", SOSABI_MODULE]
+    # design 23: a riscv32 board's `hal` module re-exports the shared
+    # `rv32core`, so that module has to be on the path beside it. arm64 brings
+    # none and this adds nothing there.
+    for extra in arch["hal_modules"]:
+        cmd += ["--module-path", extra]
     _run(cmd)
 
     objs = list(shared_objs) + [obj]
@@ -5438,9 +5488,13 @@ def main():
 
         # The kernel is ONE compile for all three cases: they differ in what is
         # appended to it, never in the kernel itself.
+        # `boot.S` is this board's; `trap.S` and `sink.c` are the SHARED riscv32
+        # ones, out of `hal/riscv32-common/kernel/` (design 23).
         shared = [c3_cc(os.path.join(C3_HAL, "kernel", "boot.S"),
                         os.path.join(C3_BUILD, "boot.o")),
-                  c3_cc(os.path.join(C3_HAL, "kernel", "sink.c"),
+                  c3_cc(os.path.join(RV32_COMMON_DIR, "kernel", "trap.S"),
+                        os.path.join(C3_BUILD, "trap.o")),
+                  c3_cc(os.path.join(RV32_COMMON_DIR, "kernel", "sink.c"),
                         os.path.join(C3_BUILD, "sink.o"), extra=("-O2",)),
                   c3_cc(os.path.join(RT_COMMON_C_DIR, "support.c"),
                         os.path.join(C3_BUILD, "support.o"), extra=("-O2",))]
@@ -5453,6 +5507,10 @@ def main():
                             "--module-path", CORE_MODULE,
                             "--module-path",
                             f"hal={os.path.join(C3_HAL, 'kernel')}",
+                            # design 23: this board's `hal` re-exports the
+                            # shared riscv32 core, so `rv32core` rides beside it
+                            # exactly as it does on the virt path.
+                            "--module-path", RV32_CORE_MODULE,
                             "--module-path", tc().module_path_arg("imgformat"),
                             "--module-path", SOSRT_MODULE,
                             "--module-path", SOSABI_MODULE])

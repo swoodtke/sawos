@@ -1,9 +1,12 @@
 # hal/riscv32-esp32c3 — the board facts (design 20, derived Sep 2 2026)
 
 THE CONTRACT FOR THIS BOARD HAL, and the record of how every number in
-it was obtained. `boot.S`, `lib.saw`, `sink.c`, `esp32c3.ld` and the two
-user linker scripts beside them are the HAL; this file says why each
-address is what it is.
+it was obtained. `boot.S`, `lib.saw`, `esp32c3.ld` and the two user
+linker scripts beside them are the BOARD half of the HAL; the shared
+riscv32 half — `trap.S`, `sink.c`, the `rv32core` module and the `ecall`
+stub — lives in `../riscv32-common/` since design 23 and is compiled into
+this board's image unchanged. This file says why each address is what it
+is; none of the addresses moved with that split.
 
 Every number below was read off the running machine, not off a
 datasheet. Where the emulator and the ESP32-C3 TRM disagree, the
@@ -248,7 +251,7 @@ restates all three keys in its `[sos.<triple>]` section:
 ```toml
 [sos.riscv32-unknown-none-elf]
 linker-script = "../../hal/riscv32-esp32c3/user/root.ld"
-native = "../../hal/riscv32-esp32c3/user/syscall.c ../../rt/common_c/support.c"
+native = "../../hal/riscv32-common/user/syscall.c ../../rt/common_c/support.c"
 march = "rv32imc_zicsr_zifencei"
 mabi = "ilp32"
 target-features = "+m,+c"
@@ -453,7 +456,9 @@ loop spins, while `irq_poll()` reads the SYSTIMER's own latch — which
 does work. It costs a core burned while idle, invisible under emulation
 and this target is emulator-only by ruling. Nothing above the HAL
 changes: D2 is untouched, the kernel still never takes a trap in kernel
-mode. `sink.c`'s `sos_wait_for_irq` is left in place, unused, because on
+mode. The shared `sink.c`'s `sos_wait_for_irq` is left in place, unused
+and undeclared by this board's `extern` block (design 23 splits that
+block by CALLER, so `--gc-sections` drops the leaf), because on
 REAL SILICON `wfi` does wake from the interrupt matrix (the C3 TRM's
 low-power section is explicit that any enabled interrupt resumes the
 core) and a hardware bring-up should restore the call.

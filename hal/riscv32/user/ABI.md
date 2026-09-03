@@ -4,6 +4,14 @@ The entire architecture-dependent surface of an SOS process: ONE symbol.
 `sos/root/src/` builds for arm64 with only the manifest's `[sos] native` line
 changing, and that line names one C file holding one function.
 
+**WHERE THAT FILE LIVES, SINCE DESIGN 23: `hal/riscv32-common/user/syscall.c`.**
+It names the ISA's syscall instruction and the ABI's registers and nothing about
+a board, so it is ONE copy for every riscv32 board and every root and child
+manifest points at that path whichever board it targets — this document is the
+seam it implements, and none of it changed. What is left in THIS directory is
+the QEMU `virt` board's own user-side linker scripts (`root.ld`, `child.ld`,
+`child2.ld`), which genuinely differ per board because the load addresses do.
+
 Design 172 part 2 shrank this from four symbols to one. The three that left —
 `sos_set_system_handle`, `sos_rt_write` and `sos_rt_abort` — named no
 architecture: a byte reaches the console through a System op, which is the same
