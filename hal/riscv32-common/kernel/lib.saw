@@ -141,6 +141,45 @@ static FRAME_WORDS: UInt = 32
 static_assert(sizeof<TrapFrame>() == FRAME_BYTES, "the riscv32 trap frame is 32 words")
 
 // =============================================================================
+// The linear-map seam (sawos design 29, M5 unit 1.5)
+// =============================================================================
+//
+// **ON AN MPU TIER THE TWO ARE THE SAME NUMBER, AND THAT IS THE POINT.** The
+// kernel's ruled discipline is that ADDRESSES-AS-DATA STAY PHYSICAL everywhere
+// — grant rows, sosimg records, boot-handle records, region tables, Memory and
+// IoMemory capabilities, fault report words — and that only the moment of
+// kernel DEREFERENCE converts. Here there is nothing to convert: this machine
+// has no MMU, so a physical address IS the address the kernel loads and stores
+// through, and both bodies are the identity.
+//
+// They exist anyway, and having them cost NOTHING is what buys the discipline.
+// `kernel/core` spells one sequence for both tiers — `phys_to_virt` at every
+// site where a stored physical address becomes a dereference — and on this HAL
+// every one of those calls folds away to its argument, so the arch-free code
+// reads the same on both profiles and this profile pays no instruction for it.
+// Design 19's doctrine again: the DIFFERENCE is advertised (the arm64 HAL's
+// bodies are an OR and an AND), never faked, and never pushed up into a tier
+// conditional the kernel would have to carry.
+//
+// THE SV32 NOTE, for whoever picks the punted climb up (design 25 ruling 11):
+// this board's RAM sits at 0x8000_0000, already in the upper 2 GiB of a 32-bit
+// address space, so an Sv32 kernel does not have to move to be "high" and this
+// seam stays the identity even then. The climb costs a page-table walk, not an
+// address vocabulary.
+
+/// A physical address as the kernel must spell it to DEREFERENCE it. Identity
+/// here: this machine translates nothing.
+public func phys_to_virt(pa: UInt) -> UInt {
+    pa
+}
+
+/// The inverse: a kernel dereference address back to the physical address that
+/// is its name everywhere else. Identity here, for the same reason.
+public func virt_to_phys(va: UInt) -> UInt {
+    va
+}
+
+// =============================================================================
 // The protection budget
 // =============================================================================
 

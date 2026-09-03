@@ -616,11 +616,23 @@ public(package) func clear_domain(p: Int) unsafe {
 // M2 WAS ONE ADDRESS SPACE and that is what made the write a plain copy: the
 // writer may be a DIFFERENT thread from the one that asked (a signaller waking
 // a parked waiter). With several address spaces the copy is still plain, because
-// neither profile TRANSLATES — spec §5.5's contract is that an address is the
-// same number in every process — so what changed is the PERMISSION set, which
-// the kernel is not subject to. The mapping switch a translating profile would
-// need goes HERE and in `copy_in`, which between them are the only two places
-// the kernel dereferences a user address.
+// spec §5.5's contract is that a user address is the same number in every
+// process — so what changed is the PERMISSION set, which the kernel is not
+// subject to.
+//
+// **AND THE CONVERSION A TRANSLATING KERNEL NEEDS DID LAND HERE** (sawos design
+// 29), exactly where the sentence this paragraph used to end with predicted it:
+// these two doors are the only places the kernel dereferences a user address, so
+// they are the only places in this module that turn one into a kernel
+// dereference. On a tier whose kernel does not run at physical addresses,
+// `hal.phys_to_virt` is the arithmetic that gets there; on a tier that has no
+// translation at all it is the identity and compiles to nothing. Either way the
+// two lines below read the same, which is what keeps this module arch-free.
+//
+// §5.5 IS UNTOUCHED BY THIS, and a reader could reasonably wonder: it says a
+// USER address is the same number everywhere, and it still is — placement is
+// design 25's unit 2, not this one. What moved is where the KERNEL stands,
+// which §5.5 never spoke about.
 
 /// Validate a destination the kernel is about to write. `None` when it is fine.
 ///
@@ -666,7 +678,14 @@ public(package) func copy_out(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe 
     if let why = copy_out_check(p, dst, bytes) {
         return why
     }
-    copy_bytes(dst, src, bytes)
+    // **THE ASYMMETRY IS THE WHOLE SEAM** (sawos design 29). `dst` is the
+    // PROCESS's address — physical, because user placement is still identity —
+    // and the kernel does not run at those addresses any more, so it converts to
+    // dereference. `src` is already a kernel address: it comes from a `&var` of
+    // a record on this frame, which the linker placed wherever the kernel lives.
+    // On an MPU tier `phys_to_virt` is the identity and this line is what it
+    // always was.
+    copy_bytes(hal.phys_to_virt(dst), src, bytes)
     None
 }
 
@@ -767,7 +786,10 @@ public(package) func copy_in(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe -
     if let why = copy_in_check(p, src, bytes) {
         return why
     }
-    copy_bytes(dst, src, bytes)
+    // The mirror of `copy_out`'s conversion, and the same sentence in the other
+    // direction: `src` is the PROCESS's physical address and converts,
+    // `dst` is the kernel's own storage and does not. See design 29 there.
+    copy_bytes(dst, hal.phys_to_virt(src), bytes)
     None
 }
 
@@ -885,13 +907,16 @@ static REGION_TABLE_VERSION: UInt16 = 2
 
 /// Overlay the header on the section's first bytes. One view construction, then
 /// an ordinary safe struct — the unsafety is confined to this line.
+///
+/// `addr` is PHYSICAL, as every address the kernel holds as data is; the linear
+/// map is where the kernel reaches it (sawos design 29).
 func region_header_at(addr: UInt) unsafe -> RegionTableHeader {
-    UnsafeMemory<RegionTableHeader, Normal>(addr).read()
+    UnsafeMemory<RegionTableHeader, Normal>(hal.phys_to_virt(addr)).read()
 }
 
-/// Overlay one row.
+/// Overlay one row. Same conversion, same reason.
 func region_row_at(addr: UInt) unsafe -> RegionRow {
-    UnsafeMemory<RegionRow, Normal>(addr).read()
+    UnsafeMemory<RegionRow, Normal>(hal.phys_to_virt(addr)).read()
 }
 
 /// Parse the region table and mint one Memory per row into process `p`, queuing
@@ -955,6 +980,22 @@ func mint_boot_regions(p: Int) unsafe {
         if not fits_word(row.base) || not fits_word(row.len) {
             fatal_image("boot region is past this machine's address space", i)
         }
+        // **A ROW'S BASE IS NORMALIZED TO PHYSICAL HERE, ONCE** (sawos design
+        // 29), because the rows come from two producers with two readings. A
+        // BLOB row's base is a LINKER EXPRESSION — the child section's own
+        // symbol, which is the whole point of generating the stub — so on a
+        // higher-half kernel it resolves to a link address in the high half. A
+        // destination, pool or device row's base is a literal the build wrote,
+        // already physical. `virt_to_phys` answers both: masking off bits that
+        // are not set changes nothing, so it is IDEMPOTENT on the literal rows
+        // and corrective on the linker-resolved ones. It is the identity on
+        // every MPU HAL.
+        //
+        // It has to happen before the base is stored, not at some later
+        // dereference, because this base becomes a `Memory`/`IoMemory`
+        // capability's — a USER-VISIBLE address that root maps and hands to
+        // children, and that ends up as a grant row's bounds in hardware.
+        let row_base = hal.virt_to_phys(row.base as UInt)
         // The kind is DATA the build wrote, so it is decoded rather than
         // trusted — `from(raw:)` is total and an unknown byte stops the boot
         // with the number in it, exactly as a bad magic does.
@@ -997,7 +1038,7 @@ func mint_boot_regions(p: Int) unsafe {
                 // what "return to ROOT" is made of. The ledger starts empty —
                 // nothing lent, nothing free but the cursor, nothing dropped.
                 MEMORIES[slot] = MemorySlot(state: SlotState.Live, process: p,
-                                            base: row.base as UInt,
+                                            base: row_base,
                                             len: row.len as UInt,
                                             refs: 1, maps: 0, root: slot,
                                             free_head: 0, out_bytes: 0,
@@ -1015,7 +1056,7 @@ func mint_boot_regions(p: Int) unsafe {
                     fatal_image("out of IoMemory slots for the boot regions", i)
                 }
                 IOMEMORIES[slot] = IoMemorySlot(state: SlotState.Live, process: p,
-                                                base: row.base as UInt,
+                                                base: row_base,
                                                 len: row.len as UInt,
                                                 refs: 1)
                 let handle = mint_handle(p, ObjType.IoMemory, iomemory_rights(),

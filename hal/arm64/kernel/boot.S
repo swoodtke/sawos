@@ -46,36 +46,189 @@
      * `IRQ_CAUSE` is the same description and must move with it. */
     .equ IRQ_CAUSE_HI, 1
 
+/* ---- the higher-half bring-up (sawos design 29) ---------------------------
+ *
+ * THE ORDER IS FORCED, and it is worth stating before the code because every
+ * line below is a consequence of it. This kernel LINKS in the high half
+ * (`virt.ld` places every section at `physical + LINMAP_OFFSET`), so NO COMPILED
+ * CODE — C or Saw — may be called until the MMU is on and TTBR1 is walked: a
+ * `bl` reaches a high address, and a compiled body reaches its globals through
+ * PC-relative pairs that would resolve against whatever address it is running
+ * at. The MMU therefore has to come up on a table built by HAND-WRITTEN
+ * ASSEMBLY, which is what the block below is, and it is the whole of the
+ * relocation window.
+ *
+ * THE BOOT TABLE IS TWO DESCRIPTORS. At the 4 KiB granule with a 39-bit VA,
+ * level 1 covers 1 GiB per entry — so one entry for the device gigabyte and one
+ * for RAM's is the entire map. It serves BOTH halves at once: `pa | OFFSET`
+ * leaves the low 39 bits alone, so a high kernel address and its physical twin
+ * select the SAME level-1 entry, and installing the table in TTBR0 and TTBR1
+ * together makes the identity map and the (coarse) linear map one page of
+ * memory. That is what makes the jump into the high half a plain branch.
+ *
+ * THEN THE REAL TABLES. `sos_mmu_tables` (sink.c -> lib.saw) builds the linear
+ * map and `sos_page_tables_build` the per-process sets, both with translation
+ * already on, both writing descriptors through the seam. Installing TTBR1
+ * happens from the IDENTITY MAP — the branch to `.Lswap_phys` below — for the
+ * ordinary reason a kernel does that: code that changes the register its own PC
+ * translates through has nowhere to stand. This is Linux's
+ * `idmap_cpu_replace_ttbr1` shape, and once TTBR1 holds the real linear map the
+ * identity map has done its job and TTBR0 becomes root's set.
+ *
+ * THE VALUES ARE NOT SPELLED HERE. `sos_boot_mair` and `sos_boot_tcr` are
+ * `const u64`s in sink.c, read out of `.rodata` through a masked pointer while
+ * the MMU is off (`.rodata` is loaded at that physical address). The MAIR copy
+ * is checked against `lib.saw`'s `sos_mair_value()` on every boot. The
+ * descriptor bits below are this file's own and are the one duplication left —
+ * a wrong one is an immediate, visible boot failure rather than a silent one.
+ */
+
+    /* Block descriptors for the two boot entries, at level 1.
+     *
+     * The ATTRIBUTE INDICES are `MemoryType`'s in lib.saw: 0 Device-nGnRnE,
+     * 1 Normal write-back. `sos_boot_mair` is the register those index, and
+     * sink.c checks it against the Saw builder on every boot. */
+    .equ DESC_VALID,     (1 << 0)   /* bit 0 set, bit 1 clear = BLOCK          */
+    .equ DESC_ATTR_DEV,  (0 << 2)   /* AttrIndx = MemoryType.Device            */
+    .equ DESC_ATTR_NORM, (1 << 2)   /* AttrIndx = MemoryType.Normal            */
+    .equ DESC_SH_INNER,  (3 << 8)   /* inner shareable                         */
+    .equ DESC_AF,        (1 << 10)  /* access flag                             */
+    .equ DESC_PXN,       (1 << 53)  /* no execute at EL1                       */
+    .equ DESC_UXN,       (1 << 54)  /* no execute at EL0                       */
+    /* AP = 00: EL1 read/write, EL0 no access. Global (nG clear): the boot map
+     * belongs to the kernel, not to an address space. */
+    .equ BOOT_DESC_DEV,  (DESC_VALID | DESC_ATTR_DEV | DESC_AF | DESC_PXN | DESC_UXN)
+    .equ BOOT_DESC_RAM,  (DESC_VALID | DESC_ATTR_NORM | DESC_SH_INNER | DESC_AF | DESC_UXN)
+    .equ RAM_BASE,       0x40000000
+
+    .equ SCTLR_M,        (1 << 0)   /* MMU on            */
+    .equ SCTLR_C,        (1 << 2)   /* data cache        */
+    .equ SCTLR_I,        (1 << 12)  /* instruction cache */
+
     .section .text.boot, "ax", @progbits
     .globl _start
 _start:
-    /* Stack: the 64 KiB reservation below (in .bss), top-aligned. */
-    ldr     x0, =_stack_top
-    mov     sp, x0
+    /* RUNNING AT THE PHYSICAL ADDRESS, MMU OFF. Every symbol a literal pool
+     * hands us is a HIGH address from here until the jump below, so each one is
+     * masked down with `LINMAP_PHYS_MASK` (an absolute symbol `virt.ld`
+     * exports — loading its "address" loads its value). x9 holds the mask for
+     * the whole window. */
+    ldr     x9, =LINMAP_PHYS_MASK
 
-    /* Exception vectors. VBAR_EL1 wants a 2 KiB-aligned table. */
-    ldr     x0, =_vectors
-    msr     vbar_el1, x0
+    /* A stack, at its physical address. Nothing here calls anything, but a
+     * window with no stack is a window where a fault has nowhere to go. */
+    ldr     x0, =_stack_top
+    and     x0, x0, x9
+    mov     sp, x0
 
     /* FP/SIMD access — see the header note. Must precede any compiled code. */
     mov     x0, #CPACR_FPEN
     msr     cpacr_el1, x0
     isb
 
-    /* Zero .bss [_bss_start, _bss_end) a doubleword at a time.
+    /* Zero .bss [_bss_start, _bss_end) a doubleword at a time, physically.
      *
-     * AUDIT (design 1): no preemption point, here or in the page-table build
-     * below. Both are native code running before kmain and before the GIC comes
-     * up — pre-IRQ by construction. */
+     * AUDIT (design 1): no preemption point, here or in the table builds below.
+     * All of it runs before kmain and before the GIC comes up — pre-IRQ by
+     * construction. */
     ldr     x0, =_bss_start
+    and     x0, x0, x9
     ldr     x1, =_bss_end
+    and     x1, x1, x9
 1:  cmp     x0, x1
     b.hs    2f
     str     xzr, [x0], #8
     b       1b
 2:
-    /* The page tables live in .bss, so this must follow the zeroing. */
-    bl      sos_mmu_init
+    /* The boot table lives in .bss, so it is built AFTER the zeroing. Two
+     * level-1 block descriptors: entry 0 the device gigabyte at 0, entry 1
+     * RAM's gigabyte at 0x4000_0000. */
+    ldr     x0, =_boot_l1
+    and     x0, x0, x9
+    ldr     x1, =BOOT_DESC_DEV
+    str     x1, [x0]
+    ldr     x1, =(BOOT_DESC_RAM | RAM_BASE)
+    str     x1, [x0, #8]
+
+    /* MAIR and TCR, out of sink.c's `.rodata` at its load address. */
+    ldr     x1, =sos_boot_mair
+    and     x1, x1, x9
+    ldr     x1, [x1]
+    msr     mair_el1, x1
+    ldr     x1, =sos_boot_tcr
+    and     x1, x1, x9
+    ldr     x1, [x1]
+    msr     tcr_el1, x1
+
+    /* ONE TABLE IN BOTH BASE REGISTERS — see the header: a high address and its
+     * physical twin index the same level-1 entry, so this is the identity map
+     * and a coarse linear map at once. */
+    msr     ttbr0_el1, x0
+    msr     ttbr1_el1, x0
+    dsb     ish
+    isb
+
+    /* Read-modify-write rather than a constant: the reset value carries the
+     * stack-alignment and endianness bits this kernel has no opinion about.
+     * The three bits together are not a logical immediate, so they arrive in a
+     * register. */
+    mrs     x1, sctlr_el1
+    ldr     x2, =(SCTLR_M | SCTLR_C | SCTLR_I)
+    orr     x1, x1, x2
+    msr     sctlr_el1, x1
+    isb
+
+    /* INTO THE HIGH HALF. An absolute branch through a literal — the one
+     * instruction the whole relocation window exists for. */
+    ldr     x0, =.Lhigh
+    br      x0
+
+.Lhigh:
+    /* RUNNING HIGH. Every symbol is its own link address from here on, and
+     * ordinary compiled code is callable. */
+    ldr     x0, =_stack_top
+    mov     sp, x0
+
+    /* Exception vectors. VBAR_EL1 wants a 2 KiB-aligned table, and holds a
+     * VIRTUAL address — so it is set here rather than before the MMU, where it
+     * would have named an address nothing could translate. */
+    ldr     x0, =_vectors
+    msr     vbar_el1, x0
+
+    /* The real tables, built with translation on. x19/x20 are callee-saved, so
+     * they survive the second call. */
+    bl      sos_mmu_tables              /* -> the linear map's level-1 base   */
+    mov     x19, x0
+    bl      sos_page_tables_build       /* -> process set 0's level-1 base    */
+    mov     x20, x0
+
+    /* Install TTBR1 FROM THE IDENTITY MAP. Branching low first is what gives
+     * the swap somewhere to stand: the instruction after `msr ttbr1_el1` is
+     * fetched through TTBR0, which this is not touching. */
+    ldr     x9, =LINMAP_PHYS_MASK
+    ldr     x0, =.Lswap_phys
+    and     x0, x0, x9
+    br      x0
+
+.Lswap_phys:
+    msr     ttbr1_el1, x19
+    isb
+    tlbi    vmalle1
+    dsb     nsh
+    isb
+    ldr     x0, =.Lhigh_final
+    br      x0
+
+.Lhigh_final:
+    /* Back in the high half, now through the real linear map. TTBR0 becomes
+     * set 0's — `ROOT_PROCESS`'s, which the boot door re-installs by name — and
+     * the identity map is gone with it. From here the low half is the user's
+     * alone, which is the whole point of the unit. */
+    msr     ttbr0_el1, x20
+    isb
+    tlbi    vmalle1
+    dsb     nsh
+    isb
 
     /* Enter the Saw kernel. It stops the machine and does not return; if it
      * ever does, hang rather than execute past the image. */
@@ -272,3 +425,19 @@ _stack_bottom:
     .skip 0x10000
     .globl _stack_top
 _stack_top:
+
+/* THE BOOT TABLE (sawos design 29): one page, two live descriptors, used for
+ * exactly the window between the MMU coming on and the real linear map being
+ * installed. Dead memory afterwards — 4 KiB is cheaper than the alternatives,
+ * which are running compiled code before translation exists or teaching the
+ * assembly to build the real map.
+ *
+ * In `.bss` and therefore zeroed by the loop above, which is what leaves the
+ * other 510 entries INVALID; it is built after that loop for the same reason.
+ * A translation table must be page-aligned, and here that is the assembler's
+ * job rather than a run-time round-up. */
+    .section .bss.boottable, "aw", @nobits
+    .balign 4096
+    .globl _boot_l1
+_boot_l1:
+    .skip 4096

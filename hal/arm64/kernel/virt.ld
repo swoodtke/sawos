@@ -41,27 +41,71 @@
  * `.payload` section.
  */
 
+/* ---------------------------------------------------------------------------
+ * THE HIGHER-HALF LINK (sawos design 29, M5 unit 1.5)
+ * ---------------------------------------------------------------------------
+ * The kernel LINKS at high virtual addresses and LOADS at the physical ones it
+ * always loaded at. Every section below is placed at `physical + LINMAP_OFFSET`
+ * and given an explicit load address of `ADDR(section) - LINMAP_OFFSET`, so:
+ *
+ *   - the ELF's PROGRAM HEADERS carry the same physical addresses as before,
+ *     and QEMU (which loads `-kernel` at each segment's `p_paddr`) puts the
+ *     image exactly where it used to;
+ *   - every symbol the kernel resolves at run time is a high address, which is
+ *     what makes the kernel reachable through TTBR1 and TTBR0 purely the user's.
+ *
+ * `AT(ADDR(.x) - LINMAP_OFFSET)` per section rather than a second MEMORY region:
+ * with two regions the VMA and LMA cursors advance independently, so a section
+ * whose alignment differs from its predecessor's silently breaks the fixed
+ * delta the whole scheme rests on. Spelling the load address from the virtual
+ * one makes the delta an identity instead of a coincidence.
+ *
+ * THE ENTRY POINT IS PHYSICAL. QEMU sets the reset PC from `e_entry` with the
+ * MMU off, so a high entry would fault before the first instruction. `_start`
+ * itself stays a high symbol like everything else; `_start_phys` below is its
+ * load address, and that is what `ENTRY` names.
+ *
+ * THE OFFSET IS ALSO IN `hal/arm64/kernel/lib.saw` (`LINMAP_OFFSET`), and
+ * nothing at build time can compare the two — a Saw static's VALUE is not a
+ * linker symbol. `linmap_offset_probe` compares them AT BOOT, against the
+ * address this script actually gave a static that file owns, before the linear
+ * map is built. `LINMAP_PHYS_MASK` is exported for `boot.S`, which needs the
+ * complement as a value it can load; the two ASSERTs below are what keep this
+ * file's own pair consistent.
+ */
+LINMAP_OFFSET    = 0xFFFFFF8000000000;
+LINMAP_PHYS_MASK = 0x0000007FFFFFFFFF;
+ASSERT((LINMAP_OFFSET & LINMAP_PHYS_MASK) == 0,
+       "the linear-map offset must not overlap the physical half")
+ASSERT((LINMAP_OFFSET | LINMAP_PHYS_MASK) == 0xFFFFFFFFFFFFFFFF,
+       "the linear-map offset and mask must partition the 64-bit address")
+
 OUTPUT_ARCH(aarch64)
-ENTRY(_start)
+ENTRY(_start_phys)
 
 MEMORY {
-    RAM (rwxa) : ORIGIN = 0x40000000, LENGTH = 128M
+    RAM (rwxa) : ORIGIN = 0x40000000 + 0xFFFFFF8000000000, LENGTH = 128M
 }
 
 SECTIONS {
-    . = 0x40000000;
+    . = 0x40000000 + LINMAP_OFFSET;
 
-    .text : {
+    .text : AT(ADDR(.text) - LINMAP_OFFSET) {
         KEEP(*(.text.boot))
         KEEP(*(.text.vectors))
         *(.text .text.*)
     } > RAM
 
-    .rodata : {
+    /* The ELF entry: `_start`'s LOAD address, which is where the reset PC has to
+     * land because the MMU is off there. `boot.S` runs a handful of instructions
+     * at this address and then jumps to its own high half. */
+    _start_phys = _start - LINMAP_OFFSET;
+
+    .rodata : AT(ADDR(.rodata) - LINMAP_OFFSET) {
         *(.rodata .rodata.*)
     } > RAM
 
-    .data : {
+    .data : AT(ADDR(.data) - LINMAP_OFFSET) {
         *(.data .data.*)
     } > RAM
 
@@ -76,7 +120,7 @@ SECTIONS {
      * rather than tidy: protection granularity here IS the page, so a payload
      * sharing a page with kernel code would grant EL0 that code. Rounding the
      * end up as well is what keeps the grant from spilling into `.bss`. */
-    .payload : ALIGN(4096) {
+    .payload : AT(ADDR(.payload) - LINMAP_OFFSET) ALIGN(4096) {
         _payload_start = .;
         KEEP(*(.payload))
         . = ALIGN(4096);
@@ -104,17 +148,17 @@ SECTIONS {
      * granularity does not reach it, and the blob is dead bytes once the copy
      * is done. `.payload` above is page-aligned precisely because it IS
      * granted; these are not. */
-    .regions : ALIGN(8) {
+    .regions : AT(ADDR(.regions) - LINMAP_OFFSET) ALIGN(8) {
         _region_table_start = .;
         KEEP(*(.regions))
         _region_table_end = .;
     } > RAM
 
-    .childimg : ALIGN(16) {
+    .childimg : AT(ADDR(.childimg) - LINMAP_OFFSET) ALIGN(16) {
         KEEP(*(.childimg))
     } > RAM
 
-    .bss (NOLOAD) : ALIGN(4096) {
+    .bss (NOLOAD) : AT(ADDR(.bss) - LINMAP_OFFSET) ALIGN(4096) {
         _bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
@@ -139,7 +183,17 @@ SECTIONS {
      *
      * `ROOT_LOAD_BASE` in hal/arm64/kernel/lib.saw is the same number; this is
      * the linker's copy of it, and a build that trips this assert should widen
-     * the region map rather than shrink the pool silently. */
-    ASSERT(_bss_end <= 0x40200000,
+     * the region map rather than shrink the pool silently.
+     *
+     * **IT CARRIES A SECOND JOB SINCE sawos design 29**, and it is worth knowing
+     * before widening the ceiling: 0x40200000 is also the top of RAM's FIRST
+     * 2 MiB block, and the linear map leaves exactly that one block executable
+     * at EL1 (`KERNEL_IMAGE_BLOCK` in lib.saw) with every other block PXN. So an
+     * image that outgrew this bound would also have run its own tail
+     * non-executable. Widening it means widening the carve-out there too.
+     *
+     * Compared on the LOAD address: `_bss_end` is a high symbol now, and what
+     * has to stay below root's base is where the bytes land. */
+    ASSERT(_bss_end - LINMAP_OFFSET <= 0x40200000,
            "kernel .bss overruns ROOT_LOAD_BASE (0x40200000) -- see PROT_DOMAIN_SLOTS")
 }

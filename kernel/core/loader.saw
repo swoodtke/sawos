@@ -90,13 +90,17 @@ public(package) func root_region() -> LoadRegion {
 
 /// Overlay the header on the image's first bytes. One view construction, then
 /// an ordinary safe struct — the unsafety is confined to this line.
+///
+/// `addr` is PHYSICAL — a sosimg blob's base, which is an address-as-data and
+/// stays physical by the design-29 discipline. The linear map is where the
+/// kernel reaches it, and `hal.phys_to_virt` is the identity on the MPU tier.
 func header_at(addr: UInt) unsafe -> SosimgHeader {
-    UnsafeMemory<SosimgHeader, Normal>(addr).read()
+    UnsafeMemory<SosimgHeader, Normal>(hal.phys_to_virt(addr)).read()
 }
 
-/// Overlay one segment record.
+/// Overlay one segment record. Same conversion, same reason.
 func seg_at(addr: UInt) unsafe -> SosimgSeg {
-    UnsafeMemory<SosimgSeg, Normal>(addr).read()
+    UnsafeMemory<SosimgSeg, Normal>(hal.phys_to_virt(addr)).read()
 }
 
 /// Validate one segment record against the image bounds and the destination
@@ -445,8 +449,15 @@ public(package) func place_image(p: Int, img_base: UInt,
             record_grant(p, load_addr, load_addr + mem_len, seg.flags, true,
                          NO_MEMORY)
         } else {
-            long_copy(load_addr, img_base + (seg.file_off as UInt), file_len)
-            long_zero(load_addr + file_len, mem_len - file_len)
+            // BOTH ENDS ARE PHYSICAL AND BOTH CONVERT (sawos design 29): the
+            // destination is where the child's bytes go in RAM, the source is
+            // inside the sosimg blob, and neither is an address the kernel runs
+            // at. `load_addr` itself stays physical below — it is what
+            // `record_grant` installs and what the child will see.
+            long_copy(hal.phys_to_virt(load_addr),
+                      hal.phys_to_virt(img_base + (seg.file_off as UInt)),
+                      file_len)
+            long_zero(hal.phys_to_virt(load_addr + file_len), mem_len - file_len)
 
             // The sosimg flag bits ARE the protection vocabulary (imgformat
             // states the encoding; each HAL translates it into its own

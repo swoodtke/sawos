@@ -32,7 +32,57 @@ typedef unsigned int  u32;
 // edit here, with nothing to catch a missed one.
 
 u64 sos_page_tables_build(void);
+u64 sos_linmap_build(void);
 u64 sos_mair_value(void);
+
+// ---- the linear map, and the one arithmetic fact this file needs ------------
+//
+// The kernel LINKS in the high half and LOADS at its physical addresses (sawos
+// design 29; `virt.ld` adds the offset to the VMA and takes it back off with
+// `AT`). So every linker symbol's address here is a KERNEL address, and the
+// three places below that publish an address as DATA have to hand back the
+// physical one.
+//
+// The offset is `virt.ld`'s number and `lib.saw`'s; this is a third spelling of
+// its complement, and it is kept honest at run time rather than at build time —
+// `linmap_offset_probe` in `lib.saw` compares the linker's answer against its
+// own before anything can depend on either. There is no build-time comparison
+// to make: a Saw `static`'s value is not a linker symbol.
+#define SOS_LINMAP_PHYS_MASK 0x0000007FFFFFFFFFUL
+
+// ---- the two translation-control words boot.S installs ----------------------
+//
+// **DEFINED HERE AND READ BY `boot.S`, rather than spelled twice.** The MMU has
+// to be on before any compiled code can run at its link address, so the enable
+// sequence is hand-written assembly — but the VALUES it installs are decisions,
+// and a decision spelled in two files is a decision that drifts. `boot.S` loads
+// both of these out of `.rodata` through a masked (physical) pointer, which
+// works with the MMU off because `.rodata` is loaded at that address.
+//
+// MAIR is the one word this file cannot own: `lib.saw` builds it from the
+// `MemoryType` cases the descriptors use, and a `const` initializer cannot call
+// a function. So it is COPIED here and CHECKED against the original in
+// `sos_mmu_tables` below, on every boot.
+
+const u64 sos_boot_mair = 0x000000000004FF00UL;
+
+// T0SZ = T1SZ = 25: a 39-bit VA on BOTH halves, level 1 first, 4 KiB granule.
+// EPD1 is CLEAR since design 29 — the high half is walked, which is where the
+// kernel lives. A1 = 0, so TTBR0 still defines the ASID (design 27 relies on
+// it). IPS = 0: a 32-bit output address, which covers this board's map.
+const u64 sos_boot_tcr = 25UL                   // T0SZ
+                       | (1UL << 8)             // IRGN0: walks write-back cacheable
+                       | (1UL << 10)            // ORGN0: likewise
+                       | (3UL << 12)            // SH0: inner shareable
+                       | (0UL << 14)            // TG0: 4 KiB granule
+                       | (25UL << 16)           // T1SZ
+                       | (0UL << 22)            // A1: TTBR0 holds the ASID
+                       | (0UL << 23)            // EPD1: WALK the high half
+                       | (1UL << 24)            // IRGN1
+                       | (1UL << 26)            // ORGN1
+                       | (3UL << 28)            // SH1
+                       | (2UL << 30)            // TG1: 4 KiB granule
+                       | (0UL << 32);           // IPS: 32-bit output
 
 // ---- stopping the machine -------------------------------------------------
 //
@@ -77,8 +127,11 @@ void sos_platform_exit(u64 code) {
 extern unsigned char _payload_start[];
 extern unsigned char _payload_end[];
 
-u64 sos_payload_start(void) { return (u64)_payload_start; }
-u64 sos_payload_end(void)   { return (u64)_payload_end; }
+// MASKED TO PHYSICAL (sawos design 29). These bounds are granted to EL0 and
+// read by the loader as an image base — both physical readings — while the
+// symbol itself is a high link address. See the linear-map note at the top.
+u64 sos_payload_start(void) { return (u64)_payload_start & SOS_LINMAP_PHYS_MASK; }
+u64 sos_payload_end(void)   { return (u64)_payload_end   & SOS_LINMAP_PHYS_MASK; }
 
 // ---- the boot region table ------------------------------------------------
 //
@@ -95,45 +148,49 @@ u64 sos_payload_end(void)   { return (u64)_payload_end; }
 extern unsigned char _region_table_start[];
 extern unsigned char _region_table_end[];
 
-u64 sos_region_table_start(void) { return (u64)_region_table_start; }
-u64 sos_region_table_end(void)   { return (u64)_region_table_end; }
+// MASKED TO PHYSICAL for the reason the payload bounds are (sawos design 29).
+// The table's ROWS carry link addresses too — the linker resolves each blob
+// row's base from the child section's own symbol — and those are normalized in
+// `kernel/core/process.saw`, at the one place a row is read, because the mask
+// there is the arch-free `hal.virt_to_phys` and is idempotent on the rows whose
+// bases were literals all along.
+u64 sos_region_table_start(void) { return (u64)_region_table_start & SOS_LINMAP_PHYS_MASK; }
+u64 sos_region_table_end(void)   { return (u64)_region_table_end   & SOS_LINMAP_PHYS_MASK; }
 
-// ---- turning the MMU on ---------------------------------------------------
+// ---- the real translation tables (sawos design 29) -------------------------
 //
-// C BECAUSE: `msr`/`mrs` name a system register at assembly time, and `dsb`/
-// `isb` are barriers. The MAP itself is built in `lib.saw` and arrives here as
-// an address.
+// **TURNING THE MMU ON MOVED TO `boot.S`, AND THIS IS WHAT IS LEFT.** It used to
+// be one function here: build the identity map with translation OFF, then set
+// four system registers and enable. That order is no longer available. The
+// kernel LINKS in the high half, so no compiled code — C or Saw — may run until
+// the MMU is on and the high half is walked; the enable has to happen before the
+// first call, out of hand-written assembly, against a table hand-written
+// assembly can build.
 //
-// Called by `_start` after `.bss` is zeroed, because the tables live there.
+// So `boot.S` brings the machine up on a two-descriptor BOOT table, jumps into
+// the high half, and calls this. Which means the tables below are built with
+// TRANSLATION ALREADY ON, and every descriptor address goes out through
+// `lib.saw`'s `phys_to_virt` on the way to memory. `boot.S` then installs what
+// this hands back.
+//
+// C BECAUSE: reason 2 does not apply and reason 1 barely does — this is a
+// sequencing shim between two Saw builders and one assembly caller, and it is
+// here rather than in `lib.saw` only because the MAIR cross-check below reads a
+// C `const` that `boot.S` also reads.
 
-void sos_mmu_init(void) {
-    u64 ttbr0 = sos_page_tables_build();
-    u64 mair = sos_mair_value();
+// A boot-time bug stop distinct from anything `lib.saw`, the kernel or root
+// chooses: `sos_boot_mair` above has drifted from `sos_mair_value()` in
+// `lib.saw`, so the attributes the MMU came up under are not the ones the
+// descriptors mean. `lib.saw`'s neighbouring codes are 66 and 67.
+#define SOS_ABORT_MAIR_DRIFT 68
 
-    u64 tcr = 25UL                  // T0SZ = 25: a 39-bit VA, level 1 first
-            | (1UL << 8)            // IRGN0: walks are write-back cacheable
-            | (1UL << 10)           // ORGN0: likewise
-            | (3UL << 12)           // SH0: inner shareable
-            | (0UL << 14)           // TG0: 4 KiB granule
-            | (25UL << 16)          // T1SZ, unused but not left reserved
-            | (1UL << 23)           // EPD1: no TTBR1 walks at all
-            | (2UL << 30)           // TG1: 4 KiB granule
-            | (0UL << 32);          // IPS: 32-bit output, which covers the map
-
-    __asm__ volatile("msr mair_el1, %0" :: "r"(mair));
-    __asm__ volatile("msr tcr_el1, %0" :: "r"(tcr));
-    __asm__ volatile("msr ttbr0_el1, %0" :: "r"(ttbr0));
-    __asm__ volatile("dsb ish; isb" ::: "memory");
-
-    // Read-modify-write rather than a constant: the reset value carries the
-    // stack-alignment and endianness bits this kernel has no opinion about.
-    u64 sctlr;
-    __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
-    sctlr |= (1UL << 0)     // M: enable the MMU
-           | (1UL << 2)     // C: data cache
-           | (1UL << 12);   // I: instruction cache
-    __asm__ volatile("msr sctlr_el1, %0" :: "r"(sctlr));
-    __asm__ volatile("isb" ::: "memory");
+// Build the kernel's LINEAR MAP and hand back its level-1 physical base, for
+// `boot.S` to install in TTBR1_EL1 from the identity map.
+u64 sos_mmu_tables(void) {
+    if (sos_boot_mair != sos_mair_value()) {
+        sos_platform_exit(SOS_ABORT_MAIR_DRIFT);
+    }
+    return sos_linmap_build();
 }
 
 // ---- publishing a staged grant set ----------------------------------------

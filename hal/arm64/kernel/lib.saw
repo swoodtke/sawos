@@ -53,8 +53,12 @@ struct Pl011 {
 }
 
 extension Pl011 {
+    /// `at` is the PHYSICAL base — the number the board publishes and the number
+    /// a device grant carries. The linear map is where the kernel reaches it
+    /// (sawos design 29): the conversion is here, at the one construction, so
+    /// every caller keeps naming the register block by its real address.
     init(at: UInt) unsafe -> Pl011 {
-        Pl011(regs: UnsafeMemory<Pl011Regs, Device>(at))
+        Pl011(regs: UnsafeMemory<Pl011Regs, Device>(phys_to_virt(at)))
     }
 }
 
@@ -161,6 +165,103 @@ static GIC_CPU_BASE: UInt = 0x0801_0000
 /// The line the core's physical timer arrives on: a per-core interrupt, so it
 /// is the same number on every core and needs no distributor target.
 static TIMER_IRQ: UInt = 30
+
+// =============================================================================
+// The linear-map seam (sawos design 29, M5 unit 1.5)
+// =============================================================================
+//
+// **ADDRESSES-AS-DATA STAY PHYSICAL; ONLY A DEREFERENCE CONVERTS.** That is the
+// whole discipline of this unit, and these two functions are the whole of its
+// machinery. A `GrantRow`, a sosimg record, a boot-handle record, a region
+// table row, a `Memory`/`IoMemory` capability and a fault report word all carry
+// the SAME number they carried before the kernel moved: a physical address is
+// the one name for a location that crosses any API. What changed is that the
+// kernel no longer runs at those addresses, so the moment it DEREFERENCES one
+// it says so.
+//
+// On this HAL the pair is an OR and an AND with a fixed offset — no table walk,
+// no lookup, three instructions between them. On both riscv32 HALs it is the
+// identity and compiles to nothing. `kernel/core` names only these two and
+// carries no tier conditional.
+//
+// **WHY PURE OR/AND IS SAFE, AND WHY IT IS ASSERTED RATHER THAN ASSUMED.** The
+// offset's low `VA_BITS` bits are zero and every address this board can name
+// fits under that, so `pa | LINMAP_OFFSET` never carries into a set bit and
+// `va & LINMAP_PHYS_MASK` never clears one. The `static_assert`s below (and the
+// RAM one beside `RAM_BASE`, where that constant is declared) are what hold the
+// board's map to it: widen RAM past 512 GiB or move a device above it and the
+// BUILD stops, rather than a kernel quietly folding an address onto another.
+//
+// A pleasant consequence worth knowing when reading the sweep: `virt_to_phys`
+// is IDEMPOTENT on an address that is already physical, because masking off
+// bits that are not set changes nothing. That is what lets it normalize a value
+// whose provenance is mixed — a region-table row base, which the linker fills
+// in from a section symbol (a LINK address, high) in one row and from a literal
+// (already physical) in the next.
+
+/// The virtual-address size TCR selects for BOTH halves — `T0SZ` = `T1SZ` =
+/// `64 - VA_BITS`. 39 bits at the 4 KiB granule puts level 1 first, with 512
+/// entries of 1 GiB each; `sink.c` writes the register and this is the number
+/// it writes.
+static VA_BITS: Int = 39
+
+/// The low half of a 64-bit address at `VA_BITS`: the bits a physical address
+/// may occupy, and exactly the mask `virt_to_phys` applies.
+static LINMAP_PHYS_MASK: UInt = (1 << VA_BITS) - 1
+
+/// **WHERE THE KERNEL LIVES** — the canonical TTBR1 base for a `VA_BITS`-bit
+/// virtual address, `2^64 - 2^39`. Every kernel address in the running system
+/// is `physical | LINMAP_OFFSET`, which is what makes the conversion arithmetic
+/// rather than a lookup, and the kernel's own image is LINKED at these
+/// addresses (`virt.ld` adds it to the load address and takes it back off with
+/// `AT`, so the ELF's physical addresses are unchanged and QEMU loads the image
+/// exactly where it always did).
+///
+/// Written as a literal because a const fold runs in the SIGNED platform-`Int`
+/// domain (design 185), where this value is negative — the language's own
+/// advice for a constant with the top bit set is to write it out. The asserts
+/// below are what check it against `VA_BITS` anyway, so the literal cannot
+/// drift from the register.
+public static LINMAP_OFFSET: UInt = 0xFFFF_FF80_0000_0000
+
+static_assert((LINMAP_OFFSET & LINMAP_PHYS_MASK) == 0,
+              "the linear-map offset must not overlap the physical half, or `|` would carry")
+static_assert((LINMAP_OFFSET | LINMAP_PHYS_MASK) == UInt.max,
+              "the offset and the mask must partition the 64-bit address")
+
+// The BOARD'S MMIO, held to the same bound as RAM. Both device blocks live in
+// the first GiB, so these are never close — which is the point of asserting
+// them: a board file that moved a controller would have to notice.
+static_assert(UART_BASE <= LINMAP_PHYS_MASK,
+              "the console UART must fit under the linear-map offset")
+static_assert(GIC_DIST_BASE <= LINMAP_PHYS_MASK,
+              "the GIC distributor must fit under the linear-map offset")
+static_assert(GIC_CPU_BASE <= LINMAP_PHYS_MASK,
+              "the GIC CPU interface must fit under the linear-map offset")
+
+/// **A PHYSICAL ADDRESS AS THE KERNEL MUST SPELL IT TO DEREFERENCE IT.**
+///
+/// Every kernel-side `UnsafeMemory`/`UnsafePointer` built out of a STORED
+/// physical address goes through here — the sosimg overlays, the region-table
+/// overlays, the copy doors, the descriptor writes, and this file's own MMIO
+/// views. What does NOT go through here is an address that was already a kernel
+/// one: a pointer taken from a Saw reference (`(&var THREAD_FRAMES) as ...`) is
+/// a link-time address and is high already.
+public func phys_to_virt(pa: UInt) -> UInt {
+    pa | LINMAP_OFFSET
+}
+
+/// The inverse: a kernel dereference address back to the physical address that
+/// is its name everywhere else.
+///
+/// Its callers are the places a kernel address has to become HARDWARE's or
+/// DATA's: the translation-table pool's base (a descriptor and a TTBR hold
+/// physical addresses), the payload and region-table linker bounds, and the
+/// region rows the linker resolved. Idempotent on an address that is already
+/// physical — see the section header.
+public func virt_to_phys(va: UInt) -> UInt {
+    va & LINMAP_PHYS_MASK
+}
 
 // =============================================================================
 // Identity (design 162)
@@ -460,6 +561,12 @@ public func resume_frame(frame_addr: UInt) -> Never {
 
 /// First byte of the appended payload — the `.payload` section `virt.ld`
 /// bounds. Saw cannot name a linker symbol, so the bounds arrive through C.
+///
+/// **PHYSICAL, AND THE CONVERSION IS IN `sink.c`** (sawos design 29). A linker
+/// symbol's address is a LINK address, and this kernel now links high — but a
+/// payload's bounds are granted to EL0 and read by the loader as an image base,
+/// which are both physical readings. So the C accessors mask, and every caller
+/// keeps the number it always had.
 public func payload_start() -> UInt {
     sos_payload_start()
 }
@@ -541,6 +648,28 @@ extension ExceptionClass {
 }
 
 /// ISS bit 6 (WnR) on a data abort: set means the access was a write.
+///
+/// **THE FAULT CLASS IS NORMALIZED HERE BY BEING IGNORED, AND THAT IS NOW A
+/// DECISION RATHER THAN AN OMISSION** (sawos design 29). The ISS also carries a
+/// `DFSC` field saying WHICH KIND of abort this was — translation, permission,
+/// access flag, address size — and this decode reads none of it. §5.7 reports
+/// what a process may act on: WHETHER it was refused and in WHICH DIRECTION.
+/// Which table level noticed is the kernel's business.
+///
+/// It became load-bearing with this unit. Under design 27 a stray EL0 access to
+/// a page its process was not granted hit a descriptor that was PRESENT and
+/// EL0-denied, so it was a PERMISSION fault; the same access now finds an
+/// INVALID descriptor and is a TRANSLATION fault. Both are `EC` 0x24, both come
+/// through here, and both render `store-access-fault` / `load-access-fault`.
+/// The vocabulary is also Profile A's, where a PMP violation has no class at
+/// all — which is the deeper reason not to publish one.
+///
+/// **THE GATE CANNOT WITNESS THIS** (design 27 finding 3): the console
+/// transcript holds pass/fail rows and build sizes, and every fault assertion in
+/// the runner is the bare prefix `"SOS: fault "`. So the class change was checked
+/// by PROBE — a case made to fault on a non-granted page, with the raw `ESR`
+/// `fault_trap` prints read by hand — and design 29's As-built records the two
+/// syndromes side by side.
 func abort_direction(iss: UInt) -> String {
     if (iss & ISS_WNR) != 0 {
         "store-access-fault"
@@ -802,9 +931,32 @@ static PT_SET_BYTES: UInt = (512 + 512 + 1024 + 512 + 512) * 8
 /// `GRANT_ROW_BUDGET`, so the two cannot disagree without the build saying so.
 public static PROT_DOMAIN_SLOTS: Int = 3
 
-/// The pool: one set per process slot, back to back, plus one table's worth of
-/// alignment slack for the run-time round-up.
-static PT_DESCRIPTORS: Int = PT_SET_DESCRIPTORS * PROT_DOMAIN_SLOTS + 512
+/// **THE KERNEL'S OWN TABLES — the LINEAR MAP, and it exists ONCE** (sawos
+/// design 29). Three tables: a level 1, a level 2 over the device gigabyte, and
+/// a level 2 over RAM's gigabyte. No level 3 anywhere, because nothing in the
+/// kernel's own map is granted a page at a time — page granularity is a
+/// property of the USER windows, which live in TTBR0 and in the per-process
+/// sets above.
+///
+/// **THIS IS WHAT THE PER-PROCESS SETS STOPPED CARRYING.** Before this unit
+/// every set repeated the whole EL1 half — 2 MiB identity blocks over all of
+/// RAM and over the device space — because `TCR_EL1.EPD1` was set and the high
+/// half was not walked at all, so kernel mappings had nowhere else to live.
+/// TTBR1 is open now and they live here, once.
+static LINMAP_DESCRIPTORS: Int = 512 + 512 + 512
+
+/// Bytes in the linear map, the `UInt` spelling for address arithmetic.
+static LINMAP_BYTES: UInt = (512 + 512 + 512) * 8
+
+/// The pool: one set per process slot, back to back, then the LINEAR MAP, plus
+/// one table's worth of alignment slack for the run-time round-up.
+///
+/// The slack argument is unchanged and is stated at `PT_SET_DESCRIPTORS`: a
+/// `[UInt64; N]` static is 8-aligned, so rounding its base up to a page costs at
+/// most 511 descriptors, and one spare table covers that however many sets and
+/// kernel tables sit behind it.
+static PT_DESCRIPTORS: Int = (PT_SET_DESCRIPTORS * PROT_DOMAIN_SLOTS
+                              + LINMAP_DESCRIPTORS + 512)
 
 unsafe static var PAGE_TABLES: [UInt64; PT_DESCRIPTORS] = [0; PT_DESCRIPTORS]
 
@@ -835,6 +987,20 @@ static DEVICE_LEVEL2_OFFSET: UInt = 16_384
 static DEVICE_LEVEL3_OFFSET: UInt = 20_480
 
 static RAM_BASE: UInt = 0x4000_0000
+
+/// How much RAM this board wires — `virt.ld`'s `MEMORY` LENGTH, restated here
+/// because the LINEAR MAP has to know where to stop. Mapping exactly the RAM
+/// that exists (rather than the whole gigabyte the level-1 entry covers) is what
+/// makes a kernel dereference past the end of memory a translation fault instead
+/// of a read of nothing.
+static RAM_LEN: UInt = 128 * 1024 * 1024
+
+// The linear map's own bound, and the last of design 29's build-time checks:
+// every byte of RAM must fit under the offset for `pa | LINMAP_OFFSET` to be a
+// pure OR. The device asserts sit with the seam, beside the board's MMIO bases.
+static_assert(RAM_BASE + RAM_LEN - 1 <= LINMAP_PHYS_MASK,
+              "RAM must fit under the linear-map offset for the OR/AND pair to be exact")
+
 static PAGE_SHIFT: Int = 12
 /// Where the ASID sits in `TTBR0_EL1` — bits 63:48, of which `TCR_EL1.AS` = 0
 /// makes bits 55:48 significant. Three process slots use three of those 256.
@@ -950,9 +1116,22 @@ func align_up(v: UInt, align: UInt) -> UInt {
     }
 }
 
-/// The page-aligned base of the whole pool — set 0's level-1 table.
+/// The page-aligned PHYSICAL base of the whole pool — set 0's level-1 table.
+///
+/// **PHYSICAL, AND THAT IS THE WHOLE OF WHY THE CONVERSION IS HERE** (sawos
+/// design 29). Everything downstream of this number is hardware's reading of it:
+/// a `TTBR` holds a physical table base, and so does every table descriptor that
+/// points at a next level. The pointer arrives as a KERNEL address — a Saw
+/// reference to a static, which the linker placed in the high half — so this is
+/// one of the seam's few `virt_to_phys` sites, and `put_desc` converts back at
+/// the store.
+///
+/// Alignment survives the conversion in either order: the offset's low
+/// `VA_BITS` bits are zero and `PAGE_SIZE` divides `2^VA_BITS`, so masking never
+/// disturbs a page boundary.
 func pool_base() unsafe -> UInt {
-    align_up(((&var PAGE_TABLES) as UnsafePointer<UInt64>) as UInt, PAGE_SIZE)
+    align_up(virt_to_phys(((&var PAGE_TABLES) as UnsafePointer<UInt64>) as UInt),
+             PAGE_SIZE)
 }
 
 /// The page-aligned base of `set`'s five tables.
@@ -973,55 +1152,199 @@ func tables_base() unsafe -> UInt {
     set_base(CURRENT_SET)
 }
 
-/// Write descriptor `index` of the table at `table`.
+/// Write descriptor `index` of the table at PHYSICAL address `table`.
+///
+/// **THE ONE DEREFERENCE OF A TABLE ADDRESS IN THIS FILE** (sawos design 29).
+/// Table addresses travel as physical throughout — they are what a descriptor
+/// and a `TTBR` hold — so the linear-map conversion belongs at the store rather
+/// than at each of the dozen places a table base is computed. Every window
+/// walk, every set build and every grant edit reaches memory through this line.
 func put_desc(table: UInt, index: UInt, desc: UInt64) unsafe {
-    UnsafeMemory<UInt64, Normal>(table + index * DESC_BYTES).write(desc)
+    UnsafeMemory<UInt64, Normal>(phys_to_virt(table + index * DESC_BYTES)).write(desc)
 }
 
-/// A grant-window page as the KERNEL sees it: read, write and execute at EL1,
-/// nothing at EL0.
-func kernel_page(va: UInt) -> UInt64 {
-    ((va as UInt64) | DESC_VALID | DESC_PAGE | MemoryType.Normal.attr_index()
-     | ATTR_AF | ATTR_SH_INNER | ATTR_NG | (AccessPerm.El1Rw as UInt64) | ATTR_UXN)
-}
+/// **AN UNGRANTED PAGE — AND IT IS NOW GENUINELY ABSENT** (sawos design 29).
+///
+/// A zero descriptor is INVALID, which is the whole encoding: no output
+/// address, no permissions, no attributes to get wrong. Nothing else is needed
+/// to say "this process was not given these bytes".
+///
+/// **THE UNIT-1 REASON IT COULD NOT BE ZERO HAS DISSOLVED.** Design 27 had to
+/// leave every window page PRESENT and EL1-only, because the kernel's own
+/// `.text`, its stack and its table pool all sit inside the 4 MiB window and the
+/// per-process set was the ONLY map — so an absent page there would have
+/// unmapped the kernel from itself, and `place_image`/`copy_in`/`copy_out`
+/// reached a peer's RAM through whatever set happened to be live. Both of those
+/// now go through TTBR1's linear map, which no process switch touches, so
+/// TTBR0 owes the kernel nothing at all and a set holds ONLY its process's
+/// grants.
+///
+/// What that buys, beyond the low half becoming purely the user's: isolation
+/// here is now the absence of a TRANSLATION rather than the absence of a
+/// permission — which is what design 27's own As-built said it could not yet
+/// claim at the descriptor level, even while it held at the table level.
+///
+/// The `va` parameter is gone with the body: an invalid descriptor names no
+/// address. Both windows share this one spelling, RAM and device alike, because
+/// "not granted" has no per-window flavour once it stops carrying attributes.
+static DESC_ABSENT: UInt64 = 0
 
-/// Every page of the window back to kernel-only.
+/// Every page of the window back to ungranted.
 func reset_window(level3: UInt) unsafe {
     var i: UInt = 0
     while i < GRANT_PAGES {
-        put_desc(level3, i, kernel_page(RAM_BASE + (i << PAGE_SHIFT)))
+        put_desc(level3, i, DESC_ABSENT)
         i = i + 1
     }
 }
 
-/// A device page as the KERNEL sees it: read and write at EL1, no EL0, no
-/// execution at either level, and the strictest device attribute.
-func kernel_device_page(va: UInt) -> UInt64 {
-    ((va as UInt64) | DESC_VALID | DESC_PAGE | MemoryType.Device.attr_index()
-     | ATTR_AF | ATTR_NG | (AccessPerm.El1Rw as UInt64) | ATTR_PXN | ATTR_UXN)
-}
-
-/// Every page of the DEVICE window back to kernel-only.
+/// Every page of the DEVICE window back to ungranted.
 func reset_device_window(level3: UInt) unsafe {
     var i: UInt = 0
     while i < PT_ENTRIES {
-        put_desc(level3, i, kernel_device_page(DEVICE_WINDOW_BASE + (i << PAGE_SHIFT)))
+        put_desc(level3, i, DESC_ABSENT)
         i = i + 1
     }
 }
 
-/// Build the identity map and hand back the level-1 table's address, which is
-/// what the low translation base register wants.
+/// The physical base of the LINEAR MAP's level-1 table — the value `TTBR1_EL1`
+/// holds for the life of the machine.
 ///
-/// Called by `sink.c`'s activation leaf before it turns the MMU on, so this
-/// runs with translation OFF and physical == virtual. It must follow the `.bss`
-/// zerofill, because that is where `PAGE_TABLES` lives.
+/// It sits after every process set in the same pool, which is what lets one
+/// run-time round-up serve the whole thing.
+func linmap_base() unsafe -> UInt {
+    pool_base() + (PROT_DOMAIN_SLOTS as UInt) * PT_SET_BYTES
+}
+
+/// Which 2 MiB block of RAM the kernel image occupies — the one block the
+/// linear map leaves executable. Zero, and `virt.ld`'s `_bss_end` assert is what
+/// keeps it so; see `linmap_build`.
+static KERNEL_IMAGE_BLOCK: UInt = 0
+
+/// This HAL's second failure code: the linker script and this file disagree
+/// about where the kernel lives. Distinct from `ABORT_GRANT_OUTSIDE_WINDOW` and
+/// from anything the kernel or root chooses.
+static ABORT_LINMAP_OFFSET: UInt = 67
+
+/// **DO THE LINKER SCRIPT AND THIS FILE AGREE ABOUT WHERE THE KERNEL LIVES?**
+///
+/// `LINMAP_OFFSET` is written twice — here, and in `virt.ld`, which adds it to
+/// the load address and takes it back off with `AT`. Nothing at build time can
+/// compare the two (a Saw `static`'s VALUE is not a linker symbol, so neither
+/// side can assert against the other), so they are compared at BOOT instead,
+/// against the address the linker actually gave a static this file owns. One
+/// `and` and two compares, once, on a path that runs before anything can depend
+/// on being wrong.
+///
+/// It runs FIRST in `linmap_build`, while the boot tables are still live and the
+/// console still answers — which is what makes the report reachable rather than
+/// a silent stop.
+func linmap_offset_probe() unsafe {
+    let here = ((&var PAGE_TABLES) as UnsafePointer<UInt64>) as UInt
+    if (here & LINMAP_OFFSET) != LINMAP_OFFSET {
+        report_str("SOS: kernel is not linked in the high half: ")
+        report_hex(here)
+        report_str("\n")
+        exit_fail(ABORT_LINMAP_OFFSET)
+    }
+    let pa = virt_to_phys(here)
+    if pa < RAM_BASE || pa >= RAM_BASE + RAM_LEN {
+        report_str("SOS: kernel physical address is outside RAM: ")
+        report_hex(pa)
+        report_str("\n")
+        exit_fail(ABORT_LINMAP_OFFSET)
+    }
+}
+
+/// **BUILD THE KERNEL'S OWN MAP AND HAND BACK ITS LEVEL-1 BASE** (sawos design
+/// 29). `boot.S` installs it in `TTBR1_EL1` from the identity map and never
+/// writes that register again.
+///
+/// Two level-2 tables and nothing finer: 2 MiB Device blocks over the device
+/// gigabyte, 2 MiB Normal blocks over the RAM this board actually wires. A
+/// kernel dereference past `RAM_LEN` finds an invalid descriptor rather than a
+/// mapping of nothing, which is why the walk stops at the real length instead of
+/// filling the level-1 entry's whole gigabyte.
+///
+/// **PXN EVERYWHERE THE KERNEL'S OWN TEXT IS NOT** — the W^X improvement this
+/// unit gets for free. Before it, every set carried EL1 blocks over ALL of RAM
+/// with PXN clear, so all 128 MiB was kernel-executable; here exactly one 2 MiB
+/// block is, and it is the one the image occupies. The device half is PXN and
+/// UXN throughout: registers are not instructions.
+///
+/// **WHAT MAKES "EXACTLY ONE BLOCK" TRUE IS AN ASSERT THAT ALREADY EXISTED.**
+/// `virt.ld` requires the whole kernel image to end below `ROOT_LOAD_BASE`
+/// (0x4020_0000) so that `.bss` cannot overrun root's load address — and that
+/// bound IS the top of RAM's first 2 MiB block. So the linker script's ceiling
+/// and this carve-out are one number, and an image that outgrew the block would
+/// stop the BUILD rather than silently run non-executable. Said at both ends.
+///
+/// **NOT TAKEN, AND RECORDED AS A LIMIT:** per-section W^X inside that block —
+/// `.text` RX, `.rodata` RO, `.data`/`.bss` RW — which wants a level-3 table and
+/// page-aligned section bounds the linker script does not publish today. The
+/// block is EL1 RWX, so the kernel's own data is executable to the kernel. That
+/// is strictly better than the 128 MiB it was and strictly short of the page
+/// granularity this machinery could express; whoever wants it adds three linker
+/// symbols and a level 3 here.
+///
+/// AUDIT (design 1): NO PREEMPTION POINT — 578 descriptor stores, before
+/// `kmain`, with no interrupt controller yet. Pre-IRQ by construction.
+@export("sos_linmap_build")
+func linmap_build() unsafe -> UInt {
+    linmap_offset_probe()
+
+    let level1 = linmap_base()
+    let dev_level2 = level1 + LEVEL2_OFFSET
+    let ram_level2 = level1 + LEVEL3_OFFSET
+
+    put_desc(level1, 0, (dev_level2 as UInt64) | DESC_VALID | DESC_TABLE)
+    put_desc(level1, 1, (ram_level2 as UInt64) | DESC_VALID | DESC_TABLE)
+
+    // The device gigabyte: everything below RAM, EL1 read/write, never
+    // executable at either level, strictest device attribute. The kernel's UART
+    // and its interrupt controller are both in here.
+    var d: UInt = 0
+    while d < PT_ENTRIES {
+        put_desc(dev_level2, d,
+                 ((d << BLOCK_SHIFT) as UInt64)
+                 | DESC_VALID | DESC_BLOCK | MemoryType.Device.attr_index()
+                 | ATTR_AF | (AccessPerm.El1Rw as UInt64) | ATTR_PXN | ATTR_UXN)
+        d = d + 1
+    }
+
+    // RAM: Normal cacheable, inner shareable, EL1 read/write, never executable
+    // at EL0. GLOBAL on purpose — these translations belong to the kernel rather
+    // than to an address space, so `ATTR_NG` would be wrong here and would cost
+    // a TLB entry per process for a mapping every process shares.
+    var i: UInt = 0
+    while i < (RAM_LEN >> BLOCK_SHIFT) {
+        var block = (((RAM_BASE + (i << BLOCK_SHIFT)) as UInt64)
+                     | DESC_VALID | DESC_BLOCK | MemoryType.Normal.attr_index()
+                     | ATTR_AF | ATTR_SH_INNER | (AccessPerm.El1Rw as UInt64)
+                     | ATTR_UXN)
+        if i != KERNEL_IMAGE_BLOCK {
+            block = block | ATTR_PXN
+        }
+        put_desc(ram_level2, i, block)
+        i = i + 1
+    }
+    level1
+}
+
+/// Build the per-process table sets and hand back set 0's base, which is what
+/// `TTBR0_EL1` starts on.
+///
+/// **IT RUNS WITH THE MMU ALREADY ON** (sawos design 29), from `boot.S` after
+/// the jump into the high half and through the boot tables that jump installed.
+/// That is the reversal this unit makes: it used to run with translation OFF,
+/// where physical and virtual coincided and nothing had to convert. Now
+/// `put_desc` converts, and the addresses in every descriptor stay physical.
 ///
 /// AUDIT (design 1): NO PREEMPTION POINT in any of the walks below (~2560
 /// descriptor stores per set, so ~7680 at `PROT_DOMAIN_SLOTS` 3 — sawos design
 /// 27 multiplied the count and changed nothing else about the argument). This
-/// runs before `kmain`, with the MMU off and no interrupt controller yet —
-/// pre-IRQ by construction, so there is nothing a point could deliver.
+/// runs before `kmain`, with no interrupt controller yet — pre-IRQ by
+/// construction, so there is nothing a point could deliver.
 @export("sos_page_tables_build")
 func page_tables_build() unsafe -> UInt {
     var set: UInt = 0
@@ -1036,31 +1359,39 @@ func page_tables_build() unsafe -> UInt {
     set_base(0)
 }
 
-/// Build ONE complete set at `level1`: the identity map, both windows reset to
-/// kernel-only, every table it needs.
+/// Build ONE complete set at `level1`: the two USER WINDOWS, empty, and the
+/// tables that reach them.
 ///
-/// **EVERY SET CARRIES THE WHOLE EL1 HALF, AND THAT IS LOAD-BEARING** (sawos
-/// design 27; design 25 D-3 leaves the placement to this file and names the
-/// constraint). Two things forbid narrowing it:
+/// **A SET IS NOW THE PROCESS'S WINDOWS AND NOTHING ELSE** (sawos design 29).
+/// `TTBR0_EL1` is purely the user's register: a set maps the 4 MiB RAM grant
+/// window and the console's device block at page granularity, both starting
+/// ungranted, and every other address in the low half is INVALID — no EL1
+/// blocks over RAM, no EL1 device blocks, no kernel anything.
 ///
-///  - **TTBR1 IS NOT AVAILABLE.** `sink.c` sets `TCR_EL1.EPD1`, so the high
-///    half is not walked at all, and every address this kernel uses is identity
-///    in the LOW half — which is TTBR0's range. Kernel mappings therefore have
-///    nowhere else to live: one set per process means the EL1 half is repeated
-///    in each, not hoisted out of them.
-///  - **THE CROSS-PROCESS COPY FUNNELS NEED ALL-RAM EL1 REACHABILITY.**
-///    `place_image` writes a child's segments while ANOTHER set is live, and
-///    `copy_in`/`copy_out` touch a peer's buffer the same way. Those reads and
-///    writes go through whatever set `TTBR0_EL1` holds, so every set maps all
-///    of RAM at EL1 or the kernel faults on its own copy. The kernel's `.text`
-///    and this very table pool live inside the grant window too (`.bss` is at
-///    0x4005_2000, well inside 0x4000_0000..0x4040_0000), so a window page that
-///    was merely ABSENT rather than EL1-only would unmap the kernel from itself.
+/// **WHAT PAID FOR THAT IS TTBR1.** Design 27 had to repeat the whole EL1 half
+/// in every set, and its own As-built gives the two reasons: `TCR_EL1.EPD1` was
+/// set so the high half was not walked at all, and the cross-process copy
+/// funnels (`place_image`, `copy_in`, `copy_out`) reached a peer's RAM through
+/// whatever set `TTBR0_EL1` happened to hold. Both are gone. EPD1 is clear and
+/// the LINEAR MAP is in TTBR1, which no switch touches; the copy funnels convert
+/// the physical address they already resolve and dereference through it. So the
+/// kernel is reachable from itself no matter which set is live — including no
+/// set at all — and the low half owes it nothing.
 ///
-/// That second point is also why a non-granted window page stays PRESENT and
-/// EL0-denied rather than becoming an invalid descriptor: isolation here is the
-/// absence of an EL0 PERMISSION, which is the same thing the shared window
-/// meant and the same fault class it raised.
+/// **AND THE FAULT CLASS CHANGES, DELIBERATELY.** A stray EL0 access to a
+/// non-granted window page used to be a PERMISSION fault (the page was present
+/// and EL0-denied); it is a TRANSLATION fault now. §5.7's reported reason does
+/// not move, because `cause_tag` decodes the ESR's `EC` field and the direction
+/// bit and never the `DFSC` class — both are `EC` 0x24 and both render through
+/// `abort_direction`. That is stated at the decode, and design 29's As-built
+/// records the probe that checked it rather than the transcript, which cannot
+/// see a fault class at all (design 27 finding 2).
+///
+/// The level-2 and device level-2 tables stay full-size even though one entry
+/// each is now live: a translation table is a PAGE, so an entry that goes away
+/// frees a descriptor and never a table. That is why removing the kernel blocks
+/// made the sets no smaller — recorded in design 29's As-built, where the brief
+/// expected otherwise.
 func build_set(level1: UInt) unsafe {
     let level2 = level1 + LEVEL2_OFFSET
     let level3 = level1 + LEVEL3_OFFSET
@@ -1072,36 +1403,18 @@ func build_set(level1: UInt) unsafe {
     put_desc(level1, 0, (dev_level2 as UInt64) | DESC_VALID | DESC_TABLE)
     put_desc(level1, 1, (level2 as UInt64) | DESC_VALID | DESC_TABLE)
 
-    // The device level 2: 2 MiB device blocks over everything below RAM,
-    // EL1-only and never executable — which is what the single 1 GiB block used
-    // to say in one descriptor.
-    var d: UInt = 0
-    while d < PT_ENTRIES {
-        put_desc(dev_level2, d,
-                 ((d << BLOCK_SHIFT) as UInt64)
-                 | DESC_VALID | DESC_BLOCK | MemoryType.Device.attr_index()
-                 | ATTR_AF | (AccessPerm.El1Rw as UInt64) | ATTR_PXN | ATTR_UXN)
-        d = d + 1
-    }
-
-    // ...except the one block holding the console, which points at a level-3
-    // table so a single register page can be granted to EL0.
+    // The device level 2: ONE live entry, the block holding the console, which
+    // points at a level-3 table so a single register page can be granted to EL0.
+    // Every other entry stays zero — the kernel reaches its own MMIO through the
+    // linear map now, so a user set has no reason to name it.
     put_desc(dev_level2, DEVICE_WINDOW_BASE >> BLOCK_SHIFT,
              (dev_level3 as UInt64) | DESC_VALID | DESC_TABLE)
     reset_device_window(dev_level3)
 
-    // Level 2: 2 MiB blocks over RAM, EL1 only.
-    var i: UInt = 0
-    while i < PT_ENTRIES {
-        put_desc(level2, i,
-                 ((RAM_BASE + (i << BLOCK_SHIFT)) as UInt64)
-                 | DESC_VALID | DESC_BLOCK | MemoryType.Normal.attr_index()
-                 | ATTR_AF | ATTR_SH_INNER | (AccessPerm.El1Rw as UInt64) | ATTR_UXN)
-        i = i + 1
-    }
-
-    // ...except the first few, which point at the level-3 tables instead: the
-    // grant window, where permissions are editable a page at a time.
+    // Level 2 over RAM: the grant window's entries point at the level-3 tables,
+    // where permissions are editable a page at a time. Every other entry stays
+    // zero, which is what makes RAM outside the window unreachable from this
+    // process at all rather than merely EL0-denied.
     var t: UInt = 0
     while t < GRANT_PAGES / PT_ENTRIES {
         put_desc(level2, t,
@@ -1286,9 +1599,11 @@ public func prot_switch(p: UInt) unsafe {
 ///
 /// **`perms == 0` IS A REVOCATION, and it is a real domain value rather than a
 /// mode flag** (user ruling, Sep 3). A grant of nothing IS the absence of a
-/// grant: on this profile a non-granted window page is present and EL0-denied,
-/// so removal is literally the installation of deny and the two directions were
-/// never two operations. Nothing is overloaded to make that true — the kernel
+/// grant, and sawos design 29 made that literally true of the descriptor: a
+/// non-granted window page is now INVALID rather than present-and-EL0-denied, so
+/// removal writes the same zero `reset_window` writes and the two directions
+/// were never two operations. Nothing is overloaded to make that true — the
+/// kernel
 /// REFUSES to record a permitting-nothing row at both of its doors, so the
 /// encoding cannot collide with a live grant:
 ///
@@ -1311,9 +1626,10 @@ public func prot_switch(p: UInt) unsafe {
 /// than which operation. Its GRANT direction ignores `perms` exactly as
 /// `prot_device` always has — a device page is read/write to EL0 and never
 /// executable, which is a property of registers and not of the image's flag
-/// bits — and its REVOKE direction restores `kernel_device_page`, the deny
-/// spelling that window resets to. So `perms` is read here only to answer
-/// grant-or-revoke, never to shade a device grant.
+/// bits — and its REVOKE direction writes `DESC_ABSENT`, the same nothing the
+/// window resets to. So `perms` is read here only to answer grant-or-revoke,
+/// never to shade a device grant, and the two windows' revoke arms differ only
+/// in which table and which index the zero lands in.
 public func prot_update(p: UInt, base: UInt, top: UInt, perms: UInt8,
                         device: Bool) unsafe {
     let level1 = set_base(p)
@@ -1323,10 +1639,10 @@ public func prot_update(p: UInt, base: UInt, top: UInt, perms: UInt8,
             if device {
                 put_desc(level1 + DEVICE_LEVEL3_OFFSET,
                          (va - DEVICE_WINDOW_BASE) >> PAGE_SHIFT,
-                         kernel_device_page(va))
+                         DESC_ABSENT)
             } else {
                 put_desc(level1 + LEVEL3_OFFSET, (va - RAM_BASE) >> PAGE_SHIFT,
-                         kernel_page(va))
+                         DESC_ABSENT)
             }
             va = va + PAGE_SIZE
         }
@@ -1458,8 +1774,11 @@ static REGISTER_BYTES: UInt = 4
 
 extension Gic {
     init() unsafe -> Gic {
-        Gic(dist: UnsafeMemory<GicDistRegs, Device>(GIC_DIST_BASE),
-            cpu: UnsafeMemory<GicCpuRegs, Device>(GIC_CPU_BASE))
+        // The two controller halves by their PHYSICAL bases, reached through
+        // the linear map (sawos design 29) — the same conversion the console's
+        // driver makes, at the same one place per view.
+        Gic(dist: UnsafeMemory<GicDistRegs, Device>(phys_to_virt(GIC_DIST_BASE)),
+            cpu: UnsafeMemory<GicCpuRegs, Device>(phys_to_virt(GIC_CPU_BASE)))
     }
 
     /// How many lines this board wired, out of the field that counts them in
@@ -1470,14 +1789,14 @@ extension Gic {
     }
 
     func word_at(&self, base: UInt, line: UInt) unsafe -> UnsafeMemory<UInt32, Device> {
-        UnsafeMemory<UInt32, Device>(
-            GIC_DIST_BASE + base + (line / GIC_LINES_PER_WORD) * REGISTER_BYTES)
+        UnsafeMemory<UInt32, Device>(phys_to_virt(
+            GIC_DIST_BASE + base + (line / GIC_LINES_PER_WORD) * REGISTER_BYTES))
     }
 
     /// A per-line BYTE register — priorities and targets are one byte each,
     /// which is why these are not the word view above.
     func byte_at(&self, base: UInt, line: UInt) unsafe -> UnsafeMemory<UInt8, Device> {
-        UnsafeMemory<UInt8, Device>(GIC_DIST_BASE + base + line)
+        UnsafeMemory<UInt8, Device>(phys_to_virt(GIC_DIST_BASE + base + line))
     }
 
     /// Every line masked, then both halves on. Nothing is deliverable until
@@ -1492,8 +1811,8 @@ extension Gic {
         let lines = self.line_count()
         var word: UInt = 0
         while word * GIC_LINES_PER_WORD < lines {
-            let disable = UnsafeMemory<UInt32, Device>(
-                GIC_DIST_BASE + GICD_ICENABLER + word * REGISTER_BYTES)
+            let disable = UnsafeMemory<UInt32, Device>(phys_to_virt(
+                GIC_DIST_BASE + GICD_ICENABLER + word * REGISTER_BYTES))
             disable.write(0xFFFF_FFFF)
             word = word + 1
         }
@@ -1531,7 +1850,8 @@ extension Gic {
 
     /// Raise a software-generated line on this core.
     func raise_to_self(&self, line: UInt) unsafe {
-        let trigger = UnsafeMemory<UInt32, Device>(GIC_DIST_BASE + GICD_SGIR)
+        let trigger = UnsafeMemory<UInt32, Device>(
+            phys_to_virt(GIC_DIST_BASE + GICD_SGIR))
         trigger.write(GIC_SGIR_TO_SELF | (line as UInt32))
     }
 }
