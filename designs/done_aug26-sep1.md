@@ -999,3 +999,49 @@ repo's first done file; sawos was born Aug 28 (sawlang#238).
   with a FileExistsError traceback instead of the documented
   three-way refusal — pre-existing resolver behavior, noted for a
   future toolchain.py pass.
+
+- 2. design 23 — riscv32 HAL consolidation — **CLOSED (agent, Sep 2),
+  awaiting review/merge** [brief authored Sep 2, review WAIVED by the
+  user ("i don't see that needing my input"); branch
+  `design/023-riscv-hal-consolidation`]. **BOTH GATES BYTE-IDENTICAL,
+  image sizes included** — `make sos-test` 232/232 with a transcript
+  that `diff`s empty against the `a88a602` baseline (every case verdict
+  and all 232 `.sosimg` sizes), and `make sos-smoke-esp32c3` 3/3 with
+  all three flash sizes matching design 20 §9 exactly and the three
+  consoles replayed and diffed row by row, addresses included.
+  WHAT LANDED: the mandatory C dedup, the substantial `.saw` split AND
+  the optional `boot.S` split — nothing parked. `hal/riscv32-common/`
+  now holds one copy each of `kernel/lib.saw` (the `rv32core` module:
+  trap frame, PMP staging, frame_init/resume_frame, the payload and
+  region-table seams, the cause and syscall decoding), `kernel/trap.S`
+  (trap_entry + sos_resume_frame), `kernel/sink.c` and
+  `user/syscall.c`; each board keeps its console, timer, interrupt
+  controller, memory map, `_start`, `kernel_fault` and stack. 3737 →
+  3100 lines across the eight touched files (−17%), one whole second
+  copy of every shared file retired. THE `hal` SEAM DID NOT MOVE:
+  `kcore` still imports `hal`, the runner still maps
+  `hal=<board>/kernel`, and each board re-exports 28 names from
+  `rv32core` with a `public import`. **SL-6 DID NOT FIRE** — the
+  `extern` block is split by CALLER into disjoint sets, so no shared
+  declaration needs an owner, and no new SL entry is owed. The
+  load-bearing probe was proved by PERTURBATION: `GRANT_ROW_BUDGET`
+  temporarily set to 10 in `rv32core` tripped `kcore`'s own
+  `static_assert(hal.GRANT_ROW_BUDGET <= 9)` two module hops away, so a
+  re-exported static still folds as a constant. Runner: build wiring
+  only (`hal_native` / `hal_modules` / `hal_asm` per arch, plus the
+  same three by hand in the `--board esp32c3` section) — no case,
+  assertion or report line moved. Two repo-structure docs are LEFT FOR
+  DESIGN 24 BY NAME and recorded in the As-built §8.4: `CLAUDE.md`'s
+  repo map and `README.md` line 46 both describe the pre-23 layout, and
+  design 24's §6 consistency grep already names both files. One
+  ADDENDUM written into design 20 §9: its isolation oracle paste is
+  missing a blank line after `root survived`, a transcription artifact
+  the same section's own doubling note predicts — no behaviour delta.
+  THEN:
+  INTEGRATED to main Sep 3 2026, night run (lead-reviewed; fences
+  verified — kernel/, rt/, hal/arm64 zero diff, the 121 tests/
+  manifest edits are `native=` path repoints only; lead gate re-run
+  green 232 byte-identical AND smoke re-witnessed 3/3 matching the
+  oracle, image sizes unmoved; sawlang HEAD 46eebb36 stable;
+  fast-forward ca8ca50). The perturbation proof for two-hop constant
+  folding is the As-built's keeper.
