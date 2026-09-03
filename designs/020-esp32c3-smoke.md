@@ -113,9 +113,9 @@ answered. The brief above is otherwise unchanged; these two supersede it
 where they touch it.
 
 **A. XIP TEXT PLACEMENT IS RULED IN, superseding the brief's
-copy-to-SRAM default.** The kernel's loadable image is ~392 KiB against
+copy-to-SRAM default.** The kernel's loadable image is ~445 KiB against
 400 KiB of SRAM, so copy-to-SRAM is arithmetically impossible — `.text`
-alone is 352 KiB. `.text` and `.rodata` stay IN PLACE in the flash IBUS
+alone is 404 KiB. `.text` and `.rodata` stay IN PLACE in the flash IBUS
 window at 0x4200_0000 (the linker places them there, and the ROM's
 `jalr` target 0x4200_0008 is the entry); the boot code copies ONLY
 `.data` and zeroes `.bss` in SRAM. Design 19's Sep-2 addendum already
@@ -193,7 +193,7 @@ windows for one region, or one `unmap` would revoke one of two doors.
 **The SRAM budget, every number measured:**
 
 ```
-0x4037_C000  kernel .data + .bss   168K   needs 166,608 of 172,032
+0x4037_C000  kernel .data + .bss   168K   needs 167,360 of 172,032
 0x403A_6000  ROOT region           124K   needs  99,392 of 110,592
 0x403C_5000  CHILD region           92K   needs  67,600 of  77,824
 0x403D_C000  RAM pool               16K
@@ -285,14 +285,14 @@ to 0x4037_C000, the first word of SRAM, which is the kernel's own
 
 ```
 0x4200_0000  .magic     8 B        two words of 0xAEDB041D
-0x4200_0008  .text      361,824 B  THE ROM's CALL TARGET
+0x4200_0008  .text      413,622 B  THE ROM's CALL TARGET
              .rodata     27,356 B
              .payload               root's sosimg, page-aligned both ends
              .regions               the boot region table
              .childimg              child sosimgs
              (.data's load image)
-0x4037_C000  .data       14,432 B  VMA in SRAM, LMA in flash
-0x4037_F860  .bss       152,176 B  ends 0x403A_4AD0
+0x4037_C000  .data       14,416 B  VMA in SRAM, LMA in flash
+0x4037_F860  .bss       152,944 B  ends 0x403A_4DC0
 ```
 
 `.payload`, `.regions` and `.childimg` stay in FLASH, which the brief's
@@ -429,9 +429,9 @@ SOS ESP32-C3 board smoke (design 20, NON-GATING)
   qemu   /Users/swoodtke/.espressif/tools/qemu-riscv32/esp_develop_9.2.2_20250817/qemu/bin/qemu-system-riscv32
   clang  /Users/swoodtke/.espressif/tools/esp-clang/esp-20.1.1_20250829/esp-clang/bin/clang
   target riscv32-unknown-none-elf --target-features +m,+c (rv32imc_zicsr_zifencei — no A extension)
-[1/3] ✓ boot  (407632 bytes of flash)
-[2/3] ✓ timer  (436304 bytes of flash)
-[3/3] ✓ isolation  (446656 bytes of flash)
+[1/3] ✓ boot  (456784 bytes of flash)
+[2/3] ✓ timer  (485456 bytes of flash)
+[3/3] ✓ isolation  (495808 bytes of flash)
 
 ============================================================
 ESP32-C3 SMOKE PASSED (3 cases)
@@ -545,7 +545,7 @@ no existing test was edited.
 3. **The C3 is a tier-2 part AT the floor in two dimensions, not one.**
    Design 19 sizes tier 2 by PMP slots and the C3 meets that exactly
    (16 entries, all implemented, all four `pmpcfg` words writable). What
-   design 19 did not price is RAM: 400 KiB against a 392 KiB kernel
+   design 19 did not price is RAM: 400 KiB against a 445 KiB kernel
    image, which is why XIP is the entry price rather than a placement
    preference. Both belong in the M5 sketch's tier table.
 4. **`sosrt`'s 64 KiB ARENA dominates every process image here.** Root
@@ -570,3 +570,36 @@ no existing test was edited.
 7. **A `u32`-suffixed shift still folds signed**, so bit 31 of a
    `UInt32` cannot be written as a shift on a 32-bit target and the
    house bit-flag style breaks at exactly one bit. Filed as SL-19.
+
+## 12. The gate
+
+`make sos-test` at the base commit (`8b17012`, design 21 integrated) and
+again on this branch, both under the machine-wide suite lock:
+
+```
+ALL SOS TESTS PASSED (232 passed across riscv32 + arm64)
+```
+
+116 cases per architecture, both runs, exit 0. **The two transcripts are
+BYTE-IDENTICAL — `diff` reports nothing at all**, including the cases
+whose timing-dependent rows are licensed to move (`thread_preempt`'s A/B
+interleave, `timer` tick lines and `interrupts=`; `timer_interval`'s
+`fires=`; `process_stats`' `interrupts=`). They were free to move and
+happened not to; the requirement was only that nothing ELSE move, and
+nothing did.
+
+That is the expected result, and the reason it is worth stating: this
+branch adds a HAL directory, three test packages and a board section
+that `--board virt` never enters. The gate compiles none of it. The
+smoke target is NON-GATING by ruling and was run separately, under the
+same lock.
+
+The image sizes in §2, §6 and §9 are the POST-REBASE numbers — design
+21's kernel is ~52 KiB of `.text` larger than the one this unit first
+measured, which moves the XIP argument further in its own favour and
+left the root and child budgets untouched (both re-measured: 99,392 and
+67,600 bytes, unchanged). The kernel's SRAM slack is now 4,672 bytes of
+172,032, which is the number to watch as the kernel keeps growing.
+
+sawlang toolchain: `46eebb36` throughout, unchanged from the first probe
+to the final gate.

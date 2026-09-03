@@ -34,7 +34,7 @@ entry below or the brief that carries it, never restating either.
   (boot / timer / isolation). As-built with the verbatim oracle
   transcripts: `designs/020-esp32c3-smoke.md`; every address with the
   probe that produced it: `hal/riscv32-esp32c3/ABI.md`.
-  BOTH BLOCKERS CLOSED. (A) XIP as ruled: `.text` (361,824 B) and
+  BOTH BLOCKERS CLOSED. (A) XIP as ruled: `.text` (413,622 B) and
   `.rodata` execute in place in the flash IBUS window at 0x4200_0000,
   `boot.S` copies only `.data` and zeroes `.bss` in SRAM;
   `.payload`/`.regions`/`.childimg` stay in flash too, since the kernel

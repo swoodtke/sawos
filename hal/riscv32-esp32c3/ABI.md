@@ -489,10 +489,10 @@ hardware.
 
 ## 8. The SRAM budget, and why the layout is XIP
 
-The kernel's loadable image is ~392 KiB (`.text` 360,624 + `.rodata`
-27,004 + `.data` 14,224) and this part has 400 KiB of SRAM in total, so
+The kernel's loadable image is ~445 KiB (`.text` 413,622 + `.rodata`
+27,356 + `.data` 14,416) and this part has 400 KiB of SRAM in total, so
 the brief's original copy-to-SRAM boot mode cannot hold it — `.text`
-alone is 352 KiB. USER-RULED Sep 2: **XIP text placement.** `.text` and
+alone is 404 KiB. USER-RULED Sep 2: **XIP text placement.** `.text` and
 `.rodata` execute and are read in place in the flash IBUS window at
 0x4200_0000; only `.data` is copied to SRAM and `.bss` zeroed there.
 `.payload`, `.regions` and `.childimg` stay in flash too — the kernel
@@ -511,7 +511,7 @@ The whole 400 KiB, as `esp32c3.ld` and the two user scripts divide it:
 Every one of those is MEASURED, not chosen for tidiness:
 
 ```
-kernel .data + .bss                     166,608 B   of 172,032 granted
+kernel .data + .bss                     167,360 B   of 172,032 granted
 root, largest image (c3-isolation)       99,392 B   of 110,592 granted
 child (c3-child-poke)                    67,600 B   of  77,824 granted
 ```
@@ -524,9 +524,9 @@ of every process image is dominated by ONE number: `sosrt`'s 64 KiB
 overlap.
 
 A linked kernel image, for the record: `.text` at 0x4200_0008 (the ROM's
-call target), 361,824 B; `.rodata` 27,356 B; `.data` VMA 0x4037_C000 /
-LMA in flash, 14,432 B; `.bss` 152,176 B ending at 0x403A_4AD0; a
-407,648-byte flash image, of 4 MiB.
+call target), 413,622 B; `.rodata` 27,356 B; `.data` VMA 0x4037_C000 /
+LMA in flash, 14,416 B; `.bss` 152,944 B ending at 0x403A_4DC0; a
+456,784-byte flash image, of 4 MiB.
 
 ---
 

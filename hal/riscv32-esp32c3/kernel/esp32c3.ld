@@ -9,9 +9,9 @@
  * ---------------------------------------------------------------------------
  * WHY XIP, AND WHAT IT COSTS (design 20, blocker A, user-ruled Sep 2)
  * ---------------------------------------------------------------------------
- * The kernel's loadable image is ~392 KiB and the ESP32-C3 has 400 KiB of
+ * The kernel's loadable image is ~445 KiB and the ESP32-C3 has 400 KiB of
  * SRAM TOTAL, so the brief's original copy-to-SRAM default cannot hold it —
- * .text alone is 352 KiB. The ruling: .text and .rodata stay IN PLACE in the
+ * .text alone is 404 KiB. The ruling: .text and .rodata stay IN PLACE in the
  * flash instruction window, and only .data is copied and .bss zeroed in SRAM
  * (~163 KiB, which fits with room for root, a child and the pool). Design 19's
  * Sep-2 addendum already named XIP the ESP32 family's execution model; this is
@@ -51,7 +51,7 @@
  *   0x403E_0000  end of SRAM
  *
  * Every one of those four numbers is MEASURED, not chosen for tidiness. The
- * kernel needs 166,608 B of .data+.bss and gets 172,032; root's largest image
+ * kernel needs 167,360 B of .data+.bss and gets 172,032; root's largest image
  * (c3-isolation) needs 99,392 B and gets 110,592; the child needs 67,600 and
  * gets 77,824. The slack is thousands of bytes rather than tens of thousands,
  * which is what 400 KiB of SRAM looks like once this kernel is in it — and an
