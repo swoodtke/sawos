@@ -409,7 +409,12 @@ standing tail); the IOMMU driver (death-notification consumer 2).
     assert). Ownership-transfer-at-give is REJECTED: charge-follows-
     handle goes incoherent once minted siblings span processes.
     UNREACHABLE TODAY, and provably (MAX_PROCESSES = 2, give flows
-    only downward, root dies last) — ruled on the unit-5.5
+    only downward, root dies last) [LEAD RIDER, Sep 3, design 24
+    finding F1: the premise moved — MAX_PROCESSES is 3 since design
+    21 — but the argument's other two legs hold (give still flows
+    only downward, root still dies last), so holder-outlives-creator
+    stays unreachable and the deferred transcript proof stays
+    deferred] — ruled on the unit-5.5
     principle: an invariant that has quietly become false is worse
     than a branch nothing takes. Lands as a RIDER ON UNIT 2 (sweep
     arms deleted, D-4's write-off activates, the reasoning recorded

@@ -1045,3 +1045,61 @@ repo's first done file; sawos was born Aug 28 (sawlang#238).
   oracle, image sizes unmoved; sawlang HEAD 46eebb36 stable;
   fast-forward ca8ca50). The perturbation proof for two-hop constant
   folding is the As-built's keeper.
+
+- 3. design 24 — the M4 docs sweep (unit 6) — **CLOSED Sep 3 2026, DOCS
+  ONLY, gate BYTE-IDENTICAL** (116 cases/arch, 232 runs; `diff` against a
+  baseline captured at `0f73b45` is empty, and `git diff` over
+  `kernel/ hal/ rt/` filtered to non-comment lines is empty too — design
+  11's second proof). All six owed items landed: **§2.1 FLIPPED TO
+  BUILT** (the ratified text untouched; the 301-line seven-unit
+  annotation block rewritten as 270 lines of built thing, organized by
+  what EXISTS with unit history compressed to citations); **§2.2's
+  waitable list CLOSED** over the four pipe kinds named individually,
+  with the inlet room level, the delivery-payload record, the consuming
+  attach and the completion-queue attachment pointed at from the list
+  and persistent-by-default stated once in the ratified attach clause;
+  **§11 REFRESHED** — "does NOT have after M3" -> after M4, the 125-line
+  accreted Pipes bullet struck to a 34-line BUILT entry carrying the
+  four facts that are §11's own, and a 65-line **M4 RECAP** added to the
+  roadmap (what the milestone set out, the amended ladder unit by unit
+  with the two non-pipe riders, the gate at close, the trap ladder
+  3->2->1 with unit 5's answered-vs-discarded refinement, the standing
+  tail unchanged, and `designs/019` as M5's anchor); **the design-10
+  AUDIT** traced all twelve rulings to landed doc lines and found FOUR
+  promised-but-missing (§5.7 had no record of ruling 12's
+  `PipeReplyOp.Ready`, and three doc comments still spelled the retired
+  `Ok(None)` / minted-one-shot-sibling) — all four now written; and
+  **the CONSISTENCY GREP** caught 15 prose sites plus a 66-site
+  pre-split-`sos/`-path family in the kernel/hal/rt doc banners (design
+  11 swept that family in spec.md only), including design 23's two named
+  leftovers (CLAUDE.md's repo map and README line 46, both now showing
+  `hal/riscv32-common/` and the two boards). The parked F2 nod is
+  CARRIED FORWARD UNTOUCHED, with one collision flagged in the As-built.
+  Four findings for the lead there; NO SL entry owed. **M4 CLOSES at
+  this entry's integration** — the As-built says so and the lead moves
+  on it. THEN:
+- 4. the M5 scoping session [designs/019 the anchor + the seed pile;
+  USER-RULED Sep 2 (night): TIER 1 — MMU configuration, per-process
+  address spaces over the existing load_domain seam, arm64-virt the
+  first climb — is the OPENING item; riscv Sv32 follows the arm64
+  climb].
+  INTEGRATED to main Sep 3 2026 (lead-reviewed; the four argued
+  deviations accepted — D-2, preserving the ratified text verbatim,
+  is more conservative than the brief asked; lead gate re-run green
+  232 byte-identical, sawlang HEAD 46eebb36 stable; fast-forward
+  500f478). **M4 CLOSES AT THIS INTEGRATION** — the As-built §1
+  statement, moved on. Finding F1 answered with a lead rider at #10
+  ruling 10; finding F3 answered by closing the M4-scoping backlog
+  entry below in the same pass.
+
+- M4 scoping — pipes [#10 — designs/010-m4-pipes.md, DRAFT Aug 30,
+  awaiting user review]: §2.1 carried by reference; waiter revocation
+  as unit 0 (the Aug-30 ruling — the free arm wakes parked threads,
+  answering #7 finding 2 as "wake, don't count"); the role-split
+  endpoint pair; a 7-unit ladder + decisions agenda
+  **CLOSED BY THE MILESTONE (lead, Sep 3 2026, at M4's close — design
+  24 finding F3's stale label corrected in the same act): the DRAFT
+  label outlived the Aug-30 session that ruled all seven agenda items
+  and made #10 the PLAN OF RECORD; every rung of its ladder as amended
+  has landed (units 0-6 + 4.5 + 16-stats + the 020/023 riders).**
+  INTEGRATED (moved) at design 24's integration, the M4 close.

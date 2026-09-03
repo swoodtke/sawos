@@ -21,43 +21,6 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
-- 3. design 24 — the M4 docs sweep (unit 6) — **CLOSED Sep 3 2026, DOCS
-  ONLY, gate BYTE-IDENTICAL** (116 cases/arch, 232 runs; `diff` against a
-  baseline captured at `0f73b45` is empty, and `git diff` over
-  `kernel/ hal/ rt/` filtered to non-comment lines is empty too — design
-  11's second proof). All six owed items landed: **§2.1 FLIPPED TO
-  BUILT** (the ratified text untouched; the 301-line seven-unit
-  annotation block rewritten as 270 lines of built thing, organized by
-  what EXISTS with unit history compressed to citations); **§2.2's
-  waitable list CLOSED** over the four pipe kinds named individually,
-  with the inlet room level, the delivery-payload record, the consuming
-  attach and the completion-queue attachment pointed at from the list
-  and persistent-by-default stated once in the ratified attach clause;
-  **§11 REFRESHED** — "does NOT have after M3" -> after M4, the 125-line
-  accreted Pipes bullet struck to a 34-line BUILT entry carrying the
-  four facts that are §11's own, and a 65-line **M4 RECAP** added to the
-  roadmap (what the milestone set out, the amended ladder unit by unit
-  with the two non-pipe riders, the gate at close, the trap ladder
-  3->2->1 with unit 5's answered-vs-discarded refinement, the standing
-  tail unchanged, and `designs/019` as M5's anchor); **the design-10
-  AUDIT** traced all twelve rulings to landed doc lines and found FOUR
-  promised-but-missing (§5.7 had no record of ruling 12's
-  `PipeReplyOp.Ready`, and three doc comments still spelled the retired
-  `Ok(None)` / minted-one-shot-sibling) — all four now written; and
-  **the CONSISTENCY GREP** caught 15 prose sites plus a 66-site
-  pre-split-`sos/`-path family in the kernel/hal/rt doc banners (design
-  11 swept that family in spec.md only), including design 23's two named
-  leftovers (CLAUDE.md's repo map and README line 46, both now showing
-  `hal/riscv32-common/` and the two boards). The parked F2 nod is
-  CARRIED FORWARD UNTOUCHED, with one collision flagged in the As-built.
-  Four findings for the lead there; NO SL entry owed. **M4 CLOSES at
-  this entry's integration** — the As-built says so and the lead moves
-  on it. THEN:
-- 4. the M5 scoping session [designs/019 the anchor + the seed pile;
-  USER-RULED Sep 2 (night): TIER 1 — MMU configuration, per-process
-  address spaces over the existing load_domain seam, arm64-virt the
-  first climb — is the OPENING item; riscv Sv32 follows the arm64
-  climb].
 ## [BACKLOG] — filed, not scheduled
 
 - **`PipeRequestRight.Reply` HAS NO TEST ANY MORE** [#22 As-built
@@ -155,11 +118,6 @@ entry below or the brief that carries it, never restating either.
   consumption is CONDITIONAL, which is the one shape the effect cannot
   express
 
-- M4 scoping — pipes [#10 — designs/010-m4-pipes.md, DRAFT Aug 30,
-  awaiting user review]: §2.1 carried by reference; waiter revocation
-  as unit 0 (the Aug-30 ruling — the free arm wakes parked threads,
-  answering #7 finding 2 as "wake, don't count"); the role-split
-  endpoint pair; a 7-unit ladder + decisions agenda
 - tools/sosimg_dump.py — landed Aug 29 (user-requested dev tool, this
   line is its capture): dumps sosimg v3 headers/segments and raw v2
   region tables; kept in step with imgformat + process.saw by hand —
