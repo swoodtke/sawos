@@ -106,441 +106,467 @@ unmoved on virt/both-arches.
 
 ---
 
-# As-built — PARKED (Sep 2 2026)
+# Amendments (user, Sep 2, after the first flight parked)
 
-**The unit did not build the HAL. It stopped at two blockers, both of
-which need a user ruling, and neither of which can be routed around
-without deviating from a reviewed point.** Nothing under `kernel/`,
-`user/`, `tools/sos_runner.py` or the `Makefile` was touched: the
-`--board esp32c3` stub still refuses, `make sos-smoke-esp32c3` still
-points at this brief, and the pre-carved seams are exactly as the stub
-pass left them.
+Both of the unit's blockers were carried back to the user and both were
+answered. The brief above is otherwise unchanged; these two supersede it
+where they touch it.
 
-What DID land is the half of the unit the brief called "derive it from
-the emulator and record it": `hal/riscv32-esp32c3/ABI.md`, the board's
-verified facts — memory map, boot protocol, no-A build spelling, and
-the probed semantics of the UART, SYSTIMER, interrupt matrix and PMP.
-A re-dispatch after the ruling starts from measurements, not from a
-datasheet.
+**A. XIP TEXT PLACEMENT IS RULED IN, superseding the brief's
+copy-to-SRAM default.** The kernel's loadable image is ~392 KiB against
+400 KiB of SRAM, so copy-to-SRAM is arithmetically impossible — `.text`
+alone is 352 KiB. `.text` and `.rodata` stay IN PLACE in the flash IBUS
+window at 0x4200_0000 (the linker places them there, and the ROM's
+`jalr` target 0x4200_0008 is the entry); the boot code copies ONLY
+`.data` and zeroes `.bss` in SRAM. Design 19's Sep-2 addendum already
+named XIP the ESP32 family's execution model. **Scope stays minimal: NO
+sosimg loader XIP mode** — child payloads keep loading to RAM as today.
 
-## Blocker A — the kernel does not fit in SRAM, so COPY-TO-SRAM is impossible
+**B. THE NO-INTERRUPT-DELIVERY FINDING WAS A RETRY, NOT A RULING — and
+the retry succeeded.** The machine source shows the matrix outputs wired
+to the CPU, and the systimer is an EDGE source, so the first flight's
+"nothing reaches the CPU" was suspected to be a lost pulse. It was a
+misconfiguration, though not that one: see §7 below. The pre-authorised
+polled-clock fallback was NOT needed and is NOT used.
 
-The brief rules: *"For SMOKE the ruled default is COPY-TO-SRAM (a tiny
-flash stub copies the image and jumps): XIP placement is design 19's
-later C3/P4-port consideration, explicitly out of scope here."*
+---
 
-The arithmetic refuses it. Measured with `llvm-size` on the baseline
-commit's riscv32 virt build — the same kernel module a C3 build
-compiles, and a C3 build is slightly LARGER, because no-A turns atomics
-into `rt/common_c/support.c` libcalls:
+# As-built (Sep 2 2026) — LANDED
+
+**SOS boots on the ESP32-C3, and `make sos-smoke-esp32c3` is green on
+all three reviewed cases.** The first flight of this unit parked on two
+blockers; both are closed, and one of them was closed by discovering
+that the park's own finding was wrong.
+
+## 1. What landed
 
 ```
-.text                 360,624 B
-.rodata                27,004 B
-.data                  14,224 B
-                     ----------
-LOADABLE              401,852 B  =  392.4 KiB
-.bss                  152,176 B  =  148.6 KiB
-                     ----------
-kernel alone          554,028 B  =  541.0 KiB
-
-+ .payload (root)      36,864 B   (process_isolation's root image)
-+ .regions                 56 B
-+ .childimg             2,336 B
-                     ----------
-one real case         593,284 B  =  579.4 KiB
-
-ESP32-C3 SRAM         409,600 B  =  400.0 KiB   (esp32c3.iram, per info mtree)
+hal/riscv32-esp32c3/
+  ABI.md              every address with the probe that produced it
+  README.md           the sibling-copy rule, and what filled the directory
+  kernel/boot.S       XIP .data copy; a console-printing kernel_fault
+  kernel/lib.saw      Espressif UART, SYSTIMER, interrupt matrix, the C3 map
+  kernel/sink.c       unchanged from the sibling (CSR/linker-symbol leaves)
+  kernel/esp32c3.ld   the .magic section IS the direct-boot protocol
+  user/root.ld        root at 0x403A_6000
+  user/child.ld       child at 0x403C_5000
+  user/syscall.c      unchanged from the sibling (the ecall stub)
+tests/c3-timer/       root: five deterministic ticks
+tests/c3-isolation/   root: launch, park, report the child's fault
+tests/c3-child-poke/  child: store into a kernel-owned address
+tools/sos_runner.py   the pre-carved board section, filled — and nothing
+                      outside it (one contiguous diff hunk)
+Makefile              sos-smoke-esp32c3, real
 ```
 
-**The kernel's loadable image alone is 98.1% of the part's entire
-RAM**, before one byte of `.bss`. The `.bss` is 64 KiB of sosrt's
-`ARENA`, 64 KiB of `boot.S`'s kernel stack, and ~21 KiB of object
-tables. Only the stack is mine to shrink under the sibling-copy rule
-(`ARENA` is `rt/`, the tables are `kernel/`, and both are read-only to
-this unit); taking it to 8 KiB leaves 496,684 B = 485 KiB, still
-**76 KiB over**, with nothing left for a root region, a child region or
-the pool. There is no arrangement of copy-to-SRAM that fits.
+Every copied file names its origin at the top, per the sibling-copy
+rule, so the later dedup pass can find the pairs. What is genuinely the
+sibling's and untouched is everything ARCHITECTURAL: the trap entry, the
+32-word frame layout, the resume path, `sos_resume_frame`, the whole PMP
+staging apparatus, the cause decoding, the syscall accessors. The C3 is
+the same RV32 M/U machine with the same sixteen PMP entries; what
+differs is the board, and each board difference is marked `BOARD (C3)`
+where it sits.
 
-Levers examined and rejected:
+## 2. The memory map, as derived
 
-- **Size optimization.** `sawc` has no `-Os`/`-Oz`; its only
-  optimization flag is `-O0`, which *disables* passes. Filed as SL-18.
-- **Trimming `.bss`.** `MAX_PROCESSES` and the table sizes are unit 5's
-  question in `kernel/`, off-limits here, and even zeroing all ~21 KiB
-  of tables does not close a 76 KiB gap.
-- **Leaving `.rodata`/`.payload` in the flash DBUS window.** Saves
-  27 KiB + 37 KiB and is still hopeless, because `.text` alone
-  (352 KiB) plus `.bss` (149 KiB) is 501 KiB. `.text` is the term that
-  has to move.
-- **More RAM.** There is none. `esp32c3.iram` (400 KiB) plus
-  `esp32c3.rtcram` (8 KiB) is the whole writable map. The
-  `esp-rgb-vram` region at `0x2000_0000` is QEMU's display extension,
-  not C3 silicon, and counting it would be a fiction.
-
-The only layout that fits is **text-in-place in the flash IBUS window
-at `0x4200_0000`, data/bss copied to SRAM** — precisely design 19's
-addendum ("XIP is the family's execution model … the sosimg loader
-wants an XIP placement mode: text-in-place at the flash-mapped
-address, data/bss copied to SRAM"), and precisely what this brief puts
-out of scope. So the ruling this unit needs is: **does design 20 adopt
-XIP text placement for the C3 smoke, or does the C3 smoke wait for the
-code-size work?** Either is a user call; picking one silently is not.
-
-Nothing about the copy-to-SRAM MECHANISM is wrong — the stub was
-built, booted, and used to run every probe below from SRAM
-(`ABI.md` §2a). It is the payload that is too big, not the method.
-
-## Blocker B — this QEMU delivers no peripheral interrupts, so the `timer` case cannot be shown
-
-Reviewed point 1 rules the `timer` case as *"a SYSTIMER alarm arrives
-through the interrupt matrix and ticks N times — proves trap entry +
-interrupt routing."*
-
-The two halves of that sentence come apart on this emulator. The alarm
-fires; it never arrives.
-
-- SYSTIMER counts and alarms correctly: the UPDATE/VALUE_VALID
-  handshake works, `UNIT0_VALUE_LO` advances, and arming TARGET0 sets
-  `INT_RAW` bit 0 **and** `INT_ST` bit 0, which `INT_CLR` then clears.
-- TIMG0 T0 does the same, as a cross-check.
-- The interrupt matrix register file is present and correctly laid out.
-  The mask ROM's own footprint proves the source numbering: it leaves
-  `0x600C_2054` reading `5`, i.e. source index 21 (UART0) routed to CPU
-  interrupt 5.
-- **And nothing reaches the core.** With both timers asserting, every
-  source index 0..63 mapped to CPU interrupt 7, `CPU_INT_ENABLE` bit 7
-  set, `CPU_INT_PRI_7 = 1`, `CPU_INT_THRESH = 1`, `mie = 0xFFFFFFFE`
-  and `mstatus.MIE = 1`: `CPU_INT_EIP_STATUS` reads `0x00000000`,
-  **`mip` reads `0x00000000`**, and zero traps are taken. Scanned one
-  source at a time (all 64) and all-at-once; same answer both ways.
-
-`mip` reading zero is decisive — it is the CPU's own pending register,
-so this is not a mask, priority or threshold error in the probe.
-Espressif QEMU 9.2.2's `esp32c3` machine models the interrupt matrix as
-a register file and wires no source to the core.
-
-So the `timer` case as reviewed is not achievable here. The nearby
-shapes, all of which are deviations from the reviewed point and so are
-NOT taken:
-
-- a POLLED clock case (SYSTIMER counter + `INT_RAW`, no interrupt) —
-  proves the timer and the map, drops "trap entry + interrupt routing",
-  which is the half the case exists for;
-- an `ecall`/fault-driven trap-entry case — the trap ENTRY path does
-  work (see the isolation probe), but that is the `isolation` case's
-  proof, not a second one;
-- upgrading the QEMU fork or patching in the wiring — out of scope and
-  not this repo's to do.
-
-The ruling this needs: **does the `timer` case become a polled-clock
-case, does it drop until the emulator wires the matrix, or does the
-board smoke target a different QEMU?**
-
-## The isolation case: which entry, argued
-
-Reviewed point 1 asks the agent to argue whether `process-isolation`'s
-entry is map-portable or whether a minimal C3-local case is needed.
-
-**It is NOT portable, and a C3-local case would be needed** — but the
-reason is entirely blocker A, and the mechanism it would rest on is
-verified working.
-
-- Not portable because every address in the case is a virt address.
-  `process-isolation` runs a root at `0x8020_0000` and a child at
-  `0x8024_0000` (`hal/riscv32/user/root.ld`, `child.ld`, and
-  `ARCHES`'s `root_entry` / `child_region_base`), and its payload
-  pokes a kernel-owned address chosen from that map. None of
-  `0x8000_0000`+ exists on the C3, whose only RAM is
-  `0x4037_C000-0x403D_FFFF`. The case would need its own link scripts
-  and its own poke address regardless — which is exactly the "minimal
-  C3-local case" the brief anticipates.
-- But the *shape* transfers exactly, and that is the good news:
-  probed directly on the emulator, one TOR pair granting R/W/X over
-  `[0x403C_0000, 0x403C_1000)`, then `mret` to U-mode —
-
-  ```
-  granted window, ecall from U-mode        -> mcause = 0x00000008
-  U-mode load of 0x4038_0000 (not granted) -> mcause = 0x00000005
-                                              mtval  = 0x40380000
-                                              mepc   = the faulting instruction
-  ```
-
-  Default-deny, the TOR encoding, the fault cause, `mtval` and `mepc`
-  all behave exactly as `hal/riscv32`'s PMP code already assumes, and
-  the C3 implements all 16 `pmpaddr` entries and all four `pmpcfg`
-  words — design 19 tier 2's ruled floor met exactly, with no headroom.
-  So the PMP half of this unit needs no rethinking; it needs a kernel
-  that fits.
-
-## The board facts that landed
-
-Full detail in `hal/riscv32-esp32c3/ABI.md`. The headlines:
-
-**Memory map** (from the monitor's `info mtree` on the running
-machine, cross-checked by probing):
+From the monitor's `info mtree` on the running machine, cross-checked by
+probing. Full table in `hal/riscv32-esp32c3/ABI.md` §1.
 
 ```
 0x3C00_0000-0x3C7F_FFFF  flash DBUS window (romd, 8M)
-0x3FC8_0000-0x3FCD_FFFF  SRAM via DRAM window (alias of IRAM+0x4000)
-0x3FF0_0000-0x3FF1_FFFF  mask ROM via DROM window
+0x3FC8_0000-0x3FCD_FFFF  SRAM via the DRAM window (alias of IRAM+0x4000)
 0x4000_0000-0x4005_FFFF  mask ROM, 384K
-0x4037_C000-0x403D_FFFF  internal SRAM, 400K   <-- the only RAM
+0x4037_C000-0x403D_FFFF  internal SRAM, 400K      <- the only RAM
 0x4200_0000-0x427F_FFFF  flash IBUS window (romd, 8M)
 0x5000_0000-0x5000_1FFF  RTC RAM, 8K
-0x6000_0000  UART0     0x6001_F000  TIMG0     0x6002_3000  SYSTIMER
-0x6001_0000  UART1     0x6002_0000  TIMG1     0x600C_2000  INT MATRIX
-0x600C_0000  SOC CLK   0x600C_4000  CACHE     0x6004_3000  USB-SERIAL-JTAG
+0x6000_0000 UART0   0x6001_F000 TIMG0   0x6002_3000 SYSTIMER
+0x6001_0000 UART1   0x6002_0000 TIMG1   0x600C_2000 INTERRUPT MATRIX
 ```
 
 The SRAM alias was verified rather than assumed: a store to IRAM
-`0x4038_0000` reads back at DRAM `0x3FC8_0000`, and IRAM
-`0x4037_C000-0x4037_FFFF` (16 KiB) has no DRAM alias at all.
+0x4038_0000 reads back at DRAM 0x3FC8_0000, and IRAM's low 16 KiB has no
+alias at all. It is not an isolation hole — PMP is default-deny, so only
+granted addresses are reachable — but a HAL must never grant BOTH
+windows for one region, or one `unmap` would revoke one of two doors.
 
-**Boot protocol — DIRECT BOOT, read out of the mask ROM and then
-confirmed by booting:** flash words at offset `0x00` and `0x04` must
-BOTH be `0xAEDB041D`; the ROM maps flash offset 0 at `0x4200_0000`
-(IBUS) and `0x3C00_0000` (DBUS), then `jalr`s to **`0x4200_0008`** —
-it CALLS the image, with `ra` pointing at a ROM path that prints
-`Direct boot returned`, so an image that returns is diagnosed rather
-than hanging. No esptool format, no header, no checksum: the two magic
-words are the whole protocol. Flash attaches as
-`-drive file=<img>,if=mtd,format=raw`.
-
-**The no-A build spelling** (the brief's FIRST PROBE):
+**The SRAM budget, every number measured:**
 
 ```
-sawc :  --target riscv32-unknown-none-elf --target-features +m,+c
-        (the virt profile's +m,+a,+c minus +a — the triple names the
-         architecture, --target-features names the extensions)
-
-clang:  ~/.espressif/tools/esp-clang/esp-20.1.1_20250829/esp-clang/bin/clang
-        --target=riscv32-esp-unknown-elf
-        -march=rv32imc_zicsr_zifencei
-        -mabi=ilp32
+0x4037_C000  kernel .data + .bss   168K   needs 166,608 of 172,032
+0x403A_6000  ROOT region           124K   needs  99,392 of 110,592
+0x403C_5000  CHILD region           92K   needs  67,600 of  77,824
+0x403D_C000  RAM pool               16K
+0x403E_0000  end of SRAM
 ```
 
-`_zifencei` is not decoration: `-march=rv32imc_zicsr` warns
-`no multilib found matching flags [-Wmissing-multilib]` and prints the
-bundled set, in which `rv32imc_zicsr_zifencei` is the exact C3 row.
+The slack is thousands of bytes, not tens of thousands. That is what
+400 KiB looks like with this kernel in it, and the reason every process
+image is so large is one number: `sosrt`'s 64 KiB `ARENA`, which every
+freestanding image links. An overshoot is a loud `ld.lld: will not fit
+in region` error, never a silent overlap.
 
-**And the emulator will not police it.** This QEMU's esp32c3 CPU
-reports `misa = 0x401411AD` — RV32 with **A C D F H I M S U**. It
-advertises the A extension, hardware float, the hypervisor extension
-and S-mode, none of which exist on C3 silicon (M and U only, RV32IMC).
-An accidental `+a` build runs green here and fails on the part, so the
-no-A discipline is a build invariant, never something the smoke target
-can be relied on to catch. That is worth carrying into whatever this
-unit becomes.
+## 3. The boot protocol
 
-## The oracle transcripts
+Read out of the bundled mask ROM by disassembly, then confirmed by
+booting. Flash words at offset `0x00` and `0x04` must BOTH be
+`0xAEDB041D`; the ROM maps flash offset 0 at 0x4200_0000 (IBUS) and
+0x3C00_0000 (DBUS), then **`jalr`s to 0x4200_0008** — it CALLS the
+image, with `ra` pointing at a ROM path that prints `Direct boot
+returned`, so an image that returns is diagnosed rather than hanging.
+No esptool format, no header, no checksum: the two magic words are the
+entire protocol.
 
-There is no smoke transcript to record, because there is no smoke
-target: the harness stub was deliberately left refusing. What follows
-is what the brief's "the emulator is the oracle" clause actually
-produced — the probe runs the board facts were read from, verbatim,
-each preceded by the QEMU stderr line and the mask ROM's own banner.
-Every probe is a direct-boot flash image whose payload the copy-to-SRAM
-stub moved to `0x4038_0000`.
+`esp32c3.ld` emits them as a `.magic` output section, and the harness
+re-checks them in the flattened image before booting — without them the
+ROM never enters the image and the run fails as a silent timeout, which
+is a failure mode that says nothing.
 
-### Probe 1 — direct boot, CPU identity, PMP count, SRAM extents, UART, SYSTIMER
+## 4. The no-A build spelling, and its third half
+
+```
+sawc    --target riscv32-unknown-none-elf --target-features +m,+c
+clang   --target=riscv32-esp-unknown-elf
+        -march=rv32imc_zicsr_zifencei -mabi=ilp32
+blade   march = "rv32imc_zicsr_zifencei"      (in each package's
+        mabi = "ilp32"                         [sos.<triple>] section)
+        target-features = "+m,+c"
+```
+
+The `_zifencei` is not decoration: `-march=rv32imc_zicsr` warns
+`no multilib found matching flags` and prints the bundled set, in which
+`rv32imc_zicsr_zifencei` is the exact C3 row.
+
+**THE BLADE HALF IS THE ONE THAT WOULD HAVE SHIPPED A BROKEN IMAGE IN
+SILENCE.** Blade's built-in default for any `riscv32*` triple is the
+virt/ESP32-P4 Profile A baseline — `rv32imac_zicsr` / `+m,+a,+c` — so a
+package that says nothing gets the A extension, and the first build of
+these packages did. It was caught by reading blade's own build line, not
+by anything failing, because **nothing can fail**: this emulator's CPU
+reports `misa = 0x401411AD`, advertising A, hardware float, the
+hypervisor extension and S-mode, none of which exist on C3 silicon. An
+accidental `+a` build runs green here and faults on the part. The no-A
+discipline is a BUILD invariant, never something the smoke can catch.
+
+## 5. The isolation case: C3-local, and the brief's question answered
+
+The brief asks whether `process-isolation`'s entry is map-portable. **It
+is not, for two independent reasons**, and the second is the interesting
+one.
+
+The MECHANICAL reason: a package names its linker script BY TARGET
+TRIPLE, and the C3 profile is the same `riscv32-unknown-none-elf` triple
+the gate's virt profile is. So a package can name virt's script or the
+C3's and not both, and reusing `process-isolation` would link root at
+0x8020_0000 — an address this part does not have.
+
+The SUBSTANTIVE reason: `tests/child-poke` is arch-free because it finds
+its target by ROUNDING ITS OWN ADDRESS DOWN to a 256 KiB grid — both
+virt profiles put every process region on that grid, so a child's own
+base is a rounding away and root's top is the same number. **That
+arithmetic is a fact about the virt memory map, not about processes.**
+This board has 400 KiB of SRAM in total and its regions are 168 / 124 /
+92 / 16 KiB, sized to fit the kernel rather than to tile a grid; nothing
+rounds. So the C3 child names its target instead, which is honest for a
+board-local case.
+
+**And it names a KERNEL-owned address rather than root's**, which is
+what the brief's `isolation` case actually asks for and is the stronger
+of the two available claims: root's memory is denied because the
+protection domain was RELOADED at the switch, but the kernel's is denied
+because U-mode matches no PMP entry there AT ALL. The second is the
+property the whole protection model rests on, and it is the one a fresh
+board port can get wrong by programming its sixteen entries at the wrong
+addresses — precisely what this smoke exists to catch. The child stores
+to 0x4037_C000, the first word of SRAM, which is the kernel's own
+`.data` and is granted to nobody.
+
+## 6. The XIP layout as landed
+
+```
+0x4200_0000  .magic     8 B        two words of 0xAEDB041D
+0x4200_0008  .text      361,824 B  THE ROM's CALL TARGET
+             .rodata     27,356 B
+             .payload               root's sosimg, page-aligned both ends
+             .regions               the boot region table
+             .childimg              child sosimgs
+             (.data's load image)
+0x4037_C000  .data       14,432 B  VMA in SRAM, LMA in flash
+0x4037_F860  .bss       152,176 B  ends 0x403A_4AD0
+```
+
+`.payload`, `.regions` and `.childimg` stay in FLASH, which the brief's
+copy-to-SRAM shape would not have allowed: they are read-only blobs the
+KERNEL copies out of (the sosimg loader copies root's segments into the
+root region), so nothing is granted where it sits, and leaving them
+there buys back ~39 KiB of SRAM. A payload GRANTED IN PLACE would not
+survive this — it would be a read-only flash grant — but no case does
+that.
+
+`boot.S` copies `.data` from `_data_lma`, zeroes `.bss`, `fence.i`s, and
+calls `kmain`. A 407,632-byte flash image for the `boot` case.
+
+## 7. The interrupt outcome: DELIVERED, and the park's finding was wrong
+
+**The `timer` case takes five real interrupts. The polled-clock fallback
+was not needed and is not used.** What follows is the correction, with
+its evidence, because the first flight of this unit parked on the
+opposite conclusion.
+
+**THE PARK WAS WRONG ABOUT `mie`.** The interrupt matrix drives the
+core's MACHINE EXTERNAL interrupt, so `mie` bit 11 (MEIE) is the
+architectural gate; per-line masking happens in the matrix's own
+`CPU_INT_ENABLE`, not in `mie`. But `mcause` on entry reports the
+MATRIX's CPU interrupt NUMBER, not 11. The first sweeps set `mie` to the
+line bit alone, saw nothing arrive, and concluded the matrix was not
+wired. Probed one variable at a time, source 37 routed to CPU interrupt
+7 throughout:
+
+```
+mie = (1<<7)             the number mcause reports    -> NOT delivered
+mie = (1<<7) | (1<<3)                                 -> NOT delivered
+mie = (1<<7) | (1<<11)                                -> delivered
+mie = (1<<11)            MEIE alone                   -> delivered
+mie = 0xFFFF0080         bit 7 + everything above 15  -> NOT delivered
+mie = 0xFFFFFFFF                                      -> delivered
+```
+
+and with the recipe fixed at `mie |= 1<<11`, five successive one-shot
+arms delivered five interrupts, `mcause = 0x80000007` each time.
+
+**`TIMER_CPU_INT` IS CHOSEN AS 7 ON PURPOSE.** Because `mcause` carries
+the matrix's line number, routing SYSTIMER to line 7 makes a C3 tick
+arrive with exactly the cause word a standard machine-timer interrupt
+has — so `InterruptCause.MachineTimer`, `is_interrupt`, and every
+arch-generic reader above the HAL keep working unexamined. A
+`static_assert` ties the two numbers together so the claim cannot rot.
+
+**SYSTIMER TARGET0 IS SOURCE 37**, established by taking the interrupt
+rather than by reading a table: mapping only source 37 delivered,
+mapping only source 6 (the other candidate an earlier sweep left open)
+did not. The source numbering is independently corroborated by the mask
+ROM's own footprint — it leaves the map register at +0x054 reading 5,
+i.e. source 21 (UART0) routed to CPU interrupt 5, which pins both the
+4-byte stride and Espressif's indices.
+
+**THE EDGE ORDERING IS REAL AND THE HAL RESPECTS IT.** SYSTIMER TARGET0
+is an edge source, so its alarm is a pulse: armed with the delivery path
+down, it is lost and no later remapping recovers it. `intc_init` brings
+the whole path up at boot — map, priority, threshold, CPU-int enable,
+`mie` — before any deadline is ever armed, and `timer_set_deadline_ns`
+only ever runs afterwards.
+
+### 7a. ONE REAL EMULATOR GAP, and the HAL absorbs it
+
+**This matrix never raises `mip`, so `wfi` NEVER WAKES on it.** Three
+observations: `mip` reads 0x00000000 in the same breath as an interrupt
+being taken with `mcause = 0x8000_0007`; `CPU_INT_EIP_STATUS` reads 0
+while an interrupt is being delivered; and a `wfi` with the entire
+delivery path up sleeps forever — with the CPU interrupt configured
+LEVEL and configured EDGE alike.
+
+That matters because SOS idles as
+`while nothing runnable { wait_for_irq(); irq_poll() }` with
+`mstatus.MIE` never set (design 178 D2 — interrupts are taken from USER
+mode only), so the wake it depends on is `wfi` returning on a PENDING
+interrupt. On virt the CLINT and PLIC raise `mip`, which is exactly
+`wfi`'s wake condition; here nothing does. **This is what the `timer`
+case was hanging on after the `mie` fix, and it is a genuine gap in the
+machine model rather than a property of the part.**
+
+The HAL absorbs it, which is what a HAL is for: `wait_for_irq()` is
+EMPTY on this board and the idle loop spins, while `irq_poll()` reads
+the SYSTIMER's own latch, which does work. It costs a core burned while
+idle — invisible under emulation, and this target is emulator-only by
+ruling. **Nothing above the HAL changes**: D2 is untouched, the kernel
+still never takes a trap in kernel mode, and the same `deliver_line`
+services the line. `sink.c`'s `sos_wait_for_irq` is left in place,
+unused, because on real silicon `wfi` DOES wake from the interrupt
+matrix (the C3 TRM's low-power section is explicit that any enabled
+interrupt resumes the core) and a hardware bring-up should restore it.
+
+### 7b. A bug of my own, worth recording
+
+Between the two fixes above sat a third failure with the same symptom.
+The C3's classes both map to one hardware bit, and collapsing the
+kernel-side TAGS onto it too made `intc_init`'s EXTERNAL enable also
+read as the TIMER class — which opened `irq_poll`'s systimer gate at
+boot, where an unprogrammed comparator reads as permanently expired
+(deadline zero). The virt HAL's own comment warns about exactly that.
+The tags are kept distinct now and only `irq_class_enable` maps them
+onto MEIE. Three different causes, one symptom (`the kernel never
+halted`), which is the argument for probing one variable at a time.
+
+## 8. The harness
+
+`--board esp32c3` fills the pre-carved stub section and nothing outside
+it — one contiguous diff hunk in `tools/sos_runner.py`. It shares no
+table, no build directory and no run path with the gate, on three
+counts. The BOARD differs in every way that matters (direct boot from a
+flash image rather than `-kernel`, XIP text, no exit door). The BUILD
+DIRECTORY has to differ even though the target triple does not — both
+profiles are `riscv32-unknown-none-elf`, so a shared `.build/<triple>/`
+would let the smoke silently clobber the objects `make sos-test` is
+about to link. And the VERDICT is read differently:
+
+**ON THIS BOARD THE EXIT STATUS CARRIES NOTHING.** The C3 has no
+`sifive_test` finisher and Espressif QEMU gives a guest no shutdown
+door, so the emulator never exits on its own. The kernel's `exit_pass` /
+`exit_fail` print a verdict line and halt; the harness matches the
+transcript and kills QEMU. That inverts one of the gate's habits and is
+the first thing to know before writing another case here.
+
+Serial, not `-j`: three cases, and a smoke whose job is to be diffable
+gains nothing from overlapping them. The report prints in
+case-definition order and the target exits non-zero on any failure.
+
+## 9. The smoke oracle transcript (VERBATIM)
+
+`make sos-smoke-esp32c3`:
+
+```
+SOS ESP32-C3 board smoke (design 20, NON-GATING)
+  qemu   /Users/swoodtke/.espressif/tools/qemu-riscv32/esp_develop_9.2.2_20250817/qemu/bin/qemu-system-riscv32
+  clang  /Users/swoodtke/.espressif/tools/esp-clang/esp-20.1.1_20250829/esp-clang/bin/clang
+  target riscv32-unknown-none-elf --target-features +m,+c (rv32imc_zicsr_zifencei — no A extension)
+[1/3] ✓ boot  (407632 bytes of flash)
+[2/3] ✓ timer  (436304 bytes of flash)
+[3/3] ✓ isolation  (446656 bytes of flash)
+
+============================================================
+ESP32-C3 SMOKE PASSED (3 cases)
+============================================================
+```
+
+And the three consoles behind it, each captured from the same flash
+images the run booted. THE BOARD'S ORACLE TRANSCRIPT — diff this.
+
+### boot
 
 ```
 ESP-ROM:esp32c3-api1-20210207
 Build:Feb  7 2021
 rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)
-
-C3PROBE begin
-misa      = 0x401411ad
-  ext:ACDFHIMSU
-mvendorid = 0x00000000
-marchid   = 0x00000000
-mimpid    = 0x00000000
-mhartid   = 0x00000000
-pmpaddr implemented mask = 0x0000ffff
-pmp entries = 16
-pmpcfg0..3 = 0x0f0f0f0f 0x0f0f0f0f 0x0f0f0f0f 0x0f0f0f0f  traps=0
-iram[0x4037c000] = 0xc0ffee01
-iram[0x403dfffc] = 0xc0ffee02
-dram[0x3fc80000] (alias of iram 0x40380000) = 0xa5a5a5a5
-........................................................................................................................................................................................................
-uart status after 200-byte burst = 0x00000000
-uart clkdiv = 0x0030015b
-systimer DATE = 0x00000000
-systimer CONF (reset) = 0x46000000
-systimer unit0 lo #1 = 0x0003fc10
-systimer unit0 lo #2 = 0x0003ff70
-systimer advanced = 864
-systimer INT_RAW = 0x00000001
-systimer INT_ST  = 0x00000001
-intmtx 0x100.. baseline: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
-found systimer source index = NONE
-C3PROBE end
+SOS M1: kernel up on riscv32 (ESP32-C3)
+SOS: bad root image: no root image appended (0x00000000)
+SOS-C3: halt fail code=0x00000004
 ```
 
-(The 200 dots are the UART burst; the status register read immediately
-after reads zero, and all 200 bytes arrived — QEMU drains the FIFO
-synchronously and never reports a TX count.)
-
-### Probe 2 — the interrupt matrix, per-source scan with two timers asserting
+### timer
 
 ```
 ESP-ROM:esp32c3-api1-20210207
 Build:Feb  7 2021
 rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)
+SOS M1: kernel up on riscv32 (ESP32-C3)
+SOS: root image ok segments=0x00000002 entry=0x403a82cc prio=0x01010100
+SOS: console handover
+SOS c3timer: arming
+SOS c3timer: tick 1 key=37 fires=1
 
-C3PROBE5 begin
-systimer INT_RAW = 0x00000001
-timg0    INT_RAW = 0x00000001
-eip with nothing mapped = 0x00000000
-per-source scan:
-  src 0 (?) eip=0x00000000
-  src 1 (?) eip=0x00000000
-  src 2 (?) eip=0x00000000
-  src 3 (?) eip=0x00000000
-  src 4 (?) eip=0x00000000
-  src 5 (?) eip=0x00000000
-  src 6 (?) eip=0x00000000
-  src 7 (?) eip=0x00000000
-  src 8 (?) eip=0x00000000
-  src 9 (?) eip=0x00000000
-  src 10 (?) eip=0x00000000
-  src 11 (?) eip=0x00000000
-  src 12 (?) eip=0x00000000
-  src 13 (?) eip=0x00000000
-  src 14 (?) eip=0x00000000
-  src 15 (?) eip=0x00000000
-  src 16 (?) eip=0x00000000
-  src 17 (?) eip=0x00000000
-  src 18 (?) eip=0x00000000
-  src 19 (?) eip=0x00000000
-  src 20 (?) eip=0x00000000
-  src 21 (?) eip=0x00000000
-  src 22 (?) eip=0x00000000
-  src 23 (?) eip=0x00000000
-  src 24 (?) eip=0x00000000
-  src 25 (?) eip=0x00000000
-  src 26 (?) eip=0x00000000
-  src 27 (?) eip=0x00000000
-  src 28 (?) eip=0x00000000
-  src 29 (?) eip=0x00000000
-  src 30 (?) eip=0x00000000
-  src 31 (?) eip=0x00000000
-  src 32 (?) eip=0x00000000
-  src 33 (?) eip=0x00000000
-  src 34 (?) eip=0x00000000
-  src 35 (?) eip=0x00000000
-  src 36 (?) eip=0x00000000
-  src 37 (?) eip=0x00000000
-  src 38 (?) eip=0x00000000
-  src 39 (?) eip=0x00000000
-  src 40 (?) eip=0x00000000
-  src 41 (?) eip=0x00000000
-  src 42 (?) eip=0x00000000
-  src 43 (?) eip=0x00000000
-  src 44 (?) eip=0x00000000
-  src 45 (?) eip=0x00000000
-  src 46 (?) eip=0x00000000
-  src 47 (?) eip=0x00000000
-  src 48 (?) eip=0x00000000
-  src 49 (?) eip=0x00000000
-  src 50 (?) eip=0x00000000
-  src 51 (?) eip=0x00000000
-  src 52 (?) eip=0x00000000
-  src 53 (?) eip=0x00000000
-  src 54 (?) eip=0x00000000
-  src 55 (?) eip=0x00000000
-  src 56 (?) eip=0x00000000
-  src 57 (?) eip=0x00000000
-  src 58 (?) eip=0x00000000
-  src 59 (?) eip=0x00000000
-  src 60 (?) eip=0x00000000
-  src 61 (?) eip=0x00000000
-  src 62 (?) eip=0x00000000
-  src 63 (?) eip=0x00000000
-C3PROBE5 end
+SOS c3timer: tick 2 key=37 fires=1
+
+SOS c3timer: tick 3 key=37 fires=1
+
+SOS c3timer: tick 4 key=37 fires=1
+
+SOS c3timer: tick 5 key=37 fires=1
+
+SOS c3timer: done ticks=5 slept=1
+
+SOS: process teardown handles=0x00000007 threads=0x00000001 events=0x00000000 waiters=0x00000001 interrupts=0x00000000 timers=0x00000001 process=0x00000000
+SOS-C3: halt pass
 ```
 
-A companion run with `mie = 0xFFFFFFFE` and `mstatus.MIE = 1` while
-both timers asserted reported `ticks = 0`, `exceptions = 0`,
-`mip = 0x00000000`.
-
-### Probe 3 — PMP and U-mode isolation
+### isolation
 
 ```
 ESP-ROM:esp32c3-api1-20210207
 Build:Feb  7 2021
 rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)
+SOS M1: kernel up on riscv32 (ESP32-C3)
+SOS: root image ok segments=0x00000002 entry=0x403a8388 prio=0x01010100
+SOS: boot regions=0x00000002
+SOS: console handover
+SOS c3iso: started
+SOS: fault store-access-fault cause=0x00000007 epc=0x403c5528 tval=0x4037c000
+SOS: process teardown handles=0x00000000 threads=0x00000001 events=0x00000000 waiters=0x00000000 interrupts=0x00000000 timers=0x00000000 process=0x00000001
+SOS c3iso: root survived child status=131072
+SOS c3iso: child syscalls=0 faults=1
 
-C3PROBE6 begin
-user blob at 0x403c0000 = 0x403805b7
-pmpcfg0  = 0x00000f00
-pmpaddr0 = 0x100f0000
-pmpaddr1 = 0x100f0400
-back in M-mode
-mcause = 0x00000005
-mtval  = 0x40380000
-mepc   = 0x403c0004
-VERDICT: load access fault (PMP denied)
-VERDICT: mtval is the denied address
-VERDICT: mepc is the faulting instruction
-granted-region run mcause = 0x00000008
-VERDICT: ecall from U-mode (region was reachable)
-C3PROBE6 end
+SOS c3iso: done
+
+SOS: process teardown handles=0x0000000a threads=0x00000001 events=0x00000000 waiters=0x00000001 interrupts=0x00000000 timers=0x00000001 process=0x00000000
+SOS-C3: halt pass
 ```
 
-## The gate
+Two things in those transcripts are worth naming so a future reader does
+not treat them as findings. The BLANK LINES after each `SOS c3*:` line
+are the tree's own convention, not this board's: a test writes
+`print("...\n", args)` and `print` adds its own newline, so every
+`print`-with-arguments line in every case on every profile doubles. The
+lines that do not double came from `debug_print`, which takes its
+newline literally. And `tval=0x4037c000` in the isolation case is the
+exact address `c3-child-poke` names — the kernel's own `.data` base —
+which is the whole of that case's assertion.
 
-`make sos-test` at the base commit (`ca60dd2`) and again on this
-branch's commit, both under the machine-wide suite lock:
+## 10. Deviations
 
-```
-ALL SOS TESTS PASSED (222 passed across riscv32 + arm64)
-```
+None. Both departures from the brief as written are the user's own
+amendments, recorded at the top of this As-built: XIP text placement
+(superseding the copy-to-SRAM default) and the interrupt retry. The
+pre-authorised polled-clock fallback was available and was not used —
+the interrupt is real.
 
-111 cases per architecture, both runs, exit 0. **The two transcripts
-are BYTE-IDENTICAL — `diff` reports nothing at all**, including the
-three cases whose timing-dependent rows are licensed to move
-(`thread_preempt`'s A/B interleave, `timer` tick lines and
-`interrupts=`; `timer_interval`'s `fires=`; `process_stats`'
-`interrupts=`). They were free to move and happened not to; the
-requirement was only that nothing ELSE move, and nothing did.
+Two things inside the ruled scope are worth naming as deliberate
+choices rather than deviations. `wait_for_irq()` is empty on this board
+(§7a) — a HAL-local absorption of an emulator gap, with no change above
+the HAL and design 178 D2 untouched. And the three C3 test packages are
+NEW directories under `tests/`, which the dispatch explicitly permits;
+no existing test was edited.
 
-That is the expected result and the reason it is worth stating: this
-branch adds two files and edits two more, all of them documentation,
-and touches no code the gate compiles. The smoke target itself never
-ran — there is no case for it to run — so it could not have moved the
-gate even had it been built.
+## 11. Findings
 
-## Deviations
-
-None. The unit stopped at the first reviewed point it could not
-implement as written, and implemented nothing in its place.
-
-## Findings
-
-1. **The C3 is a tier-2 part at the floor with no room for this
-   kernel.** Design 19 sizes tier 2 by PMP slots and the C3 meets that
-   floor exactly (16 entries). What design 19 did not price is RAM:
-   400 KiB against a 392 KiB loadable kernel image. The tier taxonomy
-   is about what the hardware can DENY; this unit found that the
-   binding constraint on the family's proxy is what the hardware can
-   HOLD. Worth carrying into the M5 sketch beside the tier table.
-2. **XIP is not a placement preference for this family, it is the
-   entry price.** Design 19's addendum already says so; this unit
-   measured it. Any ESP32 port needs the sosimg loader's XIP placement
-   mode before it needs anything else.
-3. **The emulator is a weaker oracle than the brief assumed, in two
-   specific ways.** It over-reports the ISA (`misa` advertises A, F, D,
-   H and S-mode, none on real C3 silicon), so it cannot police the no-A
-   discipline; and it under-implements the SoC (no interrupt source is
-   wired to the core), so it cannot demonstrate interrupt routing. Both
-   are worth stating before a P4 or S3 port trusts a green smoke run.
-4. **The UART status poll is unexercisable here.** QEMU drains the TX
-   FIFO synchronously and `UART_STATUS` reads 0 even mid-burst, so a
-   `TXFIFO_CNT` poll written against the wrong bit field would pass on
-   the emulator and hang on hardware. The console sink's poll is
-   hardware-only correctness with no test.
-5. **`sawc` has no size-optimization level** — only `-O0`, which
-   disables passes. On an MCU target that is the difference between a
-   port and a park. Filed as SL-18.
+1. **The park's own conclusion was wrong, and the shape of the mistake
+   is the lesson.** "Nothing reaches the CPU" was three different
+   misconfigurations wearing one symptom — a missing MEIE bit, a
+   collapsed class tag, and a genuine `wfi`/`mip` gap — each of which
+   individually produced a silent hang with every register reading
+   correct. The only thing that separated them was probing one variable
+   at a time against a known-good control. A sweep that changes several
+   things at once cannot distinguish "not wired" from "wired and I asked
+   wrongly", and this unit spent a park learning that.
+2. **`mcause` naming a controller's line number rather than the
+   architectural cause is a portability trap with a cheap fix.**
+   Choosing the matrix's CPU interrupt 7 so the cause word matches the
+   standard machine-timer encoding cost one constant and kept every
+   arch-generic reader above the HAL working unexamined. Worth doing on
+   any board whose controller multiplexes into `mcause`.
+3. **The C3 is a tier-2 part AT the floor in two dimensions, not one.**
+   Design 19 sizes tier 2 by PMP slots and the C3 meets that exactly
+   (16 entries, all implemented, all four `pmpcfg` words writable). What
+   design 19 did not price is RAM: 400 KiB against a 392 KiB kernel
+   image, which is why XIP is the entry price rather than a placement
+   preference. Both belong in the M5 sketch's tier table.
+4. **`sosrt`'s 64 KiB ARENA dominates every process image here.** Root
+   needs 99,392 bytes and the child 67,600, of which 65,536 is the arena
+   in each. On a 400 KiB part that is the single biggest lever on how
+   many processes fit, and it is a `rt/` question rather than a board
+   one.
+5. **The emulator is a weaker oracle than the brief assumed, in three
+   specific ways**, each marked at its section in `ABI.md`: it
+   over-reports the ISA (`misa` advertises A, F, D, H and S-mode, none
+   on real C3 silicon), so it cannot police the no-A discipline; it
+   drains the UART TX FIFO synchronously and reports `TXFIFO_CNT` as
+   zero even mid-burst, so the console sink's poll is silicon-only
+   correctness with no test; and it never raises `mip` for a matrix
+   interrupt, so `wfi` is unusable. A P4 or S3 port should re-read those
+   three before trusting a green run.
+6. **`irq_raise_selftest_line` is the one line of this HAL that is
+   UNEXERCISED**, and it says so in its own doc comment. None of the
+   three smoke cases takes a device interrupt, and a probe that enabled
+   UART interrupts wholesale saw the console output stop dead — an
+   interaction this unit did not chase. Treat a first use as bring-up.
+7. **A `u32`-suffixed shift still folds signed**, so bit 31 of a
+   `UInt32` cannot be written as a shift on a 32-bit target and the
+   house bit-flag style breaks at exactly one bit. Filed as SL-19.

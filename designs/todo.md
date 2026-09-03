@@ -29,8 +29,51 @@ entry below or the brief that carries it, never restating either.
   note, both queue entries below pre-written.
 - 3. design 20 — ESP32-C3 board HAL, SMOKE ONLY (bringup + memory
   config; direct boot; RV32IMC no-A; non-gating, machine-local QEMU)
-  [brief user-reviewed Sep 2; agent IN FLIGHT (worktree off ca60dd2
-  — second-lander, rebases onto new main at its integration)]. AND:
+  [#20, brief user-reviewed Sep 2]. **CLOSED — SOS BOOTS ON THE C3 AND
+  `make sos-smoke-esp32c3` IS GREEN ON ALL THREE REVIEWED CASES**
+  (boot / timer / isolation). As-built with the verbatim oracle
+  transcripts: `designs/020-esp32c3-smoke.md`; every address with the
+  probe that produced it: `hal/riscv32-esp32c3/ABI.md`.
+  BOTH BLOCKERS CLOSED. (A) XIP as ruled: `.text` (361,824 B) and
+  `.rodata` execute in place in the flash IBUS window at 0x4200_0000,
+  `boot.S` copies only `.data` and zeroes `.bss` in SRAM;
+  `.payload`/`.regions`/`.childimg` stay in flash too, since the kernel
+  copies out of them. The 400 KiB divides 168/124/92/16 KiB across
+  kernel, root, child and pool, every number MEASURED (the tightest is
+  root at 99,392 of 110,592). (B) THE PARK'S FINDING WAS WRONG and the
+  retry says so: the matrix IS wired, and what the first sweeps got
+  wrong was `mie` — the matrix drives MACHINE EXTERNAL, so bit 11 is
+  the gate while `mcause` reports the matrix's own CPU interrupt
+  number. `TIMER_CPU_INT` is chosen as 7 so a C3 tick's cause word
+  reads exactly like a standard machine-timer interrupt and the
+  arch-generic decoding above the HAL is untouched. No fallback was
+  needed: five deterministic ticks, taken as real interrupts.
+  ONE REAL EMULATOR GAP remains and the HAL absorbs it: this matrix
+  never raises `mip`, so `wfi` never wakes on it (probed level and edge
+  alike, with `mip` reading 0 in the same breath as an interrupt being
+  taken). `wait_for_irq()` is EMPTY here and the idle loop spins while
+  `irq_poll()` reads the SYSTIMER latch — design 178 D2 untouched, no
+  kernel change, and `sos_wait_for_irq` left in place because `wfi`
+  does wake from the matrix on real silicon.
+  WHAT LANDED: `hal/riscv32-esp32c3/{kernel,user}/` as a sibling copy
+  (each file notes its origin); `tests/c3-{timer,isolation,child-poke}/`
+  as NEW packages (a package names its linker script by TRIPLE and the
+  C3 shares `riscv32-unknown-none-elf` with virt, so it can name one or
+  the other and not both); the pre-carved board section of
+  `tools/sos_runner.py` filled and nothing outside it; the Makefile
+  target real. The isolation case is C3-LOCAL and the brief's question
+  is answered NO: `child-poke` finds its target by rounding its own
+  address to a 256 KiB grid, which is a fact about the virt map, and
+  this board's regions are 124/92 KiB. It names a kernel-owned address
+  instead — the stronger claim, and the one the brief actually asks for.
+  THE NO-A BUILD SPELLING HAS THREE HALVES, and the third would have
+  shipped a broken image in silence: sawc `--target-features +m,+c`;
+  esp-clang `-march=rv32imc_zicsr_zifencei -mabi=ilp32`; and BLADE,
+  whose default for any riscv32 triple is the virt/P4 baseline
+  `+m,+a,+c`, so every C3 package restates march/mabi/target-features in
+  its manifest. Nothing catches a miss — this emulator's CPU advertises
+  A (`misa` 0x401411AD), so the wrong build runs green here and faults
+  on the part.
 ## [BACKLOG] — filed, not scheduled
 
 - **`PipeRequestRight.Reply` HAS NO TEST ANY MORE** [#22 As-built
@@ -302,3 +345,4 @@ One entry per issue, resolution-sufficient: the symptom verbatim, the probe/site
   **RESOLUTION: REFUSAL, RULED (user, Sep 2).** Option (a) — you cannot move a field or payload out of a BORROWED reference, uniformly; the place-match arm was a missing check rather than a missing semantics. The partial-move-tracking alternative was weighed and REJECTED: partial-move-through-a-borrow stays banned everywhere, so marking the payload moved-from and skipping the enclosing drop would carve out a special case the rest of the language does not have. `take()`, `swap_out` and the owned-local match remain the outs. ONE BOUNDARY, because the two rules meet: design 260's `consumes` carve-out is the licensed exception — a `consumes` body moves its own fields out because the effect marks the receiver DYING-OWNED rather than borrowed — so the refusal and the carve-out compose rather than conflict. The nested-place face wants its own answer in the same ruling: an arm binding is a borrow, so re-matching it must borrow too rather than materialize.
   **AND THE DESIGN-AROUND IS RETIRED, BY A SECOND USER RULING THE SAME DAY.** The paragraph that used to sit here said design 18's §API shape — a payload enum owning its wrappers — was unwritable; it was not. What SL-17 forbids is the INVALID construction, and the LICENSED one already exists: `WaitPayload` carries `Reply(outcome: ReplyDelivery)` and `Message(msg: PipeMsg, request: PipeRequest)`, `WaitResult` is `{key, what}` again, and extraction goes through a `consumes` accessor (`WaitResult.open(&var self) consumes -> (UInt, WaitPayload)`, an unconditional multi-field move-out) whose result is matched OWNED — the path this entry's own probe verified sound. The `message`/`request` optional fields are gone. Probed before it was written: the tuple-of-moved-fields return compiles under sawc 0.4.0 and drops each payload exactly once, so the ruled fallback (optionals inside the case, extracted with `Optional.take()`) was not needed and the type invariant is kept rather than traded away.
 - SL-18 — THERE IS NO SIZE-OPTIMIZATION LEVEL: `sawc --help` offers exactly one optimization flag, ``-O0  Disable optimization passes (emit raw codegen output for debugging)``, and nothing that ASKS for smaller code — no `-O1/-O2/-Os/-Oz`, no per-build tradeoff of speed for image size (design 20, sawc 0.4.0 @ `46eebb36`). Probe: `sawc --help`, plus `llvm-size` on the riscv32 kernel image — `.text` 360,624 B, `.rodata` 27,004 B, `.data` 14,224 B, `.bss` 152,176 B. It is filed from sawos rather than as a nicety because on an MCU-class target it is the difference between a port and a park: design 20's ESP32-C3 unit parked on a 392.4 KiB loadable image against 400 KiB of on-chip SRAM, and the ONE build-side lever that could have closed a gap that size does not exist. The shape of the `.text`, measured with `llvm-nm --print-size --size-sort`, is a long tail with a heavy shoulder rather than a hot spot: the largest single function is 35,134 B (`end_process`), the next four are 23,294 / 19,764 / 17,400 / 16,642 B, and the top twenty together are 209,470 B — 58% of `.text` — with the remaining 42% spread over hundreds of mid-size functions. So no excision closes the gap and the lever wanted is whole-program codegen policy. Workaround in-tree: NONE — the alternatives are all source-side (sawos's own lazy-decode lever, filed in [BACKLOG], and the ESP32 family's XIP execution model, which moves the tax to flash rather than removing it). Resolution shape: an optimization-level flag that reaches LLVM's `optsize`/`minsize` function attributes and the matching pass pipeline, selectable per build so a freestanding MCU profile can ask for it without changing what the hosted profile does; the useful reporting companion is a per-module `.text` attribution the caller can diff across a change, since "which module grew" is currently only answerable with `llvm-nm --size-sort` on the linked image. **FIX IN FLIGHT (user, Sep 2, relayed): sawlang size work queued after its current run — probe bundle (llvm-size --format=sysv, llvm-nm --size-sort tail-40, --emit-bt-table: 138 B, zero frames) sent upstream; closes at a future pin bump. At closure: re-measure the C3 fit and record whether copy-to-SRAM becomes viable — the XIP ruling stands regardless (it is the family's execution model, not a size workaround).**
+- SL-19 — A `u32`-SUFFIXED SHIFT STILL FOLDS IN THE SIGNED PLATFORM DOMAIN, so bit 31 of a `UInt32` cannot be written as a shift on a 32-bit target: ``constant expression -2147483648 does not fit in `UInt32` (range 0..=4294967295)``, anchored at the `<<` (design 20, `hal/riscv32-esp32c3/kernel/lib.saw`, sawc 0.4.0 @ `46eebb36`, target riscv32). `static SYSTIMER_CLK_EN: UInt32 = 1 << 31` is refused, which design 185's documented gotcha predicts and licenses — the fold is in the signed platform-`Int` domain, and on riscv32 `1 << 31` is `Int.min`. WHAT IS NOT PREDICTED is that the EXACT-TYPED spelling behaves identically: `1u32 << 31` is refused with the same message at the same column, even though a suffixed literal is documented as exact-typed and `UInt32` has 0x8000_0000 comfortably in range. So the suffix — the one lever LANGUAGE_SPEC offers for "no expected type reaches this subexpression" — does not reach the constant folder, and there is no spelling of the house style's bit-flag-as-a-shift rule that works at the top bit of a fixed-width unsigned slot on a 32-bit target. Probe: the two `static` lines above, either alone, on riscv32; both compile on a 64-bit host, which is what makes this easy to miss (the fold has 64 bits of room there and `1 << 31` is a comfortable positive). Workaround in-tree: write the literal — `static SYSTIMER_CLK_EN: UInt32 = 0x8000_0000` — with the reason at the line, while every other bit in the same file stays a shift, so the file is inconsistent exactly where the language forces it to be. Resolution shape: fold a suffixed operand in ITS OWN declared domain (the suffix is a type ascription, and `1u32 << 31` has an unambiguous `UInt32` answer), or — the wider fix — fold a const shift in the domain of the SLOT it is landing in, which is what DF-243a already does for a mixed binop's operand and what DF-240a did for the enum-flag combination. Either would let the bit-flag style hold at bit 31 as it does at bit 30.
