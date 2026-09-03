@@ -1,0 +1,1177 @@
+//! THE RIGHTS (spec §3) — one enum per object kind, and what every default set
+//! mints.
+//!
+//! The fifteen `*Right` enums with the `static_assert`s that pin the universal
+//! low byte, the two kind-blind predicates the generic paths check through, and
+//! the per-kind functions that say what a freshly minted handle carries. The
+//! default sets read the rights, which is why the two sections share a file.
+//!
+//! Reached through the `sosabi` facade — see `lib.saw`.
+
+// =============================================================================
+// Rights (spec §3)
+// =============================================================================
+
+// RIGHTS ARE SCOPED PER OBJECT KIND (ratified Aug 7). Each kind declares its
+// own rights enum, so a bit means nothing until you know which kind's word it
+// sits in — and dispatch establishes the kind before any right is checked (§3's
+// order: table lookup -> object type -> op table -> rights check -> op). Two
+// consequences worth stating plainly:
+//
+//   - Kind-specific bits OVERLAP freely across kinds. A rights word is only ever
+//     interpreted against its handle's kind, so each kind owns 24 bits of its
+//     own instead of all kinds sharing 32.
+//   - The check is TYPED. `SystemObject.allows` takes a `SystemRight` and
+//     nothing else, so testing a pipe right against a System handle is a
+//     compile error rather than a bit comparison that quietly answers.
+//
+// THE UNIVERSAL LOW BYTE. Bits 0-7 are identical in EVERY kind's enum:
+//
+//   bit 0   Transfer   may be sent over a pipe — the movability capability
+//   bit 1   Mint       may mint a SIBLING handle onto the same object
+//   bits 2-7           RESERVED (candidates as they prove universal:
+//                      wait/signal, introspect/info, revoke)
+//
+// **THE DOCTRINE, ruled Aug 29 (user), and it is what `Manage`'s removal made
+// explicit: SPECIFIC RIGHTS FOR SPECIFIC OPERATIONS, PER OBJECT TYPE; UNIVERSAL
+// BITS FOR UNIVERSAL OPS; THERE IS NO GENERIC AUTHORITY.** `Manage` held bit 1
+// from M2 until this unit and meant "derive children" — a phrase general enough
+// to be borrowed by four unrelated ops (`ProcessSelf`, `ThreadSelf`, `Give`, and
+// a reading of sibling-derivation) and therefore specific enough to gate none of
+// them. It is GONE, not renamed: every op it stood in front of now has a bit
+// named after the op, and a launcher stripping one strips exactly one authority
+// instead of an unpredictable bundle.
+//
+// **`Mint` TOOK ITS BIT** rather than sitting above it (vDSO discipline: numbers
+// are not ABI, and a hole where a retired right used to be is a number nobody
+// can read a reason for). It gates `MINT_OP`, the second universal op: a handle
+// carrying it may produce a SIBLING onto the same object, in the caller's own
+// table, with rights that are the source's INTERSECTED with a keep mask. That is
+// a genuinely kind-independent authority — the op never learns the kind — which
+// is what the universal byte is for, and it is the only bit besides `Transfer`
+// that has earned a place in it.
+//
+// WHAT THE DOCTRINE DOES NOT MEAN: one bit per op NUMBER. `TimerRight.Arm` gates
+// both `Arm` and `Disarm`, and `WaiterRight.Attach` gates both `Add` and
+// `Remove`, because each pair is ONE capability — the power to decide when this
+// timer fires, the power to decide what this Waiter watches — and splitting one
+// would produce a right that withholds nothing (a holder who may arm can silence
+// a timer by arming it a century out). The unit of a right is an AUTHORITY, and
+// `Manage`'s failure was that "derive children" named no authority anybody could
+// point at.
+//
+// A RIGHTS BIT IS SPELLED AS A SHIFT (ruled Aug 17, user; writable since
+// DF-232c made a case value a const EXPRESSION). `case ClockGet = 1 << 10`, not
+// `= 1024` — including the low bits, `Transfer = 1 << 0`, so the whole column
+// reads as bit positions. The asserts below take the same spelling, which is
+// what makes each one read as the rule it enforces: `>= (1 << 8)` IS
+// "starts at bit 8".
+//
+// ONE THING ABOUT THE ASSERT SPELLING, and it is easy to get wrong: the
+// PARENTHESES ARE LOAD-BEARING — Saw's bitwise tier binds BELOW comparison, so
+// a bare `x >= 1 << 8` is `(x >= 1) << 8`. The `u32` suffix these asserts used
+// to carry is GONE (DF-243a, fixed Aug 22): a const expression adopts the other
+// operand's width in a mixed binop exactly as a bare literal does, so one bit is
+// spelled one way here — as a shift, in the case value and in the assert that
+// checks it. The numbers never moved.
+//
+// Six bits are reserved rather than assigned because more shared operations are
+// coming and a universal right added later must not have to move a kind's bits
+// to make room. Generic kernel paths — pipe handle-transfer is the first —
+// check universal bits without knowing the kind, which is only sound while the
+// table holds, so the `static_assert`s below hold it: they are what stops a kind
+// enum from drifting, and what catches a kind-specific right placed below bit 8.
+
+/// A right on the System object.
+///
+/// The low byte is the universal table above; System's own rights start at bit
+/// 8. `Debug` gates the console, `Shutdown` gates stopping the machine — a
+/// process holding the handle without them can name the object and do nothing
+/// with it, which is the point of checking rights per-OP rather than per-object.
+///
+/// **`ProcessSelf` IS NEW IN M3 UNIT 3, and it exists because `Manage` does
+/// not** (the Aug-29 doctrine: specific rights for specific operations). Asking
+/// the System object which Process you are was gated by `Manage` from M2, on a
+/// reading of "derive children" that died when universal `Mint` took over
+/// sibling-derivation and left the word meaning nothing in particular. It is a
+/// specific authority with its own substitution seam, exactly as `ClockGet` is:
+/// a launcher that strips this bit hands a child a System handle through which
+/// it can print and tell the time and never learn its own identity — and a
+/// launcher that later wants to SUPPLY that identity some other way (a virtual
+/// process object over IPC, the same move `ClockGet` describes for a virtual
+/// clock) has a bit to strip rather than an op to intercept.
+/// `ClockGet` gates the one op that hands out a time source, and it is a right
+/// rather than an ambient facility for a reason worth stating where the bit is
+/// (design 232 unit 1; the M3 time notes): TIME IS A GRANTED CAPABILITY. A
+/// launcher that strips this bit from a child's System handle has a process
+/// that cannot read the machine's clock at all — which is what makes handing it
+/// a VIRTUAL clock over IPC later a substitution rather than a rewrite. It is
+/// deliberately NOT in the stripped-by-construction set the M3 device rulings
+/// describe (`Shutdown` and the bind/alloc ops): an ordinary process needs to
+/// tell the time, and a clock grants authority over nothing.
+///
+/// `ProcessCreate` is the newest bit, and WHY IT IS HERE rather than on Process
+/// is the Aug-29 user ruling recorded as sawos design 2's RIDER: process-scoped
+/// objects are minted by your Process; PROCESSES ARE MINTED BY THE SYSTEM. The
+/// process table is a machine-global resource bounded by machine facts — the
+/// slab today, the protection-domain reloads, ASIDs when Profile B grows real
+/// translation — so its refusals and its limits are SYSTEM answers, while
+/// threads, events, waiters and timers stay a process's own. `ProcessSelf` is
+/// the precedent that was already sitting here: Process handles have always
+/// come from System, and now they all do. A launcher that is handed a System
+/// handle stripped of this bit cannot spawn — which is the attenuation the old
+/// placement only appeared to offer, since with a root/launcher topology a
+/// creation right on the CALLER's own Process handle gates nothing real.
+public enum SystemRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Mint = 1 << 1,
+    case Debug = 1 << 8,
+    case Shutdown = 1 << 9,
+    case ClockGet = 1 << 10,
+    case ProcessCreate = 1 << 11,
+    case ProcessSelf = 1 << 12,
+}
+
+// The universal low byte, pinned. Every kind's enum repeats these two asserts
+// verbatim; that repetition IS the check, since it is what makes a drifted bit
+// fail to build rather than fail in a pipe transfer years later.
+static_assert((SystemRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((SystemRight.Mint as UInt32) == (1 << 1),
+              "universal right Mint must be bit 1 in every kind's enum")
+
+// Kind-specific rights start at bit 8, leaving bits 2-7 free for universal
+// rights not yet assigned. One assert per kind-specific case.
+static_assert((SystemRight.Debug as UInt32) >= (1 << 8),
+              "kind-specific right Debug must start at bit 8 or above")
+static_assert((SystemRight.Shutdown as UInt32) >= (1 << 8),
+              "kind-specific right Shutdown must start at bit 8 or above")
+static_assert((SystemRight.ClockGet as UInt32) >= (1 << 8),
+              "kind-specific right ClockGet must start at bit 8 or above")
+static_assert((SystemRight.ProcessCreate as UInt32) >= (1 << 8),
+              "kind-specific right ProcessCreate must start at bit 8 or above")
+static_assert((SystemRight.ProcessSelf as UInt32) >= (1 << 8),
+              "kind-specific right ProcessSelf must start at bit 8 or above")
+
+/// A right on a Process object (§2 table row; design 178 D4).
+///
+/// `ThreadSelf` gates one thing: asking the process for the CALLING THREAD's
+/// handle. It was `Manage`'s from M2 until the Aug-29 doctrine retired that word
+/// — specific rights for specific operations — and it is now named for its op
+/// like every other bit here. What it buys a launcher is what `ProcessSelf` buys
+/// one object up: a child that may not learn which thread it is, withheld by a
+/// bit rather than by a second mechanism.
+///
+/// `Kill` is deliberately ABSENT. Spec §8 ratifies it as the capability-gated
+/// escape hatch userspace supervision needs against a wedged process — ANOTHER
+/// process. With one process in the system it is `Exit` under a second name,
+/// and an op whose only reachable use is degenerate is an op nothing tests. It
+/// lands with M3's multi-process loading, beside `process_create`.
+///
+/// THE TWO M3-UNIT-2 BITS, and each one gates a DIFFERENT ROLE the Process
+/// object now plays (sawos design 2 D-4, as amended by its RIDER):
+///
+///   - `Start` is a RECEIVER authority on the CHILD's handle — the second
+///     phase of the two-phase lifecycle, and the reason it is its own bit is
+///     that a supervisor may legitimately hold a child's handle to WATCH it
+///     (`Wait`) without being allowed to run it.
+///   - `BootHandles` gates the boot-set iterator. Root holds it because root is
+///     the process the kernel minted the boot set FOR; what a CHILD gets is
+///     unit 3's question, and a bit withheld here is the whole of the answer.
+///
+/// THERE WAS A THIRD, AND IT MOVED. `ProcessCreate` sat here as a factory
+/// authority on the CALLER's own Process handle until the Aug-29 user ruling
+/// (sawos design 2's RIDER) put it on System: process-scoped objects are minted
+/// by your Process; PROCESSES ARE MINTED BY THE SYSTEM. It is now
+/// `SystemRight.ProcessCreate`, and `Start`/`BootHandles` renumbered DOWN into
+/// the hole it left — legal because `kernel/sysapi` is vDSO discipline and
+/// these numbers are not ABI: userspace names the case, the module supplies the
+/// value, and the two are compiled together in one image.
+///
+/// `EventCreate` and `WaiterCreate` are M2 unit 3's, and where they sit ANSWERS
+/// an open pin: spec §12 leaves the creation-authority model for plain objects
+/// (Pipe/Event/Waiter/Timer) open between quota-gated free creation and a
+/// factory capability. This is the factory capability, and it is one a process
+/// already holds — the Process object is what an Event or a Waiter is CHARGED
+/// to (its slab slot, its handle-table entry, its teardown), so making the
+/// authority to create one flow through the Process handle is §3's derivation
+/// rule rather than a new mechanism beside it. A quota is additive on top: it
+/// would be a field on the process slot, checked where `NoResource` is returned
+/// today. Nothing here forecloses it.
+///
+/// ONE BIT PER CREATION OP rather than a single `Create`, matching
+/// `ThreadCreate`. The bits are what attenuation strips, so an object kind a
+/// process may not make is a bit it was not given — collapsing them would make
+/// "may create Events" and "may create Waiters" the same capability, which they
+/// are not. Twenty-four bits are available and eight are used.
+///
+/// `InterruptBind` is the one whose absence MATTERS today, and it is worth
+/// saying why the same shape carries a much stronger authority: an Interrupt
+/// BINDS AN IRQ LINE, so the bit is what separates a driver process from an
+/// ordinary one. In M2 root holds it because root is the only process there is;
+/// M3's launcher strips it from everything it spawns except the drivers, which
+/// is §3's monotonic attenuation doing exactly what it is for.
+/// **`Map` IS THE UNIT-4 BIT, AND IT IS AN AUTHORITY OVER *THIS* PROCESS**
+/// (sawos design 6 D-3). `Memory.Map` / `IoMemory.Map` name a target Process as
+/// their argument, and installing a protection row into somebody's domain is
+/// not something possession of a region should imply — the doctrine, again: no
+/// possession-implies-authority. So a map spends TWO rights on two different
+/// objects, `MemoryRight.Map` on the region and this bit on the process being
+/// mapped into, and a launcher that hands a child a region without this bit on
+/// the child's handle has handed over bytes it cannot install anywhere.
+///
+/// It sits beside `Give` for the same reason `Give` sits beside `Start`: they
+/// are separable authorities over one child. A builder that may furnish a
+/// child's boot set need not be allowed to edit its address space, and a
+/// supervisor that may run and watch need not be allowed either.
+///
+/// **`Give` IS ITS OWN BIT** (M3 unit 3, as amended by the Aug-29 doctrine). An
+/// earlier cut of this unit gated the courier op on `Manage`, arguing that
+/// furnishing a process you created is management OF it; the doctrine refused
+/// the move on its own terms — "management" is exactly the generic word that
+/// gates nothing — and the authority has a perfectly good name of its own: MAY
+/// PLACE HANDLES INTO THIS CHILD'S BOOT SET. It sits beside `Start` rather than
+/// inside it because the two are genuinely separable: a supervisor may hold a
+/// child's handle to run and watch it without being allowed to furnish it, and a
+/// builder may furnish without being allowed to run.
+///
+/// **`PipeCreate` IS M4 UNIT 1's BIT, AND WHY IT IS *HERE* IS A RULING** (sawos
+/// design 10 ruling 3, built by design 13). The factory for a connection sits on
+/// the PROCESS object, like `EventCreate` and `WaiterCreate` and unlike
+/// `ProcessCreate` — pipes are IPC and carry nothing system-shaped, so the
+/// System lean was REJECTED. What that buys is the thing a machine-global
+/// factory could not offer without a mask: the authority is PER-PROCESS
+/// ATTENUABLE. A launcher that hands a child a Process handle minted through a
+/// keep mask without this bit has a child that can hold and use connections
+/// somebody else made and can never make one of its own.
+///
+/// It joins the ONE default set below, on the same terms `EventCreate` did: the
+/// Process object is what a connection is CHARGED to (its slab slot, its two
+/// handle entries, its quota row), so the authority to make one flows through
+/// the handle that is charged — §3's derivation rule rather than a new mechanism
+/// beside it.
+///
+/// **`Stats` IS DESIGN 16's BIT, AND IT IS AN AUTHORITY TO OBSERVE** (sawos
+/// design 16, user-ruled Sep 1). It gates `ProcessOp.Stats` — a per-kind right
+/// named for its op, the Aug-29 doctrine — and it is worth saying what makes
+/// reading three counters worth a bit of its own rather than riding `Wait`, the
+/// other observation bit. `Wait` answers §8's status word, which is a fact about
+/// whether the process is ALIVE; this answers how many traps it has taken, which
+/// is a fact about what it has been DOING. A supervisor that may learn a child
+/// died need not be able to watch it work, and the separation costs one bit.
+///
+/// It joins the ONE default set below on the terms every other kind-specific bit
+/// joined it on: self-inspection has to compose for free (`ProcessSelf` ->
+/// `proc.stats()`, which is the whole point of the op), and attenuating it away
+/// from a child is a launcher's keep mask rather than a second default list.
+public enum ProcessRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Mint = 1 << 1,
+    case ThreadCreate = 1 << 8,
+    case Exit = 1 << 9,
+    case Wait = 1 << 10,
+    case EventCreate = 1 << 11,
+    case WaiterCreate = 1 << 12,
+    case InterruptBind = 1 << 13,
+    case Start = 1 << 14,
+    case BootHandles = 1 << 15,
+    case ThreadSelf = 1 << 16,
+    case Give = 1 << 17,
+    case Map = 1 << 18,
+    case PipeCreate = 1 << 19,
+    case Stats = 1 << 20,
+}
+
+static_assert((ProcessRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((ProcessRight.Mint as UInt32) == (1 << 1),
+              "universal right Mint must be bit 1 in every kind's enum")
+static_assert((ProcessRight.ThreadCreate as UInt32) >= (1 << 8),
+              "kind-specific right ThreadCreate must start at bit 8 or above")
+static_assert((ProcessRight.Exit as UInt32) >= (1 << 8),
+              "kind-specific right Exit must start at bit 8 or above")
+static_assert((ProcessRight.Wait as UInt32) >= (1 << 8),
+              "kind-specific right Wait must start at bit 8 or above")
+static_assert((ProcessRight.EventCreate as UInt32) >= (1 << 8),
+              "kind-specific right EventCreate must start at bit 8 or above")
+static_assert((ProcessRight.WaiterCreate as UInt32) >= (1 << 8),
+              "kind-specific right WaiterCreate must start at bit 8 or above")
+static_assert((ProcessRight.InterruptBind as UInt32) >= (1 << 8),
+              "kind-specific right InterruptBind must start at bit 8 or above")
+static_assert((ProcessRight.Start as UInt32) >= (1 << 8),
+              "kind-specific right Start must start at bit 8 or above")
+static_assert((ProcessRight.BootHandles as UInt32) >= (1 << 8),
+              "kind-specific right BootHandles must start at bit 8 or above")
+static_assert((ProcessRight.ThreadSelf as UInt32) >= (1 << 8),
+              "kind-specific right ThreadSelf must start at bit 8 or above")
+static_assert((ProcessRight.Give as UInt32) >= (1 << 8),
+              "kind-specific right Give must start at bit 8 or above")
+static_assert((ProcessRight.Map as UInt32) >= (1 << 8),
+              "kind-specific right Map must start at bit 8 or above")
+static_assert((ProcessRight.PipeCreate as UInt32) >= (1 << 8),
+              "kind-specific right PipeCreate must start at bit 8 or above")
+static_assert((ProcessRight.Stats as UInt32) >= (1 << 8),
+              "kind-specific right Stats must start at bit 8 or above")
+
+/// A right on a Thread object (§2 table row; design 178 D4).
+///
+/// The split is between what an OWNER of a thread may do to it — `Start` it,
+/// `Join` it — and what a thread does to ITSELF, which is `Control`: exit, and
+/// yield the processor. Both of the latter check that the caller IS the named
+/// thread, so `Control` on someone else's handle still cannot drive it; the
+/// right is what makes the check worth running rather than the check itself.
+public enum ThreadRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Mint = 1 << 1,
+    case Start = 1 << 8,
+    case Join = 1 << 9,
+    case Control = 1 << 10,
+}
+
+static_assert((ThreadRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((ThreadRight.Mint as UInt32) == (1 << 1),
+              "universal right Mint must be bit 1 in every kind's enum")
+static_assert((ThreadRight.Start as UInt32) >= (1 << 8),
+              "kind-specific right Start must start at bit 8 or above")
+static_assert((ThreadRight.Join as UInt32) >= (1 << 8),
+              "kind-specific right Join must start at bit 8 or above")
+static_assert((ThreadRight.Control as UInt32) >= (1 << 8),
+              "kind-specific right Control must start at bit 8 or above")
+
+/// A right on an Event object (§2.4; design 178 D5).
+///
+/// THE THREE ARE THE THREE ENDS OF A NOTIFICATION and they attenuate apart on
+/// purpose. `Signal` is the producer's — it is the whole of what a driver or a
+/// peer needs, and a handle carrying only this bit can raise the event and can
+/// never learn anything from it. `Receive` is the consumer's: it drains the
+/// word and resets it. `Wait` is the right to have READINESS OBSERVED — what
+/// attaching to a Waiter spends — and it is separate from `Receive` because a
+/// dispatcher that parks on a set of events need not be the code that reads any
+/// of them.
+///
+/// `Wait` IS A CONSUMING RIGHT TOO, since the Aug-17 ruling: a wait's record
+/// carries the accumulated word and the delivery clears it, so a handle holding
+/// only this bit takes values as well as observes them. That was always half
+/// true — the record has carried the word since M2 — and what changed is that it
+/// now empties the object as well. The two bits therefore attenuate by DOOR
+/// (park or poll) rather than by whether the holder learns anything, and a
+/// launcher that wants a pure readiness observer has no bit for it. Nothing in
+/// SOS needs one yet: with no handle transfer before M4, every right on an Event
+/// is held by the process that made it.
+///
+/// `Mint` is granted at creation on the uniform lean the default-sets section
+/// records: a second NAME for an Event costs nothing and can itself be
+/// attenuated, where withholding it would only mean the object cannot be handed
+/// on in narrowed form. (`Manage` used to be withheld here on the argument that
+/// an Event derives nothing; the Aug-29 doctrine retired the bit entirely.)
+public enum EventRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Mint = 1 << 1,
+    case Signal = 1 << 8,
+    case Receive = 1 << 9,
+    case Wait = 1 << 10,
+}
+
+static_assert((EventRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((EventRight.Mint as UInt32) == (1 << 1),
+              "universal right Mint must be bit 1 in every kind's enum")
+static_assert((EventRight.Signal as UInt32) >= (1 << 8),
+              "kind-specific right Signal must start at bit 8 or above")
+static_assert((EventRight.Receive as UInt32) >= (1 << 8),
+              "kind-specific right Receive must start at bit 8 or above")
+static_assert((EventRight.Wait as UInt32) >= (1 << 8),
+              "kind-specific right Wait must start at bit 8 or above")
+
+/// A right on a Waiter object (§2.2; design 178 D5).
+///
+/// `Attach` gates BOTH `Add` and `Remove`, which is one bit for what reads like
+/// two operations — deliberately, because they are one capability: the power to
+/// decide what a Waiter watches. A holder who may add may already replace the
+/// whole attachment set by adding and never removing, so splitting the pair
+/// would produce a right that withholds nothing.
+///
+/// `Wait` is the right to PARK on it, and it is separate because the two roles
+/// genuinely divide: §2.2 ratifies many threads waiting on one Waiter, so a
+/// pool of workers holds `Wait` while whoever builds the attachment set holds
+/// `Attach`.
+public enum WaiterRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Mint = 1 << 1,
+    case Attach = 1 << 8,
+    case Wait = 1 << 9,
+}
+
+static_assert((WaiterRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((WaiterRight.Mint as UInt32) == (1 << 1),
+              "universal right Mint must be bit 1 in every kind's enum")
+static_assert((WaiterRight.Attach as UInt32) >= (1 << 8),
+              "kind-specific right Attach must start at bit 8 or above")
+static_assert((WaiterRight.Wait as UInt32) >= (1 << 8),
+              "kind-specific right Wait must start at bit 8 or above")
+
+/// A right on an Interrupt object (§2 table; spec §9; design 178 D6).
+///
+/// TWO RIGHTS, AND THEY ARE THE TWO HALVES OF spec §9's CYCLE. `Wait` is the
+/// right to have the line's assertion OBSERVED — what attaching to a Waiter
+/// spends, the same meaning `EventRight.Wait` has — and `Ack` is the right to
+/// END a fire, which is what unmasks the line and lets the device interrupt
+/// again. They attenuate apart for a real shape: a supervisor that watches a
+/// driver's lines holds `Wait` alone and can never rearm one, which is exactly
+/// the authority a monitor should have.
+///
+/// There is deliberately no `Mask` right and no mask op. Masking is the
+/// KERNEL's half of the cycle (§9's mask-on-fire), not something a driver
+/// asks for — a driver that could mask a line at will could also leave it
+/// masked, which is a denial of the device with no diagnostic. What a driver
+/// controls is its own device's interrupt-enable register, through the window
+/// it was granted, which is where that decision belongs.
+///
+/// `Mint` is granted at creation on the uniform lean the default-sets section
+/// records. (`Manage` used to be withheld here, on the argument that an
+/// Interrupt derives nothing; the bit no longer exists.)
+public enum InterruptRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Mint = 1 << 1,
+    case Wait = 1 << 8,
+    case Ack = 1 << 9,
+}
+
+static_assert((InterruptRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((InterruptRight.Mint as UInt32) == (1 << 1),
+              "universal right Mint must be bit 1 in every kind's enum")
+static_assert((InterruptRight.Wait as UInt32) >= (1 << 8),
+              "kind-specific right Wait must start at bit 8 or above")
+static_assert((InterruptRight.Ack as UInt32) >= (1 << 8),
+              "kind-specific right Ack must start at bit 8 or above")
+
+/// A right on a Clock object (§2 table; design 232 unit 1).
+///
+/// THE TWO SPLIT READING TIME FROM SCHEDULING IT, and they attenuate apart for
+/// a shape that already exists: a process that only ever stamps a log line
+/// holds `Read` alone and can never consume a Timer slot, while a dispatcher
+/// that arms timeouts holds both. Neither is the other's subset in practice —
+/// `TimerCreate` without `Read` is a process that sleeps by the clock without
+/// being able to name what time it is, which is exactly what a pure event loop
+/// does.
+///
+/// `Mint` is granted at creation on the uniform lean the default-sets section
+/// records. (`Manage` used to be withheld here, on the argument that a Clock's
+/// only derivation IS a Timer and that already has its own bit — which is the
+/// Aug-29 doctrine arriving early, about the very bit it retired.)
+public enum ClockRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Mint = 1 << 1,
+    case Read = 1 << 8,
+    case TimerCreate = 1 << 9,
+}
+
+static_assert((ClockRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((ClockRight.Mint as UInt32) == (1 << 1),
+              "universal right Mint must be bit 1 in every kind's enum")
+static_assert((ClockRight.Read as UInt32) >= (1 << 8),
+              "kind-specific right Read must start at bit 8 or above")
+static_assert((ClockRight.TimerCreate as UInt32) >= (1 << 8),
+              "kind-specific right TimerCreate must start at bit 8 or above")
+
+/// A right on a Timer object (§2 table; design 232 unit 1).
+///
+/// `Arm` GATES BOTH `Arm` AND `Disarm`, which is one bit for what reads like two
+/// operations — the same call `WaiterRight.Attach` makes, and for the same
+/// reason: they are one capability, the power to decide when this timer fires.
+/// A holder who may arm can already silence a timer by arming it a century out,
+/// so splitting the pair would produce a right that withholds nothing.
+///
+/// `Wait` is the right to have readiness OBSERVED — what attaching to a Waiter
+/// spends, the same meaning it has on an Event and an Interrupt — and it is
+/// separate because the roles genuinely divide: a supervisor parked on a set of
+/// timeouts holds `Wait` alone and can never reschedule one.
+///
+/// `Mint` is granted at creation on the uniform lean the default-sets section
+/// records. (`Manage` used to be withheld here; the bit no longer exists.)
+public enum TimerRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Mint = 1 << 1,
+    case Arm = 1 << 8,
+    case Wait = 1 << 9,
+}
+
+static_assert((TimerRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((TimerRight.Mint as UInt32) == (1 << 1),
+              "universal right Mint must be bit 1 in every kind's enum")
+static_assert((TimerRight.Arm as UInt32) >= (1 << 8),
+              "kind-specific right Arm must start at bit 8 or above")
+static_assert((TimerRight.Wait as UInt32) >= (1 << 8),
+              "kind-specific right Wait must start at bit 8 or above")
+
+/// A right on a Memory object (spec §2.5; sawos design 2 D-2, grown by design
+/// 6 D-2/D-3).
+///
+/// `Transfer` is unit 3's `give` — a region is exactly the kind of thing a
+/// launcher hands to a child — and `Mint` is unit 3's attenuated sibling. Both
+/// were minted at boot before anything read either, because attenuation is
+/// monotonic: a bit not minted at boot could never appear later.
+///
+/// **THE TWO UNIT-4 BITS ARE NAMED FOR THEIR OPS**, per the Aug-29 doctrine —
+/// which is exactly what unit 2's docstring promised would happen here instead
+/// of a generic `Manage` (the bit that used to sit at 1 << 1 for that borrowed
+/// purpose, and is gone):
+///
+///   - `Split` is the authority to DERIVE — one cut from the front, the parent
+///     becoming the remainder. A pool root a launcher hands out with this bit
+///     withheld is a fixed range and nothing else, which is the honest way to
+///     say "here is your RAM, you may not subdivide it for anyone".
+///   - `Map` is the authority to INSTALL this region in some domain. It is
+///     half of what a map spends: `ProcessRight.Map` on the target process is
+///     the other half, because possession of bytes must not imply authority
+///     over an address space.
+///
+/// There is STILL deliberately NO `Read`/`Write` pair, and unit 4 is what makes
+/// the reason visible rather than merely stated: access is a property of the
+/// MAPPING (`map(access:)`), which is precisely what lets one region be mapped
+/// read-only in one place and read-write in another. Rights on the region could
+/// not express that without becoming per-mapping, at which point they would be
+/// the mapping's.
+///
+/// **AND `MapExecute` IS THE ONE EXCEPTION TO THAT PARAGRAPH, RULED AUG 30**
+/// (sawos design 9 D-1). X stays a property of the MAPPING — the sentence above
+/// is untouched, and a region carries no R/W/X triple — but WHICH access bits a
+/// handle may REQUEST is now itself an authority. `MemoryOp.Map` refuses
+/// `MapAccess.Execute` unless the handle carries this bit, which is the same
+/// refusal every unspent right answers.
+///
+/// **IT IS CAPABILITY FLOW, NOT IDENTITY.** "Only root maps executable" holds
+/// because root never GRANTS the bit — it mints an attenuated sibling and gives
+/// that — and not because the kernel asks who is calling. A launcher that hands
+/// a driver child its RAM through a mint whose keep mask omits `MapExecute` has
+/// handed over memory that child can read and write and can never execute from,
+/// stated once at the mint rather than checked at every map.
+///
+/// **WHY A FOURTH BIT RATHER THAN A W^X RULE ALONE**: the two answer different
+/// questions. W^X (below, in `MapAccess`) says no single ROW may be both
+/// writable and executable, which every process may still satisfy by
+/// double-mapping. This bit says whether a process may produce an executable row
+/// AT ALL. A system that only had W^X would let any holder of a region build
+/// itself a JIT; a system that only had this bit would let a privileged holder
+/// build a W|X row. Both, and each is one comparison.
+///
+/// **STATED HONESTLY: THIS IS PER-HANDLE, NOT PER-REGION.** A second handle onto
+/// the same bytes that still carries the bit can map them executable — the
+/// aliasing stance design 6 took (no aliasing bookkeeping on a machine that does
+/// not translate) is unchanged, and a region-level immutable flag was REJECTED
+/// as a second mechanism doing overlapping work.
+public enum MemoryRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Mint = 1 << 1,
+    case Split = 1 << 8,
+    case Map = 1 << 9,
+    case MapExecute = 1 << 10,
+}
+
+static_assert((MemoryRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((MemoryRight.Mint as UInt32) == (1 << 1),
+              "universal right Mint must be bit 1 in every kind's enum")
+static_assert((MemoryRight.Split as UInt32) >= (1 << 8),
+              "kind-specific right Split must start at bit 8 or above")
+static_assert((MemoryRight.Map as UInt32) >= (1 << 8),
+              "kind-specific right Map must start at bit 8 or above")
+static_assert((MemoryRight.MapExecute as UInt32) >= (1 << 8),
+              "kind-specific right MapExecute must start at bit 8 or above")
+
+/// A right on an IoMemory object (spec §2.5; sawos design 6 D-1/D-2).
+///
+/// **THE SAME TWO SHAPES AS `MemoryRight`, WITH THE DERIVATION VERB CHANGED**,
+/// and the change of verb is the whole difference between the kinds. `Carve`
+/// takes a sub-window and LEAVES THE PARENT ALONE — §2.5's "a fixed region may
+/// be handed out many times" — where `Split` consumes what it hands out. There
+/// is no bit that means both, because a holder of one authority is not a holder
+/// of the other: a driver handed a carve right over a peripheral's window can
+/// produce views for its own sub-devices without ever being able to take a
+/// range away from anyone.
+///
+/// `Map` means what it means on a Memory and spends the same second right
+/// (`ProcessRight.Map`) on the target. What differs is not the authority but the
+/// ROW it installs: an IoMemory can only ever produce a device-attribute row,
+/// which is the type-level guarantee `ObjType.IoMemory` exists for.
+///
+/// `Transfer` is here because handing a driver its window is the whole point of
+/// unit 6's flow, and `Mint` on the uniform lean the default-sets section
+/// records. **UNIT 6 SPENT IT** (sawos design 9 D-2): `Process.give(iomemory:)`
+/// moves the console's register page into a driver child's table, and the child
+/// maps it into itself. There is deliberately no `MapExecute` bit beside `Map`
+/// here — `IoMemoryOp.Map` takes no access argument at all, so the authority
+/// design 9 added to `MemoryRight` has nothing to gate on this kind.
+public enum IoMemoryRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Mint = 1 << 1,
+    case Carve = 1 << 8,
+    case Map = 1 << 9,
+}
+
+static_assert((IoMemoryRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((IoMemoryRight.Mint as UInt32) == (1 << 1),
+              "universal right Mint must be bit 1 in every kind's enum")
+static_assert((IoMemoryRight.Carve as UInt32) >= (1 << 8),
+              "kind-specific right Carve must start at bit 8 or above")
+static_assert((IoMemoryRight.Map as UInt32) >= (1 << 8),
+              "kind-specific right Map must start at bit 8 or above")
+
+/// A right on a Mapping object (spec §2.5; sawos design 6 D-1/D-3).
+///
+/// **ONE KIND-SPECIFIC BIT, BECAUSE THE OBJECT HAS ONE OP.** `Unmap` is the
+/// authority to take the row out, and §2.5's "only the Mapping handle can
+/// unmap" is what makes holding one meaningful at all.
+///
+/// **`Transfer` IS DECLARED AND NEVER MINTED**, which is the one thing worth
+/// reading here. The bit exists because the universal low byte is pinned in
+/// every kind's enum by the asserts below — that repetition IS the check — but
+/// `mapping_rights()` does not grant it, so a Mapping cannot be given and
+/// `BootHandleKind` has no case for one. The reason is the object's own
+/// meaning: a Mapping names a row in a SPECIFIC process's domain, so handing
+/// one to a third party would be handing over the power to edit an address
+/// space that party was never given authority over. Revocation across a
+/// process boundary is a supervision story, and it wants a ruling rather than a
+/// bit granted by default.
+public enum MappingRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Mint = 1 << 1,
+    case Unmap = 1 << 8,
+}
+
+static_assert((MappingRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((MappingRight.Mint as UInt32) == (1 << 1),
+              "universal right Mint must be bit 1 in every kind's enum")
+static_assert((MappingRight.Unmap as UInt32) >= (1 << 8),
+              "kind-specific right Unmap must start at bit 8 or above")
+
+/// A right on a PipeInlet — the CLIENT end of a connection (spec §2.1; sawos
+/// design 13, on design 10 ruling 2).
+///
+/// **ONE KIND-SPECIFIC BIT IN UNIT 1, AND IT IS NAMED FOR ITS OP** (the Aug-29
+/// doctrine): `Post` gates the one submission op the kernel's client side has.
+/// Ruling 4 is why there is exactly one — `post` IS the primitive, and blocking
+/// send, timeout and TELL are all LIBRARY compositions over it, so there is no
+/// second door for a bit to gate.
+///
+/// **THE `Wait` BIT ARRIVED WITH WAITABILITY** (M4 unit 3, sawos design 15). Its
+/// absence through units 1 and 2 was a scope line rather than a decision —
+/// attaching an endpoint to a Waiter spends a right, and which right that is
+/// could not be answered before there was a readiness to observe — and
+/// `waitable_slot`'s `NotWaitable` arms for both kinds are gone.
+///
+/// `Transfer` is minted because handing a child one end of a connection is the
+/// whole point of the pair (design 13's `pipe-child` proof), and `Mint` on the
+/// uniform lean the default-sets section records — a second NAME for an endpoint
+/// is a second REFERENCE on that endpoint's column, which is what makes "any
+/// handle to an end holds that end open" (D-1's v1 rule, the Unix dup
+/// precedent) true by construction rather than by a check.
+public enum PipeInletRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Mint = 1 << 1,
+    case Post = 1 << 8,
+    /// **THE SECOND KIND-SPECIFIC BIT, AND M4 UNIT 3 IS WHERE IT ARRIVED**
+    /// (sawos design 15). It gates attaching this kind to a Waiter, on the
+    /// Timer precedent — the OUTLET's readable level and this end's own room-to-post level are two different waitables; this bit is the one that gates attaching THIS end (design 10 ruling 8). Its absence through unit 2 was a scope line and
+    /// this is that line being crossed, not a widening of anything: the bit is
+    /// in the default set for the reason every kind-specific bit is, which is
+    /// that attenuation is monotonic and a bit not minted at creation could
+    /// never appear later.
+    case Wait = 1 << 9,
+}
+
+static_assert((PipeInletRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((PipeInletRight.Mint as UInt32) == (1 << 1),
+              "universal right Mint must be bit 1 in every kind's enum")
+static_assert((PipeInletRight.Post as UInt32) >= (1 << 8),
+              "kind-specific right Post must start at bit 8 or above")
+static_assert((PipeInletRight.Wait as UInt32) >= (1 << 8),
+              "kind-specific right Wait must start at bit 8 or above")
+
+/// A right on a PipeOutlet — the SERVER end of a connection (spec §2.1; sawos
+/// design 13).
+///
+/// The mirror of `PipeInletRight` with the verb changed, and the change of verb
+/// is the whole difference between the ends: `Take` gates the one op that reads
+/// a staged message out. Everything `PipeInletRight` says about the missing
+/// `Wait` bit, about `Transfer` and about `Mint` holds here word for word.
+///
+/// **THE BITS OVERLAP `PipeInletRight`'s AND THAT IS SOUND** — a rights word is
+/// only ever interpreted against its handle's KIND, which §3's order establishes
+/// first, so `Post` and `Take` sharing bit 8 is the per-kind scoping working
+/// rather than a collision. Testing an inlet's right against an outlet is a
+/// COMPILE error, not a bit comparison that quietly answers.
+public enum PipeOutletRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Mint = 1 << 1,
+    case Take = 1 << 8,
+    /// **THE SECOND KIND-SPECIFIC BIT, AND M4 UNIT 3 IS WHERE IT ARRIVED**
+    /// (sawos design 15). It gates attaching this kind to a Waiter, on the
+    /// Timer precedent — attaching the SERVER end to a Waiter is what a multiplexed server does instead of polling `Take` (spec §2.2's waitable list). Its absence through unit 2 was a scope line and
+    /// this is that line being crossed, not a widening of anything: the bit is
+    /// in the default set for the reason every kind-specific bit is, which is
+    /// that attenuation is monotonic and a bit not minted at creation could
+    /// never appear later.
+    case Wait = 1 << 9,
+}
+
+static_assert((PipeOutletRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((PipeOutletRight.Mint as UInt32) == (1 << 1),
+              "universal right Mint must be bit 1 in every kind's enum")
+static_assert((PipeOutletRight.Take as UInt32) >= (1 << 8),
+              "kind-specific right Take must start at bit 8 or above")
+static_assert((PipeOutletRight.Wait as UInt32) >= (1 << 8),
+              "kind-specific right Wait must start at bit 8 or above")
+
+/// A right on a PipeReply — the CLIENT's claim on one reply (spec §2.1; sawos
+/// design 14).
+///
+/// **ONE KIND-SPECIFIC BIT, NAMED FOR ITS OP** (the Aug-29 doctrine): `Resolve`
+/// gates the one op a claim carries. **THE `Wait` BIT — the reply-ready level
+/// §2.2 owed — ARRIVED WITH WAITABILITY** (M4 unit 3, sawos design 15), and it
+/// is the sharpest of the four: a claim's delivery carries the reply's own
+/// BYTES, so attaching one replaces resolving it.
+///
+/// `Transfer` is minted because a claim is a capability like any other and §2.1
+/// ratifies both one-shots as transferable.
+///
+/// **`Mint` IS NOT MINTED, AND A ONE-SHOT IS THE ONE PLACE THE UNIFORM LEAN
+/// BREAKS** (`designs/010` ruling 12(c), Sep 2; sawos design 22). The bit is
+/// DECLARED here — universal bit 1 belongs in every kind's enum whatever any
+/// default set does with it, which is what the `static_assert` below pins — and
+/// `pipe_reply_rights()` simply does not hand it out. Two things decided it. The
+/// use-case audit came up empty: attenuate-then-give is `give`'s keep mask
+/// (`tests/give-keep-mask`), a claim has two meaningful bits to attenuate
+/// between, and no caller in this tree mints a one-shot sibling. And a sibling
+/// UNDERMINES the single-use `Resolve` now carries: `resolve` consumes on every
+/// path and PARKS when pending (ruling 12(b)), so a second name is a second
+/// claim that can only ever be told `PeerClosed` — a nuisance dressed as
+/// authority. Attenuation is monotonic, so the absence is permanent: `Post`
+/// mints the one name and `Transfer` moves it.
+public enum PipeReplyRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Mint = 1 << 1,
+    case Resolve = 1 << 8,
+    /// **THE SECOND KIND-SPECIFIC BIT, AND M4 UNIT 3 IS WHERE IT ARRIVED**
+    /// (sawos design 15). It gates attaching this kind to a Waiter, on the
+    /// Timer precedent — attaching a CLAIM is how a client waits for one answer among many — and since ruling 11(a) the delivery carries the answer itself, so the attach can replace the resolve entirely. Its absence through unit 2 was a scope line and
+    /// this is that line being crossed, not a widening of anything: the bit is
+    /// in the default set for the reason every kind-specific bit is, which is
+    /// that attenuation is monotonic and a bit not minted at creation could
+    /// never appear later.
+    case Wait = 1 << 9,
+}
+
+static_assert((PipeReplyRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((PipeReplyRight.Mint as UInt32) == (1 << 1),
+              "universal right Mint must be bit 1 in every kind's enum")
+static_assert((PipeReplyRight.Resolve as UInt32) >= (1 << 8),
+              "kind-specific right Resolve must start at bit 8 or above")
+static_assert((PipeReplyRight.Wait as UInt32) >= (1 << 8),
+              "kind-specific right Wait must start at bit 8 or above")
+
+/// A right on a PipeRequest — the SERVER's obligation to send one reply (spec
+/// §2.1; sawos design 14).
+///
+/// The mirror of `PipeReplyRight` with the verb changed, and the change of verb
+/// is the whole difference between the two halves of a pair: a claim resolves,
+/// an obligation replies. Everything `PipeReplyRight` says about the `Wait` bit
+/// (here it gates the request-abandoned level — §2.1's ratified early notice),
+/// about `Transfer` — here it is §2.1's DELEGATION PRIMITIVE rather than a
+/// convenience — and about `Mint` — declared, not minted, on ruling 12(c)'s
+/// one-shot-has-one-name rule — holds word for word.
+///
+/// The bits overlap `PipeReplyRight`'s and that is sound for the reason the
+/// endpoint pair's do: a rights word is only ever read against its handle's
+/// KIND, which §3's order establishes first.
+public enum PipeRequestRight: UInt32 {
+    case Transfer = 1 << 0,
+    case Mint = 1 << 1,
+    case Reply = 1 << 8,
+    /// **THE SECOND KIND-SPECIFIC BIT, AND M4 UNIT 3 IS WHERE IT ARRIVED**
+    /// (sawos design 15). It gates attaching this kind to a Waiter, on the
+    /// Timer precedent — attaching an OBLIGATION is the server's cancellation watcher: §2.1's ratified "the `PipeRequestHandle` is WAITABLE for abandoned". Its absence through unit 2 was a scope line and
+    /// this is that line being crossed, not a widening of anything: the bit is
+    /// in the default set for the reason every kind-specific bit is, which is
+    /// that attenuation is monotonic and a bit not minted at creation could
+    /// never appear later.
+    case Wait = 1 << 9,
+}
+
+static_assert((PipeRequestRight.Transfer as UInt32) == (1 << 0),
+              "universal right Transfer must be bit 0 in every kind's enum")
+static_assert((PipeRequestRight.Mint as UInt32) == (1 << 1),
+              "universal right Mint must be bit 1 in every kind's enum")
+static_assert((PipeRequestRight.Reply as UInt32) >= (1 << 8),
+              "kind-specific right Reply must start at bit 8 or above")
+static_assert((PipeRequestRight.Wait as UInt32) >= (1 << 8),
+              "kind-specific right Wait must start at bit 8 or above")
+
+/// Whether a rights word carries the UNIVERSAL `Transfer` bit (§3's low byte).
+///
+/// **IT TAKES A PLAIN MASK RATHER THAN A TYPED RIGHT, and that is the point**
+/// (sawos design 4 D-1). `ProcessOp.Give` checks this bit on the handle BEING
+/// GIVEN, which may be any kind at all — so the check happens at the one
+/// altitude that has the entry and has not branched on its `obj_type`, exactly
+/// as `RELEASE_OP` does. A typed `allows` cannot be written there, and writing
+/// nine of them would be nine spellings of one universal bit.
+///
+/// `SystemRight.Transfer` is the spelling and ANY kind's would do: the
+/// `static_assert`s above pin all ten enums' `Transfer` to bit 0, and that
+/// repetition is what makes this function's one reading safe. This is the first
+/// consumer of the universal low byte the §3 table has ever had — the bit was
+/// declared in M2 and read by nothing until give.
+public func rights_allow_transfer(rights: UInt32) -> Bool {
+    (rights & (SystemRight.Transfer as UInt32)) != 0
+}
+
+/// Whether a rights word carries the UNIVERSAL `Mint` bit (§3's low byte, bit 2).
+///
+/// The same shape and the same reasoning as `rights_allow_transfer` above:
+/// `MINT_OP` is intercepted BEFORE the kind match, so the check has the entry and
+/// not the kind and a typed `allows` cannot be written there. `SystemRight.Mint`
+/// is the spelling and any kind's would do — the `static_assert`s pin every kind to
+/// bit 2.
+public func rights_allow_mint(rights: UInt32) -> Bool {
+    (rights & (SystemRight.Mint as UInt32)) != 0
+}
+
+// =============================================================================
+// WHAT EVERY DEFAULT SET MINTS (spec §3)
+// =============================================================================
+//
+// **`Mint` IS IN EVERY ONE OF THEM BUT THE TWO ONE-SHOTS** (the Aug-29 user
+// rulings on design 4, ruling 3, as amended by `designs/010` ruling 12(c) on
+// Sep 2). The lean was uniformity and the argument for it still holds for every
+// kind that outlives one act: the alternative is a per-kind table nobody can
+// predict from the outside, so a handle either can name its object twice or
+// cannot, and making that vary by kind means a launcher has to know which kinds
+// are mintable before it can write a policy.
+//
+// **WHAT BREAKS THE UNIFORMITY IS SINGLE USE, AND ONLY THAT** (sawos design 22).
+// `pipe_reply_rights()` and `pipe_request_rights()` withhold the bit because a
+// second name on a one-shot cannot mean what a second name means anywhere else:
+// the object is spent by ONE op, so the sibling is not a second way to use the
+// object but a handle whose only possible answer is `PeerClosed`. That is the
+// per-kind ruling the last paragraph below said nothing had needed yet; it is
+// needed now, it is exactly two kinds wide, and the enum bits stay declared so
+// the universal-bit-1 doctrine is untouched.
+//
+// **WHAT IT COSTS IS NOTHING, AND THAT IS THE POINT.** A mint AMPLIFIES NOTHING
+// (§3): the rights it produces are the source's INTERSECTED with a keep mask, so
+// the sibling is always a subset, and the authority to mint is itself a bit a
+// mask can omit — a launcher hands out a handle whose mask left `Mint` out and
+// the proliferation stops there. A default that withheld `Mint` would only mean
+// "this kind cannot be attenuated", which is a strictly worse system: the
+// alternative to minting an attenuated sibling is handing over the full-rights
+// original.
+//
+// Where `Mint` IS withheld is therefore a per-kind ruling, exactly as
+// `Transfer`'s placement is — and the two one-shots are the whole of the list.
+
+/// What the kernel mints for root's System handle at boot (§12).
+///
+/// A function rather than a `static`, and THE ORIGINAL REASON HAS EXPIRED: a
+/// static initializer folds const expressions since design 186 (an OR of
+/// raw-backed enum cases among them, DF-240a), so this body would be a legal
+/// static initializer today. The function is kept as it is anyway — converting
+/// it is a real change nobody has ruled on, and the spelling was never the
+/// point. What is: `768` with a comment saying which bits it is made of is
+/// exactly the magic number this file is getting rid of.
+///
+/// Root gets both System operations plus the three DERIVATION bits its boot set
+/// is a SEED of rather than the whole of: `ProcessSelf` (ask the System object
+/// which Process you are), `ClockGet` (ask for a time source) and `Mint`. Every
+/// later object arrives through a handle already held (§3's derivation rule)
+/// rather than through a register the kernel had to widen.
+///
+/// **`ProcessSelf` REPLACED `Manage` HERE IN M3 UNIT 3** (the Aug-29 doctrine:
+/// specific rights for specific operations). The bit is the same authority under
+/// a name that says which op it gates; nothing root can do changed.
+///
+/// **`Transfer` IS HERE SINCE M3 UNIT 3, AND THE M2 REASON FOR ITS ABSENCE IS
+/// SUPERSEDED** (user ruling, Aug 29). M2 withheld it saying "there is nobody to
+/// transfer a handle to in a one-process world"; unit 2 ENDED that world and
+/// this unit acts on it. What the bit buys is the launch flow's last missing
+/// piece: root MINTS a masked sibling of its System handle — `Debug |
+/// ProcessSelf | ClockGet | Transfer`, with `Shutdown`, `ProcessCreate` and
+/// `Mint` absent BY SILENCE from the keep mask — and GIVES that to a child. So a
+/// child bootstraps EXACTLY AS ROOT DOES: a System handle in its first argument
+/// register, its own Process handle derived from it, and its boot set drained
+/// from there (§12's symmetry). It can print without owning a device, tell the
+/// time, and neither stop the machine nor spawn.
+///
+/// Note which handle travels: never THIS one. Root gives a SIBLING a keep mask
+/// has already narrowed, and what a child receives cannot be re-widened, since a
+/// mint's result is a subset of its source.
+///
+/// **THE MASK MUST KEEP `Transfer`, AND THAT IS A RECORDED FINDING** rather than
+/// a choice: `give` checks the universal `Transfer` bit on the handle BEING
+/// GIVEN, so a launcher cannot narrow BELOW the ticket that lets the narrowed
+/// thing arrive. A child therefore holds `Transfer` on its System handle and
+/// could pass it on — inert today, since it has no `ProcessCreate` to make a
+/// receiver with and no pipe to send over until M4. Closing it wants a ruling (a
+/// give that CONSUMES the bit, or a strip-on-arrival rule), and either would
+/// amend design 4 D-1's rights-VERBATIM sentence, so neither is taken here.
+///
+/// `ProcessCreate` joins in M3 unit 2, by design 2's RIDER (Aug 29): processes
+/// are minted by the SYSTEM, so root's authority to launch is a bit on the one
+/// handle the entry register carries. A launcher handed a System handle without
+/// it cannot spawn — which, with a root/launcher topology, is the only place
+/// that refusal could have been made to mean anything.
+///
+/// Attenuation is monotonic, so a right withheld here can never appear later —
+/// which is the right default for a set the boot handle hands out.
+public func root_system_rights() -> UInt32 {
+    ((SystemRight.Debug as UInt32) | (SystemRight.Shutdown as UInt32)
+     | (SystemRight.ProcessSelf as UInt32) | (SystemRight.ClockGet as UInt32)
+     | (SystemRight.ProcessCreate as UInt32) | (SystemRight.Mint as UInt32)
+     | (SystemRight.Transfer as UInt32))
+}
+
+/// **THE Process DEFAULT SET — ONE SET, THREE MINTERS** (§12; design 178 D4;
+/// design 2 D-4; re-ruled by design 4 D-3 and collapsed by the Aug-29 doctrine).
+///
+/// The three places a Process handle is minted — root's at boot, the one
+/// `SystemOp.ProcessSelf` hands a process for itself, and the one
+/// `SystemOp.ProcessCreate` hands a launcher for its child — all mint THIS. That
+/// is a collapse of two functions into one, and what forced it is worth stating:
+/// unit 2 gave the child's handle three bits and wrote "unit 3 revisits", design
+/// 4 D-3 widened it to the self-management vocabulary plus `Start` and
+/// `Transfer`, and once `Manage` was retired there was nothing left distinguishing
+/// the two lists at all. A second copy of a list is a second place to forget a
+/// bit.
+///
+/// WHAT IS IN IT, all of it named for the op it gates: `ThreadCreate`,
+/// `ThreadSelf`, `Exit`, `Wait`, `EventCreate`, `WaiterCreate`, `InterruptBind`,
+/// `Start`, `BootHandles`, `Give`, `Map` (M3 unit 4), `PipeCreate` (M4 unit 1),
+/// `Stats` (design 16), plus the two universal bits `Transfer` and `Mint`.
+///
+/// TWO BITS READ ODDLY ON ROOT'S OWN HANDLE and are harmless there, which is the
+/// price of one list. `Start` on a process that is already `Running` is the
+/// ordinary `BadState`, and nobody starts root. `Give` into a process that is not
+/// `Created` is the same refusal. Both used to be argued about per-minter; the
+/// state word answers them better than a rights word could, because it answers
+/// them for a CHILD too.
+///
+/// `InterruptBind` WAS EXPECTED TO STOP BEING HANDED OUT FREELY IN M3, AND IT
+/// DID NOT — recorded here rather than left to be discovered (sawos design 9,
+/// M3 unit 6's finding). The plan was §3's monotonic attenuation with `MINT_OP`
+/// as the tool: root keeps the bit because it launches the drivers, and a
+/// launcher spawning something that is not one hands over a handle its keep
+/// mask left the bit out of. The mask cannot reach it. `SystemOp.ProcessSelf`
+/// mints THIS ONE default set and takes no keep mask, so a child derives its
+/// own Process handle with `InterruptBind` and `Map` on it whatever its SYSTEM
+/// handle was narrowed to — a launcher's mask reaches the System sibling it
+/// gives, not the Process handle the child derives from it. Withholding either
+/// bit needs `ProcessSelf` to take a keep mask of its own; nothing in v1 needs
+/// that (a driver child is exactly the process that should hold both), and the
+/// attenuate-at-derive seam is a ruled M4 rider (`designs/010` agenda 7b).
+public func process_rights() -> UInt32 {
+    ((ProcessRight.ThreadCreate as UInt32) | (ProcessRight.ThreadSelf as UInt32)
+     | (ProcessRight.Exit as UInt32) | (ProcessRight.Wait as UInt32)
+     | (ProcessRight.EventCreate as UInt32)
+     | (ProcessRight.WaiterCreate as UInt32)
+     | (ProcessRight.InterruptBind as UInt32)
+     | (ProcessRight.Start as UInt32)
+     | (ProcessRight.BootHandles as UInt32) | (ProcessRight.Give as UInt32)
+     | (ProcessRight.Map as UInt32)
+     | (ProcessRight.PipeCreate as UInt32)
+     | (ProcessRight.Stats as UInt32)
+     | (ProcessRight.Transfer as UInt32) | (ProcessRight.Mint as UInt32))
+}
+
+/// What the kernel mints for a PipeInlet at `ProcessOp.PipeCreate` (spec §2.1;
+/// sawos design 13).
+///
+/// **THE CREATOR GETS EVERY END OF ITS OWN CONNECTION**, on `event_rights`'
+/// reasoning exactly: it made the object and there is nobody to attenuate
+/// against yet. Attenuation happens when a handle is DERIVED for somebody else —
+/// a `MINT_OP` sibling through a keep mask — and §3 makes that monotonic, so a
+/// client handed a post-only inlet can never widen back to this.
+///
+/// `Transfer` HAS TO BE HERE, and for the reason `memory_rights` states about
+/// `MapExecute`: attenuation only ever narrows, so a bit not minted at creation
+/// could never appear later by any sequence of ops — and a connection whose ends
+/// cannot travel is a connection with exactly one process on both sides of it,
+/// which is not IPC.
+public func pipe_inlet_rights() -> UInt32 {
+    ((PipeInletRight.Transfer as UInt32) | (PipeInletRight.Mint as UInt32)
+     | (PipeInletRight.Post as UInt32) | (PipeInletRight.Wait as UInt32))
+}
+
+/// What the kernel mints for a PipeOutlet at `ProcessOp.PipeCreate`. The mirror
+/// of `pipe_inlet_rights`, with the verb changed and nothing else.
+public func pipe_outlet_rights() -> UInt32 {
+    ((PipeOutletRight.Transfer as UInt32) | (PipeOutletRight.Mint as UInt32)
+     | (PipeOutletRight.Take as UInt32) | (PipeOutletRight.Wait as UInt32))
+}
+
+/// What the kernel mints for a PipeReply at `PipeInletOp.Post` — the CLAIM the
+/// poster is handed (spec §2.1; sawos design 14 D-1).
+///
+/// **THE POSTER GETS EVERY BIT OF ITS OWN CLAIM BUT ONE**, on
+/// `pipe_inlet_rights`' reasoning as far as it goes, and `Transfer` carries the
+/// same weight it does there: §2.1 RATIFIES both one-shots as transferable, so a
+/// claim that could not travel would be a promise the spec makes and the kernel
+/// withholds.
+///
+/// **THE ONE IS `Mint`, AND A ONE-SHOT HAS ONE NAME** (`designs/010` ruling
+/// 12(c); sawos design 22). Handing a narrower claim ON is `give`'s KEEP MASK,
+/// which needs no sibling — that is what `tests/give-keep-mask` proves — and the
+/// sibling a mint would produce could never be anything but a second claim on an
+/// exchange only one act may spend. The bit is declared in `PipeReplyRight` and
+/// simply not handed out here; attenuation is monotonic, so no sequence of ops
+/// puts it back.
+public func pipe_reply_rights() -> UInt32 {
+    ((PipeReplyRight.Transfer as UInt32)
+     | (PipeReplyRight.Resolve as UInt32) | (PipeReplyRight.Wait as UInt32))
+}
+
+/// What the kernel mints for a PipeRequest at `PipeOutletOp.Take` — the
+/// OBLIGATION the taker is handed. The mirror of `pipe_reply_rights`, with the
+/// verb changed — `Mint` withheld here for the same one-name reason, and
+/// delegation untouched because delegation is `Transfer` MOVING the one name
+/// rather than a second one being made (`tests/pipe-delegate-msg`).
+///
+/// **`Transfer` HERE IS §2.1's DELEGATION PRIMITIVE ITSELF**, not a convenience:
+/// the ratified zero-copy example is a filesystem forwarding this very handle to
+/// a flash driver, which replies with the hardware bytes straight to the original
+/// client. Withholding the bit would delete the example.
+public func pipe_request_rights() -> UInt32 {
+    ((PipeRequestRight.Transfer as UInt32)
+     | (PipeRequestRight.Reply as UInt32) | (PipeRequestRight.Wait as UInt32))
+}
+
+/// What the kernel mints for a Memory region — a boot RAM-pool root, and every
+/// region a `Split` derives from one (spec §2.5).
+///
+/// **ONE SET, TWO MINTERS, on `process_rights()`'s precedent** (sawos design 6
+/// D-2). A boot root and a split child carry the same four bits, because a
+/// split is a DERIVATION and §3 makes derivation monotonic: a caller that wants
+/// a narrower child mints an attenuated sibling of it (`MINT_OP`) and hands
+/// THAT on. Two default sets here would be a second place to forget a bit, and
+/// would silently make "the second cut of a pool" less capable than the first.
+///
+/// The unit-2 docstring's promise is kept exactly: the kind-specific bits
+/// are named for the ops they gate (`Split`, `Map`, `MapExecute`), per the
+/// Aug-29 doctrine, rather than a generic authority.
+///
+/// **`MapExecute` IS IN THE SET, AND IT HAS TO BE** (sawos design 9 D-1). A boot
+/// pool root and every region a `Split` derives from one carry the authority to
+/// map executable, because §3's attenuation is MONOTONIC: a bit not minted at
+/// boot could never appear later by any sequence of ops, so a default set that
+/// withheld it would make an executable mapping unreachable in the whole system
+/// rather than merely restricted. The narrowing is the HOLDER's, done with
+/// `MINT_OP` and a keep mask that omits the bit — which is exactly the shape the
+/// one-set-two-minters doctrine above already asks for, applied to a fourth bit.
+///
+/// So the default is PERMISSIVE and the policy is written where the capability
+/// is handed over, not here. That is the same trade `Transfer` makes two lines
+/// up: root holds everything, and what a child holds is what root chose to mint.
+public func memory_rights() -> UInt32 {
+    ((MemoryRight.Transfer as UInt32) | (MemoryRight.Mint as UInt32)
+     | (MemoryRight.Split as UInt32) | (MemoryRight.Map as UInt32)
+     | (MemoryRight.MapExecute as UInt32))
+}
+
+/// What the kernel mints for an IoMemory window — a boot DEVICE-pool root, and
+/// every window a `Carve` derives from one (spec §2.5; sawos design 6 D-1).
+///
+/// The same one-set-two-minters shape `memory_rights` has, and for the same
+/// reason. `Transfer` is what makes unit 6's flow possible — root hands a
+/// driver child its window — and it is minted at boot because attenuation only
+/// ever narrows. **THAT FLOW RUNS NOW** (sawos design 9 D-2), which is this
+/// set's bit being spent for the first time rather than merely reserved.
+///
+/// It gains NO `MapExecute` (`MemoryRight`'s design-9 addition): a device
+/// window has no access argument to gate, so the authority would name an ask
+/// nobody can make.
+public func iomemory_rights() -> UInt32 {
+    ((IoMemoryRight.Transfer as UInt32) | (IoMemoryRight.Mint as UInt32)
+     | (IoMemoryRight.Carve as UInt32) | (IoMemoryRight.Map as UInt32))
+}
+
+/// What the kernel mints for a Mapping a process has just installed (spec
+/// §2.5; sawos design 6 D-3).
+///
+/// **`Transfer` IS ABSENT BY SILENCE**, which is the one thing this set says
+/// that the others do not: a Mapping names a row in one particular process's
+/// domain, so it is not a capability that travels. `MappingRight` records the
+/// argument. `Mint` is granted on the uniform lean the section above states —
+/// a second NAME for a mapping costs nothing and can itself be attenuated,
+/// which is how a holder hands out an un-unmappable reference to one.
+public func mapping_rights() -> UInt32 {
+    ((MappingRight.Unmap as UInt32) | (MappingRight.Mint as UInt32))
+}
+
+/// What the kernel mints for a thread's own handle — root's initial thread at
+/// boot, and every thread `Process.ThreadCreate` makes.
+///
+/// `Mint` is granted on the uniform lean the default-sets section records; the
+/// three kind-specific bits are the whole of the object's surface, which is deliberate — a thread's creator holds a handle
+/// and the thread can mint its own through `ThreadSelf`, and both carry this
+/// same set, so there is no attenuated split between the two to express.
+/// (`ThreadSelf` MINTS since sawos design 3 D-4, which is what makes "both hold
+/// a handle" two independently-owned instances rather than one word read twice.
+/// Which bits a derived handle should withhold from a creator's is unit 3's
+/// question, noted and not answered.)
+public func thread_rights() -> UInt32 {
+    ((ThreadRight.Start as UInt32) | (ThreadRight.Join as UInt32)
+     | (ThreadRight.Control as UInt32) | (ThreadRight.Mint as UInt32))
+}
+
+/// What the kernel mints for an Event a process has just created (§2.4).
+///
+/// The creator gets every end of its own notification — it made the object, so
+/// there is nobody to attenuate against yet. Attenuation happens when a handle
+/// is DERIVED for somebody else, and §3 makes that monotonic, so a producer
+/// handed `Signal` alone can never widen back to this.
+public func event_rights() -> UInt32 {
+    ((EventRight.Signal as UInt32) | (EventRight.Receive as UInt32)
+     | (EventRight.Wait as UInt32) | (EventRight.Mint as UInt32))
+}
+
+/// What the kernel mints for a Waiter a process has just created (§2.2).
+public func waiter_rights() -> UInt32 {
+    ((WaiterRight.Attach as UInt32) | (WaiterRight.Wait as UInt32)
+     | (WaiterRight.Mint as UInt32))
+}
+
+/// What the kernel mints for an Interrupt a process has just bound (§9).
+///
+/// Both ends of the cycle, for the reason `event_rights` gives: the creator
+/// made the object and there is nobody to attenuate against yet. A monitor
+/// handle carrying `Wait` alone is a DERIVATION, and §3 makes derivation
+/// monotonic, so it can never widen back to this.
+public func interrupt_rights() -> UInt32 {
+    ((InterruptRight.Wait as UInt32) | (InterruptRight.Ack as UInt32)
+     | (InterruptRight.Mint as UInt32))
+}
+
+/// What the kernel mints for a Clock a process has just been granted (§2 table).
+///
+/// Both ends, for the reason `event_rights` gives: the grant is the whole
+/// capability and there is nobody to attenuate against yet. A child handed a
+/// read-only clock is a DERIVATION, and §3 makes derivation monotonic, so it
+/// can never widen back to this.
+public func clock_rights() -> UInt32 {
+    ((ClockRight.Read as UInt32) | (ClockRight.TimerCreate as UInt32)
+     | (ClockRight.Mint as UInt32))
+}
+
+/// What the kernel mints for a Timer a process has just created (§2 table).
+public func timer_rights() -> UInt32 {
+    ((TimerRight.Arm as UInt32) | (TimerRight.Wait as UInt32)
+     | (TimerRight.Mint as UInt32))
+}

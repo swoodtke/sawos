@@ -1,0 +1,163 @@
+//! THE BOOT HANDOFF (spec §12) — the boot-handle record and the boot handle set.
+//!
+//! The three-word record a `Give` writes and a `BootHandleNext` hands back, the
+//! kinds it can name, and the two constants the kernel's own handoff is
+//! written in.
+//!
+//! Reached through the `sosabi` facade — see `lib.saw`.
+
+// =============================================================================
+// The boot-handle record (spec §12; sawos design 2 D-3, settling sawlang#232
+// agenda item 5)
+// =============================================================================
+//
+// `Process.BootHandleNext` answers with a RECORD the kernel copies out, on the
+// `Waiter.Wait` precedent exactly and through the same funnel. Three machine
+// words: which region this is, what kind of object was minted for it, and the
+// handle.
+//
+// IT IS MACHINE WORDS, NOT DOUBLEWORDS, and the rule is the wait record's: a
+// tag, a kind and a handle are all machine-word-shaped things, so the layout
+// follows the register. Only a TIME is a fixed 64 bits on every profile.
+//
+// THE RECORD IS CONSUMED BY DELIVERY, AND THERE ARE TWO DELIVERIES. The drain
+// hands back the next undelivered record and advances; there is no rewind, no
+// peek and no count op. A drained iterator answers `SosStatus.Drained` forever —
+// a loop's termination check, never a fault, because exhaustion is exactly what
+// a caller could not have known in advance and is the ordinary way the loop
+// ends. **THE OTHER DELIVERY IS `start(boot_tag:)`'s RESOLUTION** (the Aug-29
+// user ruling): putting a record's word in the child's first argument REGISTER
+// is a delivery like any other, so that record is spent and the drain skips it.
+// One record, one delivery, whichever door it went out of — which is what makes
+// "a child can never be handed one word twice" a property of the kernel rather
+// than an obligation on the child.
+//
+// **THE SET IS PER-PROCESS SINCE M3 UNIT 3** (sawos design 4 D-2), and there are
+// now two ways one gets filled: the KERNEL writes root's at boot, one record per
+// row of the build-emitted region table, and a LAUNCHER writes a child's with
+// `ProcessOp.Give`, one record per capability it hands across. Nothing about the
+// record or the op distinguishes them — the kernel is the giver nobody gave to.
+// The set FREEZES at `Start` (a give afterwards is a `BadState` fault), which is
+// what makes a half-populated table unrepresentable at the child's first
+// instruction with no synchronization invented; the DRAIN has no deadline at
+// all, so a child that drains late drains correctly.
+
+/// Words in a boot-handle record: tag, kind, handle.
+public static BOOT_HANDLE_RECORD_WORDS: Int = 3
+
+/// Where each lives. Named rather than written, on both sides of the boundary.
+public static BOOT_HANDLE_TAG_WORD: Int = 0
+public static BOOT_HANDLE_KIND_WORD: Int = 1
+public static BOOT_HANDLE_HANDLE_WORD: Int = 2
+
+/// Bytes in a boot-handle record — the minimum capacity a caller must give the
+/// op, and what the kernel checks the buffer against.
+///
+/// A FUNCTION AND NOT A `static` for the reason `wait_record_bytes` gives:
+/// `sizeof<T>()` does not fold in a static initializer (DF-178f).
+public func boot_handle_record_bytes() -> Int {
+    BOOT_HANDLE_RECORD_WORDS * sizeof<UInt>()
+}
+
+/// What kind of object a boot-handle record names — the record's KIND WORD.
+///
+/// PUBLIC API rather than kernel bookkeeping, on the module docstring's line:
+/// the kernel WRITES this value and userspace READS it, so one declaration has
+/// to serve both. It is deliberately NOT `ObjType`, which is kernel-internal
+/// and renumberable — a boot handle's kind crosses the trap boundary, so it is
+/// its own closed set with its own stated numbers.
+///
+/// M3 unit 2 declared one kind, because the boot set was exactly the region
+/// table's rows. **UNIT 3 DECLARES THE SECOND** (sawos design 4 D-3): a give may
+/// carry a PROCESS handle, and the one that matters is the child's own — the
+/// drain lives on the Process object, so a child that is to drain must be handed
+/// the handle `process_create` minted. The raw backing is what lets a kind be
+/// ADDED without renumbering (design 145's wire idiom), which is exactly what
+/// happened here and happened AGAIN at unit 4's `IoMemory` below; unit 5.5's
+/// death channels are the next to want it.
+///
+/// **THE SET IS EXACTLY THE GIVABLE KINDS, and it is smaller than `ObjType` on
+/// purpose.** A kind reaches this enum when something can actually deliver one:
+/// v1 mints the universal `Transfer` bit in `memory_rights()`, in
+/// `child_process_rights()` (D-3) and — since the Aug-29 rulings — in
+/// `root_system_rights()`, and NOWHERE ELSE. So a Thread, Event, Waiter,
+/// Interrupt, Clock or Timer handle cannot be given at all and a case for one
+/// would be dead surface — the same rule `ClockType` follows in declaring one
+/// domain. The kernel's `boot_kind_of` is the one place the two enums meet, and
+/// it refuses what it cannot spell rather than inventing a number.
+///
+/// `System` is the one a launch actually uses: it is what a child receives in
+/// its first argument register, a masked sibling of root's own, which is what
+/// makes every process bootstrap the same way (§12).
+///
+/// Backed by `UInt`, the width of the word it travels in, for the reason
+/// `WaitTag` gives: userspace decodes it through `from(raw:)`, which is total.
+/// **THE TAG BESIDE IT IS THE GIVER'S OWN WORD, HANDED BACK UNREAD.** For root's
+/// boot set the kernel is the giver and the tags are region ordinals (row `n` is
+/// tag `n`, sawos design 2 D-3); for a child's set the LAUNCHER is the giver and
+/// the tag is whatever it chose. The kernel knows nothing about either — which
+/// ordinal is an image blob, which is destination RAM, which capability a child
+/// expects under 7 — because THE TAG IS THE IDENTITY and identities are the only
+/// cross-process vocabulary there is (design 4's ruled surface). Keeping the
+/// meaning in root's config is what makes the kernel's half of the launch flow
+/// the same code for a hand-built M3 system and for M4's dynamic loading.
+/// **UNIT 4 DECLARES THE FOURTH** (sawos design 6 D-1/D-5), which is the
+/// raw backing doing exactly what the paragraph above predicted: the region
+/// table now carries a KIND column, a Device row mints an `IoMemory`, and root
+/// receives it through the same drain as everything else. It is `Transfer`-able
+/// (`iomemory_rights()`) because handing a driver child its window is unit 6's
+/// whole flow. **THAT FLOW IS BUILT** (sawos design 9 D-2): root drains the
+/// console's window at boot and GIVES it to a child that maps it into itself and
+/// echoes the harness's bytes, on both profiles — so this case is now exercised
+/// end to end rather than merely declared.
+///
+/// There is deliberately NO `Mapping` case. A Mapping is not givable —
+/// `mapping_rights()` withholds `Transfer` on purpose (see `MappingRight`) — so
+/// a case for one would be dead surface on the rule this set already follows.
+public enum BootHandleKind: UInt {
+    case Memory = 0,
+    case Process = 1,
+    case System = 2,
+    case IoMemory = 3,
+    /// **M4 UNIT 1's PAIR, AND THE RAW BACKING DOING WHAT IT KEEPS DOING**
+    /// (sawos design 13 D-3): two more givable kinds took the next two numbers
+    /// and moved none of the four above them. `pipe_inlet_rights()` and
+    /// `pipe_outlet_rights()` mint `Transfer` because handing a child ONE END of
+    /// a connection is the whole point of the pair — a launcher creates it and
+    /// wires the two ends outward, which is what makes `pipe-child` the seed of
+    /// unit 5's driver-as-service.
+    case PipeInlet = 4,
+    case PipeOutlet = 5,
+    /// **M4 UNIT 2's ONE-SHOTS, AND THIS PAIR IS THE ONE §2.1 ARGUED FOR BY
+    /// NAME** (sawos design 14). `pipe_reply_rights()` and
+    /// `pipe_request_rights()` mint `Transfer` because the ratified section says
+    /// both one-shots are transferable and calls it THE DELEGATION PRIMITIVE: a
+    /// server MOVES its obligation to a third party, who replies straight to the
+    /// original client, and the payload never transits the middle process. So a
+    /// give must be able to carry one, and a give's record must be able to spell
+    /// it.
+    case PipeReply = 6,
+    case PipeRequest = 7,
+}
+
+// THE DECODED RECORD IS NOT DECLARED HERE, and the asymmetry with `WaitResult`
+// is worth one note. A wait answer is made of plain words — a key, a tag, a
+// count — so one declaration serves the kernel that writes it and the process
+// that reads it. A boot-handle answer carries a HANDLE, and the whole point of
+// the `sos` module's typed layer is that a handle a process holds is a `Memory`
+// or a `Process` and never a word. So the decoded form is `sos`'s
+// `BootHandle`, which this file could not name; what crosses is the three-word
+// layout above, and that is declared once, here.
+
+// =============================================================================
+// The boot handle set (spec §12)
+// =============================================================================
+
+/// The handle the kernel gives root for the System object. Root receives it in
+/// the first argument register at entry rather than assuming it, so this
+/// constant is the KERNEL's choice of what to mint — not a number userspace is
+/// expected to know.
+public static ROOT_SYSTEM_HANDLE: UInt = 1
+
+/// The `stack_top` handed to a user entry that was granted no stack region.
+public static NO_USER_STACK: UInt = 0

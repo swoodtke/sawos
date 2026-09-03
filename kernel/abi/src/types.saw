@@ -1,0 +1,368 @@
+//! THE OBJECT KINDS AND THE HANDLE WORD (spec §2's table, §3).
+//!
+//! What a handle-table entry names, the per-kind handle aliases over it, the
+//! word that names nothing, and the one knob the word's index/generation split
+//! is derived from. It is the bottom of the module order: it names no right, no
+//! op and no record, and everything else here is written about the objects it
+//! names.
+//!
+//! Reached through the `sosabi` facade — see `lib.saw`.
+
+// =============================================================================
+// Object types
+// =============================================================================
+
+/// What a handle-table entry names.
+///
+/// `Unbound` is the reserved zero: handle 0 names nothing, so a zeroed register
+/// can never be mistaken for authority, and a table slot that was never filled
+/// reads as "no object" rather than as object type 0.
+///
+/// A `UInt8` backing because this is a kernel-internal field in `HandleEntry`,
+/// never a number that crosses the trap boundary.
+public enum ObjType: UInt8 {
+    case Unbound = 0,
+    case System = 1,
+    case Process = 2,
+    case Thread = 3,
+    case Event = 4,
+    case Waiter = 5,
+    case Interrupt = 6,
+    case Clock = 7,
+    case Timer = 8,
+    /// RAM AUTHORITY — a range of physical memory, derived by `Split` and
+    /// installed by `Map` (spec §2.5; sawos design 2 D-2, grown by design 6).
+    ///
+    /// **UNIT 2 BUILT THE FIRST SLICE AND UNIT 4 BUILT THE REST, WITHOUT
+    /// MOVING THIS ROW** — which is what the slice was shaped to make true.
+    /// M3 unit 2's Memory was `{base, len}` and NOTHING ELSE: no pools, no
+    /// derivation, no `map()`, no attributes and NO OP TABLE, minted only at
+    /// boot from the build-emitted region table and NAMED as the two arguments
+    /// of `process_create`. Design 6 gave it two ops, two rights and a slab a
+    /// process spends THROUGH, and the number, the handle type and every
+    /// existing caller stayed exactly as they were.
+    ///
+    /// §2.5 was never contradicted, only STARTED: unit 2's boot regions are
+    /// that section's "pool roots given to the root server at boot", and unit
+    /// 4 added the pools, the derivation and the mapping on top. What it did
+    /// NOT add is a bounds reader — a region is still a CAPABILITY rather than
+    /// a description, which is the one property of the slice that was load
+    /// -bearing rather than provisional.
+    case Memory = 9,
+    /// DEVICE AUTHORITY — a range of memory-mapped registers (spec §2.5;
+    /// sawos design 6 D-1).
+    ///
+    /// **A DISTINCT KIND, NOT A FLAG ON `Memory`**, and the reason is that
+    /// every question about it answers differently. §2.5's pool ATTRIBUTE is
+    /// design 46's intent marker, and making it a KIND is what turns "a Device
+    /// MemoryObject can only produce Device mappings" from a rule somebody
+    /// checks into a fact of the type system: an IoMemory's `Map` installs a
+    /// device-attribute row and there is no other op on it that could install
+    /// anything else, so a driver cannot get a cacheable view of a register
+    /// block BY CONSTRUCTION.
+    ///
+    /// The lifecycle differs everywhere too, which is the other half: it is
+    /// PINNED (never freed — MMIO is not memory that can be reclaimed), it is
+    /// carved NON-EXCLUSIVELY (§2.5: "a fixed region may be handed out many
+    /// times", so several drivers may hold windows onto one peripheral), and
+    /// it has no contents — an image never carries bytes for it.
+    ///
+    /// ONE DISPATCH ARM IS THE ENTIRE COST, and what it retires is every
+    /// flag-check the M2 device-grant placeholder scattered (`check_device_grant`
+    /// in `kcore.loader`, `SegFlag.Device` in `imgformat`).
+    case IoMemory = 10,
+    /// ONE INSTALLED PROTECTION ROW, with its own handle (spec §2.5; sawos
+    /// design 6 D-1).
+    ///
+    /// **A MAPPING IS AN INSTALLED GRANT ROW.** That is the whole of it on a
+    /// no-translation machine (spec §5.5: an address is the same number in
+    /// every process), so this object records WHICH process's domain carries
+    /// the row and WHICH row it is — not a virtual placement, because there is
+    /// no virtual to place at.
+    ///
+    /// **ONLY A MAPPING UNMAPS** (§2.5), which is what the object is for.
+    /// Releasing a Mapping HANDLE frees the table entry and never the row —
+    /// the entries-never-touch-objects rule (design 3 D-2), which is what
+    /// makes §2.5's "dropped without unmap = permanent, safe-but-leaked" fall
+    /// out of existing doctrine rather than being new law.
+    case Mapping = 11,
+    /// THE CLIENT END OF A CONNECTION — requests flow IN here (spec §2.1;
+    /// sawos design 10 D-1 / ruling 2, built by design 13).
+    ///
+    /// **TWO KINDS, ONE SLAB, AND THAT IS THE WHOLE OF D-1's "ROLES ARE
+    /// OBJECTS".** A Pipe carries traffic both ways, so "how many handles can
+    /// still send" cannot be asked of one symmetric object — a parked receiver
+    /// is itself a holder, which is the socket-`shutdown()` hole — and a
+    /// rights-partitioned count on one object would be a SECOND LEDGER against
+    /// design 7's one-ledger doctrine. So the bidirectionality DISSOLVES: the
+    /// connection is a pair of counted ENDPOINT kinds, and "the writers went to
+    /// zero" is "the client end reached zero references", which is the existing
+    /// ledger with no new vocabulary.
+    ///
+    /// Both kinds TARGET THE SAME `PIPES` slot, and which of the connection's
+    /// two reference columns a handle counts on is decided by its KIND — which
+    /// §3's order establishes before anything else is asked. `kcore.refs` is
+    /// where that becomes mechanical.
+    ///
+    /// **A SIDE REACHING ZERO RAISES PEER-GONE ON THE OTHER**, and the
+    /// connection frees only when BOTH columns are zero. In unit 1 nothing
+    /// parks, so peer-gone is visible as `SosStatus.PeerClosed` answers alone;
+    /// unit 3 gives it a waitable level.
+    case PipeInlet = 12,
+    /// THE SERVER END OF A CONNECTION — requests come OUT here (spec §2.1;
+    /// sawos design 10 D-1 / ruling 2, built by design 13).
+    ///
+    /// The mirror of `PipeInlet` in every respect except which column it counts
+    /// on and which op it carries: an inlet posts, an outlet takes. Rights stay
+    /// named for ops (the Aug-29 doctrine), so the ROLE is structural rather
+    /// than a rights mask somebody counts by — which is exactly what let D-1
+    /// answer the writer-count question with the ledger it already had.
+    case PipeOutlet = 13,
+    /// THE CLIENT'S CLAIM ON ONE REPLY — single-use, transferable (spec §2.1's
+    /// ratified `PipeReplyHandle`; sawos design 14 D-1).
+    ///
+    /// **IT IS RING-SLOT STATE, NOT A THIRD SLAB.** A one-shot pair exists for
+    /// exactly as long as one in-flight message does, and design 10 ruling 4's
+    /// rider already pins the reply body to the staging slot that carried the
+    /// request — so the claim lives WITH THE SLOT. `entry.target` for this kind
+    /// is an EXCHANGE index (`connection * PIPE_INFLIGHT + ring slot`), which is
+    /// the same flat arithmetic the bodies and lengths already use, one level
+    /// down from `PipeInlet`'s "two kinds, one slab".
+    ///
+    /// **TWO COLUMNS AGAIN, AND THEY ARE THE ABANDONMENT STATE** (D-2, design
+    /// 13's own property one level down): `PIPE_REPLY_REFS` counts the claims and
+    /// `PIPE_REQUEST_REFS` counts the obligations, each column only ever falls,
+    /// and which one a handle counts on is its KIND. The client dropping its
+    /// claim IS abandoned-by-client; the server dropping its request without
+    /// replying IS abandoned-by-server. No flag beside them says so.
+    ///
+    /// SINGLE-USE IS A PROPERTY OF THE EXCHANGE, NOT OF THE HANDLE: `Resolve`
+    /// consumes the caller's ENTRY, and the exchange's state is what makes a
+    /// second resolve impossible — one reply may be written and one resolve may
+    /// succeed however many siblings a `Mint` produced.
+    case PipeReply = 14,
+    /// THE SERVER'S OBLIGATION TO SEND ONE REPLY — single-use, transferable
+    /// (spec §2.1's ratified `PipeRequestHandle`; sawos design 14 D-1).
+    ///
+    /// The mirror of `PipeReply` in every respect except which column it counts
+    /// on and which op it carries: a claim resolves, an obligation replies. It is
+    /// minted at `PipeOutletOp.Take` into the TAKER's table, which is what makes
+    /// it the delegation primitive — §2.1's canonical zero-copy example is a
+    /// server GIVING this handle to a third party who replies straight to the
+    /// original client, and `Transfer` is minted for exactly that.
+    case PipeRequest = 15,
+}
+
+// WHICH KINDS ARE WAITABLE is deliberately NOT recorded here (§2.2). It cannot
+// be a property of the kind alone: attaching a handle to a Waiter also spends a
+// RIGHT, and which enum's bits that right lives in is decided by the kind — so
+// the two questions are one question, answered in one exhaustive `match` in the
+// kernel's `waitable_slot`. A `Bool` here would be the same fact in a second
+// place, and the place that could go stale.
+
+// =============================================================================
+// Handles (spec §3)
+// =============================================================================
+
+/// A handle naming the kernel's System object.
+///
+/// Each object kind gets its OWN handle type (ratified Aug 7). Saw's distinct
+/// `type` alias gives exactly the asymmetry a handle wants for free: it flows
+/// TO `UInt` implicitly, so the syscall stub takes it with no cast and no
+/// conversion is emitted — but a raw word, or another kind's handle, cannot
+/// flow IN. Crossing into a handle type is an explicit construction, and there
+/// are only two places that do it: userspace adopting its boot handle, and the
+/// kernel's dispatch AFTER the table has resolved the handle to a System
+/// object. That is what makes the type mean "validated as System" rather than
+/// merely "a number".
+///
+/// The typing stops at the ABI boundary. The `@export`ed vDSO symbols and the
+/// `sos_syscallN` stubs keep raw `UInt` words, because a C caller sees words
+/// and the export whitelist is primitives; the handle TABLE indexes by word too.
+///
+/// This is TIER ONE of two — kind safety. TIER TWO, the OWNING tier, IS BUILT
+/// (sawos design 3, M3 unit 2.75): every `kernel/sysapi` wrapper is a `NoCopy`
+/// structs over these aliases whose `deinit` releases the word, so DROP IS
+/// RELEASE and §3's no-DUPLICATE rule has its exact `NoCopy` correspondence.
+/// The alias became the payload and nothing written against it changed, which
+/// is what the additive claim promised.
+///
+/// **WHAT A HANDLE WORD IS MADE OF (sawos design 3 D-1).** The word is
+/// `(generation << HANDLE_INDEX_BITS) | (index + 1)` on BOTH profiles — the low
+/// `HANDLE_INDEX_BITS` bits are a 1-based table index, the rest of the portable
+/// 32-bit budget is the slot's generation, and the top 32 bits of an arm64 word
+/// stay zero. Same split and same width everywhere means the wrap behaves
+/// identically on both machines: one story, one test. **THE SPLIT IS ONE NAMED
+/// CONSTANT** (`HANDLE_INDEX_BITS`, default 8, below) with every mask and shift
+/// derived from it, so moving it is a one-line edit.
+///
+///   - **THE INDEX IS 1-BASED, which is what keeps generation 0 free.** Slot 0
+///     is usable and `NO_HANDLE = 0` still names nothing, because "names
+///     nothing" is the INDEX FIELD being zero rather than the whole word being
+///     zero. A malformed word like `0x100` — generation 1 over a zero index, at
+///     the default split — is not equal to `NO_HANDLE` and must still name
+///     nothing; the kernel's `lookup_handle` tests the field for exactly that
+///     reason.
+///   - **GENERATION 0 STAMPS NOTHING.** A slot's first-life word EQUALS the
+///     bare index, so every contract written before generations existed
+///     survives verbatim: §12's boot order (1 = System, 2 = Process, 3 =
+///     Thread) that the hand-assembled payloads encode, and root's "boot
+///     handle 1". Only a REUSED slot's word grows high bits, and no reuse
+///     exists until a release happens.
+///   - **IT IS BEST-EFFORT DETECTION OF A BUG, not a uniqueness guarantee.** A
+///     word held across exactly `HANDLE_GENERATION_MODULUS` reuses of one slot
+///     aliases silently.
+///     Tables are per-process, so a wrap collision crosses no process boundary
+///     and grants nothing; nobody later "fixes" this into unbounded
+///     bookkeeping.
+public type SystemHandle = UInt
+
+/// A handle naming a Process object (§2 table). Same discipline as
+/// `SystemHandle`: it flows TO `UInt` at the syscall stub and nothing flows in.
+public type ProcessHandle = UInt
+
+/// A handle naming a Thread object (§2 table).
+public type ThreadHandle = UInt
+
+/// A handle naming an Event object (§2.4). Same discipline again.
+public type EventHandle = UInt
+
+/// A handle naming a Waiter object (§2.2).
+public type WaiterHandle = UInt
+
+/// A handle naming an Interrupt object (§2 table, §9) — an IRQ line bound to a
+/// waitable. Same discipline as every other handle type.
+public type InterruptHandle = UInt
+
+/// A handle naming a Clock object (§2 table; design 232 unit 1) — a granted
+/// time source. Same discipline as every other handle type.
+public type ClockHandle = UInt
+
+/// A handle naming a Timer object (§2 table; design 232 unit 1) — a deadline
+/// bound to the Clock that created it. Same discipline again.
+public type TimerHandle = UInt
+
+/// A handle naming a Memory object (spec §2.5; sawos design 2 D-2) — a sealed
+/// range of physical memory. Same discipline again.
+public type MemoryHandle = UInt
+
+/// A handle naming an IoMemory object (spec §2.5; sawos design 6 D-1) — a
+/// range of device registers. Same discipline again.
+public type IoMemoryHandle = UInt
+
+/// A handle naming a Mapping object (spec §2.5; sawos design 6 D-1) — one
+/// installed protection row. Same discipline again.
+public type MappingHandle = UInt
+
+/// A handle naming a PipeInlet (spec §2.1; sawos design 13) — the CLIENT end of
+/// a connection. Same discipline again.
+public type PipeInletHandle = UInt
+
+/// A handle naming a PipeOutlet (spec §2.1; sawos design 13) — the SERVER end
+/// of a connection. Same discipline again.
+///
+/// Two handle types for two kinds, exactly as the §2 table's other rows get
+/// one each: a word validated as an inlet cannot flow into a place that wants
+/// an outlet, which is the whole reason each kind gets its own alias rather
+/// than a shared `PipeHandle` with a role field.
+public type PipeOutletHandle = UInt
+
+/// A handle naming a PipeReply (spec §2.1; sawos design 14) — the CLIENT's claim
+/// on one reply. Same discipline again.
+///
+/// **THE TYPED WRAPPER OVER IT IS `sos.pipe`'s `PipeReply`**, which is where
+/// §2.1's ratified name lands: the tree renders a §2 object name at the typed
+/// tier the way it renders `MemoryObject` as `Memory`, so the spec's
+/// `PipeReplyHandle` is this alias and the owning wrapper is the short name.
+public type PipeReplyHandle = UInt
+
+/// A handle naming a PipeRequest (spec §2.1; sawos design 14) — the SERVER's
+/// obligation to send one reply. Same discipline again.
+public type PipeRequestHandle = UInt
+
+/// A handle word the table can never hand out. Handle 0 names nothing, so a
+/// zeroed register is never authority (see `ObjType.Unbound`).
+///
+/// Under design 3's split word this is the LOW BYTE's zero, at every
+/// generation: `0x100` is as unbindable as `0` is, because the index a word
+/// carries is 1-based and zero is not an index. The kernel's `lookup_handle`
+/// tests the byte rather than the word, and the wrappers' disarm sentinel is
+/// this value for the same reason — an armed wrapper's word always has a
+/// non-zero low byte.
+public static NO_HANDLE: UInt = 0
+
+// -----------------------------------------------------------------------------
+// THE HANDLE WORD'S ENCODING — one constant, everything else derived
+// (sawos design 3 D-1, as amended by the Aug-29 user note)
+// -----------------------------------------------------------------------------
+//
+// **THE SPLIT IS POLICY, STATED ONCE.** Where the index field ends and the
+// generation field begins is a design choice this system will want to revisit —
+// ~254 per-process handles is generous for a microkernel with sixteen and not
+// obviously enough for one that grows — so it is ONE named constant with every
+// mask, shift, bound and assert derived from it. Raising `HANDLE_INDEX_BITS` is
+// a one-line edit that moves all of them together; there are no hardcoded `0xFF`
+// masks and no bare `>> 8` shifts anywhere in the kernel or this module.
+//
+// It lives HERE, beside `NO_HANDLE`, because it defines what a handle word IS.
+// The kernel's table and the wrappers' sentinel are both consequences of this
+// encoding, and a consequence should not be where the rule is written.
+//
+// The budget being divided is 32 BITS on BOTH profiles — the portable width, so
+// the wrap behaves identically on either machine and there is one story to test.
+// A 64-bit word's top 32 bits stay zero, and `lookup_handle` enforces that
+// rather than assuming it (see `handle_word_generation`).
+
+/// The portable width a handle word is encoded in, on both profiles.
+public static HANDLE_WORD_BITS: Int = 32
+
+/// **THE ONE KNOB.** How many low bits of a handle word carry the table index;
+/// the rest carry the generation. Default 8.
+///
+/// It is a SHIFT COUNT everywhere it is used, which is the one operand position
+/// exempt from Saw's type-agreement rule, so it stays a plain `Int` and needs no
+/// conversion at any use site.
+public static HANDLE_INDEX_BITS: Int = 8
+
+/// What is left of the portable budget for the generation counter.
+public static HANDLE_GENERATION_BITS: Int = HANDLE_WORD_BITS - HANDLE_INDEX_BITS
+
+/// The mask that takes the index field out of a handle word.
+public static HANDLE_INDEX_MASK: UInt = (1 << HANDLE_INDEX_BITS) - 1
+
+/// The generation counter's modulus — it WRAPS here, identically on both
+/// profiles (D-1's "one story, one test").
+///
+/// It is also what makes the top-half-stays-zero rule ENFORCED rather than
+/// assumed: a stored generation is always below this, and a word resolves by
+/// comparing its whole generation FIELD against one, so a 64-bit word with
+/// anything set above the portable budget has a generation no entry can equal
+/// and names nothing. No separate range test is owed.
+public static HANDLE_GENERATION_MODULUS: UInt32 = 1 << HANDLE_GENERATION_BITS
+
+// THE KNOB'S OWN GUARD RAILS. Each field must exist, and the two must exactly
+// divide the portable budget — a split that lost a bit would silently make some
+// words unrepresentable, and one that overlapped would make a generation alias
+// an index. The bound tying `MAX_HANDLES` to the index field is in
+// `kcore.objects`, which is the module that knows both numbers.
+static_assert(HANDLE_INDEX_BITS >= 1,
+              "the index field must be at least one bit wide")
+static_assert(HANDLE_GENERATION_BITS >= 1,
+              "the generation field must be at least one bit wide")
+static_assert(HANDLE_INDEX_BITS + HANDLE_GENERATION_BITS == HANDLE_WORD_BITS,
+              "the index and generation fields must exactly divide the portable word")
+
+/// The `entry` argument to `Process.ThreadCreate` that means "start the thread
+/// at this process's own IMAGE ENTRY" — the entry the loader took out of the
+/// image header.
+///
+/// It exists because of a LANGUAGE GAP, and the gap is worth stating where the
+/// constant is: Saw cannot name the address of a function (design 172's reason
+/// 3, DF-172a — `extern` declares functions, an extern function is not usable
+/// as a value, and `@export` on a static emits a definition). So a process
+/// written in Saw has no way to compute an entry address for a thread it wants
+/// to create, and this is the one entry it can ask for by name. A process that
+/// CAN produce an address — one with a C leaf, which is what the harness's
+/// thread images use — passes it and the kernel checks it against the image's
+/// granted region. See DF-178c.
+public static ENTRY_IMAGE: UInt = 0

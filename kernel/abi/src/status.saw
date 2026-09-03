@@ -1,0 +1,309 @@
+//! THE ANSWERS (spec §5.7, §8) — the status word every syscall returns, the
+//! reason a process was terminated, and the §8 process status.
+//!
+//! `SosStatus` is the one thing in this module a process MUST agree with the
+//! kernel about beyond the calling convention, which is why it carries a
+//! `describe` and conforms to `Printable` and `Error` where the op numbers
+//! beside it carry nothing.
+//!
+//! Reached through the `sosabi` facade — see `lib.saw`.
+
+// =============================================================================
+// Status words (spec §5.7)
+// =============================================================================
+
+/// The status a syscall returns in the status register.
+///
+/// **A STATUS IS FOR WHAT THE CALLER COULD NOT HAVE KNOWN** (ratified Aug 8,
+/// carried into design 178's ruling Aug 15). A caller error the process could
+/// have checked — an invalid handle, an op the object does not have, a right it
+/// was not given, driving a thread that is not itself — TERMINATES the process
+/// and is not in this enum at all. It is a `FaultReason` below. What is left
+/// here is the class a correct process can still meet: resource exhaustion, and
+/// (when there are peers to die, which is M3) peer death.
+///
+/// That cut is why `BadHandle`, `BadOp` and `AccessDenied` are GONE from this
+/// enum rather than merely unused. They moved to `FaultReason` keeping their
+/// numbers, so the tags read the same in a kernel report and cannot be confused
+/// with a status a process might branch on. Values 1-3 are left as a gap here
+/// for exactly that reason: reusing them would make an old build's `BadHandle`
+/// and a new build's status collide on the wire.
+///
+/// These tags ARE part of the contract in a way the op numbers are not, because
+/// a process branches on them, so the backing is FIXED-WIDTH (design 47: a
+/// value that crosses an ABI pins its width) even though the register carrying
+/// it is wider.
+///
+/// A STATUS, NOT AN ERROR (ratified Aug 7): the type is named for what it is —
+/// an enum with an `Ok` case describes how a call went, and only some of those
+/// ways are failures. The `Sos` prefix says whose status it is, which is the
+/// other half of the rename: the hosted runtime has its own frozen `SysError`
+/// (errno tags, `sawc/rt/ABI.md`) and the two contracts are unrelated. They now
+/// read as unrelated too.
+///
+/// `Ok` is a case because this enum is the wire table and 0 is in it. It is the
+/// one value that is not a failure, and `sos`'s `checked` is the single place
+/// that turns it into `Ok(())` — which is why an `Err(SosStatus.Ok)` cannot be
+/// constructed anywhere downstream.
+///
+/// `Unknown` is NOT a status the kernel returns. It is where the userspace
+/// mapping's `from(raw:)` miss lands, so a tag this build does not define stays
+/// a typed error instead of being read as success. In M1 it is unreachable —
+/// both halves compile from this one declaration — and it exists for the build
+/// skew that static linking makes impossible today and a mapped vDSO will not.
+/// **THE TWO M3-UNIT-2 CASES, and each is here because of the same cut** (sawos
+/// design 2 D-3/D-4; the numbers continue past the 1-3 gap rather than filling
+/// it, for the reason above).
+///
+/// `BadImage` (5) is a malformed process image handed to `process_create`.
+/// sawlang#232 agenda item 2 leaned this way and design 2 ruled it: IMAGE BYTES
+/// ARE DATA, on the `from(raw:)` precedent — an unrecognized wire byte is data
+/// a reader rejects, never a trap — and a launcher that fetches images
+/// dynamically (M4) must be able to report a bad download rather than die of
+/// it. It is the one place the faults ruling's line falls on the STATUS side
+/// for something the caller supplied, and the reason it does is that the caller
+/// did not WRITE those bytes: it was handed a region and asked to launch it.
+///
+/// `Drained` (6) is the boot-handle iterator having nothing left to give. It is
+/// a status and not a fault for the plainest possible reason: a loop that
+/// drains an iterator ENDS by meeting it, so faulting would make the correct
+/// program the one that dies. It STAYS drained — every later call answers the
+/// same — so a caller may test it as often as it likes.
+///
+/// **`QuotaExceeded` (7) IS POLICY'S VOICE, AND `NoResource` IS THE MACHINE'S**
+/// (sawos design 7 D-3). They are two different answers to what used to be one
+/// refusal, and a caller can act on the difference: `NoResource` says the SLAB
+/// is full — a machine-wide edge, nothing this process can do about it —
+/// while `QuotaExceeded` says THIS PROCESS has spent its budget, which a
+/// release of something it already holds will fix. A launcher meeting the
+/// first has met the end of the machine; a program meeting the second has met
+/// the end of its allowance, and the two want different code.
+///
+/// IT IS A STATUS AND NOT A FAULT, which the sharpened faults line decides on
+/// its own terms: quota headroom is DYNAMIC resource vocabulary — how much of
+/// its budget a process has left changes as objects it does not own are freed
+/// and as its own peers release — so it is precisely the thing a caller could
+/// not have checked. That is the same carve-out `NoResource` sits in, which is
+/// why the two are neighbours here rather than one being a `FaultReason`.
+///
+/// **`Revoked` (8) IS THE PEER-GONE DOCTRINE'S ONE WORD** (sawos design 12, M4
+/// unit 0; `designs/010` rulings 1 and 2). It answers a call that was PARKED on
+/// something which can no longer happen: today the one site is a `Waiter.Wait`
+/// whose Waiter reached zero references while the caller was on its blocked
+/// list, and the doctrine it lands is that nothing parked is ever silently
+/// doomed — every "what you are waiting for is gone" is a DELIVERED WAKE
+/// carrying a distinguishable status, never a strand for the deadlock report to
+/// name later.
+///
+/// IT IS A STATUS AND NOT A FAULT, and the cut is the faults ruling's own. The
+/// mistake belongs to whoever released the handle, and this word is delivered to
+/// somebody ELSE — a sibling thread that made no error and cannot be terminated
+/// for one it did not make. A parked caller is also in the one position from
+/// which nothing could have been checked in advance: the answer changed after
+/// the call was made.
+///
+/// **IT IS ONE WORD FOR EVERY REVOCATION SITE, deliberately** (ruling 1's own
+/// text), which is why it is not named for the Waiter. M4's later rungs reach
+/// the same doctrine with their own vocabulary — a pipe's peer closing is
+/// `PeerClosed`, because "the far end went away" is information a protocol acts
+/// on — and what belongs here is the case where the OBJECT BEING WAITED ON
+/// stopped existing under the waiter. A caller distinguishes the two, which is
+/// the whole reason neither is folded into the other.
+/// **`PeerClosed` (9) IS THE PEER-GONE DOCTRINE'S OTHER WORD** (sawos design 13,
+/// M4 unit 1; `designs/010` D-1 and ruling 2). It is §2.1's own term, and it
+/// answers a call whose FAR END no longer exists: a `Post` through an inlet
+/// whose outlet column reached zero (nobody can ever take it), and a `Take`
+/// through an outlet whose inlet column reached zero AND whose ring has been
+/// drained (no sender can ever appear, since attenuation is monotonic and the
+/// count is zero).
+///
+/// **IT IS NOT `Revoked`, AND THE TWO MUST NOT FOLD INTO EACH OTHER.** `Revoked`
+/// is for the OBJECT BEING WAITED ON ceasing to exist under a parked caller —
+/// nothing to act on, only to report. `PeerClosed` is INFORMATION A PROTOCOL
+/// ACTS ON: the connection is still there and still yours, and what changed is
+/// that the other role is unoccupied. A client meeting it stops sending; a
+/// server meeting it closes the session. `Revoked`'s own docstring names this
+/// split from the other side.
+///
+/// **IT IS TERMINAL.** Nothing un-closes — the ends' reference columns only ever
+/// fall to zero and a zero column can never rise (a handle onto an end is what
+/// would raise it, and there is none) — so a caller may test it as often as it
+/// likes and will be told the same. That is design 8's terminal-level shape
+/// arriving in a second vocabulary.
+///
+/// **`WouldBlock` (10) IS ONE TRANSIENT FOR BOTH DIRECTIONS**: a `Post` whose
+/// ring is full, and a `Take` whose ring is empty. It says CALL AGAIN — the
+/// answer will change when the peer acts — which is the exact opposite of the
+/// case above and is why the two could not share a word.
+///
+/// ONE CASE AND NOT TWO, deliberately, and the reason is design 234's
+/// narrowest-type doctrine read the way that doctrine actually runs: a status is
+/// narrow when it names ONE CONDITION, and post-full and take-empty are the same
+/// condition — the ring is not in a state to serve this call yet. Which
+/// direction it was is already in the op the caller made, so a `PostWouldBlock`
+/// beside a `TakeWouldBlock` would encode the receiver twice and force every
+/// poll loop to match two tags that mean one thing. `describe()` is worded for
+/// the CONDITION rather than for either op, which is the same rule stated in the
+/// text a human reads.
+///
+/// IT IS A STATUS AND NOT A FAULT, and the cut is the faults ruling's own: how
+/// full a shared ring is changes as the PEER acts, so it is precisely the thing
+/// a caller could not have checked in advance. It is `NoResource`'s neighbour in
+/// spirit — a resource edge — and differs in being the peer's to clear rather
+/// than the machine's.
+public enum SosStatus: UInt8 {
+    case Ok = 0,
+    case NoResource = 4,
+    case BadImage = 5,
+    case Drained = 6,
+    case QuotaExceeded = 7,
+    case Revoked = 8,
+    case PeerClosed = 9,
+    case WouldBlock = 10,
+    case Unknown = 255,
+}
+
+extension SosStatus {
+    /// A short human-readable tag, for a diagnostic or a log line.
+    public func describe(&self) -> String {
+        match self {
+            case Ok -> "ok",
+            case NoResource -> "out of kernel objects",
+            case BadImage -> "not a loadable process image",
+            case Drained -> "no more boot handles",
+            case QuotaExceeded -> "this process is at its quota",
+            case Revoked -> "what this call was waiting for is gone",
+            case PeerClosed -> "the other end of this connection is gone",
+            // WORDED FOR THE CONDITION, NOT FOR THE OP (the case's own
+            // docstring): one sentence has to be true of a full ring and of an
+            // empty one, because one tag answers both.
+            case WouldBlock -> "not right now — try again",
+            case Unknown -> "unknown status",
+        }
+    }
+
+    /// Whether this status reports a failure. The inverse of `Ok`, named so a
+    /// caller reads intent rather than a comparison.
+    public func is_failure(&self) -> Bool {
+        match self {
+            case Ok -> false,
+            case _ -> true,
+        }
+    }
+}
+
+extension SosStatus: Printable {
+    public func format(&self, into: &var StringBuilder) {
+        // design 234 §5's rendering boundary: `format` has no error channel,
+        // and on SOS the builder is fixed storage anyway, which refuses nothing.
+        try! into.append(self.describe())
+    }
+}
+
+extension SosStatus: Error {}
+
+// =============================================================================
+// Fault reasons (design 178's faults ruling, ratified Aug 15)
+// =============================================================================
+
+/// Why the kernel TERMINATED a process.
+///
+/// The other half of the cut `SosStatus` describes: these are the caller errors
+/// a process could have checked, and meeting one ends the process rather than
+/// returning it a word to branch on. It is the same line the language draws at
+/// an indexed accessor — an out-of-range index panics, it does not hand back a
+/// flag — and it cuts userspace error handling down to the failures that are
+/// real.
+///
+/// A process never RECEIVES one of these: it is dead by the time the tag
+/// exists. It reaches a human through the kernel's report, and the harness
+/// asserts on that line. The first three keep the numbers they had as statuses
+/// so a reader of an old transcript and a new one sees the same tag for the
+/// same mistake.
+///
+/// `UInt8` because it is a kernel-internal tag that crosses no register.
+public enum FaultReason: UInt8 {
+    case BadHandle = 1,
+    case BadOp = 2,
+    case AccessDenied = 3,
+    case NotSelf = 4,
+    case BadState = 5,
+    case BadEntry = 6,
+    case Deadlock = 7,
+    case NotWaitable = 8,
+    case BadArg = 9,
+    case BadAlign = 10,
+    case BadBuffer = 11,
+    case DuplicateKey = 12,
+    case LineBound = 13,
+}
+
+extension FaultReason {
+    /// The short tag the kernel's termination line carries.
+    public func describe(&self) -> String {
+        match self {
+            case BadHandle -> "bad handle",
+            case BadOp -> "bad op",
+            case AccessDenied -> "access denied",
+            case NotSelf -> "not the calling thread",
+            // Not "thread in the wrong state" any more: the tag has covered
+            // every object kind since Events and Waiters landed, and it covers
+            // an Interrupt acked before it fired now.
+            case BadState -> "object in the wrong state",
+            case BadEntry -> "thread entry outside the process",
+            case Deadlock -> "every thread blocked",
+            case NotWaitable -> "not a waitable",
+            case BadArg -> "argument outside its domain",
+            case BadAlign -> "buffer is not word-aligned",
+            // Direction-neutral since design 232 unit 1 opened the copy-IN
+            // door beside the copy-out one. The two check DIFFERENT windows —
+            // outbound must land in the process's writable memory, inbound
+            // merely inside the memory it was granted — so a wording naming
+            // one of them was accurate for exactly as long as there was one.
+            case BadBuffer -> "buffer is outside the process's memory",
+            // TWO CONSUMERS SINCE M3 UNIT 3, and the WORDING DID NOT MOVE: a
+            // give whose tag is already in the child's boot set raises this
+            // exact tag (sawos design 4 — an identity naming two handles is
+            // broken config, caller-checkable, and it would make the record a
+            // multimap and the boot lookup ambiguous). The sentence names the
+            // Waiter case because that is the one it was written for and
+            // because the string is ASSERTED by a shipped transcript
+            // (`event_dupkey`); design 4 authorised no expectation changes, so
+            // the generalisation is recorded here rather than spelled in the
+            // line. A later unit that touches that row should widen it to name
+            // the key rather than the attachment.
+            case DuplicateKey -> "an attachment already uses that key",
+            case LineBound -> "that interrupt line is already bound",
+        }
+    }
+}
+
+// =============================================================================
+// Process status (spec §8)
+// =============================================================================
+
+/// How a process ended, or that it has not. Spec §8: ONE fixed-width status
+/// word, KIND in the high bits and a code in the low bits, so a supervisor
+/// reads both out of one register.
+///
+/// `Killed` is declared and unreachable in M2 for the reason `ProcessRight`
+/// gives: there is no second process to be killed by. It is here because the
+/// word's ENCODING is what a supervisor parses, and a kind added later would
+/// renumber nothing but would still be a wire change.
+public enum ProcessStatusKind: UInt8 {
+    case Running = 0,
+    case Exited = 1,
+    case Faulted = 2,
+    case Killed = 3,
+}
+
+/// Where the kind sits in the status word. The low half is the code — an exit
+/// status, or a `FaultReason` — so both fit a 32-bit reader on either profile.
+static PROCESS_STATUS_KIND_SHIFT: Int = 16
+static PROCESS_STATUS_CODE_MASK: UInt = 0xFFFF
+
+/// Assemble the §8 status word.
+public func process_status_word(kind: ProcessStatusKind, code: UInt) -> UInt {
+    ((((kind as UInt8) as UInt) << PROCESS_STATUS_KIND_SHIFT)
+     | (code & PROCESS_STATUS_CODE_MASK))
+}
