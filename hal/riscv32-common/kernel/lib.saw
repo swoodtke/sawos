@@ -378,7 +378,7 @@ public func prot_commit() unsafe {
 //
 // Profile B gives every process a persistent translation-table set, edits it
 // when the grant RECORD is edited, and makes a switch one register write. This
-// profile does none of that, and the four bodies below are empty for one
+// profile does none of that, and the three bodies below are empty for one
 // reason: **PMP HAS NO PER-PROCESS STANDING IMAGE TO EDIT.** There are sixteen
 // numbered registers describing the machine's current view, and the only way to
 // make them describe a different process is to rewrite them — which is exactly
@@ -392,7 +392,7 @@ public func prot_commit() unsafe {
 // authoritative and the hardware still learns at switch time" looks like from
 // the other side of the seam.
 //
-// The kernel calls all five on both profiles; each profile implements the half
+// The kernel calls all three on both profiles; each profile implements the half
 // it means. Nothing in `kernel/core` asks which tier it is on.
 
 /// **DOES THIS PROFILE REBUILD ITS PROTECTION IMAGE AT EVERY SWITCH?** Yes —
@@ -416,20 +416,18 @@ public static PROT_DOMAIN_SLOTS: Int = 256
 public func prot_switch(p: UInt) unsafe {
 }
 
-/// Grant `[base, top)` in `p`'s standing image. There is no standing image —
-/// the row is in the kernel's record, and the next `load_domain(p)` replays it.
-public func prot_install(p: UInt, base: UInt, top: UInt, perms: UInt8,
-                         device: Bool) unsafe {
+/// Make `[base, top)` in `p`'s standing image say `perms` — with `perms == 0`
+/// meaning revoke, the user's Sep 3 ruling that a grant of nothing IS the
+/// absence of a grant. There is no standing image here: the row is in the
+/// kernel's record, and the next `load_domain(p)` replays whatever the record
+/// then says. Both directions are therefore the same nothing.
+public func prot_update(p: UInt, base: UInt, top: UInt, perms: UInt8,
+                        device: Bool) unsafe {
 }
 
-/// Revoke `[base, top)` from `p`'s standing image. Same reason: the row leaves
-/// the record, and the replay that follows stops programming it.
-public func prot_remove(p: UInt, base: UInt, top: UInt, device: Bool) unsafe {
-}
-
-/// Revoke everything `p` holds. `clear_domain` has already emptied the record
-/// and invalidated `LAST_PROT_PROCESS`, which is what forces the next switch to
-/// reprogram the hardware from scratch.
+/// Retire `p`'s domain. `clear_domain` has already emptied the record and
+/// invalidated `LAST_PROT_PROCESS`, which is what forces the next switch to
+/// reprogram the hardware from scratch — this profile's whole-set reset.
 public func prot_clear(p: UInt) unsafe {
 }
 

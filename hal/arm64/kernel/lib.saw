@@ -1164,7 +1164,7 @@ public func prot_region(idx: UInt, base: UInt, top: UInt, perms: UInt8) unsafe {
 
 /// Grant `[base, top)` with `perms` in the level-3 window at `level3`.
 ///
-/// The walk `prot_region` and `prot_install` share: one takes the LIVE set's
+/// The walk `prot_region` and `prot_update` share: one takes the LIVE set's
 /// window, the other any process's, and neither wants a second copy of the
 /// bounds checks or the attribute assembly.
 func install_region(level3: UInt, base: UInt, top: UInt, perms: UInt8) unsafe {
@@ -1250,7 +1250,7 @@ func install_device(dev_level3: UInt, base: UInt, len: UInt) unsafe {
 // process owns a persistent table set, edited when its RECORD is edited, and a
 // switch is one register write.
 //
-// The four calls below are the whole of the difference, and every one of them
+// The three calls below are the whole of the difference, and every one of them
 // has a no-op twin on the riscv32 HAL — which is what lets `kernel/core` spell
 // one sequence for both profiles.
 
@@ -1281,17 +1281,56 @@ public func prot_switch(p: UInt) unsafe {
     sos_ttbr0_write(set_base(p) | (p << TTBR_ASID_SHIFT))
 }
 
-/// **THE EDIT PAIR, HALF ONE.** Grant `[base, top)` in `p`'s OWN tables,
-/// whether or not `p` is the process currently running.
+/// **THE RANGE EDIT.** Make `[base, top)` in `p`'s OWN tables say exactly
+/// `perms`, whether or not `p` is the process currently running.
 ///
-/// Reached from `record_grant`, which is the single funnel every grant row is
-/// appended through — the loader's three at boot and `install_row`'s one from a
-/// `map` — so the record and the tables move together by construction rather
-/// than by two call sites agreeing to stay in step.
-public func prot_install(p: UInt, base: UInt, top: UInt, perms: UInt8,
-                         device: Bool) unsafe {
+/// **`perms == 0` IS A REVOCATION, and it is a real domain value rather than a
+/// mode flag** (user ruling, Sep 3). A grant of nothing IS the absence of a
+/// grant: on this profile a non-granted window page is present and EL0-denied,
+/// so removal is literally the installation of deny and the two directions were
+/// never two operations. Nothing is overloaded to make that true — the kernel
+/// REFUSES to record a permitting-nothing row at both of its doors, so the
+/// encoding cannot collide with a live grant:
+///
+///   - an image segment must be readable or executable
+///     (`imgformat.has_sane_perms`), so `flags == 0` never reaches the loader's
+///     `record_grant`;
+///   - `map_access` refuses NO ACCESS AT ALL by name — "a row that permits
+///     nothing spends a protection slot to say what default-deny already says"
+///     — as a caller-visible `BadArg`.
+///
+/// So zero is a value the grant vocabulary already had no use for, which is
+/// what makes it free to mean the one thing it should.
+///
+/// Reached from BOTH record funnels: `record_grant` passes the row's real
+/// permissions, `remove_grant` passes zero. Those are the only two places a
+/// grant record changes shape, so the record and the tables move together by
+/// construction rather than by call sites agreeing to stay in step.
+///
+/// THE DEVICE WINDOW takes the same path, `device` picking which window rather
+/// than which operation. Its GRANT direction ignores `perms` exactly as
+/// `prot_device` always has — a device page is read/write to EL0 and never
+/// executable, which is a property of registers and not of the image's flag
+/// bits — and its REVOKE direction restores `kernel_device_page`, the deny
+/// spelling that window resets to. So `perms` is read here only to answer
+/// grant-or-revoke, never to shade a device grant.
+public func prot_update(p: UInt, base: UInt, top: UInt, perms: UInt8,
+                        device: Bool) unsafe {
     let level1 = set_base(p)
-    if device {
+    if perms == 0 {
+        var va = base - (base & (PAGE_SIZE - 1))
+        while va < top {
+            if device {
+                put_desc(level1 + DEVICE_LEVEL3_OFFSET,
+                         (va - DEVICE_WINDOW_BASE) >> PAGE_SHIFT,
+                         kernel_device_page(va))
+            } else {
+                put_desc(level1 + LEVEL3_OFFSET, (va - RAM_BASE) >> PAGE_SHIFT,
+                         kernel_page(va))
+            }
+            va = va + PAGE_SIZE
+        }
+    } else if device {
         install_device(level1 + DEVICE_LEVEL3_OFFSET, base, top - base)
     } else {
         install_region(level1 + LEVEL3_OFFSET, base, top, perms)
@@ -1299,34 +1338,27 @@ public func prot_install(p: UInt, base: UInt, top: UInt, perms: UInt8,
     invalidate_domain(p)
 }
 
-/// **THE EDIT PAIR, HALF TWO.** Put `[base, top)` in `p`'s tables back to
-/// kernel-only — the revocation half.
+/// Retire `p`'s domain: both its windows back to kernel-only, wholesale.
 ///
-/// Reached from `remove_grant`, the single removal funnel, BEFORE the record
-/// compaction that would lose the row's bounds.
-public func prot_remove(p: UInt, base: UInt, top: UInt, device: Bool) unsafe {
-    let level1 = set_base(p)
-    var va = base - (base & (PAGE_SIZE - 1))
-    while va < top {
-        if device {
-            put_desc(level1 + DEVICE_LEVEL3_OFFSET,
-                     (va - DEVICE_WINDOW_BASE) >> PAGE_SHIFT,
-                     kernel_device_page(va))
-        } else {
-            put_desc(level1 + LEVEL3_OFFSET, (va - RAM_BASE) >> PAGE_SHIFT,
-                     kernel_page(va))
-        }
-        va = va + PAGE_SIZE
-    }
-    invalidate_domain(p)
-}
-
-/// Revoke every grant `p` holds: both its windows back to kernel-only.
+/// **IT STAYS A SEPARATE NAME DELIBERATELY** (user ruling, Sep 3), and the
+/// reason is that this is not a range edit with wide bounds — it is domain
+/// RETIREMENT, a different event with two properties `prot_update` cannot
+/// carry:
 ///
-/// Reached from `clear_domain` at teardown, which is where a process slot — and
-/// therefore an ASID — becomes reusable. The invalidation inside is what stops
-/// a new process inheriting a dead one's cached translations under the same
-/// tag, which is the slot-reuse hazard design 27 D-2 names.
+///   - **IT IS THE FAIL-CLOSED MASK.** It resets the whole set rather than the
+///     ranges the record happens to list, so it is correct even if the record
+///     and the hardware have skewed — which is exactly the moment you cannot
+///     trust the record to enumerate what is live. Spelling teardown as a walk
+///     of the rows would make the cleanup depend on the very bookkeeping whose
+///     failure it is there to contain.
+///   - **IT ANCHORS THE ASID-REUSE INVALIDATION TO ONE NAMED LIFECYCLE EVENT.**
+///     A process slot — and therefore an address-space identifier — becomes
+///     reusable here and nowhere else, so the invalidation that stops a new
+///     process inheriting a dead one's cached translations has exactly one
+///     site. That is the slot-reuse hazard design 27 D-2 names, and a range
+///     edit is the wrong shape to hang it on.
+///
+/// Reached from `clear_domain` at teardown.
 public func prot_clear(p: UInt) unsafe {
     let level1 = set_base(p)
     reset_window(level1 + LEVEL3_OFFSET)

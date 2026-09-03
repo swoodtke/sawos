@@ -203,8 +203,8 @@ built in assembly, entered once, with no storage a second thread could have had.
 - **Table walks are cacheable and inner-shareable**, so a descriptor written
   with the MMU on is visible to the walker without cache maintenance and
   `prot_commit` only has to order and flush the TLB. The same property is what
-  lets sawos design 27's per-process edits (`prot_install` / `prot_remove` /
-  `prot_clear`) get away with a `dsb ishst` and one `tlbi aside1is`: they write
+  lets sawos design 27's per-process edits (`prot_update` / `prot_clear`) get
+  away with a `dsb ishst` and one `tlbi aside1is`: they write
   descriptors in another process's set with the MMU on, and nothing has to
   reach memory beyond ordering the stores ahead of the invalidation. The tables
   are built BEFORE the MMU comes on, where a real board would want a data-cache

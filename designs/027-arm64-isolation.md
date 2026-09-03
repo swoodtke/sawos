@@ -123,48 +123,80 @@ declarations (unit 8's sweep owns the sections).
 **Status: BUILT.** Gate green and the transcript byte-identical on both
 architectures; riscv32's behavior is unchanged by construction.
 
-### The seam, as landed
+### The seam, as landed (THREE names — user-ruled Sep 3, reworked before merge)
 
-Five names, not the two the brief proposed. Every HAL implements all
-five; each implements the half its tier means, and `kernel/core` spells
-ONE sequence with no tier conditional written in it:
+The unit first landed a five-name edit surface
+(`prot_install` + `prot_remove` as a pair). **The user ruled it down to
+three before merge**, and the collapse is recorded here rather than
+hidden in a diff because the reasoning is the interesting part:
 
 ```saw
 PROT_REPLAY_AT_SWITCH: Bool          // arm64 false, riscv32 true
 prot_switch(p: UInt)
-prot_install(p: UInt, base: UInt, top: UInt, perms: UInt8, device: Bool)
-prot_remove(p: UInt, base: UInt, top: UInt, device: Bool)
+prot_update(p: UInt, base: UInt, top: UInt, perms: UInt8, device: Bool)
 prot_clear(p: UInt)
 ```
 
-Three departures from the brief's sketch, each forced:
+**`prot_update` replaces the pair: `perms == 0` MEANS REVOKE.** This is
+a real domain value, not a mode flag, so it does not reopen the Optional
+discipline (a `Bool` "install-or-remove" argument would have been exactly
+the mode flag that ruling exists to refuse). The unit's own structural
+finding is what licenses it — a non-granted window page is present and
+EL0-denied anyway, so **removal IS the installation of deny**, and the
+two directions were never two operations on a translating tier.
 
-1. **The pair is VA-KEYED, not `idx`-keyed** (`prot_install(p, idx, row)`
-   was proposed). A `GrantRow` is a `kernel/core` type the HAL cannot
-   see, so the row arrives as its fields; and `idx` is already the
-   asymmetry the seam carries badly — it is the numbered PMP region on
-   riscv32 and *unused* on arm64. A translation HAL wants the VA range,
-   which is what it keys tables on, so the index stays where it means
-   something: in the kernel's record.
-2. **A fifth call, `prot_clear(p)`**, because teardown drops rows
-   WHOLESALE (`clear_domain` zeroes `grant_count`; the teardown loop
-   never calls `remove_grant`), so there is no per-row removal to hang
-   the revocation on. It is also where an ASID becomes reusable, which
-   is the slot-reuse hazard D-2 names.
-3. **`PROT_REPLAY_AT_SWITCH`, an advertised constant.** The brief asked
-   for a spelling with "no tier conditional in kernel/core". A genuine
-   one is unavoidable: the replay must read `PROCESSES[p].grants`, and
-   a HAL cannot import the kernel to read it, so the loop cannot move
-   into the HAL. What CAN move is the decision — so the kernel asks the
-   HAL which tier it is on, and the loop folds away at compile time on
-   arm64 and stays whole on riscv32. This is design 19's "difference
-   ADVERTISED, never faked" rather than a conditional the kernel
-   invented.
+What makes zero SAFE to spend, verified at both producers rather than
+assumed:
+
+- an image segment must be readable or executable
+  (`imgformat.has_sane_perms` ends `is_readable() || is_executable()`),
+  so `flags == 0` never reaches the loader's `record_grant`;
+- `map_access` refuses NO ACCESS AT ALL by name, as a caller-visible
+  `BadArg` — "a row that permits nothing spends a protection slot to say
+  what default-deny already says".
+
+So the grant vocabulary already had no use for zero. It cannot collide
+with a live row, which is what turns "a grant of nothing is a
+revocation" from a pun into an encoding.
+
+The DEVICE window takes the same path, `device` picking which window
+rather than which operation: the grant direction ignores `perms` exactly
+as `prot_device` always has (a device page is user read/write and never
+executable — a property of registers, not of the image's flag bits), and
+the revoke direction restores `kernel_device_page`, the deny spelling
+that window already resets to. Said at the site.
+
+**`prot_clear` STAYS a separate name, deliberately.** It is domain
+RETIREMENT, not a range edit with wide bounds, and it carries two things
+`prot_update` cannot: it is the FAIL-CLOSED MASK (a whole-set reset,
+correct even if record and hardware have skewed — which is exactly the
+moment you cannot trust the record to enumerate what is live), and it
+ANCHORS THE ASID-REUSE INVALIDATION to one named lifecycle event, since
+a slot and its address-space identifier become reusable here and nowhere
+else. Recorded at the definition so nobody re-asks.
+
+**`PROT_REPLAY_AT_SWITCH` and the MPU replay quartet
+(`prot_reset`/`prot_region`/`prot_device`/`prot_commit`) are unchanged.**
+The advertised constant is there because a genuine tier conditional is
+unavoidable: the replay must read `PROCESSES[p].grants`, and a HAL cannot
+import the kernel to read it, so the LOOP cannot move into the HAL. What
+CAN move is the DECISION — the kernel asks the HAL which tier it is on,
+and the loop folds away at compile time on arm64 and stays whole on
+riscv32. Design 19's "difference ADVERTISED, never faked", rather than a
+conditional the kernel invented.
+
+**CONSIDERED AND NOT TAKEN: collapsing the replay quartet into
+`prot_update` too.** Declined (user, Sep 3): it touches the staged
+reset/commit PUBLISH contract — `prot_reset` and `prot_commit` bracket a
+sequence that must never be half-live, and the four calls are the MPU's
+staging protocol, not four spellings of one edit — for zero behavioral
+gain. The quartet keeps its own shape and its own audit note.
 
 **Where the calls hang — the record's own funnels, not the op sites.**
-`prot_install` went into `record_grant` and `prot_remove` into
-`remove_grant`, rather than into `install_row`/`Unmap` as the brief
-sketched. `record_grant` is the single funnel every row is appended
+Both directions go into the record's own funnels rather than into
+`install_row`/`Unmap` as the brief sketched: `record_grant` calls
+`prot_update` with the row's real permissions, `remove_grant` calls it
+with zero. `record_grant` is the single funnel every row is appended
 through (the loader's three at boot, `install_row`'s one from a `map`),
 so record and tables move together by construction instead of by two
 call sites agreeing to stay in step — and it is what makes the BOOT path
@@ -172,6 +204,14 @@ work at all, since `place_image` records root's rows and deliberately
 "commits nothing to hardware", so an edit hung on `install_row` alone
 would have left root's tables empty. `remove_grant` reads the row's
 bounds BEFORE its own compaction moves them.
+
+One departure from the brief survives the rework unchanged: **the edit is
+VA-KEYED, not `idx`-keyed** (`prot_install(p, idx, row)` was proposed). A
+`GrantRow` is a `kernel/core` type the HAL cannot see, so the row arrives
+as its fields; and `idx` is the asymmetry the seam carries badly — the
+numbered PMP region on riscv32, *unused* on arm64. A translation HAL keys
+tables on the VA range, so the index stays where it means something: in
+the kernel's record.
 
 `load_domain` gained the guard and one trailing `prot_switch`.
 `domain_changed` and `run_thread` are UNCHANGED: on arm64 `load_domain`
@@ -297,6 +337,10 @@ the edit, instead of once per switch.
   + arm64**.
 - After the change, same command: **116/116, 232 passed**, both
   architectures.
+- **Re-gated after the three-name seam rework**: **116/116, 232 passed**,
+  both architectures, transcript byte-identical again and to the same
+  hash. So the collapse is witnessed as behavior-preserving in its own
+  right, not merely inherited from the first gate.
 - `diff baseline after` → **BYTE-IDENTICAL**, 483 lines, no exceptions
   claimed — the three documented timing rows did not move either.
 - Both transcripts hash to
@@ -309,10 +353,12 @@ the edit, instead of once per switch.
 - The arm64 half proves the mechanism swap is invisible from above.
   Note what makes that a real proof rather than a weak one: the replay
   is compiled OUT on arm64 (`PROT_REPLAY_AT_SWITCH` is `false`), so
-  `prot_install` is the ONLY path by which a grant reaches arm64
+  `prot_update` is the ONLY path by which a grant reaches arm64
   hardware. Every one of the 116 cases boots root, loads images and
   runs children through it; `process_isolation` and `child_oversteps`
-  re-witness peer isolation under the new mechanism specifically.
+  re-witness peer isolation under the new mechanism specifically, and
+  `map_unmap` / `iomemory_carve` witness the revoke direction and the
+  device window through the collapsed call.
 
 ### Findings
 
@@ -322,6 +368,16 @@ the edit, instead of once per switch.
    calls** and remains live on the old four. Not cleaned up here: the
    brief forbids surface churn beyond the unit, and riscv32's
    `prot_region` genuinely means it.
+2b. **THE ARCH-FREE LINT READS PROSE, not just code** — and it caught a
+   comment during the seam rework: `sos-test` refused the build with
+   "architecture names in the arch-free kernel" over the word `EL0` in a
+   `kernel/core/process.saw` COMMENT (design 162 unit 1: kcore reaches
+   the machine through `hal` only). Reworded to "denied to user mode".
+   Worth knowing before writing kernel-side commentary about a HAL
+   mechanism: the rule governs what the file SAYS as well as what it
+   calls, which is stricter than it first reads and is the right
+   strictness — a kernel comment that names EL0 is a kernel that has
+   quietly learned which machine it is on.
 3. **Unit 3 (riscv Sv32) inherits an unlit gate for fault classes** —
    see the second bullet under the fault-class question above. If that
    unit wants the class witnessed, it has to add the assertion first.

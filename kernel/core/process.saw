@@ -383,9 +383,14 @@ public(package) func record_grant(p: Int, base: UInt, top: UInt, perms: UInt8,
     //
     // AFTER the reference above, so the region is held before anything can
     // reach the bytes: the grant is the thing that makes them reachable, and
-    // taking the reference first is what stops a concurrent free from racing
-    // the row that is about to permit access to it.
-    hal.prot_install(p as UInt, base, top, perms, device)
+    // taking the reference first is what stops a free from racing the row that
+    // is about to permit access to it.
+    //
+    // `perms` is non-zero by construction on both paths into here — an image
+    // segment must be readable or executable, and `map_access` refuses a row
+    // that permits nothing — which is what leaves zero free to mean the
+    // revocation `remove_grant` spells below.
+    hal.prot_update(p as UInt, base, top, perms, device)
 }
 
 /// Make process `p`'s recorded domain the LIVE one.
@@ -480,7 +485,14 @@ public(package) func remove_grant(p: Int, row: Int) unsafe {
     // a revocation that did not revoke — the sentence `domain_changed` has
     // always carried. On the MPU tier it is a no-op and the replay is what
     // stops programming the row.
-    hal.prot_remove(p as UInt, gone.base, gone.top, gone.device)
+    //
+    // A GRANT OF NOTHING IS THE REVOCATION (user ruling, Sep 3): the same call
+    // `record_grant` makes, with permissions of zero. It is one operation
+    // because on a translating tier it IS one — a non-granted page is still
+    // mapped and simply denied to user mode, so removal is the installation of
+    // deny — and zero is available to say so because neither door will record a
+    // row that permits nothing.
+    hal.prot_update(p as UInt, gone.base, gone.top, 0, gone.device)
     var i = row
     while i + 1 < PROCESSES[p].grant_count {
         PROCESSES[p].grants[i] = PROCESSES[p].grants[i + 1]
