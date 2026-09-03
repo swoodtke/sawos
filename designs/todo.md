@@ -50,11 +50,18 @@ entry below or the brief that carries it, never restating either.
   inlet), `uart-cancel`, `delegate-3p` + `child-forward` +
   `child-far`; `hal/{riscv32,arm64}/user/child2.ld`, because unit 5 is
   the first case in the tree with two children alive at once. FIVE new
-  cases (113 -> 118 per-arch pair). ROW CENSUS AT PEAK WIRING: root
-  spends 3 protection rows and needs no more — a launcher maps nothing
-  — so the squeeze is the HANDLE table, not the grant record; measured
-  peak 11 of 16 with the boot Memory wrappers released after
-  `process_create`. TWO EXISTING CASES ADAPTED, asserted rows
+  case entries, three reaching each arch (113 -> 116 per arch, 226 ->
+  232). ROW CENSUS AT PEAK WIRING: root spends 3 protection rows and
+  needs no more — `process_create` reads a child's image with kernel
+  privilege and a launcher maps nothing — so the squeeze is the HANDLE
+  table rather than the grant record; counted call by call, peak 11 of
+  16 with the boot Memory wrappers released after the creates, 15
+  without them. TRAP ACCOUNTING, measured at both ends and it moved the
+  ladder's headline: one trap per message the server ANSWERS and TWO
+  per message it DISCARDS, because a TELL owes no reply and the
+  obligation it minted must still be released — the client pays the
+  same two for the same reason, so a one-way message buys latency
+  rather than syscalls. TWO EXISTING CASES ADAPTED, asserted rows
   unchanged: `process-reclaim` and `death-late-attach` each create one
   unstarted FILLER process, because both ask whether a slot is
   available and that question needs a full table. As-built in

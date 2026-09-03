@@ -4217,7 +4217,7 @@ TEST_CASES = [
                        # 0x5A — 'Z', the first byte of the phrase, which is the
                        # one root's own claim was answered with.
                        "SOS uartsvc: root's claim answered byte 90",
-                       "SOS uartsvc: client echoed 3 more and exited clean",
+                       "SOS uartsvc: client traps=13 for 3 reads and 3 writes",
                        "SOS uartsvc drv: served=13 abandoned=0 dropped=0",
                        "SOS uartsvc drv: after the mark answered=2 discarded=2 "
                        "traps=7",
@@ -4251,7 +4251,7 @@ TEST_CASES = [
                        "SOS uartsvc: root wrote this line through the driver",
                        "SOS uartsvc: and root does not hold the device",
                        "SOS uartsvc: root's claim answered byte 90",
-                       "SOS uartsvc: client echoed 3 more and exited clean",
+                       "SOS uartsvc: client traps=13 for 3 reads and 3 writes",
                        "SOS uartsvc drv: served=13 abandoned=0 dropped=0",
                        "SOS uartsvc drv: after the mark answered=2 discarded=2 "
                        "traps=7",

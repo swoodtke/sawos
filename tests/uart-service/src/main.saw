@@ -116,6 +116,11 @@ static_assert((1 * 65536) + 61 == 65597,
 /// `Exited`(1) << 16 | 0 — the driver's clean ending.
 static DRIVER_STATUS: UInt = 65536
 
+/// The client's exact syscall count. Its arithmetic is written out where it is
+/// checked; the number is here so a reader meets it beside the status word it
+/// belongs with.
+static CLIENT_SYSCALLS: UInt64 = 13
+
 @export("_start")
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
@@ -265,8 +270,39 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
               CLIENT_STATUS)
         return BUG
     }
+
+    // **THE CLIENT'S SIDE OF THE TRAP LEDGER, READ THROUGH THE HANDLE THAT
+    // OUTLIVES IT** (design 16's arrangement, `pipe-cq`'s own): a `Gone` slot
+    // keeps its columns for exactly as long as somebody can name it.
+    //
+    //   1  process_self          the derive every process starts with
+    //   1  boot_handle_next      the inlet is record 0
+    //   3  send(Read)            ONE TRAP EACH, and each one PARKED until a
+    //                            device interrupt in another process made an
+    //                            answer possible
+    //   3  post(Write)           the TELL's submission
+    //   3  the claim's release   ...and the TELL's other half
+    //   1  send(Sync)            the flush before exiting
+    //   1  exit                  charged at trap entry, never returning
+    //   --
+    //   13
+    //
+    // **A TELL IS NOT CHEAPER THAN A CALL ON THIS ABI, AND THAT IS THE ROW
+    // WORTH READING.** A one-way write costs the client TWO traps — the post
+    // and the release of the claim it never wanted — where a blocking `Call`
+    // costs ONE. The saving a TELL buys is LATENCY, not syscalls: it does not
+    // park. The server side is symmetric (see the driver's own report), and the
+    // reason is the same at both ends: a message that owes no answer still
+    // mints a real capability, and letting go of a capability is an act.
+    let client_traps = try client.stats()
+    if client_traps.syscalls != CLIENT_SYSCALLS {
+        print("SOS uartsvc: client traps={} wanted {}\n",
+              client_traps.syscalls, CLIENT_SYSCALLS)
+        return BUG
+    }
     print("SOS uartsvc: root's claim answered byte {}\n", got)
-    print("SOS uartsvc: client echoed {} more and exited clean\n", 3)
+    print("SOS uartsvc: client traps={} for 3 reads and 3 writes\n",
+          client_traps.syscalls)
 
     // **HANGING UP IS DROPPING THE LAST INLET.** The client's sibling went with
     // its teardown; this is the other one, and the connection's client column
