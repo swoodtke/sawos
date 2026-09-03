@@ -91,15 +91,45 @@ public(package) static NO_PROCESS: Int = -1
 /// (sawos design 7 D-1), so a cut that is dropped returns its slot inside the
 /// release and this number bounds CONCURRENT regions rather than total cuts —
 /// `tests/memory-split` walks twenty rounds past these sixteen slots with
-/// nothing refused. What a long-running allocator meets instead is the POOL,
-/// because a freed Memory returns its slot and not its BYTES (§2.5's narrowing:
-/// quotas count objects in v1). That is the honest state of the system and
-/// `NoResource` is what says so, rather than a bigger table hiding the same
-/// fact one order of magnitude further out.
+/// nothing refused.
+///
+/// **AND SINCE M5 UNIT 5 IT IS NOT THE POOL EITHER** (sawos design 28). What
+/// this paragraph used to say — that a long-running allocator meets the POOL,
+/// because a freed Memory returns its slot and not its BYTES — was the honest
+/// state of the system and is what that unit built. A dropped region's range
+/// goes back onto its pool root's free list now, so what bounds a workload is
+/// concurrency in both currencies: how many regions exist at once, and how many
+/// bytes are out at once.
 public(package) static MAX_MEMORIES: Int = 16
 
 /// The same sentinel for the Memory slab.
 public(package) static NO_MEMORY: Int = -1
+
+/// Free-range NODES a pool's free list can hold, over ALL pools (sawos design
+/// 28; design 25 D-5).
+///
+/// **THE PARAGRAPH ABOVE IS WHAT THIS NUMBER RETIRES.** `MAX_MEMORIES` used to
+/// say a long-running allocator meets the POOL rather than the slab, because a
+/// freed region returned its slot and not its BYTES. It returns both now: the
+/// range goes onto its pool root's free list, and this is the storage that list
+/// is made of.
+///
+/// A NODE IS ONLY EVER NEEDED FOR A HOLE. A range returned ADJACENT to another
+/// free range coalesces into it, and one adjacent to the pool's own unspent
+/// frontier folds back into the cursor and needs no node at all — which is the
+/// common shape, since a cut-and-drop loop returns the piece it just took. So
+/// the list is as long as the pool is FRAGMENTED, and thirty-two is generous
+/// against a Memory slab of sixteen: every live region could be released out of
+/// order, each landing as its own hole, and the list would still be half empty.
+///
+/// **EXHAUSTION MUST NOT FAULT A RELEASE** (design 28's infallible-release
+/// doctrine). A range that finds no node after coalescing is LEAKED, honestly
+/// and counted, into its pool's `dropped` — never refused, never silently lost.
+/// `SlabDonate` (design 25 D-6) names this slab as its first customer.
+public(package) static MAX_FREE_RANGES: Int = 32
+
+/// The same sentinel for the free-range slab.
+public(package) static NO_FREE_RANGE: Int = -1
 
 /// IoMemory objects the kernel can hold (spec §2.5; sawos design 6 D-1/D-7).
 ///

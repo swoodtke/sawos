@@ -1,0 +1,31 @@
+[package]
+name = "memory-recycle"
+version = "0.1.0"
+
+# Same reason as sos/root's: this image carries its own `__saw_rt_*` seams, out
+# of the `sosrt` module its `sos` dependency pulls in. See that manifest.
+runtime = true
+
+# M5 UNIT 5: SPENT BYTES COME BACK (sawos design 28, on design 25 D-5). A pool
+# is taken to its last byte, given back OUT OF ORDER, and then handed out AS ONE
+# RANGE — which is the free list, the coalescing and the frontier fold in one
+# claim. Then the second zero across a process boundary: a region whose handles
+# are all gone and whose only row lives in a CHILD's domain comes home when that
+# child dies, and the same bytes split out again carrying the child's own mark.
+#
+# It names an address through the same one-line C constant the other pool cases
+# use (`tests/poolbase_<arch>.c`) — root's config, not kernel state leaking.
+[dependencies]
+sos = { path = "../../kernel/sysapi" }
+
+[sos]
+emit = "sosimg"
+priorities = { background = 0, low = 1, normal = 1, high = 1 }
+
+[sos.riscv32-unknown-none-elf]
+linker-script = "../../hal/riscv32/user/root.ld"
+native = "../../hal/riscv32-common/user/syscall.c ../../rt/common_c/support.c ../poolbase_riscv32.c"
+
+[sos.aarch64-unknown-none-elf]
+linker-script = "../../hal/arm64/user/root.ld"
+native = "../../hal/arm64/user/syscall.c ../../rt/common_c/support.c ../poolbase_arm64.c"

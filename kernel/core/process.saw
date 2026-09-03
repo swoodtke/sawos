@@ -55,6 +55,8 @@ import kcore.objects.{
     mint_handle,
     queue_boot_handle,
     quota_charge,
+    ref_region_row,
+    unref_region_row,
 }
 import kcore.threads.{
     CURRENT_THREAD,
@@ -95,6 +97,21 @@ public(package) struct GrantRow {
     public(package) top: UInt,
     public(package) perms: UInt8,
     public(package) device: Bool,
+    /// WHICH `Memory` REGION these bytes are, or `NO_MEMORY` (sawos design 28).
+    ///
+    /// **THE BACK-REFERENCE RIDES THE ROW BECAUSE THE ROW IS WHAT IS COUNTED**
+    /// (`MemorySlot.maps`). A row outlives its `Mapping` object by design — 7
+    /// D-2's husk arm frees the slot and leaves the row installed — so a link
+    /// kept on the Mapping slot would be lost exactly when the region still
+    /// needed to know that something was granting its bytes. Here it cannot be:
+    /// a row is born in `record_grant`, dies in `remove_grant` or
+    /// `clear_domain`, and travels with its own row through the compaction
+    /// because the compaction copies whole rows.
+    ///
+    /// `NO_MEMORY` is the common case and means "these bytes are not a region
+    /// the pool lent out": an image segment, the kernel's stack grant, and every
+    /// DEVICE row (an IoMemory is pinned and returns nothing — §5.9's carve-out).
+    public(package) region: Int,
 }
 
 /// One process (spec §2 table row): its protection domain, its handle table and
@@ -235,7 +252,8 @@ public(package) unsafe static var PROCESSES: [ProcessSlot; MAX_PROCESSES] = [
     ProcessSlot(state: ProcessState.Free, entry: 0,
              stack_top: 0, region_base: 0, region_top: 0, rw_base: 0, rw_top: 0,
              grant_count: 0,
-             grants: [GrantRow(base: 0, top: 0, perms: 0, device: false);
+             grants: [GrantRow(base: 0, top: 0, perms: 0, device: false,
+                               region: NO_MEMORY);
                       MAX_GRANT_ROWS],
              exit_kind: ProcessStatusKind.Running, exit_code: 0,
              refs: 0, attachment: 0,
@@ -339,16 +357,22 @@ public(package) func reclaim_process_slot(slot: Int) unsafe {
 /// that plus the stack. The bound is re-tested here anyway because a silently
 /// dropped grant is a process running with less memory than it was given, which
 /// presents as a fault somewhere else entirely.
+/// **AND A ROW THAT NAMES A REGION IS A REFERENCE ON IT** (sawos design 28).
+/// `region` is `NO_MEMORY` for every row that is not one — image segments, the
+/// stack grant, device windows — and `ref_region_row` takes that arm, which is
+/// what lets all five callers pass their answer unconditionally.
 public(package) func record_grant(p: Int, base: UInt, top: UInt, perms: UInt8,
-                                  device: Bool) unsafe {
+                                  device: Bool, region: Int) unsafe {
     if PROCESSES[p].grant_count >= MAX_GRANT_ROWS {
         fatal_image("more grants than a process's record can hold",
                     PROCESSES[p].grant_count as UInt)
     }
     let n = PROCESSES[p].grant_count
     PROCESSES[p].grants[n] = GrantRow(base: base, top: top,
-                                      perms: perms, device: device)
+                                      perms: perms, device: device,
+                                      region: region)
     PROCESSES[p].grant_count = n + 1
+    ref_region_row(region)
 }
 
 /// Make process `p`'s recorded domain the LIVE one.
@@ -403,13 +427,22 @@ public(package) func load_domain(p: Int) unsafe {
 /// immediately before appending its row, and the only thing that has moved one
 /// since is a compaction — which is exactly what `compact_mapping_rows` beside
 /// this call keeps in step. So the index names a row this record still has.
+///
+/// **THE REGION IS READ FIRST AND DROPPED LAST** (sawos design 28), and the
+/// order is the contract rather than a convenience: taking the row out of the
+/// record before dropping the count means the domain has already stopped
+/// granting these bytes at the moment they may go back on the pool's free list.
+/// The reverse order would let a `Split` hand a range to a new owner while the
+/// old one's protection row still reached it.
 public(package) func remove_grant(p: Int, row: Int) unsafe {
+    let region = PROCESSES[p].grants[row].region
     var i = row
     while i + 1 < PROCESSES[p].grant_count {
         PROCESSES[p].grants[i] = PROCESSES[p].grants[i + 1]
         i = i + 1
     }
     PROCESSES[p].grant_count = PROCESSES[p].grant_count - 1
+    unref_region_row(region)
 }
 
 /// **THE LIVE-DOMAIN RULE** (sawos design 6 D-3): any edit to `PROCESSES[p]`'s
@@ -454,8 +487,27 @@ public(package) func domain_changed(p: Int) unsafe {
 /// PROTECTION DOMAIN from being left installed for it. Neither substitutes for
 /// the other — the first is about what userspace may name, the second about what
 /// the hardware is programmed with.
+/// **AND THIS IS WHERE A TEARDOWN RECYCLES** (sawos design 28). Every row this
+/// record still holds is a reference on a region, so dropping the record drops
+/// them all — and a region whose LAST row goes here, with its handles already
+/// closed by the sweep above this call, returns its range to its pool. That is
+/// what narrows §2.5's "dropped without unmap = permanent, safe-but-leaked" to
+/// "leaked until the TARGET PROCESS's teardown": the bound was always the
+/// target's death, and the death now gives the bytes back instead of forgetting
+/// them.
+///
+/// THE COUNT IS ZEROED FIRST, for `remove_grant`'s reason one function up: the
+/// rows are gone from the record — nothing replays them, `grant_count` is what
+/// says how many there are — before any range can move. The row DATA is left
+/// where it lies, which costs nothing and is overwritten by the next grant.
 public(package) func clear_domain(p: Int) unsafe {
+    let rows = PROCESSES[p].grant_count
     PROCESSES[p].grant_count = 0
+    var i: Int = 0
+    while i < rows {
+        unref_region_row(PROCESSES[p].grants[i].region)
+        i = i + 1
+    }
     if LAST_PROT_PROCESS == p {
         LAST_PROT_PROCESS = NO_PROCESS
     }
@@ -868,10 +920,18 @@ func mint_boot_regions(p: Int) unsafe {
                 // handle onto it, so the count starts at one rather than being
                 // incremented afterwards — a fresh slot's reference is not a
                 // change to a count, it IS the count.
+                // **A BOOT REGION IS A POOL ROOT, AND A ROOT NAMES ITSELF**
+                // (sawos design 28). This is the one place a pool is created:
+                // every other region in the system is a `Split` off one of
+                // these and carries this slot's index down the chain, which is
+                // what "return to ROOT" is made of. The ledger starts empty —
+                // nothing lent, nothing free but the cursor, nothing dropped.
                 MEMORIES[slot] = MemorySlot(state: SlotState.Live, process: p,
                                             base: row.base as UInt,
                                             len: row.len as UInt,
-                                            refs: 1)
+                                            refs: 1, maps: 0, root: slot,
+                                            free_head: 0, out_bytes: 0,
+                                            dropped: 0)
                 let handle = mint_handle(p, ObjType.Memory, memory_rights(), slot)
                 if handle == NO_HANDLE {
                     fatal_image("no handle table room for the boot regions", i)

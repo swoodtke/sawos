@@ -75,19 +75,29 @@ extension Memory {
     /// chose the number, and it knows what it has split off so far. A full slab
     /// or handle table is `SosStatus.NoResource`, which it could not have known.
     ///
-    /// THE PIECE IS PERMANENT UNTIL TEARDOWN, and it is worth being exact about
-    /// WHICH piece. **Free-on-last-reference LANDED in M3 unit 5** (sawos
-    /// design 7 D-1), so DROPPING the region that comes back returns its kernel
-    /// SLAB SLOT immediately — inside the release that took the count to zero,
-    /// no teardown involved — and credits the caller's Memory quota row. What
-    /// it does NOT return is the RANGE: quotas count OBJECTS and not bytes in
-    /// v1, and a front-cut parent is a one-way cursor that cannot absorb an
-    /// arbitrary hole, so those bytes belong to no pool afterwards. A pool
-    /// walked to its end stays walked. The consequence is the opposite of what
-    /// this note used to say: a loop that splits and discards no longer runs
-    /// out of SLOTS at all — `tests/memory-split` completes twenty rounds past
-    /// a slab of sixteen — it runs out of POOL. Stated here rather than
-    /// discovered.
+    /// **DROPPING THE PIECE GIVES BACK THE SLOT AND THE BYTES** (sawos design
+    /// 28, on design 25 D-5; M3 unit 5's design 7 D-1 landed the first half).
+    /// The release that takes a region's last reference to zero returns its
+    /// kernel SLAB SLOT and credits the caller's Memory quota row — and returns
+    /// its RANGE to the pool it was ultimately split from, where it coalesces
+    /// with its free neighbours and, if it touches the pool's unspent frontier,
+    /// folds back into it. A pool walked to its end and then released is a pool
+    /// again: `tests/memory-recycle` takes one to its last byte, gives the
+    /// pieces back out of order, and splits the whole thing out in one call.
+    ///
+    /// **THE LAST REFERENCE IS NOT ALWAYS THE LAST HANDLE**, which is the one
+    /// thing to know. §2.5 frees a region when the last reference of EITHER kind
+    /// drops, and an installed mapping is the other kind — so a region that is
+    /// still MAPPED somewhere keeps its bytes after every handle onto it is
+    /// gone, and they come home at the last `unmap` (or at the death of the
+    /// process whose domain holds the row). Dropping a region you have mapped
+    /// into a child is therefore safe and eventually tidy, rather than safe and
+    /// permanent as it was through M4.
+    ///
+    /// This note used to say the opposite in as many words — that a front-cut
+    /// parent cannot absorb an arbitrary hole, so the bytes belong to no pool
+    /// afterwards and a pool walked to its end stays walked. That was the honest
+    /// state of the system until this unit and is what the unit was for.
     public func split(&self, len: UInt) -> Result<Memory, SosStatus> {
         let raw = try call_value(self.handle, MemoryOp.Split as UInt, len, 0, 0)
         return Memory(handle: MemoryHandle(raw))

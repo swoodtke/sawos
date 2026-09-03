@@ -290,6 +290,12 @@ QUOTA_VS_WALL_PKG = os.path.join(TESTS_DIR, "quota-vs-wall")
 REFCOUNT_FREE_PKG = os.path.join(TESTS_DIR, "refcount-free")
 INTERRUPT_UNBIND_PKG = os.path.join(TESTS_DIR, "interrupt-unbind")
 MAPPING_SLOT_FREE_PKG = os.path.join(TESTS_DIR, "mapping-slot-free")
+
+# sawos design 28 (M5 unit 5): the real allocator. ONE root server, and it
+# borrows M3 unit 4's child (`child-touch`) rather than growing one of its own —
+# what leg 2 needs from a child is exactly what that one does, which is to mark
+# a page it was mapped and die.
+MEMORY_RECYCLE_PKG = os.path.join(TESTS_DIR, "memory-recycle")
 CHILD_QUOTA_PKG = os.path.join(TESTS_DIR, "child-quota")
 CHILD_MAPWALL_PKG = os.path.join(TESTS_DIR, "child-mapwall")
 
@@ -2533,18 +2539,29 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
-        # DESIGN 6's RECORDED DEVIATION, SHOWN RESOLVED, and §2.5's leak shown
-        # to be exactly what it always said it was.
+        # DESIGN 6's RECORDED DEVIATION, SHOWN RESOLVED — and, since M5 unit 5,
+        # §2.5's leak shown to be SMALLER than it always said it was.
         #
         # `rounds=12` is past `MAX_MAPPINGS` (8), so the slab is demonstrably
         # recycling — and past root's own ROW allowance too (its free rows,
         # five on the smaller profile), so `Unmap` is demonstrably crediting the
         # ledger as well as returning the row. One number carries both halves.
         #
-        # `husk wrote 0x5e read 94` is the other side: a Mapping dropped WITHOUT
-        # an unmap frees its slot and LEAVES its row, so the memory is still
-        # reachable through a grant no object names any more. That is §2.5's
-        # "permanent, safe-but-leaked", executed.
+        # **THE OTHER TWO LINES WERE RETARGETED BY SAWOS DESIGN 28**, which
+        # authorises this case's rows to move by name, and they are the ruled
+        # second-zero condition from both sides. `husk wrote 94 read 94`: every
+        # HANDLE on the region is destroyed and its bytes are still there, so
+        # the slot survived the handle drop — a kernel counting handles alone
+        # would have freed it with a protection row still reaching those bytes.
+        # `recycled read 94`: the unmap takes the last row, the range folds back
+        # into the pool's frontier, and the next split of the same size is the
+        # SAME PAGE — proven by the marker written through the first mapping and
+        # read through the second.
+        #
+        # What it used to assert with those numbers was narrower and is still
+        # true of the Mapping object itself: a Mapping dropped without an unmap
+        # frees its slot and leaves its row. What changed is that the RANGE no
+        # longer leaks with it.
         "name": "mapping_slot_free",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": MAPPING_SLOT_FREE_PKG,
@@ -2553,6 +2570,7 @@ TEST_CASES = [
                        "SOS: boot regions={one}",
                        "SOS mapfree: rounds=12 refused=0",
                        "SOS mapfree: husk wrote 94 read 94",
+                       "SOS mapfree: recycled read 94",
                        "SOS mapfree: done",
                        "SOS: process teardown"],
         "expect_clean_exit": True,
@@ -4404,6 +4422,54 @@ TEST_CASES = [
                        "SOS delegate3p: the answer crossed three processes",
                        "SOS delegate3p: middle=65607 far=65617",
                        "SOS delegate3p: done"],
+        "expect_clean_exit": True,
+    },
+    # =========================================================================
+    # M5 unit 5 — the real allocator: spent bytes come back (sawos design 28)
+    # =========================================================================
+    #
+    # ONE NEW CASE, and its sibling is a RETARGET: `mapping_slot_free` above now
+    # proves the second zero from the region's side (its slot survives a handle
+    # drop while a row counts against it, and the range returns at the last
+    # unmap). This one proves the pool itself, and is APPENDED rather than filed
+    # beside the M3 memory cases on purpose — the report is printed in
+    # case-definition order, so a case added at the end leaves every existing
+    # case's ordinal exactly where a reader of an older transcript left it.
+    {
+        # **THE PROOF THAT A POOL IS A POOL** (sawos design 28; design 25 D-5).
+        #
+        # `quarters=4` then `whole=1` is the allocator's whole arithmetic in two
+        # numbers: four 64 KiB pieces are the ENTIRE 256 KiB pool, they are
+        # released OUT OF ORDER — which forces the free list, two disjoint holes
+        # and a three-into-one merge rather than a tidy LIFO fold — and what
+        # comes out afterwards is ONE region the size of the pool. A cursor that
+        # had not taken all four back could not serve that split, and a `split`
+        # too big is a `BadArg` FAULT, so a kernel without pool returns dies on
+        # that line instead of printing a smaller number.
+        #
+        # `reused read 60` is the second zero across a process boundary, and it
+        # is the sharpest form of §2.5's sentence: root maps a page into a child
+        # and then destroys BOTH of its own objects — the Memory handle and the
+        # Mapping — leaving the child's protection ROW as the only reference to
+        # that region. The bytes come home at the child's TEARDOWN, and the mark
+        # read back is the child's own (`{touch_mark}`, the same byte
+        # `map_into_child` asserts from the other side).
+        #
+        # The child is `child-touch` unchanged: it writes its mark at the pool
+        # base and exits with it, which is exactly the witness this case needs.
+        "name": "memory_recycle",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MEMORY_RECYCLE_PKG,
+        "children": [CHILD_TOUCH_PKG],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS recycle: quarters=4",
+                       "SOS recycle: whole=1",
+                       "SOS childtouch: wrote 60 read 60",
+                       "SOS: process exit: code={touch_mark} process={one}",
+                       "SOS recycle: reused read 60",
+                       "SOS recycle: done"],
         "expect_clean_exit": True,
     },
 ]

@@ -62,6 +62,7 @@ import kcore.limits.{
     DEFAULT_QUOTA_TIMERS,
     DEFAULT_QUOTA_WAITERS,
     MAX_EVENTS,
+    MAX_FREE_RANGES,
     MAX_HANDLES,
     MAX_INTERRUPTS,
     MAX_IOMEMORIES,
@@ -72,6 +73,7 @@ import kcore.limits.{
     MAX_THREADS,
     MAX_TIMERS,
     MAX_WAITERS,
+    NO_FREE_RANGE,
     NO_IOMEMORY,
     NO_MAPPING,
     NO_MEMORY,
@@ -879,12 +881,27 @@ public(package) func mint_refusal(p: Int) unsafe -> SosStatus {
 // process frees what it owned, so the storage has to be reachable from the
 // teardown.
 
-/// One Memory object: a range of physical memory, and whose it is.
+/// One Memory object: a range of physical memory, whose it is, and — since
+/// sawos design 28 — which POOL the bytes came out of.
 ///
 /// `len` rather than a top address, because that is the shape the region table
-/// carries and the shape a pool will hand out. The kernel computes the top
+/// carries and the shape a pool hands out. The kernel computes the top
 /// where it needs one, with the bound test ordered so the addition cannot
 /// overflow — the loader's own discipline.
+///
+/// **TWO COUNTS, AND THE RANGE GOES BACK AT THE SECOND ZERO** (sawos design 28;
+/// design 25 D-5, ruled). §2.5 has always said a region is "freed only when the
+/// LAST reference of either kind — any MemoryObject handle OR any Mapping —
+/// drops", and until this unit only the first kind was counted: `refs` reached
+/// zero, the slot came back, and the RANGE returned to nobody. `maps` is the
+/// second kind, and the two together are that sentence executed.
+///
+/// **THREE FIELDS ARE THE POOL'S AND ARE MEANINGFUL ONLY ON A ROOT.** A pool is
+/// not a fourth object kind: it is the boot-minted region every derived region
+/// points back at, so its ledger lives on its own slot rather than in a table
+/// that would have to be kept in step with this one. `free_head`, `out_bytes`
+/// and `dropped` read as zero on every derived region and nothing asks them
+/// there.
 public(package) struct MemorySlot {
     public(package) state: SlotState,
     public(package) process: Int,
@@ -892,10 +909,56 @@ public(package) struct MemorySlot {
     public(package) len: UInt,
     /// How many handle entries name this region (sawos design 7 D-1).
     public(package) refs: UInt16,
+    /// How many INSTALLED GRANT ROWS name this region (sawos design 28) — the
+    /// SECOND of §2.5's two reference kinds.
+    ///
+    /// **IT COUNTS ROWS, NOT `Mapping` OBJECTS, and that is the load-bearing
+    /// choice** (design 28's bookkeeping, which design 25 D-5 left to the
+    /// implementation). A Mapping object and its row have different lifetimes —
+    /// design 7 D-2's husk arm frees the slot and LEAVES the row installed — so
+    /// counting objects would lose the row that is still granting these bytes
+    /// the moment its last handle went. A row cannot vanish unwitnessed: it is
+    /// born in `record_grant` and dies in `remove_grant` or `clear_domain`, and
+    /// those three sites are where this count moves. That is also why the
+    /// back-reference rides the GRANT ROW rather than the Mapping slot — one
+    /// ledger, kept where the thing it counts actually lives (design 7's
+    /// doctrine).
+    public(package) maps: UInt16,
+    /// The POOL ROOT these bytes belong to: a boot-minted region names ITSELF,
+    /// and a split carries its parent's answer down (sawos design 28; design 25
+    /// D-5's ruled RETURN TO ROOT).
+    ///
+    /// THE DERIVATION CHAIN IS A CURSOR ARTIFACT, NOT AN OWNERSHIP TREE — the
+    /// ruling's own words. A piece cut from a piece returns to the POOL, not to
+    /// the intermediate cursor it happened to be cut from, so one back-reference
+    /// is the whole of the new per-object state.
+    public(package) root: Int,
+    /// ROOT-ONLY: the head of this pool's free list — node index + 1, 0 empty.
+    public(package) free_head: Int,
+    /// ROOT-ONLY: bytes handed out of this pool and not yet returned.
+    ///
+    /// **THE PAIR WITH `pool_free_bytes` IS §5.9's "BYTE ACCOUNTING"** and is
+    /// the pool's own ledger: outstanding here, free there. Quotas STAY
+    /// object-counted (design 25 D-5, ruled) — bytes are the pool's business,
+    /// not a per-process authority — and there is no op to read this in v1. It
+    /// is not decoration: it is the third count in a ROOT's release condition
+    /// (see `memory_release_if_idle`), which is what keeps a derived region's
+    /// back-reference from ever naming a slot that has been given away.
+    public(package) out_bytes: UInt,
+    /// ROOT-ONLY: bytes LOST to free-node exhaustion, never silently.
+    ///
+    /// **RELEASE IS INFALLIBLE** (design 28): a range that finds no node after
+    /// coalescing is leaked and COUNTED here, because the alternative — refusing
+    /// a release — would mean an object that cannot be given up. Reaching this
+    /// takes a pool fragmented into more than `MAX_FREE_RANGES` holes; it is
+    /// zero in this tree.
+    public(package) dropped: UInt,
 }
 
 public(package) unsafe static var MEMORIES: [MemorySlot; MAX_MEMORIES] = [
-    MemorySlot(state: SlotState.Free, process: 0, base: 0, len: 0, refs: 0);
+    MemorySlot(state: SlotState.Free, process: 0, base: 0, len: 0, refs: 0,
+               maps: 0, root: NO_MEMORY, free_head: 0, out_bytes: 0,
+               dropped: 0);
     MAX_MEMORIES]
 
 /// Take a free Memory slot, or `NO_MEMORY` when the slab is full.
@@ -909,6 +972,414 @@ public(package) func alloc_memory() unsafe -> Int {
         i = i + 1
     }
     NO_MEMORY
+}
+
+// -----------------------------------------------------------------------------
+// THE POOL: spent bytes come back (spec §2.5, §5.9; sawos design 28, on design
+// 25 D-5 as ruled)
+// -----------------------------------------------------------------------------
+//
+// **WHAT WAS WRONG.** A RAM pool was a one-way front-cut cursor. `Split` took
+// the front of the parent's range and the parent advanced past it; a freed
+// region gave back its SLAB SLOT (design 7 D-1) and its BYTES to nobody, so a
+// system with process churn leaked physical RAM permanently. §2.5 recorded the
+// deferral honestly and the §5.9 pin has waited on "a real allocator" since M1.
+//
+// **THE WHOLE MECHANISM IS FOUR SENTENCES.** A region knows its pool root. When
+// both of its counts are zero its range goes back to that root. A returned range
+// COALESCES with its free neighbours, and one that touches the root's unspent
+// frontier folds back into the cursor — which is what lets a fully-freed pool
+// return to its boot state. A `Split` takes the FIRST FIT off the free list and
+// falls back to the cursor.
+//
+// **THE CURSOR STAYS, and is not a legacy path.** It is the empty-free-list fast
+// path, it is what a fresh pool is, and the fold-back is what makes "spent bytes
+// come back" observable as the pool becoming whole again rather than as a list
+// nobody can see. A cut-and-drop loop therefore allocates and frees the SAME
+// range forever and never touches a node at all.
+//
+// **ONLY A ROOT DRAWS ON THE LIST**, and that is an authority statement rather
+// than an optimisation. A derived region names exactly its own range; serving
+// its `Split` out of the pool's list would hand its holder bytes it never had.
+// A pool ROOT is different in kind — it names the POOL, its cut ranges are on
+// loan, and a returned loan is the pool's again, which is precisely what the
+// fold-back does to its `base`/`len` in the ordinary case.
+//
+// **IoMemory IS UNTOUCHED** — §5.9's own carve-out, stated where the mechanism
+// is. A carve leaves the parent whole, MMIO is pinned, nothing is ever placed in
+// those bytes and nothing is ever returned; the slab above has no pool and needs
+// none.
+
+/// One free range on a pool's list: where it is, how big, and what follows it.
+///
+/// The list is kept SORTED BY BASE, which is what makes coalescing two
+/// comparisons against the immediate neighbours instead of a scan, and first-fit
+/// a walk that stops.
+public(package) struct FreeRange {
+    public(package) state: SlotState,
+    public(package) base: UInt,
+    public(package) len: UInt,
+    /// The next node of this pool's list — node index + 1, 0 = end.
+    ///
+    /// Index + 1 rather than a `-1` sentinel because that is the spelling every
+    /// other list in this kernel uses (`WaiterSlot.attached`, an attachment's
+    /// `link`), and a zeroed slab is then an empty list by construction.
+    public(package) next: Int,
+}
+
+unsafe static var FREE_RANGES: [FreeRange; MAX_FREE_RANGES] = [
+    FreeRange(state: SlotState.Free, base: 0, len: 0, next: 0); MAX_FREE_RANGES]
+
+/// Take a free node, or `NO_FREE_RANGE` when the slab is full.
+func alloc_free_range() unsafe -> Int {
+    var i: Int = 0
+    while i < MAX_FREE_RANGES {
+        match FREE_RANGES[i].state {
+            case Free -> { return i },
+            case Live -> {},
+        }
+        i = i + 1
+    }
+    NO_FREE_RANGE
+}
+
+/// Give one node back.
+func free_free_range(n: Int) unsafe {
+    FREE_RANGES[n] = FreeRange(state: SlotState.Free, base: 0, len: 0, next: 0)
+}
+
+/// The bytes pool `root` has ready to hand out: its unspent frontier plus every
+/// free range on its list.
+///
+/// **THE OTHER HALF OF THE LEDGER** — `out_bytes` is what is on loan, this is
+/// what is home, and `dropped` is what was lost. Together they are §5.9's byte
+/// accounting; nothing in v1 reads them out to userspace, and an op could front
+/// them later without a surface break (the design-16 pattern).
+public(package) func pool_free_bytes(root: Int) unsafe -> UInt {
+    var total = MEMORIES[root].len
+    var cur = MEMORIES[root].free_head
+    while cur != 0 {
+        let n = cur - 1
+        total = total + FREE_RANGES[n].len
+        cur = FREE_RANGES[n].next
+    }
+    total
+}
+
+/// Can region `slot` serve a cut of `len` bytes — from its own cursor, or (for a
+/// pool root) from one range on its free list?
+///
+/// **THIS IS THE `Split` REFUSAL, AND IT IS STILL ONE SERVING** — the question is
+/// not "does this pool hold `len` bytes in total" but "can it hand them out in
+/// ONE range", which is what a region IS. A pool holding two non-adjacent halves
+/// of the ask answers no, and that is fragmentation rather than exhaustion.
+public(package) func pool_can_serve(slot: Int, len: UInt) unsafe -> Bool {
+    if MEMORIES[slot].len >= len {
+        return true
+    }
+    if MEMORIES[slot].root != slot {
+        return false
+    }
+    var cur = MEMORIES[slot].free_head
+    while cur != 0 {
+        let n = cur - 1
+        if FREE_RANGES[n].len >= len {
+            return true
+        }
+        cur = FREE_RANGES[n].next
+    }
+    false
+}
+
+/// Cut `len` bytes out of region `slot` and answer where they are.
+///
+/// FIRST FIT FIRST, CURSOR SECOND (design 25 D-5's ruled policy; the free list is
+/// short and coalescing does the real work). Taking the list first is also what
+/// keeps the frontier unspent for as long as possible, so a pool that is being
+/// recycled stays whole at its top edge instead of fragmenting outward.
+///
+/// The caller has asked `pool_can_serve` and been told yes — `install_row`'s
+/// shape, and for the same reason: a wall reached with the check passed is the
+/// kernel's bug and not the caller's, so it stops the machine rather than
+/// inventing a status.
+public(package) func pool_cut(slot: Int, len: UInt) unsafe -> UInt {
+    let root = MEMORIES[slot].root
+    if root == slot {
+        var prev: Int = NO_FREE_RANGE
+        var cur = MEMORIES[slot].free_head
+        while cur != 0 {
+            let n = cur - 1
+            if FREE_RANGES[n].len >= len {
+                // THE FRONT OF THE HOLE, exactly as the cursor hands out its
+                // own front — one arithmetic shape for both sources.
+                let base = FREE_RANGES[n].base
+                FREE_RANGES[n].base = base + len
+                FREE_RANGES[n].len = FREE_RANGES[n].len - len
+                if FREE_RANGES[n].len == 0 {
+                    if prev == NO_FREE_RANGE {
+                        MEMORIES[slot].free_head = FREE_RANGES[n].next
+                    } else {
+                        FREE_RANGES[prev].next = FREE_RANGES[n].next
+                    }
+                    free_free_range(n)
+                }
+                MEMORIES[root].out_bytes = MEMORIES[root].out_bytes + len
+                return base
+            }
+            prev = n
+            cur = FREE_RANGES[n].next
+        }
+    }
+    if MEMORIES[slot].len < len {
+        fatal_kernel("a split cut bytes its region does not have", len)
+        // `fatal_kernel` stops the machine but is not declared `-> Never`
+        // (design 6's finding 4), so the scope has to exit itself.
+        return 0
+    }
+    let base = MEMORIES[slot].base
+    MEMORIES[slot].base = base + len
+    MEMORIES[slot].len = MEMORIES[slot].len - len
+    // **BYTES LEAVE THE POOL ONLY AT THE ROOT.** A cut from a DERIVED region
+    // moves bytes that are already on loan from one holder to another, so the
+    // ledger does not move — and the books still balance, because each piece
+    // returns its own length and the parent returns whatever its cursor has
+    // left.
+    if root == slot {
+        MEMORIES[root].out_bytes = MEMORIES[root].out_bytes + len
+    }
+    base
+}
+
+/// Put `[base, base + len)` back on pool `root`'s free list, coalescing.
+///
+/// THE INSERT IS THE COALESCE. A range that touches the free neighbour below it
+/// grows that node; one that touches the neighbour above it grows that one; one
+/// that touches both merges three into one and gives a node back. Only a range
+/// with free space on neither side needs a node of its own, which is why the
+/// list is as long as the pool is FRAGMENTED rather than as long as it is busy.
+func pool_insert_range(root: Int, base: UInt, len: UInt) unsafe {
+    var prev: Int = NO_FREE_RANGE
+    var cur = MEMORIES[root].free_head
+    while cur != 0 {
+        let n = cur - 1
+        if FREE_RANGES[n].base > base {
+            break
+        }
+        prev = n
+        cur = FREE_RANGES[n].next
+    }
+    let next = if cur == 0 { NO_FREE_RANGE } else { cur - 1 }
+
+    var b = base
+    var l = len
+    var into: Int = NO_FREE_RANGE
+    if prev != NO_FREE_RANGE {
+        if FREE_RANGES[prev].base + FREE_RANGES[prev].len == b {
+            FREE_RANGES[prev].len = FREE_RANGES[prev].len + l
+            b = FREE_RANGES[prev].base
+            l = FREE_RANGES[prev].len
+            into = prev
+        }
+    }
+    if next != NO_FREE_RANGE {
+        if b + l == FREE_RANGES[next].base {
+            if into == NO_FREE_RANGE {
+                FREE_RANGES[next].base = b
+                FREE_RANGES[next].len = FREE_RANGES[next].len + l
+                into = next
+            } else {
+                // THREE INTO ONE, and the node in the middle comes back.
+                FREE_RANGES[into].len = FREE_RANGES[into].len + FREE_RANGES[next].len
+                FREE_RANGES[into].next = FREE_RANGES[next].next
+                free_free_range(next)
+            }
+        }
+    }
+    if into != NO_FREE_RANGE {
+        return
+    }
+
+    let n = alloc_free_range()
+    if n == NO_FREE_RANGE {
+        // **LEAK IT HONESTLY** (design 28). A release cannot fail: an object
+        // whose last reference cannot be given up is worse than a hole in a
+        // pool, and a silent hole is worse than a counted one.
+        MEMORIES[root].dropped = MEMORIES[root].dropped + l
+        return
+    }
+    FREE_RANGES[n] = FreeRange(state: SlotState.Live, base: b, len: l, next: cur)
+    if prev == NO_FREE_RANGE {
+        MEMORIES[root].free_head = n + 1
+    } else {
+        FREE_RANGES[prev].next = n + 1
+    }
+}
+
+/// Fold the free range that touches pool `root`'s unspent frontier back INTO the
+/// cursor.
+///
+/// **THIS IS WHAT MAKES A FULLY-FREED POOL WHOLE AGAIN** — the cleanest possible
+/// proof that spent bytes come back, and the reason the cursor survives the
+/// allocator rather than being replaced by it.
+///
+/// ONLY THE LAST NODE CAN TOUCH IT: bytes are cut from the FRONT, so every range
+/// ever handed out lies below the frontier, and the list is sorted. And only ONE
+/// pass is needed, because the coalescing invariant leaves no two free ranges
+/// adjacent — the node below the one just absorbed cannot also be touching.
+func pool_fold_frontier(root: Int) unsafe {
+    var prev: Int = NO_FREE_RANGE
+    var cur = MEMORIES[root].free_head
+    while cur != 0 {
+        let n = cur - 1
+        if FREE_RANGES[n].next == 0 {
+            if FREE_RANGES[n].base + FREE_RANGES[n].len == MEMORIES[root].base {
+                MEMORIES[root].base = FREE_RANGES[n].base
+                MEMORIES[root].len = MEMORIES[root].len + FREE_RANGES[n].len
+                if prev == NO_FREE_RANGE {
+                    MEMORIES[root].free_head = 0
+                } else {
+                    FREE_RANGES[prev].next = 0
+                }
+                free_free_range(n)
+            }
+            return
+        }
+        prev = n
+        cur = FREE_RANGES[n].next
+    }
+}
+
+/// Give `[base, base + len)` back to pool `root`, and take it off the loan
+/// ledger.
+func pool_return(root: Int, base: UInt, len: UInt) unsafe {
+    if len == 0 {
+        return
+    }
+    // A POOL THAT IS NOT THERE IS A KERNEL BUG, not a case to handle: a root's
+    // own release refuses while any of its bytes are out (see
+    // `memory_release_if_idle`), so every live back-reference names a live pool.
+    match MEMORIES[root].state {
+        case Live -> {},
+        case Free -> {
+            fatal_kernel("a region returned its range to a pool that is gone",
+                         root as UInt)
+            return
+        },
+    }
+    if MEMORIES[root].out_bytes < len {
+        fatal_kernel("a pool got back more bytes than it ever lent", len)
+        return
+    }
+    MEMORIES[root].out_bytes = MEMORIES[root].out_bytes - len
+    pool_insert_range(root, base, len)
+    pool_fold_frontier(root)
+}
+
+/// Give every node of pool `root`'s free list back to the slab.
+///
+/// Reached only when the pool ITSELF is going, which in this tree never happens:
+/// root servers hold the boot-minted regions for the machine's life. The bytes
+/// those nodes described die with the pool — there is nothing left to hold them
+/// — and that is the honest behaviour to state rather than a branch to test.
+func pool_drop_nodes(root: Int) unsafe {
+    var cur = MEMORIES[root].free_head
+    while cur != 0 {
+        let n = cur - 1
+        let next = FREE_RANGES[n].next
+        free_free_range(n)
+        cur = next
+    }
+    MEMORIES[root].free_head = 0
+}
+
+/// A grant row now names region `region`. Count it.
+///
+/// `NO_MEMORY` is the ordinary case rather than an error: an image segment's
+/// row, a stack row and a DEVICE row all name no region, and taking that arm
+/// here is what keeps the three call sites in `process` unconditional.
+public(package) func ref_region_row(region: Int) unsafe {
+    if region == NO_MEMORY {
+        return
+    }
+    MEMORIES[region].maps = MEMORIES[region].maps + 1
+}
+
+/// A grant row that named region `region` is GONE — from an `Unmap` or from the
+/// target's teardown. Count it out, and release the region if that was its
+/// second zero.
+public(package) func unref_region_row(region: Int) unsafe {
+    if region == NO_MEMORY {
+        return
+    }
+    if MEMORIES[region].maps == 0 {
+        // THE INVARIANT WRITTEN DOWN: a region does not free while a row names
+        // it, so no row can outlive the slot it points at and be found here.
+        fatal_kernel("a grant row was removed from a region with no rows",
+                     region as UInt)
+        return
+    }
+    MEMORIES[region].maps = MEMORIES[region].maps - 1
+    memory_release_if_idle(region)
+}
+
+/// **THE SECOND ZERO** (design 25 D-5, ruled; sawos design 28). Give region
+/// `slot` back — its range to its pool and its slot to the slab — if and only if
+/// NOTHING names it any more: no handle, and no installed row.
+///
+/// §2.5's refcount sentence, finally executed as written. The two counts are
+/// independent and either one may reach zero first:
+///
+///   - handles first: a mapped-but-unreferenced region is a HUSK. Its slot
+///     stays out of the slab and its charge stays on its creator's ledger,
+///     because the object still exists — a row is still granting its bytes to
+///     somebody. §2.5's "dropped without unmap = permanent, safe-but-leaked"
+///     narrows here to "leaked until the TARGET PROCESS's teardown", and that
+///     teardown RECYCLES.
+///   - rows first: the ordinary `Unmap` before a release, which frees at the
+///     handle drop exactly as it did before this unit.
+///
+/// **A POOL ROOT HAS A THIRD COUNT**, and it is `out_bytes`. A root whose own
+/// handles and rows are gone still cannot be given away while pieces of it are
+/// on loan: every one of those pieces carries a back-reference to this slot, and
+/// a slot handed to the next `Split` would make those references name a
+/// stranger. So the root waits for its own bytes, and the last piece to come
+/// home is what releases it — through the tail call below, which is the only
+/// recursion here and is one level deep by construction (a root's root is
+/// itself). UNREACHABLE IN THIS TREE: root servers hold the boot-minted regions
+/// for the machine's life, so no pool has ever gone away. Written for the day
+/// one does, and stated rather than tested.
+public(package) func memory_release_if_idle(slot: Int) unsafe {
+    match MEMORIES[slot].state {
+        case Free -> { return },
+        case Live -> {},
+    }
+    if MEMORIES[slot].refs != 0 {
+        return
+    }
+    if MEMORIES[slot].maps != 0 {
+        return
+    }
+    let root = MEMORIES[slot].root
+    if root == slot {
+        if MEMORIES[slot].out_bytes != 0 {
+            return
+        }
+        pool_drop_nodes(slot)
+    } else {
+        // THE ROW IS ALREADY GONE BY THE TIME THE BYTES MOVE, and the order is
+        // the contract: `remove_grant`/`clear_domain` take the row out of the
+        // record BEFORE they drop this count, so a range can never be handed to
+        // a new owner while a domain still grants it to the old one.
+        pool_return(root, MEMORIES[slot].base, MEMORIES[slot].len)
+    }
+    let owner = MEMORIES[slot].process
+    MEMORIES[slot] = MemorySlot(state: SlotState.Free, process: 0, base: 0,
+                                len: 0, refs: 0, maps: 0, root: NO_MEMORY,
+                                free_head: 0, out_bytes: 0, dropped: 0)
+    quota_credit(owner, QuotaKind.Memory)
+    if root != slot {
+        memory_release_if_idle(root)
+    }
 }
 
 // =============================================================================

@@ -24,7 +24,7 @@ import imgformat.{SosimgHeader, SosimgSeg, SegFlag, fits_target_word}
 import kcore.mem.{align_up}
 import kcore.diag.{console, fatal_image}
 import kcore.preempt.{long_copy, long_zero}
-import kcore.limits.{ROOT_PROCESS}
+import kcore.limits.{NO_MEMORY, ROOT_PROCESS}
 import kcore.process.{load_domain, record_grant, start_process}
 
 /// What a refused too-high address REPORTS: its top 32 bits. The low half is
@@ -403,8 +403,21 @@ public(package) func image_prio_map(img_base: UInt) unsafe -> UInt {
 /// is current, so the tick charges no slice; no Timer object exists before root
 /// runs, so expiry walks a table of free slots; and the reprogramming it ends
 /// with is the same one the idle path does.
+/// **`region` IS THE `Memory` THE DESTINATION IS, OR `NO_MEMORY`** (sawos design
+/// 28), and it is what keeps a running process's own memory from being handed to
+/// somebody else. A placed segment and the stack grant live IN the destination
+/// region's bytes, so their rows are references on it under the second-zero rule
+/// — which means a launcher that releases its handle on a child's memory while
+/// the child is still running leaves a husk rather than a range on the free
+/// list. The bytes come back when the child dies and its rows go, which is the
+/// same recycling every other row does, one object larger.
+///
+/// The BOOT path passes `NO_MEMORY`: root's image is placed at a HAL constant,
+/// into memory no `Memory` object ever names. A DEVICE segment passes it too —
+/// those bytes are registers somewhere else entirely, and `process_create`
+/// refuses one from a child image anyway.
 public(package) func place_image(p: Int, img_base: UInt,
-                                 dest: &LoadRegion) unsafe -> UInt {
+                                 dest: &LoadRegion, region: Int) unsafe -> UInt {
     let header_len = sizeof<SosimgHeader>() as UInt
     let seg_len = sizeof<SosimgSeg>() as UInt
     let seg_count = image_seg_count(img_base)
@@ -429,7 +442,8 @@ public(package) func place_image(p: Int, img_base: UInt,
         // would stretch the copy-out window from the device page to the top of
         // the region and make `copy_out`'s check accept most of the machine.
         if seg.is_device_grant() {
-            record_grant(p, load_addr, load_addr + mem_len, seg.flags, true)
+            record_grant(p, load_addr, load_addr + mem_len, seg.flags, true,
+                         NO_MEMORY)
         } else {
             long_copy(load_addr, img_base + (seg.file_off as UInt), file_len)
             long_zero(load_addr + file_len, mem_len - file_len)
@@ -440,7 +454,7 @@ public(package) func place_image(p: Int, img_base: UInt,
             // with nothing in between.
             record_grant(p, load_addr,
                          align_up(load_addr + mem_len, hal.PROT_GRAIN),
-                         seg.flags, false)
+                         seg.flags, false, region)
             if (seg.flags & (SegFlag.Write as UInt8)) != 0 && load_addr < rw_base {
                 rw_base = load_addr
             }
@@ -451,7 +465,8 @@ public(package) func place_image(p: Int, img_base: UInt,
     // The stack is the kernel's grant, not the image's: a program asks for code
     // and data, the kernel decides where it runs.
     record_grant(p, dest.top - dest.stack_len, dest.top,
-                 (SegFlag.Read as UInt8) | (SegFlag.Write as UInt8), false)
+                 (SegFlag.Read as UInt8) | (SegFlag.Write as UInt8), false,
+                 region)
     rw_base
 }
 
@@ -497,7 +512,7 @@ public func load_root_and_enter() unsafe {
     // be a process the scheduler could switch away from and never back into.
     // The device-window row is in there too, which is what keeps a driver
     // image's window across a switch.
-    let rw_base = place_image(ROOT_PROCESS, base, &dest)
+    let rw_base = place_image(ROOT_PROCESS, base, &dest, NO_MEMORY)
     load_domain(ROOT_PROCESS)
 
     // spec §7: root's band map applies verbatim from its image. D3 keeps the

@@ -135,7 +135,6 @@ import kcore.objects.{
     MAPPINGS,
     MEMORIES,
     MappingSlot,
-    MemorySlot,
     NO_EXCHANGE,
     NO_ROW,
     PIPES,
@@ -163,6 +162,7 @@ import kcore.objects.{
     take_staged,
     handle_word_index,
     lookup_handle,
+    memory_release_if_idle,
     mint_handle,
     mint_refusal,
     msg_word_at,
@@ -713,14 +713,26 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
             quota_credit(owner, QuotaKind.Timer)
         },
         case Memory -> {
-            // THE SLOT COMES BACK; THE RANGE GOES NOWHERE. A front-cut parent
-            // cannot absorb an arbitrary hole, so the bytes stay spent until
-            // an allocator exists to spend them again (design 6 D-2; §2.5's
-            // narrowing).
-            let owner = MEMORIES[slot].process
-            MEMORIES[slot] = MemorySlot(state: SlotState.Free, process: 0,
-                                        base: 0, len: 0, refs: 0)
-            quota_credit(owner, QuotaKind.Memory)
+            // **THE RANGE GOES BACK, AND THE SLOT GOES WITH IT — AT THE SECOND
+            // ZERO** (sawos design 28; design 25 D-5, ruled). What stood here
+            // was "the slot comes back; the range goes nowhere": a front-cut
+            // parent could not absorb an arbitrary hole, so the bytes stayed
+            // spent (design 6 D-2, §2.5's narrowing). There is a pool now, and
+            // the release is one call because the CONDITION is not this
+            // function's to decide.
+            //
+            // **THIS ARM NO LONGER ALWAYS FREES**, which is the one thing to
+            // know about it. Reaching `free_object` means the HANDLE count hit
+            // zero; §2.5 frees a region only when the last reference of EITHER
+            // kind drops, and an installed grant row is the other kind. So a
+            // mapped-but-unreferenced region stays Live here — a husk that
+            // still holds its slot and its charge because a domain is still
+            // granting its bytes — and `unref_region_row` frees it when the
+            // last row goes. The two callers are indifferent: `unref_object`
+            // asks nothing about what happened, and `reap_unreferenced`'s
+            // "give back what nobody names" is exactly the question this
+            // answers, because a row is a namer.
+            memory_release_if_idle(slot)
         },
         case IoMemory -> {
             // MMIO IS PINNED, so this touches no hardware whatever: the

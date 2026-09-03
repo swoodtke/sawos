@@ -182,6 +182,8 @@ import kcore.objects.{
     alloc_memory,
     alloc_exchange,
     alloc_pipe,
+    pool_can_serve,
+    pool_cut,
     staged_count,
     table_room,
     boot_handle_cursor,
@@ -762,7 +764,15 @@ func process_create(p: Int, image_handle: UInt,
     }
 
     // Only now does anything happen to the destination region.
-    let rw_base = place_image(slot, img_base, &dest)
+    //
+    // **AND THE ROWS IT RECORDS COUNT AGAINST THAT REGION** (sawos design 28).
+    // A child's image and stack live in `dst`'s bytes, so they are references on
+    // it in exactly the sense §2.5 means: a launcher may release its own handle
+    // on a child's memory, and the range does not go back on the pool's free
+    // list while a process is running in it. It goes back when the child dies —
+    // which is a whole process's memory returning to the pool at its teardown,
+    // and is the largest thing this unit recycles.
+    let rw_base = place_image(slot, img_base, &dest, dst)
 
     PROCESSES[slot].state = ProcessState.Created
     // A CHILD'S TABLE STARTS EMPTY AND `give` IS WHAT FILLS IT (sawos design 4).
@@ -2342,8 +2352,14 @@ func map_target(p: Int, handle: UInt) unsafe -> Int {
 /// **AND THE LIVE-DOMAIN RULE IS OBEYED AT THE END** (`domain_changed`): an
 /// edit to the running process's record would otherwise never be installed at
 /// all, because the scheduler skips equal domains.
+///
+/// **`region` IS WHICH `Memory` THESE BYTES ARE** (sawos design 28), or
+/// `NO_MEMORY` for a device window — an IoMemory is pinned and its range is
+/// never returned to anybody (§5.9's carve-out). `record_grant` counts the row
+/// against the region, and that count is half of the release condition §2.5 has
+/// always described.
 func install_row(p: Int, t: Int, base: UInt, top: UInt, perms: UInt8,
-                 device: Bool) unsafe -> SyscallResult {
+                 device: Bool, region: Int) unsafe -> SyscallResult {
     // THE TARGET IS CHARGED, NOT THE CALLER — D-3's one ruled exception to
     // creator-pays. What a mapping consumes is the target's grant-row budget,
     // and charging the caller would let a launcher's own allowance gate how big
@@ -2371,7 +2387,7 @@ func install_row(p: Int, t: Int, base: UInt, top: UInt, perms: UInt8,
     // all-or-nothing shape, and here it matters more: a half-installed row is a
     // protection domain that disagrees with its own record.
     let row = PROCESSES[t].grant_count
-    record_grant(t, base, top, perms, device)
+    record_grant(t, base, top, perms, device, region)
     MAPPINGS[slot] = MappingSlot(state: SlotState.Live, process: p, target: t,
                                  row: row, refs: 1)
     quota_charge(t, QuotaKind.Mapping)
@@ -2394,14 +2410,33 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
         // (sawos design 6 D-2). Allocation is repeated front-splits, so the
         // parent IS the pool cursor and nothing else has to be remembered.
         //
+        // **AND SINCE M5 UNIT 5 THE POOL HANDS BACK WHAT IT GOT BACK** (sawos
+        // design 28; design 25 D-5). A pool ROOT serves a cut from its free
+        // list first and its cursor second, so the "one cut from the front"
+        // sentence above is now the FALLBACK rather than the whole story —
+        // what has not changed is that a region is one contiguous range and a
+        // caller supplies no addresses.
+        //
         // THREE CALLER-CHECKABLE REFUSALS, all `BadArg` faults. A `len` of
-        // zero: a region naming no bytes is not a region. A `len` past what
-        // the parent holds: the caller knows what it has split off so far, and
-        // a split that silently clamped would hand back a region smaller than
-        // the number in the call. And a MISALIGNED `len`: a grant covers whole
-        // units of the target's protection granularity, so a cut mid-unit
-        // would leave a remainder that could never be mapped without granting
-        // the piece before it too.
+        // zero: a region naming no bytes is not a region. A `len` this region
+        // cannot serve in ONE range (`pool_can_serve`): the caller knows what
+        // it has split off and what it has given back, and a split that
+        // silently clamped would hand back a region smaller than the number in
+        // the call. And a MISALIGNED `len`: a grant covers whole units of the
+        // target's protection granularity, so a cut mid-unit would leave a
+        // remainder that could never be mapped without granting the piece
+        // before it too.
+        //
+        // **THE SECOND REFUSAL'S ARGUMENT NARROWED HERE AND THE ANSWER DID NOT
+        // MOVE**, which is worth saying out loud (design 28's recorded
+        // finding). With a free list, a pool can hold the bytes and still be
+        // unable to serve them in one range — FRAGMENTATION, which the caller
+        // cannot compute and which is therefore not, strictly, its mistake.
+        // The fault stays anyway in v1: the vocabulary for "the machine cannot
+        // right now" is `NoResource`, it already exists, and moving this
+        // refusal onto it is a behaviour change that belongs to the unit that
+        // wants it rather than to the one that made fragmentation possible.
+        // Every caller in this tree asks for what it can account for.
         //
         // Slab exhaustion is `NoResource`, a STATUS, because a caller cannot
         // know how many slots are left — and since unit 5 it is a HARDER wall
@@ -2415,7 +2450,7 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
                 fault_process(p, FaultReason.AccessDenied)
             }
             let len = arg0
-            if len == 0 || len > MEMORIES[obj.slot].len {
+            if len == 0 || not pool_can_serve(obj.slot, len) {
                 fault_process(p, FaultReason.BadArg)
             }
             if (len % hal.PROT_GRAIN) != 0 {
@@ -2432,16 +2467,24 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
             if handle == NO_HANDLE {
                 return op_status(mint_refusal(p))
             }
-            // The cut, once both allocations are behind us. The child takes the
-            // front and the parent advances past it; a parent split down to
-            // zero is representable and simply refuses every later split, which
-            // is the honest end of a cursor.
-            let base = MEMORIES[obj.slot].base
+            // The cut, once both allocations are behind us — FIRST FIT off the
+            // pool's free list, else the front-cut cursor, and `pool_cut` is
+            // where that choice lives (sawos design 28). The child takes the
+            // front of whichever range served it; a parent split down to zero
+            // is representable and simply refuses every later split, which is
+            // the honest end of a cursor.
+            //
+            // **AND THE CHILD CARRIES THE ROOT DOWN** (design 25 D-5's ruled
+            // return-to-root). Its bytes go back to the POOL when both of its
+            // counts reach zero, not to this parent — the derivation chain is a
+            // cursor artifact, not an ownership tree — so one field is the whole
+            // of the new per-object state.
+            let base = pool_cut(obj.slot, len)
             MEMORIES[slot] = MemorySlot(state: SlotState.Live, process: p,
-                                        base: base, len: len, refs: 1)
+                                        base: base, len: len, refs: 1, maps: 0,
+                                        root: MEMORIES[obj.slot].root,
+                                        free_head: 0, out_bytes: 0, dropped: 0)
             quota_charge(p, QuotaKind.Memory)
-            MEMORIES[obj.slot].base = base + len
-            MEMORIES[obj.slot].len = MEMORIES[obj.slot].len - len
             op_value(handle)
         },
         // **INSTALL THIS REGION IN A DOMAIN, AND ANSWER WITH THE MAPPING.**
@@ -2495,7 +2538,7 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
             if not hal.map_target_ok(base, top) {
                 fault_process(p, FaultReason.BadArg)
             }
-            install_row(p, t, base, top, grant_perms(access), false)
+            install_row(p, t, base, top, grant_perms(access), false, obj.slot)
         },
     }
 }
@@ -2580,8 +2623,12 @@ func iomemory_op_decoded(op: IoMemoryOp, obj: &IoMemoryObject, arg0: UInt,
             // own device path is what actually decides the attribute, so this
             // says READ|WRITE and nothing about caching — which is the split
             // the seam has had since M2.
+            // `NO_MEMORY`: MMIO IS PINNED, so a device row counts against no
+            // region and returns no bytes when it goes (sawos design 28,
+            // §5.9's own carve-out).
             install_row(p, t, base, base + len,
-                        (SegFlag.Read as UInt8) | (SegFlag.Write as UInt8), true)
+                        (SegFlag.Read as UInt8) | (SegFlag.Write as UInt8), true,
+                        NO_MEMORY)
         },
     }
 }
