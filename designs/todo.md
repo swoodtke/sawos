@@ -21,59 +21,19 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
-- 1. the stub pass — pre-carve the shared files for the concurrent
-  pair [user-ruled Sep 2; lead's own, small, gated]: sos_runner
-  `--board` arg + empty marked esp32c3 section, Makefile smoke-target
-  stub, hal/riscv32-esp32c3/ placeholder (SIBLING-COPY rule: no
-  hal/riscv32 restructure — unit 5 owns it), CLAUDE.md non-gating
-  note, both queue entries below pre-written.
-- 3. design 20 — ESP32-C3 board HAL, SMOKE ONLY (bringup + memory
-  config; direct boot; RV32IMC no-A; non-gating, machine-local QEMU)
-  [#20, brief user-reviewed Sep 2]. **CLOSED — SOS BOOTS ON THE C3 AND
-  `make sos-smoke-esp32c3` IS GREEN ON ALL THREE REVIEWED CASES**
-  (boot / timer / isolation). As-built with the verbatim oracle
-  transcripts: `designs/020-esp32c3-smoke.md`; every address with the
-  probe that produced it: `hal/riscv32-esp32c3/ABI.md`.
-  BOTH BLOCKERS CLOSED. (A) XIP as ruled: `.text` (413,622 B) and
-  `.rodata` execute in place in the flash IBUS window at 0x4200_0000,
-  `boot.S` copies only `.data` and zeroes `.bss` in SRAM;
-  `.payload`/`.regions`/`.childimg` stay in flash too, since the kernel
-  copies out of them. The 400 KiB divides 168/124/92/16 KiB across
-  kernel, root, child and pool, every number MEASURED (the tightest is
-  root at 99,392 of 110,592). (B) THE PARK'S FINDING WAS WRONG and the
-  retry says so: the matrix IS wired, and what the first sweeps got
-  wrong was `mie` — the matrix drives MACHINE EXTERNAL, so bit 11 is
-  the gate while `mcause` reports the matrix's own CPU interrupt
-  number. `TIMER_CPU_INT` is chosen as 7 so a C3 tick's cause word
-  reads exactly like a standard machine-timer interrupt and the
-  arch-generic decoding above the HAL is untouched. No fallback was
-  needed: five deterministic ticks, taken as real interrupts.
-  ONE REAL EMULATOR GAP remains and the HAL absorbs it: this matrix
-  never raises `mip`, so `wfi` never wakes on it (probed level and edge
-  alike, with `mip` reading 0 in the same breath as an interrupt being
-  taken). `wait_for_irq()` is EMPTY here and the idle loop spins while
-  `irq_poll()` reads the SYSTIMER latch — design 178 D2 untouched, no
-  kernel change, and `sos_wait_for_irq` left in place because `wfi`
-  does wake from the matrix on real silicon.
-  WHAT LANDED: `hal/riscv32-esp32c3/{kernel,user}/` as a sibling copy
-  (each file notes its origin); `tests/c3-{timer,isolation,child-poke}/`
-  as NEW packages (a package names its linker script by TRIPLE and the
-  C3 shares `riscv32-unknown-none-elf` with virt, so it can name one or
-  the other and not both); the pre-carved board section of
-  `tools/sos_runner.py` filled and nothing outside it; the Makefile
-  target real. The isolation case is C3-LOCAL and the brief's question
-  is answered NO: `child-poke` finds its target by rounding its own
-  address to a 256 KiB grid, which is a fact about the virt map, and
-  this board's regions are 124/92 KiB. It names a kernel-owned address
-  instead — the stronger claim, and the one the brief actually asks for.
-  THE NO-A BUILD SPELLING HAS THREE HALVES, and the third would have
-  shipped a broken image in silence: sawc `--target-features +m,+c`;
-  esp-clang `-march=rv32imc_zicsr_zifencei -mabi=ilp32`; and BLADE,
-  whose default for any riscv32 triple is the virt/P4 baseline
-  `+m,+a,+c`, so every C3 package restates march/mabi/target-features in
-  its manifest. Nothing catches a miss — this emulator's CPU advertises
-  A (`misa` 0x401411AD), so the wrong build runs green here and faults
-  on the part.
+- 2. design 23 — riscv32 HAL consolidation [brief authored Sep 2,
+  review WAIVED by the user ("i don't see that needing my input");
+  agent DISPATCHING at design 20's integration; behavior-preserving,
+  proof = virt byte-identical + c3 smoke matching its oracle]. THEN:
+- 3. design 24 — the M4 docs sweep (unit 6) [brief authored Sep 2,
+  review WAIVED (user reviews the landed result); dispatches AFTER
+  design 23 integrates — the consistency grep wants the settled
+  tree; M4 CLOSES at its integration]. THEN:
+- 4. the M5 scoping session [designs/019 the anchor + the seed pile;
+  USER-RULED Sep 2 (night): TIER 1 — MMU configuration, per-process
+  address spaces over the existing load_domain seam, arm64-virt the
+  first climb — is the OPENING item; riscv Sv32 follows the arm64
+  climb].
 ## [BACKLOG] — filed, not scheduled
 
 - **`PipeRequestRight.Reply` HAS NO TEST ANY MORE** [#22 As-built
