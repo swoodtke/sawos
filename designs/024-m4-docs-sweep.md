@@ -58,9 +58,14 @@ M4-CLOSES statement the lead moves on at integration.
 
 Base `0f73b45` (the design-23 integration). **DOCS ONLY, AND THE GATE IS
 BYTE-IDENTICAL.** 116 cases per architecture, 232 runs, riscv32 and arm64
-both; `diff` against a transcript captured at the merge base before a
-character was edited is EMPTY. sawlang HEAD `46eebb36` at dispatch and
-unchanged at the gate; `sawlang.pin` untouched.
+both. The check was the whole 483-line transcript and not a row count: a
+baseline was captured at the merge base before a character was edited, `diff`
+against it is EMPTY, `cmp` says identical, and both files hash to
+`3f6dde15f0f9e3f3cea88bcd3976902414028054c323c96afea74b0460add307`. None of
+the three timing-tolerant cases (`thread_preempt`, `timer_interval`,
+`process_stats`) flapped, so the tolerance never had to be invoked. sawlang
+HEAD `46eebb36` at dispatch and unchanged at the gate; `sawlang.pin`
+untouched.
 
 A second, independent proof that nothing could have moved, the one design 11
 established: `git diff` over `kernel/ hal/ rt/` filtered to non-comment lines
