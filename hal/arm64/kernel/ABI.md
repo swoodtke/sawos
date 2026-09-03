@@ -68,7 +68,9 @@ rather than a byte to THR.
 | `sos_resume_frame(frame)` | boot.S | Enter EL0 in a saved context, behind `resume_frame`. One branch into the restore path above, because the frame already holds the `SPSR` that selects EL0t. | The `eret` the restore path owns. |
 | `sos_platform_exit(code)` | sink.c | Stop the machine through semihosting `SYS_EXIT`. | `hlt #0xf000` with the call number and parameter block pinned in x0/x1. |
 | `sos_mmu_init()` | sink.c | Ask `lib.saw` for a finished identity map, then turn the MMU on. Called by `_start` after `.bss` is zeroed, because the tables live there. | `msr`/`mrs` to four system registers plus `dsb`/`isb`. The MAP is Saw (design 172 unit 1). |
-| `sos_prot_commit()` | sink.c | Publish the staged grant set. | `dsb`/`isb` barriers and a `tlbi`. The DESCRIPTORS are Saw. |
+| `sos_prot_commit()` | sink.c | Publish the staged grant set. Since sawos design 27 this serves only the six legacy harness kernels in `tests/` that program the protection surface directly — the kernel's own switch is `sos_ttbr0_write`. | `dsb`/`isb` barriers and a `tlbi`. The DESCRIPTORS are Saw. |
+| `sos_ttbr0_write(value)` | sink.c | **THE PROCESS SWITCH** (sawos design 27): install a persistent per-process table set. `value` is the set's level-1 base with the ASID already in bits 63:48 — one word, assembled in Saw. | `msr` names a system register at assembly time; the `dsb ishst`/`isb` around it are barriers. |
+| `sos_tlbi_asid(asid)` | sink.c | Drop every cached translation carrying this ASID — the maintenance behind a grant install, a revocation, and a domain clear. Shifts the argument into bits 63:48 itself. | `tlbi` is a maintenance instruction and the fences are barriers. |
 | `sos_timer_freq()` / `sos_timer_ctl_read()` / `sos_timer_ctl_write(v)` / `sos_timer_count()` / `sos_timer_set_compare(v)` | sink.c | The core's physical timer: its frequency, its control register (enabled / masked / fired), the free-running 64-bit counter, and the 64-bit ABSOLUTE deadline it is compared against. | `mrs`/`msr` name a system register at assembly time. One instruction each; the nanosecond arithmetic, the tick policy and the deadline composition are Saw. |
 | `sos_payload_start()` / `sos_payload_end()` | sink.c | Bounds of the appended payload. | A linker symbol's ADDRESS, which Saw cannot name — DF-172a. |
 | `sos_region_table_start()` / `sos_region_table_end()` | sink.c | Bounds of the `.regions` section — the boot region table (sawos design 2 D-2). | Same reason, DF-172a. It is the ONE new fixed symbol pair that unit brought: the table's blob rows carry bases the LINKER resolved when it placed the generated stub, so no per-child symbol has to be nameable here. |
@@ -200,10 +202,14 @@ built in assembly, entered once, with no storage a second thread could have had.
   Profile A cannot make.
 - **Table walks are cacheable and inner-shareable**, so a descriptor written
   with the MMU on is visible to the walker without cache maintenance and
-  `prot_commit` only has to order and flush the TLB. The tables are built
-  BEFORE the MMU comes on, where a real board would want a data-cache clean
-  first; QEMU does not model caches, and a board port is where that stops being
-  free.
+  `prot_commit` only has to order and flush the TLB. The same property is what
+  lets sawos design 27's per-process edits (`prot_install` / `prot_remove` /
+  `prot_clear`) get away with a `dsb ishst` and one `tlbi aside1is`: they write
+  descriptors in another process's set with the MMU on, and nothing has to
+  reach memory beyond ordering the stores ahead of the invalidation. The tables
+  are built BEFORE the MMU comes on, where a real board would want a data-cache
+  clean first; QEMU does not model caches, and a board port is where that stops
+  being free.
 - **The interrupt controller is v2, and it is PINNED** (design 178 M2 unit 1).
   `tools/sos_runner.py` passes `gic-version=2` rather than taking the machine's
   default: this HAL programs a v2 distributor and CPU interface, and a newer

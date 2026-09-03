@@ -147,6 +147,34 @@ void sos_prot_commit(void) {
     __asm__ volatile("dsb ishst; tlbi vmalle1; dsb ish; isb" ::: "memory");
 }
 
+// ---- switching a persistent domain ----------------------------------------
+//
+// C BECAUSE: reason 1 — `msr` names a system register and `tlbi` is a
+// maintenance instruction, both at assembly time. The table pool, the ASID
+// choice and every descriptor are `lib.saw`'s (sawos design 27).
+//
+// `sos_ttbr0_write` is the whole of a process switch on this profile: the
+// table base and the ASID arrive as one word, already assembled. The `dsb
+// ishst` orders any descriptor stores the caller just made ahead of the switch;
+// the `isb` is what makes the new base visible to the instructions after it.
+
+void sos_ttbr0_write(u64 value) {
+    __asm__ volatile("dsb ishst; msr ttbr0_el1, %0; isb" :: "r"(value) : "memory");
+}
+
+// Drop every cached translation carrying this ASID. `aside1is` is the
+// inner-shareable by-ASID form; the argument goes in bits 63:48, matching the
+// TTBR0 layout the caller already built.
+//
+// The trailing `dsb ish; isb` is what makes the invalidation complete before
+// the next access — a revocation that had not landed yet would be a revocation
+// that did not revoke.
+
+void sos_tlbi_asid(u64 asid) {
+    __asm__ volatile("dsb ishst; tlbi aside1is, %0; dsb ish; isb"
+                     :: "r"(asid << 48) : "memory");
+}
+
 // ---- the core's physical timer --------------------------------------------
 //
 // C BECAUSE: `mrs`/`msr` name a system register at assembly time (reason 1

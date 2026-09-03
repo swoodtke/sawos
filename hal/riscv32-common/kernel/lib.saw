@@ -372,6 +372,67 @@ public func prot_commit() unsafe {
     sos_pmpcfg_write(PMPCFG0, PMPCFG1, PMPCFG2, PMPCFG3)
 }
 
+// =============================================================================
+// The persistent-domain seam (sawos design 27, M5 unit 1) — NO-OPS HERE
+// =============================================================================
+//
+// Profile B gives every process a persistent translation-table set, edits it
+// when the grant RECORD is edited, and makes a switch one register write. This
+// profile does none of that, and the four bodies below are empty for one
+// reason: **PMP HAS NO PER-PROCESS STANDING IMAGE TO EDIT.** There are sixteen
+// numbered registers describing the machine's current view, and the only way to
+// make them describe a different process is to rewrite them — which is exactly
+// what `load_domain`'s replay already does through `prot_reset` / `prot_region`
+// / `prot_device` / `prot_commit` above.
+//
+// So this is not a stub awaiting an implementation. Design 25 D-2 ruled that
+// replay-at-switch REMAINS the MPU tier's shape rather than becoming a
+// permitted MMU one, and `PROT_REPLAY_AT_SWITCH` below is that ruling spelled
+// where the kernel can read it. The empty bodies are what "the record is still
+// authoritative and the hardware still learns at switch time" looks like from
+// the other side of the seam.
+//
+// The kernel calls all five on both profiles; each profile implements the half
+// it means. Nothing in `kernel/core` asks which tier it is on.
+
+/// **DOES THIS PROFILE REBUILD ITS PROTECTION IMAGE AT EVERY SWITCH?** Yes —
+/// that IS the switch here. See the block comment above.
+public static PROT_REPLAY_AT_SWITCH: Bool = true
+
+/// How many process domains this profile can serve.
+///
+/// **IT IS NOT A STORAGE LIMIT HERE, and that is the point of the number.** On
+/// Profile B the matching constant sizes a static pool of persistent table
+/// sets, so a process slot without one would index past the end; this profile
+/// stores no per-process image at all — it reprograms sixteen registers from
+/// the kernel's record at every switch — so the only thing bounding how many
+/// domains it can serve is how many process slots the kernel has. The value is
+/// therefore chosen to never bind, and `kernel/core/limits.saw`'s assert
+/// against it is satisfied for any `MAX_PROCESSES` this kernel will hold.
+public static PROT_DOMAIN_SLOTS: Int = 256
+
+/// Make `p`'s domain live. Nothing to do: the replay `load_domain` just
+/// performed IS this profile's switch, and it published it with `prot_commit`.
+public func prot_switch(p: UInt) unsafe {
+}
+
+/// Grant `[base, top)` in `p`'s standing image. There is no standing image —
+/// the row is in the kernel's record, and the next `load_domain(p)` replays it.
+public func prot_install(p: UInt, base: UInt, top: UInt, perms: UInt8,
+                         device: Bool) unsafe {
+}
+
+/// Revoke `[base, top)` from `p`'s standing image. Same reason: the row leaves
+/// the record, and the replay that follows stops programming it.
+public func prot_remove(p: UInt, base: UInt, top: UInt, device: Bool) unsafe {
+}
+
+/// Revoke everything `p` holds. `clear_domain` has already emptied the record
+/// and invalidated `LAST_PROT_PROCESS`, which is what forces the next switch to
+/// reprogram the hardware from scratch.
+public func prot_clear(p: UInt) unsafe {
+}
+
 /// Build a fresh user context in `frame_addr`: `entry` as the resume address,
 /// `stack_top` as the stack pointer, `arg0` in the first argument register.
 ///

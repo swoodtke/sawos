@@ -26,6 +26,18 @@ entry below or the brief that carries it, never restating either.
   arch-free, may pipeline in a parallel worktree; stats region 7;
   docs sweep 8 closes; arena+kernel-stack unit slots at convenience.
   Unit briefs dispatch from the sketch.
+  **UNIT 1 BUILT (`designs/027`, Sep 3):** arm64 translation-as-isolation
+  — per-process persistent table sets from a static HAL pool
+  (`PROT_DOMAIN_SLOTS` 3 × 24 KiB, `.bss` +48 KiB measured), the switch
+  collapsed from ~1.6k descriptor stores to one TTBR0+ASID write, ASID =
+  process slot, the seam grown by five names (`PROT_REPLAY_AT_SWITCH`,
+  `prot_switch`, `prot_install`, `prot_remove`, `prot_clear`) hung on the
+  record's own funnels (`record_grant`/`remove_grant`/`clear_domain`).
+  Gate 232/232 both arches, transcript BYTE-IDENTICAL and hashing to the
+  same `3f6dde15` design 24 recorded. riscv32 unchanged (four no-op
+  bodies). No SL entry owed. Units 2→4 still open, so this entry stays
+  whole; its three As-built findings ride there, one of them a warning
+  for unit 3 (the gate does not witness fault CLASS — see 027).
 
 ## [BACKLOG] — filed, not scheduled
 

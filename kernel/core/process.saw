@@ -373,6 +373,19 @@ public(package) func record_grant(p: Int, base: UInt, top: UInt, perms: UInt8,
                                       region: region)
     PROCESSES[p].grant_count = n + 1
     ref_region_row(region)
+    // THE HARDWARE LEARNS HERE, on a tier that keeps a standing image (sawos
+    // design 27). This is the single funnel every grant row is appended
+    // through — the loader's three at boot and `install_row`'s one from a
+    // `map` — so putting the edit here is what makes the record and the tables
+    // move together by construction, for ANY process, current or not, rather
+    // than by two call sites agreeing to stay in step. On the MPU tier it is a
+    // no-op and the row reaches hardware at the next switch, exactly as before.
+    //
+    // AFTER the reference above, so the region is held before anything can
+    // reach the bytes: the grant is the thing that makes them reachable, and
+    // taking the reference first is what stops a concurrent free from racing
+    // the row that is about to permit access to it.
+    hal.prot_install(p as UInt, base, top, perms, device)
 }
 
 /// Make process `p`'s recorded domain the LIVE one.
@@ -383,31 +396,45 @@ public(package) func record_grant(p: Int, base: UInt, top: UInt, perms: UInt8,
 /// written once so the boot domain and a switched-in domain cannot be programmed
 /// differently.
 ///
-/// COST, RECORDED HONESTLY (sawos design 2 D-5). On Profile A this is about
-/// nineteen control-register writes and no translation-buffer work at all. On
-/// Profile B it is a window reset (1024 + 512 descriptor stores), a regrant
-/// walk, and a full translation-buffer flush — the order of 1.6k stores,
-/// accepted at M3 switch rates. Clearing only the OUTGOING rows instead of the
-/// whole window is a permitted improvement and costs nothing above this line;
-/// address-space identifiers and per-process tables are SMP-era.
+/// COST, RECORDED HONESTLY (sawos design 2 D-5, amended by design 27). On
+/// Profile A this is about nineteen control-register writes and no
+/// translation-buffer work at all. On Profile B it WAS a window reset
+/// (1024 + 512 descriptor stores), a regrant walk and a full
+/// translation-buffer flush — the order of 1.6k stores per switch. That is
+/// retired: Profile B now holds a persistent table set per process and this
+/// collapses to ONE register write, because the tables were already brought up
+/// to date when the RECORD was edited (`record_grant` / `remove_grant`).
+///
+/// **THE REPLAY IS THE MPU TIER'S, AND THE HAL SAYS WHICH TIER IT IS.** Design
+/// 25 D-2 ruled that replay-at-switch stays MPU-only rather than becoming a
+/// permitted MMU implementation — an address-space identifier means nothing if
+/// the tables are rebuilt under it — so the loop below is guarded by a HAL
+/// constant rather than by anything this file knows. On Profile A it folds to
+/// the same three steps it always was; on Profile B it folds away entirely and
+/// `prot_switch` is the whole of the switch. This is design 19's doctrine that
+/// a tier difference is ADVERTISED and never faked, spelled at the one seam
+/// that has to care.
 ///
 /// AUDIT (design 1): NO PREEMPTION POINT, and both HALs say so at their own
 /// `prot_reset` — a half-rewritten grant table is exactly an in-flight
 /// invariant, and the whole staged sequence is one edit published by
 /// `prot_commit`.
 public(package) func load_domain(p: Int) unsafe {
-    hal.prot_reset()
-    var i: Int = 0
-    while i < PROCESSES[p].grant_count {
-        let row = PROCESSES[p].grants[i]
-        if row.device {
-            hal.prot_device(i as UInt, row.base, row.top - row.base)
-        } else {
-            hal.prot_region(i as UInt, row.base, row.top, row.perms)
+    if hal.PROT_REPLAY_AT_SWITCH {
+        hal.prot_reset()
+        var i: Int = 0
+        while i < PROCESSES[p].grant_count {
+            let row = PROCESSES[p].grants[i]
+            if row.device {
+                hal.prot_device(i as UInt, row.base, row.top - row.base)
+            } else {
+                hal.prot_region(i as UInt, row.base, row.top, row.perms)
+            }
+            i = i + 1
         }
-        i = i + 1
+        hal.prot_commit()
     }
-    hal.prot_commit()
+    hal.prot_switch(p as UInt)
     LAST_PROT_PROCESS = p
 }
 
@@ -435,14 +462,32 @@ public(package) func load_domain(p: Int) unsafe {
 /// The reverse order would let a `Split` hand a range to a new owner while the
 /// old one's protection row still reached it.
 public(package) func remove_grant(p: Int, row: Int) unsafe {
-    let region = PROCESSES[p].grants[row].region
+    // THE ROW IS READ ONCE, and both consumers see that same read: design 28's
+    // `region` (dropped last, below) and design 27's hardware revoke (issued
+    // first, here). The compaction underneath is about to move this storage, so
+    // reading it twice would be two reads of a row in motion.
+    let gone = PROCESSES[p].grants[row]
+    // REVOKED FROM THE HARDWARE BEFORE THE RANGE CAN MOVE — and that is what
+    // makes the paragraph above this function TRUE on a tier whose tables
+    // PERSIST (sawos design 27 meeting design 28). Design 28's ordering
+    // argument is that the domain has stopped granting these bytes by the time
+    // they may reach the pool's free list, and it rests on the ROW LEAVING THE
+    // RECORD — which is sufficient exactly where the hardware image is rebuilt
+    // from the record at the next switch. Where the tables stand, the record no
+    // longer speaks for the hardware, so THIS call is what stops the grant, and
+    // it therefore precedes `unref_region_row` rather than merely the
+    // compaction. Eagerly for its own reason too: an unmap that waited would be
+    // a revocation that did not revoke — the sentence `domain_changed` has
+    // always carried. On the MPU tier it is a no-op and the replay is what
+    // stops programming the row.
+    hal.prot_remove(p as UInt, gone.base, gone.top, gone.device)
     var i = row
     while i + 1 < PROCESSES[p].grant_count {
         PROCESSES[p].grants[i] = PROCESSES[p].grants[i + 1]
         i = i + 1
     }
     PROCESSES[p].grant_count = PROCESSES[p].grant_count - 1
-    unref_region_row(region)
+    unref_region_row(gone.region)
 }
 
 /// **THE LIVE-DOMAIN RULE** (sawos design 6 D-3): any edit to `PROCESSES[p]`'s
@@ -503,6 +548,19 @@ public(package) func domain_changed(p: Int) unsafe {
 public(package) func clear_domain(p: Int) unsafe {
     let rows = PROCESSES[p].grant_count
     PROCESSES[p].grant_count = 0
+    // AND THE STANDING IMAGE GOES WITH THE RECORD (sawos design 27), BEFORE the
+    // walk below can return a single range to its pool — the same composition
+    // `remove_grant` spells one function up. Zeroing the count above is what
+    // stops a REPLAY tier from granting these bytes again; this is what stops a
+    // persistent-table one, and the free list is reachable from the next line,
+    // so the order is the contract and not a preference.
+    //
+    // It is also where the slot — and so the address-space identifier the
+    // tables are tagged with — becomes reusable, which is why the identifier's
+    // cached translations are dropped here. Invalidating `LAST_PROT_PROCESS`
+    // below is not enough there: it forces the next SWITCH to reprogram, which
+    // is exactly what a persistent-table profile no longer does.
+    hal.prot_clear(p as UInt)
     var i: Int = 0
     while i < rows {
         unref_region_row(PROCESSES[p].grants[i].region)

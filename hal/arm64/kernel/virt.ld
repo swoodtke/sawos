@@ -129,4 +129,17 @@ SECTIONS {
         *(.ARM.attributes)
         *(.ARM.exidx*)
     }
+
+    /* THE KERNEL MUST END BELOW ROOT'S REGION, and until sawos design 27
+     * nothing checked it. The per-process translation-table pool put 48 KiB
+     * into .bss in one edit (three 24 KiB sets where there was one), which is
+     * the first change big enough to make the ceiling worth stating: overrun
+     * 0x40200000 and the kernel's own .bss and root's image occupy the same
+     * addresses, which corrupts root at load time with no diagnostic anywhere.
+     *
+     * `ROOT_LOAD_BASE` in hal/arm64/kernel/lib.saw is the same number; this is
+     * the linker's copy of it, and a build that trips this assert should widen
+     * the region map rather than shrink the pool silently. */
+    ASSERT(_bss_end <= 0x40200000,
+           "kernel .bss overruns ROOT_LOAD_BASE (0x40200000) -- see PROT_DOMAIN_SLOTS")
 }
