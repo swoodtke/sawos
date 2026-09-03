@@ -1,0 +1,77 @@
+// SOS design 20, the `isolation` SMOKE CASE's other half — ESP32-C3.
+//
+// **THE PMP PROOF, from the wrong side of the fence.** This child stores a word
+// into the KERNEL's own memory. If the PMP program over the real C3 map is
+// right, the access faults, the child dies and root carries on; if the kernel's
+// rows were left open — or if U-mode were not default-deny after all — the
+// store would land in the kernel's data and the run would come apart somewhere
+// else entirely, with no diagnostic naming the cause.
+//
+// So the transcript's fault line IS the assertion, and the case is written so
+// that a broken protection program fails by its ABSENCE rather than by a wrong
+// value.
+//
+// # WHY IT NAMES AN ADDRESS, WHERE ITS VIRT SIBLING DOES NOT
+//
+// `tests/child-poke` is arch-free: both virt profiles put every process region
+// on a 256 KiB grid, so a child can find its own base by rounding its own
+// address down and its neighbour's top is that same number. THAT ARITHMETIC IS
+// A FACT ABOUT THE VIRT MAP, not about processes — this board has 400 KiB of
+// SRAM in total and its regions are 176 / 96 / 80 / 48 KiB, chosen to fit the
+// kernel rather than to tile a grid. There is no rounding that finds a
+// neighbour here, so this file names the target instead, which is honest for a
+// board-local case and is why design 20's brief asked whether the entry was
+// portable. It is not; this is the C3-local answer.
+//
+// # WHY THE KERNEL'S MEMORY AND NOT ROOT'S
+//
+// The brief's `isolation` case is "a user-mode touch of a KERNEL-OWNED address
+// faults and is reported", and that is the stronger claim of the two available:
+// root's memory is denied because the domain was RELOADED at the switch, but
+// the kernel's is denied because U-mode matches no PMP entry there AT ALL. The
+// second is the property the whole protection model rests on, and it is the one
+// a fresh board port can get wrong by programming the entries at the wrong
+// addresses — which is precisely what this smoke exists to catch.
+
+// The `sos` module is imported for the RUNTIME rather than for the API: it is
+// what pulls `sosrt` into this compilation unit, and `sosrt` is what defines
+// the frozen `__saw_rt_*` seams every freestanding image needs. A child holding
+// no handles calls no op through it; parking its (absent) System handle is what
+// makes those seams MUTE rather than absent.
+import sos.{System}
+
+/// The first word of the C3's SRAM, which `hal/riscv32-esp32c3/kernel/
+/// esp32c3.ld` gives to the kernel's own `.data` and which the kernel grants to
+/// nobody, ever. Kernel-owned by construction rather than by convention: it is
+/// where `RAM_BASE` is, so every process region on this board is strictly above
+/// it.
+static KERNEL_OWNED: UInt = 0x4037_C000
+
+/// A value with no other reason to exist, so a debugger finding it in the
+/// kernel's memory would know exactly what put it there.
+static POKE_VALUE: UInt = 0xD00D
+
+/// Store into the KERNEL's memory. Never comes back on a correct kernel.
+///
+/// `unsafe` by design 130's trigger rule — it names an `UnsafeMemory` — and the
+/// unsafety stops here: `_start` below calls it and stays an ordinary safe
+/// signature.
+func poke_the_kernel() unsafe {
+    UnsafeMemory<UInt, Normal>(KERNEL_OWNED).write(POKE_VALUE)
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    // Park the handle the kernel actually gave this process, which is nothing.
+    // The runtime's writer checks it and stays silent, so a panic here would
+    // cost a fault rather than a garbled line on somebody else's console.
+    let _ = System(boot_handle: boot_handle)
+
+    poke_the_kernel()
+
+    // Unreachable on a correct kernel: the store above faults and the kernel
+    // ends this process. A child that got here has been granted the kernel's
+    // own memory, and it has no handle to complain with — so it spins, and the
+    // harness catches the MISSING fault report rather than a wrong one.
+    while { }
+}

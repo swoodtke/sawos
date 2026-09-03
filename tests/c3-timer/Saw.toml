@@ -1,0 +1,38 @@
+[package]
+name = "c3-timer"
+version = "0.1.0"
+
+# Same reason as sos/root's: this image carries its own `__saw_rt_*` seams, out
+# of the `sosrt` module its `sos` dependency pulls in.
+runtime = true
+
+# DESIGN 20's `timer` SMOKE CASE. A SYSTIMER alarm reaches the CPU through the
+# ESP32-C3's interrupt matrix and ticks a fixed number of times.
+#
+# WHY THIS IS A NEW PACKAGE rather than `timer-oneshot` reused: a package names
+# its linker script BY TARGET TRIPLE, and the C3 profile is the same
+# `riscv32-unknown-none-elf` triple the gate's virt profile is. So a package can
+# name one script or the other and not both, and reusing the gate's would link
+# root at 0x8020_0000 — an address this part does not have. Nothing about the
+# PROGRAM is board-specific; it is the manifest that had to fork.
+[dependencies]
+sos = { path = "../../kernel/sysapi" }
+
+[sos]
+emit = "sosimg"
+priorities = { background = 0, low = 1, normal = 1, high = 1 }
+
+[sos.riscv32-unknown-none-elf]
+linker-script = "../../hal/riscv32-esp32c3/user/root.ld"
+native = "../../hal/riscv32-esp32c3/user/syscall.c ../../rt/common_c/support.c"
+
+# THE NO-A BUILD SPELLING, USERSPACE HALF (design 20; ../../hal/
+# riscv32-esp32c3/ABI.md §3). Blade's built-in default for a riscv32 triple is
+# the virt/P4 Profile A baseline — `rv32imac_zicsr` / `+m,+a,+c` — and the
+# ESP32-C3 HAS NO A EXTENSION, so all three keys are restated here. Without
+# them the image links `amo*`/`lr`/`sc` instructions the part cannot execute,
+# and NOTHING catches it: this emulator's CPU model advertises A (misa reads
+# 0x401411AD), so the wrong build runs green here and faults on silicon.
+march = "rv32imc_zicsr_zifencei"
+mabi = "ilp32"
+target-features = "+m,+c"

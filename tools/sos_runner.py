@@ -5160,27 +5160,358 @@ def main():
 
     if args.board != "virt":
         # ------------------------------------------------------------------
-        # BOARD SECTION: esp32c3 — STUB, filled by design 20's agent.
+        # BOARD SECTION: esp32c3 — design 20, NON-GATING.
         # Everything board-specific lands HERE and only here, so the virt
         # tables above stay another unit's to edit (the Sep-2 stub-pass
-        # ruling: pre-carved regions instead of rebase conflicts). To fill:
-        #   - resolve the Espressif QEMU binary (~/.espressif/tools/
-        #     qemu-riscv32/<ver>/qemu/bin/qemu-system-riscv32; see the
-        #     espressif-qemu-tools memory / design 19 addenda)
-        #   - `-machine esp32c3`, direct-boot flash image (magic words at
-        #     offset 0; the bundled ROM jumps in)
-        #   - the SMOKE list only: bringup (boot->transcript, trap entry,
-        #     timer tick) + memory config (PMP over the real C3 map,
-        #     isolation smoke). NON-GATING by ruling — never sos-test.
+        # ruling: pre-carved regions instead of rebase conflicts).
         # ------------------------------------------------------------------
-        if args.board == "esp32c3":
-            print(f"{RED}--board esp32c3 is a stub: design 20 fills this "
-                  f"section (the smoke harness is not built yet){RESET}",
-                  file=sys.stderr)
-        else:
+        if args.board != "esp32c3":
             print(f"{RED}unknown --board {args.board!r}; known: virt, "
-                  f"esp32c3 (stub){RESET}", file=sys.stderr)
-        sys.exit(2)
+                  f"esp32c3{RESET}", file=sys.stderr)
+            sys.exit(2)
+
+        # ------------------------------------------------------------------
+        # THE ESP32-C3 SMOKE (design 20). NON-GATING BY RULING: never part of
+        # `make sos-test`, never CI, and it runs against a MACHINE-LOCAL
+        # Espressif QEMU that no other developer is assumed to have.
+        #
+        # It shares no table, no build directory and no run path with the gate
+        # above. That is deliberate on three counts. The BOARD is different in
+        # every way that matters (direct boot from a flash image rather than
+        # `-kernel`, XIP text, no exit door). The BUILD DIRECTORY has to differ
+        # even though the target triple does not — both profiles are
+        # `riscv32-unknown-none-elf`, so a shared `.build/<triple>/` would let
+        # `make sos-smoke-esp32c3` silently clobber the objects `make sos-test`
+        # is about to link. And the VERDICT is read differently: this part has
+        # no sifive_test finisher and Espressif QEMU gives a guest no shutdown
+        # door, so the emulator never exits on its own and its exit status
+        # carries nothing — the TRANSCRIPT is the whole of the result, and the
+        # kernel's `exit_pass`/`exit_fail` say which it was in words.
+        #
+        # Serial, not `-j`: three cases, and a smoke whose job is to be
+        # diffable has nothing to gain from overlapping them.
+        #
+        # Everything below was derived from the running emulator and is
+        # recorded with its probe in hal/riscv32-esp32c3/ABI.md.
+        #
+        # The three imports are LOCAL on purpose: this section is the only
+        # thing in the file that needs them, and the stub-pass ruling keeps
+        # every board-specific edit inside these lines rather than spreading
+        # one more diff hunk into a header another unit is also editing.
+        # ------------------------------------------------------------------
+        import glob
+        import select
+        import struct
+
+        C3_HAL = os.path.join(HAL_DIR, "riscv32-esp32c3")
+        C3_BUILD = os.path.join(REPO_ROOT, ".build", "esp32c3", "sos")
+        C3_TRIPLE = "riscv32-unknown-none-elf"      # what sawc/blade are told
+        C3_FEATURES = "+m,+c"                       # RV32IMC — NO `+a`
+        C3_ESP_TRIPLE = "riscv32-esp-unknown-elf"   # esp-clang's own row
+        C3_MARCH = "-march=rv32imc_zicsr_zifencei"
+        C3_MABI = "-mabi=ilp32"
+        C3_FLASH_BYTES = 4 * 1024 * 1024
+        C3_MAGIC = 0xAEDB041D
+        C3_CHILD_BASE = 0x403C5000
+        C3_CHILD_LEN = 0x17000
+        C3_HALT = "SOS-C3: halt"
+        C3_TIMEOUT_S = 20
+
+        def c3_tool(pattern, what, hint):
+            """Find a machine-local Espressif tool, newest version first."""
+            hits = sorted(glob.glob(os.path.expanduser(pattern)), reverse=True)
+            if not hits:
+                print(f"{RED}no {what} found at {pattern}{RESET}",
+                      file=sys.stderr)
+                print(f"  {hint}", file=sys.stderr)
+                sys.exit(2)
+            return hits[0]
+
+        qemu = c3_tool(
+            "~/.espressif/tools/qemu-riscv32/*/qemu/bin/qemu-system-riscv32",
+            "Espressif QEMU",
+            "install it with the ESP-IDF tools installer; this target is "
+            "machine-local and NON-GATING, so its absence breaks nothing else")
+        clang = c3_tool(
+            "~/.espressif/tools/esp-clang/*/esp-clang/bin/clang",
+            "esp-clang",
+            "the C3 build needs the no-A multilib row "
+            "(rv32imc_zicsr_zifencei); see hal/riscv32-esp32c3/ABI.md §3")
+        lld = os.path.join(os.path.dirname(clang), "ld.lld")
+        objcopy = os.path.join(os.path.dirname(clang), "llvm-objcopy")
+
+        os.makedirs(C3_BUILD, exist_ok=True)
+
+        # The arch dict `_build_root_image` wants. Its `triple` is what blade
+        # and sawc are told; a root package's own artifacts live under
+        # `<package>/.build/<triple>/`, and the C3 packages are distinct
+        # packages, so nothing collides with the gate there.
+        c3_arch = {"name": "riscv32-esp32c3", "triple": C3_TRIPLE}
+
+        def c3_cc(src, obj, extra=()):
+            _run([clang, f"--target={C3_ESP_TRIPLE}", C3_MARCH, C3_MABI,
+                  "-nostdlib", "-ffreestanding", *extra, "-c", src, "-o", obj])
+            return obj
+
+        def c3_payload_stub(name, sosimg):
+            """The `.incbin` stub that pulls a root sosimg into `.payload`."""
+            stub_s = os.path.join(C3_BUILD, f"{name}.rootimg.S")
+            with open(stub_s, "w") as f:
+                f.write("/* GENERATED by tools/sos_runner.py --board esp32c3 */\n"
+                        "    .section .payload, \"ax\", @progbits\n"
+                        "    .balign 16\n"
+                        f"    .incbin \"{sosimg}\"\n")
+            return c3_cc(stub_s, os.path.join(C3_BUILD, f"{name}.rootimg.o"))
+
+        def c3_regions_stub(name, child_images):
+            """The child blobs and the BOOT REGION TABLE that names them.
+
+            The virt path's `_stitch_regions` cannot be reused: it sizes a
+            child's destination row from the module-level `CHILD_REGION_LEN`
+            (256 KiB), and this board's whole SRAM is 400 KiB. Row ORDER is the
+            same contract — every blob, then every destination — because root's
+            config reads it as tags.
+            """
+            lines = ["/* GENERATED by tools/sos_runner.py --board esp32c3 */",
+                     "    .section .childimg, \"a\", @progbits",
+                     "    .balign 16"]
+            for i, img in enumerate(child_images):
+                lines += [f"_sos_child{i}_start:",
+                          f"    .incbin \"{img}\"",
+                          f"_sos_child{i}_end:",
+                          "    .balign 16"]
+            rows = [(f"_sos_child{i}_start",
+                     f"_sos_child{i}_end - _sos_child{i}_start",
+                     REGION_KIND_RAM) for i in range(len(child_images))]
+            rows += [(f"{C3_CHILD_BASE + i * C3_CHILD_LEN:#x}",
+                      f"{C3_CHILD_LEN:#x}", REGION_KIND_RAM)
+                     for i in range(len(child_images))]
+            lines += ["", "    .section .regions, \"a\", @progbits",
+                      "    .balign 8",
+                      f"    .4byte {REGION_TABLE_MAGIC:#010x}",
+                      f"    .2byte {REGION_TABLE_VERSION}",
+                      f"    .byte  {len(rows)}",
+                      "    .byte  0"]
+            for i, (base, length, kind) in enumerate(rows):
+                # 64-bit fields on a 32-bit assembler: low half then a zero
+                # high half, which is the same bytes little-endian.
+                lines += [f"    /* row {i} */",
+                          f"    .4byte {base}", "    .4byte 0",
+                          f"    .4byte {length}", "    .4byte 0",
+                          f"    .byte  {kind}",
+                          "    .byte  0, 0, 0, 0, 0, 0, 0"]
+            stub_s = os.path.join(C3_BUILD, f"{name}.regions.S")
+            with open(stub_s, "w") as f:
+                f.write("\n".join(lines) + "\n")
+            return c3_cc(stub_s, os.path.join(C3_BUILD, f"{name}.regions.o"))
+
+        def c3_flash_image(name, objs):
+            """Link, flatten, and check the direct-boot magic is really there."""
+            elf = os.path.join(C3_BUILD, f"{name}.elf")
+            raw = os.path.join(C3_BUILD, f"{name}.bin")
+            flash = os.path.join(C3_BUILD, f"{name}.flash.bin")
+            _run([lld, "-T", os.path.join(C3_HAL, "kernel", "esp32c3.ld"),
+                  "--gc-sections", "-o", elf, *objs])
+            _run([objcopy, "-O", "binary", elf, raw])
+            with open(raw, "rb") as f:
+                image = f.read()
+            # THE ONE INVARIANT THE HARNESS CHECKS ITSELF. Without these two
+            # words the mask ROM does not enter the image at all and the run
+            # fails as a silent timeout with no output — a failure mode that
+            # says nothing. Checking here turns it into a sentence.
+            m0, m1 = struct.unpack_from("<II", image, 0)
+            if m0 != C3_MAGIC or m1 != C3_MAGIC:
+                raise ToolError(
+                    f"{name}: flash image lacks the direct-boot magic "
+                    f"(read {m0:#010x} {m1:#010x}, want {C3_MAGIC:#010x} twice)"
+                    " — check .magic in hal/riscv32-esp32c3/kernel/esp32c3.ld")
+            if len(image) > C3_FLASH_BYTES:
+                raise ToolError(f"{name}: image is {len(image)} bytes, "
+                                f"flash is {C3_FLASH_BYTES}")
+            with open(flash, "wb") as f:
+                f.write(image + b"\xff" * (C3_FLASH_BYTES - len(image)))
+            return flash, len(image)
+
+        def c3_run(flash):
+            """Boot the image and collect the console until it halts.
+
+            The machine never exits on its own — there is no finisher and no
+            shutdown door — so the run ends at the kernel's own halt line or at
+            the timeout, and QEMU is killed either way. Stderr is collected
+            separately and kept OUT of the transcript: QEMU writes
+            `Adding SPI flash device` there on every run, which is noise a
+            diff should never see.
+            """
+            proc = subprocess.Popen(
+                [qemu, "-machine", "esp32c3", "-nographic",
+                 "-drive", f"file={flash},if=mtd,format=raw"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL)
+            out = b""
+            deadline = time.time() + C3_TIMEOUT_S
+            halted = False
+            try:
+                while time.time() < deadline:
+                    ready, _, _ = select.select([proc.stdout], [], [], 0.2)
+                    if ready:
+                        chunk = os.read(proc.stdout.fileno(), 4096)
+                        if not chunk:
+                            break
+                        out += chunk
+                        if C3_HALT.encode() in out:
+                            # Drain what is still in flight, POLLING rather than
+                            # reading: the halt line is usually the last thing
+                            # the machine ever writes, so a blocking read here
+                            # waits on a guest that has stopped talking — which
+                            # is a hang, not a timeout, because the deadline
+                            # above is no longer being consulted.
+                            drain_until = time.time() + 0.3
+                            while time.time() < drain_until:
+                                more_ready, _, _ = select.select(
+                                    [proc.stdout], [], [], 0.05)
+                                if not more_ready:
+                                    continue
+                                more = os.read(proc.stdout.fileno(), 4096)
+                                if not more:
+                                    break
+                                out += more
+                            halted = True
+                            break
+                    elif proc.poll() is not None:
+                        break
+            finally:
+                proc.kill()
+                proc.wait()
+                proc.stdout.close()
+            return out.decode("utf-8", "replace"), halted
+
+        # THE SMOKE LIST, in the order it is reported — design 20's three
+        # reviewed cases and nothing else. `boot` needs no package at all: a
+        # kernel with no root image appended must say so, which proves direct
+        # boot, the XIP linker layout and the Espressif console sink in one.
+        C3_BANNER = "SOS M1: kernel up on riscv32 (ESP32-C3)"
+        C3_ROM = "ESP-ROM:esp32c3-api1-20210207"
+        c3_cases = [
+            {
+                "name": "boot",
+                "root_pkg": None,
+                "children": [],
+                "expect": [C3_ROM, C3_BANNER,
+                           "SOS: bad root image: no root image appended",
+                           "SOS-C3: halt fail code=0x00000004"],
+            },
+            {
+                "name": "timer",
+                "root_pkg": os.path.join(TESTS_DIR, "c3-timer"),
+                "children": [],
+                "expect": [C3_ROM, C3_BANNER,
+                           "SOS c3timer: arming",
+                           "SOS c3timer: tick 1 key=37 fires=1",
+                           "SOS c3timer: tick 2 key=37 fires=1",
+                           "SOS c3timer: tick 3 key=37 fires=1",
+                           "SOS c3timer: tick 4 key=37 fires=1",
+                           "SOS c3timer: tick 5 key=37 fires=1",
+                           "SOS c3timer: done ticks=5 slept=1",
+                           "SOS-C3: halt pass"],
+            },
+            {
+                "name": "isolation",
+                "root_pkg": os.path.join(TESTS_DIR, "c3-isolation"),
+                "children": [os.path.join(TESTS_DIR, "c3-child-poke")],
+                "expect": [C3_ROM, C3_BANNER,
+                           "SOS c3iso: started",
+                           "SOS: fault ",
+                           "SOS c3iso: root survived child status=131072",
+                           "SOS c3iso: child syscalls=0 faults=1",
+                           "SOS c3iso: done",
+                           "SOS-C3: halt pass"],
+            },
+        ]
+
+        print(f"{BOLD}SOS ESP32-C3 board smoke{RESET} (design 20, NON-GATING)")
+        print(f"  qemu   {qemu}")
+        print(f"  clang  {clang}")
+        print(f"  target {C3_TRIPLE} --target-features {C3_FEATURES} "
+              f"({C3_MARCH[len('-march='):]} — no A extension)")
+
+        blade_bin = _build_blade(C3_BUILD)
+
+        # The kernel is ONE compile for all three cases: they differ in what is
+        # appended to it, never in the kernel itself.
+        shared = [c3_cc(os.path.join(C3_HAL, "kernel", "boot.S"),
+                        os.path.join(C3_BUILD, "boot.o")),
+                  c3_cc(os.path.join(C3_HAL, "kernel", "sink.c"),
+                        os.path.join(C3_BUILD, "sink.o"), extra=("-O2",)),
+                  c3_cc(os.path.join(RT_COMMON_C_DIR, "support.c"),
+                        os.path.join(C3_BUILD, "support.o"), extra=("-O2",))]
+        kobj = os.path.join(C3_BUILD, "kernel.o")
+        _run(tc().sawc() + [os.path.join(KERNEL_DIR, "main.saw"), "-o", kobj,
+                            "--freestanding", "--no-hidden-alloc",
+                            "--runtime-provider",
+                            "--target", C3_TRIPLE,
+                            "--target-features", C3_FEATURES,
+                            "--module-path", CORE_MODULE,
+                            "--module-path",
+                            f"hal={os.path.join(C3_HAL, 'kernel')}",
+                            "--module-path", tc().module_path_arg("imgformat"),
+                            "--module-path", SOSRT_MODULE,
+                            "--module-path", SOSABI_MODULE])
+
+        failed = 0
+        for i, case in enumerate(c3_cases, 1):
+            name = case["name"]
+            try:
+                objs = list(shared) + [kobj]
+                if case["root_pkg"]:
+                    objs.append(c3_payload_stub(
+                        name, _build_root_image(blade_bin, case["root_pkg"],
+                                                c3_arch, clang)))
+                if case["children"]:
+                    objs.append(c3_regions_stub(
+                        name, [_build_root_image(blade_bin, pkg, c3_arch, clang)
+                               for pkg in case["children"]]))
+                flash, size = c3_flash_image(name, objs)
+                out, halted = c3_run(flash)
+            except ToolError as e:
+                print(f"[{i}/{len(c3_cases)}] {CROSS} {name}")
+                print(f"    {e}")
+                failed += 1
+                continue
+
+            missing = None
+            cursor = 0
+            for want in case["expect"]:
+                at = out.find(want, cursor)
+                if at < 0:
+                    missing = want
+                    break
+                cursor = at + len(want)
+            if missing is None and halted:
+                print(f"[{i}/{len(c3_cases)}] {CHECK} {name}  "
+                      f"({size} bytes of flash)")
+            else:
+                failed += 1
+                print(f"[{i}/{len(c3_cases)}] {CROSS} {name}")
+                if not halted:
+                    print(f"    the kernel never halted within "
+                          f"{C3_TIMEOUT_S}s")
+                if missing is not None:
+                    print(f"    expected and not found, in order: {missing!r}")
+                print("    --- console ---")
+                for line in out.splitlines():
+                    print(f"    {line}")
+                print("    --- end ---")
+
+        print()
+        print("=" * 60)
+        if failed:
+            print(f"{RED}SOS ESP32-C3 SMOKE FAILED{RESET} "
+                  f"({failed} of {len(c3_cases)})")
+        else:
+            print(f"{GREEN}ESP32-C3 SMOKE PASSED{RESET} "
+                  f"({len(c3_cases)} cases)")
+        print("=" * 60)
+        sys.exit(1 if failed else 0)
 
     if args.jobs < 1:
         print(f"{RED}-j must be at least 1 (got {args.jobs}){RESET}",

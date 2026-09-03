@@ -1,0 +1,40 @@
+[package]
+name = "c3-child-poke"
+version = "0.1.0"
+
+runtime = true
+
+# DESIGN 20's `isolation` SMOKE CASE, from the wrong side of the fence. This
+# child stores a word into memory the KERNEL owns and nobody was ever granted.
+#
+# WHY A NEW PACKAGE rather than `child-poke` reused, and the argument is in two
+# halves. The MECHANICAL half is the manifest: a package names its linker script
+# by target triple, the C3 shares `riscv32-unknown-none-elf` with the gate's
+# virt profile, and `child-poke` names virt's script — which links at
+# 0x8024_0000, an address this part does not have. The SUBSTANTIVE half is that
+# `child-poke` finds its target by ROUNDING ITS OWN ADDRESS DOWN to a 256 KiB
+# region, which is a fact about the virt memory map: this board's regions are
+# 96 KiB and 80 KiB, because 400 KiB of SRAM does not divide the way 128 MiB of
+# DRAM does. So the arithmetic that makes that file arch-free is exactly what
+# does not port, which is the answer design 20's brief asked this unit to argue.
+[dependencies]
+sos = { path = "../../kernel/sysapi" }
+
+[sos]
+emit = "sosimg"
+priorities = { background = 0, low = 1, normal = 1, high = 1 }
+
+[sos.riscv32-unknown-none-elf]
+linker-script = "../../hal/riscv32-esp32c3/user/child.ld"
+native = "../../hal/riscv32-esp32c3/user/syscall.c ../../rt/common_c/support.c"
+
+# THE NO-A BUILD SPELLING, USERSPACE HALF (design 20; ../../hal/
+# riscv32-esp32c3/ABI.md §3). Blade's built-in default for a riscv32 triple is
+# the virt/P4 Profile A baseline — `rv32imac_zicsr` / `+m,+a,+c` — and the
+# ESP32-C3 HAS NO A EXTENSION, so all three keys are restated here. Without
+# them the image links `amo*`/`lr`/`sc` instructions the part cannot execute,
+# and NOTHING catches it: this emulator's CPU model advertises A (misa reads
+# 0x401411AD), so the wrong build runs green here and faults on silicon.
+march = "rv32imc_zicsr_zifencei"
+mabi = "ilp32"
+target-features = "+m,+c"
