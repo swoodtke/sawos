@@ -510,6 +510,18 @@ newline literally. And `tval=0x4037c000` in the isolation case is the
 exact address `c3-child-poke` names — the kernel's own `.data` base —
 which is the whole of that case's assertion.
 
+**ADDENDUM (design 23, Sep 2 2026) — ONE BLANK LINE IS MISSING FROM THE
+ISOLATION PASTE ABOVE, and a reader diffing against it should expect it
+back.** `SOS c3iso: root survived child status=131072` is followed by a
+blank line on the real console, exactly as every other `SOS c3*:` row in
+these transcripts is: it is `print("SOS c3iso: root survived child
+status={}\n", status)` in `tests/c3-isolation/src/main.saw`, which is the
+doubling convention the paragraph above explains. The paste dropped it.
+Design 23's re-run of these three images — byte-identical flash sizes,
+every address matching — shows the blank line present; nothing about the
+oracle's MEANING changes, and every other row of all three consoles is
+verbatim correct.
+
 ## 10. Deviations
 
 None. Both departures from the brief as written are the user's own
