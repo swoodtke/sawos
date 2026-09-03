@@ -60,6 +60,41 @@ entry below or the brief that carries it, never restating either.
   after design 28's `8f080c3`). Units 1.5→2→4 and 6→6b→7→8 still
   open, so this entry stays whole; its As-built findings ride there, one a warning for
   unit 3 (the gate does not witness fault CLASS — see 027).
+  **UNIT 6 BUILT (`designs/032`, Sep 3):** slab donation —
+  `SystemOp.SlabDonate(kind, memory)` on its own `SystemRight.SlabDonate`
+  (minted in the root set of necessity), consuming, permanent, with the static
+  array as extent 0 so the kernel boots with no donation. NINE kinds converted
+  (Events, Waiters, Interrupts, Attachments, Timers, Memories, IoMemories,
+  Mappings, FreeRanges — design 28's named first customer) through ONE generic
+  `Slab<T, const N: Int>` in the new `kcore.slab`; the kind vocabulary is a
+  dedicated `SlabKind` in `sosabi.ops` rather than `ObjType`, which is the wrong
+  set in both directions (it holds undonatable kinds and MISSES the free-range
+  nodes, which have no `ObjType` at all). **THE `borrows` ACCESSOR IS WHY THIS
+  WAS SMALL: `EVENTS[i]` keeps its exact spelling, so ~370 access sites did not
+  move** and the whole risk sat in the TWELVE loop bounds that had to become
+  `capacity()`. **THREE KINDS EXCLUDED BY NAME, each with its reason** — PIPES
+  (ten satellite arrays on a DERIVED index), THREADS (one satellite, the frame
+  arena; excluded on RISK to the context-switch path and named as the cheapest
+  next increment), CLOCKS (not a slab). Processes stay unit 6b. Gate: baseline
+  234/234 at `b613c5a` hashing to the same `d37d2db` main records, then
+  **238/238, 119 cases**; every pre-existing case line BYTE-IDENTICAL both
+  arches and the normalised transcripts diffing to ZERO. **ONE unanticipated
+  motion, reported not hidden: 119 riscv32 images grew a uniform +40 bytes**
+  (arm64: 0) because the new floor `@export` links into every image as all ~40
+  of its neighbours do. TWO SL ENTRIES FILED (SL-21 struct-typed `static` refused
+  as a repeat-literal value; SL-22 a `static` initializer cannot wrap after `=`).
+  **THREE THINGS THE LEAD SHOULD SEE**: (a) design 25 D-6's "a handle word's
+  index bits span the chain" is FALSE for this kernel — a handle names a
+  per-process TABLE ROW and the row names the slot in a full `Int`, so
+  `HANDLE_INDEX_BITS` bounds `MAX_HANDLES` and not slab capacity, and the brief's
+  requested assert was replaced with two honest ones; (b) the brief's refusal
+  word `BadState` is a `FaultReason` here, not a `SosStatus`, so the safety
+  condition ENDS the caller — which matches the doctrine and is what the negative
+  case asserts; (c) the `maps == 0` half of the condition is implemented but
+  UNTESTED (it wants a live mapping, a bigger case), named as a finding.
+  **THE 1.5 SEAM IS OPEN AND ONE LINE**: `Slab.extent_addr` returns the physical
+  address raw with the conversion site written at it, so whichever of 029/032
+  rebases second changes exactly that return to `hal.phys_to_virt(...)`.
 
 - M6 (after M5): the storage milestone — seed `designs/030` (user-
   ruled Sep 3): flash-first block driver, RO archive fs + a simple
@@ -364,3 +399,23 @@ One entry per issue, resolution-sufficient: the symptom verbatim, the probe/site
   func main() { print("{}", consume(Handle(7))) }
   ```
   Workaround in-tree: name every re-exported symbol — `kernel/abi/src/lib.saw`'s facade lists all 138 (generated from the leaves' public declarations, so the surface is provably the pre-split one), with the reason written in its header. The selective form carries an alias WHOLE, verified by probe in every position the split needed: construction, annotation, struct field, parameter, return, and the implicit widening to the underlying, two hops from the declaring module. Resolution: make a glob bind every public declaration KIND, aliases included — a `type` is a declaration like any other and nothing in design 150 or 229 says otherwise; failing that, a diagnostic AT THE GLOB naming what it declined to bind, since the current one fires at a use site in a module that may not import the alias's declarer and cannot see that a glob was involved.
+- SL-21 — A STRUCT-TYPED `static` MAY NOT BE A REPEAT LITERAL'S VALUE, THOUGH AN INTEGER-TYPED ONE MAY, AND THOUGH THE SAME STRUCT LITERAL WRITTEN INLINE COMPILES: ``static `C` must be initialized by a compile-time constant`` (design 32, `kernel/core/waitables.saw`, sawc 0.4.0 @ `46eebb36`). The hint that comes with it lists "an earlier module `static`" among the things a constant expression may name, which is what makes this look like a bug rather than a rule — the entry is a `static` and it IS earlier. Minimal repro, one file, hosted:
+  ```saw
+  struct Slot { a: Int, b: Int }
+  static N: Int = 4
+  static ZERO_INT: Int = 0
+  static ZERO_SLOT: Slot = Slot(a: 0, b: 0)
+
+  unsafe static var A: [Int; N] = [ZERO_INT; N]          // compiles
+  unsafe static var B: [Slot; N] = [Slot(a: 0, b: 0); N] // compiles
+  unsafe static var C: [Slot; N] = [ZERO_SLOT; N]        // error
+  ```
+  So the repeat literal's VALUE position accepts a struct literal and an integer static but not a struct static, and the three are equally constant. It bites where a slab's zero element is wanted by name: design 32 converts nine kernel slabs whose initializers each repeat a zero slot, and naming that slot once per kind (`static ZERO_EVENT: EventSlot = ...`) is exactly what the size-in-one-place idiom would suggest. Workaround in-tree: write the struct literal INLINE inside each repeat, which is what the arrays already did before the conversion, so nothing regressed — but the nine initializers now repeat their field lists in the one place a name would have read better. Resolution: let a repeat literal's value name a `static` of any constant-constructible type, exactly as it names an integer one — or, if the restriction is deliberate, say which types the value position admits and make the hint stop advertising "an earlier module `static`" for a case it does not accept.
+- SL-22 — A `static` DECLARATION'S INITIALIZER CANNOT WRAP AFTER THE `=`, WHICH FORCES A LONG GENERIC TYPE ONTO ONE OVER-LENGTH LINE: ``Parse error at 289:72: Unexpected token: NEWLINE`` (design 32, `kernel/core/waitables.saw`, sawc 0.4.0 @ `46eebb36`). A newline ends a statement, and neither spelling of the wrap is available, so a declaration whose type must be written TWICE — which is every generic `static`, since constructors do not infer type arguments (design 93/105) — has no legal way to fit a line budget:
+  ```saw
+  unsafe static var EVENTS: Slab<EventSlot, MAX_EVENTS> =
+      Slab<EventSlot, MAX_EVENTS>(...)      // error: Unexpected token: NEWLINE
+  unsafe static var EVENTS: Slab<EventSlot, MAX_EVENTS>
+      = Slab<EventSlot, MAX_EVENTS>(...)    // same, at the other break
+  ```
+  Only the argument LIST wraps, because it is inside `(`/`)` (design 129), so the head `NAME: T<...> = T<...>(` must be one line. In-tree that is 100–118 characters on nine declarations against a file that otherwise holds ~80, which is the whole cost — the code is correct and reads fine, it simply cannot be formatted. This is DF-172d's shape (unbracketed expressions do not wrap) at a declaration rather than at a binary operator, and a `type` alias is not the way out: an alias over a struct is a DISTINCT type whose back-conversion takes one argument, not the memberwise initializer. Workaround in-tree: accept the long lines, noted at the block. Resolution: allow a break after `=` in a declaration whose right-hand side is unambiguously incomplete, which is the same judgement the bracket rule already makes — or make constructor type arguments infer from the annotation, which removes the second spelling and the problem with it.
