@@ -59,6 +59,7 @@ import sosabi.{
     PipeReplyOp,
     PipeRequestOp,
     EventMode,
+    SlabKind,
     ClockType,
     MapAccess,
     MAP_ACCESS_MASK,
@@ -115,6 +116,7 @@ import sosabi.{
 }
 import kcore.limits.{
     MAX_HANDLES,
+    MAX_SLAB_CAPACITY,
     NO_ATTACHMENT,
     NO_EVENT,
     NO_INTERRUPT,
@@ -129,6 +131,7 @@ import kcore.limits.{
     PIPE_INFLIGHT,
 }
 import kcore.mem.{align_up}
+import kcore.preempt.{long_zero}
 import imgformat.{SegFlag}
 import kcore.result.{
     SyscallResult,
@@ -146,12 +149,14 @@ import kcore.objects.{
     ClockObject,
     EventObject,
     HandleEntry,
+    FREE_RANGES,
     IOMEMORIES,
     InterruptObject,
     IoMemoryObject,
     IoMemorySlot,
     MAPPINGS,
     MEMORIES,
+    memory_retire_donated,
     MappingObject,
     MappingSlot,
     MemoryObject,
@@ -419,6 +424,16 @@ func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt, arg1: UInt,
             }
             process_create(p, arg0, arg1)
         },
+        // THE SIXTH OP, AND THE ONLY ONE THAT CHANGES THE MACHINE (sawos design
+        // 32, M5 unit 6). `arg0` is the `SlabKind`, `arg1` the Memory handle it
+        // consumes — the second System op to read both, on `ProcessCreate`'s
+        // precedent and through the same decoder.
+        case SlabDonate -> {
+            if not obj.allows(SystemRight.SlabDonate) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            slab_donate(p, arg0, arg1)
+        },
     }
 }
 
@@ -681,6 +696,156 @@ func memory_arg(p: Int, handle: UInt) unsafe -> Int {
         case Unbound -> fault_process(p, FaultReason.BadHandle),
         case _ -> fault_process(p, FaultReason.BadHandle),
     }
+}
+
+// =============================================================================
+// `SystemOp.SlabDonate` — capacity becomes policy (sawos design 32, M5 unit 6)
+// =============================================================================
+//
+// THE WHOLE OP IS THREE QUESTIONS AND ONE IRREVERSIBLE STEP. May this caller do
+// it (a right); is this region safe to absorb (the condition unit 5 made
+// expressible); does it hold a whole slot and has the chain room (the machine's
+// two answers). Only then does anything move, and what moves is permanent.
+
+/// One donatable slab's GEOMETRY: how many bytes a slot needs, what its base
+/// must be aligned to, how many more extents it can take, and how many slots it
+/// already holds.
+///
+/// Four numbers in one match rather than four matches, because they are asked
+/// together and a kind that answered one of them from a different slab than the
+/// others would be a silent corruption rather than a compile error.
+func slab_geometry(kind: SlabKind) unsafe -> (Int, Int, Int, Int) {
+    match kind {
+        case Events -> (EVENTS.slot_bytes(), EVENTS.slot_align(), EVENTS.extents_left(), EVENTS.capacity()),
+        case Waiters -> (WAITERS.slot_bytes(), WAITERS.slot_align(), WAITERS.extents_left(), WAITERS.capacity()),
+        case Interrupts -> (INTERRUPTS.slot_bytes(), INTERRUPTS.slot_align(), INTERRUPTS.extents_left(), INTERRUPTS.capacity()),
+        case Attachments -> (ATTACHMENTS.slot_bytes(), ATTACHMENTS.slot_align(), ATTACHMENTS.extents_left(), ATTACHMENTS.capacity()),
+        case Timers -> (TIMERS.slot_bytes(), TIMERS.slot_align(), TIMERS.extents_left(), TIMERS.capacity()),
+        case Memories -> (MEMORIES.slot_bytes(), MEMORIES.slot_align(), MEMORIES.extents_left(), MEMORIES.capacity()),
+        case IoMemories -> (IOMEMORIES.slot_bytes(), IOMEMORIES.slot_align(), IOMEMORIES.extents_left(), IOMEMORIES.capacity()),
+        case Mappings -> (MAPPINGS.slot_bytes(), MAPPINGS.slot_align(), MAPPINGS.extents_left(), MAPPINGS.capacity()),
+        case FreeRanges -> (FREE_RANGES.slot_bytes(), FREE_RANGES.slot_align(), FREE_RANGES.extents_left(), FREE_RANGES.capacity()),
+    }
+}
+
+/// Append the extent. The caller has validated everything and ZEROED the bytes;
+/// this is the step that makes them reachable.
+func slab_install(kind: SlabKind, base: UInt, slots: Int) unsafe -> Bool {
+    match kind {
+        case Events -> EVENTS.donate(base, slots),
+        case Waiters -> WAITERS.donate(base, slots),
+        case Interrupts -> INTERRUPTS.donate(base, slots),
+        case Attachments -> ATTACHMENTS.donate(base, slots),
+        case Timers -> TIMERS.donate(base, slots),
+        case Memories -> MEMORIES.donate(base, slots),
+        case IoMemories -> IOMEMORIES.donate(base, slots),
+        case Mappings -> MAPPINGS.donate(base, slots),
+        case FreeRanges -> FREE_RANGES.donate(base, slots),
+    }
+}
+
+/// §2's `slab_donate(kind:memory:)` — root hands the kernel memory to back a
+/// named slab, forever.
+///
+/// **THE SAFETY CONDITION IS UNIT 5's TWO COUNTS, and that is why this op could
+/// not have been written before it** (design 25 D-6; sawos design 28). The
+/// kernel is about to start writing its own object slots into these bytes, so
+/// nothing else may be able to see them: `refs == 1` says the handle being
+/// consumed is the region's ONLY reference, and `maps == 0` says no installed
+/// grant row reaches it from any domain. Before design 28 the second question
+/// had no answer to read — a region did not know how many rows named it — so the
+/// honest version of this op did not exist.
+///
+/// A POOL ROOT NEEDS THE THIRD COUNT for `memory_release_if_idle`'s own reason:
+/// pieces on loan carry a back-reference to the slot, and retiring it under them
+/// would make those references name a stranger.
+///
+/// **WHICH REFUSALS ARE FAULTS AND WHICH ARE STATUSES**, on design 178's split:
+/// a missing right, an unknown kind, a handle that is not a Memory, and each of
+/// the three state conditions are all things THE CALLER COULD HAVE CHECKED — it
+/// minted the siblings, it installed the rows, it split the pieces — so they end
+/// the process. Whether a region holds a whole slot of some kind the caller
+/// cannot name, and whether the extent chain has room, are MACHINE answers, so
+/// they come back as `NoResource` with nothing consumed and the caller's
+/// capability untouched.
+func slab_donate(p: Int, raw_kind: UInt, handle: UInt) unsafe -> SyscallResult {
+    guard let kind = SlabKind.from(raw: raw_kind) else {
+        fault_process(p, FaultReason.BadArg)
+    }
+    let slot = memory_arg(p, handle)
+
+    if MEMORIES[slot].refs != 1 {
+        fault_process(p, FaultReason.BadState)
+    }
+    if MEMORIES[slot].maps != 0 {
+        fault_process(p, FaultReason.BadState)
+    }
+    let root = MEMORIES[slot].root
+    if root == slot && MEMORIES[slot].out_bytes != 0 {
+        fault_process(p, FaultReason.BadState)
+    }
+
+    let base = MEMORIES[slot].base
+    let len = MEMORIES[slot].len
+    let (stride_i, align_i, room, held) = slab_geometry(kind)
+    let stride = stride_i as UInt
+    let align = align_i as UInt
+
+    // Aligned by ARITHMETIC, not by refusal. A region's base is whatever the
+    // pool's cursor reached, and the caller cannot know a kernel slot's
+    // alignment — so a misaligned donation is not a caller mistake to fault on.
+    // The remainder form never overflows, which `align_up` on a near-max base
+    // would.
+    let rem = base % align
+    let pad: UInt = if rem == 0 { 0 } else { align - rem }
+    if pad >= len {
+        return op_status(SosStatus.NoResource)
+    }
+    let start = base + pad
+    let slots = ((len - pad) / stride) as Int
+    if slots <= 0 {
+        return op_status(SosStatus.NoResource)
+    }
+    if room <= 0 {
+        return op_status(SosStatus.NoResource)
+    }
+    // The machine-wide ceiling, checked HERE so that `slab_install`'s refusal
+    // stays what it says it is: a kernel invariant that was violated, not a
+    // caller condition nobody looked at.
+    if slots > MAX_SLAB_CAPACITY - held {
+        return op_status(SosStatus.NoResource)
+    }
+
+    // **ZERO BEFORE INSTALLING, AND THE ORDER IS THE ARGUMENT.** A slab slot
+    // must start Free, and `SlotState.Free` is zero in every converted kind, so
+    // a zeroed extent is an extent full of free slots by construction — the same
+    // claim the static arrays' zerofill initializers make (design 149).
+    //
+    // AUDIT (design 1): this is the one place this unit takes preemption points,
+    // and it is `long_zero`'s ordinary contract. It is SAFE HERE because nothing
+    // is half-built across a point: the extent is not installed yet, so no
+    // allocator and no teardown sweep can reach these bytes, and the handle is
+    // not consumed yet, so the region is still exactly the caller's. A delivery
+    // landing mid-zero finds the machine in the state it was in before the call.
+    long_zero(start, (slots as UInt) * stride)
+
+    if not slab_install(kind, start, slots) {
+        fatal_kernel("a validated slab donation was refused", raw_kind)
+        return op_status(SosStatus.NoResource)
+    }
+
+    // **THE CONSUME, AND IT DELIBERATELY DOES NOT GO THROUGH `unref_object`.**
+    // The ordinary path would reach `memory_release_if_idle`, which returns the
+    // range to its pool root's free list — and the next `Split` would hand a
+    // slab's backing store to somebody else. Donation is PERMANENT (design 25
+    // D-6, the mapping-leak stance): the slot comes back, the BYTES never do,
+    // and a derived region's length stays charged to its root's `out_bytes`
+    // forever, which is what keeps the root from ever being handed on with a
+    // slab living inside it. Pool returns for donated ranges are recorded, not
+    // built.
+    unbind_handle(p, handle_word_index(handle))
+    memory_retire_donated(slot)
+    op_ok()
 }
 
 /// Would `[base, base + len)` run past the end of the address space?

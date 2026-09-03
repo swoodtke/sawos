@@ -122,6 +122,17 @@
 /// handle stripped of this bit cannot spawn — which is the attenuation the old
 /// placement only appeared to offer, since with a root/launcher topology a
 /// creation right on the CALLER's own Process handle gates nothing real.
+///
+/// `SlabDonate` is the newest bit (sawos design 32, M5 unit 6), and it is the
+/// most powerful one on this object: it hands the KERNEL memory to keep
+/// forever. It is its own bit rather than a reading of `ProcessCreate` or
+/// `Mint` because it is a different kind of authority — those spend a resource
+/// the machine already has, this one CHANGES HOW MUCH the machine has, for every
+/// process, permanently. A launcher handed a System handle without it can create
+/// processes and mint handles all day and can never move a slab ceiling; a boot
+/// server that is meant to size the machine keeps it and hands its children
+/// System siblings stripped of it, which is the ordinary attenuation and is why
+/// the bit has to exist separately to be strippable at all.
 public enum SystemRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
@@ -130,6 +141,7 @@ public enum SystemRight: UInt32 {
     case ClockGet = 1 << 10,
     case ProcessCreate = 1 << 11,
     case ProcessSelf = 1 << 12,
+    case SlabDonate = 1 << 13,
 }
 
 // The universal low byte, pinned. Every kind's enum repeats these two asserts
@@ -933,9 +945,16 @@ public func rights_allow_mint(rights: UInt32) -> Bool {
 /// Attenuation is monotonic, so a right withheld here can never appear later —
 /// which is the right default for a set the boot handle hands out.
 public func root_system_rights() -> UInt32 {
+    // `SlabDonate` MINTS IN THE ROOT SET OF NECESSITY (sawos design 32): §3's
+    // attenuation is monotonic, so a right nothing starts with is a right
+    // nothing can ever hold. Root is init and its authority IS the machine —
+    // the same argument that makes its quota rows unlimited — and a deployment
+    // that does not want its children sizing slabs strips the bit on the way
+    // down, which is what every other bit here is for.
     ((SystemRight.Debug as UInt32) | (SystemRight.Shutdown as UInt32)
      | (SystemRight.ProcessSelf as UInt32) | (SystemRight.ClockGet as UInt32)
      | (SystemRight.ProcessCreate as UInt32) | (SystemRight.Mint as UInt32)
+     | (SystemRight.SlabDonate as UInt32)
      | (SystemRight.Transfer as UInt32))
 }
 

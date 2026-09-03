@@ -25,6 +25,7 @@ import kcore.limits.{
     MAX_ATTACHMENTS,
     MAX_EVENTS,
     MAX_INTERRUPTS,
+    MAX_SLAB_EXTENTS,
     MAX_THREADS,
     MAX_WAITERS,
     NO_ATTACHMENT,
@@ -33,6 +34,7 @@ import kcore.limits.{
     NO_THREAD,
     NO_WAITER,
 }
+import kcore.slab.{Slab}
 import kcore.objects.{
     ExchangeState,
     PIPES,
@@ -277,27 +279,51 @@ public(package) struct Attachment {
     public(package) link: Int,
 }
 
-public(package) unsafe static var EVENTS: [EventSlot; MAX_EVENTS] = [
-    EventSlot(state: SlotState.Free, process: 0, mode: EventMode.Or, word: 0,
-              attachment: 0, refs: 0); MAX_EVENTS]
+// **FOUR EXTENT CHAINS SINCE M5 UNIT 6** (sawos design 32). Each of these is a
+// `Slab<T, N>` rather than a bare `[T; N]`: the array is EXTENT 0 and the
+// `MAX_<KIND>` beside it is the compiled floor, so nothing about a machine that
+// never donates has moved. `EVENTS[i]` still names slot `i` — the accessor lends
+// the slot where it sits — and what changed is every LOOP BOUND below, which now
+// reads `capacity()` so that a donated slot is one the allocator can find.
 
-public(package) unsafe static var WAITERS: [WaiterSlot; MAX_WAITERS] = [
-    WaiterSlot(state: SlotState.Free, process: 0, attached: 0,
-               blocked: 0, refs: 0); MAX_WAITERS]
+public(package) unsafe static var EVENTS: Slab<EventSlot, MAX_EVENTS> = Slab<EventSlot, MAX_EVENTS>(
+    inline: [EventSlot(state: SlotState.Free, process: 0, mode: EventMode.Or,
+                       word: 0, attachment: 0, refs: 0); MAX_EVENTS],
+    ext_base: [0; MAX_SLAB_EXTENTS],
+    ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_count: 0,
+    total: MAX_EVENTS)
 
-public(package) unsafe static var INTERRUPTS: [InterruptSlot; MAX_INTERRUPTS] = [
-    InterruptSlot(state: SlotState.Free, process: 0, line: 0, pending: false,
-                  attachment: 0, refs: 0); MAX_INTERRUPTS]
+public(package) unsafe static var WAITERS: Slab<WaiterSlot, MAX_WAITERS> = Slab<WaiterSlot, MAX_WAITERS>(
+    inline: [WaiterSlot(state: SlotState.Free, process: 0, attached: 0,
+                        blocked: 0, refs: 0); MAX_WAITERS],
+    ext_base: [0; MAX_SLAB_EXTENTS],
+    ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_count: 0,
+    total: MAX_WAITERS)
 
-public(package) unsafe static var ATTACHMENTS: [Attachment; MAX_ATTACHMENTS] = [
-    Attachment(state: SlotState.Free, kind: WaitableKind.Event, target: 0,
-               waiter: 0, key: 0, oneshot: false, owns: false,
-               link: 0); MAX_ATTACHMENTS]
+public(package) unsafe static var INTERRUPTS: Slab<InterruptSlot, MAX_INTERRUPTS> = Slab<InterruptSlot, MAX_INTERRUPTS>(
+    inline: [InterruptSlot(state: SlotState.Free, process: 0, line: 0,
+                           pending: false, attachment: 0,
+                           refs: 0); MAX_INTERRUPTS],
+    ext_base: [0; MAX_SLAB_EXTENTS],
+    ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_count: 0,
+    total: MAX_INTERRUPTS)
+
+public(package) unsafe static var ATTACHMENTS: Slab<Attachment, MAX_ATTACHMENTS> = Slab<Attachment, MAX_ATTACHMENTS>(
+    inline: [Attachment(state: SlotState.Free, kind: WaitableKind.Event,
+                        target: 0, waiter: 0, key: 0, oneshot: false,
+                        owns: false, link: 0); MAX_ATTACHMENTS],
+    ext_base: [0; MAX_SLAB_EXTENTS],
+    ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_count: 0,
+    total: MAX_ATTACHMENTS)
 
 /// Take a free event slot, or `NO_EVENT` when the slab is empty.
 public(package) func alloc_event() unsafe -> Int {
     var i: Int = 0
-    while i < MAX_EVENTS {
+    while i < EVENTS.capacity() {
         match EVENTS[i].state {
             case Free -> { return i },
             case Live -> {},
@@ -310,7 +336,7 @@ public(package) func alloc_event() unsafe -> Int {
 /// Take a free waiter slot, or `NO_WAITER` when the slab is empty.
 public(package) func alloc_waiter() unsafe -> Int {
     var i: Int = 0
-    while i < MAX_WAITERS {
+    while i < WAITERS.capacity() {
         match WAITERS[i].state {
             case Free -> { return i },
             case Live -> {},
@@ -323,7 +349,7 @@ public(package) func alloc_waiter() unsafe -> Int {
 /// Take a free interrupt slot, or `NO_INTERRUPT` when the slab is empty.
 public(package) func alloc_interrupt() unsafe -> Int {
     var i: Int = 0
-    while i < MAX_INTERRUPTS {
+    while i < INTERRUPTS.capacity() {
         match INTERRUPTS[i].state {
             case Free -> { return i },
             case Live -> {},
@@ -336,7 +362,7 @@ public(package) func alloc_interrupt() unsafe -> Int {
 /// Take a free attachment slot, or `NO_ATTACHMENT` when the slab is empty.
 public(package) func alloc_attachment() unsafe -> Int {
     var i: Int = 0
-    while i < MAX_ATTACHMENTS {
+    while i < ATTACHMENTS.capacity() {
         match ATTACHMENTS[i].state {
             case Free -> { return i },
             case Live -> {},
@@ -891,7 +917,7 @@ public(package) func detach_attachment(w: Int, a: Int) unsafe {
 /// refuses using exactly this walk.
 public(package) func interrupt_by_line(line: UInt) unsafe -> Int {
     var i: Int = 0
-    while i < MAX_INTERRUPTS {
+    while i < INTERRUPTS.capacity() {
         match INTERRUPTS[i].state {
             case Live -> {
                 if INTERRUPTS[i].line == line {

@@ -319,6 +319,62 @@ static_assert(PIPE_INFLIGHT <= 64,
 /// Handles one process's table can hold (§3).
 public(package) static MAX_HANDLES: Int = 16
 
+// =============================================================================
+// THE EXTENT CHAIN (sawos design 32, M5 unit 6; design 25 D-6)
+// =============================================================================
+//
+// **EVERY NUMBER ABOVE IS NOW A FLOOR RATHER THAN A CEILING, for the nine kinds
+// design 32 converted.** A `MAX_<KIND>` is extent 0's length — what the image is
+// built with, what the kernel boots on, and what a machine that never donates
+// still gets — and `SlabDonate` raises the machine's actual capacity above it.
+// The numbers did not change and neither did the argument for choosing them:
+// they are the smallest that serve the workload of record, and the deployment
+// that wants more now says so instead of asking for a recompile.
+
+/// DONATED extents one slab may accept, beyond its compiled extent 0.
+///
+/// Four, and the number is about the TABLE rather than about the memory: each
+/// extent costs a base and a slot count in every converted slab's static, so the
+/// cost is paid by kinds that are never donated to as well. A deployment wanting
+/// one kind very large donates one large region rather than four small ones,
+/// which is the shape a boot-time policy actually has — donation is permanent in
+/// v1, so nothing here is spent and re-spent.
+///
+/// A fifth donation for one kind answers `NoResource`, which is that status
+/// meaning exactly what it always meant: the machine cannot do this right now.
+public(package) static MAX_SLAB_EXTENTS: Int = 4
+
+/// The largest total capacity any one slab may reach.
+///
+/// **WHAT `HANDLE_INDEX_BITS` DOES AND DOES NOT BOUND, recorded here because the
+/// design that asked for this assert assumed the other answer** (design 25 D-6:
+/// "a handle word's index bits span the chain"). In THIS kernel they do not. A
+/// handle word is `(generation, index)` where the index names a row of the
+/// CALLER'S OWN HANDLE TABLE (§3), and the row then names the slab slot in a
+/// full-width `Int` field (`HandleEntry.target`) — so a slab may grow past
+/// `1 << HANDLE_INDEX_BITS` without a single extra index bit, and design 32
+/// needed no change to the handle word at all.
+///
+/// What `HANDLE_INDEX_BITS` really bounds is `MAX_HANDLES`, the PER-PROCESS
+/// table (the assert lives with the decoder, in `kcore.objects`) — and that is
+/// the ceiling a deployment actually meets: however many Events the machine can
+/// hold, one process can NAME at most `MAX_HANDLES` of them at once. Raising
+/// that is raising a `MAX_PROCESSES`-shaped array, which is unit 6b's subject
+/// and deliberately not this unit's.
+///
+/// So the honest relation to pin is the one below: the machine's slab ceiling is
+/// never the thing that stops every process from filling its table.
+public(package) static MAX_SLAB_CAPACITY: Int = 1 << 20
+
+static_assert(MAX_SLAB_CAPACITY >= MAX_HANDLES * MAX_PROCESSES,
+              "a slab must be able to back every handle every process could hold")
+
+static_assert(MAX_SLAB_CAPACITY < Int.max / 1024,
+              "slot arithmetic (index * slot bytes) must not overflow a platform Int")
+
+static_assert(MAX_SLAB_EXTENTS >= 1,
+              "a slab that can accept no donation is not a chain")
+
 /// Bytes reserved per thread for its saved context.
 ///
 /// A STRIDE, not a size: the frame layout is the HAL's and differs per profile

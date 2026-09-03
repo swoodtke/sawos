@@ -23,6 +23,7 @@
 //! region, and the five objects a Process mints.
 
 import sosabi.{SosStatus, SystemOp, ProcessOp, MemoryOp, IoMemoryOp, MINT_OP,
+               SlabKind,
                SystemHandle, ProcessHandle, ThreadHandle, EventHandle,
                WaiterHandle, InterruptHandle, ClockHandle, MemoryHandle,
                IoMemoryHandle, MappingHandle,
@@ -56,7 +57,8 @@ import sos.floor.{ALL_RIGHTS, call_value, checked, park_system_handle,
                   sos_handle_release, sos_process_boot_handle_next,
                   sos_process_exit, sos_process_give, sos_process_pipe_create,
                   sos_process_start, sos_process_stats,
-                  sos_system_debug_print, sos_system_shutdown, sos_waiter_add}
+                  sos_system_debug_print, sos_system_shutdown,
+                  sos_system_slab_donate, sos_waiter_add}
 import sos.memory.{Memory}
 import sos.iomemory.{IoMemory}
 import sos.mapping.{Mapping}
@@ -284,6 +286,42 @@ extension System {
         let raw = try call_value(self.handle, SystemOp.ProcessCreate as UInt,
                                  image.handle, memory.handle, 0)
         return Process(handle: ProcessHandle(raw))
+    }
+
+    /// Give the kernel `memory` to back the slab `kind` names — PERMANENTLY.
+    /// Requires `SystemRight.SlabDonate` (sawos design 32, M5 unit 6).
+    ///
+    /// **THIS IS HOW A DEPLOYMENT SIZES THE MACHINE.** Every `MAX_<KIND>` in the
+    /// kernel is a compiled FLOOR, not a ceiling: the image boots on its static
+    /// arrays and a boot server that wants a system with more events, more
+    /// timers or more regions than the build chose donates the storage for them.
+    /// `SosStatus.NoResource` from a create op afterwards means the same thing it
+    /// always meant — the slab is full — at whatever ceiling the deployment set.
+    ///
+    /// **IT CONSUMES THE REGION AND NOTHING GIVES IT BACK.** Donation is
+    /// permanent in v1: the bytes become kernel object storage, the capability is
+    /// spent, and the range never returns to any pool. The kernel refuses — by
+    /// ENDING the caller — a region it cannot safely absorb: one that any other
+    /// handle still names, one with a mapping row installed, or a pool root with
+    /// pieces still on loan. Those are all conditions the caller created and can
+    /// see, which is why they fault rather than answer.
+    ///
+    /// ON A REFUSAL THE REGION COMES BACK, in the error, which is `Waiter.give`'s
+    /// shape and is here for the same reason: the two refusals that are STATUSES
+    /// (a region too small to hold one slot of that kind, a slab whose extent
+    /// chain is full) consume nothing, so a caller that has just been told "not
+    /// this one" still owns its memory and must be handed it back rather than
+    /// left holding a disarmed wrapper.
+    public func slab_donate(&self, kind: SlabKind,
+                            memory: Memory) -> Result<Void, (SosStatus, Memory)> {
+        var region = move memory
+        let word: UInt = region.handle
+        region.handle = MemoryHandle(NO_HANDLE)
+        try checked(sos_system_slab_donate(self.handle, kind as UInt, word)) catch {
+            let back: (SosStatus, Memory) = (error, Memory(handle: MemoryHandle(word)))
+            return move back
+        }
+        return
     }
 
     /// This process's Clock for `type` — a GRANTED TIME SOURCE. Requires

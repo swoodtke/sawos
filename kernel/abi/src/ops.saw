@@ -171,12 +171,22 @@ public static MINT_OP: UInt = 0xFFFE
 /// table is the precedent: a Process handle has always been something you ask
 /// the System object for. It is gated on `SystemRight.ProcessCreate`; its
 /// ARGUMENTS are two Memory handles, which spend no right of their own.
+///
+/// `SlabDonate` is the sixth, and it is the first op on any object that changes
+/// what the MACHINE can hold rather than what the caller holds (sawos design 32,
+/// M5 unit 6; design 25 D-6). It takes a `SlabKind` and a Memory handle, CONSUMES
+/// the capability, and is permanent in v1. It is on System for `ProcessCreate`'s
+/// reason exactly: a slab is a machine-global resource, so the op that sizes one
+/// is a System answer. Its second argument is a Memory handle spending no
+/// `MemoryRight` of its own — the operation's argument, not a second authority —
+/// which is `ProcessCreate`'s rule again and why this decoder already takes two.
 public enum SystemOp: UInt {
     case DebugPrint = 0,
     case Shutdown = 1,
     case ProcessSelf = 2,
     case ClockGet = 3,
     case ProcessCreate = 4,
+    case SlabDonate = 5,
 }
 
 // =============================================================================
@@ -1013,6 +1023,51 @@ public static MAP_ACCESS_MASK: UInt32 = ((MapAccess.Read as UInt32)
 public enum EventMode: UInt {
     case Or = 0,
     case SaturatingSum = 1,
+}
+
+/// **WHICH SLAB A `SystemOp.SlabDonate` IS FEEDING** (sawos design 32, M5 unit
+/// 6; design 25 D-6).
+///
+/// A SMALL DEDICATED ENUM RATHER THAN `ObjType`, and the choice is the unit's
+/// own (the brief left it open). `ObjType` names every kind a HANDLE can name,
+/// and the two sets do not coincide in either direction. It has members that are
+/// not donatable — `Process`, whose storage is `MAX_PROCESSES`-shaped and is
+/// unit 6b's subject; `Clock`, which is a census of domains rather than a slab
+/// and has nothing to run out of; the four pipe kinds, which are two counted
+/// columns over one connection slot with ten parallel arrays behind them. And
+/// the most important donatable slab in the system has NO `ObjType` at all: the
+/// free-range NODES the allocator's free lists are made of are not objects, have
+/// no handles, and are exactly what design 28 named as this op's first customer.
+/// So reusing `ObjType` would mean a vocabulary that is both too wide and too
+/// narrow, with a `from(raw:)` that accepts numbers the kernel then has to
+/// refuse one by one. This enum names EXACTLY the donatable slabs, so a value
+/// that decodes is a value that can be served.
+///
+/// THE NAMES ARE PLURAL, deliberately: a `SlabKind` names a TABLE, not an
+/// object. `SlabKind.Events` is the Event slab, and the reading "one event" is
+/// never available to confuse it with `ObjType.Event`.
+///
+/// A KIND IS ABSENT HERE IFF ITS SLAB HAS PARALLEL STORAGE KEYED BY THE SAME
+/// INDEX, or is `MAX_PROCESSES`-shaped, or is not a slab. Growing a slot array
+/// and leaving its satellite behind would be a memory-safety bug rather than a
+/// small capacity lie, so those kinds are excluded BY NAME rather than served
+/// badly — design 32's As-built carries the table and the per-kind reason.
+///
+/// Backed by `UInt`, the width of the register the kind arrives in, for the
+/// reason `SystemOp` and `EventMode` give: the value is PROCESS-CONTROLLED, so
+/// the decode is exact and `from(raw:)` rejects every number that is not a kind.
+public enum SlabKind: UInt {
+    case Events = 0,
+    case Waiters = 1,
+    case Interrupts = 2,
+    case Attachments = 3,
+    case Timers = 4,
+    case Memories = 5,
+    case IoMemories = 6,
+    case Mappings = 7,
+    /// The allocator's free-list nodes — design 28's named first customer, and
+    /// the one donatable slab that backs no object kind at all.
+    case FreeRanges = 8,
 }
 
 /// **THE MESSAGE BODY'S MAXIMUM, AS A BUILD DEFINE** (spec §2.1's fixed body;

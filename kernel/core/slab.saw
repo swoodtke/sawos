@@ -1,0 +1,181 @@
+//! THE EXTENT CHAIN — how a slab's capacity stops being a compile-time fact
+//! (sawos design 32; design 25 D-6).
+//!
+//! A slab used to BE its static array, and `MAX_<KIND>` was both the array's
+//! length and the machine's answer to "how many of these can exist". This module
+//! separates the two. A slab is now a `Slab<T, N>`: the static array is EXTENT 0
+//! and stays exactly as long as it was, so the kernel boots with the same
+//! compiled floor and before any donation exists; a `SlabDonate` appends a
+//! DONATED EXTENT, and the capacity that allocators and teardown walks read is
+//! the sum.
+//!
+//! **THE SPELLING AT EVERY USE SITE IS UNCHANGED, and that is the point of doing
+//! it this way.** `EVENTS[i].state` means what it always meant, because `[]` is a
+//! `borrows` accessor (design 141/146) that lends the slot WHERE IT SITS —
+//! inside the inline array for an index below the floor, inside donated memory
+//! above it. So this unit moved no access site: a place window is a place window
+//! whichever arm opened it, `&var EVENTS[i]` still borrows a real slot, and the
+//! ~370 indexed reads and writes across `kernel/core/` were not touched. What DID
+//! have to move is every LOOP BOUND — an allocator scanning `0..MAX_EVENTS`
+//! would never see a donated slot — and those sites are named in design 32's
+//! As-built.
+//!
+//! # THE ONE ACCESS FUNNEL
+//!
+//! `extent_addr` below is the ONLY place a donated extent's memory becomes an
+//! address. Every dereference of a donated slot goes through it, which is what
+//! makes the higher-half kernel's sweep (sawos design 29, M5 unit 1.5) a
+//! one-site edit rather than a hunt: see the note at the function.
+//!
+//! # WHY A GENERIC RATHER THAN NINE HAND-WRITTEN SLABS
+//!
+//! Every converted kind wants the identical three things — an inline extent 0, a
+//! chain of donated ones, and an index-to-place lookup — and the only thing that
+//! differs is the slot type and the floor. A const-generic parameter carries the
+//! floor into the type (`Slab<EventSlot, MAX_EVENTS>` IS a distinct type from
+//! `Slab<TimerSlot, MAX_TIMERS>`, with its own layout), so there is one body to
+//! review and one place a bug in the arithmetic could be.
+//!
+//! # WHAT IS NOT HERE
+//!
+//! A kind whose slab has PARALLEL storage keyed by the same index cannot use
+//! this type as it stands, because growing the slot array would leave the
+//! satellite behind. Design 32 excludes those kinds by name rather than growing
+//! them badly — see its As-built for the table and the reasons.
+
+import kcore.limits.{MAX_SLAB_CAPACITY, MAX_SLAB_EXTENTS}
+
+/// A slab: an inline extent 0 of `N` slots, plus up to `MAX_SLAB_EXTENTS`
+/// donated extents.
+///
+/// **EXTENT 0 IS THE STATIC ARRAY**, which is what lets the kernel boot with no
+/// donation at all: `total` starts at `N` and every allocator, every teardown
+/// sweep and every census reads `total`, so a machine that never donates behaves
+/// exactly as it did before this type existed.
+///
+/// The extent table is a pair of parallel fixed arrays rather than a linked list
+/// of nodes, because a chain of at most `MAX_SLAB_EXTENTS` entries walked from
+/// the front is simpler than anything that could hold it and because there is no
+/// allocator underneath a slab to allocate nodes FROM — this is the storage the
+/// rest of the kernel's storage is made of.
+///
+/// `total` is cached rather than summed on demand: `capacity()` is read once per
+/// loop ITERATION in several of the walks that used to read a `static`, and a
+/// sum over the extent table at each of them would be the one place this design
+/// could cost measurable time.
+public(package) struct Slab<T, const N: Int> {
+    /// Extent 0 — the compiled floor, and the whole slab until something donates.
+    public(package) inline: [T; N],
+    /// Each donated extent's base ADDRESS. Physical today; see `extent_addr`.
+    public(package) ext_base: [UInt; MAX_SLAB_EXTENTS],
+    /// How many slots each donated extent holds.
+    public(package) ext_slots: [Int; MAX_SLAB_EXTENTS],
+    /// How many donated extents are live. Only grows — donation is permanent
+    /// in v1 (design 25 D-6, the mapping-leak stance).
+    public(package) ext_count: Int,
+    /// `N` plus every donated extent's slots. The number every walk reads.
+    public(package) total: Int,
+}
+
+extension Slab<T, N> {
+    /// THE ONE ACCESS FUNNEL: the address of slot `i`, which must be at or above
+    /// the floor.
+    ///
+    /// **THIS IS THE COORDINATION SEAM WITH M5 UNIT 1.5** (sawos design 29, the
+    /// higher-half kernel and its linear map). The address returned here is the
+    /// PHYSICAL address the donated Memory region named, and the kernel
+    /// dereferences it directly — which is correct on every tier the tree builds
+    /// today, because the kernel's own addressing is identity on all of them. When
+    /// the linmap lands, the kernel stops being able to touch a physical address,
+    /// and THIS RETURN VALUE is the conversion site: it becomes
+    /// `hal.phys_to_virt(base + offset)`, one edit, here. Nothing else in this
+    /// unit dereferences a donated extent, which is why 1.5's sweep of "every
+    /// kernel-side pointer built from a stored physical address" finds exactly
+    /// one site in the slab machinery.
+    ///
+    /// The walk is bounded by `MAX_SLAB_EXTENTS` and its body is O(1), so it
+    /// takes no preemption point and needs none — design 1's audit argument
+    /// unchanged, restated in design 32's As-built for the loops whose bounds
+    /// moved.
+    public(package) func extent_addr(&self, i: Int) unsafe -> UInt {
+        var rest = i - N
+        var e = 0
+        while e < self.ext_count {
+            let here = self.ext_slots[e]
+            if rest < here {
+                return self.ext_base[e] + ((rest * sizeof<T>()) as UInt)
+            }
+            rest = rest - here
+            e = e + 1
+        }
+        panic("Slab.extent_addr: index out of range: {} (len {})", i, self.total)
+    }
+
+    /// Slot `i`, lent where it sits (design 146's place accessor).
+    ///
+    /// A read opens a shared window and a write an exclusive one, out of this one
+    /// declaration — which is what lets `EVENTS[i].state` and
+    /// `EVENTS[i].state = Live` both keep the spelling they had when `EVENTS` was
+    /// a bare array.
+    ///
+    /// Out of range PANICS, in the house wording (DF-249a) and for the reason a
+    /// direct accessor always does: an index past the capacity is a kernel bug,
+    /// not a caller's mistake — every index reaching here came from a slab scan
+    /// or from a handle entry the table validated.
+    public(package) func [](&self, i: Int) unsafe borrows -> T {
+        if i < 0 || i >= self.total {
+            panic("Slab.[]: index out of range: {} (len {})", i, self.total)
+        }
+        if i < N {
+            lend self.inline[i]
+        } else {
+            let p = self.extent_addr(i) as UnsafePointer<T>
+            lend p[0]
+        }
+    }
+
+    /// How many slots this slab holds RIGHT NOW — the compiled floor plus every
+    /// donation. This is what an allocator scans to and what a teardown sweep
+    /// walks to.
+    public(package) func capacity(&self) -> Int { self.total }
+
+    /// The COMPILED floor — extent 0's length. Used where a number has to be the
+    /// one the image was built with rather than the one the deployment made.
+    public(package) func floor(&self) -> Int { N }
+
+    /// How many bytes one slot needs, which is what turns a donated region's
+    /// LENGTH into a slot count.
+    public(package) func slot_bytes(&self) -> Int { sizeof<T>() }
+
+    /// What a donated extent's base address must be aligned to.
+    public(package) func slot_align(&self) -> Int { alignof<T>() }
+
+    /// How many more extents this slab can accept.
+    public(package) func extents_left(&self) -> Int {
+        MAX_SLAB_EXTENTS - self.ext_count
+    }
+
+    /// Append a donated extent of `slots` slots based at `base`.
+    ///
+    /// The caller has already validated the region, checked the alignment, worked
+    /// out the slot count and ZEROED the bytes — this only records. Answers
+    /// `false` when the extent table is full or the donation would take the slab
+    /// past `MAX_SLAB_CAPACITY`, which the caller turns into `NoResource`: the
+    /// machine cannot take this donation, which is exactly what that status means.
+    ///
+    /// THE CAPACITY TEST IS HERE RATHER THAN AT THE CALLER because this is the
+    /// one function that knows the running total, and a ceiling nothing enforces
+    /// is a comment. It is the runtime half of `MAX_SLAB_CAPACITY`'s asserts:
+    /// they pin the CONSTANT against the handle table and against `Int` overflow,
+    /// and this keeps a real chain under it.
+    public(package) func donate(&var self, base: UInt, slots: Int) -> Bool {
+        if slots <= 0 { return false }
+        if self.ext_count >= MAX_SLAB_EXTENTS { return false }
+        if slots > MAX_SLAB_CAPACITY - self.total { return false }
+        self.ext_base[self.ext_count] = base
+        self.ext_slots[self.ext_count] = slots
+        self.ext_count = self.ext_count + 1
+        self.total = self.total + slots
+        true
+    }
+}

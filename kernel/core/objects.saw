@@ -70,6 +70,7 @@ import kcore.limits.{
     MAX_MEMORIES,
     MAX_PIPES,
     MAX_PROCESSES,
+    MAX_SLAB_EXTENTS,
     MAX_THREADS,
     MAX_TIMERS,
     MAX_WAITERS,
@@ -81,6 +82,7 @@ import kcore.limits.{
     PIPE_INFLIGHT,
 }
 import kcore.diag.{fatal_kernel}
+import kcore.slab.{Slab}
 
 /// One handle-table entry: the object a handle names, the rights its holder has
 /// on it (§3), WHICH object of that kind it is, and which LIFE of this slot it
@@ -955,16 +957,24 @@ public(package) struct MemorySlot {
     public(package) dropped: UInt,
 }
 
-public(package) unsafe static var MEMORIES: [MemorySlot; MAX_MEMORIES] = [
-    MemorySlot(state: SlotState.Free, process: 0, base: 0, len: 0, refs: 0,
-               maps: 0, root: NO_MEMORY, free_head: 0, out_bytes: 0,
-               dropped: 0);
-    MAX_MEMORIES]
+// AN EXTENT CHAIN SINCE M5 UNIT 6 (sawos design 32). `MAX_MEMORIES` is extent
+// 0's length — the floor the image is built with — and the deployment that wants
+// more regions donates them. Note what this does NOT change: a Memory slot is
+// the OBJECT, and donating slots raises how many regions can exist at once
+// without adding a single byte to any pool.
+public(package) unsafe static var MEMORIES: Slab<MemorySlot, MAX_MEMORIES> = Slab<MemorySlot, MAX_MEMORIES>(
+    inline: [MemorySlot(state: SlotState.Free, process: 0, base: 0, len: 0,
+                        refs: 0, maps: 0, root: NO_MEMORY, free_head: 0,
+                        out_bytes: 0, dropped: 0); MAX_MEMORIES],
+    ext_base: [0; MAX_SLAB_EXTENTS],
+    ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_count: 0,
+    total: MAX_MEMORIES)
 
 /// Take a free Memory slot, or `NO_MEMORY` when the slab is full.
 public(package) func alloc_memory() unsafe -> Int {
     var i: Int = 0
-    while i < MAX_MEMORIES {
+    while i < MEMORIES.capacity() {
         match MEMORIES[i].state {
             case Free -> { return i },
             case Live -> {},
@@ -1027,13 +1037,30 @@ public(package) struct FreeRange {
     public(package) next: Int,
 }
 
-unsafe static var FREE_RANGES: [FreeRange; MAX_FREE_RANGES] = [
-    FreeRange(state: SlotState.Free, base: 0, len: 0, next: 0); MAX_FREE_RANGES]
+// **THE NAMED FIRST CUSTOMER OF `SlabDonate`** (sawos design 32; design 28's
+// closing sentence, and design 25 D-6). This is the slab whose exhaustion the
+// allocator answers by LEAKING — a returned range that coalesces into nothing
+// and finds no node is added to its pool's `dropped` and lost, because release
+// is infallible and must stay so. Donating nodes is what turns that from a
+// permanent property of the image into a deployment's choice: after a donation
+// the same release finds a node and the bytes come home.
+//
+// IT STOPPED BEING MODULE-PRIVATE HERE, and the widening is worth a line: the
+// donation dispatch has to name every donatable slab in one `match`, and it
+// sits above `waitables`, so it cannot be written in this file. The privacy was
+// incidental — nothing outside had wanted a node — rather than a guarantee.
+public(package) unsafe static var FREE_RANGES: Slab<FreeRange, MAX_FREE_RANGES> = Slab<FreeRange, MAX_FREE_RANGES>(
+    inline: [FreeRange(state: SlotState.Free, base: 0, len: 0,
+                       next: 0); MAX_FREE_RANGES],
+    ext_base: [0; MAX_SLAB_EXTENTS],
+    ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_count: 0,
+    total: MAX_FREE_RANGES)
 
 /// Take a free node, or `NO_FREE_RANGE` when the slab is full.
 func alloc_free_range() unsafe -> Int {
     var i: Int = 0
-    while i < MAX_FREE_RANGES {
+    while i < FREE_RANGES.capacity() {
         match FREE_RANGES[i].state {
             case Free -> { return i },
             case Live -> {},
@@ -1382,6 +1409,40 @@ public(package) func memory_release_if_idle(slot: Int) unsafe {
     }
 }
 
+/// Retire a Memory slot whose bytes have become a SLAB EXTENT (sawos design 32).
+///
+/// **THE SIBLING OF `memory_release_if_idle`, and the whole of the difference is
+/// the one call it does not make.** A released region gives its range back to
+/// its pool root's free list; a DONATED region must never, because the kernel is
+/// now keeping its own object slots there and the next `Split` would hand them
+/// out. So this frees the SLOT — the object is gone, nothing can name it, and
+/// the slab slot is reusable — while the RANGE stays out of every pool forever.
+///
+/// The bookkeeping that makes that permanent rather than merely unrecorded: a
+/// derived region's length stays counted in its root's `out_bytes`, so the root
+/// still believes those bytes are on loan and can never itself be released or
+/// re-served. That is the mapping-leak stance stated in the ledger instead of in
+/// a comment (design 25 D-6).
+///
+/// A POOL ROOT may be donated whole, and then its free-list nodes go back to the
+/// node slab exactly as `memory_release_if_idle` does it — the caller has already
+/// checked `out_bytes == 0`, so nothing is out on loan to be orphaned.
+///
+/// There is no `refs`/`maps` test here and there must not be: the caller checked
+/// both, and reaching this function is the statement that the region is the
+/// kernel's now.
+public(package) func memory_retire_donated(slot: Int) unsafe {
+    let root = MEMORIES[slot].root
+    if root == slot {
+        pool_drop_nodes(slot)
+    }
+    let owner = MEMORIES[slot].process
+    MEMORIES[slot] = MemorySlot(state: SlotState.Free, process: 0, base: 0,
+                                len: 0, refs: 0, maps: 0, root: NO_MEMORY,
+                                free_head: 0, out_bytes: 0, dropped: 0)
+    quota_credit(owner, QuotaKind.Memory)
+}
+
 // =============================================================================
 // The IoMemory slab (spec §2.5; sawos design 6 D-1)
 // =============================================================================
@@ -1405,14 +1466,22 @@ public(package) struct IoMemorySlot {
     public(package) refs: UInt16,
 }
 
-public(package) unsafe static var IOMEMORIES: [IoMemorySlot; MAX_IOMEMORIES] = [
-    IoMemorySlot(state: SlotState.Free, process: 0, base: 0, len: 0, refs: 0);
-    MAX_IOMEMORIES]
+// AN EXTENT CHAIN SINCE M5 UNIT 6 (sawos design 32). The slab grows; what does
+// NOT grow is the number of device windows a BOARD has, which is what the floor
+// was chosen against — donating IoMemory slots buys a machine that carves one
+// peripheral into many views, not a machine with more peripherals.
+public(package) unsafe static var IOMEMORIES: Slab<IoMemorySlot, MAX_IOMEMORIES> = Slab<IoMemorySlot, MAX_IOMEMORIES>(
+    inline: [IoMemorySlot(state: SlotState.Free, process: 0, base: 0, len: 0,
+                          refs: 0); MAX_IOMEMORIES],
+    ext_base: [0; MAX_SLAB_EXTENTS],
+    ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_count: 0,
+    total: MAX_IOMEMORIES)
 
 /// Take a free IoMemory slot, or `NO_IOMEMORY` when the slab is full.
 public(package) func alloc_iomemory() unsafe -> Int {
     var i: Int = 0
-    while i < MAX_IOMEMORIES {
+    while i < IOMEMORIES.capacity() {
         match IOMEMORIES[i].state {
             case Free -> { return i },
             case Live -> {},
@@ -1477,15 +1546,23 @@ public(package) struct MappingSlot {
     public(package) refs: UInt16,
 }
 
-public(package) unsafe static var MAPPINGS: [MappingSlot; MAX_MAPPINGS] = [
-    MappingSlot(state: SlotState.Free, process: 0, target: 0, row: NO_ROW,
-                refs: 0);
-    MAX_MAPPINGS]
+// AN EXTENT CHAIN SINCE M5 UNIT 6 (sawos design 32), and the one kind where the
+// slab was never the binding wall: a Mapping is an INSTALLED ROW with a handle
+// on it, and the rows are a per-domain hardware budget (`hal.GRANT_ROW_BUDGET`)
+// that no donation touches. Growing this slab lets more mappings exist ACROSS
+// processes; it does not let one process install more.
+public(package) unsafe static var MAPPINGS: Slab<MappingSlot, MAX_MAPPINGS> = Slab<MappingSlot, MAX_MAPPINGS>(
+    inline: [MappingSlot(state: SlotState.Free, process: 0, target: 0,
+                         row: NO_ROW, refs: 0); MAX_MAPPINGS],
+    ext_base: [0; MAX_SLAB_EXTENTS],
+    ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_count: 0,
+    total: MAX_MAPPINGS)
 
 /// Take a free Mapping slot, or `NO_MAPPING` when the slab is full.
 public(package) func alloc_mapping() unsafe -> Int {
     var i: Int = 0
-    while i < MAX_MAPPINGS {
+    while i < MAPPINGS.capacity() {
         match MAPPINGS[i].state {
             case Free -> { return i },
             case Live -> {},
@@ -1505,7 +1582,7 @@ public(package) func alloc_mapping() unsafe -> Int {
 /// remembered across a syscall.
 public(package) func compact_mapping_rows(target: Int, removed: Int) unsafe {
     var i: Int = 0
-    while i < MAX_MAPPINGS {
+    while i < MAPPINGS.capacity() {
         match MAPPINGS[i].state {
             case Live -> {
                 if MAPPINGS[i].target == target && MAPPINGS[i].row > removed {

@@ -296,6 +296,14 @@ MAPPING_SLOT_FREE_PKG = os.path.join(TESTS_DIR, "mapping-slot-free")
 # what leg 2 needs from a child is exactly what that one does, which is to mark
 # a page it was mapped and die.
 MEMORY_RECYCLE_PKG = os.path.join(TESTS_DIR, "memory-recycle")
+
+# M5 unit 6 (sawos design 32): root donates a page to the Waiter slab and creates
+# past the compiled floor. No child, no device — only a pool to cut from.
+SLAB_DONATE_PKG = os.path.join(TESTS_DIR, "slab-donate")
+
+# The negative half: a region with a SIBLING handle is refused, by ending the
+# caller. See the package header for why that is a fault and not a status.
+SLAB_DONATE_SHARED_PKG = os.path.join(TESTS_DIR, "slab-donate-shared")
 CHILD_QUOTA_PKG = os.path.join(TESTS_DIR, "child-quota")
 CHILD_MAPWALL_PKG = os.path.join(TESTS_DIR, "child-mapwall")
 
@@ -4471,6 +4479,54 @@ TEST_CASES = [
                        "SOS recycle: reused read 60",
                        "SOS recycle: done"],
         "expect_clean_exit": True,
+    },
+
+    # =========================================================================
+    # M5 unit 6 — slab donation: capacity becomes policy (sawos design 32)
+    # =========================================================================
+    #
+    # APPENDED, for `memory_recycle`'s reason one section up: the report prints
+    # in case-definition order, so a case added at the END leaves every existing
+    # case's ordinal where a reader of an older transcript left it.
+    #
+    # The case asserts that the ceiling MOVED and never what it moved TO. A
+    # donated extent holds `page / sizeof(WaiterSlot)` slots and that divisor is
+    # per-profile, so the new ceiling is arch-dependent while every line below is
+    # not — see the package's own header.
+    {
+        "name": "slab_donate",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": SLAB_DONATE_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS slabdonate: floor=4 fifth refused: "
+                       "out of kernel objects",
+                       "SOS slabdonate: donated a page of waiters",
+                       "SOS slabdonate: fifth waiter created",
+                       "SOS slabdonate: extent waiter woke key=77 word=4",
+                       "SOS slabdonate: done"],
+        "expect_clean_exit": True,
+    },
+
+    # THE NEGATIVE, and it is a FAULT case: the safety condition's `refs == 1`
+    # half. Root mints a sibling onto the region it then tries to donate, and
+    # the kernel ends it — "object in the wrong state" is `FaultReason.BadState`,
+    # the same wording `process_doublestart` above asserts. The `maps == 0` half
+    # is deliberately uncovered; design 32's As-built names the gap.
+    {
+        "name": "slab_donate_shared",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": SLAB_DONATE_SHARED_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS slabshared: minted a sibling",
+                       "SOS: process fault: object in the wrong state "
+                       "process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
     },
 ]
 

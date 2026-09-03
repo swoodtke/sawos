@@ -1,0 +1,96 @@
+// SOS M5 unit 6, THE NEGATIVE: THE KERNEL NEVER SHARES SLAB BACKING WITH
+// USER-REACHABLE MEMORY (sawos design 32, on design 25 D-6).
+//
+// The transcript:
+//
+//   SOS slabshared: minted a sibling
+//   SOS: process fault: object in the wrong state process=0x...
+//   SOS: process teardown handles=...
+//
+// **THE SAFETY CONDITION IS `refs == 1 && maps == 0`, and this case exercises
+// the first half.** A donated region becomes kernel object storage — the kernel
+// writes Waiter slots into those bytes — so anything else that can still reach
+// them is a hole straight through the object model. `refs` counts the HANDLE
+// ENTRIES naming a region, so the donated handle being the ONLY one is exactly
+// the question "can anybody else still name this?", and unit 5 is what made it
+// askable (design 28 put both counts on the `MemorySlot`).
+//
+// A sibling is the cheapest way to make the condition false and the most honest:
+// `mint` is the ordinary way a second name onto one region comes to exist, and
+// nothing about the sibling is malformed — it is a perfectly good capability
+// that simply must not coexist with a donation.
+//
+// WHY THE PROCESS DIES rather than getting a status back (design 178's faults
+// ruling): root MINTED that sibling. A caller that cannot see a condition it
+// created itself is not a caller the kernel can help, and every other
+// caller-checkable refusal on this path — a handle that names nothing, a handle
+// that is not a Memory, an unknown `SlabKind` — ends the process for the same
+// reason. The two refusals root genuinely cannot compute (a region too small for
+// one slot of some kind whose size is kernel-internal, an extent chain that is
+// full) are statuses instead, and `tests/slab-donate` is where the op returns.
+//
+// The `maps == 0` half is NOT exercised here: proving it wants a live mapping,
+// which wants a second process to map into or a self-map, and it is the same
+// `BadState` out of the same three-condition block two lines below the one this
+// case reaches. Design 32's As-built records that gap by name rather than
+// claiming coverage this case does not have.
+
+import sos.{System, Process, Memory, SlabKind, SosStatus}
+
+/// One protection unit's worth on either profile.
+static PAGE: UInt = 0x1000
+
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS slabshared: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var pool_record = try proc.boot_handle_next() catch {
+        let _ = system.debug_print("SOS slabshared: no pool region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let pool = pool_record.take_memory() else {
+        let _ = system.debug_print("SOS slabshared: pool record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let scratch = try pool.split(len: PAGE) catch {
+        print("SOS slabshared: no page to donate: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // THE SECOND NAME. `sibling` stays live for the rest of this program, which
+    // is the point — a sibling that had been released would leave `refs` at 1
+    // and the donation would be perfectly safe.
+    let sibling = try scratch.mint() catch {
+        print("SOS slabshared: no sibling: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS slabshared: minted a sibling\n")
+
+    // THIS CALL DOES NOT RETURN. Both arms below are unreachable and say so, on
+    // `tests/map-wx-refused`'s pattern: a case whose negative arrives as a fault
+    // must fail loudly if it ever arrives as a value instead.
+    match system.slab_donate(kind: SlabKind.Waiters, memory: move scratch) {
+        case Ok(_) -> {
+            let _ = system.debug_print(
+                "SOS slabshared: UNREACHABLE — a shared region was absorbed\n")
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+        case Err(_) -> {
+            let _ = system.debug_print(
+                "SOS slabshared: UNREACHABLE — refused with a status\n")
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+    }
+}

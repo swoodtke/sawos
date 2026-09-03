@@ -10,8 +10,9 @@
 
 import hal
 import sosabi.{ClockType}
-import kcore.limits.{CLOCK_KINDS, MAX_TIMERS, NO_TIMER}
+import kcore.limits.{CLOCK_KINDS, MAX_SLAB_EXTENTS, MAX_TIMERS, NO_TIMER}
 import kcore.objects.{SlotState}
+import kcore.slab.{Slab}
 
 /// One Clock (spec §2 table; design 232 unit 1, amended Aug 17): a GRANTED TIME
 /// SOURCE, and a KERNEL-ETERNAL one.
@@ -117,10 +118,19 @@ public(package) func clock_slot(kind: ClockType) -> Int {
     (kind as UInt) as Int
 }
 
-public(package) unsafe static var TIMERS: [TimerSlot; MAX_TIMERS] = [
-    TimerSlot(state: SlotState.Free, process: 0, clock: 0, armed: false,
-              deadline_ns: 0, interval_ns: 0, fires: 0,
-              attachment: 0, refs: 0); MAX_TIMERS]
+// AN EXTENT CHAIN SINCE M5 UNIT 6 (sawos design 32) — `MAX_TIMERS` is extent
+// 0's length and the compiled floor; `capacity()` is what every scan reads.
+// **`CLOCKS` ABOVE IS DELIBERATELY NOT ONE**: it is a census of domains rather
+// than a slab (nothing is ever allocated in it and the slot IS the ordinal), so
+// there is no shortage for a donation to relieve — see design 32's kinds table.
+public(package) unsafe static var TIMERS: Slab<TimerSlot, MAX_TIMERS> = Slab<TimerSlot, MAX_TIMERS>(
+    inline: [TimerSlot(state: SlotState.Free, process: 0, clock: 0, armed: false,
+                       deadline_ns: 0, interval_ns: 0, fires: 0,
+                       attachment: 0, refs: 0); MAX_TIMERS],
+    ext_base: [0; MAX_SLAB_EXTENTS],
+    ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_count: 0,
+    total: MAX_TIMERS)
 
 // There is no `alloc_clock`. A Clock is kernel-eternal and its slot is its
 // domain's ordinal (`clock_slot`), so there is nothing to take and nothing to
@@ -129,7 +139,7 @@ public(package) unsafe static var TIMERS: [TimerSlot; MAX_TIMERS] = [
 /// Take a free timer slot, or `NO_TIMER` when the slab is empty.
 public(package) func alloc_timer() unsafe -> Int {
     var i: Int = 0
-    while i < MAX_TIMERS {
+    while i < TIMERS.capacity() {
         match TIMERS[i].state {
             case Free -> { return i },
             case Live -> {},
@@ -295,7 +305,7 @@ extension TimerSlot {
 func earliest_timer_deadline(soonest: UInt64) unsafe -> UInt64 {
     var next = soonest
     var i: Int = 0
-    while i < MAX_TIMERS {
+    while i < TIMERS.capacity() {
         match TIMERS[i].state {
             case Live -> { next = TIMERS[i].sooner_of(next) },
             case Free -> {},

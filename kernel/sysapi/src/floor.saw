@@ -221,6 +221,28 @@ public func sos_system_process_create(handle: UInt, image: UInt, memory: UInt,
                  value_out)
 }
 
+/// Give the kernel a Memory region to back the slab `kind` names, FOREVER
+/// (sawos design 32, M5 unit 6). Requires `SystemRight.SlabDonate`.
+///
+/// The region's capability is CONSUMED on success and donation is permanent in
+/// v1 — nothing gives a donated range back. `kind` is a `SlabKind`.
+///
+/// A kind that is not a `SlabKind`, a handle that names nothing or names
+/// something that is not a Memory, and a region the kernel cannot safely absorb
+/// — one with a sibling handle, one with an installed mapping row, or a pool
+/// root with pieces still on loan — are all FAULTS: the caller minted the
+/// siblings, installed the rows and cut the pieces, so each is something it
+/// could have checked. A region too small to hold one slot of that kind, and a
+/// slab whose extent chain is already full, are `SosStatus.NoResource` — a
+/// STATUS, and the donation did not happen, so the caller's handle is untouched.
+@export("sos_system_slab_donate")
+public func sos_system_slab_donate(handle: UInt, kind: UInt,
+                                   memory: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, SystemOp.SlabDonate as UInt, kind, memory, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
+}
+
 /// Make a thread in this process, ready to start. Requires
 /// `ProcessRight.ThreadCreate`. `entry` may be `ENTRY_IMAGE`.
 @export("sos_process_thread_create")
