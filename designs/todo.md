@@ -309,6 +309,20 @@ entry below or the brief that carries it, never restating either.
   had no `>= (1 << 8)` assert though the rule beside it says one per case.
   `spec.md` untouched per the brief — §5b/§2's tier table is unit 8's, which now
   has a built word and a built profile to describe.
+  **AND ONE PRE-EXISTING FLAKE OBSERVED, NOT CAUSED AND NOT FIXED**: the
+  confirming gate run came back 365/366 on `thread_preempt`, then passed 5/5 in
+  isolation and reproduced the green transcript byte for byte. **CLAUDE.md lists
+  that case's A/B interleave among the rows "that no assertion reads" — an
+  assertion DOES read it** (`"AB", "BA", "AB"` as ordered substrings, which is a
+  good claim well argued in the case's own comment). What breaks is adjacency:
+  the kernel's `SOS: timer tick` lines print into the same stream, and a tick
+  landing between the `B` and the `A` leaves no adjacent `"BA"` on a run whose
+  interleave (`A×7, B, A, B×7`) demonstrated all three crossings. Fix for
+  whoever takes it: match the interleave against the letters-only projection
+  (strip `SOS:` lines), and amend CLAUDE.md in the same pass — the interleave is
+  asserted; the tick COUNT and the `interrupts=` column are the unasserted ones.
+  This unit's only relation to it is that a third profile makes a run longer,
+  which shifts where a tick lands.
   **UNIT 1.5 BUILT (`designs/029`, Sep 3):** the higher-half kernel +
   the linmap seam. The arm64 kernel LINKS at
   `physical + 0xFFFF_FF80_0000_0000` and loads at its physical

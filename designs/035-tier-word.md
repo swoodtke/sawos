@@ -346,6 +346,47 @@ and neither changes behaviour (`static_assert`s are compile-time):
   beside it says "one assert per kind-specific case". Backfilled beside the new
   one — the repetition IS the check, and a hole in it checks nothing.
 
+## 7a. A PRE-EXISTING FLAKE THIS UNIT OBSERVED — `thread_preempt`
+
+Not caused by this unit and not fixed by it, but it fired once during the
+confirming run (365/366) and it contradicts something CLAUDE.md says, so it is
+recorded rather than shrugged at.
+
+CLAUDE.md lists `thread_preempt`'s A/B interleave among the timing-dependent
+rows "that no assertion reads". **An assertion does read it.** The case asserts
+`"AB", "BA", "AB"` as ordered substrings, deliberately and with a good comment
+explaining why direction-changes are the robust claim (whoever goes first, three
+crossings happened).
+
+What the comment does not anticipate is that the substring match needs the
+letters to be **adjacent in the console stream**, and the kernel's own
+`SOS: timer tick …` lines are printed into that same stream. The failing run:
+
+```
+AAAAAAASOS: timer tick 0x00000002 at 0x80200a5e
+BSOS: timer tick 0x00000003 at 0x80200956
+SOS: timer tick 0x00000004 at 0x80200a5e
+ABBBBBBB
+```
+
+The interleave is `A×7, B, A, B×7` — three crossings, exactly what the case
+means to prove — but a tick line sits between the `B` and the `A`, so no
+adjacent `"BA"` exists and the match fails on a run that demonstrated the
+property perfectly.
+
+Re-run five times in isolation: 5/5 pass. The full gate then reproduced the
+green transcript byte for byte (`0588f8b7…` twice). So it is a genuine flake
+with a low rate, and this unit's only relation to it is making a gate run longer
+— a third profile changes host timing, which is exactly the kind of thing that
+shifts where a tick lands.
+
+**The fix, for whoever takes it:** match the interleave against the letters-only
+projection of the output (strip lines beginning `SOS:`) rather than against the
+raw stream. That preserves the direction-change claim exactly and removes the
+dependence on where the kernel's own diagnostics land. CLAUDE.md's sentence
+wants amending in the same pass: the interleave IS asserted; what is unasserted
+is the tick COUNT and the `interrupts=` column.
+
 ## 8. What the lead should see
 
 1. **SL-25 is the substantial finding**, and its consequence outlives this unit:
@@ -363,6 +404,10 @@ and neither changes behaviour (`static_assert`s are compile-time):
    (§5), purely because of the byte-identical fence. One line to fix when rows
    may move.
 4. **The C floor stub is deliberately absent** (§6) and one line to add.
-5. `spec.md` is untouched, per the brief's out-of-scope list — §5b/§2's tier
+5. **A pre-existing `thread_preempt` flake fired once** (§7a) — the A/B
+   interleave IS asserted, against CLAUDE.md's claim, and a kernel tick line
+   landing between two letters breaks the substring match. Not this unit's,
+   not fixed here, and the one-line fix is named.
+6. `spec.md` is untouched, per the brief's out-of-scope list — §5b/§2's tier
    table belongs to unit 8, which now has a built word and a built profile to
    describe.
