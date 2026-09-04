@@ -96,6 +96,22 @@ scripted mode (feed a command list, assert the output) so the gate
 can witness it the way it witnesses everything else; the QEMU
 harness already types into the UART for the uart-echo cases.
 
+## A rights seed this milestone will want: `MemoryRight.MapWrite`
+
+Recorded from the M5 unit-7 discussion (user question, Sep 4): the
+tree can install RO rows anywhere (access is the mapping's
+property) and can grant access-without-possession (the kernel or a
+launcher installs the row; the holder gets only a Mapping), but the
+RIGHTS vocabulary cannot express an RO-ONLY Memory handle — design
+9 gated Execute (`MapExecute`) and never Write. The stats region
+does not need it (its page is kernel-owned, not allocatable memory,
+so it rides the no-handle shape). An fs service handing clients
+read-only views of CACHED PAGES does need it: those pages are real
+allocatable memory whose handles should travel, so attenuate-at-
+give wants the Write bit to exist. The shape is `MapExecute`'s twin
+— minted by default of necessity (§3 monotonicity), withheld by a
+keep mask, fail-closed. One right, one refusal arm, no new op.
+
 ## What M5 hands this milestone
 
 The allocator (image-sized splits and their return — landed unit 5),
