@@ -1,0 +1,374 @@
+// SOS M5 unit 6b: A DONATED PROCESS IS A PROCESS THE MACHINE RUNS (sawos design
+// 36, closing designs 32/34's "processes are unit 6b" note).
+//
+// The transcript:
+//
+//   SOS procdonate: floor=3 third child refused: out of kernel objects
+//   SOS procdonate: donated a region of process slots
+//   SOS procdonate: third child created past the floor
+//   SOS procdonate: started three children
+//   SOS echo0: alive       <- each child, scheduled, in its own address space
+//   SOS echo1: alive
+//   SOS echo2: alive       <- THIS one lives in a donated slot
+//   SOS procdonate: exits a=65577 b=65578 c=65579
+//   SOS procdonate: donated slot reused d=65579
+//   SOS procdonate: done
+//
+// **WHY THIS CASE EXISTS.** Design 32 delivered slab donation and excluded
+// processes by name, because a process's storage was `MAX_PROCESSES`-shaped in
+// FIVE places at once — the slot, the handle table, the boot-handle set with its
+// count and cursor, and the two quota rows — so a donated slot would have
+// indexed off the end of four tables sized for the compiled floor. Unit 6b made
+// those four into FIELDS of `ProcessSlot`. What that buys is exactly this case:
+// a deployment that donates runs more concurrent processes than the image was
+// built for, which was the first of the user's three motivating examples.
+//
+// FIVE CLAIMS, IN ORDER.
+//
+//  1. THE FLOOR IS REAL. `MAX_PROCESSES` is 3 and ROOT IS ONE OF THEM, so root
+//     plus two children IS the whole table. The third `process_create` meets the
+//     slab and answers `NoResource` — a STATUS, because the caller cannot know
+//     how full the machine's table is.
+//
+//  2. THE DONATION IS ORDINARY MEMORY, cut out of a region root was given.
+//
+//     **THE PIECE DONATED IS A FRESH CUT, NOT A SPLIT'S REMAINDER**, and the
+//     difference is a refusal this case would otherwise have hit: a region that
+//     has lent bytes out is a POOL ROOT with `out_bytes != 0`, and donating one
+//     FAULTS (design 32's safety condition — retiring a root under its own
+//     pieces would leave their back-references naming a stranger). A freshly cut
+//     piece has lent nothing, is named by exactly one handle and is mapped
+//     nowhere, so it satisfies all three counts by construction.
+//
+//  3. THE CEILING MOVED: the create that was refused now succeeds, and the
+//     process it makes is the FOURTH live process on a machine compiled for
+//     three.
+//
+//  4. **AND A DONATED SLOT IS A WHOLE PROCESS.** All three children are STARTED
+//     and each says its own line before exiting with its own code. That line is
+//     the donated slot's handle table, its quota ledger and its boot set all
+//     working at once — the child derives a Process object out of the System
+//     handle root gave it (a boot-set record, drained through the new fields)
+//     and makes a syscall (a handle-table lookup in the new field) — and the
+//     exit code coming back through root's wait record is its teardown.
+//
+//     The three codes are distinct, so `a=`/`b=`/`c=` is a claim about WHICH
+//     process ended, not merely that three did. They are read in KEY order
+//     rather than in completion order, so the line is deterministic however the
+//     scheduler interleaves them.
+//
+//  5. THE DONATED SLOT COMES BACK AND IS SPENT AGAIN. Root drops the third
+//     child's Process handle, which is what lets `reclaim_process_slot` free a
+//     `Gone` slot (design 3 D-3) — and that slot is above the compiled floor, so
+//     the reclaim walk and the allocator scan both have to reach into the
+//     donated extent for this to work at all. The replacement child runs and
+//     dies exactly as the first one did, at a new GENERATION of the same slot.
+//
+// WHY NO SLOT COUNT IS PRINTED, as in `tests/slab-donate`, `thread-donate` and
+// `pipe-donate`: a donated region buys `len / sizeof(ProcessSlot)` slots and
+// that size differs per profile, so the new ceiling is arch-dependent while
+// every claim above is not. Design 36's As-built prices it.
+//
+// **THE arm64 DOMAIN WALL IS WHY THIS CASE STOPS AT FOUR PROCESSES.** A
+// translating tier keeps a persistent table set per process slot in a STATIC HAL
+// pool that donation cannot reach (design 25 D-3), so `hal.PROT_DOMAIN_SLOTS`
+// bounds what a donated slot can be used for there. Design 36 raised it from 3
+// to 5, which is what makes this case's fourth process possible on arm64 at all;
+// the fifth is deliberately left unspent so the gate does not sit exactly on a
+// wall. The wall's own refusal is not witnessed here — see the As-built for why
+// it is not portable.
+
+import sos.{System, Process, Memory, SlabKind, SystemRight, Waiter, WaitResult,
+            SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// `MAX_PROCESSES`, written down so that raising the kernel's floor fails THIS
+/// case loudly rather than quietly making its first claim vacuous.
+static FLOOR: UInt = 3
+
+/// What each child's address space gets: 128 KiB out of the 256 KiB destination
+/// region the build hands root. An echo child's image spans about 80 KiB and the
+/// kernel puts a 16 KiB stack at the top, so this is comfortable — and it is a
+/// multiple of every profile's protection grain, which `split` requires.
+///
+/// **IT IS CUT OFF THE FRONT, WHICH IS THE POINT.** `split` serves from the
+/// front, so the piece keeps the destination row's own base — and on riscv32 a
+/// child image runs at exactly the address it was linked at, so a child's region
+/// base is not a free choice.
+static CHILD_SPAN: UInt = 0x20000
+
+/// The donation: the next cut after the third child's span. Many process slots
+/// on either profile and far more than this case spends, which is deliberate —
+/// it makes the machine's remaining bound the TIER's domain pool rather than the
+/// slab, which is the honest state of arm64 after this unit.
+static GIFT: UInt = 0x2000
+
+/// Root's config: the tag each child drains its System handle under. The kernel
+/// supplies no meaning for any of it.
+static TAG_BOOT: UInt = 61
+
+/// The keys the three children are attached under, so the exits can be READ in a
+/// fixed order whatever order they happen in.
+static KEY_A: UInt = 71
+static KEY_B: UInt = 72
+static KEY_C: UInt = 73
+
+/// What a child may do: say a line, and find itself. Nothing else — a launcher
+/// hands down the smallest set that works, and neither `ProcessCreate` nor
+/// `SlabDonate` is in it.
+///
+/// **`Transfer` IS IN THE SET BECAUSE THE GIVE ITSELF NEEDS IT**, which is the
+/// transfer-funnel contract rather than an authority the child wants: a
+/// capability that may not be transferred cannot be handed down, so a sibling
+/// minted without this bit is one root can only keep. Root's own set carries it
+/// and §3 attenuation is monotonic, so the child's copy is the smallest set that
+/// can arrive at all.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Revoked
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS procdonate: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // The build's region table, in `_region_rows`' order: every child's image
+    // blob first, then every child's destination, both in the order the case
+    // lists the packages. Root's business, never the kernel's.
+    var img0_rec = try proc.boot_handle_next() catch {
+        let _ = system.debug_print("SOS procdonate: no image 0\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var img1_rec = try proc.boot_handle_next() catch {
+        let _ = system.debug_print("SOS procdonate: no image 1\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var img2_rec = try proc.boot_handle_next() catch {
+        let _ = system.debug_print("SOS procdonate: no image 2\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let img0 = img0_rec.take_memory() else {
+        let _ = system.debug_print("SOS procdonate: image 0 is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let img1 = img1_rec.take_memory() else {
+        let _ = system.debug_print("SOS procdonate: image 1 is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let img2 = img2_rec.take_memory() else {
+        let _ = system.debug_print("SOS procdonate: image 2 is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // ---- CLAIM 1: the compiled floor is real -------------------------------
+    //
+    // Root is process 0, so two children fill the table. Each child's region is
+    // the FRONT of its own destination row, which is what keeps its base equal
+    // to the address its image was linked at on the identity-placement profile.
+    let c0 = try make_child(&system, &proc, &img0) catch {
+        print("SOS procdonate: first child failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let c1 = try make_child(&system, &proc, &img1) catch {
+        print("SOS procdonate: second child failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // Both of those images are spent — the kernel read them with its own
+    // privilege at create and a child's bytes are its region's now — so root
+    // stops naming them. `MAX_HANDLES` is 16 and this launcher holds three
+    // Process handles, three regions and a Waiter at its peak, which is close
+    // enough to the table that the two rows are worth giving back.
+    let _ = move img0
+    let _ = move img1
+
+    var dst2_rec = try proc.boot_handle_next() catch {
+        let _ = system.debug_print("SOS procdonate: no destination 2\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dst2 = dst2_rec.take_memory() else {
+        let _ = system.debug_print("SOS procdonate: destination 2 is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let piece2 = try dst2.split(len: CHILD_SPAN) catch {
+        print("SOS procdonate: no third child region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    match system.process_create(image: &img2, memory: &piece2) {
+        case Ok(_) -> {
+            let _ = system.debug_print(
+                "SOS procdonate: a fourth process existed BEFORE the donation\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        case Err(e) -> print("SOS procdonate: floor={} third child refused: {}\n",
+                             FLOOR, e),
+    }
+
+    // ---- CLAIM 2: the donation ---------------------------------------------
+    //
+    // A FRESH CUT rather than what is left of `dst2`: see the header. `dst2` has
+    // lent bytes to `piece2` and is therefore a pool root the op would refuse.
+    let gift = try dst2.split(len: GIFT) catch {
+        print("SOS procdonate: no region to donate: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try system.slab_donate(kind: SlabKind.Processes, memory: move gift) catch {
+        let _ = system.debug_print("SOS procdonate: donation refused\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS procdonate: donated a region of process slots\n")
+
+    // ---- CLAIM 3: the ceiling moved ----------------------------------------
+    let c2 = try system.process_create(image: &img2, memory: &piece2) catch {
+        print("SOS procdonate: the donated extent gave nothing: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS procdonate: third child created past the floor\n")
+
+    // ---- CLAIM 4: and a donated slot is a whole process --------------------
+    try furnish_and_start(&system, &c0) catch {
+        let _ = system.debug_print("SOS procdonate: first child would not start\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try furnish_and_start(&system, &c1) catch {
+        let _ = system.debug_print("SOS procdonate: second child would not start\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try furnish_and_start(&system, &c2) catch {
+        let _ = system.debug_print("SOS procdonate: third child would not start\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS procdonate: started three children\n")
+
+    let waiter = try proc.waiter_create() catch {
+        print("SOS procdonate: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // A death is a TERMINAL level, so attaching after the fact still wakes —
+    // which is what lets these three waits run in KEY order and makes the line
+    // below deterministic however the three children interleaved.
+    let a = try reap(&waiter, &c0, KEY_A) catch {
+        let _ = system.debug_print("SOS procdonate: first child never ended\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let b = try reap(&waiter, &c1, KEY_B) catch {
+        let _ = system.debug_print("SOS procdonate: second child never ended\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let c = try reap(&waiter, &c2, KEY_C) catch {
+        let _ = system.debug_print("SOS procdonate: third child never ended\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS procdonate: exits a={} b={} c={}\n", a, b, c)
+
+    // ---- CLAIM 5: the donated slot comes back, and is spent again ----------
+    //
+    // Dropping the handle IS the release (design 3 D-5), and it is what lets the
+    // kernel reclaim a `Gone` slot — one that lives above the compiled floor, so
+    // both the reclaim and the next allocator scan have to reach into the
+    // donated extent.
+    let _ = move c2
+
+    let c2b = try system.process_create(image: &img2, memory: &piece2) catch {
+        print("SOS procdonate: the donated slot did not come back: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try furnish_and_start(&system, &c2b) catch {
+        let _ = system.debug_print("SOS procdonate: replacement would not start\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let d = try reap(&waiter, &c2b, KEY_C) catch {
+        let _ = system.debug_print("SOS procdonate: replacement never ended\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS procdonate: donated slot reused d={}\n", d)
+
+    let _ = system.debug_print("SOS procdonate: done\n")
+    let _ = proc.exit(EXIT_OK)
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+/// Drain one destination row, carve the child's span off its front, and create.
+///
+/// The destination REMAINDER is dropped on the way out: root has no further use
+/// for it, and a region root stops naming is bytes the child's own grant rows
+/// still hold (design 28), so nothing is lost and nothing is freed early.
+func make_child(system: &System, proc: &Process,
+                image: &Memory) -> Result<Process, SosStatus> {
+    var dst_rec = try proc.boot_handle_next()
+    guard let dst = dst_rec.take_memory() else { return BUG }
+    let piece = try dst.split(len: CHILD_SPAN)
+    return system.process_create(image: &image, memory: &piece)
+}
+
+/// Give a child the smallest System handle that lets it speak, and start it on
+/// that record.
+///
+/// `start(boot_tag:)` puts the word in the child's first argument register,
+/// which is the one handle §12 keeps at the entry — everything else a process is
+/// furnished with is COLLECTED. One give and one start is the whole furnishing
+/// an echo child needs.
+func furnish_and_start(system: &System, child: &Process) -> Result<Void, SosStatus> {
+    let sib = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move sib, tag: TAG_BOOT)
+    return child.start(boot_tag: TAG_BOOT)
+}
+
+/// Attach `child` under `key`, wait for its death, and answer the §8 status word.
+///
+/// The attachment is REMOVED afterwards so the next call can reuse the key —
+/// which is what makes the three reads happen in a fixed order rather than in
+/// whichever order the children finished.
+func reap(waiter: &Waiter, child: &Process, key: UInt) -> Result<UInt, SosStatus> {
+    try waiter.add(process: &child, key: key)
+    let gone = try waiter.wait()
+    if gone.key != key { return BUG }
+    let status = status_of(&gone)
+    let _ = move gone
+    try waiter.remove(key)
+    return status
+}
+
+/// The §8 status word out of a wait record.
+func status_of(r: &WaitResult) -> UInt {
+    match r.what {
+        case Process(status) -> status,
+        case _ -> panic("this launcher attached only Processes"),
+    }
+}

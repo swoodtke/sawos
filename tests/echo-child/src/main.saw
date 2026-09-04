@@ -1,0 +1,38 @@
+// SOS ECHO CHILD echo0 — a process that proves it is real by ending distinctly
+// (sawos design 36, M5 unit 6b).
+//
+// **THE POINT OF THIS PROGRAM IS THAT THERE ARE THREE OF IT ALIVE AT ONCE.**
+// `MAX_PROCESSES` is 3 and root is one of them, so root plus two children IS the
+// compiled floor; a THIRD concurrent child is a process living in a slot that
+// only exists because the deployment donated one. Each child derives its own
+// Process object out of the masked System handle its launcher gave it, says one
+// line — which is scheduling, a syscall and a handle table, witnessed — and
+// exits with its own code, so the section-8 status word its launcher reads says
+// WHICH of the three ended rather than merely that one did.
+//
+// The codes are 41/42/43 and the distinctness is what matters, not the values:
+// `Exited`(1) << 16 | code is a word no fault could produce, so a launcher
+// asserting it is asserting the KIND of death as well as the identity.
+//
+// A CHILD THAT CANNOT REACH ITS OWN PROCESS OBJECT STILL DIES, and says so by
+// dying differently: it falls off `_start`, whose link register is zero (section
+// 8), so the kernel faults it and the launcher reads `Faulted` where it expected
+// `Exited`. `child-bye`'s reasoning, unchanged.
+
+import sos.{System}
+
+/// This child's ending. See the header for why distinctness is the property.
+static EXIT_CODE: UInt = 41
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS echo0: no process handle: {}\n", error)
+        return
+    }
+
+    let _ = system.debug_print("SOS echo0: alive\n")
+    let _ = proc.exit(EXIT_CODE)
+}

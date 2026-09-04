@@ -1051,10 +1051,12 @@ public enum EventMode: UInt {
 /// A SMALL DEDICATED ENUM RATHER THAN `ObjType`, and the choice is the unit's
 /// own (the brief left it open). `ObjType` names every kind a HANDLE can name,
 /// and the two sets do not coincide in either direction. It has members that are
-/// not donatable — `Process`, whose storage is `MAX_PROCESSES`-shaped and is
-/// unit 6b's subject; `Clock`, which is a census of domains rather than a slab
-/// and has nothing to run out of; the four pipe kinds, which are two counted
-/// columns over one connection slot with ten parallel arrays behind them. And
+/// not donatable — `Clock`, which is a census of domains rather than a slab and
+/// has nothing to run out of; the four pipe kinds, which are two counted columns
+/// over ONE connection slot, so donating "an inlet" is not a thing to ask for.
+/// (`Process` was on that list until M5 unit 6b and no longer is — its storage
+/// was `MAX_PROCESSES`-shaped in five places, and design 36 made the four
+/// satellites into fields.) And
 /// the most important donatable slab in the system has NO `ObjType` at all: the
 /// free-range NODES the allocator's free lists are made of are not objects, have
 /// no handles, and are exactly what design 28 named as this op's first customer.
@@ -1067,11 +1069,13 @@ public enum EventMode: UInt {
 /// object. `SlabKind.Events` is the Event slab, and the reading "one event" is
 /// never available to confuse it with `ObjType.Event`.
 ///
-/// A KIND IS ABSENT HERE IFF ITS SLAB HAS PARALLEL STORAGE KEYED BY THE SAME
-/// INDEX, or is `MAX_PROCESSES`-shaped, or is not a slab. Growing a slot array
-/// and leaving its satellite behind would be a memory-safety bug rather than a
-/// small capacity lie, so those kinds are excluded BY NAME rather than served
-/// badly — design 32's As-built carries the table and the per-kind reason.
+/// A KIND IS ABSENT HERE IFF IT IS NOT A SLAB, or names one END of a slot two
+/// kinds share. Growing a slot array and leaving a satellite behind would be a
+/// memory-safety bug rather than a small capacity lie, so a satellite-bearing
+/// kind is either CONVERTED — by making the satellite part of the slot, or a
+/// chain the same boundary walk answers — or excluded by name. Designs 32, 34
+/// and 36 converted every one of them in turn, and their As-builts carry the
+/// table and the per-kind reason.
 ///
 /// Backed by `UInt`, the width of the register the kind arrives in, for the
 /// reason `SystemOp` and `EventMode` give: the value is PROCESS-CONTROLLED, so
@@ -1113,6 +1117,31 @@ public enum SlabKind: UInt {
     /// than about this op — the same storage was always there — and it is why a
     /// deployment that wants many connections donates a large region.
     case Pipes = 10,
+    /// **PROCESSES, AND EVERY TABLE A PROCESS INDEX KEYS** (sawos design 36, M5
+    /// unit 6b) — the last of the three kinds the user named as the motivation
+    /// for donation, and the one that had to change a data structure first.
+    ///
+    /// Design 32 excluded it because its storage was `MAX_PROCESSES`-SHAPED in
+    /// four other places: the handle table, the boot-handle set with its count
+    /// and cursor, and the two quota rows all sat outside the slot as parallel
+    /// arrays, so a donated process slot would have indexed off the end of every
+    /// one of them. Unit 6b made them FIELDS of `ProcessSlot`, which is the
+    /// "fatten one level down" shape unit 6a used for pipes — easier here,
+    /// because each inner dimension is already a per-process constant.
+    ///
+    /// **ONE DONATION, ONE ARRAY.** A `ProcessSlot` is large (it carries a handle
+    /// table, a boot set, a grant record and two ledger rows) and entirely plain,
+    /// so this kind needs none of `Threads`' side arena or `Pipes`' second chain:
+    /// a region buys `len / sizeof(ProcessSlot)` processes and nothing else.
+    ///
+    /// **A TRANSLATING TIER HAS A SECOND CEILING THIS OP CANNOT MOVE**, and it is
+    /// the one honest asymmetry of the kind: a per-process protection domain
+    /// comes out of a static HAL pool (design 25 D-3 ruled donation out of
+    /// HAL-internal storage), so `hal.PROT_DOMAIN_SLOTS` bounds what a donated
+    /// slot can actually be USED for there. A create past it answers
+    /// `NoResource` — the machine's real answer on that tier, advertised rather
+    /// than faulted. See `kcore.process.process_slots_usable`.
+    case Processes = 11,
 }
 
 /// **THE MESSAGE BODY'S MAXIMUM, AS A BUILD DEFINE** (spec §2.1's fixed body;

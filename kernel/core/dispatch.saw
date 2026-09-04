@@ -143,13 +143,10 @@ import kcore.result.{
     op_value,
     write_result,
 }
+import kcore.pslot.{HandleEntry, PROCESSES, ProcessState, QuotaKind}
 import kcore.objects.{
-    BOOT_HANDLES,
-    BOOT_HANDLE_COUNT,
-    BOOT_HANDLE_NEXT,
     ClockObject,
     EventObject,
-    HandleEntry,
     FREE_RANGES,
     IOMEMORIES,
     InterruptObject,
@@ -173,7 +170,6 @@ import kcore.objects.{
     PipeRequestObject,
     PipeSlot,
     ProcessObject,
-    QuotaKind,
     SlotState,
     SystemObject,
     ThreadObject,
@@ -265,8 +261,6 @@ import kcore.waitables.{
     waiter_ready_attachment,
 }
 import kcore.process.{
-    PROCESSES,
-    ProcessState,
     alloc_process,
     copy_in,
     copy_in_check,
@@ -755,6 +749,14 @@ func slab_geometry(kind: SlabKind) unsafe -> (Int, Int, Int, Int) {
                        min_int(PIPES.extents_left(), EXCHANGES.extents_left()),
                        min_int(MAX_SLAB_CAPACITY - PIPES.capacity(),
                                (MAX_SLAB_CAPACITY - EXCHANGES.capacity()) / PIPE_INFLIGHT)),
+        // A PROCESS UNIT IS A SLOT, FULL STOP (sawos design 36, M5 unit 6b) —
+        // which is the whole point of the record having absorbed its four
+        // satellites. The handle table, the boot set and the two ledger rows
+        // ride INSIDE `ProcessSlot`, so this kind is a plain one-array chain
+        // like the first nine and needs neither a side arena nor a second
+        // ceiling. It is the largest slot in the kernel by some way, which is a
+        // fact about what a process IS rather than about this op.
+        case Processes -> (PROCESSES.slot_bytes(), PROCESSES.slot_align(), PROCESSES.extents_left(), MAX_SLAB_CAPACITY - PROCESSES.capacity()),
     }
 }
 
@@ -809,6 +811,7 @@ func slab_install(kind: SlabKind, base: UInt, slots: Int) unsafe -> Bool {
             }
             true
         },
+        case Processes -> PROCESSES.donate(base, slots),
     }
 }
 
@@ -1363,10 +1366,10 @@ func boot_handle_next(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
     // through the register door — one record, one delivery, whichever door it
     // went out of (the Aug-29 user ruling).
     let cursor = boot_handle_cursor(p)
-    if cursor >= BOOT_HANDLE_COUNT[p] {
+    if cursor >= PROCESSES[p].boot_count {
         return op_status(SosStatus.Drained)
     }
-    let queued = BOOT_HANDLES[p * MAX_HANDLES + cursor]
+    let queued = PROCESSES[p].boot_handles[cursor]
     var rec = BootHandleWire(tag: queued.tag, kind: queued.kind as UInt,
                              handle: queued.handle)
     if let why = copy_out(p, dst,
@@ -1374,7 +1377,7 @@ func boot_handle_next(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
                           boot_handle_record_bytes() as UInt) {
         fault_process(p, why)
     }
-    BOOT_HANDLE_NEXT[p] = cursor + 1
+    PROCESSES[p].boot_next = cursor + 1
     op_ok()
 }
 

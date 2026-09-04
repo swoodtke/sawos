@@ -321,6 +321,22 @@ PIPE_DONATE_PKG = os.path.join(TESTS_DIR, "pipe-donate")
 SLAB_DONATE_MAPPED_PKG = os.path.join(TESTS_DIR, "slab-donate-mapped")
 SLAB_DONATE_MAPPED_CHILD_PKG = os.path.join(TESTS_DIR, "child-donor")
 SLAB_DONATE_NODES_PKG = os.path.join(TESTS_DIR, "slab-donate-free-nodes")
+
+# M5 unit 6b (sawos design 36): the last of the three kinds the user named.
+# `process-donate` fills the process table at `MAX_PROCESSES` (root plus two
+# children), watches the next create answer `NoResource`, donates, and then
+# creates + starts + reaps + RE-creates a third child that can only be living in
+# the donated extent.
+#
+# THREE ECHO CHILDREN, AND THERE ARE THREE OF THEM FOR ONE PROFILE'S SAKE.
+# riscv32 places by identity, so three CONCURRENT children need three load
+# addresses and therefore three linker scripts — and a package's manifest picks
+# a script, so three packages that differ only in that line and in an exit code.
+# On aarch64 design 33's placement means all three name one `user.ld`.
+PROCESS_DONATE_PKG = os.path.join(TESTS_DIR, "process-donate")
+ECHO_CHILD_PKG = os.path.join(TESTS_DIR, "echo-child")
+ECHO_CHILD2_PKG = os.path.join(TESTS_DIR, "echo-child2")
+ECHO_CHILD3_PKG = os.path.join(TESTS_DIR, "echo-child3")
 CHILD_QUOTA_PKG = os.path.join(TESTS_DIR, "child-quota")
 CHILD_MAPWALL_PKG = os.path.join(TESTS_DIR, "child-mapwall")
 
@@ -4721,6 +4737,42 @@ TEST_CASES = [
                        "SOS: process teardown handles="],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
+    },
+
+    # M5 unit 6b (sawos design 36): THE LAST OF THE THREE KINDS. A process's
+    # storage was `MAX_PROCESSES`-shaped in five places at once; unit 6b made
+    # four of them fields of `ProcessSlot`, which is what let the kind convert.
+    #
+    # It lists THREE children and asks for NO POOL, which is why the runner's
+    # two-children-plus-a-pool refusal never comes up: the region root donates is
+    # cut out of the third child's own destination row, after that child's span
+    # has been carved off its front.
+    {
+        "name": "process_donate",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PROCESS_DONATE_PKG,
+        "children": [ECHO_CHILD_PKG, ECHO_CHILD2_PKG, ECHO_CHILD3_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={six}",
+                       # CLAIM 1: root plus two children IS the table.
+                       "SOS procdonate: floor=3 third child refused: "
+                       "out of kernel objects",
+                       # CLAIMS 2 and 3.
+                       "SOS procdonate: donated a region of process slots",
+                       "SOS procdonate: third child created past the floor",
+                       "SOS procdonate: started three children",
+                       # CLAIM 4: each child is a whole process. The third one's
+                       # line is a syscall made through a handle table that lives
+                       # in donated memory.
+                       "SOS echo0: alive",
+                       "SOS echo1: alive",
+                       "SOS echo2: alive",
+                       "SOS procdonate: exits a=65577 b=65578 c=65579",
+                       # CLAIM 5: the donated slot is reclaimed and spent again,
+                       # at a new generation.
+                       "SOS procdonate: donated slot reused d=65579",
+                       "SOS procdonate: done"],
+        "expect_clean_exit": True,
     },
 ]
 

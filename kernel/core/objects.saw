@@ -69,7 +69,6 @@ import kcore.limits.{
     MAX_MAPPINGS,
     MAX_MEMORIES,
     MAX_PIPES,
-    MAX_PROCESSES,
     MAX_SLAB_EXTENTS,
     MAX_TIMERS,
     MAX_WAITERS,
@@ -82,37 +81,23 @@ import kcore.limits.{
 }
 import kcore.diag.{fatal_kernel}
 import kcore.slab.{Slab}
-
-/// One handle-table entry: the object a handle names, the rights its holder has
-/// on it (§3), WHICH object of that kind it is, and which LIFE of this slot it
-/// belongs to.
-///
-/// `obj_type` is the typed tag; `rights` stays a plain `UInt32` because it is a
-/// MASK — a set of bits, not one of the cases of any kind's rights enum. It is
-/// deliberately NOT interpretable on its own: which enum's bits these are is
-/// decided by `obj_type`, and the pairing happens below.
-///
-/// `target` is the object's slot in its kind's table. It was not needed while
-/// the only object was a singleton; with Threads it is the whole point of the
-/// entry, because "which thread" is exactly what a handle answers.
-///
-/// **`gen` SURVIVES THE UNBIND, and that is the whole mechanism** (sawos design
-/// 3 D-1). It is the only field a release does not clear: unbinding zeroes the
-/// binding and INCREMENTS the generation, so the next mint in this slot stamps
-/// a word that no word handed out before it can equal. A stale word therefore
-/// fails the equality test in `lookup_handle` and becomes the `Unbound` answer
-/// the callers already turn into a `BadHandle` fault — which is what makes
-/// use-after-release a DIAGNOSED bug rather than a silent alias onto whatever
-/// took the slot.
-///
-/// It lives in the ENTRY rather than in a parallel array because the two are one
-/// fact about one slot, and a second array would be a second place to forget.
-public(package) struct HandleEntry {
-    public(package) obj_type: ObjType,
-    public(package) rights: UInt32,
-    public(package) target: Int,
-    public(package) gen: UInt32,
+// THE PER-PROCESS RECORD (sawos design 36, M5 unit 6b). The handle table, the
+// quota ledger and the boot-handle queue are FIELDS of `ProcessSlot` now, so
+// this module reaches them through `PROCESSES` — which is why the record lives
+// BELOW this file rather than in `kcore.process`, where it used to. The
+// functions did not move; the storage did. See `pslot.saw`'s header.
+import kcore.pslot.{
+    BootHandleSlot,
+    HandleEntry,
+    PROCESSES,
+    QUOTA_KINDS,
+    QuotaKind,
 }
+
+// `HandleEntry` MOVED TO `kcore.pslot` in M5 unit 6b (sawos design 36): the
+// handle table is a field of `ProcessSlot` now, and a field's type has to be
+// declared where the record is. Everything this file does WITH one is still
+// here — see `lookup_handle` and its neighbours below.
 
 /// A System handle the dispatch has VALIDATED (§3).
 ///
@@ -384,17 +369,13 @@ public(package) enum SlotState: UInt8 {
     case Live = 1,
 }
 
-/// Every process's handle table, back to back: process `p`'s handle INDEX `i`
-/// (0-based inside the table) lives at `p * MAX_HANDLES + i`, and the word a
-/// process holds carries `i + 1` in its low byte (§3's "handle 0 names
-/// nothing").
-///
-/// Generations start at zero, which is what makes a fresh slot's first word the
-/// bare index — D-1's compatibility rule, and the reason §12's boot order still
-/// hands root 1, 2, 3.
-public(package) unsafe static var HANDLES: [HandleEntry; MAX_PROCESSES * MAX_HANDLES] = [
-    HandleEntry(obj_type: ObjType.Unbound, rights: 0, target: 0, gen: 0);
-    MAX_PROCESSES * MAX_HANDLES]
+// THE HANDLE TABLE IS `PROCESSES[p].handles` (sawos design 36, M5 unit 6b).
+//
+// It was `HANDLES`, one flat `MAX_PROCESSES * MAX_HANDLES` array sliced at
+// `p * MAX_HANDLES`. The multiply is gone: the slab's own boundary walk is what
+// the multiply used to stand in for, and a process slot in a DONATED extent
+// carries its table with it instead of indexing off the end of a table sized
+// for the compiled floor.
 
 // -----------------------------------------------------------------------------
 // The handle table (spec §3) and the split word (sawos design 3 D-1)
@@ -498,7 +479,7 @@ public(package) func lookup_handle(p: Int, h: UInt) unsafe -> HandleEntry {
     if index >= MAX_HANDLES {
         return unbound_entry()
     }
-    let entry = HANDLES[p * MAX_HANDLES + index]
+    let entry = PROCESSES[p].handles[index]
     match entry.obj_type {
         case Unbound -> unbound_entry(),
         case _ -> {
@@ -532,13 +513,13 @@ public(package) func mint_handle(p: Int, kind: ObjType, rights: UInt32, target: 
     }
     var h: Int = 0
     while h < MAX_HANDLES {
-        let entry = HANDLES[p * MAX_HANDLES + h]
+        let entry = PROCESSES[p].handles[h]
         match entry.obj_type {
             case Unbound -> {
-                HANDLES[p * MAX_HANDLES + h] = HandleEntry(obj_type: kind,
-                                                           rights: rights,
-                                                           target: target,
-                                                           gen: entry.gen)
+                PROCESSES[p].handles[h] = HandleEntry(obj_type: kind,
+                                                      rights: rights,
+                                                      target: target,
+                                                      gen: entry.gen)
                 quota_charge(p, QuotaKind.Handle)
                 return handle_word(h, entry.gen)
             },
@@ -571,7 +552,7 @@ public(package) func table_room(p: Int, n: Int) unsafe -> Bool {
     var free: Int = 0
     var h: Int = 0
     while h < MAX_HANDLES {
-        match HANDLES[p * MAX_HANDLES + h].obj_type {
+        match PROCESSES[p].handles[h].obj_type {
             case Unbound -> { free = free + 1 },
             case _ -> {},
         }
@@ -597,11 +578,11 @@ public(package) func table_room(p: Int, n: Int) unsafe -> Bool {
 /// to close with unbounded bookkeeping — the table is per-process, so a wrap
 /// collision crosses no boundary and grants nothing.
 public(package) func unbind_handle(p: Int, index: Int) unsafe {
-    let entry = HANDLES[p * MAX_HANDLES + index]
+    let entry = PROCESSES[p].handles[index]
     let next = (entry.gen + 1) % HANDLE_GENERATION_MODULUS
-    HANDLES[p * MAX_HANDLES + index] = HandleEntry(obj_type: ObjType.Unbound,
-                                                   rights: 0, target: 0,
-                                                   gen: next)
+    PROCESSES[p].handles[index] = HandleEntry(obj_type: ObjType.Unbound,
+                                              rights: 0, target: 0,
+                                              gen: next)
     // THE HANDLE ROW IS CREDITED HERE, at the one place a binding is destroyed
     // — which is what makes the entry count and the quota count the same fact
     // rather than two that agree today (sawos design 7 D-3).
@@ -612,17 +593,19 @@ public(package) func unbind_handle(p: Int, index: Int) unsafe {
 // THE QUOTA LEDGER (spec §12's promise; sawos design 7 D-3)
 // =============================================================================
 //
-// **PER-PROCESS STORAGE, SO IT LIVES WHERE THE PER-PROCESS STORAGE LIVES.**
-// §12 promised "a field on the process slot", and this is that promise kept one
-// module down, for a reason the module order decides rather than taste: the
-// HANDLE row has to be charged inside `mint_handle` and credited inside
-// `unbind_handle`, which are here, and `kcore.process` sits ABOVE this file —
-// so a table on `ProcessSlot` could not be reached from the two functions that
-// most need it, and the alternative was a second funnel over "the one place a
-// binding is destroyed". The flat `p * QUOTA_KINDS + kind` array is the handle
-// table's own idiom, one file down from where the boot-handle queue uses it,
-// which is the shape this module already has for per-process storage.
-// `ProcessSlot`'s docstring points here.
+// **§12's "A FIELD ON THE PROCESS SLOT" IS LITERALLY TRUE SINCE M5 UNIT 6b**
+// (sawos design 36), and the paragraph that used to stand here is worth keeping
+// as the record of why it took so long. It said the promise was "kept one module
+// down, for a reason the module order decides rather than taste": the HANDLE row
+// is charged inside `mint_handle` and credited inside `unbind_handle`, which are
+// HERE, and `kcore.process` sat ABOVE this file — so a table on `ProcessSlot`
+// could not be reached from the two functions that most need it.
+//
+// Unit 6b answered that by moving the RECORD below both files rather than by
+// moving the functions: `ProcessSlot` lives in `kcore.pslot` now and the ledger
+// is `PROCESSES[p].quota_used` / `.quota_limit`. `mint_handle` did not go
+// anywhere, the flat `p * QUOTA_KINDS + kind` arithmetic is gone, and a process
+// slot in a DONATED extent carries its own two rows.
 //
 // **TWO ROWS PER KIND: what is spent, and what may be.** A charge happens at
 // the allocation sites that answer `NoResource` today, ordered POLICY FIRST —
@@ -638,54 +621,10 @@ public(package) func unbind_handle(p: Int, index: Int) unsafe {
 // `install_quota_limits` to compile until somebody says what a child may hold
 // of it.
 
-/// What a process may be charged for (sawos design 7 D-3).
-///
-/// Raw-backed and dense from zero, because the value IS the column index in the
-/// two arrays below — the same "the slot is the ordinal" arrangement `ClockType`
-/// uses, and the reason no lookup table is owed.
-///
-/// **`Handle` IS THE KIND WITH NO SLAB**, and that is why it is here rather
-/// than derived: a handle entry lives in the per-process table region, so the
-/// thing that bounds it is this row and nothing else. It is design 3's promised
-/// addition, arriving with the rest of the ledger.
-///
-/// **`Mapping` COUNTS INSTALLED ROWS, NOT OBJECTS**, and it is the one row in
-/// this enum that does. D-3 rules that a mapping charges its TARGET, because
-/// the scarce thing it consumes is that process's grant-row budget — and the
-/// row budget is what a `map` can physically meet, so a ledger that counted
-/// Mapping OBJECTS would drift from it the moment a mapped Mapping's last
-/// handle went away (D-2 frees the slot and LEAVES the row). Counting rows
-/// keeps `used` and the target's `grant_count` exactly in step, which is what
-/// makes `install_row`'s `fatal` provably unreachable rather than merely
-/// unlikely. `Thread` is the mirror asymmetry from the other side: it has a
-/// slab and no refcount, so its row is charged and only ever credited by the
-/// teardown.
-/// **`Pipe` IS M4 UNIT 1's ROW, AND IT IS CREATOR-PAYS FOR A CONNECTION RATHER
-/// THAN FOR AN ENDPOINT** (sawos design 10 ruling 6; design 13 D-1). One charge
-/// at `ProcessOp.PipeCreate`, credited when BOTH reference columns reach zero
-/// and the connection's slot goes back — which is the only moment the scarce
-/// thing it counts (a `PIPES` row and its staging ring) is actually returned.
-///
-/// **CHARGING THE PAIR ONCE IS THE POINT.** Two ends of one connection are two
-/// handle entries, and the HANDLE row already counts those; a second charge per
-/// endpoint would make a launcher that keeps both ends pay twice for one slab
-/// slot, and would make "give one end away" look like a refund. What the ledger
-/// tracks is what the slab holds.
-public(package) enum QuotaKind: UInt8 {
-    case Thread = 0,
-    case Event = 1,
-    case Waiter = 2,
-    case Interrupt = 3,
-    case Timer = 4,
-    case Memory = 5,
-    case IoMemory = 6,
-    case Mapping = 7,
-    case Handle = 8,
-    case Pipe = 9,
-}
-
-/// Columns in the ledger — one per `QuotaKind`, and the arrays' stride.
-public(package) static QUOTA_KINDS: Int = 10
+// `QuotaKind` and `QUOTA_KINDS` MOVED TO `kcore.pslot` in M5 unit 6b (sawos
+// design 36), with the rows they index — a field's type belongs where the
+// record is. The vocabulary is unchanged and its full reasoning travelled with
+// it; everything that CHARGES or CREDITS a row is still here.
 
 /// "No policy cap on this row: the MACHINE answers."
 ///
@@ -699,20 +638,16 @@ public(package) static QUOTA_KINDS: Int = 10
 /// the sentence executed rather than approximated.
 public(package) static QUOTA_UNLIMITED: UInt16 = 0xFFFF
 
-/// What each process has spent, by kind.
-public(package) unsafe static var QUOTA_USED: [UInt16; MAX_PROCESSES * QUOTA_KINDS] = [
-    0; MAX_PROCESSES * QUOTA_KINDS]
-
-/// What each process may spend, by kind. Zero until `install_quota_limits`
-/// runs, which is deliberate: a slot with no limits installed can allocate
-/// nothing, so a process reached before its ledger exists refuses rather than
-/// running unbudgeted.
-public(package) unsafe static var QUOTA_LIMIT: [UInt16; MAX_PROCESSES * QUOTA_KINDS] = [
-    0; MAX_PROCESSES * QUOTA_KINDS]
-
-/// Where process `p`'s row for `kind` lives.
-func quota_at(p: Int, kind: QuotaKind) -> Int {
-    p * QUOTA_KINDS + ((kind as UInt8) as Int)
+/// WHICH COLUMN of a process's two ledger rows `kind` is.
+///
+/// **THE MULTIPLY IS WHAT UNIT 6b UNLEARNED HERE** (sawos design 36). This was
+/// `quota_at(p, kind) = p * QUOTA_KINDS + kind`, an index into one flat
+/// `MAX_PROCESSES ×` array; the rows are fields of the process slot now, so the
+/// process half of the address is the slab lookup and what is left is the
+/// column. It keeps its own name because "the value IS the column index" is a
+/// property of `QuotaKind` worth spelling once rather than casting at six sites.
+func quota_column(kind: QuotaKind) -> Int {
+    (kind as UInt8) as Int
 }
 
 /// Has `p` room for one more of `kind`?
@@ -720,11 +655,12 @@ func quota_at(p: Int, kind: QuotaKind) -> Int {
 /// ASKED BEFORE THE SLAB IS, at every allocation site — D-3's check order, and
 /// the reason a caller can tell "my budget" from "the machine's edge".
 public(package) func quota_room(p: Int, kind: QuotaKind) unsafe -> Bool {
-    let at = quota_at(p, kind)
-    if QUOTA_LIMIT[at] == QUOTA_UNLIMITED {
+    let at = quota_column(kind)
+    let limit = PROCESSES[p].quota_limit[at]
+    if limit == QUOTA_UNLIMITED {
         return true
     }
-    QUOTA_USED[at] < QUOTA_LIMIT[at]
+    PROCESSES[p].quota_used[at] < limit
 }
 
 /// Has `p` room for `n` more of `kind`?
@@ -740,11 +676,12 @@ public(package) func quota_room(p: Int, kind: QuotaKind) unsafe -> Bool {
 /// `n == 0` is legal and answers true, which is what a message with no handles
 /// asks.
 public(package) func quota_room_for(p: Int, kind: QuotaKind, n: Int) unsafe -> Bool {
-    let at = quota_at(p, kind)
-    if QUOTA_LIMIT[at] == QUOTA_UNLIMITED {
+    let at = quota_column(kind)
+    let limit = PROCESSES[p].quota_limit[at]
+    if limit == QUOTA_UNLIMITED {
         return true
     }
-    ((QUOTA_USED[at] as Int) + n) <= (QUOTA_LIMIT[at] as Int)
+    ((PROCESSES[p].quota_used[at] as Int) + n) <= (limit as Int)
 }
 
 /// Spend one of `kind` against `p`.
@@ -753,8 +690,9 @@ public(package) func quota_room_for(p: Int, kind: QuotaKind, n: Int) unsafe -> B
 /// all-or-nothing shape, applied to the ledger: a charge made before a slab
 /// refusal would leave a process paying for an object it never got.
 public(package) func quota_charge(p: Int, kind: QuotaKind) unsafe {
-    let at = quota_at(p, kind)
-    QUOTA_USED[at] = QUOTA_USED[at] + 1
+    let at = quota_column(kind)
+    let spent = PROCESSES[p].quota_used[at]
+    PROCESSES[p].quota_used[at] = spent + 1
 }
 
 /// Give one of `kind` back to `p`.
@@ -763,9 +701,10 @@ public(package) func quota_charge(p: Int, kind: QuotaKind) unsafe {
 /// a credit may land on a row the teardown has already zeroed, and the honest
 /// answer for "give back what nobody is charged for" is to do nothing.
 public(package) func quota_credit(p: Int, kind: QuotaKind) unsafe {
-    let at = quota_at(p, kind)
-    if QUOTA_USED[at] != 0 {
-        QUOTA_USED[at] = QUOTA_USED[at] - 1
+    let at = quota_column(kind)
+    let spent = PROCESSES[p].quota_used[at]
+    if spent != 0 {
+        PROCESSES[p].quota_used[at] = spent - 1
     }
 }
 
@@ -779,15 +718,15 @@ public(package) func quota_credit(p: Int, kind: QuotaKind) unsafe {
 public(package) func quota_clear(p: Int) unsafe {
     var i: Int = 0
     while i < QUOTA_KINDS {
-        QUOTA_USED[p * QUOTA_KINDS + i] = 0
-        QUOTA_LIMIT[p * QUOTA_KINDS + i] = 0
+        PROCESSES[p].quota_used[i] = 0
+        PROCESSES[p].quota_limit[i] = 0
         i = i + 1
     }
 }
 
 /// Write one row of `p`'s allowance.
 func set_limit(p: Int, kind: QuotaKind, value: UInt16) unsafe {
-    QUOTA_LIMIT[quota_at(p, kind)] = value
+    PROCESSES[p].quota_limit[quota_column(kind)] = value
 }
 
 /// Give process `p` its allowance, and zero what it has spent.
@@ -815,7 +754,7 @@ func set_limit(p: Int, kind: QuotaKind, value: UInt16) unsafe {
 public(package) func install_quota_limits(p: Int, root: Bool, free_rows: Int) unsafe {
     var i: Int = 0
     while i < QUOTA_KINDS {
-        QUOTA_USED[p * QUOTA_KINDS + i] = 0
+        PROCESSES[p].quota_used[i] = 0
         i = i + 1
     }
 
@@ -2467,12 +2406,15 @@ public(package) func exchange_settle(x: Int) unsafe -> StagedRefs {
 // uses, and their tags are region ordinals because that is the config root and
 // the build agreed on.
 //
-// THE STORAGE IS THE HANDLE TABLE'S OWN IDIOM — one flat array indexed
-// `p * MAX_HANDLES + i`, with a count and a cursor per process — so the file has
-// one shape for "per-process storage" rather than two. **`MAX_HANDLES` IS THE
-// RIGHT BOUND AND NOT AN ARBITRARY ONE**: every record names a handle in that
-// process's table, so a boot set larger than the table it fills could never be
-// drained into existence.
+// THE STORAGE IS THE HANDLE TABLE'S OWN IDIOM, and since M5 unit 6b (sawos
+// design 36) it is literally the handle table's NEIGHBOUR: the set, its count
+// and its cursor are `PROCESSES[p].boot_handles` / `.boot_count` / `.boot_next`,
+// three fields beside `.handles`. It was three flat `MAX_PROCESSES ×` arrays,
+// which was the same idiom spelled with a multiply.
+// **`MAX_HANDLES` IS THE RIGHT BOUND AND NOT AN ARBITRARY ONE**: every record
+// names a handle in that process's table, so a boot set larger than the table it
+// fills could never be drained into existence — a statement that is now visible
+// in the record rather than only in this comment.
 //
 // It is still a queue with a cursor and no removal: the cursor only ever
 // advances, so a drained iterator STAYS drained and a delivered record can never
@@ -2481,34 +2423,8 @@ public(package) func exchange_settle(x: Int) unsafe -> StagedRefs {
 // enforced by the give's own `BadState` refusal, one level up — and the DRAIN
 // has no deadline at all.
 
-/// One boot handle waiting to be collected.
-///
-/// **`taken` IS WHICH DELIVERY ALREADY HAPPENED** (the Aug-29 user ruling on
-/// design 4). A record leaves the set through one of two doors — the drain, or
-/// `start(boot_tag:)` putting its word in the child's first argument register —
-/// and a delivery through either spends it. The flag is what lets the SECOND
-/// door reach into the middle of the queue, which a cursor alone cannot: a
-/// resolved record may sit anywhere, and the drain simply skips it.
-///
-/// A TAG STAYS SPENT WHETHER OR NOT ITS RECORD WAS DELIVERED — `boot_tag_used`
-/// scans the whole set, flag and all — because a tag is an IDENTITY for the
-/// process's boot set, not a slot in a queue.
-public(package) struct BootHandleSlot {
-    public(package) tag: UInt,
-    public(package) kind: BootHandleKind,
-    public(package) handle: UInt,
-    public(package) taken: Bool,
-}
-
-public(package) unsafe static var BOOT_HANDLES: [BootHandleSlot; MAX_PROCESSES * MAX_HANDLES] = [
-    BootHandleSlot(tag: 0, kind: BootHandleKind.Memory, handle: 0, taken: false);
-    MAX_PROCESSES * MAX_HANDLES]
-
-/// How many records are queued for each process.
-public(package) unsafe static var BOOT_HANDLE_COUNT: [Int; MAX_PROCESSES] = [0; MAX_PROCESSES]
-
-/// How many each has collected. `NEXT[p] == COUNT[p]` is "drained".
-public(package) unsafe static var BOOT_HANDLE_NEXT: [Int; MAX_PROCESSES] = [0; MAX_PROCESSES]
+// `BootHandleSlot` MOVED TO `kcore.pslot` with the set it is an element of
+// (sawos design 36). The three statics went with it and became three fields.
 
 /// Is there room for one more record in process `p`'s set?
 ///
@@ -2518,7 +2434,7 @@ public(package) unsafe static var BOOT_HANDLE_NEXT: [Int; MAX_PROCESSES] = [0; M
 /// is here anyway because a silently dropped record is a capability a child was
 /// given and can never collect.
 public(package) func boot_handle_room(p: Int) unsafe -> Bool {
-    BOOT_HANDLE_COUNT[p] < MAX_HANDLES
+    PROCESSES[p].boot_count < MAX_HANDLES
 }
 
 /// Does process `p`'s set already carry `tag`?
@@ -2531,9 +2447,10 @@ public(package) func boot_handle_room(p: Int) unsafe -> Bool {
 /// boot set — a tag reused after the child drained the first one would still name
 /// two handles.
 public(package) func boot_tag_used(p: Int, tag: UInt) unsafe -> Bool {
+    let n = PROCESSES[p].boot_count
     var i: Int = 0
-    while i < BOOT_HANDLE_COUNT[p] {
-        if BOOT_HANDLES[p * MAX_HANDLES + i].tag == tag {
+    while i < n {
+        if PROCESSES[p].boot_handles[i].tag == tag {
             return true
         }
         i = i + 1
@@ -2556,12 +2473,18 @@ public(package) func boot_tag_used(p: Int, tag: UInt) unsafe -> Bool {
 /// second — a set freezes at start and start happens once — and the arm costs a
 /// comparison.
 public(package) func boot_handle_take(p: Int, tag: UInt) unsafe -> UInt {
+    let n = PROCESSES[p].boot_count
     var i: Int = 0
-    while i < BOOT_HANDLE_COUNT[p] {
-        let at = p * MAX_HANDLES + i
-        if BOOT_HANDLES[at].tag == tag && not BOOT_HANDLES[at].taken {
-            BOOT_HANDLES[at].taken = true
-            return BOOT_HANDLES[at].handle
+    while i < n {
+        // ONE VALUE READ RATHER THAN THREE WINDOWS. `BootHandleSlot` is
+        // trivially copyable, so reading the record out is free and the test,
+        // the mark and the answer then work on one loaded copy — which also
+        // keeps two place windows out of a single `&&` (design 34's SL-17
+        // lesson, and the whole reason the flat `let at = ...` index is gone).
+        let rec = PROCESSES[p].boot_handles[i]
+        if rec.tag == tag && not rec.taken {
+            PROCESSES[p].boot_handles[i].taken = true
+            return rec.handle
         }
         i = i + 1
     }
@@ -2573,11 +2496,11 @@ public(package) func boot_handle_take(p: Int, tag: UInt) unsafe -> UInt {
 /// boot minting and a launcher's `give` — come through it.
 public(package) func queue_boot_handle(p: Int, tag: UInt, kind: BootHandleKind,
                                        handle: UInt) unsafe {
-    let n = BOOT_HANDLE_COUNT[p]
-    BOOT_HANDLES[p * MAX_HANDLES + n] = BootHandleSlot(tag: tag, kind: kind,
-                                                       handle: handle,
-                                                       taken: false)
-    BOOT_HANDLE_COUNT[p] = n + 1
+    let n = PROCESSES[p].boot_count
+    PROCESSES[p].boot_handles[n] = BootHandleSlot(tag: tag, kind: kind,
+                                                  handle: handle,
+                                                  taken: false)
+    PROCESSES[p].boot_count = n + 1
 }
 
 /// Advance process `p`'s cursor past every record already delivered, and answer
@@ -2589,11 +2512,12 @@ public(package) func queue_boot_handle(p: Int, tag: UInt, kind: BootHandleKind,
 /// So a drained iterator stays drained, and no record is ever handed out twice
 /// however it left the set.
 public(package) func boot_handle_cursor(p: Int) unsafe -> Int {
-    var at = BOOT_HANDLE_NEXT[p]
-    while at < BOOT_HANDLE_COUNT[p] && BOOT_HANDLES[p * MAX_HANDLES + at].taken {
+    let n = PROCESSES[p].boot_count
+    var at = PROCESSES[p].boot_next
+    while at < n && PROCESSES[p].boot_handles[at].taken {
         at = at + 1
     }
-    BOOT_HANDLE_NEXT[p] = at
+    PROCESSES[p].boot_next = at
     at
 }
 
@@ -2606,6 +2530,6 @@ public(package) func boot_handle_cursor(p: Int) unsafe -> Int {
 /// process slot is reclaimable (design 3 D-3) and the next occupant would
 /// otherwise inherit a stranger's boot set.
 public(package) func clear_boot_handles(p: Int) unsafe {
-    BOOT_HANDLE_COUNT[p] = 0
-    BOOT_HANDLE_NEXT[p] = 0
+    PROCESSES[p].boot_count = 0
+    PROCESSES[p].boot_next = 0
 }

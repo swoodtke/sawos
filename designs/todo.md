@@ -158,6 +158,65 @@ entry below or the brief that carries it, never restating either.
   same five hunks of new rows, and proven PER ARCH since the two units'
   authorizations differ by profile — with 6a's rows removed the riscv32 half is
   BYTE-IDENTICAL to main's and the arm64 half is too but for the total line.
+  **UNIT 6b BUILT (`designs/036`, Sep 4) — THE ALLOCATOR TRACK'S LAST RUNG, and
+  the last of the user's three motivating kinds.** `SlabKind` grows
+  `Processes = 11`; `ProcessSlot` absorbs the FOUR tables a process index used to
+  key outside it (the handle table, the boot set with its count and cursor, the
+  two quota rows), so `PROCESSES` becomes a plain `Slab` chain and a deployment
+  that donates runs MORE CONCURRENT PROCESSES than the compiled floor.
+  **THE REAL WORK WAS THE MODULE ORDER, NOT THE FIELD LAYOUT.** Those four
+  storages lived in `kcore.objects`, which sits ABOVE `kcore.process` — and the
+  quota ledger's own header already said that was why §12's promised "field on
+  the process slot" had been kept one module down. Making them fields therefore
+  meant moving either the FUNCTIONS down (out of the module whose 2,400 other
+  lines call them) or the RECORD down below both; this unit took the second, so
+  the new `kcore.pslot` holds the record and its field types and does no work at
+  all, and **not one function moved between modules**. That is `kcore`'s own
+  altitude rule applied to STORAGE rather than to code. The fattening is BYTE FOR
+  BYTE FREE (4,296 bytes of per-process storage on arm64 before and after, no
+  padding introduced); what it costs is a SECTION — `.bss` -> `.data`, because
+  `GrantRow.region`'s `NO_MEMORY` is `-1` so design 149's zerofill does not apply
+  — which is invisible to the gate (the transcript's image column is the
+  userspace sosimg, not the kernel ELF) and is filed as a seed with the
+  plus-one encoding that would fix it. ~16 access sites unlearned their multiply;
+  THREE were rewritten rather than renamed, each a place-window question now that
+  `PROCESSES[...]` is an accessor (a `&&` with two windows on one root, a
+  three-subscript read/mark/return, and the quota comparison) — design 34's SL-17
+  lesson applied, and two shapes I expected to be refused turned out documented
+  as legal. **BOTH HALVES OF THE PRICED arm64 CONTACT LANDED.** The wall is
+  enforced by `process_slots_usable()` = `min(capacity, hal.PROT_DOMAIN_SLOTS)`,
+  which `alloc_process` scans to — one bound carrying both "a donated slot must be
+  visible" and "a slot no tier can isolate must not be handed out" — so a create
+  past it is `NoResource`, advertised rather than faulted, and `limits`' assert
+  re-scopes to the FLOOR in its wording. And `PROT_DOMAIN_SLOTS` goes **3 -> 5,
+  +48 KiB of `.bss`**, verified at `0x22000`. Gate: baseline `ebf76d0` 246/246
+  hashing to the same `c823c1b5` the brief records, then **248/248 (124 cases)**,
+  and the normalised diff is **TEN NEW ROWS AND THE TOTAL LINE — with this unit's
+  rows removed the transcripts are IDENTICAL at 515 lines, ONE hunk**, so no
+  pre-existing case row and no image size moved on either arch. NO SL ENTRY OWED
+  (highest remains SL-24).
+  **THREE THINGS THE LEAD SHOULD SEE**: (a) **the brief's "per-process sets SHRANK
+  at unit 1.5" premise is FALSE and design 29's own As-built already recorded it**
+  — a translation table is a page, so removing entries frees descriptors and never
+  a table, and a set is 3072 descriptors (24 KiB) before 1.5 and after; the brief
+  derived a "pool under ~64 KiB of .bss" budget from it that is UNSATISFIABLE as
+  written (the pool is already 88 KiB at three slots), so it was re-read as
+  "keep the ADDED .bss under ~64 KiB", which is plainly what was meant, and the
+  re-measurement is in the record so the next raise starts from a true number;
+  (b) **the wall is WITNESSED but by a measured PROBE rather than a gated case** —
+  with `PROT_DOMAIN_SLOTS` temporarily back at 3 the donation succeeds (the slab
+  grows by ~91 slots) and the create still answers `NoResource`, which also proves
+  the raise load-bearing, since without it an arm64 process donation would buy
+  exactly nothing; it is not gated because the number is per-tier (riscv32
+  publishes 256, and witnessing that would want 256 identity-placed images and
+  ~24 MiB) and because a case asserting 5 would pin this unit's own arbitrary pool
+  size rather than a behaviour; (c) the case needed TWO design-arounds worth
+  knowing — the donated region must be a FRESH CUT and not a split's remainder (a
+  region that has lent bytes out is a pool root with `out_bytes != 0` and donating
+  one FAULTS), and there are THREE echo-child packages plus a new
+  `hal/riscv32/user/child3.ld` purely because riscv32 places by identity, so three
+  concurrent children need three load addresses while arm64 serves all three from
+  one `user.ld`.
   **THE 1.5 SEAM IS CLOSED (029 rebased second, Sep 3) — AND IT WAS TWO SITES,
   NOT ONE.** This entry used to say `Slab.extent_addr` was the single line to
   flip. The READ funnel was indeed one line, but `slab_donate`'s `long_zero` in

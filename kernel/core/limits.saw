@@ -66,6 +66,20 @@ import sosabi.{ClockType}
 /// Three rather than eight for the same reason it was two rather than eight:
 /// the number is the smallest that serves the workload of record. A fourth is
 /// an edit to this line when a unit argues for one.
+///
+/// **AND IT IS THE COMPILED FLOOR SINCE M5 UNIT 6b** (sawos design 36).
+/// `SlabKind.Processes` raises the machine's real ceiling, and a process
+/// donation carries the whole per-process record with it — handle table, quota
+/// ledger and boot set are FIELDS of `ProcessSlot` now, which is what made the
+/// kind convertible at all. So a deployment that donates runs more concurrent
+/// processes than this line says, and the census above ("a slot is not free")
+/// is exactly the storage a donated extent supplies per slot.
+///
+/// **ON A TRANSLATING TIER THERE IS A SECOND, LOWER CEILING**, and it is not
+/// this one: a persistent per-process table set comes out of a STATIC HAL pool
+/// that donation cannot reach (design 25 D-3), so `hal.PROT_DOMAIN_SLOTS` is
+/// what a create actually meets there. See the assert below and
+/// `kcore.process.process_slots_usable`.
 public(package) static MAX_PROCESSES: Int = 3
 
 /// Root's slot. The kernel loads exactly one image (§12) and it lands here, so
@@ -191,8 +205,18 @@ static_assert(hal.GRANT_ROW_BUDGET <= 9,
 // than read from here because a HAL that had to import the kernel to size its
 // own page tables would be the wrong way round — this assert is what keeps the
 // two spellings honest, exactly as the `GRANT_ROW_BUDGET` pair above does.
+//
+// **IT BINDS THE FLOOR AND ONLY THE FLOOR SINCE M5 UNIT 6b** (sawos design 36).
+// `MAX_PROCESSES` is extent 0's length now, so what this says is "the processes
+// the image was BUILT for must have somewhere to live, or the kernel could not
+// boot them". Donation moves the slab's capacity past this line and CANNOT move
+// the HAL's pool — that storage is static and design 25 D-3 ruled it out of
+// donation's reach — so above the floor the same question is answered at RUN
+// TIME by `kcore.process.process_slots_usable`, and a create past the pool is
+// the `NoResource` a full table already answers. Advertised wall, not a fault:
+// the caller cannot know the number, because the kernel does not publish it.
 static_assert(MAX_PROCESSES <= hal.PROT_DOMAIN_SLOTS,
-              "every process slot needs a protection domain in the HAL's pool")
+              "the compiled floor of process slots must fit the HAL's domain pool")
 
 /// Threads the kernel can hold, across all processes — THE COMPILED FLOOR since
 /// M5 unit 6a (sawos design 34). `SlabKind.Threads` raises the machine's real
@@ -266,6 +290,24 @@ public(package) static MAX_TIMERS: Int = 8
 /// for a shape no program in the tree has. `NoResource` at `add` is what says
 /// so when a program finds the wall — design 21's driver holds at most six
 /// attachments at once (its outlet, its IRQ line, and up to four held reads).
+///
+/// **THE DERIVATION IS A SUM OF FLOORS, AND SINCE M5 UNIT 6b IT IS ITSELF ONLY A
+/// FLOOR** (sawos design 36; designs 32/34 for the other three terms). Every
+/// term is now a compiled floor rather than a ceiling — `MAX_EVENTS`,
+/// `MAX_INTERRUPTS`, `MAX_TIMERS` and `MAX_PROCESSES` are all donatable kinds —
+/// so the sentence "nothing can need more attachments than there are waitables"
+/// is no longer true of a DONATING machine: a deployment that donates events can
+/// have more events than this sum, and `NoResource` at `Waiter.add` is what says
+/// so.
+///
+/// **THAT IS THE HONEST STATE AND IT COSTS NOTHING, because `Attachments` IS
+/// ITSELF A DONATABLE KIND** (design 32's table, converted there). A deployment
+/// that raises one of the waitable slabs raises this one alongside it, in the
+/// same vocabulary, with the same op — so the relation the sum expresses is
+/// preserved by the DEPLOYMENT rather than by the compile, which is exactly what
+/// D-6 moved every one of these numbers to. What the arithmetic still buys is
+/// the boot minimum: a machine that never donates keeps the old guarantee
+/// exactly, and the sum is what makes it true.
 public(package) static MAX_ATTACHMENTS: Int = (MAX_EVENTS + MAX_INTERRUPTS
                                                + MAX_TIMERS + MAX_PROCESSES)
 
@@ -289,6 +331,9 @@ public(package) static MAX_ATTACHMENTS: Int = (MAX_EVENTS + MAX_INTERRUPTS
 /// connection count tracks its number of SESSIONS and not its number of
 /// clients. The three-process delegation beside it spends two, which is the
 /// largest a case in this tree has wanted.
+///
+/// (This paragraph's neighbour, `MAX_ATTACHMENTS`, restates its own derivation
+/// as a FLOOR since unit 6b — see there.)
 /// **AND IT IS THE COMPILED FLOOR SINCE M5 UNIT 6a** (sawos design 34).
 /// `SlabKind.Pipes` raises it, and a pipe donation carries the STAGING RINGS with
 /// it: one unit is a connection slot plus `PIPE_INFLIGHT` exchange records, which

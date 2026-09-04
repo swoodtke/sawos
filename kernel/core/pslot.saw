@@ -1,0 +1,445 @@
+//! THE PROCESS SLOT — one record per process, and EVERY storage a process index
+//! keys (sawos design 36, M5 unit 6b).
+//!
+//! # WHY THIS MODULE EXISTS
+//!
+//! Until this unit there were SIX storages keyed by a process index and they
+//! lived in two modules: `PROCESSES` in `kcore.process`, and the handle table,
+//! the quota ledger and the boot-handle queue in `kcore.objects`. That split was
+//! not a design — it was the module ORDER, recorded as such at the quota
+//! ledger's old home ("§12 promised a field on the process slot, and this is
+//! that promise kept one module down"). `objects` sits ABOVE `process`, so the
+//! handle table could not be a field of a record `process` owned.
+//!
+//! **UNIT 6b MAKES THEM ONE RECORD, so they need ONE module, and it has to sit
+//! below every module that reads any of them — `objects` included.** That is
+//! this file. Nothing here does any work: it is the per-process record, its
+//! field types, and the slab that holds it. The FUNCTIONS that maintain each
+//! part stayed exactly where they were — the handle table's in `kcore.objects`,
+//! the grant record's and the copy doors' in `kcore.process` — because altitude
+//! is decided by what a function has to REACH, and none of them moved.
+//!
+//! # WHY THE SLOT HAD TO ABSORB THEM
+//!
+//! `PROCESSES` is a `Slab` now (sawos designs 32/34), so a deployment can DONATE
+//! process slots and run more concurrent processes than the image was compiled
+//! for. A slab is one array keyed by the slot index and nothing else: a parallel
+//! `MAX_PROCESSES ×` table would simply be left behind by a donation, and slot 4
+//! would index off the end of a handle table sized for three. So every
+//! per-process table becomes a FIELD, all of its inner dimensions being
+//! per-process constants — which makes `ProcessSlot` large and entirely plain.
+//!
+//! This is design 34's "fatten one level down" for the third time, and it is the
+//! easy shape rather than the hard one: a pipe's ten satellites hung off a
+//! DERIVED index and a thread's frame arena could not be a field at all
+//! (alignment), while every table here is already indexed by the process slot
+//! itself. The flat `p * MAX_HANDLES + i` arithmetic simply UNLEARNS its
+//! multiply — `PROCESSES[p].handles[i]` — and the boundary walk the slab does is
+//! the one the multiply used to stand in for.
+//!
+//! # THE ONE COST, MEASURED
+//!
+//! `PROCESSES` is in `.data` rather than `.bss`, and absorbing ~950 bytes per
+//! slot of previously-`.bss` tables moves those bytes into the kernel's loaded
+//! image. The cause is ONE FIELD: `GrantRow.region`'s `NO_MEMORY` sentinel is
+//! `-1`, so the record's initializer is not all-zero and design 149's zerofill
+//! does not apply. It costs no TEST image bytes (a test's image is its
+//! userspace `sosimg`; the kernel's `.data` is not in it) and the As-built
+//! measures it. A plus-one encoding for that field — the idiom
+//! `ProcessSlot.attachment` already uses — would put the whole record back in
+//! `.bss`; recorded there as a seed rather than built here, because it is a
+//! change to design 28's back-reference and this unit had no need of it.
+
+import sosabi.{BootHandleKind, ObjType, ProcessStatusKind}
+import kcore.limits.{
+    MAX_GRANT_ROWS,
+    MAX_HANDLES,
+    MAX_PROCESSES,
+    MAX_SLAB_EXTENTS,
+    NO_MEMORY,
+}
+import kcore.slab.{Slab}
+
+/// One handle-table entry: the object a handle names, the rights its holder has
+/// on it (§3), WHICH object of that kind it is, and which LIFE of this slot it
+/// belongs to.
+///
+/// `obj_type` is the typed tag; `rights` stays a plain `UInt32` because it is a
+/// MASK — a set of bits, not one of the cases of any kind's rights enum. It is
+/// deliberately NOT interpretable on its own: which enum's bits these are is
+/// decided by `obj_type`, and the pairing happens in `kcore.objects`.
+///
+/// `target` is the object's slot in its kind's table. It was not needed while
+/// the only object was a singleton; with Threads it is the whole point of the
+/// entry, because "which thread" is exactly what a handle answers.
+///
+/// **`gen` SURVIVES THE UNBIND, and that is the whole mechanism** (sawos design
+/// 3 D-1). It is the only field a release does not clear: unbinding zeroes the
+/// binding and INCREMENTS the generation, so the next mint in this slot stamps
+/// a word that no word handed out before it can equal. A stale word therefore
+/// fails the equality test in `lookup_handle` and becomes the `Unbound` answer
+/// the callers already turn into a `BadHandle` fault — which is what makes
+/// use-after-release a DIAGNOSED bug rather than a silent alias onto whatever
+/// took the slot.
+///
+/// It lives in the ENTRY rather than in a parallel array because the two are one
+/// fact about one slot, and a second array would be a second place to forget.
+public(package) struct HandleEntry {
+    public(package) obj_type: ObjType,
+    public(package) rights: UInt32,
+    public(package) target: Int,
+    public(package) gen: UInt32,
+}
+
+/// One boot handle waiting to be collected.
+///
+/// **`taken` IS WHICH DELIVERY ALREADY HAPPENED** (the Aug-29 user ruling on
+/// design 4). A record leaves the set through one of two doors — the drain, or
+/// `start(boot_tag:)` putting its word in the child's first argument register —
+/// and a delivery through either spends it. The flag is what lets the SECOND
+/// door reach into the middle of the queue, which a cursor alone cannot: a
+/// resolved record may sit anywhere, and the drain simply skips it.
+///
+/// A TAG STAYS SPENT WHETHER OR NOT ITS RECORD WAS DELIVERED — `boot_tag_used`
+/// scans the whole set, flag and all — because a tag is an IDENTITY for the
+/// process's boot set, not a slot in a queue.
+public(package) struct BootHandleSlot {
+    public(package) tag: UInt,
+    public(package) kind: BootHandleKind,
+    public(package) handle: UInt,
+    public(package) taken: Bool,
+}
+
+/// What a process may be charged for (sawos design 7 D-3).
+///
+/// Raw-backed and dense from zero, because the value IS the column index in the
+/// two rows of `ProcessSlot` below — the same "the slot is the ordinal"
+/// arrangement `ClockType` uses, and the reason no lookup table is owed.
+///
+/// **`Handle` IS THE KIND WITH NO SLAB**, and that is why it is here rather
+/// than derived: a handle entry lives in the per-process table, so the thing
+/// that bounds it is this row and nothing else. It is design 3's promised
+/// addition, arriving with the rest of the ledger.
+///
+/// **`Mapping` COUNTS INSTALLED ROWS, NOT OBJECTS**, and it is the one row in
+/// this enum that does. D-3 rules that a mapping charges its TARGET, because
+/// the scarce thing it consumes is that process's grant-row budget — and the
+/// row budget is what a `map` can physically meet, so a ledger that counted
+/// Mapping OBJECTS would drift from it the moment a mapped Mapping's last
+/// handle went away (D-2 frees the slot and LEAVES the row). Counting rows
+/// keeps `used` and the target's `grant_count` exactly in step, which is what
+/// makes `install_row`'s `fatal` provably unreachable rather than merely
+/// unlikely. `Thread` is the mirror asymmetry from the other side: it has a
+/// slab and no refcount, so its row is charged and only ever credited by the
+/// teardown.
+/// **`Pipe` IS M4 UNIT 1's ROW, AND IT IS CREATOR-PAYS FOR A CONNECTION RATHER
+/// THAN FOR AN ENDPOINT** (sawos design 10 ruling 6; design 13 D-1). One charge
+/// at `ProcessOp.PipeCreate`, credited when BOTH reference columns reach zero
+/// and the connection's slot goes back — which is the only moment the scarce
+/// thing it counts (a `PIPES` row and its staging ring) is actually returned.
+///
+/// **CHARGING THE PAIR ONCE IS THE POINT.** Two ends of one connection are two
+/// handle entries, and the HANDLE row already counts those; a second charge per
+/// endpoint would make a launcher that keeps both ends pay twice for one slab
+/// slot, and would make "give one end away" look like a refund. What the ledger
+/// tracks is what the slab holds.
+public(package) enum QuotaKind: UInt8 {
+    case Thread = 0,
+    case Event = 1,
+    case Waiter = 2,
+    case Interrupt = 3,
+    case Timer = 4,
+    case Memory = 5,
+    case IoMemory = 6,
+    case Mapping = 7,
+    case Handle = 8,
+    case Pipe = 9,
+}
+
+/// Columns in the ledger — one per `QuotaKind`, and the two rows' length.
+///
+/// It was the ledger arrays' STRIDE until unit 6b; the stride is gone with the
+/// flat array, and what is left is the honest statement: a process's ledger is
+/// this many `UInt16`s wide.
+public(package) static QUOTA_KINDS: Int = 10
+
+/// What a process slot is doing.
+///
+/// `Created` is M3 unit 2's, and it is the whole of the two-phase lifecycle in
+/// the state machine: `process_create` leaves a process INERT — an address
+/// space with an entry and a stack recorded and no thread — and `start` is what
+/// makes it run. A second `start` is a `BadState` fault because this word says
+/// the first one already happened.
+public(package) enum ProcessState: UInt8 {
+    case Free = 0,
+    case Running = 1,
+    case Gone = 2,
+    case Created = 3,
+}
+
+/// ONE INSTALLED PROTECTION ROW — a range, what may be done with it, and
+/// whether it names hardware (sawos design 2 D-5).
+///
+/// It is the argument list of a `hal.prot_region` / `hal.prot_device` call,
+/// remembered. That is the honest description and it is why there is no
+/// per-profile field: what a permission bit does to the machine is the HAL's,
+/// and this record's job is only to say the same thing twice — once when the
+/// grant is made and once when the scheduler puts it back.
+///
+/// **AND SINCE M5 UNIT 2 A ROW HAS TWO ADDRESSES** (sawos design 33). `base` and
+/// `top` are the USER's range — the numbers the process itself issues — and `pa`
+/// is the PHYSICAL base that `base` translates to. Until placement they were one
+/// number written twice, and every tier still says so except the translating
+/// one: `hal.map_place` and `hal.image_link_base` answer the physical address on
+/// the MPU tier, and `hal.prot_update` asserts there that `pa == base`.
+///
+/// The mapping is AFFINE over the row: the physical address of a user address
+/// `va` inside it is `pa + (va - base)`, which is what `translate_user` computes
+/// and what a translating HAL's own walk installs. A row is the largest unit
+/// over which that holds, which is exactly why the copy funnels resolve against
+/// ONE row rather than against a span of them.
+public(package) struct GrantRow {
+    public(package) base: UInt,
+    public(package) top: UInt,
+    public(package) pa: UInt,
+    public(package) perms: UInt8,
+    public(package) device: Bool,
+    /// WHICH `Memory` REGION these bytes are, or `NO_MEMORY` (sawos design 28).
+    ///
+    /// **THE BACK-REFERENCE RIDES THE ROW BECAUSE THE ROW IS WHAT IS COUNTED**
+    /// (`MemorySlot.maps`). A row outlives its `Mapping` object by design — 7
+    /// D-2's husk arm frees the slot and leaves the row installed — so a link
+    /// kept on the Mapping slot would be lost exactly when the region still
+    /// needed to know that something was granting its bytes. Here it cannot be:
+    /// a row is born in `record_grant`, dies in `remove_grant` or
+    /// `clear_domain`, and travels with its own row through the compaction
+    /// because the compaction copies whole rows.
+    ///
+    /// `NO_MEMORY` is the common case and means "these bytes are not a region
+    /// the pool lent out": an image segment, the kernel's stack grant, and every
+    /// DEVICE row (an IoMemory is pinned and returns nothing — §5.9's carve-out).
+    ///
+    /// **IT IS ALSO THE ONE FIELD THAT KEEPS THIS RECORD OUT OF `.bss`**, since
+    /// `NO_MEMORY` is `-1` and every other field's rest value is zero. See this
+    /// module's header for the measurement and for the plus-one encoding that
+    /// would fix it.
+    public(package) region: Int,
+}
+
+/// One process (spec §2 table row): its protection domain, its handle table,
+/// its ledger, its boot set and its threads.
+///
+/// **THE HANDLE TABLE IS A FIELD NOW, and the sentence this comment used to
+/// carry is what unit 6b retired.** It said the table "is not a field: it is a
+/// slice of `HANDLES`, indexed by this slot… a fixed-size array of fixed-size
+/// arrays is a shape the kernel has no allocator for". The shape was always
+/// fine — what was missing was a reason to pay for it, and donation is that
+/// reason: a slab may only be ONE array keyed by the slot, so a parallel table
+/// is a table a donated slot does not have. See this module's header.
+///
+/// `region_base`/`region_top` ARE the address-space domain's OUTER BOUNDS: one
+/// granted range per process, and the one question thread creation has to ask —
+/// is this entry, is this stack, inside the process at all.
+/// `rw_base`/`rw_top` are the WRITABLE window inside that range, and they exist
+/// because the kernel now writes into a process's memory (`copy_out`). A
+/// process that asks the kernel to place a record in its own CODE has made a
+/// caller-checkable mistake, and the check needs somewhere to read the answer
+/// from. It is ONE window rather than a per-segment list because a loaded image
+/// is contiguous (spec §5.5's `code|rodata|rw` layout) plus a stack at the
+/// region's top edge, so the writable part is the span between them. That holds
+/// for a CHILD exactly as it does for root — `process_create` computes it by
+/// root's own rule. **UNIT 4's `Mapping` DID NOT REPLACE THIS PAIR, and the
+/// reason is worth recording where the pair is**: a mapping records its own
+/// access, so the per-mapping answer now EXISTS — but this window is what the
+/// KERNEL checks a record it is about to write against (`copy_out`), and
+/// answering that by walking the grant rows would make every copy-out a scan.
+/// The pair stays the conservative span it always was; a row-walk is the
+/// improvement, not the correction.
+/// It is CONSERVATIVE in one direction only: a gap between the image's writable
+/// end and the stack falls inside the span, so the kernel may write RAM the
+/// process was not granted. That corrupts nothing — the process owns the whole
+/// region either way, and a process that names a hole gets a record it cannot
+/// read, which is its own bug.
+///
+/// Zero/zero means NO writable grant, and that is the honest answer for the
+/// harness kernels that grant a payload its own bytes read+execute: a process
+/// with nowhere to receive a record cannot receive one.
+///
+/// `grants`/`grant_count` are the GRANT RECORD (sawos design 2 D-5) — the rows
+/// this process's domain is made of, written by whoever grants and REPLAYED by
+/// the scheduler when it switches in. With one process the live protection set
+/// and the only process's set were the same thing, so nothing had to be
+/// remembered; with two they cannot be — one profile has a small fixed budget
+/// of numbered regions and a three-segment image spends all of it, and the
+/// other's grant window is a single shared user-mode permission map — so the
+/// domain is DATA now and installing it is an operation.
+///
+/// `public(package)`, like the `PROCESSES` table below it: `kcore.dispatch` and
+/// `kcore.sched` read slots out of that table, so a private element type would
+/// be a value a sibling module holds and cannot name (refused since the Aug-21
+/// signature-visibility rule).
+/// (`self_handle` WAS HERE and is GONE — sawos design 3 D-4. It cached the word
+/// `ProcessSelf` answered with, which only made sense while a getter handed the
+/// same handle back every ask. Under mint-per-call a process's own Process
+/// handle is not a fact about the process at all: it is however many capability
+/// instances the process asked for, each independently releasable, so a cached
+/// word would name one of them and go stale the moment that one was released.
+/// The table is the truth. `ThreadSlot.self_handle` went the same way and for
+/// the same reason.)
+public(package) struct ProcessSlot {
+    public(package) state: ProcessState,
+    /// The image entry, which is what `ENTRY_IMAGE` resolves to.
+    public(package) entry: UInt,
+    /// Where a `start` puts the first thread's stack pointer — the kernel's
+    /// grant at the region's top, recorded at create so root supplies no
+    /// numbers at start.
+    public(package) stack_top: UInt,
+    public(package) region_base: UInt,
+    public(package) region_top: UInt,
+    public(package) rw_base: UInt,
+    public(package) rw_top: UInt,
+    public(package) grant_count: Int,
+    public(package) grants: [GrantRow; MAX_GRANT_ROWS],
+    public(package) exit_kind: ProcessStatusKind,
+    public(package) exit_code: UInt,
+    /// **THIS PROCESS'S HANDLE TABLE** (§3) — handle INDEX `i` (0-based inside
+    /// the table) is `handles[i]`, and the word the process holds carries
+    /// `i + 1` in its low byte ("handle 0 names nothing").
+    ///
+    /// Generations start at zero, which is what makes a fresh slot's first word
+    /// the bare index — design 3 D-1's compatibility rule, and the reason §12's
+    /// boot order still hands root 1, 2, 3.
+    ///
+    /// `MAX_HANDLES` IS THE ONE PER-PROCESS CEILING UNIT 6b LEAVES STANDING.
+    /// However many objects the machine can hold after a donation, one process
+    /// can NAME at most this many at once — design 32's finding 3, design 34's
+    /// findings 1 and 4. Raising it is a handle-table GROWTH op and it is
+    /// deliberately not this unit's; the seed is filed in `designs/036`.
+    public(package) handles: [HandleEntry; MAX_HANDLES],
+    /// **THIS PROCESS'S BOOT SET** — what somebody minted for it before it ran
+    /// and has not handed over yet (spec §12; sawos design 4).
+    ///
+    /// `MAX_HANDLES` IS THE RIGHT BOUND AND NOT AN ARBITRARY ONE: every record
+    /// names a handle in this same table, so a boot set larger than the table it
+    /// fills could never be drained into existence. That was true when the two
+    /// were separate flat arrays and it is visible now that they are neighbours.
+    public(package) boot_handles: [BootHandleSlot; MAX_HANDLES],
+    /// How many records are queued.
+    public(package) boot_count: Int,
+    /// How many have been collected. `boot_next == boot_count` is "drained".
+    public(package) boot_next: Int,
+    /// What this process has spent, by `QuotaKind` (sawos design 7 D-3).
+    ///
+    /// **§12 PROMISED "A FIELD ON THE PROCESS SLOT" AND THIS IS FINALLY IT.**
+    /// The ledger lived one module down, in `kcore.objects`, for a reason that
+    /// was the module order and said so: the HANDLE row is charged inside
+    /// `mint_handle` and credited inside `unbind_handle`, which are there, and
+    /// `kcore.process` sat above. Unit 6b moved the RECORD below both instead of
+    /// moving the functions, so the promise is kept and `mint_handle` did not
+    /// have to go anywhere.
+    public(package) quota_used: [UInt16; QUOTA_KINDS],
+    /// What this process may spend, by kind. Zero until `install_quota_limits`
+    /// runs, which is deliberate: a slot with no limits installed can allocate
+    /// nothing, so a process reached before its ledger exists refuses rather
+    /// than running unbudgeted.
+    public(package) quota_limit: [UInt16; QUOTA_KINDS],
+    /// How many handle entries ANYWHERE name this process (sawos design 7
+    /// D-1).
+    ///
+    /// **THIS IS DESIGN 3 D-3's SCAN, GENERALIZED INTO A COUNT.** Unit 2.75
+    /// answered "may this Gone slot be spent again" by walking every process's
+    /// handle table looking for a reference, and argued at the time that a
+    /// per-slot count would be a second fact to keep in step with the table.
+    /// Unit 5 keeps seven other kinds' counts in step at exactly the same
+    /// sites, so the argument reverses: the count is now the CHEAPER thing to
+    /// maintain and the walk is the odd one out. The answer is identical —
+    /// no handle naming the slot means no possible reader of its §8 status
+    /// word — and `reclaim_process_slot` reads this instead of scanning.
+    ///
+    /// It counts references from EVERY process's table, which is why it lives
+    /// on the slot rather than in the ledger: whoever still holds a handle is
+    /// the reader that matters, and that need not be the process releasing one.
+    ///
+    /// **AND SINCE M3 UNIT 5.5 IT COUNTS THE ATTACHMENT TOO** (sawos design 8,
+    /// amending design 7 D-1's table row): a Process handle is a waitable, an
+    /// attachment is a counted reference on every waitable, and this one is
+    /// load-bearing rather than uniform — it is what makes attach-after-death
+    /// SOUND. A supervisor watching a dead child holds the slot open, so the
+    /// §8 status word it is waiting to read cannot be reclaimed out from under
+    /// it by design 3 D-3's rule.
+    public(package) refs: UInt16,
+    /// The attachment naming this process (slot + 1); 0 = unattached (sawos
+    /// design 8).
+    ///
+    /// THE SAME FIELD THE THREE OTHER WAITABLES CARRY, for the same reason
+    /// (`EventSlot.attachment`): §2.2 ratifies at most one Waiter per handle,
+    /// so it is a field rather than a list, and it is the ONE thing the
+    /// notifying side has to load — `end_process` asks it and nothing else
+    /// about the wait machinery.
+    ///
+    /// It lives here rather than beside the wait tables because it is a
+    /// property of the process slot, and that is also why `kcore.waitables`
+    /// sits ABOVE the process table: a Process's readiness and payload are read
+    /// out of it. See `kcore`'s module-order list.
+    public(package) attachment: Int,
+    /// **THE THREE TRAP COLUMNS** (sawos design 16), split by the cause class
+    /// `ktrap` decides on: syscall traps, interrupts taken while this process
+    /// was current, and every other exception. `sosabi`'s
+    /// `PROCESS_STATS_RECORD_DOUBLEWORDS` block is the full description of what
+    /// each counts and which one an assertion may read.
+    ///
+    /// **`UInt64` ON BOTH PROFILES, AND THAT IS THE POINT.** A count is a
+    /// property of the quantity rather than of the machine: a `UInt` column
+    /// would be register-wide, so the same program would answer two different
+    /// things about itself depending on which profile it was built for. It is
+    /// the same rule the Clock record follows for a nanosecond count.
+    ///
+    /// THEY LIVE ON THE PROCESS SLOT AND NOT ON THE THREAD SLOT because the
+    /// ruled surface is PER-PROCESS (design 16, user, Sep 1) — per-thread waits
+    /// for a consumer that names it. A thread's traps are its process's, which
+    /// is what makes the count survive the thread and makes a multi-threaded
+    /// process's total the one number a supervisor asked for.
+    public(package) syscalls: UInt64,
+    public(package) interrupts: UInt64,
+    public(package) faults: UInt64,
+}
+
+/// The process slab — extent 0 is `MAX_PROCESSES` long and a donation appends
+/// (sawos design 36, on designs 32/34's machinery).
+///
+/// **THE LAST OF THE USER'S THREE MOTIVATING KINDS.** Design 32 delivered the
+/// mechanism and nine plain-chain kinds; design 34 took threads and pipes; this
+/// is processes, which is the one that needed a record to absorb its tables
+/// first.
+///
+/// `capacity()` is what every scan reads, and it is NOT by itself what bounds a
+/// creation: a tier that keeps a persistent protection domain per process slot
+/// publishes how many it has (`hal.PROT_DOMAIN_SLOTS`), and `alloc_process`
+/// takes the smaller of the two. See `kcore.process.process_slots_usable`.
+public(package) unsafe static var PROCESSES: Slab<ProcessSlot, MAX_PROCESSES> = Slab<ProcessSlot, MAX_PROCESSES>(
+    inline: [ProcessSlot(state: ProcessState.Free, entry: 0,
+                         stack_top: 0, region_base: 0, region_top: 0,
+                         rw_base: 0, rw_top: 0,
+                         grant_count: 0,
+                         grants: [GrantRow(base: 0, top: 0, pa: 0, perms: 0,
+                                           device: false,
+                                           region: NO_MEMORY);
+                                  MAX_GRANT_ROWS],
+                         exit_kind: ProcessStatusKind.Running, exit_code: 0,
+                         handles: [HandleEntry(obj_type: ObjType.Unbound,
+                                               rights: 0, target: 0, gen: 0);
+                                   MAX_HANDLES],
+                         boot_handles: [BootHandleSlot(tag: 0,
+                                                       kind: BootHandleKind.Memory,
+                                                       handle: 0, taken: false);
+                                        MAX_HANDLES],
+                         boot_count: 0, boot_next: 0,
+                         quota_used: [0; QUOTA_KINDS],
+                         quota_limit: [0; QUOTA_KINDS],
+                         refs: 0, attachment: 0,
+                         syscalls: 0, interrupts: 0, faults: 0); MAX_PROCESSES],
+    ext_base: [0; MAX_SLAB_EXTENTS],
+    ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_side: [0; MAX_SLAB_EXTENTS],
+    ext_count: 0,
+    total: MAX_PROCESSES)

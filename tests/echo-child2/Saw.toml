@@ -1,0 +1,33 @@
+[package]
+name = "echo-child2"
+version = "0.1.0"
+
+# Same reason as sos/root's: this image carries its own `__saw_rt_*` seams, out
+# of the `sosrt` module its `sos` dependency pulls in. See that manifest.
+runtime = true
+
+# THE SECOND OF THREE ECHO CHILDREN (sawos design 36, M5 unit 6b). Each one says a
+# line and exits with its own code, so a launcher can tell which one ran; the
+# three are IDENTICAL apart from that code and their riscv32 linker script.
+#
+# **THE THREE PACKAGES EXIST BECAUSE riscv32 PLACES BY IDENTITY.** A child image
+# runs at exactly the base it was linked at there, so three CONCURRENT children
+# need three load addresses and therefore three scripts — and a package's
+# manifest picks a script, so three packages. On aarch64 design 33 made every
+# user image link at one canonical base and the kernel translates, so all three
+# name the same `user.ld` and the duplication buys nothing there. The runner
+# assigns destination regions BY INDEX, so this package must be listed SECOND.
+[dependencies]
+sos = { path = "../../kernel/sysapi" }
+
+[sos]
+emit = "sosimg"
+priorities = { background = 0, low = 1, normal = 1, high = 1 }
+
+[sos.riscv32-unknown-none-elf]
+linker-script = "../../hal/riscv32/user/child2.ld"
+native = "../../hal/riscv32-common/user/syscall.c ../../rt/common_c/support.c"
+
+[sos.aarch64-unknown-none-elf]
+linker-script = "../../hal/arm64/user/user.ld"
+native = "../../hal/arm64/user/syscall.c ../../rt/common_c/support.c"

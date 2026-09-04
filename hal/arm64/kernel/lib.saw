@@ -1023,13 +1023,51 @@ static PT_SET_BYTES: UInt = (512 + 512 + 1024 + 512 + 512) * 8
 /// **HOW MANY PERSISTENT TABLE SETS THE POOL HOLDS — one per process slot**
 /// (sawos design 27, M5 unit 1; design 25 D-3's static per-process pools).
 ///
-/// It is `MAX_PROCESSES`, and it is declared HERE rather than read from the
-/// kernel because a HAL that had to import the kernel to size its own page
-/// tables would be the wrong way round — the same reason `align_up` is
-/// duplicated below. `kernel/core/limits.saw` static_asserts that the kernel's
-/// `MAX_PROCESSES` fits this, exactly as it already does for
-/// `GRANT_ROW_BUDGET`, so the two cannot disagree without the build saying so.
-public static PROT_DOMAIN_SLOTS: Int = 3
+/// It is declared HERE rather than read from the kernel because a HAL that had
+/// to import the kernel to size its own page tables would be the wrong way round
+/// — the same reason `align_up` is duplicated below. `kernel/core/limits.saw`
+/// static_asserts that the kernel's `MAX_PROCESSES` fits this, exactly as it
+/// already does for `GRANT_ROW_BUDGET`, so the two cannot disagree without the
+/// build saying so.
+///
+/// **IT WAS `MAX_PROCESSES` AND IT IS NOW STRICTLY LARGER — FIVE SINCE M5 UNIT
+/// 6b** (sawos design 36), which is the whole of this tier's half of that unit.
+/// `SlabKind.Processes` lets a deployment donate process slots, but THIS POOL IS
+/// STATIC and donation cannot reach it (design 25 D-3, ruled), so on a
+/// translating tier a donated slot with no table set behind it could never run.
+/// Leaving this at 3 would have made an arm64 process donation buy exactly
+/// nothing. The kernel takes the smaller of the two numbers at run time
+/// (`kcore.process.process_slots_usable`) and answers `NoResource` past it.
+///
+/// **THE ARITHMETIC, AND IT IS PAID IN `.bss` ONLY.** One set is
+/// `PT_SET_DESCRIPTORS` = 3072 descriptors = 24 KiB (unchanged by the
+/// higher-half kernel — design 29 measured that the sets kept their TABLES and
+/// lost only ENTRIES, since a translation table is a page and removing entries
+/// frees no page). So:
+///
+/// | slots | pool descriptors | pool bytes | delta |
+/// |---|---|---|---|
+/// | 3 (before) | 3072*3 + 1536 + 512 = 11264 | 90,112 (`0x16000`) | — |
+/// | **5 (now)** | 3072*5 + 1536 + 512 = 17408 | **139,264 (`0x22000`)** | **+49,152 (+48 KiB)** |
+///
+/// Five rather than six because +48 KiB is the largest raise that keeps the
+/// ADDED `.bss` under a 64 KiB budget; a sixth set would be +72 KiB. Five rather
+/// than four so that the gate's own case (root plus three children) sits one
+/// slot below the wall rather than exactly on it. `.bss` is `NOLOAD`, so this
+/// costs ZERO image bytes (design 149) — what it costs is `boot.S`'s zerofill
+/// and two more set-builds, each of which writes two live entries at rest.
+///
+/// Headroom is unchanged in character: `_bss_end` stays about 1.3 MiB below
+/// `ROOT_LOAD_BASE`, and `virt.ld`'s `ASSERT` is what would catch a raise that
+/// went too far — which is why that assert names this constant.
+public static PROT_DOMAIN_SLOTS: Int = 5
+
+// THE ASID IS THE SLOT INDEX (see `prot_switch`), and `TCR_EL1.AS` = 0 makes the
+// field 8 bits wide. This is the bound that raise had to respect, and at five it
+// is not close — but it is the one that would bite silently, by aliasing two
+// domains' TLB entries onto one tag, so it is checked rather than reasoned about.
+static_assert(PROT_DOMAIN_SLOTS <= 256,
+              "the ASID is the process slot index and TCR_EL1.AS=0 gives it 8 bits")
 
 /// **THE KERNEL'S OWN TABLES — the LINEAR MAP, and it exists ONCE** (sawos
 /// design 29). Three tables: a level 1, a level 2 over the device gigabyte, and
@@ -1103,7 +1141,9 @@ static_assert(RAM_BASE + RAM_LEN - 1 <= LINMAP_PHYS_MASK,
 
 static PAGE_SHIFT: Int = 12
 /// Where the ASID sits in `TTBR0_EL1` — bits 63:48, of which `TCR_EL1.AS` = 0
-/// makes bits 55:48 significant. Three process slots use three of those 256.
+/// makes bits 55:48 significant. `PROT_DOMAIN_SLOTS` slots use that many of
+/// those 256, and the `static_assert` beside that constant is what keeps the
+/// ASID-as-slot-index encoding honest if the pool is ever raised again.
 static TTBR_ASID_SHIFT: Int = 48
 static BLOCK_SHIFT: Int = 21              // a level-2 block is 2 MiB
 static MAIR_INDEX_SHIFT: Int = 2          // descriptor bits 4:2
@@ -1697,10 +1737,12 @@ public static PROT_REPLAY_AT_SWITCH: Bool = false
 /// **THE SWITCH.** Make `p`'s tables the live ones.
 ///
 /// One `msr` and an `isb` — no descriptor stores and no TLB flush, which is the
-/// whole point of the unit. The ASID is the process slot index: three slots, a
-/// field the architecture gives at least 8 bits for (`TCR_EL1.AS` is 0 here, so
-/// 8), so no allocator is needed and the number is stable for a process's whole
-/// life. `TCR_EL1.A1` is 0, so TTBR0 is what defines the ASID.
+/// whole point of the unit. The ASID is the process slot index: `PROT_DOMAIN_SLOTS`
+/// of them, in a field the architecture gives at least 8 bits for (`TCR_EL1.AS`
+/// is 0 here, so 8), so no allocator is needed and the number is stable for a
+/// process's whole life. `TCR_EL1.A1` is 0, so TTBR0 is what defines the ASID.
+/// The `static_assert` at `PROT_DOMAIN_SLOTS` is what keeps that encoding true
+/// as the pool grows — it was three slots until M5 unit 6b and is five now.
 ///
 /// Entries stay valid across the switch because every window descriptor carries
 /// `ATTR_NG` and is therefore tagged with the ASID that installed it — the
