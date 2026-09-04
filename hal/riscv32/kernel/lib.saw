@@ -39,7 +39,7 @@ public import rv32core.{
     MAX_ROOT_SEGMENTS, payload_end, payload_start, phys_to_virt, prot_clear,
     prot_commit,
     prot_device, PROT_DOMAIN_SLOTS, PROT_GRAIN, prot_region,
-    PROT_REPLAY_AT_SWITCH, prot_reset, prot_switch, prot_update,
+    prot_reset, prot_switch, prot_update,
     region_table_end, region_table_start,
     resume_frame, syscall_arg0, syscall_arg1, syscall_arg2, syscall_handle,
     syscall_op, syscall_return, trap_pc, virt_to_phys,
@@ -172,6 +172,44 @@ static CONSOLE_IRQ: UInt = 10
 // =============================================================================
 // Identity (design 162)
 // =============================================================================
+
+
+// **THE TWO TIER FACTS ARE FUNCTIONS, NOT `static`s, AND THAT IS FORCED**
+// (sawos design 35, M5 unit 4 — SL-25).
+//
+// A module-level `static` does not carry module identity the way a free function
+// does: two modules in one compilation unit cannot both declare `PROT_ISOLATED`,
+// however few things import which, while both may declare `prot_isolated()` and
+// each caller gets its own. A BUILD PROFILE is exactly a module that overrides
+// part of another's seam — `hal/riscv32-flat` re-exports this board's whole
+// device half and answers differently about protection — so a seam value a
+// profile may need to override CANNOT be a `static`. The other HAL constants
+// (`PROT_GRAIN`, `GRANT_ROW_BUDGET`, `FRAME_BYTES`, the memory map) stay
+// `static`s because nothing overrides them: they are declared once and
+// re-exported, which is the shape that works.
+//
+// Both fold anyway — a leaf returning a literal inlines — so `load_domain`'s
+// replay loop still compiles away where it is dead.
+/// **DOES THIS PROFILE REBUILD ITS PROTECTION IMAGE AT EVERY SWITCH?** Yes —
+/// the PMP replay in `load_domain` IS the switch here, which is why
+/// `prot_switch` is empty.
+public func prot_replay_at_switch() -> Bool { true }
+
+/// **CAN THIS PLATFORM DENY?** Yes. This is the TIER WORD (sawos design 35;
+/// designs 19 and 25 D-4) — the only protection fact that reaches USERSPACE.
+/// `kernel/core` maps it to `sosabi.ProtectionTier` and `SystemOp.TierGet` hands
+/// the word out, where a program that relies on isolation reads it once and
+/// refuses to run if it reads `Flat`.
+///
+/// It answers a `Bool` and not that enum because the dependency order forbids
+/// the enum here — a board's `lib.saw` imports `sosrt`, never `sosabi` — and
+/// because two words is exactly what a `Bool` holds.
+///
+/// **IT IS A CLAIM ABOUT THE HARDWARE, NOT ABOUT THE `prot_*` BODIES.** What
+/// `true` promises is that an access a process was not granted FAULTS, which on
+/// this board is RISC-V's own default-deny rule: the kernel, the UART and the
+/// finisher are locked away from root by SAYING NOTHING about them.
+public func prot_isolated() -> Bool { true }
 
 /// What this kernel says it is booting on, for the banner.
 public func arch_name() -> String {

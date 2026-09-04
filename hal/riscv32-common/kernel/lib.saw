@@ -451,6 +451,52 @@ public func prot_commit() unsafe {
     sos_pmpcfg_write(PMPCFG0, PMPCFG1, PMPCFG2, PMPCFG3)
 }
 
+/// **PERMIT EVERYTHING** — one TOR entry over the whole address space, RWX.
+/// `prot_reset`'s opposite, and the other extreme of the same register file.
+///
+/// The FLAT build profile's one hardware act (sawos design 35,
+/// `hal/riscv32-flat/`), and it lives here rather than there because PMP is an
+/// architectural fact: this body would be identical on any RV32 M/U part with
+/// PMP, which is this directory's split rule verbatim. It is also the only way
+/// the flat profile can reach these registers at all — `sos_pmpaddr_write` and
+/// `sos_pmpcfg_write` are `extern "C"`, an extern carries no visibility and
+/// cannot be re-exported (SL-6), and two modules declaring one C symbol collide
+/// across the compilation unit. One owner, one declaration, one routine.
+///
+/// **WHY OPENING IS AN ACT AND NOT AN OMISSION.** RISC-V gives default-DENY for
+/// free: if no entry matches a U-mode access and at least one entry is
+/// implemented, the access fails. At reset every `pmpcfg` byte is zero, so a
+/// profile that merely emptied its `prot_*` bodies would deny root its own first
+/// instruction. "PMP left open" has to be written down.
+///
+/// Entry 0 is the range's lower bound with its config byte left at zero (A=OFF,
+/// matching nothing on its own); entry 1 is the upper bound with
+/// `A=TOR | R | W | X`. Bounds are stored `>> 2`, so `0xFFFF_FFFF` is the top of
+/// the 32-bit space and the pair covers every address U-mode can name. The other
+/// fourteen entries stay at zero and need no clearing — an A=OFF byte matches
+/// nothing.
+///
+/// M-mode is unaffected, as it already was: SOS never sets an entry's L bit, so
+/// a matching entry constrains U-mode only.
+///
+/// It writes the CSRs DIRECTLY rather than through the `PMPCFG*` shadow words,
+/// because the shadows exist to accumulate a replay this profile does not do —
+/// staging into them would leave the isolated profile's bookkeeping half-built
+/// in a build that never reads it.
+public func prot_open_all() unsafe {
+    sos_pmpaddr_write(0, 0)
+    sos_pmpaddr_write(1, PMP_OPEN_TOP)
+    sos_pmpcfg_write((PMP_PERM_MASK | PMP_A_TOR) << BITS_PER_PMP_CFG, 0, 0, 0)
+}
+
+/// The top of the address space in PMP's shifted-by-two encoding — the upper
+/// bound of `prot_open_all`'s one TOR range.
+///
+/// Written as a literal rather than derived from a shift for SL-19's reason: a
+/// const shift folds in the SIGNED platform domain, so anything reaching bit 31
+/// refuses to fit a `UInt` on a 32-bit target.
+static PMP_OPEN_TOP: UInt = 0xFFFF_FFFF
+
 // =============================================================================
 // The persistent-domain seam (sawos design 27, M5 unit 1) — NO-OPS HERE
 // =============================================================================
@@ -466,17 +512,38 @@ public func prot_commit() unsafe {
 //
 // So this is not a stub awaiting an implementation. Design 25 D-2 ruled that
 // replay-at-switch REMAINS the MPU tier's shape rather than becoming a
-// permitted MMU one, and `PROT_REPLAY_AT_SWITCH` below is that ruling spelled
-// where the kernel can read it. The empty bodies are what "the record is still
+// permitted MMU one, and each board's `prot_replay_at_switch()` is that ruling
+// spelled where the kernel can read it. The empty bodies are what "the record is still
 // authoritative and the hardware still learns at switch time" looks like from
 // the other side of the seam.
 //
 // The kernel calls all three on both profiles; each profile implements the half
 // it means. Nothing in `kernel/core` asks which tier it is on.
 
-/// **DOES THIS PROFILE REBUILD ITS PROTECTION IMAGE AT EVERY SWITCH?** Yes —
-/// that IS the switch here. See the block comment above.
-public static PROT_REPLAY_AT_SWITCH: Bool = true
+// **THE TWO TIER FACTS ARE THE BOARD'S, NOT THE ARCH'S** (sawos design 35).
+//
+// `PROT_REPLAY_AT_SWITCH` was a `public static` here until M5 unit 4, and the
+// tier word was nearly written beside it. Both left, and both changed shape on
+// the way out: each board now answers `prot_replay_at_switch()` and
+// `prot_isolated()`.
+//
+// WHY THEY LEFT is this directory's own split rule — ASK WHAT WOULD CHANGE IF
+// THE BOARD CHANGED — with the flat build profile as the answer arriving in
+// person: `hal/riscv32-flat` is riscv32 with PMP opened, and it disagrees with
+// `hal/riscv32` about both while sharing every line of this file. A value two
+// profiles of one architecture disagree about was never an architectural fact.
+//
+// WHY THEY ARE FUNCTIONS is a language constraint, worth knowing before anyone
+// converts them back: a module-level `static` does NOT carry module identity the
+// way a free function does (SL-25), so two modules in one compilation unit
+// cannot both declare `PROT_ISOLATED` — they collide at the kernel entry however
+// few things import which — while both may declare `prot_isolated()` and each
+// caller gets its own. `prot_reset` and its six siblings ARE declared in both
+// `rv32core` and the flat profile and coexist fine, which is exactly the
+// asymmetry, and exactly what makes it easy to trip over.
+//
+// `prot_open_all` below is the flat profile's one hardware act, and it lives
+// HERE because PMP is architectural — the split rule applied the other way.
 
 /// How many process domains this profile can serve.
 ///

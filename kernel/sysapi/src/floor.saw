@@ -531,6 +531,40 @@ public func sos_system_clock_get(handle: UInt, type: UInt,
     sos_syscall3(handle, SystemOp.ClockGet as UInt, type, 0, 0, value_out)
 }
 
+// **`SystemOp.TierGet` HAS NO STUB HERE, AND THE ABSENCE IS MEASURED RATHER
+// THAN OVERSIGHT** (sawos design 35, M5 unit 4).
+//
+// It would be six lines and it would read exactly like `sos_system_clock_get`
+// above. What stopped it is a cost THIS TREE HAS ALREADY MEASURED TWICE: an
+// `@export`ed stub is a LINKER GC ROOT (it lands in `llvm.used`), so it links
+// into EVERY process image whether or not anything calls it. Design 32's
+// As-built reported the same thing as an unanticipated motion — "119 riscv32
+// images grew a uniform +40 bytes … because the new floor `@export` links into
+// every image as all ~40 of its neighbours do" — and design 34 confirmed the
+// converse, that a unit adding no `@export` sees no growth at all.
+//
+// Unit 4 is the first to have a REASON not to pay it: design 35's fence
+// requires the two isolated profiles' rows to stay byte-identical, and an
+// image-size row is a row. Measured both ways here: with the stub, all 126
+// riscv32 sosimgs grew by 24 or 40 bytes and every image-size row in the
+// riscv32 section moved; without it, the section hashes to the baseline
+// exactly. (arm64 showed 0 either way — its segments are page-granular, so
+// small growth hides in padding, which is why this only ever shows on the
+// profile whose `PROT_GRAIN` is 4.)
+//
+// The number worth carrying forward is not this op's 24 bytes but the total:
+// this file exports about sixty stubs on those terms, and a process that calls
+// none of them still carries all of them. On the MCU-class targets designs 19
+// and 20 aim at, that is the kind of constant that decides a port — design 20's
+// C3 unit parked on an image-size wall. Making the C altitude opt-in per
+// package is a real unit and it is not this one.
+//
+// The typed `System.tier()` is the whole surface meanwhile, which the vDSO
+// discipline is comfortable with — the Saw method IS the API and the C floor is
+// a parallel altitude. Adding the stub is a one-line change for whichever unit
+// next holds an authorization to move the image-size rows.
+
+
 /// Read the clock into `buf` — a COPY-OUT record, because a nanosecond count is
 /// 64 bits and one profile's registers are not. Requires `ClockRight.Read`.
 ///

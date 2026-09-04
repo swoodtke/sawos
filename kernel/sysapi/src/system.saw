@@ -29,7 +29,8 @@ import sosabi.{SosStatus, SystemOp, ProcessOp, MemoryOp, IoMemoryOp, MINT_OP,
                IoMemoryHandle, MappingHandle,
                PipeInletHandle, PipeOutletHandle, PipeReplyHandle,
                PipeRequestHandle,
-               NO_HANDLE, BootTagForm, EventMode, ClockType, BootHandleKind,
+               NO_HANDLE, BootTagForm, EventMode, ClockType, ProtectionTier,
+               BootHandleKind,
                BOOT_HANDLE_RECORD_WORDS, BOOT_HANDLE_TAG_WORD,
                BOOT_HANDLE_KIND_WORD, BOOT_HANDLE_HANDLE_WORD,
                boot_handle_record_bytes,
@@ -354,6 +355,49 @@ extension System {
         let raw = try call_value(self.handle, SystemOp.ClockGet as UInt,
                                  type as UInt, 0, 0)
         return Clock(handle: ClockHandle(raw))
+    }
+
+    /// **WHAT THIS PLATFORM CAN DENY** — `Isolated` or `Flat`, and nothing else.
+    /// Requires `SystemRight.TierGet` (sawos design 19's platform attribute,
+    /// ruled as design 25 D-4, built by design 35).
+    ///
+    /// ASK IT ONCE, AT STARTUP, AND ONLY IF YOU RELY ON ISOLATION. The tier is
+    /// fixed for the life of the machine, so a program that re-reads it per
+    /// operation has misunderstood what it is for: this is not a per-call
+    /// permission check, it is a platform fact you decide whether to run on.
+    ///
+    /// ```saw
+    /// let tier = try system.tier() catch { return }
+    /// match tier {
+    ///     case Isolated -> { },
+    ///     case Flat -> {
+    ///         let _ = system.debug_print("vault: refusing to run on a flat platform\n")
+    ///         let _ = system.shutdown(EXIT_FAILED)
+    ///     },
+    /// }
+    /// ```
+    ///
+    /// **WHAT `Flat` DOES NOT MEAN.** It does not mean `map` lies: on flat
+    /// hardware `map`'s contract — "make this region accessible with at least
+    /// these rights" — is trivially true, so the call succeeds HONESTLY and the
+    /// mapping is real. It does not mean handles stop being checked, rights stop
+    /// being enforced, quotas stop counting or lifetimes stop ending: the kernel
+    /// boundary survives at every tier. What it means is exactly two things —
+    /// `unmap` revokes nothing the hardware will enforce, and a peer process can
+    /// reach your memory.
+    ///
+    /// **AN UNKNOWN WORD PANICS**, on `decode_boot_handle`'s reasoning exactly:
+    /// the KERNEL wrote it, out of the same `ProtectionTier` declaration this
+    /// function reads, so a value that does not decode is a skew between the
+    /// kernel and the `sos` module it exports — a bug in the pair, not a runtime
+    /// condition a caller could act on.
+    public func tier(&self) -> Result<ProtectionTier, SosStatus> {
+        let raw = try call_value(self.handle, SystemOp.TierGet as UInt, 0, 0, 0)
+        guard let word = ProtectionTier.from(raw: raw) else {
+            panic("sos: kernel wrote protection tier {}, which this build cannot name",
+                  raw)
+        }
+        return word
     }
 }
 

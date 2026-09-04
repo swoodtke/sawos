@@ -1732,7 +1732,40 @@ func install_device(dev_level3: UInt, base: UInt, len: UInt) unsafe {
 /// one it is. Design 19's doctrine is that a tier difference is ADVERTISED,
 /// never faked; this is that sentence as a compile-time constant, so the replay
 /// loop folds away here and stays whole on Profile A.
-public static PROT_REPLAY_AT_SWITCH: Bool = false
+// **THE TWO TIER FACTS ARE FUNCTIONS, NOT `static`s, AND THAT IS FORCED**
+// (sawos design 35, M5 unit 4 — SL-25).
+//
+// A module-level `static` does not carry module identity the way a free function
+// does: two modules in one compilation unit cannot both declare `PROT_ISOLATED`,
+// however few things import which, while both may declare `prot_isolated()` and
+// each caller gets its own. A BUILD PROFILE is exactly a module that overrides
+// part of another's seam — `hal/riscv32-flat` re-exports this board's whole
+// device half and answers differently about protection — so a seam value a
+// profile may need to override CANNOT be a `static`. The other HAL constants
+// (`PROT_GRAIN`, `GRANT_ROW_BUDGET`, `FRAME_BYTES`, the memory map) stay
+// `static`s because nothing overrides them: they are declared once and
+// re-exported, which is the shape that works.
+//
+// Both fold anyway — a leaf returning a literal inlines — so `load_domain`'s
+// replay loop still compiles away where it is dead.
+
+public func prot_replay_at_switch() -> Bool { false }
+
+/// **CAN THIS PLATFORM DENY?** Yes — an EL0 access to a page whose descriptor
+/// does not permit it takes a data abort (sawos design 35, M5 unit 4; the tier
+/// word of designs 19 and 25 D-4).
+///
+/// The second tier fact, and the only one that reaches USERSPACE: `kernel/core`
+/// maps it to `sosabi.ProtectionTier` and `SystemOp.TierGet` hands the word out.
+/// The paragraph above says why a tier difference is a compile-time constant
+/// here rather than a runtime query; this is the same sentence about the other
+/// half of the tier, and the half a PROGRAM can act on.
+///
+/// Since design 29 the kernel lives under TTBR1 and the whole low half belongs
+/// to the user, so what a process may reach is exactly what its own tables map —
+/// isolation by absence rather than by permission bits in a shared window, which
+/// is a stronger form of the same `true`.
+public func prot_isolated() -> Bool { true }
 
 /// **THE SWITCH.** Make `p`'s tables the live ones.
 ///

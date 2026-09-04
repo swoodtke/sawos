@@ -1,0 +1,241 @@
+//! **THE FLAT BUILD PROFILE of the riscv32 `virt` board** — SOS's tier-3
+//! demonstration (sawos design 35, M5 unit 4; design 19's "the flat tier is a
+//! PROFILE, not an architecture"; design 25's tier table, last row).
+//!
+//! Same architecture, same board, same silicon, same toolchain. What differs is
+//! ONE thing: this profile programs the hardware to deny nothing, and it SAYS SO
+//! through the tier word. Everything else — the trap frame, the UART, the CLINT
+//! timer, the PLIC, the memory map, the linker scripts, the user-side ABI — is
+//! reached from the two modules that already own it, so there is no second copy
+//! of anything to keep in step.
+//!
+//! ## The three modules, and why this file is short
+//!
+//! Design 23 split riscv32 into an ARCH half (`rv32core`, shared by every
+//! riscv32 board) and a BOARD half (each board's own `lib.saw`, published as
+//! `hal`). This profile is a third level of the same idea — a PROFILE half —
+//! and it is built by naming the other two rather than by copying either:
+//!
+//! ```
+//! rv32core   hal/riscv32-common/kernel   the arch: frame, PMP, cause decode
+//! rv32virt   hal/riscv32/kernel          the board: UART, CLINT, PLIC, map
+//! hal        hal/riscv32-flat/kernel     THIS FILE: the protection profile
+//! ```
+//!
+//! **`rv32virt` IS THE VIRT BOARD'S OWN `lib.saw`, UNDER A SECOND MODULE NAME.**
+//! Not a copy and not a fork — the identical directory, mapped by the runner as
+//! `rv32virt=hal/riscv32/kernel` for this profile where it maps it as
+//! `hal=hal/riscv32/kernel` for the isolated one. A Saw module's name comes from
+//! its `--module-path` mapping, so one directory can be the board's `hal` in one
+//! build and a component of somebody else's `hal` in another. That is the whole
+//! trick, and it is what keeps design 23's consolidation intact: `riscv32-common`
+//! is still the one arch home, `hal/riscv32/` is still the one virt board, and
+//! adding this profile edited neither.
+//!
+//! The arch names are taken from `rv32core` DIRECTLY rather than through
+//! `rv32virt`, though `rv32virt` re-exports them too. Two reasons, and the
+//! second is the load-bearing one: a two-level re-export is the shape design 23
+//! probed and proved, and — more to the point — the names this profile must NOT
+//! inherit are exactly the protection ones, so taking the arch half by name
+//! makes the omission visible in one list instead of hidden in a chain.
+//!
+//! ## What "flat" means here, precisely
+//!
+//! `prot_isolated()` answers `false` and `SystemOp.TierGet` answers `Flat`. Per design
+//! 19, carried whole:
+//!
+//! - `map` SUCCEEDS HONESTLY. Its contract is "make this region accessible with
+//!   at least these rights"; on this profile every region already is, so the
+//!   contract holds and the call is not a lie. The kernel still records the row,
+//!   still charges the quota, still hands back a Mapping that still owns it.
+//! - `unmap`'s REVOCATION HALF IS WHAT IS DISCLAIMED. The row leaves the record
+//!   and the Mapping dies; the hardware goes on permitting the access.
+//! - PEER ISOLATION IS DISCLAIMED. A process can reach another's memory.
+//! - THE KERNEL BOUNDARY IS NOT DISCLAIMED. Handles are checked, rights are
+//!   enforced, quotas count and lifetimes end, exactly as on the isolated
+//!   profile. That is why the object-model suite runs here unchanged and passes.
+//!
+//! ## PMP is OPENED, not left alone — the one thing worth knowing
+//!
+//! "Leave PMP open" cannot mean "write nothing". RISC-V gives default-DENY for
+//! free: if no PMP entry matches a U-mode access AND at least one entry is
+//! implemented, the access fails. At reset every `pmpcfg` byte is zero (A=OFF),
+//! so a profile that simply emptied the `prot_*` bodies would deny root its own
+//! first instruction. Flat therefore takes ONE affirmative action — a single TOR
+//! entry spanning the whole address space, RWX — and that is the only hardware
+//! this file touches.
+//!
+//! It is published from `prot_commit` AND `prot_switch`, both of which are
+//! stateless and idempotent, because those are the two seam calls that survive
+//! `prot_replay_at_switch()` being false on the paths that matter: `load_domain` calls
+//! `prot_switch` unconditionally, and the pre-M2 harness kernels under `tests/`
+//! program the seam directly and end at `prot_commit`. Covering both means no
+//! new HAL hook and no `kernel/core` edit — and three CSR writes on a path that
+//! runs a handful of times per process is not a cost worth a boot flag.
+//!
+//! The act itself is `rv32core.prot_open_all`, not a body here: PMP is
+//! ARCHITECTURAL, so the register writes live in the arch home beside
+//! `prot_reset`, whose exact opposite they are. This file decides WHEN the
+//! hardware is opened; `rv32core` knows HOW.
+
+// THE ARCH HALF, RE-EXPORTED — minus the protection surface, which is this
+// profile's whole reason to exist. What is deliberately ABSENT from this list,
+// and defined below instead: `prot_reset`, `prot_region`, `prot_device`,
+// `prot_commit`, `prot_switch`, `prot_update`, `prot_clear`,
+// `prot_replay_at_switch` and `prot_isolated` — the last two of which are the
+// BOARD's rather than the arch's, so they are absent from this list because
+// `rv32core` no longer has them to give.
+//
+// `PROT_GRAIN`, `GRANT_ROW_BUDGET`, `PROT_DOMAIN_SLOTS` and `device_window_ok`
+// DO come across unchanged, and that is deliberate rather than incidental: a
+// flat platform has no hardware wall, but the kernel's static asserts price a
+// grant record against these numbers and a profile that moved them would be
+// testing a different kernel. `device_window_ok` in particular still REFUSES a
+// malformed window here — the flat tier disclaims denial by the HARDWARE, not
+// the kernel's own argument checking, and `iomemory_carve` proves it.
+public import rv32core.{
+    arch_tag, cause_tag, device_window_ok, FRAME_BYTES, frame_init,
+    GRANT_ROW_BUDGET, image_link_base, IRQ_NONE, IRQ_TIMER, is_interrupt,
+    is_syscall, map_place,
+    MAX_ROOT_SEGMENTS, payload_end, payload_start, phys_to_virt,
+    PROT_DOMAIN_SLOTS, PROT_GRAIN,
+    region_table_end, region_table_start,
+    resume_frame, syscall_arg0, syscall_arg1, syscall_arg2, syscall_handle,
+    syscall_op, syscall_return, trap_pc, virt_to_phys,
+}
+
+// THE BOARD HALF, RE-EXPORTED FROM THE VIRT BOARD ITSELF. Every one of these is
+// a fact about the QEMU `virt` machine — where its UART is, how its CLINT
+// counts, which PLIC context it wires, where its RAM begins and where root is
+// linked — and none of them changes because the protection profile did. The
+// board is the same board.
+//
+// `arch_name` is the ONE public name of the board's that is NOT taken: this
+// profile announces itself, below, because a boot banner that could not tell
+// the two profiles apart would make a transcript diff read the same for two
+// different machines.
+public import rv32virt.{
+    console_byte, DEVICE_GRANT_BASE, DEVICE_GRANT_LEN, exit_fail, exit_pass,
+    intc_init, irq_claim, irq_complete, irq_line_valid, irq_mask, irq_poll,
+    irq_raise_selftest_line, irq_unmask, map_source_ok, map_target_ok,
+    ROOT_LOAD_BASE, ROOT_REGION_TOP, ROOT_STACK_LEN, timer_now_ns,
+    timer_pending, timer_set_deadline_ns, UNMAPPED_PROBE, wait_for_irq,
+}
+
+// THE ONE ROUTINE THIS PROFILE CALLS THAT IT DOES NOT RE-EXPORT. `prot_open_all`
+// is `rv32core`'s — PMP is architectural, and that body would be identical on
+// any RV32 M/U part with PMP — and it is reached through a PLAIN import because
+// `kernel/core` has no business with it: the seam `kcore` sees is the seven
+// `prot_*` functions below, and opening the hardware is how THIS profile
+// implements two of them.
+//
+// It is `rv32core`'s for a second reason worth knowing before anyone moves it
+// here: the CSR writes are `extern "C"` leaves, an extern carries no visibility
+// and cannot be re-exported (SL-6), and two modules that both DECLARE one C
+// symbol collide across the whole compilation unit. One owner, one declaration.
+import rv32core.{prot_open_all}
+
+// =============================================================================
+// Identity
+// =============================================================================
+
+/// What the boot banner says. It NAMES THE PROFILE, which the isolated board's
+/// answer ("riscv32 (QEMU virt)") deliberately does not need to.
+///
+/// The harness matches its banner expectation as a PREFIX, so the arch word at
+/// the front is what the assertion reads and the parenthesis is for the human
+/// reading a transcript. A flat kernel and an isolated one boot on the same
+/// machine and differ in exactly one advertised property; a reader who cannot
+/// see which one produced a log cannot check anything about it.
+public func arch_name() -> String {
+    "riscv32 (QEMU virt, flat profile)"
+}
+
+// =============================================================================
+// The protection seam — the whole of this profile
+// =============================================================================
+
+/// **DOES THIS PROFILE REBUILD ITS PROTECTION IMAGE AT EVERY SWITCH?** No —
+/// there is nothing to rebuild. (A function and not a `static`: see SL-25 and
+/// the board's note — a `static` is a name the whole program shares, so a
+/// profile could not override one.)
+///
+/// `false` retires `load_domain`'s replay loop entirely: the kernel keeps its
+/// grant record (teardown and compaction still walk it, and the quota ledger
+/// still prices it), and simply never programs hardware from it. The constant
+/// folds, so the loop is not emitted here at all.
+public func prot_replay_at_switch() -> Bool { false }
+
+/// **CAN THIS PLATFORM DENY?** No. This is the tier word (sawos design 35), and
+/// it is the one sentence this whole directory exists to be able to say
+/// honestly.
+///
+/// `kernel/core` maps it to `sosabi.ProtectionTier.Flat` and `SystemOp.TierGet`
+/// hands it to userspace, where a program that relies on isolation reads it once
+/// and refuses to run. Design 19's rule, restated at the declaration: the
+/// difference between the tiers is ADVERTISED, never faked. Every `prot_*` body
+/// below is empty or permissive; this word is what makes that honest rather than
+/// broken.
+public func prot_isolated() -> Bool { false }
+
+/// Nothing to reset — this profile installs one permission and never varies it.
+/// The isolated profile clears sixteen entries here because it is about to
+/// rebuild them from the record; there is no record-driven image to rebuild.
+public func prot_reset() unsafe {
+}
+
+/// A no-op. The grant row is in the kernel's record, which stays authoritative
+/// at every tier; this profile just never turns a row into a hardware region.
+public func prot_region(idx: UInt, base: UInt, top: UInt, perms: UInt8) unsafe {
+}
+
+/// A no-op, for `prot_region`'s reason. A device window is as reachable as
+/// everything else here.
+public func prot_device(idx: UInt, base: UInt, len: UInt) unsafe {
+}
+
+/// **PUBLISH THE PERMISSIVE CONFIGURATION.** One of the two places
+/// `rv32core.prot_open_all` is reached from.
+///
+/// This is the call the pre-M2 harness kernels under `tests/` end their
+/// protection setup with — they program `prot_reset`/`prot_region`/`prot_commit`
+/// directly rather than through `load_domain`, so `prot_switch` alone would
+/// leave them with a dead PMP and a U-mode payload that faults on its first
+/// instruction. Publishing here costs three CSR writes and keeps every one of
+/// those cases running on this profile.
+public func prot_commit() unsafe {
+    prot_open_all()
+}
+
+/// **PUBLISH THE PERMISSIVE CONFIGURATION.** The other place, and the one the
+/// real kernel takes.
+///
+/// `load_domain` calls this unconditionally — it is outside the
+/// `prot_replay_at_switch()` guard — so it is the one seam call guaranteed to run
+/// before root ever enters U-mode, and it runs again at every process switch
+/// after that. Doing the work every time rather than once behind a flag keeps
+/// this profile STATELESS: there is no "have we opened it yet" word to get wrong
+/// on a path nobody tested.
+public func prot_switch(p: UInt) unsafe {
+    prot_open_all()
+}
+
+/// A no-op — with the isolated profile's one assertion KEPT.
+///
+/// The flat tier does not translate either, so design 33's invariant holds here
+/// exactly as it does on PMP: a user address IS its physical address, and a row
+/// whose `pa` had drifted from its `base` would mean the placement seams
+/// disagreed. Keeping the check costs one comparison per grant and catches a
+/// class of bug that a profile programming no hardware would otherwise be unable
+/// to notice at all — which is the argument for keeping it here rather than
+/// against it.
+public func prot_update(p: UInt, base: UInt, top: UInt, pa: UInt, perms: UInt8,
+                        device: Bool) unsafe {
+    assert(pa == base,
+           "a user address on the flat tier IS its physical address")
+}
+
+/// Nothing to retire. `clear_domain` has already emptied the kernel's record,
+/// which is the only place this profile's protection state ever lived.
+public func prot_clear(p: UInt) unsafe {
+}

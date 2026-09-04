@@ -224,6 +224,91 @@ entry below or the brief that carries it, never restating either.
   `Free` — dereferences the same raw physical base BEFORE the extent is in the
   table, so it never passes through the funnel. Both convert now; see 029's
   finding 6 for the fault that found it and why riscv32 could not.
+  **UNIT 4 BUILT (`designs/035`, Sep 4):** the tier word + the flat profile —
+  and the tier track's last rung is complete (1 → 1.5 → 2 → 4).
+  `SystemOp.TierGet` (op 6) on `SystemRight.TierGet` (bit 14, in the root set)
+  answers a `ProtectionTier` — `Isolated`/`Flat`, TWO WORDS per D-4 — and
+  `System.tier()` decodes it exactly, panicking on a skew in
+  `decode_boot_handle`'s idiom. It is **the first op on any object that answers
+  a plain fact about the machine**: no state read, no resource spent, no
+  argument, cannot fail. **THE BOOT-INFO HALF OF D-4 HAS NO CARRIER AND NONE WAS
+  INVENTED** — `sosabi.boot` holds only the boot-handle record ("exactly the
+  givable kinds", its tag word contractually "handed back unread"), design 232
+  ruled a bootinfo SECTION out by name (the vDSO discipline's whole point), and
+  `kernel/sysapi` depends on no HAL so a build constant cannot see the tier
+  either; the scout's evidence is in the As-built §2.
+  `hal/riscv32-flat/` is **250 lines of facade, not a fork**: the runner maps
+  the virt board's own directory a SECOND time as `rv32virt=`, so the profile
+  re-exports the arch half from `rv32core` and the board half from the board and
+  shares `boot.S`, `virt.ld`, all three user scripts, `sink.c`, `trap.S`,
+  `syscall.c`, the `tests/riscv32` payloads and every `.sosimg`. **Design 23's
+  consolidation is untouched** — neither `riscv32-common` nor `hal/riscv32/`
+  gained a copy of anything. Four runner keys carry it (`hal_board`,
+  `tests_arch`, `build_tag`, `banner_arch`), each defaulting to what the two
+  existing entries already had. A build FLAG was not an option: this toolchain
+  has no conditional compilation at all, so a module swap is the mechanism the
+  language gives.
+  **ONE SL ENTRY, AND IT RESHAPED THE SEAM (SL-25): a module-level `static` does
+  not carry module identity the way a free function does**, so two modules in
+  one compilation unit cannot both declare one — reported at the KERNEL ENTRY, a
+  file naming neither module, while `prot_reset` and its six siblings are
+  declared in both and coexist fine. The consequence outlives this unit: **a HAL
+  seam value a build profile may override cannot be a `static`**, and
+  `PROT_REPLAY_AT_SWITCH` had been one since design 27, so the flat profile
+  could not have existed without finding it. Both tier facts became functions
+  (`prot_replay_at_switch()`, `prot_isolated()`) and moved from `rv32core` to the
+  BOARDS while they were being changed — `riscv32-common`'s own split rule
+  applied correctly, since two profiles of one architecture disagree about both.
+  Both still fold. **The sharper version is filed and UNMET: a profile that had
+  to override a SIZE has no spelling at all**, because a `static_assert` operand
+  needs a compile-time constant and a function is not one.
+  PMP is OPENED, not left alone (RISC-V default-denies, so an empty seam would
+  deny root its first instruction): one TOR entry over `[0, 4 GiB)` RWX, in
+  `rv32core.prot_open_all()` because PMP is architectural and because an
+  `extern "C"` leaf has one owner (SL-6) — the flat profile declares no externs.
+  Published from BOTH `prot_commit` and `prot_switch`, the two seam calls that
+  survive `prot_replay_at_switch()` being false (the pre-M2 harness kernels
+  program the seam directly and end at the former; `load_domain` calls the
+  latter unconditionally), so no new HAL hook and no `kernel/core` edit.
+  **FOUR CASES EXCLUDED BY NAME WITH REASONS, printed, no silent skips**:
+  `process_isolation`, `map_unmap`, `umode_access_fault`,
+  `root_server_oversteps` — derived by grepping every `expect_out` for a
+  HARDWARE fault string rather than by reading names. **THE BRIEF'S EXAMPLE LIST
+  WAS WRONG IN TWO PLACES AND THE CORRECTION IS DOCTRINAL**: `map_wx_refused`
+  and `map_exec_gated` are KERNEL refusals (the W^X word check and the
+  `MapExecute` gate, both in `dispatch.saw`), the tier word disclaims nothing
+  about the kernel boundary, so both RUN ON FLAT AND PASS — a better proof of
+  design 19's "the AUTHORITY enforcement survives intact" than any case written
+  for it. `iomemory_carve` likewise still refuses, through a `device_window_ok`
+  the profile re-exports unchanged.
+  Gate: baseline RE-RUN at the base commit and reproducing the brief's stated
+  `c823c1b5…` exactly (514 lines, 246/246), then **366/366 across three
+  profiles (123 + 123 + 120), 764 lines, `0588f8b7…`** — and **THE FENCE HELD**:
+  the header block and BOTH isolated sections hash identically before and after
+  (`0a2eb417…` riscv32, `f4324849…` arm64), so the only motion is the flat
+  profile's own 250-line section and the totals line. `sos-smoke-esp32c3` 3/3
+  besides (this unit edits the C3 HAL).
+  **FOUR THINGS THE LEAD SHOULD SEE**: (a) SL-25's unmet sharper version, above,
+  is a real constraint on any future tier-2 board wanting a per-PROFILE
+  `GRANT_ROW_BUDGET`; (b) **the `tier_word` case is FLAT-ONLY IN THE GATE purely
+  because of the byte-identical fence** — adding it to the other two lists moves
+  every `[i/N]` row in both — so the ISOLATED answer is PROBE-witnessed instead
+  (all three profiles run and pass it; the widening was reverted), and promoting
+  it is one line for unit 8, which will hold the authorization anyway;
+  (c) **the `@export`ed C floor stub was DELIBERATELY NOT SHIPPED**, because it
+  broke the fence — design 32's +24/+40-bytes-per-riscv32-image finding
+  recurring, measured both ways here, mechanism confirmed in the emitted IR
+  (every `@export` lands in `llvm.used`, a linker GC root) — so `System.tier()`
+  is the whole surface and the stub is one line to add when rows may move; the
+  number worth carrying is the TOTAL, ~60 stubs every process links whether it
+  calls them or not, which is the kind of constant that decides an MCU port
+  (**making the C altitude opt-in per package is filed, not built**);
+  (d) two ABI hygiene fixes taken in passing, both compile-time only — the
+  SystemOp bound assert named case 4 while the top was 5 (design 32 added a case
+  without re-pointing it; it names `TierGet` now), and `SystemRight.SlabDonate`
+  had no `>= (1 << 8)` assert though the rule beside it says one per case.
+  `spec.md` untouched per the brief — §5b/§2's tier table is unit 8's, which now
+  has a built word and a built profile to describe.
   **UNIT 1.5 BUILT (`designs/029`, Sep 3):** the higher-half kernel +
   the linmap seam. The arm64 kernel LINKS at
   `physical + 0xFFFF_FF80_0000_0000` and loads at its physical
@@ -720,3 +805,24 @@ One entry per issue, resolution-sufficient: the symptom verbatim, the probe/site
   SlabKind.from(raw: 0)                      // same, on a UInt-backed enum
   ```
   Low severity and the workaround is what the house style wants anyway (design 153: name the constant, do not write a magic number), so both in-tree sites became named `static`s with a comment pointing here. It is worth filing because the ASYMMETRY is the surprising part — `arg: 0` at a `UInt32` parameter compiles and at a `UInt` one does not, and nothing at the call site says which width a parameter is. Resolution: extend design 257 §1's slot list to call arguments at the platform pair, which is where every other width already adopts.
+- SL-25 — A MODULE-LEVEL `static` DOES NOT CARRY MODULE IDENTITY, THOUGH A FREE FUNCTION DOES, SO TWO MODULES IN ONE COMPILATION UNIT CANNOT BOTH DECLARE ONE: ``ambiguous static `X`: defined in both `core` and `top` `` with ``hint: rename one definition, or import `X` from a single module``, anchored at the ENTRY FILE's first line (design 35, `hal/riscv32-flat/kernel/lib.saw`, sawc 0.5.0). Design 249 ruled that a free function is identified by (defining module, name) and that two modules may declare the same one; design 144 ruled the same for types. A `static` was never swept with them, and it is the one module-level declaration kind that still reserves its name PROGRAM-WIDE. Minimal repro, three files, hosted — note that `h` is declared in both modules and draws no complaint, which is the whole asymmetry:
+  ```saw
+  // core/lib.saw
+  public static X: Bool = true
+  public func h() -> Int { 1 }
+  public func only_core() -> Int { 7 }
+
+  // top/lib.saw — a PLAIN import, nothing re-exported
+  import core.{only_core}
+  public static X: Bool = false      // <- the error is reported for this
+  public func h() -> Int { 2 }       // <- ...and never for this
+  public func board() -> Int { only_core() }
+
+  // entry.saw — names `core` nowhere
+  import top
+  func main() -> Int { if top.X { top.h() + top.board() } else { 0 } }
+  ```
+  **THE DIAGNOSTIC IS WHAT MAKES IT EXPENSIVE**, twice over. It is anchored at `entry.saw:1:1` — a file that imports one module and mentions neither the name nor the other module — so it points at the importer rather than at either declaration, and the hint's second half ("import `X` from a single module") describes a fix the entry file cannot make, since it is not importing `X` from anywhere. And the ambiguity is reported whether or not anything ever READS the name, so a module can be broken by a static it does not use, added to a module it does not import.
+  **WHERE IT BIT, and it is the interesting half:** a BUILD PROFILE is exactly a module that re-implements part of another module's seam. SOS's flat profile (design 35) re-exports the riscv32 virt board's device half and answers differently about protection, and `PROT_REPLAY_AT_SWITCH` — a `public static Bool` in the shared arch module since design 27 — could therefore not be overridden by it AT ALL. `prot_reset` and its six siblings ARE declared in both modules and coexist, which is what made the failure read as a spelling problem for an hour. **In-tree resolution: the two seam values a profile must override became FUNCTIONS** (`prot_replay_at_switch()`, `prot_isolated()`), which is livable — a leaf returning a literal still inlines and folds, so `load_domain`'s replay loop still compiles away where it is dead — and which yields a rule worth stating on its own: **a HAL constant that a build profile may need to override cannot be a `static`.** The other HAL constants (`PROT_GRAIN`, `GRANT_ROW_BUDGET`, `FRAME_BYTES`, the memory map) stay `static`s because nothing overrides them; they are declared once and re-exported, which is the shape that works — and which is also why this went unnoticed for eight designs' worth of HAL work.
+  What it does NOT reach: a `static_assert` operand, an array length, a const generic argument. Those want a compile-time constant, and a function is not one — so a profile that had to override a SIZE rather than a flag would have no spelling at all today, which is the sharper version of this entry and is filed here rather than met.
+  Resolution shape: give a module-level `static` the identity a free function has (design 249's rule at the fourth declaration kind), so `top.X` and `core.X` are two statics and each importer resolves its own. Failing that, the diagnostic should anchor on the two DECLARATIONS and say which modules they are in, rather than on an entry file that names neither.

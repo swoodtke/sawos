@@ -180,6 +180,24 @@ public static MINT_OP: UInt = 0xFFFE
 /// is a System answer. Its second argument is a Memory handle spending no
 /// `MemoryRight` of its own — the operation's argument, not a second authority —
 /// which is `ProcessCreate`'s rule again and why this decoder already takes two.
+///
+/// `TierGet` is the seventh, and it is the FIRST OP ON ANY OBJECT THAT ANSWERS A
+/// PLAIN FACT ABOUT THE MACHINE (sawos design 35, M5 unit 4; design 25 D-4).
+/// Every op above it either performs an act or mints a handle; this one reads
+/// no state, spends no resource, cannot fail, and hands back a `ProtectionTier`
+/// in the value register. It is on System because the tier is a property of the
+/// MACHINE rather than of any process — the same argument that put
+/// `ProcessCreate` and `SlabDonate` here — and it takes no arguments at all.
+///
+/// WHY AN OP AND NOT A BOOT-INFO FIELD, recorded where the surface is: design
+/// 25 D-4's ruled shape was "getter + boot info", and the boot-info half HAS NO
+/// CARRIER IN THIS TREE. `sosabi.boot` holds the boot-handle record — a tag, a
+/// kind and a handle, "exactly the givable kinds" — and nothing platform-shaped;
+/// design 232 ruled a bootinfo SECTION out explicitly ("delivery is the
+/// retrieval op, not a bootinfo section", the vDSO discipline's whole point);
+/// and `kernel/sysapi` depends on `sosabi` and `sosrt` only, never on a HAL, so
+/// a build-time constant cannot see the tier either. The op is therefore the
+/// whole of the surface, which is also the checkable half design 35 asked for.
 public enum SystemOp: UInt {
     case DebugPrint = 0,
     case Shutdown = 1,
@@ -187,6 +205,7 @@ public enum SystemOp: UInt {
     case ClockGet = 3,
     case ProcessCreate = 4,
     case SlabDonate = 5,
+    case TierGet = 6,
 }
 
 // =============================================================================
@@ -892,7 +911,12 @@ public enum ReplyWaitLeg: UInt {
 // case, in the spirit of the rights asserts above — the repetition IS the check,
 // and a table growing toward the top of the space fails to build rather than
 // failing as a release or a mint that quietly ran somebody's op.
-static_assert((SystemOp.ProcessCreate as UInt) < MINT_OP,
+// NOTE (sawos design 35): this assert named `ProcessCreate` — case 4 — until
+// unit 4 moved it, because neither `SlabDonate` (5) nor anything before it
+// re-pointed it at the new top. The rule above says "on its highest case", and
+// a bound tested against a case that is no longer the highest is a check that
+// would pass while the table walked past `MINT_OP`. It names `TierGet` now.
+static_assert((SystemOp.TierGet as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
 static_assert((ProcessOp.Stats as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
@@ -949,6 +973,51 @@ static_assert(MINT_OP < RELEASE_OP,
 /// own.
 public enum ClockType: UInt {
     case Monotonic = 0,
+}
+
+/// WHAT THE PLATFORM CAN DENY — the tier word `SystemOp.TierGet` answers (sawos
+/// design 19's platform attribute; design 25 D-4; built by design 35).
+///
+/// **TWO WORDS, AND THAT IS RULED** (design 25 D-4b): MMU versus MPU is NOT
+/// advertised. Slot pricing and `map`'s answer are already the visible
+/// difference between those two, and a third word would invite tier-sniffing —
+/// a program branching on the mechanism instead of on what the mechanism can
+/// promise. So the question this enum answers is exactly one: can the platform
+/// DENY?
+///
+/// `Isolated` — the hardware can refuse an access. `unmap` revokes, a peer
+/// cannot reach this process's memory, and the isolation proofs mean something.
+/// Both in-tree protection profiles answer this: arm64-virt through page-table
+/// permissions, riscv32-virt through PMP regions.
+///
+/// `Flat` — the important regions are mapped once at boot and everyone reaches
+/// them. **WHAT THIS DISCLAIMS IS PRECISE, AND IT IS NOT `map`** (design 19):
+/// `map`'s contract is "make this region accessible with at least these
+/// rights", which on flat hardware is TRIVIALLY TRUE, so the call succeeds
+/// HONESTLY rather than being ignored — the contract holds, it just costs
+/// nothing to keep. What is disclaimed is DENIAL: `unmap`'s revocation half,
+/// and isolation between peers.
+///
+/// **THE KERNEL BOUNDARY IS NOT DISCLAIMED ANYWHERE.** Handles stay checked,
+/// authority stays unforgeable through the API, quotas and lifetimes stay real
+/// at every tier. The degradation is sayable in one sentence: the capability
+/// model's AUTHORITY enforcement survives intact; MEMORY isolation between
+/// peers does not.
+///
+/// A program that RELIES on isolation checks this once, at startup, and refuses
+/// to run when it reads `Flat` — which is the whole reason the word exists. The
+/// alternative design, and the one design 19 ruled out by name, is a per-call
+/// lie: an `unmap` that returns `Ok` on hardware that revoked nothing.
+///
+/// Backed by `UInt` for `SystemOp`'s and `ClockType`'s reason — it rides the
+/// value register — though this one travels OUTWARD, so the width is about the
+/// register rather than about a hostile caller. Both cases are PRODUCIBLE
+/// today, which is what makes declaring both honest where `ClockType` declares
+/// one: design 35 lands a flat build profile of the riscv32 virt board in the
+/// same pass, so nothing here is a word no build can answer.
+public enum ProtectionTier: UInt {
+    case Isolated = 0,
+    case Flat = 1,
 }
 
 /// WHAT A MAPPING PERMITS — the access bits `MemoryOp.Map` takes (spec §2.5's

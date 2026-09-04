@@ -133,6 +133,24 @@
 /// server that is meant to size the machine keeps it and hands its children
 /// System siblings stripped of it, which is the ordinary attenuation and is why
 /// the bit has to exist separately to be strippable at all.
+///
+/// `TierGet` is the newest bit (sawos design 35, M5 unit 4), and it is the
+/// LEAST powerful one here: it gates reading a word that describes the machine.
+/// It has a bit at all because design 25 D-4 ruled the surface "a `SystemOp`
+/// getter ... plus a `SystemRight` bit for it in the root set (attenuable like
+/// any)", and because the alternative — an ambient fact no handle gates — would
+/// be the one place in this ABI where a process learns something about the
+/// machine without holding a capability that says it may. `ClockGet`'s docstring
+/// two paragraphs up makes the same argument about time, and the same
+/// substitution motivates it: a launcher that means to run a child under a
+/// SIMULATED platform (a flat-tier test harness over isolated hardware, or the
+/// reverse) strips this bit and answers the question itself over IPC, which is a
+/// substitution rather than a rewrite only because the child had no second way
+/// to ask.
+///
+/// It grants no authority over anything and leaks no other process's state, so
+/// it is in the root set and in the ordinary child mask, exactly as `ClockGet`
+/// is.
 public enum SystemRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
@@ -142,6 +160,7 @@ public enum SystemRight: UInt32 {
     case ProcessCreate = 1 << 11,
     case ProcessSelf = 1 << 12,
     case SlabDonate = 1 << 13,
+    case TierGet = 1 << 14,
 }
 
 // The universal low byte, pinned. Every kind's enum repeats these two asserts
@@ -164,6 +183,14 @@ static_assert((SystemRight.ProcessCreate as UInt32) >= (1 << 8),
               "kind-specific right ProcessCreate must start at bit 8 or above")
 static_assert((SystemRight.ProcessSelf as UInt32) >= (1 << 8),
               "kind-specific right ProcessSelf must start at bit 8 or above")
+// `SlabDonate`'s assert is BACKFILLED here by sawos design 35: the rule one
+// comment up says "one assert per kind-specific case", and design 32 added the
+// case without the line. Unit 4 adds its own and its neighbour's rather than
+// leaving the repetition — which IS the check — with a hole in it.
+static_assert((SystemRight.SlabDonate as UInt32) >= (1 << 8),
+              "kind-specific right SlabDonate must start at bit 8 or above")
+static_assert((SystemRight.TierGet as UInt32) >= (1 << 8),
+              "kind-specific right TierGet must start at bit 8 or above")
 
 /// A right on a Process object (§2 table row; design 178 D4).
 ///
@@ -965,6 +992,10 @@ public func root_system_rights() -> UInt32 {
      | (SystemRight.ProcessSelf as UInt32) | (SystemRight.ClockGet as UInt32)
      | (SystemRight.ProcessCreate as UInt32) | (SystemRight.Mint as UInt32)
      | (SystemRight.SlabDonate as UInt32)
+     // `TierGet` (sawos design 35) is here on `ClockGet`'s terms exactly: it
+     // grants authority over nothing, and a process that cannot ask which tier
+     // it is running on cannot make the one decision the word exists for.
+     | (SystemRight.TierGet as UInt32)
      | (SystemRight.Transfer as UInt32))
 }
 

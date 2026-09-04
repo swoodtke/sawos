@@ -1,0 +1,108 @@
+// SOS M5 unit 4: THE TIER WORD (sawos design 35; design 19's platform
+// attribute; design 25 D-4).
+//
+// **THE PLATFORM ADVERTISES WHAT IT CAN DENY, AND A PROGRAM READS IT ONCE.**
+// This is the whole intended use, written out: ask the System object, match on
+// the answer, and decide whether to run. A program that relies on isolation
+// stops here when the word is `Flat`; a program that does not carries on either
+// way.
+//
+// THE TRANSCRIPT, read as three claims:
+//
+//   SOS tier: Flat            <- the platform said which tier it is
+//   SOS tier: stable          <- and it says the same thing every time
+//   SOS tier: kernel boundary intact   <- what `Flat` does NOT disclaim
+//
+// **THE THIRD LINE IS THE ONE WORTH ARGUING ABOUT.** The tier word disclaims
+// exactly two things — `unmap`'s revocation half and peer isolation — and
+// disclaims NOTHING about the kernel boundary. So on a flat platform a handle is
+// still checked and a right is still enforced, and this program proves it the
+// only way a proof of a refusal can be written: it mints a System sibling with
+// the tier bit STRIPPED and asks again. The kernel refuses that ask on a flat
+// platform exactly as it would on an isolated one, because rights are not
+// tiered.
+//
+// **AND THAT REFUSAL IS A FAULT, NOT A STATUS** (design 178's faults ruling): a
+// missing right is a mistake the caller could have checked, so the kernel ends
+// the process rather than answering it. The program therefore prints its third
+// line BEFORE the ask that kills it, and the case asserts the process fault and
+// the teardown that follows — which is why this program never reaches a clean
+// shutdown and has no `EXIT_OK`.
+
+import sos.{System, ProtectionTier, SystemRight, SosStatus}
+
+static EXIT_FAILED: UInt = 1
+
+// EVERY System right EXCEPT `TierGet` — the keep mask that makes the sibling a
+// handle which can do everything this program has been doing and cannot ask the
+// one question. Spelled as the bits to KEEP rather than as an inversion,
+// because a mask is monotonic and naming what survives is what a launcher
+// actually writes.
+static KEEP_WITHOUT_TIER: UInt32 = (SystemRight.Debug | SystemRight.Shutdown
+                                    | SystemRight.ProcessSelf
+                                    | SystemRight.ClockGet
+                                    | SystemRight.Mint
+                                    | SystemRight.Transfer)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    // **THE ASK.** No arguments, no resource spent, and the answer is one of
+    // exactly two words.
+    let tier = try system.tier() catch {
+        print("SOS tier: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // A `match` rather than a comparison, because two words is what the enum
+    // has and an exhaustive match is what makes a third word — should one ever
+    // be ruled in — a compile error here rather than a silent fall-through.
+    match tier {
+        case Isolated -> {
+            let _ = system.debug_print("SOS tier: Isolated\n")
+        },
+        case Flat -> {
+            let _ = system.debug_print("SOS tier: Flat\n")
+        },
+    }
+
+    // **A PLATFORM FACT DOES NOT CHANGE.** Asking twice is not paranoia, it is
+    // the assertion that this op reads a compile-time constant rather than
+    // sampling something: an implementation that answered from mutable state
+    // would be a different op with the same name.
+    let again = try system.tier() catch {
+        print("SOS tier: second ask refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    if again != tier {
+        let _ = system.debug_print("SOS tier: UNSTABLE\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS tier: stable\n")
+
+    // **THE KERNEL BOUNDARY, ON WHATEVER TIER THIS IS.** The sibling holds every
+    // System right this handle held except `TierGet`.
+    let narrowed = try system.mint(rights: KEEP_WITHOUT_TIER) catch {
+        print("SOS tier: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // Printed BEFORE the ask, because the ask does not return: a missing right
+    // faults the process. This line is the last thing the program says, and the
+    // kernel's fault report is the next line in the transcript.
+    let _ = system.debug_print("SOS tier: kernel boundary intact\n")
+
+    let _ = narrowed.tier()
+
+    // Unreachable on a correct kernel — the ask above ended this process. A
+    // build that gets here has answered a question through a handle that was
+    // not allowed to ask it, which is a capability leak and not a tier
+    // property, so it fails loudly rather than shutting down cleanly.
+    let _ = system.debug_print("SOS tier: UNREACHABLE\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

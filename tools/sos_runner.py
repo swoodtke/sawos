@@ -149,6 +149,17 @@ RT_COMMON_C_DIR = os.path.join(REPO_ROOT, "rt", "common_c")
 RV32_COMMON_DIR = os.path.join(HAL_DIR, "riscv32-common")
 RV32_CORE_MODULE = f"rv32core={os.path.join(RV32_COMMON_DIR, 'kernel')}"
 
+# **THE VIRT BOARD, UNDER A SECOND MODULE NAME** (sawos design 35, M5 unit 4).
+#
+# The same directory the isolated profile maps as `hal=`, mapped as `rv32virt=`
+# for the FLAT profile, whose own `hal` module re-exports the board half from it
+# and defines only the protection surface itself. A Saw module's name comes from
+# its `--module-path` mapping, so one directory can be the board's `hal` in one
+# build and a component of somebody else's `hal` in another — which is what lets
+# a build profile exist without a second copy of the UART, the CLINT, the PLIC
+# and the memory map, and what keeps design 23's consolidation untouched.
+RV32_VIRT_MODULE = f"rv32virt={os.path.join(HAL_DIR, 'riscv32', 'kernel')}"
+
 # `ExitCode.ProcessFault` in sos/kernel/core/lib.saw: what the machine exits
 # with when the kernel TERMINATES a process for a caller error it could have
 # checked (design 178's faults ruling). Kept in step with that enum.
@@ -530,6 +541,7 @@ TIMER_INTERVAL_PKG = os.path.join(TESTS_DIR, "timer-interval")
 TIMER_DEADLOCK_PKG = os.path.join(TESTS_DIR, "timer-deadlock")
 TIMER_BADCLOCK_PKG = os.path.join(TESTS_DIR, "timer-badclock")
 TIMER_BADRECORD_PKG = os.path.join(TESTS_DIR, "timer-badrecord")
+TIER_WORD_PKG = os.path.join(TESTS_DIR, "tier-word")
 
 # What the harness types at the guest's serial port for the echo cases, and what
 # it then expects to read back out of it.
@@ -572,11 +584,34 @@ QEMU_TIMEOUT_S = 10
 # per architecture rather than duplicated, so a case asserts the same FACT on
 # both and the widths follow the target.
 
+# =============================================================================
+# The protection tiers (sawos design 19, ruled as design 25 D-4, built by 35)
+# =============================================================================
+#
+# TWO WORDS, because the kernel advertises two: `Isolated` means the hardware
+# refuses an access a process was not granted, `Flat` means it does not. They are
+# spelled here as the runner's own constants rather than read out of the kernel,
+# because the harness has to decide which cases to RUN before it has booted
+# anything — and the `tier_word` case is what checks that the runner's claim and
+# the kernel's answer agree.
+#
+# WHAT THE WORD DECIDES, and it is only ever this: whether a case whose assertion
+# is that the HARDWARE denied something is meaningful on this profile. Nothing
+# about the kernel boundary is tiered — handles, rights, quotas and lifetimes are
+# enforced identically everywhere — so the object-model suite carries no tier at
+# all and runs on all three profiles unchanged.
+TIER_ISOLATED = "isolated"
+TIER_FLAT = "flat"
+
 ARCHES = [
     {
         "name": "riscv32",
         "triple": "riscv32-unknown-none-elf",
         "qemu": "qemu-system-riscv32",
+        # PMP: an unmatched U-mode access faults whenever any entry is
+        # implemented, which is what locks the kernel, the UART and the finisher
+        # away from root by SAYING NOTHING about them (sawos design 35).
+        "tier": TIER_ISOLATED,
         # `-bios none`: no OpenSBI, the kernel IS the reset target.
         "qemu_args": ["-M", "virt", "-bios", "none"],
         # A triple names the architecture but not which optional extensions the
@@ -629,6 +664,10 @@ ARCHES = [
         "name": "arm64",
         "triple": "aarch64-unknown-none-elf",
         "qemu": "qemu-system-aarch64",
+        # Page tables: since design 29 the kernel lives under TTBR1 and a
+        # process reaches exactly what its own tables map — isolation by
+        # absence (sawos design 35).
+        "tier": TIER_ISOLATED,
         # `-cpu cortex-a53` (design 162 decision 3): ubiquitous, EL1
         # well-exercised. `-semihosting` is what makes SYS_EXIT carry a status
         # code — see sos/hal/arm64/kernel/sink.c for why not PSCI.
@@ -682,6 +721,80 @@ ARCHES = [
         "device_base": 0x09000000,
         "device_len": 0x1000,
     },
+    # =========================================================================
+    # **THE FLAT BUILD PROFILE** (sawos design 35, M5 unit 4; design 19's
+    # "testing targets for the flat tier"; design 25's tier table, last row)
+    # =========================================================================
+    #
+    # THE SAME BOARD, WITH THE PROTECTION TURNED OFF AND THE TIER WORD SAYING SO.
+    # Not a third architecture and not a third board — the riscv32 `virt`
+    # machine, the same QEMU invocation, the same triple, the same toolchain,
+    # the same `boot.S`, the same linker scripts, the same `tests/riscv32`
+    # payloads, the same root and child images down to the byte. What differs is
+    # ONE module: `hal/riscv32-flat/kernel/lib.saw`, whose `prot_*` bodies are
+    # empty, whose PMP is opened once to permit everything, and whose
+    # `prot_isolated()` answers `false`.
+    #
+    # **IT IS LAST IN THIS LIST DELIBERATELY.** The architectures run in list
+    # order and each prints a contiguous block, so appending here leaves the
+    # riscv32 and arm64 sections exactly where a reader of an older transcript
+    # left them — which is design 35's fence: the tier word and the case sorting
+    # are required to cost the isolated profiles nothing, and a diff is how that
+    # is checked.
+    #
+    # **WHY A THIRD PROFILE RATHER THAN A BUILD FLAG.** The flat/isolated choice
+    # has to change the VALUES of constants that `kernel/core`'s `static_assert`s
+    # and `load_domain`'s folded `if` read, and this toolchain has no
+    # conditional-compilation mechanism at all — no `--define`, no `cfg`, and the
+    # only build-side switches in this file are `--target-features` and
+    # `--module-path`. A module swap is therefore not one option among several;
+    # it is the mechanism the language gives, and it happens to be the honest
+    # one: the profile is a HAL, so it is a HAL directory.
+    {
+        "name": "riscv32-flat",
+        "tier": TIER_FLAT,
+        # The same machine, so the same everything the machine decides.
+        "triple": "riscv32-unknown-none-elf",
+        "qemu": "qemu-system-riscv32",
+        "qemu_args": ["-M", "virt", "-bios", "none"],
+        "cc_args": ["-march=rv32imac_zicsr", "-mabi=ilp32"],
+        "features": "+m,+a,+c",
+        # `hal=` is THIS profile's own module; `rv32core` and `rv32virt` are the
+        # arch half and the board half it re-exports from. `hal_native` and
+        # `hal_asm` are the shared riscv32 ones, unchanged — the trap entry and
+        # the CSR sinks are facts about the ISA and this profile does not touch
+        # them.
+        "hal_native": os.path.join("riscv32-common", "kernel"),
+        "hal_modules": [RV32_CORE_MODULE, RV32_VIRT_MODULE],
+        "hal_asm": [os.path.join("riscv32-common", "kernel", "trap.S")],
+        # `boot.S` and `virt.ld` come from the BOARD, because they are the
+        # board's: where the stack is, where the payload section lands, where
+        # RAM begins. A flat profile changes none of that. There is deliberately
+        # no copy of either under `hal/riscv32-flat/`.
+        "hal_board": os.path.join("riscv32", "kernel"),
+        # The hand-assembled payloads under `tests/riscv32/` are riscv32
+        # instructions, so they are this profile's too.
+        "tests_arch": "riscv32",
+        # **THE ONE THING THAT MUST NOT BE SHARED.** Two profiles on one triple
+        # would otherwise write their kernel objects into the same
+        # `.build/<triple>/sos/`, and the second would silently relink the
+        # first's — the exact hazard the esp32c3 section below documents and
+        # dodges the same way.
+        "build_tag": "riscv32-unknown-none-elf-flat",
+        # The BANNER names the architecture, not the profile: the kernel prints
+        # "riscv32 (QEMU virt, flat profile)" and this is matched as a prefix of
+        # it, so a case asserts the same fact on all three profiles while a human
+        # reading a transcript can still see which kernel wrote it.
+        "banner_arch": "riscv32",
+        "hex_width": 8,
+        "root_entry": 0x80200000,
+        "child_region_base": 0x80240000,
+        "selftest_line": 10,
+        "pool_base": 0x80280000,
+        "pool_len": 0x40000,
+        "device_base": 0x10000000,
+        "device_len": 0x1000,
+    },
 ]
 
 # How big a child's destination region is, on both profiles.
@@ -718,18 +831,36 @@ REGION_KIND_DEVICE = 1
 
 
 def arch_dirs(arch):
-    """The per-architecture directories a build reaches into.
+    """The per-profile directories a build reaches into.
 
-    `hal_kernel` is the BOARD's own directory — `boot.S`, the linker script and
-    the `hal` module. `hal_native` is where this architecture's `sink.c` lives,
-    which is the same directory for arm64 and the SHARED `riscv32-common` one
-    for riscv32 (design 23).
+    `hal_kernel` is where the `hal` MODULE lives. `hal_board` is where the
+    BOARD's native half lives — `boot.S` and the linker script — and it is the
+    same directory for every profile that is a board in its own right. `hal_native`
+    is where this architecture's `sink.c` lives, which is the same directory for
+    arm64 and the SHARED `riscv32-common` one for riscv32 (design 23).
+
+    **THE THREE `.get` DEFAULTS ARE WHAT MAKES A PROFILE POSSIBLE** (sawos design
+    35). A profile that is a variant of an existing board — riscv32-flat, whose
+    only difference from riscv32-virt is that it programs the hardware to deny
+    nothing — shares that board's `boot.S`, its linker script and its `tests/`
+    payloads, and differs only in the `hal` module it compiles and the `.build/`
+    directory it writes into. Every default below is the value the two original
+    entries already had, so neither of them changes by one byte.
+
+    `build` is keyed on `build_tag` rather than on the triple for the hazard the
+    esp32c3 section names one screen down: two profiles can share a target triple,
+    and a shared `.build/<triple>/` would let one silently relink the other's
+    objects.
     """
     return {
         "hal_kernel": os.path.join(HAL_DIR, arch["name"], "kernel"),
+        "hal_board": os.path.join(HAL_DIR,
+                                  arch.get("hal_board",
+                                           os.path.join(arch["name"], "kernel"))),
         "hal_native": os.path.join(HAL_DIR, arch["hal_native"]),
-        "tests": os.path.join(TESTS_DIR, arch["name"]),
-        "build": os.path.join(REPO_ROOT, ".build", arch["triple"], "sos"),
+        "tests": os.path.join(TESTS_DIR, arch.get("tests_arch", arch["name"])),
+        "build": os.path.join(REPO_ROOT, ".build",
+                              arch.get("build_tag", arch["triple"]), "sos"),
     }
 
 
@@ -742,7 +873,20 @@ def expectations(arch):
     """
     width = arch["hex_width"]
     return {
-        "banner": f"SOS M1: kernel up on {arch['name']}",
+        # `banner_arch` is the ARCHITECTURE's name, which is the profile's name
+        # for a profile that is a board in its own right and the BOARD's for a
+        # variant of one (sawos design 35). The kernel prints `hal.arch_name()`
+        # and this is matched as a PREFIX of it, so riscv32-flat's banner —
+        # "SOS M1: kernel up on riscv32 (QEMU virt, flat profile)" — is asserted
+        # by the same string the isolated profile asserts, while a reader can
+        # still see which kernel wrote the line.
+        "banner": f"SOS M1: kernel up on {arch.get('banner_arch', arch['name'])}",
+        # **THE TIER WORD, AS A CASE WRITES IT** (sawos design 35). A case says
+        # `tier={tier}` and gets `Isolated` on the two protected profiles and
+        # `Flat` on the flat one — the same mechanism `{entry}` and `{banner}`
+        # use, and for the same reason: the FACT under test is "the platform
+        # advertised what it can actually deny", and the word is the target's.
+        "tier": "Isolated" if arch["tier"] == TIER_ISOLATED else "Flat",
         "entry": f"0x{arch['root_entry']:0{width}x}",
         "zero": f"0x{0:0{width}x}",
         "one": f"0x{1:0{width}x}",
@@ -941,6 +1085,14 @@ TEST_CASES = [
     },
     {
         "name": "umode_access_fault",
+        # ISOLATED-ONLY (sawos design 35). The payload stores into the kernel's
+        # own .text, which it was never granted, and the ASSERTION IS THE FAULT.
+        # A flat platform permits the store, the payload runs on, and the line
+        # is missing rather than wrong — which is the failure mode this case was
+        # engineered for and exactly why it cannot be asked here.
+        "tier": TIER_ISOLATED,
+        "tier_reason": "a U-mode store into kernel .text must FAULT; a flat "
+                       "platform permits it and the line never appears",
         "src": os.path.join(TESTS_DIR, "umode.saw"),
         "asm": "payload_fault.S",
         # Both HALs report the same name for the same event, which is why one
@@ -1445,7 +1597,15 @@ TEST_CASES = [
     # the driver. Neither of these two rows moved for that unit.
     {
         "name": "uart_echo_ns16550",
-        "arches": ["riscv32"],
+        # **AND `riscv32-flat`, WHICH IS THE SAME MACHINE** (sawos design 35).
+        # An `arches` list names the profiles a case applies to, and a riscv32
+        # profile added after this list was written is not named by it — so
+        # widening these five is what stops a NEW profile from silently running
+        # fewer cases than the one it is a variant of. Nothing about the reason
+        # each case is riscv32-only (a per-DEVICE driver package; a `PROT_GRAIN`
+        # arithmetic) distinguishes the two profiles: they share the device, the
+        # grain and the triple.
+        "arches": ["riscv32", "riscv32-flat"],
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": UART_ECHO_NS16550_PKG,
         "device": True,
@@ -1793,6 +1953,12 @@ TEST_CASES = [
         # The grant has to hold against a root that is merely WRONG, not just
         # against one that behaves.
         "name": "root_server_oversteps",
+        # ISOLATED-ONLY (sawos design 35): "the grant has to hold" is a claim
+        # about what the HARDWARE refuses, and a flat platform holds no grant
+        # against anybody. Root reaches for the kernel and simply arrives.
+        "tier": TIER_ISOLATED,
+        "tier_reason": "root reaching into kernel memory must FAULT; a flat "
+                       "platform lets the store land",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": FAULT_ROOT_PKG,
         "expect_out": ["SOS root: reaching for the kernel",
@@ -1866,6 +2032,17 @@ TEST_CASES = [
         # is the one thing that differs from the lifecycle case's `131073`, and
         # it is what says the two children died in two different ways.
         "name": "process_isolation",
+        # ISOLATED-ONLY, AND THE CASE THE TIER WORD IS ABOUT (sawos design 35).
+        # This is the money proof named four comments up, and the property it
+        # proves — a peer cannot reach another process's memory — is precisely
+        # the one design 19 says the flat tier DISCLAIMS. Running it there would
+        # not be a stricter test, it would be a test of a promise nobody made:
+        # the child's store lands in root's stack, the child spins in the
+        # `while { }` its own source calls unreachable, and the case burns its
+        # ten-second timeout to discover the tier word was telling the truth.
+        "tier": TIER_ISOLATED,
+        "tier_reason": "peer isolation is the property the Flat tier disclaims "
+                       "BY NAME (design 19) — the child's poke would land",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": PROCESS_ISOLATION_PKG,
         "children": [CHILD_POKE_PKG],
@@ -2461,6 +2638,16 @@ TEST_CASES = [
         # The fault's tag and cause differ per machine (a load access fault
         # here, a data abort there), so what is asserted is that ONE was taken.
         "name": "map_unmap",
+        # ISOLATED-ONLY (sawos design 35), and the OTHER property the tier word
+        # disclaims by name: `unmap`'s revocation half. On this profile the row
+        # leaves the record, the hardware forgets it, and the touch dies. On a
+        # flat profile the row still leaves the record and the Mapping still
+        # dies — the kernel-side half is not tiered — but the hardware goes on
+        # permitting the access, so the program prints its own UNREACHABLE line
+        # and exits non-zero on its own account.
+        "tier": TIER_ISOLATED,
+        "tier_reason": "unmap's revocation half is the other property Flat "
+                       "disclaims by name — the touch after unmap would succeed",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": MAP_UNMAP_PKG,
         "pool": True,
@@ -2884,7 +3071,7 @@ TEST_CASES = [
         # kernel whose armed tick narrates over a process that owns the device.
         # A case whose transcript matters after handover arms none.
         "name": "child_echo_ns16550",
-        "arches": ["riscv32"],
+        "arches": ["riscv32", "riscv32-flat"],
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": DRIVER_CHILD_PKG,
         "children": [CHILD_ECHO_NS16550_PKG],
@@ -4305,7 +4492,7 @@ TEST_CASES = [
         # to fake it on a machine with no translation and no driver in the
         # kernel.
         "name": "uart_service_ns16550",
-        "arches": ["riscv32"],
+        "arches": ["riscv32", "riscv32-flat"],
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": UART_SERVICE_PKG,
         "children": [SVC_UART_NS16550_PKG, SVC_CLIENT_PKG],
@@ -4398,7 +4585,7 @@ TEST_CASES = [
         # driver program, which is what makes them about the loop rather than
         # about a case.
         "name": "uart_cancel_ns16550",
-        "arches": ["riscv32"],
+        "arches": ["riscv32", "riscv32-flat"],
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": UART_CANCEL_PKG,
         "children": [SVC_UART_NS16550_PKG],
@@ -4721,7 +4908,7 @@ TEST_CASES = [
         # `hal.PROT_GRAIN`, and at the other profile's 4096-byte grain the 32
         # holes alone would want 2.1 MiB against a pool that cannot exceed the
         # grant window. Design 34's As-built records the asymmetry.
-        "arches": ["riscv32"],
+        "arches": ["riscv32", "riscv32-flat"],
         "expect_out": ["{banner}",
                        "SOS: boot regions={one}",
                        "SOS slabnodes: pool trimmed to the construction",
@@ -4773,6 +4960,55 @@ TEST_CASES = [
                        "SOS procdonate: donated slot reused d=65579",
                        "SOS procdonate: done"],
         "expect_clean_exit": True,
+    },
+
+    {
+        # =====================================================================
+        # M5 UNIT 4 — THE TIER WORD ITSELF (sawos design 35)
+        # =====================================================================
+        #
+        # The platform is asked what it can DENY and says so, twice with the same
+        # answer; then the ask is made through a handle minted WITHOUT the right
+        # and the kernel ends the process.
+        #
+        # **FLAT-ONLY, AND THE `arches` KEY IS A TRANSCRIPT FENCE RATHER THAN A
+        # CLAIM ABOUT THE CASE.** This case is meaningful on all three profiles
+        # and would pass on all three — `{tier}` substitutes `Isolated` on the
+        # two protected ones — but design 35 requires the riscv32 and arm64
+        # sections to stay BYTE-IDENTICAL to the pre-unit baseline, and a case
+        # added to their lists moves every `[i/N]` row in both by changing N.
+        # So the word's ISOLATED answer is witnessed by a probe recorded in
+        # design 35's As-built rather than by the gate, and promoting this case
+        # to all three profiles is queued for the unit that next holds an
+        # authorization to move those rows (unit 8, the M5 docs sweep).
+        #
+        # It is APPENDED, per the convention this file states above: the report
+        # prints in case-definition order, so a case added at the END leaves
+        # every existing case's ordinal where a reader of an older transcript
+        # left it.
+        "name": "tier_word",
+        "arches": ["riscv32-flat"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": TIER_WORD_PKG,
+        "expect_out": ["{banner}",
+                       # THE WORD. `{tier}` is the HARNESS's claim about this
+                       # profile and the line is the KERNEL's answer, so this row
+                       # is the two of them agreeing — the one place in the suite
+                       # where the runner's tier table is checked against the HAL
+                       # that implements it.
+                       "SOS tier: {tier}",
+                       "SOS tier: stable",
+                       "SOS tier: kernel boundary intact",
+                       # AND THE BOUNDARY, ON THE FLAT TIER. A right is not
+                       # tiered: the sibling minted without `TierGet` is refused
+                       # here exactly as it would be on hardware that can deny,
+                       # because this refusal is the KERNEL's and not the
+                       # platform's. It is the positive statement of what the
+                       # tier word does NOT disclaim.
+                       "SOS: process fault: access denied process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
     },
 ]
 
@@ -4856,7 +5092,9 @@ def _find_clang(arches):
         for arch in arches:
             dirs = arch_dirs(arch)
             os.makedirs(dirs["build"], exist_ok=True)
-            probe_src = os.path.join(dirs["hal_kernel"], "boot.S")
+            # The BOARD's boot.S (sawos design 35): a profile that is a variant
+            # of an existing board has none of its own.
+            probe_src = os.path.join(dirs["hal_board"], "boot.S")
             try:
                 _run([path, f"--target={arch['triple']}", *arch["cc_args"],
                       "-nostdlib", "-c", probe_src,
@@ -4964,7 +5202,7 @@ def _build_shared(arch, clang):
     sink_o = os.path.join(build, "sink.o")
     support_o = os.path.join(build, "support.o")
     _run([clang, f"--target={arch['triple']}", *arch["cc_args"],
-          "-nostdlib", "-c", os.path.join(dirs["hal_kernel"], "boot.S"),
+          "-nostdlib", "-c", os.path.join(dirs["hal_board"], "boot.S"),
           "-o", boot_o])
     # design 23: any SHARED assembly this architecture's HAL splits out of its
     # board `boot.S` — the riscv32 trap entry and M -> U transition, which are
@@ -5310,7 +5548,10 @@ def _build_elf(case, arch, shared_objs, lld, clang):
     if case.get("children") or case.get("pool") or case.get("device"):
         objs.append(_stitch_regions(case, arch, clang))
 
-    _run([lld, "-T", os.path.join(dirs["hal_kernel"], "virt.ld"), "--gc-sections",
+    # The BOARD's linker script, for `boot.S`'s reason (sawos design 35): the
+    # memory map, the payload section and the region table are the board's, and
+    # a protection profile moves none of them.
+    _run([lld, "-T", os.path.join(dirs["hal_board"], "virt.ld"), "--gc-sections",
           "-o", elf, *objs])
     return elf
 
@@ -5455,6 +5696,30 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, selected_cases, jobs):
     cases = [c for c in selected_cases
              if arch["name"] in c.get("arches", (arch["name"],))]
 
+    # **AND A CASE MAY NAME THE TIER IT NEEDS** (sawos design 35, M5 unit 4;
+    # design 19's "one story, one test — sorted by tier"). The default is EVERY
+    # tier and that is the important half: the object model — pipes, waiters,
+    # events, timers, stats, quotas, handles, donation, the allocator — is not
+    # tiered at all, so the overwhelming majority of this table carries no `tier`
+    # key and runs identically on all three profiles. A `tier` key is a claim
+    # that the case's ASSERTION IS DENIAL BY THE HARDWARE, which is the one
+    # thing a flat platform cannot do.
+    #
+    # **NOTHING IS SKIPPED SILENTLY.** Every excluded case is named, with its
+    # reason, in the report below — the no-silent-caps doctrine, and the reason
+    # this is a two-list partition rather than one comprehension. A suite that
+    # quietly ran 5 fewer cases on one profile would be a suite whose green line
+    # means something different in each section.
+    # Partitioned in ONE pass and by IDENTITY rather than by filtering twice: a
+    # case is a plain dict, so `in` would compare CONTENTS, and two cases that
+    # happened to agree field for field would take each other's place in the
+    # split.
+    runnable, excluded = [], []
+    for case in cases:
+        need = case.get("tier")
+        (runnable if need is None or need == arch["tier"] else excluded).append(case)
+    cases = runnable
+
     try:
         shared_objs = _build_shared(arch, clang)
     except ToolError as e:
@@ -5534,6 +5799,24 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, selected_cases, jobs):
         if ok:
             return True, f"{CHECK} {name}", []
         return False, f"{CROSS} {name}  ({reason})", []
+
+    # **THE EXCLUDED CASES, BY NAME, WITH THE REASON** (sawos design 35).
+    #
+    # Printed here rather than folded into the numbered rows because these cases
+    # did not run and did not pass, and a `[i/N]` line saying either would be a
+    # lie. It sits immediately above the rows so the relationship between this
+    # list and that `N` is on the screen at once.
+    #
+    # THE BLOCK IS SKIPPED ENTIRELY WHEN THE LIST IS EMPTY, which is what keeps
+    # the riscv32 and arm64 sections byte-identical: on an isolated profile
+    # every `tier` key matches and nothing is excluded, so not one character of
+    # this appears. It is the flat profile's section that grows it.
+    if excluded:
+        print(f"  tier {arch['tier']}: {len(excluded)} isolation "
+              f"{'proof' if len(excluded) == 1 else 'proofs'} excluded "
+              f"(this platform cannot deny, and says so)")
+        for case in excluded:
+            print(f"    - {case['name']}: {case['tier_reason']}")
 
     passed = 0
     failed = 0
@@ -5983,8 +6266,18 @@ def main():
     print(f"{BOLD}SOS QEMU tests{RESET}")
     print(f"  clang: {clang}")
     print(f"  lld  : {lld}")
+    # One line per DISTINCT emulator, in first-use order. This header names the
+    # TOOLS a run used, and two profiles of one architecture use one binary —
+    # riscv32 and riscv32-flat are the same `qemu-system-riscv32` (sawos design
+    # 35). Printing it twice would say there were two. Deduplicating also leaves
+    # this header byte-identical to the two-architecture one, which is a fence
+    # design 35 asked for rather than a coincidence worth relying on.
+    seen_qemus = []
     for arch in arches:
-        print(f"  qemu : {qemus[arch['name']]}")
+        binary = qemus[arch["name"]]
+        if binary not in seen_qemus:
+            seen_qemus.append(binary)
+            print(f"  qemu : {binary}")
     print()
 
     # Blade is architecture-neutral (a host binary), so it is built once and

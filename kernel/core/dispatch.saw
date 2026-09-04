@@ -60,6 +60,7 @@ import sosabi.{
     PipeRequestOp,
     EventMode,
     SlabKind,
+    ProtectionTier,
     ClockType,
     MapAccess,
     MAP_ACCESS_MASK,
@@ -426,6 +427,41 @@ func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt, arg1: UInt,
             }
             slab_donate(p, arg0, arg1)
         },
+        // THE SEVENTH OP, AND THE ONLY ONE THAT MERELY ANSWERS (sawos design 35,
+        // M5 unit 4; design 25 D-4). It reads no state, spends no resource,
+        // takes no argument and cannot fail — so there is no helper below to
+        // delegate to, and the whole body is the rights check and the word.
+        //
+        // The tier comes from the HAL, because whether the hardware can DENY is
+        // the one protection fact `kernel/core` cannot know for itself. It
+        // arrives as a `Bool` rather than as this enum: `sosabi` sits ABOVE the
+        // HAL in the dependency order (a board's `lib.saw` imports `sosrt`, not
+        // `sosabi`), so the HAL cannot name `ProtectionTier` and the mapping to
+        // the ABI word belongs here, at the seam that can see both.
+        case TierGet -> {
+            if not obj.allows(SystemRight.TierGet) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            op_value(protection_tier() as UInt)
+        },
+    }
+}
+
+/// WHICH TIER THIS BUILD IS — `hal.prot_isolated()` in the ABI's vocabulary.
+///
+/// A `Bool` is exactly two-valued and the tier word is exactly two words, which
+/// is what makes the HAL's half of this honest to answer with one, beside
+/// `hal.prot_replay_at_switch()` (the other protection fact `kernel/core`
+/// reads). Both are FUNCTIONS rather than `static`s, which is forced rather
+/// than chosen — see SL-25, and the note each board's HAL carries: a
+/// module-level `static` is a name the whole program shares, so a build PROFILE
+/// could not override one. A leaf returning a literal inlines, so this still
+/// folds and the branch is not emitted.
+func protection_tier() -> ProtectionTier {
+    if hal.prot_isolated() {
+        ProtectionTier.Isolated
+    } else {
+        ProtectionTier.Flat
     }
 }
 
