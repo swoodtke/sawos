@@ -512,6 +512,33 @@ widened.
    RHS names its own root; two shared reads of one root in one call) are
    documented as legal and are. Current highest entry remains SL-24.
 
+## Located for unit 8, not edited (the brief's out-of-scope duty)
+
+spec.md prose this unit makes stale, found and left alone so the docs sweep owns
+one edit rather than two:
+
+- **§2's Process table row, `spec.md:46`** — three clauses. "The check therefore
+  scans the handle tables (**bounded: `MAX_PROCESSES` × `MAX_HANDLES`**)": that
+  product is no longer the bound, since the tables are per-slot fields and the
+  scan walks the CHAIN. "**`MAX_PROCESSES` consequently bounds CONCURRENT
+  processes again**": true of a non-donating machine and now the FLOOR, with
+  `min(capacity, hal.PROT_DOMAIN_SLOTS)` the real bound. And M4 unit 5's "the
+  bump is `MAX_PROCESSES` and NOTHING ELSE — **every per-process table was
+  already indexed rather than assumed**, `MAX_ATTACHMENTS` derives": still true,
+  and now true for a second reason worth the sweep's attention — those tables are
+  no longer separate arrays to index at all.
+- **`spec.md:2579`** — "at `alloc_process`, so `MAX_PROCESSES` bounds CONCURRENT
+  processes": the same floor/ceiling correction, in §8's voice.
+- **`spec.md:3044`** — "one number (`MAX_PROCESSES` = 3)": still the compiled
+  number, no longer the only one that decides.
+- **`spec.md:2466`** — "bounded by `MAX_ATTACHMENTS` rather than by a quota":
+  unchanged in meaning; `MAX_ATTACHMENTS` is a floor now, and `Attachments` is
+  itself donatable, so the sentence wants the same one-clause rider
+  `kcore.limits` just gained.
+
+§12's capacity sentences were searched for and the ones that name a number are
+the four above; nothing in §12 states a process capacity independently of them.
+
 ## Seeds filed
 
 - **The `MAX_HANDLES` naming ceiling** — recorded here as the brief asks, and NOT
