@@ -421,9 +421,103 @@ public static MAX_ROOT_SEGMENTS: UInt = 8
 /// Root's region on this board. The base is 2 MiB into RAM — the same offset
 /// Profile A uses, and here it is also a level-2 boundary, so root's pages come
 /// out of the grant window whole. Mirrored by the root linker script.
+///
+/// **`ROOT_LOAD_BASE` IS NOW THE PHYSICAL DESTINATION AND NOTHING ELSE** (sawos
+/// design 33). It used to be both — where root's bytes go AND the address root
+/// sees them at — because the two were the same number. Under placement the
+/// second half is `USER_IMAGE_BASE` below, and root is the one process for which
+/// the two still coincide.
 public static ROOT_LOAD_BASE: UInt = 0x4020_0000
 public static ROOT_REGION_TOP: UInt = 0x4024_0000
 public static ROOT_STACK_LEN: UInt = 0x4000
+
+// =============================================================================
+// PLACEMENT: the two seams that decide a user address (sawos design 33)
+// =============================================================================
+//
+// **ON THIS TIER A USER ADDRESS IS THE KERNEL'S ANSWER.** Every process image
+// links at ONE canonical base and loads wherever the allocator put its frames;
+// a `map` lands where a per-process cursor says. Both facts are expressed as
+// FUNCTIONS rather than as a tier flag the kernel branches on, because the
+// other tier's answer is the IDENTITY — an image links where it loads, a
+// mapping lands at its own physical address — and an identity body compiles to
+// nothing. That is design 19's doctrine at the one place M5 unit 2 needed it:
+// the difference is ADVERTISED by each HAL stating its own answer, never faked,
+// and `kernel/core` spells one sequence for both tiers (design 29's
+// `phys_to_virt` pair is the same shape and the same argument).
+//
+// SO §5.5's IDENTITY LAW RE-SCOPES HERE, and this is the file that says so
+// first: "an address is the same number in every process" is the TIER-2 answer,
+// which `hal/riscv32-common` still gives verbatim. Unit 8 owns the spec prose.
+
+/// **THE ONE VIRTUAL BASE EVERY USER IMAGE ON THIS BOARD IS LINKED AT** (sawos
+/// design 33).
+///
+/// Root, a child and a grandchild all see their own image here, because each
+/// runs under its own translation-table set and the low half belongs entirely to
+/// whichever process is current (design 29 freed it). What differs between them
+/// is the PHYSICAL frames the identical virtual range resolves to, and that is
+/// the allocator's answer rather than the linker's.
+///
+/// It is `ROOT_LOAD_BASE`'s value on purpose: root's image is placed at a HAL
+/// constant by the boot door, so keeping the canonical link base equal to it
+/// leaves root's own numbers exactly where every earlier milestone put them —
+/// which is what keeps the boot transcript's `entry=` row from moving.
+///
+/// Mirrored by `hal/arm64/user/user.ld`, the ONE user linker script this board
+/// now has. Nothing at build time can compare the two (a Saw static's value is
+/// not a linker symbol — design 29 finding 5), so the loader's own
+/// `check_segment` is what catches a script that disagrees, and it catches it
+/// with a named diagnostic rather than a silent misplacement.
+public static USER_IMAGE_BASE: UInt = 0x4020_0000
+
+/// **THE VIRTUAL BASE AN IMAGE LOADING AT PHYSICAL `dest_base` IS LINKED AT.**
+///
+/// The canonical base, whatever the frames are: that is the whole of placement's
+/// image half. `dest_base` is ignored HERE and is the ANSWER on the MPU tier,
+/// which is why the seam takes it — an identity body needs the argument, and a
+/// constant that ignored it would have forced a tier conditional upstairs.
+public func image_link_base(dest_base: UInt) -> UInt {
+    USER_IMAGE_BASE
+}
+
+/// **WHERE A `map` OF PHYSICAL `pa` LANDS IN A PROCESS WHOSE MAP CURSOR STANDS
+/// AT `cursor`.**
+///
+/// RAM takes the cursor — the address is the kernel's answer, and the caller
+/// held no opinion (design 25 ruling 1: `map` takes no VA hint on any tier).
+///
+/// **A DEVICE WINDOW TAKES ITS OWN ADDRESS, AND THAT IS A STATEMENT ABOUT THIS
+/// BOARD RATHER THAN A LIMITATION OF THE SEAM.** MMIO lives in a level-3 window
+/// of its own here (`DEVICE_WINDOW_BASE`, one 2 MiB span), indexed by the
+/// hardware address, and the addresses in it are the ones the board's region
+/// table publishes — so placing a register block somewhere else in that window
+/// would buy a driver nothing and cost the window a second cursor. Recorded as a
+/// deliberate v1 limit: a translating tier COULD place MMIO, and this one does
+/// not.
+public func map_place(cursor: UInt, pa: UInt, device: Bool) -> UInt {
+    if device {
+        return pa
+    }
+    cursor
+}
+
+/// **MAY `[base, top)` BE HANDED TO A USER DOMAIN AS PHYSICAL BACKING?** — the
+/// other half of `map_target_ok`, which since design 33 asks only about the
+/// VIRTUAL range.
+///
+/// The two questions came apart when the two addresses did. A descriptor's
+/// output address may be any frame the linear map covers, so the physical bound
+/// is RAM; the INPUT range is what has to fit the 4 MiB grant window, because
+/// that is the level-3 table's own span. Before placement one predicate answered
+/// both because there was one address.
+///
+/// On the MPU tier the two predicates have the same body, and that is the tier
+/// split visible in one file: where a user address IS its physical address, the
+/// virtual question and the physical question are one question asked twice.
+public func map_source_ok(base: UInt, top: UInt) -> Bool {
+    base < top && base >= RAM_BASE && top <= RAM_BASE + RAM_LEN
+}
 
 /// The ONE device window this board offers a process (design 178's finale
 /// constraint 3, ruled Aug 16, user): the console UART's page.
@@ -473,6 +567,12 @@ public static GRANT_ROW_BUDGET: UInt = 9
 /// that begins mid-page grants the whole page. What is required is that every
 /// page the walk would touch is inside the window — which is what the top bound
 /// tests, since the walk stops at `top`.
+///
+/// **SINCE PLACEMENT IT ASKS ABOUT THE VIRTUAL RANGE ONLY** (sawos design 33),
+/// and that is not a widening of the question but a splitting of it: the window
+/// is a level-3 TABLE, so what has to fit inside it is what INDEXES it, which is
+/// the input address. The physical half moved to `map_source_ok` above. The body
+/// did not change; what changed is which number `install_row` hands it.
 public func map_target_ok(base: UInt, top: UInt) -> Bool {
     base < top && base >= RAM_BASE && top <= RAM_BASE + (GRANT_PAGES << PAGE_SHIFT)
 }
@@ -1471,16 +1571,30 @@ public func prot_reset() unsafe {
 /// it.) `PXN` is the one thing added unconditionally: the kernel must not
 /// execute user memory even by accident, which is a guarantee Profile A's
 /// unconstrained M-mode cannot make.
+/// **THE LEGACY REPLAY ENTRY GRANTS IDENTITY, and that is what its callers
+/// mean** (sawos design 33). The six harness kernels in `tests/` program this
+/// surface directly with ranges that are addresses-as-they-are — they hold no
+/// grant record and no image was placed for them — so the physical output is the
+/// input. `prot_update` below is the door placement actually goes through.
 public func prot_region(idx: UInt, base: UInt, top: UInt, perms: UInt8) unsafe {
-    install_region(tables_base() + LEVEL3_OFFSET, base, top, perms)
+    install_region(tables_base() + LEVEL3_OFFSET, base, top, base, perms)
 }
 
-/// Grant `[base, top)` with `perms` in the level-3 window at `level3`.
+/// Grant the pages of `[base, top)` with `perms` in the level-3 window at
+/// `level3`, translating to physical `pa`.
 ///
 /// The walk `prot_region` and `prot_update` share: one takes the LIVE set's
 /// window, the other any process's, and neither wants a second copy of the
 /// bounds checks or the attribute assembly.
-func install_region(level3: UInt, base: UInt, top: UInt, perms: UInt8) unsafe {
+///
+/// **`base`..`top` IS THE INPUT RANGE AND `pa` IS THE OUTPUT BASE** (sawos
+/// design 33) — the two halves a translation descriptor has always had, now
+/// carrying two different numbers. Both ends round DOWN to their own page for
+/// the same reason the input always did, which keeps the offset between them
+/// exact: the two are page-aligned together or misaligned together, because
+/// every placement in this kernel is affine at page granularity.
+func install_region(level3: UInt, base: UInt, top: UInt, pa: UInt,
+                    perms: UInt8) unsafe {
     var attrs = (DESC_VALID | DESC_PAGE | MemoryType.Normal.attr_index() | ATTR_AF
                  | ATTR_SH_INNER | ATTR_NG | ATTR_PXN)
     if (perms & (SegFlag.Write as UInt8)) != 0 {
@@ -1495,7 +1609,9 @@ func install_region(level3: UInt, base: UInt, top: UInt, perms: UInt8) unsafe {
     // index: `va - RAM_BASE` underflows below the base, and overflow checks are
     // always on, so the order is what turns a bad map into a diagnostic rather
     // than into a panic from inside the protection primitive.
-    var va = base - (base & (PAGE_SIZE - 1))
+    let va_start = base - (base & (PAGE_SIZE - 1))
+    let pa_start = pa - (pa & (PAGE_SIZE - 1))
+    var va = va_start
     while va < top {
         if va < RAM_BASE {
             grant_outside_window(va)
@@ -1504,7 +1620,7 @@ func install_region(level3: UInt, base: UInt, top: UInt, perms: UInt8) unsafe {
         if page >= GRANT_PAGES {
             grant_outside_window(va)
         }
-        put_desc(level3, page, (va as UInt64) | attrs)
+        put_desc(level3, page, ((pa_start + (va - va_start)) as UInt64) | attrs)
         va = va + PAGE_SIZE
     }
 }
@@ -1630,7 +1746,18 @@ public func prot_switch(p: UInt) unsafe {
 /// window resets to. So `perms` is read here only to answer grant-or-revoke,
 /// never to shade a device grant, and the two windows' revoke arms differ only
 /// in which table and which index the zero lands in.
-public func prot_update(p: UInt, base: UInt, top: UInt, perms: UInt8,
+///
+/// **`base`..`top` IS THE USER'S VIRTUAL RANGE AND `pa` IS WHAT IT TRANSLATES
+/// TO** (sawos design 33). Until placement the seam carried one number twice
+/// over; now the input range selects the descriptors and `pa` is the output
+/// address written into them. The REVOKE arm reads only the virtual half, which
+/// is right: removing a translation is a statement about which addresses stop
+/// resolving, and what they used to resolve to has stopped mattering.
+///
+/// The DEVICE arm ignores `pa` because `map_place` answered `pa` for it — a
+/// register block is mapped at the address the board publishes, so its two
+/// halves are still one number here. Said at `map_place`, where the choice is.
+public func prot_update(p: UInt, base: UInt, top: UInt, pa: UInt, perms: UInt8,
                         device: Bool) unsafe {
     let level1 = set_base(p)
     if perms == 0 {
@@ -1649,7 +1776,7 @@ public func prot_update(p: UInt, base: UInt, top: UInt, perms: UInt8,
     } else if device {
         install_device(level1 + DEVICE_LEVEL3_OFFSET, base, top - base)
     } else {
-        install_region(level1 + LEVEL3_OFFSET, base, top, perms)
+        install_region(level1 + LEVEL3_OFFSET, base, top, pa, perms)
     }
     invalidate_domain(p)
 }

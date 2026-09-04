@@ -276,6 +276,7 @@ import kcore.process.{
     copy_out,
     copy_out_check,
     domain_changed,
+    free_user_va,
     record_grant,
     remove_grant,
 }
@@ -915,8 +916,14 @@ func process_create(p: Int, image_handle: UInt,
     // ONE STACK LENGTH SERVES BOTH PROCESSES in v1 (sawos design 2 D-4). A
     // per-create length is unit 4/5 vocabulary — it is a quota question, and
     // inventing an argument for it now would be an ABI to keep.
+    // **THE FRAMES ARE THE CALLER'S AND THE ADDRESS IS THE KERNEL'S** (sawos
+    // design 33). Root still supplies two capabilities and no numbers; what the
+    // kernel adds is where the child will SEE the region it was given, which on
+    // a translating tier is the one canonical link base every image shares and
+    // on an identity tier is the destination itself.
     let dest = LoadRegion(base: dst_base, top: dst_base + dst_len,
-                          stack_len: hal.ROOT_STACK_LEN)
+                          stack_len: hal.ROOT_STACK_LEN,
+                          link_base: hal.image_link_base(dst_base))
     if let _ = validate_image(img_base, img_len, &dest, false) {
         return op_status(SosStatus.BadImage)
     }
@@ -957,11 +964,17 @@ func process_create(p: Int, image_handle: UInt,
     // `Start`, and a child that was given nothing is still the ruled
     // "legal-but-doomed" sandboxed compute process, which is a FEATURE.
     PROCESSES[slot].entry = image_entry(img_base)
-    PROCESSES[slot].stack_top = dest.top
-    PROCESSES[slot].region_base = dest.base
-    PROCESSES[slot].region_top = dest.top
+    // **EVERY ADDRESS ON A PROCESS SLOT IS A USER ADDRESS** (sawos design 33),
+    // which is what these four lines now say out loud: the entry goes into a
+    // program counter, the stack top into a stack pointer, and the two windows
+    // are what the copy doors check a process's own buffers against. The frames
+    // behind them live in the grant rows, which is the one place both halves
+    // are written down.
+    PROCESSES[slot].stack_top = dest.link_top()
+    PROCESSES[slot].region_base = dest.link_base
+    PROCESSES[slot].region_top = dest.link_top()
     PROCESSES[slot].rw_base = rw_base
-    PROCESSES[slot].rw_top = dest.top
+    PROCESSES[slot].rw_top = dest.link_top()
     PROCESSES[slot].exit_kind = ProcessStatusKind.Running
     PROCESSES[slot].exit_code = 0
     // THE LAUNCHER'S HANDLE IS THE CHILD'S FIRST REFERENCE, and it is the one
@@ -2549,6 +2562,36 @@ func install_row(p: Int, t: Int, base: UInt, top: UInt, perms: UInt8,
         // reaches this line.
         return op_status(SosStatus.NoResource)
     }
+    // **THE ADDRESS IS CHOSEN HERE, AND IT IS CHOSEN BEFORE ANYTHING IS
+    // ALLOCATED** (sawos design 33). `base`/`top` arrive PHYSICAL — a region's
+    // own frames, or a device window's registers — and the target's virtual
+    // range is the kernel's answer: `free_user_va` proposes the lowest unclaimed
+    // address above the target's image, `hal.map_place` decides whether that
+    // proposal is the answer (translating tier) or whether the physical address
+    // is (identity tier, and every device row on both).
+    //
+    // **NO VA HINT, ON ANY TIER** — design 25 ruling 1. The caller passed no
+    // address and there is nowhere in this signature for one; that is the whole
+    // of "the address is the answer" as a mechanism rather than a slogan.
+    //
+    // Placed ahead of `alloc_mapping` and `mint_handle` so that a refusal
+    // leaks neither: the all-or-nothing shape the comment below names, extended
+    // to the one refusal placement can raise.
+    let span = top - base
+    let va_base = hal.map_place(free_user_va(t, span), base, device)
+    if span > UInt.max - va_base {
+        return op_status(SosStatus.NoResource)
+    }
+    let va_top = va_base + span
+    // **RUNNING OUT OF ADDRESS SPACE IS `NoResource`, NOT `BadArg`.** The caller
+    // chose no address, so it cannot have chosen a bad one — what it met is a
+    // machine that has no room left in this domain's window, which is exactly
+    // the vocabulary `NoResource` carries everywhere else. A device row is not
+    // asked: its window is the board's, and `device_window_ok` answered for it
+    // at the op that named the bounds.
+    if not device && not hal.map_target_ok(va_base, va_top) {
+        return op_status(SosStatus.NoResource)
+    }
     let slot = alloc_mapping()
     if slot == NO_MAPPING {
         return op_status(SosStatus.NoResource)
@@ -2561,7 +2604,7 @@ func install_row(p: Int, t: Int, base: UInt, top: UInt, perms: UInt8,
     // all-or-nothing shape, and here it matters more: a half-installed row is a
     // protection domain that disagrees with its own record.
     let row = PROCESSES[t].grant_count
-    record_grant(t, base, top, perms, device, region)
+    record_grant(t, va_base, va_top, base, perms, device, region)
     MAPPINGS[slot] = MappingSlot(state: SlotState.Live, process: p, target: t,
                                  row: row, refs: 1)
     quota_charge(t, QuotaKind.Mapping)
@@ -2709,7 +2752,13 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
             // range a PROCESS chose. So a map asks first and faults with
             // `BadArg`, and the HAL's kernel-bug stop stays for the path it was
             // written for.
-            if not hal.map_target_ok(base, top) {
+            // **THE PHYSICAL HALF OF THE OLD QUESTION** (sawos design 33).
+            // This predicate used to answer both — there was one address — and
+            // placement split it: here the range is the region's own FRAMES, so
+            // what is asked is whether the board can hand them to a user domain
+            // at all. The VIRTUAL half moved to `install_row`, which is the
+            // first place the answer exists.
+            if not hal.map_source_ok(base, top) {
                 fault_process(p, FaultReason.BadArg)
             }
             install_row(p, t, base, top, grant_perms(access), false, obj.slot)
@@ -2877,6 +2926,38 @@ func mapping_op_decoded(op: MappingOp, obj: &MappingObject,
             compact_mapping_rows(t, row)
             domain_changed(t)
             op_ok()
+        },
+        // **WHERE THE ROW IS, IN THE TARGET'S OWN ADDRESSES** (sawos design 33).
+        //
+        // The answer M5 unit 2 owes userspace. Before placement a program could
+        // compute its own mapping's address from build-time config, because the
+        // address was the region's; now the kernel chooses it and this is the
+        // only way to find out. `MemoryOp.Map`'s return shape is unchanged — it
+        // still answers a Mapping handle, because the capability is what a
+        // caller must not lose — and the address hangs off the object that owns
+        // the row, which is where §2.5 already put every other fact about it.
+        //
+        // THE TWO REFUSALS ARE `Unmap`'s, VERBATIM AND FOR ITS REASONS: a freed
+        // slot and a `NO_ROW` husk are both "this object is not in a state to do
+        // that", and the second covers both a second unmap and a target process
+        // that has died taking its whole domain with it. A husk that answered an
+        // address would be answering about a row that is not installed anywhere.
+        case Base -> {
+            if not obj.allows(MappingRight.Base) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            match MAPPINGS[obj.slot].state {
+                case Live -> {},
+                case Free -> fault_process(p, FaultReason.BadState),
+            }
+            let row = MAPPINGS[obj.slot].row
+            if row == NO_ROW {
+                fault_process(p, FaultReason.BadState)
+            }
+            // The RECORD is what is read, not the hardware: the grant record is
+            // authoritative on every tier (design 25 D-2), and the row's user
+            // base is the number the target's own instructions will issue.
+            op_value(PROCESSES[MAPPINGS[obj.slot].target].grants[row].base)
         },
     }
 }

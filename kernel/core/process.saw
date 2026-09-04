@@ -39,7 +39,7 @@ import kcore.limits.{
     NO_PROCESS,
     ROOT_PROCESS,
 }
-import kcore.mem.{copy_bytes, word_bytes}
+import kcore.mem.{align_up, copy_bytes, word_bytes}
 import kcore.diag.{console, fatal_image}
 import kcore.objects.{
     IOMEMORIES,
@@ -92,9 +92,23 @@ public(package) enum ProcessState: UInt8 {
 /// per-profile field: what a permission bit does to the machine is the HAL's,
 /// and this record's job is only to say the same thing twice — once when the
 /// grant is made and once when the scheduler puts it back.
+///
+/// **AND SINCE M5 UNIT 2 A ROW HAS TWO ADDRESSES** (sawos design 33). `base` and
+/// `top` are the USER's range — the numbers the process itself issues — and `pa`
+/// is the PHYSICAL base that `base` translates to. Until placement they were one
+/// number written twice, and every tier still says so except the translating
+/// one: `hal.map_place` and `hal.image_link_base` answer the physical address on
+/// the MPU tier, and `hal.prot_update` asserts there that `pa == base`.
+///
+/// The mapping is AFFINE over the row: the physical address of a user address
+/// `va` inside it is `pa + (va - base)`, which is what `translate_user` below
+/// computes and what a translating HAL's own walk installs. A row is the largest
+/// unit over which that holds, which is exactly why the copy funnels resolve
+/// against ONE row rather than against a span of them.
 public(package) struct GrantRow {
     public(package) base: UInt,
     public(package) top: UInt,
+    public(package) pa: UInt,
     public(package) perms: UInt8,
     public(package) device: Bool,
     /// WHICH `Memory` REGION these bytes are, or `NO_MEMORY` (sawos design 28).
@@ -252,7 +266,8 @@ public(package) unsafe static var PROCESSES: [ProcessSlot; MAX_PROCESSES] = [
     ProcessSlot(state: ProcessState.Free, entry: 0,
              stack_top: 0, region_base: 0, region_top: 0, rw_base: 0, rw_top: 0,
              grant_count: 0,
-             grants: [GrantRow(base: 0, top: 0, perms: 0, device: false,
+             grants: [GrantRow(base: 0, top: 0, pa: 0, perms: 0,
+                               device: false,
                                region: NO_MEMORY);
                       MAX_GRANT_ROWS],
              exit_kind: ProcessStatusKind.Running, exit_code: 0,
@@ -361,14 +376,22 @@ public(package) func reclaim_process_slot(slot: Int) unsafe {
 /// `region` is `NO_MEMORY` for every row that is not one — image segments, the
 /// stack grant, device windows — and `ref_region_row` takes that arm, which is
 /// what lets all five callers pass their answer unconditionally.
-public(package) func record_grant(p: Int, base: UInt, top: UInt, perms: UInt8,
+///
+/// **`base`/`top` ARE THE USER'S RANGE AND `pa` IS ITS PHYSICAL BASE** (sawos
+/// design 33). Every caller supplies both because every caller knows both: the
+/// loader computes the destination frame from the region it was handed, and
+/// `install_row` asks `hal.map_place` where the row lands. On a tier that does
+/// not translate the two are the same number, which `hal.prot_update` asserts
+/// there rather than trusting.
+public(package) func record_grant(p: Int, base: UInt, top: UInt, pa: UInt,
+                                  perms: UInt8,
                                   device: Bool, region: Int) unsafe {
     if PROCESSES[p].grant_count >= MAX_GRANT_ROWS {
         fatal_image("more grants than a process's record can hold",
                     PROCESSES[p].grant_count as UInt)
     }
     let n = PROCESSES[p].grant_count
-    PROCESSES[p].grants[n] = GrantRow(base: base, top: top,
+    PROCESSES[p].grants[n] = GrantRow(base: base, top: top, pa: pa,
                                       perms: perms, device: device,
                                       region: region)
     PROCESSES[p].grant_count = n + 1
@@ -390,7 +413,114 @@ public(package) func record_grant(p: Int, base: UInt, top: UInt, perms: UInt8,
     // segment must be readable or executable, and `map_access` refuses a row
     // that permits nothing — which is what leaves zero free to mean the
     // revocation `remove_grant` spells below.
-    hal.prot_update(p as UInt, base, top, perms, device)
+    hal.prot_update(p as UInt, base, top, pa, perms, device)
+}
+
+/// **WHERE THE NEXT MAPPING OF `len` BYTES GOES IN `p`'s ADDRESS SPACE** — the
+/// kernel's VA policy, in one function (sawos design 33).
+///
+/// **FIRST FIT AT OR ABOVE THE IMAGE REGION'S TOP, over the rows `p` already
+/// has.** The floor is `region_top` because everything below it is the image and
+/// its stack, which the linker placed and the loader recorded; above it is space
+/// no one has claimed. Device rows are skipped: they live in a window of their
+/// own and never contend with RAM for an address.
+///
+/// **THE BRIEF PROPOSED A MONOTONIC CURSOR AND THE SUITE REFUSED IT**, which is
+/// worth recording where the policy is rather than only in the design record.
+/// A cursor that only ever rises never reuses an address, which is the safer
+/// story — a stale pointer into an unmapped region keeps faulting forever. But
+/// two existing cases need the address back: `mapping_slot_free` maps and
+/// unmaps thirteen times and then expects the fourteenth mapping of a re-split
+/// range to answer at the address the thirteenth wrote, and `memory_split`
+/// expects two consecutive splits at two consecutive addresses. Both are
+/// statements about RECYCLING, which is what M5 unit 5 built underneath, and a
+/// virtual address that never came back would have made the physical recycling
+/// unobservable. So first fit it is, and the cost is named: **an address freed
+/// by `unmap` may be handed to a later mapping of different bytes**, so a
+/// program that keeps a pointer past its own `unmap` can reach a stranger's
+/// memory instead of faulting. That is the same hazard `mapping_slot_free`
+/// already documents one level down for the physical range, and closing it
+/// wants a generation or a quarantine that v1 does not have.
+///
+/// AUDIT (design 1): NO POINT, and it is provably short — at most
+/// `grant_count + 1` passes over at most `MAX_GRANT_ROWS` rows, because every
+/// pass that changes anything moves `va` above one more row's top and there are
+/// only so many rows.
+///
+/// The answer is not checked against the tier's window here: `install_row` asks
+/// `hal.map_target_ok` about the range this returns, which is the one place a
+/// refusal has somewhere to go.
+public(package) func free_user_va(p: Int, len: UInt) unsafe -> UInt {
+    var va = PROCESSES[p].region_top
+    var pass: Int = 0
+    while pass <= PROCESSES[p].grant_count {
+        // Asked before the addition that computes the candidate's top, for the
+        // loader's own reason: overflow checks are always on, so a length that
+        // would run off the end of the address space has to become a refusal
+        // upstairs rather than a panic in here. `install_row`'s window check is
+        // what refuses it.
+        if len > UInt.max - va {
+            return va
+        }
+        var bumped = false
+        var i: Int = 0
+        while i < PROCESSES[p].grant_count {
+            let row = PROCESSES[p].grants[i]
+            if not row.device && va < row.top && row.base < va + len {
+                va = align_up(row.top, hal.PROT_GRAIN)
+                bumped = true
+            }
+            i = i + 1
+        }
+        if not bumped {
+            return va
+        }
+        pass = pass + 1
+    }
+    va
+}
+
+/// **RESOLVE A USER ADDRESS TO THE PHYSICAL ONE IT NAMES IN `p`'s DOMAIN**, or
+/// say why it names nothing (sawos design 33).
+///
+/// This is the shape design 29 said would exist ahead of need, now real: walk
+/// the TARGET's grant records for the row covering `va`, then let the caller
+/// dereference through the linear map. Bounded by `MAX_GRANT_ROWS`, which is
+/// nine — the record is a fixed array and always was.
+///
+/// **THE WHOLE RANGE MUST LIE IN ONE ROW, and that is the honest bound rather
+/// than a convenience.** A row is the largest span over which the user→physical
+/// mapping is affine (`GrantRow`), so a copy that crossed a row boundary would
+/// need two translations and could not be one `copy_bytes`. It costs nothing
+/// real: a buffer is a variable in one segment or one mapped region, and no
+/// program in this tree hands the kernel a buffer that straddles two grants.
+///
+/// A DEVICE row is not a candidate. The kernel does not copy through a register
+/// window — `copy_out`'s and `copy_in`'s own windows are the image region, which
+/// is RAM — and a memcpy over device memory would break the access-size
+/// discipline a driver's own reads keep.
+///
+/// **A VA THAT RESOLVES TO NO ROW IS THE FAULT IT ALWAYS WAS** — `BadBuffer`,
+/// the same answer the window checks give, because it is the same mistake: the
+/// process handed the kernel an address it does not own. What is new is that the
+/// question now has a precise answer instead of a conservative span.
+public(package) func translate_user(p: Int, va: UInt,
+                                    bytes: UInt) unsafe -> Result<UInt, FaultReason> {
+    var i: Int = 0
+    while i < PROCESSES[p].grant_count {
+        let row = PROCESSES[p].grants[i]
+        if not row.device && va >= row.base && va < row.top {
+            // Ordered so the subtraction cannot underflow, exactly as the
+            // window checks below order their own: `row.top - va` is computed
+            // only once `va` is known to be inside the row.
+            if bytes > row.top - va {
+                return FaultReason.BadBuffer
+            }
+            return row.pa + (va - row.base)
+        }
+        i = i + 1
+    }
+    FaultReason.BadBuffer
 }
 
 /// Make process `p`'s recorded domain the LIVE one.
@@ -430,10 +560,17 @@ public(package) func load_domain(p: Int) unsafe {
         var i: Int = 0
         while i < PROCESSES[p].grant_count {
             let row = PROCESSES[p].grants[i]
+            // **THE REPLAY PROGRAMS THE PHYSICAL RANGE** (sawos design 33).
+            // A replay tier filters addresses the processor actually issues,
+            // and on such a tier a user address IS its physical address — so
+            // `row.pa` and `row.base` are the same number here and the seam
+            // asserts it. Spelling the PHYSICAL half is what makes the line
+            // say which of the two it means now that a row carries both.
             if row.device {
-                hal.prot_device(i as UInt, row.base, row.top - row.base)
+                hal.prot_device(i as UInt, row.pa, row.top - row.base)
             } else {
-                hal.prot_region(i as UInt, row.base, row.top, row.perms)
+                hal.prot_region(i as UInt, row.pa, row.pa + (row.top - row.base),
+                                row.perms)
             }
             i = i + 1
         }
@@ -492,7 +629,7 @@ public(package) func remove_grant(p: Int, row: Int) unsafe {
     // mapped and simply denied to user mode, so removal is the installation of
     // deny — and zero is available to say so because neither door will record a
     // row that permits nothing.
-    hal.prot_update(p as UInt, gone.base, gone.top, 0, gone.device)
+    hal.prot_update(p as UInt, gone.base, gone.top, gone.pa, 0, gone.device)
     var i = row
     while i + 1 < PROCESSES[p].grant_count {
         PROCESSES[p].grants[i] = PROCESSES[p].grants[i + 1]
@@ -657,6 +794,16 @@ public(package) func copy_out_check(p: Int, dst: UInt, bytes: UInt) unsafe -> Fa
     if bytes > PROCESSES[p].rw_top - dst {
         return FaultReason.BadBuffer
     }
+    // **AND THE ADDRESS MUST ACTUALLY RESOLVE** (sawos design 33). The window
+    // above is the conservative span the pair has always been — it includes the
+    // hole between the image's writable end and the stack — and under placement
+    // the kernel can do better than conservative, because the grant record now
+    // says which user addresses exist and what they translate to. The early
+    // check owes the same answer the copy will get: `pipe_call` validates when
+    // it PARKS and copies at the resume, so a destination that passed here and
+    // failed there would be a kernel invariant broken rather than a caller's
+    // mistake.
+    let _ = try translate_user(p, dst, bytes) catch { return error }
     None
 }
 
@@ -685,7 +832,17 @@ public(package) func copy_out(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe 
     // a record on this frame, which the linker placed wherever the kernel lives.
     // On an MPU tier `phys_to_virt` is the identity and this line is what it
     // always was.
-    copy_bytes(hal.phys_to_virt(dst), src, bytes)
+    // **`dst` IS RESOLVED, NOT ASSUMED** (sawos design 33). It is the
+    // PROCESS's address, and on a translating tier that is a number only the
+    // process's own tables give meaning to — so the kernel asks the record what
+    // it names before it asks the linear map how to reach it. Two lookups,
+    // named separately, because they answer two questions: `translate_user`
+    // says WHICH BYTES, `phys_to_virt` says HOW THE KERNEL TOUCHES THEM.
+    // `src` is already a kernel address: it comes from a `&var` of a record on
+    // this frame, which the linker placed wherever the kernel lives. On an MPU
+    // tier both calls are the identity and this line is what it always was.
+    let pa = try translate_user(p, dst, bytes) catch { return error }
+    copy_bytes(hal.phys_to_virt(pa), src, bytes)
     None
 }
 
@@ -779,6 +936,9 @@ public(package) func copy_in_check(p: Int, src: UInt, bytes: UInt) unsafe -> Fau
     if bytes > PROCESSES[p].region_top - src {
         return FaultReason.BadBuffer
     }
+    // The outbound door's new second half, in the inbound direction and for the
+    // same reason — see `copy_out_check` (sawos design 33).
+    let _ = try translate_user(p, src, bytes) catch { return error }
     None
 }
 
@@ -789,7 +949,12 @@ public(package) func copy_in(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe -
     // The mirror of `copy_out`'s conversion, and the same sentence in the other
     // direction: `src` is the PROCESS's physical address and converts,
     // `dst` is the kernel's own storage and does not. See design 29 there.
-    copy_bytes(dst, hal.phys_to_virt(src), bytes)
+    // The mirror of `copy_out`'s resolution, and the same two questions in the
+    // other direction: `src` is the PROCESS's address and is resolved through
+    // its record then reached through the linear map, `dst` is the kernel's own
+    // storage and is neither. See design 33 there.
+    let pa = try translate_user(p, src, bytes) catch { return error }
+    copy_bytes(dst, hal.phys_to_virt(pa), bytes)
     None
 }
 

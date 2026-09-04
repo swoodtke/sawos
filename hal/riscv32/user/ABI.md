@@ -12,6 +12,17 @@ seam it implements, and none of it changed. What is left in THIS directory is
 the QEMU `virt` board's own user-side linker scripts (`root.ld`, `child.ld`,
 `child2.ld`), which genuinely differ per board because the load addresses do.
 
+**THERE ARE STILL THREE OF THEM, AND SINCE sawos design 33 THAT IS A CLAIM
+RATHER THAN AN ACCIDENT.** This profile does not translate, so a user address IS
+its physical address and two resident images cannot share a base — each process
+must be linked where its own frames are. The arm64 board collapsed its three
+scripts into one `user.ld` in the same unit, because there the kernel places each
+image's frames under a canonical virtual base. Design 25 ruling 11 punted the
+riscv Sv32 climb to the backlog deliberately so that this board keeps giving
+§5.5's original answer — "an address is the same number in every process" — every
+gate run. So the two directories, side by side, ARE the tier split: three scripts
+here, one there.
+
 Design 172 part 2 shrank this from four symbols to one. The three that left —
 `sos_set_system_handle`, `sos_rt_write` and `sos_rt_abort` — named no
 architecture: a byte reaches the console through a System op, which is the same

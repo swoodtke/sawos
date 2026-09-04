@@ -1,11 +1,17 @@
 //! MAPPING — one installed protection row, with a handle on it (spec §2.5;
 //! sawos design 6 D-1/D-3).
 //!
-//! **A MAPPING IS AN INSTALLED GRANT ROW.** SOS does not translate (spec §5.5:
-//! an address is the same number in every process), so §2.5's "installed
-//! virtual placement" has no virtual half here — what a Mapping records is
-//! which process's domain carries the row and which row it is, and the address
-//! is the region's own.
+//! **A MAPPING IS AN INSTALLED GRANT ROW.**
+//!
+//! **AND SINCE M5 UNIT 2 IT HAS A VIRTUAL HALF** (sawos design 33). This header
+//! used to say SOS does not translate and that §2.5's "installed virtual
+//! placement" therefore had none — true of every tier until arm64 grew
+//! per-process page tables, and still true of the tiers that stayed. What a
+//! Mapping records is which process's domain carries the row and which row it
+//! is; `base()` below is how a program reads the address that row was placed at,
+//! and on a tier that does not translate the answer is the region's own address,
+//! which is that tier's answer rather than a missing one. §5.5's identity law
+//! re-scopes with it — unit 8 owns the spec prose.
 //!
 //! **ONLY A MAPPING UNMAPS** (§2.5), which is the object's whole reason to
 //! exist. That is why `Process.map` answers with one instead of returning a
@@ -14,9 +20,9 @@
 //!
 //! It names only the floor, so `sos.system` — which produces one — can name it.
 
-import sosabi.{SosStatus, MappingHandle, NO_HANDLE}
+import sosabi.{SosStatus, MappingHandle, MappingOp, NO_HANDLE}
 
-import sos.floor.{checked, sos_handle_release, sos_mapping_unmap}
+import sos.floor.{call_value, checked, sos_handle_release, sos_mapping_unmap}
 
 /// A handle to a Mapping — one protection row, installed.
 ///
@@ -86,5 +92,30 @@ extension Mapping {
     /// here, only a row leaving a record.
     public func unmap(&self) -> Result<Void, SosStatus> {
         checked(sos_mapping_unmap(self.handle))
+    }
+
+    /// **WHERE THIS MAPPING IS.** Requires `MappingRight.Base`.
+    ///
+    /// **THE ADDRESS IS THE ANSWER, AND THIS IS WHERE IT IS ANSWERED** (sawos
+    /// design 33; design 25 ruling 1). A caller supplies no address to `map` on
+    /// any tier — a hint is an opinion no tier could honor uniformly — so the
+    /// kernel chooses, and a program treats what comes back as DATA. That is
+    /// design 19's portable idiom, and until this method existed the tree had no
+    /// way to write it: `map` answers a capability, a `Memory` has no bounds
+    /// reader, and the address had to come from a build-time constant that only
+    /// happened to be right while user addresses were physical ones.
+    ///
+    /// The number is a USER address in the TARGET's address space — which is the
+    /// caller's own when a process maps into itself, and the child's when a
+    /// launcher maps into a child. Two processes holding two Mappings of ONE
+    /// region may legitimately get two different answers; on a tier that does
+    /// not translate they get the same one, and neither is a fact a portable
+    /// program should assume.
+    ///
+    /// Asking an already-unmapped Mapping, or one whose target has died, ends
+    /// the caller with `BadState` — `unmap`'s own two refusals, since it is the
+    /// same husk in both cases.
+    public func base(&self) -> Result<UInt, SosStatus> {
+        call_value(self.handle, MappingOp.Base as UInt, 0, 0, 0)
     }
 }

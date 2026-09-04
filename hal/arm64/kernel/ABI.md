@@ -46,10 +46,26 @@ HAL number rather than a shared constant:
 |---|---|
 | `GRANT_ROW_BUDGET: UInt` | **A POLICY CAP, NOT A HARDWARE ONE.** There are no numbered regions to run out of — a grant is a walk of page descriptors — so what bounds a domain is the kernel's fixed-size grant RECORD, and this restates its length (`kcore.limits.MAX_GRANT_ROWS`, 9) as a HAL fact. On Profile A the same name is the PHYSICAL wall. A `map()` meeting either answers `NoResource`; the difference is what a later unit would have to change to raise it. |
 | `map_target_ok(base, top) -> Bool` | **THE 4 MiB GRANT WINDOW, ASKED RATHER THAN DIED IN.** `prot_region` already enforces this bound and enforces it by STOPPING THE MACHINE (`grant_outside_window`) — correct for the loader path, where a memory map that outgrew the window is a kernel bug, and wrong for a map, where the range came from a region a PROCESS chose. The predicate moves that refusal to the op as a caller-visible `BadArg`, and the HAL's kernel-bug stop stays for the path it was written for. Page alignment of `base` is NOT required: the walk rounds down to the page it starts in, exactly as it does for a segment. |
+| `map_source_ok(base, top) -> Bool` | **THE OTHER HALF OF THE QUESTION ABOVE, SINCE sawos design 33.** Placement split one predicate into two because it split one address into two: `map_target_ok` asks about the range that INDEXES the level-3 table (the input, which must fit the 4 MiB window) and this asks about the FRAMES a descriptor's output address names (which must be RAM the linear map covers, 128 MiB). On both riscv32 boards the two have the same body — where a user address IS its physical address there is only one question — and that identity is the tier split visible in a single file. |
 | `device_window_ok(base, len) -> Bool` | Whole pages, both ends, inside the one device window this board publishes a level-3 table for. Profile A's rule differs in FORM (a naturally-aligned power of two, because a window there is ONE protection entry) and is identical in purpose, which is what makes the predicate per-HAL rather than a shared check with two branches. |
 
-**sawos design 29 added a PAIR to that shared table, and this profile is the
-only one where it does anything:**
+**sawos design 33 added a SECOND PAIR, and this is the profile whose answers are
+not the identity — placement, expressed as two functions rather than as a tier
+flag the kernel branches on:**
+
+| Name | What it means HERE |
+|---|---|
+| `USER_IMAGE_BASE: UInt` | `0x4020_0000`. **THE ONE VIRTUAL BASE EVERY USER IMAGE ON THIS BOARD IS LINKED AT**, mirrored by `hal/arm64/user/user.ld` — the single user linker script that replaced `root.ld` / `child.ld` / `child2.ld`. Root, a child and a grandchild all see their own image here, because each runs under its own table set and design 29 gave the whole low half to whichever process is current. Its value equals `ROOT_LOAD_BASE` on purpose, which is what keeps root's `entry=` console row where every earlier milestone put it. Nothing at build time can compare it with the linker script (a Saw static's value is not a linker symbol); the loader's `check_segment` is what catches a disagreement, with a named diagnostic. |
+| `image_link_base(dest_base) -> UInt` | `USER_IMAGE_BASE`, whatever the frames are. `dest_base` is ignored here and is the ANSWER on the MPU tier — the seam takes it so that an identity body has an argument to return and the kernel needs no tier conditional. |
+| `map_place(cursor, pa, device) -> UInt` | `cursor` for RAM: the address is the kernel's answer, and `map` takes NO VA hint on any tier (design 25 ruling 1). `pa` for a DEVICE row, and that is a statement about this board rather than a limitation of the seam — MMIO lives in a level-3 window of its own indexed by the hardware address, and the addresses in it are the ones the board's region table publishes. A translating tier COULD place MMIO; this one does not, recorded as a deliberate v1 limit. |
+
+The `cursor` it is handed is `kcore.process.free_user_va`'s answer: first fit at
+or above the target's own region top, over the rows that target already has.
+That policy is the KERNEL's and is stated there, not here — this seam only says
+whether the board uses it.
+
+**sawos design 29 added an earlier PAIR to that shared table, and this profile is
+the only one where it does anything:**
 
 | Name | What it means HERE |
 |---|---|

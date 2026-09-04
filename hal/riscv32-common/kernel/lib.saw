@@ -180,6 +180,46 @@ public func virt_to_phys(va: UInt) -> UInt {
 }
 
 // =============================================================================
+// PLACEMENT: identity is the tier-2 answer (sawos design 33; design 25 ruling 11)
+// =============================================================================
+//
+// **THIS IS THE SEAM WHERE §5.5's OLD LAW SURVIVES VERBATIM.** "An address is
+// the same number in every process" is not the system's law any more — the
+// translating tier chooses user addresses now — but it is still THIS tier's
+// answer, and unit 3 (riscv Sv32) was PUNTED TO BACKLOG precisely so that a
+// board keeps giving it every gate run. Both bodies below are the identity, and
+// they are not stubs: they are the answer.
+//
+// What "identity" costs a program here is what it always cost — each process
+// links at its OWN base, because two images at one address cannot both be
+// resident when the address means one thing. So this board keeps `child.ld` and
+// `child2.ld` while the arm64 board collapsed to one script, and that pair of
+// facts IS the tier split, sitting in the tree where anyone can read it.
+
+/// **THE VIRTUAL BASE AN IMAGE LOADING AT PHYSICAL `dest_base` IS LINKED AT.**
+///
+/// Where it loads. There is no translation on this machine, so an image's link
+/// base and its destination frames are one number and a linker script that said
+/// otherwise would produce a program that runs nowhere.
+public func image_link_base(dest_base: UInt) -> UInt {
+    dest_base
+}
+
+/// **WHERE A `map` OF PHYSICAL `pa` LANDS IN A PROCESS WHOSE MAP CURSOR STANDS
+/// AT `cursor`.**
+///
+/// At `pa`. The cursor is the translating tier's instrument and is ignored here
+/// — the kernel keeps one per process on both tiers because it is arch-free
+/// bookkeeping, and on this tier nothing reads it back.
+///
+/// Design 25 ruling 1 still holds on this tier and is worth saying where the
+/// answer is: `map` takes NO VA hint HERE EITHER. The address is still the
+/// answer; it just happens to be an answer this machine has no freedom about.
+public func map_place(cursor: UInt, pa: UInt, device: Bool) -> UInt {
+    pa
+}
+
+// =============================================================================
 // The protection budget
 // =============================================================================
 
@@ -460,8 +500,23 @@ public func prot_switch(p: UInt) unsafe {
 /// absence of a grant. There is no standing image here: the row is in the
 /// kernel's record, and the next `load_domain(p)` replays whatever the record
 /// then says. Both directions are therefore the same nothing.
-public func prot_update(p: UInt, base: UInt, top: UInt, perms: UInt8,
+///
+/// **AND THE NOTHING NOW CARRIES ONE ASSERTION** (sawos design 33). Placement
+/// split a grant row's user range from its physical backing, and on this tier
+/// they must be the SAME NUMBER — PMP filters physical addresses and user mode
+/// issues them unchanged, so a row whose `pa` had drifted from its `base` would
+/// program a range nobody asked for. The invariant is established two seams
+/// above (`image_link_base` and `map_place` both answer the physical address),
+/// so this is the check that those two answers actually reached the record.
+///
+/// It is HERE rather than in `prot_region` because this is the funnel EVERY row
+/// passes through at the moment it is recorded — the replay reads the record
+/// afterwards, so a bad row would already be stored by then — and it costs one
+/// comparison per grant on a path that runs a handful of times per process.
+public func prot_update(p: UInt, base: UInt, top: UInt, pa: UInt, perms: UInt8,
                         device: Bool) unsafe {
+    assert(pa == base,
+           "a user address on the MPU tier IS its physical address")
 }
 
 /// Retire `p`'s domain. `clear_domain` has already emptied the record and

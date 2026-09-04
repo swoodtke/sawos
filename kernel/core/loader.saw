@@ -60,10 +60,43 @@ static HIGH_HALF_SHIFT: Int = 32
 /// below `top - stack_len`. That is root's own rule ("the stack is the kernel's
 /// grant, not the image's"), and a child gets it unchanged: root supplies a
 /// region capability and no numbers at all.
+///
+/// **AND SINCE M5 UNIT 2 IT CARRIES THE LINK BASE TOO** (sawos design 33).
+/// `base`..`top` stayed exactly what they were — the PHYSICAL frames the bytes
+/// go into, addresses-as-data under design 29's discipline — and `link_base` is
+/// the VIRTUAL address the image was linked at, which is where the process will
+/// see them. The two used to be one number, which is why the field is new rather
+/// than renamed.
+///
+/// **WHO ANSWERS IT IS THE TIER, AND THE ANSWER IS A SEAM CALL**
+/// (`hal.image_link_base`). A translating board says "the one canonical base,
+/// whatever the frames are"; a board without translation says "where it loads",
+/// which is the identity and folds away. So this struct is where placement is
+/// PARAMETERIZED and nothing below it branches on a tier.
 public(package) struct LoadRegion {
     public(package) base: UInt,
     public(package) top: UInt,
     public(package) stack_len: UInt,
+    public(package) link_base: UInt,
+}
+
+extension LoadRegion {
+    /// The virtual top: the link base plus the destination's own length. Spelled
+    /// as an offset from `link_base` rather than stored, so the two ranges are
+    /// the same SIZE by construction and cannot drift.
+    public(package) func link_top(&self) -> UInt {
+        self.link_base + (self.top - self.base)
+    }
+
+    /// The physical address the user address `va` names in this image.
+    ///
+    /// One affine map for the whole destination, which is what lets the copy
+    /// funnels resolve a buffer spanning two segments' rows and what makes the
+    /// identity tier's arithmetic vanish: there `link_base == base`, so this is
+    /// `va`.
+    public(package) func phys_of(&self, va: UInt) -> UInt {
+        self.base + (va - self.link_base)
+    }
 }
 
 /// WHY AN IMAGE WAS REFUSED — the answer the shared phases give, so that the
@@ -85,7 +118,8 @@ public(package) struct ImageFault {
 /// Root's destination, from the HAL's own constants.
 public(package) func root_region() -> LoadRegion {
     LoadRegion(base: hal.ROOT_LOAD_BASE, top: hal.ROOT_REGION_TOP,
-               stack_len: hal.ROOT_STACK_LEN)
+               stack_len: hal.ROOT_STACK_LEN,
+               link_base: hal.image_link_base(hal.ROOT_LOAD_BASE))
 }
 
 /// Overlay the header on the image's first bytes. One view construction, then
@@ -167,7 +201,13 @@ func check_segment(seg: &SosimgSeg, img_len: UInt, dest: &LoadRegion,
         return check_device_grant(&seg, load_addr, file_len, mem_len)
     }
 
-    if load_addr < dest.base {
+    // **JUDGED IN THE VIRTUAL DOMAIN SINCE PLACEMENT** (sawos design 33). A
+    // segment's `load_addr` is what the LINKER wrote, so the region it has to
+    // fit is the one the image was linked into — `link_base` and the length of
+    // the destination — and not the frames it will be copied to. On an identity
+    // tier the two ranges are the same numbers and every diagnostic below keeps
+    // the wording it has always had.
+    if load_addr < dest.link_base {
         return ImageFault(reason: "segment loads below the root region",
                           detail: load_addr)
     }
@@ -181,7 +221,7 @@ func check_segment(seg: &SosimgSeg, img_len: UInt, dest: &LoadRegion,
         return ImageFault(reason: "segment is not aligned to the grant granularity",
                           detail: load_addr)
     }
-    let limit = dest.top - dest.stack_len
+    let limit = dest.link_top() - dest.stack_len
     if load_addr > limit {
         return ImageFault(reason: "segment loads above the root region",
                           detail: load_addr)
@@ -329,7 +369,7 @@ public(package) func validate_image(img_base: UInt, img_len: UInt,
         i = i + 1
     }
 
-    if entry < dest.base || entry >= dest.top - dest.stack_len {
+    if entry < dest.link_base || entry >= dest.link_top() - dest.stack_len {
         return ImageFault(reason: "entry outside the root region", detail: entry)
     }
     // THE ENTRY MUST BE SOMETHING THE PROCESS MAY EXECUTE (sawos design 2 D-7).
@@ -431,7 +471,7 @@ public(package) func place_image(p: Int, img_base: UInt,
     // always part of it — so it starts at the region's top edge and only ever
     // grows downward, which means "no writable segment at all" still leaves the
     // stack, and a process always has somewhere to receive one.
-    var rw_base = dest.top - dest.stack_len
+    var rw_base = dest.link_top() - dest.stack_len
 
     var s: UInt = 0
     while s < seg_count {
@@ -445,19 +485,35 @@ public(package) func place_image(p: Int, img_base: UInt,
         // a hardware address is BELOW RAM on one profile, so folding it in
         // would stretch the copy-out window from the device page to the top of
         // the region and make `copy_out`'s check accept most of the machine.
+        // A DEVICE WINDOW IS MAPPED AT ITS OWN ADDRESS on every tier, so its
+        // row's two halves are one number (`hal.map_place` says the same thing
+        // for a mapped `IoMemory`). Registers are named by where the board put
+        // them, and the image declared exactly that address.
         if seg.is_device_grant() {
-            record_grant(p, load_addr, load_addr + mem_len, seg.flags, true,
-                         NO_MEMORY)
+            record_grant(p, load_addr, load_addr + mem_len, load_addr,
+                         seg.flags, true, NO_MEMORY)
         } else {
             // BOTH ENDS ARE PHYSICAL AND BOTH CONVERT (sawos design 29): the
             // destination is where the child's bytes go in RAM, the source is
             // inside the sosimg blob, and neither is an address the kernel runs
             // at. `load_addr` itself stays physical below — it is what
             // `record_grant` installs and what the child will see.
-            long_copy(hal.phys_to_virt(load_addr),
+            // **THE SEGMENT LOADS AT A FRAME AND IS MAPPED AT ITS LINK
+            // ADDRESS** (sawos design 33). `load_addr` is what the linker wrote
+            // — a USER address now, not a destination — and `dest.phys_of` is
+            // what turns it into the frame the bytes actually go into. On an
+            // identity tier the two are equal and this is the line it always
+            // was.
+            //
+            // BOTH ENDS ARE PHYSICAL AND BOTH CONVERT (sawos design 29): the
+            // destination is where the child's bytes go in RAM, the source is
+            // inside the sosimg blob, and neither is an address the kernel runs
+            // at.
+            let load_pa = dest.phys_of(load_addr)
+            long_copy(hal.phys_to_virt(load_pa),
                       hal.phys_to_virt(img_base + (seg.file_off as UInt)),
                       file_len)
-            long_zero(hal.phys_to_virt(load_addr + file_len), mem_len - file_len)
+            long_zero(hal.phys_to_virt(load_pa + file_len), mem_len - file_len)
 
             // The sosimg flag bits ARE the protection vocabulary (imgformat
             // states the encoding; each HAL translates it into its own
@@ -465,7 +521,7 @@ public(package) func place_image(p: Int, img_base: UInt,
             // with nothing in between.
             record_grant(p, load_addr,
                          align_up(load_addr + mem_len, hal.PROT_GRAIN),
-                         seg.flags, false, region)
+                         load_pa, seg.flags, false, region)
             if (seg.flags & (SegFlag.Write as UInt8)) != 0 && load_addr < rw_base {
                 rw_base = load_addr
             }
@@ -475,7 +531,10 @@ public(package) func place_image(p: Int, img_base: UInt,
 
     // The stack is the kernel's grant, not the image's: a program asks for code
     // and data, the kernel decides where it runs.
-    record_grant(p, dest.top - dest.stack_len, dest.top,
+    // The stack's two ranges, each at its own end of the destination: the user
+    // sees the top of the LINKED region, the bytes are the top of the FRAMES.
+    record_grant(p, dest.link_top() - dest.stack_len, dest.link_top(),
+                 dest.top - dest.stack_len,
                  (SegFlag.Read as UInt8) | (SegFlag.Write as UInt8), false,
                  region)
     rw_base
@@ -535,5 +594,6 @@ public func load_root_and_enter() unsafe {
     // §12: root's boot handle set. The entry register still carries exactly one
     // handle — System — and everything else the kernel minted for root is
     // COLLECTED through `ProcessOp.BootHandleNext` rather than passed.
-    start_process(entry, dest.top, dest.base, dest.top, rw_base, dest.top)
+    start_process(entry, dest.link_top(), dest.link_base, dest.link_top(),
+                  rw_base, dest.link_top())
 }

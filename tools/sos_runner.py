@@ -343,6 +343,12 @@ DRIVER_CHILD_PKG = os.path.join(TESTS_DIR, "driver-child")
 CHILD_ECHO_NS16550_PKG = os.path.join(TESTS_DIR, "child-echo-ns16550")
 CHILD_ECHO_PL011_PKG = os.path.join(TESTS_DIR, "child-echo-pl011")
 SHARE_DOUBLE_MAP_PKG = os.path.join(TESTS_DIR, "share-double-map")
+# **PLACEMENT'S OWN PAIR** (sawos design 33, M5 unit 2): one region, two
+# address spaces, two DIFFERENT addresses. aarch64 only — riscv32 keeps
+# identity placement deliberately (design 25 ruling 11), so there the two
+# addresses would be one and the case would assert nothing.
+MAP_PLACED_PKG = os.path.join(TESTS_DIR, "map-placed")
+CHILD_PLACED_PKG = os.path.join(TESTS_DIR, "child-placed")
 CHILD_SHARE_PKG = os.path.join(TESTS_DIR, "child-share")
 MAP_EXEC_GATED_PKG = os.path.join(TESTS_DIR, "map-exec-gated")
 MAP_WX_REFUSED_PKG = os.path.join(TESTS_DIR, "map-wx-refused")
@@ -610,12 +616,24 @@ ARCHES = [
         "hal_modules": [],
         "hal_asm": [],
         "hex_width": 16,
+        # **THE ONE VIRTUAL BASE EVERY IMAGE ON THIS BOARD IS LINKED AT** (sawos
+        # design 33), mirroring `hal.USER_IMAGE_BASE` and `hal/arm64/user/user.ld`.
+        # It is also root's physical destination, which is why the console's
+        # `entry=` row did not move when placement landed: root is the one
+        # process whose two addresses still coincide.
         "root_entry": 0x40200000,
-        # One region above root's top, as on Profile A — and here the choice is
-        # CONSTRAINED as well as tidy: EL0 can only be granted pages inside the
-        # HAL's grant window, the first 4 MiB of RAM, so a child's destination
-        # has to sit between root's top (0x4024_0000) and 0x4040_0000. See
-        # `hal/arm64/user/child.ld`.
+        # **A CHILD'S DESTINATION FRAMES — PHYSICAL, AND NO LONGER AN ADDRESS ANY
+        # PROGRAM SEES** (sawos design 33). One region above root's, as on
+        # Profile A. It used to be a link base too (`hal/arm64/user/child.ld`,
+        # now collapsed into `user.ld`): a child linked HERE because a user
+        # address was a physical address, and it links at `root_entry` now
+        # because the kernel translates. The number stays because the FRAMES stay
+        # — the build's region table still hands a launcher this range.
+        #
+        # Still CONSTRAINED as well as tidy, and the constraint moved with the
+        # split: the frames must be RAM the linear map covers (`map_source_ok`),
+        # while it is the VIRTUAL range that must land in the HAL's 4 MiB grant
+        # window (`map_target_ok`).
         "child_region_base": 0x40240000,
         # This controller HAS a software trigger, so the selftest line is a
         # software-generated one and no device is involved.
@@ -4527,6 +4545,50 @@ TEST_CASES = [
                        "SOS: process teardown handles="],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
+    },
+
+    # **SHARED AT PER-PROCESS ADDRESSES** (sawos design 33, M5 unit 2) — the
+    # case §5.5's old identity law forbade. One page, two domains, two DIFFERENT
+    # addresses, and both processes read and write the same bytes through their
+    # own.
+    #
+    # **THE ADDRESSES ARE ASSERTED AS LITERALS AND THAT IS DELIBERATE.** They are
+    # what the kernel's VA policy answers — first fit at or above a process's own
+    # region top, every image linked at `hal.USER_IMAGE_BASE` = 0x4020_0000, a
+    # region 256 KiB — so root's spacer and the child's only mapping both land at
+    # 0x4024_0000 (1076101120) and root's second mapping one page higher at
+    # 0x4024_1000 (1076105216). Pinning them is what makes the case an oracle rather than a
+    # tautology: a policy change has to come here and say so.
+    #
+    # The two witnesses are independent. The console lines say the two processes
+    # got different numbers; the status word (65731 = `Exited`(1) << 16 | 195)
+    # says the child really read the byte root wrote, through a path no console
+    # line goes near.
+    #
+    # **AARCH64 ONLY, and the `arches` key is this unit's gate as much as its
+    # scope.** riscv32 is untouched by M5 unit 2 and its half of the transcript
+    # is required to be byte-identical, so a case that ran there would move 119
+    # rows to prove something that tier does not claim.
+    {
+        "name": "map_placed",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAP_PLACED_PKG,
+        "children": [CHILD_PLACED_PKG],
+        "pool": True,
+        "arches": ["arm64"],
+        "expect_out": ["{banner}",
+                       "SOS placed: created",
+                       "SOS placed: spacer at 1076101120",
+                       "SOS placed: root sees 1076105216",
+                       "SOS placed: wrote 195",
+                       "SOS placed: gave the region",
+                       "SOS placed: started",
+                       "SOS childplaced: mapped at 1076101120",
+                       "SOS childplaced: saw 195 wrote 45",
+                       "SOS placed: root observed child status=65731",
+                       "SOS placed: read back 45",
+                       "SOS placed: done"],
+        "expect_clean_exit": True,
     },
 ]
 

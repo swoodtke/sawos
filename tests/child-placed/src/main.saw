@@ -1,0 +1,94 @@
+// SOS M5 unit 2: THE CHILD THAT ASKS WHERE ITS MEMORY IS (sawos design 33;
+// spec §2.5).
+//
+// It is given a `Memory` capability and nothing else about it — no address, no
+// length, no build-time constant. It maps the region into its own domain and
+// then ASKS: `Mapping.base()` is the op M5 unit 2 added, and it is the only way
+// a program can learn an address the kernel chose.
+//
+// **WHAT IT PROVES BY WORKING.** The byte it finds at that address was written
+// by its launcher, through a DIFFERENT address, into the same frames. So the
+// address is per-process and the memory is shared, at once — which is the pair
+// of facts §5.5's identity law used to make unsayable.
+//
+// It carries the byte it saw out as its exit code as well as printing it, on
+// `child-share`'s precedent: a status word its launcher reads through the §8
+// record is a second, independent witness that does not go through the console.
+
+import sos.{System, Process, Memory, Mapping, MapAccess, SosStatus}
+
+/// Read and write: this child both reads its launcher's byte and leaves one.
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// The byte the LAUNCHER wrote, and the byte this child leaves. Two numbers that
+/// appear nowhere else in any transcript, so a line carrying one can only have
+/// come from the program that wrote it.
+static ROOT_MARK: UInt8 = 0xC3
+static CHILD_MARK: UInt8 = 0x2D
+
+static EXIT_FAILED: UInt = 1
+
+func poke(addr: UInt, value: UInt8) unsafe {
+    UnsafeMemory<UInt8, Normal>(addr).write(value)
+}
+
+func peek(addr: UInt) unsafe -> UInt8 {
+    UnsafeMemory<UInt8, Normal>(addr).read()
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS childplaced: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // The one record this child was given: the shared region. The System handle
+    // never appears at the drain — resolving a boot tag CONSUMES its record,
+    // because the register IS the delivery — so this loop is one call and needs
+    // no tag test, exactly as the driver child's is.
+    var record = try proc.boot_handle_next() catch {
+        print("SOS childplaced: no region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let region = record.take_memory() else {
+        let _ = system.debug_print("SOS childplaced: record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // **THE CHILD INSTALLS ITS OWN ROW.** It holds the capability, so where the
+    // row goes is its business — the ruled lean the device handoff established
+    // (design 9 D-2), here over ordinary RAM.
+    let mine = try proc.map(memory: &region, access: RW) catch {
+        print("SOS childplaced: map failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // **AND THEN IT ASKS.** There is no other way: `map` answered a capability,
+    // a `Memory` has no bounds reader, and this program was linked at the same
+    // address as its launcher so it cannot even guess from its own layout.
+    let at = try mine.base() catch {
+        print("SOS childplaced: base failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS childplaced: mapped at {}\n", at)
+
+    let seen = peek(at)
+    poke(at, CHILD_MARK)
+    print("SOS childplaced: saw {} wrote {}\n", seen as Int, CHILD_MARK as Int)
+    if seen != ROOT_MARK {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // The byte, carried out where a console line cannot reach: the launcher
+    // reads it back as `Exited << 16 | seen` through its §8 record.
+    let _ = proc.exit(seen as UInt)
+}

@@ -177,6 +177,76 @@ entry below or the brief that carries it, never restating either.
   makes their passing the seam-flip's own witness. Sweep is now
   **17 sites**.
 
+  **UNIT 2 BUILT (`designs/033`, Sep 3):** PLACEMENT — on arm64 a user
+  address is the kernel's answer. `GrantRow` grew ONE field (`pa`); the
+  seam grew `image_link_base(dest_base)` and
+  `map_place(cursor, pa, device)` and split `map_target_ok` into a
+  VIRTUAL half (the 4 MiB window, body unchanged) plus a new
+  `map_source_ok` PHYSICAL half (RAM) — **and there is NO tier
+  conditional anywhere, because the MPU tier's answer to both new
+  functions is the IDENTITY** and folds away exactly as design 29's
+  `phys_to_virt` does. `prot_update` grew `pa`; the MPU tier ASSERTS
+  `pa == base` there, the funnel every row passes through as it is
+  recorded. `LoadRegion` grew `link_base` and `place_image` now copies to
+  `dest.phys_of(va)` while recording `(va, va_top, pa)`; every address on
+  a `ProcessSlot` is now a USER address. The copy funnels resolve through
+  `translate_user` (walk the target's rows, `row.pa + (va - row.base)`,
+  whole range in ONE row) and then `phys_to_virt` — the shape 029 said
+  would exist ahead of need. **`MappingOp.Base` + `MappingRight.Base` +
+  `Mapping.base()`** is the op the unit owed: once the kernel chooses,
+  nothing else can tell a program where its memory is.
+  **THE VA POLICY IS NOT THE BRIEF'S, AND THE SUITE IS WHAT REFUSED IT.**
+  The brief proposed a monotonic per-process cursor; `mapping_slot_free`
+  (map/unmap thirteen times, then expect the fourteenth mapping of a
+  re-split range at the address the thirteenth wrote) and `memory_split`
+  (`base` and `base + CHUNK` through two consecutive splits) both assert
+  that a recycled range comes back at a USABLE address, which a cursor
+  that only rises cannot give. What landed is `free_user_va`: FIRST FIT
+  at or above the target's own `region_top`, over the rows it already
+  has, device rows skipped — no new `ProcessSlot` field, since it is
+  derived from the record. Cost named at the site: an address freed by
+  `unmap` may be reused by a later mapping of different bytes. Its useful
+  consequence is what carried the unit — one link base and one region
+  size mean **every process's FIRST mapping lands at the same number**
+  (0x4024_0000), so `share_double_map` needed NO retargeting against the
+  brief's expectation that it was the likeliest case to.
+  **LINKER SCRIPTS: arm64's THREE COLLAPSED INTO ONE** (`user.ld`;
+  `root.ld`/`child.ld`/`child2.ld` deleted, **121 `Saw.toml` files**
+  repointed), **riscv32's THREE KEPT** (ruling 11) — one directory
+  against the other IS the tier split, in the tree, gated every run.
+  The runner's arm64 constants did NOT need simplifying, they needed
+  DISAMBIGUATING: `child_region_base` and `pool_base` are PHYSICAL and no
+  frame moved, and `root_entry` is unmoved because `USER_IMAGE_BASE` was
+  given `ROOT_LOAD_BASE`'s value on purpose, so root's `entry=` row stays.
+  **Gate: baseline 238/238 119 cases 495 lines `801a0f98` (the brief's
+  stated baseline, reproduced exactly) -> 239/239, 120 cases, 498 lines,
+  `2238afc8`. THE riscv32 HALF IS BYTE-IDENTICAL — 250 lines, hash
+  `1ca29323` both sides, a diff of ZERO lines.** The arm64 motion is
+  enumerated and totals 120 removed / 123 added: 119 case rows
+  RENUMBERED (payload byte-identical, `[i/119]` -> `[i/120]`, the case
+  appended at the END so no index moved), 1 new row `map_placed`, 2 new
+  aarch64 size rows (the new packages), the total line, and **ZERO
+  existing size rows moved on EITHER arch** — the brief authorized aarch64
+  size motion and none was needed, because `user.ld` page-pads.
+  **EIGHT FINDINGS**, the load-bearing ones: (1) the policy deviation
+  above; (3) **an `@export` costs every image on every architecture —
+  measured at +24 bytes per riscv32 image**, which is why the per-op C
+  wrapper `sos_mapping_base` is OMITTED and recorded as owed (032 saw the
+  same mechanism from the other side at +40); (5) **`sos_test_pool_base()`
+  now returns a VIRTUAL address on arm64 under a name that says
+  otherwise** — ten test packages read it, all ten compile for BOTH
+  arches, and a byte-identical riscv32 gate leaves the per-triple `native`
+  slot as the ONLY arm64-only lever, so **migrating those ten onto
+  `Mapping.base()` is OWED and needs a unit authorized to move riscv32
+  size rows**; (6) `map_basics`'s header now describes a machine arm64 is
+  not (its double map is two addresses, not an alias) and is owed with
+  (5); (7) `process_isolation` now faults for a STRICTLY BETTER reason —
+  the child cannot reach root's region at all rather than being refused
+  at it, same observable. (4) is design 27's finding 2b met verbatim: the
+  arch-free lint refused the build over the word `arm64` in a
+  `kernel/core` DOC COMMENT. **No SL entry owed** — the language did not
+  bite once.
+
 - M6 (after M5): the storage milestone — seed `designs/030` (user-
   ruled Sep 3): flash-first block driver, RO archive fs + a simple
   tmpfs (the write path, same protocol), userspace loader, the

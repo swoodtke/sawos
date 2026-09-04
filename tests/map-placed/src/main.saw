@@ -1,0 +1,266 @@
+// SOS M5 unit 2: SHARED AT PER-PROCESS ADDRESSES (sawos design 33; design 25
+// D-1 step two; spec §2.5, §5.5).
+//
+// **THE CASE §5.5's OLD LAW FORBADE.** "An address is the same number in every
+// process" made "one region, two addresses" not merely absent from the tree but
+// unsayable. Placement makes it ordinary, and this is the program that says it:
+// one page, two domains, two DIFFERENT addresses, and both processes read and
+// write the same bytes through their own.
+//
+// THE TRANSCRIPT, read as an order:
+//
+//   SOS placed: created
+//   SOS placed: spacer at 1076101120       <- 0x4024_0000, root's FIRST mapping
+//   SOS placed: root sees 1076105216       <- 0x4024_1000, root's SECOND
+//   SOS placed: wrote 195                  <- 0xC3, through root's address
+//   SOS placed: gave the region
+//   SOS placed: started
+//   SOS childplaced: mapped at 1076101120  <- 0x4024_0000, THE CHILD's first
+//   SOS childplaced: saw 195 wrote 45      <- the same bytes, another address
+//   SOS: process exit: code=...
+//   SOS placed: root observed child status=65731
+//   SOS placed: read back 45               <- 0x2D, back through root's address
+//   SOS placed: done
+//
+// **THE SPACER IS THE WHOLE TRICK, AND IT IS ONE LINE.** The kernel's VA policy
+// is first fit at or above a process's own region top, so the FIRST mapping into
+// any process on this board lands at the same number. Root therefore maps a
+// throwaway page first; its second mapping — the shared one — is pushed a page
+// higher, and the child's only mapping sits where root's spacer is. The two
+// addresses differ because the two processes have different mapping HISTORIES,
+// which is exactly the property "the kernel chooses" is supposed to have.
+//
+// So the case does not depend on the policy being first fit. It depends on the
+// address being the KERNEL's answer rather than the region's, and it would keep
+// its meaning under any policy that answers per-process.
+//
+// **NEITHER PROGRAM CONTAINS AN ADDRESS.** `Mapping.base()` is asked on both
+// sides. Every earlier map case in this tree reads `sos_test_pool_base()`, a
+// build-time constant that was right only because a user address used to be a
+// physical one; this pair is what those cases should become, and their migration
+// is recorded as owed rather than done in this unit (the gate that proves the
+// tier split forbids touching a source both architectures compile).
+//
+// **THE HANDOFF DIRECTION IS "HAND OVER AUTHORITY"** — root GIVES the region and
+// the child maps it into itself, the driver-child shape (design 9 D-2) over
+// ordinary RAM. That is deliberate: the child must hold a Mapping to be able to
+// ask where it is, and a Mapping is not transferable (`mapping_rights()`
+// withholds `Transfer`). `share-double-map` beside this one is the other
+// direction — root keeps the region and installs the child's row — and neither
+// program could have asked the child's question.
+
+import sos.{System, Process, Memory, Mapping, MapAccess, Waiter, WaitResult,
+            WaitPayload, SosStatus, SystemRight}
+
+/// One page of the pool, which is the smallest thing either profile grants.
+static CHUNK: UInt = 0x1000
+
+/// Read and write, in both domains.
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// The byte ROOT writes, and the byte the CHILD writes. Two numbers that appear
+/// nowhere else in any transcript.
+static ROOT_MARK: UInt8 = 0xC3
+static CHILD_MARK: UInt8 = 0x2D
+
+/// The key this launcher attaches the child's Process handle under.
+static KEY: UInt = 77
+
+/// Root's config: the tag the child's System handle travels under, and the tag
+/// the shared region travels under.
+///
+/// THE TWO ARE ORDERED BY WHAT CONSUMES THEM, not by when they are given:
+/// resolving a boot tag CONSUMES its record, so the System handle never appears
+/// at the child's drain and the region is the only record it ever sees.
+static TAG_BOOT: UInt = 51
+static TAG_REGION: UInt = 52
+
+/// What a child of this launcher may ask its System object for: print, and learn
+/// its own Process object — which is both the handle its `exit` goes through and
+/// the one it maps with. `Transfer` is in the mask because it is the bit `give`
+/// checks on the thing being given; everything else is absent BY SILENCE.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+func poke(addr: UInt, value: UInt8) unsafe {
+    UnsafeMemory<UInt8, Normal>(addr).write(value)
+}
+
+func peek(addr: UInt) unsafe -> UInt8 {
+    UnsafeMemory<UInt8, Normal>(addr).read()
+}
+
+/// The §8 status word out of the record the kernel copied into this process's
+/// memory while the thread was parked. The other arms panic: this program
+/// attached exactly one thing.
+func status_of(r: &WaitResult) -> UInt {
+    match r.what {
+        case Process(status) -> status,
+        case _ -> panic("this launcher attached only a Process"),
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS placed: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // The boot set, in the build's row order: the child's image blob, the RAM it
+    // will run in, and the pool this launcher allocates the shared page out of.
+    var image = try proc.boot_handle_next() catch {
+        print("SOS placed: no image region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var dest = try proc.boot_handle_next() catch {
+        print("SOS placed: no destination region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var pool_record = try proc.boot_handle_next() catch {
+        print("SOS placed: no pool region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let image_mem = image.take_memory() else {
+        let _ = system.debug_print("SOS placed: image record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest_mem = dest.take_memory() else {
+        let _ = system.debug_print("SOS placed: dest record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let pool = pool_record.take_memory() else {
+        let _ = system.debug_print("SOS placed: pool record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let child = try system.process_create(image: &image_mem,
+                                          memory: &dest_mem) catch {
+        print("SOS placed: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS placed: created\n")
+
+    // **THE SPACER.** Root's first mapping, which exists only to occupy the
+    // address the child's mapping will land at — see the header. It is a real
+    // page and root never touches it; what it takes is a slot in root's own
+    // address space, which is the resource placement hands out.
+    let spacer = try pool.split(len: CHUNK) catch {
+        print("SOS placed: spacer split failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let spacer_map = try proc.map(memory: &spacer, access: RW) catch {
+        print("SOS placed: spacer map failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let spacer_at = try spacer_map.base() catch {
+        print("SOS placed: spacer base failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS placed: spacer at {}\n", spacer_at)
+
+    // The shared page, mapped into root SECOND — so it lands above the spacer.
+    let shared = try pool.split(len: CHUNK) catch {
+        print("SOS placed: split failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let here = try proc.map(memory: &shared, access: RW) catch {
+        print("SOS placed: map into self failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let root_at = try here.base() catch {
+        print("SOS placed: base failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS placed: root sees {}\n", root_at)
+    if root_at == spacer_at {
+        let _ = system.debug_print("SOS placed: two rows at one address\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // ROOT'S HALF OF THE CONVERSATION, before the child exists in any runnable
+    // sense — the child is `Created` and has no thread, so the ordering here is
+    // forced rather than raced.
+    poke(root_at, ROOT_MARK)
+    print("SOS placed: wrote {}\n", ROOT_MARK as Int)
+
+    let waiter = try proc.waiter_create() catch {
+        print("SOS placed: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try waiter.add(process: &child, key: KEY) catch {
+        print("SOS placed: attach failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let for_child = try system.mint(rights: CHILD_SYSTEM) catch {
+        print("SOS placed: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        print("SOS placed: give system failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // **THE REGION MOVES AND ROOT'S ROW STAYS.** `give` consumes the capability
+    // — root cannot map this page anywhere else afterwards — but root's own row
+    // was installed before the give and is not the child's to take. §2.5's
+    // refcount clause is what keeps the page alive while neither process holds
+    // a `Memory` handle onto it: the two ROWS are references of their own.
+    try child.give(memory: move shared, tag: TAG_REGION) catch {
+        print("SOS placed: give region failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS placed: gave the region\n")
+
+    try child.start(boot_tag: TAG_BOOT) catch {
+        print("SOS placed: start failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS placed: started\n")
+
+    let record = try waiter.wait() catch {
+        print("SOS placed: wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS placed: root observed child status={}\n", status_of(&record))
+
+    // **AND THE OTHER DIRECTION, THROUGH ROOT'S OWN ADDRESS.** The child is gone
+    // and its row went with it; this load is at a number the child never used,
+    // reading the byte the child stored.
+    let seen = peek(root_at)
+    print("SOS placed: read back {}\n", seen as Int)
+    if seen != CHILD_MARK {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    print("SOS placed: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

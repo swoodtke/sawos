@@ -46,7 +46,8 @@ import sosrt.{ConsoleSink, console_write, abort_status}
 // and this line is what keeps that invisible from above.
 public import rv32core.{
     arch_tag, cause_tag, device_window_ok, FRAME_BYTES, frame_init,
-    GRANT_ROW_BUDGET, IRQ_NONE, IRQ_TIMER, is_interrupt, is_syscall,
+    GRANT_ROW_BUDGET, image_link_base, IRQ_NONE, IRQ_TIMER, is_interrupt,
+    is_syscall, map_place,
     MAX_ROOT_SEGMENTS, payload_end, payload_start, phys_to_virt, prot_clear,
     prot_commit,
     prot_device, PROT_DOMAIN_SLOTS, PROT_GRAIN, prot_region,
@@ -433,6 +434,21 @@ public static RAM_TOP: UInt = 0x403E_0000
 /// BOARD-SIDE, unlike its `device_window_ok` sibling: the granularity rule is
 /// PMP's and is shared, but WHERE RAM IS is this machine's alone.
 public func map_target_ok(base: UInt, top: UInt) -> Bool {
+    base < top && base >= RAM_BASE && top <= RAM_TOP
+}
+
+/// **MAY `[base, top)` BE HANDED TO A USER DOMAIN AS PHYSICAL BACKING?** (sawos
+/// design 33.)
+///
+/// **THE SAME BODY AS `map_target_ok`, AND THAT IS THE TIER SPLIT IN ONE FILE.**
+/// Placement split one question into two — which INPUT addresses a domain may
+/// use, and which OUTPUT frames it may reach — and on a machine that does not
+/// translate they are the same question, because there is only one address. The
+/// arm64 HAL answers them differently (a 4 MiB grant window against 128 MiB of
+/// RAM); here the two predicates are deliberately identical rather than one
+/// forwarding to the other, so that each states its own question where a reader
+/// of either finds it.
+public func map_source_ok(base: UInt, top: UInt) -> Bool {
     base < top && base >= RAM_BASE && top <= RAM_TOP
 }
 

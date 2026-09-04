@@ -9,6 +9,27 @@ in `hal/riscv32/user/ABI.md`: the three that left named no architecture, so
 two per-arch C copies were two copies of one thing. They are Saw now, once, in
 `kernel/sysapi/`.
 
+## The linker script: ONE, since sawos design 33
+
+What else lives in this directory is `user.ld`, and there is exactly one of it.
+It replaced `root.ld`, `child.ld` and `child2.ld`, which differed from each other
+in a single number — the base — and existed only because a user address used to
+BE a physical address, so two resident images could not share one.
+
+Under M5 unit 2 they can. Every process on this board runs under its own
+translation-table set (design 27) over a low half that belongs entirely to
+whichever process is current (design 29), so every image links at
+`hal.USER_IMAGE_BASE` = `0x4020_0000` and the kernel maps its frames — root's
+from a HAL constant, a child's from the `Memory` capability its launcher supplied
+— at that same canonical address. `hal.image_link_base` is the seam that answers
+"linked where"; `user.ld` is its arm64 answer written in the other language, and
+nothing at build time compares the two (a Saw static's value is not a linker
+symbol, design 29 finding 5). The loader's `check_segment` is what catches a
+disagreement, with a named diagnostic rather than a silent misplacement.
+
+`hal/riscv32/user/` still carries three scripts, deliberately (design 25 ruling
+11). That pair of directories is the tier split as a thing you can look at.
+
 ## Which altitude is supported for whom
 
 Unchanged from `hal/riscv32/user/ABI.md`: typed Saw (`system.shutdown(0)`)
