@@ -596,3 +596,135 @@ public static PROCESS_STATS_FAULTS_SLOT: Int = 2
 public func process_stats_record_bytes() -> Int {
     PROCESS_STATS_RECORD_DOUBLEWORDS * sizeof<UInt64>()
 }
+
+/// **THE THREE COLUMNS AS A RECORD** — the one declaration both doors read
+/// (sawos design 37, M5 unit 7).
+///
+/// Declaration order IS the layout (design 58), so this struct and the
+/// doubleword slots above are ONE description of ONE thing: `Process.Stats`
+/// copies this record out, and the shared region below is an array of it. That
+/// is what makes the v1 op a COMPATIBILITY FLOOR rather than a second surface —
+/// the two answers cannot drift, because there is nothing for them to drift
+/// between.
+public struct StatsRow {
+    public syscalls: UInt64,
+    public interrupts: UInt64,
+    public faults: UInt64,
+}
+
+static_assert(sizeof<StatsRow>()
+              == PROCESS_STATS_RECORD_DOUBLEWORDS * sizeof<UInt64>(),
+              "a stats row must be exactly the doublewords sosabi publishes")
+
+/// Bytes in one row. A FUNCTION for `process_stats_record_bytes`' reason.
+public func stats_row_bytes() -> Int {
+    sizeof<StatsRow>()
+}
+
+// =============================================================================
+// The shared stats region (sawos design 37, M5 unit 7; design 25 seed 1)
+// =============================================================================
+//
+// **ONE STORAGE, TWO DOORS, NO MIRROR.** The three columns live HERE — in a
+// kernel-owned, protection-granularity-aligned region — and `Process.Stats`
+// READS this same storage. There is no second copy kept in step, because a
+// second copy is a thing that can skew; what the op gives a caller is a
+// snapshot COPIED OUT of the one storage, and what the region gives a caller is
+// the storage itself, read-only.
+//
+// **THE POINT IS A `top` THAT COSTS NO SYSCALLS.** A supervisor maps the region
+// once and reads every process's columns out of its own address space for the
+// life of the machine — no trap per sample, no trap per process. That is the
+// whole reason the region exists; `Process.Stats` remains the answer for a
+// caller that wants one process's numbers and does not want a mapping.
+//
+// **ROWS ARE INDEXED BY PROCESS SLOT**, and the region has a row for every slot
+// the machine can ever hand out. See `kcore.stats` for the capacity argument —
+// the short version is that `alloc_process` scans to
+// `min(capacity, hal.PROT_DOMAIN_SLOTS)`, so `PROT_DOMAIN_SLOTS` is a CEILING
+// on the slot index and a region sized to it can never be outgrown, donated
+// process slots (design 36) included.
+//
+// **TEARING IS DOCUMENTED, NOT HIDDEN.** A column is 64 bits and one profile's
+// registers are 32, so a reader on riscv32 loads a doubleword as two words and
+// the kernel can bump the low word between them. What a torn read yields is
+// therefore a value BETWEEN two true readings of that counter, never a value
+// the counter never held — the columns only ever increase, so the low word
+// carrying or not carrying is the whole of the hazard, and the high word moves
+// once every 2^32 traps. v1's answer is this paragraph plus monotonicity: a
+// `top` renders a number that is at most one carry stale, which is what a `top`
+// is for. A SEQLOCK is the refinement if a consumer ever needs exactness — an
+// even/odd generation word per row, written around each bump — and it is
+// deliberately NOT built, because no consumer needs it and a lock in the trap
+// path costs every process to serve a reader that does not exist yet.
+//
+// **THE REGION IS NOT A `Memory`, AND THAT IS THE DESIGN.** No handle is minted
+// for it: it is kernel storage, not allocatable RAM, so it must not wear the
+// Split/donate machinery a `Memory` carries — splitting the stats page or
+// donating it to a slab are not operations that could ever mean anything. What
+// the caller gets is ACCESS WITHOUT POSSESSION: a protection row installed in
+// its own domain and a `Mapping` naming that row, which is exactly enough to
+// read the page and to give the access back.
+
+/// What the region publishes about itself, at its own base.
+///
+/// **SELF-DESCRIBING ON PURPOSE.** A reader that has the page and this struct
+/// needs nothing else: `rows_offset` says where row 0 starts and `row_bytes`
+/// says how far apart they are, so a v2 that grows this header does not move
+/// the rows out from under a v1 reader's arithmetic — it changes a number the
+/// v1 reader already reads. `version` is what a reader checks first and refuses
+/// on.
+///
+/// Every field is `UInt64` for the columns' own reason: the region is one
+/// layout on both profiles, so nothing here follows the register.
+public struct StatsRegionHeader {
+    public version: UInt64,
+    public rows: UInt64,
+    public row_bytes: UInt64,
+    public rows_offset: UInt64,
+}
+
+/// The layout version this build publishes and this build's readers accept.
+public static STATS_REGION_VERSION: UInt64 = 1
+
+/// Bytes in the header. A FUNCTION for `process_stats_record_bytes`' reason.
+public func stats_region_header_bytes() -> Int {
+    sizeof<StatsRegionHeader>()
+}
+
+/// Words in a `System.StatsRegionMap` copy-out record: the caller's own ROW
+/// INDEX, and nothing else.
+///
+/// **MACHINE WORDS, NOT DOUBLEWORDS** — the pipe-create record's rule: a table
+/// index is a register-shaped thing.
+///
+/// **THE MAPPING IS NOT IN HERE, AND THAT IS `map`'s SHAPE KEPT.** The op
+/// answers with a `Mapping` handle in the value register exactly as
+/// `MemoryOp.Map` does, and the ADDRESS comes from `MappingOp.Base` exactly as
+/// it does there — one mechanism for "the address is the kernel's answer",
+/// not two. This record carries the one thing `map` has no equivalent of.
+///
+/// **WHY A ROW INDEX IS OWED AT ALL.** Rows are indexed by process SLOT, and
+/// until this op there was no way for a process to learn its own — slot
+/// numbering is kernel-internal. A caller handed the page without it would hold
+/// a table it cannot find itself in.
+///
+/// **IT IS WRITTEN BEFORE THE ROW IS INSTALLED, AND THAT IS NOT A PARTIAL
+/// SUCCESS.** The index is a FACT ABOUT THE CALLER — process `p` occupies row
+/// `p` — rather than a product of the mapping, so it is true whether or not the
+/// install goes on to succeed. A caller that gets an error status simply did not
+/// get a mapping; the number it was told is still its row.
+///
+/// It is the caller's OWN row and nobody else's. Learning which row ANOTHER
+/// process occupies is a naming question this unit does not answer — see design
+/// 37's As-built, which records it as the follow-on a general `top` needs.
+public static STATS_REGION_MAP_RECORD_WORDS: Int = 1
+
+/// Where the row index sits. Named rather than written, on both sides.
+public static STATS_REGION_MAP_ROW_WORD: Int = 0
+
+/// Bytes in a `System.StatsRegionMap` record — the minimum capacity a caller
+/// must give the op, and what the kernel checks the buffer against.
+public func stats_region_map_record_bytes() -> Int {
+    STATS_REGION_MAP_RECORD_WORDS * sizeof<UInt>()
+}

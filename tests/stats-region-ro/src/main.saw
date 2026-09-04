@@ -1,0 +1,78 @@
+// SOS M5 unit 7: THE STATS REGION IS READ-ONLY, PROVED BY DYING ON IT (sawos
+// design 37).
+//
+// **A DENIAL CAN ONLY BE PROVED BY MEETING IT.** `stats-region` beside this one
+// proves the page is readable and that its numbers are the kernel's own; this
+// program proves the other half — that the grant is READ-ONLY — the only way
+// that claim can be witnessed: it stores into the page and does not come back.
+//
+// THE TRANSCRIPT, read as three claims:
+//
+//   SOS statsro: read ok       <- the row really is installed; this is not a
+//                                 program that faults because it was never
+//                                 granted anything
+//   SOS statsro: writing       <- printed BEFORE the store, because the store
+//                                 does not return
+//   SOS: fault ...             <- the kernel's report, and the assertion
+//
+// **WHY THE COLUMNS MUST NOT BE WRITABLE.** They are the kernel's account of
+// what every process has cost the machine. A process that could write them could
+// lie to every supervisor on the machine about its own traffic and about its
+// peers' — so the one thing the region hands out is READ, and `MapAccess.Write`
+// never appears anywhere on this op's path.
+//
+// **THIS CASE IS ISOLATED-TIER ONLY, AND THE RUNNER SAYS SO BY NAME.** The
+// assertion here is DENIAL BY THE HARDWARE, which is precisely what the `Flat`
+// tier disclaims (design 19, built by design 35): on a flat platform the store
+// simply lands, this program runs on and prints its UNREACHABLE line, and the
+// case would fail by omission rather than tell anyone anything true. So it is
+// excluded there with its reason, exactly as the four isolation proofs before it
+// are.
+
+import sos.{System, Process, StatsRegion, ProcessStats, SosStatus}
+
+static EXIT_FAILED: UInt = 1
+
+/// The value this program tries to force into the kernel's counters. Its
+/// arrival anywhere would be the bug; it appears in no expectation.
+static LIE: UInt64 = 0x7777_7777
+
+func poke(addr: UInt, value: UInt64) unsafe {
+    UnsafeMemory<UInt64, Normal>(addr).write(value)
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let region = try system.stats_region_map() catch {
+        print("SOS statsro: map failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // **THE ROW IS REALLY THERE.** Without this line a fault below would prove
+    // nothing — an address that was never granted faults too, and the two are
+    // indistinguishable in a transcript. Reading a column first is what makes
+    // the fault a statement about the ACCESS BITS rather than about the mapping.
+    let mine = region.mine()
+    if mine.syscalls == 0 {
+        let _ = system.debug_print("SOS statsro: own row reads zero syscalls\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS statsro: read ok\n")
+
+    // Printed BEFORE the store, because the store does not return. This is the
+    // last thing the program says; the kernel's fault report is the next line in
+    // the transcript.
+    let _ = system.debug_print("SOS statsro: writing\n")
+
+    poke(region.base, LIE)
+
+    // Unreachable on hardware that can deny. A build that gets here has let a
+    // process write the kernel's own accounting, so it fails loudly rather than
+    // shutting down cleanly.
+    let _ = system.debug_print("SOS statsro: UNREACHABLE\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

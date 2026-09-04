@@ -38,7 +38,10 @@ import sosabi.{SosStatus, SystemOp, ProcessOp, MemoryOp, IoMemoryOp, MINT_OP,
                PIPE_CREATE_OUTLET_WORD, pipe_create_record_bytes,
                PROCESS_STATS_RECORD_DOUBLEWORDS, PROCESS_STATS_SYSCALLS_SLOT,
                PROCESS_STATS_INTERRUPTS_SLOT, PROCESS_STATS_FAULTS_SLOT,
-               process_stats_record_bytes}
+               process_stats_record_bytes,
+               StatsRow, StatsRegionHeader, STATS_REGION_VERSION,
+               STATS_REGION_MAP_RECORD_WORDS, STATS_REGION_MAP_ROW_WORD,
+               stats_region_map_record_bytes}
 
 // And the `sosabi.` qualifier, for the one encoding this module names WITHOUT
 // binding bare: `sosabi.ENTRY_IMAGE`, the sentinel a process passes when it has
@@ -399,6 +402,96 @@ extension System {
         }
         return word
     }
+
+    /// **MAP THE MACHINE'S TRAP COUNTERS READ-ONLY INTO THIS PROCESS** — the
+    /// shared stats region (sawos design 37, M5 unit 7). Requires
+    /// `SystemRight.StatsRegionMap`.
+    ///
+    /// **THIS IS A `top` THAT COSTS NO SYSCALLS.** Call it once; every sample
+    /// afterwards is a load out of this process's own address space. The
+    /// alternative surface — `Process.stats()` — costs one trap per process per
+    /// sample and needs a handle onto each process; this costs one trap ever and
+    /// covers every slot the machine has.
+    ///
+    /// ```saw
+    /// let region = try system.stats_region_map() catch { return }
+    /// let mine = region.row(region.self_row)
+    /// print("syscalls={}\n", mine.syscalls)
+    /// ```
+    ///
+    /// **READ-ONLY, AND A WRITE FAULTS WHERE THE HARDWARE CAN SAY SO.** The
+    /// columns are the kernel's; a process that could write them could lie to
+    /// every supervisor on the machine. On the `Flat` tier the tier word already
+    /// disclaims hardware denial (`tier()` above) and this call has nothing new
+    /// to say about it — the row is installed read-only either way, and only one
+    /// tier enforces it.
+    ///
+    /// **THE NUMBERS CAN TEAR ON A 32-BIT PROFILE, AND THAT IS DOCUMENTED
+    /// RATHER THAN LOCKED.** A column is 64 bits and riscv32's registers are 32,
+    /// so a read can land between the two halves of a carry. The columns only
+    /// ever increase, so what a torn read yields is a value BETWEEN two true
+    /// readings — never a number the counter never held — and the high word
+    /// moves once per 2^32 traps. A `top` is exactly the consumer that can live
+    /// with that. A caller that needs an exact reading uses `Process.stats()`,
+    /// whose copy-out is made with interrupts masked.
+    ///
+    /// **IT MINTS NO `Memory`.** The region is kernel storage, not allocatable
+    /// RAM: what you are granted is the access and nothing that owns it. The
+    /// `Mapping` inside the returned value is what takes the access back —
+    /// `unmap()` below — and dropping the value releases the handle without
+    /// removing the row, which is `Mapping`'s own ruled stance.
+    ///
+    /// A version this build cannot read PANICS, on `tier()`'s reasoning exactly:
+    /// the kernel wrote the word out of the same declaration this module reads,
+    /// so a mismatch is a skew between the kernel and the `sos` it exported
+    /// rather than a runtime condition a caller could act on.
+    public func stats_region_map(&self) -> Result<StatsRegion, SosStatus> {
+        let answer = try stats_region_into_frame(self.handle)
+        var mapping = Mapping(handle: MappingHandle(answer.0))
+        let base = try mapping.base()
+        let head = read_stats_header(base)
+        if head.version != STATS_REGION_VERSION {
+            panic("sos: kernel published stats region version {}, which this build cannot read",
+                  head.version)
+        }
+        return StatsRegion(mapping: move mapping, base: base,
+                           rows: head.rows as Int,
+                           rows_offset: head.rows_offset as UInt,
+                           row_bytes: head.row_bytes as UInt,
+                           self_row: answer.1)
+    }
+}
+
+/// The `unsafe` half of `System.stats_region_map`, confined to one small named
+/// helper (design 136). The record buffer's address never leaves it.
+///
+/// It answers the pair the op answers: the Mapping handle out of the value
+/// register, and the caller's own row index out of the copy-out record.
+func stats_region_into_frame(handle: UInt) unsafe -> Result<(UInt, Int), SosStatus> {
+    var buf: [UInt; STATS_REGION_MAP_RECORD_WORDS] = [0; STATS_REGION_MAP_RECORD_WORDS]
+    let raw = try call_value(handle, SystemOp.StatsRegionMap as UInt,
+                             ((&var buf) as UnsafePointer<UInt>) as UInt,
+                             stats_region_map_record_bytes() as UInt, 0)
+    let pair: (UInt, Int) = (raw, buf[STATS_REGION_MAP_ROW_WORD] as Int)
+    return pair
+}
+
+/// Read the region's published header — the typed-view idiom (the Aug-5 user
+/// ruling): the layout is declared ONCE in `sosabi` and read by FIELD NAME, so
+/// a layout edit that skewed the offsets would be a compile error rather than a
+/// silent misread.
+///
+/// `unsafe` because it names an `UnsafeMemory`; the contact stops here. It
+/// cannot fail — the page is mapped by the time it is called — so it carries no
+/// error channel to make every caller unwrap (CLAUDE.md's Optional/Result
+/// discipline: a channel for a condition that cannot arise is noise).
+func read_stats_header(base: UInt) unsafe -> StatsRegionHeader {
+    UnsafeMemory<StatsRegionHeader, Normal>(base).read()
+}
+
+/// Read one row, the same way.
+func read_stats_row(at: UInt) unsafe -> StatsRow {
+    UnsafeMemory<StatsRow, Normal>(at).read()
 }
 
 // =============================================================================
@@ -1412,4 +1505,96 @@ func boot_handle_into_frame(handle: ProcessHandle) unsafe -> Result<BootHandle, 
     return decode_boot_handle(buf[BOOT_HANDLE_TAG_WORD],
                               buf[BOOT_HANDLE_KIND_WORD],
                               buf[BOOT_HANDLE_HANDLE_WORD])
+}
+
+// =============================================================================
+// StatsRegion — the mapped view of the machine's trap counters (sawos design
+// 37, M5 unit 7)
+// =============================================================================
+
+/// **THE MACHINE'S TRAP COUNTERS, IN THIS PROCESS'S OWN ADDRESS SPACE.** Built
+/// by `System.stats_region_map` and by nothing else.
+///
+/// **IT OWNS THE ACCESS, NOT THE BYTES.** The `Mapping` inside is the installed
+/// protection row; the page underneath is the kernel's and is never anybody's to
+/// own. That is why there is no `Memory` here and no way to obtain one:
+/// splitting or donating the page the kernel counts traps into are not
+/// operations that could mean anything.
+///
+/// **`NoCopy`, AND DROPPING IT RELEASES THE HANDLE WITHOUT UNMAPPING** —
+/// `Mapping`'s own ruled stance, inherited by containment, and worth restating
+/// because the RAII habit points the other way. A `StatsRegion` that falls out
+/// of scope leaves its row installed: permanent, safe-but-leaked, never a
+/// dangling read. Call `unmap()` where revocation is meant.
+///
+/// The three layout numbers are read ONCE, out of the header the kernel
+/// published, and kept — the header is written at boot and never again, so
+/// re-reading it per access would buy nothing.
+public struct StatsRegion {
+    /// The row's owner. Package-private: a holder reaches it through `unmap()`,
+    /// which is the only thing a caller has any business doing with it.
+    public(package) mapping: Mapping,
+    /// Where the region starts in this process's address space — the kernel's
+    /// answer, read from `Mapping.base()` and never assumed.
+    public base: UInt,
+    /// How many rows the region publishes: one per process slot this machine
+    /// can ever hand out.
+    public rows: Int,
+    /// Bytes from `base` to row 0, as published.
+    public(package) rows_offset: UInt,
+    /// Bytes per row, as published.
+    public(package) row_bytes: UInt,
+    /// **WHICH ROW IS THE CALLER'S OWN.** Rows are indexed by process slot and
+    /// slot numbering is kernel-internal, so this is the number that makes the
+    /// table addressable to the process reading it.
+    public self_row: Int,
+}
+
+extension StatsRegion: NoCopy {}
+
+extension StatsRegion {
+    /// **ROW `index`'s THREE COLUMNS**, read out of the mapped page with no
+    /// syscall at all — which is the whole point of the region.
+    ///
+    /// The numbers mean exactly what `Process.stats()` means (see
+    /// `ProcessStats`) and come from the same storage, so the two surfaces
+    /// cannot disagree. A row belonging to a slot no process currently occupies
+    /// reads as whatever its last occupant left, until a create zeroes it:
+    /// `rows` is a CAPACITY, not a census, and this v1 publishes no liveness
+    /// column.
+    ///
+    /// **A 32-BIT READER CAN TEAR.** See `System.stats_region_map` for the whole
+    /// statement; the short version is that a torn column is a value between two
+    /// true readings and never one the counter never held.
+    ///
+    /// Out of range PANICS, which is the accessor rule (design 130): a direct
+    /// indexed accessor on a safe type is checked and faults loudly rather than
+    /// clamping or answering nonsense.
+    public func row(&self, index: Int) -> ProcessStats {
+        if index < 0 || index >= self.rows {
+            panic("StatsRegion.row: index out of range: {} (rows {})",
+                  index, self.rows)
+        }
+        let at = self.base + self.rows_offset + (index as UInt) * self.row_bytes
+        let raw = read_stats_row(at)
+        ProcessStats(syscalls: raw.syscalls, interrupts: raw.interrupts,
+                     faults: raw.faults)
+    }
+
+    /// This process's own row — `row(self.self_row)`, named because it is what
+    /// most readers want and because spelling it out invites a caller to
+    /// re-derive a number the kernel already answered.
+    public func mine(&self) -> ProcessStats {
+        self.row(self.self_row)
+    }
+
+    /// **TAKE THE ROW BACK OUT OF THIS PROCESS'S DOMAIN.** The page becomes
+    /// unreachable at once, on `Mapping.unmap`'s terms exactly — including the
+    /// live-domain rule, since the target is the caller itself.
+    ///
+    /// Unmapping twice terminates the caller, which is `Mapping.unmap`'s own
+    /// refusal and is caller-checkable.
+    public func unmap(&self) -> Result<Void, SosStatus> {
+        self.mapping.unmap()
+    }
 }

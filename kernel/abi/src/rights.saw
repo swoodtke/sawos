@@ -151,6 +151,22 @@
 /// It grants no authority over anything and leaks no other process's state, so
 /// it is in the root set and in the ordinary child mask, exactly as `ClockGet`
 /// is.
+///
+/// `StatsRegionMap` is the newest bit (sawos design 37, M5 unit 7), and it is
+/// the one right here that DOES leak other processes' state — which is exactly
+/// why it is its own bit rather than riding `ProcessRight.Stats`. The v1 op
+/// answers ONE process's columns through a handle onto THAT process, so its
+/// gate is per-target by construction; the region is every slot's columns in
+/// one page, so its gate has to be a separate, separately-strippable statement
+/// that this caller may see the whole machine's traffic. A launcher that wants
+/// a child to watch itself and nothing else gives it `ProcessRight.Stats` and
+/// withholds this; a supervisor that is meant to be a `top` gets this and pays
+/// no syscall per sample.
+///
+/// It is in the root set for `SlabDonate`'s reason — root is the process that
+/// is meant to be able to supervise the machine — and it is ABSENT from the
+/// ordinary child mask, because "everything a child normally gets" must not
+/// include every peer's trap counts.
 public enum SystemRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
@@ -161,6 +177,7 @@ public enum SystemRight: UInt32 {
     case ProcessSelf = 1 << 12,
     case SlabDonate = 1 << 13,
     case TierGet = 1 << 14,
+    case StatsRegionMap = 1 << 15,
 }
 
 // The universal low byte, pinned. Every kind's enum repeats these two asserts
@@ -191,6 +208,8 @@ static_assert((SystemRight.SlabDonate as UInt32) >= (1 << 8),
               "kind-specific right SlabDonate must start at bit 8 or above")
 static_assert((SystemRight.TierGet as UInt32) >= (1 << 8),
               "kind-specific right TierGet must start at bit 8 or above")
+static_assert((SystemRight.StatsRegionMap as UInt32) >= (1 << 8),
+              "kind-specific right StatsRegionMap must start at bit 8 or above")
 
 /// A right on a Process object (§2 table row; design 178 D4).
 ///
@@ -996,6 +1015,12 @@ public func root_system_rights() -> UInt32 {
      // grants authority over nothing, and a process that cannot ask which tier
      // it is running on cannot make the one decision the word exists for.
      | (SystemRight.TierGet as UInt32)
+     // `StatsRegionMap` (sawos design 37) is here on `SlabDonate`'s terms and
+     // not on `TierGet`'s: it DOES leak state — every process's trap columns,
+     // in one page — so it is in the root set because root is the process meant
+     // to be able to supervise the machine, and it is exactly the kind of bit a
+     // deployment strips on the way down to anything that is not a supervisor.
+     | (SystemRight.StatsRegionMap as UInt32)
      | (SystemRight.Transfer as UInt32))
 }
 

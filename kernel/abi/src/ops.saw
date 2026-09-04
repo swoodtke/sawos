@@ -35,7 +35,7 @@
 ///
 /// **`0xFFFF` IS OUTSIDE EVERY PER-OBJECT TABLE, FOREVER, and that is a rule
 /// rather than a coincidence.** Every op table in this file is DENSE FROM ZERO
-/// — `SystemOp` runs 0..4, `ProcessOp` 0..8, `EventOp` 0..1 — and stays that
+/// — `SystemOp` runs 0..7, `ProcessOp` 0..8, `EventOp` 0..1 — and stays that
 /// way, so no kind can ever grow into this number. A table that wanted 65535
 /// ops would have to say so here first. `from(raw:)` on a per-kind enum
 /// therefore never sees this value: the dispatch intercepts it BEFORE the kind
@@ -198,6 +198,35 @@ public static MINT_OP: UInt = 0xFFFE
 /// and `kernel/sysapi` depends on `sosabi` and `sosrt` only, never on a HAL, so
 /// a build-time constant cannot see the tier either. The op is therefore the
 /// whole of the surface, which is also the checkable half design 35 asked for.
+/// `StatsRegionMap` is the eighth, and it is THE FIRST OP ON ANY OBJECT THAT
+/// HANDS OUT ACCESS WITHOUT POSSESSION (sawos design 37, M5 unit 7; design 25
+/// seed 1). It installs a READ-ONLY protection row over the kernel's published
+/// stats region in the CALLER's own domain and answers a `Mapping` naming that
+/// row, together with the caller's own row index in the region.
+///
+/// **NO `Memory` HANDLE IS MINTED, AND THAT IS THE WHOLE SHAPE.** Every other
+/// way to obtain a mapping in this system starts from a Memory or an IoMemory —
+/// possession of bytes, then authority over an address space, two rights on two
+/// objects. The stats region is neither: it is kernel storage, so a Memory
+/// handle onto it would carry `Split` and would make it donatable, and neither
+/// of those is an operation that could ever mean anything over the page the
+/// kernel counts traps into. What the caller is granted is exactly the access
+/// and nothing that owns it.
+///
+/// **ONE RIGHT, BECAUSE THERE IS ONE OBJECT.** The two-rights doctrine exists
+/// because installing a row in SOMEBODY ELSE's address space is a second
+/// authority; this op installs into the caller's own and takes no Process
+/// handle to name another. So `SystemRight.StatsRegionMap` is the whole gate,
+/// and it is on System for `TierGet`'s reason: the region describes the
+/// MACHINE's processes rather than any one of them.
+///
+/// **IT IS `map`'s SHAPE.** The `Mapping` handle comes back in the value
+/// register and the ADDRESS comes from `MappingOp.Base`, exactly as for
+/// `MemoryOp.Map` — one mechanism for "the address is the kernel's answer",
+/// not two. Its arguments are a copy-out buffer and its capacity, which carry
+/// back the one thing `map` has no equivalent of: the caller's own ROW INDEX in
+/// the region, without which a caller holds a table it cannot find itself in.
+/// See `STATS_REGION_MAP_RECORD_WORDS`.
 public enum SystemOp: UInt {
     case DebugPrint = 0,
     case Shutdown = 1,
@@ -206,6 +235,7 @@ public enum SystemOp: UInt {
     case ProcessCreate = 4,
     case SlabDonate = 5,
     case TierGet = 6,
+    case StatsRegionMap = 7,
 }
 
 // =============================================================================
@@ -915,8 +945,10 @@ public enum ReplyWaitLeg: UInt {
 // unit 4 moved it, because neither `SlabDonate` (5) nor anything before it
 // re-pointed it at the new top. The rule above says "on its highest case", and
 // a bound tested against a case that is no longer the highest is a check that
-// would pass while the table walked past `MINT_OP`. It names `TierGet` now.
-static_assert((SystemOp.TierGet as UInt) < MINT_OP,
+// would pass while the table walked past `MINT_OP`. It named `TierGet` (6) from
+// unit 4 until M5 unit 7 added `StatsRegionMap` (7), and re-pointing it is the
+// same one-line duty this note exists to make impossible to forget.
+static_assert((SystemOp.StatsRegionMap as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
 static_assert((ProcessOp.Stats as UInt) < MINT_OP,
               "an op table must stay below the universal ops")

@@ -92,6 +92,13 @@ import sosabi.{
     ReplyWaitLeg,
     PROCESS_STATS_RECORD_DOUBLEWORDS,
     process_stats_record_bytes,
+    PROCESS_STATS_SYSCALLS_SLOT,
+    PROCESS_STATS_INTERRUPTS_SLOT,
+    PROCESS_STATS_FAULTS_SLOT,
+    StatsRow,
+    STATS_REGION_MAP_RECORD_WORDS,
+    STATS_REGION_MAP_ROW_WORD,
+    stats_region_map_record_bytes,
     SosStatus,
     FaultReason,
     ProcessStatusKind,
@@ -209,6 +216,8 @@ import kcore.objects.{
     unbind_handle,
 }
 import kcore.diag.{fatal_kernel}
+import kcore.stats.{stats_bump, stats_clear, stats_read, stats_region_phys,
+                    stats_region_len}
 import kcore.refs.{PipeMsgPrefix, PipeTakePrefix, deliver_attachment,
                    hold_staged, mint_staged, move_entry, msg_prefix,
                    notify_claim, notify_if_ready,
@@ -444,7 +453,61 @@ func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt, arg1: UInt,
             }
             op_value(protection_tier() as UInt)
         },
+        // THE EIGHTH OP, AND THE ONLY ONE THAT GRANTS ACCESS WITHOUT HANDING
+        // OVER ANYTHING TO POSSESS (sawos design 37, M5 unit 7). `arg0` is the
+        // copy-out buffer for the caller's row index and `arg1` its capacity;
+        // the Mapping comes back in the value register, which is `MemoryOp.Map`'s
+        // own shape.
+        case StatsRegionMap -> {
+            if not obj.allows(SystemRight.StatsRegionMap) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            stats_region_map(p, arg0, arg1)
+        },
     }
+}
+
+/// Install a READ-ONLY row over the published stats region in `p`'s own domain,
+/// and tell `p` which row of it is its own (sawos design 37, M5 unit 7).
+///
+/// **NO `Memory` IS INVOLVED ANYWHERE IN THIS FUNCTION, AND THAT IS THE OP.**
+/// Every other path to `install_row` starts from a region a caller possesses;
+/// this one starts from kernel storage the caller may READ and may never own.
+/// So the row's `region` is `NO_MEMORY` — the same word a device window uses,
+/// and for a neighbouring reason: there is no Memory slot whose mapping count
+/// this row belongs to, and nothing will ever return these bytes to a pool.
+/// `unmap` still works, because a Mapping owns its ROW rather than its bytes.
+///
+/// **READ-ONLY IS THE WHOLE ACCESS, AND IT IS WHAT THE TIER CAN ENFORCE.** On an
+/// isolated tier a store into the region faults; on the flat tier the tier word
+/// already disclaims hardware denial (design 19/35) and this op has nothing new
+/// to say about it. Execute is absent for the obvious reason and Write is absent
+/// for the load-bearing one: the columns are the kernel's, and a process that
+/// could write them could lie to every supervisor on the machine.
+///
+/// **THE ROW INDEX IS WRITTEN FIRST, DELIBERATELY.** It is a fact about the
+/// caller — process `p` occupies row `p` — and not a product of the install, so
+/// it is true on the refusal paths too; see `STATS_REGION_MAP_RECORD_WORDS`. A
+/// capacity below the published size, and a buffer outside the caller's own
+/// writable memory, are both mistakes only the caller could have made and both
+/// TERMINATE it, which is `process_stats`' rule at the same kind of door.
+func stats_region_map(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
+    if cap < (stats_region_map_record_bytes() as UInt) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    var row: [UInt; STATS_REGION_MAP_RECORD_WORDS] = [0; STATS_REGION_MAP_RECORD_WORDS]
+    row[STATS_REGION_MAP_ROW_WORD] = p as UInt
+    if let why = copy_out(p, dst,
+                          ((&var row) as UnsafePointer<UInt>) as UInt,
+                          stats_region_map_record_bytes() as UInt) {
+        fault_process(p, why)
+    }
+    // **THE PHYSICAL BASE, NOT THE KERNEL'S OWN** — a grant row names frames,
+    // and on a tier whose kernel lives in the linear map the two addresses
+    // differ (sawos design 29). `kcore.stats` owns that conversion.
+    let base = stats_region_phys()
+    install_row(p, p, base, base + stats_region_len(),
+                grant_perms(MapAccess.Read as UInt32), false, NO_MEMORY)
 }
 
 /// WHICH TIER THIS BUILD IS — `hal.prot_isolated()` in the ABI's vocabulary.
@@ -1100,10 +1163,11 @@ func process_create(p: Int, image_handle: UInt,
     // **THE COLUMNS OPEN AT ZERO** (sawos design 16), and this slot may be a
     // RECLAIMED one (design 3 D-3) — so this is the line that keeps a child from
     // inheriting its predecessor's traffic and reading a first `stats()` that
-    // describes a program it never was.
-    PROCESSES[slot].syscalls = 0
-    PROCESSES[slot].interrupts = 0
-    PROCESSES[slot].faults = 0
+    // describes a program it never was. Since M5 unit 7 it clears the slot's ROW
+    // of the shared region (sawos design 37) rather than three fields, which is
+    // the same statement about the same storage; a supervisor watching the page
+    // sees the row go to zero exactly here.
+    stats_clear(slot)
 
     // **THE CHILD'S LEDGER OPENS HERE, AFTER `place_image`** (sawos design 7
     // D-3), and the order is what the mapping row needs: `free_rows` is what
@@ -1417,20 +1481,12 @@ func boot_handle_next(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
     op_ok()
 }
 
-/// The record `Process.Stats` answers with, in kernel memory (sawos design 16).
-///
-/// Declaration order IS the layout (design 58), so the fields here and the
-/// doubleword indices `sosabi` publishes are one description — pinned by the
-/// assert below rather than by agreement, exactly as the clock reading is.
-struct ProcessStatsRecord {
-    syscalls: UInt64,
-    interrupts: UInt64,
-    faults: UInt64,
-}
-
-static_assert(sizeof<ProcessStatsRecord>()
-              == PROCESS_STATS_RECORD_DOUBLEWORDS * sizeof<UInt64>(),
-              "the stats record must be exactly the doublewords sosabi publishes")
+// **THE RECORD `Process.Stats` ANSWERS WITH IS `sosabi.StatsRow` SINCE M5 UNIT
+// 7** (sawos design 37). This file used to declare a kernel-private
+// `ProcessStatsRecord` with the same three fields and pin it to the published
+// doubleword indices with an assert. There is nothing left to pin: the shared
+// region is an ARRAY of the published row, so the op and the region are the same
+// declaration and cannot drift. The assert moved to `sosabi` with the struct.
 
 /// Copy `target`'s three trap columns into `p`'s buffer (sawos design 16).
 ///
@@ -1441,11 +1497,19 @@ static_assert(sizeof<ProcessStatsRecord>()
 /// makes the self case and the supervision case one function.
 ///
 /// **IT COSTS NOTHING TO ANSWER AND ALLOCATES NOTHING**, which is why no quota
-/// row is charged and no `NoResource` path exists: the columns are already on
-/// the slot, and the record is built on the kernel's own stack. So the only
+/// row is charged and no `NoResource` path exists: the columns are already in
+/// the region, and the record is built on the kernel's own stack. So the only
 /// failures a correct caller can meet are the copy door's, and those terminate
 /// (a buffer outside your own writable memory is a mistake only you could have
 /// made).
+///
+/// **IT IS THE COMPATIBILITY FLOOR SINCE M5 UNIT 7** (sawos design 37), and
+/// nothing about its surface moved: the columns now come out of the shared
+/// region rather than off the process slot, which is a change of address and not
+/// of answer. A caller that does not want a mapping — or does not hold
+/// `SystemRight.StatsRegionMap` — asks here and gets the same three numbers,
+/// consistent by construction rather than by synchronization, because this reads
+/// the very storage the region publishes.
 ///
 /// **THE CALL ITSELF IS COUNTED, AND IT IS COUNTED BEFORE THIS RUNS.** `ktrap`
 /// charges the syscall column at trap entry, so a reading taken by the process
@@ -1462,11 +1526,9 @@ func process_stats(p: Int, target: Int, dst: UInt, cap: UInt) unsafe -> SyscallR
     if cap < (process_stats_record_bytes() as UInt) {
         fault_process(p, FaultReason.BadArg)
     }
-    var rec = ProcessStatsRecord(syscalls: PROCESSES[target].syscalls,
-                                 interrupts: PROCESSES[target].interrupts,
-                                 faults: PROCESSES[target].faults)
+    var rec = stats_read(target)
     if let why = copy_out(p, dst,
-                          ((&var rec) as UnsafePointer<ProcessStatsRecord>) as UInt,
+                          ((&var rec) as UnsafePointer<StatsRow>) as UInt,
                           process_stats_record_bytes() as UInt) {
         fault_process(p, why)
     }
@@ -4438,12 +4500,16 @@ func count_trap(kind: TrapKind) unsafe {
         return
     }
     let p = THREADS[CURRENT_THREAD].process
+    // **THE COLUMN IS A ROW OF THE PUBLISHED REGION SINCE M5 UNIT 7** (sawos
+    // design 37). The attribution above is untouched — same process, same cause
+    // classes, same moment — and what changed is only where the doubleword
+    // lives: `kcore.stats` owns it, `ProcessOp.Stats` reads it back out of the
+    // same place, and a supervisor holding a read-only mapping sees this store
+    // land with no syscall of its own.
     match kind {
-        case Syscall -> { PROCESSES[p].syscalls = PROCESSES[p].syscalls + 1 },
-        case Interrupt -> {
-            PROCESSES[p].interrupts = PROCESSES[p].interrupts + 1
-        },
-        case Fault -> { PROCESSES[p].faults = PROCESSES[p].faults + 1 },
+        case Syscall -> { stats_bump(p, PROCESS_STATS_SYSCALLS_SLOT) },
+        case Interrupt -> { stats_bump(p, PROCESS_STATS_INTERRUPTS_SLOT) },
+        case Fault -> { stats_bump(p, PROCESS_STATS_FAULTS_SLOT) },
     }
 }
 

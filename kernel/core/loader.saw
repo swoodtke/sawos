@@ -23,6 +23,7 @@ import hal
 import imgformat.{SosimgHeader, SosimgSeg, SegFlag, fits_target_word}
 import kcore.mem.{align_up}
 import kcore.diag.{console, fatal_image}
+import kcore.stats.{stats_publish}
 import kcore.preempt.{long_copy, long_zero}
 import kcore.limits.{NO_MEMORY, ROOT_PROCESS}
 import kcore.process.{load_domain, record_grant, start_process}
@@ -548,6 +549,14 @@ public(package) func place_image(p: Int, img_base: UInt,
 /// regions the image asks for plus a stack, and drop to user mode at its entry.
 /// Never returns.
 public func load_root_and_enter() unsafe {
+    // **THE STATS REGION ANNOUNCES ITSELF BEFORE ANYTHING CAN COUNT** (sawos
+    // design 37, M5 unit 7). Four stores that write the version, the row count
+    // and the two offsets into the region's header — done here because this is
+    // the door into user mode and nothing traps before it, and done at boot
+    // rather than in the static's initializer so the whole region stays
+    // zerofill (design 149).
+    stats_publish()
+
     let base = hal.payload_start()
     let end = hal.payload_end()
     if end < base {

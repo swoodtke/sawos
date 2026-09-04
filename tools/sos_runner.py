@@ -543,6 +543,13 @@ TIMER_BADCLOCK_PKG = os.path.join(TESTS_DIR, "timer-badclock")
 TIMER_BADRECORD_PKG = os.path.join(TESTS_DIR, "timer-badrecord")
 TIER_WORD_PKG = os.path.join(TESTS_DIR, "tier-word")
 
+# M5 unit 7 (sawos design 37): the shared stats region. The launcher and the
+# child that reads ITS row out of the same page, plus the read-only proof, which
+# is its own package because a program that dies cannot go on to assert anything.
+STATS_REGION_PKG = os.path.join(TESTS_DIR, "stats-region")
+STATS_READER_PKG = os.path.join(TESTS_DIR, "stats-reader")
+STATS_REGION_RO_PKG = os.path.join(TESTS_DIR, "stats-region-ro")
+
 # What the harness types at the guest's serial port for the echo cases, and what
 # it then expects to read back out of it.
 #
@@ -5009,6 +5016,115 @@ TEST_CASES = [
                        "SOS: process teardown handles="],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
+    },
+
+    {
+        # =====================================================================
+        # M5 UNIT 7 — THE SHARED STATS REGION (sawos design 37)
+        # =====================================================================
+        #
+        # The milestone's own demo, the way the uart service was M4's: the trap
+        # counters live in ONE kernel-owned page, a process maps it read-only,
+        # and a `top` costs no syscalls at all.
+        #
+        # FOUR CLAIMS, and each row below is one of them.
+        #
+        #   1. The op tells a caller which row is its OWN. Rows are indexed by
+        #      process slot and slot numbering is kernel-internal, so without
+        #      this number a caller holds a table it cannot find itself in. Root
+        #      is the first process, so the answer is zero — and root ASSERTING
+        #      that is what makes the child's read of row zero sound.
+        #   2. The region's numbers are the kernel's real ones. Root makes
+        #      exactly eight syscalls between two reads of its own row and the
+        #      column moves by exactly eight. `syscalls` is the deterministic
+        #      column (`sosabi`'s record block), so this is an equality and not
+        #      a range — and neither bracket costs a trap, which is the property
+        #      the whole unit exists for.
+        #   3. The v1 op is still the floor. `Process.stats()` reads the SAME
+        #      storage, so it answers one higher — its own trap, charged before
+        #      the answer is assembled — and the program asserts the `+ 1`.
+        #   4. Cross-process visibility, which is the `top` shape. A CHILD with
+        #      the right maps the same page and reads its LAUNCHER's row: another
+        #      process's state, with no handle onto that process and no syscall
+        #      per sample. A child minted without `SystemRight.StatsRegionMap`
+        #      could not have made the call.
+        #
+        # And the region is UNMAPPED at the end, which says the access can be
+        # handed back even though nothing about it was ever owned.
+        #
+        # NO POOL: the page is the kernel's, granted by the op rather than carved
+        # out of memory root possesses. That is the access-without-possession
+        # shape, and it is why this case's boot set is two rows (the child's blob
+        # and its destination) rather than three.
+        #
+        # It runs on ALL THREE PROFILES. Nothing it asserts is a hardware denial
+        # — mapping, counting and reading are the kernel's own work — so the flat
+        # tier witnesses it exactly as the isolated ones do. The read-only half
+        # is the case below, and that one is tiered.
+        #
+        # It is APPENDED, per the convention this file states above: the report
+        # prints in case-definition order, so a case added at the END leaves
+        # every existing case's ordinal where a reader of an older transcript
+        # left it.
+        "name": "stats_region",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": STATS_REGION_PKG,
+        "children": [STATS_READER_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       # CLAIM 1. These row numbers are printed by the PROGRAM
+                       # and are therefore plain decimals — the `{zero}`/`{one}`
+                       # placeholders are for words the KERNEL prints, which are
+                       # fixed-width hex and word-width-sensitive.
+                       "SOS statsregion: self row 0",
+                       # CLAIM 2. Eight traps in, eight counted.
+                       "SOS statsregion: region delta 8",
+                       # CLAIM 3.
+                       "SOS statsregion: op agrees",
+                       # CLAIM 4 — the child's own voice, from a page it was
+                       # granted rather than given.
+                       "SOS statsreader: my row 1",
+                       "SOS statsreader: launcher busier",
+                       # The round trip through the §8 status word, read by root
+                       # through the Process handle it never gave away: `Exited`
+                       # in the high half and the child's mark (42) in the low.
+                       # The kernel's own exit line is not asserted beside it —
+                       # it renders the code as a word-width hex word, so it
+                       # would differ per profile for no gain here.
+                       "SOS statsregion: child exit 65578",
+                       "SOS statsregion: unmapped",
+                       "SOS statsregion: done"],
+        "expect_clean_exit": True,
+    },
+
+    {
+        # THE READ-ONLY HALF, AND IT IS ITS OWN CASE BECAUSE IT ENDS THE PROCESS.
+        # A program that dies proving a denial cannot go on to assert anything
+        # else, which is why `map_basics` and `map_unmap` are two cases and why
+        # these are.
+        #
+        # The program maps the region, READS a column first — so that the fault
+        # below is a statement about the access bits rather than about an address
+        # that was never granted at all — and then stores into it.
+        "name": "stats_region_ro",
+        # ISOLATED-ONLY (sawos design 35's machinery, design 37's leg). The
+        # assertion IS denial by the hardware: the columns are the kernel's
+        # account of what every process has cost the machine, and a process that
+        # could write them could lie to every supervisor on it. A flat platform
+        # lets the store land, the program runs on and prints its UNREACHABLE
+        # line, so the case would fail by omission rather than say anything true.
+        "tier": TIER_ISOLATED,
+        "tier_reason": "a store into the kernel's read-only counter page must "
+                       "FAULT; a flat platform lets the write land",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": STATS_REGION_RO_PKG,
+        "expect_out": ["{banner}",
+                       # The row really is installed — without this the fault
+                       # below would prove nothing.
+                       "SOS statsro: read ok",
+                       "SOS statsro: writing",
+                       "SOS: fault "],
+        "expect_clean_exit": False,
     },
 ]
 

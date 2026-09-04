@@ -1,0 +1,249 @@
+// SOS M5 unit 7: THE SHARED STATS REGION (sawos design 37; design 25 seed 1).
+//
+// **A `top` THAT COSTS NO SYSCALLS, WRITTEN OUT.** The kernel counts every trap
+// into a page it owns; a process with the right maps that page read-only and
+// reads the columns out of its own address space forever after. This program is
+// that flow end to end, and every line it prints is a claim about it.
+//
+// THE TRANSCRIPT, read as five claims:
+//
+//   SOS statsregion: self row 0          <- the op told this process which row
+//                                           is its own, and root is the first
+//                                           process, so it is row zero
+//   SOS statsregion: region delta 8      <- EIGHT syscalls made, eight counted,
+//                                           observed with no syscall of its own
+//   SOS statsregion: op agrees           <- `Process.stats()` answers the same
+//                                           storage: exactly one more, the trap
+//                                           that asked
+//   SOS statsreader: ...                 <- the CHILD's voice, reading root's
+//                                           row out of the same page
+//   SOS statsregion: unmapped            <- and the access can be given back
+//
+// **THE DELTA IS EXACT, WHICH IS WHY IT IS WORTH ASSERTING.** `syscalls` is the
+// deterministic column (`sosabi`'s record block says so): one per trap, whatever
+// the op and whatever the answer. So a window containing exactly eight traps
+// moves it by exactly eight — no tolerance, no range. Nothing may print inside
+// that window, because printing is syscalls; the reads that bracket it are plain
+// loads out of the mapped page and cost nothing, which is the property under
+// test.
+//
+// **THE `op agrees` LINE IS THE COMPATIBILITY FLOOR WITNESSED.** `Process.stats()`
+// is v1's surface and it now reads the very storage this page publishes, so the
+// two cannot drift. It reads ONE HIGHER than the region did because the call
+// itself is a trap and is charged before the answer is assembled — the honest
+// arrangement `sosabi` documents, and asserting the `+ 1` is what proves the
+// counting site is where it says it is.
+//
+// **NO POOL, NO `Memory`, NO SPLIT.** The page this program maps is the
+// kernel's. It is granted by the op and owned by nobody, which is the
+// access-without-possession shape design 37 exists to build: what comes back is
+// a `Mapping` — enough to read, and enough to hand the access back.
+
+import sos.{System, Process, Memory, StatsRegion, ProcessStats, SosStatus,
+            SystemRight, Clock, ClockType, Timer, Waiter}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// How many syscalls the measured window makes. A number that appears nowhere
+/// else in this transcript, so the line carrying it can only have been counted.
+static SPIN: Int = 8
+
+/// Root's config: the tag the child's System handle travels under.
+static TAG_BOOT: UInt = 21
+
+/// The key this case attaches its park timer under.
+static KEY: UInt = 93
+
+/// Twenty milliseconds — `map_into_child`'s number, and three orders of
+/// magnitude more than the child needs to map a page, read two rows and exit.
+static PARK_NS: UInt64 = 20_000_000
+
+/// **WHAT THE CHILD MAY ASK ITS SYSTEM OBJECT FOR**, and the middle bit is the
+/// one this case is about: print, learn its own Process object, and MAP THE
+/// STATS REGION. `Transfer` rides along because `give` checks it on the thing
+/// being given. Everything else — `Shutdown`, `ProcessCreate`, `ClockGet`,
+/// `SlabDonate`, `TierGet` — is absent BY SILENCE.
+///
+/// A child WITHOUT `StatsRegionMap` simply could not make this call, which is
+/// the attenuation the right exists to express: watching the whole machine's
+/// traffic is a thing a launcher hands over deliberately.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.StatsRegionMap
+                               | SystemRight.Transfer)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS statsregion: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // **THE MAP.** One trap, and every sample after it is free.
+    let region = try system.stats_region_map() catch {
+        print("SOS statsregion: map failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // The op told this process which row is its own. Root is the first process
+    // the machine reifies, so the answer is zero — and asserting it here is what
+    // lets the CHILD below read row zero and know whose it is.
+    if region.self_row != 0 {
+        print("SOS statsregion: self row {} wanted 0\n", region.self_row)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    // The region must have a row for every slot the machine can run, so it can
+    // never be narrower than the compiled floor. The COUNT is per-profile (it
+    // tracks the protection-domain pool), so the number is checked and not
+    // printed — a transcript row carrying it would say more about the HAL than
+    // about this op.
+    if region.rows < 1 {
+        print("SOS statsregion: region publishes {} rows\n", region.rows)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS statsregion: self row {}\n", region.self_row)
+
+    // ================= THE MEASURED WINDOW — NOTHING PRINTS =================
+    // Both brackets are plain loads out of the mapped page. Between them this
+    // process makes exactly `SPIN` traps and nothing else.
+    let before = region.mine().syscalls
+    var spun = 0
+    while spun < SPIN {
+        let _ = try system.tier() catch {
+            print("SOS statsregion: tier ask failed: {}\n", error)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        spun = spun + 1
+    }
+    let after = region.mine().syscalls
+    // Taken here, still inside the quiet window, so its own trap is the only one
+    // between the region read and this answer.
+    let op = try proc.stats() catch {
+        print("SOS statsregion: stats op failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    // =======================================================================
+
+    let moved = after - before
+    if moved != (SPIN as UInt64) {
+        print("SOS statsregion: region delta {} wanted {}\n", moved, SPIN)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS statsregion: region delta {}\n", moved)
+
+    if op.syscalls != after + 1 {
+        print("SOS statsregion: op says {} region said {}\n", op.syscalls, after)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS statsregion: op agrees\n")
+
+    // ===================== THE CROSS-PROCESS HALF ==========================
+    // The boot set, in the build's row order: the child's image blob, then the
+    // RAM it will run in. There is no pool row — this case allocates nothing.
+    var image = try proc.boot_handle_next() catch {
+        print("SOS statsregion: no image region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var dest = try proc.boot_handle_next() catch {
+        print("SOS statsregion: no destination region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let image_mem = image.take_memory() else {
+        let _ = system.debug_print("SOS statsregion: image record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest_mem = dest.take_memory() else {
+        let _ = system.debug_print("SOS statsregion: dest record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let child = try system.process_create(image: &image_mem,
+                                          memory: &dest_mem) catch {
+        print("SOS statsregion: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM) catch {
+        print("SOS statsregion: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        print("SOS statsregion: give failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try child.start(boot_tag: TAG_BOOT) catch {
+        print("SOS statsregion: start failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // Park, so the child gets the processor. Everything below happens after it
+    // has mapped the page, read two rows, printed and exited.
+    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
+        print("SOS statsregion: no clock: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let waiter = try proc.waiter_create() catch {
+        print("SOS statsregion: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let timer = try clock.timer_create() catch {
+        print("SOS statsregion: no timer: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try waiter.add(&timer, KEY) catch {
+        print("SOS statsregion: attach failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try timer.arm(after_ns: PARK_NS) catch {
+        print("SOS statsregion: arm failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try waiter.wait() catch {
+        print("SOS statsregion: wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let status = try child.get_status() catch {
+        print("SOS statsregion: status failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS statsregion: child exit {}\n", status)
+
+    // **AND THE ACCESS GOES BACK.** A Mapping owns its ROW, so unmapping works
+    // exactly as it does for memory this process owned — which is the point
+    // worth witnessing about a grant that came with nothing to own.
+    try region.unmap() catch {
+        print("SOS statsregion: unmap failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS statsregion: unmapped\n")
+
+    let _ = system.debug_print("SOS statsregion: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}

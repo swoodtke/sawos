@@ -1,0 +1,268 @@
+//! THE SHARED STATS REGION — the ONE storage the trap columns live in, and the
+//! page a process maps to read them (sawos design 37, M5 unit 7; design 25
+//! seed 1).
+//!
+//! **THE STORAGE MOVED; THE COUNTING SITES DID NOT.** The three columns used to
+//! be fields of `ProcessSlot`. They are rows of this region now, and
+//! `ProcessOp.Stats` reads them from here — so the v1 op answers identical
+//! numbers out of the new home, and there is no mirror to keep in step. That is
+//! the whole of the relocation: one storage, two doors.
+//!
+//! **WHERE THIS SITS IN THE MODULE ORDER, and why it is a module at all.** It
+//! names `kcore.mem` (the alignment arithmetic), `kcore.diag` (the kernel-bug
+//! report) and the HAL, and it is named BY the trap path, the stats op, the
+//! process reset and the map op. Everything that writes a column is above it and
+//! nothing it calls can reach back — the same test `mem` and `diag` pass, which
+//! is why it belongs down beside them rather than inside `pslot` (which holds
+//! records and does no work) or inside `dispatch` (which is at the top and would
+//! make the loader's boot-time publish an upward reach).
+//!
+//! # THE CAPACITY DECISION, RECORDED HERE BECAUSE THIS IS WHERE IT IS SPENT
+//!
+//! Design 37 asked for the region's row capacity to be decided honestly, and
+//! named two candidates: the compiled floor's rows in a static page with
+//! rows-beyond-floor as a follow-on, or the region sized for
+//! `PROT_DOMAIN_SLOTS`-scale counts up front.
+//!
+//! **THE FIRST IS NOT AVAILABLE, and finding out why is what settled it.** Once
+//! the columns RELOCATE, a process slot with no row has nowhere to count — so a
+//! floor-sized region would silently stop counting the donated slots M5 unit 6b
+//! exists to create. "Follow-on" would mean shipping a kernel that miscounts.
+//!
+//! **THE SECOND IS NOT MERELY BIGGER, IT IS EXACT.** `alloc_process` scans to
+//! `process_slots_usable()` = `min(PROCESSES.capacity(), hal.PROT_DOMAIN_SLOTS)`
+//! (design 36's wall), so `PROT_DOMAIN_SLOTS` is a CEILING on the slot index the
+//! machine can ever hand out — donation raises the capacity and cannot raise
+//! that. A region with `PROT_DOMAIN_SLOTS` rows therefore has a row for every
+//! process that can ever exist on this build, and the follow-on the brief was
+//! willing to accept is not owed at all.
+//!
+//! The cost is `.bss` and nothing else (design 149: an all-zero static is
+//! zerofill in both profiles, so the image carries none of it) — see the
+//! measurements in design 37's As-built.
+
+import hal
+
+import sosabi.{StatsRow, StatsRegionHeader, STATS_REGION_VERSION,
+               PROCESS_STATS_RECORD_DOUBLEWORDS, PROCESS_STATS_SYSCALLS_SLOT,
+               PROCESS_STATS_INTERRUPTS_SLOT, PROCESS_STATS_FAULTS_SLOT}
+
+import kcore.mem.{align_up}
+import kcore.diag.{fatal_kernel}
+
+// =============================================================================
+// The shape, in doublewords
+// =============================================================================
+//
+// THE BACKING IS RAW DOUBLEWORDS AND THE ABI IS TYPED STRUCTS, and the two are
+// pinned to each other by the asserts below rather than by agreement. That split
+// is deliberate: a READER overlays `sosabi`'s `StatsRegionHeader` / `StatsRow`
+// and reads by field name (the blessed typed-view idiom), while the WRITER is
+// the trap path, which must touch ONE doubleword per trap. A typed
+// read-modify-write of a whole row would be three loads and three stores where
+// one of each will do, on the hottest path in the kernel, to serve a spelling
+// preference. So the write side indexes by the slot constants `sosabi` already
+// publishes for the copy-out record — the same names, describing the same
+// layout, which is what keeps this from being magic-number arithmetic.
+
+/// Bytes in a doubleword. Named because it appears in the offset arithmetic
+/// below, and asserted rather than assumed.
+static DOUBLEWORD_BYTES: Int = 8
+
+static_assert(sizeof<UInt64>() == DOUBLEWORD_BYTES,
+              "a doubleword must be eight bytes for the region arithmetic")
+
+/// Doublewords in the published header.
+static HEADER_DOUBLEWORDS: Int = 4
+
+static_assert(sizeof<StatsRegionHeader>() == HEADER_DOUBLEWORDS * DOUBLEWORD_BYTES,
+              "the header's doubleword count must match the struct sosabi publishes")
+
+/// Where each header field sits, in doublewords from the region's base. The
+/// order is `StatsRegionHeader`'s declaration order, which IS its layout.
+static HEADER_VERSION_SLOT: Int = 0
+static HEADER_ROWS_SLOT: Int = 1
+static HEADER_ROW_BYTES_SLOT: Int = 2
+static HEADER_ROWS_OFFSET_SLOT: Int = 3
+
+/// Doublewords in one row — `sosabi`'s own number, not a second one.
+static ROW_DOUBLEWORDS: Int = PROCESS_STATS_RECORD_DOUBLEWORDS
+
+static_assert(sizeof<StatsRow>() == ROW_DOUBLEWORDS * DOUBLEWORD_BYTES,
+              "a row's doubleword count must match the struct sosabi publishes")
+
+/// **HOW MANY ROWS THE REGION PUBLISHES** — one per process slot this build can
+/// ever hand out. See the capacity argument in the module header.
+public(package) static STATS_ROWS: Int = hal.PROT_DOMAIN_SLOTS
+
+/// The alignment and granularity the region is PLACED and SIZED at when it is
+/// mapped, as a compile-time bound.
+///
+/// **IT IS THE COARSEST `PROT_GRAIN` ANY PROFILE IN THIS TREE PUBLISHES, and it
+/// is a constant here because a STORAGE SIZE has to fold.** The runtime
+/// arithmetic below aligns to `hal.PROT_GRAIN` — whatever this build's own
+/// granularity is — so the region a caller maps is exactly as tight as its
+/// hardware allows. What this constant sizes is the SLACK the static has to
+/// carry so that an aligned base exists inside it at all, and a bound is all it
+/// has to be: the assert below is what keeps it true as profiles are added.
+static REGION_ALIGN: Int = 4096
+
+static_assert(hal.PROT_GRAIN <= 4096,
+              "the stats region's compiled slack must cover this profile's protection grain")
+
+static_assert((REGION_ALIGN % DOUBLEWORD_BYTES) == 0,
+              "the region's alignment must be a whole number of doublewords")
+
+/// The published region's own size — header plus every row.
+static LIVE_DOUBLEWORDS: Int = HEADER_DOUBLEWORDS + STATS_ROWS * ROW_DOUBLEWORDS
+static LIVE_BYTES: Int = LIVE_DOUBLEWORDS * DOUBLEWORD_BYTES
+
+/// The static's size: the mapped span rounded up to the coarsest grain, plus one
+/// more grain so an aligned base is reachable wherever the linker lands the
+/// array. Both halves are the reason a caller never sees a byte the kernel did
+/// not mean to publish — the tail of the last granule is the region's OWN
+/// storage, so rounding the span up leaks nothing.
+/// (Written on one line because a `static` initializer may not wrap after the
+/// `=` — SL-22, filed by design 32 and still open.)
+static STORAGE_BYTES: Int = ((LIVE_BYTES + REGION_ALIGN - 1) / REGION_ALIGN) * REGION_ALIGN + REGION_ALIGN
+static STORAGE_DOUBLEWORDS: Int = STORAGE_BYTES / DOUBLEWORD_BYTES
+
+/// **THE REGION ITSELF.** An `unsafe static var` (design 149) rather than a
+/// `Once` or an `Atomic`, on the arena's terms exactly: it is compound state
+/// mutated throughout, its consistency spans words, and spec §7's uniprocessor
+/// argument plus interrupts-masked-in-the-kernel is what serializes it.
+///
+/// ALL-ZERO, so it is zerofill in both profiles and costs the image nothing
+/// (design 149). The header is written at boot by `stats_publish` rather than
+/// declared, which is what keeps that true — a non-zero initializer would move
+/// the whole region out of `.bss`.
+unsafe static var STATS_STORAGE: [UInt64; STORAGE_DOUBLEWORDS] = [0; STORAGE_DOUBLEWORDS]
+
+// =============================================================================
+// Where the published region starts
+// =============================================================================
+
+/// The doubleword index within `STATS_STORAGE` at which the published region
+/// begins — the alignment slack, measured rather than assumed.
+///
+/// The array is `[UInt64; N]`, so its address is already doubleword-aligned,
+/// and a `PROT_GRAIN` is a power of two — so the distance to the next boundary
+/// is a whole number of doublewords whichever side of eight the granularity
+/// falls on. A grain FINER than a doubleword is already satisfied and the
+/// distance is zero; a coarser one is a multiple of eight.
+func stats_first() unsafe -> Int {
+    let raw = ((&var STATS_STORAGE) as UnsafePointer<UInt64>) as UInt
+    let aligned = align_up(raw, hal.PROT_GRAIN)
+    ((aligned - raw) / (DOUBLEWORD_BYTES as UInt)) as Int
+}
+
+/// **WHERE THE REGION IS TO THE KERNEL** — the address the kernel's own loads
+/// and stores use. Aligned to this profile's real protection granularity.
+func stats_region_base() unsafe -> UInt {
+    align_up(((&var STATS_STORAGE) as UnsafePointer<UInt64>) as UInt, hal.PROT_GRAIN)
+}
+
+/// **WHERE THE REGION IS TO THE HARDWARE** — the PHYSICAL base a protection row
+/// has to name, which is what the map op grants.
+///
+/// **THE TWO ARE NOT THE SAME ADDRESS ON EVERY TIER, AND THAT IS THE WHOLE
+/// REASON THIS FUNCTION EXISTS** (sawos design 29's linear-map seam). A kernel
+/// static is reached by the kernel through whatever address the kernel runs at;
+/// a grant row's output address is a FRAME. On a tier whose kernel lives in the
+/// linear map those differ by a fixed offset, and handing the kernel's own
+/// address to a protection row produces a descriptor whose output address is not
+/// memory — which the hardware reports as an ADDRESS SIZE fault on the first
+/// read, not as a missing mapping. `hal.virt_to_phys` is identity where the two
+/// coincide, so this is one spelling on every profile rather than a branch.
+public(package) func stats_region_phys() unsafe -> UInt {
+    hal.virt_to_phys(stats_region_base())
+}
+
+/// **HOW MUCH OF IT IS GRANTED** — the published size rounded up to this
+/// profile's granularity, because a protection row is granular and a row that
+/// stopped mid-granule is not expressible.
+public(package) func stats_region_len() -> UInt {
+    align_up(LIVE_BYTES as UInt, hal.PROT_GRAIN)
+}
+
+// =============================================================================
+// The columns
+// =============================================================================
+
+/// Which doubleword of the storage a row's column sits at.
+func column_at(first: Int, row: Int, column: Int) -> Int {
+    first + HEADER_DOUBLEWORDS + row * ROW_DOUBLEWORDS + column
+}
+
+/// **IS THERE A ROW FOR THIS SLOT?** Structurally always yes — see the module
+/// header's capacity argument — so a `false` here is the kernel disagreeing with
+/// its own wall, which is a kernel bug and is reported as one rather than
+/// absorbed. `fatal_kernel` stops the machine and is not declared `-> Never`
+/// (design 6's finding 4), so every caller exits its own scope after it.
+func row_ok(row: Int) -> Bool {
+    if row < 0 || row >= STATS_ROWS {
+        return false
+    }
+    true
+}
+
+/// Add one to a column of `row`. The trap path's whole contact with the region.
+///
+/// ONE LOAD AND ONE STORE, which is why the write side does not go through a
+/// typed overlay (see the section header above).
+public(package) func stats_bump(row: Int, column: Int) unsafe {
+    if not row_ok(row) {
+        fatal_kernel("a trap was charged to a process slot with no stats row",
+                     row as UInt)
+        return
+    }
+    let at = column_at(stats_first(), row, column)
+    STATS_STORAGE[at] = STATS_STORAGE[at] + 1
+}
+
+/// Read `row`'s three columns out of the region — what `ProcessOp.Stats`
+/// answers with, from the one storage rather than from a copy of it.
+public(package) func stats_read(row: Int) unsafe -> StatsRow {
+    if not row_ok(row) {
+        fatal_kernel("stats were asked for a process slot with no row", row as UInt)
+        return StatsRow(syscalls: 0, interrupts: 0, faults: 0)
+    }
+    let first = stats_first()
+    StatsRow(syscalls: STATS_STORAGE[column_at(first, row, PROCESS_STATS_SYSCALLS_SLOT)],
+             interrupts: STATS_STORAGE[column_at(first, row, PROCESS_STATS_INTERRUPTS_SLOT)],
+             faults: STATS_STORAGE[column_at(first, row, PROCESS_STATS_FAULTS_SLOT)])
+}
+
+/// Zero `row`'s columns — what a process create does, so a reused slot never
+/// inherits its predecessor's traffic (the rule `sosabi`'s record block states).
+public(package) func stats_clear(row: Int) unsafe {
+    if not row_ok(row) {
+        fatal_kernel("stats were cleared for a process slot with no row", row as UInt)
+        return
+    }
+    let first = stats_first()
+    STATS_STORAGE[column_at(first, row, PROCESS_STATS_SYSCALLS_SLOT)] = 0
+    STATS_STORAGE[column_at(first, row, PROCESS_STATS_INTERRUPTS_SLOT)] = 0
+    STATS_STORAGE[column_at(first, row, PROCESS_STATS_FAULTS_SLOT)] = 0
+}
+
+// =============================================================================
+// Publishing
+// =============================================================================
+
+/// **WRITE THE HEADER**, once, before anything can count.
+///
+/// It is a boot-time write rather than a static initializer because an all-zero
+/// static is zerofill and a non-zero one is not: declaring the version would
+/// move the whole region — every row of it — out of `.bss` and into the image
+/// (design 149's rule, and design 36's `.bss` -> `.data` finding is the same
+/// trap seen from the other side). Four stores at boot buy that back.
+public(package) func stats_publish() unsafe {
+    let first = stats_first()
+    STATS_STORAGE[first + HEADER_VERSION_SLOT] = STATS_REGION_VERSION
+    STATS_STORAGE[first + HEADER_ROWS_SLOT] = STATS_ROWS as UInt64
+    let row_bytes = ROW_DOUBLEWORDS * DOUBLEWORD_BYTES
+    let rows_offset = HEADER_DOUBLEWORDS * DOUBLEWORD_BYTES
+    STATS_STORAGE[first + HEADER_ROW_BYTES_SLOT] = row_bytes as UInt64
+    STATS_STORAGE[first + HEADER_ROWS_OFFSET_SLOT] = rows_offset as UInt64
+}

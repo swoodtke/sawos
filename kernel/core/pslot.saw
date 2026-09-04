@@ -382,27 +382,24 @@ public(package) struct ProcessSlot {
     /// sits ABOVE the process table: a Process's readiness and payload are read
     /// out of it. See `kcore`'s module-order list.
     public(package) attachment: Int,
-    /// **THE THREE TRAP COLUMNS** (sawos design 16), split by the cause class
-    /// `ktrap` decides on: syscall traps, interrupts taken while this process
-    /// was current, and every other exception. `sosabi`'s
-    /// `PROCESS_STATS_RECORD_DOUBLEWORDS` block is the full description of what
-    /// each counts and which one an assertion may read.
-    ///
-    /// **`UInt64` ON BOTH PROFILES, AND THAT IS THE POINT.** A count is a
-    /// property of the quantity rather than of the machine: a `UInt` column
-    /// would be register-wide, so the same program would answer two different
-    /// things about itself depending on which profile it was built for. It is
-    /// the same rule the Clock record follows for a nanosecond count.
-    ///
-    /// THEY LIVE ON THE PROCESS SLOT AND NOT ON THE THREAD SLOT because the
-    /// ruled surface is PER-PROCESS (design 16, user, Sep 1) — per-thread waits
-    /// for a consumer that names it. A thread's traps are its process's, which
-    /// is what makes the count survive the thread and makes a multi-threaded
-    /// process's total the one number a supervisor asked for.
-    public(package) syscalls: UInt64,
-    public(package) interrupts: UInt64,
-    public(package) faults: UInt64,
 }
+
+// **THE THREE TRAP COLUMNS LEFT THIS RECORD IN M5 UNIT 7** (sawos design 37),
+// and the note stays because the absence is the design rather than an omission.
+//
+// `syscalls` / `interrupts` / `faults` were fields here from design 16 until the
+// stats region landed. They are rows of `kcore.stats`' published region now —
+// ONE storage, which `ProcessOp.Stats` reads and a mapped supervisor reads, with
+// no mirror on the slot to skew against it. What did NOT change is any of design
+// 16's semantics: still per-PROCESS rather than per-thread (a thread's traps are
+// its process's), still `UInt64` on both profiles (a count is a property of the
+// quantity, not of the machine), still keyed by the cause class `ktrap` decides
+// on, and still zeroed at create so a reused slot inherits nothing. `sosabi`'s
+// record block remains the full description of what each column counts.
+//
+// The reason they could not stay here AND be published is the one design 37
+// names: a mapped page is a page, so the columns have to be contiguous and
+// grain-aligned, and a `ProcessSlot` is neither.
 
 /// The process slab — extent 0 is `MAX_PROCESSES` long and a donation appends
 /// (sawos design 36, on designs 32/34's machinery).
@@ -436,8 +433,7 @@ public(package) unsafe static var PROCESSES: Slab<ProcessSlot, MAX_PROCESSES> = 
                          boot_count: 0, boot_next: 0,
                          quota_used: [0; QUOTA_KINDS],
                          quota_limit: [0; QUOTA_KINDS],
-                         refs: 0, attachment: 0,
-                         syscalls: 0, interrupts: 0, faults: 0); MAX_PROCESSES],
+                         refs: 0, attachment: 0); MAX_PROCESSES],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
     ext_side: [0; MAX_SLAB_EXTENTS],
