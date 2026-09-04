@@ -187,6 +187,21 @@ before anyone tunes it: riscv32's 12288 is mostly ROWS (256 of them at 24
 bytes), while arm64's 8192 is almost entirely GRANULARITY — 152 live
 bytes rounded up to one 4 KiB page plus one page of alignment slack.
 
+**AND THE MCU-CLASS BOARD PAYS THE RISCV32 NUMBER, which is the one
+figure here that could decide a port.** `kcore` is shared, so the
+non-gating ESP32-C3 kernel compiles this region too (checked: it builds
+clean, `--target-features +m,+c`). It takes `PROT_DOMAIN_SLOTS` and
+`PROT_GRAIN` straight from `rv32core`, so it gets **256 rows and the same
+12288 bytes of `.bss`** — on a part with a few hundred KiB of DRAM, which
+is a different proposition from the same number on a board with 128 MiB.
+Nothing is broken and nothing is changed here, because the C3 is
+non-gating and this unit had no authorization to retune a board knob. But
+the fix if it ever bites is small and worth naming now: `PROT_DOMAIN_SLOTS`
+is a BOARD number, and a board that will never run 256 concurrent
+processes should publish a smaller one — which shrinks the domain pool and
+this region together, since they are now sized by the same constant.
+Filed for design 20's port, not for this unit.
+
 ## 4. Alignment — the static has to carry its own slack
 
 A protection row is granular, and on the coarser profile a row whose base

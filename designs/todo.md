@@ -378,7 +378,12 @@ entry below or the brief that carries it, never restating either.
   not built, nothing in M5 consumes it); (c) `hal.PROT_DOMAIN_SLOTS` now sizes a
   SECOND thing, so raising it costs 24 bytes of `.bss` per slot on top of the
   domain pool's own cost — cheap, but no longer free, and an arena-sizing unit
-  should re-measure rather than reuse a pre-unit-7 number.
+  should re-measure rather than reuse a pre-unit-7 number. **The NON-GATING C3
+  board compiles this region too and gets riscv32's 256 rows / 12288 bytes of
+  `.bss` on a part with a few hundred KiB of DRAM** — checked to build clean,
+  deliberately not retuned (no authorization to move a board knob), and the fix
+  when it bites is that `PROT_DOMAIN_SLOTS` is a BOARD number which now sizes
+  the domain pool and this region together. Filed for design 20's port.
   **UNIT 1.5 BUILT (`designs/029`, Sep 3):** the higher-half kernel +
   the linmap seam. The arm64 kernel LINKS at
   `physical + 0xFFFF_FF80_0000_0000` and loads at its physical
