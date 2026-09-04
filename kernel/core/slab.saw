@@ -24,8 +24,9 @@
 //!
 //! `extent_addr` below is the ONLY place a donated extent's memory becomes an
 //! address. Every dereference of a donated slot goes through it, which is what
-//! makes the higher-half kernel's sweep (sawos design 29, M5 unit 1.5) a
-//! one-site edit rather than a hunt: see the note at the function.
+//! made the higher-half kernel's sweep (sawos design 29, M5 unit 1.5) a
+//! one-site edit rather than a hunt — and that edit HAS LANDED: the funnel
+//! converts through `hal.phys_to_virt` now. See the note at the function.
 //!
 //! # WHY A GENERIC RATHER THAN NINE HAND-WRITTEN SLABS
 //!
@@ -42,6 +43,10 @@
 //! this type as it stands, because growing the slot array would leave the
 //! satellite behind. Design 32 excludes those kinds by name rather than growing
 //! them badly — see its As-built for the table and the reasons.
+
+// The linear-map seam, for the one access funnel below (sawos design 29). The
+// identity on an MPU tier, so this import costs nothing there.
+import hal
 
 import kcore.limits.{MAX_SLAB_CAPACITY, MAX_SLAB_EXTENTS}
 
@@ -66,7 +71,8 @@ import kcore.limits.{MAX_SLAB_CAPACITY, MAX_SLAB_EXTENTS}
 public(package) struct Slab<T, const N: Int> {
     /// Extent 0 — the compiled floor, and the whole slab until something donates.
     public(package) inline: [T; N],
-    /// Each donated extent's base ADDRESS. Physical today; see `extent_addr`.
+    /// Each donated extent's base ADDRESS. PHYSICAL, and it stays physical —
+    /// a base is addresses-as-data; only `extent_addr` converts (design 29).
     public(package) ext_base: [UInt; MAX_SLAB_EXTENTS],
     /// How many slots each donated extent holds.
     public(package) ext_slots: [Int; MAX_SLAB_EXTENTS],
@@ -81,17 +87,26 @@ extension Slab<T, N> {
     /// THE ONE ACCESS FUNNEL: the address of slot `i`, which must be at or above
     /// the floor.
     ///
-    /// **THIS IS THE COORDINATION SEAM WITH M5 UNIT 1.5** (sawos design 29, the
-    /// higher-half kernel and its linear map). The address returned here is the
-    /// PHYSICAL address the donated Memory region named, and the kernel
-    /// dereferences it directly — which is correct on every tier the tree builds
-    /// today, because the kernel's own addressing is identity on all of them. When
-    /// the linmap lands, the kernel stops being able to touch a physical address,
-    /// and THIS RETURN VALUE is the conversion site: it becomes
-    /// `hal.phys_to_virt(base + offset)`, one edit, here. Nothing else in this
-    /// unit dereferences a donated extent, which is why 1.5's sweep of "every
-    /// kernel-side pointer built from a stored physical address" finds exactly
-    /// one site in the slab machinery.
+    /// **THIS IS THE COORDINATION SEAM WITH M5 UNIT 1.5, AND IT IS NOW LIVE**
+    /// (sawos design 29, the higher-half kernel and its linear map — merged
+    /// after this unit, which made 029 the second rebaser and this its
+    /// sixteenth sweep site).
+    ///
+    /// `ext_base[e]` stays PHYSICAL, because that is what a donated extent's
+    /// base IS everywhere else: it comes from a `Memory` capability, it is
+    /// addresses-as-data, and the design-29 discipline is that such an address
+    /// never changes meaning — only the moment of kernel DEREFERENCE converts.
+    /// This return is that moment, so the conversion is here and nowhere else.
+    /// The extent table, the donate op, the capacity arithmetic and every
+    /// caller are untouched by it.
+    ///
+    /// It is the identity on an MPU tier and folds away to nothing there; on a
+    /// tier whose kernel runs outside physical addresses it is the linear map's
+    /// arithmetic. Nothing else in this module dereferences a donated extent,
+    /// which is why 1.5's sweep of "every kernel-side pointer built from a
+    /// stored physical address" finds exactly one site in the slab machinery —
+    /// and why getting it wrong would have been a hard fault on a translating
+    /// tier and invisible on the others.
     ///
     /// The walk is bounded by `MAX_SLAB_EXTENTS` and its body is O(1), so it
     /// takes no preemption point and needs none — design 1's audit argument
@@ -103,7 +118,8 @@ extension Slab<T, N> {
         while e < self.ext_count {
             let here = self.ext_slots[e]
             if rest < here {
-                return self.ext_base[e] + ((rest * sizeof<T>()) as UInt)
+                return hal.phys_to_virt(self.ext_base[e]
+                                        + ((rest * sizeof<T>()) as UInt))
             }
             rest = rest - here
             e = e + 1

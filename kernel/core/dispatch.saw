@@ -827,7 +827,16 @@ func slab_donate(p: Int, raw_kind: UInt, handle: UInt) unsafe -> SyscallResult {
     // allocator and no teardown sweep can reach these bytes, and the handle is
     // not consumed yet, so the region is still exactly the caller's. A delivery
     // landing mid-zero finds the machine in the state it was in before the call.
-    long_zero(start, (slots as UInt) * stride)
+    //
+    // **THE SECOND HALF OF THE 1.5 COORDINATION SEAM** (sawos design 29). This
+    // is a kernel DEREFERENCE of a donated extent, so it converts, exactly as
+    // `Slab.extent_addr` does at the read side. `start` itself stays PHYSICAL —
+    // it is what `slab_install` records in the extent table below, and what the
+    // extent table holds is addresses-as-data. The two sites are the whole of
+    // the donation path's contact with the linear map: this one writes the
+    // bytes once, before anything can reach them, and the funnel reads them
+    // ever after.
+    long_zero(hal.phys_to_virt(start), (slots as UInt) * stride)
 
     if not slab_install(kind, start, slots) {
         fatal_kernel("a validated slab donation was refused", raw_kind)
