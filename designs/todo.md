@@ -92,9 +92,90 @@ entry below or the brief that carries it, never restating either.
   condition ENDS the caller — which matches the doctrine and is what the negative
   case asserts; (c) the `maps == 0` half of the condition is implemented but
   UNTESTED (it wants a live mapping, a bigger case), named as a finding.
-  **THE 1.5 SEAM IS OPEN AND ONE LINE**: `Slab.extent_addr` returns the physical
-  address raw with the conversion site written at it, so whichever of 029/032
-  rebases second changes exactly that return to `hal.phys_to_virt(...)`.
+  **THE 1.5 SEAM IS CLOSED (029 rebased second, Sep 3) — AND IT WAS TWO SITES,
+  NOT ONE.** This entry used to say `Slab.extent_addr` was the single line to
+  flip. The READ funnel was indeed one line, but `slab_donate`'s `long_zero` in
+  `dispatch.saw` — the write that zeroes a donated extent so its slots start
+  `Free` — dereferences the same raw physical base BEFORE the extent is in the
+  table, so it never passes through the funnel. Both convert now; see 029's
+  finding 6 for the fault that found it and why riscv32 could not.
+  **UNIT 1.5 BUILT (`designs/029`, Sep 3):** the higher-half kernel +
+  the linmap seam. The arm64 kernel LINKS at
+  `physical + 0xFFFF_FF80_0000_0000` and loads at its physical
+  addresses unchanged (`virt.ld`: one VMA cursor plus a per-section
+  `AT(ADDR(.x) - LINMAP_OFFSET)`, and `ENTRY(_start_phys)` because QEMU
+  sets the reset PC from `e_entry` with the MMU off). `TCR_EL1.EPD1`
+  opens and `T1SZ` = `T0SZ` = 25 — a 39-bit VA on both halves, chosen
+  to MATCH so a kernel address and its physical twin share a level-1
+  index, which is what makes the seam a pure OR/AND and lets one
+  two-descriptor boot table serve TTBR0 and TTBR1 at once. TTBR1 holds
+  a LINEAR MAP (3 tables, 12 KiB, built once): 2 MiB Device blocks over
+  the device gigabyte and 2 MiB Normal blocks over the 128 MiB of real
+  RAM, PXN throughout **except RAM block 0**, which holds the kernel
+  image and must execute — bounded by the `_bss_end <= ROOT_LOAD_BASE`
+  assert that already existed, so the linker ceiling and the carve-out
+  are one number. Per-process sets lose their kernel blocks entirely:
+  TTBR0 is the process's two windows and nothing else, and a
+  non-granted page is now genuinely ABSENT. `hal.phys_to_virt` /
+  `virt_to_phys` land on every HAL (identity on both riscv32 boards,
+  folding away to nothing); **15 kernel-side sites swept**, and the
+  As-built lists the 4 deliberately NOT swept — an address from a Saw
+  reference is already a kernel address, which is exactly why
+  `copy_out` converts `dst` and not `src`. The boot window is
+  hand-written assembly because a high-linked kernel cannot call
+  compiled code before the MMU is on; the TTBR1 swap runs from the
+  identity map (Linux's `idmap_cpu_replace_ttbr1` shape). No value is
+  spelled twice: `boot.S` reads MAIR/TCR from `sink.c` `const`s through
+  a masked pointer, MAIR is checked against `sos_mair_value()` every
+  boot, and the offset's two spellings (`virt.ld`, `lib.saw`) are
+  compared at boot by `linmap_offset_probe`.
+  **Gate 117 cases, 234/234 both arches, transcript BYTE-IDENTICAL and
+  hashing to `d37d2db` — the same hash main's own run records**, so the
+  unit moves no row.
+  THREE FINDINGS, the first against the brief:
+  (1) **the `.bss` delta is `+0x4000` (+16 KiB), POSITIVE where the
+  brief expected NEGATIVE** — the sets did lose their kernel content,
+  but that content was ENTRIES inside tables the user windows still
+  need, and a translation table is a PAGE, so a set is the same 3072
+  descriptors it was; the delta is exactly the linmap's 3 tables plus
+  the 4 KiB boot table, and the honest win is "+12 KiB instead of
+  +36 KiB", not a shrink;
+  (2) **the fault class DID flip** — `ESR` `0x9200004F` (DFSC 0x0F,
+  permission) → `0x92000047` (DFSC 0x07, translation), same EC and
+  direction bit, so `cause_tag` renders identically; checked by PROBE
+  because the gate cannot witness a class (027 finding 3), and the
+  normalization is now stated at `abort_direction` as a decision;
+  (3) **PXN is not end to end** — one 2 MiB block is EL1 RWX, and
+  per-section W^X inside it (3 linker symbols + a level 3) is a named,
+  unspent refinement. No SL entry owed.
+  **REBASED onto design 32 (`d919aae`) and re-gated — 1.5 was the
+  SECOND REBASER, so the coordination seam is DISCHARGED here.** One
+  conflicting file, `designs/todo.md`, and it is pure adjacency (two
+  units appending to this entry; both kept). No code file conflicted:
+  032 touched no HAL file and 1.5 touched no allocator file.
+  **THE SEAM WAS TWO SITES, NOT THE ONE BOTH UNITS WROTE DOWN** —
+  finding 6, and the one thing the lead should carry forward.
+  `Slab.extent_addr` (the READ funnel, `kernel/core/slab.saw`) was
+  anticipated by everyone; `slab_donate`'s `long_zero` (`dispatch.saw`),
+  which zeroes an extent before installing it so its slots start `Free`,
+  was not — it lives in another file, reaches the extent by its raw
+  physical base, and runs BEFORE the extent is in the table, so it never
+  passes through the funnel. Both now convert; the base stays PHYSICAL
+  in the extent table either way. **A TEST CAUGHT IT, NOT A REVIEW**:
+  with only the funnel flipped, `slab_donate` failed on arm64 with
+  `ec=0x25 elr=0xffffff804000abdc far=0x40280000` — a kernel data abort
+  whose ELR is high and whose FAR is the raw extent base, the exact
+  shape of a missed conversion — while riscv32 passed at every stage,
+  because the seam is the identity there. The general lesson outlives
+  this pair: a "one access funnel" claim covers READS, and memory must
+  be initialized before it can be read.
+  **Combined-state gate: 119 cases, 238/238 both arches, 495 lines,
+  hashing to `13b3214c` — exactly the hash 032's As-built records for
+  its own 238-run on main**, so the combined tree reproduces main's
+  transcript byte for byte and 1.5 adds no row on top of 032's. The
+  slab-donate cases now execute over 1.5's linear map on arm64, which
+  makes their passing the seam-flip's own witness. Sweep is now
+  **17 sites**.
 
 - M6 (after M5): the storage milestone — seed `designs/030` (user-
   ruled Sep 3): flash-first block driver, RO archive fs + a simple

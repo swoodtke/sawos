@@ -48,6 +48,21 @@ HAL number rather than a shared constant:
 | `map_target_ok(base, top) -> Bool` | **THE 4 MiB GRANT WINDOW, ASKED RATHER THAN DIED IN.** `prot_region` already enforces this bound and enforces it by STOPPING THE MACHINE (`grant_outside_window`) — correct for the loader path, where a memory map that outgrew the window is a kernel bug, and wrong for a map, where the range came from a region a PROCESS chose. The predicate moves that refusal to the op as a caller-visible `BadArg`, and the HAL's kernel-bug stop stays for the path it was written for. Page alignment of `base` is NOT required: the walk rounds down to the page it starts in, exactly as it does for a segment. |
 | `device_window_ok(base, len) -> Bool` | Whole pages, both ends, inside the one device window this board publishes a level-3 table for. Profile A's rule differs in FORM (a naturally-aligned power of two, because a window there is ONE protection entry) and is identical in purpose, which is what makes the predicate per-HAL rather than a shared check with two branches. |
 
+**sawos design 29 added a PAIR to that shared table, and this profile is the
+only one where it does anything:**
+
+| Name | What it means HERE |
+|---|---|
+| `phys_to_virt(pa) -> UInt` | `pa \| LINMAP_OFFSET`. **A PHYSICAL ADDRESS AS THE KERNEL MUST SPELL IT TO DEREFERENCE IT.** The kernel runs in the high half under TTBR1 over a linear map of RAM and MMIO, so a stored physical address — a sosimg record, a region-table row, a grant's bounds, an MMIO base, a translation table — is not an address the kernel can load through. Both riscv32 HALs answer the IDENTITY and fold the call away entirely. |
+| `virt_to_phys(va) -> UInt` | `va & LINMAP_PHYS_MASK`, the inverse, for the three places a kernel address has to become hardware's or DATA's: the table pool's base (a TTBR and every table descriptor hold physical), the payload and region-table linker bounds, and a region row the linker resolved. IDEMPOTENT on an already-physical address, which is what lets one call normalize the region table's mixed-provenance rows. |
+
+The discipline above them is the kernel's, not this file's, and it is what keeps
+`kernel/core` arch-free: **addresses-as-data stay PHYSICAL everywhere, and only
+the moment of kernel DEREFERENCE converts.** `LINMAP_OFFSET` is
+`0xFFFF_FF80_0000_0000` (`2^64 - 2^39`, matching `TCR_EL1.T1SZ` = `T0SZ` = 25),
+and five `static_assert`s hold this board's RAM and MMIO under it so the pair
+stays a pure OR/AND.
+
 The design 172 review round changed how much of that surface this file writes,
 not the surface: the poll-and-place, the panic path's write LOOP and the
 exit-status promotion are `sosrt`'s, once, for both profiles. What stays here is
@@ -60,22 +75,22 @@ rather than a byte to THR.
 
 | Symbol | Where | Contract | Why not Saw |
 |---|---|---|---|
-| `_start` | boot.S | Reset entry. Stack, `VBAR_EL1`, `CPACR_EL1.FPEN`, `.bss` zerofill, `sos_mmu_init`, `kmain`. Never returns. | Instructions: `msr`, and a stack pointer before any compiled code can run. |
+| `_start` (entered as `_start_phys`) | boot.S | Reset entry, and **the whole relocation window** (sawos design 29). At its PHYSICAL address, MMU off: a masked stack, `CPACR_EL1.FPEN`, `.bss` zerofill, and a two-descriptor BOOT TABLE installed in TTBR0 and TTBR1 at once — one page serving as both the identity map and a coarse linear map, because a kernel address and its physical twin share a level-1 index. Then MMU on, branch HIGH, set the real stack and `VBAR_EL1`, build the real tables (`sos_mmu_tables`, `sos_page_tables_build`), install TTBR1 from the identity map, install TTBR0 = set 0, `kmain`. Never returns. `ENTRY` names `_start_phys` (`_start - LINMAP_OFFSET`) because QEMU sets the reset PC from `e_entry` with the MMU off. | Instructions: `msr`, and — the reason the window exists at all — a high-linked kernel cannot CALL compiled code until the MMU is on and TTBR1 is walked. |
 | `_vectors` | boot.S | The 16-entry EL1 vector table. TWO entries are a user trap now — "lower EL, AArch64, synchronous" and, since design 178, "lower EL, AArch64, IRQ"; every other entry is a kernel bug (an interrupt among them, see D2 below) and lands on `kernel_fault_entry`. | A vector table is placement + branches at fixed 0x80 strides. |
 | `user_trap_entry` | boot.S | Saves the RUNNING THREAD'S 34-doubleword frame, switches `SP_EL1` to the kernel stack, calls `ktrap(frame, ESR, FAR)`, and resumes the frame `ktrap` RETURNS — which need not be the one it was called with, and that is the context switch. | Register saves and `eret`. |
 | `user_irq_entry` | boot.S | The same frame, then `ktrap(frame, IRQ_CAUSE, 0)`, then the same return path — the save is a macro and the restore is shared code, so the two entries cannot drift. | Register saves and `eret`. |
 | `kernel_fault_entry` | boot.S | Reads `ESR`/`ELR`/`FAR` and calls the SAW `sos_kernel_fault` with them. | `mrs` names a register at assembly time. The REPORT is Saw (design 172 unit 3). |
 | `sos_resume_frame(frame)` | boot.S | Enter EL0 in a saved context, behind `resume_frame`. One branch into the restore path above, because the frame already holds the `SPSR` that selects EL0t. | The `eret` the restore path owns. |
 | `sos_platform_exit(code)` | sink.c | Stop the machine through semihosting `SYS_EXIT`. | `hlt #0xf000` with the call number and parameter block pinned in x0/x1. |
-| `sos_mmu_init()` | sink.c | Ask `lib.saw` for a finished identity map, then turn the MMU on. Called by `_start` after `.bss` is zeroed, because the tables live there. | `msr`/`mrs` to four system registers plus `dsb`/`isb`. The MAP is Saw (design 172 unit 1). |
+| `sos_mmu_tables()` | sink.c | Build the kernel LINEAR MAP and hand back its level-1 PHYSICAL base, for `boot.S` to install in TTBR1. Checks `sos_boot_mair` against `lib.saw`s `sos_mair_value()` first and stops the machine (68) on drift. Called from the HIGH half, so the tables below it are built with translation already on. It REPLACED `sos_mmu_init`, which enabled the MMU — that moved to `boot.S` when the kernel started linking high (sawos design 29). | A sequencing shim between two Saw builders and one assembly caller. |
 | `sos_prot_commit()` | sink.c | Publish the staged grant set. Since sawos design 27 this serves only the six legacy harness kernels in `tests/` that program the protection surface directly — the kernel's own switch is `sos_ttbr0_write`. | `dsb`/`isb` barriers and a `tlbi`. The DESCRIPTORS are Saw. |
 | `sos_ttbr0_write(value)` | sink.c | **THE PROCESS SWITCH** (sawos design 27): install a persistent per-process table set. `value` is the set's level-1 base with the ASID already in bits 63:48 — one word, assembled in Saw. | `msr` names a system register at assembly time; the `dsb ishst`/`isb` around it are barriers. |
 | `sos_tlbi_asid(asid)` | sink.c | Drop every cached translation carrying this ASID — the maintenance behind a grant install, a revocation, and a domain clear. Shifts the argument into bits 63:48 itself. | `tlbi` is a maintenance instruction and the fences are barriers. |
 | `sos_timer_freq()` / `sos_timer_ctl_read()` / `sos_timer_ctl_write(v)` / `sos_timer_count()` / `sos_timer_set_compare(v)` | sink.c | The core's physical timer: its frequency, its control register (enabled / masked / fired), the free-running 64-bit counter, and the 64-bit ABSOLUTE deadline it is compared against. | `mrs`/`msr` name a system register at assembly time. One instruction each; the nanosecond arithmetic, the tick policy and the deadline composition are Saw. |
-| `sos_payload_start()` / `sos_payload_end()` | sink.c | Bounds of the appended payload. | A linker symbol's ADDRESS, which Saw cannot name — DF-172a. |
+| `sos_payload_start()` / `sos_payload_end()` | sink.c | Bounds of the appended payload, **masked to PHYSICAL** (sawos design 29): the symbol is a high link address, but these bounds are granted to EL0 and read as an image base, which are both physical readings. | A linker symbol's ADDRESS, which Saw cannot name — DF-172a. |
 | `sos_region_table_start()` / `sos_region_table_end()` | sink.c | Bounds of the `.regions` section — the boot region table (sawos design 2 D-2). | Same reason, DF-172a. It is the ONE new fixed symbol pair that unit brought: the table's blob rows carry bases the LINKER resolved when it placed the generated stub, so no per-child symbol has to be nameable here. |
 | `sos_wait_for_irq()` | sink.c | Park the core until an interrupt is pending, behind `wait_for_irq`. | `wfi` is an INSTRUCTION. One line, and it is the whole of design 178 M2 unit 4's native delta on this profile. |
-| `virt.ld` | — | Places the image at RAM base 0x4000_0000 and bounds the appended payload on PAGE boundaries — protection granularity here is the page. | Not a program. |
+| `virt.ld` | — | LINKS the image at `0x4000_0000 + LINMAP_OFFSET` and LOADS it at 0x4000_0000 (one VMA cursor, a per-section `AT(ADDR(.x) - LINMAP_OFFSET)`), bounds the appended payload on PAGE boundaries, and exports `LINMAP_PHYS_MASK` as an absolute symbol for `boot.S`. Asserts `_bss_end` below `ROOT_LOAD_BASE` — which is also the top of the one RAM block the linear map leaves executable. | Not a program. |
 
 Moved to `lib.saw` by design 172, and no longer C: `sos_rt_write` (unit 4, and
 now check-free by construction so the panic path cannot re-enter it),
