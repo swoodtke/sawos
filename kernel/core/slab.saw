@@ -37,12 +37,31 @@
 //! `Slab<TimerSlot, MAX_TIMERS>`, with its own layout), so there is one body to
 //! review and one place a bug in the arithmetic could be.
 //!
-//! # WHAT IS NOT HERE
+//! # THE SATELLITE KINDS, AND THE TWO SHAPES THAT ADMITTED THEM
 //!
-//! A kind whose slab has PARALLEL storage keyed by the same index cannot use
-//! this type as it stands, because growing the slot array would leave the
-//! satellite behind. Design 32 excludes those kinds by name rather than growing
-//! them badly — see its As-built for the table and the reasons.
+//! This paragraph used to say that a kind with PARALLEL storage keyed by the
+//! same index could not use this type, because growing the slot array would
+//! leave the satellite behind — and design 32 excluded THREADS and PIPES on
+//! exactly that. **M5 unit 6a (sawos design 34) converted both, and it took two
+//! different answers rather than one.**
+//!
+//! - **PIPES had TEN satellites, and the fix was to stop having ten.** The
+//!   per-exchange arrays are fields of one `Exchange` record now, so the
+//!   exchanges are an ordinary `Slab` of their own — and it grows in LOCKSTEP
+//!   with the connection slab because the flat exchange index
+//!   (`x = c * PIPE_INFLIGHT + i`) is uniform across the chain, which makes the
+//!   two chains' extent boundaries agree by arithmetic rather than by
+//!   bookkeeping. See `kcore.objects`' exchange-record header for the proof.
+//!
+//! - **THREADS had ONE satellite that could not become a field**, because a
+//!   trap frame's ALIGNMENT is load-bearing on one profile and no struct layout
+//!   gives it on both. So the extent table grew a column: `ext_side` below, read
+//!   through the same `locate` walk the slot lookup uses, so slot `i`'s frame and
+//!   slot `i`'s storage can never disagree about which extent they are in.
+//!
+//! The rule the old paragraph stated still holds for anything that fits neither:
+//! a satellite has to become part of the slot, or a chain the same `locate`
+//! answers for. What is not allowed is a second table.
 
 // The linear-map seam, for the one access funnel below (sawos design 29). The
 // identity on an MPU tier, so this import costs nothing there.
@@ -76,6 +95,29 @@ public(package) struct Slab<T, const N: Int> {
     public(package) ext_base: [UInt; MAX_SLAB_EXTENTS],
     /// How many slots each donated extent holds.
     public(package) ext_slots: [Int; MAX_SLAB_EXTENTS],
+    /// **THE SIDE ARENA'S BASE FOR THIS EXTENT** (sawos design 34), PHYSICAL on
+    /// `ext_base`'s terms and `0` for a kind that has no side arena — which is
+    /// nine of the eleven.
+    ///
+    /// A SIDE ARENA IS PER-SLOT STORAGE THAT IS NOT PART OF THE SLOT: the
+    /// thread frame arena is the one this exists for, a saved context that must
+    /// be `THREAD_FRAME_STRIDE`-aligned and therefore cannot be a field of
+    /// `ThreadSlot` (see `kcore.threads.frame_slot` for why the alignment is
+    /// load-bearing rather than tidy). Growing it with the chain means every
+    /// donated extent carries BOTH arrays, and the two must be indexed by one
+    /// boundary or a donated thread could read another thread's frame.
+    ///
+    /// **IT IS A COLUMN OF THE EXTENT TABLE RATHER THAN A TABLE OF ITS OWN, and
+    /// that is the whole point.** `locate` answers `(extent, offset)` once, and
+    /// both the slot address and the side-arena address are derived from that
+    /// one answer — so there is no second lookup that could disagree with the
+    /// first. A parallel array living somewhere else would have been the same
+    /// arithmetic with a skew failure mode added to it.
+    ///
+    /// The nine kinds with no side arena pay `MAX_SLAB_EXTENTS` words of `.bss`
+    /// for a column they never read. That is 4 words per slab, zero image bytes
+    /// (design 149's zerofill), and it buys the structural impossibility above.
+    public(package) ext_side: [UInt; MAX_SLAB_EXTENTS],
     /// How many donated extents are live. Only grows — donation is permanent
     /// in v1 (design 25 D-6, the mapping-leak stance).
     public(package) ext_count: Int,
@@ -113,19 +155,40 @@ extension Slab<T, N> {
     /// unchanged, restated in design 32's As-built for the loops whose bounds
     /// moved.
     public(package) func extent_addr(&self, i: Int) unsafe -> UInt {
+        let (e, rest) = self.locate(i)
+        hal.phys_to_virt(self.ext_base[e] + ((rest * sizeof<T>()) as UInt))
+    }
+
+    /// **THE ONE BOUNDARY WALK**: which donated extent holds slot `i`, and how
+    /// far into it — for an `i` at or above the floor.
+    ///
+    /// It was `extent_addr`'s loop body until sawos design 34, and it is its own
+    /// function now because a SIDE ARENA (see `ext_side`) has to land in the
+    /// same extent at the same offset as the slot it belongs to. Two walks would
+    /// have been two chances to disagree; one walk answering `(extent, offset)`
+    /// is a pair both addresses are then pure arithmetic on.
+    ///
+    /// Bounded by `MAX_SLAB_EXTENTS` over an O(1) body — design 1's audit
+    /// argument, unmoved, and restated at `frame_slot` for the context-switch
+    /// path that now reaches it.
+    public(package) func locate(&self, i: Int) -> (Int, Int) {
         var rest = i - N
         var e = 0
         while e < self.ext_count {
             let here = self.ext_slots[e]
             if rest < here {
-                return hal.phys_to_virt(self.ext_base[e]
-                                        + ((rest * sizeof<T>()) as UInt))
+                return (e, rest)
             }
             rest = rest - here
             e = e + 1
         }
-        panic("Slab.extent_addr: index out of range: {} (len {})", i, self.total)
+        panic("Slab.locate: index out of range: {} (len {})", i, self.total)
     }
+
+    /// Extent `e`'s SIDE ARENA base — PHYSICAL, exactly as `ext_base` is, and
+    /// converted by whoever dereferences it (the side arena's own funnel; for
+    /// threads that is `kcore.threads.frame_slot`).
+    public(package) func side_base(&self, e: Int) -> UInt { self.ext_side[e] }
 
     /// Slot `i`, lent where it sits (design 146's place accessor).
     ///
@@ -185,11 +248,25 @@ extension Slab<T, N> {
     /// they pin the CONSTANT against the handle table and against `Int` overflow,
     /// and this keeps a real chain under it.
     public(package) func donate(&var self, base: UInt, slots: Int) -> Bool {
+        self.donate_paired(base, slots, 0)
+    }
+
+    /// `donate` for a kind that carries a SIDE ARENA: the same extent, plus the
+    /// arena's base recorded in the same row (sawos design 34).
+    ///
+    /// ONE FUNCTION WRITES BOTH COLUMNS, which is what makes the pair
+    /// inseparable: an extent either exists with its arena or does not exist,
+    /// and there is no ordering in which a slot is reachable and its frame is
+    /// not. `donate` is this with `side = 0` — the nine arena-less kinds say so
+    /// by not having one rather than by remembering to pass a zero.
+    public(package) func donate_paired(&var self, base: UInt, slots: Int,
+                                       side: UInt) -> Bool {
         if slots <= 0 { return false }
         if self.ext_count >= MAX_SLAB_EXTENTS { return false }
         if slots > MAX_SLAB_CAPACITY - self.total { return false }
         self.ext_base[self.ext_count] = base
         self.ext_slots[self.ext_count] = slots
+        self.ext_side[self.ext_count] = side
         self.ext_count = self.ext_count + 1
         self.total = self.total + slots
         true

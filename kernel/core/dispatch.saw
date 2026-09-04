@@ -129,6 +129,7 @@ import kcore.limits.{
     NO_TIMER,
     NO_WAITER,
     PIPE_INFLIGHT,
+    THREAD_FRAME_STRIDE,
 }
 import kcore.mem.{align_up}
 import kcore.preempt.{long_zero}
@@ -163,12 +164,8 @@ import kcore.objects.{
     MemorySlot,
     NO_ROW,
     NO_EXCHANGE,
+    EXCHANGES,
     PIPES,
-    PIPE_CALLER,
-    PIPE_EX_STATE,
-    PIPE_LENS,
-    PIPE_REPLY_REFS,
-    PIPE_REQUEST_REFS,
     ExchangeState,
     PipeInletObject,
     PipeOutletObject,
@@ -708,29 +705,75 @@ func memory_arg(p: Int, handle: UInt) unsafe -> Int {
 // expressible); does it hold a whole slot and has the chain room (the machine's
 // two answers). Only then does anything move, and what moves is permanent.
 
-/// One donatable slab's GEOMETRY: how many bytes a slot needs, what its base
-/// must be aligned to, how many more extents it can take, and how many slots it
-/// already holds.
+/// One donatable slab's GEOMETRY: how many bytes ONE DONATED UNIT needs, what
+/// the extent's base must be aligned to, how many more extents the kind can
+/// take, and how many more units its ceiling still allows.
 ///
 /// Four numbers in one match rather than four matches, because they are asked
 /// together and a kind that answered one of them from a different slab than the
 /// others would be a silent corruption rather than a compile error.
+///
+/// **A UNIT IS NOT ALWAYS A SLOT SINCE M5 UNIT 6a** (sawos design 34), and the
+/// first two numbers are what carry that. Nine kinds donate one array and a unit
+/// IS a slot. `Threads` and `Pipes` donate a slot AND the per-slot storage that
+/// belongs to it, so a unit is the PAIR and the stride is the pair's size — one
+/// region, carved by `slab_install` below, because asking a caller to donate two
+/// regions in the right ratio would be asking it to know two kernel-internal
+/// sizes and to get their alignment right.
+///
+/// **THE FOURTH NUMBER IS HEADROOM RATHER THAN THE HELD COUNT**, which is the
+/// one signature change this unit makes here. It used to be `capacity()` and the
+/// caller subtracted; a kind with TWO chains has two ceilings and only the kind
+/// knows which binds, so the kind answers "how many more units may I take" and
+/// the caller compares. For `Pipes` the exchange chain is what binds, by a
+/// factor of `PIPE_INFLIGHT`.
 func slab_geometry(kind: SlabKind) unsafe -> (Int, Int, Int, Int) {
     match kind {
-        case Events -> (EVENTS.slot_bytes(), EVENTS.slot_align(), EVENTS.extents_left(), EVENTS.capacity()),
-        case Waiters -> (WAITERS.slot_bytes(), WAITERS.slot_align(), WAITERS.extents_left(), WAITERS.capacity()),
-        case Interrupts -> (INTERRUPTS.slot_bytes(), INTERRUPTS.slot_align(), INTERRUPTS.extents_left(), INTERRUPTS.capacity()),
-        case Attachments -> (ATTACHMENTS.slot_bytes(), ATTACHMENTS.slot_align(), ATTACHMENTS.extents_left(), ATTACHMENTS.capacity()),
-        case Timers -> (TIMERS.slot_bytes(), TIMERS.slot_align(), TIMERS.extents_left(), TIMERS.capacity()),
-        case Memories -> (MEMORIES.slot_bytes(), MEMORIES.slot_align(), MEMORIES.extents_left(), MEMORIES.capacity()),
-        case IoMemories -> (IOMEMORIES.slot_bytes(), IOMEMORIES.slot_align(), IOMEMORIES.extents_left(), IOMEMORIES.capacity()),
-        case Mappings -> (MAPPINGS.slot_bytes(), MAPPINGS.slot_align(), MAPPINGS.extents_left(), MAPPINGS.capacity()),
-        case FreeRanges -> (FREE_RANGES.slot_bytes(), FREE_RANGES.slot_align(), FREE_RANGES.extents_left(), FREE_RANGES.capacity()),
+        case Events -> (EVENTS.slot_bytes(), EVENTS.slot_align(), EVENTS.extents_left(), MAX_SLAB_CAPACITY - EVENTS.capacity()),
+        case Waiters -> (WAITERS.slot_bytes(), WAITERS.slot_align(), WAITERS.extents_left(), MAX_SLAB_CAPACITY - WAITERS.capacity()),
+        case Interrupts -> (INTERRUPTS.slot_bytes(), INTERRUPTS.slot_align(), INTERRUPTS.extents_left(), MAX_SLAB_CAPACITY - INTERRUPTS.capacity()),
+        case Attachments -> (ATTACHMENTS.slot_bytes(), ATTACHMENTS.slot_align(), ATTACHMENTS.extents_left(), MAX_SLAB_CAPACITY - ATTACHMENTS.capacity()),
+        case Timers -> (TIMERS.slot_bytes(), TIMERS.slot_align(), TIMERS.extents_left(), MAX_SLAB_CAPACITY - TIMERS.capacity()),
+        case Memories -> (MEMORIES.slot_bytes(), MEMORIES.slot_align(), MEMORIES.extents_left(), MAX_SLAB_CAPACITY - MEMORIES.capacity()),
+        case IoMemories -> (IOMEMORIES.slot_bytes(), IOMEMORIES.slot_align(), IOMEMORIES.extents_left(), MAX_SLAB_CAPACITY - IOMEMORIES.capacity()),
+        case Mappings -> (MAPPINGS.slot_bytes(), MAPPINGS.slot_align(), MAPPINGS.extents_left(), MAX_SLAB_CAPACITY - MAPPINGS.capacity()),
+        case FreeRanges -> (FREE_RANGES.slot_bytes(), FREE_RANGES.slot_align(), FREE_RANGES.extents_left(), MAX_SLAB_CAPACITY - FREE_RANGES.capacity()),
+        // A THREAD UNIT IS A SLOT PLUS A FRAME, and the frame's stride is also
+        // the extent's ALIGNMENT — which is the strictest of the two and
+        // therefore serves both, since `THREAD_FRAME_STRIDE` is a multiple of
+        // every slot alignment either profile has.
+        case Threads -> (THREADS.slot_bytes() + THREAD_FRAME_STRIDE,
+                         THREAD_FRAME_STRIDE,
+                         THREADS.extents_left(),
+                         MAX_SLAB_CAPACITY - THREADS.capacity()),
+        // A PIPE UNIT IS A CONNECTION PLUS ITS WHOLE STAGING RING. Both chains
+        // must have an extent free, and the EXCHANGE ceiling is the one that
+        // binds — `PIPE_INFLIGHT` exchanges are spent per connection, so the
+        // headroom in connections is the exchange headroom divided by it.
+        case Pipes -> (PIPES.slot_bytes() + PIPE_INFLIGHT * EXCHANGES.slot_bytes(),
+                       max_int(PIPES.slot_align(), EXCHANGES.slot_align()),
+                       min_int(PIPES.extents_left(), EXCHANGES.extents_left()),
+                       min_int(MAX_SLAB_CAPACITY - PIPES.capacity(),
+                               (MAX_SLAB_CAPACITY - EXCHANGES.capacity()) / PIPE_INFLIGHT)),
     }
 }
 
+/// The larger / smaller of two counts. Local because the two-chain kinds are the
+/// only callers and neither is worth a module.
+func max_int(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+
+func min_int(a: Int, b: Int) -> Int { if a < b { a } else { b } }
+
 /// Append the extent. The caller has validated everything and ZEROED the bytes;
 /// this is the step that makes them reachable.
+///
+/// **THE TWO-CHAIN KINDS CARVE HERE, AND THE ORDER IS THE ARGUMENT** (sawos
+/// design 34). `slab_geometry` already refused a donation either chain has no
+/// room for, so by the time the first `donate` runs the second cannot fail —
+/// and if it somehow did, the chains would SKEW, which is the one corruption
+/// this design must make unreachable. So the second refusal is `fatal_kernel`:
+/// it is a kernel invariant, not a caller condition, and it has never been
+/// reachable.
 func slab_install(kind: SlabKind, base: UInt, slots: Int) unsafe -> Bool {
     match kind {
         case Events -> EVENTS.donate(base, slots),
@@ -742,6 +785,30 @@ func slab_install(kind: SlabKind, base: UInt, slots: Int) unsafe -> Bool {
         case IoMemories -> IOMEMORIES.donate(base, slots),
         case Mappings -> MAPPINGS.donate(base, slots),
         case FreeRanges -> FREE_RANGES.donate(base, slots),
+        // FRAMES FIRST, at the extent's own base: the base is aligned to
+        // `THREAD_FRAME_STRIDE` (the geometry said so), each frame is exactly a
+        // stride, so every frame in the extent is stride-aligned — which is what
+        // `frame_slot`'s doc comment says the profile's stack pointer requires.
+        // The slots follow at `slots * THREAD_FRAME_STRIDE`, itself a multiple of
+        // the stride and therefore of any slot alignment.
+        case Threads -> THREADS.donate_paired(
+            base + ((slots * THREAD_FRAME_STRIDE) as UInt), slots, base),
+        // CONNECTIONS FIRST, then their exchanges. `slots * sizeof(PipeSlot)` is
+        // a multiple of the slot's alignment, which is the alignment `Exchange`
+        // wants too (the geometry took the larger of the two for the base), so
+        // the second array lands aligned with no pad between them.
+        case Pipes -> {
+            let ex_base = base + ((slots * PIPES.slot_bytes()) as UInt)
+            if not PIPES.donate(base, slots) {
+                return false
+            }
+            if not EXCHANGES.donate(ex_base, slots * PIPE_INFLIGHT) {
+                fatal_kernel("a pipe donation installed connections without exchanges",
+                             slots as UInt)
+                return false
+            }
+            true
+        },
     }
 }
 
@@ -788,7 +855,7 @@ func slab_donate(p: Int, raw_kind: UInt, handle: UInt) unsafe -> SyscallResult {
 
     let base = MEMORIES[slot].base
     let len = MEMORIES[slot].len
-    let (stride_i, align_i, room, held) = slab_geometry(kind)
+    let (stride_i, align_i, room, headroom) = slab_geometry(kind)
     let stride = stride_i as UInt
     let align = align_i as UInt
 
@@ -812,8 +879,10 @@ func slab_donate(p: Int, raw_kind: UInt, handle: UInt) unsafe -> SyscallResult {
     }
     // The machine-wide ceiling, checked HERE so that `slab_install`'s refusal
     // stays what it says it is: a kernel invariant that was violated, not a
-    // caller condition nobody looked at.
-    if slots > MAX_SLAB_CAPACITY - held {
+    // caller condition nobody looked at. `headroom` is the kind's own answer
+    // since M5 unit 6a — a two-chain kind has two ceilings and only it knows
+    // which one binds (sawos design 34).
+    if slots > headroom {
         return op_status(SosStatus.NoResource)
     }
 
@@ -2990,7 +3059,10 @@ func mapping_op_decoded(op: MappingOp, obj: &MappingObject,
 // unbounded-looking thing in either is the body copy, and it is bounded by
 // `PIPE_BODY_BYTES` — 128 bytes, an order of magnitude under the arena zero the
 // point map exists for, and comparable to a boot-handle record's three words.
-// `alloc_pipe` scans `MAX_PIPES`, which is 4. Recorded either way, as D-4 asks.
+// `alloc_pipe` scans the connection slab, whose floor is 4 and whose length a
+// deployment may raise by donation (sawos design 34) — the bound is
+// `PIPES.capacity()` and it is finite for `kcore.limits`' own reason: extents are
+// finitely many and each is finitely sized. Recorded either way, as D-4 asks.
 
 /// The record `Process.PipeCreate` answers with, in kernel memory.
 ///
@@ -3288,7 +3360,7 @@ func pipe_post(p: Int, slot: Int, args_src: UInt, args_bytes: UInt) unsafe -> Sy
     // unless it fits `PIPE_BODY_BYTES`, which the ABI's own assert keeps well
     // inside the width. An out-of-range value here would be a kernel bug, which
     // is precisely when design 170 says to write `as`.
-    PIPE_LENS[x] = len as UInt16
+    EXCHANGES[x].len = len as UInt16
     // **AND THE HANDLES LEAVE THE SENDER HERE** (`designs/010` ruling 5 as
     // re-ruled Sep 2 — take-at-post). It is the last line that can change
     // anything the caller owns and every refusal is already behind it, so the
@@ -3301,9 +3373,9 @@ func pipe_post(p: Int, slot: Int, args_src: UInt, args_bytes: UInt) unsafe -> Sy
     // be a recorded state — a zero request column means "not minted yet" here and
     // "abandoned by the server" one state later, and the columns alone cannot
     // tell those apart.
-    PIPE_REPLY_REFS[x] = 1
-    PIPE_REQUEST_REFS[x] = 0
-    PIPE_EX_STATE[x] = ExchangeState.Staged
+    EXCHANGES[x].reply_refs = 1
+    EXCHANGES[x].request_refs = 0
+    EXCHANGES[x].state = ExchangeState.Staged
     stage_push(slot, x)
     // **AND THE SERVER END IS NOW READABLE** (sawos design 15, M4 unit 3;
     // §2.2's readable arm). A staged message is exactly what that level means,
@@ -3401,15 +3473,15 @@ func pipe_call(p: Int, slot: Int, args_src: UInt, args_bytes: UInt,
             fault_process(p, why)
         }
     }
-    PIPE_LENS[x] = len as UInt16
+    EXCHANGES[x].len = len as UInt16
     hold_staged(p, x, &args)
     // **ONE COLUMN AT ONE FOR A THREAD RATHER THAN FOR A HANDLE**, which is the
     // only line in this function that is not `pipe_post`'s. The asymmetry with
     // the request column is unchanged and means what it means there: the claim
     // exists from the call, the obligation does not exist until somebody takes.
-    PIPE_REPLY_REFS[x] = 1
-    PIPE_REQUEST_REFS[x] = 0
-    PIPE_EX_STATE[x] = ExchangeState.Staged
+    EXCHANGES[x].reply_refs = 1
+    EXCHANGES[x].request_refs = 0
+    EXCHANGES[x].state = ExchangeState.Staged
     stage_push(slot, x)
     // PARK BEFORE NOTIFYING, so a server woken by the staging can never find
     // this thread runnable with its answer already owed. The wake only queues,
@@ -3526,7 +3598,7 @@ func pipe_take(p: Int, slot: Int, rec_dst: UInt, rec_cap: UInt) unsafe -> Syscal
     // it empty: staleness cannot exist under take-at-post.
     let moved = mint_staged(x, p)
 
-    let len = PIPE_LENS[x] as UInt
+    let len = EXCHANGES[x].len as UInt
     var rec = PipeTakePrefix(request: request, msg: msg_prefix(len, &moved))
     // THE ONE DOOR OUTWARD, twice, as one contiguous prefix ending at the
     // message's length: the fixed part, then the bytes straight out of the ring
@@ -3552,8 +3624,8 @@ func pipe_take(p: Int, slot: Int, rec_dst: UInt, rec_cap: UInt) unsafe -> Syscal
     // handed over exactly once" true rather than nearly true. The exchange stays
     // in the ring; what it leaves is the staged LIST.
     stage_pop(slot)
-    PIPE_REQUEST_REFS[x] = 1
-    PIPE_EX_STATE[x] = ExchangeState.Taken
+    EXCHANGES[x].request_refs = 1
+    EXCHANGES[x].state = ExchangeState.Taken
     op_ok()
 }
 
@@ -3664,9 +3736,9 @@ func pipe_resolve(p: Int, word: UInt, x: Int, dst: UInt,
         fault_process(p, why)
     }
 
-    match PIPE_EX_STATE[x] {
+    match EXCHANGES[x].state {
         case Replied -> {
-            let len = PIPE_LENS[x] as UInt
+            let len = EXCHANGES[x].len as UInt
             // **THE PRE-FLIGHT COMES BEFORE THE DELIVERY, AND SINCE UNIT 4.5 A
             // REFUSAL IS TERMINAL** (`designs/010` ruling 5, met by ruling
             // 12(b)). A reply may carry handles, so this op mints too — and a
@@ -3703,7 +3775,7 @@ func pipe_resolve(p: Int, word: UInt, x: Int, dst: UInt,
             op_value(len)
         },
         case Taken -> {
-            if PIPE_REQUEST_REFS[x] == 0 {
+            if EXCHANGES[x].request_refs == 0 {
                 consume_entry(p, word, ObjType.PipeReply, x)
                 return op_status(SosStatus.PeerClosed)
             }
@@ -3770,7 +3842,7 @@ func pipe_resolve(p: Int, word: UInt, x: Int, dst: UInt,
 /// **THE DETACH IS RULING 9(a) VERBATIM.** A consuming op detaches the object's
 /// subscription implicitly, and this op is consuming from here on — so a claim
 /// that was attached to a Waiter AND resolved loses the attachment at the park,
-/// which is also what keeps `PIPE_REPLY_ATTACH[x]` and `PIPE_CALLER[x]`
+/// which is also what keeps `EXCHANGES[x].reply_attach` and `EXCHANGES[x].caller`
 /// alternatives rather than a pair (the invariant `kcore.refs`' wake-arm banner
 /// states, and `exchange_settle` asserts).
 ///
@@ -3810,10 +3882,10 @@ func park_resolve(p: Int, word: UInt, x: Int, dst: UInt) unsafe -> SyscallResult
 /// function reads the states directly and reports the terminal where the matrix
 /// reports a false level.
 func pipe_ready(x: Int) unsafe -> SyscallResult {
-    match PIPE_EX_STATE[x] {
+    match EXCHANGES[x].state {
         case Replied -> op_ok(),
         case Taken -> {
-            if PIPE_REQUEST_REFS[x] == 0 {
+            if EXCHANGES[x].request_refs == 0 {
                 return op_status(SosStatus.PeerClosed)
             }
             op_status(SosStatus.WouldBlock)
@@ -3903,9 +3975,9 @@ func pipe_reply_status(p: Int, word: UInt, x: Int,
                        args: &PipeSendRecord) unsafe -> SosStatus {
     let len = args.len
 
-    match PIPE_EX_STATE[x] {
+    match EXCHANGES[x].state {
         case Taken -> {
-            if PIPE_REPLY_REFS[x] == 0 {
+            if EXCHANGES[x].reply_refs == 0 {
                 // ABANDONED BY THE CLIENT. Nothing is copied — there is nobody
                 // to copy it FOR — and the obligation is discharged, which is
                 // what settles the slot. **NOTHING IS STAGED EITHER**, which is
@@ -3920,14 +3992,14 @@ func pipe_reply_status(p: Int, word: UInt, x: Int,
                     fault_process(p, why)
                 }
             }
-            PIPE_LENS[x] = len as UInt16
+            EXCHANGES[x].len = len as UInt16
             // **THE REPLY DIRECTION STAGES INTO THE SAME SLOTS THE REQUEST
             // USED** (sawos design 18), and they are provably empty: the take
             // that produced this obligation moved every handle the request
             // carried and cleared the note. §2.1's `send(data?, handles?)` is
             // symmetric, so this is the identical act one direction over.
             hold_staged(p, x, &args)
-            PIPE_EX_STATE[x] = ExchangeState.Replied
+            EXCHANGES[x].state = ExchangeState.Replied
             // **AND THE CLAIM'S LEVEL IS NOW READY** (sawos design 15;
             // `designs/010` ruling 11(a)). A client parked on this claim is
             // woken HERE and its record carries the bytes just written — which

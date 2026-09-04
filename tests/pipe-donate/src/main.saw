@@ -1,0 +1,207 @@
+// SOS M5 unit 6a: A DONATED CONNECTION CARRIES A REAL MESSAGE
+// (sawos design 34, on design 32's excluded-on-merit note).
+//
+// The transcript:
+//
+//   SOS pipedonate: floor=4 fifth refused: out of kernel objects
+//   SOS pipedonate: donated a region of pipes
+//   SOS pipedonate: fifth connection created
+//   SOS pipedonate: server took len=5 byte0=80
+//   SOS pipedonate: client resolved len=3 byte0=90
+//   SOS pipedonate: done
+//
+// **WHY THIS CASE EXISTS.** M5 unit 6 excluded PIPES on merit, not on risk: ten
+// parallel arrays hung off a flat exchange index derived from `MAX_PIPES`, so
+// growing the connection slab renumbered every satellite — "not an extent chain,
+// a different data structure". Unit 6a made the ten into ONE `Exchange` record,
+// which is what turned it back into a chain. What has to be shown is therefore
+// not that a fifth connection SLOT exists, but that the STAGING RING that lives
+// beside it in donated memory works: the exchange state machine, the message
+// bytes, the length, and the reply written back over the request.
+//
+// FOUR CLAIMS, IN ORDER.
+//
+//  1. THE FLOOR IS REAL. `MAX_PIPES` is 4 and root's quota is unlimited, so the
+//     fifth `pipe_create` meets the SLAB and answers `NoResource`.
+//
+//     BOTH ENDS OF EACH FILLING PAIR ARE HELD LIVE, and they have to be: a
+//     connection frees when BOTH of its reference columns reach zero (sawos
+//     design 13), so a loop that dropped each pair as it went would never fill
+//     anything. Four separate pairs, eight live bindings — the `tests/slab-donate`
+//     shape, for the same reason.
+//
+//  2. THE DONATION IS ORDINARY MEMORY, and it is BIGGER than the other cases'
+//     one page on purpose. A pipe unit is a connection slot PLUS
+//     `PIPE_INFLIGHT` exchange records, and an exchange record carries a whole
+//     `PIPE_BODY_BYTES` body — so one connection costs several kilobytes and a
+//     single page would buy exactly one. Four pages buys a handful on both
+//     profiles, which leaves the claim ("the ceiling moved") arch-free.
+//
+//  3. THE CEILING MOVED: the create that was refused now succeeds.
+//
+//  4. **AND THE DONATED RING IS A RING.** The fifth connection — which can only
+//     be in extent 1, since the first four are live and are extent 0 in its
+//     entirety — carries a full round trip: the client POSTS five bytes, the
+//     server TAKES them and reads the length and the first byte back, the server
+//     REPLIES three bytes, and the client RESOLVES and reads those. Every one of
+//     those four steps reads or writes an `Exchange` in donated memory —
+//     `state`, `len`, `body`, the reference columns and the staged list link —
+//     and the two printed byte values are what say the body arrived rather than
+//     merely the status.
+//
+//     `byte0=80` and `byte0=90` are numbers that appear nowhere else in the
+//     transcript, in each direction, so a body copied out of the wrong record
+//     loses them.
+
+import sos.{System, Process, Memory, PipeInlet, PipeOutlet, PipeReply,
+            PipeRequest, PipeMsg, SlabKind, SosStatus, PIPE_BODY_BYTES}
+
+/// FOUR pages. See claim 2: a pipe unit is a connection plus its whole staging
+/// ring, which is the largest per-object storage in this kernel.
+static REGION: UInt = 0x4000
+
+/// `MAX_PIPES`, written down so that raising the kernel's floor fails THIS case
+/// loudly rather than quietly making its first claim vacuous.
+static FLOOR: UInt = 4
+
+/// The request: five bytes, the first of which is a number appearing nowhere
+/// else in the transcript.
+static REQ_LEN: UInt = 5
+static REQ_MARK: UInt8 = 80
+
+/// The reply: three bytes, likewise marked.
+static REP_LEN: UInt = 3
+static REP_MARK: UInt8 = 90
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS pipedonate: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var pool_record = try proc.boot_handle_next() catch {
+        let _ = system.debug_print("SOS pipedonate: no pool region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let pool = pool_record.take_memory() else {
+        let _ = system.debug_print("SOS pipedonate: pool record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // ---- CLAIM 1: the compiled floor is real ------------------------------
+    let p0 = try proc.pipe_create() catch {
+        print("SOS pipedonate: no pair 0: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let p1 = try proc.pipe_create() catch {
+        print("SOS pipedonate: no pair 1: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let p2 = try proc.pipe_create() catch {
+        print("SOS pipedonate: no pair 2: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let p3 = try proc.pipe_create() catch {
+        print("SOS pipedonate: no pair 3: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    // **ONE END EACH IS ENOUGH, AND ROOT'S HANDLE TABLE IS WHY IT HAS TO BE.**
+    // A connection frees only when BOTH reference columns reach zero (sawos
+    // design 13), so keeping the inlet keeps the slot and the outlet may go. That
+    // matters here because `MAX_HANDLES` is 16 and this program is the densest
+    // handle user in the tree: holding both ends of four pairs left no row for the
+    // obligation the take below mints, and the case failed with `NoResource` from
+    // the TABLE while every slab still had room. Four rows saved, and the fill is
+    // exactly as live as it was.
+    let (i0, o0) = move p0
+    let (i1, o1) = move p1
+    let (i2, o2) = move p2
+    let (i3, o3) = move p3
+    let _ = move o0
+    let _ = move o1
+    let _ = move o2
+    let _ = move o3
+
+    match proc.pipe_create() {
+        case Ok(_) -> {
+            let _ = system.debug_print(
+                "SOS pipedonate: a fifth connection existed BEFORE the donation\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        case Err(e) -> print("SOS pipedonate: floor={} fifth refused: {}\n",
+                             FLOOR, e),
+    }
+
+    // ---- CLAIM 2: the donation ------------------------------------------
+    let scratch = try pool.split(len: REGION) catch {
+        print("SOS pipedonate: no region to donate: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try system.slab_donate(kind: SlabKind.Pipes, memory: move scratch) catch {
+        let _ = system.debug_print("SOS pipedonate: donation refused\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS pipedonate: donated a region of pipes\n")
+
+    // ---- CLAIM 3: the ceiling moved --------------------------------------
+    let extent = try proc.pipe_create() catch {
+        print("SOS pipedonate: the donated extent gave nothing: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let (inlet, outlet) = move extent
+    let _ = system.debug_print("SOS pipedonate: fifth connection created\n")
+
+    // ---- CLAIM 4: and the donated RING carries a message ------------------
+    var req: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    req[0] = REQ_MARK
+    var claim = try inlet.post(body: &req, len: REQ_LEN) catch {
+        print("SOS pipedonate: post into the extent failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let got = try outlet.take() catch {
+        print("SOS pipedonate: take from the extent failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let (msg, request) = move got
+    print("SOS pipedonate: server took len={} byte0={}\n",
+          msg.len, msg.bytes[0] as UInt)
+
+    var rep: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    rep[0] = REP_MARK
+    var obligation = move request
+    try (move obligation).reply(body: &rep, len: REP_LEN) catch {
+        print("SOS pipedonate: reply into the extent failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let answer = try (move claim).resolve() catch {
+        print("SOS pipedonate: resolve from the extent failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS pipedonate: client resolved len={} byte0={}\n",
+          answer.len, answer.bytes[0] as UInt)
+
+    let _ = system.debug_print("SOS pipedonate: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

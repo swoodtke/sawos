@@ -118,16 +118,15 @@ import sosabi.{EventMode, NO_HANDLE, ObjType, OutletLevel, PIPE_BODY_BYTES,
                WaitTag,
                pipe_msg_body_offset, pipe_request_rights, rights_allow_transfer,
                wait_meta_end_bytes, wait_prefix_bytes}
-import kcore.limits.{MAX_IOMEMORIES, MAX_MEMORIES, MAX_PIPES, MAX_THREADS,
+import kcore.limits.{MAX_IOMEMORIES, MAX_MEMORIES,
                      NO_THREAD, PIPE_INFLIGHT}
 import kcore.diag.{ExitCode, fatal, fatal_kernel}
 import kcore.result.{op_ok, op_status, op_value, write_result}
 import kcore.threads.{THREADS, ThreadState, frame_slot, ready_push}
 import kcore.objects.{
+    EXCHANGES,
     ExchangeState,
     HandleEntry,
-    PIPE_MSG_HELD,
-    PIPE_NEXT,
     StagedRef,
     StagedRefs,
     IOMEMORIES,
@@ -138,14 +137,6 @@ import kcore.objects.{
     NO_EXCHANGE,
     NO_ROW,
     PIPES,
-    PIPE_CALLER,
-    PIPE_EXCHANGES,
-    PIPE_EX_STATE,
-    PIPE_LENS,
-    PIPE_REPLY_ATTACH,
-    PIPE_REPLY_REFS,
-    PIPE_REQUEST_ATTACH,
-    PIPE_REQUEST_REFS,
     QuotaKind,
     SlotState,
     alloc_exchange,
@@ -165,7 +156,6 @@ import kcore.objects.{
     memory_release_if_idle,
     mint_handle,
     mint_refusal,
-    msg_word_at,
     quota_credit,
     stage_peek,
     stage_pop,
@@ -240,9 +230,9 @@ public(package) func ref_object(kind: ObjType, slot: Int) unsafe {
         // and therefore which of the exchange's two columns it counts on. Two
         // kinds over one slot, decided by `obj_type`, exactly as the two
         // endpoint kinds are over the connection above.
-        case PipeReply -> { PIPE_REPLY_REFS[slot] = PIPE_REPLY_REFS[slot] + 1 },
+        case PipeReply -> { EXCHANGES[slot].reply_refs = EXCHANGES[slot].reply_refs + 1 },
         case PipeRequest -> {
-            PIPE_REQUEST_REFS[slot] = PIPE_REQUEST_REFS[slot] + 1
+            EXCHANGES[slot].request_refs = EXCHANGES[slot].request_refs + 1
         },
         case System -> {},
         case Clock -> {},
@@ -440,17 +430,17 @@ func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
         // honest answer for "should the caller free it" once somebody else
         // already has.
         case PipeReply -> {
-            if PIPE_REPLY_REFS[slot] == 0 { return false }
-            PIPE_REPLY_REFS[slot] = PIPE_REPLY_REFS[slot] - 1
-            if PIPE_REPLY_REFS[slot] == 0 {
+            if EXCHANGES[slot].reply_refs == 0 { return false }
+            EXCHANGES[slot].reply_refs = EXCHANGES[slot].reply_refs - 1
+            if EXCHANGES[slot].reply_refs == 0 {
                 notify_if_ready(WaitableKind.PipeRequest, slot)
             }
             exchange_can_settle(slot)
         },
         case PipeRequest -> {
-            if PIPE_REQUEST_REFS[slot] == 0 { return false }
-            PIPE_REQUEST_REFS[slot] = PIPE_REQUEST_REFS[slot] - 1
-            if PIPE_REQUEST_REFS[slot] == 0 {
+            if EXCHANGES[slot].request_refs == 0 { return false }
+            EXCHANGES[slot].request_refs = EXCHANGES[slot].request_refs - 1
+            if EXCHANGES[slot].request_refs == 0 {
                 notify_claim(slot)
             }
             exchange_can_settle(slot)
@@ -914,7 +904,7 @@ public(package) func reap_unreferenced() unsafe {
     }
 
     var x: Int = 0
-    while x < PIPE_EXCHANGES {
+    while x < EXCHANGES.capacity() {
         if exchange_can_settle(x) {
             // AND ITS HELD HANDLES GO BACK WITH IT (design 18's Sep-2 re-rule).
             // A reap can free the very objects a LATER row of this scan is
@@ -927,7 +917,7 @@ public(package) func reap_unreferenced() unsafe {
     }
 
     var c: Int = 0
-    while c < MAX_PIPES {
+    while c < PIPES.capacity() {
         if pipe_frees_now(c) { free_pipe(c) }
         c = c + 1
     }
@@ -1209,7 +1199,7 @@ public(package) func hold_staged(p: Int, x: Int,
                         let held = StagedRef(obj_type: entry.obj_type,
                                              rights: entry.rights,
                                              target: entry.target)
-                        PIPE_MSG_HELD[msg_word_at(x, i)] = held
+                        EXCHANGES[x].held[i] = held
                     }
                 },
             }
@@ -1319,8 +1309,8 @@ public(package) func pipe_drop_staged(c: Int) unsafe {
     PIPES[c].staged = 0
     while cur != 0 {
         let x = cur - 1
-        cur = PIPE_NEXT[x]
-        PIPE_NEXT[x] = 0
+        cur = EXCHANGES[x].next
+        EXCHANGES[x].next = 0
         if exchange_can_settle(x) {
             // THE LINK IS READ BEFORE THE SETTLE and the release runs after
             // it, so the walk holds nothing a cascade could invalidate: `cur`
@@ -1641,7 +1631,7 @@ func deliver_take(p: Int, dst: UInt, key: UInt, waiter: Int, a: Int, c: Int,
 
     var rec = WaitPrefix(key: key, tag: WaitTag.Message as UInt,
                          payload: OutletLevel.Msg as UInt,
-                         meta: PipeMsgMeta(len: PIPE_LENS[x] as UInt8,
+                         meta: PipeMsgMeta(len: EXCHANGES[x].len as UInt8,
                                            kinds: [0; PIPE_MSG_HANDLES]),
                          handles: [NO_HANDLE; WAIT_HANDLE_SLOTS])
     rec.handles[WAIT_REQUEST_SLOT] = request
@@ -1657,8 +1647,8 @@ func deliver_take(p: Int, dst: UInt, key: UInt, waiter: Int, a: Int, c: Int,
     // own ordering, and what makes "a staged message is handed over exactly
     // once" true rather than nearly true.
     stage_pop(c)
-    PIPE_REQUEST_REFS[x] = 1
-    PIPE_EX_STATE[x] = ExchangeState.Taken
+    EXCHANGES[x].request_refs = 1
+    EXCHANGES[x].state = ExchangeState.Taken
 
     // The readable level is not CONSUMED by this delivery and does not have to
     // be: taking the message off the staged list is what lowers it, which is
@@ -1787,7 +1777,7 @@ func notify_claims(c: Int) unsafe {
 // here: a parked resolver is a thread with a reference on the claim column and a
 // buffer to write into, which is precisely what a fused `Call` is. `park_resolve`
 // gets there by taking the caller's handle ENTRY and keeping its reference — the
-// unbind without the unref — so the two arrive at `PIPE_CALLER[x]` in the same
+// unbind without the unref — so the two arrive at `EXCHANGES[x].caller` in the same
 // state and nothing downstream reads back to find out which. What generalizes is
 // the RECORD, not the protocol: one park shape, one wake shape, one teardown
 // arm.
@@ -1797,7 +1787,7 @@ func notify_claims(c: Int) unsafe {
 // no word anybody could pass to `Waiter.Add`; a parked resolver may have had an
 // attachment, and `park_resolve` detaches it on the way down (ruling 9(a)'s
 // implicit detach, which a consuming op owes). Either way
-// `PIPE_REPLY_ATTACH[x]` is provably zero for as long as `PIPE_CALLER[x]` is
+// `EXCHANGES[x].reply_attach` is provably zero for as long as `EXCHANGES[x].caller` is
 // not, which is why the two arms are alternatives rather than two things to do
 // in sequence.
 //
@@ -1811,7 +1801,7 @@ func notify_claims(c: Int) unsafe {
 /// **A CLAIM'S LEVEL CHANGED — tell whoever holds it, whichever kind of holder
 /// that is.** The one arm.
 public(package) func notify_claim(x: Int) unsafe {
-    let parked = PIPE_CALLER[x]
+    let parked = EXCHANGES[x].caller
     if parked == 0 {
         notify_if_ready(WaitableKind.PipeReply, x)
         return
@@ -1985,7 +1975,7 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
                   ExitCode.ProcessFault)
         }
     }
-    PIPE_LENS[x] = len as UInt16
+    EXCHANGES[x].len = len as UInt16
     // **THE HANDLE WORDS ARE RE-VALIDATED HERE, AND THEY HAVE TO BE** (design
     // 18's Sep-2 re-rule). The record was re-read out of the caller's memory
     // one line above, so a SIBLING THREAD may have rewritten it since
@@ -1995,9 +1985,9 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
     // that fails simply arrives empty, and nothing a rewritten record can say
     // will stage a handle its process does not hold or may not send.
     hold_staged(p, x, &args)
-    PIPE_REPLY_REFS[x] = 1
-    PIPE_REQUEST_REFS[x] = 0
-    PIPE_EX_STATE[x] = ExchangeState.Staged
+    EXCHANGES[x].reply_refs = 1
+    EXCHANGES[x].request_refs = 0
+    EXCHANGES[x].state = ExchangeState.Staged
     stage_push(c, x)
     tie_call_reply(t, x, dst)
     notify_ready(WaitableKind.PipeOutlet, c)
@@ -2035,14 +2025,14 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
 /// reference is dropped this process has none left for a delivery to find.
 public(package) func release_pending_calls(p: Int) unsafe {
     var t: Int = 0
-    while t < MAX_THREADS {
+    while t < THREADS.capacity() {
         if THREADS[t].process == p && THREADS[t].call_pipe != 0 {
             clear_pending_call(t)
         }
         t = t + 1
     }
     var u: Int = 0
-    while u < MAX_THREADS {
+    while u < THREADS.capacity() {
         if THREADS[u].process == p && THREADS[u].call_claim != 0 {
             let x = THREADS[u].call_claim - 1
             clear_pending_call(u)

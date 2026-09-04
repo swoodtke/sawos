@@ -26,7 +26,6 @@ import kcore.limits.{
     MAX_EVENTS,
     MAX_INTERRUPTS,
     MAX_SLAB_EXTENTS,
-    MAX_THREADS,
     MAX_WAITERS,
     NO_ATTACHMENT,
     NO_EVENT,
@@ -36,15 +35,9 @@ import kcore.limits.{
 }
 import kcore.slab.{Slab}
 import kcore.objects.{
+    EXCHANGES,
     ExchangeState,
     PIPES,
-    PIPE_CALLER,
-    PIPE_EX_STATE,
-    PIPE_LENS,
-    PIPE_REPLY_ATTACH,
-    PIPE_REPLY_REFS,
-    PIPE_REQUEST_ATTACH,
-    PIPE_REQUEST_REFS,
     SlotState,
     exchange_body_addr,
     exchange_pipe,
@@ -291,6 +284,7 @@ public(package) unsafe static var EVENTS: Slab<EventSlot, MAX_EVENTS> = Slab<Eve
                        word: 0, attachment: 0, refs: 0); MAX_EVENTS],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_side: [0; MAX_SLAB_EXTENTS],
     ext_count: 0,
     total: MAX_EVENTS)
 
@@ -299,6 +293,7 @@ public(package) unsafe static var WAITERS: Slab<WaiterSlot, MAX_WAITERS> = Slab<
                         blocked: 0, refs: 0); MAX_WAITERS],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_side: [0; MAX_SLAB_EXTENTS],
     ext_count: 0,
     total: MAX_WAITERS)
 
@@ -308,6 +303,7 @@ public(package) unsafe static var INTERRUPTS: Slab<InterruptSlot, MAX_INTERRUPTS
                            refs: 0); MAX_INTERRUPTS],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_side: [0; MAX_SLAB_EXTENTS],
     ext_count: 0,
     total: MAX_INTERRUPTS)
 
@@ -317,6 +313,7 @@ public(package) unsafe static var ATTACHMENTS: Slab<Attachment, MAX_ATTACHMENTS>
                         owns: false, link: 0); MAX_ATTACHMENTS],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_side: [0; MAX_SLAB_EXTENTS],
     ext_count: 0,
     total: MAX_ATTACHMENTS)
 
@@ -467,8 +464,8 @@ public(package) func waitable_attachment(kind: WaitableKind, slot: Int) unsafe -
         case PipeOutlet -> PIPES[slot].outlet_attachment,
         case PipeInlet -> PIPES[slot].inlet_attachment,
         // ...and two kinds over one EXCHANGE, one level further down.
-        case PipeReply -> PIPE_REPLY_ATTACH[slot],
-        case PipeRequest -> PIPE_REQUEST_ATTACH[slot],
+        case PipeReply -> EXCHANGES[slot].reply_attach,
+        case PipeRequest -> EXCHANGES[slot].request_attach,
     }
 }
 
@@ -481,8 +478,8 @@ public(package) func set_waitable_attachment(kind: WaitableKind, slot: Int, a: I
         case Process -> { PROCESSES[slot].attachment = a },
         case PipeOutlet -> { PIPES[slot].outlet_attachment = a },
         case PipeInlet -> { PIPES[slot].inlet_attachment = a },
-        case PipeReply -> { PIPE_REPLY_ATTACH[slot] = a },
-        case PipeRequest -> { PIPE_REQUEST_ATTACH[slot] = a },
+        case PipeReply -> { EXCHANGES[slot].reply_attach = a },
+        case PipeRequest -> { EXCHANGES[slot].request_attach = a },
     }
 }
 
@@ -537,9 +534,9 @@ public(package) func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Boo
         // all. `Settled` is NOT ready — the answer has already been delivered
         // to somebody — and `Free` names no exchange a handle could hold.
         case PipeReply -> {
-            match PIPE_EX_STATE[slot] {
+            match EXCHANGES[slot].state {
                 case Replied -> true,
-                case Taken -> PIPE_REQUEST_REFS[slot] == 0,
+                case Taken -> EXCHANGES[slot].request_refs == 0,
                 case Staged -> PIPES[exchange_pipe(slot)].outlet_refs == 0,
                 case Settled -> false,
                 case Free -> false,
@@ -552,8 +549,8 @@ public(package) func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Boo
         // are past it. Terminal, because a reply column that reached zero can
         // never rise — a mint needs a source handle there is none of.
         case PipeRequest -> {
-            match PIPE_EX_STATE[slot] {
-                case Taken -> PIPE_REPLY_REFS[slot] == 0,
+            match EXCHANGES[slot].state {
+                case Taken -> EXCHANGES[slot].reply_refs == 0,
                 case Replied -> false,
                 case Settled -> false,
                 case Staged -> false,
@@ -618,10 +615,10 @@ public(package) func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> Wa
         // (design 10 ruling 4's rider); every other ready state is the
         // abandonment `pipe_resolve` reports, and it has nothing to copy.
         case PipeReply -> {
-            match PIPE_EX_STATE[slot] {
+            match EXCHANGES[slot].state {
                 case Replied -> WaitAnswer(
                     tag: WaitTag.Reply, payload: ReplyLevel.Data as UInt,
-                    body_len: PIPE_LENS[slot] as UInt,
+                    body_len: EXCHANGES[slot].len as UInt,
                     body_src: exchange_body_addr(slot)),
                 case _ -> WaitAnswer(tag: WaitTag.Reply,
                                      payload: ReplyLevel.PeerClosed as UInt,
@@ -710,7 +707,7 @@ public(package) func waitable_consume(kind: WaitableKind, slot: Int) unsafe {
         // It runs for the ABANDONED deliveries too, and that is right: the
         // claim has been told there will never be an answer, so there is
         // nothing left for it either.
-        case PipeReply -> { PIPE_EX_STATE[slot] = ExchangeState.Settled },
+        case PipeReply -> { EXCHANGES[slot].state = ExchangeState.Settled },
     }
 }
 
@@ -782,7 +779,7 @@ public(package) func block_on_wait(slot: Int, w: Int, dst: UInt) unsafe {
 // for a reason rather than an omission: several threads of one process may be
 // waiting for room on one connection at once, so the connection would need a
 // chain — and `ThreadSlot.link` is already spoken for by the ready queue the
-// resumed thread goes straight onto. A bounded walk of `MAX_THREADS` at the one
+// resumed thread goes straight onto. A bounded walk of the thread slab at the one
 // moment a ring stops being full is the cheaper answer, and it is the same
 // bounded-scan trade `alloc_thread`, `live_threads` and `ready_remove_process`
 // all take one file down.
@@ -823,7 +820,7 @@ public(package) func tie_call_reply(slot: Int, x: Int, dst: UInt) unsafe {
     THREADS[slot].call_claim = x + 1
     THREADS[slot].call_src = 0
     THREADS[slot].call_len = 0
-    PIPE_CALLER[x] = slot + 1
+    EXCHANGES[x].caller = slot + 1
 }
 
 /// The RUNNING thread's version: tie, and ask for the switch it now needs.
@@ -837,7 +834,7 @@ public(package) func block_on_call_reply(slot: Int, x: Int, dst: UInt) unsafe {
 /// three callers each own that decision.
 public(package) func clear_pending_call(slot: Int) unsafe {
     if THREADS[slot].call_claim != 0 {
-        PIPE_CALLER[THREADS[slot].call_claim - 1] = 0
+        EXCHANGES[THREADS[slot].call_claim - 1].caller = 0
     }
     THREADS[slot].call_pipe = 0
     THREADS[slot].call_claim = 0
@@ -854,7 +851,7 @@ public(package) func clear_pending_call(slot: Int) unsafe {
 /// chain.
 public(package) func call_room_waiter(c: Int) unsafe -> Int {
     var t: Int = 0
-    while t < MAX_THREADS {
+    while t < THREADS.capacity() {
         if THREADS[t].call_pipe == c + 1 {
             return t
         }

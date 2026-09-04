@@ -71,7 +71,6 @@ import kcore.limits.{
     MAX_PIPES,
     MAX_PROCESSES,
     MAX_SLAB_EXTENTS,
-    MAX_THREADS,
     MAX_TIMERS,
     MAX_WAITERS,
     NO_FREE_RANGE,
@@ -968,6 +967,7 @@ public(package) unsafe static var MEMORIES: Slab<MemorySlot, MAX_MEMORIES> = Sla
                         out_bytes: 0, dropped: 0); MAX_MEMORIES],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_side: [0; MAX_SLAB_EXTENTS],
     ext_count: 0,
     total: MAX_MEMORIES)
 
@@ -1054,6 +1054,7 @@ public(package) unsafe static var FREE_RANGES: Slab<FreeRange, MAX_FREE_RANGES> 
                        next: 0); MAX_FREE_RANGES],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_side: [0; MAX_SLAB_EXTENTS],
     ext_count: 0,
     total: MAX_FREE_RANGES)
 
@@ -1475,6 +1476,7 @@ public(package) unsafe static var IOMEMORIES: Slab<IoMemorySlot, MAX_IOMEMORIES>
                           refs: 0); MAX_IOMEMORIES],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_side: [0; MAX_SLAB_EXTENTS],
     ext_count: 0,
     total: MAX_IOMEMORIES)
 
@@ -1556,6 +1558,7 @@ public(package) unsafe static var MAPPINGS: Slab<MappingSlot, MAX_MAPPINGS> = Sl
                          row: NO_ROW, refs: 0); MAX_MAPPINGS],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_side: [0; MAX_SLAB_EXTENTS],
     ext_count: 0,
     total: MAX_MAPPINGS)
 
@@ -1764,29 +1767,27 @@ public(package) struct PipeSlot {
     public(package) outlet_refs: UInt16,
 }
 
-public(package) unsafe static var PIPES: [PipeSlot; MAX_PIPES] = [
-    PipeSlot(state: SlotState.Free, process: 0, staged: 0,
-             inlet_attachment: 0, outlet_attachment: 0,
-             inlet_refs: 0, outlet_refs: 0);
-    MAX_PIPES]
+/// **AN EXTENT CHAIN SINCE M5 UNIT 6a** (sawos design 34). `MAX_PIPES` is the
+/// compiled floor; a `SlabKind.Pipes` donation adds connections AND the
+/// exchanges that belong to them — see `EXCHANGES` for why the two chains cannot
+/// come apart.
+public(package) unsafe static var PIPES: Slab<PipeSlot, MAX_PIPES> = Slab<PipeSlot, MAX_PIPES>(
+    inline: [PipeSlot(state: SlotState.Free, process: 0, staged: 0,
+                      inlet_attachment: 0, outlet_attachment: 0,
+                      inlet_refs: 0, outlet_refs: 0);
+             MAX_PIPES],
+    ext_base: [0; MAX_SLAB_EXTENTS],
+    ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_side: [0; MAX_SLAB_EXTENTS],
+    ext_count: 0,
+    total: MAX_PIPES)
 
-/// Every connection's staging ring, back to back — the storage the slots above
-/// describe.
-static PIPE_BODY_STORAGE: Int = MAX_PIPES * PIPE_INFLIGHT * PIPE_BODY_BYTES
-
-public(package) unsafe static var PIPE_BODIES: [UInt8; PIPE_BODY_STORAGE] = [
-    0; PIPE_BODY_STORAGE]
-
-/// Ring slots in the whole machine — the stride every per-exchange array below
-/// is sized to. One row per (connection, ring slot) pair, which is what an
-/// EXCHANGE index names.
+/// Ring slots the COMPILED floor holds — one row per (connection, ring slot)
+/// pair, which is what an EXCHANGE index names.
+///
+/// It is `EXCHANGES`' floor rather than the machine's exchange count since M5
+/// unit 6a: `EXCHANGES.capacity()` is what a scan reads.
 public(package) static PIPE_EXCHANGES: Int = MAX_PIPES * PIPE_INFLIGHT
-
-/// How long the message in each staging slot is — and, once a reply has been
-/// written, how long THAT is. One number, because a slot holds one body at a
-/// time and the exchange's state is what says which body it is.
-public(package) unsafe static var PIPE_LENS: [UInt16; PIPE_EXCHANGES] = [
-    0; PIPE_EXCHANGES]
 
 // =============================================================================
 // The one-shot pair — CLAIM AND OBLIGATION, AS RING-SLOT STATE (spec §2.1;
@@ -1796,9 +1797,11 @@ public(package) unsafe static var PIPE_LENS: [UInt16; PIPE_EXCHANGES] = [
 // **NO THIRD SLAB, AND D-1's ARGUMENT IS ONE SENTENCE**: a one-shot pair exists
 // for exactly as long as one in-flight message does, and design 10 ruling 4's
 // rider already pins the reply body to the staging slot that carried the
-// request. So the claim state lives WITH THE SLOT — four parallel arrays beside
-// `PIPE_LENS`, all zero-initialized, all in `.bss` (design 149), costing no
-// image bytes and no new limit.
+// request. So the claim state lives WITH THE SLOT — four fields of the
+// `Exchange` record below, zero-initialized and therefore `.bss` (design 149),
+// costing no image bytes and no new limit. (They were four parallel ARRAYS
+// beside `PIPE_LENS` until M5 unit 6a folded the ten satellites into one record;
+// the claim state's shape is unchanged, only where it is stored.)
 //
 // **THE EXCHANGE INDEX IS THE OBJECT'S IDENTITY.** `ObjType.PipeReply` and
 // `ObjType.PipeRequest` both target `connection * PIPE_INFLIGHT + ring slot`,
@@ -1863,63 +1866,12 @@ public(package) enum ExchangeState: UInt8 {
     case Settled = 4,
 }
 
-public(package) unsafe static var PIPE_EX_STATE: [ExchangeState; PIPE_EXCHANGES] = [
-    ExchangeState.Free; PIPE_EXCHANGES]
-
-/// How many handle entries name each exchange's CLAIM.
-public(package) unsafe static var PIPE_REPLY_REFS: [UInt16; PIPE_EXCHANGES] = [
-    0; PIPE_EXCHANGES]
-
-/// How many name its OBLIGATION.
-public(package) unsafe static var PIPE_REQUEST_REFS: [UInt16; PIPE_EXCHANGES] = [
-    0; PIPE_EXCHANGES]
-
-/// The attachment watching each exchange's CLAIM (slot + 1); 0 = unattached.
-///
-/// **TWO ARRAYS, BECAUSE A CLAIM AND AN OBLIGATION ARE TWO WAITABLES** (sawos
-/// design 15). They are one exchange and two objects — the reply-ready level
-/// belongs to the client, the request-abandoned level to the server — so §2.2's
-/// at-most-one-Waiter rule holds per COLUMN, exactly as the reference count
-/// does, and the two may be watched from two different processes at once. It is
-/// the `PipeSlot` pair one level down, which is the shape design 14 already
-/// inherited from design 13.
-public(package) unsafe static var PIPE_REPLY_ATTACH: [Int; PIPE_EXCHANGES] = [
-    0; PIPE_EXCHANGES]
-
-/// The attachment watching each exchange's OBLIGATION (slot + 1).
-public(package) unsafe static var PIPE_REQUEST_ATTACH: [Int; PIPE_EXCHANGES] = [
-    0; PIPE_EXCHANGES]
-
-/// **THE THREAD PARKED IN A FUSED `Call` ON THIS EXCHANGE** (thread slot + 1;
-/// 0 = none), sawos design 17.
-///
-/// **IT IS A THIRD WAY TO NAME A CLAIM, AND THE ONLY ONE THAT IS NOT A HANDLE.**
-/// Design 10 ruling 4's rider says a fused call mints no `PipeReply` into the
-/// caller's table — zero handle traffic and zero table rows on the fast path —
-/// so the claim it holds is KERNEL-INTERNAL and tied to the parked thread. This
-/// array is that tie, and the reference model is unchanged underneath it: a
-/// parked caller counts ONE on `PIPE_REPLY_REFS`, exactly as a handle entry or
-/// an attachment would, so nothing can settle the ring slot out from under it.
-///
-/// **TWO DIRECTIONS, TWO FIELDS, AND EACH EARNS ITS PLACE.** This one answers
-/// "who is waiting for this exchange", which is what a settling reply has to
-/// know and what makes the wake arm a load rather than a scan of the thread
-/// table; `ThreadSlot.call_claim` answers "what is this thread waiting for",
-/// which is what the teardown has to know when a process dies parked. Neither
-/// question can be answered from the other side without a walk.
-///
-/// A parked caller is on NO LIST — it is not on a Waiter's `blocked` chain,
-/// because a fused call involves no Waiter at all — so this field is the whole
-/// of how it is reachable. That is why `exchange_settle` asserts it is clear.
-public(package) unsafe static var PIPE_CALLER: [Int; PIPE_EXCHANGES] = [
-    0; PIPE_EXCHANGES]
-
-/// The staged list's links — the next STAGED exchange in this connection, plus
-/// one, or zero at the end. Only ever appended at the tail and removed at the
-/// head (a take), or cleared whole (the outlet's zero-arm), so it is a strict
-/// FIFO and never needs a removal from the middle.
-public(package) unsafe static var PIPE_NEXT: [Int; PIPE_EXCHANGES] = [
-    0; PIPE_EXCHANGES]
+// (`PIPE_EX_STATE`, `PIPE_REPLY_REFS`, `PIPE_REQUEST_REFS`, `PIPE_REPLY_ATTACH`,
+// `PIPE_REQUEST_ATTACH`, `PIPE_CALLER`, `PIPE_NEXT`, `PIPE_LENS`, `PIPE_BODIES`
+// and `PIPE_MSG_HELD` WERE HERE, ten arrays keyed by the flat exchange index.
+// They are the `Exchange` record below since M5 unit 6a — see the block header
+// there for why ten parallel arrays could not become an extent chain and one
+// record could.)
 
 // =============================================================================
 // THE STAGED HANDLE LEDGER (spec §2.1's rendezvous transfer; `designs/010`
@@ -1963,9 +1915,10 @@ public(package) unsafe static var PIPE_NEXT: [Int; PIPE_EXCHANGES] = [
 // slots they were charged for. Quota <= wall therefore still holds: the SLAB is
 // what refuses the next allocation, and no staged handle can conjure one.
 //
-// The array is zero-initialized and therefore `.bss` (design 149), costing no
-// image bytes: `PIPE_EXCHANGES * PIPE_MSG_HANDLES` entries, which at the tree's
-// numbers is 64 × 4.
+// The ledger is zero-initialized and therefore `.bss` (design 149), costing no
+// image bytes: `PIPE_MSG_HANDLES` entries per exchange, which at the tree's
+// numbers is 4 per slot over a floor of 64. (It was its own flat array until M5
+// unit 6a made it `Exchange.held`.)
 
 /// ONE HANDLE A MESSAGE IS CARRYING, held by the kernel between the post and the
 /// rendezvous — a `HandleEntry` with the two table-only fields left off.
@@ -2002,23 +1955,161 @@ public(package) func no_staged_ref() -> StagedRef {
     StagedRef(obj_type: ObjType.Unbound, rights: 0, target: 0)
 }
 
-/// The references a post or a reply staged, per exchange. Indexed
-/// `x * PIPE_MSG_HANDLES + slot`, which is the flat arithmetic the bodies and
-/// lengths already use.
-///
-/// ONE ARRAY SERVES BOTH DIRECTIONS, and it can because an exchange only ever
-/// has one message in flight: the request's handles leave at the take, which is
-/// the same moment the slot stops holding a request and starts being able to
-/// hold a reply. The take COLLECTS what it minted, so a reply stages into slots
-/// that are provably empty.
-public(package) unsafe static var PIPE_MSG_HELD: [StagedRef; PIPE_EXCHANGES * PIPE_MSG_HANDLES] = [
-    StagedRef(obj_type: ObjType.Unbound, rights: 0, target: 0);
-    PIPE_EXCHANGES * PIPE_MSG_HANDLES]
+// =============================================================================
+// THE EXCHANGE RECORD — ten satellites become one slot (sawos design 34,
+// M5 unit 6a; design 25 D-6)
+// =============================================================================
+//
+// **M5 UNIT 6 EXCLUDED PIPES ON MERIT, AND THIS IS THE ANSWER TO ITS OBJECTION.**
+// Design 32's As-built named the shape: ten arrays hanging off the flat exchange
+// index `x = c * PIPE_INFLIGHT + i`, with the index DERIVED from `MAX_PIPES`, so
+// growing the connection slab renumbered every satellite. "That is not an extent
+// chain, it is a different data structure." True of ten arrays; not true of ONE.
+//
+// **WHAT CHANGED IS THE SATELLITE COUNT, NOT THE INDEX.** The ten per-exchange
+// arrays are fields of this record now, so an exchange's storage is ONE slot at
+// ONE index and `EXCHANGES` is a plain `Slab` like the other ten kinds. The flat
+// index is untouched: `x = c * PIPE_INFLIGHT + i` and `c = x / PIPE_INFLIGHT`
+// mean exactly what they meant, at every index, because `PIPE_INFLIGHT` is a
+// compile-time constant that does not know where a connection lives. That is the
+// property that made this conversion cheap, and it is worth stating as an
+// invariant: THE EXCHANGE NUMBERING IS UNIFORM ACROSS THE CHAIN.
+//
+// **AND IT IS WHAT PROVES THE TWO CHAINS CANNOT SKEW.** A `Pipes` donation
+// appends `k` connections to `PIPES` and `k * PIPE_INFLIGHT` exchanges to
+// `EXCHANGES`, in one function, in one step, having checked both first. So
+// `PIPES` extent `e` holds connections `[S, S + k)` and `EXCHANGES` extent `e`
+// holds exchanges `[S * PIPE_INFLIGHT, (S + k) * PIPE_INFLIGHT)` — which is
+// exactly the set the flat arithmetic maps those connections to. The two walks
+// land in the same extent for corresponding indices BY THE ARITHMETIC, not by a
+// shared table and not by a promise: skew would need one donation to succeed and
+// the other to fail, which `slab_install` makes unreachable.
+//
+// **NO SECOND BOUNDS CHECK, WHICH THE BRIEF ASKED FOR BY NAME.** `EXCHANGES[x].len`
+// was one array index; `EXCHANGES[x].len` is one slab lookup. The rendezvous
+// paths (`pipe_post`, `pipe_take`, `pipe_resolve`, `pipe_reply_status`,
+// `deliver_take`) do the same one check they always did, on the same flat `x`,
+// with no division and no second lookup — which is why the alternative shape
+// (fold the exchanges into `PipeSlot` as an inline ring) was declined: it would
+// have made every satellite access `PIPES[x / PIPE_INFLIGHT].ex[x % PIPE_INFLIGHT]`,
+// two bounds checks and a division, on the hottest paths in the kernel.
+//
+// **ZERO IS THE FREE EXCHANGE, BY CONSTRUCTION.** `ExchangeState.Free` is 0 and
+// `ObjType.Unbound` is 0, so a zeroed record is a free slot with an empty ledger
+// — which is what lets `slab_donate` install a donated extent by zeroing it, and
+// what keeps the inline array in `.bss` (design 149) exactly as the ten arrays
+// were.
 
-/// Where exchange `x`'s handle slot `i` lives.
-public(package) func msg_word_at(x: Int, i: Int) -> Int {
-    x * PIPE_MSG_HANDLES + i
+/// ONE EXCHANGE: a ring slot's whole state, and what a `PipeReply` or a
+/// `PipeRequest` handle targets.
+///
+/// The field docs below are the ten arrays' own, kept where they were written.
+public(package) struct Exchange {
+    /// Where this exchange is in its life.
+    public(package) state: ExchangeState,
+    /// How long the message in this staging slot is — and, once a reply has been
+    /// written, how long THAT is. One number, because a slot holds one body at a
+    /// time and the exchange's state is what says which body it is.
+    public(package) len: UInt16,
+    /// How many handle entries name this exchange's CLAIM.
+    public(package) reply_refs: UInt16,
+    /// How many name its OBLIGATION.
+    public(package) request_refs: UInt16,
+    /// The attachment watching this exchange's CLAIM (slot + 1); 0 = unattached.
+    ///
+    /// **TWO FIELDS, BECAUSE A CLAIM AND AN OBLIGATION ARE TWO WAITABLES** (sawos
+    /// design 15). They are one exchange and two objects — the reply-ready level
+    /// belongs to the client, the request-abandoned level to the server — so
+    /// §2.2's at-most-one-Waiter rule holds per COLUMN, exactly as the reference
+    /// count does, and the two may be watched from two different processes at
+    /// once. It is the `PipeSlot` pair one level down, which is the shape design
+    /// 14 already inherited from design 13.
+    public(package) reply_attach: Int,
+    /// The attachment watching this exchange's OBLIGATION (slot + 1).
+    public(package) request_attach: Int,
+    /// **THE THREAD PARKED IN A FUSED `Call` ON THIS EXCHANGE** (thread slot + 1;
+    /// 0 = none), sawos design 17.
+    ///
+    /// **IT IS A THIRD WAY TO NAME A CLAIM, AND THE ONLY ONE THAT IS NOT A
+    /// HANDLE.** Design 10 ruling 4's rider says a fused call mints no
+    /// `PipeReply` into the caller's table — zero handle traffic and zero table
+    /// rows on the fast path — so the claim it holds is KERNEL-INTERNAL and tied
+    /// to the parked thread. This field is that tie, and the reference model is
+    /// unchanged underneath it: a parked caller counts ONE on `reply_refs`,
+    /// exactly as a handle entry or an attachment would, so nothing can settle
+    /// the ring slot out from under it.
+    ///
+    /// **TWO DIRECTIONS, TWO FIELDS, AND EACH EARNS ITS PLACE.** This one answers
+    /// "who is waiting for this exchange", which is what a settling reply has to
+    /// know and what makes the wake arm a load rather than a scan of the thread
+    /// table; `ThreadSlot.call_claim` answers "what is this thread waiting for",
+    /// which is what the teardown has to know when a process dies parked. Neither
+    /// question can be answered from the other side without a walk.
+    ///
+    /// A parked caller is on NO LIST — it is not on a Waiter's `blocked` chain,
+    /// because a fused call involves no Waiter at all — so this field is the
+    /// whole of how it is reachable. That is why `exchange_settle` asserts it is
+    /// clear.
+    public(package) caller: Int,
+    /// The staged list's link — the next STAGED exchange in this connection, plus
+    /// one, or zero at the end. Only ever appended at the tail and removed at the
+    /// head (a take), or cleared whole (the outlet's zero-arm), so it is a strict
+    /// FIFO and never needs a removal from the middle.
+    public(package) next: Int,
+    /// The references a post or a reply staged.
+    ///
+    /// ONE LEDGER SERVES BOTH DIRECTIONS, and it can because an exchange only
+    /// ever has one message in flight: the request's handles leave at the take,
+    /// which is the same moment the slot stops holding a request and starts being
+    /// able to hold a reply. The take COLLECTS what it minted, so a reply stages
+    /// into slots that are provably empty.
+    public(package) held: [StagedRef; PIPE_MSG_HANDLES],
+    /// This staging slot's message bytes — the request, then the reply.
+    ///
+    /// **IT IS A FIELD RATHER THAN AN ARENA SINCE M5 UNIT 6a**, and that is the
+    /// only one of the ten that changed SHAPE rather than merely address: the
+    /// bodies were one flat `MAX_PIPES * PIPE_INFLIGHT * PIPE_BODY_BYTES` array
+    /// reached by `exchange_body_addr`'s own arithmetic, and they are per-record
+    /// storage now. The accessor is unchanged in meaning and its one caller-facing
+    /// promise — `PIPE_BODY_BYTES` contiguous writable bytes — is unchanged too.
+    public(package) body: [UInt8; PIPE_BODY_BYTES],
 }
+
+extension Exchange {
+    /// This exchange's body bytes, as an address the copy movers can use.
+    ///
+    /// **IT IS A METHOD BECAUSE `&var EXCHANGES[x].body` IS NOT SPELLABLE**
+    /// (SL-23). A `borrows` accessor lends a PLACE, and Saw will not take a
+    /// reference to a field of one — ``can only take reference to a variable,
+    /// field, or array element``, with the hint "references require an
+    /// addressable location". Inside a `&var self` method the receiver arrives
+    /// BY POINTER (design 261), so `self.body` is an ordinary addressable field
+    /// of the caller's storage and the crossing is the ordinary one.
+    ///
+    /// So the address still comes out of the slot the slab lent, through the
+    /// accessor and its one funnel, which is what `exchange_body_addr`'s note
+    /// claims and this is the mechanism behind it.
+    public(package) func body_addr(&var self) unsafe -> UInt {
+        ((&var self.body) as UnsafePointer<UInt8>) as UInt
+    }
+}
+
+/// Every exchange in the machine. **A CHAIN IN LOCKSTEP WITH `PIPES`** — see the
+/// block header above for the proof that "lockstep" is arithmetic rather than
+/// bookkeeping.
+public(package) unsafe static var EXCHANGES: Slab<Exchange, PIPE_EXCHANGES> = Slab<Exchange, PIPE_EXCHANGES>(
+    inline: [Exchange(state: ExchangeState.Free, len: 0, reply_refs: 0,
+                      request_refs: 0, reply_attach: 0, request_attach: 0,
+                      caller: 0, next: 0,
+                      held: [StagedRef(obj_type: ObjType.Unbound, rights: 0,
+                                       target: 0); PIPE_MSG_HANDLES],
+                      body: [0; PIPE_BODY_BYTES]);
+             PIPE_EXCHANGES],
+    ext_base: [0; MAX_SLAB_EXTENTS],
+    ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_side: [0; MAX_SLAB_EXTENTS],
+    ext_count: 0,
+    total: PIPE_EXCHANGES)
 
 /// How many references exchange `x` is holding.
 ///
@@ -2031,7 +2122,7 @@ public(package) func staged_count(x: Int) unsafe -> Int {
     var live: Int = 0
     var i: Int = 0
     while i < PIPE_MSG_HANDLES {
-        match PIPE_MSG_HELD[msg_word_at(x, i)].obj_type {
+        match EXCHANGES[x].held[i].obj_type {
             case Unbound -> {},
             case _ -> { live = live + 1 },
         }
@@ -2055,8 +2146,8 @@ public(package) func take_staged(x: Int) unsafe -> StagedRefs {
                                  PIPE_MSG_HANDLES])
     var i: Int = 0
     while i < PIPE_MSG_HANDLES {
-        out.slots[i] = PIPE_MSG_HELD[msg_word_at(x, i)]
-        PIPE_MSG_HELD[msg_word_at(x, i)] = no_staged_ref()
+        out.slots[i] = EXCHANGES[x].held[i]
+        EXCHANGES[x].held[i] = no_staged_ref()
         i = i + 1
     }
     out
@@ -2085,7 +2176,7 @@ public(package) func pipe_exchange_at(c: Int, i: Int) -> Int {
 /// Take a free Pipe slot, or `NO_PIPE` when the slab is full.
 public(package) func alloc_pipe() unsafe -> Int {
     var i: Int = 0
-    while i < MAX_PIPES {
+    while i < PIPES.capacity() {
         match PIPES[i].state {
             case Free -> { return i },
             case Live -> {},
@@ -2097,18 +2188,26 @@ public(package) func alloc_pipe() unsafe -> Int {
 
 /// The KERNEL address of exchange `x`'s body slot.
 ///
-/// The whole-array address plus an offset, which is `frame_slot`'s own idiom in
-/// `kcore.threads` — an `unsafe static var` array has one address and every slot
-/// is arithmetic on it. Confined to this small named helper (design 136), so the
-/// callers stay ordinary code and the pointer never leaves the expression.
+/// **IT IS NOT A NEW FUNNEL, AND THAT IS THE POINT** (sawos design 34; designs
+/// 29 + 32). It was the whole-bodies-array address plus `x * PIPE_BODY_BYTES`;
+/// it is now the address of a FIELD of the slot `EXCHANGES[x]` lends, so it
+/// reaches donated memory through `Slab.extent_addr` — the read funnel design 29
+/// converts — and through nothing else. There is no second `phys_to_virt` here
+/// because there is no second dereference of a stored physical base: the
+/// accessor already did that, and this is field arithmetic on what it lent.
+/// (029's rebase note is the reason that sentence is worth writing down: a
+/// missed conversion is a hard fault on a translating profile and INVISIBLE on
+/// an MPU one, so "no new funnel" has to be shown rather than assumed.)
+///
+/// Confined to this small named helper (design 136), so the callers stay
+/// ordinary code and the pointer never leaves the expression.
 ///
 /// ONE SLOT CARRIES BOTH BODIES, one at a time: the request on the way in, and
 /// then the reply written over it (sawos design 14 D-1, on design 10 ruling 4's
 /// rider — "ruling 6's fixed slots carry the reply"). Nothing is owed to the
 /// request bytes once the taker has copied them out.
 public(package) func exchange_body_addr(x: Int) unsafe -> UInt {
-    let base = ((&var PIPE_BODIES) as UnsafePointer<UInt8>) as UInt
-    base + ((x * PIPE_BODY_BYTES) as UInt)
+    EXCHANGES[x].body_addr()
 }
 
 /// Take a FREE ring slot of connection `c`, or `NO_EXCHANGE` when every one of
@@ -2129,7 +2228,7 @@ public(package) func alloc_exchange(c: Int) unsafe -> Int {
     var i: Int = 0
     while i < PIPE_INFLIGHT {
         let x = pipe_exchange_at(c, i)
-        match PIPE_EX_STATE[x] {
+        match EXCHANGES[x].state {
             case Free -> { return x },
             case _ -> {},
         }
@@ -2150,7 +2249,7 @@ public(package) func alloc_exchange(c: Int) unsafe -> Int {
 public(package) func pipe_has_room(c: Int) unsafe -> Bool {
     var i: Int = 0
     while i < PIPE_INFLIGHT {
-        match PIPE_EX_STATE[pipe_exchange_at(c, i)] {
+        match EXCHANGES[pipe_exchange_at(c, i)].state {
             case Free -> { return true },
             case _ -> {},
         }
@@ -2166,16 +2265,16 @@ public(package) func pipe_has_room(c: Int) unsafe -> Bool {
 /// tail index, which is design 13's own trade taken again: a second index is a
 /// second thing two paths have to keep in step.
 public(package) func stage_push(c: Int, x: Int) unsafe {
-    PIPE_NEXT[x] = 0
+    EXCHANGES[x].next = 0
     if PIPES[c].staged == 0 {
         PIPES[c].staged = x + 1
         return
     }
     var cur = PIPES[c].staged - 1
-    while PIPE_NEXT[cur] != 0 {
-        cur = PIPE_NEXT[cur] - 1
+    while EXCHANGES[cur].next != 0 {
+        cur = EXCHANGES[cur].next - 1
     }
-    PIPE_NEXT[cur] = x + 1
+    EXCHANGES[cur].next = x + 1
 }
 
 /// The OLDEST staged exchange of connection `c`, or `NO_EXCHANGE` when nothing
@@ -2195,8 +2294,8 @@ public(package) func stage_pop(c: Int) unsafe {
     if head == 0 {
         return
     }
-    PIPES[c].staged = PIPE_NEXT[head - 1]
-    PIPE_NEXT[head - 1] = 0
+    PIPES[c].staged = EXCHANGES[head - 1].next
+    EXCHANGES[head - 1].next = 0
 }
 
 /// Is every ring slot of connection `c` free — is there no exchange left in it?
@@ -2212,7 +2311,7 @@ public(package) func stage_pop(c: Int) unsafe {
 public(package) func pipe_idle(c: Int) unsafe -> Bool {
     var i: Int = 0
     while i < PIPE_INFLIGHT {
-        match PIPE_EX_STATE[pipe_exchange_at(c, i)] {
+        match EXCHANGES[pipe_exchange_at(c, i)].state {
             case Free -> {},
             case _ -> { return false },
         }
@@ -2260,10 +2359,10 @@ public(package) func free_pipe(slot: Int) unsafe {
 /// zero nobody can ever take it, so the message is owed to nobody and the slot
 /// may go.
 public(package) func exchange_can_settle(x: Int) unsafe -> Bool {
-    if PIPE_REPLY_REFS[x] != 0 || PIPE_REQUEST_REFS[x] != 0 {
+    if EXCHANGES[x].reply_refs != 0 || EXCHANGES[x].request_refs != 0 {
         return false
     }
-    match PIPE_EX_STATE[x] {
+    match EXCHANGES[x].state {
         case Free -> false,
         case Staged -> PIPES[exchange_pipe(x)].outlet_refs == 0,
         case Taken -> true,
@@ -2305,7 +2404,7 @@ public(package) func exchange_settle(x: Int) unsafe -> StagedRefs {
     // column it watches, so both columns at zero means nobody is watching
     // either. If it ever fired, a Waiter would be holding a level on a ring slot
     // the next `Post` is about to write.
-    if PIPE_REPLY_ATTACH[x] != 0 || PIPE_REQUEST_ATTACH[x] != 0 {
+    if EXCHANGES[x].reply_attach != 0 || EXCHANGES[x].request_attach != 0 {
         fatal_kernel("an exchange settled while attached", x as UInt)
     }
     // **AND NO THREAD CAN BE PARKED ON IT EITHER** (sawos design 17), which is
@@ -2315,18 +2414,18 @@ public(package) func exchange_settle(x: Int) unsafe -> StagedRefs {
     // pair's — a parked caller is on no list at all, so a settle that lost one
     // would strand a thread nothing could ever reach again, which is precisely
     // what design 10 ruling 2 forbids.
-    if PIPE_CALLER[x] != 0 {
+    if EXCHANGES[x].caller != 0 {
         fatal_kernel("an exchange settled with a caller parked on it", x as UInt)
     }
     // **THE HELD REFERENCES COME OUT FIRST AND ARE RELEASED LAST** — collected
     // here so the ledger is already empty for anything the caller's release
     // cascades into, handed back so the release happens where releases live.
     let held = take_staged(x)
-    PIPE_EX_STATE[x] = ExchangeState.Free
-    PIPE_REPLY_REFS[x] = 0
-    PIPE_REQUEST_REFS[x] = 0
-    PIPE_LENS[x] = 0
-    PIPE_NEXT[x] = 0
+    EXCHANGES[x].state = ExchangeState.Free
+    EXCHANGES[x].reply_refs = 0
+    EXCHANGES[x].request_refs = 0
+    EXCHANGES[x].len = 0
+    EXCHANGES[x].next = 0
 
     let c = exchange_pipe(x)
     match PIPES[c].state {

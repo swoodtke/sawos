@@ -1,0 +1,328 @@
+// SOS M5 unit 6a, GAP CLOSER 2: THE UNIT-5 COMPOSITION, WITNESSED
+// (sawos design 34, closing design 32's finding 6).
+//
+// The transcript:
+//
+//   SOS slabnodes: pool trimmed to the construction
+//   SOS slabnodes: fragmented holes=32
+//   SOS slabnodes: released one more past the node slab
+//   SOS slabnodes: donated a page of free ranges
+//   SOS slabnodes: the range came back
+//   SOS: process fault: bad argument process=...
+//
+// **WHAT DESIGN 28 COULD ONLY RECORD AND DESIGN 32 COULD ONLY FILE.** A pool's
+// free list is made of `FREE_RANGES` nodes; a release that finds none LEAKS its
+// range into the pool's `dropped` counter rather than failing (design 28's
+// infallible-release doctrine). Design 28 recorded that path as "zero in this
+// tree" because nothing could reach it; design 32 made `FreeRanges` donatable and
+// filed the case with its shape, unable to build it. This is that case.
+//
+// # THE CONSTRUCTION, AND WHY EVERY PIECE OF IT IS FORCED
+//
+// A node is spent only on a HOLE — a free range with allocated bytes on BOTH
+// sides — so exhausting 32 of them needs 32 simultaneous holes and therefore 33
+// simultaneous SEPARATORS. Two walls make the obvious program impossible, and
+// neither is the one design 32 named:
+//
+//  1. A separator has to be bytes the pool has handed out and not got back. A
+//     live region is one, and `MAX_HANDLES` is 16 — so a process cannot NAME 33
+//     of them. (`MAX_MEMORIES` is the wall design 32 expected; it is not the
+//     binding one, and raising it alone would not have helped.)
+//
+//  2. Cutting the holes one at a time does not work either, because `pool_cut` is
+//     FIRST FIT: the next cut would be served out of the hole just made instead
+//     of from the cursor, and the fragmentation would never grow.
+//
+// **BOTH ARE ANSWERED BY THE OP UNDER TEST.** A DONATED region's bytes leave the
+// pool permanently and its Memory slot is retired — so a donation is a separator
+// that costs NO handle and NO slot, which is what makes 33 of them fit. And the
+// holes are cut in STRICTLY GROWING sizes, so no later cut can be served out of
+// an earlier hole and every one of them comes off the cursor. Design 32 wrote
+// that the composition is "not merely untested but currently unreachable WITHOUT
+// this unit"; it is truer than it knew — `SlabDonate` supplies the separators.
+//
+// # WHY THIS CASE IS riscv32 ONLY
+//
+// Growing sizes are forced by first-fit, and the step is one `hal.PROT_GRAIN` —
+// which is 4 bytes on this profile and 4096 on the other. At 4096 the 32 holes
+// alone would want `4096 * (1 + 2 + ... + 32)` = 2.1 MiB, and their separators as
+// much again, against a pool of 256 KiB that cannot grow (the other profile's
+// grant window caps it). So the construction is arithmetically impossible there,
+// and saying so is better than not testing the path at all. Design 34's As-built
+// records it as the one place this unit's coverage is asymmetric.
+//
+// # HOW THE LEAK IS OBSERVED, GIVEN THAT `dropped` HAS NO OP
+//
+// By a CONTROLLED PAIR: two identical releases of two identical regions, one
+// before the `FreeRanges` donation and one after.
+//
+//   R1 is released with the node slab FULL. It leaks — its bytes are gone.
+//   R2 is released after nodes have been donated. It gets a node.
+//
+// Then `split` is the read-out. The pool's cursor is spent to zero by
+// construction, and every remaining hole is smaller than R2, so a split of R2's
+// size can only be served out of R2's own returned range: it SUCCEEDS, and
+// "the range came back" is that success.
+//
+// **AND THE FAULT AT THE END IS THE OTHER HALF OF THE PAIR.** Asking for the same
+// size once more can only be served by R1's range — which leaked — so
+// `pool_can_serve` says no and `MemoryOp.Split` ends the caller with `BadArg`
+// (design 178's split: a caller that asks a pool for bytes it does not have could
+// have checked). The case therefore EXPECTS root to fault, exactly as
+// `tests/slab-donate-shared` does. A kernel that had not leaked R1 would have
+// served that split and the run would end cleanly — so the fault is the
+// assertion, not an accident.
+
+import sos.{System, Process, Memory, SlabKind, SosStatus}
+
+/// The runner's pool length for this profile. Mirrored here because the
+/// construction has to spend the cursor to EXACTLY zero: `split` faults when a
+/// pool cannot serve the ask, so the program may never over-request.
+static POOL_LEN: UInt = 0x40000
+
+/// Holes to make, which is `MAX_FREE_RANGES` — the node slab, filled exactly.
+static HOLES: Int = 32
+
+/// The first hole's size, and the step every later one grows by. The step is one
+/// protection grain on this profile; see the header for why it must be positive.
+static HOLE0: UInt = 256
+static STEP: UInt = 8
+
+/// A separator is cut just after the hole below it and must be LARGER than every
+/// hole that exists, so first fit cannot serve it out of one.
+static SEP_BUMP: UInt = 4
+
+/// The last three separators are also `SlabKind.Threads` donations, and a thread
+/// unit is a slot PLUS a frame stride — so they are sized for that rather than
+/// for the four bytes the layout needs.
+static BIG_SEP: UInt = 1536
+
+/// The controlled pair's size. Larger than every hole, so a split of it can only
+/// ever be served out of one of these two ranges.
+static PAIR: UInt = 512
+
+/// The page donated to `FreeRanges` between the two releases.
+static NODES: UInt = 4096
+
+/// `SlabKind.Events`, the first separator kind. Named because a bare `0` does not
+/// adopt a platform `UInt` at an argument (SL-24).
+static EVENTS_KIND: UInt = 0
+
+/// `SlabKind.Threads`'s raw value — the kind the three big separators go to.
+static THREADS_KIND: UInt = 9
+
+/// Kinds 0..7 (`Events` .. `Mappings`) take four separators each, which is
+/// `MAX_SLAB_EXTENTS` per kind and exactly the 32 the small separators need.
+/// `SlabKind.Memories` is one of them, so the Memories donation design 32's
+/// finding asked for happens here — as one separator among many rather than as
+/// the enabling step it was expected to be.
+static SEPS_PER_KIND: Int = 4
+
+static EXIT_FAILED: UInt = 1
+
+/// Hole `i`'s length.
+func hole_len(i: Int) -> UInt { HOLE0 + STEP * (i as UInt) }
+
+/// The separator cut just below hole `i` — bigger than hole `i - 1`, which is the
+/// largest free range in existence when it is cut.
+func sep_len(i: Int) -> UInt { hole_len(i) + SEP_BUMP }
+
+/// Every byte the construction spends, so the trim below can leave exactly that
+/// much on the cursor.
+func construction_bytes() -> UInt {
+    var total: UInt = NODES + PAIR + PAIR + 3 * BIG_SEP
+    var i: Int = 0
+    while i < HOLES {
+        total = total + hole_len(i) + sep_len(i)
+        i = i + 1
+    }
+    total
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS slabnodes: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var pool_record = try proc.boot_handle_next() catch {
+        let _ = system.debug_print("SOS slabnodes: no pool region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let pool = pool_record.take_memory() else {
+        let _ = system.debug_print("SOS slabnodes: pool record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // ---- TRIM THE POOL TO THE CONSTRUCTION -------------------------------
+    //
+    // The read-out at the end depends on the cursor being SPENT, so that a split
+    // can only be served out of a returned range. The surplus goes where every
+    // separator goes — into a slab, permanently — and `Pipes` takes it because a
+    // pipe unit is the largest in the kernel and one extent swallows the lot.
+    let surplus = POOL_LEN - construction_bytes()
+    let trim = try pool.split(len: surplus) catch {
+        print("SOS slabnodes: trim split failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try system.slab_donate(kind: SlabKind.Pipes, memory: move trim) catch {
+        let _ = system.debug_print("SOS slabnodes: trim donation refused\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS slabnodes: pool trimmed to the construction\n")
+
+    // The nodes for stage 2, cut BEFORE the fragmentation so that the pool is
+    // whole when it is taken and the construction's arithmetic stays exact.
+    let nodes_page = try pool.split(len: NODES) catch {
+        print("SOS slabnodes: nodes split failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // ---- THE FRAGMENTATION ------------------------------------------------
+    //
+    // `sep, hole, sep, hole, ...` — each hole released only once the separator
+    // ABOVE it is out of the pool, so it touches neither a free neighbour nor the
+    // cursor and must take a node of its own.
+    guard let first_kind = SlabKind.from(raw: EVENTS_KIND) else {
+        let _ = system.debug_print("SOS slabnodes: kind 0 is not a kind\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let first_sep = try pool.split(len: sep_len(0)) catch {
+        print("SOS slabnodes: first separator failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try system.slab_donate(kind: first_kind, memory: move first_sep) catch {
+        let _ = system.debug_print("SOS slabnodes: first separator refused\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    var made: Int = 0
+    var i: Int = 0
+    while i < HOLES {
+        let hole = try pool.split(len: hole_len(i)) catch {
+            print("SOS slabnodes: hole {} failed: {}\n", i, error)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+
+        // The separator ABOVE this hole. Its kind is the next extent in the
+        // round-robin; the last one is a Threads extent, which is why it is big.
+        let next = i + 1
+        let raw = if next < HOLES { (next / SEPS_PER_KIND) as UInt } else { THREADS_KIND }
+        let want = if next < HOLES { sep_len(next) } else { BIG_SEP }
+        guard let kind = SlabKind.from(raw: raw) else {
+            print("SOS slabnodes: {} is not a kind\n", raw)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        let sep = try pool.split(len: want) catch {
+            print("SOS slabnodes: separator {} failed: {}\n", next, error)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        try system.slab_donate(kind: kind, memory: move sep) catch {
+            print("SOS slabnodes: separator {} refused\n", next)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+
+        // THE RELEASE THAT MAKES THE HOLE. Both neighbours are donated bytes, so
+        // there is nothing to coalesce with and nothing to fold into.
+        let _ = move hole
+        made = made + 1
+        i = i + 1
+    }
+    print("SOS slabnodes: fragmented holes={}\n", made)
+
+    // ---- R1: THE RELEASE THAT LEAKS ---------------------------------------
+    let r1 = try pool.split(len: PAIR) catch {
+        print("SOS slabnodes: R1 split failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let threads_kind = SlabKind.from(raw: THREADS_KIND) else {
+        let _ = system.debug_print("SOS slabnodes: Threads is not a kind\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let sep_r1 = try pool.split(len: BIG_SEP) catch {
+        print("SOS slabnodes: R1 separator failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try system.slab_donate(kind: threads_kind, memory: move sep_r1) catch {
+        let _ = system.debug_print("SOS slabnodes: R1 separator refused\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    // The node slab holds exactly `HOLES` live nodes at this point, so this
+    // release finds none and the range is added to the pool's `dropped` and lost.
+    let _ = move r1
+    let _ = system.debug_print(
+        "SOS slabnodes: released one more past the node slab\n")
+
+    // ---- R2: THE SAME RELEASE, HELD BACK ----------------------------------
+    let r2 = try pool.split(len: PAIR) catch {
+        print("SOS slabnodes: R2 split failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let sep_r2 = try pool.split(len: BIG_SEP) catch {
+        print("SOS slabnodes: R2 separator failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try system.slab_donate(kind: threads_kind, memory: move sep_r2) catch {
+        let _ = system.debug_print("SOS slabnodes: R2 separator refused\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // ---- STAGE 2: DONATE THE NODES ----------------------------------------
+    try system.slab_donate(kind: SlabKind.FreeRanges, memory: move nodes_page) catch {
+        let _ = system.debug_print("SOS slabnodes: node donation refused\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS slabnodes: donated a page of free ranges\n")
+
+    // The identical release, now with a node to take. Its range goes onto the
+    // free list where R1's went nowhere.
+    let _ = move r2
+
+    // ---- THE READ-OUT -----------------------------------------------------
+    //
+    // The cursor is spent and every hole is smaller than `PAIR`, so this can only
+    // be served out of R2's returned range.
+    let back = try pool.split(len: PAIR) catch {
+        print("SOS slabnodes: the range did NOT come back: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS slabnodes: the range came back\n")
+
+    // AND THE OTHER HALF OF THE PAIR, WHICH IS THE ASSERTION.
+    //
+    // `back` is deliberately still HELD, so R2's range is spent and the only
+    // thing left in the machine that could serve another `PAIR` is R1's range.
+    // It leaked, so `pool_can_serve` says no and `MemoryOp.Split` ends this
+    // process with `BadArg`. Had R1's release found a node, this split would
+    // have been served out of it and the run would have ended cleanly — which is
+    // what makes the fault a measurement of the leak rather than of the pool.
+    let _ = pool.split(len: PAIR)
+    let _ = system.debug_print(
+        "SOS slabnodes: UNREACHABLE — the leaked range was served\n")
+    let _ = move back
+    let _ = system.shutdown(EXIT_FAILED)
+}

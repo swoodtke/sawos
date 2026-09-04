@@ -7,14 +7,18 @@
 //! waiter's delivery, a timer's expiry — can push one onto the ready queue
 //! without reaching for the scheduler that will pick it up.
 
+import hal
+
 import kcore.limits.{
     FRAME_ARENA_WORDS,
+    MAX_SLAB_EXTENTS,
     MAX_THREADS,
     NO_PROCESS,
     NO_THREAD,
     THREAD_FRAME_STRIDE,
 }
 import kcore.mem.{align_up}
+import kcore.slab.{Slab}
 
 // =============================================================================
 // Processes, threads and the scheduler (design 178 D2/D3/D4; spec §2, §7, §8)
@@ -48,18 +52,83 @@ import kcore.mem.{align_up}
 // scheduler compares against: `LAST_PROT_PROCESS`, below, beside the rest of
 // the state a switch reads.
 
-/// Every thread's saved context, back to back.
+/// EXTENT 0's frames: every compiled thread's saved context, back to back.
 ///
 /// All-zero, so it costs no image bytes (design 149) — and a zeroed frame is
 /// also the right initial state, since `frame_init` only has to write the three
 /// or four words that are not zero.
+///
+/// It stays a bare array rather than becoming part of `THREADS` (sawos design
+/// 34), and `frame_slot` below says why: the alignment is load-bearing, and a
+/// `Slab`'s inline array cannot promise it.
 unsafe static var THREAD_FRAMES: [UInt64; FRAME_ARENA_WORDS] = [0; FRAME_ARENA_WORDS]
 
 /// The address of thread slot `index`'s frame.
+///
+/// # THE CONTEXT-SWITCH PATH, AND WHY IT IS SHAPED LIKE THIS
+///
+/// **THIS IS THE READ THE TRAP PATH MAKES WITH INTERRUPTS IMPLIED OFF.** Every
+/// context switch in the system is `kcore.sched.run_thread` calling this and
+/// `ktrap` returning the answer; the HAL's trap entry then resumes that frame.
+/// M5 unit 6 (design 32) declined to convert THREADS for exactly this reason,
+/// and unit 6a converts it under the rule that this function's hot arm must stay
+/// the arithmetic it was.
+///
+/// **THE FLOOR ARM IS BYTE-FOR-BYTE THE OLD FUNCTION.** `index < MAX_THREADS` is
+/// every thread on a machine that never donates — which is every case in the
+/// suite — and that arm is the same `align_up` plus multiply-add it has always
+/// been, now behind one compare against a compile-time constant. No walk, no
+/// memory read of the extent table, no branch on donated state.
+///
+/// **THE DONATED ARM IS ONE BOUNDED WALK AND NO MORE.** `THREADS.locate` is at
+/// most `MAX_SLAB_EXTENTS` (4) iterations of an O(1) body over the same table
+/// the slot lookup uses, and the address is then a multiply-add on the side-arena
+/// base recorded in that same row. AUDIT (design 1): no preemption point, and
+/// none possible — the body allocates nothing, can fault on nothing (the extent
+/// was validated and zeroed before it was installed, and donation is permanent
+/// so a base is never retired), and takes no lock. The bound is finite because
+/// extents are finitely many.
+///
+/// **THE ONE THING THAT COULD DISAGREE IS MADE UNABLE TO.** Slot `i`'s frame and
+/// slot `i`'s storage come from ONE `locate` answer — the same extent, the same
+/// offset — so a donated thread cannot read another thread's frame however the
+/// chain was built. That is what `Slab.ext_side` is for, and it is why the frame
+/// base is a COLUMN of the extent table rather than a parallel array.
+///
+/// # WHY THE FRAME IS NOT A FIELD OF `ThreadSlot`
+///
+/// The obvious conversion — fold the frame into the slot, let the plain chain
+/// carry both — is UNSOUND, and the reason is three instructions deep in one
+/// profile's trap entry: its user-return path loads the frame address INTO THE
+/// STACK POINTER, so a frame IS that register and must carry its alignment.
+/// That is what `THREAD_FRAME_STRIDE % 16 == 0` in `kcore.limits` has always
+/// been about, and the static_assert beside it is the statement of record.
+///
+/// A fattened `ThreadSlot` would be `sizeof(ThreadSlot) + THREAD_FRAME_STRIDE`
+/// bytes at `alignof(Int)`. On one profile that is 592, a multiple of 16, so it
+/// would have passed; on the other it is 552, which is 8 mod 16, so every other
+/// frame would have been misaligned — ON THE PROFILE THAT DOES NOT CHECK.
+/// Saw has no alignment attribute to pin a struct with, and no padding makes a
+/// struct a multiple of 16 on both profiles at once (the two headers are 40 and
+/// 80 bytes, so the parity the padding must fix is opposite on each). So the
+/// arena stays separately aligned, at the stride, exactly as it always was.
+///
+/// **THE SECOND FUNNEL, NAMED** (sawos designs 29 + 32). `Slab.extent_addr` is
+/// the funnel for donated SLOTS; this is the funnel for donated FRAMES, and it
+/// is the only other place in the kernel where a stored physical base becomes a
+/// kernel-dereferenced address. `ext_side[e]` stays PHYSICAL — a base is
+/// addresses-as-data — and the `hal.phys_to_virt` below is the moment of
+/// dereference, which is design 29's whole discipline. Getting this wrong is a
+/// hard fault on a translating profile and INVISIBLE on an MPU one, which is
+/// precisely what 029's rebase note warned the next unit about.
 public(package) func frame_slot(index: Int) unsafe -> UInt {
     let stride = THREAD_FRAME_STRIDE as UInt
-    let base = align_up(((&var THREAD_FRAMES) as UnsafePointer<UInt64>) as UInt, stride)
-    base + (index as UInt) * stride
+    if index < MAX_THREADS {
+        let base = align_up(((&var THREAD_FRAMES) as UnsafePointer<UInt64>) as UInt, stride)
+        return base + (index as UInt) * stride
+    }
+    let (e, rest) = THREADS.locate(index)
+    hal.phys_to_virt(THREADS.side_base(e) + (rest as UInt) * stride)
 }
 
 /// What a thread slot is doing (spec §8).
@@ -162,11 +231,19 @@ public(package) struct ThreadSlot {
     public(package) call_len: UInt,
 }
 
-public(package) unsafe static var THREADS: [ThreadSlot; MAX_THREADS] = [
-    ThreadSlot(state: ThreadState.Free, process: 0,
-               exit_code: 0, joiners: 0, link: 0, wait_buf: 0,
-               call_pipe: 0, call_claim: 0, call_src: 0,
-               call_len: 0); MAX_THREADS]
+/// **AN EXTENT CHAIN SINCE M5 UNIT 6a** (sawos design 34), with the frame arena
+/// riding the extent table's side column — see `frame_slot`. `THREADS[i]` names
+/// what it always named; the loop bounds below read `capacity()`.
+public(package) unsafe static var THREADS: Slab<ThreadSlot, MAX_THREADS> = Slab<ThreadSlot, MAX_THREADS>(
+    inline: [ThreadSlot(state: ThreadState.Free, process: 0,
+                        exit_code: 0, joiners: 0, link: 0, wait_buf: 0,
+                        call_pipe: 0, call_claim: 0, call_src: 0,
+                        call_len: 0); MAX_THREADS],
+    ext_base: [0; MAX_SLAB_EXTENTS],
+    ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_side: [0; MAX_SLAB_EXTENTS],
+    ext_count: 0,
+    total: MAX_THREADS)
 
 /// The running thread's slot, or `NO_THREAD`.
 ///
@@ -260,8 +337,10 @@ public(package) func ready_pop() unsafe -> Int {
 /// the only other word the queue has, and it is wrong exactly when the removed
 /// node was the last one.
 ///
-/// AUDIT (design 1): NO PREEMPTION POINT. `MAX_THREADS` iterations at most, of
-/// an O(1) body — and the ready queue IS state the IRQ path writes
+/// AUDIT (design 1): NO PREEMPTION POINT. As many iterations as the thread slab
+/// is long at most (`MAX_THREADS` plus whatever a deployment donated — sawos
+/// design 34; finite because extents are finitely many and each is finitely
+/// sized), of an O(1) body — and the ready queue IS state the IRQ path writes
 /// (`ready_push` from a wake), so a delivery landing mid-walk is precisely the
 /// in-flight invariant the placement rule refuses.
 public(package) func ready_remove_process(p: Int) unsafe {
@@ -295,7 +374,7 @@ public(package) func ready_remove_process(p: Int) unsafe {
 /// Take a free thread slot, or `NO_THREAD` when the slab is empty.
 public(package) func alloc_thread() unsafe -> Int {
     var i: Int = 0
-    while i < MAX_THREADS {
+    while i < THREADS.capacity() {
         match THREADS[i].state {
             case Free -> { return i },
             case _ -> {},
@@ -313,7 +392,7 @@ public(package) func alloc_thread() unsafe -> Int {
 public(package) func live_threads(p: Int) unsafe -> Int {
     var live: Int = 0
     var i: Int = 0
-    while i < MAX_THREADS {
+    while i < THREADS.capacity() {
         if THREADS[i].process == p {
             match THREADS[i].state {
                 case Free -> {},

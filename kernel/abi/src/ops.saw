@@ -1088,6 +1088,31 @@ public enum SlabKind: UInt {
     /// The allocator's free-list nodes — design 28's named first customer, and
     /// the one donatable slab that backs no object kind at all.
     case FreeRanges = 8,
+    /// **THREADS, AND THE FRAME ARENA THAT COMES WITH THEM** (sawos design 34,
+    /// M5 unit 6a). One donation buys both: a thread is a slot plus a saved
+    /// context, and the kernel carves the region into the two arrays itself
+    /// rather than asking a caller to donate twice and get the ratio right.
+    ///
+    /// Design 32 excluded this kind on RISK — the context-switch path reads a
+    /// frame by index — and unit 6a converted it with that path as a reviewed
+    /// surface; `kcore.threads.frame_slot` carries the audit.
+    case Threads = 9,
+    /// **PIPE CONNECTIONS, AND THE `PIPE_INFLIGHT` EXCHANGES EACH ONE OWNS**
+    /// (sawos design 34). The same one-donation-two-arrays shape as `Threads`,
+    /// with a fan-out: `k` connections need `k * PIPE_INFLIGHT` exchange records,
+    /// and a caller never names either number.
+    ///
+    /// Design 32 excluded this kind on MERIT — ten satellite arrays hanging off
+    /// a derived index — and unit 6a made the ten into one `Exchange` record,
+    /// which is what turned "a different data structure" back into a chain.
+    ///
+    /// **IT IS BY FAR THE MOST EXPENSIVE KIND PER SLOT**, because a connection
+    /// carries its whole staging ring: a donated region buys
+    /// `len / (sizeof(PipeSlot) + PIPE_INFLIGHT * sizeof(Exchange))` connections,
+    /// which is single digits for one page. That is a fact about pipes rather
+    /// than about this op — the same storage was always there — and it is why a
+    /// deployment that wants many connections donates a large region.
+    case Pipes = 10,
 }
 
 /// **THE MESSAGE BODY'S MAXIMUM, AS A BUILD DEFINE** (spec §2.1's fixed body;

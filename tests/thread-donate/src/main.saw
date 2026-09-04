@@ -1,0 +1,216 @@
+// SOS M5 unit 6a: A DONATED THREAD IS A THREAD THE PROCESSOR SWITCHES INTO
+// (sawos design 34, on design 32's excluded-on-risk note).
+//
+// The transcript:
+//
+//   SOS threaddonate: floor=8 ninth refused: out of kernel objects
+//   SOS threaddonate: donated a page of threads
+//   SOS threaddonate: extent thread created
+//   TTT
+//   SOS threaddonate: extent thread joined code=33
+//   SOS threaddonate: done
+//
+// **WHY THIS CASE EXISTS AND WHY IT IS THE UNIT'S RISK WITNESS.** M5 unit 6
+// converted nine slabs and declined THREADS by name, on risk: a thread carries a
+// saved-context arena beside its slot, and the trap path reads a frame BY INDEX
+// with interrupts implied off. So a donated thread slot proves nothing on its
+// own — a count only shows the allocator found the extent. What has to be shown
+// is that the kernel can BUILD a context in donated memory, SWITCH INTO IT, and
+// switch back out again with the register file intact.
+//
+// FOUR CLAIMS, IN ORDER.
+//
+//  1. THE FLOOR IS REAL. `MAX_THREADS` is 8. The initial thread holds one slot
+//     and seven more fill the rest, so the ninth `thread_create` meets the SLAB
+//     and answers `NoResource`.
+//
+//     THE FILL IS A LOOP AND THE HANDLES ARE DROPPED, which is sound for exactly
+//     one reason worth writing down: a Thread slot has NO reference count (sawos
+//     design 7 D-1 — the join/exit protocol owns its lifetime) and comes back
+//     only at process teardown. So a dropped handle leaves the slot spent, and a
+//     loop fills the slab where the Waiter case next door needed seven separate
+//     live bindings.
+//
+//  2. THE DONATION IS ORDINARY MEMORY — one page out of root's pool, consumed by
+//     the op exactly as `tests/slab-donate` consumes its own.
+//
+//  3. THE CEILING MOVED: the create that was refused now succeeds.
+//
+//  4. **AND THE DONATED FRAME IS A FRAME.** The ninth thread — which can only be
+//     in extent 1, since the first eight are live and are extent 0 in its
+//     entirety — is STARTED, prints, YIELDS three times and exits with a value
+//     the joiner reads back. Every one of those is the context-switch path
+//     running on a donated frame: `frame_init` writes the entry, stack pointer
+//     and argument into it, the trap return resumes it, each yield saves the
+//     register file INTO it and restores it again, and the exit code surviving
+//     the round trip is what says the save and the restore agreed.
+//
+//     `code=33` is that proof in one number. It is written by the donated thread
+//     into its own frame's result registers and read by a joiner in extent 0, so
+//     a frame address computed even slightly wrong loses it.
+//
+// WHY NO SLOT COUNT IS PRINTED, as in `tests/slab-donate`: a donated thread unit
+// is `sizeof(ThreadSlot) + THREAD_FRAME_STRIDE` and the slot half differs
+// per-profile, so the new ceiling is arch-dependent while every claim above is
+// not. Design 34's As-built prices both.
+
+import sos.{System, Process, Thread, Memory, SlabKind, SosStatus}
+
+/// One protection unit's worth on either profile — many thread units, which is
+/// all the donation has to be.
+static PAGE: UInt = 0x1000
+
+/// `MAX_THREADS`, written down so that raising the kernel's floor fails THIS
+/// case loudly rather than quietly making its first claim vacuous.
+static FLOOR: UInt = 8
+
+/// Threads to create BESIDE the initial one to fill extent 0.
+static FILL: Int = 7
+
+/// The value the donated thread exits with, and therefore the number the join
+/// reports. It appears nowhere else in the transcript.
+static EXIT_CODE: UInt = 33
+
+/// How many times the donated thread yields — each one a switch out of and back
+/// into a frame in donated memory.
+static TURNS: Int = 3
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The boot handle, parked by the initial thread for the worker. Handle 0 names
+/// nothing, so a parked handle is never 0 and an unparked slot is never a handle
+/// — the `tests/thread-basics` idiom, and for its reason: every thread of this
+/// image enters at `_start`, so the entry has to work out which thread it is.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+static STACK_WORDS: Int = 1024
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+/// The donated thread's stack. The FILL threads never run, so they need no
+/// stack of their own and share this one's top — an address a thread that is
+/// never started never touches.
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+/// The argument a FILL thread is created with. It never runs, so the value is
+/// never read — it is named because a bare `0` does not adopt a platform `UInt`
+/// at an argument (SL-24).
+static NO_ARG: UInt = 0
+
+static NO_VALUE: UInt = 0
+
+func stack_top_of(base: UInt) -> UInt {
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func stack_top() unsafe -> UInt {
+    stack_top_of(((&var STACK) as UnsafePointer<UInt64>) as UInt)
+}
+
+func park_boot_handle(word: UInt) unsafe { BOOT_HANDLE = word }
+
+func parked_boot_handle() unsafe -> UInt { BOOT_HANDLE }
+
+/// The thread living in donated memory: print, yield, repeat, exit.
+///
+/// It derives every object it uses from the parked boot handle, so nothing about
+/// it depends on which extent its slot came out of — which is the point.
+func worker() {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    var turn = 0
+    while turn < TURNS {
+        let _ = system.debug_print("T")
+        // THE SWITCH, out of a donated frame and back into it. This kernel arms
+        // no timer for this image, so a yield is the only thing that can move the
+        // processor at all.
+        let _ = me.yield_now()
+        turn = turn + 1
+    }
+    let _ = me.exit(EXIT_CODE)
+}
+
+func initial(boot_handle: UInt) {
+    park_boot_handle(boot_handle)
+
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS threaddonate: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var pool_record = try proc.boot_handle_next() catch {
+        let _ = system.debug_print("SOS threaddonate: no pool region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let pool = pool_record.take_memory() else {
+        let _ = system.debug_print("SOS threaddonate: pool record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // ---- CLAIM 1: the compiled floor is real ------------------------------
+    var made = 0
+    while made < FILL {
+        let _ = try proc.thread_create(stack_top: stack_top(), arg: NO_ARG) catch {
+            print("SOS threaddonate: fill create failed: {}\n", error)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        made = made + 1
+    }
+
+    match proc.thread_create(stack_top: stack_top(), arg: NO_ARG) {
+        case Ok(_) -> {
+            let _ = system.debug_print(
+                "SOS threaddonate: a ninth thread existed BEFORE the donation\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        case Err(e) -> print("SOS threaddonate: floor={} ninth refused: {}\n",
+                             FLOOR, e),
+    }
+
+    // ---- CLAIM 2: the donation ------------------------------------------
+    let scratch = try pool.split(len: PAGE) catch {
+        print("SOS threaddonate: no page to donate: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try system.slab_donate(kind: SlabKind.Threads, memory: move scratch) catch {
+        let _ = system.debug_print("SOS threaddonate: donation refused\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS threaddonate: donated a page of threads\n")
+
+    // ---- CLAIM 3: the ceiling moved --------------------------------------
+    let extent = try proc.thread_create(stack_top: stack_top(), arg: NO_ARG) catch {
+        print("SOS threaddonate: the donated extent gave nothing: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS threaddonate: extent thread created\n")
+
+    // ---- CLAIM 4: and the donated FRAME works ----------------------------
+    let _ = extent.start()
+    let code: UInt = try extent.join() catch { NO_VALUE }
+    print("\nSOS threaddonate: extent thread joined code={}\n", code)
+
+    let _ = system.debug_print("SOS threaddonate: done\n")
+    let _ = proc.exit(EXIT_OK)
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        worker()
+    }
+}

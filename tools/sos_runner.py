@@ -304,6 +304,23 @@ SLAB_DONATE_PKG = os.path.join(TESTS_DIR, "slab-donate")
 # The negative half: a region with a SIBLING handle is refused, by ending the
 # caller. See the package header for why that is a fault and not a status.
 SLAB_DONATE_SHARED_PKG = os.path.join(TESTS_DIR, "slab-donate-shared")
+
+# M5 unit 6a (sawos design 34): the two kinds design 32 excluded, one package
+# each. `thread-donate` is the unit's RISK witness — a donated thread is started,
+# yields and is joined, so the context-switch path runs on a frame in donated
+# memory. `pipe-donate` carries a real message over a connection whose slot and
+# whose staging ring are both in extent 1.
+THREAD_DONATE_PKG = os.path.join(TESTS_DIR, "thread-donate")
+PIPE_DONATE_PKG = os.path.join(TESTS_DIR, "pipe-donate")
+
+# The two gaps design 32's As-built recorded against itself, closed here.
+# `slab-donate-mapped` is the `maps == 0` half of the safety condition (finding
+# 2); `slab-donate-free-nodes` is the unit-5 composition (finding 6), which needs
+# a Memories donation before the pool can even be fragmented far enough to reach
+# the node slab's wall.
+SLAB_DONATE_MAPPED_PKG = os.path.join(TESTS_DIR, "slab-donate-mapped")
+SLAB_DONATE_MAPPED_CHILD_PKG = os.path.join(TESTS_DIR, "child-donor")
+SLAB_DONATE_NODES_PKG = os.path.join(TESTS_DIR, "slab-donate-free-nodes")
 CHILD_QUOTA_PKG = os.path.join(TESTS_DIR, "child-quota")
 CHILD_MAPWALL_PKG = os.path.join(TESTS_DIR, "child-mapwall")
 
@@ -4589,6 +4606,121 @@ TEST_CASES = [
                        "SOS placed: read back 45",
                        "SOS placed: done"],
         "expect_clean_exit": True,
+    },
+
+    # M5 UNIT 6a (sawos design 34): the two kinds unit 6 excluded.
+    #
+    # THE RISK ONE FIRST. A donated thread is not proven by a count — what design
+    # 32 declined this kind over is the context-switch path, so the case starts
+    # the thread whose slot and whose FRAME are both in donated memory, watches it
+    # yield three times, and reads its exit code back through a join. `TTT` is the
+    # three switches; `code=33` is the register file surviving them.
+    {
+        "name": "thread_donate",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": THREAD_DONATE_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS threaddonate: floor=8 ninth refused: "
+                       "out of kernel objects",
+                       "SOS threaddonate: donated a page of threads",
+                       "SOS threaddonate: extent thread created",
+                       "TTT",
+                       "SOS threaddonate: extent thread joined code=33",
+                       "SOS threaddonate: done"],
+        "expect_clean_exit": True,
+    },
+
+    # AND THE ONE UNIT 6 EXCLUDED ON MERIT. A connection in extent 1 carries a
+    # real message end to end — post, take, reply, resolve — so the staging ring
+    # that lives in donated memory beside its connection slot is shown to work
+    # rather than merely to exist.
+    {
+        "name": "pipe_donate",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_DONATE_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS pipedonate: floor=4 fifth refused: "
+                       "out of kernel objects",
+                       "SOS pipedonate: donated a region of pipes",
+                       "SOS pipedonate: fifth connection created",
+                       "SOS pipedonate: server took len=5 byte0=80",
+                       "SOS pipedonate: client resolved len=3 byte0=90",
+                       "SOS pipedonate: done"],
+        "expect_clean_exit": True,
+    },
+
+    # GAP CLOSER 1 (design 32 finding 2): the `maps == 0` half of the safety
+    # condition, which unit 6 implemented and did not test.
+    #
+    # THE DONOR IS THE CHILD, AND THAT IS WHAT MAKES THE SECOND HALF OBSERVABLE.
+    # The refusal is a FAULT, so the donor dies — and "the region was not
+    # absorbed" cannot be read out of a dead process. So root maps the page into
+    # its OWN space, stamps a witness byte through the mapping, hands the region
+    # to a child carrying `SlabDonate`, and reads the witness back AFTER the child
+    # has faulted. A donation that had been accepted would have zeroed those
+    # bytes before installing them.
+    {
+        "name": "slab_donate_mapped",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": SLAB_DONATE_MAPPED_PKG,
+        "children": [SLAB_DONATE_MAPPED_CHILD_PKG],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS slabmapped: stamped witness=165",
+                       "SOS donor: donating a mapped region",
+                       "SOS: process fault: object in the wrong state "
+                       "process={one}",
+                       "SOS: process teardown handles={three} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       # Faulted(2) << 16 | BadState(5) — the child died of the
+                       # `maps` leg specifically, which is the claim.
+                       "SOS slabmapped: child faulted status=131077",
+                       "SOS slabmapped: witness still 165",
+                       "SOS slabmapped: done"],
+        "expect_clean_exit": True,
+    },
+
+    # GAP CLOSER 2 (design 32 finding 6): the unit-5 composition, which that unit
+    # filed with its shape and could not reach.
+    #
+    # IT IS A TWO-STAGE DONATION, and the first stage is the very op under test.
+    # A free-range node is only ever spent on a HOLE, so exhausting the node slab
+    # needs more non-adjacent free ranges than `MAX_MEMORIES` can hold live
+    # regions to make — the pool physically cannot be fragmented that far on a
+    # stock image. Donating to `Memories` first is what lifts that wall.
+    {
+        "name": "slab_donate_free_nodes",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": SLAB_DONATE_NODES_PKG,
+        "pool": True,
+        # riscv32 ONLY, and the package header carries the arithmetic: the
+        # construction needs strictly growing cuts (first fit would otherwise
+        # serve them out of the holes it just made), the step is one
+        # `hal.PROT_GRAIN`, and at the other profile's 4096-byte grain the 32
+        # holes alone would want 2.1 MiB against a pool that cannot exceed the
+        # grant window. Design 34's As-built records the asymmetry.
+        "arches": ["riscv32"],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS slabnodes: pool trimmed to the construction",
+                       "SOS slabnodes: fragmented holes=32",
+                       "SOS slabnodes: released one more past the node slab",
+                       "SOS slabnodes: donated a page of free ranges",
+                       "SOS slabnodes: the range came back",
+                       # THE ASSERTION. R2's range came home and R1's did not, so
+                       # the second ask of the pair cannot be served and the
+                       # kernel ends the caller — `MemoryOp.Split`'s `BadArg`.
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
     },
 ]
 

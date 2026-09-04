@@ -1,0 +1,222 @@
+// SOS M5 unit 6a, GAP CLOSER 1: THE `maps == 0` HALF OF THE SAFETY CONDITION
+// (sawos design 34, closing design 32's finding 2).
+//
+// The transcript:
+//
+//   SOS slabmapped: stamped witness=165
+//   SOS donor: donating a mapped region
+//   SOS: process fault: object in the wrong state process=...
+//   SOS slabmapped: child faulted
+//   SOS slabmapped: witness still 165
+//   SOS slabmapped: done
+//
+// **WHAT UNIT 6 LEFT UNCOVERED, AND WHY IT DID.** `SystemOp.SlabDonate` refuses a
+// region the kernel cannot safely absorb, and the condition has two halves:
+// `refs == 1` (this handle is the region's only reference) and `maps == 0` (no
+// installed grant row reaches it from any domain). `tests/slab-donate-shared`
+// proves the first. Design 32's As-built named the second as implemented and
+// untested, because proving it wants a LIVE MAPPING — which wants somebody still
+// alive to have made one.
+//
+// **THE DONOR IS THE CHILD, AND THAT IS THE WHOLE DESIGN OF THIS CASE.** The
+// refusal is a FAULT, so whoever calls the op dies; and "the region was not
+// absorbed" cannot be read out of a dead process. So the two roles are split:
+//
+//   ROOT maps the page into its OWN space and stamps a witness byte through the
+//   mapping. That is what makes `maps` non-zero, and it is also the observer.
+//
+//   THE CHILD holds the region's ONLY handle and carries `SystemRight.SlabDonate`
+//   — minted down from root's own set, since attenuation is monotonic and no
+//   child starts with the bit. It donates, and it dies.
+//
+//   ROOT then reads the witness back. A donation that had been ACCEPTED would
+//   have zeroed those bytes before installing the extent (`slab_donate` zeroes so
+//   that every slot starts `Free`), so `witness still 165` is a direct statement
+//   that nothing was absorbed — not an inference from the fault.
+//
+// **THE LEG IS PINNED, NOT MERELY REACHED.** `refs` must be exactly 1 for the
+// `maps` check to be the one that fires, because the kernel tests them in that
+// order. It is: root GIVES the region away, which is a transfer that unbinds
+// root's own entry, so the child's is the only one left. Root keeps the MAPPING
+// rather than a second handle — and a Mapping counts on `maps`, never on `refs`
+// (sawos design 28), which is exactly the distinction this case is about.
+
+import sos.{System, Process, Memory, Mapping, MapAccess, Waiter, WaitResult,
+            WaitPayload, SlabKind, SosStatus, SystemRight}
+
+extern "C" {
+    func sos_test_pool_base() -> UInt
+}
+
+/// One page — the smallest thing either profile grants, and more than one slot
+/// of any kind, so a donation of it would certainly have been accepted had the
+/// mapping not been there.
+static CHUNK: UInt = 0x1000
+
+/// Read and write, in root's own domain.
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// The witness. 0xA5 = 165, a number that appears nowhere else in the transcript,
+/// and NOT zero — which is the whole point, since absorption zeroes.
+static WITNESS: UInt8 = 0xA5
+
+/// The tags root's gives travel under, and the key the child's death arrives on.
+static TAG_BOOT: UInt = 51
+static TAG_PAGE: UInt = 53
+static KEY: UInt = 55
+
+/// What the donor child may ask its System object for. `SlabDonate` is the point;
+/// `Transfer` is the bit `give` checks on the thing being given; `Debug` lets it
+/// announce itself and `ProcessSelf` lets it reach its own Process object.
+/// Everything else is absent BY SILENCE.
+static CHILD_SYSTEM: UInt32 = (SystemRight.SlabDonate | SystemRight.Debug
+                               | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+func poke(addr: UInt, value: UInt8) unsafe {
+    UnsafeMemory<UInt8, Normal>(addr).write(value)
+}
+
+func peek(addr: UInt) unsafe -> UInt8 {
+    UnsafeMemory<UInt8, Normal>(addr).read()
+}
+
+/// The status word the wait delivered. This program attaches exactly one Process,
+/// so every other payload is a kernel bug rather than a case to handle.
+func status_of(r: &WaitResult) -> UInt {
+    match r.what {
+        case Process(status) -> status,
+        case _ -> panic("this program attached only a Process"),
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS slabmapped: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // THREE RECORDS, in the runner's own order: the child's image, the child's
+    // destination RAM, then the pool this case cuts from.
+    var image = try proc.boot_handle_next() catch {
+        print("SOS slabmapped: no image region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var dest = try proc.boot_handle_next() catch {
+        print("SOS slabmapped: no dest region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var pool_record = try proc.boot_handle_next() catch {
+        print("SOS slabmapped: no pool region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let image_mem = image.take_memory() else {
+        let _ = system.debug_print("SOS slabmapped: image record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest_mem = dest.take_memory() else {
+        let _ = system.debug_print("SOS slabmapped: dest record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let pool = pool_record.take_memory() else {
+        let _ = system.debug_print("SOS slabmapped: pool record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // ---- ROOT MAKES `maps` NON-ZERO, AND BECOMES THE OBSERVER --------------
+    let page = try pool.split(len: CHUNK) catch {
+        print("SOS slabmapped: split failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    // THE ROW THAT MAKES THE DONATION UNSAFE. It is root's, it stays installed
+    // for the rest of the run, and it is what the kernel refuses the child over.
+    let _row = try proc.map(memory: &page, access: RW) catch {
+        print("SOS slabmapped: map into self failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let base = sos_test_pool_base()
+    poke(base, WITNESS)
+    print("SOS slabmapped: stamped witness={}\n", peek(base) as UInt)
+
+    // ---- THE CHILD, CARRYING THE BIT AND THE REGION ------------------------
+    let child = try system.process_create(image: &image_mem,
+                                          memory: &dest_mem) catch {
+        print("SOS slabmapped: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let waiter = try proc.waiter_create() catch {
+        print("SOS slabmapped: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try waiter.add(process: &child, key: KEY) catch {
+        print("SOS slabmapped: attach failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM) catch {
+        print("SOS slabmapped: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        print("SOS slabmapped: give system failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    // **THE GIVE IS WHAT PINS THE LEG.** A give is a MOVE: root's entry goes and
+    // the child's arrives, so the region has exactly ONE reference and the
+    // `refs == 1` test the kernel makes first cannot be the one that fires.
+    try child.give(memory: move page, tag: TAG_PAGE) catch {
+        print("SOS slabmapped: give page failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try child.start(boot_tag: TAG_BOOT) catch {
+        print("SOS slabmapped: start failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // ---- AND ROOT OUTLIVES IT, WHICH IS WHY THE SECOND HALF IS OBSERVABLE ---
+    let record = try waiter.wait() catch {
+        print("SOS slabmapped: wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS slabmapped: child faulted status={}\n", status_of(&record))
+
+    // THE CLAIM THE FAULT ALONE DOES NOT MAKE. `slab_donate` zeroes a region on
+    // the way in, so an absorbed page reads back as zeroes; this one still reads
+    // the witness, through the mapping that caused the refusal.
+    let seen = peek(base)
+    if seen != WITNESS {
+        print("SOS slabmapped: the region WAS absorbed: witness now {}\n",
+              seen as UInt)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS slabmapped: witness still {}\n", seen as UInt)
+
+    let _ = system.debug_print("SOS slabmapped: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

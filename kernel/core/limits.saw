@@ -194,7 +194,11 @@ static_assert(hal.GRANT_ROW_BUDGET <= 9,
 static_assert(MAX_PROCESSES <= hal.PROT_DOMAIN_SLOTS,
               "every process slot needs a protection domain in the HAL's pool")
 
-/// Threads the kernel can hold, across all processes.
+/// Threads the kernel can hold, across all processes — THE COMPILED FLOOR since
+/// M5 unit 6a (sawos design 34). `SlabKind.Threads` raises the machine's real
+/// ceiling, and a thread donation carries the FRAME ARENA with it: a donated
+/// extent holds both, at `THREAD_FRAME_STRIDE` alignment, addressed through the
+/// extent table's side column. See `kcore.threads.frame_slot`.
 public(package) static MAX_THREADS: Int = 8
 
 /// Events the kernel can hold, across all processes (spec §2.4).
@@ -285,6 +289,11 @@ public(package) static MAX_ATTACHMENTS: Int = (MAX_EVENTS + MAX_INTERRUPTS
 /// connection count tracks its number of SESSIONS and not its number of
 /// clients. The three-process delegation beside it spends two, which is the
 /// largest a case in this tree has wanted.
+/// **AND IT IS THE COMPILED FLOOR SINCE M5 UNIT 6a** (sawos design 34).
+/// `SlabKind.Pipes` raises it, and a pipe donation carries the STAGING RINGS with
+/// it: one unit is a connection slot plus `PIPE_INFLIGHT` exchange records, which
+/// makes it by far the most expensive kind per slot — exactly the storage this
+/// paragraph already says a connection is not free because of.
 public(package) static MAX_PIPES: Int = 4
 
 /// The same sentinel for the Pipe slab.
@@ -323,8 +332,8 @@ public(package) static MAX_HANDLES: Int = 16
 // THE EXTENT CHAIN (sawos design 32, M5 unit 6; design 25 D-6)
 // =============================================================================
 //
-// **EVERY NUMBER ABOVE IS NOW A FLOOR RATHER THAN A CEILING, for the nine kinds
-// design 32 converted.** A `MAX_<KIND>` is extent 0's length — what the image is
+// **EVERY NUMBER ABOVE IS NOW A FLOOR RATHER THAN A CEILING, for the ELEVEN
+// kinds designs 32 and 34 converted between them.** A `MAX_<KIND>` is extent 0's length — what the image is
 // built with, what the kernel boots on, and what a machine that never donates
 // still gets — and `SlabDonate` raises the machine's actual capacity above it.
 // The numbers did not change and neither did the argument for choosing them:

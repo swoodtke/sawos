@@ -92,6 +92,72 @@ entry below or the brief that carries it, never restating either.
   condition ENDS the caller — which matches the doctrine and is what the negative
   case asserts; (c) the `maps == 0` half of the condition is implemented but
   UNTESTED (it wants a live mapping, a bigger case), named as a finding.
+  **UNIT 6a BUILT (`designs/034`, Sep 3):** the satellite slabs — `SlabKind` grows
+  `Threads = 9` and `Pipes = 10`, so BOTH kinds unit 6 excluded now convert and the
+  user's three motivating examples are down to processes alone (6b). **TWO KINDS,
+  TWO SHAPES, and the difference is the substance.** PIPES: the ten satellite
+  arrays become the FIELDS of one `Exchange` record, and `EXCHANGES` is then a
+  plain chain in lockstep with `PIPES` — lockstep proven by ARITHMETIC rather than
+  by a shared table, since `x = c * PIPE_INFLIGHT + i` is uniform across the chain,
+  so extent `e` of one holds exactly the exchanges extent `e` of the other maps to.
+  Every access site is a mechanical rename on the SAME flat index (82 of them), so
+  the rendezvous paths keep their ONE bounds check and gain no division — the
+  fatten-`PipeSlot` alternative was declined for exactly that. THREADS: the frame
+  arena cannot become a field, because one HAL's user-return loads the frame
+  address INTO THE STACK POINTER (`mov sp, x0`) so a frame must carry its 16-byte
+  alignment, and a fattened `ThreadSlot` is 592 on arm64 (fine) and 552 on riscv32
+  (8 mod 16, misaligned ON THE PROFILE THAT DOES NOT CHECK) — so the extent table
+  grew a COLUMN, `Slab.ext_side`, read through the same new `locate` walk the slot
+  lookup uses, which is what makes "slot i's frame and slot i's storage cannot
+  disagree" structural. **THE SWITCH PATH'S FLOOR ARM IS BYTE-FOR-BYTE THE OLD
+  FUNCTION** behind one compare against a constant, which is why 238 pre-existing
+  rows are byte-identical; the donated arm is a <=4-iteration walk with an O(1)
+  body and design 1's verdict is unchanged. ONE NEW FUNNEL, named and justified
+  (`frame_slot`'s `phys_to_virt`); `EXCHANGES` deliberately adds none, since an
+  exchange is a slab slot and reaches donated memory through `extent_addr` like
+  every other. **BOTH OF UNIT 6's GAPS CLOSED**: `slab_donate_mapped` (+ its
+  `child-donor`) proves the `maps == 0` leg with the CHILD as donor — the refusal
+  is a fault, so the donor dies and only a survivor can show the region was not
+  absorbed, which root does by reading a witness byte back through the very
+  mapping that caused the refusal; and `slab_donate_free_nodes` witnesses design
+  28's leak path end to end. Gate: baseline 238/238 at `340e4c5` hashing to the
+  same `801a0f98` the pin bump records, then **245/245**, and the normalised diff
+  is FIVE HUNKS OF NEW ROWS — **not one pre-existing case line or IMAGE SIZE
+  moved**, because this unit adds no floor `@export` and so design 32's +40 bytes
+  per riscv32 image does not recur. TWO SL ENTRIES FILED (SL-23 `&var slab[i].field`
+  is not addressable though the same field is inside a `&var self` method; SL-24 a
+  bare literal does not adopt a platform `UInt` at a call argument).
+  **THREE THINGS THE LEAD SHOULD SEE**: (a) **design 32's finding 6 named the wrong
+  wall** — exhausting the free-range nodes is blocked by `MAX_HANDLES` (16) and by
+  `pool_cut` being FIRST FIT, not by `MAX_MEMORIES`, so donating Memories alone
+  would not have helped; what made the case reachable is that a DONATED region
+  holds bytes out of a pool costing neither a handle nor a slot, which is the op
+  under test supplying its own test fixture; (b) that case is **riscv32 ONLY** and
+  the arithmetic is in the record — first-fit forces strictly growing cuts, the
+  step is one `hal.PROT_GRAIN`, and at the other profile's 4096 the 32 holes alone
+  want 2.1 MiB against a 256 KiB pool that cannot grow, so it is impossible there
+  rather than merely unwritten; (c) the brief's expected facade motion did NOT
+  happen and did not need to — `SlabKind` is a NAME already on both facade lines
+  since unit 6, and a CASE is not a name.
+  **REBASED ONTO 033 (Sep 4, 6a lands second).** One textual conflict, pure
+  adjacency (both units append cases to `sos_runner.py`; 033's `map_placed` kept
+  first so its ordinal holds); `dispatch.saw` auto-merged despite both units
+  editing it. **THE REAL CONTACT WAS NOT A CONFLICT AT ALL AND IS WORTH THE
+  LEAD'S ATTENTION**: 033 collapsed the arm64 user linker scripts into one
+  `user.ld`, and this unit's FIVE NEW packages named the old `root.ld`/`child.ld`
+  — git had nothing to conflict with, because those files are new on one side and
+  untouched on the other, so the rebase was clean and the arm64 build then failed
+  at the LINK step. A new file naming a removed one is invisible to a three-way
+  merge; a clean rebase is not evidence a rebase is done. COMPOSITION CONFIRMED
+  rather than assumed: this unit dereferences donated memory only through
+  `hal.phys_to_virt` (029's KERNEL-side seam, untouched by 033, which split the
+  USER side), `MEMORIES[].base` is still physical as the donate path needs, and
+  `thread-donate` on arm64 — a thread whose FRAME is donated memory reached
+  through the linmap, under an image 033 now places at frames — is the witness.
+  Re-gate: main `4cb149c` 239/239 (120 cases) then **246/246 (123 cases)**, the
+  same five hunks of new rows, and proven PER ARCH since the two units'
+  authorizations differ by profile — with 6a's rows removed the riscv32 half is
+  BYTE-IDENTICAL to main's and the arm64 half is too but for the total line.
   **THE 1.5 SEAM IS CLOSED (029 rebased second, Sep 3) — AND IT WAS TWO SITES,
   NOT ONE.** This entry used to say `Slab.extent_addr` was the single line to
   flip. The READ funnel was indeed one line, but `slab_donate`'s `long_zero` in
@@ -570,3 +636,28 @@ One entry per issue, resolution-sufficient: the symptom verbatim, the probe/site
       = Slab<EventSlot, MAX_EVENTS>(...)    // same, at the other break
   ```
   Only the argument LIST wraps, because it is inside `(`/`)` (design 129), so the head `NAME: T<...> = T<...>(` must be one line. In-tree that is 100–118 characters on nine declarations against a file that otherwise holds ~80, which is the whole cost — the code is correct and reads fine, it simply cannot be formatted. This is DF-172d's shape (unbracketed expressions do not wrap) at a declaration rather than at a binary operator, and a `type` alias is not the way out: an alias over a struct is a DISTINCT type whose back-conversion takes one argument, not the memberwise initializer. Workaround in-tree: accept the long lines, noted at the block. Resolution: allow a break after `=` in a declaration whose right-hand side is unambiguously incomplete, which is the same judgement the bracket rule already makes — or make constructor type arguments infer from the annotation, which removes the second spelling and the problem with it.
+
+- SL-23 — A `borrows` ACCESSOR'S LENT PLACE HAS NO ADDRESS: `&var slab[i].field` IS REFUSED THOUGH THE SAME FIELD IS ADDRESSABLE INSIDE A `&var self` METHOD: ``can only take reference to a variable, field, or array element`` with ``hint: references require an addressable location`` (design 34, `kernel/core/objects.saw`, sawc 0.5.0). Design 146's whole claim for a place accessor is that it lends the element WHERE IT SITS, and design 130's one sanctioned crossing into the unsafe tier is `(&x) as UnsafePointer<T>` — but the two do not compose, so a kernel that needs the ADDRESS of a slot's field (a message body handed to a byte mover) cannot ask the accessor for it:
+  ```saw
+  // EXCHANGES: Slab<Exchange, N>, Exchange { body: [UInt8; 128], ... }
+  ((&var EXCHANGES[x].body) as UnsafePointer<UInt8>) as UInt   // error
+  ```
+  The workaround is a method on the ELEMENT type, and it works because design 261 passes every receiver by pointer, so the receiver's own field is an ordinary addressable location:
+  ```saw
+  extension Exchange {
+      public(package) func body_addr(&var self) unsafe -> UInt {
+          ((&var self.body) as UnsafePointer<UInt8>) as UInt   // fine
+      }
+  }
+  EXCHANGES[x].body_addr()
+  ```
+  So the capability exists and only the SPELLING is missing — which is what makes this a wart rather than a wall: one extra declaration per element type that needs it, and the address still comes out of the slot the accessor lent. It bit exactly once in-tree (the pipe body arena becoming a field of a slab slot) and the workaround is arguably the better code, since it names the operation. Resolution: let a `&`/`&var` of a lent place's field take the address the window already refers to, on the ordinary unsafe-tier terms — the window's extent is the expression, which is exactly as long as the existing crossing's.
+
+- SL-24 — A BARE INTEGER LITERAL DOES NOT ADOPT A PLATFORM `UInt` AT A CALL ARGUMENT, THOUGH IT DOES AT A `static` AND AT EVERY FIXED WIDTH: ``argument 2 expects `UInt` but got `Int` `` with the three-conversion hint (design 34, `tests/thread-donate`, `tests/slab-donate-free-nodes`, sawc 0.5.0). Design 257 §1 put the platform pair on the adoption list and the entry in the saw-lang digest names a `static` slot; an ARGUMENT is on the bare-literal list for every fixed width, so the gap is the intersection of the two:
+  ```saw
+  static N: UInt = 0
+  proc.thread_create(stack_top: t, arg: 0)   // error: expects `UInt`, got `Int`
+  proc.thread_create(stack_top: t, arg: N)   // fine
+  SlabKind.from(raw: 0)                      // same, on a UInt-backed enum
+  ```
+  Low severity and the workaround is what the house style wants anyway (design 153: name the constant, do not write a magic number), so both in-tree sites became named `static`s with a comment pointing here. It is worth filing because the ASYMMETRY is the surprising part — `arg: 0` at a `UInt32` parameter compiles and at a `UInt` one does not, and nothing at the call site says which width a parameter is. Resolution: extend design 257 §1's slot list to call arguments at the platform pair, which is where every other width already adopts.

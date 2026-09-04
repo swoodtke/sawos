@@ -1,0 +1,57 @@
+// SOS M5 unit 6a, GAP CLOSER 1's CHILD: the process that donates a region
+// somebody else has mapped, and dies for it (sawos design 34).
+//
+// It holds the region's ONLY handle and carries `SystemRight.SlabDonate`, minted
+// down from root's set — so nothing about this donation is refused for want of a
+// right or for a sibling reference. What is wrong with it is the one thing this
+// process cannot see: root has a grant row installed on those bytes.
+//
+// **BOTH ARMS OF THE MATCH ARE UNREACHABLE, AND THEY SAY SO** — the
+// `tests/slab-donate-shared` shape. The op does not return: `maps != 0` is a
+// FAULT (design 178's split — the caller could have checked, and here the caller
+// is a child whose launcher mapped the page before handing it over, which is
+// exactly the mistake the fault channel is for). If either line ever prints, the
+// kernel absorbed a mapped region or downgraded the refusal to a status, and
+// either would be the finding.
+
+import sos.{System, Process, Memory, SlabKind, SosStatus}
+
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS donor: no process handle: {}\n", error)
+        return
+    }
+
+    // ONE RECORD: the region its launcher gave it. The drain hands records back
+    // in give order and there is only one.
+    var record = try proc.boot_handle_next() catch {
+        print("SOS donor: no region: {}\n", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    guard let region = record.take_memory() else {
+        let _ = system.debug_print("SOS donor: the record is not a region\n")
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+
+    let _ = system.debug_print("SOS donor: donating a mapped region\n")
+
+    match system.slab_donate(kind: SlabKind.Waiters, memory: move region) {
+        case Ok(_) -> {
+            let _ = system.debug_print(
+                "SOS donor: UNREACHABLE — a mapped region was absorbed\n")
+            let _ = proc.exit(EXIT_FAILED)
+        },
+        case Err(_) -> {
+            let _ = system.debug_print(
+                "SOS donor: UNREACHABLE — refused with a status\n")
+            let _ = proc.exit(EXIT_FAILED)
+        },
+    }
+}
