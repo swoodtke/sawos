@@ -57,8 +57,9 @@ entry below or the brief that carries it, never restating either.
   `unref_region_row` because 028's "stopped granting before the range
   can be freed" argument rests on the row leaving the RECORD, which
   stops nothing once the tables persist. INTEGRATED (lead, Sep 3, `215ba09`,
-  after design 28's `8f080c3`). Units 1.5→2→4 and 6→6b→7→8 still
-  open, so this entry stays whole; its As-built findings ride there, one a warning for
+  after design 28's `8f080c3`). Units 1.5→2→4 and 6→6b→7 are BUILT and
+  **unit 8 (the docs sweep) is the only one still open**, so this entry stays
+  whole; its As-built findings ride there, one a warning for
   unit 3 (the gate does not witness fault CLASS — see 027).
   **UNIT 6 BUILT (`designs/032`, Sep 3):** slab donation —
   `SystemOp.SlabDonate(kind, memory)` on its own `SystemRight.SlabDonate`
@@ -323,6 +324,61 @@ entry below or the brief that carries it, never restating either.
   asserted; the tick COUNT and the `interrupts=` column are the unasserted ones.
   This unit's only relation to it is that a third profile makes a run longer,
   which shifts where a tick lands.
+  **UNIT 7 BUILT (`designs/037`, Sep 4) — THE MILESTONE'S OWN DEMO.** The three
+  trap columns LEAVE `ProcessSlot` for a kernel-owned, grain-aligned region a
+  process maps READ-ONLY, and `ProcessOp.Stats` reads that same storage — so v1
+  is a compatibility floor BY CONSTRUCTION rather than by synchronization, and
+  the kernel-private `ProcessStatsRecord` is gone because the op's record and
+  the region's row are now one published declaration (`sosabi.StatsRow`) with
+  nothing left to pin. `SystemOp.StatsRegionMap` (op 7) on
+  `SystemRight.StatsRegionMap` (bit 15, root set, ABSENT from the child mask)
+  installs the row into the CALLER and answers a `Mapping` in `map`'s own shape.
+  **NO `Memory` IS MINTED — access without possession, deliberately**: the page
+  is kernel storage, so a Memory handle would carry `Split` and would make it
+  donatable, and neither is an operation that could mean anything over the page
+  the kernel counts traps into. ONE right gates it, not two, because the op
+  installs into the caller's own domain and names no other process.
+  **THE CAPACITY DECISION CAME OUT EXACT, AND OPTION (a) WAS NOT AVAILABLE.**
+  The brief offered a floor-sized page with a donated second one as a follow-on;
+  scouting killed it, because once the columns RELOCATE a slot with no row has
+  nowhere to count, so a floor-sized region would silently stop counting exactly
+  the donated slots unit 6b exists to create. The other option turned out not
+  merely bigger but EXACT: `alloc_process` scans to
+  `min(capacity, hal.PROT_DOMAIN_SLOTS)`, so that constant is a CEILING on the
+  slot index the machine can ever hand out — donation raises the capacity and
+  cannot raise it — and a region with `PROT_DOMAIN_SLOTS` rows can never be
+  outgrown. **The follow-on the brief was willing to accept is not owed at all.**
+  Measured: **12288 bytes of `.bss` on riscv32 (256 rows), 8192 on arm64 (5)**,
+  zerofill so the image carries none of it; `PROCESSES` shrinks 2504 → 2420 and
+  4408 → 4336 bytes of `.data` — **the two deltas differ because riscv32 also
+  recovered tail padding** the three doublewords were forcing on an otherwise
+  4-aligned struct. TEARING IS DOCUMENTED IN THREE PLACES and the seqlock is
+  recorded as the refinement and NOT built.
+  **ONE DEVIATION FROM THE BRIEF, and it closed a hole rather than opening
+  one**: the op also returns the caller's own ROW INDEX, in a one-word copy-out
+  record. Rows are indexed by process SLOT and slot numbering is kernel-internal,
+  so the brief's `(va, Mapping)` alone hands a caller a table it cannot find
+  itself in — the case could only have asserted "its own row" by hard-coding 0.
+  The `Mapping` still comes back in the value register and the address still
+  comes from `MappingOp.Base`, so `map`'s shape is intact. Gate: baseline 369/369
+  reproduced at `a64d359`, then **374/374 (126 + 126 + 122)**, and **the
+  normalised diff is NINE HUNKS, every one an addition — not one pre-existing
+  case row and not one image size moved on any profile.** No new floor
+  `@export` (unit 4's finding stands). No SL entry owed; highest remains SL-24.
+  **THREE THINGS THE LEAD SHOULD SEE**: (a) **the kernel's own address is not
+  the frame's, and only the translating profile could witness it** — the first
+  arm64 run took an ADDRESS SIZE fault (`0x92000003`, DFSC `0b000011`) because
+  the grant was handed the kernel's linear-map address instead of the physical
+  one; `hal.virt_to_phys` is the seam and is identity on riscv32, which passed
+  throughout, so a unit that hands kernel storage to hardware must be exercised
+  on arm64 before it is believed; (b) **a row index is not a name** — the op
+  answers only the CALLER's row, so the child reads row 0 on the strength of
+  root's assertion in the same transcript, and a general `top` wants either a
+  per-row identity column or an op resolving a Process handle to its row (filed,
+  not built, nothing in M5 consumes it); (c) `hal.PROT_DOMAIN_SLOTS` now sizes a
+  SECOND thing, so raising it costs 24 bytes of `.bss` per slot on top of the
+  domain pool's own cost — cheap, but no longer free, and an arena-sizing unit
+  should re-measure rather than reuse a pre-unit-7 number.
   **UNIT 1.5 BUILT (`designs/029`, Sep 3):** the higher-half kernel +
   the linmap seam. The arm64 kernel LINKS at
   `physical + 0xFFFF_FF80_0000_0000` and loads at its physical
