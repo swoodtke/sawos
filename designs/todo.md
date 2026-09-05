@@ -57,10 +57,10 @@ entry below or the brief that carries it, never restating either.
   `unref_region_row` because 028's "stopped granting before the range
   can be freed" argument rests on the row leaving the RECORD, which
   stops nothing once the tables persist. INTEGRATED (lead, Sep 3, `215ba09`,
-  after design 28's `8f080c3`). Units 1.5→2→4 and 6→6b→7 are BUILT and
-  **unit 8 (the docs sweep) is the only one still open**, so this entry stays
-  whole; its As-built findings ride there, one a warning for
-  unit 3 (the gate does not witness fault CLASS — see 027).
+  after design 28's `8f080c3`). Units 1.5→2→4, 6→6b→7 and the arena unit
+  (`designs/038`) are BUILT and **unit 8 (the docs sweep) is the only one still
+  open**, so this entry stays whole; its As-built findings ride there, one a
+  warning for unit 3 (the gate does not witness fault CLASS — see 027).
   **UNIT 6 BUILT (`designs/032`, Sep 3):** slab donation —
   `SystemOp.SlabDonate(kind, memory)` on its own `SystemRight.SlabDonate`
   (minted in the root set of necessity), consuming, permanent, with the static
@@ -384,6 +384,65 @@ entry below or the brief that carries it, never restating either.
   deliberately not retuned (no authorization to move a board knob), and the fix
   when it bites is that `PROT_DOMAIN_SLOTS` is a BOARD number which now sizes
   the domain pool and this region together. Filed for design 20's port.
+  **THAT LAST CLAIM DOES NOT HOLD, AND THE ARENA UNIT FOUND IT (design 38,
+  Sep 5): the C3 board smoke has been 0/3 since this unit landed.** It fails at
+  the LINK — `section '.bss' will not fit in region 'SRAM': overflowed by
+  10,416 bytes` — and the bisect is unambiguous: 3/3 at `a64d359`, 0/3 at
+  `9026bf7` and at every commit after it, the pin bump included. The board had
+  under 2 KiB of `.bss` slack and this region costs it 12,288. Design 38 did
+  not retune the board (out of scope by its own brief) but it PROBED the fix
+  and built two of the three levers: `ARENA_SIZE = 16K` in `esp32c3.ld` alone
+  frees 48 KiB and takes the smoke back to 3/3 with 38,760 bytes of slack. See
+  038 finding 1; the board's `ABI.md` and `esp32c3.ld` carry the corrected
+  numbers.
+  **ARENA UNIT BUILT (`designs/038`, Sep 5) — the small-board RAM levers, and
+  the one unit of M5 that is about a NUMBER rather than a mechanism.** `sosrt`'s
+  64 KiB ARENA leaves the SHARED runtime module and becomes a LINKER REGION:
+  every user and kernel script `PROVIDE`s `ARENA_SIZE = 64K` and reserves
+  `[_arena_start, _arena_end)` inside `.bss`, `rt/common_c/support.c` reads the
+  pair back (Saw cannot name a linker symbol — `sink.c`'s wall, answered
+  `sink.c`'s way, and the file's header gains a THIRD permanent reason), and
+  `rt_alloc` keeps its cursor, its absolute-address alignment and its
+  subtraction-form bound check line for line. **THE OVERRIDE IS TWO LINES AND
+  NEEDED NO TOOLCHAIN CHANGE** — the brief's STOP condition did not fire: a
+  package names a script of its own that assigns `ARENA_SIZE` and INCLUDEs the
+  shared one, `PROVIDE` defines a symbol only when nothing else has, and
+  `ld.lld` resolves an INCLUDE against the very working directory blade already
+  runs it in, so the fragment spells its path exactly as the manifest would.
+  THE KERNEL STACK becomes `KERNEL_STACK_SIZE` per board — **and the brief's
+  premise that it was already a linker-script constant was WRONG**: it was a
+  `.skip 0x10000` in each board's `boot.S`, which is the one file a board
+  VARIANT (design 35's flat profile) inherits wholesale and cannot edit, so the
+  knob was worth more than the brief thought. Both virt boards keep 64 KiB; the
+  C3's is left at 64 KiB deliberately and noted there. Gate: baseline 374/374
+  reproduced at `588ab67`, then **377/377 (127 + 127 + 123)**, and with the
+  `[i/N]` denominator and the image-size column normalised out the diff is SIX
+  HUNKS, every one an addition and every one the new case's own row — not one
+  pre-existing case row moved on any profile. No SL entry owed (highest remains
+  SL-24).
+  **THREE THINGS THE LEAD SHOULD SEE**: (a) **the image-size column DOES move,
+  and it is brought back rather than normalised** — every riscv32 image grows
+  56–128 bytes (clustered at +96) while **133 of 134 arm64 images are
+  byte-identical**, the exception being `pipe-pingpong`, whose `.text` sat
+  inside 60 bytes of a page boundary and crossed it (+4096). The cause is
+  measured, not guessed: `__saw_rt_alloc` reached a `static` and a `sizeof`
+  that the compiler folded in as immediates and now makes two cross-TU calls
+  (114 → 138 bytes), plus a 10-byte and a 22-byte accessor, plus one `.LCPI`
+  entry, then the sosimg's 16-byte re-round of `.data`'s start. It is design
+  32's finding from a different cause, and the only thing that would avoid it
+  is LTO or a Saw spelling for a linker symbol — the toolchain change the brief
+  forbade; (b) **the RAM side went the right way everywhere**: `.bss` did not
+  grow in any image (it shrank 12–16 bytes on riscv32 from the removed static's
+  own padding) and an 8 KiB package saves **57,344 bytes exactly** — 56 KiB,
+  the arena difference and nothing else — which puts design 20's 67,600-byte C3
+  child at 10,256; (c) `tests/arena-small` is **the first `Vector` anywhere in
+  the SOS tree**, and it works freestanding with no ceremony, so std's
+  allocating surface reaching this arena is now witnessed rather than assumed
+  (its `Result<_, AllocError>` channel is dead here, because the allocator
+  ABORTS rather than answering — the case asserts the abort's status, 65).
+  ONE ITEM FOR UNIT 8: `spec.md`'s design-172 retrospective still says
+  `support.c` is "reason 2, and reason 2 only"; there is a reason 3 now. Not
+  edited, per the brief.
   **UNIT 1.5 BUILT (`designs/029`, Sep 3):** the higher-half kernel +
   the linmap seam. The arm64 kernel LINKS at
   `physical + 0xFFFF_FF80_0000_0000` and loads at its physical
