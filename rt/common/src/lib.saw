@@ -264,6 +264,16 @@ extern "C" {
     func sos_rt_abort(code: UInt32) -> Never
 }
 
+// WHERE THE ARENA IS, and how big (sawos design 38 — see the bump-arena
+// section below for what the region is for and why it moved). NOT a per-side
+// hook like the two above: there is exactly one answer, in the one C file both
+// sides already link (`rt/common_c/support.c`), because the numbers come from
+// the LINKER and Saw cannot name a linker symbol.
+extern "C" {
+    func sos_arena_base() -> UInt
+    func sos_arena_size() -> UInt
+}
+
 // Abort codes the RUNTIME raises on its own behalf. A side's own exit codes
 // live with that side; these two are ours, and they stay distinct so a
 // transcript can tell "the program panicked" from "the arena ran dry".
@@ -306,34 +316,34 @@ func rt_panic(ptr: UnsafePointer<Int8>, len: UInt) unsafe -> Never {
 //
 // No reclamation: `dealloc` is a no-op and the real slab allocator arrives with
 // the kernel object model (spec §4).
+//
+// THE REGION IS THE LINKER'S, NOT THIS MODULE'S (sawos design 38), and the
+// reason is the one thing a `static` here could never express: `sosrt` is
+// SHARED, so its size was one compile-time fact for every image in the system —
+// the kernel, root, and every test package alike — and a deployment that wanted
+// a smaller arena for one process had nowhere to say so. This toolchain has no
+// conditional compilation (design 35 confirmed it), and a module-level `static`
+// carries no module identity a build profile could override (SL-25), so the
+// only seam left is the LINK.
+//
+// So the linker scripts reserve `[_arena_start, _arena_end)` inside `.bss`
+// under a `PROVIDE`d `ARENA_SIZE` — 64 KiB unless a package's own script says
+// otherwise, which is exactly what `tests/arena-small/` does — and the two
+// accessors above read it back. NOTHING ELSE CHANGED: `.bss`-resident then and
+// now, so the region costs the image no bytes and the process's region all of
+// them; the bound check below is the same subtraction; and the cursor is still
+// this module's own state.
 
-/// The arena's region, sized ONCE. The length lives in this type and nowhere
-/// else: `arena_bytes()` reads it back with `sizeof`, and the initializer's own
-/// length is checked against it, so the size cannot be edited in one place and
-/// left stale in another.
-type ArenaRegion = [UInt8; 65_536]
-
-/// The region and the cursor over it — compound global state whose consistency
-/// spans two words, which is what design 149's `unsafe static var` is for. The
-/// serialization argument is spec §7's: SOS v1 is a uniprocessor kernel and M1
-/// enables no interrupt sources, so no other agent can observe the window
-/// between the bound check and the cursor store. Enabling interrupts, SMP or
-/// preemption each invalidate that and take a `SpinLock` here.
+/// The cursor over the region — `unsafe static var` for design 149's reason,
+/// and the serialization argument is spec §7's: SOS v1 is a uniprocessor kernel
+/// and M1 enables no interrupt sources, so no other agent can observe the
+/// window between the bound check and the cursor store. Enabling interrupts,
+/// SMP or preemption each invalidate that and take a `SpinLock` here.
 ///
-/// An all-zero static costs no image bytes (design 149) — this is 64 KiB of
-/// `.bss`, not 64 KiB of ELF.
-unsafe static var ARENA: ArenaRegion = [0; 65_536]
+/// It is the ONLY arena state left here. The region it walks is the linker's
+/// (above), which is what makes the pair no longer "compound state spanning two
+/// words": the extent is a link-time constant and only the offset moves.
 unsafe static var ARENA_NEXT: UInt = 0
-
-/// The arena's capacity, read off the region's own type.
-func arena_bytes() -> UInt {
-    sizeof<ArenaRegion>() as UInt
-}
-
-/// The region's base address.
-func arena_base() unsafe -> UInt {
-    ((&var ARENA) as UnsafePointer<UInt8>) as UInt
-}
 
 /// Hand out `size` bytes aligned to `align`, or stop the machine.
 ///
@@ -343,7 +353,9 @@ func arena_base() unsafe -> UInt {
 /// only satisfies the caller if the REGION itself is at least as aligned as
 /// anything asked of it; a `[UInt8; N]` has an alignment of one, and so did the
 /// C array in principle. Rounding the address the caller actually receives is
-/// correct whatever the region landed on.
+/// correct whatever the region landed on — which is why design 38 moving the
+/// region into the linker scripts (`. = ALIGN(16)` there) changed nothing here:
+/// the scripts' alignment is a courtesy, not a precondition.
 ///
 /// The bound is checked as a SUBTRACTION so a hostile `size` cannot wrap past
 /// it, exactly as the C did. The padding step uses `&-` because a checked one
@@ -356,8 +368,8 @@ func rt_alloc(size: UInt, align: UInt) unsafe -> UnsafePointer<Int8> {
     if step < 1 {
         step = 1
     }
-    let base = arena_base()
-    let capacity = arena_bytes()
+    let base = sos_arena_base()
+    let capacity = sos_arena_size()
     var offset = ARENA_NEXT
     let rem = (base &+ offset) % step
     if rem != 0 {

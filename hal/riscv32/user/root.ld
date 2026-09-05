@@ -23,6 +23,25 @@
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 
+/* THE ARENA (sawos design 38) — `sosrt`'s bump-allocator region, which every
+ * freestanding Saw image needs because the compiler's own panic path can
+ * allocate.
+ *
+ * `ARENA_SIZE` IS THE KNOB, and 64 KiB is what a package that says nothing
+ * gets. A package that wants another size writes a script of its own that
+ * assigns the symbol and then INCLUDEs this file (`tests/arena-small/` is the
+ * worked example); `PROVIDE` is what makes that work, since it defines the
+ * symbol only when nothing else has, so the override wins with no conditional
+ * anywhere. `rt/common_c/support.c` reads `_arena_start` and `_arena_end` back
+ * — Saw cannot name a linker symbol — and `rt/common/src/lib.saw` allocates
+ * between them; see that file for why the arena exists at all.
+ *
+ * It is `.bss`-resident, so it costs the IMAGE nothing and the process's
+ * REGION everything: design 20 finding 4 measured 65,536 bytes of arena in a
+ * 67,600-byte child, on a part with 400 KiB of SRAM.
+ */
+PROVIDE(ARENA_SIZE = 64K);
+
 MEMORY {
     ROOT (rwxa) : ORIGIN = 0x80200000, LENGTH = 240K
 }
@@ -51,6 +70,10 @@ SECTIONS {
         *(.sbss .sbss.*)
         *(.bss .bss.*)
         *(COMMON)
+        . = ALIGN(16);
+        _arena_start = .;
+        . = . + ARENA_SIZE;
+        _arena_end = .;
         . = ALIGN(16);
     } > ROOT
 

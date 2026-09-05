@@ -81,6 +81,24 @@
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 
+/* ---------------------------------------------------------------------------
+ * THE TWO `.bss` KNOBS (sawos design 38, M5 arena unit)
+ * ---------------------------------------------------------------------------
+ * Sibling-copied from `hal/riscv32/kernel/virt.ld`, which carries the full
+ * argument. What is worth saying HERE is that this is the board the knobs were
+ * built for: 400 KiB of SRAM total, of which 168 KiB is this section's budget
+ * and 167,360 bytes are already spent (the header above).
+ *
+ * BOTH VALUES ARE DELIBERATELY LEFT AT THE VIRT BOARD'S, and design 38 says so
+ * on purpose: retuning a board is that board's own unit, and every number in
+ * the SRAM budget above was MEASURED against these. Whoever takes design 20's
+ * port has two levers here that did not exist before — and a third, since
+ * `PROT_DOMAIN_SLOTS` sizes both the domain pool and design 37's stats region
+ * on this board (that finding is filed there).
+ */
+PROVIDE(ARENA_SIZE = 64K);
+KERNEL_STACK_SIZE = 64K;
+
 MEMORY {
     /* The ROM maps flash offset 0 here before jumping in. 4 MiB is what it
      * maps (0x40 pages of 64 KiB); the image uses well under half of it. */
@@ -163,6 +181,20 @@ SECTIONS {
         *(.sbss .sbss.*)
         *(.bss .bss.*)
         *(COMMON)
+
+        /* The arena and the boot stack, both inside `.bss` so `boot.S`'s zero
+         * loop (which runs `_bss_start`..`_bss_end`) covers them exactly as it
+         * covered the `static` and the `.skip` they replace. */
+        . = ALIGN(16);
+        _arena_start = .;
+        . = . + ARENA_SIZE;
+        _arena_end = .;
+
+        . = ALIGN(16);
+        _stack_bottom = .;
+        . = . + KERNEL_STACK_SIZE;
+        _stack_top = .;
+
         . = ALIGN(16);
         _bss_end = .;
     } > SRAM

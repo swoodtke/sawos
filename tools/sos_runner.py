@@ -165,6 +165,13 @@ RV32_VIRT_MODULE = f"rv32virt={os.path.join(HAL_DIR, 'riscv32', 'kernel')}"
 # checked (design 178's faults ruling). Kept in step with that enum.
 EXIT_PROCESS_FAULT = 5
 
+# `AbortCode.NoMemory` in sos/rt/common/src/lib.saw: what the RUNTIME stops the
+# machine with when the bump arena cannot serve a request. A different number
+# from the kernel's exit codes on purpose — a transcript should be able to tell
+# "the program panicked" and "the arena ran dry" apart from the status alone.
+# Kept in step with that enum.
+EXIT_ARENA_EXHAUSTED = 65
+
 # Root-server packages. These are real Blade packages built by Blade — the
 # whole point of unit C is that root goes through the same package pipeline any
 # SOS process will, not a bespoke rule in this file. (Blade itself, and the
@@ -549,6 +556,13 @@ TIER_WORD_PKG = os.path.join(TESTS_DIR, "tier-word")
 STATS_REGION_PKG = os.path.join(TESTS_DIR, "stats-region")
 STATS_READER_PKG = os.path.join(TESTS_DIR, "stats-reader")
 STATS_REGION_RO_PKG = os.path.join(TESTS_DIR, "stats-region-ro")
+
+# M5 arena unit (sawos design 38): the package that chooses its own arena. It is
+# the only package in the tree whose `linker-script` is not one of the shared
+# `hal/*/user/` scripts — it names a two-line file of its own that sets
+# `ARENA_SIZE` and then INCLUDEs the shared one, which IS the override
+# mechanism. Nothing else about the package differs.
+ARENA_SMALL_PKG = os.path.join(TESTS_DIR, "arena-small")
 
 # What the harness types at the guest's serial port for the echo cases, and what
 # it then expects to read back out of it.
@@ -5125,6 +5139,58 @@ TEST_CASES = [
                        "SOS statsro: writing",
                        "SOS: fault "],
         "expect_clean_exit": False,
+    },
+
+    {
+        # M5 ARENA UNIT (sawos design 38): A PACKAGE THAT CHOSE ITS OWN ARENA.
+        #
+        # `sosrt`'s bump arena was a `static` in the SHARED runtime module, so
+        # its 64 KiB was one compile-time fact for the kernel and for every
+        # process image at once — and on a 400 KiB part that one number is the
+        # single biggest lever on how many processes fit (design 20 finding 4
+        # measured 65,536 bytes of arena inside a 67,600-byte child). It is a
+        # LINKER REGION now, `PROVIDE`d at 64 KiB by every shared user script,
+        # and this package's manifest names a two-line script of its own that
+        # assigns `ARENA_SIZE = 8K` and then INCLUDEs exactly the `root.ld`
+        # every other root package names.
+        #
+        # **THE CASE IS THE MECHANISM'S ONLY PROOF, AND IT IS A PAIR OF
+        # BRACKETS.** There is no op that reports an arena size and there should
+        # not be, so the program makes two requests whose answers together pin
+        # the size to a range only the override can produce: 2 KiB is served
+        # (so the region is real, which rules out a build where the linker
+        # reserved nothing) and 16 KiB is not (so the region is under 16 KiB,
+        # which is impossible at the 64 KiB default). An image that missed the
+        # override serves BOTH and reaches the program's UNREACHABLE line, which
+        # fails the case rather than passing by omission.
+        #
+        # THE SECOND BRACKET ENDS THE MACHINE, which is why this case asserts a
+        # status rather than a clean shutdown. `__saw_rt_alloc` has nowhere to
+        # report a refusal to — it is the allocator every reporting path would
+        # allocate through — so it writes one line and aborts, and the exact
+        # status is what tells "the arena ran dry" from "the program panicked".
+        #
+        # It runs on ALL THREE PROFILES. A link address and a bump cursor are
+        # the same on a flat platform as on an isolated one, so nothing here is
+        # tiered.
+        #
+        # It is APPENDED, per the convention this file states above: the report
+        # prints in case-definition order, so a case added at the END leaves
+        # every existing case's ordinal where a reader of an older transcript
+        # left it.
+        "name": "arena_small",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": ARENA_SMALL_PKG,
+        "expect_out": ["{banner}",
+                       # BRACKET ONE: reserved, written and read back.
+                       "SOS arenasmall: 2 KiB ok",
+                       # Printed BEFORE the ask, because the ask does not
+                       # return.
+                       "SOS arenasmall: asking 16 KiB",
+                       # `sosrt`'s own words, from `rt/common/src/lib.saw`.
+                       "sos: out of arena memory"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_ARENA_EXHAUSTED,
     },
 ]
 

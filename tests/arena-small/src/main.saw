@@ -1,0 +1,101 @@
+// SOS M5 arena unit: A PACKAGE THAT CHOOSES ITS OWN ARENA (sawos design 38).
+//
+// **THE MECHANISM'S ONE PROOF, AND IT IS A PAIR OF BRACKETS.** `sosrt`'s bump
+// arena used to be a `static` in the SHARED runtime module, so its 64 KiB was
+// one compile-time fact for the kernel and for every process image in the
+// system at once. It is a LINKER REGION now, and this package's manifest names
+// a two-line script (`arena-small.riscv32.ld`) that sets `ARENA_SIZE = 8K`
+// before INCLUDEing the same `root.ld` every other root package names.
+//
+// Nothing in this file mentions any of that — there is no API to ask an arena
+// how big it is, and there should not be, since a program that could ask would
+// be a program that could branch on it. What the program does instead is make
+// two requests whose answers, together, pin the size to a range only the
+// override can produce:
+//
+//   SOS arenasmall: 2 KiB ok          <- the region is REAL (a 0 KiB arena, or
+//                                        one the linker forgot, fails here)
+//   SOS arenasmall: asking 16 KiB     <- printed BEFORE the ask, because the
+//                                        ask does not return
+//   sos: out of arena memory          <- `sosrt`'s own honest failure, and the
+//                                        machine stops with `AbortCode.NoMemory`
+//
+// **THE SECOND BRACKET IS THE ONE THAT PROVES THE OVERRIDE.** 16 KiB is past
+// this package's 8 KiB and far inside the 64 KiB default, so an image that did
+// NOT take the override serves the request, runs on, and prints the
+// UNREACHABLE line at the bottom — which fails the case loudly rather than
+// passing by omission. The first bracket rules out the other way to be wrong: a
+// build where the region ended up empty or unreserved would fail at 2 KiB, and
+// "everything fails" is not evidence that a size was chosen.
+//
+// **THE FAILURE IS AN ABORT, NOT A STATUS, AND THAT IS THE RUNTIME'S RULE
+// RATHER THAN THIS UNIT'S.** `__saw_rt_alloc` has nowhere to report to — it IS
+// the allocator every reporting path would allocate through — so it writes one
+// line and stops the machine (`rt/common/src/lib.saw`). The `catch` arms below
+// are therefore unreachable on this runtime and are written anyway, because the
+// signatures carry an error channel and a bind-or-bail arm is what this tree
+// writes at one.
+//
+// It runs on ALL THREE PROFILES. Nothing here is a hardware denial — a link
+// address and a bump cursor are the same on a flat platform as on an isolated
+// one — so the flat tier witnesses the mechanism exactly as the other two do.
+
+import sos.{System}
+
+/// 512 words = 2 KiB. Comfortably inside the 8 KiB the script asks for, with
+/// room for whatever the allocator rounds or aligns.
+static WITHIN_WORDS: Int = 512
+
+/// 4096 words = 16 KiB. Both bounds are load-bearing: past this package's
+/// 8 KiB, and far inside the 64 KiB every package that overrides nothing gets.
+static BEYOND_WORDS: Int = 4096
+
+/// A pattern with bits in both nibbles of every byte, so reading it back is a
+/// claim about the storage rather than a coincidence with zeroed `.bss`.
+static WITNESS: UInt32 = 0xA5A5_5A5A
+
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    // BRACKET ONE. A request the override must still be able to serve.
+    var within = try Vector<UInt32>(capacity: WITHIN_WORDS) catch {
+        print("SOS arenasmall: 2 KiB refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try within.push(WITNESS) catch {
+        print("SOS arenasmall: push refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    // Reserving storage and USING it are two claims, and the second is the one
+    // that says the address the arena handed back is inside the region the
+    // linker reserved rather than merely a number.
+    if within[0] != WITNESS {
+        let _ = system.debug_print("SOS arenasmall: witness LOST\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS arenasmall: 2 KiB ok\n")
+
+    // BRACKET TWO. Printed first, because the ask below does not return: the
+    // next line in the transcript is the runtime's, not this program's.
+    let _ = system.debug_print("SOS arenasmall: asking 16 KiB\n")
+    let beyond = try Vector<UInt32>(capacity: BEYOND_WORDS) catch {
+        // Unreachable on this runtime — see the header. If it is ever reached,
+        // the allocator grew an error channel and this case should be rewritten
+        // to assert THAT, which is why the arm says so rather than passing.
+        print("SOS arenasmall: 16 KiB refused as a STATUS: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // Unreachable on a correct build: the ask above stopped the machine. A run
+    // that gets here linked the shared 64 KiB arena and not this package's, so
+    // it exits non-zero rather than shutting down clean.
+    print("SOS arenasmall: UNREACHABLE, got {} words\n", beyond.len())
+    let _ = system.shutdown(EXIT_FAILED)
+}

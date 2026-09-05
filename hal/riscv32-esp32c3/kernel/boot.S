@@ -139,11 +139,8 @@ kernel_fault:
 
 /* ---- reservations -------------------------------------------------------- */
 
-/* 64 KiB kernel stack, reserved in .bss (zeroed by the loop above). `trap.S`
- * loads `_stack_top` to run the Saw handler on it. */
-    .section .bss.stack, "aw", @nobits
-    .balign 16
-    .globl _stack_top
-_stack_bottom:
-    .skip 0x10000
-_stack_top:
+/* THE KERNEL STACK IS NOT RESERVED HERE ANY MORE (sawos design 38), for the
+ * reason the virt board's `boot.S` gives: `esp32c3.ld` reserves it inside
+ * `.bss` under `KERNEL_STACK_SIZE`, which is where a 400 KiB part's stack
+ * budget belongs. `_stack_top` is a linker symbol; nothing about how `boot.S`
+ * and `trap.S` USE it changed. */

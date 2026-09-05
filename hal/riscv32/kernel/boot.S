@@ -82,11 +82,9 @@ kernel_fault:
 
 /* ---- reservations -------------------------------------------------------- */
 
-/* 64 KiB kernel stack, reserved in .bss (zeroed by the loop above). `trap.S`
- * loads `_stack_top` to run the Saw handler on it. */
-    .section .bss.stack, "aw", @nobits
-    .balign 16
-    .globl _stack_top
-_stack_bottom:
-    .skip 0x10000
-_stack_top:
+/* THE KERNEL STACK IS NOT RESERVED HERE ANY MORE (sawos design 38). It was a
+ * `.skip 0x10000` in a `.bss.stack` section, which put the one number a board
+ * might want to change in the one file a board variant does not get to edit;
+ * `virt.ld` reserves it inside `.bss` now, under `KERNEL_STACK_SIZE`, and
+ * `_stack_top` is a linker symbol. Nothing about how `boot.S` and `trap.S` USE
+ * it changed — they still `la sp, _stack_top`. */

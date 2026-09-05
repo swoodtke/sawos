@@ -80,6 +80,34 @@ ASSERT((LINMAP_OFFSET & LINMAP_PHYS_MASK) == 0,
 ASSERT((LINMAP_OFFSET | LINMAP_PHYS_MASK) == 0xFFFFFFFFFFFFFFFF,
        "the linear-map offset and mask must partition the 64-bit address")
 
+/* ---------------------------------------------------------------------------
+ * THE TWO `.bss` KNOBS (sawos design 38, M5 arena unit)
+ * ---------------------------------------------------------------------------
+ * Both regions used to be written somewhere the number could not be changed
+ * per build: the arena was a `static` in the SHARED `sosrt` module, and the
+ * stack was a `.skip` in this board's `boot.S`. They are linker regions now,
+ * so each is one number in the file that already fixes this side of the map.
+ *
+ * ARENA_SIZE — `sosrt`'s bump-allocator region, the storage behind
+ *   `__saw_rt_alloc`. `PROVIDE`d rather than assigned because the USER script
+ *   lets a package override it (see `hal/arm64/user/user.ld`); nothing
+ *   overrides the kernel's, and 64 KiB is what it has always had.
+ *
+ * KERNEL_STACK_SIZE — the boot stack `boot.S` loads into `sp` at each of its
+ *   three entry points, and the stack every trap frame is built on. A
+ *   PER-BOARD number: this board has 128 MiB, so 64 KiB costs nothing and
+ *   stays.
+ *
+ * CAPS is a number you may change; a leading underscore is an address the
+ * program uses (`_stack_top` in `boot.S`, `_arena_start` / `_arena_end`
+ * through `rt/common_c/support.c`, because Saw cannot name a linker symbol).
+ * Both regions are inside `.bss` and therefore below the ASSERT at the foot of
+ * this file — growing either one eats the same ceiling `PROT_DOMAIN_SLOTS`
+ * does.
+ */
+PROVIDE(ARENA_SIZE = 64K);
+KERNEL_STACK_SIZE = 64K;
+
 OUTPUT_ARCH(aarch64)
 ENTRY(_start_phys)
 
@@ -162,6 +190,21 @@ SECTIONS {
         _bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
+
+        /* The arena and the boot stack, both inside `.bss` so `boot.S`'s zero
+         * loop (which runs `_bss_start`..`_bss_end`) covers them exactly as it
+         * covered the `static` and the `.skip` they replace. The stack keeps
+         * the 16-byte alignment AArch64's `sp` requires. */
+        . = ALIGN(16);
+        _arena_start = .;
+        . = . + ARENA_SIZE;
+        _arena_end = .;
+
+        . = ALIGN(16);
+        _stack_bottom = .;
+        . = . + KERNEL_STACK_SIZE;
+        _stack_top = .;
+
         . = ALIGN(16);
         _bss_end = .;
     } > RAM

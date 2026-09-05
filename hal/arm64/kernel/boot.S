@@ -416,15 +416,15 @@ sos_resume_frame:
 
 /* ---- reservations -------------------------------------------------------- */
 
-/* 64 KiB kernel stack, reserved in .bss (zeroed by the loop above). Unlike the
- * RISC-V profile there is no separate trap-frame reservation: the frame is
- * built on this stack. */
-    .section .bss.stack, "aw", @nobits
-    .balign 16
-_stack_bottom:
-    .skip 0x10000
-    .globl _stack_top
-_stack_top:
+/* THE KERNEL STACK IS NOT RESERVED HERE ANY MORE (sawos design 38). It was a
+ * `.skip 0x10000` in a `.bss.stack` section, which put the one number a board
+ * might want to change in the one file a board variant does not get to edit;
+ * `virt.ld` reserves it inside `.bss` now, under `KERNEL_STACK_SIZE`, 16-byte
+ * aligned as `sp` requires, and `_stack_top` is a linker symbol. Nothing about
+ * how this file USES it changed — all three entry points still
+ * `ldr x0, =_stack_top`. Unlike the RISC-V profile there is still no separate
+ * trap-frame reservation: the frame is built on this stack.
+ */
 
 /* THE BOOT TABLE (sawos design 29): one page, two live descriptors, used for
  * exactly the window between the MMU coming on and the real linear map being

@@ -54,6 +54,32 @@
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 
+/* ---------------------------------------------------------------------------
+ * THE TWO `.bss` KNOBS (sawos design 38, M5 arena unit)
+ * ---------------------------------------------------------------------------
+ * Both regions used to be written somewhere the number could not be changed
+ * per build: the arena was a `static` in the SHARED `sosrt` module, and the
+ * stack was a `.skip` in this board's `boot.S`. They are linker regions now,
+ * so each is one number in the file that already fixes this side of the map.
+ *
+ * ARENA_SIZE — `sosrt`'s bump-allocator region, the storage behind
+ *   `__saw_rt_alloc`. `PROVIDE`d rather than assigned because the USER scripts
+ *   let a package override it (see `hal/riscv32/user/root.ld`); nothing
+ *   overrides the kernel's, and 64 KiB is what it has always had.
+ *
+ * KERNEL_STACK_SIZE — the boot stack `boot.S` sets `sp` to and `trap.S`
+ *   reloads on every trap. A PER-BOARD number: this board has 128 MiB, so
+ *   64 KiB costs nothing and stays; `hal/riscv32-esp32c3/kernel/esp32c3.ld`
+ *   is where a smaller one will matter.
+ *
+ * CAPS is a number you may change; a leading underscore is an address the
+ * program uses (`_stack_top` in the two assembly files, `_arena_start` /
+ * `_arena_end` through `rt/common_c/support.c`, because Saw cannot name a
+ * linker symbol).
+ */
+PROVIDE(ARENA_SIZE = 64K);
+KERNEL_STACK_SIZE = 64K;
+
 MEMORY {
     RAM (rwxa) : ORIGIN = 0x80000000, LENGTH = 128M
 }
@@ -148,6 +174,20 @@ SECTIONS {
         *(.sbss .sbss.*)
         *(.bss .bss.*)
         *(COMMON)
+
+        /* The arena and the boot stack, both inside `.bss` so `boot.S`'s zero
+         * loop (which runs `_bss_start`..`_bss_end`) covers them exactly as it
+         * covered the `static` and the `.skip` they replace. */
+        . = ALIGN(16);
+        _arena_start = .;
+        . = . + ARENA_SIZE;
+        _arena_end = .;
+
+        . = ALIGN(16);
+        _stack_bottom = .;
+        . = . + KERNEL_STACK_SIZE;
+        _stack_top = .;
+
         . = ALIGN(16);
         _bss_end = .;
     } > RAM

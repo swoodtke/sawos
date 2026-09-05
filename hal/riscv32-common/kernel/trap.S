@@ -15,7 +15,10 @@
  * needs three symbols from it and from the Saw side, and there is nowhere in
  * assembly to declare that contract, so it is written here:
  *
- *   IN:  `_stack_top`   the board's kernel stack, from its `.bss.stack`
+ *   IN:  `_stack_top`   the board's kernel stack, reserved inside `.bss` by
+ *                       its LINKER SCRIPT since sawos design 38 (it was a
+ *                       `.bss.stack` reservation in `boot.S` before that, and
+ *                       the symbol is the same either way)
  *        `kernel_fault` the board's kernel-mode-trap reporter, `.globl`
  *        `ktrap`        the Saw handler (kcore), which takes a frame address
  *                       and RETURNS the frame to resume

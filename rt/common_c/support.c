@@ -1,10 +1,10 @@
 // SOS common runtime support (designs 140, 172) — the C that must stay C, once.
 //
-// EVERY LINE IN THIS FILE IS C FOR ONE OF TWO REASONS, and both are PERMANENT.
-// Nothing here is waiting on a language feature; when this file was written it
-// also held a bump arena and the four `__saw_rt_*` seams, and design 172 part 2
-// moved those to Saw (`rt/common/src/lib.saw`), which is what leaves the
-// two reasons below as the whole story.
+// EVERY LINE IN THIS FILE IS C FOR ONE OF THREE REASONS, and all three are
+// PERMANENT. Nothing here is waiting on a language feature; when this file was
+// written it also held a bump arena and the four `__saw_rt_*` seams, and design
+// 172 part 2 moved those to Saw (`rt/common/src/lib.saw`), which is what leaves
+// the reasons below as the whole story.
 //
 //  1. mem* : a byte-copy loop written in Saw is exactly the pattern LLVM's
 //     loop-idiom recognizer rewrites into a call to `memcpy` — which, in a
@@ -18,12 +18,19 @@
 //     name an atomics extension. There is nothing for Saw to express — the
 //     caller is codegen, not source. See the uniprocessor caveat below.
 //
-// So this file has no seam of its own any more and declares no hook. The two
-// per-side hooks it used to be written against — `sos_rt_write` and
-// `sos_rt_abort`, where a byte goes and how the machine stops — are still the
-// system's one runtime seam; they are just Saw on both ends now. See
-// `rt/common/src/lib.saw` for that contract, and `spec.md` §5c for the
-// C floor as a whole.
+//  3. the arena's extent (sawos design 38) : SAW CANNOT NAME A LINKER SYMBOL.
+//     That is the same wall `hal/*/kernel/sink.c` meets for `.payload` and
+//     `.regions`, and it is answered the same way — two accessors, in the one
+//     C file BOTH the kernel and every process image already link, so one
+//     answer serves both sides of the M/U split. See the section at the foot
+//     of this file.
+//
+// So this file has one accessor pair and no SEAM of its own: nothing here is a
+// per-side hook. The two per-side hooks it used to be written against —
+// `sos_rt_write` and `sos_rt_abort`, where a byte goes and how the machine
+// stops — are still the system's one runtime seam; they are just Saw on both
+// ends now. See `rt/common/src/lib.saw` for that contract, and `spec.md` §5c
+// for the C floor as a whole.
 //
 // What design 172 moved out of the SOS C layer over its two parts: the board
 // consoles, the machine stops, the arm64 page tables, the PMP region staging,
@@ -161,3 +168,31 @@ u32 __atomic_fetch_sub_4(volatile void *ptr, u32 val, int memorder) {
     *p = old - val;
     return old;
 }
+
+// ---- the arena's extent (sawos design 38) ---------------------------------
+//
+// REASON 3: `sosrt`'s bump arena is a LINKER REGION now rather than a `static`
+// in the shared module, so that a package can choose its size without a
+// conditional compilation this toolchain does not have. The linker scripts
+// reserve `[_arena_start, _arena_end)` inside `.bss` under a `PROVIDE`d
+// `ARENA_SIZE`; these two functions are how the Saw side reads that back,
+// because Saw cannot name a linker symbol.
+//
+// `extern unsigned char sym[]` is the idiom for a linker symbol: an array's
+// name IS its address, so nothing here dereferences storage that does not
+// exist. The SIZE comes from subtracting the two addresses rather than from an
+// absolute `ARENA_SIZE` symbol — same number, and a pair of real addresses is
+// what `sink.c` already does for `.payload`, so there is one idiom in the tree
+// and not two.
+//
+// BOTH SIDES LINK THIS FILE (the kernel through `_build_shared`, every process
+// image through its manifest's `[sos.<triple>] native`), which is what makes
+// one definition enough for a module that serves an M-mode kernel and a U-mode
+// process alike.
+
+extern unsigned char _arena_start[];
+extern unsigned char _arena_end[];
+
+usize sos_arena_base(void) { return (usize)_arena_start; }
+
+usize sos_arena_size(void) { return (usize)(_arena_end - _arena_start); }
