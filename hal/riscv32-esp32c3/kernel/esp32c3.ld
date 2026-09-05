@@ -103,14 +103,20 @@ ENTRY(_start)
  * built for: 400 KiB of SRAM total, of which 168 KiB is this section's budget
  * and 167,360 bytes are already spent (the header above).
  *
- * BOTH VALUES ARE DELIBERATELY LEFT AT THE VIRT BOARD'S, and design 38 says so
- * on purpose: retuning a board is that board's own unit, and every number in
- * the SRAM budget above was MEASURED against these. Whoever takes design 20's
- * port has two levers here that did not exist before — and a third, since
- * `PROT_DOMAIN_SLOTS` sizes both the domain pool and design 37's stats region
- * on this board (that finding is filed there).
+ * THE ARENA IS RETUNED TO 16K AND THE STACK LEFT AT THE VIRT BOARD'S (the
+ * design-38 integration, Sep 5 — the lead applied design 38's own probe after
+ * the unit merged, because the smoke had been red since design 37 and the
+ * seventh pin bump's -Oz re-measure needs a board that links). 16K is the
+ * probed value: it alone frees 48 KiB and takes the smoke back to 3/3 with
+ * 38,760 B of slack, and a kernel that allocates nothing on its steady path
+ * (every kernel source builds under `--no-hidden-alloc`; the arena backs only
+ * the compiler's panic path) is the argument for touching this lever and not
+ * the stack's. Whoever takes design 20's port still holds the other two
+ * levers: `KERNEL_STACK_SIZE` below, and `PROT_DOMAIN_SLOTS`, which sizes
+ * both the domain pool and design 37's stats region on this board (that
+ * finding is filed there).
  */
-PROVIDE(ARENA_SIZE = 64K);
+PROVIDE(ARENA_SIZE = 16K);
 KERNEL_STACK_SIZE = 64K;
 
 MEMORY {

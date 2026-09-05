@@ -190,7 +190,14 @@ bytes rounded up to one 4 KiB page plus one page of alignment slack.
 **AND THE MCU-CLASS BOARD PAYS THE RISCV32 NUMBER, which is the one
 figure here that could decide a port.** `kcore` is shared, so the
 non-gating ESP32-C3 kernel compiles this region too (checked: it builds
-clean, `--target-features +m,+c`). It takes `PROT_DOMAIN_SLOTS` and
+clean, `--target-features +m,+c`). **CORRECTION (design 38's bisect,
+Sep 5): that check stopped at COMPILE, and the board fails at LINK —
+`.bss` overflows SRAM by 10,416 bytes, `make sos-smoke-esp32c3` 0/3
+from this unit's first commit (`9026bf7`) onward. "It bites" arrived
+the same week it was named. Resolved at the design-38 integration: the
+arena unit's own probe (`ARENA_SIZE = 16K` in `esp32c3.ld`) frees
+48 KiB and returns the smoke to 3/3; the `PROT_DOMAIN_SLOTS` lever
+named below stays open for design 20's real port.** It takes `PROT_DOMAIN_SLOTS` and
 `PROT_GRAIN` straight from `rv32core`, so it gets **256 rows and the same
 12288 bytes of `.bss`** — on a part with a few hundred KiB of DRAM, which
 is a different proposition from the same number on a board with 128 MiB.
