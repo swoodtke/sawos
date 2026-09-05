@@ -889,7 +889,8 @@ extension PipeInlet {
 func post_body(handle: PipeInletHandle, body: &[UInt8; PIPE_BODY_BYTES],
                len: UInt,
                handles: &var PipeHandles) unsafe -> Result<PipeReply, SosStatus> {
-    var args = send_record(&body, len, &handles)
+    var staged: [UInt64; PIPE_STAGE_DWORDS] = [0; PIPE_STAGE_DWORDS]
+    var args = send_record(body_addr_for_kernel(&body, &var staged), len, &handles)
     var value: UInt = 0
     let raw = sos_pipe_inlet_post(handle,
                                   (&var args) as UnsafePointer<UInt>,
@@ -908,17 +909,65 @@ func post_body(handle: PipeInletHandle, body: &[UInt8; PIPE_BODY_BYTES],
     return PipeReply(handle: PipeReplyHandle(value))
 }
 
+/// The staging buffer's length, in DOUBLEWORDS — `UInt64` rather than the
+/// machine word, deliberately: a `[UInt64; N]` local is EIGHT-aligned by the
+/// natural ABI on both targets, which satisfies any machine-word alignment
+/// the copy doors could ask, and its count is one literal instead of a
+/// per-target `sizeof` division (which a static initializer refused to fold
+/// at sawc 0.8.0 — the platform-typed `sizeof<UInt>()` operand).
+static PIPE_STAGE_DWORDS: Int = 16
+
+static_assert(PIPE_STAGE_DWORDS * 8 == PIPE_BODY_BYTES,
+              "the staging buffer must cover exactly one pipe body")
+
+/// **THE ADDRESS THE KERNEL MAY READ THE BODY FROM** — the caller's own
+/// storage where it is already word-aligned, a copy in `staged` where it is
+/// not (found at the seventh pin bump, Sep 5).
+///
+/// The copy-in door faults a source that is not word-aligned (the rule
+/// `kernel/core/process.saw` states once for every kernel record), and the
+/// public surface takes `&[UInt8; PIPE_BODY_BYTES]` — a byte array, whose
+/// alignment is ONE. Saw has no way to ask for more (no alignment attribute
+/// exists), so every caller's `var body: [UInt8; ...]` local is word-aligned
+/// only by the accident of stack layout — which held at every optimization
+/// level until `-Oz` packed two riscv32 frames differently and the gate
+/// caught the fault. The sysapi is the vDSO: the contract is made to hold
+/// HERE, for every caller ever written, rather than re-learned at each call
+/// site. The aligned common case pays one branch and no copy; an unaligned
+/// caller pays a 128-byte copy it cannot notice next to the trap it is about
+/// to take. The `staged` buffer is the FUNNEL's frame-local, so it outlives
+/// the syscall that reads it.
+func body_addr_for_kernel(body: &[UInt8; PIPE_BODY_BYTES],
+                          staged: &var [UInt64; PIPE_STAGE_DWORDS]) unsafe -> UInt {
+    let src = (&body) as UnsafePointer<UInt8>
+    let addr = src as UInt
+    if addr % (sizeof<UInt>() as UInt) == 0 {
+        return addr
+    }
+    let dst = (&var staged) as UnsafePointer<UInt8>
+    var i: Int = 0
+    while i < PIPE_BODY_BYTES {
+        dst[i] = src[i]
+        i = i + 1
+    }
+    dst as UInt
+}
+
 /// Assemble the argument record every sending op takes — a body address, a
 /// length and the handle words (sawos design 18).
+///
+/// The address arrives ALREADY VETTED through `body_addr_for_kernel` — the
+/// funnel owns the staging storage, because the record only carries the
+/// number and the kernel reads through it after this function has returned.
 ///
 /// **IT READS THE CARRIER AND DOES NOT EMPTY IT**, which is what lets the three
 /// callers decide per answer whether the handles were handed over. The kinds are
 /// NOT sent: the kernel reads each word out of this process's own table, so it
 /// knows the kind better than the caller could tell it, and a kind argument
 /// would be a second description of one fact.
-func send_record(body: &[UInt8; PIPE_BODY_BYTES], len: UInt,
+func send_record(body_addr: UInt, len: UInt,
                  handles: &PipeHandles) unsafe -> PipeSendRecord {
-    var args = PipeSendRecord(body: ((&body) as UnsafePointer<UInt8>) as UInt,
+    var args = PipeSendRecord(body: body_addr,
                               len: len,
                               handles: [NO_HANDLE; PIPE_MSG_HANDLES])
     var i: Int = 0
@@ -946,7 +995,8 @@ func send_record(body: &[UInt8; PIPE_BODY_BYTES], len: UInt,
 func call_body(handle: PipeInletHandle, body: &[UInt8; PIPE_BODY_BYTES],
                len: UInt,
                handles: &var PipeHandles) unsafe -> Result<PipeMsg, SosStatus> {
-    var args = send_record(&body, len, &handles)
+    var staged: [UInt64; PIPE_STAGE_DWORDS] = [0; PIPE_STAGE_DWORDS]
+    var args = send_record(body_addr_for_kernel(&body, &var staged), len, &handles)
     var reply = PipeMsgRecord(meta: PipeMsgMeta(len: 0,
                                                 kinds: [0; PIPE_MSG_HANDLES]),
                               handles: [NO_HANDLE; PIPE_MSG_HANDLES],
@@ -1407,7 +1457,8 @@ extension PipeRequest {
 func reply_body(handle: PipeRequestHandle, body: &[UInt8; PIPE_BODY_BYTES],
                 len: UInt,
                 handles: &var PipeHandles) unsafe -> Result<Void, SosStatus> {
-    var args = send_record(&body, len, &handles)
+    var staged: [UInt64; PIPE_STAGE_DWORDS] = [0; PIPE_STAGE_DWORDS]
+    var args = send_record(body_addr_for_kernel(&body, &var staged), len, &handles)
     let raw = sos_pipe_request_reply(handle,
                                      (&var args) as UnsafePointer<UInt>,
                                      pipe_send_record_bytes() as UInt)
@@ -1483,8 +1534,10 @@ extension ReplyWaitError: Error {}
 func reply_wait_body(handle: PipeRequestHandle, body: &[UInt8; PIPE_BODY_BYTES],
                      len: UInt, waiter: WaiterHandle,
                      handles: &var PipeHandles) unsafe -> Result<WaitResult, ReplyWaitError> {
+    var staged: [UInt64; PIPE_STAGE_DWORDS] = [0; PIPE_STAGE_DWORDS]
     var args = PipeReplyWaitRecord(waiter: waiter,
-                                   msg: send_record(&body, len, &handles))
+                                   msg: send_record(body_addr_for_kernel(&body, &var staged),
+                                                    len, &handles))
     var buf = WaitBuffer(header: [0; WAIT_HEADER_WORDS],
                          meta: PipeMsgMeta(len: 0, kinds: [0; PIPE_MSG_HANDLES]),
                          handles: [NO_HANDLE; WAIT_HANDLE_SLOTS],

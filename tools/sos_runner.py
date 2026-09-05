@@ -5433,7 +5433,12 @@ def _build_blade(build_dir):
 
 def _blade_env(clang):
     env = dict(os.environ)
-    env["SAWC"] = tc().sawc_env_value()
+    # The trailing -Oz rides into every blade-driven sawc invocation: the SAWC
+    # value is a full command line split on spaces (blade's documented
+    # `CC="ccache gcc"` convention), which is what carries the seventh pin
+    # bump's ruling — -Oz on all freestanding builds — to the packages blade
+    # builds (root and every test sosimg).
+    env["SAWC"] = tc().sawc_env_value() + " -Oz"
     # macOS's Apple clang mis-drives the riscv integrated assembler; hand Blade
     # the same clang this harness probed for.
     env["SOS_CLANG"] = clang
@@ -5683,7 +5688,12 @@ def _build_elf(case, arch, shared_objs, lld, clang):
     # --module-path, so THIS is the compile that defines them. Without it the
     # `@export`s are refused by name; with it every signature is checked against
     # sawc/rt/ABI.md.
-    cmd = tc().sawc() + [case["src"], "-o", obj,
+    # design 265 (sawc 0.8.0) + the user ruling at the seventh pin bump: every
+    # freestanding Saw build asks for -Oz — size is the scarce resource on
+    # target, and one configuration keeps one baseline. The C objects keep
+    # their own -O2; blade-built packages get the same -Oz through the SAWC
+    # env value in `_blade_env`.
+    cmd = tc().sawc() + [case["src"], "-o", obj, "-Oz",
                          "--freestanding", "--no-hidden-alloc",
                          "--runtime-provider", "--target", arch["triple"]]
     if arch["features"]:
@@ -6333,6 +6343,7 @@ def main():
                         os.path.join(C3_BUILD, "support.o"), extra=("-O2",))]
         kobj = os.path.join(C3_BUILD, "kernel.o")
         _run(tc().sawc() + [os.path.join(KERNEL_DIR, "main.saw"), "-o", kobj,
+                            "-Oz",
                             "--freestanding", "--no-hidden-alloc",
                             "--runtime-provider",
                             "--target", C3_TRIPLE,
