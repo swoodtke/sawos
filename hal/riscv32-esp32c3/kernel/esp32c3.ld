@@ -50,13 +50,27 @@
  *   0x403D_C000  RAM POOL                                          16 KiB
  *   0x403E_0000  end of SRAM
  *
- * Every one of those four numbers is MEASURED, not chosen for tidiness. The
- * kernel needs 167,360 B of .data+.bss and gets 172,032; root's largest image
- * (c3-isolation) needs 99,392 B and gets 110,592; the child needs 67,600 and
- * gets 77,824. The slack is thousands of bytes rather than tens of thousands,
- * which is what 400 KiB of SRAM looks like once this kernel is in it — and an
- * overshoot is a LOUD ld.lld "will not fit in region" error, never a silent
- * overlap.
+ * Every one of those four numbers is MEASURED, not chosen for tidiness. At
+ * design 20 the kernel needed 167,360 B of .data+.bss and got 172,032; root's
+ * largest image (c3-isolation) needed 99,392 B and got 110,592; the child
+ * needed 67,600 and got 77,824. The slack was thousands of bytes rather than
+ * tens of thousands, which is what 400 KiB of SRAM looks like once this kernel
+ * is in it — and an overshoot is a LOUD ld.lld "will not fit in region" error,
+ * never a silent overlap.
+ *
+ * **AND IT IS OVERSHOOTING NOW, LOUDLY** (re-measured sawos design 38, Sep 5).
+ * The kernel wants 182,424 B of .data+.bss against the 172,032 this region
+ * grants, so `make sos-smoke-esp32c3` fails at the LINK with that error and has
+ * done since design 37 (`9026bf7`) — bisected: 3/3 at `a64d359`, 0/3 at every
+ * commit after it. Design 37's stats region is 12,288 B of `.bss` on this board
+ * (it is sized by `PROT_DOMAIN_SLOTS`, which riscv32 publishes as 256) and the
+ * board had under 2 KiB of slack to pay it with. THIS FILE IS NOT WHERE THAT IS
+ * FIXED and design 38 deliberately did not fix it — retuning a board is that
+ * board's own unit — but the two knobs below are now the levers, and the fit
+ * was PROBED rather than assumed: `ARENA_SIZE = 16K` alone frees 48 KiB and
+ * takes the smoke back to 3/3 with 38,760 B of slack. A kernel that allocates
+ * nothing on its steady path (every kernel source builds under
+ * `--no-hidden-alloc`) is the argument for that being the first lever tried.
  *
  * The root/child/pool numbers are NOT set here — root.ld, child.ld and the
  * harness's region table own them, and the kernel validates every segment

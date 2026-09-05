@@ -513,7 +513,7 @@ The whole 400 KiB, as `esp32c3.ld` and the two user scripts divide it:
 0x403E_0000  end of SRAM
 ```
 
-Every one of those is MEASURED, not chosen for tidiness:
+Every one of those is MEASURED, not chosen for tidiness. As of design 20:
 
 ```
 kernel .data + .bss                     167,360 B   of 172,032 granted
@@ -523,15 +523,44 @@ child (c3-child-poke)                    67,600 B   of  77,824 granted
 
 The slack is thousands of bytes, not tens of thousands. That is what
 400 KiB looks like once this kernel is in it, and it is why the `.bss`
-of every process image is dominated by ONE number: `sosrt`'s 64 KiB
-`ARENA`, which every freestanding image links. An overshoot is a loud
+of every process image is dominated by ONE number: the 64 KiB arena
+every freestanding image links. An overshoot is a loud
 `ld.lld: section '.bss' will not fit in region` error, never a silent
 overlap.
 
-A linked kernel image, for the record: `.text` at 0x4200_0008 (the ROM's
-call target), 413,622 B; `.rodata` 27,356 B; `.data` VMA 0x4037_C000 /
-LMA in flash, 14,416 B; `.bss` 152,944 B ending at 0x403A_4DC0; a
-456,784-byte flash image, of 4 MiB.
+**THE KERNEL ROW IS OVERSHOOTING TODAY** (re-measured sawos design 38,
+Sep 5): it wants 182,424 B of the 172,032 it is granted, so
+`make sos-smoke-esp32c3` fails at the LINK — 3/3 green at `a64d359`,
+0/3 at every commit after design 37 (`9026bf7`), bisected. Design 37's
+stats region costs this board 12,288 B of `.bss`, because it is sized
+by `PROT_DOMAIN_SLOTS` and riscv32 publishes 256; the board had under
+2 KiB of slack to pay it with. Design 38 did not retune the board (that
+is this board's own unit's call) but it did build the levers and probe
+the fit: the arena is a linker region now under a `PROVIDE`d
+`ARENA_SIZE`, the boot stack is `KERNEL_STACK_SIZE`, both in
+`kernel/esp32c3.ld`, and `ARENA_SIZE = 16K` alone frees 48 KiB and
+takes the smoke back to 3/3 with 38,760 B of slack. A third lever is
+`PROT_DOMAIN_SLOTS` itself, which is a BOARD number sizing the domain
+pool and the stats region together (filed at design 37).
+
+Note also that the arena is no longer the `static` named `ARENA` this
+document once pointed at: it is `[_arena_start, _arena_end)`, reserved
+inside `.bss` by the linker script and read back through
+`rt/common_c/support.c`, and a process package may choose its own size
+(`tests/arena-small/`). Nothing about the SRAM arithmetic changes —
+`.bss` is `.bss` — but the number now has a name a board can set.
+
+A linked kernel image at design 20, for the record: `.text` at
+0x4200_0008 (the ROM's call target), 413,622 B; `.rodata` 27,356 B;
+`.data` VMA 0x4037_C000 / LMA in flash, 14,416 B; `.bss` 152,944 B
+ending at 0x403A_4DC0; a 456,784-byte flash image, of 4 MiB.
+
+The shipped configuration does not link today (above), so there is no
+current image to put beside it. With design 38's `ARENA_SIZE = 16K`
+probe it is `.text` 119,576 B, `.rodata` 21,700 B, `.data` 34,392 B,
+`.bss` 98,880 B — the `.text` collapse is the fifth pin bump's
+(sawlang 0.5.0, -71%), and `.data` grew because design 36's
+`GrantRow.region` sentinel moved per-process storage out of `.bss`.
 
 ---
 
