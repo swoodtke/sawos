@@ -27,8 +27,12 @@ nothing at build time compares the two (a Saw static's value is not a linker
 symbol, design 29 finding 5). The loader's `check_segment` is what catches a
 disagreement, with a named diagnostic rather than a silent misplacement.
 
-`hal/riscv32/user/` still carries three scripts, deliberately (design 25 ruling
-11). That pair of directories is the tier split as a thing you can look at.
+`hal/riscv32/user/` carries FOUR scripts, deliberately (design 25 ruling 11) —
+`root.ld` plus `child.ld`/`child2.ld`/`child3.ld`, the fourth added by design 36
+when a third resident child had to exist at once. That is the shape of the cost:
+on a tier that does not translate, a script per resident image; here, one script
+whatever the process count. That pair of directories is the tier split as a
+thing you can look at.
 
 ## Which altitude is supported for whom
 
@@ -38,7 +42,14 @@ and the raw `sos_syscall1` / `sos_syscall3` for the HAL and the kernel package
 only.
 The first two are the kernel package's (`kernel/sysapi/`), not this
 directory's; this directory supplies only the bottom of the chain. The typed C
-row's in-tree caller went away with the C sinks — see DF-172i, recorded there.
+row's in-tree caller went away with the C sinks (DF-172i) — **and the row is
+also OUT OF REACH of a genuinely non-Saw image**, because those symbols are
+compiled from the `sos` SAW module, which depends on `sosrt`: linking them makes
+the image a Saw image with a C `main` in it. M5's C-leg probe (sawos design 39)
+is the first program in this tree to find that out, and it hardcoded three op
+numbers out of KERNEL-INTERNAL `kernel/abi/` instead. The riscv32 twin states
+the whole finding and what would fix it (design 31 part 1); spec §5.7 now
+scopes its "an op number is not ABI" claim to the altitude that can honour it.
 
 ## Provided to a process
 
@@ -59,9 +70,33 @@ directory's any more. See `kernel/sysapi/src/lib.saw`.
 
 ## Required of a process
 
-- An entry point taking the boot handle as its first argument. The kernel places
-  it in x0 before `eret`ing to EL0, so a Saw
-  `@export("_start") func _start(boot_handle: UInt)` receives it directly.
+**READ THIS BEFORE WRITING A crt0.** Same list as the riscv32 twin, which states
+the reasoning; the four facts below the first are things the kernel ALREADY DOES,
+and design 39's probe had to read them out of `kernel/core/` because this section
+was one bullet until M5's docs sweep.
+
+- **An entry point taking the boot handle as its first argument.** The kernel
+  places it in x0 before `eret`ing to EL0, so a Saw
+  `@export("_start") func _start(boot_handle: UInt)` — or a C
+  `void _start(unsigned long h)` — receives it directly.
+- **THE STACK POINTER IS ALREADY SET**, to the top of the region the image was
+  linked into (`stack_top = dest.link_top()` at create, into `sp` at
+  `frame_init`). It is 16-byte aligned, which is what this architecture's `sp`
+  rule requires. A crt0 sets up no stack.
+- **`.bss` IS ALREADY ZERO**: the loader zero-fills each segment's `mem_len`
+  tail past its `file_len`. No startup zeroing loop.
+- **`.data` IS ALREADY IN PLACE**: segments are copied to their LINK addresses,
+  which since M5 unit 2 is the CANONICAL base every image on this board shares
+  (`hal.USER_IMAGE_BASE`) — the kernel maps that image's own frames there. No
+  startup copy loop, and nothing to relocate.
+- **x30 IS ZERO, DELIBERATELY.** `frame_init` zeroes the whole trap frame before
+  writing elr / spsr / sp / x0, so the link register is 0 and FALLING OFF THE
+  END OF `_start` FAULTS — which is what makes a failed bootstrap show up as
+  `Faulted` in a launcher's `get_status` instead of as a hang. Do not write a
+  `_Noreturn` crt0 that spins.
+
+The way out is the process's own job: `process_self` off the System handle it
+was given, then `exit`. There is no other door.
 
 ## The syscall ABI (spec.md §5.7)
 
