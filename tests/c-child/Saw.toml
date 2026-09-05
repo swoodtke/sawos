@@ -1,0 +1,42 @@
+[package]
+name = "c-child"
+version = "0.1.0"
+
+# THE C CHILD (sawos design 39, the C-leg probe) — one freestanding C program,
+# end to end.
+#
+# **READ THIS MANIFEST AGAINST `../echo-child/Saw.toml` AND THE DIFFERENCE IS
+# THE UNIT.** That package says `runtime = true` and depends on `sos`, because a
+# Saw image carries its own `__saw_rt_*` seams out of `sosrt` and reaches the
+# kernel through the typed `sos` module. This one says neither: it has NO
+# dependencies, so nothing links `sosrt`, so there is no runtime to provide and
+# no arena to reserve. What is left is the `native` line — three C translation
+# units — and a linker script that turns the arena off.
+#
+# The `src/main.saw` this package still needs is empty and explains itself; see
+# its header, and design 39's finding 5.
+[dependencies]
+
+[sos]
+emit = "sosimg"
+priorities = { background = 0, low = 1, normal = 1, high = 1 }
+
+# **THE `native` LINE IS THE SAME ON BOTH TARGETS**, which the Saw children's
+# manifests cannot say: theirs name a per-arch `syscall.c` out of `hal/`, and
+# this package's `syscall.c` picks its instruction with a `#if` instead. A C
+# program has the preprocessor; a Saw manifest has one line per triple, which is
+# why the tree's own copies are split.
+#
+# Blade compiles each unit with `--target=<triple> -march -mabi -ffreestanding
+# -fno-builtin -ffunction-sections -fdata-sections -nostdlib -O2 -c` (its
+# `build_sos_image`, sawlang `blade/src/builder.saw`), through the `SOS_CLANG`
+# the runner exports — the same clang that builds `sink.c` and `support.c`.
+# The `-O2` is Blade's and is not a knob: the seventh pin bump's `-Oz` rides the
+# `SAWC` env value, so it reaches the Saw half of an image and not the C half.
+[sos.riscv32-unknown-none-elf]
+linker-script = "c-child.riscv32.ld"
+native = "crt0.c syscall.c main.c"
+
+[sos.aarch64-unknown-none-elf]
+linker-script = "c-child.arm64.ld"
+native = "crt0.c syscall.c main.c"

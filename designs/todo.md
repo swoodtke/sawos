@@ -32,12 +32,15 @@ entry below or the brief that carries it, never restating either.
   **0.8.0 @ `449d2485`** with **-Oz on all freestanding builds**
   (user-ruled; kernel `.text` 76,808 B, −37% at adoption), C3 board
   smoke 3/3 (arena retuned to 16K at the design-38 integration).
-- THE C-LEG PROBE (`designs/039`, user-ruled Sep 4): one freestanding
-  C process end to end — clang + crt0 + hand-rolled syscall wrappers
-  + a gate case root spawns and asserts. NO kernel/sysapi/ABI change
-  (stop-and-report is a finding, not a failure). DISPATCHES NEXT,
-  before unit 8, so its doc-skew findings feed the sweep. De-risks
-  M7's untested toolchain hinge; the spawn hinge is already proven.
+- THE C-LEG PROBE (`designs/039`, user-ruled Sep 4): **BUILT AND
+  CLOSED.** `tests/c-child/` is a freestanding C image (main.c +
+  crt0.c + a hand-rolled syscall.c, no `sos`, no `sosrt`, no arena)
+  that `tests/c-hello/` spawns and asserts; case `c_hello` appended,
+  gate 380/380 = 128 + 128 + 124. NO kernel, sysapi, ABI or toolchain
+  change was needed and NO new runner build leg — a C package reaches
+  Blade's sosimg emit through the same `[sos] native` line the HAL
+  stubs use. Findings and their M7 sizing are the As-built in
+  `designs/039`; the four items it hands unit 8 are in that entry.
 - M5 UNIT 8 — the docs sweep, M5 CLOSES. The pile, collected at the
   Sep-5 tracker sweep:
   - spec §5.5 re-scope + §2.5 amendments + §5.9/F2 CLOSE (built by
@@ -58,6 +61,32 @@ entry below or the brief that carries it, never restating either.
     `interrupts=` column are the unasserted ones.
   - ThreadState's stale pre-M3 generations comment; design 16's
     future-shape paragraph.
+  - FROM THE C-LEG PROBE (`designs/039` As-built §7), four doc items,
+    located and deliberately not edited:
+    - `hal/riscv32/user/ABI.md` says "three scripts" in THREE places
+      and lists `root/child/child2`; design 36 added `child3.ld`, so
+      there are four. `hal/arm64/user/ABI.md`'s tier-split paragraph
+      repeats the same stale count.
+    - both `user/ABI.md`s' "Required of a process" is ONE bullet (the
+      entry register) where a crt0 author needs four: the kernel also
+      preloads the STACK POINTER with the region's `link_top()`,
+      zero-fills each segment's `mem_len` tail so `.bss` needs no
+      startup loop, places segments at their LINK addresses so `.data`
+      needs no copy, and enters with a ZERO link register so falling
+      off `_start` faults. The probe read all four out of
+      `kernel/core/` rather than out of the ABI documents.
+    - both ABI.md "altitude" tables offer typed C
+      (`sos_system_shutdown(h, 0)`) "for non-Saw languages" without
+      saying that those symbols are compiled from the `sos` SAW module,
+      which depends on `sosrt` — so the row is reachable only by an
+      image that is no longer a C image. DF-172i records the row has no
+      in-tree caller; the probe is the first non-Saw process and could
+      not use it.
+    - spec §5.7's vDSO discipline ("an op number is not ABI") holds for
+      Saw and not for C: `tests/c-child/sos.h` writes three op numbers
+      out of KERNEL-INTERNAL `kernel/abi/`, on
+      `tests/riscv32/payload_sosimg.S`'s precedent. Either the spec
+      qualifies the claim or design 31 part 1 discharges it.
   - design 37's follow-on, recorded not built: row IDENTITY for a
     general `top` (a per-row identity column, or an op resolving a
     Process handle to its row).

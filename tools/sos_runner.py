@@ -564,6 +564,19 @@ STATS_REGION_RO_PKG = os.path.join(TESTS_DIR, "stats-region-ro")
 # mechanism. Nothing else about the package differs.
 ARENA_SMALL_PKG = os.path.join(TESTS_DIR, "arena-small")
 
+# THE C-LEG PROBE (sawos design 39): the first process in this tree that is not
+# written in Saw. `c-child` is a freestanding C image — a `main.c`, a `crt0.c`
+# and a hand-rolled `syscall.c`, no `sos` dependency, no `sosrt`, no arena — and
+# `c-hello` is an ordinary Saw launcher that spawns it and asserts its lines and
+# its exit code. THE PAIR IS THE FINDING: a C package reaches Blade's sosimg
+# emit through the same `[sos] native` line the HAL stubs already use, so the
+# harness needed no new build leg for it. The one thing it does need is a stub
+# `src/main.saw`, which Blade's `find_source_file()` demands and which is not
+# quite free — 138 bytes of RETAIN-marked backtrace table survive
+# `--gc-sections`; see that file's header.
+C_HELLO_PKG = os.path.join(TESTS_DIR, "c-hello")
+C_CHILD_PKG = os.path.join(TESTS_DIR, "c-child")
+
 # What the harness types at the guest's serial port for the echo cases, and what
 # it then expects to read back out of it.
 #
@@ -5191,6 +5204,64 @@ TEST_CASES = [
                        "sos: out of arena memory"],
         "expect_clean_exit": False,
         "expect_status": EXIT_ARENA_EXHAUSTED,
+    },
+    {
+        # THE C-LEG PROBE (sawos design 39) — the first process in this tree
+        # that is not written in Saw, end to end.
+        #
+        # **EVERY OTHER CASE IN THIS FILE SPAWNS A SAW IMAGE.** This one spawns
+        # a freestanding C one: `tests/c-child/` is a `main.c`, a `crt0.c` and a
+        # hand-rolled `syscall.c` compiled by the same clang that builds
+        # `sink.c` and `support.c`, linked by the same `ld.lld` against the same
+        # user linker script, emitted as the same sosimg and loaded by the same
+        # loader. It has no `sos` dependency, so it links no `sosrt` and
+        # reserves no arena — its `src/main.saw` is an empty file Blade's
+        # `find_source_file()` demands, and all that survives it is 138 bytes of
+        # RETAIN-marked backtrace table.
+        #
+        # **THE LAUNCHER CANNOT TELL, AND THAT IS THE CLAIM.**
+        # `tests/c-hello/src/main.saw` is `death-notify`'s program with the
+        # strings changed: two Memory capabilities into `process_create`, a
+        # masked System handle given under a tag, a Waiter on the child's
+        # Process handle, and the §8 status word read out of the wake. Nothing
+        # in it names C, and nothing in the kernel does either.
+        #
+        # THE THREE ASSERTIONS ARE THE THREE THINGS "a C process really ran"
+        # MEANS, and each rules out a different way of passing by accident:
+        #
+        #   hello line   the image LOADED — `.rodata` reached its link address
+        #                and the console op works.
+        #   wrote 38     the image COMPUTED — 38 is counted by a loop, held in a
+        #                stack frame the kernel's initial sp provides, and
+        #                rendered by an integer division. A replay of a constant
+        #                string cannot produce it.
+        #   status       the image ENDED PROPERLY — `Exited`(1) << 16 | 55 =
+        #                65591, a word no fault could produce, carrying `main`'s
+        #                own return value through the crt0 into `Process.exit`.
+        #
+        # It runs on ALL THREE PROFILES. Nothing about a C image is tiered: the
+        # entry contract, the initial stack pointer and the segment copy are the
+        # same on a flat platform as on an isolated one.
+        #
+        # It is APPENDED, per the convention this file states above: the report
+        # prints in case-definition order, so a case added at the END leaves
+        # every existing case's ordinal where a reader of an older transcript
+        # left it.
+        "name": "c_hello",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": C_HELLO_PKG,
+        "children": [C_CHILD_PKG],
+        "expect_out": ["{banner}",
+                       # One child, no pool: the blob row and the destination
+                       # row, and nothing else.
+                       "SOS: boot regions={two}",
+                       "SOS chello: started",
+                       # THE C IMAGE'S OWN WORDS.
+                       "SOS cchild: hello from freestanding C",
+                       "SOS cchild: wrote 38 bytes",
+                       "SOS chello: woke status=65591",
+                       "SOS chello: done"],
+        "expect_clean_exit": True,
     },
 ]
 

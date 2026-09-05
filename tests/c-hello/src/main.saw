@@ -1,0 +1,167 @@
+// SOS C-LEG PROBE: the launcher (sawos design 39).
+//
+// **THE POINT IS EVERYTHING THIS FILE DOES NOT SAY.** Its child is a
+// freestanding C image — clang, a hand-written crt0, three hand-rolled syscall
+// wrappers, no `sosrt`, no arena, no Saw — and there is not one line here that
+// knows it. `process_create` takes two Memory capabilities and reads neither
+// (root never parses, sawlang#232 unit 2), `give` moves a masked System handle
+// under a tag, `start` resolves that tag into the child's first argument
+// register, and the §8 status word comes back the same shape it comes back for
+// a Saw child. `tests/death-notify/` is this program with different strings.
+//
+// The transcript is read as an order:
+//
+//   SOS chello: started                          <- root, still running
+//   SOS cchild: hello from freestanding C        <- THE C IMAGE
+//   SOS cchild: wrote 38 bytes                   <- ...having COMPUTED
+//   SOS: process exit: code=... process=...
+//   SOS: process teardown ... process=...
+//   SOS chello: woke status=65591                <- `Exited`(1) << 16 | 55
+//   SOS chello: done
+//
+// WHAT EACH LINE RULES OUT. The child's FIRST line rules out an image that did
+// not load: `.rodata` reached its link address and the console op works. Its
+// SECOND rules out an image that loaded and did not run: 38 is counted by a
+// loop, held in a stack frame the kernel's initial stack pointer provides, and
+// rendered by an integer division — a byte-for-byte replay of a constant cannot
+// produce it. The STATUS rules out an image that ran and did not end properly:
+// `Exited` in the high half is a kind no fault produces, and 55 is `main`'s
+// return value carried through the crt0 into `Process.exit`.
+//
+// THERE IS NO TIMER IN THIS FILE, for `death-notify`'s reason: the child's
+// Process handle is attached to a Waiter before the start, so the only thing in
+// the machine that can make root runnable again is the child ending. A kernel
+// that failed to notify would leave nothing runnable and the run would end in
+// `every thread blocked`, which is a loud failure rather than a hang.
+
+import sos.{System, Process, Memory, BootHandle, Waiter, WaitResult,
+            SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The key this case attaches the child's Process handle under — a number that
+/// appears nowhere else in the transcript, so reading it back would prove the
+/// record came from THIS attachment. Only the status is printed; the key is
+/// what makes the record identifiable if it ever needs to be.
+static KEY: UInt = 39
+
+/// Root's config: the tag the child's System handle travels under.
+static TAG_BOOT: UInt = 21
+
+/// What the C child may ask its System object for: print, and learn its own
+/// Process object — which is the handle its `exit` goes through. `Transfer` is
+/// in the mask because it is the bit `give` checks on the thing being given;
+/// everything else is absent BY SILENCE.
+///
+/// **THIS IS THE SAME MASK `death-notify` GIVES A SAW CHILD.** A C child needs
+/// no wider authority to bootstrap than a Saw one does, which is §12's symmetry
+/// holding across the language boundary as well as across the two profiles.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The §8 status word out of the record the kernel copied into this process's
+/// memory while the thread was parked.
+///
+/// THE OTHER ARMS PANIC, and they are not defensive: this program attached
+/// exactly one thing, so a record of any other kind would mean the kernel
+/// reported an attachment nobody made — a bug in the pair rather than a
+/// condition to handle.
+func status_of(r: &WaitResult) -> UInt {
+    match r.what {
+        case Process(status) -> status,
+        case _ -> panic("this program attached only a Process"),
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS chello: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // The boot set, in the build's row order: the C child's image blob, then
+    // the RAM it will run in. Root's config is what says which ordinal is
+    // which — the kernel knows neither, and neither does it know that the blob
+    // is a C image.
+    var image = try proc.boot_handle_next() catch {
+        print("SOS chello: no image region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var dest = try proc.boot_handle_next() catch {
+        print("SOS chello: no destination region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let image_mem = image.take_memory() else {
+        let _ = system.debug_print("SOS chello: image record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest_mem = dest.take_memory() else {
+        let _ = system.debug_print("SOS chello: dest record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // PHASE ONE, and the load is the loader's: the kernel validates the sosimg
+    // header, checks every segment against the destination region and copies
+    // each to its link address. A C image reaches all of that through the same
+    // door, with the same refusals available — an entry outside an executable
+    // segment, a segment that does not fit, a bad magic. It passed.
+    let child = try system.process_create(image: &image_mem,
+                                          memory: &dest_mem) catch {
+        print("SOS chello: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let waiter = try proc.waiter_create() catch {
+        print("SOS chello: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try waiter.add(process: &child, key: KEY) catch {
+        print("SOS chello: attach failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // PHASE TWO: mint, give, start. The tag resolves to the child-side word the
+    // kernel puts in its first argument register — which the C crt0 receives as
+    // an ordinary `unsigned long` parameter, because the entry contract IS the
+    // C calling convention on both profiles.
+    let for_child = try system.mint(rights: CHILD_SYSTEM) catch {
+        print("SOS chello: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        print("SOS chello: give failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try child.start(boot_tag: TAG_BOOT) catch {
+        print("SOS chello: start failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS chello: started\n")
+
+    // THE PARK. Nothing else in this machine is armed, so the C child's death
+    // is the only thing that can end this call.
+    let record = try waiter.wait() catch {
+        print("SOS chello: wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    print("SOS chello: woke status={}\n", status_of(&record))
+    print("SOS chello: done\n")
+    let _ = proc.exit(EXIT_OK)
+}
