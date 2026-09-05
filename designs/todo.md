@@ -107,6 +107,26 @@ entry below or the brief that carries it, never restating either.
 
 ## [BACKLOG] — filed, not scheduled
 
+- **arm64 EL0 FP/SIMD is enabled and the trap frame saves no FP state
+  — a LATENT SILENT-CORRUPTION hazard** [#39 As-built §7 K1, filed by
+  the lead at integration, Sep 5]. `hal/arm64/kernel/boot.S` sets
+  `CPACR_EL1.FPEN = 3` (no trap at EL0 or EL1 — the kernel opened it
+  for its own SIMD per design 172's contract) and `TrapFrame` is 34
+  doublewords with no `q`/`v` state, so two userspace programs using
+  SIMD corrupt each other across a context switch, silently. Nothing
+  in-tree trips it today (the probe's arm64 image was disassembled to
+  confirm zero SIMD references), but the kernel's own `support.c`
+  compiles to 16 SIMD references at -O2 and a libc `memcpy` is the
+  same idiom on the same optimizer — the first real C program is the
+  likely finder. **Recommended first step (probe's, endorsed): narrow
+  FPEN to 0b01 (trap EL0, keep EL1) and FAULT the process — one
+  instruction, turns silent corruption into a named fault** — with a
+  fault-witness case; price the lazy FP save (3-4 days) when a real
+  FP workload asks. riscv32 unaffected (rv32imac_zicsr has no FP
+  registers). Schedule: its own small unit, or M6 scoping's first
+  housekeeping item — NOT unit 8 (a kernel behavior change is not a
+  docs sweep's to take).
+
 - riscv32 Sv32 tier-1 climb — PUNTED from M5 [`designs/025` ruling
   11, user, Sep 3]: 32-bit VA scarcity makes placement a genuinely
   different design (careful fitting vs 64-bit's space-for-tables
