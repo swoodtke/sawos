@@ -21,17 +21,25 @@ entry below or the brief that carries it, never restating either.
 
 ## [QUEUE] — scheduled, in order (user-approved)
 
-- M5: the memory milestone — `designs/025`: **BUILT AND MERGED except
-  unit 8** (below). Units 1, 1.5, 2, 4, 5, 6, 6a, 6b, 7 and the arena
-  unit all landed behind independent lead gates; the full unit digests
-  with their "things the lead should see" moved to
-  `designs/done_sep2-sep5.md` at the Sep-5 tracker sweep, and each
-  design's own As-built (027/028/029/032/033/034/035/036/037/038) is
-  the archival record. State at the sweep: gate **377/377 = 127 + 127
-  + 123** across riscv32 / arm64 / riscv32-flat, sawlang pinned
-  **0.8.0 @ `449d2485`** with **-Oz on all freestanding builds**
-  (user-ruled; kernel `.text` 76,808 B, −37% at adoption), C3 board
-  smoke 3/3 (arena retuned to 16K at the design-38 integration).
+- M5: the memory milestone — `designs/025`: **COMPLETE, Sep 5 2026.**
+  Every rung landed behind an independent lead gate: units 1 (`027`),
+  1.5 (`029`), 2 (`033`), 4 (`035`), 5 (`028`), 6 (`032`), 6a (`034`),
+  6b (`036`), 7 (`037`), the arena unit (`038`) and unit 8 (`040`,
+  the docs sweep that closes it). Unit 3 (riscv32 Sv32) VACATED to
+  [BACKLOG] by ruling 11; two riders touched no rung — the `sosabi`
+  split (`026`) and the C-leg probe (`039`). The full unit digests
+  moved to `designs/done_sep2-sep5.md` at the Sep-5 tracker sweep;
+  each design's own As-built is the archival record, and
+  `designs/025`'s closing note ("M5 as it ran") is the milestone
+  retrospective — the ladder as executed, the gate, and the four
+  things the plan got wrong. **Gate at close: 382/382 = 129 + 129 +
+  124** across riscv32 / arm64 / riscv32-flat (238 at the milestone's
+  start; the SHAPE changed once, at unit 4, when the flat profile
+  became a third run). sawlang pinned **0.8.0 @ `449d2485`** with
+  **-Oz on all freestanding builds** (user-ruled; kernel `.text`
+  76,808 B, −37% at adoption), C3 board smoke 3/3. **M6's anchor is
+  `designs/030-m6-storage-seed.md`; its scoping session unlocks
+  here.**
 - THE C-LEG PROBE (`designs/039`, user-ruled Sep 4): **BUILT AND
   CLOSED.** `tests/c-child/` is a freestanding C image (main.c +
   crt0.c + a hand-rolled syscall.c, no `sos`, no `sosrt`, no arena)
@@ -40,61 +48,33 @@ entry below or the brief that carries it, never restating either.
   change was needed and NO new runner build leg — a C package reaches
   Blade's sosimg emit through the same `[sos] native` line the HAL
   stubs use. Findings and their M7 sizing are the As-built in
-  `designs/039`; the four items it hands unit 8 are in that entry.
-- M5 UNIT 8 — the docs sweep, M5 CLOSES. The pile, collected at the
-  Sep-5 tracker sweep:
-  - spec §5.5 re-scope + §2.5 amendments + §5.9/F2 CLOSE (built by
-    unit 5) + the §5b/§2 tier table (unit 4 built the word and the
-    profile it describes).
-  - spec.md's stale capacity prose — design 36's second commit
-    LOCATED it and deliberately did not edit.
-  - spec.md §5c: `support.c` carries THREE permanent reasons now, not
-    two (design 38 added the linker-symbol accessor pair).
-  - promote `tier_word` to all three profiles (one runner line; this
-    unit holds the row authorization).
-  - the `thread_preempt` flake FIX: match the interleave against a
-    letters-only projection (strip `SOS:` lines) — the A/B interleave
-    IS asserted via substring adjacency and a tick landing between
-    the letters breaks it (design 35 As-built). Amend CLAUDE.md's
-    timing-rows paragraph in the same pass: it wrongly lists the
-    interleave among the unasserted rows; the tick COUNT and the
-    `interrupts=` column are the unasserted ones.
-  - ThreadState's stale pre-M3 generations comment; design 16's
-    future-shape paragraph.
-  - FROM THE C-LEG PROBE (`designs/039` As-built §7), four doc items,
-    located and deliberately not edited:
-    - `hal/riscv32/user/ABI.md` says "three scripts" in THREE places
-      and lists `root/child/child2`; design 36 added `child3.ld`, so
-      there are four. `hal/arm64/user/ABI.md`'s tier-split paragraph
-      repeats the same stale count.
-    - both `user/ABI.md`s' "Required of a process" is ONE bullet (the
-      entry register) where a crt0 author needs four: the kernel also
-      preloads the STACK POINTER with the region's `link_top()`,
-      zero-fills each segment's `mem_len` tail so `.bss` needs no
-      startup loop, places segments at their LINK addresses so `.data`
-      needs no copy, and enters with a ZERO link register so falling
-      off `_start` faults. The probe read all four out of
-      `kernel/core/` rather than out of the ABI documents.
-    - both ABI.md "altitude" tables offer typed C
-      (`sos_system_shutdown(h, 0)`) "for non-Saw languages" without
-      saying that those symbols are compiled from the `sos` SAW module,
-      which depends on `sosrt` — so the row is reachable only by an
-      image that is no longer a C image. DF-172i records the row has no
-      in-tree caller; the probe is the first non-Saw process and could
-      not use it.
-    - spec §5.7's vDSO discipline ("an op number is not ABI") holds for
-      Saw and not for C: `tests/c-child/sos.h` writes three op numbers
-      out of KERNEL-INTERNAL `kernel/abi/`, on
-      `tests/riscv32/payload_sosimg.S`'s precedent. Either the spec
-      qualifies the claim or design 31 part 1 discharges it.
-  - design 37's follow-on, recorded not built: row IDENTITY for a
-    general `top` (a per-row identity column, or an op resolving a
-    Process handle to its row).
-  - CANDIDATE, decided by the unit's own scope: design 33 findings
-    5/6 — the ten `sos_test_pool_base()` packages migrate onto
-    `Mapping.base()` (wants exactly the riscv32 row authorization
-    this unit holds) + `map_basics`' stale header. If declined, both
-    re-file to [BACKLOG] explicitly.
+  `designs/039`. **THE FOUR DOC ITEMS IT HANDED UNIT 8 ARE DONE**
+  (`designs/040` §4–§5): spec §5.7's vDSO claim is qualified for C,
+  both `user/ABI.md`s' "Required of a process" grew from one bullet to
+  five, the typed-C altitude row now records that it is unreachable by
+  an image not already linking `sos`, and the stale script count is
+  corrected in SIX places — two more than the probe had looked at.
+- M5 UNIT 8 — the docs sweep: **BUILT AND CLOSED (`designs/040`,
+  Sep 5). M5 CLOSES WITH IT.** Gate **382/382 = 129 + 129 + 124**;
+  every row that moved is enumerated in that design's §2 (four
+  classes, all caused by one deleted runner key: 256 denominator
+  changes, 8 of them index shifts, 2 new case rows, 2 new `.sosimg`
+  size rows, the totals pair — and NOT ONE existing image size moved,
+  on any profile; the flat section is byte-identical). The whole pile
+  landed; `designs/040` §4–§6 is the section-by-section record, and
+  three things in it are the lead's to see. **`tier_word` runs on all
+  three profiles.** **THE `thread_preempt` FLAKE HAD TWO CAUSES, NOT
+  ONE** — design 35's prescribed letters-only projection does NOT fix
+  the run design 35 recorded, because design 158's ordered matcher
+  advances past each whole match and that run's three crossings
+  OVERLAP; both halves are per-case keys now (`strip_kernel_lines`,
+  `overlapping_matches`), verified against the recorded transcript and
+  against the no-preemption control, and CLAUDE.md's timing-rows
+  paragraph is corrected. **TWO STALE ABI ASSERTS**, both design 33's,
+  both the species design 35 §7 fixed one unit earlier, found by a
+  mechanical audit and repaired. Design 37's row-identity follow-on is
+  RECORDED in spec §2's `Process` row, not built. The `pool_base`
+  CANDIDATE is DECLINED with reasons and re-filed to [BACKLOG] below.
 - M6 (after M5): the storage milestone — seed `designs/030` (user-
   ruled Sep 3): flash-first block driver, RO archive fs + a simple
   tmpfs (the write path, same protocol), userspace loader, the
@@ -106,6 +86,39 @@ entry below or the brief that carries it, never restating either.
   session at M6's close.
 
 ## [BACKLOG] — filed, not scheduled
+
+- **`sos_test_pool_base()` MIGRATES ONTO `Mapping.base()`, and
+  `map_basics`' header is corrected with it** [#33 findings 5/6,
+  RE-FILED BY M5 unit 8 after declining it — `designs/040` §7].
+  Eleven test packages read an address out of a per-triple C constant
+  whose arm64 body has, since design 33, returned a VIRTUAL address
+  under a name that says "pool base" — documented at length in
+  `tests/poolbase_arm64.c` and true only by the coincidence that every
+  process's first mapping lands at `0x4024_0000`. `Mapping.base()`
+  exists, asks the kernel, needs no build-time constant and is right
+  on every tier; `tests/map-placed` is the worked example. **DECLINED
+  BY UNIT 8 for four reasons, the second decisive**: (1) it is a code
+  migration in eleven programs, not a docs or harness edit, and unit
+  8's constraint was comments/docs/spec/harness; (2) **IT IS NOT A
+  MECHANICAL SUBSTITUTION** — `map-wx-refused` needs the address to
+  attempt a map that is REFUSED (so no Mapping exists to ask),
+  `child-touch` pokes an address in a CHILD holding no Mapping at all,
+  and `memory-recycle` does arithmetic with the pool LENGTH, which
+  `Mapping.base()` has no twin for; each wants its own answer and two
+  want a new way to learn an address; (3) folding ~24 moving
+  image-size rows into unit 8's diff would have made that unit's row
+  enumeration unreadable as two causes; (4) **the authorization
+  argument is answerable** — the rows it needs are riscv32 and flat
+  image-size rows, and ANY unit editing a shared test package moves
+  those, so this needs its own brief naming them rather than a rare
+  standing authorization. Scope when taken: the eleven packages, the
+  two `tests/poolbase_*.c` files (delete `sos_test_pool_base`, keep
+  `sos_test_pool_len` — a length is a length on any tier), and
+  `map_basics`' header, whose prose still describes a double map as
+  two rows over ONE address deciding by "the hardware's own matching
+  rule" — under placement they are two rows at two addresses and
+  nothing is aliased. The case passes and asserts the right value
+  today; only its explanation is of a machine arm64 no longer is.
 
 - **arm64 EL0 FP/SIMD is enabled and the trap frame saves no FP state
   — a LATENT SILENT-CORRUPTION hazard** [#39 As-built §7 K1, filed by

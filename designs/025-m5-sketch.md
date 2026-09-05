@@ -1,8 +1,11 @@
 # SawOS design 25 — M5 SKETCH: the memory milestone (agenda for the scoping session)
 
-**Status: RULED Sep 3 2026 (user, the scoping session — all eight
-agenda items; see "As ruled" at the end) — THE PLAN OF RECORD for
-M5.** Drafted the same day as the session, the design-10 pattern.
+**Status: RULED Sep 3 2026, and M5 IS COMPLETE at unit 8's integration
+(Sep 5 2026 — `designs/040`). See "M5 as it ran" at the very end for the
+ladder as executed, the gate at close, and what the plan got wrong.**
+Ruled by the user at the scoping session — all eight
+agenda items; see "As ruled" below — and THE PLAN OF RECORD for
+M5 throughout. Drafted the same day as the session, the design-10 pattern.
 **Anchor: `designs/019-m5-memory-story.md` (RULED Sep 2)**, carried
 whole and not reopened here: one idiom set (alloc → map → unmap)
 over three protection tiers, difference advertised never faked,
@@ -409,3 +412,81 @@ session pulls it in.
    real S-mode riscv target earning a HAL. The seam's cross-tier
    honesty check stays live — riscv32-virt exercises it as the MPU
    tier every gate run.
+
+---
+
+## M5 as it ran (closing note, written at unit 8's integration — Sep 5 2026)
+
+**STATUS: M5 COMPLETE.** Every rung of the ladder above landed behind an
+independent lead gate; `designs/040` is the closing unit and carries the
+formal M5-CLOSES statement. This note is the plan compared with the
+execution, which is what a sketch is worth reading again for.
+
+### The ladder as it actually ran
+
+| planned rung | ran as | design | note |
+|---|---|---|---|
+| unit 1 | unit 1 | `027` | as planned — byte-identical ambition met |
+| unit 1.5 | unit 1.5 | `029` | ruled in post-session (ruling 10) and executed as ruled |
+| unit 2 | unit 2 | `033` | as planned, arm64 only; ruling 9's transcript authorization spent |
+| unit 3 (Sv32) | **VACATED** | — | punted to backlog by ruling 11; the numbering stands |
+| unit 4 | unit 4 | `035` | as planned, plus SL-25 (a HAL seam value a profile may override cannot be a `static`) |
+| unit 5 | unit 5 | `028` | as planned; §5.9 / design 11 F2 answered, and CLOSED in prose by unit 8 |
+| unit 6 | unit 6 | `032` | as planned |
+| — | **unit 6a** | `034` | NOT in the plan: the satellite slabs (threads, pipes), which unit 6 discovered it had left behind |
+| unit 6b | unit 6b | `036` | the process-slot restructure D-6 warned might want its own rung. It did |
+| unit 7 | unit 7 | `037` | as planned, and it is the milestone's own demo |
+| seed 4 | the arena unit | `038` | slotted at convenience, as the plan allowed |
+| — | the C-leg probe | `039` | NOT in the plan: user-ruled Sep 4, out of the ladder, before unit 8 |
+| unit 8 | unit 8 | `040` | this docs sweep |
+
+Plus one rider that touched no rung: the `sosabi` module split (`026`,
+user-requested housekeeping, byte-identical transcripts).
+
+### The gate
+
+**238 → 382.** It started at 238 = 119 + 119 across two architectures and
+closes at **382 = 129 + 129 + 124** across THREE PROFILES — the shape change
+is unit 4's, and it is design 19's "one story, one test, sorted by tier"
+executed rather than restated. sawlang went from 0.5.0 to **0.8.0 @
+`449d2485`** across seven pin bumps, the last adopting `-Oz` on every
+freestanding build (kernel `.text` −37% at adoption). The ESP32-C3 board
+smoke ends the milestone at 3/3, non-gating as ever.
+
+### What the plan got wrong, and it is worth recording
+
+1. **D-6's "may want its own rung" was right, and understated.** The process
+   restructure was not just a rung: it turned out that a slab is one array
+   keyed by its slot, so every parallel `MAX_PROCESSES ×` table had to become
+   a FIELD of the process slot. `kcore.pslot` exists because of it.
+2. **THE PLAN HAD NO UNIT 6a.** Unit 6 converted "every kind except
+   processes" and discovered that threads and pipes have SATELLITE storage —
+   a thread's frame arena, a pipe's ten side tables — which the extent chain
+   does not reach by itself. That is a rung the sketch could not have seen
+   without unit 6 having run.
+3. **The tier-word unit's real finding was a LANGUAGE one** (SL-25): a build
+   profile is precisely a module that overrides part of another module's
+   seam, and a module-level `static` does not carry module identity — so a
+   HAL constant a profile may need to override cannot be a `static`. The
+   sketch priced the flat profile as packaging; it was packaging plus a
+   language wall.
+4. **The C-leg probe was not on any list**, and it paid for itself: it found
+   that spec §5.7's vDSO discipline holds for Saw and not for C, that the
+   typed-C altitude is unreachable by an image that is not already a Saw
+   image, and that `hal/*/user/ABI.md`'s "Required of a process" was one
+   bullet where a crt0 author needs five. All three are fixed by unit 8.
+5. **Ruling 4's tier-2 floor number is still deferred**, exactly as ruled —
+   no in-tree target consumes it yet. It carries into M6 unchanged.
+6. **`map`'s "no VA hint on any tier" (ruling 1) never came under pressure.**
+   Placement landed and no caller wanted an opinion; `Mapping.base()` is the
+   whole of what programs needed instead.
+
+### What M5 hands to M6
+
+`designs/030-m6-storage-seed.md` is the anchor and nothing here amends it.
+The standing tail came out of the milestone unchanged except where a ruling
+moved it: riscv32 Sv32 is in the backlog with a named revisit trigger
+(ruling 11), and the arm64 EL0 FP/SIMD hazard (`designs/039` §7 K1) was
+filed to the backlog by the lead at design 39's integration — recommended as
+its own small unit or M6 scoping's first housekeeping item, explicitly NOT
+unit 8's, because a kernel behaviour change is not a docs sweep's to take.
