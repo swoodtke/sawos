@@ -135,10 +135,22 @@ public(package) func frame_slot(index: Int) unsafe -> UInt {
 ///
 /// `Exited` is a state a slot STAYS IN rather than a transition to `Free`,
 /// because a join arriving after the exit must still find the exit code. The
-/// slot returns to the pool at process teardown; reaping it earlier needs a
-/// handle-close op, which M2 does not have — and without close, no slot is ever
-/// reused, which is also why handles carry no generation yet (§3's
-/// stale-handle detection has nothing to detect until a slot can be reused).
+/// slot returns to the pool at PROCESS TEARDOWN and at no earlier moment —
+/// `end_process` holds the one loop that ever writes `Free` — and that is a
+/// ruling rather than a gap: a Thread carries no reference count on purpose (sawos
+/// design 7 D-1, argued at `ThreadSlot` below), because the join/exit protocol
+/// already owns the slot's lifetime on terms a handle count cannot express.
+/// `RELEASE_OP` therefore destroys a Thread HANDLE and never a thread; reaping
+/// a slot earlier would want a close op, which does not exist for any kind.
+///
+/// **THIS PARAGRAPH USED TO END "…which is also why handles carry no generation
+/// yet", AND THAT HAS BEEN FALSE SINCE M3.** Handle words have carried an
+/// index/generation split since sawos design 3 D-1 (`kernel/abi/`'s
+/// `HANDLE_INDEX_BITS`), every countable kind's slot is reused, and §3's
+/// stale-handle detection has had plenty to detect ever since — including for
+/// Thread handles, whose slots outlive nothing but are freed wholesale at a
+/// teardown and handed to the next process. The state machine's own shape is
+/// unchanged; only the pre-M3 reason attached to it was.
 public(package) enum ThreadState: UInt8 {
     case Free = 0,
     case Created = 1,
