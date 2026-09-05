@@ -75,6 +75,7 @@ stdin, and `main`'s eager `tc()`.
 import argparse
 import concurrent.futures
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1399,8 +1400,36 @@ TEST_CASES = [
         # in user mode, so it is the one place the column has something to show —
         # every alternation above is one of them. The row is NOT in the list
         # below, deliberately: a tick lands where the host puts it, so asserting
-        # the number would be asserting the weather. It joins the two
-        # timing-dependent rows this case already carries.
+        # the number would be asserting the weather. The tick COUNT is the other
+        # unasserted thing here, and for the same reason.
+        #
+        # **THE FLAKE, AND IT HAD TWO CAUSES RATHER THAN ONE** (M5 unit 8, fixing
+        # what design 35 §7a recorded). The three claims below are ADJACENCY
+        # claims, and the run that failed interleaved `A×7, B, A, B×7` — three
+        # crossings, exactly what the case means to prove. Neither half of the
+        # matcher could see it:
+        #
+        #   1. The kernel's own `SOS: timer tick …` lines go into the same serial
+        #      stream the workers write letters into, and one landed between the
+        #      `B` and the `A`, so no adjacent `BA` existed. `strip_kernel_lines`
+        #      matches against the letters-only projection instead. Nothing this
+        #      case expects begins `SOS: `, so the projection drops the narration
+        #      and keeps every claim.
+        #   2. **AND EVEN ON A CLEAN STREAM THAT RUN COULD NOT MATCH**, which
+        #      design 35's one-line prescription did not anticipate: the three
+        #      crossings are CONSECUTIVE (`…AB` at 6, `BA` at 7, `AB` at 8), and
+        #      the ordered matcher advanced the cursor past each whole match, so
+        #      finding `AB` at 6 put the cursor at 8 and stepped over the `BA`.
+        #      The case's real claim was therefore "five-ish crossings, arranged
+        #      so as not to overlap" rather than the three it says.
+        #      `overlapping_matches` advances by one character, which is what
+        #      "three DIRECTION CHANGES" means when written as adjacent pairs.
+        #
+        # Both were verified against the transcript design 35 recorded: with only
+        # the strip it still fails; with both it passes; and the no-preemption
+        # control `AAAAAAAABBBBBBBB` still fails, which is the claim's other end.
+        "strip_kernel_lines": True,
+        "overlapping_matches": True,
         "expect_out": ["SOS M2: preemptive kernel up on",
                        "AB", "BA", "AB",
                        "SOS preempt: joined a=33 b=44"],
@@ -5005,23 +5034,23 @@ TEST_CASES = [
         # answer; then the ask is made through a handle minted WITHOUT the right
         # and the kernel ends the process.
         #
-        # **FLAT-ONLY, AND THE `arches` KEY IS A TRANSCRIPT FENCE RATHER THAN A
-        # CLAIM ABOUT THE CASE.** This case is meaningful on all three profiles
-        # and would pass on all three — `{tier}` substitutes `Isolated` on the
-        # two protected ones — but design 35 requires the riscv32 and arm64
-        # sections to stay BYTE-IDENTICAL to the pre-unit baseline, and a case
-        # added to their lists moves every `[i/N]` row in both by changing N.
-        # So the word's ISOLATED answer is witnessed by a probe recorded in
-        # design 35's As-built rather than by the gate, and promoting this case
-        # to all three profiles is queued for the unit that next holds an
-        # authorization to move those rows (unit 8, the M5 docs sweep).
+        # **IT RUNS ON ALL THREE PROFILES, AND THAT IS THE POINT OF IT** (promoted
+        # by M5 unit 8, which holds the row authorization design 35 was waiting
+        # for). The case landed FLAT-ONLY, not because the isolated tiers had
+        # nothing to prove but because design 35's gate required the riscv32 and
+        # arm64 sections to stay byte-identical and a case added to their lists
+        # moves every `[i/N]` row in both by changing N. Its Isolated answer was
+        # witnessed by a probe recorded in that unit's As-built instead — which is
+        # a weaker thing than a gate row, since a probe is run once and a gate row
+        # is run every time. `{tier}` substitutes `Isolated` on the two protected
+        # profiles and `Flat` here, so the ONE case checks the runner's tier table
+        # against the HAL that implements it on every profile the suite has.
         #
-        # It is APPENDED, per the convention this file states above: the report
-        # prints in case-definition order, so a case added at the END leaves
-        # every existing case's ordinal where a reader of an older transcript
-        # left it.
+        # It is NOT the last case in this table, so promoting it shifted the four
+        # cases below it by one on the two isolated profiles. That is the cost of
+        # putting a case where its milestone's unit put it rather than at the end,
+        # and it is paid once.
         "name": "tier_word",
-        "arches": ["riscv32-flat"],
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": TIER_WORD_PKG,
         "expect_out": ["{banner}",
@@ -5033,12 +5062,14 @@ TEST_CASES = [
                        "SOS tier: {tier}",
                        "SOS tier: stable",
                        "SOS tier: kernel boundary intact",
-                       # AND THE BOUNDARY, ON THE FLAT TIER. A right is not
-                       # tiered: the sibling minted without `TierGet` is refused
-                       # here exactly as it would be on hardware that can deny,
+                       # AND THE BOUNDARY, ON EVERY TIER. A right is not tiered:
+                       # the sibling minted without `TierGet` is refused on the
+                       # flat profile exactly as it is on hardware that can deny,
                        # because this refusal is the KERNEL's and not the
                        # platform's. It is the positive statement of what the
-                       # tier word does NOT disclaim.
+                       # tier word does NOT disclaim, and asserting it on all
+                       # three profiles is what makes it a statement rather than
+                       # a hope — the same row, the same reason, three machines.
                        "SOS: process fault: access denied process={zero}",
                        "SOS: process teardown handles="],
         "expect_clean_exit": False,
@@ -5895,12 +5926,46 @@ def _run_qemu(qemu, arch, elf, feed=None):
         return None, out, True
 
 
+# THE LETTERS-ONLY PROJECTION (sawos design 35 §7a, fixed by M5 unit 8).
+#
+# The kernel and a user process share ONE serial port with no locking, so the
+# kernel's own narration lands INSIDE a process's byte stream. That is harmless
+# for a case asserting a line, and it is fatal for a case asserting ADJACENCY:
+# `thread_preempt` claims the processor crossed between two threads by matching
+# `AB`, `BA`, `AB` as ordered substrings, and a `SOS: timer tick …` line landing
+# between the `B` and the `A` breaks the match on a run that demonstrated the
+# property perfectly. Design 35 caught exactly that (365/366, once).
+#
+# So a case may ask to be matched against the output with the KERNEL'S OWN LINES
+# REMOVED. The removal is exact rather than approximate: the kernel writes a
+# diagnostic line from inside a trap handler, start to newline, with no
+# preemption point in it, so `SOS: …\n` always appears WHOLE and never has a
+# user byte inside it — it is the USER's stream that gets split, which is the
+# thing being repaired. What is left is the process's bytes in the order the
+# process wrote them.
+#
+# It changes what the harness MATCHES and nothing about what the kernel PRINTS,
+# so no transcript row moves for it. Only `thread_preempt` asks for it, and any
+# case that does must not expect a line beginning `SOS: ` — that is the whole
+# rule, and it is checked by reading the case's own list.
+_KERNEL_DIAGNOSTIC_LINE = re.compile(r"SOS: [^\r\n]*(?:\r?\n)?")
+
+
+def _strip_kernel_diagnostics(out):
+    return _KERNEL_DIAGNOSTIC_LINE.sub("", out)
+
+
 def _check(case, arch, status, out, timed_out):
     """Return (ok, reason). Validates console output and exit expectations."""
     if timed_out:
         return False, f"QEMU hung (> {QEMU_TIMEOUT_S}s) — no clean exit"
     if isinstance(out, bytes):
         out = out.decode(errors="replace")
+    # The RAW output is what a failure reports, always: a reader diagnosing a
+    # red row needs the console as the machine wrote it, ticks included.
+    hay = out
+    if case.get("strip_kernel_lines"):
+        hay = _strip_kernel_diagnostics(out)
     expected = case["expect_out"]
     if expected is not None:
         # A single substring or a list of them — one boot can assert several
@@ -5913,15 +5978,23 @@ def _check(case, arch, status, out, timed_out):
         # like the task dump is asserting that the dump comes AFTER the panic
         # line, which an unordered `in` cannot see. Every list already reads in
         # output order, so this only adds what they were already claiming.
+        # **AND A CASE MAY ASK FOR OVERLAPPING MATCHES** (M5 unit 8) — the cursor
+        # then advances by ONE character instead of past the whole match, so the
+        # next expectation may begin inside the previous one. The default stays
+        # non-overlapping and that is right for every case asserting LINES: two
+        # expectations must not be satisfied by one line. It is wrong for the one
+        # case asserting ADJACENT PAIRS, where three crossings can be consecutive
+        # — see `thread_preempt`, whose claim is unmatchable without it.
+        step_one = case.get("overlapping_matches", False)
         cursor = 0
         for want in expected:
             want = want.format(**fmt)
-            at = out.find(want, cursor)
+            at = hay.find(want, cursor)
             if at < 0:
-                where = "out of order" if want in out else "missing"
+                where = "out of order" if want in hay else "missing"
                 return False, (f"{where} expected output {want!r} "
                                f"(got {out!r})")
-            cursor = at + len(want)
+            cursor = at + (1 if step_one else len(want))
     if case["expect_clean_exit"]:
         if status != 0:
             return False, f"expected clean exit (0), got status {status}"

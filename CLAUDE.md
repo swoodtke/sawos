@@ -21,7 +21,12 @@ hal/riscv32-common/  # SPLIT ARCH/BOARD since design 23 — the ARCH half both
                    # + user/ (the ecall stub); see its README.md
 hal/riscv32/       # the riscv32 `virt` BOARD: kernel/ (boot.S, lib.saw =
                    # the `hal` facade re-exporting rv32core, virt.ld, ABI.md)
-                   # + user/ (root.ld, child*.ld, ABI.md)
+                   # + user/ (root.ld, child.ld/child2.ld/child3.ld, ABI.md
+                   # — one script per resident image, the tier-2 cost)
+hal/riscv32-flat/  # the FLAT BUILD PROFILE of that board (design 35): 250
+                   # lines of facade, NOT a fork — it re-exports rv32core and
+                   # the virt board (mapped a second time as `rv32virt`) and
+                   # overrides the protection seam. THE THIRD GATE RUN
 hal/riscv32-esp32c3/ # the ESP32-C3 BOARD, same shape (design 20) — reached
                    # only by `make sos-smoke-esp32c3`, never by sos-test
 rt/common/         # `sosrt`: the SOS runtime, arch-free + role-free Saw
@@ -46,8 +51,14 @@ rigorously — the check is version-only (D-b2's documented asymmetry).
 ## Testing
 ```bash
 make sos-test        # tools/sos_runner.py: builds kernel AND root, stitches
-                     # them, boots both arches under QEMU. THE gate.
+                     # them, boots THREE PROFILES under QEMU — riscv32,
+                     # arm64, and riscv32-flat (design 35). THE gate.
 ```
+At M5's close the gate is **382 = 129 + 129 + 124**. The flat profile runs
+four fewer cases, each excluded BY NAME with its reason printed above the
+rows, because each asserts a HARDWARE denial the tier disclaims — no silent
+skips (the no-silent-caps doctrine).
+
 Every change gates on `make sos-test` before commit. The acceptance oracle
 tradition: diff the console transcript, don't just read "green"
 (sawlang#238 unit 0).
@@ -61,14 +72,25 @@ P-cores, six E-cores; the parallelism tracks the P-cores). The report is
 printed in case-definition order whatever the completion order, so a
 transcript diff reads the same as it always did. `-j 1` is the serial
 harness, kept reachable for exactly that comparison. THREE CASES CARRY
-TIMING-DEPENDENT ROWS that move run to run in EITHER mode and that no
-assertion reads: `thread_preempt`'s A/B interleave, its `timer tick`
-lines and its `interrupts=` count; `timer_interval`'s `fires=` counters;
-and `process_stats`' `interrupts=` count (design 16 — the column is
-printed and never asserted, because a tick lands where the host puts it;
-it happens to read 0 there today, since root takes no tick in user mode
+TIMING-DEPENDENT CONSOLE OUTPUT that moves run to run in EITHER mode and
+that NO ASSERTION READS: `thread_preempt`'s `SOS: timer tick` lines and
+its `interrupts=` count; `timer_interval`'s `fires=` counters; and
+`process_stats`' `interrupts=` count (design 16 — the column is printed
+and never asserted, because a tick lands where the host puts it; it
+happens to read 0 there today, since root takes no tick in user mode
 over so short a run, and a value that is not 0 is not a finding).
-Anything else moving in a transcript diff is a real finding.
+**`thread_preempt`'s A/B INTERLEAVE IS NOT ON THAT LIST — it IS asserted**
+(design 35 §7a's correction of this paragraph, fixed by M5 unit 8): the
+case matches `AB`, `BA`, `AB` as ordered ADJACENT PAIRS, which is "the
+processor crossed between the two threads at least three times, whoever
+went first". It is matched against the letters-only projection of the
+console (the kernel's own `SOS: ` lines stripped, since they land inside
+the workers' byte stream) and with overlapping matches (three crossings
+can be consecutive) — `strip_kernel_lines` and `overlapping_matches` on
+that case, both documented at the site. None of the above appears in the
+transcript at all on a passing run: the report prints case rows, image
+sizes and totals, so a console line only reaches the screen when a case
+goes red. Anything moving in a transcript diff is a real finding.
 
 ## The suite lock (machine-wide, sawos's own)
 QEMU-suite invocations serialize through a mkdir lock at
