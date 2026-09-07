@@ -1,5 +1,5 @@
 ---
-{"assignee":"","author":"agent:codex-todo-import","body_bytes":2100,"created":"1788791279","id":"SO-2","labels":["todo-import","queued","design","plan","design-proposal"],"priority":"normal","project":"SO","revision":1,"sequence":2,"status":"open","title":"Scope M7 POSIX compatibility with toybox and posix_spawn","updated":"1788791279"}
+{"assignee":"","author":"agent:codex-todo-import","body_bytes":2279,"created":"1788791279","id":"SO-2","labels":["todo-import","queued","design","plan","design-proposal"],"priority":"normal","project":"SO","revision":2,"sequence":18,"status":"open","title":"Scope M7 POSIX compatibility with toybox and posix_spawn","updated":"1788791308"}
 ---
 
 
@@ -25,6 +25,12 @@ Scheduling: retain the source’s queue order and prerequisites; seed/scoping ta
 - [ ] The M6 dependency, minimal libc surface and spawn/fd authority model are explicit.
 - [ ] The plan includes a measured utility build/run prototype on both target architectures and a decision on native shell versus toysh.
 - [ ] Unruled tty and job-control scope is not silently included in implementation.
+
+## Related tracker work
+
+These are related findings/plans; a reference alone does not imply a blocking dependency.
+
+- SO-1 — Scope M6 storage, namespace, loader and UART shell
 
 ## Existing design references
 
