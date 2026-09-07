@@ -1,0 +1,53 @@
+---
+{"assignee":"","author":"agent:codex-todo-import","body_bytes":2559,"created":"1788791280","id":"SO-5","labels":["todo-import","backlog","deferred","design","plan","design-proposal"],"priority":"low","project":"SO","revision":1,"sequence":5,"status":"open","title":"Revisit Sv32 only when a real supervisor-mode RISC-V target needs it","updated":"1788791280"}
+---
+
+
+## Description
+
+## Scope and status
+
+Revisit Sv32 only when a real supervisor-mode RISC-V target needs it
+
+Imported from repository TODO records on 2026-09-07. The reporter/version, evidence, workarounds and prior rulings are preserved in the source context below. This import is not a fresh reproduction or approval of a proposed design.
+
+Scheduling: retain the source’s deferral or revisit trigger.
+
+## Proposed plan
+
+1. Reconcile the linked brief and recorded rulings with current consumers. Keep already-landed behavior and stated deferrals explicit.
+2. Draft the remaining contract: supported syntax/API, ownership and failure behavior, alternatives, compatibility effects and the exact questions still requiring a decision.
+3. Define small implementation units and consumer migrations, then specify the positive, negative and boundary tests before dispatch.
+4. Name any permitted transcript/image-size changes before implementation and validate the affected riscv32/arm64 QEMU cases; preserve capability attenuation and failure behavior.
+
+## Acceptance criteria
+
+- [ ] The design names a concrete consumer or retains its recorded revisit trigger.
+- [ ] Existing rulings are preserved; unresolved choices and a recommended option are explicit.
+- [ ] The proposed API/semantics, migration scope and acceptance tests are reviewable. Drafting this plan does not mark an unruled design approved.
+
+## Existing design references
+
+- [sawos/designs/025-m5-sketch.md](https://github.com/swoodtke/sawos/blob/754ec9570aef54609820cc7e28457c7623547670/designs/025-m5-sketch.md)
+- [sawos/designs/029-higher-half.md](https://github.com/swoodtke/sawos/blob/754ec9570aef54609820cc7e28457c7623547670/designs/029-higher-half.md)
+
+## Source context
+
+Historical closed subcases are context, not new work. Legacy DF/SL/SO numbers use a nonbreaking hyphen here to avoid accidental tracker links; the linked source retains the original spelling.
+
+### sawos TODO lines 89–97
+
+[Original record](https://github.com/swoodtke/sawos/blob/754ec9570aef54609820cc7e28457c7623547670/designs/todo.md#L89-L97)
+
+- riscv32 Sv32 tier-1 climb — PUNTED from M5 [`designs/025` ruling
+  11, user, Sep 3]: 32-bit VA scarcity makes placement a genuinely
+  different design (careful fitting vs 64-bit's space-for-tables
+  trade); no in-tree hardware target wants Sv32 (C3/P4 are M+U); a
+  future riscv MMU target is likelier rv64/Sv39, inheriting the
+  64-bit shape. Revisit trigger: a real S-mode riscv target earning
+  a HAL. Design 029 carries the Sv32-stays-identity linmap note for
+  whoever picks it up.
+
+
+## Comments
+
