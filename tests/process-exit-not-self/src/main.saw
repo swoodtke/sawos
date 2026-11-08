@@ -1,0 +1,63 @@
+// `Process.exit` is self-only: through another process's handle it faults the
+// caller.
+//
+// Root creates a child and starts it, then calls `exit` on the child's Process
+// handle. The handle carries `ProcessRight.Exit`, so the rights check passes
+// and the target check is what refuses.
+//
+//   SOS exitnotself: started
+//   SOS: process fault: not the caller process=0
+//   SOS: process teardown ... process=0
+//
+// It is a fault and not a status because the caller could have known: the
+// handle names a process other than itself. The child is not ended by the call;
+// root's death stops the machine (process 0 is init; spec §8), so which child
+// image is appended is immaterial and the case reuses `child-fault`.
+
+import sos.{System}
+
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS exitnotself: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    var image = try proc.boot_handle_next() catch {
+        print("SOS exitnotself: no image region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var dest = try proc.boot_handle_next() catch {
+        print("SOS exitnotself: no destination region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let image_mem = image.take_memory()!
+    let dest_mem = dest.take_memory()!
+
+    let child = try system.process_create(image: &image_mem,
+                                          memory: &dest_mem) catch {
+        print("SOS exitnotself: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try child.start() catch {
+        print("SOS exitnotself: start failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS exitnotself: started\n")
+
+    // Not the caller's own handle. This does not return.
+    let _ = child.exit(0)
+
+    let _ = system.debug_print("SOS exitnotself: survived, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

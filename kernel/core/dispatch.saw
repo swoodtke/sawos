@@ -550,11 +550,16 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             op_value(handle)
         },
         // Process exit belongs here, not on the System object (spec §5.7).
-        // Every thread of the process goes with it (§8's teardown is
-        // unconditional), so this never returns.
+        // It ends the calling process only: a handle naming any other process
+        // faults the caller (`NotSelf`), since there is no kill. Every thread
+        // of the process goes with it (§8's teardown is unconditional), so
+        // this never returns.
         case Exit -> {
             if not obj.allows(ProcessRight.Exit) {
                 fault_process(p, FaultReason.AccessDenied)
+            }
+            if obj.slot != p {
+                fault_process(p, FaultReason.NotSelf)
             }
             // `end_process` does not return, so this arm diverges and owes the
             // `match` no value.

@@ -1044,9 +1044,9 @@ lifecycle is §8 and its boot set is §12.
 `Give`, and `Stats`. `ProcessRight.Map` is the target-side right `MemoryOp.Map`
 and `IoMemoryOp.Map` spend (§2.5). Creation is not an op on this object:
 `ProcessCreate` is on System, because a process is a machine-wide resource
-(§12). `Exit` ends the calling process; not yet enforced: the kernel does not
-check the target, so `Exit` through another process's handle ends that process
-and strands the caller's thread. `kill` has no op and no right (§8).
+(§12). `Exit` ends the calling process only: through a handle naming another
+process the kernel faults the caller (`NotSelf`). `kill` has no op and no right
+(§8).
 
 **The default set.** One Process default set serves all three minters (root's,
 `ProcessSelf`'s and `ProcessCreate`'s), named for its ops throughout:
@@ -1212,7 +1212,7 @@ a whole.
 | `StatsRegionMap` | `SystemRight.StatsRegionMap` | maps the trap-counter page read-only, on the isolated tiers (§2.7) |
 
 - **`exit` is not here**: process exit is `ProcessOp.Exit`, which ends the
-  calling process (not yet enforced: §2.7).
+  calling process, and faults a caller whose handle names another (§2.7).
 - **`process_self` is §3's derivation rule made real.** The boot register
   stays one handle wide, and a process obtains its Process object through the
   System handle rather than being handed it. Strip `SystemRight.ProcessSelf`
@@ -2305,11 +2305,10 @@ dead process's table and not in its creator's — or be woken by the death
 reaches back down into the copy doors; so the copy doors report a bad buffer,
 and the callers above the switch point terminate on it.
 
-**`process.kill()` has neither op nor right** (not yet enforced: `Exit` through
-another process's handle ends that process and strands the caller's thread,
-§2.7). It is specified below; what it waits on is a ruling about what killing a
-process that is not the caller does to a scheduler that may be running its
-thread.
+**`process.kill()` has neither op nor right** (`Exit` through another
+process's handle faults the caller, §2.7). It is specified below; what it
+waits on is a ruling about what killing a process that is not the caller does
+to a scheduler that may be running its thread.
 
 **What is built.** The fault rule, whole. `get_status` as
 `ProcessOp.GetStatus`, gated on `ProcessRight.Wait`, answering the one
@@ -2651,9 +2650,9 @@ loader parses and reports while no Process slot stores either.
 
 - **Priorities and the band map** (§7). The scheduler is one round-robin FIFO.
 - **Thread waitability, and `kill`** (§8). Attaching a thread is a `NotWaitable`
-  fault; `kill` has no op and no right (but see the known limits below on
-  `Exit`). A supervisor learns a child died by reading `get_status` through the
-  handle it holds, or by being woken through an attachment on the same handle.
+  fault; `kill` has no op and no right. A supervisor learns a child died by
+  reading `get_status` through the handle it holds, or by being woken through an
+  attachment on the same handle.
 - **`IntrSpinLock` and SMP** (§9b, §7). A preemption point is the assertion
   that state is consistent, so nothing yet has a critical section for the type
   to protect.
@@ -2690,8 +2689,6 @@ loader parses and reports while no Process slot stores either.
 
 **Known limits.**
 
-- `Exit` is not yet confined to the caller: through another process's handle it
-  ends that process and strands the caller's thread (§2.7).
 - `Process.give` does not yet hand the object back on a status refusal: the
   capability stays in the giver's table with no wrapper naming it (§3).
 - The factory ops `ThreadCreate`, `EventCreate`, `WaiterCreate`, `InterruptBind`

@@ -226,6 +226,7 @@ GIVE_BOOT_DRAIN_PKG = os.path.join(TESTS_DIR, "give-boot-drain")
 GIVE_DUPLICATE_TAG_PKG = os.path.join(TESTS_DIR, "give-duplicate-tag")
 GIVE_AFTER_START_PKG = os.path.join(TESTS_DIR, "give-after-start")
 GIVE_NO_TRANSFER_PKG = os.path.join(TESTS_DIR, "give-no-transfer")
+PROCESS_EXIT_NOT_SELF_PKG = os.path.join(TESTS_DIR, "process-exit-not-self")
 START_BAD_TAG_PKG = os.path.join(TESTS_DIR, "start-bad-tag")
 GIVE_WORD_DEAD_PKG = os.path.join(TESTS_DIR, "give-word-dead")
 MINT_REVOKED_PKG = os.path.join(TESTS_DIR, "mint-revoked")
@@ -2261,6 +2262,22 @@ TEST_CASES = [
                        "SOS giveafter: started",
                        "SOS: process fault: object in the wrong state "
                        "process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # `Process.exit` is self-only. Root holds its child's Process handle,
+        # which carries `ProcessRight.Exit`, so the rights check passes and the
+        # target check refuses: a fault on the caller, the way `ThreadOp.Exit`
+        # refuses a thread that is not the caller's own.
+        "name": "process_exit_not_self",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PROCESS_EXIT_NOT_SELF_PKG,
+        "children": [CHILD_FAULT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS exitnotself: started",
+                       "SOS: process fault: not the caller process={zero}",
                        "SOS: process teardown handles="],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
