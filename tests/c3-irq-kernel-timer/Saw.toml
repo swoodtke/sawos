@@ -1,0 +1,35 @@
+[package]
+name = "c3-irq-kernel-timer"
+version = "0.1.0"
+
+# This image carries its own `__saw_rt_*` seams, from the `sosrt` module its
+# `sos` dependency pulls in; see root/Saw.toml.
+runtime = true
+
+# The `irq_timer_source_refused` smoke case: binding the matrix source the
+# kernel routes to its tick faults the caller.
+#
+# This is a separate package from the virt cases for the reason `c3-timer`
+# gives: a package names its linker script by target triple, and the C3 uses
+# the same triple as virt.
+[dependencies]
+sos = { path = "../../kernel/sysapi" }
+
+[sos]
+emit = "sosimg"
+priorities = { background = 0, low = 1, normal = 1, high = 1 }
+
+[sos.riscv32-unknown-none-elf]
+linker-script = "../../hal/riscv32-esp32c3/user/root.ld"
+native = "../../hal/riscv32-common/user/syscall.c ../../rt/common_c/support.c"
+
+# Userspace half of the no-A build spelling (hal/riscv32-esp32c3/ABI.md §3).
+# Blade's default for a riscv32 triple is the virt Profile A baseline
+# (`rv32imac_zicsr`, `+m,+a,+c`), and the ESP32-C3 has no A extension, so all
+# three keys are restated here. Without them the image links `amo*`/`lr`/`sc`
+# instructions the part cannot execute, and nothing catches it: the emulator's
+# CPU model advertises A (ABI.md §3a), so the wrong build runs green there and
+# faults on silicon.
+march = "rv32imc_zicsr_zifencei"
+mabi = "ilp32"
+target-features = "+m,+c"

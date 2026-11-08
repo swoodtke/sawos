@@ -6131,6 +6131,14 @@ def main():
                            "SOS c3iso: done",
                            "SOS-C3: halt pass"],
             },
+            {
+                "name": "irq_timer_source_refused",
+                "root_pkg": os.path.join(TESTS_DIR, "c3-irq-kernel-timer"),
+                "children": [],
+                "expect": [C3_ROM, C3_BANNER,
+                           "SOS c3irq: binding the kernel timer's source",
+                           "SOS: process fault: argument outside its domain"],
+            },
         ]
 
         print(f"{BOLD}SOS ESP32-C3 board smoke{RESET} (NON-GATING)")
