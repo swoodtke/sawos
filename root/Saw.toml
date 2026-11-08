@@ -2,41 +2,39 @@
 name = "sos-root"
 version = "0.1.0"
 
-# design 149 + 172 part 2: this image CARRIES ITS OWN RUNTIME. The four frozen
-# `__saw_rt_*` seams and the arena behind them come from the `sosrt` dependency
-# below, and a package build compiles its whole module graph into one unit — so
-# this compile is where those definitions land, and it is the compile that has
-# to say so. Blade passes `--runtime-provider`, which permits the exports,
-# checks each signature against sawc/rt/ABI.md, and links no runtime of ours
-# beside it. There is no host runtime to link here in any case; what the key
-# buys is the ABI check.
+# This image carries its own runtime. The `__saw_rt_*` seams and the arena
+# behind them come from `sosrt`, which arrives through the `sos` dependency
+# below, and a package build compiles its whole module graph into one unit, so
+# this compile is where those definitions land. Blade passes `--runtime`, which
+# permits the exports, checks each signature against sawlang's runtime/ABI.md,
+# and links no runtime beside it. There is no host runtime to link here in any
+# case; what the key buys is the ABI check.
 runtime = true
 
-# The SOS root server is a freestanding process image, not a host binary:
-# `blade build --target <triple>` compiles it with `--freestanding`, links it at
-# its fixed load address with that profile's linker script, and emits a flat
-# sosimg the kernel can walk. See sos/spec.md §6 (boot protocol), §7 (priority
-# bands), §12 (root server).
+# The SOS root server is a freestanding process image, not a host binary: `blade
+# build --target <triple>` compiles it with `--freestanding`, links it at its
+# fixed load address with that profile's linker script, and emits a flat sosimg
+# the kernel can walk. See spec.md §5.6 (boot protocol), §7 (priority bands),
+# §12 (root server).
 [dependencies]
-# The kernel's exported userspace API (sos/spec.md §5.7): typed wrappers over
-# the syscall surface, owned by the kernel package so the op numbers stay
-# inside it. This is the ONLY thing root needs to talk to the kernel.
+# The kernel's exported userspace API (spec.md §5.7): typed wrappers over the
+# syscall surface, owned by the kernel package so the op numbers stay inside it.
+# It is root's only dependency.
 sos = { path = "../kernel/sysapi" }
 
-# What is true of the PROGRAM, whichever machine it is built for.
+# What is true of the program, whichever machine it is built for.
 [sos]
 emit = "sosimg"
 
-# spec §7: a REQUEST, not authority. The kernel applies root's map verbatim
-# because it parses root's image anyway and root is trusted by construction;
-# for every later process the launcher may honor, clamp, or override it.
+# The image's priority map (spec.md §7): a request, not authority. The loader
+# parses and reports it; per spec.md §7 nothing enforces it.
 priorities = { background = 0, low = 1, normal = 1, high = 1 }
 
-# What is true of the MACHINE. Root's own sources name no architecture —
-# everything that does is reached through the HAL, which is why both of these
-# sections point into `sos/hal/<arch>/user/` and `src/` is identical for both.
-# `blade build --target <triple>` picks one; a triple with no section here is a
-# refusal naming the ones there are, never a build for something else.
+# What is true of the machine. Root's own sources name no architecture;
+# everything that does is reached through the HAL, so both sections point into
+# the HAL's `user/` directories and `src/` is identical for both. `blade build
+# --target <triple>` picks one; a triple with no section here is refused with an
+# error naming the ones there are, never built as something else.
 [sos.riscv32-unknown-none-elf]
 linker-script = "../hal/riscv32/user/root.ld"
 native = "../hal/riscv32-common/user/syscall.c ../rt/common_c/support.c"

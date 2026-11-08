@@ -2,22 +2,20 @@
 name = "child-fault"
 version = "0.1.0"
 
-# Same reason as sos/root's: this image carries its own `__saw_rt_*` seams, out
-# of the `sosrt` module its `sos` dependency pulls in. See that manifest.
+# This image carries its own `__saw_rt_*` seams, from the `sosrt` module its
+# `sos` dependency pulls in; see root/Saw.toml.
 runtime = true
 
-# A CHILD PROCESS (sawos design 2) — the first image in SOS that the KERNEL does
-# not load at boot. It is built exactly as root is and linked at a DIFFERENT
-# base (`child.ld`), because under the no-translation contract every process
-# shares one physical address space and two images cannot occupy one range.
+# A child process, built exactly as root is. On riscv32 it is linked at a
+# different base (`child.ld`), because that profile does not translate: every
+# process shares one physical address space and two images cannot occupy one
+# range. arm64 links it with `user.ld`.
 #
-# IT HOLDS NO HANDLES, and that is what it is for. `start()` hands its first
-# thread `NO_HANDLE` in the argument register (unit 3's `give` is what changes
-# that), so this process cannot print, cannot exit and cannot make a syscall
-# that resolves — the ruled "legal-but-doomed" sandboxed compute process. What
-# it does is TRY, which is how it dies: a syscall on handle 0 is a `BadHandle`
-# fault, and the kernel's report is this case's evidence that a child died
-# without taking the machine with it.
+# It holds no handles. `start()` hands its first thread `NO_HANDLE` in the
+# argument register, so this process cannot print, cannot exit and cannot make a
+# syscall that resolves: a sandboxed compute process that can only try, and a
+# syscall on handle 0 is a `BadHandle` fault. The kernel's report of that fault
+# is the case's evidence that a child died without taking the machine down.
 [dependencies]
 sos = { path = "../../kernel/sysapi" }
 

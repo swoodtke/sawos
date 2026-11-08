@@ -2,19 +2,19 @@
 name = "uart-echo-ns16550"
 version = "0.1.0"
 
-# Same reason as sos/root's: this image carries its own `__saw_rt_*` seams, out
-# of the `sosrt` module its `sos` dependency pulls in. See that manifest.
+# This image carries its own `__saw_rt_*` seams, from the `sosrt` module its
+# `sos` dependency pulls in; see root/Saw.toml.
 runtime = true
 
-# THE USERSPACE UART ECHO DRIVER (design 178 option A's proof), for the board
-# whose console is an NS16550A. It holds an Interrupt handle for the console's
-# line, waits on it through a Waiter, reads the device's registers DIRECTLY
-# through the window this manifest asks for, echoes each byte back out the same
-# device, acks and re-waits. The kernel has no driver code in it.
+# The userspace UART echo driver, for the board whose console is an NS16550A. It
+# holds an Interrupt handle for the console's line, waits on it through a
+# Waiter, reads the device's registers directly through its mapped window,
+# echoes each byte back out the same device, acks and re-waits. The kernel has
+# no driver code in it.
 #
-# IT IS PER-DEVICE, not per-architecture: a driver names its device, and the two
-# SOS profiles happen to have different UARTs. The pl011 package beside this one
-# is the same program for the other one.
+# It is per-device, not per-architecture: a driver names its device, and the two
+# SOS profiles have different UARTs. The pl011 package beside this one is the
+# same program for the other.
 [dependencies]
 sos = { path = "../../kernel/sysapi" }
 
@@ -22,18 +22,9 @@ sos = { path = "../../kernel/sysapi" }
 emit = "sosimg"
 priorities = { background = 0, low = 1, normal = 1, high = 1 }
 
-# **`device-window` IS GONE — THE MIGRATION LANDED** (sawos design 6 D-6; spec
-# §2.5's migration case, come true). Design 178's finale constraint 1 declared
-# the MMIO grant IN THE IMAGE and had the board authorize it, and said in as
-# many words that it was a PLACEHOLDER for M3's Mapping. It is: this driver now
-# receives the console's register page as an `IoMemory` capability in its BOOT
-# SET, maps it into itself with `Process.map(iomemory:)`, and drives exactly the
-# same registers at exactly the same addresses.
-#
-# **THE SAME WINDOW, OBTAINED RATHER THAN DECLARED.** The echo behaviour is
-# unchanged — same bytes, same line number — which is what makes this a
-# migration rather than a rewrite, and the image now carries TWO segments rather
-# than three because the third was the declaration.
+# The console's register page arrives as an `IoMemory` capability in this
+# driver's boot set, and it maps it into itself with `Process.map(iomemory:)`
+# rather than declaring a window in the image.
 [sos.riscv32-unknown-none-elf]
 linker-script = "../../hal/riscv32/user/root.ld"
 native = "../../hal/riscv32-common/user/syscall.c ../../rt/common_c/support.c"
