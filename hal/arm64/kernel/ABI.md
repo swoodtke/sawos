@@ -180,17 +180,16 @@ entered once has no storage a second thread could have.
   C.** `CPACR_EL1.FPEN` traps Advanced SIMD at EL1 out of reset, and LLVM
   reaches for `q` registers to move a struct, so compiled C faults at EL1
   without it. The freestanding profile implies `-neon,-fp-armv8` on aarch64, so
-  the Saw half emits no SIMD instructions; the boot line stays because
-  `rt/common_c/support.c` is C (its `memcpy` is the loop-idiom self-recursion
-  case) and compiles to SIMD references at `-O2`. Removing it needs
-  `-mgeneral-regs-only` on every aarch64 C compile, which needs a Blade manifest
-  key for per-target C flags. FP/SIMD state is not saved across a trap (the
-  frame holds x0-x30 and three system registers), although EL0 code may use it
-  (`FPEN` is set for EL0 as well) and the kernel's own C does: `support.c`'s
-  `memcpy` uses q0/q1/d0 and runs on the IRQ wake path. A syscall is safe,
-  because the stub is a C call and v0-v7 are caller-saved; an asynchronous trap
-  can corrupt a thread's vector registers, with no thread switch needed (open:
-  SO-4).
+  the Saw half emits no SIMD instructions, and the C the kernel links
+  (`sink.c`, `rt/common_c/support.c`) has none either: the kernel image
+  executes no FP/SIMD instruction. The boot line stays because clang compiles
+  that C without `-mgeneral-regs-only` and may emit vector code. A trap
+  therefore does not clobber EL0's vector registers. FP/SIMD state is still
+  not saved across a trap (the frame holds x0-x30 and three system registers)
+  while `FPEN` is set for EL0, so an EL0 image that uses vector registers
+  would have them corrupted across a thread switch. Nothing in the C build
+  forbids vector code (no `-mgeneral-regs-only`), so a C image may use vector
+  registers (open: SO-4).
 - **Semihosting, not PSCI, for shutdown.** PSCI `SYSTEM_OFF` over the HVC
   conduit works on `-M virt` but always exits the emulator with status 0, and
   this harness asserts on exit status — one case encodes its entire verdict in

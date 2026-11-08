@@ -2105,7 +2105,7 @@ price yet, and a number nobody runs is a number nobody believes.
 
 SOS is written in Saw, and the exceptions are enumerated rather than tolerated.
 Every surviving line of C states, in the file that holds it, why it is not Saw —
-and there are only three reasons in the whole system:
+and there are only two reasons in the whole system:
 
 1. **An instruction with no Saw spelling.** `ecall` / `svc`, `mret` / `eret`,
    the vector tables, `csrw` / `msr` / `mrs`, `dsb` / `isb` / `tlbi`, `wfi`,
@@ -2113,14 +2113,8 @@ and there are only three reasons in the whole system:
    example, `sos_syscall3` and `sos_wait_for_irq` per profile, and the
    interrupt-mask and timer system registers). Inline asm in Saw is a separate
    design conversation.
-2. **`memcpy` / `memset` / `memmove`.** A byte-copy loop written in Saw is
-   exactly the pattern LLVM's loop-idiom recognizer rewrites into a call to
-   `memcpy` — which, in a freestanding build where this is `memcpy`, is a call
-   to itself. C compiled with `-fno-builtin` is the supported way to say "do
-   not do that", and it is why every libc writes these in assembly or with the
-   same flag. Permanent. (The `__atomic_*` libcalls beside them are the same
-   shape: the caller is codegen, not source.)
-3. **A linker symbol's address.** Saw cannot name one — `extern` declares only
+2. **What only the environment can supply.**
+   *A linker symbol's address.* Saw cannot name one — `extern` declares only
    functions, an extern function is not usable as a value, and `@export` on a
    static emits a definition rather than a reference. The accessors are the
    kernel HALs' `sos_payload_start`/`_end` and
@@ -2130,25 +2124,28 @@ and there are only three reasons in the whole system:
    span of `.bss`), and `sosrt` reads those bounds back at run time with the
    same `extern unsigned char sym[]` idiom. That is what lets a C image set
    `ARENA_SIZE = 0` and link no arena at all, and a small board scale the arena
-   per package rather than per tree.
+   per package rather than per tree. *The word atomics.* On a target whose word
+   compare-and-swap is no instruction (the ESP32-C3, riscv32 without the A
+   extension) the language leaves the `__atomic_*_4` routines to the
+   environment; elsewhere the compiler inlines atomic instructions and nothing
+   references them.
 
-Reason 3 is the only open language gap: the other two are permanent by
-construction, and this one closes the day Saw can name a linker symbol.
+The first half of reason 2 is a language gap: it closes the day Saw can name a
+linker symbol.
+
+The compiler's own libcalls are mostly not part of the floor. `memset` /
+`memcpy` / `memmove` and the 64-bit division helpers come from sawc's std,
+written in Saw, on every profile.
 
 **Where the floor is.** `rt/common_c/support.c` — one copy, shared by the kernel
-and every process — is `mem*`, the atomic libcalls, the 64-bit division pair,
-and the arena accessors. The division pair is worth its line: a Clock reads
-nanoseconds, which is a 64-bit quantity on every profile because 32 bits of them
-wraps in four seconds, and rv32 has no 64-bit divide instruction even with `+m`.
-So the floor grows when a 32-bit machine meets an arithmetic width the ISA does
-not have — not when the language falls short. Each user HAL is its syscall
-instruction and nothing else. The bump arena and the frozen `__saw_rt_*` seams
-are Saw in `rt/common/src/lib.saw`, one copy serving the kernel and every
-process; the process side's two hooks and its parked boot handle are Saw in
-`kernel/sysapi/`, beside the System object whose authority they spend. A thread
-context is built in Saw (`frame_init`, and a `resume_frame` that branches into
-the trap entry's own restore path), so no register-clearing prologue is needed
-in assembly.
+and every process — is the arena accessors and the word atomics. Each user HAL is
+its syscall instruction and nothing else. The bump arena and the frozen
+`__saw_rt_*` seams are Saw in `rt/common/src/lib.saw`, one copy serving the
+kernel and every process; the process side's two hooks and its parked boot
+handle are Saw in `kernel/sysapi/`, beside the System object whose authority
+they spend. A thread context is built in Saw (`frame_init`, and a
+`resume_frame` that branches into the trap entry's own restore path), so no
+register-clearing prologue is needed in assembly.
 
 **The panic path is check-free by construction.** The console writer the runtime
 seams call is Saw, and it is check-free by construction rather than by

@@ -22,8 +22,8 @@ Pipeline per test case, per architecture:
               kernel and the HAL it reaches the machine through)
   2. clang  : boot.S     -> boot.o     (kernel HAL; assembled once)
   3. clang  : sink.c     -> sink.o     (kernel HAL: board hooks + protection)
-     clang  : support.c  -> support.o  (mem*, the atomic libcalls and a few
-                                        helpers — the C that must stay C,
+     clang  : support.c  -> support.o  (the arena accessors and the word
+                                        atomics — the C that must stay C,
                                         compiled once)
   4. the `.payload` blob, if the case has one — EITHER a hand-written `.S` from
      `tests/<arch>/` (user-mode code, hand-assembled sosimgs) OR a root
@@ -5119,8 +5119,8 @@ def _build_shared(arch, clang):
     A kernel image is that architecture's kernel HAL (boot + trap entry, the
     board sinks, the protection primitive) plus the shared C floor every SOS
     build links: the same `support.c` a root package names in its
-    `[sos.<triple>] native`, which is `mem*`, the atomic libcalls and a few
-    helpers. The runtime seams are Saw and reach the image through
+    `[sos.<triple>] native`, which holds the arena accessors and the word
+    atomics. The runtime seams are Saw and reach the image through
     `--module-path sosrt=` below.
     """
     dirs = arch_dirs(arch)
@@ -5149,8 +5149,8 @@ def _build_shared(arch, clang):
     # arm64 and the shared `riscv32-common` one on riscv32.
     for src, obj in ((os.path.join(dirs["hal_native"], "sink.c"), sink_o),
                      (os.path.join(RT_COMMON_C_DIR, "support.c"), support_o)):
-        # -fno-builtin: support.c DEFINES memcpy, and without it LLVM may
-        # rewrite its byte loop into a call to itself.
+        # -fno-builtin: freestanding C must not be rewritten into calls to
+        # memcpy and friends.
         _run([clang, f"--target={arch['triple']}", *arch["cc_args"],
               "-ffreestanding", "-fno-builtin", "-ffunction-sections",
               "-fdata-sections", "-nostdlib", "-O2", "-c", src, "-o", obj])

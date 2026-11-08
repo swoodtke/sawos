@@ -9,18 +9,17 @@
  * map, installs the vector table, and calls the Saw `kmain`.
  *
  * FP/SIMD is enabled here because out of reset `CPACR_EL1.FPEN` traps every
- * Advanced-SIMD instruction at EL1 and EL0. sawc builds freestanding aarch64
- * code with `-neon,-fp-armv8`, but the C is compiled by clang at -O2, and
- * support.c's `memcpy`/`memset` use the q registers. Without this, the first
- * of those takes an EC=0x07 trap.
+ * Advanced-SIMD instruction at EL1 and EL0, and clang compiles the kernel's C
+ * (sink.c, support.c) without `-mgeneral-regs-only`, so it may emit vector
+ * code. sawc builds freestanding aarch64 code with `-neon,-fp-armv8`; the
+ * kernel image as built executes no FP/SIMD instruction.
  *
  * FP/SIMD state is not saved across a trap: the frame below holds x0-x30 and
- * three system registers. The C runs vector code at both levels: every Saw
- * image links support.c, so its `memcpy` (q0/q1/d0) runs at EL0 too, and EL0
- * has vector state to lose. A syscall is safe, because the stub is a C call and
- * v0-v7 are caller-saved. An asynchronous trap is not: the kernel's own C
- * clobbers EL0's vector registers (that `memcpy` runs on the IRQ wake path),
- * with no thread switch needed.
+ * three system registers. Because the kernel executes no vector code, a trap
+ * does not clobber EL0's vector registers. EL0 may still use them (`FPEN` is
+ * set for EL0). Nothing in the C build forbids vector code (no
+ * `-mgeneral-regs-only`), so a C image may use vector registers, and one that
+ * does would have them corrupted across a thread switch.
  *
  * The user/kernel split is free here. arm64 has sixteen vectors, four per
  * source (current EL on SP0, current EL on SPx, lower EL in AArch64, lower EL

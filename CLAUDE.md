@@ -30,7 +30,7 @@ hal/riscv32-flat/  # the flat build profile of that board: a small facade, not
 hal/riscv32-esp32c3/ # the ESP32-C3 board, same shape — reached only by
                    # `make sos-smoke-esp32c3`, never by sos-test
 rt/common/         # `sosrt`: the SOS runtime, arch-free + role-free Saw
-rt/common_c/       # support.c — mem* + atomic libcalls, one copy
+rt/common_c/       # support.c — the arena accessors + word atomics, one copy
 root/              # the root server: a real Blade package, sosimg emit
 tests/             # kernel entries + hand-assembled payloads/images
 tools/             # sos_runner.py (build+boot harness, QEMU both arches)

@@ -158,8 +158,10 @@ rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)
 ## 3. The no-A build spelling
 
 The ESP32-C3 is **RV32IMC**: no A extension, so atomics are
-`rt/common_c/support.c` libcalls with interrupts off, and `SpinLock` is
-language-refused. Single core makes that sound.
+plain read-modify-write libcalls that the environment
+(`rt/common_c/support.c`) supplies, and `SpinLock` is language-refused. That
+is sound on a single core in the kernel, which runs with interrupts masked,
+and in a user process only while nothing preempts it.
 
 **sawc** — the triple names an architecture, `--target-features` names
 the extensions, so the C3 spelling is the virt profile's list minus
