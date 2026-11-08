@@ -1,12 +1,16 @@
 # SOS — a capability-based microkernel in Saw
 
-Working notes. The name is SawOS ("SOS" for short — ruled Aug 28 2026, no
-longer a placeholder). Requirements in
-§1 are ratified (user, Jul 29); later sections are proposals and open
-questions for discussion. First target: ESP32-P4 (riscv32) via Saw's
-freestanding profile; the design must not preclude MMU-class targets.
+SawOS ("SOS" for short) is a capability-based microkernel written in Saw. This
+document specifies it: the object model, handles and rights, the ops and what
+each answers, the invariants the kernel keeps, and the protocols built on
+them. Where something is specified but not built, the text says so; §11
+collects what is not built, the known limits, and the plan.
 
-## 1. Ratified requirements (user)
+The first hardware target is the ESP32-P4 (riscv32) through Saw's freestanding
+profile, and the design must not preclude MMU-class targets. Two profiles run
+under QEMU (§5b).
+
+## 1. Requirements
 
 - **Capability-based microkernel.** The kernel implements only what is
   required to efficiently provide core OS resources:
@@ -20,50 +24,42 @@ freestanding profile; the design must not preclude MMU-class targets.
   another Handle the process already holds, with the required
   capability enabled — authority flows only through held authority.
 - **Pipes** send data synchronously, optionally carrying Handles,
-  which are MOVED to the receiving process. Not every Handle is
+  which are moved to the receiving process. Not every Handle is
   movable — transferability is a capability of the Handle itself.
 
-## 2. Proposed object model (discussion)
+## 2. Object model
 
-Minimal kernel object types (each a slab-allocated kernel struct;
-names provisional):
+The kernel's object kinds, each a slab-allocated kernel struct:
 
 | Object | Role |
 |---|---|
-| `AddressSpace` | Isolation domain, defined abstractly. P4: PMP region set + APM/REE security context (see §5.5 — the P4's MMU is real but global/external-memory-only, not per-process). Paging targets: page-table root. |
-| `Thread` | Kernel-scheduled execution context bound to an AddressSpace. Saw's cooperative TaskGroups run *inside* a thread, in userspace — the kernel never sees tasks. BUILT M2 (design 178 unit 2): ops `Start`/`Join`/`Exit`/`Yield`, rights `ThreadRight.Start`/`.Join`/`.Control`. The saved trap frame IS the context, so a switch is the trap handler returning a different frame — see §11. |
-| `MemoryObject` | A range of memory (RAM or device MMIO) that can be mapped into AddressSpaces. Derived by splitting/attenuating a parent MemoryObject; roots handed to the first process at boot. BUILT M3 unit 2, FIRST SLICE (sawos design 2 D-2): a SEALED `{base, len}` and nothing else — no pools, no derivation, no `map()`, no attributes, no op table (an op aimed at one is a `BadOp` fault). Minted only at boot, one per row of the build-emitted REGION TABLE, delivered to root through `ProcessOp.BootHandleNext`, and NAMED as the two arguments of `process_create`. **BUILT OUT M3 unit 4 (sawos design 6), and the slice's two open questions are both answered**: the row is now `Memory` (RAM) or `IoMemory` (device MMIO) by the region table's KIND COLUMN, and the object has an op table. Ops `Split`/`Map`, rights `MemoryRight.Split`/`.Map` beside the universal pair (`Transfer` for unit 3's `give`, `Mint` for its attenuated sibling — the generic `Manage` that once sat here was removed by the Aug-29 doctrine, and unit 4's bits are named for their ops as that doctrine requires). `split(len)` is ONE CUT FROM THE FRONT and the parent becomes the remainder, so allocation is repeated front-splits and THE PARENT IS THE POOL CURSOR — arbitrary-offset carving is refused BY THE SHAPE rather than by a check, since one `{base, len}` slot cannot hold two remainders. `map(process, access)` installs a protection row and answers with a `Mapping`; it spends `MemoryRight.Map` on the region AND `ProcessRight.Map` on the target, because possession of bytes must not imply authority over an address space. There is STILL no op that reads a MemoryObject's bounds: a region is a capability, and what a process knows about where its memory is, it knows from the config that gave it the region. **FREE-ON-LAST-REFERENCE LANDED M3 unit 5** (sawos design 7 D-1), amending this row's M3-unit-4 "NOT built": a Memory slot carries a count of the handle entries naming it and returns to its slab inside the release that takes the count to zero. What was NARROWED rather than built at that unit was the BYTES: a freed region returned its SLOT and no range to any pool. **THE RANGE COMES BACK SINCE M5 UNIT 5** (sawos design 28; design 25 D-5, ruled) — a second count on the slot (installed grant ROWS beside handle entries) releases the range to its POOL ROOT at the second zero, adjacent free ranges coalesce, and `split` serves the free list before advancing the cursor. Quotas still count OBJECTS in v1; bytes are the pool's own ledger, which is §5.9's answer and is fronted by no op (§2.5). **BUILT OUT AGAIN M3 unit 6 (sawos design 9 D-1): a fifth right, `MemoryRight.MapExecute`.** A `map` whose access word names `MapAccess.Execute` spends it, on top of the two above — so EXECUTABLE IS AN AUTHORITY rather than a free choice, and "only root maps executable" is a fact about capability FLOW (root never grants the bit at a mint) rather than about identity. `memory_rights()` mints it, of necessity: attenuation is monotonic, so a bit not minted at boot could never appear later, and the narrowing is a HOLDER's `MINT_OP` keep mask. Access is still per-MAPPING and a region still carries no R/W/X triple — what became a right is which access bits a HANDLE may request. Its companion is a `MapAccess` rule rather than a right: `Write | Execute` in ONE row is a caller-checkable `BadArg`, which costs nothing expressible because double-mapping is sanctioned (an RW row here and an RX row there is the same JIT-shaped pattern, with every individual row W^X). Both govern the DYNAMIC map only: an image's own X segments come through `process_create`'s loader under `SystemRight.ProcessCreate`. |
-| `IoMemoryObject` | Physical memory-mapped DEVICE registers. BUILT M3 unit 4 (sawos design 6 D-1) as a DISTINCT KIND rather than a flag on `MemoryObject`, which is §2.5's pool ATTRIBUTE made a type: an IoMemory can only ever produce device-attribute rows — `map` takes no access argument at all — so a driver cannot obtain a cacheable view of a register block BY CONSTRUCTION rather than by a check. Its lifecycle differs everywhere too: PINNED (never freed — MMIO is not reclaimable), carved NON-EXCLUSIVELY (§2.5's "a fixed region may be handed out many times", so `carve(offset, len)` leaves the parent WHOLE where `split` consumes), and it has no contents. Ops `Carve`/`Map`, rights `IoMemoryRight.Carve`/`.Map` plus the universal pair. The machine's own granularity is checked AT THE CARVE against a per-profile HAL predicate (Profile A needs a naturally-aligned power of two — one protection entry; Profile B needs whole pages), because a window that could never be installed anywhere is a capability that lies about itself. One dispatch arm is the entire cost, and what it RETIRES is the M2 device-grant placeholder: see §2.5's migration case and §11. **UNTOUCHED BY M3 unit 6's exec gate, and that is a property of the kind rather than an omission** (sawos design 9 D-1): `IoMemoryOp.Map` takes no access argument at all, so execute-on-device is refused vocabulary and there is no `IoMemoryRight.MapExecute` to add. What unit 6 DID exercise here is its `Transfer` bit: root gives a driver child the console's window and the child maps it into itself, which is the flow this kind's `Transfer` was minted for at unit 4. |
-| `Mapping` | ONE INSTALLED PROTECTION ROW, with its own handle. BUILT M3 unit 4 (sawos design 6 D-1/D-3). **A MAPPING IS AN INSTALLED GRANT ROW**, and the object records which process's domain carries the row and which row it is. It had "no virtual half" for four milestones because SOS did not translate anywhere; **SINCE M5 UNIT 2 (sawos design 33) A GRANT ROW CARRIES BOTH HALVES** — a user VA range AND the physical base it translates to — so §2.5's "installed virtual placement" is literal on tier 1 and the two halves are asserted EQUAL on the tiers that do not translate (§5.5 as re-scoped). That is one mechanism with one degree of freedom unspent on the MPU tier, not two mechanisms. **TWO OPS** since that unit: `Unmap` (on `MappingRight.Unmap`) and `Base` (on `MappingRight.Base`) — the address the kernel CHOSE, asked for rather than assumed, which is the portable spelling every program should use and the one `tests/map-placed` is written against. `Base` is a SEPARATE BIT from `Unmap` on the Aug-29 doctrine's own terms: locating a row and revoking one are different authorities, so a launcher may hand a child a Mapping it can find and not take away (the ordinary shape — the child needs the address to use the memory) or one it can revoke and not locate. The answer is a USER address on every tier, and on a tier that does not translate it is also the physical one — the same question, answered by a machine with one fewer degree of freedom, because everything else about a mapping was decided when it was installed. **RELEASING THE HANDLE IS NOT AN UNMAP**: release destroys the entry and never the object (design 3 D-2), so §2.5's "dropped without unmap = permanent, safe-but-leaked" falls out of existing doctrine rather than being new law. §2.5's sketched unmapping Deinit is deliberately NOT built — it would make the ROW's lifetime the wrapper's, and a launcher's wrapper drops right after it hands a child its memory. **THE LIVE-DOMAIN RULE** is the half a caller relies on: any edit to a grant record RELOADS IMMEDIATELY when that domain is the installed one, because `run_thread` skips equal domains and an unmap that waited for the next reschedule would be a revocation that did not revoke. Unmapping twice, or unmapping a Mapping whose TARGET PROCESS has died (its whole domain went with it), are both `BadState`. It is not givable — `mapping_rights()` withholds `Transfer` — because a Mapping names a row in one specific domain. |
-| `Pipe` | Synchronous message IPC with request/reply built in — see §2.1 (ratified Jul 29; renamed from Channel + client API amended Aug 20). **BUILT M4 unit 1, A SLICE NAMED HONESTLY (sawos design 13): the CONNECTION as an object, with the data path and the lifetime machinery and no reply path at that unit — unit 2's block below is where the reply path landed.** What exists: two kinds, `PipeInlet` (the CLIENT end, requests flow IN) and `PipeOutlet` (the SERVER end, they come OUT), which is design 10 D-1's answer to the writer-count question — ROLES ARE OBJECTS. A single symmetric pipe object cannot express "the writers went to zero" (a parked receiver is itself a holder, the socket-`shutdown()` hole) and a rights-partitioned count on one object would be a second ledger against design 7's doctrine; a PAIR of counted endpoint kinds makes it the ledger that already exists. The two kinds TARGET ONE `PIPES` SLAB ROW with TWO reference columns, and which column a handle counts on is decided by its KIND — which §3's order establishes before any right is read. Factory: `ProcessOp.PipeCreate` on `ProcessRight.PipeCreate` (design 10 ruling 3 — pipes are IPC and carry nothing system-shaped, so the authority is per-process ATTENUABLE), answering BOTH ends through a two-word copy-out record because one op returns one word. Ops `PipeInletOp.Post` / `PipeOutletOp.Take` on `PipeInletRight.Post` / `PipeOutletRight.Take`, data-only, POLLING: a full ring and an empty one are both `SosStatus.WouldBlock`, never a park, because unit 1 has no waitability. Staging is a per-connection RING of `PIPE_INFLIGHT` slots at `PIPE_BODY_BYTES` each (design 10 ruling 6's amendment to §2.1's "one fixed slot" — still zero dynamic kernel allocation, which is the property that sentence existed for). **THE ZERO-ARMS ARE THE PEER-GONE DOCTRINE**: the outlet column reaching zero drops what is staged and makes every later `Post` answer `SosStatus.PeerClosed`, while the inlet column reaching zero DRAINS FIRST — `Take` hands over everything already staged and only a dry ring answers `PeerClosed`, terminal thereafter. Creator-pays: one `QuotaKind.Pipe` row charged at create, credited when BOTH columns reach zero and the slot goes back. Both ends carry `Transfer`, so a launcher wires them outward with `give` and a child drains one out of its boot set. **BUILT M4 UNIT 2, THE ONE-SHOT PAIR (sawos design 14): the REPLY PATH, so §2.1's request/reply primitive is a primitive here too.** Two more counted kinds, `PipeReply` (the client's claim on one reply) and `PipeRequest` (the server's obligation to send it), and D-1's answer to where they live is that a one-shot exists for exactly as long as one in-flight message — so they are RING-SLOT STATE, two more reference columns on the staging slot that carried the request and now carries the reply back (design 10 ruling 4's rider), with no third slab and no new quota row. `Post` grew its claim return and `Take` grew the obligation beside the message, which is §5.7's renumberable-op discipline doing exactly what unit 1 said it would. Ops `PipeReplyOp.Resolve` / `PipeRequestOp.Reply` on their own rights, both CONSUMING the caller's entry, so single use is enforced by the ledger and `NoCopy` is the ergonomics on top. **AND AT THE REPLY SIDE SINGLE USE IS A COMPILE ERROR TOO SINCE SL-16** (sawc 0.4.0): `PipeRequest.reply` and `PipeRequest.reply_wait` consume on every path, so the sysapi methods carry `consumes` and their callers spell `(move request)`, which refuses a second use before the ledger is ever asked; `PipeReply.resolve` could not join them at that unit, because a pending resolve consumed NOTHING and an effect that consumes on every path would have spent a live claim at the first empty poll — **M4 UNIT 4.5 REMOVED THE EMPTY POLL INSTEAD (ruling 12(b), below), so all three one-shot ops carry the effect now.** The kernel checks are unchanged for a raw-altitude caller either way. **THE SLOT NOW LIVES UNTIL THE EXCHANGE SETTLES**, not until its bytes are taken, so `PIPE_INFLIGHT` bounds awaiting-reply exchanges — ruling 6's in-flight budget read literally. **ABANDONMENT IS DERIVED FROM THE COLUMNS**, not flagged: a dropped claim makes the server's `reply()` answer `PeerClosed` with the obligation discharged either way, a dropped obligation makes the client's `resolve` answer it, and a staged message whose outlet column reached zero is abandoned by a server that never existed. Transferable, so §2.1's zero-copy DELEGATION example runs end to end across a real process boundary. **BUILT M4 UNIT 3, WAITABILITY (sawos design 15): all four kinds are §2.2 waitables now, and the four `NotWaitable` refusal arms units 1 and 2 wrote by hand are gone.** No new object, no new op, no new slab — four kinds that already existed, each gaining a `Wait = 1 << 9` bit in its own rights enum and its own default set, and four columns in the per-kind matrix. The arms: the OUTLET is readable while a message is staged or the client end is gone (drain-then-terminal, so `PeerGone` waits for a dry ring); the INLET is postable while the ring has room or the server end is gone (design 10 ruling 8's addition to §2.2's list — `post` can never block, so a refused poster parks here); the REPLY is ready once its answer is written or can never be; the REQUEST is ready once the claim behind it was abandoned (§2.1's ratified early notice). **THE REPLY ARM IS THE ONE THAT CHANGED THE RECORD** (ruling 11(a)): its delivery carries the reply's BYTES, out of the ring slot that already holds them, so the wait IS the resolve and a multiplexed RPC is post + attach + wait. `WaiterOp.Add` grew a FLAGS word with it — `AttachMode.OneShot` detaches at delivery, and the CONSUMING attach (`Waiter.give`) releases the caller's entry so a multiplexer holds zero handles. **EVERY PIECE THE RATIFIED BLOCKING `send(msg)` / `send(msg, timeout:)` COMPOSE OUT OF IS NOW SHIPPED — AND THE COMPOSITION IS DELIBERATELY NOT A LIBRARY TYPE** (user ruling, lead review Sep 1): a wrapper would freeze a shape unit 3.5's fused `Call` is meant to replace with one kernel call, and a kernel-side timeout, if ever ruled in, arrives as an op. §2.1's `send` surface therefore arrives with `Call`; `tests/pipe-send-manual` proves a caller can write it today out of post + attach + wait plus a Timer, which is what keeps the kernel from ever learning what a timeout is. **BUILT M4 UNIT 3.5, THE FUSED PATHS (sawos design 17): `PipeInletOp.Call` and `PipeRequestOp.ReplyWait`, one more op on each of two kinds and NOT a new object anywhere.** A fused op is THE COMPOSITION RUN WITHOUT RETURNING TO USERSPACE, so every rule the composed path obeys applies verbatim and both spend the EXISTING right of the op they extend — `Post` and `Reply` — because each adds a PARK and a park is mechanics rather than authority. `Call` is post-park-resolve behind one trap and NEVER answers `WouldBlock`: a full ring parks on the inlet's room level (ruling 8, reached from inside). `ReplyWait` lives ON THE REQUEST (user-ruled Sep 1 — a reply with a built-in wait, the reply being the act that consumes the receiver), discharges the obligation and then parks on a WAITER exactly as a plain `wait` does, so the wake protocol stays singular; the waiter is REQUIRED, because the first turn of a loop and the dead-client recovery are both the existing `WaiterOp.Wait` and reply-without-wait is the existing `Reply`. Its answer names the LEG that failed and `Wait(_)` means the reply landed — a refused reply returns WITHOUT parking, so one dead client cannot stall a server loop, and the request is CONSUMED on every path. **A FUSED CALL MINTS NOTHING**: the claim is kernel-internal and tied to the parked thread, one reference on the exchange's claim column that no handle table holds, so a blocking client spends no table row and no quota — which is design 14's `MAX_HANDLES`-bounds-a-client finding answered. **THE WAKE DISPATCH GREW ONE ARM AND NOT A SECOND PROTOCOL**: a claim is either a subscription's or a parked thread's, and exactly one function in the kernel tells them apart; `end_process` gained the mirror, so a process dying with a thread parked in a call has that claim ABANDONED by its teardown and the server's later `reply()` answers `PeerClosed` by the ratified rule. Measured: ONE trap per RPC at the client against three for the composition, TWO per message at the server against three. **BUILT M4 UNIT 4, RENDEZVOUS (sawos design 18): HANDLES IN MESSAGES, so §2.1's `send(data?, handles?)` is whole and the row has nothing left owed.** No new object, no new kind, no new slab, and not one new op: `Post`, `Call`, `Reply` and `ReplyWait` each take the message through ONE argument record now — a body address, a length and `PIPE_MSG_HANDLES` (4) handle words no longer fit three registers — and `Take` and `Resolve` answer through one. **A SEND IS A HALF-MOVE AND A RECEIVE IS THE OTHER HALF** (`designs/010` ruling 5, RE-RULED Sep 2 to TAKE-AT-POST). The handles a message carries LEAVE THE SENDER AT THE POST — each entry unbound, the reference it was holding parked in the ring note as a typed ref (object, target, rights), the sender's `QuotaKind.Handle` row credited — and are MINTED INTO THE RECEIVER at the take or the delivery, where the taker is charged. So the transfer is `Give`'s one act performed in two steps with the kernel holding the reference in between, and both steps obey `Give`'s own rule: THE COUNT GOES UP BEFORE IT GOES DOWN, per handle, so nothing can transiently reach zero and be freed mid-move. **WHAT THAT BUYS IS A GUARANTEE**: a message the kernel accepted will deliver what it was carrying, whatever becomes of the sender — a capability handed over fire-and-forget no longer races its sender's own exit (`tests/pipe-send-exit`, where the receiver takes AFTER the sender is `Gone` and the capability still works). It also makes the typed tier honest, since `post_with` CONSUMES the wrapper and a consumed wrapper must not come back. The earlier ruling left the entry with the sender until the rendezvous and re-validated it there, which was sound and delivered an EMPTY slot when the sender let go; ruling 10's orphan accounting and design 260's `consumes` both post-date it and both point the other way. **NOBODY IS CHARGED WHILE A MESSAGE IS STAGED**, which is design 14 D-4's write-off vocabulary at a second kind, and it is bounded rather than open-ended: a connection can hold at most `PIPE_INFLIGHT * PIPE_MSG_HANDLES` such handles, so quota <= wall still holds and the SLAB is still what refuses. Two consequences beside the guarantee, each a case: a taker whose table or quota cannot accept the batch refuses ATOMICALLY, nothing minted, the message left staged with its references still held and its level up (`tests/pipe-table-full`); and the unwind arms are RELEASES now rather than the old ruling's unwind-free forgetting — the outlet's zero-arm and every `exchange_settle` give the held references back, while the INLET's zero-arm deliberately does not, because close-drains-first means a staged message is still owed to a live outlet. **THE KINDS RIDE THE RECORD** (user-ruled Sep 2): each slot carries a `BootHandleKind` byte beside its word — `decode_boot_handle`'s precedent generalized — so a receiver MATCHES a typed handle out instead of holding a number, and the kinds a message may carry are the six the receiving vocabulary can name (`Memory`, `IoMemory`, `PipeInlet`, `PipeOutlet`, `PipeReply`, `PipeRequest`). `Process` and `System` are refused AT THE SENDER, as a scope line rather than a rule: both wrappers live above `sos.pipe` in the module order, so admitting them is a module split and is a NAMED FOLLOW-UP, not a prohibition. **THE DELEGATION EXAMPLE IS A PROTOCOL NOW**: a `PipeRequest` travelling in a message is §2.1's ratified zero-copy move made at RUN TIME about a request that did not exist when either process launched — unit 2's `give` could only wire one before `start` — and `tests/pipe-delegate-msg` is that flow across a real process boundary, the replier holding no end of the connection it answers on. **AND THE LAST RUNG OF THE TRAP LADDER**: ruling 11(d)'s delivery-as-take, a CONSUMING PERSISTENT outlet attachment handed each message through `wait` itself with the obligation minted at the delivery, under its own `WaitTag.Message` because it says something different about the record's shape than `Readable` does. Such a server holds ZERO endpoint handles and runs `wait` then `reply_wait` forever: `tests/pipe-cq` measures 10 traps for the eight round trips `tests/pipe-pingpong` measures at 18, same client program, which is ONE per message against unit 3.5's two and unit 3's three. **BUILT M4 UNIT 4.5, THE ONE-SHOT DISCIPLINE (sawos design 22; `designs/010` ruling 12): no new object, no new kind, no new slab, ONE new op, and not one wire value changed.** Three parts. THE POLL SPLIT IS RETIRED (12(a), re-ruling sawos design 13 D-2): `WouldBlock` is an ERROR again at the typed tier, so `take` and `post` lose their Optionals and a genuine poller declares itself with a `WouldBlock` arm — D-2 was written at unit 1 when every caller polled, and units 3/3.5 inverted that population (the tree had ZERO `case None` arms). `PipeReplyOp.Resolve` PARKS AND CONSUMES ON EVERY PATH (12(b)): a pending exchange blocks the calling thread on the claim's ready level instead of answering `WouldBlock`, so the op ends the exchange whichever way it returns and `PipeReply.resolve` can carry `consumes` — the compile-time single use SL-16 gave the obligation side, arriving at the claim, with `pipe_dead_claim`'s double resolve becoming a compile error and the suite's last Saw-visible ledger `BadHandle` retiring. **IT COST NO NEW MACHINERY**: `park_resolve` is `consume_entry` with the unref left out, so the entry's reference becomes the parked thread's and a parked resolver is indistinguishable from a parked fused caller to `notify_claim`, to `wake_call_reply` and to `end_process`'s orphan arm — the wake dispatch's ONE arm generalized rather than a second protocol (`tests/pipe-resolve-park`, `tests/pipe-resolve-orphan`). The poll it replaced is the new `PipeReplyOp.Ready`, gated on `PipeReplyRight.Wait` because the level question is the same question attaching asks; status-only, consumes nothing, and the TERMINAL rides the error channel so a caller with no answer coming DROPS the claim instead of spending a resolve on it. AND A ONE-SHOT HAS ONE NAME (12(c)): `Mint` leaves `pipe_reply_rights()` and `pipe_request_rights()` — the enum bits STAY, since §3's universal low byte is pinned by assert in every kind — because a second name on an object one op spends can only ever be told `PeerClosed`, and it undermines the single use the other two parts just made structural. Delegation is untouched: it is `Transfer` MOVING the one name. Measured: post + resolve is TWO traps against the fused `Call`'s one and unit 3's composed three (`tests/pipe-resolve-park`). **M4 UNIT 5 ADDED NOTHING TO THIS ROW, WHICH IS THE POINT OF IT** (sawos design 21): driver-as-service is a PROGRAM — a UART driver with a pipe-server face and two clients that hold no device authority — and it spends this object exactly as built, with no op, no kind, no right and no status added. What it demonstrates about the row is what a blocking read, a one-way write and a cancellation cost when they are compositions: a held obligation, a TELL, and a dropped claim seen through the request's abandoned level. See §2.1's unit-5 block. |
-| `Event` | Accumulating non-blocking notification (OR / saturating-sum); a waitable — see §2.4 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Signal`/`Receive`, the mode chosen by the caller at creation (`event_create(mode:)`). AMENDED Aug 17 (user): the word is CONSUMED BY WHOEVER TAKES IT, through either door — `receive` is the non-blocking poll, a `Waiter.wait` delivery is the blocking one, and both read-and-clear, so a value is reported exactly once (§2.2, §2.4). |
-| `Clock` | A GRANTED TIME SOURCE — time is a capability, not an ambient facility. BUILT M3 (design 232 unit 1): obtained through `SystemOp.ClockGet` on `SystemRight.ClockGet`, ops `Now`/`TimerCreate`, rights `ClockRight.Read`/`.TimerCreate`. **A HARDWARE-BACKED CLOCK IS ONE KERNEL-ETERNAL OBJECT PER `ClockType`** (ruled Aug 17, user), existing from boot and owned by NOBODY: the machine has one monotonic counter, and a per-process object naming it would be a copy of a fact with a lifetime attached. So there is one slot per domain (the slot IS the domain's ordinal), no allocation and no `NoResource`, and process teardown frees no clock — a dead process's clock HANDLE is unbound like any other, and the object it named is not the process's to reclaim. `ClockGet` is therefore a GETTER that mints a handle onto a well-known object — and it MINTS ON EVERY ASK (sawos design 3 D-4, M3 unit 2.75), superseding this row's earlier "asking twice answers the SAME handle": two asks are two capability INSTANCES naming the one Clock, each independently owned and independently released, which is what §4's owning wrapper is an owner OF. It amplifies nothing (see §3's no-amplification amendment) and it makes the op fallible on repetition — a full handle table is `NoResource`, which is what earns it a quota row in unit 5. `ClockType` declares `Monotonic` ONLY in v1 (`Boot`/`Realtime` are future values of a raw-backed enum, undeclared because an unproducible case is dead surface), and `Now` dispatches on the clock's domain, so a second domain fails to compile until somebody says what its reading is. `Now` answers through a copy-out record, because a nanosecond count is 64 bits and one profile's registers are not. The point of the capability: strip the right from a child and hand it a VIRTUAL clock over IPC instead, with no code change on either side — and a virtual clock is a DIFFERENT animal, separately created and STATEFUL (offset, rate, owner), so it gets its own creation op and its own lifetime rather than a row in this table. |
-| `Timer` | Deadline object bound to the Clock that created it; directly waitable. BUILT M3 (design 232 unit 1) — THE PROCESS-SLEEP PRIMITIVE, and before it a wait either returned at once or blocked forever. Ops `Arm`/`Disarm`, rights `TimerRight.Arm` (gating both) / `.Wait`. `arm(after_ns, interval_ns)` arrives through the new COPY-IN record (§2.2's copy-out funnel's mirror twin, built here and inherited by M4's IPC send) because two 64-bit times exceed the argument registers on a 32-bit profile; `interval_ns == 0` is a one-shot, which disarms itself when it fires. The re-arm is DRIFT-FREE (next = previous DEADLINE + interval, the timerfd model) and missed expiries COALESCE into a saturating fire count delivered as `WaitPayload.Timer(fires:)`. **There is NO ACK**: unlike §9's Interrupt there is no mask to release, so the wait that reports the fires is what consumes them. Arming an armed timer REPLACES its schedule and clears the count; disarming an unarmed one is a NO-OP, deliberately opposite to §9's ack-with-no-fire — a one-shot disarms itself, so cancelling a timeout that just expired is an ordinary race rather than a caller error. |
-| `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it, ack via the handle. BUILT M2 (design 178 unit 4): one op (`Ack`), two rights (`InterruptRight.Wait`/`.Ack`), created by `ProcessOp.InterruptBind` on its own Process right — the factory bit a launcher strips from everything that is not a driver. The BINDING IS THE OBJECT'S EXISTENCE (creation takes the line, there is no rebind), which is what stops one handle naming two devices over its life. A line the board does not have, the TIMER's line, and a line already bound are all faults. |
-| `Waiter` | Generic wait aggregator (epoll/Port-style) — see §2.2 (ratified Jul 29). BUILT M2 (design 178 unit 3): ops `Add`/`Remove`/`Wait`, rights `WaiterRight.Attach`/`.Wait`, the wait answer a copy-out record. AMENDED M4 unit 3 (sawos design 15): `Add` grew a FLAGS word — one-shot (detach at delivery) and CONSUMING (the op releases the caller's entry and the attachment owns the object) — and the wait RECORD grew a body region so a delivery may carry a message-sized payload, which one arm does. Neither cost a register or an op number; §5.7's renumberable discipline is what made both free. AMENDED M4 unit 0 (sawos design 12): its free has a SECOND last rite beside the attachment cascade — REVOCATION. Reaching zero references wakes every thread on its blocked list with `SosStatus.Revoked`, writing no record (nothing became ready, so there is no key, tag or payload), which supersedes M3's recorded "legal-but-doomed" strand. The count is the gate, not the release: a release with a minted sibling still live frees nothing and wakes nobody. It is the peer-gone doctrine's first instance — nothing parked can be silently doomed (§2.2). AMENDED M4 unit 3.5 (sawos design 17): `WaiterOp` itself was NOT touched, and that is the claim — `PipeRequestOp.ReplyWait` parks on a Waiter and resumes with THIS record into THIS buffer, so the fused server path is a second door onto one wake protocol rather than a protocol of its own. AMENDED M4 unit 4 (sawos design 18): `WaiterOp` was not touched AGAIN, and the record reached its final shape — a three-word header, a PACKED META (one length byte plus one kind byte per message slot), a HANDLE REGION of five words, then the body, in that order because every copy-out is then a contiguous prefix (§2.2). Unit 3's fourth header word for the body length is GONE into the meta, so the record that gained handle transfer came out SMALLER than the one that did not have it. **A DELIVERY CAN NOW MINT**, which is the substantive change: ruling 11(d)'s delivery-as-take hands a consuming outlet attachment the message, its handles and a freshly minted obligation in one record, and because minting can fail against a full table or a spent quota, a delivery has a REFUSAL arm for the first time — atomic, nothing consumed or detached, the message left staged and its level raised, the waiter woken with the status and no record, exactly as revocation wakes with no record. |
-| ~~`MemoryObject`~~ | (A duplicate row from the Jul-29 draft, pointing at §2.3 where the section is §2.5. Both of its claims are in the rows above: RAM is `MemoryObject`, device MMIO is `IoMemoryObject`, and "mappable" is `Map`. Kept struck rather than deleted so a reader of the Jul-29 discussion finds where it went.) |
-| ~~`Mapping`~~ | (Likewise — see the `Mapping` row above, built M3 unit 4.) |
-| `Process` | AddressSpace + handle table + threads (ratified Jul 29: NO kernel Job/hierarchy). Kernel guarantees teardown on exit/fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a USERSPACE concern. BUILT M2 (design 178 unit 2), one process: ops `ThreadCreate`/`ThreadSelf`/`Exit`/`GetStatus` plus the three factory ops `EventCreate`/`WaiterCreate`/`InterruptBind`, each on its own right. BUILT M3 unit 2 (sawos design 2), **TWO processes**: `Start` (on the CHILD's handle, `ProcessRight.Start`) mints the first thread of a created process and runs it; `BootHandleNext` (`ProcessRight.BootHandles`) drains §12's boot set one record at a time. The CREATE half of that lifecycle is not an op on this object — design 2's RIDER (Aug 29) puts `ProcessCreate` on System, because a process is a machine-wide resource (§12's amended creation-authority note). The child's handle carried `Start | Wait | Manage` and nothing else at that unit — everything a process may do to ITSELF withheld from its creator (M3 unit 3 re-ruled the set; see below). The TEARDOWN now forks (§8): process 0 stops the machine, any other reschedules. **THE SLOT OF A DEAD PROCESS IS RECLAIMED** (sawos design 3 D-3, M3 unit 2.75), and it is the ONLY slab that reclaims on a handle release. A `Gone` slot holds one thing — its §8 status word — and the only way to read that word is `GetStatus` through a Process handle, so "no handle names this slot" IS "no possible reader", exactly. The check therefore scans the handle tables when a released entry named a `Gone` process, and again at the end of a process's own teardown for its own slot. D-1's generations are what make the reuse safe, and `clear_domain` already invalidated `LAST_PROT_PROCESS` in anticipation. (**That scan's bound was `MAX_PROCESSES` × `MAX_HANDLES` until M5 unit 6b** — see the capacity paragraph at the end of this row: the handle tables are FIELDS of the process slot now, so the walk is over the slab's extent CHAIN and the product names nothing. It is still bounded, by `process_slots_usable()` × `MAX_HANDLES`.) `MAX_PROCESSES` consequently bounds CONCURRENT processes again, which is what the name says — **and since M5 unit 6b it is the FLOOR of that bound rather than the whole of it** (below). **SUPERSEDED IN ITS MECHANISM, NOT ITS ANSWER, BY M3 UNIT 5** (sawos design 7 D-1): the scan is a COUNT now — `ProcessSlot.refs`, maintained by the same lines that maintain an Event's — because unit 2.75's argument that a second fact would be one more thing to keep in step reverses once seven other kinds keep theirs at exactly those sites. The answer is identical, so no transcript moved for it. And this row is no longer the ONLY slab that reclaims on release: every countable kind does (see the counted-kinds column above), which is what makes a `Gone` process ordinary rather than special. `kill` (§8) still has no op. **BUILT M3 unit 3 (sawos design 4): `Give` — THE COURIER OP.** `give(handle, tag:)` on the CHILD's handle (gated by `ProcessRight.Give` there, plus the UNIVERSAL `Transfer` right on the handle being given) MOVES a handle into a fresh slot of the child's table and returns ONLY ITS STATUS: the child-side word is meaningless to the giver, which can call no op through it. What crosses instead is the TAG — the giver's own word, handed back unread at the child's drain. It is unbind-and-rebind with RIGHTS VERBATIM (a move, not a mint: no default set is consulted and nothing amplifies), the caller's entry unbinds exactly as a release does so the giver's word goes stale, and a full child table is `NoResource` with the give not having happened. **AMENDED M4 unit 4 (sawos design 18, `designs/010` agenda 7b): `give` takes a KEEP MASK** — a third argument word, intersected with the entry's rights, `ALL_RIGHTS` spelling the old behaviour — so ATTENUATE-AT-GIVE is one op instead of mint-narrow-give-release. It is `MINT_OP`'s mask reached through the courier: fail-closed (a bit the source lacks is ignored, never an error), structurally non-amplifying (the result is an intersection), and it leaves the move a move. Four caller errors END the caller: a handle that names nothing (`BadHandle`), one without `Transfer` (`AccessDenied`), a child that has already been STARTED (`BadState` — the boot set FREEZES at start, which is the launch flow's whole soundness argument), and a tag the child's set already carries (`DuplicateKey` — the tag is the identity, and one naming two handles would make the boot lookup ambiguous). `Start` gained a `boot_tag` argument in the same unit: the kernel resolves the tag to the child-side word, puts it in the child's first argument register and CONSUMES the record it named (the register IS the delivery, so a child can never be handed one word twice), leaving `_start(boot_handle)` unchanged and a launcher never seeing a child-relative word. `BootHandleNext` now drains the CALLER's own PER-PROCESS set — the kernel writes root's at boot and a launcher writes a child's with `give`, through one op with one exhaustion rule. The Process default set is now ONE set for all three minters (root's, `ProcessSelf`'s and `ProcessCreate`'s), named for its ops throughout: `ThreadCreate | ThreadSelf | Exit | Wait | EventCreate | WaiterCreate | InterruptBind | Start | BootHandles | Give` plus the universal `Transfer | Mint`. A LAUNCHER KEEPS the child's handle — it is what supervises with — and the child derives its own authority from the masked System handle it was given, so supervision and self-management are no longer alternatives (`MINT_OP`, §3, closing design 3's finding 2). **BUILT M3 unit 5.5 (sawos design 8): A PROCESS HANDLE IS A WAITABLE**, which is §8's own promise below and the fourth member of §2.2's list. Readiness is `state == Gone`; the payload is the §8 status word (`WaitTag.Process`, `WaitPayload.Process(status:)`); the right it spends is `ProcessRight.Wait`, the SAME bit `GetStatus` spends, because attaching is that question asked asynchronously and a second bit would let a supervisor poll a death it may not be woken by. It is TERMINAL LEVEL — the one readiness in the system a delivery does not consume — so a waiter attaching AFTER the death still wakes, a second wait answers the same word, and supervision has no lost-edge race. The attachment is a counted reference like every other waitable's, which is what keeps a dead child's slot readable for exactly as long as somebody is watching it. There is still no notification to anyone but a parked or attaching waiter: the Waiter IS the delivery system. **BUILT (sawos design 16, user-ruled Sep 1): `Stats` — EXACT TRAP INTROSPECTION.** `ProcessOp.Stats` on `ProcessRight.Stats` (a per-kind right named for its op, in the ONE default set) answers through a three-doubleword copy-out record: `syscalls`, `interrupts`, `faults`, split by the CAUSE CLASS the trap entry decides on. The split is what makes any of it usable — a single total would mix a quantity the program determines with one the machine determines, so nothing could be asserted about it; separated, `syscalls` is EXACT for a given program path (one per syscall instruction, whatever the op, whatever the answer, and ONE for a call that parks for a millisecond), `interrupts` moves with the host and is printed rather than asserted, and `faults` is exact where a test provokes one. **A BAD SYSCALL COUNTS AS A SYSCALL**: an unknown handle, an unknown op or a missing right ends the process (§5.7's faults ruling) but arrived through the syscall instruction, and keying on the outcome instead would make the assertable column unpredictable — a caller cannot know in advance which of its calls will be refused. **ATTRIBUTION IS TO THE PROCESS CURRENT AT TRAP ENTRY**, decided before any dispatch, so a syscall that switches processes is charged to the one that made it and an interrupt that preempts is charged to the one it interrupted; traps taken through the boot door before any process exists are UNATTRIBUTED, and an interrupt taken while the kernel is IDLE or at a preemption point is not counted at all, because it arrives through the poll rather than through a vector and no process was current. Columns ZERO at process create, on both doors, so a reclaimed slot never inherits its predecessor's traffic; they survive the death, because a `Gone` slot lives while a handle names it — which is the only shape in which the fault column is ever observable, since a faulting process is not around to ask about itself. The reading INCLUDES the call that took it (the column is charged at trap entry, ahead of the op), which is why a delta between two readings carries the second reading's own trap. **PER-PROCESS ONLY** (user ruling): per-thread stats still wait for a consumer that names one. **AND THE RECORDED FUTURE SHAPE IS BUILT — M5 UNIT 7 (sawos design 37; design 25 seed 1).** This paragraph used to describe a SHARED MEMORY REGION exporting the counters read-only, "a purely-userspace `top`, reads free", as a thing parked beside the M5 growable-pool seed; it exists. `SystemOp.StatsRegionMap` on `SystemRight.StatsRegionMap` installs a READ-ONLY row over the kernel's own counter page in the CALLER's domain and answers a `Mapping` plus the caller's own ROW INDEX; the kernel writes each process's row at the same trap-entry sites that maintain these columns, so a reader's `top` costs no syscalls at all after the map. **THE OP-SHAPED v1 SURVIVED IT, and that is the claim this sentence was making** — `ProcessOp.Stats` is unchanged in number, right, record and meaning, and is what a program uses when it wants ANOTHER process's counters (the region answers only about rows, and only a row a caller was told about). Three things about the region are worth knowing at this row: **NO `Memory` HANDLE IS MINTED** (the caller is granted the access and nothing that owns it — a Memory onto kernel storage would carry `Split` and would make the page donatable); **`rows` is a CAPACITY, not a census** (a row for an unoccupied slot reads whatever its last occupant left until a create zeroes it, and v1 publishes no liveness column); and **A ROW INDEX IS NOT A NAME** — the op answers the caller's own row and nothing else, so a general `top` that maps an arbitrary process to a row still wants either a per-row identity column or an op resolving a Process handle to its row. That is design 37's recorded follow-on, not built, because nothing in M5 consumes it. `Process.mint(rights:)` arrived with it, and is what makes the new bit attenuable at the typed tier: a supervisor may be handed a sibling that learns WHETHER its child is alive and may not watch it work. **THREE PROCESSES SINCE M4 UNIT 5** (sawos design 21, user-ruled Sep 2): driver-as-service needs root, a driver child and a client child alive at once, and the bump is `MAX_PROCESSES` and NOTHING ELSE — every per-process table was already indexed rather than assumed, `MAX_ATTACHMENTS` derives, and the PROTECTION-ROW budget is per DOMAIN so a third process adds nothing to it (root's own record stays at `IMAGE_GRANT_ROWS` = 3 whatever it wires up, because a launcher hands out capabilities and maps nothing). What DID move is two negative proofs: `process-reclaim` and `death-late-attach` ask whether a slot is AVAILABLE, and that question only has a load-bearing answer when the table is full, so each now creates one unstarted FILLER process to spend the slot the bump added — written against "the table is full" rather than against a number, so the next bump is one more filler. **AND `MAX_PROCESSES` IS A FLOOR SINCE M5 UNIT 6b (sawos design 36), NOT A CEILING.** A deployment DONATES memory to back more process slots (`SystemOp.SlabDonate`, §2's System row), so the compiled number is what the kernel boots with and the running bound is `process_slots_usable()` — `min(PROCESSES.capacity(), hal.PROT_DOMAIN_SLOTS)`. That second term is the honest half: a per-process translation-table set comes out of a STATIC HAL pool by ruling (donation does not reach HAL-internal storage), so a translating tier has a lower ceiling than its slab does and a create past it answers `NoResource` — a STATUS, not a fault, because the caller could not have known a number the kernel does not publish. `kcore.limits`' `static_assert(MAX_PROCESSES <= hal.PROT_DOMAIN_SLOTS)` is the compile-time half and now binds only the floor. **The sentence above about per-process tables being "already indexed rather than assumed" is true for a SECOND reason now**: they are not parallel arrays to index at all. A slab is one array keyed by its slot, so a `MAX_PROCESSES ×` table beside it would simply be left behind by a donation — the handle table, the quota ledger, the boot-handle queue and the grant record are all FIELDS of the process slot (`kcore.pslot`), and `p * MAX_HANDLES + i` unlearned its multiply. |
-| `System` | Kernel singleton (ratified Aug 5): the object behind system-scoped primitives so that EVERY syscall is an object op (§5.7) — v1 ops `debug_print`, `shutdown(status)` (stop the machine; QEMU: sifive_test), rights-gated (`SystemRight.Debug`/`.Shutdown`, §3 scoped rights). Root receives its handle at boot (§12). `exit` is NOT here — process exit belongs to the Process object when it exists (ratified Aug 5). M2 added a third op, `process_self` (design 178 unit 2): §3's derivation rule made real, so the boot register stays ONE handle wide and a process obtains its Process object THROUGH the System handle rather than being handed it. It was gated on the generic `Manage` until M3 unit 3 gave it `SystemRight.ProcessSelf` — a bit named for its op, per the Aug-29 doctrine, and a real attenuation seam: strip it and a child may print and tell the time and never learn its own identity. M3 added `clock_get` on `SystemRight.ClockGet` (design 232 unit 1: time is a granted capability) and, by sawos design 2's RIDER (Aug 29), `process_create` on `SystemRight.ProcessCreate` — the object's one FACTORY, here because a process is machine-wide and only this object is (§12's amended creation-authority note); `process_self` was already the precedent, since a Process handle has always come out of this object. **M3 unit 3 gave this object the launch flow's pivot** (sawos design 4, Aug-29 rulings): `root_system_rights()` gained `Transfer` — the M2 "nobody to transfer to" reason expired when unit 2 made a second process — so a launcher MINTS a masked sibling of its System handle (`MINT_OP`, §3) and GIVES that to a child. A child therefore bootstraps exactly as root does (§12's symmetry): System in the first argument register, its own Process handle derived from it, its boot set drained from there. `Debug` in the mask is what lets a child print without owning a device; `Shutdown` left out is what stops it halting the machine. **AMENDED M4 unit 4 (sawos design 18, `designs/010` agenda 7b): `process_self` takes a KEEP MASK**, intersected with the ONE Process default set, so a process can narrow the Process handle it derives at the moment it derives it — which closes §9's recorded finding that `ProcessRight.InterruptBind` and `ProcessRight.Map` were nobody's to withhold. THE ADDRESSEE IS STILL THE DERIVER and not the launcher: a keep mask on this op is a process narrowing ITSELF (a driver that has bound its line dropping the authority to bind another, a plugin deriving a handle that cannot start children), which is the privilege-drop shape a capability system should have and the launcher's mask on the System handle remains the launcher's lever. Fail-closed like every other keep mask: a bit the default set lacks is ignored. **AND M5 GAVE THIS OBJECT THREE MORE OPS, each on its own right in the root set, each here for the same reason `ProcessCreate` is — it names a MACHINE-WIDE fact or resource, and this is the only object that is machine-wide.** `SlabDonate` (`SystemRight.SlabDonate`, sawos designs 32/34/36, M5 unit 6): a holder DONATES a `Memory` region to back a named object KIND's slab, consuming the capability, permanently in v1 — so the compiled limits become a FLOOR and CAPACITY BECOMES POLICY, decided by the deployment rather than by the build. The region must have no live mappings and no sibling references (`BadState` otherwise): the kernel never shares slab backing with user-reachable memory. `TierGet` (`SystemRight.TierGet`, design 35, M5 unit 4) answers the PROTECTION TIER — `Isolated` or `Flat`, two words (§5b) — and is the first op on any object that answers a plain fact about the machine: it reads no state, spends no resource, takes no argument and cannot fail. `StatsRegionMap` (`SystemRight.StatsRegionMap`, design 37, M5 unit 7) hands out READ-ONLY access to the kernel's published trap-counter page without minting anything that owns it; see the `Stats` block in the `Process` row above. "Later candidates: info queries" is what `TierGet` turned out to be, and the answer it settles is that such an op belongs HERE and is gated like any other. |
+| `AddressSpace` | Isolation domain, defined abstractly. P4: PMP region set + APM/REE security context (see §5.5 — the P4's MMU is real but global and external-memory-only, not per-process). Paging targets: page-table root. There is no AddressSpace object: the domain is the process (see below). |
+| `Thread` | Kernel-scheduled execution context bound to an AddressSpace. Saw's cooperative TaskGroups run *inside* a thread, in userspace — the kernel never sees tasks. Ops `Start`/`Join`/`Exit`/`Yield`; rights `ThreadRight.Start`/`.Join`/`.Control`. The saved trap frame is the context, so a switch is the trap handler returning a different frame (§7). Lifecycle: §8. |
+| `MemoryObject` | A range of RAM that can be mapped into AddressSpaces; the kind is `Memory`. Ops `Split`/`Map`; rights `MemoryRight.Split`/`.Map`/`.MapExecute`. Roots are minted at boot from the region table. §2.5. |
+| `IoMemoryObject` | Physical memory-mapped device registers; the kind is `IoMemory`. A distinct kind rather than a flag on `MemoryObject`, so a driver cannot obtain a cacheable view of a register block by construction. Ops `Carve`/`Map`; rights `IoMemoryRight.Carve`/`.Map`. §2.5. |
+| `Mapping` | One installed protection row, with its own handle. Ops `Unmap`/`Base`; rights `MappingRight.Unmap`/`.Base`. Not givable. §2.5. |
+| `Pipe` | Synchronous message IPC with request/reply built in. Four kinds: `PipeInlet` and `PipeOutlet` (the client and server ends of a connection) and `PipeReply` and `PipeRequest` (the client's claim on one reply and the server's obligation to send it). §2.1. |
+| `Event` | Accumulating non-blocking notification (OR / saturating-sum); a waitable. Ops `Signal`/`Receive`, the mode chosen by the caller at creation (`event_create(mode:)`). The word is consumed by whoever takes it, through either door — `receive` is the non-blocking poll, a `Waiter.wait` delivery is the blocking one, and both read and clear, so a value is reported exactly once. §2.2, §2.4. |
+| `Clock` | A granted time source — time is a capability, not an ambient facility. §2.6. |
+| `Timer` | Deadline object bound to the Clock that created it; directly waitable. The process-sleep primitive. §2.6. |
+| `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it and ack through the handle. One op (`Ack`), two rights (`InterruptRight.Wait`/`.Ack`), created by `ProcessOp.InterruptBind` on its own Process right — the factory bit a launcher strips from everything that is not a driver. The binding is the object's existence (creation takes the line, there is no rebind), which stops one handle naming two devices over its life. A line the board does not have, the timer's line, and a line already bound are all faults. §9. |
+| `Waiter` | Generic wait aggregator (epoll/Port-style). Ops `Add`/`Remove`/`Wait`; rights `WaiterRight.Attach`/`.Wait`; the wait answer is a copy-out record. §2.2. |
+| `Process` | AddressSpace + handle table + threads. No kernel Job or hierarchy. The kernel guarantees teardown on exit or fault — closing all handles, freeing/unmapping owned memory. Supervision (restart, kill-trees, launchd-style) is a userspace concern. §2.7, §8, §12. |
+| `System` | Kernel singleton: the object behind system-scoped primitives, so that every syscall is an object op (§5.7). §2.8. |
 
-**Fifteen of these kinds exist today** — System, Process, Thread, Event,
-Waiter, Interrupt, Clock, Timer, MemoryObject (M3 unit 2), IoMemoryObject and
-Mapping (M3 unit 4), since M4 unit 1 **PipeInlet and PipeOutlet**, and since M4
-unit 2 **PipeReply and PipeRequest**
-(`ObjType`, `kernel/abi/`, the kernel-internal numbering §5.7's vDSO discipline
-keeps renumberable). **THE `Pipe` ROW IS NOW FOUR KINDS AND NOT ONE**, which is
-design 10 D-1's ruling plus §2.1's own ratified pair rather than an
-implementation choice: a connection is a PAIR of counted endpoint kinds and each
-in-flight message is a second pair — the client's claim on a reply and the
-server's obligation to send it — with "Pipe" surviving as the collective name,
-and the row above says what the M4 slices built of it.
+The kinds are System, Process, Thread, Event, Waiter, Interrupt, Clock, Timer,
+Memory, IoMemory, Mapping, PipeInlet, PipeOutlet, PipeReply and PipeRequest
+(`ObjType`, `kernel/abi/`, the kernel-internal numbering §5.7's
+vDSO discipline keeps renumberable). The `Pipe` row is four kinds rather than
+one: a connection is a pair of counted endpoint kinds, and each in-flight
+message is a second pair — the client's claim on a reply and the server's
+obligation to send it — with "Pipe" the collective name.
 
-**AND TWELVE OF THE FIFTEEN ARE COUNTED** (sawos design 7 D-1, M3 unit 5). Every
-countable kind's slab slot carries the number of handle entries naming it —
-plus, for a waitable, its attachment — and reaching ZERO frees the slot
-synchronously, inside the syscall that dropped the last reference. The column,
-enumerated per kind so that a new kind fails to compile until somebody says what
-references it:
+**Every kind but Thread, Clock and System is counted.** Every countable kind's
+slab slot carries the number of references naming it, and reaching zero frees
+the slot synchronously, inside the syscall that dropped the last reference. The
+column is enumerated per kind, so that a new kind fails to compile until
+somebody says what references it:
 
 | kind | counted references |
 |---|---|
@@ -71,1960 +67,2115 @@ references it:
 | Waiter | handle entries |
 | Interrupt | handle entries + its attachment |
 | Timer | handle entries + its attachment |
-| MemoryObject / IoMemoryObject | handle entries |
-| Mapping | handle entries — **NOT its row**, which the Mapping owns rather than the reverse (§2.5) |
-| Process | handle entries **+ its attachment** (M3 unit 5.5, sawos design 8 — a Process handle is a waitable now, and an attachment counts on every waitable); a LIVE process is never freed by losing its last handle, and a `Gone` one's slot is reclaimed exactly as design 3 D-3 ruled — this count is that ruling's handle-table scan, kept rather than recomputed. The attachment column is what makes attach-after-death SOUND against that reclaim: a watched dead slot cannot reach zero while somebody is watching it |
-| PipeInlet | handle entries **+ its attachment** — **ON THE CONNECTION'S INLET COLUMN** (M4 unit 1, sawos design 13; the attachment column is M4 unit 3's, sawos design 15). The two endpoint kinds share one `PIPES` row and count on SEPARATE columns, which is what makes "every client handle is gone" askable at all; a side reaching zero raises PEER-GONE on the other, and the SLOT frees only when BOTH columns are zero. **THE ATTACHMENT IS PER END, not per connection**: a client waits for ROOM and a server waits for a MESSAGE, so §2.2's at-most-one-Waiter rule holds per column exactly as the count does |
-| PipeOutlet | handle entries **+ its attachment** — the same row's OUTLET column, mirrored. The two arms of `free_object` are one act written twice, because reaching it through either kind means both columns are already zero |
-| PipeReply | handle entries **+ its attachment** — **ON ONE RING SLOT'S CLAIM COLUMN** (M4 unit 2, sawos design 14; the attachment column is M4 unit 3's). **A DELIVERY OF THIS KIND DROPS THAT ATTACHMENT'S REFERENCE** (design 10 ruling 11(b)) — a claim is a one-shot, so its delivery is inherently consuming — which is the one place in the ledger where answering a wait is what frees an object. A one-shot exists for exactly as long as one in-flight message, so the pair is RING-SLOT STATE rather than a third slab: the object is an EXCHANGE (`connection * PIPE_INFLIGHT + ring slot`) and the claim counts on its reply column. The ring slot goes back when both of the exchange's columns are zero AND nothing is owed — a STAGED message is still owed to a live outlet whatever became of its claim, which is §2.1's TELL idiom |
-| PipeRequest | handle entries **+ its attachment** — the same exchange's OBLIGATION column, mirrored. Reaching zero on ONE column is the ABANDONMENT transition, read off the counts by `reply` and `resolve` exactly as the connection's peer-gone is; and the CONNECTION cannot free while any exchange in it is live, which is what keeps a claim from being handed a recycled row |
-| Thread | **NOT COUNTED IN v1** — the join/exit protocol owns a thread slot's lifetime on terms a handle count cannot express (`Exited` is a state a slot stays in so a late join still finds the exit code, and a joiner holds no handle). Recorded, deferred; the slot comes back at the teardown |
-| Clock | **EXEMPT** — kernel-eternal, owned by nobody (the Aug-17 ruling). Freeing a domain's slot on a release would take the machine's counter from everybody else |
-| System | no slab: the singleton every process's boot handle names |
+| MemoryObject / IoMemoryObject | handle entries (a Memory's installed grant rows are a second count, §2.5) |
+| Mapping | handle entries — not its row, which the Mapping owns rather than the reverse (§2.5) |
+| Process | handle entries + its attachment. A live process is never freed by losing its last handle, and a `Gone` one's slot is reclaimed when the count reaches zero (§2.7). The attachment column is what makes attach-after-death sound against that reclaim: a watched dead slot cannot reach zero while somebody is watching it |
+| PipeInlet | handle entries + its attachment, on the connection's inlet column. The two endpoint kinds share one `PIPES` row and count on separate columns, which is what makes "every client handle is gone" askable at all; a side reaching zero raises peer-gone on the other, and the slot frees only when both columns are zero. The attachment is per end, not per connection: a client waits for room and a server waits for a message, so §2.2's at-most-one-Waiter rule holds per column exactly as the count does |
+| PipeOutlet | handle entries + its attachment — the same row's outlet column, mirrored. The two arms of `free_object` are one act written twice, because reaching it through either kind means both columns are already zero |
+| PipeReply | handle entries + its attachment, on one ring slot's claim column. A delivery of this kind drops that attachment's reference — a claim is a one-shot, so its delivery is inherently consuming — which is the one place in the ledger where answering a wait is what frees an object. A one-shot exists for exactly as long as one in-flight message, so the pair is ring-slot state rather than a third slab: the object is an exchange (`connection * PIPE_INFLIGHT + ring slot`) and the claim counts on its reply column. The ring slot goes back when both of the exchange's columns are zero and nothing is owed — a staged message is still owed to a live outlet whatever became of its claim, which is §2.1's TELL idiom |
+| PipeRequest | handle entries + its attachment — the same exchange's obligation column, mirrored. Reaching zero on one column is the abandonment transition, read off the counts by `reply` and `resolve` exactly as the connection's peer-gone is; and the connection cannot free while any exchange in it is live, which keeps a claim from being handed a recycled row |
+| Thread | not counted in v1 — the join/exit protocol owns a thread slot's lifetime on terms a handle count cannot express (`Exited` is a state a slot stays in so a late join still finds the exit code, and a joiner holds no handle). The slot comes back at the teardown |
+| Clock | exempt — kernel-eternal, owned by nobody (§2.6). Freeing a domain's slot on a release would take the machine's counter from everybody else |
+| System | no slab: the singleton every System handle names |
 
-**AND M4 UNIT 4's STAGED HANDLES ADD NO ROW AND NO NEW COLUMN TO THIS TABLE —
-BUT THEY ADD A SECOND KIND OF HOLDER** (sawos design 18; `designs/010` ruling 5
-as re-ruled Sep 2 — take-at-post). A handle riding in a staged message is not a
-handle entry at all: the entry was UNBOUND at the post and the reference it was
-holding was parked in the ring slot, so what counts on the object's column is
-THE KERNEL rather than a table. Every column above is unchanged and no kind had
-to learn about messages; what changed is that "handle entries" is no longer the
-only thing that can be holding one, and a message is the second — which is why
-`Waiter`'s attachment column has company in the reasoning even though it has
-none in the table.
-That is what makes the guarantee mechanical: an object a message is carrying
-cannot reach zero while the message exists, so it cannot be freed by its
-sender's teardown and it is still there when the receiver takes. THE MOVE IS
-`Give`'s (§3), performed in two halves — unbind here at the post, bind there at
-the rendezvous, rights verbatim, the count raised before it is lowered at each
-half — so a transfer changes no count and a message in flight changes none
-either.
-The unwind is the price: an arm that drops a staged message must RELEASE what
-it was holding, which is the outlet's zero-arm and every exchange settle. The
-inlet's zero-arm must not, because close-drains-first says the message is still
-owed to a live outlet.
+**A staged message is a second kind of holder.** A handle riding in a staged
+message is not a handle entry: the entry was unbound at the post and the
+reference it held was parked in the ring slot, so what counts on the object's
+column is the kernel rather than a table (§2.1). No column above is affected and
+no kind has to know about messages; handle entries are simply not the only thing
+that can hold a reference. That makes the delivery guarantee mechanical: an
+object a message is carrying cannot reach zero while the message exists, so it
+cannot be freed by its sender's teardown, and it is still there when the
+receiver takes. The move is `Give`'s (§3), performed in two halves — unbind at
+the post, bind at the take or delivery, rights verbatim, the count raised before
+it is lowered at each half — so a transfer changes no count and a message in
+flight changes none either. The price is the unwind: an arm that drops a staged
+message must release what it was holding, which is the outlet's zero-arm and
+every `exchange_settle`. The inlet's zero-arm must not, because
+close-drains-first says the message is still owed to a live outlet.
 
-The three kinds with LAST RITES are the three that hold something outside their
-slab: an Interrupt masks its line (and is then bindable again, mid-life), a
+**Last rites.** Three kinds hold something outside their slab and act on it when
+they free: an Interrupt masks its line (and is then bindable again, mid-life), a
 Timer reprograms the comparator, and a Waiter detaches its list — which may take
-a waitable to zero in turn, the one cascade, terminating because an attachment
-references the WAITABLE and never the Waiter that holds it.
+a waitable to zero in turn, a cascade that terminates because an attachment
+references the waitable and never the Waiter that holds it. A Waiter's free also
+wakes its parked threads (§2.2). Delivery and the ledger are mutually recursive
+— a delivery can drop a counted reference (a one-shot attachment detaches at its
+copy-out) and a dropped reference can deliver (a column reaching zero raises a
+peer-gone level) — so both live in one module, `kcore.refs`.
 
-**AddressSpace is still implicit, and unit 4 is what makes the absence
-deliberate rather than pending.** Each process gets one granted range plus a
-writable window, and its protection rows are recorded in its process slot and
-REPLAYED by the scheduler when it switches in (sawos design 2 D-5). That record
-is what an AddressSpace object would own if one existed — and a `Mapping` is now
-a handle onto ONE ROW OF IT, which is the shape that would have needed the
-object most. It did not: `map` names a target PROCESS, because §5b says the
-domain IS the process on both profiles, so an AddressSpace object would be a
-second name for a thing every op already has. Nothing above it would change if
-it existed. §11 is the ledger.
+**AddressSpace is implicit, deliberately.** Each process gets one granted range
+plus a writable window, and its protection rows are recorded in its process slot
+and installed when the scheduler switches it in (§7). That record is what an
+AddressSpace object would own if one existed, and a `Mapping` is a handle onto
+one row of it. `map` names a target process, because §5b says the domain is the
+process on every profile, so an AddressSpace object would be a second name for a
+thing every op already has. Nothing above it would change if it existed.
 
-### 2.1 Pipes: bounded messages + built-in request/reply (ratified Jul 29;
-### renamed from Channels + client API amended Aug 20)
+### 2.1 Pipes: bounded messages and built-in request/reply
+
+**The model.**
 
 - **`send(data?, handles?) -> PipeReplyHandle`.** Body bytes are copied
-  from the sender's address space; handles are attached but TRANSFERRED
-  into the receiver's table only when the receiver actually receives
-  the message (rendezvous transfer — no orphaned handles if the send
-  is abandoned). Both are OPTIONAL (data-only, handles-only, or both).
-- **Bounded by design (kept simple on purpose):** a fixed maximum body
-  size and a fixed maximum handle count per message → the kernel
-  stages one message in a fixed slot, zero dynamic kernel allocation.
-  Bulk data goes through shared memory (§2.5); the small message
-  carries the MemoryObject handle. (Concrete limits: TBD — a small
-  body, e.g. 64–256 bytes, and a handful of handles.)
-- **Request/reply is a PRIMITIVE, not a convention.** `send` returns a
+  from the sender's address space; handles travel with the message and are
+  moved into the receiver's table (the transfer rule is below). Both are
+  optional: data-only, handles-only, or both.
+- **Bounded by design, kept simple on purpose:** a fixed maximum body size
+  and a fixed maximum handle count per message, so the kernel stages messages
+  in fixed slots with zero dynamic kernel allocation. Bulk data goes through
+  shared memory (§2.5); the small message carries the MemoryObject handle.
+- **Request/reply is a primitive, not a convention.** `send` returns a
   **PipeReplyHandle** — a single-use, one-shot "reply pipe" the sender
   waits on. `receive(...) -> (message, PipeRequestHandle)` returns a
   matching one-shot **PipeRequestHandle** the server replies through
   (`request.reply(data?, handles?)`). Properties:
   - The reply capability is unforgeable and **consumed on reply**
-    (NoCopy in Saw — the type system enforces single-use on top of the
+    (NoCopy in Saw — the type system enforces single use on top of the
     kernel's own check).
   - If the server drops its PipeRequestHandle without replying, the
     client's wait wakes with a **peer-closed error** — no hung
     clients, no timeout hacks. (seL4 call/reply + Zircon channel-call,
     fused.)
-  - PipeReplyHandle/PipeRequestHandle **are transferable** (ratified Jul 29) —
-    this is the delegation primitive, not a hazard. A server may MOVE
-    its PipeRequestHandle to a third party who replies directly to the
+  - PipeReplyHandle/PipeRequestHandle **are transferable** — this is the
+    delegation primitive, not a hazard. A server may move its
+    PipeRequestHandle to a third party who replies directly to the
     original client. **Canonical example — zero-copy delegation:** the
-    filesystem receives a read (a PipeRequestHandle), forwards that handle
-    over a pipe to the flash driver; the flash driver replies
+    filesystem receives a read (a PipeRequestHandle) and forwards that
+    handle over a pipe to the flash driver; the flash driver replies
     through it with the hardware bytes straight to the client — the
-    payload never transits the fs address space. Single-use is
+    payload never transits the fs address space. Single use is
     preserved through transfer: the handle is consumed on reply
     regardless of who holds it (transfer moves the reply *obligation*).
-  - **Fire-and-forget is NOT a pipe concern** — use an Event
-    (§2.4), the accumulating non-blocking notification object. (Amended
-    Aug 20: the TELL idiom below sanctions the payload-carrying one-way
-    message; Event remains the payload-free door.)
+  - **Payload-free fire-and-forget is not a pipe concern** — use an Event
+    (§2.4), the accumulating non-blocking notification object. The TELL
+    idiom below is the payload-carrying one-way message.
 
-**AMENDED Aug 20 (user) — the RENAME and the client API.** The object is a
-**Pipe** (was Channel): the old name collided with Saw's own `Channel`
-while sharing none of its semantics (buffered queue, any-holder close,
-fire-and-forget — everything a rendezvous request/reply object is not),
-and the planned Plan 9-style namespace resolves paths like `/dev/uart0` to
-a server-owned object speaking a protocol, which is the NAMED-PIPE model
-nearly verbatim (path-registered, message-framed, transactional). `Pipe`
-names the PER-CLIENT connection object; the path-attached acceptor the
-namespace will need is a separate, later object, named in the namespace
-design. Handle types follow the abi's object-kind convention —
-`PipeHandle`, `PipeRight`, and the auxiliary pair `PipeRequestHandle` /
-`PipeReplyHandle` (the prefix also reserves bare Request/Reply for a
-future protocol layer's own message types).
+**The name.** The object is a **Pipe**. Saw has its own `Channel` with different
+semantics (any-holder close and fire-and-forget sends, where a Pipe is a bounded
+request/reply connection whose ends close separately), and the planned Plan
+9-style namespace resolves paths like `/dev/uart0` to a server-owned object
+speaking a protocol, which is the named-pipe model nearly verbatim
+(path-registered, message-framed, transactional). `Pipe` names the per-client
+connection; the path-attached acceptor the namespace will need is a separate,
+later object, named in the namespace design and not built. Handle types follow
+the abi's object-kind convention: `PipeInletHandle` and `PipeOutletHandle` for
+the two ends, and the auxiliary pair `PipeRequestHandle` / `PipeReplyHandle`
+(the prefix also reserves bare Request/Reply for a future protocol layer's own
+message types). Rights and ops are per endpoint kind
+(`PipeInletRight`/`PipeInletOp` and so on).
 
-The client API (superseding Jul 31's separate `call` verb): ONE `send`
-name, overloaded by the presence of `timeout:` — a runtime flag cannot
-change a return type, so blocking-ness is never a parameter.
-`pipe.send(msg) -> Result<PipeReply, PipeError>` suspends until the reply;
-`pipe.send(msg, timeout: Duration) -> Result<PipeReply, PipeSendError>`,
-where `case TimedOut(pending: PipeReplyHandle)` carries the still-live
-claim in the error payload. `PipeReply` is the RESOLVED reply (body plus
-transferred handles); a `PipeReplyHandle` resolves to one. The split-phase
-form (send now, wait later; returns the bare `PipeReplyHandle`) is what a
-client attaches to a Waiter to multiplex outstanding requests; its method
-name is an M4-brief decision (leading candidate `post`).
+**The client API.** Blocking-ness is never a parameter — a runtime flag cannot
+change a return type — so the blocking and split-phase forms are different
+verbs. `send(msg)` (and `send_with`, carrying handles) suspends until the reply;
+there is no `timeout:` overload. The split-phase form (send now, wait later;
+returns the bare claim) is `post`, and it is what a client attaches to a Waiter
+to multiplex outstanding requests. `send(msg, timeout:)` is the caller's own
+composition (below); its contract is that a timeout leaves the still-live claim
+in the caller's hands.
 
-**Abandoned requests** (a client drop and a client crash are the same
-event to the kernel): `reply()` to an abandoned request answers
-`Err(PeerClosed)`, never a silent success — ignorable with `let _ =`, the
-std-Channel close precedent. The obligation is discharged and attached
-handles closed either way. The `PipeRequestHandle` is WAITABLE for
-"abandoned" (opt-in early notice; state on the kernel object, so it
-travels with a delegated handle). Drop of a `PipeReplyHandle` is thereby
-the CANCELLATION primitive — time out, then drop the pending handle; no
-`cancel()` verb, and deterministic destruction makes the timing
-deterministic. ABANDONMENT IS INFORMATION, NOT AN IMPERATIVE: whether it
-cancels is the protocol's per-request-type decision (a tell-style message
-ignores the signal; a cancellable read honors it). The TELL idiom is
-sanctioned: send-then-drop carries data an Event cannot, the server
-discharging with `let _ = request.reply()`; it is spelled on the
-split-phase form, since the suspending `send` would wait for the very
-reply it is about to discard.
+**Abandoned requests** (a client drop and a client crash are the same event to
+the kernel): `reply()` to an abandoned request answers `Err(PeerClosed)`, never
+a silent success — ignorable with `let _ =`, the std-Channel close precedent.
+The obligation is discharged either way. The handles attached to such a reply
+are not taken — the kernel takes nothing from a reply to an abandoned request —
+so the replier keeps them, and the typed tier hands them back. Not yet enforced
+at the typed tier: `reply_with` and `reply_wait_with` empty their handle carrier
+before reading the status, so the handles stay in the replier's table with no
+wrapper naming them. The `PipeRequestHandle` is waitable for "abandoned" (opt-in
+early notice; state on the kernel object, so it travels with a delegated
+handle). Dropping the last reference to a claim is thereby the cancellation
+primitive — time out, then drop the pending claim; no `cancel()` verb, and
+deterministic destruction makes the timing deterministic. A handle drop with a
+live attachment is not abandonment: the subscription is the interested party,
+and a client that gave its claim to one holds no handle at all, so what signals
+cancellation is the last reference going — removing the attachment, or the
+Waiter dying before delivery. Abandonment is information, not an imperative:
+whether it cancels is the protocol's per-request-type decision (a tell-style
+message ignores the signal; a cancellable read honors it). The TELL idiom is
+sanctioned: send-then-drop carries data an Event cannot, the server discharging
+with `let _ = request.reply()`; it is spelled on the split-phase form, since the
+suspending `send` would wait for the very reply it is about to discard.
 
-**BUILT WHOLE — M4 (sawos designs 13, 14, 15, 17, 18, 21 and 22, over the rulings
-of `designs/010`).** Nothing ratified above is reopened, and nothing in this
-section is a promise: the message model is complete in both halves and both
-directions — DATA, HANDLES, request and reply — the delegation example runs as a
-protocol across three real processes, and a device driver serves real clients
-through it. What follows describes THE BUILT THING rather than the order it
-arrived in. Each part cites the unit that executed it, so the reasoning is one
-hop away without being restated here.
+**The connection is a pair of counted endpoint kinds.** `PipeInlet` is the
+client end — requests flow in — and `PipeOutlet` is the server end, where they
+come out; "Pipe" is the pair's collective name. Roles are objects rather than
+rights: a single symmetric object cannot express "the writers went to zero" (a
+parked receiver is itself a holder — the socket-`shutdown()` hole), and a
+rights-partitioned count would be a second ledger beside the reference count,
+so the two kinds share one slab row with two reference columns, and which
+column a handle counts on is decided by its kind — which §3's order
+establishes before any right is read. The factory is `ProcessOp.PipeCreate` on
+`ProcessRight.PipeCreate` — pipes are IPC and carry nothing system-shaped, so
+the authority is per-process and attenuable — answering both ends through a
+two-word copy-out record, because one op returns one word. Both ends carry
+`Transfer`, so a launcher creates the pair and wires it outward with `give`,
+and a child drains an end out of its boot set.
 
-- **THE CONNECTION IS A PAIR OF COUNTED ENDPOINT KINDS** (design 13;
-  `designs/010` D-1 and ruling 3). `PipeInlet` is the CLIENT end — requests flow
-  IN — and `PipeOutlet` is the SERVER end, where they come out; "Pipe" survives
-  as the pair's collective name, which is what the ratified "per-client
-  connection object" sentence names. ROLES ARE OBJECTS rather than rights: a
-  single symmetric object cannot express "the writers went to zero" (a parked
-  receiver is itself a holder — the socket-`shutdown()` hole) and a
-  rights-partitioned count would be a SECOND LEDGER against design 7's doctrine,
-  so the two kinds share ONE slab row with TWO reference columns and "every
-  client handle is gone" is the ledger that already exists. The factory is
-  `ProcessOp.PipeCreate` on `ProcessRight.PipeCreate` — pipes are IPC and carry
-  nothing system-shaped, so the authority is per-process ATTENUABLE — answering
-  both ends through a copy-out record. Both ends carry `Transfer`, so a launcher
-  creates the pair and wires it outward with `give`.
-- **THE STAGING IS A RING OF FIXED SLOTS** (design 13; ruling 6). The body
-  maximum is `PIPE_BODY_BYTES` (128, inside this section's ratified 64–256
-  range) and the ring is `PIPE_INFLIGHT` (`2 × MAX_THREADS`) slots — build
-  defines pinned by `static_assert`, and they live in two places for one
-  reason: the body maximum and `PIPE_MSG_HANDLES` are a PUBLISHED CONTRACT a
-  caller sizes buffers against, so they sit in `kernel/abi/` beside the record
-  layouts, while the ring depth is nobody's business but the kernel's and sits
-  in `kcore.limits` with the slab sizes. That is
-  ruling 6's amendment to "the kernel stages one message in a fixed slot": the
-  property the sentence exists for — ZERO DYNAMIC KERNEL ALLOCATION — is
-  untouched, and what it buys is a client posting again before the server has
-  taken the first. Body bytes are COPIED from the sender through §2.2's copy-in
-  funnel, and the `data?` optionality is real: a zero-length body is a legal
-  MESSAGE, distinguishable at the typed tier from nothing staged.
-- **PEER-CLOSED IS READ OFF THE COLUMNS** (design 13; the peer-gone doctrine,
-  ruling 2). A post whose outlet column reached zero answers
-  `SosStatus.PeerClosed`; a take answers it only once the inlet column has
-  reached zero AND the ring is dry, because CLOSE DRAINS FIRST — everything
-  already staged is handed over before the server is told. The level is
-  TERMINAL: nothing un-closes.
-- **REQUEST/REPLY IS A PRIMITIVE HERE TOO, AND THE ONE-SHOT PAIR IS RING-SLOT
-  STATE** (design 14 D-1). `post` answers a **`PipeReplyHandle`** — the client's
-  claim on one reply — and the outlet's `take` answers the message together with
-  the matching **`PipeRequestHandle`**, minted into the taker's table. Both are
-  counted kernel objects, and where they LIVE is the unit's own answer: a
-  one-shot exists for exactly as long as one in-flight message, so the claim and
-  the obligation are two more reference columns on the staging slot that carried
-  the request and now carries the reply back. No third slab, no new quota row.
-  The visible consequence is that a ring slot lives until the exchange SETTLES
-  rather than until its bytes are taken, so the fixed in-flight budget bounds
-  AWAITING-REPLY EXCHANGES — which is what ruling 6's "in-flight messages per
-  client" says read literally.
-- **SINGLE USE IS THE LEDGER AND THE COMPILER BOTH** (design 14; SL-16 and
-  ruling 12(b)). `PipeRequestOp.Reply` and `PipeReplyOp.Resolve` each destroy the
-  caller's handle ENTRY, so the kernel's check stands for a raw-altitude caller;
-  above it `PipeRequest.reply`, `PipeRequest.reply_wait` and `PipeReply.resolve`
-  are all `consumes` methods whose callers spell `(move …)`, so a second use is a
-  COMPILE error before the ledger is ever asked. Both one-shots are
-  **TRANSFERABLE** — the ratified delegation primitive — and the zero-copy
-  example is exercised end to end.
-- **ABANDONMENT IS DERIVED, NOT FLAGGED** (design 14). Server drops its
-  obligation -> the client's `resolve` answers `SosStatus.PeerClosed`; client
-  drops its claim -> the server's `reply()` answers `Err(PeerClosed)`, and THE
-  OBLIGATION IS DISCHARGED EITHER WAY, ignorable with `let _ =`. A message still
-  staged when the outlet column reaches zero is abandoned on the same terms,
-  because its obligation can never be minted. Cancellation-by-drop and the TELL
-  idiom both fall out of that and are exercised.
-  **THE RATIFIED SENTENCE RE-WORDS TO THE LAST REFERENCE** (ruling 11, amending
-  the "Abandoned requests" paragraph above): a handle drop with a LIVE
-  ATTACHMENT is not abandonment — the subscription is the interested party, and
-  a client that gave its claim to one holds no handle at all — so what signals
-  cancellation is the last reference going, which is removing the attachment or
-  the Waiter dying before delivery.
-- **ALL FOUR KINDS ARE WAITABLE, AND §2.2's LIST CLOSES OVER THEM** (design 15;
-  rulings 8, 9 and 11). The four `NotWaitable` refusal arms units 1 and 2 wrote
-  by hand are gone: the OUTLET is readable while a message is staged or the
-  client end is gone; the INLET is postable while the ring has room or the
-  server end is gone (ruling 8 — `post` can never block, so a refused poster
-  PARKS here instead of polling, and the payload word says which of the two it
-  was woken for); the REPLY is ready once its answer is written or can never be;
-  and the REQUEST is ready once the claim behind it was abandoned, which is this
-  section's ratified early notice. A server that does not attach still learns
-  that same fact the ratified way, at its own `reply()`.
-- **A DELIVERED REPLY IS THE RESOLVE** (design 15; ruling 11(a)/(b)). The wait
-  record carries the reply's bytes out of the ring slot that already holds them,
-  so a client that waits this way never calls `resolve` at all and a multiplexed
-  RPC is post + attach + wait. The delivery DISCHARGES the exchange — a claim the
-  caller kept answers `PeerClosed` at a later resolve, because a second copy of
-  an answer must not exist — and a one-shot kind's delivery detaches whatever
-  mode was passed, since a subscription to something that has happened for the
-  last time is a promise nothing can keep.
-- **THE RATIFIED `send(msg)` IS ONE KERNEL CALL** (design 17; ruling 4's Aug-31
-  rider as amended Sep 1). `PipeInletOp.Call` is POST, PARK AND RESOLVE BEHIND
-  ONE TRAP — THE COMPOSITION RUN WITHOUT RETURNING TO USERSPACE, so every rule
-  the composed path obeys applies verbatim (same ring, same body maximum, same
-  peer-gone answer) and it is gated by the EXISTING `PipeInletRight.Post`,
-  because what it adds is a PARK and a park is mechanics rather than authority.
-  It NEVER answers `WouldBlock`: a full ring parks on the inlet's room-to-post
-  level, reached from inside the op. And it takes NO DURATION — **THE KERNEL
-  STILL NEVER LEARNS WHAT A TIMEOUT IS.**
-- **`send(msg, timeout:)` IS THE CALLER'S OWN COMPOSITION, AND THERE IS
-  DELIBERATELY NO LIBRARY WRAPPER FOR IT** (user ruling, lead review Sep 1). The
-  shape is post + attach + wait plus a Timer on the same Waiter, which
-  `tests/pipe-send-manual` writes out inline: a wrapper TYPE would freeze a shape
-  the fused call replaces with a single kernel call, and a kernel-side timeout,
-  if a consumer ever names one, arrives as an OP rather than as a method.
-  `TimedOut(pending:)`'s substance holds without a type to carry it — the
-  composition uses the NON-consuming attach, so the claim is the caller's the
-  whole time and is simply still in hand when the Timer's key comes back.
-- **A FUSED CALL MINTS NOTHING** (design 17). The claim is KERNEL-INTERNAL and
-  tied to the parked thread — one reference on the exchange's claim column that
-  no handle table holds — so a blocking client spends no table row and no quota
-  on it, and `post` keeps minting the real handle for multiplexers. That is
-  design 14's finding that `MAX_HANDLES` rather than `PIPE_INFLIGHT` bounds a
-  client holding its claims, answered.
-- **`PipeRequestOp.ReplyWait` IS THE SERVER'S HALF, AND IT LIVES ON THE REQUEST**
-  (design 17; user-ruled Sep 1): a reply with a built-in wait, the reply being
-  the act that consumes the receiver and the wait the fused tail. It discharges
-  the obligation and then parks on a WAITER exactly as a plain `wait` parks —
-  never on the outlet directly, so the wake protocol stays SINGULAR — and the
-  waiter is REQUIRED, because the first turn of a loop and the dead-client
-  recovery are both the existing `WaiterOp.Wait` and reply-without-wait is the
-  existing `Reply`. **THE ANSWER NAMES ITS LEG**: a reply that does not land
-  returns `Err(Reply(...))` WITHOUT PARKING, so one dead client can never stall a
-  server loop, and `Wait(_)` means the reply landed. The request is CONSUMED on
-  every path, which is this section's ratified sentence unchanged.
-- **ABANDONMENT REACHES A PARKED CALLER THROUGH ONE WAKE ARM** (designs 17 and
-  22). A claim is either a subscription's or a parked thread's, and exactly one
-  place in the kernel tells them apart — a parked fused caller and a parked
-  resolver are one shape to it. `end_process` carries the mirror, so a process
-  dying with a thread parked in a call has that claim ABANDONED by its teardown
-  and the server's later `reply()` answers `Err(PeerClosed)` by the ratified
-  rule, with no new vocabulary anywhere.
-- **`send(data?, handles?)` MEANS WHAT IT SAYS** (design 18; ruling 5 as re-ruled
-  Sep 2, plus agenda 7b's keep-mask rider). A message carries up to
-  `PIPE_MSG_HANDLES` (4) handles on `Post`, `Call`, `Reply` and `ReplyWait`
-  alike — §2.1's `send` is one sentence and the answering direction is not a
-  different one — and all four take the message through ONE argument record,
-  because a body address, a length and four handle words no longer fit three
-  registers.
-- **A SEND IS HALF OF A MOVE — TAKE-AT-POST.** The handles a message carries
-  LEAVE THE SENDER AT THE POST: each entry is unbound, the reference it was
-  holding is parked in the ring note as a typed ref, and the sender's
-  handle-quota row is credited. They are MINTED INTO THE RECEIVER at the take or
-  the delivery, where the taker is charged. It is `Give`'s single act performed
-  in two steps with the kernel holding the reference in between, and each step
-  keeps `Give`'s own ordering — THE COUNT GOES UP BEFORE IT GOES DOWN, per
-  handle — so no object can transiently reach zero and be freed mid-move.
-  **WHAT IT BUYS IS A GUARANTEE: a message the kernel accepted delivers what it
-  was carrying, whatever becomes of the sender.** A capability handed over
-  fire-and-forget no longer races its sender's exit (`tests/pipe-send-exit` takes
-  the message after the sender is `Gone` and posts through what arrived), the
-  typed tier stops lying (`post_with` consumes the wrapper, and a consumed
-  wrapper must not come back), and **`None` IN A RECEIVED SLOT MEANS ONE
-  THING**: the sender left it empty. The Aug-30 ruling kept the entry with the
-  sender and re-validated it at the rendezvous, which was sound and delivered an
-  EMPTY slot when the sender let go; ruling 10's orphan accounting and design
-  260's `consumes` both post-date it and both point this way.
-  Two consequences beside the guarantee, each proved: a taker whose table or
-  quota cannot accept the batch refuses ATOMICALLY, leaving the message staged
-  with its references still held and its level raised (`tests/pipe-table-full`);
-  and the unwind arms are RELEASES — the outlet's zero-arm and every settle hand
-  the held references back, while the INLET's zero-arm deliberately does not,
-  because close-drains-first means a staged message is still owed to a live
-  outlet. **"No orphaned handles if the send is abandoned" now has something to
-  be true of, and it is true** — a send nobody takes releases exactly what it
-  took, at the arm that discovers nobody will.
-- **A HANDLE ARRIVING IN A MESSAGE IS TYPED AT THE BOUNDARY** (design 18,
-  user-ruled Sep 2), which is the `decode_boot_handle` precedent generalized: the
-  record carries a KIND byte per slot beside the word, so a receiver MATCHES a
-  `PipeHandle` out instead of holding a number. The six kinds a message may carry
-  are the givable ones the receiving vocabulary can name — `Memory`, `IoMemory`,
-  `PipeInlet`, `PipeOutlet`, `PipeReply`, `PipeRequest`. `Process` and `System`
-  are refused AT THE SENDER as a scope line rather than a rule: both wrappers
-  live above `sos.pipe` in the module order, so admitting them is a sysapi module
-  split and is a NAMED FOLLOW-UP (see the `Pipe` row in §2).
-- **THE DELEGATION EXAMPLE IS A PROTOCOL, ACROSS THREE REAL PROCESSES** (designs
-  18 and 21). A `PipeRequest` travelling in a message is the ratified zero-copy
-  example's own move made at RUN TIME, about a request that did not exist when
-  either process was launched — `give` could only ever wire one before `start`.
-  `tests/pipe-delegate-msg` is that flow across a process boundary with the
-  replier holding no end of the connection it answers on, and
-  `tests/pipe-delegate-3p` is the ratified paragraph with the names filled in:
-  root asks a MIDDLE process, the middle forwards the obligation in a message and
-  EXITS, and a FAR process answers it, with the bytes landing at root's original
-  claim. What three processes add is that the middle is a different PRINCIPAL
-  from both ends — its own table, its own quota, its own death — and that the
-  answer lands AFTER that death, which take-at-post is what makes irrelevant.
-- **AND THE DELIVERY CAN BE THE TAKE** (design 18; ruling 11(d)). A server that
-  attaches its outlet CONSUMING and PERSISTENT is handed each message through
-  `wait` itself, with the obligation minted at the delivery. It holds ZERO
-  endpoint handles for however many clients it serves, and hanging up IS
-  destroying the subscription.
-- **THE ONE-SHOT DISCIPLINE IS STRUCTURAL** (design 22; ruling 12) — three parts,
-  none of which changed a wire value. **`WouldBlock` IS AN ERROR** at the typed
-  tier: `take` and `post` carry no Optionals, and a genuine poller declares
-  itself with a `WouldBlock` arm (the poll split was written at unit 1, when
-  every caller polled; waitability and the fused paths inverted that population).
-  **`Resolve` PARKS AND CONSUMES ON EVERY PATH**: a pending exchange blocks the
-  calling thread on the claim's ready level, so the op ends the exchange
-  whichever way it returns — it is the waiter-free blocking receive, and it is
-  what lets `PipeReply.resolve` carry `consumes`. The poll it replaced is
-  `PipeReplyOp.Ready`, gated on `PipeReplyRight.Wait` because the level question
-  is the same question attaching asks: `Ok(true)` the answer is THERE (readiness
-  is monotonic, so check-then-act has no race), `Ok(false)` not yet and the
-  exchange is live, and the TERMINAL rides the ERROR channel — `Err(PeerClosed)`
-  means no answer can arrive, at which point the claim is DROPPED rather than
-  resolved. And **A ONE-SHOT HAS ONE NAME**: `Mint` leaves `pipe_reply_rights()`
-  and `pipe_request_rights()`, because a second name on an object one op spends
-  can only ever be told `PeerClosed`. Delegation is untouched — it is `Transfer`
-  MOVING the one name.
-- **DRIVER-AS-SERVICE, AND EVERY PIECE OF IT WAS ALREADY HERE** (design 21;
-  ruling 7(a), amended Sep 2 for multiple clients). This section ratified a
-  MESSAGE model, not a device model, and the unit that spends it added nothing
-  here: no op, no kind, no right, no status. What it adds is a PROGRAM — a UART
-  driver whose clients reach the device only through a pipe — and what is worth
-  recording is what that program did not need.
-  - **A BLOCKING READ IS COMPOSED, NOT BUILT.** A client that wants the next byte
-    spends a fused `Call` and parks. The driver, finding no input, HOLDS the
-    obligation — this section's transferable one-shot is state a server may
-    simply keep — and answers it when its interrupt line delivers something. The
-    kernel never learns what a UART is, exactly as it never learns what a
-    timeout is.
-  - **CANCELLATION IS THE RATIFIED DROP, AND THE SERVER IS TOLD BY A LEVEL IT WAS
-    ALREADY WATCHING.** A client that gives up composes its OWN deadline — a
-    Waiter with the claim and a Timer on it — and DROPS the claim when the timer
-    wins; the abandoned level fires at the driver, which discards the held
-    obligation and serves the next request. There is no `Cancel` op and no cancel
-    byte on the wire: a correlation the protocol would have had to carry is a
-    reference count the kernel already maintains (`tests/uart-cancel`).
-  - **A TELL IS THE ONE-WAY WRITE** — post-then-drop at the client, obligation
-    discharged by being dropped at the server: the idiom this section sanctioned,
-    in a real protocol rather than in a test.
-  - **MULTIPLE CLIENTS COST NO NEW MECHANISM AND NO SECOND CONNECTION.** Two
-    processes are clients of one service over ONE connection through MINTED
-    SIBLING INLETS — per-client authority as a keep mask rather than as a session
-    table — and each request carries its own reply obligation, so a
-    completion-queue server routes every answer to the claim that asked for it
-    with nothing on the wire to correlate. `tests/uart-service` pins TWO
-    outstanding reads in a FIXED ORDER (the second client's process does not yet
-    exist when the first request is posted, so the ring's FIFO decides it) and
-    each answer lands at its own claim in its own table.
-  - **WHAT THE NAMESPACE STILL OWES IS A PATH AND NOTHING ELSE.** A client finds
-    this service by a boot tag its launcher chose; `/dev/uart0` is the same
-    connection reached by a NAME, and the acceptor object that resolves one is
-    the separate, later design the Aug-20 amendment already named.
-- **THE TRAP LADDER, MEASURED RATHER THAN ASSERTED, AND STATED ONCE.** The
-  multiplexed composition is THREE traps per RPC (post, attach, wait). The fused
-  `Call` is ONE at the client, and `ReplyWait` takes the server from three per
-  message to TWO — because a readable level says "there is something" and never
-  "here it is", so the `take` stays its own op (`tests/pipe-pingpong` counts both
-  over `ProcessOp.Stats`, and `tests/pipe-send-manual` prints the client's two
-  numbers side by side). Ruling 11(d)'s delivery-as-take takes that TWO to ONE,
-  because the delivery IS the take: `tests/pipe-cq` serves at 10 traps the eight
-  round trips `pipe-pingpong` serves at 18, against the same client program.
-  **THE ONE-PER-MESSAGE FLOOR IS FOR A MESSAGE THE SERVER ANSWERS** (design 21's
-  refinement). A TELL costs the server TWO, and the second is not overhead:
-  nothing is owed back, so there is nothing to reply to, and the obligation the
-  delivery minted has to be RELEASED — which is a syscall because a one-way
-  message carries a real capability rather than a datagram. `reply_wait` on an
-  abandoned claim answers without parking, so there is no cheaper spelling.
-- **A SPELLING NOTE, so a later reader is not surprised.** The tree renders a §2
-  object name short at its typed tier — `MemoryObject` is `Memory`,
-  `PipeInlet`'s handle alias is `PipeInletHandle` — so `sos`'s owning wrappers
-  for the one-shot pair are `PipeReply` and `PipeRequest`, with
-  `PipeReplyHandle` / `PipeRequestHandle` as the `sosabi` aliases they wrap. That
-  takes the name the client-API paragraph above uses for the RESOLVED reply
-  value, and what the resolved value is actually called is **`PipeMsg`** — the
-  same struct a reply delivery carries, which is why there is one type and not
-  two, with `ReplyDelivery` the wait record's name for the delivery that carries
-  it.
+**The staging is a ring of fixed slots.** The body maximum is `PIPE_BODY_BYTES`
+and the ring is `PIPE_INFLIGHT` slots per connection, both build defines.
+`static_assert`s pin `PIPE_BODY_BYTES` to at least 8 (a body holds at least one
+64-bit word), a multiple of 8 (a staging slot is doubleword-sized on both
+profiles), at most 1024 (a body is copied with interrupts masked, so it stays
+bounded), and — the binding bound — at most `UInt8.max`, because a delivery's
+body length rides one byte of the packed meta (§2.2). `PIPE_INFLIGHT` is
+`2 × MAX_THREADS` — two per thread, so a system in which every thread has a
+request in flight and a reply outstanding still cannot fill the ring on the
+sender's own account — and is pinned to 1..64, since the ring is inline per
+connection. The ring delivers in post order (FIFO). The two defines live in two
+places for one reason: the body maximum and `PIPE_MSG_HANDLES` are a published
+contract a caller sizes buffers against, so they sit in `kernel/abi/` beside the
+record layouts, while the ring depth is nobody's business but the kernel's and
+sits in `kcore.limits` with the slab sizes. A ring rather than a single slot is
+what lets a client post again before the server has taken the first; zero
+dynamic kernel allocation is untouched. Body bytes are copied from the sender
+through §2.2's copy-in funnel, and the `data?` optionality is real: a
+zero-length body is a legal message, distinguishable at the typed tier from
+nothing staged.
 
-### 2.2 Waiter: the generic wait aggregator (ratified Jul 29)
+**Ops.** `PipeInletOp.Post` (`PipeInletRight.Post`) stages a message and
+answers the claim; `PipeOutletOp.Take` (`PipeOutletRight.Take`) answers the
+message together with the matching obligation, minted into the taker's table.
+A full ring at `Post` and an empty one at `Take` both answer
+`SosStatus.WouldBlock`, and `WouldBlock` is an error at the typed tier: `take`
+and `post` carry no Optionals, and a genuine poller declares itself with a
+`WouldBlock` arm. `PipeReplyOp.Resolve` and `PipeRequestOp.Reply` each spend
+their own right (`PipeReplyRight.Resolve`, `PipeRequestRight.Reply`) and each
+destroy the caller's handle entry. `PipeInletOp.Call`, `PipeRequestOp.ReplyWait`
+and `PipeReplyOp.Ready` are described below.
+
+**Peer-closed is read off the columns** — the peer-gone doctrine (§2.2). The
+outlet column reaching zero drops what is staged, and every later `Post`
+answers `SosStatus.PeerClosed`. The inlet column reaching zero drains first:
+`Take` hands over everything already staged, and only once the inlet column is
+zero and the ring is dry does it answer `PeerClosed`. The level is terminal:
+nothing un-closes. Accounting is creator-pays: one `QuotaKind.Pipe` row
+charged at create, credited when both columns reach zero and the slot goes back
+(§2.9).
+
+**The one-shot pair is ring-slot state.** A one-shot exists for exactly as
+long as one in-flight message, so the claim and the obligation are two more
+reference columns on the staging slot that carried the request and now carries
+the reply back — no third slab and no new quota row. A ring slot therefore
+lives until the exchange settles rather than until its bytes are taken, so
+`PIPE_INFLIGHT` bounds awaiting-reply exchanges (in-flight messages per
+client, read literally).
+
+**Single use is the ledger and the compiler both.** `Reply` and `Resolve`
+destroy the caller's entry, so the kernel's check stands for a raw-altitude
+caller; above it `PipeRequest.reply`, `reply_with`, `reply_wait`,
+`reply_wait_with` and `PipeReply.resolve` are all `consumes` methods whose
+callers spell `(move …)`, so a second use is a compile error before the ledger
+is ever asked. Both one-shots are transferable — the delegation primitive — and
+the zero-copy example runs end to end.
+
+**A one-shot has one name.** `Mint` is absent from `pipe_reply_rights()` and
+`pipe_request_rights()` (the enum bits stay declared, since §3's universal low
+byte is pinned by assert in every kind), because a second name on an object one
+op spends can only ever be told `PeerClosed`, and it would undermine the single
+use the rest of this section makes structural. Delegation is untouched: it is
+`Transfer` moving the one name.
+
+**Abandonment is derived, not flagged.** A server that drops its obligation
+makes the client's `resolve` answer `SosStatus.PeerClosed`; a client that drops
+its claim makes the server's `reply()` answer `Err(PeerClosed)`, and the
+obligation is discharged either way. A message still staged when the outlet
+column reaches zero is abandoned on the same terms, because its obligation can
+never be minted. Cancellation-by-drop and the TELL idiom both fall out of that.
+
+**All four kinds are waitable** (§2.2's list). The outlet is readable while a
+message is staged or the client end is gone (drain-then-terminal, so its
+`PeerGone` payload waits for a dry ring); the inlet is postable while the ring
+has room or the server end is gone — `post` never blocks, so a refused poster
+parks here instead of polling, and the payload word says which of the two it was
+woken for; the reply is ready once its answer is written or can never be; and
+the request is ready once the claim behind it was abandoned, which is this
+section's early notice. A server that does not attach still learns that fact at
+its own `reply()`.
+
+**A delivered reply is the resolve.** The wait record carries the reply's
+bytes out of the ring slot that already holds them, so a client that waits
+this way never calls `resolve` at all and a multiplexed RPC is post + attach +
+wait. The delivery discharges the exchange — a claim the caller kept answers
+`PeerClosed` at a later resolve, because a second copy of an answer must not
+exist — and a one-shot kind's delivery detaches whatever mode was passed, since
+a subscription to something that has happened for the last time is a promise
+nothing can keep.
+
+**`Resolve` parks and consumes on every path.** A pending exchange blocks the
+calling thread on the claim's ready level, so the op ends the exchange
+whichever way it returns; it is the waiter-free blocking receive, and it is
+what lets `PipeReply.resolve` carry `consumes`. The non-consuming poll is
+`PipeReplyOp.Ready`, gated on `PipeReplyRight.Wait` because the level question
+is the same question attaching asks: `Ok(true)` means the answer is there
+(readiness is monotonic, so check-then-act has no race), `Ok(false)` means not
+yet and the exchange is live, and the terminal rides the error channel —
+`Err(PeerClosed)` means no answer can arrive, at which point the claim is
+dropped rather than resolved.
+
+**`send(msg)` is one kernel call.** `PipeInletOp.Call` is post, park and
+resolve behind one trap — the composition run without returning to userspace,
+so every rule the composed path obeys applies verbatim (same ring, same body
+maximum, same peer-gone answer), and it is gated by the existing
+`PipeInletRight.Post`, because what it adds is a park and a park is mechanics
+rather than authority. It never answers `WouldBlock`: a full ring parks on the
+inlet's room-to-post level, reached from inside the op. It takes no duration —
+the kernel never learns what a timeout is. The typed spelling is
+`PipeInlet.send`.
+
+**`send(msg, timeout:)` is the caller's own composition, and there is
+deliberately no library wrapper for it.** The shape is post + attach + wait plus
+a Timer on the same Waiter, which `tests/pipe-send-manual` writes out inline. A
+wrapper type would freeze a shape the fused call replaces with a single kernel
+call, and a kernel-side timeout, if a consumer ever names one, arrives as an op
+rather than as a method. `TimedOut(pending:)`'s substance holds without a type
+to carry it: the composition uses the non-consuming attach, so the claim is the
+caller's the whole time and is still in hand when the Timer's key comes back.
+
+**A fused call mints nothing.** The claim is kernel-internal and tied to the
+parked thread — one reference on the exchange's claim column that no handle
+table holds — so a blocking client spends no table row and no quota on it, and
+`MAX_HANDLES` does not bound a client blocked in calls. `post` keeps minting
+the real handle for multiplexers.
+
+**`PipeRequestOp.ReplyWait` is the server's half, and it lives on the
+request:** a reply with a built-in wait, the reply being the act that consumes
+the receiver and the wait the fused tail. It spends the existing
+`PipeRequestRight.Reply`, plus `WaiterRight.Wait` on the waiter it is handed
+(holding an obligation must not imply authority over somebody else's Waiter).
+It discharges the obligation and then parks on a Waiter exactly as a plain
+`wait` parks — never on the outlet directly, so the wake protocol stays
+singular — and the waiter is required, because the first turn of a loop and
+the dead-client recovery are both the existing `WaiterOp.Wait`, and
+reply-without-wait is the existing `Reply`. The answer names its leg: a reply
+that does not land returns `Err(Reply(...))` without parking, so one dead
+client can never stall a server loop, and `Wait(_)` means the reply landed. The
+request is consumed on every path. §2.2 has the record.
+
+**Abandonment reaches a parked caller through one wake arm.** A claim is either
+a subscription's or a parked thread's, and exactly one place in the kernel tells
+them apart; a parked fused caller and a parked resolver are one shape to it, and
+to `notify_claim`, `wake_call_reply` and `end_process`'s orphan arm
+(`park_resolve` is `consume_entry` with the unref left out, so the entry's
+reference becomes the parked thread's). `end_process` carries the mirror, so a
+process dying with a thread parked in a call or a resolve has that claim
+abandoned by its teardown, and the server's later `reply()` answers
+`Err(PeerClosed)` by the rule above (`tests/pipe-resolve-park`,
+`tests/pipe-resolve-orphan`).
+
+**Messages carry handles.** A message carries up to `PIPE_MSG_HANDLES`
+handles on `Post`, `Call`, `Reply` and `ReplyWait` alike — `send` is one
+sentence, and the answering direction is not a different one — and all four
+take the message through one argument record, because a body address, a length
+and the handle words do not fit three registers. `Take` and `Resolve` answer
+through one copy-out record.
+
+**A send is half of a move — take-at-post.** The handles a message carries
+leave the sender at the post: each entry is unbound, the reference it held is
+parked in the ring note as a typed ref (object, target, rights), and the
+sender's handle-quota row is credited. They are minted into the receiver at
+the take or the delivery, where the taker is charged. It is `Give`'s single act
+performed in two steps with the kernel holding the reference in between, and
+each step keeps `Give`'s ordering — the count goes up before it goes down, per
+handle — so no object can transiently reach zero and be freed mid-move. The
+`Transfer` bit is checked at the sender exactly as `give` checks it.
+
+- **What it buys is a guarantee: a message the kernel accepted delivers what
+  it was carrying, whatever becomes of the sender.** A capability handed over
+  fire-and-forget does not race its sender's exit (`tests/pipe-send-exit`
+  takes the message after the sender is `Gone` and posts through what
+  arrived); the typed tier is honest, since `post_with` consumes the wrapper
+  and a consumed wrapper must not come back; and `None` in a received slot
+  means one thing: the sender left it empty.
+- **A taker that cannot accept the batch refuses atomically**: if its table
+  or its quota cannot take the handles, nothing is minted, and the message
+  stays staged with its references still held and its level raised
+  (`tests/pipe-table-full`).
+- **The unwind arms are releases**: the outlet's zero-arm and every settle
+  hand the held references back, while the inlet's zero-arm deliberately does
+  not, because close-drains-first means a staged message is still owed to a
+  live outlet. So "no orphaned handles if the send is abandoned" is true: a
+  send nobody takes releases exactly what it took, at the arm that discovers
+  nobody will.
+
+**A handle arriving in a message is typed at the boundary** — the
+`decode_boot_handle` precedent generalized: the record carries a kind byte per
+slot beside the word, so a receiver matches a `PipeHandle` out instead of
+holding a number. The six kinds a message may carry are the givable ones the
+receiving vocabulary can name: `Memory`, `IoMemory`, `PipeInlet`,
+`PipeOutlet`, `PipeReply`, `PipeRequest`. `Process` and `System` are refused at
+the sender, as a scope line rather than a rule: both wrappers live above
+`sos.pipe` in the module order, so admitting them is a sysapi module split and
+a named follow-up (§11).
+
+**The delegation example is a protocol, across three real processes.** A
+`PipeRequest` travelling in a message is the zero-copy example's own move made
+at run time, about a request that did not exist when either process was
+launched (`give` can only wire one before `start`). `tests/pipe-delegate-msg`
+is that flow across a process boundary, with the replier holding no end of
+the connection it answers on, and `tests/delegate-3p` is the canonical example
+with the names filled in: root asks a middle process, the middle forwards the
+obligation in a message and exits, and a far process answers it, the bytes
+landing at root's original claim. The middle is a different principal from
+both ends — its own table, its own quota, its own death — and the answer lands
+after that death, which take-at-post makes irrelevant.
+
+**The delivery can be the take.** A server that attaches its outlet consuming
+and persistent is handed each message through `wait` itself, with the
+obligation minted at the delivery (§2.2). It holds zero endpoint handles for
+however many clients it serves, and hanging up is destroying the subscription.
+
+**The trap ladder.** The multiplexed composition is three traps per RPC at the
+client (post, attach, wait). The fused `Call` is one. A server is three per
+message with take + reply + wait, and `ReplyWait` makes it two — a readable
+level says "there is something" and never "here it is", so the `take` stays its
+own op. Delivery-as-take makes it one, because the delivery is the take. The
+one-per-message floor is for a message the server answers: a TELL costs the
+server two, and the second is not overhead — nothing is owed back, so there is
+nothing to reply to, and the obligation the delivery minted has to be released,
+which is a syscall because a one-way message carries a real capability rather
+than a datagram. `reply_wait` on an abandoned claim answers without parking, so
+there is no cheaper spelling. Post + resolve is two traps. `ProcessOp.Stats`
+counts them (`tests/pipe-pingpong`, `tests/pipe-cq`, `tests/pipe-send-manual`
+and `tests/pipe-resolve-park` assert the ladder).
+
+**Driver-as-service needs nothing beyond this section.** A UART driver whose
+clients reach the device only through a pipe (§9) uses this object as built,
+with no added op, kind, right or status:
+
+- **A blocking read is composed, not built.** A client that wants the next
+  byte spends a fused `Call` and parks. The driver, finding no input, holds
+  the obligation — a transferable one-shot is state a server may simply keep —
+  and answers it when its interrupt line delivers something. The kernel never
+  learns what a UART is, exactly as it never learns what a timeout is.
+- **Cancellation is the drop, and the server is told by a level it was
+  already watching.** A client that gives up composes its own deadline — a
+  Waiter with the claim and a Timer on it — and drops the claim when the timer
+  wins; the abandoned level fires at the driver, which discards the held
+  obligation and serves the next request. There is no `Cancel` op and no
+  cancel byte on the wire: a correlation the protocol would have had to carry
+  is a reference count the kernel already maintains (`tests/uart-cancel`).
+- **A TELL is the one-way write** — post-then-drop at the client, obligation
+  discharged by being dropped at the server.
+- **Multiple clients cost no new mechanism and no second connection.** Two
+  processes are clients of one service over one connection through minted
+  sibling inlets — per-client authority as a keep mask rather than as a session
+  table — and each request carries its own reply obligation, so a
+  completion-queue server routes every answer to the claim that asked for it
+  with nothing on the wire to correlate. `tests/uart-service` pins two
+  outstanding reads in a fixed order — the ring delivers in post order, so its
+  FIFO decides it — and each answer lands at its own claim in its own table.
+- **What the namespace still owes is a path and nothing else.** A client finds
+  this service by a boot tag its launcher chose; `/dev/uart0` is the same
+  connection reached by a name, and the acceptor object that resolves one is
+  the separate, later design named above.
+
+**A spelling note.** The tree renders a §2 object name short at its typed tier
+— `MemoryObject` is `Memory`, `PipeInlet`'s handle alias is `PipeInletHandle`
+— so `sos`'s owning wrappers for the one-shot pair are `PipeReply` and
+`PipeRequest`, with `PipeReplyHandle` / `PipeRequestHandle` the `sosabi`
+aliases they wrap. The resolved reply value is **`PipeMsg`** — the same struct
+a reply delivery carries, which is why there is one type and not two — and
+`ReplyDelivery` is the wait record's name for the delivery that carries it.
+
+### 2.2 Waiter: the generic wait aggregator
 
 - epoll/Port-style. `waiter.add(handle, key)` attaches a waitable;
   `waiter.wait(buffer, capacity)` blocks until any attached handle is
-  ready and **copies out a RECORD** naming the **word-sized key the
+  ready and **copies out a record** naming the **word-sized key the
   attacher supplied** (not just a bit — a word can directly encode the
   waiting Saw task's identity, so kernel wake sources dispatch to
   userspace tasks with no side-table lookup — the async-executor
   integration point) plus a per-kind payload.
-- **THE RESULT SHAPE, AMENDED** (Jul 29's `wait() -> (key, readiness)`
-  register pair → this record; ratified Aug 16, user, as design 178 M2
-  unit 3 rider 3 — the one place a ratified section has changed).
-  The record is `key` word, `tag` word, payload words, with the sizes and
-  word offsets published as constants and the tag a raw-backed enum (the
-  §2 design-145 wire idiom) whose value space is extensible. Why: the KEY
-  is universal and the PAYLOAD is not — a Pipe's readiness is not a
-  Timer's is not an Event's — so a fixed register pair would have had to
-  be the union of every waitable's answer forever, and the register file
-  is the one thing that cannot grow. The Event's payload is its
-  accumulated word, which makes the common wait one syscall instead of
-  two.
-- **THE ANSWER CONSUMES WHAT IT REPORTS** (ruled Aug 17, user, amending
-  the Aug-16 snapshot wording above). A delivery of an Event READS AND
-  CLEARS the word into the wait record, in one interrupts-masked step —
-  so the bits a record carries are bits nothing else will ever be told
-  about, and a `receive` right after a wake answers zero. A signal
-  landing after the take re-arms readiness with its own bits alone:
-  nothing lost, nothing double-counted. The alternative — a snapshot the
-  wait leaves behind — reports the same bits to the next wait as well,
-  and a recipient cannot tell that duplicate from a real second signal.
-  §2.4's `receive` keeps its exact semantics as the NON-BLOCKING POLL;
-  the two are doors onto one value, and a process picks by whether it
-  wants to park.
-- **THE MULTIPLEXING RULE, in one line:** many threads per Waiter is
-  DISTRIBUTION (one wake per delivery, the worker-pool shape); one
-  Waiter per waitable is OWNERSHIP, and it is structural — a handle
-  attaches to at most one Waiter, so a delivered value has exactly one
-  recipient by construction and no multi-watcher caveat exists.
-- **THE WAITER ITSELF CAN GO, AND A PARKED THREAD IS TOLD** (BUILT M4
-  unit 0, sawos design 12; `designs/010` rulings 1 and 2). When a
-  Waiter's LAST reference drops, its free wakes every thread on its
-  blocked list with `SosStatus.Revoked`. Three things make that one
-  sentence:
-  - **NO RECORD IS WRITTEN, and that is the contrast to hold onto.** A
-    delivery copies a record into the caller's memory and THEN answers
-    `Ok`, because something became ready and the record is what became
-    ready. Nothing became ready here — no key, since a key names an
-    attachment; no tag, since no waitable fired; no payload, since there
-    is no value — so a revocation writes the STATUS REGISTER and nothing
-    else, and the woken `wait` returns with its buffer exactly as it left
-    it. Said as the pair: a delivery copies out and answers `Ok`; a
-    revocation answers `Revoked` and copies nothing.
-  - **THE WALK IS THE WHOLE LIST, not the pop a readiness does.** The
-    distribution rule above is about a ready HANDLE, of which there is
-    one; here the thing every parked thread is waiting on is what ceased
-    to exist, so every one of them is answered.
-  - **THE COUNT IS THE GATE, NOT THE RELEASE.** A release with a minted
-    sibling still live frees nothing and wakes nobody — that is the
-    §2 reference ledger unchanged, and it is the difference between
-    revocation and any-release.
-  It supersedes M3's recorded "legal-but-doomed" stance, under which such
-  a thread stayed `Blocked` forever for the deadlock report to name
-  (design 7's As-built finding 2, which carries the rider). The husk
-  alternative — count a parked thread as a reference so the Waiter never
-  reaches zero — was weighed and REJECTED: it keeps the thread alive and
-  makes the drop silent, turning an error a program can handle into a
-  hang somebody has to infer. **THIS IS THE PEER-GONE DOCTRINE'S FIRST
-  INSTANCE, and the doctrine is the contract: NOTHING PARKED CAN BE
-  SILENTLY DOOMED** — every "what you are waiting for can no longer
-  happen" is a delivered wake carrying a distinguishable status, never a
-  strand. Its other two instances are M4's and are BUILT (§2.1): the
-  ratified one-shot reply pair (`PeerClosed`, both directions) and a
-  connection endpoint reaching zero references (`designs/010` D-1's
-  role split). Terminal levels follow design 8's precedent —
-  attaching after the fact still wakes, and nothing un-closes. The
-  deadlock predicate gained no arm: the wake is synchronous inside the
-  syscall that dropped the last reference, so there is no idle-and-doomed
-  state for it to see.
-- **Copy-out is checked, and it is one door.** This is the first place the
-  kernel writes a process's memory. The destination must be word-aligned
-  and inside the process's writable grant; one that is not TERMINATES the
-  process (§5.7's faults ruling — a process linked its own image and knows
-  where its data is). A single kernel funnel performs that check for
-  everything that will ever copy out, §2.1's message body included; it is
-  also the only place the kernel dereferences a user address, which is
-  what makes the per-address-space mapping switch a one-place change when
-  there is more than one address space.
-- The buffer is the CALLER's, because the kernel has no allocator and
-  nowhere to put one that would outlive the call. The typed Saw wrapper
-  supplies it out of its own frame, so a raw address never appears in
-  that surface.
-- **`remove` TAKES THE KEY, and keys are UNIQUE per Waiter** (ratified Aug 16,
-  user, as design 178 M2 unit 3 rider 4). Detaching edits the WAITER's own
-  attachment table and never touches the waitable, so the authority it spends is
-  the Waiter handle plus the key that names the attachment — a waitable's handle
-  would be authority the operation does not use. It is also the only form that
-  survives handle CLOSE: a closed waitable's stale attachment has no handle left
-  to name it with. The invariant that forces: `add` with a key the Waiter
-  already uses is a FAULT, because a duplicate makes two questions ambiguous at
-  once — which attachment a `remove` names, and which one an answer came from.
-- **Waitables — THE LIST IS CLOSED, and these are its EIGHT members:**
+- **The result is a record, not a register pair.** The record is a `key`
+  word, a `tag` word and payload, with the sizes and offsets published as
+  constants and the tag a raw-backed enum whose value space is
+  extensible. Why: the key is universal and the payload
+  is not — a Pipe's readiness is not a Timer's is not an Event's — so a fixed
+  register pair would have had to be the union of every waitable's answer
+  forever, and the register file is the one thing that cannot grow. The
+  Event's payload is its accumulated word, which makes the common wait one
+  syscall instead of two.
+- **The answer consumes what it reports.** A delivery of an Event reads and
+  clears the word into the wait record, in one interrupts-masked step — so
+  the bits a record carries are bits nothing else will ever be told about,
+  and a `receive` right after a wake answers zero. A signal landing after the
+  take re-arms readiness with its own bits alone: nothing lost, nothing
+  double-counted. The alternative — a snapshot the wait leaves behind —
+  reports the same bits to the next wait as well, and a recipient cannot tell
+  that duplicate from a real second signal. §2.4's `receive` keeps its exact
+  semantics as the non-blocking poll; the two are doors onto one value, and a
+  process picks by whether it wants to park.
+- **The multiplexing rule, in one line:** many threads per Waiter is
+  distribution (one wake per delivery, the worker-pool shape); one Waiter per
+  waitable is ownership, and it is structural — a handle attaches to at most
+  one Waiter, so a delivered value has exactly one recipient by construction
+  and no multi-watcher caveat exists.
+- **Level-triggered is an absence.** Nothing records that a waiter has been
+  told, so `Wait` scans the attachment set, and three properties fall out of
+  that one decision rather than being coded separately: a signal before
+  anyone waits is not lost, an event still ready wakes the next waiter, and
+  attaching an already-ready handle reports immediately. An attachment is its
+  own object — (waiter, kind, target, key) — rather than a field of the
+  waitable, because a Waiter's set has to be one list: a wait scans it once
+  and a `remove` walks it once, so per-kind lists would make both a matrix
+  over kinds.
+- **The Waiter itself can go, and a parked thread is told.** When a Waiter's
+  last reference drops, its free wakes every thread on its blocked list with
+  `SosStatus.Revoked`. Three things make that one sentence:
+  - **No record is written, and that is the contrast to hold onto.** A
+    delivery copies a record into the caller's memory and then answers `Ok`,
+    because something became ready and the record is what became ready.
+    Nothing became ready here — no key, since a key names an attachment; no
+    tag, since no waitable fired; no payload, since there is no value — so a
+    revocation writes the status register and nothing else, and the woken
+    `wait` returns with its buffer exactly as it left it. As a pair: a
+    delivery copies out and answers `Ok`; a revocation answers `Revoked` and
+    copies nothing. (The wake therefore lives beside the free rather than in
+    the delivery path: it touches no process memory.)
+  - **The walk is the whole list, not the pop a readiness does.** The
+    distribution rule above is about a ready handle, of which there is one;
+    here the thing every parked thread is waiting on is what ceased to exist,
+    so every one of them is answered.
+  - **The count is the gate, not the release.** A release with a minted
+    sibling still live frees nothing and wakes nobody — the §2 reference
+    ledger unchanged, and the difference between revocation and any-release.
+
+  The alternative of counting a parked thread as a reference, so the Waiter
+  never reaches zero, does not work: it keeps the thread alive and makes the
+  drop silent, turning an error a program can handle into a hang somebody has
+  to infer. **This is the peer-gone doctrine, and the doctrine is the
+  contract: nothing parked can be silently doomed** — every "what you are
+  waiting for can no longer happen" is a delivered wake carrying a
+  distinguishable status, never a strand. Its other instances are the one-shot
+  reply pair (`PeerClosed`, both directions) and a connection endpoint
+  reaching zero references (§2.1). Terminal levels follow the Process
+  precedent (§8): attaching after the fact still wakes, and nothing un-closes.
+  The deadlock predicate has no arm for revocation: the wake is synchronous
+  inside the syscall that dropped the last reference, so there is no
+  idle-and-doomed state for it to see. The typed surface needs nothing new,
+  since `Waiter.wait` already answers `Result<WaitResult, SosStatus>`.
+- **Copy-out is checked, and it is one door.** The destination must be
+  word-aligned and inside the process's writable grant; one that is not
+  terminates the process (§5.7's faults ruling — a process linked its own
+  image and knows where its data is). A single kernel funnel, `copy_out`,
+  performs that check for everything that copies out, §2.1's message body
+  included; with its mirror `copy_in` it is the only place the kernel
+  dereferences a user address, which is what keeps a per-address-space
+  mapping switch a one-place change.
+- **`write_result` is the only function that writes an answer into a frame** —
+  its callers are `ktrap` for an op that answered at once and the wake paths
+  that answer a parked thread — which is what makes "exactly one write per
+  syscall" checkable.
+- The buffer is the caller's, because the kernel has no allocator and nowhere
+  to put one that would outlive the call. The typed Saw wrapper supplies it
+  out of its own frame, so a raw address never appears in that surface.
+- **`remove` takes the key, and keys are unique per Waiter.** Detaching edits
+  the Waiter's own attachment table and never touches the waitable, so the
+  authority it spends is the Waiter handle plus the key that names the
+  attachment — a waitable's handle would be authority the operation does not
+  use. It is also the only form that survives handle close: a closed
+  waitable's stale attachment has no handle left to name it with. The
+  invariant that forces: `add` with a key the Waiter already uses is a fault
+  (`DuplicateKey`), because a duplicate makes two questions ambiguous at once
+  — which attachment a `remove` names, and which one an answer came from.
+- **Waitables — the list is closed, and these are its members:**
   `PipeOutlet` (readable — a message is staged, or the client end is gone),
-  `PipeInlet` (**room-to-post**), Event, Timer, Interrupt, **Process** (§8),
-  `PipeReply` (reply-ready), and `PipeRequest` (abandoned — the Aug-20
-  amendment, §2.1). **ALL EIGHT ARE BUILT** (M2 units 3 and 4 for Event,
-  Interrupt; design 232 unit 1 for Timer; sawos design 8, M3 unit 5.5, for
-  Process; sawos design 15, M4 unit 3, for the four PIPE kinds). The four that
-  closed it took no new object, no new op and no new slab: they are kinds that
-  already existed moving out of the `NotWaitable` refusal arms units 1 and 2
-  wrote by hand, each spending a `Wait = 1 << 9` bit added to its own rights enum
-  and its own default set, and each answering the five per-kind questions below.
-  **THE CLIENT END IS A MEMBER TOO** (`designs/010` ruling 8, amending this
-  line): `post` can never block, so a refused poster needed something better than
-  a poll loop, and the inlet's ROOM-TO-POST level is it — ready while the staging
-  ring has a free slot OR the server end is gone, with the payload word saying
-  which, so a waker learns whether to post or to stop without a probe post. It is
-  a plain LEVEL and not a terminal one: consume clears nothing, and the level's
-  end is the poster's own next post. What the four DELIVER is specified below —
-  the reply arm carries the reply's own bytes (ruling 11(a)), the outlet arm
-  under a CONSUMING attachment carries the whole message and mints the obligation
-  (ruling 11(d)) — and the attachment vocabulary they arrived with (persistent by
-  default, `AttachMode.OneShot`, and the consuming `Waiter.give`) is stated in
-  the four bullets after the copy-in door.
-  A waitable
-  THREAD is still
-  §8's deferred half, and attaching one is a `NotWaitable` fault for a different
-  reason. The second kind is what moved an
-  attachment
-  out of the waitable and into a table of its own: a Waiter's set has to
-  be ONE list, since a wait scans it once and a `remove` walks it once,
-  so per-kind lists would make both a matrix over kinds. What stays
-  per-kind is FIVE questions — who is watching me, set who is watching
-  me, am I ready, what does a record say, and (added by the Timer) a
-  record was DELIVERED — each an exhaustive match, so a further waitable
-  cannot be added silently. **THAT PROPERTY WAS COLLECTED RATHER THAN
-  CLAIMED when the fourth kind arrived** (sawos design 8): adding
-  `WaitableKind.Process` failed all five matrix arms, adding the `WaitTag`
-  and `WaitPayload` cases failed every userspace match on a wait answer,
-  and `waitable_slot` failed its own — so the compiler enumerated the
-  work instead of a reviewer having to.
-  The fifth question is the ACK-FREE DRAIN, and the four built kinds
-  answer it three different ways: an Event's word and a Timer's
-  fire count are both SPENT by the delivery; an INTERRUPT
-  answers with nothing, because its readiness ends at the driver's ack —
-  the line stays masked until the device has actually been serviced, so
-  the kernel cannot know a record was enough; and a PROCESS's death also
-  spends nothing, for the OPPOSITE reason — it is the TERMINAL LEVEL, so
-  there is nothing to end. Nothing un-dies: a delivery reports the §8
-  status word and leaves it, so every later wait on that attachment
-  answers the same word, and a waiter that attaches after the death is
-  told at once. Delivery is one funnel, so
-  the drain cannot happen on the already-ready path and not on the wake
-  path.
-  **AND THE FOUR PIPE ARMS ANSWERED THE FIFTH QUESTION THREE MORE WAYS** (sawos
-  design 15). A READABLE outlet and a POSTABLE inlet spend nothing, on the
-  Interrupt's terms: their readiness has an end the kernel does not own — a take,
-  and the poster's own next post. An ABANDONED claim spends nothing on the
-  PROCESS's terms: nothing un-abandons, so there is nothing to end. The REPLY is
-  the fourth answer and the only one that is neither: its delivery DISCHARGES
-  the exchange, because the record carried the reply itself and a second copy of
-  an answer must not exist. So the five kinds that answer "nothing" now do it for
-  four distinct reasons, which is what the matrix is a matrix for.
-  **AND M4 UNIT 4 MADE ONE OF THOSE ANSWERS DEPEND ON THE ATTACHMENT** (sawos
-  design 18; ruling 11(d)). A readable outlet still spends nothing when it is
-  watched by a BORROWING attach — the take is a later op, and that is what
-  "there is something" means. Under a CONSUMING one the delivery IS the take, so
-  it spends the staged message exactly as a reply delivery spends the exchange.
-  The fifth question therefore reads the attachment and not only the kind, which
-  is the first time it has had to, and it is the same funnel doing it: one place
-  drains, whichever door the readiness came through.
-- **THE COPY-IN DOOR is the copy-out funnel's mirror twin** (design 232
-  unit 1), built for `Timer.Arm` and inherited by §2.1's message body. It
-  refuses the same two things — a misaligned address, an address outside
-  the process — and TERMINATES the process for either, on the same
-  reasoning. One asymmetry is deliberate: copy-out's window is the
-  process's WRITABLE memory and copy-in's is the whole GRANTED region,
-  because a record may legitimately come out of a process's own rodata,
-  and the two doors guard different hazards (writing outside the writable
-  window corrupts the process; reading outside the granted region reads
-  somebody else). A copy-in LENGTH is checked for equality rather than
-  "at least": a capacity may be over-provisioned, but an inbound length is
-  the caller's statement of what it is handing over.
-  **Attach semantics (ratified Jul 29, amended M4 unit 3):**
-  **level-triggered** (keeps reporting ready until the waiter handles
-  it — no lost edges); attachments are **persistent BY DEFAULT** with explicit
-  `remove(key)` (and the KEY, per the Aug-16 amendment
-  above, never the waitable's handle); a handle attaches to **at most
-  one Waiter**, but **multiple threads/tasks may wait on the same
-  Waiter** (a ready handle wakes one waiter — the shared
-  readiness-queue shape).
+  `PipeInlet` (room-to-post), Event, Timer, Interrupt, Process (§8),
+  `PipeReply` (reply-ready), and `PipeRequest` (abandoned, §2.1). Each pipe
+  kind spends a `Wait` bit (`1 << 9`) in its own rights enum and default set.
+  The inlet's room-to-post level is ready while the staging ring has a free
+  slot or the server end is gone, with the payload word saying which, so a
+  waker learns whether to post or to stop without a probe post. It is a plain
+  level, not a terminal one: consume clears nothing, and the level's end is
+  the poster's own next post. A Thread is not waitable (§8), and attaching one
+  is a `NotWaitable` fault; so is attaching a MemoryObject, which has no state
+  that could become ready.
 
-- **ONE-SHOT IS AN OPT-IN PROPERTY OF THE ATTACHMENT** (BUILT M4 unit 3, sawos
-  design 15; `designs/010` ruling 9, amending "no one-shot mode" above).
-  `AttachMode.OneShot` detaches AT DELIVERY — when the record for its key is
-  COPIED OUT, never at mere readiness, and the delivery is otherwise identical.
-  It is the attacher's choice like the key, spelled as a defaulted trailing
-  parameter so no existing call site changed. What it buys: a blocked poster's
-  room-wait, a request-abandoned watcher and a wait-once death supervisor all
-  stop owing a trailing `remove`. **THE FOOTGUN IS STATED RATHER THAN GUARDED**:
-  attach one-shot, take the delivery, and wait again on a Waiter with nothing
-  left attached, and the thread parks forever — which the deadlock report names,
-  exactly as it always has for an empty Waiter.
-  **AND AN OP THAT CONSUMES ITS OBJECT DETACHES IT IMPLICITLY** (ruling 9(a),
-  MANDATORY): `PipeReplyOp.Resolve` and `PipeRequestOp.Reply` destroy the
-  caller's entry, and an attachment is a counted reference, so without the
-  implicit detach the op could not free what it consumed and refusing while
-  attached would wedge the op ordering instead.
+  What stays per-kind is five questions — who is watching me, set who is
+  watching me, am I ready, what does a record say, and a record was
+  delivered — each an exhaustive match, and `waitable_slot` is the only place
+  waitability is decided, so a further waitable cannot be added silently:
+  adding a `WaitableKind` fails all five matrix arms, adding the `WaitTag` and
+  `WaitPayload` cases fails every userspace match on a wait answer, and
+  `waitable_slot` fails its own, so the compiler enumerates the work.
 
-- **THE CONSUMING ATTACH IS A DIFFERENT VERB, NOT A THIRD MODE** (BUILT M4 unit
-  3; ruling 11(c)). `Waiter.give(...)` takes the wrapper BY MOVE: the op
-  releases the caller's handle entry and the ATTACHMENT owns the object from
-  there, so a multiplexer holds ZERO handles however many things it is watching
-  and "hanging up" is destroying the subscription. It is a verb rather than a
-  mode value because consuming is an EFFECT change and a runtime flag may not
-  make one — §2.1's own reason for rejecting a send-mode enum. The two axes are
-  ORTHOGONAL: `add`/`give` crossed with `Persistent`/`OneShot` is a 2x2. A
-  refused `give` HANDS THE OBJECT BACK in its error payload, because a full
+  The fifth question is the ack-free drain, and the kinds answer it
+  differently. An Event's word and a Timer's fire count are both spent by the
+  delivery. An Interrupt answers with nothing, because its readiness ends at
+  the driver's ack — the line stays masked until the device has actually been
+  serviced, so the kernel cannot know a record was enough. A Process's death
+  also spends nothing, for the opposite reason — it is the terminal level, so
+  there is nothing to end: a delivery reports the §8 status word and leaves
+  it, so every later wait on that attachment answers the same word, and a
+  waiter that attaches after the death is told at once. A readable outlet and
+  a postable inlet spend nothing on the Interrupt's terms: their readiness has
+  an end the kernel does not own — a take, and the poster's own next post. An
+  abandoned claim spends nothing on the Process's terms: nothing un-abandons.
+  The reply is the only one that is neither: its delivery discharges the
+  exchange, because the record carried the reply itself and a second copy of
+  an answer must not exist. One answer depends on the attachment and not only
+  the kind: a readable outlet watched by a borrowing attach spends nothing —
+  the take is a later op, and that is what "there is something" means — while
+  under a consuming attach the delivery is the take, so it spends the staged
+  message exactly as a reply delivery spends the exchange. Delivery is one
+  funnel, so the drain cannot happen on the already-ready path and not on the
+  wake path, whichever door the readiness came through.
+- **The copy-in door is the copy-out funnel's mirror twin**, used by
+  `Timer.Arm` and by §2.1's message body. It refuses the same two things — a
+  misaligned address, an address outside the process — and terminates the
+  process for either, on the same reasoning. One asymmetry is deliberate:
+  copy-out's window is the process's writable memory and copy-in's is the
+  whole granted region, because a record may legitimately come out of a
+  process's own rodata, and the two doors guard different hazards (writing
+  outside the writable window corrupts the process; reading outside the
+  granted region reads somebody else). A copy-in length is checked for
+  equality rather than "at least": a capacity may be over-provisioned, but an
+  inbound length is the caller's statement of what it is handing over.
+- **Attach semantics:** **level-triggered** (keeps reporting ready until the
+  waiter handles it — no lost edges); attachments are **persistent by
+  default** with explicit `remove(key)` (by key, never by the waitable's
+  handle); a handle attaches to **at most one Waiter**, but **multiple
+  threads/tasks may wait on the same Waiter** (a ready handle wakes one waiter
+  — the shared readiness-queue shape). `WaiterOp.Add` takes a target, a key
+  and a flags word (§5.7).
+- **One-shot is an opt-in property of the attachment.** `AttachMode.OneShot`
+  detaches at delivery — when the record for its key is copied out, never at
+  mere readiness — and the delivery is otherwise identical. It is the
+  attacher's choice like the key, spelled as a defaulted trailing parameter.
+  What it buys: a blocked poster's room-wait, a request-abandoned watcher and a
+  wait-once death supervisor all stop owing a trailing `remove`. **The footgun
+  is stated rather than guarded**: attach one-shot, take the delivery, and
+  wait again on a Waiter with nothing left attached, and the thread parks
+  forever — which the deadlock report names, as it does for any empty Waiter.
+  **An op that consumes its object detaches it implicitly, and must**:
+  `PipeReplyOp.Resolve` and `PipeRequestOp.Reply` destroy the caller's entry,
+  and an attachment is a counted reference, so without the implicit detach the
+  op could not free what it consumed, and refusing while attached would wedge
+  the op ordering instead.
+- **The consuming attach is a different verb, not a third mode.**
+  `Waiter.give(...)` takes the wrapper by move: the op releases the caller's
+  handle entry and the attachment owns the object from there, so a
+  multiplexer holds zero handles however many things it is watching, and
+  "hanging up" is destroying the subscription. It is a verb rather than a
+  mode value because consuming is an effect change and a runtime flag may not
+  make one — the reason §2.1 has no send-mode enum. The two axes are
+  orthogonal: `add`/`give` crossed with `Persistent`/`OneShot` is a 2x2. A
+  refused `give` hands the object back in its error payload, because a full
   attachment table is a resource condition and the caller keeps what it had.
-
-- **A DELIVERY MAY CARRY A PAYLOAD LARGER THAN A WORD, AND THE RECORD GREW TO
-  HOLD ONE** (BUILT M4 unit 3; ruling 11(a), amending the record shape above).
-  Its one producer at that unit was a reply-ready delivery, which hands over the
-  reply's own bytes out of the ring slot that already holds them: the wait IS the
-  resolve, so a client that waits this way never calls `resolve` at all and a
-  multiplexed RPC is post + attach + wait.
-  **THE BUFFER IS MAX-SIZED AND THE COPY IS NOT** (ruled Sep 1, user): a parked
-  waiter cannot predict which arm fires, so the buffer holds the biggest answer
-  its attachments could give, while the kernel copies only what the delivery
-  needs. So the growth costs a Timer waiter buffer SPACE and never copy TIME.
-  `wait_record_bytes()` moved, which the vDSO discipline makes free: every typed
-  caller's buffer comes out of the wrapper's own frame, so the number is written
-  once and read once.
-
-- **THE RECORD'S FINAL LAYOUT — FIXED PREFIX, VARIABLE TAIL** (BUILT M4 unit 4,
-  sawos design 18; the ORDER user-ruled Sep 2, and the packing with it). A
-  delivery can now carry HANDLES, so the record is four regions in this order and
-  the order is the rule:
-  1. a **HEADER** of three words — key, tag, payload;
-  2. the **PACKED META**, one byte of BODY LENGTH followed by one KIND byte per
-     message handle slot (a `BootHandleKind` value, 0 = empty);
-  3. the **HANDLE REGION**, one word per slot: the REQUEST slot first, then one
-     per message slot;
-  4. the **BODY**, `PIPE_BODY_BYTES` of it, and it is last because it is the only
+- **The buffer is max-sized and the copy is not.** A parked waiter cannot
+  predict which arm fires, so the buffer holds the biggest answer its
+  attachments could give, while the kernel copies only what the delivery
+  needs. A larger record costs a Timer waiter buffer space and never copy time.
+  `wait_record_bytes()` is written once and read once, since every typed
+  caller's buffer comes out of the wrapper's own frame.
+- **The record layout: fixed prefix, variable tail.** A delivery can carry a
+  message, so the record is four regions in this order, and the order is the
+  rule:
+  1. a **header** of three words — key, tag, payload;
+  2. the **packed meta**, one byte of body length followed by one kind byte
+     per message handle slot (a `BootHandleKind` value, 0 = empty);
+  3. the **handle region**, one word per slot: the request slot first, then
+     one per message slot;
+  4. the **body**, `PIPE_BODY_BYTES` of it, last because it is the only
      region whose used length varies.
-  The published capacity a caller must supply is all four together.
-  **BYTES LAST IS WHAT MAKES EVERY COPY-OUT A CONTIGUOUS PREFIX**: a delivery
-  carrying handles and no data writes up to the end of the handle region and
-  stops, rather than skipping a 128-byte hole to reach a region behind it. There
-  are exactly TWO copy lengths — a word-payload delivery ends at the meta (all
-  five bytes zero, so the decode reads no handle word and no body byte), and a
-  message delivery writes the whole fixed prefix plus the meta's `len`.
-  **THE LENGTH IS A BYTE AND NOT A WORD** (user-ruled Sep 2): unit 3 spent a
-  fourth header word on it; a number bounded by `PIPE_BODY_BYTES` fits in a byte
-  and has to travel beside the kind bytes anyway, so it packs with them and the
-  record came out of unit 4 SMALLER than unit 3 left it, handles included.
-  **AND THE PER-PROFILE ANSWER IS THE ABI's RATHER THAN ANYBODY's ARITHMETIC**:
-  declaration order is layout (§5.7), so the five meta bytes sit in the padding
-  the word-aligned handle region needs regardless — one machine word of it on the
-  64-bit profile, two on the 32-bit one — and the fixed prefix stays a whole
-  number of machine words on both, which is the property "a prefix ending at the
-  body's length" is an arithmetic rather than a hope because of. `sosabi`
-  publishes the region offsets and `static_assert`s all three facts.
 
-- **AND THE DELIVERY MAY BE THE TAKE** (BUILT M4 unit 4; ruling 11(d)). A
-  CONSUMING, PERSISTENT attachment on a `PipeOutlet` is handed each message
-  through `wait` itself: its own tag (`Message`, distinct from `Readable` because
-  the two say different things about the RECORD's shape), the message's bytes in
-  the body, its handles in the message slots, and — minted at the delivery — the
-  obligation to answer, in the request slot. A server built this way holds ZERO
-  endpoint handles and reaches ONE TRAP PER MESSAGE IT ANSWERS, `wait` then
-  `reply_wait` forever — and TWO for a message it DISCARDS, because a TELL is
-  owed no reply and the obligation the delivery minted still has to be released
-  (M4 unit 5's refinement; §2.1 carries the ladder and the measurement).
-  **A DELIVERY THAT MINTS CAN BE REFUSED, AND THE REFUSAL IS ATOMIC.** The mints
-  a message delivery needs — the obligation and one per carried handle — can meet
-  a full handle table or a spent quota, and that is a RESOURCE condition rather
-  than a protocol one. So the kernel pre-flights the whole batch: if it will not
-  fit, NOTHING is copied, consumed or detached, the message stays staged with its
-  readable level still raised, and the waiter is woken with the status and no
-  record — which is exactly the shape revocation already established (§2.2's
-  "nothing parked can be silently doomed": a wake that hands nothing over is
-  still a wake). The server frees a slot and waits again.
+  The published capacity a caller must supply is all four together. Bytes
+  last is what makes every copy-out a contiguous prefix: a delivery carrying
+  handles and no data writes up to the end of the handle region and stops,
+  rather than skipping the body region to reach a region behind it. There are
+  exactly two copy lengths — a word-payload delivery ends at the meta (all
+  meta bytes zero, so the decode reads no handle word and no body byte), and a
+  message delivery writes the whole fixed prefix plus the meta's `len`. The
+  length is a byte and not a word, because a number bounded by
+  `PIPE_BODY_BYTES` fits in a byte and has to travel beside the kind bytes
+  anyway. The per-profile answer is the ABI's rather than anybody's
+  arithmetic: declaration order is layout (§5.7), so the meta bytes sit
+  in the padding the word-aligned handle region needs regardless — one machine
+  word of it on the 64-bit profile, two on the 32-bit one — and the fixed
+  prefix stays a whole number of machine words on both, which is what makes
+  "a prefix ending at the body's length" an arithmetic rather than a hope.
+  `sosabi` publishes the region offsets and `static_assert`s all three facts.
+- **The delivery may be the take.** A consuming, persistent attachment on a
+  `PipeOutlet` is handed each message through `wait` itself: its own tag
+  (`WaitTag.Message`, distinct from `Readable` because the two say different
+  things about the record's shape), the message's bytes in the body, its handles
+  in the message slots, and — minted at the delivery — the obligation to answer,
+  in the request slot. A server built this way holds zero endpoint handles and
+  spends one trap per message it answers, `wait` then `reply_wait` forever, and
+  two for a message it discards (§2.1). **A delivery that mints can be refused,
+  and the refusal is atomic.** The mints a message delivery needs — the
+  obligation and one per carried handle — can meet a full handle table or a
+  spent quota, and that is a resource condition rather than a protocol one. So
+  the kernel pre-flights the whole batch: if it will not fit, nothing is copied,
+  consumed or detached, the message stays staged with its readable level still
+  raised, and the waiter is woken with the status and no record — the shape
+  revocation established (a wake that hands nothing over is still a wake). The
+  server frees a slot and waits again.
+- **A second door answers with the same record.** `PipeRequestOp.ReplyWait`
+  (§2.1) discharges a request and then parks on a Waiter exactly as
+  `WaiterOp.Wait` does, resuming with exactly this record into exactly this
+  buffer — the wake protocol stays singular, and there is one decode because
+  there is one record. What differs is only the refusal, and it is the shape a
+  two-legged op needs: the answer carries a `ReplyWaitLeg` beside the status
+  saying which half produced it. `Reply` means the reply did not land and the
+  op did not park, so a server loop recovers by waiting afresh and one dead
+  client cannot stall it; `Wait` means the reply landed and the wait itself
+  broke. `Wait` is the zero value, which costs nothing to maintain: every path
+  that answers a parked thread — a delivery, a revocation, a teardown —
+  already writes a zero value register, so only the non-parking leg has to
+  stamp anything. A plain `wait()` is unaffected by the second door.
 
-- **A SECOND DOOR ANSWERS WITH THE SAME RECORD** (BUILT M4 unit 3.5, sawos
-  design 17). `PipeRequestOp.ReplyWait` (§2.1) discharges a request and then
-  parks ON A WAITER exactly as `WaiterOp.Wait` does, resuming with exactly this
-  record into exactly this buffer — the wake protocol stays SINGULAR, which is
-  the property the fused client side already demanded, and there is one decode
-  because there is one record.
-  **WHAT IS DIFFERENT IS ONLY THE REFUSAL**, and it is the shape a two-legged op
-  needs: the answer carries a `ReplyWaitLeg` beside the status saying which half
-  produced it. `Reply` means the reply did not land AND THE OP DID NOT PARK, so a
-  server loop recovers by waiting afresh and one dead client cannot stall it;
-  `Wait` means the reply LANDED and the wait itself broke. `Wait` is the ZERO
-  value, which costs nothing to maintain: every path that answers a parked thread
-  — a delivery, a revocation, a teardown — already writes a zero value register,
-  so only the non-parking leg has to stamp anything. A `wait()` proper is
-  unchanged in every respect; `WaiterOp` was not touched by that unit.
+### 2.4 Event: accumulating non-blocking notifications
 
-### 2.4 Event: accumulating non-blocking notifications (ratified Jul 29)
-
-- The fire-and-forget primitive. `event.signal(bits)` NEVER blocks;
-  the kernel accumulates into the Event's word. `event.receive() ->
-  word` drains and resets to 0. Waitable (non-zero = ready → attach to
-  a Waiter).
-- **THE WORD HAS TWO DOORS AND BOTH CONSUME IT** (ruled Aug 17, user).
-  `receive` is the NON-BLOCKING POLL — drain-and-reset, 0 when empty,
-  never parks — and a `Waiter.wait` delivery is the blocking one, whose
-  record carries the same accumulated word and clears it in the same
-  interrupts-masked step (§2.2). A value is therefore delivered exactly
-  once, whichever door it came through, and the choice between them is
-  only whether the caller wants to park. The recipient is unique by
-  construction: a handle attaches to at most one Waiter, so no second
-  watcher can be deprived of a word a wait took.
+- The fire-and-forget primitive. `event.signal(bits)` never blocks; the kernel
+  accumulates into the Event's word. `event.receive() -> word` drains and resets
+  to 0. Waitable (non-zero = ready → attach to a Waiter).
+- **The word has two doors and both consume it.** `receive` is the
+  non-blocking poll — drain-and-reset, 0 when empty, never parks — and a
+  `Waiter.wait` delivery is the blocking one, whose record carries the same
+  accumulated word and clears it in the same interrupts-masked step (§2.2). A
+  value is therefore delivered exactly once, whichever door it came through,
+  and the choice between them is only whether the caller wants to park. The
+  recipient is unique by construction: a handle attaches to at most one
+  Waiter, so no second watcher can be deprived of a word a wait took.
 - **Accumulation mode is a per-Event property:**
   - **bitwise-OR** — "which of these events occurred since last drain"
     (flag set; the signal use case).
   - **saturating-sum** — "how many times" (counting-semaphore use case;
-    SATURATES rather than wrapping — a fast producer must not corrupt
+    saturates rather than wrapping — a fast producer must not corrupt
     the count).
-- Lowers to the kernel's atomic fetch-or / saturating-fetch-add on the
-  Event word (the design-41 Atomic machinery). Multiple senders race
-  harmlessly (atomic accumulate); one drain reads-and-clears.
+- Accumulation is a plain OR or saturating add on the Event word (`accumulate`).
+  Multiple senders race harmlessly, because the kernel runs a syscall to
+  completion and takes no interrupt in kernel mode (§9) on one processor (§7);
+  one drain reads-and-clears.
 
-### 2.5 Memory: MemoryObject vs Mapping (ratified Jul 29)
+### 2.5 Memory: MemoryObject vs Mapping
 
-**BUILT M3 unit 2 (the first slice), M3 unit 4 (the rest of it), AND M3 units 5
-and 6 (the refcount, shared memory, and executable-as-a-right)** — sawos designs
-2 D-2, 6, 7 and 9. Everything this section describes exists now, the refcount
-included; what is NARROWED rather than missing is stated below in the clause's
-own words.
+**Names.** This section's design vocabulary is `MemoryObject`; the kinds the
+kernel declares are **`Memory`** (RAM), **`IoMemory`** (device MMIO) and
+**`Mapping`** (one installed row) — `ObjType` cases in `kernel/abi/`, under
+the numbering §5.7's vDSO discipline keeps renumberable. The verbs are `split`
+(RAM: one cut from the front, the parent becomes the remainder), `carve`
+(device: the parent stays whole), `map` (install a row, answer a `Mapping`)
+and `give` (§3's move of a region into a child's table). The longer spellings
+name the same three kinds wherever they appear.
 
-**THE NAMES AS BUILT, stated once because this section predates them.** The
-Jul-29 draft wrote `MemoryObject`, and this document still does wherever it
-quotes itself; the kinds the kernel declares are **`Memory`** (RAM),
-**`IoMemory`** (device MMIO) and **`Mapping`** (one installed row) — `ObjType`
-9, 10 and 11 in `kernel/abi/`, the numbering §5.7's vDSO discipline keeps
-renumberable. The verbs are `split` (RAM: one cut from the front, the parent
-becomes the remainder), `carve` (device: the parent stays whole), `map` (install
-a row, answer a `Mapping`) and `give` (§3's move of a region into a child's
-table). The longer Jul-29 spellings name the same three kinds wherever they
-survive above and below; nothing was renumbered and no wrapper changed.
-
-**WHAT UNIT 2 BUILT** was deliberately the smallest useful part: a MemoryObject
-was a SEALED `{base, len}` — no pool, no derivation, no `map()`, no attribute,
-no ops — minted only at boot, one per row of a build-emitted region table, its
-whole surface being NAMED as an argument to `process_create`. Those were exactly
-this section's "**pool roots given to the root server at boot**" in a v1 static
-form. The one thing the slice settled is the one thing unit 4 kept: a region is
-a CAPABILITY rather than a description, so there is STILL no op that reads a
-MemoryObject's bounds and a process that holds one can hand it to the kernel and
-cannot learn a number from it. What a process knows about where its memory IS,
-it knows from the config that gave it the region — which is what root's
-tag-to-meaning config has always been, and where the uart-echo driver's
-`UART_BASE` has always come from.
-
-**WHAT UNIT 4 BUILT, point by point against the bullets below** (sawos design 6):
-
-- **THE POOL ATTRIBUTE BECAME A KIND.** A RAM pool root is a `MemoryObject` and
-  a device pool root is an `IoMemoryObject`, decided by a KIND COLUMN in the
-  build-emitted region table (design 6 D-5, table version 2). Design 46's intent
-  marker is therefore not a flag anybody checks: an IoMemory's `map` takes no
-  access argument and installs a device-attribute row, and there is no other op
-  on the kind, so "a Device MemoryObject can only produce Device mappings"
-  holds BY CONSTRUCTION. The attribute travels with the handle because the
-  attribute IS the handle's kind.
-- **UNIQUE-VS-SHARED ALLOCATION BECAME TWO VERBS.** `MemoryObject.split(len)` is
-  ONE CUT FROM THE FRONT and the parent becomes the remainder — allocation is
-  repeated front-splits and the parent IS the pool cursor, so a piece is
-  allocated once and unavailable until freed. `IoMemoryObject.carve(offset, len)`
-  leaves the parent WHOLE, which is this section's "a fixed region may be handed
-  out many times", and the window is never freed because MMIO is pinned.
-- **`map(aspace, ...) -> Mapping` IS BUILT, and `aspace` is a PROCESS.** §5b
-  says the domain IS the process on both profiles, so the argument names the
-  process rather than an object that would be a second name for it. It answers
-  with a distinct kernel object with its own handle, and ONLY THE MAPPING HANDLE
-  CAN UNMAP.
-- **THE DELIBERATE STANCE HOLDS AND IS NOW FREE.** Dropping a Mapping handle
-  without unmapping means that mapping is permanent — safe-but-leaked, never a
-  dangling-unmap hazard — and it costs no new rule: release destroys a TABLE
-  ENTRY and never an object (design 3 D-2), so the stance falls out of doctrine
-  that predates it. **The Deinit-unmaps-at-scope-exit half is NOT built**, and
-  the reason is the shape unit 4 exists for: a launcher that maps a page into a
-  child holds the Mapping in a local, and a scope-exit unmap would revoke the
-  page before the child ever ran. Tying the row's lifetime to a wrapper looked
-  like it wanted the refcount immediately below; **unit 5 landed that refcount
-  and RULED THE OTHER WAY** (D-2, two paragraphs down — a Mapping owns its row
-  and the row is not a reference back), so the Deinit stays DECLINED on the
-  launcher argument rather than pending on a mechanism.
-- **THE REFCOUNT INVARIANT WAS NOT BUILT AT UNIT 4, AND THE CLAUSE IS QUOTED
-  HERE SO THE DEFERRAL — AND THEN ITS NARROWING — STAYS
-  VISIBLE**: "*a Mapping holds a reference to the physical pages (not
-  merely to a MemoryObject handle). The pages are freed only when the LAST
-  reference of either kind — any MemoryObject handle OR any Mapping — drops.*"
-  Nothing in unit 4 frees pages at all: a split is PERMANENT until its owner's
-  teardown, and teardown returns slab SLOTS rather than ranges, so a pool walked
-  to its end stays walked and `NoResource` is what says so (the `memory_split`
-  case asserts exactly that). Free-on-last-reference lands with unit 5, beside
-  quotas, which is where a refcount has something to be checked against.
-
-  **BUILT M3 UNIT 5 (sawos design 7 D-1), AND NARROWED WHERE IT LANDED.** The
-  refcount exists: every countable slab slot carries one, the count reaches zero
-  inside the syscall that drops the last reference, and the free is synchronous
-  — no deferred reclamation, no cleanup queue. `memory_split`'s claim flipped
-  with it, from "the slab runs out" to twenty cut-and-drop rounds past a slab of
-  sixteen. What the clause above said about PAGES was deliberately still not
-  true at that unit, and the narrowing was the ruling rather than an omission:
-  a freed Memory slot returned to its slab and its
-  bytes returned to NO POOL — a front-cut parent is a one-way cursor and cannot
-  absorb an arbitrary hole, which is the one-`{base, len}` shape design 6 D-2
-  chose — so what unit 5 reclaimed was the SLOT, not the range.
-
-  **AND THE QUOTED CLAUSE IS NOW EXECUTED, WORD FOR WORD — M5 UNIT 5 (sawos
-  design 28; design 25 D-5, ruled).** "Freed only when the LAST reference of
-  either kind — any MemoryObject handle OR any Mapping — drops" is two counts
-  on the region's own slab slot, `refs` and `maps`, and the range goes back at
-  the SECOND zero. So a region whose handles are all released but whose grant
-  row is still installed stays OUT of the pool until that row dies, which is
-  the sentence's whole point and was the one thing a handle count alone could
-  never say. **`maps` counts installed grant ROWS rather than `Mapping`
-  OBJECTS**, because a Mapping's slot and its row have different lifetimes (the
-  husk arm below), and a row cannot die unwitnessed — `record_grant` makes one,
-  `remove_grant` and `clear_domain` are the only two things that take one away.
-  RETURN IS TO THE POOL ROOT: every region carries a back-reference to the
-  boot-minted region it was ultimately cut from (a root names itself), adjacent
-  free ranges coalesce, and `split` serves the free list before advancing the
-  cursor — first fit. A release is INFALLIBLE, so a range that finds no free-list
-  node after coalescing is leaked and COUNTED (`dropped`) rather than refused;
-  it is zero in this tree. **QUOTAS STAY OBJECT-COUNTED** — that narrowing was
-  never the gap; bytes are the pool's ledger (`out_bytes` beside
-  `pool_free_bytes`), which is what §5.9's "byte accounting" always meant, and
-  no op fronts it in v1. `IoMemory` is untouched by all of it: `carve` leaves
-  the parent whole and MMIO is pinned, which is §5.9's own carve-out.
-
-  **AND ONE MAPPING SHAPE IS RULED HERE RATHER THAN INFERRED** (design 7 D-2).
-  A Mapping OWNS its row; the row is not a counted reference back. So a
-  mapped-but-unreferenced Mapping — every handle released, the grant still
-  installed — reaches zero, FREES ITS SLOT AND LEAVES THE ROW: exactly this
-  section's "dropped without unmap = permanent, safe-but-leaked", now a line of
-  kernel rather than a sentence about one. The row is then unremovable until the
-  TARGET process's teardown, which is what "leaked" has always meant and is the
-  bound on it. `mapping_slot_free`'s husk arm writes and reads through such a
-  row to show it. The mirror case is a husk of the other kind — unmapped but
-  still referenced — whose `Unmap` stays the `BadState` fault it already was.
-  **WHAT M5 UNIT 5 CHANGED ABOUT THAT SENTENCE IS ITS SUBJECT, NOT ITS TRUTH:**
-  the ROW is still leaked to the target's teardown, and the BYTES are not — the
-  region survives its own last handle because the row still counts against it,
-  and the range returns when the row goes. The Mapping slab's lifetime rule did
-  not move at all; the level above it did.
-
-**THE MIGRATION CASE BELOW CAME TRUE** (design 6 D-6). M2's boot-time device
-grant was a `sosimg` record a driver package declared in its manifest; both
-driver packages now receive the console's register page as an `IoMemory`
-capability in their boot set and map it into themselves, and the echoed bytes
-and the line number in their transcripts are UNCHANGED. That is the migration's
-own claim — "the same window, obtained rather than declared" — as a diff of two
-console transcripts. What has NOT retired is the `SegFlag.Device` flag itself
-and the boot loader's `allow_device: true` door: the emitter is sawlang-side
-(`blade/sosimg.saw`), so deleting the flag is a pin-bump event. The path is
-DORMANT — no image in this tree uses it — and its retirement is a backlog entry.
-Children still cannot declare windows (`allow_device: false`, unchanged); a
-driver child gets its window because root MAPS it in or GIVES it a carved
-IoMemory, which is unit 6's flow.
-
-**AND UNIT 6 RAN THAT FLOW** (sawos design 9 D-2). Root drains the console's
-register page out of its own boot set, `give`s the `IoMemory` to a child under a
-tag, and the CHILD maps it into itself and echoes the harness's bytes — on both
-profiles, with the driver body byte-identical to the root-as-driver twin's apart
-from the three things being a child changes (the window arrives by give rather
-than as a region row, it ends with `Process.exit` because it holds no
-`SystemRight.Shutdown`, and it is linked at the child base). The two twins STAY
-in the suite unmoved, so the same driver running as root and as a child is two
-transcripts side by side. `give(iomemory:)` is the one piece of surface it
-needed: `iomemory_rights()` has minted `Transfer` and the kernel's `boot_kind_of`
-has had its `IoMemory` arm since unit 4, both written for exactly this.
-
-**AND THE OUTER BOUND ON ALL OF IT: A DMA-CAPABLE DEVICE'S DRIVER IS INSIDE THE
-TCB** (sawlang#178 round 4, ruled Aug 16; recorded here because this is where
-device grants are ruled, and stated in M3's docs sweep because M3 is the
-milestone that made a driver a separate process). A `map` bounds what a driver's
-CPU may reach. It bounds nothing a BUS MASTER may reach — so a driver that can
-program a DMA engine can make that engine write any physical address on the
-machine, and the window it was granted is a fence around the DRIVER, never
-around the DEVICE. Until an IOMMU exists, such a driver is a TCB member and is
-trusted like one; isolating it is not something a rights mask can do. The ruled
-architecture is a USERSPACE IOMMU DRIVER that owns the IOMMU as an ordinary
-device (a window and a line, granted by root) and to which a DMA driver SENDS
-Memory handles over IPC, creator-pays charging composing unchanged. It names two
-prerequisites and M3 landed the first: **process-death notifications** (§8, unit
-5.5), so the IOMMU driver can stop a dead process's device operations and
-release its memory deliberately rather than by teardown. The second is
-**critical processes** — a process root marks at launch whose exit FOR ANY
-REASON faults the system, checked at the TOP of teardown ahead of any release,
-because the halt must preempt the free or the window it exists to close reopens
-inside it — and it is unbuilt, M4+, filed with the IOMMU item. None of this
-costs the current tree anything, which is what keeps M2/M3's scope honest: both
-v1 boards' consoles are programmed-I/O, so no case in the suite is a DMA driver
-and no capability in the tree is a lie about one.
-
-**AND THE SHARED-MEMORY BULLET BELOW CAME TRUE WITH IT** (design 9 D-3): one
-region, `map`ped into two processes, written from each side and read from the
-other. The launcher installs the CHILD's row itself, so that child holds no
-`Memory` handle at all — access without possession — which is the deliberate
-contrast with the driver child, which was given the capability and installed its
-own row. Two installation directions, one unit, no mode flag anywhere.
-
-**EXECUTABLE BECAME A RIGHT** (design 9 D-1, ruled Aug 30), which is this
-section's `map(aspace, ...)` amended in one place and left alone everywhere else:
-
-- **ACCESS IS STILL A PROPERTY OF THE MAPPING.** A region carries no R/W/X
-  triple and nothing about double-mapping one region RO here and RW there
-  changed. What became an authority is WHICH ACCESS BITS A HANDLE MAY REQUEST:
-  `MemoryOp.Map` refuses `MapAccess.Execute` unless the Memory handle carries
-  **`MemoryRight.MapExecute`**, the same refusal (`AccessDenied`, a fault) every
-  unspent right answers. It is CAPABILITY FLOW, not identity — "only root maps
-  executable" holds because root never grants the bit, not because the kernel
-  asks who is calling — and `memory_rights()` therefore MINTS it at boot, of
-  necessity: §3's attenuation is monotonic, so a bit not minted at boot could
-  never appear later, and the narrowing is a holder's `MINT_OP` keep mask.
-- **NO ROW IS BOTH WRITABLE AND EXECUTABLE.** `Write | Execute` in one access
-  word is a caller-checkable `BadArg` fault, landing beside the existing
-  write-without-read refusal. It costs nothing expressible, because the double
-  map is already sanctioned: an RW row here and an RX row there over one region
-  is the JIT-shaped pattern in full, and what is removed is only the single row
-  a process could write and then fetch from.
-- **THE BOUNDARY IS THE DYNAMIC MAP.** Neither rule governs a process image's
-  own executable segments: those arrive through `process_create`'s loader as
-  `SegFlag` bits read out of the image, validated by `imgformat.has_sane_perms`
-  (which refuses write-without-read and X-on-device and deliberately not W|X —
-  an image's segments are kept apart by its linker script), under
-  `SystemRight.ProcessCreate` authority that a driver child does not hold.
-- **STATED HONESTLY: IT IS PER HANDLE, NOT PER REGION.** A second handle that
-  still carries the bit can map the same bytes executable. Design 6's aliasing
-  stance is unchanged, and a region-level immutable flag was REJECTED as a second
-  mechanism doing overlapping work. `IoMemory` is untouched throughout —
-  execute-on-device was already refused vocabulary and its `map` takes no access
-  argument at all.
+**The model.**
 
 - **`MemoryObject`** = authority over a physical page range, allocated
-  **from a typed pool** (ratified Jul 29). The pool's attribute governs
-  three things at once:
-  - **RAM pool** (cacheable, `Normal`): unique allocation — a region
-    is allocated once and unavailable until freed; returns to the pool
-    when its last reference drops (see refcount below). Maps as
+  **from a typed pool**. The pool's attribute governs three things at once:
+  - **RAM pool** (cacheable, `Normal`): unique allocation — a region is
+    allocated once and unavailable until freed; returns to the pool when its
+    last reference drops (see the refcount invariant below). Maps as
     `UnsafeMemory<_, Normal>`-class cacheable memory.
   - **Device pool** (uncacheable MMIO, `Device`): a fixed region may be
-    handed out many times (multiple drivers can hold handles to the
-    same peripheral window) and is **never freed** — MMIO is pinned.
-    Maps as `UnsafeMemory<_, Device>` volatile memory.
-  - The pool attribute IS design 46's intent marker surfacing at the
-    kernel layer — a Device MemoryObject can only produce Device
-    mappings, so a driver physically cannot get a cached view of a
-    register block. The attribute travels with the handle.
-  - **ITS FIRST MIGRATION CASE ALREADY EXISTS** (design 178 unit 4): M2's
-    boot-time device grant is a `sosimg` record a driver package declares
-    in its manifest and the kernel installs before entering user mode,
-    authorized against one window the board publishes. Everything a
-    Mapping adds is what that placeholder lacks — a handle, a derivation,
-    an op that installs it, and a close that revokes it — so the migration
-    is "the same window, obtained rather than declared", and the M2 code
-    says so where the check is. **DONE M3 unit 4** (sawos design 6 D-6):
-    both driver packages migrated, same echoed bytes, same line number.
-- Sendable over pipes — so the SAME physical memory can be mapped
-  into multiple address spaces at multiple virtual locations (the
-  shared-memory primitive). Derived by splitting / attenuating a
-  parent; pool roots given to the root server at boot.
-  **THE SHARED-MEMORY HALF IS BUILT (M3 unit 6, sawos design 9 D-3)** — one
-  region mapped into two processes, written from each side and read from
-  the other (`share_double_map`). **AND SINCE M5 UNIT 2 (sawos design 33)
-  "AT MULTIPLE VIRTUAL LOCATIONS" IS TRUE AS WRITTEN, ON THE TIER THAT
-  TRANSLATES.** The Jul-29 clause was narrowed for four milestones because
-  SOS did not translate at all; it does now on tier 1, where `map` CHOOSES
-  the address it answers with, so two processes sharing one region hold two
-  different numbers for the same bytes and `tests/map-placed` asserts both.
-  On tiers 2 and 3 the original narrowing still holds and is now the TIER's
-  answer rather than the system's law (§5.5 as re-scoped): those platforms
-  do not translate, so a region is shared AT ITS OWN ADDRESS and
-  `share_double_map` reads one constant on both sides. What is portable
-  across the split, and what every program in this tree is written against,
-  is that **A MAPPING'S ADDRESS IS THE KERNEL'S ANSWER AND IS TREATED AS
-  DATA** — `Mapping.base()` asks, no caller holds an opinion, and `map`
-  takes no VA hint on any tier (design 25 ruling 1).
-  **AND THE SENDABLE-OVER-PIPES HALF IS BUILT TOO (M4 unit 4, sawos design
-  18)**: `Memory` and `IoMemory` are two of the six kinds a message may
-  carry, so a region reaches a RUNNING process now — not only through
-  `give` before its start, or through a row the launcher installs. The
-  transfer is take-at-post (§2.1), so a region a message is carrying
-  cannot be freed by its sender's exit. Splitting and attenuating are both
-  built — `MemoryOp.Split` and the universal `MINT_OP` over
-  `MemoryRight` — and unit 6 is the first unit with a reason to attenuate
-  a REGION rather than merely split one.
-- **`map(aspace, ...) -> Mapping`.** Mapping is a DISTINCT kernel
-  object with its own handle, recording the virtual placement. **Only
-  the Mapping handle can unmap** (`mapping.unmap()` / its Deinit).
-- **Deliberate stance:** dropping a Mapping handle without unmapping
-  means that mapping is permanent — safe-but-leaked, never a
-  dangling-unmap hazard. In Saw, a Mapping's Deinit unmaps at scope
-  exit, so the common path is leak-free by construction.
-- **Refcount invariant:** a Mapping holds a reference to the physical
-  pages (not merely to a MemoryObject handle). The pages are freed
-  only when the LAST reference of either kind — any MemoryObject
-  handle OR any Mapping — drops. This is what makes multi-mapping
-  safe: no mapping can outlive its backing.
+    handed out many times (multiple drivers can hold handles to the same
+    peripheral window) and is **never freed** — MMIO is pinned. Maps as
+    `UnsafeMemory<_, Device>` volatile memory.
+  - The pool attribute is Saw's `UnsafeMemory` intent marker surfacing at the
+    kernel layer — a Device MemoryObject can only produce Device mappings, so
+    a driver physically cannot get a cached view of a register block. The
+    attribute travels with the handle.
+- Sendable over pipes — so the same physical memory can be mapped into
+  multiple address spaces at multiple virtual locations (the shared-memory
+  primitive). Derived by splitting / attenuating a parent; pool roots given
+  to the root server at boot.
+- **`map(aspace, ...) -> Mapping`.** Mapping is a distinct kernel object with
+  its own handle, recording the virtual placement. **Only the Mapping handle
+  can unmap** (`mapping.unmap()`).
+- **Deliberate stance:** dropping a Mapping handle without unmapping means
+  that mapping is permanent — safe-but-leaked, never a dangling-unmap hazard.
+- **Refcount invariant:** a Mapping holds a reference to the physical pages
+  (not merely to a MemoryObject handle). The pages are freed only when the
+  last reference of either kind — any MemoryObject handle or any Mapping —
+  drops. This is what makes multi-mapping safe: no mapping can outlive its
+  backing.
 
-## 3. Handles, rights, derivation (proposal detail)
+**The pool attribute is a kind.** A RAM pool root is a `Memory` and a device
+pool root is an `IoMemory`, decided by a kind column in the build-emitted
+region table (§12). The intent marker is therefore not a flag anybody checks:
+an IoMemory's `map` takes no access argument and installs a device-attribute
+row, and there is no other op on the kind, so "a Device MemoryObject can only
+produce Device mappings" holds by construction. The attribute travels with
+the handle because the attribute is the handle's kind.
 
-- Per-process handle table: index → (object ref, rights word).
-  Handles are plain integers in the syscall ABI; the kernel validates
-  index + generation (stale-handle detection) + rights on every use.
-  **GENERATIONS ARE BUILT** (sawos design 3 D-1, M3 unit 2.75). An entry
-  is (object type, rights, target, generation), and a handle word is
-  `(generation << HANDLE_INDEX_BITS) | (index + 1)` — the index field's
-  width is ONE NAMED CONSTANT in `sosabi` (default 8) with every mask and
-  shift derived from it, and the remaining bits of a portable 32-bit
-  budget are generation, identically on both profiles. Four properties
-  worth stating here:
-  - **Generation 0 stamps nothing.** A slot's first-life word IS the bare
-    1-based index, so §12's boot order and every contract written before
-    generations existed survive verbatim.
-  - **"Names nothing" is the INDEX FIELD's zero, at every generation.** A
+**A region is a capability, not a description.** There is no op that reads a
+MemoryObject's bounds: a process that holds one can hand it to the kernel and
+cannot learn a number from it. What a process knows about where its memory is,
+it knows from the config that gave it the region — which is what root's
+tag-to-meaning config is, and where a driver's `UART_BASE` comes from.
+
+**`Memory`: ops `Split` and `Map`, rights `MemoryRight.Split`, `.Map` and
+`.MapExecute`** beside the universal `Transfer` and `Mint`.
+
+- **`split(len)` is one cut from the front, and the parent becomes the
+  remainder.** Allocation is repeated front-splits and the parent is the pool
+  cursor, so a piece is allocated once and unavailable until freed.
+  Arbitrary-offset carving is refused by the shape rather than by a check,
+  since one `{base, len}` slot cannot hold two remainders.
+- **`map(process, access)` installs a protection row and answers with a
+  `Mapping`.** It spends `MemoryRight.Map` on the region and `ProcessRight.Map`
+  on the target, because possession of bytes must not imply authority over an
+  address space. `aspace` is a process: §5b says the domain is the process on
+  every profile, so the argument names the process rather than an object that
+  would be a second name for it. A process may be given access without
+  possession: a launcher that keeps a region and installs the child's row
+  itself leaves the child holding no `Memory` handle at all
+  (`tests/share-double-map`), while a driver child given an `IoMemory`
+  installs its own row. Two installation directions, no mode flag.
+- **Access is a property of the mapping.** A region carries no R/W/X triple,
+  and double-mapping one region RO here and RW there is expressible and
+  allowed. An access word asking for write without read is refused.
+- **Executable is a right.** `MemoryOp.Map` refuses `MapAccess.Execute`
+  unless the Memory handle carries **`MemoryRight.MapExecute`** — the same
+  refusal (`AccessDenied`, a fault) every unspent right answers. It is
+  capability flow, not identity: "only root maps executable" holds because
+  root never grants the bit, not because the kernel asks who is calling, and
+  `memory_rights()` therefore mints it at boot, of necessity — §3's attenuation
+  is monotonic, so a bit not minted at boot could never appear later, and the
+  narrowing is a holder's `MINT_OP` keep mask (a launcher writes "this child
+  may map its RAM and may never map it executable" with
+  `Memory.mint(rights:)` before the region travels).
+- **No row is both writable and executable.** `Write | Execute` in one access
+  word is a caller-checkable `BadArg` fault, beside the write-without-read
+  refusal. It costs nothing expressible,
+  because the double map is sanctioned: an RW row here and an RX row there
+  over one region is the JIT-shaped pattern in full, and what is removed is
+  only the single row a process could write and then fetch from.
+- **The boundary is the dynamic map.** Neither rule governs a process image's
+  own executable segments: those arrive through `process_create`'s loader as
+  `SegFlag` bits read out of the image, validated by `imgformat.has_sane_perms`
+  (which refuses write-without-read and X-on-device and deliberately not W|X
+  — an image's segments are kept apart by its linker script), under
+  `SystemRight.ProcessCreate` authority that a driver child does not hold.
+- **It is per handle, not per region.** A second handle that still carries
+  the bit can map the same bytes executable. A region-level immutable flag
+  would be a second mechanism doing overlapping work.
+
+**`IoMemory`: ops `Carve` and `Map`, rights `IoMemoryRight.Carve` and `.Map`**
+beside the universal pair.
+
+- It is pinned (never freed — MMIO is not reclaimable), carved
+  non-exclusively — `carve(offset, len)` leaves the parent whole where
+  `split` consumes, which is "a fixed region may be handed out many times" —
+  and it has no contents.
+- The machine's granularity is checked at the carve against a per-profile
+  HAL predicate (Profile A needs a naturally aligned power of two — one
+  protection entry; Profile B needs whole pages), because a window that could
+  never be installed anywhere is a capability that lies about itself.
+- `IoMemoryOp.Map` takes no access argument at all, so execute-on-device is
+  refused vocabulary and there is no `IoMemoryRight.MapExecute`; the
+  executable gate does not apply to the kind, by construction.
+- `iomemory_rights()` mints `Transfer`, so a launcher can `give` a driver
+  child its device window (`give(iomemory:)`), and the child maps it into
+  itself (§9). The kernel's `boot_kind_of` has its `IoMemory` arm for the
+  same flow.
+
+**`Mapping`: one installed protection row.** The object records which
+process's domain carries the row and which row it is. A grant row carries both
+halves — a user VA range and the physical base it translates to — so
+"recording the virtual placement" is literal on tier 1, and the two halves are
+asserted equal on the tiers that do not translate (§5.5): one mechanism with
+one degree of freedom unspent on the MPU tier, not two mechanisms.
+
+- **Two ops.** `Unmap` (on `MappingRight.Unmap`) and `Base` (on
+  `MappingRight.Base`) — the address the kernel chose, asked for rather than
+  assumed, which is the portable spelling every program should use
+  (`tests/map-placed`). `Base` is a separate bit from `Unmap` because locating
+  a row and revoking one are different authorities, so a launcher may hand a
+  child a Mapping it can find and not take away (the ordinary shape — the
+  child needs the address to use the memory) or one it can revoke and not
+  locate. The answer is a user address on every tier, and on a tier that does
+  not translate it is also the physical one.
+- **A mapping's address is the kernel's answer and is treated as data.** `map`
+  takes no VA hint on any tier; `Mapping.base()` asks. On tier 1 `map` chooses
+  the address, so two processes sharing one region hold two different numbers
+  for the same bytes and `tests/map-placed` asserts both. On tiers 2 and 3 a
+  region is shared at its own address and `share-double-map` reads one
+  constant on both sides.
+- **Releasing the handle is not an unmap.** Release destroys a table entry and
+  never the object's state (§3), so "dropped without unmap = permanent,
+  safe-but-leaked" falls out of existing doctrine rather than being a new rule.
+  There is no unmapping `Deinit`: it would make the row's lifetime the
+  wrapper's, and a launcher that maps a page into a child holds the Mapping in
+  a local and drops it right after it hands the child its memory, so a
+  scope-exit unmap would revoke the page before the child ever ran.
+- **A Mapping owns its row; the row is not a counted reference back.** So a
+  mapped-but-unreferenced Mapping — every handle released, the grant still
+  installed — reaches zero, frees its slot and leaves the row: the
+  safe-but-leaked stance as a line of kernel. The row is then unremovable until
+  the target process's teardown, which is what "leaked" means and is the bound
+  on it (`tests/mapping-slot-free` writes and reads through such a row). The
+  mirror case is a husk of the other kind — unmapped but still referenced —
+  whose `Unmap` is a `BadState` fault. The row being leaked does not leak the
+  bytes past it: the region survives its own last handle because the row still
+  counts against it, and the range returns when the row goes (below).
+- **The live-domain rule.** Any edit to a grant record reloads immediately
+  when that domain is the installed one, because `run_thread` skips equal
+  domains and an unmap that waited for the next reschedule would be a
+  revocation that did not revoke.
+- Unmapping twice, or unmapping a Mapping whose target process has died (its
+  whole domain went with it), are both `BadState`.
+- **It is not givable** — `mapping_rights()` withholds `Transfer` — because a
+  Mapping names a row in one specific domain.
+- A Mapping charges the target process's quota, not the caller's (§2.9).
+
+**The refcount invariant, as built.** The region's own slab slot carries two
+counts: `MemorySlot.refs` (handle entries naming the region, and references held
+by a staged pipe message) and `MemorySlot.maps` (installed grant rows naming
+it).
+
+- Reaching zero on `refs` frees the slot synchronously, inside the release
+  that drops the last reference (§3) — no deferred reclamation, no cleanup
+  queue.
+- The range returns to its pool at the second zero, which is the invariant
+  above executing as written: a region whose handles are all released but
+  whose grant row is still installed stays out of the pool until that row
+  dies. `maps` counts installed grant rows rather than `Mapping` objects,
+  because a Mapping's slot and its row have different lifetimes (the husk
+  above), and a row cannot die unwitnessed — `record_grant` makes one, and
+  `remove_grant` and `clear_domain` are the only two things that take one
+  away.
+- Where a returned range goes (the pool root, coalescing, first fit), how bytes
+  are accounted, and why `IoMemory` is exempt are §5.9.
+
+**Device grants.** A driver obtains its device window as an `IoMemory`
+capability — from its boot set, or given by a launcher — and maps it into
+itself; or a launcher that keeps the window maps it into the driver
+(`Process.map(iomemory:)` on the child's handle, §12). Children cannot declare
+windows in their images (`allow_device: false`). The image-declared device grant
+(`SegFlag.Device` and the boot loader's `allow_device: true` door) still exists
+but is dormant: no image in this tree uses it, and its emitter is sawlang-side
+(`blade/sosimg.saw`), so deleting the flag is a toolchain-pin event (§11).
+
+**A DMA-capable device's driver is inside the TCB.** On the isolated tiers, a
+`map` bounds what a driver's CPU may reach. It bounds nothing a bus master may
+reach — so a driver that can program a DMA engine can make that engine write any
+physical address on the machine, and the window it was granted is a fence around
+the driver, never around the device. Until an IOMMU exists, such a driver is a
+TCB member and is trusted like one; isolating it is not something a rights mask
+can do. The architecture is a userspace IOMMU driver that owns the IOMMU as an
+ordinary device (a window and a line, granted by root) and to which a DMA driver
+sends Memory handles over IPC, creator-pays charging composing unchanged. It has
+two prerequisites. The first, process-death notifications (§8), is built, so the
+IOMMU driver can stop a dead process's device operations and release its memory
+deliberately rather than by teardown. The second is not: **critical processes**
+— a process root marks at launch whose exit for any reason faults the system,
+checked at the top of teardown ahead of any release, because the halt must
+preempt the free or the window it exists to close reopens inside it. Both v1
+boards' consoles are programmed I/O, so no case in the suite is a DMA driver and
+no capability in the tree is a lie about one.
+
+### 2.6 Clock and Timer
+
+**Clock.** A granted time source: time is a capability, not an ambient
+facility. Obtained through `SystemOp.ClockGet` on `SystemRight.ClockGet`; ops
+`Now`/`TimerCreate`; rights `ClockRight.Read`/`.TimerCreate`.
+
+- **A hardware-backed clock is one kernel-eternal object per `ClockType`**,
+  existing from boot and owned by nobody: the machine has one monotonic
+  counter, and a per-process object naming it would be a copy of a fact with a
+  lifetime attached. So there is one slot per domain (the slot is the domain's
+  ordinal), no allocation and no slab `NoResource`, and process teardown frees
+  no clock — a dead process's clock handle is unbound like any other, and the
+  object it named is not the process's to reclaim.
+- **`ClockGet` is a getter that mints a handle onto a well-known object, and
+  it mints on every ask.** Two asks are two capability instances naming the
+  one Clock, each independently owned and independently released, which is
+  what §4's owning wrapper is an owner of. It amplifies nothing (§3), and it
+  makes the op fallible on repetition — a full handle table is `NoResource` —
+  which is why it is subject to the handle quota (§2.9). The label is
+  `clock_get(type:)`.
+- `ClockType` declares `Monotonic` only (`Boot`/`Realtime` are future values
+  of a raw-backed enum, undeclared because an unproducible case is dead
+  surface), and `Now` dispatches on the clock's domain, so a second domain
+  fails to compile until somebody says what its reading is. `Now` answers
+  through a copy-out record, because a nanosecond count is 64 bits and one
+  profile's registers are not.
+- **The point of the capability:** strip the right from a child and hand it a
+  virtual clock over IPC instead, with no code change on either side. A
+  virtual clock is a different animal — separately created and stateful
+  (offset, rate, owner) — so it gets its own creation op and its own lifetime
+  rather than a row in this table. Not implemented: virtual clocks.
+
+**Timer.** A deadline object bound to the Clock that created it, and directly
+waitable; it is the process-sleep primitive (without it a wait either returns
+at once or blocks forever). Ops `Arm`/`Disarm`; rights `TimerRight.Arm`
+(gating both) and `.Wait`.
+
+- `arm(after_ns, interval_ns)` arrives through the copy-in record (§2.2),
+  because two 64-bit times exceed the argument registers on a 32-bit profile.
+  `interval_ns == 0` is a one-shot, which disarms itself when it fires.
+- **The re-arm is drift-free** (next = previous deadline + interval, the
+  timerfd model), and missed expiries coalesce into a saturating fire count
+  delivered as `WaitPayload.Timer(fires:)`. The count is computed by division
+  rather than by a loop, so an interval far below what the machine can serve
+  costs one divide; what keeps it from livelocking is a floor on how soon the
+  hardware is ever programmed, which leaves the logical schedule untouched. No
+  minimum interval is imposed and nothing is refused.
+- **There is no ack**: unlike §9's Interrupt there is no mask to release, so
+  the wait that reports the fires is what consumes them.
+- Arming an armed timer replaces its schedule and clears the count; disarming
+  an unarmed one is a no-op, deliberately opposite to §9's ack-with-no-fire —
+  a one-shot disarms itself, so cancelling a timeout that just expired is an
+  ordinary race rather than a caller error.
+
+**One hardware timer, two customers.** Both machines have a single
+comparator, and the scheduler tick (§7) and every armed Timer want it. The
+per-arch seam is absolute (`timer_now_ns()` + `timer_set_deadline_ns(at)`) — a
+periodic seam can express exactly one customer — and the tick's period lives
+in the arch-free kernel, where scheduler policy belongs. The kernel keeps every
+deadline it owes in nanoseconds and programs the earliest; a fire means
+"something may be due", and one reading of the clock answers for every
+customer with the tick asked first. The tick is inviolate by construction: a
+Timer deadline can only ever move the hardware earlier, never later. The two
+re-arm rules are opposite, deliberately: the tick re-arms from now (a late tick
+is one tick, never a burst of catch-up), a Timer from its own deadline — a
+timeslice has no history to be faithful to and an interval does.
+
+### 2.7 Process
+
+The Process object: an AddressSpace, a handle table and threads. Its
+lifecycle is §8 and its boot set is §12.
+
+**Ops**, each on its own `ProcessRight`: `ThreadCreate`, `ThreadSelf`, `Exit`,
+`GetStatus` (on `Wait`), the factory ops `EventCreate`, `WaiterCreate`,
+`InterruptBind` and `PipeCreate`, `Start`, `BootHandleNext` (on `BootHandles`),
+`Give`, and `Stats`. `ProcessRight.Map` is the target-side right `MemoryOp.Map`
+and `IoMemoryOp.Map` spend (§2.5). Creation is not an op on this object:
+`ProcessCreate` is on System, because a process is a machine-wide resource
+(§12). `Exit` ends the calling process; not yet enforced: the kernel does not
+check the target, so `Exit` through another process's handle ends that process
+and strands the caller's thread. `kill` has no op and no right (§8).
+
+**The default set.** One Process default set serves all three minters (root's,
+`ProcessSelf`'s and `ProcessCreate`'s), named for its ops throughout:
+`ThreadCreate`, `ThreadSelf`, `Exit`, `Wait`, `EventCreate`, `WaiterCreate`,
+`InterruptBind`, `Start`, `BootHandles`, `Give`, `Map`, `PipeCreate` and
+`Stats`, plus the universal `Transfer | Mint`. A launcher keeps the child's
+handle — it is what supervises with — and the child derives its own authority
+from the masked System handle it was given (§12), so supervision and
+self-management are not alternatives. `Process.mint(rights:)` makes each bit
+attenuable at the typed tier: a supervisor may be handed a sibling that learns
+whether its child is alive and may not watch it work.
+
+**`Give` — the courier op.** `give(handle, tag:)` on the child's handle, gated
+by `ProcessRight.Give` there plus the universal `Transfer` right on the handle
+being given, moves a handle into a fresh slot of the child's table and returns
+only its status: the child-side word is meaningless to the giver, which can
+call no op through it. What crosses instead is the tag — the giver's own word,
+handed back unread at the child's drain.
+
+- It takes a keep mask: a third argument word, intersected with the entry's
+  rights, `ALL_RIGHTS` spelling "the rights the giver held". It is `MINT_OP`'s
+  mask reached through the courier: fail-closed (a bit the source lacks is
+  ignored, never an error), structurally non-amplifying (the result is an
+  intersection), and it leaves the move a move — no default set is consulted,
+  and the caller's entry unbinds exactly as a release does, so the giver's word
+  goes stale.
+- Its faults and statuses are listed in full at §3 ("Which failures fault and
+  which answer a status", beside the transfer-funnel contract). A caller error
+  ends the caller — among them a child that has already been started (`BadState`
+  — the boot set freezes at start, which is the launch flow's whole soundness
+  argument) and a tag the child's set already carries (`DuplicateKey` — the tag
+  is the identity, and one naming two handles would make the boot lookup
+  ambiguous). A resource refusal is a status, and the give has not happened.
+- `Start` takes a `boot_tag`: the kernel resolves the tag to the child-side
+  word, puts it in the child's first argument register and consumes the record
+  it named (the register is the delivery, so a child can never be handed one
+  word twice). The child's entry is `_start(boot_handle)`, and a launcher never
+  sees a child-relative word through the launch flow (but see §11's line on the
+  factory ops through a child's handle).
+- `BootHandleNext` drains the caller's own per-process set — the kernel writes
+  root's at boot and a launcher writes a child's with `give`, through one op
+  with one exhaustion rule (§12).
+
+**A Process handle is a waitable**, a member of §2.2's list. Readiness is
+`state == Gone`; the payload is the §8 status word (`WaitTag.Process`,
+`WaitPayload.Process(status:)`); the right it spends is `ProcessRight.Wait`, the
+same bit `GetStatus` spends, because attaching is that question asked
+asynchronously, and a second bit would let a supervisor poll a death it may not
+be woken by. It is a terminal level — a delivery does not consume it — so a
+waiter attaching after the death still wakes, a second wait answers the same
+word, and supervision has no lost-edge race. The attachment is a counted
+reference like every other waitable's, which keeps a dead child's slot readable
+for exactly as long as somebody is watching it. There is no notification to
+anyone but a parked or attaching waiter: the Waiter is the delivery system.
+
+**The slot of a dead process is reclaimed.** A `Gone` slot holds its §8 status
+word, and the only ways to read that word are a Process handle (`GetStatus`) and
+an attachment on one (a wait — including an attachment that owns a reference to
+the object after `Waiter.give(process:)`), so "no reference (handle entry or
+attachment) names this slot" is "no possible reader of the word", exactly. The
+trap counters are not in the slot: they are the slot's row of the shared stats
+region (`Stats`, below). The count that decides it is `ProcessSlot.refs`,
+maintained at the same sites as every other kind's, so a `Gone` process is
+ordinary rather than special. Handle generations (§3) make the reuse safe, and
+`clear_domain` invalidates `LAST_PROT_PROCESS`. Where the kernel walks every
+handle table, the walk is over the process slab's extent chain and is bounded by
+`process_slots_usable()` × `MAX_HANDLES`.
+
+**`Stats` — exact trap introspection.** `ProcessOp.Stats` on
+`ProcessRight.Stats` answers through a three-doubleword copy-out record:
+`syscalls`, `interrupts`, `faults`, split by the cause class the trap entry
+decides on.
+
+- The split is what makes the numbers usable: a single total would mix a
+  quantity the program determines with one the machine determines, so nothing
+  could be asserted about it. Separated, `syscalls` is exact for a given
+  program path (one per syscall instruction, whatever the op, whatever the
+  answer, and one for a call that parks for a millisecond), `interrupts` moves
+  with the host, and `faults` is exact where a test provokes one.
+- **A bad syscall counts as a syscall**: an unknown handle, an unknown op or a
+  missing right ends the process (§5.7's faults ruling) but arrived through the
+  syscall instruction, and keying on the outcome would make the assertable
+  column unpredictable.
+- **Attribution is to the process current at trap entry**, decided before any
+  dispatch, so a syscall that switches processes is charged to the one that
+  made it and an interrupt that preempts is charged to the one it interrupted.
+  Traps taken through the boot door before any process exists are
+  unattributed, and an interrupt taken while the kernel is idle or at a
+  preemption point is not counted at all, because it arrives through the poll
+  rather than through a vector and no process was current.
+- The columns live in the slot's row of the shared stats region (below), and the
+  row is zeroed at process create, on both doors, so a reclaimed slot never
+  inherits its predecessor's traffic. They survive the death: the row is cleared
+  only when a create reuses the slot, and the slot cannot be reused while a
+  handle names it, so `Stats` through that handle reads a dead process's columns
+  — which is how a supervisor observes a fault column, since a faulting process
+  is not around to ask about itself. A mapped stats-region reader can see the
+  row without any handle, even after the slot is reclaimed, until a create
+  clears it. The reading includes the call that took it (the column is charged
+  at trap entry, ahead of the op), so a delta between two readings carries the
+  second reading's own trap.
+- Per-process only: per-thread stats wait for a consumer that names one.
+
+**The stats region.** `SystemOp.StatsRegionMap` on `SystemRight.StatsRegionMap`
+installs a row, read-only on the isolated tiers, over the kernel's own counter
+page in the caller's domain and answers a `Mapping` plus the caller's own row
+index; the kernel writes each process's row at the same trap-entry sites that
+maintain the columns above, so a reader's `top` costs no syscalls at all after
+the map. `ProcessOp.Stats` is independent of it and is what a program uses for
+another process's counters. Three things about the region:
+
+- **No `Memory` handle is minted.** The caller is granted the access and
+  nothing that owns it — a Memory onto kernel storage would carry `Split` and
+  would make the page donatable.
+- **`rows` is a capacity, not a census.** A row for an unoccupied slot reads
+  whatever its last occupant left until a create zeroes it, and v1 publishes
+  no liveness column.
+- **A row index is not a name.** The op answers the caller's own row and
+  nothing else, so a general `top` that maps an arbitrary process to a row
+  still wants either a per-row identity column or an op resolving a Process
+  handle to its row. Not built.
+
+**Capacity.** `MAX_PROCESSES` is the compiled number of process slots the kernel
+boots with — the floor of the bound, not the whole of it. A deployment donates
+memory to back more slots (`SystemOp.SlabDonate`, §2.8), and the running bound
+is `process_slots_usable()` =
+`min(PROCESSES.capacity(), hal.PROT_DOMAIN_SLOTS)`. The second term exists
+because a per-process translation-table set comes out of a static HAL pool
+(donation does not reach HAL-internal storage), so a translating tier has a
+lower ceiling than its slab does, and a create past it answers `NoResource` — a
+status, not a fault, because the caller could not have known a number the kernel
+does not publish. `kcore.limits`'
+`static_assert(MAX_PROCESSES <= hal.PROT_DOMAIN_SLOTS)` binds the floor at
+compile time. Per-process state is never a parallel `MAX_PROCESSES ×` array: the
+handle table, the quota ledger, the boot-handle queue and the grant record are
+all fields of the process slot (`kcore.pslot`), because a table beside the slab
+would be left behind by a donation. `MAX_ATTACHMENTS` derives from the non-pipe
+waitable slabs (`MAX_EVENTS + MAX_INTERRUPTS + MAX_TIMERS + MAX_PROCESSES`; the
+pipe kinds are left out of the sum), and the protection-row budget is per
+domain, so a process adds nothing to another's (root's own record stays at
+`IMAGE_GRANT_ROWS` whatever it wires up, because a launcher hands out
+capabilities and maps nothing).
+
+### 2.8 System
+
+The kernel singleton: the object behind system-scoped primitives, so that every
+syscall is an object op (§5.7). Root receives its handle at boot; a child
+receives a masked sibling of its launcher's when the launcher gives one and
+names its tag at `start`, and a child started with no tag receives none in its
+first argument register (§12). Each op names a machine-wide fact or resource,
+which is why it lives here: System is the object that stands for the machine as
+a whole.
+
+| op | right | what it does |
+|---|---|---|
+| `DebugPrint` | `SystemRight.Debug` | places a byte on the console (§9a) |
+| `Shutdown(status)` | `SystemRight.Shutdown` | stops the machine (QEMU: `sifive_test` on Profile A, semihosting on Profile B) |
+| `ProcessSelf` | `SystemRight.ProcessSelf` | mints the caller's own Process handle, narrowed by a keep mask |
+| `ClockGet` | `SystemRight.ClockGet` | mints a Clock handle (§2.6) |
+| `ProcessCreate` | `SystemRight.ProcessCreate` | the object's one factory: creates an inert process (§8, §12) |
+| `SlabDonate` | `SystemRight.SlabDonate` | donates a `Memory` region to a kind's slab |
+| `TierGet` | `SystemRight.TierGet` | answers the protection tier (§5b.1) |
+| `StatsRegionMap` | `SystemRight.StatsRegionMap` | maps the trap-counter page read-only, on the isolated tiers (§2.7) |
+
+- **`exit` is not here**: process exit is `ProcessOp.Exit`, which ends the
+  calling process (not yet enforced: §2.7).
+- **`process_self` is §3's derivation rule made real.** The boot register
+  stays one handle wide, and a process obtains its Process object through the
+  System handle rather than being handed it. Strip `SystemRight.ProcessSelf`
+  and a child may print and tell the time and never learn its own identity. It
+  takes a keep mask, intersected with the one Process default set (§2.7), so a
+  process can narrow the Process handle it derives at the moment it derives it
+  — a driver that has bound its line dropping the authority to bind another, a
+  plugin deriving a handle that cannot start children. The addressee is the
+  deriver, not the launcher: a keep mask on this op is a process narrowing
+  itself, which is the privilege-drop shape a capability system should have,
+  and the launcher's lever remains its mask on the System handle. It is
+  fail-closed like every keep mask: a bit the default set lacks is ignored.
+- **`root_system_rights()` includes `Transfer`**, so a launcher mints a masked
+  sibling of its System handle (`MINT_OP`, §3) and gives that to a child. A
+  child therefore bootstraps exactly as root does (§12): System in the first
+  argument register, its own Process handle derived from it, its boot set
+  drained from there. `Debug` in the mask is what lets a child print without
+  owning a device; `Shutdown` left out is what stops it halting the machine
+  through syscalls (a flat-tier process can write the finisher, §5b.1).
+- **`SlabDonate`** consumes the donated capability and backs a named object
+  kind's slab with it, permanently in v1 — so the compiled limits are a floor
+  and capacity is policy, decided by the deployment rather than by the build.
+  The region must have no live mappings and no sibling references (`BadState`
+  otherwise): the kernel never shares slab backing with user-reachable memory.
+- **`TierGet`** answers `Isolated` or `Flat` (§5b.1). It reads no state, spends
+  no resource, takes no argument and cannot fail. Info queries of this kind
+  belong on this object and are gated like any other op.
+
+### 2.9 Quotas
+
+The factory capabilities (§12) decide whether a process may create an object;
+the quota decides how many. The table is two per-process rows, used and
+limit, with one column per `QuotaKind` — `Thread`, `Event`, `Waiter`,
+`Interrupt`, `Timer`, `Memory`, `IoMemory`, `Mapping`, `Handle` and `Pipe` —
+stored in the process slot (`ProcessSlot.quota_used` / `quota_limit`). The
+`Handle` row is charged inside `mint_handle` and credited inside
+`unbind_handle`.
+
+- **Policy first.** A quota is checked at every allocation site that answers
+  `NoResource`, ahead of the slab, so a process at its budget is told
+  `SosStatus.QuotaExceeded` and only one still within it can meet the machine's
+  edge (`NoResource`). The charge itself is made once every refusal is behind it
+  (`quota_room` is the check, `quota_charge` the charge).
+- **Creator-pays**, against the slot's own `process` field, with one
+  exception: a Mapping charges the target, because what it consumes is that
+  process's grant-row budget, and charging the caller would let a launcher's
+  allowance gate another process's domain size.
+- **Root's rows are unlimited** — root is init, and its policy cap is the
+  machine, so the slab is what refuses it — except its mapping row, which is
+  clamped to its own free grant rows. That clamp makes a `map()` meeting the
+  physical wall with quota headroom left (which would be fatal) unreachable
+  rather than merely unlikely.
+- A child gets `kcore.limits`' documented defaults; there is no per-create
+  quota argument in v1.
+- **`Pipe` counts a connection.** `ProcessOp.PipeCreate` charges it once, and
+  the credit lands when both of the connection's reference columns reach zero
+  and the slot goes back. Charging per endpoint would be wrong: two ends of
+  one connection are two handle entries, which the `Handle` row already
+  counts, so a launcher that keeps both ends would pay twice for one slot, and
+  giving an end away would look like a refund. Creator-pays means a child
+  given an end spends nothing here, which lets a server child hold many
+  sessions under a small pipe budget.
+- **A one-shot pair has no column.** It is ring-slot state inside a connection
+  the creator was already charged for, so `QuotaKind.Pipe` covers the row and
+  its whole staging ring. An exchange spends `QuotaKind.Handle` twice — one
+  entry for the claim at the post and one for the obligation at the take —
+  the ordinary rule that a capability costs a table row; a fused `Call` mints
+  neither, a difference of handle traffic and of nothing else.
+- **Attachments have no column.** They are bounded by `MAX_ATTACHMENTS` — a
+  floor, since `Attachments` is a donatable kind — because an attachment
+  already costs the one thing quotas count on this axis: a Waiter to hold it,
+  charged at `QuotaKind.Waiter`. A client that gives its claim to a
+  subscription spends no `Handle` row while the request is outstanding, so
+  `MAX_HANDLES` is not the bound on a client's in-flight depth.
+- **A handle in a staged message is charged to nobody.** The post unbinds the
+  entry, which credits the sender at the one place a binding is destroyed, and
+  the take or the delivery mints it, which charges the taker; the charge is
+  written off at one end and raised at the other. The hole is bounded, which
+  is why it is safe: a connection's ring is `PIPE_INFLIGHT` slots each
+  carrying at most `PIPE_MSG_HANDLES` handles, a connection cost a `Pipe` row,
+  and every object a staged reference names already occupies the slab slot it
+  was charged for. Quota <= wall therefore holds, and the slab is still what
+  refuses the next allocation.
+- **The taker's budget refuses, atomically.** A delivery mints up to
+  `PIPE_MSG_HANDLES` + 1 entries at once, so the whole batch is pre-flighted
+  against the taker's table and its `Handle` row before anything is minted; a
+  receiver at its budget is told `QuotaExceeded` and the message stays staged,
+  references and all. A partial charge would leave a message half-delivered,
+  which is the state the pre-flight makes unrepresentable. Creator-pays decides
+  who pays for an object; a message only ever moves who pays for a name.
+- **Teardown writes off rather than force-freeing.** A dying process drops its
+  own references (the close-all) and its quota rows are written off, so an
+  orphaned object is charged to nobody until it frees, and a slot outlives its
+  creator for exactly as long as anybody holds a reference. The books balance
+  and the machine stays bounded because quota <= wall. Because the close-all
+  counts without freeing, the teardown then reaps what nobody names, freeing
+  through `free_object` so each kind's own credit runs. The counted
+  sweeps remain (the teardown line reports them), and the Mapping sweep
+  remains with them, because a Mapping's handles carry no `Transfer` and
+  so cannot outlive their owner.
+- Quotas count objects, not bytes, in v1; bytes are the pool's ledger (§2.5).
+
+## 3. Handles, rights, derivation
+
+- **The handle table.** Each process has a table: index → (object ref, rights
+  word). Handles are plain integers in the syscall ABI; the kernel validates
+  index + generation (stale-handle detection) + rights on every use. An entry is
+  (object type, rights, target, generation), and a handle word is
+  `(generation << HANDLE_INDEX_BITS) | (index + 1)` — the index field's width is
+  one named constant in `sosabi` (`HANDLE_INDEX_BITS`) with every mask and shift
+  derived from it, and the remaining bits of a portable 32-bit budget are
+  generation, identically on both profiles. Four properties:
+  - **Generation 0 stamps nothing.** A slot's first-life word is the bare
+    1-based index, so §12's boot order holds verbatim.
+  - **"Names nothing" is the index field's zero, at every generation.** A
     malformed word carrying generation bits over a zero index is not equal
     to `NO_HANDLE` and must still resolve to nothing.
-  - The generation SURVIVES an unbind and is incremented BY it, so a
+  - The generation survives an unbind and is incremented by it, so a
     released word fails the equality test and becomes the ordinary
-    `BadHandle` fault the callers already raise.
-  - **BEST-EFFORT detection of a bug, not a uniqueness guarantee.** A word
+    `BadHandle` fault.
+  - **Best-effort detection of a bug, not a uniqueness guarantee.** A word
     held across a full wrap of one slot's generation aliases silently;
     tables are per-process, so such a collision crosses no boundary and
     grants nothing. This is not to be "fixed" into unbounded bookkeeping.
-- **Rights are a bitmask, SCOPED PER OBJECT KIND (ratified Aug 7,
-  user).** Each kind defines its own backed rights enum —
-  `SystemRight: UInt32 { case Transfer = 1, case Mint = 2, case
-  Debug = 256, case Shutdown = 512 }`, `PipeRight { … Send,
-  Receive }`
-  — spelled `SystemRight.Debug`, scoped by the ENUM (no flat
-  name-mangling; exhaustive match + the design-145 wire discipline
-  come free). Kind-specific bits OVERLAP freely across kinds: a
-  rights word is only ever interpreted against its handle's kind,
-  which dispatch establishes before the check (§3 order), so each
-  kind owns 24 bits instead of sharing 32. With §3's typed handles,
-  the check helper demands the MATCHING right type
-  (`check(h: SystemHandle, r: SystemRight)`) — testing a pipe
-  right against a System handle is a COMPILE error. The exception:
-  **UNIVERSAL rights own the pinned LOW BYTE — bits 0-7, identical in
-  every kind's enum (ratified Aug 7, user: reserve room, more shared
-  operations are coming).** Assigned so far: bit 0 = `Transfer` (may
-  be sent over a pipe — the movability capability), bit 1 =
-  `Mint` (may mint a SIBLING handle onto the same object); bits 2-7
-  RESERVED (candidates as they prove universal: wait/signal,
-  introspect/info, revoke).
-  **THE DOCTRINE (ruled Aug 29, user, at M3 unit 3): SPECIFIC RIGHTS
-  FOR SPECIFIC OPERATIONS, PER OBJECT TYPE; UNIVERSAL BITS FOR
-  UNIVERSAL OPS; THERE IS NO GENERIC AUTHORITY.** `Manage` held bit 1
-  from M2 until that ruling and meant "derive children" — general
-  enough to be borrowed by four unrelated ops (`ProcessSelf`,
-  `ThreadSelf`, `Give`, and a reading of sibling-derivation) and
-  therefore specific enough to gate none of them. It is REMOVED, not
-  renamed: `SystemRight.ProcessSelf`, `ProcessRight.ThreadSelf` and
-  `ProcessRight.Give` are the bits that replaced it, each named for
-  its op, so a launcher stripping one strips exactly one authority
-  instead of an unpredictable bundle. `Mint` took the vacated bit
-  (numbers are not ABI). What the doctrine does NOT mean is one bit
-  per op NUMBER: `TimerRight.Arm` gates `Arm` and `Disarm`, and
-  `WaiterRight.Attach` gates `Add` and `Remove`, because each pair is
-  ONE capability and splitting it would produce a right that withholds
-  nothing. The unit of a right is an AUTHORITY. Generic
-  kernel paths (pipe handle-transfer) check universal bits without
-  knowing the kind; `sosabi` `static_assert`s each kind's enum
-  against the pinned table so no kind can drift, and a kind-specific
-  right below bit 8 is a spec violation the assert catches.
-  **`Transfer` HAS ITS FIRST CONSUMER** (sawos design 4, M3 unit 3): the
-  bit was declared in every kind's enum in M2 and read by NOTHING until
-  `ProcessOp.Give`, which checks it on the handle BEING GIVEN — at the
-  one altitude that has the entry and has not yet branched on its kind,
-  the same place `RELEASE_OP` is intercepted. So the universal low byte
-  is now load-bearing rather than reserved, and `rights_allow_transfer`
-  is the one function that reads it. Which kinds' DEFAULT sets mint it
-  is a per-kind ruling: v1 mints it in `memory_rights()`,
-  `process_rights()` and `root_system_rights()`, so a Thread, Event,
-  Waiter, Interrupt, Clock or Timer handle cannot be given yet. Root's
-  System handle GAINED it at M3 unit 3 (the M2 "nobody to transfer to"
-  reason expired when unit 2 made a second process), which is what lets
-  a launcher hand a child a masked System sibling — and is why a child
-  is no longer console-silent.
-- **THE INVARIANT IS NO AMPLIFICATION — and it always was.** REWRITTEN
-  HERE at M3 unit 7, replacing the Jul-29 rule rather than amending it
-  (sawos design 3 D-4 carried the compact amendment through unit 2.75;
-  this is the statement it deferred). The old text read: "**No DUPLICATE
-  right — no handle duplication at all**: every handle is unique, the
-  exact `NoCopy` correspondence. If a second handle to a resource is
-  legitimately needed, the resource's CREATOR (who holds MANAGE) mints a
-  fresh one; there is no in-process copy. Attenuation happens only at
-  that creation, monotonically." Three of those clauses are no longer
-  true, and the one that is was never the point:
-  - **ASKING TWICE GIVES TWO HANDLES.** Every getter of an existing
-    object MINTS A FRESH ONE (`clock_get`, `process_self`,
-    `thread_self` — unit 2.75's mint-per-call): no find-or-create, no
-    handle-table search, no cached self-handle fact.
-  - **`MANAGE` DOES NOT EXIST**, so there is no "creator who holds
-    MANAGE" to re-mint through. The Aug-29 doctrine above removed it;
-    rights are named for the operations they gate.
-  - **ATTENUATION IS AN OPERATION A HOLDER PERFORMS**, not a property of
-    what the kernel happened to mint at a creation — `MINT_OP`, below.
-  What survives is the property the rule existed to protect: **no
-  sequence of asks yields authority the asker did not already have.** A
-  handle is still a unique ENTRY, which is the `NoCopy` correspondence §4
-  builds on — but uniqueness was the mechanism, and no amplification is
-  the law.
+- **Rights are a bitmask, scoped per object kind.** Each kind defines its own
+  backed rights enum — `SystemRight: UInt32`, whose cases include
+  `Transfer = 1`, `Mint = 2`, `Debug = 256` and `Shutdown = 512`, or
+  `PipeInletRight`, whose cases include `Post` and `Wait` — spelled
+  `SystemRight.Debug`, scoped by the enum (no flat name-mangling; exhaustive
+  match and the raw-backed wire discipline come free). Kind-specific bits
+  overlap freely across kinds: a rights word is only ever interpreted against
+  its handle's kind, which dispatch establishes before the check (§3 order), so
+  each kind owns 24 bits instead of sharing 32. Kernel-side, dispatch resolves a
+  handle to a typed object view whose check takes only its own kind's enum
+  (`SystemObject.allows(&self, right: SystemRight)`, and likewise per kind), so
+  testing a pipe right against a System handle is a compile error. The
+  exception: **universal rights own the pinned low byte — bits 0-7, identical in
+  every kind's enum**, with room reserved because more shared operations are
+  coming. Assigned: bit 0 = `Transfer` (may be moved to another process — the
+  movability capability), bit 1 = `Mint` (may mint a sibling handle onto the
+  same object); bits 2-7 reserved (candidates as they prove universal:
+  wait/signal, introspect/info, revoke).
+- **The doctrine: specific rights for specific operations, per object type;
+  universal bits for universal ops; there is no generic authority.** Each
+  right is named for the op it gates, so a launcher stripping one strips
+  exactly one authority instead of an unpredictable bundle — which is why
+  there is no `Manage`-style bit meaning "derive children": a bit general
+  enough to be borrowed by several unrelated ops (`ProcessSelf`,
+  `ThreadSelf`, `Give`, sibling derivation) is specific enough to gate none
+  of them. `SystemRight.ProcessSelf`, `ProcessRight.ThreadSelf` and
+  `ProcessRight.Give` are separate bits for that reason. What the doctrine
+  does not mean is one bit per op number: `TimerRight.Arm` gates `Arm` and
+  `Disarm`, and `WaiterRight.Attach` gates `Add` and `Remove`, because each
+  pair is one capability and splitting it would produce a right that
+  withholds nothing. The unit of a right is an authority. Generic kernel paths
+  (handle transfer) check universal bits without knowing the kind; `sosabi`
+  `static_assert`s each kind's enum against the pinned table so no kind can
+  drift, and a kind-specific right below bit 8 is a spec violation the assert
+  catches.
+- **`Transfer` is read by the courier.** `ProcessOp.Give` checks it on the
+  handle being given, at the one altitude that has the entry and has not yet
+  branched on its kind — the same place `RELEASE_OP` is intercepted — and a
+  pipe send checks it on each handle a message carries (§2.1).
+  `rights_allow_transfer` is the one function that reads it. Which kinds'
+  default sets mint it is a per-kind ruling: v1 mints it in
+  `root_system_rights()`, `process_rights()`, `memory_rights()`,
+  `iomemory_rights()`, `pipe_inlet_rights()`, `pipe_outlet_rights()`,
+  `pipe_reply_rights()` and `pipe_request_rights()`, so a Thread, Event,
+  Waiter, Interrupt, Clock or Timer handle cannot be given (nor a Mapping,
+  §2.5). Root's System handle carries it, which is what lets a launcher hand a
+  child a masked System sibling (§12).
+- **The invariant is no amplification: no sequence of asks yields authority
+  the asker did not already have.** A handle is a unique entry, which is the
+  `NoCopy` correspondence §4 builds on — but uniqueness is the mechanism, and
+  no amplification is the law. Three consequences of stating it that way:
+  - **Asking twice gives two handles.** Every getter of an existing object
+    mints a fresh one (`clock_get`, `process_self`, `thread_self`): no
+    find-or-create, no handle-table search, no cached self-handle fact.
+  - **There is no creator-holds-manage re-mint path**; rights are named for
+    the operations they gate.
+  - **Attenuation is an operation a holder performs**, not a property of what
+    the kernel happened to mint at a creation — `MINT_OP`, below.
 
-  THREE FACTS HOLD IT, each a line of kernel rather than a discipline:
-  - **A MINT CARRIES THE KIND'S DEFAULT SET, or a subset of the source.**
-    A getter mints the kind's default rights and nothing else;
-    `MINT_OP` mints the SOURCE's rights INTERSECTED with a caller-supplied
-    keep mask. Neither spelling can exceed what already exists.
-  - **THE AUTHORITY TO MINT IS ITSELF RIGHTS-GATED** —
-    `SystemRight.ClockGet`, `SystemRight.ProcessSelf`,
-    `SystemRight.ProcessCreate`, `ProcessRight.ThreadSelf`, and the
-    universal `Mint` for `MINT_OP`. A process that cannot spend the bit
-    cannot perform the mint.
-  - **A GIVE MOVES RIGHTS VERBATIM** (sawos design 4 D-1, M3 unit 3) —
-    the same invariant read from the transfer side. `ProcessOp.Give`
-    copies the entry's kind, target and RIGHTS WORD into the receiver's
-    table and consults no default set at all, so what the giver
-    attenuated stays attenuated and no handle is ever wider on the far
-    side of a transfer than it was on the near one. The giver's entry is
-    UNBOUND by the same act — `unbind_handle`, generation bump included,
-    the same function release and the teardown call — so exactly one
-    process holds the capability at every instant and the giver's word is
-    a diagnosed `BadHandle` afterwards rather than an alias.
-    **AMENDED M4 UNIT 4 TO "VERBATIM, OR NARROWER"** (sawos design 18;
-    `designs/010` agenda 7b). `Give` takes a KEEP MASK, so the rights word
-    that lands in the receiver's table is the entry's INTERSECTED with
-    what the giver asked to keep — `MINT_OP`'s mask in `Give`'s clothes,
-    with the same fail-closed polarity and the same no-amplification
-    structure, and `ALL_RIGHTS` is the mask that spells the old
-    behaviour. The invariant is untouched and the sentence gets STRONGER:
-    no handle is ever wider on the far side of a transfer, and now it may
-    be narrower without the giver having to mint a sibling, narrow it,
-    give that away and release the original. `SystemOp.ProcessSelf` took
-    a keep mask in the same unit for the same reason at the DERIVE side,
-    which is what closes §9's recorded gap about the two rights a driver
-    spends on itself. THE MOVE IS STILL A MOVE: no default set is
-    consulted, nothing amplifies, and the giver's entry unbinds exactly
-    as before.
-    **AND RENDEZVOUS IS A THIRD DOOR ONTO THIS SAME MOVE, OPENED TWICE**
-    (design 18; ruling 5 as re-ruled Sep 2). A handle arriving in a
-    message is unbound from the sender and bound in the receiver by the
-    same mechanism, rights verbatim — but the two halves are separated in
-    time, so the kernel HOLDS the reference in between and the unbind
-    happens at the POST rather than at the receive. What differs from
-    `Give` is therefore WHEN (a give happens before the child starts, a
-    rendezvous at any time between two running processes), WHO consents
-    (both ends, since one had to send and the other had to take), and
-    that a rendezvous has a middle — during which the capability belongs
-    to the MESSAGE, which is what makes it survive its sender.
+  Three facts hold the invariant, each a line of kernel rather than a
+  discipline:
+  - **A mint carries the kind's default set, or a subset of the source.** A
+    getter mints the kind's default rights and nothing else; `MINT_OP` mints
+    the source's rights intersected with a caller-supplied keep mask. Neither
+    spelling can exceed what already exists.
+  - **The authority to mint is itself rights-gated** — `SystemRight.ClockGet`,
+    `SystemRight.ProcessSelf`, `SystemRight.ProcessCreate`,
+    `ProcessRight.ThreadSelf`, and the universal `Mint` for `MINT_OP`. A
+    process that cannot spend the bit cannot perform the mint.
+  - **A give moves rights verbatim, or narrower** — the same invariant read
+    from the transfer side. `ProcessOp.Give` copies the entry's kind, target
+    and rights word into the receiver's table, intersected with the giver's
+    keep mask, and consults no default set at all, so what the giver
+    attenuated stays attenuated and no handle is ever wider on the far side of
+    a transfer than it was on the near one. The mask lets a giver narrow at
+    the give without minting a sibling, narrowing it, giving that away and
+    releasing the original; it has `MINT_OP`'s fail-closed polarity and
+    no-amplification structure, and `ALL_RIGHTS` is the mask that gives
+    everything the entry holds. The giver's entry is unbound by the same act —
+    `unbind_handle`, generation bump included, the same function release and
+    the teardown call — so exactly one process holds the capability at every
+    instant and the giver's word is a diagnosed `BadHandle` afterwards rather
+    than an alias. `SystemOp.ProcessSelf` takes a keep mask for the same reason
+    at the derive side (§2.8).
+    **Rendezvous is a third door onto this same move.** A handle arriving in
+    a message is unbound from the sender and bound in the receiver by the same
+    mechanism, rights verbatim — but the two halves are separated in time, so
+    the kernel holds the reference in between and the unbind happens at the
+    post rather than at the receive (§2.1). What differs from `Give` is when
+    (a give happens before the child starts, a rendezvous at any time between
+    two running processes), who consents (both ends, since one had to send and
+    the other had to take), and that a rendezvous has a middle — during which
+    the capability belongs to the message, which is what makes it survive its
+    sender.
 
-  **THE CLOCK IS THE WORKED EXAMPLE, and it is why mint-per-call is not a
+  **The Clock is the worked example, and it is why mint-per-call is not a
   hole in attenuation.** A Clock is kernel-eternal and owned by nobody
-  (§2), so `SystemOp.ClockGet` is a getter onto a well-known object and
-  every ask mints another handle to it. Read carelessly that sounds like
-  a leak — if asking always works, what does attenuating a clock handle
-  buy? It buys everything, because THE ASK IS GATED TOO. A process whose
-  System handle carries `ClockGet` could always read the clock, and a
-  second handle adds nothing to what it already had. A process whose
-  System handle had `ClockGet` masked out at the mint CANNOT ASK AT ALL,
-  so a narrowed Clock handle it was GIVEN is the only clock it will ever
-  have and narrowing that handle means exactly what it says. Attenuating
-  a handle you give away is meaningful precisely when the receiver lacks
-  its own minting authority — which is the launcher's ordinary case,
-  since the keep mask that builds a child's System handle is where a
-  launcher decides. What the extra INSTANCES buy is therefore ownership
-  rather than authority: each is independently held and independently
-  released, which is what makes §4's `NoCopy` wrapper an owner rather
-  than a name, and it is exactly what the same-handle model could not
-  give (two values wrapping one word double-release).
-- **`Mint` IS THE SECOND UNIVERSAL BIT, and `MINT_OP` IS THE SECOND
-  UNIVERSAL OP** (M3 unit 3; the Aug-29 rulings). A handle carrying it
-  may mint a SIBLING onto the same object, in the caller's own table,
-  whose rights are the source's INTERSECTED with a KEEP MASK the caller
-  supplies. It is the ATTENUATE op §3 lacked. Four properties, and the
+  (§2.6), so `SystemOp.ClockGet` is a getter onto a well-known object and
+  every ask mints another handle to it. Read carelessly that sounds like a
+  leak — if asking always works, what does attenuating a clock handle buy? It
+  buys everything, because the ask is gated too. A process whose System
+  handle carries `ClockGet` could always read the clock, and a second handle
+  adds nothing to what it already had. A process whose System handle had
+  `ClockGet` masked out at the mint cannot ask at all, so a narrowed Clock
+  handle it was given is the only clock it will ever have, and narrowing that
+  handle means exactly what it says. Attenuating a handle you give away is
+  meaningful precisely when the receiver lacks its own minting authority —
+  which is the launcher's ordinary case, since the keep mask that builds a
+  child's System handle is where a launcher decides. What the extra instances
+  buy is therefore ownership rather than authority: each is independently held
+  and independently released, which is what makes §4's `NoCopy` wrapper an
+  owner rather than a name, and it is what a same-handle model could not give
+  (two values wrapping one word double-release).
+- **`Mint` is the second universal bit, and `MINT_OP` is the second universal
+  op.** A handle carrying it may mint a sibling onto the same object, in the
+  caller's own table, whose rights are the source's intersected with a keep
+  mask the caller supplies. It is the attenuate op. Four properties, and the
   first two are why it is safe to hand out:
-  - **NO-AMPLIFICATION IS STRUCTURAL.** The result is a subset of the
-    source by construction, not by a check that could be forgotten, so
-    a garbage mask cannot widen anything.
-  - **`Mint` IS ITSELF MASKABLE.** A sibling minted through a mask that
-    omits it cannot mint again, so proliferation stops where the mask
-    says it does.
-  - **THE MASK IS A KEEP SET, WHICH FAILS CLOSED.** A mask written
-    before a kind gains a right is a whitelist that has never heard of
-    it and therefore denies it. The removal polarity fails open, and the
-    case that decided it is a launcher masking System handles for
-    children — where an old mask would have handed every future System
-    capability to every child ever configured.
-  - **IT IS TOTAL, and needs no introspection.** There is no
-    rights-introspection op; naming a right the source lacks is a no-op,
-    so nothing can be over-asked and nothing has to be read first.
-  It also CLOSES design 3's finding 2 ("no op mints a second handle onto
-  an object a process already owns"), which was the blocking limitation
-  of the launch flow: a launcher now mints what it hands over and keeps
-  its own, so supervision and self-management stop being alternatives.
-- **Attenuation is monotonic**: any derivation may only strip rights,
-  never add. The only rights source is still the boot handle set given to
-  the root server, so every rights word in the machine is a subset of one
-  of those, reached by some path of mints and gives. `MINT_OP` made it two
-  things it was not before. It is STRUCTURAL rather than a rule to obey —
-  a sibling's rights are an intersection, so no sequence of mints recovers
-  a masked bit — and it is PERFORMABLE, so a launcher narrows a capability
-  itself instead of depending on what the kernel happened to mint.
-  **AND MONOTONICITY IS WHAT MAKES A RIGHT A POLICY KNOB. The worked
-  example is M3 unit 6's executable gate** (sawos design 9 D-1, §2.5).
-  `MemoryRight.MapExecute` gates `MapAccess.Execute` on a `map`, so "only
-  root maps executable" is a fact about capability FLOW rather than about
-  identity: `memory_rights()` MINTS the bit at boot — of necessity,
-  because a bit not minted at boot could never appear later — and root
-  simply never grants it, narrowing a child's region handle with a keep
-  mask before the region travels. The kernel asks no question about who
-  is calling. The policy lives entirely in a mask a launcher writes,
-  which is what a right named for its op buys and what a generic `Manage`
+  - **No-amplification is structural.** The result is a subset of the source
+    by construction, not by a check that could be forgotten, so a garbage mask
+    cannot widen anything.
+  - **`Mint` is itself maskable.** A sibling minted through a mask that omits
+    it cannot mint again, so proliferation stops where the mask says it does.
+  - **The mask is a keep set, which fails closed.** A mask written before a
+    kind gains a right is a whitelist that has never heard of it and therefore
+    denies it. A removal mask would fail open: a launcher masking System
+    handles for children would hand every future System capability to every
+    child ever configured.
+  - **It is total, and needs no introspection.** There is no
+    rights-introspection op; naming a right the source lacks is a no-op, so
+    nothing can be over-asked and nothing has to be read first.
+
+  It is what lets a launcher mint what it hands over and keep its own, so
+  supervision and self-management are not alternatives (§12).
+- **Attenuation is monotonic**: any derivation may only strip rights, never add.
+  The only rights source is the boot handle set given to the root server, so
+  every rights word in the machine is a subset of one of those, reached by some
+  path of mints and gives (a statement about the syscall path; a flat-tier
+  process can write kernel memory, §5b.1). It is structural rather than a rule
+  to obey — a sibling's rights are an intersection, so no sequence of mints
+  recovers a masked bit — and it is performable, so a launcher narrows a
+  capability itself instead of depending on what the kernel happened to mint.
+  **Monotonicity is what makes a right a policy knob.** `MemoryRight.MapExecute`
+  gates `MapAccess.Execute` on a `map` (§2.5), so "only root maps executable" is
+  a fact about capability flow rather than about identity: `memory_rights()`
+  mints the bit at boot — of necessity, because a bit not minted at boot could
+  never appear later — and root simply never grants it, narrowing a child's
+  region handle with a keep mask before the region travels. The kernel asks no
+  question about who is calling. The policy lives entirely in a mask a launcher
+  writes, which is what a right named for its op buys and what a generic bit
   could not have expressed at all.
-- Handle close is explicit in ABI, automatic in Saw (Deinit).
-  **RELEASE IS BUILT; CLOSE IS NOT** (sawos design 3 D-2, M3 unit 2.75),
-  and the two are different acts that were once one word. RELEASE
-  destroys the CALLER'S HANDLE: one universal op number
-  (`sosabi.RELEASE_OP`, documented forever outside every per-object
-  table, which is dense from 0), intercepted by dispatch between the
-  table lookup and the kind match; UNGATED, since destroying your own
-  capability instance harms nobody and identity lives in the object's
-  slot; it unbinds the entry, bumps the generation and never touches the
-  object's STATE. **IT DOES, SINCE M3 UNIT 5, TOUCH THE OBJECT'S
-  REFERENCE COUNT — AND ZERO FREES** (sawos design 7 D-1, amending unit
-  2.75's "an object whose last handle is gone is unreachable-but-live
-  until its process's teardown"; that era ends here). Every countable
-  slab slot carries a count of the handle entries naming it, plus, for a
-  waitable, its attachment; a release decrements, and a count reaching
-  zero frees SYNCHRONOUSLY, inside the very syscall that dropped the
-  last reference — the kernel runs to completion, so there is no
-  deferred reclamation and no cleanup queue. The kind's own last rites
-  run there: an Interrupt MASKS ITS LINE and becomes re-bindable, a
-  Timer gives the comparator back, a Waiter DETACHES ITS LIST (which may
-  take a waitable to zero in turn — the one cascade), a Memory returns
-  its SLOT and no bytes (§2.5's narrowing), and a `Gone` process's slot
-  is reclaimed, which is design 3 D-3's scan turned into the count it
-  was approximating. **THE ONE EXCEPTION IS A MAPPING**, whose row is not
-  a reference back: it frees its slot and LEAVES the row installed, which
-  is §2.5's own permanent-but-safe stance made mechanical. Releasing a
-  word that does not resolve — `NO_HANDLE`, a malformed word, a stale
-  one, a second release — is the ordinary
-  `BadHandle` fault. In Saw it is automatic: every `sos` wrapper is
-  `NoCopy` with a `deinit` that releases, so DROP IS RELEASE and there is
-  no typed `release()` method to write. CLOSE — ending the OBJECT for
-  everyone — is still unbuilt: it is object-protocol, exists only on kinds
-  with an end-state, and arrives with Pipe in M4 under a per-kind right.
-  A process's remaining handles are still released by the ratified
-  teardown.
-- Syscall ABI sketch (riscv32 `ecall`, args in registers): every call
-  is `(handle, op, args...) -> Result`. The kernel's dispatch is a
-  table lookup + rights check + object-op — the fast path must stay
-  tens of instructions.
-- **Typed handles in the Saw API (ratified Aug 7, user).** Each object
-  kind gets a DISTINCT handle type in the `sos` module —
-  `type SystemHandle = UInt`, `type PipeHandle = UInt`, … — and the
-  Saw-facing wrapper holds the typed handle (`System` stores a
-  `handle: SystemHandle`; its `shutdown` method passes it to the raw
-  exported `sos_system_shutdown`). Saw's distinct-alias rule gives exactly the
-  wanted asymmetry for free: the typed handle FLOWS TO `UInt`
-  implicitly (one zero-cost lowering at the `sos_syscallN` stub), but
-  a raw word or a different kind's handle cannot flow IN — crossing
-  into a handle type is an explicit construction, done at creation
-  and, kernel-side, in dispatch AFTER table/generation/rights
-  validation (the type then means "validated as this kind", not just
-  "a number"). The typing stops at the ABI boundary: `@export`ed vDSO
-  symbols and the syscall stubs keep raw `UInt` words (C callers see
-  words; the export whitelist is primitives), and the kernel handle
-  TABLE indexes by word. This is TIER ONE (kind safety) of two, and
-  **TIER TWO IS BUILT** (sawos design 3 D-5, M3 unit 2.75; the Aug-29
-  drop-is-release ruling). Every wrapper is a `NoCopy` struct over the
-  aliases with a hand-written `deinit` that releases the word — the
-  TcpStream pattern, and §3's no-DUPLICATE rule is its exact `NoCopy`
-  correspondence — so the alias became the payload and nothing written
-  against it changed, exactly as the additive claim promised. M2 brought
-  neither half; 2.75 brought both TOGETHER, because a release op beside
-  copyable wrappers is a stale-fault factory (copy, drop, and the
-  sibling's next use is a manufactured `BadHandle`). Three consequences:
-  - The word field doubles as the DISARM SENTINEL, since `NO_HANDLE` is
+- **Release and close are different acts.** Handle close is explicit in ABI,
+  automatic in Saw (`deinit`).
+  - **Release** destroys the caller's handle: one universal op number
+    (`sosabi.RELEASE_OP`, documented forever outside every per-object table,
+    which is dense from 0), intercepted by dispatch between the table lookup
+    and the kind match. It is ungated, since destroying your own capability
+    instance harms nobody and identity lives in the object's slot. It unbinds
+    the entry, bumps the generation and never touches the object's state.
+  - **It does touch the object's reference count, and zero frees.** Every
+    countable slab slot carries a count of the handle entries naming it, plus,
+    for a waitable, its attachment (§2); a release decrements, and a count
+    reaching zero frees synchronously, inside the very syscall that dropped the
+    last reference — the kernel runs to completion, so there is no deferred
+    reclamation and no cleanup queue. The kind's own last rites run there: an
+    Interrupt masks its line and becomes re-bindable, a Timer gives the
+    comparator back, a Waiter detaches its list (which may take a waitable to
+    zero in turn — a cascade) and wakes its parked threads, a Memory
+    returns its slot (and its range once no grant row names it, §2.5), and a
+    `Gone` process's slot is reclaimed. **The one exception is a Mapping**,
+    whose row is not a reference back: it frees its slot and leaves the row
+    installed (§2.5).
+  - Releasing a word that does not resolve — `NO_HANDLE`, a malformed word, a
+    stale one, a second release — is the ordinary `BadHandle` fault.
+  - In Saw it is automatic: every `sos` wrapper is `NoCopy` with a `deinit`
+    that releases, so drop is release and there is no typed `release()`
+    method to write.
+  - **Close** — ending the object for everyone — is not built, and the kinds
+    that exist do not need it. A connection end is closed by releasing the last
+    handle onto it, which is the reference column reaching zero — a fact the
+    ledger already maintains at every bind and unbind. A `close` op beside it
+    would be a second way to reach the same state, reachable while a sibling
+    handle is still live, and would have to answer what a minted sibling then
+    names. So drop-is-release is the close for these kinds, `let _ = move inlet`
+    is how a program says it, and a per-kind close right has nothing to gate.
+    Whether a later kind genuinely needs one is open on its own terms; such a
+    close would be object protocol, existing only on kinds with an end state.
+    Per-kind release rights (which would be a new universal bit) are not built.
+  - A process's remaining handles are released by the teardown (§8).
+- Syscall ABI sketch (args in registers; §5.7 has the convention): every call
+  is `(handle, op, args...) -> Result`. The kernel's dispatch is a table
+  lookup + rights check + object-op — the fast path must stay tens of
+  instructions.
+- **Typed handles in the Saw API.** Each object kind gets a distinct handle
+  type, declared in `sosabi` (`types.saw`) — `type SystemHandle = UInt`,
+  `type PipeInletHandle = UInt`, … — and the Saw-facing `sos` wrapper holds the
+  typed handle (`System` stores a `handle: SystemHandle`; its `shutdown` method
+  passes it to the raw exported `sos_system_shutdown`). Saw's distinct-alias
+  rule gives exactly the wanted asymmetry for free: the typed handle flows to
+  `UInt` implicitly (one zero-cost lowering at the `sos_syscallN` stub), but a
+  raw word or a different kind's handle cannot flow in — crossing into a handle
+  type is an explicit construction, done at creation and, kernel-side, in
+  dispatch after table/generation/rights validation (the type then means
+  "validated as this kind", not just "a number"). The typing stops at the ABI
+  boundary: `@export`ed vDSO symbols and the syscall stubs keep raw `UInt` words
+  (C callers see words; the export whitelist is primitives), and the kernel
+  handle table indexes by word. This is tier one (kind safety) of two. **Tier
+  two is ownership**: every wrapper is a `NoCopy` struct over the aliases with a
+  hand-written `deinit` that releases the word — the TcpStream pattern, the
+  exact `NoCopy` correspondence of a unique handle entry. Release, generations,
+  mint-per-call and owning wrappers exist together because three pairings are
+  broken: release beside copyable (non-owning) wrappers is a stale-fault factory
+  (copy, drop, and the sibling's next use is a manufactured `BadHandle`),
+  mint-per-call without release is a leak by design, and release without
+  generations is aliasing. Consequences:
+  - The word field doubles as the disarm sentinel, since `NO_HANDLE` is
     unrepresentable as a live handle at any generation.
   - There is deliberately no typed `release()` method. Early release is
-    dropping the value (`let _ = move w`), which is one concept rather
-    than two spellings of it.
-  - **THE TRANSFER-FUNNEL CONTRACT**, recorded for unit 3's `give` and
-    M4's pipes: when an op MOVES the word out of the caller's table, the
-    sysapi funnel consumes the wrapper, reads the word, sets the field to
-    `NO_HANDLE` BEFORE the syscall, and lets the disarmed value drop.
-    Disarm-before-syscall because every failure of such a syscall is a
-    fault (the process ends, teardown covers everything), so no path
-    leaves a disarmed-but-unsent word. User code never touches the
-    sentinel; generations backstop the discipline, so a funnel bug that
-    released after a transfer is a diagnosed `BadHandle`, not corruption.
-    **IT HAS ITS FIRST CONSUMERS** (sawos design 4, M3 unit 3):
-    `Process.give(memory:tag:)` and `give(system:tag:)` take their wrapper
-    BY VALUE and disarm it before the syscall, so a given capability is
+    dropping the value (`let _ = move w`), which is one concept rather than
+    two spellings of it.
+  - **The transfer-funnel contract.** When an op moves the word out of the
+    caller's table, the sysapi funnel consumes the wrapper, reads the word, sets
+    the field to `NO_HANDLE` before the syscall, and lets the disarmed value
+    drop. User code never touches the sentinel; generations backstop the
+    discipline, so a funnel bug that released after a transfer is a diagnosed
+    `BadHandle`, not corruption. `Process.give(memory:tag:)`,
+    `give(system:tag:)` and the other `Process.give` overloads take their
+    wrapper by value and disarm it before the syscall, so a given capability is
     unreachable from the giver by construction rather than by discipline.
-    `Process.start(donating:)` is the one place the wrapper is DISARMED
-    rather than consumed — the handle being moved is the one the op is
-    invoked through — so it leaves a husk whose drop does nothing and whose
-    use is the ordinary `BadHandle`.
-  - **THE FUNNEL HAS A SECOND SPELLING NOW, FOR RECEIVERS** (SL-16, closed
-    against sawlang design 260 at sawc 0.4.0; the sentence that used to
-    stand here said Saw has no consuming `self` receiver, and it no longer
-    does). Where the op consumes the handle it is INVOKED THROUGH, the
-    sysapi method carries `consumes` in its effect slot beside `&var self`
-    and the caller spells `(move w).op(...)`. The word is then read and
-    passed, and NOTHING IS DISARMED: a consuming body substitutes for the
-    wrapper's `deinit` body on that path, the handle field's synthesized
-    drop is a no-op, and no release fires. What this buys over the
-    sentinel is the diagnosis moving from run time to compile time — a
-    second use is `use of moved variable`, not a `BadHandle` the kernel
-    has to draw. `PipeRequest.reply` and `PipeRequest.reply_wait` are its
-    first consumers, and `PipeReply.resolve` JOINED THEM AT M4 UNIT 4.5
-    (`designs/010` ruling 12(b); sawos design 22). It could not before,
-    because it consumed on two paths out of three and an effect that
-    consumed on every path would have spent a live claim at the first
-    empty poll; the ruling removed the empty poll instead of working
-    around it — a pending resolve PARKS — so all three one-shot ops now
-    carry the effect. ONE SHAPE KEEPS THE SENTINEL: a funnel taking its
-    wrapper as a by-value PARAMETER (`Process.give`, the four
-    `Waiter.give` overloads), because `consumes` is a receiver-position
-    effect.
+  - **Which failures fault and which answer a status.** A failed transfer is one
+    of two kinds, and neither loses the kernel object. `ProcessOp.Give` faults
+    the caller for a handle that names nothing (`BadHandle`), a caller handle
+    without `ProcessRight.Give` or a given handle without `Transfer`
+    (`AccessDenied`), a kind no boot record can carry (`BadArg`), a child
+    already started (`BadState`) and a duplicate tag (`DuplicateKey`), and it
+    checks every fault before touching either table. It answers a status —
+    `NoResource` when the child's table or boot set is full, `QuotaExceeded`
+    when the child is at its handle budget — and then the give has not happened:
+    the child-side binding is made first, so a refusal leaves the caller's entry
+    exactly as it was. `WaiterOp.Add` with the consuming flag (`Waiter.give`)
+    faults for a Waiter handle without `WaiterRight.Attach` (`AccessDenied`), a
+    flags word outside the published set (`BadArg`), a target that names nothing
+    (`BadHandle`), is not waitable (`NotWaitable`) or lacks its `Wait` right
+    (`AccessDenied`), a target already attached to a Waiter (`BadState`) and a
+    duplicate key (`DuplicateKey`), and answers `NoResource` when the attachment
+    slab is full, having consumed nothing.
+  - **What the typed tier does on a status.** A status refusal (`NoResource`,
+    `QuotaExceeded`) is a resource condition, and the caller keeps what it had:
+    the funnel disarms first, so no path can leave two owners of one word, and
+    the refusal arm builds a fresh wrapper around the word the kernel provably
+    did not consume and hands it back in the error payload. So no path leaves a
+    disarmed-but-unsent word. The same rule covers the handles a pipe message
+    carries: a post, send or reply refused with nothing taken hands them back
+    (`post` keeps its carrier on a refusal). `Waiter.give` follows this rule.
+    Not yet enforced for `Process.give`: it does not re-mint on a status
+    refusal, and the capability stays in the giver's table with no wrapper
+    naming it. Not yet enforced for `send_with`, `reply_with` and
+    `reply_wait_with`: they empty the handle carrier before reading the status,
+    so on a refusal that took nothing the handles stay in the caller's table
+    with no wrapper naming them.
+  - **The funnel has a second spelling, for receivers.** Where the op consumes
+    the handle it is invoked through, the sysapi method carries `consumes` in
+    its effect slot beside `&var self`, and the caller spells
+    `(move w).op(...)`. The word is then read and passed, and nothing is
+    disarmed: a consuming body substitutes for the wrapper's `deinit` body on
+    that path, the handle field's synthesized drop is a no-op, and no release
+    fires. What this buys over the sentinel is the diagnosis moving from run
+    time to compile time — a second use is `use of moved variable`, not a
+    `BadHandle` the kernel has to draw. `PipeRequest.reply`, `reply_with`,
+    `reply_wait`, `reply_wait_with` and `PipeReply.resolve` carry it. One shape
+    keeps the sentinel: a funnel taking its wrapper as a by-value parameter
+    (`Process.give`, the `Waiter.give` overloads), because `consumes` is a
+    receiver-position effect.
 
 ## 4. The Saw synergy (why this language, this kernel)
 
 - **Handle lifecycle = ownership.** Userspace handles are
   `NoCopy + Deinit` wrappers: scope exit closes (capability leaks are
   a compile error class); `move` is transfer;
-  `pipe.send(move h)` enforces at COMPILE TIME that the sender no
-  longer holds what it sent. Kernel-side transferability (TRANSFER
+  `pipe.send(move h)` enforces at compile time that the sender no
+  longer holds what it sent. Kernel-side transferability (`Transfer`
   right) is checked at runtime; the language makes the userspace
   discipline free. Distinct types (`type TimerHandle = ...`) make
   handle-kind confusion unrepresentable in the syscall wrappers.
 - **`sync` effect = ISR discipline.** Interrupt entry paths and
   kernel critical sections are `sync` contexts — suspension-free,
   compiler-verified.
-- **Slabs + statics (designs 41/42)**: kernel objects live in
-  fixed-size per-type slabs over static regions — allocation-free
-  after boot, exhaustion is an explicit Err, the D4 model verbatim.
-- **UnsafeMemory (design 46)**: userspace drivers get MMIO
-  MemoryObjects mapped into their space and wrap them in
-  `UnsafeMemory<Regs, Device>` register blocks — typed, volatile,
-  access-mode-checked driver code with no kernel driver surface.
-- **Cooperative tasks in userspace**: the kernel schedules THREADS
-  only; Saw TaskGroups/channels give each process its own async
-  runtime; kernel Events integrate as wake sources (the __wake
-  protocol's externally-signaled variant — future design).
+- **Slabs + statics**: kernel objects live in fixed-size per-type slabs over
+  static regions — allocation-free after boot, exhaustion is an explicit
+  Err.
+- **UnsafeMemory**: userspace drivers get MMIO MemoryObjects mapped into
+  their space and wrap them in `UnsafeMemory<Regs, Device>` register blocks —
+  typed, volatile, access-mode-checked driver code with no kernel driver
+  surface.
+- **Cooperative tasks in userspace**: the kernel schedules threads only; Saw
+  TaskGroups/channels give each process its own async runtime; kernel Events
+  integrate as wake sources (the `__wake` protocol's externally-signaled
+  variant — future design).
 - **No-forced-destroy carries over**: thread/process teardown is
   cooperative-first (signal + join); the kill-tree question is §5.3.
 
-## 5. Open questions (need decisions before the kernel brief)
+## 5. Design decisions
 
-1. ~~Pipe semantics~~ RESOLVED §2.1 + **base-send DECIDED (user,
-   Jul 31): STRICT RENDEZVOUS.** Every send blocks until a receiver
-   takes the message — the kernel holds NO message buffers (bounded
-   only by waiting senders; zero-copy handoff at the rendezvous).
-   Async notification is the Event object's job (§2.4). Request/reply:
-   `call` = rendezvous handoff + block on the PipeReplyHandle (AMENDED
-   Aug 20: no separate `call` verb — the send-and-wait form is the
-   suspending overload of `send`; §2.1). Message
-   limits (max body + max handles) still apply per message; concrete
-   numbers are a kernel-brief constant (orchestrator pin, veto-able:
-   64-byte body, 4 handles).
-2. ~~DUPLICATE right~~ RESOLVED §3: no duplication; unique handles;
-   creator re-mints when a second is needed. (Mirrors NoCopy exactly.)
-3. ~~Process/Job hierarchy~~ RESOLVED §2 table: flat Process, kernel
-   teardown-on-exit/fault only, supervision in userspace.
-4. ~~The async wait primitive~~ RESOLVED §2.2: the `Waiter`
-   aggregator with word-sized keys.
-5. **P4 memory-hardware realities (verified against Espressif docs,
-   Jul 29):** The P4 HAS an MMU with basic virtual memory — but it
-   translates EXTERNAL memory only (SPI flash + PSRAM), as a single
-   GLOBAL mapping (one system-wide virtual pool, per-page R/W/X, no
-   ASIDs); internal SRAM is physically addressed and bypasses it. The
-   cores implement Machine + User modes only — no S-mode, hence no
-   Sv32 per-process paging. Isolation = up to 16 PMP/PMA regions
-   (first-level check) + the APM/TEE module (bus-level permission
-   contexts; User-mode accesses tagged into one of 3 REE contexts).
-   Kernel consequences: AddressSpace on P4 = PMP region set + APM/REE
-   context; the global MMU mapping is a KERNEL-managed resource
-   (executable code / large data mapped from flash/PSRAM with W^X —
-   shared mapping, not per-process; per-context remapping would cost
-   cache flushes). Physical memory, no overcommit/COW, small-N
-   processes (PMP/REE context counts bound simultaneous domains).
-   Document as a profile, not a limitation of the model.
+The questions the kernel had to answer before it could be built, each with
+its decision.
 
-   **RE-SCOPED BY M5 (sawos designs 27, 29 and 33), and this is the item
-   the rest of the document cites when it says "§5.5".** Everything above
-   is still true OF THE P4 and of every part like it, and what changed is
-   its REACH: "an address is the same number in every process" was written
-   here as a fact about SOS and it is now a fact about a TIER. Three
-   sentences, in the order a reader needs them:
-   - **On tier 1 an address is the KERNEL'S ANSWER.** arm64-virt runs each
-     process under its own translation-table set with the kernel relocated
-     into the upper half (designs 27 and 29), so every user image links at
-     ONE canonical base (`hal.USER_IMAGE_BASE`), loads at whatever physical
-     frames the allocator supplied, and `map` CHOOSES the virtual address it
-     answers with. Two processes sharing one region see it at two different
-     addresses, and `tests/map-placed` asserts exactly that. There is no VA
-     hint on any tier — the address is the answer, never a request (design
-     25 ruling 1).
-   - **On tiers 2 and 3 an address is still the same number in every
-     process**, because those platforms do not translate: a grant row's
-     input range IS its output range, and two resident images therefore
-     cannot share a link base. riscv32-virt keeps its three per-child
-     linker scripts for precisely that reason, deliberately (design 25
-     ruling 11), so the two HAL directories side by side ARE the tier
-     split.
-   - **The kernel above the seam never learned which of those it is on.**
-     `GrantRow` carries a user VA range and the physical base it
-     translates to; on a non-translating profile the two are asserted
-     equal, so the identity tier is the general mechanism with one degree
-     of freedom unspent rather than a second mechanism. Addresses-as-DATA
-     stay PHYSICAL everywhere they are stored — Memory capabilities, the
-     build-emitted region table, `sosimg` records — and only the moment of
-     kernel dereference converts, through `hal.phys_to_virt`.
-7. ~~Waiter attach semantics~~ RESOLVED §2.2: level-triggered,
-   persistent BY DEFAULT + remove (M4 unit 3 added the opt-in
-   `AttachMode.OneShot`), one-Waiter-per-handle,
-   many-waiters-per-Waiter.
-8. ~~send_oneway~~ RESOLVED §2.4: replaced by the accumulating Event.
-9. ~~Memory RAM/Device distinction~~ RESOLVED §2.5 (typed pools).
-   ~~The remaining sub-detail: exactly where the per-physical-region
-   refcount lives (a pool-side region descriptor) and reconciling it
-   with Device regions that are never freed.~~ **CLOSED BY M5 UNIT 5
-   (sawos design 28; design 25 D-5, ruled), AND BUILT RATHER THAN
-   RE-WORDED A THIRD TIME.** This is the sub-detail that had been open
-   since M1, restated at M3's close and at M4's; the answer, in the four
-   places it landed:
-   - **THE COUNT LIVES ON THE REGION'S OWN SLAB SLOT, and there are two
-     of them** — `MemorySlot.refs` (handle entries naming the region,
-     M3 unit 5) and `MemorySlot.maps` (INSTALLED GRANT ROWS naming it).
-     The range returns to its pool at the SECOND zero, which is §2.5's
-     quoted invariant — "freed only when the LAST reference of either
-     kind" — finally executing as written. It counts ROWS rather than
-     `Mapping` OBJECTS deliberately: design 7 D-2's husk arm frees a
-     Mapping's slot and leaves its row installed, so an object count
-     would stop counting exactly when bytes were still being granted.
-   - **THERE IS NO POOL-SIDE REGION DESCRIPTOR, and that is the answer
-     rather than a shortcut.** A pool is not a fourth object kind: every
-     region carries a `root` back-reference (a boot-minted region names
-     itself; a split carries its parent's answer down), and the pool's
-     ledger — free-list head, bytes outstanding, bytes dropped — lives
-     on the ROOT's own `MemorySlot`. RETURN IS TO THE ROOT, never to the
-     intermediate cursor a piece was cut from, because the derivation
-     chain is an artifact of front-cutting and not an ownership tree.
-     Free ranges COALESCE with their neighbours and `split` serves from
-     the free list before advancing the cursor (first fit).
-   - **BYTE ACCOUNTING IS THAT LEDGER**: `MemorySlot.out_bytes`
-     (outstanding) beside `pool_free_bytes(root)` (available). It is the
-     POOL's business and not a per-process authority — **quotas stay
-     OBJECT-counted in v1** — and no op fronts it, so nothing in the ABI
-     moved for it.
-   - **`IoMemory` IS UNTOUCHED, which is this item's own carve-out
-     discharged where the mechanism lives.** `carve` leaves the parent
-     whole, MMIO is pinned and never freed, and a device region's counts
-     are therefore effectively pinned exactly as this item predicted.
+### 5.1 Pipe semantics
 
-   Design 11's F2 nod goes with it: the pin had "a caller, a
-   neighbouring mechanism, and still no home", and it has a home now.
-   §11's ledger entry below is struck to match.
-6. ~~Boot protocol~~ **DECIDED (user, Jul 31): KERNEL LOADS the root
-   server** from a separate flash partition — real separation from
-   day one; independent updates. To keep the loader microkernel-sized
-   the image format is NOT ELF but a minimal flat **sosimg** header
-   (orchestrator pin, veto-able: magic, version, entry offset,
-   segment table of {flash_off, load_addr, len, flags}) that Blade
-   emits as a build target. Kernel: parse header → map/copy segments
-   (PMP/APM per §5.5) → mint root handles (boot pipe, root
-   MemoryObjects for RAM + device ranges, root IRQ table) → enter
-   U-mode at the entry. Everything else derives from those handles.
-7. ~~Syscall ABI~~ **DECIDED (user, Jul 31; object-uniform Aug 5): (status,
-   value) PAIR, every call an OBJECT OP.** Conceptually every syscall is
-   `object.method(args)` — there are NO bare numbered syscalls `[user,
-   Aug 5]`. **The register convention, per profile (arm64 column ratified
-   Aug 7, design 162 decision 1):**
+Decided by §2.1. Asynchronous payload-free notification is the Event's job
+(§2.4). The send-and-wait form is `send` (`send_with` with handles), one kernel
+call (`PipeInletOp.Call`); the split-phase form is `post`; there is no
+`timeout:` overload (§2.1). Message limits — a maximum body and a maximum handle
+count — apply per message (§2.1).
 
-   | Role | Profile A (riscv32) | Profile B (arm64) |
-   |---|---|---|
-   | handle in / status out | `a0` | `x0` |
-   | op (a method id on that object's table) | `a7` | `x8` |
-   | arguments | `a1`-`a5` | `x1`-`x5` |
-   | value/handle out | `a1` | `x1` |
-   | trap | `ecall` | `svc #0` |
+### 5.2 Duplicate handles
 
-   The two are the same shape one-to-one, deliberately: the op sits in a
-   register OUTSIDE the argument run on both, so arguments are a clean
-   sequence and neither profile has to shuffle. `x8` is where AArch64 Linux
-   puts a syscall number, so every disassembler and every reader who has seen
-   one arm64 syscall reads this one correctly. ONE difference is not
-   cosmetic and belongs to the HAL rather than the kernel: `ecall` leaves the
-   saved PC pointing AT the instruction and `svc` leaves it pointing PAST,
-   so advancing on return is a per-profile decision (a kernel that advanced
-   on Profile B would skip the instruction after every syscall). Returns:
-   status word
-   (0 = ok, else a small **`SosStatus`** enum tag — RENAMED from
-   `SysError`, ratified Aug 7 [user]: an enum with an `Ok` case is a
-   STATUS, not an error (`SosStatus.Ok`, `SosStatus.NoResource`, …), and
-   the `Sos` prefix names whose status it is. The hosted runtime's
-   `SysError` in rt/ABI.md is a SEPARATE frozen contract (errno tags,
-   machine-parsed since design 149) and keeps its name; the spec notes
-   the correspondence, nothing more. An `Err(SosStatus.Ok)` never
-   arises by construction: the wrapper boundary splits on the status —
-   `Ok` → `Result.Ok(value)`, anything else → `Err(status)`).
-   **THE STATUS SPACE NARROWED AT M2** (the fault-don't-status ruling,
-   design 178 pin 6, ratified Aug 8): a caller error the process could
-   have checked — an invalid handle, a malformed op, a rights violation —
-   TERMINATES the offending process, so `BadHandle`, `BadOp` and
-   `AccessDenied` are `FaultReason` tags rather than statuses, keeping
-   their numbers. What is left in `SosStatus` is what a caller could not
-   have known — `NoResource`, a full slab — with `Unknown` still the
-   userspace mapping artifact. M3 adds `QuotaExceeded` beside it (design
-   232 unit 5) on the same line design 178's fourth round drew: a
-   dynamic resource condition answers with a status, broken code faults.
-   Kernel
-   dispatch is §3's shape verbatim: handle-table lookup → object type →
-   op table → rights check → op. Even the M1 primitives conform: a
-   **System object** (kernel singleton; see §2 table) is minted to root
-   at boot, and `debug_print` / `shutdown(status)` are its first ops,
-   rights-gated (`SystemRight.Debug`/`.Shutdown`, §3) — a process without the System
-   handle cannot even print. `exit` is deliberately absent: process exit
-   is a Process-object op when Process objects land (ratified Aug 5); in
-   M1's one-process world, root's `system.shutdown(status)` ends the run
-   (QEMU: the sifive_test write). Maps 1:1 onto the
-   `sos` module's typed wrappers (`system.debug_print(...)`,
-   `-> Result<T, SosStatus>` — auto-wrap does the rest).
-   **API ownership (ratified Aug 5, revising the Jul-31 line):** the `sos`
-   module is U-MODE LIBRARY CODE (never kernel-mode — that half of the
-   Jul-31 decision stands) but it is OWNED AND EXPORTED BY THE KERNEL
-   PACKAGE — the Zircon-vDSO discipline: syscall/method NUMBERS ARE NOT
-   ABI. They live in one kernel-internal constants file shared by the
-   dispatch tables and the wrappers, so the two can never skew and the
-   kernel may renumber freely; userspace links the exported module and
-   never sees a raw number. Delivery is static linking in v1 (the
-   manifest/module-path mechanism); a true mapped-vDSO is an
-   object-model-era upgrade that changes nothing about the shape. The
-   kernel package ALSO exports a C-ABI surface for non-Saw languages
-   (`@export`, whitelist-clean — handles/statuses/ops are integers):
-   per-op functions (`sos_system_shutdown(handle, status)`) as the
-   supported C interface, over fixed-arity raw forms
-   (`sos_syscall1(h, op, a)` — no varargs across the trap boundary),
-   over the per-arch HAL `ecall`/`svc` stub. One implementation chain,
-   three entry altitudes: typed Saw, typed C, raw.
+Decided by §3: there is no duplicate right, and the invariant is no
+amplification. A second handle onto an object a process holds comes from a
+getter (which mints the kind's default set) or from `MINT_OP` (a subset of
+the source); a handle is a unique entry, which mirrors `NoCopy` exactly.
 
-   **QUALIFIED BY M5's C-LEG PROBE (sawos design 39, Sep 4): THE
-   DISCIPLINE HOLDS FOR SAW AND DOES NOT YET HOLD FOR C, and the reason
-   is structural rather than an omission.** The typed-C altitude above is
-   REAL — the per-op `@export`s exist, they are linked, and their bodies
-   run on every boot — but they are COMPILED FROM THE `sos` SAW MODULE,
-   which depends on `sosrt`; so reaching them makes an image a Saw image
-   with a C `main` in it, at the price of the runtime and an arena. The
-   probe is the first genuinely non-Saw process this tree has had, and it
-   could not use the row that was written for it: `tests/c-child/sos.h`
-   writes three op NUMBERS out of `kernel/abi/`, a module whose own header
-   calls itself KERNEL-INTERNAL, on `tests/riscv32/payload_sosimg.S`'s
-   precedent. **So for a C image an op number IS ABI today**, and a
-   renumbering that costs a Saw caller a rebuild would cost that image
-   correctness. Nothing about the discipline is withdrawn: the claim is
-   scoped to the altitude that can honour it, and what is missing is
-   named — an `sos.h` this tree owns and keeps in step with
-   `kernel/abi/src/ops.saw`, and a way to link the exported floor without
-   the Saw runtime behind it (a `sos` build profile carrying the floor
-   alone, or generated numbers). That is design 31 part 1, and until it
-   lands this paragraph is the honest version. The C-ABI surface itself
-   is unchanged and correct; it is the LINKABILITY, not the exports, that
-   the probe found missing.
+### 5.3 Process/Job hierarchy
 
-   **AMENDED FOR M3** (M3 unit 7's docs sweep, discharging the spec edit
-   design 178's fourth round owed and deferred to this milestone). TEN
-   object kinds joined the surface across M2 and M3 — one at M1b, eleven
-   now — and the shape above did not move for any of them; three things
-   the ladder settled about it are worth stating here, where the ABI is:
-   - **RIGHTS-GATED OPS ARE THE WHOLE OF THE SURFACE, and every gate is
-     named for its op.** There is no bare numbered syscall, no ambient
-     facility, and — since the Aug-29 doctrine (§3) — no generic
-     authority anywhere in the ABI: an op is reached through a handle of
-     the right kind and spends a bit named for that op. §12's "become
-     real objects in M3" line is what this amends. The pool roots DID
-     become objects (`Memory`/`IoMemory`, M3 unit 4, delivered through
-     the boot set), and the root IRQ TABLE DID NOT — binding a line is
-     `ProcessRight.InterruptBind` on a handle a process already holds,
-     which is §3's derivation rule rather than a second mechanism beside
-     it. A right where the Jul-29 draft imagined an object is the
-     cheaper answer whenever the "object" would have been a table with
-     no state and one verb.
-   - **THE BOOT SET IS ONE HANDLE WIDE AT THE ENTRY REGISTER, and every
-     kind added to it has kept it that way.** A process enters user mode
-     with exactly one word — its System handle — and everything else the
-     kernel or a launcher minted for it DRAINS through
-     `ProcessOp.BootHandleNext`, one `{tag, kind, handle}` record per
-     call (§12). Regions, device windows and masked System siblings have
-     all joined that set since M1 and the register count has not changed,
-     which is the property the design existed for: the entry ABI is
-     fixed and the furnishing is open-ended.
-   - **TWO COPY FUNNELS ARE THE ONLY PLACES THE KERNEL TOUCHES USER
-     MEMORY.** `copy_out` (§2.2 — the wait record and every answer wider
-     than the registers, including the boot-set record above) and its
-     mirror `copy_in` (design 232 unit 1 — `Timer.Arm`, and M4's message
-     body) are the only code in the kernel that dereferences a user
-     address. Each validates alignment and containment and TERMINATES
-     the process on a violation, on this item's own faults ruling; the
-     asymmetry between their windows is deliberate and is stated at
-     §2.2. That is what keeps "where does the kernel read user memory"
-     a two-site audit rather than a property of the whole dispatch
-     table — and it is what makes a per-address-space mapping switch a
-     one-place change if Profile B ever grows real translation.
+Decided by §2: a flat Process, with kernel teardown on exit or fault only, and
+supervision in userspace. The kill-tree question is answered in §8: `kill`
+is specified process-granular only, with no kernel trees — supervision
+topology is userspace's.
 
-   **AND M4 UNIT 3 GREW AN OP'S ARGUMENT LIST WITHOUT COSTING A REGISTER**
-   (sawos design 15; `designs/010` rulings 9(b) and 11(c)). `Waiter.Add` took
-   two arguments and now takes three: a target, a key, and a FLAGS word — bit 0
-   detaches the attachment at delivery, bit 1 releases the caller's handle entry
-   into the attachment's keeping. Two things about that are this item's own
-   claims paying out:
-   - **THE REGISTER WAS ALREADY THERE.** An op has `a1`-`a5` and the raw form is
-     fixed-arity, so `sos_waiter_add` was riding the three-argument raw form with
-     a zero in the third slot. Growing the op edited one seam and one dispatch
-     arm and nothing about the convention. The renumberable-op discipline is
-     what made unit 1's `Post` grow a return and unit 2's `Take` grow a record;
-     this is the same freedom on the ARGUMENT side.
-   - **A FLAGS WORD OUTSIDE THE PUBLISHED SET IS A FAULT, not a status**, on
-     this item's own fault-don't-status line: the two bits are published in the
-     module userspace links against, so a word carrying any other is a mistake
-     the caller could have checked. The typed surface cannot spell one at all —
-     `AttachMode` has two cases and the consuming half is a distinct VERB
-     (`Waiter.give`) — so the four legal combinations are the only things a Saw
-     caller can ask for, and the kernel's check exists for the C altitude
-     beneath it.
+### 5.4 The async wait primitive
 
-   **AND M4 UNIT 3.5 GREW TWO OP TABLES, WHICH IS THE OTHER HALF OF THE SAME
-   FREEDOM** (sawos design 17; `designs/010` ruling 4's rider). `PipeInletOp`
-   and `PipeRequestOp` had one case each and have two: `Call` beside `Post`,
-   `ReplyWait` beside `Reply`. Nothing about the convention moved, and three
-   things this item already claims are what made that free:
-   - **THE NUMBERS ARE NOT ABI**, so the new cases took the next value in their
-     own tables and displaced nothing. Each table's `< MINT_OP` assert moved to
-     its new highest case, which is the rule that file states — one assert per
-     table, on its top — and is what keeps a growing table from ever reaching a
-     universal op number.
-   - **NO NEW RIGHT.** `Call` spends `PipeInletRight.Post` and `ReplyWait`
-     spends `PipeRequestRight.Reply`, because each new op does what its
-     neighbour does and adds a PARK — and a park is mechanics, not authority.
-     `ReplyWait` additionally spends `WaiterRight.Wait` on the waiter it is
-     handed, which is the two-rights-on-two-objects shape `MemoryOp.Map`
-     already has and for the same reason: holding an obligation must not imply
-     authority over somebody else's Waiter.
-   - **THE THIRD ARGUMENT REGISTER IS SPENT, SO THE FOURTH THING RIDES A
-     RECORD.** `Call` is (body, length, reply buffer) and the reply buffer
-     carries no capacity of its own — it is checked against `PIPE_BODY_BYTES`
-     of the caller's REAL memory, which is `PipeOutletOp.Take`'s own precedent
-     and a stricter test than a number the caller types. `ReplyWait` has FOUR
-     things to say — a waiter, a reply body, its length, and where the delivery
-     goes — so the three small words travel through the COPY-IN funnel this
-     item's third bullet names and the register that is left carries the wait
-     buffer. Neither op widened the convention; one of them reached for the
-     door that already existed, which is what that door was built general for.
-   - **AND THE COPY-IN FUNNEL GREW AN EARLY-CHECK TWIN, for the reason the
-     copy-OUT one has had since M2.** A `Call` that meets a full ring PARKS with
-     its message still in the caller's memory, so the copy happens at the
-     RESUME, in whichever context freed the slot — the first inbound op with the
-     shape `Waiter.Wait` has always had outbound. So `copy_in_check` validates
-     at the CALL, while the caller is still the running process and a refusal can
-     still terminate it, and the later copy cannot fail. The two-site audit is
-     unchanged: it is the same door, asked its question a moment earlier.
+Decided by §2.2: the `Waiter` aggregator with word-sized keys. Attach
+semantics: level-triggered, persistent by default with `remove` (and an
+opt-in `AttachMode.OneShot`), one Waiter per handle, many waiters per Waiter.
 
-   **AND M4 UNIT 4 RAN OUT OF REGISTERS AT LAST, WHICH IS WHY THE MESSAGE IS A
-   RECORD NOW** (sawos design 18; `designs/010` ruling 5). A message is a body
-   address, a length and up to `PIPE_MSG_HANDLES` (4) handle words, and six
-   things do not fit in three registers on any profile. So `Post`, `Call`,
-   `Reply` and `ReplyWait` each take ONE argument record through the copy-in
-   funnel and `Take` and `Resolve` answer through ONE copy-out record, and the
-   convention did not move a millimetre — the previous bullet's door, reached
-   by four more ops. Three consequences worth stating:
-   - **THE FUNNEL IS THE AUDIT AND IT STAYED TWO SITES.** Every new word a
-     message carries arrives through `copy_in`/`copy_in_check` and leaves
-     through `copy_out`, so "where does the kernel read user memory" is the same
-     answer it was before handles could travel at all. A handle WORD is data
-     until the dispatch resolves it against the caller's table, which is the
-     rule every op has always followed for a handle in a register.
-   - **THE NESTED RECORD IS THE FUSED OP'S ANSWER, NOT A SECOND CONVENTION.**
-     `ReplyWait`'s record now CONTAINS the send record it shares with `Reply`,
-     because the fused op is the composition and its arguments should be the
-     composed ones. One layout, declared once, read at two arities.
-   - **AND THE VALIDATION HAPPENS BEFORE ANYTHING IS UNBOUND.** A send's handle
-     words are resolved, checked for `Transfer`, and checked against the kinds a
-     message may carry, all before the ring slot is touched — and the UNBINDS
-     that take the entries away from the sender are the LAST thing a submission
-     op does, after the body copy and the claim mint have both succeeded. That
-     ordering is what makes the batch atomic without an unwind: every step from
-     the first unbind onward is infallible, so a half-staged message is
-     unrepresentable rather than merely unlikely. A caller error still ends the
-     caller by this item's faults ruling.
-     ONE PATH ASKS TWICE, and it has to: a `Call` that met a full ring parks
-     with its argument record still in the caller's memory and RE-READS it at
-     the resume, so a sibling thread may have rewritten it since. The three
-     questions are asked again there, and a slot that fails one simply arrives
-     empty — there is no honest fault to raise at a resume, because the caller
-     is not the running process.
+### 5.5 Memory hardware and the address story
 
-   **AND M4 UNIT 4.5 ADDED ONE OP AND CHANGED ANOTHER'S CONTRACT, WITHOUT
-   MOVING A WIRE VALUE** (sawos design 22; `designs/010` ruling 12). The new op
-   is `PipeReplyOp.Ready` — the non-consuming poll `Resolve` gave up when it
-   learned to PARK — and it took the next value in `PipeReplyOp`'s own table
-   under this item's renumberable-op discipline, displacing nothing and moving
-   that table's `< MINT_OP` assert to its new highest case. Three things about
-   it are this item's own claims paying out again:
-   - **NO NEW RIGHT.** `Ready` spends `PipeReplyRight.Wait`, because asking
-     whether a level is up is the same question attaching to a Waiter asks, and
-     a second bit would let a caller poll a readiness it may not be woken by —
-     the `ProcessRight.Wait` precedent verbatim.
-   - **A CONTRACT MAY CHANGE WHERE A NUMBER MAY NOT.** `Resolve` kept its op
-     number, its right and its record and stopped answering `WouldBlock`: a
-     pending exchange PARKS the calling thread instead. Statuses on the wire are
-     identical, so nothing userspace links against moved — which is what the
-     vDSO discipline is for, read at the semantics rather than at the numbering.
-   - **AND THE TYPED TIER MOVED WHERE THE ABI DID NOT** (ruling 12(a)):
-     `take` and `post` lost their Optionals and `WouldBlock` went back to the
-     ERROR channel, which is a `sos`-module change with no dispatch arm behind
-     it at all. Surface is not ops; this is the same sentence read from the
-     other end.
+**The ESP32-P4's memory hardware**, verified against Espressif's documents:
+the P4 has an MMU with basic virtual memory — but it translates external
+memory only (SPI flash + PSRAM), as a single global mapping (one system-wide
+virtual pool, per-page R/W/X, no ASIDs); internal SRAM is physically
+addressed and bypasses it. The cores implement Machine + User modes only — no
+S-mode, hence no Sv32 per-process paging. Isolation = up to 16 PMP/PMA
+regions (first-level check) + the APM/TEE module (bus-level permission
+contexts; User-mode accesses tagged into one of 3 REE contexts). Kernel
+consequences: AddressSpace on the P4 = PMP region set + APM/REE context; the
+global MMU mapping is a kernel-managed resource (executable code / large data
+mapped from flash/PSRAM with W^X — shared mapping, not per-process;
+per-context remapping would cost cache flushes). Physical memory, no
+overcommit/COW, small-N processes (PMP/REE context counts bound simultaneous
+domains). This is a profile, not a limitation of the model.
 
-## 5b. Two machine profiles, two architectures (DECIDED, user, Jul 31)
+**"An address is the same number in every process" is a fact about a tier,
+not about SOS** (§5b.1):
 
-SOS targets TWO first-class profiles from the beginning, both
-QEMU-runnable for a fast dev loop:
-- **Profile A — MPU**: riscv32, QEMU `virt` first, ESP32-P4 hardware
-  later (the P4 IS this profile: M+U modes, PMP/APM, no per-process
-  paging). Single multitask image, physical addresses, coarse
-  protection, small-N domains. 32-bit.
-- **Profile B — MMU**: arm64 (aarch64), QEMU `virt`. Kernel at EL1,
-  processes at EL0, real per-process page-table AddressSpaces. 64-bit.
-  (arm64 moots the RISC-V S-mode/SBI question: QEMU enters EL1
-  directly; no firmware protocol needed for M1-class work.)
+- **On tier 1 an address is the kernel's answer.** arm64-virt runs each
+  process under its own translation-table set with the kernel relocated into
+  the upper half, so every user image links at one canonical base
+  (`hal.USER_IMAGE_BASE`), loads at whatever physical frames the allocator
+  supplied, and `map` chooses the virtual address it answers with. Two
+  processes sharing one region see it at two different addresses, and
+  `tests/map-placed` asserts exactly that. There is no VA hint on any tier —
+  the address is the answer, never a request.
+- **On tiers 2 and 3 an address is the same number in every process**,
+  because those platforms do not translate: a grant row's input range is its
+  output range, and two resident images therefore cannot share a link base.
+  riscv32-virt keeps one linker script per resident child image for precisely
+  that reason, deliberately, so the two HAL directories side by side are the
+  tier split.
+- **The kernel above the seam does not know which of those it is on.**
+  `GrantRow` carries a user VA range and the physical base it translates to;
+  on a non-translating profile the two are asserted equal, so the identity
+  tier is the general mechanism with one degree of freedom unspent rather than
+  a second mechanism. Addresses-as-data stay physical everywhere they are
+  stored — Memory capabilities, the build-emitted region table, `sosimg`
+  records — and only the moment of kernel dereference converts, through
+  `hal.phys_to_virt`.
 
-Rationale: multi-arch + 32/64-bit awareness from day one; the
-object/handle/pipe/syscall model is IDENTICAL across profiles —
-divergence is confined to a small per-arch HAL (boot, trap entry,
-context switch, Mapping/AddressSpace implementation), selected at
-build time via the module-path mechanism (`--module-path
-hal=hal/<target>/kernel` — Blade/B0 machinery). All wire/boot formats
-(sosimg, message headers) use FIXED-WIDTH fields (the design-47
-discipline) so 32/64-bit profiles interoperate. AddressSpace on A =
-PMP region set (+APM on P4); on B = page-table root. Roadmap: M1 =
-riscv32 boot-to-root-server (design 78); M1b = arm64 EL1 boot parity
-+ HAL extraction (design 162) BEFORE object-model work; then the
-object model lands once, two-profile-tested.
+### 5.6 Boot protocol
 
-**BOTH PROFILES ARE LIVE (design 162, Aug 7).** The claim above is no
-longer a plan: `make sos-test` boots the same kernel on
-`qemu-system-riscv32 -M virt` and `qemu-system-aarch64 -M virt -cpu
-cortex-a53`, twelve cases each, and either failing is red. What the port
-cost, and what it proved:
+**The kernel loads the root server** from a separate flash partition — real
+separation from day one; independent updates. To keep the loader
+microkernel-sized the image format is not ELF but a minimal flat **sosimg** (a
+header carrying magic, version, segment count, arch tag, priority map and an
+absolute entry address; then segments of {load_addr, file_off, file_len,
+mem_len, flags}; `imgformat` owns the layout) that Blade emits as a build
+target. Kernel: parse header → map/copy segments (PMP/APM per §5.5) → mint root
+handles (the System handle in the entry register; root `Memory` and `IoMemory`
+regions for RAM and device ranges, collected through the boot set; the root IRQ
+table is a right rather than an object, §12) → enter U-mode at the entry.
+Everything else derives from those handles.
 
-- **The kernel has no architecture in it.** `kernel/core/` names no
-  register, no trap cause, no protection hardware and no board; it reaches
-  all of it through one module it imports as `hal`, mapped per build to
-  `hal/<arch>/kernel/`. The harness SCANS that directory for
-  architecture names and fails the run on a hit, comments included —
-  because a leaked constant still compiles and is only wrong on the profile
-  nobody happened to be building.
+- **The format.** A versioned flat header plus fixed-size segment records
+  (the layout is `imgformat`'s), all
+  fixed-width little-endian so 32- and 64-bit profiles interoperate, carrying
+  an `arch` tag (a wrong-profile image is a clean load error) and the §7
+  priority map. It is emitted by a Blade `emit = "sosimg"` build target reading
+  the package's `[sos]` manifest section (with `[sos.<triple>]` sections, so
+  one package builds for both profiles with `src/` unchanged), and appended to
+  the kernel image as a `.payload` blob with linker-symbol bounds. The layout
+  lives once, in the shared `libs/imgformat/` package (sawlang-side): Blade
+  consumes it as a path dependency and emits bytes through it, the kernel
+  consumes it through `--module-path` and reads images by overlaying the same
+  structs as `UnsafeMemory` typed views, with `static_assert` pinning the sizes
+  on both sides.
+- **The kernel validates an image in full before placing a byte of it**, so a
+  segment aimed at the kernel is refused rather than obeyed. A segment must be
+  aligned to the target's grant granularity (a page on Profile B, four bytes on
+  Profile A) — without that, code could become writable because data started in
+  the same unit. Blade reads ELF32 and ELF64. Image addresses are 64-bit fields
+  on every profile, and a 32-bit kernel refuses an entry or segment address that
+  does not fit its machine word (`fits_target_word`) rather than narrowing it.
+- **The build also emits a region table** (§12), the second boot input the
+  kernel reads.
+
+### 5.7 Syscall ABI
+
+**A (status, value) pair, and every call is an object op.** Conceptually every
+syscall is `object.method(args)` — there are no bare numbered syscalls. The
+register convention, per profile:
+
+| Role | Profile A (riscv32) | Profile B (arm64) |
+|---|---|---|
+| handle in / status out | `a0` | `x0` |
+| op (a method id on that object's table) | `a7` | `x8` |
+| arguments | `a1`-`a3` | `x1`-`x3` |
+| value/handle out | `a1` | `x1` |
+| trap | `ecall` | `svc #0` |
+
+The two are the same shape one-to-one, deliberately: the op sits in a
+register outside the argument run on both, so arguments are a clean sequence
+and neither profile has to shuffle. `x8` is where AArch64 Linux puts a syscall
+number, so every disassembler and every reader who has seen one arm64 syscall
+reads this one correctly. One difference is not cosmetic and belongs to the
+HAL rather than the kernel: `ecall` leaves the saved PC pointing at the
+instruction and `svc` leaves it pointing past, so advancing on return is a
+per-profile decision (a kernel that advanced on Profile B would skip the
+instruction after every syscall).
+
+**Statuses.** The status word is 0 for ok, else a small **`SosStatus`** enum
+tag. An enum with an `Ok` case is a status, not an error (`SosStatus.Ok`,
+`SosStatus.NoResource`, …), and the `Sos` prefix names whose status it is. The
+hosted runtime's `SysError` in sawlang's runtime ABI (`sawc/rt/ABI.md` at the
+pinned toolchain) is a separate frozen contract (errno tags, machine-parsed) and
+keeps its name; the two correspond and nothing more. An `Err(SosStatus.Ok)`
+never arises by construction: the wrapper boundary splits on the status — `Ok` →
+`Result.Ok(value)`, anything else → `Err(status)`.
+
+**The faults ruling: a caller error faults, a condition the caller could not
+have known answers with a status.** A caller error the process could have
+checked — an invalid handle, a malformed op, a rights violation — terminates the
+offending process, so `BadHandle`, `BadOp` and `AccessDenied` are `FaultReason`
+tags rather than statuses, keeping their numbers — `SosStatus` leaves 1–3
+unused. The kernel stays up, reports, and runs the teardown (§8). The rule is
+uniform because it has to be: an unbound handle names no kind, so there is no op
+table to ask which rule applies. What is left in `SosStatus` is what a caller
+could not have known — `NoResource` (a full slab), `QuotaExceeded` (§2.9),
+`BadImage` (§8), `Drained` (§12), `Revoked` (§2.2), `PeerClosed` and
+`WouldBlock` (§2.1) — with `Unknown` the userspace mapping artifact. A dynamic
+resource condition answers with a status; broken code faults.
+
+**Dispatch** is §3's shape verbatim: handle-table lookup → object type → op
+table → rights check → op. The System object (§2.8) is minted to root at boot,
+and `debug_print` / `shutdown(status)` are among its ops (§2.8 lists them),
+rights-gated (`SystemRight.Debug`/`.Shutdown`) — a process without the System
+handle cannot even print. Process exit is a Process op. Ops map 1:1 onto the
+`sos` module's typed wrappers (`system.debug_print(...)`,
+`-> Result<T, SosStatus>`). Op tables and rights sets are named for the §2
+object, spelled out (`SystemOp`, `ProcessOp`, `ThreadOp` beside `SystemRight`,
+…).
+
+**Rights-gated ops are the whole of the surface, and every gate is named for its
+op.** There is no bare numbered syscall, no ambient facility, and no generic
+authority anywhere in the ABI (§3): an op is reached through a handle of the
+right kind and spends a bit named for that op. Binding an interrupt line is
+`ProcessRight.InterruptBind` on a handle a process already holds, not a root
+IRQ-table object: a right is the cheaper answer whenever an "object" would have
+been a table with no state and one verb.
+
+**The boot set is one handle wide at the entry register.** A process enters user
+mode with exactly one word in its first argument register — root's System
+handle; for a child, the handle its start tag names (a System sibling, by the
+§12 convention), or `NO_HANDLE` when it was started with no tag — and everything
+else the kernel or a launcher minted for it drains through
+`ProcessOp.BootHandleNext`, one `{tag, kind, handle}` record per call (§12). The
+entry ABI is fixed and the furnishing is open-ended.
+
+**API ownership: the vDSO discipline.** The `sos` module is U-mode library
+code (never kernel-mode), but it is owned and exported by the kernel package:
+syscall and method numbers are not ABI. They live in one kernel-internal
+constants package (`kernel/abi/`) shared by the dispatch tables and the
+wrappers (`kernel/sysapi/`), so the two can never skew and the kernel may
+renumber freely; userspace links the exported module and never sees a raw
+number. Delivery is static linking in v1 (the manifest/module-path
+mechanism); a true mapped vDSO would change nothing about the shape and is not
+built. The kernel package also exports a C-ABI surface for non-Saw languages
+(`@export`, whitelist-clean — handles, statuses and ops are integers): per-op
+functions (`sos_system_shutdown(handle, status)`) as the supported C
+interface, over fixed-arity raw forms (`sos_syscall1(h, op, a)` — no varargs
+across the trap boundary), over the per-arch HAL `ecall`/`svc` stub. One
+implementation chain, three entry altitudes: typed Saw, typed C, raw.
+
+**The discipline holds for Saw and does not yet hold for C, and the reason is
+structural.** The typed-C altitude is real — the per-op `@export`s exist, are
+linked, and run on every boot — but they are compiled from the `sos` Saw module,
+which depends on `sosrt`, so reaching them makes an image a Saw image with a C
+`main` in it, at the price of the runtime and an arena. A genuinely non-Saw
+process therefore writes op numbers itself: `tests/c-child/sos.h` copies them
+out of `kernel/abi/`, a module whose own header calls itself kernel-internal, on
+`tests/riscv32/payload_sosimg.S`'s precedent. **So for a C image an op number is
+ABI**, and a renumbering that costs a Saw caller a rebuild would cost that image
+correctness. The claim is scoped to the altitude that can honour it. What is
+missing is an `sos.h` this tree owns and keeps in step with
+`kernel/abi/src/ops.saw`, and a way to link the exported floor without the Saw
+runtime behind it (a `sos` build profile carrying the floor alone, or generated
+numbers). The C-ABI surface itself is correct; it is the linkability, not the
+exports, that is missing.
+
+**Two copy funnels are the only places the kernel touches user memory.**
+`copy_out` (§2.2 — the wait record and every answer wider than the registers,
+including the boot-set record) and its mirror `copy_in` (`Timer.Arm` and the
+message records) are the only code in the kernel that dereferences a user
+address. Each validates alignment and containment and terminates the process
+on a violation, on the faults ruling above; the asymmetry between their
+windows is deliberate and is stated at §2.2. That keeps "where does the kernel
+read user memory" a two-site audit rather than a property of the whole
+dispatch table, and keeps a per-address-space mapping switch a one-place
+change. A handle word arriving through either is data until dispatch resolves
+it against the caller's table, which is the rule every op follows for a handle
+in a register.
+
+**Growing an op costs no register and no ABI.** Because the numbers are not ABI,
+a new op takes the next value in its own table and displaces nothing, and each
+table's `< MINT_OP` assert sits on its highest case — one assert per table, on
+its top — which keeps a growing table from ever reaching a universal op number.
+An op's argument list may grow the same way, up to the three argument registers:
+the raw form is fixed-arity, so a grown argument rides a register the raw form
+already passes, and the convention does not move. An op that needs more than
+three argument words passes an argument record in memory through the copy-in
+funnel (the pipe send records below are the example). An op answers one value
+word (`a1`/`x1`); an answer wider than that goes through the copy-out funnel.
+And a contract may change where a number may not: an op can keep its number,
+right and record while its semantics change, because nothing a Saw program links
+against is a number (a C image is the exception stated above) — the vDSO
+discipline read at the semantics rather than at the numbering. Surface is not
+ops: a typed-tier change (such as `take` and `post` answering `WouldBlock`
+through the error channel rather than an Optional) needs no dispatch arm at all.
+
+**Declaration order is layout.** Records the ABI publishes are laid out in
+declaration order. §2.2's wait record is the worked example: `sosabi` publishes
+its region offsets and `static_assert`s them.
+
+**`WaiterOp.Add` takes a target, a key and a flags word.** Bit 0 detaches the
+attachment at delivery (`AttachMode.OneShot`), bit 1 releases the caller's
+handle entry into the attachment's keeping (`Waiter.give`). **A flags word
+outside the published set is a fault, not a status**: the two bits are
+published in the module userspace links against, so a word carrying any other
+is a mistake the caller could have checked. The typed surface
+cannot spell one at all — `AttachMode` has two cases and the consuming half is
+a distinct verb — so the four legal combinations are the only things a Saw
+caller can ask for, and the kernel's check exists for the C altitude beneath
+it.
+
+**The fused pipe ops add no right.** `PipeInletOp.Call` spends
+`PipeInletRight.Post` and `PipeRequestOp.ReplyWait` spends
+`PipeRequestRight.Reply`, because each does what its neighbour does and adds a
+park — and a park is mechanics, not authority. `ReplyWait` additionally spends
+`WaiterRight.Wait` on the waiter it is handed, which is the
+two-rights-on-two-objects shape `MemoryOp.Map` has and for the same reason:
+holding an obligation must not imply authority over somebody else's Waiter.
+`PipeReplyOp.Ready` spends `PipeReplyRight.Wait`, because asking whether a
+level is up is the same question attaching to a Waiter asks, and a second bit
+would let a caller poll a readiness it may not be woken by — the
+`ProcessRight.Wait` precedent.
+
+**Pipe messages travel in records.** A message is a body address, a length
+and up to `PIPE_MSG_HANDLES` handle words, which do not fit three registers on
+any profile. So `Post`, `Call`, `Reply` and `ReplyWait` each take one argument
+record through the copy-in funnel, and `Take` and `Resolve` answer through one
+copy-out record:
+
+- `Call` is (argument record, its length, reply buffer); the reply buffer
+  carries no capacity of its own — it is checked against
+  `pipe_msg_record_bytes()` of the caller's real memory, a stricter test than a
+  number the caller types. (`Take`, by contrast, takes a capacity and checks it
+  against `pipe_take_record_bytes()`.) `ReplyWait` has four things to say — a
+  waiter, a reply body, its length, and where the delivery goes — so the small
+  words travel through the copy-in funnel and a register carries the wait
+  buffer. `ReplyWait`'s record contains the send record it shares with `Reply`,
+  because the fused op is the composition and its arguments are the composed
+  ones: one layout, declared once, read at two arities.
+- **The copy-in funnel has an early-check twin.** A `Call` that meets a full
+  ring parks with its message still in the caller's memory, so the copy
+  happens at the resume, in whichever context freed the slot. So
+  `copy_in_check` validates at the call, while the caller is still the running
+  process and a refusal can still terminate it, and the later copy cannot
+  fail. The audit stays two sites: it is the same door, asked its
+  question a moment earlier.
+- **Validation happens before anything is unbound.** A send's handle words are
+  resolved, checked for `Transfer`, and checked against the kinds a message may
+  carry, all before the ring slot is touched — and the unbinds that take the
+  entries away from the sender are the last thing a submission op does, after
+  the body copy and the claim mint have both succeeded. That ordering makes the
+  batch atomic without an unwind: every step from the first unbind onward is
+  infallible, so a half-staged message is unrepresentable rather than merely
+  unlikely. A caller error ends the caller by the faults ruling. One path asks
+  twice, and it has to: a `Call` that met a full ring re-reads its argument
+  record at the resume, since a sibling thread may have rewritten it. The three
+  questions are asked again there, and a slot that fails one simply arrives
+  empty — there is no honest fault to raise at a resume, because the caller is
+  not the running process.
+- **`Resolve` parks rather than answering `WouldBlock`**: a pending exchange is
+  not a status it returns.
+
+### 5.8 One-way send
+
+Decided by §2.4: there is no `send_oneway`; the accumulating Event is the
+payload-free one-way primitive, and the TELL idiom (§2.1) carries a payload.
+
+### 5.9 Memory: the RAM/device distinction and the region refcount
+
+Decided by §2.5's typed pools: RAM is `Memory`, device MMIO is `IoMemory`. The
+per-physical-region refcount, and its reconciliation with device regions that
+are never freed:
+
+- **The counts live on the region's own slab slot**: §2.5's "refcount invariant,
+  as built".
+- **There is no pool-side region descriptor**, and that is the answer rather
+  than a shortcut: a pool is not a fourth object kind. Every region carries a
+  `root` back-reference (a boot-minted region names itself; a split carries its
+  parent's answer down), and the pool's ledger — free-list head, bytes
+  outstanding, bytes dropped — lives on the root's own `MemorySlot`. Return is
+  to the root, never to the intermediate cursor a piece was cut from, because
+  the derivation chain is an artifact of front-cutting and not an ownership
+  tree. Adjacent free ranges coalesce, and `split` serves from the free list
+  before advancing the cursor (first fit).
+- A release is infallible, so a range that finds no free-list node after
+  coalescing is leaked and counted (`dropped`) rather than refused.
+- **Byte accounting is that ledger**: `MemorySlot.out_bytes` (outstanding)
+  beside `pool_free_bytes(root)` (available). It is the pool's business and not
+  a per-process authority — quotas stay object-counted in v1 (§2.9) — and no op
+  fronts it.
+- **`IoMemory` is the carve-out.** `carve` leaves the parent whole, MMIO is
+  pinned and never freed, and a device region's counts are therefore
+  effectively pinned.
+
+## 5b. Two machine profiles, two architectures
+
+SOS targets two first-class profiles, both QEMU-runnable for a fast dev loop:
+
+- **Profile A — MPU**: riscv32, QEMU `virt` first, ESP32-P4 hardware later (the
+  P4 is this profile: M+U modes, PMP/APM, no per-process paging). Single
+  multitask image, physical addresses, coarse protection, small-N domains.
+  32-bit. M-mode kernel, U-mode processes, PMP with U-mode default-deny doing
+  the work, so the kernel and the finisher are protected by never being granted,
+  and a device such as the UART is reachable only through an `IoMemory` window a
+  process was given (§2.5). QEMU runs it as
+  `qemu-system-riscv32 -M virt -bios none` at RAM base 0x8000_0000, and the
+  machine stops through `sifive_test` (0x5555 = exit 0).
+- **Profile B — MMU**: arm64 (aarch64), QEMU `virt` (`-cpu cortex-a53`).
+  Kernel at EL1, processes at EL0, real per-process page-table address
+  spaces (§5.5). 64-bit. (arm64 moots the RISC-V S-mode/SBI question: QEMU
+  enters EL1 directly; no firmware protocol is needed for M1-class work.)
+
+Rationale: multi-arch and 32/64-bit awareness from day one. The
+object/handle/pipe/syscall model is identical across profiles — divergence is
+confined to a small per-arch HAL (boot, trap entry, context switch,
+Mapping/AddressSpace implementation), selected at build time via the
+module-path mechanism (`--module-path hal=hal/<target>/kernel` — Blade's
+machinery). All wire and boot formats (sosimg, message headers) use fixed-width
+fields so 32- and 64-bit profiles interoperate. AddressSpace on A = PMP region
+set (+APM on the P4); on B = page-table root.
+
+`make sos-test` boots the same kernel on both profiles and on the flat build
+profile of §5b.1 — three gate runs — and any run failing is red.
+
+- **The kernel has no architecture in it.** `kernel/core/` names no register,
+  no trap cause, no protection hardware and no board; it reaches all of it
+  through one module it imports as `hal`, mapped per build to the target's
+  `hal/<target>/kernel/`. The harness scans that directory for architecture
+  names and fails the run on a hit, comments included — because a leaked
+  constant still compiles and is only wrong on the profile nobody happened to
+  be building. The riscv32 HAL is split into an architecture half
+  (`hal/riscv32-common/`) and per-board halves.
 - **The HAL is the whole of the difference**, and it is small: boot +
-  vectors, the privilege transition, the protection primitive, a console
-  byte sink, a way to stop the machine, the trap-frame accessors, and the
-  board's memory map. Everything else — dispatch, rights, the loader's
-  order of checks, the console's FORMATTING — is shared.
-- **Profile B's isolation is a static identity map** (design 162 decision
-  2): one map built at boot, EL0 default-deny, and the only mutable part is
-  the EL0 permission bits of the pages a root image was granted. That is
-  PMP parity, not paging — Mapping/AddressSpace objects stay M2.
-- **The same root server sources build for both.** `root/src/` is
-  unchanged between profiles; only its manifest's `[sos.<triple>]` section
-  differs, and Blade grew per-target sections plus an ELF64 reader to make
-  that true.
-- **Images are arch-tagged** (sosimg v2): a wrong-profile image is a clean
-  load error, tested on both. Before the tag, the two profiles' headers
-  were byte-compatible wrappers around incompatible instructions and the
-  only thing stopping one booting on the other was that nobody had tried.
+  vectors, the privilege transition, the protection primitive, a console byte
+  sink, a way to stop the machine, the trap-frame accessors, the interrupt and
+  timer seams (§9, §2.6), and the board's memory map. Everything else —
+  dispatch, rights, the loader's order of checks, the console's formatting — is
+  shared, and `kernel/core/` is shared by every kernel image, which keeps them
+  all on the same trap path.
+- **The same root server sources build for both.** `root/src/` is unchanged
+  between profiles; only its manifest's `[sos.<triple>]` section differs.
+- **Images are arch-tagged**: a wrong-profile image is a clean load error,
+  tested on both.
+- **The two profiles report the same fault names.** ESR's exception class
+  plus the data-abort direction bit decode to `store-access-fault` and
+  friends, so the harness asserts one string against both machines.
+- **Profile A's trap entry** uses `mscratch` as the mode witness (0 in the
+  kernel, the running thread's frame address in U-mode), which splits a syscall
+  from a kernel bug in one branch. A U-mode trap saves 31 GPRs + `mepc` into a
+  32-word frame (word `i` holds `x<i>`; word 0 holds `mepc`). A kernel-mode trap
+  is `kernel_fault`, which reports and fails the run rather than hanging.
+- **Profile B facts:** FP/SIMD must be enabled at EL1 before any compiled code
+  runs — `CPACR_EL1.FPEN` traps Advanced SIMD out of reset, and LLVM vectorizes
+  ordinary loops. FP state is not saved across a trap (FP-in-userspace is in
+  §11's plan). Semihosting (`SYS_EXIT`), not PSCI, stops the machine: PSCI
+  `SYSTEM_OFF` always exits 0, and the harness asserts on exit status.
+  Cortex-A53 is ARMv8.0 and has no LSE atomics; `ldxr`/`stxr` exclusives cover
+  everything the kernel and `SpinLock` need.
+- The kernel's hex output follows the target's word width.
 
-### 5b.1 The PROTECTION TIER, and the word the platform advertises (M5)
+### 5b.1 The protection tier, and the word the platform advertises
 
-**A PROFILE IS AN ARCHITECTURE-AND-BOARD; A TIER IS WHAT ITS PROTECTION
-HARDWARE CAN DO.** The two are independent, and M5 made the second one a
-thing a PROGRAM can ask about rather than a thing this document knows
-(sawos design 19, ruled as design 25 D-4, built by design 35):
+**A profile is an architecture-and-board; a tier is what its protection
+hardware can do.** The two are independent, and the tier is a thing a program
+can ask about (`SystemOp.TierGet`, §2.8):
 
 | tier | what the hardware does | address story (§5.5) | `TierGet` answers |
 |---|---|---|---|
-| 1 — MMU | per-process translation; a peer's memory is not mapped at all | the KERNEL'S ANSWER — `map` places, one link base | `Isolated` |
+| 1 — MMU | per-process translation; a peer's memory is not mapped at all | the kernel's answer — `map` places, one link base | `Isolated` |
 | 2 — MPU | numbered protection regions replayed per switch; a peer's memory is mapped and denied | identity — the same number in every process | `Isolated` |
 | 3 — flat | nothing; every access lands | identity | `Flat` |
 
 | target | tier | in the gate? | notes |
 |---|---|---|---|
-| arm64 `virt` | 1 | YES — Profile B | per-process table sets, higher-half kernel, `map` places (designs 27/29/33) |
-| riscv32 `virt` | 2 | YES — Profile A | PMP regions replayed through the one seam; keeps its per-child linker scripts, deliberately, as the living identity-tier demonstration |
-| riscv32 `virt`, FLAT BUILD PROFILE | 3 | YES — a third run | a module swap over the same board: `prot_*` no-ops, PMP opened with one TOR entry, `prot_isolated()` false. Zero new toolchain, and the tier-3 story's first real test target |
-| ESP32-C3 | 2, at the floor | no — a NON-GATING board smoke | 16 PMP entries exactly, 400 KB SRAM; XIP is the entry price (design 20) |
+| arm64 `virt` | 1 | yes — Profile B | per-process table sets, higher-half kernel, `map` places |
+| riscv32 `virt` | 2 | yes — Profile A | PMP regions replayed through the one seam; keeps its per-child linker scripts, deliberately, as the living identity-tier demonstration |
+| riscv32 `virt`, flat build profile | 3 | yes — a third run | a module swap over the same board: `prot_*` no-ops, PMP opened with one TOR entry, `prot_isolated()` false. No new toolchain, and the tier-3 story's test target |
+| ESP32-C3 | 2, at the floor | no — a non-gating board smoke (`make sos-smoke-esp32c3`) | 16 PMP entries exactly, 400 KB SRAM; XIP is the entry price |
 | ESP32-P4 | 2 | no — no QEMU machine yet | 32 PMP + 16 PMA, 768 KB; the first real tier-2 part |
 | ESP32-S3-class | 3 | no | WORLD0/1 only; a `--target` port, not a new backend |
 
-**TWO WORDS AND NOT THREE, which is the ruling worth restating here.**
-`Isolated` and `Flat`; MMU-vs-MPU is NOT advertised, because slot pricing
-and the `map` answer are already the visible difference and a third word
-would invite tier-sniffing. A program that relies on isolation checks the
-word ONCE and refuses to run; everything else is written against the one
-idiom set and never asks.
+**Two words and not three.** `Isolated` and `Flat`; MMU-vs-MPU is not
+advertised, because slot pricing and the `map` answer are already the visible
+difference and a third word would invite tier-sniffing. A program that relies
+on isolation checks the word once and refuses to run; everything else is
+written against the one idiom set and never asks.
 
-**WHAT THE WORD DISCLAIMS IS DENIAL, AND NOTHING ELSE** (design 19,
-carried whole). On `Flat`, `map`'s contract — "make this accessible with
-at least these rights" — is TRIVIALLY TRUE and succeeds honestly; what a
-flat platform cannot do is the other half, `unmap`'s revocation and peer
-isolation. **THE KERNEL BOUNDARY IS NOT TIERED ANYWHERE**: handles,
-rights, generations, quotas and lifetimes are enforced identically on all
-three, so a W^X refusal, a missing-right fault and a full-slab
-`NoResource` read the same on a machine that cannot deny a single load.
-The gate says so rather than claiming it — the whole object-model suite
-runs on all three profiles unchanged, and exactly four cases are excluded
-from the flat one BY NAME, each because its assertion IS a hardware
-denial (`umode_access_fault`, `root_server_oversteps`,
-`process_isolation`, `map_unmap`).
+**What the word disclaims is protecting memory from a process — the kernel's
+included.** On `Flat`, `map`'s contract — "make this accessible with at least
+these rights" — is trivially true and succeeds honestly; what a flat platform
+cannot do is the other half, `unmap`'s revocation and peer isolation. Its
+user-mode protection range is read/write/execute over the whole address space,
+so a process can read and write any address, the kernel's memory and the test
+finisher included, and a process that writes kernel memory directly bypasses
+every check (`SystemRight.Shutdown` included). **The checks are identical on the
+syscall path**: handles, rights, generations, quotas and lifetimes are checked
+on every syscall on all three tiers, so a W^X refusal, a missing-right fault and
+a full-slab `NoResource` read the same on a machine that cannot deny a single
+load. The isolated tiers enforce both halves. The gate shows the syscall-path
+half: the object-model suite runs unchanged on all three gate runs (both
+profiles and the flat build profile), because every case reaches the kernel
+through syscalls, and the flat run excludes only the cases whose assertion is a
+hardware denial, each marked isolated-only in the runner and printed with its
+reason (for example `umode_access_fault`, `root_server_oversteps`,
+`process_isolation`, `map_unmap` and `stats_region_ro`).
 
-**THE TIER-2 FLOOR: shape ratified, NUMBER deferred** (design 25 ruling
-4). A tier-2 part has few enough protection slots that a mapping quota
-must be priced against them, and TOR-costs-two / NAPOT-costs-one stays
-HAL-INTERNAL under a conservative quota so a budget never varies by
-allocation luck. `DEFAULT_QUOTA_MAPPINGS` prices at 6–8 when a real
-tier-2 board unit asks; no in-tree target consumes it yet, and a number
-nobody runs is a number nobody believes.
+**The tier-2 floor: shape decided, number deferred.** A tier-2 part has few
+enough protection slots that a mapping quota must be priced against them, and
+TOR-costs-two / NAPOT-costs-one stays HAL-internal under a conservative quota,
+so a budget never varies by allocation luck. `DEFAULT_QUOTA_MAPPINGS` is to be
+priced at 6–8 when a real tier-2 board asks; no in-tree target consumes that
+price yet, and a number nobody runs is a number nobody believes.
 
-## 5c. The native floor (design 172, both parts, Aug 7)
+## 5c. The native floor
 
-SOS is written in Saw, and the exceptions are ENUMERATED rather than tolerated.
+SOS is written in Saw, and the exceptions are enumerated rather than tolerated.
 Every surviving line of C states, in the file that holds it, why it is not Saw —
 and there are only three reasons in the whole system:
 
-1. **An INSTRUCTION with no Saw spelling.** `ecall` / `svc`, `mret` / `eret`,
-   the vector tables, `csrw` / `msr` / `mrs`, `dsb` / `isb` / `tlbi`, the
-   semihosting `hlt`, and the register pinning each of them needs. Inline asm in
-   Saw is a separate design conversation and deliberately not one this milestone
-   opened.
+1. **An instruction with no Saw spelling.** `ecall` / `svc`, `mret` / `eret`,
+   the vector tables, `csrw` / `msr` / `mrs`, `dsb` / `isb` / `tlbi`, `wfi`,
+   the semihosting `hlt`, and the register pinning each of them needs (so, for
+   example, `sos_syscall3` and `sos_wait_for_irq` per profile, and the
+   interrupt-mask and timer system registers). Inline asm in Saw is a separate
+   design conversation.
 2. **`memcpy` / `memset` / `memmove`.** A byte-copy loop written in Saw is
-   exactly the pattern LLVM's loop-idiom recognizer rewrites INTO a call to
-   `memcpy` — which, in a freestanding build where this IS `memcpy`, is a call
-   to itself. C compiled with `-fno-builtin` is the supported way to say "do not
-   do that", and it is why every libc writes these in assembly or with the same
-   flag. PERMANENT. (The `__atomic_*` libcalls beside them are the same shape:
-   the caller is codegen, not source.)
-3. **A LINKER SYMBOL's ADDRESS.** Saw cannot name one — `extern` declares only
+   exactly the pattern LLVM's loop-idiom recognizer rewrites into a call to
+   `memcpy` — which, in a freestanding build where this is `memcpy`, is a call
+   to itself. C compiled with `-fno-builtin` is the supported way to say "do
+   not do that", and it is why every libc writes these in assembly or with the
+   same flag. Permanent. (The `__atomic_*` libcalls beside them are the same
+   shape: the caller is codegen, not source.)
+3. **A linker symbol's address.** Saw cannot name one — `extern` declares only
    functions, an extern function is not usable as a value, and `@export` on a
-   static emits a definition rather than a reference. Filed as DF-172a. **TEN
-   accessor bodies now, and they are no longer all in the kernel HALs**: four
-   per kernel profile (`sos_payload_start`/`_end` and
-   `sos_region_table_start`/`_end`) plus `sos_arena_base`/`sos_arena_size` in
-   `rt/common_c/support.c`, which M5's arena unit added (sawos design 38) when
-   a package's arena SIZE became a linker-script knob and the runtime had to
-   read the bounds back. That last pair is the reason the paragraph below about
-   `support.c` no longer says "reason 2 only".
+   static emits a definition rather than a reference. The accessors are the
+   kernel HALs' `sos_payload_start`/`_end` and
+   `sos_region_table_start`/`_end`, and `rt/common_c/support.c`'s
+   `sos_arena_base`/`sos_arena_size`: a package's arena size is a
+   linker-script knob (`ARENA_SIZE`, a `PROVIDE`d symbol bounding a reserved
+   span of `.bss`), and `sosrt` reads those bounds back at run time with the
+   same `extern unsigned char sym[]` idiom. That is what lets a C image set
+   `ARENA_SIZE = 0` and link no arena at all, and a small board scale the arena
+   per package rather than per tree.
 
-What that cost, measured: the C went from 383 code lines to 135, a 65%
-reduction, over two passes.
+Reason 3 is the only open language gap: the other two are permanent by
+construction, and this one closes the day Saw can name a linker symbol.
 
-Part 1 took it to 207, nearly all of it out of the two kernel HALs — `sink.c` is
-170 code lines to 47 on arm64 and 75 to 22 on riscv32. What moved: both board
-consoles and both machine-stops, the arm64 static identity map and its grant
-editing, the riscv32 PMP region staging, and the kernel-fault report with its
-hex formatting.
+**Where the floor is.** `rt/common_c/support.c` — one copy, shared by the kernel
+and every process — is `mem*`, the atomic libcalls, the 64-bit division pair,
+and the arena accessors. The division pair is worth its line: a Clock reads
+nanoseconds, which is a 64-bit quantity on every profile because 32 bits of them
+wraps in four seconds, and rv32 has no 64-bit divide instruction even with `+m`.
+So the floor grows when a 32-bit machine meets an arithmetic width the ISA does
+not have — not when the language falls short. Each user HAL is its syscall
+instruction and nothing else. The bump arena and the frozen `__saw_rt_*` seams
+are Saw in `rt/common/src/lib.saw`, one copy serving the kernel and every
+process; the process side's two hooks and its parked boot handle are Saw in
+`kernel/sysapi/`, beside the System object whose authority they spend. A thread
+context is built in Saw (`frame_init`, and a `resume_frame` that branches into
+the trap entry's own restore path), so no register-clearing prologue is needed
+in assembly.
 
-Part 2 took it to 135, out of the two places part 1 could not reach. The bump
-arena and the four `__saw_rt_*` seams are Saw in `rt/common/src/lib.saw`,
-one copy serving the kernel and every process; the process side's two hooks and
-its parked boot handle are Saw in `kernel/sysapi/`, beside the System object
-whose authority they spend. Both user HALs are now their syscall instruction and
-nothing else, and `rt/common_c/support.c` is `mem*`, the atomic libcalls and
-(since design 232 unit 1) the 64-bit division pair. That last entry is worth its
-line: a Clock reads NANOSECONDS, which is a
-64-bit quantity on every profile because 32 bits of them wraps in four seconds,
-and rv32 has no 64-bit divide instruction even with `+m`. So the floor grows
-when a 32-bit machine meets an arithmetic width the ISA does not have — not
-when the language falls short.
-
-**AND `support.c` CARRIES THREE PERMANENT REASONS SINCE M5, NOT TWO** (sawos
-design 38). This paragraph used to end "reason 2, and reason 2 only"; the arena
-unit made a package's arena size a linker-script knob (`ARENA_SIZE`, a
-`PROVIDE`d symbol bounding a reserved span of `.bss`), and `sosrt` has to read
-those bounds back at run time — so `sos_arena_base` and `sos_arena_size` joined
-the file as **reason 3**, the same wall `sink.c` meets for `.payload` and
-answered with the same `extern unsigned char sym[]` idiom. What that buys is
-worth the reason: the arena stopped being a compiled-in constant every image
-pays for, so a C image sets `ARENA_SIZE = 0` and links no arena at all (design
-39's probe measured a 580-byte process), and a small board scales it per
-package rather than per tree.
-
-So the floor is one shared C file plus four inline-asm leaves, and every line of
-it is reason 1, reason 2, or — in ten accessor bodies across three files —
-reason 3. Reason 3 remains the only open LANGUAGE gap: the other two are
-permanent by construction, and this one closes the day Saw can name a linker
-symbol.
-
-**M2 moved both numbers and added no reason** (design 178's per-unit
-measurements): C went 135 -> 168 code lines — one interrupt-class mask register
-on Profile A and four timer system registers on Profile B (unit 1),
-`sos_syscall3` per profile (unit 2: an op that answers with a VALUE needs one,
-and the C ABI the Saw side declares against has no aggregate return), and
-`sos_wait_for_irq` per profile (unit 4: `wfi` is an instruction). Assembly went
-UP by 13 for Profile B's interrupt vector entry and then DOWN to 268 total,
-because a thread context built in Saw needs no register-clearing prologue —
-`enter_user` is gone from both HALs, replaced by a Saw `frame_init` and a
-`resume_frame` that branches into the trap entry's own restore path. Reason 1 in
-every case: an object model grew by five kinds and the diet's direction did not
-change.
-
-**The panic path is the interesting one.** The console writer the runtime seams
-call is now Saw, and it is CHECK-FREE BY CONSTRUCTION rather than by
+**The panic path is check-free by construction.** The console writer the runtime
+seams call is Saw, and it is check-free by construction rather than by
 inspection: raw pointer reads, wrapping arithmetic, no indexing, no allocation.
 That is what makes a panic raised inside the panic reporter unreachable instead
-of merely unlikely, and it was verified from emitted IR before the code shipped
-— the whole call cone contains no bounds check, no overflow trap and no call
-back into `__saw_rt_panic`. A harness case pins it on both machines by taking a
-compiler-raised bounds check and asserting the message arrives in three
-independent pieces.
+of merely unlikely: the whole call cone contains no bounds check, no overflow
+trap and no call back into `__saw_rt_panic`. A harness case pins it on both
+machines by taking a compiler-raised bounds check and asserting the message
+arrives in three independent pieces. In the kernel and in root, the panic seam
+writes its message to the console and then fails the run; it never hangs. A
+child's panic ends in a `shutdown` request through its System handle: the launch
+mask of §12 withholds `Shutdown`, so the child dies by `AccessDenied`, and a
+child started with no tag received `NO_HANDLE` in its first argument register,
+so its runtime has no System handle parked (even if the launcher gave it one),
+prints nothing and dies by `BadHandle`. Sawlang's runtime ABI (`sawc/rt/ABI.md`)
+freezes `__saw_rt_panic` as `noreturn`; the Saw seam produces `Never` with a
+conditionless `while { }` that has no `break`.
 
-**What blocked part 2, and what unblocked it** (DF-172e, now CLOSED). The seams
-were the one place the diet stalled on the LANGUAGE rather than on effort. Every
-part of the move had been probed and worked — the arena is expressible,
-`--runtime-provider` permits and checks the exports, and `sosrt` is already a
-dependency of both the kernel and every process — except one signature.
-`rt/ABI.md` freezes `__saw_rt_panic` as `noreturn`, and the only things that
-produced `Never` were `panic()`, which is what the seam IS, and an `extern`
-already declared noreturn, which Profile A lost when its finisher write became
-Saw. Design 177 supplied the missing producer: a conditionless `while { }` with
-no `break` types `Never`. The seams landed unchanged in every other respect,
-which is what the probing bought.
+**Who declares the runtime.** `@export`ing a frozen `__saw_rt_*` name needs
+the compile to say it implements the runtime ABI, so `tools/sos_runner.py`
+passes `--runtime-provider` for kernel images (a kernel is not a Blade
+package) and a process image carries `[package] runtime = true`. The seam
+bodies arrive from a dependency in both cases, which is sound because the flag
+describes the compile and a package build compiles its whole module graph into
+one unit.
 
-**Who declares the runtime.** `@export`ing a frozen `__saw_rt_*` name needs the
-COMPILE to say it implements the ABI (design 149), so `tools/sos_runner.py`
-passes `--runtime-provider` for kernel images (a kernel is not a Blade package)
-and a process image carries `[package] runtime = true`. The seam bodies arrive
-from a dependency in both cases, which is sound because the flag describes the
-compile and a package build compiles its whole module graph into one unit.
-
-## 6. Explicitly NOT in the kernel
+## 6. Explicitly not in the kernel
 
 Drivers (userspace via Interrupt + MMIO MemoryObjects), filesystems,
 network stacks, POSIX personality, dynamic linking/loading, package/
@@ -2032,426 +2183,406 @@ process management policy, time-of-day (a userspace service over the
 Timer primitive). The kernel knows objects, handles, rights, threads,
 memory words, and nothing else.
 
-## 7. Scheduling (ratified Aug 3)
+## 7. Scheduling
 
-**STATUS AFTER M2: none of this section is built** (design 178 D3, ratified
-Aug 15). The kernel schedules ONE round-robin FIFO — no levels, no ready
-bitmap — on a one-tick slice, and no shipping kernel image even arms the
-tick: `kernel/main.saw` arms none, and the harness kernels that test
-preemption arm their own. The §7 map stays a LOADER ARTIFACT: the loader parses the
-image's priority field and REPORTS it, no Process slot stores it, no syscall
-carries a band tag, and there is therefore no enforcement point yet. Two
-consequences worth reading here rather than deducing: `create_process` and
-its LAUNCH capability do not exist (M3, design 232 unit 2), and "nothing
-runnable" is not simply the idle case — it is idle when some interrupt line
-is bound and the ratified deadlock report otherwise (§9). Round-robin is
-ruled to stay through M3 (design 232 agenda item 10); what follows is what
-SMP-era work builds.
+**What is built.** The kernel schedules one round-robin FIFO — no levels, no
+ready bitmap — on a one-tick slice. The tick's period is kernel policy (§2.6);
+the tick re-arms from now, so a late tick is one tick, never a burst of
+catch-up. No shipping kernel image arms the tick: `kernel/main.saw` arms none,
+and the harness kernels that test preemption arm their own.
+
+- **The trap frame is the thread context**, so a context switch is `ktrap`
+  returning a different frame than it was called with: one switch point, at the
+  user-return boundary by construction, which enforces §9's
+  no-interrupts-in-kernel-mode rule by shape rather than by promise, and leaves
+  no half-saved state to protect. Root's first thread enters user mode through
+  `hal.resume_frame`, called from `kcore.start_process`; after that a thread
+  enters user mode when `ktrap` returns `pick_next`'s frame to the trap entry's
+  restore path, and through `hal.resume_frame` again only from
+  `resume_after_death`, after a teardown. Every thread belongs to a Process: a
+  kernel that could enter user mode without a Process would have syscalls no
+  handle table answers.
+- **Protection is installed at the switch.** A process's rows are data in its
+  slot. On a replay tier (`hal.prot_replay_at_switch()` true: Profile A, which
+  has a small fixed budget of numbered regions) the scheduler replays them when
+  the incoming thread's process differs from the installed domain. On Profile B
+  each process holds a persistent translation-table set, brought up to date when
+  its grant record is edited, and the switch is one table-base write. A
+  same-process switch reloads nothing.
+- **Nothing runnable is idle or deadlock.** The kernel idles iff something
+  outside the thread set can still wake somebody — a bound interrupt line or an
+  armed Timer (an unarmed Timer is not one: it will never fire) — and reports
+  deadlock otherwise (§9).
+
+**Not built: priorities.** The priority map is a loader artifact: the loader
+parses the image's priority field and reports it, no Process slot stores it, no
+syscall carries a band tag, and there is therefore no enforcement point.
+`SystemOp.ProcessCreate` exists (§8) and takes no priority map. The rest of
+this section specifies the scheduler that is not yet built.
 
 - **Fixed-priority preemptive, 8 system levels (0–7).** Ready queue =
-  per-level FIFO + a one-BYTE ready bitmap; pick-next = find-first-set
-  + pop, O(1), a handful of instructions on both profiles. Idle is NOT
+  per-level FIFO + a one-byte ready bitmap; pick-next = find-first-set +
+  pop, O(1), a handful of instructions on both profiles. Idle is not
   a level — a per-profile WFI loop runs when the bitmap is empty.
-- **Round-robin within a level**, fixed timeslice (pin, veto-able:
-  10 ms), tick from the per-profile timer (CLINT mtimer / ARM generic
-  timer — the same source the Timer object needs). Preemption is
-  immediate: readying a higher-priority thread switches on the way out
-  of the kernel; same-priority never preempts mid-slice.
-- **Priority bands, not raw levels.** Processes NEVER see or name
+- **Round-robin within a level**, fixed timeslice (provisionally 10 ms), tick
+  from the per-profile timer (CLINT mtimer / ARM generic timer — the same source
+  the Timer object uses). Preemption is immediate: readying a higher-priority
+  thread switches on the way out of the kernel; same-priority never preempts
+  mid-slice.
+- **Priority bands, not raw levels.** Processes never see or name
   system levels. The only priority surface is
   `enum Priority { Background, Low, Normal, High }` in the userspace
-  `sos` module, with FIXED ABI tags 0–3 (the wire representation never
-  changes). The thread-spawn syscall carries the band TAG; no syscall
+  `sos` module, with fixed ABI tags 0–3 (the wire representation never
+  changes). The thread-spawn syscall carries the band tag; no syscall
   accepts a raw system level.
 - **Per-process band→level map, kernel-side.** Each Process object
   holds a 4-slot map resolving band → system level; the kernel
-  resolves at thread-spawn — the map is the ENFORCEMENT point (a
+  resolves at thread-spawn — the map is the enforcement point (a
   process cannot escape its band with raw syscalls). A thread's
-  system priority is resolved ONCE at spawn and stored plain — the
+  system priority is resolved once at spawn and stored plain — the
   scheduler hot path is numeric-only. Initial default map:
   `Background→0, Low/Normal/High→1` (apps cluster at 0–1; levels 2–7
   are headroom for drivers/services). Low/Normal/High are declarative
   until a deployment differentiates them — intended.
-- **The map comes from build-time metadata + launcher policy.** The
-  process image declares its requested map in `sosimg` metadata (a
-  4-byte header field; Blade emits it from the package manifest, e.g.
-  `[sos] priorities = { background = 0, low = 1, normal = 1,
-  high = 1 }` in Saw.toml). Metadata is a REQUEST, not authority: the
-  launcher reads it and may honor, clamp, or override; the kernel
-  stores whatever map the launcher passes to `create_process` and
-  never parses metadata for policy. The root server's own map is
-  applied verbatim from its image at boot (the kernel parses that
+- **The map comes from build-time metadata + launcher policy.** The process
+  image declares its requested map in `sosimg` metadata (a 4-byte header field;
+  Blade emits it from the package manifest, e.g.
+  `[sos] priorities = { background = 0, low = 1, normal = 1, high = 1 }` in
+  Saw.toml). Metadata is a request, not authority: the launcher reads it and may
+  honor, clamp, or override; the kernel stores whatever map the launcher passes
+  to `process_create` and never parses metadata for policy. The root server's
+  own map is applied verbatim from its image at boot (the kernel parses that
   image anyway; root is trusted by construction).
-- **Launching is a capability.** `create_process` requires a
-  specialized LAUNCH capability, minted at boot to the root server.
-  Ordinary processes cannot create processes in v1 — they ask the
+- **Launching is a capability.** `process_create` requires the launch
+  capability, `SystemRight.ProcessCreate`, minted at boot to the root
+  server. Ordinary processes cannot create processes in v1 — they ask the
   launcher service over a pipe.
 - **The map is immutable after creation.** No remap syscall, no
   self-modification, no visibility into the map from inside the
   process (each process sees only its 4 named bands). Changing a
   running process's priority = restart it. (A future dynamic
-  re-prioritization design could add a LAUNCH-gated syscall without
+  re-prioritization design could add a launch-gated syscall without
   disturbing anything here.)
 - **No priority inheritance.** Inheritance chains through transferable
   PipeReplyHandles are ill-defined (the reply obligation migrates). The
-  mitigations: (a) the CONVENTION that servers run at ≥ the max
-  priority of their clients (the launcher assigns both, so this is
-  enforceable policy); (b) the **direct-switch fastpath** — on a
-  rendezvous handoff, switch straight to the receiver when runnable,
-  which removes most incidental inversion with no donation semantics.
-  MCS-style budgets/inheritance remain possible later designs.
-- **Uniprocessor kernel in v1**, both profiles (P4 is dual-core and
+  mitigations: (a) the convention that servers run at ≥ the max priority of
+  their clients (the launcher assigns both, so this is enforceable policy); (b)
+  the **direct-switch fastpath** — when a post or a reply readies a parked
+  receiver (a server parked on a Waiter its outlet is attached to, or a client
+  parked in a fused `Call`), switch straight to it when runnable, which removes
+  most incidental inversion with no donation semantics. MCS-style
+  budgets/inheritance remain possible later designs.
+- **Uniprocessor kernel in v1**, both profiles (the P4 is dual-core and
   QEMU can do SMP; SMP is its own future design — locking model,
   per-core queues — and nothing above precludes it).
 
-## 8. Thread & process lifecycle (ratified Aug 3)
+## 8. Thread & process lifecycle
 
-**BUILT M3 unit 2 — THE SECOND ADDRESS SPACE** (sawos design 2). Process
-creation is real, and the lifecycle it is built on is the one ruled Aug 16:
-**TWO PHASES, INERT UNTIL STARTED.** `SystemOp.ProcessCreate` (on the caller's
-SYSTEM handle, gated by `SystemRight.ProcessCreate` — the Aug-29 receiver ruling
-amended into §12: processes are minted by the System) takes two
-Memory regions — a read-only image blob and the child's destination RAM — and
-returns a process with an address space, a recorded entry and stack, and NO
-THREAD. `ProcessOp.Start` (on the CHILD's handle, gated by
-`ProcessRight.Start`) mints the first thread at that recorded entry and makes
-it runnable; the caller keeps running. The ordering IS the soundness argument
-for the launch flow: whatever a launcher gives a child must be complete at its
-first instruction, and the start call is the barrier that makes a
-half-populated table unrepresentable — with no synchronization invented. **A
-SECOND `start` is a `BadState` fault** (ruled): broken code, and the caller is
-the one that started it the first time. **A malformed image is a `BadImage`
-STATUS, not a fault** — the one caller-supplied thing that does not end the
-caller, because image bytes are DATA a launcher was handed rather than
+**Two phases, inert until started.** `SystemOp.ProcessCreate` (on the caller's
+System handle, gated by `SystemRight.ProcessCreate` — processes are minted by
+the System, §12) takes two Memory regions — a read-only image blob and the
+child's destination RAM — and returns a process with an address space, a
+recorded entry and stack, and no thread. `ProcessOp.Start` (on the child's
+handle, gated by `ProcessRight.Start`) mints the first thread at that recorded
+entry and makes it runnable; the caller keeps running. The ordering is the
+soundness argument for the launch flow: whatever a launcher gives a child must
+be complete at its first instruction, and the start call is the barrier that
+makes a half-populated table unrepresentable — with no synchronization
+invented. **A second `start` is a `BadState` fault**: broken code, and the
+caller is the one that started it the first time. **A malformed image is a
+`BadImage` status, not a fault** — the one caller-supplied thing that does not
+end the caller, because image bytes are data a launcher was handed rather than
 something it wrote (the `from(raw:)` precedent).
-**THE FAULT RULE BELOW NOW FORKS.** A thread fault still kills its process and
-the teardown still runs unconditionally; what changed is what happens after.
-Process 0 — root, the one image the kernel loads (§12) — stops the machine,
-byte-identically to every earlier era. **ANY OTHER PROCESS RESCHEDULES**: its
-threads are REMOVED from the ready queue (leaving everybody else's), its slabs
-and its protection rows go back, and the path ends in the scheduler rather than
-in a stopped machine. Children die with the machine when root ends, uncounted;
-observing a child's death as an event is unit 5.5's death notifications, BUILT
-since (the Process-waitable bullet below); either way a supervisor may read
-`get_status` through the handle it still holds —
-which outlives the child, because the teardown closes the handles in the DEAD
-process's table and not in its creator's.
-**`process.kill()` still has neither op nor right.** The second process exists
-now, so the argument that made it degenerate has expired; what it waits on is a
-ruling about what killing a process that is not the caller does to a scheduler
-that may be running its thread.
 
-**STATUS AFTER M2** (design 178 D4, ratified Aug 15). BUILT: the fault rule
-below, whole — a thread fault kills its process and the ratified teardown
-runs unconditionally — and `get_status` as `ProcessOp.GetStatus` gated on
-`ProcessRight.Wait`, answering the one fixed-width word (kind in the high
-bits, `Running` beside the three ratified ones, code in the low). **`Join`
-EXISTS, which supersedes the "no join syscall" line below**: D4 gave Thread
-`Start`/`Join`/`Exit`/`Yield`, and a joiner parks on the target's list and is
-answered exactly once through the funnel §2.2 describes. The observability
-this section reserved for stack reclamation therefore arrived a milestone
-early, because the wait/wake substrate needed a first consumer. **AND THE
-PROCESS HALF OF THE WAITABILITY LINE BELOW IS BUILT SINCE M3 UNIT 5.5** (sawos
-design 8), amending this paragraph's own "NOT BUILT" of the M2 era: a Process
-handle attaches, on `ProcessRight.Wait`, and its death is the terminal level.
-STILL NOT BUILT: a THREAD handle is not waitable — attaching one is a
-`NotWaitable` fault, and since M4 unit 3 closed §2.2's list over the four pipe
-arms it is the LAST kind in the tree for which that arm is a scope line rather
-than a statement about the object.
-**AND THE §8 WORD HAS A NEIGHBOUR SINCE sawos design 16**, which is worth
-stating where the word is defined because the two are read through the same
-handle and answer different questions. `get_status` answers WHETHER and HOW a
-process ended; `ProcessOp.Stats` answers what it COST, in traps, split by cause
-class (§2's Process row has the record and the counting rule). The two are
-separate rights on purpose — `ProcessRight.Wait` and `ProcessRight.Stats` — so
-a supervisor that may learn a child died need not be able to watch it work.
-Both survive the death for the same reason and for exactly as long: a `Gone`
-slot lives while some handle names it, so the fault column of a process that
-faulted is readable by the supervisor holding that handle, which is the only
-reader there can be. (`process.kill()` was named here too, on the M2-era reason
-that with one process it would be `Exit` under a second name. Unit 2 loaded the
-second process, so that reason expired; the deferral is stated ONCE, with its
-current reason, in the paragraph above.)
+**The fault rule, and how teardown ends.** A thread fault kills its process and
+the teardown runs unconditionally; what happens after forks. Process 0 — root,
+the one image the kernel loads (§12) — stops the machine. **Any other process
+reschedules**: its threads are removed from the ready queue (leaving everybody
+else's), its slabs and its protection rows go back, and the path ends in the
+scheduler rather than in a stopped machine. Children die with the machine when
+root ends, uncounted. A supervisor may read `get_status` through the handle it
+holds — which outlives the child, because the teardown closes the handles in the
+dead process's table and not in its creator's — or be woken by the death
+(below). The teardown (`end_process`) lives in the scheduler module beside
+`pick_next`, because the reschedule can idle, idling delivers, and delivery
+reaches back down into the copy doors; so the copy doors report a bad buffer,
+and the callers above the switch point terminate on it.
+
+**`process.kill()` has neither op nor right** (not yet enforced: `Exit` through
+another process's handle ends that process and strands the caller's thread,
+§2.7). It is specified below; what it waits on is a ruling about what killing a
+process that is not the caller does to a scheduler that may be running its
+thread.
+
+**What is built.** The fault rule, whole. `get_status` as
+`ProcessOp.GetStatus`, gated on `ProcessRight.Wait`, answering the one
+fixed-width word (kind in the high bits — `Running` beside the three below —
+code in the low). Thread `Start`/`Join`/`Exit`/`Yield`: a joiner parks on the
+target's list and is answered exactly once through the funnel §2.2 describes.
+Process waitability (below). Not built: a thread handle is not waitable —
+attaching one is a `NotWaitable` fault, and it is the last kind for which that
+arm is a scope line rather than a statement about the object.
+
+**The status word has a neighbour.** `get_status` answers whether and how a
+process ended; `ProcessOp.Stats` answers what it cost, in traps, split by cause
+class (§2.7). The two are separate rights on purpose — `ProcessRight.Wait` and
+`ProcessRight.Stats` — so a supervisor that may learn a child died need not be
+able to watch it work. Both survive the death. The status word lives in the
+`Gone` slot, which lives while some reference names it (a handle entry,
+including a minted sibling's entry, or an attachment), and the holders of those
+references are the only readers there can be. The counters live in the slot's
+stats-region row (§2.7), which `Stats` reads through the same handle and which a
+mapped stats-region reader can also see until a create reuses the slot.
 
 - **A thread fault kills its process.** The process exits with a
   fault status; there is no per-thread fault recovery (a faulted
   thread shares mutable state with its process — "keep running minus
   one thread" is silent corruption). Kernel teardown-on-exit/fault
-  (§2 table) reclaims everything unconditionally.
-- **No join syscall; no thread kill.** Threads are expected to be
-  POOL WORKERS: created at startup, draining task queues, dying at
-  process exit. Work completion is a task-level concept (channels/
-  Events), not a thread concept. A wedged/hostile thread is a
-  process-level problem by the fault rule.
+  (§2) reclaims everything unconditionally.
+- **No thread kill.** Threads are expected to be pool workers: created at
+  startup, draining task queues, dying at process exit. Work completion is a
+  task-level concept (channels/Events), not a thread concept. A
+  wedged/hostile thread is a process-level problem by the fault rule.
 - **Thread handles are waitables** (level-triggered ready when the
-  thread has FULLY exited) — the observability that join traditionally
+  thread has fully exited) — the observability that join traditionally
   provides, needed only for safe stack reclamation when a dynamic pool
   scales down (thread stacks are userspace memory passed to
   `thread_create`; reuse before real exit is a use-after-free). v1
-  fixed pools never use it.
+  fixed pools never use it. Not built.
 - **Process handles are waitables** (ready on exit, any cause) — the
-  primitive userspace supervision parks a Waiter on. **BUILT M3 unit 5.5
-  (sawos design 8), and it is the existing Process object becoming
-  waitable rather than a new kind.** §2.2's `waiter.add(handle, key)`
-  takes a Process handle
-  on `ProcessRight.Wait` — the SAME bit `get_status` below spends,
-  because being woken by a death and asking about one are the same
-  question at two tempos — readiness is the slot being `Gone` whatever
-  ended it, and the payload the record carries is exactly the status word
-  the next bullet defines (`WaitTag.Process`,
-  `WaitPayload.Process(status:)`). It adds no vocabulary to §8; it adds a
-  second DOOR onto §8's word. **DEATH IS A TERMINAL LEVEL**: the delivery
-  consumes nothing, so a waiter attaching after the death still wakes and
-  a second wait answers the same word — which is what makes supervision
+  primitive userspace supervision parks a Waiter on, and the existing Process
+  object being waitable rather than a new kind (§2.7). §2.2's
+  `waiter.add(handle, key)` takes a Process handle on `ProcessRight.Wait` —
+  the same bit `get_status` spends, because being woken by a death and asking
+  about one are the same question at two tempos. Readiness is the slot being
+  `Gone` whatever ended it, and the payload the record carries is exactly the
+  status word the next bullet defines (`WaitTag.Process`,
+  `WaitPayload.Process(status:)`). It adds no vocabulary to this section; it
+  adds a second door onto its word. **Death is a terminal level**: the
+  delivery consumes nothing, so a waiter attaching after the death still wakes
+  and a second wait answers the same word — which is what makes supervision
   race-free, since there is no window in which a death can be missed. The
   attachment counts as a reference on the process slot (§2's counted-kinds
   table), so a watched dead process's slot survives until the watcher
-  detaches. THE ORDERING: the kernel notifies once the status word is
-  recorded and BEFORE the teardown runs, but a notification only queues a
-  thread, so the woken supervisor runs after the teardown has completed
-  and no observer ever sees a half-dead process.
-- **`process.get_status()`**, gated on the WAIT right: ONE fixed-width
-  status word — kind in the high bits (`Exited | Faulted | Killed`),
-  code in the low bits (exit code, or a fault-cause tag). Detailed
-  fault forensics (faulting PC/address) is a later design.
-- **`process.kill()`**, gated on a KILL right. Cooperative-first
+  detaches. **The ordering:** the kernel notifies once the status word is
+  recorded and before the teardown runs, but a notification only queues a
+  thread, so the woken supervisor runs after the teardown has completed and no
+  observer ever sees a half-dead process. The deadlock predicate has no arm
+  for it: a death arrives from inside the thread set, so a supervisor parked on
+  a live child is not idle-and-doomed — the child's own threads are runnable —
+  and one parked on a dead child was already woken.
+- **`process.get_status()`**, gated on the wait right: one fixed-width status
+  word — kind in the high bits (`Exited | Faulted | Killed`), code in the low
+  bits (exit code, or a fault-cause tag). The kernel's fault report prints the
+  faulting PC and address on the console (`epc=`, `tval=`); fault forensics a
+  supervisor can read is a later design.
+- **`process.kill()`**, gated on a kill right. Cooperative-first
   teardown stays the norm; kill is the capability-gated escape hatch
   that makes userspace supervision real against wedged/hostile
-  processes. (This resolves §4's kill-tree question: kill exists,
-  process-granular only, no kernel trees — supervision topology is
-  userspace's.)
+  processes. This answers §4's kill-tree question: kill is
+  process-granular only, with no kernel trees — supervision topology is
+  userspace's. Not built.
 
-## 9. Interrupt delivery (ratified Aug 3)
+## 9. Interrupt delivery
 
 - **Mask-on-fire, ack-to-rearm.** IRQ fires → kernel masks the line +
   marks the Interrupt object ready (wakes per Waiter rules). At most
-  one UNACKED fire exists per Interrupt, ever. `irq.ack()` unmasks;
+  one unacked fire exists per Interrupt, ever. `irq.ack()` unmasks;
   a still/again-asserting device re-fires — correct level semantics.
-  Level-triggered Waiter readiness means NO interleaving loses a
+  Level-triggered Waiter readiness means no interleaving loses a
   fire (readiness persists until consumed).
-- **Ack is a RELEASE.** The discipline: everything that touches device
-  registers happens BEFORE ack; post-ack code runs only on data
+- **Ack is a release.** The discipline: everything that touches device
+  registers happens before ack; post-ack code runs only on data
   already extracted. Under it, a second worker entering the pre-ack
-  section while the first runs its post-ack tail is PIPELINING (a
+  section while the first runs its post-ack tail is pipelining (a
   throughput feature), not a race. Drivers that need post-ack register
   work serialize with a Mutex — their choice; the kernel does not
   enforce single-servicing.
-- **v1 canonical driver shape: ONE task owns one Interrupt.** A single
+- **v1 canonical driver shape: one task owns one Interrupt.** A single
   cooperative servicer can never race itself — the ack-position
   question evaporates. Multi-threads-on-one-Waiter is for servers
   multiplexing independent streams, not for a device IRQ.
 - **The serve idiom needs no kernel support**: a `sos`-module closure
-  wrapper that acks ON HANDLER EXIT gets non-reentrancy directly from
+  wrapper that acks on handler exit gets non-reentrancy directly from
   mask-until-ack (the line is masked for the whole handler body — the
-  "mask while handler runs" mechanism IS the interrupt mask). An
+  "mask while handler runs" mechanism is the interrupt mask). An
   explicit mid-handler ack is the deliberate opt-in to pipelining.
-- **Combined form (pin): `waiter.wait(ack: irq_handle)`** — atomically
-  ack, then block. Pure syscall-halving for the hot loop (one syscall
-  per interrupt); not needed for correctness (level-triggering already
-  covers the gap). One optional arg on wait. STILL A PIN after M2 built
-  the object: the echo driver runs the two calls separately and the
-  transcript does not notice.
-- **BUILT M2, and what the implementation added to this section**
-  (design 178 unit 4):
-  - **The wait ANSWER carries the LINE** — `WaitPayload.Interrupt(line:)`
-    through §2.2's copy-out record. There is no fire COUNT, because the
-    mask-on-fire rule makes it always one; a dispatcher parked on several
-    lines gets which one without a side table, exactly as it gets the key.
-  - **An ACK WITH NO FIRE OUTSTANDING IS A FAULT**, not a tolerated no-op.
-    The only way to learn about a fire is to be told about one, so an
-    extra ack is a servicer that will ack the NEXT fire without servicing
-    it — a dropped byte or a wedged device with no first symptom.
-  - **THERE IS NO MASK OP AND NO MASK RIGHT.** Masking is the kernel's
-    half of the cycle; a driver that could mask at will could leave a line
-    masked, which is a denial of the device with no diagnostic. What a
-    driver controls is its own device's interrupt-enable register, through
-    the window it was granted.
-  - **"NOTHING RUNNABLE" STOPPED MEANING DEADLOCK.** An Interrupt is the
-    first readiness that arrives from outside the set of runnable threads,
-    so the kernel idles when any line is bound and reports the ratified
-    deadlock otherwise. It idles by PARKING THE CORE AND POLLING rather
-    than by taking the trap, which leaves design 178's D2 exactly as it
-    was: the kernel still never takes an interrupt in kernel mode.
-  - **THE MMIO GRANT IS DECLARED BY THE IMAGE** (finale constraint 1,
-    ruled Aug 16, user): a `sosimg` device record, emitted from the
-    driver package's own manifest, authorized against a window the board
-    publishes. It is the M2 PLACEHOLDER for §2.5's Mapping and is that
-    section's first migration case.
-    **RETIRED IN TWO STEPS, AND BOTH ARE DONE.** M3 unit 4 made the grant
-    an `IoMemory` a driver OBTAINS from its boot set and maps into itself
-    (§2.5's migration case); M3 unit 6 made it a capability a LAUNCHER
-    HANDS OVER — see the driver-child bullet below, which is where a
-    driver's authority now comes from.
-- **BUILT M3 unit 6 (sawos design 9), and it is the section's finale: A
-  DRIVER IS A CHILD PROCESS.** Every earlier §9 sentence is unchanged —
-  mask-on-fire, ack-to-rearm, ack-is-a-release, one task one Interrupt —
-  and what changed is WHO the driver is:
-  - **A DRIVER'S DEVICE ARRIVES FROM ANOTHER PROCESS.** Root drains the
-    console's register page as an `IoMemory`, `give`s it to a child under
-    a tag (spending the universal `Transfer` bit on the window and
-    `ProcessRight.Give` on the child), and the CHILD maps it into ITSELF
-    with `Process.map(iomemory:)`. The lean is deliberate: what crosses
-    the boundary is authority over a device, and where the row goes is
-    then the holder's own business. Root never maps the window, never
-    binds the line, and never learns the UART's address.
-  - **THE DRIVER PROGRAM DID NOT CHANGE.** The two child packages are the
-    two root-as-driver packages, driver body for driver body — same
-    registers, same enable bit, same drain-before-ack loop, same echoed
-    bytes, same line number — differing only in that the window arrives
-    by give, that they end with `Process.exit` (a driver child holds no
-    `SystemRight.Shutdown` and should not), and that they are linked at
-    the child base. Both twins stay in the suite, so the claim is two
-    transcripts side by side rather than an assertion.
-  - ~~**THE TWO RIGHTS A DRIVER SPENDS ON ITSELF ARE NOT ITS LAUNCHER'S TO
-    WITHHOLD**~~, which was a recorded finding rather than a design.
-    `ProcessRight.InterruptBind` and `ProcessRight.Map` arrive on the
-    handle `SystemOp.ProcessSelf` mints, and that op minted the ONE Process
-    default set; a launcher's keep mask reached the child's SYSTEM handle,
-    not the Process handle the child derives from it. Withholding them
-    would need `ProcessSelf` to take a keep mask of its own.
-    **CLOSED M4 unit 4** (sawos design 18; `designs/010` agenda 7b): it takes
-    one. `ProcessSelf` reads a keep mask out of its argument register and
-    INTERSECTS it with the default set, so a child narrows its own Process
-    handle at the moment it derives it — and `Give` takes the same mask in
-    the same shape, so ATTENUATE-AT-GIVE and attenuate-at-derive are one
-    rule spelled twice rather than two mechanisms. The intersection is
-    FAIL-CLOSED in both places (§3): a bit the source lacks is silently
-    ignored rather than an error, because a request for authority that
-    does not exist is answered by not granting it. What stays true is the
-    ADDRESSEE: a launcher still cannot reach into the handle its child
-    derives — only the child can narrow that one — so the gap this bullet
-    named is closed by giving the DERIVER the verb, not by giving the
-    launcher reach. `tests/child-narrow` is the proof.
-  - **THE SUPERVISOR PARKS ON THE DEATH, NOT ON A DEADLINE.** A driver
-    waits on a real serial port, so a timer would have to be guessed at —
-    and §9a's one bounded exception to the console handover is a kernel
-    whose armed tick narrates over a process that owns the device. Unit
-    5.5's Process waitable is what makes a launcher able to arm nothing.
-- **BUILT M4 unit 5 (sawos design 21): A DRIVER IS A SERVICE, and this is
-  the chapter §9 has been writing toward.** M2 put a driver in userspace,
-  M3 unit 4 made its window a capability, M3 unit 6 made a LAUNCHER hand
-  that capability over. Unit 5 gives the driver CLIENTS: two other
-  processes read and write the console through a pipe protocol, and hold
-  no device authority at all.
-  - **THE DEVICE HALF OF THIS SECTION IS UNTOUCHED.** The service driver
-    is the unit-6 child driver with a server face bolted on: same
-    register block, same `listen`, same drain, same ack-is-a-release
-    ordering — everything §9 ratifies still happens in exactly one
-    process. What is new sits entirely above the line: where the bytes GO
-    after the drain, and where a write comes FROM.
-  - **THE INTERRUPT IS ONE ARM OF A `wait`, BESIDE THE MESSAGES.** A
-    service driver attaches its Interrupt and its `PipeOutlet` to ONE
-    Waiter, so a device event and a client request arrive through the
-    same door and are told apart by the record's tag. §2.2's aggregator
-    was ratified for exactly this and needed nothing added: a driver is
-    the first program in the tree with two genuinely different wake
-    sources.
-  - **A READ THE DEVICE CANNOT ANSWER YET IS A HELD OBLIGATION** rather
-    than a poll, a queue of its own, or a kernel notion of blocking I/O.
-    §2.1's one-shot is the driver's only per-request state, and dropping
-    one is how a client is told the answer will never come.
-  - **THE DRIVER STILL OWNS THE CONSOLE ALONE**, which is what keeps §9a
-    true with three processes in the machine: the two clients write
-    through the protocol, so exactly one address space names the
-    transmitter and the handover protocol's single-owner rule is
-    unweakened by the number of writers.
-- **BUILT M3 unit 1.5 (sawos design 1), and what it amends here.**
-  Delivery gains a THIRD entry point beside the trap path and the idle
-  poll: a PREEMPTION POINT inside a long kernel operation. The sentence
-  design 178's D2 is now written in:
-  - **The hardware never delivers an interrupt in kernel mode; the kernel
-    ASKS, at named points.** The first half is unchanged and still
-    enforced by both machines — an interrupt arriving in kernel mode is
-    each HAL's kernel-bug path, which stays a live tripwire rather than
-    becoming a delivery path. What is new is that a long operation POLLS,
-    through the same `irq_poll` the idle path already needed and the same
-    delivery funnel. No new seam, no brief unmask, no nested trap frame.
-  - **A point interrupts LATENCY, NOT ATOMICITY.** A reschedule the
-    delivery signals is honored where it always was, at the user-return
-    boundary; the operation still completes before the switch it may have
-    motivated.
-  - **The placement rule is one reviewable sentence per site**: a point
-    is legal where no in-flight invariant spans state the IRQ path
-    touches. The design carries the audit of every kernel-mode loop, and
-    the verdicts live as comments at the sites.
-  - **One guard backs the rule mechanically** — a kernel flag set around
-    the delivery funnel's body and checked first at every point, so a
-    point reached from INSIDE delivery is inert. It exists because the
-    byte movers are shared: the loader's segment placement is preemptible
-    boot context and §2.2's record copy-out runs in IRQ context.
-  - **What still takes no point**, recorded rather than hidden: the
-    console write loops and the UART ready spin (device-drain-bounded, a
-    long diagnostic line IS masked latency), the controller and grant
-    walks (half-configured hardware is IRQ-shared state in flight), the
-    bounded slab scans, and process teardown (the scheduler is dismantled
-    across it).
+- **Combined form (provisional): `waiter.wait(ack: irq_handle)`** — atomically
+  ack, then block. Pure syscall-halving for the hot loop (one syscall per
+  interrupt); not needed for correctness (level-triggering already covers the
+  gap). One optional arg on wait. Not built: drivers run the two calls
+  separately.
+- **The wait answer carries the line** — `WaitPayload.Interrupt(line:)`
+  through §2.2's copy-out record. There is no fire count, because the
+  mask-on-fire rule makes it always one; a dispatcher parked on several lines
+  gets which one without a side table, exactly as it gets the key.
+- **An ack with no fire outstanding is a fault**, not a tolerated no-op. The
+  only way to learn about a fire is to be told about one, so an extra ack is a
+  servicer that will ack the next fire without servicing it — a dropped byte
+  or a wedged device with no first symptom.
+- **There is no mask op and no mask right.** Masking is the kernel's half of
+  the cycle; a driver that could mask at will could leave a line masked, which
+  is a denial of the device with no diagnostic. What a driver controls is its
+  own device's interrupt-enable register, through the window it was granted.
+- **An interrupt line is readiness from outside the thread set**, so a bound
+  line keeps "nothing runnable" from being a deadlock (§7). The kernel idles
+  by parking the core and polling rather than by taking the trap.
+- **The interrupt seam.** Each HAL exposes a small set of names and the kernel
+  reaches interrupts through those and nothing else — among them `intc_init`,
+  `is_interrupt`, `irq_line_valid`, `irq_claim`/`irq_complete`,
+  `irq_mask`/`irq_unmask`, `irq_poll`, `wait_for_irq`, the timer seam of §2.6,
+  and a selftest line. `ktrap` decides interrupt / fault / syscall in that order
+  — an interrupt's instruction has not run, so it must never reach the syscall
+  return path that steps the saved PC — and `service_irq` is the one arch-free
+  entry: claim, rearm or mask, run the hook, complete.
 
-### 9a. The console handover protocol (ratified Aug 16, user)
+**The hardware never delivers an interrupt in kernel mode; the kernel asks,
+at named points.** The first half is enforced by both machines — an interrupt
+arriving in kernel mode is each HAL's kernel-bug path, which stays a live
+tripwire rather than becoming a delivery path. Delivery has three entry
+points: the trap path from user mode, the idle poll, and a preemption point
+inside a long kernel operation, which polls through the same `irq_poll` and
+the same delivery funnel. No new seam, no brief unmask, no nested trap frame.
 
-Both v1 machines have ONE console UART, and both the kernel and a driver
-process can drive it. Unstated, that is a flaky-test mystery — two
-writers on one device interleave mid-word and neither is wrong.
+- **A point interrupts latency, not atomicity.** A reschedule the delivery
+  signals is honored where it always is, at the user-return boundary; the
+  operation still completes before the switch it may have motivated.
+- **The placement rule is one reviewable sentence per site**: a point is
+  legal where no in-flight invariant spans state the IRQ path touches. Every
+  kernel-mode loop carries its placement verdict as a comment at its site.
+- **One guard backs the rule mechanically** — a kernel flag set around the
+  delivery funnel's body and checked first at every point, so a point reached
+  from inside delivery is inert. It exists because the byte movers are shared:
+  the loader's segment placement is preemptible boot context, and §2.2's
+  record copy-out runs in IRQ context.
+- **The mechanism** is `preempt_point()` beside the idle poll, that guard, and a
+  `PREEMPT_STRIDE` stride on the long-op movers every bulk copy goes through. A
+  point delivers, so it sits above the byte loops it drives in the module order
+  while delivery reaches back down to them; that cycle is why the cadence is its
+  own module (`kcore.preempt`) rather than a point written inside `copy_bytes`.
+- **What takes no point**: the console write loops and the UART ready spin
+  (device-drain-bounded; a long diagnostic line is masked latency, accepted),
+  the controller and grant walks (half-configured hardware is IRQ-shared state
+  in flight), the bounded slab scans, and process teardown (the scheduler is
+  dismantled across it).
+
+**A driver is a child process.** Every rule above holds; what the tree adds is
+who the driver is.
+
+- **A driver's device arrives from another process.** Root drains the
+  console's register page as an `IoMemory`, `give`s it to a child under a tag
+  (spending the universal `Transfer` bit on the window and `ProcessRight.Give`
+  on the child), and the child maps it into itself with
+  `Process.map(iomemory:)`. What crosses the boundary is authority over a
+  device, and where the row goes is then the holder's own business. Root never
+  maps the window, never binds the line, and never learns the UART's address.
+- **The driver program is the same wherever it runs, apart from three things.**
+  The child driver packages are the root-as-driver packages, driver body for
+  driver body — same registers, same enable bit, same drain-before-ack loop —
+  differing only in that the window arrives by give, that they end with
+  `Process.exit` (a driver child holds no `SystemRight.Shutdown` and should
+  not), and that they are linked at the child base. Both twins stay in the
+  suite. Each driver comes in two packages, one per device rather than per
+  machine, because a driver is its device.
+- **The rights a driver spends on itself are the driver's to narrow.**
+  `ProcessRight.InterruptBind` and `ProcessRight.Map` arrive on the handle
+  `SystemOp.ProcessSelf` mints, and `ProcessSelf` takes a keep mask (§2.8), so
+  a child narrows its own Process handle at the moment it derives it; `Give`
+  takes the same mask in the same shape, so attenuate-at-give and
+  attenuate-at-derive are one rule spelled twice. The intersection is
+  fail-closed in both places (§3): a bit the source lacks is silently ignored,
+  because a request for authority that does not exist is answered by not
+  granting it. A launcher still cannot reach into the handle its child derives
+  — only the child can narrow that one (`tests/child-narrow`).
+- **The supervisor parks on the death, not on a deadline.** A driver waits on
+  a real serial port, so a timer would have to be guessed at — and §9a's one
+  bounded exception to the console handover is a kernel whose armed tick
+  narrates over a process that owns the device. The Process waitable (§8) is
+  what lets a launcher arm nothing.
+
+**A driver is a service.** Two other processes read and write the console
+through a pipe protocol (§2.1) and hold no device authority at all.
+
+- **The device half of this section is untouched.** The service driver is the
+  child driver with a server face: same register block, same `listen`, same
+  drain, same ack-is-a-release ordering — everything this section specifies
+  still happens in exactly one process. What is new sits entirely above the
+  line: where the bytes go after the drain, and where a write comes from.
+- **The interrupt is one arm of a `wait`, beside the messages.** A service
+  driver attaches its Interrupt and its `PipeOutlet` to one Waiter, so a
+  device event and a client request arrive through the same door and are told
+  apart by the record's tag. §2.2's aggregator needs nothing added for it.
+- **A read the device cannot answer yet is a held obligation** rather than a
+  poll, a queue of its own, or a kernel notion of blocking I/O. §2.1's
+  one-shot is the driver's only per-request state, and dropping one is how a
+  client is told the answer will never come.
+- **The driver still owns the console alone**, which keeps §9a true with
+  several processes in the machine: the clients write through the protocol,
+  so exactly one address space names the transmitter and the handover
+  protocol's single-owner rule is unweakened by the number of writers.
+
+### 9a. The console handover protocol
+
+Both v1 machines have one console UART, and both the kernel and a driver
+process can drive it. Unstated, that is a flaky-test mystery — two writers on
+one device interleave mid-word and neither is wrong.
 
 - **Boot**: the kernel owns the device outright and narrates.
-- **Handover**: entering user mode writes ONE marker line, and it is the
-  last thing the kernel says on its own initiative. After it, THE PROCESS
-  OWNS THE DEVICE.
+- **Handover**: entering user mode writes one marker line, and it is the
+  last thing the kernel says on its own initiative. After it, the process
+  owns the device.
 - **Reclaim, on diagnostics only**: a fault report, a process teardown, a
   panic, or an interrupt on a line nothing is bound to. Interleaving
   there is acceptable because there is no longer a transcript to protect.
 
-A `SystemOp.DebugPrint` is NOT a violation: that is the process asking
+A `SystemOp.DebugPrint` is not a violation: that is the process asking
 the kernel to place a byte, and the process is the one sequencing it.
 What the protocol forbids is the kernel narrating over a process that is
 using the device. The one bounded exception is a kernel that arms a
 timer, whose first few ticks are narrated after handover — which is why a
 case whose transcript matters after handover arms none.
 
-## 9b. Kernel sync primitives: IntrSpinLock (ratified Aug 6)
+## 9b. Kernel sync primitives: IntrSpinLock
 
-- **std owns `SpinLock<T>`** (design 149): safe cross-context lock, any
-  environment with real atomics, userspace included. **The KERNEL owns
-  `IntrSpinLock<T>`** — SpinLock composed with interrupt masking, which
-  is privileged (mstatus.MIE / DAIF) and therefore cannot exist in
-  userspace even in principle.
-- Semantics (the spin_lock_irqsave discipline): `lock` SAVES current
-  interrupt state and disables BEFORE spinning (an ISR must not arrive
-  mid-spin and deadlock on the same core); the epilogue RESTORES, never
+- **std owns `SpinLock<T>`**: safe cross-context lock, any environment with
+  real atomics, userspace included. **The kernel owns `IntrSpinLock<T>`** —
+  SpinLock composed with interrupt masking, which is privileged (mstatus.MIE /
+  DAIF) and therefore cannot exist in userspace even in principle.
+- Semantics (the spin_lock_irqsave discipline): `lock` saves current
+  interrupt state and disables before spinning (an ISR must not arrive
+  mid-spin and deadlock on the same core); the epilogue restores, never
   blindly re-enables — nesting works, irqs-off callers stay irqs-off.
   Saved flags are per-acquisition, carried by the closure scope. The
   body inherits `sync` and carries the latency contract: irqs-off time
-  IS interrupt latency — short sections only.
+  is interrupt latency — short sections only.
 - Mechanism: two per-arch HAL one-liners, `hal_irq_save() -> Flags` /
   `hal_irq_restore(Flags)`, under `hal/<arch>/kernel/`. The CAS
   stays even on uniprocessor (SMP-future correctness; under `+a` it is
-  cheap; a FAILED acquire on uniprocessor signals reentrancy — panic,
+  cheap; a failed acquire on uniprocessor signals reentrancy — panic,
   never spin forever).
-- Timing: DESIGN ratified Aug 6. **STILL UNBUILT after M3 unit 1.5, and
-  correctly so.** The M2-era interrupt work landed under design 178's
-  D2 — interrupts are taken from user mode only, enforced by both
-  machines rather than intended by the kernel, and the idle path POLLS
-  rather than taking the trap (§9) — so the kernel held no state an ISR
-  could interrupt and there was no critical section for the type to
-  protect. **Kernel interruptibility has since been BUILT (sawos design
-  1) and did not change that**, which is the amendment worth recording:
-  it landed as explicit PREEMPTION POINTS, and a point IS the assertion
-  that state is consistent, so it needs no lock — what it needs is a
-  placement sentence per site plus one reentrancy guard for the code the
-  two contexts share. SMP — sequenced after pipes — is what still forces
-  the lock, and the point placements are now a REAL map of where it must
-  go rather than a promised one.
+- **Not built, and correctly so.** Interrupts are taken from user mode only,
+  enforced by both machines, and the idle path polls rather than taking the
+  trap (§9), so the kernel holds no state an ISR could interrupt. Kernel
+  interruptibility is explicit preemption points, and a point is the
+  assertion that state is consistent, so it needs no lock — what it needs is a
+  placement sentence per site plus one reentrancy guard for the code the two
+  contexts share. SMP is what will force the lock (§11), and the point
+  placements are a real map of where it must go.
 
-## 10. Userspace runtime: HandlerGroup + the wake bridge (ratified Aug 3)
+## 10. Userspace runtime: HandlerGroup + the wake bridge
 
-Saw's sequential surface is UNCHANGED: `pipe.send()`, `receive()`,
+Not built: `HandlerGroup` is userspace runtime work rather than kernel
+surface, and a process wires a Waiter by hand. What follows specifies it.
+
+Saw's sequential surface stays as it is: `pipe.send()`, `receive()`,
 `read()` suspend in place on plain tasks — colorless straight-line
 code stays the substrate, and TaskGroup remains exactly what it is
-today (a lifetime/join scope for tasks on a thread pool). The
-event-driven EDGE of a process gets a second, distinct construct:
+(a lifetime/join scope for tasks on a thread pool). The
+event-driven edge of a process gets a second, distinct construct:
 
-- **`HandlerGroup`** — a group of waiting HANDLES running on a task
+- **`HandlerGroup`** — a group of waiting handles running on a task
   pool; the userspace face of the kernel Waiter, one-to-one (TaskGroup
-  ↔ threads/tasks; HandlerGroup ↔ Waiter/handles). Deliberately NOT
+  ↔ threads/tasks; HandlerGroup ↔ Waiter/handles). Deliberately not
   bolted onto TaskGroup: attachments are persistent subscriptions by
   default (removed, never "joined" — §2.2's `AttachMode.OneShot` is the
   opt-in exception), and K workers service M handles (no
@@ -2464,993 +2595,286 @@ event-driven EDGE of a process gets a second, distinct construct:
   // Deinit: detach all, close unclaimed handles, cancel workers
   ```
 - **Ownership: move-in, forced by the language.** Handles are NoCopy
-  and references are non-escaping — a HandlerGroup CANNOT store
+  and references are non-escaping — a HandlerGroup cannot store
   `&Timer`, so group-owns-while-attached is the only representable
   design, exactly mirroring unique kernel handles. `add` returns a
-  distinct-typed `AttachmentId` (NOT authority — meaningless without
+  distinct-typed `AttachmentId` (not authority — meaningless without
   the group). `remove(id) -> Box<any Waitable>?` returns ownership
   (recover the concrete type with `take<T>()`; typed sugar can come
   later); None = stale id.
-- **Per-attachment NON-REENTRANCY, guaranteed**: one handle's handler
+- **Per-attachment non-reentrancy, guaranteed**: one handle's handler
   never runs concurrently with itself (in-service flag; readiness
   arriving mid-handler is deferred and re-dispatched on completion).
   Generalizes the one-task-per-Interrupt decision to every handle
   kind as a stated guarantee.
-- **The handler BORROWS the source per invocation** (`&Source`, a
+- **The handler borrows the source per invocation** (`&Source`, a
   scoped non-escaping lend — the `with_ref` shape), which is sound
-  precisely BECAUSE of non-reentrancy: at most one borrow live per
+  precisely because of non-reentrancy: at most one borrow live per
   attachment. Per-kind signatures: Timer → `(&Timer, fired)`;
   Pipe → `(&Pipe, msg, PipeRequestHandle)` — the PipeRequestHandle is
-  fresh PER MESSAGE and moves in (forwardable, per §2.1 delegation);
+  fresh per message and moves in (forwardable, per §2.1 delegation);
   Interrupt → `(&Interrupt)` with ack-on-exit default (§9).
-- **Cross-handle parallelism up to `workers`.** Parallelism WITHIN one
-  source stays explicit user code (spawn from the handler body into a
-  TaskGroup) — the concurrency decision is visible, never implicit in
-  a dispatch engine. Handler bodies are ordinary task code and may
-  suspend; a suspended handler parks its worker, others keep
-  dispatching. Backpressure is free: all workers busy → readiness sits
-  (level-triggered) and rendezvous senders block; nothing buffers,
-  nothing drops.
-- **The wake bridge is ONE mechanism**: a parked task's wake-word is
-  the Waiter KEY supplied at attach; kernel readiness returns the key;
+- **Cross-handle parallelism up to `workers`.** Parallelism within one source
+  stays explicit user code (spawn from the handler body into a TaskGroup) — the
+  concurrency decision is visible, never implicit in a dispatch engine. Handler
+  bodies are ordinary task code and may suspend; a suspended handler parks its
+  worker, others keep dispatching. Backpressure is free: all workers busy →
+  readiness sits (level-triggered) and the connection's staging ring fills; a
+  `post` to a full ring answers `WouldBlock`, and the fused `send`
+  (`PipeInletOp.Call`) parks on the inlet's room-to-post level (§2.1). Nothing
+  drops.
+- **The wake bridge is one mechanism**: a parked task's wake-word is
+  the Waiter key supplied at attach; kernel readiness returns the key;
   the executor marks that task runnable. Handlers, blocking-shaped
   calls, and raw waits all ride the same path (this is what §2.2's
   word-sized key was designed for). Implementation freedom (runtime
-  brief, not spec): whether a HandlerGroup owns its own kernel Waiter
+  design, not spec): whether a HandlerGroup owns its own kernel Waiter
   or registers through the process runtime's reactor Waiter — the
   kernel permits both (one Waiter per handle; many Waiters per
   process).
 
-## 11. What is built, and what remains
+## 11. What is not built, known limits, and the plan
 
-- ~~Design (with user): root server responsibilities~~ RESOLVED §12
-  (ratified Aug 5).
-- **Orchestrator pins SETTLED by M1/M1b/M2, and still settled after M3:** the
-  rights-word bit assignments and the per-object op tables are concrete and
-  kernel-internal (`kernel/abi/`, one file shared by the dispatch and
-  the wrappers — §5.7's vDSO discipline is what keeps them renumberable, and
-  M3 renumbered inside it twice without a userspace edit: `Manage` vacated bit
-  1 for `Mint`, and five kinds joined `ObjType`);
-  the per-profile kernel memory layout is two linker scripts under
-  `hal/<arch>/kernel/` over per-type static slabs; the `sosimg`
-  header is concrete at v3, the §7 priority-map field included, beside the
-  build-emitted REGION TABLE at v2 whose kind column M3 unit 4 added.
-- **Orchestrator pins: ONE STILL OPEN after M5, and it is no longer the
-  memory one.** ~~Where the PHYSICAL-REGION refcount lives (§5.9)~~ **CLOSED
-  BY M5 UNIT 5** (sawos design 28), which is the entry this bullet carried
-  from M1 through three milestone closes. The history is worth its two lines,
-  because each rung answered a neighbouring question and left this one: M3
-  unit 4 made something ALLOCATE physical regions (`Memory.Split`) without
-  answering it, and M3 unit 5 built a refcount that answered a DIFFERENT
-  question — it counts the handle entries naming a SLAB SLOT, and reaching
-  zero returns the slot, not the range. What M5 added is the SECOND count
-  (installed grant rows, `MemorySlot.maps`) and the pool ROOT back-reference
-  that says where a range goes: the bytes return at the second zero, adjacent
-  free ranges coalesce, and `split` serves the free list before the cursor.
-  Byte accounting is the root's own ledger (`out_bytes` beside
-  `pool_free_bytes`), quotas stay OBJECT-counted, and `IoMemory` is untouched
-  — §5.9 above carries the whole answer, and design 11's F2 nod closes with
-  it. ~~Also open: §2.1's message limits~~ **CLOSED BY M4** — pinned here
-  at a 64-byte body / 4 handles, SUPERSEDED by `designs/010`'s ruling 6, and
-  BUILT by M4 unit 1 as `PIPE_BODY_BYTES` (128), `PIPE_MSG_HANDLES` (4, unit
-  4) and `PIPE_INFLIGHT` (2 × `MAX_THREADS`), all build defines with
-  `static_assert`s pinning §2.1's ranges — the first two in `kernel/abi/`
-  because a caller sizes buffers against them, the third in `kcore.limits`
-  because nobody outside the kernel can see the ring. STILL OPEN: the §7
-  priority map plus root's bootstrap band map, which the loader parses and
-  REPORTS while no Process slot stores either.
-- **What the kernel does NOT have after M4.** One area per line, with the
-  section that specifies it. The M3 and M4 rows below are struck as the two
-  ladders landed them; design 232 was the M3 plan of record and
-  `designs/010` is M4's, and each is pointed at rather than duplicated.
-  - ~~**Clock and Timer**~~ BUILT by design 232 unit 1 — see the M3 entry in
-    the roadmap below. A process can sleep.
-  - ~~**A second process**~~ BUILT by sawos design 2 (M3 unit 2).
-    `process_create(image:memory:)` + `start()` are real, §12's
-    loader-above-boot rule is EXERCISED — one loader, two doors, differing
-    only in region parameters and failure vocabulary — and the protection
-    domain is RELOADED per process at the scheduler's one switch point.
-  - ~~**The launch flow — a child that RECEIVES something**~~ BUILT by sawos
-    design 4 (M3 unit 3), and it is what turns a second address space into a
-    second PROCESS. `give(handle, tag:)` moves a capability into a child's
-    table under a word the launcher chooses and the kernel never reads;
-    `start(boot_tag:)` resolves that word to the child-side handle and puts
-    it in the child's first argument register; `BootHandleNext` drains the
-    caller's own PER-PROCESS set, so a child's boot sequence is literally a
-    receive loop. THE BOOT SET FREEZES AT START — a give afterwards is
-    `BadState` — and that ordering is the whole soundness argument: what a
-    launcher furnishes must be complete at the child's first instruction, and
-    the barrier makes a half-populated table unrepresentable with no
-    synchronization invented. A child handed nothing is STILL the ruled
-    "legal-but-doomed" sandboxed compute process, which is a feature and the
-    default.
-  - ~~**Attenuation as an OPERATION, and a second handle onto one object**~~
-    BUILT by the same unit, and the two are one op: `MINT_OP` (§3) mints a
-    SIBLING onto the object a handle names, in the caller's own table, with
-    rights the source's INTERSECTED with a KEEP MASK. It closes design 3's
-    finding 2, it makes §3's monotonic attenuation something a HOLDER performs
-    rather than a property of what the kernel minted, and it is what lets a
-    launcher hand a child a MASKED SYSTEM HANDLE — so a child bootstraps
-    exactly as root does (§12's symmetry), prints without owning a device, and
-    cannot stop the machine. `Mint` is itself maskable, so proliferation is
-    revocable. What the flow still lacks, named rather than pending: a
-    handle cannot be narrowed BELOW `Transfer` and still be given (the give
-    checks that bit on the thing given, so a receiver holds it too — inert
-    today, a ruling for the unit that gives a child a pipe); and dynamic
-    transfer to a RUNNING process, which **M4 UNIT 4 BUILT** — handles ride
-    messages over pipes to a receiver expecting them, and the `Transfer` bit
-    is checked at the SENDER exactly as `give` checks it (§2.1).
-  - ~~**Memory / IoMemory / Mapping and `map()`**~~ (§2.5) **BUILT by sawos
-    design 6 (M3 unit 4)**, over unit 2's first slice. **A MAPPING IS AN
-    INSTALLED GRANT ROW**, which is what the unit costs so little: SOS does
-    not translate (§5.5), so the grant record M3 unit 2 built for the
-    SCHEDULER is the record `map` edits and the object is a handle onto one
-    row of it. Three kinds because the operations differ — `Memory`
-    (`Split`/`Map`), `IoMemory` (`Carve`/`Map`, a distinct KIND so a device
-    region cannot produce a cacheable mapping by construction), `Mapping`
-    (`Unmap`, and only it unmaps). Derivation is one cut FROM THE FRONT for
-    RAM (the parent is the pool cursor; arbitrary-offset carving is refused by
-    the SHAPE) and non-exclusive for device windows (§2.5's "handed out many
-    times"). Access is PER MAPPING, so double-mapping one region RO here and
-    RW there is expressible and allowed. **THE LIVE-DOMAIN RULE** is the one
-    piece of law the unit added: a grant-record edit reloads IMMEDIATELY when
-    that domain is the installed one, because `run_thread` skips equal domains
-    and a revocation that waited for a reschedule would not revoke. The M2
-    device-grant placeholder is RETIRED IN-TREE — both driver packages obtain
-    their window instead of declaring it, same bytes, same line number — with
-    the sawlang-side `SegFlag.Device` deletion left as a pin-bump backlog
-    entry. What unit 4 left absent was FREE-ON-LAST-REFERENCE — a split was
-    permanent until teardown and teardown returned SLOTS, not ranges — and
-    **M3 UNIT 5 BUILT IT AND NARROWED IT**: the slot comes back inside the
-    release that drops the last reference, and the RANGE still comes back to
-    nobody, because quotas count objects rather than bytes in v1 (§2.5 states
-    the narrowing in the refcount clause's own words).
-    **AND M3 UNIT 6 (sawos design 9) FINISHED IT, in the two directions §2.5
-    named and one the ladder ruled on the way past.** SHARED MEMORY is real —
-    one region mapped into two processes, written from each side and read from
-    the other — and the launcher installs the second row itself, so a process
-    can be given ACCESS without possession of the region object. A DEVICE
-    WINDOW travels the other way: `give(iomemory:)` moves the console's page to
-    a driver child, which maps it into itself and echoes the harness's bytes on
-    both profiles. And EXECUTABLE BECAME AN AUTHORITY —
-    `MemoryRight.MapExecute` gates `MapAccess.Execute` per handle, and
-    `Write | Execute` in one row is a `BadArg` — which is the one piece of law
-    this unit added and is written out at §2.5. What stays absent is unchanged:
-    a freed Memory returns its SLOT and not its BYTES. A region REACHING a
-    running process is no longer absent — **M4 unit 4 made `Memory` and
-    `IoMemory` two of the six kinds a message may carry** (§2.1, §2.5).
-  - **Quotas** (§12's creation-authority pin, which M2 ANSWERED with a
-    factory-capability rights bit rather than a quota) — the per-process
-    table, `QuotaExceeded`, and creator-pays accounting are design 232
-    unit 5. A full slab answers `SosStatus.NoResource` today.
-    **BUILT M3 UNIT 5 (sawos design 7 D-3).** The table is
-    `kcore.objects`' two flat per-process rows (used and limit, one column
-    per `QuotaKind`), charged at every allocation site that answers
-    `NoResource` — POLICY FIRST, so a process at its budget is told
-    `SosStatus.QuotaExceeded = 7` and only one still within it can meet
-    the machine's edge. Accounting is CREATOR-PAYS, against the slot's own
-    `process` field, with ONE ruled exception: a Mapping charges the
-    TARGET, because what it consumes is that process's grant-row budget
-    and charging the caller would let a launcher's allowance gate another
-    process's domain size. ROOT'S ROWS ARE UNLIMITED — root is init and
-    its policy cap IS the machine, so the slab is what refuses it — except
-    its mapping row, which is clamped to its own free grant rows; that
-    clamp is what makes agenda item 8's ruled `fatal` (a `map()` meeting
-    the physical wall with quota headroom left) unreachable rather than
-    merely unlikely. A child gets `kcore.limits`' documented defaults;
-    there is no per-create quota argument in v1.
-    **M4 UNIT 1 ADDED THE TENTH COLUMN, `QuotaKind.Pipe`** (sawos design 13),
-    and it is the first row that counts a CONNECTION rather than an object with
-    one name: `ProcessOp.PipeCreate` charges it once and the credit lands when
-    BOTH of the connection's reference columns reach zero and the slab slot goes
-    back. Charging per ENDPOINT was considered and refused — two ends of one
-    connection are two handle entries, which the `Handle` row already counts, so
-    a second charge would make a launcher that keeps both ends pay twice for one
-    slot and would make giving an end away look like a refund. Creator-pays
-    means a child GIVEN an end spends nothing here, which is what lets a server
-    child hold many sessions under a small pipe budget.
-    **M4 UNIT 2 ADDED NO COLUMN AT ALL, and that is a ruling rather than an
-    omission** (sawos design 14 D-1). A one-shot pair — a `PipeReply` claim and
-    its `PipeRequest` obligation — is RING-SLOT STATE inside a connection the
-    creator was already charged for, so the scarce thing an exchange occupies is
-    already paid for: `QuotaKind.Pipe` covers the row and its whole staging ring,
-    and a per-exchange row would charge a client twice for the same kilobytes.
-    What an exchange DOES spend is `QuotaKind.Handle`, twice — one entry for the
-    claim at the post and one for the obligation at the take — which is the
-    ordinary rule that a capability costs a table row, and which is also what
-    design 10 ruling 4 means by "zero one-shot quota rows on the fast path": when
-    `Call` fuses the composition, the claim is kernel-internal and even those two
-    entries stop being minted, a difference of HANDLE TRAFFIC and of nothing
-    else.
-    **M4 UNIT 3 ADDED NO COLUMN EITHER, and it is the same argument one level
-    out** (sawos design 15). An ATTACHMENT is a slab slot too, and it is bounded
-    by `MAX_ATTACHMENTS` rather than by a quota — which unit 3 did not change,
-    because an attachment already costs the ONE thing quotas count on this
-    axis: a Waiter to hold it, charged at `QuotaKind.Waiter`. (**Since M5 unit
-    6 that bound is a FLOOR**: `Attachments` is one of the donatable kinds, so
-    `MAX_ATTACHMENTS` is what the kernel boots with and a deployment raises it
-    — the same one-clause rider every compiled limit in `kcore.limits` now
-    carries. The argument above is unaffected: what a quota counts here is
-    still a Waiter.) What the unit's
-    CONSUMING attach does change is the handle side, and in the caller's favour:
-    a client that gives its claim to a subscription spends no `QuotaKind.Handle`
-    row at all while the request is outstanding, which is design 14 finding 5's
-    answer — `MAX_HANDLES` had been the real bound on a client's in-flight
-    depth, and it stops being one.
-    **M4 UNIT 4 ADDED NO COLUMN EITHER, AND WROTE ONE OFF INSTEAD** (sawos
-    design 18; `designs/010` ruling 5 as re-ruled Sep 2 — take-at-post). A
-    handle riding in a message is a `QuotaKind.Handle` row that stops being
-    anybody's for as long as the message is staged: the post UNBINDS the entry,
-    which credits the sender at the one place a binding is destroyed, and the
-    take or the delivery MINTS it, which charges the taker. So the charge does
-    not travel with the message — it is written off at one end and raised at the
-    other, which is design 14 D-4's orphan vocabulary arriving at a second kind
-    and is the same shape as an object that outlives its creator.
-    **THE HOLE IS BOUNDED, WHICH IS WHY IT IS SAFE**: a connection's ring is
-    `PIPE_INFLIGHT` slots and each carries at most `PIPE_MSG_HANDLES` handles,
-    so at most that many rows can be uncharged per connection — and a connection
-    cost a `QuotaKind.Pipe` row, and every object a staged reference names
-    already occupies the slab slot it was charged for. Quota <= wall therefore
-    still holds and the SLAB is still what refuses the next allocation; nothing
-    a process can do with messages conjures one.
-    **AND IT IS THE TAKER'S BUDGET THAT REFUSES, ATOMICALLY**: a delivery mints
-    up to `PIPE_MSG_HANDLES` + 1 entries at once, so the whole batch is
-    pre-flighted against the taker's table AND its `Handle` row before anything
-    is minted — a partial charge would leave a message half-delivered, which is
-    the one state ruling 5 exists to make unrepresentable. A receiver at its
-    budget is told `QuotaExceeded` and the message stays staged, references and
-    all. Creator-pays is untouched by all of this: it decides who pays for an
-    OBJECT, and a rendezvous only ever moves who pays for a NAME.
-    **AND THE TEARDOWN NOW WRITES OFF RATHER THAN FORCE-FREEING** (`designs/010`
-    ruling 10, landed by design 14 D-3). `end_process` used to sweep the Memory,
-    IoMemory and Pipe slabs by charged process and zero every slot, whatever
-    another process still held; those three sweeps are DELETED. A dying process
-    drops its own references (the close-all) and its quota rows are written off
-    in one line — D-4's orphan vocabulary, arriving as the degenerate case it was
-    landed in anticipation of — so an ORPHANED OBJECT IS CHARGED TO NOBODY until
-    it frees, and a slot outlives its creator for exactly as long as anybody
-    holds a reference. The books still balance and the machine stays bounded
-    because quota <= wall: the SLAB is what refuses the next allocation. What
-    replaced the sweeps is not a sweep by ownership but a reap of what NOBODY
-    NAMES — necessary because the close-all deliberately counts without freeing
-    (D-5), so deleting them outright would strand a slot whose last handle the
-    dying process happened to hold — and it frees through `free_object`, so each
-    kind's own credit runs, which the old sweeps never did for a slot another
-    process had been charged for. The five counted sweeps stay (their numbers are
-    in the teardown line), and Mapping stays with them because its handles carry
-    no `Transfer` and so cannot outlive their owner at all.
-  - ~~**Pipes and PipeReplyHandle**~~ (§2.1) — **BUILT BY M4, WHOLE** (sawos
-    designs 13, 14, 15, 17, 18, 21 and 22, over `designs/010`'s twelve rulings;
-    the ladder is the roadmap's M4 entry below). §2.1 is no longer a surface with
-    no implementation, and since unit 4 it is no longer a surface with promises in
-    it: the CONNECTION is an object, request/reply is a kernel primitive, all four
-    pipe kinds are §2.2 waitables, the dominant client and server shapes are
-    single traps, messages carry handles, and a driver serves two client processes
-    through the result. §2.1 states what exists and the `Pipe` row of §2's table
-    records which slice built which part; what this section owes BEYOND them is
-    four facts that are §11's own rather than §2.1's:
-    - **THE LEDGER ANSWERED THE STRUCTURAL QUESTION, TWICE.** Design 10 D-1's role
-      split is real — `PipeInlet` and `PipeOutlet` are two counted kinds over ONE
-      slab row with two reference columns — and `PipeReply`/`PipeRequest` repeat
-      the shape one level down over one RING SLOT, so "the writers went to zero"
-      and "the exchange was abandoned" are both the reference count design 7
-      already built rather than a second ledger. Four new kinds, ONE new slab and
-      ONE new quota column (`QuotaKind.Pipe`) between them.
-    - **ONE MODULE SEAM DISAPPEARED** (unit 3). `kcore.wake` STOPPED EXISTING: a
-      delivery now drops a counted reference (a one-shot attachment detaches at
-      its copy-out) and a dropped reference now delivers (a column reaching zero
-      raises a peer-gone level), so delivery and the ledger became mutually
-      recursive and merged into `kcore.refs`. The module list is one seam shorter
-      and the altitude rule that produced it is unchanged.
-    - **THE WAKE DISPATCH GREW ONE ARM AND NEVER A SECOND PROTOCOL.** A claim is
-      either a subscription's or a parked thread's, and exactly one function in
-      the kernel tells them apart; unit 3.5's parked fused caller and unit 4.5's
-      parked resolver are the SAME shape to it, and `end_process` carries the
-      mirror for both. That is what kept `WaiterOp` itself untouched through three
-      units that each added a park — and unit 3.5's `ReplyWait` resumes with §2.2's
-      record into §2.2's buffer, a second door onto one wake protocol.
-    - **AND AGENDA 7b RODE ALONG** (unit 4): `Give` and `SystemOp.ProcessSelf`
-      both take a KEEP MASK now, which closes §9's recorded gap about a driver
-      child's own rights and answers design 11's finding F1 — the one doc-level
-      promise M3 made that M3 could not keep.
-  - ~~**A parked thread whose Waiter dies**~~ **BUILT M4 UNIT 0 (sawos design
-    12)**, and it is the doctrine above arriving before anything that needs
-    it. `free_object`'s Waiter arm gained a second last rite: reaching zero
-    references now WAKES every thread on the blocked list with the new
-    `SosStatus.Revoked`, where M3 left it `Blocked` forever and recorded the
-    strand as legal-but-doomed (design 7's As-built finding 2, which the
-    ruling answers "wake, don't count"). **NO RECORD IS WRITTEN** — a
-    delivery copies out then answers `Ok`, a revocation answers `Revoked` and
-    copies nothing, because nothing became ready — which is also why the wake
-    lives beside the free rather than in the delivery module: it touches no
-    process memory, so it needs neither the copy door nor its altitude. THE
-    COUNT IS THE GATE, NOT THE RELEASE (a minted sibling still live frees
-    nothing and wakes nobody), and the walk is the WHOLE blocked list rather
-    than the pop a readiness does. The husk alternative was weighed and
-    rejected; the deadlock predicate gained no arm; the typed surface gained
-    none either, since `Waiter.wait` already answers
-    `Result<WaitResult, SosStatus>`. One harness row per profile
-    (`waiter-revoked`), 160 runs.
-  - ~~**Handle close and generations**~~ **THE LIFECYCLE TIER IS BUILT**
-    (§3; sawos design 3, M3 unit 2.75). Three mechanisms landed together
-    because each alone is broken — mint-per-call without release is a leak
-    by design, release without generations is aliasing, and a release op
-    beside copyable wrappers is a stale-fault factory. What exists now:
-    one UNIVERSAL `RELEASE_OP` intercepted between the table lookup and
-    the kind match; a split handle word carrying a per-slot GENERATION
-    that survives the unbind, so §3's stale-handle detection is real; every
-    getter MINTING a fresh handle; §4's owning `NoCopy` tier over every
-    wrapper, so DROP IS RELEASE; and one slab reclaiming on release — a
-    `Gone` process's slot, once no handle names it (closing unit 2's pend
-    at `alloc_process`, so the process TABLE bounds concurrent processes
-    again — `MAX_PROCESSES` was that bound until M5 unit 6b made it the
-    FLOOR of one, `process_slots_usable()`; §2's `Process` row carries the
-    correction). What is STILL absent is CLOSE, which is a different act: it
-    ends the OBJECT for everyone and exists only on kinds with an end-state.
-    **M4 UNIT 1 WAS EXPECTED TO BRING IT AND DID NOT, WHICH IS A FINDING
-    RATHER THAN A DEFERRAL** (sawos design 13): a connection END is closed by
-    releasing the LAST handle onto it, and that is the reference column
-    reaching zero — a fact the ledger already maintains at every bind and
-    unbind. A `close` op beside it would be a second way to reach the same
-    state, reachable while a sibling handle is still live, and would have to
-    answer what a minted sibling then names. So drop-is-release IS the close
-    for the kinds M4 has, `let _ = move inlet` is how a program says it, and a
-    per-kind close right has nothing left to gate. Whether any later kind
-    genuinely needs one is open on its own terms. **THE REFCOUNTED
-    RECLAMATION THIS ENTRY DEFERRED IS BUILT (M3 unit 5, sawos design 7
-    D-1)**: every countable slab reclaims on the last release now, not
-    only a `Gone` process's — and that one arm is no longer special, since
-    its handle-table scan became the count every other kind keeps. What
-    stays absent from this tier: CLOSE, and per-kind release rights (which
-    would be a new universal bit and are explicitly not built). What stays
-    absent from the RECLAMATION is stated at §2.5: a freed Memory returns
-    its SLOT and not its BYTES, because quotas count objects rather than
-    bytes in v1.
-  - **Priorities** (§7) — nothing of §7 is built; round-robin was ruled to
-    stay through M3 (design 232 agenda item 10) and it did. M4 did not take
-    it up either, exactly as planned: `designs/010` left the §7 band map in
-    its standing tail beside SMP, FP-in-userspace and the vDSO true-mapping,
-    and the tail came out of the milestone unchanged.
-  - ~~**Process waitability**~~ **BUILT M3 UNIT 5.5 (sawos design 8)** — the
-    existing Process object became §2.2's fourth waitable, which is what the
-    ruling asked for and the whole of what the unit is: no new kind, no new
-    right (`ProcessRight.Wait` gates the attach exactly as it gates
-    `get_status`), no new status vocabulary (`WaitTag.Process` carries §8's
-    own word). **DEATH IS A TERMINAL LEVEL** — a delivery consumes nothing —
-    so attach-after-death wakes, a second wait answers again, and supervision
-    has no lost-edge race; the attachment is a counted reference (§2's
-    counted-kinds table), which is what makes that sound against design 3
-    D-3's slot reclaim. The kernel notifies after the status word is recorded
-    and before the teardown, and the wake only QUEUES, so a supervisor never
-    observes a half-dead process. The deadlock predicate deliberately gained
-    no arm: a death arrives from INSIDE the thread set, so a supervisor parked
-    on a live child is not idle-and-doomed — the child's own threads are
-    runnable — and one parked on a dead child was already woken.
-  - **Thread waitability, and `kill`** (§8) — attaching a THREAD is still a
-    `NotWaitable` fault (and so is attaching a MemoryObject, which
-    has no state that could become ready); `kill` still has no op and no
-    right. A supervisor may now learn a child died either way: by READING
-    `get_status` through the handle it holds, or by being WOKEN through an
-    attachment on the same handle.
-  - **`IntrSpinLock` (§9b), SMP** — still unbuilt, and correctly so: a
-    preemption point IS the assertion that state is consistent, so
-    nothing yet has a critical section for the type to protect. It used to
-    say SMP waits for pipes; pipes landed at M4 and SMP was left in
-    `designs/010`'s standing tail deliberately, so what it waits for now is
-    a milestone that takes the tail up. **Kernel interruptibility itself is BUILT** (sawos
-    design 1, M3 unit 1.5): design 178's D2 holds in its sharpened form —
-    the hardware never delivers in kernel mode, and the kernel asks at
-    named points inside long operations. §9 records what that amended.
-  - **`HandlerGroup`** (§10) — userspace runtime work rather than kernel
-    surface, and unbuilt: a process wires a Waiter by hand today.
-  - **DMA CONFINEMENT — the IOMMU driver and CRITICAL PROCESSES** (§2.5's
-    TCB note, ruled sawlang#178 round 4). Nothing of it is built and nothing
-    in the tree needs it yet: a `map` fences a driver's CPU and not its
-    device's bus mastering, so a DMA-capable device's driver is a TCB member
-    until an IOMMU exists, and both v1 boards' consoles are programmed-I/O.
-    Of the two prerequisites the ruling named, M3 landed the first —
-    process-death notifications (§8, unit 5.5) — and the second, a process
-    root marks CRITICAL whose exit for any reason faults the system, is
-    unbuilt. M4+ (`designs/010` explicitly excludes the IOMMU driver from
-    M4 and lists it as death-notification consumer 2).
-  - **The mapped vDSO** (§5.7) — delivery is still static linking, which
-    changes nothing about the shape.
-- **Roadmap (brief numbers assigned at dispatch — the design-78/79
-  references in §5b are stale). PATH NOTE, since the entries below name
-  directories: the tree FLATTENED at the sawos split (sawlang#238 D-e,
-  Aug 28) — what these entries built as `sos/kernel/`, `sos/hal/`,
-  `sos/rt/` and `sos/root/` are `kernel/`, `hal/`, `rt/` and `root/` in
-  this repository, and every path in this document is spelled the way the
-  tree spells it today (corrected wholesale at M3 unit 7).** M0 riscv32
-  QEMU target (design 112) →
-  M1 riscv32 QEMU boot-to-root-server → M1b arm64 EL1 parity + HAL
-  extraction → M2 the concurrent kernel, landed once and two-profile
-  tested → M3 the multiprocess kernel (design 232, run as sawos designs
-  1-9 and CLOSED by design 11) → M4 pipes (`designs/010`, RULED Aug 30 —
-  the plan of record; a seven-rung ladder from waiter revocation to
-  driver-as-service, run as sawos designs 12-18 and 20-23 and CLOSED by
-  design 24, this sweep) → M5, whose anchor is
-  `designs/019-m5-memory-story.md` and whose scoping session is what
-  follows this sweep's integration.
-  - **M0 DONE (design 112):** Profile A substrate is live —
-    `kernel/` (boot.S + virt.ld + rt.c runtime seams + a Saw `main.saw`
-    whose NS16550A UART driver is built on `UnsafeMemory<_, Device>`),
-    booting under `qemu-system-riscv32 -M virt -bios none` at RAM base
-    0x8000_0000, printing a banner and exiting cleanly via `sifive_test`
-    (0x5555 = exit 0). A boot trap stub FAILs the run (never hangs) on a
-    fault, and the freestanding panic seam writes to the UART then FAILs.
-    `make sos-test` (tools/sos_runner.py) is the mechanical loop the kernel
-    briefs build on. sawc's freestanding profile gained the enabling
-    dead-code-strip (internalize non-exports + per-symbol sections) so a
-    kernel links only what it reaches; the Saw object is `rv32i`/ilp32
-    soft-float (llvmlite's default for the triple), boot.S/rt.c assembled
-    `rv32imac_zicsr`.
-    M1 changed two things in this description: the M0 trap stub is now the
-    KERNEL-mode half of a two-way trap entry (`kernel_fault`, byte-identical
-    behaviour), and `kernel/main.saw` no longer prints-and-exits — it loads
-    root. The M0 banner/panic/trap cases are still green as
-    `no_root_image` / `panic_seam` / `trap_fault`.
-  - **M1 DONE (design 140), branch PARKED for user review:** riscv32
-    boot-to-root-server. A real `mtvec` handler with `mscratch` as the mode
-    witness (0 in the kernel, `&_trapframe` in U-mode) splits a syscall from a
-    kernel bug in one branch; a U-mode trap saves 31 GPRs + `mepc` into a
-    32-word frame, runs the Saw handler `ktrap`, and resumes. M-mode kernel /
-    U-mode root, isolated by PMP TOR regions — U-mode default-deny does the
-    work, so the kernel, the UART and the finisher are protected by never being
-    granted. EVERY syscall is an object op per §5.7: a0 = handle, a7 = op,
-    args a1-a5, and dispatch is §3's shape verbatim — handle-table lookup ->
-    object type -> op table -> rights check -> op. The v1 object is the
-    **System** singleton (§2) with `debug_print` and `shutdown(status)`, gated
-    on `SystemRight.Debug` / `.Shutdown`; root receives its handle in the first argument
-    register at entry (§12's boot handle set, one handle wide today). A bad
-    handle, a bad op or a missing right returns a `SosStatus` and the
-    process runs on; a FAULT is fatal and prints a cause tag (M0's never-hang
-    discipline, kept). API ownership follows the vDSO discipline: the typed
-    wrappers are a public `sos` module OWNED AND EXPORTED BY THE KERNEL PACKAGE
-    (`kernel/sysapi/`), every number lives in one kernel-internal package
-    (`kernel/abi/`) shared by the dispatch tables and those wrappers, and a
-    process links `sos` and never writes a number. A per-op C-ABI surface
-    (`sos_system_debug_print`, `sos_system_shutdown`) sits beside the Saw one
-    over a fixed-arity raw `sos_syscall1` over the per-arch stub — one chain,
-    three altitudes. The §6 boot protocol is
-    concrete: a flat **sosimg** (16-byte header + 20-byte segment records, all
-    fixed-width little-endian per design 47, carrying the §7 priority map),
-    emitted by a Blade `emit = "sosimg"` build target reading the package's
-    `[sos]` manifest section, appended to the kernel image as a `.payload` blob
-    with linker-symbol bounds. The layout lives ONCE, in the shared
-    `libs/imgformat/` package: Blade consumes it as a path dependency and emits
-    bytes through it, the kernel consumes it through `--module-path` and reads
-    images by overlaying the same structs as `UnsafeMemory` typed views, with
-    `static_assert` pinning the sizes on both sides. `root/` is a real
-    separate Saw package built by Blade; it prints its banner THROUGH a System
-    op — it holds no device grant and could not print any other way — and calls
-    `shutdown(0)`. The kernel validates an image in full before placing a byte
-    of it, so a segment aimed at the kernel is refused rather than obeyed.
-    `make sos-test` is 11 cases including the two-image boot, a root that
-    oversteps its grant, and one that makes bad calls and checks the statuses.
-    Structure: `kernel/core/` is shared by every kernel image, which
-    keeps them all on the same trap path — one module per seam since the
-    Aug-17 split, with `lib.saw` the facade that re-exports what an image
-    entry names; `rt/common/` (Saw — since design
-    172 part 2 the runtime seams and the arena too) and
-    `rt/common_c/support.c` (the C that must stay C: `mem*` and the atomic
-    libcalls) are shared by the
-    kernel and every process; and the architecture lives in
-    `hal/riscv32/{kernel,user}/`, each with an ABI.md, so M1b (design 162)
-    ADDS `hal/arm64/...` without moving any of it.
-  - **M1b DONE (design 162), branch PARKED for user review:** arm64 EL1
-    parity and the HAL extraction. The M1 feature set above runs identically
-    on `qemu-system-aarch64 -M virt -cpu cortex-a53`: twelve cases per
-    architecture, twenty-four total, either failing red. The M1 claim that
-    "the architecture lives in `hal/`" turned out to be half true — the
-    kernel still held a UART register block, an `mcause` enum, PMP wrappers,
-    `mepc + 4` and the board's memory map — so unit 1 moved all of it behind
-    a module the kernel imports as `hal` (§5b has the summary). Profile B's
-    HAL: `boot.S` (EL1 entry, sixteen exception vectors, `eret` to EL0),
-    `sink.c` (PL011, semihosting `SYS_EXIT`, and the static identity map),
-    `lib.saw` (the Saw surface: driver, trap frame, ESR decode, memory map),
-    `virt.ld`, and a user-side `svc` stub — each with an ABI.md. Four things
-    worth knowing beyond the brief:
-    (a) **FP/SIMD must be enabled at EL1 before any compiled code runs.**
-    `CPACR_EL1.FPEN` traps Advanced SIMD out of reset and LLVM vectorizes
-    ordinary loops, so the first page-table loop faulted before the vectors
-    could report it. FP state is NOT saved across a trap; with one thread and
-    no preemption nothing observes that, and M2's context switch is where it
-    stops being true.
-    (b) **Semihosting, not PSCI, stops the machine.** PSCI `SYSTEM_OFF`
-    always exits 0 and this harness asserts on exit STATUS — one case encodes
-    its whole verdict in the number.
-    (c) **Cortex-A53 is ARMv8.0** and has no LSE atomics, contrary to the
-    brief's decision-3 note; `ldxr`/`stxr` exclusives cover everything the
-    kernel and `SpinLock` need, so nothing was blocked.
-    (d) **The two profiles report the same fault names.** ESR's exception
-    class plus the data-abort direction bit decode to `store-access-fault`
-    and friends, so the harness asserts one string against both machines.
-    Also landed: sosimg **v2** with an `arch` tag (a wrong-profile image is a
-    clean load error, tested both ways), a loader check that a segment is
-    aligned to the target's grant granularity (a page here, four bytes
-    there — without it root's code could become writable because its data
-    started 200 bytes later), the kernel's hex output following the target's
-    WORD width instead of a hardcoded eight digits, Blade reading ELF64 as
-    well as ELF32 and refusing an address past the format's 32-bit field
-    rather than truncating it, and `[sos.<triple>]` manifest sections so one
-    root package builds for both profiles with `src/` unchanged.
-  - **M2 DONE (design 178), integrated Aug 16:** the concurrent kernel —
-    threads, a scheduler, Event, Waiter, the Interrupt object, and a UART
-    echo driver running in USERSPACE on both machines. Six object kinds
-    where M1b had one, and the dispatch shape of §3 did not move for any
-    of them. Four units, each per-arch-gated; the harness ends at 32 cases
-    per architecture, 64 runs, either machine failing red.
-    (a) **The interrupt seam.** Each HAL gained twelve names and the kernel
-    reaches interrupts through those and nothing else (`is_interrupt`,
-    `irq_claim`/`irq_complete`, `irq_mask`/`irq_unmask`, `timer_start`/
-    `timer_rearm`/`timer_pending`, and a selftest line) — the timer trio was
-    reshaped by M3 unit 1, see that entry. `ktrap` decides
-    interrupt / fault / syscall IN THAT ORDER — an interrupt's instruction
-    has not run, so it must never reach the syscall return path that steps
-    the saved PC — and `service_irq` is the one arch-free entry: claim,
-    rearm or mask (§9), run the hook, complete.
-    (b) **Thread and Process (D4), the scheduler (D3).** The trap frame IS
-    the thread context, so a context switch is `ktrap` RETURNING A
-    DIFFERENT FRAME than it was called with: one switch point, at the
-    user-return boundary by construction, which is D2 enforced by shape
-    rather than promised, and no half-saved state to protect.
-    `kcore.start_process` is the only way into user mode — a kernel that
-    could enter it without a Process would have syscalls no handle table
-    answers, which is what M1 was. Scheduling is ONE round-robin FIFO with
-    no levels and a one-tick slice (§7 carries the status note).
-    **The faults ruling landed whole** (178 pin 6, ratified Aug 8):
-    `BadHandle`, `BadOp` and `AccessDenied` are no longer statuses but
-    `FaultReason` tags that TERMINATE the offending process while the
-    kernel stays up, reports, and runs the ratified teardown. It had to be
-    uniform — an unbound handle names no KIND, so there is no op table to
-    ask which rule applies — and it reverses the M1 line above. What
-    survives as a status is `NoResource`, which a caller could not have
-    known. Op tables and rights sets are named for the §2 object, spelled
-    out (`SystemOp`/`ProcessOp`/`ThreadOp` beside `SystemRight`/…; ruled
-    at review, user, Aug 15).
-    (c) **Event and Waiter (D5), and two funnels.** Level-triggered is an
-    ABSENCE: nothing records that a waiter has been told, so `Wait` SCANS
-    the attachment set — and three ratified sentences fall out of that one
-    decision rather than being coded separately (a signal before anyone
-    waits is not lost, an event still ready wakes the next waiter, and
-    attaching an already-ready handle reports immediately). `write_result`
-    became the only place an answer reaches a frame, its three entry points
-    named in its docstring, which is what makes "exactly one write per
-    syscall" checkable; `waitable_slot` is the only place waitability is
-    decided, one exhaustive match, so a further waitable kind cannot be
-    added silently. Three riders amended ratified text: an argument
-    encoding is API (`event_create(mode:)`), the wait ANSWER became a
-    validated copy-out record through the `copy_out` funnel (§2.2), and
-    `remove` names the KEY with keys unique per Waiter (§2.2).
-    (d) **The Interrupt object and the milestone proof.** The second
-    waitable kind moved the attachment OUT of the waitable into a third
-    object — (waiter, kind, target, key) — because a Waiter's set has to be
-    ONE list; what varies per kind is four small functions in one place,
-    each exhaustive. "Nothing runnable" split in two (§9): idle when any
-    line is bound, the ratified deadlock report otherwise, with the idle
-    path POLLING rather than taking the trap, which is what leaves D2
-    untouched. The device window is a `SegFlag.Device` record in the
-    driver's own `sosimg`, authorized against the one window each board
-    publishes (§2.5's placeholder, §9's grant bullet), and the console
-    handover protocol is §9a. The harness types four bytes AT the
-    emulator's serial port, one at a time behind a delay so the driver must
-    PARK — which is what puts the whole ladder under test rather than the
-    echo alone — and they come back out echoed by a PROCESS, on riscv32 and
-    arm64 both. The kernel's whole part is that it granted the window the
-    image declared, routed the line, and woke the thread; none of those
-    knows what a UART is. Two driver packages, one per DEVICE rather than
-    per machine, because a driver IS its device.
-    (e) **The native floor moved, and the reasons did not** (§5c has the
-    arc). Every line M2 added is reason 1: one interrupt-class mask
-    register on Profile A and four timer system registers on Profile B,
-    `sos_syscall3` per profile (an op that answers with a value needs one
-    and the C ABI declares no aggregate return), and `sos_wait_for_irq`
-    per profile (`wfi` is an instruction). Assembly went DOWN, because a
-    thread context built in Saw needs no register-clearing prologue.
-  - **M3 IS DONE (design 232, run in sawos designs 1-9 and 11 — design 10 is
-    M4's sketch, not a rung) — units 1, 1.5, 2,
-    2.75, 3, 4, 5, 5.5, 6 and 7 all landed, and unit 7 is what closes the
-    milestone.** THE LEDGER, one line per rung, each naming the sawos
-    design that ran it: unit 1 the Clock and Timer (design 232's own unit,
-    parked before the split); unit 1.5 kernel interruptibility
-    (`designs/001`); unit 2 the second process (`designs/002`); unit 2.75
-    the handle lifecycle — release, generations, mint-per-call and the
-    owning `NoCopy` tier (`designs/003`); unit 3 `give` and `MINT_OP`
-    (`designs/004`, with the sysapi split at `designs/005`); unit 4 Memory,
-    IoMemory and Mapping (`designs/006`); unit 5 the reference count and
-    quotas (`designs/007`); unit 5.5 death notifications (`designs/008`);
-    unit 6 the driver child and `MemoryRight.MapExecute` (`designs/009`);
-    and unit 7 this docs sweep (`designs/011`), which rewrote §3 around NO
-    AMPLIFICATION, amended §5.7 and §12, recorded the DMA-TCB bound at
-    §2.5, refreshed this section, and moved no transcript row — a docs unit
-    that moves one has changed something it claimed not to. **THE GATE AT
-    M3'S CLOSE IS 79 CASES PER ARCHITECTURE, 158 RUNS**, riscv32 and arm64
-    both, either machine failing red; eleven object kinds where M2 had six,
-    with Pipe the one row of §2 left and M4's (`designs/010`) — which M4
-    built out into four kinds, so §2's table has no row owed now (the M4
-    entry below). The finale is
-    unit 6 (`designs/009-driver-child.md`): **A DRIVER IS A CHILD
-    PROCESS.** Root drains the console UART's register page out of its own
-    boot set as an `IoMemory`, GIVES it to a child, and the child maps it
-    into itself, binds the line, enables the device and echoes the
-    harness's bytes — on both profiles, with a driver body byte-identical
-    to the root-as-driver twin's. That one transcript spends every rung of
-    the ladder at once: the second address space (unit 2), the handle
-    lifecycle (2.75), give and the masked System handle (3), IoMemory and
-    `map` (4), the reference count and quotas (5), and a supervisor woken
-    by the death rather than by a guessed deadline (5.5). Beside it the
-    unit landed SHARED MEMORY — one region in two address spaces, the
-    launcher installing the child's row, the child holding no region
-    object — and, on an Aug-30 ruling, EXECUTABLE AS A RIGHT
-    (`MemoryRight.MapExecute`, with `Write | Execute` in one row refused);
-    §2.5 carries both. Eight new harness rows per the two profiles, 158
-    runs, with the 150 existing rows unchanged.
-    Unit 2 is
-    `designs/002-create-process.md`, and it is the one the milestone is named
-    for: **SOS RUNS TWO PROCESSES.** `process_create(image:memory:)` takes two
-    Memory capabilities and returns an INERT process; `start()` mints its
-    first thread and lets the scheduler pick it up while the caller keeps
-    running. Nine object kinds where unit 1 had eight; five new harness cases
-    per architecture, 47 each, 94 runs, with the 84 existing rows unchanged.
-    What the implementation added to §2, §8, §11 and §12:
-    (a) **THE LOADER STAYS IN THE KERNEL** (user, Aug 28, superseding the same
-    day's zero-copy ruling), and it is ONE loader with two doors: the phases
-    take the destination as a region parameter and differ only in whether a
-    refusal is `fatal_image` or a `BadImage` status. §12's loader-above-boot
-    rule is exercised without a second code path existing anywhere.
-    (b) **PROTECTION IS RELOADED AT THE SWITCH, forced on both profiles.** One
-    has a small fixed budget of numbered regions that a three-segment root
-    spends entirely; the other's grant window is a single shared user-mode
-    permission map. So a process's rows are DATA in its slot, replayed by the
-    scheduler when the incoming thread's process differs from the installed
-    domain — and a same-process switch, which is every switch every earlier
-    case makes, reloads nothing. That is what kept the shipped transcripts
-    byte-identical.
-    (c) **A PROCESS'S DEATH IS A SCHEDULING EVENT.** `end_process` forks: root
-    stops the machine exactly as before, a child leaves the ready queue BY
-    REMOVAL (the wholesale zeroing was a one-process spelling that would have
-    taken root's runnable threads) and the path ends in the scheduler. That
-    forced the teardown UP a module — the reschedule can idle, idling
-    delivers, and delivery reaches back down into the copy door — which is
-    design 1's cycle at a second site, resolved the same way: the doors REPORT
-    a bad buffer and the callers above the switch point terminate on it.
-    (d) **THE BUILD EMITS A REGION TABLE; THE KERNEL INTERPRETS NOTHING**
-    (sawlang#232 agenda item 2's ruled hybrid). The stitcher appends each
-    child image as it is and records `{base, len}` rows in a new fixed-symbol
-    section; the kernel mints one sealed MemoryObject per row and hands them
-    to root through `BootHandleNext`; root's config is what says which ordinal
-    is which. A missing table is zero regions, which is why every image built
-    without children boots unchanged.
-    (e) **THE MONEY PROOF IS AN ABSENCE.** A child stores into root's region,
-    the access faults, the child dies and root says so — and a kernel with a
-    broken reload fails by the fault report going MISSING rather than by a
-    wrong value, which is the failure mode worth engineering for.
-  - **Unit 1.5 DONE** —
-    the first sawos-native design (`designs/001-kernel-interruptibility.md`,
-    implementing 232 pin 1) and the first unit to land in this repository
-    rather than in sawlang: **a long kernel operation is interruptible.**
-    Design 178's D2 sharpens rather than repeals — the hardware still never
-    delivers an interrupt in kernel mode, and the kernel now ASKS at named
-    preemption points, polling and delivering through the funnel the idle
-    path already proved. The mechanism is three pieces: `preempt_point()`
-    beside the idle poll, one reentrancy guard around the delivery funnel's
-    body (the byte movers are shared with IRQ context), and a 4 KiB stride
-    on the long-op movers every bulk copy goes through. Every kernel-mode
-    loop carries a one-sentence placement verdict at its site, and the
-    console paths' verdict is an ACCEPTED latency rather than an argued-away
-    one. Two new all-arch cases invert the two D2 witnesses — a tick taken
-    in kernel mode, and a device line serviced before the entry to user
-    mode — 42 per architecture, 84 runs, with the 80 existing rows
-    unchanged. §9 and §9b carry the amendments; `IntrSpinLock` stayed
-    correctly unbuilt, because a point IS the assertion that state is
-    consistent. One structural finding, recorded in the design's as-built:
-    a point delivers, so it sits ABOVE the byte loops it drives in the
-    module order while delivery reaches back down to them, and the
-    resulting cycle is why the cadence is its own module (`kcore.preempt`)
-    rather than a point written inside `copy_bytes`.
-  - **Unit 1 DONE, branch PARKED for user
-    review:** the Clock and Timer objects, and with them the thing SOS could
-    not do before — **a process can sleep**. Eight object kinds where M2 had
-    six; eight new harness cases per architecture, 40 each, 80 runs. What the
-    implementation added to §2's two new rows:
-    (a) **ONE HARDWARE TIMER, TWO CUSTOMERS.** Both machines have a single
-    comparator, and the scheduler tick (§7) and every armed Timer now want it.
-    The per-arch seam flipped from PERIODIC (`timer_start(period_us)` +
-    `timer_rearm()`) to ABSOLUTE (`timer_now_ns()` + `timer_set_deadline_ns(at)`)
-    — a periodic seam can express exactly one customer — and the tick's PERIOD
-    moved out of the HALs into the arch-free kernel, where scheduler policy
-    belongs. The kernel keeps every deadline it owes in nanoseconds and programs
-    the EARLIEST; a fire means "something MAY be due", and one reading of the
-    clock answers for every customer with the TICK ASKED FIRST. **§7's tick is
-    thereby inviolate by construction**: a Timer deadline can only ever move the
-    hardware earlier, never later.
-    (b) **THE TWO RE-ARM RULES ARE OPPOSITE, deliberately.** The tick re-arms
-    from NOW (a late tick is one tick, never a burst of catch-up), a Timer from
-    its own DEADLINE (drift-free, the timerfd model) — a timeslice has no
-    history to be faithful to and an interval does. Missed expiries COALESCE
-    into a saturating count by DIVISION rather than by a loop, so an interval
-    far below what the machine can serve costs one divide; what keeps it from
-    livelocking is a floor on how soon the hardware is ever programmed, which
-    leaves the logical schedule untouched. No minimum interval is imposed and
-    nothing is refused.
-    (c) **The copy-IN funnel**, §2.2's copy-out door run backwards, built here
-    for `Timer.Arm` and inherited by M4's message body.
-    (d) **"Nothing runnable" split again, and the rule GENERALIZED.** M2 made it
-    "idle iff a line is bound"; an armed Timer is readiness the clock will
-    deliver, so the rule is now "idle iff something outside the thread set can
-    still wake somebody". An unarmed Timer is NOT one — it will never fire — and
-    that distinction has its own case, because getting it wrong that way fails
-    as a harness timeout rather than as a report.
-    (e) **Two language findings, neither worked around** (DF-232a, an internal
-    compiler error on a bare literal assigned to a fixed-width place; DF-232b,
-    `type` was a keyword so the ruled `clock_get(type:)` label was unwritable
-    and shipped as `kind:`. `type` became CONTEXTUAL Aug 17 and the label reads
-    `type:` as ruled).
-    (f) **THREE REVIEW RULINGS (user, Aug 17), all on this branch.** (i) An
-    EVENT'S WORD IS CONSUMED ON DELIVERY: a wait record reads and clears it in
-    one interrupts-masked step, so a value is reported exactly once, and
-    `receive` keeps its exact semantics as the non-blocking poll — the two are
-    doors onto one value (§2.2, §2.4). Two new harness packages, split by door.
-    (ii) A TIMER'S VERBS ARE METHODS ON ITS SLOT, which pulled the drift-free
-    arithmetic out of the `unsafe` bodies that index the slab and into safe ones
-    — structure, with no contract moved. (iii) THE HARDWARE CLOCK IS A GLOBAL
-    SINGLETON per `ClockType`, kernel-eternal and owned by nobody, so the slab is
-    one slot per domain and teardown frees none — the §2 Clock row has it.
-  - **M4 IS DONE (`designs/010-m4-pipes.md`, run in sawos designs 12-18 and
-    20-23 and CLOSED by design 24, this sweep) — THE KERNEL HAS IPC.** What the
-    milestone SET OUT was sawlang#232's "explicitly out" seed made a plan:
-    pipes + `PipeReplyHandle`, ruled Aug 30 as a seven-rung ladder (unit 0 waiter
-    revocation, 1 the pair, 2 the one-shot pair, 3 waitability, 4 handles in
-    messages, 5 driver-as-service, 6 this docs sweep) over an agenda of seven
-    decisions. It was AMENDED REPEATEDLY while it ran, and that is the shape
-    worth recording: rulings 8 through 12 were every one of them taken AFTER the
-    plan was ruled, each by the user, each written into `designs/010` rather than
-    into a new plan, and ruling 5 was RE-RULED outright at unit 4's review. Three
-    of them moved the ladder — ruling 4's Aug-31 fused-paths rider split unit 3.5
-    out, ruling 11's Sep-1 delivery-carries-the-payload split the record work
-    across units 3 and 4, and ruling 12's Sep-2 one-shot discipline inserted unit
-    4.5 ahead of unit 5 — and the ladder also absorbed two riders that were not
-    pipes at all. THE LEDGER, one line per rung,
-    each naming the sawos design that ran it: unit 0 waiter revocation
-    (`designs/012`); unit 1 the endpoint pair (`designs/013`); unit 2 the one-shot
-    pair, carrying ruling 10's teardown-writes-off rider (`designs/014`); unit 3
-    waitability, the record's body region and the consuming attach
-    (`designs/015`); **`ProcessOp.Stats`** (`designs/016`, user-ruled Sep 1 —
-    an UNNUMBERED rung between 3 and 3.5, taken because ruling 4's rider asks
-    for "a proof that COUNTS TRAPS" and nothing in the tree could count one; it
-    is what let every later unit MEASURE its claim instead of asserting it);
-    unit 3.5 the fused `Call` and `ReplyWait`
-    (`designs/017`); unit 4 rendezvous, take-at-post and the completion-queue
-    outlet (`designs/018`); unit 4.5 the one-shot discipline (`designs/022`);
-    unit 5 the money shot, driver-as-service (`designs/021`); and unit 6 this
-    sweep (`designs/024`). Two riders landed beside them and neither touched the
-    kernel's surface: **the ESP32-C3 board smoke** (`designs/020` — SOS boots on
-    a third machine, `make sos-smoke-esp32c3`, NON-GATING and never in
-    `sos-test`) and **the riscv32 HAL consolidation** (`designs/023` — one
-    `hal/riscv32-common/` under the virt and C3 boards, both gates
-    byte-identical).
-    **THE GATE AT M4's CLOSE IS 116 CASES PER ARCHITECTURE, 232 RUNS**, riscv32
-    and arm64 both, either machine failing red; FIFTEEN object kinds where M3 had
-    eleven, and §2's table has no row left owed.
-    **WHAT THE MILESTONE ACTUALLY BOUGHT, IN ONE MEASUREMENT.** A round trip
-    between two processes started at THREE traps per RPC at the client (post,
-    attach, wait) and three per message at the server; unit 3.5's fused `Call`
-    took the client to ONE and `ReplyWait` took the server to TWO; unit 4's
-    delivery-as-take took the server to ONE, because the delivery IS the take.
-    THREE, TWO, ONE — measured over `ProcessOp.Stats` by `tests/pipe-pingpong`
-    and `tests/pipe-cq`, never asserted from the design. Unit 5 refined the
-    headline rather than the number: **one trap per message is for a message the
-    server ANSWERS**, and a TELL costs it two, because nothing is owed back and
-    the obligation the delivery minted still has to be released. §2.1 carries the
-    ladder and the caveat together.
-    The finale is unit 5 (`designs/021-uart-service.md`): **A DRIVER IS A
-    SERVICE.** The M3 driver child grew a pipe-server face — outlet given to its
-    Waiter, `reply_wait` forever — and TWO sibling client processes read the
-    console through it over ONE connection via minted sibling inlets, holding no
-    device authority at all. It added NOTHING to the kernel: no op, no kind, no
-    right, no status, no slab, and one number (`MAX_PROCESSES` = 3 — still the
-    compiled number, and since M5 unit 6b no longer the only one that decides;
-    §2's `Process` row). The blocking
-    read is a fused `Call` meeting a held obligation, the one-way write is the
-    ratified TELL, and the cancellation is a dropped claim seen through the
-    request's abandoned level — every one of them shipped by units 1 through 4.5,
-    and unit 5 is the program that spends them.
-    **THE STANDING TAIL IS UNCHANGED, WHICH WAS THE PLAN.** `designs/010`
-    excluded the namespace and its path-attached acceptor object, `kill`, thread
-    waitability, priorities and the §7 band map, SMP with `IntrSpinLock`,
-    FP-in-userspace, the vDSO true-mapping, and the IOMMU driver with critical
-    processes — and M4 took up none of them. Each still has its row in the list
-    above, and each is still specified where it always was. **M5's anchor is
-    `designs/019-m5-memory-story.md`**; the scoping session that reads it is the
-    next thing after this sweep integrates.
+Built features are specified in their sections. This section lists what is
+not built, the limits that are deliberate or known, and the plan.
 
-## 12. The root server (ratified Aug 5, user)
+**Settled implementation pins.** The rights-word bit assignments and the
+per-object op tables are concrete and kernel-internal (`kernel/abi/`, one
+package shared by the dispatch and the wrappers — §5.7's vDSO discipline is
+what keeps them renumberable without a userspace edit). The per-profile kernel
+memory layout is the linker scripts under `hal/<arch>/kernel/` over per-type
+static slabs. The `sosimg` header is concrete, the §7 priority-map field
+included, beside the build-emitted region table and its kind column (§5.6,
+§12).
 
-- **Root = init + launcher + name service in ONE process, v1.** The
+**Open pin:** the §7 priority map, and root's bootstrap band map, which the
+loader parses and reports while no Process slot stores either.
+
+**Not built**, one area per line, with the section that specifies it:
+
+- **Priorities and the band map** (§7). The scheduler is one round-robin FIFO.
+- **Thread waitability, and `kill`** (§8). Attaching a thread is a `NotWaitable`
+  fault; `kill` has no op and no right (but see the known limits below on
+  `Exit`). A supervisor learns a child died by reading `get_status` through the
+  handle it holds, or by being woken through an attachment on the same handle.
+- **`IntrSpinLock` and SMP** (§9b, §7). A preemption point is the assertion
+  that state is consistent, so nothing yet has a critical section for the type
+  to protect.
+- **`HandlerGroup`** (§10): userspace runtime work; a process wires a Waiter by
+  hand.
+- **The combined wait-and-ack**, `waiter.wait(ack:)` (§9).
+- **DMA confinement — the userspace IOMMU driver, and critical processes**
+  (§2.5). On the isolated tiers a `map` fences a driver's CPU and not its
+  device's bus mastering, so a DMA-capable device's driver is a TCB member until
+  an IOMMU exists. Process-death notifications, the first prerequisite, are
+  built.
+- **The mapped vDSO** (§5.7): delivery is static linking, which changes
+  nothing about the shape.
+- **The C leg of the vDSO discipline** (§5.7): an `sos.h` the tree owns and
+  keeps in step with `kernel/abi/src/ops.saw`, and a way to link the exported
+  floor without the Saw runtime. Until then, for a C image an op number is ABI.
+- **Close** (§3): drop-is-release is the close for every existing kind;
+  whether a later kind needs a close op is open. Per-kind release rights are
+  not built.
+- **The namespace and its path-attached acceptor object** (§2.1), and the v1
+  bootstrap protocol convention (§12). A client finds a service by the boot
+  tag its launcher chose.
+- **`Process` and `System` handles in messages** (§2.1): a sysapi module split.
+- **Virtual clocks**, and clock types beyond `Monotonic` (§2.6).
+- **Stats:** a per-row identity column in the stats region, or an op resolving
+  a Process handle to its row (§2.7); per-thread stats.
+- **Fault forensics a supervisor can read** (the faulting PC and address reach
+  only the console's fault report) (§8).
+- **Retiring the image-declared device grant** (`SegFlag.Device` and the
+  loader's `allow_device: true` door, dormant) (§2.5): its emitter is
+  sawlang-side, so deleting it is a toolchain-pin event.
+- **The tier-2 mapping quota price** (`DEFAULT_QUOTA_MAPPINGS`, §5b.1).
+- **FP in userspace**: FP/SIMD state is not saved across a trap (§5b).
+
+**Known limits.**
+
+- `Exit` is not yet confined to the caller: through another process's handle it
+  ends that process and strands the caller's thread (§2.7).
+- `Process.give` does not yet hand the object back on a status refusal: the
+  capability stays in the giver's table with no wrapper naming it (§3).
+- The factory ops `ThreadCreate`, `EventCreate`, `WaiterCreate`, `InterruptBind`
+  and `PipeCreate` act on the process the handle names, not the caller: through
+  another process's handle they mint into that process's table and hand the
+  child-relative word back to the caller. Their behaviour through another
+  process's handle is unspecified until it is ruled.
+- `send_with`, `reply_with` and `reply_wait_with` do not yet hand carried
+  handles back on a refusal that took nothing: they stay in the caller's table
+  with no wrapper naming them (§2.1, §3).
+- `sosrt`'s bump arena takes no lock, so under a kernel that preempts (today
+  only the preemption harness; §7) two threads of one process allocating at once
+  can race (§5c).
+- Quotas count objects, not bytes, and there is no per-create quota argument
+  (§2.9). Slab donation is permanent (§2.8).
+- Thread slots are not reference-counted; the join/exit protocol owns them
+  (§2).
+- Handle generations are best-effort bug detection, not a uniqueness
+  guarantee (§3).
+- A Mapping whose handles are all released leaves its row installed until the
+  target's teardown (§2.5).
+- The kernel is uniprocessor (§7).
+
+**The plan.** The standing tail, each item specified in its own section: the
+namespace and its path-attached acceptor object (§2.1), `kill` (§8), thread
+waitability (§8), priorities and the §7 band map, SMP with `IntrSpinLock`
+(§9b), FP-in-userspace, the vDSO true-mapping (§5.7), and the IOMMU driver with
+critical processes (§2.5).
+
+## 12. The root server
+
+- **Root = init + launcher + name service in one process, v1.** The
   decided model already pushes supervision, discovery, and policy to
   userspace; v1 collapses them into root rather than booting a service
-  constellation. The DESIGN TEST: splitting the launcher or the name
+  constellation. The design test: splitting the launcher or the name
   service into its own process later must require zero kernel changes —
   if the boot handle set can't support that split, the set is wrong.
-- **Boot handle set** (minted by the kernel to root, everything else
-  derives): the **System handle** (§2/§5.7 — debug_print/shutdown ops;
-  ratified Aug 5); the LAUNCH capability (§7); root MemoryObjects — the
-  RAM pool root and the device-range roots (§2.5); the root IRQ table
-  (§2 Interrupt). Root's band map applies verbatim from its image (§7).
-  **M2 ANSWERS THE LAST TWO WITH RIGHTS RATHER THAN OBJECTS**, and the
-  set stays ONE handle wide: root's Process handle carries
-  `InterruptBind`, so binding a line is a derivation through a handle
-  it already holds rather than a table it is given — and its device
-  window arrives in its own image (§2.5), not in the boot set. **ONE OF
-  THE TWO BECAME AN OBJECT IN M3 AND THE OTHER DELIBERATELY DID NOT**
-  (corrected at M3 unit 7; §5.7's M3 amendment states the rule): the
-  pool roots are `Memory`/`IoMemory` capabilities now, delivered through
-  the boot set as the paragraph below describes, while the root IRQ
-  TABLE stayed a RIGHT — `ProcessRight.InterruptBind`, a derivation
-  through a handle root already holds rather than a table it is given.
-  Neither widened the register the kernel enters user mode with.
-  **AND THE POOL ROOTS ARE DELIVERED (M3 unit 4, sawos design 6 D-5).**
-  This bullet's "root MemoryObjects — the RAM pool root and the
-  device-range roots" now exist as written: the build-emitted region
-  table carries a KIND COLUMN, a Ram row mints a `MemoryObject` and a
-  Device row an `IoMemoryObject`, and both arrive through
-  `BootHandleNext` under their row ordinal. **THE SET IS STILL ONE
-  HANDLE WIDE AT THE REGISTER** — pool roots are COLLECTED, not passed,
-  which is the property that has survived every kind added to the set —
-  and the DEVICE ROOT is what retires the M2 "arrives in its own image"
-  clause above: a driver now obtains its window instead of declaring it,
-  which is what makes handing one to a driver CHILD possible at all.
-  What the kernel still assigns no meaning to is which ordinal is which;
-  that is root's config, exactly as it has been since unit 2.
-  NOTE (object-model brief material): the creation-authority model for
-  plain objects (Pipe/Event/Waiter/Timer) — quota-gated free
-  creation vs a factory capability — is an open pin; M1 does not need
-  it (root spawns nothing). **ANSWERED BY M2 (design 178 unit 3): the
-  factory capability, spelled as rights bits on the Process object.**
-  `EventCreate`/`WaiterCreate` — and `InterruptBind` beside them — are
-  Process ops each on its own right, so creation flows through a handle
-  the process already holds and is §3's derivation rule rather than a new
-  mechanism next to it, and a launcher strips the bit from anything with
-  no business creating. A quota stays ADDITIVE: a field on the process
-  slot, checked where `NoResource` is returned today, and design 232
-  unit 5.
-  **AND THE QUOTA IS BUILT, ADDITIVE EXACTLY AS PROMISED (M3 unit 5,
-  sawos design 7 D-3).** Not one rights bit moved and not one op was
-  added: the factory capabilities still decide WHETHER a process may
-  create, and the quota decides HOW MANY — checked at the sites this
-  bullet named, ahead of the slab, answering `SosStatus.QuotaExceeded`
-  where the machine would have answered `NoResource`. The one
-  spelling that differs from the promise is WHERE the field lives: the
-  rows are per-process storage in `kcore.objects`, beside the handle
-  table, rather than on `ProcessSlot` — because the HANDLE row (design
-  3's promised addition, and the one kind whose "slab" is a region of a
-  per-process table) has to be charged inside `mint_handle` and credited
-  inside `unbind_handle`, and the process slab sits above that module.
-  `ProcessSlot`'s docstring points at it.
-  **AMENDED Aug 29 (user ruling; sawos design 2's RIDER) — THE M2 ANSWER
-  STANDS FOR PROCESS-SCOPED OBJECTS, AND A PROCESS IS NOT ONE OF THEM.**
-  The sharpened line: process-scoped objects are minted by your Process;
-  PROCESSES ARE MINTED BY THE SYSTEM. Threads, Events, Waiters, Timers
-  and Interrupts are a process's own — charged to its slab slots, its
-  handle table and its teardown — so their creation stays a rights bit on
-  the Process object exactly as ruled in M2. The process TABLE is a
-  machine-global resource bounded by machine facts (the slab, the
-  protection-domain reloads, ASIDs when Profile B grows real
-  translation), so its refusals and its limits are SYSTEM answers:
-  `process_create` is `SystemOp.ProcessCreate` gated on
-  `SystemRight.ProcessCreate`, and `SystemOp.ProcessSelf` was already the
-  precedent — Process handles have always come from System, and now they
-  all do. Two arguments carried the ruling. The topology one is the
-  sharper: with a root/launcher creating every process, a creation right
-  on the CALLER's own Process handle gates nothing real, and creator-pays
-  accounting through the caller's slot would attribute everything to
-  root — so attribution in that world is ASSIGNED BY POLICY (unit 5's
-  quota vocabulary), not derived from who called.
-- **Loader-above-boot.** The kernel loads exactly ONE image ever: root
-  (sosimg, §6). Every later process is loaded BY ROOT from images root
-  obtains itself (e.g. a flash MemoryObject it holds), via LAUNCH +
-  `create_process`. The kernel has no second code path for process two.
-  **EXERCISED, M3 unit 2 (sawos design 2 D-1), AND THE KERNEL STILL HAS ONE
-  LOADER.** Two rulings of Aug 28 settled the shape and the second superseded
-  the first: zero-copy link-in-place was ruled and then overturned — **the
-  loader stays in the kernel entirely**, doing the copying, with a userspace
-  split deferred until it is necessary. So the kernel parses sosimg at boot and
-  at `process_create` through the SAME phases: `validate_image` and
-  `place_image` take the destination as a REGION PARAMETER (`LoadRegion`), and
-  the only thing that differs between the two doors is the FAILURE VOCABULARY —
-  the boot door raises `fatal_image` because a machine whose only image is
-  malformed has nothing else to run, and the create door returns `BadImage`
-  because a launcher must be able to report what it was handed. "No second code
-  path" is therefore kept BY CONSTRUCTION rather than by discipline: there is
-  nowhere else in the tree that reads a segment record.
-  **ROOT PROVIDES THE MEMORY AND SUPPLIES NO NUMBERS** (ruled Aug 28, via the
-  stack question): `process_create(image:memory:)` takes two Memory
-  capabilities, segments are copied to their LINK addresses inside `memory`,
-  and **the stack is the kernel's grant at that region's top** — root's own
-  loader rule, applied to a child. So a launcher never parses an image, never
-  computes a load address and never chooses a stack, which is what makes "root
-  never parses" airtight rather than merely intended.
-- **THE BOOT SET IS COLLECTED, NOT WIDENED** (M3 unit 2, sawos design 2 D-3).
-  The entry register still carries exactly ONE handle — System — and everything
-  else the kernel minted for root before it ran is drained through
-  `ProcessOp.BootHandleNext`, one `{tag, kind, handle}` record per call, through
-  §2.2's existing copy-out funnel. Exhaustion is a STATUS (`Drained`) that stays
-  exhausted, because a loop that drains an iterator ends by meeting the end. The
-  TAG is a region ordinal out of the build-emitted table and the kernel assigns
-  it no meaning: which ordinal is an image, which is a destination, which is a
-  device is ROOT's config. That is what keeps the kernel's half of the launch
-  flow identical for a hand-built system and for dynamic loading whenever it
-  arrives — M4 did not bring it, and the tag vocabulary is unchanged by
-  everything M4 did bring.
-- **AND EVERY PROCESS HAS ONE** (M3 unit 3, sawos design 4). The boot set went
-  PER-PROCESS when there were two drainers: the kernel writes root's at boot and
-  a LAUNCHER writes a child's with `ProcessOp.Give`, through the same machinery,
-  and a child drains its own through its own Process handle exactly as root
-  drains root's. The two producers are indistinguishable on purpose — the kernel
-  is the giver nobody gave to — and the drain is one op with one exhaustion rule.
-  Three sentences carry the model:
-  - **THE TAG IS THE IDENTITY, and tags are the ONLY cross-process vocabulary.**
-    A tag is the giver's own word handed back unread (the `Waiter.add` key
-    precedent): the kernel is a courier, never an interpreter, and a launcher and
-    a child agree on meaning through config and manifest. So a give answers with
-    a STATUS ALONE — the child-side word means nothing to the giver, which can
-    call no op through it — and a DUPLICATE tag is refused at the give, because
-    an identity naming two handles would make the boot lookup ambiguous.
-  - **THE SET FREEZES AT `start`.** Whatever a launcher gives must be complete at
-    the child's first instruction, and the start call is the barrier that makes a
-    half-populated table unrepresentable with no synchronization invented; a give
-    afterwards is a `BadState` fault. The DRAIN has no deadline at all — records
-    persist until consumed, so a child that drains late drains correctly.
-  - **`start(boot_tag:)` IS HOW THE FIRST HANDLE ARRIVES.** The kernel resolves
-    the tag to the child-side word and puts it in the first argument register, so
-    `_start(boot_handle)` is unchanged from M2 and a launcher never sees a
-    child-relative word at any point. Resolution consumes no record, so the child
-    meets that handle again in its drain. The no-tag form is the sandboxed
-    compute process and is still the default; a tag naming no given record is a
-    `BadArg` fault, and "no tag" is a FORM argument rather than a reserved tag
-    value, because zero is a legitimate tag (root's region ordinals start there).
-  **AND A CHILD BOOTSTRAPS EXACTLY AS ROOT DOES** (the Aug-29 rulings; §3's
-  `MINT_OP`). A launcher MINTS a masked sibling of its own System handle — a keep
-  mask naming `Debug | ProcessSelf | ClockGet | Transfer` and nothing else — gives
-  the sibling under a tag, and starts the child naming that tag. The child then
+- **Boot handle set** (minted by the kernel to root; everything else
+  derives): the **System handle** (§2.8), which carries the launch capability
+  `SystemRight.ProcessCreate` (§7); root MemoryObjects — the RAM pool root and
+  the device-range roots (§2.5); and the authority to bind interrupt lines.
+  Root's band map applies verbatim from its image (§7, not built). Two of
+  these are rights rather than objects: binding a line is
+  `ProcessRight.InterruptBind` on root's Process handle, a derivation through
+  a handle root already holds rather than a root IRQ table it is given; and
+  the launch capability is a bit on the System handle. **The set is one handle
+  wide at the register** — the pool roots are collected, not passed: the
+  build-emitted region table carries a kind column, a Ram row mints a
+  `MemoryObject` and a Device row an `IoMemoryObject`, and both arrive through
+  `BootHandleNext` under their row ordinal. A driver obtains its window
+  instead of declaring it, which is what makes handing one to a driver child
+  possible at all. The kernel assigns no meaning to which ordinal is which;
+  that is root's config.
+- **Creation authority.** The creation-authority model for plain objects is the
+  factory capability, spelled as rights bits on the Process object:
+  `EventCreate`, `WaiterCreate`, `InterruptBind` and `PipeCreate` are Process
+  ops each on its own right, so creation flows through a handle the process
+  already holds — §3's derivation rule rather than a new mechanism next to it —
+  and a launcher strips the bit from anything with no business creating. A quota
+  is additive (§2.9): the factory capabilities decide whether a process may
+  create, and the quota decides how many. **Process-scoped objects are minted by
+  your Process; processes are minted by the System.** Threads, Events, Waiters,
+  Timers and Interrupts are a process's own — charged to its slab slots, its
+  handle table and its teardown — so their creation flows through a handle the
+  process already holds: a rights bit on the Process object for Threads, Events,
+  Waiters and Interrupts, and for a Timer `ClockOp.TimerCreate` on
+  `ClockRight.TimerCreate`, through a Clock handle (§2.6). The process table is
+  a machine-global resource bounded by machine facts (the slab, the
+  protection-domain reloads, ASIDs on a translating profile), so its refusals
+  and its limits are System answers: `process_create` is
+  `SystemOp.ProcessCreate` gated on `SystemRight.ProcessCreate`, and
+  `SystemOp.ProcessSelf` is the precedent — every Process handle comes from
+  System. With a launcher creating every process, a creation right on the
+  caller's own Process handle would gate nothing real, and creator-pays
+  accounting through the caller's slot would attribute everything to root — so
+  attribution is assigned by policy (the quota vocabulary), not derived from who
+  called.
+- **Loader-above-boot.** The kernel loads exactly one image ever: root (sosimg,
+  §5.6). Every later process is loaded by root from images root obtains itself
+  (e.g. a flash MemoryObject it holds), via the launch capability and
+  `process_create`. The kernel has no second code path for process two. **The
+  kernel has one loader**, doing the copying (a userspace loader split is
+  deferred until it is necessary): the kernel parses sosimg at boot and at
+  `process_create` through the same phases — `validate_image` and `place_image`
+  take the destination as a region parameter (`LoadRegion`) — and the only thing
+  that differs between the two doors is the failure vocabulary: the boot door
+  raises `fatal_image`, because a machine whose only image is malformed has
+  nothing else to run, and the create door returns `BadImage`, because a
+  launcher must be able to report what it was handed. "No second code path" is
+  therefore kept by construction: nowhere else in the tree reads a segment
+  record. **Root provides the memory and supplies no numbers.**
+  `process_create(image:memory:)` takes two Memory capabilities, segments are
+  copied to their virtual link addresses inside `memory`, and **the stack is the
+  kernel's grant at that region's top** — root's own loader rule, applied to a
+  child. So a launcher never parses an image, never computes a load address and
+  never chooses a stack, which is what makes "root never parses" airtight. On a
+  translating tier the link address is the virtual address the kernel's mapping
+  establishes, over the frames of the `memory` region the launcher passed
+  (§5.5); on a non-translating tier the virtual and physical addresses coincide.
+- **The build emits a region table; the kernel interprets nothing.** The
+  stitcher appends each child image as it is and records its rows (`{base, len}`
+  and the kind column) in a fixed-symbol section; the kernel mints one sealed
+  region per row and hands them to root through `BootHandleNext`; root's config
+  says which ordinal is which. A missing table is zero regions. An image without
+  children may still have a table: a root that drives a device boots with its
+  device row.
+- **The boot set is collected, not widened.** The entry register carries exactly
+  one handle — System — and everything else the kernel minted for root before it
+  ran is drained through `ProcessOp.BootHandleNext`, one `{tag, kind, handle}`
+  record per call, through §2.2's copy-out funnel. Exhaustion is a status
+  (`Drained`) that stays exhausted, because a loop that drains an iterator ends
+  by meeting the end. The tag is a region ordinal out of the build-emitted table
+  and the kernel assigns it no meaning: which ordinal is an image, which is a
+  destination, which is a device is root's config. That keeps the kernel's half
+  of the launch flow identical for a hand-built system and for dynamic loading
+  whenever it arrives.
+- **Every process has one.** The boot set is per-process: the kernel writes
+  root's at boot and a launcher writes a child's with `ProcessOp.Give`,
+  through the same machinery, and a child drains its own through its own
+  Process handle exactly as root drains root's. The two producers are
+  indistinguishable on purpose — the kernel is the giver nobody gave to — and
+  the drain is one op with one exhaustion rule. Three rules carry the model:
+  - **The tag is the identity, and tags are the launch flow's only cross-process
+    vocabulary.** A tag is the giver's own word handed back unread (the
+    `Waiter.add` key precedent): the kernel is a courier, never an interpreter,
+    and a launcher and a child agree on meaning through config and manifest. So
+    a give answers with a status alone — the child-side word means nothing to
+    the giver, which can call no op through it — and a duplicate tag is refused
+    at the give, because an identity naming two handles would make the boot
+    lookup ambiguous.
+  - **The set freezes at `start`.** Whatever a launcher gives must be complete
+    at the child's first instruction, and the start call is the barrier that
+    makes a half-populated table unrepresentable with no synchronization
+    invented; a give afterwards is a `BadState` fault. The drain has no
+    deadline at all — records persist until consumed, so a child that drains
+    late drains correctly.
+  - **`start(boot_tag:)` is how the first handle arrives.** The kernel resolves
+    the tag to the child-side word and puts it in the first argument register,
+    so the entry is `_start(boot_handle)` and the launch flow never shows a
+    launcher a child-relative word (§11 notes the factory ops, which can).
+    Resolution consumes the record the tag names — the register is the delivery
+    — so the drain never answers with a word the child already holds. The no-tag
+    form, with nothing given, is the sandboxed compute process (sandboxed on the
+    isolated tiers) and is the default; a tag naming no given record is a
+    `BadArg` fault, and "no tag" is a form argument rather than a reserved tag
+    value, because zero is a legitimate tag (root's region ordinals start
+    there).
+- **A child bootstraps exactly as root does.** A launcher mints a masked
+  sibling of its own System handle (§3's `MINT_OP`) — a keep mask naming
+  `Debug | ProcessSelf | ClockGet | Transfer` and nothing else — gives the
+  sibling under a tag, and starts the child naming that tag. The child then
   does what root does at boot: adopt the System handle in its first argument
-  register, derive its own Process object from it, drain its boot set from there.
-  So the kernel has ONE way in for every process, which is the same claim
-  loader-above-boot makes about images, and the differences between root and a
-  child are entirely in a rights word.
-  What that buys, and it is the whole point of the mint: the launcher KEEPS the
-  child's Process handle, so it supervises (`get_status`, and unit 5.5's
-  death-wait) while the child manages itself. Before `MINT_OP` there was one
-  Process handle per child and a launcher had to choose. What the mask withholds
-  is enforced at run time by the ordinary rights check — a child that asks to
-  `shutdown` is `AccessDenied` and dies, and the machine keeps running.
-  **AND WHAT A LAUNCHER FURNISHES REACHED HARDWARE** (M3 unit 6, sawos design 9
-  D-2). The furnishing vocabulary did not grow a mechanism — it grew a third
-  `give` funnel, `give(iomemory:)`, over a bit `iomemory_rights()` has minted
-  since unit 4 — and with it a launcher hands a child a DEVICE. That is this
-  section's design test taken literally: splitting the launcher's job out of
-  root required zero kernel changes, and so did moving a driver out of root,
-  because a device window was already a capability rather than a manifest key.
-  Two shapes are now both ordinary and a launcher picks by policy: GIVE the
-  capability and let the child install its own row (the driver child), or KEEP
-  the capability and install the child's row yourself (`share_double_map`'s
-  shared page, where the child holds no region object at all). Attenuation runs
-  the same way on either: `Memory.mint(rights:)` narrows a region before it
-  travels, which is where a launcher writes "this child may map its RAM and may
-  never map it executable" (§2.5's `MemoryRight.MapExecute`).
-- **v1 protocol conventions** (userspace convention section, not kernel
-  surface): a launched process receives ONE bootstrap pipe handle at
-  launch; its first messages request its initial handle set from the
-  launcher (name-service discovery = ask by string name over that
-  pipe). Conventions are versioned in the `sos` userspace module,
-  not in the kernel.
-  **AFTER M4 EVERY MECHANISM THIS SENTENCE NEEDS EXISTS, AND THE CONVENTION
-  ITSELF IS STILL UNWRITTEN.** A launcher creates a connection
+  register, derive its own Process object from it, drain its boot set from
+  there. So the kernel has one way in for every process, which is the same
+  claim loader-above-boot makes about images, and the differences between root
+  and a child are entirely in a rights word. The launcher keeps the child's
+  Process handle, so it supervises (`get_status`, and the death wait, §8) while
+  the child manages itself. What the mask withholds is enforced at run time by
+  the ordinary rights check — a child that asks to `shutdown` is
+  `AccessDenied` and dies, and the machine keeps running.
+- **What a launcher furnishes reaches hardware.** `give(iomemory:)` hands a
+  child a device, over the `Transfer` bit `iomemory_rights()` mints, with no
+  further mechanism: moving a driver out of root needs no kernel change,
+  because a device window is a capability rather than a manifest key. Two
+  shapes are both ordinary and a launcher picks by policy: give the capability
+  and let the child install its own row (the driver child), or keep the
+  capability and install the child's row yourself (a shared page the child
+  holds no region object for). Attenuation runs the same way on either:
+  `Memory.mint(rights:)` narrows a region before it travels (§2.5's
+  `MemoryRight.MapExecute`).
+- **v1 protocol conventions** (userspace convention, not kernel surface): a
+  launched process receives one bootstrap pipe handle at launch; its first
+  messages request its initial handle set from the launcher (name-service
+  discovery = ask by string name over that pipe). Conventions are versioned in
+  the `sos` userspace module, not in the kernel. Every mechanism the
+  convention needs exists — a launcher creates a connection
   (`ProcessOp.PipeCreate`), gives an end to a child under a tag, and the child
-  drains it and calls — `tests/uart-service` is that flow with a driver at the
-  far end — and a message can carry the handles an answer consists of (§2.1's
-  six kinds). What is missing is only the NAME: a client finds a service by the
-  boot tag its launcher chose rather than by a string, and the path-attached
-  acceptor that would resolve `/dev/uart0` is the separate, later design §2.1's
-  Aug-20 amendment already named.
+  drains it and calls (`tests/uart-service` is that flow with a driver at the
+  far end), and a message can carry the handles an answer consists of (§2.1).
+  The convention itself is not written: a client finds a service by the boot
+  tag its launcher chose rather than by a string, and the path-attached
+  acceptor that would resolve `/dev/uart0` is the separate, later design §2.1
+  names.
