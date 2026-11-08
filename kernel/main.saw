@@ -1,20 +1,19 @@
-// SOS kernel entry (designs 112, 140, 162).
+// SOS kernel entry.
 //
-// The per-arch kernel HAL (`hal/<arch>/kernel/`) supplies the boot shim
-// that sets up the stack, zeroes .bss and calls `kmain`, the board hooks and
-// the memory-protection primitive, and the linker script that places the whole
-// image; `sosrt` (`rt/common/src/lib.saw`) supplies the runtime seams and
-// the arena over those hooks; `core/` is the arch-free kernel (console, `ktrap`, the
-// object-op dispatch, the sosimg loader), one module per seam with `core/lib.saw`
-// the facade over them. See spec.md §5b and §12.
+// The per-arch kernel HAL (`hal/<arch>/kernel/`) supplies the boot shim (stack,
+// .bss zeroing, the call to `kmain`), the board hooks, the memory-protection
+// primitive and the linker script that places the image. `sosrt`
+// (`rt/common/src/lib.saw`) supplies the runtime seams and the arena over those
+// hooks. `core/` is the arch-free kernel (console, `ktrap`, the object-op
+// dispatch, the sosimg loader), one module per seam with `core/lib.saw` as the
+// facade. See spec.md §5b and §12.
 //
-// This file names no architecture either — which is the point of the seam: the
-// same kernel entry boots Profile A and Profile B, and the only thing that
-// changes is which HAL the build maps `hal` to.
+// This file names no architecture: the same entry boots every profile, and the
+// build only chooses which HAL `hal` maps to.
 //
-// The kernel's whole job at boot is to hand control to the root server: load
-// the one appended image, grant it its regions, drop to user mode. A kernel
-// with no root image has nothing to run and says so — it does not exit quietly.
+// At boot the kernel hands control to the root server: load the one appended
+// image, grant it its regions, drop to user mode. With no root image there is
+// nothing to run, and the kernel says so rather than exiting quietly.
 
 import kcore.{console, load_root_and_enter}
 import hal
@@ -26,16 +25,14 @@ func kmain() {
     uart.write_str(hal.arch_name())
     uart.write_str("\n")
 
-    // The interrupt controller comes up with EVERY LINE MASKED (design 178 M2
-    // unit 1). A kernel that can hand a device line to a driver has to bring it
-    // up at boot — an Interrupt object's `create` unmasks one line and nothing
-    // else — and bringing it up masked is what makes that safe to do before
-    // there is any driver: nothing is deliverable until something asks.
+    // The interrupt controller comes up with every line masked. Binding an
+    // Interrupt (`ProcessOp.InterruptBind`) unmasks one line and nothing else,
+    // so the controller must already be initialised; masked, nothing is
+    // deliverable until a driver asks.
     //
-    // NO TIMER IS ARMED HERE. The scheduler works without one (a `yield` and a
-    // block both switch), and arming it would narrate over the process for the
-    // first few ticks — see the handover protocol on `kcore`'s `Console`. The
-    // preemption harness arms its own.
+    // No timer is armed here. The scheduler works without one (a `yield` and a
+    // block both switch), and a tick would narrate over the process for the
+    // first few ticks; see the handover protocol on `kcore`'s `Console`.
     hal.intc_init()
 
     load_root_and_enter()

@@ -1,305 +1,233 @@
-//! `sos` — the SOS userspace API (design 140; spec.md §2, §5.7, §12).
+//! `sos`: the SOS userspace API (spec.md §2, §5.7, §12).
 //!
-//! U-MODE LIBRARY CODE, OWNED AND EXPORTED BY THE KERNEL PACKAGE. Nothing here
-//! runs in kernel mode; all of it lives in the kernel's tree. That is the
-//! Zircon-vDSO discipline (ratified Aug 5) and it buys one specific thing:
-//! SYSCALL NUMBERS ARE NOT ABI. The op numbers come from `sosabi`, which the
-//! kernel's dispatch tables import too, so the two halves of the contract
-//! cannot skew — and because a process links this module instead of writing
-//! numbers, the kernel may renumber between builds without breaking anything
-//! that was compiled against it.
+//! User-mode library code, owned and exported by the kernel package. Nothing
+//! here runs in kernel mode; all of it lives in the kernel's tree. This is the
+//! vDSO discipline, and it buys one thing: syscall numbers are not ABI. The op
+//! numbers come from `sosabi`, which the kernel's dispatch tables import too,
+//! so the two halves of the contract cannot skew, and because a process links
+//! this module instead of writing numbers, the kernel may renumber between
+//! builds without breaking anything compiled against it.
 //!
-//! THREE ENTRY ALTITUDES, ONE IMPLEMENTATION CHAIN. There is exactly one place
-//! in the system that issues a trap, and everything above it is a wrapper:
+//! Three entry altitudes, one implementation chain. Exactly one place in the
+//! system issues a trap, and everything above it is a wrapper:
 //!
 //!   typed Saw   `system.shutdown(0)`                 <- prefer this
 //!   typed C     `sos_system_shutdown(h, 0)`          <- for non-Saw languages
 //!   raw         `sos_syscall1(h, op, arg)`           <- the HAL stub
 //!
 //! The Saw methods below call the `@export`ed C functions, which call the raw
-//! form, which is the per-arch `ecall`/`svc` stub in `hal/<arch>/user/`.
-//! No altitude reimplements the one below it, so there is no second trap path
-//! to keep in step.
+//! form, which is the per-arch `ecall`/`svc` stub in `hal/<arch>/user/`. No
+//! altitude reimplements the one below it, so there is no second trap path to
+//! keep in step.
 //!
-//! WHAT A PROCESS MUST STILL AGREE WITH THE KERNEL ABOUT: the calling
-//! convention (§5.7 — handle in a0, op in a7, status back in a0) and the status
+//! What a process must still agree with the kernel about: the calling
+//! convention (§5.7: handle in a0, op in a7, status back in a0) and the status
 //! tags it branches on. The first lives in the HAL stub; the second is
-//! `SosStatus` below. Neither is a number this file's callers ever write.
+//! `SosStatus`. Neither is a number this file's callers write.
 //!
-//! THE TWO LAYERS, AND WHICH ONE CARRIES A GUARANTEE (ruled Aug 15, user). The
-//! TYPED SAW SURFACE NEVER EXPOSES OR ACCEPTS A RAW HANDLE WORD: `System`,
-//! `Process` and `Thread` keep private fields, offer no word extractor and no
-//! word constructor, and every one of them is minted INSIDE this module by the
-//! op wrapper that received it from the kernel — so the only crossing INTO the
-//! typed layer is `System(boot_handle:)`, §12's root of trust, and there is no
-//! crossing out at all. A handle you hold is one the kernel handed you, and a
-//! handle you were never given is not a thing you can spell.
-//! The `@export`ed C SURFACE below is the FLOOR and keeps raw `UInt` handles,
-//! because a C caller has no type system to carry the guarantee in. That is a
-//! documented difference in kind, not an oversight: the C altitude buys a
-//! non-Saw process the same operations with none of the same protection, and a
-//! process that wants the protection writes Saw.
+//! The two layers, and which one carries a guarantee. The typed Saw surface
+//! never exposes or accepts a raw handle word: every wrapper keeps its handle
+//! field private or `public(package)`, offers no word extractor and no public
+//! word constructor, and is minted inside this package by the op wrapper that
+//! received it from the kernel. The only crossing into the typed layer is
+//! `System(boot_handle:)` (§12's root of trust), and there is no crossing out.
+//! A handle you hold is one the kernel handed you, and a handle you were never
+//! given is not a thing you can spell. The `@export`ed C surface below is the
+//! floor and keeps raw `UInt` handles, because a C caller has no type system to
+//! carry the guarantee: a non-Saw process gets the same operations without the
+//! protection, and a process that wants the protection writes Saw.
 //!
-//! WHICH ENUMS ARE PUBLIC API, AND WHICH ARE BOOKKEEPING (ruled Aug 16, user).
-//! The vDSO discipline is about OP NUMBERS, not about argument encodings, and
-//! the line runs exactly there:
+//! Which enums are public API and which are bookkeeping. The vDSO discipline is
+//! about op numbers, not argument encodings, and the line runs exactly there:
 //!
-//!   PUBLIC — an enum or record whose values a PROCESS CHOOSES and passes as a
-//!   syscall argument, or that the kernel HANDS BACK as data. `EventMode` is
+//!   Public: an enum or record whose values a process chooses and passes as a
+//!   syscall argument, or that the kernel hands back as data. `EventMode` is
 //!   the first kind: a caller names it (`event_create(mode:
-//!   EventMode.SaturatingSum)`), so it is API, and the alternative — a method
-//!   per mode — reads fine at two and stops scaling at the next object, where
-//!   M3's Mapping brings an access mode AND a memory type and a method per
-//!   combination is a matrix rather than a list. `WaitTag` / `WaitPayload` /
-//!   `WaitResult` and the wait record's word offsets are the second kind: the
-//!   kernel WRITES that record and userspace READS it, so its layout is a
-//!   contract between the two and one declaration has to serve both. Mapping
-//!   inherits both patterns.
+//!   EventMode.SaturatingSum)`), and a method per mode stops scaling once an
+//!   object has several modes. `BootHandleKind` and the pipe levels are the
+//!   second kind: the kernel writes them and userspace matches on them, so
+//!   one declaration has to serve both. The wait record is decoded inside this
+//!   package, so the facade re-exports the decoded `WaitResult` and
+//!   `WaitPayload` (from `sos.pipe`, because they hold owning wrappers) rather
+//!   than `WaitTag` and the record's word offsets.
 //!
-//!   KERNEL-INTERNAL — op numbers, rights bits, `ObjType`, `FaultReason`, the
-//!   dispatch's bookkeeping. A process never writes one of these, which is what
-//!   leaves the kernel free to renumber between builds.
+//!   Kernel-internal: op numbers, the rights enums not re-exported below,
+//!   `ObjType`, `FaultReason`, the dispatch's bookkeeping. A process never
+//!   writes one of these, which leaves the kernel free to renumber between
+//!   builds.
 //!
-//! EXACTLY ONE DECLARATION EITHER WAY, and for a public one that declaration
-//! stays in `sosabi` — the kernel's dispatch decodes the same enum, and a second
-//! copy here is precisely the skew that file exists to prevent. Saw's imports
-//! RE-EXPORT, so the one declaration is reachable through this module and a
-//! process writes `import sos.{EventMode}`. It is worth knowing that the
-//! re-export is INDISCRIMINATE — everything imported here is reachable through
-//! here, and `sosabi` is on a process's module path as a transitive dependency
-//! regardless — so the split above is held by what userspace is TOLD to write
-//! rather than by a wall. That was already true; the rule only says which side
-//! of the line each family sits on.
+//! Either way there is exactly one declaration, and for a public one it stays
+//! in `sosabi`: the kernel's dispatch decodes the same enum, and a second copy
+//! here is the skew that file exists to prevent. A `public import`
+//! re-exports, so the one declaration is reachable through this module and a
+//! process writes `import sos.{EventMode}`. Only the names a `public import`
+//! below lists are reachable through `sos`, but `sosabi` is on a process's
+//! module path as a transitive dependency regardless, so the split is held by
+//! what userspace is told to write rather than by a wall. Don't move the enum
+//! into this module for the kernel to import: this module and the kernel HAL
+//! export the two runtime hooks under the same C names, so importing one into
+//! the other is a duplicate-`@export` error.
 //!
-//! (The other direction was probed and does not work: the enum cannot MOVE here
-//! and be imported by the kernel, because this module and the kernel HAL export
-//! the two runtime hooks under the same C names for their two sides — importing
-//! one into the other is a duplicate-`@export` error, since a Saw import
-//! compiles the whole module into the unit.)
+//! # This file is the facade
 //!
-//! # THIS FILE IS THE FACADE (sawos design 5)
+//! It holds no code. It re-exports the names a process writes, so `import
+//! sos.{System}` means the same thing wherever it appears. Each object lives in
+//! its own module.
 //!
-//! The module used to be one 2,000-line file. It is now twelve modules and this
-//! facade, one file per object, and this file holds no code: it re-exports the
-//! names a process writes, so `import sos.{System}` in `root/src/main.saw` and
-//! every `import sos.{...}` in `tests/*/src/main.saw` means exactly what it
-//! always did.
-//!
-//! THE MODULES, IN DEPENDENCY ORDER — a file may import only those above it,
-//! because an import cycle is a compile error naming the loop (DF-232e):
+//! The modules, in dependency order. A file may import only modules listed
+//! before it, because an import cycle is a compile error naming the loop:
 //!
 //!   `floor`      the two syscall externs, the status split, the whole
 //!                `@export`ed C-ABI surface, `ALL_RIGHTS`, the owning tier's
 //!                contract, and the boot handle the runtime hooks print
 //!                through
-//!   `memory`     Memory — RAM authority, and `split`
-//!   `iomemory`   IoMemory — device authority, and `carve`
-//!   `mapping`    Mapping — one installed protection row, and `unmap`
-//!   `pipe`       PipeInlet + PipeOutlet — the two ends of a connection, and
-//!                `post` / `take` — plus, since M4 unit 2, PipeReply +
-//!                PipeRequest, the one-shot pair one exchange is made of, and
-//!                `resolve` / `reply`. FOUR TYPES IN ONE FILE, alone among
-//!                these, because they are TWO PAIRS and every sentence about
-//!                either half of either pair explains it by contrast with its
-//!                opposite. Nothing forced it: no type here names another
-//!                except at `take`'s return, so the module graph was
-//!                indifferent and READABILITY chose — which is the placement
-//!                rule that became available when sawlang 0.2.0 made extension
-//!                lookup follow `public import` (SL-7)
+//!   `memory`     Memory: RAM authority, and `split`
+//!   `iomemory`   IoMemory: device authority, and `carve`
+//!   `mapping`    Mapping: one installed protection row, and `unmap`
 //!   `thread`     Thread
 //!   `event`      Event
 //!   `interrupt`  Interrupt
 //!   `timer`      Timer
 //!   `clock`      Clock, which constructs Timer
-//!   `waiter`     Waiter, whose three `add` overloads name the three above
-//!   `system`     System, Process and BootHandle — see below
+//!   `waiter`     Waiter, whose `add` overloads name Event, Interrupt and
+//!                Timer
+//!   `pipe`       PipeInlet + PipeOutlet (the two ends of a connection, and
+//!                `post` / `take`) and PipeReply + PipeRequest (the one-shot
+//!                pair one exchange is made of, and `resolve` / `reply`).
+//!                Pipe types, alone among these, share a file because they are
+//!                two pairs and every sentence about either half of a pair
+//!                explains it by contrast with its opposite. It comes after
+//!                `waiter` because it extends `Waiter` with the pipe overloads
+//!   `system`     System, Process and BootHandle; see below
 //!   `rt`         `sos_rt_write` / `sos_rt_abort`, both written over a System
 //!                op
 //!
-//! WHERE THE LINE FELL, twice, and neither is where the brief's sketch put it:
+//! Where the line fell:
 //!
-//!   - `waiter` MOVED ABOVE the three waitables. `add` is one overload per
-//!     kind (`&Event`, `&Interrupt`, `&Timer`) and each overload reads the
-//!     target's handle field, so the aggregator names all three and none of
-//!     them names it. Written below them it would be the cycle DF-232e
-//!     diagnoses.
-//!   - `system` HOLDS THREE TYPES, because every pair of them names the
-//!     other: System constructs Process, `Process.give(system:)` consumes a
-//!     System, and `BootHandle` carries all three while `Process` answers with
-//!     one. `system.saw`'s own header has the full argument. There is no
-//!     `process.saw`; a type's extension methods must live in the module that
-//!     declares the type (a re-export widens no extension scope — design
-//!     142/229), so no arrangement of files splits them today.
-//!   - **THE SAME FINDING BIT AGAIN IN M3 UNIT 4, and it moved a METHOD rather
-//!     than a file.** Design 6 sketched the map funnels as `Memory.map(into:
-//!     &Process)`; `BootHandle` carries a `Memory?` and an `IoMemory?`, so both
-//!     of those modules are BELOW `system` and a `map` written in either naming
-//!     `Process` is the cycle DF-232e diagnoses. So the funnels are
-//!     `Process.map(memory:access:)` and `Process.map(iomemory:)`, which reads
-//!     exactly like the `give` overloads beside them — the same receiver
-//!     answering the same question about the same child — and the region is
-//!     BORROWED rather than consumed, because a map moves no handle word.
-//!   - **AND A THIRD TIME IN M3 UNIT 5.5, at the one place the brief had
-//!     written the other spelling out.** Design 8 ruled the surface
-//!     `Waiter.add(process:, key:)` — the fourth member of the overload list
-//!     `waiter.saw` already holds. It is unwritable here: `waiter` is ABOVE the
-//!     three waitables precisely because `add` reads its argument's handle
-//!     field, and `Process` is declared in `system` one line further up, so the
-//!     fourth overload would import downward into its own importer. So it is
-//!     `Process.attach(waiter:, key:)`, unit 4's move applied verbatim — the
-//!     receiver flips, the semantics do not, and `waiter.saw` carries a comment
-//!     where the overload would have gone so the list still reads as four. The
-//!     three sites together are the same missing language tier (an `internal`
-//!     or forward-declaration story, or extension lookup that follows
-//!     `public import`); until it exists, method PLACEMENT in this package is
-//!     decided by the module graph rather than by which receiver reads best.
-//!   - **THE TIER LANDED (sawlang 0.2.0, the first pin bump — SL-7 closed):**
-//!     extension lookup follows `public import` now, so an `extension` beside
-//!     the type it cannot be declared with is visible wherever the facade is
-//!     imported. The third site is respelled to the ruled surface —
-//!     `Waiter.add(process:, key:)` lives in `system.saw` as an `extension
-//!     Waiter`, `Process.attach` is retired, and `waiter.saw`'s raw funnel
-//!     widened to `public(package)` for exactly that one caller. The first
-//!     two sites STAND: this fix moves methods, not declarations, so the
-//!     System/Process/BootHandle module split and the `Process.map` receiver
-//!     flip keep their recorded reasons (the map funnels also READ well —
-//!     nobody has argued them back).
+//!   - `waiter` comes after `event`, `interrupt` and `timer`. `add` is one
+//!     overload per kind and each overload reads the target's handle field, so
+//!     `waiter` imports those three and none of them imports it.
+//!   - `system` holds three types, because every pair of them names the other:
+//!     System constructs Process, `Process.give(system:)` consumes a System,
+//!     and `BootHandle` carries all three while `Process` answers with one.
+//!     See `system.saw`'s header. There is no `process.saw`.
+//!   - The map funnels are `Process.map(memory:access:)` and
+//!     `Process.map(iomemory:)`, not `Memory.map(into: &Process)`: `BootHandle`
+//!     carries a `Memory?` and an `IoMemory?`, so `system` imports both of
+//!     those modules, and a `map` written in either naming `Process` is an
+//!     import cycle. The region is borrowed rather than consumed, because a map
+//!     moves no handle word.
+//!   - The `Waiter` overloads for kinds declared after `waiter` live with
+//!     those kinds as `extension Waiter`: the pipe ends and one-shots in
+//!     `pipe.saw`, `Waiter.add(process:, key:)` in `system.saw`. Extension
+//!     lookup follows `public import`, so each call site reads as a member of
+//!     `waiter.saw`'s overload list. The raw attach funnel in `waiter.saw` is
+//!     `public(package)` so those extensions can reach it.
 //!
-//! WHAT A SPLIT COSTS HERE: the names two seams share are `public(package)`,
-//! which is a REAL package-internal tier here rather than kcore's DF-232f
-//! widening to bare `public`, because `kernel/sysapi/Saw.toml` is a manifest
-//! root and a manifest root IS a package. So the NINE wrapper handle fields a
-//! sibling constructs or reads — Memory, IoMemory, Mapping (M3 unit 4), Thread,
-//! Event, Interrupt, Timer, Clock, Waiter — are reachable by their siblings and
-//! by nothing outside the package, and `System`'s and `Process`'s stay private
-//! because only their own module touches them. Nothing widened to bare
-//! `public`, and the surface below is exactly what it was plus what unit 4
-//! added.
+//! What a split costs: the names two seams share are `public(package)`.
+//! `kernel/sysapi/Saw.toml` is a manifest root, so it is a real package and the
+//! tier is a real package-internal one. The wrapper handle fields a sibling
+//! constructs or reads (Memory, IoMemory, Mapping, Thread, Event, Interrupt,
+//! Timer, Clock, Waiter, and the pipe types) are reachable by their siblings
+//! and by nothing outside the package. `System`'s and `Process`'s stay private
+//! because only their own module touches them. Nothing is widened to bare
+//! `public`.
 
-// THE ENCODINGS A PROCESS IS MEANT TO WRITE OR MATCH ON, and the only things
-// this module re-exports (design 229): the status tag every `Result<_,
-// SosStatus>` hands back, the mode a `event_create(mode:)` caller names, and
-// the record + payload a `wait()` caller matches on. `import sos.{SosStatus}`
-// (etc.) is how a process takes them.
-//
-// **AND M4 UNIT 3 ADDED FIVE MORE TO THAT SECOND KIND** (sawos design 15;
-// `designs/010` rulings 8 and 11(a)). `OutletLevel`, `InletLevel` and
-// `ReplyDelivery` are what the four new `WaitPayload` cases carry, `PipeMsg` is
-// the body a reply delivery hands over — the shared struct unit 4's
-// message deliveries will reuse — and `ReplyLevel` is the discriminator the
-// decode reads. Every one of them is written by the kernel and read by
-// userspace, which is the rule's own definition of the kind, and a process
-// cannot match on a payload whose sub-enum it cannot name.
+// The encodings a process is meant to write or match on are the only things
+// this module re-exports from `sosabi`. This line carries the status tag every
+// `Result<_, SosStatus>` hands back, the mode an `event_create(mode:)` caller
+// names, the domain a `clock_get(type:)` caller names, the kind a boot-set
+// record reports, and the pipe levels: `OutletLevel` and `InletLevel` (what
+// the pipe `WaitPayload` cases carry) and `ReplyLevel` (the discriminator the
+// reply decode reads). The kernel writes each level and userspace reads it,
+// and a process cannot match on a payload whose sub-enum it cannot name.
+// `import sos.{SosStatus}` (etc.) is how a process takes them.
 public import sosabi.{SosStatus, EventMode, ClockType,
                       BootHandleKind, OutletLevel, InletLevel, ReplyLevel}
 
-// **AND `MapAccess`, WHICH `Process.map` MADE PUBLIC** (sawos design 6 D-3).
-// It is the module docstring's PUBLIC kind exactly: a value a PROCESS CHOOSES
-// and passes as a syscall argument. It is also the case the docstring's own
-// `event_create` note PREDICTED — "M3's Mapping brings an access mode AND a
-// memory type and a method per combination is a matrix rather than a list" —
-// and the prediction held one way and not the other: the ACCESS is a value a
-// caller names, and the MEMORY TYPE turned out to be a KIND (`IoMemory`) rather
-// than an argument, so `map(iomemory:)` takes no mode at all.
+// `MapAccess` is public because `Process.map` takes it: a value a process
+// chooses and passes as a syscall argument. The memory type is a kind
+// (`IoMemory`), not an argument, so `map(iomemory:)` takes no mode at all.
 public import sosabi.{MapAccess}
 
-// **AND `SlabKind`, WHICH `System.slab_donate` MADE PUBLIC** (sawos design 32,
-// M5 unit 6). Same test as `MapAccess`: a value a PROCESS CHOOSES and passes as
-// a syscall argument. It is the one piece of the slab machinery that crosses the
-// vDSO wall — the extents, the floors and the capacities stay kernel-internal,
-// because a donor names WHICH SLAB it is feeding and never how big the slab is.
+// `SlabKind` is public because `System.slab_donate` takes it: a value a process
+// chooses and passes as a syscall argument. It is the one piece of the slab
+// machinery that crosses the wall. The extents, floors and capacities stay
+// kernel-internal, because a donor names which slab it is feeding and never how
+// big the slab is.
 public import sosabi.{SlabKind}
 
-// **AND `ProtectionTier`, WHICH `System.tier` MADE PUBLIC** (sawos design 35,
-// M5 unit 4). This one crosses on the docstring rule's OTHER clause — not a
-// value a process chooses and passes, but one THE KERNEL HANDS BACK AS DATA,
-// which is `BootHandleKind`'s and `OutletLevel`'s side of the line. A process
-// cannot `match` on a tier whose cases it cannot name, and matching is the
-// whole intended use: read it once, and refuse to run if you needed the other
-// word.
+// `ProtectionTier` is public because `System.tier` hands it back: the other
+// clause of the rule, a value the kernel hands back as data (like
+// `BootHandleKind` and `OutletLevel`). A process cannot `match` on a tier whose
+// cases it cannot name, and matching is the intended use: read it once, and
+// refuse to run if you needed the other word.
 //
-// It does not breach the vDSO wall for `SystemRight`'s reason restated: the
-// wall is about OP NUMBERS, and what is republished here is a NAME. That the
-// name currently carries 0 or 1 is this build's business.
+// This does not breach the op-number wall: what is republished is a name, and
+// what number it carries is the build's business.
 public import sosabi.{ProtectionTier}
 
-// **AND `SystemRight`, WHICH THE MINT MASK MADE PUBLIC** (the Aug-29 rulings on
-// design 4). Rights bits were kernel-internal for as long as no argument
-// carried one; `MINT_OP` takes a KEEP MASK the caller assembles, so the bits are
-// now exactly what the module docstring's rule calls PUBLIC — values a PROCESS
-// CHOOSES and passes as a syscall argument. `System.mint(rights:)` is the one
-// consumer, which is why this is the one rights enum re-exported: a kind whose
-// handles nothing masks has no reason to publish its bits, and each one joins
-// this line with the funnel that needs it.
+// `SystemRight` is public because `MINT_OP` takes a keep mask the caller
+// assembles, so the bits are values a process chooses and passes as a syscall
+// argument; `System.mint(rights:)` is its consumer. A kind whose handles
+// nothing masks has no reason to publish its bits, and each rights enum joins
+// this list with the funnel that needs it.
 //
-// It does NOT breach the vDSO wall, which is about OP NUMBERS: userspace still
-// never writes an op, and a right is a capability rather than an index the
-// kernel trusts.
+// This does not breach the op-number wall: userspace never writes an op, and a
+// right is a capability rather than an index the kernel trusts.
 public import sosabi.{SystemRight}
 
-// **AND `MemoryRight`, WHICH THE EXEC GATE MADE PUBLIC** (sawos design 9 D-1).
-// The same rule again, and the sentence above says which funnel brings a rights
-// enum here: `Memory.mint(rights:)` is a caller assembling a keep mask out of
-// these bits, so they are values a PROCESS CHOOSES and passes as a syscall
-// argument. What forced it is `MemoryRight.MapExecute` — before it, a launcher
-// had no reason to narrow a region at all (`Split` and `Map` are what a region
-// is FOR), so the bits had no consumer and stayed kernel-internal; withholding
-// the authority to map executable is the first policy anybody writes about RAM.
+// `MemoryRight` is public because `Memory.mint(rights:)` is a caller assembling
+// a keep mask out of these bits. `MemoryRight.MapExecute` is what makes
+// narrowing a region worth doing: withholding the authority to map executable
+// is the first policy anybody writes about RAM (`Split` and `Map` are what a
+// region is for, so a launcher had no other reason to narrow it).
 //
-// It publishes NO op number, exactly as `SystemRight` publishes none: a right is
-// a capability the caller already holds, not an index the kernel trusts.
+// It publishes no op number, as `SystemRight` publishes none.
 public import sosabi.{MemoryRight}
 
-// **AND THE PAIR'S THREE, WHICH M4 UNIT 1 MADE PUBLIC** (sawos design 13). The
-// same rule a third and fourth time — a rights enum joins this list with the
-// funnel that needs it, and `PipeInlet.mint(rights:)` / `PipeOutlet.mint(rights:)`
-// are callers assembling a keep mask out of these bits. That is where a
-// launcher's pipe policy is written: an endpoint's default set has to be
-// permissive (attenuation is monotonic, so a bit not minted at creation could
-// never appear later), so "this child may post and may not hand the end on" is a
-// mask at the mint and nothing else.
+// The pipe rights enums are public on the same rule: a rights enum joins this
+// list with the funnel that needs it, and `PipeInlet.mint(rights:)` /
+// `PipeOutlet.mint(rights:)` are callers assembling a keep mask out of these
+// bits. That is where a launcher's pipe policy is written: an endpoint's
+// default set has to be permissive (attenuation is monotonic, so a bit not
+// minted at creation could never appear later), so "this child may post and may
+// not hand the end on" is a mask at the mint and nothing else.
 //
-// **AND THE ONE-SHOT PAIR'S TWO, WHICH M4 UNIT 2 MADE PUBLIC** (sawos design
-// 14), on the same rule and with a sharper case for it than any before:
-// `PipeRequest.mint(rights:)` through a mask of `Transfer | Mint` describes a
-// COURIER — a delegate that may pass an obligation further along §2.1's
-// forwarding chain and may never speak for it — which is a policy the ratified
-// zero-copy example genuinely wants to be able to state.
+// The one-shot pair's rights are public for the same reason, with a sharper
+// case: `PipeRequest.mint(rights:)` through a mask of `Transfer | Mint`
+// describes a courier, a delegate that may pass an obligation further along
+// §2.1's forwarding chain and may never speak for it.
 //
-// `PIPE_BODY_BYTES` is here for a different reason and it is the plainest one in
-// the file: it is a SIZE THE TWO HALVES MUST AGREE ON. A `post` may not name
-// more, a `take` must supply at least that much, and the typed methods take a
-// `&[UInt8; PIPE_BODY_BYTES]` — so a caller cannot even declare the buffer
-// without the number. It publishes no op and gates no authority; it is the same
-// kind of thing `wait_record_bytes()` is, and it is the one build define of the
-// unit that crosses the boundary (the staging ring's DEPTH stays in
-// `kcore.limits`, because a caller meeting a full ring is told `WouldBlock`
-// without ever needing to know how deep it was).
+// `PIPE_BODY_BYTES` is a size the two halves must agree on. A `post` may not
+// name more, a delivered message's body region is that wide, and the typed
+// methods take a `&[UInt8; PIPE_BODY_BYTES]`, so a caller cannot declare the
+// buffer without the number. It publishes no op and gates no authority; it is
+// the same kind of thing `wait_record_bytes()` is. The staging ring's depth
+// stays in `kcore.limits`: a caller meeting a full ring is told `WouldBlock`
+// without needing to know how deep it was.
 public import sosabi.{PipeInletRight, PipeOutletRight, PipeReplyRight,
                       PipeRequestRight, PIPE_BODY_BYTES, PIPE_MSG_HANDLES}
 
-// **AND `ProcessRight`, WHICH DESIGN 16 MADE PUBLIC** — the rule a fifth time,
-// and the funnel that needed it arrived in the same unit: `Process.mint(rights:)`
-// is a caller assembling a keep mask out of these bits, and it exists because
-// `ProcessRight.Stats` is a bit whose whole point is to be WITHHELD. "You may
-// learn my child died, and you may not watch it work" is a policy a supervisor
-// states once at a mint; without the enum on this line it would be a policy
-// nobody outside the kernel could spell.
+// `ProcessRight` is public because `Process.mint(rights:)` is a caller
+// assembling a keep mask out of these bits, and `ProcessRight.Stats` is a bit
+// whose whole point is to be withheld. "You may learn my child died, and you
+// may not watch it work" is a policy a supervisor states once at a mint;
+// without the enum on this line nobody outside the kernel could spell it.
 //
-// It publishes no op number, exactly as the four enums above publish none.
+// It publishes no op number, as the enums above publish none.
 public import sosabi.{ProcessRight}
 
-// Everything else `sosabi` holds is KERNEL-INTERNAL and stays that way: the op
-// numbers, the rights, the handle aliases, the wait record's wire layout. The
-// modules below import what each of them needs directly, and every one of those
-// is an ordinary import, so a process cannot reach one through `sos` under any
-// spelling — the vDSO discipline ("syscall numbers are not ABI") is a wall now
-// rather than a convention the module docstring asks callers to respect. The
-// split narrowed that wall rather than widening it: a file names the handful of
-// encodings it uses instead of the whole list.
+// Nothing else in `sosabi` is re-exported: not the op numbers, the rights
+// enums not listed above, the handle aliases, or `WaitTag` and the wait
+// record's word offsets. The record's layout is still a contract with C
+// callers (see `sos_waiter_wait`); a Saw caller reads it decoded as a
+// `WaitResult`. The modules below import what each of them needs directly
+// with ordinary imports, so a process cannot reach one through `sos` under
+// any spelling.
 
 // The object modules, and the C-ABI floor under them. Re-exported by name
-// rather than by glob: the list IS this module's surface, so a name that is not
+// rather than by glob: the list is this module's surface, so a name that is not
 // here is not something a process can reach, and adding one is a decision with
 // a line to write.
 public import sos.floor.{ALL_RIGHTS, sos_handle_mint, sos_handle_release,
@@ -338,17 +266,16 @@ public import sos.interrupt.{Interrupt}
 public import sos.timer.{Timer}
 public import sos.clock.{Clock}
 public import sos.waiter.{AttachMode, Waiter}
-// `ProcessStats` joins the three types this module has always published, and it
-// is the one that is not a capability: it is the ANSWER `Process.stats()` gives
-// (sawos design 16), three plain counts a process may hold, copy and print. A
-// name on this line is a name a process can reach, and the reading has to be one
-// — a method whose return type could not be spelled is a method nobody can bind.
+// `ProcessStats` is not a capability: it is the answer `Process.stats()` gives,
+// three plain counts a process may hold, copy and print. A name on this line is
+// a name a process can reach, and the reading has to be one: a method whose
+// return type could not be spelled is a method nobody can bind.
 public import sos.system.{System, Process, ProcessStats, BootHandle, StatsRegion}
 
-// THE ONE NON-RE-EXPORTING LINE, and it is here for a reason no `public import`
-// can serve: `sos.rt` publishes nothing — its two functions are module-private
-// and reach the world through `@export` alone — so the facade has no name to
-// re-export and still has to name the module, because an import is what
-// compiles it into the unit. Without this line a process links with no
-// `sos_rt_write` and its first `print` goes nowhere.
+// The one non-re-exporting line, for a reason no `public import` can serve:
+// `sos.rt` publishes nothing (its two functions are module-private and reach
+// the world through `@export` alone), so the facade has no name to re-export
+// and still has to name the module, because an import is what compiles it into
+// the unit. Without this line a process links with no `sos_rt_write` and its
+// first `print` goes nowhere.
 import sos.rt

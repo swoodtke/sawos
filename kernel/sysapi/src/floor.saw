@@ -1,16 +1,15 @@
-//! THE FLOOR — the trap seam, the status split, and the whole `@export`ed
-//! C-ABI surface (spec §5.7) every typed wrapper above is written on.
+//! The floor: the trap seam, the status split, and the whole `@export`ed C-ABI
+//! surface (spec §5.7) every typed wrapper above is written on.
 //!
-//! It is the bottom of the module order because it names no wrapper type: an
-//! op here takes a raw handle word and answers a raw status, which is exactly
-//! what makes it reachable from every object kind without reaching back into
-//! any of them. `checked` is where a number becomes a `Result`, and
-//! `sos_handle_release` is the one call every wrapper's `deinit` issues — so
-//! the owning tier's whole contract is recorded here too, below every file
-//! that implements it.
+//! It is the bottom of the module order because it names no wrapper type: an op
+//! here takes a raw handle word and answers a raw status, which makes it
+//! reachable from every object kind without reaching back into any of them.
+//! `checked` is where a number becomes a `Result`, and `sos_handle_release` is
+//! the one call every wrapper's `deinit` issues, so the owning tier's whole
+//! contract is recorded here too, below every file that implements it.
 //!
-//! THE TWO SYSCALL EXTERNS LIVE HERE AND NOWHERE ELSE, and that is what put
-//! the per-op C surface here with them: an `extern "C"` declaration carries no
+//! The two syscall externs live here and nowhere else, and that is what put the
+//! per-op C surface here with them: an `extern "C"` declaration carries no
 //! visibility modifier, so it cannot be shared with a sibling module, and two
 //! modules declaring one symbol is an ambiguity error at the importer. One
 //! declaration, one file, and the typed layer above calls the named seams.
@@ -20,10 +19,10 @@ import sosabi.{SosStatus, SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp,
                PipeInletOp, PipeOutletOp, PipeReplyOp, PipeRequestOp,
                RELEASE_OP, MINT_OP}
 
-// The per-arch HAL, and since design 172 part 2 the WHOLE of it: the one
-// instruction in the system that crosses the trap boundary. FIXED ARITY on
-// purpose — a varargs call across a trap boundary has no portable register
-// story, so a wider op gets `sos_syscall2` beside this, not an ellipsis.
+// The per-arch HAL's whole surface: the one instruction in the system that
+// crosses the trap boundary. Fixed arity on purpose: a varargs call across a
+// trap boundary has no portable register story, so a wider op gets a wider
+// fixed form beside these (`sos_syscall3` is that form), not an ellipsis.
 extern "C" {
     func sos_syscall1(handle: UInt, op: UInt, arg0: UInt) -> UInt
     func sos_syscall3(handle: UInt, op: UInt, arg0: UInt, arg1: UInt, arg2: UInt,
@@ -34,38 +33,33 @@ extern "C" {
 // Errors
 // =============================================================================
 
-// How a syscall reports what happened is `sosabi`'s `SosStatus` (spec §5.7) —
-// the SAME declaration the kernel's dispatch returns, so the two halves of the
+// How a syscall reports what happened is `sosabi`'s `SosStatus` (spec §5.7),
+// the same declaration the kernel's dispatch returns, so the two halves of the
 // contract cannot disagree about what tag 3 means. It carries its own
-// `describe()`, `Printable` and `Error` (design 145: an enum takes methods and
-// hand-written trait bodies), which is what retired the free `sys_error(status)`
-// helper this module used to need. A process reaches all of it through the
-// value it is handed and never imports `sosabi` — the type's own module is
-// always consulted for its methods (design 142), and an enum case pattern
-// resolves from the scrutinee.
+// `describe()`, `Printable` and `Error`. A process reaches all of it through
+// the value it is handed and never imports `sosabi`: the type's own module is
+// always consulted for its methods, and an enum case pattern resolves from the
+// scrutinee. So userspace can interpolate a failure (`print("{}", e)`) as well
+// as `match` it.
 //
-// So userspace can now interpolate a failure (`print("{}", e)`) as well as
-// `match` it. Before, the type could conform to nothing and had to be branched
-// on to say anything at all.
-//
-// IT IS A STATUS, AND ONLY SOME STATUSES ARE ERRORS. `checked` below is the one
-// place that distinction is made, and it is what keeps the `Ok` case out of the
-// error channel entirely.
+// It is a status, and only some statuses are errors. `checked` below is the one
+// place that distinction is made, and it keeps the `Ok` case out of the error
+// channel entirely.
 
 /// Turn a raw status word into a Result. The one place a number becomes a type.
 ///
-/// THE SPLIT (ratified Aug 7): `Ok` becomes `Result.Ok`, everything else becomes
-/// `Err(status)`. So the `Ok` case exists on the wire, where 0 has to mean
-/// something, and cannot exist in an `Err` — `Err(SosStatus.Ok)`, a value that
-/// would claim a call both failed and succeeded, is unconstructible downstream
-/// because this function is the only constructor of the error channel.
+/// The split: `Ok` becomes `Result.Ok`, everything else becomes `Err(status)`.
+/// The `Ok` case exists on the wire, where 0 has to mean something, and cannot
+/// exist in an `Err`: `Err(SosStatus.Ok)`, a value that would claim a call both
+/// failed and succeeded, is unconstructible downstream because this function is
+/// the only constructor of the error channel.
 ///
-/// The narrowing is guarded rather than assumed: `a0` is register-wide, the enum
-/// is byte-wide (its width is ABI), and an `as UInt8` on a value above 255 is a
-/// PANIC — in a process, over a word the process did not choose. A kernel
-/// compiled from this same table never returns one, so the guard is unreachable
-/// in M1 and costs a compare; what it buys is that the impossible case is an
-/// error value rather than a trap.
+/// The narrowing is guarded rather than assumed: the status register is
+/// register-wide, the enum is byte-wide (its width is ABI), and an `as UInt8`
+/// on a value above 255 is a panic, in a process, over a word the process did
+/// not choose. A kernel compiled from this same table never returns one, so the
+/// guard is unreachable and costs a compare; what it buys is that the
+/// impossible case is an error value rather than a trap.
 public(package) func checked(raw: UInt) -> Result<Void, SosStatus> {
     if raw > (UInt8.max as UInt) {
         return SosStatus.Unknown
@@ -79,8 +73,8 @@ public(package) func checked(raw: UInt) -> Result<Void, SosStatus> {
     return
 }
 
-/// The same split for an op that answers with a VALUE — a created thread's
-/// handle, a joined thread's exit code, a status word. `Ok` carries the value;
+/// The same split for an op that answers with a value (a created thread's
+/// handle, a joined thread's exit code, a status word). `Ok` carries the value;
 /// anything else is the error and the value is not read.
 func checked_value(raw: UInt, value: UInt) -> Result<UInt, SosStatus> {
     try checked(raw)
@@ -88,49 +82,38 @@ func checked_value(raw: UInt, value: UInt) -> Result<UInt, SosStatus> {
 }
 
 // -----------------------------------------------------------------------------
-// THE LEVEL DECODE — one function, and `WouldBlock` is an ERROR again everywhere
-// else (`designs/010` ruling 12(a), which RE-RULES sawos design 13 D-2; sawos
-// design 22)
+// The level decode
 // -----------------------------------------------------------------------------
 //
-// **THE POLL SPLIT IS RETIRED.** D-2 put `WouldBlock` on the OK channel at the
-// typed tier, on `Channel.try_receive`'s precedent (design 234 §4): a poll loop
-// that cannot tell "nothing yet" from "this is broken" waits for ever. It was
-// written at M4 unit 1, when every pipe caller WAS a poll loop. Units 3 and 3.5
-// inverted that population — waitability and the fused paths mean a caller waits
-// with a `Waiter` or a `Call` and reaches these ops already knowing the answer —
-// and the tree's own evidence closed it: ZERO `case None` arms across `tests/`
-// and `root/`, every site paying a `try` for the errors and then a guard that
-// treats the `None` as a bug. So the general rule applies here as everywhere
-// (CLAUDE.md's Optional discipline): an Optional in a signature is an
-// antipattern unless the absence is a real domain value, and a transient rides
-// the ERROR channel — error plus retry.
+// `WouldBlock` is an ordinary error at the typed tier, everywhere but one op. A
+// transient condition rides the error channel (error plus retry), not
+// `Ok(None)`: a caller that waits on the level with a `Waiter` first reaches
+// these ops already knowing the answer, and an Optional in the signature would
+// make every such caller unwrap for the rare refusal. `take` and `post` use
+// `checked` and `call_value` like every other op.
 //
-// **THE DIVERGENCE FROM `Channel.try_receive` IS DELIBERATE, AND THIS IS THE
-// SEAM IT IS RECORDED AT.** A Saw channel's `try_receive` is the ONLY door onto
-// a channel that does not block, so its caller is a poll loop by construction; a
-// pipe has four doors — attach and wait, the fused `Call`, the parking
-// `Resolve`, and these polls — so its caller has already chosen to poll by
-// picking the door, and does not need the shape to keep reminding it. Same rule,
-// different population.
+// This diverges from `Channel.try_receive` on purpose. A Saw channel's
+// `try_receive` is the only door onto a channel that does not block, so its
+// caller is a poll loop by construction. A pipe has four doors (attach and
+// wait, the fused `Call`, the parking `Resolve`, and these polls), so its
+// caller has already chosen to poll by picking the door, and does not need the
+// shape to keep reminding it.
 //
-// **ONE FUNCTION SURVIVES, AND ITS JOB IS A LEVEL RATHER THAN A POLL.**
+// The one decode here that answers a level, not a poll, is `polled_ok`.
 // `PipeReplyOp.Ready` asks whether a reply has arrived and answers a `Bool` on
-// the OK channel with the terminal on the error channel — which is exactly this
-// decode, and is a real domain answer rather than a transient absence: "not yet"
-// is the question's whole point. `polled_value`, its `Optional`-shaped twin, is
-// GONE with the split; `take` and `post` use `checked` and `call_value` like
-// every other op.
+// the Ok channel with the terminal on the error channel. "Not yet" is the
+// question's whole point, so it is a real domain answer rather than a
+// transient absence.
 
-/// Decode a status word for an op that asks a LEVEL: `Ok(true)` the level is up,
-/// `Ok(false)` it is not, and every other status is the error channel — which is
-/// where a terminal lives (`PipeReply.ready`'s `Err(PeerClosed)`: the answer can
-/// never arrive, so there is no second call to make).
+/// Decode a status word for an op that asks a level: `Ok(true)` the level is
+/// up, `Ok(false)` it is not, and every other status is the error channel,
+/// which is where a terminal lives (`PipeReply.ready`'s `Err(PeerClosed)`: the
+/// answer can never arrive, so there is no second call to make).
 public(package) func polled_ok(raw: UInt) -> Result<Bool, SosStatus> {
-    // The same guarded narrowing `checked` writes, and for the same reason: `a0`
-    // is register-wide and the enum is byte-wide, so an `as UInt8` on a word a
-    // kernel skew produced would be a PANIC in a process over a number it did
-    // not choose.
+    // The same guarded narrowing `checked` writes, and for the same reason: the
+    // status register is register-wide and the enum is byte-wide, so an `as
+    // UInt8` on a word a kernel skew produced would be a panic in a process
+    // over a number it did not choose.
     if raw > (UInt8.max as UInt) {
         return SosStatus.Unknown
     }
@@ -149,8 +132,8 @@ public(package) func polled_ok(raw: UInt) -> Result<Bool, SosStatus> {
 ///
 /// `unsafe` because it names a pointer: the value register comes back through
 /// an out-parameter, which is the shape that crosses a C ABI with no aggregate
-/// return. The typed methods above call this and stay safe signatures — the
-/// pointer never leaves this function, which is design 136's confinement rule.
+/// return. The typed methods above call this and stay safe signatures; the
+/// pointer never leaves this function.
 public(package) func call_value(handle: UInt, op: UInt, arg0: UInt, arg1: UInt,
                                 arg2: UInt) unsafe -> Result<UInt, SosStatus> {
     var value: UInt = 0
@@ -160,10 +143,10 @@ public(package) func call_value(handle: UInt, op: UInt, arg0: UInt, arg1: UInt,
 }
 
 // =============================================================================
-// The C-ABI surface (spec §5.7) — for non-Saw languages
+// The C-ABI surface (spec §5.7), for non-Saw languages
 // =============================================================================
 //
-// PER-OP functions are the supported C interface: one function per operation,
+// Per-op functions are the supported C interface: one function per operation,
 // named for it, with the arguments the operation actually takes. A C caller
 // gets the same contract a Saw caller does minus the type wrapper, and still
 // never writes an op number.
@@ -172,11 +155,11 @@ public(package) func call_value(handle: UInt, op: UInt, arg0: UInt, arg1: UInt,
 // escape hatch, not the interface: it takes an op number, which is the thing
 // this whole arrangement exists to keep out of callers.
 //
-// Whitelist-clean by construction — handles, ops and statuses are all
-// integers, so nothing here needs a type the C ABI cannot carry.
+// Whitelist-clean by construction: handles, ops and statuses are all integers,
+// so nothing here needs a type the C ABI cannot carry.
 
-/// Write one byte to the debug console. Requires `SystemRight.Debug`.
-/// Returns a status word: 0 on success.
+/// Write one byte to the debug console. Requires `SystemRight.Debug`. Returns a
+/// status word: 0 on success.
 @export("sos_system_debug_print")
 public func sos_system_debug_print(handle: UInt, byte: UInt) -> UInt {
     sos_syscall1(handle, SystemOp.DebugPrint as UInt, byte)
@@ -189,11 +172,15 @@ public func sos_system_shutdown(handle: UInt, status: UInt) -> UInt {
     sos_syscall1(handle, SystemOp.Shutdown as UInt, status)
 }
 
-// The ops that answer with a VALUE take an out-parameter for it, exactly as the
-// raw form does. A C caller writes `unsigned long h; sos_process_thread_self(p,
+// The ops that answer with a value take an out-parameter for it, as the raw
+// form does. A C caller writes `unsigned long h; sos_process_thread_self(p,
 // &h);` and gets the same contract a Saw caller does minus the Result.
 
 /// This process's own handle. Requires `SystemRight.ProcessSelf`.
+///
+/// The handle carries the Process default set intersected with `keep` (all
+/// ones keeps the whole set). A caller at its handle quota gets
+/// `SosStatus.QuotaExceeded`; a full handle table is `SosStatus.NoResource`.
 @export("sos_system_process_self")
 public func sos_system_process_self(handle: UInt, keep: UInt,
                                     value_out: UnsafePointer<UInt>) unsafe -> UInt {
@@ -201,19 +188,20 @@ public func sos_system_process_self(handle: UInt, keep: UInt,
 }
 
 /// Load the image in region `image` into region `memory` and answer with a
-/// handle to the new, INERT process. Requires `SystemRight.ProcessCreate` on
-/// the caller's SYSTEM handle — processes are minted by the System (sawos
-/// design 2's RIDER, ruled Aug 29).
+/// handle to the new, inert process. Requires `SystemRight.ProcessCreate` on
+/// the caller's System handle (processes are minted by the System).
 ///
-/// Both arguments are Memory handles — the read-only source blob and the
-/// child's destination RAM. The kernel copies each segment to its link address
-/// inside `memory` and grants a stack at that region's top; the caller supplies
-/// no addresses at all.
+/// Both arguments are Memory handles: the read-only source blob and the child's
+/// destination RAM. The kernel copies each segment to its link address inside
+/// `memory` and grants a stack at that region's top; the caller supplies no
+/// addresses at all.
 ///
-/// A malformed image is `SosStatus.BadImage` — a VALUE, not a fault — because
-/// image bytes are data the caller was handed rather than something it wrote.
-/// A handle that names nothing, or names something that is not a Memory, IS a
-/// fault: the caller chose which handles to pass.
+/// A malformed image is `SosStatus.BadImage`, a value, not a fault, because
+/// image bytes are data the caller was handed rather than something it wrote. A
+/// handle that names nothing, or names something that is not a Memory, is a
+/// fault: the caller chose which handles to pass. A full process table or
+/// handle table is `SosStatus.NoResource`, and a caller at its handle quota
+/// gets `SosStatus.QuotaExceeded`.
 @export("sos_system_process_create")
 public func sos_system_process_create(handle: UInt, image: UInt, memory: UInt,
                                       value_out: UnsafePointer<UInt>) unsafe -> UInt {
@@ -221,20 +209,21 @@ public func sos_system_process_create(handle: UInt, image: UInt, memory: UInt,
                  value_out)
 }
 
-/// Give the kernel a Memory region to back the slab `kind` names, FOREVER
-/// (sawos design 32, M5 unit 6). Requires `SystemRight.SlabDonate`.
+/// Give the kernel a Memory region to back the slab `kind` names.
+/// Requires `SystemRight.SlabDonate`.
 ///
-/// The region's capability is CONSUMED on success and donation is permanent in
-/// v1 — nothing gives a donated range back. `kind` is a `SlabKind`.
+/// The region's capability is consumed on success, and no op gives a donated
+/// range back. `kind` is a `SlabKind`.
 ///
 /// A kind that is not a `SlabKind`, a handle that names nothing or names
 /// something that is not a Memory, and a region the kernel cannot safely absorb
-/// — one with a sibling handle, one with an installed mapping row, or a pool
-/// root with pieces still on loan — are all FAULTS: the caller minted the
+/// (one with a sibling handle, one with an installed mapping row, or a pool
+/// root with pieces still on loan) are all faults: the caller minted the
 /// siblings, installed the rows and cut the pieces, so each is something it
-/// could have checked. A region too small to hold one slot of that kind, and a
-/// slab whose extent chain is already full, are `SosStatus.NoResource` — a
-/// STATUS, and the donation did not happen, so the caller's handle is untouched.
+/// could have checked. A region too small to hold one slot of that kind, a
+/// slab whose extent chain is already full, and a donation that would take the
+/// kind past its machine-wide ceiling are `SosStatus.NoResource`, a status; the
+/// donation did not happen, so the caller's handle is untouched.
 @export("sos_system_slab_donate")
 public func sos_system_slab_donate(handle: UInt, kind: UInt,
                                    memory: UInt) unsafe -> UInt {
@@ -253,7 +242,7 @@ public func sos_process_thread_create(handle: UInt, entry: UInt, stack_top: UInt
                  value_out)
 }
 
-/// The CALLING thread's own handle. Requires `ProcessRight.ThreadSelf`.
+/// The calling thread's own handle. Requires `ProcessRight.ThreadSelf`.
 @export("sos_process_thread_self")
 public func sos_process_thread_self(handle: UInt,
                                     value_out: UnsafePointer<UInt>) unsafe -> UInt {
@@ -287,7 +276,7 @@ public func sos_thread_join(handle: UInt,
     sos_syscall3(handle, ThreadOp.Join as UInt, 0, 0, 0, value_out)
 }
 
-/// End the CALLING thread with `code`. Requires `ThreadRight.Control` on the
+/// End the calling thread with `code`. Requires `ThreadRight.Control` on the
 /// caller's own handle. Does not return.
 @export("sos_thread_exit")
 public func sos_thread_exit(handle: UInt, code: UInt) -> UInt {
@@ -305,10 +294,9 @@ public func sos_thread_yield(handle: UInt) -> UInt {
 /// is 0 for bitwise-OR accumulation and 1 for saturating-sum (spec §2.4); any
 /// other value terminates the process.
 ///
-/// THE C ALTITUDE WRITES THE MODE AS A NUMBER, and that is the documented
-/// difference in kind the module docstring describes rather than an oversight:
-/// a C caller has no enum to be handed, so it gets the wire value. The Saw
-/// altitude above never writes one — it offers a method per mode.
+/// The C altitude writes the mode as a number, the documented difference in
+/// kind the module docstring describes: a C caller has no enum to be handed, so
+/// it gets the wire value.
 @export("sos_process_event_create")
 public func sos_process_event_create(handle: UInt, mode: UInt,
                                      value_out: UnsafePointer<UInt>) unsafe -> UInt {
@@ -323,8 +311,8 @@ public func sos_process_waiter_create(handle: UInt,
 }
 
 /// Bind IRQ `line` to a new Interrupt in this process. Requires
-/// `ProcessRight.InterruptBind`. A line this machine does not have, the
-/// timer's line, or one already bound TERMINATES the process.
+/// `ProcessRight.InterruptBind`. A line this machine does not have, the timer's
+/// line, or one already bound terminates the process.
 @export("sos_process_interrupt_bind")
 public func sos_process_interrupt_bind(handle: UInt, line: UInt,
                                          value_out: UnsafePointer<UInt>) unsafe -> UInt {
@@ -340,27 +328,29 @@ public func sos_interrupt_ack(handle: UInt) -> UInt {
 
 /// Run a created process: mint its first thread at the recorded entry, on the
 /// recorded stack, and make it runnable. Requires `ProcessRight.Start` on the
-/// CHILD's handle. The caller keeps running.
+/// child's handle. The caller keeps running.
 ///
-/// A SECOND START TERMINATES THE CALLER — it is broken code, and the caller is
+/// A second start terminates the caller: it is broken code, and the caller is
 /// the one that started it the first time.
 ///
-/// **`boot_tag_form` SAYS WHETHER `boot_tag` MEANS ANYTHING** (sawos design 4
-/// D-4): 0 is the no-tag form and puts nothing (`NO_HANDLE`) in the child's
-/// first argument register; 1 resolves `boot_tag` against the child's boot set
-/// and puts the CHILD-SIDE word there. Any other value terminates the caller.
+/// `boot_tag_form` says whether `boot_tag` means anything: 0 is the no-tag form
+/// and puts nothing (`NO_HANDLE`) in the child's first argument register; 1
+/// resolves `boot_tag` against the child's boot set and puts the child-side
+/// word there. Any other value terminates the caller.
 ///
-/// It is a flag argument rather than a reserved tag value because ZERO IS A
-/// LEGITIMATE TAG — root's region ordinals start at 0 — and because a tag is the
-/// giver's own word, which the kernel must not reserve values out of. A tag that
-/// names no given record terminates the caller: it is config the caller wrote
-/// both halves of.
+/// It is a flag argument rather than a reserved tag value because zero is a
+/// legitimate tag (root's region ordinals start at 0) and because a tag is the
+/// giver's own word, which the kernel must not reserve values out of. A tag
+/// that names no given record terminates the caller: it is config the caller
+/// wrote both halves of.
 ///
-/// THE C ALTITUDE WRITES THE FORM AS A NUMBER, which is the documented
-/// difference in kind the module docstring describes (see
-/// `sos_process_event_create`'s mode): a C caller has no enum to be handed. The
-/// Saw altitude above never writes one — it offers `start()` and
-/// `start(boot_tag:)`.
+/// A child at its thread quota is `SosStatus.QuotaExceeded` and a full thread
+/// slab is `SosStatus.NoResource`; on either the child stays `Created` and its
+/// boot set is untouched.
+///
+/// The C altitude writes the form as a number (see `sos_process_event_create`'s
+/// mode): a C caller has no enum to be handed. The Saw altitude offers
+/// `start()` and `start(boot_tag:)`.
 @export("sos_process_start")
 public func sos_process_start(handle: UInt, boot_tag_form: UInt,
                               boot_tag: UInt) unsafe -> UInt {
@@ -369,29 +359,33 @@ public func sos_process_start(handle: UInt, boot_tag_form: UInt,
                  (&var ignored) as UnsafePointer<UInt>)
 }
 
-/// **GIVE `given` TO THIS PROCESS UNDER `tag`** — the courier op (sawos design
-/// 4). Requires `ProcessRight.Give` on the CHILD's handle — "may place handles
-/// into this child's boot set" — and the universal `Transfer` right on the
-/// handle BEING GIVEN.
+/// Give `given` to this process under `tag`: the courier op. Requires
+/// `ProcessRight.Give` on the child's handle ("may place handles into this
+/// child's boot set") and the universal `Transfer` right on the handle being
+/// given.
 ///
-/// It MOVES the handle: the caller's entry is unbound and its generation bumped,
-/// a fresh entry binds in the child's table carrying the SAME kind, target and
-/// RIGHTS, and a record is appended to the child's boot set under `tag`. **THE
-/// RETURN IS A STATUS ALONE** — the child-side word is meaningless to the caller,
-/// which can call no op through it, so nothing hands it back. What crosses is the
-/// TAG, which the child reads at its drain and which the kernel never interprets.
+/// It moves the handle: a fresh entry binds in the child's table carrying the
+/// same kind and target and the given handle's rights intersected with `keep`
+/// (all ones keeps them all), the caller's entry is unbound and its generation
+/// bumped, and a record is appended to the child's boot set under `tag`. The
+/// return is a status alone: the child-side word is meaningless to the caller,
+/// which can call no op through it, so nothing hands it back. What crosses is
+/// the tag, which the child reads at its drain and which the kernel never
+/// interprets.
 ///
-/// **THE GIVER'S WORD IS DEAD AFTERWARDS.** Using it again is the ordinary
-/// `BadHandle` fault, which is design 3's generations doing the only job they
-/// have. Typed Saw callers cannot meet that: `Process.give` consumes the wrapper
-/// and disarms it before the syscall.
+/// The giver's word is dead afterwards. Using it again is the ordinary
+/// `BadHandle` fault, which is what generations are for. Typed Saw callers
+/// cannot meet that: `Process.give` consumes the wrapper and disarms it before
+/// the syscall.
 ///
-/// FOUR WAYS TO TERMINATE THE CALLER, all caller-checkable: a `given` that names
-/// nothing (`BadHandle`); one without `Transfer`, or a receiver handle without
-/// `Give` (`AccessDenied`); a child that has already been STARTED — the boot
-/// set freezes at start (`BadState`); and a `tag` the child's set already carries
-/// (`DuplicateKey`). A full child table is `SosStatus.NoResource`, a STATUS, and
-/// the give did not happen — the caller's handle is untouched.
+/// Four ways to terminate the caller, all caller-checkable: a `given` that
+/// names nothing (`BadHandle`); one without `Transfer`, or a receiver handle
+/// without `Give` (`AccessDenied`); a child that has already been started,
+/// since the boot set freezes at start (`BadState`); and a `tag` the child's
+/// set already carries (`DuplicateKey`). A full child table or boot set is
+/// `SosStatus.NoResource` and a child at its handle quota is
+/// `SosStatus.QuotaExceeded`. Both are statuses, and the give did not happen:
+/// the caller's handle is untouched.
 @export("sos_process_give")
 public func sos_process_give(handle: UInt, given: UInt, tag: UInt,
                              keep: UInt) unsafe -> UInt {
@@ -400,18 +394,18 @@ public func sos_process_give(handle: UInt, given: UInt, tag: UInt,
                  (&var ignored) as UnsafePointer<UInt>)
 }
 
-/// Take the next handle out of this process's BOOT SET, as a record copied into
-/// `buf` (spec §12). Requires `ProcessRight.BootHandles`.
+/// Take the next handle out of the calling process's boot set, as a record
+/// copied into `buf` (spec §12). Requires `ProcessRight.BootHandles`.
 ///
-/// `cap` is the buffer's size in BYTES and must be at least
+/// `cap` is the buffer's size in bytes and must be at least
 /// `boot_handle_record_bytes()`. The buffer must be word-aligned and inside
-/// this process's writable memory; a buffer that is not TERMINATES the process,
+/// the caller's writable memory; a buffer that is not terminates the caller,
 /// because it is a mistake only the caller could have made.
 ///
-/// The record's layout is public: word 0 the region ordinal, word 1 a
-/// `BootHandleKind`, word 2 the handle. An exhausted set answers
-/// `SosStatus.Drained` and keeps answering it — that is a loop's termination
-/// check, not a failure.
+/// The record's layout is public: word 0 the tag (a region ordinal in root's
+/// set, the launcher's tag in a child's), word 1 a `BootHandleKind`, word 2 the
+/// handle. An exhausted set answers `SosStatus.Drained` and keeps answering
+/// it; that is a loop's termination check, not a failure.
 @export("sos_process_boot_handle_next")
 public func sos_process_boot_handle_next(handle: UInt, buf: UnsafePointer<UInt>,
                                          cap: UInt) unsafe -> UInt {
@@ -420,25 +414,25 @@ public func sos_process_boot_handle_next(handle: UInt, buf: UnsafePointer<UInt>,
                  (&var ignored) as UnsafePointer<UInt>)
 }
 
-/// **READ THIS PROCESS'S TRAP COUNTERS** into `buf` — a copy-out record, because
-/// three 64-bit columns fit no value register on either profile (sawos design
-/// 16). Requires `ProcessRight.Stats`.
+/// Read this process's trap counters into `buf`, a copy-out record because
+/// three 64-bit columns fit no value register on either profile. Requires
+/// `ProcessRight.Stats`.
 ///
-/// `cap` is the buffer's size in BYTES and must be at least
+/// `cap` is the buffer's size in bytes and must be at least
 /// `process_stats_record_bytes()`. The buffer must be doubleword-aligned and
-/// inside this process's writable memory; a buffer that is not TERMINATES the
-/// process, because it is a mistake only the caller could have made.
+/// inside the caller's writable memory; a buffer that is not terminates the
+/// caller, because it is a mistake only the caller could have made.
 ///
-/// The record's layout is public: doubleword 0 the SYSCALL count, doubleword 1
-/// the INTERRUPT count, doubleword 2 the FAULT count. Which one is worth
-/// asserting on is `sosabi`'s to say and the short version is: the first is
-/// exact for a given program path, the second moves with the machine, the third
-/// is exact where a fault was provoked on purpose.
+/// The record's layout is public: doubleword 0 the syscall count, doubleword 1
+/// the interrupt count, doubleword 2 the fault count. Which one is worth
+/// asserting on is `sosabi`'s to say; in short, the first is exact for a given
+/// program path, the second moves with the machine, the third is exact where a
+/// fault was provoked on purpose.
 ///
-/// **THE COUNTERS BELONG TO THE HANDLE'S PROCESS, NOT TO THE CALLER.** Asking
-/// your own Process handle reads your own; asking a child's reads the child's,
-/// alive or dead. THE CALL ITSELF IS COUNTED before the answer is assembled, so
-/// a self-reading already includes the trap that took it.
+/// The counters belong to the handle's process, not to the caller. Asking your
+/// own Process handle reads your own; asking a child's reads the child's, alive
+/// or dead. The call itself is counted before the answer is assembled, so a
+/// self-reading already includes the trap that took it.
 @export("sos_process_stats")
 public func sos_process_stats(handle: UInt, buf: UnsafePointer<UInt64>,
                               cap: UInt) unsafe -> UInt {
@@ -461,22 +455,19 @@ public func sos_event_receive(handle: UInt,
 }
 
 /// Attach a waitable to a Waiter under `key`, which must not already be in use
-/// on that Waiter. Requires `WaiterRight.Attach` on the waiter and
-/// `EventRight.Wait` on the target.
+/// on that Waiter. Requires `WaiterRight.Attach` on the waiter and the target
+/// kind's `Wait` right on the target (`EventRight.Wait` for an Event).
 ///
-/// It is the first op taking TWO arguments and answering with a status alone,
-/// and the raw forms are fixed-arity by design (§5.7: no varargs across a trap
-/// boundary), so it rides the three-argument form and drops the value. The
-/// scratch that catches it is what makes this signature `unsafe`; the pointer
-/// never leaves the function, which is design 136's confinement rule.
+/// It takes three arguments and answers with a status alone, and the raw forms
+/// are fixed-arity by design (§5.7: no varargs across a trap boundary), so it
+/// rides the three-argument form and drops the value. The scratch that catches
+/// it is what makes this signature `unsafe`; the pointer never leaves the
+/// function.
 ///
-/// **AND M4 UNIT 3 SPENT THE THIRD ARGUMENT ON FLAGS** (`designs/010` rulings
-/// 9(b) and 11(c)): `WAITER_ADD_ONESHOT` detaches at delivery,
-/// `WAITER_ADD_CONSUMING` releases the caller's entry and hands the object to
-/// the attachment. The register was already there — this seam was riding the
-/// three-argument form with a zero in it — so the growth cost nothing on either
-/// side of the trap, which is the §5.7 renumberable-ops discipline paying out a
-/// second time. A word carrying any other bit is a `BadArg` fault.
+/// The third argument is a flags word: `WAITER_ADD_ONESHOT` detaches at
+/// delivery, and `WAITER_ADD_CONSUMING` releases the caller's entry and hands
+/// the object to the attachment. A word carrying any other bit is a `BadArg`
+/// fault.
 @export("sos_waiter_add")
 public func sos_waiter_add(handle: UInt, target: UInt, key: UInt,
                            flags: UInt) unsafe -> UInt {
@@ -485,10 +476,9 @@ public func sos_waiter_add(handle: UInt, target: UInt, key: UInt,
                  (&var ignored) as UnsafePointer<UInt>)
 }
 
-/// Detach the attachment registered under `key`. Requires
-/// `WaiterRight.Attach`.
+/// Detach the attachment registered under `key`. Requires `WaiterRight.Attach`.
 ///
-/// IT TAKES THE KEY, NOT THE WAITABLE'S HANDLE: detaching edits the Waiter's
+/// It takes the key, not the waitable's handle: detaching edits the Waiter's
 /// own table and never touches the waitable, so the key is the whole of what
 /// names the attachment.
 @export("sos_waiter_remove")
@@ -496,18 +486,17 @@ public func sos_waiter_remove(handle: UInt, key: UInt) -> UInt {
     sos_syscall1(handle, WaiterOp.Remove as UInt, key)
 }
 
-/// Block until an attached handle is ready, and COPY OUT a record describing it
-/// into `buf` (spec §2.2, as amended by design 178 unit 3 rider 3). Requires
-/// `WaiterRight.Wait`.
+/// Block until an attached handle is ready, and copy out a record describing it
+/// into `buf` (spec §2.2). Requires `WaiterRight.Wait`.
 ///
-/// `cap` is the buffer's size in BYTES and must be at least
+/// `cap` is the buffer's size in bytes and must be at least
 /// `wait_record_bytes()`. The buffer must be word-aligned and inside this
-/// process's writable memory; a buffer that is not TERMINATES the process,
+/// process's writable memory; a buffer that is not terminates the process,
 /// because it is a mistake only the caller could have made.
 ///
-/// The record's layout is public: word 0 the attacher's key, word 1 a `WaitTag`,
-/// word 2 the payload. A C caller reads the words; a Saw caller gets them
-/// decoded into a `WaitResult` by `sos.waiter`'s `Waiter.wait`.
+/// The record's layout is public: word 0 the attacher's key, word 1 a
+/// `WaitTag`, word 2 the payload. A C caller reads the words; a Saw caller gets
+/// them decoded into a `WaitResult` by `Waiter.wait`.
 @export("sos_waiter_wait")
 public func sos_waiter_wait(handle: UInt, buf: UnsafePointer<UInt>,
                             cap: UInt) unsafe -> UInt {
@@ -520,55 +509,28 @@ public func sos_waiter_wait(handle: UInt, buf: UnsafePointer<UInt>,
 /// `SystemRight.ClockGet`. A `type` that is not a `ClockType` terminates the
 /// process.
 ///
-/// **A FRESH HANDLE EVERY TIME onto the one Clock** (sawos design 3 D-4),
-/// superseding this seam's old "the same handle every time". Two asks are two
-/// capability instances naming one kernel-eternal object; the caller owns each
-/// and releases each. A full handle table is `SosStatus.NoResource`, which
-/// repetition can now reach.
+/// Each call mints a fresh handle onto the one Clock: two asks are two
+/// capability instances naming one kernel-eternal object, and the caller owns
+/// and releases each. A caller at its handle quota gets
+/// `SosStatus.QuotaExceeded`; a full handle table is `SosStatus.NoResource`.
 @export("sos_system_clock_get")
 public func sos_system_clock_get(handle: UInt, type: UInt,
                                  value_out: UnsafePointer<UInt>) unsafe -> UInt {
     sos_syscall3(handle, SystemOp.ClockGet as UInt, type, 0, 0, value_out)
 }
 
-// **`SystemOp.TierGet` HAS NO STUB HERE, AND THE ABSENCE IS MEASURED RATHER
-// THAN OVERSIGHT** (sawos design 35, M5 unit 4).
-//
-// It would be six lines and it would read exactly like `sos_system_clock_get`
-// above. What stopped it is a cost THIS TREE HAS ALREADY MEASURED TWICE: an
-// `@export`ed stub is a LINKER GC ROOT (it lands in `llvm.used`), so it links
-// into EVERY process image whether or not anything calls it. Design 32's
-// As-built reported the same thing as an unanticipated motion — "119 riscv32
-// images grew a uniform +40 bytes … because the new floor `@export` links into
-// every image as all ~40 of its neighbours do" — and design 34 confirmed the
-// converse, that a unit adding no `@export` sees no growth at all.
-//
-// Unit 4 is the first to have a REASON not to pay it: design 35's fence
-// requires the two isolated profiles' rows to stay byte-identical, and an
-// image-size row is a row. Measured both ways here: with the stub, all 126
-// riscv32 sosimgs grew by 24 or 40 bytes and every image-size row in the
-// riscv32 section moved; without it, the section hashes to the baseline
-// exactly. (arm64 showed 0 either way — its segments are page-granular, so
-// small growth hides in padding, which is why this only ever shows on the
-// profile whose `PROT_GRAIN` is 4.)
-//
-// The number worth carrying forward is not this op's 24 bytes but the total:
-// this file exports about sixty stubs on those terms, and a process that calls
-// none of them still carries all of them. On the MCU-class targets designs 19
-// and 20 aim at, that is the kind of constant that decides a port — design 20's
-// C3 unit parked on an image-size wall. Making the C altitude opt-in per
-// package is a real unit and it is not this one.
-//
-// The typed `System.tier()` is the whole surface meanwhile, which the vDSO
-// discipline is comfortable with — the Saw method IS the API and the C floor is
-// a parallel altitude. Adding the stub is a one-line change for whichever unit
-// next holds an authorization to move the image-size rows.
+// There is no stub for `SystemOp.TierGet`, nor for `SystemOp.StatsRegionMap`.
+// An `@export`ed stub is a linker GC root (it lands in `llvm.used`), so it
+// links into every process image whether or not anything calls it, and every
+// such export grows every image: a process that calls none of the stubs here
+// still carries all of them. Making the C altitude opt-in per package is a
+// separate piece of work. The typed `System.tier()` and
+// `System.stats_region_map()` are the surface.
 
-
-/// Read the clock into `buf` — a COPY-OUT record, because a nanosecond count is
+/// Read the clock into `buf`, a copy-out record because a nanosecond count is
 /// 64 bits and one profile's registers are not. Requires `ClockRight.Read`.
 ///
-/// `cap` is the buffer's size in BYTES and must be at least
+/// `cap` is the buffer's size in bytes and must be at least
 /// `clock_now_record_bytes()`. Doubleword 0 is the reading.
 @export("sos_clock_now")
 public func sos_clock_now(handle: UInt, buf: UnsafePointer<UInt64>,
@@ -585,19 +547,18 @@ public func sos_clock_timer_create(handle: UInt,
     sos_syscall3(handle, ClockOp.TimerCreate as UInt, 0, 0, 0, value_out)
 }
 
-/// Arm a Timer from a COPY-IN record at `record` — doubleword 0 the delay from
+/// Arm a Timer from a copy-in record at `record`: doubleword 0 the delay from
 /// now, doubleword 1 the repeat interval (0 for one-shot), both in nanoseconds.
 /// Requires `TimerRight.Arm`.
 ///
-/// THIS IS THE COPY-OUT FUNNEL'S MIRROR TWIN, and the first op in the system to
-/// hand the kernel a record rather than take one. `bytes` must be EXACTLY
+/// This is the copy-out funnel's mirror twin: the op that hands the kernel a
+/// record rather than taking one. `bytes` must be exactly
 /// `timer_arm_record_bytes()`; a record that is misaligned, outside this
-/// process's memory, or the wrong length TERMINATES the process, because all
+/// process's memory, or the wrong length terminates the process, because all
 /// three are mistakes only the caller could have made.
 ///
-/// Arming an already-armed Timer REPLACES its schedule and clears any fires it
-/// had not yet delivered. That is not an error — it is how a timeout is
-/// changed.
+/// Arming an already-armed Timer replaces its schedule and clears any fires it
+/// had not yet delivered. That is not an error; it is how a timeout is changed.
 @export("sos_timer_arm")
 public func sos_timer_arm(handle: UInt, record: UnsafePointer<UInt64>,
                           bytes: UInt) unsafe -> UInt {
@@ -609,155 +570,155 @@ public func sos_timer_arm(handle: UInt, record: UnsafePointer<UInt64>,
 /// Stop a Timer and discard any fires it had not delivered. Requires
 /// `TimerRight.Arm`.
 ///
-/// Disarming one that is not armed is a NO-OP, deliberately — a one-shot
-/// disarms itself when it fires, so cancelling a timeout that has just expired
-/// is an ordinary race rather than a caller error. (This is the opposite call
-/// from `sos_interrupt_ack`, whose no-fire case IS a fault; see `Timer.disarm`.)
+/// Disarming one that is not armed is a no-op, deliberately: a one-shot disarms
+/// itself when it fires, so cancelling a timeout that has just expired is an
+/// ordinary race rather than a caller error. (The opposite of
+/// `sos_interrupt_ack`, whose no-fire case is a fault; see `Timer.disarm`.)
 @export("sos_timer_disarm")
 public func sos_timer_disarm(handle: UInt) -> UInt {
     sos_syscall1(handle, TimerOp.Disarm as UInt, 0)
 }
 
 // -----------------------------------------------------------------------------
-// Memory, IoMemory and Mapping (spec §2.5; sawos design 6)
+// Memory, IoMemory and Mapping (spec §2.5)
 // -----------------------------------------------------------------------------
 //
-// FIVE OPS ACROSS THREE KINDS, and the pairing is the design: each memory kind
-// has a DERIVATION verb and an INSTALL verb, and the third kind is what an
-// install produces. The verbs differ because the kinds do — a split consumes
-// what it hands out and a carve does not — which is D-2's whole argument, seen
-// from the ABI.
+// Five ops across three kinds. Each memory kind has a derivation verb and an
+// install verb, and the third kind is what an install produces. The verbs
+// differ because the kinds do: a split consumes what it hands out and a carve
+// does not.
 
-/// **SPLIT — one cut from the FRONT of a region.** Requires
+/// Split: cut a `len`-byte piece out of a region. Requires
 /// `MemoryRight.Split`.
 ///
-/// The new Memory covers the first `len` bytes and THE PARENT BECOMES THE
-/// REMAINDER, so repeated splits walk a pool forward and the parent handle is
-/// the cursor. `len` must be a non-zero multiple of the target's protection
-/// granularity and no larger than the parent; anything else TERMINATES the
-/// caller, which chose the number. A full Memory slab or handle table is
+/// On a pool root the piece is served first fit from the root's free list
+/// (ranges released pieces gave back), and only when no free range can hold
+/// it, off the front of the root's unspent frontier. On any other region it
+/// comes off the front and the parent becomes the remainder. `len` must be a
+/// non-zero multiple of the target's protection granularity, and the region
+/// must be able to serve it as one range; anything else terminates the caller
+/// with `BadArg`, including a root whose free bytes are too fragmented to
+/// serve it, which the caller cannot compute. A caller at its Memory or handle
+/// quota gets `SosStatus.QuotaExceeded`; a full Memory slab or handle table is
 /// `SosStatus.NoResource`.
 ///
-/// There is no carve-from-the-middle, and the reason is the representation
-/// rather than a policy: a region is one `{base, len}` slot, and a cut from the
-/// middle would leave the parent as two ranges.
+/// There is no cut at an offset the caller chooses, for a representational
+/// reason: a region is one `{base, len}` slot, and a cut from the middle would
+/// leave the parent as two ranges.
 @export("sos_memory_split")
 public func sos_memory_split(handle: UInt, len: UInt,
                              value_out: UnsafePointer<UInt>) unsafe -> UInt {
     sos_syscall3(handle, MemoryOp.Split as UInt, len, 0, 0, value_out)
 }
 
-/// **MAP — install this region in `process`'s address space, and answer with a
-/// MAPPING handle.** Requires `MemoryRight.Map` here AND `ProcessRight.Map` on
+/// Map: install this region in `process`'s address space, and answer with a
+/// Mapping handle. Requires `MemoryRight.Map` here and `ProcessRight.Map` on
 /// `process`.
 ///
-/// TWO RIGHTS ON TWO OBJECTS, because holding bytes must not imply authority
+/// Two rights on two objects, because holding bytes must not imply authority
 /// over somebody's address space. `access` is a mask of `MapAccess` bits; write
-/// without read, no access at all, and any bit outside the three all TERMINATE
+/// without read, no access at all, and any bit outside the three all terminate
 /// the caller. A region whose range this machine cannot grant is the same
-/// fault. A domain with no protection row left, or a full Mapping slab or
-/// handle table, is `SosStatus.NoResource`.
+/// fault. The target's mapping quota is capped at the protection rows its
+/// domain has left, so a domain with no row left is `SosStatus.QuotaExceeded`,
+/// as is a caller at its handle quota. No address space left for the range, a
+/// full Mapping slab or a full handle table is `SosStatus.NoResource`.
 ///
-/// THE CALLER SUPPLIES NO ADDRESSES. The range is the region's own, which is
-/// why there is still no op that reads a Memory's bounds.
+/// The caller supplies no addresses. No op reads a Memory's bounds;
+/// `MappingOp.Base` reads where a mapping landed.
 @export("sos_memory_map")
 public func sos_memory_map(handle: UInt, process: UInt, access: UInt,
                            value_out: UnsafePointer<UInt>) unsafe -> UInt {
     sos_syscall3(handle, MemoryOp.Map as UInt, process, access, 0, value_out)
 }
 
-/// **CARVE — a sub-window of this device window, LEAVING THE PARENT WHOLE.**
+/// Carve: a sub-window of this device window, leaving the parent whole.
 /// Requires `IoMemoryRight.Carve`.
 ///
 /// `offset` is relative to the parent, so a caller names a sub-window without
-/// learning an address. The parent is UNCHANGED — MMIO is pinned and a fixed
-/// region may be handed out many times — which is the whole difference from
+/// learning an address. The parent is unchanged (MMIO is pinned and a fixed
+/// region may be handed out many times), which is the difference from
 /// `sos_memory_split`.
 ///
-/// A window this machine cannot express as one protection grant TERMINATES the
+/// A window this machine cannot express as one protection grant terminates the
 /// caller, and the rule is per-profile: one wants a naturally-aligned power of
 /// two, the other a whole number of pages. So does a range past the parent's
-/// end. A full slab or handle table is `SosStatus.NoResource`.
+/// end. A caller at its IoMemory or handle quota gets
+/// `SosStatus.QuotaExceeded`; a full slab or handle table is
+/// `SosStatus.NoResource`.
 @export("sos_iomemory_carve")
 public func sos_iomemory_carve(handle: UInt, offset: UInt, len: UInt,
                                value_out: UnsafePointer<UInt>) unsafe -> UInt {
     sos_syscall3(handle, IoMemoryOp.Carve as UInt, offset, len, 0, value_out)
 }
 
-/// **MAP — install this device window in `process`'s address space.** Requires
-/// `IoMemoryRight.Map` here AND `ProcessRight.Map` on `process`.
+/// Map: install this device window in `process`'s address space. Requires
+/// `IoMemoryRight.Map` here and `ProcessRight.Map` on `process`.
 ///
-/// THERE IS NO ACCESS ARGUMENT, and that is the type doing its job: an IoMemory
-/// can only ever produce a device-attribute row, read-write, never executable.
-/// A driver therefore cannot obtain a cacheable view of a register block by any
-/// spelling — the guarantee is the object kind, not a check.
+/// There is no access argument: an IoMemory can only ever produce a
+/// device-attribute row, read-write, never executable. A driver therefore
+/// cannot obtain a cacheable view of a register block by any spelling; the
+/// guarantee is the object kind, not a check.
 @export("sos_iomemory_map")
 public func sos_iomemory_map(handle: UInt, process: UInt,
                              value_out: UnsafePointer<UInt>) unsafe -> UInt {
     sos_syscall3(handle, IoMemoryOp.Map as UInt, process, 0, 0, value_out)
 }
 
-/// **UNMAP — take this mapping's row out of the domain it was installed in.**
+/// Unmap: take this mapping's row out of the domain it was installed in.
 /// Requires `MappingRight.Unmap`.
 ///
 /// Only a Mapping unmaps (§2.5), which is what the object is for. A mapping
-/// that is already unmapped — or whose target process has died, taking its
-/// whole domain with it — TERMINATES the caller with `BadState`: the caller
+/// that is already unmapped, or whose target process has died and taken its
+/// whole domain with it, terminates the caller with `BadState`: the caller
 /// either unmapped it or created the child.
 ///
-/// RELEASING THE HANDLE IS NOT AN UNMAP. Release destroys the entry and never
-/// the row (§2.5's stance: a mapping dropped without an unmap is permanent,
-/// safe-but-leaked), so a caller that means to revoke says so.
+/// Releasing the handle is not an unmap. Release destroys the entry and never
+/// the row (§2.5: a mapping dropped without an unmap is permanent, safe but
+/// leaked), so a caller that means to revoke says so.
 @export("sos_mapping_unmap")
 public func sos_mapping_unmap(handle: UInt) -> UInt {
     sos_syscall1(handle, MappingOp.Unmap as UInt, 0)
 }
 
-// **`MappingOp.Base` HAS NO `sos_mapping_base` HERE, AND THE OMISSION IS
-// DELIBERATE AND OWED** (sawos design 33).
-//
-// The per-op C function is what this section is, so the op ought to have one —
-// `Mapping.base()` reaches it through `call_value` instead, which is a complete
-// answer for a Saw caller and no answer at all for a C one. What stopped it is
-// mechanical rather than principled: an `@export`ed symbol is externally visible
-// and therefore never garbage-collected, so adding one grows EVERY user image on
-// every architecture, and this unit's gate requires the riscv32 half of the
-// transcript to be byte-identical. Measured, not assumed: the export cost every
-// riscv32 image exactly 24 bytes.
-//
-// So it is recorded as owed work for whichever unit next has authorization to
-// move those rows, rather than smuggled in against the gate that proves the tier
-// split is real. Nothing else about the op is provisional — the number, the
-// right and the kernel arm are all here.
+// There is no `sos_mapping_base` for `MappingOp.Base`: `Mapping.base()` reaches
+// it through `call_value`, which answers a Saw caller and not a C one. The
+// reason is mechanical: an `@export`ed symbol is externally visible and never
+// garbage-collected, so adding one grows every user image on every
+// architecture. Nothing else about the op is provisional (the number, the right
+// and the kernel arm are all here).
 
 // -----------------------------------------------------------------------------
-// The pair (spec §2.1; sawos design 13)
+// The pair (spec §2.1)
 // -----------------------------------------------------------------------------
 //
-// THREE OPS: make a connection, put a message in, take one out. The factory is
-// on the PROCESS object because a pipe is IPC and carries nothing system-shaped
-// (design 10 ruling 3), and each END has exactly one op because `post` is the
-// one kernel primitive on the client side (ruling 4) and nonblocking `take` is
-// its mirror.
+// `ProcessOp.PipeCreate` makes a connection; the inlet posts (`Post`) or
+// posts and parks for the answer (`Call`); the outlet takes (`Take`); a claim
+// resolves (`Resolve`) or asks whether the answer is in (`Ready`); an
+// obligation replies (`Reply`) or replies and waits (`ReplyWait`). The factory
+// is on the Process object because a pipe is IPC and carries nothing
+// system-shaped.
 
-/// **MAKE A CONNECTION, and answer with BOTH of its ends** as a record copied
-/// into `buf` (spec §2.1). Requires `ProcessRight.PipeCreate`.
+/// Make a connection, and answer with both of its ends as a record copied into
+/// `buf` (spec §2.1). Requires `ProcessRight.PipeCreate`.
 ///
-/// `cap` is the buffer's size in BYTES and must be at least
-/// `pipe_create_record_bytes()`. The buffer must be word-aligned and inside this
-/// process's writable memory; a buffer that is not TERMINATES the process,
+/// `cap` is the buffer's size in bytes and must be at least
+/// `pipe_create_record_bytes()`. The buffer must be word-aligned and inside
+/// the caller's writable memory; a buffer that is not terminates the caller,
 /// because it is a mistake only the caller could have made.
 ///
-/// The record's layout is public: word 0 the PipeInlet handle — the client end,
-/// where requests flow in — and word 1 the PipeOutlet handle, the server end
-/// where they come out. It answers through the funnel rather than the value
-/// register for the plainest reason: an op returns ONE word and this one has two
-/// to say (`sos_clock_now` is the precedent for answering in memory at all).
+/// The record's layout is public: word 0 the PipeInlet handle (the client end,
+/// where requests flow in) and word 1 the PipeOutlet handle (the server end,
+/// where they come out). It answers through the funnel rather than the value
+/// register because an op returns one word and this one has two to say
+/// (`sos_clock_now` is the precedent for answering in memory).
 ///
-/// Both ends are minted into the CALLER's table; wiring them outward is
-/// `sos_process_give`'s job, which is what makes a launcher able to hand the
-/// inlet to one child and keep or pass the outlet. A process at its pipe budget
-/// is `SosStatus.QuotaExceeded`; a full slab or handle table is
+/// Both ends are minted into the table of the process the handle names, which
+/// is also the one charged; that is the caller only on its own handle, and
+/// `buf` is always the caller's. Wiring the ends outward is
+/// `sos_process_give`'s job, which lets a launcher hand the inlet to one child
+/// and keep or pass the outlet. That process at its pipe or handle quota is
+/// `SosStatus.QuotaExceeded`; a full slab or handle table is
 /// `SosStatus.NoResource`.
 @export("sos_process_pipe_create")
 public func sos_process_pipe_create(handle: UInt, buf: UnsafePointer<UInt>,
@@ -767,25 +728,36 @@ public func sos_process_pipe_create(handle: UInt, buf: UnsafePointer<UInt>,
                  (&var ignored) as UnsafePointer<UInt>)
 }
 
-/// **POST — stage `len` bytes from `body` for the far end, and answer with the
-/// CLAIM on its reply** through `value_out`. Requires `PipeInletRight.Post`.
+/// Post: stage a message for the far end, and answer with the claim on its
+/// reply through `value_out`. Requires `PipeInletRight.Post`.
 ///
-/// IT NEVER SUSPENDS (design 10 ruling 4). `len` may be 0 — a data-free message
-/// is §2.1's own option, and a zero-length post reads no buffer at all, so the
-/// address is not even looked at. A `len` above `PIPE_BODY_BYTES` TERMINATES the
-/// caller: the maximum is published and the caller chose the number. So does a
-/// body that is misaligned or outside this process's memory.
+/// `args` is a send record (`PipeSendRecord`): word 0 the body's address, word
+/// 1 its length, then `PIPE_MSG_HANDLES` handle words, `NO_HANDLE` for an empty
+/// slot. `args_bytes` must be exactly `pipe_send_record_bytes()`.
 ///
-/// **THE VALUE IS A `PipeReply` HANDLE** (sawos design 14) — the client's claim
-/// on the one reply this message is owed, minted into the caller's table. On a
-/// refusal nothing is minted and the value means nothing.
+/// It never suspends. The length may be 0 (a data-free message is §2.1's own
+/// option, and a zero-length post reads no body at all, so the address is not
+/// even looked at). A length above `PIPE_BODY_BYTES` terminates the caller:
+/// the maximum is published and the caller chose the number. So does a record
+/// or body that is misaligned or outside this process's memory, and a handle
+/// word that names nothing, lacks the universal `Transfer` right, or names a
+/// kind a message cannot carry.
 ///
-/// THREE REFUSALS ARE STATUSES: `SosStatus.PeerClosed` when the far end is gone
-/// (nobody can ever take it, and it is terminal — nothing un-closes),
-/// `SosStatus.WouldBlock` when the ring has no free slot, which is transient and
-/// clears when an exchange settles, and `SosStatus.NoResource` /
-/// `SosStatus.QuotaExceeded` when there is no room in the caller's table for the
-/// claim.
+/// The handles leave the caller's table at the post: the kernel unbinds each
+/// one and holds it in the exchange until the receiver takes it, so each word
+/// is stale afterwards and using it, a release included, is a `BadHandle`
+/// fault. A refusal takes nothing.
+///
+/// The value is a `PipeReply` handle: the client's claim on the one reply this
+/// message is owed, minted into the caller's table. On a refusal nothing is
+/// minted and the value means nothing.
+///
+/// Three refusals are statuses: `SosStatus.PeerClosed` when the far end is gone
+/// (nobody can ever take it, and it is terminal since nothing un-closes),
+/// `SosStatus.WouldBlock` when the ring has no free slot (transient; it clears
+/// when an exchange settles), and `SosStatus.NoResource` /
+/// `SosStatus.QuotaExceeded` when there is no room in the caller's table for
+/// the claim.
 @export("sos_pipe_inlet_post")
 public func sos_pipe_inlet_post(handle: UInt, args: UnsafePointer<UInt>,
                                 args_bytes: UInt,
@@ -794,37 +766,42 @@ public func sos_pipe_inlet_post(handle: UInt, args: UnsafePointer<UInt>,
                  value_out)
 }
 
-/// **CALL — post `len` bytes from `body`, PARK, and answer the REPLY's length**
-/// through `value_out`, with the reply's bytes in `reply` (sawos design 17; the
-/// fused client path of design 10 ruling 4's rider). Requires
-/// `PipeInletRight.Post` — the SAME bit `sos_pipe_inlet_post` spends, because a
-/// call submits a message exactly as a post does and the fusion is mechanics
-/// rather than authority.
+/// Call: post a message, park, and answer the reply's length through
+/// `value_out`, with the reply in `reply`. Requires `PipeInletRight.Post`, the
+/// same bit `sos_pipe_inlet_post` spends, because a call submits a message
+/// exactly as a post does and the fusion is mechanics rather than authority.
 ///
-/// **IT IS THE WHOLE RPC IN ONE TRAP**: post, wait for the answer, copy it out.
-/// The composed spelling — post, attach the claim to a Waiter, wait — is three,
-/// and both remain available; a caller picks by whether it wants to multiplex.
+/// It is the whole RPC in one trap: post, wait for the answer, copy it out. The
+/// composed spelling (post, attach the claim to a Waiter, wait) is three, and
+/// both remain available; a caller picks by whether it wants to multiplex.
 ///
-/// **IT NEVER ANSWERS `WouldBlock`.** A full staging ring PARKS the caller on
-/// the connection's room-to-post level and resumes it when an exchange settles,
+/// It never answers `WouldBlock`. A full staging ring parks the caller on the
+/// connection's room-to-post level and resumes it when an exchange settles,
 /// which is the leg the composed send has to write by hand.
 ///
-/// `reply` takes no capacity of its own, on `sos_pipe_outlet_take`'s precedent:
-/// it is checked against `PIPE_BODY_BYTES` of the caller's REAL memory rather
-/// than against a number the caller typed. `len` may be 0. A `len` above
-/// `PIPE_BODY_BYTES`, a body outside this process's memory and a reply buffer
-/// that is not writable for a whole slot all TERMINATE the caller.
+/// `args` is the send record `sos_pipe_inlet_post` takes, with the same checks
+/// and the same rule for the handles it carries. `reply` receives a
+/// delivered-message record (`PipeMsgRecord`: the packed meta, the handle
+/// words, then the body). It takes no capacity of its own: it is checked
+/// against `pipe_msg_record_bytes()` of the caller's real memory rather than
+/// against a number the caller typed, and a reply buffer that is not writable
+/// for that many bytes terminates the caller.
 ///
-/// `SosStatus.PeerClosed` is the one refusal and it covers every way the answer
-/// can fail to arrive: the server end was already gone, the server dropped the
-/// obligation, the server end went while the caller was parked, or the caller's
-/// message was still staged when the last outlet handle went. It is `resolve`'s
-/// own convention, which is what makes the fused and composed paths report the
-/// same fact with the same word.
+/// `SosStatus.PeerClosed` covers every way the answer can fail to arrive: the
+/// server end was already gone, the server dropped the obligation, the server
+/// end went while the caller was parked, or the caller's message was still
+/// staged when the last outlet handle went. It is `resolve`'s own convention,
+/// so the fused and composed paths report the same fact with the same word.
+/// When the server end was gone before the message was staged (at the call, or
+/// while the caller was parked for room), nothing was taken and the handle
+/// words are still the caller's.
 ///
-/// NO HANDLE IS MINTED, either way. That is the fused path's other saving: a
-/// blocking client spends no table row on a claim, so its in-flight depth stops
-/// being bounded by `MAX_HANDLES`.
+/// The one other refusal is a reply whose handles find no room in the caller's
+/// table: `SosStatus.NoResource` or `SosStatus.QuotaExceeded`, with the reply
+/// and its handles lost, because a parked call cannot ask again.
+///
+/// No claim handle is minted, either way. A blocking client spends no table row
+/// on a claim, so its in-flight depth is not bounded by `MAX_HANDLES`.
 @export("sos_pipe_inlet_call")
 public func sos_pipe_inlet_call(handle: UInt, args: UnsafePointer<UInt>,
                                 args_bytes: UInt, reply: UnsafePointer<UInt>,
@@ -833,30 +810,33 @@ public func sos_pipe_inlet_call(handle: UInt, args: UnsafePointer<UInt>,
                  reply as UInt, value_out)
 }
 
-/// **REPLY-WAIT — discharge this obligation, then park on a Waiter, in one
-/// trap** (sawos design 17; the fused server path). Requires
-/// `PipeRequestRight.Reply` here AND `WaiterRight.Wait` on the waiter the args
-/// record names — two rights on two objects, because the op does two things.
+/// Reply-wait: discharge this obligation, then park on a Waiter, in one trap.
+/// Requires `PipeRequestRight.Reply` here and `WaiterRight.Wait` on the waiter
+/// the args record names: two rights on two objects, because the op does two
+/// things.
 ///
-/// `args` is a `pipe_reply_wait_record_bytes()` copy-IN record: word 0 the
-/// Waiter handle, word 1 the reply body's address, word 2 its length. It goes
-/// through a record rather than through registers because the op has four
-/// things to say and §5.7 gives it three — `sos_timer_arm`'s door, used for the
-/// same reason. `args_bytes` must be EXACTLY that size.
+/// `args` is a `pipe_reply_wait_record_bytes()` copy-in record
+/// (`PipeReplyWaitRecord`): word 0 the Waiter handle, then the send record
+/// `sos_pipe_inlet_post` takes (the reply body's address, its length and the
+/// handle words). It goes through a record because the op has four things to
+/// say and §5.7 gives it three (`sos_timer_arm`'s door, used for the same
+/// reason). `args_bytes` must be exactly that size.
 ///
 /// `record` is where the delivery lands and is the same buffer
 /// `sos_waiter_wait` takes, checked against `wait_record_bytes()` of the
 /// caller's real memory.
 ///
-/// **THE OBLIGATION IS DISCHARGED ON EVERY PATH**, so the caller's handle word
-/// is dead whatever comes back — §2.1's ratified sentence, and the reason the
-/// typed wrapper disarms before the trap.
+/// The obligation is discharged on every path (§2.1), so the caller's handle
+/// word is dead whatever comes back. A Saw caller cannot reach it again,
+/// because `PipeRequest.reply_wait` is a `consumes` method. The reply's
+/// handles leave the caller's table when the reply lands; a `Reply`-leg
+/// failure took none of them.
 ///
-/// **THE ANSWER HAS TWO CHANNELS.** `Ok` means the reply landed AND a delivery
-/// is in `record`. Any other status comes with a `ReplyWaitLeg` in `value_out`
-/// saying which half produced it: `Reply` (the client had abandoned its claim —
-/// the op returned WITHOUT parking, so one dead client cannot stall a server
-/// loop) or `Wait` (the reply LANDED and the wait itself broke, e.g.
+/// The answer has two channels. `Ok` means the reply landed and a delivery is
+/// in `record`. Any other status comes with a `ReplyWaitLeg` in `value_out`
+/// saying which half produced it: `Reply` (the client had abandoned its claim;
+/// the op returned without parking, so one dead client cannot stall a server
+/// loop) or `Wait` (the reply landed and the wait itself broke, e.g.
 /// `SosStatus.Revoked`). `Wait` is zero, which is what every waker in the
 /// kernel writes anyway.
 @export("sos_pipe_request_reply_wait")
@@ -868,27 +848,23 @@ public func sos_pipe_request_reply_wait(handle: UInt, args: UnsafePointer<UInt>,
                  args_bytes, record as UInt, value_out)
 }
 
-/// **TAKE — copy the OLDEST staged message into `body`, and answer a RECORD
-/// naming its length and the obligation to reply to it.** Requires
-/// `PipeOutletRight.Take`.
+/// Take: copy the oldest staged message into `rec`, with the obligation to
+/// reply to it. Requires `PipeOutletRight.Take`.
 ///
-/// IT NEVER PARKS. `rec` is a two-word buffer — word 0 the message's LENGTH,
-/// word 1 a `PipeRequest` handle minted into the caller's table — and `rec_cap`
-/// is its size in BYTES, which must be at least `pipe_take_record_bytes()`. A
-/// smaller one TERMINATES the caller, as does a record buffer outside this
-/// process's writable memory.
+/// It never parks. `rec` receives a take record (`PipeTakeRecord`): word 0 a
+/// `PipeRequest` handle minted into the caller's table, then a
+/// delivered-message record (`PipeMsgRecord`: the packed meta with the length
+/// and the handle kinds, the handle words, then the body). `rec_cap` is its
+/// size in bytes, which must be at least `pipe_take_record_bytes()`. A smaller
+/// one terminates the caller, as does a record buffer outside this process's
+/// writable memory.
 ///
-/// `body` takes no capacity of its own: it is checked against `PIPE_BODY_BYTES`,
-/// still the published minimum, but against the caller's REAL memory rather than
-/// against a number the caller typed — a buffer that short TERMINATES the caller
-/// with `BadBuffer`.
-///
-/// TWO REFUSALS ARE STATUSES: `SosStatus.WouldBlock` when nothing is staged and
+/// Two refusals are statuses: `SosStatus.WouldBlock` when nothing is staged and
 /// the far end still exists, and `SosStatus.PeerClosed` when nothing is staged
-/// AND the far end is gone. THE ORDER IS THE CONTRACT — everything staged is
+/// and the far end is gone. The order is the contract: everything staged is
 /// handed over first, whatever became of the sender, and only a drained ring
-/// answers `PeerClosed`. Nothing un-closes, so every later take answers the same.
-/// A full table or a spent handle budget is `SosStatus.NoResource` /
+/// answers `PeerClosed`. Nothing un-closes, so every later take answers the
+/// same. A full table or a spent handle budget is `SosStatus.NoResource` /
 /// `SosStatus.QuotaExceeded`, with the message left staged for whoever takes it
 /// next.
 @export("sos_pipe_outlet_take")
@@ -899,31 +875,31 @@ public func sos_pipe_outlet_take(handle: UInt, rec: UnsafePointer<UInt>,
                  (&var ignored) as UnsafePointer<UInt>)
 }
 
-/// **RESOLVE — take the reply, PARKING until it is written, and answer its
-/// length** through `value_out`. Requires `PipeReplyRight.Resolve`.
+/// Resolve: take the reply, parking until it is written, and answer its length
+/// through `value_out`. Requires `PipeReplyRight.Resolve`.
 ///
-/// **IT PARKS SINCE M4 UNIT 4.5, AND IT NEVER ANSWERS `WouldBlock`**
-/// (`designs/010` ruling 12(b)). A pending exchange blocks the calling thread on
-/// the claim's ready level and resumes with one of the two answers below; the
-/// non-blocking question is `sos_pipe_reply_ready` beside it. The blocking
-/// `send(msg)` / `send(msg, timeout:)` compositions are a THIRD door and use
-/// neither — they attach the claim, and the reply arrives IN THE WAIT RECORD, so
-/// a claim whose answer was delivered that way answers `PeerClosed` here.
+/// It parks and never answers `WouldBlock`. A pending exchange blocks the
+/// calling thread on the claim's ready level and resumes with one of the two
+/// answers below; the non-blocking question is `sos_pipe_reply_ready` beside
+/// it. A claim attached to a Waiter is a third door that uses neither: the
+/// reply arrives in the wait record, so a claim whose answer was delivered that
+/// way answers `PeerClosed` here.
 ///
-/// `cap` is the buffer's size in BYTES and must be at least `PIPE_BODY_BYTES` —
-/// the whole slot's size, because a caller cannot size a buffer against a length
-/// it has not been told yet.
+/// `rec` receives a delivered-message record (`PipeMsgRecord`), and `cap` is
+/// its size in bytes, which must be at least `pipe_msg_record_bytes()`: a
+/// whole slot's record, because a caller cannot size a buffer against a length
+/// it has not been told yet. A smaller one terminates the caller.
 ///
-/// **IT CONSUMES THE CLAIM ON EVERY PATH.** A delivered reply, a
+/// It consumes the claim on every path. A delivered reply, a
 /// `SosStatus.PeerClosed` and a refused handle mint all end the exchange for
-/// this caller, so the handle is destroyed with them and using the word again is
-/// the ordinary `BadHandle` fault. A C caller that must not lose the handles a
-/// reply carries makes table room BEFORE it resolves; a Saw caller cannot reach
-/// the word at all, because the wrapper is a `consumes` method.
+/// this caller, so the handle is destroyed with them and using the word again
+/// is the ordinary `BadHandle` fault. A C caller that must not lose the handles
+/// a reply carries makes table room before it resolves; a Saw caller cannot
+/// reach the word at all, because the wrapper is a `consumes` method.
 ///
-/// `SosStatus.PeerClosed` means the server side abandoned it — the obligation was
-/// dropped without a reply, or the connection's server end went away before the
-/// message could ever be taken.
+/// `SosStatus.PeerClosed` means the server side abandoned it: the obligation
+/// was dropped without a reply, or the connection's server end went away before
+/// the message could ever be taken.
 @export("sos_pipe_reply_resolve")
 public func sos_pipe_reply_resolve(handle: UInt, rec: UnsafePointer<UInt>,
                                    cap: UInt,
@@ -932,34 +908,38 @@ public func sos_pipe_reply_resolve(handle: UInt, rec: UnsafePointer<UInt>,
                  value_out)
 }
 
-/// **READY — has the answer arrived?** Requires `PipeReplyRight.Wait` (the level
+/// Ready: has the answer arrived? Requires `PipeReplyRight.Wait` (the level
 /// question's bit; `Resolve` stays the consuming act's).
 ///
-/// Status-only and it SPENDS NOTHING: `0` (`SosStatus.Ok`) the reply is written
-/// and a resolve will return it without parking, `SosStatus.WouldBlock` not yet
-/// and the exchange is still live, `SosStatus.PeerClosed` it can never arrive —
-/// at which point the holder RELEASES the claim rather than resolving it, since
-/// there is no answer to fetch. Readiness is monotonic, so asking and then
-/// resolving has no check-then-act race.
+/// Status-only, and it spends nothing: `0` (`SosStatus.Ok`) the reply is
+/// written and a resolve will return it without parking, `SosStatus.WouldBlock`
+/// not yet and the exchange is still live, `SosStatus.PeerClosed` it can never
+/// arrive, at which point the holder releases the claim rather than resolving
+/// it, since there is no answer to fetch. Readiness is monotonic, so asking and
+/// then resolving has no check-then-act race.
 @export("sos_pipe_reply_ready")
 public func sos_pipe_reply_ready(handle: UInt) -> UInt {
     sos_syscall1(handle, PipeReplyOp.Ready as UInt, 0)
 }
 
-/// **REPLY — copy `len` bytes from `body` back to the client, and DISCHARGE the
-/// obligation.** Requires `PipeRequestRight.Reply`.
+/// Reply: send a message back to the client, and discharge the obligation.
+/// Requires `PipeRequestRight.Reply`.
 ///
-/// `len` may be 0 — a reply that carries no data is still an answer — and a `len`
-/// above `PIPE_BODY_BYTES` TERMINATES the caller, exactly as it does at a post.
+/// `args` is the send record `sos_pipe_inlet_post` takes, with the same
+/// checks; `args_bytes` must be exactly `pipe_send_record_bytes()`. The length
+/// may be 0 (a reply that carries no data is still an answer), and a length
+/// above `PIPE_BODY_BYTES` terminates the caller, as at a post. The handles
+/// leave the caller's table when the reply lands; a `PeerClosed` took none of
+/// them.
 ///
-/// **IT ALWAYS CONSUMES THE REQUEST**, which is what single-use means: the
-/// caller's handle is destroyed whether the reply landed or not, and using the
-/// word again is the ordinary `BadHandle` fault.
+/// It always consumes the request, which is what single-use means: the caller's
+/// handle is destroyed whether the reply landed or not, and using the word
+/// again is the ordinary `BadHandle` fault.
 ///
 /// `SosStatus.PeerClosed` says the reply was not delivered because the client
-/// abandoned its claim — §2.1's ratified answer, never a silent success, and
-/// ignorable with `let _ =` on the std-Channel close precedent. The obligation is
-/// discharged either way.
+/// abandoned its claim. It is §2.1's answer, never a silent success, and
+/// ignorable with `let _ =` on the std-Channel close precedent. The obligation
+/// is discharged either way.
 @export("sos_pipe_request_reply")
 public func sos_pipe_request_reply(handle: UInt, args: UnsafePointer<UInt>,
                                    args_bytes: UInt) unsafe -> UInt {
@@ -968,149 +948,142 @@ public func sos_pipe_request_reply(handle: UInt, args: UnsafePointer<UInt>,
                  0, (&var ignored) as UnsafePointer<UInt>)
 }
 
-/// **RELEASE — destroy this handle, whatever kind it names** (sawos design 3
-/// D-2). The ONE spelling of release in this module.
+/// Release: destroy this handle, whatever kind it names. The one spelling of
+/// release in this module.
 ///
-/// It is not `sos_<object>_release` nine times, because release is not an op on
-/// any object: it is one universal op number the kernel intercepts before it
-/// has decided the kind, so there is one function here for the same reason there
-/// is one op number there.
+/// It is not `sos_<object>_release` once per kind, because release is not an op
+/// on any object: it is one universal op number the kernel intercepts before it
+/// has decided the kind, so there is one function here for the same reason
+/// there is one op number there.
 ///
-/// **UNGATED.** No right is checked. A handle is a capability INSTANCE and the
+/// Ungated. No right is checked. A handle is a capability instance and the
 /// object's identity lives in its slot, so destroying your own instance takes
 /// nothing from anybody else holding one. Releasing your System handle or your
-/// own Process handle is legal-but-doomed: you lose the authority, which is what
-/// you asked for.
+/// own Process handle is legal but doomed: you lose the authority, which is
+/// what you asked for.
 ///
-/// **A WORD THAT DOES NOT RESOLVE TERMINATES THE PROCESS.** `NO_HANDLE`, a
-/// malformed word, a word whose handle was already released — all of them are
-/// the ordinary `BadHandle` fault, because using a handle you released is broken
-/// code and the kernel's generations exist to diagnose it rather than to
-/// tolerate it. This function therefore does not return on that path, and its
-/// status word is only ever `Ok`.
+/// A word that does not resolve terminates the process. `NO_HANDLE`, a
+/// malformed word, a word whose handle was already released: all are the
+/// ordinary `BadHandle` fault, because using a handle you released is broken
+/// code and the kernel's generations exist to diagnose it rather than tolerate
+/// it. This function therefore does not return on that path, and its status
+/// word is only ever `Ok`.
 ///
-/// TYPED SAW CALLERS DO NOT WRITE THIS. In the typed layer release is DROPPING
-/// the wrapper — that is what its `deinit` does, and this is the syscall the
-/// deinit issues. It is public because the C altitude is the floor and a non-Saw
-/// process needs a way to say it; a Saw process that reaches for it is working
-/// with raw words, which is a thing only the raw altitude does.
+/// Typed Saw callers do not write this. In the typed layer release is dropping
+/// the wrapper: that is what its `deinit` does, and this is the syscall the
+/// deinit issues. It is public because the C altitude is the floor and a
+/// non-Saw process needs a way to say it.
 @export("sos_handle_release")
 public func sos_handle_release(handle: UInt) -> UInt {
     sos_syscall1(handle, RELEASE_OP, 0)
 }
 
-/// **MINT — a SIBLING handle onto the same object, whatever kind it names** (the
-/// Aug-29 user rulings on design 4). The second universal op, beside release and
-/// for the same reason: naming an object twice is one act for every kind.
+/// Mint: a sibling handle onto the same object, whatever kind it names. The
+/// second universal op, beside release and for the same reason: naming an
+/// object twice is one act for every kind.
 ///
-/// `keep` is a KEEP MASK: the sibling's rights are the source's INTERSECTED with
-/// it, so all-ones means "the same rights" and anything narrower attenuates. The
-/// intersection is what makes no-amplification structural — a sibling is a
-/// subset of its source by construction — and it is TOTAL, so naming a right the
-/// source does not hold is a no-op rather than an error. Its polarity is the
-/// ruling: a keep mask FAILS CLOSED when a kind gains a right later, where a
-/// removal mask would have passed the new authority through in silence. Write a
-/// complement (`~(SystemRight.Transfer as UInt32) & 0xFFFF_FFFF`) when
-/// subtractive intent is what you mean — the fail-open choice then reads at the
-/// call site.
+/// `keep` is a keep mask: the sibling's rights are the source's intersected
+/// with it, so all-ones means "the same rights" and anything narrower
+/// attenuates. The intersection makes no-amplification structural (a sibling is
+/// a subset of its source by construction) and it is total, so naming a right
+/// the source does not hold is a no-op rather than an error. A keep mask fails
+/// closed when a kind gains a right later, where a removal mask would pass the
+/// new authority through in silence. Write a complement
+/// (`~(SystemRight.Transfer as UInt32) & 0xFFFF_FFFF`) when subtractive intent
+/// is what you mean; the fail-open choice then reads at the call site.
 ///
-/// **IT IS GATED ON THE UNIVERSAL `Mint` BIT, WHICH IS ITSELF MASKABLE**: a
-/// sibling minted through a mask that left `Mint` out cannot mint again, so a
-/// launcher stops proliferation exactly where it says it does. A source without
-/// `Mint` TERMINATES the caller, as does a word that names nothing.
+/// It is gated on the universal `Mint` bit, which is itself maskable: a sibling
+/// minted through a mask that left `Mint` out cannot mint again, so a launcher
+/// stops proliferation where it says. A source without `Mint` terminates the
+/// caller, as does a word that names nothing.
 ///
-/// The sibling is INDEPENDENT — its own slot, its own generation, its own
-/// release — and names the same object, which is what makes it a second NAME
-/// rather than a second object.
+/// The sibling is independent (its own slot, generation and release) and names
+/// the same object, so it is a second name rather than a second object.
 @export("sos_handle_mint")
 public func sos_handle_mint(handle: UInt, keep: UInt,
                             value_out: UnsafePointer<UInt>) unsafe -> UInt {
     sos_syscall3(handle, MINT_OP, keep, 0, 0, value_out)
 }
 
-/// The keep mask that narrows nothing — `System.mint()`'s default.
+/// The keep mask that narrows nothing: `System.mint()`'s default.
 ///
 /// It is spelled as every bit rather than as a list of the rights that exist,
-/// which is the KEEP mask's own polarity applied to itself: a mask naming the
-/// rights of today would silently start narrowing the day a right is added, and
-/// "the same rights this handle has" is what the no-argument spelling means.
+/// which is the keep mask's polarity applied to itself: a mask naming the
+/// rights defined when it was written would silently start narrowing the day
+/// a right is added, and "the same rights this handle has" is what the
+/// no-argument spelling means.
 public static ALL_RIGHTS: UInt32 = 0xFFFF_FFFF
 
 // =============================================================================
-// The OWNING tier's contract (sawos design 3 D-5) — what every wrapper's
-// `deinit` above this file is written to
+// The owning tier's contract: what every wrapper's `deinit` is written to
 // =============================================================================
 //
-// **EVERY WRAPPER IS `NoCopy`, AND DROP IS RELEASE** (the Aug-29 user ruling).
-// Each holds one handle word and one hand-written `deinit` that releases it, so
-// a wrapper going out of scope destroys the capability instance it owned —
-// RAII, over kernel handles, with the kernel's own generations backstopping it.
+// Every wrapper is `NoCopy`, and drop is release. Each holds one handle word
+// and one hand-written `deinit` that releases it, so a wrapper going out of
+// scope destroys the capability instance it owned: RAII over kernel handles,
+// with the kernel's own generations backstopping it. `Mapping` is the one worth
+// reading its own docstring for: dropping it releases the handle and does not
+// unmap the row.
 //
-// There were nine when the ruling landed and there are ELEVEN since M3 unit 4
-// (`IoMemory`, `Mapping`); the count is not written here any more, because the
-// rule is what matters and a number in prose is what goes stale. `Mapping` is
-// the one worth reading its own docstring for: dropping it releases the HANDLE
-// and does not unmap the ROW, which is §2.5's ruled stance rather than an
-// omission.
-//
-// WHY THE TWO HALVES HAD TO LAND TOGETHER. A release op beside COPYABLE wrappers
-// is a stale-fault factory: copy a `Clock`, let one copy drop, and the sibling's
+// The two halves must land together. A release op beside copyable wrappers is a
+// stale-fault factory: copy a `Clock`, let one copy drop, and the sibling's
 // next use is a `BadHandle` fault the program did nothing to deserve. `NoCopy`
-// is what makes "this value owns that word" true, and it is what §3's
-// no-DUPLICATE rule always meant at this altitude.
+// is what makes "this value owns that word" true, and what §3's no-duplicate
+// rule means at this altitude.
 //
-// **THE DISARM SENTINEL IS THE WORD FIELD ITSELF**, which costs no second field
-// and cannot get out of step with one: `NO_HANDLE` is unrepresentable as a LIVE
-// handle (design 3 D-1 makes it the index byte's zero at every generation), so
-// a field holding it is exactly a wrapper that has already given its word away.
+// The disarm sentinel is the word field itself, which costs no second field and
+// cannot get out of step with one: `NO_HANDLE` is unrepresentable as a live
+// handle (it is the index byte's zero at every generation), so a field holding
+// it is exactly a wrapper that has already given its word away.
 //
-// **THERE IS NO TYPED `release()` METHOD, deliberately.** Early release is
-// dropping the value — `let _ = move clock` — which is one concept for the
-// reader instead of two ways to say it, and it is the same spelling every other
-// owning type in Saw uses. A `release()` beside a RAII deinit would also be a
-// second way to reach the disarmed state, which is precisely the state the
-// sentinel exists to make unreachable from user code.
+// There is no typed `release()` method, deliberately. Early release is dropping
+// the value (`let _ = move clock`), which is one concept for the reader and the
+// spelling every other owning type in Saw uses. A `release()` beside a RAII
+// deinit would also be a second way to reach the disarmed state, which is the
+// state the sentinel exists to make unreachable from user code.
 //
-// **THE TRANSFER-FUNNEL CONTRACT, recorded now for unit 3's `give` and M4's
-// pipes.** When a kernel op MOVES the word out of the caller's table, the sysapi
-// funnel that owns that syscall CONSUMES the wrapper, reads the word, sets the
-// field to `NO_HANDLE` BEFORE issuing the syscall, and lets the disarmed value
-// drop. Disarm-before-syscall is the deliberate order: every failure of such a
-// syscall is a FAULT (the process ends, and teardown covers everything it held),
-// so there is no path on which a disarmed-but-unsent word leaks. User code never
-// touches the sentinel. Generations are the backstop: a funnel bug that released
-// after a transfer is a diagnosed `BadHandle` fault, never corruption.
+// The transfer-funnel contract: when a kernel op moves the word out of the
+// caller's table, the sysapi funnel that owns that syscall consumes the
+// wrapper, reads the word, sets the field to `NO_HANDLE` before issuing the
+// syscall, and lets the disarmed value drop. Disarm-before-syscall is the
+// deliberate order, so no path leaves two owners of one word. A caller error
+// faults (the process ends, and teardown covers everything it held); a
+// resource refusal answers a status, and a funnel that does not re-mint its
+// wrapper does not hand the object back. User code never touches the sentinel.
+// The `consumes` receivers (`PipeReply.resolve`, `PipeRequest.reply` and
+// `reply_wait`) write no sentinel: the consuming body stands in for the
+// `deinit` on that path. Generations are the backstop: a funnel bug that
+// released after a transfer is a diagnosed `BadHandle` fault, never corruption.
 //
-// **`shutdown()` NEVER RETURNS**, so wrappers live at that moment never run
-// their deinit and die in the kernel's teardown instead. That is the backstop
-// working as designed rather than a leak, and the transcript's `handles=` count
-// is what says which path each handle took.
+// `shutdown()` never returns, so wrappers live at that moment never run their
+// deinit and die in the kernel's teardown instead. That is the backstop working
+// as designed, not a leak.
 
 // =============================================================================
-// The boot handle the runtime hooks print through (design 172 part 2)
+// The boot handle the runtime hooks print through
 // =============================================================================
 //
-// It sits at the floor because TWO files need it and neither is below the
-// other: `sos.system` WRITES it, out of `System(boot_handle:)`, and `sos.rt`
-// READS it, out of the panic path's writer. A helper two seams share lives
+// It sits at the floor because two files need it and neither is below the
+// other: `sos.system` writes it, out of `System(boot_handle:)`, and `sos.rt`
+// reads it, out of the panic path's writer. A helper two seams share lives
 // below both.
 
 /// The boot handle, parked for the runtime hooks in `sos.rt`.
 ///
-/// The runtime seams take no handle — the ABI has no room for one — so the one
+/// The runtime seams take no handle (the ABI has no room for one), so the one
 /// root is given at boot is remembered here by `System.init` before anything
-/// can print. It is root's own authority being kept in root's own address
-/// space, NOT ambient authority: a process that was never given the handle has
-/// nothing to remember and its panics are simply silent.
+/// can print. It is root's own authority kept in root's own address space, not
+/// ambient authority: a process that was never given the handle has nothing to
+/// remember and its panics are simply silent.
 ///
-/// `unsafe static var` (design 149) rather than an `Atomic`: it is plain
-/// compound process state written once at boot, and spec §7's uniprocessor
-/// argument covers it exactly as it covers the arena.
+/// `unsafe static var` rather than an `Atomic`: it is plain compound process
+/// state written once at boot, and spec §7's uniprocessor argument covers it as
+/// it covers the arena.
 public(package) unsafe static var SYSTEM_HANDLE: UInt = 0
 
-/// Park the boot handle. A small named `unsafe` helper is how design 136 says
-/// to confine contact with an unsafe-typed value, and it is what keeps the
-/// public `System(boot_handle:)` an ordinary safe signature.
+/// Park the boot handle. A small named `unsafe` helper is how contact with an
+/// unsafe-typed value is confined, and it keeps the public
+/// `System(boot_handle:)` an ordinary safe signature.
 public(package) func park_system_handle(handle: UInt) unsafe {
     SYSTEM_HANDLE = handle
 }

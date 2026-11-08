@@ -1,68 +1,49 @@
-//! MAPPING — one installed protection row, with a handle on it (spec §2.5;
-//! sawos design 6 D-1/D-3).
+//! Mapping: one installed protection row, with a handle on it (spec §2.5).
 //!
-//! **A MAPPING IS AN INSTALLED GRANT ROW.**
+//! A Mapping is an installed grant row. It records which process's domain
+//! carries the row and which row it is; `base()` reads the address that row was
+//! placed at. On a tier that does not translate, that address is the region's
+//! own.
 //!
-//! **AND SINCE M5 UNIT 2 IT HAS A VIRTUAL HALF** (sawos design 33). This header
-//! used to say SOS does not translate and that §2.5's "installed virtual
-//! placement" therefore had none — true of every tier until arm64 grew
-//! per-process page tables, and still true of the tiers that stayed. What a
-//! Mapping records is which process's domain carries the row and which row it
-//! is; `base()` below is how a program reads the address that row was placed at,
-//! and on a tier that does not translate the answer is the region's own address,
-//! which is that tier's answer rather than a missing one. §5.5's identity law
-//! re-scopes with it — unit 8 owns the spec prose.
+//! Only a Mapping unmaps (§2.5), which is the object's reason to exist. That is
+//! why `Process.map` answers with one instead of a status: without a handle
+//! onto the row there would be no way to take it back.
 //!
-//! **ONLY A MAPPING UNMAPS** (§2.5), which is the object's whole reason to
-//! exist. That is why `Process.map` answers with one instead of returning a
-//! status: without a handle onto the row there would be no way to take it back,
-//! and revocation would have to be some other mechanism.
-//!
-//! It names only the floor, so `sos.system` — which produces one — can name it.
+//! It names only the floor, so `sos.system`, which produces one, can name it.
 
 import sosabi.{SosStatus, MappingHandle, MappingOp, NO_HANDLE}
 
 import sos.floor.{call_value, checked, sos_handle_release, sos_mapping_unmap}
 
-/// A handle to a Mapping — one protection row, installed.
+/// A handle to a Mapping, one protection row, installed.
 ///
-/// Built by `Process.map` and by nothing else.
+/// Built by `Process.map`, and by `System.stats_region_map` inside the
+/// `StatsRegion` it answers.
 ///
-/// **`NoCopy`, AND DROPPING IT RELEASES THE HANDLE — WHICH IS NOT AN UNMAP.**
-/// That distinction is §2.5's ruled stance rather than an implementation
-/// detail, and it is worth reading carefully because the RAII habit points the
-/// other way. Release destroys the caller's ENTRY and never the object (design
-/// 3 D-2's entries-never-touch-objects rule), so a `Mapping` that falls out of
-/// scope leaves its row installed: **the mapping is permanent, safe-but-leaked,
-/// never a dangling-unmap hazard.** A caller that means to revoke calls
-/// `unmap()` and then drops the value.
+/// `NoCopy`, and dropping it releases the handle, which is not an unmap. The
+/// RAII habit points the other way, so read this carefully. Release destroys
+/// the caller's entry and never the row, so a `Mapping` that falls out of
+/// scope leaves its row installed: the mapping is permanent, safe but leaked,
+/// never a dangling-unmap hazard. A caller that means to revoke calls `unmap()`
+/// and then drops the value.
 ///
-/// §2.5 sketches a Deinit that unmaps at scope exit, so that "the common path
-/// is leak-free by construction". SOS does not do that today and the reason is
-/// stated rather than hidden: unmapping in a `deinit` would make the ROW's
-/// lifetime the wrapper's, and a wrapper drops on every path out of a scope
-/// including the ones a launcher takes right after handing a child its memory —
-/// so the shape unit 4 exists for (map into a child, then start it) would
-/// revoke the mapping before the child ever ran.
+/// Don't unmap in a `deinit`: that would make the row's lifetime the wrapper's,
+/// and a wrapper drops on every path out of a scope, including a launcher's
+/// right after it hands a child its memory (map into a child, then start it).
+/// The mapping would be revoked before the child ever ran.
 ///
-/// **THE REFCOUNT ARRIVED IN M3 UNIT 5 AND DID NOT CHANGE THAT** (sawos design
-/// 7 D-2), which is why this note now records a RULING rather than a wait. A
-/// Mapping OWNS its row; the row is not a counted reference back. So a
-/// mapped-but-unreferenced Mapping — every handle released, the grant still
-/// installed — reaches zero, FREES ITS SLOT AND LEAVES THE ROW, and the row is
-/// then unremovable until the TARGET process's teardown. That is exactly the
-/// permanent-but-safe stance above, made mechanical instead of promised. An
-/// unmapping `deinit` is therefore not blocked on a mechanism any more; it is
-/// declined on the launcher argument, and the escape hatch is the one it always
-/// was — call `unmap()` where revocation is meant, and let the drop be a drop.
+/// A Mapping owns its row; the row is not a counted reference back. So a
+/// Mapping with every handle released and the grant still installed frees its
+/// slot and leaves the row, which is then unremovable until the target
+/// process's teardown.
 public struct Mapping {
     public(package) handle: MappingHandle,
 }
 
 extension Mapping: NoCopy {
-    /// Drop is release, and release is NOT unmap — see the type's docstring.
+    /// Drop is release, and release is not unmap; see the type's docstring.
     /// Otherwise this is `System`'s deinit exactly: the sentinel and the
-    /// discard for the same reasons.
+    /// discard.
     func deinit(&var self) {
         if self.handle != NO_HANDLE {
             let _ = sos_handle_release(self.handle)
@@ -71,50 +52,41 @@ extension Mapping: NoCopy {
 }
 
 extension Mapping {
-    /// **TAKE THE ROW OUT OF THE DOMAIN IT WAS INSTALLED IN.** Requires
+    /// Take the row out of the domain it was installed in. Requires
     /// `MappingRight.Unmap`.
     ///
-    /// The memory becomes unreachable to the target process at once — not at
-    /// its next switch, AT ONCE, even when the target is the process running
-    /// right now. That is the live-domain rule (design 6 D-3) and it is the
-    /// half of this op a caller most needs to be able to rely on: an `unmap`
-    /// that returned `Ok` and left the window open until some later reschedule
-    /// would be a revocation that did not revoke.
+    /// The memory becomes unreachable to the target process at once, not at its
+    /// next switch, even when the target is the process running right now. An
+    /// `unmap` that returned `Ok` and left the window open until some later
+    /// reschedule would be a revocation that did not revoke.
     ///
-    /// **UNMAPPING TWICE TERMINATES THE CALLER** (`BadState`), and so does
-    /// unmapping a Mapping whose target process has DIED — its whole domain
-    /// went with it, so there is no row left to remove. Both are
-    /// caller-checkable: the caller either unmapped it or created the child.
+    /// Unmapping twice terminates the caller (`BadState`), and so does
+    /// unmapping a Mapping whose target process has died: its whole domain went
+    /// with it, so no row is left to remove. Both are caller-checkable.
     ///
     /// It consumes nothing. The wrapper stays valid and still owns its handle,
-    /// which is what makes "unmap, then drop" one ordinary sequence rather than
-    /// a consuming funnel with a disarm; there is no word moving between tables
-    /// here, only a row leaving a record.
+    /// so "unmap, then drop" is one ordinary sequence; no word moves between
+    /// tables, only a row leaving a record.
     public func unmap(&self) -> Result<Void, SosStatus> {
         checked(sos_mapping_unmap(self.handle))
     }
 
-    /// **WHERE THIS MAPPING IS.** Requires `MappingRight.Base`.
+    /// Where this mapping is. Requires `MappingRight.Base`.
     ///
-    /// **THE ADDRESS IS THE ANSWER, AND THIS IS WHERE IT IS ANSWERED** (sawos
-    /// design 33; design 25 ruling 1). A caller supplies no address to `map` on
-    /// any tier — a hint is an opinion no tier could honor uniformly — so the
-    /// kernel chooses, and a program treats what comes back as DATA. That is
-    /// design 19's portable idiom, and until this method existed the tree had no
-    /// way to write it: `map` answers a capability, a `Memory` has no bounds
-    /// reader, and the address had to come from a build-time constant that only
-    /// happened to be right while user addresses were physical ones.
+    /// A caller supplies no address to `map` on any tier (a hint is an opinion
+    /// no tier could honor uniformly), so the kernel chooses, and a program
+    /// treats what comes back as data. This is the portable way to learn the
+    /// address; a build-time constant is right only while user addresses are
+    /// physical ones.
     ///
-    /// The number is a USER address in the TARGET's address space — which is the
-    /// caller's own when a process maps into itself, and the child's when a
-    /// launcher maps into a child. Two processes holding two Mappings of ONE
-    /// region may legitimately get two different answers; on a tier that does
-    /// not translate they get the same one, and neither is a fact a portable
-    /// program should assume.
+    /// The number is a user address in the target's address space: the caller's
+    /// own when a process maps into itself, the child's when a launcher maps
+    /// into a child. Two processes holding two Mappings of one region may get
+    /// two different answers; on a tier that does not translate they get the
+    /// same one. A portable program assumes neither.
     ///
     /// Asking an already-unmapped Mapping, or one whose target has died, ends
-    /// the caller with `BadState` — `unmap`'s own two refusals, since it is the
-    /// same husk in both cases.
+    /// the caller with `BadState`, the same two refusals as `unmap`.
     public func base(&self) -> Result<UInt, SosStatus> {
         call_value(self.handle, MappingOp.Base as UInt, 0, 0, 0)
     }

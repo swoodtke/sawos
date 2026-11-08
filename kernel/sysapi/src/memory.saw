@@ -1,45 +1,36 @@
-//! MEMORY — a range of physical memory, and the one op it owns (spec §2.5;
-//! sawos design 2 D-2, grown by design 6 D-2).
+//! Memory: a range of physical memory, and the one op it owns (spec §2.5).
 //!
-//! It sits one step above the floor and names nothing else, which is what M3
-//! unit 4 had to keep true while giving the object ops. `split` is here because
-//! it needs only a Memory; `map` is NOT, because it needs a `Process` and
-//! `Process` is declared in `sos.system`, which imports this file. See
-//! `Process.map` there for the shape that cycle forced and why the funnel reads
-//! the way it does.
+//! It imports the floor and no other `sos` module. `split` is here
+//! because it needs only a Memory; `map` is not, because it needs a `Process`,
+//! and `Process` is declared in `sos.system`, which imports this file. See
+//! `Process.map` there for the shape that cycle forces.
 //!
-//! A region is still AUTHORITY OVER BYTES rather than a description of them:
-//! there is no way to read a Memory's base or length, and unit 4 did not add
-//! one. `split` names a LENGTH and `map` names a target, and both answer with
-//! capabilities rather than numbers.
+//! A region is authority over bytes, not a description of them: there is no way
+//! to read a Memory's base or length. `split` names a length and `map` names a
+//! target, and both answer with capabilities rather than numbers.
 
 import sosabi.{SosStatus, MemoryHandle, MemoryOp, MINT_OP, NO_HANDLE}
 
 import sos.floor.{ALL_RIGHTS, call_value, sos_handle_release}
 
-/// A handle to a Memory — a sealed range of physical memory.
+/// A handle to a Memory, a sealed range of physical memory.
 ///
-/// §2.5's RAM AUTHORITY. A process receives pool roots at boot through
-/// `Process.boot_handle_next`, DERIVES pieces of them with `split`, INSTALLS
+/// §2.5's RAM authority. A process receives pool roots at boot through
+/// `Process.boot_handle_next`, derives pieces of them with `split`, installs
 /// those pieces with `Process.map`, and passes whole regions to
 /// `System.process_create`.
 ///
-/// **THERE IS STILL NO WAY TO READ THE BOUNDS**, which is the unit-2 property
-/// unit 4 deliberately kept: a region is authority over bytes, not a
-/// description of them. What a caller names is a LENGTH (`split`) or a TARGET
-/// (`map`), and what it gets back is another capability.
+/// There is no way to read the bounds. What a caller names is a length
+/// (`split`) or a target (`map`), and what it gets back is another capability.
 ///
-/// Built by `Process.boot_handle_next` and by `split`, and by nothing else — no
-/// word constructor, no word extractor, the module docstring's rule.
+/// Built by `Process.boot_handle_next`, `split`, `mint`, a message's handle
+/// decode in `sos.pipe`, and a refused `System.slab_donate` handing the region
+/// back: no word constructor, no word extractor.
 ///
-/// **IT IS `NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5),
-/// which SUPERSEDES this docstring's own unit-2 paragraph explaining why it was
-/// a plain value. Both reasons that paragraph gave have been answered rather
-/// than overridden. The OWNING tier is here, so a move-only handle's drop now
-/// does something — it is the enforcement the discipline was waiting for. And
-/// the boot-handle record's shape is what changed to fit: see `BootHandle` in
-/// `sos.system`, whose `Memory` is an optional the caller TAKES rather than a
-/// field it would have had to partially move out of.
+/// `NoCopy`, and dropping it releases the handle. A move-only handle's drop
+/// does something, which is the enforcement the discipline needs. See
+/// `BootHandle` in `sos.system`: its `Memory` is an optional the caller takes,
+/// not a field it would have to partially move out of.
 public struct Memory {
     public(package) handle: MemoryHandle,
 }
@@ -54,65 +45,60 @@ extension Memory: NoCopy {
 }
 
 extension Memory {
-    /// **CUT `len` BYTES OFF THE FRONT, and become the remainder.** Requires
+    /// Cut a `len`-byte piece out of this region. Requires
     /// `MemoryRight.Split`.
     ///
-    /// **THIS RECEIVER IS THE POOL CURSOR**, which is the whole of design 6
-    /// D-2's allocation story: the region that comes back covers `[base, base +
-    /// len)` and THIS ONE now covers everything after it, so repeated splits
-    /// walk a pool forward and nothing else has to be remembered. Allocation is
-    /// this method in a loop.
+    /// On a pool root the piece is served first fit from the root's free list
+    /// (ranges released pieces gave back), and only when no free range can
+    /// hold it, off the front of the root's unspent frontier. On a region that
+    /// is not a root it comes off the front, and this region becomes the
+    /// remainder. Allocation is this method in a loop.
     ///
-    /// **IT CONSUMES NOTHING.** `&self`, no `move`, no disarm — the parent
-    /// handle is the same handle afterwards and the caller keeps using it. What
-    /// changed is kernel-side (the region the handle names is now shorter),
-    /// which is exactly the asymmetry that makes this NOT a transfer funnel: no
-    /// word moved between tables, so the owning tier has nothing to say here.
+    /// It consumes nothing. `&self`, no `move`, no disarm: the parent handle is
+    /// the same handle afterwards. Only kernel-side state changed (a cut off
+    /// the front shortens the region the handle names; a cut from a root's
+    /// free list shrinks that free range and leaves the root's own range as it
+    /// was), so this is not a transfer funnel; no word moved between tables.
     ///
     /// `len` must be a non-zero multiple of the target's protection
-    /// granularity, and no larger than what this region still holds. All three
-    /// are caller-checkable, so all three TERMINATE the caller — the caller
-    /// chose the number, and it knows what it has split off so far. A full slab
-    /// or handle table is `SosStatus.NoResource`, which it could not have known.
+    /// granularity, and this region must be able to serve it as one range
+    /// (its frontier or, on a root, one free range). Each refusal terminates
+    /// the caller with `BadArg`. A zero or misaligned length is the caller's
+    /// mistake; a root whose free bytes are too fragmented to serve it in one
+    /// range is not something the caller can compute, and it is refused the
+    /// same way. A caller at its Memory or handle quota gets
+    /// `SosStatus.QuotaExceeded`; a full slab or handle table is
+    /// `SosStatus.NoResource`, which the caller could not have known.
     ///
-    /// **DROPPING THE PIECE GIVES BACK THE SLOT AND THE BYTES** (sawos design
-    /// 28, on design 25 D-5; M3 unit 5's design 7 D-1 landed the first half).
-    /// The release that takes a region's last reference to zero returns its
-    /// kernel SLAB SLOT and credits the caller's Memory quota row — and returns
-    /// its RANGE to the pool it was ultimately split from, where it coalesces
-    /// with its free neighbours and, if it touches the pool's unspent frontier,
-    /// folds back into it. A pool walked to its end and then released is a pool
-    /// again: `tests/memory-recycle` takes one to its last byte, gives the
-    /// pieces back out of order, and splits the whole thing out in one call.
+    /// Dropping the piece gives back the slot and the bytes. The release that
+    /// takes a region's last reference to zero returns its kernel slab slot,
+    /// credits the splitter's Memory quota row, and returns its range to its
+    /// pool root's free list, where it coalesces with its free neighbours and,
+    /// if it touches the pool's unspent frontier, folds back into it. A pool
+    /// walked to its end and then released is a pool again
+    /// (`tests/memory-recycle`). A range that needs a free-list node when none
+    /// is left is dropped from the pool and counted, never lost silently.
     ///
-    /// **THE LAST REFERENCE IS NOT ALWAYS THE LAST HANDLE**, which is the one
-    /// thing to know. §2.5 frees a region when the last reference of EITHER kind
-    /// drops, and an installed mapping is the other kind — so a region that is
-    /// still MAPPED somewhere keeps its bytes after every handle onto it is
-    /// gone, and they come home at the last `unmap` (or at the death of the
-    /// process whose domain holds the row). Dropping a region you have mapped
-    /// into a child is therefore safe and eventually tidy, rather than safe and
-    /// permanent as it was through M4.
-    ///
-    /// This note used to say the opposite in as many words — that a front-cut
-    /// parent cannot absorb an arbitrary hole, so the bytes belong to no pool
-    /// afterwards and a pool walked to its end stays walked. That was the honest
-    /// state of the system until this unit and is what the unit was for.
+    /// The last reference is not always the last handle. §2.5 frees a region
+    /// when the last reference of either kind drops, and an installed mapping
+    /// is the other kind: a region that is still mapped somewhere keeps its
+    /// bytes after every handle onto it is gone, and they come home at the last
+    /// `unmap` (or at the death of the process whose domain holds the row).
+    /// Dropping a region you have mapped into a child is therefore safe.
     public func split(&self, len: UInt) -> Result<Memory, SosStatus> {
         let raw = try call_value(self.handle, MemoryOp.Split as UInt, len, 0, 0)
         return Memory(handle: MemoryHandle(raw))
     }
 
-    /// **MINT A SIBLING of this region handle, narrowed by a KEEP MASK** — the
+    /// Mint a sibling of this region handle, narrowed by a keep mask: the
     /// universal `MINT_OP`, on `System.mint`'s exact terms. Requires the
-    /// universal `MemoryRight.Mint` on THIS handle.
+    /// universal `MemoryRight.Mint` on this handle.
     ///
-    /// **THIS IS WHERE A LAUNCHER'S MEMORY POLICY IS WRITTEN** (sawos design 9
-    /// D-1). A region's default set is permissive — `memory_rights()` carries
-    /// `Transfer | Mint | Split | Map | MapExecute`, and it has to, because
-    /// attenuation is monotonic and a bit not minted at boot could never appear
-    /// later — so what a child may do with the RAM it is handed is decided HERE,
-    /// once, by the mask the launcher writes:
+    /// This is where a launcher's memory policy is written. A region's default
+    /// set is permissive (`memory_rights()` carries `Transfer | Mint | Split |
+    /// Map | MapExecute`, because attenuation is monotonic and a bit not minted
+    /// at boot could never appear later), so what a child may do with the RAM
+    /// it is handed is decided here, once, by the mask the launcher writes:
     ///
     /// ```saw
     /// let for_child = pool_page.mint(rights: MemoryRight.Transfer
@@ -121,23 +107,22 @@ extension Memory {
     /// ```
     ///
     /// That child can install its page and read and write it, and can never
-    /// execute from it — not because the kernel asks who is calling, but because
+    /// execute from it, not because the kernel asks who is calling but because
     /// nothing it holds carries `MapExecute`. `Split` is absent from that mask
-    /// too, which is the honest way to say "here is your RAM, you may not
-    /// subdivide it for anyone".
+    /// too: the child may not subdivide its RAM for anyone.
     ///
-    /// **THE MASK MUST KEEP `Transfer` if the sibling is to be GIVEN**, exactly
-    /// as `Process.give(system:)` records: `give` checks that bit on the thing
-    /// being given, so a launcher cannot narrow below the ticket that lets the
-    /// narrowed handle arrive.
+    /// The mask must keep `Transfer` if the sibling is to be given: `give`
+    /// checks that bit on the handle being given. What arrives need not keep
+    /// it, because `give`'s own keep mask narrows the child's entry (see
+    /// `Process.give(memory:)`).
     ///
     /// Everything else `System.mint` says holds unchanged: the rights are this
-    /// handle's INTERSECTED with the mask (so no-amplification is structural and
-    /// naming an absent right is a no-op), `Mint` is itself maskable, the
-    /// sibling is INDEPENDENT — its own slot, its own generation, its own
-    /// release — and it is a second NAME onto one region rather than a second
-    /// region. A full handle table is `SosStatus.NoResource`; a handle without
-    /// `Mint` TERMINATES the caller.
+    /// handle's intersected with the mask (so no-amplification is structural
+    /// and naming an absent right is a no-op), `Mint` is itself maskable, and
+    /// the sibling is independent (its own slot, generation and release) and is
+    /// a second name onto one region, not a second region. A caller at its
+    /// handle quota gets `SosStatus.QuotaExceeded` and a full handle table is
+    /// `SosStatus.NoResource`; a handle without `Mint` terminates the caller.
     public func mint(&self,
                      rights: UInt32 = ALL_RIGHTS) -> Result<Memory, SosStatus> {
         let raw = try call_value(self.handle, MINT_OP, rights as UInt, 0, 0)

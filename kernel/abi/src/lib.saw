@@ -1,87 +1,78 @@
-//! The SOS call numbers — KERNEL-INTERNAL (design 140; spec.md §5.7).
+//! The SOS call numbers: kernel-internal (spec.md §5.7).
 //!
 //! Every op number, rights bit, status tag and handle type in the system, in
-//! one place.
-//! Exactly two things import this: the kernel's dispatch tables
-//! (`kernel/core/`) and the `sos` wrapper module the kernel package exports
-//! to userspace (`kernel/sysapi/`). Nothing else, ever.
+//! one place. Exactly two things import this: the kernel's dispatch tables
+//! (`kernel/core/`) and the `sos` wrapper module the kernel package exports to
+//! userspace (`kernel/sysapi/`). Nothing else.
 //!
-//! WHY IT IS SHARED RATHER THAN DUPLICATED: the dispatch and the wrappers are
-//! the two halves of one contract. Held apart, they skew — and a syscall-number
-//! skew is not a compile error anywhere, it is a working call that does the
+//! Why it is shared rather than duplicated: the dispatch and the wrappers are
+//! the two halves of one contract. Held apart, they skew, and a syscall-number
+//! skew is not a compile error anywhere; it is a working call that does the
 //! wrong thing. Held together, renumbering is a one-line edit that either
 //! rebuilds both halves or fails.
 //!
-//! WHY IT IS KERNEL-INTERNAL: the Zircon-vDSO discipline (ratified Aug 5).
-//! NUMBERS ARE NOT ABI. Userspace links the exported `sos` module and calls
-//! methods; it never writes `7` for an op, so the kernel may renumber freely
-//! between builds. The one thing a process must agree with the kernel about is
-//! the CALLING CONVENTION (§5.7: handle in a0, op in a7), and that lives in the
-//! per-arch HAL stub, not here.
+//! Why it is kernel-internal: the vDSO discipline. Numbers are not ABI.
+//! Userspace links the exported `sos` module and calls methods; it never writes
+//! `7` for an op, so the kernel may renumber freely between builds. The one
+//! thing a process must agree with the kernel about is the calling convention
+//! (§5.7: handle in a0, op in a7), and that lives in the per-arch HAL stub, not
+//! here.
 //!
-//! WHY THESE ARE ENUMS AND NOT STATICS (design 145/153). Every family here is a
-//! CLOSED NAMED SET of values, which is what an Int-inheriting enum is for: it
-//! names the set, PINS the numbers so a reorder cannot renumber them, gives the
-//! dispatch an exhaustive `match`, and turns the read at the trap boundary into
-//! `from(raw:)` — a total function returning `E?`, so an unrecognized number is
-//! DATA the kernel rejects rather than an index it trusts. The parallel statics
-//! this replaced (`OP_SYSTEM_DEBUG_PRINT`, `SYS_ERR_BAD_OP`, …) could be
-//! compared against anything and validated only by a hand-written `> MAX` test.
+//! Why these are enums and not statics: every family here is a closed named set
+//! of values, which is what an Int-inheriting enum is for. It names the set,
+//! pins the numbers so a reorder cannot renumber them, gives the dispatch an
+//! exhaustive `match`, and turns the read at the trap boundary into
+//! `from(raw:)`, a total function returning `E?`, so an unrecognized number is
+//! data the kernel rejects rather than an index it trusts. Parallel statics
+//! could be compared against anything and validated only by a hand-written `>
+//! MAX` test.
 //!
-//! HOW A FAMILY IS NAMED (ruled Aug 15, user). An op table or a rights set is
-//! named for the spec §2 OBJECT it belongs to, spelled OUT, plus the
-//! term-of-art suffix §5.7 already uses: `SystemOp`, `ProcessOp`, `ThreadOp`,
-//! `EventOp`, `WaiterOp`, `SystemRight`, `ProcessRight`, `ThreadRight`,
-//! `EventRight`, `WaiterRight`. No abbreviated object prefix — not `SysOp`, not
-//! `ProcRight`, not `EvtRight` — because the abbreviation saves four characters
-//! in a file nobody types into and costs every reader the question of whether
-//! `Sys` means the System object or the syscall. The rule extends to anything
-//! else here named after an object (`ProcessStatusKind`, `process_status_word`,
-//! `EventMode`, `WaiterReadiness`), and the next object kind inherits it: name
-//! the family after the row in the §2 table.
+//! How a family is named. An op table or a rights set is named for the spec §2
+//! object it belongs to, spelled out, plus the term-of-art suffix §5.7 uses:
+//! `SystemOp`, `ProcessOp`, `ThreadOp`, `EventOp`, `WaiterOp`, `SystemRight`,
+//! `ProcessRight`, and so on. No abbreviated object prefix (not `SysOp`, not
+//! `ProcRight`, not `EvtRight`): the abbreviation saves four characters in a
+//! file nobody types into and costs every reader the question of whether `Sys`
+//! means the System object or the syscall. The rule extends to anything else
+//! here named after an object (`ProcessStatusKind`, `process_status_word`,
+//! `EventMode`): name the family after the row in the §2 table.
 //!
-//! HOW AN OP IS NAMED (ruled Aug 17, user). Inside a family an op reads
-//! `object_operation`: the OBJECT KIND the op concerns leads, then the verb —
-//! `ProcessOp.ThreadCreate`, `SystemOp.ClockGet`, `ClockOp.TimerCreate` — and
-//! the typed method and the C export mirror it (`process.thread_create`,
-//! `sos_system_clock_get`). An op whose RECEIVER IS the object it concerns keeps
-//! the bare verb, there being no second noun to lead with: `Arm`, `Ack`, `Wait`,
-//! `Signal`, `Join`, `Start`, `Exit`, `Yield`, `Now`, `Add`, `Remove`,
-//! `Shutdown`, `DebugPrint`, `GetStatus`. What the rule buys is that every op
-//! concerning a kind sorts together — a reader looking for what makes a Timer
-//! finds `TimerCreate` without having to know which object is the factory — and
-//! that a rights bit named after an op (`ProcessRight.ThreadCreate`) reads
-//! exactly like the op it gates. A right naming a CAPABILITY rather than an op
-//! (`Transfer`, `Mint`, `Read`, `Control`, `Attach`, `Debug`) is not under this
-//! rule and keeps its own noun.
+//! How an op is named. Inside a family an op reads `object_operation`: the
+//! object kind the op concerns leads, then the verb (`ProcessOp.ThreadCreate`,
+//! `SystemOp.ClockGet`, `ClockOp.TimerCreate`), and the typed method and the C
+//! export mirror it (`process.thread_create`, `sos_system_clock_get`). An op
+//! whose receiver is the object it concerns keeps the bare verb, there being no
+//! second noun to lead with: `Arm`, `Ack`, `Wait`, `Signal`, `Join`, `Start`,
+//! `Exit`, `Yield`, `Now`, `Add`, `Remove`, `Shutdown`, `DebugPrint`,
+//! `GetStatus`. Every op concerning a kind then sorts together, and a rights
+//! bit named after an op (`ProcessRight.ThreadCreate`) reads exactly like the
+//! op it gates. A right naming a capability rather than an op (`Transfer`,
+//! `Mint`, `Read`, `Control`, `Attach`, `Debug`) keeps its own noun.
 //!
-//! Delivery in v1 is static linking through the manifest/module-path
-//! mechanism. A genuinely mapped vDSO is an object-model-era upgrade that
-//! changes none of the above.
+//! Delivery is static linking through the manifest/module-path mechanism. A
+//! genuinely mapped vDSO would change none of the above.
 //!
-//! # THIS FILE IS THE FACADE (sawos design 26)
+//! # This file is the facade
 //!
-//! The module used to be one 3,735-line file. It is now six leaf modules and
-//! this facade, and this file holds NO DECLARATION: it re-exports what the
-//! leaves declare, so every `import sosabi.{...}` in `kernel/core/`,
-//! `kernel/sysapi/` and `tests/` means exactly what it always did — and so does
-//! the `sosabi.` QUALIFIER, which `kernel/sysapi/src/system.saw` uses to reach
-//! `ENTRY_IMAGE` without binding it bare.
+//! It holds no declaration: it re-exports what the leaves declare, so every
+//! `import sosabi.{...}` in `kernel/core/`, `kernel/sysapi/` and `tests/` means
+//! the same thing, and so does the `sosabi.` qualifier, which
+//! `kernel/sysapi/src/system.saw` uses to reach `ENTRY_IMAGE` without binding
+//! it bare.
 //!
-//! THE ONE-PLACE DOCTRINE IS UNCHANGED, and the split is what the doctrine
-//! never said: it is ONE PACKAGE and ONE IMPORTABLE NAME that keep the dispatch
-//! and the wrappers from skewing, not one FILE. Renumbering is still a one-line
-//! edit that either rebuilds both halves or fails.
+//! What keeps the dispatch and the wrappers from skewing is one package and one
+//! importable name, not one file. Renumbering is a one-line edit that either
+//! rebuilds both halves or fails.
 //!
-//! THE MODULES, IN DEPENDENCY ORDER — a file may import only those above it,
-//! because an import cycle is a compile error naming the loop (DF-232e):
+//! The modules, in dependency order. A file may import only those above it,
+//! because an import cycle is a compile error naming the loop:
 //!
 //!   `types`    what a handle-table entry names, the per-kind handle aliases,
 //!              `NO_HANDLE`, the handle word's encoding and `ENTRY_IMAGE`
-//!   `rights`   the fifteen `*Right` enums with the asserts that pin the
-//!              universal low byte, the two kind-blind predicates, and what
-//!              every default set mints
-//!   `ops`      the two universal ops and every per-object op table — plus the
+//!   `rights`   the `*Right` enums with the asserts that pin the universal low
+//!              byte, the two kind-blind predicates, and what every default set
+//!              mints
+//!   `ops`      the two universal ops and every per-object op table, plus the
 //!              argument encodings that sit under the last op-table banner
 //!              (`ClockType`, `MapAccess`, `EventMode`, `PIPE_BODY_BYTES`,
 //!              `PIPE_MSG_HANDLES`, `PipeMsgMeta`)
@@ -91,33 +82,30 @@
 //!   `boot`     the boot-handle record and the boot handle set
 //!   `status`   the status words, the fault reasons and the §8 process status
 //!
-//! EXACTLY ONE EDGE CROSSES A LEAF BOUNDARY: `records` imports
+//! Exactly one edge crosses a leaf boundary: `records` imports
 //! `PIPE_BODY_BYTES`, `PIPE_MSG_HANDLES` and `PipeMsgMeta` from `ops`, because
-//! `WaitBuffer` and `PipeMsgRecord` are sized in them. It is one-way — nothing
-//! in `ops` names a record — so nothing here is a cycle, and `records.saw`
-//! carries the note at the import.
+//! `WaitBuffer` and `PipeMsgRecord` are sized in them. It is one-way (nothing
+//! in `ops` names a record), so it is not a cycle, and `records.saw` carries
+//! the note at the import.
 //!
-//! WHY EVERY NAME IS LISTED, rather than one `public import sosabi.<leaf>.*`
-//! per leaf. A GLOB DOES NOT CARRY A `type` ALIAS (SL-20, probed against sawc
-//! 0.4.0 @ `46eebb36`): `public import sosabi.types.*` re-exports the statics,
-//! the enums and the functions and silently omits the fifteen handle aliases,
-//! so `MemoryHandle` became a name-only type in `kernel/sysapi/src/memory.saw`
-//! — no constructor, and no longer flowing to `UInt` — in a file this split
-//! never edited. The selective form carries an alias WHOLE, in every position
-//! (construction, annotation, field, parameter, return), which is what these
-//! lists are. They are GENERATED from the leaves' public declarations rather
-//! than curated, so the surface is exactly the one file's: this is a zero-churn
-//! split, not a re-decided API.
+//! Every name is listed, rather than one `public import sosabi.<leaf>.*` per
+//! leaf. A glob does not carry a `type` alias: it re-exports the statics, the
+//! enums and the functions and silently omits the handle aliases, so
+//! `MemoryHandle` would become a name-only type in
+//! `kernel/sysapi/src/memory.saw` (no constructor, and no longer flowing to
+//! `UInt`). The selective form carries an alias whole, in every position
+//! (construction, annotation, field, parameter, return). The lists mirror the
+//! leaves' public declarations exactly.
 //!
 //! So a declaration added to a leaf owes a name on the matching line here. That
-//! is the same bargain `kcore`'s facade and `sos`'s already make, and here it
-//! fails LOUDLY — an op number nothing republishes is unreachable at its first
-//! use, not silently absent.
+//! is the bargain `kcore`'s facade and `sos`'s make too, and here it fails
+//! loudly: an op number nothing republishes is unreachable at its first use,
+//! not silently absent.
 //!
-//! WHAT DOES NOT CHANGE: the vDSO wall. `kernel/sysapi/src/lib.saw` names the
-//! handful of encodings a process is meant to write and re-exports THOSE; the
-//! op numbers, the rights bits and the handle aliases stay kernel-internal
-//! because nothing republishes them, exactly as before.
+//! The vDSO wall is unchanged: `kernel/sysapi/src/lib.saw` names the handful of
+//! encodings a process is meant to write and re-exports those. The op numbers,
+//! the rights bits and the handle aliases stay kernel-internal because nothing
+//! republishes them.
 
 public import sosabi.types.{ObjType, SystemHandle, ProcessHandle, ThreadHandle,
                             EventHandle, WaiterHandle, InterruptHandle,

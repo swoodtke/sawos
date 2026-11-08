@@ -1,26 +1,22 @@
-//! SYSTEM, PROCESS, AND THE BOOT-SET RECORD — the authority objects, and the
-//! one module in this package that holds more than one of them.
+//! System, Process, and the boot-set record: the authority objects, and the one
+//! module in this package that holds more than one of them.
 //!
-//! THE THREE CANNOT BE SEPARATED, and that is design 5's one structural
-//! finding rather than a placement choice. Every pair of them names the other:
+//! The three cannot be separated. Every pair of them names the other:
 //!
-//!   - `System.process_self` and `System.process_create` CONSTRUCT a
-//!     `Process`, so System is above Process;
-//!   - `Process.give(system:)` takes a `System` BY VALUE — the courier funnel
-//!     the launch flow turns on (sawos design 4 D-4) — so Process is above
-//!     System;
-//!   - `BootHandle` carries a `Memory?`, a `Process?` AND a `System?`, and
+//!   - `System.process_self` and `System.process_create` construct a `Process`,
+//!     so System is above Process;
+//!   - `Process.give(system:)` takes a `System` by value (the courier funnel
+//!     the launch flow turns on), so Process is above System;
+//!   - `BootHandle` carries a `Memory?`, a `Process?` and a `System?`, and
 //!     `Process.boot_handle_next` answers with one, so the record is above all
 //!     three and below Process at the same time.
 //!
-//! An import cycle is a compile error naming the loop (DF-232e) and a type's
-//! extension methods must sit in the module that DECLARES the type — a
-//! re-export widens no extension scope (design 142/229) — so there is no
-//! spelling in today's Saw that puts these in three files. They are one
-//! module, and the sections below keep the three seams visibly apart.
+//! An import cycle is a compile error naming the loop, so these cannot be
+//! three files. They are one module, and the sections below keep the three
+//! seams visibly apart.
 //!
-//! Everything else this file names is BELOW it: the floor's raw seams, the
-//! region, and the five objects a Process mints.
+//! Everything else this file names comes from modules it imports: the floor's
+//! raw seams, the regions, the pipe types, and the objects a Process mints.
 
 import sosabi.{SosStatus, SystemOp, ProcessOp, MemoryOp, IoMemoryOp, MINT_OP,
                SlabKind,
@@ -43,14 +39,11 @@ import sosabi.{SosStatus, SystemOp, ProcessOp, MemoryOp, IoMemoryOp, MINT_OP,
                STATS_REGION_MAP_RECORD_WORDS, STATS_REGION_MAP_ROW_WORD,
                stats_region_map_record_bytes}
 
-// And the `sosabi.` qualifier, for the one encoding this module names WITHOUT
+// The `sosabi.` qualifier, for the one encoding this module names without
 // binding bare: `sosabi.ENTRY_IMAGE`, the sentinel a process passes when it has
-// no way to compute an entry address (see `thread_create` below). Since
-// DF-247b's amendment to design 150 a selective import binds its list and no
-// qualifier, so the reach is written rather than inherited — which is the
-// point: this line is what says the module depends on more of `sosabi` than
-// the braces above list. It is an ORDINARY import, so it re-exports nothing and
-// the vDSO wall above is unchanged.
+// no way to compute an entry address (see `thread_create` below). A selective
+// import binds its list and no qualifier, so the reach is written rather than
+// inherited. It is an ordinary import, so it re-exports nothing.
 import sosabi
 
 // The scalar-to-console-byte rule, shared with the kernel's own console so the
@@ -67,11 +60,10 @@ import sos.memory.{Memory}
 import sos.iomemory.{IoMemory}
 import sos.mapping.{Mapping}
 import sos.pipe.{PipeInlet, PipeOutlet, PipeReply, PipeRequest}
-// QUALIFIED, ALONE AMONG THE NINE: `std.task` publishes a prelude
-// `Thread<T>`, and a bare imported `Thread` ties with it where a locally
-// DECLARED one used to win — which is what the split turned this name into.
-// `thread.Thread` says which, at the five places `Process` names one; the
-// facade re-exports the bare spelling a process writes, unchanged.
+// Qualified, alone among these imports: `std.task` publishes a prelude
+// `Thread<T>`, and a bare imported `Thread` ties with it. `thread.Thread` says
+// which, wherever `Process` names one; the facade re-exports the bare spelling
+// a process writes.
 import sos.thread
 import sos.event.{Event}
 import sos.interrupt.{Interrupt}
@@ -79,41 +71,40 @@ import sos.clock.{Clock}
 import sos.waiter.{AttachMode, Waiter, mode_flag}
 
 // =============================================================================
-// System (spec §12; sawos design 3 D-5)
+// System (spec §12)
 // =============================================================================
 
-/// A handle to the kernel's System object — in M1 the whole of a process's
-/// authority (§12's boot handle set, one handle wide today).
+/// A handle to the kernel's System object, the root of a process's authority
+/// (§12's boot handle set).
 ///
 /// The field is a `SystemHandle`, not a `UInt`: one kind of handle cannot be
 /// built from a raw word or from another kind's handle, so handle-kind
-/// confusion is not expressible here even before the ops are considered. It
-/// still costs nothing — the alias flows to `UInt` implicitly at the stub, so
-/// the calls below pass `self.handle` with no cast and no conversion is emitted.
+/// confusion is not expressible here. It costs nothing: the alias flows to
+/// `UInt` implicitly at the stub, so the calls below pass `self.handle` with no
+/// cast.
 ///
-/// **IT IS `NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5),
-/// which is the OWNING tier this docstring used to promise for "§4" — it is
-/// built. A `System` is a capability instance, not a description of one, so it
-/// cannot be duplicated and its scope is its life.
+/// `NoCopy`, and dropping it releases the handle. A `System` is a capability
+/// instance, not a description of one, so it cannot be duplicated and its scope
+/// is its life.
 ///
-/// **ROOT'S OWN `System` NORMALLY DIES IN THE KERNEL'S TEARDOWN, not here**, and
-/// that is not an oversight: a root server's last act is `shutdown()` or
-/// `exit()`, neither of which returns, so the deinit below is never reached and
-/// the handle is closed by the process teardown along with everything else. The
-/// deinit is what covers the cases that DO fall out of a scope.
+/// Root's own `System` normally dies in the kernel's teardown, not here: a root
+/// server's last act is `shutdown()` or `exit()`, neither of which returns, so
+/// the deinit below is never reached and the process teardown closes the handle
+/// with everything else. The deinit covers the cases that do fall out of a
+/// scope.
 public struct System {
     handle: SystemHandle,
 }
 
 extension System: NoCopy {
-    /// DROP IS RELEASE. The word field doubles as the disarm flag because
+    /// Drop is release. The word field doubles as the disarm flag because
     /// `NO_HANDLE` cannot name a live handle at any generation; a transfer
     /// funnel writes it there before handing the word to the kernel, and this
     /// deinit then has nothing to do.
     ///
-    /// The status is discarded because there is nobody to report it to — a
+    /// The status is discarded because there is nobody to report it to: a
     /// deinit runs at a point no source construct names, so it has no error
-    /// channel and needs none: the only way this call fails is a word that does
+    /// channel and needs none. The only way this call fails is a word that does
     /// not resolve, which the kernel answers by ending the process rather than
     /// by returning.
     func deinit(&var self) {
@@ -127,25 +118,21 @@ extension System {
     /// Adopt the boot handle the kernel passed in the first argument register.
     ///
     /// The parameter is a raw `UInt` because that is what a register holds and
-    /// what the ABI specifies; this is one of the two places in the system that
-    /// crosses INTO a handle type (the other is the kernel's dispatch, after
-    /// the table has resolved it). Crossing at CREATION is what the explicit
-    /// construction is for.
+    /// what the ABI specifies. It is the one public constructor that takes a
+    /// raw word into a typed handle.
     ///
-    /// **EVERY PROCESS COMES THROUGH HERE SINCE M3 UNIT 3, not just root** (the
-    /// Aug-29 rulings; §12's symmetry). Root's word is the one the kernel minted
-    /// at boot; a child's is a MASKED SIBLING its launcher minted and gave under
-    /// the tag it was started with. Neither can tell the difference, and neither
-    /// needs to: what a process may do with the handle is the rights word, and
-    /// where it came from is the launcher's business. From here both bootstrap
-    /// identically — derive the Process object, drain the boot set.
+    /// Every process comes through here, not just root (§12's symmetry). Root's
+    /// word is the one the kernel minted at boot; a child's is a masked sibling
+    /// its launcher minted and gave under the tag it was started with. Neither
+    /// can tell the difference, and neither needs to: what a process may do
+    /// with the handle is the rights word. From here both bootstrap
+    /// identically: derive the Process object, drain the boot set.
     ///
-    /// A word arriving here is one the KERNEL RESOLVED, never one anybody
-    /// guessed, and it can be adopted at most once: `start(boot_tag:)` CONSUMES
+    /// A word arriving here is one the kernel resolved, never one anybody
+    /// guessed, and it can be adopted at most once: `start(boot_tag:)` consumes
     /// the record it resolved, so the drain can never hand the same word back a
     /// second time and there is no way to end up with two wrappers over one
-    /// handle. An earlier cut of this unit had to document that hazard instead;
-    /// the ruling made it unrepresentable.
+    /// handle.
     public init(boot_handle: UInt) -> System {
         // The runtime's panic path prints through this same handle, so it has
         // to be parked where the seams below can reach it before any Saw code
@@ -154,41 +141,41 @@ extension System {
         System(handle: SystemHandle(boot_handle))
     }
 
-    /// **MINT A SIBLING of this System handle, narrowed by a KEEP MASK** — the
-    /// universal `MINT_OP` (the Aug-29 user rulings on design 4). Requires the
-    /// universal `SystemRight.Mint` on THIS handle.
+    /// Mint a sibling of this System handle, narrowed by a keep mask: the
+    /// universal `MINT_OP`. Requires the universal `SystemRight.Mint` on this
+    /// handle.
     ///
-    /// `rights` is what the sibling may KEEP: its rights are this handle's
-    /// INTERSECTED with the mask, so the default (all ones) is "the same rights"
-    /// and anything narrower attenuates. Naming a right this handle does not hold
-    /// is a no-op — the intersection makes no-amplification structural rather
-    /// than checked, so there is nothing to fault on and nothing to introspect
-    /// first.
+    /// `rights` is what the sibling may keep: its rights are this handle's
+    /// intersected with the mask, so the default (all ones) is "the same
+    /// rights" and anything narrower attenuates. Naming a right this handle
+    /// does not hold is a no-op: the intersection makes no-amplification
+    /// structural rather than checked, so there is nothing to fault on and
+    /// nothing to introspect first.
     ///
-    /// **THIS IS HOW A CHILD GETS A SYSTEM HANDLE**, and the mask is the whole
-    /// of the policy:
+    /// This is how a child gets a System handle, and the mask is the whole of
+    /// the policy:
     ///
     /// ```saw
     /// let for_child = system.mint(rights: SystemRight.Debug
     ///                                     | SystemRight.ProcessSelf
-    ///                                     | SystemRight.ClockGet)!
+    ///                                     | SystemRight.ClockGet
+    ///                                     | SystemRight.Transfer)!
     /// child.give(system: move for_child, tag: BOOT)
     /// ```
     ///
-    /// Everything not named is absent BY SILENCE, which is the polarity ruling:
-    /// a keep mask FAILS CLOSED when a later unit adds a System right, where a
-    /// removal mask would have handed every future capability to every child a
-    /// launcher had ever configured. Write a complement
-    /// (`~(SystemRight.Transfer as UInt32) & 0xFFFF_FFFF`) when subtractive
-    /// intent really is what you mean — the fail-open choice then reads at the
-    /// call site rather than hiding in the op.
+    /// Everything not named is absent by silence. A keep mask fails closed when
+    /// a later change adds a System right, where a removal mask would hand
+    /// every future capability to every child a launcher had ever configured.
+    /// Write a complement (`~(SystemRight.Transfer as UInt32) & 0xFFFF_FFFF`)
+    /// when subtractive intent is what you mean, so the fail-open choice reads
+    /// at the call site.
     ///
-    /// **`Mint` IS ITSELF MASKABLE.** A sibling minted through a mask that left
-    /// it out cannot mint again, so proliferation stops exactly where the mask
-    /// says it does.
+    /// `Mint` is itself maskable. A sibling minted through a mask that left it
+    /// out cannot mint again, so proliferation stops where the mask says.
     ///
-    /// A full handle table is `SosStatus.NoResource`. A handle without `Mint`
-    /// TERMINATES the caller.
+    /// A process at its handle quota gets `SosStatus.QuotaExceeded`; a full
+    /// handle table is `SosStatus.NoResource`. A handle without `Mint`
+    /// terminates the caller.
     public func mint(&self,
                      rights: UInt32 = ALL_RIGHTS) -> Result<System, SosStatus> {
         let raw = try call_value(self.handle, MINT_OP, rights as UInt, 0, 0)
@@ -200,7 +187,7 @@ extension System {
         checked(sos_system_debug_print(self.handle, byte as UInt))
     }
 
-    /// Write an ASCII string. Stops at the FIRST failure and reports it — a
+    /// Write an ASCII string. Stops at the first failure and reports it; a
     /// partial write is surfaced, never swallowed.
     public func debug_print(&self, msg: String) -> Result<Void, SosStatus> {
         for scalar in msg.scalars() {
@@ -219,24 +206,20 @@ extension System {
     /// obtained through a handle already held). Requires
     /// `SystemRight.ProcessSelf`.
     ///
-    /// **A FRESH HANDLE EVERY TIME** (sawos design 3 D-4), which supersedes this
-    /// method's old "the same handle every time". Calling it twice is two
-    /// capability INSTANCES of one authority, each independently owned and
-    /// independently released — which is what makes the `NoCopy` wrapper an
-    /// owner rather than a name. It amplifies nothing: a mint carries the kind's
-    /// default rights and `SystemRight.ProcessSelf` gates the minting, so a caller
-    /// asking twice ends up with exactly the authority it asked once for.
-    ///
-    /// It can therefore FAIL, where reading a cached word could not: a full
+    /// Each call mints a fresh handle: two calls are two capability instances
+    /// of one authority, each independently owned and released, which is what
+    /// makes the `NoCopy` wrapper an owner rather than a name. It amplifies
+    /// nothing: a mint carries the kind's default rights and
+    /// `SystemRight.ProcessSelf` gates the minting. It can therefore fail: a
+    /// process at its handle quota gets `SosStatus.QuotaExceeded`, and a full
     /// handle table is `SosStatus.NoResource`.
-    /// **AND IT TAKES A KEEP MASK SINCE M4 UNIT 4** (`designs/010` agenda 7b;
-    /// sawos design 18), which closes the M3-unit-6 finding spec §9 records.
-    /// `process_rights()` is ONE default set, so a child used to derive its own
-    /// Process handle carrying `InterruptBind` and `Map` whatever its SYSTEM
-    /// handle had been narrowed to — a launcher's mask reached the sibling it
-    /// gave and not the handle the child derived from it. The mask is
-    /// `mint(rights:)`'s in every respect: an intersection, total, fail-closed,
-    /// and all-ones by default so no existing caller changed.
+    ///
+    /// `keep` is a keep mask with `mint(rights:)`'s semantics (an intersection,
+    /// total, fail-closed, all ones by default). The derived Process handle
+    /// carries the default set intersected with it. The mask is the deriving
+    /// process's own: a launcher's mask on the System handle it gave does not
+    /// reach the handle a child derives here, and only the child can narrow
+    /// that one (spec §9).
     ///
     /// ```saw
     /// let proc = try system.process_self(keep: ProcessRight.ThreadCreate
@@ -249,42 +232,39 @@ extension System {
         return Process(handle: ProcessHandle(raw))
     }
 
-    /// **PHASE ONE OF THE TWO-PHASE LIFECYCLE**: load `image` into `memory` and
+    /// Phase one of the two-phase lifecycle: load `image` into `memory` and
     /// answer with a process that exists and is not running. Requires
     /// `SystemRight.ProcessCreate`.
     ///
-    /// **IT IS ASKED OF THE SYSTEM OBJECT**, and that is the Aug-29 user ruling
-    /// recorded as sawos design 2's RIDER: process-scoped objects are minted by
-    /// your Process; PROCESSES ARE MINTED BY THE SYSTEM. A process table is a
-    /// machine-global resource bounded by machine facts, so its refusals are
-    /// System answers — and `process_self` directly above is the precedent,
-    /// since a Process handle has always come out of this object. It sat on
-    /// `Process` through unit 2; the move costs a caller one word at the
-    /// receiver and nothing else.
+    /// It is asked of the System object: process-scoped objects are minted by
+    /// your Process, but processes are minted by the System. A process table is
+    /// a machine-global resource bounded by machine facts, so its refusals are
+    /// System answers.
     ///
-    /// THE CALLER SUPPLIES CAPABILITIES AND NO NUMBERS. `image` is the
+    /// The caller supplies capabilities and no numbers. `image` is the
     /// read-only region holding a process image; `memory` is the RAM the child
     /// will run in. The kernel copies each segment to the address the image was
-    /// LINKED at, checks that every one of them lands inside `memory`, and
-    /// grants a stack at that region's top — so where the child's stack is, and
-    /// how big, is the kernel's answer rather than the launcher's. That is the
-    /// same rule the kernel applies to itself when it loads root.
+    /// linked at, checks that every one lands inside `memory`, and grants a
+    /// stack at that region's top, so where the child's stack is and how big is
+    /// the kernel's answer. The kernel applies the same rule to itself when it
+    /// loads root.
     ///
-    /// WHAT COMES BACK IS INERT: an address space, an entry and a stack
-    /// recorded, and NO THREAD. Nothing runs until `Process.start()`, which is
-    /// what makes "hand the child its handles, then run it" expressible without
-    /// inventing any synchronization — the start call IS the barrier.
+    /// What comes back is inert: an address space, an entry and a stack
+    /// recorded, and no thread. Nothing runs until `Process.start()`, so "hand
+    /// the child its handles, then run it" needs no synchronization; the start
+    /// call is the barrier.
     ///
-    /// **A MALFORMED IMAGE IS `SosStatus.BadImage`, A VALUE** — not a fault.
-    /// Image bytes are DATA the launcher was handed, and a launcher that cannot
-    /// report a bad image cannot launch anything else either. What IS a fault is
-    /// passing a handle that names nothing or names something that is not a
-    /// region: the caller chose which handles to pass. A full process table or
-    /// handle table comes back as `SosStatus.NoResource`.
+    /// A malformed image is `SosStatus.BadImage`, a value, not a fault: image
+    /// bytes are data the launcher was handed, and a launcher that cannot
+    /// report a bad image cannot launch anything else either. Passing a handle
+    /// that names nothing, or something that is not a region, is a fault: the
+    /// caller chose which handles to pass. A full process table or handle table
+    /// comes back as `SosStatus.NoResource`, and a caller at its handle quota
+    /// gets `SosStatus.QuotaExceeded`.
     ///
-    /// The two regions must be DISJOINT, which also means the same region
-    /// cannot serve as both. Nothing is copied until every check has passed, so
-    /// a refusal leaves `memory` exactly as it was.
+    /// The two regions must be disjoint, so the same region cannot serve as
+    /// both. Nothing is copied until every check has passed, so a refusal
+    /// leaves `memory` exactly as it was.
     public func process_create(&self, image: &Memory,
                                memory: &Memory) -> Result<Process, SosStatus> {
         let raw = try call_value(self.handle, SystemOp.ProcessCreate as UInt,
@@ -292,30 +272,30 @@ extension System {
         return Process(handle: ProcessHandle(raw))
     }
 
-    /// Give the kernel `memory` to back the slab `kind` names — PERMANENTLY.
-    /// Requires `SystemRight.SlabDonate` (sawos design 32, M5 unit 6).
+    /// Give the kernel `memory` to back the slab `kind` names, for good.
+    /// Requires `SystemRight.SlabDonate`.
     ///
-    /// **THIS IS HOW A DEPLOYMENT SIZES THE MACHINE.** Every `MAX_<KIND>` in the
-    /// kernel is a compiled FLOOR, not a ceiling: the image boots on its static
-    /// arrays and a boot server that wants a system with more events, more
-    /// timers or more regions than the build chose donates the storage for them.
-    /// `SosStatus.NoResource` from a create op afterwards means the same thing it
-    /// always meant — the slab is full — at whatever ceiling the deployment set.
+    /// This is how a deployment sizes the machine. Every `MAX_<KIND>` in the
+    /// kernel is a compiled floor: the image boots on its static arrays, and a
+    /// boot server that wants more events, timers or regions than the build
+    /// chose donates the storage for them, up to each kind's machine-wide
+    /// ceiling. `SosStatus.NoResource` from a create op afterwards means the
+    /// slab is full, at whatever size the deployment set.
     ///
-    /// **IT CONSUMES THE REGION AND NOTHING GIVES IT BACK.** Donation is
-    /// permanent in v1: the bytes become kernel object storage, the capability is
-    /// spent, and the range never returns to any pool. The kernel refuses — by
-    /// ENDING the caller — a region it cannot safely absorb: one that any other
-    /// handle still names, one with a mapping row installed, or a pool root with
-    /// pieces still on loan. Those are all conditions the caller created and can
-    /// see, which is why they fault rather than answer.
+    /// It consumes the region and nothing gives it back: the bytes become
+    /// kernel object storage, the capability is spent, and no op returns the
+    /// range to a pool. The kernel refuses, by ending the caller, a region
+    /// it cannot safely absorb: one that any other handle still names, one with
+    /// a mapping row installed, or a pool root with pieces still on loan. The
+    /// caller created those conditions and can see them, so they fault rather
+    /// than answer.
     ///
-    /// ON A REFUSAL THE REGION COMES BACK, in the error, which is `Waiter.give`'s
-    /// shape and is here for the same reason: the two refusals that are STATUSES
-    /// (a region too small to hold one slot of that kind, a slab whose extent
-    /// chain is full) consume nothing, so a caller that has just been told "not
-    /// this one" still owns its memory and must be handed it back rather than
-    /// left holding a disarmed wrapper.
+    /// On a refusal the region comes back in the error, as with `Waiter.give`.
+    /// The refusals that are statuses are all `SosStatus.NoResource`: a region
+    /// too small to hold one slot of that kind, a slab whose extent chain is
+    /// full, and a donation that would take the kind past its machine-wide
+    /// ceiling. They consume nothing, so the caller still owns its memory and
+    /// is handed it back rather than left holding a disarmed wrapper.
     public func slab_donate(&self, kind: SlabKind,
                             memory: Memory) -> Result<Void, (SosStatus, Memory)> {
         var region = move memory
@@ -328,31 +308,27 @@ extension System {
         return
     }
 
-    /// This process's Clock for `type` — a GRANTED TIME SOURCE. Requires
+    /// This process's Clock for `type`, a granted time source. Requires
     /// `SystemRight.ClockGet`.
     ///
-    /// TIME IS A CAPABILITY HERE, and that is the whole reason this is an op
-    /// rather than a free function. A process that was not granted the right
-    /// cannot read the machine's clock at all — which is what makes handing a
-    /// child a VIRTUAL clock later a substitution with no code change on either
-    /// side: the child asks its System object for a Clock exactly as it does
-    /// now, and what it gets back is somebody else's idea of the time.
+    /// Time is a capability, which is why this is an op rather than a free
+    /// function. A process that was not granted the right cannot read the
+    /// machine's clock at all, so handing a child a virtual clock later is a
+    /// substitution with no code change on either side: the child asks its
+    /// System object for a Clock exactly as it does now.
     ///
-    /// **A FRESH HANDLE EVERY TIME onto the one Clock** (sawos design 3 D-4),
-    /// superseding this method's old "the same Clock every time". A machine has
-    /// one monotonic clock and this hands out capability INSTANCES naming it, so
-    /// two asks are two owned handles rather than two names one caller must not
-    /// both drop. It amplifies nothing — `SystemRight.ClockGet` gates the
-    /// minting and every mint carries the kind's default rights — and it makes
-    /// the call fallible on repetition: a full handle table is
-    /// `SosStatus.NoResource`. `ClockType.Monotonic` is the only domain v1
-    /// declares; it counts nanoseconds from an unpublished epoch, never steps
-    /// and never goes backwards, so two readings are comparable and one means
-    /// nothing alone.
+    /// Each call mints a fresh handle onto the one Clock, so two asks are two
+    /// owned handles. It amplifies nothing (`SystemRight.ClockGet` gates the
+    /// minting and every mint carries the kind's default rights) and it is
+    /// fallible on repetition: a process at its handle quota gets
+    /// `SosStatus.QuotaExceeded`, and a full handle table is
+    /// `SosStatus.NoResource`.
+    /// `ClockType.Monotonic` is the only domain declared; it counts nanoseconds
+    /// from an unpublished epoch, never steps and never goes backwards, so two
+    /// readings are comparable and one means nothing alone.
     ///
     /// The label is `type:` and it is a label, not a declaration: `type` is a
-    /// CONTEXTUAL keyword in Saw (DF-232b), reserved only where an alias
-    /// begins, so the domain is named by the word for it.
+    /// contextual keyword in Saw, reserved only where an alias begins.
     public func clock_get(&self,
                           type: ClockType = ClockType.Monotonic) -> Result<Clock, SosStatus> {
         let raw = try call_value(self.handle, SystemOp.ClockGet as UInt,
@@ -360,14 +336,13 @@ extension System {
         return Clock(handle: ClockHandle(raw))
     }
 
-    /// **WHAT THIS PLATFORM CAN DENY** — `Isolated` or `Flat`, and nothing else.
-    /// Requires `SystemRight.TierGet` (sawos design 19's platform attribute,
-    /// ruled as design 25 D-4, built by design 35).
+    /// What this platform can deny: `Isolated` or `Flat`, and nothing else.
+    /// Requires `SystemRight.TierGet`.
     ///
-    /// ASK IT ONCE, AT STARTUP, AND ONLY IF YOU RELY ON ISOLATION. The tier is
+    /// Ask it once, at startup, and only if you rely on isolation. The tier is
     /// fixed for the life of the machine, so a program that re-reads it per
-    /// operation has misunderstood what it is for: this is not a per-call
-    /// permission check, it is a platform fact you decide whether to run on.
+    /// operation has misunderstood what it is for: it is a platform fact you
+    /// decide whether to run on, not a per-call permission check.
     ///
     /// ```saw
     /// let tier = try system.tier() catch { return }
@@ -380,20 +355,20 @@ extension System {
     /// }
     /// ```
     ///
-    /// **WHAT `Flat` DOES NOT MEAN.** It does not mean `map` lies: on flat
-    /// hardware `map`'s contract — "make this region accessible with at least
-    /// these rights" — is trivially true, so the call succeeds HONESTLY and the
-    /// mapping is real. It does not mean handles stop being checked, rights stop
-    /// being enforced, quotas stop counting or lifetimes stop ending: the kernel
-    /// boundary survives at every tier. What it means is exactly two things —
-    /// `unmap` revokes nothing the hardware will enforce, and a peer process can
-    /// reach your memory.
+    /// What `Flat` does not mean: it does not mean `map` lies. On flat hardware
+    /// `map`'s contract ("make this region accessible with at least these
+    /// rights") is trivially true, so the call succeeds honestly and the
+    /// mapping is real. Handles, rights, quotas and lifetimes are checked on
+    /// every syscall at every tier. What `Flat` means is that the hardware
+    /// denies nothing: `unmap` revokes nothing it will enforce, a peer process
+    /// can reach your memory, and any process can write the kernel's own
+    /// memory and so bypass every check the syscall path makes.
     ///
-    /// **AN UNKNOWN WORD PANICS**, on `decode_boot_handle`'s reasoning exactly:
-    /// the KERNEL wrote it, out of the same `ProtectionTier` declaration this
-    /// function reads, so a value that does not decode is a skew between the
-    /// kernel and the `sos` module it exports — a bug in the pair, not a runtime
-    /// condition a caller could act on.
+    /// An unknown word panics, on `decode_boot_handle`'s reasoning: the kernel
+    /// wrote it out of the same `ProtectionTier` declaration this function
+    /// reads, so a value that does not decode is a skew between the kernel and
+    /// the `sos` module it exports, not a runtime condition a caller could act
+    /// on.
     public func tier(&self) -> Result<ProtectionTier, SosStatus> {
         let raw = try call_value(self.handle, SystemOp.TierGet as UInt, 0, 0, 0)
         guard let word = ProtectionTier.from(raw: raw) else {
@@ -403,14 +378,13 @@ extension System {
         return word
     }
 
-    /// **MAP THE MACHINE'S TRAP COUNTERS READ-ONLY INTO THIS PROCESS** — the
-    /// shared stats region (sawos design 37, M5 unit 7). Requires
-    /// `SystemRight.StatsRegionMap`.
+    /// Map the machine's trap counters read-only into this process: the shared
+    /// stats region. Requires `SystemRight.StatsRegionMap`.
     ///
-    /// **THIS IS A `top` THAT COSTS NO SYSCALLS.** Call it once; every sample
+    /// This is a `top` that costs no syscalls. Call it once; every sample
     /// afterwards is a load out of this process's own address space. The
-    /// alternative surface — `Process.stats()` — costs one trap per process per
-    /// sample and needs a handle onto each process; this costs one trap ever and
+    /// alternative, `Process.stats()`, costs one trap per process per sample
+    /// and needs a handle onto each process; this costs one trap ever and
     /// covers every slot the machine has.
     ///
     /// ```saw
@@ -419,32 +393,31 @@ extension System {
     /// print("syscalls={}\n", mine.syscalls)
     /// ```
     ///
-    /// **READ-ONLY, AND A WRITE FAULTS WHERE THE HARDWARE CAN SAY SO.** The
-    /// columns are the kernel's; a process that could write them could lie to
-    /// every supervisor on the machine. On the `Flat` tier the tier word already
-    /// disclaims hardware denial (`tier()` above) and this call has nothing new
-    /// to say about it — the row is installed read-only either way, and only one
-    /// tier enforces it.
+    /// The mapping is read-only, and a write faults where the hardware can say
+    /// so. The columns are the kernel's; a process that could write them could
+    /// lie to every supervisor on the machine. On the `Flat` tier the tier word
+    /// already disclaims hardware denial (`tier()` above): the row is installed
+    /// read-only either way, and only one tier enforces it.
     ///
-    /// **THE NUMBERS CAN TEAR ON A 32-BIT PROFILE, AND THAT IS DOCUMENTED
-    /// RATHER THAN LOCKED.** A column is 64 bits and riscv32's registers are 32,
-    /// so a read can land between the two halves of a carry. The columns only
-    /// ever increase, so what a torn read yields is a value BETWEEN two true
-    /// readings — never a number the counter never held — and the high word
-    /// moves once per 2^32 traps. A `top` is exactly the consumer that can live
-    /// with that. A caller that needs an exact reading uses `Process.stats()`,
-    /// whose copy-out is made with interrupts masked.
+    /// The numbers can tear on a 32-bit profile, which is documented rather
+    /// than locked. A column is 64 bits and a 32-bit profile's registers are
+    /// 32, so a read can land between the two halves of a carry. The columns
+    /// only ever increase, so a torn read yields a value between two true
+    /// readings, never a number the counter never held, and the high word moves
+    /// once per 2^32 traps. A `top` is exactly the consumer that can live with
+    /// that. A caller that needs an exact reading uses `Process.stats()`, whose
+    /// copy-out is made with interrupts masked.
     ///
-    /// **IT MINTS NO `Memory`.** The region is kernel storage, not allocatable
-    /// RAM: what you are granted is the access and nothing that owns it. The
-    /// `Mapping` inside the returned value is what takes the access back —
-    /// `unmap()` below — and dropping the value releases the handle without
-    /// removing the row, which is `Mapping`'s own ruled stance.
+    /// It mints no `Memory`. The region is kernel storage, not allocatable RAM:
+    /// what you are granted is the access and nothing that owns it. The
+    /// `Mapping` inside the returned value is what takes the access back
+    /// (`unmap()`), and dropping the value releases the handle without removing
+    /// the row, as for any `Mapping`.
     ///
-    /// A version this build cannot read PANICS, on `tier()`'s reasoning exactly:
-    /// the kernel wrote the word out of the same declaration this module reads,
-    /// so a mismatch is a skew between the kernel and the `sos` it exported
-    /// rather than a runtime condition a caller could act on.
+    /// A version this build cannot read panics, on `tier()`'s reasoning: the
+    /// kernel wrote the word out of the same declaration this module reads, so
+    /// a mismatch is a skew between the kernel and the `sos` it exported, not a
+    /// runtime condition a caller could act on.
     public func stats_region_map(&self) -> Result<StatsRegion, SosStatus> {
         let answer = try stats_region_into_frame(self.handle)
         var mapping = Mapping(handle: MappingHandle(answer.0))
@@ -463,7 +436,7 @@ extension System {
 }
 
 /// The `unsafe` half of `System.stats_region_map`, confined to one small named
-/// helper (design 136). The record buffer's address never leaves it.
+/// helper. The record buffer's address never leaves it.
 ///
 /// It answers the pair the op answers: the Mapping handle out of the value
 /// register, and the caller's own row index out of the copy-out record.
@@ -476,15 +449,13 @@ func stats_region_into_frame(handle: UInt) unsafe -> Result<(UInt, Int), SosStat
     return pair
 }
 
-/// Read the region's published header — the typed-view idiom (the Aug-5 user
-/// ruling): the layout is declared ONCE in `sosabi` and read by FIELD NAME, so
-/// a layout edit that skewed the offsets would be a compile error rather than a
-/// silent misread.
+/// Read the region's published header. The layout is declared once in `sosabi`
+/// and read by field name, so a layout edit that skewed the offsets would be a
+/// compile error rather than a silent misread.
 ///
 /// `unsafe` because it names an `UnsafeMemory`; the contact stops here. It
-/// cannot fail — the page is mapped by the time it is called — so it carries no
-/// error channel to make every caller unwrap (CLAUDE.md's Optional/Result
-/// discipline: a channel for a condition that cannot arise is noise).
+/// cannot fail (the page is mapped by the time it is called), so it carries no
+/// error channel to make every caller unwrap.
 func read_stats_header(base: UInt) unsafe -> StatsRegionHeader {
     UnsafeMemory<StatsRegionHeader, Normal>(base).read()
 }
@@ -495,82 +466,85 @@ func read_stats_row(at: UInt) unsafe -> StatsRow {
 }
 
 // =============================================================================
-// Process (spec §2, §7, §8; design 178 D4)
+// Process (spec §2, §7, §8)
 // =============================================================================
 
-/// **WHAT A PROCESS HAS COST THE MACHINE, IN TRAPS** — the answer
-/// `Process.stats()` gives (sawos design 16, user-ruled Sep 1).
+/// What a process has cost the machine, in traps: the answer `Process.stats()`
+/// gives.
 ///
-/// THREE COLUMNS AND NOT ONE NUMBER, because the split is what makes any of it
-/// usable. A single total would mix a quantity a program determines with one the
-/// machine determines, so nothing could ever be asserted about it:
+/// Three columns, not one number, because the split is what makes any of it
+/// usable. A single total would mix a quantity a program determines with one
+/// the machine determines, so nothing could be asserted about it:
 ///
 ///   `syscalls`    every trap this process took through the syscall
-///                 instruction — one per call, whatever the op, whatever the
-///                 answer, and ONE for a call that parked for a millisecond.
-///                 DETERMINISTIC for a given program path, so this is the column
-///                 a test asserts on.
+///                 instruction: one per call, whatever the op, whatever the
+///                 answer, and one for a call that parked for a millisecond.
+///                 Deterministic for a given program path, so this is the
+///                 column a test asserts on.
 ///   `interrupts`  every timer or device interrupt taken while this process was
-///                 the running one. It moves with the machine, so PRINT it and
+///                 the running one. It moves with the machine, so print it and
 ///                 never assert it.
-///   `faults`      every other exception — an access fault, a misaligned
-///                 access, an illegal instruction. Normally zero, because a
-///                 fault ends the process; the interesting reader is a
-///                 SUPERVISOR holding the dead child's handle.
+///   `faults`      every other exception (an access fault, a misaligned access,
+///                 an illegal instruction). Normally zero, because a fault ends
+///                 the process; the interesting reader is a supervisor holding
+///                 the dead child's handle.
 ///
-/// **A BAD SYSCALL IS A SYSCALL.** Spending a right you were not given ends the
-/// process (design 178's faults ruling), but the trap arrived through the
-/// syscall instruction and the columns are keyed by how the machine entered the
-/// kernel. Keying on the outcome would make `syscalls` unpredictable, since a
-/// caller cannot know in advance which call the kernel will refuse.
+/// A bad syscall is a syscall. Spending a right you were not given ends the
+/// process, but the trap arrived through the syscall instruction and the
+/// columns are keyed by how the machine entered the kernel. Keying on the
+/// outcome would make `syscalls` unpredictable, since a caller cannot know in
+/// advance which call the kernel will refuse.
 ///
-/// **THE READING INCLUDES THE CALL THAT TOOK IT.** `syscalls` is charged at trap
+/// The reading includes the call that took it. `syscalls` is charged at trap
 /// entry, before the op runs, so a process reading its own stats sees the
-/// `stats()` call already counted. That is the honest arrangement — a column
-/// that excluded the observer would be wrong by one at exactly the moment anyone
-/// looked — and it means a DELTA between two readings includes the second
-/// reading's own trap. Subtract the boundary where the window is what you are
-/// measuring, and say so.
+/// `stats()` call already counted. A column that excluded the observer would be
+/// wrong by one at exactly the moment anyone looked. It means a delta between
+/// two readings includes the second reading's own trap; subtract it where the
+/// window is what you are measuring.
 ///
-/// PLAIN DATA: three integers, no handle, nothing owned. So it is on the
-/// automatic `Copy` tier and needs no policy — a reading is a fact you took, not
-/// a capability you hold.
+/// Plain data: three integers, no handle, nothing owned. It is on the automatic
+/// `Copy` tier and needs no policy; a reading is a fact you took, not a
+/// capability you hold.
 ///
-/// `UInt64` ON BOTH PROFILES: a count is a property of the quantity rather than
-/// of the machine, so riscv32 and arm64 answer with the same width. It is the
-/// same rule a nanosecond reading follows.
+/// `UInt64` on every profile: a count is a property of the quantity rather than
+/// of the machine, so every profile answers with the same width, as for a
+/// nanosecond reading.
 public struct ProcessStats {
     public syscalls: UInt64,
     public interrupts: UInt64,
     public faults: UInt64,
 }
 
-/// A handle to a Process — an address-space domain, a handle table and threads.
+/// A handle to a Process: an address-space domain, a handle table and threads.
 ///
-/// A process reaches its OWN through `System.process_self`. Holding somebody
-/// else's IS supervision, and since M3 there is somebody else to hold: a
-/// launcher keeps the handle `System.process_create` gave it, `give`s and
-/// `start`s through it, reads `get_status` through it, and — since unit 5.5 —
+/// A process reaches its own through `System.process_self`. Holding somebody
+/// else's is supervision: a launcher keeps the handle `System.process_create`
+/// gave it, `give`s and `start`s through it, reads `get_status` through it, and
 /// attaches it to a Waiter to be woken by the death (`Waiter.add(process:)`,
 /// declared at the bottom of this file).
 ///
-/// THERE IS NO WAY TO BUILD ONE FROM A WORD and no way to get a word back out.
-/// The field is private (design 80), the only constructors are this module's own
-/// op wrappers, and the derivation chain starts at `System(boot_handle:)` — so
-/// a `Process` in hand is one the kernel handed over, not an integer somebody
-/// guessed. See the module docstring's two-layer rule.
+/// There is no way to build one from a word and no way to get a word back out.
+/// The field is private, the only constructors are this module's own op
+/// wrappers, and the derivation chain starts at `System(boot_handle:)`, so a
+/// `Process` in hand is one the kernel handed over, not an integer somebody
+/// guessed. See the two-layer rule in the `sos` module docstring (`lib.saw`).
 ///
-/// **`NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5).
-/// `System.process_self()` MINTS a fresh instance on every ask now, so two calls
-/// give two independently-owned handles rather than two names the caller must
-/// not both drop — which is exactly why mint-per-call and this policy had to
-/// land together.
+/// `NoCopy`, and dropping it releases the handle. `System.process_self()` mints
+/// a fresh instance on every call, so two calls give two independently owned
+/// handles.
 ///
-/// DROPPING A CHILD'S HANDLE IS HOW ITS SLOT COMES BACK. A dead child's process
+/// Dropping a child's handle is how its slot comes back. A dead child's process
 /// slot is held only by the §8 status word somebody might still read, so the
-/// last handle onto it going away is what frees it (design 3 D-3) — which makes
-/// letting a supervisor's `Process` fall out of scope a real reclamation rather
-/// than mere tidiness.
+/// last reference onto it going away (its last handle, or a Waiter attachment
+/// watching it) frees it. Letting a supervisor's `Process` fall out of scope
+/// is a real reclamation, not mere tidiness.
+///
+/// The factory methods (`thread_create`, `event_create`, `waiter_create`,
+/// `interrupt_bind`, `pipe_create`) act on the process the handle names,
+/// whether or not that is the caller: that process is charged and its table
+/// receives the new handles. On a handle onto another process the returned
+/// words belong to that process's table, so in the caller's table the
+/// wrappers they come back in name nothing, or a different object.
 public struct Process {
     handle: ProcessHandle,
 }
@@ -589,13 +563,15 @@ extension Process {
     /// `ProcessRight.ThreadCreate`.
     ///
     /// The thread runs with `stack_top` as its stack pointer and `arg` in its
-    /// first argument register, and it must NOT return: its link register is
+    /// first argument register, and it must not return: its link register is
     /// zero, so returning faults and the fault ends the process (spec §8).
     ///
-    /// An entry or a stack outside this process TERMINATES it (the faults
-    /// ruling — a process knows where its own memory is). A full thread slab or
-    /// handle table comes back as `SosStatus.NoResource`, which it could not
-    /// have known.
+    /// The kernel acts on the process this handle names, which is the caller
+    /// only on its own handle: an entry or a stack outside that process
+    /// terminates it, the thread is charged to its Thread quota, and the
+    /// handle is minted into its table. That process at its Thread or handle
+    /// quota is `SosStatus.QuotaExceeded`; a full thread slab or handle table
+    /// comes back as `SosStatus.NoResource`.
     public func thread_create(&self, entry: UInt, stack_top: UInt,
                               arg: UInt) -> Result<thread.Thread, SosStatus> {
         let raw = try call_value(self.handle, ProcessOp.ThreadCreate as UInt,
@@ -603,24 +579,23 @@ extension Process {
         return thread.Thread(handle: ThreadHandle(raw))
     }
 
-    /// Make a thread that starts at this process's own IMAGE ENTRY — the entry
-    /// the kernel took out of the image header — with `arg` in its first
+    /// Make a thread that starts at this process's own image entry (the entry
+    /// the kernel took out of the image header), with `arg` in its first
     /// argument register, so the entry can tell which thread it is running as.
     ///
-    /// THIS OVERLOAD EXISTS BECAUSE OF A LANGUAGE GAP, and it is worth knowing
-    /// which: Saw cannot name the address of a function (design 172's reason 3,
-    /// DF-172a — `extern` declares functions, an extern function is not usable
-    /// as a value, and `@export` on a static emits a definition). So a process
-    /// written entirely in Saw cannot compute an entry address at all, and this
-    /// is the one entry it can ask for by name. A process with a C leaf that
-    /// CAN produce an address uses the overload above. See DF-178c.
+    /// This overload exists because Saw cannot name the address of a function:
+    /// `extern` declares functions, an extern function is not usable as a
+    /// value, and `@export` on a static emits a definition. A process written
+    /// entirely in Saw therefore cannot compute an entry address, and this is
+    /// the one entry it can ask for by name. A process with a C leaf that can
+    /// produce an address uses the overload above.
     public func thread_create(&self, stack_top: UInt,
                               arg: UInt) -> Result<thread.Thread, SosStatus> {
         self.thread_create(entry: sosabi.ENTRY_IMAGE, stack_top: stack_top,
                            arg: arg)
     }
 
-    /// The CALLING thread's own Thread object. Requires
+    /// The calling thread's own Thread object. Requires
     /// `ProcessRight.ThreadSelf`.
     ///
     /// This is how a thread reaches the handle it needs to exit or yield: it is
@@ -640,29 +615,25 @@ extension Process {
     /// This process's §8 status word: kind in the high bits, code in the low
     /// ones. Requires `ProcessRight.Wait`.
     ///
-    /// THE POLLING DOOR. `Waiter.add(process:, key:)` — the fourth overload,
-    /// declared at the bottom of this file — is the blocking one, onto the
-    /// same word.
+    /// This is the polling door. `Waiter.add(process:, key:)`, declared at the
+    /// bottom of this file, is the blocking one onto the same word.
     public func get_status(&self) -> Result<UInt, SosStatus> {
         call_value(self.handle, ProcessOp.GetStatus as UInt, 0, 0, 0)
     }
 
-    /// Make an Event accumulating in `mode` — §2.4's per-Event property, fixed
+    /// Make an Event accumulating in `mode`, §2.4's per-Event property, fixed
     /// for the object's life. Requires `ProcessRight.EventCreate`.
     ///
     /// `EventMode.Or` is the flag set, "which of these events occurred since
-    /// last drain", and it is the default because it is the signal use case.
+    /// last drain", and is the default because it is the signal use case.
     /// `EventMode.SaturatingSum` is the counting semaphore, "how many times",
-    /// and it saturates rather than wrapping — so a producer faster than its
-    /// consumer loses count but never rolls back through zero, which is the
-    /// value that means "not ready".
+    /// and it saturates rather than wrapping, so a producer faster than its
+    /// consumer loses count but never wraps back to zero, the value that means
+    /// "not ready".
     ///
-    /// ONE METHOD TAKING THE MODE, not one method per mode (ruled Aug 16,
-    /// user, reversing this module's first answer). A method per mode reads
-    /// fine at two and stops scaling immediately: M3's Mapping brings an access
-    /// mode and a memory type, and a method per combination is a matrix rather
-    /// than a list. The mode is a VALUE the caller chooses, so it is spelled
-    /// as one. See the module docstring for which enums are public API.
+    /// One method takes the mode rather than one per mode: the mode is a value
+    /// the caller chooses, so it is spelled as one. See the `sos` module
+    /// docstring (`lib.saw`) for which enums are public API.
     public func event_create(&self,
                              mode: EventMode = EventMode.Or) -> Result<Event, SosStatus> {
         let raw = try call_value(self.handle, ProcessOp.EventCreate as UInt,
@@ -670,7 +641,7 @@ extension Process {
         return Event(handle: EventHandle(raw))
     }
 
-    /// Make a Waiter — §2.2's generic wait aggregator. Requires
+    /// Make a Waiter, §2.2's generic wait aggregator. Requires
     /// `ProcessRight.WaiterCreate`.
     public func waiter_create(&self) -> Result<Waiter, SosStatus> {
         let raw = try call_value(self.handle, ProcessOp.WaiterCreate as UInt,
@@ -678,123 +649,121 @@ extension Process {
         return Waiter(handle: WaiterHandle(raw))
     }
 
-    /// Bind IRQ `line` to an Interrupt — spec §2's row and §9's delivery.
+    /// Bind IRQ `line` to an Interrupt (spec §2's row and §9's delivery).
     /// Requires `ProcessRight.InterruptBind`.
     ///
-    /// THE LINE IS A NUMBER THE CALLER CHOOSES, so it is spelled as one, which
-    /// is the same rule `event_create`'s mode follows. A driver knows its
-    /// device's line from the device's own description; the kernel checks it
-    /// against the board and TERMINATES the process for a line this machine
-    /// does not have, the timer's line, or one already bound — all three
-    /// caller-checkable, and all three the faults ruling's kind of mistake.
+    /// The line is a number the caller chooses, so it is spelled as one, as for
+    /// `event_create`'s mode. A driver knows its device's line from the
+    /// device's own description; the kernel checks it against the board and
+    /// terminates the process for a line this machine does not have, the
+    /// timer's line, or one already bound. All three are caller-checkable.
     ///
-    /// The line comes back UNMASKED, which is §9's starting state: the object
+    /// The line comes back unmasked, which is §9's starting state: the object
     /// exists, the controller will deliver, and the first fire masks it until
-    /// an `ack`. What the kernel does NOT touch is the device's own
-    /// interrupt-enable register — that is behind the driver's granted window
-    /// and is the driver's to write.
+    /// an `ack`. The kernel does not touch the device's own interrupt-enable
+    /// register; that is behind the driver's granted window and is the driver's
+    /// to write.
     public func interrupt_bind(&self, line: UInt) -> Result<Interrupt, SosStatus> {
         let raw = try call_value(self.handle, ProcessOp.InterruptBind as UInt,
                                  line, 0, 0)
         return Interrupt(handle: InterruptHandle(raw))
     }
 
-    /// **PHASE TWO**: run this process, handing it NOTHING in its first argument
-    /// register. Requires `ProcessRight.Start`, which is a right on the CHILD's
-    /// handle — the one `process_create` handed back.
+    /// Phase two: run this process, handing it nothing in its first argument
+    /// register. Requires `ProcessRight.Start`, a right on the child's handle
+    /// (the one `process_create` handed back).
     ///
-    /// It mints the first thread at the entry and stack RECORDED AT CREATE, so
+    /// It mints the first thread at the entry and stack recorded at create, so
     /// the caller supplies neither: a launcher never parses an image, and there
     /// is no address it could get wrong. The thread starts with `NO_HANDLE` in
-    /// its first argument register — a child that was given nothing, or that was
-    /// given handles but no BOOT TAG to find one of them by, is a fully
-    /// sandboxed compute process, which is a FEATURE rather than a state to
-    /// detect.
+    /// its first argument register. A child that was given nothing, or that was
+    /// given handles but no boot tag to find one of them by, is a fully
+    /// sandboxed compute process.
     ///
-    /// THE CALLER KEEPS RUNNING. The child becomes runnable and the scheduler
-    /// picks it up, exactly as `Thread.start` does.
+    /// The caller keeps running. The child becomes runnable and the scheduler
+    /// picks it up, as with `Thread.start`.
     ///
-    /// **A SECOND `start()` TERMINATES THE CALLER.** It is broken code — the
-    /// caller is the one that started it the first time — so it is a fault on
-    /// the faults ruling's terms rather than a status to branch on. The same
-    /// state word FREEZES THE BOOT SET: a `give` after this call is the same
-    /// fault, which is the ordering the whole launch flow rests on.
+    /// A second `start()` terminates the caller: it is broken code, since the
+    /// caller started it the first time. The same state word freezes the boot
+    /// set: a `give` after this call is the same fault, which is the ordering
+    /// the whole launch flow rests on.
+    ///
+    /// A child at its thread quota is `SosStatus.QuotaExceeded` (the first
+    /// thread is charged to the child), and a full thread slab is
+    /// `SosStatus.NoResource`. Either refusal leaves the child `Created` and
+    /// its boot set as it was.
     public func start(&self) -> Result<Void, SosStatus> {
         checked(sos_process_start(self.handle, BootTagForm.Absent as UInt, 0))
     }
 
-    /// **PHASE TWO, WITH THE CHILD'S FIRST HANDLE IN ITS FIRST ARGUMENT
-    /// REGISTER** (sawos design 4). The kernel resolves `boot_tag` against this
-    /// process's boot set and puts the CHILD-SIDE word in a0, so
-    /// `_start(boot_handle)` is unchanged from M2 and **the launcher never sees
-    /// a child-relative word at any point**.
+    /// Phase two, with the child's first handle in its first argument register.
+    /// The kernel resolves `boot_tag` against this process's boot set and puts
+    /// the child-side word in the child's first argument register, so
+    /// `_start(boot_handle)` is unchanged and the launcher never sees a
+    /// child-relative word at any point.
     ///
-    /// That is the whole reason `give` answers with a status alone: the word it
-    /// minted means nothing on this side, and the one place it means anything is
-    /// the register the child wakes up with. The launcher speaks TAGS, which are
-    /// its own words handed back unread — the kernel is a courier, and what a
+    /// That is why `give` answers with a status alone: the word it minted means
+    /// nothing on this side, and the one place it means anything is the
+    /// register the child wakes up with. The launcher speaks tags, which are
+    /// its own words handed back unread; the kernel is a courier, and what a
     /// tag means is config the launcher and the child agree on.
     ///
-    /// **THE TAGGED RECORD IS STILL DRAINED.** Resolution consumes nothing, so a
-    /// child that receives its own Process handle in a0 also meets that handle's
-    /// record in its drain. Exactly one wrapper per word is the child's
-    /// obligation there; see `Process(boot_handle:)`.
+    /// Resolution takes the tagged record: the child's drain steps over it, so
+    /// the word is delivered once, in the register, and never again by
+    /// `boot_handle_next`.
     ///
-    /// **A TAG THAT NAMES NO GIVEN RECORD TERMINATES THE CALLER** — config
-    /// error, and the caller wrote both halves of it (the tag it gave and the
-    /// tag it started with). So is a second start, exactly as for `start()`.
+    /// A tag that names no given record terminates the caller: a config error,
+    /// and the caller wrote both halves of it. So does a second start, as for
+    /// `start()`. The quota and slab statuses are `start()`'s.
     public func start(&self, boot_tag: UInt) -> Result<Void, SosStatus> {
         checked(sos_process_start(self.handle, BootTagForm.Present as UInt,
                                   boot_tag))
     }
 
     // -------------------------------------------------------------------------
-    // THE GIVE FUNNELS (sawos design 4 D-4; design 3 D-5's transfer contract)
+    // The give funnels
     // -------------------------------------------------------------------------
     //
-    // **ONE FUNNEL PER GIVABLE WRAPPER KIND, each CONSUMING its wrapper.** They
-    // are label-distinguished overloads of one verb — `child.give(memory: move
-    // r, tag: 3)` — because `give` is one operation over one op number and what
-    // varies is only which typed thing is crossing.
+    // One funnel per givable wrapper kind, each consuming its wrapper. They are
+    // label-distinguished overloads of one verb (`child.give(memory: move r,
+    // tag: 3)`) because `give` is one operation over one op number and only the
+    // typed thing crossing varies.
     //
-    // EACH ONE IS THE TRANSFER-FUNNEL CONTRACT, spelled the same way three
-    // times (design 3 D-5): take the wrapper BY VALUE so the caller cannot keep
-    // it, read the word, write `NO_HANDLE` into the field BEFORE the syscall,
-    // and let the disarmed value drop. Disarm-before-syscall is deliberate —
-    // every failure of this syscall is a FAULT, so there is no path on which a
-    // disarmed-but-unsent word leaks — and the local `var` exists only because a
-    // by-value parameter is a `let` and the disarm is a write.
+    // Each is the transfer-funnel contract: take the wrapper by value so the
+    // caller cannot keep it, read the word, write `NO_HANDLE` into the field
+    // before the syscall, and let the disarmed value drop. The local `var`
+    // exists because a by-value parameter is a `let` and the disarm is a write.
     //
-    // **THREE FUNNELS AND NOT NINE, and the rights audit is the reason.** A
-    // handle can be given only if its rights word carries the universal
-    // `Transfer` bit, and v1 mints that bit in exactly four places:
-    // `memory_rights()` (M3 unit 2), `process_rights()` (design 4 D-3),
-    // `root_system_rights()` (the Aug-29 rulings) and `iomemory_rights()` (M3
-    // unit 4). A Thread, Event, Waiter, Interrupt, Clock or Timer handle
-    // therefore cannot be given at all, and a funnel for one would be a method
-    // whose every call is an `AccessDenied` fault — dead surface, on the same
-    // rule that has `ClockType` declare one domain. (A Mapping carries
-    // `Transfer` in its ENUM and never in its default set, which is the same
-    // answer arrived at from the other side — see `MappingRight`.)
+    // The errors and the keep mask are stated once, on `give(memory:)`.
     //
-    // **THE THIRD ONE IS UNIT 6's** (sawos design 9 D-2). `iomemory_rights()`
-    // has minted `Transfer` since unit 4 and the kernel's `boot_kind_of` has
-    // had its `IoMemory` arm since then too, both of them written FOR this
-    // flow; what was missing was the typed funnel. A window is now a thing a
-    // launcher hands over, which is what a driver child is made of.
+    // A handle can be given only if its rights word carries the universal
+    // `Transfer` bit. The default sets that carry it belong to System, Process,
+    // Memory, IoMemory, the pipe ends and the pipe one-shots. Thread, Event,
+    // Waiter, Interrupt, Clock, Timer and Mapping handles therefore cannot be
+    // given at all, and a funnel for one would be a method whose every call is
+    // an `AccessDenied` fault. There is no `give(process:)` funnel: a launcher
+    // keeps the child's Process handle to supervise with. A kind that must
+    // travel gets its default set ruled on and a funnel added beside these.
     //
-    // `give(system:)` IS THE ONE THE LAUNCH FLOW TURNS ON: a launcher mints a
-    // MASKED sibling of its own System handle and gives that, which is how a
-    // child gets a voice, a clock and its own Process handle without getting the
-    // machine's off switch. There is no `give(process:)` because nothing needs
-    // one — a launcher keeps the child's Process handle to supervise WITH, and a
-    // Process handle onto some THIRD process is a supervision hand-off nothing
-    // can hold two of yet. When a unit needs a kind to travel, it rules on that
-    // kind's default set and adds the funnel beside it.
+    // `give(system:)` is the one the launch flow turns on: a launcher mints a
+    // masked sibling of its own System handle and gives that, which is how a
+    // child gets a voice, a clock and its own Process handle without the
+    // machine's off switch.
 
-    /// Give a memory REGION to this process under `tag`, consuming the wrapper.
+    /// Give a memory region to this process under `tag`, consuming the wrapper.
     /// Requires `ProcessRight.Give` here and `MemoryRight.Transfer` on the
-    /// region — which every boot region carries.
+    /// region, which every boot region carries.
+    ///
+    /// The contract every `give` overload shares: the child's entry carries the
+    /// given handle's rights intersected with `keep` (all ones keeps them all).
+    /// The child must still be `Created` and `tag` must be new in its boot set.
+    /// Caller errors fault, and the process ends with teardown covering
+    /// everything it held. A full child table or boot set is
+    /// `SosStatus.NoResource` and a child at its handle quota is
+    /// `SosStatus.QuotaExceeded`. On those the give did not happen, but the
+    /// wrapper was already disarmed: these overloads do not return the object,
+    /// so the handle stays bound in the caller's table under a word nothing
+    /// holds until the caller exits.
     public func give(&self, memory: Memory, tag: UInt,
                      keep: UInt32 = ALL_RIGHTS) -> Result<Void, SosStatus> {
         var region = move memory
@@ -803,28 +772,25 @@ extension Process {
         return checked(sos_process_give(self.handle, word, tag, keep as UInt))
     }
 
-    /// Give a DEVICE WINDOW to this process under `tag`, consuming the wrapper.
+    /// Give a device window to this process under `tag`, consuming the wrapper.
     /// Requires `ProcessRight.Give` here and `IoMemoryRight.Transfer` on the
-    /// window — which every boot window and every carved sub-window carries.
+    /// window, which every boot window and every carved sub-window carries.
     ///
-    /// **THIS IS THE HANDOVER A DRIVER CHILD IS MADE OF** (sawos design 9 D-2),
-    /// and it is what §2.5's migration case bought: M2's device grant was a
-    /// record in the driver's own manifest, so the kernel could only ever grant
-    /// the one process it loads and a child was refused a window outright. A
-    /// window that arrives as a CAPABILITY is a window somebody can hand over.
+    /// This is the handover a driver child is made of. A window that arrives as
+    /// a capability is a window somebody can hand over, where a window declared
+    /// in a driver's own manifest could only ever be granted to the one process
+    /// the kernel loads.
     ///
-    /// **THE CHILD MAPS IT, NOT THE LAUNCHER.** Root gives the window and stops
-    /// there; the child drains the record, takes the `IoMemory` and calls
-    /// `Process.map(iomemory:)` on ITS OWN Process handle. That is the lean
-    /// deliberately: what crosses the boundary is authority over a device, and
-    /// where the row goes is then the holder's own business. (The other
-    /// direction — a launcher INSTALLING a row in a child it created — is
-    /// `Process.map` above, and unit 6 exercises both so the two read side by
-    /// side.)
+    /// The child maps it, not the launcher. The launcher gives the window and
+    /// stops there; the child drains the record, takes the `IoMemory` and calls
+    /// `Process.map(iomemory:)` on its own Process handle. What crosses the
+    /// boundary is authority over a device, and where the row goes is then the
+    /// holder's own business. (A launcher installing a row in a child it
+    /// created is `Process.map` below.)
     ///
-    /// The transfer-funnel contract is the same as the two funnels beside this
-    /// one: by value, disarm before the syscall, let the disarmed value drop.
-    /// What root gives away it cannot map anywhere.
+    /// The transfer-funnel contract is the same as the funnels beside this one:
+    /// by value, disarm before the syscall, let the disarmed value drop. What
+    /// the launcher gives away it cannot map anywhere.
     public func give(&self, iomemory: IoMemory,
                      tag: UInt,
                      keep: UInt32 = ALL_RIGHTS) -> Result<Void, SosStatus> {
@@ -834,27 +800,25 @@ extension Process {
         return checked(sos_process_give(self.handle, word, tag, keep as UInt))
     }
 
-    /// Give a SYSTEM handle to this process under `tag`, consuming the wrapper.
+    /// Give a System handle to this process under `tag`, consuming the wrapper.
     ///
-    /// **THIS IS THE ONE THE LAUNCH FLOW TURNS ON.** A launcher does not give
-    /// away the System handle it holds — it MINTS a masked sibling
-    /// (`System.mint(rights:)`) and gives that, so what a child receives was
-    /// narrowed before it left. Pair it with `start(boot_tag:)` naming the same
-    /// tag and the child wakes up holding it, which is how every process in the
-    /// system bootstraps: System in the first argument register, its own Process
-    /// handle derived from it, its boot set drained from there (§12).
+    /// A launcher does not give away the System handle it holds; it mints a
+    /// masked sibling (`System.mint(rights:)`) and gives that, so what a child
+    /// receives was narrowed before it left. Pair it with `start(boot_tag:)`
+    /// naming the same tag and the child wakes up holding it, which is how
+    /// every process bootstraps: System in the first argument register, its own
+    /// Process handle derived from it, its boot set drained from there (§12).
     ///
     /// The sibling's mask is the whole of the policy. `Debug | ProcessSelf |
-    /// ClockGet` gives a child a voice, an identity and a clock; `Shutdown`,
-    /// `ProcessCreate` and `Mint` are absent BY SILENCE, so the child cannot stop
-    /// the machine, cannot spawn and cannot widen what it holds — a mint's result
-    /// is a subset of its source, so no sequence of ops recovers a masked bit.
+    /// ClockGet | Transfer` gives a child a voice, an identity and a clock;
+    /// `Shutdown`, `ProcessCreate` and `Mint` are absent by silence, so the
+    /// child cannot stop the machine, cannot spawn and cannot widen what it
+    /// holds. A mint's result is a subset of its source, so no sequence of ops
+    /// recovers a masked bit.
     ///
-    /// **THE MASK MUST KEEP `Transfer`**, because that is the bit this op checks
-    /// on the thing being given: a launcher cannot narrow below the ticket that
-    /// lets the narrowed handle arrive. So a child holds `Transfer` too, which is
-    /// inert today (nothing it can reach is a receiver) and is a recorded finding
-    /// for the unit that gives a child a pipe.
+    /// The sibling's mask must keep `Transfer`, the bit this op checks on the
+    /// thing being given. What the child receives need not: a `keep` that
+    /// leaves `Transfer` out delivers a handle without it.
     public func give(&self, system: System, tag: UInt,
                      keep: UInt32 = ALL_RIGHTS) -> Result<Void, SosStatus> {
         var authority = move system
@@ -863,29 +827,25 @@ extension Process {
         return checked(sos_process_give(self.handle, word, tag, keep as UInt))
     }
 
-    /// Give the CLIENT END of a connection to this process under `tag`,
+    /// Give the client end of a connection to this process under `tag`,
     /// consuming the wrapper. Requires `ProcessRight.Give` here and
-    /// `PipeInletRight.Transfer` on the end — which every end
+    /// `PipeInletRight.Transfer` on the end, which every end
     /// `Process.pipe_create` mints carries.
     ///
-    /// **THIS IS WHAT A PAIR IS FOR** (sawos design 13 D-3). A launcher creates
-    /// the connection, keeps or gives the outlet, and hands the inlet to whoever
-    /// is to be the client — two ordinary gives, and the two processes are then
-    /// joined by a capability neither of them could have named otherwise.
-    /// `pipe-child` is that flow at its smallest: root keeps the outlet, the
-    /// child posts through the inlet, and the only thing the two programs share
-    /// is the tag.
+    /// This is what a pair is for. A launcher creates the connection, keeps or
+    /// gives the outlet, and hands the inlet to whoever is to be the client.
+    /// The two processes are then joined by a capability neither could have
+    /// named otherwise.
     ///
-    /// **THE COUNT DOES NOT CHANGE, AND THAT MATTERS HERE MORE THAN ANYWHERE
-    /// ELSE.** A give is a MOVE: the connection's inlet column is exactly what
-    /// it was on both sides of this call, so handing an end over is never the
-    /// event that tells the far end anything. Only the LAST holder of an end
-    /// dropping it is news — which is what makes a launcher able to route an end
-    /// through itself without the peer ever seeing a flicker of peer-gone.
+    /// The count does not change. A give is a move: the connection's inlet
+    /// column is exactly what it was on both sides of this call, so handing an
+    /// end over is never the event that tells the far end anything. Only the
+    /// last holder of an end dropping it is news, so a launcher can route an
+    /// end through itself without the peer ever seeing peer-gone.
     ///
-    /// The transfer-funnel contract is the same as the three funnels above: by
-    /// value, disarm before the syscall, let the disarmed value drop. What you
-    /// give away you cannot post through.
+    /// The transfer-funnel contract is the same as the funnels above: by value,
+    /// disarm before the syscall, let the disarmed value drop. What you give
+    /// away you cannot post through.
     public func give(&self, inlet: PipeInlet,
                      tag: UInt,
                      keep: UInt32 = ALL_RIGHTS) -> Result<Void, SosStatus> {
@@ -895,14 +855,13 @@ extension Process {
         return checked(sos_process_give(self.handle, word, tag, keep as UInt))
     }
 
-    /// Give the SERVER END of a connection to this process under `tag`,
+    /// Give the server end of a connection to this process under `tag`,
     /// consuming the wrapper. Requires `ProcessRight.Give` here and
     /// `PipeOutletRight.Transfer` on the end.
     ///
-    /// The mirror of `give(inlet:)`, and the direction a launcher uses when the
-    /// CHILD is the server: root creates the pair, gives the child the outlet
-    /// and keeps the inlet, and the child's loop is a `take` poll. Unit 5's
-    /// driver-as-service is that shape with a protocol on top.
+    /// The mirror of `give(inlet:)`, for when the child is the server: the
+    /// launcher creates the pair, gives the child the outlet and keeps the
+    /// inlet, and the child's loop is a `take` poll.
     public func give(&self, outlet: PipeOutlet,
                      tag: UInt,
                      keep: UInt32 = ALL_RIGHTS) -> Result<Void, SosStatus> {
@@ -912,16 +871,15 @@ extension Process {
         return checked(sos_process_give(self.handle, word, tag, keep as UInt))
     }
 
-    /// Give a CLAIM ON A REPLY to this process under `tag`, consuming the
+    /// Give a claim on a reply to this process under `tag`, consuming the
     /// wrapper. Requires `ProcessRight.Give` here and `PipeReplyRight.Transfer`
     /// on the claim.
     ///
-    /// **§2.1 RATIFIES BOTH ONE-SHOTS AS TRANSFERABLE, AND THIS IS THE CLIENT
-    /// SIDE OF THAT.** It hands the right to READ one answer to somebody else: a
-    /// client that has asked a question and wants a third party to collect the
-    /// reply gives the claim away, and the exchange neither notices nor cares —
-    /// the obligation still names the same ring slot, and whoever holds the claim
-    /// when the reply is written is who gets it.
+    /// §2.1 makes both one-shots transferable, and this is the client side: it
+    /// hands the right to read one answer to somebody else. A client that has
+    /// asked a question and wants a third party to collect the reply gives the
+    /// claim away; the obligation still names the same ring slot, and whoever
+    /// holds the claim when the reply is written is who gets it.
     ///
     /// The transfer-funnel contract is the same as the funnels above: by value,
     /// disarm before the syscall, let the disarmed value drop.
@@ -934,21 +892,19 @@ extension Process {
         return checked(sos_process_give(self.handle, word, tag, keep as UInt))
     }
 
-    /// Give an OBLIGATION TO REPLY to this process under `tag`, consuming the
+    /// Give an obligation to reply to this process under `tag`, consuming the
     /// wrapper. Requires `ProcessRight.Give` here and
     /// `PipeRequestRight.Transfer` on the obligation.
     ///
-    /// **THIS IS §2.1's DELEGATION PRIMITIVE, IN ONE CALL.** The ratified
-    /// zero-copy example is exactly this: a filesystem receives a read, forwards
-    /// the request handle to the flash driver, and the driver replies with the
-    /// hardware bytes STRAIGHT to the original client — the payload never transits
-    /// the middle process. Single use survives the transfer, because it is a
-    /// property of the exchange rather than of who holds the handle: one reply may
-    /// be written, wherever it is written from.
+    /// This is §2.1's delegation primitive in one call. A filesystem receives a
+    /// read, forwards the request handle to the flash driver, and the driver
+    /// replies with the hardware bytes straight to the original client; the
+    /// payload never transits the middle process. Single use survives the
+    /// transfer, because it is a property of the exchange rather than of who
+    /// holds the handle: one reply may be written, wherever it is written from.
     ///
-    /// `pipe-delegate` is that flow at its smallest, and unit 4 is where it stops
-    /// needing a `give` at all — a request handle travelling IN A MESSAGE is what
-    /// makes the example a protocol rather than a launch-time wiring.
+    /// A request handle can also travel in a message, which makes the
+    /// delegation a protocol rather than launch-time wiring.
     public func give(&self, request: PipeRequest,
                      tag: UInt,
                      keep: UInt32 = ALL_RIGHTS) -> Result<Void, SosStatus> {
@@ -958,33 +914,29 @@ extension Process {
         return checked(sos_process_give(self.handle, word, tag, keep as UInt))
     }
 
-    /// **MAKE A CONNECTION IN THIS PROCESS, and receive BOTH of its ends** (spec
-    /// §2.1; sawos design 10 ruling 3, built by design 13). Requires
-    /// `ProcessRight.PipeCreate`.
+    /// Make a connection in this process and receive both of its ends (spec
+    /// §2.1). Requires `ProcessRight.PipeCreate`.
     ///
-    /// **THE FACTORY IS ON THE PROCESS OBJECT**, not on System, and that is a
-    /// ruling rather than a placement: pipes are IPC and carry nothing
-    /// system-shaped, and putting the authority on a per-process handle is what
-    /// makes it ATTENUABLE — a child whose Process handle was minted through a
-    /// keep mask without the bit can hold and use connections somebody else made
-    /// and can never make one of its own. `EventCreate` and `WaiterCreate` are
-    /// the precedents; `ProcessCreate` is the one op that went the other way,
-    /// because a process is machine-global and a pipe is not.
+    /// The factory is on the Process object, not on System. Pipes are IPC and
+    /// carry nothing system-shaped. The bit narrows a handle, not a process: a
+    /// Process handle without it cannot make a connection, but a process whose
+    /// System handle carries `SystemRight.ProcessSelf` can derive one that can
+    /// (`process_self` mints the default set intersected with its own mask on
+    /// every call). `EventCreate` and `WaiterCreate` are the precedents;
+    /// `ProcessCreate` goes the other way because a process is machine-global
+    /// and a pipe is not.
     ///
-    /// **BOTH ENDS COME BACK AT ONCE, AND THAT IS WHY THE KERNEL ANSWERS IN
-    /// MEMORY.** An op returns one word; a connection has two ends. So the
-    /// answer is a two-word copy-out record — the funnel `Clock.now` already
-    /// uses — decoded here into the two owning wrappers. A caller never sees the
-    /// record and never sees a word.
+    /// Both ends come back at once. An op returns one word and a connection has
+    /// two ends, so the kernel answers with a two-word copy-out record (the
+    /// funnel `Clock.now` uses), decoded here into the two owning wrappers. A
+    /// caller never sees the record or a word.
     ///
-    /// **THE CREATOR HOLDS BOTH, AND WIRES THEM OUTWARD WITH `give`.** That is
-    /// the whole launch story for a connection: `let (inlet, outlet) = try
-    /// proc.pipe_create()`, then `child.give(inlet: move inlet, tag: …)` and
-    /// keep the outlet — or the mirror. Nothing about the flow is new; a
-    /// connection end is a capability like any other.
+    /// The creator holds both and wires them outward with `give`: `let (inlet,
+    /// outlet) = try proc.pipe_create()`, then `child.give(inlet: move inlet,
+    /// tag: ...)` and keep the outlet, or the mirror.
     ///
-    /// A process at its pipe budget is `SosStatus.QuotaExceeded` — creator-pays,
-    /// so this ONE charge covers the pair — and a full slab or handle table is
+    /// A process at its pipe or handle quota is `SosStatus.QuotaExceeded` (one
+    /// pipe charge covers the pair), and a full slab or handle table is
     /// `SosStatus.NoResource`. Either way nothing was created and neither table
     /// moved.
     public func pipe_create(&self) -> Result<(PipeInlet, PipeOutlet), SosStatus> {
@@ -992,77 +944,63 @@ extension Process {
     }
 
     // -------------------------------------------------------------------------
-    // THE MAP FUNNELS (sawos design 6 D-3)
+    // The map funnels
     // -------------------------------------------------------------------------
     //
-    // **THE RECEIVER IS THE PROCESS BEING MAPPED INTO, AND THAT IS A SHAPE THE
-    // MODULE ORDER FORCED.** Design 6 D-7 sketched these as `Memory.map(into:
-    // &Process)`, which does not compile in today's Saw: `BootHandle` carries a
-    // `Memory?` and an `IoMemory?`, so `sos.memory` and `sos.iomemory` are
-    // BELOW this module, and a `map` written there naming `Process` would be
-    // the import cycle DF-232e diagnoses. A type's extension methods must live
-    // in the module that declares the type (design 142/229 — a re-export widens
-    // no extension scope), so there is no arrangement of files that puts the
-    // method on the region. Recorded as design 5's finding 1 biting a second
-    // time.
+    // The receiver is the process being mapped into, which the module order
+    // forces: `BootHandle` carries a `Memory?` and an `IoMemory?`, so
+    // `sos.memory` and `sos.iomemory` are below this module, and a `map`
+    // written there naming `Process` would be an import cycle. The funnels read
+    // like `give` one section up (`child.map(memory: &region, access: RW)`
+    // beside `child.give(memory: move region, tag: 3)`). The syscall's own
+    // receiver is still the region handle; every one of these methods passes
+    // `self.handle` as the target argument.
     //
-    // WHAT IT COSTS IS NOTHING AND WHAT IT BUYS IS CONSISTENCY: the funnels
-    // read exactly like `give` one section up — `child.map(memory: &region,
-    // access: RW)` beside `child.give(memory: move region, tag: 3)` — which is
-    // the same receiver answering the same question about the same child. The
-    // syscall's own receiver is still the REGION handle; a wrapper is not
-    // obliged to mirror the op's handle register, and every one of these
-    // methods passes `self.handle` as the target argument.
-    //
-    // **NOTHING IS CONSUMED, AND THERE IS NO DISARM**, which is the difference
-    // from the give funnels beside them and is worth saying at the funnel: a
-    // map MOVES NO HANDLE WORD. The region stays in the caller's table and
-    // stays the caller's, the target Process handle stays the caller's, and
-    // what comes back is a NEW capability naming a row. So the transfer-funnel
-    // contract (design 3 D-5) has nothing to say here — there is no word that
-    // left, so there is nothing to write `NO_HANDLE` over. The borrows say it
-    // in the signature: `&Memory`, `&IoMemory`, `&self`.
+    // Nothing is consumed and there is no disarm, unlike the give funnels: a
+    // map moves no handle word. The region stays in the caller's table, the
+    // target Process handle stays the caller's, and what comes back is a new
+    // capability naming a row. There is no word that left, so there is nothing
+    // to write `NO_HANDLE` over. The borrows say it in the signature:
+    // `&Memory`, `&IoMemory`, `&self`.
 
-    /// **INSTALL `memory` IN THIS PROCESS'S ADDRESS SPACE**, and answer with the
-    /// Mapping that names the row. Requires `ProcessRight.Map` here AND
+    /// Install `memory` in this process's address space, and answer with the
+    /// Mapping that names the row. Requires `ProcessRight.Map` here and
     /// `MemoryRight.Map` on the region.
     ///
-    /// **TWO RIGHTS ON TWO OBJECTS**, and the doctrine is why: possession of
-    /// bytes must not imply authority over somebody's address space. A launcher
-    /// handed a region without `Map` on the child's handle has memory it cannot
-    /// install anywhere, which is exactly the attenuation a single right could
-    /// not express.
+    /// Two rights on two objects, because possession of bytes must not imply
+    /// authority over somebody's address space. A launcher handed a region
+    /// without `Map` on the child's handle has memory it cannot install
+    /// anywhere, which a single right could not express.
     ///
-    /// **THE ADDRESS IS THE REGION'S OWN.** A caller supplies no address at all
-    /// — SOS does not translate, so a region maps where it IS — which is what
-    /// keeps a Memory a capability rather than a description and is why this
-    /// method answers with a Mapping instead of a number. What a process knows
-    /// about where its memory is, it knows from the config that gave it the
-    /// region, exactly as a driver knows its device's address.
+    /// The caller supplies no address; the kernel chooses. Read the result with
+    /// `Mapping.base()`. This keeps a Memory a capability rather than a
+    /// description and is why this method answers with a Mapping instead of a
+    /// number.
     ///
-    /// `access` is a mask of `MapAccess` bits, and it is a property of THIS
-    /// MAPPING rather than of the region — which is what makes double-mapping
-    /// one region read-only in one place and read-write in another expressible.
-    /// A double map is ALLOWED: two rows, two Mappings, no aliasing bookkeeping
-    /// owed on a machine with no translation.
+    /// `access` is a mask of `MapAccess` bits, and a property of this mapping
+    /// rather than of the region, so one region can be mapped read-only in one
+    /// place and read-write in another. A double map is allowed: two rows, two
+    /// Mappings.
     ///
     /// Write without read, no access at all, a bit outside the three, and a
-    /// range this machine cannot grant all TERMINATE the caller. A domain with
-    /// no protection row left is `SosStatus.NoResource` — the PHYSICAL wall,
-    /// which on one profile is a fixed number of hardware regions.
+    /// range this machine cannot grant all terminate the caller. The target's
+    /// mapping quota is capped at the protection rows its domain has left
+    /// (on one profile a fixed number of hardware regions), so a domain with no
+    /// row left is `SosStatus.QuotaExceeded`; so is a caller at its handle
+    /// quota. No address space left for the range in the target's domain, a
+    /// full mapping slab or a full handle table is `SosStatus.NoResource`.
     ///
-    /// **IT WORKS BEFORE `start()` AND AFTER IT.** A mapping is not a boot
-    /// record: the give-freeze (§12's "the boot set freezes at start") does not
-    /// apply to it, because a row is not a handle in the child's table and
-    /// installing one answers no question the child has already asked. Mapping
-    /// into a `Created` child is how a launcher hands over memory the child's
-    /// image never declared.
+    /// It works before `start()` and after it. A mapping is not a boot record:
+    /// the give-freeze (§12's "the boot set freezes at start") does not apply,
+    /// because a row is not a handle in the child's table and installing one
+    /// answers no question the child has already asked. Mapping into a
+    /// `Created` child is how a launcher hands over memory the child's image
+    /// never declared.
     ///
-    /// **WHAT IT DOES NOT WORK ON IS A DEAD PROCESS** — that TERMINATES the
-    /// caller. A supervisor's handle onto a dead child outlives it on purpose
-    /// (reading how it died is what the handle is for), so the refusal has to be
-    /// stated rather than implied, and it is caller-checkable: ask
-    /// `get_status()` first if you cannot be sure.
+    /// It does not work on a dead process, and that terminates the caller. A
+    /// supervisor's handle onto a dead child outlives it on purpose (reading
+    /// how it died is what the handle is for), so the refusal is stated here.
+    /// It is caller-checkable: ask `get_status()` first if you cannot be sure.
     public func map(&self, memory: &Memory,
                     access: UInt32) -> Result<Mapping, SosStatus> {
         let raw = try call_value(memory.handle, MemoryOp.Map as UInt,
@@ -1070,154 +1008,138 @@ extension Process {
         return Mapping(handle: MappingHandle(raw))
     }
 
-    /// **INSTALL `iomemory` IN THIS PROCESS'S ADDRESS SPACE** — a device window,
-    /// with device memory attributes. Requires `ProcessRight.Map` here AND
+    /// Install `iomemory` in this process's address space: a device window,
+    /// with device memory attributes. Requires `ProcessRight.Map` here and
     /// `IoMemoryRight.Map` on the window.
     ///
-    /// **THERE IS NO `access:` ARGUMENT, AND THAT IS THE TYPE DOING ITS JOB**
-    /// (design 6 D-1). An IoMemory can only ever produce a device-attribute row
-    /// — read-write, never executable, never cacheable — so a driver cannot get
-    /// a cached view of a register block by any spelling available to it. The
-    /// guarantee is which method exists, not a check somebody runs.
+    /// There is no `access:` argument. An IoMemory can only ever produce a
+    /// device-attribute row (read-write, never executable, never cacheable), so
+    /// a driver cannot get a cached view of a register block by any spelling
+    /// available to it. The guarantee is which method exists, not a check
+    /// somebody runs.
     ///
-    /// **THIS IS "THE SAME WINDOW, OBTAINED RATHER THAN DECLARED"** (§2.5's
-    /// migration case, come true). M2's driver declared its MMIO window in its
-    /// manifest and the kernel installed it before user mode; a driver now
-    /// receives the window as a capability, maps it into itself with this call,
-    /// and drives exactly the same registers at exactly the same addresses. The
-    /// difference is that the window is now something a launcher HANDS OVER,
-    /// which is what makes a driver child possible at all.
+    /// A driver receives its window as a capability and maps it into itself
+    /// with this call. Because the window is something a launcher hands over, a
+    /// driver child is possible at all.
     public func map(&self, iomemory: &IoMemory) -> Result<Mapping, SosStatus> {
         let raw = try call_value(iomemory.handle, IoMemoryOp.Map as UInt,
                                  self.handle, 0, 0)
         return Mapping(handle: MappingHandle(raw))
     }
 
-    /// Take the next handle out of this process's BOOT SET (spec §12).
-    /// Requires `ProcessRight.BootHandles`.
+    /// Take the next handle out of the calling process's boot set (spec §12),
+    /// whichever process this handle names. Requires
+    /// `ProcessRight.BootHandles`.
     ///
-    /// §12 keeps the boot set ONE HANDLE WIDE at the entry register — the
-    /// System handle — so everything else the kernel minted before the process
-    /// ran is COLLECTED rather than passed. This is that collection, one record
-    /// at a time, and it is what a launcher's first loop looks like.
+    /// §12 keeps the boot set one handle wide at the entry register (the System
+    /// handle), so everything else the kernel minted before the process ran is
+    /// collected rather than passed. This is that collection, one record at a
+    /// time, and a launcher's first loop is built on it.
     ///
-    /// **EXHAUSTION IS `Err(SosStatus.Drained)` AND IT IS THE LOOP'S EXIT**, not
-    /// a failure to report: a drain ENDS by meeting the end. It stays drained,
-    /// so asking again is safe and answers the same.
+    /// Exhaustion is `Err(SosStatus.Drained)`, and it is the loop's exit, not a
+    /// failure to report: a drain ends by meeting the end. It stays drained, so
+    /// asking again is safe and answers the same.
     ///
-    /// Each record carries the REGION ORDINAL it came from. The kernel assigns
-    /// no meaning to that number — which image, which destination, which device
-    /// — because the meaning is the launcher's config, and keeping it there is
-    /// what lets the same kernel serve a hand-built system and a dynamic one.
+    /// Each record carries a tag. In root's set it is the ordinal of the boot
+    /// region the record names; in a child's it is the tag its launcher gave
+    /// the handle under. The kernel assigns no meaning to either (which image,
+    /// which destination, which device); the meaning is config.
     public func boot_handle_next(&self) -> Result<BootHandle, SosStatus> {
         boot_handle_into_frame(self.handle)
     }
 
-    /// **MINT A SIBLING of this Process handle, narrowed by a KEEP MASK** — the
+    /// Mint a sibling of this Process handle, narrowed by a keep mask: the
     /// universal `MINT_OP`, on `System.mint`'s terms exactly (see it for the
-    /// polarity ruling and the maskable `Mint` bit). Requires
-    /// `ProcessRight.Mint` on THIS handle.
+    /// fail-closed polarity and the maskable `Mint` bit). Requires
+    /// `ProcessRight.Mint` on this handle.
     ///
-    /// **THE ONE KIND THAT DID NOT HAVE THIS, AND DESIGN 16 IS WHAT NEEDED IT.**
-    /// System, Memory and the four pipe ends each grew a typed `mint` with the
-    /// funnel that wanted one; a Process handle had none because nothing had
-    /// asked to hand out a NARROWED one. `ProcessRight.Stats` is that ask: the
-    /// bit exists to be withheld — "you may learn my child died, and not watch
-    /// it work" — and without this method the withholding would be unwritable at
-    /// the typed tier, which is dead surface by another name.
+    /// This is where withholding `ProcessRight.Stats` is written: "you may
+    /// learn my child died, and not watch it work". A launcher supervising a
+    /// child through a sibling minted here holds exactly the authority its mask
+    /// names.
     ///
-    /// A launcher supervising a child through a sibling minted here holds
-    /// exactly the authority its mask names, and it is worth noting what the
-    /// mask CANNOT reach: a child derives its OWN Process handle from its System
-    /// handle through `process_self()`, which mints the one default set (see
-    /// `sosabi`'s `process_rights`). So this narrows what a SUPERVISOR may ask
+    /// The mask cannot reach what the child derives for itself: a child derives
+    /// its own Process handle from its System handle through `process_self()`,
+    /// which takes its own keep mask. So this narrows what a supervisor may ask
     /// about a child, not what the child may ask about itself.
     ///
-    /// A full handle table is `SosStatus.NoResource`. A handle without `Mint`
-    /// TERMINATES the caller.
+    /// A process at its handle quota gets `SosStatus.QuotaExceeded`; a full
+    /// handle table is `SosStatus.NoResource`. A handle without `Mint`
+    /// terminates the caller.
     public func mint(&self,
                      rights: UInt32 = ALL_RIGHTS) -> Result<Process, SosStatus> {
         let raw = try call_value(self.handle, MINT_OP, rights as UInt, 0, 0)
         return Process(handle: ProcessHandle(raw))
     }
 
-    /// **HOW MANY TRAPS THIS PROCESS HAS TAKEN**, split by kind (sawos design
-    /// 16). Requires `ProcessRight.Stats`.
+    /// How many traps this process has taken, split by kind. Requires
+    /// `ProcessRight.Stats`.
     ///
     /// Read `ProcessStats` for what each column counts and which one is worth
-    /// asserting on. The two things to hold in mind at a call site:
+    /// asserting on. At a call site:
     ///
-    ///   - **The receiver is whose counters come back.** `process_self()` then
+    ///   - The receiver is whose counters come back. `process_self()` then
     ///     `stats()` is self-inspection; the same call on a child's handle is
-    ///     supervision, and it reads a DEAD child's columns perfectly well —
+    ///     supervision, and it reads a dead child's columns perfectly well,
     ///     which is the only way to see the `faults` column move, since a
     ///     faulting process is not there to ask.
-    ///   - **This call is itself a syscall and is counted before it answers.**
-    ///     A delta between two readings therefore includes the second reading's
+    ///   - This call is itself a syscall and is counted before it answers. A
+    ///     delta between two readings therefore includes the second reading's
     ///     own trap; subtract that one where the measured window is what
     ///     matters.
     ///
-    /// The answer rides the copy-out funnel (`Clock.now`'s) because three 64-bit
-    /// columns fit no value register on either profile. It allocates nothing and
-    /// charges no quota, so there is no `NoResource` path: a correct caller
-    /// meets no failure here at all.
+    /// The answer rides the copy-out funnel (`Clock.now`'s) because three
+    /// 64-bit columns fit no value register on any profile. It allocates
+    /// nothing and charges no quota, so a correct caller meets no failure here
+    /// at all.
     public func stats(&self) -> Result<ProcessStats, SosStatus> {
         process_stats_into_frame(self.handle)
     }
 }
 
-// **THE FOURTH `Waiter.add` OVERLOAD LIVES HERE, NOT IN `sos.waiter`** — and
-// since sawlang 0.2.0 that placement is invisible to callers, which is the
-// point. Design 8 RULED this spelling and unit 5.5 could not write it: the
-// overload has to read `process.handle`, so it must sit where `Process` is
-// declared, and extension lookup did not follow the facade's `public import`,
-// so a method declared here was out of scope at every real call site
-// (`Process.attach` was the workaround — SL-7's third site). Sawlang 0.2.0
-// made extension lookup follow `public import`, so an `import sos.{Waiter}`
-// now carries this overload with it and the ruled surface is writable — the
-// first pin bump is what delivered it.
+// The `Waiter.add(process:, key:)` overload lives here because it reads
+// `process.handle`, so it must sit where `Process` is declared. Extension
+// lookup follows the facade's `public import`, so callers see it as a member of
+// `Waiter`.
 extension Waiter {
-    /// WATCH A PROCESS DIE: attach it under `key`, which a `wait()` hands back
-    /// with the §8 status word when it ends, whatever ended it (spec §8; sawos
-    /// design 8, M3 unit 5.5). Requires `ProcessRight.Wait` there and
-    /// `WaiterRight.Attach` here — the same bit `get_status` spends and no new
-    /// one, because being woken by a death and asking whether one happened are
-    /// one question at two tempos.
+    /// Watch a process die: attach it under `key`, which a `wait()` hands back
+    /// with the §8 status word when it ends, whatever ended it (spec §8).
+    /// Requires `ProcessRight.Wait` there and `WaiterRight.Attach` here. It is
+    /// the same bit `get_status` spends, because being woken by a death and
+    /// asking whether one happened are one question at two tempos.
     ///
-    /// Every rule the other three overloads state holds unchanged: keys are
-    /// unique per Waiter, a handle attaches to at most one Waiter, readiness
-    /// is level-triggered. What is NEW here is that **DEATH IS A TERMINAL
-    /// LEVEL**: an Event's word and a Timer's fire count are CONSUMED by the
-    /// wait that reports them; a death is not. A process that was ALREADY DEAD
-    /// when you attached still wakes you — no window in which a death can be
-    /// missed, which is what makes supervision race-free — and a second
-    /// `wait()` on the same attachment answers the same word. Nothing un-dies.
+    /// Every rule the other overloads state holds unchanged: keys are unique
+    /// per Waiter, a handle attaches to at most one Waiter, readiness is
+    /// level-triggered. What is new is that death is a terminal level. An
+    /// Event's word and a Timer's fire count are consumed by the wait that
+    /// reports them; a death is not. A process that was already dead when you
+    /// attached still wakes you, so there is no window in which a death can be
+    /// missed, and a second `wait()` on the same attachment answers the same
+    /// word. Nothing un-dies.
     ///
-    /// THE PROCESS IS BORROWED AND NOTHING IS CONSUMED: an attachment is a
-    /// subscription the WAITER owns, so the handle stays yours, and dropping
-    /// it detaches nothing (`remove(key)` is what detaches). The attachment is
-    /// also a REFERENCE — a dead process's slot lives until BOTH its last
-    /// handle and its attachment are gone, which is what keeps the status word
-    /// readable for as long as anybody is watching.
+    /// The process is borrowed and nothing is consumed: an attachment is a
+    /// subscription the Waiter owns, so the handle stays yours, and dropping it
+    /// detaches nothing (`remove(key)` does). The attachment is also a
+    /// reference: a dead process's slot lives until both its last handle and
+    /// its attachment are gone, which keeps the status word readable for as
+    /// long as anybody is watching.
     public func add(&self, process: &Process, key: UInt,
                     mode: AttachMode = AttachMode.Persistent) -> Result<Void, SosStatus> {
         self.attach(process.handle, key, mode_flag(mode))
     }
 
-    /// **HAND A PROCESS HANDLE TO THIS WAITER, AND STOP HOLDING IT** — `give`'s
-    /// fourth overload, declared here for the reason `add`'s fourth is (sawos
-    /// design 15, M4 unit 3; `designs/010` ruling 11(c)).
+    /// Hand a process handle to this Waiter, and stop holding it: `give`'s
+    /// Process overload, declared here for the reason `add`'s is.
     ///
-    /// Everything `Waiter.give(event:)` says holds word for word, and the
-    /// wait-once DEATH SUPERVISOR is the shape it was ruled for: a launcher that
-    /// only ever wants to be told a child ended gives the handle to its Waiter
-    /// and holds nothing — no `remove` to write, no handle to release, and the
-    /// process slot's last reader is the subscription, which is exactly what
-    /// keeps the §8 status word readable until it is delivered.
+    /// Everything `Waiter.give(event:)` says holds word for word. The wait-once
+    /// death supervisor is the shape it serves: a launcher that only wants to
+    /// be told a child ended gives the handle to its Waiter and holds nothing,
+    /// with no `remove` to write and no handle to release. The process slot's
+    /// last reader is the subscription, which keeps the §8 status word readable
+    /// until it is delivered.
     ///
-    /// **THE DEFAULT `OneShot` IS RIGHT HERE IN A WAY IT IS NOWHERE ELSE**:
-    /// nothing un-dies, so a persistent subscription to a death would be a
-    /// subscription that can never fire twice.
+    /// The default `OneShot` is right here as nowhere else: nothing un-dies, so
+    /// a persistent subscription to a death could never fire twice.
     public func give(&self, process: Process, key: UInt,
                      mode: AttachMode = AttachMode.OneShot
     ) -> Result<Void, (SosStatus, Process)> {
@@ -1233,85 +1155,75 @@ extension Waiter {
 }
 
 // =============================================================================
-// The boot set's record (spec §12; sawos design 4 D-4)
+// The boot set's record (spec §12)
 // =============================================================================
 
-/// One entry of a process's BOOT SET, decoded.
+/// One entry of a process's boot set, decoded.
 ///
-/// It is declared HERE and not in `sosabi` — where `WaitResult` lives — for one
-/// reason: it carries a HANDLE. A wait answer is made of plain words, so one
-/// declaration serves both sides of the trap boundary; a boot handle's whole
-/// point is that what a process receives is a `Memory` and never a number, and
-/// that type is this module's. The three-word WIRE layout is still declared
-/// exactly once, in `sosabi`, which is what the vDSO discipline actually asks.
+/// It is declared here and not in `sosabi` because it carries owning
+/// wrappers: what a process receives for a boot handle is a `Memory` (or
+/// another wrapper) and never a number, and `sosabi` cannot name those types.
+/// `WaitResult` lives in `sos.pipe` for the same reason. The three-word wire
+/// layout is still declared exactly once, in `sosabi`.
 ///
-/// **EXACTLY ONE WRAPPER PER WORD is the constraint the owning tier puts on this
-/// record** (sawos design 3 D-5), and it is what shaped the two things that
-/// changed here. The record is `NoCopy`, because a copyable record holding a
-/// `Memory` would be two owners of one handle; and the region is an `Optional`
-/// behind `take_memory` rather than a public field, because a `NoCopy` field
-/// cannot be moved OUT of a struct (there are no partial moves in Saw) and a
-/// caller that only ever borrows could never keep the region past the record.
-/// `Optional.take` is exactly the tool for this: it writes `None` into the place
-/// and hands the payload over owned.
+/// Exactly one wrapper per word is the constraint the owning tier puts on this
+/// record. The record is `NoCopy`, because a copyable record holding a `Memory`
+/// would be two owners of one handle. The region is an `Optional` behind
+/// `take_memory` rather than a public field, because a `NoCopy` field cannot be
+/// moved out of a struct (there are no partial moves in Saw). `Optional.take`
+/// writes `None` into the place and hands the payload over owned.
 ///
-/// A record whose region was never taken RELEASES IT when the record drops,
-/// which is the right default — an iterator entry a launcher looked at and did
-/// not want is a capability it declined.
+/// A record whose region was never taken releases it when the record drops. An
+/// iterator entry a launcher looked at and did not want is a capability it
+/// declined.
 ///
-/// The rejected alternative, recorded because it is the obvious one: a copyable
-/// record with a `memory()` method minting a wrapper. Two copies would mint two
-/// owners for one word, and the second drop would be a fault the program did
-/// nothing to deserve.
+/// Don't make the record copyable with a `memory()` method minting a wrapper:
+/// two copies would mint two owners for one word, and the second drop would be
+/// a fault the program did nothing to deserve.
 public struct BootHandle {
-    /// **THE GIVER'S OWN WORD, HANDED BACK UNREAD.** For root's boot set the
-    /// kernel is the giver and this is a REGION ORDINAL — row `n` of the build's
-    /// region table is tag `n`. For a child's set the LAUNCHER is the giver and
-    /// this is whatever it chose at `Process.give(…, tag:)`. Either way the
-    /// kernel assigns it no meaning: the tag IS the identity, and identities are
-    /// the only cross-process vocabulary there is.
+    /// The giver's own word, handed back unread. For root's boot set the kernel
+    /// is the giver and this is a region ordinal: row `n` of the build's region
+    /// table is tag `n`. For a child's set the launcher is the giver and this
+    /// is whatever it chose at `Process.give(..., tag:)`. Either way the kernel
+    /// assigns it no meaning: the tag is the identity, and identities are the
+    /// only cross-process vocabulary there is.
     public tag: UInt,
     /// What kind of object was minted, so a caller knows which accessor to
-    /// reach for. Regions and (since M3 unit 3) Process handles are what v1 can
-    /// deliver; a caller that asserts this is asserting the giver gave what its
-    /// config says it gave.
+    /// reach for. A caller that asserts this is asserting the giver gave what
+    /// its config says it gave.
     public kind: BootHandleKind,
     /// The region itself, until somebody takes it. Private on purpose: the only
     /// way out is `take_memory`, which is what makes the one-owner rule hold.
     memory: Memory?,
-    /// The Process handle, on the same terms — `take_process` is its one door.
+    /// The Process handle, on the same terms; `take_process` is its one door.
     process: Process?,
-    /// The System handle, on the same terms — `take_system` is its one door.
-    /// A record has ONE object, so exactly one of these slots is ever occupied
-    /// and `kind` is what says which. Separate fields rather than an enum
-    /// payload because asking the WRONG one must be harmless: an enum would have
-    /// to be taken out of the record to be matched, and a mismatch would then
-    /// drop a capability the caller still wanted.
+    /// The System handle, on the same terms; `take_system` is its one door. A
+    /// record has one object, so at most one of these slots is ever occupied
+    /// and `kind` says which. They are separate fields rather than an enum
+    /// payload because asking the wrong one must be harmless: an enum would
+    /// have to be taken out of the record to be matched, and a mismatch would
+    /// then drop a capability the caller still wanted.
     system: System?,
-    /// The device window, on the same terms — `take_iomemory` is its one door.
-    /// The fourth slot, and the one M3 unit 4 added: a DEVICE row of the
-    /// build's region table mints an `IoMemory`, and a driver's first act is to
-    /// drain it (sawos design 6 D-1/D-5).
+    /// The device window, on the same terms; `take_iomemory` is its one door. A
+    /// device row of the build's region table mints an `IoMemory`, and a
+    /// driver's first act is to drain it.
     iomemory: IoMemory?,
-    /// The CLIENT end of a connection, on the same terms — `take_inlet` is its
-    /// one door. M4 unit 1's slot (sawos design 13 D-3): a launcher creates a
-    /// pair and gives one end across, and the child drains it exactly as it
-    /// drains a region.
+    /// The client end of a connection, on the same terms; `take_inlet` is its
+    /// one door. A launcher creates a pair and gives one end across, and the
+    /// child drains it as it drains a region.
     inlet: PipeInlet?,
-    /// The SERVER end, on the same terms — `take_outlet` is its one door. The
-    /// sixth slot, and the pair's other half: which end a child receives is
-    /// entirely its launcher's config, so both spellings exist and a record
-    /// carries at most one of them.
+    /// The server end, on the same terms; `take_outlet` is its one door. Which
+    /// end a child receives is entirely its launcher's config, so both
+    /// spellings exist and a record carries at most one of them.
     outlet: PipeOutlet?,
-    /// A CLAIM ON ONE REPLY, on the same terms — `take_reply` is its one door.
-    /// M4 unit 2's slot (sawos design 14): §2.1 ratifies both one-shots as
-    /// transferable, so a launcher — or any holder — may hand one across, and a
-    /// child collects it exactly as it collects a region.
+    /// A claim on one reply, on the same terms; `take_reply` is its one door.
+    /// §2.1 makes both one-shots transferable, so any holder may hand one
+    /// across, and a child collects it as it collects a region.
     reply: PipeReply?,
-    /// AN OBLIGATION TO REPLY, on the same terms — `take_request` is its one
-    /// door. The eighth slot, and the one §2.1 calls THE DELEGATION PRIMITIVE:
-    /// a child that receives one answers a question it was never asked, and its
-    /// bytes go straight to whoever asked it.
+    /// An obligation to reply, on the same terms; `take_request` is its one
+    /// door. §2.1 calls it the delegation primitive: a child that receives one
+    /// answers a question it was never asked, and its bytes go straight to
+    /// whoever asked it.
     request: PipeRequest?,
 }
 
@@ -1321,14 +1233,14 @@ extension BootHandle {
     /// Take the region out of this record, leaving it empty.
     ///
     /// It answers `None` on the second call, and `None` on a record that is not
-    /// a region at all — neither is an error condition to dress up: a record has
-    /// one object, and asking for the wrong kind or asking twice are both asking
-    /// for a capability this record does not have. Callers that know better
-    /// write `!`. It never DISTURBS the other slot, which is what makes asking
-    /// the wrong question harmless.
+    /// a region at all. Neither is an error condition to dress up: a record has
+    /// one object, and asking for the wrong kind or asking twice is asking for
+    /// a capability this record does not have. Callers that know better write
+    /// `!`. It never disturbs the other slots, which makes asking the wrong
+    /// question harmless.
     ///
-    /// `&var self` because taking WRITES the record — which is also what makes
-    /// the transfer visible in the type rather than in a convention.
+    /// `&var self` because taking writes the record, which makes the transfer
+    /// visible in the type rather than in a convention.
     public func take_memory(&var self) -> Memory? {
         self.memory.take()
     }
@@ -1336,12 +1248,9 @@ extension BootHandle {
     /// Take the Process handle out of this record, leaving it empty. Same terms
     /// as `take_memory`.
     ///
-    /// **A DONATED CHILD MUST TAKE THIS ONE.** Its record names the very word
-    /// the child adopted from its first argument register (resolving a boot tag
-    /// consumes no record), so a record left holding it would RELEASE that word
-    /// when it drops and leave the child's own Process handle stale. See
-    /// `Process(boot_handle:)` for the one-wrapper-per-word obligation this is
-    /// half of.
+    /// A record left holding one releases it when it drops. A handle that was
+    /// the child's boot tag never reaches this accessor: `start(boot_tag:)`
+    /// takes that record, so the drain never hands the same word back.
     public func take_process(&var self) -> Process? {
         self.process.take()
     }
@@ -1349,54 +1258,50 @@ extension BootHandle {
     /// Take the System handle out of this record. Same terms as `take_memory`.
     ///
     /// A launcher's masked sibling arrives as one of these when it is given
-    /// under a tag the child DRAINS. When it is given as the child's BOOT TAG —
-    /// the ordinary shape — the child never meets this accessor at all: the
-    /// register is the delivery and the record is consumed by it.
+    /// under a tag the child drains. When it is given as the child's boot tag
+    /// (the ordinary shape) the child never meets this accessor: the register
+    /// is the delivery and the record is consumed by it.
     public func take_system(&var self) -> System? {
         self.system.take()
     }
 
-    /// Take the DEVICE WINDOW out of this record. Same terms as `take_memory`.
+    /// Take the device window out of this record. Same terms as `take_memory`.
     ///
-    /// A driver's first act, and the one that makes the M2 device-grant
-    /// placeholder retire: the window its manifest used to declare is now a
-    /// capability its boot set carries, and `Process.map(iomemory:)` is what
-    /// installs it.
+    /// A driver's first act: the window is a capability its boot set carries,
+    /// and `Process.map(iomemory:)` is what installs it.
     public func take_iomemory(&var self) -> IoMemory? {
         self.iomemory.take()
     }
 
-    /// Take the CLIENT END of a connection out of this record. Same terms as
+    /// Take the client end of a connection out of this record. Same terms as
     /// `take_memory`.
     ///
     /// A child that is to be a client drains this and posts through it. Asking
-    /// for the wrong end is `None` and disturbs nothing, which is the property
-    /// that makes SIX separate slots the right shape rather than an enum
-    /// payload: a mismatch must not drop the capability the caller still wanted.
+    /// for the wrong end is `None` and disturbs nothing, which is why separate
+    /// slots are the right shape rather than an enum payload.
     public func take_inlet(&var self) -> PipeInlet? {
         self.inlet.take()
     }
 
-    /// Take the SERVER END of a connection out of this record. Same terms as
+    /// Take the server end of a connection out of this record. Same terms as
     /// `take_memory`.
     public func take_outlet(&var self) -> PipeOutlet? {
         self.outlet.take()
     }
 
-    /// Take a CLAIM ON A REPLY out of this record. Same terms as `take_memory`.
+    /// Take a claim on a reply out of this record. Same terms as `take_memory`.
     ///
-    /// A record left holding one RELEASES it when it drops, which for a claim is
-    /// not merely tidy: releasing the last claim on an exchange is what tells the
-    /// server its client has abandoned the question. A child that declines a
-    /// capability declines it out loud.
+    /// A record left holding one releases it when it drops, which for a claim
+    /// is not merely tidy: releasing the last claim on an exchange tells the
+    /// server its client has abandoned the question.
     public func take_reply(&var self) -> PipeReply? {
         self.reply.take()
     }
 
-    /// Take an OBLIGATION TO REPLY out of this record. Same terms as
-    /// `take_memory`, and the same sentence as `take_reply` from the other side:
-    /// a record left holding one releases it, which tells the CLIENT that nobody
-    /// will answer.
+    /// Take an obligation to reply out of this record. Same terms as
+    /// `take_memory`, and the same sentence as `take_reply` from the other
+    /// side: a record left holding one releases it, which tells the client that
+    /// nobody will answer.
     public func take_request(&var self) -> PipeRequest? {
         self.request.take()
     }
@@ -1404,11 +1309,10 @@ extension BootHandle {
 
 /// Decode a record the kernel copied out into a `BootHandle`.
 ///
-/// AN UNKNOWN KIND PANICS, loudly, for exactly the reason `decode_wait`'s
-/// unknown tag does: the KERNEL wrote it, out of the same `BootHandleKind`
-/// declaration this function reads, so a kind that does not decode is a skew
-/// between the kernel and the `sos` module it exports — a bug in the pair, not
-/// a runtime condition a caller could act on.
+/// An unknown kind panics, for the reason `decode_wait`'s unknown tag does: the
+/// kernel wrote it out of the same `BootHandleKind` declaration this function
+/// reads, so a kind that does not decode is a skew between the kernel and the
+/// `sos` module it exports, not a runtime condition a caller could act on.
 func decode_boot_handle(tag: UInt, kind: UInt, handle: UInt) -> BootHandle {
     guard let what = BootHandleKind.from(raw: kind) else {
         panic("sos: kernel wrote boot handle kind {}, which this build cannot name",
@@ -1458,16 +1362,15 @@ func decode_boot_handle(tag: UInt, kind: UInt, handle: UInt) -> BootHandle {
 }
 
 /// The `unsafe` half of `Process.pipe_create`, confined to one small named
-/// helper (design 136). The record buffer's address never leaves it.
+/// helper. The record buffer's address never leaves it.
 ///
-/// **THE TUPLE IS THE ANSWER, AND IT IS THE RIGHT ONE HERE** — where the boot
-/// record needed an `Optional` per slot and a `take_*` per Optional. The reason
-/// is the difference between the two records: a `BootHandle` carries at most ONE
-/// of six kinds and a caller must be able to ask the wrong question harmlessly,
-/// so its slots have to survive being looked at; a pipe-create answer always
-/// carries EXACTLY TWO wrappers and the caller always wants both, so a
-/// destructuring `let` moves each into its own binding and there is no husk to
-/// leave behind.
+/// The tuple is the right answer here, where the boot record needed an
+/// `Optional` per slot and a `take_*` per Optional. A `BootHandle` carries at
+/// most one of its kinds and a caller must be able to ask the wrong question
+/// harmlessly, so its slots have to survive being looked at. A pipe-create
+/// answer always carries exactly two wrappers and the caller always wants both,
+/// so a destructuring `let` moves each into its own binding and there is no
+/// husk to leave behind.
 func pipe_create_into_frame(handle: ProcessHandle) unsafe -> Result<(PipeInlet, PipeOutlet), SosStatus> {
     var buf: [UInt; PIPE_CREATE_RECORD_WORDS] = [0; PIPE_CREATE_RECORD_WORDS]
     try checked(sos_process_pipe_create(handle,
@@ -1478,14 +1381,13 @@ func pipe_create_into_frame(handle: ProcessHandle) unsafe -> Result<(PipeInlet, 
     return (move inlet, move outlet)
 }
 
-/// The `unsafe` half of `Process.stats`, confined to one small named helper
-/// (design 136). The record buffer's address never leaves it.
+/// The `unsafe` half of `Process.stats`, confined to one small named helper.
+/// The record buffer's address never leaves it.
 ///
-/// THE BUFFER IS `[UInt64; N]` AND NOT `[UInt; N]`, which is the one thing that
-/// differs from the two helpers beside it: the columns are counts and a count is
-/// sixty-four bits on both profiles, so the slots `sosabi` publishes are
-/// DOUBLEWORD indices. `sos.clock`'s reading buffer is the precedent, one
-/// doubleword wide.
+/// The buffer is `[UInt64; N]`, not `[UInt; N]`, unlike the two helpers beside
+/// it: the columns are counts and a count is sixty-four bits on every profile,
+/// so the slots `sosabi` publishes are doubleword indices. `sos.clock`'s
+/// reading buffer is the precedent, one doubleword wide.
 func process_stats_into_frame(handle: ProcessHandle) unsafe -> Result<ProcessStats, SosStatus> {
     var buf: [UInt64; PROCESS_STATS_RECORD_DOUBLEWORDS] = [0; PROCESS_STATS_RECORD_DOUBLEWORDS]
     try checked(sos_process_stats(handle, (&var buf) as UnsafePointer<UInt64>,
@@ -1496,7 +1398,7 @@ func process_stats_into_frame(handle: ProcessHandle) unsafe -> Result<ProcessSta
 }
 
 /// The `unsafe` half of `Process.boot_handle_next`, confined to one small named
-/// helper (design 136). The buffer's address never leaves it.
+/// helper. The buffer's address never leaves it.
 func boot_handle_into_frame(handle: ProcessHandle) unsafe -> Result<BootHandle, SosStatus> {
     var buf: [UInt; BOOT_HANDLE_RECORD_WORDS] = [0; BOOT_HANDLE_RECORD_WORDS]
     try checked(sos_process_boot_handle_next(handle,
@@ -1508,33 +1410,30 @@ func boot_handle_into_frame(handle: ProcessHandle) unsafe -> Result<BootHandle, 
 }
 
 // =============================================================================
-// StatsRegion — the mapped view of the machine's trap counters (sawos design
-// 37, M5 unit 7)
+// StatsRegion: the mapped view of the machine's trap counters
 // =============================================================================
 
-/// **THE MACHINE'S TRAP COUNTERS, IN THIS PROCESS'S OWN ADDRESS SPACE.** Built
-/// by `System.stats_region_map` and by nothing else.
+/// The machine's trap counters, in this process's own address space. Built by
+/// `System.stats_region_map` and by nothing else.
 ///
-/// **IT OWNS THE ACCESS, NOT THE BYTES.** The `Mapping` inside is the installed
-/// protection row; the page underneath is the kernel's and is never anybody's to
-/// own. That is why there is no `Memory` here and no way to obtain one:
-/// splitting or donating the page the kernel counts traps into are not
-/// operations that could mean anything.
+/// It owns the access, not the bytes. The `Mapping` inside is the installed
+/// protection row; the page underneath is the kernel's and is never anybody's
+/// to own. That is why there is no `Memory` here and no way to obtain one:
+/// splitting or donating the page the kernel counts traps into could mean
+/// nothing.
 ///
-/// **`NoCopy`, AND DROPPING IT RELEASES THE HANDLE WITHOUT UNMAPPING** —
-/// `Mapping`'s own ruled stance, inherited by containment, and worth restating
-/// because the RAII habit points the other way. A `StatsRegion` that falls out
-/// of scope leaves its row installed: permanent, safe-but-leaked, never a
-/// dangling read. Call `unmap()` where revocation is meant.
+/// `NoCopy`, and dropping it releases the handle without unmapping, as for
+/// `Mapping`, inherited by containment. A `StatsRegion` that falls out of scope
+/// leaves its row installed: permanent, safe but leaked, never a dangling read.
+/// Call `unmap()` where revocation is meant.
 ///
-/// The three layout numbers are read ONCE, out of the header the kernel
-/// published, and kept — the header is written at boot and never again, so
-/// re-reading it per access would buy nothing.
+/// The three layout numbers are read once, out of the header the kernel
+/// published, and kept: the header is written at boot and never again.
 public struct StatsRegion {
     /// The row's owner. Package-private: a holder reaches it through `unmap()`,
     /// which is the only thing a caller has any business doing with it.
     public(package) mapping: Mapping,
-    /// Where the region starts in this process's address space — the kernel's
+    /// Where the region starts in this process's address space: the kernel's
     /// answer, read from `Mapping.base()` and never assumed.
     public base: UInt,
     /// How many rows the region publishes: one per process slot this machine
@@ -1544,32 +1443,31 @@ public struct StatsRegion {
     public(package) rows_offset: UInt,
     /// Bytes per row, as published.
     public(package) row_bytes: UInt,
-    /// **WHICH ROW IS THE CALLER'S OWN.** Rows are indexed by process slot and
-    /// slot numbering is kernel-internal, so this is the number that makes the
-    /// table addressable to the process reading it.
+    /// Which row is the caller's own. Rows are indexed by process slot and slot
+    /// numbering is kernel-internal, so this is the number that makes the table
+    /// addressable to the process reading it.
     public self_row: Int,
 }
 
 extension StatsRegion: NoCopy {}
 
 extension StatsRegion {
-    /// **ROW `index`'s THREE COLUMNS**, read out of the mapped page with no
-    /// syscall at all — which is the whole point of the region.
+    /// Row `index`'s three columns, read out of the mapped page with no syscall
+    /// at all.
     ///
     /// The numbers mean exactly what `Process.stats()` means (see
     /// `ProcessStats`) and come from the same storage, so the two surfaces
     /// cannot disagree. A row belonging to a slot no process currently occupies
     /// reads as whatever its last occupant left, until a create zeroes it:
-    /// `rows` is a CAPACITY, not a census, and this v1 publishes no liveness
+    /// `rows` is a capacity, not a census, and the region publishes no liveness
     /// column.
     ///
-    /// **A 32-BIT READER CAN TEAR.** See `System.stats_region_map` for the whole
-    /// statement; the short version is that a torn column is a value between two
-    /// true readings and never one the counter never held.
+    /// A 32-bit reader can tear; see `System.stats_region_map` for the whole
+    /// statement. The short version is that a torn column is a value between
+    /// two true readings and never one the counter never held.
     ///
-    /// Out of range PANICS, which is the accessor rule (design 130): a direct
-    /// indexed accessor on a safe type is checked and faults loudly rather than
-    /// clamping or answering nonsense.
+    /// An out-of-range `index` panics: a direct indexed accessor on a safe type
+    /// is checked and faults loudly rather than clamping or answering nonsense.
     public func row(&self, index: Int) -> ProcessStats {
         if index < 0 || index >= self.rows {
             panic("StatsRegion.row: index out of range: {} (rows {})",
@@ -1581,15 +1479,15 @@ extension StatsRegion {
                      faults: raw.faults)
     }
 
-    /// This process's own row — `row(self.self_row)`, named because it is what
-    /// most readers want and because spelling it out invites a caller to
+    /// This process's own row, `row(self.self_row)`. It is named because it is
+    /// what most readers want, and spelling it out invites a caller to
     /// re-derive a number the kernel already answered.
     public func mine(&self) -> ProcessStats {
         self.row(self.self_row)
     }
 
-    /// **TAKE THE ROW BACK OUT OF THIS PROCESS'S DOMAIN.** The page becomes
-    /// unreachable at once, on `Mapping.unmap`'s terms exactly — including the
+    /// Take the row back out of this process's domain. The page becomes
+    /// unreachable at once, on `Mapping.unmap`'s terms exactly, including the
     /// live-domain rule, since the target is the caller itself.
     ///
     /// Unmapping twice terminates the caller, which is `Mapping.unmap`'s own

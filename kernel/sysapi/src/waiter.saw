@@ -1,30 +1,19 @@
-//! WAITER — §2.2's generic wait aggregator, and the decode of the record the
-//! kernel copies back (design 178 D5).
+//! Waiter: §2.2's generic wait aggregator.
 //!
-//! It is the TOP of the waitable stack rather than the bottom of it: `add` is
-//! one overload per kind, so this file names `Event`, `Interrupt` and `Timer`
-//! and each of those names nothing here. That is the whole reason it moved
-//! above them in the declared order — the brief's sketch had it below, which
-//! the three overloads make impossible.
+//! `add` is one overload per kind, so this file imports `Event`, `Interrupt`
+//! and `Timer`, and none of those modules imports this one.
 //!
-//! **AND THE FOURTH KIND IS WHERE THAT SHAPE RAN OUT** (sawos design 8, M3
-//! unit 5.5). A PROCESS handle is waitable too, but `Process` is declared
-//! ABOVE this file (in `sos.system`, with `System` and `BootHandle`, because
-//! every pair of those three names the other), so the fourth `add` overload
-//! written HERE would import downward into its own importer. It lives in
-//! `sos.system` instead, as an `extension Waiter` beside `Process` — same op,
-//! same rules — which callers see because extension lookup follows the
-//! facade's `public import` since sawlang 0.2.0 (the first pin bump; SL-7's
-//! resolution; unit 5.5 shipped `Process.attach` in the interim).
+//! The `add` overloads for kinds declared in modules that import this one live
+//! beside those kinds, as `extension Waiter` (visible at the call site through
+//! the facade's `public import`): `Process`'s in `sos.system` and the pipe
+//! kinds' `add`/`give` overloads in `sos.pipe`. An overload written here would
+//! make this module import its own importer, a cycle. For the same reason
+//! `wait` and the decode of the record the kernel copies back live in
+//! `sos.pipe`: a delivery may carry handles, which are owning wrappers
+//! (`PipeReply`, `Memory`) this module cannot import.
 //!
-//! **AND M4 UNIT 3 SENT FOUR MORE THE SAME WAY** (sawos design 15). The four
-//! PIPE kinds are §2.2 waitables now, and their `add`/`give` overloads are
-//! declared in `sos.pipe` for the same reason the Process one is declared in
-//! `sos.system`: that file names `Waiter` (its four overloads take one), so it
-//! sits ABOVE this one and an overload written here would be the
-//! cycle again. What this file still declares is `AttachMode`, the three
-//! overloads whose types it names, and the DECODE — which is where the four new
-//! payload cases land, because the record is one thing whatever wrote it.
+//! What stays here is what a Waiter is: the object, the attach modes, the
+//! subscription verbs and the one wire call under them.
 
 import sosabi.{SosStatus, WaiterHandle, NO_HANDLE, EventHandle,
                InterruptHandle, TimerHandle,
@@ -36,34 +25,30 @@ import sos.event.{Event}
 import sos.interrupt.{Interrupt}
 import sos.timer.{Timer}
 
-/// **WHAT AN ATTACHMENT DOES AT DELIVERY** (`designs/010` ruling 9(b); sawos
-/// design 15, M4 unit 3).
+/// What an attachment does at delivery.
 ///
-/// One-shot is a property of the ATTACHMENT — the attacher's choice, like the
-/// key — so it is a defaulted trailing parameter on every `add` rather than a
-/// second method per kind, which is the `EventMode` doctrine and is what keeps
-/// the existing call sites unchanged.
+/// One-shot is a property of the attachment, the attacher's choice like the
+/// key, so it is a defaulted trailing parameter on every `add` rather than a
+/// second method per kind.
 ///
-/// **IT IS NOT THE OTHER AXIS.** Whether the attach CONSUMES the caller's handle
-/// is spelled by a different VERB (`give`), not by a third case here: consuming
-/// changes what the call does to its argument, and ruling 4's own mode-enum
-/// rejection applies — a runtime flag can change neither a return type nor a Saw
-/// function's effect. The two are a 2x2, and ruling 11(c) struck
-/// `OneShotConsuming` for exactly that reason.
+/// It is not the other axis. Whether the attach consumes the caller's handle is
+/// spelled by a different verb (`give`), not a third case here: consuming
+/// changes what the call does to its argument, and a runtime flag can change
+/// neither a return type nor a Saw function's effect. Don't add an
+/// `OneShotConsuming` case: it conflates the two axes.
 public enum AttachMode: UInt {
     /// Stay subscribed. The attachment lives until `remove(key)` or until the
-    /// Waiter does — §2.2's ratified default, now said out loud.
+    /// Waiter does (§2.2's default).
     case Persistent = 0,
-    /// Detach when a record for this key is COPIED OUT — never at mere
-    /// readiness. What it buys: a blocked poster's room-wait, a
-    /// request-abandoned watcher and a wait-once death supervisor all stop
-    /// owing a trailing `remove`.
+    /// Detach when a record for this key is copied out, never at mere
+    /// readiness. A blocked poster's room-wait, a request-abandoned watcher and
+    /// a wait-once death supervisor all stop owing a trailing `remove`.
     case OneShot = 1,
 }
 
 /// The flag bit `mode` becomes at the wire. A `match` rather than a cast: the
-/// enum's numbers are the typed surface's own and the wire's are `sosabi`'s, and
-/// the vDSO discipline is that the two are allowed to differ.
+/// enum's numbers are the typed surface's own and the wire's are `sosabi`'s,
+/// and the two are allowed to differ.
 public(package) func mode_flag(mode: AttachMode) -> UInt {
     match mode {
         case Persistent -> 0,
@@ -71,41 +56,30 @@ public(package) func mode_flag(mode: AttachMode) -> UInt {
     }
 }
 
-// **THE DECODE IS NOT HERE ANY MORE, AND NEITHER IS `wait` ITSELF** (sawos
-// design 18, amended at the STOP). A delivery may carry HANDLES now, and a
-// handle at the typed tier is an owning wrapper — a `PipeReply`, a `Memory` —
-// so `WaitResult` names types this module sits BELOW. `decode_wait`,
-// `Waiter.wait` and the whole decoded vocabulary moved to `sos.pipe`, where
-// every wrapper a message can carry is nameable; `wait` went as an
-// `extension Waiter`, which is the same shape `add(outlet:)` and
-// `add(process:)` already have and which the facade's `public import` makes
-// invisible at the call site.
-//
-// What stays here is what a Waiter IS: the object, the attach modes, the eight
-// subscription verbs and the one wire call under them.
+// The decode of the delivery record and `Waiter.wait` live in `sos.pipe`; see
+// the module docstring.
 
-/// A handle to a Waiter — §2.2's generic wait aggregator, epoll/Port-style.
+/// A handle to a Waiter, §2.2's generic wait aggregator (epoll/Port-style).
 ///
-/// Attachments are PERSISTENT BY DEFAULT: `add` once, and the handle stays
-/// watched until `remove`. `AttachMode.OneShot` is the opt-in that detaches at
-/// the delivery instead (M4 unit 3, `designs/010` ruling 9(b)), and readiness is
-/// LEVEL-TRIGGERED either way, so a signal that lands before anyone waits is
-/// still there when the wait arrives.
+/// Attachments are persistent by default: `add` once, and the handle stays
+/// watched until `remove`. `AttachMode.OneShot` opts into detaching at the
+/// delivery. Readiness is level-triggered either way, so a signal that lands
+/// before anyone waits is still there when the wait arrives.
 ///
-/// **THE ONE-SHOT FOOTGUN IS STATED RATHER THAN GUARDED**: attach one-shot, take
+/// The one-shot footgun is stated rather than guarded: attach one-shot, take
 /// the delivery, and `wait()` again on a Waiter with nothing left attached, and
-/// the thread parks forever — which the kernel's deadlock report names, exactly
-/// as it always has for an empty Waiter. A subscription that ends itself is a
-/// subscription you have to re-arm.
+/// the thread parks forever, which the kernel's deadlock report names, as for
+/// any empty Waiter. A subscription that ends itself is one you have to re-arm.
 ///
 /// Several threads may park on one Waiter (§2.2), and a ready handle wakes one
-/// of them; a handle attaches to at most one Waiter, and attaching it twice
-/// terminates the process, on the faults ruling's terms — it is a mistake only
-/// the attacher could have made.
-/// **`NoCopy`, AND DROPPING IT RELEASES THE HANDLE** (sawos design 3 D-5).
-/// Attachments belong to the WAITER object, not to the handle, so a released
-/// handle detaches nothing — the subscriptions live until the object does, which
-/// is until the process's teardown.
+/// of them. A handle attaches to at most one Waiter, and attaching it twice
+/// terminates the process: only the attacher could have made the mistake.
+///
+/// `NoCopy`, and dropping it releases the handle. Attachments belong to the
+/// Waiter object, not to the handle, so releasing one handle detaches nothing
+/// while another still names the Waiter. When the last handle goes the Waiter
+/// is freed: every attachment is released, and every thread parked on it
+/// wakes with `SosStatus.Revoked`.
 public struct Waiter {
     public(package) handle: WaiterHandle,
 }
@@ -123,29 +97,23 @@ extension Waiter {
     /// Attach `event` under `key`, which `wait` hands back when it becomes
     /// ready. Requires `WaiterRight.Attach` here and `EventRight.Wait` there.
     ///
-    /// KEYS ARE UNIQUE PER WAITER: `key` must not already name an attachment on
-    /// this Waiter, and reusing one TERMINATES the process. It is the invariant
-    /// `remove` and the wait answer both rest on — with two attachments under
-    /// one key, neither could say which it meant.
+    /// Keys are unique per Waiter: `key` must not already name an attachment on
+    /// this Waiter, and reusing one terminates the process. `remove` and the
+    /// wait answer both rest on that; with two attachments under one key,
+    /// neither could say which it meant.
     ///
-    /// IT TAKES A `&Event` AND NOT A HANDLE WORD. That is the module
-    /// docstring's rule reaching cross-type plumbing: there is no way to spell
-    /// a handle you were not given, so an attachment names an object this
-    /// process holds by construction. The field access below is same-PACKAGE —
-    /// design 5 made each waitable's `handle` `public(package)` so this
-    /// module can read a sibling's — which is why no accessor is owed and
-    /// none exists.
+    /// It takes a `&Event`, not a handle word: there is no way to spell a
+    /// handle you were not given, so an attachment names an object this process
+    /// holds by construction. The field access below is same-package (each
+    /// waitable's `handle` is `public(package)`), so no accessor is owed.
     ///
-    /// ONE METHOD PER WAITABLE KIND, and it stays that way on purpose — see the
-    /// brief's note on why a `Waitable` trait is not the shape (a public trait
-    /// with a handle-producing requirement is a forged-handle door under the
-    /// orphan rule, and Saw has no sealed traits yet). Kinds are a LIST, so
-    /// overloads are a list; it is MODES that multiply, which is why
-    /// `event_create` takes its mode as a value.
-    ///
-    /// The second kind is here now, and it is what the shape predicted: each
-    /// overload is TWO LINES delegating to one internal, so the list grows by a
-    /// method per kind and the wire call has one caller.
+    /// There is one method per waitable kind, on purpose. Don't introduce a
+    /// `Waitable` trait: a public trait with a handle-producing requirement is
+    /// a forged-handle door under the orphan rule, and Saw has no sealed
+    /// traits. Kinds are a list, so overloads are a list; modes are what
+    /// multiply, which is why `event_create` takes its mode as a value. Each
+    /// overload is two lines delegating to one internal, so the wire call has
+    /// one caller.
     public func add(&self, event: &Event, key: UInt,
                     mode: AttachMode = AttachMode.Persistent) -> Result<Void, SosStatus> {
         self.attach(event.handle, key, mode_flag(mode))
@@ -157,106 +125,84 @@ extension Waiter {
     ///
     /// Every rule the Event overload states holds unchanged: keys are unique
     /// per Waiter, a handle attaches to at most one Waiter, and readiness is
-    /// level-triggered — so an Interrupt that fired BEFORE it was attached is
-    /// reported by this call, which is the ordering a driver hits when the
-    /// device was already asserting at bring-up.
+    /// level-triggered, so an Interrupt that fired before it was attached is
+    /// reported by this call. A driver hits that ordering when the device was
+    /// already asserting at bring-up.
     public func add(&self, interrupt: &Interrupt, key: UInt,
                     mode: AttachMode = AttachMode.Persistent) -> Result<Void, SosStatus> {
         self.attach(interrupt.handle, key, mode_flag(mode))
     }
 
-    /// Attach a Timer under `key`, which `wait` hands back with the FIRE COUNT
+    /// Attach a Timer under `key`, which `wait` hands back with the fire count
     /// when it comes due. Requires `WaiterRight.Attach` here and
     /// `TimerRight.Wait` there.
     ///
-    /// The third kind, and every rule the other two state holds unchanged: keys
-    /// are unique per Waiter, a handle attaches to at most one Waiter, and
-    /// readiness is level-triggered — so a Timer that fired BEFORE it was
-    /// attached is reported by this call rather than lost.
+    /// Every rule the Event overload states holds unchanged: keys are unique
+    /// per Waiter, a handle attaches to at most one Waiter, and readiness is
+    /// level-triggered, so a Timer that fired before it was attached is
+    /// reported by this call rather than lost.
     ///
-    /// A DISARMED Timer is simply never ready, so attaching one and waiting
-    /// parks until somebody arms it. That is what makes "arm, then wait" and
-    /// "attach, then arm" both work.
+    /// A disarmed Timer is never ready, so attaching one and waiting parks
+    /// until somebody arms it. "Arm, then wait" and "attach, then arm" both
+    /// work.
     public func add(&self, timer: &Timer, key: UInt,
                     mode: AttachMode = AttachMode.Persistent) -> Result<Void, SosStatus> {
         self.attach(timer.handle, key, mode_flag(mode))
     }
 
-    // **THE FOURTH KIND IS NOT HERE, AND IT IS THE ONLY ONE THAT IS NOT**
-    // (sawos design 8, M3 unit 5.5; respelled at the first pin bump). A
-    // PROCESS handle attaches like the three above — same op, same key rules,
-    // same level-triggered contract — but the overload is declared in
-    // `sos.system` where `Process` is: this module sits BELOW that one (`add`
-    // reads its argument's handle field), so an overload naming `Process`
-    // here would be the import cycle DF-232e diagnoses, exactly as `Waiter`
-    // below the three waitables would have been. Since sawlang 0.2.0 an
-    // extension travels with `public import`, so the split is invisible at
-    // the call site — `waiter.add(process:, key:)` reads as the fourth
-    // member of this list, which is what design 8 ruled.
+    // The Process overload is declared in `sos.system`; see the module
+    // docstring.
 
-    /// The one call the per-kind overloads share. `public(package)` and not
-    /// `public` — a raw handle word crosses here and nowhere else, and the
-    /// module docstring's no-forged-handles rule rests on this form being
-    /// unreachable from USER code. Package width exists for exactly one
-    /// caller: the fourth overload, in `sos.system`, whose receiver type
-    /// cannot be named here (the header says why).
+    /// The one call the per-kind overloads share. `public(package)`, not
+    /// `public`: a raw handle word crosses here and nowhere else, and the
+    /// no-forged-handles rule rests on this form being unreachable from user
+    /// code. Package width exists for the overloads in `sos.pipe` and
+    /// `sos.system`, whose argument types cannot be named here.
     public(package) func attach(&self, target: UInt, key: UInt,
                                 flags: UInt) -> Result<Void, SosStatus> {
         checked(sos_waiter_add(self.handle, target, key, flags))
     }
 
-    /// **THE CONSUMING ATTACH'S ONE CALL, shared by every `give` overload**
-    /// (`designs/010` ruling 11(c)). `attach` with the consuming bit set, which
-    /// is the whole difference at the wire; what makes `give` a different VERB
+    /// The consuming attach's one call, shared by every `give` overload:
+    /// `attach` with the consuming bit set. What makes `give` a different verb
     /// rather than a different argument is what it does to the caller's value,
-    /// and that is spelled in each overload's signature.
+    /// which each overload's signature spells.
     ///
-    /// `public(package)` for `attach`'s own reason: the `give` overloads for the
-    /// kinds declared above this file live beside those kinds, so they call in
-    /// from `sos.pipe` and `sos.system`.
+    /// `public(package)` for `attach`'s reason: the `give` overloads for kinds
+    /// declared in modules that import this one live beside those kinds and
+    /// call in from `sos.pipe` and `sos.system`.
     public(package) func attach_consuming(&self, target: UInt, key: UInt,
                                           mode: AttachMode) -> Result<Void, SosStatus> {
         self.attach(target, key, mode_flag(mode) | WAITER_ADD_CONSUMING)
     }
 
-    /// **HAND AN EVENT TO THIS WAITER, AND STOP HOLDING IT** (`designs/010`
-    /// ruling 11(c); sawos design 15, M4 unit 3).
+    /// Hand an Event to this Waiter, and stop holding it.
     ///
-    /// **`give` IS THE TREE'S ONE VERB FOR "OWNERSHIP LEAVES THROUGH THIS
-    /// RECEIVER"** (user-named, Sep 1). `Process.give` hands a handle to a
-    /// process; `Waiter.give` hands it to a SUBSCRIPTION. A distinct name rather
-    /// than a by-value overload of `add`, so the consuming semantic is visible
-    /// at the call site and overload resolution never hinges on a sigil.
+    /// `give` is the tree's one verb for "ownership leaves through this
+    /// receiver": `Process.give` hands a handle to a process, `Waiter.give` to
+    /// a subscription. A distinct name rather than a by-value overload of
+    /// `add`, so the consuming semantic is visible at the call site and
+    /// overload resolution never hinges on a sigil.
     ///
-    /// **SAME VERB, DIFFERENT GATE**, and it is worth saying at the op:
-    /// give-to-PROCESS crosses a process boundary and spends the `Transfer`
-    /// right; give-to-WAITER crosses none — the attachment lives in this
-    /// process's own Waiter — so it spends the `Wait` right alone, exactly as
-    /// `add` does.
+    /// Same verb, different gate: give-to-process crosses a process boundary
+    /// and spends the `Transfer` right; give-to-waiter crosses none (the
+    /// attachment lives in this process's own Waiter), so it spends the `Wait`
+    /// right alone, as `add` does.
     ///
-    /// **THE REFUSAL HANDS THE OBJECT BACK** (user-ruled, Sep 1): a full
-    /// attachment table is a RESOURCE CONDITION, not a bug, so the caller keeps
-    /// what it had. It is `TimedOut(pending:)`'s shape — the error payload
-    /// carries the live thing — and the kernel's half is what makes it honest: a
-    /// refused add consumes nothing, so the wrapper's word is still good.
+    /// The refusal hands the object back. A full attachment table is a resource
+    /// condition, not a bug, so the caller keeps what it had; as with
+    /// `TimedOut(pending:)`, the error payload carries the live thing. A
+    /// refused add consumes nothing kernel-side, so the word is still good.
     ///
-    /// **THE FUNNEL CONTRACT IS KEPT, AND THE REFUSAL RE-MINTS.** Every other
-    /// `give` in the tree disarms BEFORE the syscall because every failure of
-    /// such a syscall is a fault; this one has a STATUS outcome as well, so the
-    /// body disarms first (so no path can leave two owners of one word) and the
-    /// error arm builds a FRESH wrapper around the word the kernel provably did
-    /// not consume. That is stronger than a conditional disarm: the value handed
-    /// back is a new one, and the old husk is dead on every path.
+    /// The funnel contract: the body disarms before the syscall (no path can
+    /// leave two owners of one word), and a refused add is a status, so the
+    /// error arm builds a fresh wrapper around the word the kernel provably did
+    /// not consume. The old husk is dead on every path.
     ///
-    /// (`PipeReply.resolve`'s conditional disarm is the other shape and stays
-    /// the departure — it cannot re-mint, because on ITS would-block path the
-    /// caller's own binding is the thing that must survive.)
-    ///
-    /// It defaults to `OneShot` where `add` defaults to `Persistent`, and the
-    /// asymmetry is deliberate: a caller that has given the object away has no
-    /// handle left to `remove` with in the ordinary case, so the subscription
-    /// that ends itself is the one that reads right. Pass `Persistent`
-    /// explicitly for the attachment-owned supervisor ruling 11(c) names.
+    /// It defaults to `OneShot` where `add` defaults to `Persistent`: a caller
+    /// that has given the object away usually has no handle left to `remove`
+    /// with, so the subscription that ends itself reads right. Pass
+    /// `Persistent` explicitly for an attachment-owned supervisor.
     public func give(&self, event: Event, key: UInt,
                      mode: AttachMode = AttachMode.OneShot
     ) -> Result<Void, (SosStatus, Event)> {
@@ -284,9 +230,9 @@ extension Waiter {
         return
     }
 
-    /// Hand a Timer to this Waiter. Everything `give(event:)` says holds — and
-    /// note what `Persistent` means here: a periodic timer nobody holds a handle
-    /// to still fires, and its subscription ends when the Waiter does.
+    /// Hand a Timer to this Waiter. Everything `give(event:)` says holds. With
+    /// `Persistent`, a periodic timer nobody holds a handle to still fires, and
+    /// its subscription ends when the Waiter does.
     public func give(&self, timer: Timer, key: UInt,
                      mode: AttachMode = AttachMode.OneShot
     ) -> Result<Void, (SosStatus, Timer)> {
@@ -303,11 +249,9 @@ extension Waiter {
     /// Stop watching whatever is attached under `key`. A key this Waiter does
     /// not use terminates the process. Requires `WaiterRight.Attach`.
     ///
-    /// THE KEY IS WHAT NAMES AN ATTACHMENT, not the waitable: detaching edits
-    /// this Waiter's own table and never touches the object on the other end,
-    /// so it needs no handle and no right over it. That is also what will let a
-    /// stale attachment be removed once handles can be closed — at which point
-    /// there is no handle left to name it with.
+    /// The key names an attachment, not the waitable: detaching edits this
+    /// Waiter's own table and never touches the object on the other end, so it
+    /// needs no handle and no right over it.
     public func remove(&self, key: UInt) -> Result<Void, SosStatus> {
         checked(sos_waiter_remove(self.handle, key))
     }
