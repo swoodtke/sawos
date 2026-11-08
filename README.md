@@ -43,7 +43,9 @@ The build resolves a Saw toolchain in this order: a `SAWLANG_ROOT`
 environment variable naming a sawlang checkout, a `sawc` on `$PATH` whose
 `--version` matches `sawlang.pin`, then a cached fetch of the pinned
 commit. Building the kernel needs a checkout (the first or third option):
-the runtime and image-format packages are compiled from source.
+the `imgformat` package is compiled from source, and so is Blade when no
+`blade` binary is supplied. The runtime (`sosrt`) is in this tree, under
+`rt/common/`.
 
 Host tools: `clang`, `ld.lld`, `qemu-system-riscv32`, `qemu-system-aarch64`.
 The harness probes for them and prints install hints if one is missing.

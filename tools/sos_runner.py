@@ -965,14 +965,13 @@ TEST_CASES = [
         # where its tasks are.
         "name": "task_dump",
         "src": os.path.join(TESTS_DIR, "taskdump.saw"),
-        "csrc": "taskdump_stubs.c",
         "expect_out": ["saw tasks: 2 live (unsynchronized snapshot)",
-                       "at taskdump.saw:95 in knap",
-                       "at taskdump.saw:100 in ksleeper",
-                       "panic at taskdump.saw:116: SOS task dump: deliberate panic",
+                       "at taskdump.saw:91 in knap",
+                       "at taskdump.saw:96 in ksleeper",
+                       "panic at taskdump.saw:112: SOS task dump: deliberate panic",
                        "saw tasks: 1 live (as-of panic, unsynchronized)",
-                       "at taskdump.saw:95 in knap",
-                       "at taskdump.saw:100 in ksleeper"],
+                       "at taskdump.saw:91 in knap",
+                       "at taskdump.saw:96 in ksleeper"],
         "expect_clean_exit": False,
     },
     {
@@ -5471,16 +5470,6 @@ def _build_elf(case, arch, shared_objs, lld, clang):
     _run(cmd)
 
     objs = list(shared_objs) + [obj]
-    # A case may bring one C file of its own, for the bodies Saw cannot write (a
-    # raw C function pointer). Per-case rather than in the shared `support.c`
-    # every image links: a stand-in that satisfies one test must not satisfy
-    # another kernel's accidental reference to a facility that is not there.
-    if case.get("csrc"):
-        c_src = os.path.join(TESTS_DIR, case["csrc"])
-        c_obj = os.path.join(dirs["build"], f"{name}.stubs.o")
-        _run([clang, f"--target={arch['triple']}", *arch["cc_args"],
-              "-nostdlib", "-ffreestanding", "-O2", "-c", c_src, "-o", c_obj])
-        objs.append(c_obj)
     if case.get("asm"):
         payload_src = os.path.join(dirs["tests"], case["asm"])
         payload_o = os.path.join(dirs["build"], f"{name}.payload.o")
