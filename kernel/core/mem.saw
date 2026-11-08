@@ -1,14 +1,12 @@
-//! ADDRESSES AND BYTES — the arithmetic and the two byte moves everything
-//! else in the kernel is written on top of.
+//! Addresses and bytes: the arithmetic and the two byte moves the rest of the
+//! kernel is written on top of.
 //!
-//! It names no kernel state and calls nothing, which is what puts it at the
+//! This module names no kernel state and calls nothing, which puts it at the
 //! bottom of the module order: the copy doors (`process`), the frame arena
-//! (`threads`) and — through `kcore.preempt`'s strided movers — the sosimg
-//! loader all reach for these four, and none of them can be reached back into.
-//!
-//! CALLING NOTHING IS NOW LOAD-BEARING RATHER THAN INCIDENTAL (design 1): it is
-//! why the byte moves below carry no preemption point, since a point delivers
-//! and delivery is at the top of the order. See the section header on them.
+//! (`threads`) and, through `kcore.preempt`'s strided movers, the sosimg loader
+//! all use these, and none of them can be reached back into. Calling nothing is
+//! load-bearing: it is why the byte moves carry no preemption point, since a
+//! point delivers and delivery is at the top of the order.
 
 // =============================================================================
 // Arithmetic the loader needs
@@ -25,8 +23,7 @@ public func align_up(v: UInt, align: UInt) -> UInt {
 }
 
 /// Word alignment, from the machine rather than from a constant. A function
-/// because `sizeof` does not fold in a static initializer — DF-178f, the same
-/// gap `sosabi`'s `wait_record_bytes` works around, and it folds fine here.
+/// because `sizeof` does not fold in a static initializer.
 public(package) func word_bytes() -> UInt {
     sizeof<UInt>() as UInt
 }
@@ -35,23 +32,22 @@ public(package) func word_bytes() -> UInt {
 // The two byte moves
 // =============================================================================
 //
-// THESE ARE THE PRIMITIVE, NOT THE OPERATION (design 1, M3 unit 1.5). Neither
-// loop takes a preemption point, and neither may: this module is at the BOTTOM
-// of the order and a point delivers, which reaches `irq` at the top — see
-// `kcore.preempt`, which holds the strided movers every bulk copy goes through
-// and states the cycle in full.
+// These are the primitive, not the operation. Neither loop takes a preemption
+// point, and neither may: this module is at the bottom of the order and a point
+// delivers, which reaches `irq` at the top (see `kcore.preempt`, which holds
+// the strided movers and states the cycle in full).
 //
-// SO A BULK CALLER USES `preempt.long_copy` / `preempt.long_zero`, and the two
-// callers left here are deliberate: the copy DOORS (`process.copy_out` /
-// `copy_in`) sit below `preempt` and move a 24-byte wait record, well under one
-// stride. §2.1's Pipe bodies are the length that changes that, and their callers
-// are above `preempt`, so the pointed door goes there when it arrives.
+// A bulk caller uses `preempt.long_copy` / `preempt.long_zero`. The copy doors
+// (`process.copy_out` / `copy_in`) sit below `preempt` and move records
+// bounded by `WaitBuffer` (its body is at most `PIPE_BODY_BYTES`), well under
+// one stride, so they use these directly. A bulk move would need a pointed
+// door, and that belongs above `preempt`.
 
 /// Copy `len` bytes from `src` to `dst`, one byte at a time and without pause.
 ///
-/// AUDIT (design 1): a caller moving more than a stride's worth reaches for
-/// `preempt.long_copy` instead. Reaching for this one is a claim that the copy
-/// is short or that the caller cannot be interrupted — the copy doors are both.
+/// A caller moving more than a stride's worth uses `preempt.long_copy` instead.
+/// Using this one claims that the copy is short or that the caller cannot be
+/// interrupted.
 public(package) func copy_bytes(dst: UInt, src: UInt, len: UInt) unsafe {
     var i: UInt = 0
     while i < len {
@@ -62,8 +58,8 @@ public(package) func copy_bytes(dst: UInt, src: UInt, len: UInt) unsafe {
 
 /// Clear `len` bytes at `dst`, one byte at a time and without pause.
 ///
-/// AUDIT (design 1): `preempt.long_zero` is the bulk spelling. This one has no
-/// caller outside that wrapper today.
+/// `preempt.long_zero` is the bulk spelling. This one has no caller outside
+/// that wrapper.
 public(package) func zero_bytes(dst: UInt, len: UInt) unsafe {
     var i: UInt = 0
     while i < len {

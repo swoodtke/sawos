@@ -1,27 +1,19 @@
-//! A PROCESS: the slab, its GRANT RECORD, the two doors into and out of its
-//! memory, and the one way into user mode.
+//! A process: the grant record, the two doors into and out of its memory, and
+//! the one way into user mode.
 //!
-//! WHAT THIS MODULE IS *NOT* IS THE TEARDOWN, and its absence is design 2's one
-//! structural finding rather than a tidy-up. Ending a process used to stop the
-//! machine, so it could live here beside the slabs it frees; with more than one
-//! process it ends in a RESCHEDULE, and choosing what runs next can IDLE, and
-//! idling DELIVERS, and delivery reaches back down into this module's copy door.
-//! That is design 1's cycle at a second site, so the teardown sits with the
-//! scheduler (`kcore.sched`) and this module holds the state it frees. The full
-//! argument is in `sched.saw`'s header.
+//! The teardown is not here; it lives in `kcore.sched`. Ending a process ends
+//! in a reschedule, choosing what runs next can idle, and idling delivers,
+//! which reaches back down into this module's copy doors. Putting the teardown
+//! here would be an import cycle. Consequently the copy doors report a bad
+//! buffer as a `FaultReason` instead of terminating, and the callers above the
+//! scheduler terminate on it. See `sched.saw`'s header.
 //!
-//! What is left here divides cleanly: the protection domain each slot records,
-//! the two copy doors — which now REPORT a bad buffer instead of faulting on it,
-//! for the same altitude reason — and `start_process`, the single way a program
-//! reaches user mode.
-//!
-//! **THE TABLE ITSELF LEFT IN M5 UNIT 6b** (sawos design 36) and the note below
-//! the imports says why: `ProcessSlot` absorbed every storage a process index
-//! keys, which put it below `kcore.objects`, whose handle functions index it.
-//! What this module owns is the same as it ever was — everything that ACTS on a
-//! process — which is the module-order rule applied to storage rather than to
-//! code. `alloc_process` and `process_slots_usable` stayed, because allocating a
-//! slot is an action and it is where the domain-pool wall is answered.
+//! This module holds what acts on a process: the protection domain each slot
+//! records, the copy doors, and `start_process`. The slot record and the
+//! `PROCESSES` table are in `kcore.pslot`, below `kcore.objects`, whose handle
+//! functions index it. `alloc_process` and `process_slots_usable` stay here
+//! because allocating a slot is an action and it is where the domain-pool limit
+//! is applied.
 
 import hal
 import sosabi.{
@@ -49,8 +41,6 @@ import kcore.limits.{
 import kcore.mem.{align_up, copy_bytes, word_bytes}
 import kcore.diag.{console, fatal_image}
 import kcore.stats.{stats_clear}
-// THE RECORD THIS MODULE USED TO DECLARE (sawos design 36) — see the note below
-// the import block for why it left.
 import kcore.pslot.{
     GrantRow,
     PROCESSES,
@@ -85,50 +75,27 @@ import kcore.threads.{
     frame_slot,
 }
 
-// `ProcessState`, `GrantRow`, `ProcessSlot` AND `PROCESSES` MOVED TO
-// `kcore.pslot` IN M5 UNIT 6b (sawos design 36), and the move is the unit's
-// whole structural change rather than a tidy-up.
-//
-// The record absorbed every storage `kcore.objects` keyed by a process index —
-// the handle table, the boot-handle set with its count and its cursor, and the
-// two quota rows — because a slab is ONE array keyed by its slot, and a parallel
-// `MAX_PROCESSES x` table is a table a DONATED slot does not have. `objects`
-// sits above this file, so a record its functions must index cannot live here.
-// Moving the record below both files was the smaller move than relocating
-// `mint_handle` and the ledger it charges.
-//
-// Everything that ACTS on a process stayed: the grant record, `translate_user`,
-// the two copy doors, `load_domain`, `clear_domain` and `start_process`. That
-// is the rule `kcore`'s module-order list already states — a module sits at the
-// altitude its CALL GRAPH allows — applied to storage rather than to code.
+// `ProcessState`, `GrantRow`, `ProcessSlot` and `PROCESSES` are declared in
+// `kcore.pslot`. The record holds every storage keyed by a process index, so it
+// must sit below `kcore.objects`, whose functions index it. Everything that
+// acts on a process stays here: the grant record, `translate_user`, the copy
+// doors, `load_domain`, `clear_domain` and `start_process`.
 
 
-/// **HOW MANY PROCESS SLOTS THIS MACHINE CAN ACTUALLY RUN** — the slab's
-/// capacity, capped by the protection domains the tier has to put them in
-/// (sawos design 36, M5 unit 6b).
+/// How many process slots this machine can actually run: the slab's capacity,
+/// capped by the protection domains the tier has to put them in.
 ///
-/// **THE WALL IS ADVERTISED AND ENFORCED, AND IT IS NOT A FAULT.** Donation
-/// raises `PROCESSES.capacity()` past the compiled floor, but a persistent
-/// per-process table set comes out of a STATIC HAL pool (sawos design 27,
-/// ruled: donation does not reach HAL-internal storage) — so on such a tier
-/// there is a second, lower ceiling, and a slot with no domain behind it would
-/// index past that pool. `hal.PROT_DOMAIN_SLOTS` is the number, published by
-/// every profile, and taking the smaller of the two here is what turns the
-/// ceiling into an ANSWER: the scan simply never reaches a slot the machine
-/// could not give a domain to, so a create past it is the `NoResource` the full
-/// table already answers. The caller could not have known the number — the
-/// kernel does not publish it — which is exactly what a status is for, as
-/// against a fault.
+/// Donation raises `PROCESSES.capacity()` past the compiled floor, but a tier
+/// that keeps a persistent per-process table set draws it from a static pool
+/// that donation does not reach. `hal.PROT_DOMAIN_SLOTS` is that pool's size
+/// (every profile publishes it). Taking the smaller of the two means the scan
+/// never reaches a slot with no domain behind it, so a create past the limit is
+/// the `NoResource` a full table already answers. The caller cannot know the
+/// number, which is what a status is for as against a fault.
 ///
-/// `kcore.limits`' `static_assert(MAX_PROCESSES <= hal.PROT_DOMAIN_SLOTS)` is
-/// the compile-time half and it now binds only the FLOOR: extent 0 must fit the
-/// pool, or the kernel could not boot the processes it was built for. Above the
-/// floor the check is this one, at run time, because that is where donation
-/// happens.
-///
-/// The MPU tier publishes 256 and is therefore bounded by the slab in practice;
-/// the translating tier publishes what its table pool holds. Neither profile
-/// needs a conditional: both answer the same question with their own number.
+/// `kcore.limits`' `static_assert(MAX_PROCESSES <= hal.PROT_DOMAIN_SLOTS)`
+/// binds only the floor (extent 0 must fit the pool); this function enforces
+/// the limit above the floor at run time.
 public(package) func process_slots_usable() unsafe -> Int {
     let held = PROCESSES.capacity()
     if held > hal.PROT_DOMAIN_SLOTS {
@@ -139,29 +106,19 @@ public(package) func process_slots_usable() unsafe -> Int {
 
 /// Take a free process slot, or `NO_PROCESS` when the table is full.
 ///
-/// **THE SCAN IS BOUNDED BY `process_slots_usable`, NOT BY `MAX_PROCESSES`**
-/// (sawos design 36): the floor is a floor since M5 unit 6b, so a donated slot
-/// has to be visible here or a donation would buy nothing, and the domain-pool
-/// wall has to be respected here or a slot would be handed out that no tier
-/// could isolate. Both are one bound. The walk stays bounded and its body stays
-/// O(1), so design 1's audit verdict is unchanged and its argument is the same
-/// one with a different number.
+/// The scan is bounded by `process_slots_usable`, not `MAX_PROCESSES`, so a
+/// donated slot is visible and the domain-pool limit is respected. The walk is
+/// bounded and its body O(1).
 ///
-/// **`Gone` IS NOT `Free`, AND A DEAD SLOT IS SPENT AGAIN ONLY WHEN NOTHING CAN
-/// READ IT** (sawos design 3 D-3, amending unit 2's pend) — which is why this
-/// scans rather than counting how many processes have been made. The teardown
-/// leaves the slot holding its §8 status word, because the creator's handle onto
-/// it OUTLIVES it (the teardown closes the handles in the DEAD process's table,
-/// not in its creator's) and reading how a child died is the whole of the
-/// supervision story. What unit 2 lacked was a way to know when the last reader
-/// was gone; RELEASE is that reader-count, and `reclaim_process_slot` below is
-/// the check. So `MAX_PROCESSES` bounds CONCURRENT processes again, which is
-/// what the name says, and a request past it is still `NoResource`.
+/// `Gone` is not `Free`: a dead slot is spent again only when nothing can read
+/// it. Teardown leaves the slot holding its status word (spec §8) because the
+/// creator's handle onto it outlives it, and `reclaim_process_slot` frees the
+/// slot once the last such handle is gone. So `MAX_PROCESSES` bounds concurrent
+/// processes, and a request past it is `NoResource`.
 ///
-/// `ThreadState.Exited` is the same decision one level down, and it has NOT
-/// moved: a join arriving after the exit still has to find the exit code, and no
-/// handle names a thread slot the way one names a process slot, so there is no
-/// reader-count to run. Thread slots come back at the process's teardown.
+/// `ThreadState.Exited` is not reclaimed this way: a join after the exit must
+/// still find the exit code, no handle names a thread slot the way one names a
+/// process slot, and thread slots come back at the process's teardown.
 public(package) func alloc_process() unsafe -> Int {
     let usable = process_slots_usable()
     var i: Int = 0
@@ -175,46 +132,26 @@ public(package) func alloc_process() unsafe -> Int {
     NO_PROCESS
 }
 
-/// Free a `Gone` process's slot if no handle ANYWHERE still names it (sawos
-/// design 3 D-3).
+/// Free a `Gone` process's slot if no handle anywhere still names it.
 ///
-/// **THE ONE SLAB THAT RECLAIMS ON RELEASE, and it is special for a reason the
-/// others do not share.** Every other kind's slot is freed by its owner's
-/// teardown, because "may I free this" has no cheap answer for an Event or a
-/// Timer — it needs a refcount nothing yet justifies. A Gone process's slot is
-/// different twice over: unit 2 explicitly queued it (`alloc_process` above
-/// recorded the pend), and its question has a PRECISE answer. The only thing a
-/// Gone slot still holds is its §8 status word, the only way to read that word
-/// is `GetStatus` through a Process handle, so no handle naming the slot means
-/// no possible reader and the slot may go.
+/// A `Gone` slot holds only its status word (spec §8), and the only way to read
+/// it is `GetStatus` through a Process handle, so `ProcessSlot.refs == 0` means
+/// no possible reader and the slot may go. It runs when the last reference to a
+/// Process is dropped (`free_object`'s Process arm) and at the end of a
+/// process's own teardown.
 ///
-/// **COUNTED, NOT SCANNED — AND THAT IS WHAT UNIT 5 CHANGED HERE** (sawos
-/// design 7 D-1, superseding design 3 D-3's walk). Unit 2.75 argued the walk
-/// was the cheaper thing, because a per-slot count would be a second fact to
-/// keep in step with the table across mint, release, teardown and `give`.
-/// Design 7 keeps seven other kinds' counts in step at exactly those sites, so
-/// the second fact is no longer second: `ProcessSlot.refs` is maintained by the
-/// same lines that maintain an Event's, and the thirty-two-entry walk is gone
-/// with the era that needed it. The ANSWER is unchanged — zero references means
-/// no possible reader of the §8 status word — which is why no transcript moves
-/// for this alone.
+/// `refs` counts Process handles bound in every process's table, not just the
+/// caller's. A process's own teardown closes its handles first, so if it held
+/// the last one on its own slot (it released its creator's handle, or it refers
+/// to itself) that close is what takes the count to zero.
 ///
-/// EVERY PROCESS'S TABLE, not the caller's, exactly as before: the count is
-/// incremented wherever a Process handle is bound, in whichever table. It runs
-/// at the END of a process's own teardown too, for its own slot — the dying
-/// process's handles are closed there, and if it happened to hold the last one
-/// (a process that released its creator's handle, or a self-referring root)
-/// that close is what takes the count to zero.
+/// Handle generations make the reused slot safe: a later process landing here
+/// gets a new life, and a word onto the old one no longer matches.
+/// `clear_domain` has already invalidated `LAST_PROT_PROCESS` for the same
+/// reuse.
 ///
-/// D-1's generations are what make the reused slot SAFE: a later process landing
-/// here gets a new life, and a word onto the old one has a generation that no
-/// longer matches. `clear_domain` already invalidated `LAST_PROT_PROCESS` in
-/// anticipation of exactly this.
-///
-/// A LIVE PROCESS IS NEVER RECLAIMED however far its count falls — a process
-/// nobody holds a handle to is still running, and its slot is what it is
-/// running IN. That is the whole reason this is a `Gone`-only arm rather than
-/// the plain "free at zero" every other kind gets.
+/// A live process is never reclaimed however far its count falls: its slot is
+/// what it is running in.
 public(package) func reclaim_process_slot(slot: Int) unsafe {
     match PROCESSES[slot].state {
         case Gone -> {},
@@ -227,34 +164,30 @@ public(package) func reclaim_process_slot(slot: Int) unsafe {
 }
 
 // -----------------------------------------------------------------------------
-// The grant record, and installing a domain (sawos design 2 D-5)
+// The grant record, and installing a domain
 // -----------------------------------------------------------------------------
 
 /// Record one row of process `p`'s protection domain.
 ///
-/// Rows are appended IN THE ORDER THEY ARE GRANTED, and the order is
-/// load-bearing on one profile: `hal.prot_region`'s index names a numbered
-/// hardware region there, so replaying row `i` at index `i` is what makes an
-/// installed domain identical to the one the loader staged directly before this
-/// record existed.
+/// Rows are appended in the order they are granted. On a tier whose
+/// `hal.prot_region` index names a numbered hardware region, replaying row `i`
+/// at index `i` is what makes an installed domain match the one the loader
+/// staged.
 ///
-/// An overflowing record is a caller error the caller has already refused: both
-/// the boot loader and `process_create` bound `seg_count` against
-/// `hal.MAX_ROOT_SEGMENTS` before the first grant, and `MAX_GRANT_ROWS` covers
-/// that plus the stack. The bound is re-tested here anyway because a silently
-/// dropped grant is a process running with less memory than it was given, which
-/// presents as a fault somewhere else entirely.
-/// **AND A ROW THAT NAMES A REGION IS A REFERENCE ON IT** (sawos design 28).
-/// `region` is `NO_MEMORY` for every row that is not one — image segments, the
-/// stack grant, device windows — and `ref_region_row` takes that arm, which is
-/// what lets all five callers pass their answer unconditionally.
+/// An overflow is a kernel bug, since the boot loader and `process_create` both
+/// bound `seg_count` against `hal.MAX_ROOT_SEGMENTS` before the first grant and
+/// `MAX_GRANT_ROWS` covers that plus the stack. The bound is re-tested here
+/// because a silently dropped grant presents as a fault somewhere else
+/// entirely.
 ///
-/// **`base`/`top` ARE THE USER'S RANGE AND `pa` IS ITS PHYSICAL BASE** (sawos
-/// design 33). Every caller supplies both because every caller knows both: the
-/// loader computes the destination frame from the region it was handed, and
-/// `install_row` asks `hal.map_place` where the row lands. On a tier that does
-/// not translate the two are the same number, which `hal.prot_update` asserts
-/// there rather than trusting.
+/// A row that names a region is a reference on it. `region` is `NO_MEMORY` for
+/// image segments, the stack grant and device windows, and `ref_region_row`
+/// takes that arm, so every caller passes its answer unconditionally.
+///
+/// `base`/`top` are the user's range and `pa` its physical base. Every caller
+/// knows both: the loader computes the destination frame from the region it was
+/// handed, and `install_row` asks `hal.map_place`. On a tier that does not
+/// translate the two are equal, which `hal.prot_update` asserts.
 public(package) func record_grant(p: Int, base: UInt, top: UInt, pa: UInt,
                                   perms: UInt8,
                                   device: Bool, region: Int) unsafe {
@@ -268,69 +201,52 @@ public(package) func record_grant(p: Int, base: UInt, top: UInt, pa: UInt,
                                       region: region)
     PROCESSES[p].grant_count = n + 1
     ref_region_row(region)
-    // THE HARDWARE LEARNS HERE, on a tier that keeps a standing image (sawos
-    // design 27). This is the single funnel every grant row is appended
-    // through — the loader's three at boot and `install_row`'s one from a
-    // `map` — so putting the edit here is what makes the record and the tables
-    // move together by construction, for ANY process, current or not, rather
-    // than by two call sites agreeing to stay in step. On the MPU tier it is a
-    // no-op and the row reaches hardware at the next switch, exactly as before.
+    // The hardware learns here, on a tier that keeps a standing image. This is
+    // the single funnel every grant row is appended through (the loader's at
+    // boot and `install_row`'s from a `map`), so the record and the tables move
+    // together by construction, for any process, current or not. On a replay
+    // tier it is a no-op and the row reaches hardware at the next switch.
     //
-    // AFTER the reference above, so the region is held before anything can
-    // reach the bytes: the grant is the thing that makes them reachable, and
-    // taking the reference first is what stops a free from racing the row that
-    // is about to permit access to it.
+    // After the reference above: the region is held before anything can reach
+    // the bytes, so a free cannot race the row that is about to permit access.
     //
-    // `perms` is non-zero by construction on both paths into here — an image
-    // segment must be readable or executable, and `map_access` refuses a row
-    // that permits nothing — which is what leaves zero free to mean the
-    // revocation `remove_grant` spells below.
+    // `perms` is non-zero on both paths into here (an image segment must be
+    // readable or executable, and `map_access` refuses a row that permits
+    // nothing), which leaves zero free to mean the revocation in
+    // `remove_grant`.
     hal.prot_update(p as UInt, base, top, pa, perms, device)
 }
 
-/// **WHERE THE NEXT MAPPING OF `len` BYTES GOES IN `p`'s ADDRESS SPACE** — the
-/// kernel's VA policy, in one function (sawos design 33).
+/// Where the next mapping of `len` bytes goes in `p`'s address space: the
+/// kernel's VA policy.
 ///
-/// **FIRST FIT AT OR ABOVE THE IMAGE REGION'S TOP, over the rows `p` already
-/// has.** The floor is `region_top` because everything below it is the image and
-/// its stack, which the linker placed and the loader recorded; above it is space
-/// no one has claimed. Device rows are skipped: they live in a window of their
-/// own and never contend with RAM for an address.
+/// First fit at or above the image region's top, over the rows `p` already has.
+/// Everything below `region_top` is the image and its stack, placed by the
+/// linker and recorded by the loader. Device rows are skipped: they live in a
+/// window of their own and never contend with RAM for an address.
 ///
-/// **THE BRIEF PROPOSED A MONOTONIC CURSOR AND THE SUITE REFUSED IT**, which is
-/// worth recording where the policy is rather than only in the design record.
-/// A cursor that only ever rises never reuses an address, which is the safer
-/// story — a stale pointer into an unmapped region keeps faulting forever. But
-/// two existing cases need the address back: `mapping_slot_free` maps and
-/// unmaps thirteen times and then expects the fourteenth mapping of a re-split
-/// range to answer at the address the thirteenth wrote, and `memory_split`
-/// expects two consecutive splits at two consecutive addresses. Both are
-/// statements about RECYCLING, which is what M5 unit 5 built underneath, and a
-/// virtual address that never came back would have made the physical recycling
-/// unobservable. So first fit it is, and the cost is named: **an address freed
-/// by `unmap` may be handed to a later mapping of different bytes**, so a
-/// program that keeps a pointer past its own `unmap` can reach a stranger's
-/// memory instead of faulting. That is the same hazard `mapping_slot_free`
-/// already documents one level down for the physical range, and closing it
-/// wants a generation or a quarantine that v1 does not have.
+/// Addresses are recycled, so an address freed by `unmap` may be handed to a
+/// later mapping of different bytes, and a program that keeps a pointer past
+/// its own `unmap` can reach a stranger's memory instead of faulting. Closing
+/// that would need a generation or quarantine. Don't replace this with a
+/// monotonic cursor: cases such as `mapping_slot_free` and `memory_split` rely
+/// on a freed address coming back.
 ///
-/// AUDIT (design 1): NO POINT, and it is provably short — at most
-/// `grant_count + 1` passes over at most `MAX_GRANT_ROWS` rows, because every
-/// pass that changes anything moves `va` above one more row's top and there are
-/// only so many rows.
+/// No preemption point: at most `grant_count + 1` passes over at most
+/// `MAX_GRANT_ROWS` rows, because every pass that changes anything moves `va`
+/// above one more row's top.
 ///
 /// The answer is not checked against the tier's window here: `install_row` asks
-/// `hal.map_target_ok` about the range this returns, which is the one place a
-/// refusal has somewhere to go.
+/// `hal.map_target_ok` about the returned range, the one place a refusal has
+/// somewhere to go.
 public(package) func free_user_va(p: Int, len: UInt) unsafe -> UInt {
     var va = PROCESSES[p].region_top
     var pass: Int = 0
     while pass <= PROCESSES[p].grant_count {
-        // Asked before the addition that computes the candidate's top, for the
-        // loader's own reason: overflow checks are always on, so a length that
-        // would run off the end of the address space has to become a refusal
-        // upstairs rather than a panic in here. `install_row`'s window check is
-        // what refuses it.
+        // Checked before the addition that computes the candidate's top:
+        // overflow checks are always on, so a length that would run off the end
+        // of the address space must become a refusal upstairs (`install_row`'s
+        // window check) rather than a panic here.
         if len > UInt.max - va {
             return va
         }
@@ -352,39 +268,31 @@ public(package) func free_user_va(p: Int, len: UInt) unsafe -> UInt {
     va
 }
 
-/// **RESOLVE A USER ADDRESS TO THE PHYSICAL ONE IT NAMES IN `p`'s DOMAIN**, or
-/// say why it names nothing (sawos design 33).
+/// Resolve a user address to the physical one it names in `p`'s domain, or
+/// `BadBuffer` if it names nothing.
 ///
-/// This is the shape design 29 said would exist ahead of need, now real: walk
-/// the TARGET's grant records for the row covering `va`, then let the caller
-/// dereference through the linear map. Bounded by `MAX_GRANT_ROWS`, which is
-/// nine — the record is a fixed array and always was.
+/// Walks `p`'s grant rows for the one covering `va`; the caller then
+/// dereferences through the linear map. Bounded by `MAX_GRANT_ROWS`.
 ///
-/// **THE WHOLE RANGE MUST LIE IN ONE ROW, and that is the honest bound rather
-/// than a convenience.** A row is the largest span over which the user→physical
-/// mapping is affine (`GrantRow`), so a copy that crossed a row boundary would
-/// need two translations and could not be one `copy_bytes`. It costs nothing
-/// real: a buffer is a variable in one segment or one mapped region, and no
-/// program in this tree hands the kernel a buffer that straddles two grants.
+/// The whole range must lie in one row. A row is the largest span over which
+/// the user-to-physical mapping is affine (`GrantRow`), so a copy that crossed
+/// a row boundary would need two translations and could not be one
+/// `copy_bytes`.
 ///
-/// A DEVICE row is not a candidate. The kernel does not copy through a register
-/// window — `copy_out`'s and `copy_in`'s own windows are the image region, which
-/// is RAM — and a memcpy over device memory would break the access-size
+/// A device row is not a candidate: the kernel does not copy through a register
+/// window, and a memcpy over device memory would break the access-size
 /// discipline a driver's own reads keep.
 ///
-/// **A VA THAT RESOLVES TO NO ROW IS THE FAULT IT ALWAYS WAS** — `BadBuffer`,
-/// the same answer the window checks give, because it is the same mistake: the
-/// process handed the kernel an address it does not own. What is new is that the
-/// question now has a precise answer instead of a conservative span.
+/// An address in no row is `BadBuffer`, the same answer the window checks give,
+/// because the process handed the kernel an address it does not own.
 public(package) func translate_user(p: Int, va: UInt,
                                     bytes: UInt) unsafe -> Result<UInt, FaultReason> {
     var i: Int = 0
     while i < PROCESSES[p].grant_count {
         let row = PROCESSES[p].grants[i]
         if not row.device && va >= row.base && va < row.top {
-            // Ordered so the subtraction cannot underflow, exactly as the
-            // window checks below order their own: `row.top - va` is computed
-            // only once `va` is known to be inside the row.
+            // Ordered so the subtraction cannot underflow: `row.top - va` is
+            // computed only once `va` is known to be inside the row.
             if bytes > row.top - va {
                 return FaultReason.BadBuffer
             }
@@ -395,49 +303,32 @@ public(package) func translate_user(p: Int, va: UInt,
     FaultReason.BadBuffer
 }
 
-/// Make process `p`'s recorded domain the LIVE one.
+/// Make process `p`'s recorded domain the live one.
 ///
-/// THE ONE PLACE A DOMAIN IS INSTALLED, reached from exactly two callers: the
-/// boot path, once, and the scheduler at a switch that changes process. Reset,
-/// replay, commit — the same three steps the loader used to perform inline, now
-/// written once so the boot domain and a switched-in domain cannot be programmed
-/// differently.
+/// The one place a domain is installed. Its callers are the boot path
+/// (`loader`), the scheduler at a switch that changes process (`run_thread`)
+/// and `domain_changed`. Reset, replay and commit are written once so the boot
+/// domain and a switched-in domain cannot be programmed differently.
 ///
-/// COST, RECORDED HONESTLY (sawos design 2 D-5, amended by design 27). On
-/// Profile A this is about nineteen control-register writes and no
-/// translation-buffer work at all. On Profile B it WAS a window reset
-/// (1024 + 512 descriptor stores), a regrant walk and a full
-/// translation-buffer flush — the order of 1.6k stores per switch. That is
-/// retired: Profile B now holds a persistent table set per process and this
-/// collapses to ONE register write, because the tables were already brought up
-/// to date when the RECORD was edited (`record_grant` / `remove_grant`).
+/// The replay is for tiers where `hal.prot_replay_at_switch()` holds (the HAL
+/// advertises this; the kernel does not guess the tier). Such a tier rebuilds
+/// its protection set from the record at each switch. A tier that keeps a
+/// persistent table set per process folds the loop away: the tables were
+/// brought up to date when the record was edited (`record_grant` /
+/// `remove_grant`), and `prot_switch` is the whole of the switch.
 ///
-/// **THE REPLAY IS THE MPU TIER'S, AND THE HAL SAYS WHICH TIER IT IS.** Design
-/// 25 D-2 ruled that replay-at-switch stays MPU-only rather than becoming a
-/// permitted MMU implementation — an address-space identifier means nothing if
-/// the tables are rebuilt under it — so the loop below is guarded by a HAL
-/// constant rather than by anything this file knows. On Profile A it folds to
-/// the same three steps it always was; on Profile B it folds away entirely and
-/// `prot_switch` is the whole of the switch. This is design 19's doctrine that
-/// a tier difference is ADVERTISED and never faked, spelled at the one seam
-/// that has to care.
-///
-/// AUDIT (design 1): NO PREEMPTION POINT, and both HALs say so at their own
-/// `prot_reset` — a half-rewritten grant table is exactly an in-flight
-/// invariant, and the whole staged sequence is one edit published by
-/// `prot_commit`.
+/// No preemption point: a half-rewritten grant table is an in-flight invariant,
+/// and the staged sequence is one edit published by `prot_commit`.
 public(package) func load_domain(p: Int) unsafe {
     if hal.prot_replay_at_switch() {
         hal.prot_reset()
         var i: Int = 0
         while i < PROCESSES[p].grant_count {
             let row = PROCESSES[p].grants[i]
-            // **THE REPLAY PROGRAMS THE PHYSICAL RANGE** (sawos design 33).
-            // A replay tier filters addresses the processor actually issues,
-            // and on such a tier a user address IS its physical address — so
-            // `row.pa` and `row.base` are the same number here and the seam
-            // asserts it. Spelling the PHYSICAL half is what makes the line
-            // say which of the two it means now that a row carries both.
+            // The replay programs the physical range. A replay tier filters
+            // addresses the processor actually issues, where a user address is
+            // its physical address, so `row.pa` and `row.base` are equal here
+            // and the seam asserts it.
             if row.device {
                 hal.prot_device(i as UInt, row.pa, row.top - row.base)
             } else {
@@ -452,55 +343,43 @@ public(package) func load_domain(p: Int) unsafe {
     LAST_PROT_PROCESS = p
 }
 
-/// Take row `row` out of process `p`'s grant record and COMPACT what is left.
+/// Take row `row` out of process `p`'s grant record and compact what is left.
 ///
-/// **COMPACTION IS FORCED BY `load_domain`'s REPLAY-BY-INDEX** (sawos design 6
-/// D-3). A row's position is what the hardware sees on one profile — row `i`
-/// programs numbered region `i` — so a hole would either install a disabled
-/// region in the middle of the set or shift every later row's meaning at the
-/// next reload. Shifting them down HERE, once, is the version of that everybody
-/// can see; the Mapping slab's stored indices are fixed up beside this call
-/// (`compact_mapping_rows`), which is the whole of the index sensitivity the
-/// census found.
+/// Compaction is forced by `load_domain`'s replay by index: on a tier whose row
+/// `i` programs numbered region `i`, a hole would install a disabled region in
+/// the middle of the set or shift every later row's meaning at the next reload.
+/// The Mapping slab's stored indices are fixed up beside this call
+/// (`compact_mapping_rows`).
 ///
-/// The caller has already established that `row` is in range, and it is worth
-/// saying HOW: a Mapping's stored index is the `grant_count` `install_row` read
-/// immediately before appending its row, and the only thing that has moved one
-/// since is a compaction — which is exactly what `compact_mapping_rows` beside
-/// this call keeps in step. So the index names a row this record still has.
+/// The caller has established that `row` is in range: a Mapping's stored index
+/// is the `grant_count` `install_row` read immediately before appending its
+/// row, and only a compaction has moved it since, which `compact_mapping_rows`
+/// keeps in step.
 ///
-/// **THE REGION IS READ FIRST AND DROPPED LAST** (sawos design 28), and the
-/// order is the contract rather than a convenience: taking the row out of the
-/// record before dropping the count means the domain has already stopped
-/// granting these bytes at the moment they may go back on the pool's free list.
-/// The reverse order would let a `Split` hand a range to a new owner while the
-/// old one's protection row still reached it.
+/// The region is read first and dropped last, and the order is the contract:
+/// the row leaves the record, and the grant is revoked in hardware, before the
+/// region's count drops, so the domain has stopped granting these bytes by the
+/// time they may go back on the pool's free list. The reverse order would let a
+/// `Split` hand a range to a new owner while the old protection row still
+/// reached it.
 public(package) func remove_grant(p: Int, row: Int) unsafe {
-    // THE ROW IS READ ONCE, and both consumers see that same read: design 28's
-    // `region` (dropped last, below) and design 27's hardware revoke (issued
-    // first, here). The compaction underneath is about to move this storage, so
-    // reading it twice would be two reads of a row in motion.
+    // Read once, and both consumers see that read: the hardware revoke (issued
+    // first, here) and `region` (dropped last, below). The compaction is about
+    // to move this storage.
     let gone = PROCESSES[p].grants[row]
-    // REVOKED FROM THE HARDWARE BEFORE THE RANGE CAN MOVE — and that is what
-    // makes the paragraph above this function TRUE on a tier whose tables
-    // PERSIST (sawos design 27 meeting design 28). Design 28's ordering
-    // argument is that the domain has stopped granting these bytes by the time
-    // they may reach the pool's free list, and it rests on the ROW LEAVING THE
-    // RECORD — which is sufficient exactly where the hardware image is rebuilt
-    // from the record at the next switch. Where the tables stand, the record no
-    // longer speaks for the hardware, so THIS call is what stops the grant, and
-    // it therefore precedes `unref_region_row` rather than merely the
-    // compaction. Eagerly for its own reason too: an unmap that waited would be
-    // a revocation that did not revoke — the sentence `domain_changed` has
-    // always carried. On the MPU tier it is a no-op and the replay is what
-    // stops programming the row.
+    // Revoked from the hardware before the range can move. Removing the row
+    // from the record suffices where the hardware image is rebuilt from the
+    // record at the next switch; where the tables persist, the record no longer
+    // speaks for the hardware, so this call is what stops the grant and it must
+    // precede `unref_region_row`. It is eager because an unmap that waited
+    // would be a revocation that did not revoke. On a replay tier it is a no-op
+    // and the replay stops programming the row.
     //
-    // A GRANT OF NOTHING IS THE REVOCATION (user ruling, Sep 3): the same call
-    // `record_grant` makes, with permissions of zero. It is one operation
-    // because on a translating tier it IS one — a non-granted page is still
-    // mapped and simply denied to user mode, so removal is the installation of
-    // deny — and zero is available to say so because neither door will record a
-    // row that permits nothing.
+    // A grant of nothing is the revocation: the same call `record_grant` makes,
+    // with permissions of zero. On a translating tier a non-granted page is
+    // still mapped and simply denied to user mode, so removal is the
+    // installation of deny. Zero is free to say so because neither door records
+    // a row that permits nothing.
     hal.prot_update(p as UInt, gone.base, gone.top, gone.pa, 0, gone.device)
     var i = row
     while i + 1 < PROCESSES[p].grant_count {
@@ -511,26 +390,17 @@ public(package) func remove_grant(p: Int, row: Int) unsafe {
     unref_region_row(gone.region)
 }
 
-/// **THE LIVE-DOMAIN RULE** (sawos design 6 D-3): any edit to `PROCESSES[p]`'s
-/// grant record RELOADS IMMEDIATELY when `p`'s domain is the one in the
-/// hardware.
+/// The live-domain rule: any edit to `PROCESSES[p]`'s grant record reloads
+/// immediately when `p`'s domain is the one in the hardware.
 ///
-/// **IT IS LAW BECAUSE `run_thread` SKIPS EQUAL DOMAINS.** The scheduler
-/// reloads only when the process changes, which is what keeps every
-/// one-process transcript free of protection work — and it means a grant record
-/// edited under the RUNNING process would never be installed at all. Not
-/// "installed late": never, for as long as that process keeps the processor.
-/// A `map()` would appear to succeed and the memory would still fault; an
-/// `unmap()` would return `Ok` and the window would stay open, which is the
-/// direction that matters.
+/// This is required because `run_thread` skips equal domains: the scheduler
+/// reloads only when the process changes, so a record edited under the running
+/// process would never be installed for as long as that process keeps the
+/// processor. A `map()` would appear to succeed and the memory would still
+/// fault; an `unmap()` would return `Ok` and the window would stay open.
 ///
-/// ONE HELPER, BOTH OPS, and the `map_unmap` case is what asserts it end to
-/// end: the touch after the unmap FAULTS, which is only true if the reload
-/// happened.
-///
-/// It is a no-op for the common shape — a launcher mapping into a child it has
-/// not started — so the cost is one comparison on the path that does not need
-/// it.
+/// It is a no-op for the common shape, a launcher mapping into a child it has
+/// not started.
 public(package) func domain_changed(p: Int) unsafe {
     if LAST_PROT_PROCESS == p {
         load_domain(p)
@@ -539,48 +409,36 @@ public(package) func domain_changed(p: Int) unsafe {
 
 /// Forget process `p`'s domain and its rows. Called by the teardown.
 ///
-/// INVALIDATING `LAST_PROT_PROCESS` IS THE PART THAT MATTERS, and the hazard it
-/// was written for HAS ARRIVED (sawos design 3 D-3). A dead slot is reclaimed
-/// now, as soon as no handle names it, so a new process really can land in this
-/// slot — and it would compare EQUAL to a domain that is no longer installed,
-/// and the next switch would skip the reload and run it under the dead one's
-/// map. Clearing the word here is what makes the reuse safe, and it costs one
-/// comparison.
+/// Invalidating `LAST_PROT_PROCESS` is required: a dead slot is reclaimed as
+/// soon as no handle names it, so a new process can land in this slot, compare
+/// equal to a domain that is no longer installed, and run under the dead one's
+/// map because the next switch skips the reload. This is separate from handle
+/// generations: a generation stops a stale handle from naming the new occupant,
+/// and this stops a stale protection domain from staying installed for it.
 ///
-/// It is a SEPARATE mechanism from D-1's handle generations rather than a
-/// duplicate of one, and the difference is worth keeping straight: a generation
-/// stops a stale HANDLE from naming the new occupant, and this stops a stale
-/// PROTECTION DOMAIN from being left installed for it. Neither substitutes for
-/// the other — the first is about what userspace may name, the second about what
-/// the hardware is programmed with.
-/// **AND THIS IS WHERE A TEARDOWN RECYCLES** (sawos design 28). Every row this
-/// record still holds is a reference on a region, so dropping the record drops
-/// them all — and a region whose LAST row goes here, with its handles already
-/// closed by the sweep above this call, returns its range to its pool. That is
-/// what narrows §2.5's "dropped without unmap = permanent, safe-but-leaked" to
-/// "leaked until the TARGET PROCESS's teardown": the bound was always the
-/// target's death, and the death now gives the bytes back instead of forgetting
-/// them.
+/// Every row this record holds is a reference on a region, so dropping the
+/// record drops them all. A region whose last row goes here, with its handles
+/// already closed by the sweep above this call, returns its range to its pool
+/// (spec §2.5: a mapping dropped without unmap is leaked until the target
+/// process's teardown).
 ///
-/// THE COUNT IS ZEROED FIRST, for `remove_grant`'s reason one function up: the
-/// rows are gone from the record — nothing replays them, `grant_count` is what
-/// says how many there are — before any range can move. The row DATA is left
-/// where it lies, which costs nothing and is overwritten by the next grant.
+/// The count is zeroed first, for `remove_grant`'s reason: nothing replays the
+/// rows before any range can move. The row data is left in place and
+/// overwritten by the next grant.
 public(package) func clear_domain(p: Int) unsafe {
     let rows = PROCESSES[p].grant_count
     PROCESSES[p].grant_count = 0
-    // AND THE STANDING IMAGE GOES WITH THE RECORD (sawos design 27), BEFORE the
-    // walk below can return a single range to its pool — the same composition
-    // `remove_grant` spells one function up. Zeroing the count above is what
-    // stops a REPLAY tier from granting these bytes again; this is what stops a
-    // persistent-table one, and the free list is reachable from the next line,
-    // so the order is the contract and not a preference.
+    // The standing image goes with the record, before the walk below can return
+    // a range to its pool (the same composition as `remove_grant`). Zeroing the
+    // count stops a replay tier from granting these bytes again; this call
+    // stops a persistent-table tier, and the free list is reachable from the
+    // next line, so the order is a contract.
     //
-    // It is also where the slot — and so the address-space identifier the
-    // tables are tagged with — becomes reusable, which is why the identifier's
-    // cached translations are dropped here. Invalidating `LAST_PROT_PROCESS`
-    // below is not enough there: it forces the next SWITCH to reprogram, which
-    // is exactly what a persistent-table profile no longer does.
+    // The slot, and so the address-space identifier the tables are tagged with,
+    // becomes reusable here, so the identifier's cached translations are
+    // dropped. Invalidating `LAST_PROT_PROCESS` below is not enough: it only
+    // forces the next switch to reprogram, which a persistent-table tier no
+    // longer does.
     hal.prot_clear(p as UInt)
     var i: Int = 0
     while i < rows {
@@ -593,63 +451,43 @@ public(package) func clear_domain(p: Int) unsafe {
 }
 
 // -----------------------------------------------------------------------------
-// COPY-OUT: the one door from kernel memory into a process's
+// Copy-out: the one door from kernel memory into a process's
 // -----------------------------------------------------------------------------
 //
-// This is SOS's FIRST kernel-writes-userspace path, and it is built as a funnel
-// on the first use rather than after the third, because the shape of what
-// follows is already known: spec §2.1 has a Pipe `receive` copying a message
-// body into the receiver's address space, and that is the same operation with a
-// bigger length.
+// Spec §2.1's Pipe `receive` copies a message body into the receiver's address
+// space through this door. The writer may be a different thread from the one
+// that asked (a signaller waking a parked waiter). The destination is resolved
+// through the target process's own grant record (`translate_user`) and reached
+// through the linear map, so the copy does not depend on which process's domain
+// is installed.
 //
-// WHAT IT REFUSES, and why each is a FAULT rather than a status (design 178's
-// ruling — a caller error the process could have checked ends it):
+// What it refuses, each as a fault rather than a status because the process
+// could have checked it:
 //
-//   - a destination that is not word-aligned. The kernel writes machine words;
-//     a misaligned store traps on one profile and is merely wrong on the other,
-//     and neither is something to discover at the wake.
-//   - a destination outside the process's WRITABLE window. A process asking the
-//     kernel to place a record in its own code has misread its own memory map.
+//   - a destination that is not word-aligned (the kernel writes machine words;
+//     a misaligned store traps on some tiers and is merely wrong on others);
+//   - a destination outside the process's writable window (a record placed in
+//     its own code is a misread memory map).
 //
-// A process knows where its own writable memory is — it linked the image — so
-// both are caller-checkable in the strongest sense.
+// The door reports and its caller faults: ending a process is a scheduling
+// event, so the termination lives above the scheduler and these functions
+// answer with the `FaultReason`. `None` means the buffer is good.
 //
-// **THE DOOR REPORTS; ITS CALLER FAULTS** (sawos design 2). It used to end the
-// process itself, which was free while ending a process stopped the machine.
-// With more than one process a fault is a SCHEDULING EVENT — somebody else has
-// to run next — so the kill lives above the scheduler and these functions answer
-// with the `FaultReason` instead. `None` means the buffer is good. Nothing about
-// what is checked or what a caller does with the answer changed; only where the
-// termination is spelled.
-//
-// M2 WAS ONE ADDRESS SPACE and that is what made the write a plain copy: the
-// writer may be a DIFFERENT thread from the one that asked (a signaller waking
-// a parked waiter). With several address spaces the copy is still plain, because
-// spec §5.5's contract is that a user address is the same number in every
-// process — so what changed is the PERMISSION set, which the kernel is not
-// subject to.
-//
-// **AND THE CONVERSION A TRANSLATING KERNEL NEEDS DID LAND HERE** (sawos design
-// 29), exactly where the sentence this paragraph used to end with predicted it:
-// these two doors are the only places the kernel dereferences a user address, so
-// they are the only places in this module that turn one into a kernel
-// dereference. On a tier whose kernel does not run at physical addresses,
-// `hal.phys_to_virt` is the arithmetic that gets there; on a tier that has no
-// translation at all it is the identity and compiles to nothing. Either way the
-// two lines below read the same, which is what keeps this module arch-free.
-//
-// §5.5 IS UNTOUCHED BY THIS, and a reader could reasonably wonder: it says a
-// USER address is the same number everywhere, and it still is — placement is
-// design 25's unit 2, not this one. What moved is where the KERNEL stands,
-// which §5.5 never spoke about.
+// These two doors are the only places the kernel dereferences a user address,
+// so they are the only places that turn one into a kernel dereference.
+// `hal.phys_to_virt` is the conversion on a tier whose kernel does not run at
+// physical addresses, and the identity otherwise; the code reads the same
+// either way, which keeps this module arch-free.
 
 /// Validate a destination the kernel is about to write. `None` when it is fine.
 ///
-/// Split out from `copy_out` for exactly one caller: `Waiter.Wait` validates
-/// when it PARKS, so that a bad buffer ends the process that supplied it while
-/// that process is still the running one, rather than at some later wake in
-/// another thread's context. Every other consumer validates and copies in one
-/// step, which is what `copy_out` is.
+/// Split out from `copy_out` for two reasons. Ops that park and copy at a later
+/// wake (`Waiter.Wait`, the fused pipe call) validate while parking, so a bad
+/// buffer ends the process that supplied it while that process is still the
+/// running one, rather than at some later wake in another thread's context. Ops
+/// that mint before they copy (`pipe_create`, `pipe_take`) validate first, so a
+/// bad buffer faults before anything is minted. A consumer with neither
+/// concern validates and copies in one step (`copy_out`).
 public(package) func copy_out_check(p: Int, dst: UInt, bytes: UInt) unsafe -> FaultReason? {
     if (dst % word_bytes()) != 0 {
         return FaultReason.BadAlign
@@ -659,138 +497,81 @@ public(package) func copy_out_check(p: Int, dst: UInt, bytes: UInt) unsafe -> Fa
     }
     // Ordered so the subtraction below cannot underflow: `rw_top - dst` is only
     // computed once `dst` is known to be inside the window. A hostile length
-    // must produce a diagnostic, not a panic — the loader's own discipline.
+    // must produce a diagnostic, not a panic.
     if dst >= PROCESSES[p].rw_top {
         return FaultReason.BadBuffer
     }
     if bytes > PROCESSES[p].rw_top - dst {
         return FaultReason.BadBuffer
     }
-    // **AND THE ADDRESS MUST ACTUALLY RESOLVE** (sawos design 33). The window
-    // above is the conservative span the pair has always been — it includes the
-    // hole between the image's writable end and the stack — and under placement
-    // the kernel can do better than conservative, because the grant record now
-    // says which user addresses exist and what they translate to. The early
-    // check owes the same answer the copy will get: `pipe_call` validates when
-    // it PARKS and copies at the resume, so a destination that passed here and
-    // failed there would be a kernel invariant broken rather than a caller's
-    // mistake.
+    // The address must also resolve. The window above is conservative (it
+    // includes the hole between the image's writable end and the stack); the
+    // grant record says which user addresses exist. The early check owes the
+    // same answer the copy will get: `pipe_call` validates when it parks and
+    // copies at the resume, so a destination that passed here and failed there
+    // would be a broken kernel invariant rather than a caller's mistake.
     let _ = try translate_user(p, dst, bytes) catch { return error }
     None
 }
 
 /// Copy `bytes` from kernel memory at `src` into process `p` at `dst`, unless
-/// the destination is refused — in which case NOTHING is written and the reason
+/// the destination is refused, in which case nothing is written and the reason
 /// comes back.
 ///
-/// THE ONE DOOR. Its consumers, current and intended:
+/// The one door outward. Consumers include `Waiter.Wait` (ready and wake
+/// paths), the boot-handle iterator's record, `clock_now`, the stats ops, and
+/// the pipe ops that return a record or a message body (spec §2.1).
 ///
-///   - `Waiter.Wait` (both paths — the ready one and the wake);
-///   - the boot-handle iterator's record;
-///   - the Interrupt object's wait result, when that lands;
-///   - M4's Pipe `receive`, which is §2.1's message body and the reason this
-///     is a general copy rather than a record writer.
-///
-/// Nothing else in the kernel may dereference a user address. That is the whole
-/// rule, and it is one function long so it stays checkable by reading.
+/// Nothing else in the kernel may dereference a user address for writing.
 public(package) func copy_out(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe -> FaultReason? {
     if let why = copy_out_check(p, dst, bytes) {
         return why
     }
-    // **THE ASYMMETRY IS THE WHOLE SEAM** (sawos design 29). `dst` is the
-    // PROCESS's address — physical, because user placement is still identity —
-    // and the kernel does not run at those addresses any more, so it converts to
-    // dereference. `src` is already a kernel address: it comes from a `&var` of
-    // a record on this frame, which the linker placed wherever the kernel lives.
-    // On an MPU tier `phys_to_virt` is the identity and this line is what it
-    // always was.
-    // **`dst` IS RESOLVED, NOT ASSUMED** (sawos design 33). It is the
-    // PROCESS's address, and on a translating tier that is a number only the
-    // process's own tables give meaning to — so the kernel asks the record what
-    // it names before it asks the linear map how to reach it. Two lookups,
-    // named separately, because they answer two questions: `translate_user`
-    // says WHICH BYTES, `phys_to_virt` says HOW THE KERNEL TOUCHES THEM.
-    // `src` is already a kernel address: it comes from a `&var` of a record on
-    // this frame, which the linker placed wherever the kernel lives. On an MPU
-    // tier both calls are the identity and this line is what it always was.
+    // `dst` is the process's address and is resolved through its record
+    // (`translate_user`: which bytes) and then reached through the linear map
+    // (`phys_to_virt`: how the kernel touches them). `src` is already a kernel
+    // address, from a `&var` of a record on this frame, and is neither.
     let pa = try translate_user(p, dst, bytes) catch { return error }
     copy_bytes(hal.phys_to_virt(pa), src, bytes)
     None
 }
 
 // -----------------------------------------------------------------------------
-// COPY-IN: the one door from a process's memory into the kernel's
+// Copy-in: the one door from a process's memory into the kernel's
 // -----------------------------------------------------------------------------
 //
-// THE MIRROR TWIN OF `copy_out`, and it is built as a funnel on its first use
-// for the same reason that one was: the shape of what follows is already known.
-// Spec §2.1 has a Pipe `send` copying a message BODY out of the sender's
-// address space, and that is this operation with a bigger length — so design
-// 232 unit 1 builds the door, and `Timer.Arm` is its small first consumer
-// exactly as `Waiter.Wait` was for copy-out.
+// The mirror of `copy_out`. Spec §2.1's Pipe `send` copies a message body out
+// of the sender's address space through it, and `Timer.Arm` uses it because a
+// nanosecond time is 64 bits and `arm`'s (first deadline, interval) pair is
+// four words on a 32-bit tier, which does not fit the three argument registers
+// (spec §5.7).
 //
-// WHY AN OP NEEDS IT AT ALL. §5.7 gives an op three argument registers. A
-// nanosecond time is 64 bits — anything narrower wraps in four seconds — so
-// `arm`'s (first deadline, interval) pair is FOUR words on a 32-bit profile.
-// The arguments do not fit, and widening the register convention would widen it
-// for every op forever to suit one.
+// What it refuses, each as a fault rather than a status because the process
+// could have checked it:
 //
-// WHAT IT REFUSES, and why each is a FAULT rather than a status (design 178's
-// ruling — a caller error the process could have checked ends it):
+//   - a source that is not word-aligned (the same rule as copy-out, so a caller
+//     learns one alignment rule for kernel records);
+//   - a source outside the process's own memory (this check stops a process
+//     from naming kernel memory or another process's).
 //
-//   - a source that is not word-aligned. Same rule the copy-out door applies,
-//     and stated once so a caller learns ONE alignment rule for kernel records
-//     rather than one per direction.
-//   - a source outside the process's own memory. A process asking the kernel to
-//     read a record from an address it does not own has misread its own memory
-//     map — and this is the check that stops it naming KERNEL memory, or
-//     ANOTHER PROCESS's, which is the whole reason the door exists.
-//
-// THE WINDOW IS THE WHOLE GRANTED REGION, NOT THE WRITABLE ONE, and the
-// asymmetry with `copy_out` is deliberate. A process may legitimately hand the
-// kernel a record out of its own RODATA — a constant schedule is exactly the
-// thing a driver would write — so demanding a writable source would refuse
-// correct programs. The hazard the two doors guard against is not the same one:
-// writing outside the writable window CORRUPTS the process, while reading
-// outside the granted region READS SOMEBODY ELSE, so each door checks the
-// window that answers its own question.
+// The window is the whole granted region, not the writable one. A process may
+// hand the kernel a record out of its own rodata, so demanding a writable
+// source would refuse correct programs. Writing outside the writable window
+// corrupts the process, while reading outside the granted region reads somebody
+// else, so each door checks the window that answers its own question.
 
-/// Copy `bytes` from process `p` at `src` into kernel memory at `dst`, unless
-/// the source is refused — in which case NOTHING is read and the reason comes
-/// back.
+/// Check a source the kernel is about to read from process `p`;
+/// `copy_out_check`'s twin. `None` when it is fine.
 ///
-/// THE ONE DOOR INWARD. Its consumers, current and intended:
-///
-///   - `timer_arm` (design 232 unit 1), the (after, interval) pair;
-///   - M4's Pipe `send`, which is §2.1's message body and the reason this is
-///     a general copy rather than a record reader.
-///
-/// Nothing else in the kernel may dereference a user address for reading. That
-/// is the whole rule, and it is one function long so it stays checkable by
-/// reading.
-///
-/// **THE INBOUND DOOR'S CHECK, WITHOUT THE COPY** — `copy_out_check`'s twin, and
-/// M4 unit 3.5 is what it exists for (sawos design 17).
-///
-/// The paragraph that used to stand here said no `copy_in_check` was owed,
-/// because the split exists for a caller that validates when it PARKS and reads
-/// much later, and "no inbound op can have that shape: a copy-in happens while
-/// the calling process is still the running one, by construction". THE FUSED
-/// `PipeInletOp.Call` IS THE OP THAT BROKE THAT SENTENCE. A `Call` that meets a
-/// full ring parks on the inlet's room level (design 10 ruling 8, reached from
-/// inside), and the message it has not staged yet is still sitting in the
-/// caller's memory — so the copy happens at the RESUME, in whichever context
-/// freed the slot, exactly as a wait record's copy-out happens in the waker's.
-///
-/// So the rule generalizes rather than bending: A DOOR THAT CAN BE USED LATE
-/// OWES AN EARLY CHECK, both directions, and the reason is the same one
-/// `Waiter.Wait` gives — a bad buffer is the calling process's mistake and
-/// terminating it while it is still the running process is both the better
-/// diagnostic and the simpler thing to reason about.
+/// A door that can be used late owes an early check. A fused `PipeInletOp.Call`
+/// that meets a full ring parks on the inlet's room level with its message
+/// still in the caller's memory, so the copy happens at the resume, in
+/// whichever context freed the slot. Validating while the caller is still the
+/// running process is both the better diagnostic and simpler to reason about.
 ///
 /// A process's granted region is fixed for its life, so a source that passes
-/// here cannot fail later; `pipe_call`'s resume treats a refusal as a kernel
-/// invariant broken, exactly as `deliver_wait_record` treats its own.
+/// here cannot fail later; `pipe_call`'s resume treats a refusal as a broken
+/// kernel invariant, as `deliver_wait_record` does for its own.
 public(package) func copy_in_check(p: Int, src: UInt, bytes: UInt) unsafe -> FaultReason? {
     if (src % word_bytes()) != 0 {
         return FaultReason.BadAlign
@@ -798,84 +579,73 @@ public(package) func copy_in_check(p: Int, src: UInt, bytes: UInt) unsafe -> Fau
     if src < PROCESSES[p].region_base {
         return FaultReason.BadBuffer
     }
-    // Ordered so the subtraction below cannot underflow, exactly as the
-    // outbound door orders its own: `region_top - src` is computed only once
-    // `src` is known to be inside the region. A hostile length must produce a
-    // diagnostic, not a panic.
+    // Ordered so the subtraction below cannot underflow: `region_top - src` is
+    // computed only once `src` is known to be inside the region. A hostile
+    // length must produce a diagnostic, not a panic.
     if src >= PROCESSES[p].region_top {
         return FaultReason.BadBuffer
     }
     if bytes > PROCESSES[p].region_top - src {
         return FaultReason.BadBuffer
     }
-    // The outbound door's new second half, in the inbound direction and for the
-    // same reason — see `copy_out_check` (sawos design 33).
+    // The address must also resolve, as in `copy_out_check`.
     let _ = try translate_user(p, src, bytes) catch { return error }
     None
 }
 
+/// Copy `bytes` from process `p` at `src` into kernel memory at `dst`, unless
+/// the source is refused, in which case nothing is read and the reason comes
+/// back.
+///
+/// The one door inward. Consumers include `timer_arm` (the (after, interval)
+/// pair) and the pipe ops that read a send record or a message body (spec
+/// §2.1). Nothing else in the kernel may dereference a user address for
+/// reading.
 public(package) func copy_in(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe -> FaultReason? {
     if let why = copy_in_check(p, src, bytes) {
         return why
     }
-    // The mirror of `copy_out`'s conversion, and the same sentence in the other
-    // direction: `src` is the PROCESS's physical address and converts,
-    // `dst` is the kernel's own storage and does not. See design 29 there.
-    // The mirror of `copy_out`'s resolution, and the same two questions in the
-    // other direction: `src` is the PROCESS's address and is resolved through
-    // its record then reached through the linear map, `dst` is the kernel's own
-    // storage and is neither. See design 33 there.
+    // As in `copy_out`: `src` is the process's address, resolved through its
+    // record and then reached through the linear map; `dst` is the kernel's own
+    // storage and is neither.
     let pa = try translate_user(p, src, bytes) catch { return error }
     copy_bytes(dst, hal.phys_to_virt(pa), bytes)
     None
 }
 
 // =============================================================================
-// The boot region table, and the Memory objects it mints (sawos design 2 D-2)
+// The boot region table, and the Memory objects it mints
 // =============================================================================
 //
-// THE BUILD EMITS A TABLE; THE KERNEL MINTS ONE OBJECT PER ROW AND INTERPRETS
-// NOTHING. That is the whole of the ruled hybrid (sawlang#232 agenda item 2):
-// the stitcher appends each child image to the boot blob AS IT IS and records
-// where things are, the kernel turns each row into a capability, and ROOT's
-// config is what says which ordinal is an image and which is a destination.
-// A kernel that knew would be a kernel with a launcher inside it.
+// The build emits a table and the kernel mints one object per row, interpreting
+// nothing: the stitcher appends each child image to the boot blob as it is and
+// records where things are, the kernel turns each row into a capability, and
+// root's config says which ordinal is an image and which is a destination.
 //
-// **ROWS CARRY A KIND SINCE M3 UNIT 4** (sawos design 6 D-5), and that is the
-// one thing the kernel now reads out of a row besides its bounds. There are
-// three kinds of row in practice and only TWO the kernel distinguishes:
+// A row carries a kind, the one thing the kernel reads besides its bounds:
 //
-//   - a blob region (where an appended image sits, its base resolved by the
-//     LINKER) and a free-RAM region (a pool or a child's destination range,
-//     assigned in config) are both `kind = Ram` and are INDISTINGUISHABLE here
-//     on purpose — the difference is entirely in what root does with them;
-//   - a DEVICE row names a peripheral's registers and mints an `IoMemory`
-//     rather than a `Memory`, because §2.5's pool attribute is a KIND (D-1) and
-//     a kind cannot be inferred from an address the kernel is not allowed to
+//   - a blob region (an appended image, base resolved by the linker) and a
+//     free-RAM region (a pool or a child's destination range) are both
+//     `kind = Ram` and indistinguishable here on purpose; the difference is in
+//     what root does with them;
+//   - a Device row names a peripheral's registers and mints an `IoMemory`
+//     rather than a `Memory`, because the pool attribute is a kind (spec §2.5)
+//     and a kind cannot be inferred from an address the kernel may not
 //     interpret.
 //
-// That is why the column exists at all: everything else about a row stays the
-// build's business, and the kernel still assigns no MEANING to a Ram row.
-//
-// A MISSING OR EMPTY TABLE IS ZERO REGIONS. That is not a special case, it is
-// the ordinary reading of a section the linker script always defines and the
-// stitcher usually does not fill — which is what keeps every image built
-// without regions booting byte-identically, and the `len == 0` short-circuit
-// below is deliberately AHEAD of every header read so that a v1-era image with
+// A missing or empty table is zero regions, the ordinary reading of a section
+// the linker script always defines and the stitcher usually does not fill. The
+// `len == 0` short-circuit is ahead of every header read so that an image with
 // no table is not refused for a version it never wrote.
 //
-// WIRE LAYOUT (frozen by design 2 D-2 and REVISED by design 6 D-5, fixed-width
-// little-endian, the design-47 discipline the sosimg format follows): an 8-byte
-// header — magic `u32`, version `u16`, count `u8`, reserved `u8` — then `count`
-// rows of `{base: u64, len: u64, kind: u8, reserved × 7}`. The header's size is
-// what puts every row on an 8-byte boundary and the row's padding is what keeps
-// the NEXT one there, which is what makes the overlay below exact.
+// Wire layout (fixed-width little-endian, as the sosimg format): an 8-byte
+// header (magic `u32`, version `u16`, count `u8`, reserved `u8`), then `count`
+// rows of `{base: u64, len: u64, kind: u8, reserved x 7}`. The header's size
+// puts every row on an 8-byte boundary and the row's padding keeps the next one
+// there, which is what makes the overlay below exact.
 
-/// The region table's header: 8 bytes at the section's start.
-///
-/// UNCHANGED BY VERSION 2, and pinned so it stays that way: the version field
-/// is the first thing a reader needs, so its position is the one part of a
-/// versioned format that may never move.
+/// The region table's header: 8 bytes at the section's start. The version field
+/// is the first thing a reader needs, so its position may never move.
 struct RegionTableHeader {
     magic: UInt32,
     version: UInt16,
@@ -883,17 +653,14 @@ struct RegionTableHeader {
     reserved0: UInt8,
 }
 
-/// WHAT A REGION ROW IS (sawos design 6 D-5) — the table's kind column.
+/// A region row's kind. The two kinds are spec §2.5's pool attributes: RAM is
+/// cacheable memory a process runs in, Device is a peripheral's registers, and
+/// the kernel mints a different object kind for each (`Memory` / `IoMemory`).
 ///
-/// TWO KINDS, AND THEY ARE §2.5's TWO POOL ATTRIBUTES: RAM is cacheable memory
-/// a process runs in, Device is a peripheral's registers. The kernel mints a
-/// different OBJECT KIND for each (`Memory` / `IoMemory`), which is D-1's
-/// ruling arriving at the one place a window can enter the system.
-///
-/// Raw-backed, so a reorder cannot renumber them and the read at the boundary
-/// is `from(raw:)` — total, so an unrecognized byte is DATA the loader refuses
-/// rather than an index it trusts. Refusing is `fatal_image`, like every other
-/// malformation in this table: the build wrote it.
+/// Raw-backed, so a reorder cannot renumber them, and read at the boundary with
+/// `from(raw:)`, which is total: an unrecognized byte is data the loader
+/// refuses (`fatal_image`, since the build wrote the table) rather than an
+/// index it trusts.
 enum RegionKind: UInt8 {
     case Ram = 0,
     case Device = 1,
@@ -901,10 +668,9 @@ enum RegionKind: UInt8 {
 
 /// One row: a range, what kind of memory it is, and room to grow.
 ///
-/// **24 BYTES, SIZE-PINNED**, and the seven reserved bytes are not padding the
-/// compiler happened to add — they are declared, so the size is a decision
-/// rather than a consequence of field order. What they buy is the next column
-/// (a pool identity, an attribute finer than Ram/Device) without a version 3.
+/// 24 bytes, size-pinned. The seven reserved bytes are declared rather than
+/// compiler padding so the size is a decision; they leave room for another
+/// column (a pool identity, a finer attribute) without a version bump.
 struct RegionRow {
     base: UInt64,
     len: UInt64,
@@ -918,35 +684,29 @@ struct RegionRow {
     reserved6: UInt8,
 }
 
-// The ABI pin, on the sosimg format's own terms: a layout edit that skews these
-// stops the build here instead of misreading a table at boot. They hold on both
-// profiles, which is what the field order is arranged to make true.
+// ABI pin: a layout edit that skews these stops the build here instead of
+// misreading a table at boot. They hold on every profile.
 static_assert(sizeof<RegionTableHeader>() == 8,
               "the region table header must be exactly 8 bytes")
 static_assert(sizeof<RegionRow>() == 24,
               "a region table row must be exactly 24 bytes")
 
-/// 'S','R','G','N' as a little-endian word — "SOS regions".
+/// 'S','R','G','N' as a little-endian word, "SOS regions".
 static REGION_TABLE_MAGIC: UInt32 = 0x4E47_5253
 
-/// **VERSION 2** (sawos design 6 D-5). A loader refuses anything it does not
-/// know, on the sosimg format's terms: there is no reading of an unknown layout
-/// that is safe to guess at, and a v1 row read as a v2 one would take the next
-/// row's base as this one's kind.
-///
-/// THE KERNEL ACCEPTS EXACTLY THIS NUMBER — no v1 compatibility arm — and that
-/// is the format's own refuse-unknown rule applied to itself rather than a
-/// convenience: v1 never shipped past this tree, and the stitcher and the
-/// kernel move in one commit. The compatibility that IS kept is the one that
-/// matters to every case in the suite: an image with no table at all reads as
-/// zero regions and never reaches this comparison.
+/// The only region table version the kernel accepts. A loader refuses anything
+/// it does not know, as the sosimg format does: an unknown layout cannot be
+/// safely guessed at, and a version-1 row read as version 2 would take the next
+/// row's base as this one's kind. The stitcher and kernel are built together.
+/// An image with no table at all reads as zero regions and never reaches this
+/// comparison.
 static REGION_TABLE_VERSION: UInt16 = 2
 
 /// Overlay the header on the section's first bytes. One view construction, then
-/// an ordinary safe struct — the unsafety is confined to this line.
+/// an ordinary safe struct; the unsafety is confined to this line.
 ///
-/// `addr` is PHYSICAL, as every address the kernel holds as data is; the linear
-/// map is where the kernel reaches it (sawos design 29).
+/// `addr` is physical, as every address the kernel holds as data is; the linear
+/// map is where the kernel reaches it.
 func region_header_at(addr: UInt) unsafe -> RegionTableHeader {
     UnsafeMemory<RegionTableHeader, Normal>(hal.phys_to_virt(addr)).read()
 }
@@ -956,18 +716,17 @@ func region_row_at(addr: UInt) unsafe -> RegionRow {
     UnsafeMemory<RegionRow, Normal>(hal.phys_to_virt(addr)).read()
 }
 
-/// Parse the region table and mint one Memory per row into process `p`, queuing
-/// a boot-handle record for each.
+/// Parse the region table and mint one Memory or IoMemory per row into process
+/// `p`, queuing a boot-handle record for each.
 ///
-/// EVERY REFUSAL IS `fatal_image`, and that is the right vocabulary even though
-/// the bytes are not a process image: this table is part of the BOOT IMAGE, it
-/// was written by the build that produced this kernel, and a machine whose own
-/// boot data is malformed has nothing to run. The other failure vocabulary —
-/// `BadImage` as a status — belongs to `process_create`, where the bytes came
-/// from a region root handed over at run time.
+/// Every refusal is `fatal_image`: the table is part of the boot image, written
+/// by the build that produced this kernel, and a machine whose own boot data is
+/// malformed has nothing to run. `BadImage` as a status belongs to
+/// `process_create`, where the bytes came from a region root handed over at run
+/// time.
 ///
-/// AUDIT (design 1): NO PREEMPTION POINT. At most `MAX_MEMORIES` iterations of
-/// an O(1) body, and it runs before any thread exists.
+/// No preemption point: at most `MAX_MEMORIES + MAX_IOMEMORIES` iterations of
+/// an O(1) body, before any thread exists.
 func mint_boot_regions(p: Int) unsafe {
     let start = hal.region_table_start()
     let end = hal.region_table_end()
@@ -978,8 +737,8 @@ func mint_boot_regions(p: Int) unsafe {
     let header_len = sizeof<RegionTableHeader>() as UInt
     let row_len = sizeof<RegionRow>() as UInt
 
-    // An image built with no children has an EMPTY section, which is zero
-    // regions and not an error. This is the branch every existing case takes.
+    // An image built with no children has an empty section: zero regions, not
+    // an error.
     if len == 0 {
         return
     }
@@ -996,10 +755,9 @@ func mint_boot_regions(p: Int) unsafe {
                     header.version as UInt)
     }
     let count = (header.count as UInt)
-    // THE BOUND IS BOTH SLABS' — a row mints into one or the other by its kind,
-    // and a table larger than the two together could not be minted whichever
-    // way the kinds fell. The per-row `alloc_*` refusals below are what catch a
-    // table that is small enough overall and lopsided.
+    // The bound is both slabs' combined: a row mints into one or the other by
+    // its kind. The per-row `alloc_*` refusals below catch a table that is
+    // small enough overall but lopsided.
     if count > ((MAX_MEMORIES + MAX_IOMEMORIES) as UInt) {
         fatal_image("more boot regions than the kernel can hold", count)
     }
@@ -1010,70 +768,57 @@ func mint_boot_regions(p: Int) unsafe {
     var i: UInt = 0
     while i < count {
         let row = region_row_at(start + header_len + i * row_len)
-        // The table's fields are 64-bit on both profiles, exactly as sosimg's
-        // addresses are and for the same reason. A 32-bit kernel refuses a row
-        // it cannot address rather than narrowing one into a low address the
-        // build never meant.
+        // The table's fields are 64-bit on every profile, as sosimg's addresses
+        // are. A 32-bit kernel refuses a row it cannot address rather than
+        // narrowing one into a low address the build never meant.
         if not fits_word(row.base) || not fits_word(row.len) {
             fatal_image("boot region is past this machine's address space", i)
         }
-        // **A ROW'S BASE IS NORMALIZED TO PHYSICAL HERE, ONCE** (sawos design
-        // 29), because the rows come from two producers with two readings. A
-        // BLOB row's base is a LINKER EXPRESSION — the child section's own
-        // symbol, which is the whole point of generating the stub — so on a
-        // higher-half kernel it resolves to a link address in the high half. A
-        // destination, pool or device row's base is a literal the build wrote,
-        // already physical. `virt_to_phys` answers both: masking off bits that
-        // are not set changes nothing, so it is IDEMPOTENT on the literal rows
-        // and corrective on the linker-resolved ones. It is the identity on
-        // every MPU HAL.
+        // A row's base is normalized to physical here, once, because the rows
+        // come from two producers. A blob row's base is a linker expression
+        // (the child section's own symbol), which on a higher-half kernel is a
+        // link address in the high half; a destination, pool or device row's
+        // base is a literal the build wrote, already physical. `virt_to_phys`
+        // is idempotent on the literals and corrective on the linker-resolved
+        // ones, and the identity on a tier without a higher half.
         //
-        // It has to happen before the base is stored, not at some later
-        // dereference, because this base becomes a `Memory`/`IoMemory`
-        // capability's — a USER-VISIBLE address that root maps and hands to
-        // children, and that ends up as a grant row's bounds in hardware.
+        // This must precede storing the base, because it becomes a
+        // `Memory`/`IoMemory` capability's base: a user-visible address that
+        // root maps and hands to children and that ends up as a grant row's
+        // bounds in hardware.
         let row_base = hal.virt_to_phys(row.base as UInt)
-        // The kind is DATA the build wrote, so it is decoded rather than
-        // trusted — `from(raw:)` is total and an unknown byte stops the boot
-        // with the number in it, exactly as a bad magic does.
-        // The `return` is owed by the language rather than by the logic:
-        // `fatal_image` stops the machine but is not declared `-> Never`, so a
-        // guard's else block has to exit the scope itself.
+        // The kind is data the build wrote, so it is decoded rather than
+        // trusted: an unknown byte stops the boot with the number in it. The
+        // `return` is required by the language: `fatal_image` is not declared
+        // `-> Never`, so a guard's else block has to exit the scope itself.
         guard let kind = RegionKind.from(raw: row.kind) else {
             fatal_image("boot region has a kind this build cannot name",
                         row.kind as UInt)
             return
         }
-        // THE TAG IS THE ROW ORDINAL and nothing else — root's config is what
-        // gives it a meaning. **THE KERNEL IS THE GIVER NOBODY GAVE TO** (sawos
-        // design 4 D-2): this writes root's boot record through exactly the
-        // machinery `ProcessOp.Give` writes a child's, into root's own
-        // per-process set, so the two producers are one and the drain cannot
-        // tell them apart.
+        // The tag is the row ordinal; root's config gives it a meaning. The
+        // kernel writes root's boot record through the same machinery
+        // `ProcessOp.Give` uses for a child's, into root's own per-process set,
+        // so the drain cannot tell the two producers apart.
         if not boot_handle_room(p) {
             fatal_image("no boot-record room for the boot regions", i)
         }
-        // **TWO KINDS OF ROW, TWO KINDS OF OBJECT** (sawos design 6 D-5), and
-        // the arms are deliberately symmetrical: the same range becomes a
-        // different CAPABILITY depending on one byte the build wrote, which is
-        // the whole of what the kind column buys.
+        // Two kinds of row, two kinds of object: the same range becomes a
+        // different capability depending on the kind byte the build wrote.
         match kind {
             case Ram -> {
                 let slot = alloc_memory()
                 if slot == NO_MEMORY {
                     fatal_image("out of Memory slots for the boot regions", i)
                 }
-                // `refs: 1` IS THE MINT BELOW, WRITTEN AT THE SLOT (sawos
-                // design 7 D-1). A boot region is created with exactly one
-                // handle onto it, so the count starts at one rather than being
-                // incremented afterwards — a fresh slot's reference is not a
-                // change to a count, it IS the count.
-                // **A BOOT REGION IS A POOL ROOT, AND A ROOT NAMES ITSELF**
-                // (sawos design 28). This is the one place a pool is created:
-                // every other region in the system is a `Split` off one of
-                // these and carries this slot's index down the chain, which is
-                // what "return to ROOT" is made of. The ledger starts empty —
-                // nothing lent, nothing free but the cursor, nothing dropped.
+                // `refs: 1` is the mint below: a boot region is created with
+                // exactly one handle onto it, so the count starts at one.
+                //
+                // A boot region is a pool root, and a root names itself (`root:
+                // slot`). This is the one place a pool is created; every other
+                // region is a `Split` off one of these and carries this slot's
+                // index down the chain. The ledger starts empty: nothing lent,
+                // nothing free but the cursor, nothing dropped.
                 MEMORIES[slot] = MemorySlot(state: SlotState.Live, process: p,
                                             base: row_base,
                                             len: row.len as UInt,
@@ -1114,12 +859,12 @@ func mint_boot_regions(p: Int) unsafe {
     uart.write_str("\n")
 }
 
-/// Can THIS build's machine word hold `v`?
+/// Can this build's machine word hold `v`?
 ///
-/// `imgformat.fits_target_word` says the same thing about a sosimg field; this
-/// is the region table's own copy of the question because the table is sawos's
-/// format rather than the shared image format, and the two must be free to
-/// version apart. It folds to a constant `true` on a 64-bit profile.
+/// `imgformat.fits_target_word` answers the same question for a sosimg field;
+/// this copy exists because the region table is sawos's format, not the shared
+/// image format, and the two must be free to version apart. It folds to a
+/// constant `true` on a 64-bit profile.
 func fits_word(v: UInt64) -> Bool {
     if sizeof<UInt>() >= 8 {
         return true
@@ -1134,40 +879,34 @@ func fits_word(v: UInt64) -> Bool {
 /// Reify a user-mode program as a Process with one Thread, mint its boot handle
 /// set, and run it. Never returns.
 ///
-/// THE ONLY WAY INTO USER MODE FOR THE FIRST PROCESS. The loader reaches it with
-/// a root image's entry and region; the harness kernels that grant a
-/// hand-written payload its own bytes reach it with theirs. A CHILD does not
-/// come through here — `ProcessOp.Start` makes a thread and lets the scheduler
-/// pick it up, because by then there is a scheduler to return to and a process
-/// already running that must not be displaced.
+/// The only way into user mode for the first process. The loader reaches it
+/// with a root image's entry and region; harness kernels that grant a
+/// hand-written payload its own bytes reach it with theirs. A child does not
+/// come through here: `ProcessOp.Start` makes a thread and lets the scheduler
+/// pick it up.
 ///
-/// `let p = ROOT_PROCESS` IS STILL EXACTLY RIGHT with two process slots, and the
-/// comment is the point of this line: the kernel loads exactly ONE image (§12),
-/// it lands in slot 0, and every later process is created by root through
-/// `process_create` — which allocates its own slot. This is not a
-/// one-process leftover; it is the statement that root is process 0.
+/// `p = ROOT_PROCESS`: the kernel loads exactly one image (spec §12), it lands
+/// in slot 0, and every later process is created by root through
+/// `process_create`.
 ///
 /// The three handles are minted in an order the boot ABI depends on: System
-/// first, so that it comes out as `ROOT_SYSTEM_HANDLE` and the register the
-/// program receives means what §12 says it means. The other two are not passed
-/// anywhere — the program asks for them — so their numbers are the kernel's
-/// business and stay that way. THE BOOT REGIONS COME AFTER ALL THREE, for the
-/// same reason and in the same spirit: they are collected rather than passed
-/// (`ProcessOp.BootHandleNext`), so the entry register stays one handle wide.
+/// first, so it comes out as `ROOT_SYSTEM_HANDLE`, the register the program
+/// receives (spec §12). The other two are not passed anywhere; the program asks
+/// for them. The boot regions come after all three: they are collected
+/// (`ProcessOp.BootHandleNext`) rather than passed, so the entry register stays
+/// one handle wide.
 ///
-/// `rw_base`/`rw_top` DEFAULT TO NONE, and that default is the right answer
-/// rather than a convenience: the harness kernels that grant a hand-written
-/// payload its own bytes grant them read+execute, so those processes have
-/// nowhere the kernel may write and should be told so if they ask. Only the
-/// loader, which grants a data segment and a stack, passes a window.
+/// `rw_base`/`rw_top` default to none: harness payloads are granted
+/// read+execute only, so the kernel may write nowhere in them and should say so
+/// if asked. Only the loader, which grants a data segment and a stack, passes a
+/// window.
 public func start_process(entry: UInt, stack_top: UInt,
                           region_base: UInt, region_top: UInt,
                           rw_base: UInt = 0, rw_top: UInt = 0) unsafe -> Never {
     let p: Int = ROOT_PROCESS
 
-    // FIELD BY FIELD RATHER THAN A WHOLE-SLOT LITERAL, because the GRANT RECORD
-    // is already there: the loader records root's rows as it places them, and a
-    // struct literal here would erase them on the way past.
+    // Field by field rather than a whole-slot literal: the loader has already
+    // recorded root's grant rows, and a struct literal would erase them.
     PROCESSES[p].state = ProcessState.Running
     PROCESSES[p].entry = entry
     PROCESSES[p].stack_top = stack_top
@@ -1178,42 +917,33 @@ public func start_process(entry: UInt, stack_top: UInt,
     PROCESSES[p].exit_kind = ProcessStatusKind.Running
     PROCESSES[p].exit_code = 0
     PROCESSES[p].refs = 0
-    // **THE COLUMNS OPEN AT ZERO** (sawos design 16). Root is reified HERE
-    // rather than through `process_create`, so its columns are zeroed here too —
-    // and the number that matters is what the zero MEANS: the boot-door traps a
-    // harness kernel takes before this line are unattributed by `ktrap`, so
-    // nothing has been counted against slot 0 yet and this is a statement rather
-    // than a discard. It clears root's ROW of the shared region since M5 unit 7
-    // (sawos design 37) — one storage, so this is the same statement it always
-    // was, written where the storage now is.
+    // The trap columns open at zero. Root is reified here rather than through
+    // `process_create`, so its row of the stats region is cleared here.
+    // Boot-door traps a harness kernel takes before this line are unattributed
+    // by `ktrap`, so nothing has been counted against slot 0 yet.
     stats_clear(p)
 
-    // **THE LEDGER OPENS BEFORE THE FIRST MINT** (sawos design 7 D-3), because
-    // `mint_handle` consults the handle row and a slot with no limits installed
-    // can allocate nothing. Root's rows are `QUOTA_UNLIMITED` — root is init and
-    // its policy cap IS the machine, so the SLAB is what refuses it — with the
-    // one exception the mapping row is: it is clamped to the rows root's domain
-    // still has after the loader spent its image's, which is what makes
-    // `install_row`'s kernel-bug `fatal` unreachable.
-    //
-    // The loader has already recorded root's grant rows by this line, which is
-    // why the free-row count can be read here at all.
+    // The ledger opens before the first mint, because `mint_handle` consults
+    // the handle row and a slot with no limits installed can allocate nothing.
+    // Root's rows are `QUOTA_UNLIMITED` (root is init and the slab is what
+    // refuses it) except the mapping row, which is clamped to the rows root's
+    // domain still has after the loader spent its image's. That is what makes
+    // `install_row`'s kernel-bug `fatal` unreachable. The loader has already
+    // recorded root's grant rows, so the free-row count can be read here.
     install_quota_limits(p, true,
                          (hal.GRANT_ROW_BUDGET as Int) - PROCESSES[p].grant_count)
 
-    // §12's ORDER IS THE CONTRACT and it is unchanged by design 3: these three
-    // are minted into a virgin table, so each lands at generation 0 and D-1's
-    // rule makes its word the bare index — 1 = System, 2 = Process, 3 = Thread,
-    // exactly what root and the hand-assembled payloads have always been handed.
-    // The two that are not passed anywhere are minted so that root's own Process
-    // and its main Thread OCCUPY those indices; nothing reads the words back
-    // (`ProcessSelf` and `ThreadSelf` mint their own now, D-4), which is why
-    // neither is bound to a name here.
+    // Spec §12's order is the contract: the three are minted into a virgin
+    // table, so each lands at generation 0 and its word is the bare index (1 =
+    // System, 2 = Process, 3 = Thread). The Process and Thread handles are
+    // minted so root's own Process and main Thread occupy those indices;
+    // nothing reads the words back (`ProcessSelf` and `ThreadSelf` mint their
+    // own), so neither is bound to a name.
     let system = mint_handle(p, ObjType.System, root_system_rights(), 0)
     let _ = mint_handle(p, ObjType.Process, process_rights(), p)
-    // ROOT'S OWN PROCESS HANDLE IS A REFERENCE TO ROOT'S SLOT, counted like any
-    // other (sawos design 7 D-1). It is what makes root's count start at one
-    // rather than at zero, and the teardown's own check is what reads it back.
+    // Root's own Process handle is a reference to root's slot, counted like any
+    // other. It makes root's count start at one, and the teardown's check reads
+    // it back.
     PROCESSES[p].refs = PROCESSES[p].refs + 1
 
     let main = alloc_thread()
@@ -1234,20 +964,20 @@ public func start_process(entry: UInt, stack_top: UInt,
 
     mint_boot_regions(p)
 
-    // The domain this process runs under is INSTALLED, and the scheduler is
-    // told so: the boot path grants directly (the loader recorded the rows as
-    // it placed the segments), so the first switch must not reload what is
-    // already live. A harness kernel that programmed `prot_*` itself records no
-    // rows, and with one process the comparison never comes up again.
+    // The domain this process runs under is installed and the scheduler is told
+    // so: the boot path grants directly, so the first switch must not reload
+    // what is already live. A harness kernel that programmed `prot_*` itself
+    // records no rows, and with one process the comparison never comes up
+    // again.
     LAST_PROT_PROCESS = p
 
-    // THE HANDOVER MARKER — the last thing the kernel says on its own
-    // initiative, and the line a transcript reads everything after as the
-    // PROCESS's. See `Console` for the protocol it announces.
+    // The handover marker: the last thing the kernel says on its own
+    // initiative, after which a transcript reads everything as the process's.
+    // See `Console`.
     console().write_str("SOS: console handover\n")
 
     hal.frame_init(frame_slot(main), entry, stack_top, system)
     // `resume_frame` is `-> Never`: it enters the process and the kernel is
-    // only ever re-entered through a trap. That is this function's divergence.
+    // only re-entered through a trap. That is this function's divergence.
     hal.resume_frame(frame_slot(main))
 }

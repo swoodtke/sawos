@@ -1,11 +1,11 @@
-//! THE THREAD TABLE, THE FRAME ARENA AND THE READY QUEUE — a thread's STATE,
+//! The thread table, the frame arena and the ready queue: a thread's state,
 //! held below everything that acts on it.
 //!
-//! What is NOT here is the SWITCH (`sched`) and the exit (`sched` again,
-//! because retiring the last thread ends the process): this module is the
-//! storage and the queue discipline, so the seams that wake a thread — a
-//! waiter's delivery, a timer's expiry — can push one onto the ready queue
-//! without reaching for the scheduler that will pick it up.
+//! The switch (`sched`) and the exit (`sched` again, because retiring the last
+//! thread ends the process) are not here. This module is the storage and the
+//! queue discipline, so the seams that wake a thread (a waiter's delivery, a
+//! timer's expiry) can push one onto the ready queue without reaching for the
+//! scheduler that will pick it up.
 
 import hal
 
@@ -21,106 +21,88 @@ import kcore.mem.{align_up}
 import kcore.slab.{Slab}
 
 // =============================================================================
-// Processes, threads and the scheduler (design 178 D2/D3/D4; spec §2, §7, §8)
+// Threads and the scheduler (spec §2, §7, §8)
 // =============================================================================
 //
-// THE TRAP FRAME IS THE THREAD CONTEXT, and that one decision is most of this
-// unit. A thread's saved registers are the frame the HAL's trap entry writes on
-// the way in and reads on the way out; a thread SWITCH is therefore not a
-// separate save/restore at all — it is `ktrap` returning a DIFFERENT frame
-// address than it was called with. Entering user mode for the first time is the
-// same operation with a frame nothing has run in yet. Two seam calls carry the
-// whole of it: `hal.frame_init` builds a fresh context, `hal.resume_frame`
-// enters one, and the trap entry's ordinary return path does every switch after
-// that.
+// The trap frame is the thread context. A thread's saved registers are the
+// frame the HAL's trap entry writes on the way in and reads on the way out, so
+// a thread switch is not a separate save/restore: it is `ktrap` returning a
+// different frame address than it was called with. Entering user mode for the
+// first time is the same operation with a frame nothing has run in yet. Two
+// seam calls carry it: `hal.frame_init` builds a fresh context and
+// `hal.resume_frame` enters one.
 //
-// WHERE A SWITCH CAN HAPPEN is design 178's D2, and the frame model is what
-// makes it free: the only place a frame address is chosen is the user-return
-// boundary, because that is the only place `ktrap` returns. The kernel is never
-// preempted, holds no lock, and has no half-saved context to protect — the
-// state a switch reads is a table, and the tick that motivates one only sets a
-// flag.
+// The only place a frame address is chosen is the user-return boundary, because
+// that is the only place `ktrap` returns. The kernel is never preempted and
+// holds no lock; the state a switch reads is a table, and the tick that
+// motivates a switch only sets a flag.
 //
-// THE PROTECTION-DOMAIN RELOAD IS NOT HERE, and its absence is deliberate
-// rather than forgotten (design 178 D4 + the M3 memory notes). Threads of one
-// process share one domain, so a same-process switch reloads nothing; the
-// reload belongs at exactly one point — `kcore.sched`'s `pick_next`, where the
-// outgoing and incoming threads' PROCESSES are both in hand — and sawos design
-// 2 D-5 installed it there and nowhere else. Whether that reload is a register
-// file or a table root is the HAL's business, which is why this paragraph can
-// say it without naming either. What DOES live here is the one word the
-// scheduler compares against: `LAST_PROT_PROCESS`, below, beside the rest of
-// the state a switch reads.
+// The protection-domain reload is not here. Threads of one process share one
+// domain, so a same-process switch reloads nothing; a switch that changes
+// process reloads in `kcore.sched`'s `run_thread`, where the incoming thread's
+// process is in hand, and `kcore.process.domain_changed` reloads after an edit
+// to the running process's record. What lives here is the one word they compare
+// against, `LAST_PROT_PROCESS`, beside the rest of the state a switch reads.
 
-/// EXTENT 0's frames: every compiled thread's saved context, back to back.
+/// Extent 0's frames: every compiled thread's saved context, back to back.
 ///
-/// All-zero, so it costs no image bytes (design 149) — and a zeroed frame is
-/// also the right initial state, since `frame_init` only has to write the three
-/// or four words that are not zero.
+/// All-zero, so it costs no image bytes; a zeroed frame is also the right
+/// initial state, since `frame_init` only writes the few words that are not
+/// zero.
 ///
-/// It stays a bare array rather than becoming part of `THREADS` (sawos design
-/// 34), and `frame_slot` below says why: the alignment is load-bearing, and a
-/// `Slab`'s inline array cannot promise it.
+/// It is a bare array rather than part of `THREADS`; `frame_slot` below says
+/// why (the alignment is load-bearing, and a `Slab`'s inline array cannot
+/// promise it).
 unsafe static var THREAD_FRAMES: [UInt64; FRAME_ARENA_WORDS] = [0; FRAME_ARENA_WORDS]
 
 /// The address of thread slot `index`'s frame.
 ///
-/// # THE CONTEXT-SWITCH PATH, AND WHY IT IS SHAPED LIKE THIS
+/// # The context-switch path
 ///
-/// **THIS IS THE READ THE TRAP PATH MAKES WITH INTERRUPTS IMPLIED OFF.** Every
-/// context switch in the system is `kcore.sched.run_thread` calling this and
-/// `ktrap` returning the answer; the HAL's trap entry then resumes that frame.
-/// M5 unit 6 (design 32) declined to convert THREADS for exactly this reason,
-/// and unit 6a converts it under the rule that this function's hot arm must stay
-/// the arithmetic it was.
+/// This is the read the trap path makes with interrupts implied off. Every
+/// context switch is `kcore.sched.run_thread` calling this and `ktrap`
+/// returning the answer; the HAL's trap entry then resumes that frame. The
+/// floor arm must stay plain arithmetic.
 ///
-/// **THE FLOOR ARM IS BYTE-FOR-BYTE THE OLD FUNCTION.** `index < MAX_THREADS` is
-/// every thread on a machine that never donates — which is every case in the
-/// suite — and that arm is the same `align_up` plus multiply-add it has always
-/// been, now behind one compare against a compile-time constant. No walk, no
-/// memory read of the extent table, no branch on donated state.
+/// The floor arm: `index < MAX_THREADS` covers every thread on a machine that
+/// never donates. It is an `align_up` plus a multiply-add behind one compare
+/// against a compile-time constant, with no walk and no read of the extent
+/// table.
 ///
-/// **THE DONATED ARM IS ONE BOUNDED WALK AND NO MORE.** `THREADS.locate` is at
-/// most `MAX_SLAB_EXTENTS` (4) iterations of an O(1) body over the same table
-/// the slot lookup uses, and the address is then a multiply-add on the side-arena
-/// base recorded in that same row. AUDIT (design 1): no preemption point, and
-/// none possible — the body allocates nothing, can fault on nothing (the extent
-/// was validated and zeroed before it was installed, and donation is permanent
-/// so a base is never retired), and takes no lock. The bound is finite because
-/// extents are finitely many.
+/// The donated arm is one bounded walk. `THREADS.locate` is at most
+/// `MAX_SLAB_EXTENTS` iterations of an O(1) body over the same table the slot
+/// lookup uses, and the address is then a multiply-add on the side-arena base
+/// recorded in that same row. It takes no preemption point and needs none: it
+/// allocates nothing, takes no lock, and cannot fault (the extent was validated
+/// and zeroed before it was installed, and donation is permanent so a base is
+/// never retired).
 ///
-/// **THE ONE THING THAT COULD DISAGREE IS MADE UNABLE TO.** Slot `i`'s frame and
-/// slot `i`'s storage come from ONE `locate` answer — the same extent, the same
-/// offset — so a donated thread cannot read another thread's frame however the
-/// chain was built. That is what `Slab.ext_side` is for, and it is why the frame
-/// base is a COLUMN of the extent table rather than a parallel array.
+/// Slot `i`'s frame and slot `i`'s storage come from one `locate` answer (the
+/// same extent, the same offset), so a donated thread cannot read another
+/// thread's frame. That is why the frame base is a column of the extent table
+/// (`Slab.ext_side`) rather than a parallel array.
 ///
-/// # WHY THE FRAME IS NOT A FIELD OF `ThreadSlot`
+/// # Why the frame is not a field of `ThreadSlot`
 ///
-/// The obvious conversion — fold the frame into the slot, let the plain chain
-/// carry both — is UNSOUND, and the reason is three instructions deep in one
-/// profile's trap entry: its user-return path loads the frame address INTO THE
-/// STACK POINTER, so a frame IS that register and must carry its alignment.
-/// That is what `THREAD_FRAME_STRIDE % 16 == 0` in `kcore.limits` has always
-/// been about, and the static_assert beside it is the statement of record.
+/// Folding the frame into the slot is unsound. The trap entry's user-return
+/// path loads the frame address into the stack pointer, so a frame must carry
+/// that register's alignment (`THREAD_FRAME_STRIDE % 16 == 0` in
+/// `kcore.limits`, with a static_assert). A fattened `ThreadSlot` would be
+/// `sizeof(ThreadSlot) + THREAD_FRAME_STRIDE` bytes at `alignof(Int)`; on some
+/// targets that is a multiple of 16 and on others it is 8 mod 16, so every
+/// other frame would be misaligned, silently on a target that does not check.
+/// Saw has no alignment attribute to pin a struct, and no padding fixes both at
+/// once because the header sizes differ in parity. So the arena stays
+/// separately aligned, at the stride.
 ///
-/// A fattened `ThreadSlot` would be `sizeof(ThreadSlot) + THREAD_FRAME_STRIDE`
-/// bytes at `alignof(Int)`. On one profile that is 592, a multiple of 16, so it
-/// would have passed; on the other it is 552, which is 8 mod 16, so every other
-/// frame would have been misaligned — ON THE PROFILE THAT DOES NOT CHECK.
-/// Saw has no alignment attribute to pin a struct with, and no padding makes a
-/// struct a multiple of 16 on both profiles at once (the two headers are 40 and
-/// 80 bytes, so the parity the padding must fix is opposite on each). So the
-/// arena stays separately aligned, at the stride, exactly as it always was.
+/// # The second funnel
 ///
-/// **THE SECOND FUNNEL, NAMED** (sawos designs 29 + 32). `Slab.extent_addr` is
-/// the funnel for donated SLOTS; this is the funnel for donated FRAMES, and it
-/// is the only other place in the kernel where a stored physical base becomes a
-/// kernel-dereferenced address. `ext_side[e]` stays PHYSICAL — a base is
-/// addresses-as-data — and the `hal.phys_to_virt` below is the moment of
-/// dereference, which is design 29's whole discipline. Getting this wrong is a
-/// hard fault on a translating profile and INVISIBLE on an MPU one, which is
-/// precisely what 029's rebase note warned the next unit about.
+/// `Slab.extent_addr` is the funnel for donated slots; this is the funnel for
+/// donated frames, and the only other place where a stored physical base
+/// becomes a kernel-dereferenced address. `ext_side[e]` stays physical (a base
+/// is address-as-data) and the `hal.phys_to_virt` below is the moment of
+/// dereference. A missed conversion is a hard fault on a translating target and
+/// invisible on the others.
 public(package) func frame_slot(index: Int) unsafe -> UInt {
     let stride = THREAD_FRAME_STRIDE as UInt
     if index < MAX_THREADS {
@@ -133,24 +115,15 @@ public(package) func frame_slot(index: Int) unsafe -> UInt {
 
 /// What a thread slot is doing (spec §8).
 ///
-/// `Exited` is a state a slot STAYS IN rather than a transition to `Free`,
+/// `Exited` is a state a slot stays in rather than a transition to `Free`,
 /// because a join arriving after the exit must still find the exit code. The
-/// slot returns to the pool at PROCESS TEARDOWN and at no earlier moment —
-/// `end_process` holds the one loop that ever writes `Free` — and that is a
-/// ruling rather than a gap: a Thread carries no reference count on purpose (sawos
-/// design 7 D-1, argued at `ThreadSlot` below), because the join/exit protocol
-/// already owns the slot's lifetime on terms a handle count cannot express.
-/// `RELEASE_OP` therefore destroys a Thread HANDLE and never a thread; reaping
-/// a slot earlier would want a close op, which does not exist for any kind.
-///
-/// **THIS PARAGRAPH USED TO END "…which is also why handles carry no generation
-/// yet", AND THAT HAS BEEN FALSE SINCE M3.** Handle words have carried an
-/// index/generation split since sawos design 3 D-1 (`kernel/abi/`'s
-/// `HANDLE_INDEX_BITS`), every countable kind's slot is reused, and §3's
-/// stale-handle detection has had plenty to detect ever since — including for
-/// Thread handles, whose slots outlive nothing but are freed wholesale at a
-/// teardown and handed to the next process. The state machine's own shape is
-/// unchanged; only the pre-M3 reason attached to it was.
+/// slot returns to the pool at process teardown and at no earlier moment:
+/// `end_process` holds the one loop that ever writes `Free`. A Thread carries
+/// no reference count (argued at `ThreadSlot` below), so `RELEASE_OP` destroys
+/// a Thread handle and never a thread; reaping a slot earlier would need a
+/// close op, which does not exist for any kind. Slots freed at teardown are
+/// handed to the next process, so stale-handle detection (§3) applies to Thread
+/// handles as to every other kind.
 public(package) enum ThreadState: UInt8 {
     case Free = 0,
     case Created = 1,
@@ -162,90 +135,77 @@ public(package) enum ThreadState: UInt8 {
 
 /// One thread (spec §2 table row).
 ///
-/// `link` is the ONE list pointer a thread needs, because a thread is on at
+/// `link` is the one list pointer a thread needs, because a thread is on at
 /// most one list at a time: the ready queue when it is runnable, or the joiner
 /// list of the thread it is waiting for when it is blocked. Slot indices are
-/// stored PLUS ONE so that zero means "no thread", which is what a zeroed
+/// stored plus one so that zero means "no thread", which is what a zeroed
 /// static already says.
 ///
-/// **THERE IS NO `refs` FIELD HERE, AND ITS ABSENCE IS A DECISION** (sawos
-/// design 7 D-1). Every other countable kind gained one; a Thread did not,
-/// because the JOIN/EXIT PROTOCOL already owns a thread slot's lifetime and it
-/// owns it on terms a handle count cannot express. `ThreadState.Exited` is a
-/// state a slot STAYS IN so that a join arriving after the exit still finds the
-/// exit code — a reader that holds no handle and is not counted anywhere — and
-/// the joiner list is a second such claim on the slot. Folding those into a
-/// reference count is real design (what is a joiner worth? what does a
-/// zero-reference `Exited` slot owe a join that has not arrived?) with no
-/// current payoff, since nothing yet runs out of thread slots before its
-/// process ends. So the slot comes back at the teardown exactly as it always
-/// has, the QUOTA row for threads is charged and only ever credited there, and
-/// this paragraph is the record that the question was asked and deferred.
+/// There is no `refs` field, on purpose. The join/exit protocol already owns a
+/// thread slot's lifetime on terms a handle count cannot express.
+/// `ThreadState.Exited` is a state a slot stays in so that a join arriving
+/// after the exit still finds the exit code (a reader that holds no handle and
+/// is not counted anywhere), and the joiner list is a second such claim on the
+/// slot. Folding those into a reference count raises questions (what is a
+/// joiner worth, what does a zero-reference `Exited` slot owe a join that has
+/// not arrived) with no payoff, since nothing runs out of thread slots before
+/// its process ends. The slot comes back at teardown, and the thread quota row
+/// is charged and only credited there.
 public(package) struct ThreadSlot {
-    /// `public(package)` because PARKING A THREAD HAPPENS OUTSIDE THIS MODULE
-    /// since the split: `waitables` blocks one on a Waiter's list. The state
-    /// machine is still described here and nowhere else.
+    /// `public(package)` because parking a thread happens outside this module:
+    /// `waitables` blocks one on a Waiter's list. The state machine is
+    /// described here and nowhere else.
     public(package) state: ThreadState,
     public(package) process: Int,
-    // (`self_handle` WAS HERE and is GONE — sawos design 3 D-4. It cached the
-    // word `ThreadSelf` handed back, which was a fact about the thread only
-    // while a getter answered the same handle every ask. Mint-per-call makes a
-    // thread's own handle a capability INSTANCE the caller owns and may release,
-    // so there is no single word to cache and a cached one would go stale at the
-    // first release. `ProcessSlot.self_handle` went with it.)
     public(package) exit_code: UInt,
-    /// Head of the list of threads blocked joining THIS one (slot + 1).
+    /// Head of the list of threads blocked joining this one (slot + 1).
     public(package) joiners: Int,
     /// Next slot on whichever list this thread is on (slot + 1).
     /// `public(package)`: the list a parked thread is on may be a Waiter's,
     /// which `waitables` owns.
     public(package) link: Int,
-    /// Where a PARKED THREAD wants its answer written — a user address, ALREADY
-    /// VALIDATED by `copy_out_check` at the call. Validating at the call rather
-    /// than at the wake is what makes a bad buffer terminate the process that
-    /// supplied it, while it is still the running one.
-    /// `public(package)` because the wait side is what sets it, at the park.
+    /// Where a parked thread wants its answer written: a user address, already
+    /// validated by `copy_out_check` at the call. Validating at the call rather
+    /// than at the wake makes a bad buffer terminate the process that supplied
+    /// it while it is still the running one. `public(package)` because the wait
+    /// side sets it, at the park.
     ///
-    /// **TWO PARKS USE IT SINCE M4 UNIT 3.5** (sawos design 17) and the field is
-    /// still one field, because a thread is inside at most one syscall: a
-    /// `Waiter.Wait` writes a wait RECORD here, and a fused `PipeInlet.Call`
-    /// writes the REPLY BODY here. Both are "the buffer this park will answer
-    /// into", both were checked while the caller was running, and which one it
-    /// is is said by the two fields below rather than by a second address.
+    /// Two parks use it, and it is one field because a thread is inside at most
+    /// one syscall: a `Waiter.Wait` writes a wait record here, and a fused
+    /// `PipeInlet.Call` writes the reply body here. Both are the buffer this
+    /// park will answer into, both were checked while the caller was running,
+    /// and `call_pipe` / `call_claim` say which one it is.
     public(package) wait_buf: UInt,
-    /// **THE FUSED CALL'S ROOM PARK: which connection this thread is waiting
-    /// for space on** (slot + 1; 0 = it is not), sawos design 17.
+    /// The fused call's room park: which connection this thread is waiting for
+    /// space on (slot + 1; 0 = it is not).
     ///
-    /// `PipeInletOp.Call` never answers `WouldBlock` — design 10 ruling 8's
-    /// level, reached from inside the op — so a full ring parks the caller
-    /// here, and the room the next settle makes is what resumes it. EXACTLY ONE
+    /// `PipeInletOp.Call` never answers `WouldBlock`, so a full ring parks the
+    /// caller here, and the room the next settle makes resumes it. Exactly one
     /// of this field and `call_claim` is non-zero while a thread is inside a
     /// `Call`, and the pair names which of the two things it is waiting for.
     public(package) call_pipe: Int,
-    /// **THE FUSED CALL'S REPLY PARK: which exchange this thread's answer is
-    /// coming from** (exchange + 1; 0 = it is not waiting for one).
+    /// The fused call's reply park: which exchange this thread's answer is
+    /// coming from (exchange + 1; 0 = it is not waiting for one).
     ///
-    /// **IT IS THE CLAIM ITSELF, NOT A NOTE ABOUT ONE.** A fused call mints no
-    /// `PipeReply` handle (design 10 ruling 4's rider: zero handle traffic on
-    /// the fast path), so the parked THREAD is what holds the exchange's reply
-    /// column open — one reference, taken at the stage and dropped at the wake.
-    /// `PIPE_CALLER` is the same fact indexed the other way, which is what lets
-    /// a settling exchange find the thread without a scan.
+    /// It is the claim itself, not a note about one. A fused call mints no
+    /// `PipeReply` handle, so the parked thread is what holds the exchange's
+    /// reply column open: one reference, taken at the stage and dropped at the
+    /// wake. `Exchange.caller` is the same fact indexed the other way, which
+    /// lets a settling exchange find the thread without a scan.
     public(package) call_claim: Int,
-    /// The request body's address in the caller's memory, and its length —
-    /// live only while `call_pipe` is set.
+    /// The request body's address in the caller's memory, and its length; live
+    /// only while `call_pipe` is set.
     ///
-    /// A ROOM-PARKED CALL HAS NOT STAGED ANYTHING YET, so the message is still
-    /// where the caller put it and the resume has to copy it then. The address
-    /// went through `copy_in_check` at the call, while the caller was running,
-    /// which is what makes the later copy unable to fail.
+    /// A room-parked call has not staged anything yet, so the message is still
+    /// where the caller put it and the resume copies it then. The address went
+    /// through `copy_in_check` at the call, while the caller was running, which
+    /// is what makes the later copy unable to fail.
     public(package) call_src: UInt,
     public(package) call_len: UInt,
 }
 
-/// **AN EXTENT CHAIN SINCE M5 UNIT 6a** (sawos design 34), with the frame arena
-/// riding the extent table's side column — see `frame_slot`. `THREADS[i]` names
-/// what it always named; the loop bounds below read `capacity()`.
+/// The thread slab: an extent chain, with the frame arena riding the extent
+/// table's side column (see `frame_slot`). Loop bounds read `capacity()`.
 public(package) unsafe static var THREADS: Slab<ThreadSlot, MAX_THREADS> = Slab<ThreadSlot, MAX_THREADS>(
     inline: [ThreadSlot(state: ThreadState.Free, process: 0,
                         exit_code: 0, joiners: 0, link: 0, wait_buf: 0,
@@ -259,17 +219,15 @@ public(package) unsafe static var THREADS: Slab<ThreadSlot, MAX_THREADS> = Slab<
 
 /// The running thread's slot, or `NO_THREAD`.
 ///
-/// It really is none before the first process exists, and it stays none for the
-/// harness kernels that enter user mode without one — those cases predate
-/// Thread objects and must go on working, which is what every `NO_THREAD` guard
-/// below is for. Compound global state on design 149's terms: uniprocessor
-/// kernel, interrupts taken from user mode only (D2), so the only writer is the
-/// trap path and nothing can interleave with it.
+/// It is none before the first process exists, and stays none for the harness
+/// kernels that enter user mode without one; every `NO_THREAD` guard below is
+/// for those. Uniprocessor kernel with interrupts taken from user mode only, so
+/// the only writer is the trap path and nothing can interleave with it.
 public(package) unsafe static var CURRENT_THREAD: Int = NO_THREAD
 
 /// The ready queue: a FIFO of runnable threads, head and tail as slot + 1.
-/// The RUNNING thread is not on it — round-robin is "put the outgoing thread
-/// at the tail, take the head", and both halves happen in `pick_next`.
+/// The running thread is not on it: round-robin puts the outgoing thread at the
+/// tail and takes the head, and both halves happen in `pick_next`.
 public(package) unsafe static var READY_HEAD: Int = 0
 
 public(package) unsafe static var READY_TAIL: Int = 0
@@ -282,26 +240,23 @@ public(package) unsafe static var NEED_RESCHED: Bool = false
 public(package) unsafe static var SLICE_LEFT: UInt = 0
 
 /// Ticks a thread runs before the timer takes the processor away (spec §7's
-/// fixed timeslice). ONE tick, because M2's tick period is already the unit the
-/// scheduler cares about and a longer slice would only make the preemption
-/// harness wait for it.
+/// fixed timeslice). One tick, since the tick period is already the unit the
+/// scheduler cares about.
 public(package) static SLICE_TICKS: UInt = 1
 
-/// Whose protection domain is CURRENTLY INSTALLED in the hardware, or
-/// `NO_PROCESS` when none is (sawos design 2 D-5).
+/// Whose protection domain is currently installed in the hardware, or
+/// `NO_PROCESS` when none is.
 ///
-/// THE ONE WORD THAT MAKES THE RELOAD CHEAP. A switch between two threads of one
-/// process must reload nothing — that is every switch every M2 case makes, and
-/// keeping it free is what keeps the shipped transcripts untouched — so the
-/// scheduler compares the incoming thread's process against this and does the
-/// work only when they differ. It is set by whoever installs a domain, which is
-/// the boot path (through `start_process`) and `kcore.sched`'s reload, and
-/// INVALIDATED when a process is torn down, so a slot reused by a later child
-/// can never inherit the dead one's map by number.
+/// This word makes the reload cheap. A switch between two threads of one
+/// process must reload nothing, so the scheduler compares the incoming thread's
+/// process against this and reloads only when they differ. It is set by whoever
+/// installs a domain (`load_domain`, and the boot path through
+/// `start_process`) and invalidated when a process is torn down, so a
+/// slot reused by a later child can never inherit the dead one's map by number.
 ///
 /// It lives here rather than beside the reload because it is scheduler state in
-/// exactly the sense `CURRENT_THREAD` is, and because `process` — which is below
-/// the scheduler — has to write it at boot.
+/// the sense `CURRENT_THREAD` is, and because `process`, which is below the
+/// scheduler, has to write it at boot.
 public(package) unsafe static var LAST_PROT_PROCESS: Int = NO_PROCESS
 
 // -----------------------------------------------------------------------------
@@ -332,29 +287,18 @@ public(package) func ready_pop() unsafe -> Int {
     slot
 }
 
-/// Take every thread of process `p` OFF the ready queue, leaving everybody
-/// else's where they were (sawos design 2 D-6).
+/// Take every thread of process `p` off the ready queue, leaving everybody
+/// else's where they were.
 ///
-/// THIS IS WHAT REPLACED `READY_HEAD = READY_TAIL = 0` in the teardown, and the
-/// zeroing was not a shortcut so much as a ONE-PROCESS SPELLING: with a single
-/// process every runnable thread belonged to the process that was ending, so
-/// emptying the queue and removing its threads were the same act. With two they
-/// are not, and the wholesale version would take ROOT's runnable threads away
-/// when a child died.
+/// A singly-linked walk with a trailing pointer, because `link` is the one list
+/// pointer a thread has (see `ThreadSlot`): there is no back pointer to unlink
+/// through. `READY_TAIL` follows the removal rather than being recomputed; it
+/// is wrong exactly when the removed node was the last one.
 ///
-/// A singly-linked walk with a trailing pointer, because that is what the list
-/// is — `link` is the one list pointer a thread has (see `ThreadSlot`), so
-/// there is no back pointer to unlink through and no second list to keep in
-/// step. `READY_TAIL` follows the removal rather than being recomputed: it is
-/// the only other word the queue has, and it is wrong exactly when the removed
-/// node was the last one.
-///
-/// AUDIT (design 1): NO PREEMPTION POINT. As many iterations as the thread slab
-/// is long at most (`MAX_THREADS` plus whatever a deployment donated — sawos
-/// design 34; finite because extents are finitely many and each is finitely
-/// sized), of an O(1) body — and the ready queue IS state the IRQ path writes
-/// (`ready_push` from a wake), so a delivery landing mid-walk is precisely the
-/// in-flight invariant the placement rule refuses.
+/// No preemption point: at most as many iterations as the thread slab is long
+/// (`MAX_THREADS` plus whatever was donated; finite), of an O(1) body. The
+/// ready queue is state the IRQ path writes (`ready_push` from a wake), so a
+/// delivery landing mid-walk would be an in-flight invariant.
 public(package) func ready_remove_process(p: Int) unsafe {
     // Slot + 1 throughout, matching the list's own encoding: 0 means "no node".
     var prev: Int = 0
@@ -425,9 +369,9 @@ public(package) func block_on_join(slot: Int, target: Int) unsafe {
     NEED_RESCHED = true
 }
 
-/// The calling process. In M2 that is the process of the running thread, and
-/// before there are threads it is the only process there is — the harness
-/// kernels that enter user mode with no object model still make syscalls.
+/// The calling process: the process of the running thread. Before there are
+/// threads it is process 0, the only one there is (harness kernels that enter
+/// user mode with no object model still make syscalls).
 public(package) func calling_process() unsafe -> Int {
     if CURRENT_THREAD == NO_THREAD {
         return 0

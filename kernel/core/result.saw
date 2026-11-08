@@ -1,8 +1,8 @@
-//! A SYSCALL'S ANSWER: the (status, value) pair, the third answer `blocked`,
-//! and the ONE place any of them is written into a thread's frame.
+//! A syscall's answer: the (status, value) pair, the third answer `blocked`,
+//! and the one place any of them is written into a thread's frame.
 //!
-//! Its own module because its writers sit in three different seams — the return
-//! path (`dispatch`), a thread's exit (`sched`) and a waiter's wake (`wake`) —
+//! Its own module because its writers sit in different seams (the return path
+//! in `dispatch`, a thread's exit in `sched`, deliveries and wakes in `refs`),
 //! which is the funnel `write_result` documents. A seam that can answer a
 //! syscall imports this one; nothing here imports anything.
 
@@ -10,19 +10,17 @@ import hal
 import sosabi.{SosStatus}
 
 /// What one op did: a (status, value) pair for the caller, or the news that the
-/// caller is not going to receive one YET.
+/// caller is not going to receive one yet.
 ///
-/// `blocked` is the third answer a syscall can give and it is not a failure. A
-/// thread that parks in `Join` has made no mistake and gets no status; its pair
-/// is written into its frame by whatever wakes it, exactly once. Modelling that
-/// as a field rather than as a magic status is what keeps the return path from
-/// having to know which ops can park.
+/// `blocked` is the third answer and not a failure. A thread that parks in
+/// `Join` gets no status now; its pair is written into its frame by whatever
+/// wakes it, exactly once. Modelling that as a field rather than a magic status
+/// keeps the return path from having to know which ops can park.
 public(package) struct SyscallResult {
     status: SosStatus,
     value: UInt,
-    /// Read by `ktrap` to decide whether to answer at all, which is the one
-    /// field of the three a caller of this module has any business seeing —
-    /// the pair itself is written by `write_result` and nowhere else.
+    /// Read by `ktrap` to decide whether to answer at all; the pair itself is
+    /// written by `write_result` and nowhere else.
     public(package) blocked: Bool,
 }
 
@@ -38,18 +36,14 @@ public(package) func op_status(s: SosStatus) -> SyscallResult {
     SyscallResult(status: s, value: 0, blocked: false)
 }
 
-/// A REFUSAL THAT STILL HAS SOMETHING TO SAY — a status beside a value, which is
-/// the one combination the four above cannot spell (sawos design 17, M4 unit
-/// 3.5).
+/// A refusal that still carries a value: a status beside a value, the one
+/// combination the helpers above cannot spell.
 ///
-/// **ITS ONE CALLER IS `PipeRequestOp.ReplyWait`, AND THE SHAPE IS THAT OP'S
-/// TWO CHANNELS.** A fused reply-then-wait can fail in either half, and which
-/// half it was decides what a server loop does next — recover by waiting afresh,
-/// or stop because the wait itself is broken — so the answer carries a status
-/// AND a `ReplyWaitLeg`. Everywhere else in the kernel a failed op's value
-/// register is meaningless and `op_status` says so by writing zero; here the
-/// zero is `ReplyWaitLeg.Wait`, which is exactly why that case took the number
-/// it did.
+/// It serves `PipeRequestOp.ReplyWait`. A fused reply-then-wait can
+/// fail in either half, and which half decides what a server loop does next
+/// (wait afresh, or stop because the wait itself is broken), so the answer
+/// carries a status and a `ReplyWaitLeg`. Elsewhere a failed op's value is
+/// meaningless and `op_status` writes zero; here zero is `ReplyWaitLeg.Wait`.
 public(package) func op_status_value(s: SosStatus, v: UInt) -> SyscallResult {
     SyscallResult(status: s, value: v, blocked: false)
 }
@@ -58,26 +52,26 @@ public(package) func op_blocked() -> SyscallResult {
     SyscallResult(status: SosStatus.Ok, value: 0, blocked: true)
 }
 
-/// THE ONE PLACE a syscall's answer is written into a thread's frame.
+/// The one place a syscall's answer is written into a thread's frame.
 ///
-/// A funnel rather than a rule repeated per caller, because the writers are not
-/// all on the return path: an op that PARKS is answered later, by whatever wakes
-/// it, and "later" is a different function each time. Its ENTRY POINTS, all of
-/// them:
+/// A funnel rather than a rule repeated per caller, because an op that parks is
+/// answered later by whatever wakes it. The callers include:
 ///
 ///   - `ktrap`, for an op that answered immediately;
 ///   - `exit_thread`, waking everything that joined the thread that just left;
-///   - `wake_one_waiter`, handing a ready attachment to a parked waiter (§2.2).
+///   - the wake paths in `refs` (`wake_one_waiter` handing a ready attachment
+///     to a parked waiter, §2.2; `revoke_blocked`; `wake_call_reply`;
+///     `resume_call_room`).
 ///
-/// Each writes EXACTLY ONCE for one syscall, which is the invariant the whole
-/// blocking protocol rests on: a blocked caller is skipped on the return path
-/// precisely so that its waker is the only writer, and a second write would
-/// step the saved PC twice on the profile that steps it at all.
+/// Each writes exactly once per syscall, the invariant the blocking protocol
+/// rests on: a blocked caller is skipped on the return path so that its waker
+/// is the only writer, and a second write would step the saved PC twice where
+/// the PC is stepped at all.
 ///
-/// It answers with a (status, value) pair and nothing wider. An op whose answer
-/// does not fit — `Waiter.Wait`'s record is the first — writes the rest into the
-/// caller's own memory through `copy_out` and returns a status here, which is
-/// what keeps the register convention (§5.7) the same shape it was in M1.
+/// The answer is a (status, value) pair and nothing wider. An op whose answer
+/// does not fit (`Waiter.Wait`'s record) writes the rest into the caller's own
+/// memory through `copy_out` and returns a status here (register convention,
+/// §5.7).
 public(package) func write_result(frame_addr: UInt, result: SyscallResult) unsafe {
     hal.syscall_return(frame_addr, (result.status as UInt8) as UInt,
                        result.value)

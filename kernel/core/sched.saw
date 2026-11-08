@@ -1,31 +1,19 @@
-//! THE SWITCH POINT (design 178 D2/D3) AND THE END OF A PROCESS (sawos design
-//! 2 D-5/D-6) — because with more than one process those are the same subject.
+//! The switch point, and process teardown.
 //!
-//! It is the TOP of the state seams rather than the bottom, and both reasons are
-//! in the bodies: choosing nothing to run parks the core in the idle poll
-//! (`irq`), and retiring the last thread of a process ends it. So the queue it
-//! takes from lives below in `threads`, the slabs it frees live below in
-//! `objects`/`time`/`waitables`, and the seam that decides WHEN to ask —
-//! `ktrap`'s user-return boundary — lives above in `dispatch`.
+//! This module sits above `threads`, `objects`, `time` and `waitables` and
+//! below `dispatch`. Choosing nothing to run parks the core in the idle poll
+//! (`irq`); retiring the last thread of a process ends the process. The seam
+//! that decides when to ask, `ktrap`'s user-return boundary, lives in
+//! `dispatch`.
 //!
-//! # WHY THE TEARDOWN MOVED UP HERE (sawos design 2's structural finding)
-//!
-//! `end_process` used to live in `kcore.process`, beside the slot it clears.
-//! That worked while ending a process ENDED THE MACHINE: the function had no
-//! successor to choose. Design 2's D-6 gives it one — a child's death
-//! reschedules — and a reschedule can IDLE, and idling DELIVERS, and delivery
-//! reaches back down through `wake` into `process.copy_out`. So a teardown
-//! written in `process` would be `process` importing `irq` from above it: the
-//! import cycle DF-232e diagnoses, and exactly the shape design 1 met when it
-//! tried to put a preemption point inside `mem`'s byte loops.
-//!
-//! The resolution is design 1's, applied a second time: NOTHING IS DUPLICATED
-//! AND EVERY PIECE STAYS SINGLE-SITED — the process slot and its grant record
-//! stay in `process`, the slabs stay where they are, and the one function that
-//! frees them moves to the altitude that can also say what runs next. What it
-//! costs is one more thing `process` cannot do for itself, and the copy doors
-//! pay it: they REPORT a bad buffer now and the callers above the switch point
-//! are what terminate on it (`process.saw` states that at the doors).
+//! `end_process` lives here rather than in `process` because ending a process
+//! can reschedule, rescheduling can idle, and idle delivery reaches back
+//! through `refs` into `process.copy_out`. Placing it in `process` would create
+//! an import cycle. The process slot (`pslot`), the grant-record operations
+//! (`process`) and the slabs stay where they are; only the function that frees
+//! them is here. Consequence: `process`'s copy routines report a bad buffer
+//! instead of terminating, and the callers above the switch point terminate on
+//! it.
 
 import hal
 import sosabi.{
@@ -92,7 +80,7 @@ import kcore.process.{clear_domain, load_domain, reclaim_process_slot}
 import kcore.irq.{has_external_wake_source, idle_until_runnable}
 
 // =============================================================================
-// The scheduler (design 178 D3; sawos design 2 D-5)
+// The scheduler
 // =============================================================================
 
 /// Whether the currently running thread should be left running.
@@ -103,26 +91,18 @@ func stays_running(slot: Int) unsafe -> Bool {
     }
 }
 
-/// Make `next` the running thread, RELOADING ITS PROTECTION DOMAIN if the
+/// Make `next` the running thread, reloading its protection domain if the
 /// domain in the hardware is somebody else's, and answer with its frame.
 ///
-/// **THIS IS THE MARKED POINT, OCCUPIED** (sawos design 2 D-5). The census
-/// closed the question the M2 comment left open, and both profiles closed it
-/// the same way: one has a small fixed budget of numbered protection regions
-/// that a three-segment root spends entirely, so two processes cannot share the
-/// live set; the other's grant window is a single shared user-mode permission
-/// map, so grants left installed across a switch are the other process's to
-/// touch. Same answer twice, which is why there is no per-profile branch here —
-/// `load_domain` is what differs, and it is the HAL's business.
+/// Switches within one process reload nothing. The domain is not shared across
+/// processes: each process has its own protection record, which `load_domain`
+/// (`kcore.process`) installs, replaying the rows or switching tables as the
+/// HAL advertises. So there is no per-profile branch here.
 ///
-/// SAME-PROCESS SWITCHES RELOAD NOTHING, and that is not an optimisation so
-/// much as the property that keeps every shipped transcript untouched: every
-/// switch a one-process system makes compares equal and does no work at all.
-///
-/// One helper rather than two copies because there are two ways a thread starts
-/// running — `pick_next` at the trap-return boundary, and `resume_after_death`
-/// when the thread that was running has ceased to exist — and a reload written
-/// in one of them would be missing from the other.
+/// This is one helper rather than two copies because a thread starts running
+/// in two places, `pick_next` at the trap-return boundary and
+/// `resume_after_death` after the running thread has ceased to exist. A reload
+/// written in only one of them would be missing from the other.
 func run_thread(next: Int) unsafe -> UInt {
     CURRENT_THREAD = next
     THREADS[next].state = ThreadState.Running
@@ -136,19 +116,14 @@ func run_thread(next: Int) unsafe -> UInt {
 
 /// Choose the thread to run next and return the frame to resume in.
 ///
-/// THE ONE SWITCH POINT. `ktrap` returns whatever this returns, and the HAL's
-/// trap entry resumes that frame — so every context switch in the system is
-/// this function picking a different slot, and there is no second path to keep
-/// in step. A kernel with no Thread objects at all (the harness cases that
-/// predate this unit) never has a current thread and gets its own frame back
-/// untouched.
+/// This is the only switch point. `ktrap` returns whatever this returns, and
+/// the HAL's trap entry resumes that frame, so every context switch is this
+/// function picking a different slot. A kernel with no Thread objects (the
+/// harness cases) never has a current thread and gets its own frame back.
 ///
-/// THE TWO EARLY RETURNS KEEP THE SAME THREAD, so the protection domain cannot
-/// have changed at either — which is why the reload lives at the tail, in
-/// `run_thread`, and not at the top of this function. `NO_THREAD` means no
-/// process is running at all (the harness kernels), and `stays_running` means
-/// the interrupted thread is resuming; in both cases the hardware is already
-/// programmed for whoever is about to run, because it is whoever just was.
+/// Both early returns keep the same thread, so the protection domain cannot
+/// have changed at either. That is why the reload lives at the tail, in
+/// `run_thread`, and not at the top of this function.
 public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
     let cur = CURRENT_THREAD
     if cur == NO_THREAD {
@@ -158,9 +133,9 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
         return current_frame
     }
 
-    // A thread leaving the processor while still runnable goes to the TAIL,
-    // which is the whole of round-robin. One that blocked or exited is already
-    // on the list it belongs to, or on none.
+    // A thread leaving the processor while still runnable goes to the tail
+    // (round-robin). One that blocked or exited is already on the list it
+    // belongs to, or on none.
     match THREADS[cur].state {
         case Running -> {
             THREADS[cur].state = ThreadState.Runnable
@@ -172,17 +147,14 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
 
     var next = ready_pop()
     if next == NO_THREAD {
-        // Nothing runnable, and two readings of it (see THE IDLE PATH below).
-        // With a bound IRQ line, readiness can still arrive from outside the
-        // set of runnable threads, so the kernel WAITS for it; with none, every
-        // thread is blocked on something no thread can now deliver, which is
-        // the deadlock M2 has always reported here.
-        //
-        // WITH N PROCESSES THIS KILLS THE CURRENT ONE AND RESCHEDULES, which is
-        // today's rule applied to N rather than a new one: the process whose
-        // thread just blocked is the one that cannot proceed, so it is the one
-        // that is told. The cascade ends when root dies, because that stops the
-        // machine.
+        // Nothing runnable. With a bound IRQ line or an armed Timer
+        // (`has_external_wake_source`), readiness can still arrive from outside
+        // the set of runnable threads, so the kernel waits for it in the idle
+        // path. With neither, every thread is blocked on something no thread
+        // can now deliver: a deadlock. The process whose thread just blocked
+        // is the one that cannot proceed, so it is the one terminated, and the
+        // machine reschedules. The cascade ends when root dies, which
+        // stops the machine.
         if not has_external_wake_source() {
             fault_process(THREADS[cur].process, FaultReason.Deadlock)
         }
@@ -193,31 +165,20 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
     run_thread(next)
 }
 
-/// Resume whatever should run now, after the thread that WAS running has ceased
-/// to exist. Never returns.
+/// Resume whatever should run now, after the thread that was running has
+/// ceased to exist. Never returns.
 ///
-/// This is the half of a child's teardown that `kcore.process` cannot express,
-/// and the whole reason the teardown lives in this module. It is `pick_next`'s
-/// tail without its head: there is no outgoing thread to requeue, because the
-/// outgoing thread's slot has just gone back to the pool.
+/// This is `pick_next`'s tail without its head: there is no outgoing thread to
+/// requeue, because the outgoing thread's slot has just gone back to the pool.
 ///
-/// THE NO-WAKE-SOURCE ARM ENDS ROOT, and the reasoning is worth writing down
-/// because it differs from `pick_next`'s. There, a CURRENT process exists and is
-/// the one that blocked. Here the process that was current is already gone, so
-/// there is nobody to blame — what is left is a machine whose surviving
-/// processes are all blocked on something no thread can now deliver. The report
-/// ends ROOT whoever else is in that set, which produces the same stop M2
-/// always did — and since M4 unit 5 raised `MAX_PROCESSES` to 3 the set can
-/// genuinely hold a peer, so "ends root" is a POLICY (init is what a machine
-/// stops by ending) rather than the arithmetic it used to be.
-///
-/// **AND M3 UNIT 5.5 IS WHY THIS ARM IS NOW THE UNUSUAL PATH RATHER THAN THE
-/// SUPERVISORY ONE** (sawos design 8), which is what the sentence that used to
-/// end this paragraph predicted. A root parked on its child's Process handle is
-/// woken BY the death — `end_process` notified before it started tearing down,
-/// so the `ready_pop` above finds root and this arm is never reached. What
-/// still reaches it is a root parked on something the dead child was the only
-/// possible source of, which is a genuine deadlock and is reported as one.
+/// The no-wake-source arm ends root, unlike `pick_next`, which ends the
+/// current process. Here the process that was current is already gone, so
+/// there is nobody to blame: every surviving process is blocked on something no
+/// thread can now deliver. Ending root is a policy (root is init, and ending it
+/// stops the machine), whoever else is in that set. A root parked on its
+/// child's Process handle is woken by the death (`end_process` notifies before
+/// tearing down), so `ready_pop` finds root and this arm is not reached. What
+/// does reach it is a genuine deadlock.
 func resume_after_death() unsafe -> Never {
     var next = ready_pop()
     if next == NO_THREAD {
@@ -232,12 +193,11 @@ func resume_after_death() unsafe -> Never {
 
 /// Retire the running thread with `code`, waking everything that joined it.
 ///
-/// A JOINER'S RETURN IS WRITTEN HERE, into ITS frame, which is the half of the
-/// blocking protocol that is easy to get wrong: a thread that blocks in a
+/// A joiner's return is written here, into its frame. A thread that blocks in a
 /// syscall must not have its result written when it blocks, or the resume would
 /// step over the trapping instruction twice on one profile and hand back a
-/// value nobody computed on both. So `Join` writes nothing, and the wake writes
-/// the pair exactly once.
+/// value nobody computed on both. So `Join` writes nothing, and the wake
+/// writes the result pair exactly once.
 public(package) func exit_thread(slot: Int, code: UInt) unsafe {
     THREADS[slot].state = ThreadState.Exited
     THREADS[slot].exit_code = code
@@ -252,10 +212,10 @@ public(package) func exit_thread(slot: Int, code: UInt) unsafe {
         ready_push(waiter)
     }
 
-    // The last thread out ends the process, carrying its own exit code — the
-    // ordinary way a program finishes when nobody called `Process.Exit`. For
-    // root that stops the machine; for a child `end_process` does not return
-    // here at all, because it resumes whoever runs next.
+    // The last thread out ends the process, carrying its own exit code (the
+    // ordinary way a program finishes without `Process.Exit`). For root that
+    // stops the machine; for a child `end_process` does not return here,
+    // because it resumes whoever runs next.
     let p = THREADS[slot].process
     if live_threads(p) == 0 {
         end_process(p, ProcessStatusKind.Exited, code, code)
@@ -264,85 +224,56 @@ public(package) func exit_thread(slot: Int, code: UInt) unsafe {
 }
 
 // =============================================================================
-// Process teardown (spec §2's Process row: close all handles, free what it owned)
+// Process teardown (spec §2.7: close all handles, free what it owned)
 // =============================================================================
 
-/// End process `p`. Never returns — but WHERE it does not return to is the
-/// fork this unit built (sawos design 2 D-6).
+/// End process `p`. Never returns.
 ///
-/// The teardown itself is the ratified one and it is unconditional: every handle
-/// in the process's table is closed, every thread slot and every frame it owns
-/// goes back to the kernel's pools, every Event, Waiter, Interrupt, Timer and
-/// Memory it held goes back to its slab. Then:
+/// Teardown is unconditional: every handle in the process's table is closed,
+/// every thread slot and frame it owns goes back to the kernel's pools, and
+/// every Event, Waiter, Interrupt, Timer and Mapping it held goes back to its
+/// slab. Then:
 ///
-///   - **PROCESS 0 STOPS THE MACHINE**, exactly as every earlier era did, with a
-///     byte-identical report. Root is init: a system whose first process has
-///     ended has nothing to run, and its children die with it, uncounted. That
-///     last part is a v1 statement rather than a principle — quotas (unit 5)
-///     are what make a child's resources worth reclaiming separately, and unit
-///     5.5's death notifications (sawos design 8) are what made a child's end
-///     OBSERVABLE: a supervisor parked on the child's Process handle is woken
-///     by the `notify_ready` at the top of this function.
-///   - **A CHILD RESCHEDULES.** Its threads leave the ready queue by REMOVAL,
-///     its slot and its grant record go back, and the path ends in
-///     `resume_after_death` — so the machine keeps running and root is simply
-///     the next thing picked.
+///   - Process 0 (root, init) stops the machine. Its children die with it,
+///     uncounted.
+///   - A child reschedules. Its threads leave the ready queue by removal, its
+///     slot and grant record go back, and the path ends in
+///     `resume_after_death`, so root is simply the next thing picked. A
+///     supervisor parked on the child's Process handle is woken by the
+///     `notify_ready` at the top of this function.
 ///
-/// `machine_status` is separate from `code` because they answer different
-/// questions: `code` is what a supervisor would read out of the §8 status word,
-/// and `machine_status` is what the EMULATOR exits with — which for a fault is
-/// the kernel's own vocabulary rather than anything the process chose. It is
-/// read only on the process-0 arm, since a child's death stops nothing.
+/// `code` is what a supervisor reads out of the spec §8 status word.
+/// `machine_status` is what the emulator exits with, which for a fault is the
+/// kernel's own vocabulary rather than anything the process chose. It is read
+/// only on the process-0 arm.
 ///
-/// AUDIT (design 1): NO PREEMPTION POINT anywhere in the teardown (~76 slot
-/// visits and a report). The scheduler is DISMANTLED across it —
-/// `CURRENT_THREAD` and the dying process's queue entries are cleared before
-/// the scans — so IRQ-shared state is in flight for the whole walk, which is
-/// the placement rule's plainest refusal. It is also bounded-tiny, and it ends
-/// in a machine stop or a fresh schedule either way.
+/// There is no preemption point anywhere in the teardown. The scheduler is
+/// dismantled across it (`CURRENT_THREAD` and the dying process's queue entries
+/// are cleared before the scans), so IRQ-shared state is in flight for the
+/// whole walk. It is bounded, and ends in a machine stop or a fresh schedule.
 public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
                  machine_status: UInt) unsafe -> Never {
     PROCESSES[p].state = ProcessState.Gone
     PROCESSES[p].exit_kind = kind
     PROCESSES[p].exit_code = code
 
-    // **AND A PARKED SUPERVISOR IS TOLD, RIGHT HERE** (sawos design 8, M3 unit
-    // 5.5). The three lines above are the whole of what a wait record carries,
-    // so this is the earliest point the notification could be honest — and
-    // being early is what the ORDERING argument needs.
-    //
-    // THE WAKE ONLY QUEUES. `notify_ready` reaches `wake_one_waiter`, which
-    // writes the record into the supervisor's memory and pushes its thread onto
-    // the ready queue; it does not switch. So the whole teardown below runs to
-    // completion first, and the woken thread is picked up by
-    // `resume_after_death` at the bottom of this function. **NO OBSERVER EVER
-    // SEES A HALF-DEAD PROCESS**, and that is a consequence of the kernel
-    // running to completion rather than of where this line sits — which is
-    // exactly why the line can sit at the honest place instead of at the end.
-    //
-    // It is unconditional, root included. Root's own slot can only be attached
-    // by root, and root's death stops the machine a few lines down, so the arm
-    // is unreachable-but-correct rather than special-cased into silence.
+    // A parked supervisor is told here, the earliest point at which the wait
+    // record (the three fields above) is honest. The wake only queues:
+    // `notify_ready` reaches `wake_one_waiter`, which writes the record into
+    // the supervisor's memory and pushes its thread onto the ready queue
+    // without switching. The whole teardown below runs to completion first and
+    // the woken thread is picked up by `resume_after_death`, so no observer
+    // sees a half-dead process. The call is unconditional, root included:
+    // root's slot can only be attached by root, and root's death stops the
+    // machine.
     notify_ready(WaitableKind.Process, p)
 
-    // **A CHILD'S CLEAN EXIT IS REPORTED, and this line is new in M3 unit 3**
-    // (sawos design 4). Until give existed, a child could not exit at all — it
-    // held no Process handle, so it had no `Exit` right and its only way out was
-    // a fault, which `fault_process` already reports. A child that was DONATED
-    // its own Process handle exits with a code, and that code is the only thing
-    // it can say: root gave the handle away, so there is nobody left holding a
-    // §8 status word to read (D-3's one-handle-one-choice), and a donated child
-    // has no System handle and therefore no console.
-    //
-    // IT IS A SEPARATE LINE RATHER THAN A FIELD ON THE TEARDOWN, deliberately.
-    // Appending to that line would rewrite it for every process that has ever
-    // died, and design 4 authorised no change to a shipped transcript. This line
-    // is unreachable for every case written before it: root takes the other arm,
-    // and no child before this unit could exit.
-    //
-    // The FAULT half is unchanged and is reported one level up by
-    // `fault_process`, which is why the two reports read alike and neither
-    // repeats the other.
+    // A child's clean exit is reported on its own line. A child that was
+    // donated its own Process handle exits with a code, and that code is the
+    // only thing it can say: nobody holds a status word to read and it has no
+    // console handle. This stays a separate line, not a field on the teardown
+    // line below, so the teardown line is identical for every process. The
+    // fault half is reported by `fault_process`.
     if p != ROOT_PROCESS {
         match kind {
             case Exited -> {
@@ -357,43 +288,31 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
         }
     }
 
-    // **THE ORPHANED CLAIMS GO FIRST** (`designs/010` ruling 4's rider; sawos
-    // design 17 D-2). A thread parked in a fused `PipeInletOp.Call` holds its
-    // exchange's claim column open WITHOUT A HANDLE ENTRY — that is what the
-    // fused path buys — so the close-all below cannot reach it, and the thread
-    // sweep further down would recycle the slot while `PIPE_CALLER` still named
-    // it. Dropping the claim IS the abandonment the ratified rule describes:
-    // the column falls to zero, and the server's later `reply` reads that as
-    // abandoned-by-client and answers `Err(PeerClosed)` — no new vocabulary
-    // anywhere, which is what says the fused path is the composed one run
-    // differently.
+    // Orphaned claims go first. A thread parked in a fused `PipeInletOp.Call`
+    // holds its exchange's claim column open without a handle entry, so the
+    // close-all below cannot reach it, and the thread sweep further down would
+    // recycle the slot while `Exchange.caller` still named it. Dropping the
+    // claim abandons the call: the column falls to zero, and the server's later
+    // `reply` reads that as abandoned-by-client and answers `Err(PeerClosed)`.
     //
-    // IT RUNS BEFORE THE CLOSE-ALL because the close-all drops endpoint columns
-    // and every one of those transitions NOTIFIES, and a notification must
-    // never find a thread of the process being torn down. `release_pending_calls`
+    // This must run before the close-all, because the close-all drops endpoint
+    // columns, every such transition notifies, and a notification must never
+    // find a thread of the process being torn down. `release_pending_calls`
     // carries the two-pass argument for why its own unrefs cannot either.
     release_pending_calls(p)
 
-    // THE CLOSE-ALL GOES THROUGH `unbind_handle` (sawos design 3 D-1), which is
-    // what makes a teardown and a release do the SAME thing to a slot: zero the
-    // binding, BUMP the generation. It matters even though the whole table is
-    // about to belong to somebody else — a process slot is reclaimable now
-    // (D-3), so these very entries can be minted into again, and a word from the
-    // dead process's life must not resolve in the next one's.
+    // The close-all goes through `unbind_handle`, so teardown and release do
+    // the same thing to a slot: zero the binding and bump the generation. The
+    // bump matters because a process slot is reclaimable, so these entries can
+    // be minted into again, and a word from the dead process's life must not
+    // resolve in the next one's. It touches only the entry, never the object.
     //
-    // It still touches only the ENTRY and never the OBJECT: what the process
-    // owned is freed by the loops below, per slab, exactly as before.
-    //
-    // **AND IT COUNTS, WITHOUT FREEING** (sawos design 7 D-1). Every entry here
-    // is one reference fewer, and objects some OTHER process owns must see
-    // that — a region a launcher gave a child is the case that exists today.
-    // But the decrement is `unref_teardown`, which deliberately does not free
-    // at zero: the sweeps below free what this process OWNED, by ownership, and
-    // they COUNT what they freed for the report. A close-all that freed by
-    // reference would collapse those counts for objects being reclaimed either
-    // way, in this same function, and would move every teardown line in the
-    // suite — which design 7 D-5 authorizes for pre-exit releases and for
-    // nothing else. `unref_teardown`'s own docstring carries the argument.
+    // Each entry is also one reference fewer, and objects another process owns
+    // must see that (a region a launcher gave a child, for example). The
+    // decrement is `unref_teardown`, which deliberately does not free at zero:
+    // the sweeps below free what this process owned, by ownership, and count
+    // what they freed for the report. Freeing by reference here would collapse
+    // those counts. `unref_teardown`'s docstring carries the argument.
     var closed: UInt = 0
     var h: Int = 0
     while h < MAX_HANDLES {
@@ -409,12 +328,10 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
         h = h + 1
     }
 
-    // THE READY QUEUE IS EDITED, NOT EMPTIED (sawos design 2 D-6), and it
-    // happens BEFORE the thread slots are freed because the walk reads each
-    // thread's `process` field to decide. Emptying it wholesale — which is what
-    // this was while there was one process, and what read as correct because
-    // every runnable thread belonged to the process that was ending — would
-    // take ROOT's runnable threads away when a child died.
+    // The ready queue is edited, not emptied: the dying process's threads are
+    // removed and other processes' runnable threads stay. This happens before
+    // the thread slots are freed because the walk reads each thread's `process`
+    // field.
     ready_remove_process(p)
 
     var freed: UInt = 0
@@ -435,17 +352,17 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
         }
         t = t + 1
     }
-    // The dying process is always the CALLER today — every path here runs in
-    // the context of a thread belonging to `p` — so the running thread is one
-    // of the slots just freed and there is nothing current any more.
+    // This assumes the dying process is the caller, so the running thread is
+    // one of the slots just freed and nothing is current any more. A path that
+    // ended some other process (`ProcessOp.Exit` through a handle on a child
+    // is one) would have to keep its caller schedulable; this one does not.
     CURRENT_THREAD = NO_THREAD
 
-    // Interrupts go back FIRST, and masking each line is the part that is not
-    // bookkeeping: a device the dead process was driving may still be
-    // asserting, and an unmasked line with no object behind it would be taken,
-    // reported and masked once per fire forever. Masking here is the kernel
-    // taking the line back, which is the same handover §9 describes running
-    // backwards.
+    // Interrupts go back first. Masking each line is not just bookkeeping: a
+    // device the dead process was driving may still be asserting, and an
+    // unmasked line with no object behind it would be taken, reported and
+    // masked once per fire forever. Spec §9 masks on fire and unmasks on ack;
+    // here the mask happens with no ack coming.
     var irqs_freed: UInt = 0
     var q: Int = 0
     while q < INTERRUPTS.capacity() {
@@ -465,39 +382,22 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
         q = q + 1
     }
 
-    // Attachments belong to a WAITER, so they are reclaimed by walking the
-    // process's waiters rather than by scanning for a process field they do not
-    // carry — which is also the honest ownership statement: an attachment is a
-    // row in a Waiter's table and dies with it.
+    // Attachments belong to a Waiter, so they are reclaimed by walking the
+    // process's waiters: an attachment is a row in a Waiter's table and dies
+    // with it. Each is also unhooked from the far end, because a supervisor's
+    // Waiter can attach to a child's process slot, and that pair spans two
+    // processes:
     //
-    // **AND SINCE M3 UNIT 5.5 EACH ONE IS UNHOOKED FROM THE FAR END TOO**
-    // (sawos design 8). The sentence this loop used to rest on — "an attachment
-    // only ever joins two objects of the SAME process, so freeing both ends is
-    // freeing the list" — stopped being true the moment a Process handle became
-    // waitable: a supervisor's Waiter attaches to a CHILD's process slot, and
-    // that pair spans two processes. So the two lines added here are the far
-    // end's, and they are the close-all's own discipline one table down:
+    //   - Clear the back pointer, or the waitable's `attachment` field would
+    //     name a slot this loop has just freed. For a same-process waitable the
+    //     per-slab sweeps below zero it anyway; for a Process slot another
+    //     process owns, this stops a later death from notifying through a stale
+    //     index.
+    //   - Count without freeing (`unref_waitable_teardown`), for the same
+    //     reason as the handle close-all above: an object another process owns
+    //     must see the reference go, and freeing is the per-slab sweeps' job.
     //
-    //   - CLEAR THE BACK POINTER, because the waitable's `attachment` field
-    //     would otherwise name a slot this loop has just freed. For a
-    //     same-process waitable the per-slab sweeps below zero it anyway, so
-    //     nothing observable changes; for a Process slot another process owns,
-    //     it is what stops a later death from notifying through a stale index.
-    //   - COUNT, WITHOUT FREEING (`unref_waitable_teardown`). Exactly the
-    //     asymmetry the handle close-all above states and for the same reason:
-    //     an object some OTHER process owns must see the reference go, and the
-    //     freeing is the per-slab sweeps' job.
-    //
-    // Reachable only when a supervisor dies before what it watches. **THE
-    // ARITHMETIC THAT USED TO MAKE THAT IMPOSSIBLE IS GONE** (sawos design 21,
-    // M4 unit 5): with `MAX_PROCESSES` at two the only supervisor was root and
-    // root's death stops the machine; at three a CHILD may supervise a sibling
-    // and die first. No case in this tree wires that up — every launcher in
-    // `tests/` is root — so the arm stays untaken, but it is now untaken by
-    // topology rather than by the table's size, which is the difference between
-    // a branch nothing takes and a branch nothing can reach. Written anyway,
-    // for the reason it always was: an invariant that has quietly become false
-    // is worse than a branch nothing takes.
+    // Reachable when a supervisor dies before what it watches.
     var a: Int = 0
     while a < ATTACHMENTS.capacity() {
         match ATTACHMENTS[a].state {
@@ -519,11 +419,10 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
         a = a + 1
     }
 
-    // Events and Waiters go back to their slabs whole (spec §2's Process row:
-    // free what the process owned). No unlinking is needed first — an
-    // attachment only ever joins two objects of the SAME process, so freeing
-    // both ends is freeing the list, and a Waiter's blocked list named threads
-    // this loop's predecessor has already reclaimed.
+    // Events and Waiters go back to their slabs whole (spec §2.7).
+    // No unlinking is needed first: the attachment loop above has already
+    // unhooked every attachment of this process's waiters, and a Waiter's
+    // blocked list names threads that were reclaimed in the thread sweep.
     var events_freed: UInt = 0
     var e: Int = 0
     while e < EVENTS.capacity() {
@@ -557,18 +456,15 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
         w = w + 1
     }
 
-    // NO CLOCK IS RECLAIMED HERE, and the absence is the point (ruled Aug 17,
-    // user). A Clock is kernel-eternal and owned by nobody, so a dead process
-    // leaves nothing behind: its clock HANDLE was unbound by the close-all loop
-    // above like every other, and the loop touches only the table entry, never
-    // the object it names — which is exactly why that path needs no per-kind
-    // arm to skip this one. Freeing a domain's slot on a process's death would
-    // take the machine's monotonic clock away from everybody else.
+    // No Clock is reclaimed here. A Clock is kernel-eternal and owned by
+    // nobody; the process's clock handle was unbound by the close-all above,
+    // which touches only the table entry. Freeing the clock's slot would take
+    // the monotonic clock away from everybody else.
     //
-    // TIMERS go back, and they matter beyond the bookkeeping for the reason the
-    // interrupt loop does: a dead process's armed deadline is one the kernel
-    // would otherwise keep waking itself for, forever, with nobody left to tell.
-    // Freeing them and reprogramming is the kernel taking the comparator back.
+    // Timers go back for the same reason as interrupts: a dead process's armed
+    // deadline is one the kernel would otherwise keep waking itself for, with
+    // nobody left to tell. Freeing them and reprogramming takes the comparator
+    // back.
     var timers_freed: UInt = 0
     var tm: Int = 0
     while tm < TIMERS.capacity() {
@@ -588,73 +484,44 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     }
     reprogram_timer()
 
-    // **AND HERE THE TEARDOWN STOPS FORCE-FREEING COUNTED KINDS** (`designs/010`
-    // ruling 10, landed by sawos design 14 D-3). What stood in these lines were
-    // three sweeps — MEMORY REGIONS, IO WINDOWS and PIPE CONNECTIONS, each
-    // zeroing every slab slot whose `process` field named the dying process,
-    // whatever anybody else still held. They were pre-refcount survivors, from
-    // the units that had no count to consult, and design 13's finding 2 named the
-    // hazard they leave: a connection whose CREATOR dies while a peer still holds
-    // an end has its row freed under that holder, staged messages and all. A
-    // region a launcher gave a child has carried the same property since M3 unit
-    // 2, because a give does not move a slot's `process` field.
+    // Counted kinds that other processes may still reference (memory regions,
+    // IO windows, pipe connections) are not force-freed by their creator's
+    // death. References govern lifetime: a slot outlives its creator for as
+    // long as anybody holds a reference. A forced free would pull a connection
+    // out from under a peer that still holds an end, staged messages and all.
+    // Don't force-free by `process` field: a give does not move a slot's
+    // `process` field, so a region a launcher gave a child is not the dying
+    // process's to free. What the dying process was charged for is written off
+    // by `quota_clear` below; an orphaned object is charged to nobody until it
+    // frees.
     //
-    // **REFERENCES GOVERN LIFETIME.** A slot outlives its creator for exactly as
-    // long as anybody holds a reference — possession keeps alive, the capability
-    // model's own answer — and the ownership-transfer-at-`give` alternative was
-    // rejected for adding bookkeeping that goes incoherent the moment minted
-    // siblings span processes. What the dying process owed is dropped by the
-    // close-all at the top of this function; what it was CHARGED for is written
-    // off by `quota_clear` below (design 7 D-4's orphan vocabulary, landed as its
-    // degenerate case: an orphaned object is charged to NOBODY until it frees,
-    // and the machine stays bounded because quota <= wall).
+    // `reap_unreferenced` gives back what nobody names. It must exist because
+    // the close-all above counts without freeing, so a slot whose last handle
+    // the dying process held would otherwise be stranded. The free goes through
+    // `free_object`, so each kind's quota credit runs.
     //
-    // `reap_unreferenced` is what remains, and it is not a sweep by ownership: it
-    // gives back what NOBODY NAMES. It has to exist because the close-all above
-    // deliberately counts without freeing (design 7 D-5 — the sweeps that DO free
-    // are also what count for the report), so deleting these three outright would
-    // strand a slot whose last handle the dying process happened to hold. Same
-    // reclamation, no force-free, and the free goes through `free_object` so each
-    // kind's own quota CREDIT runs — which the old sweeps never did for a slot
-    // another process had been charged for.
+    // The arm is untaken whenever root creates every shared object and outlives
+    // them, since then no dying process is the last namer of another's slot.
+    // That is a property of the wiring, not of the table.
     //
-    // UNREACHABLE IN THIS TREE, and no longer provably so — which is the change
-    // M4 unit 5 made here (sawos design 21). With `MAX_PROCESSES` at two the
-    // only process that could outlive a peer was root and root's death stops
-    // the machine; at three, unit 5's own topology has a client child dying
-    // while its sibling driver keeps serving. What still keeps this arm untaken
-    // is that ROOT creates every object those two share and outlives both, so
-    // no dying process is ever the last namer of somebody else's slot. That is
-    // a property of the wiring rather than of the table, and it is exactly why
-    // ruling 10 deleted the force-free arms instead of leaving them: the branch
-    // is here for the day a launcher is not root. Written on the unit-5.5
-    // principle the attachment sweep above records.
-    //
-    // THE OTHER FIVE SWEEPS STAY. Threads, Events, Waiters, Interrupts and Timers
-    // are COUNTED for the teardown line, and D-5 authorises no change to those
-    // numbers. Mapping stays too, and it is a counted kind: its sweep looks like
-    // these three and is not one, because `mapping_rights()` withholds `Transfer`
-    // — a Mapping handle cannot leave the process that owns it, so the hazard
-    // ruling 10 names cannot arise — and its second arm clears a row rather than
-    // freeing a slot.
+    // Threads, Events, Waiters, Interrupts and Timers are counted for the
+    // teardown line and swept by ownership. Mappings are swept below: a Mapping
+    // is not subject to the hazard above because `mapping_rights()` withholds
+    // `Transfer`, so its handle cannot leave the owning process.
     reap_unreferenced()
 
-    // **MAPPINGS COME APART FROM BOTH ENDS** (sawos design 6 D-3), which is why
-    // this loop has two arms over one slab rather than one arm like every
-    // teardown above it. A Mapping names TWO processes — the OWNER, whose
-    // handle it is, and the TARGET, whose domain carries the row — and a death
-    // means something different at each end:
+    // Mappings come apart from both ends, which is why this loop has two arms.
+    // A Mapping names two processes: the owner, whose handle it is, and the
+    // target, whose domain carries the row.
     //
-    //   - the owner dying frees the SLOT. The row is not touched, and that is
-    //     §2.5's own stance rather than an omission: a mapping dropped without
-    //     an unmap is permanent, safe-but-leaked. Here the leak is bounded by
-    //     the target's own death, one arm down.
-    //   - the target dying takes the ROW, because `clear_domain` below drops
-    //     the whole record. The slot stays LIVE and its owner still holds the
-    //     handle, so what is left is a Mapping with nothing installed — which
-    //     is exactly the state an `unmap` already answers `BadState` for. It
-    //     must NOT be freed here: the owner's word still names this slot, and a
-    //     freed slot the next `map` reused would be reachable through it.
+    //   - The owner dying frees the slot. The row is not touched: a mapping
+    //     dropped without an unmap is permanent, safe-but-leaked (spec §2.5),
+    //     bounded here by the target's own death.
+    //   - The target dying takes the row, because `clear_domain` below drops
+    //     the whole record. The slot stays live and its owner keeps the handle,
+    //     now naming a Mapping with nothing installed (`unmap` answers
+    //     `BadState`). It must not be freed here: the owner's word still names
+    //     this slot, and a reused slot would be reachable through it.
     var mp: Int = 0
     while mp < MAPPINGS.capacity() {
         match MAPPINGS[mp].state {
@@ -673,51 +540,32 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     }
 
     // The protection rows go with the slot, and `LAST_PROT_PROCESS` is
-    // invalidated with them — a later process landing in this slot must not
+    // invalidated with them, so a later process landing in this slot cannot
     // compare equal to a domain that is no longer installed.
     clear_domain(p)
 
-    // AND THE BOOT SET, undrained records included (sawos design 4 D-2). Nothing
-    // is released here and nothing leaks: every record names a handle in the
-    // table the close-all above already emptied, so what is left is bookkeeping
-    // — a count and a cursor — and it MUST be reset, because a process slot is
-    // reclaimable (design 3 D-3) and the next occupant would otherwise inherit a
-    // stranger's boot set and drain handles that are not its own.
+    // The boot set, undrained records included. Every record names a handle in
+    // the table the close-all already emptied, so what remains is a count and a
+    // cursor. It must be reset because a process slot is reclaimable, and the
+    // next occupant would otherwise drain handles that are not its own.
     clear_boot_handles(p)
 
-    // **AND THE QUOTA LEDGER — CREDITS DIE WITH IT** (sawos design 7 D-4). This
-    // is the whole of the orphan write-off, and one line is still the right size
-    // for it — but the sentence under it changed at M4 unit 2 (`designs/010`
-    // ruling 10, sawos design 14 D-3). It used to say the interesting case could
-    // not occur, because the sweeps above freed everything this process was
-    // charged for and nothing outlived it. Now the sweeps are gone and this line
-    // is LOAD-BEARING: an object a peer still holds a reference to SURVIVES its
-    // creator, and its charge is written off here, so an orphan is charged to
-    // NOBODY until it frees. That is D-4's own vocabulary, arriving as the
-    // degenerate case it was landed in anticipation of.
-    //
-    // The books still balance and the machine stays bounded, because quota <=
-    // wall: the SLAB is what refuses the next allocation, and `quota_credit`'s
-    // zero test is what makes a credit onto this cleared row a no-op rather than
-    // an underflow. The LIMITS go with the used counts, for `clear_boot_handles`'
-    // own reason: the slot is reclaimable, and the next occupant must not inherit
-    // a stranger's allowance.
-    //
-    // The one charge that legitimately outlives its charger is a MAPPING ROW in
-    // somebody else's domain — and it is not this process's row at all: it is
-    // the TARGET's, credited when the row goes, which for a target that is
-    // still alive is its own `Unmap` or its own teardown.
+    // The quota ledger dies with the process. This is the orphan write-off:
+    // an object a peer still references survives its creator, and its charge is
+    // dropped here. The books balance because quota <= wall (the slab refuses
+    // the next allocation), and `quota_credit`'s zero test makes a credit onto
+    // this cleared row a no-op rather than an underflow. The limits are cleared
+    // with the used counts so the next occupant of the slot does not inherit
+    // an allowance. A mapping row in another process's domain is credited to
+    // that target when its row goes (its own `Unmap` or teardown).
     quota_clear(p)
 
-    // AND THE SLOT ITSELF, IF NOBODY CAN STILL READ IT (sawos design 3 D-3).
-    // The dying process's own handles were closed at the top of this function,
-    // so this is the point at which the reader-count is finally right — and a
-    // process that happened to hold the last handle onto its own slot (or onto
-    // itself) frees it here rather than leaving a `Gone` slot nothing can ever
-    // reach. The usual case is the opposite one and is why the check has to ask
-    // rather than assume: a CREATOR's handle onto its dead child normally
-    // survives, which is what keeps the §8 status word readable, and that
-    // creator's release is what frees the slot later.
+    // Free the slot itself if nobody can still read it. The dying process's
+    // handles were closed above, so the reader count is now right: a process
+    // that held the last handle onto its own slot frees it here rather than
+    // leaving a `Gone` slot nothing can reach. The usual case is the opposite:
+    // a creator's handle onto its dead child survives (keeping the spec §8
+    // status word readable), and the creator's release frees the slot later.
     reclaim_process_slot(p)
 
     let uart = console()
@@ -731,22 +579,18 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     uart.write_hex(waiters_freed)
     uart.write_str(" interrupts=")
     uart.write_hex(irqs_freed)
-    // No `clocks=` field: this line counts what the process OWNED, and a Clock
-    // is owned by nobody. A permanent zero would be a column that only ever
-    // says the same thing.
+    // No `clocks=` field: this line counts what the process owned, and a Clock
+    // is owned by nobody.
     uart.write_str(" timers=")
     uart.write_hex(timers_freed)
-    // WHICH PROCESS, appended rather than led with, so that every transcript
-    // written before there were two still reads the same up to this point. With
-    // one process the number was implied; with two it is the first thing a
-    // reader of the isolation proof needs, because "root survived" is exactly
-    // the claim that this says 1 and the run continues.
+    // The process number comes last, so the fields before it keep their
+    // positions.
     uart.write_str(" process=")
     uart.write_hex(p as UInt)
     uart.write_str("\n")
 
     if p != ROOT_PROCESS {
-        // A CHILD'S DEATH IS A SCHEDULING EVENT. The machine has work left, so
+        // A child's death is a scheduling event: the machine has work left, so
         // this path never touches `machine_status` and never stops.
         resume_after_death()
     }
@@ -759,21 +603,18 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     while { }
 }
 
-/// TERMINATE a process for a caller error it could have checked — design 178's
-/// faults ruling, ratified Aug 15.
+/// Terminate a process for a caller error it could have checked: an invalid
+/// handle, an unknown op, a missing right, or an op aimed at the wrong thread.
 ///
-/// This is what an invalid handle, an unknown op, a missing right or an op
-/// aimed at the wrong thread DOES. It is not a status the process receives: the
-/// process is the thing that was wrong, so it ends, and the kernel stays up to
-/// say so. Never returns — into a stopped machine when root is the one that was
-/// wrong, and into whatever runs next when it was a child.
+/// This is not a status the process receives: the process is the thing that was
+/// wrong, so it ends, and the kernel stays up to say so. Never returns: into a
+/// stopped machine when root is the one that was wrong, and into whatever runs
+/// next when it was a child.
 public(package) func fault_process(p: Int, reason: FaultReason) unsafe -> Never {
     let uart = console()
     uart.write_str("SOS: process fault: ")
     uart.write_str(reason.describe())
-    // Appended, like the teardown line's own: the reason still reads first, so
-    // every transcript written before there were two processes is unchanged up
-    // to the end of the reason.
+    // The process number is appended so the reason reads first.
     uart.write_str(" process=")
     uart.write_hex(p as UInt)
     uart.write_str("\n")
@@ -782,10 +623,9 @@ public(package) func fault_process(p: Int, reason: FaultReason) unsafe -> Never 
 }
 
 /// The same termination, reached from a hardware fault rather than a syscall
-/// (spec §8: a thread fault kills its process). The report keeps M1's wording
-/// and shape, because the harness reads it and because a reader of the two eras
-/// should see the same line for the same event; WHICH process it was is in the
-/// teardown line that follows.
+/// (spec §8: a thread fault kills its process). The harness reads the report's
+/// wording and shape, so keep them; which process it was is in the teardown
+/// line that follows.
 public(package) func fault_trap(tag: String, cause: UInt, epc: UInt, tval: UInt) unsafe -> Never {
     let uart = console()
     uart.write_str("SOS: fault ")

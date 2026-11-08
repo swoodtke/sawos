@@ -1,195 +1,141 @@
-//! THE SLAB BUDGET — how many of each object this kernel can hold, the stride
-//! it reserves per thread context, and the sentinel each table answers with
-//! when it has no slot to give.
+//! The slab budget: how many of each object this kernel can hold, the stride
+//! reserved per thread context, and the sentinel each table answers with when
+//! it has no slot to give.
 //!
-//! ONE MODULE BECAUSE THEY ARE ONE DECISION. Every number here is a fixed-size
-//! table's dimension, they are chosen against each other (`MAX_ATTACHMENTS` is
-//! the SUM of the waitables, because an attachment is one (Waiter, waitable)
-//! pair and §2.2 allows a handle at most one Waiter), and raising one is meant
-//! to be an edit in one place. lib.saw already had them as one adjacent block;
-//! this file is that block.
+//! These are one decision. Every number is a fixed-size table's dimension and
+//! they are chosen against each other (`MAX_ATTACHMENTS` is the sum of the
+//! waitables, because an attachment is one (Waiter, waitable) pair and spec
+//! §2.2 allows a handle at most one Waiter). A derived `static` built from an
+//! imported const is not a compile-time length, so a derived size and its
+//! operands cannot be split across modules; `MAX_ATTACHMENTS` has to sit beside
+//! the terms it adds.
 //!
-//! IT IS ALSO WHAT THE LANGUAGE ALLOWS TODAY (DF-232g): a `static` DERIVED from
-//! an imported const is not a compile-time length, so a derived size and its
-//! operands cannot be split across modules — `MAX_ATTACHMENTS` has to sit
-//! beside the four it adds up.
-//!
-//! AUDIT (design 1, M3 unit 1.5): NO SLAB SCAN OR HANDLE WALK IN THE KERNEL
-//! TAKES A PREEMPTION POINT, and this file is where that verdict belongs
-//! because these numbers ARE its argument. Every free-slot search, every
-//! by-line/by-key lookup and every teardown sweep is bounded by one of the
-//! constants below — 8, 16, 20 at the largest — over an O(1) body in RAM, so
-//! there is no masked window here for a point to shorten. Raising one of these
-//! numbers by an order of magnitude is what would make the audit worth
-//! re-running.
+//! No slab scan or handle walk in the kernel takes a preemption point. Every
+//! free-slot search, by-line or by-key lookup and teardown sweep is bounded by
+//! one of the constants below, or by the `capacity()` of a slab that donation
+//! has grown, over an O(1) body in RAM, so there is no masked window for a
+//! point to shorten. Raising a bound by an order of magnitude is what would
+//! make that worth re-checking.
 
 import hal
 import sosabi.{ClockType}
 
-/// Processes the kernel can hold. THREE since M4 unit 5 (sawos design 21,
-/// user-ruled Sep 2): root, and the two children driver-as-service needs — a
-/// driver child that owns the UART and a client child that reads it through a
-/// pipe. It was TWO from M3 unit 2 (sawos design 2 D-6) to there.
+/// Processes the kernel can hold, compiled floor: root plus the two children a
+/// driver-as-service launch needs (a driver child that owns the UART and a
+/// client child that reads it through a pipe).
 ///
-/// **"RAISING THIS NUMBER IS THE ONLY EDIT" HAS NOW BEEN EXERCISED TWICE, and
-/// it held both times.** Every table that is per-process was already indexed
-/// rather than assumed — the handle table is a slice of `HANDLES` at
-/// `p * MAX_HANDLES`, the thread/event/waiter/interrupt/timer slabs carry a
-/// `process` field their teardown scans by — so the one-to-two step was this
-/// line and the `ProcessSlot` arithmetic that follows from it, and the
-/// two-to-three step was this line and NOTHING ELSE in the kernel. What did NOT
-/// come for free at the first step is what design 2 is about: the protection
-/// domain, which one process could leave installed and two cannot (D-5), and
-/// the end of a process, which with one was the end of the machine (D-6).
+/// Raising this number is the only edit needed. Every per-process table is
+/// indexed rather than assumed: the handle table is a field of `ProcessSlot`,
+/// and the thread, event, waiter, interrupt and timer slabs carry a `process`
+/// field their teardown scans by.
 ///
-/// **THE CENSUS THE SECOND BUMP OWES, since a slot is not free** (design 21's
-/// forcing question, answered by measurement rather than by assertion):
+/// A slot is not free. Each one costs:
 ///
-///   - `MAX_HANDLES` handle entries — `HANDLES` grows 32 -> 48 rows, and
-///     `BOOT_HANDLES` with it. Zero-initialised, so it is .bss and no image
-///     byte is spent on it (design 149).
-///   - one `MAX_GRANT_ROWS`-row grant record, one `ProcessSlot`, one
-///     `QUOTA_KINDS`-wide pair of quota rows.
-///   - one term in `MAX_ATTACHMENTS` below (22 -> 23), because a Process handle
-///     is a waitable and one attachment per slot is the honest bound.
-///   - **NOT the protection-row budget.** Protection rows are PER DOMAIN and
-///     reprogrammed at `load_domain`, so `hal.GRANT_ROW_BUDGET` is what ONE
-///     process may hold installed and a third process adds nothing to it.
-///     Root's own record is the one to watch, and it does not move: root spends
-///     `IMAGE_GRANT_ROWS` = 3 (its two loadable segments plus the kernel's
-///     stack grant) whatever a launch wires up, because a launcher hands out
-///     CAPABILITIES and maps nothing — `process_create` reads a child's image
-///     with kernel privilege and a driver child maps its own window. Design 21
-///     measured a two-child launch at 3 rows used, leaving every profile's
-///     budget five or more rows to spare.
+///   - `MAX_HANDLES` handle entries in `ProcessSlot.handles` and as many in
+///     `ProcessSlot.boot_handles` (zero-initialised, so .bss and no image
+///     bytes);
+///   - one `MAX_GRANT_ROWS`-row grant record, one `ProcessSlot`, and one
+///     `QUOTA_KINDS`-wide pair of quota rows;
+///   - one term in `MAX_ATTACHMENTS`, because a Process handle is a waitable.
 ///
-/// Three rather than eight for the same reason it was two rather than eight:
-/// the number is the smallest that serves the workload of record. A fourth is
-/// an edit to this line when a unit argues for one.
+/// It does not cost protection rows. Those are per domain and reprogrammed at
+/// `load_domain`, so `hal.GRANT_ROW_BUDGET` is what one process may hold
+/// installed, and another process adds nothing to it. Root spends
+/// `IMAGE_GRANT_ROWS` (its two loadable segments plus the kernel's stack grant)
+/// whatever a launch wires up, because a launcher hands out capabilities and
+/// maps nothing: `process_create` reads a child's image with kernel privilege
+/// and a driver child maps its own window.
 ///
-/// **AND IT IS THE COMPILED FLOOR SINCE M5 UNIT 6b** (sawos design 36).
-/// `SlabKind.Processes` raises the machine's real ceiling, and a process
-/// donation carries the whole per-process record with it — handle table, quota
-/// ledger and boot set are FIELDS of `ProcessSlot` now, which is what made the
-/// kind convertible at all. So a deployment that donates runs more concurrent
-/// processes than this line says, and the census above ("a slot is not free")
-/// is exactly the storage a donated extent supplies per slot.
+/// This is the smallest floor that serves the launch shape above; a larger one
+/// is an edit to this line when something needs it.
 ///
-/// **ON A TRANSLATING TIER THERE IS A SECOND, LOWER CEILING**, and it is not
-/// this one: a persistent per-process table set comes out of a STATIC HAL pool
-/// that donation cannot reach (design 25 D-3), so `hal.PROT_DOMAIN_SLOTS` is
-/// what a create actually meets there. See the assert below and
-/// `kcore.process.process_slots_usable`.
+/// This is the compiled floor. `SlabKind.Processes` raises the machine's real
+/// ceiling, and a process donation carries the whole per-process record with it
+/// (handle table, quota ledger and boot set are fields of `ProcessSlot`).
+///
+/// On a tier that translates addresses there is a second, lower ceiling: a
+/// persistent per-process table set comes out of a static HAL pool that
+/// donation cannot reach, so `hal.PROT_DOMAIN_SLOTS` is what a create actually
+/// meets there. See the assert below and `kcore.process.process_slots_usable`.
 public(package) static MAX_PROCESSES: Int = 3
 
-/// Root's slot. The kernel loads exactly one image (§12) and it lands here, so
-/// "process 0" and "root" are the same statement — which is what lets
-/// `end_process` fork on a comparison rather than on a flag.
+/// Root's slot. The kernel loads exactly one image (spec §12) and it lands
+/// here, so "process 0" and "root" are the same statement; that is what lets
+/// `end_process` branch on a comparison rather than a flag.
 public(package) static ROOT_PROCESS: Int = 0
 
 /// "No process". The plain-form sentinel, like `NO_THREAD`.
 public(package) static NO_PROCESS: Int = -1
 
-/// Memory objects the kernel can hold (spec §2.5; sawos design 2 D-2, raised
-/// by design 6 D-7).
+/// Memory objects the kernel can hold (spec §2.5).
 ///
-/// **IT IS A REAL ALLOCATION BUDGET NOW, which is what unit 4 changed about
-/// it.** Unit 2's number was a census of boot regions — v1 minted these only at
-/// boot, one per row of the build-emitted region table, and nothing created one
-/// at run time. `MemoryOp.Split` creates one per cut, so the slab is what a
-/// pool is spent THROUGH: sixteen is the boot rows plus room for a handful of
-/// derived regions, which is what a hand-written system's launcher needs.
-///
-/// It is deliberately NOT large, and since M3 unit 5 it is the SLAB that stays
-/// small rather than the system that stays short. Free-on-last-reference landed
-/// (sawos design 7 D-1), so a cut that is dropped returns its slot inside the
-/// release and this number bounds CONCURRENT regions rather than total cuts —
-/// `tests/memory-split` walks twenty rounds past these sixteen slots with
-/// nothing refused.
-///
-/// **AND SINCE M5 UNIT 5 IT IS NOT THE POOL EITHER** (sawos design 28). What
-/// this paragraph used to say — that a long-running allocator meets the POOL,
-/// because a freed Memory returns its slot and not its BYTES — was the honest
-/// state of the system and is what that unit built. A dropped region's range
-/// goes back onto its pool root's free list now, so what bounds a workload is
-/// concurrency in both currencies: how many regions exist at once, and how many
-/// bytes are out at once.
+/// This is a real allocation budget: `MemoryOp.Split` creates one per cut, so
+/// the slab is what a pool is spent through. The number is the boot rows plus
+/// room for a handful of derived regions, which is what a hand-written system's
+/// launcher needs. A dropped region returns its slot on last release and its
+/// range goes back onto its pool root's free list, so this number bounds
+/// concurrent regions rather than total cuts (`tests/memory-split` runs more
+/// split rounds than there are slots with nothing refused). The workload is
+/// bounded by concurrency in both currencies: regions alive at once, and bytes
+/// out at once.
 public(package) static MAX_MEMORIES: Int = 16
 
 /// The same sentinel for the Memory slab.
 public(package) static NO_MEMORY: Int = -1
 
-/// Free-range NODES a pool's free list can hold, over ALL pools (sawos design
-/// 28; design 25 D-5).
+/// Free-range nodes a pool's free list can hold, over all pools.
 ///
-/// **THE PARAGRAPH ABOVE IS WHAT THIS NUMBER RETIRES.** `MAX_MEMORIES` used to
-/// say a long-running allocator meets the POOL rather than the slab, because a
-/// freed region returned its slot and not its BYTES. It returns both now: the
-/// range goes onto its pool root's free list, and this is the storage that list
-/// is made of.
+/// A node is only ever needed for a hole. A range returned adjacent to another
+/// free range coalesces into it, and one adjacent to the pool's unspent
+/// frontier folds back into the cursor and needs no node. So the list is as
+/// long as the pool is fragmented, and this number is generous against
+/// `MAX_MEMORIES`: every live region could be released out of order, each
+/// landing as its own hole, and the list would still have nodes to spare.
 ///
-/// A NODE IS ONLY EVER NEEDED FOR A HOLE. A range returned ADJACENT to another
-/// free range coalesces into it, and one adjacent to the pool's own unspent
-/// frontier folds back into the cursor and needs no node at all — which is the
-/// common shape, since a cut-and-drop loop returns the piece it just took. So
-/// the list is as long as the pool is FRAGMENTED, and thirty-two is generous
-/// against a Memory slab of sixteen: every live region could be released out of
-/// order, each landing as its own hole, and the list would still be half empty.
-///
-/// **EXHAUSTION MUST NOT FAULT A RELEASE** (design 28's infallible-release
-/// doctrine). A range that finds no node after coalescing is LEAKED, honestly
-/// and counted, into its pool's `dropped` — never refused, never silently lost.
-/// `SlabDonate` (design 25 D-6) names this slab as its first customer.
+/// Exhaustion must not fault a release. A range that finds no node after
+/// coalescing is leaked, and counted, into its pool's `dropped`; it is never
+/// refused and never silently lost.
 public(package) static MAX_FREE_RANGES: Int = 32
 
 /// The same sentinel for the free-range slab.
 public(package) static NO_FREE_RANGE: Int = -1
 
-/// IoMemory objects the kernel can hold (spec §2.5; sawos design 6 D-1/D-7).
+/// IoMemory objects the kernel can hold (spec §2.5).
 ///
-/// SMALLER THAN THE RAM SLAB, and for the reason `MAX_INTERRUPTS` is small: an
-/// IoMemory is a DEVICE WINDOW, and a machine has as many of those as it has
-/// peripherals a driver wants — a board fact, not a workload one. Carving is
-/// non-exclusive, so several windows onto one peripheral cost several slots,
-/// which is what makes eight rather than four.
+/// Smaller than the RAM slab for the reason `MAX_INTERRUPTS` is small: an
+/// IoMemory is a device window, and a machine has as many of those as it has
+/// peripherals a driver wants. Carving is non-exclusive, so several windows
+/// onto one peripheral cost several slots, so it is larger than
+/// `MAX_INTERRUPTS`.
 public(package) static MAX_IOMEMORIES: Int = 8
 
 /// The same sentinel for the IoMemory slab.
 public(package) static NO_IOMEMORY: Int = -1
 
-/// Mapping objects the kernel can hold (spec §2.5; sawos design 6 D-3/D-7).
+/// Mapping objects the kernel can hold (spec §2.5).
 ///
-/// A Mapping is one INSTALLED ROW with a handle on it, so the honest ceiling is
-/// the rows every process's domain can hold at once — which is smaller than
-/// this on one profile and the same order on the other. Eight is that, and a
-/// map that meets it answers `NoResource` exactly as one that meets the
-/// hardware's row budget does.
+/// A Mapping is one installed row with a handle on it, so the honest ceiling is
+/// the rows every process's domain can hold at once. A map that meets this
+/// answers `NoResource`, exactly as one that meets the hardware's row budget
+/// does.
 public(package) static MAX_MAPPINGS: Int = 8
 
 /// The same sentinel for the Mapping slab.
 public(package) static NO_MAPPING: Int = -1
 
-/// Rows in a process's GRANT RECORD (sawos design 2 D-5) — the protection map
-/// the scheduler REPLAYS when it switches into that process.
+/// Rows in a process's grant record: the protection map the scheduler replays
+/// when it switches into that process.
 ///
-/// It is the ARRAY LENGTH, and since M3 unit 4 that is ALL it is. One row per
-/// image segment plus one for the kernel's stack grant was the whole story
-/// while grants were made at load time only; `MemoryOp.Map` installs rows at
-/// run time, so what a process may actually hold is a PER-PROFILE budget the
-/// HAL publishes (`hal.GRANT_ROW_BUDGET`) and this number is the storage that
-/// has to cover the larger of them.
+/// This is only the array length. What a process may actually hold is a
+/// per-profile budget the HAL publishes (`hal.GRANT_ROW_BUDGET`), and this
+/// number is the storage that has to cover the larger of them. One profile's
+/// limit is hardware (a fixed number of numbered protection regions), so a map
+/// meeting it is a map the machine cannot install. The other has no such limit
+/// and its limit is this policy number, chosen so one array serves both. A map
+/// checks the HAL's number and never this one; the asserts below stop the array
+/// being too short.
 ///
-/// **THE TWO PROFILES' BUDGETS NOW MEAN DIFFERENT THINGS**, and that is the
-/// note unit 4 owes this constant. One profile's wall is HARDWARE — a fixed
-/// number of numbered protection regions, eight of them since design 6 D-4
-/// widened the budget — so a map meeting it is a map the machine cannot
-/// install. The other has no such limit at all (it grants by page table) and
-/// its wall is this POLICY number, chosen so that one array serves both. A map
-/// checks the HAL's number and never this one; this one is what stops the array
-/// from being too short for it (the assert below).
-///
-/// It stays 9 because raising it costs every process slot a row of storage and
-/// nothing needs more yet.
+/// Raising it costs every process slot a row of storage.
 public(package) static MAX_GRANT_ROWS: Int = 9
 
 static_assert(hal.MAX_ROOT_SEGMENTS + 1 <= 9,
@@ -198,171 +144,119 @@ static_assert(hal.MAX_ROOT_SEGMENTS + 1 <= 9,
 static_assert(hal.GRANT_ROW_BUDGET <= 9,
               "a process's grant record must hold every row its profile may install")
 
-// EVERY PROCESS SLOT NEEDS A PROTECTION DOMAIN TO LIVE IN (sawos design 27).
-// On a tier that keeps a persistent table set per process, the HAL sizes a
-// static pool and advertises how many sets it holds; a process slot with no set
-// behind it would index past the pool. The number is declared in the HAL rather
-// than read from here because a HAL that had to import the kernel to size its
-// own page tables would be the wrong way round — this assert is what keeps the
-// two spellings honest, exactly as the `GRANT_ROW_BUDGET` pair above does.
+// Every process slot needs a protection domain to live in. On a tier that keeps
+// a persistent table set per process, the HAL sizes a static pool and
+// advertises how many sets it holds; a process slot with no set behind it would
+// index past the pool. The number is declared in the HAL rather than read from
+// here because a HAL that had to import the kernel to size its own page tables
+// would be the wrong way round. This assert keeps the two spellings honest, as
+// the `GRANT_ROW_BUDGET` pair above does.
 //
-// **IT BINDS THE FLOOR AND ONLY THE FLOOR SINCE M5 UNIT 6b** (sawos design 36).
-// `MAX_PROCESSES` is extent 0's length now, so what this says is "the processes
-// the image was BUILT for must have somewhere to live, or the kernel could not
-// boot them". Donation moves the slab's capacity past this line and CANNOT move
-// the HAL's pool — that storage is static and design 25 D-3 ruled it out of
-// donation's reach — so above the floor the same question is answered at RUN
-// TIME by `kcore.process.process_slots_usable`, and a create past the pool is
-// the `NoResource` a full table already answers. Advertised wall, not a fault:
-// the caller cannot know the number, because the kernel does not publish it.
+// It binds only the compiled floor: `MAX_PROCESSES` is extent 0's length, so
+// the processes the image was built for must have somewhere to live. Donation
+// moves the slab's capacity past this line but cannot move the HAL's pool, so
+// above the floor the same question is answered at run time by
+// `kcore.process.process_slots_usable`, and a create past the pool answers the
+// `NoResource` a full table already answers.
 static_assert(MAX_PROCESSES <= hal.PROT_DOMAIN_SLOTS,
               "the compiled floor of process slots must fit the HAL's domain pool")
 
-/// Threads the kernel can hold, across all processes — THE COMPILED FLOOR since
-/// M5 unit 6a (sawos design 34). `SlabKind.Threads` raises the machine's real
-/// ceiling, and a thread donation carries the FRAME ARENA with it: a donated
-/// extent holds both, at `THREAD_FRAME_STRIDE` alignment, addressed through the
-/// extent table's side column. See `kcore.threads.frame_slot`.
+/// Threads the kernel can hold, across all processes (compiled floor).
+/// `SlabKind.Threads` raises the machine's real ceiling, and a thread donation
+/// carries the frame arena with it: a donated extent holds both, at
+/// `THREAD_FRAME_STRIDE` alignment, addressed through the extent table's side
+/// column. See `kcore.threads.frame_slot`.
 public(package) static MAX_THREADS: Int = 8
 
 /// Events the kernel can hold, across all processes (spec §2.4).
 public(package) static MAX_EVENTS: Int = 8
 
 /// Waiters the kernel can hold, across all processes (spec §2.2). Fewer than
-/// events on purpose: a Waiter is a DISPATCH POINT, and the shape §2.2 ratifies
-/// — many handles per Waiter, many threads per Waiter — is one per pool of
+/// events on purpose: a Waiter is a dispatch point, and the shape §2.2 ratifies
+/// (many handles per Waiter, many threads per Waiter) is one per pool of
 /// workers rather than one per notification.
 public(package) static MAX_WAITERS: Int = 4
 
 /// Interrupts the kernel can hold, across all processes (spec §2 table, §9).
 ///
-/// Small because an Interrupt is a BOUND DEVICE LINE, and a machine has as many
-/// of those as it has devices with drivers — not as many as it has
-/// notifications. Every one costs a masked/unmasked line in the controller,
-/// which is a real resource the board fixes.
+/// Small because an Interrupt is a bound device line, and a machine has as many
+/// of those as it has devices with drivers. Each costs a masked/unmasked line
+/// in the controller, a resource the board fixes.
 public(package) static MAX_INTERRUPTS: Int = 4
 
-/// Clock objects in the system (spec §2 table; design 232 unit 1, amended
-/// Aug 17).
+/// Clock objects in the system (spec §2.6).
 ///
-/// NOT A SLAB BUDGET — A CENSUS OF DOMAINS. A hardware-backed Clock is ONE
-/// KERNEL-ETERNAL OBJECT PER `ClockType`, existing from boot and owned by
-/// nobody: a machine has one monotonic counter, and a per-process object naming
-/// it would be a copy of a fact with a lifetime attached to it. So the slab has
-/// exactly one slot per domain, THE SLOT IS THE DOMAIN'S ORDINAL, and nothing is
-/// ever allocated or freed here. v1 declares one domain, hence one.
-///
-/// This is what a VIRTUAL clock will NOT be: a virtual clock is a separately
-/// created, STATEFUL object (it has an offset, a rate, an owner) and it will get
-/// its own creation op and its own lifetime. Sharing this slab with it would put
-/// two different kinds of thing in one table for the sake of a name they share.
+/// Not a slab budget but a census of domains. A hardware-backed Clock is one
+/// kernel-eternal object per `ClockType`, existing from boot and owned by
+/// nobody, so the slot is the domain's ordinal and nothing is allocated or
+/// freed here. A virtual clock would be a separately created, stateful object
+/// (offset, rate, owner) with its own creation op and lifetime; it must not
+/// share this slab.
 public(package) static CLOCK_KINDS: Int = 1
 
-/// Timers the kernel can hold, across all processes (spec §2 table; design 232
-/// unit 1).
+/// Timers the kernel can hold, across all processes (spec §2.6).
 ///
-/// Sized like Events rather than like Interrupts: a Timer is a per-DEADLINE
-/// object — one per timeout a process is tracking — not a per-device one, and
-/// the shape M4's select-with-timeout makes is one Timer beside each thing
-/// being waited on.
+/// Sized like Events rather than Interrupts: a Timer is a per-deadline object,
+/// one per timeout a process is tracking, not a per-device one.
 public(package) static MAX_TIMERS: Int = 8
 
 /// Attachments the kernel can hold, across all Waiters.
 ///
-/// Sized to cover every waitable being attached at once, which is the honest
-/// bound: an attachment is one (Waiter, waitable) pair and §2.2 allows a handle
-/// at most one Waiter, so nothing can need more than there are waitables. The
-/// Timer is the third waitable kind and joins the sum for that reason — a
-/// Clock does NOT, because a Clock is not waitable.
+/// Sized to cover every waitable being attached at once: an attachment is one
+/// (Waiter, waitable) pair and spec §2.2 allows a handle at most one Waiter, so
+/// nothing can need more than there are waitables. The terms are events,
+/// interrupts, timers and processes (a Process handle is a waitable, one
+/// attachment per slot at most). A Clock and a thread are not waitable, so
+/// `CLOCK_KINDS` and `MAX_THREADS` are absent.
 ///
-/// **AND `MAX_PROCESSES` IS THE FOURTH TERM** (sawos design 8, M3 unit 5.5).
-/// A Process handle is a waitable now, one attachment per process slot at
-/// most, so the sum grows by the process table's own size and by exactly that.
-/// A THREAD is still not waitable, which is why `MAX_THREADS` is absent — the
-/// same reason the Clock is. The M4-unit-5 process bump therefore moved this
-/// number too, 22 -> 23, by the arithmetic and not by an edit — which is what
-/// the derived spelling is for.
+/// The pipe waitables (outlet, inlet, claim, obligation) are deliberately not
+/// terms. Sizing this to cover every one at once would multiply the table by
+/// the in-flight budget. `NoResource` at `add` is what reports the wall.
 ///
-/// **THE PIPE WAITABLES ARE DELIBERATELY NOT TERMS**, and the omission is a
-/// judgement rather than an oversight: an outlet, an inlet, a claim and an
-/// obligation are all attachable since M4 unit 3, and sizing this sum to cover
-/// every one of them at once would multiply the table by the in-flight budget
-/// for a shape no program in the tree has. `NoResource` at `add` is what says
-/// so when a program finds the wall — design 21's driver holds at most six
-/// attachments at once (its outlet, its IRQ line, and up to four held reads).
-///
-/// **THE DERIVATION IS A SUM OF FLOORS, AND SINCE M5 UNIT 6b IT IS ITSELF ONLY A
-/// FLOOR** (sawos design 36; designs 32/34 for the other three terms). Every
-/// term is now a compiled floor rather than a ceiling — `MAX_EVENTS`,
-/// `MAX_INTERRUPTS`, `MAX_TIMERS` and `MAX_PROCESSES` are all donatable kinds —
-/// so the sentence "nothing can need more attachments than there are waitables"
-/// is no longer true of a DONATING machine: a deployment that donates events can
-/// have more events than this sum, and `NoResource` at `Waiter.add` is what says
-/// so.
-///
-/// **THAT IS THE HONEST STATE AND IT COSTS NOTHING, because `Attachments` IS
-/// ITSELF A DONATABLE KIND** (design 32's table, converted there). A deployment
-/// that raises one of the waitable slabs raises this one alongside it, in the
-/// same vocabulary, with the same op — so the relation the sum expresses is
-/// preserved by the DEPLOYMENT rather than by the compile, which is exactly what
-/// D-6 moved every one of these numbers to. What the arithmetic still buys is
-/// the boot minimum: a machine that never donates keeps the old guarantee
-/// exactly, and the sum is what makes it true.
+/// Every term is itself a compiled floor, so on a machine that donates,
+/// "nothing can need more attachments than there are waitables" no longer
+/// holds: a deployment that donates events can have more events than this sum,
+/// and `NoResource` at `Waiter.add` reports it. `Attachments` is itself a
+/// donatable kind, so a deployment that raises a waitable slab raises this one
+/// with the same op. The sum still guarantees the boot minimum for a machine
+/// that never donates.
 public(package) static MAX_ATTACHMENTS: Int = (MAX_EVENTS + MAX_INTERRUPTS
                                                + MAX_TIMERS + MAX_PROCESSES)
 
-/// Pipe CONNECTIONS the kernel can hold (spec §2.1; sawos design 13).
+/// Pipe connections the kernel can hold (spec §2.1), compiled floor.
 ///
-/// **ONE SLAB FOR THE PAIR, NOT ONE PER END** (design 10 D-1): a `PipeInlet` and
-/// a `PipeOutlet` are two counted KINDS over one connection slot, so this is a
-/// census of live connections rather than of endpoints. A connection frees when
-/// BOTH of its reference columns reach zero.
+/// One slab serves the pair, not one per end: a `PipeInlet` and a `PipeOutlet`
+/// are two counted kinds over one connection slot, so this counts live
+/// connections. A connection frees when both of its reference columns reach
+/// zero.
 ///
-/// Four rather than eight because a slot is not free: it carries
-/// `PIPE_INFLIGHT` staging slots of `PIPE_BODY_BYTES` each, which is the only
-/// per-object storage in the kernel that is measured in kilobytes. Sized like
-/// `MAX_WAITERS` and for a related reason — a connection is a per-CLIENT
-/// relationship, and a hand-written system has a handful.
+/// Small because a slot is not free: it carries `PIPE_INFLIGHT` staging slots
+/// of `PIPE_BODY_BYTES` each, the only per-object storage in the kernel
+/// measured in kilobytes. A connection is a per-client relationship and a
+/// hand-written system has a handful. A service's connection count tracks its
+/// sessions, not its clients (sibling inlets are per-client authority).
 ///
-/// **UNIT 5 WAS EXPECTED TO ARGUE FOR MORE AND DID NOT** (sawos design 21).
-/// Driver-as-service serves TWO clients over ONE connection — sibling inlets
-/// are per-client authority, which is exactly why an endpoint kept `Mint` when
-/// the one-shots lost it (`designs/010` ruling 12(c)) — so a service's
-/// connection count tracks its number of SESSIONS and not its number of
-/// clients. The three-process delegation beside it spends two, which is the
-/// largest a case in this tree has wanted.
-///
-/// (This paragraph's neighbour, `MAX_ATTACHMENTS`, restates its own derivation
-/// as a FLOOR since unit 6b — see there.)
-/// **AND IT IS THE COMPILED FLOOR SINCE M5 UNIT 6a** (sawos design 34).
-/// `SlabKind.Pipes` raises it, and a pipe donation carries the STAGING RINGS with
-/// it: one unit is a connection slot plus `PIPE_INFLIGHT` exchange records, which
-/// makes it by far the most expensive kind per slot — exactly the storage this
-/// paragraph already says a connection is not free because of.
+/// `SlabKind.Pipes` raises the ceiling, and a pipe donation carries the staging
+/// rings with it: one unit is a connection slot plus `PIPE_INFLIGHT` exchange
+/// records, by far the most expensive kind per slot.
 public(package) static MAX_PIPES: Int = 4
 
 /// The same sentinel for the Pipe slab.
 public(package) static NO_PIPE: Int = -1
 
-/// **MESSAGES ONE CONNECTION MAY HOLD STAGED, AS A BUILD DEFINE** (spec §2.1 as
-/// amended by design 10 ruling 6; sawos design 13).
+/// Messages one connection may hold staged (spec §2.1).
 ///
-/// **IT DERIVES FROM `MAX_THREADS`, AND THAT IS THE RULING'S OWN ARITHMETIC**:
-/// two per thread, so a system in which every thread has a request in flight and
-/// a reply outstanding still cannot fill the ring on the sender's own account.
-/// A derived size beside the number it derives from is what DF-232g permits and
-/// what this file exists for.
+/// Derived from `MAX_THREADS`: two per thread, so a system in which every
+/// thread has a request in flight and a reply outstanding cannot fill the ring
+/// on the sender's own account. The staging is a small per-connection ring of
+/// fixed slots, which keeps spec §2.1's property of zero dynamic kernel
+/// allocation while letting a client post again before the server has taken the
+/// first.
 ///
-/// **IT AMENDS §2.1's "STAGES ONE MESSAGE IN A FIXED SLOT"** (ruling 6): the
-/// staging is a small per-connection RING of fixed slots, which keeps the
-/// property that sentence was ratified FOR — zero dynamic kernel allocation —
-/// while letting a client post again before the server has taken the first.
-///
-/// It is deliberately NOT published to userspace, and that is the cut design 13
-/// records against ruling 6: a ring's depth is a slab dimension, and a caller
-/// that meets a full one is told `WouldBlock` without ever needing the number.
-/// `PIPE_BODY_BYTES` is the half that IS a published contract, so it lives in
-/// `sosabi` where both halves compile against one declaration.
+/// It is deliberately not published to userspace: a ring's depth is a slab
+/// dimension, and a caller that meets a full one is told `WouldBlock` without
+/// needing the number. `PIPE_BODY_BYTES` is the half that is a published
+/// contract, so it lives in `sosabi`.
 public(package) static PIPE_INFLIGHT: Int = 2 * MAX_THREADS
 
 static_assert(PIPE_INFLIGHT >= 1,
@@ -374,50 +268,38 @@ static_assert(PIPE_INFLIGHT <= 64,
 public(package) static MAX_HANDLES: Int = 16
 
 // =============================================================================
-// THE EXTENT CHAIN (sawos design 32, M5 unit 6; design 25 D-6)
+// The extent chain
 // =============================================================================
 //
-// **EVERY NUMBER ABOVE IS NOW A FLOOR RATHER THAN A CEILING, for the ELEVEN
-// kinds designs 32 and 34 converted between them.** A `MAX_<KIND>` is extent 0's length — what the image is
-// built with, what the kernel boots on, and what a machine that never donates
-// still gets — and `SlabDonate` raises the machine's actual capacity above it.
-// The numbers did not change and neither did the argument for choosing them:
-// they are the smallest that serve the workload of record, and the deployment
-// that wants more now says so instead of asking for a recompile.
+// Every slab budget above (each `MAX_<KIND>` except `MAX_HANDLES` and
+// `MAX_GRANT_ROWS`, which are fixed array lengths) is a floor, not a ceiling:
+// it is extent 0's length, what the image is built with and what a machine that
+// never donates gets. `SlabDonate` raises the machine's actual capacity above
+// it.
 
-/// DONATED extents one slab may accept, beyond its compiled extent 0.
+/// Donated extents one slab may accept, beyond its compiled extent 0.
 ///
-/// Four, and the number is about the TABLE rather than about the memory: each
-/// extent costs a base and a slot count in every converted slab's static, so the
-/// cost is paid by kinds that are never donated to as well. A deployment wanting
-/// one kind very large donates one large region rather than four small ones,
-/// which is the shape a boot-time policy actually has — donation is permanent in
-/// v1, so nothing here is spent and re-spent.
+/// The number is about the table rather than the memory: each extent costs a
+/// base and a slot count in every converted slab's static, paid by kinds that
+/// are never donated to as well. A deployment wanting one kind very large
+/// donates one large region rather than several small ones. Donation is
+/// permanent, so nothing is spent and re-spent.
 ///
-/// A fifth donation for one kind answers `NoResource`, which is that status
-/// meaning exactly what it always meant: the machine cannot do this right now.
+/// A donation to a kind that already has this many extents answers
+/// `NoResource`: the machine cannot do this right now.
 public(package) static MAX_SLAB_EXTENTS: Int = 4
 
 /// The largest total capacity any one slab may reach.
 ///
-/// **WHAT `HANDLE_INDEX_BITS` DOES AND DOES NOT BOUND, recorded here because the
-/// design that asked for this assert assumed the other answer** (design 25 D-6:
-/// "a handle word's index bits span the chain"). In THIS kernel they do not. A
-/// handle word is `(generation, index)` where the index names a row of the
-/// CALLER'S OWN HANDLE TABLE (§3), and the row then names the slab slot in a
-/// full-width `Int` field (`HandleEntry.target`) — so a slab may grow past
-/// `1 << HANDLE_INDEX_BITS` without a single extra index bit, and design 32
-/// needed no change to the handle word at all.
-///
-/// What `HANDLE_INDEX_BITS` really bounds is `MAX_HANDLES`, the PER-PROCESS
-/// table (the assert lives with the decoder, in `kcore.objects`) — and that is
-/// the ceiling a deployment actually meets: however many Events the machine can
-/// hold, one process can NAME at most `MAX_HANDLES` of them at once. Raising
-/// that is raising a `MAX_PROCESSES`-shaped array, which is unit 6b's subject
-/// and deliberately not this unit's.
-///
-/// So the honest relation to pin is the one below: the machine's slab ceiling is
-/// never the thing that stops every process from filling its table.
+/// `HANDLE_INDEX_BITS` does not bound this. A handle word is
+/// `(generation, index)` where the index names a row of the caller's own handle
+/// table (spec §3), and the row names the slab slot in a full-width `Int` field
+/// (`HandleEntry.target`), so a slab may grow past `1 << HANDLE_INDEX_BITS`
+/// without an extra index bit. `HANDLE_INDEX_BITS` bounds `MAX_HANDLES`, the
+/// per-process table (the assert lives with the decoder, in `kcore.objects`):
+/// however many Events the machine can hold, one process can name at most
+/// `MAX_HANDLES` of them at once. The relation pinned below is that the slab
+/// ceiling never stops every process from filling its table.
 public(package) static MAX_SLAB_CAPACITY: Int = 1 << 20
 
 static_assert(MAX_SLAB_CAPACITY >= MAX_HANDLES * MAX_PROCESSES,
@@ -431,12 +313,11 @@ static_assert(MAX_SLAB_EXTENTS >= 1,
 
 /// Bytes reserved per thread for its saved context.
 ///
-/// A STRIDE, not a size: the frame layout is the HAL's and differs per profile
-/// (32 words on one, 34 doublewords on the other), so the kernel reserves a
+/// A stride, not a size: the frame layout is the HAL's and differs per profile
+/// (a different number of words on each), so the kernel reserves a
 /// generous power-of-two slot and asserts the machine's real frame fits. The
-/// stride is also the ALIGNMENT the arena is rounded to, which is how a frame
-/// gets the 16-byte alignment one profile's stack pointer requires without the
-/// kernel having to know that is why.
+/// stride is also the alignment the arena is rounded to, which gives each frame
+/// the 16-byte alignment one profile's stack pointer requires.
 public(package) static THREAD_FRAME_STRIDE: Int = 512
 
 static_assert(hal.FRAME_BYTES <= THREAD_FRAME_STRIDE,
@@ -453,10 +334,10 @@ static_assert(CLOCK_KINDS == 1,
               "one slot per ClockType, and v1 declares exactly one domain")
 
 /// "No thread". Slot indices are ordinary 0-based `Int`s in the tables and
-/// PLUS-ONE inside list links; this is the sentinel for the plain form.
+/// plus-one inside list links; this is the sentinel for the plain form.
 public(package) static NO_THREAD: Int = -1
 
-/// The same sentinel for the other tables. There is none for CLOCKS: every
+/// The same sentinel for the other tables. There is none for clocks: every
 /// domain's slot exists from boot, so "no clock" is not a state the kernel can
 /// be in.
 public(package) static NO_EVENT: Int = -1
@@ -470,31 +351,23 @@ public(package) static NO_ATTACHMENT: Int = -1
 public(package) static NO_TIMER: Int = -1
 
 // =============================================================================
-// THE QUOTA DEFAULTS (spec §12's promise; sawos design 7 D-3)
+// The quota defaults (spec §2.9)
 // =============================================================================
 //
-// **THEY ARE IN THIS FILE BECAUSE THEY ARE THE SAME DECISION THE SLAB SIZES
-// ARE.** A slab size says how many of a thing the MACHINE can hold; a default
-// says how many one CHILD may hold of that. Choosing one without seeing the
-// other is how a policy cap ends up above the table it is supposed to sit
-// under, so the two blocks are adjacent and every number below is visibly
-// smaller than the slab above it.
+// A slab size says how many of a thing the machine can hold; a default says how
+// many one child may hold of that. Every number below is smaller than the slab
+// above it, so a policy cap is never above the table it sits under.
 //
-// **THEY ARE THE CHILD'S NUMBERS AND NOBODY ELSE'S.** Root is init and its
-// policy cap IS the machine (D-3), so root's rows are `QUOTA_UNLIMITED` and the
-// SLAB is what refuses it — see `install_quota_limits` in `kcore.objects` for
-// why a numerically-equal cap would have been the wrong spelling. There is no
-// per-create quota argument in v1: a launcher gets these numbers for every
-// child it makes, and the vocabulary for assigning others arrives with the
-// "assigned by policy" sentence the `process_create` receiver ruling left open.
+// These are the child's numbers only. Root is init and its policy cap is the
+// machine, so root's rows are `QUOTA_UNLIMITED` and the slab is what refuses
+// it; see `install_quota_limits` in `kcore.objects`. There is no per-create
+// quota argument: a launcher gets these numbers for every child it makes.
 //
-// **A THREAD ROW IS CHARGED AND NEVER CREDITED BEFORE TEARDOWN**, and that is
-// not an oversight: a thread slot itself is only returned at its process's
-// teardown (`ThreadState.Exited` is a state a slot stays in, so a join arriving
-// late still finds the exit code), so the quota tracks the slab exactly. A
-// process that creates and exits four threads has spent its four, which is what
-// the machine would have told it one slab larger.
-
+// A thread row is charged and not credited before teardown: a thread slot is
+// returned only at its process's teardown (`ThreadState.Exited` is a state a
+// slot stays in, so a late join still finds the exit code), so the quota tracks
+// the slab exactly. A process that creates and exits threads has spent one row
+// for each.
 /// Threads a child may hold at once.
 public(package) static DEFAULT_QUOTA_THREADS: Int = 4
 
@@ -502,7 +375,7 @@ public(package) static DEFAULT_QUOTA_THREADS: Int = 4
 public(package) static DEFAULT_QUOTA_EVENTS: Int = 4
 
 /// Waiters a child may hold at once. Fewer than events for the reason
-/// `MAX_WAITERS` is: a Waiter is a DISPATCH POINT, one per pool of workers.
+/// `MAX_WAITERS` is: a Waiter is a dispatch point.
 public(package) static DEFAULT_QUOTA_WAITERS: Int = 2
 
 /// IRQ lines a child may hold bound at once. Small because a driver child
@@ -518,65 +391,55 @@ public(package) static DEFAULT_QUOTA_MEMORIES: Int = 4
 /// Device windows a child may hold at once.
 public(package) static DEFAULT_QUOTA_IOMEMORIES: Int = 2
 
-/// GRANT ROWS a child's domain may carry beyond the ones its image spent.
+/// Grant rows a child's domain may carry beyond the ones its image spent.
 ///
-/// **THIS ROW COUNTS INSTALLED ROWS, NOT MAPPING OBJECTS**, which is the one
-/// place design 7's ledger departs from "quotas count objects" — and it is what
-/// makes agenda item 8's assert executable. See `QuotaKind.Mapping`.
+/// This row counts installed rows, not Mapping objects, the one place the
+/// ledger departs from "quotas count objects". See `QuotaKind.Mapping`.
 public(package) static DEFAULT_QUOTA_MAPPINGS: Int = 2
 
-/// Pipe CONNECTIONS a child may hold at once (spec §2.1; sawos design 13).
+/// Pipe connections a child may hold at once (spec §2.1).
 ///
-/// **CREATOR-PAYS, so this row counts what a child MADE and not what it was
-/// handed** (design 10 ruling 6's "the pair's creator is charged for both
-/// ends"). A child given one end of a connection its launcher created spends
-/// nothing here — it spends a HANDLE row, like every other capability that
-/// arrives — which is what makes a server child able to hold many sessions
-/// under a small pipe budget.
-///
-/// Two, on `DEFAULT_QUOTA_WAITERS`' reasoning: a connection is a per-client
-/// relationship and a child that makes its own is a launcher in miniature.
+/// Creator pays: this row counts what a child made, not what it was handed. A
+/// child given one end of a connection its launcher created spends a handle row
+/// like any other capability, which lets a server child hold many sessions
+/// under a small pipe budget. The row is small because a connection slot is the
+/// most expensive object per slot (see `MAX_PIPES`).
 public(package) static DEFAULT_QUOTA_PIPES: Int = 2
 
-/// Handle-table entries a child may hold at once (§3; design 3's promised row).
+/// Handle-table entries a child may hold at once (spec §3).
 ///
-/// Below `MAX_HANDLES` on purpose, so a child meets ITS budget rather than the
-/// table's — the table is shared machinery and the number a child is told about
-/// should be its own.
+/// Below `MAX_HANDLES` on purpose, so a child meets its own budget rather than
+/// the table's.
 public(package) static DEFAULT_QUOTA_HANDLES: Int = 12
 
 /// Grant rows a v1 image spends before its process runs: `code|rodata|rw`
 /// collapses to two loadable segments, plus the kernel's stack grant at the
-/// region's top. Root's images and children's images both spend three.
+/// region's top. Root's image and children's images spend the same.
 public(package) static IMAGE_GRANT_ROWS: Int = 3
 
-/// The SMALLER of the two profiles' row budgets, written down so the assert
-/// below can be a compile-time one. `hal.GRANT_ROW_BUDGET` is a `UInt` and the
-/// quota numbers are `Int`s; rather than cast in a `static_assert`, the minimum
-/// is stated here and pinned against the HAL on the next line.
+/// The smaller of the two profiles' row budgets, written down so the assert
+/// below can be compile-time. `hal.GRANT_ROW_BUDGET` is a `UInt` and the quota
+/// numbers are `Int`s; the minimum is stated here and pinned against the HAL on
+/// the next line rather than cast in a `static_assert`.
 public(package) static MIN_GRANT_ROW_BUDGET: Int = 8
 
 static_assert(hal.GRANT_ROW_BUDGET >= 8,
               "MIN_GRANT_ROW_BUDGET is stale — this profile grants fewer rows than it claims")
 
-// **AGENDA ITEM 8's ASSERT, THE COMPILE-TIME HALF** (sawos design 7 D-3). The
-// mapping default is chosen so that a child on it can always spend its whole
-// budget without the MACHINE refusing first — on either profile, since the
-// smaller of the two is what is tested. That is what makes `install_row`'s
-// `fatal` a statement about a kernel bug rather than about a number somebody
-// picked too large: a `map()` meeting the physical wall with quota headroom
-// left cannot be a policy mistake if policy was proven to fit.
+// The mapping default is chosen so that a child on it can always spend its
+// whole budget without the machine refusing first, on either profile (the
+// smaller is what is tested). That makes `install_row`'s `fatal` a statement
+// about a kernel bug rather than a number picked too large.
 //
-// The RUNTIME half is `install_quota_limits`, which clamps every process's
-// mapping row to what its own domain actually has left after its image — the
-// part a compile-time test cannot know, because how many rows an image spends
-// is a property of the image.
+// The run-time half is `install_quota_limits`, which clamps every process's
+// mapping row to what its own domain has left after its image, something a
+// compile-time test cannot know.
 static_assert(DEFAULT_QUOTA_MAPPINGS + IMAGE_GRANT_ROWS <= MIN_GRANT_ROW_BUDGET,
               "a child's mapping quota must fit the smaller profile's free grant rows")
 
-// Every default is under the slab it draws from, which is what makes a child
-// meet its OWN budget rather than the machine's. A default at or above its slab
-// would make `QuotaExceeded` unreachable for that kind and the row a lie.
+// Every default is under the slab it draws from, so a child meets its own
+// budget rather than the machine's. A default at or above its slab would make
+// `QuotaExceeded` unreachable for that kind.
 static_assert(DEFAULT_QUOTA_THREADS < MAX_THREADS, "a thread default must be under the slab")
 static_assert(DEFAULT_QUOTA_EVENTS < MAX_EVENTS, "an event default must be under the slab")
 static_assert(DEFAULT_QUOTA_WAITERS < MAX_WAITERS, "a waiter default must be under the slab")

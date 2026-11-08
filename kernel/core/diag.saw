@@ -1,62 +1,59 @@
-//! THE CONSOLE, AND THE WAYS A RUN ENDS BADLY.
+//! The console, and the ways a run ends badly.
 //!
 //! The formatting half of a diagnostic (a string one scalar at a time, a
-//! machine word as fixed-width hex) plus the two reports that stop the machine:
-//! `fatal` for a trap the kernel cannot survive and `fatal_image` for a root
-//! image it refuses to boot.
+//! machine word as fixed-width hex) plus the reports that stop the machine:
+//! `fatal` for a trap the kernel cannot survive, `fatal_kernel` for a broken
+//! kernel invariant and `fatal_image` for a root image it refuses to boot.
 //!
-//! IT CALLS NOTHING IN THE KERNEL, which is what lets every other seam report.
-//! The reports that TEAR A PROCESS DOWN are not here — they own kernel state and
-//! live in `process` — and the difference is exactly whether there is anything
-//! left to clean up.
+//! It calls nothing in the kernel, which is what lets every other seam report.
+//! The reports that tear a process down are not here: they own kernel state and
+//! live in `sched`. The difference is whether there is anything left to clean
+//! up.
 
 import hal
 import sosrt.{ascii_byte, hex_digit_of, hex_digits_per_word}
 
 /// The kernel's console: the arch-free half of writing a diagnostic.
 ///
-/// It formats — a string one scalar at a time, a machine word as fixed-width
-/// hex — and hands each byte to the HAL, which knows what device it is. The
-/// split is deliberate: `write_hex` is the same code on every target, and the
-/// only thing that ever differs is where the byte lands.
+/// It formats (a string one scalar at a time, a machine word as fixed-width
+/// hex) and hands each byte to the HAL, which knows what device it is.
+/// `write_hex` is the same code on every target; only where the byte lands
+/// differs.
 ///
-/// # THE UART HANDOVER PROTOCOL (ruled Aug 16, user — design 178's finale)
+/// # The UART handover protocol
 ///
-/// Both machines have ONE console UART and both the kernel and a driver process
-/// can drive it. Unstated, that is a flaky-test mystery: two writers on one
-/// device interleave mid-word and nothing in either is wrong.
-///
-/// So the ownership is stated, and it has three phases:
+/// There is one console UART and both the kernel and a driver process can drive
+/// it. Unstated, that is a flaky-test mystery: two writers on one device
+/// interleave mid-word and nothing in either is wrong. Ownership has three
+/// phases:
 ///
 ///   1. **Boot.** The kernel owns the device outright. It narrates the banner,
 ///      the image, and anything that goes wrong.
-///   2. **Handover.** `start_process` writes ONE marker line — `SOS: console
-///      handover` — as the last thing the kernel says on its own initiative.
-///      After it, THE PROCESS OWNS THE DEVICE.
+///   2. **Handover.** `start_process` writes one marker line, `SOS: console
+///      handover`, as the last thing the kernel says on its own initiative.
+///      After it, the process owns the device.
 ///   3. **Reclaim, on diagnostics only.** The kernel writes again exactly where
 ///      the run has already failed or ended: a fault report, a process
 ///      teardown, a panic, or an interrupt on a line nothing is bound to. The
 ///      interleaving those may cause is acceptable because there is no longer a
 ///      transcript to protect.
 ///
-/// WHAT THE KERNEL STILL WRITES ON DEMAND is not a violation of this: a
-/// `SystemOp.DebugPrint` is the PROCESS asking the kernel to place a byte, and
-/// the process is the one sequencing it. What the protocol forbids is the
-/// kernel narrating over a process that is using the device.
+/// What the kernel writes on demand does not violate this: a
+/// `SystemOp.DebugPrint` is the process asking the kernel to place a byte, and
+/// the process sequences it. The protocol forbids the kernel narrating over a
+/// process that is using the device.
 ///
-/// A KERNEL THAT ARMS A TIMER is the one exception worth knowing, and it is
-/// bounded: `TICK_REPORT_LIMIT` ticks are narrated after handover before the
-/// tick path goes quiet. That is why the preemption case does not assert its
-/// root's banner, and why a case whose transcript matters after handover arms
-/// no timer.
+/// A kernel that arms a timer is the one bounded exception: `TICK_REPORT_LIMIT`
+/// ticks are narrated after handover before the tick path goes quiet. That is
+/// why the preemption case does not assert its root's banner, and why a case
+/// whose transcript matters after handover arms no timer.
 ///
-/// The DEVICE half of this — which registers, and what a second writer does to
-/// them — is stated in each HAL's console section.
+/// The device half (which registers, and what a second writer does to them) is
+/// stated in each HAL's console section.
 public struct Console {
     /// A console is a capability to write, not a device handle: the HAL owns
-    /// the device. The field exists because a zero-field struct has no reason
-    /// to exist either — it records which sink the writes go to, and today
-    /// there is one.
+    /// the device. The field records which sink the writes go to (there is
+    /// one), since a zero-field struct has no reason to exist either.
     sink: UInt8,
 }
 
@@ -70,14 +67,13 @@ extension Console {
     /// `sosrt`'s, so the kernel console and a process console agree on what a
     /// non-ASCII scalar becomes.
     ///
-    /// AUDIT (design 1): NO PREEMPTION POINT, and this is the one verdict that
-    /// ACCEPTS latency rather than arguing it away. The loop is bounded by the
-    /// device drain, so a long diagnostic line IS masked latency and is recorded
-    /// as such. Two reasons not to point it anyway: half of this module's callers
-    /// are the fault reports, which run with the kernel's state already
-    /// deliberately inconsistent; and a delivery here would interleave the tick
-    /// path's own console output into the middle of the line being written —
-    /// into the very transcript the acceptance oracle diffs.
+    /// No preemption point, and this is the one verdict that accepts latency
+    /// rather than arguing it away. The loop is bounded by the device drain, so
+    /// a long diagnostic line is masked latency. Two reasons not to point it:
+    /// half of this module's callers are the fault reports, which run with the
+    /// kernel's state already deliberately inconsistent; and a delivery here
+    /// would interleave the tick path's own console output into the middle of
+    /// the line being written, into the transcript the acceptance oracle diffs.
     public func write_str(&self, msg: String) {
         for scalar in msg.scalars() {
             hal.console_byte(ascii_byte(scalar))
@@ -85,12 +81,11 @@ extension Console {
     }
 
     /// Write a machine word as `0x` + one hex digit per nibble. No allocation,
-    /// no formatting machinery — the kernel has neither an allocator worth
-    /// spending nor a reason to build a string.
+    /// no formatting machinery.
     ///
-    /// The WIDTH is the target's word, not a constant: eight digits on a
-    /// 32-bit profile and sixteen on a 64-bit one. A fixed eight would print
-    /// the low half of a 64-bit address and look like a complete answer.
+    /// The width is the target's word, not a constant: eight digits on a 32-bit
+    /// target and sixteen on a 64-bit one. A fixed eight would print the low
+    /// half of a 64-bit address and look like a complete answer.
     public func write_hex(&self, v: UInt) {
         self.write_str("0x")
         let digits = hex_digits_per_word()
@@ -102,8 +97,7 @@ extension Console {
     }
 }
 
-/// A console for this board. Constructing one costs nothing; a true `static`
-/// singleton waits on Once/Lazy (tracker F5).
+/// A console for this board. Constructing one costs nothing.
 public func console() -> Console {
     Console(sink: 0)
 }
@@ -112,23 +106,19 @@ public func console() -> Console {
 /// distinct from any status root chooses for itself.
 ///
 /// A type rather than a family of `UInt`s so `fatal` cannot be handed an
-/// arbitrary number: the kernel's own failure vocabulary is closed, and the
-/// harness asserts on these values.
-/// 3 is deliberately absent. It was `BadSyscall`, from when a bad op number
-/// killed the process; under the object-op model a caller's mistake became a
-/// status the process received and survived — and design 178's faults ruling
-/// has since made it a kill again, under `ProcessFault`. The values are
-/// per-case, so a gap costs nothing and a reused number would have made two
-/// eras' transcripts read alike.
+/// arbitrary number: the kernel's failure vocabulary is closed, and the harness
+/// asserts on these values.
+///
+/// 3 is deliberately absent. The values are per-case, so a gap costs nothing,
+/// and reusing a retired number would make unrelated transcripts read alike.
 public enum ExitCode: UInt {
     case UmodeFault = 2,
     case BadImage = 4,
     case ProcessFault = 5,
-    /// **THE KERNEL FOUND ITS OWN INVARIANT BROKEN** (sawos design 7). Not a
-    /// process's mistake and not the build's: a state the kernel's own rules
-    /// say cannot exist. It is a separate number from `BadImage` because the
-    /// two say opposite things about who is at fault, and a transcript reader
-    /// should never have to guess which.
+    /// The kernel found its own invariant broken: a state the kernel's own
+    /// rules say cannot exist. Not a process's mistake and not the build's. It
+    /// is a separate number from `BadImage` because the two say opposite things
+    /// about who is at fault.
     case KernelBug = 6,
 }
 
@@ -136,9 +126,8 @@ public enum ExitCode: UInt {
 // Fault reporting
 // =============================================================================
 
-/// Report a fatal condition on the console and FAIL the run. Never returns —
-/// M0's discipline, carried into the user-mode split: a fault is diagnosed and
-/// the machine stops non-zero, never a hang.
+/// Report a fatal condition on the console and fail the run. Never returns: a
+/// fault is diagnosed and the machine stops non-zero, never a hang.
 public func fatal(tag: String, cause: UInt, epc: UInt, tval: UInt, code: ExitCode) {
     let uart = console()
     uart.write_str("SOS: fault ")
@@ -153,20 +142,18 @@ public func fatal(tag: String, cause: UInt, epc: UInt, tval: UInt, code: ExitCod
     hal.exit_fail(code as UInt)
 }
 
-/// **STOP: THE KERNEL BROKE ITS OWN INVARIANT.** Never returns.
+/// Stop: the kernel broke its own invariant. Never returns.
 ///
-/// The third failure vocabulary, and the line between the three is WHOSE
-/// MISTAKE IT WAS. A caller error ends the PROCESS (`fault_process`); a
-/// malformed boot image ends the machine as `fatal_image`, because the build
-/// wrote those bytes; and this one ends the machine because the KERNEL reached
-/// a state its own rules say is unreachable. Reporting it as either of the
-/// others would blame somebody who did nothing wrong.
+/// The line between the three failure vocabularies is whose mistake it was. A
+/// caller error ends the process (`fault_process`); a malformed boot image ends
+/// the machine as `fatal_image`, because the build wrote those bytes; and this
+/// one ends the machine because the kernel reached a state its own rules say is
+/// unreachable. Reporting it as either of the others would blame somebody who
+/// did nothing wrong.
 ///
-/// It exists because design 7 made two such states nameable for the first time:
-/// a `map()` that meets the physical row wall with quota headroom left (agenda
-/// item 8's ruled sentence, now executable — `install_quota_limits` is what
-/// makes it unreachable), and a `free_object` reaching a kind that has no slab
-/// to free into.
+/// Examples: a `map()` that meets the physical row wall with quota headroom
+/// left (`install_quota_limits` is what makes it unreachable), and a
+/// `free_object` reaching a kind that has no slab to free into.
 public func fatal_kernel(reason: String, detail: UInt) {
     let uart = console()
     uart.write_str("SOS: kernel bug: ")

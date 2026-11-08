@@ -1,23 +1,18 @@
-//! EVENTS, WAITERS AND ATTACHMENTS (spec §2.2, §2.4; design 178 D5) — the
-//! slabs, and THE PER-KIND MATRIX in one place.
+//! Events, Waiters and Attachments (spec §2.2, §2.4): the slabs, and the
+//! per-kind matrix in one place.
 //!
-//! Between them the whole of asynchronous notification: an Event is a word that
-//! accumulates and never blocks, a Waiter is a set of waitables plus the threads
-//! parked on the set, and an Attachment is the pair.
+//! Together they are the whole of asynchronous notification: an Event is a word
+//! that accumulates and never blocks, a Waiter is a set of waitables plus the
+//! threads parked on the set, and an Attachment is the pair.
 //!
-//! THE DELIVERY IS NOT HERE (`wake`), and the split is the module order rather
-//! than a preference: answering a wait writes into a process's memory, which is
-//! the copy door in `process`, which tears a process down, which frees these
-//! slabs. So the tables and the questions asked OF them stay below the teardown,
-//! and the act of telling somebody stays above it.
+//! Delivery is not here (see `refs`). Answering a wait writes into a process's
+//! memory through the copy door in `process`, and delivery drops references and
+//! frees objects, so it sits above both `process` and these slabs. The tables
+//! and the questions asked of them stay below it.
 //!
-//! **AND SINCE M3 UNIT 5.5 THIS FILE SITS ABOVE `process`** (sawos design 8),
-//! which is the one altitude the split moved. The fourth waitable is a PROCESS,
-//! and its three per-kind answers — who is watching it, is it dead, what does
-//! the record say — are reads of `PROCESSES`. The rule is unchanged and the
-//! order it produced changed: a module sits where its call graph allows, this
-//! one now reaches down into the process table, and `process` reaches nothing
-//! here.
+//! The Process waitable's per-kind answers (who is watching it, is it dead,
+//! what does the record say) are reads of `PROCESSES` in `pslot`. `process`
+//! imports nothing from here, so there is no cycle.
 
 import sosabi.{EventMode, InletLevel, OutletLevel, ReplyLevel, WaitTag,
                process_status_word}
@@ -45,66 +40,45 @@ import kcore.objects.{
 }
 import kcore.threads.{NEED_RESCHED, THREADS, ThreadState}
 import kcore.time.{TIMERS, saturating_add}
-// **THE ONE IMPORT M3 UNIT 5.5 ADDED, AND IT MOVED THIS MODULE'S ALTITUDE**
-// (sawos design 8). A Process handle is the fourth waitable, and everything the
-// matrix below has to know about one — is it ready, what does a record say, who
-// is watching it — is a read of the process slot. So this file now sits ABOVE
-// `process` in `kcore`'s dependency order instead of below it. Nothing went the
-// other way: `process` names nothing here, which is what makes the flip a
-// reordering rather than the cycle DF-232e diagnoses.
+// Process is a waitable kind, so the per-kind matrix below reads the process
+// slot. `process` must not import this module.
 import kcore.pslot.{PROCESSES, ProcessState}
 
-/// WHICH KINDS CAN BE ATTACHED TO A WAITER — the waitable kinds, and only
+/// The kinds that can be attached to a Waiter: the waitable kinds, and only
 /// those.
 ///
-/// It is a SECOND enum beside `ObjType` rather than a `Bool` on it, and the
-/// reason is the same one `sosabi` gives for not recording waitability there at
-/// all: attaching also spends a RIGHT, and which enum's bits that right lives in
-/// is decided by the kind. `waitable_slot` is where an `ObjType` becomes one of
-/// these, and it is the only place — every non-waitable arm of that match
-/// terminates the process instead of producing a value.
+/// This is a second enum beside `ObjType` rather than a `Bool` on it, because
+/// attaching also spends a right, and which enum's bits that right lives in is
+/// decided by the kind. `waitable_slot` is the only place an `ObjType` becomes
+/// one of these; every non-waitable arm of that match terminates the process
+/// instead of producing a value.
 ///
-/// What this enum buys downstream is that the five per-kind questions below are
-/// EXHAUSTIVE OVER WAITABLES rather than over object types: an object kind that
-/// is not waitable costs them nothing, and a new WAITABLE kind fails all five
-/// to compile until somebody answers for it. (The count was "four" here until
-/// design 232 unit 1's Timer added the drain question and this line was missed;
-/// design 8 fixes it while collecting the promise.)
-///
-/// **THE FOURTH KIND COLLECTED THAT PROMISE** (sawos design 8, M3 unit 5.5):
-/// adding `Process` here failed all five matrix arms and `waitable_obj_type`
-/// beside them, so the compiler enumerated the work rather than a reviewer.
-///
-/// **AND M4 UNIT 3 COLLECTED IT FOUR MORE TIMES AT ONCE** (sawos design 15, on
-/// design 10 rulings 8 and 11): the four pipe kinds moved from `NotWaitable` to
-/// waitable, which is not a new object anywhere — no slab, no op, no kind —
-/// and every one of the five matrix questions failed to compile until each of
-/// the four had an answer.
+/// The per-kind questions below are exhaustive over waitables, not over object
+/// types: a non-waitable object kind costs them nothing, and a new waitable
+/// kind fails every one of them to compile until somebody answers for it.
 public(package) enum WaitableKind: UInt8 {
     case Event = 0,
     case Interrupt = 1,
     case Timer = 2,
-    /// A PROCESS, ready once it has ENDED (spec §8; sawos design 8). The one
-    /// waitable that is not a notification object: nothing creates it to be
-    /// waited on, it is the process itself, and what a supervisor attaches is
-    /// the handle `process_create` already gave it.
+    /// A process, ready once it has ended (spec §8). It is not a notification
+    /// object: nothing creates it to be waited on, and what a supervisor
+    /// attaches is the handle `process_create` already gave it.
     case Process = 3,
-    /// A `PipeOutlet` — the SERVER end, READABLE while a message is staged or
+    /// A `PipeOutlet`, the server end: readable while a message is staged or
     /// the client end is gone (spec §2.2's waitable list). `slot` is the
-    /// CONNECTION's.
+    /// connection's.
     case PipeOutlet = 4,
-    /// A `PipeInlet` — the CLIENT end, POSTABLE while the ring has a free slot
-    /// or the server end is gone (design 10 ruling 8). `slot` is the
-    /// connection's, so the two endpoint kinds index one table and differ only
-    /// in which column and which attachment field they read — design 13 D-1's
-    /// mechanism reaching the wait machinery.
+    /// A `PipeInlet`, the client end: postable while the ring has a free slot
+    /// or the server end is gone. `slot` is the connection's, so the two
+    /// endpoint kinds index one table and differ only in which column and which
+    /// attachment field they read.
     case PipeInlet = 5,
-    /// A `PipeReply` — the CLIENT's claim, ready once the answer has been
-    /// written or can never be (design 10 ruling 11(a)). `slot` is an EXCHANGE,
-    /// and this is the one waitable whose delivery carries BYTES.
+    /// A `PipeReply`, the client's claim: ready once the answer has been
+    /// written or can never be. `slot` is an exchange. This is the one waitable
+    /// whose delivery carries bytes.
     case PipeReply = 6,
-    /// A `PipeRequest` — the SERVER's obligation, ready once the claim behind it
-    /// has been abandoned (§2.1's ratified early notice). `slot` is an exchange.
+    /// A `PipeRequest`, the server's obligation: ready once the claim behind it
+    /// has been abandoned (§2.1's early notice). `slot` is an exchange.
     case PipeRequest = 7,
 }
 
@@ -116,25 +90,21 @@ public(package) struct Waitable {
 
 /// One Event (spec §2.4): the accumulating non-blocking notification.
 ///
-/// `word` IS the object. Non-zero means ready, which is what makes readiness
-/// LEVEL-TRIGGERED for free (§2.2) — nothing records that a waiter has been
-/// told, so every look at the word gives the same answer until somebody TAKES
-/// it. There is no edge to lose because there is no edge.
+/// `word` is the object. Non-zero means ready, which makes readiness
+/// level-triggered (§2.2): nothing records that a waiter has been told, so
+/// every look at the word gives the same answer until somebody takes it.
 ///
-/// TAKING IT IS READ-AND-CLEAR THROUGH EITHER DOOR (ruled Aug 17, user):
-/// §2.4's `Receive` is the non-blocking poll, a `Waiter.wait` delivery is the
-/// blocking one, and both hand the word to a process and reset it. So the word
-/// is never reported twice, and a signal arriving after a take re-arms this
-/// object with its own bits alone.
+/// Taking is read-and-clear through either door: §2.4's `Receive` (the
+/// non-blocking poll) and a `Waiter.wait` delivery (the blocking one) both hand
+/// the word to a process and reset it. So the word is never reported twice, and
+/// a signal arriving after a take re-arms this object with its own bits alone.
 ///
-/// `attachment` is the ONE thing an Event knows about the wait side: which
-/// attachment names it, or zero. §2.2 ratifies at most one Waiter per handle,
-/// so that is a field rather than a list, and it is what makes `Signal`'s hot
-/// path one load. Everything else about the attachment — which Waiter, which
-/// key, what comes next on the list — lives in the attachment itself, because
-/// an Interrupt has the same field and neither kind should carry a copy of the
-/// wait machinery. Slot indices are stored PLUS ONE so that zero means "none",
-/// which is what a zeroed static already says.
+/// `attachment` is the one thing an Event knows about the wait side: which
+/// attachment names it, or zero. §2.2 allows at most one Waiter per handle, so
+/// this is a field rather than a list, which keeps `Signal`'s hot path to one
+/// load. Everything else about the attachment lives in the attachment itself.
+/// Slot indices are stored plus one so that zero means "none", which is what a
+/// zeroed static already says.
 public(package) struct EventSlot {
     public(package) state: SlotState,
     public(package) process: Int,
@@ -144,33 +114,25 @@ public(package) struct EventSlot {
     public(package) word: UInt,
     /// The attachment naming this event (slot + 1); 0 = unattached.
     public(package) attachment: Int,
-    /// Handle entries naming this event, PLUS its attachment (sawos design 7
-    /// D-1).
+    /// Handle entries naming this event, plus its attachment.
     ///
-    /// **THE ATTACHMENT COUNTS**, and that is what makes design 7's cascade
-    /// well-founded rather than circular: an attached Event cannot reach zero,
-    /// so nothing frees a waitable out from under the Waiter watching it — the
-    /// Waiter's own death detaches first, and THAT decrement is what may take
-    /// this one to zero.
+    /// The attachment counts, so an attached Event cannot reach zero: nothing
+    /// frees a waitable out from under the Waiter watching it. The Waiter's own
+    /// death detaches first, and that decrement may take this one to zero.
     public(package) refs: UInt16,
 }
 
 /// One Interrupt (spec §2 table, §9): an IRQ line bound to a waitable.
 ///
-/// `pending` IS the object, exactly as an Event's word is: it is set when the
-/// line fires and cleared by `Ack`, and "ready" means nothing more than that.
-/// §9's at-most-one-unacked-fire invariant is therefore not maintained, it is
-/// REPRESENTED — a `Bool` cannot hold two — and what makes it true rather than
-/// merely representable is that the kernel MASKS the line before the hook runs
-/// and only `Ack` unmasks it, so the device physically cannot fire again in
-/// between.
+/// `pending` is the object, as an Event's word is: set when the line fires,
+/// cleared by `Ack`, and "ready" means nothing more. §9's
+/// at-most-one-unacked-fire invariant is represented (a `Bool` cannot hold
+/// two), and it is true because the kernel masks the line before the hook runs
+/// and only `Ack` unmasks it, so the device cannot fire again in between.
 ///
-/// `line` is the number the controller answers with, and it is what makes an
-/// Interrupt findable from the trap path: the hook has a line and needs the
-/// object. A table scan is what answers that, which at this slab size is a
-/// handful of loads and is bounded by the same argument every other scan in the
-/// interrupt path is (design 178 D2 — it runs with interrupts masked, so its
-/// length is interrupt latency).
+/// `line` is the number the controller answers with. The trap path has a line
+/// and needs the object, which a table scan answers. The scan runs with
+/// interrupts masked, so its length is interrupt latency.
 public(package) struct InterruptSlot {
     public(package) state: SlotState,
     public(package) process: Int,
@@ -180,21 +142,20 @@ public(package) struct InterruptSlot {
     public(package) pending: Bool,
     /// The attachment naming this interrupt (slot + 1); 0 = unattached.
     public(package) attachment: Int,
-    /// Handle entries naming this interrupt, PLUS its attachment (sawos design
-    /// 7 D-1). Reaching zero MASKS THE LINE — the kernel taking the line back
-    /// exactly as the teardown does — and returns the slot, so the line becomes
-    /// bindable again mid-life.
+    /// Handle entries naming this interrupt, plus its attachment. Reaching zero
+    /// masks the line and returns the slot, so the line becomes bindable again.
     public(package) refs: UInt16,
 }
 
 /// One Waiter (spec §2.2): the generic wait aggregator.
 ///
-/// TWO LISTS AND NOTHING ELSE. `attached` is the persistent subscription set —
-/// §2.2 has no one-shot mode, so an attachment is removed and never consumed —
-/// and `blocked` is the threads parked in `Wait`, which §2.2 allows to be
-/// several. Readiness is NOT a third list: it is derived by scanning `attached`
-/// for something ready, which is the level-triggered semantics stated as an
-/// implementation rather than maintained beside one.
+/// Two lists and nothing else. `attached` is the subscription set (§2.2 has no
+/// one-shot mode at the Waiter level; one-shot is a property of the attachment,
+/// `Attachment.oneshot`, and a kind whose delivery consumes ends its attachment
+/// at delivery too). `blocked` is the threads parked in `Wait`, which §2.2
+/// allows to be several. Readiness is not a third list: it is derived by
+/// scanning `attached` for something ready, which is the level-triggered
+/// semantics implemented rather than maintained beside it.
 public(package) struct WaiterSlot {
     public(package) state: SlotState,
     public(package) process: Int,
@@ -202,35 +163,27 @@ public(package) struct WaiterSlot {
     public(package) attached: Int,
     /// Head of the list of threads parked in `Wait` (thread slot + 1).
     ///
-    /// **AND IT IS WALKED ONE MORE TIME THAN A WAKE WALKS IT** (sawos design
-    /// 12, M4 unit 0): when this Waiter's last reference goes, `free_object`
-    /// answers every thread on this list with `SosStatus.Revoked` before the
-    /// slot returns to the slab. A readiness feeds ONE of them (§2.2's
-    /// distribution); a revocation answers ALL of them, because what they were
-    /// waiting on is what ceased to exist.
+    /// When this Waiter's last reference goes, `free_object` answers every
+    /// thread on this list with `SosStatus.Revoked` before the slot returns to
+    /// the slab. A readiness feeds one of them (§2.2's distribution); a
+    /// revocation answers all of them.
     public(package) blocked: Int,
-    /// Handle entries naming this waiter (sawos design 7 D-1).
-    ///
-    /// **ONLY HANDLES**, unlike the three waitable kinds: an attachment is a
-    /// reference to the WAITABLE, not to the Waiter that holds it — a Waiter
+    /// Handle entries naming this waiter. Only handles: an attachment is a
+    /// reference to the waitable, not to the Waiter that holds it. A Waiter
     /// owns its attachment list, so counting them here would be an object
-    /// counting itself and nothing would ever reach zero. That asymmetry is
-    /// what makes the Waiter the one kind whose free CASCADES.
+    /// counting itself and nothing would reach zero. This asymmetry is why the
+    /// Waiter's free cascades.
     public(package) refs: UInt16,
 }
 
-/// ONE ATTACHMENT: a Waiter, a waitable, and the key that names the pair.
+/// One attachment: a Waiter, a waitable, and the key that names the pair.
 ///
-/// IT IS A THIRD OBJECT RATHER THAN FIELDS ON THE WAITABLE, and the second
-/// waitable kind is what forced that (M2 unit 3 kept them on the Event). A
-/// Waiter's set has to be ONE list — a wait scans it once and a `Remove` walks
-/// it once — so a per-kind list would make both operations a matrix over kinds
-/// instead of a walk, and rider 4's "the same walk, and therefore one place to
-/// be wrong" would stop being true at exactly two kinds.
+/// It is a third object rather than fields on the waitable, so that a Waiter's
+/// set is one list: a wait scans it once and a `Remove` walks it once, instead
+/// of a matrix over kinds.
 ///
-/// What each waitable still keeps is a single `attachment` field, which is the
-/// answer to the only question the SIGNAL side asks: who, if anyone, is
-/// watching me.
+/// Each waitable keeps a single `attachment` field, which answers the only
+/// question the signal side asks: who, if anyone, is watching me.
 public(package) struct Attachment {
     public(package) state: SlotState,
     /// Which table `target` indexes.
@@ -242,42 +195,30 @@ public(package) struct Attachment {
     /// The word-sized key the attacher supplied (§2.2). The kernel stores it
     /// and hands it back; it never interprets it.
     public(package) key: UInt,
-    /// **DETACH AT DELIVERY** (design 10 ruling 9(b); sawos design 15). Set from
-    /// `WAITER_ADD_ONESHOT` at the attach, and read once — when a record for
-    /// this attachment's key is COPIED OUT, never at mere readiness. One-shot is
-    /// a property of the ATTACHMENT, the attacher's choice like the key, which
-    /// is why it is a field here and not a bit on the waitable.
-    ///
-    /// It is a `Bool` rather than the userspace `AttachMode` enum for the reason
-    /// `pending` is one on an `InterruptSlot`: the kernel's question is a yes/no
-    /// about this attachment, and the mode VALUE is the typed surface's
-    /// vocabulary. What crosses the boundary is a flag bit either way.
+    /// Detach at delivery. Set from `WAITER_ADD_ONESHOT` at the attach, and
+    /// read once, when a record for this attachment's key is copied out (never
+    /// at mere readiness). One-shot is the attacher's choice per attachment,
+    /// like the key, which is why it is a field here and not a bit on the
+    /// waitable. It is a `Bool` rather than the userspace `AttachMode` enum
+    /// because the kernel's question is a yes/no about this attachment.
     public(package) oneshot: Bool,
-    /// **THE ATTACHMENT OWNS THE OBJECT** — set from `WAITER_ADD_CONSUMING` at
-    /// the attach (`designs/010` ruling 11(c); sawos design 18).
+    /// The attachment owns the object. Set from `WAITER_ADD_CONSUMING` at the
+    /// attach. A persistent-consuming attachment on a `PipeOutlet` is the
+    /// completion-queue server, and its delivery is the take itself rather than
+    /// a report that there is something to take, so the attachment must
+    /// remember which kind of subscription it is.
     ///
-    /// Unit 3 read the consuming bit, released the caller's entry and threw the
-    /// bit away, because nothing downstream needed to know afterwards. Ruling
-    /// 11(d) is what needs it: a PERSISTENT-CONSUMING attachment on a
-    /// `PipeOutlet` is the COMPLETION-QUEUE SERVER, and its delivery is THE
-    /// TAKE rather than a report that there is something to take. That is a
-    /// different act, so the attachment has to remember which kind of
-    /// subscription it is.
-    ///
-    /// It is the second axis of ruling 11(c)'s 2x2 recorded beside the first:
-    /// `oneshot` says what happens to the ATTACHMENT at delivery, this says who
-    /// owns the OBJECT while it lives.
+    /// `oneshot` says what happens to the attachment at delivery; this says who
+    /// owns the object while it lives.
     public(package) owns: Bool,
     /// Next attachment on that waiter's list (slot + 1).
     public(package) link: Int,
 }
 
-// **FOUR EXTENT CHAINS SINCE M5 UNIT 6** (sawos design 32). Each of these is a
-// `Slab<T, N>` rather than a bare `[T; N]`: the array is EXTENT 0 and the
-// `MAX_<KIND>` beside it is the compiled floor, so nothing about a machine that
-// never donates has moved. `EVENTS[i]` still names slot `i` — the accessor lends
-// the slot where it sits — and what changed is every LOOP BOUND below, which now
-// reads `capacity()` so that a donated slot is one the allocator can find.
+// Each slab is a `Slab<T, N>`: the array is extent 0 and `MAX_<KIND>` is the
+// compiled floor. `EVENTS[i]` names slot `i` (the accessor lends the slot where
+// it sits). Loop bounds read `capacity()` so that a donated slot is one the
+// allocator can find.
 
 public(package) unsafe static var EVENTS: Slab<EventSlot, MAX_EVENTS> = Slab<EventSlot, MAX_EVENTS>(
     inline: [EventSlot(state: SlotState.Free, process: 0, mode: EventMode.Or,
@@ -370,49 +311,35 @@ public(package) func alloc_attachment() unsafe -> Int {
 }
 
 // -----------------------------------------------------------------------------
-// Events and Waiters (spec §2.2, §2.4; design 178 D5)
+// Events and Waiters (spec §2.2, §2.4)
 // -----------------------------------------------------------------------------
 //
-// THE TWO SMALLEST OBJECTS IN THE §2 TABLE, and between them the whole of
-// asynchronous notification: an Event is a word that accumulates and never
-// blocks, a Waiter is a set of them plus the threads parked on the set. They
-// are here rather than in M3 because they are what proves the handle machinery
-// generalizes past the singleton — three kinds became five with no change to
-// the dispatch's shape, which is the claim §3 has been making since M1.
+// Level-triggered readiness is an absence, not a mechanism (§2.2). The kernel
+// records nowhere that a waiter has been told about a ready event, so every
+// look at the attachment set gives the same answer until somebody takes the
+// word. That is what makes a signal landing before anyone waits safe: the word
+// is still non-zero when the wait arrives. An edge-triggered design would need
+// a "reported" flag per attachment and would lose exactly that.
 //
-// LEVEL-TRIGGERED IS AN ABSENCE, NOT A MECHANISM (§2.2, ratified Jul 29). The
-// kernel records nowhere that a waiter has been told about a ready event, so
-// every look at the attachment set gives the same answer until somebody TAKES
-// the word. That is what makes a signal landing BEFORE anyone waits safe: the
-// word is still non-zero when the wait arrives, and the scan finds it. An
-// edge-triggered design would need a "reported" flag per attachment and would
-// lose exactly that.
+// The take has two doors and both consume. `Receive` is the non-blocking poll
+// and a `Waiter.wait` is the blocking one; each hands the accumulated word to a
+// process, so each clears it. A delivery that left the word behind would report
+// the same bits to the next wait, and the recipient could not tell that
+// duplicate from a real second signal. A signal that lands after the take
+// re-arms readiness with its own bits alone.
 //
-// THE TAKE HAS TWO DOORS, AND BOTH CONSUME (ruled Aug 17, user). `Receive` is
-// the non-blocking poll and a `Waiter.wait` is the blocking one; each hands the
-// accumulated word to a process, so each clears it. A delivery that left the
-// word behind would report the same bits to the next wait as well, and the
-// recipient could not tell that duplicate from a real second signal — the one
-// failure mode a notification must not have. Nothing is lost either way: a
-// signal that lands after the take re-arms readiness with its own bits alone.
-//
-// WHAT WAKES WHOM, and it is a DISTRIBUTION rather than a broadcast. `Signal`
-// wakes AT MOST ONE parked thread (§2.2: "a ready handle wakes one waiter"),
-// and that thread's record carries the word — so with several threads parked on
-// one Waiter, one signal feeds exactly one of them and the rest wait for the
-// next, which is the worker-pool shape §2.2 exists for. THE RECIPIENT IS UNIQUE
-// BY CONSTRUCTION and no multi-watcher caveat is owed: a waitable has at most
-// ONE attachment (§2.2), so a signal reaches exactly one Waiter, which hands it
-// to exactly one thread.
+// A signal is a distribution, not a broadcast. `Signal` wakes at most one
+// parked thread (§2.2: "a ready handle wakes one waiter"), and that thread's
+// record carries the word, so with several threads parked on one Waiter one
+// signal feeds exactly one of them. The recipient is unique by construction: a
+// waitable has at most one attachment (§2.2), so a signal reaches one Waiter,
+// which hands it to one thread.
 
 /// §2.4's accumulation, both modes.
 ///
-/// THE SUM SATURATES RATHER THAN WRAPPING, which is the half of §2.4 that is a
-/// correctness requirement rather than a convenience: a producer faster than
-/// its consumer must not roll a full count back through zero, because zero is
-/// what "not ready" means — a wrap would make a saturated event go quiet.
-/// `&+` is the wrapping add (Saw's overflow checks are always on, so a plain
-/// `+` would panic in the kernel), and the comparison after it is the carry.
+/// The sum saturates rather than wrapping: a producer faster than its consumer
+/// must not roll a full count back through zero, because zero means "not ready"
+/// and a wrap would make a saturated event go quiet.
 public(package) func accumulate(slot: Int, bits: UInt) unsafe {
     match EVENTS[slot].mode {
         case Or -> {
@@ -425,31 +352,24 @@ public(package) func accumulate(slot: Int, bits: UInt) unsafe {
 }
 
 // -----------------------------------------------------------------------------
-// THE PER-KIND MATRIX: four questions, one arm per waitable kind (obligation 1)
+// The per-kind matrix: one arm per waitable kind
 // -----------------------------------------------------------------------------
 //
 // Everything the wait machinery needs to know about a waitable is one of these
-// five questions, and each is answered by an EXHAUSTIVE match on
-// `WaitableKind`:
+// questions, each answered by an exhaustive match on `WaitableKind`:
 //
 //   `waitable_attachment` / `set_waitable_attachment`   who is watching me
 //   `waitable_ready`                                    am I ready
 //   `waitable_answer`                                   what does a record say
 //   `waitable_consume`                                  a record was delivered
 //
-// That is a MATRIX rather than a funnel because the answers genuinely differ
-// per kind — an Event's readiness is a word, an Interrupt's is a masked line,
-// a Timer's is a count of expiries and a Process's is being dead — and it is
-// written as five small functions in one place so the matrix is READABLE AS
-// ONE. Adding a waitable kind fails all five to compile, which is the property
-// a `_` arm anywhere here would destroy. (The Timer, design 232 unit 1's third
-// kind, is what added the fifth question and it added it to every existing row
-// at once — which is the matrix working. The PROCESS, sawos design 8's fourth
-// kind, added no question and answered all five, which is the same claim from
-// the other side: the questions were the right ones.)
+// The answers differ per kind (an Event's readiness is a word, an Interrupt's
+// is a masked line, a Timer's is a count of expiries, a Process's is being
+// dead), so they are small functions in one place. Adding a waitable kind fails
+// every one of them to compile, which a `_` arm anywhere here would defeat.
 //
-// Everything ELSE about waiting — the list walk, the key lookup, the wake, the
-// copy-out — is kind-blind and appears exactly once below.
+// Everything else about waiting (the list walk, the key lookup, the wake, the
+// copy-out) is kind-blind and appears exactly once below.
 
 /// Which attachment names this waitable (slot + 1), or 0.
 public(package) func waitable_attachment(kind: WaitableKind, slot: Int) unsafe -> Int {
@@ -458,12 +378,11 @@ public(package) func waitable_attachment(kind: WaitableKind, slot: Int) unsafe -
         case Interrupt -> INTERRUPTS[slot].attachment,
         case Timer -> TIMERS[slot].attachment,
         case Process -> PROCESSES[slot].attachment,
-        // TWO KINDS OVER ONE CONNECTION ROW, and the kind is what says which
-        // field — the same three-line mechanism `ref_object` uses for the two
-        // reference columns, one screen of a different file away.
+        // Two kinds over one connection row; the kind says which field, as in
+        // `ref_object` for the two reference columns.
         case PipeOutlet -> PIPES[slot].outlet_attachment,
         case PipeInlet -> PIPES[slot].inlet_attachment,
-        // ...and two kinds over one EXCHANGE, one level further down.
+        // Two kinds over one exchange.
         case PipeReply -> EXCHANGES[slot].reply_attach,
         case PipeRequest -> EXCHANGES[slot].request_attach,
     }
@@ -485,18 +404,16 @@ public(package) func set_waitable_attachment(kind: WaitableKind, slot: Int, a: I
 
 /// Is this waitable ready, in §2.2's level-triggered sense?
 ///
-/// Every answer is a READ of the object's own state and none consults a flag
-/// the wait machinery maintains, which is what makes level-triggering an
-/// absence rather than a mechanism: an Event is ready while its word is
-/// non-zero, an Interrupt while its fire is unacked, a Timer while it has
-/// expiries nobody has been told about, and a Process once it is `Gone`.
+/// Every answer is a read of the object's own state; none consults a flag the
+/// wait machinery maintains. An Event is ready while its word is non-zero, an
+/// Interrupt while its fire is unacked, a Timer while it has expiries nobody
+/// has been told about, and a Process once it is `Gone`.
 ///
-/// THE PROCESS ARM IS THE ONE THAT CAN NEVER GO BACK, which is the whole of
-/// what "terminal" means here (sawos design 8): the other three answers can
-/// flip to false again — a word is taken, a line is acked, a count is spent —
-/// while `Gone` is a state a slot leaves only by being freed, and it cannot be
-/// freed while somebody is attached to it. So the level a death raises stays
-/// raised for exactly as long as anyone can observe it.
+/// The Process arm is terminal: the other levels can drop again (a word is
+/// taken, a line is acked, a count is spent), but `Gone` is a state a slot
+/// leaves only by being freed, and it cannot be freed while somebody is
+/// attached to it. So the level a death raises stays raised for as long as
+/// anyone can observe it.
 public(package) func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Bool {
     match kind {
         case Event -> EVENTS[slot].word != 0,
@@ -505,34 +422,30 @@ public(package) func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Boo
         case Process -> {
             match PROCESSES[slot].state {
                 case Gone -> true,
-                // `Created` is NOT ready, and the arm is worth its line: a
-                // process that has been made and never started has not ended,
-                // so a supervisor parked on one waits — correctly, and
-                // forever, which `pick_next`'s deadlock report is what names.
+                // `Created` is not ready: a process that was made and never
+                // started has not ended, so a supervisor parked on one waits
+                // (and `pick_next`'s deadlock report names it).
                 case _ -> false,
             }
         },
-        // **DRAIN-THEN-TERMINAL, AS ONE `||`** (spec §2.2's readable arm; design
-        // 230's close-drains-first rule, which `pipe_take` already reads in this
-        // exact order). Anything staged is readable whatever became of the
-        // sender; an empty ring with no inlet left is readable too, and what
-        // the waiter is told there is `PeerGone`. Both halves can only ever be
-        // answered by the connection's own state, so the level is derived like
-        // every other one here and maintained nowhere.
+        // Drain-then-terminal (spec §2.2's readable arm): anything staged is
+        // readable whatever became of the sender, and an empty ring with no
+        // inlet left is readable too (the waiter is told `PeerGone`). This is
+        // the order `pipe_take` reads. Both halves are the connection's own
+        // state, so the level is derived and maintained nowhere.
         case PipeOutlet -> PIPES[slot].staged != 0 || PIPES[slot].inlet_refs == 0,
-        // **ROOM OR NOBODY TO TAKE** (design 10 ruling 8). The mirror, and it
-        // reads in `pipe_post`'s order for `pipe_post`'s reason: the outlet
-        // column at zero is the stronger fact, so a poster woken by it learns
-        // that posting is over rather than that there is space.
+        // Room, or nobody to take. Mirrors the above and reads in `pipe_post`'s
+        // order: the outlet column at zero is the stronger fact, so a poster
+        // woken by it learns that posting is over rather than that there is
+        // space.
         case PipeInlet -> (PIPES[slot].outlet_refs == 0
                            || pipe_has_room(slot)),
-        // **THE ANSWER IS HERE, OR IT NEVER WILL BE** (design 10 ruling 11(a)).
-        // Three of the five exchange states are ready and two are not, and the
-        // split is exactly `pipe_resolve`'s: `Replied` has the bytes; a `Taken`
-        // exchange whose obligation column fell was abandoned by the server; a
-        // `Staged` one whose connection lost its outlet can never be taken at
-        // all. `Settled` is NOT ready — the answer has already been delivered
-        // to somebody — and `Free` names no exchange a handle could hold.
+        // The answer is here, or it never will be. This is `pipe_resolve`'s
+        // split: `Replied` has the bytes; a `Taken` exchange whose obligation
+        // column fell was abandoned by the server; a `Staged` one whose
+        // connection lost its outlet can never be taken at all. `Settled` is
+        // not ready (the answer was already delivered) and `Free` names no
+        // exchange a handle could hold.
         case PipeReply -> {
             match EXCHANGES[slot].state {
                 case Replied -> true,
@@ -542,12 +455,10 @@ public(package) func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Boo
                 case Free -> false,
             }
         },
-        // **THE CLAIM WAS DROPPED — the server's cancellation watcher** (§2.1's
-        // ratified early notice). It is asked only of a `Taken` exchange,
-        // because that is the only state in which an obligation exists to be
-        // watching: a `Staged` one has not minted it, and `Replied` / `Settled`
-        // are past it. Terminal, because a reply column that reached zero can
-        // never rise — a mint needs a source handle there is none of.
+        // The claim was dropped (§2.1's early notice to the server). Asked only
+        // of a `Taken` exchange, the only state in which an obligation exists:
+        // `Staged` has not minted it, and `Replied` / `Settled` are past it.
+        // Terminal, because a reply column that reached zero can never rise.
         case PipeRequest -> {
             match EXCHANGES[slot].state {
                 case Taken -> EXCHANGES[slot].reply_refs == 0,
@@ -562,19 +473,15 @@ public(package) func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Boo
 
 /// The tag and payload words a wait record carries for this waitable.
 ///
-/// THE PROCESS ARM CARRIES §8's OWN WORD and invents nothing (sawos design 8):
-/// `process_status_word` is the same assembly `ProcessOp.GetStatus` answers
-/// with, so being woken by a death and asking about one produce identical
-/// bits. Unit 5.5 adds a second DOOR onto §8's word rather than a second
-/// vocabulary for it — the `Exited`/`Faulted` distinction sharpening 2 asked
-/// for is the kind field that already shipped.
-/// **AND THE PIPE ARMS ARE WHERE THIS ANSWER GREW A BODY** (design 10 ruling
-/// 11(a); sawos design 15). Three of the four are word-shaped levels and answer
-/// with `body_len: 0`, exactly as every kind above them does; the fourth
-/// carries the reply's BYTES, and `body_src` is the kernel address the delivery
-/// copies them from. The copy is SIZED TO THE DELIVERY — a word-payload kind
-/// writes four header words and stops — so a Timer waiter pays for the record's
-/// growth in buffer space and never in copy time.
+/// The Process arm carries spec §8's own word: `process_status_word` is the
+/// same assembly `ProcessOp.GetStatus` answers with, so being woken by a death
+/// and asking about one produce identical bits.
+///
+/// Three of the four pipe arms are word-shaped levels and answer with
+/// `body_len: 0`. The `PipeReply` arm carries the reply's bytes, and `body_src`
+/// is the kernel address the delivery copies them from. The copy is sized to
+/// the delivery: the waiter's buffer always has room for a body, but a
+/// word-payload delivery copies none of it.
 public(package) func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> WaitAnswer {
     match kind {
         case Event -> WaitAnswer(tag: WaitTag.Event, payload: EVENTS[slot].word,
@@ -591,8 +498,8 @@ public(package) func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> Wa
                                          PROCESSES[slot].exit_code),
             body_len: 0, body_src: 0),
         // Drain-first, so a staged message is `Msg` whatever became of the
-        // sender — the readiness test above and this answer read the connection
-        // in the same order, which is what keeps them from ever disagreeing.
+        // sender; this matches the order of the readiness test above, so the
+        // two never disagree.
         case PipeOutlet -> {
             var level = OutletLevel.PeerGone
             if PIPES[slot].staged != 0 {
@@ -601,7 +508,7 @@ public(package) func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> Wa
             WaitAnswer(tag: WaitTag.Readable, payload: level as UInt,
                        body_len: 0, body_src: 0)
         },
-        // PeerGone first, mirroring `pipe_post`'s own order of questions.
+        // `PeerGone` first, mirroring `pipe_post`.
         case PipeInlet -> {
             var level = InletLevel.Room
             if PIPES[slot].outlet_refs == 0 {
@@ -610,10 +517,10 @@ public(package) func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> Wa
             WaitAnswer(tag: WaitTag.Room, payload: level as UInt,
                        body_len: 0, body_src: 0)
         },
-        // **THE ONE DELIVERY THAT CARRIES BYTES.** `Replied` hands over the
-        // reply body out of the very ring slot that carried the request
-        // (design 10 ruling 4's rider); every other ready state is the
-        // abandonment `pipe_resolve` reports, and it has nothing to copy.
+        // The one delivery that carries bytes. `Replied` hands over the reply
+        // body out of the same ring slot that carried the request; every other
+        // ready state is the abandonment `pipe_resolve` reports, with nothing
+        // to copy.
         case PipeReply -> {
             match EXCHANGES[slot].state {
                 case Replied -> WaitAnswer(
@@ -625,88 +532,66 @@ public(package) func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> Wa
                                      body_len: 0, body_src: 0),
             }
         },
-        // NO PAYLOAD AT ALL: the fact is the notification. A `payload` of zero
-        // is what the record carries, and `WaitPayload.Abandoned` is the
-        // decoded form that binds nothing.
+        // No payload: the fact is the notification.
         case PipeRequest -> WaitAnswer(tag: WaitTag.Abandoned, payload: 0,
                                        body_len: 0, body_src: 0),
     }
 }
 
-/// A record describing this waitable HAS BEEN DELIVERED to a thread. Update
+/// A record describing this waitable has been delivered to a thread. Update
 /// whatever the delivery spent.
 ///
-/// THE THREE ANSWERS, and the differences between them are real rather than
-/// accidents of how each object happens to be written:
+/// The kinds differ for real reasons:
 ///
-///   - an EVENT's word is CONSUMED BY WHOEVER TAKES THE VALUE, through either
-///     door (ruled Aug 17, user). §2.4's `receive` is the non-blocking poll and
-///     a `Waiter.wait` is the blocking one; both hand the accumulated word to a
-///     process, so both clear it. A delivery that left the word behind would
-///     report the same bits to the next wait as well, which is a duplicate the
-///     recipient cannot tell from a real second signal.
-///   - an INTERRUPT's readiness is ended by the driver's `ack` and by nothing
-///     else (§9), because the line stays masked until the device has actually
-///     been serviced. The kernel cannot know that a record was enough.
-///   - a TIMER's fire count is SPENT by the delivery, because a Timer has no
-///     second op to drain with and needs none. It has no mask to hold and no
-///     device to service, so the fire has done its whole job once somebody has
-///     been told — which is the ack-free half of the timerfd model, and what
-///     makes a periodic timer a schedule rather than a request/response.
-///   - a PROCESS's death CLEARS NOTHING, and it is the fourth answer rather
-///     than a copy of the Interrupt's (sawos design 8, sharpening 1). The two
-///     empty arms are empty for OPPOSITE reasons: an Interrupt's readiness has
-///     an end the kernel does not own, and a death has no end at all. **THIS IS
-///     THE ONE PLACE TERMINAL DIFFERS FROM EVENT'S CLEAR-ON-CONSUME**:
-///     consuming a death REPORTS it, nothing un-dies, so the next wait on the
-///     same attachment answers the same §8 word and a waiter attaching after
-///     the death is told at once.
-///
-/// So the INTERRUPT is no longer the odd kind out — it shares its emptiness
-/// with the Process now, and what distinguishes them is whose business the end
-/// of the readiness is: a DEVICE's for one, nobody's for the other.
+///   - An Event's word is consumed by whoever takes the value, through either
+///     door. §2.4's `receive` and a `Waiter.wait` both hand the accumulated
+///     word to a process, so both clear it. Leaving it would report the same
+///     bits to the next wait, a duplicate the recipient cannot tell from a real
+///     second signal.
+///   - An Interrupt's readiness is ended by the driver's `ack` and nothing else
+///     (§9), because the line stays masked until the device has been serviced.
+///     The kernel cannot know that a record was enough.
+///   - A Timer's fire count is spent by the delivery. It has no mask to hold
+///     and no device to service, so the fire has done its job once somebody has
+///     been told. This is what makes a periodic timer a schedule rather than a
+///     request/response.
+///   - A Process's death clears nothing. The empty arm differs from the
+///     Interrupt's: an Interrupt's readiness has an end the kernel does not
+///     own, while a death has no end. Consuming a death reports it and nothing
+///     un-dies, so the next wait on the same attachment answers the same §8
+///     word, and a waiter attaching after the death is told at once.
 public(package) func waitable_consume(kind: WaitableKind, slot: Int) unsafe {
     match kind {
-        // The take is READ-AND-CLEAR, and `deliver_attachment` is what makes it
-        // one act: the read happened a few lines earlier in the same
-        // interrupts-masked region, so no signal can land between the two and
-        // there are no bits here that the record did not carry.
+        // Read-and-clear is one act: `deliver_attachment` read the word a few
+        // lines earlier in the same interrupts-masked region, so no signal can
+        // land between the read and this clear.
         case Event -> { EVENTS[slot].word = 0 },
         case Interrupt -> {},
         case Timer -> { TIMERS[slot].fires = 0 },
-        // TERMINAL LEVEL. Deliberately, and see the docstring above: this is
-        // the arm that would have to write something for a death to be
-        // reportable once, and there is nothing it could honestly write.
+        // Terminal level; see the docstring. There is nothing a death could
+        // honestly write here.
         case Process -> {},
-        // **THREE OF THE FOUR PIPE ARMS SPEND NOTHING, AND FOR THREE DIFFERENT
-        // REASONS** (sawos design 15) — which is the matrix earning its keep a
-        // fifth time.
+        // Three of the four pipe arms spend nothing, for different reasons:
         //
-        //   - a READABLE outlet's level ends when the server actually TAKES the
-        //     message, and a delivery is not a take (the record says "there is
-        //     something", not "here it is"). So this is the Interrupt's shape:
-        //     the readiness has an end the kernel does not own.
-        //   - a POSTABLE inlet's level ends at the poster's own next post —
-        //     design 10 ruling 8 says so in as many words, the Interrupt-shaped
-        //     emptiness — so consuming it would make a client that woke and
-        //     then chose not to post never hear about the room again.
-        //   - an ABANDONED claim is the TERMINAL level, on the Process arm's
-        //     terms exactly: nothing un-abandons, so there is nothing to end.
+        //   - A readable outlet's level ends when the server takes the message,
+        //     and a delivery is not a take (the record says "there is
+        //     something", not "here it is"). Like the Interrupt, the readiness
+        //     has an end the kernel does not own.
+        //   - A postable inlet's level ends at the poster's own next post.
+        //     Consuming it would make a client that woke and then chose not to
+        //     post never hear about the room again.
+        //   - An abandoned claim is terminal, like the Process arm: nothing
+        //     un-abandons.
         case PipeOutlet -> {},
         case PipeInlet -> {},
         case PipeRequest -> {},
-        // **AND THE FOURTH IS THE ONE THAT DISCHARGES AN EXCHANGE** (design 10
-        // ruling 11(a)/(b)). The delivery handed the reply's bytes to a process
-        // — the wait IS the resolve — so the answer is spent and the exchange
-        // moves to `Settled`. Without this the slot would stay `Replied` and a
-        // later `Resolve` through the very same claim would copy the answer out
-        // a second time, which is the duplicate §2.2's consume rule exists to
-        // make impossible; with it, a later `Resolve` is `PeerClosed` and the
-        // slot goes back when the columns fall.
-        //
-        // It runs for the ABANDONED deliveries too, and that is right: the
-        // claim has been told there will never be an answer, so there is
-        // nothing left for it either.
+        // The fourth discharges an exchange. The delivery handed the reply's
+        // bytes to a process (the wait is the resolve), so the answer is spent
+        // and the exchange moves to `Settled`. Without this the slot would stay
+        // `Replied` and a later `Resolve` through the same claim would copy the
+        // answer out a second time. With it, a later `Resolve` is `PeerClosed`
+        // and the slot goes back when the columns fall. It runs for abandoned
+        // deliveries too: that claim has been told no answer will come.
         case PipeReply -> { EXCHANGES[slot].state = ExchangeState.Settled },
     }
 }
@@ -716,15 +601,12 @@ public(package) func waitable_consume(kind: WaitableKind, slot: Int) unsafe {
 ///
 /// `public(package)`, like the function that hands it out: `kcore.refs` binds
 /// one and reads every field, so a private type here would be a value a sibling
-/// module holds and cannot name (refused since the Aug-21 signature-visibility
-/// rule).
+/// module holds and cannot name.
 ///
-/// **THE LAST TWO FIELDS ARE M4 UNIT 3's** (design 10 ruling 11(a)). `body_len`
-/// is how many bytes the delivery carries — zero for every kind but a reply
-/// with data — and `body_src` is the KERNEL address they are copied from, which
-/// is a ring slot's body and nothing else. Both zero is the word-payload case,
-/// and it is what makes the copy-out sized to the delivery rather than to the
-/// buffer.
+/// `body_len` is how many bytes the delivery carries (zero for every kind but a
+/// reply with data) and `body_src` is the kernel address they are copied from,
+/// which is a ring slot's body and nothing else. Both zero is the word-payload
+/// case, and the copy-out is sized to the delivery rather than to the buffer.
 public(package) struct WaitAnswer {
     public(package) tag: WaitTag,
     public(package) payload: UInt,
@@ -734,14 +616,11 @@ public(package) struct WaitAnswer {
 
 /// The first attachment of `w` whose waitable is ready, or `NO_ATTACHMENT`.
 ///
-/// A SCAN, and that is the level-triggered semantics implemented rather than
-/// maintained: there is no ready QUEUE to keep in step with the objects, so a
-/// waitable that goes back to not-ready cannot leave a stale entry behind and
-/// one that stays ready is found again by the next scan. It is O(attachments),
-/// which at M2's slab sizes is a handful of loads and is bounded by the same
-/// argument the ready queue's is — this runs with interrupts masked, so its
-/// length is interrupt latency (design 178 D2), and a Waiter with hundreds of
-/// attachments is what an M3 ready-list optimisation would be for.
+/// A scan, which is the level-triggered semantics implemented rather than
+/// maintained: there is no ready queue to keep in step with the objects, so a
+/// waitable that goes back to not-ready cannot leave a stale entry behind. It
+/// is O(attachments) and runs with interrupts masked, so its length is
+/// interrupt latency.
 public(package) func waiter_ready_attachment(w: Int) unsafe -> Int {
     var cur = WAITERS[w].attached
     while cur != 0 {
@@ -765,31 +644,29 @@ public(package) func block_on_wait(slot: Int, w: Int, dst: UInt) unsafe {
 }
 
 // -----------------------------------------------------------------------------
-// THE FUSED CALL'S TWO PARKS (sawos design 17, M4 unit 3.5)
+// The fused call's two parks
 // -----------------------------------------------------------------------------
 //
-// **NEITHER OF THEM PUTS THE THREAD ON A LIST, and that is the whole structural
-// difference from `block_on_wait` above.** A `Waiter.Wait` parks on an object
-// several threads may share, so the Waiter keeps a chain of them; a fused
-// `PipeInlet.Call` parks on something at most one thread can be waiting for —
-// the exchange it just staged — so the back pointer IS the list, of one, and it
-// lives in `PIPE_CALLER` where a settling reply already has the index.
+// Neither puts the thread on a list, unlike `block_on_wait` above. A
+// `Waiter.Wait` parks on an object several threads may share, so the Waiter
+// keeps a chain of them. A fused `PipeInlet.Call` parks on something at most
+// one thread can be waiting for, the exchange it just staged, so the back
+// pointer is the list (of one) and lives in `Exchange.caller`, where a settling
+// reply already has the index.
 //
-// THE ROOM PARK IS THE ONE WITHOUT A BACK POINTER, and it is a SCAN at the wake
-// for a reason rather than an omission: several threads of one process may be
-// waiting for room on one connection at once, so the connection would need a
-// chain — and `ThreadSlot.link` is already spoken for by the ready queue the
-// resumed thread goes straight onto. A bounded walk of the thread slab at the one
-// moment a ring stops being full is the cheaper answer, and it is the same
-// bounded-scan trade `alloc_thread`, `live_threads` and `ready_remove_process`
-// all take one file down.
+// The room park has no back pointer, and the wake finds the thread by scan.
+// Several threads of one process may wait for room on one connection, so the
+// connection would need a chain, and `ThreadSlot.link` is already used by the
+// ready queue the resumed thread goes straight onto. A bounded walk of the
+// thread slab at the moment a ring stops being full is the cheaper answer, the
+// same trade `alloc_thread`, `live_threads` and `ready_remove_process` make.
 
-/// Park the running thread until connection `c` has room to stage — the fused
-/// `Call`'s FIRST park (design 10 ruling 8's level, reached from inside the op).
+/// Park the running thread until connection `c` has room to stage: the fused
+/// `Call`'s first park.
 ///
-/// `src`/`len` are the message the caller has not staged yet, and `dst` is where
-/// its reply will go. Both addresses were validated at the call, while the
-/// caller was the running process.
+/// `src`/`len` are the message the caller has not staged yet, and `dst` is
+/// where its reply will go. Both addresses were validated at the call, while
+/// the caller was the running process.
 public(package) func block_on_call_room(slot: Int, c: Int, src: UInt, len: UInt,
                                         dst: UInt) unsafe {
     THREADS[slot].state = ThreadState.Blocked
@@ -801,18 +678,16 @@ public(package) func block_on_call_room(slot: Int, c: Int, src: UInt, len: UInt,
     NEED_RESCHED = true
 }
 
-/// Tie thread `slot` to exchange `x` and stop it — the fused `Call`'s SECOND
-/// park, and the one that holds the claim.
+/// Tie thread `slot` to exchange `x` and stop it: the fused `Call`'s second
+/// park, the one that holds the claim.
 ///
-/// The caller has already taken the exchange's reply reference; this records the
-/// tie in BOTH directions and marks the thread blocked.
+/// The caller has already taken the exchange's reply reference; this records
+/// the tie in both directions and marks the thread blocked.
 ///
-/// **IT DOES NOT ASK FOR A RESCHEDULE, and that is why it is split from
-/// `block_on_call_reply` below.** Two callers reach it: the op, which is the
-/// thread being parked and does want one, and the ROOM RESUME, which runs in
-/// whichever thread freed the slot and must not preempt itself for somebody
-/// else's park. The re-tie is the same act either way; only who is running
-/// differs, so the request for a switch belongs to the caller that is it.
+/// It does not request a reschedule, which is why it is split from
+/// `block_on_call_reply`. It is reached by the op, which is the thread being
+/// parked and wants one, and by the room resume, which runs in whichever thread
+/// freed the slot and must not preempt itself for somebody else's park.
 public(package) func tie_call_reply(slot: Int, x: Int, dst: UInt) unsafe {
     THREADS[slot].state = ThreadState.Blocked
     THREADS[slot].wait_buf = dst
@@ -823,15 +698,15 @@ public(package) func tie_call_reply(slot: Int, x: Int, dst: UInt) unsafe {
     EXCHANGES[x].caller = slot + 1
 }
 
-/// The RUNNING thread's version: tie, and ask for the switch it now needs.
+/// The running thread's version: tie, and request the switch it now needs.
 public(package) func block_on_call_reply(slot: Int, x: Int, dst: UInt) unsafe {
     tie_call_reply(slot, x, dst)
     NEED_RESCHED = true
 }
 
-/// Forget everything about a thread's fused call — the state, both directions of
-/// the tie, and the buffer. It does NOT touch the reference the claim held; the
-/// three callers each own that decision.
+/// Forget everything about a thread's fused call: the state, both directions of
+/// the tie, and the buffer. It does not touch the reference the claim held;
+/// each caller owns that decision.
 public(package) func clear_pending_call(slot: Int) unsafe {
     if THREADS[slot].call_claim != 0 {
         EXCHANGES[THREADS[slot].call_claim - 1].caller = 0
@@ -843,12 +718,11 @@ public(package) func clear_pending_call(slot: Int) unsafe {
     THREADS[slot].wait_buf = 0
 }
 
-/// The thread waiting for ROOM on connection `c`, or `NO_THREAD`.
+/// The thread waiting for room on connection `c`, or `NO_THREAD`.
 ///
-/// The scan the block above argues for. It answers the OLDEST-INDEXED waiter
-/// rather than the longest-waiting one, which is the same fairness the ready
-/// queue's own slot ordering has and is what a bounded table buys instead of a
-/// chain.
+/// This is the scan the park comment above describes. It answers the
+/// lowest-indexed waiter rather than the longest-waiting one, the same fairness
+/// the ready queue's slot ordering has.
 public(package) func call_room_waiter(c: Int) unsafe -> Int {
     var t: Int = 0
     while t < THREADS.capacity() {
@@ -862,10 +736,9 @@ public(package) func call_room_waiter(c: Int) unsafe -> Int {
 
 /// The attachment on `w` under `key`, or `NO_ATTACHMENT`.
 ///
-/// THE KEY IS THE ATTACHMENT'S NAME, which is what makes the attachment set a
-/// TABLE keyed by it rather than a bag: `Remove` names an attachment this way,
-/// and `Add` uses the same walk to refuse a duplicate. Both rest on keys being
-/// unique per Waiter, which is exactly why the duplicate is refused.
+/// The key is the attachment's name, so the set is a table keyed by it rather
+/// than a bag: `Remove` names an attachment this way, and `Add` uses the same
+/// walk to refuse a duplicate. Both rest on keys being unique per Waiter.
 public(package) func attached_by_key(w: Int, key: UInt) unsafe -> Int {
     var cur = WAITERS[w].attached
     while cur != 0 {
@@ -907,11 +780,10 @@ public(package) func detach_attachment(w: Int, a: Int) unsafe {
 
 /// The Interrupt bound to `line`, or `NO_INTERRUPT`.
 ///
-/// A SCAN over four slots, and it is what turns the trap path's line number
-/// back into an object. Keeping a line -> slot map instead would be a second
-/// description of the same fact — the bindings are already in the table, and
-/// the table is the only place a line may be bound twice, which `interrupt_bind`
-/// refuses using exactly this walk.
+/// A scan, which turns the trap path's line number back into an object. A
+/// separate line-to-slot map would be a second description of the same fact:
+/// the bindings are already in the table, and `interrupt_bind` refuses a double
+/// bind using this same walk.
 public(package) func interrupt_by_line(line: UInt) unsafe -> Int {
     var i: Int = 0
     while i < INTERRUPTS.capacity() {

@@ -1,4 +1,4 @@
-//! SOS kernel core (designs 112, 140, 162) — the arch-free kernel.
+//! SOS kernel core: the arch-free kernel.
 //!
 //! Everything a SOS kernel image shares: the console, the trap handler `ktrap`,
 //! the object-op dispatch, and the sosimg loader. An image is one per-arch
@@ -6,35 +6,35 @@
 //! (`sosrt`, rt/common/src/lib.saw) + this module + one entry `.saw` defining
 //! `kmain` — `kernel/main.saw` for the real kernel, `tests/*.saw` for
 //! the harness cases. Sharing the module is what keeps every test image on the
-//! SAME trap path instead of a copy of it.
+//! same trap path instead of a copy of it.
 //!
-//! NO ARCHITECTURE APPEARS IN THIS DIRECTORY (design 162 unit 1). Registers,
-//! trap causes, protection hardware, the board's console and the way the machine
-//! stops are all reached through `hal`, and the harness enforces it: a scan
-//! rejects an arch name anywhere under `core/`, so the seam cannot erode by one
-//! convenient constant at a time. Adding an architecture is writing a HAL.
+//! No architecture appears in this directory. Registers, trap causes,
+//! protection hardware, the board's console and the way the machine stops are
+//! all reached through `hal`, and the harness enforces it: a scan rejects an
+//! arch name anywhere under `core/`, so the seam cannot erode by one convenient
+//! constant at a time. Adding an architecture is writing a HAL.
 //!
-//! Addresses and machine words are `UInt` throughout, never `Int` — `Int` is
-//! platform-width and SIGNED, so a RAM address lands in its negative half on a
-//! 32-bit profile and means a different number on a 64-bit one (DF-140a).
+//! Addresses and machine words are `UInt` throughout, never `Int`: `Int` is
+//! platform-width and signed, so a RAM address lands in its negative half on a
+//! 32-bit target and means a different number on a 64-bit one.
 //!
-//! # THIS FILE IS THE FACADE (the Aug-17 split)
+//! # This file is the facade
 //!
-//! The kernel used to be one 4000-line file. It is now fourteen, one per seam,
-//! and this file holds no code: it re-exports the names an image entry uses, so
+//! This file holds no code: it re-exports the names an image entry uses, so
 //! `import kcore.{console, load_root_and_enter}` in `main.saw` and in every
-//! `tests/` entry means exactly what it always did.
+//! `tests/` entry resolves here.
 //!
-//! THE MODULES, IN DEPENDENCY ORDER — a file may import only those above it,
-//! because an import cycle is not diagnosed (DF-232e); it silently empties a
-//! module's export table and blames a third file:
+//! The modules, in dependency order. A file may import only those above it,
+//! because an import cycle is not diagnosed; it silently empties a module's
+//! export table and blames a third file.
 //!
 //!   `limits`     every slab size, the frame stride, the "no slot" sentinels
 //!   `mem`        addresses and byte moves
 //!   `diag`       the console, and the reports that stop the machine
+//!   `stats`      the published trap-counter region
 //!   `result`     a syscall's answer, and the one place it enters a frame
 //!   `slab`       the extent chain every donatable kind is held in
-//!   `pslot`      the PROCESS RECORD and its slab — the handle table, the
+//!   `pslot`      the process record and its slab — the handle table, the
 //!                quota ledger and the boot set are fields of it
 //!   `objects`    the handle-table operations, the validated per-kind objects,
 //!                the Memory slab and the boot-handle queue's operations
@@ -42,102 +42,63 @@
 //!   `time`       the Clock/Timer slabs and the one hardware comparator
 //!   `process`    the grant record, the copy doors, the way into user mode
 //!   `waitables`  the Event/Waiter/Interrupt slabs and the per-kind matrix
-//!   `refs`       the reference count, free-on-zero, the per-kind last rites
-//!                (sawos design 7), AND the delivery that turns readiness into
-//!                a woken thread (`wake` merged in at M4 unit 3 — see below)
+//!   `refs`       the reference count, free-on-zero, the per-kind last rites,
+//!                and the delivery that turns readiness into a woken thread
 //!   `irq`        the tick, expiry, device lines, the idle path, the point
 //!   `preempt`    the strided long-op movers that take that point
 //!   `loader`     the sosimg loader — validate, place, record
 //!   `sched`      the switch point, and the end of a process
 //!   `dispatch`   every object op, and `ktrap`
 //!
-//! TWO OF THOSE MOVED IN M3 UNIT 2 (sawos design 2), and both moves are the
-//! same rule the `preempt` split below states — a module sits at the altitude
-//! its CALL GRAPH allows, and where a piece lives is decided by what it has to
-//! reach:
+//! A module sits at the altitude its call graph allows, and where a piece lives
+//! is decided by what it has to reach. The state of a thing sits below the code
+//! that acts on it: ending a process (`sched`) touches every slab, and
+//! answering a wait (`refs`) goes through `process`'s copy door. That is why a
+//! thread's table (`threads`) is not its scheduler (`sched`), a timer's
+//! schedule (`time`) is not its expiry (`irq`), and the wait tables
+//! (`waitables`) are not the delivery (`refs`).
 //!
-//!   - the TEARDOWN left `process` for `sched`. Ending a process used to stop
-//!     the machine; with more than one it RESCHEDULES, and a reschedule can
-//!     idle, and idling delivers, and delivery reaches back down into
-//!     `process`'s own copy door. Written in `process` it would be the cycle
-//!     DF-232e diagnoses. `sched.saw`'s header has the full argument; its
-//!     visible cost is that the copy doors REPORT a bad buffer and their callers
-//!     terminate on it.
-//!   - the LOADER left the top for just below `sched`. It was last because it
-//!     ended by handing the machine to `start_process`; it now has a SECOND
-//!     door — `process_create`, which is an op — so its phases have to be
-//!     reachable from `dispatch`. It reaches nothing above itself either way.
+//!   - The teardown is in `sched`, not `process`. Ending a process can
+//!     reschedule, a reschedule can idle, and idling delivers, which reaches
+//!     back down into `process`'s own copy door; written in `process` it would
+//!     be an import cycle. The visible cost is that the copy doors report a bad
+//!     buffer and their callers terminate on it. `sched.saw`'s header has the
+//!     argument.
+//!   - The loader sits just below `sched`. It has two doors, boot and
+//!     `process_create` (an op), so its phases have to be reachable from
+//!     `dispatch`. It reaches nothing above itself.
+//!   - `preempt` sits above `irq` because a preemption point delivers, while
+//!     the byte loops it drives sit at the bottom under `mem` (delivery reaches
+//!     them through `refs` -> `process` -> `copy_out`). A point inside the loop
+//!     would make `mem` import `irq`. `preempt.saw`'s header has the argument.
+//!   - `pslot` holds every table a process index keys (handle table, quota
+//!     ledger, boot set), because a donatable slab is one array keyed by its
+//!     slot and a parallel `MAX_PROCESSES`-sized table is one a donated slot
+//!     does not have. It sits below `objects`, whose handle functions index it,
+//!     and below `process`. The functions that act on that state sit above it:
+//!     `mint_handle` is in `objects` and the grant-record operations are in
+//!     `process`.
+//!   - `stats` holds the published trap-counter region, at the bottom: it names
+//!     only `mem`, `diag` and the HAL, and nothing it calls can reach back into
+//!     it. Its callers are spread across the order (the trap path and the stats
+//!     op in `dispatch`, the create reset in `process`, the boot-time publish
+//!     in `loader`), so it cannot live in any one of them.
+//!   - `waitables` sits above `pslot`, `threads` and `time`, whose slabs its
+//!     per-kind matrix reads: a Process handle is a waitable, so the matrix's
+//!     Process arms read `PROCESSES`. It does not import `process`, and
+//!     `process` must not import it.
+//!   - Delivery lives in `refs`. A delivery drops a counted reference (a
+//!     one-shot attachment detaches when its record is copied out) and a
+//!     dropped reference delivers (a column reaching zero raises the peer-gone
+//!     terminal levels, and `drop_reference` is the only place that is
+//!     observed). The two are mutually recursive, so they cannot be separate
+//!     modules. `refs.saw`'s header has the argument.
 //!
-//! `preempt` is where it is because of design 1's one structural finding: a
-//! preemption point DELIVERS, so it sits above `irq`, while the byte loops it
-//! drives sit at the bottom under `mem` — delivery reaches them through
-//! `refs` -> `process` -> `copy_out`. A point written inside the loop would be
-//! `mem` importing `irq`, which is the cycle this list exists to prevent. So the
-//! loop stays a primitive, the point stays beside the idle poll, and the cadence
-//! that joins them is its own module between them. `preempt.saw`'s header has
-//! the full argument.
-//!
-//! AND ONE MODULE WAS BORN IN M5 UNIT 6b (sawos design 36), which is the rule
-//! applied to STORAGE rather than to code. `ProcessSlot` absorbed every table a
-//! process index keys — the handle table, the quota ledger, the boot set —
-//! because a donatable slab is ONE array keyed by its slot and a parallel
-//! `MAX_PROCESSES ×` table is a table a donated slot does not have. The record
-//! then had to sit below `objects`, whose handle functions index it, AND below
-//! `process`, which is where it used to live. Neither set of functions moved:
-//! `mint_handle` is still in `objects` and the grant record is still in
-//! `process`. Only the state went down. (`slab` above it is design 32's, listed
-//! here for the first time — it was added without this list being updated.)
-//!
-//! AND ANOTHER WAS BORN IN M5 UNIT 7 (sawos design 37), at the BOTTOM rather
-//! than in the middle: `stats` holds the published trap-counter region — the
-//! storage the three columns left `ProcessSlot` for. It passes `mem`'s and
-//! `diag`'s own test, which is what decides its place: it names those two and
-//! the HAL and nothing else, and nothing it calls can reach back into it. Its
-//! callers are spread across the order — the trap path and the stats op in
-//! `dispatch`, the create reset in `process`, the boot-time publish in `loader`
-//! — which is precisely why it cannot live in any one of them. It is state plus
-//! four accessors, so `pslot` (records, no work) was the near miss; what rules
-//! that out is that `pslot` sits ABOVE `mem`'s consumers and this has to be
-//! reachable from the loader.
-//!
-//! ONE MORE MOVED IN M3 UNIT 5.5 (sawos design 8), and it is the same rule
-//! again: `waitables` PASSED `process`, where the list above used to have it
-//! one line earlier. A Process handle became §2.2's fourth waitable, so the
-//! per-kind matrix's Process arms read `PROCESSES` — who is watching this
-//! slot, is it `Gone`, what §8 word does its record carry — and a module that
-//! reads the process table sits above the module that owns it. Nothing went
-//! the other way: `process` names nothing in `waitables`, which is what makes
-//! this a reordering rather than the cycle DF-232e diagnoses.
-//!
-//! AND ONE MODULE STOPPED EXISTING IN M4 UNIT 3 (sawos design 15), which is the
-//! same rule taken to its conclusion: `wake` — delivery — MERGED INTO `refs`,
-//! because the two became mutually recursive. `designs/010` ruling 9(b) makes a
-//! DELIVERY drop a counted reference (a one-shot attachment detaches when its
-//! record is copied out) and the peer-gone terminal levels make a DROPPED
-//! REFERENCE deliver (a column reaching zero is what raises them, and
-//! `drop_reference` is the only place that is observed). Two modules cannot
-//! hold that, and DF-232e does not diagnose the cycle — it empties an export
-//! table and blames a third file — so the two seams became one. `refs.saw`'s
-//! header carries the full argument.
-//!
-//! WHERE THE LINE FELL, when a seam of the sketch came in two: the STATE of a
-//! thing sits below the process teardown that frees it, and ACTING on it sits
-//! above — because ending a process touches every slab, and answering a wait
-//! goes through the copy door that can end one. That is why a thread's table
-//! (`threads`) is not its scheduler (`sched`), a timer's schedule (`time`) is
-//! not its expiry (`irq`), and the wait tables (`waitables`) are not the
-//! delivery (`refs`' second half, which was `wake` until M4 unit 3 and is the
-//! same altitude under a different file name). The unit-5.5 move above does not bend that rule: the
-//! process SLAB and the wait tables are both STATE, so their order relative to
-//! each other was never fixed by it — only their order relative to the
-//! teardown was, and both are still below it.
-//!
-//! WHAT A SPLIT COSTS HERE (DF-232f): Saw has no package-internal visibility, so
-//! every name two seams share is `public` — visible to anything that imports
-//! `kcore`, not merely to its siblings. Design 80's gate no longer protects the
-//! kernel's own tables from the kernel's own consumers. Nothing about the IMAGE
-//! changed; the widening is a compile-time fact, and it is the argument for an
-//! `internal` tier rather than a reason to keep one 4000-line file.
+//! The cost of the split: Saw has no package-internal visibility, so every name
+//! two seams share is `public`, visible to anything that imports `kcore`, not
+//! merely to its siblings. The kernel's own tables are not protected from the
+//! kernel's own consumers by the language. The image is unaffected; the
+//! widening is a compile-time fact.
 
 public import kcore.mem.{align_up}
 public import kcore.diag.{Console, ExitCode, console, fatal, fatal_image}

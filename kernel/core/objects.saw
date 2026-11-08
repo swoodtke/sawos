@@ -1,12 +1,12 @@
-//! HANDLES AND THE OBJECTS THEY NAME (spec §2, §3, §5.7): the process-indexed
-//! handle table, and the VALIDATED wrapper each object kind gets out of it.
+//! Handles and the objects they name (spec §2, §3, §5.7): the process-indexed
+//! handle table, and the validated wrapper each object kind gets out of it.
 //!
 //! This is the vocabulary the dispatch is written in, held below every table it
 //! indexes into: a `HandleEntry` says which kind and which slot, and the typed
-//! wrappers pair a kind with its rights word so testing one kind's right against
-//! another's object is a compile error rather than a bit comparison.
+//! wrappers pair a kind with its rights word so testing one kind's right
+//! against another's object is a compile error rather than a bit comparison.
 //!
-//! `SlotState` is here rather than beside any one slab because four of them
+//! `SlotState` is here rather than beside any one slab because several of them
 //! answer the same question with it.
 
 import sosabi.{
@@ -81,11 +81,9 @@ import kcore.limits.{
 }
 import kcore.diag.{fatal_kernel}
 import kcore.slab.{Slab}
-// THE PER-PROCESS RECORD (sawos design 36, M5 unit 6b). The handle table, the
-// quota ledger and the boot-handle queue are FIELDS of `ProcessSlot` now, so
-// this module reaches them through `PROCESSES` — which is why the record lives
-// BELOW this file rather than in `kcore.process`, where it used to. The
-// functions did not move; the storage did. See `pslot.saw`'s header.
+// The handle table, quota ledger and boot-handle queue are fields of
+// `ProcessSlot`, reached through `PROCESSES`. The record lives below this file
+// (in `pslot`) so these functions can reach it.
 import kcore.pslot.{
     BootHandleSlot,
     HandleEntry,
@@ -94,21 +92,13 @@ import kcore.pslot.{
     QuotaKind,
 }
 
-// `HandleEntry` MOVED TO `kcore.pslot` in M5 unit 6b (sawos design 36): the
-// handle table is a field of `ProcessSlot` now, and a field's type has to be
-// declared where the record is. Everything this file does WITH one is still
-// here — see `lookup_handle` and its neighbours below.
-
-/// A System handle the dispatch has VALIDATED (§3).
+/// A System handle the dispatch has validated (§3).
 ///
-/// This type is the pairing of a handle kind with its rights word, and it is
-/// what makes the rights check typed rather than cosmetic. The only way to get
-/// one is through `dispatch`, after the table resolved the handle to a System
-/// object — so the type carries the claim "validated as System", and
-/// `allows` can accept a `SystemRight` and nothing else. `ProcessObject` and
-/// `ThreadObject` below are the same construction with their own rights enums,
-/// so testing one kind's right against another's object is a compile error, not
-/// a bit comparison that quietly returns an answer.
+/// The type pairs a handle kind with its rights word. The only way to get one
+/// is through `dispatch`, after the table resolved the handle to a System
+/// object, so the type carries the claim "validated as System" and `allows`
+/// accepts a `SystemRight` and nothing else. The other `*Object` wrappers below
+/// are the same construction with their own rights enums.
 public(package) struct SystemObject {
     public(package) handle: SystemHandle,
     public(package) rights: UInt32,
@@ -117,15 +107,14 @@ public(package) struct SystemObject {
 extension SystemObject {
     /// Whether this holder may perform an op requiring `right`.
     ///
-    /// The mask arithmetic lives here rather than at each call site, so the
-    /// dispatch below reads as the question it is asking and there is one place
-    /// to change when rights become a wider word.
+    /// The mask arithmetic lives here rather than at each call site, so there
+    /// is one place to change when rights become a wider word.
     public(package) func allows(&self, right: SystemRight) -> Bool {
         (self.rights & (right as UInt32)) != 0
     }
 }
 
-/// A Process handle the dispatch has VALIDATED, paired with its rights and the
+/// A Process handle the dispatch has validated, paired with its rights and the
 /// process slot it names.
 public(package) struct ProcessObject {
     public(package) handle: ProcessHandle,
@@ -139,7 +128,7 @@ extension ProcessObject {
     }
 }
 
-/// A Thread handle the dispatch has VALIDATED, paired with its rights and the
+/// A Thread handle the dispatch has validated, paired with its rights and the
 /// thread slot it names.
 public(package) struct ThreadObject {
     public(package) handle: ThreadHandle,
@@ -153,7 +142,7 @@ extension ThreadObject {
     }
 }
 
-/// An Event handle the dispatch has VALIDATED, paired with its rights and the
+/// An Event handle the dispatch has validated, paired with its rights and the
 /// event slot it names (spec §2.4).
 public(package) struct EventObject {
     public(package) handle: EventHandle,
@@ -167,7 +156,7 @@ extension EventObject {
     }
 }
 
-/// A Waiter handle the dispatch has VALIDATED, paired with its rights and the
+/// A Waiter handle the dispatch has validated, paired with its rights and the
 /// waiter slot it names (spec §2.2).
 public(package) struct WaiterObject {
     public(package) handle: WaiterHandle,
@@ -181,7 +170,7 @@ extension WaiterObject {
     }
 }
 
-/// An Interrupt handle the dispatch has VALIDATED, paired with its rights and
+/// An Interrupt handle the dispatch has validated, paired with its rights and
 /// the interrupt slot it names (spec §2 table, §9).
 public(package) struct InterruptObject {
     public(package) handle: InterruptHandle,
@@ -195,8 +184,8 @@ extension InterruptObject {
     }
 }
 
-/// A Clock handle the dispatch has VALIDATED, paired with its rights and the
-/// clock slot it names (spec §2 table; design 232 unit 1).
+/// A Clock handle the dispatch has validated, paired with its rights and the
+/// clock slot it names (spec §2.6).
 public(package) struct ClockObject {
     public(package) handle: ClockHandle,
     public(package) rights: UInt32,
@@ -209,8 +198,8 @@ extension ClockObject {
     }
 }
 
-/// A Timer handle the dispatch has VALIDATED, paired with its rights and the
-/// timer slot it names (spec §2 table; design 232 unit 1).
+/// A Timer handle the dispatch has validated, paired with its rights and the
+/// timer slot it names (spec §2.6).
 public(package) struct TimerObject {
     public(package) handle: TimerHandle,
     public(package) rights: UInt32,
@@ -223,15 +212,12 @@ extension TimerObject {
     }
 }
 
-/// A Memory handle the dispatch has VALIDATED, paired with its rights and the
-/// region slot it names (spec §2.5; sawos design 2 D-2).
+/// A Memory handle the dispatch has validated, paired with its rights and the
+/// region slot it names (spec §2.5).
 ///
-/// **ITS `allows` WAS BUILT BEFORE ANYTHING SPENT A `MemoryRight`, AND UNIT 4
-/// IS WHAT IT WAS BUILT FOR.** Unit 2 wrote it with nothing calling it, because
-/// the wrapper is what makes "this handle resolved to a Memory" a TYPE rather
-/// than a comment — which is exactly the claim `process_create` needs about the
-/// two regions it is handed, and that op still spends no right. `MemoryOp.Split`
-/// and `MemoryOp.Map` are the callers it was waiting for.
+/// The wrapper makes "this handle resolved to a Memory" a type rather than a
+/// comment; `process_create` relies on that for the two regions it is handed,
+/// even though that op spends no right.
 public(package) struct MemoryObject {
     public(package) handle: MemoryHandle,
     public(package) rights: UInt32,
@@ -244,14 +230,13 @@ extension MemoryObject {
     }
 }
 
-/// An IoMemory handle the dispatch has VALIDATED, paired with its rights and
-/// the window slot it names (spec §2.5; sawos design 6 D-1).
+/// An IoMemory handle the dispatch has validated, paired with its rights and
+/// the window slot it names (spec §2.5).
 ///
-/// It is a SEPARATE wrapper from `MemoryObject` and not a flag on one, which is
-/// the type-system half of D-1's ruling: a function that takes one of these can
-/// only ever have been handed a device window, so "a Device region cannot
-/// produce a cacheable mapping" is a fact about which `allows` compiles rather
-/// than a check somebody runs.
+/// This is a separate wrapper from `MemoryObject`, not a flag on one: a
+/// function that takes one of these can only have been handed a device window,
+/// so "a Device region cannot produce a cacheable mapping" is a fact about
+/// which `allows` compiles rather than a check somebody runs.
 public(package) struct IoMemoryObject {
     public(package) handle: IoMemoryHandle,
     public(package) rights: UInt32,
@@ -264,8 +249,8 @@ extension IoMemoryObject {
     }
 }
 
-/// A Mapping handle the dispatch has VALIDATED, paired with its rights and the
-/// mapping slot it names (spec §2.5; sawos design 6 D-3).
+/// A Mapping handle the dispatch has validated, paired with its rights and the
+/// mapping slot it names (spec §2.5).
 public(package) struct MappingObject {
     public(package) handle: MappingHandle,
     public(package) rights: UInt32,
@@ -278,15 +263,14 @@ extension MappingObject {
     }
 }
 
-/// A PipeInlet handle the dispatch has VALIDATED, paired with its rights and the
-/// CONNECTION slot it names (spec §2.1; sawos design 13).
+/// A PipeInlet handle the dispatch has validated, paired with its rights and
+/// the connection slot it names (spec §2.1).
 ///
-/// **`slot` NAMES THE CONNECTION, NOT AN ENDPOINT**, which is D-1's one slab
-/// seen from the dispatch: both endpoint kinds target the same `PIPES` row, and
-/// what makes this handle the CLIENT end is its `obj_type` — established by §3's
-/// order before any right is read. Which reference column it counts on, which op
-/// table it answers to and which rights enum its word is read against all follow
-/// from that one fact.
+/// `slot` names the connection, not an endpoint: both endpoint kinds target the
+/// same `PIPES` row, and what makes this handle the client end is its
+/// `obj_type`, established by §3's order before any right is read. Which
+/// reference column it counts on, which op table it answers to and which rights
+/// enum its word is read against all follow from that.
 public(package) struct PipeInletObject {
     public(package) handle: PipeInletHandle,
     public(package) rights: UInt32,
@@ -299,13 +283,13 @@ extension PipeInletObject {
     }
 }
 
-/// A PipeOutlet handle the dispatch has VALIDATED, paired with its rights and
-/// the CONNECTION slot it names (spec §2.1; sawos design 13).
+/// A PipeOutlet handle the dispatch has validated, paired with its rights and
+/// the connection slot it names (spec §2.1).
 ///
-/// A SEPARATE WRAPPER AND NOT A FLAG, exactly as `IoMemoryObject` is separate
-/// from `MemoryObject`: a function taking one of these can only ever have been
-/// handed the server end, so "an inlet cannot take and an outlet cannot post" is
-/// a fact about which `allows` compiles rather than a check somebody runs.
+/// Separate from `PipeInletObject`, as `IoMemoryObject` is from `MemoryObject`:
+/// a function taking one of these can only have been handed the server end, so
+/// "an inlet cannot take and an outlet cannot post" is a fact about which
+/// `allows` compiles.
 public(package) struct PipeOutletObject {
     public(package) handle: PipeOutletHandle,
     public(package) rights: UInt32,
@@ -318,14 +302,14 @@ extension PipeOutletObject {
     }
 }
 
-/// A PipeReply handle the dispatch has VALIDATED — the CLIENT's claim on one
-/// reply, paired with the EXCHANGE it names (spec §2.1; sawos design 14 D-1).
+/// A PipeReply handle the dispatch has validated: the client's claim on one
+/// reply, paired with the exchange it names (spec §2.1).
 ///
-/// **`slot` NAMES AN EXCHANGE, WHICH IS A RING SLOT** — `connection *
-/// PIPE_INFLIGHT + ring index`, the same flat arithmetic the bodies and lengths
-/// already use. That is D-1's "the claim IS ring-slot state" seen from the
-/// dispatch: there is no third slab, because a one-shot pair exists for exactly
-/// as long as one in-flight message does.
+/// `slot` names an exchange, which is a ring slot:
+/// `connection * PIPE_INFLIGHT + ring index`, the same flat arithmetic the
+/// bodies and lengths use. The claim is ring-slot state; there is no third
+/// slab, because a one-shot pair exists for exactly as long as one in-flight
+/// message does.
 public(package) struct PipeReplyObject {
     public(package) handle: PipeReplyHandle,
     public(package) rights: UInt32,
@@ -338,13 +322,12 @@ extension PipeReplyObject {
     }
 }
 
-/// A PipeRequest handle the dispatch has VALIDATED — the SERVER's obligation,
-/// paired with the EXCHANGE it names (spec §2.1; sawos design 14 D-1).
+/// A PipeRequest handle the dispatch has validated: the server's obligation,
+/// paired with the exchange it names (spec §2.1).
 ///
-/// The mirror of `PipeReplyObject`, and separate for `PipeOutletObject`'s reason:
-/// a function taking one of these can only ever have been handed the obligation,
-/// so "a claim cannot reply and an obligation cannot resolve" is a fact about
-/// which `allows` compiles.
+/// The mirror of `PipeReplyObject`, and separate for the same reason as
+/// `PipeOutletObject`: "a claim cannot reply and an obligation cannot resolve"
+/// is a fact about which `allows` compiles.
 public(package) struct PipeRequestObject {
     public(package) handle: PipeRequestHandle,
     public(package) rights: UInt32,
@@ -357,51 +340,36 @@ extension PipeRequestObject {
     }
 }
 
-/// Whether an Event or a Waiter slot is in use.
+/// Whether a slot of a stateless kind (an Event or a Waiter, say) is in use.
 ///
-/// ONE enum for both because it really is one question. Threads and processes
-/// have state MACHINES — a thread is created, then runnable, then running, then
-/// blocked or exited, and a join arriving after the exit still has to find the
-/// code — while an Event and a Waiter are either there or not: an Event's whole
+/// One enum for all of them because it is one question. Threads and processes
+/// have state machines (a join arriving after the exit still has to find the
+/// code), while an Event and a Waiter are either there or not: an Event's whole
 /// state is its accumulated word, and a Waiter's is its two lists.
 public(package) enum SlotState: UInt8 {
     case Free = 0,
     case Live = 1,
 }
 
-// THE HANDLE TABLE IS `PROCESSES[p].handles` (sawos design 36, M5 unit 6b).
-//
-// It was `HANDLES`, one flat `MAX_PROCESSES * MAX_HANDLES` array sliced at
-// `p * MAX_HANDLES`. The multiply is gone: the slab's own boundary walk is what
-// the multiply used to stand in for, and a process slot in a DONATED extent
-// carries its table with it instead of indexing off the end of a table sized
-// for the compiled floor.
-
 // -----------------------------------------------------------------------------
-// The handle table (spec §3) and the split word (sawos design 3 D-1)
+// The handle table (spec §3) and the split word
 // -----------------------------------------------------------------------------
 
-// THE TABLE MUST FIT THE INDEX FIELD, and this is the module that knows both
-// numbers — `sosabi` owns the encoding and `kcore.limits` owns the table size,
-// so the bound tying them belongs here rather than in either.
+// The table must fit the index field. `sosabi` owns the encoding and
+// `kcore.limits` owns the table size, so the bound tying them belongs here.
 //
-// The comparison is `<=` because the field carries a 1-BASED index: the largest
-// value it must hold is `MAX_HANDLES` itself (naming slot `MAX_HANDLES - 1`),
-// not `MAX_HANDLES - 1`. Zero is spent on "names nothing", which is the whole
-// reason the index is 1-based, so a field of `HANDLE_INDEX_BITS` bits addresses
-// `HANDLE_INDEX_MASK` slots and no more.
-//
-// Raising `MAX_HANDLES` past what the field can hold fails the build here rather
-// than silently aliasing slot 1 onto slot 257.
+// The comparison is `<=` because the field carries a 1-based index: the largest
+// value it must hold is `MAX_HANDLES` itself (naming slot `MAX_HANDLES - 1`).
+// Zero means "names nothing", so a field of `HANDLE_INDEX_BITS` bits addresses
+// `HANDLE_INDEX_MASK` slots and no more. Raising `MAX_HANDLES` past that fails
+// the build here rather than silently aliasing slot 1 onto slot 257.
 static_assert(MAX_HANDLES <= (1 << HANDLE_INDEX_BITS) - 1,
               "MAX_HANDLES must fit the handle word's index field — raise HANDLE_INDEX_BITS")
 
-/// The Unbound answer — what a word that resolves to nothing looks like.
+/// The Unbound answer: what a word that resolves to nothing looks like.
 ///
-/// One constructor rather than three literals, because `lookup_handle` has
-/// three ways to reach it and a reader should be able to see that they are the
-/// SAME answer: the callers turn it into one `BadHandle` fault, so a difference
-/// between them would be a difference with no observer.
+/// One constructor, because `lookup_handle` has three ways to reach it and they
+/// must be the same answer: callers turn it into one `BadHandle` fault.
 func unbound_entry() -> HandleEntry {
     HandleEntry(obj_type: ObjType.Unbound, rights: 0, target: 0, gen: 0)
 }
@@ -409,23 +377,19 @@ func unbound_entry() -> HandleEntry {
 /// The 0-based table index a handle word names, or a number past `MAX_HANDLES`
 /// when it names none.
 ///
-/// **THE INDEX FIELD IS 1-BASED, so zero is not an index** — that is the whole
-/// of "handle 0 names nothing", and it is why it survives generations.
-/// `NO_HANDLE` is the index field's zero AT EVERY GENERATION, so a malformed
-/// word like `0x100` (generation 1 over a zero index, at the default split)
-/// names nothing exactly as a plain `0` does. Testing the WORD against
-/// `NO_HANDLE` would have missed that one; testing the FIELD cannot. The 1-based
-/// spelling is also what keeps slot 0 usable and generation 0 free to mean
-/// "first life".
+/// The index field is 1-based, so zero is not an index and "handle 0 names
+/// nothing". `NO_HANDLE` is the index field's zero at every generation, so a
+/// malformed word like `0x100` (generation 1 over a zero index, at the default
+/// split) names nothing exactly as a plain `0` does; testing the word against
+/// `NO_HANDLE` would miss that, testing the field cannot. The 1-based spelling
+/// also keeps slot 0 usable and generation 0 free to mean "first life".
 ///
-/// Answering `MAX_HANDLES` for a zero byte rather than a separate signal is
-/// deliberate: the one range test below covers both refusals, so there is one
-/// place that decides what a word can name.
+/// A zero field answers `MAX_HANDLES` rather than a separate signal, so the one
+/// range test in the caller covers both refusals.
 ///
-/// `public(package)` for exactly one caller: the release op, which has a word
-/// and a resolved entry and needs the INDEX to unbind. It gets it from the same
-/// function `lookup_handle` used, so the two can never disagree about which slot
-/// a word names.
+/// `public(package)` for the release op, which has a word and a resolved entry
+/// and needs the index to unbind. It uses the same function as `lookup_handle`,
+/// so the two can never disagree about which slot a word names.
 public(package) func handle_word_index(word: UInt) unsafe -> Int {
     let byte = word & HANDLE_INDEX_MASK
     if byte == 0 {
@@ -434,46 +398,42 @@ public(package) func handle_word_index(word: UInt) unsafe -> Int {
     (byte as Int) - 1
 }
 
-/// The generation a handle word claims — everything above its index field.
+/// The generation a handle word claims: everything above its index field.
 ///
-/// **IT IS NOT NARROWED AND NOT MASKED**, and both are deliberate. Narrowing to
-/// `UInt32` with `as` would PANIC INSIDE THE KERNEL on a 64-bit profile over a
-/// word a PROCESS chose, which is the one thing a decode at the trap boundary
-/// must never do. Masking to 24 bits would be worse than a panic: it would make
-/// a word with garbage above bit 31 compare EQUAL to a low generation and
-/// RESOLVE, quietly handing out somebody's handle.
+/// It is neither narrowed nor masked. Narrowing to `UInt32` with `as` would
+/// panic inside the kernel on a 64-bit profile over a word a process chose,
+/// which a decode at the trap boundary must never do. Masking to the generation
+/// field's width would let a word with garbage above bit 31 compare equal to a
+/// low generation and resolve.
 ///
-/// Answering the whole field in the word's own width instead makes the
-/// comparison in `lookup_handle` do the range check for free: a stored
-/// generation is always below `HANDLE_GENERATION_MODULUS`, so any word claiming
-/// a wider generation than the portable budget allows equals no entry and names
-/// nothing. That is D-1's "the top half of a 64-bit word stays zero" as an
-/// ENFORCED rule rather than an assumed one.
+/// Answering the whole field in the word's own width makes the comparison in
+/// `lookup_handle` do the range check: a stored generation is always below
+/// `HANDLE_GENERATION_MODULUS`, so a word claiming a wider generation equals no
+/// entry and names nothing. The top half of a 64-bit word is thereby enforced
+/// to be zero.
 func handle_word_generation(word: UInt) unsafe -> UInt {
     word >> HANDLE_INDEX_BITS
 }
 
 /// Build the word for slot index `i` at generation `gen`.
 ///
-/// `gen == 0` yields the bare 1-based index, which is D-1's load-bearing
-/// compatibility rule: a slot's first-life word is what it always was.
+/// `gen == 0` yields the bare 1-based index, so a slot's first-life word is the
+/// plain index. Spec §12's boot order (System, Process, Thread are words 1, 2,
+/// 3) and hand-assembled payloads depend on that.
 func handle_word(index: Int, gen: UInt32) unsafe -> UInt {
     ((gen as UInt) << HANDLE_INDEX_BITS) | ((index as UInt) + 1)
 }
 
 /// Resolve a handle in a process's table.
 ///
-/// An out-of-range, unbound or STALE handle resolves to `ObjType.Unbound`, and
-/// the rights travel WITH the entry rather than being assumed by the op — the
-/// two properties the M1 version already had, now over a real table with
-/// generations.
+/// An out-of-range, unbound or stale handle resolves to `ObjType.Unbound`, and
+/// the rights travel with the entry rather than being assumed by the op.
 ///
-/// THREE WAYS TO NAME NOTHING and one answer for all of them: a word whose index
-/// byte is not an index (zero at any generation, or past the table), a slot that
-/// holds no binding, and a slot whose GENERATION has moved on since this word
-/// was handed out. The third is design 3 D-1's whole purpose — a word from a
-/// released handle points at a live slot with the wrong life, and the caller's
-/// `BadHandle` fault is the diagnosis.
+/// Three ways to name nothing, one answer for all: a word whose index field is
+/// not an index (zero at any generation, or past the table), a slot that holds
+/// no binding, and a slot whose generation has moved on since this word was
+/// handed out. In the last case the word points at a live slot with the wrong
+/// life, and the caller's `BadHandle` fault is the diagnosis.
 public(package) func lookup_handle(p: Int, h: UInt) unsafe -> HandleEntry {
     let index = handle_word_index(h)
     if index >= MAX_HANDLES {
@@ -492,21 +452,16 @@ public(package) func lookup_handle(p: Int, h: UInt) unsafe -> HandleEntry {
 }
 
 /// Mint a handle naming `target` of kind `kind` with `rights`, in process `p`'s
-/// table. Returns `NO_HANDLE` when the table is full — an exhaustion the caller
-/// could not have known about, which is what a status is for.
+/// table. Returns `NO_HANDLE` when the table is full or the quota is spent;
+/// `mint_refusal` tells the two apart for the status.
 ///
-/// LOWEST FREE INDEX WINS, which is what makes a released slot the one the next
-/// mint reuses — the property `handle_remint` observes. The word it stamps
-/// carries the slot's SURVIVING generation, so the reuse is visible in the word
-/// and the old word is stale rather than aliasing.
+/// The lowest free index wins, so a released slot is the one the next mint
+/// reuses. The word carries the slot's surviving generation, so the reuse is
+/// visible in the word and the old word is stale rather than aliasing.
 ///
-/// **THE HANDLE ROW IS CHARGED HERE, POLICY BEFORE THE TABLE** (sawos design 7
-/// D-3). A process at its handle budget is refused before the table is walked,
-/// which is the check order every other allocation site follows spelled inside
-/// the allocator instead of beside it — `mint_handle` is the only one whose
-/// "slab" is a region of a per-process table, so there is no second scan for a
-/// caller to order against. The two refusals share `NO_HANDLE`, and
-/// `mint_refusal` is what tells them apart for the status.
+/// The handle row is charged here, policy before the table: a process at its
+/// handle budget is refused before the table is walked, matching the check
+/// order of every other allocation site.
 public(package) func mint_handle(p: Int, kind: ObjType, rights: UInt32, target: Int) unsafe -> UInt {
     if not quota_room(p, QuotaKind.Handle) {
         return NO_HANDLE
@@ -530,21 +485,19 @@ public(package) func mint_handle(p: Int, kind: ObjType, rights: UInt32, target: 
     NO_HANDLE
 }
 
-/// **CAN `p`'s TABLE ACCEPT `n` MORE ENTRIES, BOTH BY POLICY AND BY THE
-/// TABLE?** — the rendezvous's atomic pre-flight (`designs/010` ruling 5; sawos
-/// design 18).
+/// Whether `p`'s table can accept `n` more entries, both by quota and by free
+/// slots. This is the rendezvous's atomic pre-flight.
 ///
-/// It asks `mint_handle`'s two questions `n` times over, without answering
-/// either: the quota first (policy before the table, the check order every
-/// allocation site follows) and then a bounded count of the free slots. A take
-/// or a delivery that carries handles calls this ONCE, before it moves anything,
-/// so a refusal leaves the staged message exactly where it was and the level it
-/// raised still raised — free a slot, ask again, and the same message arrives.
+/// It asks `mint_handle`'s two questions `n` times over without answering
+/// either: the quota first, then a bounded count of the free slots. A take or
+/// delivery that carries handles calls this once, before it moves anything, so
+/// a refusal leaves the staged message where it was and the level it raised
+/// still raised.
 ///
-/// **IT COUNTS RATHER THAN RESERVING**, which is `pipe_has_room`'s own argument
-/// one table over: a reservation would have to be given back on every path that
-/// does not use it, and the caller is inside a single syscall with interrupts
-/// masked, so nothing can take a slot between the count and the mints.
+/// It counts rather than reserving: a reservation would have to be given back
+/// on every path that does not use it, and the caller is inside a single
+/// syscall with interrupts masked, so nothing can take a slot between the count
+/// and the mints.
 public(package) func table_room(p: Int, n: Int) unsafe -> Bool {
     if not quota_room_for(p, QuotaKind.Handle, n) {
         return false
@@ -561,21 +514,18 @@ public(package) func table_room(p: Int, n: Int) unsafe -> Bool {
     free >= n
 }
 
-/// Unbind the entry at index `i` of process `p`'s table and BUMP its generation.
+/// Unbind the entry at index `i` of process `p`'s table and bump its
+/// generation.
 ///
-/// THE ONE PLACE A BINDING IS DESTROYED — the release op and the teardown's
-/// close-all both come through here, which is what makes "release and teardown
-/// do the same thing to a slot" a fact rather than two implementations that
-/// agree today. It NEVER touches the object the entry named: an object whose
-/// last handle is gone is unreachable-but-live until its process's teardown,
-/// which is the close-all's own long-standing precedent (design 3 D-2). The one
-/// exception is a Gone process's slot, and it is decided by the caller, above
-/// this line.
+/// This is the one place a binding is destroyed: the release op and the
+/// teardown's close-all both come through here, so release and teardown do the
+/// same thing to a slot. It never touches the object the entry named or its
+/// reference count; the caller drops the reference (`unref_object` frees at
+/// zero, and the teardown's `unref_teardown` does not).
 ///
-/// The generation WRAPS at 2^24 rather than saturating, and the wrap is the
-/// documented limit of the mechanism: after 2^24 reuses of one slot a word can
-/// alias again. That is best-effort bug detection working as ruled, not a hole
-/// to close with unbounded bookkeeping — the table is per-process, so a wrap
+/// The generation wraps at `HANDLE_GENERATION_MODULUS` rather than saturating.
+/// After that many reuses of one slot a word can alias again; this is
+/// best-effort bug detection, and since the table is per-process a wrap
 /// collision crosses no boundary and grants nothing.
 public(package) func unbind_handle(p: Int, index: Int) unsafe {
     let entry = PROCESSES[p].handles[index]
@@ -583,77 +533,54 @@ public(package) func unbind_handle(p: Int, index: Int) unsafe {
     PROCESSES[p].handles[index] = HandleEntry(obj_type: ObjType.Unbound,
                                               rights: 0, target: 0,
                                               gen: next)
-    // THE HANDLE ROW IS CREDITED HERE, at the one place a binding is destroyed
-    // — which is what makes the entry count and the quota count the same fact
-    // rather than two that agree today (sawos design 7 D-3).
+    // Credited at the one place a binding is destroyed, so the entry count and
+    // the quota count are the same fact.
     quota_credit(p, QuotaKind.Handle)
 }
 
 // =============================================================================
-// THE QUOTA LEDGER (spec §12's promise; sawos design 7 D-3)
+// The quota ledger (spec §2.9)
 // =============================================================================
 //
-// **§12's "A FIELD ON THE PROCESS SLOT" IS LITERALLY TRUE SINCE M5 UNIT 6b**
-// (sawos design 36), and the paragraph that used to stand here is worth keeping
-// as the record of why it took so long. It said the promise was "kept one module
-// down, for a reason the module order decides rather than taste": the HANDLE row
-// is charged inside `mint_handle` and credited inside `unbind_handle`, which are
-// HERE, and `kcore.process` sat ABOVE this file — so a table on `ProcessSlot`
-// could not be reached from the two functions that most need it.
+// The ledger is a pair of rows on the process slot (`PROCESSES[p].quota_used` /
+// `.quota_limit`), indexed by `QuotaKind`. The handle row is charged inside
+// `mint_handle` and credited inside `unbind_handle`, which is why the record
+// lives below this file.
 //
-// Unit 6b answered that by moving the RECORD below both files rather than by
-// moving the functions: `ProcessSlot` lives in `kcore.pslot` now and the ledger
-// is `PROCESSES[p].quota_used` / `.quota_limit`. `mint_handle` did not go
-// anywhere, the flat `p * QUOTA_KINDS + kind` arithmetic is gone, and a process
-// slot in a DONATED extent carries its own two rows.
+// Two rows per kind: what is spent, and what may be. A charge happens at the
+// allocation sites that answer `NoResource`, policy first: the quota is asked
+// before the machine is, so a process at its budget is told whose limit it met.
+// A credit happens where the thing is actually returned: `free_object` for the
+// refcounted kinds, `Unmap` for the mapping row, and the teardown for
+// everything at once.
 //
-// **TWO ROWS PER KIND: what is spent, and what may be.** A charge happens at
-// the allocation sites that answer `NoResource` today, ordered POLICY FIRST —
-// the quota is asked before the machine is, so a process at its budget is told
-// whose limit it met. A credit happens where the thing is actually returned:
-// `free_object` for the refcounted kinds, `Unmap` for the mapping ROW, and the
-// teardown for everything at once.
-//
-// **NOTHING HERE IS INDEXED BY `ObjType`**, deliberately. The kinds with a
-// budget are not the kinds with a slab — a Clock is kernel-eternal and owned by
-// nobody, a System object is a singleton, and HANDLES are counted though they
-// have no slab at all — so this is its own closed set, and adding a case fails
-// `install_quota_limits` to compile until somebody says what a child may hold
-// of it.
+// Nothing here is indexed by `ObjType`. The kinds with a budget are not the
+// kinds with a slab (a Clock is kernel-eternal, a System object is a singleton,
+// and handles are counted though they have no slab), so this is its own closed
+// set. A new `QuotaKind` case needs a line in `install_quota_limits`; without
+// one its limit stays zero and a process can hold none of it.
 
-// `QuotaKind` and `QUOTA_KINDS` MOVED TO `kcore.pslot` in M5 unit 6b (sawos
-// design 36), with the rows they index — a field's type belongs where the
-// record is. The vocabulary is unchanged and its full reasoning travelled with
-// it; everything that CHARGES or CREDITS a row is still here.
-
-/// "No policy cap on this row: the MACHINE answers."
+/// "No policy cap on this row: the machine answers."
 ///
-/// **THIS IS HOW ROOT'S LIMITS ARE THE SLAB SIZES** (D-3), and the sentinel is
-/// the right spelling rather than the numbers themselves. Writing root's rows
-/// as the slab sizes would put a policy cap at exactly the point the machine
-/// refuses, and since the quota is asked FIRST, every `NoResource` root has
-/// ever been answered with would become a `QuotaExceeded` — the machine's edge
-/// speaking in policy's voice, which is the opposite of what "its policy cap IS
-/// the machine" says. With the sentinel the slab is what refuses root, which is
-/// the sentence executed rather than approximated.
+/// This is how root's limits are the slab sizes. Writing root's rows as the
+/// slab sizes would put a policy cap exactly where the machine refuses, and
+/// since the quota is asked first, every `NoResource` root was answered with
+/// would become a `QuotaExceeded`. With the sentinel the slab is what refuses
+/// root.
 public(package) static QUOTA_UNLIMITED: UInt16 = 0xFFFF
 
-/// WHICH COLUMN of a process's two ledger rows `kind` is.
+/// Which column of a process's two ledger rows `kind` is.
 ///
-/// **THE MULTIPLY IS WHAT UNIT 6b UNLEARNED HERE** (sawos design 36). This was
-/// `quota_at(p, kind) = p * QUOTA_KINDS + kind`, an index into one flat
-/// `MAX_PROCESSES ×` array; the rows are fields of the process slot now, so the
-/// process half of the address is the slab lookup and what is left is the
-/// column. It keeps its own name because "the value IS the column index" is a
-/// property of `QuotaKind` worth spelling once rather than casting at six sites.
+/// The value of `QuotaKind` is the column index; this keeps that cast in one
+/// place rather than at every site.
 func quota_column(kind: QuotaKind) -> Int {
     (kind as UInt8) as Int
 }
 
 /// Has `p` room for one more of `kind`?
 ///
-/// ASKED BEFORE THE SLAB IS, at every allocation site — D-3's check order, and
-/// the reason a caller can tell "my budget" from "the machine's edge".
+/// Asked before the slab is, at every allocation site, so a caller can tell "my
+/// budget" from "the machine's edge".
 public(package) func quota_room(p: Int, kind: QuotaKind) unsafe -> Bool {
     let at = quota_column(kind)
     let limit = PROCESSES[p].quota_limit[at]
@@ -665,16 +592,10 @@ public(package) func quota_room(p: Int, kind: QuotaKind) unsafe -> Bool {
 
 /// Has `p` room for `n` more of `kind`?
 ///
-/// **THE RENDEZVOUS IS WHY THIS EXISTS** (`designs/010` ruling 5, built by sawos
-/// design 18). Every other allocation site takes one thing and can ask about
-/// one; a take that carries handles mints SEVERAL entries at once and must
-/// refuse ATOMICALLY — the message stays staged, the level stays ready, and the
-/// answer is the table-full status — so the question has to be asked about the
-/// whole batch before any of it happens. Asking one at a time and unwinding
-/// would be the same answer reached by a path that can fail halfway.
-///
-/// `n == 0` is legal and answers true, which is what a message with no handles
-/// asks.
+/// A take that carries handles mints several entries at once and must refuse
+/// atomically (the message stays staged, the level stays ready, the answer is
+/// the table-full status), so the question is asked about the whole batch
+/// before any of it happens. `n == 0` is legal and answers true.
 public(package) func quota_room_for(p: Int, kind: QuotaKind, n: Int) unsafe -> Bool {
     let at = quota_column(kind)
     let limit = PROCESSES[p].quota_limit[at]
@@ -686,8 +607,7 @@ public(package) func quota_room_for(p: Int, kind: QuotaKind, n: Int) unsafe -> B
 
 /// Spend one of `kind` against `p`.
 ///
-/// CALLED ONLY ONCE EVERY REFUSAL IS BEHIND US — `event_create`'s
-/// all-or-nothing shape, applied to the ledger: a charge made before a slab
+/// Call only once every refusal is behind you: a charge made before a slab
 /// refusal would leave a process paying for an object it never got.
 public(package) func quota_charge(p: Int, kind: QuotaKind) unsafe {
     let at = quota_column(kind)
@@ -697,9 +617,8 @@ public(package) func quota_charge(p: Int, kind: QuotaKind) unsafe {
 
 /// Give one of `kind` back to `p`.
 ///
-/// The zero test is not defensive bookkeeping, it is the write-off D-4 names:
-/// a credit may land on a row the teardown has already zeroed, and the honest
-/// answer for "give back what nobody is charged for" is to do nothing.
+/// The zero test is the write-off: a credit may land on a row the teardown has
+/// already zeroed, and giving back what nobody is charged for does nothing.
 public(package) func quota_credit(p: Int, kind: QuotaKind) unsafe {
     let at = quota_column(kind)
     let spent = PROCESSES[p].quota_used[at]
@@ -710,11 +629,10 @@ public(package) func quota_credit(p: Int, kind: QuotaKind) unsafe {
 
 /// Forget process `p`'s ledger. Called by the teardown.
 ///
-/// **CREDITS DIE WITH THE LEDGER** (sawos design 7 D-4): a Gone process's rows
-/// zero with its slot, so everything it was ever charged for is written off in
-/// one line and the books balance by construction. Both rows go, not only the
-/// used ones — a process slot is reclaimable (design 3 D-3) and the next
-/// occupant must not inherit a stranger's allowance.
+/// A Gone process's rows zero with its slot, so everything it was ever charged
+/// for is written off and the books balance by construction. Both rows go, not
+/// only the used ones: a process slot is reclaimable and the next occupant must
+/// not inherit a stranger's allowance.
 public(package) func quota_clear(p: Int) unsafe {
     var i: Int = 0
     while i < QUOTA_KINDS {
@@ -731,26 +649,22 @@ func set_limit(p: Int, kind: QuotaKind, value: UInt16) unsafe {
 
 /// Give process `p` its allowance, and zero what it has spent.
 ///
-/// TWO POLICIES, ONE FUNCTION. `root` is init and its cap is the machine, so
-/// every row but one is `QUOTA_UNLIMITED` and the SLAB is what refuses it. A
-/// child gets `kcore.limits`' documented defaults, which are all visibly under
-/// their slabs.
+/// Root's cap is the machine, so every row but the mapping row is
+/// `QUOTA_UNLIMITED` and the slab is what refuses it. A child gets
+/// `kcore.limits`' documented defaults, all visibly under their slabs.
 ///
-/// **THE MAPPING ROW IS CLAMPED FOR BOTH, and that is agenda item 8's assert's
-/// runtime half.** `free_rows` is what the target's domain has left after its
-/// image spent its own — a fact no `static_assert` can know, since how many
-/// rows an image takes is a property of the image — and capping the row at it
-/// makes the invariant "quota limit <= free rows" true for EVERY process by
-/// construction. `install_row` then cannot meet the physical wall with quota
-/// headroom left, which is what turns its `fatal` from a hope into a
-/// consequence. Root is capped too, and that is not a departure from "root's
-/// cap is the machine": the row budget IS the machine, stated in the ledger's
-/// vocabulary so that the one refusal a `map` can meet is the one the assert
-/// reasons about.
+/// The mapping row is clamped for both. `free_rows` is what the target's domain
+/// has left after its image spent its own, which no `static_assert` can know
+/// since how many rows an image takes is a property of the image. Capping the
+/// row at it makes "quota limit <= free rows" true for every process by
+/// construction, so `install_row` cannot meet the physical wall with quota
+/// headroom left and its `fatal` is a consequence rather than a hope. Root is
+/// capped too: the row budget is the machine, stated in the ledger's
+/// vocabulary.
 ///
-/// It is called once per process life — at boot for root, at `process_create`
-/// for a child — and always AFTER the image's rows are recorded, because
-/// `free_rows` is read from the record.
+/// Call once per process life (at boot for root, at `process_create` for a
+/// child), always after the image's rows are recorded, because `free_rows` is
+/// read from the record.
 public(package) func install_quota_limits(p: Int, root: Bool, free_rows: Int) unsafe {
     var i: Int = 0
     while i < QUOTA_KINDS {
@@ -790,11 +704,10 @@ public(package) func install_quota_limits(p: Int, root: Bool, free_rows: Int) un
 
 /// Which refusal a `mint_handle` that answered `NO_HANDLE` was.
 ///
-/// The two are indistinguishable in the word — there is one sentinel — so this
-/// re-asks the question the mint asked first: a caller with no handle room left
-/// met ITS budget, anyone else met the TABLE. One helper rather than a second
-/// return channel, because every mint site already tests for `NO_HANDLE` and
-/// this turns that test into the right status without changing its shape.
+/// The word has one sentinel for both, so this re-asks the mint's first
+/// question: a caller with no handle room left met its budget, anyone else met
+/// the table. Every mint site already tests for `NO_HANDLE`; this turns that
+/// test into the right status without changing its shape.
 public(package) func mint_refusal(p: Int) unsafe -> SosStatus {
     if quota_room(p, QuotaKind.Handle) {
         return SosStatus.NoResource
@@ -803,103 +716,78 @@ public(package) func mint_refusal(p: Int) unsafe -> SosStatus {
 }
 
 // =============================================================================
-// The Memory slab, first of three (spec §2.5; sawos design 2 D-2, grown by
-// design 6)
+// The Memory slab (spec §2.5)
 // =============================================================================
 //
-// **THREE SLABS, AND NONE OF THEM IS A MODULE — WHICH UNIT 4 TESTED AND KEPT.**
-// Unit 2 put the Memory slab here beside the handle table on the argument that
-// a Memory is a SEALED PAIR: every other object kind has behaviour somewhere
-// (a thread has a state machine, a timer a schedule, an event an accumulation
-// rule) and a region had none, so a file per object would have been a file with
-// no verbs in it. Unit 4 gave all three kinds verbs — `Split`, `Carve`, `Map`,
-// `Unmap` — and they still live here, because the verbs went to the DISPATCH
-// where every other kind's do. What is here is what was here: storage, an
-// allocator per slab, and one index fixup.
-//
-// They sit BELOW `process` for the reason every other slab does: ending a
-// process frees what it owned, so the storage has to be reachable from the
-// teardown.
+// The Memory, IoMemory and Mapping slabs live here beside the handle table,
+// with storage, an allocator per slab and one index fixup; the verbs (`Split`,
+// `Carve`, `Map`, `Unmap`) live in the dispatch. They sit below `process` as
+// every slab does: ending a process frees what it owned, so the storage has to
+// be reachable from the teardown.
 
-/// One Memory object: a range of physical memory, whose it is, and — since
-/// sawos design 28 — which POOL the bytes came out of.
+/// One Memory object: a range of physical memory, whose it is, and which pool
+/// the bytes came out of.
 ///
 /// `len` rather than a top address, because that is the shape the region table
-/// carries and the shape a pool hands out. The kernel computes the top
-/// where it needs one, with the bound test ordered so the addition cannot
-/// overflow — the loader's own discipline.
+/// carries and a pool hands out. Compute the top where needed, with the bound
+/// test ordered so the addition cannot overflow.
 ///
-/// **TWO COUNTS, AND THE RANGE GOES BACK AT THE SECOND ZERO** (sawos design 28;
-/// design 25 D-5, ruled). §2.5 has always said a region is "freed only when the
-/// LAST reference of either kind — any MemoryObject handle OR any Mapping —
-/// drops", and until this unit only the first kind was counted: `refs` reached
-/// zero, the slot came back, and the RANGE returned to nobody. `maps` is the
-/// second kind, and the two together are that sentence executed.
+/// Two counts, and the range goes back at the second zero. §2.5 says a region
+/// is freed only when the last reference of either kind (any MemoryObject
+/// handle or any Mapping) drops: `refs` counts the first kind and `maps` the
+/// second.
 ///
-/// **THREE FIELDS ARE THE POOL'S AND ARE MEANINGFUL ONLY ON A ROOT.** A pool is
-/// not a fourth object kind: it is the boot-minted region every derived region
-/// points back at, so its ledger lives on its own slot rather than in a table
-/// that would have to be kept in step with this one. `free_head`, `out_bytes`
-/// and `dropped` read as zero on every derived region and nothing asks them
-/// there.
+/// `free_head`, `out_bytes` and `dropped` are the pool's, meaningful only on a
+/// root. A pool is not a separate object kind: it is the boot-minted region
+/// every derived region points back at, so its ledger lives on its own slot.
+/// They read as zero on every derived region and nothing asks them there.
 public(package) struct MemorySlot {
     public(package) state: SlotState,
     public(package) process: Int,
     public(package) base: UInt,
     public(package) len: UInt,
-    /// How many handle entries name this region (sawos design 7 D-1).
+    /// How many handle entries name this region.
     public(package) refs: UInt16,
-    /// How many INSTALLED GRANT ROWS name this region (sawos design 28) — the
-    /// SECOND of §2.5's two reference kinds.
+    /// How many installed grant rows name this region: the second of §2.5's two
+    /// reference kinds.
     ///
-    /// **IT COUNTS ROWS, NOT `Mapping` OBJECTS, and that is the load-bearing
-    /// choice** (design 28's bookkeeping, which design 25 D-5 left to the
-    /// implementation). A Mapping object and its row have different lifetimes —
-    /// design 7 D-2's husk arm frees the slot and LEAVES the row installed — so
-    /// counting objects would lose the row that is still granting these bytes
-    /// the moment its last handle went. A row cannot vanish unwitnessed: it is
-    /// born in `record_grant` and dies in `remove_grant` or `clear_domain`, and
-    /// those three sites are where this count moves. That is also why the
-    /// back-reference rides the GRANT ROW rather than the Mapping slot — one
-    /// ledger, kept where the thing it counts actually lives (design 7's
-    /// doctrine).
+    /// It counts rows, not `Mapping` objects. A Mapping object and its row have
+    /// different lifetimes (the husk arm frees the slot and leaves the row
+    /// installed), so counting objects would lose the row that is still
+    /// granting these bytes the moment its last handle went. A row is born in
+    /// `record_grant` and dies in `remove_grant` or `clear_domain`; those three
+    /// sites are where this count moves.
     public(package) maps: UInt16,
-    /// The POOL ROOT these bytes belong to: a boot-minted region names ITSELF,
-    /// and a split carries its parent's answer down (sawos design 28; design 25
-    /// D-5's ruled RETURN TO ROOT).
+    /// The pool root these bytes belong to: a boot-minted region names itself,
+    /// and a split carries its parent's answer down.
     ///
-    /// THE DERIVATION CHAIN IS A CURSOR ARTIFACT, NOT AN OWNERSHIP TREE — the
-    /// ruling's own words. A piece cut from a piece returns to the POOL, not to
-    /// the intermediate cursor it happened to be cut from, so one back-reference
-    /// is the whole of the new per-object state.
+    /// The derivation chain is a cursor artifact, not an ownership tree: a
+    /// piece cut from a piece returns to the pool, not to the intermediate
+    /// region it was cut from.
     public(package) root: Int,
-    /// ROOT-ONLY: the head of this pool's free list — node index + 1, 0 empty.
+    /// Root only: the head of this pool's free list, node index + 1, 0 empty.
     public(package) free_head: Int,
-    /// ROOT-ONLY: bytes handed out of this pool and not yet returned.
+    /// Root only: bytes handed out of this pool and not yet returned.
     ///
-    /// **THE PAIR WITH `pool_free_bytes` IS §5.9's "BYTE ACCOUNTING"** and is
-    /// the pool's own ledger: outstanding here, free there. Quotas STAY
-    /// object-counted (design 25 D-5, ruled) — bytes are the pool's business,
-    /// not a per-process authority — and there is no op to read this in v1. It
-    /// is not decoration: it is the third count in a ROOT's release condition
-    /// (see `memory_release_if_idle`), which is what keeps a derived region's
-    /// back-reference from ever naming a slot that has been given away.
+    /// With `pool_free_bytes` this is §5.9's byte accounting: outstanding here,
+    /// free there. Quotas stay object-counted; bytes are the pool's business.
+    /// It is also the third count in a root's release condition (see
+    /// `memory_release_if_idle`), which keeps a derived region's back-reference
+    /// from ever naming a slot that has been given away.
     public(package) out_bytes: UInt,
-    /// ROOT-ONLY: bytes LOST to free-node exhaustion, never silently.
+    /// Root only: bytes lost to free-node exhaustion, counted rather than
+    /// silent.
     ///
-    /// **RELEASE IS INFALLIBLE** (design 28): a range that finds no node after
-    /// coalescing is leaked and COUNTED here, because the alternative — refusing
-    /// a release — would mean an object that cannot be given up. Reaching this
-    /// takes a pool fragmented into more than `MAX_FREE_RANGES` holes; it is
-    /// zero in this tree.
+    /// Release is infallible: a range that finds no node after coalescing is
+    /// leaked and counted here, because refusing a release would mean an object
+    /// that cannot be given up. Reaching this takes a pool fragmented into more
+    /// than `MAX_FREE_RANGES` holes.
     public(package) dropped: UInt,
 }
 
-// AN EXTENT CHAIN SINCE M5 UNIT 6 (sawos design 32). `MAX_MEMORIES` is extent
-// 0's length — the floor the image is built with — and the deployment that wants
-// more regions donates them. Note what this does NOT change: a Memory slot is
-// the OBJECT, and donating slots raises how many regions can exist at once
-// without adding a single byte to any pool.
+// `MAX_MEMORIES` is the length of the inline extent; donated extents add slots.
+// A Memory slot is the object: donating slots raises how many regions can exist
+// at once without adding a byte to any pool.
 public(package) unsafe static var MEMORIES: Slab<MemorySlot, MAX_MEMORIES> = Slab<MemorySlot, MAX_MEMORIES>(
     inline: [MemorySlot(state: SlotState.Free, process: 0, base: 0, len: 0,
                         refs: 0, maps: 0, root: NO_MEMORY, free_head: 0,
@@ -924,70 +812,51 @@ public(package) func alloc_memory() unsafe -> Int {
 }
 
 // -----------------------------------------------------------------------------
-// THE POOL: spent bytes come back (spec §2.5, §5.9; sawos design 28, on design
-// 25 D-5 as ruled)
+// The pool: spent bytes come back (spec §2.5, §5.9)
 // -----------------------------------------------------------------------------
 //
-// **WHAT WAS WRONG.** A RAM pool was a one-way front-cut cursor. `Split` took
-// the front of the parent's range and the parent advanced past it; a freed
-// region gave back its SLAB SLOT (design 7 D-1) and its BYTES to nobody, so a
-// system with process churn leaked physical RAM permanently. §2.5 recorded the
-// deferral honestly and the §5.9 pin has waited on "a real allocator" since M1.
+// A region knows its pool root. When both of its counts are zero its range goes
+// back to that root. A returned range coalesces with its free neighbours, and
+// one that touches the root's unspent frontier folds back into the cursor, so a
+// fully-freed pool returns to its boot state. A `Split` takes the first fit off
+// the free list and falls back to the cursor.
 //
-// **THE WHOLE MECHANISM IS FOUR SENTENCES.** A region knows its pool root. When
-// both of its counts are zero its range goes back to that root. A returned range
-// COALESCES with its free neighbours, and one that touches the root's unspent
-// frontier folds back into the cursor — which is what lets a fully-freed pool
-// return to its boot state. A `Split` takes the FIRST FIT off the free list and
-// falls back to the cursor.
+// The cursor is the empty-free-list fast path and what a fresh pool is. A
+// cut-and-drop loop allocates and frees the same range forever and never
+// touches a node.
 //
-// **THE CURSOR STAYS, and is not a legacy path.** It is the empty-free-list fast
-// path, it is what a fresh pool is, and the fold-back is what makes "spent bytes
-// come back" observable as the pool becoming whole again rather than as a list
-// nobody can see. A cut-and-drop loop therefore allocates and frees the SAME
-// range forever and never touches a node at all.
+// Only a root draws on the list. This is an authority rule: a derived region
+// names exactly its own range, and serving its `Split` out of the pool's list
+// would hand its holder bytes it never had. A pool root's cut ranges are on
+// loan, and a returned loan is the pool's again.
 //
-// **ONLY A ROOT DRAWS ON THE LIST**, and that is an authority statement rather
-// than an optimisation. A derived region names exactly its own range; serving
-// its `Split` out of the pool's list would hand its holder bytes it never had.
-// A pool ROOT is different in kind — it names the POOL, its cut ranges are on
-// loan, and a returned loan is the pool's again, which is precisely what the
-// fold-back does to its `base`/`len` in the ordinary case.
-//
-// **IoMemory IS UNTOUCHED** — §5.9's own carve-out, stated where the mechanism
-// is. A carve leaves the parent whole, MMIO is pinned, nothing is ever placed in
-// those bytes and nothing is ever returned; the slab above has no pool and needs
-// none.
+// IoMemory is untouched (§5.9's carve-out): a carve leaves the parent whole,
+// MMIO is pinned, and nothing is ever placed in or returned from those bytes.
 
 /// One free range on a pool's list: where it is, how big, and what follows it.
 ///
-/// The list is kept SORTED BY BASE, which is what makes coalescing two
-/// comparisons against the immediate neighbours instead of a scan, and first-fit
-/// a walk that stops.
+/// The list is kept sorted by base, so coalescing is two comparisons against
+/// the immediate neighbours and first-fit is a walk that stops.
 public(package) struct FreeRange {
     public(package) state: SlotState,
     public(package) base: UInt,
     public(package) len: UInt,
-    /// The next node of this pool's list — node index + 1, 0 = end.
+    /// The next node of this pool's list: node index + 1, 0 = end.
     ///
-    /// Index + 1 rather than a `-1` sentinel because that is the spelling every
-    /// other list in this kernel uses (`WaiterSlot.attached`, an attachment's
-    /// `link`), and a zeroed slab is then an empty list by construction.
+    /// Index + 1 rather than a `-1` sentinel, matching every other list in this
+    /// kernel (`WaiterSlot.attached`, an attachment's `link`), so a zeroed slab
+    /// is an empty list by construction.
     public(package) next: Int,
 }
 
-// **THE NAMED FIRST CUSTOMER OF `SlabDonate`** (sawos design 32; design 28's
-// closing sentence, and design 25 D-6). This is the slab whose exhaustion the
-// allocator answers by LEAKING — a returned range that coalesces into nothing
-// and finds no node is added to its pool's `dropped` and lost, because release
-// is infallible and must stay so. Donating nodes is what turns that from a
-// permanent property of the image into a deployment's choice: after a donation
-// the same release finds a node and the bytes come home.
+// A donatable slab: a returned range that coalesces into nothing and finds no
+// node is added to its pool's `dropped` and lost, because release is
+// infallible. Donating nodes lets the same release find a node and the bytes
+// come home.
 //
-// IT STOPPED BEING MODULE-PRIVATE HERE, and the widening is worth a line: the
-// donation dispatch has to name every donatable slab in one `match`, and it
-// sits above `waitables`, so it cannot be written in this file. The privacy was
-// incidental — nothing outside had wanted a node — rather than a guarantee.
+// It is `public(package)` because the donation dispatch names every donatable
+// slab in one `match` and sits above `waitables`, so it cannot live in this
+// file.
 public(package) unsafe static var FREE_RANGES: Slab<FreeRange, MAX_FREE_RANGES> = Slab<FreeRange, MAX_FREE_RANGES>(
     inline: [FreeRange(state: SlotState.Free, base: 0, len: 0,
                        next: 0); MAX_FREE_RANGES],
@@ -1018,10 +887,8 @@ func free_free_range(n: Int) unsafe {
 /// The bytes pool `root` has ready to hand out: its unspent frontier plus every
 /// free range on its list.
 ///
-/// **THE OTHER HALF OF THE LEDGER** — `out_bytes` is what is on loan, this is
-/// what is home, and `dropped` is what was lost. Together they are §5.9's byte
-/// accounting; nothing in v1 reads them out to userspace, and an op could front
-/// them later without a surface break (the design-16 pattern).
+/// `out_bytes` is what is on loan, this is what is home, and `dropped` is what
+/// was lost; together they are §5.9's byte accounting.
 public(package) func pool_free_bytes(root: Int) unsafe -> UInt {
     var total = MEMORIES[root].len
     var cur = MEMORIES[root].free_head
@@ -1033,13 +900,13 @@ public(package) func pool_free_bytes(root: Int) unsafe -> UInt {
     total
 }
 
-/// Can region `slot` serve a cut of `len` bytes — from its own cursor, or (for a
+/// Can region `slot` serve a cut of `len` bytes, from its own cursor or (for a
 /// pool root) from one range on its free list?
 ///
-/// **THIS IS THE `Split` REFUSAL, AND IT IS STILL ONE SERVING** — the question is
-/// not "does this pool hold `len` bytes in total" but "can it hand them out in
-/// ONE range", which is what a region IS. A pool holding two non-adjacent halves
-/// of the ask answers no, and that is fragmentation rather than exhaustion.
+/// This is the `Split` refusal. The question is whether the pool can hand out
+/// `len` bytes in one range, which is what a region is, not whether it holds
+/// that many in total. Two non-adjacent halves of the ask answer no: that is
+/// fragmentation rather than exhaustion.
 public(package) func pool_can_serve(slot: Int, len: UInt) unsafe -> Bool {
     if MEMORIES[slot].len >= len {
         return true
@@ -1060,14 +927,12 @@ public(package) func pool_can_serve(slot: Int, len: UInt) unsafe -> Bool {
 
 /// Cut `len` bytes out of region `slot` and answer where they are.
 ///
-/// FIRST FIT FIRST, CURSOR SECOND (design 25 D-5's ruled policy; the free list is
-/// short and coalescing does the real work). Taking the list first is also what
-/// keeps the frontier unspent for as long as possible, so a pool that is being
-/// recycled stays whole at its top edge instead of fragmenting outward.
+/// First fit first, cursor second. Taking the list first keeps the frontier
+/// unspent as long as possible, so a recycled pool stays whole at its top edge
+/// instead of fragmenting outward.
 ///
-/// The caller has asked `pool_can_serve` and been told yes — `install_row`'s
-/// shape, and for the same reason: a wall reached with the check passed is the
-/// kernel's bug and not the caller's, so it stops the machine rather than
+/// The caller has asked `pool_can_serve` and been told yes. A wall reached with
+/// the check passed is the kernel's bug, so it stops the machine rather than
 /// inventing a status.
 public(package) func pool_cut(slot: Int, len: UInt) unsafe -> UInt {
     let root = MEMORIES[slot].root
@@ -1077,8 +942,7 @@ public(package) func pool_cut(slot: Int, len: UInt) unsafe -> UInt {
         while cur != 0 {
             let n = cur - 1
             if FREE_RANGES[n].len >= len {
-                // THE FRONT OF THE HOLE, exactly as the cursor hands out its
-                // own front — one arithmetic shape for both sources.
+                // The front of the hole, as the cursor hands out its own front.
                 let base = FREE_RANGES[n].base
                 FREE_RANGES[n].base = base + len
                 FREE_RANGES[n].len = FREE_RANGES[n].len - len
@@ -1099,18 +963,17 @@ public(package) func pool_cut(slot: Int, len: UInt) unsafe -> UInt {
     }
     if MEMORIES[slot].len < len {
         fatal_kernel("a split cut bytes its region does not have", len)
-        // `fatal_kernel` stops the machine but is not declared `-> Never`
-        // (design 6's finding 4), so the scope has to exit itself.
+        // `fatal_kernel` stops the machine but is not declared `-> Never`, so
+        // the scope has to exit itself.
         return 0
     }
     let base = MEMORIES[slot].base
     MEMORIES[slot].base = base + len
     MEMORIES[slot].len = MEMORIES[slot].len - len
-    // **BYTES LEAVE THE POOL ONLY AT THE ROOT.** A cut from a DERIVED region
-    // moves bytes that are already on loan from one holder to another, so the
-    // ledger does not move — and the books still balance, because each piece
-    // returns its own length and the parent returns whatever its cursor has
-    // left.
+    // Bytes leave the pool only at the root. A cut from a derived region moves
+    // bytes already on loan from one holder to another, so the ledger does not
+    // move; each piece returns its own length and the parent returns whatever
+    // its cursor has left.
     if root == slot {
         MEMORIES[root].out_bytes = MEMORIES[root].out_bytes + len
     }
@@ -1119,11 +982,11 @@ public(package) func pool_cut(slot: Int, len: UInt) unsafe -> UInt {
 
 /// Put `[base, base + len)` back on pool `root`'s free list, coalescing.
 ///
-/// THE INSERT IS THE COALESCE. A range that touches the free neighbour below it
-/// grows that node; one that touches the neighbour above it grows that one; one
-/// that touches both merges three into one and gives a node back. Only a range
-/// with free space on neither side needs a node of its own, which is why the
-/// list is as long as the pool is FRAGMENTED rather than as long as it is busy.
+/// A range that touches the free neighbour below it grows that node; one that
+/// touches the neighbour above grows that one; one that touches both merges
+/// three into one and gives a node back. Only a range with free space on
+/// neither side needs a node of its own, so the list is as long as the pool is
+/// fragmented, not as long as it is busy.
 func pool_insert_range(root: Int, base: UInt, len: UInt) unsafe {
     var prev: Int = NO_FREE_RANGE
     var cur = MEMORIES[root].free_head
@@ -1155,7 +1018,7 @@ func pool_insert_range(root: Int, base: UInt, len: UInt) unsafe {
                 FREE_RANGES[next].len = FREE_RANGES[next].len + l
                 into = next
             } else {
-                // THREE INTO ONE, and the node in the middle comes back.
+                // Three into one; the node in the middle comes back.
                 FREE_RANGES[into].len = FREE_RANGES[into].len + FREE_RANGES[next].len
                 FREE_RANGES[into].next = FREE_RANGES[next].next
                 free_free_range(next)
@@ -1168,9 +1031,9 @@ func pool_insert_range(root: Int, base: UInt, len: UInt) unsafe {
 
     let n = alloc_free_range()
     if n == NO_FREE_RANGE {
-        // **LEAK IT HONESTLY** (design 28). A release cannot fail: an object
-        // whose last reference cannot be given up is worse than a hole in a
-        // pool, and a silent hole is worse than a counted one.
+        // A release cannot fail: an object whose last reference cannot be given
+        // up is worse than a hole in a pool, and a silent hole is worse than a
+        // counted one.
         MEMORIES[root].dropped = MEMORIES[root].dropped + l
         return
     }
@@ -1182,17 +1045,13 @@ func pool_insert_range(root: Int, base: UInt, len: UInt) unsafe {
     }
 }
 
-/// Fold the free range that touches pool `root`'s unspent frontier back INTO the
-/// cursor.
+/// Fold the free range that touches pool `root`'s unspent frontier back into
+/// the cursor, so a fully-freed pool is whole again.
 ///
-/// **THIS IS WHAT MAKES A FULLY-FREED POOL WHOLE AGAIN** — the cleanest possible
-/// proof that spent bytes come back, and the reason the cursor survives the
-/// allocator rather than being replaced by it.
-///
-/// ONLY THE LAST NODE CAN TOUCH IT: bytes are cut from the FRONT, so every range
-/// ever handed out lies below the frontier, and the list is sorted. And only ONE
-/// pass is needed, because the coalescing invariant leaves no two free ranges
-/// adjacent — the node below the one just absorbed cannot also be touching.
+/// Only the last node can touch the frontier: bytes are cut from the front, so
+/// every range ever handed out lies below it, and the list is sorted. One pass
+/// suffices, because the coalescing invariant leaves no two free ranges
+/// adjacent, so the node below the one just absorbed cannot also be touching.
 func pool_fold_frontier(root: Int) unsafe {
     var prev: Int = NO_FREE_RANGE
     var cur = MEMORIES[root].free_head
@@ -1222,9 +1081,10 @@ func pool_return(root: Int, base: UInt, len: UInt) unsafe {
     if len == 0 {
         return
     }
-    // A POOL THAT IS NOT THERE IS A KERNEL BUG, not a case to handle: a root's
+    // A pool that is not there is a kernel bug, not a case to handle: a root's
     // own release refuses while any of its bytes are out (see
-    // `memory_release_if_idle`), so every live back-reference names a live pool.
+    // `memory_release_if_idle`), so every live back-reference names a live
+    // pool.
     match MEMORIES[root].state {
         case Live -> {},
         case Free -> {
@@ -1244,10 +1104,8 @@ func pool_return(root: Int, base: UInt, len: UInt) unsafe {
 
 /// Give every node of pool `root`'s free list back to the slab.
 ///
-/// Reached only when the pool ITSELF is going, which in this tree never happens:
-/// root servers hold the boot-minted regions for the machine's life. The bytes
-/// those nodes described die with the pool — there is nothing left to hold them
-/// — and that is the honest behaviour to state rather than a branch to test.
+/// Reached only when the pool itself is going. The bytes those nodes described
+/// die with the pool.
 func pool_drop_nodes(root: Int) unsafe {
     var cur = MEMORIES[root].free_head
     while cur != 0 {
@@ -1261,9 +1119,9 @@ func pool_drop_nodes(root: Int) unsafe {
 
 /// A grant row now names region `region`. Count it.
 ///
-/// `NO_MEMORY` is the ordinary case rather than an error: an image segment's
-/// row, a stack row and a DEVICE row all name no region, and taking that arm
-/// here is what keeps the three call sites in `process` unconditional.
+/// `NO_MEMORY` is the ordinary case, not an error: an image segment's row, a
+/// stack row and a device row name no region, and taking that arm here keeps
+/// the call sites in `process` unconditional.
 public(package) func ref_region_row(region: Int) unsafe {
     if region == NO_MEMORY {
         return
@@ -1271,7 +1129,7 @@ public(package) func ref_region_row(region: Int) unsafe {
     MEMORIES[region].maps = MEMORIES[region].maps + 1
 }
 
-/// A grant row that named region `region` is GONE — from an `Unmap` or from the
+/// A grant row that named region `region` is gone, from an `Unmap` or from the
 /// target's teardown. Count it out, and release the region if that was its
 /// second zero.
 public(package) func unref_region_row(region: Int) unsafe {
@@ -1279,8 +1137,8 @@ public(package) func unref_region_row(region: Int) unsafe {
         return
     }
     if MEMORIES[region].maps == 0 {
-        // THE INVARIANT WRITTEN DOWN: a region does not free while a row names
-        // it, so no row can outlive the slot it points at and be found here.
+        // Invariant: a region does not free while a row names it, so no row can
+        // outlive the slot it points at and be found here.
         fatal_kernel("a grant row was removed from a region with no rows",
                      region as UInt)
         return
@@ -1289,32 +1147,25 @@ public(package) func unref_region_row(region: Int) unsafe {
     memory_release_if_idle(region)
 }
 
-/// **THE SECOND ZERO** (design 25 D-5, ruled; sawos design 28). Give region
-/// `slot` back — its range to its pool and its slot to the slab — if and only if
-/// NOTHING names it any more: no handle, and no installed row.
+/// Give region `slot` back (its range to its pool, its slot to the slab) if and
+/// only if nothing names it any more: no handle and no installed row (§2.5).
 ///
-/// §2.5's refcount sentence, finally executed as written. The two counts are
-/// independent and either one may reach zero first:
+/// The two counts are independent and either may reach zero first:
 ///
-///   - handles first: a mapped-but-unreferenced region is a HUSK. Its slot
+///   - handles first: a mapped-but-unreferenced region is a husk. Its slot
 ///     stays out of the slab and its charge stays on its creator's ledger,
-///     because the object still exists — a row is still granting its bytes to
-///     somebody. §2.5's "dropped without unmap = permanent, safe-but-leaked"
-///     narrows here to "leaked until the TARGET PROCESS's teardown", and that
-///     teardown RECYCLES.
+///     because a row is still granting its bytes to somebody. It is leaked
+///     until the target process's teardown, which recycles it.
 ///   - rows first: the ordinary `Unmap` before a release, which frees at the
-///     handle drop exactly as it did before this unit.
+///     handle drop.
 ///
-/// **A POOL ROOT HAS A THIRD COUNT**, and it is `out_bytes`. A root whose own
-/// handles and rows are gone still cannot be given away while pieces of it are
-/// on loan: every one of those pieces carries a back-reference to this slot, and
-/// a slot handed to the next `Split` would make those references name a
-/// stranger. So the root waits for its own bytes, and the last piece to come
-/// home is what releases it — through the tail call below, which is the only
-/// recursion here and is one level deep by construction (a root's root is
-/// itself). UNREACHABLE IN THIS TREE: root servers hold the boot-minted regions
-/// for the machine's life, so no pool has ever gone away. Written for the day
-/// one does, and stated rather than tested.
+/// A pool root has a third count, `out_bytes`. A root whose own handles and
+/// rows are gone still cannot be given away while pieces of it are on loan:
+/// each piece carries a back-reference to this slot, and a slot handed to the
+/// next `Split` would make those references name a stranger. The last piece to
+/// come home releases the root through the tail call below, which is one level
+/// deep by construction (a root's root is itself). This path is taken only when
+/// a pool root is released while pieces of it are on loan.
 public(package) func memory_release_if_idle(slot: Int) unsafe {
     match MEMORIES[slot].state {
         case Free -> { return },
@@ -1333,9 +1184,9 @@ public(package) func memory_release_if_idle(slot: Int) unsafe {
         }
         pool_drop_nodes(slot)
     } else {
-        // THE ROW IS ALREADY GONE BY THE TIME THE BYTES MOVE, and the order is
+        // The row is already gone by the time the bytes move, and the order is
         // the contract: `remove_grant`/`clear_domain` take the row out of the
-        // record BEFORE they drop this count, so a range can never be handed to
+        // record before they drop this count, so a range can never be handed to
         // a new owner while a domain still grants it to the old one.
         pool_return(root, MEMORIES[slot].base, MEMORIES[slot].len)
     }
@@ -1349,28 +1200,26 @@ public(package) func memory_release_if_idle(slot: Int) unsafe {
     }
 }
 
-/// Retire a Memory slot whose bytes have become a SLAB EXTENT (sawos design 32).
+/// Retire a Memory slot whose bytes have become a slab extent.
 ///
-/// **THE SIBLING OF `memory_release_if_idle`, and the whole of the difference is
-/// the one call it does not make.** A released region gives its range back to
-/// its pool root's free list; a DONATED region must never, because the kernel is
-/// now keeping its own object slots there and the next `Split` would hand them
-/// out. So this frees the SLOT — the object is gone, nothing can name it, and
-/// the slab slot is reusable — while the RANGE stays out of every pool forever.
+/// The sibling of `memory_release_if_idle`; the difference is the one call it
+/// does not make. A released region gives its range back to its pool root's
+/// free list; a donated region must never, because the kernel now keeps its own
+/// object slots there and the next `Split` would hand them out. So this frees
+/// the slot (the object is gone and nothing can name it) while the range stays
+/// out of every pool forever.
 ///
-/// The bookkeeping that makes that permanent rather than merely unrecorded: a
-/// derived region's length stays counted in its root's `out_bytes`, so the root
-/// still believes those bytes are on loan and can never itself be released or
-/// re-served. That is the mapping-leak stance stated in the ledger instead of in
-/// a comment (design 25 D-6).
+/// A derived region's length stays counted in its root's `out_bytes`, so the
+/// root still believes those bytes are on loan and can never itself be released
+/// or re-served.
 ///
-/// A POOL ROOT may be donated whole, and then its free-list nodes go back to the
-/// node slab exactly as `memory_release_if_idle` does it — the caller has already
-/// checked `out_bytes == 0`, so nothing is out on loan to be orphaned.
+/// A pool root may be donated whole, and then its free-list nodes go back to
+/// the node slab as `memory_release_if_idle` does it; the caller has already
+/// checked `out_bytes == 0`, so nothing on loan is orphaned.
 ///
-/// There is no `refs`/`maps` test here and there must not be: the caller checked
-/// both, and reaching this function is the statement that the region is the
-/// kernel's now.
+/// There is no `refs`/`maps` test here and there must not be: the caller
+/// checked both, and reaching this function is the statement that the region is
+/// the kernel's.
 public(package) func memory_retire_donated(slot: Int) unsafe {
     let root = MEMORIES[slot].root
     if root == slot {
@@ -1384,17 +1233,16 @@ public(package) func memory_retire_donated(slot: Int) unsafe {
 }
 
 // =============================================================================
-// The IoMemory slab (spec §2.5; sawos design 6 D-1)
+// The IoMemory slab (spec §2.5)
 // =============================================================================
 //
-// THE SAME SHAPE AS THE MEMORY SLAB, AND A DIFFERENT LIFETIME. An IoMemory is
-// `{base, len}` plus the process it is charged to, exactly as a Memory is —
-// which is why the two slabs are two arrays rather than one array with a flag,
-// per D-1: what differs is not the SHAPE but everything the shape is used for.
-// The bytes it names are REGISTERS, so nothing is ever placed in them, nothing
-// is ever zeroed, and the range is never returned to anybody — carving hands
-// out a view and leaves the parent whole (§2.5's "a fixed region may be handed
-// out many times"). The teardown reclaims the slot and touches no hardware.
+// An IoMemory is `{base, len}` plus the process it is charged to, like a
+// Memory, but it is its own array rather than a flag because everything the
+// shape is used for differs. The bytes it names are registers: nothing is
+// placed in them or zeroed, and the range is never returned to anybody. Carving
+// hands out a view and leaves the parent whole (§2.5: a fixed region may be
+// handed out many times). The teardown reclaims the slot and touches no
+// hardware.
 
 /// One IoMemory object: a range of device registers, and whose it is.
 public(package) struct IoMemorySlot {
@@ -1402,14 +1250,13 @@ public(package) struct IoMemorySlot {
     public(package) process: Int,
     public(package) base: UInt,
     public(package) len: UInt,
-    /// How many handle entries name this window (sawos design 7 D-1).
+    /// How many handle entries name this window.
     public(package) refs: UInt16,
 }
 
-// AN EXTENT CHAIN SINCE M5 UNIT 6 (sawos design 32). The slab grows; what does
-// NOT grow is the number of device windows a BOARD has, which is what the floor
-// was chosen against — donating IoMemory slots buys a machine that carves one
-// peripheral into many views, not a machine with more peripherals.
+// Donated extents add slots, not device windows: the floor was chosen against
+// the number of windows a board has, so donating buys a machine that carves one
+// peripheral into many views, not one with more peripherals.
 public(package) unsafe static var IOMEMORIES: Slab<IoMemorySlot, MAX_IOMEMORIES> = Slab<IoMemorySlot, MAX_IOMEMORIES>(
     inline: [IoMemorySlot(state: SlotState.Free, process: 0, base: 0, len: 0,
                           refs: 0); MAX_IOMEMORIES],
@@ -1433,34 +1280,29 @@ public(package) func alloc_iomemory() unsafe -> Int {
 }
 
 // =============================================================================
-// The Mapping slab (spec §2.5; sawos design 6 D-3)
+// The Mapping slab (spec §2.5)
 // =============================================================================
 //
-// **A MAPPING IS AN INSTALLED GRANT ROW**, so a slot records WHICH domain
-// carries the row and WHICH row it is — an index into `PROCESSES[target].grants`
-// — and nothing else. There is no base, no length and no access word here,
-// because the row already holds all three and a copy would be a second place
-// for them to disagree.
+// A Mapping is an installed grant row, so a slot records which domain carries
+// the row and which row it is (an index into `PROCESSES[target].grants`) and
+// nothing else. The row already holds base, length and access, and a copy would
+// be a second place for them to disagree.
 //
-// **THE ROW INDEX IS THE ONE INDEX-SENSITIVE FACT IN THE SYSTEM** (design 6
-// D-3's census). `load_domain` replays rows BY POSITION, so unmapping row `i`
-// COMPACTS the record — and every Mapping slot naming a later row of the same
-// domain has to move with it. `compact_mapping_rows` below is that fixup, and
-// it is a bounded scan of this slab rather than a back-pointer per row: eight
-// slots, at an unmap, against a per-row pointer that four other paths would
-// have to keep in step.
+// The row index is the one index-sensitive fact in the system. `load_domain`
+// replays rows by position, so unmapping row `i` compacts the record and every
+// Mapping slot naming a later row of the same domain has to move with it.
+// `compact_mapping_rows` is that fixup, a bounded scan of this slab rather than
+// a back-pointer per row.
 //
-// **A SLOT OUTLIVES ITS ROW, DELIBERATELY.** Two things end a row without
-// ending the object: an `unmap`, and the death of the TARGET process (whose
-// whole domain goes with it). Both leave the slot Live with `row == NO_ROW`,
-// which is what a later `unmap` sees as `BadState`. The slot itself comes back
-// at its OWNER's teardown, like every other kind — an op that freed a slab slot
-// while a handle still named it would let the next occupant be reached through
-// a stale word, which is exactly the aliasing design 3's generations exist to
-// prevent and which they cannot cover here (a generation lives in the handle
-// ENTRY, and the entry is not what went away).
+// A slot outlives its row. An `unmap`, and the death of the target process
+// (whose whole domain goes with it), both end a row without ending the object,
+// leaving the slot Live with `row == NO_ROW`, which a later `unmap` sees as
+// `BadState`. Neither frees the slot: an op that freed a slab slot while a
+// handle still named it would let the next occupant be reached through a stale
+// word, and a generation (which lives in the handle entry) cannot cover that.
+// The slot is freed when its last handle goes (`free_object`'s Mapping arm).
 
-/// "This mapping has no row" — unmapped, or its target process is gone.
+/// "This mapping has no row": unmapped, or its target process is gone.
 ///
 /// A row index is a position in a bounded array, so a negative is unusable as
 /// one and needs no reserved slot of its own.
@@ -1469,29 +1311,25 @@ public(package) static NO_ROW: Int = -1
 /// One Mapping object: who owns the handle, whose domain holds the row, and
 /// which row it is.
 ///
-/// `process` is the OWNER — the process whose teardown reclaims this slot —
-/// and `target` is the process whose domain the row sits in. They are usually
-/// the same and are genuinely different for the shape unit 4 exists to make
-/// possible: a launcher mapping a region into a child it created.
+/// `process` is the owner, whose teardown reclaims this slot; `target` is the
+/// process whose domain the row sits in. They are usually the same, and differ
+/// when a launcher maps a region into a child it created.
 public(package) struct MappingSlot {
     public(package) state: SlotState,
     public(package) process: Int,
     public(package) target: Int,
     public(package) row: Int,
-    /// How many handle entries name this mapping (sawos design 7 D-1).
+    /// How many handle entries name this mapping.
     ///
-    /// **THE ROW IS NOT ONE OF THEM** (design 7 D-2). A Mapping OWNS its row,
-    /// not the reverse, so a mapped-but-unreferenced Mapping is at zero and
-    /// frees — leaving the row behind, which is §2.5's "permanent,
-    /// safe-but-leaked" made mechanical rather than a new law.
+    /// The row is not one of them. A Mapping owns its row, not the reverse, so
+    /// a mapped-but-unreferenced Mapping is at zero and frees, leaving the row
+    /// behind (§2.5's "permanent, safe-but-leaked").
     public(package) refs: UInt16,
 }
 
-// AN EXTENT CHAIN SINCE M5 UNIT 6 (sawos design 32), and the one kind where the
-// slab was never the binding wall: a Mapping is an INSTALLED ROW with a handle
-// on it, and the rows are a per-domain hardware budget (`hal.GRANT_ROW_BUDGET`)
-// that no donation touches. Growing this slab lets more mappings exist ACROSS
-// processes; it does not let one process install more.
+// Donated extents let more mappings exist across processes; they do not let one
+// process install more, because the rows are a per-domain hardware budget
+// (`hal.GRANT_ROW_BUDGET`) that no donation touches.
 public(package) unsafe static var MAPPINGS: Slab<MappingSlot, MAX_MAPPINGS> = Slab<MappingSlot, MAX_MAPPINGS>(
     inline: [MappingSlot(state: SlotState.Free, process: 0, target: 0,
                          row: NO_ROW, refs: 0); MAX_MAPPINGS],
@@ -1515,13 +1353,12 @@ public(package) func alloc_mapping() unsafe -> Int {
 }
 
 /// A row was removed from process `target`'s grant record at index `removed`,
-/// and the record COMPACTED. Move every Mapping that named a later row down
+/// and the record compacted. Move every Mapping that named a later row down
 /// with it.
 ///
-/// THE ONLY INDEX-SENSITIVE FIXUP IN THE KERNEL, and it is small because the
-/// census said it would be: `load_domain` is the one place a row's POSITION
-/// means anything to the hardware, and this slab is the one place a position is
-/// remembered across a syscall.
+/// This is the only index-sensitive fixup in the kernel: `load_domain` is the
+/// one place a row's position means anything to the hardware, and this slab is
+/// the one place a position is remembered across a syscall.
 public(package) func compact_mapping_rows(target: Int, removed: Int) unsafe {
     var i: Int = 0
     while i < MAPPINGS.capacity() {
@@ -1538,114 +1375,90 @@ public(package) func compact_mapping_rows(target: Int, removed: Int) unsafe {
 }
 
 // =============================================================================
-// The Pipe slab — ONE CONNECTION, TWO COUNTED KINDS (spec §2.1; sawos design 13
-// D-1, on design 10 D-1 and ruling 6)
+// The Pipe slab: one connection, two counted kinds (spec §2.1)
 // =============================================================================
 //
-// **ONE SLAB, TWO REFERENCE COLUMNS, AND THAT IS THE WHOLE OF "ROLES ARE
-// OBJECTS".** `ObjType.PipeInlet` and `ObjType.PipeOutlet` are two counted kinds
-// that TARGET THE SAME ROW here, and which column a handle entry maintains is
-// decided by its kind — which §3's order establishes before any right is read.
-// So "the writers went to zero" is "the inlet column reached zero", asked of the
-// ledger design 7 already built, with no second ledger and no rights-partitioned
-// count.
+// One slab, two reference columns. `ObjType.PipeInlet` and `ObjType.PipeOutlet`
+// are two counted kinds that target the same row here, and which column a
+// handle entry maintains is decided by its kind, which §3's order establishes
+// before any right is read. "The writers went to zero" is therefore "the inlet
+// column reached zero", with no second ledger and no rights-partitioned count.
 //
-// **THE SLOT FREES WHEN BOTH COLUMNS ARE ZERO**, and only then; ONE column
-// reaching zero is the PEER-GONE transition, which `kcore.refs` is where it
-// becomes mechanical. A connection with a live outlet and no inlet is a slot
-// that still has messages to hand over — design 230's close-drains-first rule,
-// which is exactly why the free cannot be per-endpoint.
+// The slot frees when both columns are zero, and only then. One column reaching
+// zero is the peer-gone transition (made mechanical in `kcore.refs`). A
+// connection with a live outlet and no inlet still has messages to hand over,
+// so the free cannot be per-endpoint.
 //
-// **THE STAGING IS SEPARATE STORAGE, NOT A FIELD.** A ring of `PIPE_INFLIGHT`
-// slots at `PIPE_BODY_BYTES` each is kilobytes per connection, and a slot struct
-// holding one would make every `PIPES[slot] = PipeSlot(...)` a multi-kilobyte
-// memset inside a syscall. So the bodies live in their own flat array, indexed
-// `c * PIPE_INFLIGHT * PIPE_BODY_BYTES + i * PIPE_BODY_BYTES` — the handle
-// table's own idiom, one file up from where the boot-handle queue uses it — and
-// the slot carries the three numbers that describe the ring rather than the ring
-// itself. Both arrays are all-zero initializers, so they cost NO IMAGE BYTES
-// (design 149) and the kernel's `.bss` is where the storage lands.
+// The staging is separate storage, not a field of the slot. A ring of
+// `PIPE_INFLIGHT` slots at `PIPE_BODY_BYTES` each is kilobytes per connection,
+// and a slot struct holding one would make every `PIPES[slot] = PipeSlot(...)`
+// a multi-kilobyte memset inside a syscall. The slot carries the numbers that
+// describe the ring, not the ring itself. The storage is an all-zero
+// initializer and so lands in `.bss`, costing no image bytes.
 //
-// **NOTHING IS EVER ALLOCATED PER MESSAGE**, which is the property §2.1's fixed
-// body and fixed in-flight budget were ratified for. A post writes an existing
-// slot; a take reads one and advances a cursor.
+// Nothing is allocated per message (§2.1's fixed body and in-flight budget): a
+// post writes an existing slot and a take reads one.
 //
-// It sits BELOW `process` for the reason every other slab does: ending a process
-// frees what it owned, so the storage has to be reachable from the teardown.
+// The slab sits below `process` as every slab does: ending a process frees what
+// it owned, so the storage has to be reachable from the teardown.
 
 /// Which `BootHandleKind` a given handle's `ObjType` is delivered as, or `None`
 /// when the boot record has no spelling for it.
 ///
-/// **THE ONE PLACE THE KERNEL-INTERNAL KIND AND THE PUBLIC ONE MEET** (sawos
-/// design 4). `ObjType` is renumberable bookkeeping and `BootHandleKind` crosses
-/// the trap boundary, so neither is a cast of the other; this function is the
-/// translation, written out, and it is deliberately PARTIAL. The kinds it cannot
-/// spell are exactly the kinds nothing mints `Transfer` on today — a Thread,
-/// Event, Waiter, Interrupt, Clock or Timer handle never reaches here, because
-/// the `Transfer` check above refuses it first. The arm exists so that the day a
-/// kind becomes givable, the compiler asks for its record spelling instead of
-/// letting it arrive mis-tagged.
+/// This is the one place the kernel-internal kind and the public one meet.
+/// `ObjType` is renumberable bookkeeping and `BootHandleKind` crosses the trap
+/// boundary, so neither is a cast of the other; this function is the
+/// translation, and it is deliberately partial. The kinds it cannot spell are
+/// the kinds that are never given: a Thread, Event, Waiter, Interrupt, Clock or
+/// Timer handle never reaches here, because the `Transfer` check refuses it
+/// first. The partial arm means that when a kind becomes givable, the compiler
+/// asks for its record spelling instead of letting it arrive mis-tagged.
 ///
-/// **IT MOVED DOWN HERE IN M4 UNIT 4** (sawos design 18), and the reason is a
-/// SECOND caller that could not reach it where it was: a message's handle slots
-/// carry their kinds, so `kcore.refs` has to translate one at every rendezvous —
-/// and `refs` sits BELOW `dispatch`, which is what makes reaching upward the
-/// cycle DF-232e does not diagnose. It belongs here on the ordinary rule: a
-/// translation between two `sosabi` enums names nothing this module does not
-/// already import, so the lowest module that needs it is where it goes.
+/// It lives here, below `kcore.refs`, because both the give path and `refs`
+/// (which translates a message's handle slots at every rendezvous) need it, and
+/// `refs` sits below `dispatch`. A translation between two `sosabi` enums names
+/// nothing this module does not already import.
 public(package) func boot_kind_of(kind: ObjType) -> BootHandleKind? {
     match kind {
         case Memory -> BootHandleKind.Memory,
         case Process -> BootHandleKind.Process,
         case System -> BootHandleKind.System,
-        // **UNIT 4'S ARM, AND IT IS THE ARM THE COMMENT ABOVE PREDICTED**
-        // (sawos design 6 D-1): `iomemory_rights()` mints `Transfer`, so a
-        // window can travel, so the record needs a spelling for one. A Mapping
-        // stays in the `None` arm on purpose — `mapping_rights()` withholds
-        // `Transfer`, so the `Transfer` check above refuses one first and this
-        // spelling would be dead surface.
+        // `iomemory_rights()` mints `Transfer`, so a window can travel and the
+        // record needs a spelling for one. A Mapping stays in the `None` arm:
+        // `mapping_rights()` withholds `Transfer`, so the `Transfer` check
+        // refuses one first and a spelling would be dead surface.
         case IoMemory -> BootHandleKind.IoMemory,
-        // **M4 UNIT 1's TWO ARMS, AND THEY ARE THE SAME PREDICTION COLLECTED A
-        // SECOND TIME** (sawos design 13 D-3): `pipe_inlet_rights()` and
-        // `pipe_outlet_rights()` mint `Transfer`, because handing a child ONE
-        // END of a connection is what the pair is FOR — a launcher creates the
-        // pair, gives the inlet to the client and the outlet to the server, and
-        // the launch flow is unchanged.
+        // `pipe_inlet_rights()` and `pipe_outlet_rights()` mint `Transfer`:
+        // handing a child one end of a connection is what the pair is for (a
+        // launcher creates the pair, gives the inlet to the client and the
+        // outlet to the server).
         case PipeInlet -> BootHandleKind.PipeInlet,
         case PipeOutlet -> BootHandleKind.PipeOutlet,
-        // **M4 UNIT 2's TWO ARMS, AND THIS PAIR IS THE ONE §2.1 ARGUED FOR BY
-        // NAME** (sawos design 14). `pipe_reply_rights()` and
-        // `pipe_request_rights()` mint `Transfer` because the ratified section
-        // calls the one-shots THE DELEGATION PRIMITIVE: a server MOVES its
+        // `pipe_reply_rights()` and `pipe_request_rights()` mint `Transfer`:
+        // §2.1 calls the one-shots the delegation primitive. A server moves its
         // obligation to a third party, who replies straight to the original
-        // client and the payload never transits the middle process. So a give
-        // must carry one, and its record must be able to spell it —
-        // `pipe-delegate` is that flow at its smallest.
+        // client without the payload transiting the middle process, so a give
+        // must be able to carry one.
         case PipeReply -> BootHandleKind.PipeReply,
         case PipeRequest -> BootHandleKind.PipeRequest,
         case _ -> None,
     }
 }
 
-/// Which `BootHandleKind` a handle may be delivered as IN A MESSAGE, or `None`
-/// when a message cannot carry that kind at all (sawos design 18).
+/// Which `BootHandleKind` a handle may be delivered as in a message, or `None`
+/// when a message cannot carry that kind at all.
 ///
-/// **IT IS `boot_kind_of` MINUS TWO, AND THE TWO ARE A TYPED-SURFACE FACT
-/// RATHER THAN A CAPABILITY ONE.** A `Process` and a `System` handle are both
-/// givable — `process_rights()` and `root_system_rights()` mint `Transfer`, and
-/// the boot record spells both — so a launcher hands either across at start-up
-/// today. What a MESSAGE cannot do with one is TELL THE RECEIVER WHAT ARRIVED:
-/// the receiving vocabulary is `sos.pipe`'s `PipeHandle`, and `Process` and
-/// `System` are declared in `sos.system`, which imports `sos.pipe` — so a case
-/// for either would be the import cycle DF-232e does not diagnose.
+/// This is `boot_kind_of` minus `Process` and `System`, a typed-surface fact
+/// rather than a capability one. Both are givable (their rights mint `Transfer`
+/// and the boot record spells both), but a message cannot tell the receiver
+/// what arrived: the receiving vocabulary is `sos.pipe`'s `PipeHandle`, and
+/// `Process` and `System` are declared in `sos.system`, which imports
+/// `sos.pipe`, so a case for either would be an import cycle.
 ///
-/// **REFUSING AT THE SENDER IS THE HONEST PLACE.** The alternative is delivering
-/// a word the receiver's decode would have to panic on, which turns one
-/// process's mistake into another's crash; this way the sender is told
-/// `BadArg` — a caller-checkable fault, since it chose the handle — and nothing
-/// crosses. It is `boot_kind_of`'s own partiality one door over, and the arm
-/// exists so the day the two wrappers are declarable below the message layer,
-/// the compiler asks here.
+/// Refusing at the sender is the honest place. Delivering a word the receiver's
+/// decode would have to panic on turns one process's mistake into another's
+/// crash; instead the sender is told `BadArg`, a caller-checkable fault since
+/// it chose the handle, and nothing crosses.
 public(package) func msg_kind_of(kind: ObjType) -> BootHandleKind? {
     guard let spelled = boot_kind_of(kind) else {
         return None
@@ -1657,59 +1470,50 @@ public(package) func msg_kind_of(kind: ObjType) -> BootHandleKind? {
     }
 }
 
-/// One Pipe CONNECTION: whose it is, what is staged, and how many handles name
+/// One Pipe connection: whose it is, what is staged, and how many handles name
 /// each of its two ends.
 ///
-/// `process` is the CREATOR — creator-pays (design 7 D-3), so whoever was
-/// charged is who gets the quota row back when the connection frees, whichever
-/// process happened to drop the last handle onto either end.
+/// `process` is the creator. The creator pays: whoever was charged gets the
+/// quota row back when the connection frees, whichever process dropped the last
+/// handle onto either end.
 ///
-/// `head` and `count` are the ring, and there is no `tail` because a tail is
-/// `(head + count) % PIPE_INFLIGHT` — one derivation beats a second index two
-/// paths would have to keep in step.
+/// The two columns are the peer-gone state, and no flag beside them says so.
+/// "The inlet side is gone" is `inlet_refs == 0`: a column can only fall to
+/// zero and never rise again, because raising it needs a handle onto that end,
+/// and a mint needs a source handle there is none of. The terminal level is a
+/// fact about the count, not a bit somebody has to remember to set.
 ///
-/// **THE TWO COLUMNS ARE THE PEER-GONE STATE, and no flag beside them says so.**
-/// "The inlet side is gone" IS `inlet_refs == 0`, because a column can only fall
-/// to zero and can never rise again: what would raise it is a handle onto that
-/// end, and a mint needs a source handle there is none of. So the terminal level
-/// is a fact about the count rather than a bit somebody has to remember to set,
-/// and the two can never disagree.
-///
-/// **THE RING WENT FROM A QUEUE OF BYTES TO A TABLE OF EXCHANGES IN M4 UNIT 2**
-/// (sawos design 14 D-1), which is what cost this struct its `head` and `count`.
-/// A slot used to live until its bytes were taken, so the staged messages were
-/// contiguous and a head plus a count described them; a slot now carries the
-/// REPLY back and recycles only when the exchange settles, and exchanges settle
-/// in whatever order their two holders act — so occupancy is per-slot and the
-/// staged messages are a LIST threaded through them. `staged` is that list's
-/// head, 1-based so that zero is "nothing staged", and there is no tail because
-/// appending walks at most `PIPE_INFLIGHT` links — design 13's own argument
-/// against a second index to keep in step.
+/// Occupancy is per ring slot (see `Exchange`), because exchanges settle in
+/// whatever order their two holders act. The staged messages are a list
+/// threaded through the exchanges; `staged` is its head, 1-based so that zero
+/// is "nothing staged". There is no tail: appending walks at most
+/// `PIPE_INFLIGHT` links, and a second index would be one more thing for two
+/// paths to keep in step.
 public(package) struct PipeSlot {
     public(package) state: SlotState,
     public(package) process: Int,
-    /// The oldest STAGED (untaken) exchange's ring index, PLUS ONE. Zero is
-    /// "nothing staged", which is the list-link idiom the thread queues use.
+    /// The oldest staged (untaken) exchange's flat index (see `Exchange`), plus
+    /// one. Zero is "nothing staged" (the list-link idiom the thread queues
+    /// use).
     public(package) staged: Int,
-    /// The attachment watching the CLIENT end's room-to-post level (slot + 1);
-    /// 0 = unattached. **ONE FIELD PER END, not one per connection** (sawos
-    /// design 15, M4 unit 3): the two ends are two waitables — a client waits
-    /// for room and a server waits for a message — so §2.2's at-most-one-Waiter
-    /// rule is per END, exactly as `inlet_refs` and `outlet_refs` are.
+    /// The attachment watching the client end's room-to-post level (slot + 1);
+    /// 0 = unattached. One field per end, not per connection: the two ends are
+    /// two waitables (a client waits for room, a server waits for a message),
+    /// so §2.2's at-most-one-Waiter rule is per end, as `inlet_refs` and
+    /// `outlet_refs` are.
     public(package) inlet_attachment: Int,
-    /// The attachment watching the SERVER end's readable level (slot + 1).
+    /// The attachment watching the server end's readable level (slot + 1).
     public(package) outlet_attachment: Int,
-    /// How many handle entries name the CLIENT end (sawos design 7 D-1's
-    /// counting rule, one column per kind), PLUS its attachment.
+    /// The client end's reference column: the handle entries naming it, plus
+    /// its attachment. Each end kind counts on its own column.
     public(package) inlet_refs: UInt16,
-    /// How many handle entries name the SERVER end, PLUS its attachment.
+    /// The server end's column, counted the same way.
     public(package) outlet_refs: UInt16,
 }
 
-/// **AN EXTENT CHAIN SINCE M5 UNIT 6a** (sawos design 34). `MAX_PIPES` is the
-/// compiled floor; a `SlabKind.Pipes` donation adds connections AND the
-/// exchanges that belong to them — see `EXCHANGES` for why the two chains cannot
-/// come apart.
+/// `MAX_PIPES` is the inline extent; a `SlabKind.Pipes` donation adds
+/// connections and the exchanges that belong to them (see `EXCHANGES` for why
+/// the two chains cannot come apart).
 public(package) unsafe static var PIPES: Slab<PipeSlot, MAX_PIPES> = Slab<PipeSlot, MAX_PIPES>(
     inline: [PipeSlot(state: SlotState.Free, process: 0, staged: 0,
                       inlet_attachment: 0, outlet_attachment: 0,
@@ -1721,35 +1525,30 @@ public(package) unsafe static var PIPES: Slab<PipeSlot, MAX_PIPES> = Slab<PipeSl
     ext_count: 0,
     total: MAX_PIPES)
 
-/// Ring slots the COMPILED floor holds — one row per (connection, ring slot)
-/// pair, which is what an EXCHANGE index names.
+/// Ring slots the inline extent holds: one row per (connection, ring slot)
+/// pair, which is what an exchange index names.
 ///
-/// It is `EXCHANGES`' floor rather than the machine's exchange count since M5
-/// unit 6a: `EXCHANGES.capacity()` is what a scan reads.
+/// It is `EXCHANGES`' inline size, not the machine's exchange count; scans read
+/// `EXCHANGES.capacity()`.
 public(package) static PIPE_EXCHANGES: Int = MAX_PIPES * PIPE_INFLIGHT
 
 // =============================================================================
-// The one-shot pair — CLAIM AND OBLIGATION, AS RING-SLOT STATE (spec §2.1;
-// sawos design 14 D-1/D-2)
+// The one-shot pair: claim and obligation, as ring-slot state (spec §2.1)
 // =============================================================================
 //
-// **NO THIRD SLAB, AND D-1's ARGUMENT IS ONE SENTENCE**: a one-shot pair exists
-// for exactly as long as one in-flight message does, and design 10 ruling 4's
-// rider already pins the reply body to the staging slot that carried the
-// request. So the claim state lives WITH THE SLOT — four fields of the
-// `Exchange` record below, zero-initialized and therefore `.bss` (design 149),
-// costing no image bytes and no new limit. (They were four parallel ARRAYS
-// beside `PIPE_LENS` until M5 unit 6a folded the ten satellites into one record;
-// the claim state's shape is unchanged, only where it is stored.)
+// There is no third slab. A one-shot pair exists for exactly as long as one
+// in-flight message does, and the reply body is pinned to the staging slot that
+// carried the request, so the claim state lives with the slot, in the
+// `Exchange` record below. It is zero-initialized and therefore `.bss`.
 //
-// **THE EXCHANGE INDEX IS THE OBJECT'S IDENTITY.** `ObjType.PipeReply` and
-// `ObjType.PipeRequest` both target `connection * PIPE_INFLIGHT + ring slot`,
-// which is the flat arithmetic `pipe_body_addr` already uses — design 13's "two
-// kinds, one slab" one level down, with the same consequence: which column a
-// handle counts on is decided by its KIND, before any right is read.
+// The exchange index is the object's identity. `ObjType.PipeReply` and
+// `ObjType.PipeRequest` both target the flat exchange index `connection *
+// PIPE_INFLIGHT + ring slot` (`pipe_exchange_at`), where the end kinds target a
+// connection. As with the ends, which column a handle counts on is decided by
+// its kind, before any right is read.
 //
-// **THE TWO COLUMNS ARE THE ABANDONMENT STATE**, exactly as the connection's two
-// are the peer-gone state, and no flag beside them says so:
+// The two columns are the abandonment state, as the connection's two are the
+// peer-gone state, and no flag beside them says so:
 //
 //   the claim column at zero          the client abandoned the exchange
 //   `Taken` with the request column
@@ -1757,24 +1556,21 @@ public(package) static PIPE_EXCHANGES: Int = MAX_PIPES * PIPE_INFLIGHT
 //   `Staged` with the connection's
 //     outlet column at zero           nobody can ever take it, so likewise
 //
-// **AND THE SLOT SETTLES WHEN NOBODY NAMES IT AND NOTHING IS OWED.** That is one
-// predicate (`exchange_can_settle`) and it is the counted-object rule with one
-// extra clause: a STAGED message is owed to a live outlet whatever became of the
-// claim, which is §2.1's TELL idiom (post, drop the claim, and the server still
-// receives the message) and design 230's close-drains-first rule reaching one
-// level down.
+// The slot settles when nobody names it and nothing is owed. That is one
+// predicate (`exchange_can_settle`): the counted-object rule plus one clause, a
+// staged message is owed to a live outlet whatever became of the claim (§2.1's
+// tell idiom: post, drop the claim, and the server still receives the message).
 
-/// Where an exchange is in its life. FOUR STATES, and the two abandonment
-/// answers are derived from the columns rather than stored beside them.
+/// Where an exchange is in its life. The two abandonment answers are derived
+/// from the columns rather than stored beside them.
 ///
-/// `Free` is the slot nobody is using — the ring's own occupancy, which is what
-/// `PipeInletOp.Post` scans for and what makes a full ring count AWAITING-REPLY
-/// exchanges rather than merely untaken messages (D-1's literal reading of
-/// design 10 ruling 6's in-flight budget).
+/// `Free` is the slot nobody is using: the ring's own occupancy, which is what
+/// `PipeInletOp.Post` scans for. A full ring therefore counts awaiting-reply
+/// exchanges, not merely untaken messages.
 public(package) enum ExchangeState: UInt8 {
     case Free = 0,
-    /// A request body is in the slot and nobody has taken it. The obligation has
-    /// not been minted, so its column is zero for a reason that is not
+    /// A request body is in the slot and nobody has taken it. The obligation
+    /// has not been minted, so its column is zero for a reason that is not
     /// abandonment — which is exactly why the state has to be recorded and the
     /// columns alone would not do.
     case Staged = 1,
@@ -1782,109 +1578,76 @@ public(package) enum ExchangeState: UInt8 {
     case Taken = 2,
     /// The reply body is in the slot and the claim may take it.
     case Replied = 3,
-    /// **THE EXCHANGE IS DISCHARGED, AND M4 UNIT 3 IS WHERE THAT BECAME A STATE**
-    /// (sawos design 15, on design 10 ruling 11(a)/(b)). A reply DELIVERED
-    /// through a `Waiter.wait` hands the bytes over exactly as a `Resolve` does
-    /// — the wait IS the delivery — but it does not travel through the claim's
-    /// handle ENTRY, so it cannot consume one. Without a state to move to, the
-    /// slot would stay `Replied` and a later `Resolve` through the very same
-    /// claim would copy the answer out a SECOND time, which is the duplicate
-    /// §2.2's consume rule exists to make impossible.
+    /// The exchange is discharged. A reply delivered through a `Waiter.wait`
+    /// hands the bytes over exactly as a `Resolve` does, but it does not travel
+    /// through the claim's handle entry, so it cannot consume one. Without a
+    /// state to move to, the slot would stay `Replied` and a later `Resolve`
+    /// through the same claim would copy the answer out a second time, the
+    /// duplicate §2.2's consume rule exists to make impossible.
     ///
-    /// So a delivered reply lands here, and it answers everything the way a
-    /// spent exchange should: a later `Resolve` is `PeerClosed` and consumes the
+    /// A delivered reply lands here, and it answers everything as a spent
+    /// exchange should: a later `Resolve` is `PeerClosed` and consumes the
     /// claim, a `Reply` through the obligation's still-live entry is
     /// `PeerClosed` too, and the slot settles as soon as both columns are zero.
-    /// (That sentence used to say "through a minted sibling"; since M4 unit 4.5
-    /// this kernel mints none — `designs/010` ruling 12(c) took `Mint` out of
-    /// both one-shot default sets and monotonic attenuation makes the absence
-    /// permanent — so what reaches the arm is the ONE name, wherever a
-    /// `Transfer` has since moved it.) It is the ONE state whose
-    /// arrival is not an op — which is exactly why the columns could not have
-    /// derived it.
+    /// This is the one state whose arrival is not an op, which is why the
+    /// columns could not have derived it.
     case Settled = 4,
 }
 
-// (`PIPE_EX_STATE`, `PIPE_REPLY_REFS`, `PIPE_REQUEST_REFS`, `PIPE_REPLY_ATTACH`,
-// `PIPE_REQUEST_ATTACH`, `PIPE_CALLER`, `PIPE_NEXT`, `PIPE_LENS`, `PIPE_BODIES`
-// and `PIPE_MSG_HELD` WERE HERE, ten arrays keyed by the flat exchange index.
-// They are the `Exchange` record below since M5 unit 6a — see the block header
-// there for why ten parallel arrays could not become an extent chain and one
-// record could.)
-
 // =============================================================================
-// THE STAGED HANDLE LEDGER (spec §2.1's rendezvous transfer; `designs/010`
-// ruling 5 AS RE-RULED Sep 2 — TAKE-AT-POST; sawos design 18)
+// The staged handle ledger (spec §2.1's rendezvous transfer)
 // =============================================================================
 //
-// **A HANDLE LEAVES THE SENDER AT THE POST, AND THE KERNEL HOLDS IT UNTIL THE
-// RECEIVER TAKES IT.** That is the re-ruled ruling 5 in one sentence, and this
-// array is the whole of its mechanism: a validated send UNBINDS each of its
-// handle entries and parks the REFERENCE those entries were holding in the ring
-// note, so a staged message owns what it is carrying and nothing about it can
-// go stale.
-//
-// **THE NOTE IS TYPED REFS, NOT WORDS, AND THE SHAPE IS THE RULING.** A handle
-// word is an index into a table the entry no longer occupies, so once the entry
-// is unbound the word means nothing — what survives is the OBJECT the reference
-// names and the RIGHTS the sender was holding it with. `StagedRef` is exactly
-// that: a handle entry with its table slot and its generation left off, which is
-// all a later mint needs and all a later release needs.
-//
-// **WHY THIS REPLACED SENDER-KEEPS** (the Sep-2 re-rule, recorded here because
-// this array is where the two designs differ). Under sender-keeps the note was a
-// process index plus four handle words, re-validated at the rendezvous, and a
-// released entry arrived as an empty slot; that was sound but it made a
-// capability send RACE THE SENDER'S OWN EXIT, and it contradicted the typed
-// tier's move story, where `post_with(handles:)` consumes the wrapper and a
-// consumed wrapper does not come back. Design 260's `consumes` and ruling 10's
-// orphan accounting both post-date the Aug-30 ruling and both point the other
-// way. Take-at-post turns the old first consequence into a GUARANTEE: a message
+// A handle leaves the sender at the post, and the kernel holds it until the
+// receiver takes it. A validated send unbinds each of its handle entries and
+// parks the reference those entries were holding in the ring note, so a staged
+// message owns what it is carrying and nothing about it can go stale. A message
 // that was accepted will deliver what it was carrying, whatever becomes of the
 // sender.
 //
-// **NOBODY IS CHARGED FOR A STAGED HANDLE, AND THE BOUND IS WHY THAT IS SAFE.**
-// The unbind credits the sender's `QuotaKind.Handle` row at the one place a
-// binding is destroyed, and the taker is charged at the mint — so between the
-// two the entry is charged to NOBODY, which is design 14 D-4's orphan vocabulary
-// arriving at a second kind. It cannot be exploited into an unbounded hole: a
-// connection can hold at most `PIPE_INFLIGHT * PIPE_MSG_HANDLES` staged handles
-// (the ring is fixed and every slot's note is fixed), the connection itself cost
-// a `QuotaKind.Pipe` row, and the objects the refs name already occupy the slab
-// slots they were charged for. Quota <= wall therefore still holds: the SLAB is
-// what refuses the next allocation, and no staged handle can conjure one.
+// The note is typed refs, not words. A handle word is an index into a table the
+// entry no longer occupies, so once the entry is unbound the word means
+// nothing; what survives is the object the reference names and the rights the
+// sender held it with. `StagedRef` is a handle entry with its table slot and
+// generation left off, which is all a later mint or release needs.
 //
-// The ledger is zero-initialized and therefore `.bss` (design 149), costing no
-// image bytes: `PIPE_MSG_HANDLES` entries per exchange, which at the tree's
-// numbers is 4 per slot over a floor of 64. (It was its own flat array until M5
-// unit 6a made it `Exchange.held`.)
+// Nobody is charged for a staged handle, and the bound is why that is safe. The
+// unbind credits the sender's `QuotaKind.Handle` row and the taker is charged
+// at the mint, so between the two the entry is charged to nobody. It cannot be
+// exploited into an unbounded hole: a connection holds at most
+// `PIPE_INFLIGHT * PIPE_MSG_HANDLES` staged handles, the connection itself cost
+// a `QuotaKind.Pipe` row, and the objects the refs name already occupy the slab
+// slots they were charged for. The slab is still what refuses the next
+// allocation; no staged handle can conjure one.
+//
+// The ledger is zero-initialized and therefore `.bss`: `PIPE_MSG_HANDLES`
+// entries per exchange (`Exchange.held`).
 
-/// ONE HANDLE A MESSAGE IS CARRYING, held by the kernel between the post and the
-/// rendezvous — a `HandleEntry` with the two table-only fields left off.
+/// One handle a message is carrying, held by the kernel between the post and
+/// the rendezvous: a `HandleEntry` with the two table-only fields left off.
 ///
-/// **THE RIGHTS TRAVEL WITH THE REFERENCE, and they have to.** A reference names
-/// an OBJECT; a capability is an object AND a rights word, and the receiver is
-/// owed the sender's rights verbatim (design 4 D-1, reached through a second
-/// door). Carrying only `(obj_type, target)` would make the taker's mint consult
-/// a default set, which is precisely the amplification a transfer must not do.
+/// The rights travel with the reference. A reference names an object; a
+/// capability is an object and a rights word, and the receiver is owed the
+/// sender's rights verbatim. Carrying only `(obj_type, target)` would make the
+/// taker's mint consult a default set, which is the amplification a transfer
+/// must not do.
 ///
 /// `obj_type == Unbound` is the empty slot, which is what zero-init means and
-/// why this array needs no separate occupancy word.
+/// why the ledger needs no separate occupancy word.
 public(package) struct StagedRef {
     public(package) obj_type: ObjType,
     public(package) rights: UInt32,
     public(package) target: Int,
 }
 
-/// A whole message's worth of them, COLLECTED OUT OF THE LEDGER — the value
+/// A whole message's worth of them, collected out of the ledger: the value
 /// `take_staged` answers with and the only thing a release or a mint reads.
 ///
-/// It exists because of the module order, and the module order is enforcing the
-/// right discipline: releasing a reference lives in `kcore.refs`, which is ABOVE
-/// this file, so an unwind arm down here cannot release and must hand the batch
-/// upward instead. That is COLLECT-THEN-FREE spelled across a module boundary —
-/// the ledger is left consistent before any release runs, so a cascade that
-/// re-enters this file can never find a half-emptied exchange.
+/// Releasing a reference lives in `kcore.refs`, which is above this file, so an
+/// unwind arm down here cannot release and must hand the batch upward. That is
+/// collect-then-free across a module boundary: the ledger is consistent before
+/// any release runs, so a cascade that re-enters this file never finds a
+/// half-emptied exchange.
 public(package) struct StagedRefs {
     public(package) slots: [StagedRef; PIPE_MSG_HANDLES],
 }
@@ -1895,147 +1658,117 @@ public(package) func no_staged_ref() -> StagedRef {
 }
 
 // =============================================================================
-// THE EXCHANGE RECORD — ten satellites become one slot (sawos design 34,
-// M5 unit 6a; design 25 D-6)
+// The exchange record
 // =============================================================================
 //
-// **M5 UNIT 6 EXCLUDED PIPES ON MERIT, AND THIS IS THE ANSWER TO ITS OBJECTION.**
-// Design 32's As-built named the shape: ten arrays hanging off the flat exchange
-// index `x = c * PIPE_INFLIGHT + i`, with the index DERIVED from `MAX_PIPES`, so
-// growing the connection slab renumbered every satellite. "That is not an extent
-// chain, it is a different data structure." True of ten arrays; not true of ONE.
+// An exchange's whole state is one record at one index, so `EXCHANGES` is a
+// plain `Slab` like the other kinds. The flat index `x = c * PIPE_INFLIGHT + i`
+// (and `c = x / PIPE_INFLIGHT`) means the same at every index, because
+// `PIPE_INFLIGHT` is a compile-time constant that does not know where a
+// connection lives. The exchange numbering is uniform across the chain.
 //
-// **WHAT CHANGED IS THE SATELLITE COUNT, NOT THE INDEX.** The ten per-exchange
-// arrays are fields of this record now, so an exchange's storage is ONE slot at
-// ONE index and `EXCHANGES` is a plain `Slab` like the other ten kinds. The flat
-// index is untouched: `x = c * PIPE_INFLIGHT + i` and `c = x / PIPE_INFLIGHT`
-// mean exactly what they meant, at every index, because `PIPE_INFLIGHT` is a
-// compile-time constant that does not know where a connection lives. That is the
-// property that made this conversion cheap, and it is worth stating as an
-// invariant: THE EXCHANGE NUMBERING IS UNIFORM ACROSS THE CHAIN.
-//
-// **AND IT IS WHAT PROVES THE TWO CHAINS CANNOT SKEW.** A `Pipes` donation
+// That is also what keeps the two chains from skewing. A `Pipes` donation
 // appends `k` connections to `PIPES` and `k * PIPE_INFLIGHT` exchanges to
-// `EXCHANGES`, in one function, in one step, having checked both first. So
-// `PIPES` extent `e` holds connections `[S, S + k)` and `EXCHANGES` extent `e`
-// holds exchanges `[S * PIPE_INFLIGHT, (S + k) * PIPE_INFLIGHT)` — which is
-// exactly the set the flat arithmetic maps those connections to. The two walks
-// land in the same extent for corresponding indices BY THE ARITHMETIC, not by a
-// shared table and not by a promise: skew would need one donation to succeed and
-// the other to fail, which `slab_install` makes unreachable.
+// `EXCHANGES`, in one function, having checked both first. So `PIPES` extent
+// `e` holds connections `[S, S + k)` and `EXCHANGES` extent `e` holds exchanges
+// `[S * PIPE_INFLIGHT, (S + k) * PIPE_INFLIGHT)`, exactly the set the flat
+// arithmetic maps those connections to. Corresponding indices land in the same
+// extent by the arithmetic, not by a shared table; skew would need one donation
+// to succeed and the other to fail, which `slab_install` makes unreachable.
 //
-// **NO SECOND BOUNDS CHECK, WHICH THE BRIEF ASKED FOR BY NAME.** `EXCHANGES[x].len`
-// was one array index; `EXCHANGES[x].len` is one slab lookup. The rendezvous
-// paths (`pipe_post`, `pipe_take`, `pipe_resolve`, `pipe_reply_status`,
-// `deliver_take`) do the same one check they always did, on the same flat `x`,
-// with no division and no second lookup — which is why the alternative shape
-// (fold the exchanges into `PipeSlot` as an inline ring) was declined: it would
-// have made every satellite access `PIPES[x / PIPE_INFLIGHT].ex[x % PIPE_INFLIGHT]`,
-// two bounds checks and a division, on the hottest paths in the kernel.
+// The rendezvous paths (`pipe_post`, `pipe_take`, `pipe_resolve`,
+// `pipe_reply_status`, `deliver_take`) do one bounds check on the flat `x`,
+// with no division and no second lookup. Don't fold the exchanges into
+// `PipeSlot` as an inline ring: every access would become
+// `PIPES[x / PIPE_INFLIGHT].ex[x % PIPE_INFLIGHT]`, two bounds checks and a
+// division on the hottest paths.
 //
-// **ZERO IS THE FREE EXCHANGE, BY CONSTRUCTION.** `ExchangeState.Free` is 0 and
-// `ObjType.Unbound` is 0, so a zeroed record is a free slot with an empty ledger
-// — which is what lets `slab_donate` install a donated extent by zeroing it, and
-// what keeps the inline array in `.bss` (design 149) exactly as the ten arrays
-// were.
+// Zero is the free exchange. `ExchangeState.Free` is 0 and `ObjType.Unbound` is
+// 0, so a zeroed record is a free slot with an empty ledger. That lets
+// `slab_donate` install a donated extent by zeroing it, and keeps the inline
+// array in `.bss`.
 
-/// ONE EXCHANGE: a ring slot's whole state, and what a `PipeReply` or a
+/// One exchange: a ring slot's whole state, and what a `PipeReply` or a
 /// `PipeRequest` handle targets.
-///
-/// The field docs below are the ten arrays' own, kept where they were written.
 public(package) struct Exchange {
     /// Where this exchange is in its life.
     public(package) state: ExchangeState,
-    /// How long the message in this staging slot is — and, once a reply has been
-    /// written, how long THAT is. One number, because a slot holds one body at a
-    /// time and the exchange's state is what says which body it is.
+    /// How long the message in this staging slot is and, once a reply has been
+    /// written, how long that is. One number, because a slot holds one body at
+    /// a time and the exchange's state says which body it is.
     public(package) len: UInt16,
-    /// How many handle entries name this exchange's CLAIM.
+    /// How many handle entries name this exchange's claim.
     public(package) reply_refs: UInt16,
-    /// How many name its OBLIGATION.
+    /// How many name its obligation.
     public(package) request_refs: UInt16,
-    /// The attachment watching this exchange's CLAIM (slot + 1); 0 = unattached.
+    /// The attachment watching this exchange's claim (slot + 1); 0 =
+    /// unattached.
     ///
-    /// **TWO FIELDS, BECAUSE A CLAIM AND AN OBLIGATION ARE TWO WAITABLES** (sawos
-    /// design 15). They are one exchange and two objects — the reply-ready level
-    /// belongs to the client, the request-abandoned level to the server — so
-    /// §2.2's at-most-one-Waiter rule holds per COLUMN, exactly as the reference
-    /// count does, and the two may be watched from two different processes at
-    /// once. It is the `PipeSlot` pair one level down, which is the shape design
-    /// 14 already inherited from design 13.
+    /// Two fields, because a claim and an obligation are two waitables: the
+    /// reply-ready level belongs to the client, the request-abandoned level to
+    /// the server. §2.2's at-most-one-Waiter rule holds per column, as the
+    /// reference count does, and the two may be watched from two different
+    /// processes at once.
     public(package) reply_attach: Int,
-    /// The attachment watching this exchange's OBLIGATION (slot + 1).
+    /// The attachment watching this exchange's obligation (slot + 1).
     public(package) request_attach: Int,
-    /// **THE THREAD PARKED IN A FUSED `Call` ON THIS EXCHANGE** (thread slot + 1;
-    /// 0 = none), sawos design 17.
+    /// The thread parked in a fused `Call` on this exchange (thread slot + 1;
+    /// 0 = none).
     ///
-    /// **IT IS A THIRD WAY TO NAME A CLAIM, AND THE ONLY ONE THAT IS NOT A
-    /// HANDLE.** Design 10 ruling 4's rider says a fused call mints no
-    /// `PipeReply` into the caller's table — zero handle traffic and zero table
-    /// rows on the fast path — so the claim it holds is KERNEL-INTERNAL and tied
-    /// to the parked thread. This field is that tie, and the reference model is
-    /// unchanged underneath it: a parked caller counts ONE on `reply_refs`,
-    /// exactly as a handle entry or an attachment would, so nothing can settle
-    /// the ring slot out from under it.
+    /// This is a third way to name a claim, and the only one that is not a
+    /// handle. A fused call mints no `PipeReply` into the caller's table (zero
+    /// handle traffic and zero table rows on the fast path), so the claim it
+    /// holds is kernel-internal and tied to the parked thread. A parked caller
+    /// counts one on `reply_refs`, exactly as a handle entry or an attachment
+    /// would, so nothing can settle the ring slot out from under it.
     ///
-    /// **TWO DIRECTIONS, TWO FIELDS, AND EACH EARNS ITS PLACE.** This one answers
-    /// "who is waiting for this exchange", which is what a settling reply has to
-    /// know and what makes the wake arm a load rather than a scan of the thread
-    /// table; `ThreadSlot.call_claim` answers "what is this thread waiting for",
-    /// which is what the teardown has to know when a process dies parked. Neither
-    /// question can be answered from the other side without a walk.
+    /// Two directions, two fields: this one answers "who is waiting for this
+    /// exchange" (what a settling reply needs, a load rather than a scan of the
+    /// thread table); `ThreadSlot.call_claim` answers "what is this thread
+    /// waiting for" (what the teardown needs when a process dies parked).
+    /// Neither question can be answered from the other side without a walk.
     ///
-    /// A parked caller is on NO LIST — it is not on a Waiter's `blocked` chain,
-    /// because a fused call involves no Waiter at all — so this field is the
-    /// whole of how it is reachable. That is why `exchange_settle` asserts it is
-    /// clear.
+    /// A parked caller is on no list, because a fused call involves no Waiter,
+    /// so this field is the whole of how it is reachable. That is why
+    /// `exchange_settle` asserts it is clear.
     public(package) caller: Int,
-    /// The staged list's link — the next STAGED exchange in this connection, plus
-    /// one, or zero at the end. Only ever appended at the tail and removed at the
-    /// head (a take), or cleared whole (the outlet's zero-arm), so it is a strict
-    /// FIFO and never needs a removal from the middle.
+    /// The staged list's link: the next staged exchange in this connection,
+    /// plus one, or zero at the end. Only ever appended at the tail and removed
+    /// at the head (a take), or cleared whole (the outlet's zero-arm), so it is
+    /// a strict FIFO and never needs a removal from the middle.
     public(package) next: Int,
     /// The references a post or a reply staged.
     ///
-    /// ONE LEDGER SERVES BOTH DIRECTIONS, and it can because an exchange only
-    /// ever has one message in flight: the request's handles leave at the take,
-    /// which is the same moment the slot stops holding a request and starts being
-    /// able to hold a reply. The take COLLECTS what it minted, so a reply stages
-    /// into slots that are provably empty.
+    /// One ledger serves both directions, because an exchange only ever has one
+    /// message in flight: the request's handles leave at the take, the same
+    /// moment the slot stops holding a request and can start holding a reply.
+    /// The take collects what it minted, so a reply stages into slots that are
+    /// provably empty.
     public(package) held: [StagedRef; PIPE_MSG_HANDLES],
-    /// This staging slot's message bytes — the request, then the reply.
+    /// This staging slot's message bytes: the request, then the reply.
     ///
-    /// **IT IS A FIELD RATHER THAN AN ARENA SINCE M5 UNIT 6a**, and that is the
-    /// only one of the ten that changed SHAPE rather than merely address: the
-    /// bodies were one flat `MAX_PIPES * PIPE_INFLIGHT * PIPE_BODY_BYTES` array
-    /// reached by `exchange_body_addr`'s own arithmetic, and they are per-record
-    /// storage now. The accessor is unchanged in meaning and its one caller-facing
-    /// promise — `PIPE_BODY_BYTES` contiguous writable bytes — is unchanged too.
+    /// The promise to callers is `PIPE_BODY_BYTES` contiguous writable bytes,
+    /// reached through `body_addr`.
     public(package) body: [UInt8; PIPE_BODY_BYTES],
 }
 
 extension Exchange {
     /// This exchange's body bytes, as an address the copy movers can use.
     ///
-    /// **IT IS A METHOD BECAUSE `&var EXCHANGES[x].body` IS NOT SPELLABLE**
-    /// (SL-23). A `borrows` accessor lends a PLACE, and Saw will not take a
-    /// reference to a field of one — ``can only take reference to a variable,
-    /// field, or array element``, with the hint "references require an
-    /// addressable location". Inside a `&var self` method the receiver arrives
-    /// BY POINTER (design 261), so `self.body` is an ordinary addressable field
-    /// of the caller's storage and the crossing is the ordinary one.
-    ///
-    /// So the address still comes out of the slot the slab lent, through the
-    /// accessor and its one funnel, which is what `exchange_body_addr`'s note
-    /// claims and this is the mechanism behind it.
+    /// It is a method because `&var EXCHANGES[x].body` is not spellable: a
+    /// `borrows` accessor lends a place, and Saw will not take a reference to a
+    /// field of one (``can only take reference to a variable, field, or array
+    /// element``). Inside a `&var self` method the receiver arrives by pointer,
+    /// so `self.body` is an ordinary addressable field of the caller's storage.
+    /// The address still comes out of the slot the slab lent, through the
+    /// accessor and its one funnel.
     public(package) func body_addr(&var self) unsafe -> UInt {
         ((&var self.body) as UnsafePointer<UInt8>) as UInt
     }
 }
 
-/// Every exchange in the machine. **A CHAIN IN LOCKSTEP WITH `PIPES`** — see the
-/// block header above for the proof that "lockstep" is arithmetic rather than
-/// bookkeeping.
+/// Every exchange in the machine. A chain in lockstep with `PIPES`; see the
+/// block header above for why "lockstep" is arithmetic rather than bookkeeping.
 public(package) unsafe static var EXCHANGES: Slab<Exchange, PIPE_EXCHANGES> = Slab<Exchange, PIPE_EXCHANGES>(
     inline: [Exchange(state: ExchangeState.Free, len: 0, reply_refs: 0,
                       request_refs: 0, reply_attach: 0, request_attach: 0,
@@ -2052,11 +1785,9 @@ public(package) unsafe static var EXCHANGES: Slab<Exchange, PIPE_EXCHANGES> = Sl
 
 /// How many references exchange `x` is holding.
 ///
-/// **IT IS A COUNT AND NOT A RE-VALIDATION** (the Sep-2 re-rule). Under
-/// sender-keeps this had to resolve four handle words against a table that might
-/// have moved on; now the refs are the kernel's own and staleness cannot exist,
-/// so the answer is a scan of four tags. It is what the rendezvous pre-flights
-/// the taker's table against.
+/// A count, not a re-validation: the refs are the kernel's own, so staleness
+/// cannot exist and the answer is a scan of `PIPE_MSG_HANDLES` tags. The
+/// rendezvous pre-flights the taker's table against it.
 public(package) func staged_count(x: Int) unsafe -> Int {
     var live: Int = 0
     var i: Int = 0
@@ -2070,15 +1801,14 @@ public(package) func staged_count(x: Int) unsafe -> Int {
     live
 }
 
-/// **TAKE EXCHANGE `x`'s HELD REFERENCES OUT OF THE LEDGER**, leaving it empty.
+/// Take exchange `x`'s held references out of the ledger, leaving it empty.
 ///
-/// The one way anything leaves this array, so every consumer — the rendezvous
-/// that mints them onward and every unwind arm that drops them — goes through
-/// one door and the ledger is consistent the instant the door returns. What the
-/// caller does with the batch is the caller's obligation, and there are exactly
-/// two things it may be: mint each ref into a table, or release each ref. Doing
-/// NEITHER leaks a reference, which is why every call site is named in
-/// `kcore.refs`' rendezvous header.
+/// This is the one way anything leaves the ledger, so every consumer (the
+/// rendezvous that mints them onward and every unwind arm that drops them) goes
+/// through one door and the ledger is consistent the instant it returns. The
+/// caller must either mint each ref into a table or release each ref; doing
+/// neither leaks a reference. Every call site is named in `kcore.refs`'
+/// rendezvous header.
 public(package) func take_staged(x: Int) unsafe -> StagedRefs {
     var out = StagedRefs(slots: [StagedRef(obj_type: ObjType.Unbound,
                                            rights: 0, target: 0);
@@ -2092,7 +1822,7 @@ public(package) func take_staged(x: Int) unsafe -> StagedRefs {
     out
 }
 
-/// "No exchange" — the sentinel a full ring answers with.
+/// "No exchange": the sentinel a full ring answers with.
 public(package) static NO_EXCHANGE: Int = -1
 
 /// Which connection exchange `x` belongs to.
@@ -2105,9 +1835,9 @@ public(package) func exchange_index(x: Int) -> Int {
     x % PIPE_INFLIGHT
 }
 
-/// The exchange index of connection `c`'s ring slot `i` — the flat arithmetic
-/// every per-exchange array is indexed by, and the identity `ObjType.PipeReply`
-/// and `ObjType.PipeRequest` handle entries carry.
+/// The exchange index of connection `c`'s ring slot `i`: the flat arithmetic
+/// every per-exchange access is indexed by, and the identity
+/// `ObjType.PipeReply` and `ObjType.PipeRequest` handle entries carry.
 public(package) func pipe_exchange_at(c: Int, i: Int) -> Int {
     c * PIPE_INFLIGHT + i
 }
@@ -2125,44 +1855,36 @@ public(package) func alloc_pipe() unsafe -> Int {
     NO_PIPE
 }
 
-/// The KERNEL address of exchange `x`'s body slot.
+/// The kernel address of exchange `x`'s body slot.
 ///
-/// **IT IS NOT A NEW FUNNEL, AND THAT IS THE POINT** (sawos design 34; designs
-/// 29 + 32). It was the whole-bodies-array address plus `x * PIPE_BODY_BYTES`;
-/// it is now the address of a FIELD of the slot `EXCHANGES[x]` lends, so it
-/// reaches donated memory through `Slab.extent_addr` — the read funnel design 29
-/// converts — and through nothing else. There is no second `phys_to_virt` here
-/// because there is no second dereference of a stored physical base: the
-/// accessor already did that, and this is field arithmetic on what it lent.
-/// (029's rebase note is the reason that sentence is worth writing down: a
-/// missed conversion is a hard fault on a translating profile and INVISIBLE on
-/// an MPU one, so "no new funnel" has to be shown rather than assumed.)
+/// There is no new funnel here: this is the address of a field of the slot
+/// `EXCHANGES[x]` lends, so it reaches donated memory through
+/// `Slab.extent_addr` and nothing else. There is no second `phys_to_virt`,
+/// because there is no second dereference of a stored physical base. A missed
+/// conversion would be a hard fault on a translating profile and invisible on
+/// an MPU one, so "no new funnel" has to be kept rather than assumed.
 ///
-/// Confined to this small named helper (design 136), so the callers stay
-/// ordinary code and the pointer never leaves the expression.
+/// Confined to this small named helper so the callers stay ordinary code and
+/// the pointer never leaves the expression.
 ///
-/// ONE SLOT CARRIES BOTH BODIES, one at a time: the request on the way in, and
-/// then the reply written over it (sawos design 14 D-1, on design 10 ruling 4's
-/// rider — "ruling 6's fixed slots carry the reply"). Nothing is owed to the
-/// request bytes once the taker has copied them out.
+/// One slot carries both bodies, one at a time: the request on the way in, then
+/// the reply written over it. Nothing is owed to the request bytes once the
+/// taker has copied them out.
 public(package) func exchange_body_addr(x: Int) unsafe -> UInt {
     EXCHANGES[x].body_addr()
 }
 
-/// Take a FREE ring slot of connection `c`, or `NO_EXCHANGE` when every one of
+/// Take a free ring slot of connection `c`, or `NO_EXCHANGE` when every one of
 /// them is in use.
 ///
-/// **THIS SCAN IS THE RING-FULL TEST** (sawos design 14 D-1), and what it counts
-/// is what changed in unit 2: a slot is in use from the post that stages a
-/// message until the exchange SETTLES, so a full ring is `PIPE_INFLIGHT`
-/// AWAITING-REPLY exchanges rather than `PIPE_INFLIGHT` untaken messages. That is
-/// design 10 ruling 6's "in-flight messages per client" read literally, and it is
-/// why `PipeOutletOp.Take` no longer frees anything.
+/// This scan is the ring-full test. A slot is in use from the post that stages
+/// a message until the exchange settles, so a full ring is `PIPE_INFLIGHT`
+/// awaiting-reply exchanges rather than `PIPE_INFLIGHT` untaken messages, and
+/// `PipeOutletOp.Take` frees nothing.
 ///
-/// A scan rather than a cursor, for the reason `alloc_pipe` above is one:
-/// exchanges settle in whatever order their two holders act, so the free slots
-/// are not contiguous and there is no cursor that could describe them. It is
-/// bounded by `PIPE_INFLIGHT` (16), which `kcore.limits`' audit note covers.
+/// A scan rather than a cursor, as `alloc_pipe` is: exchanges settle in
+/// whatever order their two holders act, so the free slots are not contiguous.
+/// It is bounded by `PIPE_INFLIGHT`, which `kcore.limits`' audit note covers.
 public(package) func alloc_exchange(c: Int) unsafe -> Int {
     var i: Int = 0
     while i < PIPE_INFLIGHT {
@@ -2176,15 +1898,13 @@ public(package) func alloc_exchange(c: Int) unsafe -> Int {
     NO_EXCHANGE
 }
 
-/// **IS THERE ROOM TO POST — the inlet's waitable level** (design 10 ruling 8;
-/// sawos design 15, M4 unit 3).
+/// Whether there is room to post: the inlet's waitable level.
 ///
-/// It is `alloc_exchange`'s own scan asked as a QUESTION rather than as a
-/// reservation, and that is deliberate: readiness must reserve nothing, because
-/// a level that took a slot to answer would hand it to whoever asked instead of
-/// to whoever posts. So this is the same bounded walk with no side effect, which
-/// is §2.2's level-triggering implemented rather than maintained — the same
-/// argument `waiter_ready_attachment`'s scan makes.
+/// It is `alloc_exchange`'s scan asked as a question rather than a reservation.
+/// Readiness must reserve nothing, because a level that took a slot to answer
+/// would hand it to whoever asked instead of to whoever posts. The same bounded
+/// walk with no side effect is §2.2's level-triggering implemented rather than
+/// maintained, as in `waiter_ready_attachment`.
 public(package) func pipe_has_room(c: Int) unsafe -> Bool {
     var i: Int = 0
     while i < PIPE_INFLIGHT {
@@ -2197,12 +1917,11 @@ public(package) func pipe_has_room(c: Int) unsafe -> Bool {
     false
 }
 
-/// Append exchange `x` to its connection's STAGED list — the FIFO a take reads
+/// Append exchange `x` to its connection's staged list, the FIFO a take reads
 /// from.
 ///
 /// The walk to the tail is bounded by `PIPE_INFLIGHT` and buys the absence of a
-/// tail index, which is design 13's own trade taken again: a second index is a
-/// second thing two paths have to keep in step.
+/// tail index, which two paths would otherwise have to keep in step.
 public(package) func stage_push(c: Int, x: Int) unsafe {
     EXCHANGES[x].next = 0
     if PIPES[c].staged == 0 {
@@ -2216,8 +1935,8 @@ public(package) func stage_push(c: Int, x: Int) unsafe {
     EXCHANGES[cur].next = x + 1
 }
 
-/// The OLDEST staged exchange of connection `c`, or `NO_EXCHANGE` when nothing
-/// is staged. Looks and does not remove — a take mints its obligation before it
+/// The oldest staged exchange of connection `c`, or `NO_EXCHANGE` when nothing
+/// is staged. Looks and does not remove: a take mints its obligation before it
 /// consumes anything, so the refusal path must leave the list as it found it.
 public(package) func stage_peek(c: Int) unsafe -> Int {
     if PIPES[c].staged == 0 {
@@ -2237,16 +1956,14 @@ public(package) func stage_pop(c: Int) unsafe {
     EXCHANGES[head - 1].next = 0
 }
 
-/// Is every ring slot of connection `c` free — is there no exchange left in it?
+/// Is every ring slot of connection `c` free, with no exchange left in it?
 ///
-/// **THE CONNECTION OUTLIVES ITS ENDPOINTS FOR EXACTLY AS LONG AS AN EXCHANGE
-/// INSIDE IT DOES** (sawos design 14 D-1, which is design 10 ruling 10's
-/// "references govern lifetime" one level down). A claim is a reference on a RING
-/// SLOT, and a ring slot lives inside the `PIPES` row — so freeing the row while
-/// a claim is live would hand that claim a recycled connection. This predicate is
-/// what stops it, and it is a scan rather than a third column for `alloc_pipe`'s
-/// reason: it is the same bounded walk, and a maintained count would be one more
-/// thing to keep in step.
+/// The connection outlives its endpoints for exactly as long as an exchange
+/// inside it does. A claim is a reference on a ring slot, and a ring slot lives
+/// inside the `PIPES` row, so freeing the row while a claim is live would hand
+/// that claim a recycled connection. This predicate stops it; it is a scan
+/// rather than a third column for `alloc_pipe`'s reason (the same bounded walk,
+/// and a maintained count would be one more thing to keep in step).
 public(package) func pipe_idle(c: Int) unsafe -> Bool {
     var i: Int = 0
     while i < PIPE_INFLIGHT {
@@ -2259,23 +1976,20 @@ public(package) func pipe_idle(c: Int) unsafe -> Bool {
     true
 }
 
-/// Give connection `slot` back to the Pipe slab, and credit its CREATOR.
+/// Give connection `slot` back to the Pipe slab, and credit its creator.
 ///
-/// **CREATOR-PAYS, ONE CHARGE, ONE CREDIT** (design 10 ruling 6; design 7 D-3's
-/// rule applied to an object with two names). The `process` field is who
-/// `PipeCreate` charged, and it is credited here whichever process happened to
-/// drop the last handle onto whichever end.
+/// One charge, one credit: `process` is who `PipeCreate` charged, and it is
+/// credited here whichever process dropped the last handle onto whichever end.
 ///
-/// Its precondition is both columns at zero AND `pipe_idle` — no endpoint names
-/// it and no exchange lives in it — so the ring slots are already `Free` and
+/// The precondition is both columns at zero and `pipe_idle`: no endpoint names
+/// it and no exchange lives in it, so the ring slots are already `Free` and
 /// there is nothing to unwind here.
 public(package) func free_pipe(slot: Int) unsafe {
-    // **NEITHER END CAN BE ATTACHED HERE, and the test is the invariant written
-    // down** (sawos design 15, on the Event/Timer/Interrupt precedent in
-    // `free_object`). An attachment is a counted reference on the END it
-    // watches, so a connection whose columns are both zero has no watcher on
-    // either side; if this ever fired, the ledger and the wait machinery would
-    // have disagreed and a Waiter would be watching a recycled slot.
+    // Neither end can be attached here. An attachment is a counted reference on
+    // the end it watches, so a connection whose columns are both zero has no
+    // watcher on either side; if this fires, the ledger and the wait machinery
+    // disagreed and a Waiter would be watching a recycled slot (see
+    // `free_object`).
     if PIPES[slot].inlet_attachment != 0 || PIPES[slot].outlet_attachment != 0 {
         fatal_kernel("a pipe reached zero references while attached",
                      slot as UInt)
@@ -2287,16 +2001,14 @@ public(package) func free_pipe(slot: Int) unsafe {
     quota_credit(owner, QuotaKind.Pipe)
 }
 
-/// Can exchange `x` be given back — does nobody name it and is nothing owed?
+/// Can exchange `x` be given back: does nobody name it and is nothing owed?
 ///
-/// **IT IS THE COUNTED-OBJECT RULE WITH ONE EXTRA CLAUSE** (sawos design 14
-/// D-2). Both columns at zero is what says no handle can ever act on this
-/// exchange again; the extra clause is that a `Staged` message is still OWED to a
-/// live outlet whatever became of the claim — which is §2.1's TELL idiom (post,
-/// drop the claim, and the server still receives the message) and design 230's
-/// close-drains-first rule reaching one level down. Once the outlet column is
-/// zero nobody can ever take it, so the message is owed to nobody and the slot
-/// may go.
+/// This is the counted-object rule with one extra clause. Both columns at zero
+/// says no handle can ever act on this exchange again; the extra clause is that
+/// a `Staged` message is still owed to a live outlet whatever became of the
+/// claim (§2.1's tell idiom: post, drop the claim, and the server still
+/// receives the message). Once the outlet column is zero nobody can ever take
+/// it, so the message is owed to nobody and the slot may go.
 public(package) func exchange_can_settle(x: Int) unsafe -> Bool {
     if EXCHANGES[x].reply_refs != 0 || EXCHANGES[x].request_refs != 0 {
         return false
@@ -2306,59 +2018,51 @@ public(package) func exchange_can_settle(x: Int) unsafe -> Bool {
         case Staged -> PIPES[exchange_pipe(x)].outlet_refs == 0,
         case Taken -> true,
         case Replied -> true,
-        // A DISCHARGED EXCHANGE OWES NOTHING BY CONSTRUCTION (sawos design 15):
-        // the answer has already been handed to somebody through a wait record,
-        // so there is nothing left for either side and only the columns are
+        // A discharged exchange owes nothing: the answer has already been
+        // handed to somebody through a wait record, so only the columns are
         // holding the slot.
         case Settled -> true,
     }
 }
 
-/// Give exchange `x`'s ring slot back — **and the CONNECTION with it, if that
-/// was the last thing keeping the row alive.**
+/// Give exchange `x`'s ring slot back, and the connection with it if that was
+/// the last thing keeping the row alive.
 ///
-/// The cascade is the one design 7's header describes over a different pair of
-/// kinds, and it terminates for the same reason: an exchange references its
-/// connection's storage and a connection references no exchange, so the graph is
-/// a forest.
+/// The cascade terminates because an exchange references its connection's
+/// storage and a connection references no exchange, so the graph is a forest.
 ///
-/// THE BYTES ARE NOT ZEROED, on `pipe_drop_staged`'s own reasoning: a staged or
-/// replied body is bytes that were COPIED, the slot is unreachable until a later
-/// post writes it, and every read of one is bounded by the length that post
-/// recorded.
+/// The bytes are not zeroed, as in `pipe_drop_staged`: a staged or replied body
+/// is bytes that were copied, the slot is unreachable until a later post writes
+/// it, and every read of one is bounded by the length that post recorded.
 ///
-/// **IT ANSWERS WITH THE HANDLE REFERENCES THE EXCHANGE WAS STILL HOLDING, AND
-/// THE CALLER MUST RELEASE THEM** (the Sep-2 re-rule of ruling 5). A settling
-/// exchange may still be carrying a message nobody took, and under take-at-post
-/// those handles are the KERNEL's references rather than notes about somebody
-/// else's table — so forgetting them would leak the objects. Releasing them is
-/// `kcore.refs`' job and this file sits below it, so the batch travels UP: the
-/// ledger is emptied here, every other line of the settle runs, and the release
-/// happens at the call site with the exchange already `Free`. That ordering is
-/// not incidental — a release can take a pipe endpoint to zero and cascade back
-/// into this very function, and by then there is nothing left here to corrupt.
+/// It answers with the handle references the exchange was still holding, and
+/// the caller must release them. A settling exchange may still carry a message
+/// nobody took, and those handles are the kernel's references, so forgetting
+/// them would leak the objects. Releasing is `kcore.refs`' job and this file
+/// sits below it, so the batch travels up: the ledger is emptied here, every
+/// other line of the settle runs, and the release happens at the call site with
+/// the exchange already `Free`. The ordering matters: a release can take a pipe
+/// endpoint to zero and cascade back into this function, and by then there is
+/// nothing left here to corrupt.
 public(package) func exchange_settle(x: Int) unsafe -> StagedRefs {
-    // **NEITHER HALF CAN BE ATTACHED HERE** — `free_pipe`'s assert one level
-    // down, and the same invariant: an attachment is a counted reference on the
-    // column it watches, so both columns at zero means nobody is watching
-    // either. If it ever fired, a Waiter would be holding a level on a ring slot
-    // the next `Post` is about to write.
+    // Neither half can be attached here (`free_pipe`'s assert one level down):
+    // an attachment is a counted reference on the column it watches, so both
+    // columns at zero means nobody is watching either. If this fired, a Waiter
+    // would be holding a level on a ring slot the next `Post` is about to
+    // write.
     if EXCHANGES[x].reply_attach != 0 || EXCHANGES[x].request_attach != 0 {
         fatal_kernel("an exchange settled while attached", x as UInt)
     }
-    // **AND NO THREAD CAN BE PARKED ON IT EITHER** (sawos design 17), which is
-    // the same invariant one kind of reference further along: a fused caller
-    // counts on the CLAIM column, so both columns at zero means nobody is
-    // parked. It is worth asserting for a sharper reason than the attachment
-    // pair's — a parked caller is on no list at all, so a settle that lost one
-    // would strand a thread nothing could ever reach again, which is precisely
-    // what design 10 ruling 2 forbids.
+    // No thread can be parked on it either: a fused caller counts on the claim
+    // column, so both columns at zero means nobody is parked. A parked caller
+    // is on no list at all, so a settle that lost one would strand a thread
+    // nothing could ever reach again.
     if EXCHANGES[x].caller != 0 {
         fatal_kernel("an exchange settled with a caller parked on it", x as UInt)
     }
-    // **THE HELD REFERENCES COME OUT FIRST AND ARE RELEASED LAST** — collected
-    // here so the ledger is already empty for anything the caller's release
-    // cascades into, handed back so the release happens where releases live.
+    // The held references come out first and are released last: collected here
+    // so the ledger is already empty for anything the caller's release cascades
+    // into, handed back so the release happens where releases live.
     let held = take_staged(x)
     EXCHANGES[x].state = ExchangeState.Free
     EXCHANGES[x].reply_refs = 0
@@ -2379,73 +2083,52 @@ public(package) func exchange_settle(x: Int) unsafe -> StagedRefs {
     held
 }
 
-// **`pipe_drop_staged` MOVED TO `kcore.refs` IN M4 UNIT 4** (the Sep-2 re-rule
-// of ruling 5). The outlet's zero-arm used to be pure bookkeeping — it forgot
-// notes about somebody else's table — and take-at-post made it a RELEASE SITE:
-// every staged message it drops is holding kernel references that have to go
-// back. Releasing lives one module up, so the function went with it, beside the
-// other last rites that unref. Its one caller was already there.
-
 // =============================================================================
-// The boot-handle queues, ONE PER PROCESS (spec §12; sawos design 2 D-3, as
-// re-shaped by design 4 D-2)
+// The boot-handle queues, one per process (spec §12)
 // =============================================================================
 //
-// WHAT SOMEBODY MINTED FOR A PROCESS BEFORE IT RAN AND HAS NOT HANDED OVER YET.
-// §12 keeps the boot set ONE HANDLE WIDE at the entry register, so everything
-// else a process is furnished with has to be COLLECTED rather than passed, and
-// this is where it waits.
+// What somebody minted for a process before it ran and has not handed over yet.
+// §12 keeps the boot set one handle wide at the entry register, so everything
+// else a process is furnished with is collected rather than passed, and this is
+// where it waits.
 //
-// **THE QUEUE WENT PER-PROCESS IN M3 UNIT 3, and the reason is that there are
-// two drainers now.** Unit 2's globals were correct for one — only root had a
-// boot set, because a child was handed nothing — and are wrong for two: a
-// launcher fills a child's set with `ProcessOp.Give`, and the child drains ITS
-// OWN through its own Process handle exactly as root drains root's. The two
-// producers are indistinguishable on purpose: THE KERNEL IS THE GIVER NOBODY
-// GAVE TO, root's records are written at boot by exactly the machinery a give
-// uses, and their tags are region ordinals because that is the config root and
-// the build agreed on.
+// The queue is per-process because there are two drainers: a launcher fills a
+// child's set with `ProcessOp.Give`, and the child drains its own through its
+// own Process handle exactly as root drains root's. The two producers are
+// indistinguishable on purpose: the kernel is the giver nobody gave to, root's
+// records are written at boot by the machinery a give uses, and their tags are
+// region ordinals because that is what the config root and the build agreed on.
 //
-// THE STORAGE IS THE HANDLE TABLE'S OWN IDIOM, and since M5 unit 6b (sawos
-// design 36) it is literally the handle table's NEIGHBOUR: the set, its count
-// and its cursor are `PROCESSES[p].boot_handles` / `.boot_count` / `.boot_next`,
-// three fields beside `.handles`. It was three flat `MAX_PROCESSES ×` arrays,
-// which was the same idiom spelled with a multiply.
-// **`MAX_HANDLES` IS THE RIGHT BOUND AND NOT AN ARBITRARY ONE**: every record
-// names a handle in that process's table, so a boot set larger than the table it
-// fills could never be drained into existence — a statement that is now visible
-// in the record rather than only in this comment.
+// The set, its count and its cursor are `PROCESSES[p].boot_handles` /
+// `.boot_count` / `.boot_next`, three fields beside `.handles`. `MAX_HANDLES`
+// is the right bound: every record names a handle in that process's table, so a
+// boot set larger than the table it fills could never be drained.
 //
-// It is still a queue with a cursor and no removal: the cursor only ever
-// advances, so a drained iterator STAYS drained and a delivered record can never
-// be delivered twice. That is the whole of the lifetime rule, and it is why the
-// records are plain storage rather than a slab. The set FREEZES at `Start` —
-// enforced by the give's own `BadState` refusal, one level up — and the DRAIN
-// has no deadline at all.
-
-// `BootHandleSlot` MOVED TO `kcore.pslot` with the set it is an element of
-// (sawos design 36). The three statics went with it and became three fields.
+// It is a queue with a cursor and no removal: the cursor only ever advances, so
+// a drained iterator stays drained and a delivered record can never be
+// delivered twice. That is why the records are plain storage rather than a
+// slab. The set freezes at `Start` (enforced by the give's own `BadState`
+// refusal, one level up) and the drain has no deadline.
 
 /// Is there room for one more record in process `p`'s set?
 ///
-/// Asked BEFORE a give does anything, so a refusal leaves both tables untouched.
-/// It can only ever answer `false` in theory — a record is queued beside a mint
-/// into the same process's table, so the handle table fills first — and the test
-/// is here anyway because a silently dropped record is a capability a child was
-/// given and can never collect.
+/// Asked before a give does anything, so a refusal leaves both tables
+/// untouched. In practice it never answers `false`, since a record is queued
+/// beside a mint into the same process's table and the handle table fills
+/// first; the test is here because a silently dropped record is a capability a
+/// child was given and can never collect.
 public(package) func boot_handle_room(p: Int) unsafe -> Bool {
     PROCESSES[p].boot_count < MAX_HANDLES
 }
 
 /// Does process `p`'s set already carry `tag`?
 ///
-/// **THE DUPLICATE-TAG CHECK, and it scans rather than indexes** (sawos design 4
-/// D-2). A tag is the giver's own word and the kernel constrains it in no way,
-/// so there is nothing to index by; the array is bounded by `MAX_HANDLES` and
-/// tiny, and the walk runs once per give. It looks at the WHOLE set and not only
-/// the undelivered part, because the tag is an IDENTITY for the process's whole
-/// boot set — a tag reused after the child drained the first one would still name
-/// two handles.
+/// The duplicate-tag check scans rather than indexes: a tag is the giver's own
+/// word and the kernel constrains it in no way, so there is nothing to index
+/// by; the array is bounded by `MAX_HANDLES` and the walk runs once per give.
+/// It looks at the whole set and not only the undelivered part, because the tag
+/// is an identity for the process's whole boot set: a tag reused after the
+/// child drained the first one would still name two handles.
 public(package) func boot_tag_used(p: Int, tag: UInt) unsafe -> Bool {
     let n = PROCESSES[p].boot_count
     var i: Int = 0
@@ -2458,29 +2141,25 @@ public(package) func boot_tag_used(p: Int, tag: UInt) unsafe -> Bool {
     false
 }
 
-/// TAKE the handle word process `p`'s set carries under `tag`, or `NO_HANDLE`
+/// Take the handle word process `p`'s set carries under `tag`, or `NO_HANDLE`
 /// when no record carries it.
 ///
-/// **`start(boot_tag:)`'s RESOLVER, AND IT CONSUMES** (the Aug-29 user ruling on
-/// design 4). Putting the word in the child's first argument register IS the
-/// delivery, so the record is marked spent and the drain will skip it — a child
-/// is never handed one word twice, and the two-owners-of-one-word hazard that
-/// the non-consuming reading created is unrepresentable rather than documented.
+/// This is `start(boot_tag:)`'s resolver, and it consumes. Putting the word in
+/// the child's first argument register is the delivery, so the record is marked
+/// spent and the drain skips it: a child is never handed one word twice, and a
+/// two-owners-of-one-word hazard is unrepresentable.
 ///
-/// A record already taken answers `NO_HANDLE` too, which is the same answer a
-/// tag nobody gave gets: both are "there is no word here to deliver", and the
-/// caller turns either into the `BadArg` fault. Nothing today can reach the
-/// second — a set freezes at start and start happens once — and the arm costs a
-/// comparison.
+/// A record already taken answers `NO_HANDLE` too, the same answer a tag nobody
+/// gave gets: both mean "there is no word here to deliver", and the caller
+/// turns either into the `BadArg` fault.
 public(package) func boot_handle_take(p: Int, tag: UInt) unsafe -> UInt {
     let n = PROCESSES[p].boot_count
     var i: Int = 0
     while i < n {
-        // ONE VALUE READ RATHER THAN THREE WINDOWS. `BootHandleSlot` is
-        // trivially copyable, so reading the record out is free and the test,
-        // the mark and the answer then work on one loaded copy — which also
-        // keeps two place windows out of a single `&&` (design 34's SL-17
-        // lesson, and the whole reason the flat `let at = ...` index is gone).
+        // Read the record as one value rather than three place windows.
+        // `BootHandleSlot` is trivially copyable, so the test, the mark and the
+        // answer work on one loaded copy, which also keeps two place windows
+        // out of a single `&&`.
         let rec = PROCESSES[p].boot_handles[i]
         if rec.tag == tag && not rec.taken {
             PROCESSES[p].boot_handles[i].taken = true
@@ -2506,11 +2185,10 @@ public(package) func queue_boot_handle(p: Int, tag: UInt, kind: BootHandleKind,
 /// Advance process `p`'s cursor past every record already delivered, and answer
 /// where it now points.
 ///
-/// **THE CURSOR ONLY EVER ADVANCES**, which is the whole of the lifetime rule and
-/// is unchanged by the second delivery door: a record `start(boot_tag:)` took is
-/// one the drain steps over, exactly as it steps over one it delivered itself.
-/// So a drained iterator stays drained, and no record is ever handed out twice
-/// however it left the set.
+/// The cursor only ever advances: a record `start(boot_tag:)` took is one the
+/// drain steps over, as it steps over one it delivered itself. A drained
+/// iterator stays drained, and no record is handed out twice however it left
+/// the set.
 public(package) func boot_handle_cursor(p: Int) unsafe -> Int {
     let n = PROCESSES[p].boot_count
     var at = PROCESSES[p].boot_next
@@ -2523,12 +2201,11 @@ public(package) func boot_handle_cursor(p: Int) unsafe -> Int {
 
 /// Forget process `p`'s set. Called by the teardown.
 ///
-/// **THE RECORDS ARE BOOKKEEPING AND CLEAR WITH THE SLOT** (sawos design 4 D-2).
-/// The handles they name are entries in the dying process's own table, already
-/// unbound by the close-all, so nothing is released here and nothing is leaked:
-/// what is reset is the count and the cursor, which MUST be reset because a
-/// process slot is reclaimable (design 3 D-3) and the next occupant would
-/// otherwise inherit a stranger's boot set.
+/// The records are bookkeeping and clear with the slot. The handles they name
+/// are entries in the dying process's own table, already unbound by the
+/// close-all, so nothing is released here and nothing is leaked. The count and
+/// the cursor must be reset because a process slot is reclaimable and the next
+/// occupant would otherwise inherit a stranger's boot set.
 public(package) func clear_boot_handles(p: Int) unsafe {
     PROCESSES[p].boot_count = 0
     PROCESSES[p].boot_next = 0

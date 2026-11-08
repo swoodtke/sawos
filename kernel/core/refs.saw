@@ -1,114 +1,72 @@
-//! THE REFERENCE COUNT, AND WHAT ZERO DOES (sawos design 7 D-1/D-2) — the
-//! per-kind matrix in one place, on `waitables`' own model.
+//! Reference counts, and what a count reaching zero does.
 //!
-//! Every countable slab slot carries a `refs`, and everything that can be said
-//! about maintaining it is one of three questions, each answered by an
-//! EXHAUSTIVE match on `ObjType`:
+//! Every countable slab slot carries a `refs`. Maintaining it comes down to
+//! three questions, each answered by an exhaustive match on `ObjType`:
 //!
 //!   `ref_object`     something now names this object
-//!   `unref_object`   something no longer does — and zero FREES, right here
-//!   `free_object`    the slot goes back, and the kind's last rites run
+//!   `unref_object`   something no longer does; zero frees, right here
+//!   `free_object`    the slot goes back and the kind's last rites run
 //!
-//! That is a MATRIX rather than a funnel because the answers genuinely differ
-//! per kind — an Interrupt's last rites mask a device line, a Timer's
-//! reprogram the comparator, a Waiter's detach a list AND WAKE WHAT IS PARKED
-//! ON IT (sawos design 12), a Mapping's deliberately leave a protection row
-//! installed — and it is written as three functions in one place so the matrix
-//! is READABLE AS ONE. A kind added to `ObjType` fails
-//! all three to compile until somebody says what references it, which is the
-//! property a `_` arm anywhere here would destroy.
+//! The answers differ per kind (an Interrupt masks its line, a Timer reprograms
+//! the comparator, a Waiter detaches its list and wakes what is parked on it, a
+//! Mapping deliberately leaves its protection row installed), which is why this
+//! is a matrix of three functions in one place. A kind added to `ObjType` fails
+//! to compile in all three until someone says what references it; a `_` arm
+//! here would destroy that property.
 //!
-//! **AND M4 UNIT 1 IS WHERE THAT PROPERTY EARNED ITS KEEP** (sawos design 13).
-//! `PipeInlet` and `PipeOutlet` are two counted kinds over ONE connection slot
-//! with TWO reference columns, and it was `drop_reference`'s demand for an
-//! answer to "was that the last" — for an object with two names — that turned
-//! D-1's both-zero-frees from a sentence in a brief into a property of the
-//! ledger. Each arm decrements ITS column and then answers about the PAIR, so
-//! `unref_object`'s "zero frees" means "both-zero frees" here without that
-//! function knowing two kinds are involved. The two are also the only arms in
-//! this file with something to say when a count reaches zero WITHOUT freeing:
-//! one column at zero is the PEER-GONE transition, and `free_object` runs only
-//! when both are, so there is no other site it could be written at.
+//! `PipeInlet` and `PipeOutlet` are two counted kinds over one connection slot
+//! with two reference columns. `PipeReply` and `PipeRequest` are two counted
+//! kinds over one exchange (ring slot) with two columns. Each arm decrements
+//! its own column and then answers about the pair, so `unref_object`'s "zero
+//! frees" means "both columns zero" without knowing two kinds are involved. One
+//! column reaching zero is the peer-gone (or abandonment) transition.
+//! `drop_reference` is the only place a column reaching zero is observed, and
+//! `free_object` runs only when both are zero, so the transition cannot be
+//! written anywhere else. `exchange_can_settle` carries the one extra clause: a
+//! staged message is still owed to a live outlet whatever became of its claim
+//! (spec §2.1's tell idiom).
 //!
-//! **AND M4 UNIT 2 REPEATED THE WHOLE SHAPE ONE LEVEL DOWN** (sawos design 14).
-//! `PipeReply` and `PipeRequest` — the client's claim on a reply and the server's
-//! obligation to send one — are two counted kinds over one RING SLOT with two
-//! reference columns, exactly as the endpoint pair is over one connection: each
-//! arm decrements its column and answers about the whole exchange, and reaching
-//! zero on one column alone is the ABANDONMENT transition that `Reply` and
-//! `Resolve` read off the counts. The one thing that is not the endpoint pair's
-//! rule verbatim is `exchange_can_settle`'s extra clause — a STAGED message is
-//! still owed to a live outlet whatever became of its claim, which is §2.1's TELL
-//! idiom — and it is written there rather than here.
+//! Teardown does not force-free the counted kinds other processes may still
+//! reference (regions, IO windows, pipe connections); `reap_unreferenced` frees
+//! what nobody names (see the block above it). Events, Waiters, Interrupts,
+//! Timers and Mappings are swept by owner.
 //!
-//! **THE TEARDOWN'S FORCE-FREE IS GONE** (`designs/010` ruling 10, design 14
-//! D-3): `end_process` no longer sweeps the Memory, IoMemory and Pipe slabs by
-//! charged process. `reap_unreferenced` below is what took its place and the
-//! block above it carries the argument.
+//! This file also holds delivery, readiness becoming a woken thread. The ledger
+//! and delivery are mutually recursive: a delivery drops a reference (one-shot
+//! and reply attachments detach at delivery), and a dropped reference delivers
+//! (the peer-gone levels fire when a column reaches zero). A module boundary
+//! cannot hold that cycle, and an import cycle silently empties a module's
+//! export table, so both live here. The wait tables stay in `waitables`; this
+//! file is the acting half.
 //!
-//! # AND M4 UNIT 3 MOVED THE DELIVERY IN HERE (sawos design 15)
-//!
-//! `kcore.wake` used to be its own module, one line above this one: readiness
-//! becoming a woken thread. It is now the second half of this file, and the
-//! reason is that the two became MUTUALLY RECURSIVE and a module boundary
-//! cannot hold a cycle (DF-232e — an import cycle is not diagnosed, it silently
-//! empties a module's export table and blames a third file).
-//!
-//! Both directions arrived with `designs/010`'s M4 unit-3 rulings, and each is
-//! a sentence of one of them:
-//!
-//!   - **A DELIVERY NOW DROPS A REFERENCE.** Ruling 9(b)'s `AttachMode.OneShot`
-//!     detaches AT DELIVERY, and ruling 11(b) makes a REPLY delivery detach
-//!     whatever mode was passed — and an attachment is a counted reference
-//!     (design 7 D-1), so `deliver_attachment` unrefs. That is delivery
-//!     reaching into the ledger.
-//!   - **A DROPPED REFERENCE NOW DELIVERS.** The peer-gone terminal levels
-//!     (`designs/010` ruling 2's doctrine: nothing parked can be silently
-//!     doomed) fire exactly when a column reaches zero, and the only function
-//!     that observes a column reaching zero is `drop_reference` below. That is
-//!     the ledger reaching into delivery.
-//!
-//! What did NOT change is the rule `kcore`'s facade states about where a seam
-//! lives: the STATE of a thing sits below the process teardown and ACTING on it
-//! sits above. The wait TABLES are still `waitables`, one module down, and this
-//! file is still the acting half — it simply now does both kinds of acting,
-//! because they turned out to be one act. Its altitude is unchanged: it needs
-//! `process`'s copy door, which it sits above, and nothing above itself.
-//!
-//! # ZERO FREES, SYNCHRONOUSLY (D-1)
+//! # Zero frees synchronously
 //!
 //! The kernel is one context running to completion, so the count hits zero
-//! INSIDE the very syscall that dropped the last reference and the free is a
-//! plain call: no deferred reclamation, no cleanup queue, nothing to drain at a
-//! later point. Cascades compose out of the same two functions — releasing a
-//! Waiter to zero detaches its attachments, which may drop an Event to zero,
-//! which frees and credits — and they terminate because an attachment is
-//! counted on the WAITABLE and never on the Waiter, so the graph is a forest.
+//! inside the syscall that dropped the last reference and the free is a plain
+//! call: no deferred reclamation, no cleanup queue. Cascades compose out of the
+//! same two functions (releasing a Waiter to zero detaches its attachments,
+//! which may drop an Event to zero, which frees and credits). They terminate
+//! because an attachment is counted on the waitable and never on the Waiter, so
+//! the graph is a forest.
 //!
-//! WHAT ZERO DOES NOT FREE IS A RANGE. A freed Memory slot returns to the slab
-//! and its bytes return to no pool: the front-cut parent cannot absorb an
-//! arbitrary hole (the one-`{base,len}` shape, design 6 D-2). Quotas count
-//! OBJECTS, not bytes, in v1; byte accounting arrives with a real allocator,
-//! and §2.5's pages-free-on-last-reference clause is narrowed accordingly in
-//! the spec.
+//! Quotas count objects, not bytes, in v1 (spec §2.9); bytes are the pool's own
+//! ledger (§2.5).
 //!
-//! # WHY THIS IS A MODULE AND WHERE IT SITS
+//! # Placement
 //!
-//! Between `process` and `wake`, and the call graph is what puts it there. It
-//! has to reach EVERY slab — the two memory slabs and the handle table below in
-//! `objects`, the Timer slab in `time`, the three wait slabs in `waitables` —
-//! and also `PROCESSES`, because a Process's own count is what design 3 D-3's
-//! reclaim now reads. Written any lower it could not see the process table;
-//! written any higher it would be above the teardown that also frees these
-//! slabs. It reaches nothing above itself.
+//! This module sits above `process`, because delivery needs `process`'s copy
+//! doors and a Process's own count drives its slot reclaim, and below `sched`,
+//! which holds the teardown and imports this module. It reaches every slab (the
+//! memory slabs and the handle table in `objects`, the Timer slab in `time`,
+//! the wait slabs in `waitables`) and `PROCESSES` in `pslot`, and nothing above
+//! itself.
 //!
-//! Two mints are NOT expressed through this matrix and could not be: the boot
-//! path's, in `process`, which sits below this file. They cost nothing to write
-//! out — a boot Memory and IoMemory are created with `refs: 1` in the slot
-//! literal (a fresh object's first reference is not a change to a count, it IS
-//! the count) and root's own Process handle is one increment on its own table.
-//! Every GENERIC site — where a handle is bound to a kind the code does not
-//! know — comes through here.
+//! Two mints are not expressed through this matrix because they happen in
+//! `process`, below this file: a boot Memory and IoMemory are created with
+//! `refs: 1` in the slot literal (a fresh object's first reference is the
+//! count), and root's own Process handle is one increment on its own table.
+//! Every generic site, where a handle is bound to a kind the code does not
+//! know, comes through here.
 
 import hal
 import sosabi.{EventMode, NO_HANDLE, ObjType, OutletLevel, PIPE_BODY_BYTES,
@@ -189,23 +147,19 @@ import kcore.process.{copy_in, copy_out, reclaim_process_slot}
 
 /// Something now names object `slot` of kind `kind`.
 ///
-/// Called BESIDE every generic bind: `mint_handle` at each op that hands out a
-/// handle onto an object that already existed, `give`'s child-side bind, and
-/// `waiter_add`'s attachment (through `ref_waitable`). A creation site does not
-/// call it — a fresh slot is written with `refs: 1`, because its first
-/// reference is the count rather than a change to one.
+/// Called beside every generic bind: `mint_handle` at each op that hands out a
+/// handle onto an existing object, `give`'s child-side bind, and `waiter_add`'s
+/// attachment (through `ref_waitable`). Creation sites do not call it: a fresh
+/// slot is written with `refs: 1`, because its first reference is the count.
 ///
-/// FOUR KINDS ARE NOT COUNTED, and each arm says which reason it is:
+/// Four kinds are not counted:
 ///
-///   - `System` has no slab at all. It is the singleton every process's boot
-///     handle names, so there is no slot to return and nothing to return it to.
-///   - `Clock` is EXEMPT — kernel-eternal, owned by nobody (the Aug-17 user
-///     ruling). Freeing a domain's slot on a release would take the machine's
-///     monotonic counter away from everybody else.
-///   - `Thread` is NOT COUNTED IN v1: the join/exit protocol owns a thread
-///     slot's lifetime and does it on terms a handle count cannot express
-///     (see `ThreadSlot`). Recorded, deferred.
-///   - `Unbound` names nothing, so a bind of it is not a thing that happens.
+///   - `System` has no slab; it is the singleton every boot handle names.
+///   - `Clock` is exempt: kernel-eternal and owned by nobody, so a release must
+///     not take it away from everyone else.
+///   - `Thread`'s lifetime belongs to the join/exit protocol (see
+///     `ThreadSlot`), which a handle count cannot express.
+///   - `Unbound` names nothing, so binding it never happens.
 public(package) func ref_object(kind: ObjType, slot: Int) unsafe {
     match kind {
         case Event -> { EVENTS[slot].refs = EVENTS[slot].refs + 1 },
@@ -216,19 +170,15 @@ public(package) func ref_object(kind: ObjType, slot: Int) unsafe {
         case IoMemory -> { IOMEMORIES[slot].refs = IOMEMORIES[slot].refs + 1 },
         case Mapping -> { MAPPINGS[slot].refs = MAPPINGS[slot].refs + 1 },
         case Process -> { PROCESSES[slot].refs = PROCESSES[slot].refs + 1 },
-        // **TWO KINDS, ONE SLOT, TWO COLUMNS** (sawos design 13 D-1). The slot
-        // index is the CONNECTION's; the kind is what says which end this
-        // handle names, and therefore which column it counts on. That is the
-        // whole of D-1's mechanism, and it is three lines because the kind was
-        // already established before this function was reached (§3's order).
+        // Two kinds, one slot, two columns. `slot` is the connection's index;
+        // the kind says which end the handle names and therefore which column
+        // it counts on.
         case PipeInlet -> { PIPES[slot].inlet_refs = PIPES[slot].inlet_refs + 1 },
         case PipeOutlet -> { PIPES[slot].outlet_refs = PIPES[slot].outlet_refs + 1 },
-        // **THE SAME MECHANISM ONE LEVEL DOWN** (sawos design 14 D-1). `slot` is
-        // an EXCHANGE — a connection's ring slot — and the kind is what says
-        // whether this handle is the client's CLAIM or the server's OBLIGATION,
-        // and therefore which of the exchange's two columns it counts on. Two
-        // kinds over one slot, decided by `obj_type`, exactly as the two
-        // endpoint kinds are over the connection above.
+        // The same mechanism one level down: `slot` is an exchange (a
+        // connection's ring slot), and the kind says whether the handle is the
+        // client's claim or the server's obligation, hence which column it
+        // counts on.
         case PipeReply -> { EXCHANGES[slot].reply_refs = EXCHANGES[slot].reply_refs + 1 },
         case PipeRequest -> {
             EXCHANGES[slot].request_refs = EXCHANGES[slot].request_refs + 1
@@ -240,21 +190,17 @@ public(package) func ref_object(kind: ObjType, slot: Int) unsafe {
     }
 }
 
-/// Whether connection `slot` may be given back NOW: no endpoint names it, and no
-/// exchange lives in it.
+/// Whether connection `slot` may be given back now: no endpoint names it, and
+/// no exchange lives in it.
 ///
-/// **THE THIRD CLAUSE IS M4 UNIT 2's** (sawos design 14 D-1). A `PipeReply` or a
-/// `PipeRequest` is a reference on a RING SLOT, and the ring slots live inside
-/// the `PIPES` row — so freeing the row while a claim is live would hand that
-/// claim a recycled connection. `pipe_idle` is what makes "the connection
-/// outlives its endpoints for exactly as long as an exchange inside it does"
-/// true, which is design 10 ruling 10's own sentence one level down.
+/// Ring slots live inside the `PIPES` row, so freeing the row while a claim is
+/// live would hand that claim a recycled connection. The connection therefore
+/// outlives its endpoints for as long as an exchange inside it does.
 ///
-/// **AND THE STATE TEST IS NOT DEFENSIVE.** Settling an exchange can CASCADE into
-/// freeing the connection (`exchange_settle`), and the outlet's zero-arm settles
-/// exchanges before it asks this question — so by the time it is asked the row
-/// may already be back on the slab, and the honest answer for "should the caller
-/// free it" is then no.
+/// The state test is not defensive. Settling an exchange can cascade into
+/// freeing the connection (`exchange_settle`), and the outlet's zero-arm
+/// settles exchanges before asking this question, so the row may already be
+/// back on the slab. The answer is then no.
 func pipe_frees_now(slot: Int) unsafe -> Bool {
     match PIPES[slot].state {
         case Free -> false,
@@ -267,15 +213,13 @@ func pipe_frees_now(slot: Int) unsafe -> Bool {
 
 /// Take one reference away, and answer whether that was the last.
 ///
-/// SPLIT OUT FROM `unref_object` FOR ONE CALLER — the teardown, which must
-/// decrement without freeing. See `unref_teardown` for why that is not an
-/// inconsistency.
+/// Split out of `unref_object` for the teardown, which must decrement without
+/// freeing (see `unref_teardown`).
 ///
-/// The zero test before the subtraction is not defensive bookkeeping: a
-/// teardown zeroes the slots a process owned, so a LATER decrement from another
-/// process's close-all can arrive at a slot whose count is already gone, and
-/// the honest answer for "take one away from nothing" is that nothing was taken
-/// and nothing reached zero.
+/// The zero test before the subtraction is not defensive: a teardown zeroes the
+/// slots a process owned, so a later decrement from another process's close-all
+/// can arrive at a slot whose count is already gone. Nothing is taken then, and
+/// nothing reached zero.
 func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
     match kind {
         case Event -> {
@@ -313,47 +257,34 @@ func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
             MAPPINGS[slot].refs = MAPPINGS[slot].refs - 1
             MAPPINGS[slot].refs == 0
         },
-        // **THE ONLY TWO ARMS WHOSE ANSWER IS NOT THEIR OWN COLUMN'S ZERO**
-        // (sawos design 13 D-1). A connection frees when BOTH ends have gone,
-        // so each arm decrements ITS column and then asks about the pair — which
-        // is what makes `unref_object`'s "zero frees" mean "both-zero frees"
-        // here without that function knowing there are two kinds involved.
+        // The pipe arms answer about more than their own column's zero. A
+        // connection frees when both ends have gone, so each arm decrements its
+        // column and then asks about the pair.
         //
-        // **AND ONE COLUMN REACHING ZERO IS THE PEER-GONE TRANSITION**, which is
-        // the one thing this function does besides count. It is here rather than
-        // in `free_object` for the plainest reason: `free_object` runs only when
-        // BOTH columns are zero, and peer-gone is what happens when exactly ONE
-        // is — so the transition has no other site it could be written at. The
-        // teardown's `unref_teardown` reaches it too, and should: a dying
-        // process's endpoint going away is the same news to the far end as a
-        // release of it.
+        // One column reaching zero is the peer-gone transition, which this
+        // function handles besides counting. It lives here because
+        // `free_object` runs only when both columns are zero, and peer-gone is
+        // what happens when exactly one is. `unref_teardown` reaches it too, on
+        // purpose: a dying process's endpoint going away is the same news to
+        // the far end as a release.
         case PipeInlet -> {
             if PIPES[slot].inlet_refs == 0 { return false }
             PIPES[slot].inlet_refs = PIPES[slot].inlet_refs - 1
-            // NOTHING TO DO AT THE INLET'S ZERO, and the absence is design 230's
-            // close-drains-first rule made mechanical: what is staged was posted
-            // by a sender that is gone, and the OUTLET may still take every word
-            // of it. `Take` reads the column when the ring runs dry and answers
-            // `PeerClosed` then, which is drain-then-terminal in one comparison.
+            // Nothing to do for staged messages at the inlet's zero: they were
+            // posted by a sender that is gone, but the outlet may still take
+            // every word of them. `Take` reads the column when the ring runs
+            // dry and answers `PeerClosed` then (drain, then terminal). A claim
+            // also outlives the inlet it was posted through: a `PipeReply` is
+            // counted in its own right, rooted in the ring slot, so the client
+            // may drop its inlet and still resolve every claim it holds.
             //
-            // **AND A CLAIM OUTLIVES THE INLET IT WAS POSTED THROUGH** (sawos
-            // design 14 D-2). A `PipeReply` is a counted object in its own right,
-            // rooted in the ring slot rather than in the endpoint, so a client
-            // may drop its inlet and still resolve every claim it holds — which
-            // is what makes post-then-drop-the-inlet a legal shape rather than a
-            // way to lose an answer.
-            //
-            // **WHAT IS NEW IN M4 UNIT 3 IS THAT SOMEBODY MAY BE PARKED ON THE
-            // FAR END** (sawos design 15; `designs/010` ruling 2's peer-gone
-            // doctrine). The OUTLET's readable level is drain-then-terminal, so
-            // an inlet column reaching zero raises it — `PeerGone` once the ring
-            // is dry — and a server waiting for a message that can never come
-            // has to be TOLD rather than left blocked. Reentrancy: the delivery
-            // can detach and unref the outlet's own attachment, which can take
-            // that column to zero and free the connection under us; the
-            // `pipe_frees_now` below is guarded on `PIPES[slot].state` for
-            // exactly that, and its docstring already says the test is not
-            // defensive.
+            // Someone may be parked on the far end. The outlet's readable level
+            // is drain-then-terminal, so the inlet column reaching zero raises
+            // it (`PeerGone` once the ring is dry), and a server waiting for a
+            // message that can never come is told. Reentrancy: the delivery can
+            // detach and unref the outlet's own attachment, which can take that
+            // column to zero and free the connection under us. `pipe_frees_now`
+            // below is guarded on `PIPES[slot].state` for that.
             if PIPES[slot].inlet_refs == 0 {
                 notify_if_ready(WaitableKind.PipeOutlet, slot)
             }
@@ -363,71 +294,58 @@ func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
             if PIPES[slot].outlet_refs == 0 { return false }
             PIPES[slot].outlet_refs = PIPES[slot].outlet_refs - 1
             if PIPES[slot].outlet_refs == 0 {
-                // **AND THE STAGED EXCHANGES ARE SETTLED** (sawos design 13 D-2,
-                // as amended by design 14 D-2). Nobody can ever take again — a
-                // take needs an outlet handle and this column is zero — so a
-                // staged message has no future and its CLAIM is abandoned by the
-                // server. `pipe_drop_staged` empties the list and gives back
-                // every exchange nobody names; the ones a live claim still names
-                // stay, holding the `PeerClosed` their `Resolve` is owed.
+                // Nobody can take again (a take needs an outlet handle), so a
+                // staged message has no future and its claim is abandoned by
+                // the server. `pipe_drop_staged` empties the list and gives
+                // back every exchange nobody names; exchanges a live claim
+                // still names stay, holding the `PeerClosed` their `Resolve` is
+                // owed.
                 //
-                // **IT RUNS BEFORE THE NOTIFICATIONS, AND THE ORDER IS THE
-                // ITERATE-WHILE-REMOVING CARE THIS UNIT OWES** (sawos design 15,
-                // on `designs/010` ruling 9(a)'s census obligation). The drop
-                // walks a LIST threaded through `PIPE_NEXT`, and settling an
-                // exchange zeroes its link; a delivery inside that walk could
-                // settle a node the walk had not reached yet and truncate it.
-                // So the list walk finishes first, and the notifications go out
-                // afterwards as a bounded SCAN of the ring — which needs no list
-                // at all and therefore cannot be broken by what it delivers.
+                // This runs before the notifications. The drop walks a list
+                // threaded through `Exchange.next` and settling an exchange
+                // zeroes its link, so a delivery inside that walk could settle
+                // a node the walk has not reached and truncate it. The
+                // notifications that follow are a bounded scan of the ring,
+                // which holds no list position and so cannot be broken by what
+                // it delivers.
                 pipe_drop_staged(slot)
                 // The client's room-to-post level is now `PeerGone`: posting is
-                // over, which is a better thing to be woken for than space.
-                // **AND EVERY THREAD PARKED IN A FUSED `Call` FOR ROOM IS TOLD
-                // HERE** (sawos design 17): `notify_room` serves the parked
-                // callers before the subscription, and on this transition it
-                // serves ALL of them, because a poster whose server end has gone
-                // is waiting for something that can never happen — design 10
-                // ruling 2's doctrine, reaching the one park that is on no list.
+                // over, which is a better thing to wake for than space.
+                // `notify_room` serves parked fused `Call`s before the
+                // subscription and, on this transition, serves all of them: a
+                // poster whose server end has gone is waiting for something
+                // that can never happen.
                 notify_room(slot)
-                // ...and every claim still naming a staged message learns that
-                // its obligation can never be minted.
+                // Every claim still naming a staged message learns that its
+                // obligation can never be minted.
                 notify_claims(slot)
             }
             pipe_frees_now(slot)
         },
-        // **AN EXCHANGE IS THE SAME TWO-COLUMN OBJECT ONE LEVEL DOWN** (sawos
-        // design 14 D-2), so these two arms read exactly like the pair above
-        // them: each decrements ITS column and then answers about the WHOLE
-        // exchange. `exchange_can_settle` is that question — nobody names it, and
-        // nothing is owed — and it is where design 14's one asymmetry lives: a
-        // STAGED message is still owed to a live outlet whatever became of its
-        // claim, which is §2.1's TELL idiom.
+        // An exchange is the same two-column object one level down, so these
+        // arms read like the pair above: each decrements its column and answers
+        // about the whole exchange. `exchange_can_settle` is that question
+        // (nobody names it and nothing is owed), and it carries the one
+        // asymmetry: a staged message is still owed to a live outlet whatever
+        // became of its claim (spec §2.1's tell idiom).
         //
-        // WHAT REACHING ZERO MEANS IS THE OTHER HALF, and it is not written here
-        // because it is not a transition anybody has to record: a claim column at
-        // zero IS abandoned-by-client and a request column at zero on a `Taken`
-        // exchange IS abandoned-by-server, read off the counts by `Reply` and
-        // `Resolve` at the moment they need an answer. Design 13's "the two
-        // columns are the peer-gone state, and no flag beside them says so",
-        // inherited exactly.
+        // What reaching zero means is read off the counts, not recorded. A
+        // claim column at zero is abandoned-by-client, and a request column at
+        // zero on a `Taken` exchange is abandoned-by-server; `Reply` and
+        // `Resolve` read that when they need an answer. No flag sits beside the
+        // columns.
         //
-        // **AND EACH ZERO IS NOW ALSO NEWS FOR THE OTHER HALF** (sawos design
-        // 15). §2.1 ratifies both directions and unit 2 could only answer them
-        // when somebody asked; a waitable pair means somebody may be PARKED, so
-        // the transition is delivered here. The claim column at zero raises the
-        // obligation's ABANDONED level (the server's cancellation watcher); the
-        // obligation column at zero on a `Taken` exchange raises the claim's
-        // reply-ready level, carrying `PeerClosed`.
+        // Each zero is also news for the other half, since someone may be
+        // parked there. The claim column at zero raises the obligation's
+        // abandoned level (the server's cancellation watcher); the obligation
+        // column at zero on a `Taken` exchange raises the claim's reply-ready
+        // level, carrying `PeerClosed`.
         //
-        // REENTRANCY, stated at the site: a reply delivery DETACHES whatever
-        // mode it was attached under (ruling 11(b)), so `notify_if_ready` below
-        // can re-enter this very function on the other column, settle the
-        // exchange and cascade into `free_pipe`. That is safe because the
-        // predicate this arm ends with reads the exchange AFTERWARDS —
-        // `exchange_can_settle` answers `false` for a `Free` slot, which is the
-        // honest answer for "should the caller free it" once somebody else
-        // already has.
+        // Reentrancy: a reply delivery detaches whatever mode it was attached
+        // under, so `notify_if_ready` can re-enter this function on the other
+        // column, settle the exchange and cascade into `free_pipe`. That is
+        // safe because the arm ends by reading the exchange afterwards:
+        // `exchange_can_settle` answers false for a `Free` slot.
         case PipeReply -> {
             if EXCHANGES[slot].reply_refs == 0 { return false }
             EXCHANGES[slot].reply_refs = EXCHANGES[slot].reply_refs - 1
@@ -456,25 +374,20 @@ func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
     }
 }
 
-/// Give exchange `x`'s ring slot back — **and tell whoever is waiting for room
-/// on the connection's client end** (design 10 ruling 8; sawos design 15).
+/// Give exchange `x`'s ring slot back, and tell whoever is waiting for room on
+/// the connection's client end.
 ///
-/// **A SETTLE IS THE ONLY THING THAT MAKES A FULL RING NOT FULL**, so it is the
-/// only place the inlet's room level can rise, and design 10 ruling 8 exists
-/// precisely so a refused poster has something better than a poll loop to do
-/// about it. `exchange_settle` itself lives one module down with the storage it
-/// gives back, and this is the acting half wrapped around it — the same split
-/// this file's header describes for every other last rite.
+/// A settle is what makes a full ring not full, so it is where the inlet's
+/// room level rises (the other rise is the outlet column reaching zero, handled
+/// in `drop_reference`). `exchange_settle` lives in `objects` with the storage
+/// it gives back; this is the acting half around it.
 ///
-/// The `Live` test after the settle is not defensive: settling the LAST exchange
-/// of a connection whose two endpoint columns are already zero frees the row
-/// (`exchange_settle`'s own cascade), and a freed row has no level to raise.
-///
-/// **THE HELD HANDLES ARE RELEASED BEFORE THE LEVEL IS RAISED** (design 18's
-/// Sep-2 re-rule). A settling exchange may still be carrying a message nobody
-/// took, and the release is what gives those objects back; it runs first because
-/// it can itself free the connection, and asking `PIPES[c].state` afterwards is
-/// then the same honest question it already was.
+/// The held handles are released before the level is raised: a settling
+/// exchange may still carry a message nobody took, and releasing it can itself
+/// free the connection. The `Live` test afterwards is not defensive: settling
+/// the last exchange of a connection whose endpoint columns are already zero
+/// frees the row (`exchange_settle`'s cascade), and a freed row has no level to
+/// raise.
 func settle_exchange(x: Int) unsafe {
     let c = exchange_pipe(x)
     var held = exchange_settle(x)
@@ -485,80 +398,60 @@ func settle_exchange(x: Int) unsafe {
     }
 }
 
-/// Something no longer names object `slot` of kind `kind`. **ZERO FREES.**
+/// Something no longer names object `slot` of kind `kind`. Zero frees.
 ///
-/// The ordinary decrement, and the one every op uses: `release`, `give`'s
-/// caller-side unbind, `Waiter.Remove`'s detach, and the cascade out of a freed
-/// Waiter. It is a plain call because the kernel runs to completion — the free
-/// happens inside the syscall that dropped the last reference, so there is no
-/// window in which a zero-reference object is reachable.
+/// The ordinary decrement used by every op: `release`, `give`'s caller-side
+/// unbind, `Waiter.Remove`'s detach, and the cascade out of a freed Waiter. The
+/// kernel runs to completion, so the free happens inside the syscall that
+/// dropped the last reference and no zero-reference object is ever reachable.
 public(package) func unref_object(kind: ObjType, slot: Int) unsafe {
     if drop_reference(kind, slot) {
         free_object(kind, slot)
     }
 }
 
-/// The teardown's decrement: it counts, and it DOES NOT FREE.
+/// The teardown's decrement: it counts and does not free.
 ///
-/// **THE ASYMMETRY IS THE POINT, and it is what keeps design 7 D-5's authorized
-/// set the size D-5 says it is.** A teardown frees what a process OWNED, by
-/// ownership, in per-slab sweeps that also COUNT what they freed for the
-/// report; if the close-all above those sweeps freed by reference instead,
-/// every one of those counts would collapse and every teardown line in the
-/// suite would move — for objects that were being reclaimed either way, in the
-/// same function, microseconds apart. So the close-all keeps the ledger honest
-/// (a handle in a dying table really is one reference fewer, and objects
-/// OTHER processes own must see that) and the sweeps below it do the freeing
-/// they have always done.
+/// A teardown frees what a process owned, by ownership, in per-slab sweeps that
+/// also count what they freed for the teardown report. If the close-all above
+/// those sweeps freed by reference, those counts would collapse. So the
+/// close-all keeps the ledger honest (a handle in a dying table is one
+/// reference fewer, and objects other processes own must see that) and the
+/// sweeps, plus `reap_unreferenced`, do the freeing.
 ///
-/// For the dying process's OWN objects the two agree by construction: the sweep
-/// zeroes the slot, count included, so nothing can be left half-counted.
+/// For the dying process's own objects the two agree by construction: the sweep
+/// zeroes the slot, count included, so nothing is left half-counted.
 public(package) func unref_teardown(kind: ObjType, slot: Int) unsafe {
     let _ = drop_reference(kind, slot)
 }
 
-/// **REVOCATION: WAKE EVERY THREAD PARKED ON WAITER `w`, WITH `Revoked`**
-/// (sawos design 12, M4 unit 0; `designs/010` ruling 1). The second of the
-/// Waiter's two last rites: the cascade above it releases what this Waiter was
-/// WATCHING, and this answers everybody who was watching THROUGH it.
+/// Wake every thread parked on Waiter `w` with `Revoked`.
 ///
-/// **NO RECORD IS WRITTEN, and that is the whole difference from a delivery.**
-/// `wake_one_waiter` answers a parked `Wait` by copying a wait record into the
-/// caller's memory and THEN writing `Ok` into its frame, because something
-/// became ready and the record is what became ready. Nothing became ready here:
-/// there is no key, because the key names an attachment and the attachment list
-/// is going; no tag, because no waitable fired; no payload, because there is no
-/// value. So a revocation writes the STATUS REGISTER and nothing else, and the
-/// woken `wait()` returns `Err(Revoked)` with the caller's buffer exactly as it
-/// left it. Said as the pair it is: A DELIVERY COPIES OUT AND THEN ANSWERS `Ok`;
-/// A REVOCATION ANSWERS `Revoked` AND COPIES NOTHING.
+/// This is the second of the Waiter's two last rites: the cascade releases what
+/// the Waiter was watching, and this answers everybody who was watching through
+/// it.
 ///
-/// **THAT IS ALSO WHY THIS LIVES HERE AND NOT IN `wake`.** Delivery sits above
-/// the process teardown because it goes through `copy_out` — writing a process's
-/// memory is what fixes its altitude — and `refs` sits below. A revocation
-/// touches no process memory, so it needs neither the copy door nor that
-/// altitude: it needs a frame's status word and the ready queue, both of which
-/// are `threads`', below this file. The property that makes it not-a-delivery is
-/// exactly the property that lets it live beside the free it belongs to.
+/// No record is written, which is the difference from a delivery. A delivery
+/// copies a wait record out and then answers `Ok`; a revocation answers
+/// `Revoked` and copies nothing, since nothing became ready (no key, no tag, no
+/// payload). The woken `wait()` returns `Err(Revoked)` with the caller's buffer
+/// untouched, and `wait_buf` is cleared because it records where a record was
+/// going to go.
 ///
-/// **THE WALK IS THE WHOLE LIST, not a pop.** §2.2 lets several threads park on
-/// one Waiter, and a distribution is what a READINESS is — one ready handle
-/// feeds one waiter. A revocation is not a readiness: the thing every one of
-/// them is waiting on has ceased to exist, so every one of them is answered.
+/// It touches no process memory: it needs only a frame's status word and the
+/// ready queue, both in `threads`, so unlike delivery it needs no copy door.
 ///
-/// **IT IS PROCESS-BLIND, like every wake.** Whose threads are on the list is
-/// not this function's question — a Waiter handle can be minted, and a Waiter's
-/// blocked list is simply the threads that parked on it.
-///
-/// `wait_buf` is cleared because it is a promise this wake does not keep: it
-/// records where a record was going to go, and no record is going there.
+/// The walk covers the whole list, not a pop. §2.2 lets several threads park on
+/// one Waiter and a readiness feeds only one of them, but here the thing they
+/// all wait on has ceased to exist, so every one is answered. It is
+/// process-blind, like every wake.
 func revoke_blocked(w: Int) unsafe {
     var cur = WAITERS[w].blocked
     WAITERS[w].blocked = 0
     while cur != 0 {
         let slot = cur - 1
-        // Read the link BEFORE `ready_push` takes the field for the ready
-        // queue — a thread is on at most one list at a time, and this is the
+        // Read the link before `ready_push` takes the field for the ready
+        // queue: a thread is on at most one list at a time, and this is the
         // moment it changes lists.
         cur = THREADS[slot].link
         THREADS[slot].wait_buf = 0
@@ -571,38 +464,30 @@ func revoke_blocked(w: Int) unsafe {
 /// Give object `slot` of kind `kind` back to its slab, and run the kind's own
 /// last rites.
 ///
-/// **THE LAST RITES ARE WHAT MAKE THIS A MATRIX AND NOT A LOOP.** Three kinds
-/// have something to say to the machine or to the rest of the kernel on the way
-/// out, and the reasons are the teardown's own, arriving one object at a time
-/// instead of one process at a time:
+/// Three kinds have something to say to the machine or the rest of the kernel
+/// on the way out:
 ///
-///   - an INTERRUPT MASKS ITS LINE. A device the dropping process was driving
-///     may still be asserting, and an unmasked line with no object behind it
-///     would be taken, reported and masked once per fire forever. Masking is
-///     the kernel taking the line back — §9's handover run backwards — and it
-///     is what makes the line BINDABLE AGAIN, mid-life, which no release could
-///     achieve before this unit.
-///   - a TIMER REPROGRAMS THE COMPARATOR. A dropped armed deadline is one the
-///     kernel would otherwise keep waking itself for with nobody left to tell.
-///   - a WAITER DETACHES ITS LIST, which is the one cascade in the system —
-///     **AND WAKES WHAT IS PARKED ON IT** (sawos design 12, M4 unit 0). It is
-///     the one kind with two things to say, and they are said to opposite
-///     sides: the detach releases what this Waiter was WATCHING, the revocation
-///     answers everybody who was watching THROUGH it.
+///   - An Interrupt masks its line. An unmasked line with no object behind it
+///     would be taken, reported and masked once per fire forever. Masking also
+///     makes the line bindable again.
+///   - A Timer reprograms the comparator, so the kernel does not keep waking
+///     itself for a dropped deadline.
+///   - A Waiter detaches its attachment list (the one cascade in the system)
+///     and wakes what is parked on it. The detach releases what it was
+///     watching; the revocation answers everybody who was watching through it.
 ///
-/// And one kind has something deliberate NOT to do — see the `Mapping` arm.
+/// One kind deliberately does less: see the `Mapping` arm.
 ///
-/// THE QUOTA IS CREDITED AGAINST THE SLOT'S OWN `process` FIELD, which is
-/// creator-pays (D-3): whoever was charged for the object is who gets it back,
-/// whichever process happened to drop the last handle. `Mapping` and `Process`
-/// are the two arms with no credit here, each for its own stated reason.
+/// The quota is credited against the slot's own `process` field (creator pays):
+/// whoever was charged gets it back, whichever process dropped the last handle.
+/// `Mapping` and `Process` have no credit here, each for the reason given in
+/// its arm.
 public(package) func free_object(kind: ObjType, slot: Int) unsafe {
     match kind {
         case Event -> {
-            // AN ATTACHED EVENT CANNOT BE HERE — an attachment is a counted
-            // reference (D-1's table), so reaching zero means nothing is
-            // watching. The test is the invariant written down: if it ever
-            // fired, the count and the wait machinery would have disagreed.
+            // An attached event cannot be here: an attachment is a counted
+            // reference, so zero means nothing is watching. If this fires, the
+            // count and the wait machinery disagree.
             if EVENTS[slot].attachment != 0 {
                 fatal_kernel("an event reached zero references while attached",
                              slot as UInt)
@@ -614,12 +499,11 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
             quota_credit(owner, QuotaKind.Event)
         },
         case Waiter -> {
-            // **THE ONE CASCADE.** A Waiter's attachments are references it
-            // HOLDS, so its death releases them — and each release may take a
-            // waitable to zero, which frees and credits through this same
-            // function. The list is walked whole rather than through
-            // `detach_attachment`, because there is no list left to unlink
-            // from: the Waiter is going.
+            // The one cascade. A Waiter's attachments are references it holds,
+            // so its death releases them, and each release may take a waitable
+            // to zero, which frees and credits through this function. The list
+            // is walked whole rather than through `detach_attachment`, because
+            // there is no list left to unlink from.
             var cur = WAITERS[slot].attached
             while cur != 0 {
                 let a = cur - 1
@@ -635,43 +519,28 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
                 cur = next
             }
 
-            // **AND EVERY THREAD PARKED ON IT IS WOKEN, WITH `Revoked`** (sawos
-            // design 12, M4 unit 0; `designs/010` rulings 1 and 2 — THE
-            // PEER-GONE DOCTRINE, of which this is the first instance).
-            // NOTHING PARKED CAN BE SILENTLY DOOMED: what these threads were
-            // waiting on has ceased to exist, so they are TOLD, in the status
-            // register of the very syscall that parked them, and
-            // `revoke_blocked`'s docstring carries the no-record contrast that
-            // makes this a revocation rather than a delivery.
+            // Every thread parked on the Waiter is woken with `Revoked`: what
+            // they waited on has ceased to exist, so they are told, in the
+            // status of the syscall that parked them, rather than left blocked.
+            // `revoke_blocked` documents why this is a revocation and not a
+            // delivery. Don't count a parked thread as a reference to keep the
+            // Waiter alive: that makes the drop silent and turns a handleable
+            // error into a hang.
             //
-            // It supersedes the recorded "legal-but-doomed" stance this arm
-            // carried through M3 — a parked thread left `Blocked` forever for
-            // the deadlock report to name. The alternative the ruling weighed
-            // and REJECTED was a husk: count a parked thread as a reference so
-            // the Waiter never reaches zero. That keeps the thread alive and
-            // makes the drop SILENT, which turns an error a program can handle
-            // into a hang somebody has to infer.
+            // The count is the gate, not the release: a release with a minted
+            // sibling still live never reaches this function, so it wakes
+            // nobody. Only the last name going is the object ceasing to exist.
             //
-            // THE COUNT IS THE GATE, NOT THE RELEASE, and that distinction is
-            // what makes this revocation rather than any-release: a release
-            // with a minted sibling still live never reaches this function at
-            // all, so it frees nothing and wakes nobody. Only the LAST name
-            // going is the object ceasing to exist, and only that is news.
-            //
-            // It runs AFTER the cascade and BEFORE the slot clears, which is
-            // free of consequence in both directions — the cascade reads no
-            // thread and the wake reads no attachment — and reads in the order
-            // the arm is about: release what this Waiter held, answer who held
-            // it, then hand the slot back.
+            // This runs after the cascade and before the slot clears. The order
+            // is not load-bearing (the cascade reads no thread and the wake
+            // reads no attachment); it reads as release what the Waiter held,
+            // answer who held it, hand the slot back.
             revoke_blocked(slot)
 
             let owner = WAITERS[slot].process
-            // A REUSED SLOT STARTS WITH AN EMPTY BLOCKED LIST, which is what
-            // this literal says and what keeps the next Waiter in this slot
-            // from inheriting anybody. It was the half of the old stranding
-            // paragraph that was about the SLOT rather than about the thread,
-            // and it survives the ruling intact — the wake above is what makes
-            // the list empty honestly rather than merely emptily.
+            // A reused slot starts with an empty blocked list, so the next
+            // Waiter in this slot cannot inherit any thread. The wake above is
+            // what makes the list honestly empty.
             WAITERS[slot] = WaiterSlot(state: SlotState.Free, process: 0,
                                        attached: 0, blocked: 0, refs: 0)
             quota_credit(owner, QuotaKind.Waiter)
@@ -702,115 +571,86 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
             quota_credit(owner, QuotaKind.Timer)
         },
         case Memory -> {
-            // **THE RANGE GOES BACK, AND THE SLOT GOES WITH IT — AT THE SECOND
-            // ZERO** (sawos design 28; design 25 D-5, ruled). What stood here
-            // was "the slot comes back; the range goes nowhere": a front-cut
-            // parent could not absorb an arbitrary hole, so the bytes stayed
-            // spent (design 6 D-2, §2.5's narrowing). There is a pool now, and
-            // the release is one call because the CONDITION is not this
-            // function's to decide.
-            //
-            // **THIS ARM NO LONGER ALWAYS FREES**, which is the one thing to
-            // know about it. Reaching `free_object` means the HANDLE count hit
-            // zero; §2.5 frees a region only when the last reference of EITHER
+            // The range goes back to the pool with the slot, but only at the
+            // second zero. Reaching `free_object` means the handle count hit
+            // zero; §2.5 frees a region only when the last reference of either
             // kind drops, and an installed grant row is the other kind. So a
-            // mapped-but-unreferenced region stays Live here — a husk that
-            // still holds its slot and its charge because a domain is still
-            // granting its bytes — and `unref_region_row` frees it when the
-            // last row goes. The two callers are indifferent: `unref_object`
-            // asks nothing about what happened, and `reap_unreferenced`'s
-            // "give back what nobody names" is exactly the question this
-            // answers, because a row is a namer.
+            // mapped region with no handles stays Live here, holding its slot
+            // and charge while a domain still grants its bytes, and
+            // `unref_region_row` frees it when the last row goes. The callers
+            // do not care: `unref_object` asks nothing about the outcome, and
+            // `reap_unreferenced`'s "give back what nobody names" is the
+            // question this answers, since a row is a namer.
             memory_release_if_idle(slot)
         },
         case IoMemory -> {
-            // MMIO IS PINNED, so this touches no hardware whatever: the
-            // registers were there before the window and will be there after
-            // it. What actually revokes a driver's reach is the ROW, and a row
-            // is a Mapping.
+            // MMIO is pinned, so this touches no hardware. What actually
+            // revokes a driver's reach is the row, and a row is a Mapping.
             let owner = IOMEMORIES[slot].process
             IOMEMORIES[slot] = IoMemorySlot(state: SlotState.Free, process: 0,
                                             base: 0, len: 0, refs: 0)
             quota_credit(owner, QuotaKind.IoMemory)
         },
         case Mapping -> {
-            // **THE SLOT FREES AND THE ROW STAYS** (sawos design 7 D-2), and
-            // this arm is §2.5's own sentence made mechanical rather than an
-            // omission. A Mapping OWNS its row; the row does not own the
-            // Mapping. So a mapped-but-unreferenced Mapping — every handle
-            // released, the grant still installed — is exactly §2.5's
-            // "dropped without unmap = permanent, safe-but-leaked", and the row
-            // becomes unremovable until the TARGET's teardown, which is what
-            // "leaked" has always meant. Removing it here would be a
-            // revocation nobody asked for: the process whose domain carries it
-            // is a different process from the one that dropped the handle.
+            // The slot frees and the row stays; this is §2.5 made mechanical,
+            // not an omission. A Mapping owns its row; the row does not own the
+            // Mapping. A Mapping with every handle released and the grant still
+            // installed is §2.5's "dropped without unmap = permanent,
+            // safe-but-leaked": the row stays unremovable until the target's
+            // teardown. Removing it here would be a revocation nobody asked
+            // for, in a different process from the one that dropped the handle.
             //
-            // NO QUOTA IS CREDITED HERE, and that is the consequence of the row
-            // being what the mapping quota counts (see `QuotaKind.Mapping`).
-            // The charge follows the ROW: `Unmap` credits it, the target's
-            // teardown zeroes it, and a leaked row stays charged for exactly as
-            // long as it stays installed — which is what keeps `used` and
+            // No quota is credited because the mapping quota counts the row
+            // (see `QuotaKind.Mapping`). The charge follows the row: `Unmap`
+            // credits it, the target's teardown zeroes it, and a leaked row
+            // stays charged while installed. That keeps `quota_used` and
             // `grant_count` in step and `install_row`'s `fatal` unreachable.
             MAPPINGS[slot] = MappingSlot(state: SlotState.Free, process: 0,
                                          target: 0, row: NO_ROW, refs: 0)
         },
         case Process -> {
-            // A PROCESS IS A WAITABLE SINCE M3 UNIT 5.5, so it joins the three
-            // arms above in asserting the invariant an attachment-as-reference
-            // buys (sawos design 8): reaching zero means nothing is watching,
-            // because a watcher IS a reference. The test is the invariant
-            // written down, and it is what makes attach-after-death sound
-            // against the reclaim below — if it ever fired, a supervisor would
-            // be parked on a slot the kernel had already given away.
+            // A process is a waitable, so reaching zero asserts the same
+            // invariant as the arms above: nothing is watching, because a
+            // watcher is a reference. This is what makes attach-after-death
+            // sound against the reclaim below; if it fired, a supervisor would
+            // be parked on a slot already given away.
             if PROCESSES[slot].attachment != 0 {
                 fatal_kernel("a process reached zero references while attached",
                              slot as UInt)
             }
-            // A LIVE PROCESS IS NOT FREED BY LOSING ITS LAST HANDLE — it is
-            // still running, and its slot is what it is running in. Only a
-            // `Gone` slot's last reader going makes the §8 status word
-            // unreadable, and `reclaim_process_slot` is that rule, unchanged
-            // from design 3 D-3 except that it now READS the count this unit
-            // maintains instead of walking every table to recompute it.
+            // A live process is not freed by losing its last handle: it is
+            // still running in its slot. Only a `Gone` slot's last reader going
+            // makes the §8 status word unreadable, and `reclaim_process_slot`
+            // implements that rule by reading this count.
             //
-            // The ledger is not credited either: the teardown already zeroed
-            // this slot's rows, and a process is not something another process
-            // is charged for.
+            // The ledger is not credited: the teardown already zeroed this
+            // slot's rows, and a process is not something another process is
+            // charged for.
             reclaim_process_slot(slot)
         },
-        // **BOTH ENDS ARE GONE, SO THE CONNECTION IS** (sawos design 13 D-1).
-        // The two arms are one act written twice, and they have to be: the
-        // matrix is over `ObjType`, and reaching this function through EITHER
-        // kind means `drop_reference` already found both columns at zero. Which
-        // end happened to be released last is not a fact anything downstream
-        // has any use for.
+        // Both ends are gone, so the connection is too. The two arms are one
+        // act written twice, because the matrix is over `ObjType`: either kind
+        // reaching here means `drop_reference` found both columns at zero, and
+        // which end went last does not matter.
         //
-        // The staging needs nothing said to it here. Either the outlet went
-        // first and `drop_reference` dropped what was staged at that transition,
-        // or the inlet went first and the outlet drained (or declined to) before
-        // its own last handle went — and in both cases the ring is plain storage
-        // a later `pipe_create` overwrites. Bytes are not a resource this slab
-        // hands back.
+        // Staging needs nothing here. Either the outlet went first and
+        // `drop_reference` dropped what was staged then, or the inlet went
+        // first and the outlet drained (or declined to) before its own last
+        // handle went. The ring is plain storage that a later `pipe_create`
+        // overwrites.
         case PipeInlet -> { free_pipe(slot) },
         case PipeOutlet -> { free_pipe(slot) },
-        // **AND THE ONE-SHOT PAIR IS THE SAME ACT WRITTEN TWICE AGAIN** (sawos
-        // design 14 D-1/D-2). Reaching this function through EITHER one-shot kind
-        // means `drop_reference` already found both of the exchange's columns at
-        // zero with nothing owed, so which half happened to go last is not a fact
-        // anything downstream has a use for.
+        // The one-shot pair is the same act written twice again: either kind
+        // reaching here means both of the exchange's columns are zero with
+        // nothing owed.
         //
-        // NO QUOTA IS CREDITED HERE, and that is D-1's ruling rather than an
-        // omission: a claim mints NO quota row. The scarce thing an exchange
-        // occupies is a ring slot, and the ring is part of the CONNECTION —
-        // charged once at `PipeCreate`, credited once when the row goes back. A
-        // per-exchange row would charge a client twice for the same kilobytes and
-        // would make design 10 ruling 4's "zero one-shot quota rows on the fast
-        // path" a difference in kind rather than one of handle traffic.
+        // No quota is credited: a claim mints no quota row. The scarce thing an
+        // exchange occupies is a ring slot, which belongs to the connection,
+        // charged once at `PipeCreate` and credited when the row goes back.
         //
-        // The settle may CASCADE into freeing the connection — the ring slot is
-        // storage inside the `PIPES` row — and that cascade terminates because an
-        // exchange references its connection and a connection references no
-        // exchange.
+        // The settle may cascade into freeing the connection (the ring slot is
+        // storage inside the `PIPES` row). That terminates because an exchange
+        // references its connection and a connection references no exchange.
         case PipeReply -> { settle_exchange(slot) },
         case PipeRequest -> { settle_exchange(slot) },
         case System -> {
@@ -831,54 +671,34 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
 }
 
 // =============================================================================
-// THE TEARDOWN'S WRITE-OFF — what replaced the by-charged-process force-free
-// (spec §2.1; `designs/010` ruling 10, landed by sawos design 14 D-3)
+// Teardown write-off: reaping what nobody names (spec §2.9)
 // =============================================================================
 //
-// **REFERENCES GOVERN LIFETIME, SO A TEARDOWN NEVER FORCE-FREES A COUNTED
-// KIND.** `end_process` used to sweep the Memory, IoMemory and Pipe slabs by
-// `process == p` and zero every slot the dying process had been CHARGED for —
-// a pre-refcount survivor, from the units that had no count to consult — and
-// design 13's finding 2 named the hazard it leaves: a connection whose creator
-// dies while a PEER still holds an end has its row freed under that holder,
-// staged messages and all. Ruling 10 takes the fix that deletes bookkeeping
-// rather than adding it. A slot outlives its creator for exactly as long as
-// anybody holds a reference; possession keeps alive, which is the capability
-// model's own answer.
+// References govern lifetime, so a teardown never force-frees a counted kind
+// that other processes may still reference (regions, IO windows, pipe
+// connections): a slot outlives its creator for as long as anybody holds a
+// reference. Freeing by `process == p` would free a connection under a peer
+// that still holds an end.
 //
-// **WHAT IS LEFT IS NOT A SWEEP BY OWNERSHIP BUT A REAP OF WHAT NOBODY NAMES**,
-// and the reason it cannot simply be deleted is design 7 D-5's deliberate
-// asymmetry one function up: the close-all counts WITHOUT freeing
-// (`unref_teardown`), because the per-slab sweeps that DO free are also what
-// count for the teardown report. Delete the three silent sweeps outright and a
-// slot the dying process held the last handle onto reaches zero references with
-// nothing left to free it — a leak, not a write-off. So the CONDITION changes
-// from "charged to this process" to "named by nobody", which is ruling 10's
-// sentence made mechanical: the force-free is gone, and the reclamation the
-// close-all defers still happens.
+// The close-all counts without freeing (`unref_teardown`), so a slot whose last
+// handle the dying process held reaches zero references with nothing to free
+// it. `reap_unreferenced` therefore frees by condition, "named by nobody",
+// through `free_object`, so every kind's last rites and quota credit run
+// exactly as on the ordinary release path.
 //
-// It frees through `free_object`, so every kind's own last rites and its quota
-// CREDIT run exactly as they do on the ordinary release path — which is the
-// other half of what the old sweeps got wrong. They zeroed a slot another
-// process had been charged for and credited nobody.
-//
-// **THE OTHER FIVE SWEEPS STAY, and Mapping stays with them.** Threads, Events,
-// Waiters, Interrupts and Timers are counted for the teardown report, and D-5
-// authorises no change to those numbers. A Mapping is a counted kind whose sweep
-// looks like the three deleted ones and is NOT one: `mapping_rights()` withholds
-// `Transfer`, so a Mapping handle cannot leave the process that owns it and a
-// sibling cannot outlive its owner — the hazard ruling 10 names cannot arise —
-// and its second arm (clearing the row of a mapping whose TARGET died) is not a
-// free at all.
+// The Thread, Event, Waiter, Interrupt and Timer sweeps in `end_process` remain
+// because they feed the teardown report. Mapping's sweep is not a force-free
+// either: `mapping_rights()` withholds `Transfer`, so a Mapping handle cannot
+// outlive its owner's process, and its second arm (clearing the row of a
+// mapping whose target died) is not a free.
 
-/// Reap every Memory, IoMemory, exchange and Pipe connection that NOTHING NAMES
-/// any more. Called by `end_process` after the close-all.
+/// Reap every Memory, IoMemory, exchange and Pipe connection that nothing
+/// names. Called by `end_process` after the close-all.
 ///
-/// The order is inner-to-outer: an exchange lives inside a connection's row, so
-/// the exchanges are given back first and the connections they were in can then
-/// answer `pipe_idle` honestly. (`exchange_settle` cascades into `free_pipe`
-/// itself, so the second loop is what catches a connection with no exchanges at
-/// all — the ordinary case.)
+/// Inner to outer: an exchange lives inside a connection's row, so exchanges
+/// are given back first and the connections can then answer `pipe_idle`
+/// honestly. `exchange_settle` cascades into `free_pipe` itself, so the last
+/// loop catches connections with no exchanges (the ordinary case).
 public(package) func reap_unreferenced() unsafe {
     var m: Int = 0
     while m < MEMORIES.capacity() {
@@ -905,10 +725,10 @@ public(package) func reap_unreferenced() unsafe {
     var x: Int = 0
     while x < EXCHANGES.capacity() {
         if exchange_can_settle(x) {
-            // AND ITS HELD HANDLES GO BACK WITH IT (design 18's Sep-2 re-rule).
-            // A reap can free the very objects a LATER row of this scan is
-            // about, which is why the scan is a scan and not a list: it reads
-            // each slot's own state at the moment it reaches it.
+            // Its held handles go back with it. A reap can free the very
+            // objects a later row of this scan concerns, which is why this is a
+            // scan and not a list: it reads each slot's state when it reaches
+            // it.
             var held = exchange_settle(x)
             release_staged(&held)
         }
@@ -925,25 +745,17 @@ public(package) func reap_unreferenced() unsafe {
 /// The wait machinery's kinds, translated into the object kinds this matrix is
 /// written over.
 ///
-/// A SECOND ENUM MEETS THE FIRST HERE, and nowhere else. `WaitableKind` exists
-/// because attaching also spends a right and which enum's bits that is depends
-/// on the kind (`waitables`' header); `ObjType` is what a handle entry carries.
-/// One translation written out beats a cast between two enums that happen to be
-/// numbered differently, and it is total, so the third waitable kind cost it
-/// one line — and so did the FOURTH (sawos design 8), which is where the two
-/// enums genuinely stop being numbered alike: `WaitableKind.Process` is 3 and
-/// `ObjType.Process` is not.
+/// `WaitableKind` exists because attaching spends a right and which enum's bits
+/// that is depends on the kind (see `waitables`' header); `ObjType` is what a
+/// handle entry carries. The enums are numbered differently on purpose
+/// (`WaitableKind.Process` is 3, `ObjType.Process` is not), so this is an
+/// explicit total translation rather than a cast.
 func waitable_obj_type(kind: WaitableKind) -> ObjType {
     match kind {
         case Event -> ObjType.Event,
         case Interrupt -> ObjType.Interrupt,
         case Timer -> ObjType.Timer,
         case Process -> ObjType.Process,
-        // **AND THE FOUR PIPE KINDS COST IT FOUR LINES** (sawos design 15),
-        // which is what the translation being TOTAL is for: the two enums are
-        // numbered differently on purpose — `WaitableKind` names only what can
-        // be attached — and a cast between them would have been a coincidence
-        // that stopped being true at exactly this unit.
         case PipeOutlet -> ObjType.PipeOutlet,
         case PipeInlet -> ObjType.PipeInlet,
         case PipeReply -> ObjType.PipeReply,
@@ -951,7 +763,7 @@ func waitable_obj_type(kind: WaitableKind) -> ObjType {
     }
 }
 
-/// An attachment now names this waitable (§2.2; sawos design 7 D-1).
+/// An attachment now names this waitable (§2.2).
 public(package) func ref_waitable(kind: WaitableKind, slot: Int) unsafe {
     ref_object(waitable_obj_type(kind), slot)
 }
@@ -961,103 +773,82 @@ public(package) func unref_waitable(kind: WaitableKind, slot: Int) unsafe {
     unref_object(waitable_obj_type(kind), slot)
 }
 
-/// The TEARDOWN's version: it counts, and it DOES NOT FREE — `unref_teardown`
-/// reached through the wait machinery's own enum.
+/// The teardown's version: it counts and does not free (`unref_teardown`,
+/// reached through the wait machinery's own enum).
 ///
-/// **IT EXISTS BECAUSE M3 UNIT 5.5 MADE AN ATTACHMENT ABLE TO CROSS PROCESSES**
-/// (sawos design 8). Until a Process was waitable, every attachment joined a
-/// Waiter and a waitable of the SAME process, so the teardown's attachment
-/// sweep could free both ends and be done; a supervisor's attachment onto a
-/// CHILD's Process slot is the first pair that spans two processes, and the
-/// dying supervisor's side owes the other side a decrement exactly as the
-/// close-all above it owes one for a handle onto somebody else's object. Same
-/// asymmetry, same reason: the ledger stays honest and the per-slab sweeps keep
-/// doing the freeing they have always done.
+/// An attachment can span processes (a supervisor's attachment onto a child's
+/// Process slot), so the dying supervisor's side owes the other side a
+/// decrement, as the close-all does for a handle onto someone else's object.
+/// Same asymmetry and reason as `unref_teardown`: the ledger stays honest and
+/// the per-slab sweeps do the freeing.
 public(package) func unref_waitable_teardown(kind: WaitableKind, slot: Int) unsafe {
     unref_teardown(waitable_obj_type(kind), slot)
 }
 
 // =============================================================================
-// DELIVERY — readiness turning into a woken thread (spec §2.2), and the
-// attachment lifetimes that ride on it (`designs/010` rulings 9 and 11(b))
+// Delivery: readiness turning into a woken thread (spec §2.2), and the
+// attachment lifetimes that ride on it
 // =============================================================================
 //
-// **THIS WAS `kcore.wake` UNTIL M4 UNIT 3** (sawos design 15), and the file
-// header carries the argument for why it is here instead: a delivery drops a
-// reference and a dropped reference delivers, so the two are one act and a
-// module boundary between them would be the cycle DF-232e does not diagnose.
-//
-// Three funnels, one act, exactly as before: `notify_ready` is the only place a
-// ready waitable reaches its Waiter, `wake_one_waiter` hands the answer to at
-// most one parked thread, and `deliver_attachment` is where the answer is READ,
-// the READINESS SPENT and — since ruling 9(b) — THE ATTACHMENT RELEASED, all in
-// one step, so no kind is drained on one path and not the other.
+// Three funnels, one act. `notify_ready` is the only place a ready waitable
+// reaches its Waiter, `wake_one_waiter` hands the answer to at most one parked
+// thread, and `deliver_attachment` is where the answer is read, the readiness
+// spent and the attachment released if the delivery ended it, all in one step
+// so no kind is drained on one path and not the other.
 
 // =============================================================================
-// THE RENDEZVOUS (spec §2.1's "handles enter the receiver's table only at
-// receive"; `designs/010` ruling 5 AS RE-RULED Sep 2 — TAKE-AT-POST; sawos
-// design 18)
+// The rendezvous (spec §2.1: handles enter the receiver's table only at
+// receive)
 // =============================================================================
 //
-// **A SEND IS A HALF-MOVE AND A RECEIVE IS THE OTHER HALF.** `move_entry` below
-// is still the courier op's one act — unbind here, bind there, in one call — and
-// a message now performs the same act in TWO STEPS with the kernel holding the
-// reference in between: `hold_staged` unbinds the sender's entries at the post,
-// and `mint_staged` binds the receiver's at the take or the delivery. Every rule
-// the courier obeys is obeyed twice over, including the one that matters:
-// **THE COUNT GOES UP BEFORE IT GOES DOWN**, per handle, at both halves.
+// A send is a half-move and a receive is the other half. `move_entry` is the
+// courier op's single act (unbind here, bind there). A message does the same in
+// two steps with the kernel holding the reference between them: `hold_staged`
+// unbinds the sender's entries at the post, and `mint_staged` binds the
+// receiver's at the take or the delivery. At both halves the count goes up
+// before it goes down, per handle.
 //
-// **THE CHARGE MOVES AT THE POST, AND NOBODY PAYS IN BETWEEN.** The unbind
-// credits the sender's `QuotaKind.Handle` row (that is what `unbind_handle` does
-// at the one place a binding is destroyed) and the mint charges the taker's. So
-// a staged handle is charged to nobody — design 14 D-4's orphan accounting at a
-// second kind — and `kcore.objects`' ledger header carries the bound that makes
-// that safe.
+// The charge moves at the post, and nobody pays in between. The unbind credits
+// the sender's `QuotaKind.Handle` row (`unbind_handle` does this wherever a
+// binding is destroyed) and the mint charges the taker's, so a staged handle is
+// charged to nobody. `kcore.objects`' ledger header carries the bound that
+// makes that safe.
 //
-// **THREE UNWIND ARMS, AND ALL THREE ARE RELEASES NOW.** Under sender-keeps
-// there was nothing to unwind, which was the old ruling's third consequence;
-// take-at-post trades that sentence for a guarantee and pays for it with three
-// sites, every one of which routes through `take_staged` + `release_staged`:
+// A staged message that never arrives is unwound by releasing its references
+// (`take_staged` then `release_staged`) at these sites:
 //
-//   - **the outlet's zero-arm** (`pipe_drop_staged`, which moved into this file
-//     for exactly that reason): nobody can ever take, so what is staged is
-//     dropped and its references go back;
-//   - **`exchange_settle`**, wherever it is reached from — it collects the batch
-//     and answers with it, and each of its three callers releases;
-//   - and NOT the inlet's zero-arm, which is the one that must NOT release:
-//     close-drains-first (§2.1, design 230's rule one level down) says a staged
-//     message survives the client's departure and is still owed to a live
-//     outlet, so its handles stay held and arrive at the take exactly as they
-//     would have. A dead sender changes nothing about a message it already
-//     handed over.
+//   - the outlet's zero-arm (`pipe_drop_staged`): nobody can ever take, so what
+//     is staged is dropped and its references go back;
+//   - `exchange_settle`, from each of its callers: it collects the batch and
+//     answers with it, and the caller releases;
+//   - not the inlet's zero-arm, which must not release: a staged message
+//     survives the client's departure and is still owed to a live outlet
+//     (spec §2.1), so its handles stay held and arrive at the take as usual.
 //
-// **REENTRANCY, STATED AT THE SITE.** A release can take an object to zero, and
-// that object can be a pipe endpoint or a one-shot pair — so a release out of an
-// unwind arm can re-enter `pipe_drop_staged` and `exchange_settle` on ANOTHER
-// exchange. Two things make that safe and neither is a check: the batch is
-// COLLECTED before any release runs (so the ledger a re-entry reads is already
-// consistent, and `exchange_can_settle` answers `false` for the `Free` slot the
-// outer call left behind), and the recursion cannot cycle, because a reference
-// held by exchange x's message keeps y's column NON-ZERO — so y cannot be the
-// one settling while x holds it. Depth is bounded by the exchange count, which
-// is a fixed slab dimension.
+// Reentrancy: a release can take an object to zero, and that object can be a
+// pipe endpoint or a one-shot pair, so a release can re-enter
+// `pipe_drop_staged` and `exchange_settle` on another exchange. Two things make
+// that safe. The batch is collected before any release runs, so the ledger a
+// re-entry reads is consistent (and `exchange_can_settle` answers false for the
+// `Free` slot the outer call left behind). And the recursion cannot cycle: a
+// reference held by exchange x's message keeps y's column non-zero, so y cannot
+// be settling while x holds it. Depth is bounded by the exchange count, a fixed
+// slab dimension.
 
-/// The handle slots a rendezvous produced in the TAKER's table: one kind byte
+/// The handle slots a rendezvous produced in the taker's table: one kind byte
 /// and one word per message slot, both zero for an empty or a dead one.
 public(package) struct StagedHandles {
     public(package) kinds: [UInt8; PIPE_MSG_HANDLES],
     public(package) words: [UInt; PIPE_MSG_HANDLES],
 }
 
-/// The FIXED PREFIX of a delivered-message record, in kernel memory — everything
+/// The fixed prefix of a delivered-message record, in kernel memory: everything
 /// `sosabi`'s `PipeMsgRecord` holds except the body.
 ///
-/// It exists for `WaitPrefix`'s reason and is pinned the same way: the kernel
-/// builds the prefix on its own stack and the body is a SECOND copy straight out
-/// of the ring slot, so a short message never costs a 128-byte memset in the
-/// kernel or a 128-byte copy into the caller. Declaration order IS the layout
-/// (design 58), and the assert is what says this description and `sosabi`'s are
-/// one.
+/// The kernel builds the prefix on its own stack and the body is a second copy
+/// straight out of the ring slot, so a short message costs no full-body memset
+/// or copy. Declaration order is the layout, and the assert below pins this
+/// description to `sosabi`'s.
 public(package) struct PipeMsgPrefix {
     public(package) meta: PipeMsgMeta,
     public(package) handles: [UInt; PIPE_MSG_HANDLES],
@@ -1075,9 +866,9 @@ public(package) struct PipeTakePrefix {
 static_assert(sizeof<PipeTakePrefix>() == sizeof<PipeTakeRecord>() - PIPE_BODY_BYTES,
               "the kernel's take prefix must be exactly the record sosabi publishes, less its body")
 
-/// Assemble a message prefix out of a length and a completed rendezvous. The one
-/// place the two halves of a delivered message are put together, so a take, a
-/// resolve and a fused call's reply cannot disagree about the layout.
+/// Assemble a message prefix out of a length and a completed rendezvous. The
+/// one place the two halves of a delivered message are put together, so a take,
+/// a resolve and a fused call's reply cannot disagree about the layout.
 public(package) func msg_prefix(len: UInt, moved: &StagedHandles) -> PipeMsgPrefix {
     var rec = PipeMsgPrefix(meta: PipeMsgMeta(len: len as UInt8,
                                               kinds: [0; PIPE_MSG_HANDLES]),
@@ -1091,37 +882,31 @@ public(package) func msg_prefix(len: UInt, moved: &StagedHandles) -> PipeMsgPref
     rec
 }
 
-/// How many bytes of a message record a delivery of this shape writes — the
+/// How many bytes of a message record a delivery of this shape writes: the
 /// contiguous prefix ending at the body's length.
 ///
-/// **A HANDLES-ONLY MESSAGE PAYS FOR NO PART OF THE BODY REGION**, which is what
-/// handles-before-bytes bought (user-ruled Sep 2): the variable part is the TAIL,
-/// so stopping early is an arithmetic rather than a hole to skip over.
+/// A handles-only message pays for no part of the body region, because the
+/// variable part is the tail.
 public(package) func msg_record_span(len: UInt) -> UInt {
     (pipe_msg_body_offset() as UInt) + len
 }
 
-/// **MOVE ONE HANDLE ENTRY FROM `from`'s TABLE TO `to`'s**, narrowed by `keep`.
+/// Move one handle entry from `from`'s table to `to`'s, narrowed by `keep`.
 /// Answers the receiver-side word, or `NO_HANDLE` when the receiving table had
-/// no room — in which case NOTHING happened and the giver's entry is untouched.
+/// no room, in which case nothing happened and the giver's entry is untouched.
 ///
-/// **THE COUNT GOES UP BEFORE IT GOES DOWN, AND THE ORDER IS LOAD-BEARING**
-/// (sawos design 7 D-1). A move leaves the object's reference count exactly as
-/// it was, but it is written as an increment and then a decrement rather than as
-/// nothing at all, because "every bind refs, every unbind unrefs" is a rule with
-/// no exceptions or it is not a rule. The other order would take the count to
-/// zero between two lines of one op and FREE the object being handed over.
+/// The count goes up before it goes down, and the order is load-bearing. A move
+/// leaves the reference count as it was, but it is written as an increment then
+/// a decrement so that "every bind refs, every unbind unrefs" has no
+/// exceptions. The other order would take the count to zero between two lines
+/// of one op and free the object being handed over.
 ///
-/// `keep` is `MINT_OP`'s mask and it composes for free: the receiving entry
-/// carries `source & keep`, so all-ones is design 4 D-1's "rights verbatim" and
-/// anything narrower is the attenuate-at-give the courier op grew in M4 unit 4.
+/// `keep` is `MINT_OP`'s mask: the receiving entry carries `source & keep`, so
+/// all-ones is rights verbatim and anything narrower attenuates at give.
 ///
-/// **ITS ONE CALLER IS `ProcessOp.Give`.** A message performs the same move in
-/// two halves with the kernel holding the reference in between — `hold_staged`
-/// and `mint_staged` below — because a send and a receive are separated in time
-/// and `Give` is one op. The two share this function's RULES rather than its
-/// body, which is the honest amount of sharing between a transfer that happens
-/// at once and one that happens across a park.
+/// This is `ProcessOp.Give`'s act. A message performs the same move in two
+/// halves (`hold_staged`, `mint_staged`) because a send and a receive are
+/// separated in time; the two share this function's rules, not its body.
 public(package) func move_entry(from: Int, to: Int, word: UInt,
                                 entry: HandleEntry, keep: UInt32) unsafe -> UInt {
     let given = mint_handle(to, entry.obj_type, entry.rights & keep, entry.target)
@@ -1134,48 +919,39 @@ public(package) func move_entry(from: Int, to: Int, word: UInt,
     given
 }
 
-/// **TAKE `p`'s HANDLE ENTRIES AND HOLD THEM AGAINST EXCHANGE `x`** — the FIRST
-/// half of the rendezvous move (the Sep-2 re-rule of ruling 5).
+/// Take `p`'s handle entries and hold them against exchange `x`: the first half
+/// of the rendezvous move.
 ///
-/// Every non-empty slot of the record is unbound from the sender's table and its
-/// reference parked in the ledger, so from this line the message OWNS what it is
-/// carrying: the sender's words are stale (a diagnosed `BadHandle`, exactly as
-/// after a `give`), the sender's quota row is credited, and nothing anybody does
-/// afterwards can make the delivery arrive empty.
+/// Every non-empty slot of the record is unbound from the sender's table and
+/// its reference parked in the ledger. From then on the message owns what it
+/// carries: the sender's words are stale (a diagnosed `BadHandle`, as after a
+/// `give`), the sender's quota row is credited, and nothing can make the
+/// delivery arrive empty.
 ///
-/// **THE COUNT GOES UP BEFORE IT GOES DOWN, PER HANDLE**, which is `move_entry`'s
-/// rule at the half-move: the kernel's own reference is taken, the entry is
-/// unbound, and the entry's reference is dropped. Writing it as ref-then-unref
-/// rather than as "keep the one that is already there" costs a pair of
-/// arithmetic and keeps "every bind refs, every unbind unrefs" a rule with no
-/// exceptions — and it means no object can transiently reach zero and be freed
-/// between two lines of one op.
+/// Per handle the count goes up before it goes down (`move_entry`'s rule): the
+/// kernel's reference is taken, the entry unbound, and the entry's reference
+/// dropped, so no object can reach zero and be freed between two lines of one
+/// op.
 ///
-/// **THE BATCH IS ATOMIC BECAUSE EVERY STEP OF IT IS INFALLIBLE, NOT BECAUSE
-/// THERE IS AN UNWIND.** A lookup, a ref, an unbind and a store: none of them
-/// can be refused, so a partly-staged message is unrepresentable and the unwind
-/// arm this function would otherwise need is EMPTY. The caller completes the
-/// exchange with no further failure point either — the ring slot, the body copy
-/// and the claim mint all happen AHEAD of this call, precisely so that nothing
-/// after the first unbind can go wrong.
+/// The batch is atomic because every step is infallible (a lookup, a ref, an
+/// unbind and a store), so a partly staged message is unrepresentable and no
+/// unwind is needed. The caller completes the exchange with no further failure
+/// point: the ring slot, the body copy and the claim mint all happen ahead of
+/// this call.
 ///
-/// **IT STAGES WHAT IS STAGEABLE AND SKIPS WHAT IS NOT, AND THE FAULT IS
-/// SOMEBODY ELSE'S JOB.** A word that names nothing, an entry without
-/// `Transfer`, a kind the record cannot spell: `check_send` raises each of those
-/// as a FAULT on the two paths where the caller is the running process and a
-/// fault is a thing that can be raised. This function is also reached from
-/// `resume_call_room`, where the caller is BLOCKED and there is no honest fault
-/// to raise, so the same three questions are asked here and a slot that fails
-/// one is simply left empty. The two are not a duplicated check: one decides
-/// whether to END THE CALLER, the other decides what a message is CARRYING.
+/// It stages what is stageable and skips the rest; raising a fault is the
+/// caller's job. A word that names nothing, an entry without `Transfer`, or a
+/// kind the record cannot spell is raised as a fault by `check_send` on the two
+/// paths where the caller is the running process. This function is also reached
+/// from `resume_call_room`, where the caller is blocked and there is no fault
+/// to raise, so it asks the same three questions and leaves a failing slot
+/// empty. The two are not a duplicated check: one decides whether to end the
+/// caller, the other what a message carries.
 ///
-/// **THE ROOM-PARK IS WHY THE SECOND ASKING IS LOAD-BEARING** (design 18's Sep-2
-/// re-rule, finding). A `Call` that met a full ring parks with its args record
-/// still in the caller's memory and the record is RE-READ at the resume — so a
-/// sibling thread may have rewritten it, and the words that arrive here need not
-/// be the words `check_send` blessed. Asking again is what keeps a rewritten
-/// record from staging a handle its process no longer holds or was never allowed
-/// to send.
+/// The second asking is load-bearing: a `Call` that met a full ring parks with
+/// its args record still in the caller's memory, and the record is re-read at
+/// the resume. A sibling thread may have rewritten it, so the words arriving
+/// here need not be the ones `check_send` blessed.
 public(package) func hold_staged(p: Int, x: Int,
                                  args: &PipeSendRecord) unsafe {
     var i: Int = 0
@@ -1207,27 +983,24 @@ public(package) func hold_staged(p: Int, x: Int,
     }
 }
 
-/// **MINT EVERY HELD REFERENCE OF `x` INTO `p`'s TABLE** — the SECOND half, and
-/// the one place §2.1's "attached handles enter the receiver's table only at
+/// Mint every held reference of `x` into `p`'s table: the second half, and the
+/// one place spec §2.1's "attached handles enter the receiver's table only at
 /// receive" happens.
 ///
-/// ITS PRECONDITION IS `table_room(p, staged_count(x))`, established by the
-/// caller before anything was spent, which is what makes the refusal atomic and
-/// makes every mint here provably succeed. A `NO_HANDLE` answer would mean the
-/// pre-flight and the table disagreed, and that is a kernel bug rather than a
-/// condition — `fatal_kernel` says so.
+/// Precondition: `table_room(p, staged_count(x))`, established by the caller
+/// before anything was spent. That makes the refusal atomic and every mint here
+/// succeed; a `NO_HANDLE` answer means the pre-flight and the table disagree,
+/// which is a kernel bug, and `fatal_kernel` says so.
 ///
-/// **RIGHTS VERBATIM.** The held ref carries the rights the sender was holding
-/// the entry with and the mint installs exactly those, so a transfer through a
-/// message amplifies nothing and consults no default set — design 4 D-1's
-/// sentence reached through a second door. A sender that wants to hand over less
-/// mints the narrower sibling and attaches THAT (§API's rule that a
+/// Rights are verbatim: the held ref carries the rights the sender held the
+/// entry with and the mint installs exactly those, so a transfer through a
+/// message amplifies nothing and consults no default set. A sender that wants
+/// to hand over less mints the narrower sibling and attaches that (a
 /// message-attach takes no keep mask).
 ///
-/// THE BATCH IS COLLECTED FIRST, so the ledger is empty before the first mint:
-/// what lands in the taker's table is accounted for by the taker from that
-/// moment, and the exchange's slots are free for the REPLY direction to stage
-/// into.
+/// The batch is collected first, so the ledger is empty before the first mint:
+/// what lands in the taker's table is accounted for by the taker from then on,
+/// and the exchange's slots are free for the reply direction to stage into.
 public(package) func mint_staged(x: Int, p: Int) unsafe -> StagedHandles {
     var out = StagedHandles(kinds: [0; PIPE_MSG_HANDLES],
                             words: [NO_HANDLE; PIPE_MSG_HANDLES])
@@ -1249,8 +1022,8 @@ public(package) func mint_staged(x: Int, p: Int) unsafe -> StagedHandles {
                 ref_object(ref.obj_type, ref.target)
                 unref_object(ref.obj_type, ref.target)
                 // The kind was validated at the post and an object cannot
-                // change kind, so this cannot be `None` — but it is a partial
-                // translation and never-hide says the arm reports.
+                // change kind, so this cannot be `None`. It is a partial
+                // translation, so the arm reports instead of hiding it.
                 guard let kind = msg_kind_of(ref.obj_type) else {
                     fatal_kernel("a staged handle named a kind the record cannot spell",
                                  x as UInt)
@@ -1265,14 +1038,13 @@ public(package) func mint_staged(x: Int, p: Int) unsafe -> StagedHandles {
     move out
 }
 
-/// **RELEASE A COLLECTED BATCH** — the unwind half of the rendezvous, and what
-/// every arm that drops a staged message ends with.
+/// Release a collected batch: the unwind half of the rendezvous, which every
+/// arm that drops a staged message ends with.
 ///
-/// It is a plain loop of `unref_object` and it is the ONLY thing that makes
-/// take-at-post whole: a message that never arrives was still holding real
-/// references, and dropping them is how the objects it was carrying reach zero
-/// and free. Each release can cascade — see this block's reentrancy note — which
-/// is why the batch is COLLECTED before the first line of it runs.
+/// A plain loop of `unref_object`. A message that never arrives still holds
+/// real references, and dropping them is how the objects it carried reach zero
+/// and free. Each release can cascade (see the rendezvous block's reentrancy
+/// note), which is why the batch is collected before the first release runs.
 public(package) func release_staged(held: &StagedRefs) unsafe {
     var i: Int = 0
     while i < PIPE_MSG_HANDLES {
@@ -1285,24 +1057,17 @@ public(package) func release_staged(held: &StagedRefs) unsafe {
     }
 }
 
-/// **THE OUTLET'S ZERO-ARM: NOTHING STAGED CAN EVER BE TAKEN AGAIN** (sawos
-/// design 13 D-2, as amended by design 14 D-2, and MOVED HERE by design 18's
-/// Sep-2 re-rule — it releases references now, so it belongs with the releases).
+/// The outlet's zero-arm: nothing staged can ever be taken again.
 ///
-/// It is called at the moment the OUTLET column reaches zero, because from that
-/// moment nobody can ever take: a take needs an outlet handle, a mint needs a
-/// source, and a column at zero has neither.
-///
-/// **UNIT 1 DROPPED THE MESSAGES, UNIT 2 SETTLES THE CLAIMS, AND UNIT 4 GIVES
-/// THE HANDLES BACK** — one act with three parts now. Each staged exchange's
-/// claim becomes ABANDONED-BY-SERVER (its obligation will never be minted), and
-/// D-2 says what that means: a later `Resolve` answers `PeerClosed` and consumes
-/// the claim. So the list is emptied — nothing will ever read it again — and each
-/// exchange that NOBODY NAMES is given back on the spot, its held references
-/// released with it. The rest stay exactly where they are, holding the answer
-/// their claims are owed AND the handles that answer carries, and `Resolve` reads
-/// `outlet_refs == 0` to know what to say. That is the derivation D-2 asks for:
-/// abandonment is the columns, not a flag beside them.
+/// Called when the outlet column reaches zero, because from then nobody can
+/// take: a take needs an outlet handle. Each staged exchange's claim becomes
+/// abandoned-by-server (its obligation will never be minted), so a later
+/// `Resolve` answers `PeerClosed` and consumes the claim. The list is emptied,
+/// since nothing will read it again, and each exchange nobody names is given
+/// back on the spot with its held references released. The rest stay, holding
+/// the answer their claims are owed and the handles it carries; `Resolve` reads
+/// `outlet_refs == 0` to know what to say. Abandonment is the columns, not a
+/// flag.
 public(package) func pipe_drop_staged(c: Int) unsafe {
     var cur = PIPES[c].staged
     PIPES[c].staged = 0
@@ -1311,25 +1076,23 @@ public(package) func pipe_drop_staged(c: Int) unsafe {
         cur = EXCHANGES[x].next
         EXCHANGES[x].next = 0
         if exchange_can_settle(x) {
-            // THE LINK IS READ BEFORE THE SETTLE and the release runs after
-            // it, so the walk holds nothing a cascade could invalidate: `cur`
-            // is already the next node and `x` is already off the list.
+            // The link is read before the settle and the release runs after it,
+            // so the walk holds nothing a cascade could invalidate: `cur` is
+            // already the next node and `x` is already off the list.
             var held = exchange_settle(x)
             release_staged(&held)
         }
     }
 }
 
-/// The FIXED PREFIX of the record `Waiter.Wait` answers with, in kernel memory
-/// (spec §2.2, as amended by design 178 unit 3 rider 3, grown a body by
-/// `designs/010` ruling 11(a) and handles by design 18).
+/// The fixed prefix of the record `Waiter.Wait` answers with, in kernel memory
+/// (spec §2.2).
 ///
-/// Declaration order IS the layout (design 58), so the field names here and the
-/// buffer `sosabi` publishes are one description — pinned by the assert below
-/// rather than by agreement. **THE BODY IS NOT A FIELD**: it is a separate copy
-/// at `wait_prefix_bytes()` into the same caller buffer, out of the ring slot it
-/// already lives in, which is what makes the copy sized to the DELIVERY instead
-/// of to the record.
+/// Declaration order is the layout, so the field names here and the buffer
+/// `sosabi` publishes are one description, pinned by the assert below. The body
+/// is not a field: it is a separate copy at `wait_prefix_bytes()` into the same
+/// caller buffer, out of the ring slot it already lives in, so the copy is
+/// sized to the delivery and not to the record.
 struct WaitPrefix {
     key: UInt,
     tag: UInt,
@@ -1343,31 +1106,25 @@ static_assert(sizeof<WaitPrefix>() == sizeof<WaitBuffer>() - PIPE_BODY_BYTES,
 
 /// Build one and hand it to a process. The only producer of the wire form.
 ///
-/// A REFUSED DESTINATION HERE IS A KERNEL BUG, NOT A PROCESS ERROR, and that is
-/// why it stops the machine rather than terminating anybody. `Waiter.Wait`
-/// validates the buffer AT THE CALL — that is exactly what `copy_out_check`
-/// exists for and what `ThreadSlot.wait_buf`'s docstring records — and a
+/// A refused destination here is a kernel bug, not a process error, so it stops
+/// the machine rather than terminating anybody. `Waiter.Wait` validates the
+/// buffer at the call (`copy_out_check`; see `ThreadSlot.wait_buf`), and a
 /// process's writable window is fixed for its life, so a buffer that passed
-/// then cannot fail now. Reaching either arm means the two facts disagree, which
-/// is a kernel invariant broken and nothing a process could have done. **BOTH
-/// COPIES ARE INSIDE THE ONE CHECKED WINDOW**: the check was for
-/// `wait_record_bytes()`, which is the whole prefix plus a whole message body,
-/// and `meta.len` can never exceed `PIPE_BODY_BYTES`.
+/// then cannot fail now. Both copies lie inside the one checked window: the
+/// check was for `wait_record_bytes()`, the whole prefix plus a whole message
+/// body, and `meta.len` never exceeds `PIPE_BODY_BYTES`.
 ///
-/// It is also the shape this code's ALTITUDE forces (sawos design 2): the wake
-/// path runs below the scheduler — a timer expiry reaches here out of the IRQ
-/// path with no current thread of its own — so terminating a process from here
-/// would be terminating one with nowhere to go next. The door reports, and the
-/// callers that can kill are the ones above the switch point.
+/// The wake path runs below the scheduler (a timer expiry reaches here from the
+/// IRQ path with no current thread), so terminating a process from here would
+/// leave it nowhere to go next. The door reports, and the callers that can kill
+/// are the ones above the switch point.
 ///
-/// **THE COPY IS SIZED TO THE DELIVERY, IN TWO LENGTHS** (ruled Sep 1, user;
-/// preserved through design 18's growth). A delivery that carries neither
-/// handles nor bytes writes `wait_meta_end_bytes()` and stops — which is every
-/// Event, Interrupt, Timer, death, room level, abandoned claim and plain
-/// readable outlet, so it is almost every delivery there is. Only a MESSAGE
-/// writes the handle words, and only a message with data writes any body. The
-/// meta is what tells a decode which happened, and it is inside the short length,
-/// which is why the short length can be short.
+/// The copy is sized to the delivery, in two lengths. A delivery carrying
+/// neither handles nor bytes writes `wait_meta_end_bytes()` and stops, which
+/// covers almost every delivery (Event, Interrupt, Timer, death, room level,
+/// abandoned claim, plain readable outlet). Only a message writes the handle
+/// words, and only a message with data writes a body. The meta, inside the
+/// short length, tells a decode which happened.
 func deliver_wait_record(p: Int, dst: UInt, rec: &var WaitPrefix,
                          body_src: UInt) unsafe {
     var carries = rec.meta.len != 0
@@ -1387,11 +1144,9 @@ func deliver_wait_record(p: Int, dst: UInt, rec: &var WaitPrefix,
         fatal("wait record refused by the copy door", (why as UInt8) as UInt,
               dst, p as UInt, ExitCode.ProcessFault)
     }
-    // **THE SECOND COPY IS THE WHOLE OF RULING 11(a)** — and it does not happen
-    // at all for the kinds whose answer is a word. A delivery that carries
-    // bytes carries them out of the ring slot that already holds them, so the
-    // reply never transits a kernel buffer and the record's growth costs a
-    // Timer waiter nothing but address space.
+    // The second copy happens only for a message with data, straight out of the
+    // ring slot that holds the bytes, so a reply never transits a kernel
+    // buffer.
     if rec.meta.len != 0 {
         if let why = copy_out(p, dst + (wait_prefix_bytes() as UInt), body_src,
                               rec.meta.len as UInt) {
@@ -1401,18 +1156,16 @@ func deliver_wait_record(p: Int, dst: UInt, rec: &var WaitPrefix,
     }
 }
 
-/// **DOES A DELIVERY OF THIS KIND CONSUME THE SUBSCRIPTION, whatever mode it was
-/// attached under?** (`designs/010` ruling 11(b)).
+/// Does a delivery of this kind consume the subscription, whatever mode it was
+/// attached under?
 ///
-/// ONE KIND SAYS YES, and it says yes because of what its delivery IS: a reply
-/// is a ONE-SHOT, the record carries the answer, and the exchange is discharged
-/// by the copy-out — so by ruling 9(a)'s own logic (an act that consumes the
-/// object detaches it) the attachment goes with it. A persistent reading would
-/// be a subscription to an event that has already happened for the last time.
-///
-/// Every other kind is the attacher's choice, which is `Attachment.oneshot`.
-/// Written as an exhaustive match rather than a `kind == PipeReply` so that the
-/// next one-shot waitable has to answer here too.
+/// Only a reply does: it is a one-shot, the record carries the answer, and the
+/// exchange is discharged by the copy-out, so the attachment goes with it (an
+/// act that consumes the object detaches it). A persistent reading would
+/// subscribe to an event that has already happened for the last time. Every
+/// other kind is the attacher's choice, `Attachment.oneshot`. This is an
+/// exhaustive match rather than `kind == PipeReply` so the next one-shot
+/// waitable must answer here too.
 func delivery_consumes(kind: WaitableKind) -> Bool {
     match kind {
         case Event -> false,
@@ -1426,55 +1179,16 @@ func delivery_consumes(kind: WaitableKind) -> Bool {
     }
 }
 
-/// ANSWER ONE ATTACHMENT INTO A PROCESS'S MEMORY, spend what the answer spent,
-/// and release the subscription if this delivery ended it. Its entry points,
-/// both of them:
+/// Is this attachment the completion-queue server's?
 ///
-///   - `waiter_wait`, when something was ALREADY ready and nothing parks;
-///   - `wake_one_waiter`, handing a ready attachment to a thread that did.
-///
-/// A funnel rather than two call sites, because "read the answer" and "record
-/// that it was delivered" have to be one step: split apart, a kind whose
-/// readiness is CONSUMED by delivery — the Timer and, since Aug 17, the Event —
-/// would be drained on one path and not the other, and the bug would be a
-/// periodic timer that reports the same fire twice to whichever caller forgot.
-/// Both paths are equally "a record reached a thread", which is exactly the
-/// event `waitable_consume` is about.
-///
-/// THE READ AND THE CLEAR ARE ONE ACT, and this function's body is where that is
-/// true: `waitable_answer` takes the value, `waitable_consume` clears it, and
-/// nothing between them can run. The kernel takes no trap in kernel mode (design
-/// 178 D2 — interrupts are taken from user mode only), so a signal cannot land
-/// inside this window; one landing after it finds the object empty and re-arms
-/// readiness with its own bits alone, which is neither a loss nor a double
-/// count.
-///
-/// **AND THE DETACH IS THE THIRD PART, ADDED BY M4 UNIT 3** (`designs/010`
-/// rulings 9(b) and 11(b)). An attachment ends here when the attacher asked for
-/// one delivery (`AttachMode.OneShot`) or when the KIND's delivery is inherently
-/// consuming — and because an attachment is a counted reference, ending it drops
-/// one. **THAT DROP CAN CASCADE ALL THE WAY TO A FREED CONNECTION**: a reply
-/// delivered to a consuming attachment takes the exchange's claim column to
-/// zero, which settles the ring slot, which may free the `PIPES` row it lives
-/// in. Nothing above this line reads any of that afterwards — the answer, the
-/// key and the waiter were all taken before the detach, and `wake_one_waiter`
-/// below touches only the THREAD — which is the reentrancy argument this site
-/// owes.
-///
-/// It is also why the read of `ATTACHMENTS[a]` happens up front: after the
-/// detach that slot is `Free` and belongs to whoever allocates next.
-/// **IS THIS ATTACHMENT THE COMPLETION-QUEUE SERVER'S?** (`designs/010` ruling
-/// 11(d); sawos design 18).
-///
-/// Three conditions, and each is load-bearing. The kind is a `PipeOutlet`,
-/// because a connection's server end is the only waitable whose readiness names
-/// a message somebody has to TAKE. The attachment OWNS the outlet, because
-/// ruling 11(d)'s server hands its end over entirely — a borrowing `add` leaves
-/// the caller holding a handle it is expected to `take` through, and turning its
-/// delivery into a take would consume a message the caller was told about rather
-/// than handed. And something is actually STAGED, because the same level is
-/// raised by a dead inlet with a dry ring, where there is nothing to take and
-/// `PeerGone` is the honest answer.
+/// Three conditions, each load-bearing. The kind is a `PipeOutlet`, the only
+/// waitable whose readiness names a message to take. The attachment owns the
+/// outlet, because the completion-queue server hands its end over entirely; a
+/// borrowing `add` leaves the caller holding a handle it is expected to `take`
+/// through, and turning its delivery into a take would consume a message the
+/// caller was told about, not handed. And something is staged, because the same
+/// level is raised by a dead inlet with a dry ring, where there is nothing to
+/// take and `PeerGone` is the answer.
 func outlet_take_delivery(kind: WaitableKind, target: Int, owns: Bool) unsafe -> Bool {
     match kind {
         case PipeOutlet -> owns && PIPES[target].staged != 0,
@@ -1482,14 +1196,14 @@ func outlet_take_delivery(kind: WaitableKind, target: Int, owns: Bool) unsafe ->
     }
 }
 
-/// **DOES THIS DELIVERY CARRY A MESSAGE'S HANDLES?** — the reply direction's
-/// half of the rendezvous.
+/// Does this delivery carry a message's handles? The reply direction's half of
+/// the rendezvous.
 ///
-/// Only a claim's delivery can, and only when the answer is DATA: an abandoned
-/// claim's `PeerClosed` carries nothing, and the three level kinds carry nothing
-/// by construction. §2.1's `send(data?, handles?)` is symmetric, so a reply
-/// staged handles exactly as a request did and they move at exactly the same
-/// moment — the delivery that hands the bytes over.
+/// Only a claim's delivery can, and only when the answer is data: an abandoned
+/// claim's `PeerClosed` carries nothing, and the level kinds carry nothing by
+/// construction. Spec §2.1's `send(data?, handles?)` is symmetric, so a reply
+/// stages handles as a request did and they move at the same moment, the
+/// delivery that hands the bytes over.
 func reply_carries_handles(kind: WaitableKind, answer: &WaitAnswer) -> Bool {
     match kind {
         case PipeReply -> answer.payload == (ReplyLevel.Data as UInt),
@@ -1497,51 +1211,44 @@ func reply_carries_handles(kind: WaitableKind, answer: &WaitAnswer) -> Bool {
     }
 }
 
-/// **ANSWER ONE ATTACHMENT INTO A PROCESS'S MEMORY, MOVE WHATEVER THE MESSAGE
-/// CARRIED, spend what the answer spent, and release the subscription if this
-/// delivery ended it.** Its entry points, both of them:
+/// Answer one attachment into a process's memory, move whatever the message
+/// carried, spend what the answer spent, and release the subscription if this
+/// delivery ended it. Entry points:
 ///
-///   - `waiter_wait` (and `pipe_reply_wait`'s tail), when something was ALREADY
+///   - `waiter_wait` (and `pipe_reply_wait`'s tail), when something was already
 ///     ready and nothing parks;
-///   - `wake_one_waiter`, handing a ready attachment to a thread that did.
+///   - `wake_one_waiter`, handing a ready attachment to a thread that parked.
 ///
 /// A funnel rather than two call sites, because "read the answer" and "record
-/// that it was delivered" have to be one step: split apart, a kind whose
-/// readiness is CONSUMED by delivery — the Timer and, since Aug 17, the Event —
-/// would be drained on one path and not the other, and the bug would be a
-/// periodic timer that reports the same fire twice to whichever caller forgot.
-/// Both paths are equally "a record reached a thread", which is exactly the
-/// event `waitable_consume` is about.
+/// that it was delivered" must be one step: split apart, a kind whose readiness
+/// is consumed by delivery (Timer, Event) would be drained on one path and not
+/// the other, and a periodic timer would report the same fire twice.
 ///
-/// THE READ AND THE CLEAR ARE ONE ACT, and this function's body is where that is
-/// true: `waitable_answer` takes the value, `waitable_consume` clears it, and
-/// nothing between them can run. The kernel takes no trap in kernel mode (design
-/// 178 D2 — interrupts are taken from user mode only), so a signal cannot land
-/// inside this window; one landing after it finds the object empty and re-arms
-/// readiness with its own bits alone.
+/// The read and the clear are one act: `waitable_answer` takes the value,
+/// `waitable_consume` clears it, and nothing between them can run. The kernel
+/// takes no trap in kernel mode (interrupts are taken from user mode only), so
+/// a signal cannot land inside this window; one landing after it finds the
+/// object empty and re-arms readiness with its own bits alone.
 ///
-/// **AND THE DETACH IS THE THIRD PART, ADDED BY M4 UNIT 3** (`designs/010`
-/// rulings 9(b) and 11(b)). An attachment ends here when the attacher asked for
-/// one delivery (`AttachMode.OneShot`) or when the KIND's delivery is inherently
-/// consuming — and because an attachment is a counted reference, ending it drops
-/// one. **THAT DROP CAN CASCADE ALL THE WAY TO A FREED CONNECTION**: a reply
-/// delivered to a consuming attachment takes the exchange's claim column to
-/// zero, which settles the ring slot, which may free the `PIPES` row it lives
-/// in. Nothing above this line reads any of that afterwards — the answer, the
-/// key and the waiter were all taken before the detach — which is the reentrancy
-/// argument this site owes.
+/// The detach is the third part. An attachment ends here when the attacher
+/// asked for one delivery (`AttachMode.OneShot`) or the kind's delivery is
+/// inherently consuming; an attachment is a counted reference, so ending it
+/// drops one. That drop can cascade all the way to a freed connection: a reply
+/// delivered to a consuming attachment takes the claim column to zero, which
+/// settles the ring slot, which may free the `PIPES` row. Nothing after the
+/// detach reads any of that (the answer, key and waiter were all taken before
+/// it), which is the reentrancy argument. For the same reason `ATTACHMENTS[a]`
+/// is read up front: afterwards the slot is `Free` and belongs to whoever
+/// allocates next.
 ///
-/// **IT CAN NOW REFUSE, AND M4 UNIT 4 IS WHY** (`designs/010` ruling 5's atomic
-/// table-full refusal; sawos design 18). A delivery that carries handles has to
-/// MINT them into the waiting process's table, and a table with no room is a
-/// condition rather than a bug — so this answers a `SosStatus`, and on anything
-/// but `Ok` NOTHING HAPPENED: no record was copied, no readiness was spent, no
-/// attachment was detached and the message is still staged with its level still
-/// raised. The caller writes the status where it would have written `Ok`, and a
-/// waiter that frees a slot and waits again is handed the very same message.
-/// That is `revoke_blocked`'s own shape — a delivered wake with a
-/// distinguishable status and no record — which is what `designs/010` ruling 2
-/// requires of every "this cannot happen for you right now".
+/// It can refuse. A delivery carrying handles must mint them into the waiting
+/// process's table, and a full table is a condition, not a bug, so this answers
+/// a `SosStatus`. On anything but `Ok` nothing happened: no record was copied,
+/// no readiness spent, no attachment detached, and the message is still staged
+/// with its level raised. The caller writes the status where it would have
+/// written `Ok`, and a waiter that frees a slot and waits again gets the same
+/// message. This has `revoke_blocked`'s shape: a delivered wake with a
+/// distinguishable status and no record.
 public(package) func deliver_attachment(p: Int, dst: UInt, a: Int) unsafe -> SosStatus {
     let kind = ATTACHMENTS[a].kind
     let target = ATTACHMENTS[a].target
@@ -1562,9 +1269,9 @@ public(package) func deliver_attachment(p: Int, dst: UInt, a: Int) unsafe -> Sos
                          handles: [NO_HANDLE; WAIT_HANDLE_SLOTS])
 
     if reply_carries_handles(kind, &answer) {
-        // THE PRE-FLIGHT, BEFORE ANYTHING IS SPENT. `staged_count` is exact —
-        // the refs are the kernel's own, so what the reply is carrying is what
-        // the claimant will be handed and there is nothing to re-validate.
+        // The pre-flight, before anything is spent. `staged_count` is exact:
+        // the refs are the kernel's own, so what the reply carries is what the
+        // claimant will be handed.
         if not table_room(p, staged_count(target)) {
             return mint_refusal(p)
         }
@@ -1587,33 +1294,30 @@ public(package) func deliver_attachment(p: Int, dst: UInt, a: Int) unsafe -> Sos
     SosStatus.Ok
 }
 
-/// **THE DELIVERY *IS* THE TAKE** — ruling 11(d)'s completion-queue server, and
-/// the op that takes the multiplexed server from two traps a message to ONE.
+/// The delivery is the take: the completion-queue server's op, which takes a
+/// multiplexed server from two traps per message to one.
 ///
-/// **IT IS `pipe_take`'s BODY RUN INSIDE A WAIT**, and the two are deliberately
-/// the same three acts in the same order: mint the obligation, move the message's
-/// handles, hand the bytes over. What differs is only where the answer goes — a
-/// `Take` writes its own record and this writes a wait record — and that the
-/// server never held an outlet handle to call `Take` through, because the
+/// It is `pipe_take`'s body run inside a wait, with the same three acts in the
+/// same order: mint the obligation, move the message's handles, hand the bytes
+/// over. Only the destination differs (a wait record, not a `Take` record), and
+/// the server never held an outlet handle to call `Take` through, because the
 /// attachment owns the end.
 ///
-/// **THE REFUSAL IS ATOMIC AND IT IS THE ONLY WAY THIS CAN FAIL** (ruling 5).
-/// The obligation and every live staged handle are ONE batch: `table_room` asks
-/// about all of them before any of them exists, so a full table leaves the
-/// message staged, the readable level raised and the exchange in `Staged` — the
-/// server frees a slot, waits again, and is handed the same message. There is no
-/// partial delivery, because there is no point at which half the batch has been
-/// minted.
+/// The refusal is atomic and the only way this can fail. The obligation and
+/// every live staged handle are one batch: `table_room` asks about all of them
+/// before any exists, so a full table leaves the message staged, the readable
+/// level raised and the exchange in `Staged`. The server frees a slot, waits
+/// again and is handed the same message.
 ///
-/// The staged message leaves the LIST and stays in the ring, exactly as a `Take`
-/// leaves it: the exchange is `Taken`, its slot is held by the obligation this
-/// just minted, and the reply will travel back through the same slot.
+/// The staged message leaves the list and stays in the ring, as with a `Take`:
+/// the exchange is `Taken`, its slot is held by the obligation just minted, and
+/// the reply travels back through the same slot.
 func deliver_take(p: Int, dst: UInt, key: UInt, waiter: Int, a: Int, c: Int,
                   ends: Bool) unsafe -> SosStatus {
     let x = stage_peek(c)
     if x == NO_EXCHANGE {
-        // UNREACHABLE: `outlet_take_delivery` established that something is
-        // staged, and nothing runs between the two. Written rather than assumed.
+        // Unreachable: `outlet_take_delivery` established that something is
+        // staged and nothing runs between. Written out rather than assumed.
         fatal_kernel("a completion-queue delivery found nothing staged", c as UInt)
         return SosStatus.NoResource
     }
@@ -1642,21 +1346,21 @@ func deliver_take(p: Int, dst: UInt, key: UInt, waiter: Int, a: Int, c: Int,
     }
     deliver_wait_record(p, dst, &var rec, exchange_body_addr(x))
 
-    // CONSUMED BY DELIVERY, and only after the copy SUCCEEDED — `pipe_take`'s
-    // own ordering, and what makes "a staged message is handed over exactly
-    // once" true rather than nearly true.
+    // Consumed by delivery, and only after the copy succeeded (`pipe_take`'s
+    // ordering), which makes "a staged message is handed over exactly once"
+    // true.
     stage_pop(c)
     EXCHANGES[x].request_refs = 1
     EXCHANGES[x].state = ExchangeState.Taken
 
-    // The readable level is not CONSUMED by this delivery and does not have to
-    // be: taking the message off the staged list is what lowers it, which is
-    // `waitable_consume`'s `PipeOutlet` arm saying "the level ends when the
-    // server actually TAKES" and this being that take.
+    // The readable level is not consumed by this delivery and does not have to
+    // be: taking the message off the staged list lowers it
+    // (`waitable_consume`'s `PipeOutlet` arm: the level ends when the server
+    // takes), and this is that take.
     //
     // The detach is last for `deliver_attachment`'s reason: it can cascade into
-    // a freed connection, and nothing above reads `c` afterwards. A persistent
-    // completion queue never reaches it, which is the shape ruling 11(d) is for.
+    // a freed connection, and nothing after it reads `c`. A persistent
+    // completion queue never reaches it.
     if ends {
         detach_attachment(waiter, a)
         unref_waitable(WaitableKind.PipeOutlet, c)
@@ -1664,24 +1368,23 @@ func deliver_take(p: Int, dst: UInt, key: UInt, waiter: Int, a: Int, c: Int,
     SosStatus.Ok
 }
 
-/// Hand attachment `a` to ONE thread parked on `w`, if any is (§2.2).
+/// Hand attachment `a` to one thread parked on `w`, if any is (§2.2).
 ///
-/// The record goes into the woken thread's own buffer and its STATUS into the
-/// woken thread's frame, both HERE and nowhere else — the same discipline
-/// `exit_thread` follows for a joiner: a thread that blocked in a syscall was
-/// answered by nobody when it blocked, so its waker is its single writer.
+/// The record goes into the woken thread's own buffer and its status into its
+/// frame, both here and nowhere else (as `exit_thread` does for a joiner): a
+/// thread that blocked in a syscall was answered by nobody when it blocked, so
+/// its waker is its single writer.
 ///
-/// THE WRITER IS A DIFFERENT THREAD from the one being answered, which is sound
-/// today because M2 has one address space; `copy_out`'s docstring is where that
-/// stops being free. Since the Interrupt object landed the writer need not be a
-/// THREAD at all — the trap path and the idle poll both reach here — which
-/// changes nothing about the write and everything about why the check that
-/// validated the buffer had to happen back at the `Wait` call.
+/// The writer is a different thread from the one answered, and need not be a
+/// thread at all (the trap path and the idle poll both reach here). That
+/// changes nothing about the write, but it is why the buffer check had to
+/// happen back at the `Wait` call. `copy_out` names the target process
+/// explicitly and reaches its memory through the linear map, so the write does
+/// not depend on which process's mappings are active when it runs.
 ///
-/// **THE THREAD LEAVES THE BLOCKED LIST BEFORE THE DELIVERY**, which is what
-/// keeps M4 unit 3's cascades away from that list: a delivery can now free
-/// objects and even a whole connection, and none of it can reach a walk this
-/// function has already finished.
+/// The thread leaves the blocked list before the delivery, so cascades from the
+/// delivery (which can free objects and whole connections) cannot reach a walk
+/// this function has already finished.
 public(package) func wake_one_waiter(w: Int, a: Int) unsafe {
     let head = WAITERS[w].blocked
     if head == 0 {
@@ -1691,12 +1394,11 @@ public(package) func wake_one_waiter(w: Int, a: Int) unsafe {
     WAITERS[w].blocked = THREADS[slot].link
     THREADS[slot].link = 0
 
-    // **THE ANSWER IS WHATEVER THE DELIVERY SAID** (sawos design 18). A
-    // delivery that carries handles can be refused by a full table, and a
-    // refusal here is a woken thread with a status and an untouched buffer —
-    // `revoke_blocked`'s shape, and design 10 ruling 2's doctrine: the wake is
-    // DELIVERED either way, never a strand. The message stays staged and its
-    // level stays raised, so the same thread waiting again is handed it.
+    // The answer is whatever the delivery said. A delivery that carries handles
+    // can be refused by a full table, which wakes the thread with a status and
+    // an untouched buffer (`revoke_blocked`'s shape): the wake is delivered
+    // either way, never a strand. The message stays staged and its level
+    // raised, so waiting again is handed it.
     let answered = deliver_attachment(THREADS[slot].process,
                                       THREADS[slot].wait_buf, a)
     THREADS[slot].wait_buf = 0
@@ -1707,10 +1409,10 @@ public(package) func wake_one_waiter(w: Int, a: Int) unsafe {
 
 /// A waitable just became ready: tell its Waiter, if it has one.
 ///
-/// THE ONE PLACE READINESS TURNS INTO A WAKE, reached from every producer there
-/// is — an Event's `Signal`, an Interrupt's line firing, a Timer's expiry, a
-/// process ending, and since M4 unit 3 a pipe's four levels. None of them knows
-/// anything about waiters beyond the attachment field the matrix reads.
+/// The one place readiness turns into a wake, reached from every producer: an
+/// Event's `Signal`, an Interrupt's line firing, a Timer's expiry, a process
+/// ending and a pipe's levels. None of them knows anything about waiters
+/// beyond the attachment field.
 public(package) func notify_ready(kind: WaitableKind, slot: Int) unsafe {
     let a = waitable_attachment(kind, slot)
     if a == 0 {
@@ -1719,16 +1421,14 @@ public(package) func notify_ready(kind: WaitableKind, slot: Int) unsafe {
     wake_one_waiter(ATTACHMENTS[a - 1].waiter, a - 1)
 }
 
-/// `notify_ready` for a caller that has NOT established readiness — ask first.
+/// `notify_ready` for a caller that has not established readiness: ask first.
 ///
-/// **THE PEER-GONE SITES ARE WHY IT EXISTS** (sawos design 15). Every other
-/// producer knows it just made something ready: a signal wrote a word, a line
-/// fired, a deadline passed. A reference reaching zero is different — it raises
-/// a level that may ALREADY have been raised (a readable outlet with messages
-/// still staged), or may not be raised at all (an obligation column falling on
-/// an exchange whose reply was already delivered) — so the transition is asked
-/// about rather than asserted. Cheap: the attachment field is one load and
-/// answers "nobody is watching" for almost every call.
+/// Needed at the peer-gone sites. Other producers know they just made something
+/// ready; a reference reaching zero raises a level that may already have been
+/// raised (a readable outlet with messages still staged) or not at all (an
+/// obligation column falling on an exchange whose reply was already delivered),
+/// so the transition is asked about, not asserted. It is cheap: the attachment
+/// field is one load and answers "nobody is watching" for almost every call.
 public(package) func notify_if_ready(kind: WaitableKind, slot: Int) unsafe {
     if waitable_attachment(kind, slot) == 0 {
         return
@@ -1739,16 +1439,15 @@ public(package) func notify_if_ready(kind: WaitableKind, slot: Int) unsafe {
     notify_ready(kind, slot)
 }
 
-/// Tell every watched CLAIM in connection `c` that its level just changed.
+/// Tell every watched claim in connection `c` that its level just changed.
 ///
-/// **A SCAN AND NOT A LIST WALK, deliberately** (`designs/010` ruling 9(a)'s
-/// iterate-while-removing census). It is called at the outlet's zero-arm, where
-/// each delivery it makes can settle the very exchange it just visited and can
-/// cascade into freeing the connection — so it must not be holding a position in
-/// any structure those acts edit. A bounded walk over the ring's fixed indices
+/// A scan and not a list walk, deliberately. It is called at the outlet's
+/// zero-arm, where each delivery can settle the exchange it just visited and
+/// cascade into freeing the connection, so it must hold no position in any
+/// structure those acts edit. A bounded walk over the ring's fixed indices
 /// holds nothing: an exchange settled underneath it becomes `Free`, which is
-/// unattached, which the next iteration skips. `PIPE_INFLIGHT` is 16 and
-/// `kcore.limits`' audit note already covers a scan of it.
+/// unattached, which the next iteration skips. `PIPE_INFLIGHT` is small and
+/// `kcore.limits`' audit note covers a scan of it.
 func notify_claims(c: Int) unsafe {
     var i: Int = 0
     while i < PIPE_INFLIGHT {
@@ -1758,47 +1457,35 @@ func notify_claims(c: Int) unsafe {
 }
 
 // =============================================================================
-// THE PARKED CLAIM'S WAKE ARM (sawos design 17, M4 unit 3.5, GENERALIZED by
-// sawos design 22, M4 unit 4.5; `designs/010` ruling 4's Aug-31 rider and
-// ruling 12(b))
+// The parked claim's wake arm
 // =============================================================================
 //
-// **ONE ARM, ASKED AT ONE QUESTION: is this claim a PARKED THREAD's, or a
-// SUBSCRIPTION's?** The rider says it in as many words — "the wake dispatch
-// grows ONE arm (a claim is a parked fused call -> wake the thread, or a
-// split-phase claim -> notify the Waiter — not a second wake protocol)" — and
-// `notify_claim` below is that sentence. Every producer of reply-readiness now
-// calls it instead of `notify_if_ready(PipeReply, …)`, so there is exactly one
-// place in the kernel where the two shapes of client are told apart.
+// One arm asks one question: is this claim a parked thread's or a
+// subscription's? `notify_claim` is that arm. A parked fused call wakes the
+// thread, a split-phase claim notifies the Waiter, and there is no second wake
+// protocol. Every producer of reply-readiness calls it instead of
+// `notify_if_ready(PipeReply, ...)`, so this is the one place the two shapes of
+// client are told apart.
 //
-// **AND THE ARM DOES NOT CARE WHICH OP PARKED THE THREAD** (ruling 12(b)). Unit
-// 4.5 gave `PipeReplyOp.Resolve` a park of its own, and it needed not one line
-// here: a parked resolver is a thread with a reference on the claim column and a
-// buffer to write into, which is precisely what a fused `Call` is. `park_resolve`
-// gets there by taking the caller's handle ENTRY and keeping its reference — the
-// unbind without the unref — so the two arrive at `EXCHANGES[x].caller` in the same
-// state and nothing downstream reads back to find out which. What generalizes is
-// the RECORD, not the protocol: one park shape, one wake shape, one teardown
-// arm.
+// The arm does not care which op parked the thread. A parked `Resolve` is a
+// thread with a reference on the claim column and a buffer to write into, which
+// is what a fused `Call` is. `park_resolve` gets there by taking the caller's
+// handle entry and keeping its reference (unbind without unref), so both arrive
+// at `EXCHANGES[x].caller` in the same state. One park shape, one wake shape,
+// one teardown arm.
 
-// WHAT A THREAD-TIED CLAIM CANNOT BE IS ATTACHED — and now for two reasons
-// rather than one. A fused call mints no `PipeReply` handle at all, so there is
-// no word anybody could pass to `Waiter.Add`; a parked resolver may have had an
-// attachment, and `park_resolve` detaches it on the way down (ruling 9(a)'s
-// implicit detach, which a consuming op owes). Either way
-// `EXCHANGES[x].reply_attach` is provably zero for as long as `EXCHANGES[x].caller` is
-// not, which is why the two arms are alternatives rather than two things to do
-// in sequence.
+// A thread-tied claim cannot be attached: a fused call mints no `PipeReply`
+// handle for `Waiter.Add`, and `park_resolve` detaches a parked resolver's
+// attachment on the way down. So `EXCHANGES[x].reply_attach` is zero whenever
+// `EXCHANGES[x].caller` is not, and the two arms are alternatives, not a
+// sequence.
 //
-// **THE SECOND ARM IS THE ROOM LEVEL'S, AND IT IS THE SAME SHAPE.** `Call` never
-// answers `WouldBlock` (design 10 ruling 8, reached from inside the op), so a
-// full ring parks the caller — and the level that ends that park is the inlet's
-// room-to-post one, which already had exactly two producers. `notify_room`
-// replaces `notify_if_ready(PipeInlet, …)` at both of them, asks the same
-// question, and routes into the same resume.
-//
-/// **A CLAIM'S LEVEL CHANGED — tell whoever holds it, whichever kind of holder
-/// that is.** The one arm.
+// The room level has the same shape. `Call` never answers `WouldBlock`, so a
+// full ring parks the caller, and the level that ends that park is the inlet's
+// room-to-post one. `notify_room` asks the same question at that level's
+// producers and routes into the same resume.
+/// A claim's level changed: tell whoever holds it, whichever kind of holder
+/// that is.
 public(package) func notify_claim(x: Int) unsafe {
     let parked = EXCHANGES[x].caller
     if parked == 0 {
@@ -1811,28 +1498,24 @@ public(package) func notify_claim(x: Int) unsafe {
     wake_call_reply(parked - 1, x)
 }
 
-/// **ANSWER A THREAD PARKED ON A CLAIM** — in a fused `Call` or in a `Resolve`,
-/// which since M4 unit 4.5 are one thing from here (sawos design 22). It is
-/// `deliver_attachment`'s opposite number, and deliberately its mirror image.
+/// Answer a thread parked on a claim, in a fused `Call` or a `Resolve`. It is
+/// `deliver_attachment`'s mirror image.
 ///
-/// The two do the same three things in the same order and differ only in where
-/// the answer goes: a delivery writes a wait RECORD and a parked claim writes the
-/// reply BYTES and a value register, because both of these ops resume inside
-/// their own syscall rather than inside a `Wait`. **AND THE TWO PARKED SHAPES
-/// AGREE DOWN TO THE REGISTER** — a `Resolve`'s success is the reply's length in
-/// the value register with the record copied to `wait_buf`, and so is a `Call`'s;
-/// its `PeerClosed` is a bare status, and so is a `Call`'s — which is why this
-/// function needed no arm for the second op. So the readiness is read through
-/// `waitable_answer` — the same matrix arm the split-phase path reads — the
-/// exchange is spent through `waitable_consume`, and the claim's reference is
-/// dropped last.
+/// Both do the same three things in the same order and differ in where the
+/// answer goes: a delivery writes a wait record, while a parked claim writes
+/// the reply bytes and a value register, because both ops resume inside their
+/// own syscall rather than a `Wait`. The two parked shapes agree down to the
+/// register (success is the reply's length in the value register with the
+/// record copied to `wait_buf`; `PeerClosed` is a bare status), so no second
+/// arm is needed. Readiness is read through `waitable_answer`, the exchange is
+/// spent through `waitable_consume`, and the claim's reference is dropped last.
 ///
-/// **THE UNREF IS LAST, AND THAT ORDER IS THE ONE SAFE ONE.** It can settle the
-/// ring slot and cascade all the way to a freed connection, and `exchange_settle`
-/// asserts that nobody is parked — so the tie has to be gone before the
-/// reference is. Nothing after the unref reads the exchange.
+/// The unref is last, and that order is the only safe one: it can settle the
+/// ring slot and cascade to a freed connection, and `exchange_settle` asserts
+/// that nobody is parked, so the tie must be gone first. Nothing after the
+/// unref reads the exchange.
 ///
-/// A REFUSED COPY-OUT IS A KERNEL BUG, on `deliver_wait_record`'s exact terms:
+/// A refused copy-out is a kernel bug, on `deliver_wait_record`'s terms:
 /// `pipe_call` validated the reply buffer while the caller was running, and a
 /// process's window is fixed for its life.
 func wake_call_reply(t: Int, x: Int) unsafe {
@@ -1841,30 +1524,23 @@ func wake_call_reply(t: Int, x: Int) unsafe {
     let answer = waitable_answer(WaitableKind.PipeReply, x)
     var result = op_status(SosStatus.PeerClosed)
     if answer.payload == (ReplyLevel.Data as UInt) {
-        // **THE FUSED PATH MINTS AFTER ALL — BUT ONLY WHAT THE REPLY CARRIED**
-        // (sawos design 18). A `Call` still mints no CLAIM, which is the saving
-        // design 10 ruling 4's rider is about; what it may have to mint is the
-        // handles the server attached to its answer, and those are the server's
-        // choice rather than the fusion's cost.
+        // The fused path mints only what the reply carried. A `Call` mints no
+        // claim handle; what it may mint is the handles the server attached to
+        // its answer.
         //
-        // **A FULL TABLE REFUSES THE HANDLES AND NOT THE EXCHANGE, AND UNDER
-        // TAKE-AT-POST THAT REFUSAL DESTROYS THEM** (design 18's Sep-2
-        // re-rule). The caller is PARKED INSIDE its own syscall, so there is no
-        // "try again" for it to take — the reply has been written and the claim
-        // is about to be spent either way. So it is answered with the
-        // table-full status, and the handles the replier attached go back to
-        // their slabs when the exchange settles, because the replier gave them
-        // up at the reply and there is nobody left to hand them to.
+        // A full table refuses the handles and not the exchange, and that
+        // refusal destroys them. The caller is parked inside its own syscall,
+        // so it cannot retry: the reply has been written and the claim is about
+        // to be spent either way. It is answered with the table-full status,
+        // and the handles the replier attached go back to their slabs when the
+        // exchange settles, because the replier gave them up at the reply.
         //
-        // **THIS IS THE ONE PLACE A REFUSAL IS TERMINAL, and the asymmetry is
-        // the claim's shape rather than a choice.** A refused `Take` and a
-        // refused delivery-as-take both leave the message STAGED with its level
-        // raised, so freeing a slot and asking again is handed the same
-        // message; a fused `Call`'s claim is a PARKED THREAD, which cannot ask
-        // again without returning, and returning is the thing a fused op does
-        // not do. A client that must not lose a capability this way makes room
-        // before it calls — or uses the composed path, whose claim is a handle.
-        // Nothing half-moves and nothing leaks either way.
+        // This is the one place a refusal is terminal, because a fused `Call`'s
+        // claim is a parked thread, which cannot ask again without returning. A
+        // refused `Take` or delivery-as-take leaves the message staged. A
+        // client that must not lose a capability this way makes room before it
+        // calls, or uses the composed path, whose claim is a handle. Nothing
+        // half-moves and nothing leaks either way.
         if not table_room(p, staged_count(x)) {
             result = op_status(mint_refusal(p))
         } else {
@@ -1896,21 +1572,19 @@ func wake_call_reply(t: Int, x: Int) unsafe {
     unref_waitable(WaitableKind.PipeReply, x)
 }
 
-/// **A CONNECTION'S ROOM LEVEL CHANGED — serve the parked callers, then the
-/// subscription.** The second arm.
+/// A connection's room level changed: serve the parked callers, then the
+/// subscription.
 ///
-/// It LOOPS where `notify_claim` does not, and the asymmetry is the two levels'
-/// own: a claim is one exchange with at most one holder, while room is a
-/// connection-wide level several threads may be waiting on at once. A settle
-/// frees ONE slot, so the ordinary pass serves one caller and the next finds no
-/// room and stops; a PEER-GONE transition serves every one of them, which is
-/// design 10 ruling 2's doctrine — nothing parked can be silently doomed, and a
-/// poster whose server end has died is exactly a thread waiting for something
-/// that can no longer happen.
+/// It loops where `notify_claim` does not, because a claim is one exchange with
+/// at most one holder, while room is a connection-wide level several threads
+/// may wait on. A settle frees one slot, so the ordinary pass serves one caller
+/// and the next finds no room and stops. A peer-gone transition serves every
+/// one, since a poster whose server end has died waits for something that can
+/// no longer happen.
 ///
 /// The subscription is told afterwards and asks its own question: if a resumed
 /// caller took the freed slot, `notify_if_ready` finds the level false and says
-/// nothing, which is the honest answer rather than a special case.
+/// nothing.
 public(package) func notify_room(c: Int) unsafe {
     var t = call_room_waiter(c)
     while t != NO_THREAD {
@@ -1922,21 +1596,21 @@ public(package) func notify_room(c: Int) unsafe {
     notify_if_ready(WaitableKind.PipeInlet, c)
 }
 
-/// Stage a room-parked call's message now that there may be somewhere to put it,
-/// and re-park it on its exchange. Answers whether the thread stopped waiting
-/// for room — `false` means the ring is still full and it is still parked, which
-/// is what stops `notify_room`'s loop.
+/// Stage a room-parked call's message now that there may be somewhere to put
+/// it, and re-park it on its exchange. Answers whether the thread stopped
+/// waiting for room: `false` means the ring is still full and it is still
+/// parked, which stops `notify_room`'s loop.
 ///
-/// **IT IS `pipe_post`'s BODY, RUN IN SOMEBODY ELSE'S CONTEXT**, and the two
-/// differences are both consequences of that. The questions are asked in
-/// `pipe_post`'s own order (the outlet column before the ring, because nobody
-/// being able to take is the stronger fact), and the copy-in cannot be allowed
-/// to fault a process that is not running — so the address was checked at the
-/// call by `copy_in_check` and a refusal here stops the machine instead.
+/// This is `pipe_post`'s body run in another thread's context, with two
+/// consequences. The questions are asked in `pipe_post`'s order (the outlet
+/// column before the ring, since nobody being able to take is the stronger
+/// fact), and the copy-in must not fault a process that is not running: the
+/// address was checked at the call by `copy_in_check`, so a refusal here stops
+/// the machine.
 ///
-/// It mints nothing, which is the whole of what a fused call buys: the claim is
-/// the parked thread, `PIPE_REPLY_REFS` starts at one for it, and no handle row
-/// is spent.
+/// It mints nothing, which is what a fused call buys: the claim is the parked
+/// thread, `Exchange.reply_refs` starts at one for it, and no handle row is
+/// spent.
 func resume_call_room(t: Int, c: Int) unsafe -> Bool {
     let p = THREADS[t].process
     if PIPES[c].outlet_refs == 0 {
@@ -1952,14 +1626,12 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
     }
     let src = THREADS[t].call_src
     let dst = THREADS[t].wait_buf
-    // **THE PARKED CALL'S MESSAGE IS RE-READ OUT OF ITS ARGS RECORD** (sawos
-    // design 18). `call_src`/`call_len` name the record rather than the body
-    // since a message grew handles, so the four words and the body's address
-    // come back together — and the caller is BLOCKED, so nothing it owns can
-    // have changed since `pipe_call` validated both addresses. A refusal here
-    // is a kernel bug for `copy_in_check`'s reason: the door already said yes
-    // while the caller was running, and a process's window is fixed for its
-    // life.
+    // The parked call's message is re-read out of its args record. `call_src`
+    // and `call_len` name the record, so the handle words and the body address
+    // come back together. The caller is blocked, so nothing it owns can have
+    // changed since `pipe_call` validated both addresses; a refusal here is a
+    // kernel bug, for `copy_in_check`'s reason: a process's window is fixed for
+    // its life.
     var args = PipeSendRecord(body: 0, len: 0, handles: [NO_HANDLE; PIPE_MSG_HANDLES])
     if let why = copy_in(p, ((&var args) as UnsafePointer<PipeSendRecord>) as UInt,
                          src, THREADS[t].call_len) {
@@ -1975,14 +1647,12 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
         }
     }
     EXCHANGES[x].len = len as UInt16
-    // **THE HANDLE WORDS ARE RE-VALIDATED HERE, AND THEY HAVE TO BE** (design
-    // 18's Sep-2 re-rule). The record was re-read out of the caller's memory
-    // one line above, so a SIBLING THREAD may have rewritten it since
-    // `check_send` blessed it — which is exactly why `hold_staged` asks the
-    // three questions again rather than trusting the call. There is no honest
-    // fault to raise from here: the caller is not the running process, so a slot
-    // that fails simply arrives empty, and nothing a rewritten record can say
-    // will stage a handle its process does not hold or may not send.
+    // The handle words are re-validated here, and have to be. The record was
+    // re-read from the caller's memory just above, so a sibling thread may have
+    // rewritten it since `check_send` blessed it; `hold_staged` therefore asks
+    // its three questions again. There is no fault to raise (the caller is not
+    // running), so a failing slot arrives empty, and no rewritten record can
+    // stage a handle its process does not hold or may not send.
     hold_staged(p, x, &args)
     EXCHANGES[x].reply_refs = 1
     EXCHANGES[x].request_refs = 0
@@ -1993,35 +1663,29 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
     true
 }
 
-/// **THE ORPHANED-CLAIM ARM: a process dying with threads parked ON A CLAIM**
-/// (design 10 ruling 4's rider names it; sawos design 17 D-2, widened by sawos
-/// design 22).
+/// Release the claims of threads parked on a claim when their process dies (the
+/// orphaned-claim arm).
 ///
-/// A parked caller's claim is a reference NO HANDLE TABLE HOLDS, so the
-/// teardown's close-all cannot reach it and it would otherwise pin a ring slot
-/// — and, worse, leave `PIPE_CALLER` naming a thread slot about to be recycled.
-/// This is the arm that drops it, and dropping it IS the abandonment: the claim
-/// column falls to zero, which is what `pipe_reply` already reads as
-/// abandoned-by-client, so the server's later reply answers `Err(PeerClosed)`
-/// with no new vocabulary anywhere.
+/// A parked caller's claim is a reference no handle table holds, so the
+/// teardown's close-all cannot reach it. It would pin a ring slot and leave
+/// `Exchange.caller` naming a thread slot about to be recycled. Dropping it is
+/// the abandonment: the claim column falls to zero, which `pipe_reply_status`
+/// reads as abandoned-by-client, so the server's later reply answers
+/// `Err(PeerClosed)`.
 ///
-/// **IT COVERS A THREAD PARKED IN `Resolve` WITH NO ARM OF ITS OWN** (ruling
-/// 12(b)'s `end_process` mirror). That is the teardown half of `park_resolve`'s
-/// unbind-without-unref: a parked resolver's entry is already gone from the
-/// table, so the close-all has nothing to find, and the reference it used to
-/// hold is on the claim column exactly where a fused caller's is. The claim is
-/// ABANDONED, the server's later `reply()` answers `PeerClosed`, and the loop
-/// below did not have to learn a second question to make it so.
+/// This covers a thread parked in `Resolve` with no arm of its own:
+/// `park_resolve` unbinds without unref, so the parked resolver's entry is
+/// already gone from the table and its reference sits on the claim column
+/// exactly where a fused caller's does.
 ///
-/// **IT RUNS BEFORE THE CLOSE-ALL, AND IN TWO PASSES.** Before, because the
-/// close-all drops endpoint columns and every one of those transitions notifies
-/// — and a notification must never find a thread of the process that is being
-/// torn down. Two passes, because the second one's unrefs CAN deliver: settling
-/// an exchange raises the room level, and serving a room waiter of this same
-/// dying process would be resuming a thread into a process that no longer has
-/// one. So the room waiters go first, which costs nothing at all (a room-parked
-/// call holds no exchange and therefore no reference), and by the time any
-/// reference is dropped this process has none left for a delivery to find.
+/// It runs before the close-all, in two passes. Before, because the close-all
+/// drops endpoint columns and every such transition notifies, and a
+/// notification must never find a thread of the process being torn down. Two
+/// passes, because the second pass's unrefs can deliver: settling an exchange
+/// raises the room level, and serving a room waiter of this dying process would
+/// resume a thread into a process that no longer has one. Room waiters go first
+/// (they hold no exchange and no reference), so by the time any reference is
+/// dropped this process has none left for a delivery to find.
 public(package) func release_pending_calls(p: Int) unsafe {
     var t: Int = 0
     while t < THREADS.capacity() {
@@ -2041,7 +1705,8 @@ public(package) func release_pending_calls(p: Int) unsafe {
     }
 }
 
-/// §2.4's signal: accumulate, NEVER block, and tell the Waiter if there is one.
+/// Spec §2.4's signal: accumulate, never block, and tell the Waiter if there is
+/// one.
 public(package) func signal_event(slot: Int, bits: UInt) unsafe {
     accumulate(slot, bits)
     // A signal of nothing is not a readiness. Both modes can produce it —
