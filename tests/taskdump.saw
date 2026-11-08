@@ -1,31 +1,32 @@
-// design 158 unit 3, freestanding: the task dump on bare metal, under QEMU.
+// Freestanding: the task dump on bare metal, under QEMU.
 //
-// This is the payoff the design was sold on. A kernel that dies with work in
-// flight has no debugger attached and no core to open; what it has is a serial
-// port. The dump walks its own task slots through the in-binary table and
-// writes every live task's logical stack straight to that port — no allocator,
-// no unwinder, no host, and built under `--no-hidden-alloc` like every other
-// kernel image.
+// A kernel that dies with work in flight has no debugger attached and no core
+// to open; what it has is a serial port. The dump walks its own task slots
+// through the in-binary table and writes every live task's logical stack
+// straight to that port: no allocator, no unwinder, no host, and built under
+// `--no-hidden-alloc` like every other kernel image.
 //
 // The kernel spawns a task, lets it park in a sleep, and dumps; then it panics
 // while that task is still parked, and the panic path dumps again on its own.
-// So the serial transcript carries both halves of unit 3 in order: the explicit
+// So the serial transcript carries both dumps in order: the explicit
 // `dump_tasks()` and the automatic post-panic one.
 //
-// THE STUB SEAMS BELOW ARE THIS TEST'S, not a kernel facility. SOS has no
-// reactor and no clock, and the cooperative executor's PARK path names both —
-// a freestanding link needs every name resolved even down a branch nothing
-// takes. These tasks only ever yield, so none of these is ever called; each
-// body is the honest "there is no such facility on this machine" answer rather
-// than a pretend one. `--runtime-provider` checks every signature against
-// sawc/rt/ABI.md, so they cannot drift from the contract they satisfy.
+// The stub seams below are this test's, not a kernel facility. `sosrt`
+// defines no reactor and no clock seam (the kernel's Clock objects are reached
+// by syscall, not through the runtime), and the cooperative executor's park
+// path names both, so a freestanding link needs every name resolved. Each
+// body is the honest "there is no such facility on this machine" answer
+// rather than a pretend one. `knap`'s sleep does reach the clock stub: its 0
+// never advances, so the sleeper stays parked, which is the state both dumps
+// need.
 //
-// BOTH ARCHES since design 187 closed DF-158c. It was arm64 only: on a 32-bit
-// target an `@export`ed seam returning `Int64` came out `i32` (and one
-// returning `Int` came out i64 — the two were swapped), so the clock stub below
-// and the executor's own `Int64` clock arithmetic disagreed and LLVM rejected
-// the module. The compiler's seam DECLARATIONS now carry the widths rt/ABI.md
-// gives them, which is what an `@export` of the same symbol unifies with.
+// `--runtime-provider` checks every stub against sawlang's `runtime/ABI.md`,
+// so they cannot drift from the contract they satisfy. The check compares
+// arity and width class on every target and refuses a mismatch with
+// `export.seam-signature`. That is why the clock stub returns `Int64`: the
+// ABI's clock seam is a 64-bit integer, and `Int` is a machine word, a
+// different class even on a 64-bit target. `UInt64` would pass as well; the
+// executor reads the value as unsigned.
 
 import kcore
 import std.task.*
@@ -76,20 +77,19 @@ func rt_op_budget_tick() -> Int {
 func rt_op_budget_reset() {
 }
 
-// The thread and mutex stand-ins the MT drain names live in
-// `taskdump_stubs.c`, not here: `__saw_rt_thread_spawn` takes a raw C function
-// pointer, which Saw cannot express (DF-113b), so it is one of the three bodies
-// that must be C wherever it appears.
+// `taskdump_stubs.c`, linked beside this file as the case's `csrc`, holds C
+// stand-ins for the runtime's thread, mutex and condition-variable names. They
+// stay out of `rt/common_c/support.c`, so no other image links them.
 
-// TWO frames deep, which is the honest proof of the walk on bare metal: the
-// dump has to reconstruct a logical stack the machine has no record of. It was
-// one frame until design 187 closed DF-158e — the freestanding profile compiles
-// to an object, an object compile did not treat `main` as an entry, and without
-// that the transform never embedded a nested suspending callee, so `ksleeper`
-// calling `knap` would have called it BLOCKING and the park would have run
-// inline on the kernel's only stack.
+// Two frames deep, which is the honest proof of the walk on bare metal: the
+// dump has to reconstruct a logical stack the machine has no record of.
 //
-// `knap` SLEEPS rather than yielding: a yield leaves the task ready, and the
+// The nest relies on the compiler embedding a nested suspending callee in its
+// caller under the freestanding profile, which compiles to an object rather
+// than a program with a `main`. Without that, `ksleeper` would call `knap`
+// blocking and the park would run inline on the kernel's only stack.
+//
+// `knap` sleeps rather than yielding: a yield leaves the task ready, and the
 // sweep would run it to completion before the watcher's turn.
 func knap(n: Int) -> Int {
     sleep(Duration.ms(5))
@@ -111,8 +111,8 @@ func kmain() {
     let a = g.spawn(ksleeper(4))
     let b = g.spawn(kwatcher())
     b.join()
-    // The panic runs while `a` is STILL PARKED, so the panic path has a live
-    // task to dump on its own — the automatic half of unit 3, on bare metal.
+    // The panic runs while `a` is still parked, so the panic path has a live
+    // task to dump on its own: the automatic dump, on bare metal.
     panic("SOS task dump: deliberate panic")
 }
 

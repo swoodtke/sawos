@@ -1778,7 +1778,7 @@ instruction after every syscall).
 **Statuses.** The status word is 0 for ok, else a small **`SosStatus`** enum
 tag. An enum with an `Ok` case is a status, not an error (`SosStatus.Ok`,
 `SosStatus.NoResource`, …), and the `Sos` prefix names whose status it is. The
-hosted runtime's `SysError` in sawlang's runtime ABI (`sawc/rt/ABI.md` at the
+hosted runtime's `SysError` in sawlang's runtime ABI (`runtime/ABI.md` at the
 pinned toolchain) is a separate frozen contract (errno tags, machine-parsed) and
 keeps its name; the two correspond and nothing more. An `Err(SosStatus.Ok)`
 never arises by construction: the wrapper boundary splits on the status — `Ok` →
@@ -2160,7 +2160,7 @@ child's panic ends in a `shutdown` request through its System handle: the launch
 mask of §12 withholds `Shutdown`, so the child dies by `AccessDenied`, and a
 child started with no tag received `NO_HANDLE` in its first argument register,
 so its runtime has no System handle parked (even if the launcher gave it one),
-prints nothing and dies by `BadHandle`. Sawlang's runtime ABI (`sawc/rt/ABI.md`)
+prints nothing and dies by `BadHandle`. Sawlang's runtime ABI (`runtime/ABI.md`)
 freezes `__saw_rt_panic` as `noreturn`; the Saw seam produces `Never` with a
 conditionless `while { }` that has no `break`.
 

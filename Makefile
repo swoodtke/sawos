@@ -1,18 +1,19 @@
 # sawos — the SOS microkernel, built with the Saw toolchain.
 #
-# The toolchain is RESOLVED, not assumed: tools/toolchain.py tries, in order,
-# SAWLANG_ROOT / SAWC / BLADE env overrides, a `sawc` on $PATH whose
-# --version matches sawlang.pin, then a cached fetch of the pinned sha.
-# Building the kernel needs a ROOT (SAWLANG_ROOT or the fetch) — a $PATH
-# sawc alone cannot supply the source packages (sosrt, imgformat).
+# The toolchain is resolved, not assumed: tools/toolchain.py tries, in order,
+# SAWLANG_ROOT / SAWC / BLADE env overrides, a `sawc` on $PATH (whose
+# --version must match sawlang.pin; a mismatch is refused, not skipped), then
+# a cached fetch of the pinned sha.
+# Building the kernel needs a sawlang checkout (SAWLANG_ROOT or the fetch): a
+# $PATH sawc alone cannot supply the `imgformat` package's sources.
 
 .PHONY: sos-test
 sos-test:
 	@python3 tools/sos_runner.py
 
-# NON-GATING (design 20): the ESP32-C3 board smoke — bringup + memory config
+# Non-gating: the ESP32-C3 board smoke — bringup + memory config
 # only, against the machine-local Espressif QEMU. Never part of sos-test,
-# never CI. Three cases: boot, timer, isolation.
+# never CI. Its cases are `c3_cases` in tools/sos_runner.py.
 #
 # It needs the Espressif toolchain under ~/.espressif (QEMU with the esp32c3
 # machine, and esp-clang for the no-A multilib row); the target says so and
