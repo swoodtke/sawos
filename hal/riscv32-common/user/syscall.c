@@ -1,34 +1,24 @@
-// SOS riscv32 user-side HAL: the syscall instruction (designs 140, 172, 23).
+// SOS riscv32 user-side HAL: the syscall instruction, shared by every riscv32
+// board.
 //
-// This is the ENTIRE architecture-dependent surface of an SOS process. An
+// This is the entire architecture-dependent surface of an SOS process. An
 // `ecall` is not expressible in Saw, and neither is naming the registers the
-// ABI puts arguments in, so this one file exists — and nothing else in a
-// process needs to know it is riscv32.
+// ABI puts arguments in, so this file exists and nothing else in a process
+// needs to know it is riscv32. It is C because of the `ecall` instruction plus
+// the register pinning the ABI requires; neither has a Saw spelling.
 //
-// ONE COPY, SHARED BY EVERY riscv32 BOARD (design 23). It names the ISA's
-// syscall instruction and the ABI's registers and nothing about a board, so
-// there was never a second thing for a per-board copy to say — and every root
-// and child manifest, whichever board it targets, names THIS path in its
-// `[sos.riscv32-unknown-none-elf] native` line.
+// It names the ISA's syscall instruction and the ABI's registers and nothing
+// about a board, so every root and child manifest, whichever board it targets,
+// names this path in its `[sos.riscv32-unknown-none-elf] native` line.
 //
-// WHY THIS IS C, and it is the only reason left (design 172's reason sweep):
-// the `ecall` INSTRUCTION plus the register pinning the ABI requires. Neither
-// has a Saw spelling and neither will without inline asm, which design 172
-// explicitly does not open. PERMANENT as written.
+// The runtime's hooks name no architecture (a byte reaches the console through
+// a System op, the same op on every profile), so they live in the arch-free
+// Saw module in `kernel/sysapi/`, not here.
 //
-// This file used to carry the runtime's two hooks and a parked handle beside
-// the stub, and its own header said it should be `sos_syscall1` and nothing
-// else as soon as DF-172e closed. Design 177 closed it, so design 172 part 2
-// moved them: they name no architecture — a byte reaches the console through a
-// System op, which is the same op on both profiles — so two per-arch C copies
-// were two copies of one thing. They are one arch-free Saw module now, in
-// `kernel/sysapi/`, beside the System object whose authority they use.
+// `../kernel/sink.c` is the kernel's counterpart, shared the same way;
+// `hal/arm64/user/` is this file for arm64.
 //
-// `../kernel/sink.c` beside this file is the kernel's counterpart, shared the
-// same way; `hal/arm64/user/` is this file for Profile B, and is now the
-// same six lines.
-//
-// ABI (spec.md §5.7): a0 = HANDLE, a7 = OP, args a1-a5, `ecall`; returns
+// ABI (spec.md §5.7): a0 = handle, a7 = op, args a1-a3, `ecall`; returns
 // a0 = status word, a1 = value. Every syscall is an object op, so there is no
 // form of this that does not take a handle.
 
@@ -47,12 +37,11 @@ u32 sos_syscall1(u32 handle, u32 op, u32 arg0) {
     return a0;
 }
 
-// Three arguments AND the value register, for the ops that answer with one: a
-// created thread's handle, a joined thread's exit code, a process's status word
-// (design 178 M2 unit 2). The value comes back through a pointer rather than in
-// the return, because the Saw side declares these symbols against a C ABI whose
-// whitelist has no aggregate return — one out-parameter is the shape that
-// crosses. Ops with fewer arguments pass zeros.
+// Three arguments and the value register, for the ops that answer with one: a
+// created thread's handle, a joined thread's exit code, a process's status
+// word. The value comes back through a pointer rather than in the return,
+// because the Saw side declares these symbols against a C ABI whose whitelist
+// has no aggregate return. Ops with fewer arguments pass zeros.
 u32 sos_syscall3(u32 handle, u32 op, u32 arg0, u32 arg1, u32 arg2, u32 *value_out) {
     register u32 a0 __asm__("a0") = handle;
     register u32 a1 __asm__("a1") = arg0;

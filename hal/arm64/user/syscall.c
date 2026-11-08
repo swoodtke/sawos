@@ -1,41 +1,30 @@
-// SOS arm64 user-side HAL: the syscall instruction (designs 162, 172).
+// SOS arm64 user-side HAL: the syscall instruction.
 //
-// This is the ENTIRE architecture-dependent surface of an SOS process. An `svc`
+// This is the entire architecture-dependent surface of an SOS process. An `svc`
 // is not expressible in Saw, and neither is naming the registers the ABI puts
-// arguments in, so this one file exists — and nothing else in a process needs
-// to know it is arm64.
+// arguments in, so this file exists and nothing else in a process needs to
+// know it is arm64. It is C because of the `svc` instruction plus the register
+// pinning the ABI requires; neither has a Saw spelling.
 //
-// WHY THIS IS C, and it is the only reason left (design 172's reason sweep):
-// the `svc` INSTRUCTION plus the register pinning the ABI requires. Neither has
-// a Saw spelling and neither will without inline asm, which design 172
-// explicitly does not open. PERMANENT as written.
+// The runtime's hooks name no architecture (a byte reaches the console through
+// a System op, the same op on every profile), so they live in the arch-free
+// Saw module in `kernel/sysapi/`, not here.
 //
-// This file used to carry the runtime's two hooks and a parked handle beside
-// the stub, and its own header said it should be `sos_syscall1` and nothing
-// else as soon as DF-172e closed. Design 177 closed it, so design 172 part 2
-// moved them: they name no architecture — a byte reaches the console through a
-// System op, which is the same op on both profiles — so two per-arch C copies
-// were two copies of one thing. They are one arch-free Saw module now, in
-// `kernel/sysapi/`, beside the System object whose authority they use.
+// `hal/arm64/kernel/` is the kernel's counterpart; `hal/riscv32-common/user/`
+// is this file for riscv32.
 //
-// `hal/arm64/kernel/` is the kernel's counterpart; `hal/riscv32/user/`
-// is this file for Profile A, and is now the same six lines.
-//
-// ABI (spec.md §5.7): x0 = HANDLE, x8 = OP, args x1-x5, `svc #0`; returns
+// ABI (spec.md §5.7): x0 = handle, x8 = op, args x1-x3, `svc #0`; returns
 // x0 = status word, x1 = value. Every syscall is an object op, so there is no
 // form of this that does not take a handle.
 //
-// WHY x8 AND NOT x6 (design 162 decision 1). The op could have gone in the
-// first free argument register, but x8 is where AArch64 Linux puts a syscall
-// number, so every disassembler, every debugger script and every reader who has
-// seen one arm64 syscall already reads this one correctly — and it leaves
-// x0-x5 as a clean run of argument registers. The RISC-V profile makes the same
-// trade with a7.
+// The op goes in x8, not the first free argument register, because x8 is where
+// AArch64 Linux puts a syscall number, so disassemblers and debugger scripts
+// read it correctly, and x0-x3 stay a clean run of argument registers. The
+// riscv32 profile makes the same trade with a7.
 //
-// WIDTH: the registers are 64-bit and so is this process's `UInt`, so the
-// declarations Saw makes against these symbols line up with no truncation
-// anywhere. The riscv32 counterpart says `unsigned int` for exactly the same
-// reason.
+// Width: the registers are 64-bit and so is this process's `UInt`, so Saw's
+// declarations against these symbols line up with no truncation. The riscv32
+// counterpart says `unsigned int` for the same reason.
 
 typedef unsigned long u64;
 
@@ -52,12 +41,11 @@ u64 sos_syscall1(u64 handle, u64 op, u64 arg0) {
     return x0;
 }
 
-// Three arguments AND the value register, for the ops that answer with one: a
-// created thread's handle, a joined thread's exit code, a process's status word
-// (design 178 M2 unit 2). The value comes back through a pointer rather than in
-// the return, because the Saw side declares these symbols against a C ABI whose
-// whitelist has no aggregate return — one out-parameter is the shape that
-// crosses. Ops with fewer arguments pass zeros.
+// Three arguments and the value register, for the ops that answer with one: a
+// created thread's handle, a joined thread's exit code, a process's status
+// word. The value comes back through a pointer rather than in the return,
+// because the Saw side declares these symbols against a C ABI whose whitelist
+// has no aggregate return. Ops with fewer arguments pass zeros.
 u64 sos_syscall3(u64 handle, u64 op, u64 arg0, u64 arg1, u64 arg2, u64 *value_out) {
     register u64 x0 __asm__("x0") = handle;
     register u64 x1 __asm__("x1") = arg0;

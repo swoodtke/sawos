@@ -1,20 +1,18 @@
-// SOS root server (design 140; sos/spec.md §12) — U-mode.
+// SOS root server (spec.md §12), U-mode.
 //
-// Root is the first and only process the kernel loads. Everything else — the
-// launcher, the name service, every later process — is root's job, not the
-// kernel's (§12: splitting them out later must require zero kernel changes).
+// Root is the first process, and the only one the kernel loads on its own.
+// Everything else (the launcher, the name service, every later process) is
+// root's job, not the kernel's.
 //
-// v1 proves the boundary and nothing more: print a banner and stop the machine.
-// What makes that worth booting is HOW it prints. Root holds no PMP grant for
-// the UART; a character reaches the console only because root asked the System
-// object to put it there, holding a handle carrying `SystemRight.Debug`. Take the
-// handle away and root is mute — which is exactly the property the M/U split is
-// supposed to have.
+// Root prints a banner and stops the machine. It holds no memory grant for the
+// UART: a character reaches the console only because root asks the System
+// object to put it there, through a handle carrying `SystemRight.Debug`.
+// Without that handle root is mute.
 //
-// NOTE WHAT IS NOT HERE: no op numbers, no `ecall`, no syscall stub, and no
-// architecture. All of that belongs to the kernel package and is reached
-// through the `sos` module it exports (§5.7's vDSO discipline — numbers are not
-// ABI). This file would build for arm64 unchanged.
+// This file has no op numbers, no `ecall`, no syscall stub and no
+// architecture. Those belong to the kernel package and are reached through the
+// `sos` module it exports (spec.md §5.7: numbers are not ABI). It builds for
+// either architecture unchanged.
 
 import sos.{System}
 
@@ -25,21 +23,14 @@ static EXIT_OK: UInt = 0
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
-    // The TYPED SAW altitude: a method on a handle.
-    //
-    // A failure here has nowhere to be reported TO — the console is the thing
-    // that would have failed — so it is deliberately dropped rather than
-    // dressed up as handled.
+    // Typed altitude: a method on a handle. A failure has nowhere to be
+    // reported, since the console is what would have failed, so it is dropped.
     let _ = system.debug_print("SOS root: hello from U-mode via a System op\n")
 
-    // The RUNTIME SEAM altitude, exercised rather than merely linked. `print`
-    // reaches the console through `__saw_rt_write`, which `sosrt` implements
-    // over the `sos_rt_write` hook, which the kernel's own `sos` module
-    // implements over a System op — so this line runs the whole seam chain,
-    // and every hop of it is Saw down to the syscall instruction.
-    //
-    // It is also design 137 working in U-mode: a format argument rendered into
-    // stack scratch, with no allocator anywhere in this process.
+    // Runtime-seam altitude. `print` reaches the console through
+    // `__saw_rt_write`, which `sosrt` implements over the `sos_rt_write` hook,
+    // which the kernel's `sos` module implements over a System op. The format
+    // argument is rendered into stack scratch, so `print` allocates nothing.
     print("SOS root: boot handle {}", boot_handle)
 
     let _ = system.shutdown(EXIT_OK)

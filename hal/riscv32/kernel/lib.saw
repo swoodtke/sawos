@@ -1,37 +1,33 @@
-//! The QEMU `virt` board HAL, Saw half (designs 112, 140, 162, 23) — riscv32,
-//! M-mode.
+//! The QEMU `virt` board HAL, Saw half: riscv32, M-mode.
 //!
-//! THE BOARD HALF ONLY, SINCE DESIGN 23. Everything architectural — the trap
-//! frame, the cause decoding, the syscall accessors, the whole PMP staging
-//! apparatus, the payload/region linker seams and the protection budget — lives
-//! in `rv32core` (`hal/riscv32-common/kernel/`), shared with every riscv32
-//! board, and is re-exported below so that `kcore`'s view of `hal` is exactly
-//! what it always was. What is left here is what makes this machine THIS
-//! machine: an NS16550A console, the SiFive test finisher, the CLINT, the PLIC,
-//! and where RAM is.
+//! This is the board half only. Everything architectural (trap frame, cause
+//! decoding, syscall accessors, the PMP staging apparatus, the payload/region
+//! linker seams and the protection budget) lives in `rv32core`
+//! (`hal/riscv32-common/kernel/`), shared with every riscv32 board, and is
+//! re-exported below so that `kcore` sees one `hal` surface. What is left
+//! here makes this machine this machine: an NS16550A console, the SiFive test
+//! finisher, the CLINT, the PLIC, and where RAM is.
 //!
-//! Everything the SOS kernel needs from THIS machine, and nothing more. The
-//! kernel core above it (`kernel/core/`) names no architecture at all: it
-//! reaches the board, the privilege transition and the memory-protection
-//! hardware only through the surface below, which `hal/arm64/kernel/`
-//! implements the same way for Profile B. `ABI.md` beside this file is the
-//! contract; `boot.S` is the part of it that cannot be Saw, and `sink.c` is now
-//! one copy in the common directory.
+//! The kernel core above (`kernel/core/`) names no architecture. It reaches the
+//! board, the privilege transition and the memory-protection hardware only
+//! through the surface below, which `hal/arm64/kernel/` implements the same way
+//! for Profile B. `ABI.md` beside this file is the contract; `boot.S` is the
+//! part of it that cannot be Saw, and `sink.c` is shared from the common
+//! directory.
 //!
 //! Addresses and machine words are `UInt` throughout, never `Int`. On this
-//! target `Int` is 32-bit SIGNED, so a RAM address like 0x8020_0000 lands in
-//! its negative half — and would mean a different number again on the 64-bit
-//! profile. See DF-140a in designs/todo.md.
+//! target `Int` is 32-bit signed, so a RAM address like 0x8020_0000 lands in
+//! its negative half.
 
 // The arch-free half of the console and the stop: the sink trait this file's
 // UART conforms to, the one write loop over it, and the exit-status promotion
-// both HALs used to spell out for themselves (design 172 review round).
+// shared by every HAL.
 import sosrt.{ConsoleSink, console_write, abort_status}
 
-// THE `hal` SEAM, RE-EXPORTED (design 23). `kernel/core` imports the module
-// named `hal` and reaches every one of these through it; they live in
-// `rv32core` because they are facts about riscv32 rather than about this board,
-// and this line is what keeps that invisible from above.
+// The `hal` seam, re-exported. `kernel/core` imports the module named `hal` and
+// reaches every one of these through it; they live in `rv32core` because they
+// are facts about riscv32 rather than about this board, and this line keeps
+// that invisible from above.
 public import rv32core.{
     arch_tag, cause_tag, device_window_ok, FRAME_BYTES, frame_init,
     GRANT_ROW_BUDGET, image_link_base, IRQ_NONE, IRQ_TIMER, is_interrupt,
@@ -45,23 +41,23 @@ public import rv32core.{
     syscall_op, syscall_return, trap_pc, virt_to_phys,
 }
 
-// What THIS FILE needs from the shared core and `kcore` does not: the cause
+// What this file needs from the shared core and `kcore` does not: the cause
 // word's interrupt flag and its architectural codes, which this board's
 // `irq_claim` decodes against the PLIC, and the machine word width its split
 // 64-bit timer registers are halves of.
 import rv32core.{INTERRUPT_FLAG, InterruptCause, WORD_BITS}
 
-// The two C leaves this BOARD calls. The rest of `sink.c`'s surface is declared
-// in `rv32core`, which calls it; an `extern` carries no visibility and cannot be
-// re-exported (SL-6), so the block is split by CALLER and the two halves name
-// disjoint symbols.
+// The two C leaves this board calls. The rest of `sink.c`'s surface is
+// declared in `rv32core`, which calls it; an `extern` carries no visibility and
+// cannot be re-exported, so the block is split by caller and the two halves
+// name disjoint symbols.
 extern "C" {
     func sos_mie_write(mask: UInt)
     func sos_wait_for_irq()
 }
 
 // =============================================================================
-// NS16550A UART (design 112's blessed MMIO idiom: register block + driver)
+// NS16550A UART
 // =============================================================================
 
 /// The NS16550A register block. Registers are byte-spaced; the struct's natural
@@ -78,8 +74,8 @@ struct UartRegs {
     scr: UInt8,             // +7  scratch
 }
 
-/// The console driver. A SAFE type (unsafety is not transitive — design 130):
-/// only the methods reaching through `regs` carry the `unsafe` effect.
+/// The console driver. A safe type (unsafety is not transitive): only the
+/// methods reaching through `regs` carry the `unsafe` effect.
 struct Uart16550 {
     regs: UnsafeMemory<UartRegs, Device>,
 }
@@ -90,13 +86,13 @@ extension Uart16550 {
     }
 }
 
-/// The two register touches, and nothing else — no interrupts in M1, so the
-/// transmitter is polled. Every access is a volatile Device load/store.
+/// The two register touches, and nothing else. The transmitter is polled, and
+/// every access is a volatile Device load/store.
 ///
-/// `write_byte` and the panic path's write LOOP are `sosrt`'s, once, generic
-/// over this conformance and monomorphized here (design 172 review round). What
-/// makes a 16550 a 16550 is the pair below: TX holding register empty is LSR
-/// bit 5 SET, and the byte goes to THR.
+/// `write_byte` and the panic path's write loop are `sosrt`'s, generic over
+/// this conformance and monomorphized here. What makes a 16550 a 16550 is the
+/// pair below: TX holding register empty is LSR bit 5 set, and the byte goes
+/// to THR.
 extension Uart16550: ConsoleSink {
     func can_write(&self) unsafe -> Bool {
         (self.regs.lsr.read() & LSR_TX_EMPTY) != 0
@@ -116,9 +112,8 @@ struct SifiveTestRegs {
 }
 
 /// Writing FINISHER_PASS exits the emulator with status 0; FINISHER_FAIL
-/// carries an exit code in its upper half. (`boot.S`'s `kernel_fault` and
-/// `sink.c`'s `sos_rt_abort`, which `__saw_rt_panic` calls, drive the same
-/// device from asm and C.)
+/// carries an exit code in its upper half. (`boot.S`'s `kernel_fault` drives
+/// the same device from assembly.)
 struct SifiveTest {
     regs: UnsafeMemory<SifiveTestRegs, Device>,
 }
@@ -143,17 +138,17 @@ static FAIL_CODE_SHIFT: Int = 16
 
 /// The core-local timer, whose comparator this hart's periodic tick comes from.
 /// The counter is at its own address rather than at an offset from the
-/// comparator — they are far apart in this block, so they are two views.
+/// comparator: they are far apart in this block, so they are two views.
 static TIMER_CMP_BASE: UInt = 0x0200_4000
 static TIMER_COUNT_BASE: UInt = 0x0200_BFF8
 /// The board's timebase, as counter units per microsecond: 10 MHz on this
-/// machine (`timebase-frequency` in its device tree). There is no register to
-/// read it from — it is a property of the board, which is why it is here.
+/// machine (`timebase-frequency` in its device tree). No register holds it; it
+/// is a property of the board.
 static TIMER_UNITS_PER_US: UInt = 10
 
-/// Nanoseconds per counter unit — the timebase above, inverted, because the
-/// seam speaks nanoseconds and this counter does not. It divides exactly here
-/// (10 MHz is 100 ns a tick), so no resolution is lost stating it this way.
+/// Nanoseconds per counter unit: the timebase above, inverted, because the seam
+/// speaks nanoseconds and this counter does not. It divides exactly (10 MHz is
+/// 100 ns a tick), so no resolution is lost.
 static NS_PER_UNIT: UInt64 = 100
 
 /// The platform interrupt controller, in the four windows this kernel uses.
@@ -165,50 +160,46 @@ static PLIC_CONTEXT_BASE: UInt = 0x0C20_0000
 /// Sources this board wires (`riscv,ndev`). Source 0 is reserved as "no
 /// source", which is what a claim returns when it has nothing to give.
 static PLIC_MAX_SOURCE: UInt = 95
-/// The line the board's console sits on — the one device this kernel can make
+/// The line the board's console sits on: the one device this kernel can make
 /// interrupt on demand, which is what `irq_raise_selftest_line` spends.
 static CONSOLE_IRQ: UInt = 10
 
 // =============================================================================
-// Identity (design 162)
+// Identity
 // =============================================================================
 
-
-// **THE TWO TIER FACTS ARE FUNCTIONS, NOT `static`s, AND THAT IS FORCED**
-// (sawos design 35, M5 unit 4 — SL-25).
+// The two tier facts are functions, not `static`s, and that is forced. A
+// module-level `static` does not carry module identity the way a free function
+// does: two modules in one compilation unit cannot both declare
+// `PROT_ISOLATED`, while both may declare `prot_isolated()` and each caller
+// gets its own. A build profile is a module that overrides part of another's
+// seam (`hal/riscv32-flat` re-exports this board's whole device half and
+// answers differently about protection), so a seam value a profile may need to
+// override cannot be a `static`. The other HAL constants (`PROT_GRAIN`,
+// `GRANT_ROW_BUDGET`, `FRAME_BYTES`, the memory map) stay `static`s because
+// nothing overrides them.
 //
-// A module-level `static` does not carry module identity the way a free function
-// does: two modules in one compilation unit cannot both declare `PROT_ISOLATED`,
-// however few things import which, while both may declare `prot_isolated()` and
-// each caller gets its own. A BUILD PROFILE is exactly a module that overrides
-// part of another's seam — `hal/riscv32-flat` re-exports this board's whole
-// device half and answers differently about protection — so a seam value a
-// profile may need to override CANNOT be a `static`. The other HAL constants
-// (`PROT_GRAIN`, `GRANT_ROW_BUDGET`, `FRAME_BYTES`, the memory map) stay
-// `static`s because nothing overrides them: they are declared once and
-// re-exported, which is the shape that works.
-//
-// Both fold anyway — a leaf returning a literal inlines — so `load_domain`'s
+// Both fold anyway (a leaf returning a literal inlines), so `load_domain`'s
 // replay loop still compiles away where it is dead.
-/// **DOES THIS PROFILE REBUILD ITS PROTECTION IMAGE AT EVERY SWITCH?** Yes —
-/// the PMP replay in `load_domain` IS the switch here, which is why
+
+/// Whether this profile rebuilds its protection image at every switch. It does:
+/// the PMP replay in `load_domain` is the switch here, which is why
 /// `prot_switch` is empty.
 public func prot_replay_at_switch() -> Bool { true }
 
-/// **CAN THIS PLATFORM DENY?** Yes. This is the TIER WORD (sawos design 35;
-/// designs 19 and 25 D-4) — the only protection fact that reaches USERSPACE.
-/// `kernel/core` maps it to `sosabi.ProtectionTier` and `SystemOp.TierGet` hands
-/// the word out, where a program that relies on isolation reads it once and
-/// refuses to run if it reads `Flat`.
+/// Whether this platform can deny. It can. This is the tier word, the only
+/// protection fact that reaches userspace: `kernel/core` maps it to
+/// `sosabi.ProtectionTier` and `SystemOp.TierGet` hands the word out, where a
+/// program that relies on isolation reads it once and refuses to run if it
+/// reads `Flat`.
 ///
 /// It answers a `Bool` and not that enum because the dependency order forbids
-/// the enum here — a board's `lib.saw` imports `sosrt`, never `sosabi` — and
-/// because two words is exactly what a `Bool` holds.
+/// the enum here (a board's `lib.saw` imports `sosrt`, never `sosabi`).
 ///
-/// **IT IS A CLAIM ABOUT THE HARDWARE, NOT ABOUT THE `prot_*` BODIES.** What
-/// `true` promises is that an access a process was not granted FAULTS, which on
-/// this board is RISC-V's own default-deny rule: the kernel, the UART and the
-/// finisher are locked away from root by SAYING NOTHING about them.
+/// It is a claim about the hardware, not about the `prot_*` bodies. `true`
+/// promises that an access a process was not granted faults, which on this
+/// board is RISC-V's default-deny rule: the kernel, the UART and the finisher
+/// are locked away from root by saying nothing about them.
 public func prot_isolated() -> Bool { true }
 
 /// What this kernel says it is booting on, for the banner.
@@ -225,21 +216,20 @@ public func arch_name() -> String {
 /// The kernel owns the machine, so this is the UART directly. Byte-at-a-time is
 /// what the seam needs: the arch-free half above formats, this half places.
 ///
-/// THE HANDOVER PROTOCOL, DEVICE HALF (design 178's finale constraint 4; the
-/// protocol itself is stated on `kcore`'s `Console`). This board has ONE UART
-/// and a driver process may be granted its page, so after the handover marker
-/// there can be a second writer on this device. What that costs is bounded and
-/// worth knowing: the two writers share the transmit holding register and the
+/// The handover protocol's device half (the protocol itself is stated on
+/// `kcore`'s `Console`). This board has one UART and a driver process may be
+/// granted its page, so after the handover marker there can be a second writer
+/// on this device. The two writers share the transmit holding register and the
 /// line-status bit this loop polls, so a byte written here between two of the
-/// process's lands BETWEEN them — interleaved, never lost or corrupted, since
-/// each write is one register store guarded by its own poll. So the kernel's
-/// diagnostic paths stay usable after handover (a fault report is still
-/// readable), and the protocol is what keeps them from being NOISE on a
-/// transcript that is still being written.
+/// process's lands between them: interleaved, never lost or corrupted, since
+/// each write is one register store guarded by its own poll. The kernel's
+/// diagnostic paths therefore stay usable after handover, and the protocol
+/// keeps them from being noise on a transcript that is still being written.
 ///
-/// What the kernel never touches is the RECEIVE side or the interrupt-enable
-/// register: the transmitter is polled here and always has been, so a driver
-/// that owns receive owns it alone.
+/// The console path never touches the receive side or the interrupt-enable
+/// register: the transmitter is polled here, so a driver that owns receive owns
+/// it alone. (`irq_raise_selftest_line` writes the interrupt-enable register,
+/// for interrupt bring-up only.)
 public func console_byte(b: UInt8) unsafe {
     Uart16550(at: UART_BASE).write_byte(b)
 }
@@ -255,11 +245,11 @@ public func exit_pass() unsafe {
     while true { }
 }
 
-/// Terminate the emulator with a NON-ZERO status.
+/// Terminate the emulator with a non-zero status.
 ///
-/// WHAT status is `sosrt.abort_status`'s call — a zero code would make the
+/// What status is `sosrt.abort_status`'s call: a zero code would make the
 /// finisher report success, and the rule that a failing exit never reads as a
-/// passing one is decided once, for both profiles. HOW to stop is this file's:
+/// passing one is decided once, for every board. How to stop is this file's:
 /// the SiFive test finisher takes the code in its upper half.
 public func exit_fail(code: UInt) unsafe {
     SifiveTest(at: TEST_BASE).regs.finisher.write(
@@ -268,46 +258,37 @@ public func exit_fail(code: UInt) unsafe {
 }
 
 // =============================================================================
-// The runtime's two hooks (design 172 unit 4)
+// The runtime's two hooks
 // =============================================================================
 //
-// `sosrt` (rt/common/src/lib.saw) implements the frozen `__saw_rt_*` seams
-// over exactly two per-side hooks: where a byte goes, and how the machine
-// stops. The kernel HAL answers "the UART" and "the test finisher". Both hooks
-// were C; both are Saw now, and since design 172 part 2 so is everything above
-// them. They stay on the BOARD side of design 23's split, because both of them
-// name the board's own device.
+// `sosrt` (rt/common/src/lib.saw) implements the frozen `__saw_rt_*` seams over
+// exactly two per-side hooks: where a byte goes, and how the machine stops. The
+// kernel HAL answers "the UART" and "the test finisher". Both stay on the board
+// side because both name the board's own device.
 
 /// Stop the machine with a non-zero status, for the common runtime.
 ///
 /// The promote-zero rule lives in `exit_fail`, so this is the seam name and
-/// nothing else — there is one place that decides a failing exit never reads as
-/// a passing one.
+/// nothing else.
 ///
-/// `-> Never` states in the type what the C spelled `__attribute__((noreturn))`
-/// and what `sosrt` declares this hook to be. `exit_fail` diverges on its own
-/// (it spins if the finisher write is somehow ignored) but is typed `Void`, so
-/// the trailing loop is what carries the promise up to this signature.
+/// `-> Never` states in the type what `sosrt` declares this hook to be.
+/// `exit_fail` diverges on its own (it spins if the finisher write is somehow
+/// ignored) but is typed `Void`, so the trailing loop carries the promise up to
+/// this signature.
 @export("sos_rt_abort")
 public func rt_abort(code: UInt32) unsafe -> Never {
     exit_fail(code as UInt)
     while { }
 }
 
-/// Write `len` bytes at `ptr` to the console. THE PANIC PATH'S WRITER.
+/// Write `len` bytes at `ptr` to the console. The panic path's writer.
 ///
-/// The loop itself is `sosrt.console_write`, once for both profiles, and its
-/// CHECK-FREEDOM contract (DF-172b) is stated there — this file supplies the
-/// device it walks. What is per-arch is the sink; what is per-arch about the
-/// sink is two register touches.
-///
-/// Verified rather than asserted, on THIS instantiation: `--emit-ir` shows the
-/// generic loop, the trait's default `write_byte` and both accessor bodies
-/// fully inlined, leaving `ptrtoint`, a plain `load i8`, the volatile LSR load,
-/// an `and`, an `icmp`, the volatile THR store and `add`/`add -1`. No
-/// `llvm.uadd.with.overflow`, no bounds check, no trap block, no call to
-/// `__saw_rt_panic`. A panic inside the panic reporter is not unlikely here; it
-/// is unreachable.
+/// The loop is `sosrt.console_write`, shared by every board; its check-freedom
+/// contract and the machine code that shows it are stated there. This file
+/// supplies the device it walks. On this instantiation the `-Oz` machine code
+/// is a byte loop calling `write_byte` directly, and neither has an overflow
+/// check, a bounds check, a trap or a call to `__saw_rt_panic`, so a panic
+/// inside the panic reporter is unreachable.
 @export("sos_rt_write")
 public func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
     let sink = Uart16550(at: UART_BASE)
@@ -318,73 +299,65 @@ public func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
 // This board's memory map
 // =============================================================================
 
-/// Where RAM is on this board, and how much of it there is — the window
+/// Where RAM is on this board, and how much of it there is: the window
 /// `map_target_ok` judges a RAM mapping against.
 ///
 /// QEMU's `virt` machine places RAM at this base and gives it 128 MiB by
 /// default, which is what the harness runs. It is stated here rather than
 /// derived because nothing on this profile publishes it: the linker script
-/// knows where the KERNEL is, not where memory ends.
+/// knows where the kernel is, not where memory ends.
 public static RAM_BASE: UInt = 0x8000_0000
 public static RAM_TOP: UInt = 0x8800_0000
 
-/// **MAY `[base, top)` BE INSTALLED AS A RAM ROW IN A USER DOMAIN?** (sawos
-/// design 6 D-4.)
+/// May `[base, top)` be installed as a RAM row in a user domain?
 ///
-/// THE POINT OF THE PREDICATE IS THE ALTITUDE IT MOVES THE REFUSAL TO. Both
-/// profiles have addresses a grant cannot express, and the loader's answer for
-/// one has always been to stop the machine — a memory map that outgrew the
-/// hardware is a KERNEL bug and reads as one. A `map()` is different: the range
-/// comes from a region a PROCESS chose, so an unmappable one is a caller error,
-/// and the kernel must answer `BadArg` at the op rather than dying inside the
-/// protection primitive.
+/// Both profiles have addresses a grant cannot express, and the loader stops
+/// the machine on one, since a memory map that outgrew the hardware is a kernel
+/// bug. A `map()` is different: the range comes from a region a process chose,
+/// so an unmappable one is a caller error, and the kernel must answer `BadArg`
+/// at the op rather than die inside the protection primitive.
 ///
 /// On this profile a PMP entry can name any address, so the predicate accepts
-/// everything in RAM — which is not vacuous: it is what refuses a map of a
-/// DEVICE window through the RAM door, and a region whose bounds have wrapped.
+/// everything in RAM. That is not vacuous: it refuses a map of a device window
+/// through the RAM door, and a region whose bounds have wrapped.
 ///
-/// BOARD-SIDE, unlike its `device_window_ok` sibling: the granularity rule is
-/// PMP's and is shared, but WHERE RAM IS is this machine's alone.
+/// Board-side, unlike its `device_window_ok` sibling: the granularity rule is
+/// PMP's and is shared, but where RAM is belongs to this machine alone.
 public func map_target_ok(base: UInt, top: UInt) -> Bool {
     base < top && base >= RAM_BASE && top <= RAM_TOP
 }
 
-/// **MAY `[base, top)` BE HANDED TO A USER DOMAIN AS PHYSICAL BACKING?** (sawos
-/// design 33.)
+/// May `[base, top)` be handed to a user domain as physical backing?
 ///
-/// **THE SAME BODY AS `map_target_ok`, AND THAT IS THE TIER SPLIT IN ONE FILE.**
-/// Placement split one question into two — which INPUT addresses a domain may
-/// use, and which OUTPUT frames it may reach — and on a machine that does not
-/// translate they are the same question, because there is only one address. The
-/// arm64 HAL answers them differently (a 4 MiB grant window against 128 MiB of
-/// RAM); here the two predicates are deliberately identical rather than one
-/// forwarding to the other, so that each states its own question where a reader
-/// of either finds it.
+/// The same body as `map_target_ok`, which is the tier split in one file. The
+/// two questions are which input addresses a domain may use and which output
+/// frames it may reach; on a machine that does not translate they are the same
+/// question, because there is only one address. The arm64 HAL answers them
+/// differently (a 4 MiB grant window against 128 MiB of RAM). The two
+/// predicates are deliberately identical rather than one forwarding to the
+/// other, so each states its own question where a reader of either finds it.
 public func map_source_ok(base: UInt, top: UInt) -> Bool {
     base < top && base >= RAM_BASE && top <= RAM_TOP
 }
 
-/// Root's region on this board (design 140 pin; mirrored by the root linker
-/// script and recorded in `virt.ld`'s memory map). Segments load from the base;
-/// the stack occupies the top `ROOT_STACK_LEN` bytes.
+/// Root's region on this board (mirrored by the root linker script and recorded
+/// in `virt.ld`'s memory map). Segments load from the base; the stack occupies
+/// the top `ROOT_STACK_LEN` bytes.
 public static ROOT_LOAD_BASE: UInt = 0x8020_0000
 public static ROOT_REGION_TOP: UInt = 0x8024_0000
 public static ROOT_STACK_LEN: UInt = 0x4000
 
-/// The ONE device window this board offers a process (design 178's finale
-/// constraint 2, ruled Aug 16, user): the console UART's page.
+/// The one device window this board offers a process: the console UART's page.
 ///
-/// A PAGE, NOT THE REGISTER BLOCK, and that is not rounding for tidiness. The
-/// eight registers occupy eight bytes, but this board's emulator only puts an
-/// access on its fast path when the protection region covers a whole aligned
-/// page — DF-178b, where a byte-tight kernel region made user mode two thousand
-/// times slower. A driver's register touch is the hottest thing in an interrupt
-/// path, so the grant is page-aligned and page-sized and the extra bytes belong
-/// to nothing.
+/// A page, not the register block. The eight registers occupy eight bytes, but
+/// this board's emulator only puts an access on its fast path when the
+/// protection region covers a whole aligned page, and a byte-tight region makes
+/// user mode far slower. A driver's register touch is the hottest thing in an
+/// interrupt path, so the grant is page-aligned and page-sized and the extra
+/// bytes belong to nothing.
 ///
-/// It is also what makes ONE NAPOT entry express the window: a naturally
-/// aligned power-of-two region is one PMP entry rather than a TOR pair, which
-/// matters when the budget is four regions.
+/// A page is also what lets one NAPOT entry express the window: a naturally
+/// aligned power-of-two region is one PMP entry rather than a TOR pair.
 public static DEVICE_GRANT_BASE: UInt = UART_BASE
 public static DEVICE_GRANT_LEN: UInt = 0x1000
 
@@ -393,40 +366,38 @@ static_assert(DEVICE_GRANT_LEN >= PROT_GRAIN,
 static_assert((DEVICE_GRANT_BASE % DEVICE_GRANT_LEN) == 0,
               "a NAPOT region must be aligned to its own size")
 
-/// An address the KERNEL itself cannot reach on this target — nothing is there
+/// An address the kernel itself cannot reach on this target: nothing is there
 /// and nothing maps it. The harness's kernel-fault case reads it to prove a
-/// fault taken in kernel mode is diagnosed rather than hung on (M0's
-/// discipline), and it is per-target because "unmapped" is: on a profile whose
-/// kernel runs with an MMU on, low addresses are the DEVICE window and reading
-/// one succeeds.
+/// fault taken in kernel mode is diagnosed rather than hung on. It is
+/// per-target because "unmapped" is: on a profile whose kernel runs with an MMU
+/// on, low addresses are the device window and reading one succeeds.
 public static UNMAPPED_PROBE: UInt = 0x0000_0000
 
 // =============================================================================
-// Which sources may interrupt this hart (design 178 M2 unit 1)
+// Which sources may interrupt this hart
 // =============================================================================
 //
 // Two masks stand between a device and this kernel, and they are not
-// interchangeable. THIS one is the hart's: one bit per interrupt CLASS (timer,
+// interchangeable. This one is the hart's: one bit per interrupt class (timer,
 // external), and it is what makes a class reachable at all. The PLIC's, below,
-// is per SOURCE within the external class.
+// is per source within the external class.
 //
-// What is NOT here is the GLOBAL enable, and its absence is design 178's D2:
-// this hart delivers a machine interrupt to a lower privilege mode
-// UNCONDITIONALLY, and to itself only with the global bit set — so leaving that
-// bit clear forever is exactly "interrupts are taken from user mode only". The
-// kernel needs no critical sections and the trap path needs no epilogue; a
-// wrongly-arrived interrupt lands on `boot.S`'s kernel-bug path, which is a
-// diagnosed stop rather than a silent reentry.
+// The global enable is deliberately never set. This hart delivers a machine
+// interrupt to a lower privilege mode unconditionally, and to itself only with
+// the global bit set, so leaving that bit clear forever means interrupts are
+// taken from user mode only. The kernel needs no critical sections and the trap
+// path needs no epilogue; a wrongly-arrived interrupt lands on `trap.S`'s
+// kernel-bug path, a diagnosed stop rather than a silent reentry.
 //
-// BOARD-SIDE, and it is the reason the class shadow could not be shared: on
-// this board the tags below ARE `mie` bit positions and the shadow is literally
-// what gets written, while the C3's matrix gates everything through one bit and
-// makes them software tags. Same names, two different registers.
+// The class shadow is board-side: on this board the tags below are `mie` bit
+// positions and the shadow is literally what gets written, while the C3's
+// matrix gates everything through one bit and makes them software tags.
 
 /// The class mask, staged here because the register it mirrors is written
 /// through a C leaf and reading it back would cost a second one. Compound
-/// global state on a serialization argument the compiler cannot see (design
-/// 149): uniprocessor, and only bring-up writes it.
+/// global state on a serialization argument the compiler cannot see:
+/// uniprocessor, and its one writer, `irq_class_enable`, runs in the kernel
+/// with interrupts masked (at bring-up and from `timer_set_deadline_ns`).
 unsafe static var IRQ_CLASSES: UInt = 0
 
 /// Class bits, by their architectural positions.
@@ -440,29 +411,28 @@ func irq_class_enable(bit: UInt) unsafe {
 }
 
 // =============================================================================
-// The machine timer (design 178 M2 unit 1)
+// The machine timer
 // =============================================================================
 //
 // The periodic tick comes from the core-local timer: a free-running 64-bit
-// counter and a per-hart comparator, both ordinary MMIO, so all of it is Saw
-// through the design-112 driver idiom and none of it is C.
+// counter and a per-hart comparator, both ordinary MMIO, so all of it is Saw.
 //
-// The condition is a LEVEL, not an edge — the timer asserts while the counter
-// is at or past the comparator — so servicing a fire means PROGRAMMING THE NEXT
-// DEADLINE rather than acknowledging one: writing a comparator in the future is
-// what lowers the line. That is why the seam is `timer_set_deadline_ns` and why
-// `irq_complete` has nothing to do for this line.
+// The condition is a level, not an edge: the timer asserts while the counter is
+// at or past the comparator. Servicing a fire therefore means programming the
+// next deadline rather than acknowledging one, since writing a comparator in
+// the future is what lowers the line. That is why the seam is
+// `timer_set_deadline_ns` and why `irq_complete` has nothing to do for this
+// line.
 //
-// ONE COMPARATOR, TWO CUSTOMERS (design 232 unit 1). The scheduler tick and the
-// Timer objects share this single piece of hardware, and the seam is absolute
-// rather than periodic precisely so that sharing is the KERNEL's arithmetic —
-// it programs the earliest deadline of the two and this file never learns there
-// were two.
+// One comparator, two customers: the scheduler tick and the Timer objects share
+// this hardware. The seam is absolute rather than periodic so that sharing is
+// the kernel's arithmetic; it programs the earliest deadline of the two and
+// this file never learns there were two.
 //
-// The counter is 64 bits on a 32-bit machine, which is the whole awkwardness
-// here: each half is its own register, so a read has to survive a carry between
-// them and a write has to avoid the instant where the halves describe a
-// deadline that is neither the old one nor the new one.
+// The counter is 64 bits on a 32-bit machine, and each half is its own
+// register. A read has to survive a carry between the halves, and a write has
+// to avoid the instant where the halves describe a deadline that is neither the
+// old one nor the new one.
 
 /// The comparator, low half first.
 struct TimerCmpRegs {
@@ -490,12 +460,11 @@ extension MachineTimer {
 
     /// The counter, read carry-safely: the high half is read either side of the
     /// low one, and a carry between the two reads is retried. Without this a
-    /// read that straddled a carry would be off by 2^32 counter units — about
-    /// seven minutes here, and only ever on the one read in seven minutes that
-    /// hits it.
+    /// read that straddled a carry would be off by 2^32 counter units, about
+    /// seven minutes here.
     ///
-    /// AUDIT (design 1): NO PREEMPTION POINT. The retry is bounded by one carry,
-    /// and this is reached FROM the delivery path anyway.
+    /// No preemption point: the retry is bounded by one carry, and this is
+    /// reached from the delivery path anyway.
     func now(&self) unsafe -> UInt64 {
         var hi = self.count.hi.read()
         var lo = self.count.lo.read()
@@ -513,13 +482,13 @@ extension MachineTimer {
          | (self.cmp.lo.read() as UInt64))
     }
 
-    /// Program the next deadline. The low half goes to all-ones FIRST, so the
-    /// pair never momentarily names a deadline in the past — the classic
+    /// Program the next deadline. The low half goes to all-ones first, so the
+    /// pair never momentarily names a deadline in the past (the classic
     /// split-comparator write order, and the reason this is a method rather
-    /// than two stores at the call site.
+    /// than two stores at the call site).
     ///
     /// The halves are taken with `truncating:`, which is what splitting a wide
-    /// value into two registers MEANS; a checked cast would be a panic edge on
+    /// value into two registers means; a checked cast would be a panic edge on
     /// the one path a kernel wants free of them.
     func set_deadline(&self, at: UInt64) unsafe {
         self.cmp.lo.write(0xFFFF_FFFF)
@@ -527,22 +496,22 @@ extension MachineTimer {
         self.cmp.lo.write(UInt32.from(truncating: at))
     }
 
-    /// Has the timer expired without being serviced? This IS the pending
-    /// condition — the hardware asserts on exactly this comparison — so it
-    /// needs no interrupt-controller state and no extra register.
+    /// Has the timer expired without being serviced? This is the pending
+    /// condition (the hardware asserts on exactly this comparison), so it needs
+    /// no interrupt-controller state and no extra register.
     func expired(&self) unsafe -> Bool {
         self.now() >= self.deadline()
     }
 }
 
-/// Round a nanosecond time UP to a whole counter unit.
+/// Round a nanosecond time up to a whole counter unit.
 ///
-/// UP rather than nearest, because the seam's contract is that a deadline never
-/// fires EARLY: the kernel's composition treats an interrupt as "something may
-/// be due" and reprograms if nothing is, so an early fire costs a round trip
-/// while a late one costs nothing at all. The saturating guard is what keeps
-/// the "never" deadline representable — rounding `UInt64.max` up would
-/// otherwise overflow, and Saw's overflow checks are on in a kernel.
+/// Up rather than nearest, because the seam's contract is that a deadline never
+/// fires early: the kernel treats an interrupt as "something may be due" and
+/// reprograms if nothing is, so an early fire costs a round trip while a late
+/// one costs nothing. The saturating guard keeps the "never" deadline
+/// representable: rounding `UInt64.max` up would otherwise overflow, and Saw's
+/// overflow checks are on in a kernel.
 func ns_to_units(ns: UInt64) -> UInt64 {
     if ns > UInt64.max - (NS_PER_UNIT - 1) {
         return UInt64.max / NS_PER_UNIT
@@ -550,35 +519,33 @@ func ns_to_units(ns: UInt64) -> UInt64 {
     (ns + NS_PER_UNIT - 1) / NS_PER_UNIT
 }
 
-/// This machine's monotonic time in NANOSECONDS since the counter started
-/// (design 232 unit 1; spec §2's Clock row).
+/// This machine's monotonic time in nanoseconds since the counter started
+/// (spec §2's Clock row).
 ///
-/// THE COUNTER IS THE CLOCK. There is no second time source and no software
-/// accumulator — the free-running counter above is what a `Clock.now()` reads
-/// and what every Timer deadline is measured against, so the two can never
-/// disagree about what "now" is. Its epoch is the machine's power-on, which is
-/// exactly the Monotonic domain's contract: it never steps and never goes
-/// backwards.
+/// The counter is the clock. There is no second time source and no software
+/// accumulator: the free-running counter is what a `Clock.now()` reads and what
+/// every Timer deadline is measured against, so the two cannot disagree about
+/// what "now" is. Its epoch is the machine's power-on, which matches the
+/// Monotonic domain's contract: it never steps and never goes backwards.
 public func timer_now_ns() unsafe -> UInt64 {
     MachineTimer().now() * NS_PER_UNIT
 }
 
-/// Program the ONE hardware comparator to interrupt at `at_ns`.
+/// Program the one hardware comparator to interrupt at `at_ns`.
 ///
-/// THE MACHINE HAS ONE COMPARATOR AND TWO CUSTOMERS — the scheduler tick (spec
-/// §7) and the Timer objects (§2) — so this seam takes an ABSOLUTE deadline and
-/// nothing else: the kernel composes the two arch-free by programming the
-/// EARLIEST, and the HAL never needs to know which customer a deadline came
-/// from. That is what replaced M2's `timer_start`/`timer_rearm` pair, which
-/// could only express one periodic customer.
+/// The machine has one comparator and two customers, the scheduler tick (spec
+/// §7) and the Timer objects (§2), so this seam takes an absolute deadline and
+/// nothing else. The kernel composes the two arch-free by programming the
+/// earliest, and the HAL never needs to know which customer a deadline came
+/// from.
 ///
 /// A deadline already past fires as soon as interrupts are deliverable. A
 /// deadline of `UInt64.max` is the kernel's "never", and lands far enough out
 /// that this counter reaches it in some six hundred years.
 ///
-/// It ENABLES the timer interrupt class every time, which is idempotent and is
-/// what lets a kernel that armed no tick at boot — the real one — still serve a
-/// Timer a process armed later.
+/// It enables the timer interrupt class every time, which is idempotent and is
+/// what lets a kernel that armed no tick at boot still serve a Timer a process
+/// armed later.
 public func timer_set_deadline_ns(at_ns: UInt64) unsafe {
     MachineTimer().set_deadline(ns_to_units(at_ns))
     irq_class_enable(IRQ_CLASS_TIMER)
@@ -590,23 +557,23 @@ public func timer_pending() unsafe -> Bool {
 }
 
 // =============================================================================
-// The platform interrupt controller (design 178 M2 unit 1, D6)
+// The platform interrupt controller
 // =============================================================================
 //
 // Every device interrupt on this board arrives through one controller, which
-// prioritizes the sources and hands the winner to a CONTEXT — a (hart,
+// prioritizes the sources and hands the winner to a context, a (hart,
 // privilege) pair. SOS uses one context, the one this kernel runs in.
 //
 // The cycle is claim-then-complete: reading the claim register both says which
 // source won and marks it in service, and writing the same number back releases
-// it. Between the two the source cannot win again, which is what makes the
-// handler non-reentrant for free.
+// it. Between the two the source cannot win again, which makes the handler
+// non-reentrant for free.
 //
-// MASKING IS BY PRIORITY, NOT BY THE ENABLE BIT, and that is worth knowing:
-// this controller ignores a completion for a source that is not enabled for the
-// context, so masking a line by disabling it between claim and complete would
-// leave it in service forever. Priority 0 means "never wins", which is the same
-// mask with none of that.
+// Masking is by priority, not by the enable bit. This controller ignores a
+// completion for a source that is not enabled for the context, so masking a
+// line by disabling it between claim and complete would leave it in service
+// forever. Priority 0 means "never wins", which is the same mask without that
+// hazard.
 
 /// The context window: the priority a source must beat to be delivered here,
 /// and the register that claims and completes.
@@ -620,8 +587,8 @@ struct Plic {
 }
 
 /// Priority levels this kernel uses: 0 is the architecture's "never
-/// interrupt", and every unmasked line shares the one level above it — SOS
-/// prioritizes in software (spec §7), not in the controller.
+/// interrupt", and every unmasked line shares the one level above it (SOS
+/// prioritizes in software, spec §7, not in the controller).
 static PLIC_PRIORITY_MASKED: UInt32 = 0
 static PLIC_PRIORITY_ACTIVE: UInt32 = 1
 static PLIC_SOURCES_PER_WORD: UInt = 32
@@ -646,11 +613,12 @@ extension Plic {
     /// Every source masked and disabled, and the context's threshold at 0 so
     /// that an unmasked source at any priority above it gets through.
     ///
-    /// AUDIT (design 1): NO PREEMPTION POINT, for two independent reasons and
-    /// either would be enough. A HALF-MASKED CONTROLLER IS ITSELF IRQ-shared
-    /// state in flight — a point in the middle would poll the very device it is
-    /// halfway through reconfiguring — and this runs before `intc_init`
-    /// completes, so nothing can be pending to find. 98 register stores at MMIO
+    /// No preemption point, for two independent reasons and either would be
+    /// enough. A half-masked controller is itself IRQ-shared state in flight (a
+    /// point in the middle would poll the very device it is halfway through
+    /// reconfiguring), and this runs before `intc_init` completes, so nothing
+    /// can be pending to find. It is one store per source up to
+    /// `PLIC_MAX_SOURCE` plus the enable words and the threshold, at MMIO
     /// speed, once, at boot.
     func reset(&self) unsafe {
         var line: UInt = 1
@@ -676,7 +644,7 @@ extension Plic {
         word.write(word.read() | (1u32 << ((line % PLIC_SOURCES_PER_WORD) as Int)))
     }
 
-    /// Which source won, and mark it in service. 0 means none — the
+    /// Which source won, and mark it in service. 0 means none; the
     /// architecture reserves source 0 for exactly that.
     func claim(&self) unsafe -> UInt {
         self.context.claim.read() as UInt
@@ -706,16 +674,16 @@ public func irq_unmask(line: UInt) unsafe {
     plic.set_priority(line, PLIC_PRIORITY_ACTIVE)
 }
 
-/// Stop `line` interrupting the kernel — spec §9's mask-on-fire, which the
-/// Interrupt object's `ack` will undo when there is one.
+/// Stop `line` interrupting the kernel (spec §9's mask-on-fire, which the
+/// Interrupt object's `ack` undoes).
 public func irq_mask(line: UInt) unsafe {
     Plic().set_priority(line, PLIC_PRIORITY_MASKED)
 }
 
 /// Which line is being serviced, or `IRQ_NONE`.
 ///
-/// The class comes from the cause word and the SOURCE, for an external
-/// interrupt, from the controller — which is why claiming takes the cause: on
+/// The class comes from the cause word and the source, for an external
+/// interrupt, from the controller, which is why claiming takes the cause: on
 /// this profile the timer never reaches the controller at all.
 public func irq_claim(cause: UInt) unsafe -> UInt {
     let code = cause & ~INTERRUPT_FLAG
@@ -739,11 +707,11 @@ public func irq_complete(line: UInt) unsafe {
     Plic().complete(line)
 }
 
-/// Is `line` a source THIS BOARD wires?
+/// Is `line` a source this board wires?
 ///
 /// The controller's source space is what a driver's line number has to be in,
-/// and source 0 is architecturally reserved for "no source" — so a bind of
-/// either end is a number that could never name a device. The TIMER's line is
+/// and source 0 is architecturally reserved for "no source", so a bind of
+/// either end is a number that could never name a device. The timer's line is
 /// not excluded here: on this profile it is not one of this controller's
 /// sources at all (see `IRQ_TIMER`), so it is already outside this range, and
 /// the kernel excludes it arch-free anyway because that is a policy rather than
@@ -752,20 +720,20 @@ public func irq_line_valid(line: UInt) -> Bool {
     line != IRQ_NONE && line <= PLIC_MAX_SOURCE
 }
 
-/// Ask for a pending line WITHOUT a trap having delivered one — the idle path's
+/// Ask for a pending line without a trap having delivered one: the idle path's
 /// half of the seam.
 ///
-/// The kernel idles with interrupts masked (design 178 D2), so a line that
-/// arrives then is PENDING rather than delivered and nothing hands the kernel a
-/// cause word. This is the same claim `irq_claim` performs, driven by a
-/// question instead of by a trap.
+/// The kernel idles with interrupts masked, so a line that arrives then is
+/// pending rather than delivered and nothing hands the kernel a cause word.
+/// This is the same claim `irq_claim` performs, driven by a question instead of
+/// by a trap.
 ///
-/// THE TIMER IS CHECKED FIRST AND BY HAND, because on this profile it is not
+/// The timer is checked first and by hand, because on this profile it is not
 /// one of the controller's sources: its condition is the comparator's, so the
 /// only way to notice it is to compare. It is consulted only when the timer
-/// CLASS has been enabled — a comparator nothing has ever programmed reads as
-/// permanently expired (its deadline is zero), and treating that as a fire
-/// would make an idle kernel spin on a timer nobody started. Once something HAS
+/// class has been enabled, since a comparator nothing has ever programmed reads
+/// as permanently expired (its deadline is zero), and treating that as a fire
+/// would make an idle kernel spin on a timer nobody started. Once something has
 /// programmed it, the kernel's "never" deadline keeps the same loop quiet
 /// without the gate's help.
 public func irq_poll() unsafe -> UInt {
@@ -779,11 +747,11 @@ public func irq_poll() unsafe -> UInt {
 
 /// Park this hart until an interrupt is pending.
 ///
-/// It wakes on a pending interrupt of an ENABLED CLASS whether or not the
-/// global enable would let it be taken — which is exactly the property the idle
-/// path needs, since design 178's D2 keeps that bit clear forever. So the core
-/// sleeps, the line arrives, execution continues at the next instruction, and
-/// `irq_poll` finds it.
+/// It wakes on a pending interrupt of an enabled class whether or not the
+/// global enable would let it be taken, which is the property the idle path
+/// needs, since the global enable stays clear forever. So the core sleeps, the
+/// line arrives, execution continues at the next instruction, and `irq_poll`
+/// finds it.
 public func wait_for_irq() unsafe {
     sos_wait_for_irq()
 }
@@ -796,16 +764,13 @@ public func wait_for_irq() unsafe {
 /// device this kernel already owns, and the kernel masks the line in its
 /// handler, so the still-asserting device does not re-fire.
 ///
-/// IT WAS EXPECTED TO RETIRE WITH THE INTERRUPT OBJECT AND DOES NOT (design 178
-/// M2 unit 4). A driver now takes a real line round the whole claim / mask /
-/// complete cycle, so the role this was built for is covered — but two claims
-/// are reachable only through it, and both are the kernel's rather than a
-/// driver's. It raises a line IN KERNEL MODE, so the transcript reads "raised,
-/// entered user mode, only then serviced", which is D2 for a device line where
-/// the timer case makes the same claim for a timer; and the line it raises is
-/// bound to NO Interrupt object, which is the one path where `on_external_irq`
-/// reports and leaves the line masked. The scaffolding outlived its scaffolding
-/// role and became a test of the kernel's own behaviour.
+/// Two claims are reachable only through it, and both are the kernel's rather
+/// than a driver's. It raises a line in kernel mode, so the transcript reads
+/// "raised, entered user mode, only then serviced", which is the
+/// interrupts-from-user-mode-only rule for a device line as the timer case
+/// makes it for a timer; and the line it raises is bound to no Interrupt
+/// object, which is the one path where `on_external_irq` reports and leaves the
+/// line masked.
 public func irq_raise_selftest_line() unsafe -> UInt {
     irq_unmask(CONSOLE_IRQ)
     Uart16550(at: UART_BASE).regs.ier.write(IER_TX_EMPTY)

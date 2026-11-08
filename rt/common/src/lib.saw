@@ -1,46 +1,43 @@
-//! `sosrt` — the SOS runtime (designs 140, 172): arch-free, role-free Saw.
+//! `sosrt`, the SOS runtime: arch-free, role-free Saw.
 //!
-//! Two halves, one module, and the same argument for both: the kernel and every
-//! SOS process need exactly these, and differ only in where a byte ends up.
+//! Two halves, one module: the kernel and every SOS process need exactly these,
+//! and differ only in where a byte ends up.
 //!
-//!   - THE DIAGNOSTIC HELPERS (the public surface, first below). Turning a
-//!     machine word into hex, turning a Unicode scalar into a console byte, and
-//!     — since the design 172 review round — the `ConsoleSink` trait with the
-//!     ONE write loop over it, plus the abort-status promotion. What stays with
-//!     the side that owns the device is now only the device: two register
-//!     touches per HAL, and the mechanism that stops the machine.
-//!   - THE RUNTIME PROPER (second below). The four frozen `__saw_rt_*` seams
-//!     every compiled Saw program calls — write, panic, alloc, dealloc, spelled
-//!     out in `sawc/rt/ABI.md` — plus the bump arena behind the last two. These
-//!     have no Saw callers: the COMPILER emits the calls, and this module
-//!     answers them.
+//!   - The diagnostic helpers (the public surface, first below): turning a
+//!     machine word into hex, a Unicode scalar into a console byte, the
+//!     `ConsoleSink` trait with the one write loop over it, and the
+//!     abort-status promotion. What stays with the side that owns the device is
+//!     only the device: two register touches per HAL, and the mechanism that
+//!     stops the machine.
+//!   - The runtime proper (second below): the frozen `__saw_rt_*` seams that
+//!     compiled Saw code and std reach (write, write-line, last raw code,
+//!     panic, alloc and dealloc, spelled out in sawlang's `runtime/ABI.md`)
+//!     plus the bump arena behind the last two. The compiler and std make the
+//!     calls; this module answers them.
 //!
-//! ALL OF IT RESTS ON TWO PER-SIDE HOOKS AND NOTHING ELSE — where a byte goes,
+//! All of it rests on two per-side hooks and nothing else, where a byte goes
 //! and how the machine stops:
 //!
 //!     sos_rt_write(ptr, len)      // supplied per side
 //!     sos_rt_abort(code)          // supplied per side, does not return
 //!
-//! The kernel HAL answers "the UART" and "the board's stop"
-//! (`hal/<arch>/kernel/lib.saw`); a process answers "a System op" to both
-//! (`kernel/sysapi/`). That second answer is the M/U split being real
-//! rather than claimed: if `panic()` could reach a UART from userspace, it
-//! would not be.
+//! The kernel HAL answers "the UART" and "the board's stop" (each board's
+//! `hal/*/kernel/lib.saw`); a process answers "a System op" to both
+//! (`kernel/sysapi/`). That second answer keeps the kernel/user split real: a
+//! `panic()` in userspace cannot reach a UART.
 //!
-//! Nothing here suspends and nothing names a target. No code here CALLS an
-//! allocator either — the arena below IS the one, and it hands out a fixed
-//! region it was given at link time. That is what lets one module serve an
-//! M-mode kernel and a U-mode process on two architectures.
+//! Nothing here suspends and nothing names a target. No code here calls an
+//! allocator either: the arena below is the one, and it hands out a fixed
+//! region it was given at link time.
 
-/// Hex digits in a MACHINE word on this target — eight on a 32-bit profile,
+/// Hex digits in a machine word on this target: eight on a 32-bit profile,
 /// sixteen on a 64-bit one (spec §5b).
 ///
 /// A function rather than a `static` because a static initializer takes plain
-/// literals only, and the literal is the bug: `8` was written here when riscv32
-/// was the only profile, and on arm64 it made every `write_hex` print the low
-/// half of the word with no sign that the top half existed — an address
-/// diagnostic that quietly lies. `sizeof<UInt>()` is the fact being asked for,
-/// so it is what the code asks.
+/// literals only, and a literal here would be wrong on one profile: a
+/// hard-coded `8` makes every `write_hex` on arm64 print the low half of the
+/// word with no sign that the top half exists. `sizeof<UInt>()` is the fact
+/// being asked for, so it is what the code asks.
 public func hex_digits_per_word() -> Int {
     sizeof<UInt>() * HEX_DIGITS_PER_BYTE
 }
@@ -49,11 +46,6 @@ static HEX_DIGITS_PER_BYTE: Int = 2
 static BITS_PER_HEX_DIGIT: Int = 4
 static HEX_NIBBLE_MASK: UInt = 0xF
 static HEX_DECIMAL_LIMIT: UInt = 10
-// Plainly named again. These were `HEX_`-prefixed to dodge DF-140h, where a
-// module-PRIVATE `static` inside a std file reserved its simple name for every
-// program — `sawc/std/stringbuilder.saw` has its own private `ASCII_ZERO`.
-// Design 145 unit A fixed it (the namespace now keys std statics by their
-// design-82 module identity), so the workaround is gone.
 static ASCII_ZERO: UInt = 48
 static ASCII_LOWER_A_MINUS_TEN: UInt = 87
 static ASCII_MAX: Int = 0x7F
@@ -69,7 +61,7 @@ public func hex_digit(nibble: UInt) -> UInt8 {
     }
 }
 
-/// The `index`-th hex digit of `value`, MOST SIGNIFICANT FIRST — so a caller
+/// The `index`-th hex digit of `value`, most significant first, so a caller
 /// prints `0..hex_digits_per_word()` in order and gets a full-width word with
 /// no reversal buffer and no allocation.
 public func hex_digit_of(value: UInt, index: Int) -> UInt8 {
@@ -80,11 +72,10 @@ public func hex_digit_of(value: UInt, index: Int) -> UInt8 {
 /// A Unicode scalar as a console byte.
 ///
 /// `String.scalars()` yields scalars and the console surfaces on both sides are
-/// byte-oriented, so a non-ASCII scalar has to become SOMETHING. It becomes
+/// byte-oriented, so a non-ASCII scalar has to become something. It becomes
 /// `'?'` rather than a silent truncation to a plausible-looking wrong
-/// character — the rule is stated once, here, instead of being re-decided by
-/// each caller. A byte-oriented console service is userspace work for a later
-/// milestone.
+/// character; the rule is stated once, here, instead of being re-decided by
+/// each caller.
 public func ascii_byte(scalar: Scalar) -> UInt8 {
     let v = scalar.value()
     if v < 0 || v > ASCII_MAX {
@@ -95,44 +86,40 @@ public func ascii_byte(scalar: Scalar) -> UInt8 {
 }
 
 // =============================================================================
-// The console sink, and the ONE write loop over it (design 172 review round)
+// The console sink, and the one write loop over it
 // =============================================================================
 //
-// Both kernel HALs had the same twelve lines: poll a status register, place a
-// byte, advance a cursor with wrapping arithmetic, count down. Only the two
-// register touches differed — a 16550 polls LSR bit 5 for "TX holding register
-// empty", a PL011 polls FR bit 5 for "transmit FIFO full", opposite senses of
-// opposite bits on differently-shaped blocks. That is a DEVICE difference, and
-// it is the only thing that belongs in a HAL.
+// Only the device differs between HALs: a 16550 polls LSR bit 5 for "TX holding
+// register empty", a PL011 polls FR bit 5 for "transmit FIFO full", and the
+// ESP32-C3's UART compares a FIFO count against its depth. That is the only
+// thing that belongs in a HAL. So the device is a trait and the loop is written
+// once, generic over it. The bound is static: `console_write<S: ConsoleSink>`
+// monomorphizes per sink (`Uart16550`, `Pl011`, `EspUart`), with no vtable, no
+// existential and no indirect call anywhere on the panic path.
 //
-// So the device is a trait and the loop is written once, generic over it. The
-// bound is static: `console_write<S: ConsoleSink>` MONOMORPHIZES per sink, one
-// instantiation per architecture, and there is no vtable, no existential and no
-// indirect call anywhere on the panic path.
-//
-// THE CHECK-FREEDOM CONTRACT COMES WITH IT, and it is the reason this is worth
-// stating rather than assuming. The panic reporter runs while a panic is being
-// reported, so a bounds check or an overflow check that tripped here would
-// re-enter `__saw_rt_panic` and either hang or garble the one diagnostic that
-// matters. The loop below earns that the same way the per-HAL copies did (see
-// DF-172b): raw `UnsafeMemory` reads rather than indexing, no allocation, no
+// The panic reporter runs while a panic is being reported, so a bounds check or
+// an overflow check that tripped here would re-enter `__saw_rt_panic` and
+// either hang or garble the one diagnostic that matters. The loop must stay
+// check-free: raw `UnsafeMemory` reads rather than indexing, no allocation, no
 // `String`, and a cursor that advances with `&+` / `&-` so even a nonsensical
 // length cannot raise an overflow trap.
 //
-// Generic-ness does not weaken it, and that was checked rather than hoped:
-// `--emit-ir` on BOTH monomorphizations shows the trait default body and both
-// accessor bodies fully inlined, leaving `ptrtoint`, a plain `load i8`, the
-// device's volatile load, an `and`, an `icmp`, the volatile store, and
-// `add`/`add -1` — no `llvm.uadd.with.overflow`, no bounds check, no trap block
-// and no call to `__saw_rt_panic` in either. Re-read the IR of both if you
-// touch this loop or either sink.
+// Generic-ness does not weaken this. In each kernel's `-Oz` machine code (the
+// disassembled object, not `--emit-ll`'s IR, which is pre-optimisation),
+// `sos_rt_write` is a byte loop calling the sink's `write_byte`, and each
+// `write_byte` is the status load, a mask test, a branch back and the data
+// store: no overflow check, no bounds check, no trap and no call to a failure
+// routine or `__saw_rt_panic`. The pre-optimisation IR still carries checks
+// that `-Oz` folds away (a shift-amount check in the ESP32-C3's `can_write`),
+// so judge the machine code. Re-read the disassembly of every instantiation if
+// you touch this loop or a sink.
 
 /// A byte-oriented console the kernel can reach with no allocator, no
 /// interrupts and no driver state beyond the register block itself.
 ///
 /// Two requirements, because two is what a polled transmitter is: ask whether
-/// the device will take a byte, and give it one. Splitting them is what lets
-/// the WAITING live here, once, instead of in each HAL.
+/// the device will take a byte, and give it one. Splitting them lets the
+/// waiting live here, once, instead of in each HAL.
 public trait ConsoleSink {
     /// Can the device accept a byte right now?
     func can_write(&self) -> Bool
@@ -146,12 +133,11 @@ public trait ConsoleSink {
     /// the same way, and a HAL that overrode this would be saying something
     /// about its device that `can_write` should have said instead.
     ///
-    /// AUDIT (sawos design 1): NO PREEMPTION POINT in the ready spin, and none
-    /// in `console_write`'s loop below. Both are bounded by the device drain,
-    /// which is accepted masked latency and recorded as such — and `sosrt` is
-    /// below the kernel, so it could not reach a point in any case. The panic
-    /// path runs through here, which is the strongest argument of all against
-    /// delivering an interrupt from inside it.
+    /// There is no preemption point in the ready spin or in `console_write`'s
+    /// loop below. Both are bounded by the device drain, which is accepted
+    /// masked latency, and `sosrt` is below the kernel so it could not reach a
+    /// point in any case. The panic path runs through here, which is the
+    /// strongest argument against delivering an interrupt from inside it.
     func write_byte(&self, b: UInt8) {
         while not self.can_write() {
         }
@@ -159,9 +145,9 @@ public trait ConsoleSink {
     }
 }
 
-/// Write `len` bytes at `ptr` to `sink`. THE PANIC PATH'S WRITE LOOP, once.
+/// Write `len` bytes at `ptr` to `sink`. This is the panic path's write loop.
 ///
-/// Check-free by construction — see the section header for what that means and
+/// Check-free by construction; see the section header for what that means and
 /// how it is verified.
 public func console_write<S: ConsoleSink>(sink: &S, ptr: UnsafePointer<Int8>,
                                           len: UInt) unsafe {
@@ -174,21 +160,19 @@ public func console_write<S: ConsoleSink>(sink: &S, ptr: UnsafePointer<Int8>,
     }
 }
 
-// A failing exit must never read as a passing one, and both HALs said so in
-// their own copy of these three lines.
+// A failing exit must never read as a passing one.
 static ABORT_CODE_MASK: UInt = 0xFF
 static ABORT_CODE_MIN: UInt = 1
 
 /// The exit status a failing abort actually carries: `code` narrowed to the
 /// byte an exit status is, with zero promoted.
 ///
-/// The promotion is the whole point. A machine-stop mechanism reports one byte,
-/// and `0` is what "the run passed" looks like — so an abort raised with a code
-/// that happens to be zero, or whose low byte is, would exit clean and turn a
-/// failure into a green run. Deciding that ONCE is what keeps the two HALs from
-/// drifting on it.
+/// The promotion is the point. A machine-stop mechanism reports one byte, and
+/// `0` is what "the run passed" looks like, so an abort raised with a code that
+/// is zero, or whose low byte is, would exit clean and turn a failure into a
+/// green run. Deciding that once keeps the HALs from drifting on it.
 ///
-/// The mechanism stays per-arch: this says WHAT status, not how to stop.
+/// The mechanism stays per-arch: this says what status, not how to stop.
 public func abort_status(code: UInt) -> UInt {
     let masked = code & ABORT_CODE_MASK
     if masked == 0 {
@@ -198,90 +182,71 @@ public func abort_status(code: UInt) -> UInt {
 }
 
 // =============================================================================
-// The runtime seams (design 172 part 2)
+// The runtime seams
 // =============================================================================
 //
-// These four `@export`s ARE the SOS runtime. `sawc/rt/ABI.md` freezes what a
-// compiled Saw program calls; the compiler emits the calls under every profile
-// and the environment supplies the bodies. Here is that environment.
+// These `@export`s are the SOS runtime. Sawlang's `runtime/ABI.md` freezes the
+// seams compiled Saw code and std call; the compiler and std make the calls
+// under every profile and the environment supplies the bodies, here.
 //
-// THE ONE THING THAT KEPT THEM IN C UNTIL NOW, since the file that held them
-// says the move should be taken deliberately: the ABI freezes `__saw_rt_panic`
-// as `noreturn`, and a Saw function could not be typed `Never` without CALLING
-// something that already was — which for the panic sink is circular, since this
-// IS what `panic()` reaches. Design 177 supplied the missing producer: a
-// conditionless `while { }` with no `break` types `Never`, so a Saw body can
-// satisfy the signature on its own. `sos_rt_abort` below is declared
-// `-> Never` for the same reason it was `__attribute__((noreturn))` in C, and
-// that is now a promise the type system carries rather than a comment.
+// The ABI freezes `__saw_rt_panic` as `noreturn`. A conditionless `while { }`
+// with no `break` types `Never`, so a Saw body can satisfy that signature on
+// its own: `sos_rt_abort` below is declared `-> Never`, and the type system
+// carries the promise.
 //
-// WHO TURNS THESE ON. `@export`ing a `__saw_rt_*` name is refused unless the
-// compile declares itself a runtime provider (design 149): the kernel builds
-// pass `--runtime-provider` from `tools/sos_runner.py`, and a process image
-// gets it from `[package] runtime = true` in its own manifest, because the
-// image's compile is where these definitions land. A compile that forgets it
-// gets a clean error naming the frozen set; a LINK that never compiled this
-// module gets an undefined `__saw_rt_write`. Neither failure is quiet.
+// `@export`ing a `__saw_rt_*` name is refused unless the compile declares
+// itself a runtime provider: the kernel builds pass `--runtime-provider` from
+// `tools/sos_runner.py`, and a process image gets it from
+// `[package] runtime = true` in its own manifest, because the image's compile
+// is where these definitions land. A compile that forgets it gets a clean error
+// naming the frozen set; a link that never compiled this module gets an
+// undefined `__saw_rt_write`. Neither failure is quiet.
 //
-// The signatures are machine-checked against `sawc/rt/ABI.md` (arity + machine
-// width), so editing one here without editing that document is a compile error.
-// Sizes and lengths are `UInt` rather than `Int` — same machine word, and the
-// unsigned reading is the one the bounds arithmetic below wants.
+// The signatures are machine-checked against `runtime/ABI.md` (arity and
+// machine width), so editing one here without editing that document is a
+// compile error. Sizes and lengths are `UInt` rather than `Int`: same machine
+// word, and the unsigned reading is the one the bounds arithmetic wants.
 //
-// WHAT IS NOT HERE, and the answer for when it is (design 234 §2, user ruling
-// Aug 22). The hosted runtime grew `__saw_rt_last_raw_code()` — the raw platform
-// number behind a classification, carried beside the portable tag so std's
-// `IoError` can log the errno its `kind` folded away. There is nothing here to
-// stamp: this runtime has no OS-op family and does not implement
-// `__saw_rt_last_syserror` either, and a seam nobody calls needs no body. When
-// SOS does grow one, its answer is its NATIVE STATUS WORD — which on SOS
-// numerically coincides with the SysError tag, because the status half of the
-// ratified `(status, value)` syscall ABI IS that tag space (spec.md §5.7).
-// That coincidence is recorded rather than engineered around: SOS stores no
-// second copy of the number, and `code` reads back as the same value `kind` was
-// built from.
+// Not implemented here:
 //
-// AND THE SAME QUESTION FOR THREADS (design 242 ruling 4, unit 3). The hosted
-// runtime grew `__saw_rt_thread_detach(ctrl)` — `pthread_detach`, plus the
-// handoff of the thread control block's ownership to that thread's own exit
-// path. There is nothing here to detach: this runtime has no thread surface at
-// all, so it implements neither `__saw_rt_thread_spawn` nor `_join` either, and
-// a seam nobody can reach needs no body.
-//
-// The ruled answer for when SOS does grow one is REFUSE, never NO-OP. A silent
-// no-op would tell a caller its thread was detached when no thread exists, and
-// would leak the control block of every one — two failures the never-hide-errors
-// doctrine forbids on their own. Today that refusal arrives for free and by the
-// same route the rest of the thread surface takes: a `Thread.spawn` in an SOS
-// image fails at LINK with the spawn seam missing, long before a `detach` could
-// be reached.
+//   - `__saw_rt_last_syserror`. This runtime has no OS-op family to stamp, and
+//     nothing an SOS image links calls it, so it needs no body. If SOS grows
+//     an OS-op family, the raw code is its native status word, which
+//     numerically coincides with the SysError tag because the status half of
+//     the `(status, value)` syscall ABI is that tag space (spec.md §5.7). Store
+//     no second copy of the number.
+//   - `__saw_rt_thread_detach`, `__saw_rt_thread_spawn` and
+//     `__saw_rt_thread_join`. This runtime has no thread surface, and a
+//     `Thread.spawn` in an SOS image fails at link with the spawn seam missing,
+//     long before a `detach` could be reached. If a detach is ever added it
+//     must refuse, never no-op: a silent no-op would tell a caller its thread
+//     was detached when no thread exists, and would leak the control block of
+//     every one.
 
 // Where a byte goes, and how the machine stops. Everything below is written
 // against these two and nothing else. See the module header for who answers.
-// (A plain comment, not `///`: an `extern` block is a container, and design 121
-// attaches a doc block to a DECLARATION.)
+// (A plain comment, not `///`: an `extern` block is a container, and a doc
+// block attaches to a declaration.)
 extern "C" {
     func sos_rt_write(ptr: UnsafePointer<Int8>, len: UInt)
     func sos_rt_abort(code: UInt32) -> Never
 }
 
-// WHERE THE ARENA IS, and how big (sawos design 38 — see the bump-arena
-// section below for what the region is for and why it moved). NOT a per-side
-// hook like the two above: there is exactly one answer, in the one C file both
-// sides already link (`rt/common_c/support.c`), because the numbers come from
-// the LINKER and Saw cannot name a linker symbol.
+// Where the arena is, and how big (see the bump-arena section below). Not a
+// per-side hook like the two above: there is exactly one answer, in the one C
+// file both sides link (`rt/common_c/support.c`), because the numbers come from
+// the linker and Saw cannot name a linker symbol.
 extern "C" {
     func sos_arena_base() -> UInt
     func sos_arena_size() -> UInt
 }
 
-// Abort codes the RUNTIME raises on its own behalf. A side's own exit codes
+// Abort codes the runtime raises on its own behalf. A side's own exit codes
 // live with that side; these two are ours, and they stay distinct so a
 // transcript can tell "the program panicked" from "the arena ran dry".
 //
-// A closed named set is a backed enum rather than a family of statics (design
-// 153), on the same terms as the kernel's `ExitCode`; the backing is the width
-// `sos_rt_abort` takes, so the projection at the call is one `as`.
+// A backed enum, on the same terms as the kernel's `ExitCode`; the backing is
+// the width `sos_rt_abort` takes, so the projection at the call is one `as`.
 enum AbortCode: UInt32 {
     case Panic = 64,
     case NoMemory = 65
@@ -314,17 +279,19 @@ func rt_write_line(parts: UnsafePointer<Int8>, count: UInt) unsafe -> Int {
     0
 }
 
-/// SOS keeps no errno, so there is never a raw platform code to report.
+/// Has a body because compiled code references it: the compiler emits calls to
+/// it, and std's `systemerror`, `net`, `thread` and `taskgroup` call it. It
+/// answers 0 because nothing is stamped: SOS keeps no errno.
 @export("__saw_rt_last_raw_code")
 func rt_last_raw_code() -> Int {
     0
 }
 
-/// The infallible-tier panic sink (design 19): report, then stop.
+/// The panic sink: report, then stop.
 ///
-/// CHECK-FREE BY CONSTRUCTION, like the writers under it (DF-172b) — it does no
-/// arithmetic at all, so there is nothing here that could raise the panic it is
-/// in the middle of reporting.
+/// Check-free by construction, like the writers under it: it does no arithmetic
+/// at all, so there is nothing here that could raise the panic it is in the
+/// middle of reporting.
 @export("__saw_rt_panic")
 func rt_panic(ptr: UnsafePointer<Int8>, len: UInt) unsafe -> Never {
     sos_rt_write(ptr, len)
@@ -335,60 +302,52 @@ func rt_panic(ptr: UnsafePointer<Int8>, len: UInt) unsafe -> Never {
 // The bump arena
 // -----------------------------------------------------------------------------
 //
-// SOS allocates nothing on the steady path — the kernel's diagnostics and
+// SOS allocates nothing on the steady path: the kernel's diagnostics and
 // root's banner are string literals walked byte by byte, and every kernel
 // source builds under `--no-hidden-alloc`. The arena exists because the
-// COMPILER's panic path can allocate, and an unbacked seam would turn a
+// compiler's panic path can allocate, and an unbacked seam would turn a
 // diagnosable panic into a wild jump.
 //
-// No reclamation: `dealloc` is a no-op and the real slab allocator arrives with
-// the kernel object model (spec §4).
+// No reclamation: `__saw_rt_dealloc` is a no-op.
 //
-// THE REGION IS THE LINKER'S, NOT THIS MODULE'S (sawos design 38), and the
-// reason is the one thing a `static` here could never express: `sosrt` is
-// SHARED, so its size was one compile-time fact for every image in the system —
-// the kernel, root, and every test package alike — and a deployment that wanted
-// a smaller arena for one process had nowhere to say so. This toolchain has no
-// conditional compilation (design 35 confirmed it), and a module-level `static`
-// carries no module identity a build profile could override (SL-25), so the
-// only seam left is the LINK.
-//
-// So the linker scripts reserve `[_arena_start, _arena_end)` inside `.bss`
-// under a `PROVIDE`d `ARENA_SIZE` — 64 KiB unless a package's own script says
-// otherwise, which is exactly what `tests/arena-small/` does — and the two
-// accessors above read it back. NOTHING ELSE CHANGED: `.bss`-resident then and
-// now, so the region costs the image no bytes and the process's region all of
-// them; the bound check below is the same subtraction; and the cursor is still
-// this module's own state.
+// The region is the linker's, not this module's. `sosrt` is shared, so a
+// `static` here would be one compile-time size for every image in the system.
+// This toolchain has no conditional compilation, and a module-level `static`
+// carries no module identity a build profile could override, so the only seam
+// is the link. The linker scripts reserve `[_arena_start, _arena_end)` inside
+// `.bss` under a `PROVIDE`d `ARENA_SIZE` (the default unless a package's own
+// script says otherwise, as `tests/arena-small/` does), and the two accessors
+// above read it back. The region is `.bss`-resident, so it costs the image no
+// bytes and the process's region all of them.
 
-/// The cursor over the region — `unsafe static var` for design 149's reason,
-/// and the serialization argument is spec §7's: SOS v1 is a uniprocessor kernel
-/// and M1 enables no interrupt sources, so no other agent can observe the
-/// window between the bound check and the cursor store. Enabling interrupts,
-/// SMP or preemption each invalidate that and take a `SpinLock` here.
+/// The cursor over the region. Nothing serializes the bound check against the
+/// cursor store, so the bump is safe only while no involuntary switch can land
+/// between them. In the kernel that is guaranteed: SOS is a uniprocessor kernel
+/// (spec §7) and the kernel runs with interrupts masked. In a user process with
+/// more than one thread it holds only while nothing preempts. The kernel
+/// switches threads involuntarily only on a scheduler tick, which
+/// `kernel/main.saw` does not arm (the preemption harness kernels do, through
+/// `kcore.time.start_tick`). Once a tick is armed, two threads of one process
+/// that both allocate can be handed overlapping blocks, and the cursor needs a
+/// lock.
 ///
-/// It is the ONLY arena state left here. The region it walks is the linker's
-/// (above), which is what makes the pair no longer "compound state spanning two
-/// words": the extent is a link-time constant and only the offset moves.
+/// It is the only arena state in this module. The extent is a link-time
+/// constant and only the offset moves.
 unsafe static var ARENA_NEXT: UInt = 0
 
 /// Hand out `size` bytes aligned to `align`, or stop the machine.
 ///
-/// ALIGNMENT IS APPLIED TO THE ABSOLUTE ADDRESS, not to the offset — which is
-/// where this differs from the C it replaces, and it is a fix rather than a
-/// translation. The C rounded `arena_next` up and returned `&arena[p]`, which
-/// only satisfies the caller if the REGION itself is at least as aligned as
-/// anything asked of it; a `[UInt8; N]` has an alignment of one, and so did the
-/// C array in principle. Rounding the address the caller actually receives is
-/// correct whatever the region landed on — which is why design 38 moving the
-/// region into the linker scripts (`. = ALIGN(16)` there) changed nothing here:
-/// the scripts' alignment is a courtesy, not a precondition.
+/// Alignment is applied to the absolute address, not to the offset. Rounding
+/// the offset only satisfies the caller if the region itself is at least as
+/// aligned as anything asked of it. Rounding the address the caller receives is
+/// correct wherever the region is placed; the linker scripts' `. = ALIGN(16)`
+/// is a courtesy, not a precondition.
 ///
-/// The bound is checked as a SUBTRACTION so a hostile `size` cannot wrap past
-/// it, exactly as the C did. The padding step uses `&-` because a checked one
-/// would put a panic branch inside the allocator for a subtraction that cannot
-/// go negative (`rem` is a remainder of `step`, so `rem < step` always) — the
-/// compiler cannot see that, and the allocator is not a place to spend a trap.
+/// The bound is checked as a subtraction so a hostile `size` cannot wrap past
+/// it. The padding step uses `&-` because a checked one would put a panic
+/// branch inside the allocator for a subtraction that cannot go negative (`rem`
+/// is a remainder of `step`, so `rem < step` always). The compiler cannot see
+/// that, and the allocator is not a place to spend a trap.
 @export("__saw_rt_alloc")
 func rt_alloc(size: UInt, align: UInt) unsafe -> UnsafePointer<Int8> {
     var step = align
@@ -411,8 +370,8 @@ func rt_alloc(size: UInt, align: UInt) unsafe -> UnsafePointer<Int8> {
     (base &+ offset) as UnsafePointer<Int8>
 }
 
-/// Free a block. A bump arena reclaims nothing, so this is deliberately empty —
-/// see the section header for when that changes.
+/// Free a block. A bump arena reclaims nothing, so this is deliberately
+/// empty.
 @export("__saw_rt_dealloc")
 func rt_dealloc(ptr: UnsafePointer<Int8>, size: UInt, align: UInt) unsafe {
 }

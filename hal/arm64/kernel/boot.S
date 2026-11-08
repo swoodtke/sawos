@@ -1,93 +1,90 @@
-/* SOS boot shim + exception vectors (design 162) — arm64, QEMU `virt`, EL1.
+/* SOS boot shim and exception vectors: arm64, QEMU `virt`, EL1.
  *
  * QEMU (`-M virt -cpu cortex-a53 -kernel sos.elf`) loads the ELF at RAM base
- * 0x4000_0000 and starts the CPU AT EL1 — there is no EL3 firmware and no
- * EL2 hypervisor in this configuration, so unlike the RISC-V profile there is
- * no SBI to negotiate with and nothing to drop down from. `.text.boot` (this
- * file) is placed first by virt.ld, so the ELF entry is the reset target.
+ * 0x4000_0000 and starts the CPU at EL1: there is no EL3 firmware and no EL2
+ * hypervisor, so there is nothing to drop down from. `.text.boot` (this file)
+ * is placed first by virt.ld, so the ELF entry is the reset target.
  *
- * The shim sets up the stack, installs the vector table, enables FP/SIMD,
- * zeroes .bss, builds the identity map, and calls the Saw `kmain`.
+ * The shim sets up the stack, enables FP/SIMD, zeroes .bss, builds the boot
+ * map, installs the vector table, and calls the Saw `kmain`.
  *
- * WHY FP/SIMD IS ENABLED HERE (and this is not optional): out of reset
- * `CPACR_EL1.FPEN` traps every Advanced-SIMD instruction at EL1, and the C and
- * Saw halves are both compiled by LLVM, which vectorizes ordinary loops. So the
- * FIRST table-filling loop in `sos_mmu_init` took an EC=0x07 trap before this
- * line existed — before the vectors could even report it. FP/SIMD STATE IS NOT
- * SAVED ACROSS A TRAP (the frame below holds x0-x30 and three system
- * registers); with one user thread and no preemption nothing can observe that,
- * and M2's context switch is where it stops being true.
+ * FP/SIMD is enabled here because out of reset `CPACR_EL1.FPEN` traps every
+ * Advanced-SIMD instruction at EL1 and EL0. sawc builds freestanding aarch64
+ * code with `-neon,-fp-armv8`, but the C is compiled by clang at -O2, and
+ * support.c's `memcpy`/`memset` use the q registers. Without this, the first
+ * of those takes an EC=0x07 trap.
  *
- * THE TRAP SPLIT IS FREE HERE. RISC-V needs `mscratch` as a mode witness to
- * tell a syscall from a kernel bug; arm64 has SIXTEEN vectors, four per source
- * (current EL on SP0, current EL on SPx, lower EL in AArch64, lower EL in
- * AArch32), so "did this come from user mode" is which ENTRY the hardware
- * chose. Every entry but the lower-EL synchronous one is a kernel bug or an
- * interrupt M1 never enables, and they all land on `kernel_fault_entry`.
+ * FP/SIMD state is not saved across a trap: the frame below holds x0-x30 and
+ * three system registers. The C runs vector code at both levels: every Saw
+ * image links support.c, so its `memcpy` (q0/q1/d0) runs at EL0 too, and EL0
+ * has vector state to lose. A syscall is safe, because the stub is a C call and
+ * v0-v7 are caller-saved. An asynchronous trap is not: the kernel's own C
+ * clobbers EL0's vector registers (that `memcpy` runs on the IRQ wake path),
+ * with no thread switch needed.
+ *
+ * The user/kernel split is free here. arm64 has sixteen vectors, four per
+ * source (current EL on SP0, current EL on SPx, lower EL in AArch64, lower EL
+ * in AArch32), so "did this come from user mode" is which entry the hardware
+ * chose. Every entry but the lower-EL synchronous and IRQ ones is a kernel
+ * bug, and they all land on `kernel_fault_entry`.
  *
  * Trap frame layout (34 doublewords, 272 bytes), matching `TrapFrame` in
  * lib.saw field for field:
  *
- *   +0x000  ELR_EL1   the PC to resume at (already PAST the `svc`)
+ *   +0x000  ELR_EL1   the PC to resume at (already past the `svc`)
  *   +0x008  SPSR_EL1  saved processor state
  *   +0x010  SP_EL0    the user stack pointer (a separate register at EL1)
  *   +0x018  x0 .. x30
  */
 
     .equ FRAME_SIZE,  272
-    /* The saved processor state a user context resumes in is NOT here any more:
-     * it is a word of the frame, written by `frame_init` in lib.saw, because a
-     * thread carries the state it resumes in (design 178 M2 unit 2). D,A,F
-     * masked and I NOT is still the value — interrupts are enabled at the
-     * user-mode return and nowhere else (D2). */
+    /* The processor state a user context resumes in is a word of the frame,
+     * written by `frame_init` in lib.saw: D, A, F masked and I not, so
+     * interrupts are enabled at the user-mode return and nowhere else. */
     .equ CPACR_FPEN,  (3 << 20)
     /* The high half of the cause the interrupt entry calls `ktrap` with. The
      * syndrome register is 32 bits, so this value cannot be one; `lib.saw`'s
      * `IRQ_CAUSE` is the same description and must move with it. */
     .equ IRQ_CAUSE_HI, 1
 
-/* ---- the higher-half bring-up (sawos design 29) ---------------------------
+/* ---- the higher-half bring-up ---------------------------------------------
  *
- * THE ORDER IS FORCED, and it is worth stating before the code because every
- * line below is a consequence of it. This kernel LINKS in the high half
- * (`virt.ld` places every section at `physical + LINMAP_OFFSET`), so NO COMPILED
- * CODE — C or Saw — may be called until the MMU is on and TTBR1 is walked: a
- * `bl` reaches a high address, and a compiled body reaches its globals through
- * PC-relative pairs that would resolve against whatever address it is running
- * at. The MMU therefore has to come up on a table built by HAND-WRITTEN
- * ASSEMBLY, which is what the block below is, and it is the whole of the
- * relocation window.
+ * The order is forced. This kernel links in the high half (`virt.ld` places
+ * every section at `physical + LINMAP_OFFSET`), so no compiled code, C or Saw,
+ * may be called until the MMU is on and TTBR1 is walked: a `bl` reaches a high
+ * address, and a compiled body reaches its globals through PC-relative pairs
+ * that would resolve against whatever address it is running at. The MMU
+ * therefore comes up on a table built by hand-written assembly, and the block
+ * below is the whole relocation window.
  *
- * THE BOOT TABLE IS TWO DESCRIPTORS. At the 4 KiB granule with a 39-bit VA,
- * level 1 covers 1 GiB per entry — so one entry for the device gigabyte and one
- * for RAM's is the entire map. It serves BOTH halves at once: `pa | OFFSET`
+ * The boot table is two descriptors. At the 4 KiB granule with a 39-bit VA,
+ * level 1 covers 1 GiB per entry, so one entry for the device gigabyte and one
+ * for RAM's is the entire map. It serves both halves at once: `pa | OFFSET`
  * leaves the low 39 bits alone, so a high kernel address and its physical twin
- * select the SAME level-1 entry, and installing the table in TTBR0 and TTBR1
- * together makes the identity map and the (coarse) linear map one page of
- * memory. That is what makes the jump into the high half a plain branch.
+ * select the same level-1 entry, and installing the table in TTBR0 and TTBR1
+ * together makes the identity map and the coarse linear map one page of
+ * memory. That makes the jump into the high half a plain branch.
  *
- * THEN THE REAL TABLES. `sos_mmu_tables` (sink.c -> lib.saw) builds the linear
- * map and `sos_page_tables_build` the per-process sets, both with translation
- * already on, both writing descriptors through the seam. Installing TTBR1
- * happens from the IDENTITY MAP — the branch to `.Lswap_phys` below — for the
- * ordinary reason a kernel does that: code that changes the register its own PC
- * translates through has nowhere to stand. This is Linux's
- * `idmap_cpu_replace_ttbr1` shape, and once TTBR1 holds the real linear map the
- * identity map has done its job and TTBR0 becomes root's set.
+ * The real tables follow. `sos_mmu_tables` (sink.c -> lib.saw) builds the
+ * linear map and `sos_page_tables_build` the per-process sets, both with
+ * translation already on, both writing descriptors through the seam. TTBR1 is
+ * installed from the identity map (the branch to `.Lswap_phys` below), because
+ * code that changes the register its own PC translates through has nowhere to
+ * stand. Once TTBR1 holds the real linear map the identity map has done its
+ * job and TTBR0 becomes root's set.
  *
- * THE VALUES ARE NOT SPELLED HERE. `sos_boot_mair` and `sos_boot_tcr` are
- * `const u64`s in sink.c, read out of `.rodata` through a masked pointer while
- * the MMU is off (`.rodata` is loaded at that physical address). The MAIR copy
- * is checked against `lib.saw`'s `sos_mair_value()` on every boot. The
- * descriptor bits below are this file's own and are the one duplication left —
- * a wrong one is an immediate, visible boot failure rather than a silent one.
+ * The MAIR and TCR values are not spelled here. `sos_boot_mair` and
+ * `sos_boot_tcr` are `const u64`s in sink.c, read out of `.rodata` through a
+ * masked pointer while the MMU is off (`.rodata` is loaded at that physical
+ * address). The MAIR copy is checked against `lib.saw`'s `sos_mair_value()` on
+ * every boot. The descriptor bits below are this file's own, the one
+ * duplication left.
  */
 
     /* Block descriptors for the two boot entries, at level 1.
      *
-     * The ATTRIBUTE INDICES are `MemoryType`'s in lib.saw: 0 Device-nGnRnE,
-     * 1 Normal write-back. `sos_boot_mair` is the register those index, and
-     * sink.c checks it against the Saw builder on every boot. */
+     * The attribute indices are `MemoryType`'s in lib.saw: 0 Device-nGnRnE,
+     * 1 Normal write-back. `sos_boot_mair` is the register those index. */
     .equ DESC_VALID,     (1 << 0)   /* bit 0 set, bit 1 clear = BLOCK          */
     .equ DESC_ATTR_DEV,  (0 << 2)   /* AttrIndx = MemoryType.Device            */
     .equ DESC_ATTR_NORM, (1 << 2)   /* AttrIndx = MemoryType.Normal            */
@@ -108,29 +105,27 @@
     .section .text.boot, "ax", @progbits
     .globl _start
 _start:
-    /* RUNNING AT THE PHYSICAL ADDRESS, MMU OFF. Every symbol a literal pool
-     * hands us is a HIGH address from here until the jump below, so each one is
-     * masked down with `LINMAP_PHYS_MASK` (an absolute symbol `virt.ld`
-     * exports — loading its "address" loads its value). x9 holds the mask for
-     * the whole window. */
+    /* Running at the physical address, MMU off. Every symbol a literal pool
+     * hands us is a high address until the jump below, so each one is masked
+     * down with `LINMAP_PHYS_MASK` (an absolute symbol `virt.ld` exports;
+     * loading its "address" loads its value). x9 holds the mask for the whole
+     * window. */
     ldr     x9, =LINMAP_PHYS_MASK
 
     /* A stack, at its physical address. Nothing here calls anything, but a
-     * window with no stack is a window where a fault has nowhere to go. */
+     * fault in this window needs somewhere to go. */
     ldr     x0, =_stack_top
     and     x0, x0, x9
     mov     sp, x0
 
-    /* FP/SIMD access — see the header note. Must precede any compiled code. */
+    /* FP/SIMD access (see the header). Must precede any compiled code. */
     mov     x0, #CPACR_FPEN
     msr     cpacr_el1, x0
     isb
 
     /* Zero .bss [_bss_start, _bss_end) a doubleword at a time, physically.
-     *
-     * AUDIT (design 1): no preemption point, here or in the table builds below.
-     * All of it runs before kmain and before the GIC comes up — pre-IRQ by
-     * construction. */
+     * No preemption point, here or in the table builds below: all of it runs
+     * before kmain and before the GIC comes up. */
     ldr     x0, =_bss_start
     and     x0, x0, x9
     ldr     x1, =_bss_end
@@ -140,7 +135,7 @@ _start:
     str     xzr, [x0], #8
     b       1b
 2:
-    /* The boot table lives in .bss, so it is built AFTER the zeroing. Two
+    /* The boot table lives in .bss, so it is built after the zeroing. Two
      * level-1 block descriptors: entry 0 the device gigabyte at 0, entry 1
      * RAM's gigabyte at 0x4000_0000. */
     ldr     x0, =_boot_l1
@@ -160,7 +155,7 @@ _start:
     ldr     x1, [x1]
     msr     tcr_el1, x1
 
-    /* ONE TABLE IN BOTH BASE REGISTERS — see the header: a high address and its
+    /* One table in both base registers (see above): a high address and its
      * physical twin index the same level-1 entry, so this is the identity map
      * and a coarse linear map at once. */
     msr     ttbr0_el1, x0
@@ -169,8 +164,8 @@ _start:
     isb
 
     /* Read-modify-write rather than a constant: the reset value carries the
-     * stack-alignment and endianness bits this kernel has no opinion about.
-     * The three bits together are not a logical immediate, so they arrive in a
+     * stack-alignment and endianness bits this kernel leaves alone. The three
+     * bits together are not a logical immediate, so they arrive in a
      * register. */
     mrs     x1, sctlr_el1
     ldr     x2, =(SCTLR_M | SCTLR_C | SCTLR_I)
@@ -178,20 +173,19 @@ _start:
     msr     sctlr_el1, x1
     isb
 
-    /* INTO THE HIGH HALF. An absolute branch through a literal — the one
-     * instruction the whole relocation window exists for. */
+    /* Into the high half: an absolute branch through a literal, the one
+     * instruction the relocation window exists for. */
     ldr     x0, =.Lhigh
     br      x0
 
 .Lhigh:
-    /* RUNNING HIGH. Every symbol is its own link address from here on, and
-     * ordinary compiled code is callable. */
+    /* Running high. Every symbol is its own link address from here on, and
+     * compiled code is callable. */
     ldr     x0, =_stack_top
     mov     sp, x0
 
-    /* Exception vectors. VBAR_EL1 wants a 2 KiB-aligned table, and holds a
-     * VIRTUAL address — so it is set here rather than before the MMU, where it
-     * would have named an address nothing could translate. */
+    /* Exception vectors. VBAR_EL1 wants a 2 KiB-aligned table and holds a
+     * virtual address, so it is set here rather than before the MMU is on. */
     ldr     x0, =_vectors
     msr     vbar_el1, x0
 
@@ -202,9 +196,9 @@ _start:
     bl      sos_page_tables_build       /* -> process set 0's level-1 base    */
     mov     x20, x0
 
-    /* Install TTBR1 FROM THE IDENTITY MAP. Branching low first is what gives
-     * the swap somewhere to stand: the instruction after `msr ttbr1_el1` is
-     * fetched through TTBR0, which this is not touching. */
+    /* Install TTBR1 from the identity map. Branching low first gives the swap
+     * somewhere to stand: the instruction after `msr ttbr1_el1` is fetched
+     * through TTBR0, which this does not touch. */
     ldr     x9, =LINMAP_PHYS_MASK
     ldr     x0, =.Lswap_phys
     and     x0, x0, x9
@@ -221,9 +215,9 @@ _start:
 
 .Lhigh_final:
     /* Back in the high half, now through the real linear map. TTBR0 becomes
-     * set 0's — `ROOT_PROCESS`'s, which the boot door re-installs by name — and
+     * set 0's (`ROOT_PROCESS`'s, which the boot door re-installs by name) and
      * the identity map is gone with it. From here the low half is the user's
-     * alone, which is the whole point of the unit. */
+     * alone. */
     msr     ttbr0_el1, x20
     isb
     tlbi    vmalle1
@@ -231,7 +225,7 @@ _start:
     isb
 
     /* Enter the Saw kernel. It stops the machine and does not return; if it
-     * ever does, hang rather than execute past the image. */
+     * does, hang rather than execute past the image. */
     bl      kmain
 3:  wfi
     b       3b
@@ -266,23 +260,20 @@ _vectors:
 
 /* ---- the user-mode trap path --------------------------------------------- */
 /*
- * Entered with SP_EL1 already selected and pointing at the kernel stack — EL1
- * has its own stack pointer, so there is no swap to perform and no window in
- * which the kernel is running on the user's stack. The frame is built ON that
- * kernel stack rather than in a static reservation, which is what a per-thread
- * frame will want when threads exist.
+ * Entered with SP_EL1 already selected. EL1 has its own stack pointer, so
+ * there is no swap to perform and no window in which the kernel runs on the
+ * user's stack.
  */
-/* A syscall and an interrupt save and restore the SAME frame and differ only in
- * what the kernel is called with, so the save is a macro used twice and the
- * restore is shared code both fall into — a second copy of thirty stores is
- * how the two paths would drift.
+/* A syscall and an interrupt save and restore the same frame and differ only
+ * in what the kernel is called with, so the save is a macro used twice and the
+ * restore is shared code both fall into.
  *
- * DESIGN 178 M2 UNIT 2 — THE FRAME IS A THREAD'S CONTEXT. `SP_EL1` between
- * traps points at the TOP of the running thread's frame, wherever the kernel
- * put it, so the `sub` below lands exactly on that frame. The kernel's own
- * stack is a different reservation and the macro switches to it once the frame
- * is written, because everything after that point is Saw and needs a stack the
- * frame is not sitting on. */
+ * The frame is a thread's context. `SP_EL1` between traps points at the top of
+ * the running thread's frame, wherever the kernel put it, so the `sub` below
+ * lands exactly on that frame. The kernel's own stack is a different
+ * reservation; the macro switches to it once the frame is written, because
+ * everything after that point is Saw and needs a stack the frame is not
+ * sitting on. */
     .macro save_user_frame
     sub     sp, sp, #FRAME_SIZE
     stp     x0,  x1,  [sp, #(3*8)]
@@ -308,7 +299,7 @@ _vectors:
     stp     x0, x1, [sp, #0]
     str     x2,     [sp, #16]
 
-    /* Park the frame address in x3 and move SP_EL1 to the KERNEL stack: the
+    /* Park the frame address in x3 and move SP_EL1 to the kernel stack: the
      * frame is a thread's storage, not a stack, and `ktrap` needs one. */
     mov     x3, sp
     ldr     x4, =_stack_top
@@ -321,22 +312,20 @@ user_trap_entry:
     save_user_frame
 
     /* ktrap(frame, cause, tval): the cause is ESR, the address is FAR. It
-     * RETURNS the frame to resume in x0 — this one, or another thread's. */
+     * returns the frame to resume in x0: this one, or another thread's. */
     mov     x0, x3
     mrs     x1, esr_el1
     mrs     x2, far_el1
     bl      ktrap
     b       .Luser_return
 
-/* An interrupt taken at EL0 (design 178 M2 unit 1). It has a vector of its own,
- * so there is no syndrome register to pass and nothing to decode: `ktrap` is
- * called with a cause value the syndrome register cannot hold, which is what
- * `lib.saw`'s `is_interrupt` recognizes. WHICH line it was comes from the
- * interrupt controller, not from here.
+/* An interrupt taken at EL0. It has a vector of its own, so there is no
+ * syndrome to pass: `ktrap` is called with a cause value the syndrome register
+ * cannot hold, which `lib.saw`'s `is_interrupt` recognizes. Which line fired
+ * comes from the interrupt controller, not from here.
  *
- * There is deliberately no EL1 counterpart: an interrupt taken in kernel mode
- * lands on `kernel_fault_entry` through the vector table, because the kernel
- * runs with interrupts masked and one arriving there is a bug (D2). */
+ * There is no EL1 counterpart: the kernel runs with interrupts masked, so an
+ * interrupt taken in kernel mode is a bug and lands on `kernel_fault_entry`. */
     .globl user_irq_entry
 user_irq_entry:
     save_user_frame
@@ -348,13 +337,13 @@ user_irq_entry:
 
     /* Resume the context x0 names. A returning syscall has had its (status,
      * value) pair written into that frame's x0/x1 slots; ELR already points
-     * past the `svc`, so nothing here advances it — and an interrupted
+     * past the `svc`, so nothing here advances it, and an interrupted
      * instruction has not run at all, so nothing may.
      *
-     * THE FRAME NEED NOT BE THE ONE WE CAME IN ON. `ktrap` returns whichever
-     * thread is to run, so pointing SP_EL1 at it here is the whole of the
-     * context switch — and the `add` at the bottom leaves SP_EL1 at that
-     * frame's top, which is where the next trap's `sub` expects to land. */
+     * The frame need not be the one we came in on. `ktrap` returns whichever
+     * thread is to run, so pointing SP_EL1 at it here is the whole context
+     * switch; the `add` at the bottom leaves SP_EL1 at that frame's top, where
+     * the next trap's `sub` expects to land. */
 .Luser_return:
     mov     sp, x0
     ldp     x0, x1, [sp, #0]
@@ -382,13 +371,12 @@ user_irq_entry:
     add     sp, sp, #FRAME_SIZE
     eret
 
-/* A trap the KERNEL took, i.e. a kernel bug. There is no context worth saving:
- * report the cause and stop the machine non-zero. (M0's discipline, unchanged:
- * a kernel fault never hangs.)
+/* A trap the kernel took, i.e. a kernel bug. There is no context worth saving:
+ * report the cause and stop the machine non-zero. A kernel fault never hangs.
  *
- * The three system registers are read HERE because `mrs` names a register at
- * assembly time; `sos_kernel_fault` is Saw since design 172 unit 3 and takes
- * them as ordinary arguments. */
+ * The three system registers are read here because `mrs` names a register at
+ * assembly time; `sos_kernel_fault` is Saw and takes them as ordinary
+ * arguments. */
     .globl kernel_fault_entry
 kernel_fault_entry:
     mrs     x0, esr_el1
@@ -402,13 +390,11 @@ kernel_fault_entry:
 
 /* void sos_resume_frame(u64 frame_addr) — never returns.
  *
- * Enter user mode in the context `frame_addr` holds. This is the FIRST entry
- * only: every entry after it is `ktrap` returning a frame to the path above,
- * which is why this is one branch INTO that path rather than a second copy of
- * it. It replaced `sos_enter_user`, which built a user context by zeroing
- * thirty registers in assembly and setting three system registers — the same
- * context is now built by `frame_init` in Saw, SPSR included, and the restore
- * path loads all of it. */
+ * Enter user mode in the context `frame_addr` holds. This is the first entry
+ * only; every later entry is `ktrap` returning a frame to the path above, so
+ * this is one branch into that path rather than a second copy of it. The
+ * context, SPSR included, is built by `frame_init` in Saw and the restore path
+ * loads all of it. */
     .section .text.enter, "ax", @progbits
     .globl sos_resume_frame
 sos_resume_frame:
@@ -416,26 +402,18 @@ sos_resume_frame:
 
 /* ---- reservations -------------------------------------------------------- */
 
-/* THE KERNEL STACK IS NOT RESERVED HERE ANY MORE (sawos design 38). It was a
- * `.skip 0x10000` in a `.bss.stack` section, which put the one number a board
- * might want to change in the one file a board variant does not get to edit;
- * `virt.ld` reserves it inside `.bss` now, under `KERNEL_STACK_SIZE`, 16-byte
- * aligned as `sp` requires, and `_stack_top` is a linker symbol. Nothing about
- * how this file USES it changed — all three entry points still
- * `ldr x0, =_stack_top`. Unlike the RISC-V profile there is still no separate
- * trap-frame reservation: the frame is built on this stack.
+/* The kernel stack is reserved by `virt.ld` inside `.bss`, 16-byte aligned as
+ * `sp` requires; `_stack_top` is a linker symbol. There is no separate
+ * trap-frame reservation: the frame is a thread's own storage.
  */
 
-/* THE BOOT TABLE (sawos design 29): one page, two live descriptors, used for
- * exactly the window between the MMU coming on and the real linear map being
- * installed. Dead memory afterwards — 4 KiB is cheaper than the alternatives,
- * which are running compiled code before translation exists or teaching the
- * assembly to build the real map.
+/* The boot table: one page, two live descriptors, used only for the window
+ * between the MMU coming on and the real linear map being installed. Dead
+ * memory afterwards.
  *
- * In `.bss` and therefore zeroed by the loop above, which is what leaves the
- * other 510 entries INVALID; it is built after that loop for the same reason.
- * A translation table must be page-aligned, and here that is the assembler's
- * job rather than a run-time round-up. */
+ * In `.bss`, so the zeroing loop above leaves the other 510 entries invalid;
+ * it is built after that loop for the same reason. A translation table must be
+ * page-aligned, and here that is the assembler's job. */
     .section .bss.boottable, "aw", @nobits
     .balign 4096
     .globl _boot_l1
