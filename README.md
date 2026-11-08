@@ -2,29 +2,33 @@
 
 SawOS (SOS) is a capability-based microkernel for embedded systems. It runs
 on riscv32 and arm64 — the gate is QEMU's `virt` boards for both, plus a
-FLAT BUILD PROFILE of the riscv32 board that turns its protection off, and
+flat build profile of the riscv32 board that turns its protection off, and
 there is a non-gating smoke target for the ESP32-C3 — with real hardware as
 the goal.
 
-Those three runs are the system's PROTECTION TIERS, one story told on each:
+Those three runs are the system's protection tiers, one story told on each:
 arm64 translates (per-process page tables, and a mapping's address is the
 kernel's answer), riscv32 does not (numbered protection regions, and an
 address is the same number in every process), and the flat profile cannot
-deny an access at all. The platform ADVERTISES which it is — `Isolated` or
+deny an access at all. The platform advertises which it is — `Isolated` or
 `Flat`, two words — so a program that needs isolation asks once and refuses
-to run; everything else is written against one idiom set. What the flat tier
-disclaims is DENIAL and nothing else: handles, rights, quotas and lifetimes
-are enforced identically on all three, which the gate demonstrates by running
-the whole object-model suite unchanged on each (`spec.md` §5b.1).
+to run; everything else is written against one idiom set. On the flat profile
+a process can read and write any address, the kernel's own memory included, so
+handles, rights, quotas and lifetimes hold only for a process that reaches the
+kernel through syscalls: the checks on that path are identical on all three
+tiers, and the isolated tiers also protect memory, the kernel's included, from
+a process. The gate runs the whole object-model suite unchanged on each tier,
+because every case reaches the kernel through syscalls (`spec.md` §5b.1).
 
 Every kernel resource is an object reached through a handle that carries
 rights: processes, threads, memory regions and their mappings, events, IRQ
 lines, clocks, timers, and the two ends of a pipe. A process holds handles,
 not addresses; the kernel checks the rights on every operation. Processes
 talk over pipes — bounded synchronous messages with request/reply built in,
-carrying handles as well as bytes, so a capability can be sent. Userspace enters through a typed `sos` module rather than raw
-syscall numbers, so the numbers are not ABI and can change without breaking
-programs (`spec.md` §5.7).
+carrying handles as well as bytes, so a capability can be sent. Userspace
+enters through a typed `sos` module rather than raw syscall numbers, so for a
+Saw program the numbers are not ABI and can change without breaking it; a C
+image that writes op numbers itself is the exception (`spec.md` §5.7).
 
 The kernel is written in Saw, and two properties of the language are
 properties of the system: destruction is deterministic (a dropped object is
@@ -50,9 +54,9 @@ SAWLANG_ROOT=/path/to/sawlang make sos-test
 
 This builds the kernel and the root server, stitches the boot image, and
 boots all three profiles under QEMU, asserting each console transcript and
-exit status. 382 runs: 129 cases on riscv32, 129 on arm64, and 124 on the
-flat profile — four fewer there, each excluded BY NAME with its reason,
-because its assertion is that the hardware DENIED something.
+exit status. The runner prints the totals. The flat profile excludes cases by
+name with a printed reason, because each one's assertion is that the hardware
+denied something.
 
 ## Layout
 
@@ -63,7 +67,7 @@ kernel/sysapi/  the public `sos` module userspace compiles against
 hal/arm64/      the arm64 architecture and board: boot, trap entry, linking
 hal/riscv32-common/  the riscv32 architecture, shared by its boards
 hal/riscv32/         the riscv32 `virt` board
-hal/riscv32-flat/    the flat build PROFILE of that board (a facade, not a fork)
+hal/riscv32-flat/    the flat build profile of that board (a facade, not a fork)
 hal/riscv32-esp32c3/ the ESP32-C3 board (smoke target, not part of sos-test)
 rt/         the runtime the kernel and every process share
 root/       the root server, a normal package emitting a boot image
