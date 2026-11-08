@@ -6139,6 +6139,17 @@ def main():
                            "SOS c3irq: binding the kernel timer's source",
                            "SOS: process fault: argument outside its domain"],
             },
+            {
+                "name": "cas",
+                "root_pkg": os.path.join(TESTS_DIR, "c3-cas"),
+                "children": [],
+                "expect": [C3_ROM, C3_BANNER,
+                           "SOS c3cas: start value=5",
+                           "SOS c3cas: swap 5->9 ok=true value=9",
+                           "SOS c3cas: swap 5->7 ok=false value=9",
+                           "SOS c3cas: done",
+                           "SOS-C3: halt pass"],
+            },
         ]
 
         print(f"{BOLD}SOS ESP32-C3 board smoke{RESET} (NON-GATING)")

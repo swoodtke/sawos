@@ -56,6 +56,25 @@ u32 __atomic_fetch_sub_4(volatile void *ptr, u32 val, int memorder) {
     return old;
 }
 
+// On failure the current value goes to `*expected`, as the libcall contract
+// requires. The sized libcall takes no `weak` argument and both orders are
+// ignored, like `memorder` above.
+_Bool __atomic_compare_exchange_4(volatile void *ptr, void *expected,
+                                  u32 desired, int success_order,
+                                  int failure_order) {
+    (void)success_order;
+    (void)failure_order;
+    volatile u32 *p = (volatile u32 *)ptr;
+    u32 *e = (u32 *)expected;
+    u32 old = *p;
+    if (old == *e) {
+        *p = desired;
+        return 1;
+    }
+    *e = old;
+    return 0;
+}
+
 // ---- the arena's extent ---------------------------------------------------
 //
 // `sosrt`'s bump arena is a linker region, so a package can choose its size

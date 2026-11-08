@@ -1,0 +1,46 @@
+// Smoke case (ESP32-C3, non-gating): `Atomic<Int>.compare_exchange` on a
+// target without the A extension, where it lowers to the
+// `__atomic_compare_exchange_4` libcall that rt/common_c/support.c defines.
+// The transcript reads:
+//
+//   SOS c3cas: start value=5
+//   SOS c3cas: swap 5->9 ok=true value=9
+//   SOS c3cas: swap 5->7 ok=false value=9
+//   SOS c3cas: done
+//
+// The second swap expects a stale value, so it must fail and leave the cell
+// unchanged. A libcall that stored unconditionally, or reported success
+// regardless, shows in the printed value or flag.
+
+import sos.{System, Process}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static CELL: Atomic<Int> = Atomic(5)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS c3cas: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    print("SOS c3cas: start value={}\n", CELL.load())
+
+    let first = CELL.compare_exchange(5, 9)
+    print("SOS c3cas: swap 5->9 ok={} value={}\n", first, CELL.load())
+
+    let second = CELL.compare_exchange(5, 7)
+    print("SOS c3cas: swap 5->7 ok={} value={}\n", second, CELL.load())
+
+    if not first || second || CELL.load() != 9 {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS c3cas: done\n")
+    let _ = proc.exit(EXIT_OK)
+}
