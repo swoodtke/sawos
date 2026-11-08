@@ -1,28 +1,20 @@
-/* SOS M2 unit-1 EL0 payload: spin, then stop (design 178).
+/* EL0 payload: spin, then stop.
  *
- * The interrupt cases need user mode to be RUNNING for a while — an interrupt
+ * The interrupt cases need user mode to be running for a while: an interrupt
  * that arrives while the machine is in the kernel proves nothing about where
- * interrupts are taken — so this payload burns a bounded register loop and then
- * shuts the machine down through a System op.
+ * interrupts are taken. So this payload burns a bounded register loop and
+ * then shuts the machine down through a System op.
  *
- * It touches NO memory, which is also why the count is built with two move
+ * It touches no memory, which is why the count is built with two move
  * instructions rather than the assembler's `ldr =` form: that would put the
- * constant in a literal pool and load it, and this payload's whole point is
- * that one grant of its own bytes is the entire address space it needs.
+ * constant in a literal pool and load it, and the payload needs nothing
+ * beyond one grant of its own bytes.
  *
- * THE ITERATION COUNT BUYS TIME, and how much depends on the machine. What the
- * cases need is two milliseconds of user mode (two ticks at the 1 ms period);
- * what this count must not do is outlast the harness's QEMU timeout. Measured
- * here: a hundred million iterations put a whole case — emulator startup, boot,
- * loop and shutdown — at 0.10-0.12s, with four ticks reported inside it, so the
- * loop clears the two milliseconds it owes by more than an order of magnitude
- * and clears the timeout by two.
+ * The iteration count buys time. The cases need enough user-mode time for
+ * the timer ticks they count; the count must not outlast the harness's QEMU
+ * timeout. It is chosen to clear both limits by a wide margin.
  *
- * Profile A's payload spins the SAME count at the same order of speed. It did
- * not when this unit was written — its user mode ran a thousand times slower,
- * for a reason that turned out to be one missing round-up in its linker script
- * rather than anything about either architecture (DF-178b). See that payload's
- * own note.
+ * The riscv32 payload spins the same count at the same order of speed.
  */
 
     .equ SYSTEM_HANDLE,     1       /* the boot handle, also arriving in x0 */

@@ -1,53 +1,45 @@
-// SOS M5 unit 2: SHARED AT PER-PROCESS ADDRESSES (sawos design 33; design 25
-// D-1 step two; spec §2.5, §5.5).
+// Shared at per-process addresses (spec §2.5, §5.5). Placement makes "one
+// region, two addresses" ordinary, and this is the program that says it: one
+// page, two domains, two different addresses, and both processes read and write
+// the same bytes through their own.
 //
-// **THE CASE §5.5's OLD LAW FORBADE.** "An address is the same number in every
-// process" made "one region, two addresses" not merely absent from the tree but
-// unsayable. Placement makes it ordinary, and this is the program that says it:
-// one page, two domains, two DIFFERENT addresses, and both processes read and
-// write the same bytes through their own.
-//
-// THE TRANSCRIPT, read as an order:
+// The transcript reads as an order:
 //
 //   SOS placed: created
-//   SOS placed: spacer at 1076101120       <- 0x4024_0000, root's FIRST mapping
-//   SOS placed: root sees 1076105216       <- 0x4024_1000, root's SECOND
+//   SOS placed: spacer at 1076101120       <- 0x4024_0000, root's first mapping
+//   SOS placed: root sees 1076105216       <- 0x4024_1000, root's second
 //   SOS placed: wrote 195                  <- 0xC3, through root's address
 //   SOS placed: gave the region
 //   SOS placed: started
-//   SOS childplaced: mapped at 1076101120  <- 0x4024_0000, THE CHILD's first
+//   SOS childplaced: mapped at 1076101120  <- 0x4024_0000, the child's first
 //   SOS childplaced: saw 195 wrote 45      <- the same bytes, another address
 //   SOS: process exit: code=...
 //   SOS placed: root observed child status=65731
 //   SOS placed: read back 45               <- 0x2D, back through root's address
 //   SOS placed: done
 //
-// **THE SPACER IS THE WHOLE TRICK, AND IT IS ONE LINE.** The kernel's VA policy
-// is first fit at or above a process's own region top, so the FIRST mapping into
-// any process on this board lands at the same number. Root therefore maps a
-// throwaway page first; its second mapping — the shared one — is pushed a page
-// higher, and the child's only mapping sits where root's spacer is. The two
-// addresses differ because the two processes have different mapping HISTORIES,
-// which is exactly the property "the kernel chooses" is supposed to have.
+// The spacer is the whole trick. The kernel's VA policy is first fit at or
+// above a process's own region top, so the first mapping into any process on
+// this board lands at the same number. Root therefore maps a throwaway page
+// first; its second mapping, the shared one, is pushed a page higher, and the
+// child's only mapping sits where root's spacer is. The two addresses differ
+// because the two processes have different mapping histories, which is the
+// property "the kernel chooses" is supposed to have.
 //
 // So the case does not depend on the policy being first fit. It depends on the
-// address being the KERNEL's answer rather than the region's, and it would keep
-// its meaning under any policy that answers per-process.
+// address being the kernel's answer rather than the region's, and keeps its
+// meaning under any policy that answers per-process.
 //
-// **NEITHER PROGRAM CONTAINS AN ADDRESS.** `Mapping.base()` is asked on both
-// sides. Every earlier map case in this tree reads `sos_test_pool_base()`, a
-// build-time constant that was right only because a user address used to be a
-// physical one; this pair is what those cases should become, and their migration
-// is recorded as owed rather than done in this unit (the gate that proves the
-// tier split forbids touching a source both architectures compile).
+// Neither program contains an address: `Mapping.base()` is asked on both sides.
+// The other map cases read `sos_test_pool_base()`, a build-time constant; this
+// pair asks the Mapping instead.
 //
-// **THE HANDOFF DIRECTION IS "HAND OVER AUTHORITY"** — root GIVES the region and
-// the child maps it into itself, the driver-child shape (design 9 D-2) over
-// ordinary RAM. That is deliberate: the child must hold a Mapping to be able to
-// ask where it is, and a Mapping is not transferable (`mapping_rights()`
-// withholds `Transfer`). `share-double-map` beside this one is the other
-// direction — root keeps the region and installs the child's row — and neither
-// program could have asked the child's question.
+// The handoff direction is "hand over authority": root gives the region and the
+// child maps it into itself, the driver-child shape over ordinary RAM. The
+// child must hold a Mapping to be able to ask where it is, and a Mapping is not
+// transferable (`mapping_rights()` withholds `Transfer`). `share-double-map` is
+// the other direction (root keeps the region and installs the child's row), and
+// neither program could have asked the child's question.
 
 import sos.{System, Process, Memory, Mapping, MapAccess, Waiter, WaitResult,
             WaitPayload, SosStatus, SystemRight}
@@ -58,7 +50,7 @@ static CHUNK: UInt = 0x1000
 /// Read and write, in both domains.
 static RW: UInt32 = MapAccess.Read | MapAccess.Write
 
-/// The byte ROOT writes, and the byte the CHILD writes. Two numbers that appear
+/// The byte root writes, and the byte the child writes. Two numbers that appear
 /// nowhere else in any transcript.
 static ROOT_MARK: UInt8 = 0xC3
 static CHILD_MARK: UInt8 = 0x2D
@@ -68,17 +60,16 @@ static KEY: UInt = 77
 
 /// Root's config: the tag the child's System handle travels under, and the tag
 /// the shared region travels under.
-///
-/// THE TWO ARE ORDERED BY WHAT CONSUMES THEM, not by when they are given:
-/// resolving a boot tag CONSUMES its record, so the System handle never appears
+/// The two are ordered by what consumes them, not by when they are given:
+/// resolving a boot tag consumes its record, so the System handle never appears
 /// at the child's drain and the region is the only record it ever sees.
 static TAG_BOOT: UInt = 51
 static TAG_REGION: UInt = 52
 
 /// What a child of this launcher may ask its System object for: print, and learn
-/// its own Process object — which is both the handle its `exit` goes through and
+/// its own Process object, which is both the handle its `exit` goes through and
 /// the one it maps with. `Transfer` is in the mask because it is the bit `give`
-/// checks on the thing being given; everything else is absent BY SILENCE.
+/// checks on the thing being given; everything else is absent by silence.
 static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
                                | SystemRight.Transfer)
 
@@ -154,10 +145,10 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS placed: created\n")
 
-    // **THE SPACER.** Root's first mapping, which exists only to occupy the
-    // address the child's mapping will land at — see the header. It is a real
-    // page and root never touches it; what it takes is a slot in root's own
-    // address space, which is the resource placement hands out.
+    // The spacer. Root's first mapping, which exists only to occupy the address
+    // the child's mapping will land at (see the header). It is a real page and
+    // root never touches it; what it takes is a slot in root's own address
+    // space, the resource placement hands out.
     let spacer = try pool.split(len: CHUNK) catch {
         print("SOS placed: spacer split failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -175,7 +166,7 @@ func _start(boot_handle: UInt) {
     }
     print("SOS placed: spacer at {}\n", spacer_at)
 
-    // The shared page, mapped into root SECOND — so it lands above the spacer.
+    // The shared page, mapped into root second, so it lands above the spacer.
     let shared = try pool.split(len: CHUNK) catch {
         print("SOS placed: split failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -198,8 +189,8 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // ROOT'S HALF OF THE CONVERSATION, before the child exists in any runnable
-    // sense — the child is `Created` and has no thread, so the ordering here is
+    // Root's half of the conversation, before the child exists in any runnable
+    // sense: the child is `Created` and has no thread, so the ordering here is
     // forced rather than raced.
     poke(root_at, ROOT_MARK)
     print("SOS placed: wrote {}\n", ROOT_MARK as Int)
@@ -225,11 +216,11 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // **THE REGION MOVES AND ROOT'S ROW STAYS.** `give` consumes the capability
-    // — root cannot map this page anywhere else afterwards — but root's own row
+    // The region moves and root's row stays. `give` consumes the capability
+    // (root cannot map this page anywhere else afterwards), but root's own row
     // was installed before the give and is not the child's to take. §2.5's
-    // refcount clause is what keeps the page alive while neither process holds
-    // a `Memory` handle onto it: the two ROWS are references of their own.
+    // refcount clause keeps the page alive while neither process holds a
+    // `Memory` handle onto it: the two rows are references of their own.
     try child.give(memory: move shared, tag: TAG_REGION) catch {
         print("SOS placed: give region failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -251,7 +242,7 @@ func _start(boot_handle: UInt) {
     }
     print("SOS placed: root observed child status={}\n", status_of(&record))
 
-    // **AND THE OTHER DIRECTION, THROUGH ROOT'S OWN ADDRESS.** The child is gone
+    // And the other direction, through root's own address. The child is gone
     // and its row went with it; this load is at a number the child never used,
     // reading the byte the child stored.
     let seen = peek(root_at)

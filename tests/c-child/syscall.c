@@ -1,20 +1,13 @@
-/* SOS from C: the trap instruction, both profiles, hand-rolled (sawos design
- * 39, the C-leg probe).
+/* The trap instruction for both profiles, hand-rolled.
  *
- * **ONE FILE, TWO ARCHITECTURES, AND THE `#if` IS THE ONLY THING IN IT THAT IS
- * ARCHITECTURAL.** The tree keeps two copies of this — `hal/arm64/user/syscall.c`
- * and `hal/riscv32-common/user/syscall.c` — because a Saw image reaches them
- * through a manifest's per-triple `native` line and a manifest is per triple
- * anyway. A C image has the preprocessor, so it does not need the split; the
- * probe writes it the way a C program arriving from outside the tree would.
+ * One file, two architectures; the `#if` is the only architectural thing in
+ * it. The tree keeps two copies, `hal/arm64/user/syscall.c` and
+ * `hal/riscv32-common/user/syscall.c`, because a Saw image reaches them
+ * through a manifest's per-triple `native` line. A C image has the
+ * preprocessor and does not need the split.
  *
- * THIS FILE IS A DUPLICATE AND THAT IS THE POINT (design 39 finding 4). Both
- * HAL stubs are already exactly this, are already C, are already nameable from
- * any manifest's `native` line, and are already documented as "the ENTIRE
- * architecture-dependent surface of an SOS process". Writing the seam out from
- * `hal/<arch>/user/ABI.md` cost about twenty minutes and thirty lines, and produced
- * no surprise on either profile — which is the measurement the unit was asked
- * for. The op numbers in `sos.h` are where the C leg actually hurts.
+ * This duplicates the HAL stubs on purpose: the image builds out of its own
+ * sources, writing the seam from `hal/<arch>/user/ABI.md` alone.
  *
  * ABI (spec §5.7), the two rows this file implements:
  *
@@ -87,9 +80,8 @@ sos_word sos_syscall3(sos_word handle, sos_word op, sos_word arg0, sos_word arg1
 #endif
 
 /* ---------------------------------------------------------------------------
- * The named ops. NOT architectural — a byte reaches the console through a
- * System op, which is the same op on both profiles (design 172 part 2's
- * reasoning, which is why the tree's own copies of these are Saw and not C).
+ * The named ops. Not architectural: a byte reaches the console through a
+ * System op, which is the same op on both profiles.
  * -------------------------------------------------------------------------- */
 
 sos_word sos_system_debug_print(sos_word system, sos_word byte) {

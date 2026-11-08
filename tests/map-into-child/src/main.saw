@@ -1,40 +1,36 @@
-// SOS M3 unit 4: MAPPING INTO A CHILD (sawos design 6 D-3; spec §2.5, §12).
+// Mapping into a child (spec §2.5, §12). Root creates a child, splits a page
+// off its own pool, installs that page in the child's address space, furnishes
+// the child with a masked System handle and starts it. The child then writes
+// and reads an address its image never declared.
 //
-// **THE LAUNCHER SHAPE, AND THE ONE UNIT 6 IS BUILT ON.** Root creates a child,
-// splits a page off its own pool, INSTALLS that page in the child's address
-// space, furnishes the child with a masked System handle and starts it. The
-// child then writes and reads an address its image never declared.
+// The transcript reads as an order:
 //
-// THE TRANSCRIPT, read as an order:
-//
-//   SOS mapchild: created                 <- an inert process, table EMPTY
-//   SOS mapchild: mapped a page into it   <- BEFORE the start, and before the
+//   SOS mapchild: created                 <- an inert process, table empty
+//   SOS mapchild: mapped a page into it   <- before the start, and before the
 //                                            child holds a single handle
 //   SOS mapchild: started
-//   SOS childtouch: wrote 60 read 60      <- THE CHILD'S OWN VOICE, from a page
+//   SOS childtouch: wrote 60 read 60      <- the child's own voice, from a page
 //                                            only the row above makes reachable
 //   SOS: process exit: code=60
 //   SOS mapchild: root observed child status=65596
 //
-// **A MAPPING IS NOT A BOOT RECORD**, which is why the map happens where it
-// does. §12's boot set FREEZES at `start` — a `give` afterwards is `BadState`,
-// which is the whole soundness argument for a child's handles being complete at
-// its first instruction — and a protection row is not a handle in the child's
-// table. It is state in the child's process slot, which the kernel installs
-// when it switches in. So `map` has no `Created` requirement at all and works
-// on a running process exactly as well; mapping first is simply what a launcher
-// would do.
+// A mapping is not a boot record, which is why the map happens where it does.
+// §12's boot set freezes at `start` (a `give` afterwards is `BadState`, which
+// is the soundness argument for a child's handles being complete at its first
+// instruction), and a protection row is not a handle in the child's table. It
+// is state in the child's process slot, which the kernel installs when it
+// switches in. So `map` has no `Created` requirement and works on a running
+// process just as well; mapping first is what a launcher would do.
 //
-// **AND THE ROW REACHES THE CHILD WITHOUT ANY RELOAD HERE.** The live-domain
-// rule is a no-op on this path — the child's domain is not the installed one —
-// which is the other half of what `map_unmap` proves: `domain_changed` costs
-// one comparison on the path that does not need it, and the switch INTO the
-// child is what installs the row (sawos design 2 D-5's replay, carrying a row
-// that did not come from an image).
+// The row reaches the child without any reload here. The live-domain rule is a
+// no-op on this path because the child's domain is not the installed one (the
+// other half of what `map_unmap` proves: `domain_changed` costs one comparison
+// on the path that does not need it), and the switch into the child is what
+// installs the row.
 //
 // `status=65596` is `Exited` (1) in the high half and the byte the child read
 // back (0x3C = 60) in the low, read through the Process handle root never gave
-// away — the same round trip the console line states, arriving as a VALUE.
+// away: the same round trip the console line states, arriving as a value.
 
 import sos.{System, Process, Memory, Mapping, MapAccess, Clock, ClockType,
             Timer, Waiter, SosStatus, SystemRight}
@@ -47,7 +43,7 @@ static CHUNK: UInt = 0x1000
 
 static RW: UInt32 = MapAccess.Read | MapAccess.Write
 
-/// The key this case attaches its park timer under — a number that appears
+/// The key this case attaches its park timer under, a number that appears
 /// nowhere else in the transcript.
 static KEY: UInt = 91
 
@@ -60,8 +56,8 @@ static TAG_BOOT: UInt = 11
 
 /// What a child of this launcher may ask its System object for: print, and
 /// learn its own Process object. `Transfer` is in the mask because it is the
-/// bit `give` checks on the thing being given — see `give-boot-drain`'s
-/// recorded finding. Everything else is absent BY SILENCE.
+/// bit `give` checks on the thing being given (see `give-boot-drain`).
+/// Everything else is absent by silence.
 static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
                                | SystemRight.Transfer)
 
@@ -120,11 +116,10 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS mapchild: created\n")
 
-    // **THE MAP, INTO SOMEBODY ELSE.** The receiver is the CHILD's Process
-    // handle, so the two rights this spends are `ProcessRight.Map` on that
-    // handle and `MemoryRight.Map` on the region — the doctrine's
-    // no-possession-implies-authority, which is why holding the page is not
-    // enough to install it anywhere.
+    // The map, into somebody else. The receiver is the child's Process handle,
+    // so the two rights this spends are `ProcessRight.Map` on that handle and
+    // `MemoryRight.Map` on the region: holding the page is not enough to
+    // install it anywhere.
     let page = try pool.split(len: CHUNK) catch {
         print("SOS mapchild: split failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -137,8 +132,8 @@ func _start(boot_handle: UInt) {
     }
     print("SOS mapchild: mapped a page into it at {}\n", sos_test_pool_base())
 
-    // The furnishing half, which is unit 3's flow unchanged: mint a masked
-    // sibling, give it under a tag, start naming that tag.
+    // The furnishing half: mint a masked sibling, give it under a tag, start
+    // naming that tag.
     let for_child = try system.mint(rights: CHILD_SYSTEM) catch {
         print("SOS mapchild: mint failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)

@@ -1,18 +1,18 @@
-/* SOS EL0 payload: a wait buffer the kernel may not write.
+/* EL0 payload: a wait buffer the kernel may not write.
  *
- * `Waiter.Wait` answers by COPYING a record into memory the caller supplies —
- * SOS's first kernel-writes-userspace path — so the kernel checks the
- * destination before it writes a byte, and a destination outside the process's
- * writable memory TERMINATES the process.
+ * `Waiter.Wait` answers by copying a record into memory the caller supplies,
+ * so the kernel checks the destination before writing, and a destination
+ * outside the process's writable memory terminates the process. Expected
+ * outcome: process fault.
  *
- * THIS PAYLOAD HAS NO WRITABLE MEMORY AT ALL: `sos/tests/umode.saw` grants it
- * exactly its own bytes, read+execute. Zero is used because zero is never in
- * anybody's grant. The misaligned half is `payload_misalignbuf.S`.
+ * This payload has no writable memory at all: `tests/umode.saw` grants it
+ * exactly its own bytes, read+execute. Zero is never in anybody's grant. The
+ * misaligned half is `payload_misalignbuf.S`.
  *
- * WHY A PAYLOAD AND NOT A ROOT SERVER: `Waiter.wait` in the typed layer
- * supplies its OWN buffer out of its frame and never lets a caller name one, so
- * "wait into memory I do not own" is not a thing a Saw process can spell. Kept
- * in step with the riscv32 twin, which states the reasoning in full.
+ * It is a payload, not a root server, because `Waiter.wait` in the typed layer
+ * supplies its own buffer and never lets a caller name one, so "wait into
+ * memory I do not own" cannot be spelled in Saw. Kept in step with the riscv32
+ * twin.
  *
  * The boot handle set is three wide and in a fixed order (§12): 1 = System,
  * 2 = Process, 3 = the initial Thread.
@@ -22,11 +22,11 @@
     .equ OP_WAITER_CREATE,  5       /* ProcessOp.WaiterCreate */
     .equ OP_WAITER_WAIT,    2       /* WaiterOp.Wait */
     .equ BAD_BUF,           0       /* word-aligned, and in nobody's grant */
-    .equ BUF_CAP,           256      /* ample — the capacity is not what fails.
-                                     * 256 since M4 unit 3 grew the record's
-                                     * BUFFER by a message body (design 15);
-                                     * a short cap would fault as BadArg
-                                     * before the door under test was reached. */
+    .equ BUF_CAP,           256      /* ample; the capacity is not what fails.
+                                     * It must cover the record's buffer,
+                                     * message body included, or the wait
+                                     * faults as BadArg before the check under
+                                     * test. */
 
     .section .payload, "ax", @progbits
     .balign 4
@@ -48,7 +48,7 @@ _umode_payload:
     mov     x3, #0
     svc     #0
 
-    /* Unreachable — see the riscv32 twin. Spin rather than exit cleanly, so a
-     * regression shows up as a timeout and not as a pass. */
+    /* Unreachable. Spin rather than exit cleanly, so a regression shows up as
+     * a timeout and not as a pass. */
 1:
     b       1b

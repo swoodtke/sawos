@@ -1,57 +1,47 @@
-// SOS M3 unit 4: THE POOL, SPLIT (sawos design 6 D-2; spec §2.5).
+// The pool, split (spec §2.5). `split(len)` on a pool root mints a region over
+// `len` bytes of the pool (first fit from the pool's free list, else the front
+// cut) and the handle keeps naming the rest, so allocation is this call in a
+// loop. The transcript reads as three claims:
 //
-// **THE PARENT IS THE CURSOR.** `split(len)` mints a region over the first
-// `len` bytes and leaves THIS handle naming everything after it, so allocation
-// is this call in a loop and a pool needs no second bookkeeping. The transcript
-// is read as four claims:
-//
-//   SOS split: a=170 b=187 a-again=170       <- the pieces are DISJOINT
-//                                               (0xaa, 0xbb, 0xaa — the bytes
+//   SOS split: a=170 b=187 a-again=170       <- the pieces are disjoint
+//                                               (0xaa, 0xbb, 0xaa; the bytes
 //                                               render as decimal)
-//   SOS split: cuts=20 refused=0             <- a DROPPED PIECE RETURNS ITS
-//                                               SLOT, so the slab is no longer
-//                                               what a cursor runs into
+//   SOS split: cuts=20 refused=0             <- a dropped piece returns its
+//                                               slot, so the slab is not what a
+//                                               cursor runs into
 //   SOS: process fault: argument outside its domain
-//                                            <- an oversize cut is a FAULT
+//                                            <- an oversize cut is a fault
 //
-// **THE SECOND LINE IS UNIT 5's, AND IT REPLACES UNIT 4's.** This case used to
-// assert `pool exhausted after 13 cuts` — the Memory SLAB running out with
-// most of the pool still unallocated — and its own comment said why: free-on-
-// last-reference was unit 5's, so a dropped piece returned a slot to nobody.
-// Design 7 built it, and the number that pinned `MAX_MEMORIES` in a transcript
-// is exactly what stopped being true. Twenty rounds is more than the slab has
-// slots (`MAX_MEMORIES` is 16), so completing them all with nothing refused is
-// the claim: each cut mints a region, the wrapper dies at the end of the arm,
-// the release takes its count to zero, and the slot comes straight back for the
-// next round. What still cannot be recycled is the RANGE — the parent is a
-// one-way cursor and returns no bytes — which is why the pool, not the slab, is
-// the thing this loop would eventually meet.
+// The second line: `CUT_ROUNDS` is more than the slab has slots
+// (`MAX_MEMORIES`), so completing them all with nothing refused is the
+// claim. Each cut mints a region, the wrapper dies at the end of the arm, the
+// release takes its count to zero, and the slot comes straight back for the
+// next round.
 //
-// WHY THE FIRST LINE PROVES THE ARITHMETIC. A region has no bounds reader —
-// unit 4 deliberately did not add one — so "the parent advanced" cannot be
-// observed by asking. It is observed by USING both pieces: write 0xaa into the
-// first, 0xbb into the second, read the first again. A parent that had not
-// advanced would hand out the same range twice and the second write would have
-// destroyed the first.
+// The first line proves the arithmetic. A region has no bounds reader, so "the
+// parent advanced" cannot be observed by asking. It is observed by using both
+// pieces: write 0xaa into the first, 0xbb into the second, read the first
+// again. A parent that had not advanced would hand out the same range twice and
+// the second write would have destroyed the first.
 //
-// AND THE MAPS ARE WHAT MAKE THE WRITES POSSIBLE AT ALL. Every address in this
-// program faulted before it was mapped; the pool is memory this image never
-// declared and the linker never heard of.
+// The maps are what make the writes possible at all. Every address in this
+// program faults until mapped; the pool is memory this image never declared and
+// the linker never heard of.
 //
-// THE LAST LINE IS DELIBERATELY A DEATH. `BadArg` is a fault by the faults
-// ruling — a caller that asks for more than it holds could have checked — so
-// the only way to assert it is to meet it, and a case that meets a fault ends
-// there. Everything above it has already been proven by then.
+// The last line is deliberately a death. `BadArg` is a fault by the faults
+// rule, spec §5.7 (a caller that asks for more than it holds could have
+// checked), so the only way to assert it is to meet it, and a case that meets
+// a fault ends there. Everything above it has already been proven by then.
 
 import sos.{System, Process, Memory, Mapping, MapAccess, SosStatus}
 
-// WHERE THE POOL IS — this program's config, per architecture, in C because Saw
-// cannot name an address (DF-172a). See `tests/poolbase_riscv32.c`.
+// The address of this program's first mapping: its config, per architecture, in
+// C because Saw cannot name an address. See `tests/poolbase_riscv32.c`.
 extern "C" {
     func sos_test_pool_base() -> UInt
 }
 
-/// One protection unit's worth on either profile — 4 KiB is a multiple of both
+/// One protection unit's worth on either profile: 4 KiB is a multiple of both
 /// `PROT_GRAIN`s, so one number serves both machines.
 static CHUNK: UInt = 0x1000
 
@@ -59,14 +49,13 @@ static CHUNK: UInt = 0x1000
 /// annotated `static` because a fixed-width slot is a const position.
 static RW: UInt32 = MapAccess.Read | MapAccess.Write
 
-/// A length no remaining pool can satisfy — the oversize cut.
+/// A length no remaining pool can satisfy: the oversize cut.
 static OVERSIZE: UInt = 0x0100_0000
 
-/// How many cut-and-drop rounds the loop runs. **PAST `MAX_MEMORIES` ON
-/// PURPOSE** — the kernel's Memory slab holds sixteen, so a run that completes
-/// twenty rounds with nothing refused could not have happened before design 7
-/// made a dropped region give its slot back. It is also far inside the pool's
-/// own supply (256 KiB is 64 chunks, two of them already cut above), so the
+/// How many cut-and-drop rounds the loop runs. Past `MAX_MEMORIES` on purpose:
+/// a run that completes this many rounds with nothing refused is possible only
+/// because a dropped region gives its slot back. It is also far inside the
+/// pool's own supply (many chunks, two of them already cut above), so the
 /// number this loop stops at is the one this program chose and not one the
 /// machine imposed.
 static CUT_ROUNDS: Int = 20
@@ -74,7 +63,7 @@ static CUT_ROUNDS: Int = 20
 static EXIT_FAILED: UInt = 1
 
 /// Write one byte through a mapping. `unsafe` because it names a pointer type,
-/// and confined to one line for design 136's reason.
+/// and confined to one line.
 func poke(addr: UInt, value: UInt8) unsafe {
     UnsafeMemory<UInt8, Normal>(addr).write(value)
 }
@@ -94,7 +83,7 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // The boot set carries one row: the RAM POOL. Its tag is 0 because it is
+    // The boot set carries one row: the RAM pool. Its tag is 0 because it is
     // the only row, which is root's config knowing the build's row order.
     var record = try proc.boot_handle_next() catch {
         print("SOS split: no pool region: {}\n", error)
@@ -109,7 +98,7 @@ func _start(boot_handle: UInt) {
 
     let base = sos_test_pool_base()
 
-    // **CUT ONE.** The piece covers `[base, base + CHUNK)` and `pool` now names
+    // Cut one. The piece covers `[base, base + CHUNK)` and `pool` now names
     // everything after it.
     let first = try pool.split(len: CHUNK) catch {
         print("SOS split: first cut failed: {}\n", error)
@@ -123,7 +112,7 @@ func _start(boot_handle: UInt) {
     }
     poke(base, 0xAA)
 
-    // **CUT TWO**, which lands where the cursor now points.
+    // Cut two, which lands where the cursor now points.
     let second = try pool.split(len: CHUNK) catch {
         print("SOS split: second cut failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -136,16 +125,16 @@ func _start(boot_handle: UInt) {
     }
     poke(base + CHUNK, 0xBB)
 
-    // THE DISJOINTNESS CLAIM, as a value: the first byte is still what it was.
+    // The disjointness claim, as a value: the first byte is still what it was.
     print("SOS split: a={} b={} a-again={}\n", peek(base) as Int,
           peek(base + CHUNK) as Int, peek(base) as Int)
 
-    // **AND A DROPPED PIECE RETURNS ITS SLOT** (sawos design 7 D-1). `case
-    // Ok(_)` binds nothing, so the region the kernel just minted dies at the
-    // end of the arm and its deinit releases the only handle onto it — which
-    // takes the reference count to zero INSIDE that release, and the slot is
-    // free before the next round asks for one. Twenty rounds is past the slab's
-    // sixteen slots, so `refused=0` is only possible if the recycling is real.
+    // A dropped piece returns its slot. `case Ok(_)` binds nothing, so the
+    // region the kernel just minted dies at the end of the arm and its deinit
+    // releases the only handle onto it, which takes the reference count to zero
+    // inside that release, and the slot is free before the next round asks for
+    // one. `CUT_ROUNDS` is past the slab's slots (`MAX_MEMORIES`), so
+    // `refused=0` is only possible if the recycling is real.
     var cuts = 0
     var refused: UInt = 0
     while cuts < CUT_ROUNDS && refused == 0 {
@@ -156,9 +145,9 @@ func _start(boot_handle: UInt) {
     }
     print("SOS split: cuts={} refused={}\n", cuts, refused)
 
-    // **AND AN OVERSIZE CUT IS A FAULT.** The caller knows what it has split
-    // off; asking for more than it holds is a mistake it could have checked, so
-    // it ends here.
+    // An oversize cut is a fault. The caller knows what it has split off;
+    // asking for more than it holds is a mistake it could have checked, so it
+    // ends here.
     let _ = system.debug_print("SOS split: asking for more than is left\n")
     let _ = pool.split(len: OVERSIZE)
 

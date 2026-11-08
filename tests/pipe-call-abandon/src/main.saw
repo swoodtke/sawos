@@ -1,47 +1,41 @@
-// SOS M4 unit 3.5: A PARKED FUSED CALL IS NEVER SILENTLY DOOMED (sawos design
-// 17; `designs/010` ruling 2, reaching the last park in M4 that could have
-// stranded anybody).
+// A parked fused call is never silently doomed (spec §2.1).
 //
-// **THE PARK A FUSED `Call` MAKES IS ON NO LIST.** A `Waiter.wait` puts its
-// thread on the Waiter's `blocked` chain; a `Join` puts it on the target's
-// joiner list; a fused call involves no Waiter and no thread, so the ONLY thing
-// that can ever reach the parked caller is the exchange it is tied to. That
-// makes the two arms below the sharpest test the peer-gone doctrine has:
+// The park a fused `Call` makes is on no list. A `Waiter.wait` puts its thread
+// on the Waiter's `blocked` chain and a `Join` puts it on the target's joiner
+// list; a fused call involves no Waiter and no thread, so the only thing that
+// can ever reach the parked caller is the exchange it is tied to. That makes
+// the two arms below the sharpest test of the peer-gone rule:
 //
-//   SOS callabandon: dropped the obligation      the server TOOK the message
+//   SOS callabandon: dropped the obligation      the server took the message
 //                                                and then dropped the request
 //   SOS callabandon: closed the server end       the server end went away with
-//                                                the message still STAGED
+//                                                the message still staged
 //   SOS callabandon: child said both were closed
 //
-// Each kills the exchange a different way and each has to produce the SAME
-// answer at the client — `SosStatus.PeerClosed`, which is `resolve`'s own
-// convention — through the ONE wake arm `kcore.refs.notify_claim` is.
+// Each kills the exchange a different way and each must produce the same answer
+// at the client, `SosStatus.PeerClosed` (`resolve`'s own convention), through
+// the same wake arm, `kcore.refs.notify_claim`.
 //
-// **THE CHILD'S EXIT CODE IS THE ASSERTION.** Root cannot see what its client
-// was told; the client can, and `EXIT_BOTH_CLOSED` is reachable only if BOTH
-// calls came back with that exact status. So root reads a conjunction out of
-// the §8 status word that it could not have observed for itself.
+// The child's exit code is the assertion. Root cannot see what its client was
+// told; the client can, and `EXIT_BOTH_CLOSED` is reachable only if both calls
+// came back with that exact status. So root reads, out of the status word, a
+// conjunction it could not have observed for itself.
 //
-// # WHY THE ORDER IS DETERMINISTIC AND NOT LUCKY
+// The order is deterministic, not lucky. The child is single-threaded and its
+// calls park, so it cannot reach its second connection until root has answered
+// its first. Root is likewise parked on its Waiter between the two, and the
+// child's `send` is what wakes it. Each turn of the transcript is one process
+// being unblocked by the other; a poll loop anywhere would have printed the
+// same lines without that.
 //
-// The child is single-threaded and its calls PARK, so it cannot reach its
-// second connection until root has answered its first. Root is likewise parked
-// on its Waiter between the two, and the child's `send` is what wakes it. Two
-// processes, two threads, and each turn of the transcript is one of them being
-// unblocked by the other — a poll loop anywhere would have printed the same
-// lines with none of that.
+// The second arm takes two steps. Dropping the outlet is what raises the level,
+// but an attachment is a reference: root's own `add(outlet:)` holds the server
+// end open, so the handle going is not the column reaching zero. Root has to
+// `remove` its subscription first. Hanging up means destroying the subscription
+// as well as the handle.
 //
-// # THE SECOND ARM'S TWO STEPS, AND WHY THERE ARE TWO
-//
-// Dropping the outlet is what raises the level, but an ATTACHMENT IS A
-// REFERENCE (design 7 D-1) — root's own `add(outlet:)` holds the server end
-// open — so the handle going is not the column reaching zero. Root has to
-// `remove` its subscription first. That is the abandonment re-wording ruling 11
-// landed, seen from the server's side: hanging up means destroying the
-// subscription as well as the handle.
-//
-// ONE PHASE PER FUNCTION, on design 14 finding 3's 16 KiB stack ceiling.
+// Each phase is its own function to stay under root's stack size
+// (`hal.ROOT_STACK_LEN`).
 
 import sos.{System, Process, Waiter, WaitResult, WaitPayload, PipeInlet,
             PipeOutlet, PipeRequest, OutletLevel, SosStatus, SystemRight,
@@ -51,10 +45,10 @@ static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
 /// A status the kernel can never hand this program, so meeting it in the error
-/// channel means an assertion in THIS file failed rather than a call did.
+/// channel means an assertion in this file failed rather than a call.
 static BUG: SosStatus = SosStatus.Revoked
 
-/// `Exited`(1) << 16 | 51 — `child-caller`'s verdict that BOTH fused calls came
+/// `Exited`(1) << 16 | 51: `child-caller`'s verdict that both fused calls came
 /// back `PeerClosed`.
 static CHILD_STATUS: UInt = 65587
 
@@ -67,7 +61,7 @@ static KEY_DROPPED: UInt = 81
 static KEY_CLOSING: UInt = 82
 static KEY_DEATH: UInt = 83
 
-/// The three tags. **THE TWO INLETS GO FIRST**, which is the contract
+/// The three tags. The two inlets go first, which is the contract
 /// `child-caller` reads: the boot set is a FIFO, so records 0 and 1 are the two
 /// client ends and the System handle sits behind them.
 static TAG_DROPPED: UInt = 11
@@ -108,8 +102,8 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
 
     let child = try system.process_create(image: &image_mem, memory: &dest_mem)
 
-    // TWO CONNECTIONS, which is exactly this process's pipe quota. Each one
-    // exists to be destroyed a different way.
+    // Two connections, one per arm. Each exists to be destroyed a different
+    // way.
     let first = try proc.pipe_create()
     let (inlet_a, outlet_a) = move first
     let second = try proc.pipe_create()
@@ -129,7 +123,7 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     try drop_the_obligation(&outlet_a, &waiter)
     try close_the_server_end(move outlet_b, &waiter)
 
-    // THE VERDICT. Only the death is still attached by now, so this wait can
+    // The verdict. Only the death is still attached by now, so this wait can
     // answer nothing else.
     let ended = try waiter.wait()
     if ended.key != KEY_DEATH {
@@ -145,16 +139,15 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     return
 }
 
-/// **ARM ONE: THE SERVER TAKES THE MESSAGE AND THEN DROPS THE OBLIGATION.**
+/// Arm one: the server takes the message and then drops the obligation.
 ///
-/// This is §2.1's ratified abandonment reaching a caller that is PARKED rather
-/// than polling. The obligation's last reference goes when `request` falls out
-/// of scope at the end of this function — RAII, over a kernel handle — and that
-/// decrement is what raises the claim's level, which is what
-/// `kcore.refs.notify_claim` turns into a woken thread carrying `PeerClosed`.
+/// This is §2.1's abandonment reaching a caller that is parked rather than
+/// polling. The obligation's last reference goes when `request` falls out of
+/// scope (RAII over a kernel handle), and that decrement raises the claim's
+/// level, which `kcore.refs.notify_claim` turns into a woken thread carrying
+/// `PeerClosed`.
 ///
-/// The attachment is left in place: root has one more thing to do on this
-/// connection, which is nothing, and the level it would raise is never asked
+/// The attachment is left in place; the level it would raise is never asked
 /// about again.
 func drop_the_obligation(outlet: &PipeOutlet,
                          waiter: &Waiter) -> Result<Void, SosStatus> {
@@ -170,7 +163,7 @@ func drop_the_obligation(outlet: &PipeOutlet,
 
     let got = try outlet.take()
     let (_, request) = move got
-    // THE DROP IS THE WHOLE ARM. `obligation` is never replied to and never
+    // The drop is the whole arm. `obligation` is never replied to and never
     // given away; it goes out of scope here, its `deinit` releases the handle,
     // the exchange's request column reaches zero, and the parked caller is told.
     let obligation = move request
@@ -180,19 +173,18 @@ func drop_the_obligation(outlet: &PipeOutlet,
     return
 }
 
-/// **ARM TWO: THE SERVER END ITSELF GOES, WITH THE MESSAGE STILL STAGED.**
+/// Arm two: the server end itself goes, with the message still staged.
 ///
 /// Nothing is ever taken on this connection, so the exchange is `Staged` when
-/// its future ends — a different state from arm one's `Taken`, reached by a
-/// different column falling, and answered by the same word. That is what makes
-/// the pair worth writing: one arm proves the obligation's zero raises the
-/// level, and this one proves the CONNECTION's does.
+/// its future ends, a different state from arm one's `Taken`, reached by a
+/// different column falling and answered by the same word. One arm proves the
+/// obligation's zero raises the level; this one proves the connection's does.
 ///
-/// **THE REMOVE IS NOT BOOKKEEPING.** An attachment is a counted reference on
-/// the end it watches, so root's own subscription holds the server end open;
+/// The remove is not bookkeeping. An attachment is a counted reference on the
+/// end it watches, so root's own subscription holds the server end open;
 /// dropping the handle with the subscription still live would leave the column
-/// at one and the client parked. Hanging up is destroying the subscription too,
-/// which is exactly the sentence ruling 11 added to §2.1.
+/// at one and the client parked. Hanging up is destroying the subscription too
+/// (spec §2.1).
 func close_the_server_end(outlet: PipeOutlet,
                           waiter: &Waiter) -> Result<Void, SosStatus> {
     var owned = move outlet
@@ -206,18 +198,17 @@ func close_the_server_end(outlet: PipeOutlet,
     }
 
     try waiter.remove(KEY_CLOSING)
-    // AND NOW THE LAST REFERENCE GOES.
+    // Now the last reference goes.
     let _ = move owned
 
     print("SOS callabandon: closed the server end\n")
     return
 }
 
-/// Whether a record says a message is STAGED. The other arms panic because this
+/// Whether a record says a message is staged. The other arms panic because this
 /// program attaches exactly two outlets and one Process and asks each question
-/// of the record whose key it has already checked — so any other shape would
-/// mean the kernel reported an attachment nobody made (`process_stats`'
-/// `status_of` is the same shape, and the same reasoning).
+/// of the record whose key it has already checked, so any other shape would
+/// mean the kernel reported an attachment nobody made.
 func readable_msg(r: &WaitResult) -> Bool {
     match r.what {
         case Readable(level) -> {

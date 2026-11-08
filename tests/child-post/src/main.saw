@@ -1,27 +1,24 @@
-// SOS CHILD: THE FIRST PROCESS TO SEND ANYTHING (sawos design 13 D-3, M4 unit
-// 1; spec §2.1, §12).
+// Child that sends: posts one message (spec §2.1, §12).
 //
-// It bootstraps exactly as every other child does — a masked System handle in
-// its first argument register, its own Process object derived from it, its boot
-// set drained from there — and the ONE new thing in it is what the set carries:
-// a `PipeInlet`, the client end of a connection its launcher created and kept
-// the other half of.
+// It bootstraps like every other child (a masked System handle in its first
+// argument register, its own Process object derived from it, its boot set
+// drained from there). The new thing is what the set carries: a `PipeInlet`,
+// the client end of a connection its launcher created and kept the other half
+// of.
 //
-// **THE END ARRIVES AS A CAPABILITY, WHICH IS THE WHOLE POINT.** This program
-// has no `PipeCreate` right of its own and no way to name root's connection; it
-// can post because it was HANDED an end, and it can post through nothing else.
-// `BootHandleKind.PipeInlet` is what tells it which accessor to reach for, and
-// asking for the wrong one would have been `None` and would have disturbed
-// nothing.
+// The end arrives as a capability. This program has no way to name root's
+// connection; it can post because it was handed an end, and through nothing
+// else. `BootHandleKind.PipeInlet` tells it which accessor to reach for; asking
+// for the wrong one would give `None` and disturb nothing.
 //
-// **AND THE MESSAGE OUTLIVES IT.** The inlet drops at the end of the branch that
-// took it — drop is release, so that is this process closing the client end —
-// and then the process exits. Root reads the bytes AFTER both, which is design
-// 230's close-drains-first rule proved across a process boundary: a sender
+// The message outlives the sender. The inlet drops at the end of the branch
+// that took it (drop is release, so that is this process closing the client
+// end) and then the process exits. Root reads the bytes after both, which
+// proves the close-drains-first rule across a process boundary: a sender
 // exiting mid-conversation loses nothing.
 //
 // The payload is `PIPE` in ASCII, and the launcher asserts all four bytes: a
-// status alone would not have shown that the copy funnel carried the data.
+// status alone would not show that the copy funnel carried the data.
 
 import sos.{System, Process, PipeInlet, PipeReply, BootHandle, BootHandleKind,
             SosStatus, PIPE_BODY_BYTES}
@@ -63,12 +60,12 @@ func _start(boot_handle: UInt) {
                                 let _ = proc.exit(EXIT_NO_INLET)
                                 return
                             }
-                            // **THE TELL IDIOM** (§2.1; sawos design 14): the
-                            // claim on the reply is given up at once, because
-                            // this child has nothing to wait for and is about to
-                            // exit. The message is still owed to the server —
-                            // a staged body outlives its claim exactly as it
-                            // outlives its sender.
+                            // The tell idiom (§2.1): the claim on the reply
+                            // is given up at once, because this child has
+                            // nothing to wait for and is about to exit. The
+                            // message is still owed to the server; a staged
+                            // body outlives its claim exactly as it outlives
+                            // its sender.
                             let _ = move claim
                             posted = true
                         }
@@ -89,8 +86,8 @@ func _start(boot_handle: UInt) {
     }
 
     let _ = system.debug_print("SOS childpost: posted\n")
-    // THE EXIT CODE IS THE PAYLOAD'S LENGTH, so the kernel's account of this
-    // process and the launcher's reading of the message say the same number from
-    // the two sides of the boundary.
+    // The exit code is the payload's length, so the kernel's account of this
+    // process and the launcher's reading of the message say the same number
+    // from the two sides of the boundary.
     let _ = proc.exit(PAYLOAD_LEN)
 }

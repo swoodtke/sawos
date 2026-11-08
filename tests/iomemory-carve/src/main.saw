@@ -1,34 +1,29 @@
-// SOS M3 unit 4: CARVE (sawos design 6 D-1/D-2; spec §2.5).
-//
-// **A CARVE LEAVES THE PARENT WHOLE, AND THAT IS THE WHOLE DIFFERENCE FROM A
-// SPLIT.** §2.5: "a fixed region may be handed out many times" — MMIO is
+// Carve (spec §2.5): a carve leaves the parent whole, which is the difference
+// from a split. §2.5: "a fixed region may be handed out many times". MMIO is
 // pinned, nothing is consumed, and several drivers may legitimately hold
-// windows onto one peripheral. So this program carves the SAME range twice and
-// both succeed, which is exactly the sequence `Memory.split` must refuse.
+// windows onto one peripheral. So this program carves the same range twice and
+// both succeed, which is the sequence `Memory.split` must refuse.
 //
-// THE TRANSCRIPT, read as three claims:
+// The transcript reads as three claims:
 //
 //   SOS carve: carved twice          <- non-exclusive: the parent is unchanged
 //   SOS carve: mapped                <- a carved window installs
 //   SOS: process fault: argument outside its domain
 //                                    <- a window the hardware cannot express
 //
-// **THE THIRD CLAIM IS PER-PROFILE AND THE REFUSAL IS NOT.** One machine grants
-// a device window as a single naturally-aligned power-of-two protection entry,
-// so a length of `0xC00` is not expressible there; the other grants by page, so
+// The third claim is per-profile but the refusal is not. One machine grants a
+// device window as a single naturally-aligned power-of-two protection entry, so
+// a length of `0xC00` is not expressible there; the other grants by page, so
 // `0xC00` is not a whole number of pages. Two different rules, one `BadArg`
-// fault, one line in the transcript — which is why the predicate is per-HAL and
-// the case is not.
+// fault, one transcript line, which is why the predicate is per-HAL and the
+// case is not.
 //
-// **X-ON-DEVICE IS IMPOSSIBLE BY VOCABULARY**, and that claim needs no line at
-// all: `Process.map(iomemory:)` takes no access argument. An IoMemory can only
-// ever produce a read-write, never-executable, device-attribute row, so a
-// driver cannot ask for an executable register block and there is nothing to
-// refuse. That is D-1's kind-not-a-flag ruling paying for itself — the
-// alternative would have been a fourth refusal here.
+// Execute-on-device needs no case: `Process.map(iomemory:)` takes no access
+// argument, so an IoMemory can only produce a read-write, never-executable,
+// device-attribute row and there is nothing to refuse.
 //
-// The last line is deliberately a death, on `memory_split`'s terms: `BadArg` is
-// a fault, so the only way to assert it is to meet it.
+// The last line is deliberately a death, as in `memory_split`: `BadArg` is a
+// fault, so the only way to assert it is to meet it.
 
 import sos.{System, Process, IoMemory, Mapping, SosStatus}
 
@@ -51,9 +46,9 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // The boot set carries one row and it is a DEVICE row, so what arrives is
-    // an `IoMemory` rather than a `Memory` — the kind column of the build's
-    // region table deciding which capability the same range becomes.
+    // The boot set carries one row and it is a device row, so what arrives is
+    // an `IoMemory` rather than a `Memory`: the kind column of the build's
+    // region table decides which capability the same range becomes.
     var record = try proc.boot_handle_next() catch {
         print("SOS carve: no device window: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -70,8 +65,8 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    // **THE SAME RANGE AGAIN.** A split would have nothing left to give; a
-    // carve does, because the parent was never spent.
+    // The same range again. A split would have nothing left to give; a carve
+    // does, because the parent was never spent.
     let _second = try window.carve(offset: 0, len: WINDOW_LEN) catch {
         print("SOS carve: second carve failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -86,8 +81,8 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS carve: mapped\n")
 
-    // **AND A WINDOW THE HARDWARE CANNOT EXPRESS IS A FAULT.** The caller chose
-    // the offset and the length, so it could have checked.
+    // A window the hardware cannot express is a fault. The caller chose the
+    // offset and the length, so it could have checked.
     let _ = system.debug_print("SOS carve: asking for a window this board cannot grant\n")
     let _ = window.carve(offset: 0, len: UNGRANTABLE_LEN)
 

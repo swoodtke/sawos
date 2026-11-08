@@ -1,34 +1,28 @@
-// SOS M4 unit 4: THE COMPLETION-QUEUE SERVER — ONE TRAP PER MESSAGE (sawos
-// design 18; `designs/010` ruling 11(d)).
+// The completion-queue server: one trap per message. A readable delivery says
+// "there is something", not "here it is", which costs the multiplexed server a
+// separate `take`. Here the delivery is the take, and this case measures that
+// as a number against the shapes below it:
 //
-// **THE LADDER'S LAST RUNG, AND IT IS MEASURED AGAINST THE ONE BELOW IT.**
-// Design 17 counted the multiplexed server at TWO traps a message and named the
-// missing one exactly: "a readable delivery says there is something, not here it
-// is" — the `take` neither shape could avoid. Ruling 11(d) removes it by making
-// the DELIVERY the take, and this case is that claim as a number:
+//     manual                   wait + take + reply           3 per message
+//     fused                    take + reply_wait             2 per message
+//     completion queue         reply_wait                    1 per message
 //
-//     manual (unit 3)          wait + take + reply           3 per message
-//     fused  (unit 3.5)        take + reply_wait             2 per message
-//     completion queue (4)     reply_wait                    1 per message
+// The client is `child-pingpong`, unchanged, so the comparison is exact: the
+// same program, the same round trips, the same payload check.
+// `tests/pipe-pingpong` measures the server over identical work.
 //
-// **THE CLIENT IS `child-pingpong`, UNCHANGED**, which is what makes the
-// comparison exact rather than analogous: the same program, the same eight round
-// trips, the same payload check — `tests/pipe-pingpong` measured the server at
-// 18 traps and this one measures it at 10, over identical work.
+// The server holds no outlet handle at all. It gives the connection's server
+// end to its Waiter (a consuming, persistent attach), so the subscription owns
+// the end and there is no handle left to call `take` through. A multiplexer
+// holds zero endpoint handles however many connections it serves, and hanging
+// up is destroying the subscription.
 //
-// **THE SERVER HOLDS NO OUTLET HANDLE AT ALL.** It GIVES the connection's server
-// end to its Waiter — a consuming, persistent attach — so the subscription owns
-// the end and there is no handle left to call `take` through even if the loop
-// wanted to. That is ruling 11(d)'s other half: a multiplexer holds zero
-// endpoint handles for however many connections it serves, and hanging up IS
-// destroying the subscription.
-//
-// **AND THE TERMINAL DELIVERY STILL ARRIVES.** When the child exits, the last
-// inlet handle goes with it and the readable level turns `PeerGone` — which this
-// loop is already parked on, so it ends with no counter, no timer and no
-// sentinel message. A delivery that carries a message and one that says there
-// will never be another are two TAGS of one record, which is why the loop reads
-// them in one `match`.
+// The terminal delivery still arrives. When the child exits, the last inlet
+// handle goes with it and the readable level turns `PeerGone`, which this loop
+// is already parked on, so it ends with no counter, no timer and no sentinel
+// message. A delivery that carries a message and one that says there will never
+// be another are two tags of one record, which is why the loop reads them in
+// one `match`.
 
 import sos.{System, Process, PipeInlet, PipeOutlet, PipeRequest, PipeMsg,
             Waiter, WaitResult, WaitPayload, OutletLevel, AttachMode,
@@ -37,7 +31,7 @@ import sos.{System, Process, PipeInlet, PipeOutlet, PipeRequest, PipeMsg,
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
-/// ROOT'S CONFIG. `child-pingpong` expects the inlet as boot record 0 and its
+/// Root's config. `child-pingpong` expects the inlet as boot record 0 and its
 /// System under this tag.
 static TAG_BOOT: UInt = 7
 static TAG_INLET: UInt = 9
@@ -60,12 +54,12 @@ static BYTE_P: UInt8 = 80
 static BYTE_O: UInt8 = 79
 static BYTE_N: UInt8 = 78
 
-/// **THE SERVER'S TRAP COUNT, PREDICTED FROM THE COUNTING RULE.**
+/// The server's trap count, predicted from the counting rule:
 ///
-///     1           the opening `wait` — the degenerate first turn, which is the
+///     1           the opening `wait`, the degenerate first turn, which is the
 ///                 existing op because `reply_wait` needs a request to consume
 ///     ROUNDS      one `reply_wait` per message: it answers the request it holds
-///                 AND parks, and the park's delivery IS the next take
+///                 and parks, and the park's delivery is the next take
 ///     1           the closing `stats()`, charged at trap entry before it answers
 ///     ------
 ///     ROUNDS + 2  = 10, against `pipe-pingpong`'s 18 for the same eight messages
@@ -79,7 +73,7 @@ static CLIENT_SYSCALLS: UInt64 = 11
 /// kind in its high half.
 static CHILD_STATUS: UInt = 65569
 
-/// A number no arm of this case can produce honestly.
+/// A status no arm of this case can produce honestly.
 static BUG: SosStatus = SosStatus.BadImage
 
 /// What one serving run answers with.
@@ -130,8 +124,8 @@ func _start(boot_handle: UInt) {
     }
     print("SOS cq: server traps={} for {} messages\n", done.traps, ROUNDS)
 
-    // **THE LADDER, IN ONE ROW.** The brackets come off outside the window, so
-    // the division is over the loop and nothing else — the opening wait and the
+    // The comparison in one row. The brackets come off outside the window, so
+    // the division is over the loop and nothing else: the opening wait and the
     // closing read on this side, the client's three setup traps on the other.
     print("SOS cq: per RPC client={} server={}\n",
           (done.client - 3) / (ROUNDS as UInt64),
@@ -153,12 +147,12 @@ func run(system: &System, proc: &Process) -> Result<Served, SosStatus> {
     let (inlet, outlet) = move pair
     let waiter = try proc.waiter_create()
 
-    // **THE CONSUMING, PERSISTENT ATTACH — THE WHOLE OF RULING 11(d).** `give`
-    // rather than `add`: the wrapper goes in by MOVE, the kernel releases the
-    // entry as part of the attach, and the ATTACHMENT owns the server end from
-    // here on. PERSISTENT because this subscription has to survive `ROUNDS`
-    // deliveries and one terminal one — a one-shot would detach at the first
-    // message and the next park would be on an empty Waiter.
+    // The consuming, persistent attach. `give` rather than `add`: the wrapper
+    // goes in by move, the kernel releases the entry as part of the attach, and
+    // the attachment owns the server end from here on. Persistent because this
+    // subscription has to survive `ROUNDS` deliveries and one terminal one; a
+    // one-shot would detach at the first message and the next park would be on
+    // an empty Waiter.
     try waiter.give(outlet: move outlet, key: KEY_OUTLET,
                     mode: AttachMode.Persistent) catch {
         let (why, back) = move error
@@ -166,7 +160,7 @@ func run(system: &System, proc: &Process) -> Result<Served, SosStatus> {
         return why
     }
 
-    // THE INLET FIRST, because `child-pingpong` spends exactly one
+    // The inlet first, because `child-pingpong` spends exactly one
     // `boot_handle_next` and expects it at record 0.
     try child.give(inlet: move inlet, tag: TAG_INLET)
     let for_child = try system.mint(rights: CHILD_SYSTEM)
@@ -185,18 +179,18 @@ func run(system: &System, proc: &Process) -> Result<Served, SosStatus> {
     return move answer
 }
 
-/// **THE MEASURED WINDOW: ONE `wait`, THEN `reply_wait` FOREVER.**
+/// The measured window: one `wait`, then `reply_wait` until the terminal
+/// delivery.
 ///
-/// There is NOTHING else inside the bracket — no print, no take, no mint, no
-/// wrapper falling out of scope — which is what makes the number arithmetic
-/// rather than observation.
+/// Nothing else is inside the bracket (no print, no take, no mint, no wrapper
+/// falling out of scope), which makes the number arithmetic rather than
+/// observation.
 ///
-/// **THE DELIVERY CARRIES THE MESSAGE AND THE OBLIGATION**, so the loop's body
+/// The delivery carries the message and the obligation, so the loop's body
 /// reaches for neither: `WaitPayload.Message` says both fields of the record are
 /// populated, and the request the kernel minted at the delivery is what the
-/// `reply_wait` at the bottom consumes. The `take` unit 3.5 could not avoid is
-/// simply not written here, which is the one difference between this loop and
-/// `pipe-pingpong`'s.
+/// `reply_wait` at the bottom consumes. The absent `take` is the one difference
+/// between this loop and `pipe-pingpong`'s.
 func serve(waiter: &Waiter, proc: &Process) -> Result<Served, SosStatus> {
     var out: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     out[1] = BYTE_P
@@ -215,18 +209,17 @@ func serve(waiter: &Waiter, proc: &Process) -> Result<Served, SosStatus> {
     var serving = true
     while serving {
         var more = false
-        // **LOOK FIRST, THEN TAKE.** Matching through the place BORROWS, which
-        // is all a decision needs and costs nothing; the arm that goes on to
-        // MOVE the payloads out opens the record instead (SL-17's discipline,
-        // written at `WaitResult.open`).
+        // Look first, then take. Matching through the place borrows, which is
+        // all a decision needs and costs nothing; the arm that goes on to move
+        // the payloads out opens the record instead (see `WaitResult.open`).
         match wake.what {
-            // **THE DELIVERY-AS-TAKE.** A message arrived and the obligation to
-            // answer it is in this very record — the type says so, which is why
+            // The delivery-as-take. A message arrived and the obligation to
+            // answer it is in this very record; the type says so, which is why
             // the arm below need not ask whether either is there.
             case Message(_, _) -> { more = true },
             // The terminal level: the client is gone and nothing is staged, so
             // there will never be another message. It is a `Readable` because
-            // that is what the LEVEL is; only a delivery that hands something
+            // that is what the level is; only a delivery that hands something
             // over is tagged `Message`.
             case Readable(level) -> {
                 match level {
@@ -239,11 +232,11 @@ func serve(waiter: &Waiter, proc: &Process) -> Result<Served, SosStatus> {
         if not more {
             serving = false
         } else {
-            // **OPEN THE RECORD, THEN MATCH THE OWNED PAYLOAD.** `open`
-            // consumes the wake and hands back its key and its payload BY
-            // VALUE, which is the form an arm may move out of — a `match` on an
-            // owned scrutinee consumes it, so the two wrappers below leave the
-            // enum exactly once each.
+            // Open the record, then match the owned payload. `open` consumes
+            // the wake and hands back its key and its payload by value, the
+            // form an arm may move out of: a `match` on an owned scrutinee
+            // consumes it, so the two wrappers below leave the enum exactly
+            // once each.
             let (_, what) = (move wake).open()
             match what {
                 case Message(m, r) -> {
@@ -276,7 +269,7 @@ func serve(waiter: &Waiter, proc: &Process) -> Result<Served, SosStatus> {
                         }
                     }
                 },
-                // UNREACHABLE: the borrowing look one branch up established the
+                // Unreachable: the borrowing look one branch up established the
                 // tag and nothing runs between the two.
                 case _ -> { return BUG },
             }

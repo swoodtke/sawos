@@ -1,25 +1,21 @@
-// SOS CHILD: A FUSED CALLER THAT IS REFUSED TWICE (sawos design 17, M4 unit
-// 3.5; `designs/010` ruling 2's peer-gone doctrine).
+// Test child: a fused caller that is refused twice.
 //
-// **NOTHING PARKED CAN BE SILENTLY DOOMED**, and a thread inside
-// `PipeInlet.send` is the hardest case that rule has met: it is on NO LIST — not
-// a Waiter's blocked chain, because a fused call involves no Waiter at all — so
-// the only thing that can ever reach it is the exchange it is tied to. This
-// child parks in two such calls, on two connections, and its launcher kills each
-// one a different way:
+// Nothing parked is silently doomed: a fused caller whose peer abandons the
+// exchange is woken with `PeerClosed` and never left parked. A thread inside
+// `PipeInlet.send` (a fused call) is on no list: a fused call involves no
+// Waiter, so only the exchange it is tied to can reach it. This child parks in
+// two such calls on two connections, and the launcher ends each differently:
 //
-//   connection A   the server TAKES the message and then drops the obligation
-//   connection B   the server end itself goes away with the message still staged
+//   connection A   the server takes the message, then drops the obligation
+//   connection B   the server end goes away with the message still staged
 //
-// Both must come back `SosStatus.PeerClosed` — the same word `resolve` answers
-// with, which is what says the fused path and the composed one report one fact.
+// Both calls must return `SosStatus.PeerClosed`, the status `resolve` returns,
+// so the fused and composed paths report the same fact.
 //
-// **THE VERDICT IS THE EXIT CODE**, because a child cannot assert on its
-// launcher's behalf: `EXIT_BOTH_CLOSED` is reachable only if BOTH calls came
-// back with that exact status, so the launcher reading it out of the §8 status
-// word is reading a conjunction it could not have observed itself.
+// The verdict is the exit code: `EXIT_BOTH_CLOSED` is reachable only if both
+// calls returned exactly that status, which the launcher cannot observe itself.
 //
-// The two inlets are boot records 0 and 1 — the launcher gives them before the
+// The two inlets are boot records 0 and 1; the launcher gives them before the
 // System handle, and the boot set is a FIFO.
 
 import sos.{System, PipeInlet, SosStatus, PIPE_BODY_BYTES}
@@ -43,8 +39,8 @@ func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
     let proc = try system.process_self() catch {
-        // Returning from the entry faults this process, so the launcher reads
-        // `Faulted` where it expected `Exited` — a wrong answer that says so.
+        // Returning from the entry faults this process; the launcher reads
+        // `Faulted` instead of `Exited`.
         return
     }
 
@@ -69,10 +65,10 @@ func _start(boot_handle: UInt) {
     // transcript's ordering says which side acted first.
     let _ = system.debug_print("SOS childcaller: calling\n")
 
-    // THE FIRST CALL PARKS UNTIL THE SERVER DROPS THE OBLIGATION IT TOOK.
+    // The first call parks until the server drops the obligation it took.
     let one = refused(&dropped)
-    // THE SECOND PARKS UNTIL THE SERVER END ITSELF GOES, with this message
-    // still staged and never taken at all.
+    // The second parks until the server end goes, with this message still
+    // staged and never taken.
     let two = refused(&closing)
 
     if one && two {
@@ -84,10 +80,9 @@ func _start(boot_handle: UInt) {
 
 /// One fused call that must come back `PeerClosed`.
 ///
-/// A `match` rather than the tree's `try … catch` guard shape, deliberately:
-/// this is a NEGATIVE test asserting a SPECIFIC error value, which is one of
-/// the two things CLAUDE.md's idiom ruling keeps `match` for. An `Ok` here is a
-/// failure of the case, not of the call.
+/// A `match` rather than the tree's `try … catch` guard shape: this is a
+/// negative test asserting a specific error value. An `Ok` here is a failure of
+/// the case, not of the call.
 func refused(inlet: &PipeInlet) -> Bool {
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     msg[0] = 1

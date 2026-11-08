@@ -1,26 +1,22 @@
-// SOS M3 unit 6: THE USERSPACE UART ECHO DRIVER, AS A CHILD (sawos design 9
-// D-2; spec §2.5, §9, §12) — the PL011 half.
+// Test child: the userspace UART echo driver, run as a child process, for the
+// PL011 board (spec.md §2.5, §9, §12).
 //
-// The program is the ns16550 child package's, sentence for sentence, and that
-// file carries the whole argument for why a driver CHILD is the milestone's
-// finale — the promise `uart-echo-ns16550`'s header made to this unit, kept.
-// This one carries what is different about THIS chip, which is all any driver
-// ever is: 32-bit sparsely-placed registers, readiness that reads the opposite
-// way, a mask register instead of an enable bit, and a control register the
-// driver has to turn on. `uart-echo-pl011` beside it explains each.
+// The program is the ns16550 child package's (`child-echo-ns16550`), which
+// carries the full description of the child-driver cycle. This file covers what
+// is specific to this chip: 32-bit sparsely placed registers, a receive-empty
+// flag that reads the opposite way, a mask register instead of an enable bit,
+// and a control register the driver must turn on. `uart-echo-pl011` explains
+// each.
 //
-// **WHAT MAKES IT A CHILD RATHER THAN A ROOT**, the same three things its twin
-// lists and none of them about the device: the window arrives by GIVE rather
-// than as a boot region row (the drain call is byte-identical, which is the
-// point), it ends with `Process.exit` because a driver child holds no
-// `SystemRight.Shutdown`, and it is linked at the CHILD base.
+// It differs from a root driver in the first two ways its twin lists, neither
+// of them about the device: the window arrives by give rather than as a boot
+// region row (the drain call is identical), and it ends with `Process.exit`
+// because a driver child holds no `SystemRight.Shutdown`.
 //
-// **AND ONE NOTE THAT IS THIS PROFILE'S OWN.** The DEVICE attribute (nGnRE,
-// uncached, no merging) that the access-size discipline above rests on is a
-// property of the object KIND — an `IoMemory` can only ever produce a
-// device-attribute row — so it survived the handover untouched. Nothing about
-// giving a window away could have turned it into cacheable memory, because
-// there is no op on the kind that produces one.
+// The window keeps its device memory attribute (nGnRE, uncached, no merging)
+// across the handover. The attribute is a property of the `IoMemory` kind,
+// which can only produce device-attribute rows, so giving a window away cannot
+// turn it into cacheable memory.
 
 import sos.{System, Process, Interrupt, Mapping, Waiter, WaitResult,
             WaitPayload}
@@ -34,11 +30,10 @@ import sosrt.{ascii_byte}
 // The board
 // =============================================================================
 
-/// The console UART's register page — where the window this driver is HANDED
-/// lives, and the same number the kernel's board description carries. The
-/// number did not move when the GIVER did (sawos design 9 D-2), exactly as it
-/// did not move when the acquisition did: SOS does not translate, so a mapped
-/// window is where the hardware is, whoever handed it over.
+/// The console UART's register page: where the window this driver is handed
+/// lives, and the same number the kernel's board description carries. A mapped
+/// device window sits at its physical address, whoever handed it over: the
+/// board's `map_place` returns the hardware address for a device window.
 static UART_BASE: UInt = 0x0900_0000
 
 /// The interrupt line this board wires the console to: the first shared
@@ -56,12 +51,12 @@ static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
 // =============================================================================
-// The PL011, through the granted window (design 112's blessed MMIO idiom)
+// The PL011, through the granted window
 // =============================================================================
 
-/// The register block. Declaration order IS the layout (design 58), so the
-/// holes between registers are spelled out as fields rather than computed — a
-/// gap in a register block is a field like any other.
+/// The register block. Declaration order is the layout, so the holes between
+/// registers are spelled out as fields rather than computed; a gap in a
+/// register block is a field like any other.
 struct Pl011Regs {
     dr: UInt32,              // +0x00  data
     rsr: UInt32,             // +0x04  receive status / error clear
@@ -86,8 +81,8 @@ struct Pl011Regs {
 static_assert(sizeof<Pl011Regs>() == 0x48,
               "the PL011 register block runs to the interrupt-clear register")
 
-/// FR bit 4: the receive FIFO is EMPTY — so data is waiting when it is CLEAR,
-/// which is the opposite sense to the other profile's data-ready bit.
+/// FR bit 4: the receive FIFO is empty, so data is waiting when it is clear.
+/// This is the opposite sense to the other profile's data-ready bit.
 static FR_RX_EMPTY: UInt32 = 0x10
 /// FR bit 5: the transmit FIFO is full.
 static FR_TX_FULL: UInt32 = 0x20
@@ -100,7 +95,7 @@ static INT_ALL: UInt32 = 0x7FF
 /// CR: enable the device, its transmitter and its receiver.
 static CR_ENABLE_RX_TX: UInt32 = 0x301
 
-/// The driver. A SAFE type (unsafety is not transitive — design 130).
+/// The driver. A safe type (unsafety is not transitive).
 struct Pl011 {
     regs: UnsafeMemory<Pl011Regs, Device>,
 }
@@ -112,21 +107,18 @@ extension Pl011 {
 
     /// Turn the device on and let it raise its line when a byte arrives.
     ///
-    /// NOTHING IS CLEARED FIRST, and that is the one line of this file worth
-    /// arguing about. The obvious bring-up sequence — enable, clear stale
-    /// status, unmask — LOSES A BYTE on this chip, because its receive
-    /// interrupt is a LATCH set when the FIFO level crosses the trigger rather
-    /// than a level read off the FIFO. A byte that arrived before the driver
-    /// existed has already set that latch; clearing it destroys the only edge
-    /// that byte will ever produce, and nothing re-raises it because the level
-    /// never crosses again until something reads. The driver would then park
-    /// forever holding a byte, which is exactly the hang this shape avoids.
+    /// Nothing is cleared first. The obvious bring-up sequence (enable, clear
+    /// stale status, unmask) loses a byte on this chip: its receive interrupt
+    /// is a latch set when the FIFO level crosses the trigger, not a level read
+    /// off the FIFO. A byte that arrived before the driver existed has already
+    /// set that latch, and clearing it destroys the only edge that byte will
+    /// produce; nothing re-raises it until something reads. The driver would
+    /// then park forever holding a byte.
     ///
     /// There is nothing stale to clear anyway: this driver owns the device from
-    /// reset — the kernel writes only the data register and only to transmit —
-    /// so unmasking on top of whatever the latch holds is unmasking on top of
-    /// the truth. A driver INHERITING a device from firmware would have to
-    /// clear, and would have to drain immediately afterwards to make up for it.
+    /// reset (the kernel writes only the data register, and only to transmit).
+    /// A driver inheriting a device from firmware would have to clear, and
+    /// drain immediately afterwards.
     func listen(&self) unsafe {
         self.regs.cr.write(CR_ENABLE_RX_TX)
         self.regs.imsc.write(INT_RX)
@@ -156,11 +148,11 @@ extension Pl011 {
     /// Drain everything the receiver holds, echoing each byte, and report how
     /// many.
     ///
-    /// NOTHING IS WRITTEN TO THE CLEAR REGISTER HERE, deliberately: reading the
-    /// data register is what lowers this device's receive interrupt, and a
-    /// clear on the way out would race a byte that arrived between the last
-    /// `has_byte` and the write — clearing the latch it had just set, which is
-    /// the byte lost forever described on `listen`.
+    /// Nothing is written to the clear register here: reading the data register
+    /// lowers this device's receive interrupt, and a clear on the way out would
+    /// race a byte that arrived between the last `has_byte` and the write,
+    /// clearing the latch it had just set (the lost byte described on
+    /// `listen`).
     func echo_available(&self) unsafe -> Int {
         var n = 0
         while self.has_byte() {
@@ -189,7 +181,7 @@ func woke_on_line(r: &WaitResult) -> UInt {
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
-    // §12's SYMMETRY: a child bootstraps exactly as root does. A failure here
+    // A child bootstraps exactly as root does (spec.md §12). A failure here
     // cannot report through `exit`, because `exit` is the op on the handle that
     // just failed to arrive.
     let proc = try system.process_self() catch {
@@ -197,11 +189,10 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // **STEP 0 — OBTAIN THE WINDOW.** Identical to the ns16550 child package's,
-    // which is the point twice over: acquiring a device window is not a
-    // per-device act, and receiving one from a LAUNCHER is not a different act
-    // from receiving one from the kernel. The record was queued by
-    // `ProcessOp.Give`; nothing in this call can tell, and nothing needs to.
+    // Step 0, obtain the window. Identical to the ns16550 child package's:
+    // acquiring a device window is not a per-device act, and a window received
+    // from a launcher is received the same way as one from the kernel. The
+    // record was queued by `ProcessOp.Give`; nothing in this call can tell.
     var record = try proc.boot_handle_next() catch {
         print("SOS echo: no device window: {}\n", error)
         let _ = proc.exit(EXIT_FAILED)
@@ -235,9 +226,8 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // From here on every console byte goes out through the GRANTED WINDOW, not
-    // through a System op — which is the point of the grant and is what the
-    // handover protocol makes safe to do.
+    // From here on every console byte goes out through the granted window, not
+    // through a System op.
     let uart = Pl011(at: UART_BASE)
     uart.listen()
     uart.put_str("SOS echo: driver up\n")
@@ -259,8 +249,8 @@ func _start(boot_handle: UInt) {
             return
         }
 
-        // EVERYTHING THAT TOUCHES THE DEVICE HAPPENS BEFORE THE ACK — spec §9's
-        // release rule.
+        // Everything that touches the device happens before the ack (spec.md
+        // §9's release rule).
         echoed = echoed + uart.echo_available()
         try irq.ack() catch {
             print("SOS echo: ack failed: {}\n", error)
@@ -269,16 +259,14 @@ func _start(boot_handle: UInt) {
         }
     }
 
-    // THE WAKE COUNT IS REPORTED AND NOT ASSERTED. Every byte is echoed and at
-    // least one interrupt was serviced — that is what the line number proves,
-    // since it came out of the wait RECORD — but how many wakes it took depends
-    // on how fast the host feeds the port relative to the guest, so pinning a
-    // number would be pinning the emulator's timing.
+    // The wake count is reported, not asserted. Every byte is echoed and at
+    // least one interrupt was serviced (the line number came out of the wait
+    // record), but how many wakes it took depends on how fast the host feeds
+    // the port relative to the guest.
     print("\nSOS echo: done {} bytes on line {} after {} wakes\n",
           echoed, line, wakes)
 
-    // **AND IT EXITS RATHER THAN STOPPING THE MACHINE.** Its launcher is parked
-    // on this process's death and takes the machine down afterwards, which is
-    // where that decision belongs.
+    // It exits rather than stopping the machine. Its launcher is parked on this
+    // process's death and takes the machine down afterwards.
     let _ = proc.exit(EXIT_OK)
 }

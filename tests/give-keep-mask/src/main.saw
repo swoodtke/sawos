@@ -1,35 +1,29 @@
-// SOS M4 unit 4: ATTENUATE AT GIVE, AND AT THE DERIVE (sawos design 18;
-// `designs/010` agenda 7b; spec §3, §9).
+// Attenuate at give, and at the derive (spec §3, §9).
 //
-// **A LAUNCHER COULD ALWAYS NARROW BEFORE IT GAVE, AND IT COST A TABLE ROW AND A
-// TRAP.** `MINT_OP` produces an attenuated sibling and `give` moves it, which is
-// the flow every launch in this tree runs; what the two-step spelling costs is a
-// handle whose only purpose is to be moved out immediately. The keep mask says
-// the same thing at the give, and the rules are `MINT_OP`'s unchanged: the
-// entry the child receives carries `source & keep`, all-ones is what the
-// no-argument spelling always meant, and naming a right the source does not hold
-// is a NO-OP rather than an error.
+// A launcher can narrow before it gives: `MINT_OP` produces an attenuated
+// sibling and `give` moves it. The two-step spelling costs a table row and a
+// trap for a handle whose only purpose is to be moved out immediately. The keep
+// mask does the same at the give, with `MINT_OP`'s rules unchanged: the entry
+// the child receives carries `source & keep`, all-ones is what the no-argument
+// spelling means, and naming a right the source does not hold is a no-op rather
+// than an error.
 //
-// **THE POLARITY IS THE RULING AND THE REASON IS EVOLUTION.** A keep mask FAILS
-// CLOSED when a kind gains a right in a later unit: a mask written before that
-// right existed has never heard of it and therefore denies it. A removal mask
-// would have handed every future authority to every child a launcher had ever
-// configured, which is the quiet escalation nobody is looking for.
+// The polarity is deliberate. A keep mask fails closed when a kind gains a
+// right later: a mask written before that right existed has never heard of it
+// and therefore denies it. A removal mask would hand every future authority to
+// every child a launcher had configured, a quiet escalation.
 //
-// TWO HALVES, AND THE SECOND ONE ENDS THE CASE:
+// Two halves, and the second ends the case:
 //
-//   THE GIVE. A child is handed the same connection end TWICE — once through a
+//   The give. A child is handed the same connection end twice, once through a
 //   mask naming `Post` and a right the end does not carry, and once through a
 //   mask that leaves `Post` out. It posts through the first (so the ignored bit
 //   is proved ignored rather than fatal) and faults on the second.
 //
-//   THE DERIVE. `SystemOp.ProcessSelf` mints ONE default set and took no mask
-//   until this unit, so a child derived its own Process handle with
-//   `InterruptBind` and `Map` on it whatever its SYSTEM handle had been narrowed
-//   to — the one place in the system where attenuation was not monotonic in
-//   practice, recorded as a finding by M3 unit 6 (spec §9) and closed here. Root
-//   derives a handle without `Stats` and reads them, which is the last thing it
-//   does.
+//   The derive. `SystemOp.ProcessSelf` takes a keep mask too, so a process can
+//   narrow the Process handle it derives whatever its System handle had been
+//   narrowed to (spec §9). Root derives a handle without `Stats` and reads
+//   them, which is the last thing it does and faults.
 
 import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
             PipeMsg, Waiter, WaitResult, WaitPayload,
@@ -38,7 +32,7 @@ import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
 
 static EXIT_FAILED: UInt = 1
 
-/// ROOT'S CONFIG. `child-narrow` drains the two inlets in the order they are
+/// Root's config. `child-narrow` drains the two inlets in the order they are
 /// given, so the tags only have to be distinct.
 static TAG_BOOT: UInt = 7
 static TAG_WIDE: UInt = 11
@@ -51,16 +45,16 @@ static KEY_READABLE: UInt = 5
 static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
                                | SystemRight.Transfer)
 
-/// **THE WIDE MASK NAMES A RIGHT A `PipeInlet` DOES NOT HAVE**, deliberately:
-/// `MemoryRight.Split` is a Memory's bit, and an inlet's rights word has nothing
-/// at that position. The intersection drops it silently, which is what "total,
-/// so there is nothing to fault on" means — and it is why one policy mask can be
-/// written for handles of several kinds without a launcher knowing which bits
-/// each carries.
+/// The wide mask names a right a `PipeInlet` does not have, deliberately:
+/// `MemoryRight.Split` is a Memory's bit, and an inlet's rights word has
+/// nothing at that position. The intersection drops it silently (a keep mask
+/// is total, so there is nothing to fault on), which is why one policy mask can
+/// be written for handles of several kinds without a launcher knowing which
+/// bits each carries.
 static WIDE_KEEP: UInt32 = (PipeInletRight.Transfer | PipeInletRight.Post
                             | PipeInletRight.Wait | 0x8000_0000)
 
-/// **THE NARROW MASK LEAVES `Post` OUT BY SILENCE**, which is the whole of the
+/// The narrow mask leaves `Post` out by silence, which is the whole of the
 /// policy: this child may hold the end and hand it on, and may not send through
 /// it.
 static NARROW_KEEP: UInt32 = (PipeInletRight.Transfer | PipeInletRight.Wait)
@@ -110,10 +104,10 @@ func _start(boot_handle: UInt) {
     let (inlet, outlet) = move pair
     let _ = system.debug_print("SOS keepmask: created\n")
 
-    // TWO NAMES FOR ONE END. A sibling is a second reference on the same
+    // Two names for one end. A sibling is a second reference on the same
     // connection's inlet column, so the child holding both keeps the end open
-    // exactly as one handle would — and the two travel through two different
-    // masks, which is the only difference between them.
+    // exactly as one handle would; the two travel through different masks,
+    // which is the only difference between them.
     let sibling = try inlet.mint() catch {
         print("SOS keepmask: mint failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -147,10 +141,10 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // **ROOT PARKS, WHICH IS WHAT MAKES THE CHILD RUNNABLE.** `start` makes a
-    // process runnable and does not yield, so a take on this line would find an
-    // empty ring; the wait is both the synchronisation and the proof that the
-    // wide post really happened rather than the take merely being late.
+    // Root parks, which is what lets the child run. `start` makes a process
+    // runnable and does not yield, so a take on this line would find an empty
+    // ring; the wait is both the synchronisation and the proof that the wide
+    // post really happened rather than the take merely being late.
     let waiter = try proc.waiter_create() catch {
         print("SOS keepmask: no waiter: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -201,28 +195,24 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS keepmask: the narrowed end could not post\n")
 
-    // ---- THE DERIVE, and it is the last thing root does.
-    //
-    // **`ProcessSelf` MINTS ONE DEFAULT SET, AND UNTIL THIS UNIT IT TOOK NO
-    // MASK** (spec §9's unit-6 finding). A handle derived through a mask that
-    // omits `Stats` is a Process handle that can do everything else and cannot
-    // read its own columns — which is exactly the attenuation the finding said
-    // was unreachable.
+    // The derive, and the last thing root does. A handle derived through a mask
+    // that omits `Stats` is a Process handle that keeps the rights
+    // `PROCESS_KEEP` names and cannot read its own columns.
     let watched = try system.process_self(keep: PROCESS_KEEP) catch {
         print("SOS keepmask: masked derive failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
     let _ = system.debug_print("SOS keepmask: derived a Process handle without Stats\n")
-    // AND THIS ENDS THE CASE. A missing right is a fault, so there is no arm
-    // below this line and nothing after it runs.
+    // This ends the case. A missing right is a fault, so there is no arm below
+    // this line and nothing after it runs.
     let _ = watched.stats()
 
     let _ = system.debug_print("SOS keepmask: a masked derive read its stats anyway\n")
     let _ = system.shutdown(EXIT_FAILED)
 }
 
-/// **EVERYTHING ROOT'S OWN PROCESS HANDLE NEEDS, AND NOT `Stats`.** Written as a
+/// Everything root's own process handle needs, and not `Stats`. Written as a
 /// list rather than as a complement, which is the keep mask's own polarity
 /// applied by hand: a complement would silently start granting the day a right
 /// is added, and this case is about the bit that is absent.

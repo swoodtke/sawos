@@ -1,21 +1,19 @@
-// SOS M5 unit 5: SPENT BYTES COME BACK (sawos design 28, on design 25 D-5;
-// spec §2.5, §5.9).
-//
-// **THE CASE THAT IS IMPOSSIBLE AT `bc451cb`.** Design 7's twenty-round case
-// (`memory_split`) proved a dropped region returns its slab SLOT; a pool walked
-// to its end stayed walked, because the RANGE returned to nobody. This proves
-// the range. Two legs, and each one fails LOUDLY on a kernel without pool
-// returns rather than printing a wrong number:
+// Spent bytes come back (spec §2.5, §5.9). `memory_split` proves a dropped
+// region returns its slab slot; a pool walked to its end would stay walked
+// unless the range itself returns to the pool. This proves the range. Two legs,
+// and each fails loudly on a kernel without pool returns rather than printing a
+// wrong number:
 //
 //   SOS recycle: quarters=4            <- the pool is taken to its last byte,
-//                                         in four 64 KiB pieces
-//   SOS recycle: whole=1               <- given back OUT OF ORDER, the four
-//                                         pieces come out again AS ONE 256 KiB
-//                                         RANGE. That single number is the free
-//                                         list, the coalescing and the frontier
-//                                         fold at once: a cursor that had not
-//                                         absorbed all four could not serve it
-//   SOS childtouch: wrote 60 read 60   <- a CHILD writes its mark in a page
+//                                         in `PIECES` equal pieces
+//   SOS recycle: whole=1               <- given back out of order, the four
+//                                         pieces come out again as one
+//                                         range the size of the pool. That
+//                                         single number is the free list, the
+//                                         coalescing and the frontier fold at
+//                                         once: a cursor that had not absorbed
+//                                         all four could not serve it
+//   SOS childtouch: wrote 60 read 60   <- a child writes its mark in a page
 //                                         mapped into it out of that same pool
 //   SOS recycle: reused read 60        <- the child is dead, and the page came
 //                                         home. A fresh split of the same size
@@ -23,49 +21,47 @@
 //                                         the child left in them
 //   SOS recycle: done
 //
-// **LEG 1 IS THE ALLOCATOR'S ARITHMETIC.** Four quarters is the whole pool, so
-// the fifth byte does not exist; the pieces are then released 0, 2, 1, 3 — out
-// of order ON PURPOSE, because releasing them in reverse would fold each one
+// Leg 1 is the allocator's arithmetic. Four quarters is the whole pool, so the
+// fifth byte does not exist; the pieces are then released 0, 2, 1, 3, out of
+// order on purpose, because releasing them in reverse would fold each one
 // straight back into the frontier and never build a list at all. This order
-// makes a hole (q0), a second disjoint hole (q2), a merge of three into one
-// (q1 joining them), and finally a fold of the whole 256 KiB back into the
-// cursor when q3 arrives adjacent to it. The pool ends as it began, which is
-// what `whole=1` says: one region, the size of the entire pool.
+// makes a hole (q0), a second disjoint hole (q2), a merge of three into one (q1
+// joining them), and finally a fold of the whole pool back into the cursor
+// when q3 arrives adjacent to it. The pool ends as it began, which is what
+// `whole=1` says: one region, the size of the entire pool.
 //
-// **LEG 2 IS THE SECOND ZERO, ACROSS A PROCESS BOUNDARY** (design 25 D-5's
-// ruled release condition, and the sharpest form of it). Root splits a page,
-// maps it into a child, and then destroys BOTH objects on its own side: the
-// Memory handle and the Mapping object. Nothing in the system can name that
-// region afterwards — the only thing left holding it is the protection ROW in
-// the child's domain, which is exactly §2.5's second kind of reference. A
-// kernel that counted only handles would have put those bytes back on the free
-// list while the child was still writing to them. This one waits for the child
-// to die: its teardown drops the row, the row was the last reference, and the
-// range goes home. The proof is the child's own byte, read back by root through
-// a mapping of a region split out AFTER the child was gone.
+// Leg 2 is the second zero across a process boundary: the range is released
+// only when the last reference of either kind drops. Root splits a page, maps
+// it into a child, and then destroys both objects on its own side: the Memory
+// handle and the Mapping object. Nothing in the system can name that region
+// afterwards; the only thing left holding it is the protection row in the
+// child's domain, §2.5's second kind of reference. A kernel that counted only
+// handles would have put those bytes back on the free list while the child was
+// still writing to them. This one waits for the child to die: its teardown
+// drops the row, the row was the last reference, and the range goes home. The
+// proof is the child's own byte, read back by root through a mapping of a
+// region split out after the child was gone.
 //
-// A KERNEL WITHOUT POOL RETURNS FAILS LEG 1 AT `whole=1` (a `split` that big is
-// a `BadArg` fault, so the run dies there) and, if it somehow got past, fails
-// leg 2 by faulting on the read: its cursor would have moved on and the second
-// page would be somewhere else entirely.
+// A kernel without pool returns fails leg 1 at `whole=1` (a `split` that big is
+// a `BadArg` fault, so the run dies there) and, if it got past, fails leg 2 by
+// faulting on the read: its cursor would have moved on and the second page
+// would be somewhere else entirely.
 //
-// # WHY THIS PROGRAM IS THREE FUNCTIONS AND NOT ONE
-//
-// Root's stack is 16 KiB (`hal.ROOT_STACK_LEN`, both profiles) and every
-// `print` with format arguments assembles its message in STACK SCRATCH (design
-// 137) — 508 bytes per site, which do not overlap between sites in one frame.
-// Written as a single `_start` this case overflowed root's stack ON ARM64 (a
-// permission fault a few hundred bytes below the stack row's base, arm64 frames
-// being the wider of the two) while riscv32 squeaked through. So each leg is a
-// function whose frame pops, and every diagnostic that is not an ASSERTION is a
-// plain `debug_print` of a literal rather than a formatted line. Recorded here
-// because the shape looks like taste and is not.
+// This program is three functions and not one because root's stack is small
+// (`hal.ROOT_STACK_LEN`, both profiles) and every `print` with format
+// arguments assembles its message in stack scratch, and the scratch of
+// different sites does not overlap within one frame. A single `_start` would
+// hold every leg's scratch in one frame and can overflow root's stack (arm64
+// frames are the wider of the two). So each leg is a function whose frame
+// pops, and every diagnostic that is not an assertion is a plain `debug_print`
+// of a literal rather than a formatted line. Don't merge the legs: the shape
+// looks like taste and is not.
 
 import sos.{System, Process, Memory, Mapping, MapAccess, ClockType,
             Timer, Waiter, SosStatus, SystemRight}
 
-// WHERE THE POOL IS AND HOW BIG IT IS — this program's config, per
-// architecture, in C because Saw cannot name an address (DF-172a). See
+// The address of this program's first mapping, and the pool's size: its config,
+// per architecture, in C because Saw cannot name an address. See
 // `tests/poolbase_riscv32.c`.
 extern "C" {
     func sos_test_pool_base() -> UInt
@@ -75,16 +71,15 @@ extern "C" {
 /// One protection unit's worth on either profile.
 static CHUNK: UInt = 0x1000
 
-/// How many pieces leg 1 cuts the pool into. Four quarters of a 256 KiB pool is
-/// 64 KiB each — big enough that four of them are the WHOLE pool, which is what
-/// makes "there is nothing left" a fact of this program's own arithmetic rather
-/// than a refusal it would have to survive.
+/// How many pieces leg 1 cuts the pool into. The pieces are equal and together
+/// are the whole pool, which makes "there is nothing left" a fact of this
+/// program's own arithmetic rather than a refusal it would have to survive.
 static PIECES: UInt = 4
 
 /// Read and write, which is what a scratch region wants.
 static RW: UInt32 = MapAccess.Read | MapAccess.Write
 
-/// The key this case attaches its park timer under — a number that appears
+/// The key this case attaches its park timer under, a number that appears
 /// nowhere else in the transcript.
 static KEY: UInt = 93
 
@@ -95,7 +90,7 @@ static PARK_NS: UInt64 = 20_000_000
 /// Root's config: the tag the child's System handle travels under.
 static TAG_BOOT: UInt = 11
 
-/// What a child of this launcher may ask its System object for: print, and
+/// What a child of this launcher may ask its System object for: print and
 /// learn its own Process object. `Transfer` is the bit `give` checks on the
 /// thing being given.
 static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
@@ -105,14 +100,14 @@ static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
 /// Read one byte back. `unsafe` because it names a pointer type, and confined to
-/// one line for design 136's reason.
+/// one line.
 func peek(addr: UInt) unsafe -> UInt8 {
     UnsafeMemory<UInt8, Normal>(addr).read()
 }
 
-/// **LEG 1: the pool is spent to its last byte and comes back whole.**
+/// Leg 1: the pool is spent to its last byte and comes back whole.
 ///
-/// The four pieces are separate bindings because the ORDER they are released in
+/// The four pieces are separate bindings because the order they are released in
 /// is the experiment: 0, 2, 1, 3 makes a hole, a second disjoint hole, a merge
 /// of three into one, and then a fold of everything back into the frontier.
 func pool_comes_back(system: &System, pool: &Memory, pool_bytes: UInt) -> Bool {
@@ -135,15 +130,15 @@ func pool_comes_back(system: &System, pool: &Memory, pool_bytes: UInt) -> Bool {
     }
     print("SOS recycle: quarters={}\n", PIECES)
 
-    // OUT OF ORDER, WHICH IS WHAT BUILDS A LIST. `let _ = move x` is the
+    // Out of order, which is what builds a list. `let _ = move x` is the
     // release, at the line it is written on rather than at the end of a scope.
     let _ = move q0
     let _ = move q2
     let _ = move q1
     let _ = move q3
 
-    // AND OUT IT COMES AS ONE RANGE. There is no bounds reader to ask, so the
-    // size of the region the kernel is willing to mint IS the measurement.
+    // And out it comes as one range. There is no bounds reader to ask, so the
+    // size of the region the kernel is willing to mint is the measurement.
     let whole = try pool.split(len: pool_bytes) catch {
         let _ = system.debug_print("SOS recycle: the pool did not come back\n")
         return false
@@ -153,11 +148,11 @@ func pool_comes_back(system: &System, pool: &Memory, pool_bytes: UInt) -> Bool {
     true
 }
 
-/// **LEG 2, first half: give a page to a child, drop everything, and wait for
-/// the child to die.**
+/// Leg 2, first half: give a page to a child, drop everything, and wait for
+/// the child to die.
 ///
-/// Both of root's objects go before the child even starts — the Memory handle
-/// and the Mapping — so the child's protection ROW is the only reference left
+/// Both of root's objects go before the child even starts (the Memory handle
+/// and the Mapping), so the child's protection row is the only reference left
 /// to that region while it runs.
 func lend_page_and_wait(system: &System, proc: &Process, child: &Process,
                         pool: &Memory) -> Bool {
@@ -186,8 +181,8 @@ func lend_page_and_wait(system: &System, proc: &Process, child: &Process,
     }
 
     // Park, so the child gets the processor. Everything after this call happens
-    // once the child has marked its page, printed, exited and been torn down —
-    // and its teardown is what gives the page back.
+    // once the child has marked its page, printed, exited and been torn down;
+    // its teardown is what gives the page back.
     let clock = try system.clock_get(type: ClockType.Monotonic) catch {
         let _ = system.debug_print("SOS recycle: no clock\n")
         return false
@@ -215,7 +210,7 @@ func lend_page_and_wait(system: &System, proc: &Process, child: &Process,
     true
 }
 
-/// **LEG 2, second half: the same bytes, asked for again.**
+/// Leg 2, second half: the same bytes, asked for again.
 func page_came_home(system: &System, proc: &Process, pool: &Memory,
                     base: UInt) -> Bool {
     let again = try pool.split(len: CHUNK) catch {

@@ -1,13 +1,14 @@
-/* SOS EL0 payload: a wait buffer that is not word-aligned.
+/* EL0 payload: a wait buffer that is not word-aligned.
  *
- * The other rejection row of the copy-out funnel (`payload_badbuffer.S` is the
- * range row). The kernel writes MACHINE WORDS into the record, so a misaligned
- * destination traps on one profile and is merely wrong on the other.
+ * The alignment row of the copy-out check (`payload_badbuffer.S` is the range
+ * row). The kernel writes machine words into the record, so a misaligned
+ * destination traps on one architecture and is merely wrong on the other.
+ * Expected outcome: process fault.
  *
- * ALIGNMENT IS CHECKED FIRST, which is what makes this case distinguishable
- * from the range one: this payload owns no writable memory either, so both
- * checks would refuse the address and the transcript reports whichever runs
- * first. Kept in step with the riscv32 twin.
+ * Alignment is checked first, which is what distinguishes this case from the
+ * range one: this payload owns no writable memory either, so both checks would
+ * refuse the address, and the transcript reports whichever runs first. Kept in
+ * step with the riscv32 twin.
  *
  * The boot handle set is three wide and in a fixed order (§12): 1 = System,
  * 2 = Process, 3 = the initial Thread.
@@ -17,9 +18,7 @@
     .equ OP_WAITER_CREATE,  5       /* ProcessOp.WaiterCreate */
     .equ OP_WAITER_WAIT,    2       /* WaiterOp.Wait */
     .equ ODD_BUF,           1       /* not a multiple of any word size */
-    .equ BUF_CAP,           256     /* ample; see payload_badbuffer.S — the
-                                     * record's buffer grew a message body in
-                                     * M4 unit 3 (sawos design 15) */
+    .equ BUF_CAP,           256     /* ample; see payload_badbuffer.S */
 
     .section .payload, "ax", @progbits
     .balign 4

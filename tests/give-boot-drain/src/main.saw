@@ -1,57 +1,49 @@
-// SOS M3 unit 3: MINT, GIVE, START (sawos design 4 as ruled Aug 29; spec §3,
-// §12).
-//
-// **THE MONEY SHOT, AND IT IS THREE ORDINARY OPS.** Root narrows its own
+// Mint, give, start: three ordinary ops (spec §3, §12). Root narrows its own
 // authority into a sibling handle, hands the sibling to a child under a tag,
-// runs the child naming that tag, and KEEPS the Process handle it supervises
-// with. The transcript is read as an ORDER:
+// runs the child naming that tag, and keeps the Process handle it supervises
+// with. The transcript is read as an order:
 //
-//   SOS givedrain: created                  <- a process exists, inert, table EMPTY
-//   SOS givedrain: minted a masked System   <- narrowed BEFORE anything travels
-//   SOS givedrain: gave 7 3 5               <- three capabilities, three tags
+//   SOS givedrain: created                  a process exists, unstarted
+//   SOS givedrain: minted a masked System   narrowed before anything travels
+//   SOS givedrain: gave 7 3 5               three capabilities, three tags
 //   SOS givedrain: started
-//   SOS childdrain: n=2 tags=35 kinds=0     <- THE CHILD'S OWN VOICE
-//   SOS: process exit: code=2               <- ...and the kernel's account of it
+//   SOS childdrain: n=2 tags=35 kinds=0     the child's own voice
+//   SOS: process exit: code=2               the kernel's account of it
 //   SOS: process teardown ... process=1
 //   SOS givedrain: root observed child status=65538
 //   SOS givedrain: done
 //
-// WHAT EACH LINE RULES OUT.
+// What each line rules out.
 //
-// `minted a masked System` is `MINT_OP` with a KEEP MASK: the sibling gets
-// `Debug | ProcessSelf | ClockGet | Transfer` and nothing else, because a mint's
-// rights are the source's INTERSECTED with the mask. `Shutdown`, `ProcessCreate`
-// and `Mint` are absent BY SILENCE — which is the polarity ruling working: a
-// mask written today denies a System right added tomorrow, where a removal mask
-// would have handed every future capability to every child. (`Transfer` is in
-// the mask because it is the bit `give` checks on the thing being given; see the
-// finding recorded at `CHILD_SYSTEM`.)
+// `minted a masked System` is `MINT_OP` with a keep mask: the sibling gets
+// `Debug | ProcessSelf | ClockGet | Transfer` and nothing else, because a
+// mint's rights are the source's intersected with the mask. `Shutdown`,
+// `ProcessCreate` and `Mint` are absent by silence. A keep mask
+// denies a System right added later, where a removal mask would hand every
+// future capability to every child. (`Transfer` is in the mask because it is
+// the bit `give` checks on the thing being given; see `CHILD_SYSTEM`.)
 //
-// `gave 7 3 5` before the start is the FREEZE: the boot set is complete at the
+// `gave 7 3 5` before the start is the freeze: the boot set is complete at the
 // child's first instruction because `start` is the barrier, and a give after it
-// is `BadState` (`give_after_start` proves it). No synchronization is invented
-// anywhere — the ordering IS the argument.
+// is `BadState` (`give-after-start` proves it).
 //
-// **THE CHILD DRAINS TWO RECORDS, NOT THREE, AND THAT IS A RULING.** Resolving
-// the boot tag CONSUMES the record it names: the register is the delivery. So
-// the child meets 3 and 5 and never meets 7, and there is no way for one word to
-// reach it through two doors and be released twice.
+// The child drains two records, not three. Resolving the boot tag consumes the
+// record it names (the register is the delivery), so the child meets 3 and 5
+// and never meets 7, and one word cannot reach it through two doors and be
+// released twice.
 //
-// **`SOS childdrain:` IS THE FIRST TIME ANYTHING BUT ROOT HAS SPOKEN.** The
-// child owns no device; `Debug` travelled in the mask, which is what a
-// capability is for.
+// `SOS childdrain:` is the first time anything but root speaks. The child owns
+// no device; `Debug` travelled in the mask.
 //
-// **AND ROOT STILL SUPERVISES.** `status=65538` is `Exited` (1) in the high half
-// and the drain count (2) in the low, read through the Process handle root NEVER
-// GAVE AWAY. Both halves at once — the child manages itself, root watches — is
-// exactly what the mint bought: before it there was one Process handle per child
-// and a launcher had to choose.
+// Root still supervises. `status=65538` is `Exited` (1) in the high half and
+// the drain count (2) in the low, read through the Process handle root never
+// gave away. The child manages itself while root watches.
 //
-// THE TAGS ARE THE ONLY THING THE TWO PROGRAMS SHARE. 7, 3 and 5 mean what this
+// The tags are the only thing the two programs share. 7, 3 and 5 mean what this
 // file and `child-drain` agree they mean; the kernel hands each back unread and
 // interprets none of them.
 //
-// ROOT PARKS ON A GENEROUS TIMER while the child runs, so the ordering above is
+// Root parks on a generous timer while the child runs, so the ordering above is
 // forced rather than raced: this image's kernel arms no scheduler tick, so the
 // only way root gives the processor up is the wait below.
 
@@ -66,33 +58,29 @@ static EXIT_FAILED: UInt = 1
 static KEY: UInt = 77
 
 /// Twenty milliseconds — three orders of magnitude more than the child needs to
-/// be scheduled, drain two records, print and exit. See `process_lifecycle`.
+/// be scheduled, drain two records, print and exit.
 static PARK_NS: UInt64 = 20_000_000
 
-/// ROOT'S CONFIG, and the whole of the contract with the child. These are words
+/// Root's config, and the whole of the contract with the child. These are words
 /// root chose; `child-drain` expects exactly them, in exactly this order, and
 /// the kernel supplies no meaning for any of them.
 static TAG_BOOT: UInt = 7
 static TAG_IMAGE: UInt = 3
 static TAG_RAM: UInt = 5
 
-/// **THE POLICY, AND IT IS A WHITELIST.** What a child of this launcher may ask
-/// its System object for: print, learn its own Process object, read the clock.
-/// Everything else — stopping the machine, spawning, passing the handle on,
-/// minting a wider one — is absent because it is not named, which is what makes
-/// a keep mask fail CLOSED as the System object grows.
+/// The policy, as a whitelist. What a child of this launcher may ask its System
+/// object for: print, learn its own Process object, read the clock. Everything
+/// else (stopping the machine, spawning, passing the handle on, minting a wider
+/// one) is absent because it is not named, so a keep mask fails closed as the
+/// System object grows.
 ///
-/// **`Transfer` IS IN THE MASK BECAUSE IT IS THE TICKET TO TRAVEL, and that is a
-/// FINDING rather than a preference.** `give` checks the universal `Transfer`
-/// bit on the handle BEING GIVEN, so a sibling minted without it cannot be
-/// handed to anyone — which means a launcher cannot narrow BELOW the bit that
-/// lets the narrowed thing arrive. The child therefore holds `Transfer` too and
-/// could pass its System handle on; today that is inert (it has no
-/// `ProcessCreate`, so there is no process for it to furnish, and no pipe to
-/// send over until M4). `give_no_transfer` is the same constraint seen from the
-/// refusing side. Closing it properly wants a ruling — a give that CONSUMES the
-/// bit, or a strip-on-arrival rule — and both would amend D-1's rights-verbatim
-/// sentence, so neither is taken here.
+/// `Transfer` is in the mask because it is the ticket to travel. `give` checks
+/// the universal `Transfer` bit on the handle being given, so a sibling minted
+/// without it cannot be handed to anyone: a launcher cannot narrow below the
+/// bit that lets the narrowed thing arrive. The child therefore holds
+/// `Transfer` too and could pass its System handle on; that is inert here (it
+/// has no `ProcessCreate`, so there is no process for it to furnish).
+/// `give-no-transfer` is the same constraint seen from the refusing side.
 static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
                                | SystemRight.ClockGet | SystemRight.Transfer)
 
@@ -107,8 +95,7 @@ func _start(boot_handle: UInt) {
     }
 
     // The boot set, drained in ordinal order: row 0 is the child's image blob,
-    // row 1 is the RAM it will run in. Root's config is what says which is
-    // which, exactly as in every unit-2 case.
+    // row 1 is the RAM it will run in. Root's config says which is which.
     var image = try proc.boot_handle_next() catch {
         print("SOS givedrain: no image region: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -130,10 +117,10 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS givedrain: created\n")
 
-    // **THE MINT.** Root narrows its own authority into a SIBLING — a second
-    // handle onto the same System object, in root's own table, carrying the
+    // The mint. Root narrows its own authority into a sibling: a second handle
+    // onto the same System object, in root's own table, carrying the
     // intersection of root's rights and the mask above. Root's original is
-    // untouched, which is what makes the next three lines possible at all.
+    // untouched, which is what makes the following gives possible.
     let for_child = try system.mint(rights: CHILD_SYSTEM) catch {
         print("SOS givedrain: mint failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -141,19 +128,19 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS givedrain: minted a masked System\n")
 
-    // **THE GIVES.** Each CONSUMES its wrapper — the transfer funnel's contract
-    // (design 3 D-5) — so there is no way to touch any of the three below this
-    // point: the funnel disarms the value before the syscall and lets it drop.
-    // What root gives away it cannot keep.
+    // The gives. Each consumes its wrapper (the transfer funnel's contract), so
+    // there is no way to touch any of the three below this point: the funnel
+    // disarms the value before the syscall and lets it drop. What root gives
+    // away it cannot keep.
     try child.give(system: move for_child, tag: TAG_BOOT) catch {
         print("SOS givedrain: give system failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    // The two regions the child does not actually need — its image was copied
-    // into its RAM at create, and it declines both at the drain. They are here
-    // because they are CAPABILITIES: what a launcher furnishes is a matter of
-    // config rather than of mechanism, and the drain is what proves the order.
+    // The two regions the child does not actually need (its image was copied
+    // into its RAM at create, and it declines both at the drain). They are here
+    // because they are capabilities: what a launcher furnishes is a matter of
+    // config rather than of mechanism, and the drain proves the order.
     try child.give(memory: move image_mem, tag: TAG_IMAGE) catch {
         print("SOS givedrain: give image failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -166,10 +153,10 @@ func _start(boot_handle: UInt) {
     }
     print("SOS givedrain: gave {} {} {}\n", TAG_BOOT, TAG_IMAGE, TAG_RAM)
 
-    // **THE START, naming the boot tag.** The kernel resolves 7 to the
-    // child-side word, puts it in the child's first argument register, and marks
-    // that record delivered — so root never sees a child-relative word at any
-    // point and the child never meets one twice.
+    // The start, naming the boot tag. The kernel resolves 7 to the child-side
+    // word, puts it in the child's first argument register, and marks that
+    // record delivered, so root never sees a child-relative word and the child
+    // never meets one twice.
     try child.start(boot_tag: TAG_BOOT) catch {
         print("SOS givedrain: start failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -210,11 +197,10 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // **AND ROOT ASKS.** The Process handle root kept is what makes this line
-    // writable: the child managed itself with authority root minted, and root
-    // watched. `65538` is `Exited` in the high half and the child's drain count
-    // in the low — the same fact the console line above states, arriving as a
-    // VALUE through the supervision path.
+    // Root asks. The Process handle root kept is what makes this line writable.
+    // `65538` is `Exited` in the high half and the child's drain count in the
+    // low: the same fact the console line above states, arriving as a value
+    // through the supervision path.
     let status = try child.get_status() catch {
         print("SOS givedrain: status failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)

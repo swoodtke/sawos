@@ -1,31 +1,29 @@
-// SOS M3 unit 5.5: THE FAULT ARM — a death nobody chose (sawos design 8).
+// The fault arm: a death nobody chose wakes a supervisor.
 //
-// **THE SAME PROGRAM AS `death-notify`, WITH ONE THING TAKEN AWAY.** This
-// launcher gives its child NOTHING: no System handle, no boot tag, so the child
-// holds `NO_HANDLE` and the kernel terminates it at its first `ecall`. Root's
-// park is identical, its attachment is identical, and what comes back out of
-// the wait record is a DIFFERENT §8 status word — which is the point. A
-// supervisor learns that a child died and how, through one mechanism, whether
-// the child chose the ending or the kernel did.
+// The same program as `death-notify` with one thing taken away. This launcher
+// gives its child nothing: no System handle, no boot tag, so the child holds
+// `NO_HANDLE` and the kernel terminates it at its first `ecall`. Root's park
+// and attachment are identical, and what comes back out of the wait record is
+// a different §8 status word. A supervisor learns that a child died, and how,
+// through one mechanism, whether the child chose the ending or the kernel did.
 //
-// The transcript:
+// Expected transcript:
 //
 //   SOS deathfault: started
 //   SOS: process fault: bad handle process=...      <- the kernel ending it
 //   SOS: process teardown ... process=...
 //   SOS deathfault: woke key=45 status=131073       <- root, on the far side
+//   SOS deathfault: child syscalls=1 faults=0
 //   SOS deathfault: done
 //
-// `status=131073` is `Faulted`(2) << 16 | 1, and the 1 is `FaultReason.BadHandle`
-// — the same word `process-lifecycle` reads through `get_status`, arriving here
-// as a WAKE instead of as a poll. That equality is worth stating: unit 5.5 adds
-// no vocabulary to §8, it adds a second door onto the word §8 already defines.
+// `status=131073` is `Faulted`(2) << 16 | 1, and the 1 is
+// `FaultReason.BadHandle`: the same word `process-lifecycle` reads through
+// `get_status`, arriving here as a wake instead of a poll.
 //
-// **THE FAULT REPORT COMES FIRST AND THE WAKE LAST**, for design 8 D-1's
-// reason: `fault_process` prints, then records the status, then notifies, then
-// tears the process down — and the notification only queues a thread, so root
-// runs after the teardown has finished. There is no arrangement of these lines
-// in which root observes a half-dead process.
+// The fault report comes first and the wake last: `fault_process` prints, then
+// records the status, then notifies, then tears the process down, and the
+// notification only queues a thread, so root runs after the teardown has
+// finished. Root never observes a half-dead process.
 
 import sos.{System, Process, Memory, BootHandle, Waiter, WaitResult,
             WaitPayload, SosStatus}
@@ -94,10 +92,9 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // NO `give`, NO BOOT TAG. The child receives `NO_HANDLE` in its first
-    // argument register and dies at its first syscall — the ruled
-    // "legal-but-doomed" sandboxed compute process, used here as a fault
-    // generator.
+    // No `give`, no boot tag. The child receives `NO_HANDLE` in its first
+    // argument register and dies at its first syscall: a sandboxed compute
+    // process that is legal but doomed, used here as a fault generator.
     try child.start() catch {
         print("SOS deathfault: start failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -114,17 +111,16 @@ func _start(boot_handle: UInt) {
     print("SOS deathfault: woke key={} status={}\n",
           record.key, status_of(&record))
 
-    // **AND THE COLUMNS SAY WHICH DOOR THE DEATH CAME THROUGH** (sawos design
-    // 16). `syscalls=1 faults=0` is `child-fault`'s whole life: one `ecall`,
-    // naming handle zero, which the kernel answered by ending it. The trap is
-    // charged to the SYSCALL column even though it killed the process, because
-    // the columns are keyed by how the machine entered the kernel and not by how
-    // the kernel felt about it — which is what keeps `syscalls` predictable at
-    // all, since a caller cannot know in advance which call will be refused.
+    // The columns say which door the death came through. `syscalls=1
+    // faults=0` is `child-fault`'s whole life: one `ecall`, naming handle zero,
+    // which the kernel answered by ending it. The trap is charged to the
+    // syscall column even though it killed the process, because the columns are
+    // keyed by how the machine entered the kernel, not by what the kernel did
+    // about it. That keeps `syscalls` predictable, since a caller cannot know
+    // in advance which call will be refused.
     //
-    // `process_isolation` asserts the exact mirror — `syscalls=0 faults=1`, a
-    // child that never reached the syscall door and was stopped by the hardware
-    // — and the two lines together are the whole of the split.
+    // `process_isolation` asserts the mirror, `syscalls=0 faults=1`, a child
+    // stopped by the hardware before it reached the syscall door.
     let cost = try child.stats() catch {
         print("SOS deathfault: stats failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)

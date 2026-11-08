@@ -1,32 +1,25 @@
-/* SOS from C: the program (sawos design 39, the C-leg probe).
+/* The C child's program: a `main` that returns an exit code.
  *
- * **A `main` THAT RETURNS AN EXIT CODE, AND NOTHING ELSE ABOUT IT IS SPECIAL.**
- * That is the whole claim of the unit: no `sos` module, no `sosrt`, no arena,
- * no Saw in the image at all — a C translation unit compiled freestanding by
- * the same clang the kernel's `sink.c` goes through, linked at a user image
- * base by the same `ld.lld` with the same script every Saw child uses, emitted
- * as the same sosimg, loaded by the same loader, scheduled by the same
- * scheduler, and ended through the same `Process.exit`.
+ * The image has no `sos` module, no `sosrt`, no arena and no Saw. It is a C
+ * translation unit compiled freestanding, linked at a user image base with
+ * the same script every Saw child uses, emitted as a sosimg, and ended
+ * through `Process.exit`.
  *
- * WHAT THE TWO LINES IT PRINTS ARE FOR. The first proves the image RAN — code
- * and `.rodata` reached their link addresses and the console op works. The
- * second proves it COMPUTED: the count is produced by a loop, held in a stack
- * frame, and rendered by an integer division the compiler lowered for this
- * target — so a build that merely blitted a constant string cannot produce it.
- * Together with the exit code the launcher reads back, they are the three
- * things "a C process really ran" means.
+ * It prints two lines. The first proves the image ran: code and `.rodata`
+ * reached their link addresses and the console op works. The second proves
+ * it computed: the count is produced by a loop, held in a stack frame, and
+ * rendered by an integer division, so a build that blitted a constant string
+ * cannot produce it. With the exit code the launcher reads back, these are
+ * the three things "a C process really ran" means.
  *
- * THERE IS NO `printf`, AND THE SIX LINES OF `put_uint` BELOW ARE WHY design 31
- * part 2 sizes a libc shim rather than a header (design 39 finding 6): the
- * console op takes ONE BYTE, so every string is a loop and every number is a
- * hand-rolled conversion.
+ * There is no `printf`: the console op takes one byte, so every string is a
+ * loop and every number a hand-rolled conversion (`put_uint`).
  */
 
 #include "sos.h"
 
 /* The greeting. `.rodata`, so it rides the image's one R+X segment and the
- * program has no writable data at all — which is what makes this image's
- * `.data` and `.bss` both empty. */
+ * program has no writable data: `.data` and `.bss` are both empty. */
 static const char GREETING[] = "SOS cchild: hello from freestanding C\n";
 
 /* Write a NUL-terminated string, one syscall per byte, and answer how many
@@ -40,9 +33,9 @@ static unsigned put_str(sos_word system, const char *s) {
     return n;
 }
 
-/* Write an unsigned decimal. Ten digits is more than a 32-bit count can need
- * and the buffer is on the stack, which is the other half of what this program
- * proves: the kernel's initial stack pointer is real memory a C frame can use. */
+/* Write an unsigned decimal. Ten digits is more than a 32-bit count can need.
+ * The buffer is on the stack, which proves the kernel's initial stack pointer
+ * is real memory a C frame can use. */
 static void put_uint(sos_word system, unsigned value) {
     char digits[10];
     int at = 0;
@@ -68,8 +61,8 @@ int main(sos_word boot_handle) {
     put_uint(boot_handle, wrote);
     (void)put_str(boot_handle, " bytes\n");
 
-    /* THE EXIT CODE. Distinct from the three echo children's 41/42/43, so a
-     * transcript naming it names THIS image; the launcher asserts
+    /* The exit code. Distinct from the three echo children's 41/42/43, so a
+     * transcript naming it names this image; the launcher asserts
      * `Exited`(1) << 16 | 55 = 65591, a word no fault could produce. */
     return 55;
 }

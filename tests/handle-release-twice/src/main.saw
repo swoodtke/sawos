@@ -1,28 +1,27 @@
-// SOS M3 unit 2.75: RELEASING ONE WORD TWICE IS A FAULT (sawos design 3 D-2;
-// the Aug-17 handle-lifecycle ruling).
+// Releasing one word twice is a fault.
 //
 //   SOS releasetwice: first release ok=1
 //   SOS releasetwice: releasing the same word again
 //   SOS: process fault: bad handle process=0
 //   SOS: process teardown handles=3 ... process=0
 //
-// THE FIRST LINE IS WHY THIS IS A SEPARATE CASE FROM `handle-release-nothing`.
-// The word released here was VALID one instruction earlier — the kernel said
-// `Ok` — so what makes the second call a fault is not the number's shape but the
-// entry's LIFE having moved on. That is the generation doing the only job it has
-// (design 3 D-1), and it is the difference between "you wrote a number that was
-// never a handle" and "you used a handle after giving it back".
+// The first line is why this is a separate case from `handle-release-nothing`.
+// The word released here was valid one instruction earlier (the kernel said
+// `Ok`), so what makes the second call a fault is not the number's shape but
+// the entry's life having moved on. That is the generation doing its only job,
+// and it is the difference between "you wrote a number that was never a handle"
+// and "you used a handle after giving it back".
 //
-// It is also the mechanism that makes the wrapper discipline safe to get wrong.
-// A transfer funnel that released a word it had already handed to the kernel
-// would land exactly here: a diagnosed `BadHandle` naming the process, never a
-// silent alias onto whatever took the slot.
+// It is also what makes the wrapper discipline safe to get wrong. A transfer
+// funnel that released a word it had already handed to the kernel would land
+// exactly here: a diagnosed `BadHandle` naming the process, never a silent
+// alias onto whatever took the slot.
 //
-// THE TEARDOWN COUNT is three — §12's boot set — because the Clock handle this
-// program minted is the one it released, and nothing else was derived. A count
+// The teardown count is three, §12's boot set, because the Clock handle this
+// program minted is the one it released and nothing else was derived. A count
 // of four would mean the first release did not unbind.
 //
-// ONE FAULT PER CASE: a fault ends the process, so this cannot be an arm of
+// One fault per case: a fault ends the process, so this cannot be an arm of
 // another case.
 
 import sos.{System, ClockType, sos_system_clock_get, sos_handle_release}
@@ -39,7 +38,7 @@ func flag(b: Bool) -> UInt {
     if b { YES } else { NO }
 }
 
-/// Ask for a Clock, answering the raw handle WORD — or 0, which names nothing.
+/// Ask for a Clock, answering the raw handle word, or 0, which names nothing.
 func ask_clock(handle: UInt) unsafe -> UInt {
     var out: UInt = 0
     let status = sos_system_clock_get(handle, ClockType.Monotonic as UInt,
@@ -61,14 +60,14 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // THE WORD IS GOOD, and the kernel says so. Everything after this line is
+    // The word is good, and the kernel says so. Everything after this line is
     // about the same number having stopped being a handle.
     let ok = sos_handle_release(word) == STATUS_OK
     print("SOS releasetwice: first release ok={}\n", flag(ok))
 
     let _ = system.debug_print("SOS releasetwice: releasing the same word again\n")
 
-    // Does not return. The entry is unbound AND its generation has moved, so
+    // Does not return. The entry is unbound and its generation has moved, so
     // this word resolves to nothing whichever of the two the kernel notices
     // first.
     let _ = sos_handle_release(word)

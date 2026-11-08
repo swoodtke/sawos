@@ -1,52 +1,49 @@
-// SOS M3 unit 5.5: NOTHING UN-DIES — terminal level, and what holds a dead
-// slot open (sawos design 8, sharpening 1 + the design-7 composition).
+// Nothing un-dies: a death is a terminal level, and a process slot stays open
+// as long as something can still read its §8 status word.
 //
-// THREE CLAIMS, IN ONE PROGRAM, BECAUSE THEY ARE ONE STORY: a death is a level
-// that never clears, so it can be observed by somebody who was not watching
-// when it happened, as often as they like, for as long as they keep a reference
-// to it. Take the last reference away and the slot goes.
+// A death never clears, so it can be observed by somebody who was not watching
+// when it happened, as often as they like, for as long as they hold a
+// reference to it. Take the last reference away and the slot goes. Expected
+// transcript:
 //
 //   SOS deathlate: started
 //   SOS bye: exiting
 //   SOS: process exit: code=... process=...
 //   SOS: process teardown ... process=...
-//   SOS deathlate: first=65541 second=65541      <- ATTACHED AFTER THE DEATH,
-//                                                   AND ANSWERED TWICE
+//   SOS deathlate: first=65541 second=65541      <- attached after the death,
+//                                                   and answered twice
 //   SOS deathlate: held=1 freed=1                <- which reference was holding
 //   SOS deathlate: done
 //
-// **`first=` IS THE LATE ATTACH.** Root sleeps on a timer until the child is
+// `first=` is the late attach. Root sleeps on a timer until the child is
 // already gone, and only then attaches its Process handle. An edge-triggered
-// design would have nothing left to report — the edge passed while nobody was
-// listening — and this line would print a wait that never returned. It returns
-// IMMEDIATELY, because readiness is `state == Gone` and that is still true.
+// design would have nothing left to report, and this line would print a wait
+// that never returned. It returns immediately, because readiness is
+// `state == Gone` and that is still true.
 //
-// **`second=` IS THE TERMINAL PART.** The delivery of an Event's word clears
-// it and a Timer's fire count is spent by the wait that reports it; a death
-// spends NOTHING. So the second wait on the same attachment answers the same
-// word, and would answer it a thousand times.
+// `second=` is the terminal part. The delivery of an Event's word clears it and
+// a Timer's fire count is spent by the wait that reports it; a death spends
+// nothing. The second wait on the same attachment answers the same word, and
+// would answer it a thousand times.
 //
-// **`held=1 freed=1` IS DESIGN 7'S COUNT, OBSERVED THROUGH THE SUPERVISION
-// FLOW.** A dead process's slot lives exactly as long as something can still
-// read its §8 status word, and after this unit an ATTACHMENT is one of those
-// things. So root drops the two references ONE AT A TIME and asks the machine
-// which was load-bearing:
+// `held=1 freed=1` is the slot's reference count observed through the
+// supervision flow. A dead process's slot lives exactly as long as something
+// can still read its status word, and an attachment is one of those things.
+// Root drops the two references one at a time and asks the machine which was
+// load-bearing:
 //
-//   - release the Process HANDLE, leaving only the attachment: with the table
+//   - release the Process handle, leaving only the attachment: with the table
 //     otherwise full, a `process_create` is still refused, because slot 1 is
-//     still `Gone`. That is `held=1` — the attachment alone kept it.
-//   - remove the ATTACHMENT: the count reaches zero, the slot frees inside that
+//     still `Gone`. That is `held=1`; the attachment alone kept it.
+//   - remove the attachment: the count reaches zero, the slot frees inside that
 //     very syscall, and the same create now succeeds. That is `freed=1`.
 //
-// "THE TABLE OTHERWISE FULL" IS ARRANGED BY AN UNSTARTED FILLER PROCESS since
-// M4 unit 5 raised `MAX_PROCESSES` to three (sawos design 21) — see the create
-// below the release, and `process-reclaim`, which needed the same thing for the
-// same reason.
+// An unstarted filler process makes the table otherwise full; see the create
+// below the release, and `process-reclaim`, which needs the same thing.
 //
-// A kernel that did not count the attachment would free the slot at the release
-// and print `held=0` — and the second wait above would have been reading a slot
-// the kernel had already given away, which is the hazard this composition
-// exists to close.
+// A kernel that did not count the attachment would free the slot at the
+// release and print `held=0`, and the second wait above would have been
+// reading a slot the kernel had already given away.
 
 import sos.{System, Process, Memory, BootHandle, Clock, ClockType, Timer,
             Waiter, WaitResult, WaitPayload, SosStatus, SystemRight}
@@ -57,8 +54,8 @@ static EXIT_FAILED: UInt = 1
 static YES: UInt = 1
 static NO: UInt = 0
 
-/// The key the park TIMER is attached under, and the key the DEAD CHILD is.
-/// Two numbers, because both attachments live on one Waiter at once — which is
+/// The key the park timer is attached under, and the key the dead child is.
+/// Two numbers, because both attachments live on one Waiter at once, which is
 /// what §2.2's key uniqueness is for.
 static KEY_TIMER: UInt = 46
 static KEY_DEATH: UInt = 47
@@ -80,7 +77,7 @@ func flag(b: Bool) -> UInt {
 }
 
 /// The §8 status word out of the record. The Timer arm panics like the other
-/// two even though this program DOES attach a timer: by the time this is
+/// two even though this program does attach a timer: by the time this is
 /// called the timer has already fired and been consumed, so a Timer record
 /// here would mean the wait answered from the wrong attachment.
 func status_of(r: &WaitResult) -> UInt {
@@ -110,9 +107,10 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    // BOTH REGIONS ARE USED THREE TIMES — the first child, the create that is
-    // refused, and the create that is served — which is why they are taken into
-    // locals rather than borrowed out of the records in place.
+    // Both regions are used by every `process_create` below (the first child,
+    // the filler, the create that is refused, and the create that is served),
+    // so they are taken into locals rather than borrowed out of the records in
+    // place.
     guard let image_mem = image.take_memory() else {
         let _ = system.debug_print("SOS deathlate: image record is not a region\n")
         let _ = system.shutdown(EXIT_FAILED)
@@ -147,7 +145,7 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS deathlate: started\n")
 
-    // THE PARK IS A TIMER, DELIBERATELY. This case must attach LATE, so root
+    // The park is a timer, deliberately. This case must attach late, so root
     // has to give the processor up by some means that is not the death itself.
     let clock = try system.clock_get(type: ClockType.Monotonic) catch {
         print("SOS deathlate: no clock: {}\n", error)
@@ -172,7 +170,7 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // **THE LATE ATTACH.** The child has been dead for milliseconds.
+    // The late attach. The child has been dead for a while.
     try waiter.add(process: &child, key: KEY_DEATH) catch {
         print("SOS deathlate: attach failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -197,18 +195,17 @@ func _start(boot_handle: UInt) {
     }
     print("SOS deathlate: first={} second={}\n", first, second)
 
-    // THE FIRST REFERENCE GOES, WRITTEN AS A DROP. `let _ = move child`
-    // consumes the wrapper and its `deinit` issues the release — dropping IS
-    // the spelling (design 3 D-5). The attachment is what is left.
+    // The first reference goes, written as a drop: `let _ = move child`
+    // consumes the wrapper and its `deinit` issues the release. The attachment
+    // is what is left.
     let _ = move child
 
-    // **THE FILLER, AND IT EXISTS BECAUSE M4 UNIT 5 RAISED `MAX_PROCESSES` TO
-    // THREE** (sawos design 21, user-ruled Sep 2). Both probes below ask
-    // whether a slot is AVAILABLE, and that question only has a load-bearing
-    // answer when the table has nothing else to give. One create, never
-    // started, spends the slot the bump added; `process-reclaim` does the same
-    // thing for the same reason, and both are written against "the table is
-    // full" rather than against a number so the next bump is one more filler.
+    // The filler. Both probes below ask whether a slot is available, and that
+    // question only has a load-bearing answer when the table has nothing else
+    // to give. One create, never started, spends the spare slot;
+    // `process-reclaim` does the same for the same reason. Both are written
+    // against "the table is full" rather than a number, so raising
+    // `MAX_PROCESSES` means one more filler.
     let filler = try system.process_create(image: &image_mem,
                                            memory: &dest_mem) catch {
         print("SOS deathlate: filler create failed: {}\n", error)
@@ -222,9 +219,9 @@ func _start(boot_handle: UInt) {
         case Err(_) -> true,
     }
 
-    // AND THE SECOND. A `remove` names the attachment by KEY and never touches
-    // the waitable — but the reference it drops is the waitable's, and here
-    // that reference is the last one.
+    // And the second. A `remove` names the attachment by key and never touches
+    // the waitable, but the reference it drops is the waitable's, and here that
+    // reference is the last one.
     try waiter.remove(KEY_DEATH) catch {
         print("SOS deathlate: remove failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -238,7 +235,7 @@ func _start(boot_handle: UInt) {
     }
 
     print("SOS deathlate: held={} freed={}\n", flag(held), flag(freed))
-    // The filler's handle is kept to the end, on `process-reclaim`'s reasoning:
+    // The filler's handle is kept to the end, as in `process-reclaim`:
     // releasing it would leave a `Created` slot nothing names, and only a
     // `Gone` slot is reclaimable.
     print("SOS deathlate: done\n")

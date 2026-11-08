@@ -1,25 +1,25 @@
-// SOS CHILD: THE FIRST PROCESS TO ANSWER A QUESTION IT WAS NEVER ASKED (sawos
-// design 14, M4 unit 2; spec §2.1, §12).
+// Child that answers a question it was never asked (spec §2.1, §12).
 //
-// It bootstraps exactly as every other child does — a masked System handle in
-// its first argument register, its own Process object derived from it, its boot
-// set drained from there — and the ONE new thing in it is what the set carries:
-// a `PipeRequest`, the OBLIGATION to send one reply.
+// It bootstraps like every other child (a masked System handle in its first
+// argument register, its own Process object derived from it, its boot set
+// drained from there). The new thing is what the set carries: a `PipeRequest`,
+// the obligation to send one reply.
 //
-// **IT HOLDS NO END OF ANY CONNECTION.** There is no inlet here and no outlet;
+// It holds no end of any connection. There is no inlet here and no outlet;
 // this process cannot post, cannot take, and cannot name the pipe the message
-// arrived on. What it has is the obligation, and the obligation knows where the
-// answer goes — which is exactly why §2.1 calls the one-shot pair THE DELEGATION
-// PRIMITIVE and why the canonical example (a filesystem forwarding a read to the
-// flash driver, whose bytes go straight to the client) needs nothing else.
+// arrived on. What it has is the obligation, and the obligation knows where
+// the answer goes. That is why §2.1 calls the one-shot pair the delegation
+// primitive, and why the canonical example (a filesystem forwarding a read to
+// the flash driver, whose bytes go straight to the client) needs nothing else.
 //
-// **AND THE ANSWER OUTLIVES IT.** The obligation is consumed by the reply, the
-// process exits, and the launcher resolves its claim AFTERWARDS — the transcript
-// shows the exit and the teardown before the bytes. A reply lives in the
-// exchange's own ring slot, so the replier's death takes nothing with it.
+// The answer outlives the replier. The obligation is consumed by the reply,
+// the process exits, and the launcher resolves its claim afterwards, so the
+// transcript shows the exit and the teardown before the bytes. A reply lives
+// in the exchange's own ring slot, so the replier's death takes nothing with
+// it.
 //
 // The payload is `DONE` in ASCII, and the launcher asserts all four bytes: a
-// status alone would not have shown that the copy funnel carried the data.
+// status alone would not show that the copy funnel carried the data.
 
 import sos.{System, Process, PipeRequest, BootHandle, BootHandleKind, SosStatus,
             PIPE_BODY_BYTES}
@@ -56,9 +56,9 @@ func _start(boot_handle: UInt) {
                     case PipeRequest -> {
                         if let request = rec.take_request() {
                             let obligation = move request
-                            // **THE REPLY IS THE WHOLE OF THIS PROCESS.** It
-                            // consumes the obligation, so there is nothing left
-                            // to release afterwards and nothing to forget.
+                            // The reply is the whole of this process. It
+                            // consumes the obligation, so there is nothing
+                            // left to release and nothing to forget.
                             try (move obligation).reply(body: &body,
                                                         len: PAYLOAD_LEN) catch {
                                 print("SOS childreply: reply failed: {}\n", error)
@@ -84,7 +84,7 @@ func _start(boot_handle: UInt) {
     }
 
     let _ = system.debug_print("SOS childreply: replied\n")
-    // THE EXIT CODE IS THE PAYLOAD'S LENGTH, so the kernel's account of this
+    // The exit code is the payload's length, so the kernel's account of this
     // process and the launcher's reading of the reply say the same number from
     // the two sides of the boundary.
     let _ = proc.exit(PAYLOAD_LEN)

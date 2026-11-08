@@ -1,38 +1,38 @@
-// SOS CHILD: A PROCESS MEETING ITS OWN BUDGET (sawos design 7 D-3).
+// Child that meets its own budget: it is refused by policy, not by the
+// machine.
 //
-// **THE FIRST TIME A SOS PROCESS HAS BEEN TOLD "NO" BY POLICY RATHER THAN BY
-// THE MACHINE.** Every refusal in the system until this unit was
-// `NoResource` — a slab with nothing left, an edge nothing the caller does can
-// move. This child meets `QuotaExceeded` instead, and the difference is not
-// cosmetic: it releases something it already holds and the very next creation
-// succeeds, which is a thing `NoResource` could never promise.
+// `NoResource` is a machine refusal: a slab with nothing left, an edge nothing
+// the caller does can move. This child meets `QuotaExceeded` instead, a policy
+// refusal, and the difference is not cosmetic: it releases something it
+// already holds and the very next creation succeeds, which `NoResource` could
+// never promise.
 //
-// WHAT THE LINE SAYS:
+// What the line says:
 //
 //   SOS childquota: made=4 quota=1 resumed=1
 //                        ^      ^        ^
-//                        |      |        the release CREDITED the row, and the
+//                        |      |        the release credited the row, and the
 //                        |      |        next create was served
-//                        |      the refusal at limit+1 was the POLICY one
+//                        |      the refusal at limit+1 was the policy one
 //                        |      (`SosStatus.QuotaExceeded`), not the machine's
 //                        the child's whole allowance, `DEFAULT_QUOTA_EVENTS`
 //
-// **AND THE SLAB WAS NEVER THE LIMIT THAT TRIPPED.** `MAX_EVENTS` is 8 and this
-// child's allowance is 4; root creates no events in this case at all, so at the
-// moment of the refusal the kernel's Event slab has half its slots free. A
-// `quota=1` here therefore cannot be a machine edge wearing a policy name — if
-// the two were confused, the fifth create would have SUCCEEDED.
+// The slab is never the limit that trips. `MAX_EVENTS` exceeds this child's
+// allowance, `DEFAULT_QUOTA_EVENTS`; root creates no events in this case, so at
+// the refusal the kernel's Event slab still has free slots. A `quota=1`
+// therefore cannot be a machine edge wearing a policy name: if the two were
+// confused, the fifth create would have succeeded.
 //
-// `made=4` is asserted as a number rather than compared against a constant this
-// program declares, deliberately: the child does not know its own allowance and
-// has no op to ask for it (quota introspection is out of scope for unit 5). It
-// counts what it got, which is the only thing a process can honestly say.
+// `made=4` is asserted as a number rather than compared against a constant
+// this program declares: the child does not know its own allowance and has no
+// op to ask for it. It counts what it got, which is the only thing a process
+// can honestly say.
 //
-// THE FOUR ARE HELD IN FOUR NAMED BINDINGS because there is no allocator here
-// and no way to keep a Vector of NoCopy wrappers; four is small enough to write
-// out, and writing them out is also what makes the release below spellable —
-// `let _ = move first` is the typed layer's ONLY spelling for an early release
-// (design 3 D-5), and it needs a name to consume.
+// The four events are held in four named bindings because there is no
+// allocator here and no way to keep a Vector of NoCopy wrappers. Writing them
+// out also makes the release below spellable: `let _ = move first` is the
+// typed layer's only spelling for an early release, and it needs a name to
+// consume.
 
 import sos.{System, Process, Event, SosStatus}
 
@@ -49,11 +49,11 @@ func flag(b: Bool) -> UInt {
     if b { YES } else { NO }
 }
 
-/// Was this refusal the POLICY one?
+/// Was this refusal the policy one?
 ///
-/// It matches the case rather than comparing a number, which is what makes the
-/// claim survive a renumbering of `SosStatus` — the tag is ABI, but this
-/// program is written against the name.
+/// It matches the case rather than comparing a number, so the claim survives a
+/// renumbering of `SosStatus`: the tag is ABI, but this program is written
+/// against the name.
 func is_quota(status: SosStatus) -> Bool {
     match status {
         case QuotaExceeded -> true,
@@ -70,7 +70,7 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // FOUR, WHICH IS THE ALLOWANCE. Each is a real Event with a real handle;
+    // Four, which is the allowance. Each is a real Event with a real handle;
     // nothing here is a probe.
     let first = try proc.event_create() catch {
         print("SOS childquota: create 1 failed: {}\n", error)
@@ -94,9 +94,9 @@ func _start(boot_handle: UInt) {
     }
     var made: UInt = 4
 
-    // **THE FIFTH, WHICH IS THE POINT.** `case Ok(_)` would drop the event it
-    // was handed, so a kernel that wrongly served this call leaves nothing
-    // behind to confuse the arms below — the flag is what carries the verdict.
+    // The fifth, which is the point. `case Ok(_)` would drop the event it was
+    // handed, so a kernel that wrongly served this call leaves nothing behind
+    // to confuse the arms below; the flag carries the verdict.
     let quota = match proc.event_create() {
         case Ok(_) -> {
             made = made + 1
@@ -105,9 +105,9 @@ func _start(boot_handle: UInt) {
         case Err(status) -> is_quota(status),
     }
 
-    // **THE CREDIT.** One release, and the row that was full has room. This is
-    // the half `NoResource` cannot have: a machine edge does not move because
-    // one process let go of something.
+    // The credit. One release, and the row that was full has room. This is the
+    // half `NoResource` cannot have: a machine edge does not move because one
+    // process let go of something.
     let _ = move first
 
     let resumed = match proc.event_create() {

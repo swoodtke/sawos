@@ -1,9 +1,7 @@
-// SOS design 20, the `isolation` SMOKE CASE — ESP32-C3, NON-GATING.
-//
-// A user-mode touch of a KERNEL-OWNED address faults and is REPORTED, which is
-// the brief's third case and the one that proves the PMP program over the real
-// C3 map. Root launches `c3-child-poke`, which stores a word at 0x4037_C000 —
-// the first word of SRAM, the kernel's own `.data`, granted to nobody. The
+// Smoke case (ESP32-C3, non-gating): a user-mode touch of a kernel-owned
+// address faults and is reported. Root launches `c3-child-poke`, which stores
+// a word at 0x4037_C000, the first word of SRAM, the kernel's own `.data`,
+// granted to nobody. This proves the PMP program over the real C3 map. The
 // transcript reads:
 //
 //   SOS c3iso: started
@@ -13,28 +11,25 @@
 //   SOS c3iso: child syscalls=0 faults=1
 //   SOS c3iso: done
 //
-// WHAT THE FAULT LINE PROVES. U-mode on RISC-V matches no PMP entry at that
-// address, so the store is refused by the hardware — which is the property the
-// whole protection model rests on and the one a fresh board port can get wrong
-// by programming its sixteen entries at the wrong addresses. A kernel whose
-// rows were misplaced would let the store LAND, the child would spin, and this
-// line would simply not be here. So the assertion is the PRESENCE of a hardware
-// fault, and a broken program fails by omission rather than by a wrong value.
+// The fault line proves that U-mode on RISC-V matches no PMP entry at that
+// address, so the hardware refuses the store. A board port can get this wrong
+// by programming its sixteen entries at the wrong addresses; with misplaced
+// rows the store would land, the child would spin, and this line would be
+// absent. So the assertion is the presence of a hardware fault.
 //
 // `child status=131072` is `Faulted` with code 0: kind 2 in the high half
-// (2 * 65536) and zero in the low, because a HARDWARE fault carries no
-// `FaultReason` — the cause is in the console line, not in the status word.
+// (2 * 65536) and zero in the low, because a hardware fault carries no
+// `FaultReason`; the cause is in the console line, not the status word.
 //
-// `syscalls=0 faults=1` is the child's whole biography in two numbers: it holds
-// no handles, so it never reached the kernel through the syscall door at all,
-// and the ONE trap it took was the store the hardware refused.
+// `syscalls=0 faults=1`: the child holds no handles, so it never reached the
+// kernel through the syscall door, and the one trap it took was the refused
+// store.
 //
-// ROOT PARKS ON A GENEROUS TIMER because this image's kernel arms no scheduler
-// tick, so the wait below is the only way root gives the processor up and the
-// timer is the only way it gets it back. That makes this case depend on the
-// `timer` case's machinery too — deliberately: if the SYSTIMER path were broken
-// this would hang rather than report, and the two cases would fail together
-// rather than one masking the other.
+// Root parks on a generous timer because this image's kernel arms no
+// scheduler tick: the wait below is the only way root gives up the processor
+// and the timer the only way it gets it back. The case therefore depends on
+// the `timer` case's machinery too: if the SYSTIMER path were broken this
+// would hang rather than report, and the two cases would fail together.
 
 import sos.{System, Process, Memory, BootHandle, Clock, ClockType, Timer,
             Waiter, SosStatus}
@@ -44,8 +39,8 @@ static EXIT_FAILED: UInt = 1
 
 static KEY: UInt = 88
 
-/// Twenty milliseconds — three orders of magnitude more than the child needs to
-/// be scheduled and take one fault.
+/// Twenty milliseconds: three orders of magnitude more than the child needs
+/// to be scheduled and take one fault.
 static PARK_NS: UInt64 = 20_000_000
 
 @export("_start")
@@ -58,7 +53,7 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // Row 0 is the child's image blob, row 1 the RAM it runs in — this build's
+    // Row 0 is the child's image blob, row 1 the RAM it runs in: this build's
     // config, which is root's business and never the kernel's.
     var image = try proc.boot_handle_next() catch {
         print("SOS c3iso: no image region: {}\n", error)

@@ -1,46 +1,45 @@
-// SOS M2 unit 3: Events and a Waiter, in ONE thread (design 178 D5; spec §2.2,
-// §2.4).
+// Events and a Waiter in one thread (spec §2.2, §2.4).
 //
-// Nothing here parks, and that is the point of splitting it from `event-wake`:
-// every claim below is about what an Event ACCUMULATES and what a Waiter
-// REPORTS, with the scheduler held out of it. The transcript is six lines and
-// each is a separate ratified sentence:
+// Nothing here parks, which is why it is split from `event-wake`: every claim
+// below is about what an Event accumulates and what a Waiter reports, with the
+// scheduler held out of it. The transcript is six lines and each is a separate
+// ratified sentence:
 //
 //   signal-then-wait key=11 at-wait=4 after=0    <- §2.2 level-triggered: the
-//                                                   signal came FIRST and was
+//                                                   signal came first and was
 //                                                   still there
 //   second key=22 at-wait=8 after=0              <- §2.2 the key identifies
-//                                                   WHICH of two attachments
+//                                                   which of two attachments
 //   or key=11 at-wait=3 after=0                  <- §2.4 bitwise-OR: 1|2|1
 //   detached word=8                              <- §2.2 remove: still an
 //                                                   Event, no longer watched
 //   counting key=33 at-wait=5 after=0 saturated=1
 //                                                <- §2.4 saturating-sum, and
-//                                                   that it SATURATES
+//                                                   that it saturates
 //   done
 //
-// `at-wait` is read out of the RECORD the kernel copied into this process's
-// memory, and it is the real accumulated word rather than a flag — 4, then 8,
+// `at-wait` is read out of the record the kernel copied into this process's
+// memory, and it is the real accumulated word rather than a flag: 4, then 8,
 // then 1|2|1 = 3, then a count of five, each the number that was signalled.
 //
-// `after` IS THE `receive` THAT FOLLOWS, AND IT READS ZERO EVERY TIME. That is
-// the Aug-17 ruling: a wait DELIVERY takes the word, exactly as `receive` does,
-// so the record is not a copy left beside a still-full event. The two doors are
-// checked against each other on the `detached` line below, where nothing waits
-// and the drain is the only taker.
+// `after` is the `receive` that follows, and it reads zero every time: a wait
+// delivery takes the word, exactly as `receive` does, so the record is not a
+// copy left beside a still-full event. The two doors are checked against each
+// other on the `detached` line below, where nothing waits and the drain is the
+// only taker.
 //
-// EVERY WAIT RETURNS IMMEDIATELY. A wait that found nothing would park the only
-// thread in the system, which the kernel reports as the deadlock it is — so a
-// regression in the level-triggered path fails this case in a few microseconds
-// rather than at the harness timeout.
+// Every wait returns immediately. A wait that found nothing would park the only
+// thread in the system, which the kernel reports as the deadlock it is, so a
+// regression in the level-triggered path fails this case at once rather than at
+// the harness timeout.
 
 // `EventMode` is imported like any other name this module publishes: it is a
-// value a PROCESS chooses and passes as a syscall argument, which is what makes
-// it API rather than kernel bookkeeping. There is one declaration of it in the
-// system and this is not it — see the `sos` module docstring.
+// value a process chooses and passes as a syscall argument, which makes it API
+// rather than kernel bookkeeping. There is one declaration of it in the system
+// and this is not it; see the `sos` module docstring.
 import sos.{System, Process, Event, EventMode, Waiter, WaitResult, WaitPayload}
 
-/// The keys this process attaches under. They are ITS OWN WORDS — §2.2 has the
+/// The keys this process attaches under. They are its own words: §2.2 has the
 /// kernel store one and hand it back unread, so what a key means is entirely a
 /// question for whoever attached it. Here they are just distinguishable.
 static KEY_A: UInt = 11
@@ -56,7 +55,7 @@ static BIT_EIGHT: UInt = 8
 static COUNT_TIMES: Int = 5
 
 /// A `UInt` 1 and 0, so a `Bool` can be printed without a literal having to
-/// adopt a type through a branch (DF-178e's neighbourhood).
+/// adopt a type through a branch.
 static YES: UInt = 1
 static NO: UInt = 0
 
@@ -70,24 +69,24 @@ func flag(b: Bool) -> UInt {
     if b { YES } else { NO }
 }
 
-/// Drain an event, or report the sentinel. A failure cannot happen here — this
-/// process created the event and holds every right on it — so the catch exists
+/// Drain an event, or report the sentinel. A failure cannot happen here (this
+/// process created the event and holds every right on it), so the catch exists
 /// to make that visible in the transcript rather than to be taken.
 ///
-/// After a wait it answers ZERO, because the wait already took the word; the
-/// `detached` line is where it is the only taker and answers what was signalled.
+/// After a wait it answers zero, because the wait already took the word; the
+/// `detached` line is where it is the only taker and answers what was
+/// signalled.
 func drained(e: &Event) -> UInt {
     try e.receive() catch { NO_VALUE }
 }
 
-/// The accumulated word a WAIT reported, out of the record the kernel copied
+/// The accumulated word a wait reported, out of the record the kernel copied
 /// out. A `match` rather than a field access because the payload is per-kind by
-/// construction (§2.2), and the Interrupt object made that a real choice: this
-/// program attaches nothing but Events, so any other answer is a kernel that
-/// reported an attachment this process never made.
+/// construction (§2.2): this program attaches nothing but Events, so any other
+/// answer is a kernel that reported an attachment this process never made.
 ///
-/// It is the word the delivery TOOK — the record is the value, not a copy of it
-/// — which is why every `after` in the transcript beside it reads zero.
+/// It is the word the delivery took (the record is the value, not a copy of
+/// it), which is why every `after` in the transcript beside it reads zero.
 func at_wait(r: &WaitResult) -> UInt {
     match r.what {
         case Event(word) -> word,
@@ -115,9 +114,9 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    // `a` above took the DEFAULT mode and this one names it. The two events
-    // behave identically below, which is the default parameter being checked
-    // rather than assumed.
+    // `a` above took the default mode and this one names it. The two events
+    // behave identically below, which checks the default parameter rather than
+    // assuming it.
     let b = try proc.event_create(mode: EventMode.Or) catch {
         print("SOS events: no event b: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -127,26 +126,26 @@ func _start(boot_handle: UInt) {
     let _ = waiter.add(&a, KEY_A)
     let _ = waiter.add(&b, KEY_B)
 
-    // ---- §2.2 LEVEL-TRIGGERED: signal first, wait afterwards --------------
-    // The order is the claim. An edge-triggered waiter would have nothing to
-    // report here, because the only edge happened before anyone was listening.
+    // §2.2 level-triggered: signal first, wait afterwards. The order is the
+    // claim. An edge-triggered waiter would have nothing to report here,
+    // because the only edge happened before anyone was listening.
     let _ = a.signal(BIT_FOUR)
     let first = try waiter.wait() catch {
         print("SOS events: first wait failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    // The two numbers are one fact stated from both ends: the WAIT reported the
+    // The two numbers are one fact stated from both ends: the wait reported the
     // accumulated word out of the copied-out record, and the `receive` after it
-    // finds nothing left because that report was the take. One syscall, not two,
-    // and no value delivered twice.
+    // finds nothing left because that report was the take. One syscall, not
+    // two, and no value delivered twice.
     let first_after = drained(&a)
     print("SOS events: signal-then-wait key={} at-wait={} after={}\n",
           first.key, at_wait(&first), first_after)
 
-    // ---- §2.2 WHICH one became ready ---------------------------------------
-    // Two handles on one Waiter and the other one signalled: the answer has to
-    // name the second attachment, and the key is how it names it.
+    // §2.2 which one became ready. Two handles on one Waiter and the other one
+    // signalled: the answer has to name the second attachment, and the key is
+    // how it names it.
     let _ = b.signal(BIT_EIGHT)
     let second = try waiter.wait() catch {
         let _ = system.debug_print("SOS events: second wait failed\n")
@@ -157,8 +156,8 @@ func _start(boot_handle: UInt) {
     print("SOS events: second key={} at-wait={} after={}\n",
           second.key, at_wait(&second), second_after)
 
-    // ---- §2.4 BITWISE-OR accumulation --------------------------------------
-    // Three signals, one repeated: a flag set answers 3, not 4.
+    // §2.4 bitwise-OR accumulation. Three signals, one repeated: a flag set
+    // answers 3, not 4.
     let _ = a.signal(BIT_ONE)
     let _ = a.signal(BIT_TWO)
     let _ = a.signal(BIT_ONE)
@@ -171,22 +170,21 @@ func _start(boot_handle: UInt) {
     print("SOS events: or key={} at-wait={} after={}\n",
           third.key, at_wait(&third), or_after)
 
-    // ---- §2.2 REMOVE: the attachment goes, the object stays ----------------
-    // A detached Event still accumulates and still drains; it is simply not
-    // watched. Nothing waits after this, because nothing would find it — which
-    // makes this the one line where `receive` is the ONLY taker, and the number
-    // it reports is what says the zeroes above are a take rather than a broken
-    // drain.
+    // §2.2 remove: the attachment goes, the object stays. A detached Event
+    // still accumulates and still drains; it is simply not watched. Nothing
+    // waits after this, because nothing would find it, which makes this the one
+    // line where `receive` is the only taker. The number it reports shows the
+    // zeroes above are a take rather than a broken drain.
     //
-    // IT NAMES THE ATTACHMENT BY KEY, never by the waitable — detaching edits
+    // It names the attachment by key, never by the waitable: detaching edits
     // the Waiter's own table, so `b` is not mentioned here at all.
     let _ = waiter.remove(KEY_B)
     let _ = b.signal(BIT_EIGHT)
     print("SOS events: detached word={}\n", drained(&b))
 
-    // ---- §2.4 SATURATING-SUM ----------------------------------------------
-    // Signalled five times BEFORE it is attached, which exercises the other
-    // half of level-triggering: an attachment that is already ready is ready.
+    // §2.4 saturating-sum. Signalled five times before it is attached, which
+    // exercises the other half of level-triggering: an attachment that is
+    // already ready is ready.
     let c = try proc.event_create(mode: EventMode.SaturatingSum) catch {
         print("SOS events: no counting event: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -205,11 +203,10 @@ func _start(boot_handle: UInt) {
     }
     let counted_after = drained(&c)
 
-    // And that it SATURATES rather than wrapping: two signals of the largest
+    // And that it saturates rather than wrapping: two signals of the largest
     // word there is would wrap a plain sum straight back through zero, which is
     // the value that means "not ready". The count starts from zero here because
-    // the wait above took the five, which is the consume showing up as
-    // arithmetic rather than as an assertion.
+    // the wait above took the five, so the consume shows up as arithmetic.
     let _ = c.signal(UInt.max)
     let _ = c.signal(UInt.max)
     let saturated = drained(&c)
@@ -219,7 +216,6 @@ func _start(boot_handle: UInt) {
     let _ = system.debug_print("SOS events: done\n")
 
     // Process exit, so the kernel's teardown line reports what this process
-    // owned: seven handles — the three it was given (System, Process, its own
-    // Thread) and the four it made — one thread, three events and one waiter.
+    // owned.
     let _ = proc.exit(EXIT_OK)
 }

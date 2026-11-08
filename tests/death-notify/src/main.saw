@@ -1,38 +1,35 @@
-// SOS M3 unit 5.5: A SUPERVISOR WOKEN BY A DEATH (sawos design 8).
+// A supervisor is woken by a death.
 //
-// **THERE IS NO TIMER IN THIS FILE.** That is the whole case. Every other
-// launcher in this tree parks on a generous deadline while its child runs,
-// because until this unit a death woke nobody and a launcher that waited for
-// one waited forever; this one attaches the CHILD'S OWN Process handle to a
-// Waiter and parks on it, so the only thing in the machine that can make root
+// There is no timer in this file. Some launchers park on a generous deadline
+// while their child runs; this one attaches the child's own Process handle to
+// a Waiter and parks on it, so the only thing in the machine that can make root
 // runnable again is the child ending. A kernel that did not notify would leave
-// nothing runnable and the run would end in `every thread blocked` — the
-// failure mode is loud, which is what makes a plain `wait()` an assertion.
+// nothing runnable and the run would end in `every thread blocked`. The failure
+// is loud, which is what makes a plain `wait()` an assertion.
 //
 // The transcript is read as an order:
 //
 //   SOS deathnotify: started
-//   SOS bye: exiting                              <- THE CHILD'S LAST WORD
+//   SOS bye: exiting                              <- the child's last word
 //   SOS: process exit: code=... process=...
 //   SOS: process teardown ... process=...
 //   SOS deathnotify: woke key=44 status=65541     <- root, on the far side
 //   SOS deathnotify: done
 //
-// **THE WAKE LINE COMES AFTER THE TEARDOWN LINE, AND THAT ORDERING IS THE
-// UNIT'S OWN (design 8 D-1).** The kernel notifies as soon as the status word
-// is recorded — before it closes a single handle — but the notification only
-// QUEUES a thread; the dying process's teardown runs to completion inside the
-// same syscall and root is picked afterwards. So a supervisor can never observe
-// a half-dead process, and the transcript is where that is visible.
+// The wake line comes after the teardown line. The kernel notifies as soon as
+// the status word is recorded, before it closes a single handle, but the
+// notification only queues a thread; the dying process's teardown runs to
+// completion inside the same syscall and root is picked afterwards. A
+// supervisor therefore never observes a half-dead process.
 //
 // `status=65541` is `Exited`(1) << 16 | 5: the kind in the high half and the
-// child's own exit code in the low one, out of a wait record rather than out of
-// a `get_status` poll. `key=44` is the word root chose at `attach` and the
+// child's own exit code in the low one, out of a wait record rather than a
+// `get_status` poll. `key=44` is the word root chose at `attach` and the
 // kernel handed back unread.
 //
-// THE ATTACH HAPPENS BEFORE THE START, which is the supervisor shape rather
-// than a requirement: terminal level means a LATE attach works too, and
-// `death_late_attach` is where that is the claim.
+// The attach happens before the start, which is the supervisor shape rather
+// than a requirement: a death is a terminal level, so a late attach works too
+// (`death-late-attach` proves that).
 
 import sos.{System, Process, Memory, BootHandle, Waiter, WaitResult,
             WaitPayload, SosStatus, SystemRight}
@@ -40,27 +37,27 @@ import sos.{System, Process, Memory, BootHandle, Waiter, WaitResult,
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
-/// The key this case attaches the child's Process handle under — a number that
+/// The key this case attaches the child's Process handle under: a number that
 /// appears nowhere else in the transcript, so reading it back proves the record
-/// came from THIS attachment.
+/// came from this attachment.
 static KEY: UInt = 44
 
 /// Root's config: the tag the child's System handle travels under.
 static TAG_BOOT: UInt = 21
 
 /// What a child of this launcher may ask its System object for: print, and
-/// learn its own Process object — which is the handle its `exit` goes through.
+/// learn its own Process object, which is the handle its `exit` goes through.
 /// `Transfer` is in the mask because it is the bit `give` checks on the thing
-/// being given; everything else is absent BY SILENCE.
+/// being given; everything else is absent by silence.
 static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
                                | SystemRight.Transfer)
 
 /// The §8 status word out of the record the kernel copied into this process's
 /// memory while the thread was parked.
 ///
-/// THE OTHER THREE ARMS PANIC, and they are not defensive: this program
-/// attached exactly one thing, so a record of any other kind would mean the
-/// kernel reported an attachment nobody made — a bug in the pair rather than a
+/// The other three arms panic, and not defensively: this program attached
+/// exactly one thing, so a record of any other kind would mean the kernel
+/// reported an attachment nobody made, a bug in the pair rather than a
 /// condition to handle.
 func status_of(r: &WaitResult) -> UInt {
     match r.what {
@@ -115,11 +112,9 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // **THE ATTACHMENT, AND IT SPENDS `ProcessRight.Wait`** — the same bit
-    // `get_status` spends, because this is the same question asked
-    // asynchronously. Design 8's ruled surface, writable since the first pin
-    // bump (sawlang 0.2.0: extension lookup follows `public import`); every
-    // rule the other three `add` overloads state holds unchanged.
+    // The attachment spends `ProcessRight.Wait`, the same bit `get_status`
+    // spends, because this is the same question asked asynchronously. The
+    // other three `add` overloads' rules hold unchanged.
     try waiter.add(process: &child, key: KEY) catch {
         print("SOS deathnotify: attach failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -143,7 +138,7 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS deathnotify: started\n")
 
-    // THE PARK. Nothing else in this machine is armed, so the child's death is
+    // The park. Nothing else in this machine is armed, so the child's death is
     // the only thing that can end this call.
     let record = try waiter.wait() catch {
         print("SOS deathnotify: wait failed: {}\n", error)

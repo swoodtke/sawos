@@ -1,29 +1,27 @@
-// SOS M3 unit 3: THE BOOT SET FREEZES AT START (sawos design 4).
+// The boot set freezes at start: a give after `start` faults the process.
 //
-// **THE ORDERING IS THE SOUNDNESS ARGUMENT, and this case is what makes it a
-// rule rather than a convention.** Whatever a launcher gives a child must be
-// complete at the child's FIRST INSTRUCTION — a child that drains a
-// half-populated set has no way to tell "not given yet" from "not given" — and
-// `start` is the barrier that makes a half-populated table unrepresentable. No
-// synchronization is invented anywhere: the launcher gives, then starts, and
-// after that the set is closed.
+// Whatever a launcher gives a child must be complete at the child's first
+// instruction, since a child that drains a half-populated set cannot tell "not
+// given yet" from "not given". `start` is the barrier that makes a
+// half-populated table unrepresentable. No synchronization is needed: the
+// launcher gives, then starts, and after that the set is closed.
 //
 //   SOS giveafter: started
 //   SOS: process fault: object in the wrong state process=0
 //   SOS: process teardown ... process=0
 //
-// A give afterwards is `BadState` — the same fault a second `start` raises,
-// through the same process-state word, which is what says the two refusals are
-// one rule. It is a FAULT and not a status because the caller could have known:
-// it is the one that started the child.
+// A give afterwards is `BadState`, the same fault a second `start` raises,
+// through the same process-state word, so the two refusals are one rule. It is
+// a fault and not a status because the caller could have known: it is the one
+// that started the child.
 //
-// DYNAMIC TRANSFER IS NOT REFUSED FOREVER, only here. M4's pipes are where a
-// handle travels to a process that is already running and EXPECTING it — over a
-// channel, with a protocol, to a receiver that asked. What this refuses is a
-// launcher reaching into a running process's table behind its back.
+// Dynamic transfer is refused only here. A handle may travel to a process that
+// is already running and expecting it, over a channel, to a receiver that
+// asked. What this refuses is a launcher reaching into a running process's
+// table behind its back.
 //
 // The child never runs: root dies first, and root's death stops the machine
-// (§8's fork — process 0 is init). Which child image is appended is therefore
+// (process 0 is init; spec §8). Which child image is appended is therefore
 // immaterial, and the case reuses `child-fault`.
 
 import sos.{System, Process, Memory, BootHandle, SosStatus}
@@ -63,8 +61,8 @@ func _start(boot_handle: UInt) {
     }
 
     // The no-tag form, which is what a launcher writes when it is furnishing
-    // nothing — and here, what closes the set before anything was furnished at
-    // all. Root keeps running, which is what lets the next line be reached.
+    // nothing; here it closes the set before anything was furnished. Root keeps
+    // running, which is what lets the next line be reached.
     try child.start() catch {
         print("SOS giveafter: start failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -72,7 +70,7 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS giveafter: started\n")
 
-    // TOO LATE. The set froze one line up, and this does not return.
+    // Too late. The set froze above, and this does not return.
     let _ = child.give(memory: move image_mem, tag: TAG)
 
     let _ = system.debug_print("SOS giveafter: survived, which is the bug\n")

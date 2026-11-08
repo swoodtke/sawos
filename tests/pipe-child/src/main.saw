@@ -1,35 +1,31 @@
-// SOS M4 unit 1: A CONNECTION THAT CROSSES A PROCESS BOUNDARY (sawos design 13
-// D-3; spec §2.1, §12).
-//
-// **THE SEED OF UNIT 5's CLIENT.** Root creates a pair, KEEPS THE OUTLET and
-// GIVES THE INLET to a child; the child posts one message and exits; root polls
-// until it arrives and prints the bytes. That is the whole of IPC in this
-// system, and every mechanism in it already shipped:
+// A connection that crosses a process boundary (spec §2.1, §12). Root creates a
+// pair, keeps the outlet and gives the inlet to a child; the child posts one
+// message and exits; root polls until it arrives and prints the bytes. Expected
+// outcome: root prints `received len=... b=...` with the child's bytes and
+// exits cleanly. Every mechanism involved is one the other cases prove:
 //
 //   `pipe_create`      one op, two ends, through a copy-out record
-//   `give(inlet:)`     the courier op, over a NEW kind — `Transfer` is minted
-//                      in `pipe_inlet_rights()` for exactly this
+//   `give(inlet:)`     the courier op over a new kind; `Transfer` is minted in
+//                      `pipe_inlet_rights()` for exactly this
 //   the boot drain     the child collects the end the same way it would
-//                      collect a region (§12), with the TAG as the only
+//                      collect a region (§12), with the tag as the only
 //                      cross-process vocabulary
 //   post / take        data-only, polling, no waitability anywhere
 //
-// **NOTHING ABOUT THE LAUNCH FLOW CHANGED**, which is the claim design 10
-// ruling 3 makes by putting the factory on the Process object: mint a masked
-// System sibling, give it, give the pipe end, start naming the boot tag. A
-// connection end is a capability like any other, so it rides the machinery
-// `give-boot-drain` already proves.
+// The launch flow is the usual one: mint a masked System sibling, give it, give
+// the pipe end, start naming the boot tag. A connection end is a capability
+// like any other, so it rides the machinery `give-boot-drain` proves.
 //
-// **THE POLL IS BOUNDED AND PARKS BETWEEN ROUNDS.** This image's kernel arms no
-// scheduler tick, so the only thing that ever takes the processor away from root
-// is root parking — and a spin would be a hang the deadlock report could not
-// see. So root takes, and if the ring is empty it arms a timer and waits, at
-// most `POLL_ROUNDS` times. The FIRST take necessarily answers `Ok(None)`: the
-// child has been made runnable and has not run.
+// The poll is bounded and parks between rounds. This image's kernel arms no
+// scheduler tick, so the only thing that takes the processor away from root is
+// root parking, and a spin would be a hang the deadlock report cannot see. So
+// root takes, and if the ring is empty it arms a timer and waits, at most
+// `POLL_ROUNDS` times. The first take necessarily finds nothing: the child has
+// been made runnable and has not run.
 //
-// **THE MESSAGE OUTLIVES ITS SENDER.** By the time root reads it the child has
-// dropped its inlet and exited — the transcript shows the exit and the teardown
-// BEFORE the bytes — so this is also `pipe-peer-gone`'s drain-first rule seen
+// The message outlives its sender. By the time root reads it the child has
+// dropped its inlet and exited (the transcript shows the exit and the teardown
+// before the bytes), so this is also `pipe-peer-gone`'s drain-first rule seen
 // across a real process boundary rather than inside one program.
 
 import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
@@ -53,7 +49,7 @@ static PARK_NS: UInt64 = 5_000_000
 /// printing a miss is a better failure than a spin.
 static POLL_ROUNDS: Int = 8
 
-/// ROOT'S CONFIG, and the whole of the contract with the child. `child-post`
+/// Root's config, and the whole of the contract with the child. `child-post`
 /// expects exactly these words; the kernel supplies no meaning for either.
 static TAG_BOOT: UInt = 7
 static TAG_PIPE: UInt = 9
@@ -65,8 +61,8 @@ static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
                                | SystemRight.Transfer)
 
 /// Take, and discharge the obligation by dropping it. The child posted with the
-/// TELL idiom — it gave its claim up at once — so nobody is listening and the
-/// exchange settles here (sawos design 14).
+/// tell idiom (it gave its claim up at once), so nobody is listening and the
+/// exchange settles here.
 func take_message(outlet: &PipeOutlet) -> Result<PipeMsg?, SosStatus> {
     let got = try outlet.take() catch {
         match error {
@@ -111,10 +107,10 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS pipechild: created\n")
 
-    // **BOTH ENDS ARE MINTED HERE, AND ONLY ONE TRAVELS.** That asymmetry is
-    // what makes a launcher a launcher: it decides which side of the
-    // conversation each process is on, and the child has no way to ask for the
-    // other end because there is no op that produces one from an inlet.
+    // Both ends are minted here, and only one travels. That asymmetry is what
+    // makes a launcher a launcher: it decides which side of the conversation
+    // each process is on, and the child has no way to ask for the other end
+    // because no op produces one from an inlet.
     let pair = try proc.pipe_create() catch {
         print("SOS pipechild: pipe create failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -132,9 +128,9 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    // THE GIVE CONSUMES THE WRAPPER, so there is no way to post through this end
-    // below this line — the funnel disarms the value before the syscall and lets
-    // it drop. What root gives away it cannot use.
+    // The give consumes the wrapper, so there is no way to post through this
+    // end below this line: the funnel disarms the value before the syscall and
+    // lets it drop. What root gives away it cannot use.
     match child.give(inlet: move inlet, tag: TAG_PIPE) {
         case Ok(_) -> {
             let _ = system.debug_print("SOS pipechild: gave the inlet\n")
@@ -153,9 +149,8 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS pipechild: started\n")
 
-    // The parking machinery. Unit 1 has no waitable pipe — that is unit 3 — so
-    // what root waits on is a TIMER, and the poll is what stands in for the
-    // blocking receive the ladder has not reached yet.
+    // The parking machinery. Root does not wait on the pipe here; it waits on
+    // a timer, and the poll stands in for a blocking receive.
     let clock = try system.clock_get(type: ClockType.Monotonic) catch {
         print("SOS pipechild: no clock: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)

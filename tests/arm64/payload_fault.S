@@ -1,12 +1,12 @@
-/* SOS M1b unit-A user-mode payload: an illegal access (design 162).
+/* User-mode payload: an illegal access.
  *
- * Stores to the kernel's own text base. EL0 holds no grant for that page — the
- * identity map gives it EL1 access only — so the store raises a data abort from
- * a lower EL (ESR EC 0x24) and the kernel must diagnose it and FAIL the run:
- * never hang, never let the write land.
+ * Stores to the kernel's own text base. EL0 holds no grant for that page (the
+ * identity map gives it EL1 access only), so the store raises a data abort
+ * from a lower EL (ESR EC 0x24) and the kernel must diagnose it and fail the
+ * run: never hang, never let the write land.
  *
- * The kernel reports it as `store-access-fault`, the same name Profile A uses
- * for the same event, which is why the harness asserts one string against both
+ * The kernel reports it as `store-access-fault`, the same name riscv32 uses
+ * for the same event, so the harness asserts one string against both
  * architectures.
  */
 

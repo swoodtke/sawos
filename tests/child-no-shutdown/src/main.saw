@@ -1,8 +1,8 @@
-// SOS M3 unit 3: THE MASK HOLDS AT RUN TIME (sawos design 4, as ruled Aug 29).
+// Test child launcher: a keep mask holds at run time.
 //
-// `give-boot-drain` shows what a masked System handle LETS a child do. This
-// shows what it does not, which is the half that makes a keep mask a security
-// property rather than a convenience:
+// `give-boot-drain` shows what a masked System handle lets a child do. This
+// shows what it does not, which makes a keep mask a security property rather
+// than a convenience:
 //
 //   SOS noshutdown: started a child that may print and not stop the machine
 //   SOS childover: I can print, so Debug travelled
@@ -12,27 +12,22 @@
 //   SOS noshutdown: root survived child status=131075
 //   SOS noshutdown: done
 //
-// **`Shutdown` IS ABSENT BY SILENCE**, which is the polarity ruling doing its
-// work: this launcher's mask names `Debug` and `ProcessSelf` and `ClockGet`, and
-// a right it never mentions is a right the child does not get — today, and when
-// the System object grows one nobody has thought of yet.
+// `Shutdown` is absent by silence: this launcher's mask names `Debug`,
+// `ProcessSelf`, `ClockGet` and `Transfer`, and a right it never mentions is a
+// right the child does not get, including rights the System object grows later.
 //
-// **THE FAULT NAMES PROCESS 1, AND THE MACHINE KEEPS RUNNING.** A masked bit is
-// enforced by the same path a never-minted one is — the rights check in the
-// dispatch, then design 178's faults ruling ending the caller — so the child
-// dies and root does not. `status=131075` is that fact arriving as a VALUE
-// through the Process handle root kept: `Faulted` (2) in the high half,
-// `AccessDenied` (3) in the low. The console says it and the status word says
-// it, from the two sides of the boundary.
+// The fault names process 1 and the machine keeps running. A masked bit is
+// enforced by the same path as a never-minted one (the rights check in the
+// dispatch, then the fault ending the caller), so the child dies and root does
+// not. `status=131075` is that fact as a value through the Process handle root
+// kept: `Faulted` (2) in the high half, `AccessDenied` (3) in the low.
 //
-// **A KEEP MASK CANNOT BE UNDONE FROM INSIDE.** The child holds no `Mint` and no
-// `Transfer` either, and even if it held `Mint` a sibling's rights are a SUBSET
-// of its source's — so there is no sequence of ops that recovers `Shutdown`.
-// That is what makes the one line of policy at the top of this file the whole of
-// the policy.
+// A keep mask cannot be undone from inside. The child holds no `Mint`, and even
+// with `Mint` a sibling's rights are a subset of its source's, so no sequence
+// of ops recovers `Shutdown`.
 //
-// ROOT PARKS ON A GENEROUS TIMER while the child runs, so the ordering is forced
-// rather than raced.
+// Root parks on a generous timer while the child runs, so the ordering is
+// forced rather than raced.
 
 import sos.{System, Process, Memory, BootHandle, Clock, ClockType, Timer,
             Waiter, SosStatus, SystemRight}
@@ -45,10 +40,10 @@ static PARK_NS: UInt64 = 20_000_000
 
 static TAG_BOOT: UInt = 7
 
-/// **THE POLICY.** Print, name yourself, tell the time. `Shutdown` is not here,
-/// which is the whole of the case. `Transfer` is, because it is the bit `give`
-/// checks on the thing being given — a launcher cannot narrow below the ticket
-/// that lets the narrowed handle arrive (see `give-boot-drain`'s note).
+/// The policy: print, name yourself, tell the time. `Shutdown` is not here,
+/// which is the point of the case. `Transfer` is, because it is the bit `give`
+/// checks on the thing being given: a launcher cannot narrow below the ticket
+/// that lets the narrowed handle arrive (see `give-boot-drain`).
 static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
                                | SystemRight.ClockGet | SystemRight.Transfer)
 
@@ -132,8 +127,8 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // THE MACHINE IS STILL HERE, which is the claim. The child asked to stop it
-    // and was refused; the refusal killed the asker.
+    // The machine is still here. The child asked to stop it and was refused;
+    // the refusal killed the asker.
     let status = try child.get_status() catch {
         print("SOS noshutdown: status failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)

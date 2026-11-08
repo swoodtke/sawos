@@ -1,17 +1,12 @@
-/* SOS user-mode payload: a caller's mistake is a FAULT (design 178's faults
- * ruling, ratified Aug 15 — this file used to assert the opposite).
+/* User-mode payload: a caller's mistake is a fault.
  *
- * THE RULING: a caller error the process could have checked — an invalid handle,
- * an op the object does not have, a right it was not given — TERMINATES the
- * process. Statuses are reserved for what the caller could not have known
- * (exhaustion, and later a dead peer). So `SosStatus.BadHandle`, `.BadOp` and
- * `.AccessDenied` no longer exist as statuses at all: they are `FaultReason`
- * tags in the kernel's own report.
+ * A caller error the process could have checked (an invalid handle, an op the
+ * object does not have, a right it was not given) terminates the process.
+ * Statuses are reserved for what the caller could not have known (exhaustion,
+ * a dead peer). So `BadHandle`, `BadOp` and `AccessDenied` are `FaultReason`
+ * tags in the kernel's report, not statuses.
  *
- * What that means here. The M1b version of this payload made three calls and
- * encoded the three statuses it got back into its exit code; under the ruling
- * the second call never returns, so there is nothing after it to encode. The
- * case now proves two things in ORDER, which is what the harness asserts:
+ * The case proves two things in order, which the harness asserts:
  *
  *   1. a good call still works             -> the '!' reaches the console
  *   2. an unknown op on that same handle   -> the kernel reports `bad op`,
@@ -19,12 +14,11 @@
  *                                             the machine with ExitCode
  *                                             .ProcessFault
  *
- * THE KERNEL STAYS UP, which is the other half of the ruling: it is the
- * PROCESS that was wrong, so the kernel diagnoses it and reports the teardown
- * rather than faulting itself or hanging.
+ * The kernel stays up: it diagnoses the faulting process and reports the
+ * teardown rather than faulting itself or hanging.
  *
- * Kept in step with the riscv32 twin. The bad-HANDLE half of the ruling is
- * covered by `thread_fault`, whose root joins a handle it does not hold.
+ * Kept in step with the riscv32 twin. The bad-handle half is covered by
+ * `umode_bad_handle`.
  */
 
     .equ SYSTEM_HANDLE,     1
@@ -47,8 +41,7 @@ _umode_payload:
     mov     x1, #0
     svc     #0
 
-    /* Unreachable under the ruling. If the kernel ever let this run again, spin
-     * inside the granted region rather than run off into memory EL0 cannot
-     * read — the harness reads the exit status, and a hang is a failure. */
+    /* Unreachable. If the kernel ever let this run, spin inside the granted
+     * region rather than run off into memory EL0 cannot read. */
 1:
     b       1b

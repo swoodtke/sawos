@@ -1,20 +1,20 @@
-// SOS M4 unit 2: A REPLY BIGGER THAN THE SLOT (sawos design 14; spec §2.1).
+// A reply bigger than the slot faults the process (spec §2.1).
 //
-// **THE REPLY RIDES THE REQUEST'S OWN SLOT**, which is design 10 ruling 4's rider
-// made mechanical ("ruling 6's fixed slots carry the reply") — so the answer's
-// maximum is the question's maximum, one number, `PIPE_BODY_BYTES`. A caller
-// cannot even declare the buffer without it, so a `len` above it is a mistake the
-// process could have checked, and design 178's faults ruling puts that outside
-// the status enum entirely. It is `pipe-oversized`'s line, running outward.
+// The reply rides the request's own slot, so the answer's maximum is the
+// question's maximum, one number, `PIPE_BODY_BYTES`. A caller cannot even
+// declare the buffer without it, so a `len` above it is a mistake the process
+// could have checked, which the faults rule (spec §5.7) puts outside the status
+// enum entirely. It is `pipe-oversized`'s line, running outward. Expected
+// outcome:
 //
 //   SOS bigreply: asking for 129
 //   SOS: process fault: argument outside its domain
 //
-// **THE CHECK IS BEFORE THE COPY AND BEFORE THE CONSUME**, which is what makes
-// the refusal safe rather than merely correct: nothing is read out of the
-// caller's memory, the staging slot is untouched, and the obligation is NOT
-// discharged — a hostile length is a diagnostic, never a partial write and never
-// an exchange quietly closed.
+// The length check runs before the copy and before the consume, which makes the
+// refusal safe and not merely correct: nothing is read out of the caller's
+// memory, the staging slot is untouched, and the obligation is not discharged.
+// A hostile length is a diagnostic, never a partial write and never an exchange
+// quietly closed.
 
 import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
             SosStatus, PIPE_BODY_BYTES}
@@ -55,9 +55,9 @@ func _start(boot_handle: UInt) {
     let (_, request) = move taken
     let obligation = move request
 
-    // ONE BYTE PAST THE SLOT. The buffer this names is a whole slot wide, so
-    // nothing here is out of bounds in the caller's own memory — what is out of
-    // bounds is the ASK, which is the only thing the kernel is being told.
+    // One byte past the slot. The buffer this names is a whole slot wide, so
+    // nothing here is out of bounds in the caller's own memory; what is out of
+    // bounds is the ask, which is the only thing the kernel is told.
     let too_much: UInt = (PIPE_BODY_BYTES as UInt) + 1
     print("SOS bigreply: asking for {}\n", too_much)
 
@@ -67,7 +67,7 @@ func _start(boot_handle: UInt) {
             let _ = system.shutdown(EXIT_FAILED)
             return
         },
-        // UNREACHABLE: the kernel ends this process at the length check, so
+        // Unreachable: the kernel ends this process at the length check, so
         // neither arm runs. Written so the refusal reads as a refusal.
         case Err(e) -> {
             print("SOS bigreply: reply refused: {}\n", e)

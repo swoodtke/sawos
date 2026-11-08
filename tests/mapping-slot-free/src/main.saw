@@ -1,55 +1,51 @@
-// SOS M5 unit 5: THE MAPPING SLOT COMES BACK, AND SO DO THE BYTES (sawos design
-// 28, on design 25 D-5; M3 unit 5's design 7 D-1/D-2; §2.5).
+// The mapping slot comes back, and so do the bytes (spec §2.5).
 //
-// **THIS CASE WAS RETARGETED BY DESIGN 28**, which is authorized by that brief
-// by name, and the two halves it now proves are one sentence apart:
+// The transcript proves two halves:
 //
-//   SOS mapfree: rounds=12 refused=0     <- MAP, UNMAP, DROP recycles past the
-//                                           slab. `MAX_MAPPINGS` is 8, so a
-//                                           twelfth round could not have been
-//                                           served out of fresh slots — and
-//                                           root's ROW allowance is smaller
-//                                           still, so the quota came back too
-//   SOS mapfree: husk wrote 94 read 94   <- EVERY HANDLE ON THE REGION IS GONE
+//   SOS mapfree: rounds=12 refused=0     <- map, unmap, drop recycles past the
+//                                           slab. `MAX_MAPPINGS` is below
+//                                           the round count, so the last round
+//                                           could not have been served out of
+//                                           fresh slots, and root's row
+//                                           allowance is smaller still, so the
+//                                           quota came back too
+//   SOS mapfree: husk wrote 94 read 94   <- every handle on the region is gone
 //                                           and its bytes are still there: the
-//                                           slot SURVIVES the handle drop while
+//                                           slot survives the handle drop while
 //                                           a row counts against it
 //   SOS mapfree: recycled read 94        <- the range went back to the pool at
-//                                           the LAST UNMAP, and a fresh split
-//                                           produced THE SAME BYTES
+//                                           the last unmap, and a fresh split
+//                                           produced the same bytes
 //   SOS mapfree: done
 //
-// **WHAT THE SECOND LINE USED TO CLAIM, AND WHY IT CHANGED.** It read the same
-// numbers and meant something narrower: a MAPPING dropped without an unmap frees
-// its slot and leaves its row, so §2.5's "permanent, safe-but-leaked" was
-// mechanical rather than described. That is still true and is still what happens
-// to the Mapping object here. What design 25 D-5 ruled is the other side of it —
-// the RANGE returns to its pool only when the LAST reference of EITHER kind
-// drops, handles AND installed rows — so the interesting husk is now the
-// REGION's. This program makes one deliberately: it maps a region, marks its
-// bytes, and then destroys every handle onto it. A kernel that counted only
-// handles would have freed the slot and given the range to the next `Split`
-// while a protection row was still reaching those very bytes.
+// A Mapping dropped without an unmap frees its slot and leaves its row
+// (§2.5's "permanent, safe-but-leaked"). The range returns to its pool only
+// when the last reference of either kind drops, handles and installed rows, so
+// the interesting husk is the region's. This program makes one deliberately: it
+// maps a region, marks its bytes, and then destroys every handle onto it. A
+// kernel that counted only handles would have freed the slot and given the
+// range to the next `Split` while a protection row was still reaching those
+// very bytes.
 //
-// **AND THE THIRD LINE IS THE SECOND ZERO ARRIVING.** The unmap takes the last
-// row, which is the last reference, so the range goes back onto the pool root's
-// free list — where it is adjacent to the unspent frontier and folds straight
-// into it, leaving the pool exactly as it was at boot. The next `split(CHUNK)`
+// The third line is the second zero arriving. The unmap takes the last row,
+// which is the last reference, so the range goes back onto the pool root's free
+// list, where it is adjacent to the unspent frontier and folds straight into
+// it, leaving the pool exactly as it was at boot. The next `split(CHUNK)`
 // therefore hands out the same `[base, base + CHUNK)` it handed out the first
-// time, and the marker written through the FIRST mapping is read back through
-// the SECOND. Nothing zeroes a split range, so identical bytes at an identical
-// address is what "the same memory came back" looks like from userspace, which
-// is the only place a region has no bounds reader to ask.
+// time, and the marker written through the first mapping is read back through
+// the second. Nothing zeroes a split range, so identical bytes at an identical
+// address is what "the same memory came back" looks like from userspace, where
+// a region has no bounds reader to ask.
 //
-// A KERNEL WITHOUT POOL RETURNS FAILS THIS BY FAULTING, not by printing a wrong
+// A kernel without pool returns fails this by faulting, not by printing a wrong
 // number: its cursor would have moved past the first chunk, the second split
-// would hand out the NEXT page, and the read at `base` would touch an address no
-// row grants any more.
+// would hand out the next page, and the read at `base` would touch an address
+// no row grants any more.
 
 import sos.{System, Process, Memory, Mapping, MapAccess, SosStatus}
 
-// WHERE THE POOL IS — this program's config, per architecture, in C because Saw
-// cannot name an address (DF-172a). See `tests/poolbase_riscv32.c`.
+// The address of this program's first mapping: its config, per architecture, in
+// C because Saw cannot name an address. See `tests/poolbase_riscv32.c`.
 extern "C" {
     func sos_test_pool_base() -> UInt
 }
@@ -60,14 +56,14 @@ static CHUNK: UInt = 0x1000
 /// Read and write, which is what a scratch region wants.
 static RW: UInt32 = MapAccess.Read | MapAccess.Write
 
-/// How many map/unmap/drop rounds the loop runs. **PAST `MAX_MAPPINGS` ON
-/// PURPOSE** — the kernel's Mapping slab holds eight and root's row budget is
-/// smaller still, so twelve completed rounds could not be served without both
-/// the slot and the quota row coming back each time.
+/// How many map/unmap/drop rounds the loop runs. Past `MAX_MAPPINGS` on
+/// purpose: root's row budget is smaller still, so completing this many rounds
+/// is possible only with both the slot and the quota row coming back each
+/// time.
 static ROUNDS: Int = 12
 
 /// The byte this program writes through the first mapping and reads back
-/// through a mapping of the RECYCLED range. A number that appears nowhere else
+/// through a mapping of the recycled range. A number that appears nowhere else
 /// in this transcript.
 static MARK: UInt8 = 0x5E
 
@@ -75,7 +71,7 @@ static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
 /// Write one byte through a mapping. `unsafe` because it names a pointer type,
-/// and confined to one line for design 136's reason.
+/// and confined to one line.
 func poke(addr: UInt, value: UInt8) unsafe {
     UnsafeMemory<UInt8, Normal>(addr).write(value)
 }
@@ -95,8 +91,8 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // The boot set carries one row: the RAM POOL, tag 0 because it is the only
-    // one. Root's config is what says so.
+    // The boot set carries one row: the RAM pool, tag 0 because it is the only
+    // one.
     var record = try proc.boot_handle_next() catch {
         print("SOS mapfree: no pool region: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -115,13 +111,13 @@ func _start(boot_handle: UInt) {
     }
     let base = sos_test_pool_base()
 
-    // ===== ROUND TRIPS: map, unmap, drop =====
+    // ===== Round trips: map, unmap, drop =====
     //
-    // The mapping wrapper is bound BY THE ARM so it can be UNMAPPED — `unmap`
-    // is a method on the object — and then dies at the arm's end, which
-    // releases the only handle and takes the count to zero. Both halves are
-    // needed and they do different things: the unmap returns the ROW (to the
-    // hardware and to the ledger), the drop returns the SLOT.
+    // The mapping wrapper is bound by the arm so it can be unmapped (`unmap` is
+    // a method on the object) and then dies at the arm's end, which releases
+    // the only handle and takes the count to zero. Both halves are needed and
+    // do different things: the unmap returns the row (to the hardware and to
+    // the ledger), the drop returns the slot.
     var rounds = 0
     var refused: UInt = 0
     while rounds < ROUNDS && refused == 0 {
@@ -135,10 +131,10 @@ func _start(boot_handle: UInt) {
     }
     print("SOS mapfree: rounds={} refused={}\n", rounds, refused)
 
-    // ===== THE REGION HUSK: no handles, and a row still counting =====
+    // ===== The region husk: no handles, and a row still counting =====
     //
-    // The order is the whole point. The row goes in, the bytes are marked, and
-    // then EVERY HANDLE on the region is destroyed — `chunk` was the only one —
+    // The order is the point. The row goes in, the bytes are marked, and then
+    // every handle on the region is destroyed (`chunk` was the only one),
     // leaving an object nothing can name and something is still using.
     let held = try proc.map(memory: &chunk, access: RW) catch {
         print("SOS mapfree: husk map failed: {}\n", error)
@@ -150,7 +146,7 @@ func _start(boot_handle: UInt) {
 
     print("SOS mapfree: husk wrote {} read {}\n", MARK as Int, peek(base) as Int)
 
-    // ===== THE SECOND ZERO: the last row goes, and the range comes home =====
+    // ===== The second zero: the last row goes, and the range comes home =====
     //
     // Nothing else in this program can reach those bytes after this line: the
     // handles are gone and the row is being taken away. That is precisely when
@@ -161,9 +157,9 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // AND THE SAME BYTES COME BACK OUT. A first-fit split of a pool whose only
+    // And the same bytes come back out. A first-fit split of a pool whose only
     // hole folded into its frontier is the frontier again, so this region is
-    // `[base, base + CHUNK)` for the second time — and the marker is still in
+    // `[base, base + CHUNK)` for the second time, and the marker is still in
     // it, because a returned range is bytes rather than a promise.
     let again = try pool.split(len: CHUNK) catch {
         print("SOS mapfree: re-split failed: {}\n", error)

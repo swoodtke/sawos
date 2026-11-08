@@ -1,33 +1,28 @@
-// SOS panic-recursion pin (design 172 unit 4): a COMPILER-RAISED panic reaches
-// the console intact, through a reporter that cannot itself panic.
+// Panic-recursion pin: a compiler-raised panic reaches the console intact,
+// through a reporter that cannot itself panic.
 //
-// `panic.saw` beside this file calls `panic(...)` outright. This one does not
-// say the word: it takes an out-of-range `Vector` index, so the message is
-// assembled by the compiler's own trap path — the path that would recurse if
-// the writer under it were not check-free. What is under test:
+// `panic.saw` beside this file calls `panic(...)` outright. This one takes an
+// out-of-range `Vector` index instead, so the message is assembled by the
+// compiler's own bounds-check path, the path that would recurse if the writer
+// under it were not check-free. The test proves three things:
 //
-//   1. The reporter is reached from the compiler's own BOUNDS-CHECK path, not
-//      from a hand-written `panic(...)` call, so the whole design-137
-//      stack-scratch message assembly runs on the way in. (Nothing to do with
-//      `ktrap` — no CPU trap is taken here; the kernel raises this itself.)
-//   2. The message arrives INTACT — the `panic at ` prefix, the location and
-//      the reason, three independent pieces — rather than truncated or
-//      interleaved, which is what a second panic raised mid-report produces.
-//      The location is `vector.saw`, not this file: design 122 reports the
-//      TRAPPING expression's own line, and for an indexed accessor that is
-//      inside std.
-//   3. The machine stops NON-ZERO rather than hanging, which is what a
+//   1. The reporter is reached from the compiler's bounds check, not from a
+//      hand-written `panic(...)`, so the whole stack-scratch message assembly
+//      runs on the way in. No CPU trap is taken, so `ktrap` is not involved.
+//   2. The message arrives intact: the `panic at ` prefix, the location and the
+//      reason, not truncated or interleaved (which a second panic raised
+//      mid-report would produce). The location is `vector.saw`, not this file:
+//      the report names the trapping expression's own line, and for an indexed
+//      accessor that is inside std.
+//   3. The machine stops non-zero rather than hanging, which is what a
 //      reporter that re-entered itself would do.
 //
-// The guarantee that makes (2) and (3) hold is not this test — it is that the
-// reporter contains no bounds check, no allocation and no checked arithmetic,
-// verified from emitted IR (DF-172b). Since the review round that reporter is
-// ONE loop, `sosrt.console_write`, generic over a `ConsoleSink` and
-// monomorphized per architecture, so the proof is run on BOTH instantiations:
-// each inlines the loop, the trait's default `write_byte` and both accessor
-// bodies down to a volatile poll, a volatile store and wrapping arithmetic.
-// This test is what notices if that ever stops being true, on a real machine,
-// on both profiles.
+// What makes (2) and (3) hold is that the reporter contains no bounds check, no
+// allocation and no checked arithmetic. It is one loop, `sosrt.console_write`,
+// generic over a `ConsoleSink` and monomorphized per architecture; each
+// instantiation inlines the loop, the trait's default `write_byte` and both
+// accessor bodies down to a volatile poll, a volatile store and wrapping
+// arithmetic. This test notices if that stops being true, on both profiles.
 //
 // The kernel core is imported for its `ktrap`, which the HAL's trap entry
 // calls: every SOS image links the same trap handler even when this one never

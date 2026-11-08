@@ -1,28 +1,20 @@
-/* SOS from C — the whole of what a freestanding C process needs (sawos design
- * 39, the C-leg probe).
+/* Everything a freestanding C process needs to reach the kernel. Each line is
+ * either the published ABI (`hal/<arch>/user/ABI.md`) or an op number from
+ * the kernel-internal numbering (see the op block below).
  *
- * **THIS FILE IS THE FINDING.** It is what a C program has to write down for
- * itself today in order to reach the kernel, and every line of it is either the
- * published ABI (`hal/<arch>/user/ABI.md`) or a number the tree calls
- * KERNEL-INTERNAL. The second kind is the interesting kind — see the op block
- * below and design 39's As-built.
- *
- * Nothing here is linked from the tree. The probe deliberately re-derives the
- * syscall seam from the ABI documents rather than naming
- * `hal/<arch>/user/syscall.c`, because the question the unit was dispatched to
- * answer is what a NON-Saw image costs when it starts from the documents — and
- * the answer is only honest if the image builds out of its own sources.
+ * Nothing here is linked from the tree: the syscall seam is re-derived from
+ * the ABI documents rather than taken from `hal/<arch>/user/syscall.c`, so
+ * the image builds out of its own sources.
  */
 
 #ifndef SOS_H
 #define SOS_H
 
-/* THE WORD IS THE REGISTER, AND ONE TYPEDEF COVERS BOTH PROFILES. `unsigned
- * long` is 32 bits under riscv32's ilp32 and 64 bits under aarch64's LP64, so
- * it is the same width as the machine's argument register on each — which is
- * the same claim `hal/arm64/user/ABI.md` makes about Saw's `UInt`. The two HAL
- * stubs say `unsigned int` and `unsigned long` respectively; that is two
- * spellings of this one, not two contracts. */
+/* The word is the register, and one typedef covers both profiles. `unsigned
+ * long` is 32 bits under riscv32's ilp32 and 64 bits under aarch64's LP64, the
+ * same width as the machine's argument register on each, as with Saw's `UInt`
+ * in `hal/arm64/user/ABI.md`. The two HAL stubs spell it `unsigned int` and
+ * `unsigned long` respectively; that is one contract. */
 typedef unsigned long sos_word;
 
 /* -------------------------------------------------------------------------
@@ -40,24 +32,19 @@ sos_word sos_syscall3(sos_word handle, sos_word op, sos_word arg0, sos_word arg1
                       sos_word arg2, sos_word *value_out);
 
 /* -------------------------------------------------------------------------
- * The op numbers — AND THIS BLOCK IS WHAT DESIGN 31 PART 1 EXISTS TO DELETE
+ * The op numbers
  * ------------------------------------------------------------------------- */
-/* spec §5.7's vDSO discipline says an op number is not ABI: userspace names the
- * op and the `sos` module supplies the number, so a renumbering is a rebuild
- * rather than a break. A C image cannot hold up its end of that bargain today.
- * The typed C surface it is supposed to use — `sos_system_debug_print`,
- * `sos_system_process_self`, `sos_process_exit` and the rest of
- * `kernel/sysapi/src/floor.saw`'s `@export`ed block — is compiled out of a SAW
- * module, so reaching it means linking `sos`, which means linking `sosrt`,
- * which means the image is no longer a C image. So this probe writes the
- * numbers, out of `kernel/abi/src/ops.saw`, a module whose own header calls
- * itself KERNEL-INTERNAL.
+/* spec §5.7's vDSO discipline says an op number is not ABI: userspace names
+ * the op and the `sos` module supplies the number. A C image cannot do that.
+ * The typed C surface (`sos_system_debug_print`, `sos_system_process_self`,
+ * `sos_process_exit` and the rest of `kernel/sysapi/src/floor.saw`'s
+ * `@export`ed block) is compiled out of a Saw module, so reaching it means
+ * linking `sos` and `sosrt`, and the image is no longer a C image. So these
+ * numbers are copied from `kernel/abi/src/ops.saw`, which is kernel-internal.
  *
- * THE COST OF BEING WRONG IS NOT A LINK ERROR. An op number the kernel does not
- * recognize on that object is a caller error the process could have checked, so
- * design 178's faults ruling terminates the process — the image builds, boots,
- * and dies. `tests/riscv32/payload_sosimg.S` is the existing precedent for
- * hardcoding two of these; this is the same debt at three. */
+ * A wrong number is not a link error. An op number the kernel does not
+ * recognize on that object is a caller error, which terminates the process:
+ * the image builds, boots, and dies. */
 #define SOS_OP_SYSTEM_DEBUG_PRINT  0u  /* SystemOp.DebugPrint  */
 #define SOS_OP_SYSTEM_PROCESS_SELF 2u  /* SystemOp.ProcessSelf */
 #define SOS_OP_PROCESS_EXIT        2u  /* ProcessOp.Exit       */
@@ -71,15 +58,12 @@ sos_word sos_syscall3(sos_word handle, sos_word op, sos_word arg0, sos_word arg1
 #define SOS_STATUS_OK 0u
 
 /* -------------------------------------------------------------------------
- * The two ops this probe needs, named
+ * The ops this image needs, named
  * ------------------------------------------------------------------------- */
 
-/* Write ONE byte to the debug console. Requires `SystemRight.Debug`.
- *
- * ONE BYTE PER SYSCALL is the shape, not an omission of this probe's — the Saw
- * `System.debug_print(String)` above it is a loop over exactly this call. A
- * libc's `write(2)` cannot be built on it at any sane cost; see design 39's
- * As-built finding 6. */
+/* Write one byte to the debug console. Requires `SystemRight.Debug`. One byte
+ * per syscall is the op's shape; the Saw `System.debug_print(String)` is a
+ * loop over this call. */
 sos_word sos_system_debug_print(sos_word system, sos_word byte);
 
 /* This process's own Process handle, out of its System handle. Requires

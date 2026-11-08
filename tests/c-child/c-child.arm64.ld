@@ -1,14 +1,12 @@
-/* THE C CHILD'S SCRIPT (sawos design 39) — arm64, Profile B.
+/* The C child's linker script, arm64.
  *
- * The riscv32 sibling beside this file carries the argument; this is the same
- * two lines against the other profile's shared script. That there IS a second
- * file is the manifest's doing rather than the mechanism's — a package names
- * one `linker-script` per target triple — exactly as `tests/arena-small/`
- * records.
+ * Same two lines as the riscv32 sibling (see it for the reasoning), against
+ * this board's shared script. There are two files because a package names
+ * one `linker-script` per target triple.
  *
- * `user.ld` is ONE script for every process on this board (design 33), so
- * nothing here is about being a child: the base is the canonical
- * `hal.USER_IMAGE_BASE` and the kernel maps this image's frames there.
+ * `user.ld` is one script for every process on this board, so nothing here
+ * is about being a child: the base is the canonical `hal.USER_IMAGE_BASE`
+ * and the kernel maps this image's frames there.
  */
 
 ARENA_SIZE = 0;

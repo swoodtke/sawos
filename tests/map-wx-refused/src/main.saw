@@ -1,38 +1,33 @@
-// SOS M3 unit 6: NO ROW IS BOTH WRITABLE AND EXECUTABLE (sawos design 9 D-1;
-// spec §2.5).
-//
-// **THE COMPANION INVARIANT TO THE EXEC GATE, AND IT COSTS NOTHING
-// EXPRESSIBLE.** `map-exec-gated` beside this one asks whether a handle may
-// produce an executable row at all; this asks whether ONE row may be both
-// writable and executable. The answer is no, and the two lines above the refusal
-// are why that is not a restriction:
+// No row is both writable and executable (spec §2.5). `map-exec-gated`
+// beside this one asks whether a handle may produce an executable row at all;
+// this asks whether one row may be both writable and executable. The answer is
+// no, and the two lines above the refusal show why that is not a restriction:
 //
 //   SOS mapwx: read-write here, wrote 107 read 107
 //   SOS mapwx: read-execute there: one region, two rows
 //   SOS mapwx: asking for write and execute in one row
 //   SOS: process fault: argument outside its domain
 //
-// **THE DOUBLE MAP IS THE POINT OF THE FIRST TWO LINES.** A double map is
-// sanctioned (design 6 agenda item 7 — two rows, two Mappings, no aliasing
-// bookkeeping owed on a machine that does not translate), so the JIT-shaped
-// pattern is fully available: write your instructions through the RW row, fetch
-// them through the RX row, over one region, with every individual protection row
-// W^X. What the refusal removes is only the single row a process could write to
-// and then fetch from, which has no honest use.
+// The double map is the point of the first two lines. A double map is
+// sanctioned (two rows, two Mappings, no aliasing bookkeeping on a machine that
+// does not translate), so the JIT-shaped pattern is available: write
+// instructions through the RW row, fetch them through the RX row, over one
+// region, with every individual protection row W^X. The refusal removes only
+// the single row a process could write to and then fetch from, which has no
+// honest use.
 //
-// **AND IT IS REFUSED THROUGH ROOT'S FULL POOL HANDLE**, which carries
-// `MemoryRight.MapExecute` and has just proved it two lines up. So this refusal
-// cannot be the exec gate wearing a different hat: the rights are all there, and
-// the word is what is wrong. `BadArg` rather than `AccessDenied` is the kernel
-// saying exactly that.
+// It is refused through root's full pool handle, which carries
+// `MemoryRight.MapExecute` and has just proved it. So this refusal cannot be
+// the exec gate wearing a different hat: the rights are all there, and the word
+// is what is wrong. `BadArg` rather than `AccessDenied` says exactly that.
 //
-// **THE BOUNDARY, STATED HERE TOO** (it is stated at the check and in §2.5): this
-// rule governs the DYNAMIC map. A process image's own segments arrive through
-// `process_create`'s loader with `SegFlag` bits read out of the image, validated
-// by `imgformat.has_sane_perms`, which refuses write-without-read and
-// X-on-device and NOT W|X — an image's segments are kept apart by its linker
-// script. That door is `SystemRight.ProcessCreate` authority; this one is any
-// holder of a region.
+// The boundary (also stated at the check and in §2.5): this rule governs the
+// dynamic map. A process image's own segments arrive through `process_create`'s
+// loader with `SegFlag` bits read out of the image, validated by
+// `imgformat.has_sane_perms`, which refuses write-without-read and X-on-device
+// but not W|X; an image's segments are kept apart by its linker script. That
+// door is `SystemRight.ProcessCreate` authority; this one is any holder of a
+// region.
 
 import sos.{System, Process, Memory, Mapping, MapAccess, SosStatus}
 
@@ -46,8 +41,8 @@ static CHUNK: UInt = 0x1000
 static RW: UInt32 = MapAccess.Read | MapAccess.Write
 static RX: UInt32 = MapAccess.Read | MapAccess.Execute
 
-/// The one word this unit refuses, spelled out of the same three cases every
-/// legal word is spelled out of — which is what makes it caller-checkable.
+/// The one word this case refuses, spelled out of the same three cases every
+/// legal word is spelled out of, which is what makes it caller-checkable.
 static RWX: UInt32 = (MapAccess.Read | MapAccess.Write | MapAccess.Execute)
 
 /// The byte this case writes through its read-write row. A number that appears
@@ -92,38 +87,40 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // THE WRITABLE ROW, and a byte through it — so "writable" is a fact about
+    // The writable row, and a byte through it, so "writable" is a fact about
     // the machine rather than about the kernel's bookkeeping.
     let _data = try proc.map(memory: &page, access: RW) catch {
         print("SOS mapwx: read-write map failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    // THE ADDRESS IS THE REGION'S OWN, and this program never learned it from
-    // the kernel: `map` answers with a Mapping, not a number, and a region has
-    // no bounds reader. Where the pool IS is the build's config, published to
-    // this package through one C constant per architecture, exactly as the map
-    // cases unit 4 landed do it.
+    // This program never learned the address from the kernel: `map` answers
+    // with a Mapping, not a number, and a region has no bounds reader. The
+    // address of this process's first mapping is the build's config, published
+    // to this package through one C constant per architecture, as the other map
+    // cases do. Only that first row's address is used: the executable row
+    // below maps the same page again, and where the machine translates it
+    // lands elsewhere.
     let page_at = sos_test_pool_base()
     poke(page_at, MARK)
     print("SOS mapwx: read-write here, wrote {} read {}\n",
           MARK as Int, peek(page_at) as Int)
 
-    // THE EXECUTABLE ROW, over the SAME region — the sanctioned double map, and
+    // The executable row, over the same region: the sanctioned double map, and
     // the reason W^X-per-row takes nothing away.
     let _text = try proc.map(memory: &page, access: RX) catch {
         print("SOS mapwx: read-execute map failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    // ASCII ONLY ON A CONSOLE LINE: `ascii_byte` renders a non-ASCII scalar as
-    // `?`, so an em dash here would reach the transcript as one. The prose
-    // above this file's code is where punctuation belongs.
+    // ASCII only on a console line: `ascii_byte` renders a non-ASCII scalar as
+    // `?`, so an em dash here would reach the transcript as one. Punctuation
+    // belongs in the comments.
     let _ = system.debug_print("SOS mapwx: read-execute there: one region, two rows\n")
 
-    // **AND THE REFUSAL.** Same region, same full handle, same target — only the
-    // access word differs, and it is the one word the kernel will not install.
-    // A `BadArg` fault ends the process, so this is the last thing that happens.
+    // The refusal. Same region, same full handle, same target; only the access
+    // word differs, and it is the one word the kernel will not install. A
+    // `BadArg` fault ends the process, so this is the last thing that happens.
     let _ = system.debug_print("SOS mapwx: asking for write and execute in one row\n")
     match proc.map(memory: &page, access: RWX) {
         case Ok(_) -> {

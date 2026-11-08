@@ -1,33 +1,31 @@
-// SOS M3 unit 4: MAP (sawos design 6 D-3; spec §2.5).
+// Map (spec §2.5): an address that faulted before is memory after. This is the
+// inverse of every protection proof that only reaches for an ungranted address:
+// `root_server_oversteps` reaches for one and dies; this program obtains the
+// authority, installs it, and writes. Together they show a protection domain
+// being data.
 //
-// **AN ADDRESS THAT FAULTED YESTERDAY IS MEMORY TODAY**, which is the inverse
-// of every protection proof this suite has run so far. `root_server_oversteps`
-// reaches for an address it was not granted and dies; this program reaches for
-// an address it was not granted, obtains the authority, installs it, and writes.
-// The two together are what a protection domain being DATA means.
-//
-// THE TRANSCRIPT, read as three claims:
+// The transcript reads as three claims:
 //
 //   SOS mapbasics: wrote 0x5a read 90       <- the row installed, immediately
 //                                              (90 is 0x5a; the byte renders as
 //                                              decimal)
-//   SOS mapbasics: double-mapped read-only  <- agenda item 7: it is ALLOWED
+//   SOS mapbasics: double-mapped read-only  <- allowed
 //   SOS mapbasics: still 90                 <- the alias destroyed nothing
 //
-// **THE FIRST LINE ALSO PROVES THE LIVE-DOMAIN RULE HALF THE TIME.** The
-// scheduler skips equal domains, so a `map` into the RUNNING process would
-// never be installed at all if the op did not reload — not "installed late":
-// never. The write on the next line is what says it did. (`map_unmap` proves
-// the other direction, which is the one that matters for revocation.)
+// The first line also proves the live-domain rule half the time. The scheduler
+// skips equal domains, so a `map` into the running process would never be
+// installed if the op did not reload. The write on the next line shows it did.
+// (`map_unmap` proves the other direction, the one that matters for
+// revocation.)
 //
-// **THE DOUBLE MAP IS THE POINT OF PER-MAPPING ACCESS.** Access is a property
-// of the MAPPING, not of the region (`MemoryRight` has no R/W/X pair on
-// purpose), so one region can be installed read-write here and read-only there.
-// On a machine with no translation both rows name the same addresses and the
-// hardware's own matching rule decides which one answers — which is why this
-// case asserts that both INSTALL and that a read still works, and deliberately
-// does not write again afterwards. What would be owed on a translating machine
-// — two virtual placements, aliasing bookkeeping — is owed here to nobody.
+// The double map shows per-mapping access. Access is a property of the mapping,
+// not of the region (`MemoryRight` has no R/W/X pair on purpose), so one region
+// can be installed read-write here and read-only there. On a machine with no
+// translation both rows name the same addresses and the hardware's own matching
+// rule decides which one answers; on a translating machine the second row
+// lands at a second virtual address. Either way this case asserts that both
+// install and that a read at `base` still works, and deliberately does not
+// write again afterwards.
 
 import sos.{System, Process, Memory, Mapping, MapAccess, SosStatus}
 
@@ -80,9 +78,9 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // **THE MAP.** `proc` is this process's own handle, so root is mapping into
-    // ITSELF — which spends `ProcessRight.Map` on that handle and
-    // `MemoryRight.Map` on the region, two rights on two objects.
+    // The map. `proc` is this process's own handle, so root is mapping into
+    // itself, which spends `ProcessRight.Map` on that handle and
+    // `MemoryRight.Map` on the region: two rights on two objects.
     let _rw_map = try proc.map(memory: &chunk, access: RW) catch {
         print("SOS mapbasics: map failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -92,10 +90,9 @@ func _start(boot_handle: UInt) {
     poke(base, 0x5A)
     print("SOS mapbasics: wrote 0x5a read {}\n", peek(base) as Int)
 
-    // **THE DOUBLE MAP.** The same region, a second Mapping, read-only. Nothing
-    // refuses it and nothing has to: two rows over one range on a
-    // no-translation machine are two rows, and the region is not consumed by
-    // being installed.
+    // The double map. The same region, a second Mapping, read-only. Nothing
+    // refuses it and nothing has to: two rows over one region are two rows,
+    // and the region is not consumed by being installed.
     let _ro_map = try proc.map(memory: &chunk, access: RO) catch {
         print("SOS mapbasics: double map failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)

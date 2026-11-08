@@ -1,41 +1,37 @@
-// SOS M4 unit 3: AN ATTACHMENT FLAGS WORD OUTSIDE ITS DOMAIN (sawos design 15;
-// spec §5.7's faults ruling).
+// An attachment flags word outside its domain faults the process (spec §5.7).
 //
-// **`WaiterOp.Add` GREW A THIRD ARGUMENT AND PUBLISHED EXACTLY TWO BITS**
-// (`designs/010` rulings 9(b) and 11(c)): bit 0 detaches at delivery, bit 1
-// releases the caller's entry into the attachment's keeping. A word carrying any
-// other bit names a behaviour the kernel has no reading of, and the set is
-// published — so it is a mistake the caller could have checked, which design
-// 178's faults ruling puts outside the status enum entirely.
+// `WaiterOp.Add` takes a flags word with exactly two published bits: bit 0
+// detaches at delivery, bit 1 releases the caller's entry into the attachment's
+// keeping. A word carrying any other bit names a behaviour the kernel has no
+// reading of. The set is published, so this is a mistake the caller could have
+// checked, which the faults rule (spec §5.7) puts outside the status enum
+// entirely. Expected outcome:
 //
 //   SOS badmode: asking for flags 4     one bit above the published set
 //   SOS: process fault: argument outside its domain
 //
-// **IT REACHES THE C ALTITUDE, AND THAT IS THE FINDING RATHER THAN THE
-// WORKAROUND.** The typed surface CANNOT SPELL THIS: `AttachMode` has two cases
-// and `give` is a verb, so the four legal combinations are the only things a Saw
-// caller can ask for and an invalid mode is a compile-time impossibility. That
-// is the typed layer working exactly as `pipe-dead-claim`'s docstring describes
-// its own reach downward — the kernel's check is still real underneath, and this
-// is the altitude at which a raw word legitimately exists to test it.
+// The test works at the C altitude because the typed surface cannot spell this:
+// `AttachMode` has two cases and `give` is a verb, so the four legal
+// combinations are the only things a Saw caller can ask for and an invalid mode
+// is a compile-time impossibility. The kernel's check is still real
+// underneath, and the C altitude, where a raw word can be passed, is where to
+// test it.
 //
-// The waitable is an EVENT and not a pipe, deliberately: the flags check runs in
-// `waiter_add` BEFORE the handle is resolved to a kind, so it is kind-blind by
-// construction and the cheapest waitable is the honest one to prove it with.
+// The waitable is an event, not a pipe, deliberately: the flags check runs in
+// `waiter_add` before the handle is resolved to a kind, so it is kind-blind and
+// the cheapest waitable is enough to prove it.
 
 import sos.{System, sos_system_process_self, sos_process_event_create,
             sos_process_waiter_create, sos_waiter_add}
 
 static EXIT_FAILED: UInt = 1
 
-/// The status word a successful raw op answers with (`SosStatus.Ok`). Spelled as
-/// a number because this file works at the C altitude, where a status is one.
-/// **KEEP EVERY RIGHT** — the mask `ProcessOp.Give` and `SystemOp.ProcessSelf`
-/// grew in M4 unit 4 (sawos design 18). All-ones is what the no-argument
-/// spelling meant before it existed; spelled as a number because this file works
-/// at the C altitude, where a rights mask is one.
+/// The rights mask `ProcessOp.Give` and `SystemOp.ProcessSelf` take; all-ones
+/// keeps every right. A number because this file works at the C altitude.
 static KEEP_ALL: UInt = 0xFFFF_FFFF
 
+/// The status word a successful raw op answers with (`SosStatus.Ok`), as a
+/// number for the same reason.
 static STATUS_OK: UInt = 0
 
 /// `EventMode.Or`, as the wire value — the floor's documented difference in
@@ -44,10 +40,9 @@ static MODE_OR: UInt = 0
 
 static KEY: UInt = 71
 
-/// **ONE BIT ABOVE THE PUBLISHED SET.** `WAITER_ADD_ONESHOT` is bit 0 and
+/// One bit above the published set: `WAITER_ADD_ONESHOT` is bit 0 and
 /// `WAITER_ADD_CONSUMING` is bit 1, so bit 2 is the first word the kernel has no
-/// reading of. Named rather than written as a bare literal, and written as a
-/// shift because a flag value is a bit position (the Aug-17 style ruling).
+/// reading of. Written as a shift because a flag value is a bit position.
 static BAD_FLAGS: UInt = 1 << 2
 
 /// This process's own Process handle, or `0` — which names nothing.

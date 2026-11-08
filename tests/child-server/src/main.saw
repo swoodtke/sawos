@@ -1,27 +1,24 @@
-// SOS CHILD: A SERVER THAT PARKS (sawos design 15, M4 unit 3; spec §2.1, §2.2,
-// §12).
+// Child server that parks (spec §2.1, §2.2, §12).
 //
-// It bootstraps exactly as every other child does — a masked System handle in
-// its first argument register, its own Process object derived from it, its boot
-// set drained from there — and the ONE thing the set carries is a `PipeOutlet`:
-// the SERVER end of a connection its launcher created and wired to itself.
+// It bootstraps like every other child (a masked System handle in its first
+// argument register, its own Process object derived from it, its boot set
+// drained from there). The set carries one thing: a `PipeOutlet`, the server
+// end of a connection its launcher created and wired to itself.
 //
-// **IT BLOCKS, AND THAT IS THE WHOLE POINT.** `child-post` polled its end with a
-// bounded retry loop because unit 1 had nothing to park on; this one attaches
-// the outlet to a Waiter of its own and WAITS. Its thread is `Blocked` until the
-// launcher's message is staged, which means the launcher's `post` is what wakes
-// it — spec §2.2's readable arm, proved across a process boundary and through
-// the kernel's own notify path rather than through a timer.
+// It blocks, and that is the point. It does not poll: it attaches the outlet to
+// a Waiter of its own and waits. Its thread is `Blocked` until the launcher's
+// message is staged, so the launcher's `post` is what wakes it: §2.2's readable
+// arm, proved across a process boundary and through the kernel's own notify
+// path rather than through a timer.
 //
-// **AND ITS ANSWER IS WHAT UNPARKS THE LAUNCHER**, whose composed `send` is
-// parked on the claim at the same moment. So the two halves of one round trip
-// are two blocked threads in two processes, and each wakes the other exactly
-// once: the transcript's ordering is the proof, since a poll anywhere in the
-// chain would have produced the same bytes with none of the parking.
+// Its answer is what unparks the launcher, whose composed `send` is parked on
+// the claim at the same moment. The two halves of one round trip are two
+// blocked threads in two processes, and each wakes the other exactly once. The
+// transcript's ordering is the proof: a poll anywhere in the chain would
+// produce the same bytes with none of the parking.
 //
 // The reply is `PONG` in ASCII, and the launcher asserts all four bytes: a
-// status alone would not have shown that the record's body region carried the
-// data.
+// status alone would not show that the record's body region carried the data.
 
 import sos.{System, Process, PipeOutlet, PipeRequest, Waiter, WaitResult,
             WaitPayload, OutletLevel, AttachMode, BootHandle, BootHandleKind,
@@ -34,9 +31,9 @@ static EXIT_NO_OUTLET: UInt = 96
 /// The reply's length, and the exit code that says how many bytes went.
 static PAYLOAD_LEN: UInt = 4
 
-/// **HOW MANY MESSAGES THIS CHILD ANSWERS** (sawos design 17). Two, because its
-/// launcher does the same exchange twice — once as the composition written out
-/// of the primitives, once as the fused `send` — and measures both.
+/// How many messages this child answers. Two, because its launcher does the
+/// same exchange twice, once as the composition written out of the primitives
+/// and once as the fused `send`, and measures both.
 static ROUNDS: Int = 2
 
 static KEY: UInt = 1
@@ -85,31 +82,24 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // THE EXIT CODE IS THE PAYLOAD'S LENGTH, so the kernel's account of this
+    // The exit code is the payload's length, so the kernel's account of this
     // process and the launcher's reading of the reply say the same number from
     // the two sides of the boundary.
     let _ = proc.exit(PAYLOAD_LEN)
 }
 
-/// **PARK, TAKE, ANSWER — TWICE** (the second turn is sawos design 17's).
+/// Park, take, answer, twice.
 ///
-/// The attach is PERSISTENT, which is what a server loop wants and what unit
-/// 5's driver-as-service will keep: a `OneShot` attachment would detach at the
-/// first delivery and the second wait would park on an empty Waiter for ever,
-/// which is the footgun `sos.waiter`'s own docstring states.
+/// The attach is persistent, which is what a server loop wants: a `OneShot`
+/// attachment would detach at the first delivery and the second wait would
+/// park on an empty Waiter forever (see `sos.waiter`).
 ///
-/// **WHY TWO AND NOT ONE.** M4 unit 3.5 gave this connection's client a SECOND
-/// spelling of the same exchange — the fused `PipeInlet.send`, one trap where
-/// the composition is three — and the launcher measures both. So the same
-/// server answers the same message twice, once for each spelling, which is what
-/// makes the two trap counts comparable: nothing about the SERVER differs
-/// between them.
+/// It answers twice because the launcher measures two spellings of the same
+/// exchange, the composition (three traps) and the fused `PipeInlet.send` (one
+/// trap). The same server answers the same message once for each, so the two
+/// trap counts are comparable: nothing about the server differs between them.
 ///
-/// **IT SAYS `replied` AFTER THE FIRST TURN AND NOTHING AFTER THE SECOND**, so
-/// this child's line lands exactly where it always did in the transcript. The
-/// launcher's own rows are what moved: root's report of the first round now
-/// precedes the child's death instead of following it, because the child no
-/// longer DIES at the first reply.
+/// It prints `replied` after the first turn and nothing after the second.
 func serve(outlet: &PipeOutlet, waiter: &Waiter) -> Result<Void, SosStatus> {
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
@@ -122,7 +112,7 @@ func serve(outlet: &PipeOutlet, waiter: &Waiter) -> Result<Void, SosStatus> {
 
     var served: Int = 0
     while served < ROUNDS {
-        // THIS BLOCKS. Nothing else in this process is runnable, so the kernel
+        // This blocks. Nothing else in this process is runnable, so the kernel
         // has to find work elsewhere and the launcher's message is what comes
         // back to it.
         let woke = try waiter.wait()
@@ -136,12 +126,9 @@ func serve(outlet: &PipeOutlet, waiter: &Waiter) -> Result<Void, SosStatus> {
         let obligation = move request
         try (move obligation).reply(body: &msg, len: PAYLOAD_LEN)
         served = served + 1
-        // **THE ONE LINE THIS CHILD PRINTS, AND IT GOES OUT AFTER THE FIRST
-        // TURN** so that its position in the transcript is exactly what it was
-        // when this child served one message. It is freestanding `print` rather
-        // than `System.debug_print` — `serve` holds no System handle, and the
-        // swap is worth 720 bytes of riscv32 image, which is design 16 finding
-        // 1's print-seam observation showing up as SIZE rather than as traps.
+        // The one line this child prints, after the first turn. It is
+        // freestanding `print` rather than `System.debug_print` because
+        // `serve` holds no System handle.
         if served == 1 {
             print("SOS childserver: replied\n")
         }

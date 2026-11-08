@@ -1,38 +1,31 @@
-// SOS CHILD: THE POLICY CAP IS REACHED BEFORE THE HARDWARE'S (sawos design 7
-// D-3; sawlang#232 agenda item 8).
+// Test child: the policy quota is reached before the hardware's row budget.
 //
-// **AGENDA ITEM 8's SENTENCE, FROM THE SIDE THAT CAN SEE IT.** The ruled
-// sentence — *a `map()` meeting the physical wall with quota headroom left is a
-// kernel bug to assert against* — is written in the kernel as a `fatal`, and a
-// `fatal` is by construction a thing no passing run ever shows. This program is
-// the other half of the same claim, the half a transcript can carry: it maps
-// until it is refused, and the refusal it meets is POLICY's.
+// A `map()` that meets the physical wall with quota headroom left is a kernel
+// bug, which the kernel asserts with a `fatal` that no passing run shows. This
+// program is the half a transcript can carry: it maps until it is refused, and
+// the refusal is the quota's.
 //
 //   SOS childmapwall: maps=2 quota=1
 //
-// **A CLEAN RUN IS THE PROOF, and that is worth saying plainly.** If the order
-// were the other way round, this child's third map would have met the row
-// budget while its ledger still had room — and the machine would have STOPPED
-// with `SOS: kernel bug:` instead of printing anything below. So the line above
-// existing at all is the ordering, and `quota=1` is which refusal it was.
+// A clean run is the proof. With the order reversed, the third map would meet
+// the row budget while the ledger still had room, and the machine would stop
+// with `SOS: kernel bug:` instead of printing the line above. The line existing
+// at all is the ordering; `quota=1` is which refusal it was.
 //
-// **THE NUMBERS ARE THE SAME ON BOTH MACHINES**, which is the reason this is a
-// child rather than root. A child's mapping allowance is
-// `DEFAULT_QUOTA_MAPPINGS`, clamped at install time to the rows its own domain
-// has left after its image — two on both profiles, since a two-segment image
-// plus its stack spends three of riscv32's eight rows and three of arm64's
-// nine, leaving five and six. Root's allowance IS its free row count, which
-// differs per profile, so a root-side version of this case would print a
-// different number on each machine.
+// The numbers are the same on both machines, which is why this is a child
+// rather than root. A child's mapping allowance is `DEFAULT_QUOTA_MAPPINGS`,
+// clamped at install time to the rows its own domain has left after its image.
+// Those leave at least the default on both profiles, so the clamp does not
+// bind. Root's allowance is its free row count, which differs per profile, so a
+// root-side version would print a different number on each machine.
 //
-// **EACH MAPPING OBJECT IS DROPPED AND EACH ROW STAYS**, which is deliberate
-// and is what makes this a ledger test rather than a slab test. `case Ok(_)`
-// releases the Mapping the kernel just handed back, so its SLOT returns
-// immediately (design 7 D-2) — and the grant row it installed does not, because
-// a Mapping owns its row and not the reverse. The mapping quota counts ROWS, so
-// the charge stays exactly as long as the row does, and the third map is
-// refused even though the Mapping slab is untouched. A ledger that counted
-// OBJECTS would have let this loop run forever.
+// Each Mapping object is dropped and each row stays, which makes this a ledger
+// test rather than a slab test. `case Ok(_)` releases the Mapping the kernel
+// handed back, so its slot returns immediately, but the grant row it installed
+// does not (a Mapping owns its row, not the reverse). The quota counts rows, so
+// the charge stays as long as the row does and the third map is refused even
+// though the Mapping slab is untouched. A ledger that counted objects would let
+// the loop run forever.
 
 import sos.{System, Process, Memory, Mapping, MapAccess, SosStatus}
 
@@ -40,9 +33,9 @@ import sos.{System, Process, Memory, Mapping, MapAccess, SosStatus}
 static RW: UInt32 = MapAccess.Read | MapAccess.Write
 
 /// More rounds than the allowance, so the loop is stopped by the kernel rather
-/// than by its own counter — and fewer than the free rows on either profile, so
-/// a bug that let every round through would still not reach the wall and would
-/// present as a wrong NUMBER rather than as a kernel stop.
+/// than by its own counter, and fewer than the free rows on either profile, so
+/// a bug that let every round through would not reach the wall and would show
+/// as a wrong number rather than as a kernel stop.
 static ROUNDS: Int = 4
 
 /// What it ends with when the kernel's answers were not the shape this case
@@ -56,7 +49,7 @@ func flag(b: Bool) -> UInt {
     if b { YES } else { NO }
 }
 
-/// Was this refusal the POLICY one? Matched by NAME rather than by number, so
+/// Was this refusal the policy one? Matched by name rather than by number, so
 /// the claim survives a renumbering of the wire table.
 func is_quota(status: SosStatus) -> Bool {
     match status {
@@ -74,9 +67,9 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // ONE RECORD: the region its launcher gave it. The tag is the launcher's
-    // config and this program does not read it — the drain hands records back
-    // in give order and there is only one.
+    // One record: the region its launcher gave it. The tag is the launcher's
+    // config and this program does not read it; the drain hands records back in
+    // give order and there is only one.
     var record = try proc.boot_handle_next() catch {
         print("SOS childmapwall: no region: {}\n", error)
         let _ = proc.exit(EXIT_MISMATCH)
@@ -88,10 +81,10 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // **THE SAME REGION, MAPPED INTO ITSELF AGAIN AND AGAIN.** Double-mapping
-    // is allowed (design 6 D-3, agenda item 7) — two rows, two Mappings, no
-    // aliasing bookkeeping owed on a machine that does not translate — so this
-    // spends rows without needing a second region to spend them on.
+    // The same region, mapped into itself again and again. Double-mapping is
+    // allowed (two rows, two Mappings, no aliasing bookkeeping owed on a
+    // machine that does not translate), so this spends rows without needing a
+    // second region.
     var maps: UInt = 0
     var quota = false
     var other = false
@@ -116,6 +109,6 @@ func _start(boot_handle: UInt) {
         let _ = proc.exit(EXIT_MISMATCH)
     }
     // The exit code is the map count, so the launcher reads the same fact
-    // through the §8 status word that the console line states.
+    // through the spec.md §8 status word that the console line states.
     let _ = proc.exit(maps)
 }

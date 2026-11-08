@@ -1,33 +1,32 @@
-// SOS M3: A WAIT DELIVERY TAKES THE EVENT'S WORD (ruled Aug 17, user; spec
-// §2.2, §2.4).
+// A wait delivery takes the event's word (spec §2.2, §2.4).
 //
-// Nothing here parks — every wait finds something already ready — which is the
-// same trick `event-basics` uses and for the same reason: a regression that
-// parked would park the only thread in the system, and the kernel reports that
-// as the deadlock it is, in microseconds rather than at the harness timeout.
-// The parking half of the ruling is `event-consume-wake` beside this case.
+// Nothing here parks; every wait finds something already ready. This is the
+// trick `event-basics` uses, for the same reason: a regression that parked
+// would park the only thread in the system, and the kernel reports that as the
+// deadlock it is, at once rather than at the harness timeout. The
+// parking half of the behaviour is `event-consume-wake`.
 //
 // Three lines, three separate sentences:
 //
-//   or key=11 at-wait=3 after=0       <- TWO SIGNALS, ONE RECORD. 1 then 2 land
+//   or key=11 at-wait=3 after=0       <- two signals, one record. 1 then 2 land
 //                                        with nobody waiting, and the wait that
-//                                        follows carries the MERGED word. Had
+//                                        follows carries the merged word. Had
 //                                        the delivery been per signal, this
 //                                        would read 1.
-//   newbits key=11 at-wait=8 after=0  <- a signal AFTER the take is answered
-//                                        with ONLY the new bits: 8, not 11. The
+//   newbits key=11 at-wait=8 after=0  <- a signal after the take is answered
+//                                        with only the new bits: 8, not 11. The
 //                                        object was emptied, so the old bits
 //                                        cannot come back.
 //   sum key=22 at-wait=3 after=0      <- the same, in the counting mode: three
 //                                        signals of one make a record of three,
 //                                        and the count restarts from zero.
 //
-// `after` IS THE `receive` IMMEDIATELY FOLLOWING EACH WAIT, and it reads zero
-// every time. That is the whole ruling in one column: `receive` is the
-// NON-BLOCKING POLL and the wait record is the blocking one, and a value goes
+// `after` is the `receive` immediately following each wait, and it reads zero
+// every time. That is the whole behaviour in one column: `receive` is the
+// non-blocking poll and the wait record is the blocking one, and a value goes
 // through exactly one of them.
 //
-// The zeroes are not a broken `receive` — `event-basics`'s `detached` line has
+// The zeroes are not a broken `receive`: `event-basics`'s `detached` line has
 // the same call answering a real number when no wait took it first.
 
 import sos.{System, Process, Event, EventMode, Waiter, WaitResult, WaitPayload}
@@ -50,16 +49,17 @@ static NO_VALUE: UInt = 0xDEAD
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
-/// What is LEFT in the event after a wait took its word. Zero everywhere in
+/// What is left in the event after a wait took its word. Zero everywhere in
 /// this file, which is the claim.
 func left(e: &Event) -> UInt {
     try e.receive() catch { NO_VALUE }
 }
 
-/// The word the delivery TOOK, out of the record the kernel copied into this
-/// process's memory. A `match` rather than a field access because the payload is
-/// per-kind by construction (§2.2): this program attaches nothing but Events, so
-/// any other answer is a kernel reporting an attachment it was never given.
+/// The word the delivery took, out of the record the kernel copied into this
+/// process's memory. A `match` rather than a field access because the payload
+/// is per-kind by construction (§2.2): this program attaches nothing but
+/// Events, so any other answer is a kernel reporting an attachment it was never
+/// given.
 func taken(r: &WaitResult) -> UInt {
     match r.what {
         case Event(word) -> word,
@@ -92,15 +92,15 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // BOTH ATTACHED UP FRONT, and the wait set never changes after this. Each
-    // wait below therefore has to pick the ready one out of two, which is what
-    // makes the key in every line evidence rather than decoration.
+    // Both attached up front, and the wait set never changes after this. Each
+    // wait below therefore has to pick the ready one out of two, which makes
+    // the key in every line evidence rather than decoration.
     let _ = waiter.add(&flags, KEY_FLAGS)
     let _ = waiter.add(&counter, KEY_COUNT)
 
-    // ---- TWO SIGNALS COALESCE INTO ONE RECORD ------------------------------
-    // Both land with nobody parked, so nothing is delivered as they arrive; the
-    // wait that follows is the first take, and it takes the OR of the two.
+    // Two signals coalesce into one record. Both land with nobody parked, so
+    // nothing is delivered as they arrive; the wait that follows is the first
+    // take, and it takes the OR of the two.
     let _ = flags.signal(BIT_ONE)
     let _ = flags.signal(BIT_TWO)
     let merged = try waiter.wait() catch {
@@ -112,11 +112,11 @@ func _start(boot_handle: UInt) {
     print("SOS consume: or key={} at-wait={} after={}\n",
           merged.key, taken(&merged), after_merged)
 
-    // ---- A SIGNAL AFTER THE TAKE CARRIES ONLY THE NEW BITS -----------------
-    // The event was emptied by the wait above, so this one re-arms readiness
-    // from zero: 8, not 1|2|8. A delivery that had left the old word behind
-    // would report 11 here, and the difference between those two numbers is the
-    // whole of what "the record is the value, not a copy of it" means.
+    // A signal after the take carries only the new bits. The event was emptied
+    // by the wait above, so this one re-arms readiness from zero: 8, not
+    // 1|2|8. A delivery that had left the old word behind would report 11 here,
+    // and the difference between those two numbers is the whole of what "the
+    // record is the value, not a copy of it" means.
     let _ = flags.signal(BIT_EIGHT)
     let fresh = try waiter.wait() catch {
         print("SOS consume: newbits wait failed: {}\n", error)
@@ -127,10 +127,10 @@ func _start(boot_handle: UInt) {
     print("SOS consume: newbits key={} at-wait={} after={}\n",
           fresh.key, taken(&fresh), after_fresh)
 
-    // ---- THE SAME, IN THE COUNTING MODE ------------------------------------
-    // §2.4's two accumulation modes are one field to the wait machinery, so a
-    // take that worked only for flag sets would be a per-mode bug — which this
-    // line is here to rule out. Three signals of one, one record of three.
+    // The same, in the counting mode. §2.4's two accumulation modes are one
+    // field to the wait machinery, so a take that worked only for flag sets
+    // would be a per-mode bug, which this line rules out. Three signals of one,
+    // one record of three.
     var n = 0
     while n < COUNT_TIMES {
         let _ = counter.signal(BIT_ONE)
@@ -147,8 +147,6 @@ func _start(boot_handle: UInt) {
 
     let _ = system.debug_print("SOS consume: done\n")
 
-    // Process exit, so the teardown line reports what this process owned: six
-    // handles — the three it was given (System, Process, its own Thread) and the
-    // three it made — one thread, two events and one waiter.
+    // Process exit, so the teardown line reports what this process owned.
     let _ = proc.exit(EXIT_OK)
 }

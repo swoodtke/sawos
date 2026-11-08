@@ -1,51 +1,44 @@
-// SOS CHILD: A PROCESS THAT DIES WITH A THREAD PARKED IN A FUSED CALL (sawos
-// design 17 D-2; `designs/010` ruling 4's rider names the arm this exists to
-// reach).
+// Test child: a process that dies with a thread parked in a fused call.
 //
-// **A FUSED CALL'S CLAIM IS A REFERENCE NO HANDLE TABLE HOLDS.** That is the
-// whole saving of the fused path — no `PipeReply` is minted, so a blocking
-// client spends no table row — and it is exactly why `end_process` needed a new
-// arm: the teardown's close-all walks HANDLES, and there is no handle here to
-// walk. Something else has to abandon the claim, or the ring slot is pinned for
-// ever and `PIPE_CALLER` is left naming a thread slot about to be recycled.
+// A fused call's claim is a reference no handle table holds. That is the saving
+// of the fused path (no `PipeReply` is minted, so a blocking client spends no
+// table row), and it is why `end_process` needs an arm for it: the teardown's
+// close-all walks handles, and there is none here. Something else must abandon
+// the claim, or the ring slot is pinned forever and `Exchange.caller` names a
+// thread slot about to be recycled.
 //
-// **TWO THREADS, ONE CONNECTION, AND THE SHAPE IS SYMMETRIC ON PURPOSE.** Both
-// threads do the same thing — take an inlet out of the boot set, make ONE fused
-// call, and END THE WHOLE PROCESS if it is answered — so the launcher does not
-// have to know, and cannot get wrong, which of the two it is talking to. It
-// answers ONE of the two messages; that thread exits the process; the other is
-// still parked when the teardown runs.
+// Two threads, one connection, symmetric on purpose. Both take an inlet out of
+// the boot set, make one fused call, and end the whole process if it is
+// answered, so the launcher need not know which of the two it is talking to.
+// It answers one of the two messages; that thread exits the process; the other
+// is still parked when the teardown runs.
 //
-// The launcher's later `reply` to the second obligation is what proves the arm:
-// `Err(PeerClosed)`, because the claim column reached zero in the teardown,
-// which is the ratified abandoned-by-client answer with no new vocabulary
-// anywhere.
+// The launcher's later `reply` to the second obligation proves the arm: it
+// gets `Err(PeerClosed)`, because the claim column reached zero in the
+// teardown.
 //
-// # HOW BOTH THREADS REACH THE PIPE WITHOUT PASSING A HANDLE
+// # How both threads reach the pipe without passing a handle
 //
-// The `sos` module offers no way to take a handle WORD out of a typed wrapper
-// (the facade's own guarantee), so a thread cannot be handed one by a sibling.
-// It does not need to be: the launcher MINTS a second inlet onto the same
-// connection and gives BOTH, so the boot set holds two client ends and each
-// thread drains one for itself. A sibling is a second NAME on one connection —
-// design 13 D-1's `dup` precedent — which is precisely what makes the two calls
-// two exchanges on one ring.
+// The `sos` module offers no way to take a handle word out of a typed wrapper,
+// so a thread cannot be handed one by a sibling. The launcher instead mints a
+// second inlet onto the same connection and gives both, so the boot set holds
+// two client ends and each thread drains one. A sibling is a second name on one
+// connection, which makes the two calls two exchanges on one ring.
 //
 // Every thread of this image enters at `_start`, because Saw cannot name the
-// address of a function (DF-178c), so the entry works out which thread it is
-// the way `thread-basics` does: the INITIAL thread is the one that has not yet
-// parked the boot handle.
+// address of a function, so the entry works out which thread it is the way
+// `thread-basics` does: the initial thread is the one that has not yet parked
+// the boot handle.
 
 import sos.{System, Process, PIPE_BODY_BYTES}
 
-/// The boot handle, parked by the initial thread for the sibling — and the
-/// "have I run yet" witness. Handle 0 names nothing (the object table reserves
-/// zero), so a parked boot handle is never 0 and an unparked slot is never a
-/// handle.
+/// The boot handle, parked by the initial thread for the sibling, and the "have
+/// I run yet" witness. Handle 0 names nothing (the object table reserves zero),
+/// so a parked boot handle is never 0 and an unparked slot is never a handle.
 unsafe static var BOOT_HANDLE: UInt = 0
 
-/// The sibling's stack, in this process's own zero-init data (spec §8: thread
-/// stacks are USERSPACE memory passed to thread creation).
+/// The sibling's stack, in this process's own zero-init data (spec.md §8:
+/// thread stacks are userspace memory passed to thread creation).
 static STACK_WORDS: Int = 512
 unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
 
@@ -60,8 +53,8 @@ static ROLE_SIBLING: UInt = 2
 /// One byte, which is a message rather than an absence.
 static PAYLOAD_LEN: UInt = 1
 
-/// The call was answered, so this thread ends the process — with the OTHER
-/// thread still parked in its own call, which is the whole point.
+/// The call was answered, so this thread ends the process, with the other
+/// thread still parked in its own call.
 static EXIT_ANSWERED: UInt = 61
 
 /// Something went wrong before the call could be made, or the call itself was
@@ -96,7 +89,7 @@ func _start(arg: UInt) {
 /// The initial thread: park the seed, make the sibling, start it, and then do
 /// exactly what the sibling does.
 ///
-/// **THE SIBLING IS STARTED BEFORE THIS THREAD CALLS**, and it does not matter
+/// The sibling is started before this thread calls, and it does not matter
 /// which of the two reaches the pipe first: they are interchangeable, so
 /// whichever message the launcher answers is the one whose thread exits.
 func initial(boot_handle: UInt) {
@@ -122,12 +115,12 @@ func sibling() {
     call_and_exit(&proc)
 }
 
-/// **ONE FUSED CALL, AND THE WHOLE PROCESS ENDS IF IT IS ANSWERED.**
+/// One fused call; the whole process ends if it is answered.
 ///
-/// `exit` is `ProcessOp.Exit`, not `ThreadOp.Exit`: this ends the PROCESS, so
-/// the sibling that is still parked inside its own `send` goes down with it —
-/// which is the state `end_process`'s orphaned-claim arm exists for and the only
-/// way to reach it, since nothing in SOS can kill a thread from outside.
+/// `exit` is `ProcessOp.Exit`, not `ThreadOp.Exit`: this ends the process, so
+/// the sibling still parked inside its own `send` goes down with it. That is
+/// the state `end_process`'s orphaned-claim arm exists for and the only way to
+/// reach it, since nothing in SOS can kill a thread from outside.
 func call_and_exit(proc: &Process) {
     var record = try proc.boot_handle_next() catch {
         let _ = proc.exit(EXIT_REFUSED)
@@ -141,7 +134,7 @@ func call_and_exit(proc: &Process) {
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     msg[0] = 1
 
-    // THIS PARKS. Exactly one of the two threads is ever woken from it.
+    // This parks. Exactly one of the two threads is ever woken from it.
     let _ = try inlet.send(body: &msg, len: PAYLOAD_LEN) catch {
         let _ = proc.exit(EXIT_REFUSED)
         return
