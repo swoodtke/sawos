@@ -946,7 +946,7 @@ itself; or a launcher that keeps the window maps it into the driver
 windows in their images (`allow_device: false`). The image-declared device grant
 (`SegFlag.Device` and the boot loader's `allow_device: true` door) still exists
 but is dormant: no image in this tree uses it, and its emitter is sawlang-side
-(`blade/sosimg.saw`), so deleting the flag is a toolchain-pin event (§11).
+(`blade/src/sosimg.saw`), so deleting the flag is a toolchain-pin event (§11).
 
 **A DMA-capable device's driver is inside the TCB.** On the isolated tiers, a
 `map` bounds what a driver's CPU may reach. It bounds nothing a bus master may
@@ -1038,15 +1038,15 @@ timeslice has no history to be faithful to and an interval does.
 The Process object: an AddressSpace, a handle table and threads. Its
 lifecycle is §8 and its boot set is §12.
 
-**Ops**, each on its own `ProcessRight`: `ThreadCreate`, `ThreadSelf`, `Exit`,
-`GetStatus` (on `Wait`), the factory ops `EventCreate`, `WaiterCreate`,
-`InterruptBind` and `PipeCreate`, `Start`, `BootHandleNext` (on `BootHandles`),
-`Give`, and `Stats`. `ProcessRight.Map` is the target-side right `MemoryOp.Map`
-and `IoMemoryOp.Map` spend (§2.5). Creation is not an op on this object:
-`ProcessCreate` is on System, because a process is a machine-wide resource
-(§12). `Exit` ends the calling process only: through a handle naming another
-process the kernel faults the caller (`NotSelf`). `kill` has no op and no right
-(§8).
+**Ops**, each on its own `ProcessRight`: the factory ops `ThreadCreate`,
+`EventCreate`, `WaiterCreate`, `InterruptBind` and `PipeCreate`, then
+`ThreadSelf`, `Exit`, `GetStatus` (on `Wait`), `Start`, `BootHandleNext` (on
+`BootHandles`), `Give`, and `Stats`. `ProcessRight.Map` is the target-side
+right `MemoryOp.Map` and `IoMemoryOp.Map` spend (§2.5). Creation is not an op
+on this object: `ProcessCreate` is on System, because a process is a
+machine-wide resource (§12). `Exit` ends the calling process only: through a
+handle naming another process the kernel faults the caller (`NotSelf`). `kill`
+has no op and no right (§8).
 
 **The default set.** One Process default set serves all three minters (root's,
 `ProcessSelf`'s and `ProcessCreate`'s), named for its ops throughout:
@@ -1598,6 +1598,10 @@ stored in the process slot (`ProcessSlot.quota_used` / `quota_limit`). The
     enforced for `send_with`, `reply_with` and `reply_wait_with`: they empty
     the handle carrier before reading the status, so on a refusal that took
     nothing the handles stay in the caller's table with no wrapper naming them.
+    For `send_with` the status cannot tell the two cases apart: the kernel
+    answers a fused call `PeerClosed` both when the server end was gone before
+    the message was staged, which took nothing, and when the exchange failed
+    after staging, which took the handles.
   - **The funnel has a second spelling, for receivers.** Where the op consumes
     the handle it is invoked through, the sysapi method carries `consumes` in
     its effect slot beside `&var self`, and the caller spells
@@ -1792,9 +1796,11 @@ offending process, so `BadHandle`, `BadOp` and `AccessDenied` are `FaultReason`
 tags rather than statuses, keeping their numbers — `SosStatus` leaves 1–3
 unused. The kernel stays up, reports, and runs the teardown (§8). The rule is
 uniform because it has to be: an unbound handle names no kind, so there is no op
-table to ask which rule applies. What is left in `SosStatus` is what a caller
-could not have known — `NoResource` (a full slab), `QuotaExceeded` (§2.9),
-`BadImage` (§8), `Drained` (§12), `Revoked` (§2.2), `PeerClosed` and
+table to ask which rule applies. Not yet enforced through another process's
+handle: a caller error in `ThreadCreate`, `EventCreate` or `InterruptBind`
+faults the named process instead (§11). What is left in `SosStatus` is what a
+caller could not have known — `NoResource` (a full slab), `QuotaExceeded`
+(§2.9), `BadImage` (§8), `Drained` (§12), `Revoked` (§2.2), `PeerClosed` and
 `WouldBlock` (§2.1) — with `Unknown` the userspace mapping artifact. A dynamic
 resource condition answers with a status; broken code faults.
 
@@ -2693,11 +2699,23 @@ loader parses and reports while no Process slot stores either.
 - The factory ops `ThreadCreate`, `EventCreate`, `WaiterCreate`, `InterruptBind`
   and `PipeCreate` act on the process the handle names, not the caller: through
   another process's handle they mint into that process's table and hand the
-  child-relative word back to the caller. Their behaviour through another
-  process's handle is unspecified until it is ruled.
+  caller words relative to the named process (two, for `PipeCreate`). A caller
+  error on that path faults the named process, not the caller, for
+  `ThreadCreate` (`BadEntry`), `EventCreate` (`BadArg`) and `InterruptBind`
+  (`BadArg`, `LineBound`). The teardown assumes the dying process is the
+  caller, so the caller's running thread is then never scheduled again.
+  `PipeCreate` faults the caller, and `WaiterCreate` has no fault path. Their
+  behaviour through another process's handle is unspecified until it is ruled.
+- `BootHandleNext` and `ThreadSelf` check their right on the Process handle used
+  but act on the caller: through any Process handle, `BootHandleNext` drains
+  the caller's own boot set and `ThreadSelf` names the caller's running thread.
+  So a holder of another process's handle with `BootHandles` can drain its own
+  boot set even when its own Process handle lacks the right. Not yet resolved.
 - `send_with`, `reply_with` and `reply_wait_with` do not yet hand carried
   handles back on a refusal that took nothing: they stay in the caller's table
-  with no wrapper naming them (§2.1, §3).
+  with no wrapper naming them. For `send_with` the kernel's `PeerClosed` does
+  not say whether the message was staged, so the typed tier cannot tell whether
+  the handles came back (§3; §2.1 states the reply half).
 - `sosrt`'s bump arena takes no lock, so under a kernel that preempts (today
   only the preemption harness; §7) two threads of one process allocating at once
   can race (§5c).
@@ -2830,11 +2848,11 @@ critical processes (§2.5).
     launcher a child-relative word (§11 notes the factory ops, which can).
     Resolution consumes the record the tag names — the register is the delivery
     — so the drain never answers with a word the child already holds. The no-tag
-    form, with nothing given, is the sandboxed compute process (sandboxed on the
-    isolated tiers) and is the default; a tag naming no given record is a
-    `BadArg` fault, and "no tag" is a form argument rather than a reserved tag
-    value, because zero is a legitimate tag (root's region ordinals start
-    there).
+    form is the default, and a child started with it and given nothing is the
+    sandboxed compute process (sandboxed on the isolated tiers); a tag naming no
+    given record is a `BadArg` fault, and "no tag" is a form argument rather
+    than a reserved tag value, because zero is a legitimate tag (root's region
+    ordinals start there).
 - **A child bootstraps exactly as root does.** A launcher mints a masked
   sibling of its own System handle (§3's `MINT_OP`) — a keep mask naming
   `Debug | ProcessSelf | ClockGet | Transfer` and nothing else — gives the
