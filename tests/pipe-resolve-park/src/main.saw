@@ -1,37 +1,33 @@
-// SOS M4 unit 4.5: RESOLVE PARKS (sawos design 22; `designs/010` ruling 12(b);
-// spec §2.1).
+// Resolve parks (spec §2.1).
 //
-// **THE WAITER-FREE BLOCKING RECEIVE.** Root posts and then RESOLVES, with no
-// Waiter, no attachment and no poll loop — and the resolve finds the exchange
+// The waiter-free blocking receive. Root posts and then resolves, with no
+// Waiter, no attachment and no poll loop. The resolve finds the exchange
 // pending, so it parks the calling thread on the claim's ready level inside the
-// kernel. A child server takes the message and replies, and that reply is what
-// wakes root, inside its own syscall, with the bytes in its own buffer.
+// kernel. A child server takes the message and replies, and that reply wakes
+// root, inside its own syscall, with the bytes in its own buffer.
 //
-// **REACHING THE END IS THE PROOF.** Through unit 4 a pending resolve answered
-// `WouldBlock` and consumed nothing, so this exact program would have fallen
-// through with no reply and failed its own length check. There is nothing else
-// in root that could have produced the answer: no Waiter exists in this process
-// at all.
+// Reaching the end is the proof. A resolve that answered `WouldBlock` on a
+// pending exchange would return an error and end this program with no reply,
+// and nothing else in root could have produced the answer: no Waiter exists in
+// this process at all.
 //
-// **THE ORDER IS THE SECOND HALF OF IT.** `SOS childserver: replied` comes
-// BEFORE root's row, because root parked with nothing else runnable and the
-// kernel had to go find the child; the child parked on its OUTLET and was woken
-// by root's post; its reply is what woke root. A polling implementation of
-// either half would print the same bytes with none of that interleaving.
+// The order is the second half of it. `SOS childserver: replied` comes before
+// root's row, because root parked with nothing else runnable and the kernel had
+// to go find the child; the child ran, took the message already waiting on its
+// outlet and replied; that reply is what woke root. A polling implementation
+// would print the same bytes with none of that blocking.
 //
-// **AND THE TWO SPELLINGS ARE MEASURED SIDE BY SIDE** (sawos design 16's
-// bracket, `pipe-send-manual`'s own arithmetic). The same exchange, the same
-// server, the same four bytes each way:
+// The two spellings are measured side by side: the same exchange, the same
+// server, the same four bytes each way.
 //
 //   SOS resolvepark: ops resolve=2 fused=1
 //
-// TWO against ONE. `post` + `resolve` is the composition a client writes when it
-// wants a HANDLE on the exchange — one it could have given away, or attached, or
-// dropped as a cancellation — and `PipeInlet.send` is the fused path for a client
-// that wants none of that. Unit 3's `post + attach + wait` was THREE for the same
-// answer, which is what ruling 12(b) took a trap out of.
+// `post` + `resolve` (two) is the composition a client writes when it wants a
+// handle on the exchange, one it could give away, attach, or drop as a
+// cancellation. `PipeInlet.send` (one) is the fused path for a client that
+// wants none of that. Post + attach + wait would be three for the same answer.
 //
-// ONE PHASE PER FUNCTION, on design 14 finding 3's stack ceiling.
+// One phase per function, because of the stack ceiling.
 
 import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, SosStatus,
             SystemRight, PIPE_BODY_BYTES}
@@ -39,7 +35,7 @@ import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, SosStatus,
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
-/// ROOT'S CONFIG, and the whole of the contract with the child. `child-server`
+/// Root's config, and the whole of the contract with the child. `child-server`
 /// expects exactly these words; the kernel supplies no meaning for either.
 static TAG_BOOT: UInt = 7
 static TAG_OUTLET: UInt = 12
@@ -75,10 +71,10 @@ func _start(boot_handle: UInt) {
     let _ = proc.exit(EXIT_OK)
 }
 
-/// **POST, PARK IN THE RESOLVE, WAKE WITH THE ANSWER — and then the same
-/// exchange fused, for the arithmetic.**
+/// Post, park in the resolve, wake with the answer, and then the same exchange
+/// fused, for the arithmetic.
 ///
-/// Root creates the connection, GIVES the server end to a child, and keeps the
+/// Root creates the connection, gives the server end to a child, and keeps the
 /// inlet and nothing else: the only way it can learn anything is from the
 /// child's reply.
 func round_trip(system: &System, proc: &Process) -> Result<Void, SosStatus> {
@@ -105,25 +101,24 @@ func round_trip(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     msg[2] = 78
     msg[3] = 71
 
-    // **THE MEASURED WINDOW OPENS HERE** (sawos design 16). Two calls, nothing
-    // else inside the brackets: every printed byte is an `ecall`, so a window
-    // with a `print` in it would count the prose instead of the composition.
+    // The measured window opens here. Two calls, nothing else inside the
+    // brackets: every printed byte is a syscall, so a window with a `print` in
+    // it would count the prose instead of the composition.
     let before = try proc.stats()
 
-    // 1. POST. The ring is fresh, so it cannot refuse.
+    // 1. Post. The ring is fresh, so it cannot refuse.
     let claim = try inlet.post(body: &msg, len: PING_LEN)
 
-    // 2. RESOLVE. **THIS BLOCKS**, and there is no Waiter anywhere in this
-    //    process to have blocked on: the claim's own ready level is what the
-    //    kernel parks the thread against, and the wake arm that answers it is
-    //    the fused call's, generalized (`designs/010` ruling 12(b)). The move is
-    //    the typed half — the claim is spent on every path this can return
-    //    through, so the binding is dead past this expression.
+    // 2. Resolve. This blocks, and there is no Waiter anywhere in this process
+    //    to have blocked on: the kernel parks the thread against the claim's
+    //    own ready level, and the wake that answers it is the fused call's. The
+    //    move is the typed half: the claim is spent on every path this can
+    //    return through, so the binding is dead past this expression.
     let answer = try (move claim).resolve()
 
-    // **AND CLOSES HERE, WITH ITS OWN TRAP INSIDE THE COUNT.** `ktrap` charges
-    // the syscall column at trap entry, ahead of the dispatch, so this reading
-    // includes the call that took it:
+    // The window closes here, with its own trap inside the count. `ktrap`
+    // charges the syscall column at trap entry, ahead of the dispatch, so this
+    // reading includes the call that took it:
     //
     //     delta = post + resolve + this read = 2 + 1 = 3
     let after = try proc.stats()
@@ -132,10 +127,10 @@ func round_trip(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     print("SOS resolvepark: reply len={} b={},{},{},{}\n", answer.len,
           answer.bytes[0], answer.bytes[1], answer.bytes[2], answer.bytes[3])
 
-    // **THE SAME EXCHANGE THE OTHER WAY.** Same connection, same server, same
-    // four bytes each way — the only thing that differs is the spelling.
-    // `child-server` answers twice for exactly this reason and nothing about the
-    // server side differs between the two turns.
+    // The same exchange the other way. Same connection, same server, same four
+    // bytes each way; only the spelling differs. `child-server` answers twice
+    // for exactly this reason and nothing about the server side differs
+    // between the two turns.
     let fused_before = try proc.stats()
     let fused = try inlet.send(body: &msg, len: PING_LEN)
     let fused_after = try proc.stats()
@@ -144,16 +139,16 @@ func round_trip(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     print("SOS resolvepark: fused reply len={} b={},{},{},{}\n", fused.len,
           fused.bytes[0], fused.bytes[1], fused.bytes[2], fused.bytes[3])
 
-    // **THE COMPANION ROW.** Each delta carries its own closing `stats()` trap,
-    // so subtracting one from each leaves the OPS the caller wrote: post +
-    // resolve against `send`. Two against one, measured by the same process
-    // against the same server in the same boot.
+    // The companion row. Each delta carries its own closing `stats()` trap, so
+    // subtracting one from each leaves the ops the caller wrote: post + resolve
+    // against `send`. Two against one, measured by the same process against the
+    // same server in the same boot.
     //
-    // The fused call also mints NOTHING, which the trap count does not show: the
-    // composition holds a `PipeReply` entry for the length of the exchange and
-    // the fused path holds no table row at all. What the composition buys for
-    // that row is a NAME on the exchange — one it could have given away,
-    // attached, or dropped as §2.1's cancellation.
+    // The fused call also mints nothing, which the trap count does not show:
+    // the composition holds a `PipeReply` entry for the length of the exchange
+    // and the fused path holds no table row at all. What the composition buys
+    // for that row is a name on the exchange, one it could give away, attach,
+    // or drop as §2.1's cancellation.
     print("SOS resolvepark: ops resolve={} fused={}\n",
           (after.syscalls - before.syscalls) - 1,
           (fused_after.syscalls - fused_before.syscalls) - 1)

@@ -1,18 +1,16 @@
-/* SOS M1 unit-A U-mode payload: the happy path (design 140).
+/* U-mode payload: the happy path.
  *
  * Hand-written U-mode code, deliberately tiny and free-standing: it touches no
- * memory at all, so the kernel can grant it ONE PMP region (its own bytes, RX)
- * and nothing else — the sharpest possible statement of the M/U split. Every
- * character reaches the console through a System op; the payload has no UART
- * access and could not print any other way.
+ * memory at all, so the kernel grants it one PMP region (its own bytes, RX) and
+ * nothing else. Every character reaches the console through a System op; the
+ * payload has no UART access.
  *
- * Rides the `.payload` section — the same appended-blob slot the root sosimg
- * uses from unit B on — so it executes in place, with no loader involved.
+ * It rides the `.payload` section, so it executes in place with no loader
+ * involved.
  *
- * Syscall ABI (spec §5.7): a0 = HANDLE, a7 = OP, args a1-a5, `ecall`; returns
- * a0 = status, a1 = value. Every syscall is an object op — the handle in a0 is
- * not decoration, it is the authority. a0 is clobbered by the return, so each
- * call reloads it.
+ * Syscall ABI (spec §5.7): a0 = handle, a7 = op, args a1-a5, `ecall`; returns
+ * a0 = status, a1 = value. Every syscall is an object op; the handle in a0 is
+ * the authority. a0 is clobbered by the return, so each call reloads it.
  */
 
     .equ SYSTEM_HANDLE,     1       /* the boot handle, also arriving in a0 */

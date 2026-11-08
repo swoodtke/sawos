@@ -1,48 +1,41 @@
-// SOS M4 unit 5: DRIVER-AS-SERVICE — THE MONEY SHOT (sawos design 21;
-// `designs/010` ruling 7(a), amended Sep 2 for MULTIPLE CLIENTS).
+// Driver as a service: one process owns the UART and two others read it over
+// a pipe, through a protocol none of them got from the kernel, because the
+// kernel has never heard of a UART.
 //
-// **THE SENTENCE THE WHOLE LADDER WAS FOR.** M2 put a driver in userspace. M3
-// unit 4 made its window a capability, and unit 6 handed that capability to a
-// CHILD. M4 built the connection, the message, the one-shot reply pair, the
-// waitable levels and the fused paths. Here they meet: one process owns the
-// UART and TWO OTHERS read it, over a pipe, through a protocol none of them got
-// from the kernel — because the kernel has never heard of a UART.
+//   root -- inlet --------+
+//                         +-- one connection --> svc-uart-*  -- the device
+//   client -- inlet ------+        (driver)
 //
-//   root ── inlet ────────┐
-//                         ├── one connection ──> svc-uart-*  ── the device
-//   client ── inlet ──────┘        (driver)
+// Root is a client too, at no cost of a process slot. It creates the
+// connection, mints a sibling inlet for the client child, keeps the other, and
+// after launching both children drives the same protocol itself. Sibling
+// inlets are per-client authority (an endpoint keeps `Mint`, the one-shots do
+// not), and each request carries its own reply obligation, so every answer
+// lands at the claim that asked for it with no correlation on the wire.
 //
-// **ROOT IS A CLIENT TOO, AND IT COSTS NO PROCESS SLOT.** It creates the
-// connection, MINTS A SIBLING INLET for the client child, keeps the other, and
-// after launching both children drives the same protocol itself. Sibling inlets
-// are per-client authority — exactly why an endpoint kept `Mint` when the
-// one-shots lost it (ruling 12(c)) — and each request carries its own reply
-// obligation, so every answer lands at the claim that asked for it with no
-// correlation on the wire.
+// # The phases; the order is the protocol's, not the scheduler's
 //
-// # The phases, and why the order is the PROTOCOL's rather than the scheduler's
-//
-// **PHASE A — TWO OUTSTANDING READS, IN A FIXED ORDER.** Root posts its `Read`
-// through its retained inlet BEFORE the client child is started. A post is a
-// completed syscall, and the client's first instruction has not run — so root's
-// request is first in the connection's ring by CONSTRUCTION, not by timing. The
-// ring is FIFO and the driver takes in ring order, so the driver holds root's
-// obligation ahead of the client's. Nothing is racing: the second claim belongs
-// to a process that did not exist when the first was made.
+// Phase A, two outstanding reads in a fixed order. Root posts its `Read`
+// through its retained inlet before the client child is started. A post is a
+// completed syscall and the client's first instruction has not run, so root's
+// request is first in the connection's ring by construction, not by timing.
+// The ring is FIFO and the driver takes in ring order, so the driver holds
+// root's obligation ahead of the client's.
 //
 // Then the harness types. The first byte answers root's claim, the second the
 // client's, and each reply is written into a different exchange in a different
-// process's table. THAT IS THE ROUTING PROOF: root prints the byte it got, the
-// client echoes the byte IT got, and the two are different bytes of one phrase.
+// process's table. That is the routing proof: root prints the byte it got, the
+// client echoes the byte it got, and the two are different bytes of one
+// phrase.
 //
-// **PHASE B — THE CLIENT ECHOES THE REST**, and root is parked on its death, so
+// Phase B, the client echoes the rest, and root is parked on its death, so
 // nothing root does can interleave with it.
 //
-// **PHASE C — ROOT'S OWN ROUND**, after the client is gone: `Mark`, two
-// `Write` TELLs and a `Sync`. The `Sync` is the protocol's ordering barrier —
-// a connection's ring is FIFO, so an answered `Sync` proves every message
-// posted before it has been served — which is how root knows its writes reached
-// the console before it prints a word of its own.
+// Phase C, root's own round after the client is gone: `Mark`, two `Write`
+// tells and a `Sync`. The `Sync` is the protocol's ordering barrier (the ring
+// is FIFO, so an answered `Sync` proves every earlier message has been
+// served), which is how root knows its writes reached the console before it
+// prints a word of its own.
 //
 // # The transcript, read as an order
 //
@@ -51,20 +44,19 @@
 //   SOS uartsvc: read posted            <- root's claim, first in the ring
 //   SOS uartsvc: client started         <- two reads outstanding
 //   Zq7#                                <- the harness's phrase, echoed: the
-//                                          FIRST byte by root through its own
+//                                          first byte by root through its own
 //                                          claim, the rest by the client
 //   SOS uartsvc drv: ...                <- the driver's accounting
 //   SOS uartsvc: root's claim answered byte 90
 //   ...
 //
-// # What each step rules out
+// # What the phrase rules out
 //
-// `Zq7#` after the handover marker can only happen if the give worked, the map
+// `Zq7#` after the handover marker can only appear if the give worked, the map
 // worked, the bind worked, the IRQ path woke a process that is not root, the
 // pipe carried a request across a process boundary, the one-shot reply pair
-// carried the answer back, and the whole thing ran again through a SECOND
-// client's inlet. There is no way to fake it on a machine with no translation
-// and no driver in the kernel.
+// carried the answer back, and the whole thing ran again through a second
+// client's inlet.
 
 import sos.{System, Process, Memory, IoMemory, PipeInlet, PipeOutlet, PipeReply,
             PipeMsg, Waiter, WaitResult, WaitPayload, SystemRight,
@@ -77,7 +69,7 @@ static EXIT_FAILED: UInt = 1
 /// A status no arm of this case can produce honestly.
 static BUG: SosStatus = SosStatus.Revoked
 
-/// ROOT'S CONFIG. The driver expects its window first and its outlet second;
+/// Root's config. The driver expects its window first and its outlet second;
 /// the client expects its inlet as boot record 0. Both are contracts between
 /// this file and those two, and the kernel supplies no meaning for any of them.
 static TAG_DRV_BOOT: UInt = 21
@@ -90,30 +82,28 @@ static TAG_CLI_INLET: UInt = 32
 static KEY_CLIENT: UInt = 71
 static KEY_DRIVER: UInt = 72
 
-/// **THE POLICY, AND IT IS A WHITELIST.** Both children get the same mask:
-/// print, learn their own Process object, read the clock. `Shutdown`,
-/// `ProcessCreate` and `Mint` are absent BY SILENCE — a System right added
-/// tomorrow is denied to every child configured today.
+/// A whitelist. Both children get the same mask: print, learn their own
+/// Process object, read the clock. `Shutdown`, `ProcessCreate` and `Mint` are
+/// absent by silence, so a System right added later is denied to every child.
 ///
 /// `Transfer` is in the mask because it is the bit `give` checks on the thing
-/// being given (`give-boot-drain`'s recorded finding, unchanged).
+/// being given.
 static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
                                | SystemRight.ClockGet | SystemRight.Transfer)
 
-/// **WHAT A CLIENT MAY DO WITH THE END IT IS HANDED**, decided here, once, by a
-/// keep mask. It may POST and it may hand the end on; it may NOT mint a
-/// narrower sibling of its own, because a service's client list is the
-/// service's launcher's business. Attenuation is monotonic, so the absence is
-/// permanent.
+/// What a client may do with the end it is handed, decided once by a keep
+/// mask. It may post and hand the end on; it may not mint a narrower sibling of
+/// its own, because a service's client list is the launcher's business.
+/// Attenuation is monotonic, so the absence is permanent.
 static CLIENT_INLET: UInt32 = (PipeInletRight.Transfer | PipeInletRight.Post)
 
-/// `Exited`(1) << 16 | 61 — `svc-client`'s verdict that every round matched.
+/// `Exited`(1) << 16 | 61: `svc-client`'s verdict that every round matched.
 static CLIENT_STATUS: UInt = 65597
 
 static_assert((1 * 65536) + 61 == 65597,
               "the client's status word is Exited in the high bits and its code")
 
-/// `Exited`(1) << 16 | 0 — the driver's clean ending.
+/// `Exited`(1) << 16 | 0: the driver's clean ending.
 static DRIVER_STATUS: UInt = 65536
 
 /// The client's exact syscall count. Its arithmetic is written out where it is
@@ -142,16 +132,15 @@ func _start(boot_handle: UInt) {
 
 /// Wire the service up, then be one of its clients.
 ///
-/// ONE PHASE PER FUNCTION, per design 14 finding 3: a `PipeMsg` is a
-/// message-sized value and every `print` with format arguments reserves its own
-/// scratch, so a `_start` holding all of it meets root's 16 KiB stack grant on
-/// the 64-bit profile before it meets anything else.
+/// One phase per function: a `PipeMsg` is a message-sized value and every
+/// `print` with format arguments reserves its own scratch, so a `_start`
+/// holding all of it would exceed root's stack grant (`hal.ROOT_STACK_LEN`)
+/// on the 64-bit profile.
 func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     // The boot set, in the build's row order: both child image blobs, both
-    // destination regions, then the console's REGISTER PAGE. The last row is a
-    // DEVICE row, so the kernel minted an `IoMemory` for it rather than a
-    // `Memory` — design 6 D-1's kind-not-a-flag ruling — and root's config is
-    // what says which ordinal is which.
+    // destination regions, then the console's register page. The last row is a
+    // device row, so the kernel minted an `IoMemory` for it rather than a
+    // `Memory`; root's config says which ordinal is which.
     var drv_img_rec = try proc.boot_handle_next()
     var cli_img_rec = try proc.boot_handle_next()
     var drv_ram_rec = try proc.boot_handle_next()
@@ -166,32 +155,29 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     let driver = try system.process_create(image: &drv_img, memory: &drv_ram)
     let client = try system.process_create(image: &cli_img, memory: &cli_ram)
 
-    // **THE REGIONS ARE RELEASED AS SOON AS THEY HAVE BEEN SPENT**, which is
-    // this launcher's one piece of table hygiene and the reason it fits.
-    // `process_create` COPIES an image with kernel privilege — root never maps
-    // one — so once both children exist these four capabilities name nothing
-    // root will use again, and holding them would cost four rows of a
-    // sixteen-row table this case is already the busiest user of. Dropping is
-    // the spelling (design 3 D-5).
+    // Release the regions as soon as they are spent. `process_create` copies an
+    // image with kernel privilege (root never maps one), so once both children
+    // exist these four capabilities name nothing root will use again, and
+    // holding them would cost four of the `MAX_HANDLES` rows of the handle
+    // table, which this case already uses heavily. Dropping is the release.
     let _ = move drv_img
     let _ = move cli_img
     let _ = move drv_ram
     let _ = move cli_ram
 
-    // ONE CONNECTION FOR TWO CLIENTS. The pair's creator is charged for both
-    // ends (`designs/010` ruling 6), and a child given an end spends nothing —
-    // which is what makes a service's client count independent of its pipe
-    // quota.
+    // One connection for two clients. The pair's creator is charged for both
+    // ends, and a child given an end spends nothing, so a service's client
+    // count is independent of its pipe quota.
     let pair = try proc.pipe_create()
     let (inlet, outlet) = move pair
     let for_client = try inlet.mint(rights: CLIENT_INLET)
     let _ = system.debug_print("SOS uartsvc: created\n")
 
-    // **THE DRIVER'S FURNISHING.** A masked System, the device window
-    // (`IoMemoryRight.Transfer` spent — root can map that window NOWHERE after
-    // this line), and the connection's SERVER end. Root gives the window away
-    // without ever mapping it, which is the whole point of a handoff: the
-    // registers end up in exactly one address space.
+    // The driver's furnishing: a masked System, the device window
+    // (`IoMemoryRight.Transfer` spent, so root can map that window nowhere
+    // after this line), and the connection's server end. Root gives the window
+    // away without ever mapping it, so the registers end up in exactly one
+    // address space.
     let drv_system = try system.mint(rights: CHILD_SYSTEM)
     try driver.give(system: move drv_system, tag: TAG_DRV_BOOT)
     try driver.give(iomemory: move window, tag: TAG_DRV_WINDOW)
@@ -200,53 +186,51 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     let _ = system.debug_print("SOS uartsvc: driver started\n")
 
     // =====================================================================
-    // PHASE A — ROOT'S READ GOES FIRST, AND "FIRST" IS A FACT ABOUT PROGRAM
-    // ORDER RATHER THAN ABOUT TIMING.
+    // Phase A: root's read goes first, by program order rather than timing.
     // =====================================================================
     //
-    // This post is a completed syscall before `client.start` below is even
-    // called, so the client's own first request cannot be ahead of it in the
-    // ring: the process that will make it does not exist yet. The ring is FIFO
-    // and the driver takes in ring order, so the driver's pending set holds
-    // root's obligation ahead of the client's — which is what fixes the order
-    // the two answers come back in, before a single input byte has arrived.
+    // This post completes before `client.start` is called, so the client's
+    // first request cannot be ahead of it in the ring: the process that will
+    // make it does not exist yet. The ring is FIFO and the driver takes in ring
+    // order, so the driver holds root's obligation ahead of the client's, which
+    // fixes the order the two answers come back in before any input byte has
+    // arrived.
     //
-    // It is a `post` rather than a `send` because root has more launching to do:
-    // a fused `Call` would park this thread here and the client would never be
-    // started. The claim is a HANDLE, which is exactly what `post` is for.
+    // It is a `post` rather than a `send` because root has more launching to
+    // do: a fused call would park this thread here and the client would never
+    // be started. The claim is a handle, which is what `post` returns.
     var req = UartBody.empty()
     let n = req.bare(UartOp.Read)
     let claim = try inlet.post(body: &req.bytes, len: n)
     let _ = system.debug_print("SOS uartsvc: read posted\n")
 
     let cli_system = try system.mint(rights: CHILD_SYSTEM)
-    // THE INLET FIRST, because `svc-client` spends exactly one
+    // The inlet goes first, because `svc-client` spends exactly one
     // `boot_handle_next` and expects it at record 0.
     try client.give(inlet: move for_client, tag: TAG_CLI_INLET)
     try client.give(system: move cli_system, tag: TAG_CLI_BOOT)
     try client.start(boot_tag: TAG_CLI_BOOT)
     let _ = system.debug_print("SOS uartsvc: client started\n")
 
-    // **AND NOW ROOT PARKS ON ITS OWN CLAIM.** `resolve` CONSUMES the claim and
-    // PARKS when the answer has not arrived (`designs/010` ruling 12(b), landed
-    // by design 22) — so root needs no Waiter for this at all, and there is no
-    // poll anywhere in this file. What eventually resumes it is a device
-    // interrupt taken by a process root gave the device to.
+    // Root now parks on its own claim. `resolve` consumes the claim and parks
+    // when the answer has not arrived, so root needs no Waiter for this and
+    // nothing here polls. What resumes it is a device interrupt taken by the
+    // process root gave the device to.
     let answer = try (move claim).resolve()
     if answer.len != 1 { return BUG }
     let got = answer.bytes[0]
     let _ = move answer
 
-    // Root echoes ITS byte back the way the client echoes its own — a `Write`
-    // TELL — so the phrase the harness typed comes out of the console whole,
-    // with the first byte having travelled through root's claim and the rest
-    // through the client's.
+    // Root echoes its byte back the way the client echoes its own (a `Write`
+    // tell), so the phrase the harness typed comes out of the console whole,
+    // the first byte having travelled through root's claim and the rest through
+    // the client's.
     let m = req.one(UartOp.Write, got)
     let echo_claim = try inlet.post(body: &req.bytes, len: m)
     let _ = move echo_claim
 
     // =====================================================================
-    // PHASE B — the client finishes the phrase, and root is parked on its
+    // Phase B: the client finishes the phrase, and root is parked on its
     // death, so nothing root does can interleave with the echo.
     // =====================================================================
     let waiter = try proc.waiter_create()
@@ -255,13 +239,13 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     if ended.key != KEY_CLIENT { return BUG }
     let client_status = status_of(&ended)
     let _ = move ended
-    // A death is a TERMINAL level — nothing un-dies — so the subscription has
-    // to go before this Waiter is used for anything else, or the next wait
-    // would answer the same word again.
+    // A death is a terminal level (nothing un-dies), so the subscription must
+    // go before this Waiter is used for anything else, or the next wait would
+    // answer the same word again.
     try waiter.remove(KEY_CLIENT)
 
     // =====================================================================
-    // PHASE C — ROOT'S OWN ROUND, and the driver's measured window.
+    // Phase C: root's own round, and the driver's measured window.
     // =====================================================================
     try own_round(&inlet, &var req)
 
@@ -271,29 +255,28 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
         return BUG
     }
 
-    // **THE CLIENT'S SIDE OF THE TRAP LEDGER, READ THROUGH THE HANDLE THAT
-    // OUTLIVES IT** (design 16's arrangement, `pipe-cq`'s own): a `Gone` slot
-    // keeps its columns for exactly as long as somebody can name it.
+    // The client's side of the trap ledger, read through the handle that
+    // outlives it: a `Gone` slot keeps its columns for as long as somebody can
+    // name it.
     //
     //   1  process_self          the derive every process starts with
     //   1  boot_handle_next      the inlet is record 0
-    //   3  send(Read)            ONE TRAP EACH, and each one PARKED until a
+    //   3  send(Read)            one trap each, and each parked until a
     //                            device interrupt in another process made an
     //                            answer possible
-    //   3  post(Write)           the TELL's submission
-    //   3  the claim's release   ...and the TELL's other half
+    //   3  post(Write)           the tell's submission
+    //   3  the claim's release   ...and the tell's other half
     //   1  send(Sync)            the flush before exiting
     //   1  exit                  charged at trap entry, never returning
     //   --
     //   13
     //
-    // **A TELL IS NOT CHEAPER THAN A CALL ON THIS ABI, AND THAT IS THE ROW
-    // WORTH READING.** A one-way write costs the client TWO traps — the post
-    // and the release of the claim it never wanted — where a blocking `Call`
-    // costs ONE. The saving a TELL buys is LATENCY, not syscalls: it does not
-    // park. The server side is symmetric (see the driver's own report), and the
-    // reason is the same at both ends: a message that owes no answer still
-    // mints a real capability, and letting go of a capability is an act.
+    // A tell is not cheaper than a call on this ABI. A one-way write costs the
+    // client two traps (the post and the release of the claim it never wanted)
+    // where a blocking call costs one. What a tell buys is latency, not
+    // syscalls: it does not park. The server side is symmetric (see the
+    // driver's report), because a message that owes no answer still mints a
+    // real capability, and letting go of a capability is an act.
     let client_traps = try client.stats()
     if client_traps.syscalls != CLIENT_SYSCALLS {
         print("SOS uartsvc: client traps={} wanted {}\n",
@@ -304,11 +287,10 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     print("SOS uartsvc: client traps={} for 3 reads and 3 writes\n",
           client_traps.syscalls)
 
-    // **HANGING UP IS DROPPING THE LAST INLET.** The client's sibling went with
-    // its teardown; this is the other one, and the connection's client column
-    // reaching zero is what turns the driver's readable level terminal. There is
-    // no `close` op and there does not need to be one (spec §5-era note): the
-    // reference count already knows.
+    // Hanging up is dropping the last inlet. The client's sibling went with its
+    // teardown; this is the other one, and the connection's client count
+    // reaching zero turns the driver's readable level terminal. There is no
+    // `close` op: the reference count already knows.
     try waiter.add(process: &driver, key: KEY_DRIVER)
     let _ = move inlet
     let gone = try waiter.wait()
@@ -327,10 +309,10 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     return
 }
 
-/// **ROOT DRIVING THE SAME PROTOCOL AS A CLIENT** — and the driver's measured
-/// window, which is what `Mark` opens.
+/// Root driving the same protocol as a client, inside the driver's measured
+/// window, which `Mark` opens.
 ///
-/// The two writes are TELLs and the `Sync` is a `Call`: a connection's ring is
+/// The two writes are tells and the `Sync` is a call: a connection's ring is
 /// FIFO, so an answered `Sync` proves both writes were served, which is how a
 /// client that only tells learns when its bytes reached the device. Nothing
 /// here is timing.

@@ -1,5 +1,4 @@
-// SOS M5 unit 6a: A DONATED CONNECTION CARRIES A REAL MESSAGE
-// (sawos design 34, on design 32's excluded-on-merit note).
+// A donated connection carries a real message.
 //
 // The transcript:
 //
@@ -10,57 +9,50 @@
 //   SOS pipedonate: client resolved len=3 byte0=90
 //   SOS pipedonate: done
 //
-// **WHY THIS CASE EXISTS.** M5 unit 6 excluded PIPES on merit, not on risk: ten
-// parallel arrays hung off a flat exchange index derived from `MAX_PIPES`, so
-// growing the connection slab renumbered every satellite — "not an extent chain,
-// a different data structure". Unit 6a made the ten into ONE `Exchange` record,
-// which is what turned it back into a chain. What has to be shown is therefore
-// not that a fifth connection SLOT exists, but that the STAGING RING that lives
-// beside it in donated memory works: the exchange state machine, the message
-// bytes, the length, and the reply written back over the request.
+// What has to be shown is not that a fifth connection slot exists, but that the
+// staging ring that lives beside it in donated memory works: the exchange state
+// machine, the message bytes, the length, and the reply written back over the
+// request.
 //
-// FOUR CLAIMS, IN ORDER.
+// Four claims, in order.
 //
-//  1. THE FLOOR IS REAL. `MAX_PIPES` is 4 and root's quota is unlimited, so the
-//     fifth `pipe_create` meets the SLAB and answers `NoResource`.
+//  1. The floor is real. Root's quota is unlimited, so the `pipe_create` past
+//     `MAX_PIPES` meets the slab and answers `NoResource`.
 //
-//     BOTH ENDS OF EACH FILLING PAIR ARE HELD LIVE, and they have to be: a
-//     connection frees when BOTH of its reference columns reach zero (sawos
-//     design 13), so a loop that dropped each pair as it went would never fill
-//     anything. Four separate pairs, eight live bindings — the `tests/slab-donate`
-//     shape, for the same reason.
+//     One end of each filling pair is held live, and it has to be: a
+//     connection frees when both of its reference columns reach zero, so a loop
+//     that dropped each pair as it went would never fill anything. The pairs
+//     are separate, as in `tests/slab-donate`.
 //
-//  2. THE DONATION IS ORDINARY MEMORY, and it is BIGGER than the other cases'
-//     one page on purpose. A pipe unit is a connection slot PLUS
+//  2. The donation is ordinary memory, and it is bigger than the other cases'
+//     one page on purpose. A pipe unit is a connection slot plus
 //     `PIPE_INFLIGHT` exchange records, and an exchange record carries a whole
-//     `PIPE_BODY_BYTES` body — so one connection costs several kilobytes and a
-//     single page would buy exactly one. Four pages buys a handful on both
-//     profiles, which leaves the claim ("the ceiling moved") arch-free.
+//     `PIPE_BODY_BYTES` body, so one connection costs several kilobytes and a
+//     single page would buy exactly one. `REGION` buys a handful on both
+//     profiles, which keeps the claim ("the ceiling moved") arch-free.
 //
-//  3. THE CEILING MOVED: the create that was refused now succeeds.
+//  3. The ceiling moved: the create that was refused now succeeds.
 //
-//  4. **AND THE DONATED RING IS A RING.** The fifth connection — which can only
-//     be in extent 1, since the first four are live and are extent 0 in its
-//     entirety — carries a full round trip: the client POSTS five bytes, the
-//     server TAKES them and reads the length and the first byte back, the server
-//     REPLIES three bytes, and the client RESOLVES and reads those. Every one of
-//     those four steps reads or writes an `Exchange` in donated memory —
-//     `state`, `len`, `body`, the reference columns and the staged list link —
-//     and the two printed byte values are what say the body arrived rather than
-//     merely the status.
+//  4. The donated ring is a ring. The fifth connection, which can only be in
+//     extent 1 (the first four are live and fill extent 0), carries a full
+//     round trip: the client posts five bytes, the server takes them and reads
+//     the length and the first byte back, the server replies three bytes, and
+//     the client resolves and reads those. Every one of those steps reads or
+//     writes an `Exchange` in donated memory (`state`, `len`, `body`, the
+//     reference columns and the staged list link), and the two printed byte
+//     values say the body arrived rather than merely the status.
 //
-//     `byte0=80` and `byte0=90` are numbers that appear nowhere else in the
-//     transcript, in each direction, so a body copied out of the wrong record
-//     loses them.
+//     `byte0=80` and `byte0=90` appear nowhere else in the transcript, one in
+//     each direction, so a body copied out of the wrong record loses them.
 
 import sos.{System, Process, Memory, PipeInlet, PipeOutlet, PipeReply,
             PipeRequest, PipeMsg, SlabKind, SosStatus, PIPE_BODY_BYTES}
 
-/// FOUR pages. See claim 2: a pipe unit is a connection plus its whole staging
-/// ring, which is the largest per-object storage in this kernel.
+/// The donation size. See claim 2: a pipe unit is a connection plus its whole
+/// staging ring, which is the largest per-object storage in this kernel.
 static REGION: UInt = 0x4000
 
-/// `MAX_PIPES`, written down so that raising the kernel's floor fails THIS case
+/// `MAX_PIPES`, written down so that raising the kernel's floor fails this case
 /// loudly rather than quietly making its first claim vacuous.
 static FLOOR: UInt = 4
 
@@ -96,7 +88,7 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // ---- CLAIM 1: the compiled floor is real ------------------------------
+    // ---- Claim 1: the compiled floor is real ------------------------------
     let p0 = try proc.pipe_create() catch {
         print("SOS pipedonate: no pair 0: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -117,14 +109,12 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    // **ONE END EACH IS ENOUGH, AND ROOT'S HANDLE TABLE IS WHY IT HAS TO BE.**
-    // A connection frees only when BOTH reference columns reach zero (sawos
-    // design 13), so keeping the inlet keeps the slot and the outlet may go. That
-    // matters here because `MAX_HANDLES` is 16 and this program is the densest
-    // handle user in the tree: holding both ends of four pairs left no row for the
-    // obligation the take below mints, and the case failed with `NoResource` from
-    // the TABLE while every slab still had room. Four rows saved, and the fill is
-    // exactly as live as it was.
+    // One end each is enough, and root's handle table is why it has to be. A
+    // connection frees only when both reference columns reach zero, so keeping
+    // the inlet keeps the slot and the outlet may go. Holding both ends of
+    // every pair would leave no row for the obligation the take below mints,
+    // and the case would fail with `NoResource` from the table while every
+    // slab still had room.
     let (i0, o0) = move p0
     let (i1, o1) = move p1
     let (i2, o2) = move p2
@@ -145,7 +135,7 @@ func _start(boot_handle: UInt) {
                              FLOOR, e),
     }
 
-    // ---- CLAIM 2: the donation ------------------------------------------
+    // ---- Claim 2: the donation ------------------------------------------
     let scratch = try pool.split(len: REGION) catch {
         print("SOS pipedonate: no region to donate: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -158,7 +148,7 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS pipedonate: donated a region of pipes\n")
 
-    // ---- CLAIM 3: the ceiling moved --------------------------------------
+    // ---- Claim 3: the ceiling moved --------------------------------------
     let extent = try proc.pipe_create() catch {
         print("SOS pipedonate: the donated extent gave nothing: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -167,7 +157,7 @@ func _start(boot_handle: UInt) {
     let (inlet, outlet) = move extent
     let _ = system.debug_print("SOS pipedonate: fifth connection created\n")
 
-    // ---- CLAIM 4: and the donated RING carries a message ------------------
+    // ---- Claim 4: the donated ring carries a message ----------------------
     var req: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     req[0] = REQ_MARK
     var claim = try inlet.post(body: &req, len: REQ_LEN) catch {

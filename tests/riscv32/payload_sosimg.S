@@ -1,16 +1,15 @@
-/* SOS M1 unit-B fixture: a valid sosimg, assembled by hand (design 140).
+/* Fixture: a valid sosimg, assembled by hand.
  *
- * A SECOND, independent producer of the format Blade emits. Blade's emitter
- * reads an ELF and computes everything; this file states the bytes outright.
- * If the two ever disagree, one of them is wrong and the kernel's loader —
- * which reads both — is the oracle that says so. The arm64 twin states the SAME
- * 24-byte header and 24-byte record, which is the fixed-width claim: one format,
- * two machines, identical bytes.
+ * A second, independent producer of the format Blade emits. Blade's emitter
+ * reads an ELF and computes everything; this file states the bytes outright. If
+ * the two disagree, one is wrong and the kernel's loader, which reads both, is
+ * the oracle. The arm64 twin states the same 24-byte header and 24-byte record:
+ * one format, two machines, identical bytes.
  *
  * The image carries one R+X segment: U-mode code that prints "SOS-R" through
- * `debug_putc` and exits 0. It is loaded at ROOT_ENTRY, not executed in place,
- * so this also exercises the copy path and the PMP grant derived from the
- * segment flags.
+ * the `DebugPrint` op and exits 0. It is loaded at ROOT_ENTRY, not executed in
+ * place, so this also exercises the copy path and the PMP grant derived from
+ * the segment flags.
  */
 
     .equ ROOT_ENTRY,      0x80200000

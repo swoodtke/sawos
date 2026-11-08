@@ -1,8 +1,8 @@
-/* SOS M1 unit-A U-mode payload: an illegal access (design 140).
+/* U-mode payload: an illegal access.
  *
  * Stores to the kernel's own text base. U-mode holds no PMP grant for that
  * range, so the store raises a store/AMO access fault (mcause 7) and the kernel
- * must diagnose it and FAIL the run — never hang, never let the write land.
+ * must diagnose it and fail the run: never hang, never let the write land.
  */
 
     .section .payload, "ax", @progbits

@@ -1,10 +1,10 @@
-/* SOS M1 unit-B fixture: a root image aimed at the kernel (design 140).
+/* Fixture: a root image aimed at the kernel.
  *
  * The header is valid and the magic is right; the segment asks to be loaded at
- * the kernel's own text base. This is the check that matters most — a loader
- * that trusted `load_addr` would let any image overwrite the kernel before
- * PMP ever came into it. The loader must reject the image before copying, and
- * FAIL with a diagnostic naming the address.
+ * the kernel's own text base. A loader that trusted `load_addr` would let any
+ * image overwrite the kernel before PMP ever came into it. The loader must
+ * reject the image before copying, and fail with a diagnostic naming the
+ * address.
  */
 
     .equ KERNEL_BASE,     0x80000000        /* NOT inside the root region  */

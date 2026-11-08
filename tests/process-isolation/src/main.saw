@@ -1,8 +1,8 @@
-// SOS M3 unit 2: ISOLATION — THE MONEY PROOF (sawos design 2 D-5).
+// Isolation: one process cannot touch another's memory.
 //
-// One process cannot touch another's memory, and this is the case that makes
-// that a CLAIM rather than an assumption. Root launches `child-poke`, which
-// stores a word into root's own stack; the transcript reads:
+// This case makes that a claim rather than an assumption. Root launches
+// `child-poke`, which stores a word into root's own stack; the transcript
+// reads:
 //
 //   SOS isolation: started
 //   SOS: fault <store/data-abort> cause=... epc=... tval=...
@@ -10,26 +10,25 @@
 //   SOS isolation: root survived child status=131072
 //   SOS isolation: done
 //
-// WHAT THE FAULT LINE PROVES. The child's store names an address inside root's
-// granted region. It faults because the SWITCH INTO THE CHILD RELOADED THE
-// PROTECTION DOMAIN — root's rows out, the child's rows in — which is the one
-// thing this unit had to add and the one thing neither profile could fake:
-// riscv32 spends all four PMP regions on a three-segment image, and arm64's
-// grant window is a single shared EL0 permission map. A kernel that left root's
-// grants installed would let the store LAND, the child would spin, and this
-// line would simply not be here.
+// What the fault line proves: the child's store names an address inside root's
+// granted region. It faults because the switch into the child reloaded the
+// protection domain (root's rows out, the child's rows in). Neither profile
+// could fake that: riscv32 spends all four PMP regions on a three-segment
+// image, and arm64's grant window is a single shared EL0 permission map. A
+// kernel that left root's grants installed would let the store land, the child
+// would spin, and this line would not be here.
 //
-// So the assertion is the PRESENCE of a hardware fault, and a broken reload
-// fails by omission rather than by a wrong value — which is the failure mode
+// So the assertion is the presence of a hardware fault, and a broken reload
+// fails by omission rather than by a wrong value, which is the failure mode
 // worth engineering for, because a wrong value can be argued with.
 //
 // `child status=131072` is `Faulted` with code 0: kind 2 in the high half
-// (2 * 65536), and zero in the low, because a HARDWARE fault carries no
-// `FaultReason` — the cause is in the console line, not in the status word.
-// That is the difference from the lifecycle case, whose child died in a syscall
-// and reports `131073`.
+// (2 * 65536), and zero in the low, because a hardware fault carries no
+// `FaultReason`; the cause is in the console line, not in the status word.
+// The lifecycle case differs: its child died in a syscall and reports
+// `131073`.
 //
-// ROOT PARKS ON A GENEROUS TIMER for the same reason the lifecycle case does:
+// Root parks on a generous timer for the same reason the lifecycle case does:
 // this image's kernel arms no tick, so the wait below is the only way root
 // gives the processor up and the timer is the only way it gets it back.
 
@@ -55,7 +54,7 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // Row 0 is the child's image blob, row 1 the RAM it runs in — this build's
+    // Row 0 is the child's image blob, row 1 the RAM it runs in: this build's
     // config, which is root's business and never the kernel's.
     var image = try proc.boot_handle_next() catch {
         print("SOS isolation: no image region: {}\n", error)
@@ -68,8 +67,8 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // The record hands the region over — see `process-lifecycle` for why
-    // `take_memory` is the one way out (sawos design 3 D-5).
+    // The record hands the region over; see `process-lifecycle` for why
+    // `take_memory` is the one way out.
     let image_mem = image.take_memory()!
     let dest_mem = dest.take_memory()!
 
@@ -124,19 +123,19 @@ func _start(boot_handle: UInt) {
     }
     print("SOS isolation: root survived child status={}\n", status)
 
-    // **AND THE SAME HANDLE ANSWERS HOW THE CHILD SPENT ITS LIFE** (sawos design
-    // 16). `syscalls=0 faults=1` is `child-poke`'s whole biography in two
-    // numbers: it holds no handles, so it never reached the kernel through the
-    // syscall door at all, and the ONE trap it took was the store into its
-    // neighbour's memory that the hardware refused. That is the only shape in
-    // which the fault column is ever observable — a faulting process is not
-    // around to ask about itself, so the reader has to be the supervisor whose
-    // handle held the slot open (design 3 D-3).
+    // The same handle answers how the child spent its life. `syscalls=0
+    // faults=1` is `child-poke`'s whole biography in two numbers: it holds no
+    // handles, so it never reached the kernel through the syscall door, and the
+    // one trap it took was the store into its neighbour's memory that the
+    // hardware refused. This is the only shape in which the fault column is
+    // observable: a faulting process is not around to ask about itself, so the
+    // reader has to be the supervisor whose handle held the slot open.
     //
-    // It is also the sharp end of the counting rule: a bad SYSCALL is charged to
-    // the syscall column even though it ends the process, because the columns are
-    // keyed by how the machine entered the kernel. `death_fault`'s child asserts
-    // that other half — `syscalls=1 faults=0`, the exact mirror of this line.
+    // It is also the sharp end of the counting rule: a bad syscall is charged
+    // to the syscall column even though it ends the process, because the
+    // columns are keyed by how the machine entered the kernel. `death_fault`'s
+    // child asserts that other half, `syscalls=1 faults=0`, the exact mirror of
+    // this line.
     let cost = try child.stats() catch {
         print("SOS isolation: stats failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)

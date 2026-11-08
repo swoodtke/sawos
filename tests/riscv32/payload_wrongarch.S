@@ -1,14 +1,12 @@
-/* SOS M1b fixture: a well-formed image for the OTHER profile (design 162).
+/* Fixture: a well-formed image for the other profile.
  *
- * Magic, version, segment table and permissions are all correct; the only thing
- * wrong with this image is that its code is not this machine's. Before the
- * format carried an arch tag the two profiles' headers were byte-compatible
- * wrappers around incompatible instructions, and the only thing that stopped
- * one booting on the other was that nobody had tried it. The loader must refuse
- * it on the tag, before copying a byte or entering user mode.
+ * Magic, version, segment table and permissions are all correct; the only
+ * thing wrong is that its code is not this machine's, which the arch tag
+ * declares. The loader must refuse it on the tag, before copying a byte or
+ * entering user mode.
  *
- * The segment carries no instructions at all — it is never copied, so there is
- * nothing to encode, and that keeps the fixture about the tag and nothing else.
+ * The segment carries no instructions: it is never copied, so there is nothing
+ * to encode, and that keeps the fixture about the tag and nothing else.
  */
 
     .equ ROOT_ENTRY,      0x80200000

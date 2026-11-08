@@ -1,39 +1,37 @@
-// SOS M2 unit 2: PREEMPTION (design 178 D3; spec §7).
+// Preemption (spec §7).
 //
-// Two workers that print a letter and then SPIN. Neither yields, neither
-// blocks, neither makes any call that could give the processor up — so if the
-// letters interleave at all, something took it away, and the only thing that
-// can is the timer running out a thread's slice.
+// Two workers print a letter and then spin. Neither yields, blocks, or makes
+// any call that could give the processor up, so if the letters interleave at
+// all, something took it away, and the only thing that can is the timer running
+// out a thread's slice.
 //
 //   AABBAABB...                 <- the exact grouping is timing; the
-//                                  ALTERNATION is the claim
+//                                  alternation is the claim
 //   SOS preempt: joined a=33 b=44
 //
-// The kernel booting this image is `sos/tests/threads_timer.saw`, which arms
-// the periodic tick before it loads the image. The cooperative twin of this
-// case (`thread-basics`) runs under a kernel that arms nothing, so the two
+// The kernel booting this image is `tests/threads_timer.saw`, which arms the
+// periodic tick before it loads the image. The cooperative twin of this case
+// (`thread-basics`) runs under a kernel that arms nothing, so the two
 // transcripts together separate "the scheduler switches" from "a thread asked
 // it to".
 //
-// THE SPIN LENGTH IS THE ONLY TUNED NUMBER, and it is tuned in one direction:
-// long enough that a round outlasts a slice, so a preemption lands between two
-// of a worker's own prints rather than after all of them. Too SHORT and one
-// worker would finish inside a single slice and the transcript would be AAAA
-// then BBBB; too long only makes the case slower.
+// The spin length is the only tuned number: long enough that a round outlasts a
+// slice, so a preemption lands between two of a worker's own prints rather than
+// after all of them. Too short and one worker finishes inside a single slice,
+// so the transcript reads AAAA then BBBB; too long only makes the case slower.
 
 import sos.{System, Process, Thread}
 
-/// The boot handle, parked for the workers — and the witness that says which
+/// The boot handle, parked for the workers, and the witness that says which
 /// thread `_start` is running as (handle 0 names nothing, so a parked one is
-/// never 0). A worker DERIVES everything else off it: `System(boot_handle:)`
-/// -> `process_self()` -> `thread_self()`. See `thread-basics` for why every
-/// thread of an image written in Saw enters at the same address (DF-178c).
+/// never 0). A worker derives everything else off it: `System(boot_handle:)` ->
+/// `process_self()` -> `thread_self()`. See `thread-basics` for why every
+/// thread of an image written in Saw enters at the same address.
 unsafe static var BOOT_HANDLE: UInt = 0
 
-/// Where `burn` leaves its result. A spin loop whose value nothing reads is a
-/// spin loop the optimizer DELETES, and a deleted spin makes this whole case
-/// pass or fail on which thread happened to be interrupted first — which is
-/// exactly what it did the first time it ran.
+/// Where `burn` leaves its result. A spin loop whose value nothing reads is one
+/// the optimizer deletes, and a deleted spin makes this case pass or fail on
+/// which thread happened to be interrupted first.
 unsafe static var BURN_SINK: UInt = 0
 
 static STACK_WORDS: Int = 1024
@@ -46,11 +44,10 @@ static STACK_ALIGN: UInt = 16
 static ROLE_A: UInt = 1
 static ROLE_B: UInt = 2
 static ROUNDS: Int = 8
-/// Iterations between two prints. At the kernel's 1 ms tick and a 1-tick slice
-/// this is comfortably MORE than one slice on both machines, which is the point:
-/// a round that fits inside a slice would let a worker print several times
-/// before losing the processor, and the transcript would read as blocks rather
-/// than as alternation. Measured at 400 000 it did exactly that.
+/// Iterations between two prints. With the kernel's tick and slice lengths
+/// this must be comfortably more than one slice on both machines: a round that
+/// fits inside a slice lets a worker print several times before losing the
+/// processor, and the transcript reads as blocks rather than as alternation.
 static SPIN: Int = 1_500_000
 static EXIT_A: UInt = 33
 static EXIT_B: UInt = 44
@@ -80,11 +77,11 @@ func parked_boot_handle() unsafe -> UInt {
 
 /// Burn time without touching the kernel.
 ///
-/// The body is a linear-congruential step, which is NOT an accident: a counter
-/// loop has a closed form and the optimizer writes it, leaving no time burned
-/// at all. Each step depends on the one before it and the result is stored, so
-/// the loop has to run. Arithmetic is wrapped (`&*`, `&+`) because overflow is
-/// what an LCG is made of.
+/// The body is a linear-congruential step on purpose: a counter loop has a
+/// closed form and the optimizer writes it, leaving no time burned at all. Each
+/// step depends on the one before it and the result is stored, so the loop has
+/// to run. Arithmetic is wrapped (`&*`, `&+`) because overflow is what an LCG
+/// is made of.
 func burn(iterations: Int) unsafe {
     var x = BURN_SINK
     var i = 0
@@ -138,22 +135,18 @@ func initial(boot_handle: UInt) {
     let rb: UInt = try b.join() catch { NO_VALUE }
     print("\nSOS preempt: joined a={} b={}\n", ra, rb)
 
-    // **THE INTERRUPT COLUMN, WHERE IT IS ACTUALLY NON-ZERO** (sawos design 16).
-    // This is the one case in the tree whose whole point is that ticks land in
-    // user mode, so it is the one case where the column has something to show:
+    // The interrupt column, where it is actually non-zero. This case's point
+    // is that ticks land in user mode, so the column has something to show:
     // every alternation in the transcript above is one of these.
     //
-    // **PRINTED, NEVER ASSERTED.** A tick lands where the host puts it, so the
-    // number moves run to run — which is why this row joins the two this case
-    // already carries (the A/B grouping and the tick lines) rather than becoming
-    // a fourth thing the runner checks. The counters are PER-PROCESS, so this is
-    // both workers' ticks and the initial thread's together, which is what the
-    // ruled surface says a process's stats are.
+    // Printed, never asserted: a tick lands where the host puts it, so the
+    // number moves run to run. The counters are per-process, so this is both
+    // workers' ticks and the initial thread's together.
     //
-    // The number is smaller than the tick count, and the reason is worth
-    // knowing: an interrupt taken while the kernel is IDLE never reaches `ktrap`
-    // — the idle path polls the controller rather than taking a vector — so this
-    // column counts what PREEMPTED this process, which is exactly what it is for.
+    // The number is smaller than the tick count because an interrupt taken
+    // while the kernel is idle never reaches `ktrap` (the idle path polls the
+    // controller rather than taking a vector), so this column counts what
+    // preempted this process.
     let cost = try proc.stats() catch {
         let _ = proc.exit(0)
         return

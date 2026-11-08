@@ -1,43 +1,40 @@
-// SOS M5 unit 7: THE SHARED STATS REGION (sawos design 37; design 25 seed 1).
+// The shared stats region.
 //
-// **A `top` THAT COSTS NO SYSCALLS, WRITTEN OUT.** The kernel counts every trap
-// into a page it owns; a process with the right maps that page read-only and
-// reads the columns out of its own address space forever after. This program is
-// that flow end to end, and every line it prints is a claim about it.
+// A `top` that costs no syscalls: the kernel counts every trap into a page it
+// owns; a process with the right maps that page read-only and reads the columns
+// out of its own address space from then on. This program is that flow end to
+// end, and every line it prints is a claim about it.
 //
-// THE TRANSCRIPT, read as five claims:
+// The transcript reads as five claims:
 //
 //   SOS statsregion: self row 0          <- the op told this process which row
-//                                           is its own, and root is the first
+//                                           is its own; root is the first
 //                                           process, so it is row zero
-//   SOS statsregion: region delta 8      <- EIGHT syscalls made, eight counted,
+//   SOS statsregion: region delta 8      <- eight syscalls made, eight counted,
 //                                           observed with no syscall of its own
-//   SOS statsregion: op agrees           <- `Process.stats()` answers the same
-//                                           storage: exactly one more, the trap
-//                                           that asked
-//   SOS statsreader: ...                 <- the CHILD's voice, reading root's
+//   SOS statsregion: op agrees           <- `Process.stats()` answers from the
+//                                           same storage: exactly one more, the
+//                                           trap that asked
+//   SOS statsreader: ...                 <- the child's voice, reading root's
 //                                           row out of the same page
 //   SOS statsregion: unmapped            <- and the access can be given back
 //
-// **THE DELTA IS EXACT, WHICH IS WHY IT IS WORTH ASSERTING.** `syscalls` is the
-// deterministic column (`sosabi`'s record block says so): one per trap, whatever
-// the op and whatever the answer. So a window containing exactly eight traps
-// moves it by exactly eight — no tolerance, no range. Nothing may print inside
-// that window, because printing is syscalls; the reads that bracket it are plain
-// loads out of the mapped page and cost nothing, which is the property under
-// test.
+// The delta is exact. `syscalls` is the deterministic column (`sosabi`'s
+// record block says so): one per trap, whatever the op and the answer. So a
+// window containing exactly `SPIN` traps moves it by exactly `SPIN`, with no
+// tolerance. Nothing may print inside that window, because printing is
+// syscalls; the reads that bracket it are plain loads out of the mapped page
+// and cost nothing, which is the property under test.
 //
-// **THE `op agrees` LINE IS THE COMPATIBILITY FLOOR WITNESSED.** `Process.stats()`
-// is v1's surface and it now reads the very storage this page publishes, so the
-// two cannot drift. It reads ONE HIGHER than the region did because the call
-// itself is a trap and is charged before the answer is assembled — the honest
-// arrangement `sosabi` documents, and asserting the `+ 1` is what proves the
-// counting site is where it says it is.
+// The `op agrees` line witnesses that `Process.stats()` reads the same storage
+// this page publishes, so the two cannot drift. It reads one higher than the
+// region did because the call is itself a trap and is charged before the answer
+// is assembled (as `sosabi` documents); asserting the `+ 1` proves the counting
+// site is where it says it is.
 //
-// **NO POOL, NO `Memory`, NO SPLIT.** The page this program maps is the
-// kernel's. It is granted by the op and owned by nobody, which is the
-// access-without-possession shape design 37 exists to build: what comes back is
-// a `Mapping` — enough to read, and enough to hand the access back.
+// No pool, no `Memory`, no split. The page this program maps is the kernel's,
+// granted by the op and owned by nobody: access without possession. What comes
+// back is a `Mapping`, enough to read and to hand the access back.
 
 import sos.{System, Process, Memory, StatsRegion, ProcessStats, SosStatus,
             SystemRight, Clock, ClockType, Timer, Waiter}
@@ -55,19 +52,18 @@ static TAG_BOOT: UInt = 21
 /// The key this case attaches its park timer under.
 static KEY: UInt = 93
 
-/// Twenty milliseconds — `map_into_child`'s number, and three orders of
-/// magnitude more than the child needs to map a page, read two rows and exit.
+/// The park timer's delay: far longer than the child needs to map a page, read
+/// two rows and exit.
 static PARK_NS: UInt64 = 20_000_000
 
-/// **WHAT THE CHILD MAY ASK ITS SYSTEM OBJECT FOR**, and the middle bit is the
-/// one this case is about: print, learn its own Process object, and MAP THE
-/// STATS REGION. `Transfer` rides along because `give` checks it on the thing
-/// being given. Everything else — `Shutdown`, `ProcessCreate`, `ClockGet`,
-/// `SlabDonate`, `TierGet` — is absent BY SILENCE.
+/// What the child may ask its System object for. The middle bit is the one
+/// this case is about: print, learn its own Process object, and map the stats
+/// region. `Transfer` rides along because `give` checks it on the thing being
+/// given. Everything else (`Shutdown`, `ProcessCreate`, `ClockGet`,
+/// `SlabDonate`, `TierGet`) is absent.
 ///
-/// A child WITHOUT `StatsRegionMap` simply could not make this call, which is
-/// the attenuation the right exists to express: watching the whole machine's
-/// traffic is a thing a launcher hands over deliberately.
+/// A child without `StatsRegionMap` cannot make this call: watching the whole
+/// machine's traffic is something a launcher hands over deliberately.
 static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
                                | SystemRight.StatsRegionMap
                                | SystemRight.Transfer)
@@ -82,7 +78,7 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // **THE MAP.** One trap, and every sample after it is free.
+    // The map: one trap, and every sample after it is free.
     let region = try system.stats_region_map() catch {
         print("SOS statsregion: map failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -90,18 +86,16 @@ func _start(boot_handle: UInt) {
     }
 
     // The op told this process which row is its own. Root is the first process
-    // the machine reifies, so the answer is zero — and asserting it here is what
-    // lets the CHILD below read row zero and know whose it is.
+    // the machine reifies, so the answer is zero; asserting it here lets the
+    // child below read row zero and know whose it is.
     if region.self_row != 0 {
         print("SOS statsregion: self row {} wanted 0\n", region.self_row)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
     // The region must have a row for every slot the machine can run, so it can
-    // never be narrower than the compiled floor. The COUNT is per-profile (it
-    // tracks the protection-domain pool), so the number is checked and not
-    // printed — a transcript row carrying it would say more about the HAL than
-    // about this op.
+    // never be narrower than the compiled floor. The count is per-profile (it
+    // tracks the protection-domain pool), so it is checked and not printed.
     if region.rows < 1 {
         print("SOS statsregion: region publishes {} rows\n", region.rows)
         let _ = system.shutdown(EXIT_FAILED)
@@ -109,7 +103,7 @@ func _start(boot_handle: UInt) {
     }
     print("SOS statsregion: self row {}\n", region.self_row)
 
-    // ================= THE MEASURED WINDOW — NOTHING PRINTS =================
+    // ================= The measured window: nothing prints =================
     // Both brackets are plain loads out of the mapped page. Between them this
     // process makes exactly `SPIN` traps and nothing else.
     let before = region.mine().syscalls
@@ -147,7 +141,7 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS statsregion: op agrees\n")
 
-    // ===================== THE CROSS-PROCESS HALF ==========================
+    // ===================== The cross-process half ==========================
     // The boot set, in the build's row order: the child's image blob, then the
     // RAM it will run in. There is no pool row — this case allocates nothing.
     var image = try proc.boot_handle_next() catch {
@@ -234,9 +228,9 @@ func _start(boot_handle: UInt) {
     }
     print("SOS statsregion: child exit {}\n", status)
 
-    // **AND THE ACCESS GOES BACK.** A Mapping owns its ROW, so unmapping works
-    // exactly as it does for memory this process owned — which is the point
-    // worth witnessing about a grant that came with nothing to own.
+    // The access goes back. A Mapping owns its row, so unmapping works exactly
+    // as it does for memory this process owned, even though this grant came
+    // with nothing to own.
     try region.unmap() catch {
         print("SOS statsregion: unmap failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)

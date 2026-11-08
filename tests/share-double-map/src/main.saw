@@ -1,57 +1,49 @@
-// SOS M3 unit 6: SHARED MEMORY, AND IT IS ONE REGION MAPPED TWICE (sawos design
-// 9 D-3; spec §2.5's "the SAME physical memory ... the shared-memory
-// primitive").
+// Shared memory: one region mapped into two address spaces (spec §2.5, the
+// shared-memory primitive).
 //
-// **THE FIRST CROSS-PROCESS DOUBLE MAP.** Unit 4 mapped one region twice into
-// ONE domain (`map_basics`, RW here and RO there) and mapped a page into a child
-// (`map_into_child`). This is both at once: one page, two rows, two address
-// spaces — and the two processes then talk through it in both directions with
-// no copy anywhere that could be faking it.
+// Root maps one page into itself and into a child, and the two processes then
+// talk through it in both directions with no copy anywhere that could be faking
+// it.
 //
-// THE TRANSCRIPT, read as an order:
+// Transcript, in order:
 //
 //   SOS sharemap: created
-//   SOS sharemap: mapped into both        <- TWO rows, one region, two domains
+//   SOS sharemap: mapped into both        <- two rows, one region, two domains
 //   SOS sharemap: wrote 165               <- 0xA5, through root's row
 //   SOS sharemap: started
-//   SOS childshare: saw 165 wrote 90      <- THE CHILD, through its own row
+//   SOS childshare: saw 165 wrote 90      <- the child, through its own row
 //   SOS: process exit: code=...
 //   SOS sharemap: root observed child status=65701
 //   SOS sharemap: read back 90            <- 0x5A, back through root's row
 //   SOS sharemap: done
 //
-// **BOTH DIRECTIONS, AND EACH IS PROVED TWICE.** The child saw root's byte — it
-// says so on the console AND carries it out as its exit code, which root reads
-// through the §8 status word (65701 is `Exited`(1) << 16 | 165). Root then reads
-// the child's byte back out of the same page. On a machine that does not
-// translate there is no copy step to hide in: `read back 90` is root loading the
-// address the child stored to.
+// Each direction is proved twice. The child saw root's byte: it says so on the
+// console and carries it out as its exit code, which root reads through the §8
+// status word (65701 is `Exited`(1) << 16 | 165). Root then reads the child's
+// byte back out of the same page: `read back 90` is root loading the address
+// the child stored to.
 //
-// **ROOT INSTALLS THE CHILD'S ROW, AND THE CHILD HOLDS NO `Memory` HANDLE AT
-// ALL.** That is the deliberate contrast with `driver-child` beside it, which is
-// the same unit's other installation direction:
+// Root installs the child's row and the child holds no `Memory` handle at all.
+// Contrast `driver-child`:
 //
-//   driver-child   root GIVES the capability; the CHILD maps it into itself.
+//   driver-child   root gives the capability; the child maps it into itself.
 //                  Spends `IoMemoryRight.Transfer` at the give and
 //                  `ProcessRight.Map` on the child's own handle at the map.
 //   share-double-map
-//                  root KEEPS the capability; ROOT maps it into the child.
-//                  Spends `MemoryRight.Map` on the region and `ProcessRight.Map`
-//                  on the CHILD's handle — the doctrine's
-//                  no-possession-implies-authority, since holding the page is
-//                  not enough to install it in somebody else's domain.
+//                  root keeps the capability and maps it into the child.
+//                  Spends `MemoryRight.Map` on the region and
+//                  `ProcessRight.Map` on the child's handle: holding the
+//                  page is not enough to install it in another domain.
 //
-// Both are ordinary. Which one a launcher wants is a policy question — hand over
-// authority, or hand over access — and the object model answers it without a
-// mode flag anywhere.
+// Which one a launcher wants is a policy question (hand over authority, or hand
+// over access).
 //
-// **THE CHILD'S ROW IS RW AND NOT EXECUTABLE, AND THAT IS SAID BY OMISSION**
-// (sawos design 9 D-1). Root asks for `Read | Write` when it installs the
-// child's row, so no `MapAccess.Execute` bit is in the word and the exec gate is
-// never consulted. A launcher that wanted to be sure the CHILD could never make
-// an executable row of its own would additionally withhold `MemoryRight.MapExecute`
-// at a mint — which is exactly what `map-exec-gated` shows — and here it need
-// not, because the child was never given a region object to map.
+// The child's row is RW and not executable by omission. Root asks for `Read |
+// Write`, so no `MapAccess.Execute` bit is in the word and the exec gate is
+// never consulted. A launcher that wanted to be sure the child could never make
+// an executable row of its own would withhold `MemoryRight.MapExecute` at a
+// mint (see `map-exec-gated`); here the child is never given a region object to
+// map.
 
 import sos.{System, Process, Memory, Mapping, MapAccess, Waiter, WaitResult,
             WaitPayload, SosStatus, SystemRight}
@@ -63,11 +55,11 @@ extern "C" {
 /// One page of the pool, which is the smallest thing either profile grants.
 static CHUNK: UInt = 0x1000
 
-/// Read and write, in both domains. The SAME access word for both rows here —
-/// asymmetric access is `map_basics`'s claim and would only blur this one.
+/// Read and write, in both domains. The same access word for both rows;
+/// asymmetric access would only blur this case.
 static RW: UInt32 = MapAccess.Read | MapAccess.Write
 
-/// The byte ROOT writes, and the byte the CHILD writes. Two numbers that appear
+/// The byte root writes, and the byte the child writes. Two numbers that appear
 /// nowhere else in any transcript, so a line carrying one can only have come
 /// from the program that wrote it.
 static ROOT_MARK: UInt8 = 0xA5
@@ -80,9 +72,9 @@ static KEY: UInt = 55
 static TAG_BOOT: UInt = 41
 
 /// What a child of this launcher may ask its System object for: print, and
-/// learn its own Process object — which is the handle its `exit` goes through.
-/// `Transfer` is in the mask because it is the bit `give` checks on the thing
-/// being given; everything else is absent BY SILENCE.
+/// learn its own Process object (the handle its `exit` goes through).
+/// `Transfer` is in the mask because `give` checks it on the thing being given;
+/// every other right is absent.
 static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
                                | SystemRight.Transfer)
 
@@ -117,8 +109,8 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // The boot set, in the build's row order: the child's image blob, the RAM it
-    // will run in, and the pool this launcher allocates the shared page out of.
+    // The boot set, in the build's row order: the child's image blob, the RAM
+    // it will run in, and the pool the shared page is allocated from.
     var image = try proc.boot_handle_next() catch {
         print("SOS sharemap: no image region: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -158,12 +150,11 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS sharemap: created\n")
 
-    // **ONE REGION, TWO MAPS, TWO DOMAINS.** The region object is the same in
-    // both calls — `&shared` is borrowed, not consumed, because a map moves no
-    // handle word — and what differs is only the RECEIVER: `proc` is this
-    // process, `child` is the other one. Two rows exist afterwards and two
-    // Mapping handles name them; §2.5's refcount clause is what keeps the page
-    // alive for as long as either does.
+    // One region, two maps, two domains. The region object is the same in both
+    // calls (`&shared` is borrowed, not consumed, because a map moves no handle
+    // word); only the receiver differs: `proc` is this process, `child` the
+    // other. Two rows exist afterwards and two Mapping handles name them;
+    // §2.5's refcount clause keeps the page alive for as long as either does.
     let shared = try pool.split(len: CHUNK) catch {
         print("SOS sharemap: split failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -181,16 +172,14 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS sharemap: mapped into both\n")
 
-    // ROOT'S HALF OF THE CONVERSATION, before the child exists in any runnable
-    // sense — the child is `Created` and has no thread, so the ordering here is
-    // forced rather than raced.
+    // Root's half of the conversation. The child is `Created` and has no
+    // thread, so the ordering is forced rather than raced.
     let page = sos_test_pool_base()
     poke(page, ROOT_MARK)
     print("SOS sharemap: wrote {}\n", ROOT_MARK as Int)
 
-    // The furnishing half, unit 3's flow unchanged, plus the supervision
-    // attachment `death_notify` established: the child's ending is the only
-    // thing that can wake this process, so no timer is armed anywhere.
+    // Furnish the child, and attach it to a waiter: the child's ending is the
+    // only thing that can wake this process, so no timer is armed.
     let waiter = try proc.waiter_create() catch {
         print("SOS sharemap: no waiter: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -225,10 +214,10 @@ func _start(boot_handle: UInt) {
     }
     print("SOS sharemap: root observed child status={}\n", status_of(&record))
 
-    // **AND THE OTHER DIRECTION.** The child is gone — its domain went with it,
-    // and with it the second row — but the PAGE is root's as much as it ever
-    // was, because root's own row was never the child's to take. This load is
-    // the byte the child stored, through a region neither process copied.
+    // The other direction. The child is gone and its domain, with the second
+    // row, went with it, but the page is root's as much as it ever was, because
+    // root's own row was never the child's to take. This load is the byte the
+    // child stored, through a region neither process copied.
     let seen = peek(page)
     print("SOS sharemap: read back {}\n", seen as Int)
     if seen != CHILD_MARK {

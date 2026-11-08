@@ -1,7 +1,7 @@
-/* SOS M1 unit-B fixture: a root image with the wrong magic (design 140).
+/* Fixture: a root image with the wrong magic.
  *
  * Otherwise well-formed. The loader must reject it on the first field it reads
- * and FAIL with a diagnostic, without placing a byte or entering U-mode.
+ * and fail with a diagnostic, without placing a byte or entering U-mode.
  */
 
     .equ ROOT_ENTRY,      0x80200000

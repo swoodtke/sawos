@@ -1,6 +1,6 @@
-// SOS M3 unit 2: THE BOOT SET, DRAINED (sawos design 2 D-3).
+// The boot set, drained.
 //
-// §12 keeps the entry register ONE HANDLE WIDE — the System handle — so
+// §12 keeps the entry register one handle wide (the System handle), so
 // everything else the kernel minted for root before it ran has to be collected
 // rather than passed. This is what collecting looks like:
 //
@@ -8,38 +8,37 @@
 //   SOS bootdrain: exhausted, and still exhausted
 //   SOS bootdrain: done
 //
-// THREE CLAIMS, one per line.
+// Three claims, one per line.
 //
-// A NOTE ON WHAT THIS PROGRAM DOES *NOT* KEEP, since sawos design 3 D-5. It
-// reads each record's `tag` and `kind` and never TAKES its region, so every
-// record drops at the end of the arm that inspected it — and a dropped record
-// releases the `Memory` it was still holding. That is the right default: an
-// iterator entry a launcher looked at and declined is a capability it declined.
-// The teardown line consequently reports FEWER handles than the kernel minted
-// for this process, which is drop-is-release showing up in a case that is not
-// about it (`handle-drop-release` is the one that is).
+// This program does not keep what it reads. It reads each record's `tag` and
+// `kind` and never takes its region, so every record drops at the end of the
+// arm that inspected it, and a dropped record releases the `Memory` it was
+// still holding. An iterator entry a launcher looked at and declined is a
+// capability it declined. The teardown line consequently reports fewer handles
+// than the kernel minted for this process (`handle-drop-release` is the case
+// about drop-is-release).
 //
-// `n=2` and `tags` are ROOT ASSERTING ITS OWN CONFIG. The build appended one
+// `n=2` and `tags` are root asserting its own config. The build appended one
 // child image and assigned it one destination range, so the region table has
-// two rows and their ordinals are 0 and 1 — and the kernel, which minted a
-// Memory for each, knows nothing about what either is FOR. A launcher's config
-// is what supplies the meaning, and the tag is what it looks the meaning up by.
+// two rows and their ordinals are 0 and 1. The kernel minted a Memory for each
+// and knows nothing about what either is for; a launcher's config supplies the
+// meaning, and the tag is what it looks the meaning up by.
 //
-// The tags are accumulated as DIGITS rather than printed one per record, so the
-// single number carries the ORDER as well as the set: 0 then 1 accumulates to
-// 1, where 1 then 0 would read 10. The kinds are both `BootHandleKind.Memory`
-// (0), because regions are the only thing v1 mints, and they accumulate to 0.
+// The tags are accumulated as digits rather than printed one per record, so
+// the single number carries the order as well as the set: 0 then 1 accumulates
+// to 1, where 1 then 0 would read 10. The kinds are both
+// `BootHandleKind.Memory` (0), because both records are regions, and
+// they accumulate to 0.
 //
-// THE LOOP ENDS BY MEETING `Drained`, which is why exhaustion is a status
-// rather than a fault: the correct program is exactly the one that walks off
-// the end. A kernel that faulted there would kill every launcher ever written.
+// The loop ends by meeting `Drained`, so exhaustion is a status rather than a
+// fault: the correct program is the one that walks off the end. A kernel that
+// faulted there would kill every launcher.
 //
-// AND IT STAYS DRAINED. The second ask after the loop is the claim that the
-// cursor only ever advances — a record is delivered ONCE, and asking again is
-// safe rather than a way to be handed the boot set a second time. That is a
-// property of the QUEUE rather than of §3: the boot set is a fixed list the
-// kernel minted before this process ran, and re-delivering it would hand out
-// authority over regions the launcher may already have given away.
+// It also stays drained. The second ask after the loop checks that the cursor
+// only advances: a record is delivered once, and asking again does not hand
+// out the boot set a second time. That is a property of the queue rather than
+// of §3: re-delivering would hand out authority over regions the launcher may
+// already have given away.
 
 import sos.{System, Process, Memory, BootHandle, BootHandleKind, SosStatus}
 
@@ -70,7 +69,7 @@ func _start(boot_handle: UInt) {
         match proc.boot_handle_next() {
             case Ok(h) -> {
                 // Accumulated as digits rather than printed per record, so the
-                // assertion is one line whose ORDER is part of the claim: a
+                // assertion is one line whose order is part of the claim: a
                 // kernel that delivered the rows out of order would produce
                 // `10` here rather than `01`.
                 tags = tags * 10 + h.tag
@@ -88,9 +87,9 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // EXHAUSTION IS STABLE. Asking a drained iterator again is not an error and
-    // does not hand anything back — which is what makes the loop above safe to
-    // write without a count the kernel would have had to publish separately.
+    // Exhaustion is stable. Asking a drained iterator again is not an error and
+    // hands nothing back, which is what makes the loop above safe to write
+    // without a count the kernel would have to publish separately.
     match proc.boot_handle_next() {
         case Ok(_) -> {
             let _ = system.debug_print("SOS bootdrain: a drained set gave more\n")

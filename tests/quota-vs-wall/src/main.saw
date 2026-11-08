@@ -1,35 +1,32 @@
-// SOS M3 unit 5: THE POLICY CAP IS REACHED FIRST (sawos design 7 D-3;
-// sawlang#232 agenda item 8).
+// The policy cap is reached first.
 //
-// **THE LAUNCHER FOR THE ONE CLAIM A KERNEL ASSERT CANNOT SHOW.** Design 6
-// recorded agenda item 8's sentence at the row-budget check — *a `map()`
-// meeting the physical wall with quota headroom left is a kernel bug to assert
-// against* — and design 7 made it executable: the check is a `fatal_kernel`
-// now, which by construction never appears in a passing transcript. So the
-// observable half is a child that maps until it is refused and reports WHICH
-// refusal it met, and a clean run is what says the ordering held.
+// The launcher for the one claim a kernel assert cannot show. The row-budget
+// check in `map` says that a `map()` meeting the physical wall with quota
+// headroom left is a kernel bug, and it is a `fatal_kernel`, which by
+// construction never appears in a passing transcript. So the observable half
+// is a child that maps until it is refused and reports which refusal it met; a
+// clean run is what says the ordering held.
 //
 //   SOS quotawall: created
 //   SOS quotawall: gave a page
 //   SOS quotawall: started
-//   SOS childmapwall: maps=2 quota=1     <- POLICY refused, and the machine's
+//   SOS childmapwall: maps=2 quota=1     <- policy refused, and the machine's
 //                                           row budget was never reached
 //   SOS: process exit: code=2
 //   SOS quotawall: root observed child status=65538
 //   SOS quotawall: done
 //
-// **WHAT ROOT CONTRIBUTES IS A REGION AND NOTHING ELSE.** The child maps a page
-// its launcher split off the pool INTO ITSELF, through its own Process handle —
-// so the two rights the map spends (`MemoryRight.Map` on the page,
+// Root contributes a region and nothing else. The child maps a page its
+// launcher split off the pool into itself, through its own Process handle, so
+// the two rights the map spends (`MemoryRight.Map` on the page,
 // `ProcessRight.Map` on the target) are both the child's own, and root's
-// allowance has nothing to do with how many rows the child may install. That is
-// D-3's one ruled exception to creator-pays working: a mapping charges the
-// TARGET, because the scarce thing it consumes is the target's grant-row
-// budget, and charging the caller would let a launcher's quota gate another
-// process's domain size.
+// allowance has nothing to do with how many rows the child may install. This
+// is the one exception to creator-pays: a mapping charges the target, because
+// the scarce thing it consumes is the target's grant-row budget, and charging
+// the caller would let a launcher's quota gate another process's domain size.
 //
-// ROOT PARKS ON A GENEROUS TIMER while the child runs, so the ordering above is
-// forced rather than raced.
+// Root parks on a generous timer while the child runs, so the ordering above
+// is forced rather than raced.
 
 import sos.{System, Process, Memory, BootHandle, Clock, ClockType, Timer,
             Waiter, SosStatus, SystemRight}
@@ -51,7 +48,7 @@ static TAG_BOOT: UInt = 31
 static TAG_PAGE: UInt = 33
 
 /// What a child of this launcher may ask its System object for: print, and
-/// learn its own Process object — which is also the handle it maps THROUGH.
+/// learn its own Process object, which is also the handle it maps through.
 static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
                                | SystemRight.Transfer)
 
@@ -122,10 +119,10 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    // **THE PAGE TRAVELS, AND ITS RIGHTS TRAVEL VERBATIM.** A give is a move,
-    // so the child receives `MemoryRight.Map` because root held it — which is
-    // what makes the child able to install rows at all, and what makes the
-    // rows it installs its OWN business.
+    // The page travels, and its rights travel verbatim. A give is a move, so
+    // the child receives `MemoryRight.Map` because root held it, which is what
+    // makes the child able to install rows at all and what makes the rows it
+    // installs its own business.
     try child.give(memory: move page, tag: TAG_PAGE) catch {
         print("SOS quotawall: give page failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)

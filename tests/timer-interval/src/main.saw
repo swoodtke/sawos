@@ -1,5 +1,5 @@
-// SOS M3 unit 1: a PERIODIC timer, ack-free, with missed fires COALESCING
-// (design 232; spec §2's Timer row).
+// A periodic timer is ack-free, and missed fires coalesce (spec §2's Timer
+// row).
 //
 // Three claims, in the order the transcript makes them:
 //
@@ -9,38 +9,37 @@
 //   SOS interval: drained fires=1
 //   SOS interval: done
 //
-// THE PERIODIC COUNTS ARE `N`, NOT 1, AND THAT IS THE FEATURE. A fire delivered
+// The periodic counts are `N`, not 1, and that is the feature. A fire delivered
 // more than a period late coalesces, so under an emulator whose timing belongs
-// to the host a correct kernel reports 2 or 3 on either of the first two wakes
-// — both machines were observed reporting 2 on the first. Only the LAST count
-// is deterministic, because it takes the one-shot branch, which counts one fire
-// however late it was.
+// to the host a correct kernel may report 2 or 3 on either of the first two
+// wakes. Only the last count is deterministic, because it takes the one-shot
+// branch, which counts one fire however late it was.
 //
-// 1. THE KERNEL RE-ARMS, NOT THE PROCESS. The first two waits are the whole of
-//    what this program does between them — no ack, no re-arm, no re-attach.
-//    A timer that did not re-arm itself would leave the second wait parked
+// 1. The kernel re-arms, not the process. The first two waits are the whole of
+//    what this program does between them: no ack, no re-arm, no re-attach. A
+//    timer that did not re-arm itself would leave the second wait parked
 //    forever with nothing to wake it, which this kernel reports as a deadlock
 //    rather than hanging, so the failure is a red run in milliseconds.
 //    `ackfree=1` records that claim where a reader will see it.
 //
-// 2. FIRES COALESCE WHEN NOBODY IS WAITING. The third phase spins in userspace
-//    for several periods WITHOUT waiting, then waits. Those expiries did not
+// 2. Fires coalesce when nobody is waiting. The third phase spins in userspace
+//    for several periods without waiting, then waits. Those expiries did not
 //    queue up as separate wakes and were not dropped: they accumulated into one
 //    count, so the wait answers once with `fires` above one. `coalesced=1` is
 //    that comparison. This is the property that makes a slow consumer degrade
 //    into coarser reporting instead of falling permanently behind.
 //
-// 3. THE WAIT CONSUMES THE COUNT, and the last phase proves it WITHOUT a
+// 3. The wait consumes the count, and the last phase proves it without a
 //    stopwatch: cancel, re-arm as a one-shot, wait. That count can only be one.
 //    A kernel that never reset the count would report the coalesced total again
 //    there, and a `disarm` that left the fires behind would report them too, so
 //    one line covers both. Comparing counts between the periodic wakes would
-//    have raced the emulator instead — how many periods a `print` takes is not
-//    this program's to know.
+//    race the emulator, since how many periods a `print` takes is not this
+//    program's to know.
 //
-// WHY THE COUNTS ARE COMPARED AND NOT PRINTED RAW. How many periods a spin
-// covers is a real machine's business and no assertion can name it, so every
-// line here is a derived fact.
+// The counts are compared and not printed raw: how many periods a spin covers
+// is a real machine's business and no assertion can name it, so every line here
+// is a derived fact.
 
 import sos.{System, Process, Clock, ClockType, Timer, Waiter, WaitResult,
             WaitPayload}
@@ -53,13 +52,13 @@ static NO: UInt = 0
 
 static KEY: UInt = 66
 
-/// A millisecond period — the same scale the M2 tick uses, and far above the
-/// kernel's minimum lead, so every fire here is a real scheduled one.
+/// A millisecond period, far above the kernel's minimum lead, so every fire
+/// here is a real scheduled one.
 static PERIOD_NS: UInt64 = 1_000_000
 
 /// Spin across this much time without waiting, so several periods expire with
-/// no consumer. Five periods, which gives the comparison below room to be true
-/// on a slow emulator without being true by accident.
+/// no consumer. Five periods gives the comparison below room to be true on a
+/// slow emulator without being true by accident.
 static SPIN_NS: UInt64 = 5_000_000
 
 func flag(b: Bool) -> UInt {
@@ -77,10 +76,10 @@ func now_of(clock: &Clock) -> UInt64 {
     try clock.now() catch { 0u64 }
 }
 
-/// Spin on the clock until it reads `deadline`. Timer fires land during this —
-/// the line is enabled and the kernel takes each interrupt — and they
-/// accumulate in the object rather than waking anybody, which is exactly the
-/// state the third claim is about.
+/// Spin on the clock until it reads `deadline`. Timer fires land during this
+/// (the line is enabled and the kernel takes each interrupt) and accumulate in
+/// the object rather than waking anybody, which is the state the second claim
+/// is about.
 func spin_to(clock: &Clock, deadline: UInt64) {
     var done = false
     while not done {
@@ -120,7 +119,7 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // A REPEATING schedule: first fire one period out, then every period.
+    // A repeating schedule: first fire one period out, then every period.
     try timer.arm(after_ns: PERIOD_NS, interval_ns: PERIOD_NS) catch {
         print("SOS interval: arm failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -134,7 +133,7 @@ func _start(boot_handle: UInt) {
     }
     print("SOS interval: tick one fires={}\n", fires_of(&one))
 
-    // NOTHING HAPPENS BETWEEN THESE TWO WAITS. No ack, no re-arm.
+    // Nothing happens between these two waits: no ack, no re-arm.
     let two = try waiter.wait() catch {
         print("SOS interval: second wait failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -153,10 +152,9 @@ func _start(boot_handle: UInt) {
     }
     print("SOS interval: coalesced={}\n", flag(fires_of(&many) > 1))
 
-    // THE DRAIN, PROVED WITHOUT A STOPWATCH. Comparing counts BETWEEN the
-    // periodic wakes above would race the emulator — how many periods a print
-    // takes is not this program's to know — so the claim is made where it is
-    // deterministic instead: cancel, re-arm as a ONE-SHOT, wait. That count can
+    // The drain, proved without a stopwatch. Comparing counts between the
+    // periodic wakes above would race the emulator, so the claim is made where
+    // it is deterministic: cancel, re-arm as a one-shot, wait. That count can
     // only be one. A kernel that never reset the count would report the
     // coalesced total again here, and a `disarm` that left the fires behind
     // would report them too, so the single line covers both.

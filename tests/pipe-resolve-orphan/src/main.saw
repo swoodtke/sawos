@@ -1,13 +1,11 @@
-// SOS M4 unit 4.5: THE ORPHANED-CLAIM ARM, AT A HANDLE-BACKED CLAIM (sawos
-// design 22; `designs/010` ruling 12(b)'s `end_process` mirror).
+// The orphaned-claim arm, at a handle-backed claim (spec §2.1).
 //
-// **`pipe-call-orphan` WITH THE OTHER SPELLING, AND THAT IS THE WHOLE CLAIM.**
-// A fused `Call`'s claim is a reference no handle table holds, which is what
-// made design 17 D-2's teardown arm necessary. A parked `resolve`'s claim WAS a
-// table row until the op took it — `park_resolve` unbinds the caller's entry and
-// KEEPS its reference, which is `consume_entry` with the unref left out — so
-// from the moment it parks the two shapes are indistinguishable: one reference
-// on the claim column, `PIPE_CALLER` naming the thread, and nothing on any list.
+// This is `pipe-call-orphan` with the other spelling of the claim. A fused
+// `Call`'s claim is a reference no handle table holds. A parked `resolve`'s
+// claim was a table row until the op took it: `park_resolve` unbinds the
+// caller's entry and keeps its reference. From the moment it parks, the two
+// shapes are indistinguishable: one reference on the claim column,
+// `Exchange.caller` naming the thread, and nothing on any list.
 //
 //   SOS resolveorphan: two resolves in flight
 //   SOS resolveorphan: answered one
@@ -15,27 +13,27 @@
 //   SOS resolveorphan: the orphaned claim answers the other end of this
 //                      connection is gone
 //
-// The last row is the arm, and the point of the case is that reaching it needed
-// NO KERNEL CODE: `release_pending_calls` walks threads with a claim tie and
-// drops the reference, and it never asks which op put it there. A kernel that
-// had grown a second teardown path for the second park would pass this case too;
-// what it would not have is the ONE arm the census argues for.
+// The last row is the arm. Reaching it needs no extra kernel code:
+// `release_pending_calls` walks threads with a claim tie and drops the
+// reference, and it never asks which op put it there. A kernel with a second
+// teardown path for the second park would pass this case too; what it would
+// lack is the single arm shared by both shapes.
 //
-// # WHY A SIBLING CASE RATHER THAN AN ARM ON `pipe-call-orphan`
+// # Why a sibling case rather than an arm on `pipe-call-orphan`
 //
-// The proof requires the ORPHANED thread to be the shape under test, and one
+// The proof requires the orphaned thread to be the shape under test, and one
 // two-thread child can orphan only one shape: whichever thread the launcher
 // answers exits the process and the other is the orphan. `child-orphan`'s two
-// threads are interchangeable ON PURPOSE — that symmetry is what makes the case
-// deterministic without the launcher knowing which thread it is talking to — so
-// making them differ would have traded a fact for a scan order. Two cases, one
-// spelling each, keeps both proofs and both symmetries.
+// threads are interchangeable on purpose, since that symmetry makes the case
+// deterministic without the launcher knowing which thread it is talking to.
+// Making them differ would trade a fact for a scan order. Two cases, one
+// spelling each, keep both proofs and both symmetries.
 //
-// Everything else — how a process is made to die with a thread parked, why root
-// never polls, and why the outlet is detached before the death wait — is
-// `pipe-call-orphan`'s and is written out there.
+// How a process is made to die with a thread parked, why root never polls, and
+// why the outlet is detached before the death wait are all written out in
+// `pipe-call-orphan`.
 //
-// ONE PHASE PER FUNCTION, on design 14 finding 3's 16 KiB stack ceiling.
+// One phase per function, because of the stack ceiling.
 
 import sos.{System, Process, Waiter, WaitResult, WaitPayload, PipeInlet,
             PipeOutlet, PipeRequest, PipeInletRight, OutletLevel, SosStatus,
@@ -45,7 +43,7 @@ static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
 /// A status the kernel can never hand this program, so meeting it in the error
-/// channel means an assertion in THIS file failed rather than a call did.
+/// channel means an assertion in this file failed rather than a call did.
 static BUG: SosStatus = SosStatus.Revoked
 
 /// `Exited`(1) << 16 | 71 — the code `child-resolver`'s answered thread ends
@@ -61,9 +59,9 @@ static PAYLOAD_LEN: UInt = 1
 static KEY_OUTLET: UInt = 91
 static KEY_DEATH: UInt = 92
 
-/// The three tags. **THE TWO INLETS GO FIRST**: the boot set is a FIFO, so
-/// records 0 and 1 are the two client ends and each of the child's threads
-/// drains one for itself.
+/// The three tags. The two inlets go first: the boot set is a FIFO, so records
+/// 0 and 1 are the two client ends and each of the child's threads drains one
+/// for itself.
 static TAG_INLET_A: UInt = 15
 static TAG_INLET_B: UInt = 16
 static TAG_BOOT: UInt = 17
@@ -73,9 +71,9 @@ static TAG_BOOT: UInt = 17
 /// on a handle it derives for itself and costs nothing here.
 static CHILD_SYSTEM: UInt32 = (SystemRight.ProcessSelf | SystemRight.Transfer)
 
-/// **WHAT THE SECOND CLIENT END MAY DO.** A sibling minted through this mask can
-/// post and nothing else — it may not be handed on again and may not mint a
-/// third. `Transfer` IS present, because `give` checks that bit on the thing
+/// What the second client end may do. A sibling minted through this mask can
+/// post and nothing else: it may not be handed on again and may not mint a
+/// third. `Transfer` is present, because `give` checks that bit on the thing
 /// being given and the whole purpose of this handle is to be given.
 static SECOND_INLET: UInt32 = (PipeInletRight.Transfer | PipeInletRight.Post)
 
@@ -106,9 +104,8 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
 
     let child = try system.process_create(image: &image_mem, memory: &dest_mem)
 
-    // ONE CONNECTION, TWO CLIENT ENDS — design 13 D-1's `dup` precedent, which
-    // is what lets two threads of one process each hold an end without either
-    // handing the other a handle word.
+    // One connection, two client ends: a minted sibling lets two threads of one
+    // process each hold an end without either handing the other a handle word.
     let pair = try proc.pipe_create()
     let (inlet, outlet) = move pair
     let second = try inlet.mint(rights: SECOND_INLET)
@@ -127,18 +124,18 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     return
 }
 
-/// **TAKE BOTH MESSAGES, ANSWER ONE, AND ASK THE OTHER AFTERWARDS.**
+/// Take both messages, answer one, and ask the other afterwards.
 ///
 /// The two obligations are held together across the child's death, which is the
-/// only arrangement in which the arm is observable at all: the second one has to
-/// still exist when the teardown runs, so that root can ask it a question
+/// only arrangement in which the arm is observable at all: the second one has
+/// to still exist when the teardown runs, so that root can ask it a question
 /// afterwards and be told what the teardown decided.
 func collect_and_orphan(outlet: &PipeOutlet,
                         waiter: &Waiter) -> Result<Void, SosStatus> {
     var out: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     out[0] = 2
 
-    // THE FIRST THREAD'S EXCHANGE.
+    // The first thread's exchange.
     let first = try waiter.wait()
     if first.key != KEY_OUTLET || not readable_msg(&first) {
         return BUG
@@ -147,8 +144,8 @@ func collect_and_orphan(outlet: &PipeOutlet,
     let (_, request_a) = move got_a
     let answered = move request_a
 
-    // THE SECOND THREAD'S. This wait PARKS — nothing is staged until the sibling
-    // runs — so the interleaving is the kernel's rather than a poll's.
+    // The second thread's. This wait parks (nothing is staged until the sibling
+    // runs), so the interleaving is the kernel's rather than a poll's.
     let second = try waiter.wait()
     if second.key != KEY_OUTLET || not readable_msg(&second) {
         return BUG
@@ -159,15 +156,14 @@ func collect_and_orphan(outlet: &PipeOutlet,
 
     print("SOS resolveorphan: two resolves in flight\n")
 
-    // Detached BEFORE the death, so the wait below has exactly one thing that
-    // can answer it — `pipe-call-orphan`'s own reasoning.
+    // Detached before the death, so the wait below has exactly one thing that
+    // can answer it (see `pipe-call-orphan`).
     try waiter.remove(KEY_OUTLET)
 
-    // ANSWER ONE. Whichever thread this reaches wakes up inside its own
-    // `resolve`, takes the reply, and ends the process — leaving the other one
-    // parked. That wake is `wake_call_reply`, unchanged: the answer is the
-    // reply's length in the value register with the record copied into the
-    // caller's buffer, which is what a fused `Call` gets too.
+    // Answer one. Whichever thread this reaches wakes up inside its own
+    // `resolve`, takes the reply, and ends the process, leaving the other one
+    // parked. The wake is the same one a fused `Call` gets: the reply's length
+    // in the value register with the record copied into the caller's buffer.
     try (move answered).reply(body: &out, len: PAYLOAD_LEN)
     print("SOS resolveorphan: answered one\n")
 
@@ -179,10 +175,10 @@ func collect_and_orphan(outlet: &PipeOutlet,
         return BUG
     }
 
-    // **THE ARM.** The orphaned claim was abandoned by the teardown, so this
+    // The arm. The orphaned claim was abandoned by the teardown, so this
     // discharges the obligation and is told there is nobody left to hear it. A
-    // `match` rather than the tree's guard shape, deliberately: this is a
-    // negative assertion on a SPECIFIC status.
+    // `match` rather than the guard shape, deliberately: this is a negative
+    // assertion on a specific status.
     match (move orphaned).reply(body: &out, len: PAYLOAD_LEN) {
         case Ok(_) -> {
             print("SOS resolveorphan: the orphaned claim took a reply\n")
@@ -195,8 +191,8 @@ func collect_and_orphan(outlet: &PipeOutlet,
     return
 }
 
-/// Whether a record says a message is STAGED. The other arms panic because this
-/// program checks the KEY first, so any other shape would mean the kernel
+/// Whether a record says a message is staged. The other arms panic because this
+/// program checks the key first, so any other shape would mean the kernel
 /// reported an attachment nobody made.
 func readable_msg(r: &WaitResult) -> Bool {
     match r.what {

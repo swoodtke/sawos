@@ -1,42 +1,41 @@
-// SOS M2 unit 2: threads, cooperatively (design 178 D3/D4; spec §2, §8).
+// Cooperative threads (spec §2, §8).
 //
-// Two workers that print a letter and YIELD, joined by the thread that made
-// them. The kernel booting this image arms no timer, so nothing can take the
-// processor away — every switch in the transcript is one a thread asked for,
-// and the alternation is therefore exactly the round-robin queue's behaviour:
+// Two workers print a letter and yield, joined by the thread that made them.
+// The kernel booting this image arms no timer, so nothing can take the
+// processor away. Every switch in the transcript is one a thread asked for, so
+// the alternation is exactly the round-robin queue's behaviour:
 //
 //   ABABABAB                    <- eight yields, strictly alternating
 //   SOS threads: joined a=11 b=22
 //
-// WHAT IT PROVES, in one boot: create, start, yield-driven switching, join
-// returning each worker's own exit value, the §8 status word, and the ratified
-// process teardown at the end.
+// Proves, in one boot: create, start, yield-driven switching, join returning
+// each worker's own exit value, the §8 status word, and process teardown at the
+// end.
 //
-// EVERY THREAD OF THIS IMAGE ENTERS AT `_start`, because Saw cannot name the
-// address of a function (DF-178c / design 172's reason 3) and `thread_create`
-// therefore has no entry to be given. So the entry has to work out which thread
-// it is, and it does that the only way that needs no second register: the
-// INITIAL thread is the one that has not yet parked the boot handle.
+// Every thread of this image enters at `_start`, because Saw cannot name the
+// address of a function and `thread_create` therefore has no entry to be given.
+// So the entry works out which thread it is the only way that needs no second
+// register: the initial thread is the one that has not yet parked the boot
+// handle.
 //
-// A WORKER DERIVES ITS AUTHORITY, it is not handed it. The one thing parked for
-// it is the BOOT HANDLE — §12's root of trust and the only raw word the typed
-// layer accepts — and everything else comes off it by derivation:
-// `System(boot_handle:)` -> `process_self()` -> `thread_self()`. That is why
-// nothing here passes a handle WORD between threads: the `sos` module offers no
-// way to take one out of a typed handle, and this program needs none.
+// A worker derives its authority; it is not handed it. The one thing parked for
+// it is the boot handle (§12's root of trust, and the only raw word the typed
+// layer accepts), and everything else comes off it by derivation:
+// `System(boot_handle:)` -> `process_self()` -> `thread_self()`. Nothing here
+// passes a handle word between threads: the `sos` module offers no way to take
+// one out of a typed handle.
 
 import sos.{System, Process, Thread, SosStatus}
 
 /// The boot handle, parked by the initial thread for the workers.
 ///
-/// It is also the "have I run yet" witness, and that reading is grounded rather
-/// than lucky: handle 0 names nothing (the object table reserves zero), so a
-/// parked boot handle is never 0 and an unparked slot is never a handle.
+/// It is also the "have I run yet" witness: handle 0 names nothing (the object
+/// table reserves zero), so a parked boot handle is never 0 and an unparked
+/// slot is never a handle.
 unsafe static var BOOT_HANDLE: UInt = 0
 
 /// A worker's stack, in this process's own zero-init data. Spec §8: thread
-/// stacks are USERSPACE memory passed to thread creation, so a process finds
-/// them where it finds anything else.
+/// stacks are userspace memory passed to thread creation.
 static STACK_WORDS: Int = 1024
 unsafe static var STACK_A: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
 unsafe static var STACK_B: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
@@ -51,9 +50,7 @@ static TURNS: Int = 4
 static EXIT_A: UInt = 11
 static EXIT_B: UInt = 22
 
-/// What a failed read reports. Named `UInt` constants rather than bare literals
-/// in the failure defaults, because a bare literal did not adopt the annotated
-/// type through the `match` these reads used to be — see DF-178e.
+/// What a failed read reports, as named `UInt` constants.
 static NO_VALUE: UInt = 0
 static NO_STATUS: UInt = 0xFFFF
 
@@ -82,8 +79,8 @@ func parked_boot_handle() unsafe -> UInt {
 
 /// A worker: print, yield, repeat, then exit with a value its joiner reads.
 ///
-/// The System object is what writes the tag — with NO newline after it, which
-/// `print` would add and which would break the alternation into lines.
+/// The System object is what writes the tag, with no newline after it (`print`
+/// would add one and break the alternation into lines).
 func worker(role: UInt) {
     let system = System(boot_handle: parked_boot_handle())
     let proc = try system.process_self() catch { return }
@@ -92,7 +89,7 @@ func worker(role: UInt) {
     var turn = 0
     while turn < TURNS {
         let _ = system.debug_print(tag)
-        // The switch. With no timer running, this is the ONLY thing that can
+        // The switch. With no timer running, this is the only thing that can
         // move the processor to the other worker.
         let _ = me.yield_now()
         turn = turn + 1
@@ -102,7 +99,7 @@ func worker(role: UInt) {
 
 /// The initial thread: make two workers, start them, wait for both.
 func initial(boot_handle: UInt) {
-    // Parked FIRST: it is what tells a worker's entry that it is a worker, and
+    // Parked first: it is what tells a worker's entry that it is a worker, and
     // it is the seed the worker derives its own objects from.
     park_boot_handle(boot_handle)
 
@@ -114,12 +111,10 @@ func initial(boot_handle: UInt) {
     }
 
     let a = try proc.thread_create(stack_top: stack_a_top(), arg: ROLE_A) catch {
-        // The status tag NAMED, not just printed. `SosStatus` lives in
-        // `sosabi`, which is kernel-internal and which this process does
-        // not — and must not — import; it reaches here because `sos`
-        // re-exports that one type and nothing else beside it (design 229).
-        // A process that branches on a failure needs the name, so this line
-        // is the check that the export survives.
+        // The status tag is named, not just printed. `SosStatus` lives in
+        // `sosabi`, which is kernel-internal and which this process does not
+        // import; `sos` re-exports that one type. A process that branches on a
+        // failure needs the name, so this line checks the export survives.
         let tag: SosStatus = error
         print("SOS threads: create failed: {}\n", tag)
         let _ = system.shutdown(1)
@@ -146,7 +141,7 @@ func initial(boot_handle: UInt) {
     print("\nSOS threads: joined a={} b={}\n", ra, rb)
 
     // Process exit, not System shutdown: this is the object the op belongs to
-    // (spec §5.7, ratified Aug 5), and the kernel's teardown line proves it ran.
+    // (spec §5.7), and the kernel's teardown line proves it ran.
     let _ = proc.exit(0)
 }
 

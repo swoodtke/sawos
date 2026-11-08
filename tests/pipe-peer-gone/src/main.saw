@@ -1,32 +1,30 @@
-// SOS M4 unit 1: THE PEER-GONE DOCTRINE ON A CONNECTION (sawos design 13 D-2;
-// `designs/010` D-1 and ruling 2; spec §2.1).
+// The peer-gone doctrine on a connection (spec §2.1).
 //
-// **NOTHING IS SILENTLY DOOMED, AND THE TWO DIRECTIONS ARE NOT SYMMETRIC.** A
-// side of a connection reaching zero references raises PEER-GONE on the other —
-// and what that MEANS differs by which side went, which is the whole of D-2's
-// zero-arms and the whole of this transcript:
+// A side of a connection reaching zero references raises peer-gone on the
+// other, and what that means differs by which side went:
 //
-//   THE OUTLET WENT. Nobody can ever take again, so a post has no future: it is
+//   The outlet went. Nobody can ever take again, so a post has no future: it is
 //   refused at once with `PeerClosed`, and whatever was staged was dropped at
-//   the transition. There is nothing to drain, because draining needs an outlet.
+//   the transition. There is nothing to drain, because draining needs an
+//   outlet.
 //
-//   THE INLET WENT. Nobody can ever post again — but everything ALREADY STAGED
-//   is still owed to the server, so `take` HANDS IT ALL OVER FIRST and only a
-//   drained ring answers `PeerClosed`. That is design 230's close-drains-first
-//   rule, and it is why a client exiting mid-conversation loses nothing.
+//   The inlet went. Nobody can ever post again, but everything already staged
+//   is still owed to the server, so `take` hands it all over first and only a
+//   drained ring answers `PeerClosed`. This is why a client exiting
+//   mid-conversation loses nothing.
 //
-// **AND IT IS TERMINAL.** The second take answers exactly what the first did:
+// The answer is terminal. The second take answers exactly what the first did:
 // nothing un-closes, because a reference column only ever falls and a column at
 // zero has no handle left to mint a new sender from. A caller may stop rather
 // than retry, which is the difference between this and `WouldBlock`.
 //
-// THE STATUSES ARE NAMED, NOT NUMBERED — the program prints the ABI enum's own
+// The statuses are named, not numbered: the program prints the ABI enum's own
 // `describe()`, so a case added without a describe arm would not compile and a
 // renumbering of the wire table would not move this transcript.
 //
-// TWO CONNECTIONS, because the two arms genuinely need different histories: the
-// first is killed empty from the server side, the second is loaded and then
-// killed from the client side.
+// Two connections, because the two arms need different histories: the first is
+// killed empty from the server side, the second is loaded and then killed from
+// the client side.
 
 import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
             SosStatus, PIPE_BODY_BYTES}
@@ -38,11 +36,11 @@ static EXIT_FAILED: UInt = 1
 static FIRST_BYTE: UInt8 = 7
 static SECOND_BYTE: UInt8 = 8
 
-/// **POST AND GIVE THE CLAIM UP — §2.1's TELL IDIOM** (sawos design 14). This
-/// case is about the CONNECTION's peer-gone doctrine, not the one-shot pair's, so
-/// every message here is a tell: the client never asks for an answer, and what is
-/// proved is that the staged message survives its sender exactly as unit 1 said.
-/// `pipe-abandon` is where the pair's own abandonment arms are proved.
+/// Post and give the claim up (§2.1's tell idiom). This case is about the
+/// connection's peer-gone doctrine, not the one-shot pair's, so every message
+/// here is a tell: the client never asks for an answer, and what is proved is
+/// that the staged message survives its sender. `pipe-abandon` is where the
+/// pair's own abandonment arms are proved.
 func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
           len: UInt) -> Result<Bool, SosStatus> {
     let claim = try inlet.post(body: &body, len: len) catch {
@@ -55,8 +53,8 @@ func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
     return true
 }
 
-/// Take, and discharge the obligation by dropping it. Nobody is listening — the
-/// claims went at the posts — so each exchange settles and its ring slot goes
+/// Take, and discharge the obligation by dropping it. Nobody is listening (the
+/// claims went at the posts), so each exchange settles and its ring slot goes
 /// back.
 func take_message(outlet: &PipeOutlet) -> Result<UInt?, SosStatus> {
     let got = try outlet.take() catch {
@@ -67,9 +65,9 @@ func take_message(outlet: &PipeOutlet) -> Result<UInt?, SosStatus> {
     }
     let (msg, request) = move got
     let _ = move request
-    // The FIRST BYTE rather than the length, since M4 unit 4 moved the
-    // message's bytes into the record the take answers with: what this proves is
-    // WHICH message drained, and the length of every one of them is 1.
+    // The first byte rather than the length, since the take answers with a
+    // record holding the message's bytes: what this proves is which message
+    // drained, and every message is one byte long.
     let some: UInt? = msg.bytes[0] as UInt
     return move some
 }
@@ -96,11 +94,10 @@ func _start(boot_handle: UInt) {
     }
     let (client, server) = move first_pair
 
-    // **DROP IS RELEASE, AND THAT IS HOW AN END IS CLOSED.** There is no typed
-    // `close()` — early release is dropping the value, which is one concept for
-    // the reader instead of two ways to say it (design 3 D-5). This is the LAST
-    // outlet handle onto the connection, so the column reaches zero and the
-    // far end's answer changes inside this very statement.
+    // Drop is release, and that is how an end is closed. There is no typed
+    // `close()`; early release is dropping the value. This is the last outlet
+    // handle onto the connection, so the column reaches zero and the far end's
+    // answer changes inside this very statement.
     let _ = move server
     let _ = system.debug_print("SOS peergone: outlet dropped\n")
 
@@ -143,7 +140,7 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS peergone: staged 2\n")
 
-    // The sender goes away with its messages still in flight. A design that
+    // The sender goes away with its messages still in flight. A kernel that
     // unwound the ring here would lose both of them, silently.
     let _ = move sender
     let _ = system.debug_print("SOS peergone: inlet dropped\n")
@@ -170,8 +167,8 @@ func _start(boot_handle: UInt) {
     }
     print("SOS peergone: drained a={} b={}\n", a, b)
 
-    // ...and ONLY NOW is the server told. The ring is empty and no sender can
-    // ever appear, so this is the terminal answer rather than a would-block.
+    // Only now is the server told. The ring is empty and no sender can ever
+    // appear, so this is the terminal answer rather than a would-block.
     match take_message(&receiver) {
         case Ok(_) -> {
             let _ = system.debug_print("SOS peergone: drained ring still had one\n")
@@ -181,8 +178,8 @@ func _start(boot_handle: UInt) {
         case Err(e) -> { print("SOS peergone: take says {}\n", e) },
     }
 
-    // NOTHING UN-CLOSES. Asking again answers the same word, which is what makes
-    // this a level a caller can act on rather than an edge it might miss.
+    // Nothing un-closes. Asking again answers the same word, which makes this a
+    // level a caller can act on rather than an edge it might miss.
     match take_message(&receiver) {
         case Ok(_) -> {
             let _ = system.debug_print("SOS peergone: a closed pipe re-opened\n")

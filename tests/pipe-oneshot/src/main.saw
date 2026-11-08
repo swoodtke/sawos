@@ -1,46 +1,42 @@
-// SOS M4 unit 2: THE ONE-SHOT PAIR, END TO END IN ONE PROCESS (sawos design 14;
-// spec §2.1).
+// One-shot pair, end to end in one process (spec §2.1).
 //
-// **REQUEST/REPLY IS A PRIMITIVE, AND THIS IS THE SMALLEST PROGRAM THAT PROVES
-// IT.** Root creates a connection, holds both ends, and plays both sides of
-// every exchange — no second process, no waitability, nothing parked. The
-// transcript is a list of properties:
+// Request/reply is a primitive, and this is the smallest program that proves
+// it. Root creates a connection, holds both ends, and plays both sides of every
+// exchange: no second process, no waitability, nothing parked. The transcript
+// is a list of properties:
 //
-//   request len=3 b=65,66,67   a take hands over the MESSAGE and the obligation
-//   pending is none            a resolve before the reply is `Ok(None)`, not an
-//                              error, and it consumes nothing
-//   reply len=2 b=90,89        the reply BYTES came back through the same slot
+//   request len=3 b=65,66,67   a take hands over the message and the obligation
+//   pending is not ready       `ready()` before the reply answers false and
+//                              consumes nothing
+//   reply len=2 b=90,89        the reply bytes came back through the same slot
 //   zero reply len=0           a reply that carries no data is still an answer
-//   fifo replies a=11 b=22 c=33  three exchanges in flight at once, answered out
-//                              of order, and each claim got ITS OWN reply
-//   depth with one in flight=15  ONE unsettled exchange costs ONE ring slot
+//   fifo replies a=11 b=22 c=33  three exchanges in flight at once, answered
+//                              out of order; each claim got its own reply
+//   depth with one in flight=15  one unsettled exchange costs one ring slot
 //   depth settled=16           ...and settling it gives the slot back
 //
-// **THE LAST TWO ROWS ARE THE UNIT'S SHARPEST CLAIM** (design 14 D-1). Unit 1
-// freed a staging slot the moment its bytes were taken; unit 2's slot carries the
-// REPLY back, so it recycles only when the exchange settles — which makes
-// `PIPE_INFLIGHT` a bound on AWAITING-REPLY EXCHANGES, design 10 ruling 6's
-// "in-flight messages per client" read literally. This program never names the
-// number: it holds one exchange open, posts until the kernel refuses and COUNTS
-// (15), then discharges the held exchange and counts again (16). A kernel that
-// freed the slot at the take would print 16 both times.
+// The last two rows are the sharpest claim: a slot carries the reply back, so
+// it recycles only when the exchange settles, which makes `PIPE_INFLIGHT` a
+// bound on awaiting-reply exchanges. This program never names the number: it
+// holds one exchange open, posts until the kernel refuses and counts (15), then
+// discharges the held exchange and counts again (16). A kernel that freed the
+// slot at the take would print 16 both times.
 //
-// **NOTHING HERE IS AN ERROR EXCEPT A DEAD PEER.** A ring with no free slot and
-// an exchange with no reply yet are both "not right now" — transient, cleared by
-// the other side — so they arrive in the OK channel with a distinguishable
-// absence (design 234 §4). `pipe-abandon` is where the error channel is proved.
+// A ring with no free slot and an exchange with no reply yet are both "not
+// right now", cleared by the other side. A full ring answers `Err(WouldBlock)`,
+// which `tell` below turns into `false`; a pending resolve parks instead of
+// answering. A dead peer is the terminal error.
 //
-// **ONE PHASE PER FUNCTION, AND THE FRAME IS WHY.** Root's stack grant is
-// `hal.ROOT_STACK_LEN` — 16 KiB, one page-pair on both profiles — and every
-// `print` with format arguments reserves message scratch in ITS OWN frame
-// (design 137: the message is assembled in stack scratch so a panic survives an
-// exhausted allocator). A `_start` holding every phase of this case therefore
-// holds every phase's scratch at once, which overflowed the grant on the 64-bit
-// profile and not on the 32-bit one. So each phase is a function that reports by
-// RETURNING a status and `_start` prints once. That is also how it reads best:
-// each function is one claim.
+// One phase per function, because of the frame. Root's stack grant is
+// `hal.ROOT_STACK_LEN` and every `print` with format
+// arguments reserves message scratch in its own frame (the message is assembled
+// in stack scratch so a panic survives an exhausted allocator). A `_start`
+// holding every phase would hold every phase's scratch at once, which
+// overflowed the grant on the 64-bit profile and not on the 32-bit one. So each
+// phase is a function that reports by returning a status and `_start` prints
+// once.
 //
-// EVERY LOOP IS BOUNDED. A poll loop with no ceiling is a hang the deadlock
+// Every loop is bounded: a poll loop with no ceiling is a hang the deadlock
 // report cannot see.
 
 import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
@@ -54,12 +50,11 @@ static EXIT_FAILED: UInt = 1
 /// answers, not that the number is tight.
 static MAX_ROUNDS: Int = 64
 
-/// **WHAT A PHASE ANSWERS WHEN ITS OWN ARITHMETIC IS WRONG.** Every refusal in
-/// this case that is NOT the kernel's is a bug in the case, and it needs a value
-/// to carry out of a `Result` — so it borrows the one status that can never
-/// legitimately reach `_start` from any call these phases make, and `_start`
-/// prints it. It is a test's internal assertion vocabulary, not a claim about the
-/// kernel.
+/// What a phase answers when its own arithmetic is wrong. A refusal in this
+/// case that is not the kernel's is a bug in the case, and it needs a value to
+/// carry out of a `Result`, so it borrows the one status that can never
+/// legitimately reach `_start` from any call these phases make. It is the
+/// test's internal assertion vocabulary, not a claim about the kernel.
 static BUG: SosStatus = SosStatus.Revoked
 
 @export("_start")
@@ -105,13 +100,12 @@ func _start(boot_handle: UInt) {
     let _ = proc.exit(EXIT_OK)
 }
 
-/// **THE ROUND TRIP, BOTH WAYS** — and the pending answer in the middle of it.
+/// The round trip both ways, and the pending answer in the middle of it.
 ///
-/// A post answers a CLAIM; a take answers the message AND the obligation to
-/// reply to it; a resolve before the reply is `Ok(None)` and consumes nothing,
-/// which is what makes polling with the same claim legal; a reply lands where
-/// that claim is waiting. The bytes are what is asserted at each end, because a
-/// status alone would not show that either copy funnel carried anything.
+/// A post answers a claim; a take answers the message and the obligation to
+/// reply to it; a reply lands where that claim is waiting. The bytes are
+/// asserted at each end, because a status alone would not show that either copy
+/// carried anything.
 func round_trip(inlet: &PipeInlet, outlet: &PipeOutlet) -> Result<Void, SosStatus> {
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     msg[0] = 65
@@ -127,13 +121,11 @@ func round_trip(inlet: &PipeInlet, outlet: &PipeOutlet) -> Result<Void, SosStatu
           arrived.bytes[0] as UInt, arrived.bytes[1] as UInt,
           arrived.bytes[2] as UInt)
 
-    // **THE PENDING QUESTION IS `ready()` NOW, AND IT IS `Ok(false)`**
-    // (`designs/010` ruling 12(b)). Through unit 4 this line was a `resolve`
-    // answering `Ok(None)`; a resolve would PARK here, because the exchange is
-    // taken and the server has not answered — which is exactly the state the
-    // question exists for. It consumes nothing, so the claim below this line is
-    // the SAME claim, and readiness is monotonic, so a `false` here can only
-    // become a `true`.
+    // The pending question is `ready()` and it answers false. A `resolve`
+    // here would park, because the exchange is taken and the server has not
+    // answered, which is the state the question exists for. `ready()`
+    // consumes nothing, so the claim below is the same claim, and readiness
+    // is monotonic: a false can only become a true.
     let ready = try claim.ready()
     if ready { return BUG }
     let _ = write_line("SOS oneshot: pending is not ready\n")
@@ -142,24 +134,23 @@ func round_trip(inlet: &PipeInlet, outlet: &PipeOutlet) -> Result<Void, SosStatu
     msg[1] = 89
     try (move obligation).reply(body: &msg, len: 2)
 
-    // ...and now the level is up, so the resolve returns WITHOUT parking. The
-    // move is the typed tier's half of ruling 12(b): the claim is spent, and a
-    // second use of this binding is a compile error.
+    // The level is up now, so the resolve returns without parking. The move
+    // spends the claim: a second use of this binding is a compile error.
     let got = try (move claim).resolve()
     print("SOS oneshot: reply len={} b={},{}\n", got.len,
           got.bytes[0] as UInt, got.bytes[1] as UInt)
     return
 }
 
-/// **A REPLY OF ZERO BYTES IS STILL AN ANSWER** — and since M4 unit 4.5 nothing
-/// has to keep it apart from "no reply yet", because "no reply yet" is not an
-/// answer this op can give: a pending resolve PARKS (`designs/010` ruling
-/// 12(b)). The same simplification on the request side is `take`'s: a
-/// zero-length message is `Ok`, an empty ring is `Err(WouldBlock)`.
-/// **AND IT IS THE PHASE THE TRAP COUNT IS TAKEN OVER** (sawos design 16),
-/// because it is the smallest complete exchange in the file: post, take, reply,
-/// resolve, and not one printed byte between the brackets. Every printed byte is
-/// an `ecall`, so a measured window containing a `print` counts the prose.
+/// A reply of zero bytes is still an answer. Nothing has to keep it apart from
+/// "no reply yet", because a pending resolve parks rather than answering. The
+/// request side is the same: a zero-length message is `Ok`, an empty ring is
+/// `Err(WouldBlock)`.
+///
+/// This is also the phase the trap count is taken over, because it is the
+/// smallest complete exchange in the file: post, take, reply, resolve, and not
+/// one printed byte between the brackets. Every printed byte is a syscall, so
+/// a measured window containing a `print` counts the prose.
 func zero_reply(proc: &Process, inlet: &PipeInlet,
                 outlet: &PipeOutlet) -> Result<Void, SosStatus> {
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
@@ -174,14 +165,12 @@ func zero_reply(proc: &Process, inlet: &PipeInlet,
     //
     //     delta = post + take + reply + resolve + this read = 4 + 1 = 5
     //
-    // **NOTHING RELEASES INSIDE THE BRACKET**, which is the other half of the
-    // arithmetic and is why the read sits HERE rather than at the end of the
-    // function: `claim` and `obligation` are owning wrappers, and a wrapper
-    // still holding a live word issues a release when it falls out of scope.
-    // Those releases are traps too — they are just this phase's epilogue rather
-    // than its exchange. Since M4 unit 4.5 both of them are spent by CONSUMING
-    // ops instead, so this phase's epilogue is empty and the arithmetic is the
-    // exchange alone.
+    // Nothing releases inside the bracket: `claim` and `obligation` are owning
+    // wrappers, and a wrapper still holding a live word issues a release (a
+    // trap) when it falls out of scope. Both are spent by consuming ops
+    // (`resolve`, `reply`), so no release is charged and the arithmetic is the
+    // exchange alone. The read sits before the end of the function so that a
+    // scope-exit release, were there one, would fall outside the window.
     let after = try proc.stats()
 
     print("SOS oneshot: zero reply len={}\n", zero.len)
@@ -190,10 +179,10 @@ func zero_reply(proc: &Process, inlet: &PipeInlet,
     return
 }
 
-/// **THREE EXCHANGES IN FLIGHT AT ONCE, ANSWERED OUT OF ORDER**, and each claim
-/// resolves to ITS OWN reply.
+/// Three exchanges in flight at once, answered out of order; each claim
+/// resolves to its own reply.
 ///
-/// A design that kept one reply slot per CONNECTION rather than per exchange
+/// A design that kept one reply slot per connection rather than per exchange
 /// would print the same digit three times here; one that keyed replies by queue
 /// position would print them permuted, because the obligations are discharged
 /// 2, 3, 1. An exchange is not a queue position.
@@ -227,14 +216,12 @@ func three_in_flight(inlet: &PipeInlet,
     return
 }
 
-/// **THE RING, COUNTED AROUND ONE UNSETTLED EXCHANGE** — the lifecycle change
-/// made visible.
+/// The ring, counted around one unsettled exchange.
 ///
-/// The held message is TAKEN, so its bytes are already in this process's buffer
-/// and unit 1 would have given the slot back; unit 2's slot is still spent,
-/// because the reply has nowhere else to live. So the free depth is one short,
-/// and discharging the exchange restores it. The program never names
-/// `PIPE_INFLIGHT`: what it asserts is the DIFFERENCE.
+/// The held message is taken, so its bytes are already in this process's
+/// buffer, but its slot is still spent because the reply has nowhere else to
+/// live. So the free depth is one short, and discharging the exchange restores
+/// it. The program never names `PIPE_INFLIGHT`: it asserts the difference.
 func ring_around_one(inlet: &PipeInlet,
                      outlet: &PipeOutlet) -> Result<Void, SosStatus> {
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
@@ -249,8 +236,8 @@ func ring_around_one(inlet: &PipeInlet,
     let back = try drain(&outlet)
     if back != busy { return BUG }
 
-    // ...and now the held exchange settles: the obligation is discharged and the
-    // claim takes its answer, so the slot goes back and the ring is whole again.
+    // The held exchange settles: the obligation is discharged and the claim
+    // takes its answer, so the slot goes back and the ring is whole again.
     msg[0] = 8
     try (move obligation).reply(body: &msg, len: 1)
     let _ = try (move claim).resolve()
@@ -260,10 +247,10 @@ func ring_around_one(inlet: &PipeInlet,
     return
 }
 
-/// **POST AND GIVE THE CLAIM UP — §2.1's TELL IDIOM.** The message is staged and
-/// the client says at once that it does not want the answer, so the exchange
-/// settles as soon as the server discharges. It is what the counting loops use,
-/// because they are about the RING and not about the pair.
+/// Post and give the claim up (§2.1's tell idiom). The client says at once that
+/// it does not want the answer, so the exchange settles as soon as the server
+/// discharges. The counting loops use it because they are about the ring, not
+/// the pair.
 func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
           len: UInt) -> Result<Bool, SosStatus> {
     let claim = try inlet.post(body: &body, len: len) catch {
@@ -289,7 +276,7 @@ func take_and_drop(outlet: &PipeOutlet) -> Result<Bool, SosStatus> {
     return true
 }
 
-/// Post until the kernel refuses, and hand back how many went — the ring's FREE
+/// Post until the kernel refuses, and hand back how many went: the ring's free
 /// depth, counted rather than named. The messages are tells, so nothing this
 /// leaves behind holds a slot waiting for a reply.
 func fill(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES]) -> Result<UInt, SosStatus> {
@@ -326,7 +313,7 @@ func drain(outlet: &PipeOutlet) -> Result<UInt, SosStatus> {
 }
 
 /// Take one message and hand its obligation back, refusing an empty ring as an
-/// error — every take reached this way has a message waiting by construction, so
+/// error. Every take reached this way has a message waiting by construction, so
 /// an absence is a bug in the case rather than a poll.
 func take_one(outlet: &PipeOutlet) -> Result<PipeRequest, SosStatus> {
     let got = try outlet.take()
@@ -334,13 +321,12 @@ func take_one(outlet: &PipeOutlet) -> Result<PipeRequest, SosStatus> {
     return move request
 }
 
-/// Resolve one claim and answer the first byte of its reply — which is what the
+/// Resolve one claim and answer the first byte of its reply, which is what the
 /// three-in-flight row asserts, one digit per exchange.
 ///
-/// **IT TAKES THE CLAIM BY VALUE**, because `resolve` consumes it (`designs/010`
-/// ruling 12(b)): a `&var` parameter could not be moved out of, so the helper's
-/// signature carries the same single-use the op does and the call sites spell
-/// `resolve_one(move c1)`.
+/// It takes the claim by value, because `resolve` consumes it: a `&var`
+/// parameter could not be moved out of, so the signature carries the op's
+/// single use and call sites spell `resolve_one(move c1)`.
 func resolve_one(claim: PipeReply) -> Result<UInt, SosStatus> {
     let answer = try (move claim).resolve()
     return answer.bytes[0] as UInt
@@ -348,11 +334,11 @@ func resolve_one(claim: PipeReply) -> Result<UInt, SosStatus> {
 
 /// One line to the console, out of a phase that holds no `System`.
 ///
-/// A phase gets the two connection ends and nothing else, because that is all
-/// any of them is about — so the one line that carries no format arguments goes
-/// through the runtime's own writer rather than through a `System` handle
-/// threaded down for it. `print` of a literal writes the bytes and reserves no
-/// message scratch, which is the property this whole file is arranged around.
+/// A phase gets the two connection ends and nothing else, so the one line that
+/// carries no format arguments goes through the runtime's own writer rather
+/// than a `System` handle threaded down for it. `print` of a literal writes the
+/// bytes and reserves no message scratch, the property this file is arranged
+/// around.
 func write_line(text: String) -> Int {
     print("{}", text)
     0

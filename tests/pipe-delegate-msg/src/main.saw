@@ -1,43 +1,34 @@
-// SOS M4 unit 4: THE DELEGATION PRIMITIVE, ARRIVING AS A MESSAGE (sawos design
-// 18; spec §2.1's ratified zero-copy example; `designs/010` ruling 5).
+// Delegation as a message: an obligation travels in a message's handle slot
+// (spec §2.1's zero-copy example).
 //
-// **UNIT 2 PROVED THE SAME CROSSING WITH A `give` AND THAT WAS THE SEED; THIS IS
-// THE PROTOCOL.** A launch-time `give` can only ever hand an obligation to a
-// process that has not started, out of a boot set its launcher wrote in advance;
-// §2.1's example is a FILESYSTEM forwarding a read it has just received to a
-// flash driver it talks to over IPC, which is a decision made at run time about
-// a request that did not exist when either process was launched. That needs the
-// obligation to travel IN A MESSAGE, and this case is that.
+// A launch-time `give` can only hand an obligation to a process that has not
+// started, out of a boot set its launcher wrote in advance. §2.1's example is a
+// filesystem forwarding a read it has just received to a flash driver it talks
+// to over IPC: a run-time decision about a request that did not exist when
+// either process was launched. That needs the obligation to travel in a
+// message, and this case does that.
 //
-// THE TOPOLOGY, AND WHY IT IS TWO PIPES RATHER THAN THREE PROCESSES:
+// Topology: two pipes, not three processes.
 //
 //   root  --A-->  root        root asks its own question and takes it off its
-//                             own outlet, so it holds the CLAIM and the
-//                             OBLIGATION for one exchange
-//   root  --B-->  child       root posts the OBLIGATION through a second
+//                             own outlet, so it holds the claim and the
+//                             obligation for one exchange
+//   root  --B-->  child       root posts the obligation through a second
 //                             connection, as a message's handle
 //   child --A-->  root        the child replies to the obligation it was sent,
-//                             and the bytes land at root's ORIGINAL claim
+//                             and the bytes land at root's original claim
 //
-// **THE ROUND TRIP GOES THROUGH TWO PIPES RATHER THAN THREE PROCESSES** — and
-// the mechanism is fully proven either way, because what is being tested is a
-// ONE-SHOT CROSSING A PROCESS BOUNDARY IN A MESSAGE. The third party in §2.1's
-// example differs from this child in exactly nothing that the kernel can see:
-// it holds an obligation it was sent, on a connection it cannot name, whose
-// client it has never heard of.
+// What is tested is a one-shot crossing a process boundary in a message. A
+// third party differs from this child in nothing the kernel can see: it holds
+// an obligation it was sent, on a connection it cannot name, whose client it
+// has never heard of. `tests/delegate-3p` is the three-process spelling (a
+// middle process that forwards and exits, a far process that answers); this
+// case shows the mechanism is the message and not the wiring.
 //
-// **THE THREE-PROCESS SPELLING THIS HEADER PROMISED HAS LANDED** — it waited on
-// M4 unit 5's topology and the `MAX_PROCESSES` bump it forces, and both arrived
-// with sawos design 21: `tests/delegate-3p` is root, a MIDDLE that forwards and
-// exits, and a FAR process that answers. **THIS CASE STAYS UNMOVED BESIDE IT**,
-// because the two prove different things — here, that the mechanism is the
-// MESSAGE and not the wiring; there, that the middle is a different PRINCIPAL
-// with its own table, its own quota and its own death.
-//
-// **AND THE PAYLOAD NEVER TRANSITS THE MIDDLE.** Root posts a one-byte question
-// and receives four bytes it never wrote; the child wrote them straight into the
+// The payload never transits the middle. Root posts a one-byte question and
+// receives four bytes it never wrote; the child wrote them straight into the
 // exchange's own ring slot, through an obligation that names a connection root
-// owns both ends of. That is the whole of what the zero-copy example claims.
+// owns both ends of.
 
 import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
             PipeHandle, PipeHandles, PipeMsg, Waiter, WaitResult, WaitPayload,
@@ -46,19 +37,19 @@ import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
-/// ROOT'S CONFIG, and the whole of the contract with the child. `child-handles`
-/// expects exactly these words; the kernel supplies no meaning for either.
+/// Root's config, and the whole of the contract with the child.
+/// `child-handles` expects exactly these words; the kernel supplies no meaning
+/// for either.
 static TAG_BOOT: UInt = 7
 static TAG_OUTLET: UInt = 11
 
-/// The key root's claim is attached under. One attachment, so any key would do —
-/// it is printed so the transcript says the answer came back through the wait it
-/// was asked for.
+/// The key root's claim is attached under. One attachment, so any key would do;
+/// it is printed so the transcript says the answer came back through the wait
+/// it was asked for.
 static KEY: UInt = 21
 
-/// What a child of this launcher may ask its System object for. `Transfer` is in
-/// the mask for the reason `give-boot-drain` records: it is the ticket the give
-/// itself checks.
+/// What a child of this launcher may ask its System object for. `Transfer` is
+/// the ticket the give itself checks.
 static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
                                | SystemRight.Transfer)
 
@@ -87,10 +78,10 @@ func _start(boot_handle: UInt) {
 
 /// Ask, forward, launch, and park on the claim.
 ///
-/// ONE PHASE PER FUNCTION, per design 14 finding 3: a `PipeMsg` is a
-/// message-sized value and every `print` with format arguments reserves its own
-/// scratch, so a `_start` holding all of it meets root's 16 KiB stack grant on
-/// the 64-bit profile before it meets anything else.
+/// One phase per function: a `PipeMsg` is a message-sized value and every
+/// `print` with format arguments reserves its own scratch, so a `_start`
+/// holding all of it would exhaust root's stack grant on the 64-bit
+/// profile.
 func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     var image = try proc.boot_handle_next()
     var dest = try proc.boot_handle_next()
@@ -99,10 +90,10 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
 
     let child = try system.process_create(image: &image_mem, memory: &dest_mem)
 
-    // CONNECTION A: root's own question, both ends root's.
+    // Connection A: root's own question, both ends root's.
     let a = try proc.pipe_create()
     let (a_in, a_out) = move a
-    // CONNECTION B: the courier. Root posts, the child takes.
+    // Connection B: the courier. Root posts, the child takes.
     let b = try proc.pipe_create()
     let (b_in, b_out) = move b
     let _ = system.debug_print("SOS delegatemsg: created\n")
@@ -115,16 +106,15 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     let (asked, request) = move taken
     let _ = move asked
 
-    // **THE FORWARD.** The obligation goes into a message's handle slot, and the
-    // post consumes the wrapper -- so root cannot answer its own question below
-    // this line, which is what delegation means. The exchange is untouched by
-    // the move: an obligation names a RING SLOT, and this changes only which
-    // table will name it.
+    // The forward. The obligation goes into a message's handle slot, and the
+    // post consumes the wrapper, so root cannot answer its own question below
+    // this line. The exchange is untouched by the move: an obligation names a
+    // ring slot, and this changes only which table will name it.
     var carrying = PipeHandles.none()
     carrying.put(0, request: move request)
     msg[0] = 1
     let courier = try b_in.post_with(body: &msg, len: 1, handles: &var carrying)
-    // A TELL: root wants no answer on B -- the answer it is waiting for comes
+    // A tell: root wants no answer on B; the answer it is waiting for comes
     // back on A, through the claim it kept.
     let _ = move courier
     let _ = system.debug_print("SOS delegatemsg: forwarded the obligation\n")
@@ -134,11 +124,9 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     try child.give(outlet: move b_out, tag: TAG_OUTLET)
     try child.start(boot_tag: TAG_BOOT)
 
-    // ROOT PARKS ON ITS OWN CLAIM. The answer arrives IN the wait record --
-    // `designs/010` ruling 11(a) -- so there is no resolve on this path at all,
-    // and the park is also what puts root in the one state where the child's
-    // reply can hand over a capability: the delivery runs inside the child's own
-    // syscall, while the entry it staged is still bound in its table.
+    // Root parks on its own claim. The answer arrives in the wait record, so
+    // there is no resolve on this path. Root is already parked when the child
+    // replies, so the delivery runs inside the child's own syscall.
     let waiter = try proc.waiter_create()
     try waiter.add(&claim, KEY)
     let woke = try waiter.wait()
@@ -161,7 +149,7 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     return
 }
 
-/// The four bytes, in their own frame — the one place this file formats numbers.
+/// The four bytes, in their own frame; the one place this file formats numbers.
 func report(woke: &WaitResult) -> Result<Void, SosStatus> {
     print("SOS delegatemsg: reply len={} b={},{},{},{}\n", reply_len(&woke),
           reply_byte(&woke, 0), reply_byte(&woke, 1), reply_byte(&woke, 2),
@@ -169,23 +157,22 @@ func report(woke: &WaitResult) -> Result<Void, SosStatus> {
     return
 }
 
-/// **THE ANSWER CARRIED A CAPABILITY TOO, AND THIS SPENDS IT** — §2.1's
+/// The answer carried a capability too, and this spends it: §2.1's
 /// `send(data?, handles?)` in the direction that is easiest to forget.
 ///
-/// The child replied with a sibling of its own SERVER end, so root now holds
+/// The child replied with a sibling of its own server end, so root now holds
 /// both ends of connection B: it posts through the inlet it kept and takes
 /// through the outlet that came back in a message. A word that was not a live
 /// capability could not do that.
 ///
-/// **AND IT DOES NOT MATTER WHETHER THE REPLIER IS STILL ALIVE** (`designs/010`
-/// ruling 5 as re-ruled Sep 2 — take-at-post). The child's handle left its table
-/// at the `reply_with`, so what arrives here is a reference the kernel has been
-/// holding since; whether the child was still executing when root's delivery ran
-/// is not a question this arm's correctness depends on. `pipe-send-exit` is
-/// where that independence is the point rather than a footnote.
+/// It does not matter whether the replier is still alive. The child's handle
+/// left its table at the `reply_with`, so what arrives here is a reference the
+/// kernel has been holding since; this arm does not depend on whether the child
+/// was still executing when root's delivery ran. `pipe-send-exit` is where that
+/// independence is the point.
 func use_returned_end(system: &System, b_in: &PipeInlet,
                       answered: WaitResult) -> Result<Void, SosStatus> {
-    // OPEN THE RECORD: this phase SPENDS what arrived, so it takes the payload
+    // Open the record: this phase spends what arrived, so it takes the payload
     // by value and matches it owned (`WaitResult.open`).
     let (_, what) = (move answered).open()
     guard let reply_msg = reply_of(move what) else { return SosStatus.BadImage }
@@ -214,10 +201,9 @@ func use_returned_end(system: &System, b_in: &PipeInlet,
     }
 }
 
-/// **THE MESSAGE OUT OF AN OWNED PAYLOAD.** Two nested owned matches, each
+/// The message out of an owned payload. Two nested owned matches, each
 /// consuming its scrutinee, so the `PipeMsg` comes out of `Reply(Data(msg))`
-/// exactly once — the licensed spelling of what SL-17 makes unsound through a
-/// borrow.
+/// exactly once. Moving a payload out of a borrowed match is unsound.
 func reply_of(what: WaitPayload) -> PipeMsg? {
     match what {
         case Reply(outcome) -> {
@@ -235,10 +221,10 @@ func reply_of(what: WaitPayload) -> PipeMsg? {
 
 /// How many bytes the reply in this record carries.
 ///
-/// **IT READS A FIELD RATHER THAN A PAYLOAD**, which is M4 unit 4's shape: a
-/// delivered message may carry HANDLES, and a handle has to be MOVED out to be
-/// used, so the message lives in `WaitResult`'s own optional field where a
-/// `take()` reaches it. Reading its length is an ordinary borrow.
+/// It only looks: it matches `r.what` through the place and calls the `&self`
+/// accessor `ReplyDelivery.len()` on the arm binding, both borrows. A delivered
+/// message may carry handles, and moving one out needs `WaitResult.open` (see
+/// `use_returned_end`).
 func reply_len(r: &WaitResult) -> UInt {
     match r.what {
         case Reply(outcome) -> outcome.len(),

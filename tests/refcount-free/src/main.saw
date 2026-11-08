@@ -1,49 +1,45 @@
-// SOS M3 unit 5: THE REFERENCE COUNT, AND WHAT ZERO DOES (sawos design 7 D-1).
+// The reference count, and what zero does.
 //
-// **TWO WAYS AN OBJECT OUTLIVES A RELEASE, AND A TEARDOWN THAT COUNTS
-// NEITHER.** Before this unit an Event's slot came back at its process's
-// teardown and at no other moment, so neither half of this case could be
-// written: there was nothing to count and nothing to observe counting. The
-// transcript is read as an order:
+// An object can outlive a release in two ways. A kernel that counted neither
+// would free an Event only when its process ended, which the final
+// `events={zero}` row rules out. The transcript is read as an order:
 //
-//   SOS refcount: sibling word=42        <- the FIRST handle was released and
+//   SOS refcount: sibling word=42        <- the first handle was released and
 //                                           the object answered through the
-//                                           SECOND, which is what a count buys
-//   SOS refcount: attached key=77 word=9 <- the LAST handle was released and
+//                                           second, which is what a count buys
+//   SOS refcount: attached key=77 word=9 <- the last handle was released and
 //                                           the object was still there, because
-//                                           an ATTACHMENT is a reference too
+//                                           an attachment is a reference too
 //   SOS refcount: done
 //   SOS: process teardown ... events={zero} waiters={one} ...
-//                                        <- AND BOTH ARE GONE BEFORE THE END
+//                                        <- and both are gone before the end
 //
-// **THE LAST LINE IS THE MONEY PROOF, and it is a count the harness already
-// asserts on every other case.** `events={zero}` after a program that made two
-// events says the slab got them back mid-life. Yesterday it would have said
-// two, because a teardown was the only thing that could ever free one.
+// The last line is the proof, and it is a count the harness already asserts on
+// every other case. `events={zero}` after a program that made two events says
+// the slab got them back mid-life; without a count it would say two, because a
+// teardown would be the only thing that could free one.
 //
-// ARM ONE is `MINT_OP` used for what design 4 built it for, one kind over: a
-// SIBLING handle onto the same Event, in the same table, independently
-// releasable. Releasing the first leaves the object whole — proven by USING it
-// through the second, since a freed Event would answer a `BadHandle` fault
-// rather than a word — and releasing the second is what ends it.
+// Arm one is a sibling handle onto the same Event, in the same table,
+// independently releasable. Releasing the first leaves the object whole,
+// proven by using it through the second, since a freed Event would answer a
+// `BadHandle` fault rather than a word. Releasing the second ends it.
 //
-// ARM TWO is the CASCADE's near side. An attachment is a counted reference to
-// the WAITABLE (design 7 D-1's table), so an Event whose only handle is
-// released while a Waiter watches it stays alive and stays deliverable — the
-// wait below is what proves that, since the record could not arrive from a
-// reclaimed slot. `Waiter.Remove` then drops the attachment's reference, and
-// THAT is the zero that frees it. The Waiter itself survives to the teardown,
-// which is why `waiters=` is one where `events=` is none: an attachment
-// references the waitable and never the Waiter that holds it, and that
-// asymmetry is exactly what makes the cascade terminate.
+// Arm two is the cascade's near side. An attachment is a counted reference to
+// the waitable, so an Event whose only handle is released while a Waiter
+// watches it stays alive and stays deliverable. The wait below proves that,
+// since the record could not arrive from a reclaimed slot. `Waiter.Remove`
+// then drops the attachment's reference, and that is the zero that frees it.
+// The Waiter itself survives to the teardown, which is why `waiters=` is one
+// where `events=` is none: an attachment references the waitable and never the
+// Waiter that holds it, and that asymmetry is what makes the cascade
+// terminate.
 //
-// **IT REACHES THE C ALTITUDE, and that is forced rather than chosen.** The
-// typed layer has no word extractor — an `Event` in hand is one the kernel
-// handed over, and `mint` exists only on `System` — so "a second handle onto
-// this Event" is unspellable there. `handle_remint` reaches this floor for the
-// mirror reason, and `handle-drop-release` is what the typed side of the same
-// mechanism looks like. Every pointer is confined to a small named `unsafe`
-// helper, which is `timer_badrecord`'s arrangement and design 136's rule.
+// This case works at the C altitude, which is forced: the typed layer has no
+// word extractor (an `Event` in hand is one the kernel handed over, and `Event`
+// has no `mint`), so "a second handle onto this Event" is unspellable there.
+// `handle_remint` is at this floor for the mirror reason, and
+// `handle-drop-release` is the typed side of the same mechanism. Every pointer
+// is confined to a small named `unsafe` helper, as in `timer_badrecord`.
 
 import sos.{System, sos_system_process_self, sos_process_event_create,
             sos_process_waiter_create, sos_process_exit, sos_event_signal,
@@ -53,23 +49,22 @@ import sos.{System, sos_system_process_self, sos_process_event_create,
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
-/// The status word a successful op answers with (`SosStatus.Ok`). Spelled as a
-/// number because this file works at the C altitude, where a status is one.
-/// **KEEP EVERY RIGHT** — the mask `ProcessOp.Give` and `SystemOp.ProcessSelf`
-/// grew in M4 unit 4 (sawos design 18). All-ones is what the no-argument
-/// spelling meant before it existed; spelled as a number because this file works
-/// at the C altitude, where a rights mask is one.
+/// Keep every right: the all-ones mask for `ProcessOp.Give` and
+/// `SystemOp.ProcessSelf`. Spelled as a number because this file works at the C
+/// altitude, where a rights mask is one.
 static KEEP_ALL: UInt = 0xFFFF_FFFF
 
+/// The status word a successful op answers with (`SosStatus.Ok`). Spelled as a
+/// number because this file works at the C altitude, where a status is one.
 static STATUS_OK: UInt = 0
 
 /// `EventMode.Or`, as the wire value. The C altitude writes a mode as a number
-/// — the floor's own documented difference in kind — because a C caller has no
+/// (the floor's own documented difference in kind) because a C caller has no
 /// enum to be handed.
 static MODE_OR: UInt = 0
 
 /// The bits arm one signals through the sibling. A number that appears nowhere
-/// else in this transcript, so reading it back proves WHICH object answered.
+/// else in this transcript, so reading it back proves which object answered.
 static WORD_A: UInt = 42
 
 /// The bits arm two signals before it drops its only handle.
@@ -80,13 +75,12 @@ static KEY: UInt = 77
 
 /// Words this file gives `Waiter.Wait` to answer into.
 ///
-/// **IT IS AN OVER-PROVISION, NOT THE RECORD'S SIZE** (sawos design 15, M4 unit
-/// 3). §2.2 checks a copy-out capacity for AT LEAST the record, and
-/// `designs/010` ruling 11(a) grew that minimum by a whole message body — four
-/// header words plus `PIPE_BODY_BYTES`. A caller at the C altitude cannot name
-/// either constant (both are `sosabi`'s, which this file neither imports nor
-/// could), so it says a number comfortably past both and reads only the three
-/// words it cares about.
+/// It is an over-provision, not the record's size. §2.2 checks a copy-out
+/// capacity for at least the record, and that minimum includes a whole message
+/// body: the header words, the packed meta, the handle slots and
+/// `PIPE_BODY_BYTES`. A caller at the C altitude cannot name these (they are
+/// `sosabi`'s, which this file neither imports nor could), so it says a number
+/// comfortably past them and reads only the two words it cares about.
 static RECORD_WORDS: Int = 48
 
 /// This process's own Process handle, or `0` — which names nothing.
@@ -119,9 +113,9 @@ func make_waiter(proc: UInt) unsafe -> UInt {
     out
 }
 
-/// A SIBLING handle onto whatever `word` names, or `0`. `ALL_RIGHTS` narrows
-/// nothing, so what comes back is a second NAME for one object rather than a
-/// second object — and the reference count is what makes that a fact the kernel
+/// A sibling handle onto whatever `word` names, or `0`. `ALL_RIGHTS` narrows
+/// nothing, so what comes back is a second name for one object rather than a
+/// second object, and the reference count is what makes that a fact the kernel
 /// knows rather than one this program remembers.
 func mint_second(word: UInt) unsafe -> UInt {
     var out: UInt = 0
@@ -142,7 +136,7 @@ func drain_event(word: UInt) unsafe -> UInt {
 }
 
 /// Park on `waiter` until something it watches is ready, and answer (the
-/// attacher's KEY, the PAYLOAD) — words 0 and 2 of the wait record's published
+/// attacher's key, the payload): words 0 and 2 of the wait record's published
 /// layout. `(0, 0)` when the call was refused.
 func wait_once(waiter: UInt) unsafe -> (UInt, UInt) {
     var record: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
@@ -165,7 +159,7 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // ===== ARM ONE: two handles, one object =====
+    // ===== Arm one: two handles, one object =====
 
     let first = make_event(proc)
     if first == 0 {
@@ -180,9 +174,8 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // The first handle goes. Two references become one, and NOTHING is freed —
-    // which is the whole claim, and the three lines below are how it is
-    // observed.
+    // The first handle goes. Two references become one, and nothing is freed,
+    // which is the whole claim; the three lines below are how it is observed.
     if sos_handle_release(first) != STATUS_OK {
         let _ = system.debug_print("SOS refcount: first release refused\n")
         let _ = system.shutdown(EXIT_FAILED)
@@ -191,10 +184,10 @@ func _start(boot_handle: UInt) {
     let _ = sos_event_signal(sibling, WORD_A)
     print("SOS refcount: sibling word={}\n", drain_event(sibling))
 
-    // And the second. THIS is the zero, so this is where the slot goes back.
+    // And the second. This is the zero, so this is where the slot goes back.
     let _ = sos_handle_release(sibling)
 
-    // ===== ARM TWO: an attachment outlives the last handle =====
+    // ===== Arm two: an attachment outlives the last handle =====
 
     let waiter = make_waiter(proc)
     if waiter == 0 {
@@ -209,19 +202,18 @@ func _start(boot_handle: UInt) {
         return
     }
     let _ = sos_event_signal(watched, WORD_B)
-    // The flags word is M4 unit 3's third argument (sawos design 15): zero is
-    // `AttachMode.Persistent` and a non-consuming attach, which is what this
-    // case has always done and what its reference arithmetic below counts.
+    // The flags word is the third argument: zero is `AttachMode.Persistent` and
+    // a non-consuming attach, which is what this case's reference arithmetic
+    // below counts.
     if sos_waiter_add(waiter, watched, KEY, 0) != STATUS_OK {
         let _ = system.debug_print("SOS refcount: attach refused\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
 
-    // THE ONLY HANDLE ONTO IT, RELEASED — and the object stays, because the
-    // attachment is a reference. Before design 7 nothing would have freed it
-    // either; what is new is that something COULD have, and did not, for a
-    // reason the kernel can state.
+    // The only handle onto it is released, and the object stays, because the
+    // attachment is a reference. Something could have freed it here, and did
+    // not, for a reason the kernel can state.
     let _ = sos_handle_release(watched)
 
     // A record naming this key with these bits could not have come out of a
@@ -229,8 +221,8 @@ func _start(boot_handle: UInt) {
     let (key, word) = wait_once(waiter)
     print("SOS refcount: attached key={} word={}\n", key, word)
 
-    // AND THE DETACH IS THE ZERO. The attachment was the last reference, so
-    // dropping it is what ends the object — the cascade seen from its one
+    // And the detach is the zero. The attachment was the last reference, so
+    // dropping it is what ends the object: the cascade seen from its one
     // user-visible door.
     if sos_waiter_remove(waiter, KEY) != STATUS_OK {
         let _ = system.debug_print("SOS refcount: detach refused\n")
@@ -240,7 +232,7 @@ func _start(boot_handle: UInt) {
 
     let _ = system.debug_print("SOS refcount: done\n")
 
-    // EXIT RATHER THAN SHUTDOWN, so the teardown line is printed and its
+    // Exit rather than shutdown, so the teardown line is printed and its
     // `events=` count can carry the claim. `shutdown` stops the machine with
     // nothing said.
     let _ = sos_process_exit(proc, EXIT_OK)

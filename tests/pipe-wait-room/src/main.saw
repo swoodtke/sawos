@@ -1,31 +1,25 @@
-// SOS M4 unit 3: THE INLET'S ROOM-TO-POST LEVEL (sawos design 15;
-// `designs/010` ruling 8; spec §2.2's waitable list, amended to include the
+// The inlet's room-to-post level (spec §2.2's waitable list, which includes the
 // client end).
 //
-// **`post` CAN NEVER BLOCK, SO A REFUSED POSTER NEEDED SOMETHING BETTER THAN A
-// POLL LOOP.** Ruling 4 made post the one kernel primitive on the client side
-// and gave it no park; ruling 8 gives the client END a level instead, and the
-// payload word says WHICH of the two readinesses woke you:
+// `post` never blocks, so a refused poster needs something better than a poll
+// loop. The client end has a level, and the payload word says which of the two
+// readinesses woke the waiter:
 //
 //   room says there is space    the ring had a free slot again, because an
 //                               exchange settled
-//   room says the peer is gone  every outlet handle went, so posting is over —
-//                               and a waker learns that without a probe post,
-//                               which is what ruling 8 asks the payload for
+//   room says the peer is gone  every outlet handle went, so posting is over;
+//                               a waker learns that without a probe post
 //
-// **THE FIRST ARM COUNTS THE RING AROUND ITSELF.** The ring is filled with TELLs
-// until the kernel refuses, so the level is provably FALSE; one exchange is then
-// settled and the level is provably TRUE. The program never names
-// `PIPE_INFLIGHT` — what it asserts is the DIFFERENCE, which is `pipe-oneshot`'s
-// own discipline applied to a waitable rather than to a count.
+// The first arm counts the ring around itself. The ring is filled with tells
+// until the kernel refuses, so the level is provably false; one exchange is
+// then settled and the level is provably true. The program never names
+// `PIPE_INFLIGHT`; it asserts the difference, as `pipe-oneshot` does for a
+// count.
 //
-// **NOTHING PARKS, AND THE LEVEL IS WHAT IS UNDER TEST.** Root is alone, so the
-// readiness is arranged before the wait; that is level-triggering doing what
-// §2.2 ratifies it for, and the genuine park on this arm is
-// `pipe-send-manual`'s blocking round trip, whose backpressure leg IS this
-// level — that case fills the ring so its post is genuinely refused.
+// Nothing parks, and the level is what is under test. Root is alone, so the
+// readiness is arranged before the wait (level-triggering, §2.2).
 //
-// ONE PHASE PER FUNCTION, on design 14 finding 3's stack ceiling.
+// One phase per function, within the stack ceiling.
 
 import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
             Waiter, WaitResult, WaitPayload, InletLevel, AttachMode, SosStatus,
@@ -72,15 +66,15 @@ func _start(boot_handle: UInt) {
     let _ = proc.exit(EXIT_OK)
 }
 
-/// **FILL THE RING, SETTLE ONE EXCHANGE, AND THE LEVEL COMES BACK.**
+/// Fill the ring, settle one exchange, and the level comes back.
 ///
-/// The fill is TELLs, so every staged exchange is owed to the live outlet and
+/// The fill is tells, so every staged exchange is owed to the live outlet and
 /// none of them settles on its own; taking one and dropping the obligation
-/// settles that one and no other. So the free depth goes from zero to one, and
-/// the level's answer is `Room`.
+/// settles that one and no other. The free depth goes from zero to one, and the
+/// level's answer is `Room`.
 ///
-/// The pair is created and dropped inside this phase, which keeps the two arms
-/// independent at a `DEFAULT_QUOTA_PIPES` of two.
+/// The pair is created and dropped inside this phase, so each arm starts from a
+/// fresh ring and the two arms are independent.
 func room_returns(proc: &Process, waiter: &Waiter) -> Result<Void, SosStatus> {
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
@@ -90,11 +84,9 @@ func room_returns(proc: &Process, waiter: &Waiter) -> Result<Void, SosStatus> {
     let (inlet, outlet) = move pair
 
     let depth = try fill(&inlet, &msg)
-    // The ring is now full: one more post would be refused, which is what makes
-    // the level FALSE at this instant.
-    // The refusal is on the ERROR channel since M4 unit 4.5 (`designs/010`
-    // ruling 12(a)), so the full ring is a `WouldBlock` arm rather than a
-    // `None` — this case is a poller and says so.
+    // The ring is now full: one more post would be refused, which makes the
+    // level false at this instant. The refusal is on the error channel, so the
+    // full ring is a `WouldBlock` arm.
     match inlet.post(body: &msg, len: 1) {
         case Ok(claim) -> {
             let _ = move claim
@@ -108,8 +100,8 @@ func room_returns(proc: &Process, waiter: &Waiter) -> Result<Void, SosStatus> {
         },
     }
 
-    // One exchange settles — taken, and its obligation dropped with nobody
-    // holding the claim — so exactly one slot comes back.
+    // One exchange settles (taken, and its obligation dropped with nobody
+    // holding the claim), so exactly one slot comes back.
     let took = try take_and_drop(&outlet, &var buf)
     if not took { return BUG }
 
@@ -123,12 +115,12 @@ func room_returns(proc: &Process, waiter: &Waiter) -> Result<Void, SosStatus> {
     return
 }
 
-/// **THE SERVER END GOES, AND THE LEVEL SAYS SO RATHER THAN SAYING "SPACE".**
+/// The server end goes, and the level says so rather than saying "space".
 ///
-/// `PeerGone` wins over `Room` here even though the ring is empty, and the
-/// asymmetry with the outlet's drain-then-terminal order is the OPS' own:
-/// `PipeInletOp.Post` asks about the outlet column before it asks about the
-/// ring, because a free slot would be a place to put a message with no future.
+/// `PeerGone` wins over `Room` here even though the ring is empty, unlike the
+/// outlet's drain-then-terminal order: `PipeInletOp.Post` asks about the outlet
+/// column before it asks about the ring, because a free slot would be a place
+/// to put a message with no future.
 func peer_gone(proc: &Process, waiter: &Waiter) -> Result<Void, SosStatus> {
     let pair = try proc.pipe_create()
     let (inlet, outlet) = move pair
@@ -143,8 +135,8 @@ func peer_gone(proc: &Process, waiter: &Waiter) -> Result<Void, SosStatus> {
 }
 
 /// Which of the inlet level's two readings this record carries. A record of any
-/// other kind answers with a word this case never expects to see, which is what
-/// makes the row an assertion rather than a label.
+/// other kind answers with a word this case never expects to see, so the row is
+/// an assertion rather than a label.
 func level_name(r: &WaitResult) -> String {
     match r.what {
         case Room(state) -> {

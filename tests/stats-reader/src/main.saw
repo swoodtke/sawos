@@ -1,35 +1,31 @@
-// SOS M5 unit 7: THE CHILD THAT WATCHES ITS LAUNCHER (sawos design 37) —
-// `stats-region`'s other half.
+// The child that watches its launcher: `stats-region`'s other half.
 //
-// **THIS IS THE `top` SHAPE, AND IT IS THE HALF THAT COULD NOT BE WRITTEN
-// BEFORE.** `Process.stats()` answers about ONE process and needs a handle onto
-// that process; a child holds no handle onto its launcher and never will. The
-// region is a different kind of answer: one page, every slot's columns, gated by
-// one right its launcher chose to pass on. So this program observes traffic that
-// is not its own, with no handle onto its subject and no syscall per sample.
+// This is the `top` shape. `Process.stats()` answers about one process and
+// needs a handle onto it; a child holds no handle onto its launcher. The region
+// is a different kind of answer: one page, every slot's columns, gated by one
+// right the launcher chose to pass on. So this program observes traffic that is
+// not its own, with no handle onto its subject and no syscall per sample.
 //
-// THE TRANSCRIPT, read as two claims:
+// The transcript reads as two claims:
 //
-//   SOS statsreader: my row 1        <- rows are indexed by PROCESS SLOT, and
-//                                       this is the second process the machine
-//                                       made
-//   SOS statsreader: launcher busier <- row zero — its launcher's — carries more
-//                                       syscalls than row one does, which is
-//                                       another process's state, read out of
-//                                       this process's own address space
+//   SOS statsreader: my row 1        <- rows are indexed by process slot; this
+//                                       is the second process the machine made
+//   SOS statsreader: launcher busier <- row zero (its launcher's) carries more
+//                                       syscalls than row one does: another
+//                                       process's state, read out of this
+//                                       process's own address space
 //
-// **WHY ROW ZERO IS THE LAUNCHER, STATED RATHER THAN ASSUMED.** Slot numbering
-// is kernel-internal and the op only ever answers the CALLER's own row, so this
-// program cannot ask which row its launcher occupies — that naming question is
-// design 37's recorded follow-on. What makes reading row zero sound here is that
-// `stats-region` ASSERTS its own row is zero, in this same transcript, before it
-// ever starts this child. If the allocator ever changed, that assertion fails
-// first and loudly rather than this one reading a stranger's numbers.
+// Why row zero is the launcher: slot numbering is kernel-internal and the op
+// only answers the caller's own row, so this program cannot ask which row its
+// launcher occupies. Reading row zero is sound because `stats-region` asserts
+// that its own row is zero, in this same transcript, before it starts this
+// child. If the allocator changed, that assertion fails first rather than this
+// one reading a stranger's numbers.
 //
-// The comparison is a floor, not an equality: a launcher that has drained a boot
-// set, created a process, minted, given, started and armed a timer has made many
-// more traps than a child that has mapped one page. Asserting the ORDER rather
-// than a number is what keeps the claim about visibility instead of about
+// The comparison is a floor, not an equality: a launcher that has drained a
+// boot set, created a process, minted, given, started and armed a timer has
+// made many more traps than a child that has mapped one page. Asserting the
+// order rather than a number keeps the claim about visibility, not about
 // arithmetic that would move whenever either program gained a line.
 
 import sos.{System, Process, StatsRegion, ProcessStats, SosStatus}
@@ -55,9 +51,9 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // **THE RIGHT ITS LAUNCHER PASSED ON.** A child minted without
-    // `SystemRight.StatsRegionMap` faults here instead — which is the
-    // attenuation, and is why the bit exists separately from `ProcessRight.Stats`.
+    // The right its launcher passed on. A child minted without
+    // `SystemRight.StatsRegionMap` faults here, which is the attenuation and
+    // why the bit exists separately from `ProcessRight.Stats`.
     let region = try system.stats_region_map() catch {
         print("SOS statsreader: map failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -72,7 +68,7 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // TWO ROWS, ONE PAGE, NO SYSCALLS. Neither of these reads traps.
+    // Two rows, one page, no syscalls: neither of these reads traps.
     let launcher = region.row(LAUNCHER_ROW)
     let mine = region.mine()
     if launcher.syscalls <= mine.syscalls {

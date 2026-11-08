@@ -1,7 +1,7 @@
-// SOS M5 unit 6: A SLAB'S CEILING IS THE DEPLOYMENT'S, NOT THE COMPILE'S
-// (sawos design 32, on design 25 D-6).
+// A slab's ceiling is the deployment's, not the compile's: donating a region
+// raises the number of Waiters the kernel can hold.
 //
-// The transcript:
+// Transcript:
 //
 //   SOS slabdonate: floor=4 fifth refused: out of kernel objects
 //   SOS slabdonate: donated a page of waiters
@@ -9,62 +9,56 @@
 //   SOS slabdonate: extent waiter woke key=77 word=4
 //   SOS slabdonate: done
 //
-// FOUR CLAIMS, IN ORDER.
+// Four claims, in order.
 //
-//  1. THE FLOOR IS REAL. `MAX_WAITERS` is 4 and root's quota is unlimited, so
-//     the fifth `waiter_create` meets the SLAB and answers `NoResource` — "out
-//     of kernel objects", the same status it has always answered, for the same
-//     reason.
+// 1. The floor is real. Root's quota is unlimited, so the `waiter_create` past
+//    `MAX_WAITERS` meets the slab and answers `NoResource` ("out of kernel
+//    objects").
 //
-//  2. THE DONATION IS ORDINARY MEMORY. A page is cut out of root's pool with
-//     `split` and handed to `SystemOp.SlabDonate`. Nothing about the region is
-//     special: it is the same kind of capability a launcher would hand a child.
-//     It is CONSUMED — `move scratch` at the call site says so, and there is no
-//     way to get it back.
+// 2. The donation is ordinary memory. A page is cut out of root's pool with
+//    `split` and handed to `SystemOp.SlabDonate`. It is consumed: `move
+//    scratch` at the call site says so, and there is no way to get it back.
 //
-//  3. THE CEILING MOVED. The same call that was refused two lines earlier now
-//     succeeds. That is the whole unit in one line.
+// 3. The ceiling moved. The same call that was refused now succeeds.
 //
-//  4. **AND THE SLOT IN DONATED MEMORY IS A SLOT LIKE ANY OTHER**, which is the
-//     claim that would be easy to leave untested and is the one that matters. A
-//     count proves the allocator found the extent; it does not prove the kernel
-//     can safely WRITE there. So the fifth waiter — the one that can only be in
-//     extent 1, since the first four filled extent 0 — takes an attachment, is
-//     signalled, and reports its key and the delivered word out of a wait
-//     record. Attach, deliver and wake all read and write that slot.
+// 4. A slot in donated memory is a slot like any other. A count proves the
+//    allocator found the extent; it does not prove the kernel can safely write
+//    there. The fifth waiter can only be in extent 1, since the first four
+//    filled extent 0; it takes an attachment, is signalled, and reports its key
+//    and the delivered word out of a wait record. Attach, deliver and wake all
+//    read and write that slot.
 //
-// WHY THE SLOT COUNT IS NEVER PRINTED: a donated extent holds
-// `page / sizeof(WaiterSlot)` slots, and that divisor differs between the two
-// profiles (field alignment). The new ceiling is therefore arch-dependent, while
-// every claim above is not — so the case asserts that the ceiling MOVED and
-// leaves the arithmetic to design 32's As-built, which prices both.
+// The slot count is never printed: a donated extent holds `page /
+// sizeof(WaiterSlot)` slots, and that divisor differs between the two profiles
+// (field alignment). The new ceiling is arch-dependent while every claim above
+// is not, so the case asserts that the ceiling moved and not by how much.
 //
-// The house diagnostic style (see `tests/memory-recycle`): a failure prints and
-// shuts down with a non-zero status, so a broken case cannot pass quietly.
+// A failure prints and shuts down with a non-zero status, so a broken case
+// cannot pass quietly.
 
 import sos.{System, Process, Memory, Waiter, Event, EventMode, WaitResult,
             SlabKind, SosStatus}
 
-/// One protection unit's worth on either profile — comfortably more than one
+/// One protection unit's worth on either profile; comfortably more than one
 /// waiter slot, which is all the donation has to be.
 static PAGE: UInt = 0x1000
 
-/// The key the extent-1 waiter's attachment travels under. A number that appears
-/// nowhere else in the transcript.
+/// The key the extent-1 waiter's attachment travels under. A number that
+/// appears nowhere else in the transcript.
 static KEY: UInt = 77
 
 /// The bit the event is signalled with, and therefore the word the wait reports.
 static BIT: UInt = 4
 
-/// `MAX_WAITERS`, written down so that raising the kernel's floor fails THIS
+/// `MAX_WAITERS`, written down so that raising the kernel's floor fails this
 /// case loudly rather than quietly making its first claim vacuous.
 static FLOOR: UInt = 4
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
-/// The word the wait delivered. This program attaches exactly one Event, so
-/// every other payload is a kernel bug rather than a case to handle.
+/// The word the wait delivered. This program attaches exactly one Event, so any
+/// other payload is a kernel bug rather than a case to handle.
 func at_wait(r: &WaitResult) -> UInt {
     match r.what {
         case Event(word) -> word,
@@ -92,11 +86,11 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // ---- CLAIM 1: the compiled floor is real ------------------------------
+    // ---- Claim 1: the floor is real --------------------------------------
     //
-    // Four separate bindings rather than a loop, because every one of them has
-    // to be LIVE at once for the fifth to meet the slab — a loop that dropped
-    // each waiter as it went would never fill anything.
+    // Separate bindings rather than a loop: all of them must be live at once
+    // for the next create to meet the slab, and a loop that dropped each waiter
+    // as it went would never fill anything.
     let w0 = try proc.waiter_create() catch {
         print("SOS slabdonate: no waiter 0: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -118,7 +112,7 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // The negative, asserted on the SPECIFIC status: a full slab is
+    // The negative, asserted on the specific status: a full slab is
     // `NoResource`, and an `Ok` here would mean the floor was never the floor.
     match proc.waiter_create() {
         case Ok(_) -> {
@@ -131,17 +125,17 @@ func _start(boot_handle: UInt) {
                              FLOOR, e),
     }
 
-    // ---- CLAIM 2: the donation ------------------------------------------
+    // ---- Claim 2: the donation ------------------------------------------
     let scratch = try pool.split(len: PAGE) catch {
         print("SOS slabdonate: no page to donate: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    // THE REGION IS CONSUMED HERE. `move` is written at the call site, which is
-    // the transfer-funnel contract: past this line the binding is dead and the
-    // bytes are the kernel's forever. The error carries the region BACK — a
-    // refused donation consumes nothing — and this program simply drops it,
-    // since a failure here is a failure of the case.
+    // The region is consumed here. `move` is written at the call site (the
+    // transfer-funnel contract): past this line the binding is dead and the
+    // bytes are the kernel's. The error carries the region back, since a
+    // refused donation consumes nothing, and this program drops it because a
+    // failure here is a failure of the case.
     try system.slab_donate(kind: SlabKind.Waiters, memory: move scratch) catch {
         let _ = system.debug_print("SOS slabdonate: donation refused\n")
         let _ = system.shutdown(EXIT_FAILED)
@@ -149,7 +143,7 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS slabdonate: donated a page of waiters\n")
 
-    // ---- CLAIM 3: the ceiling moved --------------------------------------
+    // ---- Claim 3: the ceiling moved --------------------------------------
     let w4 = try proc.waiter_create() catch {
         print("SOS slabdonate: the donated extent gave nothing: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -157,19 +151,19 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS slabdonate: fifth waiter created\n")
 
-    // ---- CLAIM 4: and the donated slot WORKS -----------------------------
+    // ---- Claim 4: the donated slot works -----------------------------------
     //
-    // `w4` cannot be anywhere but the donated extent: `w0`..`w3` are still live
-    // and they are extent 0 in its entirety.
+    // `w4` can only be in the donated extent: `w0`..`w3` are still live and
+    // fill extent 0 entirely.
     let event = try proc.event_create(mode: EventMode.Or) catch {
         print("SOS slabdonate: no event: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
     let _ = w4.add(&event, KEY)
-    // SIGNAL FIRST, THEN WAIT — §2.2 is level-triggered, so the readiness is
+    // Signal first, then wait: §2.2 is level-triggered, so the readiness is
     // still there when the wait looks and this single-threaded program never
-    // parks. (`tests/event-basics` is where that ordering is the subject.)
+    // parks (`tests/event-basics` is where that ordering is the subject).
     let _ = event.signal(BIT)
     let report = try w4.wait() catch {
         print("SOS slabdonate: extent waiter never woke: {}\n", error)

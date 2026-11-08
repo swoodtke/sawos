@@ -1,47 +1,35 @@
-// SOS M4 unit 3.5: THE REPLY LEG FIRES, AND IT DOES NOT PARK (sawos design 17;
-// spec §2.1's abandonment paragraph; `designs/010` ruling 4's rider).
+// The reply leg of `reply_wait` fires, and it does not park (spec §2.1's
+// abandonment paragraph). Expected: the transcript below, then exit 0.
 //
 //   SOS replywaitdead: the client let its claim go
 //   SOS replywaitdead: reply_wait says the reply did not land: the other end of
 //                      this connection is gone
 //   SOS replywaitdead: done
 //
-// **A DEAD CLIENT MUST NOT STALL A SERVER LOOP**, which is the one claim the
-// fused path owes that the composed path does not. `reply_wait` does two things
-// in one trap, so it has two ways to fail, and the order matters: if the REPLY
-// leg fails the op returns AT ONCE, without ever reaching the wait — otherwise a
-// server whose client had already given up would park on a Waiter it entered by
+// A dead client must not stall a server loop. `reply_wait` does two things in
+// one trap, so it has two ways to fail, and the order matters: if the reply leg
+// fails the op returns at once, without reaching the wait. Otherwise a server
+// whose client had already given up would park on a Waiter it entered by
 // accident, and one abandoned exchange would take the loop down with it.
 //
-// **THE EMPTY WAITER IS THE ASSERTION.** Nothing is attached to the Waiter this
+// The empty Waiter is the assertion. Nothing is attached to the Waiter this
 // program hands the op, so a park here has nothing that could ever wake it: the
 // case would end `SOS: process fault: every thread blocked`, the same report
-// `wait-deadlock` pins. Reaching the `done` line is therefore not merely a
-// status check — it is the proof that no park happened, written as the thing
-// that would have gone wrong.
+// `wait-deadlock` pins. Reaching the `done` line is therefore the proof that no
+// park happened.
 //
-// **AND THE ERROR NAMES ITS LEG** (user-ruled Sep 1). `Err(Reply(s))` says the
-// reply did not land and the obligation is discharged all the same, so the
-// loop's next act is its own `waiter.wait()`; `Err(Wait(s))` would mean the
-// exchange COMPLETED and the wait broke, which is not something waiting again
-// can fix. This case asserts the first and refuses the second by name — a
-// `match`, because a negative test that asserts a specific error value is what
-// `match` is still for.
+// The error names its leg. `Err(Reply(s))` says the reply did not land and the
+// obligation is discharged all the same, so the loop's next act is its own
+// `waiter.wait()`; `Err(Wait(s))` would mean the exchange completed and the
+// wait broke, which waiting again cannot fix. This case asserts the first and
+// refuses the second by name, with a `match` because it is a negative test
+// asserting a specific error value.
 //
-// **WHAT THIS CASE USED TO PROVE, AND WHY IT NO LONGER CAN** (SL-16, closed at
-// sawc 0.4.0). Until the `consumes` conversion it discharged the obligation with
-// `reply` and then asked a SECOND time through the spent wrapper, to show that
-// the kernel's own `BadHandle` sits underneath the wrapper's discipline. That
-// program does not compile any more: `reply` and `reply_wait` both consume their
-// receiver, so the second use is a use-after-move the compiler refuses — a
-// stronger guarantee than the fault it used to demonstrate, and one no test can
-// witness at run time. The kernel-side check is untouched and still stands for a
-// raw-altitude caller holding a word; what it cannot be shown by is a Saw
-// program, because the typed layer no longer has a spelling for the mistake.
-// `pipe-dead-claim` still draws that fault through `resolve`, which stays
-// pollable and therefore stays non-consuming.
+// A second use of the spent obligation is not tested here: `reply` and
+// `reply_wait` both consume their receiver, so it is a compile error, and the
+// kernel's `BadHandle` check only matters to a raw-altitude caller.
 //
-// Root plays both sides — post, take, abandon, answer — so nothing here parks
+// Root plays both sides (post, take, abandon, answer), so nothing here parks
 // and the whole case is one thread.
 
 import sos.{System, Process, Waiter, PipeInlet, PipeOutlet, PipeReply,
@@ -63,8 +51,8 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // EMPTY, AND IT STAYS EMPTY. Nothing is ever attached to it — see the
-    // header: a park on this Waiter is the failure this case is shaped to catch.
+    // Empty, and it stays empty. Nothing is ever attached to it (see the
+    // header): a park on this Waiter is the failure this case catches.
     let waiter = try proc.waiter_create() catch {
         print("SOS replywaitdead: no waiter: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -96,15 +84,15 @@ func _start(boot_handle: UInt) {
     let (_, request) = move got
     let obligation = move request
 
-    // **DROP IS THE CANCELLATION.** There is no `cancel()` verb: releasing the
-    // claim is the whole of saying "never mind", and deterministic destruction is
-    // what makes the timing of the signal deterministic too. The server has
-    // already taken the message, so this is a client that gave up mid-exchange.
+    // Drop is the cancellation. There is no `cancel()` verb: releasing the
+    // claim is the whole of saying "never mind", and deterministic destruction
+    // makes the timing of the signal deterministic too. The server has already
+    // taken the message, so this is a client that gave up mid-exchange.
     let _ = move claim
     let _ = system.debug_print("SOS replywaitdead: the client let its claim go\n")
 
-    // THE FUSED ANSWER, INTO NOBODY. The reply leg cannot land, so the op comes
-    // straight back and the wait leg never runs — which is why the empty Waiter
+    // The fused answer, into nobody. The reply leg cannot land, so the op comes
+    // straight back and the wait leg never runs, which is why the empty Waiter
     // above is harmless and why an abandoned exchange cannot stall a loop.
     match (move obligation).reply_wait(body: &msg, len: PAYLOAD_LEN,
                                        waiter: &waiter) {
@@ -114,17 +102,17 @@ func _start(boot_handle: UInt) {
             return
         },
         case Err(e) -> {
-            // THE ERROR RENDERS ITSELF, leg and status both, out of the two
-            // enums' own `describe` arms — so a case added to either without a
-            // describe would not compile, and a renumbering of the wire table
-            // would not move this transcript. The `match` is here to ASSERT
-            // WHICH LEG, not to build the words.
+            // The error renders itself, leg and status both, out of the two
+            // enums' own `describe` arms, so a case added to either without a
+            // describe would not compile and a renumbering of the wire table
+            // would not move this transcript. The `match` asserts which leg,
+            // not the words.
             match e {
                 case Reply(_) -> {
                     print("SOS replywaitdead: reply_wait says {}\n", e)
                 },
-                // THE WRONG LEG WOULD MEAN THE REPLY LANDED, which is the one
-                // thing an abandoned claim rules out — so it is a failure and
+                // The wrong leg would mean the reply landed, which is the one
+                // thing an abandoned claim rules out, so it is a failure and
                 // not another arm of the same story.
                 case Wait(_) -> {
                     print("SOS replywaitdead: the WAIT leg answered: {}\n", e)

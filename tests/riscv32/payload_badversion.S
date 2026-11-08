@@ -1,25 +1,22 @@
-/* SOS fixture: a version-2 image offered to a version-3 loader (design 172
- * unit 8).
+/* Fixture: a version-2 image offered to a version-3 loader.
  *
- * This is a REAL v2 image, byte for byte — the 16-byte header and the 20-byte
- * record the format had before addresses were widened — with correct magic,
- * the right arch tag, sane permissions and an entry inside the root region.
- * Everything about it is right except its age.
+ * This is a real v2 image, byte for byte: the 16-byte header and the 20-byte
+ * record the format had before addresses were widened, with correct magic, the
+ * right arch tag, sane permissions and an entry inside the root region.
+ * Everything about it is right except its version.
  *
- * A version bump in this format is a REFUSAL boundary, not a negotiation. There
- * is no reading of these bytes that is safe to guess at: a v2 record puts a
- * 32-bit `load_addr` where a v3 record puts the low half of a 64-bit one, and
- * the fields after it are all four bytes out. Guessing would place a segment
- * from a number that is half of one field and half of another, and then jump
- * into it. So the loader stops at the version and says so.
- *
- * v2 refused v1 for the same reason and by the same mechanism; this fixture is
- * that check still being live one version later.
+ * A version mismatch is a refusal boundary, not a negotiation. There is no safe
+ * reading of these bytes: a v2 record puts `file_off` at +0 and a 32-bit
+ * `load_addr` at +4, where a v3 record puts its 64-bit `load_addr` (low half at
+ * +0, high half at +4), and the fields after it are all four bytes out.
+ * Guessing would place a segment from a number that is half of one field and
+ * half of another, and then jump into it. So the loader stops at the version
+ * and says so.
  */
 
     .equ ROOT_ENTRY,      0x80200000
     .equ PRIO_MAP,        0x01010100
-    .equ SOSIMG_V2,       2                 /* deliberately NOT the current */
+    .equ SOSIMG_V2,       2                 /* deliberately not the current */
     .equ SOSIMG_ARCH,     1                 /* SosimgArch.Riscv32           */
     .equ SEG_FLAG_R,      1
     .equ SEG_FLAG_X,      4

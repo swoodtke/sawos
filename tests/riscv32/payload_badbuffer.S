@@ -1,25 +1,23 @@
-/* SOS U-mode payload: a wait buffer the kernel may not write.
+/* U-mode payload: a wait buffer the kernel may not write.
  *
- * `Waiter.Wait` answers by COPYING a record into memory the caller supplies —
- * SOS's first kernel-writes-userspace path — so the kernel checks the
- * destination before it writes a byte, and a destination outside the process's
- * writable memory TERMINATES the process. It is caller-checkable in the
- * strongest sense: a process linked its own image and knows where its data is.
+ * `Waiter.Wait` answers by copying a record into memory the caller supplies,
+ * so the kernel checks the destination before it writes a byte, and a
+ * destination outside the process's writable memory terminates the process.
+ * That is a fault rather than a status because the caller could have checked:
+ * a process linked its own image and knows where its data is.
  *
- * THIS PAYLOAD HAS NO WRITABLE MEMORY AT ALL. `sos/tests/umode.saw` grants it
- * exactly its own bytes, read+execute, so its writable window is empty and
- * EVERY address is outside it — which is the honest answer for a process with
- * nowhere to receive a record, and what makes this case need no particular
- * address. Zero is used because zero is never in anybody's grant.
+ * This payload has no writable memory at all: `tests/umode.saw` grants it
+ * exactly its own bytes, read+execute, so every address is outside its
+ * writable window and the case needs no particular address. Zero is used
+ * because it is never in anybody's grant.
  *
  * The misaligned half of the same check is `payload_misalignbuf.S`; the two
- * cover the funnel's two rejection rows.
+ * cover the copy-out check's two rejection rows.
  *
- * WHY A PAYLOAD AND NOT A ROOT SERVER, the reason `payload_badhandle.S` gives:
- * `Waiter.wait` in the typed layer supplies its OWN buffer out of its frame and
- * never lets a caller name one, so "wait into memory I do not own" is not a
- * thing a Saw process can spell. The kernel's check is still worth testing, and
- * this is the altitude where a raw address legitimately lives.
+ * This is a payload and not a root server because the typed `Waiter.wait`
+ * supplies its own buffer out of its frame and never lets a caller name one,
+ * so "wait into memory I do not own" cannot be spelled in Saw (see
+ * `payload_badhandle.S`).
  *
  * The boot handle set is three wide and in a fixed order (§12): 1 = System,
  * 2 = Process, 3 = the initial Thread.
@@ -29,11 +27,10 @@
     .equ OP_WAITER_CREATE,  5       /* ProcessOp.WaiterCreate */
     .equ OP_WAITER_WAIT,    2       /* WaiterOp.Wait */
     .equ BAD_BUF,           0       /* word-aligned, and in nobody's grant */
-    .equ BUF_CAP,           256      /* ample — the capacity is not what fails.
-                                     * 256 since M4 unit 3 grew the record's
-                                     * BUFFER by a message body (design 15);
-                                     * a short cap would fault as BadArg
-                                     * before the door under test was reached. */
+    .equ BUF_CAP,           256      /* ample; the capacity is not what fails.
+                                     * The record's buffer holds a message
+                                     * body, so a short cap would fault as
+                                     * BadArg before the check under test. */
 
     .section .payload, "ax", @progbits
     .balign 4
@@ -57,6 +54,6 @@ _umode_payload:
 
     /* Unreachable. If the kernel ever wrote through that pointer, spin inside
      * the granted region so the harness fails on the timeout rather than on a
-     * clean exit that looked like success. */
+     * clean exit that looks like success. */
 1:
     j       1b

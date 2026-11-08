@@ -1,19 +1,18 @@
-// SOS M3 unit 5: THE LAUNCHER SIDE OF THE QUOTA PROOF (sawos design 7 D-3).
+// The launcher side of the quota proof.
 //
-// **ROOT CANNOT MEET A QUOTA, WHICH IS WHY THIS CASE HAS A CHILD.** Root is
-// init and its policy cap IS the machine: its ledger rows are
-// `QUOTA_UNLIMITED`, so the SLAB is the only thing that ever refuses it and
-// `NoResource` is the only refusal it can be told. A budget is a thing a
-// LAUNCHED process has, and this program is the launcher that gives one out —
-// by doing nothing at all, since the defaults are policy the kernel applies and
-// there is no per-create quota argument in v1 (an ABI unit 5 deliberately did
-// not open).
+// Root cannot meet a quota, which is why this case has a child. Root is init
+// and its policy cap is the machine: its ledger rows are `QUOTA_UNLIMITED`, so
+// the slab is the only thing that ever refuses it and `NoResource` is the only
+// refusal it can be told. A budget is something a launched process has, and
+// this program is the launcher that gives one out by doing nothing at all:
+// the defaults are policy the kernel applies, and there is no per-create quota
+// argument.
 //
 // The transcript is read as an order:
 //
 //   SOS quotaex: created
 //   SOS quotaex: started
-//   SOS childquota: made=4 quota=1 resumed=1   <- THE CHILD'S OWN VOICE
+//   SOS childquota: made=4 quota=1 resumed=1   <- the child's own voice
 //   SOS: process exit: code=4
 //   SOS: process teardown ... events={three} ... process={one}
 //   SOS quotaex: root observed child status=65540
@@ -21,17 +20,17 @@
 //
 // `events={three}` in the child's teardown is the ledger's other half, arriving
 // as a count somebody else keeps: the child made five events in its life,
-// RELEASED one and dropped the one it made after the credit, and three were
+// released one and dropped the one it made after the credit, and three were
 // still its when it ended. A quota that charged without crediting would have
-// refused that last create; one that credited without charging would never have
-// refused anything.
+// refused that last create; one that credited without charging would never
+// have refused anything.
 //
 // `status=65540` is `Exited` (1) in the high half and the child's own count (4)
 // in the low, read through the Process handle root never gave away.
 //
-// ROOT PARKS ON A GENEROUS TIMER while the child runs, so the ordering above is
-// forced rather than raced — this image's kernel arms no scheduler tick, so the
-// only way root gives the processor up is the wait below.
+// Root parks on a generous timer while the child runs, so the ordering above
+// is forced rather than raced: this image's kernel arms no scheduler tick, so
+// the only way root gives the processor up is the wait below.
 
 import sos.{System, Process, Memory, BootHandle, Clock, ClockType, Timer,
             Waiter, SosStatus, SystemRight}
@@ -39,22 +38,22 @@ import sos.{System, Process, Memory, BootHandle, Clock, ClockType, Timer,
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
-/// The key this case attaches its park timer under — a number that appears
+/// The key this case attaches its park timer under, a number that appears
 /// nowhere else in the transcript.
 static KEY: UInt = 63
 
 /// Twenty milliseconds: three orders of magnitude more than the child needs to
-/// make four events, meet its limit, print and exit. See `process_lifecycle`.
+/// make four events, meet its limit, print and exit. See `process-lifecycle`.
 static PARK_NS: UInt64 = 20_000_000
 
 /// Root's config: the tag the child's System handle travels under.
 static TAG_BOOT: UInt = 21
 
 /// What a child of this launcher may ask its System object for: print, and
-/// learn its own Process object — which is the handle its `event_create` calls
-/// go through, and the one its allowance is written against. `Transfer` is in
-/// the mask because it is the bit `give` checks on the thing being given (see
-/// `give-boot-drain`'s recorded finding); everything else is absent BY SILENCE.
+/// learn its own Process object, which is the handle its `event_create` calls
+/// go through and the one its allowance is written against. `Transfer` is in
+/// the mask because it is the bit `give` checks on the thing being given;
+/// everything else is absent by silence.
 static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
                                | SystemRight.Transfer)
 
@@ -97,9 +96,9 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    // THE CHILD'S LEDGER OPENED AT THIS CALL, with the defaults and nothing
-    // said. Root chose the image and the RAM; it did not choose — and cannot
-    // choose — how many events the thing it made may hold.
+    // The child's ledger opens at this call, with the defaults and nothing
+    // said. Root chose the image and the RAM; it did not choose, and cannot
+    // choose, how many events the thing it made may hold.
     let _ = system.debug_print("SOS quotaex: created\n")
 
     let for_child = try system.mint(rights: CHILD_SYSTEM) catch {

@@ -1,7 +1,7 @@
-// SOS M5 unit 6a, GAP CLOSER 1: THE `maps == 0` HALF OF THE SAFETY CONDITION
-// (sawos design 34, closing design 32's finding 2).
+// Negative case: `SlabDonate` refuses a region that is still mapped (the `maps
+// == 0` half of the safety condition).
 //
-// The transcript:
+// Transcript:
 //
 //   SOS slabmapped: stamped witness=165
 //   SOS donor: donating a mapped region
@@ -10,36 +10,33 @@
 //   SOS slabmapped: witness still 165
 //   SOS slabmapped: done
 //
-// **WHAT UNIT 6 LEFT UNCOVERED, AND WHY IT DID.** `SystemOp.SlabDonate` refuses a
-// region the kernel cannot safely absorb, and the condition has two halves:
-// `refs == 1` (this handle is the region's only reference) and `maps == 0` (no
-// installed grant row reaches it from any domain). `tests/slab-donate-shared`
-// proves the first. Design 32's As-built named the second as implemented and
-// untested, because proving it wants a LIVE MAPPING — which wants somebody still
-// alive to have made one.
+// `SystemOp.SlabDonate` refuses a region the kernel cannot safely absorb. The
+// condition has two halves: `refs == 1` (this handle is the region's only
+// reference) and `maps == 0` (no installed grant row reaches it from any
+// domain). `tests/slab-donate-shared` covers the first. Proving the second
+// needs a live mapping, which needs somebody still alive to have made one.
 //
-// **THE DONOR IS THE CHILD, AND THAT IS THE WHOLE DESIGN OF THIS CASE.** The
-// refusal is a FAULT, so whoever calls the op dies; and "the region was not
-// absorbed" cannot be read out of a dead process. So the two roles are split:
+// The donor is the child. The refusal is a fault, so whoever calls the op dies,
+// and "the region was not absorbed" cannot be read out of a dead process. So
+// the roles are split:
 //
-//   ROOT maps the page into its OWN space and stamps a witness byte through the
-//   mapping. That is what makes `maps` non-zero, and it is also the observer.
+//   Root maps the page into its own space and stamps a witness byte through
+//   the mapping. That makes `maps` non-zero, and root is also the observer.
 //
-//   THE CHILD holds the region's ONLY handle and carries `SystemRight.SlabDonate`
-//   — minted down from root's own set, since attenuation is monotonic and no
-//   child starts with the bit. It donates, and it dies.
+//   The child holds the region's only handle and carries
+//   `SystemRight.SlabDonate`, minted down from root's own set (attenuation is
+//   monotonic and no child starts with the bit). It donates, and it dies.
 //
-//   ROOT then reads the witness back. A donation that had been ACCEPTED would
-//   have zeroed those bytes before installing the extent (`slab_donate` zeroes so
-//   that every slot starts `Free`), so `witness still 165` is a direct statement
-//   that nothing was absorbed — not an inference from the fault.
+//   Root then reads the witness back. An accepted donation would have zeroed
+//   those bytes before installing the extent (`slab_donate` zeroes so that
+//   every slot starts `Free`), so `witness still 165` states directly that
+//   nothing was absorbed, with no inference from the fault.
 //
-// **THE LEG IS PINNED, NOT MERELY REACHED.** `refs` must be exactly 1 for the
-// `maps` check to be the one that fires, because the kernel tests them in that
-// order. It is: root GIVES the region away, which is a transfer that unbinds
-// root's own entry, so the child's is the only one left. Root keeps the MAPPING
-// rather than a second handle — and a Mapping counts on `maps`, never on `refs`
-// (sawos design 28), which is exactly the distinction this case is about.
+// The `maps` leg is pinned, not merely reached. `refs` must be exactly 1 for
+// the `maps` check to be the one that fires, because the kernel tests them in
+// that order. It is: root gives the region away, a transfer that unbinds root's
+// own entry, so the child's is the only one left. Root keeps the mapping rather
+// than a second handle, and a Mapping counts on `maps`, never on `refs`.
 
 import sos.{System, Process, Memory, Mapping, MapAccess, Waiter, WaitResult,
             WaitPayload, SlabKind, SosStatus, SystemRight}
@@ -48,7 +45,7 @@ extern "C" {
     func sos_test_pool_base() -> UInt
 }
 
-/// One page — the smallest thing either profile grants, and more than one slot
+/// One page: the smallest thing either profile grants, and more than one slot
 /// of any kind, so a donation of it would certainly have been accepted had the
 /// mapping not been there.
 static CHUNK: UInt = 0x1000
@@ -56,8 +53,8 @@ static CHUNK: UInt = 0x1000
 /// Read and write, in root's own domain.
 static RW: UInt32 = MapAccess.Read | MapAccess.Write
 
-/// The witness. 0xA5 = 165, a number that appears nowhere else in the transcript,
-/// and NOT zero — which is the whole point, since absorption zeroes.
+/// The witness. 0xA5 = 165 appears nowhere else in the transcript, and it is
+/// not zero, which matters because absorption zeroes.
 static WITNESS: UInt8 = 0xA5
 
 /// The tags root's gives travel under, and the key the child's death arrives on.
@@ -65,10 +62,10 @@ static TAG_BOOT: UInt = 51
 static TAG_PAGE: UInt = 53
 static KEY: UInt = 55
 
-/// What the donor child may ask its System object for. `SlabDonate` is the point;
-/// `Transfer` is the bit `give` checks on the thing being given; `Debug` lets it
-/// announce itself and `ProcessSelf` lets it reach its own Process object.
-/// Everything else is absent BY SILENCE.
+/// What the donor child may ask its System object for. `SlabDonate` is the
+/// point; `Transfer` is the bit `give` checks on the thing being given; `Debug`
+/// lets it announce itself and `ProcessSelf` lets it reach its own Process
+/// object. Every other right is absent.
 static CHILD_SYSTEM: UInt32 = (SystemRight.SlabDonate | SystemRight.Debug
                                | SystemRight.ProcessSelf
                                | SystemRight.Transfer)
@@ -84,8 +81,8 @@ func peek(addr: UInt) unsafe -> UInt8 {
     UnsafeMemory<UInt8, Normal>(addr).read()
 }
 
-/// The status word the wait delivered. This program attaches exactly one Process,
-/// so every other payload is a kernel bug rather than a case to handle.
+/// The status word the wait delivered. This program attaches exactly one
+/// Process, so any other payload is a kernel bug rather than a case to handle.
 func status_of(r: &WaitResult) -> UInt {
     match r.what {
         case Process(status) -> status,
@@ -103,7 +100,7 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // THREE RECORDS, in the runner's own order: the child's image, the child's
+    // Three records, in the runner's order: the child's image, the child's
     // destination RAM, then the pool this case cuts from.
     var image = try proc.boot_handle_next() catch {
         print("SOS slabmapped: no image region: {}\n", error)
@@ -136,14 +133,14 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // ---- ROOT MAKES `maps` NON-ZERO, AND BECOMES THE OBSERVER --------------
+    // ---- Root makes `maps` non-zero, and becomes the observer ---------------
     let page = try pool.split(len: CHUNK) catch {
         print("SOS slabmapped: split failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    // THE ROW THAT MAKES THE DONATION UNSAFE. It is root's, it stays installed
-    // for the rest of the run, and it is what the kernel refuses the child over.
+    // The row that makes the donation unsafe. It is root's, stays installed for
+    // the rest of the run, and is what the kernel refuses the child over.
     let _row = try proc.map(memory: &page, access: RW) catch {
         print("SOS slabmapped: map into self failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -153,7 +150,7 @@ func _start(boot_handle: UInt) {
     poke(base, WITNESS)
     print("SOS slabmapped: stamped witness={}\n", peek(base) as UInt)
 
-    // ---- THE CHILD, CARRYING THE BIT AND THE REGION ------------------------
+    // ---- The child, carrying the bit and the region ------------------------
     let child = try system.process_create(image: &image_mem,
                                           memory: &dest_mem) catch {
         print("SOS slabmapped: create failed: {}\n", error)
@@ -182,8 +179,8 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    // **THE GIVE IS WHAT PINS THE LEG.** A give is a MOVE: root's entry goes and
-    // the child's arrives, so the region has exactly ONE reference and the
+    // The give is what pins the leg. A give is a move: root's entry goes and
+    // the child's arrives, so the region has exactly one reference and the
     // `refs == 1` test the kernel makes first cannot be the one that fires.
     try child.give(memory: move page, tag: TAG_PAGE) catch {
         print("SOS slabmapped: give page failed: {}\n", error)
@@ -197,7 +194,7 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // ---- AND ROOT OUTLIVES IT, WHICH IS WHY THE SECOND HALF IS OBSERVABLE ---
+    // ---- Root outlives the child, so the second half is observable ----------
     let record = try waiter.wait() catch {
         print("SOS slabmapped: wait failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -205,9 +202,9 @@ func _start(boot_handle: UInt) {
     }
     print("SOS slabmapped: child faulted status={}\n", status_of(&record))
 
-    // THE CLAIM THE FAULT ALONE DOES NOT MAKE. `slab_donate` zeroes a region on
-    // the way in, so an absorbed page reads back as zeroes; this one still reads
-    // the witness, through the mapping that caused the refusal.
+    // The claim the fault alone does not make. `slab_donate` zeroes a region on
+    // the way in, so an absorbed page reads back as zeroes; this one still
+    // reads the witness, through the mapping that caused the refusal.
     let seen = peek(base)
     if seen != WITNESS {
         print("SOS slabmapped: the region WAS absorbed: witness now {}\n",

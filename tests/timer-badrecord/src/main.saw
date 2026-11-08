@@ -1,28 +1,25 @@
-// SOS M3 unit 1: a malformed `Timer.Arm` record is a FAULT (design 232;
-// design 178's faults ruling).
+// A malformed `Timer.Arm` record is a fault.
 //
-// THE COPY-IN DOOR'S FIRST REFUSAL. `Timer.Arm` is the first op in SOS that
-// reads a record OUT of a process's memory rather than writing one into it, and
-// the record's size is PUBLISHED — so a caller handing over the wrong number of
-// bytes has made a mistake it could have checked, which the ruling ends the
-// process for.
+// This is a copy-in door refusal. `Timer.Arm` reads a record out of a process's
+// memory rather than writing one into it, and the record's size is published,
+// so a caller handing over the wrong number of bytes has made a mistake it
+// could have checked, and is ended for it.
 //
-// THE LENGTH IS CHECKED FOR EQUALITY, NOT FOR "AT LEAST", and that is the one
-// place this door's rule differs from the outbound one's. A copy-OUT capacity is
-// a buffer the caller provides and may reasonably over-provision; a copy-IN
-// length is the caller's statement of what it is handing over, so a number that
-// is not the record's size means the two sides disagree about the shape of the
-// thing being passed — which is exactly the skew a funnel exists to catch before
-// the kernel reads a field out of the wrong offset.
+// The length is checked for equality, not "at least". That is where this door's
+// rule differs from the outbound one's: a copy-out capacity is a buffer the
+// caller provides and may reasonably over-provision, while a copy-in length is
+// the caller's statement of what it is handing over. A number that is not the
+// record's size means the two sides disagree about the shape of the thing being
+// passed, which is the skew a funnel exists to catch before the kernel reads a
+// field at the wrong offset.
 //
-// IT GOES THROUGH THE C ALTITUDE for the reason `timer-badclock` gives: the
-// typed `Timer.arm` builds the record itself out of its own frame, so a wrong
-// length is not expressible there at all. That the mistake needs one floor down
-// to even write IS the guarantee, and this case is where it is recorded.
+// The case goes through the C altitude for the reason `timer-badclock` gives:
+// the typed `Timer.arm` builds the record itself out of its own frame, so a
+// wrong length is not expressible there at all.
 //
-// The chain of raw handles comes from the C surface too — boot handle, clock,
-// timer — because the typed layer offers no way to get a word back out of a
-// handle, which is the ruled guarantee it exists to keep.
+// The chain of raw handles (boot handle, clock, timer) comes from the C surface
+// too, because the typed layer offers no way to get a word back out of a
+// handle.
 
 import sos.{System, sos_system_clock_get, sos_clock_timer_create, sos_timer_arm}
 
@@ -30,8 +27,8 @@ import sos.{System, sos_system_clock_get, sos_clock_timer_create, sos_timer_arm}
 /// altitude where a caller does that.
 static MONOTONIC: UInt = 0
 
-/// HALF A RECORD. The record is two 64-bit fields on every profile, so eight
-/// bytes is short by exactly one field — a length a caller could plausibly
+/// Half a record. The record is two 64-bit fields on every profile, so eight
+/// bytes is short by exactly one field: a length a caller could plausibly
 /// arrive at by counting the fields and forgetting their width, which makes it
 /// a better test than a wild number.
 static SHORT_BYTES: UInt = 8
@@ -52,8 +49,8 @@ func _start(boot_handle: UInt) {
     let _ = system.shutdown(EXIT_FAILED)
 }
 
-/// The `unsafe` half, confined to one small named helper (design 136). Every
-/// pointer here is to this frame's own storage and none of them leaves it.
+/// The `unsafe` half, confined to one small named helper. Every pointer here is
+/// to this frame's own storage and none of them leaves it.
 func arm_short(handle: UInt) unsafe -> UInt {
     var clock: UInt = 0
     let _ = sos_system_clock_get(handle, MONOTONIC,
@@ -61,9 +58,9 @@ func arm_short(handle: UInt) unsafe -> UInt {
     var timer: UInt = 0
     let _ = sos_clock_timer_create(clock, (&var timer) as UnsafePointer<UInt>)
 
-    // The buffer itself is perfectly good — word-aligned, in this process's own
-    // memory, big enough. Only the LENGTH is wrong, which is what isolates the
-    // check under test from the address checks beside it.
+    // The buffer itself is good: word-aligned, in this process's own memory,
+    // big enough. Only the length is wrong, which isolates the check under test
+    // from the address checks beside it.
     var record: [UInt64; 2] = [0; 2]
     sos_timer_arm(timer, (&var record) as UnsafePointer<UInt64>, SHORT_BYTES)
 }

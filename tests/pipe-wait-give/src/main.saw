@@ -1,32 +1,29 @@
-// SOS M4 unit 3: THE CONSUMING ATTACH (sawos design 15; `designs/010` ruling
-// 11(c); spec §2.1's abandonment, re-worded to the LAST REFERENCE).
+// The consuming attach (spec §2.1's abandonment, worded as the last reference).
 //
-// **`give` HANDS THE OBJECT TO THE SUBSCRIPTION.** `add` borrows and leaves the
-// caller holding a handle it has no further use for; `give` takes the wrapper by
-// MOVE, the kernel releases the entry as part of the attach, and the ATTACHMENT
-// owns the exchange from there. The transcript is two claims about that:
+// `give` hands the object to the subscription. `add` borrows and leaves the
+// caller holding a handle it has no further use for; `give` takes the wrapper
+// by move, the kernel releases the entry as part of the attach, and the
+// attachment owns the exchange from there. The transcript makes three claims:
 //
 //   given reply len=1 b=7      the answer still arrives, through a subscription
 //                              that owns what it watches
-//   depth after delivery=16    and the delivery ended EVERYTHING — attachment,
-//                              entry and exchange — in one act, so the ring slot
-//                              came back with no `resolve` anywhere
-//   cancelled reply says ...   `remove(key)` on a GIVEN claim drops the LAST
-//                              reference, which is §2.1's cancellation primitive
-//                              reached through the Waiter
+//   depth after delivery=16    the delivery ended everything (attachment,
+//                              entry and exchange) in one act, so the ring slot
+//                              came back with no `resolve`
+//   cancelled reply says ...   `remove(key)` on a given claim drops the last
+//                              reference, which is §2.1's cancellation
+//                              primitive reached through the Waiter
 //
-// **THE MIDDLE ROW IS THE ONE THAT COULD NOT BE FAKED.** `pipe-oneshot` showed
-// that a held exchange costs a ring slot (15) and that discharging it gives the
-// slot back (16); this counts the SAME ring after a delivery to a consuming
-// attachment and gets the whole depth — which a kernel that left the exchange
-// alive under an attachment nobody can name would not produce.
+// The middle row cannot be faked. `pipe-oneshot` shows that a held exchange
+// costs a ring slot (15) and that discharging it gives the slot back (16);
+// this counts the same ring after a delivery to a consuming attachment and
+// gets the whole depth, which a kernel that left the exchange alive under an
+// attachment nobody can name would not produce.
 //
-// **THE THIRD IS THE ABANDONMENT RE-WORDING, EXERCISED.** With the claim given
-// away there is no handle left to drop, so cancelling is destroying the
-// subscription — which is exactly what ruling 11 says destroying a subscription
-// should mean.
+// The third row exercises abandonment: with the claim given away there is no
+// handle left to drop, so cancelling is destroying the subscription.
 //
-// ONE PHASE PER FUNCTION, on design 14 finding 3's stack ceiling.
+// One phase per function, within the stack ceiling.
 
 import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
             Waiter, WaitResult, WaitPayload, AttachMode,
@@ -39,7 +36,7 @@ static KEY_GIVEN: UInt = 31
 static KEY_CANCEL: UInt = 32
 
 /// The ceiling on every counting loop. Comfortably past any staging ring this
-/// kernel could have — the point is that the loop terminates whatever the
+/// kernel could have; the point is that the loop terminates whatever the
 /// kernel answers, not that the number is tight.
 static MAX_ROUNDS: Int = 64
 
@@ -82,13 +79,13 @@ func _start(boot_handle: UInt) {
     let _ = proc.exit(EXIT_OK)
 }
 
-/// **GIVE THE CLAIM AWAY, AND STILL GET THE ANSWER** — and then count the ring
-/// to show that nothing is left holding a slot.
+/// Give the claim away and still get the answer, then count the ring to show
+/// that nothing is left holding a slot.
 ///
 /// The wrapper is consumed by the `give`, so there is no `resolve` here and no
-/// handle to release: the record IS the answer and the delivery IS the end of
-/// the exchange. The count afterwards is what says so, because a full ring can
-/// only mean every exchange settled.
+/// handle to release: the record is the answer and the delivery is the end of
+/// the exchange. The count afterwards says so, because a full ring can only
+/// mean every exchange settled.
 func given(inlet: &PipeInlet, outlet: &PipeOutlet,
            waiter: &Waiter) -> Result<Void, SosStatus> {
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
@@ -100,13 +97,12 @@ func given(inlet: &PipeInlet, outlet: &PipeOutlet,
     msg[0] = 7
     try (move obligation).reply(body: &msg, len: 1)
 
-    // THE MOVE IS THE POINT: `claim` cannot be named after this line, which is
+    // The move is the point: `claim` cannot be named after this line, which is
     // the typed layer saying what the kernel did.
     match waiter.give(reply: move claim, key: KEY_GIVEN) {
         case Ok(_) -> {},
-        // A refused give HANDS THE OBJECT BACK (user-ruled Sep 1) — the tuple's
-        // second element is the live claim, and dropping it here is this case
-        // declining to retry.
+        // A refused give hands the object back: the tuple's second element is
+        // the live claim, and dropping it here declines to retry.
         case Err(back) -> { return BUG },
     }
 
@@ -121,14 +117,13 @@ func given(inlet: &PipeInlet, outlet: &PipeOutlet,
     return
 }
 
-/// **CANCELLING BY UNSUBSCRIBING** (§2.1's abandonment, re-worded to the last
-/// reference by `designs/010` ruling 11).
+/// Cancelling by unsubscribing (§2.1's abandonment, worded as the last
+/// reference).
 ///
-/// The claim was given away, so the client holds no handle onto it — a drop is
-/// not available and would not be the right verb anyway. Removing the
-/// ATTACHMENT is what drops the last reference, and the server learns of it the
-/// way §2.1 ratified: its `reply` answers `PeerClosed`, obligation discharged
-/// either way.
+/// The claim was given away, so the client holds no handle onto it, and a drop
+/// is not available. Removing the attachment drops the last reference, and the
+/// server learns of it as §2.1 specifies: its `reply` answers `PeerClosed`,
+/// obligation discharged either way.
 func cancel_by_remove(inlet: &PipeInlet, outlet: &PipeOutlet,
                       waiter: &Waiter) -> Result<Void, SosStatus> {
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
@@ -174,8 +169,8 @@ func take_one(outlet: &PipeOutlet,
     return move request
 }
 
-/// Post and give the claim up — §2.1's TELL idiom, which is what the counting
-/// loops use because they are about the RING and not about the pair.
+/// Post and give the claim up (§2.1's tell idiom), which the counting loops use
+/// because they are about the ring and not about the pair.
 func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
           len: UInt) -> Result<Bool, SosStatus> {
     let claim = try inlet.post(body: &body, len: len) catch {
@@ -188,7 +183,7 @@ func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
     return true
 }
 
-/// Take, and discharge the obligation by dropping it — the mirror of `tell`.
+/// Take, and discharge the obligation by dropping it: the mirror of `tell`.
 func take_and_drop(outlet: &PipeOutlet,
                    into: &var [UInt8; PIPE_BODY_BYTES]) -> Result<Bool, SosStatus> {
     let got = try outlet.take() catch {
@@ -202,7 +197,7 @@ func take_and_drop(outlet: &PipeOutlet,
     return true
 }
 
-/// Post until the kernel refuses, and hand back how many went — the ring's FREE
+/// Post until the kernel refuses, and hand back how many went: the ring's free
 /// depth, counted rather than named.
 func fill(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES]) -> Result<UInt, SosStatus> {
     var depth: UInt = 0

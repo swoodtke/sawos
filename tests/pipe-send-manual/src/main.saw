@@ -1,55 +1,44 @@
-// SOS M4 unit 3: THE BLOCKING SEND, WRITTEN OUT OF THE PRIMITIVES (sawos design
-// 15; spec §2.1's ratified client API; `designs/010` ruling 4).
+// Blocking send written out of the primitives (spec §2.1).
 //
-// **§2.1's `send(msg)` AND `send(msg, timeout:)` HAVE BEEN RATIFIED SINCE JULY
-// AND HAD NOTHING TO PARK ON UNTIL NOW — AND THEY ARE STILL NOT A LIBRARY CALL**
-// (user ruling, lead review Sep 1). Ruling 4 said blocking send is waiting on
-// the claim and a timeout is the same wait with a Timer on the same Waiter;
-// unit 3 shipped every piece of that, and the composition itself stays the
-// caller's. A wrapper type would freeze a shape unit 3.5's fused `Call` is meant
-// to replace, and a timeout the kernel ever genuinely needs will be an OP.
+// A blocking send is waiting on the claim, and a timeout is the same wait with
+// a Timer on the same Waiter. This program is that composition, inline. No
+// wrapper type is built over the timeout form: a timeout the kernel genuinely
+// needs would be an op. The plain blocking send is the fused `PipeInlet.send`
+// (one `Call`), which takes no timeout; it appears after the first round trip
+// as the comparison.
 //
-// So this program IS the composition, inline, and it is four calls:
+//   post           stage the message, take the claim
+//   add(reply:)    attach the claim, one-shot
+//   wait           park; the record carries the answer's bytes
+//   (timeout leg)  a Timer on the same Waiter; the key the wait answers with
+//                  says which of the two won
 //
-//   post           stage the message, take the claim              (unit 2)
-//   add(reply:)    attach the claim, one-shot                     (unit 3)
-//   wait           park; the record carries the ANSWER'S BYTES    (ruling 11(a))
-//   — and for the timeout leg, a Timer on the SAME Waiter, with the KEY the
-//     wait answers with deciding which of the two won.
+// In the first round trip only root parks. The child runs once root blocks in
+// its wait, finds the message already readable on its outlet, takes it and
+// answers; that reply wakes root:
 //
-// **THE ORDER IS THE PROOF, AND IT IS THE ONLY CASE IN THE UNIT WHOSE THREADS
-// REALLY BLOCK.** Two processes, two parked threads, each waking the other
-// exactly once:
-//
-//   SOS childserver: replied         the child parked on its OUTLET, was woken
-//                                    by root's post, took, and answered
-//   SOS: process exit: code=4        ...and ended
+//   SOS childserver: replied         the child ran when root blocked, took the
+//                                    message, and answered
 //   SOS sendmanual: reply len=4 b=80,79,78,71
-//                                    root parked on the CLAIM and woke with
-//                                    `PONG` IN THE WAIT RECORD — no `resolve`
-//                                    anywhere on this path, because ruling
-//                                    11(a) deleted that leg
+//                                    root parked on the claim and woke with
+//                                    `PONG` in the wait record; no `resolve`
+//                                    is involved
 //   SOS sendmanual: timed out        a second connection nobody serves: the
 //                                    Timer's key came back, not the claim's
-//   SOS sendmanual: after cancel ...  ...and the claim was ours the whole time,
-//                                    so DROPPING it is §2.1's cancellation
-//                                    primitive, which the server's later
-//                                    `reply` is told about
+//   SOS sendmanual: after cancel ... the claim was ours the whole time, so
+//                                    dropping it is the cancellation, which
+//                                    the server's later `reply` is told about
 //
-// Root's first wait cannot complete before the child runs, and the child cannot
-// run before root parks, so the transcript's interleaving is what says the two
-// woke each other. A polling implementation of either half would print the same
-// bytes with none of it.
+// Root's first wait cannot complete before the child runs, so the transcript's
+// order shows the child's reply woke root. A polling implementation would print
+// the same bytes with none of that blocking.
 //
-// **THE ROOM LEG IS EXERCISED TOO** (ruling 8), on the unserved connection: the
-// ring is filled first, so the poster is REFUSED and has to park on the inlet's
-// room-to-post level before it can post at all — which is the leg a library
-// `send` would have hidden and which a caller writing this by hand has to know
-// about. `post` answering `Err(WouldBlock)` is the honest surface underneath it
-// — the transient moved to the error channel at unit 4.5 (`designs/010` ruling
-// 12(a)) and this is the one program in the tree that acts on it.
+// The room leg is exercised on the unserved connection: the ring is filled
+// first, so the poster is refused and has to park on the inlet's room-to-post
+// level before it can post. `post` answers `Err(WouldBlock)` for that refusal,
+// and this program acts on it.
 //
-// ONE PHASE PER FUNCTION, on design 14 finding 3's stack ceiling.
+// One phase per function, within the stack ceiling.
 
 import sos.{System, Process, Clock, ClockType, Timer, Waiter, PipeInlet,
             PipeOutlet, PipeReply, PipeRequest, WaitResult, WaitPayload,
@@ -59,22 +48,22 @@ import sos.{System, Process, Clock, ClockType, Timer, Waiter, PipeInlet,
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
-/// ROOT'S CONFIG, and the whole of the contract with the child. `child-server`
+/// Root's config, and the whole of the contract with the child. `child-server`
 /// expects exactly these words; the kernel supplies no meaning for either.
 static TAG_BOOT: UInt = 7
 static TAG_OUTLET: UInt = 12
 
-/// What a child of this launcher may ask its System object for: print, learn its
-/// own Process object, and pass a handle on. `Transfer` is in the mask for the
-/// reason `give-boot-drain` records — it is the ticket the give itself checks.
+/// What a child of this launcher may ask its System object for: print, learn
+/// its own Process object, and pass a handle on. `Transfer` is the ticket the
+/// give itself checks.
 static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
                                | SystemRight.Transfer)
 
-/// **THE COMPOSITION'S OWN KEYS.** A client that writes the composition inline
-/// owns its Waiter's key space, and these are the two words it spends: the CLAIM
-/// (and, on the unserved connection, the room level — they never overlap in
-/// time, so one key serves both) and the TIMER. Distinct words that appear
-/// nowhere else, so a record naming one names an attachment this program made.
+/// The composition's own keys. A client that writes the composition inline owns
+/// its Waiter's key space, and these are the two words it spends: the claim
+/// (and, on the unserved connection, the room level; they never overlap in
+/// time, so one key serves both) and the timer. They appear nowhere else, so a
+/// record naming one names an attachment this program made.
 static KEY_CLAIM: UInt = 21
 static KEY_TIMER: UInt = 22
 
@@ -85,7 +74,7 @@ static PING_LEN: UInt = 4
 static ONE: UInt = 1
 
 /// Five milliseconds. Long enough that a working machine never trips it on the
-/// SERVED connection, short enough that the unserved one gives up promptly.
+/// served connection, short enough that the unserved one gives up promptly.
 static TIMEOUT_NS: UInt64 = 5_000_000
 
 /// The ceiling on the fill loop. The point is that it terminates whatever the
@@ -119,18 +108,18 @@ func _start(boot_handle: UInt) {
     let _ = proc.exit(EXIT_OK)
 }
 
-/// **THE BLOCKING ROUND TRIP, ACROSS A PROCESS BOUNDARY, IN THREE CALLS.**
+/// The blocking round trip, across a process boundary, in three calls.
 ///
-/// Root creates the connection, GIVES the server end to a child, and then does
+/// Root creates the connection, gives the server end to a child, and then does
 /// the composition by hand: post, attach the claim one-shot, wait. Nothing else
 /// in root is runnable at the wait, so the kernel runs the child; the child
 /// parks on its outlet, is woken by the post that already happened
 /// (level-triggered, so the order does not matter), takes, and replies. That
-/// reply is what wakes root, and the bytes are in the record it wakes with.
+/// reply wakes root, and the bytes are in the record it wakes with.
 ///
-/// **THE ATTACH IS NON-CONSUMING**, which is what a library `send` would also
-/// have had to do: the timeout leg below must be able to keep the claim, so both
-/// legs use the same shape. `give` is the multiplexer's tool, not this one's.
+/// The attach is non-consuming: the timeout leg below must be able to keep the
+/// claim, so both legs use the same shape. `give` is the multiplexer's tool,
+/// not this one's.
 func round_trip(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     var image = try proc.boot_handle_next()
     var dest = try proc.boot_handle_next()
@@ -145,8 +134,8 @@ func round_trip(system: &System, proc: &Process) -> Result<Void, SosStatus> {
 
     let for_child = try system.mint(rights: CHILD_SYSTEM)
     try child.give(system: move for_child, tag: TAG_BOOT)
-    // THE SERVER END LEAVES ROOT ENTIRELY. Root keeps the inlet and nothing
-    // else, so the only way it can learn anything is from the child's reply.
+    // The server end leaves root entirely. Root keeps the inlet and nothing
+    // else, so it can only learn anything from the child's reply.
     try child.give(outlet: move outlet, tag: TAG_OUTLET)
     let _ = system.debug_print("SOS sendmanual: gave the outlet\n")
 
@@ -158,37 +147,34 @@ func round_trip(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     msg[2] = 78
     msg[3] = 71
 
-    // **THE MEASURED WINDOW OPENS HERE** (sawos design 16). The three calls
-    // below are the whole composition and there is NOTHING else inside the
-    // bracket — no print, no mint, no wrapper falling out of scope — which is
-    // what makes the number arithmetic rather than observation. Every printed
-    // byte is one `ecall`, so a window with a `print` in it would count the
-    // prose instead of the composition.
+    // The measured window opens here. The three calls below are the whole
+    // composition and nothing else may sit inside the bracket (no print, no
+    // mint, no wrapper falling out of scope), or the count stops being
+    // arithmetic. Every printed byte is one syscall, so a `print` in the window
+    // would count the prose instead of the composition.
     let before = try proc.stats()
 
-    // 1. POST. The ring is fresh, so it cannot refuse; the room leg is exercised
-    //    on the unserved connection below, where a refusal is arranged.
+    // 1. Post. The ring is fresh, so it cannot refuse; the room leg is
+    //    exercised on the unserved connection below.
     var claim = try inlet.post(body: &msg, len: PING_LEN)
 
-    // 2. ATTACH the claim, one-shot — a reply happens once.
+    // 2. Attach the claim, one-shot: a reply happens once.
     try waiter.add(reply: &claim, key: KEY_CLAIM, mode: AttachMode.OneShot)
 
-    // 3. WAIT. THIS BLOCKS, and what comes back is the answer itself.
+    // 3. Wait. This blocks, and what comes back is the answer itself.
     let woke = try waiter.wait()
 
-    // **AND CLOSES HERE, WITH ITS OWN TRAP INSIDE THE COUNT.** `ktrap` charges
-    // the syscall column at trap entry, ahead of the dispatch, so this reading
-    // includes the call that took it:
+    // The window closes here, with its own trap inside the count. `ktrap`
+    // charges the syscall column at trap entry, ahead of the dispatch, so this
+    // reading includes the call that took it:
     //
     //     delta = post + attach + wait + this read = 3 + 1 = 4
     //
-    // **THE THIRD OF THOSE PARKED, AND THAT IS THE CLAIM.** Root blocked here
-    // while the child was scheduled, woke on its outlet, took the message,
-    // replied, and died — a whole cross-process round trip — and root paid ONE
-    // trap for all of it, because a park is one `ecall` however long it parks
-    // (the wake writes the answer into root's frame; it does not re-enter the
-    // kernel through the door). Until design 16 that was a sentence about the
-    // kernel's source; it is now a number the machine states.
+    // The wait parked, and that is the claim: root blocked, the child was
+    // scheduled, took the message and replied, yet root paid one trap for all
+    // of it, because a park is one syscall however long it parks (the wake
+    // writes the answer into root's frame; it does not re-enter the kernel
+    // through the door).
     let after = try proc.stats()
 
     if woke.key != KEY_CLAIM { return BUG }
@@ -198,13 +184,11 @@ func round_trip(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     print("SOS sendmanual: the round trip cost {} traps\n",
           after.syscalls - before.syscalls)
 
-    // **AND NOW THE SAME EXCHANGE THE OTHER WAY** (sawos design 17, M4 unit
-    // 3.5). Same connection, same server, same four bytes each way — the only
-    // thing that differs is the spelling, which is the whole point of measuring
-    // both from one process. `child-server` answers twice for exactly this
-    // reason and nothing about the server side differs between the two turns.
+    // The same exchange the other way: same connection, same server, same four
+    // bytes each way; only the spelling differs. `child-server` answers twice
+    // for exactly this reason.
     //
-    // THE SECOND WINDOW IS AS EMPTY AS THE FIRST: one call, one closing read,
+    // The second window is as empty as the first: one call, one closing read,
     // and no print between them.
     let fused_before = try proc.stats()
     let answer = try inlet.send(body: &msg, len: PING_LEN)
@@ -214,44 +198,35 @@ func round_trip(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     print("SOS sendmanual: fused reply len={} b={},{},{},{}\n", answer.len,
           answer.bytes[0], answer.bytes[1], answer.bytes[2], answer.bytes[3])
 
-    // **THE COMPANION ROW, AND IT IS THE UNIT'S WHOLE STORY IN TWO NUMBERS.**
-    // Each delta carries its own closing `stats()` trap — `ktrap` charges at
-    // trap entry, ahead of the dispatch — so subtracting one from each leaves
-    // the OPS the caller wrote: post + attach + wait against `send`. Three
-    // against one, measured by the same process against the same server in the
-    // same boot, which is the refactor-into-a-kernel-call story proved rather
-    // than asserted.
+    // The companion row. Each delta carries its own closing `stats()` trap, so
+    // subtracting one from each leaves the ops the caller wrote: post + attach
+    // + wait against `send`, three against one, measured by the same process
+    // against the same server in the same boot.
     //
-    // The fused call also mints NOTHING: the composition holds a `PipeReply`
+    // The fused call also mints nothing: the composition holds a `PipeReply`
     // handle for the length of the exchange and the fused path holds no table
-    // row at all, which is the saving the trap count does not show.
+    // row at all, which the trap count does not show.
     print("SOS sendmanual: ops manual={} fused={}\n",
           (after.syscalls - before.syscalls) - 1,
           (fused_after.syscalls - fused_before.syscalls) - 1)
     return
 }
 
-/// **NOBODY SERVES THIS CONNECTION, SO THE TIMER WINS** — and the claim was the
+/// Nobody serves this connection, so the timer wins, and the claim stays the
 /// caller's the whole time.
 ///
-/// This is the timeout leg written out, and it is what ruling 4 says a timeout
-/// IS: the same wait, with a Timer attached to the same Waiter. The kernel
-/// learns nothing about durations — `Timer.arm` is the op that knows, and it
-/// shipped in M3.
+/// This is the timeout leg written out: the same wait, with a Timer attached
+/// to the same Waiter. The kernel learns nothing about durations; `Timer.arm`
+/// is the op that knows.
 ///
-/// **THE KEY IS WHAT RESOLVES THE RACE**, which is what §2.2 gives a key for.
-/// Exactly one of the two attachments delivered, and a one-shot delivery
-/// DETACHES — so the loser is the one still attached, and it is the only one
-/// there is anything left to remove. That bookkeeping is the caller's here, and
-/// it is three lines.
+/// The key resolves the race (§2.2). Exactly one of the two attachments
+/// delivered, and a one-shot delivery detaches, so the loser is the one still
+/// attached and the only one left to remove. That bookkeeping is the caller's.
 ///
-/// **THE ROOM LEG RUNS FIRST.** The ring is filled with TELLs before the real
-/// post, so the post is REFUSED and the composition has to park on the inlet's
-/// room-to-post level (ruling 8) before it has a claim at all. A library `send`
-/// would have hidden that leg; written by hand, it is where a caller learns that
-/// `Err(WouldBlock)` is a level to wait on rather than a failure to give up on
-/// (`designs/010` ruling 12(a) moved that answer to the error channel; which
-/// channel it rides changes nothing about what it means).
+/// The room leg runs first. The ring is filled with tells before the real
+/// post, so the post is refused and the composition has to park on the
+/// inlet's room-to-post level before it has a claim at all. `Err(WouldBlock)`
+/// is a level to wait on rather than a failure to give up on.
 func timed_out(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     let pair = try proc.pipe_create()
     let (inlet, outlet) = move pair
@@ -263,14 +238,12 @@ func timed_out(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     var buf: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     msg[0] = 1
 
-    // 0. THE ROOM LEG. Fill the ring so the post below is refused, take one
+    // 0. The room leg. Fill the ring so the post below is refused, take one
     //    message and drop its obligation so a slot settles, then park on the
     //    inlet's level to be told there is space again.
     let filled = try fill(&inlet, &msg)
-    // **THE REFUSAL IS ON THE ERROR CHANNEL NOW** (`designs/010` ruling 12(a)),
-    // so the arm that proves the ring is full is a `WouldBlock` match rather
-    // than a `None` — which is the poll declaring itself, exactly as the fill
-    // loop's own `tell` does.
+    // The refusal arrives on the error channel, so the arm that proves the ring
+    // is full is a `WouldBlock` match.
     match inlet.post(body: &msg, len: ONE) {
         case Ok(claim) -> {
             let _ = move claim
@@ -290,28 +263,28 @@ func timed_out(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     print("SOS sendmanual: filled={} then room says {}\n", filled,
           level_name(&room))
 
-    // 1. POST — now that the level said there is space.
+    // 1. Post, now that the level said there is space.
     var claim = try inlet.post(body: &msg, len: ONE)
 
-    // 2. ATTACH both: the claim, and the Timer that bounds the wait.
+    // 2. Attach both: the claim, and the Timer that bounds the wait.
     try waiter.add(reply: &claim, key: KEY_CLAIM, mode: AttachMode.OneShot)
     try waiter.add(timer: &timer, key: KEY_TIMER, mode: AttachMode.OneShot)
     try timer.arm(after_ns: TIMEOUT_NS)
 
-    // 3. WAIT, and let the KEY say which won.
+    // 3. Wait, and let the key say which won.
     let woke = try waiter.wait()
     if woke.key == KEY_CLAIM {
         let _ = system.debug_print("SOS sendmanual: an unserved pipe replied\n")
         return BUG
     }
-    // The Timer won. Its own attachment detached at the delivery; the claim's is
-    // still live, so the caller removes it — and the CLAIM ITSELF IS STILL OURS,
-    // which is exactly what §2.1's `TimedOut(pending:)` shape exists to say.
+    // The Timer won. Its own attachment detached at the delivery; the claim's
+    // is still live, so the caller removes it. The claim itself is still ours
+    // (§2.1's `TimedOut(pending:)` shape).
     try waiter.remove(KEY_CLAIM)
     let _ = system.debug_print("SOS sendmanual: timed out\n")
 
-    // **THE CANCELLATION.** Dropping the live claim is how §2.1 says a client
-    // gives up, and it needs no verb.
+    // The cancellation. Dropping the live claim is how §2.1 says a client gives
+    // up; it needs no verb.
     let _ = move claim
 
     // Now play the server on the connection the client gave up on. The message
@@ -340,7 +313,7 @@ func reply_len(r: &WaitResult) -> UInt {
     }
 }
 
-/// Byte `i` of it, read THROUGH A BORROW — which is what makes `PipeMsg` being
+/// Byte `i` of it, read through a borrow, which is what makes `PipeMsg` being
 /// `NoCopy` cost a caller nothing.
 func reply_byte(r: &WaitResult, i: Int) -> UInt {
     match r.what {
@@ -362,8 +335,8 @@ func level_name(r: &WaitResult) -> String {
     }
 }
 
-/// Post and give the claim up — §2.1's TELL idiom, which is what the fill loop
-/// uses because it is about the RING and not about the pair.
+/// Post and give the claim up (§2.1's tell idiom), which the fill loop uses
+/// because it is about the ring and not about the pair.
 func tell(inlet: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
           len: UInt) -> Result<Bool, SosStatus> {
     let claim = try inlet.post(body: &body, len: len) catch {

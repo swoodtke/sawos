@@ -1,5 +1,4 @@
-// SOS M5 unit 6a: A DONATED THREAD IS A THREAD THE PROCESSOR SWITCHES INTO
-// (sawos design 34, on design 32's excluded-on-risk note).
+// A donated thread is a thread the processor switches into.
 //
 // The transcript:
 //
@@ -10,92 +9,88 @@
 //   SOS threaddonate: extent thread joined code=33
 //   SOS threaddonate: done
 //
-// **WHY THIS CASE EXISTS AND WHY IT IS THE UNIT'S RISK WITNESS.** M5 unit 6
-// converted nine slabs and declined THREADS by name, on risk: a thread carries a
-// saved-context arena beside its slot, and the trap path reads a frame BY INDEX
-// with interrupts implied off. So a donated thread slot proves nothing on its
-// own — a count only shows the allocator found the extent. What has to be shown
-// is that the kernel can BUILD a context in donated memory, SWITCH INTO IT, and
-// switch back out again with the register file intact.
+// A thread carries a saved-context arena beside its slot, and the trap path
+// reads a frame by index with interrupts implied off. A donated thread slot
+// therefore proves nothing on its own: a count only shows the allocator found
+// the extent. What has to be shown is that the kernel can build a context in
+// donated memory, switch into it, and switch back out with the register file
+// intact.
 //
-// FOUR CLAIMS, IN ORDER.
+// Four claims, in order.
 //
-//  1. THE FLOOR IS REAL. `MAX_THREADS` is 8. The initial thread holds one slot
-//     and seven more fill the rest, so the ninth `thread_create` meets the SLAB
-//     and answers `NoResource`.
+//   1. The floor is real. The initial thread holds one of the `MAX_THREADS`
+//      slots and creating threads fills the rest, so the first `thread_create`
+//      past the limit meets the slab and answers `NoResource`.
 //
-//     THE FILL IS A LOOP AND THE HANDLES ARE DROPPED, which is sound for exactly
-//     one reason worth writing down: a Thread slot has NO reference count (sawos
-//     design 7 D-1 — the join/exit protocol owns its lifetime) and comes back
-//     only at process teardown. So a dropped handle leaves the slot spent, and a
-//     loop fills the slab where the Waiter case next door needed seven separate
-//     live bindings.
+//     The fill is a loop and the handles are dropped. That is sound because a
+//     Thread slot has no reference count (the join/exit protocol owns its
+//     lifetime) and comes back only at process teardown: a dropped handle
+//     leaves the slot spent.
 //
-//  2. THE DONATION IS ORDINARY MEMORY — one page out of root's pool, consumed by
-//     the op exactly as `tests/slab-donate` consumes its own.
+//   2. The donation is ordinary memory: one page out of root's pool, consumed
+//      by the op exactly as `tests/slab-donate` consumes its own.
 //
-//  3. THE CEILING MOVED: the create that was refused now succeeds.
+//   3. The ceiling moved: the create that was refused now succeeds.
 //
-//  4. **AND THE DONATED FRAME IS A FRAME.** The ninth thread — which can only be
-//     in extent 1, since the first eight are live and are extent 0 in its
-//     entirety — is STARTED, prints, YIELDS three times and exits with a value
-//     the joiner reads back. Every one of those is the context-switch path
-//     running on a donated frame: `frame_init` writes the entry, stack pointer
-//     and argument into it, the trap return resumes it, each yield saves the
-//     register file INTO it and restores it again, and the exit code surviving
-//     the round trip is what says the save and the restore agreed.
+//   4. The donated frame is a frame. The ninth thread, which can only be in
+//      extent 1 (the first eight are live and fill extent 0), is started,
+//      prints, yields three times and exits with a value the joiner reads back.
+//      Each of those is the context-switch path running on a donated frame:
+//      `frame_init` writes the entry, stack pointer and argument into it, the
+//      trap return resumes it, each yield saves the register file into it and
+//      restores it again, and the exit code surviving the round trip is what
+//      says the save and the restore agreed.
 //
-//     `code=33` is that proof in one number. It is written by the donated thread
-//     into its own frame's result registers and read by a joiner in extent 0, so
-//     a frame address computed even slightly wrong loses it.
+//     `code=33` is that proof in one number. The donated thread writes it into
+//     its own frame's result registers and a joiner in extent 0 reads it, so a
+//     frame address computed even slightly wrong loses it.
 //
-// WHY NO SLOT COUNT IS PRINTED, as in `tests/slab-donate`: a donated thread unit
-// is `sizeof(ThreadSlot) + THREAD_FRAME_STRIDE` and the slot half differs
-// per-profile, so the new ceiling is arch-dependent while every claim above is
-// not. Design 34's As-built prices both.
+// No slot count is printed, as in `tests/slab-donate`: a donated thread unit is
+// `sizeof(ThreadSlot) + THREAD_FRAME_STRIDE` and the slot half differs per
+// profile, so the new ceiling is arch-dependent while every claim above is not.
 
 import sos.{System, Process, Thread, Memory, SlabKind, SosStatus}
 
-/// One protection unit's worth on either profile — many thread units, which is
+/// One protection unit's worth on either profile: many thread units, which is
 /// all the donation has to be.
 static PAGE: UInt = 0x1000
 
-/// `MAX_THREADS`, written down so that raising the kernel's floor fails THIS
+/// `MAX_THREADS`, written down so that raising the kernel's floor fails this
 /// case loudly rather than quietly making its first claim vacuous.
 static FLOOR: UInt = 8
 
-/// Threads to create BESIDE the initial one to fill extent 0.
+/// Threads to create beside the initial one to fill extent 0.
 static FILL: Int = 7
 
 /// The value the donated thread exits with, and therefore the number the join
 /// reports. It appears nowhere else in the transcript.
 static EXIT_CODE: UInt = 33
 
-/// How many times the donated thread yields — each one a switch out of and back
-/// into a frame in donated memory.
+/// How many times the donated thread yields, each a switch out of and back into
+/// a frame in donated memory.
 static TURNS: Int = 3
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
 /// The boot handle, parked by the initial thread for the worker. Handle 0 names
-/// nothing, so a parked handle is never 0 and an unparked slot is never a handle
-/// — the `tests/thread-basics` idiom, and for its reason: every thread of this
-/// image enters at `_start`, so the entry has to work out which thread it is.
+/// nothing, so a parked handle is never 0 and an unparked slot is never a
+/// handle. Every thread of this image enters at `_start`, so the entry has to
+/// work out which thread it is (the `tests/thread-basics` idiom).
 unsafe static var BOOT_HANDLE: UInt = 0
 
 static STACK_WORDS: Int = 1024
 static BYTES_PER_WORD: UInt = 8
 static STACK_ALIGN: UInt = 16
 
-/// The donated thread's stack. The FILL threads never run, so they need no
-/// stack of their own and share this one's top — an address a thread that is
+/// The donated thread's stack. The fill threads never run, so they need no
+/// stack of their own and share this one's top, an address a thread that is
 /// never started never touches.
 unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
 
-/// The argument a FILL thread is created with. It never runs, so the value is
-/// never read — it is named because a bare `0` does not adopt a platform `UInt`
-/// at an argument (SL-24).
+/// The argument a fill thread is created with. It never runs, so the value is
+/// never read; it is named because a bare `0` does not adopt a platform `UInt`
+/// at an argument.
 static NO_ARG: UInt = 0
 
 static NO_VALUE: UInt = 0
@@ -115,8 +110,8 @@ func parked_boot_handle() unsafe -> UInt { BOOT_HANDLE }
 
 /// The thread living in donated memory: print, yield, repeat, exit.
 ///
-/// It derives every object it uses from the parked boot handle, so nothing about
-/// it depends on which extent its slot came out of — which is the point.
+/// It derives every object it uses from the parked boot handle, so nothing
+/// about it depends on which extent its slot came out of.
 func worker() {
     let system = System(boot_handle: parked_boot_handle())
     let proc = try system.process_self() catch { return }
@@ -124,9 +119,9 @@ func worker() {
     var turn = 0
     while turn < TURNS {
         let _ = system.debug_print("T")
-        // THE SWITCH, out of a donated frame and back into it. This kernel arms
-        // no timer for this image, so a yield is the only thing that can move the
-        // processor at all.
+        // The switch, out of a donated frame and back into it. This kernel arms
+        // no timer for this image, so a yield is the only thing that can move
+        // the processor.
         let _ = me.yield_now()
         turn = turn + 1
     }
@@ -196,7 +191,7 @@ func initial(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS threaddonate: extent thread created\n")
 
-    // ---- CLAIM 4: and the donated FRAME works ----------------------------
+    // ---- CLAIM 4: and the donated frame works ----------------------------
     let _ = extent.start()
     let code: UInt = try extent.join() catch { NO_VALUE }
     print("\nSOS threaddonate: extent thread joined code={}\n", code)

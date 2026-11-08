@@ -1,19 +1,18 @@
-// SOS M4 unit 1: A BODY BIGGER THAN THE SLOT (sawos design 13 D-2; spec §2.1).
+// A body bigger than the slot (spec §2.1).
 //
-// **THE FIXED BODY MAXIMUM IS PUBLISHED, SO OVERSHOOTING IT IS A FAULT.**
-// `PIPE_BODY_BYTES` is `sosabi`'s — a caller cannot even declare the buffer
-// without it — so a `len` above it is a mistake the process could have checked,
-// which design 178's faults ruling puts outside the status enum entirely. It is
-// the same line `Waiter.wait`'s capacity check falls on, running inward.
+// `PIPE_BODY_BYTES` is published by `sosabi`, so overshooting it is a fault,
+// not a status: a caller cannot even declare the buffer without knowing it, so
+// a larger `len` is a mistake the process could have checked. It is the same
+// line `Waiter.wait`'s capacity check falls on, running inward. Expected: the
+// process is terminated at the post.
 //
 //   SOS oversized: asking for 129
 //   SOS: process fault: argument outside its domain
 //
-// **THE CHECK IS BEFORE THE COPY**, which is what makes the refusal safe rather
-// than merely correct: nothing is read out of the caller's memory and no staging
+// The check comes before the body copy, which makes the refusal safe: only the
+// send record is read from the caller's memory, the body is not, and no staging
 // slot is touched, so a hostile length is a diagnostic and never a partial
-// write. §2.1's zero dynamic allocation is what leaves the kernel with a fixed
-// slot to compare against in the first place.
+// write.
 
 import sos.{System, Process, PipeInlet, PipeOutlet, SosStatus, PIPE_BODY_BYTES}
 
@@ -36,9 +35,9 @@ func _start(boot_handle: UInt) {
     }
     let (inlet, outlet) = move pair
 
-    // ONE BYTE PAST THE SLOT. The buffer this names is a whole slot wide, so
-    // nothing here is out of bounds in the caller's own memory — what is out of
-    // bounds is the ASK, which is the only thing the kernel is being told.
+    // One byte past the slot. The buffer is a whole slot wide, so nothing is
+    // out of bounds in the caller's own memory; what is out of bounds is the
+    // ask, which is the only thing the kernel is told.
     let too_much: UInt = (PIPE_BODY_BYTES as UInt) + 1
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     print("SOS oversized: asking for {}\n", too_much)
@@ -49,7 +48,7 @@ func _start(boot_handle: UInt) {
             let _ = system.shutdown(EXIT_FAILED)
             return
         },
-        // UNREACHABLE: the kernel ends this process at the length check, so
+        // Unreachable: the kernel ends this process at the length check, so
         // neither arm runs. Written so the refusal reads as a refusal.
         case Err(e) -> {
             print("SOS oversized: post refused: {}\n", e)

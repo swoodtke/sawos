@@ -1,36 +1,33 @@
-// SOS M4 unit 2: THE DELEGATION PRIMITIVE, ACROSS A PROCESS BOUNDARY (sawos
-// design 14; spec §2.1's ratified zero-copy example, §12).
+// Delegation across a process boundary (spec §2.1's zero-copy example, §12).
 //
-// **A SERVER MAY MOVE ITS OBLIGATION TO A THIRD PARTY WHO REPLIES DIRECTLY.**
-// That sentence has been ratified since Jul 29 and had nothing to be true of
-// until the one-shot pair existed. Here it is, at its smallest: root posts a
-// question, takes the obligation off its own outlet, and `give`s that obligation
-// to a child which holds NO END OF THE CONNECTION AT ALL. The child answers, and
-// the bytes land at root's claim.
+// A server may move its obligation to a third party who replies directly. Here
+// it is at its smallest: root posts a question, takes the obligation off its
+// own outlet, and `give`s that obligation to a child which holds no end of the
+// connection at all. The child answers, and the bytes land at root's claim.
 //
 //   SOS delegate: created          the pair, and a child to hand work to
 //   SOS delegate: gave the request the obligation crossed the boundary
 //   SOS childreply: replied        ...and was discharged over there
 //   SOS delegate: reply len=4 b=68,79,78,69   `DONE`, read at the client
 //
-// **WHAT THE CHILD CANNOT DO IS THE POINT.** It has no inlet, no outlet and no
-// way to name root's pipe; it cannot post, cannot take, and cannot answer any
+// What the child cannot do is the point. It has no inlet, no outlet and no way
+// to name root's pipe; it cannot post, cannot take, and cannot answer any
 // question but this one. The obligation is the whole of its authority, and it
-// knows where the answer goes — which is why §2.1's filesystem can forward a read
-// to a flash driver without the payload ever transiting the filesystem.
+// knows where the answer goes, which is why §2.1's filesystem can forward a
+// read to a flash driver without the payload ever transiting the filesystem.
 //
-// **THE ORDER IS THE CLAIM.** The child's reply, its exit and its teardown all
-// come BEFORE root reads the bytes: root's first resolve necessarily answered
-// `Ok(None)` (the child was runnable and had not run), so root parked on a timer
-// and the child ran to completion. A reply lives in the exchange's own ring slot,
-// so it outlives the process that wrote it exactly as a staged message outlives
-// its sender.
+// The order matters. The child's reply, its exit and its teardown all come
+// before root reads the bytes: root's first `ready()` is false (the child was
+// runnable and had not run), so root parks on a timer and the child runs to
+// completion. A reply lives in the exchange's own ring slot, so it outlives the
+// process that wrote it exactly as a staged message outlives its sender.
 //
-// `code={four}` and `len=4` are the SAME FACT from the two sides of the boundary.
+// `code={four}` and `len=4` are the same fact from the two sides of the
+// boundary.
 //
-// **THE POLL IS BOUNDED AND PARKS BETWEEN ROUNDS.** Unit 2 has no waitable claim
-// — that is unit 3 — so what root waits on is a TIMER, and a spin would be a hang
-// the deadlock report could not see.
+// The poll is bounded and parks between rounds. Root polls the claim and waits
+// on a timer between polls, rather than waiting on the claim; a spin would be a
+// hang the deadlock report could not see.
 
 import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
             Clock, ClockType, Timer, Waiter, SosStatus, SystemRight,
@@ -43,7 +40,7 @@ static EXIT_FAILED: UInt = 1
 /// the transcript.
 static KEY: UInt = 83
 
-/// Five milliseconds per poll round — long enough for the child to be scheduled,
+/// Five milliseconds per poll round: long enough for the child to be scheduled,
 /// drain one record, reply and exit, and short enough that a broken run ends
 /// rather than hanging.
 static PARK_NS: UInt64 = 5_000_000
@@ -52,14 +49,14 @@ static PARK_NS: UInt64 = 5_000_000
 /// printing a miss is a better failure than a spin.
 static POLL_ROUNDS: Int = 8
 
-/// ROOT'S CONFIG, and the whole of the contract with the child. `child-reply`
+/// Root's config, and the whole of the contract with the child. `child-reply`
 /// expects exactly these words; the kernel supplies no meaning for either.
 static TAG_BOOT: UInt = 7
 static TAG_REQUEST: UInt = 11
 
-/// What a child of this launcher may ask its System object for: print, learn its
-/// own Process object, and pass a handle on. `Transfer` is in the mask for the
-/// reason `give-boot-drain` records — it is the ticket the give itself checks.
+/// What a child of this launcher may ask its System object for: print, learn
+/// its own Process object, and pass a handle on. `Transfer` is the ticket the
+/// give itself checks.
 static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
                                | SystemRight.Transfer)
 
@@ -104,7 +101,7 @@ func _start(boot_handle: UInt) {
     var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     msg[0] = 63
 
-    // ROOT ASKS ITS OWN QUESTION, and takes it off its own outlet. Both ends are
+    // Root asks its own question and takes it off its own outlet. Both ends are
     // root's; what crosses the boundary is neither of them.
     var claim = try inlet.post(body: &msg, len: 1) catch {
         print("SOS delegate: post failed: {}\n", error)
@@ -128,10 +125,10 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    // THE GIVE CONSUMES THE WRAPPER, so root cannot answer its own question below
-    // this line — which is the whole of what delegation means. The exchange is
-    // untouched by the move: an obligation names a RING SLOT, and a give changes
-    // only which table names the obligation.
+    // The give consumes the wrapper, so root cannot answer its own question
+    // below this line, which is what delegation means. The exchange is
+    // untouched by the move: an obligation names a ring slot, and a give
+    // changes only which table names the obligation.
     match child.give(request: move request, tag: TAG_REQUEST) {
         case Ok(_) -> {
             let _ = system.debug_print("SOS delegate: gave the request\n")
@@ -149,9 +146,8 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // The parking machinery. Unit 2 has no waitable claim — that is unit 3 — so
-    // what root waits on is a TIMER, and the poll is what stands in for the
-    // blocking `send` the ladder has not reached yet.
+    // The parking machinery. Root polls the claim and waits on a timer between
+    // polls, and the poll stands in for a blocking `send`.
     let clock = try system.clock_get(type: ClockType.Monotonic) catch {
         print("SOS delegate: no clock: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -200,20 +196,17 @@ struct Answer {
     b3: UInt,
 }
 
-/// **THE POLL, IN ITS OWN FRAME** (design 14 finding 3). It is a phase rather
-/// than a block because a `PipeMsg` is a message-sized value and every `print`
-/// with format arguments reserves its own scratch, so a `_start` holding both
-/// meets root's 16 KiB stack grant on the 64-bit profile.
+/// The poll, in its own frame. It is a phase rather than a block because a
+/// `PipeMsg` is a message-sized value and every `print` with format arguments
+/// reserves its own scratch, so a `_start` holding both would exhaust root's
+/// stack grant on the 64-bit profile.
 ///
-/// **IT IS A `ready()` LOOP WITH ONE RESOLVE AT THE END** (`designs/010` ruling
-/// 12(b); sawos design 22). Through unit 4 the loop body WAS the resolve, which
-/// worked because a pending answer was `Ok(None)` and cost nothing; a resolve
-/// would PARK now, which would make this a blocking receive with a timer
-/// attached to nothing. So the LEVEL is what the loop asks — non-consuming, as
-/// many times as it likes — and the single consuming act happens once, after the
-/// loop has established the answer is there. The claim is taken BY VALUE for
-/// exactly that reason: a `&var` parameter could not be moved into a consuming
-/// method, so the signature carries the single use the op does.
+/// It is a `ready()` loop with one resolve at the end. A resolve parks, which
+/// would make the loop a blocking receive with a timer attached to nothing. So
+/// the loop asks the level (non-consuming, as many times as it likes) and the
+/// single consuming act happens once, after the answer is known to be there.
+/// The claim is taken by value for that reason: a `&var` parameter could not be
+/// moved into a consuming method.
 func poll_reply(claim: PipeReply, timer: &Timer,
                 waiter: &Waiter) -> Result<Answer, SosStatus> {
     var rounds: Int = 0
@@ -227,7 +220,7 @@ func poll_reply(claim: PipeReply, timer: &Timer,
         }
     }
     if not arrived {
-        // The claim is DROPPED rather than resolved — resolving would park on an
+        // The claim is dropped rather than resolved: resolving would park on an
         // answer this loop has just spent its whole budget not seeing.
         let _ = move claim
         return Answer(have: false, length: 0, b0: 0, b1: 0, b2: 0, b3: 0)

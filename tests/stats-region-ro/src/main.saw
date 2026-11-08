@@ -1,33 +1,27 @@
-// SOS M5 unit 7: THE STATS REGION IS READ-ONLY, PROVED BY DYING ON IT (sawos
-// design 37).
+// The stats region is read-only, proved by dying on it.
 //
-// **A DENIAL CAN ONLY BE PROVED BY MEETING IT.** `stats-region` beside this one
-// proves the page is readable and that its numbers are the kernel's own; this
-// program proves the other half — that the grant is READ-ONLY — the only way
-// that claim can be witnessed: it stores into the page and does not come back.
+// A denial can only be proved by meeting it. `stats-region` proves the page is
+// readable and that its numbers are the kernel's own; this program proves the
+// grant is read-only by storing into the page and not coming back.
 //
-// THE TRANSCRIPT, read as three claims:
+// The transcript reads as three claims:
 //
-//   SOS statsro: read ok       <- the row really is installed; this is not a
-//                                 program that faults because it was never
-//                                 granted anything
-//   SOS statsro: writing       <- printed BEFORE the store, because the store
-//                                 does not return
+//   SOS statsro: read ok       <- the row is installed; this is not a program
+//                                 that faults because it was never granted
+//                                 anything
+//   SOS statsro: writing       <- printed before the store, which does not
+//                                 return
 //   SOS: fault ...             <- the kernel's report, and the assertion
 //
-// **WHY THE COLUMNS MUST NOT BE WRITABLE.** They are the kernel's account of
-// what every process has cost the machine. A process that could write them could
-// lie to every supervisor on the machine about its own traffic and about its
-// peers' — so the one thing the region hands out is READ, and `MapAccess.Write`
-// never appears anywhere on this op's path.
+// The columns must not be writable: they are the kernel's account of what every
+// process has cost the machine, and a writer could lie to every supervisor
+// about its own traffic and its peers'. The region hands out read only, and
+// `MapAccess.Write` never appears on this op's path.
 //
-// **THIS CASE IS ISOLATED-TIER ONLY, AND THE RUNNER SAYS SO BY NAME.** The
-// assertion here is DENIAL BY THE HARDWARE, which is precisely what the `Flat`
-// tier disclaims (design 19, built by design 35): on a flat platform the store
-// simply lands, this program runs on and prints its UNREACHABLE line, and the
-// case would fail by omission rather than tell anyone anything true. So it is
-// excluded there with its reason, exactly as the four isolation proofs before it
-// are.
+// This case runs on the isolated tier only. The assertion is denial by the
+// hardware, which the `Flat` tier disclaims: on a flat platform the store
+// lands, this program runs on and prints its UNREACHABLE line, and the case
+// would fail by omission. The runner excludes it there by name with its reason.
 
 import sos.{System, Process, StatsRegion, ProcessStats, SosStatus}
 
@@ -51,10 +45,10 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // **THE ROW IS REALLY THERE.** Without this line a fault below would prove
-    // nothing — an address that was never granted faults too, and the two are
-    // indistinguishable in a transcript. Reading a column first is what makes
-    // the fault a statement about the ACCESS BITS rather than about the mapping.
+    // The row is really there. Without this read a fault below would prove
+    // nothing, since an address that was never granted faults too. Reading a
+    // column first makes the fault a statement about the access bits rather
+    // than about the mapping.
     let mine = region.mine()
     if mine.syscalls == 0 {
         let _ = system.debug_print("SOS statsro: own row reads zero syscalls\n")
@@ -63,7 +57,7 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS statsro: read ok\n")
 
-    // Printed BEFORE the store, because the store does not return. This is the
+    // Printed before the store, because the store does not return. This is the
     // last thing the program says; the kernel's fault report is the next line in
     // the transcript.
     let _ = system.debug_print("SOS statsro: writing\n")
