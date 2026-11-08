@@ -31,7 +31,7 @@ import kcore
 import std.task.*
 
 @export("__saw_rt_reactor_create")
-func rt_reactor_create() -> Int {
+func rt_reactor_create(r_out: Int) -> Int {
     0
 }
 
@@ -39,8 +39,10 @@ func rt_reactor_create() -> Int {
 func rt_reactor_destroy(r: Int) {
 }
 
+// SOS has no reactor: -16 is the portable tag for ENOSYS (`Other`), never 0.
 @export("__saw_rt_reactor_register")
-func rt_reactor_register(r: Int, fd: Int, write: Int, token: Int) {
+func rt_reactor_register(r: Int, fd: Int, write: Int, token: Int) -> Int {
+    -16
 }
 
 @export("__saw_rt_reactor_unregister")
@@ -48,7 +50,7 @@ func rt_reactor_unregister(r: Int, fd: Int, write: Int) {
 }
 
 @export("__saw_rt_reactor_poll")
-func rt_reactor_poll(r: Int, timeout_ms: Int) -> Int {
+func rt_reactor_poll(r: Int, timeout_ms: Int, count_out: Int) -> Int {
     0
 }
 
@@ -112,4 +114,34 @@ func kmain() {
     // The panic runs while `a` is STILL PARKED, so the panic path has a live
     // task to dump on its own — the automatic half of unit 3, on bare metal.
     panic("SOS task dump: deliberate panic")
+}
+
+unsafe static var EXEC_WORD: Int = 0
+
+@export("__saw_rt_thread_executor")
+func rt_thread_executor() unsafe -> Int {
+    EXEC_WORD
+}
+
+@export("__saw_rt_set_thread_executor")
+func rt_set_thread_executor(record: Int) unsafe -> Int {
+    EXEC_WORD = record
+    0
+}
+
+@export("__saw_rt_output_lock")
+func rt_output_lock() {
+}
+
+@export("__saw_rt_output_unlock")
+func rt_output_unlock() {
+}
+
+@export("__saw_rt_write_error")
+func rt_write_error(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
+    sos_rt_write(ptr, len)
+}
+
+extern "C" {
+    func sos_rt_write(ptr: UnsafePointer<Int8>, len: UInt)
 }

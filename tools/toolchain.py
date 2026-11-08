@@ -15,8 +15,9 @@ its ENTRY POINTS are:
     `SAWLANG_ROOT` explicitly (below) so the resolution is visible in the log.
 
 Nothing else may compute a sawlang path. What this module owns is exactly:
-the compiler, the package manager, and the three Saw packages a consumer
-compiles against — `imgformat`, `toml`, `semver`.
+the compiler, the package manager, the three Saw packages a consumer
+compiles against — `imgformat`, `toml`, `semver` — and the v0 compiler's
+checkout (`v0_root`), which regenerates the Stage 0 snapshots.
 
 RESOLUTION ORDER (design 238 D-b, ruled Aug 19): explicit intent first, then
 `$PATH`, then a pinned fetch, then a refusal naming all three.
@@ -36,7 +37,7 @@ RESOLUTION ORDER (design 238 D-b, ruled Aug 19): explicit intent first, then
 
 THE IN-REPO DEFAULT. Step 1's root falls back to the repository this file
 lives in, WHEN that repository looks like a sawlang checkout (it has
-`sawc/sawc.py`). In sawlang that is always true, so sawlang resolves to itself
+`bin/sawc`). In sawlang that is always true, so sawlang resolves to itself
 and nothing about `make sos-test` changes. Copied into a consumer repository
 the same test simply fails, and resolution moves on to step 2 — so the file
 travels verbatim and needs no per-repository edit.
@@ -53,8 +54,9 @@ TWO ASYMMETRIES, STATED RATHER THAN PAPERED OVER.
   * A `$PATH` sawc is checked by VERSION, a fetched one by SHA. A semver
     string cannot separate two commits that share it, which for an unreleased
     compiler is the normal case, so the `$PATH` guarantee is the weaker of the
-    two — accepted and documented, design 238 D-b2 option (b). See
-    `sawc/version.py` for the policy that travels with it. A pin the found
+    two — accepted and documented, design 238 D-b2 option (b). The driver's
+    `driver_version` is the number, which compiler/tests/run.py holds equal to
+    the release tag `.sawtracker/version`. A pin the found
     compiler disagrees with is a loud refusal naming both, never a silent
     build; a consumer with NO pin has stated no requirement, and gets a note
     on stderr rather than a failure.
@@ -68,6 +70,10 @@ import sys
 # The upstream this resolver fetches from. Public over HTTPS (user, Aug 19), so
 # the fresh-machine promise needs no credentials.
 UPSTREAM_URL = "https://github.com/swoodtke/sawlang.git"
+
+# The Python a fetched checkout's venv is built with: the version the frozen
+# compiler's gate ran on, not whatever `python3` a consumer's PATH has.
+FETCH_PYTHON = "python3.14"
 
 # Where a fetched checkout is cached, keyed by SHA — a hit is the steady state,
 # because the fetch is a clone plus a venv plus llvmlite, which is minutes.
@@ -88,6 +94,19 @@ MODULE_DIRS = {
 
 PIN_FILE = "sawlang.pin"
 
+# The v0 compiler, `sawc0`: v0.18.0, the last release whose tree holds the
+# frozen Python compiler (that checkout's `sawc/`). The Stage 0 snapshots were
+# recorded by it, and only a snapshot's regeneration or a frozen source's build
+# runs it (`v0_root`).
+V0_ENV = "SAWLANG_V0_ROOT"
+V0_TAG = "v0.18.0"
+V0_VERSION = "0.18.0"
+V0_SHA = "4ab60f12ce2cd1359682b633869942bc0394d5d5"
+
+# How long `sawc --version` may take: a self-hosted `bin/sawc` builds its
+# compiler on first use, which is minutes, before it can answer.
+PROBE_TIMEOUT = 1800
+
 
 class ToolchainError(Exception):
     """No usable toolchain, with the message that says what to do about it.
@@ -104,8 +123,8 @@ def _repo_root():
 
 
 def _looks_like_sawlang(path):
-    """Is `path` a sawlang checkout? The compiler entry point is the marker."""
-    return bool(path) and os.path.isfile(os.path.join(path, "sawc", "sawc.py"))
+    """Is `path` a sawlang checkout? The compiler's shim is the marker."""
+    return bool(path) and os.path.isfile(os.path.join(path, "bin", "sawc"))
 
 
 def _read_pin(consumer_root):
@@ -152,7 +171,7 @@ def _probe_version(sawc_argv):
     """
     try:
         r = subprocess.run(list(sawc_argv) + ["--version"],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, timeout=PROBE_TIMEOUT)
     except (OSError, subprocess.SubprocessError):
         return None
     if r.returncode != 0:
@@ -249,7 +268,7 @@ def _resolve_root(env, consumer_root):
         if not _looks_like_sawlang(named):
             raise ToolchainError(
                 f"SAWLANG_ROOT={named} is not a sawlang checkout "
-                f"(no sawc/sawc.py under it)")
+                f"(no bin/sawc under it)")
         return named
     # The in-repo default. False in a consumer repository, which is what lets
     # this file be copied there unedited.
@@ -259,14 +278,13 @@ def _resolve_root(env, consumer_root):
 
 
 def _sawc_from_root(root):
-    """Run the checkout's compiler with the checkout's venv where there is one.
+    """The checkout's own `bin/sawc`, whichever compiler that tree names.
 
-    The `bin/sawc` shim makes the same choice (design 238 unit 3); this does
-    not go THROUGH the shim because a consumer wants the argv, not a process.
+    Every pinnable tree's shim runs that tree's compiler (design 238 unit 3):
+    Stage 0 in an old one, the self-hosted compiler, built on first use, in a
+    new one. So one argv serves every pin, and no step here decides which.
     """
-    venv_py = os.path.join(root, ".venv", "bin", "python")
-    py = venv_py if os.path.isfile(venv_py) else sys.executable
-    return [py, os.path.join(root, "sawc", "sawc.py")]
+    return [os.path.join(root, "bin", "sawc")]
 
 
 def _check_version(sawc_argv, pin, where, notes):
@@ -310,14 +328,13 @@ def _fetch(sha, env, verbose=False):
     """Step 3: `swoodtke/sawlang` at `sha`, cached, with a venv beside it.
 
     Publishes by RENAME so a fetch that dies half way leaves nothing a later
-    run can mistake for a complete checkout — the same reason `test_runner.py`
-    publishes its result directory atomically (design 220).
+    run can mistake for a complete checkout.
     """
     dest = os.path.join(_cache_root(env), sha)
     if _looks_like_sawlang(dest):
         return dest
 
-    for tool in ("git", "python3"):
+    def require(tool):
         if not _which(tool, env):
             raise ToolchainError(
                 f"fetching the pinned sawlang toolchain needs `{tool}`, and\n"
@@ -325,6 +342,8 @@ def _fetch(sha, env, verbose=False):
                 f"\n"
                 f"Install {tool}, or supply a toolchain yourself with\n"
                 f"SAWLANG_ROOT / SAWC / a `sawc` on your PATH.")
+
+    require("git")
 
     tmp = dest + ".partial"
     shutil.rmtree(tmp, ignore_errors=True)
@@ -348,14 +367,68 @@ def _fetch(sha, env, verbose=False):
     run(["git", "remote", "add", "origin", UPSTREAM_URL], cwd=tmp)
     run(["git", "fetch", "--quiet", "--depth", "1", "origin", sha], cwd=tmp)
     run(["git", "checkout", "--quiet", "FETCH_HEAD"], cwd=tmp)
-    # D-b3: the fetch creates its OWN venv, which is what keeps the
-    # fresh-machine promise. Nothing fancier — no wheel cache, no pin file for
-    # llvmlite; this is a pre-1.0 bootstrap, not a package manager.
-    run(["python3", "-m", "venv", os.path.join(tmp, ".venv")])
-    run([os.path.join(tmp, ".venv", "bin", "pip"), "install", "--quiet",
-         "llvmlite"])
+    if not _looks_like_sawlang(tmp):
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise ToolchainError(
+            f"the pinned sawlang commit {sha} has no bin/sawc, so it names no\n"
+            f"compiler this resolver can run; pin a later commit.")
+    # A tree that still holds Stage 0 gets its OWN venv, which keeps the
+    # fresh-machine promise, and pins it: the Python the frozen compiler was
+    # gated on, and the checkout's own `sawc/requirements.txt`, so a later
+    # llvmlite cannot change a consumer's pinned build (SL-539). The
+    # self-hosted compiler is not built here: its `bin/sawc` builds it on first
+    # use, at its final path, which the runtime objects it records must name.
+    requirements = os.path.join(tmp, "sawc", "requirements.txt")
+    if os.path.isfile(requirements):
+        require(FETCH_PYTHON)
+        run([FETCH_PYTHON, "-m", "venv", os.path.join(tmp, ".venv")])
+        run([os.path.join(tmp, ".venv", "bin", "pip"), "install", "--quiet",
+             "-r", requirements])
     os.replace(tmp, dest)
     return dest
+
+
+def _v0_version(root):
+    """The `SAWC_VERSION` a checkout's `sawc/version.py` states, or None."""
+    try:
+        with open(os.path.join(root, "sawc", "version.py")) as f:
+            text = f.read()
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith("SAWC_VERSION = "):
+            return line.split("=", 1)[1].strip().strip('"')
+    return None
+
+
+def v0_root(env=None, verbose=False):
+    """The checkout of the v0 compiler, `sawc0`: `SAWLANG_V0_ROOT` when it is
+    set, else `V0_TAG` fetched and cached by SHA as step 3 fetches a pin. A
+    named tree that holds no `sawc/sawc.py`, or whose `sawc/version.py` is not
+    `V0_VERSION`, is refused naming both.
+
+    ENTRY POINTS
+        oracle.v0_root
+        bin/sawc0 (`toolchain.py v0-root`)
+    """
+    env = os.environ if env is None else env
+    named = env.get(V0_ENV)
+    if named:
+        root = os.path.abspath(os.path.expanduser(named))
+        has_compiler = os.path.isfile(os.path.join(root, "sawc", "sawc.py"))
+        found = _v0_version(root)
+        if not has_compiler or found != V0_VERSION:
+            what = ("no sawc/sawc.py" if not has_compiler
+                    else f"sawc/version.py says {found or 'no SAWC_VERSION'}")
+            raise ToolchainError(
+                f"{V0_ENV}={root} is not a checkout of the v0 compiler.\n"
+                f"\n"
+                f"  found:    {what}\n"
+                f"  required: sawc/sawc.py, and sawc/version.py at {V0_VERSION} ({V0_TAG})\n"
+                f"\n"
+                f"Name a checkout of {V0_TAG}, or unset {V0_ENV} so it is fetched.")
+        return root
+    return _fetch(V0_SHA, env, verbose=verbose)
 
 
 def _refusal(consumer_root, tried):
@@ -372,7 +445,7 @@ def _refusal(consumer_root, tried):
         "\n"
         "  1. NAME ONE.\n"
         "       SAWLANG_ROOT=/path/to/sawlang   a checkout to build against\n"
-        "       SAWC=\"python /path/to/sawlang/sawc/sawc.py\"   the compiler\n"
+        "       SAWC=/path/to/sawlang/bin/sawc                the compiler\n"
         "       BLADE=/path/to/blade                          a built blade\n"
         f"     -> {tried['env']}\n"
         "\n"
@@ -408,8 +481,8 @@ def resolve(env=None, consumer_root=None, verbose=False):
     named_blade = env.get("BLADE")
 
     if named_sawc:
-        # A string, because that is how Blade already takes it and how a CI
-        # job already writes it (`SAWC="python .../sawc.py"`).
+        # A string, because that is how Blade already takes it, an
+        # interpreter and its script included (`SAWC="python3 .../sawc.py"`).
         sawc_argv = named_sawc.split()
     elif root:
         sawc_argv = _sawc_from_root(root)
@@ -458,8 +531,16 @@ def resolve(env=None, consumer_root=None, verbose=False):
 
 
 def main(argv=None):
-    """`python tools/toolchain.py` — report what would be resolved, and how."""
+    """`python tools/toolchain.py` — report what would be resolved, and how.
+    `python tools/toolchain.py v0-root` prints the v0 compiler's checkout."""
     argv = sys.argv[1:] if argv is None else argv
+    if argv == ["v0-root"]:
+        try:
+            print(v0_root())
+        except ToolchainError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        return 0
     try:
         tc = resolve(verbose=True)
     except ToolchainError as e:

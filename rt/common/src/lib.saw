@@ -79,17 +79,18 @@ public func hex_digit_of(value: UInt, index: Int) -> UInt8 {
 
 /// A Unicode scalar as a console byte.
 ///
-/// `String.chars()` yields scalars and the console surfaces on both sides are
+/// `String.scalars()` yields scalars and the console surfaces on both sides are
 /// byte-oriented, so a non-ASCII scalar has to become SOMETHING. It becomes
 /// `'?'` rather than a silent truncation to a plausible-looking wrong
 /// character — the rule is stated once, here, instead of being re-decided by
 /// each caller. A byte-oriented console service is userspace work for a later
 /// milestone.
-public func ascii_byte(scalar: Int) -> UInt8 {
-    if scalar < 0 || scalar > ASCII_MAX {
+public func ascii_byte(scalar: Scalar) -> UInt8 {
+    let v = scalar.value()
+    if v < 0 || v > ASCII_MAX {
         ASCII_SUBSTITUTE
     } else {
-        scalar as UInt8
+        v as UInt8
     }
 }
 
@@ -289,8 +290,34 @@ enum AbortCode: UInt32 {
 /// `print`'s output primitive: `len` bytes at `ptr`, to whatever this side
 /// calls a console.
 @export("__saw_rt_write")
-func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
+func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe -> Int {
     sos_rt_write(ptr, len)
+    0
+}
+
+/// `print`'s line primitive: `count` `{ptr, len}` records, each two target
+/// words, written in order and followed by a newline. Always succeeds.
+@export("__saw_rt_write_line")
+func rt_write_line(parts: UnsafePointer<Int8>, count: UInt) unsafe -> Int {
+    let WORD = sizeof<UInt>() as UInt
+    var i: UInt = 0
+    let words = parts as UInt
+    while i < count {
+        let rec = words &+ (i &* 2 &* WORD)
+        let p = UnsafeMemory<UInt, Normal>(rec).read()
+        let n = UnsafeMemory<UInt, Normal>(rec &+ WORD).read()
+        sos_rt_write(p as UnsafePointer<Int8>, n)
+        i = i &+ 1
+    }
+    let nl = "\n"
+    sos_rt_write(nl.c_string()!, 1)
+    0
+}
+
+/// SOS keeps no errno, so there is never a raw platform code to report.
+@export("__saw_rt_last_raw_code")
+func rt_last_raw_code() -> Int {
+    0
 }
 
 /// The infallible-tier panic sink (design 19): report, then stop.
@@ -377,7 +404,7 @@ func rt_alloc(size: UInt, align: UInt) unsafe -> UnsafePointer<Int8> {
     }
     if size > capacity || offset > capacity - size {
         let msg = "sos: out of arena memory\n"
-        sos_rt_write(msg, UInt.from(truncating: msg.len()))
+        sos_rt_write(msg.c_string()!, UInt.from(truncating: msg.len()))
         sos_rt_abort(AbortCode.NoMemory as UInt32)
     }
     ARENA_NEXT = offset &+ size

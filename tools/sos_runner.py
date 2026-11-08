@@ -1089,12 +1089,12 @@ TEST_CASES = [
         "src": os.path.join(TESTS_DIR, "taskdump.saw"),
         "csrc": "taskdump_stubs.c",
         "expect_out": ["saw tasks: 2 live (unsynchronized snapshot)",
-                       "at taskdump.saw:93 in knap",
-                       "at taskdump.saw:98 in ksleeper",
-                       "panic at taskdump.saw:114: SOS task dump: deliberate panic",
+                       "at taskdump.saw:95 in knap",
+                       "at taskdump.saw:100 in ksleeper",
+                       "panic at taskdump.saw:116: SOS task dump: deliberate panic",
                        "saw tasks: 1 live (as-of panic, unsynchronized)",
-                       "at taskdump.saw:93 in knap",
-                       "at taskdump.saw:98 in ksleeper"],
+                       "at taskdump.saw:95 in knap",
+                       "at taskdump.saw:100 in ksleeper"],
         "expect_clean_exit": False,
     },
     {
@@ -1104,7 +1104,7 @@ TEST_CASES = [
         "name": "task_dump_empty",
         "src": os.path.join(TESTS_DIR, "taskdump_empty.saw"),
         "expect_out": ["saw tasks: none live",
-                       "panic at taskdump_empty.saw:21: "
+                       "panic at taskdump_empty.saw:38: "
                        "SOS task dump: no tasks here"],
         "expect_clean_exit": False,
     },
@@ -5527,6 +5527,7 @@ def _build_blade(build_dir):
     _run(tc().sawc() +
          [os.path.join(tc().blade_package_dir(), "src", "main.saw"),
           "-o", blade_bin,
+          "--module-path", "blade=" + os.path.join(tc().blade_package_dir(), "src"),
           "--module-path", tc().module_path_arg("toml"),
           "--module-path", tc().module_path_arg("semver"),
           "--module-path", tc().module_path_arg("imgformat")])

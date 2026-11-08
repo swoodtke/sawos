@@ -190,18 +190,18 @@ extension Slab<T, N> {
     /// threads that is `kcore.threads.frame_slot`).
     public(package) func side_base(&self, e: Int) -> UInt { self.ext_side[e] }
 
-    /// Slot `i`, lent where it sits (design 146's place accessor).
+    /// Slot `i`, lent where it sits.
     ///
-    /// A read opens a shared window and a write an exclusive one, out of this one
-    /// declaration — which is what lets `EVENTS[i].state` and
-    /// `EVENTS[i].state = Live` both keep the spelling they had when `EVENTS` was
-    /// a bare array.
+    /// Declared `&var` with no shared twin, so every use borrows the slab
+    /// exclusively, a read included: the root must be mutable, and two windows
+    /// on one slab cannot be open at once. Every slab is a `var` static and no
+    /// kernel code needs two; `@synthesize(shared)` would add shared reads.
     ///
-    /// Out of range PANICS, in the house wording (DF-249a) and for the reason a
-    /// direct accessor always does: an index past the capacity is a kernel bug,
-    /// not a caller's mistake — every index reaching here came from a slab scan
-    /// or from a handle entry the table validated.
-    public(package) func [](&self, i: Int) unsafe borrows -> T {
+    /// Out of range PANICS, in the house wording, and for the reason a direct
+    /// accessor always does: an index past the capacity is a kernel bug, not a
+    /// caller's mistake, because every index reaching here came from a slab
+    /// scan or from a handle entry the table validated.
+    public(package) func [](&var self, i: Int) unsafe borrows -> &var T {
         if i < 0 || i >= self.total {
             panic("Slab.[]: index out of range: {} (len {})", i, self.total)
         }
