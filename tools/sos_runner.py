@@ -55,12 +55,13 @@ the language lives in a different repository and the same call finds it there.
 
 `--arch <name>` runs one architecture, for development. The GATE is both.
 
-`-j N` runs N package builds, and then N cases, at a time. It DEFAULTS TO 4
-(user ruling, Sep 1): this host has four performance cores and six efficiency
-ones, and the parallelism tracks the P-cores rather than the core count, because
-a QEMU boot parked on an E-core is the slowest thing in the run. `-j 1` is the
-serial harness, unchanged and reachable, for when a transcript has to be read
-against the one the suite has always printed.
+`-j N` runs N package builds, and then N cases, at a time. It DEFAULTS TO THE
+HOST'S PERFORMANCE-CORE COUNT (`_default_jobs`): the parallelism tracks the
+P-cores rather than the core count, because a QEMU boot parked on an
+efficiency core is the slowest thing in the run. `SOS_JOBS` overrides the
+detection and `-j` overrides both. The count is never printed, so it cannot
+move a transcript. `-j 1` is the serial harness, unchanged and reachable, for
+when a transcript has to be read against the one the suite has always printed.
 
 WHAT PARALLELISM IS NOT ALLOWED TO MOVE (the acceptance the `-j` work was
 gated on): a case's transcript, its assertions, and the ORDER the report prints
@@ -5355,6 +5356,32 @@ def _map_ordered(jobs, items, work):
                 fut.cancel()
 
 
+def _default_jobs():
+    """How many package builds, and then cases, run at once without `-j`.
+
+    One per performance core. Apple silicon reports those as perflevel 0,
+    read with `sysctl`; a host without that key has one kind of core and gets
+    all of them from `os.cpu_count()`. `SOS_JOBS` overrides the detection; a
+    malformed value is refused with exit 2 rather than ignored.
+    """
+    named = os.environ.get("SOS_JOBS")
+    if named:
+        if not named.isdigit() or int(named) < 1:
+            print(f"{RED}SOS_JOBS must be a whole number, at least 1 "
+                  f"(got {named!r}){RESET}", file=sys.stderr)
+            sys.exit(2)
+        return int(named)
+    try:
+        probe = subprocess.run(["sysctl", "-n", "hw.perflevel0.physicalcpu"],
+                               capture_output=True, text=True)
+    except OSError:
+        probe = None
+    if (probe is not None and probe.returncode == 0
+            and probe.stdout.strip().isdigit()):
+        return max(1, int(probe.stdout.strip()))
+    return os.cpu_count() or 1
+
+
 def _find_clang(arches):
     """Return the first clang that can assemble EVERY target's boot code.
 
@@ -6185,10 +6212,11 @@ def main():
                              "comma-separated list; hyphens and underscores are "
                              "interchangeable. A DEVELOPMENT convenience: the "
                              "GATE is every case on every architecture")
-    parser.add_argument("-j", "--jobs", metavar="N", type=int, default=4,
+    parser.add_argument("-j", "--jobs", metavar="N", type=int, default=None,
                         help="run N package builds, and then N cases, at a "
-                             "time (default: 4 — this host's performance-core "
-                             "count; `-j 1` is the serial harness)")
+                             "time (default: this host's performance-core "
+                             "count, or SOS_JOBS when set; `-j 1` is the "
+                             "serial harness)")
     parser.add_argument("--board", metavar="NAME", default="virt",
                         help="board profile (default: virt — the GATE's, and "
                              "the only implemented one). `esp32c3` is design "
@@ -6560,7 +6588,9 @@ def main():
         print("=" * 60)
         sys.exit(1 if failed else 0)
 
-    if args.jobs < 1:
+    if args.jobs is None:
+        args.jobs = _default_jobs()
+    elif args.jobs < 1:
         print(f"{RED}-j must be at least 1 (got {args.jobs}){RESET}",
               file=sys.stderr)
         sys.exit(2)
@@ -6601,6 +6631,13 @@ def main():
     if not _check_arch_free():
         sys.exit(1)
 
+    # Resolve the toolchain HERE, on this thread, before anything else touches
+    # it. `tc()` is a lazy global with a one-time print, and a lazy global
+    # first touched by several workers at once is two resolutions and a note
+    # printed into the middle of the report. After this line every worker
+    # reads a value that is already there.
+    sawlang = tc()
+
     print(f"{BOLD}SOS QEMU tests{RESET}")
     print(f"  clang: {clang}")
     print(f"  lld  : {lld}")
@@ -6616,6 +6653,12 @@ def main():
         if binary not in seen_qemus:
             seen_qemus.append(binary)
             print(f"  qemu : {binary}")
+    # Which resolution step answered and what it pointed at. A build against
+    # the pinned fetch names the fetch step; an env step (SAWLANG_ROOT, SAWC,
+    # BLADE) builds against whatever it names and ignores the pin, so the
+    # transcript has to show it.
+    print(f"  sawlang: {sawlang.source}  "
+          f"{sawlang.root or sawlang.sawc_env_value()}")
     print()
 
     # Blade is architecture-neutral (a host binary), so it is built once and
@@ -6632,13 +6675,6 @@ def main():
             print(f"{CROSS} failed to build blade\n{e}", file=sys.stderr)
             sys.exit(1)
         print()
-
-    # Resolve the toolchain HERE, on this thread, whether or not the Blade build
-    # above already did it. `tc()` is a lazy global with a one-time print, and a
-    # lazy global first touched by four workers at once is two resolutions and a
-    # note printed into the middle of the report. After this line every worker
-    # reads a value that is already there.
-    tc()
 
     total_passed = 0
     total_failed = 0
