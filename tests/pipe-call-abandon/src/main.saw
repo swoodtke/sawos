@@ -114,10 +114,22 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     try waiter.add(outlet: &outlet_b, key: KEY_CLOSING)
     try waiter.add(process: &child, key: KEY_DEATH)
 
-    try child.give(inlet: move inlet_a, tag: TAG_DROPPED)
-    try child.give(inlet: move inlet_b, tag: TAG_CLOSING)
+    try child.give(inlet: move inlet_a, tag: TAG_DROPPED) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(inlet: move inlet_b, tag: TAG_CLOSING) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
     let for_child = try system.mint(rights: CHILD_SYSTEM)
-    try child.give(system: move for_child, tag: TAG_BOOT)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
     try child.start(boot_tag: TAG_BOOT)
 
     try drop_the_obligation(&outlet_a, &waiter)

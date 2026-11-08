@@ -1079,7 +1079,8 @@ handed back unread at the child's drain.
   — the boot set freezes at start, which is the launch flow's whole soundness
   argument) and a tag the child's set already carries (`DuplicateKey` — the tag
   is the identity, and one naming two handles would make the boot lookup
-  ambiguous). A resource refusal is a status, and the give has not happened.
+  ambiguous). A resource refusal is a status, and the give has not happened:
+  the typed tier hands the object back in the error payload (§3).
 - `Start` takes a `boot_tag`: the kernel resolves the tag to the child-side
   word, puts it in the child's first argument register and consumes the record
   it named (the register is the delivery, so a child can never be handed one
@@ -1590,13 +1591,13 @@ stored in the process slot (`ProcessSlot.quota_used` / `quota_limit`). The
     did not consume and hands it back in the error payload. So no path leaves a
     disarmed-but-unsent word. The same rule covers the handles a pipe message
     carries: a post, send or reply refused with nothing taken hands them back
-    (`post` keeps its carrier on a refusal). `Waiter.give` follows this rule.
-    Not yet enforced for `Process.give`: it does not re-mint on a status
-    refusal, and the capability stays in the giver's table with no wrapper
-    naming it. Not yet enforced for `send_with`, `reply_with` and
-    `reply_wait_with`: they empty the handle carrier before reading the status,
-    so on a refusal that took nothing the handles stay in the caller's table
-    with no wrapper naming them.
+    (`post` keeps its carrier on a refusal). `Waiter.give` and every
+    `Process.give` overload follow this rule: a refused give answers the status
+    and the object together, as `Result<Void, (SosStatus, T)>`, since every
+    status `ProcessOp.Give` answers leaves the giver's entry in place. Not yet
+    enforced for `send_with`, `reply_with` and `reply_wait_with`: they empty
+    the handle carrier before reading the status, so on a refusal that took
+    nothing the handles stay in the caller's table with no wrapper naming them.
   - **The funnel has a second spelling, for receivers.** Where the op consumes
     the handle it is invoked through, the sysapi method carries `consumes` in
     its effect slot beside `&var self`, and the caller spells
@@ -2689,8 +2690,6 @@ loader parses and reports while no Process slot stores either.
 
 **Known limits.**
 
-- `Process.give` does not yet hand the object back on a status refusal: the
-  capability stays in the giver's table with no wrapper naming it (§3).
 - The factory ops `ThreadCreate`, `EventCreate`, `WaiterCreate`, `InterruptBind`
   and `PipeCreate` act on the process the handle names, not the caller: through
   another process's handle they mint into that process's table and hand the

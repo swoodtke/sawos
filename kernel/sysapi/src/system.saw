@@ -704,7 +704,7 @@ extension Process {
     /// `_start(boot_handle)` is unchanged and the launcher never sees a
     /// child-relative word at any point.
     ///
-    /// That is why `give` answers with a status alone: the word it minted means
+    /// That is why `give` never hands back the word it minted: that word means
     /// nothing on this side, and the one place it means anything is the
     /// register the child wakes up with. The launcher speaks tags, which are
     /// its own words handed back unread; the kernel is a courier, and what a
@@ -735,8 +735,10 @@ extension Process {
     // caller cannot keep it, read the word, write `NO_HANDLE` into the field
     // before the syscall, and let the disarmed value drop. The local `var`
     // exists because a by-value parameter is a `let` and the disarm is a write.
+    // A refusal builds a fresh wrapper around the word and hands it back.
     //
-    // The errors and the keep mask are stated once, on `give(memory:)`.
+    // The errors, the refusal and the keep mask are stated once, on
+    // `give(memory:)`.
     //
     // A handle can be given only if its rights word carries the universal
     // `Transfer` bit. The default sets that carry it belong to System, Process,
@@ -759,19 +761,30 @@ extension Process {
     /// The contract every `give` overload shares: the child's entry carries the
     /// given handle's rights intersected with `keep` (all ones keeps them all).
     /// The child must still be `Created` and `tag` must be new in its boot set.
-    /// Caller errors fault, and the process ends with teardown covering
-    /// everything it held. A full child table or boot set is
+    ///
+    /// The refusal hands the object back. A full child table or boot set is
     /// `SosStatus.NoResource` and a child at its handle quota is
-    /// `SosStatus.QuotaExceeded`. On those the give did not happen, but the
-    /// wrapper was already disarmed: these overloads do not return the object,
-    /// so the handle stays bound in the caller's table under a word nothing
-    /// holds until the caller exits.
+    /// `SosStatus.QuotaExceeded`: resource conditions, not bugs, so the caller
+    /// keeps what it had, and the error payload carries the live wrapper. Every
+    /// status this op answers is a refusal that left the caller's entry in
+    /// place (the kernel binds into the child before it unbinds here), so the
+    /// word is still good. Every other failure is a caller error that faults:
+    /// the process ends, and teardown covers everything it held.
+    ///
+    /// The funnel contract: the body disarms before the syscall (no path can
+    /// leave two owners of one word), and a refused give is a status, so the
+    /// error arm builds a fresh wrapper around the word the kernel provably did
+    /// not consume. The old husk is dead on every path.
     public func give(&self, memory: Memory, tag: UInt,
-                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, SosStatus> {
+                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, (SosStatus, Memory)> {
         var region = move memory
         let word: UInt = region.handle
         region.handle = MemoryHandle(NO_HANDLE)
-        return checked(sos_process_give(self.handle, word, tag, keep as UInt))
+        try checked(sos_process_give(self.handle, word, tag, keep as UInt)) catch {
+            let back: (SosStatus, Memory) = (error, Memory(handle: MemoryHandle(word)))
+            return move back
+        }
+        return
     }
 
     /// Give a device window to this process under `tag`, consuming the wrapper.
@@ -790,16 +803,19 @@ extension Process {
     /// holder's own business. (A launcher installing a row in a child it
     /// created is `Process.map` below.)
     ///
-    /// The transfer-funnel contract is the same as the funnels beside this one:
-    /// by value, disarm before the syscall, let the disarmed value drop. What
-    /// the launcher gives away it cannot map anywhere.
+    /// The funnel contract and the refusal that hands the window back are
+    /// `give(memory:)`'s. What the launcher gives away it cannot map anywhere.
     public func give(&self, iomemory: IoMemory,
                      tag: UInt,
-                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, SosStatus> {
+                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, (SosStatus, IoMemory)> {
         var window = move iomemory
         let word: UInt = window.handle
         window.handle = IoMemoryHandle(NO_HANDLE)
-        return checked(sos_process_give(self.handle, word, tag, keep as UInt))
+        try checked(sos_process_give(self.handle, word, tag, keep as UInt)) catch {
+            let back: (SosStatus, IoMemory) = (error, IoMemory(handle: IoMemoryHandle(word)))
+            return move back
+        }
+        return
     }
 
     /// Give a System handle to this process under `tag`, consuming the wrapper.
@@ -822,11 +838,15 @@ extension Process {
     /// thing being given. What the child receives need not: a `keep` that
     /// leaves `Transfer` out delivers a handle without it.
     public func give(&self, system: System, tag: UInt,
-                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, SosStatus> {
+                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, (SosStatus, System)> {
         var authority = move system
         let word: UInt = authority.handle
         authority.handle = SystemHandle(NO_HANDLE)
-        return checked(sos_process_give(self.handle, word, tag, keep as UInt))
+        try checked(sos_process_give(self.handle, word, tag, keep as UInt)) catch {
+            let back: (SosStatus, System) = (error, System(handle: SystemHandle(word)))
+            return move back
+        }
+        return
     }
 
     /// Give the client end of a connection to this process under `tag`,
@@ -845,16 +865,19 @@ extension Process {
     /// last holder of an end dropping it is news, so a launcher can route an
     /// end through itself without the peer ever seeing peer-gone.
     ///
-    /// The transfer-funnel contract is the same as the funnels above: by value,
-    /// disarm before the syscall, let the disarmed value drop. What you give
-    /// away you cannot post through.
+    /// The funnel contract and the refusal that hands the end back are
+    /// `give(memory:)`'s. What you give away you cannot post through.
     public func give(&self, inlet: PipeInlet,
                      tag: UInt,
-                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, SosStatus> {
+                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, (SosStatus, PipeInlet)> {
         var client = move inlet
         let word: UInt = client.handle
         client.handle = PipeInletHandle(NO_HANDLE)
-        return checked(sos_process_give(self.handle, word, tag, keep as UInt))
+        try checked(sos_process_give(self.handle, word, tag, keep as UInt)) catch {
+            let back: (SosStatus, PipeInlet) = (error, PipeInlet(handle: PipeInletHandle(word)))
+            return move back
+        }
+        return
     }
 
     /// Give the server end of a connection to this process under `tag`,
@@ -866,11 +889,15 @@ extension Process {
     /// inlet, and the child's loop is a `take` poll.
     public func give(&self, outlet: PipeOutlet,
                      tag: UInt,
-                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, SosStatus> {
+                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, (SosStatus, PipeOutlet)> {
         var server = move outlet
         let word: UInt = server.handle
         server.handle = PipeOutletHandle(NO_HANDLE)
-        return checked(sos_process_give(self.handle, word, tag, keep as UInt))
+        try checked(sos_process_give(self.handle, word, tag, keep as UInt)) catch {
+            let back: (SosStatus, PipeOutlet) = (error, PipeOutlet(handle: PipeOutletHandle(word)))
+            return move back
+        }
+        return
     }
 
     /// Give a claim on a reply to this process under `tag`, consuming the
@@ -883,15 +910,19 @@ extension Process {
     /// claim away; the obligation still names the same ring slot, and whoever
     /// holds the claim when the reply is written is who gets it.
     ///
-    /// The transfer-funnel contract is the same as the funnels above: by value,
-    /// disarm before the syscall, let the disarmed value drop.
+    /// The funnel contract and the refusal that hands the claim back are
+    /// `give(memory:)`'s.
     public func give(&self, reply: PipeReply,
                      tag: UInt,
-                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, SosStatus> {
+                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, (SosStatus, PipeReply)> {
         var claim = move reply
         let word: UInt = claim.handle
         claim.handle = PipeReplyHandle(NO_HANDLE)
-        return checked(sos_process_give(self.handle, word, tag, keep as UInt))
+        try checked(sos_process_give(self.handle, word, tag, keep as UInt)) catch {
+            let back: (SosStatus, PipeReply) = (error, PipeReply(handle: PipeReplyHandle(word)))
+            return move back
+        }
+        return
     }
 
     /// Give an obligation to reply to this process under `tag`, consuming the
@@ -909,11 +940,15 @@ extension Process {
     /// delegation a protocol rather than launch-time wiring.
     public func give(&self, request: PipeRequest,
                      tag: UInt,
-                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, SosStatus> {
+                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, (SosStatus, PipeRequest)> {
         var obligation = move request
         let word: UInt = obligation.handle
         obligation.handle = PipeRequestHandle(NO_HANDLE)
-        return checked(sos_process_give(self.handle, word, tag, keep as UInt))
+        try checked(sos_process_give(self.handle, word, tag, keep as UInt)) catch {
+            let back: (SosStatus, PipeRequest) = (error, PipeRequest(handle: PipeRequestHandle(word)))
+            return move back
+        }
+        return
     }
 
     /// Make a connection in this process and receive both of its ends (spec

@@ -435,6 +435,7 @@ PIPE_TABLE_FULL_PKG = os.path.join(TESTS_DIR, "pipe-table-full")
 PIPE_CQ_PKG = os.path.join(TESTS_DIR, "pipe-cq")
 PIPE_RESOLVE_PARK_PKG = os.path.join(TESTS_DIR, "pipe-resolve-park")
 GIVE_KEEP_MASK_PKG = os.path.join(TESTS_DIR, "give-keep-mask")
+GIVE_FULL_RETURNS_PKG = os.path.join(TESTS_DIR, "give-full-returns")
 CHILD_NARROW_PKG = os.path.join(TESTS_DIR, "child-narrow")
 
 # Driver-as-service.
@@ -4121,6 +4122,41 @@ TEST_CASES = [
                        "SOS: process fault: access denied process={zero}"],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # A give refused for capacity hands the object back. Root gives masked
+        # System siblings to a child it never starts until the child's handle
+        # budget, `DEFAULT_QUOTA_HANDLES`, refuses one with `QuotaExceeded`;
+        # `gave 12` is that budget. The refused sibling comes back in the error
+        # payload and prints, which only a live handle can do.
+        #
+        # `handles={seven}` in root's teardown is the count the same program
+        # ends with when it stops at the budget without meeting the refusal.
+        # Root dropped the returned sibling, so its entry went too; a refusal
+        # that left the entry bound with no wrapper naming it would read
+        # `{eight}`.
+        #
+        # Only `QuotaExceeded` can be provoked through a give here, not
+        # `NoResource`: the child's default handle budget is below its table
+        # size, `MAX_HANDLES`, so the budget always refuses first.
+        #
+        # `child-bye` is only the image the child is created from; it never
+        # runs, so no child line appears.
+        "name": "give_full_returns",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": GIVE_FULL_RETURNS_PKG,
+        "children": [CHILD_BYE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS givefull: created",
+                       "SOS givefull: gave 12 then refused: this process is "
+                       "at its quota",
+                       "SOS givefull: the refused System still speaks",
+                       "SOS givefull: exiting",
+                       "SOS: process teardown handles={seven} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={zero}"],
+        "expect_clean_exit": True,
     },
     # =========================================================================
     # The one-shot discipline
