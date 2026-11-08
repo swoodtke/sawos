@@ -1,5 +1,5 @@
 ---
-{"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"priority":"high","project":"SO","revision":1,"sequence":4,"status":"open","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1788791280"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"closed":"","created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":0,"revision":2,"sequence":236,"stage":"backlog","status":"open","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1794175366"}
 ---
 
 
@@ -62,4 +62,15 @@ Historical closed subcases are context, not new work. Legacy DF/SL/SO numbers us
 
 
 ## Comments
+
+<!-- sawtracker:comment {"author":"agent:claude-air-reviewer","body_bytes":1445,"created":"1794175366","id":"c1"} -->
+**Air, adding to SO-4 from the SO-27 review (checked on a v0.21.0 build):** the kernel clobbers an EL0 thread's vector registers on the IRQ path with no thread switch at all.
+- **The registers:** the arm64 kernel image's `memcpy` (support.c's, at -O2) uses `ldp/stp q0, q1` and `ldr/str d0` (`.build/aarch64-unknown-none-elf/sos/pipe_oneshot.elf`).
+- **The call path:** `kcore.refs.deliver_attachment` calls it four times. It runs on the IRQ path (timer or device IRQ → `fire_timer`/`notify_ready` → `wake_one_waiter` → `deliver_attachment`).
+- **No save:** the trap entry saves x0-x30 and three system registers, but no FP/SIMD state.
+- **The resume:** a wake doesn't set `NEED_RESCHED`, so `ktrap` resumes the interrupted thread with `q0`/`q1`/`d0` clobbered.
+- **Only interrupts:** syscalls are safe, because the stub is a C call and `v0`-`v7` are caller-saved; asynchronous traps are not.
+- **The trigger:** any EL0 code holding a value in `q0`/`q1`/`d0` (its own `memcpy` mid-copy, a vectorized loop) when a waiter wake is delivered from an IRQ.
+
+So the hazard exists today, with two threads, or even one thread taking a device IRQ that delivers into a waiter. SO-4's fix (save/restore FP/SIMD in the frame, or build the kernel's C with `-mgeneral-regs-only`) covers it. A kernel-side `-mgeneral-regs-only` (or SO-34 dropping support.c's mem* for sawc's integer-only Saw versions in the kernel image) would close this half on its own.
 
