@@ -379,7 +379,8 @@ the take or the delivery, where the taker is charged. It is `Give`'s single act
 performed in two steps with the kernel holding the reference in between, and
 each step keeps `Give`'s ordering — the count goes up before it goes down, per
 handle — so no object can transiently reach zero and be freed mid-move. The
-`Transfer` bit is checked at the sender exactly as `give` checks it.
+`Transfer` bit is checked at the sender exactly as `give` checks it. A reply
+cannot carry the request handle it is invoked through (§3).
 
 - **What it buys is a guarantee: a message the kernel accepted delivers what
   it was carrying, whatever becomes of the sender.** A capability handed over
@@ -1846,13 +1847,16 @@ Not yet enforced:
     entry is unbound from the caller's table and its reference dropped, so an
     object whose last handle this was is destroyed (a pipe end reaching zero
     tells its peer, for example). The typed tier empties the carrier on those
-    outcomes. A bad carried handle faults the caller before anything is taken.
-    No new status marks the difference; the status says which half applies. The
-    fused `send_with` never refuses the send itself transiently, since it parks
-    for room and mints no claim, so its `PeerClosed` consumes the handles
-    whether or not the message was staged. A `NoResource` or `QuotaExceeded`
-    answered at the reply's delivery comes after the carried handles were
-    staged, so it consumes them too. A reply refuses nothing transiently
+    outcomes. A bad carried handle faults the caller before anything is taken,
+    and so does a carried word equal to the handle the op is invoked through
+    when the op consumes that handle: `Reply` and `ReplyWait` consume the
+    request handle, which therefore cannot travel in their own message
+    (`BadArg`). No new status marks the difference; the status says which half
+    applies. The fused `send_with` never refuses the send itself transiently,
+    since it parks for room and mints no claim, so its `PeerClosed` consumes the
+    handles whether or not the message was staged. A `NoResource` or
+    `QuotaExceeded` answered at the reply's delivery comes after the carried
+    handles were staged, so it consumes them too. A reply refuses nothing transiently
     either: `reply_with` and `reply_wait_with` consume their handles on every
     answer, by delivery or, for a reply to an abandoned request, by release.
     `Waiter.give` and every `Process.give` overload follow the keep rule: a

@@ -527,8 +527,18 @@ public(package) func table_room(p: Int, n: Int) unsafe -> Bool {
 /// After that many reuses of one slot a word can alias again; this is
 /// best-effort bug detection, and since the table is per-process a wrap
 /// collision crosses no boundary and grants nothing.
+///
+/// The index must be bound. Unbinding an unbound slot would bump the
+/// generation and credit the handle quota for an entry that no longer exists,
+/// so it is a kernel bug and stops the machine.
 public(package) func unbind_handle(p: Int, index: Int) unsafe {
     let entry = PROCESSES[p].handles[index]
+    match entry.obj_type {
+        case Unbound -> {
+            fatal_kernel("an unbound handle slot was unbound", index as UInt)
+        },
+        case _ -> {},
+    }
     let next = (entry.gen + 1) % HANDLE_GENERATION_MODULUS
     PROCESSES[p].handles[index] = HandleEntry(obj_type: ObjType.Unbound,
                                               rights: 0, target: 0,

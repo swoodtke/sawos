@@ -1,0 +1,131 @@
+// A fused reply cannot carry the request handle it is invoked through
+// (spec.md §3). Expected outcome:
+//
+//   SOS replywaitself: reply_wait with the request in its own record
+//   SOS: process fault: argument outside its domain
+//
+// `ReplyWait` consumes the handle it is invoked through, as `Reply` does, and
+// takes its message nested in a larger record. The nested record goes through
+// the same check, ahead of the exchange and the wait leg, so the obligation
+// stays undischarged and the process never parks.
+//
+// The typed tier cannot spell this: `reply_wait_with` consumes the request, and
+// a `PipeRequest` put in the carrier is moved out of the receiver. So the case
+// drives the C-altitude floor with raw words.
+
+import sos.{System, sos_system_process_self, sos_process_pipe_create,
+            sos_process_waiter_create, sos_pipe_inlet_post,
+            sos_pipe_outlet_take, sos_pipe_request_reply_wait, ALL_RIGHTS,
+            PIPE_MSG_HANDLES}
+
+static EXIT_FAILED: UInt = 1
+
+/// The status word a successful op answers with (`SosStatus.Ok`).
+static STATUS_OK: UInt = 0
+
+/// The word that names nothing, which also marks an empty handle slot.
+static NONE: UInt = 0
+
+/// A send record's words: body address, length, then the handle words.
+static SEND_WORDS: Int = 2 + PIPE_MSG_HANDLES
+
+/// A reply-wait record: the waiter's word, then a send record.
+static REPLY_WAIT_WORDS: Int = 1 + SEND_WORDS
+
+/// Room for a take record, which is the longest record here and also holds a
+/// wait record.
+static TAKE_WORDS: Int = 64
+
+/// This process's own Process handle, as a raw word, or `NONE`.
+func ask_process(boot_handle: UInt) unsafe -> UInt {
+    var out: UInt = NONE
+    let status = sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NONE
+    }
+    out
+}
+
+/// A Waiter in `proc`, as a raw word, or `NONE`.
+func ask_waiter(proc: UInt) unsafe -> UInt {
+    var out: UInt = NONE
+    let status = sos_process_waiter_create(proc,
+                                           (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NONE
+    }
+    out
+}
+
+/// Post an empty message and take it, answering the request handle's word, or
+/// `NONE` when a step was refused.
+func post_and_take(proc: UInt) unsafe -> UInt {
+    var ends: [UInt; 2] = [NONE; 2]
+    if sos_process_pipe_create(proc, (&var ends) as UnsafePointer<UInt>,
+                               (2 * sizeof<UInt>()) as UInt) != STATUS_OK {
+        return NONE
+    }
+
+    // A zero length reads no buffer, so the body address is left empty.
+    var msg: [UInt; SEND_WORDS] = [NONE; SEND_WORDS]
+    var claim: UInt = NONE
+    if sos_pipe_inlet_post(ends[0], (&var msg) as UnsafePointer<UInt>,
+                           (SEND_WORDS * sizeof<UInt>()) as UInt,
+                           (&var claim) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+
+    // The take record starts with the request handle's word.
+    var rec: [UInt; TAKE_WORDS] = [NONE; TAKE_WORDS]
+    if sos_pipe_outlet_take(ends[1], (&var rec) as UnsafePointer<UInt>,
+                            (TAKE_WORDS * sizeof<UInt>()) as UInt) != STATUS_OK {
+        return NONE
+    }
+    rec[0]
+}
+
+/// Reply-wait through `request` with `request` in the message's first handle
+/// slot, answering the status word.
+func reply_wait_carrying_self(request: UInt, waiter: UInt) unsafe -> UInt {
+    var args: [UInt; REPLY_WAIT_WORDS] = [NONE; REPLY_WAIT_WORDS]
+    args[0] = waiter
+    args[3] = request
+    var record: [UInt; TAKE_WORDS] = [NONE; TAKE_WORDS]
+    var leg: UInt = NONE
+    sos_pipe_request_reply_wait(request, (&var args) as UnsafePointer<UInt>,
+                                (REPLY_WAIT_WORDS * sizeof<UInt>()) as UInt,
+                                (&var record) as UnsafePointer<UInt>,
+                                (&var leg) as UnsafePointer<UInt>)
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = ask_process(boot_handle)
+    if proc == NONE {
+        let _ = system.debug_print("SOS replywaitself: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let waiter = ask_waiter(proc)
+    if waiter == NONE {
+        let _ = system.debug_print("SOS replywaitself: no waiter\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let request = post_and_take(proc)
+    if request == NONE {
+        let _ = system.debug_print("SOS replywaitself: no request\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let _ = system.debug_print("SOS replywaitself: reply_wait with the request in its own record\n")
+    let status = reply_wait_carrying_self(request, waiter)
+
+    // Unreachable: the kernel ends this process at the record's check.
+    print("SOS replywaitself: the reply was answered status={}\n", status)
+    let _ = system.shutdown(EXIT_FAILED)
+}

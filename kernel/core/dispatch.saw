@@ -2976,13 +2976,18 @@ func pipe_inlet_op_decoded(op: PipeInletOp, obj: &PipeInletObject, arg0: UInt,
 /// the same whichever direction it goes, and a second copy of them is a second
 /// place to be wrong about which handle a caller may attach.
 ///
+/// `invoking` is the word the op was invoked through when the op consumes that
+/// handle (`Reply` consumes the request handle it is invoked through), and
+/// `NO_HANDLE` when it does not. A carried word equal to it is refused: the
+/// handle cannot both travel in the message and be the one the op destroys.
+///
 /// Every refusal here is a fault, and it happens before anything is staged. A
 /// record of the wrong size, a body longer than `PIPE_BODY_BYTES`, a handle
 /// word that names nothing, one whose entry lacks the universal `Transfer`
-/// right and one naming a kind no `BootHandleKind` spells are all mistakes only
-/// the caller could have made. Raising them above the ring, the exchange and
-/// every mint makes "refuses the whole post, atomic, nothing staged" true by
-/// construction rather than by an unwind.
+/// right, one naming a kind no `BootHandleKind` spells and one equal to
+/// `invoking` are all mistakes only the caller could have made. Raising them
+/// above the ring, the exchange and every mint makes "refuses the whole post,
+/// atomic, nothing staged" true by construction rather than by an unwind.
 ///
 /// It validates and does not unbind. The entries leave the sender (take at
 /// post) in `hold_staged`, which runs after the last refusal that leaves them
@@ -2990,7 +2995,8 @@ func pipe_inlet_op_decoded(op: PipeInletOp, obj: &PipeInletObject, arg0: UInt,
 /// while the caller still holds everything it held. A departed peer is
 /// answered earlier still, but it is terminal: the entries are released
 /// (`release_carried`), not kept.
-func send_args(p: Int, src: UInt, bytes: UInt) unsafe -> PipeSendRecord {
+func send_args(p: Int, src: UInt, bytes: UInt,
+               invoking: UInt) unsafe -> PipeSendRecord {
     // Exactly the published size (`timer_arm`'s rule): the record is the whole
     // argument list, and a caller that hands over a different number of words
     // has built something else.
@@ -3002,15 +3008,15 @@ func send_args(p: Int, src: UInt, bytes: UInt) unsafe -> PipeSendRecord {
                          src, bytes) {
         fault_process(p, why)
     }
-    check_send(p, &args)
+    check_send(p, &args, invoking)
     args
 }
 
 /// The domain half of `send_args`, split out for the one op whose record
 /// arrives nested inside another: `PipeRequestOp.ReplyWait` copies in a waiter
 /// and a message together, so it has the message already and needs only the
-/// checks.
-func check_send(p: Int, args: &PipeSendRecord) unsafe {
+/// checks. `invoking` is as `send_args` describes it.
+func check_send(p: Int, args: &PipeSendRecord, invoking: UInt) unsafe {
     if args.len > (PIPE_BODY_BYTES as UInt) {
         fault_process(p, FaultReason.BadArg)
     }
@@ -3018,6 +3024,9 @@ func check_send(p: Int, args: &PipeSendRecord) unsafe {
     while i < PIPE_MSG_HANDLES {
         let word = args.handles[i]
         if word != NO_HANDLE {
+            if word == invoking {
+                fault_process(p, FaultReason.BadArg)
+            }
             let entry = lookup_handle(p, word)
             match entry.obj_type {
                 case Unbound -> fault_process(p, FaultReason.BadHandle),
@@ -3078,7 +3087,7 @@ func check_send(p: Int, args: &PipeSendRecord) unsafe {
 /// A ring slot lives until its exchange settles rather than until its bytes are
 /// taken, so `PIPE_INFLIGHT` bounds awaiting-reply exchanges.
 func pipe_post(p: Int, slot: Int, args_src: UInt, args_bytes: UInt) unsafe -> SyscallResult {
-    let args = send_args(p, args_src, args_bytes)
+    let args = send_args(p, args_src, args_bytes, NO_HANDLE)
     let len = args.len
     if PIPES[slot].outlet_refs == 0 {
         // Terminal: the carried handles are consumed, as they would have been
@@ -3175,7 +3184,7 @@ func pipe_post(p: Int, slot: Int, args_src: UInt, args_bytes: UInt) unsafe -> Sy
 /// in `pipe_take`).
 func pipe_call(p: Int, slot: Int, args_src: UInt, args_bytes: UInt,
                reply_dst: UInt) unsafe -> SyscallResult {
-    let args = send_args(p, args_src, args_bytes)
+    let args = send_args(p, args_src, args_bytes, NO_HANDLE)
     let len = args.len
     if let why = copy_out_check(p, reply_dst, pipe_msg_record_bytes() as UInt) {
         fault_process(p, why)
@@ -3638,7 +3647,7 @@ func pipe_request_op_decoded(op: PipeRequestOp, obj: &PipeRequestObject,
             if not obj.allows(PipeRequestRight.Reply) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            let args = send_args(p, arg0, arg1)
+            let args = send_args(p, arg0, arg1, obj.handle)
             op_status(pipe_reply_status(p, obj.handle, obj.slot, &args))
         },
         // `Reply` gates the reply leg and the Waiter gates its own. The op does
@@ -3660,7 +3669,9 @@ func pipe_request_op_decoded(op: PipeRequestOp, obj: &PipeRequestObject,
 ///
 /// The reply body rides the copy-in funnel into the very slot that carried the
 /// request, and the request handle is consumed, so an obligation is discharged
-/// exactly once through any one name.
+/// exactly once through any one name. The request handle cannot be one of the
+/// handles the reply carries: `check_send` raises that as a `BadArg` fault on
+/// the caller, ahead of the exchange (spec §3).
 ///
 /// To an abandoned request it answers `PeerClosed` and writes nothing. The
 /// client dropping its claim is a cancellation signal the server may honour or
@@ -3792,11 +3803,11 @@ func reply_wait_waiter(p: Int, handle: UInt) unsafe -> Int {
 ///
 /// Every fault is raised before the obligation is discharged; this is the
 /// function's one real ordering decision. A bad args record, a waiter handle
-/// that names nothing or lacks `Wait`, an oversized body, a record buffer
-/// outside the caller's memory all end the process, and all are asked while the
-/// request is still live, so a caller that faults leaves an exchange its client
-/// can still be told about rather than one discharged into a process that no
-/// longer exists.
+/// that names nothing or lacks `Wait`, an oversized body, the request handle
+/// itself among the carried handles, a record buffer outside the caller's
+/// memory all end the process, and all are asked while the request is still
+/// live, so a caller that faults leaves an exchange its client can still be
+/// told about rather than one discharged into a process that no longer exists.
 ///
 /// A refused reply returns without parking. The request is consumed either way
 /// (§2.1), but a `PeerClosed` comes straight back with `ReplyWaitLeg.Reply` in
@@ -3824,7 +3835,7 @@ func pipe_reply_wait(p: Int, word: UInt, x: Int, args_src: UInt,
     // bound and the four handle words, on the same terms as a `Reply`. Every
     // one of those refusals is a fault, and every one happens while the
     // obligation is still live.
-    check_send(p, &args.msg)
+    check_send(p, &args.msg, word)
     let w = reply_wait_waiter(p, args.waiter)
     // The wait leg's buffer is validated here, on the call, as `waiter_wait`
     // validates its own: terminating a bad-buffer caller while it is the

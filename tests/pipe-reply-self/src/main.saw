@@ -1,0 +1,105 @@
+// A reply cannot carry the request handle it is invoked through (spec.md §3).
+// Expected outcome:
+//
+//   SOS replyself: replying with the request in its own record
+//   SOS: process fault: argument outside its domain
+//
+// `Reply` consumes the handle it is invoked through, so a record that names
+// that handle would hand the kernel one entry to stage and to consume. The
+// check runs with the rest of the record's validation, before the exchange is
+// touched, so the obligation stays undischarged and the handle table keeps
+// every entry it had.
+//
+// The typed tier cannot spell this: `reply_with` consumes the request, and a
+// `PipeRequest` put in the carrier is moved out of the receiver. So the case
+// drives the C-altitude floor with raw words.
+
+import sos.{System, sos_system_process_self, sos_process_pipe_create,
+            sos_pipe_inlet_post, sos_pipe_outlet_take, sos_pipe_request_reply,
+            ALL_RIGHTS, PIPE_MSG_HANDLES}
+
+static EXIT_FAILED: UInt = 1
+
+/// The status word a successful op answers with (`SosStatus.Ok`).
+static STATUS_OK: UInt = 0
+
+/// The word that names nothing, which also marks an empty handle slot.
+static NONE: UInt = 0
+
+/// A send record's words: body address, length, then the handle words.
+static SEND_WORDS: Int = 2 + PIPE_MSG_HANDLES
+
+/// Room for a take record, which is the longest record here.
+static TAKE_WORDS: Int = 64
+
+/// This process's own Process handle, as a raw word, or `NONE`.
+func ask_process(boot_handle: UInt) unsafe -> UInt {
+    var out: UInt = NONE
+    let status = sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NONE
+    }
+    out
+}
+
+/// Post an empty message and take it, answering the request handle's word, or
+/// `NONE` when a step was refused.
+func post_and_take(proc: UInt) unsafe -> UInt {
+    var ends: [UInt; 2] = [NONE; 2]
+    if sos_process_pipe_create(proc, (&var ends) as UnsafePointer<UInt>,
+                               (2 * sizeof<UInt>()) as UInt) != STATUS_OK {
+        return NONE
+    }
+
+    // A zero length reads no buffer, so the body address is left empty.
+    var msg: [UInt; SEND_WORDS] = [NONE; SEND_WORDS]
+    var claim: UInt = NONE
+    if sos_pipe_inlet_post(ends[0], (&var msg) as UnsafePointer<UInt>,
+                           (SEND_WORDS * sizeof<UInt>()) as UInt,
+                           (&var claim) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+
+    // The take record starts with the request handle's word.
+    var rec: [UInt; TAKE_WORDS] = [NONE; TAKE_WORDS]
+    if sos_pipe_outlet_take(ends[1], (&var rec) as UnsafePointer<UInt>,
+                            (TAKE_WORDS * sizeof<UInt>()) as UInt) != STATUS_OK {
+        return NONE
+    }
+    rec[0]
+}
+
+/// Reply through `request` with `request` in the record's first handle slot,
+/// answering the status word.
+func reply_carrying_self(request: UInt) unsafe -> UInt {
+    var msg: [UInt; SEND_WORDS] = [NONE; SEND_WORDS]
+    msg[2] = request
+    sos_pipe_request_reply(request, (&var msg) as UnsafePointer<UInt>,
+                           (SEND_WORDS * sizeof<UInt>()) as UInt)
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = ask_process(boot_handle)
+    if proc == NONE {
+        let _ = system.debug_print("SOS replyself: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let request = post_and_take(proc)
+    if request == NONE {
+        let _ = system.debug_print("SOS replyself: no request\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let _ = system.debug_print("SOS replyself: replying with the request in its own record\n")
+    let status = reply_carrying_self(request)
+
+    // Unreachable: the kernel ends this process at the record's check.
+    print("SOS replyself: the reply was answered status={}\n", status)
+    let _ = system.shutdown(EXIT_FAILED)
+}

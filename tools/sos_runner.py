@@ -384,6 +384,8 @@ CHILD_REPLY_PKG = os.path.join(TESTS_DIR, "child-reply")
 PIPE_NO_REPLY_PKG = os.path.join(TESTS_DIR, "pipe-no-reply")
 PIPE_BIG_REPLY_PKG = os.path.join(TESTS_DIR, "pipe-big-reply")
 PIPE_DEAD_CLAIM_PKG = os.path.join(TESTS_DIR, "pipe-dead-claim")
+PIPE_REPLY_SELF_PKG = os.path.join(TESTS_DIR, "pipe-reply-self")
+PIPE_REPLY_WAIT_SELF_PKG = os.path.join(TESTS_DIR, "pipe-reply-wait-self")
 
 # Waitability. A rights refusal and a bad-argument refusal are faults, so
 # neither negative arm can share an image with anything that has work left.
@@ -3508,6 +3510,39 @@ TEST_CASES = [
         "root_pkg": PIPE_BIG_REPLY_PKG,
         "expect_out": ["{banner}",
                        "SOS bigreply: asking for 129",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # A reply cannot carry the request handle it is invoked through
+        # (spec.md §3). The reply consumes that handle, so a record naming it
+        # would stage and consume one entry; the kernel refuses it as a caller
+        # error before it touches the exchange.
+        "name": "reply_carries_self",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_REPLY_SELF_PKG,
+        "expect_out": ["{banner}",
+                       "SOS replyself: replying with the request in its own "
+                       "record",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # `reply_carries_self`'s rule at the fused op, whose message arrives
+        # nested in a larger record and reaches the same check by a different
+        # call. The fault comes before the wait leg, so nothing parks.
+        "name": "reply_wait_carries_self",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_REPLY_WAIT_SELF_PKG,
+        "expect_out": ["{banner}",
+                       "SOS replywaitself: reply_wait with the request in "
+                       "its own record",
                        "SOS: process fault: argument outside its domain "
                        "process={zero}",
                        "SOS: process teardown handles="],
