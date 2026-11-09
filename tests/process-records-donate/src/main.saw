@@ -1,0 +1,217 @@
+// The record table is its own donatable slab (spec §2.7): donating to
+// `SlabKind.ProcessRecords` raises how many dead processes can be held before a
+// create is refused, and donating to `SlabKind.Processes` does not.
+//
+// Root runs children to their death one at a time and holds each dead one by
+// handing its Process handle to a Waiter it never waits on (a consuming,
+// persistent attachment), so its own handle table never grows. The transcript
+// reads as a sequence:
+//
+//   SOS recdonate: held=N, then out of kernel objects
+//   SOS recdonate: after a body donation, out of kernel objects
+//   SOS recdonate: after a record donation, held one more
+//   SOS recdonate: done
+//
+// `held=N` is the record table less root's own record, as in
+// `process-records`. The body donation succeeds and changes nothing: no live
+// process is waiting for a body, and every record is taken. The record
+// donation is what lets the next create through.
+//
+// The case is written at the C floor, on raw words, as `process-records` is:
+// each dead child is a word handed on to the Waiter, and the typed `Process`
+// has no word to hand.
+
+import sos.{System, SosStatus, SlabKind, sos_handle_release,
+            sos_memory_split, sos_process_boot_handle_next,
+            sos_process_get_status, sos_process_start,
+            sos_process_waiter_create, sos_system_process_create,
+            sos_system_slab_donate, sos_thread_yield, sos_waiter_add}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static STATUS_OK: UInt = 0
+
+/// Root's boot-minted Process and Thread words (spec §12).
+static BOOT_PROCESS_WORD: UInt = 2
+static BOOT_THREAD_WORD: UInt = 3
+
+/// A boot-handle record: tag, kind, handle word.
+static RECORD_WORDS: Int = 3
+static RECORD_HANDLE_WORD: Int = 2
+
+/// `BootTagForm.Absent`: the child starts with no handle at all.
+static NO_BOOT_TAG: UInt = 0
+
+/// The status word of a process that has not ended (`Running`, code 0).
+static NOT_ENDED: UInt = 0
+
+/// `WAITER_ADD_CONSUMING` with no `WAITER_ADD_ONESHOT`: the attachment takes
+/// the handle and stays, holding the dead child's record.
+static ADD_CONSUMING: UInt = 2
+
+/// One page off the pool for each donation.
+static CHUNK: UInt = 0x1000
+
+/// More creates than the case can ever reach, as a loop bound.
+static MAX_TRIES: Int = 64
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    // Rows: the child's image, the RAM it runs in, then the pool the two
+    // donations are cut from.
+    let image = next_region_word(BOOT_PROCESS_WORD)
+    let dest = next_region_word(BOOT_PROCESS_WORD)
+    let pool = next_region_word(BOOT_PROCESS_WORD)
+    if image == 0 || dest == 0 || pool == 0 {
+        let _ = system.debug_print("SOS recdonate: boot regions missing\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let bodies = cut(pool)
+    let records = cut(pool)
+    let holder = new_waiter(BOOT_PROCESS_WORD)
+    if bodies == 0 || records == 0 || holder == 0 {
+        let _ = system.debug_print("SOS recdonate: setup refused\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    var next_key: UInt = 1
+    let held = fill(boot_handle, image, dest, holder, &var next_key, MAX_TRIES)
+    if held < 0 {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let gave_bodies = sos_system_slab_donate(boot_handle,
+                                             SlabKind.Processes as UInt, bodies)
+    if gave_bodies != STATUS_OK {
+        print("SOS recdonate: body donation refused: {}\n", describe(gave_bodies))
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let after_bodies = fill_quiet(boot_handle, image, dest, holder, &var next_key)
+    if after_bodies == STATUS_OK {
+        print("SOS recdonate: after a body donation, held one more\n")
+    } else {
+        print("SOS recdonate: after a body donation, {}\n", describe(after_bodies))
+    }
+
+    let gave_records = sos_system_slab_donate(boot_handle,
+                                              SlabKind.ProcessRecords as UInt,
+                                              records)
+    if gave_records != STATUS_OK {
+        print("SOS recdonate: record donation refused: {}\n",
+              describe(gave_records))
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let after_records = fill_quiet(boot_handle, image, dest, holder,
+                                   &var next_key)
+    if after_records == STATUS_OK {
+        print("SOS recdonate: after a record donation, held one more\n")
+    } else {
+        print("SOS recdonate: after a record donation, {}\n",
+              describe(after_records))
+    }
+
+    print("SOS recdonate: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// Create, run and hold children until a create is refused, at most `tries`
+/// times; answer how many were held, or -1 when something other than the
+/// create failed.
+func fill(system: UInt, image: UInt, dest: UInt, holder: UInt,
+          next_key: &var UInt, tries: Int) unsafe -> Int {
+    var held: Int = 0
+    while held < tries {
+        let status = fill_quiet(system, image, dest, holder, &var next_key)
+        if status != STATUS_OK {
+            print("SOS recdonate: held={}, then {}\n", held, describe(status))
+            return held
+        }
+        held += 1
+    }
+    print("SOS recdonate: held={} and never refused\n", held)
+    held
+}
+
+/// Create one child, run it to its death and hand it to the holder: the
+/// create's refusal, or `STATUS_OK` once the child is held.
+func fill_quiet(system: UInt, image: UInt, dest: UInt, holder: UInt,
+                next_key: &var UInt) unsafe -> UInt {
+    var child: UInt = 0
+    let refused = sos_system_process_create(system, image, dest,
+                                            (&var child) as UnsafePointer<UInt>)
+    if refused != STATUS_OK {
+        return refused
+    }
+    let _ = sos_process_start(child, NO_BOOT_TAG, 0)
+    while status_of(child) == NOT_ENDED {
+        let _ = sos_thread_yield(BOOT_THREAD_WORD)
+    }
+    let attached = sos_waiter_add(holder, child, next_key, ADD_CONSUMING)
+    next_key += 1
+    if attached != STATUS_OK {
+        print("SOS recdonate: hold refused: {}\n", describe(attached))
+        let _ = sos_handle_release(child)
+    }
+    attached
+}
+
+/// A page cut off the front of `pool`, or 0.
+func cut(pool: UInt) unsafe -> UInt {
+    var piece: UInt = 0
+    let status = sos_memory_split(pool, CHUNK, (&var piece) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return 0
+    }
+    piece
+}
+
+/// A new Waiter made through `process`, or 0.
+func new_waiter(process: UInt) unsafe -> UInt {
+    var waiter: UInt = 0
+    let status = sos_process_waiter_create(process,
+                                           (&var waiter) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return 0
+    }
+    waiter
+}
+
+/// The status word a Process word answers, or 0 when the ask is refused.
+func status_of(process: UInt) unsafe -> UInt {
+    var word: UInt = 0
+    let status = sos_process_get_status(process,
+                                        (&var word) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return 0
+    }
+    word
+}
+
+/// The next boot-set record's handle word, drained through `process`, or 0.
+func next_region_word(process: UInt) unsafe -> UInt {
+    var buf: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+    let bytes = (RECORD_WORDS * sizeof<UInt>()) as UInt
+    let status = sos_process_boot_handle_next(process,
+                                              (&var buf) as UnsafePointer<UInt>,
+                                              bytes)
+    if status != STATUS_OK {
+        return 0
+    }
+    buf[RECORD_HANDLE_WORD]
+}
+
+/// A raw status word in the typed vocabulary's words.
+func describe(raw: UInt) -> SosStatus {
+    if raw > (UInt8.max as UInt) {
+        return SosStatus.Unknown
+    }
+    SosStatus.from(raw: raw as UInt8) ?? SosStatus.Unknown
+}

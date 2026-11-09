@@ -1,30 +1,45 @@
-//! The process slot: one record per process, holding every storage a process
-//! index keys (handle table, quota ledger, boot-handle queue, grant record).
+//! The process record and the process body (spec §2.7): every storage a
+//! process index keys, in two tables.
 //!
-//! This module does no work. It defines the record, its field types and the
-//! slab that holds it, and it sits below every module that reads any of them,
-//! `objects` included. The functions that maintain each part live elsewhere:
-//! the handle table's in `kcore.objects`, the grant record's and the copy
-//! doors' in `kcore.process`.
+//! A process is two entries. Its record (`ProcessRecord`, in `PROCESS_RECORDS`)
+//! holds what outlives it: the state, the status word, the quota ledger, the
+//! reference count and the attachment, and the final trap counters. Its body
+//! (`ProcessBody`, in `PROCESSES`) holds what only a live process needs: the
+//! handle table, the boot set, the grant record, the entry and the stack. The
+//! process number every other table stores is the record's index. A live
+//! record names its body, and the teardown frees the body and clears the link,
+//! so a `Gone` process is a record with no body.
 //!
-//! `PROCESSES` is a `Slab`, so a deployment can donate process slots. A slab is
-//! one array keyed by the slot index, so every per-process table is a field of
-//! `ProcessSlot` (all inner dimensions are per-process constants); a parallel
-//! `MAX_PROCESSES`-sized table would not grow with a donation.
+//! This module does no work beyond following that link (`body_of`). It defines
+//! both entries, their field types and the slabs that hold them, and it sits
+//! below every module that reads any of them, `objects` included. The functions
+//! that maintain each part live elsewhere: the handle table's and the ledger's
+//! in `kcore.objects`, the grant record's, the copy doors' and the link's in
+//! `kcore.process`, and the body's free in the teardown (`kcore.sched`).
 //!
-//! Cost: `PROCESSES` lives in `.data`, not `.bss`, because `GrantRow.region`'s
-//! `NO_MEMORY` sentinel is `-1` and the record's initializer is therefore not
-//! all-zero. A plus-one encoding for that field (as `ProcessSlot.attachment`
-//! uses) would put the record back in `.bss`.
+//! Both tables are `Slab`s, so a deployment can donate records and bodies
+//! separately. A slab is one array keyed by its index, so every per-process
+//! table is a field of one entry or the other (all inner dimensions are
+//! per-process constants); a parallel table would not grow with a donation.
+//!
+//! Cost: the body table lives in `.data`, not `.bss`, because
+//! `GrantRow.region`'s `NO_MEMORY` sentinel is `-1` and the body's initializer
+//! is therefore not all-zero. A plus-one encoding for that field (as
+//! `ProcessRecord.attachment` and `ProcessRecord.body_link` use) would put it
+//! back in `.bss`. The record table is all-zero, and so is a donated extent of
+//! it: a zeroed record is a `Free` record with no body.
 
-import sosabi.{BootHandleKind, ObjType, ProcessStatusKind}
+import sosabi.{BootHandleKind, ObjType, ProcessStatusKind, StatsRow}
 import kcore.limits.{
     MAX_GRANT_ROWS,
     MAX_HANDLES,
     MAX_PROCESSES,
+    MAX_PROCESS_RECORDS,
     MAX_SLAB_EXTENTS,
+    NO_BODY,
     NO_MEMORY,
 }
+import kcore.diag.{fatal_kernel}
 import kcore.slab.{Slab}
 
 /// One handle-table entry: the object a handle names, the rights its holder has
@@ -69,7 +84,7 @@ public(package) struct BootHandleSlot {
 /// What a process may be charged for.
 ///
 /// Raw-backed and dense from zero, because the value is the column index in the
-/// two quota rows of `ProcessSlot`.
+/// two quota rows of `ProcessRecord`.
 ///
 /// `Handle` has no slab: a handle entry lives in the per-process table, so this
 /// row alone bounds it.
@@ -102,7 +117,7 @@ public(package) enum QuotaKind: UInt8 {
 /// Columns in the ledger: one per `QuotaKind`, and the length of the two rows.
 public(package) static QUOTA_KINDS: Int = 10
 
-/// What a process slot is doing.
+/// What a process record is doing.
 ///
 /// `Created` is the inert state between `process_create` (an address space with
 /// an entry and stack recorded, no thread) and `start`. A second `start` is a
@@ -151,12 +166,83 @@ public(package) struct GrantRow {
     /// pinned and returns nothing, spec §5.9).
     ///
     /// Because `NO_MEMORY` is `-1` and every other field rests at zero, this
-    /// field is what keeps the record out of `.bss`; see the module header.
+    /// field is what keeps the body table out of `.bss`; see the module header.
     public(package) region: Int,
 }
 
-/// One process (spec §2.7): its protection domain, its handle table,
-/// its ledger, its boot set and its threads.
+/// One process as the rest of the kernel names it (spec §2.7): what must
+/// outlive the process.
+///
+/// A Process handle's target, an attachment on one, a thread's or a charged
+/// object's `process` field and a Mapping's `target` are all an index into
+/// `PROCESS_RECORDS`. A `Gone` record keeps its status word and final counters
+/// for as long as a reference names it, and `reclaim_process_record` frees it
+/// when `refs` reaches zero.
+///
+/// `public(package)`, like the table: `kcore.dispatch` and `kcore.sched` read
+/// records out of it, and a private element type would be a value a sibling
+/// module holds and cannot name.
+///
+/// There is no cached self-handle: a process's own Process handle is minted per
+/// call, each instance independently releasable, so a cached word would go
+/// stale when that instance was released. The handle table is the truth.
+public(package) struct ProcessRecord {
+    public(package) state: ProcessState,
+    /// The spec §8 status word's two halves, written at the death.
+    public(package) exit_kind: ProcessStatusKind,
+    public(package) exit_code: UInt,
+    /// What this process has spent, by `QuotaKind`. The record sits below
+    /// `kcore.objects` so `mint_handle` can charge and `unbind_handle` can
+    /// credit the `Handle` row.
+    public(package) quota_used: [UInt16; QUOTA_KINDS],
+    /// What this process may spend, by kind. Zero until `install_quota_limits`
+    /// runs, which is deliberate: a record with no limits installed can
+    /// allocate nothing, so a process reached before its ledger exists refuses
+    /// rather than running unbudgeted.
+    public(package) quota_limit: [UInt16; QUOTA_KINDS],
+    /// How many handle entries anywhere name this process, plus its
+    /// attachment.
+    ///
+    /// `reclaim_process_record` reads this instead of scanning every table: no
+    /// reference naming the record means no possible reader of its status word
+    /// (spec §8). It counts references from every process's table, so it lives
+    /// on the record rather than in the ledger; whoever still holds a handle is
+    /// the reader that matters, not necessarily the releaser.
+    ///
+    /// A Process handle is a waitable and an attachment is a counted reference
+    /// on every waitable, so a supervisor watching a dead child holds the
+    /// record open, and the status word it is waiting to read cannot be
+    /// reclaimed (attach-after-death is sound).
+    public(package) refs: UInt16,
+    /// The attachment naming this process (slot + 1); 0 = unattached.
+    ///
+    /// The same field the other waitables carry (`EventSlot.attachment`): spec
+    /// §2.2 allows at most one Waiter per handle, so it is a field rather than
+    /// a list, and it is the one thing `end_process` loads from the wait
+    /// machinery. It is a property of the record, which is why
+    /// `kcore.waitables` sits above `kcore.pslot` (see `kcore`'s module-order
+    /// list).
+    public(package) attachment: Int,
+    /// The trap counters as the teardown left them.
+    ///
+    /// While the process lives its counters are its body's row of the stats
+    /// region (`kcore.stats`), keyed by the body's index, and nothing is
+    /// written here. The teardown copies that row in as the body goes, after
+    /// which nothing is charged to the process, so `ProcessOp.Stats` through a
+    /// `Gone` process's handle reads a final answer.
+    public(package) final_stats: StatsRow,
+    /// The body this process runs in, plus one; 0 = no body.
+    ///
+    /// Plus one so that zero means none: a zeroed record, inline or in a
+    /// donated extent, is one no create has linked. Linked at create (root's
+    /// at boot, `claim_root`) and cleared by the teardown as the body is freed,
+    /// so a `Gone` record names none. Read and written only through `body_of`,
+    /// `has_body`, `link_body` and `unlink_body`, which own the encoding.
+    public(package) body_link: Int,
+}
+
+/// What a live process runs in (spec §2.7): its protection domain, its handle
+/// table, its boot set and its entry. The teardown frees it.
 ///
 /// `region_base`/`region_top` are the address-space domain's outer bounds: one
 /// granted range per process, which thread creation checks entries and stacks
@@ -175,17 +261,13 @@ public(package) struct GrantRow {
 /// `grants`/`grant_count` are the grant record: the rows this process's domain
 /// is made of, written by whoever grants and replayed by the scheduler when it
 /// switches in. The domain is data because a hardware protection set cannot be
-/// assumed to hold more than one process's rows at a time.
-///
-/// `public(package)`, like `PROCESSES`: `kcore.dispatch` and `kcore.sched` read
-/// slots out of the table, and a private element type would be a value a
-/// sibling module holds and cannot name.
-///
-/// There is no cached self-handle: a process's own Process handle is minted per
-/// call, each instance independently releasable, so a cached word would go
-/// stale when that instance was released. The handle table is the truth.
-public(package) struct ProcessSlot {
-    public(package) state: ProcessState,
+/// assumed to hold more than one process's rows at a time. The body's index is
+/// the domain's number at the HAL (`hal.prot_switch` and its siblings), which
+/// is why `process_slots_usable` caps the bodies and not the records.
+public(package) struct ProcessBody {
+    /// Whether a record names this body. False is free, and it is zero, so a
+    /// donated extent is an extent of free bodies.
+    public(package) live: Bool,
     /// The image entry, which is what `ENTRY_IMAGE` resolves to.
     public(package) entry: UInt,
     /// Where a `start` puts the first thread's stack pointer — the kernel's
@@ -198,16 +280,18 @@ public(package) struct ProcessSlot {
     public(package) rw_top: UInt,
     public(package) grant_count: Int,
     public(package) grants: [GrantRow; MAX_GRANT_ROWS],
-    public(package) exit_kind: ProcessStatusKind,
-    public(package) exit_code: UInt,
     /// This process's handle table (spec §3). Handle index `i` (0-based) is
     /// `handles[i]`, and the word the process holds carries `i + 1` in its low
     /// byte ("handle 0 names nothing"). Generations start at zero, so a fresh
-    /// slot's first word is the bare index and boot order hands root 1, 2, 3
+    /// body's first word is the bare index and boot order hands root 1, 2, 3
     /// (spec §12).
     ///
     /// `MAX_HANDLES` is the per-process ceiling: however many objects the
     /// machine holds, one process can name at most this many at once.
+    ///
+    /// The generations survive the body's reuse: the teardown unbinds every
+    /// entry, bumping each, so the next process in this body starts with an
+    /// empty table whose words differ from the last one's.
     public(package) handles: [HandleEntry; MAX_HANDLES],
     /// This process's boot set: what was minted for it before it ran and has
     /// not been handed over yet (spec §12).
@@ -219,55 +303,44 @@ public(package) struct ProcessSlot {
     public(package) boot_count: Int,
     /// How many have been collected. `boot_next == boot_count` is "drained".
     public(package) boot_next: Int,
-    /// What this process has spent, by `QuotaKind`. The record sits below
-    /// `kcore.objects` so `mint_handle` can charge and `unbind_handle` can
-    /// credit the `Handle` row.
-    public(package) quota_used: [UInt16; QUOTA_KINDS],
-    /// What this process may spend, by kind. Zero until `install_quota_limits`
-    /// runs, which is deliberate: a slot with no limits installed can allocate
-    /// nothing, so a process reached before its ledger exists refuses rather
-    /// than running unbudgeted.
-    public(package) quota_limit: [UInt16; QUOTA_KINDS],
-    /// How many handle entries anywhere name this process.
-    ///
-    /// `reclaim_process_slot` reads this instead of scanning every table: no
-    /// handle naming the slot means no possible reader of its status word (spec
-    /// §8). It counts references from every process's table, so it lives on the
-    /// slot rather than in the ledger; whoever still holds a handle is the
-    /// reader that matters, not necessarily the releaser.
-    ///
-    /// It also counts the attachment. A Process handle is a waitable and an
-    /// attachment is a counted reference on every waitable; a supervisor
-    /// watching a dead child therefore holds the slot open, so the status word
-    /// it is waiting to read cannot be reclaimed (attach-after-death is sound).
-    public(package) refs: UInt16,
-    /// The attachment naming this process (slot + 1); 0 = unattached.
-    ///
-    /// The same field the other waitables carry (`EventSlot.attachment`): spec
-    /// §2.2 allows at most one Waiter per handle, so it is a field rather than
-    /// a list, and it is the one thing `end_process` loads from the wait
-    /// machinery. It is a property of the process slot, which is why
-    /// `kcore.waitables` sits above `kcore.pslot` (see `kcore`'s module-order
-    /// list).
-    public(package) attachment: Int,
 }
 
-// The per-process trap counters (`syscalls`, `interrupts`, `faults`) are not
-// fields here. They are rows of `kcore.stats`' published region: one storage,
-// read by `ProcessOp.Stats` and by a mapped supervisor, with no mirror on the
-// slot. They are per process (a thread's traps are its process's), `UInt64`,
-// keyed by the cause class `ktrap` decides on, and zeroed at create so a reused
-// slot inherits nothing. They cannot live in `ProcessSlot` because a mapped
-// page needs the columns contiguous and grain-aligned.
+// A live process's trap counters (`syscalls`, `interrupts`, `faults`) are not
+// fields of its body. They are rows of `kcore.stats`' published region, keyed
+// by the body's index: one storage, read by `ProcessOp.Stats` and by a mapped
+// supervisor, with no mirror. They are per process (a thread's traps are its
+// process's), `UInt64`, keyed by the cause class `ktrap` decides on, and zeroed
+// at create so a reused body inherits nothing. They cannot live in
+// `ProcessBody` because a mapped page needs the columns contiguous and
+// grain-aligned. The teardown copies them into `ProcessRecord.final_stats`.
 
-/// The process slab: extent 0 is `MAX_PROCESSES` long and a donation appends.
+/// The record slab: extent 0 is `MAX_PROCESS_RECORDS` long and a donation
+/// (`SlabKind.ProcessRecords`) appends. `capacity()` is the record allocator's
+/// whole bound.
+public(package) unsafe static var PROCESS_RECORDS: Slab<ProcessRecord, MAX_PROCESS_RECORDS> = Slab<ProcessRecord, MAX_PROCESS_RECORDS>(
+    inline: [ProcessRecord(state: ProcessState.Free,
+                           exit_kind: ProcessStatusKind.Running, exit_code: 0,
+                           quota_used: [0; QUOTA_KINDS],
+                           quota_limit: [0; QUOTA_KINDS],
+                           refs: 0, attachment: 0,
+                           final_stats: StatsRow(syscalls: 0, interrupts: 0,
+                                                 faults: 0),
+                           body_link: 0); MAX_PROCESS_RECORDS],
+    ext_base: [0; MAX_SLAB_EXTENTS],
+    ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_side: [0; MAX_SLAB_EXTENTS],
+    ext_count: 0,
+    total: MAX_PROCESS_RECORDS)
+
+/// The body slab: extent 0 is `MAX_PROCESSES` long and a donation
+/// (`SlabKind.Processes`) appends.
 ///
 /// `capacity()` is what every scan reads, but it does not by itself bound a
-/// creation: a tier that keeps a persistent protection domain per process slot
+/// creation: a tier that keeps a persistent protection domain per body
 /// publishes how many it has (`hal.PROT_DOMAIN_SLOTS`), and `alloc_process`
 /// takes the smaller of the two. See `kcore.process.process_slots_usable`.
-public(package) unsafe static var PROCESSES: Slab<ProcessSlot, MAX_PROCESSES> = Slab<ProcessSlot, MAX_PROCESSES>(
-    inline: [ProcessSlot(state: ProcessState.Free, entry: 0,
+public(package) unsafe static var PROCESSES: Slab<ProcessBody, MAX_PROCESSES> = Slab<ProcessBody, MAX_PROCESSES>(
+    inline: [ProcessBody(live: false, entry: 0,
                          stack_top: 0, region_base: 0, region_top: 0,
                          rw_base: 0, rw_top: 0,
                          grant_count: 0,
@@ -275,7 +348,6 @@ public(package) unsafe static var PROCESSES: Slab<ProcessSlot, MAX_PROCESSES> = 
                                            device: false,
                                            region: NO_MEMORY);
                                   MAX_GRANT_ROWS],
-                         exit_kind: ProcessStatusKind.Running, exit_code: 0,
                          handles: [HandleEntry(obj_type: ObjType.Unbound,
                                                rights: 0, target: 0, gen: 0);
                                    MAX_HANDLES],
@@ -283,12 +355,39 @@ public(package) unsafe static var PROCESSES: Slab<ProcessSlot, MAX_PROCESSES> = 
                                                        kind: BootHandleKind.Memory,
                                                        handle: 0, taken: false);
                                         MAX_HANDLES],
-                         boot_count: 0, boot_next: 0,
-                         quota_used: [0; QUOTA_KINDS],
-                         quota_limit: [0; QUOTA_KINDS],
-                         refs: 0, attachment: 0); MAX_PROCESSES],
+                         boot_count: 0, boot_next: 0); MAX_PROCESSES],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
     ext_side: [0; MAX_SLAB_EXTENTS],
     ext_count: 0,
     total: MAX_PROCESSES)
+
+/// The body process `p` runs in.
+///
+/// Every caller acts on a live process, so a record with no body is a kernel
+/// bug here and stops the machine rather than indexing the body table with
+/// `NO_BODY`. A site that can meet a `Gone` process asks `has_body` first.
+public(package) func body_of(p: Int) unsafe -> Int {
+    let link = PROCESS_RECORDS[p].body_link
+    if link == 0 {
+        fatal_kernel("a process with no body was asked for one", p as UInt)
+        return NO_BODY
+    }
+    link - 1
+}
+
+/// Whether process `p` still has its body: false once its teardown has freed
+/// it, and for a record no create has linked yet.
+public(package) func has_body(p: Int) unsafe -> Bool {
+    PROCESS_RECORDS[p].body_link != 0
+}
+
+/// Record that process `p` runs in body `b`.
+public(package) func link_body(p: Int, b: Int) unsafe {
+    PROCESS_RECORDS[p].body_link = b + 1
+}
+
+/// Record that process `p` has no body any more.
+public(package) func unlink_body(p: Int) unsafe {
+    PROCESS_RECORDS[p].body_link = 0
+}

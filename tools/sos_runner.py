@@ -221,6 +221,14 @@ HANDLE_MALFORMED_WORD_PKG = os.path.join(TESTS_DIR, "handle-malformed-word")
 HANDLE_DROP_RELEASE_PKG = os.path.join(TESTS_DIR, "handle-drop-release")
 PROCESS_RECLAIM_PKG = os.path.join(TESTS_DIR, "process-reclaim")
 GONE_RECLAIM_TEARDOWN_PKG = os.path.join(TESTS_DIR, "gone-reclaim-teardown")
+# A process is a record and a body. `process-records` holds dead children until
+# the record table refuses and then gives them back; `process-records-donate`
+# moves that wall by donation; the two husk packages map into a child that dies
+# and probe the Mapping once another child lives in the dead one's body.
+PROCESS_RECORDS_PKG = os.path.join(TESTS_DIR, "process-records")
+PROCESS_RECORDS_DONATE_PKG = os.path.join(TESTS_DIR, "process-records-donate")
+MAPPING_HUSK_BASE_PKG = os.path.join(TESTS_DIR, "mapping-husk-base")
+MAPPING_HUSK_UNMAP_PKG = os.path.join(TESTS_DIR, "mapping-husk-unmap")
 CHILD_SUPERVISOR_PKG = os.path.join(TESTS_DIR, "child-supervisor")
 # Mint, give, and the boot drain. The children here receive a masked system
 # handle, so they can print, name themselves, drain and exit.
@@ -290,10 +298,10 @@ SLAB_DONATE_MAPPED_PKG = os.path.join(TESTS_DIR, "slab-donate-mapped")
 SLAB_DONATE_MAPPED_CHILD_PKG = os.path.join(TESTS_DIR, "child-donor")
 SLAB_DONATE_NODES_PKG = os.path.join(TESTS_DIR, "slab-donate-free-nodes")
 
-# `process-donate` fills the process table at `MAX_PROCESSES` (root plus two
+# `process-donate` fills the body table at `MAX_PROCESSES` (root plus two
 # children), watches the next create answer `NoResource`, donates, then creates,
-# starts, reaps and re-creates a third child that can only be living in the
-# donated extent.
+# starts and reaps a third child, and re-creates one that two fillers leave no
+# room for but the donated extent.
 #
 # There are three echo children for riscv32's sake: it places by identity, so
 # three concurrent children need three load addresses and therefore three
@@ -311,8 +319,8 @@ CHILD_MAPWALL_PKG = os.path.join(TESTS_DIR, "child-mapwall")
 # the same attachment and park deliver `Exited` for one and `Faulted` for the
 # other, so a §8 status word arrives through one mechanism either way.
 # `death_late_attach` is the terminal-level case and covers the refcount
-# interplay, since "which reference was holding the dead slot open" only has an
-# answer once there are two.
+# interplay, since "which reference was holding the dead record open" only has
+# an answer once there are two.
 #
 # `child-bye` is the smallest program that can die observably: derive a Process
 # object, say one line, `exit(5)`. `child-fault` is reused for the fault arm.
@@ -2152,20 +2160,16 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
-        # A dead process's slot is reclaimed when its last reader goes. Both
-        # flags are asserted in one line because either alone is misleading:
-        # `refused_before` is the pre-release behaviour still holding while a
-        # reader exists, and `reclaimed_after` is the reader-count reaching
-        # zero. A kernel that reclaimed eagerly would pass the second and fail
-        # the first, and lose the supervision story with it.
+        # A dead process's body comes back at its teardown, while root still
+        # holds its handle: only the record is held. With the dead child held,
+        # an unstarted filler takes the lowest free body (the dead child's),
+        # and a second create finds the last body free only because the dead
+        # child's went back. The record half (held until
+        # the last reference goes, then reclaimed) is `process_records`.
         #
         # It reuses the child-fault package, and every create loads the same
         # image into the same RAM; the first child's remains are nothing the
         # kernel tracks.
-        #
-        # The case arranges a full table: root plus a dead child leaves a slot
-        # free under `MAX_PROCESSES`, and `refused_before` would not happen. One
-        # unstarted filler process spends it.
         "name": "process_reclaim",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": PROCESS_RECLAIM_PKG,
@@ -2180,31 +2184,162 @@ TEST_CASES = [
                        "SOS: process teardown handles={zero} threads={one} "
                        "events={zero} waiters={zero} interrupts={zero} "
                        "timers={zero} process={one}",
-                       "SOS reclaim: refused_before=1 reclaimed_after=1",
+                       "SOS reclaim: body_back_while_held=1",
                        "SOS reclaim: done"],
         "expect_clean_exit": True,
     },
     {
-        # A `Gone` slot whose last reference is dropped by another process's
+        # A `Gone` record whose last reference is dropped by another process's
         # teardown is reclaimed. The supervisor makes a grandchild that faults,
-        # waits for the death and exits; the first supervisor ends holding the
-        # grandchild's Process handle, the second holding only the attachment.
-        # `spare=2` is the table (root, a supervisor and a grandchild) minus
-        # root: both the supervisor's slot and the grandchild's are free again.
-        # `status=65596` and `65597` are `Exited` (1) << 16 with the
-        # supervisor's code in the low half; any other low half is a step the
-        # supervisor could not take.
+        # waits for the death and exits; the first and third supervisors end
+        # holding the grandchild's Process handle, the second holding only the
+        # attachment. Root first holds two dead children of its own (records
+        # 1 and 2), so every supervisor lands in record 3 and every grandchild
+        # in record 4, past `MAX_PROCESSES`: free again only if the previous
+        # supervisor's teardown scanned the whole record table and reclaimed
+        # it. The fault lines' `process={four}` is the claim.
+        # `spare=2` is the body table (root, a supervisor and a grandchild)
+        # minus root: no body leaked. `status=65596` and `65597` are `Exited`
+        # (1) << 16 with the supervisor's code in the low half; any other low
+        # half is a step the supervisor could not take.
         "name": "gone_reclaim_teardown",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": GONE_RECLAIM_TEARDOWN_PKG,
         "children": [CHILD_FAULT_PKG, CHILD_SUPERVISOR_PKG],
         "expect_out": ["{banner}",
                        "SOS: boot regions={four}",
+                       "SOS: process fault: bad handle process={one}",
+                       "SOS: process fault: bad handle process={two}",
+                       "SOS: process fault: bad handle process={four}",
                        "SOS gonereclaim: handle status=65596",
+                       "SOS: process fault: bad handle process={four}",
                        "SOS gonereclaim: attachment status=65597",
+                       "SOS: process fault: bad handle process={four}",
+                       "SOS gonereclaim: again status=65596",
                        "SOS gonereclaim: spare=2",
                        "SOS gonereclaim: done"],
         "expect_clean_exit": True,
+    },
+    {
+        # Dead processes hold records, not bodies. Root runs `child-fault` to
+        # its death again and again, keeping every handle, until a create is
+        # refused. `held=11` is the record table (`MAX_PROCESS_RECORDS`) less
+        # root's own record, far past the body table, and `room=1` is a sibling
+        # minted beside the refusal, so the wall is not root's handle table.
+        #
+        # The second line is every held handle read back on the way up:
+        # `Faulted` (2) << 16 | `BadHandle` (1), and the one syscall the child
+        # died making. The third is the reclaim: each level dropped its handle,
+        # so a second pass holds as many again.
+        "name": "process_records",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PROCESS_RECORDS_PKG,
+        "children": [CHILD_FAULT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS records: pass 1 held=11 room=1, then out of "
+                       "kernel objects",
+                       "SOS records: every held child answered status=131073 "
+                       "syscalls=1 faults=0",
+                       "SOS records: pass 2 held=11 room=1, then out of "
+                       "kernel objects",
+                       "SOS records: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The record table is donatable on its own. Root holds dead children
+        # (each handed to a Waiter it never waits on, so its table stays small)
+        # until a create is refused at the same `held=11`; a page donated to
+        # `SlabKind.Processes` changes nothing, because no live process is
+        # waiting for a body, and a page donated to `SlabKind.ProcessRecords`
+        # lets the next create through.
+        "name": "process_records_donate",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PROCESS_RECORDS_DONATE_PKG,
+        "children": [CHILD_FAULT_PKG],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS recdonate: held=11, then out of kernel objects",
+                       "SOS recdonate: after a body donation, out of kernel "
+                       "objects",
+                       "SOS recdonate: after a record donation, held one more",
+                       "SOS recdonate: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A Mapping whose target died names nobody. A held dead child takes
+        # record 1, so the mapped child is record 2 in body 1. It dies with the
+        # page mapped and stays held, and a second child lands in body 1 with a
+        # page at the same row index. Three things are pinned:
+        #
+        #   counters syscalls=1   the dead mapped child's `Stats` after the
+        #                         second create zeroed body 1's row: the
+        #                         record's own copy, so its body link was
+        #                         cleared at the teardown
+        #   process={two} again   the mapped child released, a third child
+        #                         takes record 2 and dies; its teardown stops
+        #                         the kernel on a Mapping naming record 2 with
+        #                         no row, so dying normally is the husk's
+        #                         `target` disown
+        #   the BadState fault    `Base` on the husk, before any address
+        "name": "mapping_husk_base",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAPPING_HUSK_BASE_PKG,
+        "children": [CHILD_FAULT_PKG],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS: process fault: bad handle process={one}",
+                       "SOS huskbase: mapped into the first child",
+                       "SOS: process fault: bad handle process={two}",
+                       "SOS: process teardown handles={zero} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={two}",
+                       "SOS huskbase: mapped into the second child",
+                       "SOS huskbase: the first child's counters syscalls=1 "
+                       "faults=0",
+                       "SOS: process fault: bad handle process={two}",
+                       "SOS: process teardown handles={zero} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={two}",
+                       "SOS huskbase: the third child is gone",
+                       "SOS: process fault: object in the wrong state "
+                       "process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # The same husk, asked to `Unmap`: the same `BadState` fault, and the
+        # second child's row stays where it is. The counters and the reused
+        # record are pinned as in `mapping_husk_base`.
+        "name": "mapping_husk_unmap",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAPPING_HUSK_UNMAP_PKG,
+        "children": [CHILD_FAULT_PKG],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS: process fault: bad handle process={one}",
+                       "SOS huskunmap: mapped into the first child",
+                       "SOS: process fault: bad handle process={two}",
+                       "SOS: process teardown handles={zero} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={two}",
+                       "SOS huskunmap: mapped into the second child",
+                       "SOS huskunmap: the first child's counters syscalls=1 "
+                       "faults=0",
+                       "SOS: process fault: bad handle process={two}",
+                       "SOS: process teardown handles={zero} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={two}",
+                       "SOS huskunmap: the third child is gone",
+                       "SOS: process fault: object in the wrong state "
+                       "process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
     },
     # =========================================================================
     # Mint, give, and the boot drain
@@ -2865,18 +3000,14 @@ TEST_CASES = [
         # Event's word or a Timer's fire count, is not spent by the delivery
         # that reports it.
         #
-        # `held=1 freed=1` is which reference was load-bearing, asked one at a
-        # time. With the Process handle released and only the attachment left,
-        # a `process_create` against an otherwise-full table is still refused
-        # (slot 1 is still `Gone`); remove the attachment and the count reaches
-        # zero, the slot frees inside that very syscall, and the same create
-        # succeeds. A kernel that did not count the attachment would print
-        # `held=0`, and the second wait above would have been reading a slot
-        # the kernel had already given away.
-        #
-        # "Otherwise full" is arranged by an unstarted filler process
-        # (`MAX_PROCESSES`), exactly as in `process_reclaim` and for the
-        # same reason.
+        # `held=1` and the second child are which reference was load-bearing,
+        # asked one at a time. With the Process handle released and only the
+        # attachment left, a third wait still reads the same word (record 1 is
+        # still `Gone`); remove the attachment and the count reaches zero, the
+        # record frees inside that very syscall, and the next child takes it:
+        # its exit line names process 1 again. A kernel that did not count the
+        # attachment would stop at the release, reporting a record that
+        # reached zero references while attached.
         "name": "death_late_attach",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": DEATH_LATE_ATTACH_PKG,
@@ -2890,7 +3021,12 @@ TEST_CASES = [
                        "events={zero} waiters={zero} interrupts={zero} "
                        "timers={zero} process={one}",
                        "SOS deathlate: first=65541 second=65541",
-                       "SOS deathlate: held=1 freed=1",
+                       "SOS deathlate: held=1",
+                       "SOS bye: exiting",
+                       "SOS: process exit: code={five} process={one}",
+                       "SOS: process teardown handles={two} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
                        "SOS deathlate: done"],
         "expect_clean_exit": True,
     },
@@ -3912,13 +4048,13 @@ TEST_CASES = [
         # change.
         #
         # `child syscalls=8 faults=0` is read after the child is dead. The
-        # handle root created the child with outlives it (the slot is held open
-        # while anything names it), so the columns are still there, which is
-        # the only way the fault column is ever observable, since a faulting
-        # process is not around to ask about itself. Eight is `child-stats`'
-        # whole life: one `process_self`, six probes, one `exit`, and that
-        # child prints nothing precisely so the number is not a hash of its own
-        # prose. Zero faults is the negative half of the same claim.
+        # handle root created the child with outlives it (the record is held
+        # open while anything names it, with the counters the teardown copied
+        # into it), which is the only way the fault column is ever observable,
+        # since a faulting process is not around to ask about itself. Eight is
+        # `child-stats`' whole life: one `process_self`, six probes, one `exit`,
+        # and that child prints nothing precisely so the number is not a hash
+        # of its own prose. Zero faults is the negative half of the same claim.
         #
         # `interrupts=` is the one timing-dependent row in this case and is
         # deliberately not asserted: a tick lands where the host puts it, so
@@ -4845,7 +4981,7 @@ TEST_CASES = [
         "expect_status": EXIT_PROCESS_FAULT,
     },
 
-    # Process-slot donation.
+    # Process-body donation.
     #
     # It lists three children and asks for no pool, which is why the runner's
     # two-children-plus-a-pool refusal never comes up: the region root donates
@@ -4858,11 +4994,12 @@ TEST_CASES = [
         "children": [ECHO_CHILD_PKG, ECHO_CHILD2_PKG, ECHO_CHILD3_PKG],
         "expect_out": ["{banner}",
                        "SOS: boot regions={six}",
-                       # Claim 1: root plus two children is the table.
+                       # Claim 1: root plus two children is the body
+                       # table.
                        "SOS procdonate: floor=3 third child refused: "
                        "out of kernel objects",
                        # Claims 2 and 3.
-                       "SOS procdonate: donated a region of process slots",
+                       "SOS procdonate: donated a region of process bodies",
                        "SOS procdonate: third child created past the floor",
                        "SOS procdonate: started three children",
                        # Claim 4: each child is a whole process. The third
@@ -4872,8 +5009,9 @@ TEST_CASES = [
                        "SOS echo1: alive",
                        "SOS echo2: alive",
                        "SOS procdonate: exits a=65577 b=65578 c=65579",
-                       # Claim 5: the donated slot is reclaimed and spent
-                       # again, at a new generation.
+                       # Claim 5: the donated body came back at the third
+                       # child's teardown and is spent again, the two below
+                       # the floor being taken by fillers.
                        "SOS procdonate: donated slot reused d=65579",
                        "SOS procdonate: done"],
         "expect_clean_exit": True,
@@ -4929,7 +5067,7 @@ TEST_CASES = [
         # Four claims, and each row below is one of them.
         #
         #   1. The op tells a caller which row is its own. Rows are indexed by
-        #      process slot and slot numbering is kernel-internal, so without
+        #      process body and body numbering is kernel-internal, so without
         #      this number a caller holds a table it cannot find itself in.
         #      Root is the first process, so the answer is zero, and root
         #      asserting that is what makes the child's read of row zero sound.
@@ -5122,9 +5260,9 @@ TEST_CASES = [
         # splits two regions off a sibling of root's pool and carves a window
         # off a device view, posts all four to root and exits, disowning them.
         # Root drops the charger's Process handle and death attachment, and
-        # slot 1 is reclaimed although the four objects are live.
+        # record 1 is reclaimed although the four objects are live.
         #
-        #   probe ... process={one}   the probe lands in the charger's slot
+        #   probe ... process={one}   the probe lands in the charger's record
         #   freed and donated         root gives the four objects back through
         #                             the four free paths: the connection's
         #                             free, a region's release, the other

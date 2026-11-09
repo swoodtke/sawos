@@ -1,27 +1,30 @@
 //! The shared stats region: the one storage the trap columns live in, and the
 //! page a process maps to read them.
 //!
-//! The columns are rows of this region, and `ProcessOp.Stats` reads them from
-//! here, so there is one storage and no mirror to keep in step.
+//! A live process's columns are its body's row of this region, and
+//! `ProcessOp.Stats` reads them from here, so there is one storage and no
+//! mirror to keep in step. The teardown copies a dying process's row into its
+//! record (`ProcessRecord.final_stats`), which is what `Stats` reads once the
+//! body is gone.
 //!
 //! This module names `kcore.mem` (the alignment arithmetic), `kcore.diag` (the
 //! kernel-bug report) and the HAL, and is named by the trap path, the stats op,
 //! the process reset and the map op. Everything that writes a column is above
 //! it and nothing it calls can reach back, the same test `mem` and `diag` pass.
-//! That is why it sits down beside them rather than inside `pslot` (records, no
+//! That is why it sits down beside them rather than inside `pslot` (tables, no
 //! work) or `dispatch` (at the top, which would make the loader's boot-time
 //! publish an upward reach).
 //!
 //! # Capacity
 //!
-//! The region has `PROT_DOMAIN_SLOTS` rows. A region sized to the compiled
-//! floor would silently stop counting donated process slots, since a slot with
-//! no row has nowhere to count. `alloc_process` scans to
+//! The region has `PROT_DOMAIN_SLOTS` rows, keyed by body. A region sized to
+//! the compiled floor would silently stop counting donated bodies, since a body
+//! with no row has nowhere to count. `alloc_process` scans the bodies to
 //! `process_slots_usable()` =
 //! `min(PROCESSES.capacity(), hal.PROT_DOMAIN_SLOTS)`, so `PROT_DOMAIN_SLOTS`
-//! is a ceiling on the slot index the machine can ever hand out (donation
+//! is a ceiling on the body index the machine can ever hand out (donation
 //! raises the capacity, not that). A region with that many rows therefore has a
-//! row for every process that can ever exist on this build.
+//! row for every live process that can ever exist on this build.
 //!
 //! The cost is `.bss` only: an all-zero static is zerofill, so the image
 //! carries none of it.
@@ -74,7 +77,7 @@ static ROW_DOUBLEWORDS: Int = PROCESS_STATS_RECORD_DOUBLEWORDS
 static_assert(sizeof<StatsRow>() == ROW_DOUBLEWORDS * DOUBLEWORD_BYTES,
               "a row's doubleword count must match the struct sosabi publishes")
 
-/// How many rows the region publishes: one per process slot this build can ever
+/// How many rows the region publishes: one per process body this build can ever
 /// hand out. See the capacity argument in the module header.
 public(package) static STATS_ROWS: Int = hal.PROT_DOMAIN_SLOTS
 
@@ -173,7 +176,7 @@ func column_at(first: Int, row: Int, column: Int) -> Int {
     first + HEADER_DOUBLEWORDS + row * ROW_DOUBLEWORDS + column
 }
 
-/// Is there a row for this slot? Structurally always (see the module header's
+/// Is there a row for this body? Structurally always (see the module header's
 /// capacity argument), so `false` is the kernel disagreeing with its own wall:
 /// a kernel bug, reported as one rather than absorbed. `fatal_kernel` stops the
 /// machine and is not declared `-> Never`, so every caller exits its own scope
@@ -191,7 +194,7 @@ func row_ok(row: Int) -> Bool {
 /// typed overlay (see the section header above).
 public(package) func stats_bump(row: Int, column: Int) unsafe {
     if not row_ok(row) {
-        fatal_kernel("a trap was charged to a process slot with no stats row",
+        fatal_kernel("a trap was charged to a process body with no stats row",
                      row as UInt)
         return
     }
@@ -203,7 +206,7 @@ public(package) func stats_bump(row: Int, column: Int) unsafe {
 /// with, from the one storage rather than from a copy of it.
 public(package) func stats_read(row: Int) unsafe -> StatsRow {
     if not row_ok(row) {
-        fatal_kernel("stats were asked for a process slot with no row", row as UInt)
+        fatal_kernel("stats were asked for a process body with no row", row as UInt)
         return StatsRow(syscalls: 0, interrupts: 0, faults: 0)
     }
     let first = stats_first()
@@ -212,12 +215,12 @@ public(package) func stats_read(row: Int) unsafe -> StatsRow {
              faults: STATS_STORAGE[column_at(first, row, PROCESS_STATS_FAULTS_SLOT)])
 }
 
-/// Zero `row`'s columns. A process create does this so a reused slot never
+/// Zero `row`'s columns. A process create does this so a reused body never
 /// inherits its predecessor's traffic (the rule `sosabi`'s record block
 /// states).
 public(package) func stats_clear(row: Int) unsafe {
     if not row_ok(row) {
-        fatal_kernel("stats were cleared for a process slot with no row", row as UInt)
+        fatal_kernel("stats were cleared for a process body with no row", row as UInt)
         return
     }
     let first = stats_first()

@@ -151,7 +151,8 @@ import kcore.result.{
     op_value,
     write_result,
 }
-import kcore.pslot.{HandleEntry, PROCESSES, ProcessState, QuotaKind}
+import kcore.pslot.{HandleEntry, PROCESSES, PROCESS_RECORDS, ProcessState,
+                    QuotaKind, body_of, has_body}
 import kcore.objects.{
     ClockObject,
     EventObject,
@@ -273,6 +274,7 @@ import kcore.waitables.{
 }
 import kcore.process.{
     alloc_process,
+    link_process,
     copy_in,
     copy_in_check,
     copy_out,
@@ -443,8 +445,8 @@ func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt, arg1: UInt,
 /// kernel's and a writer could lie to every supervisor.
 ///
 /// The row index is written first: it is a fact about the caller (process `p`
-/// occupies row `p`), not a product of the install, so it is true on refusal
-/// paths too; see `STATS_REGION_MAP_RECORD_WORDS`. A capacity below the
+/// occupies its body's row), not a product of the install, so it is true on
+/// refusal paths too; see `STATS_REGION_MAP_RECORD_WORDS`. A capacity below the
 /// published size and a buffer outside the caller's writable memory are caller
 /// mistakes and both terminate it, as in `process_stats`.
 func stats_region_map(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
@@ -452,7 +454,7 @@ func stats_region_map(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
         fault_process(p, FaultReason.BadArg)
     }
     var row: [UInt; STATS_REGION_MAP_RECORD_WORDS] = [0; STATS_REGION_MAP_RECORD_WORDS]
-    row[STATS_REGION_MAP_ROW_WORD] = p as UInt
+    row[STATS_REGION_MAP_ROW_WORD] = body_of(p) as UInt
     if let why = copy_out(p, dst,
                           ((&var row) as UnsafePointer<UInt>) as UInt,
                           stats_region_map_record_bytes() as UInt) {
@@ -573,8 +575,8 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             if not obj.allows(ProcessRight.Wait) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            op_value(process_status_word(PROCESSES[obj.slot].exit_kind,
-                                      PROCESSES[obj.slot].exit_code))
+            op_value(process_status_word(PROCESS_RECORDS[obj.slot].exit_kind,
+                                      PROCESS_RECORDS[obj.slot].exit_code))
         },
         // The creation authority for §2's plain objects flows through a handle
         // the process holds (§3's derivation rule). See `ProcessRight`.
@@ -661,10 +663,10 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
         // columns do not fit a value register, so the answer rides the copy-out
         // funnel.
         //
-        // A `Gone` slot reads normally, which is the point of the `faults`
-        // column: a process that faulted is dead and cannot ask, but its slot
-        // survives while a handle names it, so the supervisor holding that
-        // handle reads the count.
+        // A `Gone` process reads normally, which is the point of the `faults`
+        // column: a process that faulted is dead and cannot ask, but its
+        // record keeps the final counters while a handle names it, so the
+        // supervisor holding that handle reads the count.
         case Stats -> {
             if not obj.allows(ProcessRight.Stats) {
                 fault_process(p, FaultReason.AccessDenied)
@@ -758,10 +760,15 @@ func slab_geometry(kind: SlabKind) unsafe -> (Int, Int, Int, Int) {
                        min_int(PIPES.extents_left(), EXCHANGES.extents_left()),
                        min_int(MAX_SLAB_CAPACITY - PIPES.capacity(),
                                (MAX_SLAB_CAPACITY - EXCHANGES.capacity()) / PIPE_INFLIGHT)),
-        // A process unit is a slot. The handle table, the boot set and the two
-        // ledger rows live inside `ProcessSlot`, so this is a plain one-array
-        // chain and needs neither a side arena nor a second ceiling.
+        // A process body unit is a slot. The handle table, the boot set and the
+        // grant record live inside `ProcessBody`, so this is a plain one-array
+        // chain and needs neither a side arena nor a second ceiling. The
+        // domain-pool ceiling is not a donation's business: the allocator
+        // applies it (`process_slots_usable`).
         case Processes -> (PROCESSES.slot_bytes(), PROCESSES.slot_align(), PROCESSES.extents_left(), MAX_SLAB_CAPACITY - PROCESSES.capacity()),
+        // A record unit is a slot of its own chain, the same one-array shape.
+        // Records have no domain behind them, so the slab is the whole bound.
+        case ProcessRecords -> (PROCESS_RECORDS.slot_bytes(), PROCESS_RECORDS.slot_align(), PROCESS_RECORDS.extents_left(), MAX_SLAB_CAPACITY - PROCESS_RECORDS.capacity()),
     }
 }
 
@@ -814,6 +821,7 @@ func slab_install(kind: SlabKind, base: UInt, slots: Int) unsafe -> Bool {
             true
         },
         case Processes -> PROCESSES.donate(base, slots),
+        case ProcessRecords -> PROCESS_RECORDS.donate(base, slots),
     }
 }
 
@@ -932,9 +940,9 @@ func region_wraps(base: UInt, len: UInt) -> Bool {
 ///
 /// Everything is validated before the first byte moves, so a refusal is
 /// harmless: a caller that gets `BadImage` back has a destination region
-/// exactly as it left it. The slot and the handle are taken before the copy
-/// too, so the one failure that is not about the image (a full table) also
-/// leaves the bytes alone.
+/// exactly as it left it. The record, the body and the handle are taken before
+/// the copy too, so the one failure that is not about the image (a full table)
+/// also leaves the bytes alone.
 ///
 /// What `process_create` decides that the boot path does not:
 ///
@@ -983,7 +991,10 @@ func process_create(p: Int, image_handle: UInt,
         return op_status(SosStatus.BadImage)
     }
 
-    let slot = alloc_process()
+    // A record and a body, or neither: either table full is the same
+    // `NoResource`, and the find reserves nothing, so a refusal here or at the
+    // mint below takes nothing.
+    let (slot, body) = alloc_process()
     if slot == NO_PROCESS {
         return op_status(SosStatus.NoResource)
     }
@@ -996,6 +1007,7 @@ func process_create(p: Int, image_handle: UInt,
     if handle == NO_HANDLE {
         return op_status(mint_refusal(p))
     }
+    link_process(slot, body)
 
     // Only now does anything happen to the destination region.
     //
@@ -1006,48 +1018,53 @@ func process_create(p: Int, image_handle: UInt,
     // it. It goes back when the child dies.
     let rw_base = place_image(slot, img_base, &dest, dst)
 
-    PROCESSES[slot].state = ProcessState.Created
+    PROCESS_RECORDS[slot].state = ProcessState.Created
     // A child's table starts empty and `give` fills it. There is nothing to
     // record here: a process's own Process handle is minted when asked for, and
     // a child cannot ask (`ProcessSelf` needs a System handle it has not been
     // given). Every handle a child holds arrives through `ProcessOp.Give`
     // between this call and `Start`; a child given nothing is a legal sandboxed
     // compute process.
-    PROCESSES[slot].entry = image_entry(img_base)
-    // Every address on a process slot is a user address: the entry goes into a
+    PROCESSES[body].entry = image_entry(img_base)
+    // Every address on a process body is a user address: the entry goes into a
     // program counter, the stack top into a stack pointer, and the two windows
     // are what the copy doors check a process's own buffers against. The frames
     // behind them live in the grant rows.
-    PROCESSES[slot].stack_top = dest.link_top()
-    PROCESSES[slot].region_base = dest.link_base
-    PROCESSES[slot].region_top = dest.link_top()
-    PROCESSES[slot].rw_base = rw_base
-    PROCESSES[slot].rw_top = dest.link_top()
-    PROCESSES[slot].exit_kind = ProcessStatusKind.Running
-    PROCESSES[slot].exit_code = 0
+    PROCESSES[body].stack_top = dest.link_top()
+    PROCESSES[body].region_base = dest.link_base
+    PROCESSES[body].region_top = dest.link_top()
+    PROCESSES[body].rw_base = rw_base
+    PROCESSES[body].rw_top = dest.link_top()
+    PROCESS_RECORDS[slot].exit_kind = ProcessStatusKind.Running
+    PROCESS_RECORDS[slot].exit_code = 0
     // The launcher's handle is the child's first reference. It outlives the
     // child so that reading how the child died stays possible, and its release
-    // frees the slot.
-    PROCESSES[slot].refs = 1
-    // Nobody is watching a process that does not exist yet. This slot may be a
-    // reclaimed one, so every field a previous occupant wrote is reset here. It
-    // cannot arrive non-zero (an attachment is a counted reference, so a
-    // watched slot never reaches zero and never reclaims), but the reset is
+    // frees the record.
+    PROCESS_RECORDS[slot].refs = 1
+    // Nobody is watching a process that does not exist yet. This record may be
+    // a reclaimed one, so every field a previous occupant wrote is reset here.
+    // It cannot arrive non-zero (an attachment is a counted reference, so a
+    // watched record never reaches zero and never reclaims), but the reset is
     // where a reader looks to find that out.
-    PROCESSES[slot].attachment = 0
-    // The columns open at zero. The slot may be a reclaimed one, and this is
-    // the line that keeps a child from inheriting its predecessor's traffic and
+    PROCESS_RECORDS[slot].attachment = 0
+    // The final counters are written at the teardown and read only through a
+    // `Gone` record, so a stale copy here could not be read; it is reset with
+    // the rest.
+    PROCESS_RECORDS[slot].final_stats = StatsRow(syscalls: 0, interrupts: 0,
+                                                 faults: 0)
+    // The columns open at zero. The body may be a reused one, and this is the
+    // line that keeps a child from inheriting its predecessor's traffic and
     // reading a first `stats()` that describes a program it never was. It
-    // clears the slot's row of the shared region; a supervisor watching the
+    // clears the body's row of the shared region; a supervisor watching the
     // page sees the row go to zero exactly here.
-    stats_clear(slot)
+    stats_clear(body)
 
     // The child's ledger opens here, after `place_image`: `free_rows` is what
     // this child's domain has left once its image has spent its own rows, and
     // the image's rows are recorded by that call. A child gets `kcore.limits`'
     // documented defaults; there is no per-create argument.
     install_quota_limits(slot, false,
-                         (hal.GRANT_ROW_BUDGET as Int) - PROCESSES[slot].grant_count)
+                         (hal.GRANT_ROW_BUDGET as Int) - PROCESSES[body].grant_count)
 
     op_value(handle)
 }
@@ -1056,7 +1073,7 @@ func process_create(p: Int, image_handle: UInt,
 ///
 /// It mints the first thread internally and hands out no handle for it: nobody
 /// holds a child's thread, and what a child receives is what `give` put in its
-/// table. The entry and the stack come out of the process slot, recorded at
+/// table. The entry and the stack come out of the process body, recorded at
 /// create, so root supplies neither, which keeps "root never parses" airtight.
 ///
 /// The kernel resolves the tag to the child-side word, so `_start(boot_handle)`
@@ -1103,7 +1120,7 @@ func process_start(caller: Int, child: Int,
     guard let form = BootTagForm.from(raw: raw_form) else {
         fault_process(caller, FaultReason.BadArg)
     }
-    match PROCESSES[child].state {
+    match PROCESS_RECORDS[child].state {
         case Created -> {},
         case _ -> fault_process(caller, FaultReason.BadState),
     }
@@ -1137,8 +1154,9 @@ func process_start(caller: Int, child: Int,
         },
     }
 
-    hal.frame_init(frame_slot(slot), PROCESSES[child].entry,
-                   PROCESSES[child].stack_top, boot_word)
+    let body = body_of(child)
+    hal.frame_init(frame_slot(slot), PROCESSES[body].entry,
+                   PROCESSES[body].stack_top, boot_word)
     THREADS[slot] = ThreadSlot(state: ThreadState.Runnable, process: child,
                                exit_code: 0,
                                joiners: 0, link: 0, wait_buf: 0,
@@ -1146,7 +1164,7 @@ func process_start(caller: Int, child: Int,
                                call_len: 0)
     quota_charge(child, QuotaKind.Thread)
     ready_push(slot)
-    PROCESSES[child].state = ProcessState.Running
+    PROCESS_RECORDS[child].state = ProcessState.Running
     op_ok()
 }
 
@@ -1223,7 +1241,7 @@ func give_faults(p: Int, child: Int, entry: HandleEntry,
     guard let kind = boot_kind_of(entry.obj_type) else {
         fault_process(p, FaultReason.BadArg)
     }
-    match PROCESSES[child].state {
+    match PROCESS_RECORDS[child].state {
         case Created -> {},
         case _ -> fault_process(p, FaultReason.BadState),
     }
@@ -1311,10 +1329,11 @@ func boot_handle_next(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
     // through the register door: one record, one delivery, whichever door it
     // went out of.
     let cursor = boot_handle_cursor(p)
-    if cursor >= PROCESSES[p].boot_count {
+    let body = body_of(p)
+    if cursor >= PROCESSES[body].boot_count {
         return op_status(SosStatus.Drained)
     }
-    let queued = PROCESSES[p].boot_handles[cursor]
+    let queued = PROCESSES[body].boot_handles[cursor]
     var rec = BootHandleWire(tag: queued.tag, kind: queued.kind as UInt,
                              handle: queued.handle)
     if let why = copy_out(p, dst,
@@ -1322,7 +1341,7 @@ func boot_handle_next(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
                           boot_handle_record_bytes() as UInt) {
         fault_process(p, why)
     }
-    PROCESSES[p].boot_next = cursor + 1
+    PROCESSES[body].boot_next = cursor + 1
     op_ok()
 }
 
@@ -1333,10 +1352,14 @@ func boot_handle_next(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
 /// Copy `target`'s three trap columns into `p`'s buffer.
 ///
 /// Two processes are involved, and the asymmetry is the op. `target` is whose
-/// counters are read (the handle's slot, so a supervisor asking about a child
-/// names the child) and `p` is whose memory the answer lands in, always the
-/// caller. Only the copy door consults `p`, which makes the self case and the
-/// supervision case one function.
+/// counters are read (the handle's record, so a supervisor asking about a
+/// child names the child) and `p` is whose memory the answer lands in, always
+/// the caller. Only the copy door consults `p`, which makes the self case and
+/// the supervision case one function.
+///
+/// A live target's counters are its body's row of the region. A `Gone` one has
+/// no body, and its counters are the copy its teardown left in the record,
+/// final because nothing is charged to a process once its teardown has begun.
 ///
 /// It costs nothing and allocates nothing, so no quota row is charged and no
 /// `NoResource` path exists: the columns are already in the region and the
@@ -1346,8 +1369,8 @@ func boot_handle_next(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
 ///
 /// It is the compatibility floor for callers that do not want a mapping or do
 /// not hold `SystemRight.StatsRegionMap`: they get the same three numbers,
-/// consistent by construction because this reads the very storage the region
-/// publishes.
+/// consistent by construction because, for a live process, this reads the very
+/// storage the region publishes.
 ///
 /// The call itself is counted before this runs: `ktrap` charges the syscall
 /// column at trap entry, so a reading taken by the process it describes already
@@ -1361,7 +1384,11 @@ func process_stats(p: Int, target: Int, dst: UInt, cap: UInt) unsafe -> SyscallR
     if cap < (process_stats_record_bytes() as UInt) {
         fault_process(p, FaultReason.BadArg)
     }
-    var rec = stats_read(target)
+    var rec = if has_body(target) {
+        stats_read(body_of(target))
+    } else {
+        PROCESS_RECORDS[target].final_stats
+    }
     if let why = copy_out(p, dst,
                           ((&var rec) as UnsafePointer<StatsRow>) as UInt,
                           process_stats_record_bytes() as UInt) {
@@ -1479,12 +1506,21 @@ func waiter_create(p: Int) unsafe -> SyscallResult {
 /// are), so a bad one terminates it rather than producing a thread that would
 /// fault on its first instruction and take the process down anyway, with a
 /// worse diagnostic.
+///
+/// A `Gone` process has no region left to check them against, and its ledger
+/// was cleared at its teardown, so the answer is the `QuotaExceeded` its empty
+/// thread row gives whatever the entry and stack are (spec §2.10's
+/// not-yet-enforced list).
 func thread_create(p: Int, entry: UInt, stack_top: UInt, arg: UInt) unsafe -> SyscallResult {
-    let start = if entry == ENTRY_IMAGE { PROCESSES[p].entry } else { entry }
-    if start < PROCESSES[p].region_base || start >= PROCESSES[p].region_top {
+    if not has_body(p) {
+        return op_status(SosStatus.QuotaExceeded)
+    }
+    let body = body_of(p)
+    let start = if entry == ENTRY_IMAGE { PROCESSES[body].entry } else { entry }
+    if start < PROCESSES[body].region_base || start >= PROCESSES[body].region_top {
         fault_process(p, FaultReason.BadEntry)
     }
-    if stack_top <= PROCESSES[p].region_base || stack_top > PROCESSES[p].region_top {
+    if stack_top <= PROCESSES[body].region_base || stack_top > PROCESSES[body].region_top {
         fault_process(p, FaultReason.BadEntry)
     }
 
@@ -2222,7 +2258,7 @@ func release_handle(p: Int, word: UInt, entry: HandleEntry) unsafe -> SyscallRes
     // The object loses a reference, which may be its last. `unref_object` is
     // the per-kind matrix: an Interrupt masks its line, a Timer gives the
     // comparator back, a Waiter detaches its list, a Memory returns its slot,
-    // and a `Gone` Process's slot is reclaimed.
+    // and a `Gone` Process's record is reclaimed.
     //
     // This runs after the unbind: nothing in the cascade may find the released
     // entry by lookup (a settle can resume a parked caller, which re-reads
@@ -2375,7 +2411,7 @@ func map_access(p: Int, raw: UInt) unsafe -> UInt32 {
 }
 
 /// Resolve the Process handle a map names as its target, spending
-/// `ProcessRight.Map` on it. Answers the target's process slot, or ends the
+/// `ProcessRight.Map` on it. Answers the target's process record, or ends the
 /// caller.
 ///
 /// This is the second right a map spends. Installing a row into a domain is
@@ -2387,14 +2423,11 @@ func map_access(p: Int, raw: UInt) unsafe -> UInt32 {
 /// ordinary `BadHandle`.
 ///
 /// The target must be alive, and this check is load-bearing. A supervisor's
-/// handle onto a dead child outlives it, so a `map` naming one would append a
-/// row to a `Gone` slot's grant record. That record was emptied by
-/// `clear_domain` at teardown and the slot is reclaimed once no handle names
-/// it, so the next `process_create` would land in the slot and `place_image`
-/// would append its own rows on top of the stranger's: a new process holding a
-/// protection row it never asked for. `give` and `Start` require `Created`;
-/// `map` is the first op that reaches into another process's slot without that,
-/// so it states its own requirement.
+/// handle onto a dead child outlives it, and a `Gone` record has no body, so
+/// there is no grant record to append a row to: the body went back at the
+/// teardown and the next `process_create` may already be running in it. `give`
+/// and `Start` require `Created`; `map` is the first op that reaches into
+/// another process's body without that, so it states its own requirement.
 ///
 /// `Created` and `Running` are both legal, and a mapping is not a boot record,
 /// so the give-freeze does not apply. Anything else is a `BadState` fault; the
@@ -2408,7 +2441,7 @@ func map_target(p: Int, handle: UInt) unsafe -> Int {
             if not target.allows(ProcessRight.Map) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            match PROCESSES[target.slot].state {
+            match PROCESS_RECORDS[target.slot].state {
                 case Created -> {},
                 case Running -> {},
                 case _ -> fault_process(p, FaultReason.BadState),
@@ -2453,9 +2486,10 @@ func install_row(p: Int, t: Int, base: UInt, top: UInt, perms: UInt8,
     if not quota_room(t, QuotaKind.Mapping) {
         return op_status(SosStatus.QuotaExceeded)
     }
-    if (PROCESSES[t].grant_count as UInt) >= hal.GRANT_ROW_BUDGET {
+    let target_body = body_of(t)
+    if (PROCESSES[target_body].grant_count as UInt) >= hal.GRANT_ROW_BUDGET {
         fatal_kernel("a map met the row budget with quota headroom left",
-                     PROCESSES[t].grant_count as UInt)
+                     PROCESSES[target_body].grant_count as UInt)
         // `fatal_kernel` stops the machine but is not declared `-> Never`, so
         // the scope has to exit itself. Nothing reaches this line.
         return op_status(SosStatus.NoResource)
@@ -2497,7 +2531,7 @@ func install_row(p: Int, t: Int, base: UInt, top: UInt, perms: UInt8,
     // Nothing is written until every refusal is behind us (the all-or-nothing
     // shape of `event_create`): a half-installed row is a protection domain
     // that disagrees with its own record.
-    let row = PROCESSES[t].grant_count
+    let row = PROCESSES[target_body].grant_count
     record_grant(t, va_base, va_top, base, perms, device, region)
     MAPPINGS[slot] = MappingSlot(state: SlotState.Live, process: p, target: t,
                                  row: row, refs: 1)
@@ -2764,7 +2798,10 @@ func mapping_op_decoded(op: MappingOp, obj: &MappingObject,
             }
             let t = MAPPINGS[obj.slot].target
             remove_grant(t, row)
+            // The husk names nobody, as the target's teardown leaves one: a
+            // Mapping names its target only while it has a row there.
             MAPPINGS[obj.slot].row = NO_ROW
+            MAPPINGS[obj.slot].target = NO_PROCESS
             // The credit follows the row, not the slot. The mapping quota
             // counts rows installed in the target's domain, so this is where
             // one comes back, not `free_object`, which frees the slot and may
@@ -2802,7 +2839,8 @@ func mapping_op_decoded(op: MappingOp, obj: &MappingObject,
             // The record is what is read, not the hardware: the grant record is
             // authoritative, and the row's user base is the number the target's
             // own instructions will issue.
-            op_value(PROCESSES[MAPPINGS[obj.slot].target].grants[row].base)
+            let t = MAPPINGS[obj.slot].target
+            op_value(PROCESSES[body_of(t)].grants[row].base)
         },
     }
 }
@@ -4118,15 +4156,16 @@ func count_trap(kind: TrapKind) unsafe {
     if CURRENT_THREAD == NO_THREAD {
         return
     }
-    let p = THREADS[CURRENT_THREAD].process
-    // The column is a row of the published region: `kcore.stats` owns the
-    // doubleword, `ProcessOp.Stats` reads it back out of the same place, and a
-    // supervisor holding a read-only mapping sees this store land with no
-    // syscall of its own.
+    // The column is the body's row of the published region: `kcore.stats` owns
+    // the doubleword, `ProcessOp.Stats` reads it back out of the same place,
+    // and a supervisor holding a read-only mapping sees this store land with
+    // no syscall of its own. A current thread's process is live, so it has a
+    // body.
+    let row = body_of(THREADS[CURRENT_THREAD].process)
     match kind {
-        case Syscall -> { stats_bump(p, PROCESS_STATS_SYSCALLS_SLOT) },
-        case Interrupt -> { stats_bump(p, PROCESS_STATS_INTERRUPTS_SLOT) },
-        case Fault -> { stats_bump(p, PROCESS_STATS_FAULTS_SLOT) },
+        case Syscall -> { stats_bump(row, PROCESS_STATS_SYSCALLS_SLOT) },
+        case Interrupt -> { stats_bump(row, PROCESS_STATS_INTERRUPTS_SLOT) },
+        case Fault -> { stats_bump(row, PROCESS_STATS_FAULTS_SLOT) },
     }
 }
 

@@ -44,7 +44,7 @@ The kernel's object kinds, each a slab-allocated kernel struct:
 | `Timer` | Deadline object bound to the Clock that created it; directly waitable. The process-sleep primitive. §2.6. |
 | `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it and ack through the handle. One op (`Ack`), two rights (`InterruptRight.Wait`/`.Ack`), created by `SystemOp.InterruptBind` on `SystemRight.InterruptBind`, because a line is a machine-wide resource (§2.8). The binding is the object's existence (creation takes the line, there is no rebind), which stops one handle naming two devices over its life. It has one name, its handle, and releasing that handle destroys it (§2.10). A line the board does not have, the timer's line, and a line already bound are all faults. Not yet enforced: binding is `ProcessOp.InterruptBind` on `ProcessRight.InterruptBind`, and the default set carries `Mint`. §9. |
 | `Waiter` | Generic wait aggregator (epoll/Port-style). Ops `Add`/`Remove`/`Wait`; rights `WaiterRight.Attach`/`.Wait`; the wait answer is a copy-out record. §2.2. |
-| `Process` | Two entries: a small record (the state, the status word, the quota ledger, the references naming it) that outlives the process, and a body (AddressSpace + handle table + threads) that the teardown frees. Handles name the record. No kernel Job or hierarchy. The kernel guarantees teardown on exit or fault — invalidating the objects bound to it, releasing every handle it holds, clearing its domain and freeing its body (§2.10; the invalidation is not yet enforced for the bound kinds, and the split is not built: a process is one slot, §2.7). Supervision (restart, kill-trees, launchd-style) is a userspace concern. §2.7, §8, §12. |
+| `Process` | Two entries: a small record (the state, the status word, the quota ledger, the references naming it) that outlives the process, and a body (AddressSpace + handle table + threads) that the teardown frees. Handles name the record. No kernel Job or hierarchy. The kernel guarantees teardown on exit or fault — invalidating the objects bound to it, releasing every handle it holds, clearing its domain and freeing its body (§2.10; the invalidation is not yet enforced for the bound kinds). Supervision (restart, kill-trees, launchd-style) is a userspace concern. §2.7, §8, §12. |
 | `System` | Kernel singleton: the object behind system-scoped primitives, so that every syscall is an object op (§5.7). §2.8. |
 
 The kinds are System, Process, Thread, Event, Waiter, Interrupt, Clock, Timer,
@@ -59,8 +59,7 @@ obligation to send it — with "Pipe" the collective name.
 slot carries the number of references naming it, and reaching zero frees the
 slot synchronously, inside the syscall that dropped the last reference. The
 column is enumerated per kind, so that a new kind fails to compile until
-somebody says what references it (Thread's and Process's rows are not yet
-enforced):
+somebody says what references it (Thread's row is not yet enforced):
 
 | kind | counted references |
 |---|---|
@@ -70,7 +69,7 @@ enforced):
 | Timer | handle entries + its attachment |
 | MemoryObject / IoMemoryObject | handle entries (a Memory's installed grant rows are a second count, §2.5) |
 | Mapping | handle entries — not its row, which the Mapping owns rather than the reverse (§2.5) |
-| Process | handle entries + its attachment, on the record. A shared object charged to the process holds no reference on it: the process's death disowns the object (§2.10). A live process is never freed by losing its last handle, and a `Gone` one's record is reclaimed when the count reaches zero (§2.7); its body went back at the teardown, whatever the count. The attachment column is what makes attach-after-death sound against that reclaim: a watched dead record cannot reach zero while somebody is watching it. Not yet enforced: the count is on the one process slot, record and body together, and a `Gone` process holds the whole slot until the count reaches zero (§2.7) |
+| Process | handle entries + its attachment, on the record. A shared object charged to the process holds no reference on it: the process's death disowns the object (§2.10). A live process is never freed by losing its last handle, and a `Gone` one's record is reclaimed when the count reaches zero (§2.7); its body went back at the teardown, whatever the count. The attachment column is what makes attach-after-death sound against that reclaim: a watched dead record cannot reach zero while somebody is watching it |
 | PipeInlet | handle entries + its attachment, on the connection's inlet column. The two endpoint kinds share one `PIPES` row and count on separate columns, which is what makes "every client handle is gone" askable at all; a side reaching zero raises peer-gone on the other, and the slot frees only when both columns are zero. The attachment is per end, not per connection: a client waits for room and a server waits for a message, so §2.2's at-most-one-Waiter rule holds per column exactly as the count does |
 | PipeOutlet | handle entries + its attachment — the same row's outlet column, mirrored. The two arms of `free_object` are one act written twice, because reaching it through either kind means both columns are already zero |
 | PipeReply | handle entries + its attachment, on one ring slot's claim column. A delivery of this kind drops that attachment's reference — a claim is a one-shot, so its delivery is inherently consuming — which is the one place in the ledger where answering a wait is what frees an object. A one-shot exists for exactly as long as one in-flight message, so the pair is ring-slot state rather than a third slab: the object is an exchange (`connection * PIPE_INFLIGHT + ring slot`) and the claim counts on its reply column. The ring slot goes back when both of the exchange's columns are zero and nothing is owed — a staged message is still owed to a live outlet whatever became of its claim, which is §2.1's TELL idiom |
@@ -1091,11 +1090,7 @@ child does at its create, the first of each table, so "process 0" names both
 exactly as §2.10 rules for it, since the body is gone: the creation ops and a
 `map` naming it answer `Revoked`, `Start` and `Give` are `BadState` faults
 (below), and the self-only ops are `NotSelf` faults. Not yet enforced: the
-creation ops and a `map` do not answer `Revoked` there (§2.10); and a process is
-one `ProcessSlot` in one table (`kcore.pslot`), record and body together, so a
-`Gone` process holds the whole slot for as long as its record would be held. The
-teardown empties its handle table, boot set and grant record, and their storage
-stays with the slot.
+creation ops and a `map` do not answer `Revoked` there (§2.10).
 
 **Ops**, each on its own `ProcessRight`: the creation ops `ThreadCreate`,
 `EventCreate`, `WaiterCreate` and `PipeCreate`, then `ThreadSelf`, `Exit`,
@@ -1228,10 +1223,7 @@ reference, so none of them can name a reclaimed record, and a released word
 fails its entry's generation (§3). The teardown's disown (§2.10) covers the
 fields that hold none, so no object that outlives a process still names its
 record, and a refund at a survivor's later free is owed to nobody rather than
-to the record's next occupant. Not yet enforced: the counters are not in the
-record (`Stats`, below), and a delivery at that notify reclaims the slot
-mid-teardown, which is sound only because the reclaim writes the state alone
-and nothing allocates a process before the teardown ends.
+to the record's next occupant.
 
 **The body is reclaimed at the teardown**, whatever names the record: nothing
 reads a dead process's handle table, boot set or domain, so none of them waits
@@ -1239,9 +1231,7 @@ on a reference. `clear_domain` invalidates `LAST_PROT_PROCESS` as the body goes,
 so a later process landing in it cannot compare equal to a domain that is no
 longer installed. Where the kernel walks every handle table, the walk is over
 the body table's extent chain and is bounded by `process_slots_usable()` ×
-`MAX_HANDLES`. Not yet enforced: the teardown empties the slot's handle table,
-boot set and domain and frees none of them, their storage staying with the slot
-until it is reclaimed, and the walk is over the process slab's extent chain.
+`MAX_HANDLES`.
 
 **`Stats` — exact trap introspection.** `ProcessOp.Stats` on
 `ProcessRight.Stats` answers through a three-doubleword copy-out record:
@@ -1276,10 +1266,7 @@ decides on.
   also see the dead process's row without any handle, until a create reuses the
   body and clears it. The reading includes the call that took it (the column is
   charged at trap entry, ahead of the op), so a delta between two readings
-  carries the second reading's own trap. Not yet enforced: the columns are the
-  slot's row, keyed by the slot's index, and nothing copies them; they survive
-  the death because the whole slot does, and the row is cleared when a create
-  reuses the slot.
+  carries the second reading's own trap.
 - Per-process only: per-thread stats wait for a consumer that names one.
 
 **The stats region.** `SystemOp.StatsRegionMap` on `SystemRight.StatsRegionMap`
@@ -1329,23 +1316,18 @@ another process's counters. Three things about the region:
   it, and releasing them is the remedy. The record table is its own donatable
   slab, `SlabKind.ProcessRecords`, because demand for records follows how long
   holders keep dead processes, not how many run, and on a tier whose
-  protection-domain pool caps bodies, records still grow. Not yet enforced:
-  neither constant nor the slab kind exists, and `ProcessCreate` takes one slot
-  of `PROCESSES`.
+  protection-domain pool caps bodies, records still grow.
 
 Per-process state is never a parallel `MAX_PROCESSES ×` array: the handle
 table, the boot-handle queue and the grant record are fields of the body, and
 the quota ledger, the status word and the final trap counters are fields of the
 record (`kcore.pslot`), because a table beside a slab would be left behind by a
-donation (not yet enforced: the ledger, status word, handle table, boot set and
-grant record are fields of the one `ProcessSlot`, and the counters are its row
-of the stats region). `MAX_ATTACHMENTS` derives from the waitable slabs an
-attachment can name, pipes aside, and a Process attachment names a record:
-`MAX_EVENTS + MAX_INTERRUPTS + MAX_TIMERS + MAX_PROCESS_RECORDS` (not yet
-enforced: the last term is `MAX_PROCESSES`). The protection-row budget is per
-domain, so a process adds nothing to another's (root's own grant record stays
-at `IMAGE_GRANT_ROWS` whatever it wires up, because a launcher hands out
-capabilities and maps nothing).
+donation. `MAX_ATTACHMENTS` derives from the waitable slabs an attachment can
+name, pipes aside, and a Process attachment names a record:
+`MAX_EVENTS + MAX_INTERRUPTS + MAX_TIMERS + MAX_PROCESS_RECORDS`. The
+protection-row budget is per domain, so a process adds nothing to another's
+(root's own grant record stays at `IMAGE_GRANT_ROWS` whatever it wires up,
+because a launcher hands out capabilities and maps nothing).
 
 ### 2.8 System
 
@@ -1428,8 +1410,7 @@ record (`quota_used` / `quota_limit`, §2.7), the entry a charged object's
 is charged inside `mint_handle` and credited inside `unbind_handle`. An
 Interrupt has no column: there is at most one live Interrupt per line, and the
 Interrupt slab bounds the objects (§2.8). Not yet enforced: the ledger still has
-an `Interrupt` column, charged at the bind, and both rows are fields of the one
-`ProcessSlot`.
+an `Interrupt` column, charged at the bind.
 
 - **Policy first.** A quota is checked at every allocation site that answers
   `NoResource`, ahead of the slab, so a process at its budget is told
@@ -1567,7 +1548,7 @@ payload is the slot's stored line whatever the object's state
 | Thread, Timer, Waiter, Mapping | **Bound** to the process that owns it: invalidated when that process dies, freed when the last handle goes. A Mapping's owner is the process whose domain holds its row (the target of its `map`), not the process holding its handle. A Thread that exited before its process died is not invalidated: `Exited` wins, and a late `Join` through any handle reads its exit code from the slot, even after the process is `Gone`, the slot being held while a handle names it. A Thread that has not exited when its process dies is invalid, so `Join` answers `Revoked` and the slot keeps nothing for it. A Thread whose count reached zero while it ran is freed when it exits or is invalidated |
 | Interrupt | **One name, its handle.** No `Mint` in its default set, and attenuation is monotonic, so no handle can regain it (§3). Releasing the handle, explicitly or by its holder's teardown, destroys the Interrupt: it unbinds and masks the line. A give or a staged message moves the one name and is not a release. An attachment does not extend its life; it holds the invalid Interrupt until it is removed, and fires as an invalidated waitable does. A consuming attach of an Interrupt is refused as a caller error (`BadArg`, §2.2), so the driver keeps the one handle it acks with. Charged to no quota (§2.9) |
 | Event, Pipe, Memory, IoMemory | **Shared:** live until the last handle goes, whatever happens to the process charged for them |
-| Process | `Gone` is its invalid state (§8), and a `Gone` process is a record with no body. `GetStatus` and an attachment read the status word the record keeps, and `Stats` reads the final trap counters the teardown copied into it (§2.7). `Start` and `Give` naming a `Gone` child stay `BadState` faults, because a `Gone` child was always started and its launcher knows (§2.7). Every other op that acts on the process answers `Revoked`, a `map` naming it as the target included: the mapper did not cause the death. The teardown frees the body; the record is reclaimed when it is `Gone` and its count is zero (§2.7). Not yet enforced: the teardown frees no body, `Stats` reads the slot's row of the stats region, and `reclaim_process_slot` frees the whole slot |
+| Process | `Gone` is its invalid state (§8), and a `Gone` process is a record with no body. `GetStatus` and an attachment read the status word the record keeps, and `Stats` reads the final trap counters the teardown copied into it (§2.7). `Start` and `Give` naming a `Gone` child stay `BadState` faults, because a `Gone` child was always started and its launcher knows (§2.7). Every other op that acts on the process answers `Revoked`, a `map` naming it as the target included: the mapper did not cause the death. The teardown frees the body; the record is reclaimed when it is `Gone` and its count is zero (§2.7) |
 | Clock, System | Never destroyed |
 
 **A free of a live object runs its last rites.** The last handle going is a
@@ -1623,9 +1604,8 @@ teardown clears that ledger. Not yet enforced: only the shared kinds are
 disowned (a Memory, an IoMemory or a connection still charged to the dying
 process), and only the shared kinds' frees test for no owner; the teardown
 frees the process's Threads, Events, Waiters, Interrupts and Timers instead
-(below), so none of them survives it; and a Mapping whose target died keeps its
-`target`, which nothing acts on, because its row is cleared. The rest arrives
-with the invalidation of the bound kinds and the teardown order above.
+(below), so none of them survives it. The rest arrives with the invalidation of
+the bound kinds and the teardown order above.
 
 The teardown reports itself on one console line, `SOS: process teardown`, and
 the harness asserts the line. Its fields today (`handles=`, `threads=`,
@@ -1654,16 +1634,13 @@ field.
 Not yet enforced:
 
 - Thread slots are not counted (§2's table).
-- A process is one slot, record and body together (§2.7): the teardown
-  empties the handle table, boot set and grant record but frees no body, so a
-  `Gone` process holds their storage until the count reaches zero.
 - The teardown releases the handle table first, counting without freeing, and
   then frees the dying process's Threads, Events, Waiters, Interrupts and
   Timers by owner, frees the Mappings it made, and frees the Memory, IoMemory,
   exchanges and connections nothing names any more, disowning the rest it was
-  charged for; that reap ends with a process scan, which reclaims every other
-  `Gone` process slot whose last reference the teardown dropped. An Event or an
-  Interrupt is therefore freed by its owner's death, and a Thread, Waiter or
+  charged for; that reap ends with a process scan, which reclaims every
+  `Gone` process record whose last reference the teardown dropped. An Event or
+  an Interrupt is therefore freed by its owner's death, and a Thread, Waiter or
   Timer is freed rather than left invalid, an `Exited` Thread included, which is
   sound only while every handle naming it is in the dying table. Once an Event
   can outlive its owner, it will be disowned at that death as the other shared
@@ -1674,9 +1651,11 @@ Not yet enforced:
   Mapping whose target died are `BadState` faults (§2.5), and so is a `map`
   naming a `Gone` target. The creation ops through a `Gone` process's handle
   answer `QuotaExceeded` when their arguments are well formed, its ledger
-  having been cleared; a bad entry, stack or mode faults the `Gone` process
-  again, which reruns the teardown, overwrites its status word and strands the
-  caller. `MINT_OP` mints onto an invalid object as onto a live one.
+  having been cleared, and `ThreadCreate` answers it whatever its entry and
+  stack, since no region is left to check them against; a bad mode or line
+  faults the `Gone` process again, which reruns the teardown (with no body left
+  to free), overwrites its status word and strands the caller. `MINT_OP` mints
+  onto an invalid object as onto a live one.
 - An Interrupt carries `Mint`, is charged an `Interrupt` quota row, can be
   consumed into an attachment (`Waiter.give(interrupt:)`), and stays bound
   while an attachment holds it after its handle is released.
@@ -1888,9 +1867,9 @@ Not yet enforced:
     (which may take a waitable to zero in turn — a cascade) and wakes its parked
     threads, a Memory returns its slot (and its range once no grant row names
     it, §2.5), and a `Gone` process's record is reclaimed, its body having
-    gone at the teardown (§2.7; not yet enforced, the whole slot is). **The one
-    exception is a Mapping**, whose row is not a reference back: it frees its
-    slot and leaves the row installed (§2.5).
+    gone at the teardown (§2.7). **The one exception is a Mapping**, whose row
+    is not a reference back: it frees its slot and leaves the row installed
+    (§2.5).
   - Releasing a word that does not resolve — `NO_HANDLE`, a malformed word, a
     stale one, a second release — is the ordinary `BadHandle` fault.
   - In Saw it is automatic: every `sos` wrapper is `NoCopy` with a `deinit`
@@ -2748,9 +2727,7 @@ some reference names it (a handle entry, including a minted sibling's entry, or
 an attachment). Those holders are the only readers there can be, so the record
 is reclaimed when the last of them goes, however it goes, though never before
 its own teardown has ended (§2.7). A mapped stats-region reader can also see the
-dead process's counters in its body's row until a create reuses the body. Not
-yet enforced: both live in the `Gone` slot, the counters in the slot's
-stats-region row, and the slot lives while some reference names it.
+dead process's counters in its body's row until a create reuses the body.
 
 - **A thread fault kills its process.** The process exits with a
   fault status; there is no per-thread fault recovery (a faulted
@@ -3124,10 +3101,6 @@ loader parses and reports while no process stores either.
   objects outright instead of invalidating the bound kinds first and leaving
   the shared ones to their counts; and an op on an invalid Mapping or a
   `Gone` Process does not answer `Revoked`.
-- A process is not yet split into a record and a body (§2.7): it is one slot,
-  and a `Gone` process holds the whole slot while a handle or attachment names
-  it, the emptied storage of its handle table, boot set and grant record
-  included.
 - Binding an interrupt line is not yet a System op: it is
   `ProcessOp.InterruptBind` on `ProcessRight.InterruptBind`, charged to an
   `Interrupt` quota row, minting into the named process's table and faulting
@@ -3197,11 +3170,11 @@ critical processes (§2.5).
   charged to the process that handle names (§2.7), and for a Timer
   `ClockOp.TimerCreate` on `ClockRight.TimerCreate`, through a Clock handle
   (§2.6). The process tables and the interrupt lines are machine-global
-  resources bounded by machine facts (for processes the record and body slabs —
-  not yet enforced, one `PROCESSES` slab today — the protection-domain reloads,
-  ASIDs on a translating profile; for lines the board), so their refusals and
-  their limits are System answers: `process_create` is `SystemOp.ProcessCreate`
-  gated on `SystemRight.ProcessCreate`, binding a line is
+  resources bounded by machine facts (for processes the record and body slabs,
+  the protection-domain reloads, ASIDs on a translating profile; for lines the
+  board), so their refusals and their limits are System answers:
+  `process_create` is `SystemOp.ProcessCreate` gated on
+  `SystemRight.ProcessCreate`, binding a line is
   `SystemOp.InterruptBind` gated on `SystemRight.InterruptBind` (§2.8; not yet
   enforced, binding is a Process op today), and `SystemOp.ProcessSelf` is the
   precedent — every Process handle comes from System. With a launcher creating
@@ -3215,17 +3188,16 @@ critical processes (§2.5).
   `process_create`. The kernel has no second code path for process two, and
   root's process is made of the same parts: the boot door takes a record and a
   body for it, the first of each table, as the create door takes a child's
-  (§2.7; not yet enforced: root is the first slot of the one table). **The
-  kernel has one loader**, doing the copying (a userspace loader split is
-  deferred until it is necessary): the kernel parses sosimg at boot and at
-  `process_create` through the same phases — `validate_image` and `place_image`
-  take the destination as a region parameter (`LoadRegion`) — and the only thing
-  that differs between the two doors is the failure vocabulary: the boot door
-  raises `fatal_image`, because a machine whose only image is malformed has
-  nothing else to run, and the create door returns `BadImage`, because a
-  launcher must be able to report what it was handed. "No second code path" is
-  therefore kept by construction: nowhere else in the tree reads a segment
-  record. **Root provides the memory and supplies no numbers.**
+  (§2.7). **The kernel has one loader**, doing the copying (a userspace loader
+  split is deferred until it is necessary): the kernel parses sosimg at boot and
+  at `process_create` through the same phases — `validate_image` and
+  `place_image` take the destination as a region parameter (`LoadRegion`) — and
+  the only thing that differs between the two doors is the failure vocabulary:
+  the boot door raises `fatal_image`, because a machine whose only image is
+  malformed has nothing else to run, and the create door returns `BadImage`,
+  because a launcher must be able to report what it was handed. "No second code
+  path" is therefore kept by construction: nowhere else in the tree reads a
+  segment record. **Root provides the memory and supplies no numbers.**
   `process_create(image:memory:)` takes two Memory capabilities, segments are
   copied to their virtual link addresses inside `memory`, and **the stack is the
   kernel's grant at that region's top** — root's own loader rule, applied to a

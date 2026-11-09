@@ -9,11 +9,11 @@
 //! `end_process` lives here rather than in `process` because ending a process
 //! can reschedule, rescheduling can idle, and idle delivery reaches back
 //! through `refs` into `process.copy_out`. Placing it in `process` would create
-//! an import cycle. The process slot (`pslot`), the grant-record operations
-//! (`process`) and the slabs stay where they are; only the function that frees
-//! them is here. Consequence: `process`'s copy routines report a bad buffer
-//! instead of terminating, and the callers above the switch point terminate on
-//! it.
+//! an import cycle. The process record and body (`pslot`), the grant-record
+//! operations (`process`) and the slabs stay where they are; only the function
+//! that frees them is here. Consequence: `process`'s copy routines report a bad
+//! buffer instead of terminating, and the callers above the switch point
+//! terminate on it.
 
 import hal
 import sosabi.{
@@ -30,12 +30,16 @@ import kcore.limits.{
     MAX_MAPPINGS,
     MAX_TIMERS,
     MAX_WAITERS,
+    NO_BODY,
+    NO_PROCESS,
     NO_THREAD,
     ROOT_PROCESS,
 }
 import kcore.result.{op_value, write_result}
-import kcore.diag.{ExitCode, console}
-import kcore.pslot.{PROCESSES, ProcessState}
+import kcore.diag.{ExitCode, console, fatal_kernel}
+import kcore.stats.{stats_read}
+import kcore.pslot.{PROCESSES, PROCESS_RECORDS, ProcessState, body_of, has_body,
+                    unlink_body}
 import kcore.objects.{
     MAPPINGS,
     MappingSlot,
@@ -45,8 +49,9 @@ import kcore.objects.{
     quota_clear,
     unbind_handle,
 }
-import kcore.refs.{notify_ready, reap_unreferenced, release_pending_calls,
-                   unref_teardown, unref_waitable_teardown}
+import kcore.refs.{notify_ready, reap_unreferenced, ref_object,
+                   release_pending_calls, unref_object, unref_teardown,
+                   unref_waitable_teardown}
 import kcore.threads.{
     CURRENT_THREAD,
     LAST_PROT_PROCESS,
@@ -75,7 +80,7 @@ import kcore.waitables.{
     WaiterSlot,
     set_waitable_attachment,
 }
-import kcore.process.{clear_domain, load_domain, reclaim_process_slot}
+import kcore.process.{clear_domain, load_domain}
 
 import kcore.irq.{has_external_wake_source, idle_until_runnable}
 
@@ -224,7 +229,7 @@ public(package) func exit_thread(slot: Int, code: UInt) unsafe {
 }
 
 // =============================================================================
-// Process teardown (spec §2.7: close all handles, free what it owned)
+// Process teardown (spec §2.10: close all handles, free what it owned)
 // =============================================================================
 
 /// End process `p`. Never returns.
@@ -232,15 +237,32 @@ public(package) func exit_thread(slot: Int, code: UInt) unsafe {
 /// Teardown is unconditional: every handle in the process's table is closed,
 /// every thread slot and frame it owns goes back to the kernel's pools, and
 /// every Event, Waiter, Interrupt, Timer and Mapping it held goes back to its
-/// slab. Then:
+/// slab. Its trap counters are copied into its record, and its body (the
+/// handle table, the boot set and the grant record) is freed for the next
+/// create. The record stays, `Gone`, for as long as a reference names it.
+/// Then:
 ///
 ///   - Process 0 (root, init) stops the machine. Its children die with it,
 ///     uncounted.
 ///   - A child reschedules. Its threads leave the ready queue by removal, its
-///     slot and grant record go back, and the path ends in
-///     `resume_after_death`, so root is simply the next thing picked. A
-///     supervisor parked on the child's Process handle is woken by the
-///     `notify_ready` at the top of this function.
+///     body goes back, and the path ends in `resume_after_death`, so root is
+///     simply the next thing picked. A supervisor parked on the child's Process
+///     handle is woken by the `notify_ready` at the top of this function.
+///
+/// A record is never reclaimed before its own teardown has ended, because the
+/// teardown writes it after the point where its last reference can go: the
+/// notify can deliver a one-shot attachment holding that reference, and the
+/// counters, the body link and the ledger are written further down. So the
+/// teardown holds a reference of its own on the record, taken as the record
+/// turns `Gone` and dropped by an ordinary `unref_object` at the end, which is
+/// where a record nothing else names is reclaimed. Every other reclaim path
+/// (a release, a detach, a delivery, the reap's process scan) then needs no
+/// special case: each sees a count that cannot reach zero until that drop.
+///
+/// A `Gone` record has no body, and the teardown can run on one a second time:
+/// a creation op through a `Gone` process's handle can still fault the named
+/// process (spec §2.10's not-yet-enforced list). The body's steps are skipped
+/// then, since the first teardown did them.
 ///
 /// `code` is what a supervisor reads out of the spec §8 status word.
 /// `machine_status` is what the emulator exits with, which for a fault is the
@@ -253,9 +275,13 @@ public(package) func exit_thread(slot: Int, code: UInt) unsafe {
 /// whole walk. It is bounded, and ends in a machine stop or a fresh schedule.
 public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
                  machine_status: UInt) unsafe -> Never {
-    PROCESSES[p].state = ProcessState.Gone
-    PROCESSES[p].exit_kind = kind
-    PROCESSES[p].exit_code = code
+    PROCESS_RECORDS[p].state = ProcessState.Gone
+    PROCESS_RECORDS[p].exit_kind = kind
+    PROCESS_RECORDS[p].exit_code = code
+    // The teardown's own reference, dropped at the end (see above). It is taken
+    // before the notify, which is the first thing that can drop another.
+    ref_object(ObjType.Process, p)
+    let body = if has_body(p) { body_of(p) } else { NO_BODY }
 
     // A parked supervisor is told here, the earliest point at which the wait
     // record (the three fields above) is honest. The wake only queues:
@@ -264,7 +290,7 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // without switching. The whole teardown below runs to completion first and
     // the woken thread is picked up by `resume_after_death`, so no observer
     // sees a half-dead process. The call is unconditional, root included:
-    // root's slot can only be attached by root, and root's death stops the
+    // root's record can only be attached by root, and root's death stops the
     // machine.
     notify_ready(WaitableKind.Process, p)
 
@@ -303,8 +329,8 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
 
     // The close-all goes through `unbind_handle`, so teardown and release do
     // the same thing to a slot: zero the binding and bump the generation. The
-    // bump matters because a process slot is reclaimable, so these entries can
-    // be minted into again, and a word from the dead process's life must not
+    // bump matters because the body is freed below, so these entries can be
+    // minted into again, and a word from the dead process's life must not
     // resolve in the next one's. It touches only the entry, never the object.
     //
     // Each entry is also one reference fewer, and objects another process owns
@@ -315,8 +341,8 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // those counts. `unref_teardown`'s docstring carries the argument.
     var closed: UInt = 0
     var h: Int = 0
-    while h < MAX_HANDLES {
-        let entry = PROCESSES[p].handles[h]
+    while body != NO_BODY && h < MAX_HANDLES {
+        let entry = PROCESSES[body].handles[h]
         match entry.obj_type {
             case Unbound -> {},
             case _ -> {
@@ -385,14 +411,14 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // Attachments belong to a Waiter, so they are reclaimed by walking the
     // process's waiters: an attachment is a row in a Waiter's table and dies
     // with it. Each is also unhooked from the far end, because a supervisor's
-    // Waiter can attach to a child's process slot, and that pair spans two
+    // Waiter can attach to a child's process record, and that pair spans two
     // processes:
     //
     //   - Clear the back pointer, or the waitable's `attachment` field would
     //     name a slot this loop has just freed. For a same-process waitable the
-    //     per-slab sweeps below zero it anyway; for a Process slot another
-    //     process owns, this stops a later death from notifying through a stale
-    //     index.
+    //     per-slab sweeps below zero it anyway; for a Process record another
+    //     process owns, this stops a later death from notifying through a
+    //     stale index.
     //   - Count without freeing (`unref_waitable_teardown`), for the same
     //     reason as the handle close-all above: an object another process owns
     //     must see the reference go, and freeing is the per-slab sweeps' job.
@@ -501,16 +527,16 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // what this process was charged for. Whatever survives and is charged to
     // this process is disowned in the same scans: it is charged to nobody from
     // here on, and its eventual free credits nobody rather than whichever
-    // process occupies this slot by then (spec §2.10).
+    // process occupies this record by then (spec §2.10).
     //
     // Whether either arm does anything is a property of the wiring, not of the
     // table: the reap frees only what the dying process was the last to name,
     // and disowns only what it was charged for and something else still
     // names.
     //
-    // The reap also reclaims any other `Gone` process slot whose last
+    // The reap also reclaims any other `Gone` process record whose last
     // reference the close-all or the attachment sweep just dropped; this
-    // process's own slot waits for the `reclaim_process_slot` below.
+    // process's own record waits for the teardown's drop below.
     //
     // Threads, Events, Waiters, Interrupts and Timers are counted for the
     // teardown line and swept by ownership. Mappings are swept below: a Mapping
@@ -526,10 +552,17 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     //     dropped without an unmap is permanent, safe-but-leaked (spec §2.5),
     //     bounded here by the target's own death.
     //   - The target dying takes the row, because `clear_domain` below drops
-    //     the whole record. The slot stays live and its owner keeps the handle,
-    //     now naming a Mapping with nothing installed (`unmap` answers
+    //     the whole grant record. The slot stays live and its owner keeps the
+    //     handle, now naming a husk with nothing installed (`unmap` answers
     //     `BadState`). It must not be freed here: the owner's word still names
-    //     this slot, and a reused slot would be reachable through it.
+    //     this slot, and a reused slot would be reachable through it. Its
+    //     `target` is disowned (spec §2.10), so the husk names nobody and no
+    //     later process in this record or this body is reachable through it.
+    //
+    // A Mapping names its target only while it has a row there: `Unmap` and
+    // this sweep each clear both together. So one naming the dying record
+    // with no row is a husk an earlier life of this record left undisowned,
+    // which is a kernel bug, and it stops the machine.
     var mp: Int = 0
     while mp < MAPPINGS.capacity() {
         match MAPPINGS[mp].state {
@@ -540,23 +573,41 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
                                                target: 0, row: NO_ROW,
                                                refs: 0)
                 } else if MAPPINGS[mp].target == p {
+                    if MAPPINGS[mp].row == NO_ROW {
+                        fatal_kernel("a husk still named a reused process record",
+                                     mp as UInt)
+                    }
                     MAPPINGS[mp].row = NO_ROW
+                    MAPPINGS[mp].target = NO_PROCESS
                 }
             },
         }
         mp = mp + 1
     }
 
-    // The protection rows go with the slot, and `LAST_PROT_PROCESS` is
-    // invalidated with them, so a later process landing in this slot cannot
-    // compare equal to a domain that is no longer installed.
-    clear_domain(p)
+    // The body's own parts go last, in spec §2.10's order, once every step
+    // that can drop a reference or credit the ledger is behind them. A body
+    // that is already gone was handled by this process's first teardown.
+    if body != NO_BODY {
+        // The counters first: nothing is charged to a process once its
+        // teardown has begun (`ktrap` attributes to the current thread, and
+        // this process has none left), so the copy is final. The row itself
+        // stays as it is until a create reuses the body and clears it.
+        PROCESS_RECORDS[p].final_stats = stats_read(body)
 
-    // The boot set, undrained records included. Every record names a handle in
-    // the table the close-all already emptied, so what remains is a count and a
-    // cursor. It must be reset because a process slot is reclaimable, and the
-    // next occupant would otherwise drain handles that are not its own.
-    clear_boot_handles(p)
+        // The protection rows go with the body, and `LAST_PROT_PROCESS` is
+        // invalidated with them, so a later process landing in this record or
+        // this body cannot compare equal to a domain that is no longer
+        // installed.
+        clear_domain(p)
+
+        // The boot set, undrained records included. Every record names a
+        // handle in the table the close-all already emptied, so what remains is
+        // a count and a cursor. It must be reset because the body is reused,
+        // and the next process in it would otherwise drain handles that are
+        // not its own.
+        clear_boot_handles(p)
+    }
 
     // The quota ledger dies with the process. The charge of an object a peer
     // still references, which the reap above disowned, is written off here
@@ -564,27 +615,25 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // the next allocation). No credit is owed to this row once it is cleared,
     // so `quota_credit`'s zero test is only a defence against an underflow.
     // The limits are cleared with the used counts so the next occupant of the
-    // slot does not inherit an allowance. A mapping row in another process's
+    // record does not inherit an allowance. A mapping row in another process's
     // domain is credited to that target when its row goes (its own `Unmap` or
     // teardown).
     quota_clear(p)
 
-    // Free the slot itself if nobody can still read it. The dying process's
-    // handles were closed above, so the reader count is now right: a process
-    // that held the last handle onto its own slot frees it here rather than
-    // leaving a `Gone` slot nothing can reach. The usual case is the opposite:
-    // a creator's handle onto its dead child survives (keeping the spec §8
-    // status word readable), and the creator's release frees the slot later.
-    //
-    // The slot may already be `Free` by now. The `notify_ready` at the top can
-    // deliver a one-shot attachment holding the slot's last reference (the
-    // `Waiter.give(process:)` default), which reclaims it then. That is safe
-    // only because the reclaim does nothing but write `state = Free`: every
-    // step since indexes the slot by number without reading its state,
-    // nothing allocates a process slot before `resume_after_death`, and this
-    // call is guarded on `Gone`. A reclaim that also cleared the table or the
-    // rows would break the steps above.
-    reclaim_process_slot(p)
+    // The body goes back for the next create, and the record stops naming it
+    // (spec §2.10's disown of the record's own link).
+    if body != NO_BODY {
+        PROCESSES[body].live = false
+        unlink_body(p)
+    }
+
+    // The teardown's own reference goes, which reclaims the record if nothing
+    // else names it: a process that held the last handle onto its own record
+    // frees it here rather than leaving a `Gone` record nothing can reach. The
+    // usual case is the opposite: a creator's handle onto its dead child
+    // survives (keeping the spec §8 status word readable), and the creator's
+    // release frees the record later.
+    unref_object(ObjType.Process, p)
 
     let uart = console()
     uart.write_str("SOS: process teardown handles=")
@@ -601,8 +650,8 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // is owned by nobody.
     uart.write_str(" timers=")
     uart.write_hex(timers_freed)
-    // The process number comes last, so the fields before it keep their
-    // positions.
+    // The process number (the record's index) comes last, so the fields before
+    // it keep their positions.
     uart.write_str(" process=")
     uart.write_hex(p as UInt)
     uart.write_str("\n")

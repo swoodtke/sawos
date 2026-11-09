@@ -199,12 +199,12 @@ entered once has no storage a second thread could have.
 - **Translation tables instead of PMP.** The pool is the static
   `PAGE_TABLES` in `lib.saw`, one region rounded up to a page at run time (a
   Saw static has no alignment attribute), laid out as:
-  - `PROT_DOMAIN_SLOTS` per-process table sets, one per process slot, each
+  - `PROT_DOMAIN_SLOTS` per-process table sets, one per process body, each
     `PT_SET_DESCRIPTORS` long: six tables, namely level 1, level 2 over RAM,
     two level-3 tables (`GRANT_PAGES` pages, the 4 MiB grant window),
     a device level 2 and a device level 3. Within a set the tables sit at
     `LEVEL2_OFFSET`, `LEVEL3_OFFSET`, `DEVICE_LEVEL2_OFFSET` and
-    `DEVICE_LEVEL3_OFFSET`. A set is what `TTBR0_EL1` selects, with the slot
+    `DEVICE_LEVEL3_OFFSET`. A set is what `TTBR0_EL1` selects, with the body
     index as the ASID.
   - the kernel's linear map, `LINMAP_DESCRIPTORS` long and built once: three
     tables (a level 1, a level 2 over the device gigabyte, a level 2 over

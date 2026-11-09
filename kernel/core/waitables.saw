@@ -11,8 +11,8 @@
 //! and the questions asked of them stay below it.
 //!
 //! The Process waitable's per-kind answers (who is watching it, is it dead,
-//! what does the record say) are reads of `PROCESSES` in `pslot`. `process`
-//! imports nothing from here, so there is no cycle.
+//! what does the record say) are reads of `PROCESS_RECORDS` in `pslot`.
+//! `process` imports nothing from here, so there is no cycle.
 
 import sosabi.{EventMode, InletLevel, OutletLevel, ReplyLevel, WaitTag,
                process_status_word}
@@ -42,7 +42,7 @@ import kcore.threads.{NEED_RESCHED, THREADS, ThreadState}
 import kcore.time.{TIMERS, saturating_add}
 // Process is a waitable kind, so the per-kind matrix below reads the process
 // slot. `process` must not import this module.
-import kcore.pslot.{PROCESSES, ProcessState}
+import kcore.pslot.{PROCESS_RECORDS, ProcessState}
 
 /// The kinds that can be attached to a Waiter: the waitable kinds, and only
 /// those.
@@ -377,7 +377,7 @@ public(package) func waitable_attachment(kind: WaitableKind, slot: Int) unsafe -
         case Event -> EVENTS[slot].attachment,
         case Interrupt -> INTERRUPTS[slot].attachment,
         case Timer -> TIMERS[slot].attachment,
-        case Process -> PROCESSES[slot].attachment,
+        case Process -> PROCESS_RECORDS[slot].attachment,
         // Two kinds over one connection row; the kind says which field, as in
         // `ref_object` for the two reference columns.
         case PipeOutlet -> PIPES[slot].outlet_attachment,
@@ -394,7 +394,7 @@ public(package) func set_waitable_attachment(kind: WaitableKind, slot: Int, a: I
         case Event -> { EVENTS[slot].attachment = a },
         case Interrupt -> { INTERRUPTS[slot].attachment = a },
         case Timer -> { TIMERS[slot].attachment = a },
-        case Process -> { PROCESSES[slot].attachment = a },
+        case Process -> { PROCESS_RECORDS[slot].attachment = a },
         case PipeOutlet -> { PIPES[slot].outlet_attachment = a },
         case PipeInlet -> { PIPES[slot].inlet_attachment = a },
         case PipeReply -> { EXCHANGES[slot].reply_attach = a },
@@ -410,7 +410,7 @@ public(package) func set_waitable_attachment(kind: WaitableKind, slot: Int, a: I
 /// has been told about, and a Process once it is `Gone`.
 ///
 /// The Process arm is terminal: the other levels can drop again (a word is
-/// taken, a line is acked, a count is spent), but `Gone` is a state a slot
+/// taken, a line is acked, a count is spent), but `Gone` is a state a record
 /// leaves only by being freed, and it cannot be freed while somebody is
 /// attached to it. So the level a death raises stays raised for as long as
 /// anyone can observe it.
@@ -420,7 +420,7 @@ public(package) func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Boo
         case Interrupt -> INTERRUPTS[slot].pending,
         case Timer -> TIMERS[slot].fires != 0,
         case Process -> {
-            match PROCESSES[slot].state {
+            match PROCESS_RECORDS[slot].state {
                 case Gone -> true,
                 // `Created` is not ready: a process that was made and never
                 // started has not ended, so a supervisor parked on one waits
@@ -494,8 +494,8 @@ public(package) func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> Wa
                                  body_len: 0, body_src: 0),
         case Process -> WaitAnswer(
             tag: WaitTag.Process,
-            payload: process_status_word(PROCESSES[slot].exit_kind,
-                                         PROCESSES[slot].exit_code),
+            payload: process_status_word(PROCESS_RECORDS[slot].exit_kind,
+                                         PROCESS_RECORDS[slot].exit_code),
             body_len: 0, body_src: 0),
         // Drain-first, so a staged message is `Msg` whatever became of the
         // sender; this matches the order of the readiness test above, so the

@@ -20,23 +20,26 @@
 import hal
 import sosabi.{ClockType}
 
-/// Processes the kernel can hold, compiled floor: root plus the two children a
-/// driver-as-service launch needs (a driver child that owns the UART and a
-/// client child that reads it through a pipe).
+/// Process bodies the kernel can hold, compiled floor: root plus the two
+/// children a driver-as-service launch needs (a driver child that owns the UART
+/// and a client child that reads it through a pipe).
+///
+/// A body is what a live process runs in (spec §2.7). The teardown gives it
+/// back, so this bounds the processes alive at once; the dead ones somebody
+/// still holds are records, bounded by `MAX_PROCESS_RECORDS`.
 ///
 /// Raising this number is the only edit needed. Every per-process table is
-/// indexed rather than assumed: the handle table is a field of `ProcessSlot`,
+/// indexed rather than assumed: the handle table is a field of `ProcessBody`,
 /// and the thread, event, waiter, interrupt and timer slabs carry a `process`
 /// field their teardown scans by.
 ///
-/// A slot is not free. Each one costs:
+/// A body is not free. Each one costs:
 ///
-///   - `MAX_HANDLES` handle entries in `ProcessSlot.handles` and as many in
-///     `ProcessSlot.boot_handles` (zero-initialised, so .bss and no image
-///     bytes);
-///   - one `MAX_GRANT_ROWS`-row grant record, one `ProcessSlot`, and one
-///     `QUOTA_KINDS`-wide pair of quota rows;
-///   - one term in `MAX_ATTACHMENTS`, because a Process handle is a waitable.
+///   - `MAX_HANDLES` handle entries in `ProcessBody.handles` and as many in
+///     `ProcessBody.boot_handles`;
+///   - one `MAX_GRANT_ROWS`-row grant record and one `ProcessBody`;
+///   - `PROCESS_RECORDS_PER_BODY` records, which `MAX_PROCESS_RECORDS` derives
+///     from it.
 ///
 /// It does not cost protection rows. Those are per domain and reprogrammed at
 /// `load_domain`, so `hal.GRANT_ROW_BUDGET` is what one process may hold
@@ -50,8 +53,8 @@ import sosabi.{ClockType}
 /// is an edit to this line when something needs it.
 ///
 /// This is the compiled floor. `SlabKind.Processes` raises the machine's real
-/// ceiling, and a process donation carries the whole per-process record with it
-/// (handle table, quota ledger and boot set are fields of `ProcessSlot`).
+/// ceiling, and a body donation carries the handle table, the boot set and the
+/// grant record with it, since they are fields of `ProcessBody`.
 ///
 /// On a tier that translates addresses there is a second, lower ceiling: a
 /// persistent per-process table set comes out of a static HAL pool that
@@ -59,13 +62,46 @@ import sosabi.{ClockType}
 /// meets there. See the assert below and `kcore.process.process_slots_usable`.
 public(package) static MAX_PROCESSES: Int = 3
 
-/// Root's slot. The kernel loads exactly one image (spec §12) and it lands
-/// here, so "process 0" and "root" are the same statement; that is what lets
+/// How many process records the kernel holds per body, compiled floor.
+///
+/// A body is spent again as soon as its process dies, but the record stays for
+/// as long as a handle or an attachment names it, and every live process holds
+/// one too. So the record table is the larger, and the factor is what a
+/// supervisor that keeps its dead children's handles can hold: one less than it
+/// per body before a create is refused. It must be greater than one, and it is
+/// generous because a record is small.
+public(package) static PROCESS_RECORDS_PER_BODY: Int = 4
+
+static_assert(PROCESS_RECORDS_PER_BODY > 1,
+              "the record table must hold dead processes beside the live ones")
+
+/// Process records the kernel can hold, compiled floor (spec §2.7).
+///
+/// A record is the process as handles, attachments and charged objects name
+/// it: its state, status word, quota ledger, reference count, attachment, final
+/// trap counters and the link to its body. `SlabKind.ProcessRecords` raises
+/// the machine's real ceiling, separately from the bodies: demand for records
+/// follows how long holders keep dead processes, not how many run.
+///
+/// Each one also costs a term in `MAX_ATTACHMENTS`, because a Process handle is
+/// a waitable and an attachment on one names the record.
+public(package) static MAX_PROCESS_RECORDS: Int = PROCESS_RECORDS_PER_BODY * MAX_PROCESSES
+
+/// Root's record. The kernel loads exactly one image (spec §12) and its
+/// process takes the first record and the first body (`ROOT_BODY`), so
+/// "process 0" and "root" are the same statement; that is what lets
 /// `end_process` branch on a comparison rather than a flag.
 public(package) static ROOT_PROCESS: Int = 0
 
-/// "No process". The plain-form sentinel, like `NO_THREAD`.
+/// Root's body, the first of the body table as root's record is the first of
+/// the record table.
+public(package) static ROOT_BODY: Int = 0
+
+/// "No process". The plain-form sentinel for a record index, like `NO_THREAD`.
 public(package) static NO_PROCESS: Int = -1
+
+/// "No body": a record whose process is dead, or not yet created, names none.
+public(package) static NO_BODY: Int = -1
 
 /// Memory objects the kernel can hold (spec §2.5).
 ///
@@ -135,7 +171,7 @@ public(package) static NO_MAPPING: Int = -1
 /// checks the HAL's number and never this one; the asserts below stop the array
 /// being too short.
 ///
-/// Raising it costs every process slot a row of storage.
+/// Raising it costs every process body a row of storage.
 public(package) static MAX_GRANT_ROWS: Int = 9
 
 static_assert(hal.MAX_ROOT_SEGMENTS + 1 <= 9,
@@ -144,10 +180,10 @@ static_assert(hal.MAX_ROOT_SEGMENTS + 1 <= 9,
 static_assert(hal.GRANT_ROW_BUDGET <= 9,
               "a process's grant record must hold every row its profile may install")
 
-// Every process slot needs a protection domain to live in. On a tier that keeps
-// a persistent table set per process, the HAL sizes a static pool and
-// advertises how many sets it holds; a process slot with no set behind it would
-// index past the pool. The number is declared in the HAL rather than read from
+// Every body needs a protection domain to live in. On a tier that keeps a
+// persistent table set per process, the HAL sizes a static pool and advertises
+// how many sets it holds; a body with no set behind it would index past the
+// pool. The number is declared in the HAL rather than read from
 // here because a HAL that had to import the kernel to size its own page tables
 // would be the wrong way round. This assert keeps the two spellings honest, as
 // the `GRANT_ROW_BUDGET` pair above does.
@@ -159,7 +195,7 @@ static_assert(hal.GRANT_ROW_BUDGET <= 9,
 // `kcore.process.process_slots_usable`, and a create past the pool answers the
 // `NoResource` a full table already answers.
 static_assert(MAX_PROCESSES <= hal.PROT_DOMAIN_SLOTS,
-              "the compiled floor of process slots must fit the HAL's domain pool")
+              "the compiled floor of process bodies must fit the HAL's domain pool")
 
 /// Threads the kernel can hold, across all processes (compiled floor).
 /// `SlabKind.Threads` raises the machine's real ceiling, and a thread donation
@@ -205,9 +241,9 @@ public(package) static MAX_TIMERS: Int = 8
 /// Sized to cover every waitable being attached at once: an attachment is one
 /// (Waiter, waitable) pair and spec §2.2 allows a handle at most one Waiter, so
 /// nothing can need more than there are waitables. The terms are events,
-/// interrupts, timers and processes (a Process handle is a waitable, one
-/// attachment per slot at most). A Clock and a thread are not waitable, so
-/// `CLOCK_KINDS` and `MAX_THREADS` are absent.
+/// interrupts, timers and process records (a Process handle is a waitable that
+/// names a record, one attachment per record at most). A Clock and a thread are
+/// not waitable, so `CLOCK_KINDS` and `MAX_THREADS` are absent.
 ///
 /// The pipe waitables (outlet, inlet, claim, obligation) are deliberately not
 /// terms. Sizing this to cover every one at once would multiply the table by
@@ -221,7 +257,7 @@ public(package) static MAX_TIMERS: Int = 8
 /// with the same op. The sum still guarantees the boot minimum for a machine
 /// that never donates.
 public(package) static MAX_ATTACHMENTS: Int = (MAX_EVENTS + MAX_INTERRUPTS
-                                               + MAX_TIMERS + MAX_PROCESSES)
+                                               + MAX_TIMERS + MAX_PROCESS_RECORDS)
 
 /// Pipe connections the kernel can hold (spec §2.1), compiled floor.
 ///

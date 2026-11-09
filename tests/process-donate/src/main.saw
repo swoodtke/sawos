@@ -1,29 +1,32 @@
-// A donated process slot is a process the machine runs.
+// A donated process body is a process the machine runs.
 //
 // The transcript:
 //
 //   SOS procdonate: floor=3 third child refused: out of kernel objects
-//   SOS procdonate: donated a region of process slots
+//   SOS procdonate: donated a region of process bodies
 //   SOS procdonate: third child created past the floor
 //   SOS procdonate: started three children
 //   SOS echo0: alive       <- each child, scheduled, in its own address space
 //   SOS echo1: alive
-//   SOS echo2: alive       <- this one lives in a donated slot
+//   SOS echo2: alive       <- this one lives in a donated body
 //   SOS procdonate: exits a=65577 b=65578 c=65579
 //   SOS procdonate: donated slot reused d=65579
 //   SOS procdonate: done
 //
-// A donated process slot must carry everything a process needs: its handle
-// table, boot-handle set (with count and cursor) and quota rows are fields of
-// `ProcessSlot`, not tables sized for the compiled floor. So a deployment that
-// donates runs more concurrent processes than the image was built for.
+// A donated process body must carry everything a live process needs: its
+// handle table, boot-handle set (with count and cursor) and grant record are
+// fields of `ProcessBody`, not tables sized for the compiled floor. So a
+// deployment that donates runs more concurrent processes than the image was
+// built for. The quota ledger is the record's, and records are a table of their
+// own (`process-records-donate`).
 //
 // Five claims, in order.
 //
 //  1. The floor is real. `FLOOR` is `MAX_PROCESSES` and root is one of them,
-//     so root plus `FLOOR - 1` children is the whole table. The next
-//     `process_create` meets the slab and answers `NoResource`, a status,
-//     because the caller cannot know how full the machine's table is.
+//     so root plus `FLOOR - 1` children, created and not yet run, is the
+//     whole body table. The next `process_create` meets the slab and answers
+//     `NoResource`, a status, because the caller cannot know how full the
+//     machine's table is.
 //
 //  2. The donation is ordinary memory, cut out of a region root was given.
 //
@@ -38,9 +41,9 @@
 //     process it makes is the fourth live process on a machine compiled for
 //     three.
 //
-//  4. A donated slot is a whole process. All three children are started and
+//  4. A donated body is a whole process. All three children are started and
 //     each says its own line before exiting with its own code. That line is the
-//     donated slot's handle table, quota ledger and boot set all working at
+//     donated body's handle table, boot set and grant record all working at
 //     once: the child derives a Process object out of the System handle root
 //     gave it (a boot-set record) and makes a syscall (a handle-table lookup).
 //     The exit code coming back through root's wait record is its teardown.
@@ -50,21 +53,21 @@
 //     rather than completion order, so the line is deterministic however the
 //     scheduler interleaves them.
 //
-//  5. The donated slot comes back and is spent again. Root drops the third
-//     child's Process handle, which lets `reclaim_process_slot` free a `Gone`
-//     slot. That slot is above the compiled floor, so the reclaim walk and the
-//     allocator scan both have to reach into the donated extent. The
-//     replacement child runs and dies exactly as the first one did, at a new
-//     generation of the same slot.
+//  5. The donated body comes back and is spent again. The third child's
+//     teardown gave it back. Two fillers, created and never started, take the
+//     two bodies the first two children left below the floor, so the
+//     replacement child can only land in the donated extent, and the allocator
+//     scan has to reach into it. The replacement runs and dies exactly as the
+//     first one did.
 //
-// No slot count is printed, as in `tests/slab-donate`, `thread-donate` and
-// `pipe-donate`: a donated region buys `len / sizeof(ProcessSlot)` slots, that
-// size differs per profile, and every claim above is independent of it.
+// No body count is printed, as in `tests/slab-donate`, `thread-donate` and
+// `pipe-donate`: a donated region buys `len / sizeof(ProcessBody)` bodies,
+// that size differs per profile, and every claim above is independent of it.
 //
-// The arm64 domain wall is why this case stops at four processes. A
-// translating tier keeps a persistent table set per process slot in a static
+// The arm64 domain wall is why this case stops at four live processes. A
+// translating tier keeps a persistent table set per process body in a static
 // HAL pool that donation cannot reach, so `hal.PROT_DOMAIN_SLOTS` bounds what a
-// donated slot can be used for there. It covers the fourth process on arm64;
+// donated body can be used for there. It covers the fourth process on arm64;
 // the next one is deliberately left unspent so the gate does not sit exactly
 // on the wall. The wall's own refusal is not witnessed here.
 
@@ -88,9 +91,9 @@ static FLOOR: UInt = 3
 /// the address it was linked at, so a child's region base is not a free choice.
 static CHILD_SPAN: UInt = 0x20000
 
-/// The donation: the next cut after the third child's span. Many process slots
-/// on either profile and far more than this case spends, so the machine's
-/// remaining bound is the tier's domain pool rather than the slab.
+/// The donation: the next cut after the third child's span. Many process
+/// bodies on either profile and far more than this case spends, so the
+/// machine's remaining bound is the tier's domain pool rather than the slab.
 static GIFT: UInt = 0x2000
 
 /// Root's config: the tag each child drains its System handle under. The kernel
@@ -227,7 +230,7 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let _ = system.debug_print("SOS procdonate: donated a region of process slots\n")
+    let _ = system.debug_print("SOS procdonate: donated a region of process bodies\n")
 
     // ---- Claim 3: the ceiling moved ----------------------------------------
     let c2 = try system.process_create(image: &img2, memory: &piece2) catch {
@@ -237,7 +240,7 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS procdonate: third child created past the floor\n")
 
-    // ---- Claim 4: and a donated slot is a whole process --------------------
+    // ---- Claim 4: and a donated body is a whole process --------------------
     try furnish_and_start(&system, &c0) catch {
         let _ = system.debug_print("SOS procdonate: first child would not start\n")
         let _ = system.shutdown(EXIT_FAILED)
@@ -281,12 +284,24 @@ func _start(boot_handle: UInt) {
     }
     print("SOS procdonate: exits a={} b={} c={}\n", a, b, c)
 
-    // ---- Claim 5: the donated slot comes back, and is spent again ----------
+    // ---- Claim 5: the donated body comes back, and is spent again ----------
     //
-    // Dropping the handle is the release, and it lets the kernel reclaim a
-    // `Gone` slot. This one lives above the compiled floor, so both the reclaim
-    // and the next allocator scan have to reach into the donated extent.
+    // The third child's teardown gave its body back; dropping its handle
+    // releases the record, which is all the handle held. The fillers take the
+    // two bodies below the floor, so the replacement's create has to reach into
+    // the donated extent. They are loaded into the third child's RAM and never
+    // run, and the replacement is loaded over them last.
     let _ = move c2
+    let filler_a = try system.process_create(image: &img2, memory: &piece2) catch {
+        print("SOS procdonate: first filler refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let filler_b = try system.process_create(image: &img2, memory: &piece2) catch {
+        print("SOS procdonate: second filler refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
 
     let c2b = try system.process_create(image: &img2, memory: &piece2) catch {
         print("SOS procdonate: the donated slot did not come back: {}\n", error)
@@ -304,6 +319,11 @@ func _start(boot_handle: UInt) {
         return
     }
     print("SOS procdonate: donated slot reused d={}\n", d)
+    // The fillers are released only here, with root's exit next: a process
+    // that never ran is never reclaimed, so their releases strand their bodies,
+    // and nothing runs after them that could notice.
+    let _ = move filler_b
+    let _ = move filler_a
 
     let _ = system.debug_print("SOS procdonate: done\n")
     let _ = proc.exit(EXIT_OK)

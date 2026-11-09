@@ -509,12 +509,13 @@ public func pipe_reply_wait_record_bytes() -> Int {
 // that made it and an interrupt that preempts is charged to the one that was
 // running. Traps taken through the boot door, before any process exists, are
 // unattributed: the harness kernels that enter user mode with no object model
-// have a running program and no process slot, and there is nowhere honest to
-// put their count. `ktrap` says so at the site.
+// have a running program and no process, and there is nowhere honest to put
+// their count. `ktrap` says so at the site.
 //
 // The columns zero at process create, both at root's boot-time reification and
-// at `SystemOp.ProcessCreate`, so a reused slot never inherits its
-// predecessor's traffic.
+// at `SystemOp.ProcessCreate`, so a reused body never inherits its
+// predecessor's traffic. A dead process's columns are copied into its record
+// at the teardown, and `Process.Stats` through its handle answers that copy.
 
 /// Doublewords in a `Process.Stats` answer: syscalls, interrupts, faults.
 public static PROCESS_STATS_RECORD_DOUBLEWORDS: Int = 3
@@ -574,11 +575,12 @@ public func stats_row_bytes() -> Int {
 // remains the answer for a caller that wants one process's numbers and no
 // mapping.
 //
-// Rows are indexed by process slot, and the region has a row for every slot the
+// Rows are indexed by process body, and the region has a row for every body the
 // machine can ever hand out. See `kcore.stats` for the capacity argument; in
-// short, `alloc_process` scans to `min(capacity, hal.PROT_DOMAIN_SLOTS)`, so
-// `PROT_DOMAIN_SLOTS` is a ceiling on the slot index and a region sized to it
-// can never be outgrown, donated process slots included.
+// short, `alloc_process` scans the bodies to
+// `min(capacity, hal.PROT_DOMAIN_SLOTS)`, so `PROT_DOMAIN_SLOTS` is a ceiling
+// on the body index and a region sized to it can never be outgrown, donated
+// bodies included.
 //
 // Tearing is documented, not hidden. A column is 64 bits and one profile's
 // registers are 32, so a reader on riscv32 loads a doubleword as two words and
@@ -636,16 +638,17 @@ public func stats_region_header_bytes() -> Int {
 /// the kernel's answer". This record carries the one thing `map` has no
 /// equivalent of.
 ///
-/// Why a row index is owed at all: rows are indexed by process slot, and slot
+/// Why a row index is owed at all: rows are indexed by process body, and body
 /// numbering is kernel-internal, so a process has no other way to learn its
 /// own. A caller handed the page without it would hold a table it cannot find
 /// itself in.
 ///
 /// It is written before the row is installed, and that is not a partial
-/// success. The index is a fact about the caller (process `p` occupies row `p`)
-/// rather than a product of the mapping, so it is true whether or not the
-/// install goes on to succeed. A caller that gets an error status did not get a
-/// mapping; the number it was told is still its row.
+/// success. The index is a fact about the caller (a process occupies its
+/// body's row for as long as it lives) rather than a product of the mapping,
+/// so it is true whether or not the install goes on to succeed. A caller that
+/// gets an error status did not get a mapping; the number it was told is still
+/// its row.
 ///
 /// It is the caller's own row and nobody else's. Learning which row another
 /// process occupies is a naming question this record does not answer.

@@ -493,12 +493,12 @@ static_assert((DEVICE_GRANT_BASE % PROT_GRAIN) == 0,
 /// Here it is a policy number, not a hardware one. There are no numbered
 /// regions to run out of: a grant is a walk of page descriptors, so the
 /// hardware's only limit is the window's own size. What bounds a domain is the
-/// kernel's grant record, a fixed array per process slot, and this is that
+/// kernel's grant record, a fixed array per process body, and this is that
 /// array's length (`kcore.limits.MAX_GRANT_ROWS`), restated as a HAL fact so
 /// one number serves both profiles at the map check.
 ///
 /// Don't widen it past the array: raising it means raising the storage every
-/// process slot carries.
+/// process body carries.
 public static GRANT_ROW_BUDGET: UInt = 9
 
 /// May `[base, top)` be installed as a RAM row in a user domain?
@@ -871,8 +871,8 @@ public func kernel_fault(esr: UInt, elr: UInt, far: UInt) unsafe {
 // Spec §5b: on Profile B an AddressSpace is a page-table root. Two kinds of
 // table hierarchy exist, in one static pool:
 //
-//   - one per-process set for each process slot, selected by `TTBR0_EL1` with
-//     the slot index as the ASID. It maps only the user windows, ungranted at
+//   - one per-process set for each process body, selected by `TTBR0_EL1` with
+//     the body index as the ASID. It maps only the user windows, ungranted at
 //     reset. Every other entry is invalid, so a page a process was not granted
 //     is a translation fault.
 //   - the kernel's linear map, built once and installed in `TTBR1_EL1`, which
@@ -946,7 +946,7 @@ static PT_SET_DESCRIPTORS: Int = 512 + 512 + 1024 + 512 + 512
 /// the two spellings from drifting.
 static PT_SET_BYTES: UInt = (512 + 512 + 1024 + 512 + 512) * 8
 
-/// How many persistent table sets the pool holds: one per process slot.
+/// How many persistent table sets the pool holds: one per process body.
 ///
 /// It is declared here rather than read from the kernel because a HAL that had
 /// to import the kernel to size its own page tables would be the wrong way
@@ -956,11 +956,11 @@ static PT_SET_BYTES: UInt = (512 + 512 + 1024 + 512 + 512) * 8
 /// without the build saying so.
 ///
 /// It is strictly larger than `MAX_PROCESSES`. `SlabKind.Processes` lets a
-/// deployment donate process slots, but this pool is static and donation cannot
-/// reach it, so on a translating tier a donated slot with no table set behind
-/// it could never run. The kernel takes the smaller of the two numbers at run
-/// time (`kcore.process.process_slots_usable`) and answers `NoResource` past
-/// it.
+/// deployment donate process bodies, but this pool is static and donation
+/// cannot reach it, so on a translating tier a donated body with no table set
+/// behind it could never run. The kernel takes the smaller of the two numbers
+/// at run time (`kcore.process.process_slots_usable`) and answers `NoResource`
+/// past it.
 ///
 /// The cost is paid in `.bss` only. The pool holds this many sets of
 /// `PT_SET_DESCRIPTORS` descriptors, plus the linear map's descriptors and one
@@ -973,11 +973,11 @@ static PT_SET_BYTES: UInt = (512 + 512 + 1024 + 512 + 512) * 8
 /// a raise that goes too far, which is why that assert names this constant.
 public static PROT_DOMAIN_SLOTS: Int = 5
 
-// The ASID is the slot index (see `prot_switch`), and `TCR_EL1.AS` = 0 makes
+// The ASID is the body index (see `prot_switch`), and `TCR_EL1.AS` = 0 makes
 // the field 8 bits wide. Exceeding it would silently alias two domains' TLB
 // entries onto one tag, so it is checked rather than reasoned about.
 static_assert(PROT_DOMAIN_SLOTS <= 256,
-              "the ASID is the process slot index and TCR_EL1.AS=0 gives it 8 bits")
+              "the ASID is the process body index and TCR_EL1.AS=0 gives it 8 bits")
 
 /// The kernel's own tables: the linear map, which exists once. Three tables: a
 /// level 1, a level 2 over the device gigabyte, and a level 2 over RAM's
@@ -992,7 +992,7 @@ static LINMAP_DESCRIPTORS: Int = 512 + 512 + 512
 /// Bytes in the linear map, the `UInt` spelling for address arithmetic.
 static LINMAP_BYTES: UInt = (512 + 512 + 512) * 8
 
-/// The pool: one set per process slot, back to back, then the linear map, plus
+/// The pool: one set per process body, back to back, then the linear map, plus
 /// one table's worth of alignment slack for the run-time round-up.
 ///
 /// It is one region rather than an array per table because the hardware
@@ -1378,10 +1378,10 @@ func page_tables_build() unsafe -> UInt {
         build_set(set_base(set))
         set = set + 1
     }
-    // Set 0 is `ROOT_PROCESS`'s (`kernel/core/limits.saw`: `ROOT_PROCESS = 0`),
-    // and the boot door's `load_domain(ROOT_PROCESS)` switches to it
-    // explicitly, so the ASID the machine starts on and the one root runs under
-    // are the same number and nothing runs on a set that is not its own.
+    // Set 0 is root's body's (`kernel/core/limits.saw`: `ROOT_BODY = 0`), and
+    // the boot door's `load_domain(ROOT_PROCESS)` switches to it explicitly, so
+    // the ASID the machine starts on and the one root runs under are the same
+    // number and nothing runs on a set that is not its own.
     set_base(0)
 }
 
@@ -1634,7 +1634,7 @@ public func prot_isolated() -> Bool { true }
 /// The switch: make `p`'s tables the live ones.
 ///
 /// One `msr` and an `isb`, with no descriptor stores and no TLB flush. The ASID
-/// is the process slot index: `PROT_DOMAIN_SLOTS` of them, in a field the
+/// is the process body index: `PROT_DOMAIN_SLOTS` of them, in a field the
 /// architecture gives at least 8 bits for (`TCR_EL1.AS` is 0 here, so 8), so no
 /// allocator is needed and the number is stable for a process's whole life.
 /// `TCR_EL1.A1` is 0, so TTBR0 is what defines the ASID. The `static_assert` at
@@ -1717,7 +1717,7 @@ public func prot_update(p: UInt, base: UInt, top: UInt, pa: UInt, perms: UInt8,
 ///     would make the cleanup depend on the bookkeeping whose failure it is
 ///     there to contain.
 ///   - It anchors the ASID-reuse invalidation to one lifecycle event. A process
-///     slot, and therefore an address-space identifier, becomes reusable here
+///     body, and therefore an address-space identifier, becomes reusable here
 ///     and nowhere else, so the invalidation that stops a new process
 ///     inheriting a dead one's cached translations has exactly one site.
 ///

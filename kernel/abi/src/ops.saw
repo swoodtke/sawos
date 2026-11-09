@@ -35,7 +35,7 @@
 /// What the dropped reference frees depends on the kind. System, Clock and
 /// Thread handles are not counted, so releasing one frees nothing. A counted
 /// object frees at its last reference, with these exceptions: a live Process
-/// keeps running (only a `Gone` process's slot is reclaimed), a Memory region
+/// keeps running (only a `Gone` process's record is reclaimed), a Memory region
 /// stays while an installed mapping row still grants its bytes or, on a pool
 /// root, while pieces of it are on loan, and a pipe connection or one-shot
 /// exchange frees only once both of its halves are gone and nothing in flight
@@ -1141,26 +1141,38 @@ public enum SlabKind: UInt {
     /// is a fact about pipes rather than about this op, and it is why a
     /// deployment that wants many connections donates a large region.
     case Pipes = 10,
-    /// Processes, and every table a process index keys.
+    /// Process bodies: what a live process runs in (spec §2.7).
     ///
     /// The handle table, the boot-handle set with its count and cursor, and the
-    /// quota rows are fields of `ProcessSlot`, not parallel arrays, so a
-    /// donated process slot never indexes off the end of anything.
+    /// grant record are fields of `ProcessBody`, not parallel arrays, so a
+    /// donated body never indexes off the end of anything.
     ///
-    /// One donation, one array. A `ProcessSlot` is large (it carries a
-    /// handle table, a boot set, a grant record and two ledger rows) and
-    /// entirely plain, so this kind needs none of `Threads`' side arena or
-    /// `Pipes`' second chain: a region buys `len / sizeof(ProcessSlot)`
-    /// processes and nothing else.
+    /// One donation, one array. A `ProcessBody` is large (it carries a handle
+    /// table, a boot set and a grant record) and entirely plain, so this kind
+    /// needs none of `Threads`' side arena or `Pipes`' second chain: a region
+    /// buys `len / sizeof(ProcessBody)` bodies and nothing else. It raises how
+    /// many processes can be alive at once, and not how many dead ones can be
+    /// held (`ProcessRecords`).
     ///
     /// A translating tier has a second ceiling this op cannot move: a
     /// per-process protection domain comes out of a static HAL pool (donation
     /// out of HAL-internal storage is not offered), so `hal.PROT_DOMAIN_SLOTS`
-    /// bounds what a donated slot can actually be used for there. A create past
+    /// bounds what a donated body can actually be used for there. A create past
     /// it answers `NoResource`, the machine's real answer on that tier,
     /// advertised rather than faulted. See
     /// `kcore.process.process_slots_usable`.
     case Processes = 11,
+    /// Process records: the process as handles, attachments and charged
+    /// objects name it (spec §2.7). The state, the status word, the quota
+    /// ledger and the final trap counters are fields of `ProcessRecord`.
+    ///
+    /// A record outlives its body for as long as a handle or an attachment
+    /// names it, so this is the kind a supervisor that keeps its dead
+    /// children's handles donates to: it raises how many dead processes can be
+    /// held before a create is refused, and on a tier whose domain pool caps
+    /// the bodies it still grows. One donation, one array: a region buys
+    /// `len / sizeof(ProcessRecord)` records.
+    case ProcessRecords = 12,
 }
 
 /// The message body's maximum, as a build define (spec §2.1's fixed body).

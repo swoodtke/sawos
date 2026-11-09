@@ -55,11 +55,11 @@
 //! # Placement
 //!
 //! This module sits above `process`, because delivery needs `process`'s copy
-//! doors and a Process's own count drives its slot reclaim, and below `sched`,
-//! which holds the teardown and imports this module. It reaches every slab (the
-//! memory slabs and the handle table in `objects`, the Timer slab in `time`,
-//! the wait slabs in `waitables`) and `PROCESSES` in `pslot`, and nothing above
-//! itself.
+//! doors and a Process's own count drives its record's reclaim, and below
+//! `sched`, which holds the teardown and imports this module. It reaches every
+//! slab (the memory slabs and the handle table in `objects`, the Timer slab in
+//! `time`, the wait slabs in `waitables`) and `PROCESS_RECORDS` in `pslot`, and
+//! nothing above itself.
 //!
 //! Two mints are not expressed through this matrix because they happen in
 //! `process`, below this file: a boot Memory and IoMemory are created with
@@ -81,7 +81,7 @@ import kcore.limits.{MAX_IOMEMORIES, MAX_MEMORIES,
 import kcore.diag.{ExitCode, fatal, fatal_kernel}
 import kcore.result.{op_ok, op_status, op_value, write_result}
 import kcore.threads.{THREADS, ThreadState, frame_slot, ready_push}
-import kcore.pslot.{HandleEntry, PROCESSES, QuotaKind}
+import kcore.pslot.{HandleEntry, PROCESS_RECORDS, QuotaKind}
 import kcore.objects.{
     EXCHANGES,
     ExchangeState,
@@ -144,7 +144,7 @@ import kcore.waitables.{
     waitable_consume,
     waitable_ready,
 }
-import kcore.process.{copy_in, copy_out, reclaim_process_slot}
+import kcore.process.{copy_in, copy_out, reclaim_process_record}
 
 /// Something now names object `slot` of kind `kind`.
 ///
@@ -170,7 +170,9 @@ public(package) func ref_object(kind: ObjType, slot: Int) unsafe {
         case Memory -> { MEMORIES[slot].refs = MEMORIES[slot].refs + 1 },
         case IoMemory -> { IOMEMORIES[slot].refs = IOMEMORIES[slot].refs + 1 },
         case Mapping -> { MAPPINGS[slot].refs = MAPPINGS[slot].refs + 1 },
-        case Process -> { PROCESSES[slot].refs = PROCESSES[slot].refs + 1 },
+        case Process -> {
+            PROCESS_RECORDS[slot].refs = PROCESS_RECORDS[slot].refs + 1
+        },
         // Two kinds, one slot, two columns. `slot` is the connection's index;
         // the kind says which end the handle names and therefore which column
         // it counts on.
@@ -364,9 +366,9 @@ func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
             exchange_can_settle(slot)
         },
         case Process -> {
-            if PROCESSES[slot].refs == 0 { return false }
-            PROCESSES[slot].refs = PROCESSES[slot].refs - 1
-            PROCESSES[slot].refs == 0
+            if PROCESS_RECORDS[slot].refs == 0 { return false }
+            PROCESS_RECORDS[slot].refs = PROCESS_RECORDS[slot].refs - 1
+            PROCESS_RECORDS[slot].refs == 0
         },
         case System -> false,
         case Clock -> false,
@@ -423,7 +425,7 @@ public(package) func unref_object(kind: ObjType, slot: Int) unsafe {
 /// For the dying process's own objects the two agree by construction: the sweep
 /// zeroes the slot, count included, so nothing is left half-counted.
 ///
-/// A Process whose count reaches zero here is not freed either. A `Gone` slot
+/// A Process whose count reaches zero here is not freed either. A `Gone` record
 /// whose last reference this was (a handle in the close-all, or an attachment
 /// in the attachment sweep) is reclaimed by the process scan at the end of
 /// `reap_unreferenced`.
@@ -621,20 +623,21 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
             // invariant as the arms above: nothing is watching, because a
             // watcher is a reference. This is what makes attach-after-death
             // sound against the reclaim below; if it fired, a supervisor would
-            // be parked on a slot already given away.
-            if PROCESSES[slot].attachment != 0 {
+            // be parked on a record already given away.
+            if PROCESS_RECORDS[slot].attachment != 0 {
                 fatal_kernel("a process reached zero references while attached",
                              slot as UInt)
             }
             // A live process is not freed by losing its last handle: it is
-            // still running in its slot. Only a `Gone` slot's last reader going
-            // makes the §8 status word unreadable, and `reclaim_process_slot`
-            // implements that rule by reading this count.
+            // still running as this record. Only a `Gone` record's last reader
+            // going makes the §8 status word unreadable, and
+            // `reclaim_process_record` implements that rule by reading this
+            // count. Its body went back at its teardown, whatever the count.
             //
             // The ledger is not credited: the teardown already zeroed this
-            // slot's rows, and a process is not something another process is
+            // record's rows, and a process is not something another process is
             // charged for.
-            reclaim_process_slot(slot)
+            reclaim_process_record(slot)
         },
         // Both ends are gone, so the connection is too. The two arms are one
         // act written twice, because the matrix is over `ObjType`: either kind
@@ -693,14 +696,14 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
 // it. `reap_unreferenced` therefore frees by condition, "named by nobody",
 // through `free_object`, so every kind's last rites and quota credit run
 // exactly as on the ordinary release path. The same holds for a `Gone`
-// process slot whose last reference, handle or attachment, the dying process
+// process record whose last reference, handle or attachment, the dying process
 // held: the reap's process scan reclaims it.
 //
 // What survives the reap and is charged to the dying process is disowned in
 // the same scans: its `process` field becomes `NO_PROCESS`, its charge goes
 // with the ledger `quota_clear` zeroes, and its eventual free credits nobody
-// (spec §2.10). A dead process's slot is reclaimed on its handles and
-// attachment alone, and a refund owed to it must not reach the slot's next
+// (spec §2.10). A dead process's record is reclaimed on its handles and
+// attachment alone, and a refund owed to it must not reach the record's next
 // occupant.
 //
 // The Thread, Event, Waiter, Interrupt and Timer sweeps in `end_process` remain
@@ -711,7 +714,7 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
 
 /// Reap every Memory, IoMemory, exchange and Pipe connection that nothing
 /// names, and disown every one still charged to dying process `p`. It also
-/// reclaims every `Gone` process slot other than `p`'s that nothing names.
+/// reclaims every `Gone` process record that nothing names.
 /// Called by `end_process` after the close-all and the attachment sweep, so
 /// both kinds of reference `p` held on another process are already counted.
 ///
@@ -720,9 +723,10 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
 /// honestly. `exchange_settle` cascades into `free_pipe` itself, so the
 /// connection loop catches connections with no exchanges (the ordinary case).
 ///
-/// `p`'s own slot is skipped: `end_process` reclaims it last, after the
-/// teardown has finished indexing it. Any other `Gone` slot is finished, so
-/// reclaiming it here, a write of `state` alone, cannot disturb the teardown.
+/// `p`'s own record is never reclaimed here: its teardown holds a reference on
+/// it until the teardown ends (`end_process`). Any other `Gone` record is
+/// finished, its teardown having ended, so reclaiming it here cannot disturb
+/// this one.
 ///
 /// Each object is disowned after its own free is tried, so an object the dying
 /// process alone named credits its ledger as on any release. An object freed
@@ -774,8 +778,8 @@ public(package) func reap_unreferenced(p: Int) unsafe {
     }
 
     var q: Int = 0
-    while q < PROCESSES.capacity() {
-        if q != p { reclaim_process_slot(q) }
+    while q < PROCESS_RECORDS.capacity() {
+        reclaim_process_record(q)
         q = q + 1
     }
 }
@@ -849,7 +853,7 @@ public(package) func unref_waitable(kind: WaitableKind, slot: Int) unsafe {
 /// reached through the wait machinery's own enum).
 ///
 /// An attachment can span processes (a supervisor's attachment onto a child's
-/// Process slot), so the dying supervisor's side owes the other side a
+/// Process record), so the dying supervisor's side owes the other side a
 /// decrement, as the close-all does for a handle onto someone else's object.
 /// Same asymmetry and reason as `unref_teardown`: the ledger stays honest and
 /// the per-slab sweeps do the freeing.
@@ -921,10 +925,23 @@ public(package) struct StagedHandles {
 /// straight out of the ring slot, so a short message costs no full-body memset
 /// or copy. Declaration order is the layout, and the assert below pins this
 /// description to `sosabi`'s.
+///
+/// Every byte is a field. The prefix is copied out whole, and compiler padding
+/// between the meta and the handle words would carry whatever the kernel stack
+/// held there into the receiver's memory, so the gap is `pad`, written zero.
 public(package) struct PipeMsgPrefix {
     public(package) meta: PipeMsgMeta,
+    public(package) pad: [UInt8; MSG_META_PAD],
     public(package) handles: [UInt; PIPE_MSG_HANDLES],
 }
+
+/// The bytes between the meta (one length byte and one kind byte per slot) and
+/// the word-aligned handle words: the one count below a word that aligns them.
+static MSG_META_PAD: Int = 3
+
+static_assert((1 + PIPE_MSG_HANDLES + MSG_META_PAD) % sizeof<UInt>() == 0
+              && MSG_META_PAD < sizeof<UInt>(),
+              "the message prefix's pad must be exactly the gap before the handle words")
 
 static_assert(sizeof<PipeMsgPrefix>() == sizeof<PipeMsgRecord>() - PIPE_BODY_BYTES,
               "the kernel's message prefix must be exactly the record sosabi publishes, less its body")
@@ -944,6 +961,7 @@ static_assert(sizeof<PipeTakePrefix>() == sizeof<PipeTakeRecord>() - PIPE_BODY_B
 public(package) func msg_prefix(len: UInt, moved: &StagedHandles) -> PipeMsgPrefix {
     var rec = PipeMsgPrefix(meta: PipeMsgMeta(len: len as UInt8,
                                               kinds: [0; PIPE_MSG_HANDLES]),
+                            pad: [0; MSG_META_PAD],
                             handles: [NO_HANDLE; PIPE_MSG_HANDLES])
     var i: Int = 0
     while i < PIPE_MSG_HANDLES {
@@ -1220,11 +1238,16 @@ public(package) func pipe_drop_staged(c: Int) unsafe {
 /// is not a field: it is a separate copy at `wait_prefix_bytes()` into the same
 /// caller buffer, out of the ring slot it already lives in, so the copy is
 /// sized to the delivery and not to the record.
+///
+/// Every byte is a field, for `PipeMsgPrefix`'s reason: the gap between the
+/// meta and the handle words is `pad`, written zero, rather than compiler
+/// padding carrying stale kernel stack out.
 struct WaitPrefix {
     key: UInt,
     tag: UInt,
     payload: UInt,
     meta: PipeMsgMeta,
+    pad: [UInt8; MSG_META_PAD],
     handles: [UInt; WAIT_HANDLE_SLOTS],
 }
 
@@ -1393,6 +1416,7 @@ public(package) func deliver_attachment(p: Int, dst: UInt, a: Int) unsafe -> Sos
                          payload: answer.payload,
                          meta: PipeMsgMeta(len: answer.body_len as UInt8,
                                            kinds: [0; PIPE_MSG_HANDLES]),
+                         pad: [0; MSG_META_PAD],
                          handles: [NO_HANDLE; WAIT_HANDLE_SLOTS])
 
     if reply_carries_handles(kind, &answer) {
@@ -1463,6 +1487,7 @@ func deliver_take(p: Int, dst: UInt, key: UInt, waiter: Int, a: Int, c: Int,
                          payload: OutletLevel.Msg as UInt,
                          meta: PipeMsgMeta(len: EXCHANGES[x].len as UInt8,
                                            kinds: [0; PIPE_MSG_HANDLES]),
+                         pad: [0; MSG_META_PAD],
                          handles: [NO_HANDLE; WAIT_HANDLE_SLOTS])
     rec.handles[WAIT_REQUEST_SLOT] = request
     var i: Int = 0

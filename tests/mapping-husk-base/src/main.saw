@@ -1,0 +1,194 @@
+// A Mapping whose target died is a husk, and a husk names no process: neither
+// a new child in the dead one's body nor a new child in its record is reachable
+// through it.
+//
+// Root first runs a child to its death and keeps it (record 1, body 1), so the
+// records and the bodies of what follows differ. Then:
+//
+//   - the mapped child: created (record 2, body 1), a page mapped into it, run
+//     to its death and kept. Its body goes back; its Mapping is the husk.
+//   - the second child: created into the freed body (record 3, body 1), never
+//     started, with a page of its own mapped at the row index the husk's row
+//     had. Its create zeroes body 1's stats row.
+//   - the mapped child's counters, read through the handle root kept. A dead
+//     process's counters are the copy its teardown left in its record, so this
+//     answers its one syscall; a kernel that left the record linked to body 1
+//     would read the second child's zeroed row.
+//   - the reused record: root releases the mapped child, whose record goes
+//     back, and runs a third child, which takes record 2. Its teardown sweeps
+//     the Mappings naming record 2, and the kernel stops on a husk still naming
+//     it, so this child's ordinary death is the proof the husk was disowned.
+//   - `Base` on the husk, the `BadState` fault of root, before any address.
+//
+//   SOS: process fault: bad handle process=1      <- the held child
+//   SOS huskbase: mapped into the first child
+//   SOS: process fault: bad handle process=2
+//   SOS huskbase: mapped into the second child
+//   SOS huskbase: the first child's counters syscalls=1 faults=0
+//   SOS: process fault: bad handle process=2      <- the third child, record 2
+//   SOS huskbase: the third child is gone
+//   SOS: process fault: object in the wrong state process=0
+//
+// `mapping-husk-unmap` is the same case ending in `Unmap`; each op ends root,
+// so each needs its own run.
+
+import sos.{System, Process, Memory, Mapping, MapAccess, Waiter, AttachMode}
+
+static EXIT_FAILED: UInt = 1
+
+static CHUNK: UInt = 0x1000
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+static KEY: UInt = 57
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS huskbase: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // Rows: the child's image, the RAM it runs in, then the pool the mapped
+    // pages are cut from. Every child is loaded from the same image into the
+    // same RAM; only the last one created ever runs from it.
+    var image = try proc.boot_handle_next() catch {
+        print("SOS huskbase: no image region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var dest = try proc.boot_handle_next() catch {
+        print("SOS huskbase: no destination region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var pool_record = try proc.boot_handle_next() catch {
+        print("SOS huskbase: no pool region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let image_mem = image.take_memory() else {
+        let _ = system.debug_print("SOS huskbase: image record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest_mem = dest.take_memory() else {
+        let _ = system.debug_print("SOS huskbase: dest record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let pool = pool_record.take_memory() else {
+        let _ = system.debug_print("SOS huskbase: pool record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let waiter = try proc.waiter_create() catch {
+        print("SOS huskbase: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // The held dead child: record 1, so the mapped child is record 2 in body 1.
+    let held = try system.process_create(image: &image_mem,
+                                         memory: &dest_mem) catch {
+        print("SOS huskbase: held create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    if not run_to_death(&waiter, &held) {
+        let _ = system.debug_print("SOS huskbase: the held child did not die\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let first = try system.process_create(image: &image_mem,
+                                          memory: &dest_mem) catch {
+        print("SOS huskbase: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let page = try pool.split(len: CHUNK) catch {
+        print("SOS huskbase: split failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let husk = try first.map(memory: &page, access: RW) catch {
+        print("SOS huskbase: map failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS huskbase: mapped into the first child\n")
+    if not run_to_death(&waiter, &first) {
+        let _ = system.debug_print("SOS huskbase: the first child did not die\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // Never started, so it stays exactly as created.
+    let second = try system.process_create(image: &image_mem,
+                                           memory: &dest_mem) catch {
+        print("SOS huskbase: second create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let other = try pool.split(len: CHUNK) catch {
+        print("SOS huskbase: second split failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let live = try second.map(memory: &other, access: RW) catch {
+        print("SOS huskbase: second map failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS huskbase: mapped into the second child\n")
+
+    let counters = try first.stats() catch {
+        print("SOS huskbase: stats failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS huskbase: the first child's counters syscalls={} faults={}\n",
+          counters.syscalls, counters.faults)
+
+    // The mapped child's record goes back; the third child takes it.
+    let _ = move first
+    let third = try system.process_create(image: &image_mem,
+                                          memory: &dest_mem) catch {
+        print("SOS huskbase: third create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    if not run_to_death(&waiter, &third) {
+        let _ = system.debug_print("SOS huskbase: the third child did not die\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS huskbase: the third child is gone\n")
+
+    // This call does not come back.
+    let at = try husk.base() catch {
+        print("SOS huskbase: the husk answered {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS huskbase: the husk answered an address {}\n", at)
+    let _ = move live
+    let _ = move second
+    let _ = move held
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+/// Start `child` with no handles and wait for its death. It dies on its first
+/// syscall.
+func run_to_death(waiter: &Waiter, child: &Process) -> Bool {
+    try waiter.add(process: &child, key: KEY, mode: AttachMode.OneShot) catch {
+        return false
+    }
+    try child.start() catch { return false }
+    try waiter.wait() catch { return false }
+    true
+}

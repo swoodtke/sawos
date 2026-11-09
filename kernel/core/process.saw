@@ -8,12 +8,16 @@
 //! buffer as a `FaultReason` instead of terminating, and the callers above the
 //! scheduler terminate on it. See `sched.saw`'s header.
 //!
-//! This module holds what acts on a process: the protection domain each slot
-//! records, the copy doors, and `start_process`. The slot record and the
-//! `PROCESSES` table are in `kcore.pslot`, below `kcore.objects`, whose handle
-//! functions index it. `alloc_process` and `process_slots_usable` stay here
-//! because allocating a slot is an action and it is where the domain-pool limit
-//! is applied.
+//! This module holds what acts on a process: the protection domain each body
+//! records, the copy doors, and `start_process`. The record and body tables are
+//! in `kcore.pslot`, below `kcore.objects`, whose handle functions index them.
+//! `alloc_process`, `link_process` and `process_slots_usable` stay here because
+//! taking a record and a body is an action and it is where the domain-pool
+//! limit is applied.
+//!
+//! Every `p` here is a process number, a record's index. The grant record and
+//! the windows are the body's, reached through `body_of(p)`, and the HAL's
+//! domain number is the body's index.
 
 import hal
 import sosabi.{
@@ -33,9 +37,11 @@ import kcore.limits.{
     MAX_GRANT_ROWS,
     MAX_IOMEMORIES,
     MAX_MEMORIES,
+    NO_BODY,
     NO_IOMEMORY,
     NO_MEMORY,
     NO_PROCESS,
+    ROOT_BODY,
     ROOT_PROCESS,
 }
 import kcore.mem.{align_up, copy_bytes, word_bytes}
@@ -44,8 +50,11 @@ import kcore.stats.{stats_clear}
 import kcore.pslot.{
     GrantRow,
     PROCESSES,
+    PROCESS_RECORDS,
     ProcessState,
     QuotaKind,
+    body_of,
+    link_body,
 }
 import kcore.objects.{
     IOMEMORIES,
@@ -75,27 +84,30 @@ import kcore.threads.{
     frame_slot,
 }
 
-// `ProcessState`, `GrantRow`, `ProcessSlot` and `PROCESSES` are declared in
-// `kcore.pslot`. The record holds every storage keyed by a process index, so it
-// must sit below `kcore.objects`, whose functions index it. Everything that
-// acts on a process stays here: the grant record, `translate_user`, the copy
-// doors, `load_domain`, `clear_domain` and `start_process`.
+// `ProcessState`, `GrantRow`, `ProcessRecord`, `ProcessBody` and their tables
+// are declared in `kcore.pslot`. They hold every storage keyed by a process
+// index, so they must sit below `kcore.objects`, whose functions index them.
+// Everything that acts on a process stays here: the grant record,
+// `translate_user`, the copy doors, `load_domain`, `clear_domain` and
+// `start_process`.
 
 
-/// How many process slots this machine can actually run: the slab's capacity,
-/// capped by the protection domains the tier has to put them in.
+/// How many process bodies this machine can actually run: the body slab's
+/// capacity, capped by the protection domains the tier has to put them in.
 ///
 /// Donation raises `PROCESSES.capacity()` past the compiled floor, but a tier
 /// that keeps a persistent per-process table set draws it from a static pool
 /// that donation does not reach. `hal.PROT_DOMAIN_SLOTS` is that pool's size
-/// (every profile publishes it). Taking the smaller of the two means the scan
-/// never reaches a slot with no domain behind it, so a create past the limit is
-/// the `NoResource` a full table already answers. The caller cannot know the
-/// number, which is what a status is for as against a fault.
+/// (every profile publishes it), and a body's index is its domain's number.
+/// Taking the smaller of the two means the scan never reaches a body with no
+/// domain behind it, so a create past the limit is the `NoResource` a full
+/// table already answers. The caller cannot know the number, which is what a
+/// status is for as against a fault.
 ///
 /// `kcore.limits`' `static_assert(MAX_PROCESSES <= hal.PROT_DOMAIN_SLOTS)`
 /// binds only the floor (extent 0 must fit the pool); this function enforces
-/// the limit above the floor at run time.
+/// the limit above the floor at run time. Records have no domain, so their
+/// table is bounded by its capacity alone.
 public(package) func process_slots_usable() unsafe -> Int {
     let held = PROCESSES.capacity()
     if held > hal.PROT_DOMAIN_SLOTS {
@@ -104,65 +116,113 @@ public(package) func process_slots_usable() unsafe -> Int {
     held
 }
 
-/// Take a free process slot, or `NO_PROCESS` when the table is full.
+/// Find a free record and a free body for a create: `(record, body)`, or
+/// `NO_PROCESS` as the record when either table is full.
 ///
-/// The scan is bounded by `process_slots_usable`, not `MAX_PROCESSES`, so a
-/// donated slot is visible and the domain-pool limit is respected. The walk is
-/// bounded and its body O(1).
+/// A pure scan that reserves neither, so a create refused after it leaks
+/// nothing, and a find of one without the other takes neither. The create
+/// takes both with `link_process` once every refusal is behind it. The record
+/// scan is bounded by the record slab's capacity and the body scan by
+/// `process_slots_usable`, so donated entries of either are visible and the
+/// domain-pool limit is respected. Both walks are bounded and their bodies
+/// O(1).
 ///
-/// `Gone` is not `Free`: a dead slot is spent again only when nothing can read
-/// it. Teardown leaves the slot holding its status word (spec §8) because the
-/// creator's handle onto it outlives it, and `reclaim_process_slot` frees the
-/// slot once the last such handle is gone. So `MAX_PROCESSES` bounds concurrent
-/// processes, and a request past it is `NoResource`.
+/// `Gone` is not `Free`: a dead record is spent again only when nothing can
+/// read it. The teardown leaves the record holding its status word (spec §8)
+/// because the creator's handle onto it outlives it, and
+/// `reclaim_process_record` frees it once the last such reference is gone. The
+/// body is free from the teardown on. So `MAX_PROCESSES` bounds concurrent
+/// processes and the record table bounds those plus the dead still held, and a
+/// request past either is `NoResource`.
 ///
 /// `ThreadState.Exited` is not reclaimed this way: a join after the exit must
 /// still find the exit code, no handle names a thread slot the way one names a
-/// process slot, and thread slots come back at the process's teardown.
-public(package) func alloc_process() unsafe -> Int {
-    let usable = process_slots_usable()
-    var i: Int = 0
-    while i < usable {
-        match PROCESSES[i].state {
-            case Free -> { return i },
+/// process record, and thread slots come back at the process's teardown.
+public(package) func alloc_process() unsafe -> (Int, Int) {
+    let record = free_record()
+    let body = free_body()
+    if record == NO_PROCESS || body == NO_BODY {
+        return (NO_PROCESS, NO_BODY)
+    }
+    (record, body)
+}
+
+/// The lowest free record, or `NO_PROCESS`.
+func free_record() unsafe -> Int {
+    var r: Int = 0
+    while r < PROCESS_RECORDS.capacity() {
+        match PROCESS_RECORDS[r].state {
+            case Free -> { return r },
             case _ -> {},
         }
-        i = i + 1
+        r = r + 1
     }
     NO_PROCESS
 }
 
-/// Free a `Gone` process's slot if no handle anywhere still names it.
+/// The lowest free body this machine can run, or `NO_BODY`.
+func free_body() unsafe -> Int {
+    let usable = process_slots_usable()
+    var b: Int = 0
+    while b < usable {
+        if not PROCESSES[b].live {
+            return b
+        }
+        b = b + 1
+    }
+    NO_BODY
+}
+
+/// Give record `p` body `b`, both found free by `alloc_process`. From here on
+/// `body_of(p)` answers `b`, until the teardown frees it.
+public(package) func link_process(p: Int, b: Int) unsafe {
+    link_body(p, b)
+    PROCESSES[b].live = true
+}
+
+/// Give root its record and its body, the first of each table.
 ///
-/// A `Gone` slot holds only its status word (spec §8), and the only way to read
-/// it is `GetStatus` through a Process handle, so `ProcessSlot.refs == 0` means
-/// no possible reader and the slot may go. It runs when a live process releases
-/// the last reference to a Process (`free_object`'s Process arm), for every
-/// other slot at the end of `reap_unreferenced` (a dying process held the last
-/// reference), and for the dying process's own slot at the end of its
-/// teardown.
+/// Root is not created through `alloc_process`: the kernel loads exactly one
+/// image (spec §12), and the boot door places it before anything else runs, so
+/// the two are known. The loader calls this before it records root's grant
+/// rows and `start_process` calls it again for the harness kernels that enter
+/// user mode without the loader; linking twice writes the same two fields.
+public(package) func claim_root() unsafe {
+    link_process(ROOT_PROCESS, ROOT_BODY)
+}
+
+/// Free a `Gone` process's record if nothing anywhere still names it.
+///
+/// A `Gone` record holds its status word and final counters (spec §8), and the
+/// only ways to read them are `GetStatus` and `Stats` through a Process handle
+/// and an attachment on one, so `ProcessRecord.refs == 0` means no possible
+/// reader and the record may go. It runs when a live process releases the last
+/// reference to a Process (`free_object`'s Process arm), for every record at
+/// the end of `reap_unreferenced` (a dying process held the last reference; the
+/// dying process's own record is refused there, its teardown still holding a
+/// reference), and at the end of the dying process's own teardown, when it
+/// drops the reference that teardown holds on its own record.
 ///
 /// `refs` counts Process handles bound in every process's table, not just the
 /// caller's. A process's own teardown closes its handles first, so if it held
-/// the last one on its own slot (it released its creator's handle, or it refers
-/// to itself) that close is what takes the count to zero.
+/// the last one on its own record (it released its creator's handle, or it
+/// refers to itself) that close leaves only the teardown's own reference.
 ///
-/// Handle generations make the reused slot safe: a later process landing here
-/// gets a new life, and a word onto the old one no longer matches.
-/// `clear_domain` has already invalidated `LAST_PROT_PROCESS` for the same
-/// reuse.
+/// The body is already free: the teardown gave it back. Handle generations make
+/// the reused record safe, since a word naming the old life is released or
+/// stale, and the teardown's disown leaves no field naming it (spec §2.10).
 ///
-/// A live process is never reclaimed however far its count falls: its slot is
-/// what it is running in.
-public(package) func reclaim_process_slot(slot: Int) unsafe {
-    match PROCESSES[slot].state {
+/// A live process is never reclaimed however far its count falls: its record
+/// is what it is running as.
+public(package) func reclaim_process_record(p: Int) unsafe {
+    match PROCESS_RECORDS[p].state {
         case Gone -> {},
         case _ -> { return },
     }
-    if PROCESSES[slot].refs != 0 {
+    if PROCESS_RECORDS[p].refs != 0 {
         return
     }
-    PROCESSES[slot].state = ProcessState.Free
+    PROCESS_RECORDS[p].state = ProcessState.Free
 }
 
 // -----------------------------------------------------------------------------
@@ -193,15 +253,16 @@ public(package) func reclaim_process_slot(slot: Int) unsafe {
 public(package) func record_grant(p: Int, base: UInt, top: UInt, pa: UInt,
                                   perms: UInt8,
                                   device: Bool, region: Int) unsafe {
-    if PROCESSES[p].grant_count >= MAX_GRANT_ROWS {
+    let b = body_of(p)
+    if PROCESSES[b].grant_count >= MAX_GRANT_ROWS {
         fatal_image("more grants than a process's record can hold",
-                    PROCESSES[p].grant_count as UInt)
+                    PROCESSES[b].grant_count as UInt)
     }
-    let n = PROCESSES[p].grant_count
-    PROCESSES[p].grants[n] = GrantRow(base: base, top: top, pa: pa,
+    let n = PROCESSES[b].grant_count
+    PROCESSES[b].grants[n] = GrantRow(base: base, top: top, pa: pa,
                                       perms: perms, device: device,
                                       region: region)
-    PROCESSES[p].grant_count = n + 1
+    PROCESSES[b].grant_count = n + 1
     ref_region_row(region)
     // The hardware learns here, on a tier that keeps a standing image. This is
     // the single funnel every grant row is appended through (the loader's at
@@ -216,7 +277,7 @@ public(package) func record_grant(p: Int, base: UInt, top: UInt, pa: UInt,
     // readable or executable, and `map_access` refuses a row that permits
     // nothing), which leaves zero free to mean the revocation in
     // `remove_grant`.
-    hal.prot_update(p as UInt, base, top, pa, perms, device)
+    hal.prot_update(b as UInt, base, top, pa, perms, device)
 }
 
 /// Where the next mapping of `len` bytes goes in `p`'s address space: the
@@ -242,9 +303,10 @@ public(package) func record_grant(p: Int, base: UInt, top: UInt, pa: UInt,
 /// `hal.map_target_ok` about the returned range, the one place a refusal has
 /// somewhere to go.
 public(package) func free_user_va(p: Int, len: UInt) unsafe -> UInt {
-    var va = PROCESSES[p].region_top
+    let b = body_of(p)
+    var va = PROCESSES[b].region_top
     var pass: Int = 0
-    while pass <= PROCESSES[p].grant_count {
+    while pass <= PROCESSES[b].grant_count {
         // Checked before the addition that computes the candidate's top:
         // overflow checks are always on, so a length that would run off the end
         // of the address space must become a refusal upstairs (`install_row`'s
@@ -254,8 +316,8 @@ public(package) func free_user_va(p: Int, len: UInt) unsafe -> UInt {
         }
         var bumped = false
         var i: Int = 0
-        while i < PROCESSES[p].grant_count {
-            let row = PROCESSES[p].grants[i]
+        while i < PROCESSES[b].grant_count {
+            let row = PROCESSES[b].grants[i]
             if not row.device && va < row.top && row.base < va + len {
                 va = align_up(row.top, hal.PROT_GRAIN)
                 bumped = true
@@ -289,9 +351,10 @@ public(package) func free_user_va(p: Int, len: UInt) unsafe -> UInt {
 /// because the process handed the kernel an address it does not own.
 public(package) func translate_user(p: Int, va: UInt,
                                     bytes: UInt) unsafe -> Result<UInt, FaultReason> {
+    let b = body_of(p)
     var i: Int = 0
-    while i < PROCESSES[p].grant_count {
-        let row = PROCESSES[p].grants[i]
+    while i < PROCESSES[b].grant_count {
+        let row = PROCESSES[b].grants[i]
         if not row.device && va >= row.base && va < row.top {
             // Ordered so the subtraction cannot underflow: `row.top - va` is
             // computed only once `va` is known to be inside the row.
@@ -322,11 +385,12 @@ public(package) func translate_user(p: Int, va: UInt,
 /// No preemption point: a half-rewritten grant table is an in-flight invariant,
 /// and the staged sequence is one edit published by `prot_commit`.
 public(package) func load_domain(p: Int) unsafe {
+    let b = body_of(p)
     if hal.prot_replay_at_switch() {
         hal.prot_reset()
         var i: Int = 0
-        while i < PROCESSES[p].grant_count {
-            let row = PROCESSES[p].grants[i]
+        while i < PROCESSES[b].grant_count {
+            let row = PROCESSES[b].grants[i]
             // The replay programs the physical range. A replay tier filters
             // addresses the processor actually issues, where a user address is
             // its physical address, so `row.pa` and `row.base` are equal here
@@ -341,7 +405,7 @@ public(package) func load_domain(p: Int) unsafe {
         }
         hal.prot_commit()
     }
-    hal.prot_switch(p as UInt)
+    hal.prot_switch(b as UInt)
     LAST_PROT_PROCESS = p
 }
 
@@ -368,7 +432,8 @@ public(package) func remove_grant(p: Int, row: Int) unsafe {
     // Read once, and both consumers see that read: the hardware revoke (issued
     // first, here) and `region` (dropped last, below). The compaction is about
     // to move this storage.
-    let gone = PROCESSES[p].grants[row]
+    let b = body_of(p)
+    let gone = PROCESSES[b].grants[row]
     // Revoked from the hardware before the range can move. Removing the row
     // from the record suffices where the hardware image is rebuilt from the
     // record at the next switch; where the tables persist, the record no longer
@@ -382,17 +447,17 @@ public(package) func remove_grant(p: Int, row: Int) unsafe {
     // still mapped and simply denied to user mode, so removal is the
     // installation of deny. Zero is free to say so because neither door records
     // a row that permits nothing.
-    hal.prot_update(p as UInt, gone.base, gone.top, gone.pa, 0, gone.device)
+    hal.prot_update(b as UInt, gone.base, gone.top, gone.pa, 0, gone.device)
     var i = row
-    while i + 1 < PROCESSES[p].grant_count {
-        PROCESSES[p].grants[i] = PROCESSES[p].grants[i + 1]
+    while i + 1 < PROCESSES[b].grant_count {
+        PROCESSES[b].grants[i] = PROCESSES[b].grants[i + 1]
         i = i + 1
     }
-    PROCESSES[p].grant_count = PROCESSES[p].grant_count - 1
+    PROCESSES[b].grant_count = PROCESSES[b].grant_count - 1
     unref_region_row(gone.region)
 }
 
-/// The live-domain rule: any edit to `PROCESSES[p]`'s grant record reloads
+/// The live-domain rule: any edit to process `p`'s grant record reloads
 /// immediately when `p`'s domain is the one in the hardware.
 ///
 /// This is required because `run_thread` skips equal domains: the scheduler
@@ -409,14 +474,16 @@ public(package) func domain_changed(p: Int) unsafe {
     }
 }
 
-/// Forget process `p`'s domain and its rows. Called by the teardown.
+/// Forget process `p`'s domain and its rows. Called by the teardown, just
+/// before it frees the body.
 ///
-/// Invalidating `LAST_PROT_PROCESS` is required: a dead slot is reclaimed as
-/// soon as no handle names it, so a new process can land in this slot, compare
-/// equal to a domain that is no longer installed, and run under the dead one's
-/// map because the next switch skips the reload. This is separate from handle
-/// generations: a generation stops a stale handle from naming the new occupant,
-/// and this stops a stale protection domain from staying installed for it.
+/// Invalidating `LAST_PROT_PROCESS` is required: the body goes back at the end
+/// of the teardown and the record once nothing names it, so a new process can
+/// take either, compare equal to a domain that is no longer installed, and run
+/// under the dead one's map because the next switch skips the reload. This is
+/// separate from handle generations: a generation stops a stale handle from
+/// naming the new occupant, and this stops a stale protection domain from
+/// staying installed for it.
 ///
 /// Every row this record holds is a reference on a region, so dropping the
 /// record drops them all. A region whose last row goes here, with its handles
@@ -428,23 +495,24 @@ public(package) func domain_changed(p: Int) unsafe {
 /// rows before any range can move. The row data is left in place and
 /// overwritten by the next grant.
 public(package) func clear_domain(p: Int) unsafe {
-    let rows = PROCESSES[p].grant_count
-    PROCESSES[p].grant_count = 0
+    let b = body_of(p)
+    let rows = PROCESSES[b].grant_count
+    PROCESSES[b].grant_count = 0
     // The standing image goes with the record, before the walk below can return
     // a range to its pool (the same composition as `remove_grant`). Zeroing the
     // count stops a replay tier from granting these bytes again; this call
     // stops a persistent-table tier, and the free list is reachable from the
     // next line, so the order is a contract.
     //
-    // The slot, and so the address-space identifier the tables are tagged with,
+    // The body, and so the address-space identifier the tables are tagged with,
     // becomes reusable here, so the identifier's cached translations are
     // dropped. Invalidating `LAST_PROT_PROCESS` below is not enough: it only
     // forces the next switch to reprogram, which a persistent-table tier no
     // longer does.
-    hal.prot_clear(p as UInt)
+    hal.prot_clear(b as UInt)
     var i: Int = 0
     while i < rows {
-        unref_region_row(PROCESSES[p].grants[i].region)
+        unref_region_row(PROCESSES[b].grants[i].region)
         i = i + 1
     }
     if LAST_PROT_PROCESS == p {
@@ -494,16 +562,17 @@ public(package) func copy_out_check(p: Int, dst: UInt, bytes: UInt) unsafe -> Fa
     if (dst % word_bytes()) != 0 {
         return FaultReason.BadAlign
     }
-    if dst < PROCESSES[p].rw_base {
+    let b = body_of(p)
+    if dst < PROCESSES[b].rw_base {
         return FaultReason.BadBuffer
     }
     // Ordered so the subtraction below cannot underflow: `rw_top - dst` is only
     // computed once `dst` is known to be inside the window. A hostile length
     // must produce a diagnostic, not a panic.
-    if dst >= PROCESSES[p].rw_top {
+    if dst >= PROCESSES[b].rw_top {
         return FaultReason.BadBuffer
     }
-    if bytes > PROCESSES[p].rw_top - dst {
+    if bytes > PROCESSES[b].rw_top - dst {
         return FaultReason.BadBuffer
     }
     // The address must also resolve. The window above is conservative (it
@@ -578,16 +647,17 @@ public(package) func copy_in_check(p: Int, src: UInt, bytes: UInt) unsafe -> Fau
     if (src % word_bytes()) != 0 {
         return FaultReason.BadAlign
     }
-    if src < PROCESSES[p].region_base {
+    let b = body_of(p)
+    if src < PROCESSES[b].region_base {
         return FaultReason.BadBuffer
     }
     // Ordered so the subtraction below cannot underflow: `region_top - src` is
     // computed only once `src` is known to be inside the region. A hostile
     // length must produce a diagnostic, not a panic.
-    if src >= PROCESSES[p].region_top {
+    if src >= PROCESSES[b].region_top {
         return FaultReason.BadBuffer
     }
-    if bytes > PROCESSES[p].region_top - src {
+    if bytes > PROCESSES[b].region_top - src {
         return FaultReason.BadBuffer
     }
     // The address must also resolve, as in `copy_out_check`.
@@ -887,9 +957,9 @@ func fits_word(v: UInt64) -> Bool {
 /// come through here: `ProcessOp.Start` makes a thread and lets the scheduler
 /// pick it up.
 ///
-/// `p = ROOT_PROCESS`: the kernel loads exactly one image (spec §12), it lands
-/// in slot 0, and every later process is created by root through
-/// `process_create`.
+/// `p = ROOT_PROCESS`: the kernel loads exactly one image (spec §12), it takes
+/// the first record and the first body (`claim_root`), and every later process
+/// is created by root through `process_create`.
 ///
 /// The three handles are minted in an order the boot ABI depends on: System
 /// first, so it comes out as `ROOT_SYSTEM_HANDLE`, the register the program
@@ -906,34 +976,38 @@ public func start_process(entry: UInt, stack_top: UInt,
                           region_base: UInt, region_top: UInt,
                           rw_base: UInt = 0, rw_top: UInt = 0) unsafe -> Never {
     let p: Int = ROOT_PROCESS
+    claim_root()
+    let b = body_of(p)
 
-    // Field by field rather than a whole-slot literal: the loader has already
-    // recorded root's grant rows, and a struct literal would erase them.
-    PROCESSES[p].state = ProcessState.Running
-    PROCESSES[p].entry = entry
-    PROCESSES[p].stack_top = stack_top
-    PROCESSES[p].region_base = region_base
-    PROCESSES[p].region_top = region_top
-    PROCESSES[p].rw_base = rw_base
-    PROCESSES[p].rw_top = rw_top
-    PROCESSES[p].exit_kind = ProcessStatusKind.Running
-    PROCESSES[p].exit_code = 0
-    PROCESSES[p].refs = 0
+    // Field by field rather than a whole-entry literal: the loader has already
+    // recorded root's grant rows in the body, and a struct literal would erase
+    // them.
+    PROCESS_RECORDS[p].state = ProcessState.Running
+    PROCESS_RECORDS[p].exit_kind = ProcessStatusKind.Running
+    PROCESS_RECORDS[p].exit_code = 0
+    PROCESS_RECORDS[p].refs = 0
+    PROCESSES[b].entry = entry
+    PROCESSES[b].stack_top = stack_top
+    PROCESSES[b].region_base = region_base
+    PROCESSES[b].region_top = region_top
+    PROCESSES[b].rw_base = rw_base
+    PROCESSES[b].rw_top = rw_top
     // The trap columns open at zero. Root is reified here rather than through
-    // `process_create`, so its row of the stats region is cleared here.
+    // `process_create`, so its body's row of the stats region is cleared here.
     // Boot-door traps a harness kernel takes before this line are unattributed
-    // by `ktrap`, so nothing has been counted against slot 0 yet.
-    stats_clear(p)
+    // by `ktrap`, so nothing has been counted against root's row yet.
+    stats_clear(b)
 
     // The ledger opens before the first mint, because `mint_handle` consults
-    // the handle row and a slot with no limits installed can allocate nothing.
-    // Root's rows are `QUOTA_UNLIMITED` (root is init and the slab is what
-    // refuses it) except the mapping row, which is clamped to the rows root's
-    // domain still has after the loader spent its image's. That is what makes
-    // `install_row`'s kernel-bug `fatal` unreachable. The loader has already
-    // recorded root's grant rows, so the free-row count can be read here.
+    // the handle row and a record with no limits installed can allocate
+    // nothing. Root's rows are `QUOTA_UNLIMITED` (root is init and the slab is
+    // what refuses it) except the mapping row, which is clamped to the rows
+    // root's domain still has after the loader spent its image's. That is what
+    // makes `install_row`'s kernel-bug `fatal` unreachable. The loader has
+    // already recorded root's grant rows, so the free-row count can be read
+    // here.
     install_quota_limits(p, true,
-                         (hal.GRANT_ROW_BUDGET as Int) - PROCESSES[p].grant_count)
+                         (hal.GRANT_ROW_BUDGET as Int) - PROCESSES[b].grant_count)
 
     // Spec §12's order is the contract: the three are minted into a virgin
     // table, so each lands at generation 0 and its word is the bare index (1 =
@@ -943,10 +1017,9 @@ public func start_process(entry: UInt, stack_top: UInt,
     // own), so neither is bound to a name.
     let system = mint_handle(p, ObjType.System, root_system_rights(), 0)
     let _ = mint_handle(p, ObjType.Process, process_rights(), p)
-    // Root's own Process handle is a reference to root's slot, counted like any
-    // other. It makes root's count start at one, and the teardown's check reads
-    // it back.
-    PROCESSES[p].refs = PROCESSES[p].refs + 1
+    // Root's own Process handle is a reference to root's record, counted like
+    // any other. It makes root's count start at one.
+    PROCESS_RECORDS[p].refs = PROCESS_RECORDS[p].refs + 1
 
     let main = alloc_thread()
     let _ = mint_handle(p, ObjType.Thread, thread_rights(), main)

@@ -1,35 +1,46 @@
-// A dead process's slot is reclaimed when the last reference to it is dropped
-// by another process's teardown.
+// A dead process's record is reclaimed when the last reference to it is
+// dropped by another process's teardown.
 //
-// A `Gone` slot is freed once nothing names it. Usually the last reference is
+// A `Gone` record is freed once nothing names it. Usually the last reference is
 // released by a live process, but a supervisor can die holding it. This case
-// launches a supervisor (`child-supervisor`) twice. Each supervisor creates a
-// grandchild that faults at once, waits for its death and then exits, naming
-// the dead slot in exactly one way:
+// launches a supervisor (`child-supervisor`) three times. Each supervisor
+// creates a grandchild that faults at once, waits for its death and then
+// exits, naming the dead record in exactly one way:
 //
-//   first    the supervisor's Process handle is the slot's last reference
-//   second   the supervisor's attachment is the slot's last reference
+//   first    the supervisor's Process handle is the record's last reference
+//   second   the supervisor's attachment is the record's last reference
+//   third    the handle again, to see where the second grandchild's record went
 //
-// The table holds three processes (`MAX_PROCESSES`): root, the supervisor and
-// the grandchild. Root drops its handle to each supervisor after it dies, so
-// a leaked grandchild slot shows as the next supervisor's `process_create`
-// being refused, and as a last count of spare slots below two.
+// Root first runs two children of its own to their death and keeps them, so
+// records 1 and 2 are held for the whole case and every grandchild's record
+// lies past the body table's floor (`MAX_PROCESSES`): a reclaim that scanned
+// only as far as the body table would never reach it. Root drops its handle to
+// each supervisor after it dies, so each supervisor takes record 3 and its
+// grandchild the lowest free record after it. A grandchild's record that its
+// supervisor's teardown failed to reclaim pushes the next grandchild to
+// record 5, and the kernel's fault line for every grandchild names the record
+// it got:
 //
-// Expected transcript:
-//
-//   SOS gonereclaim: handle status=65596       <- Exited << 16 | 60
-//   SOS gonereclaim: attachment status=65597   <- Exited << 16 | 61
+//   SOS: process fault: bad handle process=1      <- root's two held children
+//   SOS: process fault: bad handle process=2
+//   SOS: process fault: bad handle process=4      <- each grandchild, in turn
+//   SOS gonereclaim: handle status=65596          <- Exited << 16 | 60
+//   SOS: process fault: bad handle process=4
+//   SOS gonereclaim: attachment status=65597      <- Exited << 16 | 61
+//   SOS: process fault: bad handle process=4
+//   SOS gonereclaim: again status=65596
 //   SOS gonereclaim: spare=2
 //   SOS gonereclaim: done
 //
 // A supervisor that could not make its grandchild ends with a code of 90 or
-// more instead, and `spare=` reads one.
+// more instead.
 //
-// `spare=` counts the unstarted processes root can create and hold at once.
-// They are held, not dropped: a slot that never ran is not `Gone`, and nothing
-// reclaims it.
+// `spare=` counts the unstarted processes root can create and hold at once:
+// the body table less root's, so it says no body leaked. They are held, not
+// dropped: a process that never ran is not `Gone`, and nothing reclaims it.
 
-import sos.{System, Process, Memory, Waiter, SosStatus, SystemRight}
+import sos.{System, Process, Memory, Waiter, AttachMode, SosStatus,
+            SystemRight}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
@@ -85,15 +96,37 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     guard let sup_ram = sup_ram_rec.take_memory() else { return BUG }
     guard let gc_ram = gc_ram_rec.take_memory() else { return BUG }
 
+    // Records 1 and 2, held dead to the end. They are loaded from the
+    // grandchild's image into its RAM, each dead before the next create.
+    let dead_a = try system.process_create(image: &gc_image, memory: &gc_ram)
+    try run_to_death(&proc, &dead_a)
+    let dead_b = try system.process_create(image: &gc_image, memory: &gc_ram)
+    try run_to_death(&proc, &dead_b)
+
     let held = try supervise(&system, &proc, &sup_image, &sup_ram, &gc_image,
                              &gc_ram, TAG_HOLD)
     print("SOS gonereclaim: handle status={}\n", held)
     let watching = try supervise(&system, &proc, &sup_image, &sup_ram,
                                  &gc_image, &gc_ram, TAG_WATCH)
     print("SOS gonereclaim: attachment status={}\n", watching)
+    let again = try supervise(&system, &proc, &sup_image, &sup_ram, &gc_image,
+                              &gc_ram, TAG_HOLD)
+    print("SOS gonereclaim: again status={}\n", again)
 
     let spare = spare_slots(&system, &gc_image, &gc_ram)
     print("SOS gonereclaim: spare={}\n", spare)
+    let _ = move dead_b
+    let _ = move dead_a
+    return
+}
+
+/// Start `child` with no handles and wait for its death; it dies on its first
+/// syscall.
+func run_to_death(proc: &Process, child: &Process) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_SUPERVISOR, mode: AttachMode.OneShot)
+    try child.start()
+    let _ = try waiter.wait()
     return
 }
 
@@ -101,7 +134,7 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
 /// and release it. Returns its §8 status word.
 ///
 /// Root's handle and its attachment are the supervisor's only references, so
-/// the supervisor's own slot is reclaimed by the release here.
+/// the supervisor's own record is reclaimed by the release here.
 func supervise(system: &System, proc: &Process, image: &Memory, ram: &Memory,
                gc_image: &Memory, gc_ram: &Memory,
                image_tag: UInt) -> Result<UInt, SosStatus> {
@@ -145,7 +178,7 @@ func supervise(system: &System, proc: &Process, image: &Memory, ram: &Memory,
     return status
 }
 
-/// How many processes root can create and hold at once, up to the table's
+/// How many processes root can create and hold at once, up to the body table's
 /// size. Each is held until the whole chain returns.
 func spare_slots(system: &System, image: &Memory, ram: &Memory) -> UInt {
     match system.process_create(image: &image, memory: &ram) {

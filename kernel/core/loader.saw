@@ -14,7 +14,7 @@
 //!
 //! The loader sits below the dispatch: `process_create` is an op, so the phases
 //! must be reachable from `kcore.dispatch`. Nothing here reaches upward;
-//! placement calls the HAL, the movers and the process slot, all of which are
+//! placement calls the HAL, the movers and the process body, all of which are
 //! below.
 
 import hal
@@ -24,7 +24,7 @@ import kcore.diag.{console, fatal_image}
 import kcore.stats.{stats_publish}
 import kcore.preempt.{long_copy, long_zero}
 import kcore.limits.{NO_MEMORY, ROOT_PROCESS}
-import kcore.process.{load_domain, record_grant, start_process}
+import kcore.process.{claim_root, load_domain, record_grant, start_process}
 
 /// What a refused too-high address reports: its top 32 bits. The low half is
 /// what would have survived a narrowing, so it says nothing; the high half is
@@ -512,17 +512,19 @@ public func load_root_and_enter() unsafe {
     uart.write_hex(prio_map)
     uart.write_str("\n")
 
-    // Root's rows are recorded like every other process's. The reload at the
-    // switch is what installs a domain, so a root with no grant record could be
-    // switched away from and never back into. The device-window row is
-    // included, which keeps a driver image's window across a switch.
+    // Root's rows are recorded like every other process's, into its body, so
+    // root takes its record and its body first. The reload at the switch is
+    // what installs a domain, so a root with no grant record could be switched
+    // away from and never back into. The device-window row is included, which
+    // keeps a driver image's window across a switch.
+    claim_root()
     let rw_base = place_image(ROOT_PROCESS, base, &dest, NO_MEMORY)
     load_domain(ROOT_PROCESS)
 
     // Spec §7: root's band map applies verbatim from its image. The scheduler
     // is round-robin over one level, so the kernel parses and reports the map
     // (which proves the Blade-emitted field arrives intact) but does not store
-    // it in the Process slot.
+    // it in the process record.
     //
     // Spec §12: root's boot handle set. The entry register carries exactly one
     // handle, System; everything else the kernel minted for root is collected

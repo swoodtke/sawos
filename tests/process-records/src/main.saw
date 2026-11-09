@@ -1,0 +1,226 @@
+// A dead process holds a record and no body (spec §2.7), so a supervisor that
+// keeps its dead children's handles stops spending bodies on them and spends
+// records instead.
+//
+// Root runs children to their death one at a time and keeps every handle. Each
+// child is `child-fault`, which dies of a bad handle on its first syscall, so
+// its status word and its counters are known before it runs. The transcript
+// reads as a sequence:
+//
+//   SOS records: pass 1 held=N room=1, then out of kernel objects
+//   SOS records: every held child answered status=131073 syscalls=1 faults=0
+//   SOS records: pass 2 held=N room=1, then out of kernel objects
+//   SOS records: done
+//
+// `held=N` is how many dead children root held when a create was refused: the
+// record table less root's own record. The runner asserts the number, so a
+// kernel whose dead processes still held bodies stops at the body table instead
+// and fails the line.
+//
+// `room=1` says the refusal was not root's handle table. Root holds one handle
+// per dead child, so the case keeps only what it needs (its System handle, its
+// Thread handle to yield with, and the two regions) and mints and drops a
+// sibling of its System handle beside the refused create. A table with no room
+// would refuse that mint.
+//
+// The second line is the reading side: every held handle is asked for its
+// status word (`Faulted` (2) << 16 | `BadHandle` (1)) and its counters, and the
+// line is printed only if all of them answered the same.
+//
+// The third line is the reclaim. Every handle was released after the reading,
+// so every record is free again and a second pass holds exactly as many.
+//
+// The case is written at the C floor, on raw words, because it holds more
+// Process handles than it can name: the typed `Process` is `NoCopy` with no
+// word inside it to keep in an array. The `SOS: process fault` and `SOS:
+// process teardown` lines the children produce are not asserted.
+
+import sos.{System, SosStatus, SystemRight, sos_handle_mint, sos_handle_release,
+            sos_process_boot_handle_next, sos_process_get_status,
+            sos_process_start, sos_system_process_create, sos_thread_yield}
+
+// `sos` does not re-export the stats op's floor function by name; the C symbol
+// it exports is the same call.
+extern "C" {
+    func sos_process_stats(handle: UInt, buf: UnsafePointer<UInt64>,
+                           cap: UInt) -> UInt
+}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static STATUS_OK: UInt = 0
+
+/// Root's boot-minted Process and Thread words (spec §12). The Process word
+/// drains the boot set and is then released; the Thread word is what root
+/// yields with while a child runs.
+static BOOT_PROCESS_WORD: UInt = 2
+static BOOT_THREAD_WORD: UInt = 3
+
+/// A boot-handle record: tag, kind, handle word.
+static RECORD_WORDS: Int = 3
+static RECORD_HANDLE_WORD: Int = 2
+
+/// `BootTagForm.Absent`: the child starts with no handle at all.
+static NO_BOOT_TAG: UInt = 0
+
+/// The status word of a process that has not ended (`Running`, code 0).
+static NOT_ENDED: UInt = 0
+
+/// `Faulted` (2) << 16 | `BadHandle` (1): how every child ends.
+static FAULTED_BAD_HANDLE: UInt = 131073
+
+/// What `child-fault` costs: the one syscall that kills it, and no trap of the
+/// fault kind.
+static CHILD_SYSCALLS: UInt64 = 1
+static CHILD_FAULTS: UInt64 = 0
+
+/// The stats record: syscalls, interrupts, faults.
+static STATS_WORDS: Int = 3
+static STATS_SYSCALLS: Int = 0
+static STATS_FAULTS: Int = 2
+
+/// Room for every word root could hold: no more than its whole handle table.
+static MAX_HELD: Int = 16
+
+func flag(b: Bool) -> UInt {
+    if b { 1 } else { 0 }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    // Row 0 is the child's image, row 1 the RAM it runs in. Every child is
+    // loaded from the same image into the same RAM, which is sound because the
+    // one before it is dead and its rows are gone.
+    let image = next_region_word(BOOT_PROCESS_WORD)
+    let dest = next_region_word(BOOT_PROCESS_WORD)
+    if image == 0 || dest == 0 {
+        let _ = system.debug_print("SOS records: boot regions missing\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = sos_handle_release(BOOT_PROCESS_WORD)
+
+    var kids: [UInt; MAX_HELD] = [0; MAX_HELD]
+    let first = fill(boot_handle, image, dest, 1, &var kids)
+
+    var status_ok: Int = 0
+    var stats_ok: Int = 0
+    var i: Int = 0
+    while i < first {
+        if status_of(kids[i]) == FAULTED_BAD_HANDLE {
+            status_ok += 1
+        }
+        if stats_match(kids[i]) {
+            stats_ok += 1
+        }
+        i += 1
+    }
+    if status_ok == first && stats_ok == first {
+        print("SOS records: every held child answered status={} syscalls={} faults={}\n",
+              FAULTED_BAD_HANDLE, CHILD_SYSCALLS, CHILD_FAULTS)
+    } else {
+        print("SOS records: of {} held, {} statuses and {} counters answered\n",
+              first, status_ok, stats_ok)
+    }
+
+    // The release. Each word was a Process handle onto a dead record, and the
+    // last reference onto that record, so each release reclaims one.
+    i = 0
+    while i < first {
+        let _ = sos_handle_release(kids[i])
+        kids[i] = 0
+        i += 1
+    }
+
+    let _ = fill(boot_handle, image, dest, 2, &var kids)
+
+    print("SOS records: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// Create a child, run it to its death and keep its word, until a create is
+/// refused; answer how many were held then, and report the refusal.
+func fill(system: UInt, image: UInt, dest: UInt, pass: UInt,
+          kids: &var [UInt; MAX_HELD]) unsafe -> Int {
+    var held: Int = 0
+    while held < MAX_HELD {
+        var child: UInt = 0
+        let refused = sos_system_process_create(system, image, dest,
+                                                (&var child) as UnsafePointer<UInt>)
+        if refused != STATUS_OK {
+            print("SOS records: pass {} held={} room={}, then {}\n", pass, held,
+                  flag(table_has_room(system)), describe(refused))
+            return held
+        }
+        kids[held] = child
+        let _ = sos_process_start(child, NO_BOOT_TAG, 0)
+        // The child dies on its first syscall. Root gives the processor up
+        // until the death is in the status word.
+        while status_of(child) == NOT_ENDED {
+            let _ = sos_thread_yield(BOOT_THREAD_WORD)
+        }
+        held += 1
+    }
+    print("SOS records: pass {} held={} and never refused\n", pass, held)
+    held
+}
+
+/// Whether root's handle table can take one more entry, asked by minting a
+/// sibling of its System handle and releasing it again.
+func table_has_room(system: UInt) unsafe -> Bool {
+    var sibling: UInt = 0
+    let status = sos_handle_mint(system, SystemRight.Debug as UInt,
+                                 (&var sibling) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return false
+    }
+    let _ = sos_handle_release(sibling)
+    true
+}
+
+/// The status word a Process word answers, or 0 when the ask is refused.
+func status_of(process: UInt) unsafe -> UInt {
+    var word: UInt = 0
+    let status = sos_process_get_status(process,
+                                        (&var word) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return 0
+    }
+    word
+}
+
+/// Whether a Process word's counters are `child-fault`'s.
+func stats_match(process: UInt) unsafe -> Bool {
+    var cols: [UInt64; STATS_WORDS] = [0; STATS_WORDS]
+    let bytes = (STATS_WORDS * sizeof<UInt64>()) as UInt
+    let status = sos_process_stats(process,
+                                   (&var cols) as UnsafePointer<UInt64>, bytes)
+    if status != STATUS_OK {
+        return false
+    }
+    cols[STATS_SYSCALLS] == CHILD_SYSCALLS && cols[STATS_FAULTS] == CHILD_FAULTS
+}
+
+/// The next boot-set record's handle word, drained through `process`, or 0.
+func next_region_word(process: UInt) unsafe -> UInt {
+    var buf: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+    let bytes = (RECORD_WORDS * sizeof<UInt>()) as UInt
+    let status = sos_process_boot_handle_next(process,
+                                              (&var buf) as UnsafePointer<UInt>,
+                                              bytes)
+    if status != STATUS_OK {
+        return 0
+    }
+    buf[RECORD_HANDLE_WORD]
+}
+
+/// A raw status word in the typed vocabulary's words.
+func describe(raw: UInt) -> SosStatus {
+    if raw > (UInt8.max as UInt) {
+        return SosStatus.Unknown
+    }
+    SosStatus.from(raw: raw as UInt8) ?? SosStatus.Unknown
+}
