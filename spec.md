@@ -405,13 +405,13 @@ cannot carry the request handle it is invoked through (§3).
 slot beside the word, so a receiver matches a `PipeHandle` out instead of
 holding a number. The kinds a message may carry are the givable ones the
 receiving vocabulary can name: `Memory`, `IoMemory`, `PipeInlet`, `PipeOutlet`,
-`PipeReply`, `PipeRequest`, `Thread`, `Event`, `Waiter`, `Timer` and `Interrupt`
+`PipeReply`, `PipeRequest`, `Event`, `Thread`, `Waiter`, `Timer` and `Interrupt`
 — every kind a boot record can carry but two (`msg_kind_of` is `boot_kind_of`
-less those two). Not yet enforced for the last five: their default sets withhold
+less those two). Not yet enforced for the last four: their default sets withhold
 `Transfer`, no boot record kind names them (§3), and the typed tier has neither
 `PipeHandle` cases nor `decode_handle` arms for them, nor the `Process.give`
-overloads (`thread:`, `event:`, `waiter:`, `timer:`, `interrupt:`) or the
-`BootHandle` accessors that would carry them through a give. `Process` and
+overloads (`thread:`, `waiter:`, `timer:`, `interrupt:`) or the `BootHandle`
+accessors that would carry them through a give. `Process` and
 `System` are refused at the sender, as a scope line rather than a rule: both
 wrappers live above `sos.pipe` in the module order, so admitting them is a
 sysapi module split and a named follow-up (§11).
@@ -516,9 +516,9 @@ a reply delivery carries, which is why there is one type and not two — and
   process picks by whether it wants to park.
 - **The multiplexing rule, in one line:** many threads per Waiter is
   distribution (one wake per delivery, the worker-pool shape); one Waiter per
-  waitable is ownership, and it is structural — a handle attaches to at most
-  one Waiter, so a delivered value has exactly one recipient by construction
-  and no multi-watcher caveat exists.
+  waitable is ownership, and it is structural — an object is attached to at
+  most one Waiter, whichever handle names it, so a delivered value has exactly
+  one recipient by construction and no multi-watcher caveat exists.
 - **Level-triggered is an absence.** Nothing records that a waiter has been
   told, so `Wait` scans the attachment set, and three properties fall out of
   that one decision rather than being coded separately: a signal before
@@ -653,10 +653,14 @@ a reply delivery carries, which is why there is one type and not two — and
 - **Attach semantics:** **level-triggered** (keeps reporting ready until the
   waiter handles it — no lost edges); attachments are **persistent by
   default** with explicit `remove(key)` (by key, never by the waitable's
-  handle); a handle attaches to **at most one Waiter**, but **multiple
-  threads/tasks may wait on the same Waiter** (a ready handle wakes one waiter
-  — the shared readiness-queue shape). `WaiterOp.Add` takes a target, a key
-  and a flags word (§5.7).
+  handle); an object is attached to **at most one Waiter**, whichever handle
+  names it, but **multiple threads/tasks may wait on the same Waiter** (a
+  ready handle wakes one waiter — the shared readiness-queue shape). Attaching
+  an object that is already attached faults the caller (`BadState`), through
+  any holder's handle: the rule binds every holder of the object, so holders
+  must agree which of them attaches it, and a giver that attaches an object
+  itself withholds `Wait` when it gives the object on. `WaiterOp.Add` takes a
+  target, a key and a flags word (§5.7).
 - **One-shot is an opt-in property of the attachment.** `AttachMode.OneShot`
   detaches at delivery — when the record for its key is copied out, never at
   mere readiness — and the delivery is otherwise identical. It is the
@@ -760,8 +764,8 @@ a reply delivery carries, which is why there is one type and not two — and
   accumulated word and clears it in the same interrupts-masked step (§2.2). A
   value is therefore delivered exactly once, whichever door it came through,
   and the choice between them is only whether the caller wants to park. The
-  recipient is unique by construction: a handle attaches to at most one
-  Waiter, so no second watcher can be deprived of a word a wait took.
+  recipient is unique by construction: an object is attached to at
+  most one Waiter, so no second watcher can be deprived of a word a wait took.
 - **Accumulation mode is a per-Event property:**
   - **bitwise-OR** — "which of these events occurred since last drain"
     (flag set; the signal use case).
@@ -1115,7 +1119,7 @@ three groups:
   caller error (a bad entry, stack or mode) faults the caller. Not yet
   enforced: the handles are minted into the named process's table, so through
   another process's handle the caller is handed words relative to that table;
-  Thread, Event and Waiter handles cannot yet be given; and a bad entry or
+  Thread and Waiter handles cannot yet be given; and a bad entry or
   stack in `ThreadCreate` (`BadEntry`) or a bad mode in `EventCreate`
   (`BadArg`) faults the named process. `ProcessOp.InterruptBind` does the same
   while it exists: it mints into the named process's table and faults that
@@ -1601,19 +1605,24 @@ already written off, and a husk's check of its target would read a stranger's
 state. A disowned object's free credits nobody, whatever its kind; an object
 freed before its disown credits the dying ledger as any free does, and the
 teardown clears that ledger. Not yet enforced: only the shared kinds are
-disowned (a Memory, an IoMemory or a connection still charged to the dying
-process), and only the shared kinds' frees test for no owner; the teardown
-frees the process's Threads, Events, Waiters, Interrupts and Timers instead
+disowned (a Memory, an IoMemory, a connection or an Event still charged to the
+dying process), and only the shared kinds' frees test for no owner; the
+teardown frees the process's Threads, Waiters, Interrupts and Timers instead
 (below), so none of them survives it. The rest arrives with the invalidation of
 the bound kinds and the teardown order above.
 
 The teardown reports itself on one console line, `SOS: process teardown`, and
 the harness asserts the line. Its fields today (`handles=`, `threads=`,
 `events=`, `waiters=`, `interrupts=`, `timers=`, `process=`) count the handles
-the close-all closed and the objects today's owner sweeps freed. They follow
-what the teardown does, so they change with it: under the order above no owner
-sweep reaches an Event or an Interrupt, and the Mappings that are swept have no
-field.
+the close-all closed and the objects the teardown freed. `events=` counts the
+Events charged to the dying process that the reap's Event scan freed, which are
+those nothing named once its handles and attachments were gone. It does not
+count an Event freed earlier, inside the close-all (one staged on a connection
+whose last outlet the close-all released, say), nor one freed later by the
+reap's exchange scan, nor one still named elsewhere, which survives disowned.
+The other fields follow the owner sweeps, so they change with the teardown:
+under the order above no owner sweep reaches an Interrupt, and the Mappings
+that are swept have no field.
 
 **The refund rule.**
 
@@ -1635,18 +1644,17 @@ Not yet enforced:
 
 - Thread slots are not counted (§2's table).
 - The teardown releases the handle table first, counting without freeing, and
-  then frees the dying process's Threads, Events, Waiters, Interrupts and
-  Timers by owner, frees the Mappings it made, and frees the Memory, IoMemory,
+  then frees the dying process's Threads, Waiters, Interrupts and Timers by
+  owner, frees the Mappings it made, and frees the Event, Memory, IoMemory,
   exchanges and connections nothing names any more, disowning the rest it was
   charged for; that reap ends with a process scan, which reclaims every
-  `Gone` process record whose last reference the teardown dropped. An Event or
-  an Interrupt is therefore freed by its owner's death, and a Thread, Waiter or
+  `Gone` process record whose last reference the teardown dropped. An
+  Interrupt is therefore freed by its owner's death, and a Thread, Waiter or
   Timer is freed rather than left invalid, an `Exited` Thread included, which is
-  sound only while every handle naming it is in the dying table. Once an Event
-  can outlive its owner, it will be disowned at that death as the other shared
-  kinds are. A Mapping that targets the dying process already has the invalid
-  shape — its slot kept, its row cleared, its handles in other tables — though
-  its ops answer `BadState` today (next item).
+  sound only while every handle naming it is in the dying table. A Mapping that
+  targets the dying process already has the invalid shape — its slot kept, its
+  row cleared, its handles in other tables — though its ops answer `BadState`
+  today (next item).
 - Ops on an invalid object do not answer `Revoked`. `Unmap` and `Base` on a
   Mapping whose target died are `BadState` faults (§2.5), and so is a `map`
   naming a `Gone` target. The creation ops through a `Gone` process's handle
@@ -1734,9 +1742,9 @@ Not yet enforced:
   it on (§2.7), and an Interrupt carries it so that a launcher can hand a
   driver its line (§2.8). Each givable kind has a boot record kind
   (`BootHandleKind`), which is what lets `give` deliver it and a message carry
-  it (§2.1). Not yet enforced for Thread, Event, Waiter, Timer and Interrupt:
-  their default sets withhold `Transfer`, and `BootHandleKind` has no case for
-  any of them.
+  it (§2.1). Not yet enforced for Thread, Waiter, Timer and Interrupt: their
+  default sets withhold `Transfer`, and `BootHandleKind` has no case for any of
+  them.
 - **The invariant is no amplification: no sequence of asks yields authority
   the asker did not already have.** A handle is a unique entry, which is the
   `NoCopy` correspondence §4 builds on — but uniqueness is the mechanism, and
@@ -2057,7 +2065,7 @@ topology is userspace's.
 
 Decided by §2.2: the `Waiter` aggregator with word-sized keys. Attach
 semantics: level-triggered, persistent by default with `remove` (and an
-opt-in `AttachMode.OneShot`), one Waiter per handle, many waiters per Waiter.
+opt-in `AttachMode.OneShot`), one Waiter per object, many waiters per Waiter.
 
 ### 5.5 Memory hardware and the address story
 
@@ -3028,7 +3036,7 @@ event-driven edge of a process gets a second, distinct construct:
   word-sized key was designed for). Implementation freedom (runtime
   design, not spec): whether a HandlerGroup owns its own kernel Waiter
   or registers through the process runtime's reactor Waiter — the
-  kernel permits both (one Waiter per handle; many Waiters per
+  kernel permits both (one Waiter per object; many Waiters per
   process).
 
 ## 11. What is not built, known limits, and the plan
@@ -3109,8 +3117,8 @@ loader parses and reports while no process stores either.
   Interrupt can be consumed into an attachment, an attachment keeps it bound
   after its handle is released, and an attached Interrupt's record carries its
   line whatever its state (§2.8, §2.10, §3).
-- Thread, Event, Waiter and Timer handles cannot yet be given: their default
-  sets withhold `Transfer` and no boot record kind names them (§3).
+- Thread, Waiter and Timer handles cannot yet be given: their default sets
+  withhold `Transfer` and no boot record kind names them (§3).
 - `sosrt`'s bump arena takes no lock, so under a kernel that preempts (today
   only the preemption harness; §7) two threads of one process allocating at once
   can race (§5c).

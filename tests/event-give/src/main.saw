@@ -1,0 +1,177 @@
+// An Event crosses a process boundary by give and by message (spec §3, §2.1).
+//
+// Root makes two Events and a child. The first is given under a tag; the
+// second travels in a pipe message that is already staged when the child
+// starts. The child (`child-event`, peer role) signals the given Event, takes
+// the message, matches the Event it carries as a `PipeHandle`, signals that
+// one too, and sends both back in one message. Root decodes them and reads the
+// words:
+//
+//   SOS eventgive: given Event reads 5       <- signalled by the child
+//   SOS eventgive: sent Event waits 50       <- 0x30 from the child, 0x02 from
+//                                               root, observed through a Waiter
+//
+// A handle that came back in a message is a full capability: root drains the
+// first with `receive` and attaches the second to a Waiter, which needs the
+// `Wait` right the give and the message both preserved.
+//
+// One phase per function: root's stack grant is small and a `PipeMsg` is a
+// message-sized value.
+
+import sos.{System, Process, Event, PipeInlet, PipeOutlet, PipeHandle,
+            PipeHandles, SystemRight, SosStatus, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tags the child's boot records travel under.
+static TAG_BOOT: UInt = 7
+static TAG_EVENT: UInt = 31
+static TAG_INBOX: UInt = 32
+static TAG_OUTBOX: UInt = 33
+
+/// The keys root's attachments live under.
+static KEY_REPLY: UInt = 71
+static KEY_SENT: UInt = 72
+
+/// What `child-event` signals the given Event with, and the Event sent to it;
+/// and the bit root adds to the second before it waits.
+static BITS_GIVEN: UInt = 0x5
+static BITS_SENT: UInt = 0x30
+static BITS_ROOT: UInt = 0x2
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS eventgive: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS eventgive: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS eventgive: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    let child = try system.process_create(image: &image, memory: &ram)
+    let to_child = try proc.pipe_create()
+    let (to_child_in, to_child_out) = move to_child
+    let from_child = try proc.pipe_create()
+    let (from_child_in, from_child_out) = move from_child
+    let given = try proc.event_create()
+    let sent = try proc.event_create()
+
+    try furnish(&system, &child, move given, move to_child_out,
+                move from_child_in)
+
+    // The message is staged before the child exists to take it.
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var carrying = PipeHandles.none()
+    carrying.put(0, event: move sent)
+    let claim = try to_child_in.post_with(body: &body, len: 1,
+                                          handles: &var carrying)
+    let _ = move claim
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(outlet: &from_child_out, key: KEY_REPLY)
+    try child.start(boot_tag: TAG_BOOT)
+    let _ = system.debug_print("SOS eventgive: started\n")
+
+    let woke = try waiter.wait()
+    if woke.key != KEY_REPLY {
+        return BUG
+    }
+    try read_back(&system, &proc, &from_child_out)
+    return
+}
+
+/// Hand the child its boot System, the Event, and the two pipe ends it needs.
+func furnish(system: &System, child: &Process, given: Event,
+             inbox: PipeOutlet, outbox: PipeInlet) -> Result<Void, SosStatus> {
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(event: move given, tag: TAG_EVENT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(outlet: move inbox, tag: TAG_INBOX) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(inlet: move outbox, tag: TAG_OUTBOX) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Take the child's message and use both Events it carries.
+func read_back(system: &System, proc: &Process,
+               outlet: &PipeOutlet) -> Result<Void, SosStatus> {
+    let got = try outlet.take()
+    let (arrived, request) = move got
+    var msg = move arrived
+    let _ = move request
+    guard let first = msg.handles[0].take() else { return BUG }
+    guard let second = msg.handles[1].take() else { return BUG }
+
+    let given_back = try as_event(move first)
+    let word = try given_back.receive()
+    print("SOS eventgive: given Event reads {}\n", word)
+    if word != BITS_GIVEN {
+        return BUG
+    }
+
+    let sent_back = try as_event(move second)
+    let waiter = try proc.waiter_create()
+    try waiter.add(event: &sent_back, key: KEY_SENT)
+    try sent_back.signal(BITS_ROOT)
+    let woke = try waiter.wait()
+    if woke.key != KEY_SENT {
+        return BUG
+    }
+    match woke.what {
+        case Event(bits) -> {
+            print("SOS eventgive: sent Event waits {}\n", bits)
+            if bits != BITS_SENT + BITS_ROOT {
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
+
+/// A message slot that must be an Event.
+func as_event(h: PipeHandle) -> Result<Event, SosStatus> {
+    match h {
+        case Event(ev) -> { return move ev },
+        case _ -> { return BUG },
+    }
+}

@@ -18,7 +18,6 @@
 import hal
 import sosabi.{
     ObjType,
-    EventMode,
     FaultReason,
     ProcessStatusKind,
 }
@@ -71,8 +70,6 @@ import kcore.time.{TIMERS, TimerSlot, reprogram_timer}
 import kcore.waitables.{
     ATTACHMENTS,
     Attachment,
-    EVENTS,
-    EventSlot,
     INTERRUPTS,
     InterruptSlot,
     WAITERS,
@@ -236,10 +233,12 @@ public(package) func exit_thread(slot: Int, code: UInt) unsafe {
 ///
 /// Teardown is unconditional: every handle in the process's table is closed,
 /// every thread slot and frame it owns goes back to the kernel's pools, and
-/// every Event, Waiter, Interrupt, Timer and Mapping it held goes back to its
-/// slab. Its trap counters are copied into its record, and its body (the
-/// handle table, the boot set and the grant record) is freed for the next
-/// create. The record stays, `Gone`, for as long as a reference names it.
+/// every Waiter, Interrupt, Timer and Mapping it held goes back to its slab.
+/// An Event goes back when nothing names it any more; one that is still named
+/// elsewhere outlives the process, disowned (`reap_unreferenced`). Its trap
+/// counters are copied into its record, and its body (the handle table, the
+/// boot set and the grant record) is freed for the next create. The record
+/// stays, `Gone`, for as long as a reference names it.
 /// Then:
 ///
 ///   - Process 0 (root, init) stops the machine. Its children die with it,
@@ -445,27 +444,11 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
         a = a + 1
     }
 
-    // Events and Waiters go back to their slabs whole (spec §2.7).
-    // No unlinking is needed first: the attachment loop above has already
-    // unhooked every attachment of this process's waiters, and a Waiter's
-    // blocked list names threads that were reclaimed in the thread sweep.
-    var events_freed: UInt = 0
-    var e: Int = 0
-    while e < EVENTS.capacity() {
-        if EVENTS[e].process == p {
-            match EVENTS[e].state {
-                case Free -> {},
-                case Live -> {
-                    EVENTS[e] = EventSlot(state: SlotState.Free, process: 0,
-                                          mode: EventMode.Or, word: 0,
-                                          attachment: 0, refs: 0)
-                    events_freed = events_freed + 1
-                },
-            }
-        }
-        e = e + 1
-    }
-
+    // Waiters go back to their slabs whole (spec §2.7). No unlinking is needed
+    // first: the attachment loop above has already unhooked every attachment of
+    // this process's waiters, and a Waiter's blocked list names threads that
+    // were reclaimed in the thread sweep. Events are not swept here: an Event
+    // is a shared kind, freed or disowned by `reap_unreferenced` below.
     var waiters_freed: UInt = 0
     var w: Int = 0
     while w < WAITERS.capacity() {
@@ -511,10 +494,11 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     reprogram_timer()
 
     // Counted kinds that other processes may still reference (memory regions,
-    // IO windows, pipe connections) are not force-freed by their creator's
-    // death. References govern lifetime: a slot outlives its creator for as
-    // long as anybody holds a reference. A forced free would pull a connection
-    // out from under a peer that still holds an end, staged messages and all.
+    // IO windows, pipe connections, Events) are not force-freed by their
+    // creator's death. References govern lifetime: a slot outlives its creator
+    // for as long as anybody holds a reference. A forced free would pull a
+    // connection out from under a peer that still holds an end, staged
+    // messages and all.
     // Don't force-free by `process` field: a give does not move a slot's
     // `process` field, so a region a launcher gave a child is not the dying
     // process's to free. What the dying process was charged for is written off
@@ -538,11 +522,13 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // reference the close-all or the attachment sweep just dropped; this
     // process's own record waits for the teardown's drop below.
     //
-    // Threads, Events, Waiters, Interrupts and Timers are counted for the
-    // teardown line and swept by ownership. Mappings are swept below: a Mapping
-    // is not subject to the hazard above because `mapping_rights()` withholds
-    // `Transfer`, so its handle cannot leave the owning process.
-    reap_unreferenced(p)
+    // Events are freed or disowned by the reap, which answers the count the
+    // teardown line reports. Threads, Waiters, Interrupts and Timers are
+    // counted for the teardown line and swept by ownership. Mappings are swept
+    // below: a Mapping is not subject to the hazard above because
+    // `mapping_rights()` withholds `Transfer`, so its handle cannot leave the
+    // owning process.
+    let events_freed = reap_unreferenced(p)
 
     // Mappings come apart from both ends, which is why this loop has two arms.
     // A Mapping names two processes: the owner, whose handle it is, and the

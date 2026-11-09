@@ -649,11 +649,12 @@ public(package) func quota_credit(p: Int, kind: QuotaKind) unsafe {
 /// Give one of shared `kind` back to `owner`, the `process` field of the
 /// object being freed, if the object still has an owner.
 ///
-/// A shared kind (a connection, a Memory, an IoMemory) can outlive the process
-/// charged for it. That process's teardown disowns it, writing `NO_PROCESS`
-/// into its `process` field (spec §2.10's refund rule), and the charge goes
-/// with the dead process's ledger. A disowned object's free credits nobody, so
-/// a refund can never reach a later occupant of the dead process's record.
+/// A shared kind (a connection, a Memory, an IoMemory, an Event) can outlive
+/// the process charged for it. That process's teardown disowns it, writing
+/// `NO_PROCESS` into its `process` field (spec §2.10's refund rule), and the
+/// charge goes with the dead process's ledger. A disowned object's free credits
+/// nobody, so a refund can never reach a later occupant of the dead process's
+/// record.
 public(package) func credit_shared(owner: Int, kind: QuotaKind) unsafe {
     if owner == NO_PROCESS {
         return
@@ -1451,10 +1452,10 @@ public(package) func compact_mapping_rows(target: Int, removed: Int) unsafe {
 /// `ObjType` is renumberable bookkeeping and `BootHandleKind` crosses the trap
 /// boundary, so neither is a cast of the other; this function is the
 /// translation, and it is deliberately partial. The kinds it cannot spell are
-/// the kinds that are never given: a Thread, Event, Waiter, Interrupt, Clock or
-/// Timer handle never reaches here, because the `Transfer` check refuses it
-/// first. The partial arm means that when a kind becomes givable, the compiler
-/// asks for its record spelling instead of letting it arrive mis-tagged.
+/// the kinds that are never given: a Thread, Waiter, Interrupt, Clock or Timer
+/// handle never reaches here, because the `Transfer` check refuses it first.
+/// The partial arm means that when a kind becomes givable, the compiler asks
+/// for its record spelling instead of letting it arrive mis-tagged.
 ///
 /// It lives here, below `kcore.refs`, because both the give path and `refs`
 /// (which translates a message's handle slots at every rendezvous) need it, and
@@ -1483,6 +1484,9 @@ public(package) func boot_kind_of(kind: ObjType) -> BootHandleKind? {
         // must be able to carry one.
         case PipeReply -> BootHandleKind.PipeReply,
         case PipeRequest -> BootHandleKind.PipeRequest,
+        // `event_rights()` mints `Transfer`, and an Event is a shared kind: it
+        // outlives its owner while anything names it.
+        case Event -> BootHandleKind.Event,
         case _ -> None,
     }
 }

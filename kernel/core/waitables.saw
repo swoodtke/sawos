@@ -100,13 +100,16 @@ public(package) struct Waitable {
 /// a signal arriving after a take re-arms this object with its own bits alone.
 ///
 /// `attachment` is the one thing an Event knows about the wait side: which
-/// attachment names it, or zero. §2.2 allows at most one Waiter per handle, so
+/// attachment names it, or zero. §2.2 allows at most one Waiter per object, so
 /// this is a field rather than a list, which keeps `Signal`'s hot path to one
 /// load. Everything else about the attachment lives in the attachment itself.
 /// Slot indices are stored plus one so that zero means "none", which is what a
 /// zeroed static already says.
 public(package) struct EventSlot {
     public(package) state: SlotState,
+    /// The process charged for this Event, or `NO_PROCESS` once that process
+    /// has died and disowned it (spec §2.10). Test for that before using it
+    /// as an index.
     public(package) process: Int,
     /// §2.4's per-Event accumulation mode, fixed at creation.
     public(package) mode: EventMode,
@@ -114,7 +117,8 @@ public(package) struct EventSlot {
     public(package) word: UInt,
     /// The attachment naming this event (slot + 1); 0 = unattached.
     public(package) attachment: Int,
-    /// Handle entries naming this event, plus its attachment.
+    /// Handle entries naming this event, plus its attachment, plus the staged
+    /// messages that carry it.
     ///
     /// The attachment counts, so an attached Event cannot reach zero: nothing
     /// frees a waitable out from under the Waiter watching it. The Waiter's own

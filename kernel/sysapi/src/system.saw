@@ -743,10 +743,10 @@ extension Process {
     //
     // A handle can be given only if its rights word carries the universal
     // `Transfer` bit. The default sets that carry it belong to System, Process,
-    // Memory, IoMemory, the pipe ends and the pipe one-shots. Thread, Event,
+    // Memory, IoMemory, Event, the pipe ends and the pipe one-shots. Thread,
     // Waiter, Interrupt, Clock, Timer and Mapping handles therefore cannot be
-    // given at all, and a funnel for one would be a method whose every call is
-    // an `AccessDenied` fault. There is no `give(process:)` funnel: a launcher
+    // given, and a funnel for one would be a method whose every call is an
+    // `AccessDenied` fault. There is no `give(process:)` funnel: a launcher
     // keeps the child's Process handle to supervise with. A kind that must
     // travel gets its default set ruled on and a funnel added beside these.
     //
@@ -952,6 +952,33 @@ extension Process {
         return
     }
 
+    /// Give an Event to this process under `tag`, consuming the wrapper.
+    /// Requires `ProcessRight.Give` here and `EventRight.Transfer` on the
+    /// Event.
+    ///
+    /// An Event is a shared kind: the child's handle keeps it live after the
+    /// giver releases its own, or dies (§2.10). `keep` narrows what the child
+    /// holds, so a producer end is `EventRight.Signal` alone.
+    ///
+    /// A full-rights give hands over the right to attach, and an object is
+    /// attached to at most one Waiter whichever handle names it, so a giver
+    /// that attaches the Event itself withholds `EventRight.Wait` in `keep`.
+    ///
+    /// The funnel contract and the refusal that hands the Event back are
+    /// `give(memory:)`'s.
+    public func give(&self, event: Event,
+                     tag: UInt,
+                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, (SosStatus, Event)> {
+        var owned = move event
+        let word: UInt = owned.handle
+        owned.handle = EventHandle(NO_HANDLE)
+        try checked(sos_process_give(self.handle, word, tag, keep as UInt)) catch {
+            let back: (SosStatus, Event) = (error, Event(handle: EventHandle(word)))
+            return move back
+        }
+        return
+    }
+
     /// Make a connection in this process and receive both of its ends (spec
     /// §2.1). Requires `ProcessRight.PipeCreate`.
     ///
@@ -1147,7 +1174,7 @@ extension Waiter {
     /// asking whether one happened are one question at two tempos.
     ///
     /// Every rule the other overloads state holds unchanged: keys are unique
-    /// per Waiter, a handle attaches to at most one Waiter, readiness is
+    /// per Waiter, an object is attached to at most one Waiter, readiness is
     /// level-triggered. What is new is that death is a terminal level. An
     /// Event's word and a Timer's fire count are consumed by the wait that
     /// reports them; a death is not. A process that was already dead when you
@@ -1263,6 +1290,10 @@ public struct BootHandle {
     /// answers a question it was never asked, and its bytes go straight to
     /// whoever asked it.
     request: PipeRequest?,
+    /// A notification, on the same terms; `take_event` is its one door. A
+    /// launcher hands a child an Event, often narrowed to the producer or the
+    /// consumer end, and the child drains it as it drains a region.
+    event: Event?,
 }
 
 extension BootHandle: NoCopy {}
@@ -1343,6 +1374,12 @@ extension BootHandle {
     public func take_request(&var self) -> PipeRequest? {
         self.request.take()
     }
+
+    /// Take an Event out of this record. Same terms as `take_memory`. A record
+    /// left holding one releases it when it drops.
+    public func take_event(&var self) -> Event? {
+        self.event.take()
+    }
 }
 
 /// Decode a record the kernel copied out into a `BootHandle`.
@@ -1361,41 +1398,48 @@ func decode_boot_handle(tag: UInt, kind: UInt, handle: UInt) -> BootHandle {
                                   memory: Memory(handle: MemoryHandle(handle)),
                                   process: None, system: None, iomemory: None,
                                   inlet: None, outlet: None, reply: None,
-                                  request: None),
+                                  request: None, event: None),
         case Process -> BootHandle(tag: tag, kind: what, memory: None,
                                    process: Process(handle: ProcessHandle(handle)),
                                    system: None, iomemory: None,
                                    inlet: None, outlet: None, reply: None,
-                                   request: None),
+                                   request: None, event: None),
         case System -> BootHandle(tag: tag, kind: what, memory: None,
                                   process: None,
                                   system: System(handle: SystemHandle(handle)),
                                   iomemory: None, inlet: None, outlet: None,
-                                  reply: None, request: None),
+                                  reply: None, request: None, event: None),
         case IoMemory -> BootHandle(tag: tag, kind: what, memory: None,
                                     process: None, system: None,
                                     iomemory: IoMemory(handle: IoMemoryHandle(handle)),
                                     inlet: None, outlet: None, reply: None,
-                                    request: None),
+                                    request: None, event: None),
         case PipeInlet -> BootHandle(tag: tag, kind: what, memory: None,
                                      process: None, system: None, iomemory: None,
                                      inlet: PipeInlet(handle: PipeInletHandle(handle)),
-                                     outlet: None, reply: None, request: None),
+                                     outlet: None, reply: None, request: None,
+                                     event: None),
         case PipeOutlet -> BootHandle(tag: tag, kind: what, memory: None,
                                       process: None, system: None,
                                       iomemory: None, inlet: None,
                                       outlet: PipeOutlet(handle: PipeOutletHandle(handle)),
-                                      reply: None, request: None),
+                                      reply: None, request: None, event: None),
         case PipeReply -> BootHandle(tag: tag, kind: what, memory: None,
                                      process: None, system: None, iomemory: None,
                                      inlet: None, outlet: None,
                                      reply: PipeReply(handle: PipeReplyHandle(handle)),
-                                     request: None),
+                                     request: None, event: None),
         case PipeRequest -> BootHandle(tag: tag, kind: what, memory: None,
                                        process: None, system: None,
                                        iomemory: None, inlet: None, outlet: None,
                                        reply: None,
-                                       request: PipeRequest(handle: PipeRequestHandle(handle))),
+                                       request: PipeRequest(handle: PipeRequestHandle(handle)),
+                                       event: None),
+        case Event -> BootHandle(tag: tag, kind: what, memory: None,
+                                 process: None, system: None, iomemory: None,
+                                 inlet: None, outlet: None, reply: None,
+                                 request: None,
+                                 event: Event(handle: EventHandle(handle))),
     }
 }
 

@@ -27,9 +27,10 @@
 //! (spec §2.1's tell idiom).
 //!
 //! Teardown does not force-free the counted kinds other processes may still
-//! reference (regions, IO windows, pipe connections); `reap_unreferenced` frees
-//! what nobody names and disowns the rest (see the block above it). Events,
-//! Waiters, Interrupts, Timers and Mappings are swept by owner.
+//! reference (regions, IO windows, pipe connections, Events);
+//! `reap_unreferenced` frees what nobody names and disowns the rest (see the
+//! block above it). Waiters, Interrupts, Timers and Mappings are swept by
+//! owner.
 //!
 //! This file also holds delivery, readiness becoming a woken thread. The ledger
 //! and delivery are mutually recursive: a delivery drops a reference (one-shot
@@ -506,7 +507,7 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
             EVENTS[slot] = EventSlot(state: SlotState.Free, process: 0,
                                      mode: EventMode.Or, word: 0,
                                      attachment: 0, refs: 0)
-            quota_credit(owner, QuotaKind.Event)
+            credit_shared(owner, QuotaKind.Event)
         },
         case Waiter -> {
             // The one cascade. A Waiter's attachments are references it holds,
@@ -687,9 +688,9 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
 //
 // References govern lifetime, so a teardown never force-frees a counted kind
 // that other processes may still reference (regions, IO windows, pipe
-// connections): a slot outlives its creator for as long as anybody holds a
-// reference. Freeing by `process == p` would free a connection under a peer
-// that still holds an end.
+// connections, Events): a slot outlives its creator for as long as anybody
+// holds a reference. Freeing by `process == p` would free a connection under a
+// peer that still holds an end.
 //
 // The close-all counts without freeing (`unref_teardown`), so a slot whose last
 // handle the dying process held reaches zero references with nothing to free
@@ -706,17 +707,24 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
 // attachment alone, and a refund owed to it must not reach the record's next
 // occupant.
 //
-// The Thread, Event, Waiter, Interrupt and Timer sweeps in `end_process` remain
+// The Thread, Waiter, Interrupt and Timer sweeps in `end_process` remain
 // because they feed the teardown report. Mapping's sweep is not a force-free
 // either: `mapping_rights()` withholds `Transfer`, so a Mapping handle cannot
 // outlive its owner's process, and its second arm (clearing the row of a
 // mapping whose target died) is not a free.
 
-/// Reap every Memory, IoMemory, exchange and Pipe connection that nothing
-/// names, and disown every one still charged to dying process `p`. It also
-/// reclaims every `Gone` process record that nothing names.
+/// Reap every Event, Memory, IoMemory, exchange and Pipe connection that
+/// nothing names, and disown every one still charged to dying process `p`. It
+/// also reclaims every `Gone` process record that nothing names.
 /// Called by `end_process` after the close-all and the attachment sweep, so
 /// both kinds of reference `p` held on another process are already counted.
+///
+/// Answers how many Events charged to `p` the Event scan freed, which is what
+/// the teardown line's `events=` reports. Only that scan's own frees are
+/// counted. An Event freed before it (inside the close-all, as when an outlet's
+/// last handle releases a staged message) is not, nor is one the exchange scan
+/// frees later by settling a message nobody will take. An Event a message owed
+/// to a live outlet still names is disowned and stays live.
 ///
 /// Inner to outer: an exchange lives inside a connection's row, so exchanges
 /// are given back first and the connections can then answer `pipe_idle`
@@ -732,7 +740,23 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
 /// process alone named credits its ledger as on any release. An object freed
 /// later in the scan by a cascade may already be disowned; that credits nobody,
 /// and the ledger is cleared either way.
-public(package) func reap_unreferenced(p: Int) unsafe {
+public(package) func reap_unreferenced(p: Int) unsafe -> UInt {
+    var events_freed: UInt = 0
+    var e: Int = 0
+    while e < EVENTS.capacity() {
+        match EVENTS[e].state {
+            case Free -> {},
+            case Live -> {
+                if EVENTS[e].refs == 0 {
+                    if EVENTS[e].process == p { events_freed = events_freed + 1 }
+                    free_object(ObjType.Event, e)
+                }
+                disown_event(e, p)
+            },
+        }
+        e = e + 1
+    }
+
     var m: Int = 0
     while m < MEMORIES.capacity() {
         match MEMORIES[m].state {
@@ -782,6 +806,7 @@ public(package) func reap_unreferenced(p: Int) unsafe {
         reclaim_process_record(q)
         q = q + 1
     }
+    events_freed
 }
 
 /// Disown region `m` if dying process `p` is still charged for it. The free
@@ -792,6 +817,16 @@ func disown_region(m: Int, p: Int) unsafe {
         case Free -> {},
         case Live -> {
             if MEMORIES[m].process == p { MEMORIES[m].process = NO_PROCESS }
+        },
+    }
+}
+
+/// Disown Event `e` if dying process `p` is still charged for it.
+func disown_event(e: Int, p: Int) unsafe {
+    match EVENTS[e].state {
+        case Free -> {},
+        case Live -> {
+            if EVENTS[e].process == p { EVENTS[e].process = NO_PROCESS }
         },
     }
 }

@@ -218,41 +218,31 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // The second child takes the lowest free record. Its exit line is the
-    // kernel's answer to whether the first child's record was freed.
-    let again = try system.process_create(image: &image_mem,
-                                          memory: &dest_mem) catch {
-        print("SOS deathlate: second create failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    let for_again = try system.mint(rights: CHILD_SYSTEM) catch {
-        print("SOS deathlate: second mint failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    try again.give(system: move for_again, tag: TAG_BOOT) catch {
-        print("SOS deathlate: second give failed: {}\n", error.0)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    try waiter.add(process: &again, key: KEY_AGAIN,
-                   mode: AttachMode.OneShot) catch {
-        print("SOS deathlate: second attach failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    try again.start(boot_tag: TAG_BOOT) catch {
-        print("SOS deathlate: second start failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    try waiter.wait() catch {
-        print("SOS deathlate: second wait failed: {}\n", error)
+    try run_again(&system, &waiter, &image_mem, &dest_mem) catch {
+        print("SOS deathlate: second child failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
 
     print("SOS deathlate: done\n")
     let _ = proc.exit(EXIT_OK)
+}
+
+/// The second child takes the lowest free record. Its exit line is the
+/// kernel's answer to whether the first child's record was freed. A phase of
+/// its own because root's stack grant is small and every `print` with format
+/// arguments reserves scratch in its caller's frame.
+func run_again(system: &System, waiter: &Waiter, image: &Memory,
+               dest: &Memory) -> Result<Void, SosStatus> {
+    let again = try system.process_create(image: &image, memory: &dest)
+    let for_again = try system.mint(rights: CHILD_SYSTEM)
+    try again.give(system: move for_again, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try waiter.add(process: &again, key: KEY_AGAIN, mode: AttachMode.OneShot)
+    try again.start(boot_tag: TAG_BOOT)
+    let _ = try waiter.wait()
+    return
 }

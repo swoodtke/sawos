@@ -1,0 +1,267 @@
+// An Event outlives the process that made it, and a refund never reaches the
+// record it left behind (spec §2.10).
+//
+// Expected transcript, read as an order:
+//
+//   SOS eventoutlive: started
+//   SOS: process exit: code=44 process=1        <- the owner
+//   SOS: process teardown ... events=2 ... process=1
+//   SOS eventoutlive: the owner is gone
+//   SOS eventoutlive: the owner's Event delivered 6
+//   SOS: process exit: code=4 process=1         <- the probe, in the same record
+//   SOS eventoutlive: probe spent 4
+//   SOS eventoutlive: capacity held=7 released=8
+//   SOS eventoutlive: done
+//
+// The owner (`child-event`, owner role) makes three Events, sends one to root
+// in a message and exits holding the other two. Its teardown frees the two only
+// it named, which the teardown line counts as `events=`, and disowns the one a
+// staged message names: it stays live, charged to nobody. Root takes it after
+// the owner is gone, signals it and waits on it through a Waiter, so the Event
+// is a working object whose maker is dead.
+//
+// Capacity shows the frees. The Event slab is the only thing that can refuse
+// root an Event, because root's own quota is unlimited, so the number root can
+// make is the free slots. With the sent Event held that is one fewer than the
+// slab; the owner's other two came back at its death, or the count would be
+// two lower. Once everything is gone the whole slab is free again.
+//
+// The probe shows the refund. Root lets go of everything that names the dead
+// owner, so its record is reclaimed, and the probe (`child-event`, probe role)
+// is created into it. The probe makes one Event, says so, and waits. Root
+// then releases the disowned Event, whose free would credit the dead owner's
+// record if it were still charged there, and that record is now the probe's.
+// The probe then makes Events until refused. The total is its allowance
+// (`DEFAULT_QUOTA_EVENTS`); a refund that reached it would lower its ledger
+// and the total would be one more.
+//
+// One phase per function: root's stack grant is small.
+
+import sos.{System, Process, Memory, Event, PipeInlet, PipeOutlet,
+            SystemRight, SosStatus, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tags the child's boot records travel under.
+static TAG_BOOT: UInt = 7
+static TAG_INBOX: UInt = 32
+static TAG_OUTBOX: UInt = 33
+
+/// The keys root's attachments live under.
+static KEY_OWNER: UInt = 81
+static KEY_EVENT: UInt = 82
+static KEY_PROBE: UInt = 83
+static KEY_READY: UInt = 84
+
+/// The bits root signals the owner's Event with.
+static BITS: UInt = 0x6
+
+/// How many Events a child may hold at once (`DEFAULT_QUOTA_EVENTS`).
+static EVENT_ALLOWANCE: UInt = 4
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The owner's exit code, and the kind half of a §8 status word for a process
+/// that exited.
+static OWNER_SENT: UInt = 44
+static EXITED: UInt = 1 << 16
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS eventoutlive: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS eventoutlive: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS eventoutlive: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    let outbox = try proc.pipe_create()
+    let (outbox_in, outbox_out) = move outbox
+    let ev = try outlive(&system, &proc, &image, &ram, move outbox_in,
+                         &outbox_out)
+
+    let held = count_events(&proc)
+    try use_event(&proc, &ev)
+
+    // The owner's record is free now. The probe lands in it.
+    let spent = try refund(&system, &proc, &image, &ram, move ev)
+    print("SOS eventoutlive: probe spent {}\n", spent)
+    if spent != EVENT_ALLOWANCE {
+        let _ = system.debug_print("SOS eventoutlive: a refund reached the probe\n")
+        return BUG
+    }
+
+    let released = count_events(&proc)
+    print("SOS eventoutlive: capacity held={} released={}\n", held, released)
+    if released != held + 1 {
+        let _ = system.debug_print("SOS eventoutlive: the Event did not free its slot\n")
+        return BUG
+    }
+    return
+}
+
+/// Launch the owner, wait for its death and take the Event it sent. Nothing of
+/// root's names the owner when this returns, so its record is reclaimed.
+func outlive(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+             outbox: PipeInlet, inbox: &PipeOutlet) -> Result<Event, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_OWNER)
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(inlet: move outbox, tag: TAG_OUTBOX) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    let _ = system.debug_print("SOS eventoutlive: started\n")
+
+    let woke = try waiter.wait()
+    if woke.key != KEY_OWNER {
+        return BUG
+    }
+    match woke.what {
+        case Process(status) -> {
+            if status != EXITED + OWNER_SENT {
+                print("SOS eventoutlive: the owner exited {}\n", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    let _ = system.debug_print("SOS eventoutlive: the owner is gone\n")
+
+    // The attachment and the Process handle are the only references on the
+    // owner's record.
+    try waiter.remove(KEY_OWNER)
+    let _ = move waiter
+    let _ = move child
+
+    let got = try inbox.take()
+    let (arrived, request) = move got
+    var msg = move arrived
+    let _ = move request
+    guard let carried = msg.handles[0].take() else { return BUG }
+    match carried {
+        case Event(ev) -> { return move ev },
+        case _ -> { return BUG },
+    }
+}
+
+/// Signal the Event and wait for it through a Waiter that lives only as long as
+/// this call, so no attachment keeps the Event alive afterwards.
+func use_event(proc: &Process, ev: &Event) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(event: &ev, key: KEY_EVENT)
+    try ev.signal(BITS)
+    let woke = try waiter.wait()
+    if woke.key != KEY_EVENT {
+        return BUG
+    }
+    match woke.what {
+        case Event(bits) -> {
+            print("SOS eventoutlive: the owner's Event delivered {}\n", bits)
+            if bits != BITS {
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
+
+/// Create the probe, let it spend its first Event, release the disowned Event
+/// and send the probe on. Answers how many Events the probe made in all.
+func refund(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+            ev: Event) -> Result<UInt, SosStatus> {
+    let probe = try system.process_create(image: &image, memory: &ram)
+    let go = try proc.pipe_create()
+    let (go_in, go_out) = move go
+    let ready = try proc.pipe_create()
+    let (ready_in, ready_out) = move ready
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(outlet: &ready_out, key: KEY_READY)
+    try waiter.add(process: &probe, key: KEY_PROBE)
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try probe.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try probe.give(outlet: move go_out, tag: TAG_INBOX) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try probe.give(inlet: move ready_in, tag: TAG_OUTBOX) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try probe.start(boot_tag: TAG_BOOT)
+
+    let woke = try waiter.wait()
+    if woke.key != KEY_READY {
+        return BUG
+    }
+    let got = try ready_out.take()
+    let (msg, request) = move got
+    let _ = move msg
+    let _ = move request
+
+    // The probe holds its first Event. If this release credited the owner's
+    // record, it would credit the probe's.
+    let _ = move ev
+
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    let claim = try go_in.post(body: &body, len: 1)
+    let _ = move claim
+
+    let ended = try waiter.wait()
+    if ended.key != KEY_PROBE {
+        return BUG
+    }
+    match ended.what {
+        case Process(status) -> { return status - EXITED },
+        case _ -> { return BUG },
+    }
+}
+
+/// Make Events until the slab refuses, each held in its own frame while the
+/// next is asked for, and answer how many.
+func count_events(proc: &Process) -> UInt {
+    let ev = try proc.event_create() catch { return 0 }
+    let n = count_events(&proc)
+    let _ = move ev
+    return n + 1
+}

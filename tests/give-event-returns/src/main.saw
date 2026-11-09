@@ -1,0 +1,122 @@
+// A give the kernel refuses for capacity hands the Event back usable (spec §3).
+//
+// Root creates a child it never starts and gives it masked System siblings,
+// one tag each, until the child's handle budget refuses one with
+// `QuotaExceeded`. It then makes an Event and gives that: the child's table is
+// still at its budget, so the give is refused again, with the same status. The
+// refusal is a status, so the kernel left root's entry in place, and
+// `Process.give` returns the Event in its error payload. Root signals it and
+// reads the word back, which only a live handle can do.
+//
+// The refused System sibling of the first loop is dropped, which releases its
+// entry. Root exits still holding the returned Event, so its close-all
+// releases it. Root's teardown line is the second half of the proof, as in
+// `give-full-returns`: `events=` reads one, the Event the refusal handed back,
+// freed because the refused give left no other name for it.
+
+import sos.{System, Process, SystemRight, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The first boot tag. Each give takes the next one, so no tag repeats and the
+/// only refusal left to meet is the budget's.
+static TAG_FIRST: UInt = 40
+
+/// The tag of the Event give, distinct from every sibling's.
+static TAG_EVENT: UInt = 90
+
+/// The bits root signals the returned Event with.
+static BITS: UInt = 0x9
+
+/// What each sibling carries: `Transfer` so it can be given at all.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS eventreturns: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    var image = try proc.boot_handle_next() catch {
+        print("SOS eventreturns: no image region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var dest = try proc.boot_handle_next() catch {
+        print("SOS eventreturns: no destination region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let image_mem = image.take_memory() else {
+        let _ = system.debug_print("SOS eventreturns: image record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest_mem = dest.take_memory() else {
+        let _ = system.debug_print("SOS eventreturns: dest record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // The child stays `Created`, so every give below is legal and the boot set
+    // never freezes.
+    let child = try system.process_create(image: &image_mem,
+                                          memory: &dest_mem) catch {
+        print("SOS eventreturns: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    var given: UInt = 0
+    while true {
+        let sibling = try system.mint(rights: CHILD_SYSTEM) catch {
+            print("SOS eventreturns: mint failed: {}\n", error)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        try child.give(system: move sibling, tag: TAG_FIRST + given) catch {
+            let (why, back) = move error
+            print("SOS eventreturns: gave {} siblings then refused: {}\n",
+                  given, why)
+            let _ = move back
+            break
+        }
+        given = given + 1
+    }
+
+    let event = try proc.event_create() catch {
+        print("SOS eventreturns: event create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try child.give(event: move event, tag: TAG_EVENT) catch {
+        let (why, back) = move error
+        print("SOS eventreturns: the Event give was refused: {}\n", why)
+        try back.signal(BITS) catch {
+            print("SOS eventreturns: the refused Event is dead: {}\n", error)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        let word = try back.receive() catch {
+            print("SOS eventreturns: the refused Event cannot receive: {}\n",
+                  error)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        print("SOS eventreturns: the refused Event reads {}\n", word)
+        if word != BITS {
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        let _ = proc.exit(EXIT_OK)
+        return
+    }
+    let _ = system.debug_print("SOS eventreturns: the Event give was not refused\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

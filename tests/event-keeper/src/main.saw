@@ -1,0 +1,111 @@
+// A dying process that holds the last name to another process's Event frees it
+// without counting it among its own (spec §2.10).
+//
+// Expected transcript, read as an order:
+//
+//   SOS eventkeeper: started
+//   SOS: process exit: code=45 process=1        <- the keeper
+//   SOS: process teardown ... events=0 ... process=1
+//   SOS eventkeeper: the keeper is gone
+//   SOS eventkeeper: capacity 8
+//
+// Root makes an Event, charged to root, and gives it away. The keeper
+// (`child-event`, keeper role) exits holding it. The close-all drops the last
+// name and the reap's Event scan frees it, crediting root, whose Event it is:
+// the scan counts only Events charged to the dying process, so `events=` reads
+// zero. Root then counts the Events it can make, and the whole slab is free.
+//
+// One phase per function: root's stack grant is small.
+
+import sos.{System, Process, SystemRight, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tags the child's boot records travel under.
+static TAG_BOOT: UInt = 7
+static TAG_KEEP: UInt = 34
+
+/// The key root's attachment lives under.
+static KEY_KEEPER: UInt = 85
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The keeper's exit code, and the kind half of a §8 status word for a process
+/// that exited.
+static KEEPER_EXIT: UInt = 45
+static EXITED: UInt = 1 << 16
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS eventkeeper: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS eventkeeper: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    let child = try system.process_create(image: &image, memory: &ram)
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_KEEPER)
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let event = try proc.event_create()
+    try child.give(event: move event, tag: TAG_KEEP) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    let _ = system.debug_print("SOS eventkeeper: started\n")
+
+    let woke = try waiter.wait()
+    match woke.what {
+        case Process(status) -> {
+            if status != EXITED + KEEPER_EXIT {
+                print("SOS eventkeeper: the keeper exited {}\n", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    let _ = system.debug_print("SOS eventkeeper: the keeper is gone\n")
+
+    let free = count_events(&proc)
+    print("SOS eventkeeper: capacity {}\n", free)
+    return
+}
+
+/// Make Events until the slab refuses, each held in its own frame while the
+/// next is asked for, and answer how many.
+func count_events(proc: &Process) -> UInt {
+    let ev = try proc.event_create() catch { return 0 }
+    let n = count_events(&proc)
+    let _ = move ev
+    return n + 1
+}

@@ -454,6 +454,16 @@ GIVE_KEEP_MASK_PKG = os.path.join(TESTS_DIR, "give-keep-mask")
 GIVE_FULL_RETURNS_PKG = os.path.join(TESTS_DIR, "give-full-returns")
 CHILD_NARROW_PKG = os.path.join(TESTS_DIR, "child-narrow")
 
+# Events are givable and shared: given, carried in a message, handed back by a
+# refused give, and outliving their owner. `child-event` plays the peer and the
+# owner.
+EVENT_GIVE_PKG = os.path.join(TESTS_DIR, "event-give")
+EVENT_OUTLIVE_PKG = os.path.join(TESTS_DIR, "event-outlive")
+EVENT_KEEPER_PKG = os.path.join(TESTS_DIR, "event-keeper")
+EVENT_NARROW_PKG = os.path.join(TESTS_DIR, "event-narrow")
+GIVE_EVENT_RETURNS_PKG = os.path.join(TESTS_DIR, "give-event-returns")
+CHILD_EVENT_PKG = os.path.join(TESTS_DIR, "child-event")
+
 # Driver-as-service.
 #
 # `uartproto` is a library package rather than an image: the protocol is one
@@ -887,6 +897,9 @@ def expectations(arch):
         # `child-keeper`'s "everything is held" exit code, asserted the same
         # way in `charge_reap`.
         "keeper_mark": f"0x{0x2D:0{width}x}",
+        # `child-event`'s owner exit code, asserted the same way in
+        # `event_outlive`.
+        "owner_mark": f"0x{0x2C:0{width}x}",
     }
 
 
@@ -4437,6 +4450,113 @@ TEST_CASES = [
                        "SOS: process teardown handles={seven} threads={one} "
                        "events={zero} waiters={zero} interrupts={zero} "
                        "timers={zero} process={zero}"],
+        "expect_clean_exit": True,
+    },
+    {
+        # An Event is givable (spec 3) and a message may carry one (spec 2.1).
+        # Root gives a child one Event and sends it another; the child signals
+        # both and sends them back, and root reads the words.
+        "name": "event_give",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": EVENT_GIVE_PKG,
+        "children": [CHILD_EVENT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS eventgive: started",
+                       "SOS eventgive: given Event reads 5",
+                       "SOS eventgive: sent Event waits 50",
+                       "SOS eventgive: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A give refused for capacity hands an Event back usable, as
+        # `give_full_returns` does a System. `gave 12` is the child's handle
+        # budget, `DEFAULT_QUOTA_HANDLES`; the Event give meets the same
+        # refusal, and the Event comes back in the error payload and reads the
+        # bits root signalled.
+        "name": "give_event_returns",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": GIVE_EVENT_RETURNS_PKG,
+        "children": [CHILD_BYE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS eventreturns: gave 12 siblings then refused: this "
+                       "process is at its quota",
+                       "SOS eventreturns: the Event give was refused: this "
+                       "process is at its quota",
+                       "SOS eventreturns: the refused Event reads 9",
+                       "SOS: process teardown handles={eight} threads={one} "
+                       "events={one} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={zero}"],
+        "expect_clean_exit": True,
+    },
+    {
+        # An Event outlives its owner (spec 2.10). The owner makes three Events,
+        # sends one in a message and exits; its teardown frees the two only it
+        # named (`events={two}`) and disowns the sent one, which root then
+        # takes, signals and waits on. `held=7` is the Event slab less the one
+        # live Event; if the owner's other two had not come back it would read
+        # `5`, and `released=8` is the whole slab once root lets go.
+        #
+        # The probe is the refund half. It is created into the dead owner's
+        # reclaimed record (`process={one}` again), makes one Event, and root
+        # then releases the disowned Event. A free that credited the owner's
+        # record would credit the probe, which would then make one Event more
+        # than its allowance: `spent 4` is the allowance, `spent 5` the leak.
+        "name": "event_outlive",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": EVENT_OUTLIVE_PKG,
+        "children": [CHILD_EVENT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS eventoutlive: started",
+                       "SOS: process exit: code={owner_mark} process={one}",
+                       "SOS: process teardown handles={five} threads={one} "
+                       "events={two} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS eventoutlive: the owner is gone",
+                       "SOS eventoutlive: the owner's Event delivered 6",
+                       "SOS: process exit: code={four} process={one}",
+                       "SOS eventoutlive: probe spent 4",
+                       "SOS eventoutlive: capacity held=7 released=8",
+                       "SOS eventoutlive: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A give's keep mask narrows an Event. The child gets `Signal` alone:
+        # it signals the Event, then attaching it (which spends `Wait`) ends it
+        # with `AccessDenied`. Root sees the fault in the child's status word.
+        "name": "event_narrow",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": EVENT_NARROW_PKG,
+        "children": [CHILD_EVENT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS eventnarrow: started",
+                       "SOS childevent: narrow signalled",
+                       "SOS: process fault: access denied process={one}",
+                       "SOS eventnarrow: the child faulted"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A dying process counts only its own Events. Root makes an Event and
+        # gives it to a keeper that exits holding it; the keeper's close-all
+        # drops the last name and the reap frees the Event, but it is charged to
+        # root, so the keeper's `events=` reads zero (a count that ignored the
+        # owner would read one). Root's slab is whole afterwards.
+        "name": "event_keeper",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": EVENT_KEEPER_PKG,
+        "children": [CHILD_EVENT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS eventkeeper: started",
+                       "SOS: process exit: code={keeper_mark} process={one}",
+                       "SOS: process teardown handles={three} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS eventkeeper: the keeper is gone",
+                       "SOS eventkeeper: capacity 8"],
         "expect_clean_exit": True,
     },
     # =========================================================================

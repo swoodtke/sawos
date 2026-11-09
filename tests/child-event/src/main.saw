@@ -1,0 +1,238 @@
+// Test child: Events across a process boundary, in four roles chosen by the
+// boot set (spec §3, §2.1, §2.10).
+//
+// The peer is given an Event under `TAG_EVENT`, the server end of a pipe under
+// `TAG_INBOX` and the client end of another under `TAG_OUTBOX`. It signals the
+// Event it was given, takes one message from its inbox, matches the Event the
+// message carries and signals that too, then sends both back through its
+// outbox in one message and exits. The launcher reads the two words, which
+// proves the give and the message delivered working handles, and that a
+// handle sent back arrives as an Event.
+//
+// The owner is given only the outbox. It makes three Events, posts one of them
+// and exits holding the other two: the launcher watches what its death leaves
+// behind. The posted Event is charged to this process, which is dead by the
+// time anybody uses it.
+//
+// The keeper is given an Event under `TAG_KEEP` and exits holding it: the last
+// name to an Event another process made.
+//
+// The narrowed role is given an Event under `TAG_NARROW` whose launcher kept
+// only `EventRight.Signal`. It signals the Event, which works, then attaches it
+// to a Waiter, which needs `Wait` and so ends the process with `AccessDenied`.
+//
+// The probe is given an inbox and an outbox. It makes one Event, tells its
+// launcher, waits for the go message, then makes Events until refused and exits
+// with the total, which is its Event allowance if nothing credited its ledger
+// in between. It runs in a record an earlier process died in.
+
+import sos.{System, Process, Event, PipeInlet, PipeOutlet, PipeHandles,
+            SosStatus, PIPE_BODY_BYTES}
+
+/// The launcher's tags.
+static TAG_EVENT: UInt = 31
+static TAG_INBOX: UInt = 32
+static TAG_OUTBOX: UInt = 33
+static TAG_KEEP: UInt = 34
+static TAG_NARROW: UInt = 35
+
+/// The key the probe's inbox is attached under.
+static KEY_GO: UInt = 91
+
+/// What each Event is signalled with, so the launcher's reading says which
+/// path the handle took.
+static BITS_GIVEN: UInt = 0x5
+static BITS_SENT: UInt = 0x30
+
+/// The byte the owner's message carries.
+static BYTE_MARK: UInt8 = 78
+
+/// The boot set is neither role's.
+static EXIT_MISMATCH: UInt = 98
+/// The message carried no handle, or one that is not an Event.
+static EXIT_NO_EVENT: UInt = 93
+/// The peer served: both Events were signalled and sent back.
+static EXIT_SERVED: UInt = 41
+/// The owner sent its Event and exits holding two more.
+static EXIT_OWNED: UInt = 44
+/// The keeper exits holding the Event it was given.
+static EXIT_KEPT: UInt = 45
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS childevent: no process handle: {}\n", error)
+        return
+    }
+
+    var given: Event? = None
+    var inbox: PipeOutlet? = None
+    var outbox: PipeInlet? = None
+    var kept: Event? = None
+    var narrowed: Event? = None
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                let tag = rec.tag
+                if tag == TAG_EVENT {
+                    given = rec.take_event()
+                } else if tag == TAG_INBOX {
+                    inbox = rec.take_outlet()
+                } else if tag == TAG_OUTBOX {
+                    outbox = rec.take_inlet()
+                } else if tag == TAG_KEEP {
+                    kept = rec.take_event()
+                } else if tag == TAG_NARROW {
+                    narrowed = rec.take_event()
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+    if let narrow = narrowed.take() {
+        let code = try narrow_attach(&proc, &narrow) catch {
+            print("SOS childevent: narrow refused: {}\n", error)
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        }
+        let _ = proc.exit(code)
+        return
+    }
+    if let keep = kept.take() {
+        // `exit` does not return, so the teardown finds `keep` still held.
+        let _ = proc.exit(EXIT_KEPT)
+        return
+    }
+    guard let out = outbox.take() else {
+        let _ = system.debug_print("SOS childevent: no outbox\n")
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+
+    if let ev = given.take() {
+        guard let inb = inbox.take() else {
+            let _ = system.debug_print("SOS childevent: no inbox\n")
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        }
+        let code = try serve(move ev, &inb, &out) catch {
+            print("SOS childevent: refused: {}\n", error)
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        }
+        let _ = proc.exit(code)
+        return
+    }
+
+    if let inb = inbox.take() {
+        let total = try probe(&proc, &inb, &out) catch {
+            print("SOS childevent: probe refused: {}\n", error)
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        }
+        let _ = proc.exit(total)
+        return
+    }
+
+    let code = try own(&proc, &out) catch {
+        print("SOS childevent: refused: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let _ = proc.exit(code)
+}
+
+/// The peer: use the Event that was given, use the one that arrives, and send
+/// both back.
+func serve(given: Event, inbox: &PipeOutlet,
+           out: &PipeInlet) -> Result<UInt, SosStatus> {
+    try given.signal(BITS_GIVEN)
+
+    let got = try inbox.take()
+    let (arrived, request) = move got
+    var msg = move arrived
+    let _ = move request
+    guard let carried = msg.handles[0].take() else { return EXIT_NO_EVENT }
+    match carried {
+        case Event(ev) -> {
+            var sent = move ev
+            try sent.signal(BITS_SENT)
+
+            var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+            body[0] = BYTE_MARK
+            var back = PipeHandles.none()
+            back.put(0, event: move given)
+            back.put(1, event: move sent)
+            let staged = try out.post_with(body: &body, len: 1,
+                                           handles: &var back)
+            let _ = move staged
+            return EXIT_SERVED
+        },
+        case _ -> { return EXIT_NO_EVENT },
+    }
+}
+
+/// The owner: make three Events, post one, and exit holding the other two.
+/// `exit` does not return, so nothing unwinds and the teardown finds exactly
+/// what this frame holds.
+func own(proc: &Process, out: &PipeInlet) -> Result<UInt, SosStatus> {
+    let sent = try proc.event_create()
+    let kept_a = try proc.event_create()
+    let kept_b = try proc.event_create()
+
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = BYTE_MARK
+    var carrying = PipeHandles.none()
+    carrying.put(0, event: move sent)
+    let staged = try out.post_with(body: &body, len: 1, handles: &var carrying)
+    let _ = move staged
+    let _ = proc.exit(EXIT_OWNED)
+    return EXIT_OWNED
+}
+
+/// The probe: make one Event, report, wait for the go message, then make
+/// Events until refused. Answers the total made, which `exit` reports; the
+/// first Event is held to the exit so a credit would have a row to lower.
+func probe(proc: &Process, inbox: &PipeOutlet,
+           out: &PipeInlet) -> Result<UInt, SosStatus> {
+    let first = try proc.event_create()
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = BYTE_MARK
+    let staged = try out.post(body: &body, len: 1)
+    let _ = move staged
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(outlet: &inbox, key: KEY_GO)
+    let _ = try waiter.wait()
+    let got = try inbox.take()
+    let (msg, request) = move got
+    let _ = move msg
+    let _ = move request
+
+    let total = 1 + spend(&proc)
+    let _ = proc.exit(total)
+    return total
+}
+
+/// Make Events until one is refused, each held in its own frame while the next
+/// is asked for, and answer how many.
+func spend(proc: &Process) -> UInt {
+    let ev = try proc.event_create() catch { return 0 }
+    let n = spend(&proc)
+    let _ = move ev
+    return n + 1
+}
+
+/// The narrowed role: signal an Event that carries `Signal` alone, then try to
+/// attach it, which faults. Reaching the end is a failure.
+func narrow_attach(proc: &Process, narrow: &Event) -> Result<UInt, SosStatus> {
+    try narrow.signal(BITS_GIVEN)
+    print("SOS childevent: narrow signalled\n")
+    let waiter = try proc.waiter_create()
+    try waiter.add(event: &narrow, key: KEY_GO)
+    return EXIT_MISMATCH
+}
