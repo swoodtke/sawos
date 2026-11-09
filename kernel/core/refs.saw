@@ -422,6 +422,11 @@ public(package) func unref_object(kind: ObjType, slot: Int) unsafe {
 ///
 /// For the dying process's own objects the two agree by construction: the sweep
 /// zeroes the slot, count included, so nothing is left half-counted.
+///
+/// A Process whose count reaches zero here is not freed either. A `Gone` slot
+/// whose last reference this was (a handle in the close-all, or an attachment
+/// in the attachment sweep) is reclaimed by the process scan at the end of
+/// `reap_unreferenced`.
 public(package) func unref_teardown(kind: ObjType, slot: Int) unsafe {
     let _ = drop_reference(kind, slot)
 }
@@ -687,7 +692,9 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
 // handle the dying process held reaches zero references with nothing to free
 // it. `reap_unreferenced` therefore frees by condition, "named by nobody",
 // through `free_object`, so every kind's last rites and quota credit run
-// exactly as on the ordinary release path.
+// exactly as on the ordinary release path. The same holds for a `Gone`
+// process slot whose last reference, handle or attachment, the dying process
+// held: the reap's process scan reclaims it.
 //
 // What survives the reap and is charged to the dying process is disowned in
 // the same scans: its `process` field becomes `NO_PROCESS`, its charge goes
@@ -703,13 +710,19 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
 // mapping whose target died) is not a free.
 
 /// Reap every Memory, IoMemory, exchange and Pipe connection that nothing
-/// names, and disown every one still charged to dying process `p`. Called by
-/// `end_process` after the close-all.
+/// names, and disown every one still charged to dying process `p`. It also
+/// reclaims every `Gone` process slot other than `p`'s that nothing names.
+/// Called by `end_process` after the close-all and the attachment sweep, so
+/// both kinds of reference `p` held on another process are already counted.
 ///
 /// Inner to outer: an exchange lives inside a connection's row, so exchanges
 /// are given back first and the connections can then answer `pipe_idle`
-/// honestly. `exchange_settle` cascades into `free_pipe` itself, so the last
-/// loop catches connections with no exchanges (the ordinary case).
+/// honestly. `exchange_settle` cascades into `free_pipe` itself, so the
+/// connection loop catches connections with no exchanges (the ordinary case).
+///
+/// `p`'s own slot is skipped: `end_process` reclaims it last, after the
+/// teardown has finished indexing it. Any other `Gone` slot is finished, so
+/// reclaiming it here, a write of `state` alone, cannot disturb the teardown.
 ///
 /// Each object is disowned after its own free is tried, so an object the dying
 /// process alone named credits its ledger as on any release. An object freed
@@ -758,6 +771,12 @@ public(package) func reap_unreferenced(p: Int) unsafe {
         if pipe_frees_now(c) { free_pipe(c) }
         disown_pipe(c, p)
         c = c + 1
+    }
+
+    var q: Int = 0
+    while q < PROCESSES.capacity() {
+        if q != p { reclaim_process_slot(q) }
+        q = q + 1
     }
 }
 

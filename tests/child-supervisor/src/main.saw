@@ -1,0 +1,99 @@
+// Test child: a supervisor that dies holding the last reference to a dead
+// process's slot.
+//
+// It is given two regions, an image and the RAM to run it in, and creates a
+// process from them. It starts that process, waits for its death, and then
+// exits while naming the dead slot in exactly one way. The tag of the image
+// record says which:
+//
+//   TAG_HOLD    the Process handle stays in this table and the attachment is
+//               removed, so the handle is the slot's last reference
+//   otherwise   the handle is released and the attachment stays, so the
+//               attachment is the slot's last reference
+//
+// The exit code reports how far it got, and the launcher reads it from the
+// spec.md §8 status word.
+
+import sos.{System, Process}
+
+/// The image record's tag that asks for the handle to be held.
+static TAG_HOLD: UInt = 31
+
+/// The key the death is attached under.
+static KEY: UInt = 61
+
+/// Ended holding the handle, and ended holding the attachment.
+static EXIT_HELD: UInt = 60
+static EXIT_WATCHING: UInt = 61
+
+/// The boot set was not two regions, or the process could not be made, started,
+/// watched or waited on. Distinct so the launcher's status names the step.
+static EXIT_NO_RECORD: UInt = 90
+static EXIT_NOT_MEMORY: UInt = 91
+static EXIT_CREATE: UInt = 92
+static EXIT_WAITER: UInt = 93
+static EXIT_ATTACH: UInt = 94
+static EXIT_START: UInt = 95
+static EXIT_WAIT: UInt = 96
+static EXIT_DETACH: UInt = 97
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS supervisor: no process handle: {}\n", error)
+        return
+    }
+
+    var image_rec = try proc.boot_handle_next() catch {
+        let _ = proc.exit(EXIT_NO_RECORD)
+        return
+    }
+    var ram_rec = try proc.boot_handle_next() catch {
+        let _ = proc.exit(EXIT_NO_RECORD)
+        return
+    }
+    let hold = image_rec.tag == TAG_HOLD
+    guard let image = image_rec.take_memory() else {
+        let _ = proc.exit(EXIT_NOT_MEMORY)
+        return
+    }
+    guard let ram = ram_rec.take_memory() else {
+        let _ = proc.exit(EXIT_NOT_MEMORY)
+        return
+    }
+
+    let dead = try system.process_create(image: &image, memory: &ram) catch {
+        print("SOS supervisor: create refused: {}\n", error)
+        let _ = proc.exit(EXIT_CREATE)
+        return
+    }
+    let waiter = try proc.waiter_create() catch {
+        let _ = proc.exit(EXIT_WAITER)
+        return
+    }
+    try waiter.add(process: &dead, key: KEY) catch {
+        let _ = proc.exit(EXIT_ATTACH)
+        return
+    }
+    try dead.start() catch {
+        let _ = proc.exit(EXIT_START)
+        return
+    }
+    try waiter.wait() catch {
+        let _ = proc.exit(EXIT_WAIT)
+        return
+    }
+
+    if hold {
+        try waiter.remove(KEY) catch {
+            let _ = proc.exit(EXIT_DETACH)
+            return
+        }
+        let _ = proc.exit(EXIT_HELD)
+    } else {
+        let _ = move dead
+        let _ = proc.exit(EXIT_WATCHING)
+    }
+}

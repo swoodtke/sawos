@@ -1182,10 +1182,13 @@ are not in the slot: they are the slot's row of the shared stats region
 the teardown disowns it, so a refund at its later free is owed to nobody and
 cannot land on the slot's next occupant (§2.10). The count that decides it is
 `ProcessSlot.refs`, maintained at the same sites as every other kind's, so a
-`Gone` process is ordinary rather than special. Handle generations (§3) make the
-reuse safe, and `clear_domain` invalidates `LAST_PROT_PROCESS`. Where the kernel
-walks every handle table, the walk is over the process slab's extent chain and
-is bounded by `process_slots_usable()` × `MAX_HANDLES`.
+`Gone` process is ordinary rather than special. The slot is reclaimed when the
+count reaches zero, whoever drops the last reference: a live process releasing a
+handle or removing an attachment, or the teardown of a process that died holding
+it (its handles and its attachments are dropped there). Handle generations
+(§3) make the reuse safe, and `clear_domain` invalidates `LAST_PROT_PROCESS`.
+Where the kernel walks every handle table, the walk is over the process slab's
+extent chain and is bounded by `process_slots_usable()` × `MAX_HANDLES`.
 
 **`Stats` — exact trap introspection.** `ProcessOp.Stats` on
 `ProcessRight.Stats` answers through a three-doubleword copy-out record:

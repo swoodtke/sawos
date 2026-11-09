@@ -220,6 +220,8 @@ HANDLE_RELEASE_TWICE_PKG = os.path.join(TESTS_DIR, "handle-release-twice")
 HANDLE_MALFORMED_WORD_PKG = os.path.join(TESTS_DIR, "handle-malformed-word")
 HANDLE_DROP_RELEASE_PKG = os.path.join(TESTS_DIR, "handle-drop-release")
 PROCESS_RECLAIM_PKG = os.path.join(TESTS_DIR, "process-reclaim")
+GONE_RECLAIM_TEARDOWN_PKG = os.path.join(TESTS_DIR, "gone-reclaim-teardown")
+CHILD_SUPERVISOR_PKG = os.path.join(TESTS_DIR, "child-supervisor")
 # Mint, give, and the boot drain. The children here receive a masked system
 # handle, so they can print, name themselves, drain and exit.
 GIVE_BOOT_DRAIN_PKG = os.path.join(TESTS_DIR, "give-boot-drain")
@@ -2180,6 +2182,28 @@ TEST_CASES = [
                        "timers={zero} process={one}",
                        "SOS reclaim: refused_before=1 reclaimed_after=1",
                        "SOS reclaim: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A `Gone` slot whose last reference is dropped by another process's
+        # teardown is reclaimed. The supervisor makes a grandchild that faults,
+        # waits for the death and exits; the first supervisor ends holding the
+        # grandchild's Process handle, the second holding only the attachment.
+        # `spare=2` is the table (root, a supervisor and a grandchild) minus
+        # root: both the supervisor's slot and the grandchild's are free again.
+        # `status=65596` and `65597` are `Exited` (1) << 16 with the
+        # supervisor's code in the low half; any other low half is a step the
+        # supervisor could not take.
+        "name": "gone_reclaim_teardown",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": GONE_RECLAIM_TEARDOWN_PKG,
+        "children": [CHILD_FAULT_PKG, CHILD_SUPERVISOR_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS gonereclaim: handle status=65596",
+                       "SOS gonereclaim: attachment status=65597",
+                       "SOS gonereclaim: spare=2",
+                       "SOS gonereclaim: done"],
         "expect_clean_exit": True,
     },
     # =========================================================================

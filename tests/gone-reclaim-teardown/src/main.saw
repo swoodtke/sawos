@@ -1,0 +1,158 @@
+// A dead process's slot is reclaimed when the last reference to it is dropped
+// by another process's teardown.
+//
+// A `Gone` slot is freed once nothing names it. Usually the last reference is
+// released by a live process, but a supervisor can die holding it. This case
+// launches a supervisor (`child-supervisor`) twice. Each supervisor creates a
+// grandchild that faults at once, waits for its death and then exits, naming
+// the dead slot in exactly one way:
+//
+//   first    the supervisor's Process handle is the slot's last reference
+//   second   the supervisor's attachment is the slot's last reference
+//
+// The table holds three processes (`MAX_PROCESSES`): root, the supervisor and
+// the grandchild. Root drops its handle to each supervisor after it dies, so
+// a leaked grandchild slot shows as the next supervisor's `process_create`
+// being refused, and as a last count of spare slots below two.
+//
+// Expected transcript:
+//
+//   SOS gonereclaim: handle status=65596       <- Exited << 16 | 60
+//   SOS gonereclaim: attachment status=65597   <- Exited << 16 | 61
+//   SOS gonereclaim: spare=2
+//   SOS gonereclaim: done
+//
+// A supervisor that could not make its grandchild ends with a code of 90 or
+// more instead, and `spare=` reads one.
+//
+// `spare=` counts the unstarted processes root can create and hold at once.
+// They are held, not dropped: a slot that never ran is not `Gone`, and nothing
+// reclaims it.
+
+import sos.{System, Process, Memory, Waiter, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tag the supervisor's System travels under, and the tags
+/// of the two regions it is given. The image tag is the supervisor's choice
+/// between holding the handle and holding the attachment.
+static TAG_BOOT: UInt = 7
+static TAG_HOLD: UInt = 31
+static TAG_WATCH: UInt = 32
+static TAG_RAM: UInt = 33
+
+/// The key root watches each supervisor's death under.
+static KEY_SUPERVISOR: UInt = 62
+
+/// What the supervisor may ask its System object for. `ProcessCreate` is what
+/// lets it make the grandchild.
+static SUPERVISOR_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                                    | SystemRight.ProcessCreate
+                                    | SystemRight.Transfer)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS gonereclaim: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS gonereclaim: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS gonereclaim: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    // Rows: the grandchild's image, the supervisor's image, then the RAM of
+    // each. Root gives siblings of the grandchild's pair to each supervisor.
+    var gc_image_rec = try proc.boot_handle_next()
+    var sup_image_rec = try proc.boot_handle_next()
+    var gc_ram_rec = try proc.boot_handle_next()
+    var sup_ram_rec = try proc.boot_handle_next()
+    guard let sup_image = sup_image_rec.take_memory() else { return BUG }
+    guard let gc_image = gc_image_rec.take_memory() else { return BUG }
+    guard let sup_ram = sup_ram_rec.take_memory() else { return BUG }
+    guard let gc_ram = gc_ram_rec.take_memory() else { return BUG }
+
+    let held = try supervise(&system, &proc, &sup_image, &sup_ram, &gc_image,
+                             &gc_ram, TAG_HOLD)
+    print("SOS gonereclaim: handle status={}\n", held)
+    let watching = try supervise(&system, &proc, &sup_image, &sup_ram,
+                                 &gc_image, &gc_ram, TAG_WATCH)
+    print("SOS gonereclaim: attachment status={}\n", watching)
+
+    let spare = spare_slots(&system, &gc_image, &gc_ram)
+    print("SOS gonereclaim: spare={}\n", spare)
+    return
+}
+
+/// Launch a supervisor with the grandchild's image and RAM, wait for its death
+/// and release it. Returns its §8 status word.
+///
+/// Root's handle and its attachment are the supervisor's only references, so
+/// the supervisor's own slot is reclaimed by the release here.
+func supervise(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+               gc_image: &Memory, gc_ram: &Memory,
+               image_tag: UInt) -> Result<UInt, SosStatus> {
+    let sup = try system.process_create(image: &image, memory: &ram)
+    let for_sup = try system.mint(rights: SUPERVISOR_SYSTEM)
+    try sup.give(system: move for_sup, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let gift_image = try gc_image.mint()
+    try sup.give(memory: move gift_image, tag: image_tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let gift_ram = try gc_ram.mint()
+    try sup.give(memory: move gift_ram, tag: TAG_RAM) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &sup, key: KEY_SUPERVISOR)
+    try sup.start(boot_tag: TAG_BOOT)
+
+    let woke = try waiter.wait()
+    if woke.key != KEY_SUPERVISOR {
+        return BUG
+    }
+    var status: UInt = 0
+    match woke.what {
+        case Process(word) -> { status = word },
+        case _ -> { return BUG },
+    }
+
+    try waiter.remove(KEY_SUPERVISOR)
+    let _ = move waiter
+    let _ = move sup
+    return status
+}
+
+/// How many processes root can create and hold at once, up to the table's
+/// size. Each is held until the whole chain returns.
+func spare_slots(system: &System, image: &Memory, ram: &Memory) -> UInt {
+    match system.process_create(image: &image, memory: &ram) {
+        case Ok(p) -> {
+            let kept = move p
+            return 1 + spare_slots(&system, &image, &ram)
+        },
+        case Err(_) -> { return 0 },
+    }
+}
