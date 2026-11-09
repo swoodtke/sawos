@@ -219,7 +219,7 @@ import kcore.diag.{fatal_kernel}
 import kcore.stats.{stats_bump, stats_clear, stats_read, stats_region_phys,
                     stats_region_len}
 import kcore.refs.{PipeMsgPrefix, PipeTakePrefix, deliver_attachment,
-                   hold_staged, mint_staged, move_entry, msg_prefix,
+                   hold_staged, is_outlet_of, mint_staged, move_entry, msg_prefix,
                    notify_claim, notify_if_ready,
                    notify_ready, ref_object, ref_waitable, release_carried,
                    signal_event,
@@ -2981,13 +2981,21 @@ func pipe_inlet_op_decoded(op: PipeInletOp, obj: &PipeInletObject, arg0: UInt,
 /// `NO_HANDLE` when it does not. A carried word equal to it is refused: the
 /// handle cannot both travel in the message and be the one the op destroys.
 ///
+/// `pipe` is the slab slot of the connection the message is posted or called
+/// into, and `NO_PIPE` for a reply, whose handles go back to the client and
+/// not into the request's own ring. A carried `PipeOutlet` of that connection
+/// is refused: the staged reference keeps the connection's outlet column above
+/// zero, an exchange does not settle while it is, and once the sender dropped
+/// its inlet and claim nothing could reach the connection to free it.
+///
 /// Every refusal here is a fault, and it happens before anything is staged. A
 /// record of the wrong size, a body longer than `PIPE_BODY_BYTES`, a handle
 /// word that names nothing, one whose entry lacks the universal `Transfer`
-/// right, one naming a kind no `BootHandleKind` spells and one equal to
-/// `invoking` are all mistakes only the caller could have made. Raising them
-/// above the ring, the exchange and every mint makes "refuses the whole post,
-/// atomic, nothing staged" true by construction rather than by an unwind.
+/// right, one naming a kind no `BootHandleKind` spells, one equal to
+/// `invoking` and an outlet of `pipe` are all mistakes only the caller could
+/// have made. Raising them above the ring, the exchange and every mint makes
+/// "refuses the whole post, atomic, nothing staged" true by construction rather
+/// than by an unwind.
 ///
 /// It validates and does not unbind. The entries leave the sender (take at
 /// post) in `hold_staged`, which runs after the last refusal that leaves them
@@ -2995,8 +3003,8 @@ func pipe_inlet_op_decoded(op: PipeInletOp, obj: &PipeInletObject, arg0: UInt,
 /// while the caller still holds everything it held. A departed peer is
 /// answered earlier still, but it is terminal: the entries are released
 /// (`release_carried`), not kept.
-func send_args(p: Int, src: UInt, bytes: UInt,
-               invoking: UInt) unsafe -> PipeSendRecord {
+func send_args(p: Int, src: UInt, bytes: UInt, invoking: UInt,
+               pipe: Int) unsafe -> PipeSendRecord {
     // Exactly the published size (`timer_arm`'s rule): the record is the whole
     // argument list, and a caller that hands over a different number of words
     // has built something else.
@@ -3008,15 +3016,16 @@ func send_args(p: Int, src: UInt, bytes: UInt,
                          src, bytes) {
         fault_process(p, why)
     }
-    check_send(p, &args, invoking)
+    check_send(p, &args, invoking, pipe)
     args
 }
 
 /// The domain half of `send_args`, split out for the one op whose record
 /// arrives nested inside another: `PipeRequestOp.ReplyWait` copies in a waiter
 /// and a message together, so it has the message already and needs only the
-/// checks. `invoking` is as `send_args` describes it.
-func check_send(p: Int, args: &PipeSendRecord, invoking: UInt) unsafe {
+/// checks. `invoking` and `pipe` are as `send_args` describes them.
+func check_send(p: Int, args: &PipeSendRecord, invoking: UInt,
+                pipe: Int) unsafe {
     if args.len > (PIPE_BODY_BYTES as UInt) {
         fault_process(p, FaultReason.BadArg)
     }
@@ -3045,6 +3054,10 @@ func check_send(p: Int, args: &PipeSendRecord, invoking: UInt) unsafe {
             // granted, and this is whether the receiver could be told what
             // arrived.
             guard let _ = msg_kind_of(entry.obj_type) else {
+                fault_process(p, FaultReason.BadArg)
+            }
+            // An outlet of the connection the message enters.
+            if is_outlet_of(entry.obj_type, entry.target, pipe) {
                 fault_process(p, FaultReason.BadArg)
             }
         }
@@ -3078,6 +3091,9 @@ func check_send(p: Int, args: &PipeSendRecord, invoking: UInt) unsafe {
 /// A staged message opens an exchange, and the `PipeReply` handle minted into
 /// the poster's table is the client's claim on its one reply.
 ///
+/// The message cannot carry an outlet of this connection: `check_send` raises
+/// that as a `BadArg` fault on the caller, ahead of the ring.
+///
 /// A refused post mints nothing: the ring is scanned but nothing is committed
 /// until the claim exists, so a full handle table (`NoResource`) or a spent
 /// handle budget (`QuotaExceeded`) leaves the connection, and the caller's
@@ -3087,7 +3103,7 @@ func check_send(p: Int, args: &PipeSendRecord, invoking: UInt) unsafe {
 /// A ring slot lives until its exchange settles rather than until its bytes are
 /// taken, so `PIPE_INFLIGHT` bounds awaiting-reply exchanges.
 func pipe_post(p: Int, slot: Int, args_src: UInt, args_bytes: UInt) unsafe -> SyscallResult {
-    let args = send_args(p, args_src, args_bytes, NO_HANDLE)
+    let args = send_args(p, args_src, args_bytes, NO_HANDLE, slot)
     let len = args.len
     if PIPES[slot].outlet_refs == 0 {
         // Terminal: the carried handles are consumed, as they would have been
@@ -3129,7 +3145,7 @@ func pipe_post(p: Int, slot: Int, args_src: UInt, args_bytes: UInt) unsafe -> Sy
     // that can change anything the caller owns and every refusal is already
     // behind it, so the message is committed from this point and nothing the
     // sender does afterwards (releasing, exiting) can make it arrive empty.
-    hold_staged(p, x, &args)
+    hold_staged(p, x, &args, slot)
     // One column starts at one and the other at zero, and the asymmetry is the
     // state machine: the claim exists from the post, the obligation does not
     // exist until somebody takes the message. That is why `Staged` is a
@@ -3171,6 +3187,9 @@ func pipe_post(p: Int, slot: Int, args_src: UInt, args_bytes: UInt) unsafe -> Sy
 ///     each address is validated here, while the caller is the running process
 ///     and a refusal can still terminate it (`copy_in_check`).
 ///
+/// As at `pipe_post`, a carried outlet of this connection is a `BadArg` fault
+/// on the caller (`check_send`), raised before anything is staged.
+///
 /// The call's own refusal is never transient: a full ring parks it and no claim
 /// is minted. Its refusal, `PeerClosed`, is terminal, so the carried handles
 /// are released whether the outlet closed before the call or while it waited
@@ -3184,7 +3203,7 @@ func pipe_post(p: Int, slot: Int, args_src: UInt, args_bytes: UInt) unsafe -> Sy
 /// in `pipe_take`).
 func pipe_call(p: Int, slot: Int, args_src: UInt, args_bytes: UInt,
                reply_dst: UInt) unsafe -> SyscallResult {
-    let args = send_args(p, args_src, args_bytes, NO_HANDLE)
+    let args = send_args(p, args_src, args_bytes, NO_HANDLE, slot)
     let len = args.len
     if let why = copy_out_check(p, reply_dst, pipe_msg_record_bytes() as UInt) {
         fault_process(p, why)
@@ -3233,7 +3252,7 @@ func pipe_call(p: Int, slot: Int, args_src: UInt, args_bytes: UInt,
         }
     }
     EXCHANGES[x].len = len as UInt16
-    hold_staged(p, x, &args)
+    hold_staged(p, x, &args, slot)
     // One column at one for a thread rather than for a handle: the only line
     // here that is not `pipe_post`'s. The asymmetry with the request column
     // means what it means there: the claim exists from the call, the obligation
@@ -3647,7 +3666,7 @@ func pipe_request_op_decoded(op: PipeRequestOp, obj: &PipeRequestObject,
             if not obj.allows(PipeRequestRight.Reply) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            let args = send_args(p, arg0, arg1, obj.handle)
+            let args = send_args(p, arg0, arg1, obj.handle, NO_PIPE)
             op_status(pipe_reply_status(p, obj.handle, obj.slot, &args))
         },
         // `Reply` gates the reply leg and the Waiter gates its own. The op does
@@ -3717,7 +3736,7 @@ func pipe_reply_status(p: Int, word: UInt, x: Int,
             // obligation moved every handle the request carried and cleared the
             // note. §2.1's `send(data?, handles?)` is symmetric, so this is the
             // identical act one direction over.
-            hold_staged(p, x, &args)
+            hold_staged(p, x, &args, NO_PIPE)
             EXCHANGES[x].state = ExchangeState.Replied
             // The claim's level is now ready. A client parked on this claim is
             // woken here and its record carries the bytes just written; that is
@@ -3835,7 +3854,7 @@ func pipe_reply_wait(p: Int, word: UInt, x: Int, args_src: UInt,
     // bound and the four handle words, on the same terms as a `Reply`. Every
     // one of those refusals is a fault, and every one happens while the
     // obligation is still live.
-    check_send(p, &args.msg, word)
+    check_send(p, &args.msg, word, NO_PIPE)
     let w = reply_wait_waiter(p, args.waiter)
     // The wait leg's buffer is validated here, on the call, as `waiter_wait`
     // validates its own: terminating a bad-buffer caller while it is the

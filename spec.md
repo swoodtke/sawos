@@ -1839,28 +1839,36 @@ Not yet enforced:
     disarmed-but-unsent word. The same rule covers the handles a pipe message
     carries, and the status decides it. A transient refusal of the send itself
     (`WouldBlock`, `NoResource`, `QuotaExceeded`, answered before the message is
-    staged) leaves the carried handles in the caller's
-    table, and the typed tier keeps the wrappers with the caller:
-    `post_with` leaves its carrier untouched, so the caller may retry with it.
-    Every other outcome consumes them. On success they travel with the message.
-    On a terminal refusal (`PeerClosed`) the kernel releases them: each carried
-    entry is unbound from the caller's table and its reference dropped, so an
-    object whose last handle this was is destroyed (a pipe end reaching zero
-    tells its peer, for example). The typed tier empties the carrier on those
-    outcomes. A bad carried handle faults the caller before anything is taken,
-    and so does a carried word equal to the handle the op is invoked through
-    when the op consumes that handle: `Reply` and `ReplyWait` consume the
-    request handle, which therefore cannot travel in their own message
-    (`BadArg`). No new status marks the difference; the status says which half
-    applies. The fused `send_with` never refuses the send itself transiently,
-    since it parks for room and mints no claim, so its `PeerClosed` consumes the
-    handles whether or not the message was staged. A `NoResource` or
-    `QuotaExceeded` answered at the reply's delivery comes after the carried
-    handles were staged, so it consumes them too. A reply refuses nothing transiently
-    either: `reply_with` and `reply_wait_with` consume their handles on every
-    answer, by delivery or, for a reply to an abandoned request, by release.
-    `Waiter.give` and every `Process.give` overload follow the keep rule: a
-    refused give answers the status and the object together, as
+    staged) leaves the carried handles in the caller's table, and the typed tier
+    keeps the wrappers with the caller: `post_with` leaves its carrier
+    untouched, so the caller may retry with it. Every other outcome consumes
+    them. On success they travel with the message. On a terminal refusal
+    (`PeerClosed`) the kernel releases them: each carried entry is unbound from
+    the caller's table and its reference dropped, so an object whose last handle
+    this was is destroyed (a pipe end reaching zero tells its peer, for
+    example). The typed tier empties the carrier on those outcomes. A bad
+    carried handle faults the caller before anything is taken, and so does a
+    carried word equal to the handle the op is invoked through when the op
+    consumes that handle: `Reply` and `ReplyWait` consume the request handle,
+    which therefore cannot travel in their own message (`BadArg`). A `Post` or
+    `Call` cannot carry an outlet of the connection it enters either (`BadArg`):
+    the staged reference would hold the connection's outlet column above zero,
+    so its exchange would never settle and, with the sender's inlet and claim
+    gone, nothing could reach the connection to free it. A `Call` that parked
+    for room is checked again when it resumes, from a record a sibling thread
+    may have rewritten; there is no running caller to fault, so the slot naming
+    such an outlet arrives empty and the outlet stays in the caller's table. A
+    reply is unaffected, since it carries handles back to the client and not
+    into the request's own ring. No new status marks the difference; the status
+    says which half applies. The fused `send_with` never refuses the send itself
+    transiently, since it parks for room and mints no claim, so its `PeerClosed`
+    consumes the handles whether or not the message was staged. A `NoResource`
+    or `QuotaExceeded` answered at the reply's delivery comes after the carried
+    handles were staged, so it consumes them too. A reply refuses nothing
+    transiently either: `reply_with` and `reply_wait_with` consume their handles
+    on every answer, by delivery or, for a reply to an abandoned request, by
+    release. `Waiter.give` and every `Process.give` overload follow the keep
+    rule: a refused give answers the status and the object together, as
     `Result<Void, (SosStatus, T)>`, since every status `ProcessOp.Give` answers
     leaves the giver's entry in place.
   - **The funnel has a second spelling, for receivers.** Where the op consumes
@@ -2997,6 +3005,9 @@ loader parses and reports while no Process slot stores either.
   (§2.9). Slab donation is permanent (§2.8).
 - Handle generations are best-effort bug detection, not a uniqueness
   guarantee (§3).
+- A cycle of connections, each carrying the next one's outlet in a staged
+  message, is never freed. Only the one-link cycle, a connection's outlet
+  through its own inlet, is refused (§3).
 - A Mapping whose handles are all released leaves its row installed until the
   target's teardown (§2.5).
 - The kernel is uniprocessor (§7).

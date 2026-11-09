@@ -1,0 +1,284 @@
+// A parked call's record is rewritten to carry its own connection's outlet
+// (spec.md §3). Expected outcome:
+//
+//   SOS parkedrewrite: the call is parked
+//   SOS parkedrewrite: the record names the outlet
+//   SOS parkedrewrite: the message arrived without it
+//   SOS parkedrewrite: the connection was freed
+//
+// A fused call that meets a full ring parks with its args record still in the
+// caller's memory, and the kernel re-reads the record when room appears. The
+// record passed `check_send` while the call was being made, and a sibling
+// thread may rewrite it before the resume. The caller is blocked at the
+// resume, so there is no fault to raise: the slot naming an outlet of the
+// call's own connection must arrive empty, and the outlet must stay in the
+// caller's table. Staging it would let the connection hold a reference to
+// itself that nothing outside could drop.
+//
+// The ordering is the cooperative scheduler's: the kernel booting this image
+// arms no timer, so the call is parked by the time a yield returns, and the
+// rewrite lands before any take makes room.
+//
+// The case drives the C-altitude floor with raw words, because a typed inlet
+// cannot be handed to a second thread. Every thread of the image enters at
+// `_start`, which tells the worker from the initial thread by the parked boot
+// handle, as `thread-basics` does.
+
+import sos.{System, SosStatus, sos_system_process_self, sos_process_pipe_create,
+            sos_pipe_inlet_post, sos_pipe_inlet_call, sos_pipe_outlet_take,
+            sos_pipe_request_reply, sos_handle_release, ALL_RIGHTS,
+            PIPE_MSG_HANDLES}
+
+static EXIT_FAILED: UInt = 1
+
+static STATUS_OK: UInt = 0
+
+/// The word that names nothing, which also marks an empty handle slot.
+static NONE: UInt = 0
+
+/// A send record's words: body address, length, then the handle words.
+static SEND_WORDS: Int = 2 + PIPE_MSG_HANDLES
+
+/// Room for a take record and for a call's reply record.
+static REC_WORDS: Int = 64
+
+/// The most tells the fill posts before it gives up.
+static MAX_FILL: Int = 64
+
+/// Rounds of the closing check that creates and drops a connection.
+static ROUNDS: Int = 6
+
+/// The boot handle, parked by the initial thread for the worker.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+/// The worker's stack, in this process's own zero-init data.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+/// What the worker calls with and through: the inlet word, the args record the
+/// initial thread rewrites, the reply buffer, and the status the call answers.
+unsafe static var INLET: UInt = 0
+unsafe static var ARGS: [UInt; SEND_WORDS] = [0; SEND_WORDS]
+unsafe static var REPLY: [UInt; REC_WORDS] = [0; REC_WORDS]
+unsafe static var CALL_STATUS: UInt = 0xFFFF
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func park_boot_handle(word: UInt) unsafe {
+    BOOT_HANDLE = word
+}
+
+func parked_boot_handle() unsafe -> UInt {
+    BOOT_HANDLE
+}
+
+func set_inlet(word: UInt) unsafe {
+    INLET = word
+}
+
+/// Put the connection's outlet in the args record's first handle slot.
+func rewrite_args(outlet: UInt) unsafe {
+    ARGS[2] = outlet
+}
+
+func call_status() unsafe -> UInt {
+    CALL_STATUS
+}
+
+/// The worker: one fused call through the parked inlet, which parks until the
+/// initial thread makes room, then exits.
+func worker() unsafe {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    var value: UInt = 0
+    CALL_STATUS = sos_pipe_inlet_call(INLET, (&var ARGS) as UnsafePointer<UInt>,
+                                      (SEND_WORDS * sizeof<UInt>()) as UInt,
+                                      (&var REPLY) as UnsafePointer<UInt>,
+                                      (&var value) as UnsafePointer<UInt>)
+    let _ = me.exit(0)
+}
+
+/// This process's own Process handle, as a raw word, or `NONE`.
+func ask_process(boot_handle: UInt) unsafe -> UInt {
+    var out: UInt = NONE
+    let status = sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NONE
+    }
+    out
+}
+
+/// Post empty messages through `inlet` until the ring is full, dropping each
+/// claim. Answers how many were staged, or zero on an unexpected refusal.
+func fill(inlet: UInt) unsafe -> Int {
+    var msg: [UInt; SEND_WORDS] = [NONE; SEND_WORDS]
+    var staged: Int = 0
+    var going = true
+    while going && staged < MAX_FILL {
+        var claim: UInt = NONE
+        let status = sos_pipe_inlet_post(inlet, (&var msg) as UnsafePointer<UInt>,
+                                         (SEND_WORDS * sizeof<UInt>()) as UInt,
+                                         (&var claim) as UnsafePointer<UInt>)
+        if status == STATUS_OK {
+            let _ = sos_handle_release(claim)
+            staged = staged + 1
+        } else if status == (SosStatus.WouldBlock as UInt) {
+            going = false
+        } else {
+            return 0
+        }
+    }
+    staged
+}
+
+/// Take the oldest message into `rec`, answering the status.
+func take(outlet: UInt, rec: &var [UInt; REC_WORDS]) unsafe -> UInt {
+    sos_pipe_outlet_take(outlet, (&var rec) as UnsafePointer<UInt>,
+                         (REC_WORDS * sizeof<UInt>()) as UInt)
+}
+
+/// Whether every word of the record after the request handle is zero: a
+/// data-free message with no handle kinds and no handle words.
+func bare(rec: &[UInt; REC_WORDS]) -> Bool {
+    var i: Int = 1
+    while i < REC_WORDS {
+        if rec[i] != NONE {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// Create a connection and drop both ends, `ROUNDS` times. A connection that
+/// never freed would fill the slab and refuse one of them.
+func connections_free(proc: UInt) unsafe -> Bool {
+    var round: Int = 0
+    while round < ROUNDS {
+        var ends: [UInt; 2] = [NONE; 2]
+        if sos_process_pipe_create(proc, (&var ends) as UnsafePointer<UInt>,
+                                   (2 * sizeof<UInt>()) as UInt) != STATUS_OK {
+            return false
+        }
+        let _ = sos_handle_release(ends[0])
+        let _ = sos_handle_release(ends[1])
+        round = round + 1
+    }
+    true
+}
+
+func fail(system: &System, why: String) {
+    print("SOS parkedrewrite: {}\n", why)
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+func initial(boot_handle: UInt) unsafe {
+    park_boot_handle(boot_handle)
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        fail(&system, "no process handle")
+        return
+    }
+    let me = try proc.thread_self() catch {
+        fail(&system, "no thread handle")
+        return
+    }
+    let raw_proc = ask_process(boot_handle)
+    var ends: [UInt; 2] = [NONE; 2]
+    if raw_proc == NONE || sos_process_pipe_create(raw_proc,
+            (&var ends) as UnsafePointer<UInt>,
+            (2 * sizeof<UInt>()) as UInt) != STATUS_OK {
+        fail(&system, "no connection")
+        return
+    }
+    let inlet = ends[0]
+    let outlet = ends[1]
+
+    let depth = fill(inlet)
+    if depth == 0 {
+        fail(&system, "the fill was refused")
+        return
+    }
+
+    // The record starts clean, so the call passes `check_send` and parks.
+    set_inlet(inlet)
+    let worker_thread = try proc.thread_create(stack_top: stack_top(), arg: 1) catch {
+        fail(&system, "no worker thread")
+        return
+    }
+    let _ = worker_thread.start()
+    let _ = me.yield_now()
+    let _ = system.debug_print("SOS parkedrewrite: the call is parked\n")
+
+    // The sibling's rewrite, then room: taking and dropping one tell settles
+    // it, which resumes the parked call.
+    rewrite_args(outlet)
+    let _ = system.debug_print("SOS parkedrewrite: the record names the outlet\n")
+    var rec: [UInt; REC_WORDS] = [NONE; REC_WORDS]
+    if take(outlet, &var rec) != STATUS_OK {
+        fail(&system, "the first take was refused")
+        return
+    }
+    let _ = sos_handle_release(rec[0])
+
+    // The other tells, then the call's message, which is last in the ring.
+    var taken: Int = 1
+    while taken < depth {
+        if take(outlet, &var rec) != STATUS_OK {
+            fail(&system, "a tell was missing")
+            return
+        }
+        let _ = sos_handle_release(rec[0])
+        taken = taken + 1
+    }
+    rec = [NONE; REC_WORDS]
+    if take(outlet, &var rec) != STATUS_OK {
+        fail(&system, "the call's message was missing")
+        return
+    }
+    if not bare(&rec) {
+        fail(&system, "the message carried the outlet")
+        return
+    }
+    let _ = system.debug_print("SOS parkedrewrite: the message arrived without it\n")
+
+    var none: [UInt; SEND_WORDS] = [NONE; SEND_WORDS]
+    if sos_pipe_request_reply(rec[0], (&var none) as UnsafePointer<UInt>,
+                              (SEND_WORDS * sizeof<UInt>()) as UInt) != STATUS_OK {
+        fail(&system, "the reply was refused")
+        return
+    }
+    let _ = worker_thread.join()
+    if call_status() != STATUS_OK {
+        fail(&system, "the call did not answer Ok")
+        return
+    }
+
+    // The outlet never left this table, so releasing the two ends frees the
+    // connection.
+    let _ = sos_handle_release(inlet)
+    let _ = sos_handle_release(outlet)
+    if not connections_free(raw_proc) {
+        fail(&system, "a connection was not freed")
+        return
+    }
+    let _ = system.debug_print("SOS parkedrewrite: the connection was freed\n")
+    let _ = proc.exit(0)
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        worker()
+    }
+}

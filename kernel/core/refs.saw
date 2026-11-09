@@ -919,6 +919,16 @@ public(package) func move_entry(from: Int, to: Int, word: UInt,
     given
 }
 
+/// Whether an entry of `kind` and `target` is an outlet of connection `pipe`.
+/// `NO_PIPE` is negative and no target is, so it names no connection.
+public(package) func is_outlet_of(kind: ObjType, target: Int,
+                                  pipe: Int) -> Bool {
+    match kind {
+        case PipeOutlet -> target == pipe,
+        case _ -> false,
+    }
+}
+
 /// Take `p`'s handle entries and hold them against exchange `x`: the first half
 /// of the rendezvous move.
 ///
@@ -940,20 +950,24 @@ public(package) func move_entry(from: Int, to: Int, word: UInt,
 /// this call.
 ///
 /// It stages what is stageable and skips the rest; raising a fault is the
-/// caller's job. A word that names nothing, an entry without `Transfer`, or a
-/// kind the record cannot spell is raised as a fault by `check_send` on the two
-/// paths where the caller is the running process. This function is also reached
-/// from `resume_call_room`, where the caller is blocked and there is no fault
-/// to raise, so it asks the same three questions and leaves a failing slot
-/// empty. The two are not a duplicated check: one decides whether to end the
+/// caller's job. A word that names nothing, an entry without `Transfer`, a
+/// kind the record cannot spell, or an outlet of `pipe` is raised as a fault by
+/// `check_send` on the two paths where the caller is the running process. This
+/// function is also reached from `resume_call_room`, where the caller is
+/// blocked and there is no fault to raise, so it asks the same four questions
+/// and leaves a failing slot empty (an outlet of `pipe` stays in the sender's
+/// table). The two are not a duplicated check: one decides whether to end the
 /// caller, the other what a message carries.
+///
+/// `pipe` is the connection a request enters, and `NO_PIPE` for a reply, which
+/// may carry that connection's outlet back to the client.
 ///
 /// The second asking is load-bearing: a `Call` that met a full ring parks with
 /// its args record still in the caller's memory, and the record is re-read at
 /// the resume. A sibling thread may have rewritten it, so the words arriving
 /// here need not be the ones `check_send` blessed.
-public(package) func hold_staged(p: Int, x: Int,
-                                 args: &PipeSendRecord) unsafe {
+public(package) func hold_staged(p: Int, x: Int, args: &PipeSendRecord,
+                                 pipe: Int) unsafe {
     var i: Int = 0
     while i < PIPE_MSG_HANDLES {
         let word = args.handles[i]
@@ -964,7 +978,8 @@ public(package) func hold_staged(p: Int, x: Int,
                 case _ -> {
                     let may_send = rights_allow_transfer(entry.rights)
                     let spellable = msg_kind_of(entry.obj_type).is_some()
-                    if may_send && spellable {
+                    let own = is_outlet_of(entry.obj_type, entry.target, pipe)
+                    if may_send && spellable && not own {
                         // Up before down, per handle: the kernel's own
                         // reference is taken before the entry's is dropped, so
                         // nothing can reach zero between two lines of one op.
@@ -1702,10 +1717,11 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
     // The handle words are re-validated here, and have to be. The record was
     // re-read from the caller's memory just above, so a sibling thread may have
     // rewritten it since `check_send` blessed it; `hold_staged` therefore asks
-    // its three questions again. There is no fault to raise (the caller is not
+    // its four questions again. There is no fault to raise (the caller is not
     // running), so a failing slot arrives empty, and no rewritten record can
-    // stage a handle its process does not hold or may not send.
-    hold_staged(p, x, &args)
+    // stage a handle its process does not hold or may not send, or an outlet
+    // of this connection.
+    hold_staged(p, x, &args, c)
     EXCHANGES[x].reply_refs = 1
     EXCHANGES[x].request_refs = 0
     EXCHANGES[x].state = ExchangeState.Staged

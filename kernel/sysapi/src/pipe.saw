@@ -743,6 +743,11 @@ extension PipeInlet {
     /// release included, is a `BadHandle` fault that ends the process. A
     /// transient refusal takes nothing, and `PeerClosed` takes them to release
     /// them.
+    ///
+    /// The carrier cannot hold an outlet of this inlet's own connection (the
+    /// outlet `pipe_create` returned beside it, or one of its siblings): the
+    /// staged reference would keep the connection from ever being freed, so
+    /// the kernel terminates the caller with a `BadArg` fault.
     public func post_with(&self, body: &[UInt8; PIPE_BODY_BYTES], len: UInt,
                           handles: &var PipeHandles) -> Result<PipeReply, SosStatus> {
         post_body(self.handle, &body, len, &var handles)
@@ -801,7 +806,8 @@ extension PipeInlet {
     /// the kernel releases them, and that may destroy an object whose last
     /// handle this was. The answer may carry handles too, because §2.1's
     /// `send(data?, handles?)` is symmetric: the `PipeMsg` that comes back has
-    /// slots of its own.
+    /// slots of its own. As at `post_with`, an outlet of this inlet's own
+    /// connection in the carrier terminates the caller with a `BadArg` fault.
     public func send_with(&self, body: &[UInt8; PIPE_BODY_BYTES], len: UInt,
                           handles: &var PipeHandles) -> Result<PipeMsg, SosStatus> {
         call_body(self.handle, &body, len, &var handles)

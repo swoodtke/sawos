@@ -386,6 +386,8 @@ PIPE_BIG_REPLY_PKG = os.path.join(TESTS_DIR, "pipe-big-reply")
 PIPE_DEAD_CLAIM_PKG = os.path.join(TESTS_DIR, "pipe-dead-claim")
 PIPE_REPLY_SELF_PKG = os.path.join(TESTS_DIR, "pipe-reply-self")
 PIPE_REPLY_WAIT_SELF_PKG = os.path.join(TESTS_DIR, "pipe-reply-wait-self")
+PIPE_SELF_OUTLET_PKG = os.path.join(TESTS_DIR, "pipe-self-outlet")
+PIPE_PARKED_REWRITE_PKG = os.path.join(TESTS_DIR, "pipe-parked-rewrite")
 
 # Waitability. A rights refusal and a bad-argument refusal are faults, so
 # neither negative arm can share an image with anything that has work left.
@@ -3548,6 +3550,40 @@ TEST_CASES = [
                        "SOS: process teardown handles="],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # A connection's outlet cannot travel through its own inlet (spec.md
+        # §3). A staged reference on the outlet would keep the connection from
+        # ever freeing once the sender dropped its inlet and claim, so the
+        # kernel refuses the post as a caller error before staging anything.
+        "name": "pipe_self_outlet",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_SELF_OUTLET_PKG,
+        "expect_out": ["{banner}",
+                       "SOS selfoutlet: posting the outlet through its own "
+                       "inlet",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # `pipe_self_outlet`'s rule at the resume of a parked call. The call
+        # parks on a full ring; a sibling thread rewrites its args record to
+        # carry the connection's own outlet; a take makes room and the kernel
+        # re-reads the record. The caller is blocked, so nothing faults: the
+        # slot arrives empty, the outlet stays in the caller's table, and the
+        # connection frees once the ends are dropped.
+        "name": "pipe_parked_rewrite",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_PARKED_REWRITE_PKG,
+        "expect_out": ["{banner}",
+                       "SOS parkedrewrite: the call is parked",
+                       "SOS parkedrewrite: the record names the outlet",
+                       "SOS parkedrewrite: the message arrived without it",
+                       "SOS parkedrewrite: the connection was freed"],
+        "expect_clean_exit": True,
     },
     {
         # A claim that can never be answered. A second `resolve` of a spent

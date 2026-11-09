@@ -1,0 +1,52 @@
+// A connection's outlet cannot travel through its own inlet (spec.md §3).
+// Expected outcome:
+//
+//   SOS selfoutlet: posting the outlet through its own inlet
+//   SOS: process fault: argument outside its domain
+//
+// A staged message holds a reference on every handle it carries. An outlet
+// staged in its own connection's ring keeps that connection's outlet column
+// above zero, and the exchange cannot settle while the column is, so once the
+// sender dropped its inlet and claim nothing could reach the connection to free
+// it. The kernel refuses the post as a caller error before staging anything.
+
+import sos.{System, Process, PipeHandles, SosStatus, PIPE_BODY_BYTES}
+
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS selfoutlet: no process handle: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let _ = system.debug_print("SOS selfoutlet: posting the outlet through its own inlet\n")
+    try post_own_outlet(&proc) catch {
+        print("SOS selfoutlet: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // Unreachable: the kernel ends this process at the post.
+    let _ = system.debug_print("SOS selfoutlet: the post was accepted\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+/// Post the connection's own outlet through its inlet, then drop the inlet and
+/// the claim.
+func post_own_outlet(proc: &Process) -> Result<Void, SosStatus> {
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var carrying = PipeHandles.none()
+    carrying.put(0, outlet: move outlet)
+    let claim = try inlet.post_with(body: &body, len: 0, handles: &var carrying)
+    let _ = move claim
+    let _ = move inlet
+    return
+}
