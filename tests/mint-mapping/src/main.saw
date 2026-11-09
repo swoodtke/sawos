@@ -1,0 +1,75 @@
+// `Mapping.mint(rights:)` narrows (spec §3).
+//
+// The sibling keeps `Base` and not `Unmap`. It is a live handle: it reports
+// where the row is, which is what makes the refusal mean the missing bit and
+// not a broken sibling. Unmapping through it then ends the process with an
+// access denial.
+
+import sos.{System, Process, Memory, Mapping, MappingRight, MapAccess}
+
+/// What the sibling keeps: `Base` alone.
+static KEEP: UInt32 = (MappingRight.Base as UInt32)
+
+/// One page of the pool, which is the smallest thing either profile grants.
+static CHUNK: UInt = 0x1000
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS mintmapping: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var record = try proc.boot_handle_next() catch {
+        print("SOS mintmapping: no pool region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let pool = record.take_memory() else {
+        let _ = system.debug_print("SOS mintmapping: pool record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let page = try pool.split(len: CHUNK) catch {
+        print("SOS mintmapping: split failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let mapping = try proc.map(memory: &page, access: RW) catch {
+        print("SOS mintmapping: map failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let narrow = try mapping.mint(rights: KEEP) catch {
+        print("SOS mintmapping: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _base = try narrow.base() catch {
+        print("SOS mintmapping: the sibling could not report its base: {}\n",
+              error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS mintmapping: the sibling reports its base\n")
+
+    let _ = system.debug_print("SOS mintmapping: asking to unmap through it\n")
+    match narrow.unmap() {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS mintmapping: UNREACHABLE\n")
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+        case Err(e) -> {
+            print("SOS mintmapping: UNREACHABLE status {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+    }
+    let _ = proc.exit(EXIT_OK)
+}

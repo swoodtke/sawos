@@ -1,0 +1,54 @@
+// `Event.mint(rights:)` narrows (spec §3).
+//
+// The sibling keeps `Receive` and `Wait` and not `Signal`. It is a live handle:
+// it drains the event, which is what makes the refusal mean the missing bit and
+// not a broken sibling. Signalling through it then ends the process with an
+// access denial.
+
+import sos.{System, Process, Event, EventRight}
+
+/// What the sibling keeps: everything but `Signal` and `Mint`.
+static KEEP: UInt32 = (EventRight.Receive | EventRight.Wait)
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS mintevent: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let event = try proc.event_create() catch {
+        print("SOS mintevent: no event: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let narrow = try event.mint(rights: KEEP) catch {
+        print("SOS mintevent: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _word = try narrow.receive() catch {
+        print("SOS mintevent: the sibling could not receive: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS mintevent: the sibling receives\n")
+
+    let _ = system.debug_print("SOS mintevent: asking to signal through it\n")
+    match narrow.signal(1) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS mintevent: UNREACHABLE\n")
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+        case Err(e) -> {
+            print("SOS mintevent: UNREACHABLE status {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+    }
+    let _ = proc.exit(EXIT_OK)
+}

@@ -1,0 +1,54 @@
+// `Clock.mint(rights:)` narrows (spec §3).
+//
+// The sibling keeps `TimerCreate` and not `Read`. It is a live handle: it makes
+// a Timer, which is what makes the refusal mean the missing bit and not a
+// broken sibling. Reading the time through it then ends the process with an
+// access denial.
+
+import sos.{System, Process, Clock, ClockRight}
+
+/// What the sibling keeps: `TimerCreate` alone.
+static KEEP: UInt32 = (ClockRight.TimerCreate as UInt32)
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS mintclock: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let clock = try system.clock_get() catch {
+        print("SOS mintclock: no clock: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let narrow = try clock.mint(rights: KEEP) catch {
+        print("SOS mintclock: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _timer = try narrow.timer_create() catch {
+        print("SOS mintclock: the sibling could not make a timer: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS mintclock: the sibling makes a timer\n")
+
+    let _ = system.debug_print("SOS mintclock: asking for the time through it\n")
+    match narrow.now() {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS mintclock: UNREACHABLE\n")
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+        case Err(e) -> {
+            print("SOS mintclock: UNREACHABLE status {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+    }
+    let _ = proc.exit(EXIT_OK)
+}

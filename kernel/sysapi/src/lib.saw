@@ -167,44 +167,45 @@ public import sosabi.{SlabKind}
 // what number it carries is the build's business.
 public import sosabi.{ProtectionTier}
 
-// `SystemRight` is public because `MINT_OP` takes a keep mask the caller
-// assembles, so the bits are values a process chooses and passes as a syscall
-// argument; `System.mint(rights:)` is its consumer. A kind whose handles
-// nothing masks has no reason to publish its bits, and each rights enum joins
-// this list with the funnel that needs it.
+// Every kind's rights enum is public. A holder narrows any handle it owns at a
+// mint (`mint(rights:)`, on each wrapper whose default set carries `Mint`), at
+// a give's keep mask or before a send, and each of those takes a keep mask the
+// caller assembles out of these bits: values a process chooses and passes as a
+// syscall argument. A kind's default set is permissive, because attenuation is
+// monotonic and a bit not minted at creation could never appear later, so the
+// policy is a mask written where a handle is handed on, and it can only be
+// spelled with the enum.
 //
 // This does not breach the op-number wall: userspace never writes an op, and a
-// right is a capability rather than an index the kernel trusts.
-public import sosabi.{SystemRight}
-
-// `MemoryRight` is public because `Memory.mint(rights:)` is a caller assembling
-// a keep mask out of these bits. `MemoryRight.MapExecute` is what makes
-// narrowing a region worth doing: withholding the authority to map executable
-// is the first policy anybody writes about RAM (`Split` and `Map` are what a
-// region is for, so a launcher had no other reason to narrow it).
+// right is a capability rather than an index the kernel trusts. The enums
+// publish names, and what number a name carries is the build's business.
 //
-// It publishes no op number, as `SystemRight` publishes none.
-public import sosabi.{MemoryRight}
-
-// `EventRight` is public on the same rule: `Process.give(event:, keep:)` is a
-// caller assembling a keep mask out of these bits. A giver that attaches the
-// Event to a Waiter itself withholds `Wait`, since an object is attached to at
-// most one Waiter whichever handle names it; a producer end is `Signal` alone.
-public import sosabi.{EventRight}
-
-// The pipe rights enums are public on the same rule: a rights enum joins this
-// list with the funnel that needs it, and `PipeInlet.mint(rights:)` /
-// `PipeOutlet.mint(rights:)` are callers assembling a keep mask out of these
-// bits. That is where a launcher's pipe policy is written: an endpoint's
-// default set has to be permissive (attenuation is monotonic, so a bit not
-// minted at creation could never appear later), so "this child may post and may
-// not hand the end on" is a mask at the mint and nothing else.
+// Some of what the masks buy:
 //
-// The one-shot pair's rights are public for the same reason, with a sharper
-// case: `PipeRequest.mint(rights:)` through a mask of `Transfer | Mint`
-// describes a courier, a delegate that may pass an obligation further along
-// §2.1's forwarding chain and may never speak for it.
-//
+// - `SystemRight`: `System.mint(rights:)` is how a launcher decides what a
+//   child may ask its System object for.
+// - `MemoryRight.MapExecute` is what makes narrowing a region worth doing:
+//   withholding the authority to map executable is the first policy anybody
+//   writes about RAM (`Split` and `Map` are what a region is for, so a launcher
+//   had no other reason to narrow it).
+// - `ProcessRight.Stats` is a bit whose whole point is to be withheld. "You may
+//   learn my child died, and you may not watch it work" is a policy a
+//   supervisor states once at a mint.
+// - `EventRight` masks a `Process.give(event:, keep:)`. A giver that attaches
+//   the Event to a Waiter itself withholds `Wait`, since an object is attached
+//   to at most one Waiter whichever handle names it; a producer end is
+//   `Signal` alone.
+// - The pipe rights are where a launcher's pipe policy is written: "this child
+//   may post and may not hand the end on" is a mask at the mint and nothing
+//   else. `PipeRequest.mint(rights:)` through a mask of `Transfer | Mint`
+//   describes a courier, a delegate that may pass an obligation further along
+//   §2.1's forwarding chain and may never speak for it.
+public import sosabi.{SystemRight, ProcessRight, ThreadRight, EventRight,
+                      WaiterRight, InterruptRight, ClockRight, TimerRight,
+                      MemoryRight, IoMemoryRight, MappingRight,
+                      PipeInletRight, PipeOutletRight, PipeReplyRight,
+                      PipeRequestRight}
+
 // `PIPE_BODY_BYTES` is a size the two halves must agree on. A `post` may not
 // name more, a delivered message's body region is that wide, and the typed
 // methods take a `&[UInt8; PIPE_BODY_BYTES]`, so a caller cannot declare the
@@ -212,25 +213,14 @@ public import sosabi.{EventRight}
 // the same kind of thing `wait_record_bytes()` is. The staging ring's depth
 // stays in `kcore.limits`: a caller meeting a full ring is told `WouldBlock`
 // without needing to know how deep it was.
-public import sosabi.{PipeInletRight, PipeOutletRight, PipeReplyRight,
-                      PipeRequestRight, PIPE_BODY_BYTES, PIPE_MSG_HANDLES}
+public import sosabi.{PIPE_BODY_BYTES, PIPE_MSG_HANDLES}
 
-// `ProcessRight` is public because `Process.mint(rights:)` is a caller
-// assembling a keep mask out of these bits, and `ProcessRight.Stats` is a bit
-// whose whole point is to be withheld. "You may learn my child died, and you
-// may not watch it work" is a policy a supervisor states once at a mint;
-// without the enum on this line nobody outside the kernel could spell it.
-//
-// It publishes no op number, as the enums above publish none.
-public import sosabi.{ProcessRight}
-
-// Nothing else in `sosabi` is re-exported: not the op numbers, the rights
-// enums not listed above, the handle aliases, or `WaitTag` and the wait
-// record's word offsets. The record's layout is still a contract with C
-// callers (see `sos_waiter_wait`); a Saw caller reads it decoded as a
-// `WaitResult`. The modules below import what each of them needs directly
-// with ordinary imports, so a process cannot reach one through `sos` under
-// any spelling.
+// Nothing else in `sosabi` is re-exported: not the op numbers, the handle
+// aliases, or `WaitTag` and the wait record's word offsets. The record's
+// layout is still a contract with C callers (see `sos_waiter_wait`); a Saw
+// caller reads it decoded as a `WaitResult`. The modules below import what
+// each of them needs directly with ordinary imports, so a process cannot reach
+// one through `sos` under any spelling.
 
 // The object modules, and the C-ABI floor under them. Re-exported by name
 // rather than by glob: the list is this module's surface, so a name that is not

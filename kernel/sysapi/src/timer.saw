@@ -8,9 +8,10 @@
 
 import sosabi.{SosStatus, TimerHandle, NO_HANDLE, TIMER_ARM_RECORD_DOUBLEWORDS,
                TIMER_ARM_AFTER_SLOT, TIMER_ARM_INTERVAL_SLOT,
-               timer_arm_record_bytes}
+               timer_arm_record_bytes, MINT_OP}
 
-import sos.floor.{checked, sos_handle_release, sos_timer_arm, sos_timer_disarm}
+import sos.floor.{checked, sos_handle_release, sos_timer_arm, sos_timer_disarm,
+                  ALL_RIGHTS, call_value}
 
 /// A handle to a Timer, a deadline on the Clock that made it.
 ///
@@ -90,6 +91,27 @@ extension Timer {
     /// faulting it would make the safe idiom unwritable.
     public func disarm(&self) -> Result<Void, SosStatus> {
         checked(sos_timer_disarm(self.handle))
+    }
+
+    /// Mint a sibling of this Timer handle, narrowed by a keep mask: the
+    /// universal `MINT_OP`, on `System.mint`'s exact terms. Requires the
+    /// universal `TimerRight.Mint` on this handle.
+    ///
+    /// `rights` is what the sibling may keep: its rights are this handle's
+    /// intersected with the mask, so the default (all ones) is "the same
+    /// rights", and naming a right this handle does not hold is a no-op.
+    /// The mask is where a holder writes policy for a deadline: a
+    /// sibling that keeps `Wait` and not `Arm` can be waited on and
+    /// never re-armed.
+    ///
+    /// `Mint` is itself maskable. The sibling is independent (its own slot,
+    /// generation and release) and names the same object. A caller at its
+    /// handle quota gets `SosStatus.QuotaExceeded` and a full handle table is
+    /// `SosStatus.NoResource`; a handle without `Mint` terminates the caller.
+    public func mint(&self,
+                     rights: UInt32 = ALL_RIGHTS) -> Result<Timer, SosStatus> {
+        let raw = try call_value(self.handle, MINT_OP, rights as UInt, 0, 0)
+        return Timer(handle: TimerHandle(raw))
     }
 }
 

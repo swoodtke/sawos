@@ -1,0 +1,54 @@
+// `Thread.mint(rights:)` narrows (spec §3).
+//
+// The sibling keeps `Control` and not `Join`. It is a live handle: it yields
+// the calling thread, which needs `Control` on the caller's own handle, and
+// that is what makes the refusal mean the missing bit and not a broken sibling.
+// Joining through it then ends the process with an access denial.
+
+import sos.{System, Process, Thread, ThreadRight}
+
+/// What the sibling keeps: `Control` alone.
+static KEEP: UInt32 = (ThreadRight.Control as UInt32)
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS mintthread: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let me = try proc.thread_self() catch {
+        print("SOS mintthread: no thread handle: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let narrow = try me.mint(rights: KEEP) catch {
+        print("SOS mintthread: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try narrow.yield_now() catch {
+        print("SOS mintthread: the sibling could not yield: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS mintthread: the sibling yields\n")
+
+    let _ = system.debug_print("SOS mintthread: asking to join through it\n")
+    match narrow.join() {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS mintthread: UNREACHABLE\n")
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+        case Err(e) -> {
+            print("SOS mintthread: UNREACHABLE status {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+    }
+    let _ = proc.exit(EXIT_OK)
+}

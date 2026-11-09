@@ -5,10 +5,10 @@
 //! `Process.thread_self`, both of which live above this file, so nothing here
 //! reaches upward.
 
-import sosabi.{SosStatus, ThreadOp, ThreadHandle, NO_HANDLE}
+import sosabi.{SosStatus, ThreadOp, ThreadHandle, NO_HANDLE, MINT_OP}
 
 import sos.floor.{call_value, checked, sos_handle_release, sos_thread_exit,
-                  sos_thread_start, sos_thread_yield}
+                  sos_thread_start, sos_thread_yield, ALL_RIGHTS}
 
 /// A handle to a Thread, a kernel-scheduled execution context in a process.
 ///
@@ -69,5 +69,26 @@ extension Thread {
     /// cooperative-task spellings read alike.
     public func yield_now(&self) -> Result<Void, SosStatus> {
         checked(sos_thread_yield(self.handle))
+    }
+
+    /// Mint a sibling of this Thread handle, narrowed by a keep mask: the
+    /// universal `MINT_OP`, on `System.mint`'s exact terms. Requires the
+    /// universal `ThreadRight.Mint` on this handle.
+    ///
+    /// `rights` is what the sibling may keep: its rights are this handle's
+    /// intersected with the mask, so the default (all ones) is "the same
+    /// rights", and naming a right this handle does not hold is a no-op.
+    /// The mask is where a holder writes policy for a thread: a
+    /// sibling that keeps `Join` and not `Control` can collect the
+    /// exit value and cannot steer the thread.
+    ///
+    /// `Mint` is itself maskable. The sibling is independent (its own slot,
+    /// generation and release) and names the same object. A caller at its
+    /// handle quota gets `SosStatus.QuotaExceeded` and a full handle table is
+    /// `SosStatus.NoResource`; a handle without `Mint` terminates the caller.
+    public func mint(&self,
+                     rights: UInt32 = ALL_RIGHTS) -> Result<Thread, SosStatus> {
+        let raw = try call_value(self.handle, MINT_OP, rights as UInt, 0, 0)
+        return Thread(handle: ThreadHandle(raw))
     }
 }

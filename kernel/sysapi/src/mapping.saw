@@ -11,9 +11,10 @@
 //!
 //! It names only the floor, so `sos.system`, which produces one, can name it.
 
-import sosabi.{SosStatus, MappingHandle, MappingOp, NO_HANDLE}
+import sosabi.{SosStatus, MappingHandle, MappingOp, NO_HANDLE, MINT_OP}
 
-import sos.floor.{call_value, checked, sos_handle_release, sos_mapping_unmap}
+import sos.floor.{call_value, checked, sos_handle_release, sos_mapping_unmap,
+                  ALL_RIGHTS}
 
 /// A handle to a Mapping, one protection row, installed.
 ///
@@ -89,5 +90,26 @@ extension Mapping {
     /// the caller with `BadState`, the same two refusals as `unmap`.
     public func base(&self) -> Result<UInt, SosStatus> {
         call_value(self.handle, MappingOp.Base as UInt, 0, 0, 0)
+    }
+
+    /// Mint a sibling of this Mapping handle, narrowed by a keep mask: the
+    /// universal `MINT_OP`, on `System.mint`'s exact terms. Requires the
+    /// universal `MappingRight.Mint` on this handle.
+    ///
+    /// `rights` is what the sibling may keep: its rights are this handle's
+    /// intersected with the mask, so the default (all ones) is "the same
+    /// rights", and naming a right this handle does not hold is a no-op.
+    /// The mask is where a holder writes policy for an installed
+    /// row: a sibling that keeps `Base` and not `Unmap` can report
+    /// where the row is and cannot take it out.
+    ///
+    /// `Mint` is itself maskable. The sibling is independent (its own slot,
+    /// generation and release) and names the same object. A caller at its
+    /// handle quota gets `SosStatus.QuotaExceeded` and a full handle table is
+    /// `SosStatus.NoResource`; a handle without `Mint` terminates the caller.
+    public func mint(&self,
+                     rights: UInt32 = ALL_RIGHTS) -> Result<Mapping, SosStatus> {
+        let raw = try call_value(self.handle, MINT_OP, rights as UInt, 0, 0)
+        return Mapping(handle: MappingHandle(raw))
     }
 }

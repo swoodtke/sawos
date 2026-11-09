@@ -1833,6 +1833,12 @@ Not yet enforced:
   It is what lets a launcher mint what it hands over and keep its own, so
   supervision and self-management are not alternatives (§12).
 
+  **The typed tier spells every mask.** Every kind's rights enum is public in
+  the `sos` module, because a keep mask is assembled from its bits at a mint, a
+  give or before a send. Every wrapper whose kind's default set carries `Mint`
+  has a `mint(rights:)`, whose default is the all-ones mask. An Interrupt has
+  no typed `mint`, because it has one name.
+
   **An Interrupt has one name.** `Mint` is absent from `interrupt_rights()`,
   and attenuation is monotonic, so no handle onto an Interrupt can regain it:
   authority over a line is exactly one handle, which moves by `Transfer` and is

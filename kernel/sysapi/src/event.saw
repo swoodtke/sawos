@@ -5,9 +5,10 @@
 //! the same word and lives in `sos.waiter`, which imports this module, so the
 //! attachment that joins the two is written there.
 
-import sosabi.{SosStatus, EventOp, EventHandle, NO_HANDLE}
+import sosabi.{SosStatus, EventOp, EventHandle, NO_HANDLE, MINT_OP}
 
-import sos.floor.{call_value, checked, sos_event_signal, sos_handle_release}
+import sos.floor.{call_value, checked, sos_event_signal, sos_handle_release,
+                  ALL_RIGHTS}
 
 /// A handle to an Event, the accumulating non-blocking notification.
 ///
@@ -63,5 +64,26 @@ extension Event {
     /// wake answers zero unless a signal landed in between.
     public func receive(&self) -> Result<UInt, SosStatus> {
         call_value(self.handle, EventOp.Receive as UInt, 0, 0, 0)
+    }
+
+    /// Mint a sibling of this Event handle, narrowed by a keep mask: the
+    /// universal `MINT_OP`, on `System.mint`'s exact terms. Requires the
+    /// universal `EventRight.Mint` on this handle.
+    ///
+    /// `rights` is what the sibling may keep: its rights are this handle's
+    /// intersected with the mask, so the default (all ones) is "the same
+    /// rights", and naming a right this handle does not hold is a no-op.
+    /// The mask is where a holder writes policy for a notification:
+    /// a producer keeps `Signal` and not `Receive`, a consumer the
+    /// reverse.
+    ///
+    /// `Mint` is itself maskable. The sibling is independent (its own slot,
+    /// generation and release) and names the same object. A caller at its
+    /// handle quota gets `SosStatus.QuotaExceeded` and a full handle table is
+    /// `SosStatus.NoResource`; a handle without `Mint` terminates the caller.
+    public func mint(&self,
+                     rights: UInt32 = ALL_RIGHTS) -> Result<Event, SosStatus> {
+        let raw = try call_value(self.handle, MINT_OP, rights as UInt, 0, 0)
+        return Event(handle: EventHandle(raw))
     }
 }

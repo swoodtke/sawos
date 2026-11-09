@@ -1,0 +1,61 @@
+// `IoMemory.mint(rights:)` narrows (spec §3).
+//
+// The sibling keeps `Carve` and not `Map`. It is a live handle: it carves a
+// window, which is what makes the refusal mean the missing bit and not a broken
+// sibling. Installing it then ends the process with an access denial.
+
+import sos.{System, Process, IoMemory, IoMemoryRight}
+
+/// What the sibling keeps: `Carve` alone.
+static KEEP: UInt32 = (IoMemoryRight.Carve as UInt32)
+
+/// The console page's length, the same on both boards.
+static WINDOW_LEN: UInt = 0x1000
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS mintiomem: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var record = try proc.boot_handle_next() catch {
+        print("SOS mintiomem: no device window: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let window = record.take_iomemory() else {
+        let _ = system.debug_print("SOS mintiomem: boot record is not a window\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let narrow = try window.mint(rights: KEEP) catch {
+        print("SOS mintiomem: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _carved = try narrow.carve(offset: 0, len: WINDOW_LEN) catch {
+        print("SOS mintiomem: the sibling could not carve: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS mintiomem: the sibling carves\n")
+
+    let _ = system.debug_print("SOS mintiomem: asking to map through it\n")
+    match proc.map(iomemory: &narrow) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS mintiomem: UNREACHABLE\n")
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+        case Err(e) -> {
+            print("SOS mintiomem: UNREACHABLE status {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+    }
+    let _ = proc.exit(EXIT_OK)
+}

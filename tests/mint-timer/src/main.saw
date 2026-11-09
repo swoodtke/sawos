@@ -1,0 +1,66 @@
+// `Timer.mint(rights:)` narrows (spec §3).
+//
+// The sibling keeps `Wait` and not `Arm`. It is a live handle: a Waiter
+// attaches it, which is what makes the refusal mean the missing bit and not a
+// broken sibling. Arming it then ends the process with an access denial.
+
+import sos.{System, Process, Timer, TimerRight}
+
+/// What the sibling keeps: `Wait` alone.
+static KEEP: UInt32 = (TimerRight.Wait as UInt32)
+
+static KEY: UInt = 5
+static AFTER_NS: UInt64 = 1000000
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS minttimer: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let clock = try system.clock_get() catch {
+        print("SOS minttimer: no clock: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let timer = try clock.timer_create() catch {
+        print("SOS minttimer: no timer: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let waiter = try proc.waiter_create() catch {
+        print("SOS minttimer: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let narrow = try timer.mint(rights: KEEP) catch {
+        print("SOS minttimer: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try waiter.add(&narrow, KEY) catch {
+        print("SOS minttimer: the sibling would not attach: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS minttimer: the sibling attaches\n")
+
+    let _ = system.debug_print("SOS minttimer: asking to arm through it\n")
+    match narrow.arm(AFTER_NS) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS minttimer: UNREACHABLE\n")
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+        case Err(e) -> {
+            print("SOS minttimer: UNREACHABLE status {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+    }
+    let _ = proc.exit(EXIT_OK)
+}

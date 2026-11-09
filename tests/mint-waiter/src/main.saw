@@ -1,0 +1,82 @@
+// `Waiter.mint(rights:)` narrows (spec §3).
+//
+// The sibling keeps `Wait` and not `Attach`. It is a live handle: it reports
+// the event attached through the original, which is what makes the refusal mean
+// the missing bit and not a broken sibling. Attaching anything new through it
+// then ends the process with an access denial.
+
+import sos.{System, Process, Waiter, WaiterRight}
+
+/// What the sibling keeps: `Wait` alone.
+static KEEP: UInt32 = (WaiterRight.Wait as UInt32)
+
+static KEY_FIRST: UInt = 5
+static KEY_SECOND: UInt = 6
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS mintwaiter: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let waiter = try proc.waiter_create() catch {
+        print("SOS mintwaiter: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let first = try proc.event_create() catch {
+        print("SOS mintwaiter: no first event: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let second = try proc.event_create() catch {
+        print("SOS mintwaiter: no second event: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try waiter.add(&first, KEY_FIRST) catch {
+        print("SOS mintwaiter: attach failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try first.signal(1) catch {
+        print("SOS mintwaiter: signal failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let narrow = try waiter.mint(rights: KEEP) catch {
+        print("SOS mintwaiter: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let heard = try narrow.wait() catch {
+        print("SOS mintwaiter: the sibling could not wait: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    if heard.key != KEY_FIRST {
+        let _ = system.debug_print("SOS mintwaiter: woke for the wrong thing\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS mintwaiter: the sibling waits\n")
+
+    let _ = system.debug_print("SOS mintwaiter: asking to attach through it\n")
+    match narrow.add(&second, KEY_SECOND) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS mintwaiter: UNREACHABLE\n")
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+        case Err(e) -> {
+            print("SOS mintwaiter: UNREACHABLE status {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+    }
+    let _ = proc.exit(EXIT_OK)
+}

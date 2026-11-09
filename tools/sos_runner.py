@@ -351,15 +351,24 @@ CHILD_SHARE_PKG = os.path.join(TESTS_DIR, "child-share")
 MAP_EXEC_GATED_PKG = os.path.join(TESTS_DIR, "map-exec-gated")
 MAP_WX_REFUSED_PKG = os.path.join(TESTS_DIR, "map-wx-refused")
 
+# A typed `mint(rights:)` narrows, and the withheld right is refused. Each is
+# its own image because the refusal is a fault, which ends the process.
+MINT_EVENT_PKG = os.path.join(TESTS_DIR, "mint-event")
+MINT_WAITER_PKG = os.path.join(TESTS_DIR, "mint-waiter")
+MINT_TIMER_PKG = os.path.join(TESTS_DIR, "mint-timer")
+MINT_THREAD_PKG = os.path.join(TESTS_DIR, "mint-thread")
+MINT_CLOCK_PKG = os.path.join(TESTS_DIR, "mint-clock")
+MINT_IOMEMORY_PKG = os.path.join(TESTS_DIR, "mint-iomemory")
+MINT_MAPPING_PKG = os.path.join(TESTS_DIR, "mint-mapping")
+
 # Waiter revocation: one root server, because its three claims (a revocation is
 # delivered, the walk is the whole blocked list, the count gates it rather than
 # the release) are one story about one release, and splitting them would need
 # the same three threads on the same Waiter in each image.
 #
-# It reaches the C altitude: the count claim needs two names for one Waiter, and
-# the typed `sos` surface publishes `mint` on `System` and `Memory` alone while
-# a `Waiter` keeps its handle word private, so the reference arithmetic is
-# written where a handle is a word.
+# It is written at the C altitude, where a handle is a word: the count claim
+# needs two names for one Waiter, and the reference arithmetic mints the second
+# with `sos_handle_mint`.
 WAITER_REVOKED_PKG = os.path.join(TESTS_DIR, "waiter-revoked")
 
 # The pipe. A rights refusal and a bad-argument refusal are both faults, so the
@@ -3270,6 +3279,108 @@ TEST_CASES = [
                        "SOS: process teardown handles={eight} threads={one} "
                        "events={zero} waiters={zero} interrupts={zero} "
                        "timers={zero} process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # `Event.mint(rights:)` narrows. The sibling works (the line before
+        # the refusal), and `EventRight.Signal` is refused through it.
+        "name": "mint_narrow_event",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MINT_EVENT_PKG,
+        "expect_out": ["{banner}",
+                       "SOS mintevent: the sibling receives",
+                       "SOS mintevent: asking to signal through it",
+                       "SOS: process fault: access denied",
+                       "SOS: process teardown"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # `Waiter.mint(rights:)` narrows. The sibling works (the line before
+        # the refusal), and `WaiterRight.Attach` is refused through it.
+        "name": "mint_narrow_waiter",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MINT_WAITER_PKG,
+        "expect_out": ["{banner}",
+                       "SOS mintwaiter: the sibling waits",
+                       "SOS mintwaiter: asking to attach through it",
+                       "SOS: process fault: access denied",
+                       "SOS: process teardown"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # `Timer.mint(rights:)` narrows. The sibling works (the line before
+        # the refusal), and `TimerRight.Arm` is refused through it.
+        "name": "mint_narrow_timer",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MINT_TIMER_PKG,
+        "expect_out": ["{banner}",
+                       "SOS minttimer: the sibling attaches",
+                       "SOS minttimer: asking to arm through it",
+                       "SOS: process fault: access denied",
+                       "SOS: process teardown"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # `Thread.mint(rights:)` narrows. The sibling works (the line before
+        # the refusal), and `ThreadRight.Join` is refused through it.
+        "name": "mint_narrow_thread",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MINT_THREAD_PKG,
+        "expect_out": ["{banner}",
+                       "SOS mintthread: the sibling yields",
+                       "SOS mintthread: asking to join through it",
+                       "SOS: process fault: access denied",
+                       "SOS: process teardown"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # `Clock.mint(rights:)` narrows. The sibling works (the line before
+        # the refusal), and `ClockRight.Read` is refused through it.
+        "name": "mint_narrow_clock",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MINT_CLOCK_PKG,
+        "expect_out": ["{banner}",
+                       "SOS mintclock: the sibling makes a timer",
+                       "SOS mintclock: asking for the time through it",
+                       "SOS: process fault: access denied",
+                       "SOS: process teardown"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # `IoMemory.mint(rights:)` narrows. The sibling works (the line before
+        # the refusal), and `IoMemoryRight.Map` is refused through it.
+        "name": "mint_narrow_iomemory",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MINT_IOMEMORY_PKG,
+        "device": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS mintiomem: the sibling carves",
+                       "SOS mintiomem: asking to map through it",
+                       "SOS: process fault: access denied",
+                       "SOS: process teardown"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # `Mapping.mint(rights:)` narrows. The sibling works (the line before
+        # the refusal), and `MappingRight.Unmap` is refused through it.
+        "name": "mint_narrow_mapping",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MINT_MAPPING_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS mintmapping: the sibling reports its base",
+                       "SOS mintmapping: asking to unmap through it",
+                       "SOS: process fault: access denied",
+                       "SOS: process teardown"],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
     },

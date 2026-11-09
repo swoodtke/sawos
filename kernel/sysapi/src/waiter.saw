@@ -16,11 +16,11 @@
 //! subscription verbs and the one wire call under them.
 
 import sosabi.{SosStatus, WaiterHandle, NO_HANDLE, EventHandle,
-               InterruptHandle, TimerHandle,
-               WAITER_ADD_CONSUMING, WAITER_ADD_ONESHOT}
+               InterruptHandle, TimerHandle, WAITER_ADD_CONSUMING,
+               WAITER_ADD_ONESHOT, MINT_OP}
 
 import sos.floor.{checked, sos_handle_release, sos_waiter_add,
-                  sos_waiter_remove}
+                  sos_waiter_remove, ALL_RIGHTS, call_value}
 import sos.event.{Event}
 import sos.interrupt.{Interrupt}
 import sos.timer.{Timer}
@@ -257,4 +257,24 @@ extension Waiter {
         checked(sos_waiter_remove(self.handle, key))
     }
 
+    /// Mint a sibling of this Waiter handle, narrowed by a keep mask: the
+    /// universal `MINT_OP`, on `System.mint`'s exact terms. Requires the
+    /// universal `WaiterRight.Mint` on this handle.
+    ///
+    /// `rights` is what the sibling may keep: its rights are this handle's
+    /// intersected with the mask, so the default (all ones) is "the same
+    /// rights", and naming a right this handle does not hold is a no-op.
+    /// The mask is where a holder writes policy for a Waiter: a
+    /// sibling that keeps `Wait` and not `Attach` can park on what
+    /// is already attached and add nothing.
+    ///
+    /// `Mint` is itself maskable. The sibling is independent (its own slot,
+    /// generation and release) and names the same object. A caller at its
+    /// handle quota gets `SosStatus.QuotaExceeded` and a full handle table is
+    /// `SosStatus.NoResource`; a handle without `Mint` terminates the caller.
+    public func mint(&self,
+                     rights: UInt32 = ALL_RIGHTS) -> Result<Waiter, SosStatus> {
+        let raw = try call_value(self.handle, MINT_OP, rights as UInt, 0, 0)
+        return Waiter(handle: WaiterHandle(raw))
+    }
 }
