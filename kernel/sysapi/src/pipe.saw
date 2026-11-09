@@ -141,13 +141,19 @@ extension PipeHandle: NoCopy {}
 /// `Process.give`'s funnels do, one overload per givable kind.
 ///
 /// It is `NoCopy` and its drop releases what it still holds. A carrier that is
-/// built and never sent releases its handles, as the wrappers would have. A
-/// post that succeeds clears the slots, because the kernel has taken the
-/// entries out of this process's table, so the drop is a no-op. A post that is
-/// refused leaves the slots alone, so the caller may retry with the same
-/// carrier or drop it: `Err(WouldBlock)` must not cost a caller its
-/// capabilities. The other sending ops clear the carrier whatever they answer;
-/// see `handed_over`.
+/// built and never sent releases its handles, as the wrappers would have.
+///
+/// A send either keeps the carrier's handles or consumes them. A transient
+/// refusal (`WouldBlock`, `NoResource`, `QuotaExceeded`) leaves the slots
+/// alone, so the caller may retry with the same carrier or drop it:
+/// `Err(WouldBlock)` must not cost a caller its capabilities. Every other
+/// outcome clears the slots: the kernel has taken the entries out of this
+/// process's table, to deliver them or, on a terminal refusal such as
+/// `PeerClosed`, to release them, so the drop is a no-op. Only `post_with` can
+/// refuse the send itself transiently; the other sending ops clear the carrier
+/// whatever they answer, because a fused op's `NoResource` or `QuotaExceeded`
+/// at the reply's delivery comes after the carried handles were staged. See
+/// `handed_over`.
 public struct PipeHandles {
     public(package) kinds: [UInt8; PIPE_MSG_HANDLES],
     public(package) words: [UInt; PIPE_MSG_HANDLES],
@@ -250,12 +256,11 @@ extension PipeHandles {
         }
     }
 
-    /// Forget every slot without releasing. `post_body` calls it once the
-    /// kernel has staged the message, which unbinds each sent entry from this
-    /// process's table. `call_body`, `reply_body` and `reply_wait_body` call it
-    /// on every answer, including a `PeerClosed` that took nothing; on that
-    /// path the entries stay bound in this process's table with no word left
-    /// to name them, until the process exits.
+    /// Forget every slot without releasing. The kernel has unbound each sent
+    /// entry from this process's table by the time any of its callers runs
+    /// this: `post_body` calls it once the message is staged or on
+    /// `PeerClosed`, and `call_body`, `reply_body` and `reply_wait_body` call
+    /// it on every answer. A word kept past this point is stale.
     func handed_over(&var self) {
         var i: Int = 0
         while i < PIPE_MSG_HANDLES {
@@ -689,7 +694,7 @@ extension PipeInlet {
     /// `Err(SosStatus.PeerClosed)` means every outlet handle onto this
     /// connection is gone, so nobody can ever take what you would send. It is
     /// terminal, since nothing un-closes, so a caller may stop rather than
-    /// retry.
+    /// retry. A message that carried handles has them released.
     ///
     /// It answers the claim (§2.1's `send` yields a `PipeReplyHandle`, and this
     /// is it). `Ok(claim)` is a staged message and the client's claim on the
@@ -720,15 +725,24 @@ extension PipeInlet {
     /// than by value, because a refused post must not cost a caller its
     /// capabilities: `Err(WouldBlock)` is a full ring and the ordinary thing a
     /// poll loop meets, so the handles have to still be there to try again
-    /// with. On the staged path the carrier is emptied, and on every refusal
-    /// it is untouched.
+    /// with.
+    ///
+    /// The carrier's fate follows the status. A transient refusal
+    /// (`WouldBlock`, `NoResource` when the table has no room for the claim,
+    /// `QuotaExceeded` when the handle budget is spent) leaves the carrier
+    /// untouched, with every wrapper live. A staged message empties it, and so
+    /// does `Err(PeerClosed)`: that refusal is terminal, so the kernel releases
+    /// the carried handles. Releasing may destroy the object, when the sent
+    /// handle was its last: the far end of a carried pipe end is told, for
+    /// example.
     ///
     /// The entries leave this process's table at the post: the kernel unbinds
     /// each sent handle and holds it in the exchange until the receiver's
     /// take, or a delivery, mints it into the receiver's table. A copy of a
     /// sent word kept anywhere is stale from the post on, and using it, a
     /// release included, is a `BadHandle` fault that ends the process. A
-    /// refusal takes nothing.
+    /// transient refusal takes nothing, and `PeerClosed` takes them to release
+    /// them.
     public func post_with(&self, body: &[UInt8; PIPE_BODY_BYTES], len: UInt,
                           handles: &var PipeHandles) -> Result<PipeReply, SosStatus> {
         post_body(self.handle, &body, len, &var handles)
@@ -777,13 +791,17 @@ extension PipeInlet {
 
     /// The same call, carrying handles. Everything `post_with` says about when
     /// the entries leave holds, with one difference the fused path makes: a
-    /// `Call` never answers a transient refusal, so the carrier is emptied on
-    /// every path that returns. `Err(PeerClosed)` is the one that can cost
-    /// them: when the server end was gone before the message was staged,
-    /// nothing was taken, and the entries stay bound in this process's table
-    /// with no word left to name them. The answer may carry handles too,
-    /// because §2.1's `send(data?, handles?)` is symmetric: the `PipeMsg` that
-    /// comes back has slots of its own.
+    /// `Call` never refuses the send itself transiently (a full ring parks it),
+    /// so the carrier is emptied on every path that returns. A `NoResource` or
+    /// `QuotaExceeded` answered at the reply's delivery comes after the message
+    /// was staged, so it consumes the handles with it. `Err(PeerClosed)`
+    /// consumes the handles too,
+    /// whether or not the message was staged: when the server end was gone
+    /// before the message was staged, or went while the call waited for room,
+    /// the kernel releases them, and that may destroy an object whose last
+    /// handle this was. The answer may carry handles too, because §2.1's
+    /// `send(data?, handles?)` is symmetric: the `PipeMsg` that comes back has
+    /// slots of its own.
     public func send_with(&self, body: &[UInt8; PIPE_BODY_BYTES], len: UInt,
                           handles: &var PipeHandles) -> Result<PipeMsg, SosStatus> {
         call_body(self.handle, &body, len, &var handles)
@@ -837,11 +855,26 @@ func post_body(handle: PipeInletHandle, body: &[UInt8; PIPE_BODY_BYTES],
                                   (&var value) as UnsafePointer<UInt>)
     // `checked` decodes the answer: the wire still says `WouldBlock`, and the
     // typed answer puts it on the error channel.
-    try checked(raw)
-    // The carrier is emptied only on the staged path. The kernel has unbound
-    // the sent entries and holds them for the receiver, so the words are stale
-    // and releasing one here would be a `BadHandle` fault; a refusal never
-    // reaches this line, so the caller keeps everything it had.
+    //
+    // The status is read before the carrier is touched. A transient refusal
+    // (`WouldBlock`, `NoResource`, `QuotaExceeded`) leaves the entries bound,
+    // so the carrier keeps its wrappers and the caller may retry with it. Any
+    // other status is terminal: the kernel has released the entries, so the
+    // words are stale. The set is closed by name so that a status added later
+    // empties the carrier, which leaks at worst, rather than keeps stale words
+    // that fault when the carrier drops.
+    try checked(raw) catch {
+        match error {
+            case WouldBlock -> {},
+            case NoResource -> {},
+            case QuotaExceeded -> {},
+            case _ -> { handles.handed_over() },
+        }
+        return error
+    }
+    // A staged message: the kernel has unbound the sent entries and holds them
+    // for the receiver, so the words are stale and releasing one here would be
+    // a `BadHandle` fault.
     handles.handed_over()
     return PipeReply(handle: PipeReplyHandle(value))
 }
@@ -940,10 +973,11 @@ func call_body(handle: PipeInletHandle, body: &[UInt8; PIPE_BODY_BYTES],
                                   (&var reply) as UnsafePointer<UInt>,
                                   (&var value) as UnsafePointer<UInt>)
     // The carrier is emptied before the answer is read, unlike `post`'s: a
-    // `Call` parks rather than refusing, so every answer but `PeerClosed`
-    // follows a staged message. A `PeerClosed` from a server end that was
-    // already gone took nothing, and those entries are left bound with no word
-    // to name them (see `handed_over`).
+    // `Call` parks rather than refusing the send, so every answer consumes the
+    // entries. A staged message carries them to the server, a `PeerClosed`
+    // from a server end that was gone before or during the park has the kernel
+    // release them, and a `NoResource` or `QuotaExceeded` at the reply's
+    // delivery comes after they were staged.
     handles.handed_over()
     try checked(raw)
     return msg_of(&reply.meta, &reply.handles, &reply.bytes)
@@ -1281,10 +1315,11 @@ extension PipeRequest {
     /// answering direction.
     ///
     /// The carrier is emptied on every path this method can return through: a
-    /// reply is discharged whatever it answers, so there is no retry to keep
-    /// handles for. `Err(PeerClosed)` is the one that costs them: the client
-    /// abandoned its claim, nothing was staged, and the words the carrier held
-    /// name entries this process still owns with no typed name left for them.
+    /// reply is discharged whatever it answers and no answer refuses the send
+    /// transiently, so there is no retry to keep handles for. `Err(PeerClosed)`
+    /// consumes them too: the client abandoned its claim, nothing was staged,
+    /// and the kernel releases the carried handles, which may destroy an object
+    /// whose last handle this was.
     public func reply_with(&var self, body: &[UInt8; PIPE_BODY_BYTES], len: UInt,
                            handles: &var PipeHandles) consumes -> Result<Void, SosStatus> {
         reply_body(self.handle, &body, len, &var handles)
@@ -1339,7 +1374,8 @@ extension PipeRequest {
 
     /// The same fused reply, carrying handles. Everything `reply_with` says
     /// about the carrier holds here too: the obligation is discharged on every
-    /// path, so the handles go with it.
+    /// path, so the handles go with it, delivered or, on `Err(Reply(_))`,
+    /// released.
     public func reply_wait_with(&var self, body: &[UInt8; PIPE_BODY_BYTES],
                                 len: UInt, waiter: &Waiter,
                                 handles: &var PipeHandles

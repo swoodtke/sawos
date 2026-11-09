@@ -983,6 +983,46 @@ public(package) func hold_staged(p: Int, x: Int,
     }
 }
 
+/// Release the handle entries a refused send carried: a terminal refusal
+/// consumes them, as a delivered message does.
+///
+/// Each non-empty slot is released the way `RELEASE_OP` releases (unbind, then
+/// unref), so an object whose last handle this was is freed: a pipe end
+/// reaches zero and its peer is told, for example. A transient refusal of the
+/// send itself (`WouldBlock`, `NoResource`, `QuotaExceeded`, answered before
+/// the message is staged) must not call this; those leave the entries with the
+/// caller.
+///
+/// The slots are validated again, as `hold_staged` validates them: the paths
+/// where the caller is running have had the record through `check_send`, but
+/// `resume_call_room` re-reads a record a sibling thread may have rewritten,
+/// and there is no fault to raise for a caller that is not running. A slot that
+/// fails the questions, or that an earlier slot of the same record already
+/// released, is skipped.
+public(package) func release_carried(p: Int, args: &PipeSendRecord) unsafe {
+    var i: Int = 0
+    while i < PIPE_MSG_HANDLES {
+        let word = args.handles[i]
+        if word != NO_HANDLE {
+            let entry = lookup_handle(p, word)
+            match entry.obj_type {
+                case Unbound -> {},
+                case _ -> {
+                    let may_send = rights_allow_transfer(entry.rights)
+                    let spellable = msg_kind_of(entry.obj_type).is_some()
+                    if may_send && spellable {
+                        // Unbind before the unref, so nothing in the cascade
+                        // can find the released entry by lookup.
+                        unbind_handle(p, handle_word_index(word))
+                        unref_object(entry.obj_type, entry.target)
+                    }
+                },
+            }
+        }
+        i = i + 1
+    }
+}
+
 /// Mint every held reference of `x` into `p`'s table: the second half, and the
 /// one place spec §2.1's "attached handles enter the receiver's table only at
 /// receive" happens.
@@ -1614,10 +1654,22 @@ public(package) func notify_room(c: Int) unsafe {
 func resume_call_room(t: Int, c: Int) unsafe -> Bool {
     let p = THREADS[t].process
     if PIPES[c].outlet_refs == 0 {
+        // Terminal, and the message was never staged: the record is re-read to
+        // release the handles it carried, exactly as `pipe_call` releases them
+        // when it meets a closed outlet without parking.
+        var carried = PipeSendRecord(body: 0, len: 0,
+                                     handles: [NO_HANDLE; PIPE_MSG_HANDLES])
+        if let why = copy_in(p, ((&var carried) as UnsafePointer<PipeSendRecord>) as UInt,
+                             THREADS[t].call_src, THREADS[t].call_len) {
+            fatal("parked call record refused by the copy door",
+                  (why as UInt8) as UInt, THREADS[t].call_src, p as UInt,
+                  ExitCode.ProcessFault)
+        }
         clear_pending_call(t)
         write_result(frame_slot(t), op_status(SosStatus.PeerClosed))
         THREADS[t].state = ThreadState.Runnable
         ready_push(t)
+        release_carried(p, &carried)
         return true
     }
     let x = alloc_exchange(c)

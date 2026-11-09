@@ -221,7 +221,8 @@ import kcore.stats.{stats_bump, stats_clear, stats_read, stats_region_phys,
 import kcore.refs.{PipeMsgPrefix, PipeTakePrefix, deliver_attachment,
                    hold_staged, mint_staged, move_entry, msg_prefix,
                    notify_claim, notify_if_ready,
-                   notify_ready, ref_object, ref_waitable, signal_event,
+                   notify_ready, ref_object, ref_waitable, release_carried,
+                   signal_event,
                    unref_object, unref_waitable, wake_one_waiter}
 import kcore.threads.{
     CURRENT_THREAD,
@@ -2983,11 +2984,12 @@ func pipe_inlet_op_decoded(op: PipeInletOp, obj: &PipeInletObject, arg0: UInt,
 /// every mint makes "refuses the whole post, atomic, nothing staged" true by
 /// construction rather than by an unwind.
 ///
-/// It validates and does not unbind. The entries do leave the sender (take at
-/// post), but not here, which keeps every later refusal free of an unwind: a
-/// full ring, a departed peer and a table with no room for the claim are all
-/// answered while the caller still holds everything it held, because
-/// `hold_staged` runs after the last of them.
+/// It validates and does not unbind. The entries leave the sender (take at
+/// post) in `hold_staged`, which runs after the last refusal that leaves them
+/// in place. So a full ring and a table with no room for the claim are answered
+/// while the caller still holds everything it held. A departed peer is
+/// answered earlier still, but it is terminal: the entries are released
+/// (`release_carried`), not kept.
 func send_args(p: Int, src: UInt, bytes: UInt) unsafe -> PipeSendRecord {
     // Exactly the published size (`timer_arm`'s rule): the record is the whole
     // argument list, and a caller that hands over a different number of words
@@ -3057,18 +3059,21 @@ func check_send(p: Int, args: &PipeSendRecord) unsafe {
 ///   - The outlet column at zero is `PeerClosed`, asked before the ring because
 ///     it is the stronger fact: nobody can ever take again, so a free slot
 ///     would be a place to put a message with no future. The staged bodies were
-///     already dropped at that transition (`kcore.refs`), so this arm only
-///     reports.
+///     already dropped at that transition (`kcore.refs`). The refusal is
+///     terminal, so the handles the message carried are released.
 ///   - A full ring is `WouldBlock`: caller-checkable, transient, never a park.
 ///     A blocking send is the fused `Call` (`pipe_call`), which waits for room
-///     instead.
+///     instead. The carried handles stay with the caller, as they do on the
+///     mint refusals below.
 ///
 /// A staged message opens an exchange, and the `PipeReply` handle minted into
 /// the poster's table is the client's claim on its one reply.
 ///
 /// A refused post mints nothing: the ring is scanned but nothing is committed
-/// until the claim exists, so a full handle table leaves the connection exactly
-/// as it was. The scan reserves nothing, so an early return leaks no slot.
+/// until the claim exists, so a full handle table (`NoResource`) or a spent
+/// handle budget (`QuotaExceeded`) leaves the connection, and the caller's
+/// carried handles, exactly as they were. The scan reserves nothing, so an
+/// early return leaks no slot.
 ///
 /// A ring slot lives until its exchange settles rather than until its bytes are
 /// taken, so `PIPE_INFLIGHT` bounds awaiting-reply exchanges.
@@ -3076,6 +3081,9 @@ func pipe_post(p: Int, slot: Int, args_src: UInt, args_bytes: UInt) unsafe -> Sy
     let args = send_args(p, args_src, args_bytes)
     let len = args.len
     if PIPES[slot].outlet_refs == 0 {
+        // Terminal: the carried handles are consumed, as they would have been
+        // by a delivery.
+        release_carried(p, &args)
         return op_status(SosStatus.PeerClosed)
     }
     let x = alloc_exchange(slot)
@@ -3154,6 +3162,13 @@ func pipe_post(p: Int, slot: Int, args_src: UInt, args_bytes: UInt) unsafe -> Sy
 ///     each address is validated here, while the caller is the running process
 ///     and a refusal can still terminate it (`copy_in_check`).
 ///
+/// The call's own refusal is never transient: a full ring parks it and no claim
+/// is minted. Its refusal, `PeerClosed`, is terminal, so the carried handles
+/// are released whether the outlet closed before the call or while it waited
+/// for room (`resume_call_room`). A `NoResource` or `QuotaExceeded` at the
+/// reply's delivery comes after the message was staged, so it consumes them
+/// like every later outcome.
+///
 /// The reply buffer takes no capacity argument: the three argument registers
 /// are spent, so the buffer is checked against `pipe_msg_record_bytes()` of the
 /// caller's real memory, which is stricter than a number the caller types (as
@@ -3186,6 +3201,8 @@ func pipe_call(p: Int, slot: Int, args_src: UInt, args_bytes: UInt,
     }
 
     if PIPES[slot].outlet_refs == 0 {
+        // Terminal: the carried handles are consumed, as `pipe_post`'s are.
+        release_carried(p, &args)
         return op_status(SosStatus.PeerClosed)
     }
     let x = alloc_exchange(slot)
@@ -3650,11 +3667,14 @@ func pipe_request_op_decoded(op: PipeRequestOp, obj: &PipeRequestObject,
 /// ignore (§2.1: abandonment is information, not an imperative), and a reply
 /// that arrives afterwards is told so rather than silently succeeding,
 /// ignorable with `let _ =`. The obligation is discharged all the same, which
-/// lets the slot go.
+/// lets the slot go, and the handles the reply carried are released.
 ///
 /// An exchange already `Replied` (or `Settled`) answers `PeerClosed` too: there
 /// is no longer a claim waiting for this reply. Single use is a property of the
-/// exchange, not of the handle.
+/// exchange, not of the handle. The carried handles are released here as well.
+///
+/// No status of this op leaves the carried handles with the caller: every
+/// answer other than a fault consumes them, by delivery or by release.
 ///
 /// It answers a `SosStatus` rather than a `SyscallResult` because
 /// `PipeRequestOp.ReplyWait` runs this leg and has to look at the answer: a
@@ -3669,10 +3689,10 @@ func pipe_reply_status(p: Int, word: UInt, x: Int,
             if EXCHANGES[x].reply_refs == 0 {
                 // Abandoned by the client. Nothing is copied, since there is
                 // nobody to copy it for, and the obligation is discharged,
-                // which settles the slot. Nothing is staged either: the replier
-                // keeps every handle the reply meant to carry, as it keeps them
-                // when its client dies mid-exchange.
+                // which settles the slot. Nothing is staged either: the
+                // handles the reply meant to carry are released.
                 consume_entry(p, word, ObjType.PipeRequest, x)
+                release_carried(p, &args)
                 return SosStatus.PeerClosed
             }
             if len != 0 {
@@ -3708,6 +3728,7 @@ func pipe_reply_status(p: Int, word: UInt, x: Int,
         },
         case Replied -> {
             consume_entry(p, word, ObjType.PipeRequest, x)
+            release_carried(p, &args)
             SosStatus.PeerClosed
         },
         // A delivered reply, discharged through somebody's wait. It is
@@ -3717,6 +3738,7 @@ func pipe_reply_status(p: Int, word: UInt, x: Int,
         // happened.
         case Settled -> {
             consume_entry(p, word, ObjType.PipeRequest, x)
+            release_carried(p, &args)
             SosStatus.PeerClosed
         },
         // Unreachable: an obligation is minted at the take, the same moment the
@@ -3779,7 +3801,8 @@ func reply_wait_waiter(p: Int, handle: UInt) unsafe -> Int {
 /// A refused reply returns without parking. The request is consumed either way
 /// (§2.1), but a `PeerClosed` comes straight back with `ReplyWaitLeg.Reply` in
 /// the value register, so one dead client can never stall a server loop. The
-/// recovery is the caller's own next `WaiterOp.Wait`.
+/// recovery is the caller's own next `WaiterOp.Wait`. The reply's carried
+/// handles are released on that refusal, as `pipe_reply_status` releases them.
 func pipe_reply_wait(p: Int, word: UInt, x: Int, args_src: UInt,
                      args_bytes: UInt, rec_dst: UInt) unsafe -> SyscallResult {
     // Exactly the published size (`timer_arm`'s rule): the record is the whole

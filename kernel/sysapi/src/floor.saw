@@ -746,7 +746,10 @@ public func sos_process_pipe_create(handle: UInt, buf: UnsafePointer<UInt>,
 /// The handles leave the caller's table at the post: the kernel unbinds each
 /// one and holds it in the exchange until the receiver takes it, so each word
 /// is stale afterwards and using it, a release included, is a `BadHandle`
-/// fault. A refusal takes nothing.
+/// fault. A transient refusal of the send itself (`WouldBlock`, `NoResource`,
+/// `QuotaExceeded`, answered before the message is staged) takes nothing: the
+/// words stay the caller's. A terminal one (`PeerClosed`) releases them, which
+/// destroys an object whose last handle one was.
 ///
 /// The value is a `PipeReply` handle: the client's claim on the one reply this
 /// message is owed, minted into the caller's table. On a refusal nothing is
@@ -792,13 +795,17 @@ public func sos_pipe_inlet_post(handle: UInt, args: UnsafePointer<UInt>,
 /// end went while the caller was parked, or the caller's message was still
 /// staged when the last outlet handle went. It is `resolve`'s own convention,
 /// so the fused and composed paths report the same fact with the same word.
-/// When the server end was gone before the message was staged (at the call, or
-/// while the caller was parked for room), nothing was taken and the handle
-/// words are still the caller's.
+/// The call itself never refuses transiently: a full ring parks it and no claim
+/// is minted, so no answer leaves the carried handles with the caller.
+/// `PeerClosed` is terminal for them: the kernel releases them whether or not
+/// the message was staged (at the call, while the caller was parked for room,
+/// or after staging), and the words are stale afterwards.
 ///
 /// The one other refusal is a reply whose handles find no room in the caller's
 /// table: `SosStatus.NoResource` or `SosStatus.QuotaExceeded`, with the reply
-/// and its handles lost, because a parked call cannot ask again.
+/// and its handles lost, because a parked call cannot ask again. It comes
+/// after the message was staged, so it is terminal for the carried handles as
+/// well: they were consumed with the message.
 ///
 /// No claim handle is minted, either way. A blocking client spends no table row
 /// on a claim, so its in-flight depth is not bounded by `MAX_HANDLES`.
@@ -829,8 +836,10 @@ public func sos_pipe_inlet_call(handle: UInt, args: UnsafePointer<UInt>,
 /// The obligation is discharged on every path (§2.1), so the caller's handle
 /// word is dead whatever comes back. A Saw caller cannot reach it again,
 /// because `PipeRequest.reply_wait` is a `consumes` method. The reply's
-/// handles leave the caller's table when the reply lands; a `Reply`-leg
-/// failure took none of them.
+/// handles leave the caller's table when the reply lands. A `Reply`-leg
+/// failure (`PeerClosed`) releases them instead, which destroys an object whose
+/// last handle one was, and the words are stale afterwards. A `Wait`-leg
+/// failure comes after the reply landed, so they were consumed with it.
 ///
 /// The answer has two channels. `Ok` means the reply landed and a delivery is
 /// in `record`. Any other status comes with a `ReplyWaitLeg` in `value_out`
@@ -929,8 +938,9 @@ public func sos_pipe_reply_ready(handle: UInt) -> UInt {
 /// checks; `args_bytes` must be exactly `pipe_send_record_bytes()`. The length
 /// may be 0 (a reply that carries no data is still an answer), and a length
 /// above `PIPE_BODY_BYTES` terminates the caller, as at a post. The handles
-/// leave the caller's table when the reply lands; a `PeerClosed` took none of
-/// them.
+/// leave the caller's table when the reply lands; on a `PeerClosed` the kernel
+/// releases them instead of delivering them, which destroys an object whose
+/// last handle one was.
 ///
 /// It always consumes the request, which is what single-use means: the caller's
 /// handle is destroyed whether the reply landed or not, and using the word

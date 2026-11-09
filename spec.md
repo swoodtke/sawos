@@ -181,11 +181,9 @@ in the caller's hands.
 the kernel): `reply()` to an abandoned request answers `Err(PeerClosed)`, never
 a silent success — ignorable with `let _ =`, the std-Channel close precedent.
 The obligation is discharged either way. The handles attached to such a reply
-are not taken — the kernel takes nothing from a reply to an abandoned request —
-so the replier keeps them, and the typed tier hands them back. Not yet enforced
-at the typed tier: `reply_with` and `reply_wait_with` empty their handle carrier
-before reading the status, so the handles stay in the replier's table with no
-wrapper naming them. The `PipeRequestHandle` is waitable for "abandoned" (opt-in
+are not delivered, and they are not left with the replier either: a reply to an
+abandoned request releases them (§3), so an object whose last handle one was
+is freed. The `PipeRequestHandle` is waitable for "abandoned" (opt-in
 early notice; state on the kernel object, so it travels with a delegated
 handle). Dropping the last reference to a claim is thereby the cancellation
 primitive — time out, then drop the pending claim; no `cancel()` verb, and
@@ -1838,18 +1836,29 @@ Not yet enforced:
     the refusal arm builds a fresh wrapper around the word the kernel provably
     did not consume and hands it back in the error payload. So no path leaves a
     disarmed-but-unsent word. The same rule covers the handles a pipe message
-    carries: a post, send or reply refused with nothing taken hands them back
-    (`post` keeps its carrier on a refusal). `Waiter.give` and every
-    `Process.give` overload follow this rule: a refused give answers the status
-    and the object together, as `Result<Void, (SosStatus, T)>`, since every
-    status `ProcessOp.Give` answers leaves the giver's entry in place. Not yet
-    enforced for `send_with`, `reply_with` and `reply_wait_with`: they empty
-    the handle carrier before reading the status, so on a refusal that took
-    nothing the handles stay in the caller's table with no wrapper naming them.
-    For `send_with` the status cannot tell the two cases apart: the kernel
-    answers a fused call `PeerClosed` both when the server end was gone before
-    the message was staged, which took nothing, and when the exchange failed
-    after staging, which took the handles.
+    carries, and the status decides it. A transient refusal of the send itself
+    (`WouldBlock`, `NoResource`, `QuotaExceeded`, answered before the message is
+    staged) leaves the carried handles in the caller's
+    table, and the typed tier keeps the wrappers with the caller:
+    `post_with` leaves its carrier untouched, so the caller may retry with it.
+    Every other outcome consumes them. On success they travel with the message.
+    On a terminal refusal (`PeerClosed`) the kernel releases them: each carried
+    entry is unbound from the caller's table and its reference dropped, so an
+    object whose last handle this was is destroyed (a pipe end reaching zero
+    tells its peer, for example). The typed tier empties the carrier on those
+    outcomes. A bad carried handle faults the caller before anything is taken.
+    No new status marks the difference; the status says which half applies. The
+    fused `send_with` never refuses the send itself transiently, since it parks
+    for room and mints no claim, so its `PeerClosed` consumes the handles
+    whether or not the message was staged. A `NoResource` or `QuotaExceeded`
+    answered at the reply's delivery comes after the carried handles were
+    staged, so it consumes them too. A reply refuses nothing transiently
+    either: `reply_with` and `reply_wait_with` consume their handles on every
+    answer, by delivery or, for a reply to an abandoned request, by release.
+    `Waiter.give` and every `Process.give` overload follow the keep rule: a
+    refused give answers the status and the object together, as
+    `Result<Void, (SosStatus, T)>`, since every status `ProcessOp.Give` answers
+    leaves the giver's entry in place.
   - **The funnel has a second spelling, for receivers.** Where the op consumes
     the handle it is invoked through, the sysapi method carries `consumes` in
     its effect slot beside `&var self`, and the caller spells
@@ -2977,11 +2986,6 @@ loader parses and reports while no Process slot stores either.
   line whatever its state (§2.8, §2.10, §3).
 - Thread, Event, Waiter and Timer handles cannot yet be given: their default
   sets withhold `Transfer` and no boot record kind names them (§3).
-- `send_with`, `reply_with` and `reply_wait_with` do not yet hand carried
-  handles back on a refusal that took nothing: they stay in the caller's table
-  with no wrapper naming them. For `send_with` the kernel's `PeerClosed` does
-  not say whether the message was staged, so the typed tier cannot tell whether
-  the handles came back (§3; §2.1 states the reply half).
 - `sosrt`'s bump arena takes no lock, so under a kernel that preempts (today
   only the preemption harness; §7) two threads of one process allocating at once
   can race (§5c).

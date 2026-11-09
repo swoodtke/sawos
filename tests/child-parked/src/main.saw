@@ -1,0 +1,97 @@
+// Test child: a fused call that parks for room while carrying a handle.
+//
+// The launcher fills the connection's ring before giving this process its
+// inlet, so the `send_with` below has no room and parks. The call carries the
+// only outlet of a second connection. When the launcher then closes the first
+// connection's server end, the parked call is resumed with `PeerClosed`, and
+// the kernel releases the carried outlet.
+//
+// The verdict is the line it prints once the call returns. It then yields back
+// and stays alive: the launcher checks the other half by posting to the second
+// connection's inlet, and must do so before this process's teardown, which
+// would release a leaked outlet on its own.
+//
+// The boot set is a FIFO: the full connection's inlet is record 0, the outlet
+// to carry is record 1, and the System handle follows.
+
+import sos.{System, PipeInlet, PipeHandles, SosStatus, PIPE_BODY_BYTES}
+
+/// The most turns this process yields before it gives up and exits.
+static MAX_TURNS: Int = 100000
+
+/// Exit codes: the call answered something else, succeeding included, and the
+/// launcher never ended this process.
+static EXIT_WRONG: UInt = 62
+static EXIT_TIMEOUT: UInt = 64
+
+/// The boot set did not hold what the launcher's config says.
+static EXIT_NO_HANDLES: UInt = 63
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        return
+    }
+
+    var first = try proc.boot_handle_next() catch {
+        let _ = proc.exit(EXIT_NO_HANDLES)
+        return
+    }
+    guard let full = first.take_inlet() else {
+        let _ = proc.exit(EXIT_NO_HANDLES)
+        return
+    }
+    var second = try proc.boot_handle_next() catch {
+        let _ = proc.exit(EXIT_NO_HANDLES)
+        return
+    }
+    guard let cargo = second.take_outlet() else {
+        let _ = proc.exit(EXIT_NO_HANDLES)
+        return
+    }
+    var carrying = PipeHandles.none()
+    carrying.put(0, outlet: move cargo)
+
+    // The launcher yields to this process before it acts, so this line is
+    // printed before the call parks and the call is parked before the launcher
+    // closes the server end.
+    let _ = system.debug_print("SOS childparked: calling\n")
+
+    if not refused(&full, &var carrying) {
+        let _ = system.debug_print("SOS childparked: call did not say PeerClosed\n")
+        let _ = proc.exit(EXIT_WRONG)
+        return
+    }
+    let _ = system.debug_print("SOS childparked: call said PeerClosed\n")
+
+    let me = try proc.thread_self() catch {
+        let _ = proc.exit(EXIT_WRONG)
+        return
+    }
+    var turns: Int = 0
+    while turns < MAX_TURNS {
+        turns = turns + 1
+        let _ = me.yield_now()
+    }
+    let _ = proc.exit(EXIT_TIMEOUT)
+}
+
+/// One fused call that must come back `PeerClosed`.
+///
+/// A `match` rather than the tree's `try … catch` guard shape: this is a
+/// negative test asserting a specific error value.
+func refused(inlet: &PipeInlet, carrying: &var PipeHandles) -> Bool {
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 1
+    match inlet.send_with(body: &msg, len: 1, handles: &var carrying) {
+        case Ok(_) -> false,
+        case Err(status) -> {
+            match status {
+                case PeerClosed -> true,
+                case _ -> false,
+            }
+        },
+    }
+}

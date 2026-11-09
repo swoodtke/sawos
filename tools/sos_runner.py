@@ -363,6 +363,8 @@ WAITER_REVOKED_PKG = os.path.join(TESTS_DIR, "waiter-revoked")
 # message.
 PIPE_BASICS_PKG = os.path.join(TESTS_DIR, "pipe-basics")
 PIPE_PEER_GONE_PKG = os.path.join(TESTS_DIR, "pipe-peer-gone")
+PIPE_CONSUME_PKG = os.path.join(TESTS_DIR, "pipe-consume")
+CHILD_PARKED_PKG = os.path.join(TESTS_DIR, "child-parked")
 PIPE_CHILD_PKG = os.path.join(TESTS_DIR, "pipe-child")
 CHILD_POST_PKG = os.path.join(TESTS_DIR, "child-post")
 PIPE_NO_POST_PKG = os.path.join(TESTS_DIR, "pipe-no-post")
@@ -3214,6 +3216,40 @@ TEST_CASES = [
                        "SOS peergone: again says the other end of this "
                        "connection is gone",
                        "SOS peergone: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # What a message's carried handles do on each outcome (spec 3). A
+        # terminal refusal consumes them: each send op is aimed at a peer that
+        # is gone, carrying the only outlet of a second connection, and the
+        # case then asks that connection's inlet, which answers `PeerClosed`
+        # because the outlet was released and not merely forgotten. A transient
+        # refusal keeps them: a `post_with` into a full ring answers
+        # `WouldBlock`, the same carrier posts once there is room, and the
+        # inlet that arrives is live. The last arm parks a child's `send_with`
+        # in a full ring with an outlet aboard and closes the server end under
+        # it, which resumes the call with `PeerClosed` and releases the outlet.
+        "name": "pipe_consume",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_CONSUME_PKG,
+        "children": [CHILD_PARKED_PKG],
+        "expect_out": ["{banner}",
+                       "SOS consume: post_with released the carried outlet",
+                       "SOS consume: send_with released the carried outlet",
+                       "SOS consume: reply_with released the carried outlet",
+                       "SOS consume: reply_wait_with released the carried "
+                       "outlet",
+                       "SOS consume: WouldBlock kept the carried inlet",
+                       "SOS consume: the retry delivered a live inlet",
+                       "SOS consume: NoResource kept the carried inlet",
+                       "SOS consume: the table retry delivered a live inlet",
+                       "SOS childparked: calling",
+                       "SOS consume: closing the server end under a parked "
+                       "call",
+                       "SOS childparked: call said PeerClosed",
+                       "SOS consume: a parked send_with released the carried "
+                       "outlet",
+                       "SOS consume: done"],
         "expect_clean_exit": True,
     },
     {

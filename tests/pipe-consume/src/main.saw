@@ -1,0 +1,563 @@
+// What a message's carried handles do on each outcome (spec §3).
+//
+// A transient refusal (`WouldBlock`, `NoResource`, `QuotaExceeded`) leaves the
+// carried handles with the caller. Every other outcome consumes them: on a
+// terminal refusal such as `PeerClosed` the kernel releases them, and an object
+// whose last handle one was is destroyed.
+//
+// The destruction is observed from the far side. Each terminal probe carries
+// the only outlet of a second connection, the cargo connection, and afterwards
+// posts to that connection's inlet. A live outlet lets the post stage; a
+// released one was the last outlet going, so the post answers `PeerClosed`. A
+// kernel that left the entry bound would have kept the outlet alive and the
+// post would succeed.
+//
+// Four terminal arms (`post_with`, `send_with`, `reply_with` and
+// `reply_wait_with`, each against a peer that is gone) and one transient arm:
+// a `post_with` into a full ring answers `WouldBlock`, the carrier still holds
+// its inlet, and the same carrier posts once the ring has room. The message
+// then arrives with the handle, which the receiver proves live by posting
+// through it.
+//
+// A last arm covers the parked call: a child's `send_with` carries an outlet
+// into a full ring and parks for room, then the server end closes. The parked
+// call is resumed with `PeerClosed` and the kernel releases the outlet it
+// carried, which the launcher observes the same way.
+//
+// Root plays every side of the other arms, so nothing parks. One phase per
+// function, since every `print` with format arguments and every message-sized
+// value reserves scratch in its frame.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
+            PipeHandle, PipeHandles, PipeMsg, ReplyWaitError, SosStatus,
+            SystemRight, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static TAG_FULL: UInt = 31
+static TAG_CARGO: UInt = 32
+static TAG_BOOT: UInt = 33
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The most posts the ring is filled with before this case gives up and calls
+/// the ring unbounded. The depth is the kernel's (`PIPE_INFLIGHT`), which this
+/// program does not name.
+static MAX_ROUNDS: Int = 256
+
+/// Does a post to `inlet` answer `PeerClosed`? A staged post is dropped as a
+/// tell and answers no.
+func post_says_closed(inlet: &PipeInlet) -> Bool {
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    match inlet.post(body: &body, len: 0) {
+        case Ok(claim) -> {
+            let _ = move claim
+            false
+        },
+        case Err(e) -> {
+            match e {
+                case PeerClosed -> true,
+                case _ -> false,
+            }
+        },
+    }
+}
+
+/// A connection whose outlet is gone: the far end of the send arms.
+func dead_peer(proc: &Process) -> Result<PipeInlet, SosStatus> {
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    let _ = move outlet
+    return move inlet
+}
+
+/// `post_with` against a gone outlet: did it answer `PeerClosed`?
+func post_refused(inlet: &PipeInlet, carrying: &var PipeHandles) -> Bool {
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    match inlet.post_with(body: &body, len: 1, handles: &var carrying) {
+        case Ok(claim) -> {
+            let _ = move claim
+            false
+        },
+        case Err(e) -> {
+            match e {
+                case PeerClosed -> true,
+                case _ -> false,
+            }
+        },
+    }
+}
+
+/// `send_with` against a gone outlet: did it answer `PeerClosed`?
+func send_refused(inlet: &PipeInlet, carrying: &var PipeHandles) -> Bool {
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    match inlet.send_with(body: &body, len: 1, handles: &var carrying) {
+        case Ok(msg) -> {
+            let _ = move msg
+            false
+        },
+        case Err(e) -> {
+            match e {
+                case PeerClosed -> true,
+                case _ -> false,
+            }
+        },
+    }
+}
+
+/// A request that was taken after its claim was dropped: the replier's side of
+/// the reply arms. A reply to it finds the client gone.
+func abandoned_request(proc: &Process) -> Result<PipeRequest, SosStatus> {
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    let claim = try inlet.post(body: &body, len: 1)
+    let got = try outlet.take()
+    let (arrived, request) = move got
+    let _ = move arrived
+    let _ = move claim
+    return move request
+}
+
+/// A fresh cargo connection: the outlet goes in the carrier, and the inlet is
+/// kept to ask whether the outlet still lives.
+func load_cargo(proc: &Process,
+                carrying: &var PipeHandles) -> Result<PipeInlet, SosStatus> {
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    carrying.put(0, outlet: move outlet)
+    return move inlet
+}
+
+/// One terminal arm's verdict: the refusal came, and the cargo outlet died with
+/// it.
+func report(name: String, refused: Bool, cargo_gone: Bool) -> Bool {
+    if not refused {
+        print("SOS consume: {} was not refused\n", name)
+        return false
+    }
+    if not cargo_gone {
+        print("SOS consume: {} left the carried outlet alive\n", name)
+        return false
+    }
+    print("SOS consume: {} released the carried outlet\n", name)
+    return true
+}
+
+func phase_post(proc: &Process) -> Result<Bool, SosStatus> {
+    let peer = try dead_peer(&proc)
+    var carrying = PipeHandles.none()
+    let cargo = try load_cargo(&proc, &var carrying)
+    let refused = post_refused(&peer, &var carrying)
+    return report("post_with", refused, post_says_closed(&cargo))
+}
+
+func phase_send(proc: &Process) -> Result<Bool, SosStatus> {
+    let peer = try dead_peer(&proc)
+    var carrying = PipeHandles.none()
+    let cargo = try load_cargo(&proc, &var carrying)
+    let refused = send_refused(&peer, &var carrying)
+    return report("send_with", refused, post_says_closed(&cargo))
+}
+
+func phase_reply(proc: &Process) -> Result<Bool, SosStatus> {
+    let request = try abandoned_request(&proc)
+    var carrying = PipeHandles.none()
+    let cargo = try load_cargo(&proc, &var carrying)
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var refused = false
+    match (move request).reply_with(body: &body, len: 1, handles: &var carrying) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            match e {
+                case PeerClosed -> { refused = true },
+                case _ -> {},
+            }
+        },
+    }
+    return report("reply_with", refused, post_says_closed(&cargo))
+}
+
+func phase_reply_wait(proc: &Process) -> Result<Bool, SosStatus> {
+    let request = try abandoned_request(&proc)
+    let waiter = try proc.waiter_create()
+    var carrying = PipeHandles.none()
+    let cargo = try load_cargo(&proc, &var carrying)
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var refused = false
+    match (move request).reply_wait_with(body: &body, len: 1, waiter: &waiter,
+                                         handles: &var carrying) {
+        case Ok(_) -> {},
+        case Err(e) -> {
+            match e {
+                case Reply(s) -> {
+                    match s {
+                        case PeerClosed -> { refused = true },
+                        case _ -> {},
+                    }
+                },
+                case Wait(_) -> {},
+            }
+        },
+    }
+    return report("reply_wait_with", refused, post_says_closed(&cargo))
+}
+
+/// Post tells until the ring refuses, and answer how many went.
+func fill(inlet: &PipeInlet) -> Result<UInt, SosStatus> {
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var depth: UInt = 0
+    var filling = true
+    var rounds: Int = 0
+    while filling && rounds < MAX_ROUNDS {
+        rounds = rounds + 1
+        match inlet.post(body: &body, len: 1) {
+            case Ok(claim) -> {
+                let _ = move claim
+                depth = depth + 1
+            },
+            case Err(_) -> { filling = false },
+        }
+    }
+    return depth
+}
+
+/// Take one message and discharge it by dropping the obligation.
+func take_and_drop(outlet: &PipeOutlet) -> Result<Void, SosStatus> {
+    let got = try outlet.take()
+    let (arrived, request) = move got
+    let _ = move arrived
+    let _ = move request
+    return
+}
+
+/// Did the ring answer `WouldBlock` to a post carrying `carrying`?
+func post_blocks(inlet: &PipeInlet, carrying: &var PipeHandles) -> Bool {
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    match inlet.post_with(body: &body, len: 1, handles: &var carrying) {
+        case Ok(claim) -> {
+            let _ = move claim
+            false
+        },
+        case Err(e) -> {
+            match e {
+                case WouldBlock -> true,
+                case _ -> false,
+            }
+        },
+    }
+}
+
+/// Does a post to `inlet` answer `WouldBlock`? The ring is full if it does.
+func post_says_full(inlet: &PipeInlet) -> Bool {
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    match inlet.post(body: &body, len: 0) {
+        case Ok(claim) -> {
+            let _ = move claim
+            false
+        },
+        case Err(e) -> {
+            match e {
+                case WouldBlock -> true,
+                case _ -> false,
+            }
+        },
+    }
+}
+
+/// How a `post_with` came out: 0 staged, 1 `NoResource`, 2 `QuotaExceeded`, 3
+/// anything else.
+func post_outcome(inlet: &PipeInlet, carrying: &var PipeHandles) -> Int {
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    match inlet.post_with(body: &body, len: 1, handles: &var carrying) {
+        case Ok(claim) -> {
+            let _ = move claim
+            0
+        },
+        case Err(e) -> {
+            match e {
+                case NoResource -> 1,
+                case QuotaExceeded -> 2,
+                case _ -> 3,
+            }
+        },
+    }
+}
+
+/// The slots the table arm fills the table with. The kernel does not publish
+/// the table's depth (a caller meeting a full table is told `NoResource`), so
+/// this holds a comfortable upper bound and stops at the refusal.
+static FILL_SLOTS: Int = 16
+
+/// The mints held while the table is full. `NoCopy` because it holds `System`
+/// wrappers, and its drop releases whatever is left.
+struct Filler {
+    slots: [System?; FILL_SLOTS],
+}
+
+extension Filler: NoCopy {}
+
+extension Filler {
+    /// Every slot empty. A repeat literal cannot build a `NoCopy` optional, so
+    /// this literal tracks `FILL_SLOTS` by hand and the assert below catches it
+    /// if the number moves.
+    static func empty() -> Filler {
+        Filler(slots: [None, None, None, None, None, None, None, None,
+                       None, None, None, None, None, None, None, None])
+    }
+}
+
+static_assert(FILL_SLOTS == 16,
+              "Filler.empty spells its slots out and tracks FILL_SLOTS by hand")
+
+/// With the table full, a `post_with` has no room for its claim: the refusal is
+/// a status, the carrier keeps its wrapper, and after a row is freed the same
+/// carrier posts. The table is full when `held` stops growing.
+func table_arm(system: &System, ring_in: &PipeInlet,
+               carrying: &var PipeHandles) -> Result<Bool, SosStatus> {
+    var held = Filler.empty()
+    var depth: Int = 0
+    var filling = true
+    while filling && depth < FILL_SLOTS {
+        let got = try? system.mint()
+        if let one = move got {
+            held.slots[depth] = move one
+            depth = depth + 1
+        } else {
+            filling = false
+        }
+    }
+    if filling {
+        print("SOS consume: the table never filled\n")
+        return false
+    }
+    let refused = post_outcome(&ring_in, &var carrying)
+    if refused == 1 {
+        print("SOS consume: NoResource kept the carried inlet\n")
+    } else if refused == 2 {
+        print("SOS consume: QuotaExceeded kept the carried inlet\n")
+    } else {
+        print("SOS consume: a full table answered {}, not a resource status\n",
+              refused)
+        return false
+    }
+    // A row comes back and the same carrier posts: a kernel that had taken the
+    // entry at the refusal would fault the process here with `BadHandle`.
+    let _ = held.slots[depth - 1].take()
+    let staged = post_outcome(&ring_in, &var carrying)
+    if staged != 0 {
+        print("SOS consume: the retry answered {}\n", staged)
+        return false
+    }
+    return true
+}
+
+func phase_table(system: &System, proc: &Process) -> Result<Bool, SosStatus> {
+    let ring = try proc.pipe_create()
+    let (ring_in, ring_out) = move ring
+    let cargo = try proc.pipe_create()
+    let (cargo_in, cargo_out) = move cargo
+    var carrying = PipeHandles.none()
+    carrying.put(0, inlet: move cargo_in)
+
+    if not (try table_arm(&system, &ring_in, &var carrying)) {
+        return false
+    }
+    // The held mints are released with the arm's frame, so the take has room.
+    if not drain_and_use(&ring_out, &cargo_out) {
+        print("SOS consume: the retried message did not deliver a live inlet\n")
+        return false
+    }
+    print("SOS consume: the table retry delivered a live inlet\n")
+    return true
+}
+
+/// If the message carries an inlet, post through it and read the post out of
+/// `outlet`: the handle arrived and is live.
+func relay(msg: &var PipeMsg, outlet: &PipeOutlet) -> Bool {
+    guard let carried = msg.handles[0].take() else { return false }
+    match carried {
+        case Inlet(i) -> {
+            if post_says_closed(&i) {
+                return false
+            }
+            match outlet.take() {
+                case Ok(got) -> {
+                    let (arrived, request) = move got
+                    let _ = move arrived
+                    let _ = move request
+                    return true
+                },
+                case Err(_) -> { return false },
+            }
+        },
+        case _ -> { return false },
+    }
+}
+
+/// Take everything staged on `ring`, and report whether one message carried a
+/// live inlet through to `cargo_out`.
+func drain_and_use(ring: &PipeOutlet, cargo_out: &PipeOutlet) -> Bool {
+    var used = false
+    var more = true
+    var rounds: Int = 0
+    while more && rounds < MAX_ROUNDS {
+        rounds = rounds + 1
+        match ring.take() {
+            case Err(_) -> { more = false },
+            case Ok(got) -> {
+                let (arrived, request) = move got
+                var msg = move arrived
+                let _ = move request
+                if relay(&var msg, &cargo_out) {
+                    used = true
+                }
+            },
+        }
+    }
+    return used
+}
+
+func phase_transient(proc: &Process) -> Result<Bool, SosStatus> {
+    let ring = try proc.pipe_create()
+    let (ring_in, ring_out) = move ring
+    let cargo = try proc.pipe_create()
+    let (cargo_in, cargo_out) = move cargo
+
+    let depth = try fill(&ring_in)
+    if depth == 0 {
+        return false
+    }
+    var carrying = PipeHandles.none()
+    carrying.put(0, inlet: move cargo_in)
+
+    // The ring is full, so the refusal is transient and the carrier keeps its
+    // inlet.
+    if not post_blocks(&ring_in, &var carrying) {
+        print("SOS consume: a full ring did not answer WouldBlock\n")
+        return false
+    }
+    print("SOS consume: WouldBlock kept the carried inlet\n")
+
+    // Room, and the same carrier posts. A kernel that had taken the entry at
+    // the refusal would fault the process here with `BadHandle`.
+    try take_and_drop(&ring_out)
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    let claim = try ring_in.post_with(body: &body, len: 1, handles: &var carrying)
+    let _ = move claim
+
+    if not drain_and_use(&ring_out, &cargo_out) {
+        print("SOS consume: the retried message did not deliver a live inlet\n")
+        return false
+    }
+    print("SOS consume: the retry delivered a live inlet\n")
+    return true
+}
+
+/// Launch `child-parked` with a full connection's inlet and the cargo outlet,
+/// let it park, then close the full connection's server end.
+func phase_parked(system: &System, proc: &Process) -> Result<Bool, SosStatus> {
+    var image = try proc.boot_handle_next()
+    var dest = try proc.boot_handle_next()
+    guard let image_mem = image.take_memory() else { return false }
+    guard let dest_mem = dest.take_memory() else { return false }
+    let child = try system.process_create(image: &image_mem, memory: &dest_mem)
+
+    let full = try proc.pipe_create()
+    let (full_in, full_out) = move full
+    let cargo = try proc.pipe_create()
+    let (cargo_in, cargo_out) = move cargo
+    let _ = try fill(&full_in)
+    if not post_says_full(&full_in) {
+        print("SOS consume: the ring was not full before the call\n")
+        return false
+    }
+
+    try child.give(inlet: move full_in, tag: TAG_FULL) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(outlet: move cargo_out, tag: TAG_CARGO) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+
+    // Yield until the child has run: it prints, calls, and parks for room, and
+    // only then does the processor come back.
+    let me = try proc.thread_self()
+    try me.yield_now()
+    print("SOS consume: closing the server end under a parked call\n")
+    let _ = move full_out
+
+    // The child is resumed, prints what the call answered, and yields back
+    // while still alive. The probe has to run before the child's teardown,
+    // which would release a leaked outlet by itself.
+    try me.yield_now()
+    return report("a parked send_with", true, post_says_closed(&cargo_in))
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS consume: no process handle: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let posted = try phase_post(&proc) catch {
+        print("SOS consume: post phase failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let sent = try phase_send(&proc) catch {
+        print("SOS consume: send phase failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let replied = try phase_reply(&proc) catch {
+        print("SOS consume: reply phase failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let waited = try phase_reply_wait(&proc) catch {
+        print("SOS consume: reply_wait phase failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let kept = try phase_transient(&proc) catch {
+        print("SOS consume: transient phase failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let roomy = try phase_table(&system, &proc) catch {
+        print("SOS consume: table phase failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let parked = try phase_parked(&system, &proc) catch {
+        print("SOS consume: parked phase failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    if not (posted && sent && replied && waited && kept && roomy && parked) {
+        let _ = system.debug_print("SOS consume: a probe failed\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS consume: done\n")
+    let _ = proc.exit(EXIT_OK)
+}
