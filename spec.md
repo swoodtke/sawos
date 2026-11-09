@@ -2072,7 +2072,7 @@ can ask about (`SystemOp.TierGet`, §2.8):
 | arm64 `virt` | 1 | yes — Profile B | per-process table sets, higher-half kernel, `map` places |
 | riscv32 `virt` | 2 | yes — Profile A | PMP regions replayed through the one seam; keeps its per-child linker scripts, deliberately, as the living identity-tier demonstration |
 | riscv32 `virt`, flat build profile | 3 | yes — a third run | a module swap over the same board: `prot_*` no-ops, PMP opened with one TOR entry, `prot_isolated()` false. No new toolchain, and the tier-3 story's test target |
-| ESP32-C3 | 2, at the floor | no — a non-gating board smoke (`make sos-smoke-esp32c3`) | 16 PMP entries exactly, 400 KB SRAM; XIP is the entry price |
+| ESP32-C3 | 2, at the floor | no — a gating board smoke (`make sos-smoke-esp32c3`) | 16 PMP entries exactly, 400 KB SRAM; XIP is the entry price |
 | ESP32-P4 | 2 | no — no QEMU machine yet | 32 PMP + 16 PMA, 768 KB; the first real tier-2 part |
 | ESP32-S3-class | 3 | no | WORLD0/1 only; a `--target` port, not a new backend |
 

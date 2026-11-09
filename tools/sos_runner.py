@@ -5863,14 +5863,15 @@ def main():
                              "serial harness)")
     parser.add_argument("--board", metavar="NAME", default="virt",
                         help="board profile (default: virt, the GATE's). "
-                             "`esp32c3` is the NON-GATING smoke target: "
-                             "Espressif QEMU, machine-local, never CI")
+                             "`esp32c3` is the gating smoke target, run "
+                             "after the suite: it needs the Espressif "
+                             "toolchain on the gate's machine")
     args = parser.parse_args()
 
     if args.board != "virt":
         # ------------------------------------------------------------------
-        # Board section: esp32c3, non-gating. Everything board-specific lands
-        # here and only here.
+        # Board section: esp32c3. Everything board-specific lands here and only
+        # here.
         # ------------------------------------------------------------------
         if args.board != "esp32c3":
             print(f"{RED}unknown --board {args.board!r}; known: virt, "
@@ -5878,9 +5879,9 @@ def main():
             sys.exit(2)
 
         # ------------------------------------------------------------------
-        # The ESP32-C3 smoke. Non-gating: never part of `make sos-test`, never
-        # CI, and it runs against a machine-local Espressif QEMU that no other
-        # developer is assumed to have.
+        # The ESP32-C3 smoke. Gating: the server runs it after `make
+        # sos-test` (it is not part of that target) against the Espressif QEMU
+        # on the machine that runs the gate.
         #
         # It shares no table, no build directory and no run path with the gate
         # above. The board is different in every way that matters (direct boot
@@ -5935,8 +5936,8 @@ def main():
         qemu = c3_tool(
             "~/.espressif/tools/qemu-riscv32/*/qemu/bin/qemu-system-riscv32",
             "Espressif QEMU",
-            "install it with the ESP-IDF tools installer; this target is "
-            "machine-local and NON-GATING, so its absence breaks nothing else")
+            "install it with the ESP-IDF tools installer; the gate "
+            "needs it, so its absence fails the gate")
         clang = c3_tool(
             "~/.espressif/tools/esp-clang/*/esp-clang/bin/clang",
             "esp-clang",
@@ -6152,7 +6153,7 @@ def main():
             },
         ]
 
-        print(f"{BOLD}SOS ESP32-C3 board smoke{RESET} (NON-GATING)")
+        print(f"{BOLD}SOS ESP32-C3 board smoke{RESET} (GATING)")
         print(f"  qemu   {qemu}")
         print(f"  clang  {clang}")
         print(f"  target {C3_TRIPLE} --target-features {C3_FEATURES} "

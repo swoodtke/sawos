@@ -3,7 +3,7 @@
 SawOS (SOS) is a capability-based microkernel for embedded systems. It runs
 on riscv32 and arm64 — the gate is QEMU's `virt` boards for both, plus a
 flat build profile of the riscv32 board that turns its protection off, and
-there is a non-gating smoke target for the ESP32-C3 — with real hardware as
+there is a gating smoke target for the ESP32-C3 — with real hardware as
 the goal.
 
 Those three runs are the system's protection tiers, one story told on each:

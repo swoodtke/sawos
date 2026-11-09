@@ -30,7 +30,7 @@ hal/riscv32-flat/  # the flat build profile of that board: a facade, not a
                    # a second time as `rv32virt`) and overrides the protection
                    # seam. The gate runs this profile
 hal/riscv32-esp32c3/ # the ESP32-C3 board, same shape — reached only by
-                   # `make sos-smoke-esp32c3`, never by sos-test
+                   # `make sos-smoke-esp32c3`, which gates after sos-test
 rt/common/         # `sosrt`: the SOS runtime, arch-free + role-free Saw
 rt/common_c/       # support.c — the arena accessors + word atomics, one copy
 root/              # the root server: a real Blade package, sosimg emit
@@ -78,10 +78,11 @@ A `SAWLANG_ROOT` run skips the pin's version check, so it builds with whatever
 compiler that checkout holds, which may not be the one the server's `fetch` run
 uses.
 The sawtracker server runs the full suite. `.sawtracker/tests.json` runs
-`make sos-test` on every SO patch, and a merge needs a green run. The server
-rebases a patch onto current main before its run. `sawtracker patch log
-PATCH` prints the run's transcript; the header's `sawlang:` line names the
-resolution step that answered, and a run at the pin reads `fetch`.
+`make sos-test sos-smoke-esp32c3` on every SO patch, and a merge needs a green
+run. The server rebases a patch onto current main before its run.
+`sawtracker patch log PATCH` prints the run's transcript; the header's
+`sawlang:` line names the resolution step that answered, and a run at the pin
+reads `fetch`.
 
 The acceptance oracle tradition: diff the console transcript, don't just read
 "green".
@@ -93,8 +94,10 @@ rights, quotas and lifetimes are checked identically on the syscall path, but
 it disclaims protecting memory, the kernel's included, from a process. The
 isolated profiles enforce both the syscall-path checks and memory protection.
 
-`make sos-smoke-esp32c3` is non-gating board smoke against the machine-local
-Espressif QEMU — never part of sos-test, never CI.
+`make sos-smoke-esp32c3` is the ESP32-C3 board smoke. It is gating: the server
+runs it after `sos-test`, and it needs the Espressif toolchain (QEMU with the
+esp32c3 machine, esp-clang) on the machine that runs the gate. It is not part
+of `sos-test` itself.
 
 The runner is parallel by default: one job per performance core, detected.
 `SOS_JOBS` overrides the detection and `-j N` overrides both; the count is
