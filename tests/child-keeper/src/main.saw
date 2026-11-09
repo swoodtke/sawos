@@ -1,0 +1,113 @@
+// Child that dies holding shared objects, so that its own teardown frees them.
+//
+// What it holds at its exit, each a different path by which the teardown
+// frees a shared object charged to it:
+//
+//   - `idle`, a connection of its own with nothing in it: the teardown's
+//     `reap_unreferenced` gives it back in its connection scan.
+//   - `busy`, a connection of its own with a message staged and the claim
+//     kept: the connection goes back by the cascade out of settling that
+//     exchange.
+//   - `piece`, a region split off a sibling of its launcher's pool: the
+//     region scan gives it back to the pool.
+//   - `view`, a window carved off the device view its launcher gave it: the
+//     IoMemory scan gives it back.
+//
+// Each free credits this process's ledger before the teardown clears it, and
+// nothing is left to disown.
+//
+// Everything is bound in `_start`'s frame on purpose: `exit` does not return,
+// so nothing unwinds, and the teardown closes exactly what is listed above
+// plus the boot System and the Process this program derived.
+
+import sos.{System, Process, Memory, IoMemory, PIPE_BODY_BYTES}
+
+/// The launcher's tags.
+static TAG_RAM: UInt = 24
+static TAG_WINDOW: UInt = 25
+
+/// One protection unit on every profile, so the split is grantable.
+static CHUNK: UInt = 0x1000
+
+/// The device window's length, carved whole.
+static WINDOW_LEN: UInt = 0x1000
+
+/// A step this program's launcher makes impossible failed.
+static EXIT_MISMATCH: UInt = 98
+/// Everything is held. The launcher reads this in the §8 status word.
+static EXIT_KEPT: UInt = 45
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS keeper: no process handle: {}\n", error)
+        return
+    }
+
+    var ram: Memory? = None
+    var window: IoMemory? = None
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                let tag = rec.tag
+                if tag == TAG_RAM {
+                    ram = rec.take_memory()
+                } else if tag == TAG_WINDOW {
+                    window = rec.take_iomemory()
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+    guard let pool = ram.take() else {
+        let _ = system.debug_print("SOS keeper: no region\n")
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    guard let device = window.take() else {
+        let _ = system.debug_print("SOS keeper: no window\n")
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+
+    // The piece is charged here; the pool it was cut from stays the
+    // launcher's, and stays live while the piece is on loan.
+    let piece = try pool.split(len: CHUNK) catch {
+        print("SOS keeper: split failed: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let _ = move pool
+
+    let view = try device.carve(offset: 0, len: WINDOW_LEN) catch {
+        print("SOS keeper: carve failed: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let _ = move device
+
+    let idle = try proc.pipe_create() catch {
+        print("SOS keeper: create 1 failed: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let busy = try proc.pipe_create() catch {
+        print("SOS keeper: create 2 failed: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let (busy_in, busy_out) = move busy
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    let claim = try busy_in.post(body: &body, len: 1) catch {
+        print("SOS keeper: post failed: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+
+    let _ = system.debug_print("SOS keeper: holding\n")
+    let _ = proc.exit(EXIT_KEPT)
+}

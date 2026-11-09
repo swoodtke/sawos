@@ -504,6 +504,14 @@ ARENA_SMALL_PKG = os.path.join(TESTS_DIR, "arena-small")
 C_HELLO_PKG = os.path.join(TESTS_DIR, "c-hello")
 C_CHILD_PKG = os.path.join(TESTS_DIR, "c-child")
 
+# A dying process disowns the shared objects charged to it. Each case has one
+# child image beside a pool and a device window: `child-disown` plays both the
+# charger and the probe.
+CHARGE_DISOWN_PKG = os.path.join(TESTS_DIR, "charge-disown")
+CHILD_DISOWN_PKG = os.path.join(TESTS_DIR, "child-disown")
+CHARGE_REAP_PKG = os.path.join(TESTS_DIR, "charge-reap")
+CHILD_KEEPER_PKG = os.path.join(TESTS_DIR, "child-keeper")
+
 # What the harness types at the guest's serial port for the echo cases, and what
 # it then expects to read back.
 #
@@ -863,6 +871,12 @@ def expectations(arch):
         # status word. Its partner (0x5A, the byte the child writes) needs no
         # placeholder: it comes back as a decimal on a console line.
         "share_mark": f"0x{0xA5:0{width}x}",
+        # `child-disown`'s charger exit code ("its objects went"), asserted
+        # through the kernel's exit line in `charge_disown`.
+        "charger_mark": f"0x{0x2C:0{width}x}",
+        # `child-keeper`'s "everything is held" exit code, asserted the same
+        # way in `charge_reap`.
+        "keeper_mark": f"0x{0x2D:0{width}x}",
     }
 
 
@@ -5073,6 +5087,93 @@ TEST_CASES = [
                        "SOS cchild: wrote 38 bytes",
                        "SOS chello: woke status=65591",
                        "SOS chello: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A dying process disowns the shared objects charged to it (spec
+        # §2.10's refund rule), so a refund at a later free reaches nobody,
+        # never the dead process's slot's next occupant.
+        #
+        # One child image plays both parts. The charger makes a connection,
+        # splits two regions off a sibling of root's pool and carves a window
+        # off a device view, posts all four to root and exits, disowning them.
+        # Root drops the charger's Process handle and death attachment, and
+        # slot 1 is reclaimed although the four objects are live.
+        #
+        #   probe ... process={one}   the probe lands in the charger's slot
+        #   freed and donated         root gives the four objects back through
+        #                             the four free paths: the connection's
+        #                             free, a region's release, the other
+        #                             region's donation, and the window's free
+        #   pipes=2 regions=4         the probe's own allowances, untouched by
+        #   windows=2 quota=1         those frees: every kind refuses at its
+        #                             default with `QuotaExceeded`
+        #   status=65544              `Exited` (1) << 16 | 8, the probe's total
+        #
+        # A free that credited a disowned object's original charge would credit
+        # the probe, and that kind would count one more; one that indexed the
+        # ledger with the no-owner value would stop the machine.
+        "name": "charge_disown",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": CHARGE_DISOWN_PKG,
+        "children": [CHILD_DISOWN_PKG],
+        "pool": True,
+        "device": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS chargedisown: started",
+                       "SOS: process exit: code={charger_mark} process={one}",
+                       "SOS: process teardown handles={two} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS chargedisown: the charger is gone",
+                       "SOS chargedisown: freed and donated what it left",
+                       "SOS probe: pipes=2 regions=4 windows=2 quota=1",
+                       "SOS: process exit: code={eight} process={one}",
+                       "SOS: process teardown handles={four} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS chargedisown: probe status=65544",
+                       "SOS chargedisown: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A process's own shared objects go with it. Root counts the
+        # connections and windows it can make, launches the keeper with a pool
+        # sibling and a device view, and hands the keeper's Process handle to a
+        # Waiter as a one-shot subscription. The keeper makes two connections
+        # (one with a message staged on it), splits a region, carves a window
+        # and exits holding all of it (`handles={nine}`).
+        #
+        #   connections back=1   the same counts as before: the teardown freed
+        #   windows back=1       the idle connection in the reap's connection
+        #                        scan, the busy one by the cascade out of
+        #                        settling its staged exchange, and the window
+        #                        in the IoMemory scan
+        #   region back=1        root donates its pool whole, which a pool with
+        #                        a piece on loan refuses (as a fault)
+        #
+        # This pins the no-leak path, not the disown: everything is charged to
+        # the keeper and freed in its own teardown, so the case passes on a
+        # kernel that never disowns, by design.
+        "name": "charge_reap",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": CHARGE_REAP_PKG,
+        "children": [CHILD_KEEPER_PKG],
+        "pool": True,
+        "device": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS chargereap: started",
+                       "SOS keeper: holding",
+                       "SOS: process exit: code={keeper_mark} process={one}",
+                       "SOS: process teardown handles={nine} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS chargereap: keeper status=65581",
+                       "SOS chargereap: connections back=1 windows back=1 "
+                       "region back=1",
+                       "SOS chargereap: done"],
         "expect_clean_exit": True,
     },
 ]

@@ -28,8 +28,8 @@
 //!
 //! Teardown does not force-free the counted kinds other processes may still
 //! reference (regions, IO windows, pipe connections); `reap_unreferenced` frees
-//! what nobody names (see the block above it). Events, Waiters, Interrupts,
-//! Timers and Mappings are swept by owner.
+//! what nobody names and disowns the rest (see the block above it). Events,
+//! Waiters, Interrupts, Timers and Mappings are swept by owner.
 //!
 //! This file also holds delivery, readiness becoming a woken thread. The ledger
 //! and delivery are mutually recursive: a delivery drops a reference (one-shot
@@ -77,7 +77,7 @@ import sosabi.{EventMode, NO_HANDLE, ObjType, OutletLevel, PIPE_BODY_BYTES,
                pipe_msg_body_offset, pipe_request_rights, rights_allow_transfer,
                wait_meta_end_bytes, wait_prefix_bytes}
 import kcore.limits.{MAX_IOMEMORIES, MAX_MEMORIES,
-                     NO_THREAD, PIPE_INFLIGHT}
+                     NO_PROCESS, NO_THREAD, PIPE_INFLIGHT}
 import kcore.diag.{ExitCode, fatal, fatal_kernel}
 import kcore.result.{op_ok, op_status, op_value, write_result}
 import kcore.threads.{THREADS, ThreadState, frame_slot, ready_push}
@@ -114,6 +114,7 @@ import kcore.objects.{
     mint_handle,
     mint_refusal,
     quota_credit,
+    credit_shared,
     stage_peek,
     stage_pop,
     stage_push,
@@ -480,6 +481,8 @@ func revoke_blocked(w: Int) unsafe {
 ///
 /// The quota is credited against the slot's own `process` field (creator pays):
 /// whoever was charged gets it back, whichever process dropped the last handle.
+/// A shared kind credits through `credit_shared`, which credits nobody when the
+/// charged process's death has disowned the object.
 /// `Mapping` and `Process` have no credit here, each for the reason given in
 /// its arm.
 public(package) func free_object(kind: ObjType, slot: Int) unsafe {
@@ -589,7 +592,7 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
             let owner = IOMEMORIES[slot].process
             IOMEMORIES[slot] = IoMemorySlot(state: SlotState.Free, process: 0,
                                             base: 0, len: 0, refs: 0)
-            quota_credit(owner, QuotaKind.IoMemory)
+            credit_shared(owner, QuotaKind.IoMemory)
         },
         case Mapping -> {
             // The slot frees and the row stays; this is §2.5 made mechanical,
@@ -686,6 +689,13 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
 // through `free_object`, so every kind's last rites and quota credit run
 // exactly as on the ordinary release path.
 //
+// What survives the reap and is charged to the dying process is disowned in
+// the same scans: its `process` field becomes `NO_PROCESS`, its charge goes
+// with the ledger `quota_clear` zeroes, and its eventual free credits nobody
+// (spec §2.10). A dead process's slot is reclaimed on its handles and
+// attachment alone, and a refund owed to it must not reach the slot's next
+// occupant.
+//
 // The Thread, Event, Waiter, Interrupt and Timer sweeps in `end_process` remain
 // because they feed the teardown report. Mapping's sweep is not a force-free
 // either: `mapping_rights()` withholds `Transfer`, so a Mapping handle cannot
@@ -693,19 +703,26 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
 // mapping whose target died) is not a free.
 
 /// Reap every Memory, IoMemory, exchange and Pipe connection that nothing
-/// names. Called by `end_process` after the close-all.
+/// names, and disown every one still charged to dying process `p`. Called by
+/// `end_process` after the close-all.
 ///
 /// Inner to outer: an exchange lives inside a connection's row, so exchanges
 /// are given back first and the connections can then answer `pipe_idle`
 /// honestly. `exchange_settle` cascades into `free_pipe` itself, so the last
 /// loop catches connections with no exchanges (the ordinary case).
-public(package) func reap_unreferenced() unsafe {
+///
+/// Each object is disowned after its own free is tried, so an object the dying
+/// process alone named credits its ledger as on any release. An object freed
+/// later in the scan by a cascade may already be disowned; that credits nobody,
+/// and the ledger is cleared either way.
+public(package) func reap_unreferenced(p: Int) unsafe {
     var m: Int = 0
     while m < MEMORIES.capacity() {
         match MEMORIES[m].state {
             case Free -> {},
             case Live -> {
                 if MEMORIES[m].refs == 0 { free_object(ObjType.Memory, m) }
+                disown_region(m, p)
             },
         }
         m = m + 1
@@ -717,6 +734,7 @@ public(package) func reap_unreferenced() unsafe {
             case Free -> {},
             case Live -> {
                 if IOMEMORIES[io].refs == 0 { free_object(ObjType.IoMemory, io) }
+                disown_window(io, p)
             },
         }
         io = io + 1
@@ -738,7 +756,42 @@ public(package) func reap_unreferenced() unsafe {
     var c: Int = 0
     while c < PIPES.capacity() {
         if pipe_frees_now(c) { free_pipe(c) }
+        disown_pipe(c, p)
         c = c + 1
+    }
+}
+
+/// Disown region `m` if dying process `p` is still charged for it. The free
+/// tried just before may have given the slot back, or left it live (a mapped
+/// region keeps its slot, and so does a pool root with pieces on loan).
+func disown_region(m: Int, p: Int) unsafe {
+    match MEMORIES[m].state {
+        case Free -> {},
+        case Live -> {
+            if MEMORIES[m].process == p { MEMORIES[m].process = NO_PROCESS }
+        },
+    }
+}
+
+/// Disown window `io` if dying process `p` is still charged for it.
+func disown_window(io: Int, p: Int) unsafe {
+    match IOMEMORIES[io].state {
+        case Free -> {},
+        case Live -> {
+            if IOMEMORIES[io].process == p {
+                IOMEMORIES[io].process = NO_PROCESS
+            }
+        },
+    }
+}
+
+/// Disown connection `c` if dying process `p` is still charged for it.
+func disown_pipe(c: Int, p: Int) unsafe {
+    match PIPES[c].state {
+        case Free -> {},
+        case Live -> {
+            if PIPES[c].process == p { PIPES[c].process = NO_PROCESS }
+        },
     }
 }
 

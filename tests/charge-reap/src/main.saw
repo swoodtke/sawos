@@ -1,0 +1,180 @@
+// A process's own shared objects go with it: its teardown frees what only it
+// still names, through every free path the reap has (spec §2.10).
+//
+// Expected transcript, read as an order:
+//
+//   SOS chargereap: started
+//   SOS keeper: holding
+//   SOS: process exit: code=... process=1
+//   SOS: process teardown handles=9 ... process=1
+//   SOS chargereap: keeper status=65581
+//   SOS chargereap: connections back=1 windows back=1 region back=1
+//   SOS chargereap: done
+//
+// Root first counts the connections and the windows it can make before one is
+// refused, and lets them all go. It then launches the keeper (`child-keeper`)
+// with a sibling of its pool and a view of its device window, and hands the
+// keeper's Process handle to a Waiter as a one-shot subscription. The keeper
+// makes two connections of its own (one with a message staged on it), splits a
+// region off the pool, carves a window off the view, and exits holding all of
+// it.
+//
+// After the death root counts again. `connections back=1` and `windows back=1`
+// are the same counts as before: the teardown frees the idle connection in the
+// reap's connection scan, the busy one by the cascade out of settling its
+// staged exchange, and the window in the IoMemory scan. `region back=1` is the
+// pool donated whole: a donation refuses a pool with any piece on loan (a
+// fault, which would end root here), so it says the region scan gives the piece
+// back.
+//
+// This pins the no-leak path, not the disown: everything here is charged to
+// the keeper and freed in its own teardown, so the case passes on a kernel
+// that never disowns, by design. `charge-disown` is the case that tells the
+// two apart.
+//
+// One phase per function: root's stack grant is small, so the phases are split
+// rather than held in one frame.
+
+import sos.{System, Process, Memory, IoMemory, SlabKind, SystemRight,
+            SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tags the keeper's boot records travel under.
+static TAG_BOOT: UInt = 7
+static TAG_RAM: UInt = 24
+static TAG_WINDOW: UInt = 25
+
+/// The key the keeper's death is delivered under.
+static KEY_KEEPER: UInt = 56
+
+/// The length of each window root carves off its device window.
+static WINDOW_LEN: UInt = 0x1000
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static YES: UInt = 1
+static NO: UInt = 0
+
+func flag(b: Bool) -> UInt {
+    if b { YES } else { NO }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS chargereap: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS chargereap: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS chargereap: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    var pool_rec = try proc.boot_handle_next()
+    var window_rec = try proc.boot_handle_next()
+    guard let image = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    guard let pool = pool_rec.take_memory() else { return BUG }
+    guard let window = window_rec.take_iomemory() else { return BUG }
+
+    let connections_before = pipe_room(&proc)
+    let windows_before = window_room(&window)
+
+    let status = try outlive(&system, &proc, &image, &ram, &pool, &window)
+    print("SOS chargereap: keeper status={}\n", status)
+
+    let connections_back = pipe_room(&proc) == connections_before
+    let windows_back = window_room(&window) == windows_before
+    try system.slab_donate(kind: SlabKind.Memories, memory: move pool) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    print("SOS chargereap: connections back={} windows back={} region back=1\n",
+          flag(connections_back), flag(windows_back))
+    return
+}
+
+/// Launch the keeper with a pool sibling and a device view, and park until its
+/// death is delivered. Answers its §8 status word. Nothing of root's names the
+/// keeper once the delivery is made.
+func outlive(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+             pool: &Memory, window: &IoMemory) -> Result<UInt, SosStatus> {
+    let keeper = try system.process_create(image: &image, memory: &ram)
+    let for_keeper = try system.mint(rights: CHILD_SYSTEM)
+    try keeper.give(system: move for_keeper, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let sibling = try pool.mint()
+    try keeper.give(memory: move sibling, tag: TAG_RAM) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let view = try window.carve(offset: 0, len: WINDOW_LEN)
+    try keeper.give(iomemory: move view, tag: TAG_WINDOW) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try keeper.start(boot_tag: TAG_BOOT)
+    let _ = system.debug_print("SOS chargereap: started\n")
+
+    let waiter = try proc.waiter_create()
+    try waiter.give(process: move keeper, key: KEY_KEEPER) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let woke = try waiter.wait()
+    if woke.key != KEY_KEEPER {
+        return BUG
+    }
+    match woke.what {
+        case Process(status) -> { return status },
+        case _ -> { return BUG },
+    }
+}
+
+/// How many connections root can make before one is refused. Each is held in
+/// its own frame while the next is asked for, and they all go on the way back.
+/// Root's pipe row is unlimited, so the slab is what refuses. Only the client
+/// end is kept, which holds the connection open at one table row, so root's
+/// handle table does not run out first.
+func pipe_room(proc: &Process) -> UInt {
+    let pair = try proc.pipe_create() catch { return 0 }
+    let (keep, spare) = move pair
+    let _ = move spare
+    let more = pipe_room(&proc)
+    let _ = move keep
+    return 1 + more
+}
+
+/// `pipe_room` for windows carved off `window`. A carve leaves its parent
+/// whole, so only the IoMemory slab (or root's table) refuses.
+func window_room(window: &IoMemory) -> UInt {
+    let view = try window.carve(offset: 0, len: WINDOW_LEN) catch { return 0 }
+    let more = window_room(&window)
+    let _ = move view
+    return 1 + more
+}

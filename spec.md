@@ -69,7 +69,7 @@ somebody says what references it (Thread's row is not yet enforced):
 | Timer | handle entries + its attachment |
 | MemoryObject / IoMemoryObject | handle entries (a Memory's installed grant rows are a second count, §2.5) |
 | Mapping | handle entries — not its row, which the Mapping owns rather than the reverse (§2.5) |
-| Process | handle entries + its attachment + one per shared object charged to it (§2.10; that third column is not yet enforced). A live process is never freed by losing its last handle, and a `Gone` one's slot is reclaimed when the count reaches zero (§2.7). The attachment column is what makes attach-after-death sound against that reclaim: a watched dead slot cannot reach zero while somebody is watching it |
+| Process | handle entries + its attachment. A shared object charged to the process holds no reference on it: the process's death disowns the object (§2.10). A live process is never freed by losing its last handle, and a `Gone` one's slot is reclaimed when the count reaches zero (§2.7). The attachment column is what makes attach-after-death sound against that reclaim: a watched dead slot cannot reach zero while somebody is watching it |
 | PipeInlet | handle entries + its attachment, on the connection's inlet column. The two endpoint kinds share one `PIPES` row and count on separate columns, which is what makes "every client handle is gone" askable at all; a side reaching zero raises peer-gone on the other, and the slot frees only when both columns are zero. The attachment is per end, not per connection: a client waits for room and a server waits for a message, so §2.2's at-most-one-Waiter rule holds per column exactly as the count does |
 | PipeOutlet | handle entries + its attachment — the same row's outlet column, mirrored. The two arms of `free_object` are one act written twice, because reaching it through either kind means both columns are already zero |
 | PipeReply | handle entries + its attachment, on one ring slot's claim column. A delivery of this kind drops that attachment's reference — a claim is a one-shot, so its delivery is inherently consuming — which is the one place in the ledger where answering a wait is what frees an object. A one-shot exists for exactly as long as one in-flight message, so the pair is ring-slot state rather than a third slab: the object is an exchange (`connection * PIPE_INFLIGHT + ring slot`) and the claim counts on its reply column. The ring slot goes back when both of the exchange's columns are zero and nothing is owed — a staged message is still owed to a live outlet whatever became of its claim, which is §2.1's TELL idiom |
@@ -1178,16 +1178,14 @@ an attachment on one (a wait — including an attachment that owns a reference t
 the object after `Waiter.give(process:)`), so "no handle entry or attachment
 names this slot" is "no possible reader of the word", exactly. The trap counters
 are not in the slot: they are the slot's row of the shared stats region
-(`Stats`, below). One more kind of reference holds the slot: each shared object
-charged to the process, so that a refund owed to it at a later free can never
-land on the slot's next occupant (§2.10). Not yet enforced: shared objects hold
-no such reference, and the slot is reclaimed once no handle entry or attachment
-names it. The count that decides it is `ProcessSlot.refs`, maintained at the
-same sites as every other kind's, so a `Gone` process is ordinary rather than
-special. Handle generations (§3) make the reuse safe, and `clear_domain`
-invalidates `LAST_PROT_PROCESS`. Where the kernel walks every handle table, the
-walk is over the process slab's extent chain and is bounded by
-`process_slots_usable()` × `MAX_HANDLES`.
+(`Stats`, below). A shared object charged to the process does not hold the slot:
+the teardown disowns it, so a refund at its later free is owed to nobody and
+cannot land on the slot's next occupant (§2.10). The count that decides it is
+`ProcessSlot.refs`, maintained at the same sites as every other kind's, so a
+`Gone` process is ordinary rather than special. Handle generations (§3) make the
+reuse safe, and `clear_domain` invalidates `LAST_PROT_PROCESS`. Where the kernel
+walks every handle table, the walk is over the process slab's extent chain and
+is bounded by `process_slots_usable()` × `MAX_HANDLES`.
 
 **`Stats` — exact trap introspection.** `ProcessOp.Stats` on
 `ProcessRight.Stats` answers through a three-doubleword copy-out record:
@@ -1404,14 +1402,12 @@ column, charged at the bind.
   who pays for an object; a message only ever moves who pays for a name.
 - **Refunds follow the lifecycle (§2.10).** A bound kind's charge comes back
   when the object is invalidated, and a shared kind's when it is freed. A dying
-  process's ledger is cleared at the end of its teardown, so a shared object
-  that outlives the process it is charged to is charged to nobody until it
-  frees; it holds a reference on that process's slot, so its refund reaches
-  the ledger it was charged to and never the slot's next occupant. The books
-  balance and the machine stays bounded because quota <= wall: an object that
-  outlives its charge still occupies the slab slot it was charged for. Not yet
-  enforced: a shared object holds no reference on the slot, so a refund at its
-  free credits whichever process occupies the slot by then.
+  process's ledger is cleared at the end of its teardown, and a shared object
+  that outlives the process it is charged to is disowned there: it is charged to
+  nobody from then on, and its free credits nobody, so a refund never reaches
+  the slot's next occupant. The books balance and the machine stays bounded
+  because quota <= wall: an object that outlives its charge still occupies the
+  slab slot it was charged for.
 - Quotas count objects, not bytes, in v1; bytes are the pool's ledger (§2.5).
 
 ### 2.10 Object lifecycle
@@ -1513,10 +1509,18 @@ field.
 - **A bound kind's charge is refunded at invalidation.** Its owner is then
   either live or mid-teardown with its ledger about to be cleared, so a refund
   can never land on a reused process slot.
-- **A shared kind can outlive the process charged for it**, so each such object
-  holds a reference on that process's slot. A `Gone` slot is not reclaimed
-  until every object charged to it is freed, and the refund at free reaches
-  the right ledger.
+- **A shared kind can outlive the process charged for it**, so that process's
+  death disowns it. The teardown frees the shared objects nothing else names
+  and marks every shared object still charged to the dying process as owned by
+  nobody. An object freed before its mark credits the dying ledger as any free
+  does; one freed after it (a region whose last namer is a grant row in the
+  dying domain, or an object only a staged message named) credits nobody.
+  Either way its charge ends with the ledger, which the teardown clears. An
+  object that outlives the teardown is charged to nobody, and its later free
+  credits nobody. A dead process's ledger has no consumer, since creation
+  through a `Gone` process's handle is refused. The objects it was charged for
+  do not hold the dead slot, which is reclaimed on its handles and attachment
+  alone.
 
 Not yet enforced:
 
@@ -1524,12 +1528,14 @@ Not yet enforced:
 - The teardown releases the handle table first, counting without freeing, and
   then frees the dying process's Threads, Events, Waiters, Interrupts and
   Timers by owner, frees the Mappings it made, and frees the Memory, IoMemory,
-  exchanges and connections nothing names any more. An Event or an Interrupt
-  is therefore freed by its owner's death, and a Thread, Waiter or Timer is
-  freed rather than left invalid, an `Exited` Thread included, which is sound
-  only while every handle naming it is in the dying table. A Mapping that
-  targets the dying process already has the invalid shape — its slot kept, its
-  row cleared, its handles in other tables — though its ops answer `BadState`
+  exchanges and connections nothing names any more, disowning the rest it was
+  charged for. An Event or an Interrupt is therefore freed by its owner's
+  death, and a Thread, Waiter or Timer is freed rather than left invalid, an
+  `Exited` Thread included, which is sound only while every handle naming it
+  is in the dying table. Once an Event can outlive its owner, it will be
+  disowned at that death as the other shared kinds are. A Mapping that targets
+  the dying process already has the invalid shape — its slot kept, its row
+  cleared, its handles in other tables — though its ops answer `BadState`
   today (next item).
 - Ops on an invalid object do not answer `Revoked`. `Unmap` and `Base` on a
   Mapping whose target died are `BadState` faults (§2.5), and so is a `map`
@@ -1541,10 +1547,6 @@ Not yet enforced:
 - An Interrupt carries `Mint`, is charged an `Interrupt` quota row, can be
   consumed into an attachment (`Waiter.give(interrupt:)`), and stays bound
   while an attachment holds it after its handle is released.
-- A shared object holds no reference on the process it is charged to, so a
-  `Gone` slot is reclaimed once no handle entry or attachment names it, and a
-  connection, Memory or IoMemory freed after that credits whichever process
-  occupies the slot by then.
 
 ## 3. Handles, rights, derivation
 
@@ -1743,8 +1745,7 @@ Not yet enforced:
     the entry, bumps the generation and never touches the object's state.
   - **It does touch the object's reference count, and zero frees.** Every
     countable slab slot carries a count of the handle entries naming it, plus,
-    for a waitable, its attachment, and for a process, each shared object
-    charged to it (§2, §2.10; that last is not yet enforced); a release
+    for a waitable, its attachment (§2); a release
     decrements, and a count reaching zero frees synchronously, inside the very
     syscall that dropped the last reference — the kernel runs to completion, so
     there is no deferred reclamation and no cleanup queue. The kind's own last
@@ -2607,12 +2608,10 @@ class (§2.7). The two are separate rights on purpose — `ProcessRight.Wait` an
 `ProcessRight.Stats` — so a supervisor that may learn a child died need not be
 able to watch it work. Both survive the death. The status word lives in the
 `Gone` slot, which lives while some reference names it (a handle entry,
-including a minted sibling's entry, an attachment, or a shared object charged to
-the process, §2.10), and the holders of the first two are the only readers there
-can be; a shared object holds the slot without reading it. Not yet enforced:
-shared objects hold no reference on the slot. The counters live in the slot's
-stats-region row (§2.7), which `Stats` reads through the same handle and which a
-mapped stats-region reader can also see until a create reuses the slot.
+including a minted sibling's entry, or an attachment), and those holders are the
+only readers there can be. The counters live in the slot's stats-region row
+(§2.7), which `Stats` reads through the same handle and which a mapped
+stats-region reader can also see until a create reuses the slot.
 
 - **A thread fault kills its process.** The process exits with a
   fault status; there is no per-thread fault recovery (a faulted
@@ -2984,10 +2983,8 @@ loader parses and reports while no Process slot stores either.
   are not counted; the teardown's close-all releases every handle but counts
   without freeing, and the owner sweeps after it free the dying process's
   objects outright instead of invalidating the bound kinds first and leaving
-  the shared ones to their counts; an op on an invalid Mapping or a `Gone`
-  Process does not answer `Revoked`; and a shared object holds no reference on
-  the process it is charged to, so its refund can credit a later occupant of
-  that slot.
+  the shared ones to their counts; and an op on an invalid Mapping or a
+  `Gone` Process does not answer `Revoked`.
 - Binding an interrupt line is not yet a System op: it is
   `ProcessOp.InterruptBind` on `ProcessRight.InterruptBind`, charged to an
   `Interrupt` quota row, minting into the named process's table and faulting

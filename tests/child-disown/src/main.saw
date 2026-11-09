@@ -1,0 +1,232 @@
+// One program in two roles, chosen by the boot set: the charger, which leaves
+// shared objects charged to it behind and dies, and the probe, which runs in
+// the charger's reused slot and reads its own ledger back.
+//
+// The charger is given a carrier inlet, a sibling of its launcher's pool and a
+// view of a device window. It makes a connection, splits two regions off the
+// pool and carves a window off the view, all charged to it, posts the
+// connection's client end, both regions and the window in one message, and
+// exits. It exits holding exactly two handles, its boot System and the Process
+// it derived: everything else is released when the posting frame ends or left
+// this table at the post.
+//
+// The probe is given a go outlet, a pool sibling and a device view. It spends
+// one of each kind (a connection, a region, a window) and parks. Its launcher
+// then frees and donates the charger's objects, which the charger's death
+// disowned, and posts go. The probe then spends each kind until refused:
+//
+//   SOS probe: pipes=2 regions=4 windows=2 quota=1
+//
+// Those are its allowances (`DEFAULT_QUOTA_PIPES`, `DEFAULT_QUOTA_MEMORIES`,
+// `DEFAULT_QUOTA_IOMEMORIES`), and `quota=1` says every refusal was
+// `QuotaExceeded`. A refund of a disowned object credited to this slot would
+// leave a row one fewer than this process spent, and that kind would count one
+// more. What it spends after the park is held only while it counts; the first
+// of each kind is kept to the exit, so a release cannot muddy the count. The
+// exit code is the total.
+
+import sos.{System, Process, Memory, IoMemory, PipeInlet, PipeOutlet,
+            PipeHandles, Waiter, SosStatus, PIPE_BODY_BYTES}
+
+/// The launcher's tags.
+static TAG_CARRIER: UInt = 21
+static TAG_GO: UInt = 23
+static TAG_RAM: UInt = 24
+static TAG_WINDOW: UInt = 25
+
+/// The key the go outlet is attached under.
+static KEY_GO: UInt = 61
+
+/// One protection unit on every profile, so a split is grantable.
+static CHUNK: UInt = 0x1000
+
+/// The device view's length, carved whole.
+static WINDOW_LEN: UInt = 0x1000
+
+/// The boot set is neither role's, or a step the launcher makes impossible
+/// failed.
+static EXIT_MISMATCH: UInt = 98
+/// The charger's objects went. The launcher reads this in the §8 status word.
+static EXIT_SENT: UInt = 44
+
+/// The byte the charger's message carries, so the launcher's take proves which
+/// message.
+static BYTE_MARK: UInt8 = 78
+
+static YES: UInt = 1
+static NO: UInt = 0
+
+func flag(b: Bool) -> UInt {
+    if b { YES } else { NO }
+}
+
+func is_quota(status: SosStatus) -> Bool {
+    match status {
+        case QuotaExceeded -> true,
+        case _ -> false,
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS disown: no process handle: {}\n", error)
+        return
+    }
+
+    var carrier: PipeInlet? = None
+    var go: PipeOutlet? = None
+    var ram: Memory? = None
+    var window: IoMemory? = None
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                let tag = rec.tag
+                if tag == TAG_CARRIER {
+                    carrier = rec.take_inlet()
+                } else if tag == TAG_GO {
+                    go = rec.take_outlet()
+                } else if tag == TAG_RAM {
+                    ram = rec.take_memory()
+                } else if tag == TAG_WINDOW {
+                    window = rec.take_iomemory()
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+    guard let pool = ram.take() else {
+        let _ = system.debug_print("SOS disown: no region\n")
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    guard let view = window.take() else {
+        let _ = system.debug_print("SOS disown: no window\n")
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+
+    if let out = carrier.take() {
+        let code = try charge(&proc, move out, move pool, move view) catch {
+            print("SOS charger: refused: {}\n", error)
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        }
+        // `exit` does not return, so nothing unwinds here: the teardown closes
+        // exactly what this frame still holds.
+        let _ = proc.exit(code)
+        return
+    }
+    guard let signal = go.take() else {
+        let _ = system.debug_print("SOS disown: neither role\n")
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+
+    // The probe. The first of each kind is spent before the park, so a refund
+    // landing on this ledger would have a row to lower.
+    let first_pipe = try proc.pipe_create() catch {
+        print("SOS probe: first connection failed: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let first_piece = try pool.split(len: CHUNK) catch {
+        print("SOS probe: first split failed: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let first_view = try view.carve(offset: 0, len: WINDOW_LEN) catch {
+        print("SOS probe: first carve failed: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+
+    try park(&proc, &signal) catch {
+        print("SOS probe: park failed: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let _ = move signal
+
+    let (more_pipes, pipes_quota) = spend_pipes(&proc)
+    let (more_pieces, pieces_quota) = spend_pieces(&pool)
+    let (more_views, views_quota) = spend_views(&view)
+    let pipes = 1 + more_pipes
+    let regions = 1 + more_pieces
+    let windows = 1 + more_views
+    let quota = pipes_quota && pieces_quota && views_quota
+    print("SOS probe: pipes={} regions={} windows={} quota={}\n",
+          pipes, regions, windows, flag(quota))
+    let _ = move first_pipe
+    let _ = move first_piece
+    let _ = move first_view
+    let _ = proc.exit(pipes + regions + windows)
+}
+
+/// The charger's whole act: make one of each shared kind, charged here, and
+/// post them all to the launcher. Everything this frame holds is released when
+/// it returns.
+func charge(proc: &Process, out: PipeInlet, pool: Memory,
+            view: IoMemory) -> Result<UInt, SosStatus> {
+    let made = try proc.pipe_create()
+    let (made_in, made_out) = move made
+    let _ = move made_out
+    let piece_a = try pool.split(len: CHUNK)
+    let piece_b = try pool.split(len: CHUNK)
+    let carved = try view.carve(offset: 0, len: WINDOW_LEN)
+
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = BYTE_MARK
+    var carrying = PipeHandles.none()
+    carrying.put(0, inlet: move made_in)
+    carrying.put(1, memory: move piece_a)
+    carrying.put(2, memory: move piece_b)
+    carrying.put(3, iomemory: move carved)
+    let staged = try out.post_with(body: &body, len: 1, handles: &var carrying)
+    let _ = move staged
+    return EXIT_SENT
+}
+
+/// Wait for the launcher's go message, and take it.
+func park(proc: &Process, signal: &PipeOutlet) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(outlet: &signal, key: KEY_GO)
+    let _ = try waiter.wait()
+    let got = try signal.take()
+    let (msg, request) = move got
+    let _ = move msg
+    let _ = move request
+    return
+}
+
+/// Make connections until one is refused, each held in its own frame while
+/// the next is asked for, and answer how many and whether the refusal was
+/// `QuotaExceeded`.
+func spend_pipes(proc: &Process) -> (UInt, Bool) {
+    let pair = try proc.pipe_create() catch { return (0, is_quota(error)) }
+    let (n, quota) = spend_pipes(&proc)
+    let _ = move pair
+    return (n + 1, quota)
+}
+
+/// `spend_pipes` for regions split off `pool`.
+func spend_pieces(pool: &Memory) -> (UInt, Bool) {
+    let piece = try pool.split(len: CHUNK) catch { return (0, is_quota(error)) }
+    let (n, quota) = spend_pieces(&pool)
+    let _ = move piece
+    return (n + 1, quota)
+}
+
+/// `spend_pipes` for windows carved off `view`.
+func spend_views(view: &IoMemory) -> (UInt, Bool) {
+    let carved = try view.carve(offset: 0, len: WINDOW_LEN) catch {
+        return (0, is_quota(error))
+    }
+    let (n, quota) = spend_views(&view)
+    let _ = move carved
+    return (n + 1, quota)
+}

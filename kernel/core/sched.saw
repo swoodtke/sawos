@@ -492,23 +492,27 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // Don't force-free by `process` field: a give does not move a slot's
     // `process` field, so a region a launcher gave a child is not the dying
     // process's to free. What the dying process was charged for is written off
-    // by `quota_clear` below; an orphaned object is charged to nobody until it
-    // frees.
+    // by `quota_clear` below.
     //
     // `reap_unreferenced` gives back what nobody names. It must exist because
     // the close-all above counts without freeing, so a slot whose last handle
     // the dying process held would otherwise be stranded. The free goes through
-    // `free_object`, so each kind's quota credit runs.
+    // `free_object`, so each kind's quota credit runs, onto this ledger for
+    // what this process was charged for. Whatever survives and is charged to
+    // this process is disowned in the same scans: it is charged to nobody from
+    // here on, and its eventual free credits nobody rather than whichever
+    // process occupies this slot by then (spec §2.10).
     //
-    // The arm is untaken whenever root creates every shared object and outlives
-    // them, since then no dying process is the last namer of another's slot.
-    // That is a property of the wiring, not of the table.
+    // Whether either arm does anything is a property of the wiring, not of the
+    // table: the reap frees only what the dying process was the last to name,
+    // and disowns only what it was charged for and something else still
+    // names.
     //
     // Threads, Events, Waiters, Interrupts and Timers are counted for the
     // teardown line and swept by ownership. Mappings are swept below: a Mapping
     // is not subject to the hazard above because `mapping_rights()` withholds
     // `Transfer`, so its handle cannot leave the owning process.
-    reap_unreferenced()
+    reap_unreferenced(p)
 
     // Mappings come apart from both ends, which is why this loop has two arms.
     // A Mapping names two processes: the owner, whose handle it is, and the
@@ -550,14 +554,15 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // next occupant would otherwise drain handles that are not its own.
     clear_boot_handles(p)
 
-    // The quota ledger dies with the process. This is the orphan write-off:
-    // an object a peer still references survives its creator, and its charge is
-    // dropped here. The books balance because quota <= wall (the slab refuses
-    // the next allocation), and `quota_credit`'s zero test makes a credit onto
-    // this cleared row a no-op rather than an underflow. The limits are cleared
-    // with the used counts so the next occupant of the slot does not inherit
-    // an allowance. A mapping row in another process's domain is credited to
-    // that target when its row goes (its own `Unmap` or teardown).
+    // The quota ledger dies with the process. The charge of an object a peer
+    // still references, which the reap above disowned, is written off here
+    // with the rest. The books balance because quota <= wall (the slab refuses
+    // the next allocation). No credit is owed to this row once it is cleared,
+    // so `quota_credit`'s zero test is only a defence against an underflow.
+    // The limits are cleared with the used counts so the next occupant of the
+    // slot does not inherit an allowance. A mapping row in another process's
+    // domain is credited to that target when its row goes (its own `Unmap` or
+    // teardown).
     quota_clear(p)
 
     // Free the slot itself if nobody can still read it. The dying process's
@@ -566,6 +571,15 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // leaving a `Gone` slot nothing can reach. The usual case is the opposite:
     // a creator's handle onto its dead child survives (keeping the spec §8
     // status word readable), and the creator's release frees the slot later.
+    //
+    // The slot may already be `Free` by now. The `notify_ready` at the top can
+    // deliver a one-shot attachment holding the slot's last reference (the
+    // `Waiter.give(process:)` default), which reclaims it then. That is safe
+    // only because the reclaim does nothing but write `state = Free`: every
+    // step since indexes the slot by number without reading its state,
+    // nothing allocates a process slot before `resume_after_death`, and this
+    // call is guarded on `Gone`. A reclaim that also cleared the table or the
+    // rows would break the steps above.
     reclaim_process_slot(p)
 
     let uart = console()
