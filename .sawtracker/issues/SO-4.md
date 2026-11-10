@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"closed":"","created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":0,"revision":9,"sequence":610,"stage":"backlog","status":"open","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1794329494"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"closed":"","created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":0,"revision":10,"sequence":611,"stage":"backlog","status":"open","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1794329566"}
 ---
 
 
@@ -382,4 +382,18 @@ Submitted patch SO-4.p1 (revision 1): arm64: lazy per-thread FP/SIMD state; the 
 
 **Spec and docs.** §5b and §7 state the contract, with the arm64 and riscv32 ABI and README notes. The FP known limits are removed.
 
+
+<!-- sawtracker:comment {"author":"agent:claude-air-reviewer","body_bytes":1807,"created":"1794329566","id":"c9"} -->
+Approved patch SO-4.p1 (revision 1)
+
+**Air: SO-4.p1, approved.** It implements the agreed design with the first-use correction. I read the arm64 HAL and the kernel at 5f5c73d + p1.
+- **No cross-process leak.** `fp_trap` (EC 7 only) sets the active flag, `sos_fp_load`s the thread's area, and only then enables EL0 FP. A fresh thread's area is all zeros: `frame_init` writes `FRAME_WORDS` = 102 words = 816 = `FRAME_BYTES`, so the whole 544-byte area and the active flag at 528 are zeroed on every create and slot reuse. `fp_leak` (`nonzero=66` before) pins it.
+- **Switch:**
+  - `fp_switch_out` saves only an active thread, and runs in `pick_next` before the `PENDING_FREE` free, so a freed slot is never written;
+  - `fp_switch_in` (in `run_thread`, so it covers `resume_after_death`) loads and enables for an active thread and disables EL0 FP for any other, so an inactive thread always traps first and never sees the registers' previous owner;
+  - a dying thread's leftover register values are overwritten by the next active thread's load, or hidden behind the trap;
+  - `stays_running` keeps both the state and `FPEN` as they are.
+- **The stride** is now derived (`FRAME_STRIDE_UNIT` rounded up to `hal.FRAME_BYTES`: 1024 on arm64, 512 on riscv32). The donated extents' alignment and `FRAME_ARENA_WORDS` follow from it, and the static asserts hold the frame inside the stride.
+- **The kernel stays FP-free and it's enforced:** `-mgeneral-regs-only` for the C, plus the `llvm-objdump` check over every arm64 image's `.text*`, allowing only `sos_fp_save`/`sos_fp_load`. The IRQ path needs no save.
+- **Tests:** `fp_threads` (interleave; exactly one first-use trap per FP thread, none for the FP-free initial thread) and `fp_leak` catch the three mutants: no save, FP enabled at boot, no load on first use.
 
