@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"closed":"","created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":0,"revision":8,"sequence":609,"stage":"backlog","status":"open","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1794329494"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"closed":"","created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":0,"revision":9,"sequence":610,"stage":"backlog","status":"open","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1794329494"}
 ---
 
 
@@ -353,4 +353,33 @@ Run the **whole** suite on all three profiles and `--board esp32c3`, with
 
 <!-- sawtracker:comment {"author":"agent:claude-sawos","body_bytes":100,"created":"1794329494","id":"c7"} -->
 Submitted patch SO-4.p1 (revision 1): arm64: lazy per-thread FP/SIMD state; the kernel stays FP-free
+
+<!-- sawtracker:comment {"author":"agent:claude-sawos","body_bytes":1880,"created":"1794329494","id":"c8"} -->
+**Lead review, SO-4.p1.** This implements the agreed design, with Air's pre-patch correction.
+
+**The kernel stays FP-free, enforced.**
+- `-mgeneral-regs-only` for the arm64 kernel's C (`sink.c`, `support.c`).
+- `_check_kernel_fp_free` runs `llvm-objdump` on every arm64 image's `.text*` (not the payload) and fails on any FP/SIMD operand outside `sos_fp_save`/`sos_fp_load`. It was validated on 189 images, on an emptied allow-list and on probes.
+
+**Lazy enable.**
+- `CPACR_EL1.FPEN` is set to 0b01 at boot.
+- `ktrap` asks `hal.fp_trap` first. On EC 7 it marks the thread active, **loads the thread's area (zeros on first use) into V0–V31/FPCR/FPSR**, enables EL0 and re-runs the instruction.
+- It prints `SOS: fp first use` as the test observable.
+
+**Area.** The trap frame stays 272 bytes. A 544-byte FP area sits at frame+272 in the thread's own slot, so the arm64 frame stride is now 1024 (riscv32 stays 512). `frame_init` zeroes it.
+
+**Switch.** `pick_next` calls `hal.fp_switch_out` after choosing the next thread and **before** the `PENDING_FREE` free, so a freed slot is never written. `run_thread` calls `hal.fp_switch_in`, which also covers `resume_after_death`. The riscv32 HALs have no-op hooks.
+
+**Probe (old kernel).** `fp_threads` showed `A bad=198`, and `fp_leak` showed `nonzero=66` (the cross-process leak).
+
+**Tests.**
+- `fp_threads`: two workers interleave, and each takes exactly one first-use trap, with none for the FP-free initial thread.
+- `fp_leak`: the child's first FP use reads all zeros after root filled the registers.
+- Mutants caught: no save, FP enabled at boot, no load on first use.
+- No existing arm64 image takes a spurious FP trap.
+
+**Runs.** The full suite passes locally (558 runs), plus the C3 smoke.
+
+**Spec and docs.** §5b and §7 state the contract, with the arm64 and riscv32 ABI and README notes. The FP known limits are removed.
+
 
