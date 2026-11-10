@@ -1,0 +1,170 @@
+// A dying process's Waiter is taken apart with nobody parked on it (spec
+// §2.10, §2.2).
+//
+// Expected transcript, read as an order:
+//
+//   SOS teardowndetach: started
+//   SOS: process exit: code=52 process=1        <- the owner
+//   SOS: process teardown ... process=1
+//   SOS teardowndetach: the parked wait answered: <Revoked>
+//   SOS teardowndetach: the reply answered: <PeerClosed>
+//   SOS teardowndetach: done
+//
+// The owner (`child-waitable`, owner role) sends root a Waiter. Root posts a
+// message to a connection of its own and takes it, which makes a claim and an
+// obligation on one exchange. It gives the claim to the owner's Waiter (a
+// consuming attachment, made first, so it has the lower attachment slot),
+// attaches the obligation to it one-shot, keeping its handle, and parks on it.
+// Then the owner dies.
+//
+// The teardown takes the owner's Waiter apart row by row, in attachment-slot
+// order. Dropping the claim's row takes the claim column to zero, which raises
+// the obligation's abandoned level, whose row is on the same Waiter. Root's
+// thread must already have been answered by then: woken with `Revoked`, the
+// Waiter is gone for it. Were it still parked, that level would be delivered to
+// it while the list was half taken apart, the one-shot row's detach would miss
+// it, and the obligation's reference would be dropped twice; the exchange
+// would settle under root's live obligation handle and root's reply through it
+// would stop the machine. As it is, the obligation keeps its handle's
+// reference, and the reply answers `PeerClosed`: the claim was abandoned.
+
+import sos.{System, Process, Memory, Waiter, PipeInlet, PipeOutlet, PipeMsg,
+            PipeReply, PipeRequest, AttachMode, SystemRight, SosStatus,
+            PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tags the child's boot records travel under.
+static TAG_BOOT: UInt = 7
+static TAG_OUTBOX: UInt = 33
+
+/// The keys root's attachments live under.
+static KEY_MSG: UInt = 81
+static KEY_CLAIM: UInt = 82
+static KEY_OBLIGATION: UInt = 83
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.ClockGet | SystemRight.Transfer)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS teardowndetach: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS teardowndetach: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS teardowndetach: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    let outbox = try proc.pipe_create()
+    let (outbox_in, outbox_out) = move outbox
+    let child = try system.process_create(image: &image, memory: &ram)
+    let mail = try proc.waiter_create()
+    try mail.add(outlet: &outbox_out, key: KEY_MSG)
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(inlet: move outbox_in, tag: TAG_OUTBOX) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    let _ = system.debug_print("SOS teardowndetach: started\n")
+
+    let woke = try mail.wait()
+    if woke.key != KEY_MSG {
+        return BUG
+    }
+    let got = try outbox_out.take()
+    let (arrived, owner_request) = move got
+    var msg = move arrived
+    let waiter = try msg_waiter(&var msg, 0)
+
+    // The exchange whose two halves end up on the owner's Waiter.
+    let mine = try proc.pipe_create()
+    let (mine_in, mine_out) = move mine
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    let claim = try mine_in.post(body: &body, len: 1)
+    let taken = try mine_out.take()
+    let (posted, obligation) = move taken
+    let _ = move posted
+
+    try waiter.give(reply: move claim, key: KEY_CLAIM,
+                    mode: AttachMode.Persistent) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try waiter.add(request: &obligation, key: KEY_OBLIGATION,
+                   mode: AttachMode.OneShot)
+
+    // The owner waits on its claim until this request goes, then ends itself.
+    // This thread parks in the wait below before the owner runs again.
+    let _ = move owner_request
+    // A delivery here is the failure, but the reply below is still made: it is
+    // what shows the damage a mid-sweep delivery does.
+    var wrong = false
+    match waiter.wait() {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS teardowndetach: the parked wait was delivered\n")
+            wrong = true
+        },
+        case Err(why) -> {
+            print("SOS teardowndetach: the parked wait answered: {}\n", why)
+            wrong = why != SosStatus.Revoked
+        },
+    }
+
+    var answer: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    match (move obligation).reply(body: &answer, len: 1) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS teardowndetach: the reply was taken\n")
+            return BUG
+        },
+        case Err(why) -> {
+            print("SOS teardowndetach: the reply answered: {}\n", why)
+            if why != SosStatus.PeerClosed {
+                return BUG
+            }
+        },
+    }
+    if wrong {
+        return BUG
+    }
+    let _ = move child
+    return
+}
+
+/// Take the Waiter out of slot `at` of a delivered message.
+func msg_waiter(msg: &var PipeMsg, at: Int) -> Result<Waiter, SosStatus> {
+    guard let carried = msg.handles[at].take() else { return BUG }
+    match carried {
+        case Waiter(w) -> { return move w },
+        case _ -> { return BUG },
+    }
+}

@@ -1,0 +1,181 @@
+// An invalidated Timer is disarmed: it carries no fire count and counts no
+// more (spec §2.10, §2.6).
+//
+// Expected transcript, read as an order:
+//
+//   SOS timerdisarm: started
+//   SOS: process exit: code=52 process=1        <- the firing owner
+//   SOS: process teardown ... timers=0 process=1
+//   SOS timerdisarm: the child is gone
+//   SOS timerdisarm: the invalid Timer reads fires=0
+//   SOS timerdisarm: later it still reads fires=0
+//   SOS timerdisarm: done
+//
+// The firing owner (`child-waitable`) sends root a Timer and keeps a sibling.
+// Root attaches the Timer to a Waiter of its own and waits elsewhere, for the
+// owner's death, so nothing is delivered from that Waiter. The owner arms the
+// Timer through its sibling every `FIRING_PERIOD_NS` and sleeps for several
+// periods, so the Timer has counted fires when the owner dies, and nobody has
+// been told about them.
+//
+// The death invalidates the Timer, and the invalidation disarms it, which
+// clears the count with the schedule. So the record root then reads off its
+// Waiter carries zero fires: a Timer invalidated without the disarm would
+// still hold the count it had. Root sleeps past several more periods and reads
+// again: still zero, because nothing counts fires on an invalid Timer. The
+// owner's teardown line counts no Timer: the one it slept on was released
+// before it ended, and the one it sent was invalidated, not freed.
+
+import sos.{System, Process, Memory, Waiter, Timer, Clock, ClockType,
+            PipeInlet, PipeOutlet, PipeMsg, WaitPayload, SystemRight,
+            SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tags the child's boot records travel under.
+static TAG_BOOT: UInt = 7
+static TAG_OUTBOX_FIRING: UInt = 34
+
+/// The keys root's attachments live under.
+static KEY_MSG: UInt = 81
+static KEY_CHILD: UInt = 82
+static KEY_TIMER: UInt = 84
+static KEY_SLEEP: UInt = 85
+
+/// How long root sleeps after the death: several of the owner's periods
+/// (`child-waitable`'s `FIRING_PERIOD_NS`).
+static SLEEP_NS: UInt64 = 10_000_000
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.ClockGet | SystemRight.Transfer)
+
+/// The owner's exit code, and the kind half of a §8 status word for a process
+/// that exited.
+static OWNER_DONE: UInt = 52
+static EXITED: UInt = 1 << 16
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS timerdisarm: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
+        print("SOS timerdisarm: no clock: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc, &clock) catch {
+        print("SOS timerdisarm: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS timerdisarm: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process, clock: &Clock) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    let outbox = try proc.pipe_create()
+    let (outbox_in, outbox_out) = move outbox
+    let child = try system.process_create(image: &image, memory: &ram)
+    let watch = try proc.waiter_create()
+    try watch.add(outlet: &outbox_out, key: KEY_MSG)
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(inlet: move outbox_in, tag: TAG_OUTBOX_FIRING) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    let _ = system.debug_print("SOS timerdisarm: started\n")
+
+    let woke = try watch.wait()
+    if woke.key != KEY_MSG {
+        return BUG
+    }
+    // From here only the death is waited for on `watch`.
+    try watch.remove(KEY_MSG)
+    try watch.add(process: &child, key: KEY_CHILD)
+    let got = try outbox_out.take()
+    let (arrived, request) = move got
+    var msg = move arrived
+    let timer = try msg_timer(&var msg, 1)
+
+    let held = try proc.waiter_create()
+    try held.add(timer: &timer, key: KEY_TIMER)
+
+    // The owner waits on its claim until this request goes, then arms the
+    // Timer, sleeps and ends.
+    let _ = move request
+    let ended = try watch.wait()
+    if ended.key != KEY_CHILD {
+        return BUG
+    }
+    match ended.what {
+        case Process(status) -> {
+            if status != EXITED + OWNER_DONE {
+                print("SOS timerdisarm: the owner ended {}\n", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    let _ = system.debug_print("SOS timerdisarm: the child is gone\n")
+
+    let first = try held.wait()
+    print("SOS timerdisarm: the invalid Timer reads fires={}\n",
+          fires_of(&first.what))
+    try doze(&proc, &clock, SLEEP_NS)
+    let later = try held.wait()
+    print("SOS timerdisarm: later it still reads fires={}\n",
+          fires_of(&later.what))
+    return
+}
+
+/// The fire count a delivered record carries, or `UInt.max` for any other
+/// record.
+func fires_of(what: &WaitPayload) -> UInt {
+    match what {
+        case Timer(fires) -> fires,
+        case _ -> UInt.max,
+    }
+}
+
+/// Sleep `ns` on a Timer and a Waiter of root's own, both released on return.
+func doze(proc: &Process, clock: &Clock, ns: UInt64) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    let timer = try clock.timer_create()
+    try waiter.add(timer: &timer, key: KEY_SLEEP)
+    try timer.arm(after_ns: ns)
+    let _ = try waiter.wait()
+    return
+}
+
+/// Take the Timer out of slot `at` of a delivered message.
+func msg_timer(msg: &var PipeMsg, at: Int) -> Result<Timer, SosStatus> {
+    guard let carried = msg.handles[at].take() else { return BUG }
+    match carried {
+        case Timer(tm) -> { return move tm },
+        case _ -> { return BUG },
+    }
+}

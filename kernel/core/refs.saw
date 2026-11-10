@@ -29,9 +29,10 @@
 //! Teardown does not force-free the counted kinds other processes may still
 //! reference (regions, IO windows, pipe connections, Events);
 //! `reap_unreferenced` frees what nobody names and disowns the rest (see the
-//! block above it). Threads are invalidated by owner and freed by count in
-//! `end_process`'s thread sweep. Waiters, Interrupts, Timers and Mappings are
-//! swept by owner.
+//! block above it). Threads, Waiters and Timers are invalidated by owner and
+//! freed by count in `end_process`'s per-kind sweeps. Interrupts and Mappings
+//! are swept by owner, and the Interrupt sweep also frees another process's
+//! Interrupt that nothing names any more.
 //!
 //! This file also holds delivery, readiness becoming a woken thread. The ledger
 //! and delivery are mutually recursive: a delivery drops a reference (one-shot
@@ -124,7 +125,7 @@ import kcore.objects.{
     table_room,
     unbind_handle,
 }
-import kcore.time.{TIMERS, TimerSlot, reprogram_timer}
+import kcore.time.{TIMERS, TimerSlot, TimerState, reprogram_timer}
 import kcore.waitables.{
     ATTACHMENTS,
     Attachment,
@@ -136,6 +137,7 @@ import kcore.waitables.{
     WaitAnswer,
     WaitableKind,
     WaiterSlot,
+    WaiterState,
     accumulate,
     call_room_waiter,
     clear_pending_call,
@@ -425,31 +427,37 @@ public(package) func unref_object(kind: ObjType, slot: Int) unsafe {
 
 /// The teardown's decrement: it counts and does not free.
 ///
-/// A teardown frees what a process owned, by ownership, in per-slab sweeps that
-/// also count what they freed for the teardown report. If the close-all above
+/// A teardown frees in per-slab sweeps that also count what they freed for the
+/// teardown report, by ownership or by a count the close-all has already
+/// lowered. If the close-all above
 /// those sweeps freed by reference, those counts would collapse. So the
 /// close-all keeps the ledger honest (a handle in a dying table is one
 /// reference fewer, and objects other processes own must see that) and the
 /// sweeps, plus `reap_unreferenced`, do the freeing.
 ///
-/// For the dying process's own objects the two agree by construction: the sweep
-/// zeroes the slot, count included, so nothing is left half-counted.
+/// For the objects a sweep frees by owner (the dying process's Interrupts and
+/// Mappings) the two agree by construction: the sweep zeroes the slot, count
+/// included, so nothing is left half-counted.
 ///
 /// A Process whose count reaches zero here is not freed either. A `Gone` record
 /// whose last reference this was (a handle in the close-all, or an attachment
 /// in the attachment sweep) is reclaimed by the process scan at the end of
 /// `reap_unreferenced`. A Thread whose count reaches zero here is freed by
 /// `end_process`'s thread sweep, whichever process it belongs to, once it has
-/// exited or been invalidated.
+/// exited or been invalidated. A Waiter, Interrupt or Timer whose count reaches
+/// zero here is freed by that kind's sweep, whichever process it belongs to.
 public(package) func unref_teardown(kind: ObjType, slot: Int) unsafe {
     let _ = drop_reference(kind, slot)
 }
 
 /// Wake every thread parked on Waiter `w` with `Revoked`.
 ///
-/// This is the second of the Waiter's two last rites: the cascade releases what
-/// the Waiter was watching, and this answers everybody who was watching through
-/// it.
+/// This is one of the Waiter's two last rites, and it runs first: it answers
+/// everybody who was watching through the Waiter, and then the cascade releases
+/// what the Waiter was watching. A thread still parked during the cascade could
+/// be handed a delivery mid-walk (see `free_object`'s Waiter arm). Its owner's
+/// death runs it too, before the teardown takes the Waiter's list apart
+/// (`end_process`).
 ///
 /// No record is written, which is the difference from a delivery. A delivery
 /// copies a wait record out and then answers `Ok`; a revocation answers
@@ -465,7 +473,7 @@ public(package) func unref_teardown(kind: ObjType, slot: Int) unsafe {
 /// one Waiter and a readiness feeds only one of them, but here the thing they
 /// all wait on has ceased to exist, so every one is answered. It is
 /// process-blind, like every wake.
-func revoke_blocked(w: Int) unsafe {
+public(package) func revoke_blocked(w: Int) unsafe {
     var cur = WAITERS[w].blocked
     WAITERS[w].blocked = 0
     while cur != 0 {
@@ -492,16 +500,18 @@ func revoke_blocked(w: Int) unsafe {
 ///     makes the line bindable again.
 ///   - A Timer reprograms the comparator, so the kernel does not keep waking
 ///     itself for a dropped deadline.
-///   - A Waiter detaches its attachment list (the one cascade in the system)
-///     and wakes what is parked on it. The detach releases what it was
-///     watching; the revocation answers everybody who was watching through it.
+///   - A Waiter wakes what is parked on it and then detaches its attachment
+///     list (the one cascade in the system). The revocation answers everybody
+///     who was watching through it; the detach releases what it was watching.
 ///
 /// One kind deliberately does less: see the `Mapping` arm.
 ///
 /// The quota is credited against the slot's own `process` field (creator pays):
 /// whoever was charged gets it back, whichever process dropped the last handle.
-/// A shared kind credits through `credit_shared`, which credits nobody when the
-/// charged process's death has disowned the object.
+/// A shared kind, and a Waiter or Timer, credits through `credit_shared`, which
+/// credits nobody when the charged process's death has disowned the object: a
+/// shared one outlives its owner live, and a Waiter or Timer outlives it
+/// invalid, its charge already refunded.
 /// `Mapping`, `Process` and `Thread` have no credit here, each for the reason
 /// given in its arm.
 public(package) func free_object(kind: ObjType, slot: Int) unsafe {
@@ -521,6 +531,29 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
             credit_shared(owner, QuotaKind.Event)
         },
         case Waiter -> {
+            // Every thread parked on the Waiter is woken with `Revoked` first:
+            // what they waited on has ceased to exist, so they are told, in the
+            // status of the syscall that parked them, rather than left blocked.
+            // `revoke_blocked` documents why this is a revocation and not a
+            // delivery. Don't count a parked thread as a reference to keep the
+            // Waiter alive: that makes the drop silent and turns a handleable
+            // error into a hang.
+            //
+            // The count is the gate, not the release: a release with a minted
+            // sibling still live never reaches this function, so it wakes
+            // nobody. Only the last name going is the object ceasing to exist.
+            //
+            // The wake must come before the cascade. A release in the cascade
+            // can raise the level of a waitable another row of this list still
+            // watches (a claim dropping to zero tells its obligation), and that
+            // notification reaches `wake_one_waiter` for this Waiter. With a
+            // thread still parked, the delivery would run mid-walk, and a
+            // one-shot row's `detach_attachment` would walk a list whose head
+            // the cascade has already freed, miss its row and drop its
+            // reference, which the cascade would then drop a second time. With
+            // the list empty, the wake finds nobody and nothing is delivered.
+            revoke_blocked(slot)
+
             // The one cascade. A Waiter's attachments are references it holds,
             // so its death releases them, and each release may take a waitable
             // to zero, which frees and credits through this function. The list
@@ -541,31 +574,16 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
                 cur = next
             }
 
-            // Every thread parked on the Waiter is woken with `Revoked`: what
-            // they waited on has ceased to exist, so they are told, in the
-            // status of the syscall that parked them, rather than left blocked.
-            // `revoke_blocked` documents why this is a revocation and not a
-            // delivery. Don't count a parked thread as a reference to keep the
-            // Waiter alive: that makes the drop silent and turns a handleable
-            // error into a hang.
-            //
-            // The count is the gate, not the release: a release with a minted
-            // sibling still live never reaches this function, so it wakes
-            // nobody. Only the last name going is the object ceasing to exist.
-            //
-            // This runs after the cascade and before the slot clears. The order
-            // is not load-bearing (the cascade reads no thread and the wake
-            // reads no attachment); it reads as release what the Waiter held,
-            // answer who held it, hand the slot back.
-            revoke_blocked(slot)
-
+            // An invalid Waiter's lists are already empty and its charge came
+            // back at the invalidation; its `process` is `NO_PROCESS`, so the
+            // credit below goes to nobody.
             let owner = WAITERS[slot].process
             // A reused slot starts with an empty blocked list, so the next
             // Waiter in this slot cannot inherit any thread. The wake above is
             // what makes the list honestly empty.
-            WAITERS[slot] = WaiterSlot(state: SlotState.Free, process: 0,
+            WAITERS[slot] = WaiterSlot(state: WaiterState.Free, process: 0,
                                        attached: 0, blocked: 0, refs: 0)
-            quota_credit(owner, QuotaKind.Waiter)
+            credit_shared(owner, QuotaKind.Waiter)
         },
         case Interrupt -> {
             if INTERRUPTS[slot].attachment != 0 {
@@ -584,13 +602,15 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
                 fatal_kernel("a timer reached zero references while attached",
                              slot as UInt)
             }
+            // An invalid Timer's charge came back at the invalidation, and its
+            // `process` is `NO_PROCESS`, so the credit below goes to nobody.
             let owner = TIMERS[slot].process
-            TIMERS[slot] = TimerSlot(state: SlotState.Free, process: 0, clock: 0,
+            TIMERS[slot] = TimerSlot(state: TimerState.Free, process: 0, clock: 0,
                                      armed: false, deadline_ns: 0,
                                      interval_ns: 0, fires: 0, attachment: 0,
                                      refs: 0)
             reprogram_timer()
-            quota_credit(owner, QuotaKind.Timer)
+            credit_shared(owner, QuotaKind.Timer)
         },
         case Memory -> {
             // The range goes back to the pool with the slot, but only at the
@@ -736,14 +756,17 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
 // attachment alone, and a refund owed to it must not reach the record's next
 // occupant.
 //
-// The Waiter, Interrupt and Timer sweeps in `end_process` remain because they
-// feed the teardown report. The Thread sweep is not a force-free: it
-// invalidates the dying process's threads that have not exited, frees what
-// nothing else names and disowns the rest, and frees any other process's
-// `Exited` or `Invalid` thread whose last name the close-all dropped. Mapping's
-// sweep is not a force-free either: `mapping_rights()` withholds `Transfer`,
-// so a Mapping handle cannot outlive its owner's process, and its second arm
-// (clearing the row of a mapping whose target died) is not a free.
+// The Interrupt sweep in `end_process` frees the dying process's Interrupts by
+// owner. The Thread, Waiter and Timer sweeps are not force-frees: each
+// invalidates the dying process's objects of its kind (a thread only if it has
+// not exited), frees what nothing else names and disowns the rest. Each also
+// frees another process's object of its kind that nothing names any more (for
+// a thread, one that has exited or been invalidated), and the Interrupt sweep
+// does the same. They live there rather than here because each feeds the
+// teardown report. Mapping's sweep is not a force-free either:
+// `mapping_rights()` withholds `Transfer`, so a Mapping handle cannot outlive
+// its owner's process, and its second arm (clearing the row of a mapping whose
+// target died) is not a free.
 
 /// Reap every Event, Memory, IoMemory, exchange and Pipe connection that
 /// nothing names, and disown every one still charged to dying process `p`. It

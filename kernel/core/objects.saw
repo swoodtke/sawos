@@ -344,12 +344,13 @@ extension PipeRequestObject {
     }
 }
 
-/// Whether a slot of a stateless kind (an Event or a Waiter, say) is in use.
+/// Whether a slot of a stateless kind (an Event or a Memory, say) is in use.
 ///
 /// One enum for all of them because it is one question. Threads and processes
 /// have state machines (a join arriving after the exit still has to find the
-/// code), while an Event and a Waiter are either there or not: an Event's whole
-/// state is its accumulated word, and a Waiter's is its two lists.
+/// code), and a Waiter or Timer can be invalid (`WaiterState`, `TimerState`),
+/// while an Event is either there or not: its whole state is its accumulated
+/// word.
 public(package) enum SlotState: UInt8 {
     case Free = 0,
     case Live = 1,
@@ -646,15 +647,17 @@ public(package) func quota_credit(p: Int, kind: QuotaKind) unsafe {
     }
 }
 
-/// Give one of shared `kind` back to `owner`, the `process` field of the
-/// object being freed, if the object still has an owner.
+/// Give one of `kind` back to `owner`, the `process` field of the object being
+/// freed, if the object still has an owner.
 ///
 /// A shared kind (a connection, a Memory, an IoMemory, an Event) can outlive
-/// the process charged for it. That process's teardown disowns it, writing
-/// `NO_PROCESS` into its `process` field (spec §2.10's refund rule), and the
-/// charge goes with the dead process's ledger. A disowned object's free credits
-/// nobody, so a refund can never reach a later occupant of the dead process's
-/// record.
+/// the process charged for it, and so can a bound kind's object that its
+/// owner's death left `Exited` (a Thread) or invalid (a Thread, Waiter or
+/// Timer). That process's teardown disowns it, writing `NO_PROCESS` into its
+/// `process` field (spec §2.10's refund rule), and the charge goes with the
+/// dead process's ledger or came back at the invalidation. A disowned object's
+/// free credits nobody, so a refund can never reach a later occupant of the
+/// dead process's record.
 public(package) func credit_shared(owner: Int, kind: QuotaKind) unsafe {
     if owner == NO_PROCESS {
         return
@@ -1461,10 +1464,10 @@ public(package) func compact_mapping_rows(target: Int, removed: Int) unsafe {
 /// `ObjType` is renumberable bookkeeping and `BootHandleKind` crosses the trap
 /// boundary, so neither is a cast of the other; this function is the
 /// translation, and it is deliberately partial. The kinds it cannot spell are
-/// the kinds that are never given: a Waiter, Interrupt, Clock or Timer handle
-/// never reaches here, because the `Transfer` check refuses it first.
-/// The partial arm means that when a kind becomes givable, the compiler asks
-/// for its record spelling instead of letting it arrive mis-tagged.
+/// the kinds that are never given: an Interrupt or Clock handle never reaches
+/// here, because the `Transfer` check refuses it first. The partial arm means
+/// that when a kind becomes givable, the compiler asks for its record spelling
+/// instead of letting it arrive mis-tagged.
 ///
 /// It lives here, below `kcore.refs`, because both the give path and `refs`
 /// (which translates a message's handle slots at every rendezvous) need it, and
@@ -1500,6 +1503,11 @@ public(package) func boot_kind_of(kind: ObjType) -> BootHandleKind? {
         // handle to whoever joins it. A Thread is bound to its process, so a
         // handle that outlives the process reads `Exited` or `Revoked`.
         case Thread -> BootHandleKind.Thread,
+        // `waiter_rights()` and `timer_rights()` mint `Transfer`. Both kinds
+        // are bound to their creator, so a handle that outlives it names an
+        // invalid object and its ops answer `Revoked`.
+        case Waiter -> BootHandleKind.Waiter,
+        case Timer -> BootHandleKind.Timer,
         case _ -> None,
     }
 }

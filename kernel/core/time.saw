@@ -10,7 +10,6 @@
 import hal
 import sosabi.{ClockType}
 import kcore.limits.{CLOCK_KINDS, MAX_SLAB_EXTENTS, MAX_TIMERS, NO_TIMER}
-import kcore.objects.{SlotState}
 import kcore.slab.{Slab}
 
 /// One Clock (spec §2.6): a granted time source, and a kernel-eternal one.
@@ -41,12 +40,28 @@ public(package) struct ClockSlot {
     public(package) kind: ClockType,
 }
 
+/// Where a Timer is in its life (spec §2.10).
+///
+/// A Timer is bound to the process that created it. `Invalid` is a Timer whose
+/// owner died while a handle or an attachment elsewhere still named it: it is
+/// disarmed and never fires again, an attachment on it reports a terminal
+/// level, every `Arm` or `Disarm` answers `Revoked`, and the slot is held only
+/// for its remaining references. Its own enum for the reason `WaiterState`
+/// gives.
+public(package) enum TimerState: UInt8 {
+    case Free = 0,
+    case Live = 1,
+    case Invalid = 2,
+}
+
 /// One Timer (spec §2.6): a deadline on a Clock.
 ///
 /// `fires` is the object, as an Event's word and an Interrupt's `pending` are:
-/// non-zero means ready, and that is the whole of what a Waiter looks at.
-/// Readiness is level-triggered: nothing records that a waiter has been told,
-/// so the count is there until a wait consumes it.
+/// for a live Timer, non-zero means ready, and that is the whole of what a
+/// Waiter looks at. An invalid Timer is ready whatever its count, which its
+/// invalidation zeroed (`waitable_ready`). Readiness is level-triggered:
+/// nothing records that a waiter has been told, so the count is there until a
+/// wait consumes it.
 ///
 /// `deadline_ns` is the next fire, not the last one, which makes the re-arm
 /// drift-free: `fire_timer` advances it by whole intervals from itself rather
@@ -63,7 +78,10 @@ public(package) struct ClockSlot {
 /// functions; the `unsafe` on the ops around them is the slab's, not the
 /// timer's.
 public(package) struct TimerSlot {
-    public(package) state: SlotState,
+    public(package) state: TimerState,
+    /// The process that created this Timer and is charged for it, or
+    /// `NO_PROCESS` once it is invalid. Test for that before using it as an
+    /// index.
     public(package) process: Int,
     /// The Clock slot this timer measures against, for its life.
     public(package) clock: Int,
@@ -84,10 +102,11 @@ public(package) struct TimerSlot {
     /// `public(package)` to the same reader: who is watching is one of the
     /// matrix's questions, and it both reads and clears this.
     public(package) attachment: Int,
-    /// Handle entries naming this timer, plus its attachment. Reaching zero
-    /// returns the slot and reprograms the comparator (the kernel takes the
-    /// deadline back, as the teardown does), so a dropped timer stops waking
-    /// the machine when it is dropped rather than at its owner's death.
+    /// Handle entries naming this timer, plus its attachment, plus the staged
+    /// messages that carry it. Reaching zero returns the slot and reprograms
+    /// the comparator (the kernel takes the deadline back, as the teardown
+    /// does), so a dropped timer stops waking the machine when it is dropped
+    /// rather than at its owner's death.
     public(package) refs: UInt16,
 }
 
@@ -110,7 +129,7 @@ public(package) func clock_slot(kind: ClockType) -> Int {
 // and the slot is the ordinal), so there is no shortage for a donation to
 // relieve.
 public(package) unsafe static var TIMERS: Slab<TimerSlot, MAX_TIMERS> = Slab<TimerSlot, MAX_TIMERS>(
-    inline: [TimerSlot(state: SlotState.Free, process: 0, clock: 0, armed: false,
+    inline: [TimerSlot(state: TimerState.Free, process: 0, clock: 0, armed: false,
                        deadline_ns: 0, interval_ns: 0, fires: 0,
                        attachment: 0, refs: 0); MAX_TIMERS],
     ext_base: [0; MAX_SLAB_EXTENTS],
@@ -130,6 +149,7 @@ public(package) func alloc_timer() unsafe -> Int {
         match TIMERS[i].state {
             case Free -> { return i },
             case Live -> {},
+            case Invalid -> {},
         }
         i = i + 1
     }
@@ -276,6 +296,8 @@ func earliest_timer_deadline(soonest: UInt64) unsafe -> UInt64 {
     while i < TIMERS.capacity() {
         match TIMERS[i].state {
             case Live -> { next = TIMERS[i].sooner_of(next) },
+            // Disarmed by its invalidation, so it owes no deadline.
+            case Invalid -> {},
             case Free -> {},
         }
         i = i + 1
@@ -364,7 +386,8 @@ public func start_tick(period_us: UInt) unsafe {
 ///   - `on_timer_interrupt`, after servicing whatever came due;
 ///   - `timer_arm` and `timer_disarm`, when a process changes what it owes;
 ///   - `free_object`'s Timer arm, when the last reference to a Timer goes;
-///   - `end_process`, whose teardown frees a dying process's Timers.
+///   - `end_process`, whose teardown frees or invalidates a dying process's
+///     Timers.
 ///
 /// A funnel rather than a rule repeated per caller, because the question it
 /// answers (what is the earliest thing this kernel owes anybody) has to be

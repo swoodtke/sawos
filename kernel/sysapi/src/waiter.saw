@@ -81,6 +81,14 @@ public(package) func mode_flag(mode: AttachMode) -> UInt {
 /// while another still names the Waiter. When the last handle goes the Waiter
 /// is freed: every attachment is released, and every thread parked on it
 /// wakes with `SosStatus.Revoked`.
+///
+/// A Waiter is bound to the process that created it (§2.10). When that process
+/// dies, a Waiter still named elsewhere loses its attachments the same way,
+/// its parked threads wake with `SosStatus.Revoked`, and every later `add`,
+/// `remove`, `wait` and `mint` answers `Err(SosStatus.Revoked)`. It is built by
+/// `Process.waiter_create`, handed back by a refused `Process.give(waiter:)`,
+/// and delivered by a message as `PipeHandle.Waiter` or a boot record through
+/// `BootHandle.take_waiter`.
 public struct Waiter {
     public(package) handle: WaiterHandle,
 }
@@ -185,10 +193,10 @@ extension Waiter {
     /// `add`, so the consuming semantic is visible at the call site and
     /// overload resolution never hinges on a sigil.
     ///
-    /// Same verb, different gate: give-to-process crosses a process boundary
-    /// and spends the `Transfer` right; give-to-waiter crosses none (the
-    /// attachment lives in this process's own Waiter), so it spends the `Wait`
-    /// right alone, as `add` does.
+    /// Same verb, different gate: give-to-process hands a handle to another
+    /// process and spends the `Transfer` right; give-to-waiter hands the object
+    /// to an attachment, and no handle onto it is ever minted out of one, so it
+    /// spends the `Wait` right alone, as `add` does.
     ///
     /// The refusal hands the object back. A full attachment table is a resource
     /// condition, not a bug, so the caller keeps what it had; as with

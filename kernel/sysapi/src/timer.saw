@@ -32,13 +32,21 @@ import sos.floor.{checked, sos_handle_release, sos_timer_arm, sos_timer_disarm,
 /// re-arm is drift-free: each deadline is measured from the previous deadline,
 /// not from when the kernel got round to it.
 ///
-/// Built by `Clock.timer_create`, and handed back by a refused
-/// `Waiter.give(timer:)`: no word constructor, no word extractor.
+/// Built by `Clock.timer_create`, handed back by a refused
+/// `Waiter.give(timer:)` or `Process.give(timer:)`, and delivered by a message
+/// as `PipeHandle.Timer` or a boot record through `BootHandle.take_timer`: no
+/// word constructor, no word extractor.
 ///
 /// `NoCopy`, and dropping it releases the handle. Release does not disarm: an
 /// armed timer keeps its deadline while another handle or a Waiter attachment
 /// still holds it. At its last reference the timer is freed, the comparator
 /// is reprogrammed without it, and the quota row is credited.
+///
+/// A Timer is bound to the process that created it (§2.10). When that process
+/// dies, a Timer still named elsewhere is disarmed for good: an attachment on
+/// it reports one last record with a fire count of zero, and keeps reporting
+/// it until it is removed, and `arm`, `disarm` and `mint` answer
+/// `Err(SosStatus.Revoked)`.
 public struct Timer {
     public(package) handle: TimerHandle,
 }

@@ -1,0 +1,349 @@
+// Test child: Waiters and Timers across a process boundary, in five roles
+// chosen by the boot set (spec §3, §2.1, §2.10).
+//
+// The peer is given a Waiter under `TAG_WAITER`, a Timer under `TAG_TIMER` and
+// an outbox under `TAG_OUTBOX`, all its launcher's. It attaches the Timer to
+// the Waiter, arms it and waits for the fire, which proves a Waiter and a Timer
+// given at boot are usable. It then makes a Waiter and a Timer of its own and
+// sends both to the launcher in one message whose byte is the fire count, and
+// waits on the message's claim until the launcher has used them and dropped
+// the request. It ends holding the launcher's Waiter and Timer, the last names
+// of both.
+//
+// The owner is given only an outbox. It makes a Waiter and a Timer, keeps a
+// sibling of the Timer, and sends both originals to the launcher in one
+// message. Once the launcher has taken the message and dropped the request, it
+// arms the Timer through its sibling, periodic and soon, and ends: the
+// launcher watches what its death does to the objects it left behind.
+//
+// The firing owner is given its outbox under `TAG_OUTBOX_FIRING` instead. It
+// makes and sends a Timer the same way, but once the request is dropped it
+// arms the Timer through its sibling every `FIRING_PERIOD_NS` and sleeps for
+// several periods before it ends, so the Timer has counted fires nobody has
+// been told about when its owner dies.
+//
+// The parker is given a launcher's Waiter under `TAG_PARK` and nothing else.
+// Its main thread parks on that Waiter, and a second thread ends the process
+// while the main thread is still parked there.
+//
+// The probe is given an inbox under `TAG_PROBE_TIMERS` or `TAG_PROBE_WAITERS`
+// and an outbox. It makes one object of that kind, tells its launcher, waits
+// for the go message, then makes objects of that kind until refused and exits
+// with the total, which is its allowance if nothing credited its ledger in
+// between. It runs in a record an earlier process died in. The Waiter it
+// waits on is its first Waiter.
+//
+// Every thread of this image enters at `_start` (the `tests/thread-basics`
+// idiom): the main thread is the one that has not yet parked the boot handle.
+
+import sos.{System, Process, Waiter, Timer, Clock, ClockType, PipeInlet,
+            PipeOutlet, PipeHandles, SosStatus, PIPE_BODY_BYTES}
+
+/// The launcher's tags.
+static TAG_OUTBOX: UInt = 33
+static TAG_OUTBOX_FIRING: UInt = 34
+static TAG_WAITER: UInt = 50
+static TAG_TIMER: UInt = 51
+static TAG_PROBE_TIMERS: UInt = 52
+static TAG_PROBE_WAITERS: UInt = 53
+static TAG_PARK: UInt = 54
+
+/// The keys this program attaches under.
+static KEY_GIVEN: UInt = 71
+static KEY_GO: UInt = 72
+static KEY_SLEEP: UInt = 73
+
+/// How soon the given Timer fires, the owner's Timer's period, and the firing
+/// owner's period and how long it sleeps after arming.
+static GIVEN_DELAY_NS: UInt64 = 1_000_000
+static OWNER_PERIOD_NS: UInt64 = 5_000_000
+static FIRING_PERIOD_NS: UInt64 = 1_000_000
+static FIRING_SLEEP_NS: UInt64 = 10_000_000
+
+/// The byte the owner's and the probe's messages carry.
+static BYTE_MARK: UInt8 = 78
+
+/// The peer used what it was given and sent its own.
+static EXIT_SERVED: UInt = 51
+/// The owner's objects were taken.
+static EXIT_OWNED: UInt = 52
+/// The parker's second thread ended it.
+static EXIT_PARKED: UInt = 53
+/// The boot set names no role, or something on the way failed; the line
+/// before it says what.
+static EXIT_MISMATCH: UInt = 98
+
+/// The boot handle, parked by the main thread for the parker's second thread.
+/// Handle 0 names nothing, so a parked handle is never 0.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+/// The parker's second thread's stack.
+static STACK_WORDS: Int = 512
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func park_boot_handle(word: UInt) unsafe { BOOT_HANDLE = word }
+
+func parked_boot_handle() unsafe -> UInt { BOOT_HANDLE }
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        main_thread(arg)
+    } else {
+        ender()
+    }
+}
+
+/// The parker's second thread: it runs once the main thread has parked, and
+/// ends the process.
+func ender() {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let _ = proc.exit(EXIT_PARKED)
+}
+
+func main_thread(boot_handle: UInt) {
+    park_boot_handle(boot_handle)
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS childwaitable: no process handle: {}\n", error)
+        return
+    }
+    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
+        print("SOS childwaitable: no clock: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+
+    var given_waiter: Waiter? = None
+    var given_timer: Timer? = None
+    var parking: Waiter? = None
+    var outbox: PipeInlet? = None
+    var inbox: PipeOutlet? = None
+    var spend_timers = false
+    var firing = false
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                let tag = rec.tag
+                if tag == TAG_WAITER {
+                    given_waiter = rec.take_waiter()
+                } else if tag == TAG_TIMER {
+                    given_timer = rec.take_timer()
+                } else if tag == TAG_PARK {
+                    parking = rec.take_waiter()
+                } else if tag == TAG_OUTBOX {
+                    outbox = rec.take_inlet()
+                } else if tag == TAG_OUTBOX_FIRING {
+                    outbox = rec.take_inlet()
+                    firing = true
+                } else if tag == TAG_PROBE_TIMERS {
+                    inbox = rec.take_outlet()
+                    spend_timers = true
+                } else if tag == TAG_PROBE_WAITERS {
+                    inbox = rec.take_outlet()
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+
+    if let w = parking.take() {
+        let code = try park_elsewhere(&proc, &w) catch {
+            print("SOS childwaitable: parker refused: {}\n", error)
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        }
+        let _ = proc.exit(code)
+        return
+    }
+
+    guard let out = outbox.take() else {
+        let _ = system.debug_print("SOS childwaitable: no outbox\n")
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+
+    if let w = given_waiter.take() {
+        guard let t = given_timer.take() else {
+            let _ = system.debug_print("SOS childwaitable: no Timer\n")
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        }
+        let code = try peer(&proc, &clock, move w, move t, &out) catch {
+            print("SOS childwaitable: peer refused: {}\n", error)
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        }
+        let _ = proc.exit(code)
+        return
+    }
+
+    if let inb = inbox.take() {
+        let total = try probe(&proc, &clock, &inb, &out, spend_timers) catch {
+            print("SOS childwaitable: probe refused: {}\n", error)
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        }
+        let _ = proc.exit(total)
+        return
+    }
+
+    let code = try own(&proc, &clock, &out, firing) catch {
+        print("SOS childwaitable: owner refused: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let _ = proc.exit(code)
+}
+
+/// The parker: start the thread that ends the process, then park on the
+/// launcher's Waiter. `start` does not switch, so this thread is parked before
+/// the other runs; the wait never returns, because the process ends under it.
+func park_elsewhere(proc: &Process, waiter: &Waiter) -> Result<UInt, SosStatus> {
+    let ending = try proc.thread_create(stack_top: stack_top(), arg: 0)
+    try ending.start()
+    let _ = waiter.wait()
+    return EXIT_MISMATCH
+}
+
+/// The peer: use the launcher's Waiter and Timer, then send a pair of its own.
+/// `exit` does not return, so the teardown finds `waiter` and `timer` still
+/// held.
+func peer(proc: &Process, clock: &Clock, waiter: Waiter, timer: Timer,
+          out: &PipeInlet) -> Result<UInt, SosStatus> {
+    try waiter.add(timer: &timer, key: KEY_GIVEN)
+    try timer.arm(after_ns: GIVEN_DELAY_NS)
+    let woke = try waiter.wait()
+    var fires: UInt = 0
+    match woke.what {
+        case Timer(n) -> { fires = n },
+        case _ -> { return EXIT_MISMATCH },
+    }
+
+    let mine_waiter = try proc.waiter_create()
+    let mine_timer = try clock.timer_create()
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = UInt8.from(truncating: fires)
+    var carrying = PipeHandles.none()
+    carrying.put(0, waiter: move mine_waiter)
+    carrying.put(1, timer: move mine_timer)
+    try hand_over(&out, &body, &var carrying)
+    let _ = proc.exit(EXIT_SERVED)
+    return EXIT_SERVED
+}
+
+/// The owner: send a Waiter and a Timer, then arm the Timer through a kept
+/// sibling and end. The firing owner sleeps between the two, with the Timer
+/// firing all the while.
+func own(proc: &Process, clock: &Clock, out: &PipeInlet,
+         firing: Bool) -> Result<UInt, SosStatus> {
+    let waiter = try proc.waiter_create()
+    let timer = try clock.timer_create()
+    let kept = try timer.mint()
+
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = BYTE_MARK
+    var carrying = PipeHandles.none()
+    carrying.put(0, waiter: move waiter)
+    carrying.put(1, timer: move timer)
+    try hand_over(&out, &body, &var carrying)
+
+    if firing {
+        try kept.arm(after_ns: FIRING_PERIOD_NS, interval_ns: FIRING_PERIOD_NS)
+        try doze(&proc, &clock, FIRING_SLEEP_NS)
+        let _ = proc.exit(EXIT_OWNED)
+        return EXIT_OWNED
+    }
+
+    // Armed only now, so that nothing fires before this process ends: the
+    // launcher is parked by the time this thread runs again, and a fire it saw
+    // would be one the schedule made rather than one the death made.
+    try kept.arm(after_ns: OWNER_PERIOD_NS, interval_ns: OWNER_PERIOD_NS)
+    let _ = proc.exit(EXIT_OWNED)
+    return EXIT_OWNED
+}
+
+/// Sleep `ns` on a Waiter and a Timer of this process's own.
+func doze(proc: &Process, clock: &Clock, ns: UInt64) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    let timer = try clock.timer_create()
+    try waiter.add(timer: &timer, key: KEY_SLEEP)
+    try timer.arm(after_ns: ns)
+    let _ = try waiter.wait()
+    return
+}
+
+/// Post `body` with `handles` and park on the claim until the launcher has
+/// taken the message and dropped its request, which answers `PeerClosed`.
+func hand_over(out: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
+               handles: &var PipeHandles) -> Result<Void, SosStatus> {
+    let claim = try out.post_with(body: &body, len: 1, handles: &var handles)
+    let _ = (move claim).resolve()
+    return
+}
+
+/// The probe: make one object of its kind, report, wait for the go message,
+/// then make more until refused. Answers the total made, which `exit` reports;
+/// the first is held to the exit so a credit would have a row to lower.
+func probe(proc: &Process, clock: &Clock, inbox: &PipeOutlet, out: &PipeInlet,
+           timers: Bool) -> Result<UInt, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(outlet: &inbox, key: KEY_GO)
+    if timers {
+        let first = try clock.timer_create()
+        try ready_then_go(&waiter, &inbox, &out)
+        let total = 1 + spend_timer(&clock)
+        let _ = proc.exit(total)
+        let _ = move first
+        return total
+    }
+    try ready_then_go(&waiter, &inbox, &out)
+    let total = 1 + spend_waiter(&proc)
+    let _ = proc.exit(total)
+    return total
+}
+
+/// Tell the launcher this process holds its first object, and wait for the go
+/// message.
+func ready_then_go(waiter: &Waiter, inbox: &PipeOutlet,
+                   out: &PipeInlet) -> Result<Void, SosStatus> {
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = BYTE_MARK
+    let staged = try out.post(body: &body, len: 1)
+    let _ = move staged
+    let _ = try waiter.wait()
+    let got = try inbox.take()
+    let (msg, request) = move got
+    let _ = move msg
+    let _ = move request
+    return
+}
+
+/// Make Timers until one is refused, each held in its own frame while the next
+/// is asked for, and answer how many.
+func spend_timer(clock: &Clock) -> UInt {
+    let t = try clock.timer_create() catch { return 0 }
+    let n = spend_timer(&clock)
+    let _ = move t
+    return n + 1
+}
+
+/// Make Waiters until one is refused, on `spend_timer`'s terms.
+func spend_waiter(proc: &Process) -> UInt {
+    let w = try proc.waiter_create() catch { return 0 }
+    let n = spend_waiter(&proc)
+    let _ = move w
+    return n + 1
+}

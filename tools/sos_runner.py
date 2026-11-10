@@ -488,6 +488,20 @@ THREAD_HANG_PKG = os.path.join(TESTS_DIR, "thread-hang")
 TEARDOWN_MINT_PKG = os.path.join(TESTS_DIR, "teardown-mint")
 CHILD_TEARDOWN_MINT_PKG = os.path.join(TESTS_DIR, "child-teardown-mint")
 
+# Waiters and Timers are givable and bound to their creator: given, carried in
+# a message, handed back by a refused give, invalidated by their owner's death,
+# and freed when nothing names them. `child-waitable` plays the far process.
+WAITABLE_GIVE_PKG = os.path.join(TESTS_DIR, "waitable-give")
+GIVE_WAITABLE_RETURNS_PKG = os.path.join(TESTS_DIR, "give-waitable-returns")
+TIMER_OUTLIVE_PKG = os.path.join(TESTS_DIR, "timer-outlive")
+WAITER_OUTLIVE_PKG = os.path.join(TESTS_DIR, "waiter-outlive")
+TEARDOWN_DETACH_PKG = os.path.join(TESTS_DIR, "teardown-detach")
+FREE_CASCADE_PKG = os.path.join(TESTS_DIR, "free-cascade")
+WAITER_PARKED_PKG = os.path.join(TESTS_DIR, "waiter-parked")
+TIMER_DISARM_PKG = os.path.join(TESTS_DIR, "timer-disarm")
+PIPE_REPLY_WAIT_WAITER_PKG = os.path.join(TESTS_DIR, "pipe-reply-wait-waiter")
+CHILD_WAITABLE_PKG = os.path.join(TESTS_DIR, "child-waitable")
+
 # Driver-as-service.
 #
 # `uartproto` is a library package rather than an image: the protocol is one
@@ -934,6 +948,12 @@ def expectations(arch):
         "hung_mark": f"0x{0x31:0{width}x}",
         # `child-teardown-mint`'s exit code, asserted in `teardown_mint`.
         "ended_mark": f"0x{0x32:0{width}x}",
+        # `child-waitable`'s exit codes: the peer's in `waitable_give`, the
+        # owners' in `timer_outlive`, `waiter_outlive`, `teardown_detach` and
+        # `timer_disarm`, and the parker's in `waiter_parked`.
+        "served_mark": f"0x{0x33:0{width}x}",
+        "owned_mark": f"0x{0x34:0{width}x}",
+        "parked_mark": f"0x{0x35:0{width}x}",
     }
 
 
@@ -3881,6 +3901,23 @@ TEST_CASES = [
         "expect_status": EXIT_PROCESS_FAULT,
     },
     {
+        # Nor can a fused reply carry the Waiter its wait leg parks on: were
+        # it that Waiter's last handle, the reply could free the Waiter under
+        # the thread about to park on it. The fault comes before the exchange
+        # and the wait leg, so nothing parks.
+        "name": "reply_wait_carries_waiter",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_REPLY_WAIT_WAITER_PKG,
+        "expect_out": ["{banner}",
+                       "SOS replywaitwaiter: reply_wait carrying its own "
+                       "Waiter",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
         # A connection's outlet cannot travel through its own inlet (spec.md
         # §3). A staged reference on the outlet would keep the connection from
         # ever freeing once the sender dropped its inlet and claim, so the
@@ -4873,6 +4910,247 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS threadslots: first=7 again=7",
                        "SOS threadslots: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A Waiter and a Timer are givable (spec 3) and a message may carry
+        # them (spec 2.1). Root gives a child its pair at boot, keeping no
+        # handle: the child attaches the Timer to the Waiter and reports the
+        # fire count (`fired 1`). The child sends back a pair of its own, which
+        # root uses the same way while the child lives.
+        #
+        # `before` and `after` are the free slab slots, counted by making
+        # objects until refused. They agree only if every object of the case
+        # was freed: root's pair by the child's teardown, whose close-all drops
+        # their last names and whose Waiter and Timer sweeps then free another
+        # process's objects, and the child's pair by root's releases while the
+        # child lives. The child's teardown line counts none of the four
+        # (`waiters=0 timers=0`): two are root's, and two were already gone.
+        # Nothing here is invalidated; `timer_outlive` and `waiter_outlive`
+        # cover that.
+        "name": "waitable_give",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": WAITABLE_GIVE_PKG,
+        "children": [CHILD_WAITABLE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS waitablegive: capacity before waiters=4 timers=8",
+                       "SOS waitablegive: started",
+                       "SOS waitablegive: the child's given Timer fired 1",
+                       "SOS waitablegive: the sent pair fired 1",
+                       "SOS: process exit: code={served_mark} process={one}",
+                       "SOS: process teardown handles={six} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS waitablegive: the child is gone",
+                       "SOS waitablegive: capacity after waiters=4 timers=8",
+                       "SOS waitablegive: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A give refused for capacity hands a Waiter and a Timer back usable,
+        # as `give_event_returns` does an Event: `gave 12` is the child's
+        # handle budget, and the returned Timer attached to the returned Waiter
+        # fires once. Root's teardown frees both, since nothing else names
+        # either.
+        "name": "give_waitable_returns",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": GIVE_WAITABLE_RETURNS_PKG,
+        "children": [CHILD_BYE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS waitablereturns: gave 12 siblings then refused: "
+                       "this process is at its quota",
+                       "SOS waitablereturns: the Waiter give was refused: "
+                       "this process is at its quota",
+                       "SOS waitablereturns: the Timer give was refused: "
+                       "this process is at its quota",
+                       "SOS waitablereturns: the returned pair fired: key=60 "
+                       "fires=1",
+                       "SOS: process teardown handles={ten} threads={one} "
+                       "events={zero} waiters={one} interrupts={zero} "
+                       "timers={one} process={zero}"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A Timer outlives its owner invalid (spec 2.10). The owner sends root
+        # a Timer, keeps a sibling, arms it every 5 ms and dies; root has
+        # attached the Timer to its own Waiter and parked. The death fires the
+        # attachment with the Timer's ordinary record, zero fires because the
+        # invalidation disarmed it, and the level is terminal: waiting again
+        # reads the same. `Arm` and `Disarm` answer `Revoked`, and after root
+        # sleeps 25 ms, past several of the periods the owner armed, the record
+        # still reads zero. The owner's teardown line counts no Timer.
+        #
+        # `held=7` is the Timer slab less the invalid Timer root holds. The
+        # probe lands in the owner's reclaimed record (`process={one}` again)
+        # and holds one Timer when root releases the invalid one: a free that
+        # credited the record would let the probe make one more than its
+        # allowance, `spent 4`. `after=8` is the whole slab.
+        "name": "timer_outlive",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": TIMER_OUTLIVE_PKG,
+        "children": [CHILD_WAITABLE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS timeroutlive: capacity before=8",
+                       "SOS timeroutlive: started",
+                       "SOS: process exit: code={owned_mark} process={one}",
+                       "SOS: process teardown handles={five} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS timeroutlive: the parked wait was answered: key=84 "
+                       "fires=0",
+                       "SOS timeroutlive: waiting again reads key=84 fires=0",
+                       "SOS timeroutlive: arming it answered: what this call "
+                       "was waiting for is gone",
+                       "SOS timeroutlive: disarming it answered: what this "
+                       "call was waiting for is gone",
+                       "SOS timeroutlive: minting it answered: what this "
+                       "call was waiting for is gone",
+                       "SOS timeroutlive: past its deadlines it reads key=84 "
+                       "fires=0",
+                       "SOS timeroutlive: the attachment was removed by key",
+                       "SOS timeroutlive: capacity held=7",
+                       "SOS: process exit: code={four} process={one}",
+                       "SOS timeroutlive: probe spent 4",
+                       "SOS timeroutlive: capacity after=8",
+                       "SOS timeroutlive: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A Waiter outlives its owner invalid (spec 2.10, 2.2). The owner sends
+        # root a Waiter and dies; root has attached an Event to it and parked
+        # on it. The death wakes the parked wait with `Revoked`, and a later
+        # `Wait`, `Add` and `Remove` answer `Revoked` too. The Event is no
+        # longer attached, so it attaches to a Waiter of root's own and
+        # delivers there (`3`). The owner's teardown line counts no Waiter;
+        # its `timers={one}` is the owner's Timer, whose last name was its own
+        # sibling.
+        #
+        # `held=3` is the Waiter slab less the invalid Waiter root holds. The
+        # probe holds its first Waiter when root releases the invalid one:
+        # `spent 2` is its allowance, and a credit to the record would make it
+        # 3. `after=4` is the whole slab.
+        "name": "waiter_outlive",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": WAITER_OUTLIVE_PKG,
+        "children": [CHILD_WAITABLE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS waiteroutlive: capacity before=4",
+                       "SOS waiteroutlive: started",
+                       "SOS: process exit: code={owned_mark} process={one}",
+                       "SOS: process teardown handles={five} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={one} process={one}",
+                       "SOS waiteroutlive: the parked wait answered: what this "
+                       "call was waiting for is gone",
+                       "SOS waiteroutlive: a later wait answered: what this "
+                       "call was waiting for is gone",
+                       "SOS waiteroutlive: a later add answered: what this "
+                       "call was waiting for is gone",
+                       "SOS waiteroutlive: a later remove answered: what this "
+                       "call was waiting for is gone",
+                       "SOS waiteroutlive: a later mint answered: what this "
+                       "call was waiting for is gone",
+                       "SOS waiteroutlive: the Event moved to another Waiter: 3",
+                       "SOS waiteroutlive: capacity held=3",
+                       "SOS: process exit: code={two} process={one}",
+                       "SOS waiteroutlive: probe spent 2",
+                       "SOS waiteroutlive: capacity after=4",
+                       "SOS waiteroutlive: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A dying process's Waiter is taken apart with nobody parked on it
+        # (spec 2.10). Root parks on the owner's Waiter, which holds root's
+        # claim (consuming, the lower attachment slot) and root's obligation
+        # (one-shot, root keeps its handle). Dropping the claim's row raises
+        # the obligation's level on the same Waiter. Root must already be
+        # answered `Revoked`; a delivery to it in the middle of the sweep would
+        # drop the obligation's reference twice, the exchange would settle
+        # under root's handle, and the reply would stop the machine. Instead
+        # the reply answers `PeerClosed`.
+        "name": "teardown_detach",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": TEARDOWN_DETACH_PKG,
+        "children": [CHILD_WAITABLE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS teardowndetach: started",
+                       "SOS: process exit: code={owned_mark} process={one}",
+                       "SOS: process teardown handles={five} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS teardowndetach: the parked wait answered: what "
+                       "this call was waiting for is gone",
+                       "SOS teardowndetach: the reply answered: the other end "
+                       "of this connection is gone",
+                       "SOS teardowndetach: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A Waiter freed under a parked thread answers the thread before its
+        # cascade releases what it watched (spec 2.2): `free_cascade` is
+        # `teardown_detach`'s route through a release, in one process. The
+        # claim's row is walked first and raises the obligation's level on the
+        # next row; the worker parked on the Waiter must not be handed it.
+        "name": "free_cascade",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": FREE_CASCADE_PKG,
+        "expect_out": ["{banner}",
+                       "SOS freecascade: parking",
+                       "SOS freecascade: the reply answered: the other end of "
+                       "this connection is gone",
+                       "SOS freecascade: the parked wait answered: what this "
+                       "call was waiting for is gone"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A process dies with a thread parked on another process's Waiter
+        # (spec 2.10): the parker's main thread parks on root's Waiter and its
+        # second thread ends the process. The teardown takes the parked thread
+        # off root's Waiter before it frees the thread's slot, so root's Event
+        # signal afterwards is delivered to root's own wait (`5`), not to a
+        # thread that no longer exists.
+        "name": "waiter_parked",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": WAITER_PARKED_PKG,
+        "children": [CHILD_WAITABLE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS waiterparked: started",
+                       "SOS: process exit: code={parked_mark} process={one}",
+                       "SOS: process teardown handles={six} threads={two} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS waiterparked: the child is gone",
+                       "SOS waiterparked: the Event delivered 5",
+                       "SOS waiterparked: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # An invalidated Timer is disarmed (spec 2.10). The firing owner arms
+        # its Timer every 1 ms and sleeps 10 ms before it dies, so the Timer
+        # has counted fires nobody consumed; root holds it attached but waits
+        # elsewhere. After the death the record reads zero fires (the disarm
+        # cleared the count), and again after root sleeps past more periods.
+        "name": "timer_disarm",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": TIMER_DISARM_PKG,
+        "children": [CHILD_WAITABLE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS timerdisarm: started",
+                       "SOS: process exit: code={owned_mark} process={one}",
+                       "SOS: process teardown handles={five} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS timerdisarm: the child is gone",
+                       "SOS timerdisarm: the invalid Timer reads fires=0",
+                       "SOS timerdisarm: later it still reads fires=0",
+                       "SOS timerdisarm: done"],
         "expect_clean_exit": True,
     },
     # =========================================================================

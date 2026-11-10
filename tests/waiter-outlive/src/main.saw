@@ -1,0 +1,351 @@
+// A Waiter outlives its owner invalid, and a refund never reaches the record
+// the owner left behind (spec §2.10, §2.2).
+//
+// Expected transcript, read as an order:
+//
+//   SOS waiteroutlive: capacity before=4
+//   SOS waiteroutlive: started
+//   SOS: process exit: code=52 process=1        <- the owner
+//   SOS: process teardown ... waiters=0 ... process=1
+//   SOS waiteroutlive: the parked wait answered: <Revoked>
+//   SOS waiteroutlive: a later wait answered: <Revoked>
+//   SOS waiteroutlive: a later add answered: <Revoked>
+//   SOS waiteroutlive: a later remove answered: <Revoked>
+//   SOS waiteroutlive: a later mint answered: <Revoked>
+//   SOS waiteroutlive: the Event moved to another Waiter: 3
+//   SOS waiteroutlive: capacity held=3
+//   SOS: process exit: code=2 process=1         <- the probe, same record
+//   SOS waiteroutlive: probe spent 2
+//   SOS waiteroutlive: capacity after=4
+//   SOS waiteroutlive: done
+//
+// The owner (`child-waitable`, owner role) sends root a Waiter and a Timer.
+// Root releases the Timer at once, attaches an Event of its own to the Waiter
+// and parks on the Waiter. The owner ends.
+//
+// Its death invalidates the Waiter, because root still names it, which wakes
+// root's parked wait with `Revoked`: the object it waited on was destroyed by
+// somebody else. Every later op through root's handle answers `Revoked` too.
+// The Event that was attached to it is attached to it no longer, so root
+// attaches it to a Waiter of its own, which would fault if the dead Waiter
+// still held it (an object is attached to at most one Waiter), and the Event
+// delivers there. The owner's teardown line counts no Waiter: the one it made
+// was invalidated, not freed.
+//
+// Capacity shows the slot is held. Root's Waiter quota is unlimited, so the
+// number it can make is the slab's free slots: one fewer while the invalid
+// Waiter is held, all of them once it is released.
+//
+// The probe shows the refund, on `timer-outlive`'s terms. The probe makes its
+// first Waiter and waits on it; root releases the invalid Waiter; the probe
+// makes Waiters until refused. The total is its allowance
+// (`DEFAULT_QUOTA_WAITERS`); a refund that reached it would be one more.
+//
+// One phase per function: root's stack grant is small.
+
+import sos.{System, Process, Memory, Waiter, Event, PipeInlet, PipeOutlet,
+            PipeMsg, SystemRight, SosStatus, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tags the child's boot records travel under.
+static TAG_BOOT: UInt = 7
+static TAG_OUTBOX: UInt = 33
+static TAG_PROBE_WAITERS: UInt = 53
+
+/// The keys root's attachments live under.
+static KEY_MSG: UInt = 81
+static KEY_PROBE: UInt = 82
+static KEY_READY: UInt = 83
+static KEY_EVENT: UInt = 84
+
+/// The bits root signals its Event with.
+static BITS: UInt = 0x3
+
+/// How many Waiters a child may hold at once (`DEFAULT_QUOTA_WAITERS`).
+static WAITER_ALLOWANCE: UInt = 2
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.ClockGet | SystemRight.Transfer)
+
+/// The owner's exit code, and the kind half of a §8 status word for a process
+/// that exited.
+static OWNER_DONE: UInt = 52
+static EXITED: UInt = 1 << 16
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS waiteroutlive: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS waiteroutlive: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS waiteroutlive: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    let before = count_waiters(&proc)
+    print("SOS waiteroutlive: capacity before={}\n", before)
+
+    let outbox = try proc.pipe_create()
+    let (outbox_in, outbox_out) = move outbox
+    let waiter = try outlive(&system, &proc, &image, &ram, move outbox_in,
+                             &outbox_out)
+
+    let held = count_waiters(&proc)
+    print("SOS waiteroutlive: capacity held={}\n", held)
+    if held != before - 1 {
+        return BUG
+    }
+
+    // The owner's record is free now. The probe lands in it.
+    let spent = try refund(&system, &proc, &image, &ram, move waiter)
+    print("SOS waiteroutlive: probe spent {}\n", spent)
+    if spent != WAITER_ALLOWANCE {
+        let _ = system.debug_print("SOS waiteroutlive: a refund reached the probe\n")
+        return BUG
+    }
+
+    let after = count_waiters(&proc)
+    print("SOS waiteroutlive: capacity after={}\n", after)
+    if after != before {
+        return BUG
+    }
+    return
+}
+
+/// Launch the owner, take its Waiter, and watch the owner's death invalidate
+/// it under a parked wait. Nothing of root's names the owner when this
+/// returns, so its record is reclaimed.
+func outlive(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+             outbox: PipeInlet, inbox: &PipeOutlet) -> Result<Waiter, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let mail = try proc.waiter_create()
+    try mail.add(outlet: &inbox, key: KEY_MSG)
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(inlet: move outbox, tag: TAG_OUTBOX) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    let _ = system.debug_print("SOS waiteroutlive: started\n")
+
+    let woke = try mail.wait()
+    if woke.key != KEY_MSG {
+        return BUG
+    }
+    let _ = move mail
+    let got = try inbox.take()
+    let (arrived, request) = move got
+    var msg = move arrived
+    let waiter = try msg_waiter(&var msg, 0)
+    // The owner's Timer is not this case's subject: the owner keeps a sibling
+    // of it, so its death frees it.
+    let _ = try msg_timer(&var msg, 1)
+
+    let event = try proc.event_create()
+    try waiter.add(event: &event, key: KEY_EVENT)
+
+    // The owner waits on its claim until this request goes, then ends itself.
+    // This thread parks in the wait below before the owner runs again, and
+    // nothing signals the Event.
+    let _ = move request
+    match waiter.wait() {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS waiteroutlive: the parked wait was delivered\n")
+            return BUG
+        },
+        case Err(why) -> {
+            print("SOS waiteroutlive: the parked wait answered: {}\n", why)
+            if why != SosStatus.Revoked {
+                return BUG
+            }
+        },
+    }
+    let status = try child.get_status()
+    if status != EXITED + OWNER_DONE {
+        print("SOS waiteroutlive: the owner ended {}\n", status)
+        return BUG
+    }
+    let _ = move child
+
+    match waiter.wait() {
+        case Ok(_) -> { return BUG },
+        case Err(why) -> {
+            print("SOS waiteroutlive: a later wait answered: {}\n", why)
+            if why != SosStatus.Revoked {
+                return BUG
+            }
+        },
+    }
+    try revoked(waiter.add(event: &event, key: KEY_EVENT), "a later add")
+    try revoked(waiter.remove(KEY_EVENT), "a later remove")
+    match waiter.mint() {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS waiteroutlive: a later mint succeeded\n")
+            return BUG
+        },
+        case Err(why) -> {
+            print("SOS waiteroutlive: a later mint answered: {}\n", why)
+            if why != SosStatus.Revoked {
+                return BUG
+            }
+        },
+    }
+
+    try move_event(&proc, &event)
+    return move waiter
+}
+
+/// Attach `event` to a Waiter of root's own, signal it and wait for it there.
+/// The Waiter lives only as long as this call.
+func move_event(proc: &Process, event: &Event) -> Result<Void, SosStatus> {
+    let mine = try proc.waiter_create()
+    try mine.add(event: &event, key: KEY_EVENT)
+    try event.signal(BITS)
+    let woke = try mine.wait()
+    match woke.what {
+        case Event(bits) -> {
+            print("SOS waiteroutlive: the Event moved to another Waiter: {}\n",
+                  bits)
+            if bits != BITS {
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
+
+/// `answer` must be `Err(Revoked)`; say what it was.
+func revoked(answer: Result<Void, SosStatus>,
+             which: String) -> Result<Void, SosStatus> {
+    match answer {
+        case Ok(_) -> {
+            print("SOS waiteroutlive: {} succeeded\n", which)
+            return BUG
+        },
+        case Err(why) -> {
+            print("SOS waiteroutlive: {} answered: {}\n", which, why)
+            if why != SosStatus.Revoked {
+                return BUG
+            }
+        },
+    }
+    return
+}
+
+/// Take the Waiter out of slot `at` of a delivered message.
+func msg_waiter(msg: &var PipeMsg, at: Int) -> Result<Waiter, SosStatus> {
+    guard let carried = msg.handles[at].take() else { return BUG }
+    match carried {
+        case Waiter(w) -> { return move w },
+        case _ -> { return BUG },
+    }
+}
+
+/// Take the Timer out of slot `at` of a delivered message and release it.
+func msg_timer(msg: &var PipeMsg, at: Int) -> Result<Void, SosStatus> {
+    guard let carried = msg.handles[at].take() else { return BUG }
+    match carried {
+        case Timer(tm) -> {
+            let _ = move tm
+            return
+        },
+        case _ -> { return BUG },
+    }
+}
+
+/// Create the probe, let it make its first Waiter, release the invalid Waiter
+/// and send the probe on. Answers how many Waiters the probe made in all.
+func refund(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+            dead: Waiter) -> Result<UInt, SosStatus> {
+    let probe = try system.process_create(image: &image, memory: &ram)
+    let go = try proc.pipe_create()
+    let (go_in, go_out) = move go
+    let ready = try proc.pipe_create()
+    let (ready_in, ready_out) = move ready
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(outlet: &ready_out, key: KEY_READY)
+    try waiter.add(process: &probe, key: KEY_PROBE)
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try probe.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try probe.give(outlet: move go_out, tag: TAG_PROBE_WAITERS) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try probe.give(inlet: move ready_in, tag: TAG_OUTBOX) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try probe.start(boot_tag: TAG_BOOT)
+
+    let woke = try waiter.wait()
+    if woke.key != KEY_READY {
+        return BUG
+    }
+    let got = try ready_out.take()
+    let (msg, request) = move got
+    let _ = move msg
+    let _ = move request
+
+    // The probe holds its first Waiter. If this release credited the owner's
+    // record, it would credit the probe's.
+    let _ = move dead
+
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    let claim = try go_in.post(body: &body, len: 1)
+    let _ = move claim
+
+    let ended = try waiter.wait()
+    if ended.key != KEY_PROBE {
+        return BUG
+    }
+    match ended.what {
+        case Process(status) -> { return status - EXITED },
+        case _ -> { return BUG },
+    }
+}
+
+/// Make Waiters until the slab refuses, each held in its own frame while the
+/// next is asked for, and answer how many.
+func count_waiters(proc: &Process) -> UInt {
+    let w = try proc.waiter_create() catch { return 0 }
+    let n = count_waiters(&proc)
+    let _ = move w
+    return n + 1
+}

@@ -151,6 +151,24 @@ public(package) struct InterruptSlot {
     public(package) refs: UInt16,
 }
 
+/// Where a Waiter is in its life (spec §2.10).
+///
+/// A Waiter is bound to the process that created it, so it has an invalid
+/// state the shared kinds lack: `Invalid` is a Waiter whose owner died while a
+/// handle elsewhere still named it. Its attachments are gone, nothing is parked
+/// on it, every op through a handle onto it answers `Revoked`, and the slot is
+/// held only for those handles: the last one going frees it.
+///
+/// It is this kind's own enum rather than a third `SlotState` case, so the
+/// kinds that have no invalid state need no arm for one, and rather than a flag
+/// beside `SlotState`, so that every match on a Waiter's state has to say what
+/// an invalid one means.
+public(package) enum WaiterState: UInt8 {
+    case Free = 0,
+    case Live = 1,
+    case Invalid = 2,
+}
+
 /// One Waiter (spec §2.2): the generic wait aggregator.
 ///
 /// Two lists and nothing else. `attached` is the subscription set (§2.2 has no
@@ -161,22 +179,25 @@ public(package) struct InterruptSlot {
 /// scanning `attached` for something ready, which is the level-triggered
 /// semantics implemented rather than maintained beside it.
 public(package) struct WaiterSlot {
-    public(package) state: SlotState,
+    public(package) state: WaiterState,
+    /// The process that created this Waiter and is charged for it, or
+    /// `NO_PROCESS` once it is invalid. Test for that before using it as an
+    /// index.
     public(package) process: Int,
     /// Head of the attachment list (attachment slot + 1).
     public(package) attached: Int,
     /// Head of the list of threads parked in `Wait` (thread slot + 1).
     ///
-    /// When this Waiter's last reference goes, `free_object` answers every
-    /// thread on this list with `SosStatus.Revoked` before the slot returns to
-    /// the slab. A readiness feeds one of them (§2.2's distribution); a
-    /// revocation answers all of them.
+    /// When this Waiter's last reference goes, or its owner dies, every thread
+    /// on this list is answered `SosStatus.Revoked` (`revoke_blocked`). A
+    /// readiness feeds one of them (§2.2's distribution); a revocation answers
+    /// all of them.
     public(package) blocked: Int,
-    /// Handle entries naming this waiter. Only handles: an attachment is a
-    /// reference to the waitable, not to the Waiter that holds it. A Waiter
-    /// owns its attachment list, so counting them here would be an object
-    /// counting itself and nothing would reach zero. This asymmetry is why the
-    /// Waiter's free cascades.
+    /// Handle entries naming this waiter, plus the staged messages that carry
+    /// it. No attachment: an attachment is a reference to the waitable, not to
+    /// the Waiter that holds it. A Waiter owns its attachment list, so
+    /// counting them here would be an object counting itself and nothing would
+    /// reach zero. This asymmetry is why the Waiter's free cascades.
     public(package) refs: UInt16,
 }
 
@@ -234,7 +255,7 @@ public(package) unsafe static var EVENTS: Slab<EventSlot, MAX_EVENTS> = Slab<Eve
     total: MAX_EVENTS)
 
 public(package) unsafe static var WAITERS: Slab<WaiterSlot, MAX_WAITERS> = Slab<WaiterSlot, MAX_WAITERS>(
-    inline: [WaiterSlot(state: SlotState.Free, process: 0, attached: 0,
+    inline: [WaiterSlot(state: WaiterState.Free, process: 0, attached: 0,
                         blocked: 0, refs: 0); MAX_WAITERS],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
@@ -282,6 +303,7 @@ public(package) func alloc_waiter() unsafe -> Int {
         match WAITERS[i].state {
             case Free -> { return i },
             case Live -> {},
+            case Invalid -> {},
         }
         i = i + 1
     }
@@ -411,18 +433,26 @@ public(package) func set_waitable_attachment(kind: WaitableKind, slot: Int, a: I
 /// Every answer is a read of the object's own state; none consults a flag the
 /// wait machinery maintains. An Event is ready while its word is non-zero, an
 /// Interrupt while its fire is unacked, a Timer while it has expiries nobody
-/// has been told about, and a Process once it is `Gone`.
+/// has been told about or once it is invalid, and a Process once it is `Gone`.
 ///
-/// The Process arm is terminal: the other levels can drop again (a word is
-/// taken, a line is acked, a count is spent), but `Gone` is a state a record
-/// leaves only by being freed, and it cannot be freed while somebody is
-/// attached to it. So the level a death raises stays raised for as long as
-/// anyone can observe it.
+/// The Process arm and an invalid Timer are terminal (spec §2.10): the other
+/// levels can drop again (a word is taken, a line is acked, a count is spent),
+/// but `Gone` and `Invalid` are states an object leaves only by being freed,
+/// and it cannot be freed while somebody is attached to it. So the level a
+/// death raises stays raised for as long as anyone can observe it.
 public(package) func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Bool {
     match kind {
         case Event -> EVENTS[slot].word != 0,
         case Interrupt -> INTERRUPTS[slot].pending,
-        case Timer -> TIMERS[slot].fires != 0,
+        case Timer -> {
+            match TIMERS[slot].state {
+                case Live -> TIMERS[slot].fires != 0,
+                case Invalid -> true,
+                // A freed Timer has no attachment and no handle, so nothing
+                // asks; it is not ready.
+                case Free -> false,
+            }
+        },
         case Process -> {
             match PROCESS_RECORDS[slot].state {
                 case Gone -> true,
@@ -480,6 +510,10 @@ public(package) func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Boo
 /// The Process arm carries spec §8's own word: `process_status_word` is the
 /// same assembly `ProcessOp.GetStatus` answers with, so being woken by a death
 /// and asking about one produce identical bits.
+///
+/// An invalid Timer answers its ordinary record, with no case added for the
+/// invalidation (spec §2.10). Its count is zero, because the invalidation
+/// disarmed it, which no live Timer's delivery carries.
 ///
 /// Three of the four pipe arms are word-shaped levels and answer with
 /// `body_len: 0`. The `PipeReply` arm carries the reply's bytes, and `body_src`
@@ -558,7 +592,8 @@ public(package) func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> Wa
 ///   - A Timer's fire count is spent by the delivery. It has no mask to hold
 ///     and no device to service, so the fire has done its job once somebody has
 ///     been told. This is what makes a periodic timer a schedule rather than a
-///     request/response.
+///     request/response. An invalid Timer's count is already zero, and its
+///     level is its state, which nothing here can lower.
 ///   - A Process's death clears nothing. The empty arm differs from the
 ///     Interrupt's: an Interrupt's readiness has an end the kernel does not
 ///     own, while a death has no end. Consuming a death reports it and nothing
@@ -635,6 +670,48 @@ public(package) func waiter_ready_attachment(w: Int) unsafe -> Int {
         cur = ATTACHMENTS[a].link
     }
     NO_ATTACHMENT
+}
+
+/// Take every thread of process `p` off every Waiter's blocked list, leaving
+/// the other threads where they were.
+///
+/// A Waiter can be given, so a thread may be parked on another process's
+/// Waiter, and another process's thread on one of `p`'s. The teardown calls
+/// this before its close-all, so that no delivery and no revocation from then
+/// on can reach one of `p`'s threads, while other processes' threads stay
+/// parked for the invalidation of `p`'s Waiters to answer. A walk with a
+/// trailing pointer, as `unjoin_process` does: a thread is on at most one list.
+public(package) func unblock_process(p: Int) unsafe {
+    var w: Int = 0
+    while w < WAITERS.capacity() {
+        match WAITERS[w].state {
+            case Live -> {
+                // Slot + 1 throughout, matching the list's own encoding.
+                var prev: Int = 0
+                var cur = WAITERS[w].blocked
+                while cur != 0 {
+                    let slot = cur - 1
+                    let next = THREADS[slot].link
+                    if THREADS[slot].process == p {
+                        if prev == 0 {
+                            WAITERS[w].blocked = next
+                        } else {
+                            THREADS[prev - 1].link = next
+                        }
+                        THREADS[slot].link = 0
+                    } else {
+                        prev = cur
+                    }
+                    cur = next
+                }
+            },
+            // Nothing parks on an invalid Waiter: the invalidation emptied the
+            // list and every later `Wait` answers `Revoked`.
+            case Invalid -> {},
+            case Free -> {},
+        }
+        w = w + 1
+    }
 }
 
 /// Park the running thread on `w`'s blocked list, remembering where its record

@@ -52,8 +52,8 @@ import kcore.objects.{
     unbind_handle,
 }
 import kcore.refs.{free_object, notify_ready, reap_unreferenced, ref_object,
-                   release_pending_calls, unref_object, unref_teardown,
-                   unref_waitable_teardown}
+                   release_pending_calls, revoke_blocked, unref_object,
+                   unref_teardown, unref_waitable_teardown}
 import kcore.threads.{
     CURRENT_THREAD,
     LAST_PROT_PROCESS,
@@ -70,7 +70,7 @@ import kcore.threads.{
     ready_remove_process,
     unjoin_process,
 }
-import kcore.time.{TIMERS, TimerSlot, reprogram_timer}
+import kcore.time.{TIMERS, TimerState, reprogram_timer}
 import kcore.waitables.{
     ATTACHMENTS,
     Attachment,
@@ -79,7 +79,10 @@ import kcore.waitables.{
     WAITERS,
     WaitableKind,
     WaiterSlot,
+    WaiterState,
+    detach_attachment,
     set_waitable_attachment,
+    unblock_process,
 }
 import kcore.process.{clear_domain, load_domain}
 
@@ -270,18 +273,61 @@ func invalidate_thread(t: Int, p: Int) unsafe {
                             call_len: 0, refs: refs)
 }
 
+/// Invalidate Waiter `w` of dying process `p` (spec §2.10): it stays, for the
+/// handles other processes hold, and does nothing more.
+///
+/// The teardown has already done the rest of the invalidation by the time this
+/// runs, in the order `end_process` needs it: the threads parked on the Waiter
+/// were woken with `Revoked` before the close-all (`revoke_blocked`), and the
+/// attachment sweep detached every row and dropped the references they held.
+/// What is left is the charge, which comes back now, while `p`'s ledger is
+/// live.
+///
+/// The slot keeps its count and nothing else: `Invalid`, owned by nobody so
+/// that a later occupant of `p`'s record cannot match it, with both lists
+/// empty. Every later op through a handle onto it answers `Revoked`, and its
+/// last handle frees it.
+func invalidate_waiter(w: Int, p: Int) unsafe {
+    quota_credit(p, QuotaKind.Waiter)
+    let refs = WAITERS[w].refs
+    WAITERS[w] = WaiterSlot(state: WaiterState.Invalid, process: NO_PROCESS,
+                            attached: 0, blocked: 0, refs: refs)
+}
+
+/// Invalidate Timer `t` of dying process `p` (spec §2.10): it never fires
+/// again, and an attachment on it fires now.
+///
+/// The disarm clears the schedule and the fire count; the caller reprograms the
+/// comparator once its sweep is done. The charge comes back while `p`'s ledger
+/// is live, and the Timer is disowned. Then the attachment, if any, is
+/// notified: the Timer is now ready for good (`waitable_ready`), and the record
+/// is its ordinary one with a count of zero. The attachment is on another
+/// process's Waiter, because `p`'s own were detached by the attachment sweep,
+/// so the wake reaches another process's thread. A one-shot attachment
+/// detaches at that delivery and may drop the Timer's last reference, freeing
+/// it here.
+func invalidate_timer(t: Int, p: Int) unsafe {
+    TIMERS[t].disarm()
+    quota_credit(p, QuotaKind.Timer)
+    TIMERS[t].state = TimerState.Invalid
+    TIMERS[t].process = NO_PROCESS
+    notify_ready(WaitableKind.Timer, t)
+}
+
 /// End process `p`. Never returns.
 ///
 /// Teardown is unconditional: every handle in the process's table is closed,
-/// every thread it owns stops running, and every Waiter, Interrupt, Timer and
-/// Mapping it held goes back to its slab. A thread that had not exited is
-/// invalidated; one that had keeps its exit code. Either goes back to the pool
-/// when nothing names it any more, and one still named elsewhere outlives the
-/// process, disowned. An Event goes back when nothing names it any more; one
-/// that is still named elsewhere outlives the process, disowned
-/// (`reap_unreferenced`). Its trap counters are copied into its record, and its
-/// body (the handle table, the boot set and the grant record) is freed for the
-/// next create. The record stays, `Gone`, for as long as a reference names it.
+/// every thread it owns stops running, and every Interrupt and Mapping it owned
+/// goes back to its slab. A thread that had not exited is invalidated; one that
+/// had keeps its exit code. Either goes back to the pool when nothing names it
+/// any more, and one still named elsewhere outlives the process, disowned. A
+/// Waiter or Timer goes back when nothing names it any more; one still named
+/// elsewhere is invalidated and outlives the process, disowned. An Event goes
+/// back when nothing names it any more; one that is still named elsewhere
+/// outlives the process, disowned (`reap_unreferenced`). Its trap counters are
+/// copied into its record, and its body (the handle table, the boot set and the
+/// grant record) is freed for the next create. The record stays, `Gone`, for as
+/// long as a reference names it.
 /// Then:
 ///
 ///   - Process 0 (root, init) stops the machine. Its children die with it,
@@ -382,27 +428,39 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     //     threads stay.
     //   - Every joiner list, so that an invalidation's wake reaches only other
     //     processes' joiners and no surviving thread names one of these.
-    //   - Its own Waiters' blocked lists, emptied whole. A Waiter's handles
-    //     stay in its owner's table (`waiter_rights()` withholds `Transfer`,
-    //     and `WaiterCreate` mints into the named process's table), so only
-    //     the owner's threads park on one, and the Waiter sweep below frees it
-    //     without walking the list.
+    //   - Every Waiter's blocked list, whoever owns the Waiter: a Waiter can be
+    //     given, so these threads may be parked on another process's Waiter.
     //
     // Each walk reads `process`, which the thread sweep rewrites, so this also
     // has to come before that.
     ready_remove_process(p)
     unjoin_process(p)
-    var wb: Int = 0
-    while wb < WAITERS.capacity() {
-        match WAITERS[wb].state {
-            case Free -> {},
+    unblock_process(p)
+
+    // Then the other processes' threads parked on this process's Waiters are
+    // answered, with `Revoked`: every one of these Waiters is about to be freed
+    // or invalidated (the Waiter sweep), and this is spec §2.10's first step,
+    // invalidate before release, for the part of it that cannot wait. The
+    // close-all and the attachment sweep both drop references, a dropped
+    // reference can raise the level of a waitable another row of the same
+    // Waiter watches, and the notification reaches `wake_one_waiter` for it.
+    // With a thread still parked, that delivery would run while the
+    // attachment sweep is taking the list apart: a one-shot row's
+    // `detach_attachment` would walk from a head the sweep has cleared, miss
+    // its row and drop its reference, and the sweep would drop it again. With
+    // every list empty, such a wake finds nobody and delivers nothing.
+    var wr: Int = 0
+    while wr < WAITERS.capacity() {
+        match WAITERS[wr].state {
             case Live -> {
-                if WAITERS[wb].process == p {
-                    WAITERS[wb].blocked = 0
+                if WAITERS[wr].process == p {
+                    revoke_blocked(wr)
                 }
             },
+            case Invalid -> {},
+            case Free -> {},
         }
-        wb = wb + 1
+        wr = wr + 1
     }
 
     // The close-all goes through `unbind_handle`, so teardown and release do
@@ -414,9 +472,10 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // Each entry is also one reference fewer, and objects another process owns
     // must see that (a region a launcher gave a child, for example). The
     // decrement is `unref_teardown`, which deliberately does not free at zero:
-    // the sweeps below free what this process owned, by ownership, and count
-    // what they freed for the report. Freeing by reference here would collapse
-    // those counts. `unref_teardown`'s docstring carries the argument.
+    // the sweeps below free what nothing names any more, invalidate what this
+    // process owned and something else still names, and count what they freed
+    // for the report. Freeing by reference here would collapse those counts.
+    // `unref_teardown`'s docstring carries the argument.
     var closed: UInt = 0
     var h: Int = 0
     while body != NO_BODY && h < MAX_HANDLES {
@@ -490,44 +549,23 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // stranded thread never exits.
     CURRENT_THREAD = NO_THREAD
 
-    // Interrupts go back first. Masking each line is not just bookkeeping: a
-    // device the dead process was driving may still be asserting, and an
-    // unmasked line with no object behind it would be taken, reported and
-    // masked once per fire forever. Spec §9 masks on fire and unmasks on ack;
-    // here the mask happens with no ack coming.
-    var irqs_freed: UInt = 0
-    var q: Int = 0
-    while q < INTERRUPTS.capacity() {
-        if INTERRUPTS[q].process == p {
-            match INTERRUPTS[q].state {
-                case Free -> {},
-                case Live -> {
-                    hal.irq_mask(INTERRUPTS[q].line)
-                    INTERRUPTS[q] = InterruptSlot(state: SlotState.Free,
-                                                  process: 0, line: 0,
-                                                  pending: false, attachment: 0,
-                                                  refs: 0)
-                    irqs_freed = irqs_freed + 1
-                },
-            }
-        }
-        q = q + 1
-    }
-
     // Attachments belong to a Waiter, so they are reclaimed by walking the
     // process's waiters: an attachment is a row in a Waiter's table and dies
-    // with it. Each is also unhooked from the far end, because a supervisor's
-    // Waiter can attach to a child's process record, and that pair spans two
+    // with it, whether the Waiter is freed or invalidated below. Each is also
+    // unhooked from the far end, because a Waiter can watch an object another
+    // process owns (a supervisor's Waiter attached to a child's process record,
+    // or anything a holder of a given Waiter attached), and that pair spans two
     // processes:
     //
     //   - Clear the back pointer, or the waitable's `attachment` field would
-    //     name a slot this loop has just freed. For a same-process waitable the
-    //     per-slab sweeps below zero it anyway; for a Process record another
-    //     process owns, this stops a later death from notifying through a
-    //     stale index.
+    //     name a slot this loop has just freed and a later readiness would
+    //     notify through a stale index. The Waiter's own list head goes too,
+    //     since every row on it is freed here.
     //   - Count without freeing (`unref_waitable_teardown`), for the same
     //     reason as the handle close-all above: an object another process owns
     //     must see the reference go, and freeing is the per-slab sweeps' job.
+    //     A Timer or Interrupt this leaves unnamed is freed by its sweep below,
+    //     and anything else by `reap_unreferenced`.
     //
     // Reachable when a supervisor dies before what it watches.
     var a: Int = 0
@@ -535,7 +573,8 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
         match ATTACHMENTS[a].state {
             case Free -> {},
             case Live -> {
-                if WAITERS[ATTACHMENTS[a].waiter].process == p {
+                let owner = ATTACHMENTS[a].waiter
+                if WAITERS[owner].process == p {
                     let watched = ATTACHMENTS[a].kind
                     let watched_slot = ATTACHMENTS[a].target
                     ATTACHMENTS[a] = Attachment(state: SlotState.Free,
@@ -543,6 +582,7 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
                                                 target: 0, waiter: 0, key: 0,
                                                 oneshot: false, owns: false,
                                                 link: 0)
+                    WAITERS[owner].attached = 0
                     set_waitable_attachment(watched, watched_slot, 0)
                     unref_waitable_teardown(watched, watched_slot)
                 }
@@ -551,23 +591,83 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
         a = a + 1
     }
 
-    // Waiters go back to their slabs whole (spec §2.7). No unlinking is needed
-    // first: the attachment loop above has already unhooked every attachment of
-    // this process's waiters, and their blocked lists were emptied before the
-    // thread sweep. Events are not swept here: an Event is a shared kind, freed
-    // or disowned by `reap_unreferenced` below.
+    // The Interrupt sweep. Masking each line is not just bookkeeping: a device
+    // the dead process was driving may still be asserting, and an unmasked
+    // line with no object behind it would be taken, reported and masked once
+    // per fire forever. Spec §9 masks on fire and unmasks on ack; here the mask
+    // happens with no ack coming.
+    //
+    //   - This process's Interrupts are freed by owner. One still attached is
+    //     attached to another process's Waiter, which this process held a
+    //     handle to: the attachment is detached first, so that no Waiter keeps
+    //     a row naming a freed slot. It is detached without firing, which is
+    //     intended until an Interrupt is invalidated rather than freed (spec
+    //     §2.10's not-yet-enforced Interrupt items): a thread parked on that
+    //     Waiter for this line is not told.
+    //   - Another process's Interrupt that nothing names any more is freed
+    //     too, uncounted: its last name was an attachment on one of this
+    //     process's Waiters, dropped by the attachment sweep above.
+    var irqs_freed: UInt = 0
+    var q: Int = 0
+    while q < INTERRUPTS.capacity() {
+        match INTERRUPTS[q].state {
+            case Free -> {},
+            case Live -> {
+                if INTERRUPTS[q].process == p {
+                    let held = INTERRUPTS[q].attachment
+                    if held != 0 {
+                        detach_attachment(ATTACHMENTS[held - 1].waiter, held - 1)
+                    }
+                    hal.irq_mask(INTERRUPTS[q].line)
+                    INTERRUPTS[q] = InterruptSlot(state: SlotState.Free,
+                                                  process: 0, line: 0,
+                                                  pending: false, attachment: 0,
+                                                  refs: 0)
+                    irqs_freed = irqs_freed + 1
+                } else if INTERRUPTS[q].refs == 0 {
+                    free_object(ObjType.Interrupt, q)
+                }
+            },
+        }
+        q = q + 1
+    }
+
+    // The Waiter sweep (spec §2.10). The close-all has dropped every handle
+    // this process held, so a count here is names held elsewhere.
+    //
+    //   - A Waiter of this process that nothing else names is freed, and
+    //     counted for the teardown line. Its attachments went with the
+    //     attachment sweep, and the threads parked on it were woken with
+    //     `Revoked` before the close-all.
+    //   - One still named elsewhere is invalidated (`invalidate_waiter`): its
+    //     charge comes back, and it survives, owned by nobody, until its last
+    //     handle goes.
+    //   - Another process's Waiter, or an invalid one, that nothing names any
+    //     more is freed too, uncounted: its last handle was in this process's
+    //     table. A live one's free releases its attachments as any free does.
+    //
+    // Events are not swept here: an Event is a shared kind, freed or disowned
+    // by `reap_unreferenced` below.
     var waiters_freed: UInt = 0
     var w: Int = 0
     while w < WAITERS.capacity() {
-        if WAITERS[w].process == p {
-            match WAITERS[w].state {
-                case Free -> {},
-                case Live -> {
-                    WAITERS[w] = WaiterSlot(state: SlotState.Free, process: 0,
-                                            attached: 0, blocked: 0, refs: 0)
-                    waiters_freed = waiters_freed + 1
-                },
-            }
+        match WAITERS[w].state {
+            case Free -> {},
+            case Live -> {
+                if WAITERS[w].refs == 0 {
+                    if WAITERS[w].process == p {
+                        waiters_freed = waiters_freed + 1
+                    }
+                    free_object(ObjType.Waiter, w)
+                } else if WAITERS[w].process == p {
+                    invalidate_waiter(w, p)
+                }
+            },
+            case Invalid -> {
+                if WAITERS[w].refs == 0 {
+                    free_object(ObjType.Waiter, w)
+                }
+            },
         }
         w = w + 1
     }
@@ -577,24 +677,33 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // which touches only the table entry. Freeing the clock's slot would take
     // the monotonic clock away from everybody else.
     //
-    // Timers go back for the same reason as interrupts: a dead process's armed
-    // deadline is one the kernel would otherwise keep waking itself for, with
-    // nobody left to tell. Freeing them and reprogramming takes the comparator
-    // back.
+    // The Timer sweep, on the Waiter sweep's terms: a Timer of this process
+    // that nothing else names is freed and counted, one still named elsewhere
+    // is invalidated (`invalidate_timer`), and another process's Timer, or an
+    // invalid one, that nothing names any more is freed uncounted. Either way
+    // this process's deadlines stop: a dead process's armed deadline is one the
+    // kernel would otherwise keep waking itself for, with nobody left to tell,
+    // and the reprogram after the sweep takes the comparator back.
     var timers_freed: UInt = 0
     var tm: Int = 0
     while tm < TIMERS.capacity() {
-        if TIMERS[tm].process == p {
-            match TIMERS[tm].state {
-                case Free -> {},
-                case Live -> {
-                    TIMERS[tm] = TimerSlot(state: SlotState.Free, process: 0,
-                                           clock: 0, armed: false,
-                                           deadline_ns: 0, interval_ns: 0,
-                                           fires: 0, attachment: 0, refs: 0)
-                    timers_freed = timers_freed + 1
-                },
-            }
+        match TIMERS[tm].state {
+            case Free -> {},
+            case Live -> {
+                if TIMERS[tm].refs == 0 {
+                    if TIMERS[tm].process == p {
+                        timers_freed = timers_freed + 1
+                    }
+                    free_object(ObjType.Timer, tm)
+                } else if TIMERS[tm].process == p {
+                    invalidate_timer(tm, p)
+                }
+            },
+            case Invalid -> {
+                if TIMERS[tm].refs == 0 {
+                    free_object(ObjType.Timer, tm)
+                }
+            },
         }
         tm = tm + 1
     }
@@ -630,12 +739,11 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // process's own record waits for the teardown's drop below.
     //
     // Events are freed or disowned by the reap, which answers the count the
-    // teardown line reports. Threads were swept above: invalidated or disowned
-    // by ownership, freed by count. Waiters, Interrupts and Timers are counted
-    // for the teardown line and swept by ownership. Mappings are swept
-    // below: a Mapping is not subject to the hazard above because
-    // `mapping_rights()` withholds `Transfer`, so its handle cannot leave the
-    // owning process.
+    // teardown line reports. Threads, Waiters and Timers were swept above:
+    // invalidated or disowned by ownership, freed by count. Interrupts were
+    // swept by ownership. Mappings are swept below: a Mapping is not subject to
+    // the hazard above because `mapping_rights()` withholds `Transfer`, so its
+    // handle cannot leave the owning process.
     let events_freed = reap_unreferenced(p)
 
     // Mappings come apart from both ends, which is why this loop has two arms.

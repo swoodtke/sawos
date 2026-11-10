@@ -1,0 +1,125 @@
+// A process that dies with a thread parked on another process's Waiter leaves
+// nothing of itself on that Waiter (spec §2.10).
+//
+// Expected transcript, read as an order:
+//
+//   SOS waiterparked: started
+//   SOS: process exit: code=53 process=1        <- the parker
+//   SOS: process teardown ... threads=2 ... process=1
+//   SOS waiterparked: the child is gone
+//   SOS waiterparked: the Event delivered 5
+//   SOS waiterparked: done
+//
+// Root makes a Waiter, attaches an Event of its own to it, and gives a sibling
+// of the Waiter to a child (`child-waitable`, the parker). The child's main
+// thread parks on it, and a second thread of the child ends the process. The
+// teardown must take the parked thread off root's Waiter before it
+// invalidates and frees the thread's slot. Root then signals the Event, which
+// wakes whatever is parked on its Waiter: nothing, if the teardown did its
+// job, and root's own wait is handed the Event. A slot left on the list would
+// be handed the delivery instead, into a process that no longer exists.
+
+import sos.{System, Process, Memory, Waiter, Event, SystemRight, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tags the child's boot records travel under.
+static TAG_BOOT: UInt = 7
+static TAG_PARK: UInt = 54
+
+/// The keys root's attachments live under.
+static KEY_CHILD: UInt = 81
+static KEY_EVENT: UInt = 82
+
+/// The bits root signals its Event with.
+static BITS: UInt = 0x5
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.ClockGet | SystemRight.Transfer)
+
+/// The parker's exit code, and the kind half of a §8 status word for a process
+/// that exited.
+static CHILD_PARKED: UInt = 53
+static EXITED: UInt = 1 << 16
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS waiterparked: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS waiterparked: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS waiterparked: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    let waiter = try proc.waiter_create()
+    let event = try proc.event_create()
+    try waiter.add(event: &event, key: KEY_EVENT)
+
+    let child = try system.process_create(image: &image, memory: &ram)
+    let watch = try proc.waiter_create()
+    try watch.add(process: &child, key: KEY_CHILD)
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let sibling = try waiter.mint()
+    try child.give(waiter: move sibling, tag: TAG_PARK) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    let _ = system.debug_print("SOS waiterparked: started\n")
+
+    let ended = try watch.wait()
+    if ended.key != KEY_CHILD {
+        return BUG
+    }
+    match ended.what {
+        case Process(status) -> {
+            if status != EXITED + CHILD_PARKED {
+                print("SOS waiterparked: the child ended {}\n", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    let _ = system.debug_print("SOS waiterparked: the child is gone\n")
+
+    try event.signal(BITS)
+    let woke = try waiter.wait()
+    match woke.what {
+        case Event(bits) -> {
+            print("SOS waiterparked: the Event delivered {}\n", bits)
+            if bits != BITS {
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}

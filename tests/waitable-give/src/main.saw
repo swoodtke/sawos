@@ -1,0 +1,233 @@
+// A Waiter and a Timer cross a process boundary both ways, at boot and in a
+// message (spec §3, §2.1), and a process's death frees another process's
+// Waiter and Timer whose last names it held (spec §2.10).
+//
+// Expected transcript, read as an order:
+//
+//   SOS waitablegive: capacity before waiters=4 timers=8
+//   SOS waitablegive: started
+//   SOS waitablegive: the child's given Timer fired 1
+//   SOS waitablegive: the sent pair fired 1
+//   SOS: process exit: code=51 process=1
+//   SOS: process teardown handles=6 threads=1 ... waiters=0 ... timers=0 ...
+//   SOS waitablegive: the child is gone
+//   SOS waitablegive: capacity after waiters=4 timers=8
+//   SOS waitablegive: done
+//
+// Root makes a Waiter and a Timer and gives both to a child
+// (`child-waitable`, the peer) at boot, keeping no handle on either. The child
+// attaches the Timer to the Waiter, arms it and waits, and reports the fire
+// count in the first byte of a message, which proves a Waiter and a Timer
+// given at boot are usable. The message carries a Waiter and a Timer the child
+// made; root attaches that Timer to that Waiter, arms it and waits, which
+// proves a Waiter and a Timer carried in a message are usable. Root then drops
+// the message's request, which lets the child end itself.
+//
+// The capacity counts show what is freed. Root's quotas are unlimited, so the
+// number of Waiters or Timers it can make is the slab's free slots. `after`
+// equals `before` only if every object of the case was freed:
+//
+//   - root's pair, by the child's teardown: the child held their last names,
+//     so its close-all drops both counts to zero, and its Waiter and Timer
+//     sweeps free another process's objects that nothing names any more (the
+//     Waiter's free releases the attachment that held the Timer). They are
+//     root's, so the child's teardown line counts neither;
+//   - the child's pair, by root's releases while the child still lives, which
+//     credits the child's ledger. Its teardown never sees them.
+//
+// This case does not exercise invalidation: nothing of the child's is still
+// named when it dies. `timer-outlive` and `waiter-outlive` do.
+
+import sos.{System, Process, Memory, Waiter, Timer, Clock, ClockType, PipeMsg,
+            SystemRight, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tags the child's boot records travel under.
+static TAG_BOOT: UInt = 7
+static TAG_OUTBOX: UInt = 33
+static TAG_WAITER: UInt = 50
+static TAG_TIMER: UInt = 51
+
+/// The keys root's attachments live under.
+static KEY_MSG: UInt = 81
+static KEY_CHILD: UInt = 82
+static KEY_SENT: UInt = 83
+
+/// How soon the child's Timer fires once root arms it.
+static SENT_DELAY_NS: UInt64 = 1_000_000
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.ClockGet | SystemRight.Transfer)
+
+/// The child's exit code, and the kind half of a §8 status word for a process
+/// that exited.
+static CHILD_SERVED: UInt = 51
+static EXITED: UInt = 1 << 16
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS waitablegive: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
+        print("SOS waitablegive: no clock: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let before_w = count_waiters(&proc)
+    let before_t = count_timers(&clock)
+    print("SOS waitablegive: capacity before waiters={} timers={}\n",
+          before_w, before_t)
+    try run(&system, &proc, &clock) catch {
+        print("SOS waitablegive: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let after_w = count_waiters(&proc)
+    let after_t = count_timers(&clock)
+    print("SOS waitablegive: capacity after waiters={} timers={}\n",
+          after_w, after_t)
+    if after_w != before_w || after_t != before_t {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS waitablegive: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// Launch the peer with root's pair, use the pair it sends back, and wait for
+/// its death. Nothing root made in here survives the return.
+func run(system: &System, proc: &Process, clock: &Clock) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    let child = try system.process_create(image: &image, memory: &ram)
+    let watch = try proc.waiter_create()
+    let outbox = try proc.pipe_create()
+    let (outbox_in, outbox_out) = move outbox
+    try watch.add(outlet: &outbox_out, key: KEY_MSG)
+    try watch.add(process: &child, key: KEY_CHILD)
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let given_waiter = try proc.waiter_create()
+    try child.give(waiter: move given_waiter, tag: TAG_WAITER) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let given_timer = try clock.timer_create()
+    try child.give(timer: move given_timer, tag: TAG_TIMER) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(inlet: move outbox_in, tag: TAG_OUTBOX) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    let _ = system.debug_print("SOS waitablegive: started\n")
+
+    let woke = try watch.wait()
+    if woke.key != KEY_MSG {
+        return BUG
+    }
+    // The child's death raises the outlet's peer-gone level too; only the
+    // death is waited for from here.
+    try watch.remove(KEY_MSG)
+    let got = try outbox_out.take()
+    let (arrived, request) = move got
+    var msg = move arrived
+    print("SOS waitablegive: the child's given Timer fired {}\n", msg.bytes[0])
+    try use_sent(&var msg)
+
+    // The child waits on its claim until this request goes, then ends itself.
+    let _ = move request
+    let ended = try watch.wait()
+    if ended.key != KEY_CHILD {
+        return BUG
+    }
+    match ended.what {
+        case Process(status) -> {
+            if status != EXITED + CHILD_SERVED {
+                print("SOS waitablegive: the child ended {}\n", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    let _ = system.debug_print("SOS waitablegive: the child is gone\n")
+    return
+}
+
+/// Take the child's Waiter and Timer out of `msg`, attach the one to the other,
+/// arm and wait. Both are released on return, while the child still lives:
+/// it is parked on its claim until root drops the message's request.
+func use_sent(msg: &var PipeMsg) -> Result<Void, SosStatus> {
+    let w = try waiter_in(&var msg, 0)
+    let t = try timer_in(&var msg, 1)
+    try w.add(timer: &t, key: KEY_SENT)
+    try t.arm(after_ns: SENT_DELAY_NS)
+    let woke = try w.wait()
+    match woke.what {
+        case Timer(fires) -> {
+            print("SOS waitablegive: the sent pair fired {}\n", fires)
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
+
+/// Take the Waiter out of slot `at` of a delivered message.
+func waiter_in(msg: &var PipeMsg, at: Int) -> Result<Waiter, SosStatus> {
+    guard let carried = msg.handles[at].take() else { return BUG }
+    match carried {
+        case Waiter(w) -> { return move w },
+        case _ -> { return BUG },
+    }
+}
+
+/// Take the Timer out of slot `at` of a delivered message.
+func timer_in(msg: &var PipeMsg, at: Int) -> Result<Timer, SosStatus> {
+    guard let carried = msg.handles[at].take() else { return BUG }
+    match carried {
+        case Timer(tm) -> { return move tm },
+        case _ -> { return BUG },
+    }
+}
+
+/// Make Waiters until the slab refuses, each held in its own frame while the
+/// next is asked for, and answer how many.
+func count_waiters(proc: &Process) -> UInt {
+    let w = try proc.waiter_create() catch { return 0 }
+    let n = count_waiters(&proc)
+    let _ = move w
+    return n + 1
+}
+
+/// Make Timers until the slab refuses, on `count_waiters`' terms.
+func count_timers(clock: &Clock) -> UInt {
+    let t = try clock.timer_create() catch { return 0 }
+    let n = count_timers(&clock)
+    let _ = move t
+    return n + 1
+}

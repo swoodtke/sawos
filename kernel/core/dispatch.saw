@@ -243,6 +243,7 @@ import kcore.time.{
     NEVER_NS,
     TIMERS,
     TimerSlot,
+    TimerState,
     alloc_timer,
     clock_slot,
     reprogram_timer,
@@ -258,6 +259,7 @@ import kcore.waitables.{
     Waitable,
     WaitableKind,
     WaiterSlot,
+    WaiterState,
     alloc_attachment,
     alloc_event,
     alloc_interrupt,
@@ -898,9 +900,9 @@ func slab_donate(p: Int, raw_kind: UInt, handle: UInt) unsafe -> SyscallResult {
         return op_status(SosStatus.NoResource)
     }
 
-    // Zero before installing. A slab slot must start Free, and `SlotState.Free`
-    // is zero in every converted kind, so a zeroed extent is an extent full of
-    // free slots by construction.
+    // Zero before installing. A slab slot must start Free, and `Free` is zero
+    // in `SlotState` and in every per-kind state enum, so a zeroed extent is an
+    // extent full of free slots by construction.
     //
     // `long_zero` takes preemption points. That is safe here because nothing is
     // half-built across a point: the extent is not installed, so no allocator
@@ -1500,7 +1502,7 @@ func waiter_create(p: Int) unsafe -> SyscallResult {
     if handle == NO_HANDLE {
         return op_status(mint_refusal(p))
     }
-    WAITERS[slot] = WaiterSlot(state: SlotState.Live, process: p, attached: 0,
+    WAITERS[slot] = WaiterSlot(state: WaiterState.Live, process: p, attached: 0,
                                blocked: 0, refs: 1)
     quota_charge(p, QuotaKind.Waiter)
     op_value(handle)
@@ -1818,7 +1820,7 @@ func timer_create(p: Int, c: Int) unsafe -> SyscallResult {
     // Born disarmed and owing nothing: a Timer is a schedule not yet written,
     // so it is not ready, and attaching one to a Waiter before arming it parks
     // rather than reporting.
-    TIMERS[slot] = TimerSlot(state: SlotState.Live, process: p, clock: c,
+    TIMERS[slot] = TimerSlot(state: TimerState.Live, process: p, clock: c,
                              armed: false, deadline_ns: 0, interval_ns: 0,
                              fires: 0, attachment: 0, refs: 1)
     quota_charge(p, QuotaKind.Timer)
@@ -1826,6 +1828,10 @@ func timer_create(p: Int, c: Int) unsafe -> SyscallResult {
 }
 
 /// The Timer object's ops (spec §2.6).
+///
+/// An invalid Timer (its owner died while this handle named it, spec §2.10)
+/// answers `Arm` and `Disarm` with `Revoked`, after the rights check and, for
+/// `Arm`, the record's checks fault as they would on a live Timer.
 func timer_op(raw_op: UInt, obj: &TimerObject, arg0: UInt,
               arg1: UInt) unsafe -> SyscallResult {
     let p = calling_process()
@@ -1874,6 +1880,9 @@ func timer_arm(p: Int, slot: Int, src: UInt, bytes: UInt) unsafe -> SyscallResul
                          src, bytes) {
         fault_process(p, why)
     }
+    if timer_invalid(slot) {
+        return op_status(SosStatus.Revoked)
+    }
 
     let now = hal.timer_now_ns()
     // Saturating, because `now + after` is arithmetic on a number the process
@@ -1901,9 +1910,22 @@ func timer_arm(p: Int, slot: Int, src: UInt, bytes: UInt) unsafe -> SyscallResul
 /// It clears the fire count as well as the schedule, which makes it a clean
 /// cancel: a caller who wants the fires reads them with a wait first.
 func timer_disarm(slot: Int) unsafe -> SyscallResult {
+    if timer_invalid(slot) {
+        return op_status(SosStatus.Revoked)
+    }
     TIMERS[slot].disarm()
     reprogram_timer()
     op_ok()
+}
+
+/// Whether Timer `slot` is invalid: its owner died while a handle or an
+/// attachment elsewhere named it (spec §2.10).
+func timer_invalid(slot: Int) unsafe -> Bool {
+    match TIMERS[slot].state {
+        case Invalid -> true,
+        case Live -> false,
+        case Free -> false,
+    }
 }
 
 /// Resolve `handle` as something this caller may attach to a Waiter, or
@@ -2039,6 +2061,11 @@ func waitable_slot(p: Int, handle: UInt) unsafe -> Waitable {
 }
 
 /// The Waiter object's ops (spec §2.2).
+///
+/// An invalid Waiter (its owner died while this handle named it, spec §2.10)
+/// answers `Add`, `Remove` and `Wait` with `Revoked`, after the rights check
+/// and each op's argument checks fault as they would on a live Waiter: `Add`'s
+/// flags and target handle, `Wait`'s buffer.
 func waiter_op(raw_op: UInt, obj: &WaiterObject, arg0: UInt, arg1: UInt,
                arg2: UInt) unsafe -> SyscallResult {
     let p = calling_process()
@@ -2104,12 +2131,24 @@ func waiter_op_decoded(op: WaiterOp, obj: &WaiterObject, arg0: UInt, arg1: UInt,
 /// A refusal consumes nothing. Every early return above the commit leaves the
 /// caller's handle exactly as it was, which the typed `Waiter.give` rests on
 /// when it hands the object back in its `Err`.
+///
+/// An invalid Waiter answers `Revoked` once the flags and the target have
+/// passed their checks, and before the one-Waiter and duplicate-key checks:
+/// those ask about the Waiter's attachments, and an invalid Waiter has none
+/// and never will (spec §2.10: an op on an invalid object answers a status).
+/// So attaching an already-attached object through an invalid Waiter answers
+/// `Revoked` rather than faulting.
 func waiter_add(p: Int, w: Int, handle: UInt, key: UInt,
                 flags: UInt) unsafe -> SyscallResult {
     if (flags & ~WAITER_ADD_FLAGS) != 0 {
         fault_process(p, FaultReason.BadArg)
     }
     let target = waitable_slot(p, handle)
+    // Nothing is attached, consumed or woken: the caller keeps its handle, as
+    // on every refusal here.
+    if waiter_invalid(w) {
+        return op_status(SosStatus.Revoked)
+    }
     if waitable_attachment(target.kind, target.slot) != 0 {
         fault_process(p, FaultReason.BadState)
     }
@@ -2167,6 +2206,16 @@ func waiter_add(p: Int, w: Int, handle: UInt, key: UInt,
     op_ok()
 }
 
+/// Whether Waiter `w` is invalid: its owner died while a handle elsewhere named
+/// it (spec §2.10).
+func waiter_invalid(w: Int) unsafe -> Bool {
+    match WAITERS[w].state {
+        case Invalid -> true,
+        case Live -> false,
+        case Free -> false,
+    }
+}
+
 /// The wait machinery's kind, as the object kind the handle table speaks.
 ///
 /// This duplicates `kcore.refs`' private translation, because the consuming
@@ -2195,6 +2244,11 @@ func waitable_obj_of(kind: WaitableKind) -> ObjType {
 /// key is all the authority needed. A handle-based remove could not reach the
 /// stale attachment of a waitable whose handle has been closed.
 func waiter_remove(p: Int, w: Int, key: UInt) unsafe -> SyscallResult {
+    // An invalid Waiter has no attachments, so no key names one; the answer is
+    // that the Waiter is gone, not that the caller misnamed a key.
+    if waiter_invalid(w) {
+        return op_status(SosStatus.Revoked)
+    }
     let a = attached_by_key(w, key)
     if a == NO_ATTACHMENT {
         fault_process(p, FaultReason.BadState)
@@ -2232,6 +2286,11 @@ func waiter_wait(p: Int, w: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
     }
     if let why = copy_out_check(p, dst, wait_record_bytes() as UInt) {
         fault_process(p, why)
+    }
+    // Nothing could ever wake a thread parked on an invalid Waiter, so the
+    // wait is answered at once, with no record.
+    if waiter_invalid(w) {
+        return op_status(SosStatus.Revoked)
     }
 
     let ready = waiter_ready_attachment(w)
@@ -2293,6 +2352,8 @@ func object_invalid(kind: ObjType, slot: Int) unsafe -> Bool {
     match kind {
         case Thread -> THREADS[slot].state == ThreadState.Invalid,
         case Mapping -> MAPPINGS[slot].row == ROW_TARGET_DIED,
+        case Waiter -> waiter_invalid(slot),
+        case Timer -> timer_invalid(slot),
         case _ -> false,
     }
 }
@@ -3106,7 +3167,7 @@ func send_args(p: Int, src: UInt, bytes: UInt, invoking: UInt,
                          src, bytes) {
         fault_process(p, why)
     }
-    check_send(p, &args, invoking, pipe)
+    check_send(p, &args, invoking, NO_HANDLE, pipe)
     args
 }
 
@@ -3114,7 +3175,13 @@ func send_args(p: Int, src: UInt, bytes: UInt, invoking: UInt,
 /// arrives nested inside another: `PipeRequestOp.ReplyWait` copies in a waiter
 /// and a message together, so it has the message already and needs only the
 /// checks. `invoking` and `pipe` are as `send_args` describes them.
-func check_send(p: Int, args: &PipeSendRecord, invoking: UInt,
+///
+/// `kept` is a word the op goes on to use after the message has left, or
+/// `NO_HANDLE`: `ReplyWait`'s Waiter, which its wait leg parks on. A carried
+/// word equal to it is refused too. Carried, the entry would leave the table
+/// with the reply, and if it was the Waiter's last handle the reply's
+/// settlement could free the Waiter under the thread about to park on it.
+func check_send(p: Int, args: &PipeSendRecord, invoking: UInt, kept: UInt,
                 pipe: Int) unsafe {
     if args.len > (PIPE_BODY_BYTES as UInt) {
         fault_process(p, FaultReason.BadArg)
@@ -3123,7 +3190,7 @@ func check_send(p: Int, args: &PipeSendRecord, invoking: UInt,
     while i < PIPE_MSG_HANDLES {
         let word = args.handles[i]
         if word != NO_HANDLE {
-            if word == invoking {
+            if word == invoking || word == kept {
                 fault_process(p, FaultReason.BadArg)
             }
             let entry = lookup_handle(p, word)
@@ -3913,10 +3980,11 @@ func reply_wait_waiter(p: Int, handle: UInt) unsafe -> Int {
 /// Every fault is raised before the obligation is discharged; this is the
 /// function's one real ordering decision. A bad args record, a waiter handle
 /// that names nothing or lacks `Wait`, an oversized body, the request handle
-/// itself among the carried handles, a record buffer outside the caller's
-/// memory all end the process, and all are asked while the request is still
-/// live, so a caller that faults leaves an exchange its client can still be
-/// told about rather than one discharged into a process that no longer exists.
+/// itself or the waiter's word among the carried handles, a record buffer
+/// outside the caller's memory all end the process, and all are asked while the
+/// request is still live, so a caller that faults leaves an exchange its client
+/// can still be told about rather than one discharged into a process that no
+/// longer exists.
 ///
 /// A refused reply returns without parking. The request is consumed either way
 /// (§2.1), but a `PeerClosed` comes straight back with `ReplyWaitLeg.Reply` in
@@ -3944,7 +4012,7 @@ func pipe_reply_wait(p: Int, word: UInt, x: Int, args_src: UInt,
     // bound and the four handle words, on the same terms as a `Reply`. Every
     // one of those refusals is a fault, and every one happens while the
     // obligation is still live.
-    check_send(p, &args.msg, word, NO_PIPE)
+    check_send(p, &args.msg, word, args.waiter, NO_PIPE)
     let w = reply_wait_waiter(p, args.waiter)
     // The wait leg's buffer is validated here, on the call, as `waiter_wait`
     // validates its own: terminating a bad-buffer caller while it is the
@@ -3964,10 +4032,15 @@ func pipe_reply_wait(p: Int, word: UInt, x: Int, args_src: UInt,
         },
     }
 
-    // `waiter_wait`'s tail: the scan first, because by the level-triggered
-    // guarantee a readiness that arrived before this call (including one this
-    // very reply just raised on a claim of another connection) is still there,
-    // and only an empty set parks.
+    // `waiter_wait`'s tail. An invalid Waiter answers `Revoked` with the value
+    // register at zero, `ReplyWaitLeg.Wait`: the reply was written, and it is
+    // the wait that cannot be served. Then the scan, because by the
+    // level-triggered guarantee a readiness that arrived before this call
+    // (including one this very reply just raised on a claim of another
+    // connection) is still there, and only an empty set parks.
+    if waiter_invalid(w) {
+        return op_status(SosStatus.Revoked)
+    }
     let ready = waiter_ready_attachment(w)
     if ready != NO_ATTACHMENT {
         // A delivery can refuse: a message carrying handles needs room in this

@@ -1,0 +1,238 @@
+// A Waiter freed under a parked thread answers the thread before it releases
+// what it watched (spec §2.2).
+//
+// Expected transcript, read as an order:
+//
+//   SOS freecascade: parking
+//   SOS freecascade: the reply answered: <PeerClosed>
+//   SOS freecascade: the parked wait answered: <Revoked>
+//
+// One process, two threads. The initial thread posts a message to a connection
+// of its own and takes it, which makes a claim and an obligation on one
+// exchange, and makes a Waiter. It attaches the obligation to the Waiter
+// one-shot, keeping its handle, and then hands the claim to it (a consuming
+// attachment, so the Waiter's list holds the claim's row first). A worker
+// parks on the Waiter, and the initial thread releases the Waiter's one handle.
+//
+// The free walks the Waiter's list from its head and releases what each row
+// held. Releasing the claim takes the claim column to zero, which raises the
+// obligation's abandoned level, whose row is next on the same list. The worker
+// must already have been answered by then, with `Revoked`. Were it still
+// parked, that level would be delivered to it in the middle of the walk, the
+// one-shot row's detach would miss its row and drop its reference, the walk
+// would drop it again, and the exchange would settle under the initial
+// thread's live obligation handle: the reply through it would stop the
+// machine. As it is, the reply answers `PeerClosed` (the claim was abandoned),
+// and the worker reports `Revoked`.
+//
+// The case drives the C-altitude floor with raw words, because the worker parks
+// on a Waiter the initial thread made, and the typed tier cannot hand a handle
+// between threads.
+
+import sos.{System, SosStatus, ALL_RIGHTS, PIPE_MSG_HANDLES,
+            sos_system_process_self, sos_process_pipe_create,
+            sos_process_waiter_create, sos_pipe_inlet_post,
+            sos_pipe_outlet_take, sos_pipe_request_reply, sos_waiter_add,
+            sos_waiter_wait, sos_handle_release}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The status word a successful op answers with (`SosStatus.Ok`).
+static STATUS_OK: UInt = 0
+
+/// The word that names nothing, which also marks an empty handle slot.
+static NONE: UInt = 0
+
+/// `WaiterOp.Add`'s flag bits, spelled as numbers because this file works at
+/// the C altitude: one-shot is bit 0, consuming bit 1.
+static ADD_ONESHOT: UInt = 1
+static ADD_CONSUMING: UInt = 2
+
+/// The keys the two rows live under.
+static KEY_OBLIGATION: UInt = 1
+static KEY_CLAIM: UInt = 2
+
+/// A send record's words: body address, length, then the handle words.
+static SEND_WORDS: Int = 2 + PIPE_MSG_HANDLES
+
+/// Room for a take record and a wait record, the longest records here.
+static RECORD_WORDS: Int = 64
+
+/// The worker's role, which is its argument.
+static ROLE_WORKER: UInt = 1
+
+static STACK_WORDS: Int = 1024
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+/// The boot handle, parked by the initial thread; a parked one is never 0.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+/// The Waiter's word, parked for the worker, and the worker's answer.
+unsafe static var WAITER_WORD: UInt = 0
+unsafe static var WORKER_STATUS: UInt = 0xDEAD
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func park_boot_handle(word: UInt) unsafe { BOOT_HANDLE = word }
+func parked_boot_handle() unsafe -> UInt { BOOT_HANDLE }
+func park_waiter(word: UInt) unsafe { WAITER_WORD = word }
+func parked_waiter() unsafe -> UInt { WAITER_WORD }
+func set_worker_status(s: UInt) unsafe { WORKER_STATUS = s }
+func worker_status() unsafe -> UInt { WORKER_STATUS }
+
+/// A raw status word as a name, or `None` when this build cannot name it.
+func named_status(raw: UInt) -> SosStatus? {
+    if raw > (UInt8.max as UInt) {
+        return None
+    }
+    SosStatus.from(raw: raw as UInt8)
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        worker()
+    }
+}
+
+/// The worker: park on the Waiter and keep the answer.
+func worker() unsafe {
+    var buf: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+    let status = sos_waiter_wait(parked_waiter(), (&var buf) as UnsafePointer<UInt>,
+                                 (RECORD_WORDS * sizeof<UInt>()) as UInt)
+    set_worker_status(status)
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    let _ = me.exit(0)
+}
+
+/// This process's own Process handle, as a raw word, or `NONE`.
+func ask_process(boot_handle: UInt) unsafe -> UInt {
+    var out: UInt = NONE
+    if sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                               (&var out) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    out
+}
+
+/// A Waiter in `proc`, as a raw word, or `NONE`.
+func ask_waiter(proc: UInt) unsafe -> UInt {
+    var out: UInt = NONE
+    if sos_process_waiter_create(proc, (&var out) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    out
+}
+
+/// Post an empty message and take it. Answers the claim and the obligation, or
+/// `NONE` in the first when a step was refused.
+func claim_and_obligation(proc: UInt) unsafe -> (UInt, UInt) {
+    var ends: [UInt; 2] = [NONE; 2]
+    if sos_process_pipe_create(proc, (&var ends) as UnsafePointer<UInt>,
+                               (2 * sizeof<UInt>()) as UInt) != STATUS_OK {
+        return (NONE, NONE)
+    }
+    // A zero length reads no buffer, so the body address is left empty.
+    var msg: [UInt; SEND_WORDS] = [NONE; SEND_WORDS]
+    var claim: UInt = NONE
+    if sos_pipe_inlet_post(ends[0], (&var msg) as UnsafePointer<UInt>,
+                           (SEND_WORDS * sizeof<UInt>()) as UInt,
+                           (&var claim) as UnsafePointer<UInt>) != STATUS_OK {
+        return (NONE, NONE)
+    }
+    // The take record starts with the obligation's word.
+    var rec: [UInt; RECORD_WORDS] = [NONE; RECORD_WORDS]
+    if sos_pipe_outlet_take(ends[1], (&var rec) as UnsafePointer<UInt>,
+                            (RECORD_WORDS * sizeof<UInt>()) as UInt) != STATUS_OK {
+        return (NONE, NONE)
+    }
+    (claim, rec[0])
+}
+
+/// Reply through `obligation` with an empty message, answering the status.
+func reply_empty(obligation: UInt) unsafe -> UInt {
+    var msg: [UInt; SEND_WORDS] = [NONE; SEND_WORDS]
+    sos_pipe_request_reply(obligation, (&var msg) as UnsafePointer<UInt>,
+                           (SEND_WORDS * sizeof<UInt>()) as UInt)
+}
+
+func fail(system: &System, what: String) {
+    print("SOS freecascade: {}\n", what)
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+func initial(boot_handle: UInt) unsafe {
+    park_boot_handle(boot_handle)
+    let system = System(boot_handle: boot_handle)
+    let me_proc = try system.process_self() catch {
+        fail(&system, "no process handle")
+        return
+    }
+    let me = try me_proc.thread_self() catch {
+        fail(&system, "no thread handle")
+        return
+    }
+
+    let proc = ask_process(boot_handle)
+    let waiter = ask_waiter(proc)
+    let (claim, obligation) = claim_and_obligation(proc)
+    if proc == NONE || waiter == NONE || claim == NONE {
+        fail(&system, "could not make the objects")
+        return
+    }
+    // The obligation first: the list is pushed at its head, so the claim's row
+    // is the one the free walks first.
+    if sos_waiter_add(waiter, obligation, KEY_OBLIGATION, ADD_ONESHOT) != STATUS_OK {
+        fail(&system, "could not attach the obligation")
+        return
+    }
+    if sos_waiter_add(waiter, claim, KEY_CLAIM, ADD_CONSUMING) != STATUS_OK {
+        fail(&system, "could not attach the claim")
+        return
+    }
+    park_waiter(waiter)
+
+    let worker = try me_proc.thread_create(stack_top: stack_top(),
+                                           arg: ROLE_WORKER) catch {
+        fail(&system, "no worker")
+        return
+    }
+    let _ = worker.start()
+    let _ = system.debug_print("SOS freecascade: parking\n")
+    // `start` makes the worker runnable without switching; this yield is what
+    // lets it run and park.
+    let _ = me.yield_now()
+
+    // The Waiter's one handle: the count reaches zero and the Waiter is freed.
+    let _ = sos_handle_release(waiter)
+
+    let replied = reply_empty(obligation)
+    guard let answer = named_status(replied) else {
+        fail(&system, "the reply answered a status this build cannot name")
+        return
+    }
+    print("SOS freecascade: the reply answered: {}\n", answer)
+
+    let _ = try worker.join() catch { 0 }
+    guard let woke = named_status(worker_status()) else {
+        fail(&system, "the worker answered a status this build cannot name")
+        return
+    }
+    print("SOS freecascade: the parked wait answered: {}\n", woke)
+    if answer != SosStatus.PeerClosed || woke != SosStatus.Revoked {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.shutdown(EXIT_OK)
+}

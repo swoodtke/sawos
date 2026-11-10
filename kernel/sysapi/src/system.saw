@@ -22,7 +22,7 @@ import sosabi.{SosStatus, SystemOp, ProcessOp, MemoryOp, IoMemoryOp, MINT_OP,
                SlabKind,
                SystemHandle, ProcessHandle, ThreadHandle, EventHandle,
                WaiterHandle, InterruptHandle, ClockHandle, MemoryHandle,
-               IoMemoryHandle, MappingHandle,
+               IoMemoryHandle, MappingHandle, TimerHandle,
                PipeInletHandle, PipeOutletHandle, PipeReplyHandle,
                PipeRequestHandle,
                NO_HANDLE, BootTagForm, EventMode, ClockType, ProtectionTier,
@@ -68,6 +68,7 @@ import sos.thread
 import sos.event.{Event}
 import sos.interrupt.{Interrupt}
 import sos.clock.{Clock}
+import sos.timer.{Timer}
 import sos.waiter.{AttachMode, Waiter, mode_flag}
 
 // =============================================================================
@@ -745,8 +746,8 @@ extension Process {
     //
     // A handle can be given only if its rights word carries the universal
     // `Transfer` bit. The default sets that carry it belong to System, Process,
-    // Memory, IoMemory, Event, Thread, the pipe ends and the pipe one-shots.
-    // Waiter, Interrupt, Clock, Timer and Mapping handles therefore cannot be
+    // Memory, IoMemory, Event, Thread, Waiter, Timer, the pipe ends and the
+    // pipe one-shots. Interrupt, Clock and Mapping handles therefore cannot be
     // given, and a funnel for one would be a method whose every call is an
     // `AccessDenied` fault. There is no `give(process:)` funnel: a launcher
     // keeps the child's Process handle to supervise with. A kind that must
@@ -1001,6 +1002,57 @@ extension Process {
         owned.handle = ThreadHandle(NO_HANDLE)
         try checked(sos_process_give(self.handle, word, tag, keep as UInt)) catch {
             let back = (error, thread_of(word))
+            return move back
+        }
+        return
+    }
+
+    /// Give a Waiter to this process under `tag`, consuming the wrapper.
+    /// Requires `ProcessRight.Give` here and `WaiterRight.Transfer` on the
+    /// Waiter.
+    ///
+    /// A Waiter is bound to the process that created it, not to whoever holds
+    /// its handle. While that process lives, the child's handle attaches to and
+    /// parks on the Waiter as the giver's would. If it dies, every thread
+    /// parked on the Waiter wakes with `Err(SosStatus.Revoked)`, what was
+    /// attached to it is detached, and every later `add`, `remove`, `wait` and
+    /// `mint` answers `Err(SosStatus.Revoked)` (§2.10).
+    ///
+    /// The funnel contract and the refusal that hands the Waiter back are
+    /// `give(memory:)`'s.
+    public func give(&self, waiter: Waiter,
+                     tag: UInt,
+                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, (SosStatus, Waiter)> {
+        var owned = move waiter
+        let word: UInt = owned.handle
+        owned.handle = WaiterHandle(NO_HANDLE)
+        try checked(sos_process_give(self.handle, word, tag, keep as UInt)) catch {
+            let back: (SosStatus, Waiter) = (error, Waiter(handle: WaiterHandle(word)))
+            return move back
+        }
+        return
+    }
+
+    /// Give a Timer to this process under `tag`, consuming the wrapper.
+    /// Requires `ProcessRight.Give` here and `TimerRight.Transfer` on the
+    /// Timer.
+    ///
+    /// A Timer is bound to the process that created it. If that process dies,
+    /// the Timer is disarmed for good, an attachment on it fires once more with
+    /// a fire count of zero and keeps reporting that until it is removed, and
+    /// every later `arm`, `disarm` and `mint` answers `Err(SosStatus.Revoked)`
+    /// (§2.10).
+    ///
+    /// The funnel contract and the refusal that hands the Timer back are
+    /// `give(memory:)`'s.
+    public func give(&self, timer: Timer,
+                     tag: UInt,
+                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, (SosStatus, Timer)> {
+        var owned = move timer
+        let word: UInt = owned.handle
+        owned.handle = TimerHandle(NO_HANDLE)
+        try checked(sos_process_give(self.handle, word, tag, keep as UInt)) catch {
+            let back: (SosStatus, Timer) = (error, Timer(handle: TimerHandle(word)))
             return move back
         }
         return
@@ -1324,6 +1376,10 @@ public struct BootHandle {
     /// A Thread, on the same terms; `take_thread` is its one door. A launcher
     /// hands a child the thread it is to join.
     thread: thread.Thread?,
+    /// A Waiter, on the same terms; `take_waiter` is its one door.
+    waiter: Waiter?,
+    /// A Timer, on the same terms; `take_timer` is its one door.
+    timer: Timer?,
 }
 
 extension BootHandle: NoCopy {}
@@ -1416,6 +1472,18 @@ extension BootHandle {
     public func take_thread(&var self) -> thread.Thread? {
         self.thread.take()
     }
+
+    /// Take a Waiter out of this record. Same terms as `take_memory`. A record
+    /// left holding one releases it when it drops.
+    public func take_waiter(&var self) -> Waiter? {
+        self.waiter.take()
+    }
+
+    /// Take a Timer out of this record. Same terms as `take_memory`. A record
+    /// left holding one releases it when it drops.
+    public func take_timer(&var self) -> Timer? {
+        self.timer.take()
+    }
 }
 
 /// A `Thread` around `word`. `give(thread:)` builds its hand-back through this
@@ -1441,56 +1509,76 @@ func decode_boot_handle(tag: UInt, kind: UInt, handle: UInt) -> BootHandle {
                                   memory: Memory(handle: MemoryHandle(handle)),
                                   process: None, system: None, iomemory: None,
                                   inlet: None, outlet: None, reply: None,
-                                  request: None, event: None, thread: None),
+                                  request: None, event: None, thread: None,
+                                  waiter: None, timer: None),
         case Process -> BootHandle(tag: tag, kind: what, memory: None,
                                    process: Process(handle: ProcessHandle(handle)),
-                                   system: None, iomemory: None,
-                                   inlet: None, outlet: None, reply: None,
-                                   request: None, event: None, thread: None),
+                                   system: None, iomemory: None, inlet: None,
+                                   outlet: None, reply: None, request: None,
+                                   event: None, thread: None, waiter: None,
+                                   timer: None),
         case System -> BootHandle(tag: tag, kind: what, memory: None,
                                   process: None,
                                   system: System(handle: SystemHandle(handle)),
                                   iomemory: None, inlet: None, outlet: None,
                                   reply: None, request: None, event: None,
-                                  thread: None),
+                                  thread: None, waiter: None, timer: None),
         case IoMemory -> BootHandle(tag: tag, kind: what, memory: None,
                                     process: None, system: None,
                                     iomemory: IoMemory(handle: IoMemoryHandle(handle)),
                                     inlet: None, outlet: None, reply: None,
-                                    request: None, event: None, thread: None),
+                                    request: None, event: None, thread: None,
+                                    waiter: None, timer: None),
         case PipeInlet -> BootHandle(tag: tag, kind: what, memory: None,
-                                     process: None, system: None, iomemory: None,
+                                     process: None, system: None,
+                                     iomemory: None,
                                      inlet: PipeInlet(handle: PipeInletHandle(handle)),
                                      outlet: None, reply: None, request: None,
-                                     event: None, thread: None),
+                                     event: None, thread: None, waiter: None,
+                                     timer: None),
         case PipeOutlet -> BootHandle(tag: tag, kind: what, memory: None,
                                       process: None, system: None,
                                       iomemory: None, inlet: None,
                                       outlet: PipeOutlet(handle: PipeOutletHandle(handle)),
                                       reply: None, request: None, event: None,
-                                      thread: None),
+                                      thread: None, waiter: None, timer: None),
         case PipeReply -> BootHandle(tag: tag, kind: what, memory: None,
-                                     process: None, system: None, iomemory: None,
-                                     inlet: None, outlet: None,
+                                     process: None, system: None,
+                                     iomemory: None, inlet: None, outlet: None,
                                      reply: PipeReply(handle: PipeReplyHandle(handle)),
-                                     request: None, event: None, thread: None),
+                                     request: None, event: None, thread: None,
+                                     waiter: None, timer: None),
         case PipeRequest -> BootHandle(tag: tag, kind: what, memory: None,
                                        process: None, system: None,
-                                       iomemory: None, inlet: None, outlet: None,
-                                       reply: None,
+                                       iomemory: None, inlet: None,
+                                       outlet: None, reply: None,
                                        request: PipeRequest(handle: PipeRequestHandle(handle)),
-                                       event: None, thread: None),
+                                       event: None, thread: None, waiter: None,
+                                       timer: None),
         case Event -> BootHandle(tag: tag, kind: what, memory: None,
                                  process: None, system: None, iomemory: None,
                                  inlet: None, outlet: None, reply: None,
                                  request: None,
                                  event: Event(handle: EventHandle(handle)),
-                                 thread: None),
+                                 thread: None, waiter: None, timer: None),
         case Thread -> BootHandle(tag: tag, kind: what, memory: None,
                                   process: None, system: None, iomemory: None,
                                   inlet: None, outlet: None, reply: None,
                                   request: None, event: None,
-                                  thread: thread.Thread(handle: ThreadHandle(handle))),
+                                  thread: thread.Thread(handle: ThreadHandle(handle)),
+                                  waiter: None, timer: None),
+        case Waiter -> BootHandle(tag: tag, kind: what, memory: None,
+                                  process: None, system: None, iomemory: None,
+                                  inlet: None, outlet: None, reply: None,
+                                  request: None, event: None, thread: None,
+                                  waiter: Waiter(handle: WaiterHandle(handle)),
+                                  timer: None),
+        case Timer -> BootHandle(tag: tag, kind: what, memory: None,
+                                 process: None, system: None, iomemory: None,
+                                 inlet: None, outlet: None, reply: None,
+                                 request: None, event: None, thread: None,
+                                 waiter: None,
+                                 timer: Timer(handle: TimerHandle(handle))),
     }
 }
 

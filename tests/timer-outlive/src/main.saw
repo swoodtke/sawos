@@ -1,0 +1,356 @@
+// A Timer outlives its owner invalid, and a refund never reaches the record
+// the owner left behind (spec §2.10).
+//
+// Expected transcript, read as an order:
+//
+//   SOS timeroutlive: capacity before=8
+//   SOS timeroutlive: started
+//   SOS: process exit: code=52 process=1        <- the owner
+//   SOS: process teardown ... timers=0 process=1
+//   SOS timeroutlive: the parked wait was answered: key=84 fires=0
+//   SOS timeroutlive: waiting again reads key=84 fires=0
+//   SOS timeroutlive: arming it answered: <Revoked>
+//   SOS timeroutlive: disarming it answered: <Revoked>
+//   SOS timeroutlive: minting it answered: <Revoked>
+//   SOS timeroutlive: past its deadlines it reads key=84 fires=0
+//   SOS timeroutlive: the attachment was removed by key
+//   SOS timeroutlive: capacity held=7
+//   SOS: process exit: code=4 process=1         <- the probe, same record
+//   SOS timeroutlive: probe spent 4
+//   SOS timeroutlive: capacity after=8
+//   SOS timeroutlive: done
+//
+// The owner (`child-waitable`, owner role) sends root a Waiter and a Timer and
+// keeps a sibling of the Timer. Root releases the Waiter at once, attaches the
+// Timer to a Waiter of its own and parks on that Waiter. The owner arms the
+// Timer through its sibling, every `OWNER_PERIOD_NS`, and ends.
+//
+// Its death invalidates the Timer, because root still names it, and the
+// attachment fires: the parked wait is answered with the Timer's ordinary
+// record, and the count is zero because the invalidation disarmed it. The
+// level is terminal, so waiting again answers the same record at once, and
+// arming, disarming or minting through root's handle answers `Revoked`. Root
+// then sleeps past several of the periods the owner armed and waits once
+// more: a Timer still firing would have counted them, and the record still
+// reads zero. The attachment is removed by its key. The owner's teardown line
+// counts no Timer: the one it made was invalidated, not freed.
+//
+// Capacity shows the slot is held. Root's Timer quota is unlimited, so the
+// number it can make is the slab's free slots: one fewer while the invalid
+// Timer is held, all of them once it is released.
+//
+// The probe shows the refund. Root lets go of everything that names the dead
+// owner, so its record is reclaimed, and the probe (`child-waitable`, probe
+// role) is created into it. The probe makes one Timer, says so, and waits.
+// Root then releases the invalid Timer, whose free would credit the owner's
+// record if it were still charged there, and that record is now the probe's.
+// The probe then makes Timers until refused. The total is its allowance
+// (`DEFAULT_QUOTA_TIMERS`); a refund that reached it would be one more.
+//
+// One phase per function: root's stack grant is small.
+
+import sos.{System, Process, Memory, Waiter, Timer, Clock, ClockType,
+            PipeInlet, PipeOutlet, PipeMsg, WaitPayload, SystemRight,
+            SosStatus, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tags the child's boot records travel under.
+static TAG_BOOT: UInt = 7
+static TAG_OUTBOX: UInt = 33
+static TAG_PROBE_TIMERS: UInt = 52
+
+/// The keys root's attachments live under.
+static KEY_MSG: UInt = 81
+static KEY_PROBE: UInt = 82
+static KEY_READY: UInt = 83
+static KEY_TIMER: UInt = 84
+static KEY_SLEEP: UInt = 85
+
+/// The owner's Timer's period (`child-waitable`'s `OWNER_PERIOD_NS`), and how
+/// long root sleeps after the death: several periods.
+static OWNER_PERIOD_NS: UInt64 = 5_000_000
+static SLEEP_NS: UInt64 = 25_000_000
+
+/// How many Timers a child may hold at once (`DEFAULT_QUOTA_TIMERS`).
+static TIMER_ALLOWANCE: UInt = 4
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.ClockGet | SystemRight.Transfer)
+
+/// The owner's exit code, and the kind half of a §8 status word for a process
+/// that exited.
+static OWNER_DONE: UInt = 52
+static EXITED: UInt = 1 << 16
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS timeroutlive: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
+        print("SOS timeroutlive: no clock: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc, &clock) catch {
+        print("SOS timeroutlive: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS timeroutlive: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process, clock: &Clock) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    let before = count_timers(&clock)
+    print("SOS timeroutlive: capacity before={}\n", before)
+
+    let outbox = try proc.pipe_create()
+    let (outbox_in, outbox_out) = move outbox
+    let timer = try outlive(&system, &proc, &clock, &image, &ram,
+                            move outbox_in, &outbox_out)
+
+    let held = count_timers(&clock)
+    print("SOS timeroutlive: capacity held={}\n", held)
+    if held != before - 1 {
+        return BUG
+    }
+
+    // The owner's record is free now. The probe lands in it.
+    let spent = try refund(&system, &proc, &image, &ram, move timer)
+    print("SOS timeroutlive: probe spent {}\n", spent)
+    if spent != TIMER_ALLOWANCE {
+        let _ = system.debug_print("SOS timeroutlive: a refund reached the probe\n")
+        return BUG
+    }
+
+    let after = count_timers(&clock)
+    print("SOS timeroutlive: capacity after={}\n", after)
+    if after != before {
+        return BUG
+    }
+    return
+}
+
+/// Launch the owner, take its Timer, and watch the owner's death invalidate
+/// it. Nothing of root's names the owner when this returns, so its record is
+/// reclaimed.
+func outlive(system: &System, proc: &Process, clock: &Clock, image: &Memory,
+             ram: &Memory, outbox: PipeInlet,
+             inbox: &PipeOutlet) -> Result<Timer, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let mail = try proc.waiter_create()
+    try mail.add(outlet: &inbox, key: KEY_MSG)
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(inlet: move outbox, tag: TAG_OUTBOX) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    let _ = system.debug_print("SOS timeroutlive: started\n")
+
+    let woke = try mail.wait()
+    if woke.key != KEY_MSG {
+        return BUG
+    }
+    let got = try inbox.take()
+    let (arrived, request) = move got
+    var msg = move arrived
+    // The owner's Waiter is not this case's subject: releasing it here frees
+    // it while the owner lives.
+    let _ = try msg_waiter(&var msg, 0)
+    let timer = try msg_timer(&var msg, 1)
+
+    let watch = try proc.waiter_create()
+    try watch.add(timer: &timer, key: KEY_TIMER)
+
+    // The owner waits on its claim until this request goes, then arms the
+    // Timer and ends itself. This thread parks in the wait below before the
+    // owner runs again.
+    let _ = move request
+    let fired = try watch.wait()
+    print("SOS timeroutlive: the parked wait was answered: key={} fires={}\n",
+          fired.key, fires_of(&fired.what))
+
+    let again = try watch.wait()
+    print("SOS timeroutlive: waiting again reads key={} fires={}\n",
+          again.key, fires_of(&again.what))
+
+    try revoked(timer.arm(after_ns: OWNER_PERIOD_NS), "arming it")
+    try revoked(timer.disarm(), "disarming it")
+    match timer.mint() {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS timeroutlive: minting it succeeded\n")
+            return BUG
+        },
+        case Err(why) -> {
+            print("SOS timeroutlive: minting it answered: {}\n", why)
+            if why != SosStatus.Revoked {
+                return BUG
+            }
+        },
+    }
+
+    try doze(&proc, &clock, SLEEP_NS)
+    let late = try watch.wait()
+    print("SOS timeroutlive: past its deadlines it reads key={} fires={}\n",
+          late.key, fires_of(&late.what))
+
+    try watch.remove(KEY_TIMER)
+    let _ = system.debug_print("SOS timeroutlive: the attachment was removed by key\n")
+
+    // The owner's status is read from the record before the handle goes.
+    let status = try child.get_status()
+    if status != EXITED + OWNER_DONE {
+        print("SOS timeroutlive: the owner ended {}\n", status)
+        return BUG
+    }
+    let _ = move child
+    return move timer
+}
+
+/// The fire count a delivered record carries, or `UInt.max` for any other
+/// record.
+func fires_of(what: &WaitPayload) -> UInt {
+    match what {
+        case Timer(fires) -> fires,
+        case _ -> UInt.max,
+    }
+}
+
+/// `answer` must be `Err(Revoked)`; say what it was.
+func revoked(answer: Result<Void, SosStatus>,
+             which: String) -> Result<Void, SosStatus> {
+    match answer {
+        case Ok(_) -> {
+            print("SOS timeroutlive: {} succeeded\n", which)
+            return BUG
+        },
+        case Err(why) -> {
+            print("SOS timeroutlive: {} answered: {}\n", which, why)
+            if why != SosStatus.Revoked {
+                return BUG
+            }
+        },
+    }
+    return
+}
+
+/// Sleep `ns` on a Timer and a Waiter of root's own, both released on return.
+func doze(proc: &Process, clock: &Clock, ns: UInt64) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    let timer = try clock.timer_create()
+    try waiter.add(timer: &timer, key: KEY_SLEEP)
+    try timer.arm(after_ns: ns)
+    let _ = try waiter.wait()
+    return
+}
+
+/// Take the Waiter out of slot `at` of a delivered message.
+func msg_waiter(msg: &var PipeMsg, at: Int) -> Result<Waiter, SosStatus> {
+    guard let carried = msg.handles[at].take() else { return BUG }
+    match carried {
+        case Waiter(w) -> { return move w },
+        case _ -> { return BUG },
+    }
+}
+
+/// Take the Timer out of slot `at` of a delivered message.
+func msg_timer(msg: &var PipeMsg, at: Int) -> Result<Timer, SosStatus> {
+    guard let carried = msg.handles[at].take() else { return BUG }
+    match carried {
+        case Timer(tm) -> { return move tm },
+        case _ -> { return BUG },
+    }
+}
+
+/// Create the probe, let it make its first Timer, release the invalid Timer
+/// and send the probe on. Answers how many Timers the probe made in all.
+func refund(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+            timer: Timer) -> Result<UInt, SosStatus> {
+    let probe = try system.process_create(image: &image, memory: &ram)
+    let go = try proc.pipe_create()
+    let (go_in, go_out) = move go
+    let ready = try proc.pipe_create()
+    let (ready_in, ready_out) = move ready
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(outlet: &ready_out, key: KEY_READY)
+    try waiter.add(process: &probe, key: KEY_PROBE)
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try probe.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try probe.give(outlet: move go_out, tag: TAG_PROBE_TIMERS) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try probe.give(inlet: move ready_in, tag: TAG_OUTBOX) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try probe.start(boot_tag: TAG_BOOT)
+
+    let woke = try waiter.wait()
+    if woke.key != KEY_READY {
+        return BUG
+    }
+    let got = try ready_out.take()
+    let (msg, request) = move got
+    let _ = move msg
+    let _ = move request
+
+    // The probe holds its first Timer. If this release credited the owner's
+    // record, it would credit the probe's.
+    let _ = move timer
+
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    let claim = try go_in.post(body: &body, len: 1)
+    let _ = move claim
+
+    let ended = try waiter.wait()
+    if ended.key != KEY_PROBE {
+        return BUG
+    }
+    match ended.what {
+        case Process(status) -> { return status - EXITED },
+        case _ -> { return BUG },
+    }
+}
+
+/// Make Timers until the slab refuses, each held in its own frame while the
+/// next is asked for, and answer how many.
+func count_timers(clock: &Clock) -> UInt {
+    let t = try clock.timer_create() catch { return 0 }
+    let n = count_timers(&clock)
+    let _ = move t
+    return n + 1
+}
