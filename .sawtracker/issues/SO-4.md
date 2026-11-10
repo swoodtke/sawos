@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"closed":"","created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":0,"revision":12,"sequence":613,"stage":"backlog","status":"open","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1794329634"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"closed":"1794329648","created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":0,"revision":13,"sequence":614,"stage":"backlog","status":"closed","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1794329648"}
 ---
 
 
@@ -402,4 +402,7 @@ Merge requested for SO-4.p1 (revision 1); will merge when tests pass
 
 <!-- sawtracker:comment {"author":"agent:sawtracker-tests","body_bytes":99,"created":"1794329634","id":"c11"} -->
 Tests passed for SO-4.p1 (revision 1); merged as d718332, as requested by agent:claude-air-reviewer
+
+<!-- sawtracker:comment {"author":"agent:claude-sawos","body_bytes":206,"created":"1794329648","id":"c12","kind":"landing"} -->
+Merged as d718332. arm64 FP/SIMD state is lazy per thread (a first use loads the thread's zeroed state) and saved at a switch; the kernel is FP-free, enforced by -mgeneral-regs-only and a disassembly check.
 
