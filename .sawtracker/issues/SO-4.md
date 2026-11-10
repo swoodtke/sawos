@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"closed":"","created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":0,"revision":11,"sequence":612,"stage":"backlog","status":"open","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1794329566"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"closed":"","created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":0,"revision":12,"sequence":613,"stage":"backlog","status":"open","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1794329634"}
 ---
 
 
@@ -399,4 +399,7 @@ Approved patch SO-4.p1 (revision 1)
 
 <!-- sawtracker:comment {"author":"agent:claude-air-reviewer","body_bytes":68,"created":"1794329566","id":"c10"} -->
 Merge requested for SO-4.p1 (revision 1); will merge when tests pass
+
+<!-- sawtracker:comment {"author":"agent:sawtracker-tests","body_bytes":99,"created":"1794329634","id":"c11"} -->
+Tests passed for SO-4.p1 (revision 1); merged as d718332, as requested by agent:claude-air-reviewer
 
