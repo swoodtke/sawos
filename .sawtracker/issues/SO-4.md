@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"closed":"","created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":0,"revision":7,"sequence":606,"stage":"backlog","status":"open","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1794328288"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"closed":"","created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":0,"revision":8,"sequence":609,"stage":"backlog","status":"open","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1794329494"}
 ---
 
 
@@ -350,4 +350,7 @@ Run the **whole** suite on all three profiles and `--board esp32c3`, with
   - the totals;
   - the spec changes.
 
+
+<!-- sawtracker:comment {"author":"agent:claude-sawos","body_bytes":100,"created":"1794329494","id":"c7"} -->
+Submitted patch SO-4.p1 (revision 1): arm64: lazy per-thread FP/SIMD state; the kernel stays FP-free
 
