@@ -255,6 +255,7 @@ import kcore.waitables.{
     EventSlot,
     INTERRUPTS,
     InterruptSlot,
+    InterruptState,
     WAITERS,
     Waitable,
     WaitableKind,
@@ -432,6 +433,16 @@ func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt, arg1: UInt,
             }
             stats_region_map(p, arg0, arg1)
         },
+        // Binding an IRQ line is the strongest creation authority, and a line
+        // is a machine-wide resource, so the op is System's and its faults land
+        // on the caller. A launcher strips the bit from everything that is not
+        // a binder; a driver is given the bound Interrupt, not the bit.
+        case InterruptBind -> {
+            if not obj.allows(SystemRight.InterruptBind) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            interrupt_bind(p, arg0)
+        },
     }
 }
 
@@ -598,16 +609,6 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
                 fault_process(p, FaultReason.AccessDenied)
             }
             waiter_create(obj.slot)
-        },
-        // Binding an IRQ line is the strongest creation authority. It flows
-        // through the same handle because the Process object is what an
-        // Interrupt is charged to, and a launcher strips the bit from
-        // everything that is not a driver.
-        case InterruptBind -> {
-            if not obj.allows(ProcessRight.InterruptBind) {
-                fault_process(p, FaultReason.AccessDenied)
-            }
-            interrupt_bind(obj.slot, arg0)
         },
         // Phase two of the two-phase lifecycle, asked of the child's handle:
         // `obj.slot` is the process being started, not the caller. The right is
@@ -1442,9 +1443,10 @@ func event_create_moded(p: Int, mode: EventMode) unsafe -> SyscallResult {
     op_value(handle)
 }
 
-/// Bind `line` to a new Interrupt in process `p` (spec §2 table, §9).
+/// Bind `line` to a new Interrupt, whose one handle goes into caller `p`'s
+/// table (spec §2 table, §9).
 ///
-/// Three refusals, all faults, all caller-checkable:
+/// Three refusals, all faults on the caller, all caller-checkable:
 ///
 ///   - A line this machine does not have. A driver names a number out of its
 ///     own device's description, so a number outside the board's line space is
@@ -1456,7 +1458,13 @@ func event_create_moded(p: Int, mode: EventMode) unsafe -> SyscallResult {
 ///     not.
 ///   - A line already bound. Two Interrupts on one line would be two objects
 ///     with one `pending` between them and two acks for one fire, so the second
-///     bind is refused rather than serialized.
+///     bind is refused rather than serialized. An invalid Interrupt does not
+///     hold its line, so a line whose Interrupt was destroyed is free at once.
+///
+/// A full Interrupt slab is `NoResource`, with no Interrupt quota asked first:
+/// there is no such row, because at most one Interrupt is live per line and the
+/// slab bounds the rest. The new handle is charged to the caller's `Handle` row
+/// by the mint, as any handle is.
 ///
 /// The line is unmasked on success, the initial state §9's cycle needs
 /// (mask-on-fire, ack-to-rearm): something has to arm it first and creation is
@@ -1470,9 +1478,6 @@ func interrupt_bind(p: Int, line: UInt) unsafe -> SyscallResult {
         fault_process(p, FaultReason.LineBound)
     }
 
-    if not quota_room(p, QuotaKind.Interrupt) {
-        return op_status(SosStatus.QuotaExceeded)
-    }
     let slot = alloc_interrupt()
     if slot == NO_INTERRUPT {
         return op_status(SosStatus.NoResource)
@@ -1481,10 +1486,8 @@ func interrupt_bind(p: Int, line: UInt) unsafe -> SyscallResult {
     if handle == NO_HANDLE {
         return op_status(mint_refusal(p))
     }
-    INTERRUPTS[slot] = InterruptSlot(state: SlotState.Live, process: p,
-                                     line: line, pending: false, attachment: 0,
-                                     refs: 1)
-    quota_charge(p, QuotaKind.Interrupt)
+    INTERRUPTS[slot] = InterruptSlot(state: InterruptState.Live, line: line,
+                                     pending: false, attachment: 0, refs: 1)
     hal.irq_unmask(line)
     op_value(handle)
 }
@@ -2115,7 +2118,8 @@ func waiter_op_decoded(op: WaiterOp, obj: &WaiterObject, arg0: UInt, arg1: UInt,
 ///   - `WAITER_ADD_CONSUMING`: the op releases the caller's handle entry, and
 ///     the attachment owns the object from here on. It is the transfer funnel's
 ///     kernel half: one op rather than an add followed by a release, which
-///     would cost the very trap the pattern exists to save.
+///     would cost the very trap the pattern exists to save. On an Interrupt
+///     target it is a `BadArg` fault: the handle is the Interrupt's one name.
 ///
 /// A word with any other bit set is a `BadArg` fault (§5.7): the set is
 /// published, so the caller could have checked.
@@ -2144,6 +2148,17 @@ func waiter_add(p: Int, w: Int, handle: UInt, key: UInt,
         fault_process(p, FaultReason.BadArg)
     }
     let target = waitable_slot(p, handle)
+    // An Interrupt is the one waitable that cannot be consumed: its handle is
+    // its one name and the only thing that can `Ack` it, so an attachment that
+    // owned it would leave a driver with a line it can never acknowledge. The
+    // flags asked for something the target's kind excludes, which the caller
+    // could have checked.
+    if (flags & WAITER_ADD_CONSUMING) != 0 {
+        match target.kind {
+            case Interrupt -> fault_process(p, FaultReason.BadArg),
+            case _ -> {},
+        }
+    }
     // Nothing is attached, consumed or woken: the caller keeps its handle, as
     // on every refusal here.
     if waiter_invalid(w) {
@@ -2204,6 +2219,16 @@ func waiter_add(p: Int, w: Int, handle: UInt, key: UInt,
         wake_one_waiter(w, a)
     }
     op_ok()
+}
+
+/// Whether Interrupt `slot` is invalid: its one name went while an attachment
+/// still held it (spec §2.10).
+func interrupt_invalid(slot: Int) unsafe -> Bool {
+    match INTERRUPTS[slot].state {
+        case Invalid -> true,
+        case Live -> false,
+        case Free -> false,
+    }
 }
 
 /// Whether Waiter `w` is invalid: its owner died while a handle elsewhere named
@@ -2354,6 +2379,11 @@ func object_invalid(kind: ObjType, slot: Int) unsafe -> Bool {
         case Mapping -> MAPPINGS[slot].row == ROW_TARGET_DIED,
         case Waiter -> waiter_invalid(slot),
         case Timer -> timer_invalid(slot),
+        // No handle names an invalid Interrupt (releasing the last name is what
+        // invalidates it), and `MINT_OP` faults on the missing `Mint` right
+        // before it asks, so no path reaches this arm. It keeps the match
+        // total over the kinds that have an invalid state.
+        case Interrupt -> interrupt_invalid(slot),
         case _ -> false,
     }
 }

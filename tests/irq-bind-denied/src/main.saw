@@ -1,0 +1,38 @@
+// Binding a line needs `SystemRight.InterruptBind` on the System handle used
+// (spec §2.8), and a handle without it is the `AccessDenied` fault like any
+// op's missing right.
+//
+// Root holds the right, because every System right starts in the boot handle
+// (attenuation is monotonic). It mints a sibling that keeps only `Debug` and
+// `Transfer`, so the bit is absent by silence from the keep mask, and binds
+// through the sibling. The kernel terminates the caller; the transcript reads:
+//
+//   SOS binddenied: binding through a System handle without the right
+//   SOS: process fault: access denied
+
+import sos.{System, SystemRight}
+
+static EXIT_FAILED: UInt = 1
+
+/// A line both machines wire and neither asserts unasked.
+static QUIET_LINE: UInt = 5
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let weak = try system.mint(rights: SystemRight.Debug | SystemRight.Transfer) catch {
+        print("SOS binddenied: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let _ = system.debug_print(
+        "SOS binddenied: binding through a System handle without the right\n")
+
+    // Does not return: the kernel terminates this process.
+    let _ = weak.interrupt_bind(line: QUIET_LINE)
+
+    let _ = system.debug_print("SOS binddenied: still alive, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

@@ -49,9 +49,6 @@ import uartproto.{UartOp, UartBody, op_of, payload_len, payload_byte}
 /// whoever handed it over.
 static UART_BASE: UInt = 0x1000_0000
 
-/// The interrupt line this board wires the console to.
-static UART_IRQ: UInt = 10
-
 // =============================================================================
 // The NS16550A, through the granted window
 // =============================================================================
@@ -354,10 +351,10 @@ func run(proc: &Process) -> Result<Report, SosStatus> {
     var outlet_rec = try proc.boot_handle_next()
     guard let outlet = outlet_rec.take_outlet() else { return BUG }
 
-    // The line becomes an object, and the object is waitable. It spends
-    // `ProcessRight.InterruptBind`, which arrived on the handle `ProcessSelf`
-    // minted and is therefore not something this driver's launcher granted.
-    let irq = try proc.interrupt_bind(line: UART_IRQ)
+    // The line arrives the same way, an Interrupt its launcher bound and gave
+    // under a tag. The object is waitable, and this handle is its one name.
+    var irq_rec = try proc.boot_handle_next()
+    guard let irq = irq_rec.take_interrupt() else { return BUG }
     let waiter = try proc.waiter_create()
     try waiter.add(&irq, KEY_IRQ)
 

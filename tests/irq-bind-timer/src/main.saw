@@ -1,0 +1,35 @@
+// The kernel's own timer line is not for rent (spec §2.8): binding it faults
+// the caller with `BadArg`, as a line the board does not have does. A process
+// holding it could mask the tick and never yield.
+//
+// The number is a board fact userspace cannot see, so each target links its own
+// answer (`tests/irq-lines`). On riscv32 the timer's line lies above every
+// source the PLIC wires, so the board refuses it too; on arm64 it is an
+// ordinary controller line and only the kernel's policy refuses it. The
+// transcript reads:
+//
+//   SOS bindtimer: binding the kernel timer's line
+//   SOS: process fault: argument outside its domain
+
+import sos.{System}
+
+static EXIT_FAILED: UInt = 1
+
+// The kernel timer's interrupt line on the board this image runs on, answered
+// by the target's own C file (`tests/irq-lines`).
+extern "C" {
+    func timer_irq_line() -> UInt
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let _ = system.debug_print("SOS bindtimer: binding the kernel timer's line\n")
+
+    // Does not return: the kernel terminates this process.
+    let _ = system.interrupt_bind(line: timer_irq_line())
+
+    let _ = system.debug_print("SOS bindtimer: still alive, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

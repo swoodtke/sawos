@@ -1,0 +1,102 @@
+// A give the kernel refuses for capacity hands an Interrupt back usable
+// (spec §3).
+//
+// Root creates a child it never starts and gives it masked System siblings, one
+// tag each, until the child's handle budget refuses one with `QuotaExceeded`.
+// It then binds a line and gives the Interrupt: the child's table is still at
+// its budget, so the give is refused with the same status. The refusal is a
+// status, so the kernel left root's entry in place, and `Process.give` returns
+// the Interrupt in its error payload. Nothing was released, so the line is
+// still bound: root attaches the returned Interrupt to a Waiter, which spends
+// the `Wait` right the refused give did not disturb, and then releases it,
+// which unbinds the line, so binding it again succeeds. A line still bound at
+// that point would be a `LineBound` fault ending root.
+
+import sos.{System, Process, Interrupt, SystemRight, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The first boot tag. Each give takes the next one, so no tag repeats and the
+/// only refusal left to meet is the budget's.
+static TAG_FIRST: UInt = 40
+
+/// The tag of the Interrupt give, distinct from every sibling's.
+static TAG_LINE: UInt = 90
+
+/// A line both machines wire and neither asserts unasked.
+static LINE: UInt = 5
+
+static KEY: UInt = 60
+
+/// What each sibling carries: `Transfer` so it can be given at all.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS irqreturns: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS irqreturns: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS irqreturns: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var image = try proc.boot_handle_next()
+    var dest = try proc.boot_handle_next()
+    guard let image_mem = image.take_memory() else { return SosStatus.BadImage }
+    guard let dest_mem = dest.take_memory() else { return SosStatus.BadImage }
+
+    // The child stays `Created`, so every give below is legal and the boot set
+    // never freezes.
+    let child = try system.process_create(image: &image_mem, memory: &dest_mem)
+
+    var given: UInt = 0
+    while true {
+        let sibling = try system.mint(rights: CHILD_SYSTEM)
+        try child.give(system: move sibling, tag: TAG_FIRST + given) catch {
+            let (why, back) = move error
+            print("SOS irqreturns: gave {} siblings then refused: {}\n",
+                  given, why)
+            let _ = move back
+            break
+        }
+        given = given + 1
+    }
+
+    let line = try system.interrupt_bind(line: LINE)
+    let irq = try returned(&child, move line)
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(interrupt: &irq, key: KEY)
+    let _ = system.debug_print("SOS irqreturns: the returned Interrupt attached\n")
+
+    // The release is the destruction: the line is free at once.
+    let _ = move irq
+    let again = try system.interrupt_bind(line: LINE)
+    let _ = system.debug_print("SOS irqreturns: released it, rebound the line\n")
+    let _ = move again
+    return
+}
+
+/// Give `line` to the child; the give must be refused, and the Interrupt comes
+/// back.
+func returned(child: &Process, line: Interrupt) -> Result<Interrupt, SosStatus> {
+    try child.give(interrupt: move line, tag: TAG_LINE) catch {
+        let (why, back) = move error
+        print("SOS irqreturns: the Interrupt give was refused: {}\n", why)
+        return move back
+    }
+    print("SOS irqreturns: the Interrupt give was not refused\n")
+    return SosStatus.BadImage
+}

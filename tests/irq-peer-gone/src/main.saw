@@ -1,0 +1,149 @@
+// A thread parked on an attached Interrupt is woken when the Interrupt is
+// destroyed (spec §2.2's peer-gone doctrine, §2.10): the attachment fires, so
+// the waiter is never stranded on a line that can no longer fire.
+//
+// Root binds a line, attaches it to its own Waiter, gives the Interrupt to a
+// child (`child-hold`, which sleeps first, so root is parked before anything
+// happens) and parks. The Interrupt's destruction wakes root with its key and
+// the board's no-line value, `line=0`. It runs twice:
+//
+//   persistent  the child exits holding the Interrupt, and its teardown
+//               destroys it. The attachment stays: a second wait reads the
+//               same record (terminal level), and `remove` frees the invalid
+//               slot.
+//   one-shot    the child releases the Interrupt explicitly. The delivery
+//               detaches the attachment, which drops the last reference inside
+//               the destruction itself, so the slot is free as soon as root
+//               wakes.
+//
+// The capacity counts bind lines above the one under test until the slab
+// refuses, as `irq-attached` does; 4 is the whole slab.
+
+import sos.{System, Process, Memory, Interrupt, Waiter, AttachMode, SystemRight,
+            SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Lines both machines wire and neither asserts unasked.
+static LINE_PERSISTENT: UInt = 5
+static LINE_ONESHOT: UInt = 5
+
+/// The first line the capacity count binds.
+static FIRST_PROBE_LINE: UInt = 6
+
+static TAG_BOOT: UInt = 7
+static TAG_LINE: UInt = 31
+static TAG_RELEASE: UInt = 32
+static KEY: UInt = 91
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.ClockGet | SystemRight.Transfer)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS irqpeergone: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS irqpeergone: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS irqpeergone: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    // The region table lists both images, then both destinations.
+    var img_a = try proc.boot_handle_next()
+    var img_b = try proc.boot_handle_next()
+    var ram_a = try proc.boot_handle_next()
+    var ram_b = try proc.boot_handle_next()
+    guard let image_a = img_a.take_memory() else { return BUG }
+    guard let image_b = img_b.take_memory() else { return BUG }
+    guard let dest_a = ram_a.take_memory() else { return BUG }
+    guard let dest_b = ram_b.take_memory() else { return BUG }
+    try round(&system, &proc, &image_a, &dest_a, LINE_PERSISTENT,
+              AttachMode.Persistent, 0)
+    try round(&system, &proc, &image_b, &dest_b, LINE_ONESHOT,
+              AttachMode.OneShot, 1)
+    return
+}
+
+/// One round: bind, attach, give to a fresh child that exits, wake.
+func round(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+           line: UInt, mode: AttachMode,
+           oneshot: UInt) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let irq = try system.interrupt_bind(line: line)
+    let waiter = try proc.waiter_create()
+    try waiter.add(interrupt: &irq, key: KEY, mode: mode)
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(interrupt: move irq, tag: TAG_LINE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    // The marker that tells the child to release the Interrupt itself.
+    if oneshot != 0 {
+        let marker = try system.mint(rights: SystemRight.Transfer)
+        try child.give(system: move marker, tag: TAG_RELEASE) catch {
+            let (why, back) = move error
+            let _ = move back
+            return why
+        }
+    }
+    try child.start(boot_tag: TAG_BOOT)
+
+    // Parks: nothing is ready until the child's teardown destroys the line.
+    try woke(&waiter, oneshot, 1)
+    if oneshot == 0 {
+        try woke(&waiter, oneshot, 2)
+        print("SOS irqpeergone: persistent, capacity with it invalid={}\n",
+              count_free(&system, FIRST_PROBE_LINE))
+        try waiter.remove(KEY)
+    }
+    print("SOS irqpeergone: round {} done, capacity={}\n", oneshot,
+          count_free(&system, FIRST_PROBE_LINE))
+    return
+}
+
+/// Wait once and report the record, which must be the attachment's.
+func woke(waiter: &Waiter, oneshot: UInt, nth: UInt) -> Result<Void, SosStatus> {
+    let got = try waiter.wait()
+    if got.key != KEY {
+        return BUG
+    }
+    match got.what {
+        case Interrupt(line) -> {
+            print("SOS irqpeergone: round {} wait {} key={} line={}\n",
+                  oneshot, nth, got.key, line)
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
+
+/// Bind lines from `line` up until the slab refuses, each Interrupt held in
+/// its own frame while the next is asked for, and answer how many were bound.
+func count_free(system: &System, line: UInt) -> UInt {
+    let irq = try system.interrupt_bind(line: line) catch { return 0 }
+    let n = count_free(&system, line + 1)
+    let _ = move irq
+    return n + 1
+}

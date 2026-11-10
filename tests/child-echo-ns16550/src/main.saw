@@ -10,9 +10,12 @@
 // ns16550`): same register block, addresses, enable bit, drain loop and console
 // lines. Three things differ, all about being a child:
 //
-//   1. The window arrives by give rather than as a boot region row. The drain
-//      call is identical (`boot_handle_next` + `take_iomemory`): the receiver
-//      cannot tell whether the kernel or a launcher queued the record.
+//   1. The window and the line arrive by give rather than as a boot region row
+//      and a bind of its own. The drain call is identical (`boot_handle_next` +
+//      `take_iomemory`): the receiver cannot tell whether the kernel or a
+//      launcher queued the record. The line is an Interrupt its launcher bound
+//      and gave (`take_interrupt`); this child holds exactly that line and no
+//      authority to bind another.
 //   2. It ends with `Process.exit`, not `System.shutdown`. Its System handle is
 //      a masked sibling of root's (`Debug | ProcessSelf | ClockGet |
 //      Transfer`), so it cannot stop the machine.
@@ -27,7 +30,8 @@
 //   0. obtain the window      drain the boot set for the `IoMemory` its
 //                             launcher gave it and `Process.map(iomemory:)` it
 //                             into this process
-//   1. bind the line          `Process.interrupt_bind(line:)`
+//   1. obtain the line        drain the boot set for the `Interrupt` its
+//                             launcher bound and gave it
 //   2. watch it               `Waiter.add(&interrupt, key)`
 //   3. enable the device      write its own interrupt-enable register; the
 //                             kernel never touches it, because the register is
@@ -68,9 +72,6 @@ import sosrt.{ascii_byte}
 /// the hardware is, whoever handed it over. The address is a fact about the
 /// device, so the driver's constant does not depend on how the window arrived.
 static UART_BASE: UInt = 0x1000_0000
-
-/// The interrupt line this board wires the console to.
-static UART_IRQ: UInt = 10
 
 /// The key this driver attaches under. It is the driver's own word (the kernel
 /// stores it and hands it back unread), so a dispatcher watching several
@@ -226,13 +227,18 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS echo: window mapped\n")
 
-    // Bind the interrupt: the line becomes an object, and the object is
-    // waitable. The kernel unmasks the line here; the device is still quiet,
-    // because its own enable bit is set below. This spends
-    // `ProcessRight.InterruptBind`, which arrived on the handle `ProcessSelf`
-    // minted, not from the launcher; see `driver-child`.
-    let irq = try proc.interrupt_bind(line: UART_IRQ) catch {
+    // The line. Its launcher bound it (the kernel unmasked it then; the device
+    // is still quiet, because its own enable bit is set below) and gave the
+    // Interrupt under a tag, behind the window. The Interrupt is waitable, and
+    // this handle is its one name: dropping it, or ending this process, unbinds
+    // the line.
+    var line_record = try proc.boot_handle_next() catch {
         print("SOS echo: no interrupt: {}\n", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    guard let irq = line_record.take_interrupt() else {
+        let _ = system.debug_print("SOS echo: boot record is not an interrupt\n")
         let _ = proc.exit(EXIT_FAILED)
         return
     }

@@ -337,6 +337,36 @@ extension System {
         return Clock(handle: ClockHandle(raw))
     }
 
+    /// Bind IRQ `line` to an Interrupt (spec §2's row and §9's delivery).
+    /// Requires `SystemRight.InterruptBind`.
+    ///
+    /// A line is a machine-wide resource, so binding is a System answer and its
+    /// faults land on this process. The line is a number the caller chooses,
+    /// so it is spelled as one, as for `event_create`'s mode. A launcher knows
+    /// its board's lines from the board's own description; the kernel checks
+    /// the number against the board and terminates the caller for a line this
+    /// machine does not have, the timer's line, or one already bound. All three
+    /// are caller-checkable. A full Interrupt slab is
+    /// `SosStatus.NoResource`. The handle is charged to the caller's `Handle`
+    /// row like any mint; there is no Interrupt row.
+    ///
+    /// The Interrupt has one name, the handle returned here: it cannot be
+    /// minted from, and releasing it unbinds the line and makes it bindable
+    /// again at once. A launcher gives it to the driver that services the line
+    /// (`Process.give(interrupt:)`), so the driver holds the lines it was given
+    /// and no authority to bind another.
+    ///
+    /// The line comes back unmasked, which is §9's starting state: the object
+    /// exists, the controller will deliver, and the first fire masks it until
+    /// an `ack`. The kernel does not touch the device's own interrupt-enable
+    /// register; that is behind the driver's granted window and is the driver's
+    /// to write.
+    public func interrupt_bind(&self, line: UInt) -> Result<Interrupt, SosStatus> {
+        let raw = try call_value(self.handle, SystemOp.InterruptBind as UInt,
+                                 line, 0, 0)
+        return Interrupt(handle: InterruptHandle(raw))
+    }
+
     /// What this platform can deny: `Isolated` or `Flat`, and nothing else.
     /// Requires `SystemRight.TierGet`.
     ///
@@ -542,7 +572,7 @@ public struct ProcessStats {
 /// not mere tidiness: dead records still held are what fill the record table.
 ///
 /// The factory methods (`thread_create`, `event_create`, `waiter_create`,
-/// `interrupt_bind`, `pipe_create`) act on the process the handle names,
+/// `pipe_create`) act on the process the handle names,
 /// whether or not that is the caller: that process is charged and its table
 /// receives the new handles. On a handle onto another process the returned
 /// words belong to that process's table, so in the caller's table the
@@ -655,26 +685,6 @@ extension Process {
         return Waiter(handle: WaiterHandle(raw))
     }
 
-    /// Bind IRQ `line` to an Interrupt (spec §2's row and §9's delivery).
-    /// Requires `ProcessRight.InterruptBind`.
-    ///
-    /// The line is a number the caller chooses, so it is spelled as one, as for
-    /// `event_create`'s mode. A driver knows its device's line from the
-    /// device's own description; the kernel checks it against the board and
-    /// terminates the process for a line this machine does not have, the
-    /// timer's line, or one already bound. All three are caller-checkable.
-    ///
-    /// The line comes back unmasked, which is §9's starting state: the object
-    /// exists, the controller will deliver, and the first fire masks it until
-    /// an `ack`. The kernel does not touch the device's own interrupt-enable
-    /// register; that is behind the driver's granted window and is the driver's
-    /// to write.
-    public func interrupt_bind(&self, line: UInt) -> Result<Interrupt, SosStatus> {
-        let raw = try call_value(self.handle, ProcessOp.InterruptBind as UInt,
-                                 line, 0, 0)
-        return Interrupt(handle: InterruptHandle(raw))
-    }
-
     /// Phase two: run this process, handing it nothing in its first argument
     /// register. Requires `ProcessRight.Start`, a right on the child's handle
     /// (the one `process_create` handed back).
@@ -746,8 +756,8 @@ extension Process {
     //
     // A handle can be given only if its rights word carries the universal
     // `Transfer` bit. The default sets that carry it belong to System, Process,
-    // Memory, IoMemory, Event, Thread, Waiter, Timer, the pipe ends and the
-    // pipe one-shots. Interrupt, Clock and Mapping handles therefore cannot be
+    // Memory, IoMemory, Event, Thread, Waiter, Timer, Interrupt, the pipe ends
+    // and the pipe one-shots. Clock and Mapping handles therefore cannot be
     // given, and a funnel for one would be a method whose every call is an
     // `AccessDenied` fault. There is no `give(process:)` funnel: a launcher
     // keeps the child's Process handle to supervise with. A kind that must
@@ -1053,6 +1063,33 @@ extension Process {
         owned.handle = TimerHandle(NO_HANDLE)
         try checked(sos_process_give(self.handle, word, tag, keep as UInt)) catch {
             let back: (SosStatus, Timer) = (error, Timer(handle: TimerHandle(word)))
+            return move back
+        }
+        return
+    }
+
+    /// Give an Interrupt to this process under `tag`, consuming the wrapper.
+    /// Requires `ProcessRight.Give` here and `InterruptRight.Transfer` on the
+    /// Interrupt.
+    ///
+    /// This is how a driver gets its line: a launcher holding
+    /// `SystemRight.InterruptBind` binds it (`System.interrupt_bind`) and gives
+    /// the one handle to the process that services it, which holds that line
+    /// and no authority to bind another (§9). The give moves the Interrupt's
+    /// one name and unbinds nothing; `keep` narrows what the driver holds
+    /// (`InterruptRight.Wait` and `.Ack`).
+    ///
+    /// The funnel contract and the refusal that hands the Interrupt back are
+    /// `give(memory:)`'s: a refused give leaves the line bound and the
+    /// returned wrapper usable.
+    public func give(&self, interrupt: Interrupt,
+                     tag: UInt,
+                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, (SosStatus, Interrupt)> {
+        var owned = move interrupt
+        let word: UInt = owned.handle
+        owned.handle = InterruptHandle(NO_HANDLE)
+        try checked(sos_process_give(self.handle, word, tag, keep as UInt)) catch {
+            let back: (SosStatus, Interrupt) = (error, Interrupt(handle: InterruptHandle(word)))
             return move back
         }
         return
@@ -1380,6 +1417,10 @@ public struct BootHandle {
     waiter: Waiter?,
     /// A Timer, on the same terms; `take_timer` is its one door.
     timer: Timer?,
+    /// An Interrupt, on the same terms; `take_interrupt` is its one door. A
+    /// launcher binds a line and hands the driver that services it the one
+    /// handle.
+    interrupt: Interrupt?,
 }
 
 extension BootHandle: NoCopy {}
@@ -1484,6 +1525,15 @@ extension BootHandle {
     public func take_timer(&var self) -> Timer? {
         self.timer.take()
     }
+
+    /// Take an Interrupt out of this record. Same terms as `take_memory`.
+    ///
+    /// A record left holding one releases it when it drops, and an Interrupt
+    /// has one name, so that destroys it: the line is unbound and bindable
+    /// again.
+    public func take_interrupt(&var self) -> Interrupt? {
+        self.interrupt.take()
+    }
 }
 
 /// A `Thread` around `word`. `give(thread:)` builds its hand-back through this
@@ -1510,75 +1560,82 @@ func decode_boot_handle(tag: UInt, kind: UInt, handle: UInt) -> BootHandle {
                                   process: None, system: None, iomemory: None,
                                   inlet: None, outlet: None, reply: None,
                                   request: None, event: None, thread: None,
-                                  waiter: None, timer: None),
+                                  waiter: None, timer: None, interrupt: None),
         case Process -> BootHandle(tag: tag, kind: what, memory: None,
                                    process: Process(handle: ProcessHandle(handle)),
                                    system: None, iomemory: None, inlet: None,
                                    outlet: None, reply: None, request: None,
                                    event: None, thread: None, waiter: None,
-                                   timer: None),
+                                   timer: None, interrupt: None),
         case System -> BootHandle(tag: tag, kind: what, memory: None,
                                   process: None,
                                   system: System(handle: SystemHandle(handle)),
                                   iomemory: None, inlet: None, outlet: None,
                                   reply: None, request: None, event: None,
-                                  thread: None, waiter: None, timer: None),
+                                  thread: None, waiter: None, timer: None, interrupt: None),
         case IoMemory -> BootHandle(tag: tag, kind: what, memory: None,
                                     process: None, system: None,
                                     iomemory: IoMemory(handle: IoMemoryHandle(handle)),
                                     inlet: None, outlet: None, reply: None,
                                     request: None, event: None, thread: None,
-                                    waiter: None, timer: None),
+                                    waiter: None, timer: None, interrupt: None),
         case PipeInlet -> BootHandle(tag: tag, kind: what, memory: None,
                                      process: None, system: None,
                                      iomemory: None,
                                      inlet: PipeInlet(handle: PipeInletHandle(handle)),
                                      outlet: None, reply: None, request: None,
                                      event: None, thread: None, waiter: None,
-                                     timer: None),
+                                     timer: None, interrupt: None),
         case PipeOutlet -> BootHandle(tag: tag, kind: what, memory: None,
                                       process: None, system: None,
                                       iomemory: None, inlet: None,
                                       outlet: PipeOutlet(handle: PipeOutletHandle(handle)),
                                       reply: None, request: None, event: None,
-                                      thread: None, waiter: None, timer: None),
+                                      thread: None, waiter: None, timer: None, interrupt: None),
         case PipeReply -> BootHandle(tag: tag, kind: what, memory: None,
                                      process: None, system: None,
                                      iomemory: None, inlet: None, outlet: None,
                                      reply: PipeReply(handle: PipeReplyHandle(handle)),
                                      request: None, event: None, thread: None,
-                                     waiter: None, timer: None),
+                                     waiter: None, timer: None, interrupt: None),
         case PipeRequest -> BootHandle(tag: tag, kind: what, memory: None,
                                        process: None, system: None,
                                        iomemory: None, inlet: None,
                                        outlet: None, reply: None,
                                        request: PipeRequest(handle: PipeRequestHandle(handle)),
                                        event: None, thread: None, waiter: None,
-                                       timer: None),
+                                       timer: None, interrupt: None),
         case Event -> BootHandle(tag: tag, kind: what, memory: None,
                                  process: None, system: None, iomemory: None,
                                  inlet: None, outlet: None, reply: None,
                                  request: None,
                                  event: Event(handle: EventHandle(handle)),
-                                 thread: None, waiter: None, timer: None),
+                                 thread: None, waiter: None, timer: None, interrupt: None),
         case Thread -> BootHandle(tag: tag, kind: what, memory: None,
                                   process: None, system: None, iomemory: None,
                                   inlet: None, outlet: None, reply: None,
                                   request: None, event: None,
                                   thread: thread.Thread(handle: ThreadHandle(handle)),
-                                  waiter: None, timer: None),
+                                  waiter: None, timer: None, interrupt: None),
         case Waiter -> BootHandle(tag: tag, kind: what, memory: None,
                                   process: None, system: None, iomemory: None,
                                   inlet: None, outlet: None, reply: None,
                                   request: None, event: None, thread: None,
                                   waiter: Waiter(handle: WaiterHandle(handle)),
-                                  timer: None),
+                                  timer: None, interrupt: None),
         case Timer -> BootHandle(tag: tag, kind: what, memory: None,
                                  process: None, system: None, iomemory: None,
                                  inlet: None, outlet: None, reply: None,
                                  request: None, event: None, thread: None,
                                  waiter: None,
-                                 timer: Timer(handle: TimerHandle(handle))),
+                                 timer: Timer(handle: TimerHandle(handle)),
+                                 interrupt: None),
+        case Interrupt -> BootHandle(tag: tag, kind: what, memory: None,
+                                     process: None, system: None,
+                                     iomemory: None, inlet: None, outlet: None,
+                                     reply: None, request: None, event: None,
+                                     thread: None, waiter: None, timer: None,
+                                     interrupt: Interrupt(handle: InterruptHandle(handle))),
     }
 }
 

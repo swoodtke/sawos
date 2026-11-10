@@ -1,0 +1,96 @@
+// An Interrupt cannot be consumed into an attachment (spec §2.2, §2.10): its
+// handle is its one name and the only thing that can `Ack` it, so a Waiter that
+// owned it would leave a driver with a line it could never acknowledge. The
+// consuming flag on an Interrupt target is a `BadArg` fault: the flags word
+// asks for something the target's kind excludes.
+//
+// The typed tier has no `Waiter.give(interrupt:)` to spell it, so this drives
+// the C-altitude floor with raw words, as `pipe-reply-wait-self` does. The
+// transcript reads:
+//
+//   SOS irqconsume: attaching an Interrupt with the consuming flag
+//   SOS: process fault: argument outside its domain
+
+import sos.{System, sos_system_process_self, sos_process_waiter_create,
+            sos_system_interrupt_bind, sos_waiter_add, ALL_RIGHTS}
+
+static EXIT_FAILED: UInt = 1
+
+/// The status word a successful op answers with (`SosStatus.Ok`).
+static STATUS_OK: UInt = 0
+
+/// The word that names nothing.
+static NONE: UInt = 0
+
+/// A line both machines wire and neither asserts unasked.
+static QUIET_LINE: UInt = 5
+
+static KEY: UInt = 71
+
+/// `WAITER_ADD_CONSUMING`, the flag the kernel refuses on an Interrupt.
+static ADD_CONSUMING: UInt = 2
+
+/// This process's own Process handle, as a raw word, or `NONE`.
+func ask_process(boot_handle: UInt) unsafe -> UInt {
+    var out: UInt = NONE
+    let status = sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NONE
+    }
+    out
+}
+
+/// A Waiter in `proc`, as a raw word, or `NONE`.
+func ask_waiter(proc: UInt) unsafe -> UInt {
+    var out: UInt = NONE
+    let status = sos_process_waiter_create(proc,
+                                           (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NONE
+    }
+    out
+}
+
+/// An Interrupt on `line`, bound through `system`, as a raw word, or `NONE`.
+func ask_interrupt(system: UInt, line: UInt) unsafe -> UInt {
+    var out: UInt = NONE
+    let status = sos_system_interrupt_bind(system, line,
+                                           (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NONE
+    }
+    out
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = ask_process(boot_handle)
+    if proc == NONE {
+        let _ = system.debug_print("SOS irqconsume: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let waiter = ask_waiter(proc)
+    if waiter == NONE {
+        let _ = system.debug_print("SOS irqconsume: no waiter\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let irq = ask_interrupt(boot_handle, QUIET_LINE)
+    if irq == NONE {
+        let _ = system.debug_print("SOS irqconsume: no interrupt\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let _ = system.debug_print("SOS irqconsume: attaching an Interrupt with the consuming flag\n")
+
+    // Does not return: the kernel terminates this process.
+    let status = sos_waiter_add(waiter, irq, KEY, ADD_CONSUMING)
+
+    print("SOS irqconsume: the attach answered status={}\n", status)
+    let _ = system.shutdown(EXIT_FAILED)
+}

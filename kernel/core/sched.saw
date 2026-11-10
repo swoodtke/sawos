@@ -26,7 +26,6 @@ import kcore.limits.{
     MAX_ATTACHMENTS,
     MAX_EVENTS,
     MAX_HANDLES,
-    MAX_INTERRUPTS,
     MAX_MAPPINGS,
     MAX_TIMERS,
     MAX_WAITERS,
@@ -75,12 +74,10 @@ import kcore.waitables.{
     ATTACHMENTS,
     Attachment,
     INTERRUPTS,
-    InterruptSlot,
     WAITERS,
     WaitableKind,
     WaiterSlot,
     WaiterState,
-    detach_attachment,
     set_waitable_attachment,
     unblock_process,
 }
@@ -317,17 +314,18 @@ func invalidate_timer(t: Int, p: Int) unsafe {
 /// End process `p`. Never returns.
 ///
 /// Teardown is unconditional: every handle in the process's table is closed,
-/// every thread it owns stops running, and every Interrupt and Mapping it owned
-/// goes back to its slab. A thread that had not exited is invalidated; one that
-/// had keeps its exit code. Either goes back to the pool when nothing names it
-/// any more, and one still named elsewhere outlives the process, disowned. A
-/// Waiter or Timer goes back when nothing names it any more; one still named
-/// elsewhere is invalidated and outlives the process, disowned. An Event goes
-/// back when nothing names it any more; one that is still named elsewhere
-/// outlives the process, disowned (`reap_unreferenced`). Its trap counters are
-/// copied into its record, and its body (the handle table, the boot set and the
-/// grant record) is freed for the next create. The record stays, `Gone`, for as
-/// long as a reference names it.
+/// every thread it owns stops running, and every Mapping it owned goes back to
+/// its slab. An Interrupt it held is destroyed by the close-all (its line is
+/// masked and bindable again) and goes back when nothing names it any more. A
+/// thread that had not exited is invalidated; one that had keeps its exit code.
+/// Either goes back to the pool when nothing names it any more, and one still
+/// named elsewhere outlives the process, disowned. A Waiter or Timer goes back
+/// when nothing names it any more; one still named elsewhere is invalidated and
+/// outlives the process, disowned. An Event goes back when nothing names it any
+/// more; one that is still named elsewhere outlives the process, disowned
+/// (`reap_unreferenced`). Its trap counters are copied into its record, and its
+/// body (the handle table, the boot set and the grant record) is freed for the
+/// next create. The record stays, `Gone`, for as long as a reference names it.
 /// Then:
 ///
 ///   - Process 0 (root, init) stops the machine. Its children die with it,
@@ -476,7 +474,13 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // process owned and something else still names, and count what they freed
     // for the report. Freeing by reference here would collapse those counts.
     // `unref_teardown`'s docstring carries the argument.
+    //
+    // An Interrupt is destroyed by this drop (`drop_reference`), not by a
+    // sweep: its one name is the handle in this table, so the line is masked
+    // and bindable again here, and an attachment on another process's Waiter
+    // fires. The count of those is the teardown line's `interrupts=`.
     var closed: UInt = 0
+    var irqs_destroyed: UInt = 0
     var h: Int = 0
     while body != NO_BODY && h < MAX_HANDLES {
         let entry = PROCESSES[body].handles[h]
@@ -486,6 +490,10 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
                 unref_teardown(entry.obj_type, entry.target)
                 unbind_handle(p, h)
                 closed = closed + 1
+                match entry.obj_type {
+                    case Interrupt -> { irqs_destroyed = irqs_destroyed + 1 },
+                    case _ -> {},
+                }
             },
         }
         h = h + 1
@@ -591,40 +599,21 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
         a = a + 1
     }
 
-    // The Interrupt sweep. Masking each line is not just bookkeeping: a device
-    // the dead process was driving may still be asserting, and an unmasked
-    // line with no object behind it would be taken, reported and masked once
-    // per fire forever. Spec §9 masks on fire and unmasks on ack; here the mask
-    // happens with no ack coming.
-    //
-    //   - This process's Interrupts are freed by owner. One still attached is
-    //     attached to another process's Waiter, which this process held a
-    //     handle to: the attachment is detached first, so that no Waiter keeps
-    //     a row naming a freed slot. It is detached without firing, which is
-    //     intended until an Interrupt is invalidated rather than freed (spec
-    //     §2.10's not-yet-enforced Interrupt items): a thread parked on that
-    //     Waiter for this line is not told.
-    //   - Another process's Interrupt that nothing names any more is freed
-    //     too, uncounted: its last name was an attachment on one of this
-    //     process's Waiters, dropped by the attachment sweep above.
-    var irqs_freed: UInt = 0
+    // The Interrupt sweep. The close-all has already destroyed the Interrupts
+    // this process held (`drop_reference`): each is masked, unbound and
+    // `Invalid`, and its slot waits only for what still names it. This frees
+    // the ones nothing names any more, whoever's they were: the one handle was
+    // in this process's table and there was no attachment, or the last
+    // attachment was on one of this process's Waiters, dropped by the
+    // attachment sweep above. An invalid Interrupt still attached to another
+    // process's Waiter stays, and its attachment has already fired.
     var q: Int = 0
     while q < INTERRUPTS.capacity() {
         match INTERRUPTS[q].state {
             case Free -> {},
-            case Live -> {
-                if INTERRUPTS[q].process == p {
-                    let held = INTERRUPTS[q].attachment
-                    if held != 0 {
-                        detach_attachment(ATTACHMENTS[held - 1].waiter, held - 1)
-                    }
-                    hal.irq_mask(INTERRUPTS[q].line)
-                    INTERRUPTS[q] = InterruptSlot(state: SlotState.Free,
-                                                  process: 0, line: 0,
-                                                  pending: false, attachment: 0,
-                                                  refs: 0)
-                    irqs_freed = irqs_freed + 1
-                } else if INTERRUPTS[q].refs == 0 {
+            case Live -> {},
+            case Invalid -> {
+                if INTERRUPTS[q].refs == 0 {
                     free_object(ObjType.Interrupt, q)
                 }
             },
@@ -741,9 +730,9 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // Events are freed or disowned by the reap, which answers the count the
     // teardown line reports. Threads, Waiters and Timers were swept above:
     // invalidated or disowned by ownership, freed by count. Interrupts were
-    // swept by ownership. Mappings are swept below: a Mapping is not subject to
-    // the hazard above because `mapping_rights()` withholds `Transfer`, so its
-    // handle cannot leave the owning process.
+    // destroyed by the close-all and swept by count. Mappings are swept below:
+    // a Mapping is not subject to the hazard above because `mapping_rights()`
+    // withholds `Transfer`, so its handle cannot leave the owning process.
     let events_freed = reap_unreferenced(p)
 
     // Mappings come apart from both ends, which is why this loop has two arms.
@@ -865,9 +854,9 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     uart.write_str(" waiters=")
     uart.write_hex(waiters_freed)
     uart.write_str(" interrupts=")
-    uart.write_hex(irqs_freed)
-    // No `clocks=` field: this line counts what the process owned, and a Clock
-    // is owned by nobody.
+    uart.write_hex(irqs_destroyed)
+    // No `clocks=` field: this line counts what the process owned or held, and
+    // a Clock is owned by nobody and not counted.
     uart.write_str(" timers=")
     uart.write_hex(timers_freed)
     // The process number (the record's index) comes last, so the fields before

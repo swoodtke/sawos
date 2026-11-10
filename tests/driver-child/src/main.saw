@@ -7,6 +7,7 @@
 //
 //   SOS driverchild: created            <- an inert process, table empty
 //   SOS driverchild: gave the window    <- `Transfer` spent; root lost it
+//   SOS driverchild: gave the line      <- root bound it; the child holds it
 //   SOS driverchild: started
 //   SOS echo: window mapped             <- the child, mapping what it was given
 //   SOS echo: driver up
@@ -23,9 +24,11 @@
 // window nowhere afterwards. `window mapped` is the child calling
 // `Process.map(iomemory:)` on its own Process handle: what crosses the boundary
 // is authority over a device, and where the row goes is then the holder's
-// business. The echoed bytes exercise every step at once (give, drain, map,
-// bind, enable, park and wake) across a process boundary, on a device the
-// kernel has no driver for.
+// business. `gave the line` is the same move for the line:
+// `System.interrupt_bind` in root, then `ProcessOp.Give` over the Interrupt,
+// which spends `Transfer` and moves its one name. The echoed bytes exercise
+// every step at once (give, drain, map, enable, park, wake and ack) across a
+// process boundary, on a device the kernel has no driver for.
 //
 // The park is the child's death and there is no timer. A driver waits on the
 // harness typing at a real serial port, which takes far longer than any fixed
@@ -35,9 +38,14 @@
 // arms none.
 //
 // What root does not do is the other half of the claim. It never maps the
-// device, never binds the line, never reads a register and never learns the
-// UART's address: `UART_BASE` appears nowhere in this file. Root's whole part
-// is deciding who gets the window.
+// device, never reads a register and never learns the UART's address:
+// `UART_BASE` appears nowhere in this file. Root's whole part is deciding who
+// gets the window and the line. The line is the one thing it does name: root
+// holds `SystemRight.InterruptBind`, binds it with `System.interrupt_bind` and
+// gives the bound Interrupt away, so the driver holds that line and no
+// authority to bind another (spec §9). A line number is a fact about the board,
+// so it comes from the one C file this package links per target, and this file
+// stays arch-free.
 
 import sos.{System, Process, Memory, IoMemory, BootHandle, Waiter, WaitResult,
             WaitPayload, SosStatus, SystemRight}
@@ -61,12 +69,20 @@ static KEY: UInt = 66
 /// and needs no tag test, as in the root-as-driver twin.
 static TAG_BOOT: UInt = 31
 static TAG_WINDOW: UInt = 32
+static TAG_LINE: UInt = 33
+
+// The console UART's interrupt line on the board this image runs on, answered
+// by the target's own C file (`tests/irq-lines`).
+extern "C" {
+    func driver_irq_line() -> UInt
+}
 
 /// The policy is a whitelist. What a driver child of this launcher may ask its
 /// System object for: print, learn its own Process object, read the clock.
-/// `Shutdown`, `ProcessCreate` and `Mint` are absent by silence, which is the
-/// keep mask's polarity: a System right added later is denied to every child
-/// configured with this mask.
+/// `Shutdown`, `ProcessCreate`, `InterruptBind` and `Mint` are absent by
+/// silence, which is the keep mask's polarity: a System right added later is
+/// denied to every child configured with this mask. The child is given its line
+/// and cannot bind another.
 ///
 /// `ClockGet` is in the mask and this driver never spends it, deliberately: the
 /// mask is what a launcher grants a driver, and a driver with a device to
@@ -188,15 +204,31 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS driverchild: gave the window\n")
 
+    // The line. Root binds it and gives the one Interrupt handle away under its
+    // own tag, behind the window in the child's boot set. The give moves the
+    // Interrupt's one name: the line stays bound, now to the child, and root
+    // can neither ack it nor bind the line again while the child lives. When
+    // the child's handle goes (its release, or its teardown) the line is
+    // unbound and free.
+    let line = try system.interrupt_bind(line: driver_irq_line()) catch {
+        print("SOS driverchild: bind failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try child.give(interrupt: move line, tag: TAG_LINE) catch {
+        print("SOS driverchild: give line failed: {}\n", error.0)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS driverchild: gave the line\n")
+
     // The child's own authority over itself is what makes it a driver, and root
-    // does not grant it here. Two Process rights are spent inside the child,
-    // `InterruptBind` to bind the console's line and `Map` to install the
-    // window in its own domain. Both arrive on the handle
-    // `SystemOp.ProcessSelf` mints for it, which carries the Process
-    // default set. So the mask above does not reach those two bits: only the
-    // child can narrow the handle it derives, through `ProcessSelf`'s own keep
-    // mask (spec §9). This driver child is exactly the process that should hold
-    // both bits.
+    // does not grant it here. One Process right is spent inside the child:
+    // `Map`, to install the window in its own domain. It arrives on the handle
+    // `SystemOp.ProcessSelf` mints for it, which carries the Process default
+    // set. So the mask above does not reach that bit: only the child can narrow
+    // the handle it derives, through `ProcessSelf`'s own keep mask (spec §9).
+    // This driver child is exactly the process that should hold it.
     try child.start(boot_tag: TAG_BOOT) catch {
         print("SOS driverchild: start failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)

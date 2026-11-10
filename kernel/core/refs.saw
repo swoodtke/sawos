@@ -7,12 +7,12 @@
 //!   `unref_object`   something no longer does; zero frees, right here
 //!   `free_object`    the slot goes back and the kind's last rites run
 //!
-//! The answers differ per kind (an Interrupt masks its line, a Timer reprograms
-//! the comparator, a Waiter detaches its list and wakes what is parked on it, a
-//! Mapping deliberately leaves its protection row installed), which is why this
-//! is a matrix of three functions in one place. A kind added to `ObjType` fails
-//! to compile in all three until someone says what references it; a `_` arm
-//! here would destroy that property.
+//! The answers differ per kind (an Interrupt masks its line when its one name
+//! goes, a Timer reprograms the comparator, a Waiter detaches its list and
+//! wakes what is parked on it, a Mapping deliberately leaves its protection row
+//! installed), which is why this is a matrix of three functions in one place. A
+//! kind added to `ObjType` fails to compile in all three until someone says
+//! what references it; a `_` arm here would destroy that property.
 //!
 //! `PipeInlet` and `PipeOutlet` are two counted kinds over one connection slot
 //! with two reference columns. `PipeReply` and `PipeRequest` are two counted
@@ -30,9 +30,10 @@
 //! reference (regions, IO windows, pipe connections, Events);
 //! `reap_unreferenced` frees what nobody names and disowns the rest (see the
 //! block above it). Threads, Waiters and Timers are invalidated by owner and
-//! freed by count in `end_process`'s per-kind sweeps. Interrupts and Mappings
-//! are swept by owner, and the Interrupt sweep also frees another process's
-//! Interrupt that nothing names any more.
+//! freed by count in `end_process`'s per-kind sweeps. Mappings are swept by
+//! owner. An Interrupt has no owner: releasing its one handle destroys it
+//! (`drop_reference`), including in the close-all, and the Interrupt sweep
+//! frees the invalid ones nothing names any more.
 //!
 //! This file also holds delivery, readiness becoming a woken thread. The ledger
 //! and delivery are mutually recursive: a delivery drops a reference (one-shot
@@ -133,6 +134,7 @@ import kcore.waitables.{
     EventSlot,
     INTERRUPTS,
     InterruptSlot,
+    InterruptState,
     WAITERS,
     WaitAnswer,
     WaitableKind,
@@ -143,6 +145,7 @@ import kcore.waitables.{
     clear_pending_call,
     tie_call_reply,
     detach_attachment,
+    interrupt_names,
     set_waitable_attachment,
     waitable_answer,
     waitable_attachment,
@@ -225,9 +228,9 @@ func pipe_frees_now(slot: Int) unsafe -> Bool {
 /// The zero test before the subtraction is not defensive: a teardown zeroes the
 /// slots a process owned, so a later decrement from another process's close-all
 /// can arrive at a slot whose count is already gone. Nothing is taken then, and
-/// nothing reached zero. The Thread arm is the exception: a thread slot is only
-/// ever freed at zero, never zeroed under its namers, so a decrement at zero
-/// there is an undercount, and it stops the machine.
+/// nothing reached zero. The Thread and Interrupt arms are the exceptions:
+/// their slots are only ever freed at zero, never zeroed under their namers, so
+/// a decrement at zero there is an undercount, and it stops the machine.
 func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
     match kind {
         case Event -> {
@@ -240,10 +243,36 @@ func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
             WAITERS[slot].refs = WAITERS[slot].refs - 1
             WAITERS[slot].refs == 0
         },
+        // The one kind whose last name is not its last reference: an
+        // attachment is a reference and not a name. The drop that takes the
+        // names to zero destroys the Interrupt (`destroy_interrupt`) whether or
+        // not an attachment still holds the slot, so the answer is "free it
+        // now" only when nothing holds it either.
+        //
+        // Reentrancy: the destruction fires the attachment, and a one-shot
+        // attachment detaches at that delivery and drops the last reference,
+        // which frees the slot under us. The state is read again afterwards
+        // for that, as `PipeInlet`'s arm does for its connection.
         case Interrupt -> {
-            if INTERRUPTS[slot].refs == 0 { return false }
+            if INTERRUPTS[slot].refs == 0 {
+                fatal_kernel("an interrupt reference was dropped twice",
+                             slot as UInt)
+            }
             INTERRUPTS[slot].refs = INTERRUPTS[slot].refs - 1
-            INTERRUPTS[slot].refs == 0
+            match INTERRUPTS[slot].state {
+                case Live -> {
+                    if interrupt_names(slot) == 0 {
+                        destroy_interrupt(slot)
+                    }
+                },
+                case Invalid -> {},
+                case Free -> {},
+            }
+            match INTERRUPTS[slot].state {
+                case Free -> false,
+                case Live -> false,
+                case Invalid -> INTERRUPTS[slot].refs == 0,
+            }
         },
         case Timer -> {
             if TIMERS[slot].refs == 0 { return false }
@@ -389,6 +418,32 @@ func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
     }
 }
 
+/// Destroy Interrupt `slot`: its one name is gone (spec §2.10).
+///
+/// The line is masked and unbound, and bindable again at once, even while an
+/// attachment holds the slot. A device the holder was driving may still be
+/// asserting, and an unmasked line with no object behind it would be taken,
+/// reported and masked once per fire forever; spec §9 masks on fire and
+/// unmasks on ack, and here the mask happens with no ack coming. The slot
+/// becomes `Invalid` before the attachment is told, because the record the
+/// delivery writes reads the state: it carries `hal.IRQ_NONE` and never the old
+/// line, which may be bound to another Interrupt by then.
+///
+/// An attachment on it is told now: the Interrupt is ready for good
+/// (`waitable_ready`), so a waiter is never stranded on a line that can no
+/// longer fire. Unlike the other bound kinds there is no handle left to learn
+/// it from at the next op, so the record is the only news.
+///
+/// The delivery may free the slot (a one-shot attachment detaches at it), so
+/// this function reads nothing after the notify, and its caller
+/// (`drop_reference`) re-reads the state and `refs` to learn whether it did.
+func destroy_interrupt(slot: Int) unsafe {
+    hal.irq_mask(INTERRUPTS[slot].line)
+    INTERRUPTS[slot].state = InterruptState.Invalid
+    INTERRUPTS[slot].pending = false
+    notify_ready(WaitableKind.Interrupt, slot)
+}
+
 /// Give exchange `x`'s ring slot back, and tell whoever is waiting for room on
 /// the connection's client end.
 ///
@@ -435,17 +490,22 @@ public(package) func unref_object(kind: ObjType, slot: Int) unsafe {
 /// reference fewer, and objects other processes own must see that) and the
 /// sweeps, plus `reap_unreferenced`, do the freeing.
 ///
-/// For the objects a sweep frees by owner (the dying process's Interrupts and
-/// Mappings) the two agree by construction: the sweep zeroes the slot, count
-/// included, so nothing is left half-counted.
+/// For the objects a sweep frees by owner (the dying process's Mappings) the
+/// two agree by construction: the sweep zeroes the slot, count included, so
+/// nothing is left half-counted.
+///
+/// An Interrupt's destruction is not deferred by this: the close-all's drop of
+/// its one handle runs `destroy_interrupt` like any release, and only the
+/// slot's return waits for the sweep.
 ///
 /// A Process whose count reaches zero here is not freed either. A `Gone` record
 /// whose last reference this was (a handle in the close-all, or an attachment
 /// in the attachment sweep) is reclaimed by the process scan at the end of
 /// `reap_unreferenced`. A Thread whose count reaches zero here is freed by
 /// `end_process`'s thread sweep, whichever process it belongs to, once it has
-/// exited or been invalidated. A Waiter, Interrupt or Timer whose count reaches
-/// zero here is freed by that kind's sweep, whichever process it belongs to.
+/// exited or been invalidated. A Waiter or Timer whose count reaches zero here
+/// is freed by that kind's sweep, whichever process it belongs to; an
+/// Interrupt, which is bound to no process, by the Interrupt sweep.
 public(package) func unref_teardown(kind: ObjType, slot: Int) unsafe {
     let _ = drop_reference(kind, slot)
 }
@@ -495,9 +555,9 @@ public(package) func revoke_blocked(w: Int) unsafe {
 /// Three kinds have something to say to the machine or the rest of the kernel
 /// on the way out:
 ///
-///   - An Interrupt masks its line. An unmasked line with no object behind it
-///     would be taken, reported and masked once per fire forever. Masking also
-///     makes the line bindable again.
+///   - An Interrupt masks its line, but not here: its last rites run when its
+///     last name goes (`destroy_interrupt`), which may be well before the slot
+///     is given back, so the free only returns an already-invalid slot.
 ///   - A Timer reprograms the comparator, so the kernel does not keep waking
 ///     itself for a dropped deadline.
 ///   - A Waiter wakes what is parked on it and then detaches its attachment
@@ -506,14 +566,16 @@ public(package) func revoke_blocked(w: Int) unsafe {
 ///
 /// One kind deliberately does less: see the `Mapping` arm.
 ///
-/// The quota is credited against the slot's own `process` field (creator pays):
-/// whoever was charged gets it back, whichever process dropped the last handle.
-/// A shared kind, and a Waiter or Timer, credits through `credit_shared`, which
-/// credits nobody when the charged process's death has disowned the object: a
-/// shared one outlives its owner live, and a Waiter or Timer outlives it
-/// invalid, its charge already refunded.
-/// `Mapping`, `Process` and `Thread` have no credit here, each for the reason
-/// given in its arm.
+/// The quota is credited against the slot's own `process` field (creator pays)
+/// for the kinds that have one: whoever was charged gets it back, whichever
+/// process dropped the last handle. A shared kind, and a Waiter or Timer,
+/// credits through `credit_shared`, which credits nobody when the charged
+/// process's death has disowned the object: a shared one outlives its owner
+/// live, and a Waiter or Timer outlives it invalid, its charge already
+/// refunded. An `Exited` Thread credits through `credit_shared` too, and an
+/// invalid one credits nothing. `Interrupt`, `Mapping` and `Process` have no
+/// credit here: an Interrupt has no `process` field and no quota column, and
+/// the others for the reason given in their arms.
 public(package) func free_object(kind: ObjType, slot: Int) unsafe {
     match kind {
         case Event -> {
@@ -590,12 +652,19 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
                 fatal_kernel("an interrupt reached zero references while attached",
                              slot as UInt)
             }
-            let owner = INTERRUPTS[slot].process
-            hal.irq_mask(INTERRUPTS[slot].line)
-            INTERRUPTS[slot] = InterruptSlot(state: SlotState.Free, process: 0,
-                                             line: 0, pending: false,
-                                             attachment: 0, refs: 0)
-            quota_credit(owner, QuotaKind.Interrupt)
+            match INTERRUPTS[slot].state {
+                case Invalid -> {},
+                case Live -> {
+                    fatal_kernel("a bound interrupt was freed", slot as UInt)
+                },
+                case Free -> {
+                    fatal_kernel("a free interrupt was freed", slot as UInt)
+                },
+            }
+            // No quota is credited: an Interrupt is charged to nobody.
+            INTERRUPTS[slot] = InterruptSlot(state: InterruptState.Free, line: 0,
+                                             pending: false, attachment: 0,
+                                             refs: 0)
         },
         case Timer -> {
             if TIMERS[slot].attachment != 0 {
@@ -756,14 +825,14 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
 // attachment alone, and a refund owed to it must not reach the record's next
 // occupant.
 //
-// The Interrupt sweep in `end_process` frees the dying process's Interrupts by
-// owner. The Thread, Waiter and Timer sweeps are not force-frees: each
-// invalidates the dying process's objects of its kind (a thread only if it has
-// not exited), frees what nothing else names and disowns the rest. Each also
-// frees another process's object of its kind that nothing names any more (for
-// a thread, one that has exited or been invalidated), and the Interrupt sweep
-// does the same. They live there rather than here because each feeds the
-// teardown report. Mapping's sweep is not a force-free either:
+// The Thread, Waiter and Timer sweeps in `end_process` are not force-frees:
+// each invalidates the dying process's objects of its kind (a thread only if it
+// has not exited), frees what nothing else names and disowns the rest. Each
+// also frees another process's object of its kind that nothing names any more
+// (for a thread, one that has exited or been invalidated). The Interrupt sweep
+// is that second half alone: an Interrupt has no owner, so it only frees the
+// invalid ones nothing names. They live there rather than here because the
+// counts feed the teardown report. Mapping's sweep is not a force-free either:
 // `mapping_rights()` withholds `Transfer`, so a Mapping handle cannot outlive
 // its owner's process, and its second arm (clearing the row of a mapping whose
 // target died) is not a free.

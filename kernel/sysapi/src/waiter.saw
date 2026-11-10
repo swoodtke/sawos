@@ -16,7 +16,7 @@
 //! subscription verbs and the one wire call under them.
 
 import sosabi.{SosStatus, WaiterHandle, NO_HANDLE, EventHandle,
-               InterruptHandle, TimerHandle, WAITER_ADD_CONSUMING,
+               TimerHandle, WAITER_ADD_CONSUMING,
                WAITER_ADD_ONESHOT, MINT_OP}
 
 import sos.floor.{checked, sos_handle_release, sos_waiter_add,
@@ -137,6 +137,15 @@ extension Waiter {
     /// is level-triggered, so an Interrupt that fired before it was attached is
     /// reported by this call. A driver hits that ordering when the device was
     /// already asserting at bring-up.
+    ///
+    /// There is no `give(interrupt:)`: an Interrupt's handle is its one name
+    /// and the only thing that can `ack` it, so it is borrowed, never consumed.
+    /// The attachment does not keep the Interrupt alive. If the handle is
+    /// released while the attachment stands, the Interrupt is destroyed (its
+    /// line is unbound and bindable again) and the attachment reports it as a
+    /// wait record whose line is the board's no-line value and never a real
+    /// one. The level is terminal: every wait reports it until the attachment
+    /// is removed (§2.10).
     public func add(&self, interrupt: &Interrupt, key: UInt,
                     mode: AttachMode = AttachMode.Persistent) -> Result<Void, SosStatus> {
         self.attach(interrupt.handle, key, mode_flag(mode))
@@ -220,20 +229,6 @@ extension Waiter {
         owned.handle = EventHandle(NO_HANDLE)
         try self.attach_consuming(word, key, mode) catch {
             let back: (SosStatus, Event) = (error, Event(handle: EventHandle(word)))
-            return move back
-        }
-        return
-    }
-
-    /// Hand an Interrupt to this Waiter. Everything `give(event:)` says holds.
-    public func give(&self, interrupt: Interrupt, key: UInt,
-                     mode: AttachMode = AttachMode.OneShot
-    ) -> Result<Void, (SosStatus, Interrupt)> {
-        var owned = move interrupt
-        let word: UInt = owned.handle
-        owned.handle = InterruptHandle(NO_HANDLE)
-        try self.attach_consuming(word, key, mode) catch {
-            let back: (SosStatus, Interrupt) = (error, Interrupt(handle: InterruptHandle(word)))
             return move back
         }
         return

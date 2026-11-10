@@ -42,7 +42,7 @@ The kernel's object kinds, each a slab-allocated kernel struct:
 | `Event` | Accumulating non-blocking notification (OR / saturating-sum); a waitable. Ops `Signal`/`Receive`, the mode chosen by the caller at creation (`event_create(mode:)`). The word is consumed by whoever takes it, through either door — `receive` is the non-blocking poll, a `Waiter.wait` delivery is the blocking one, and both read and clear, so a value is reported exactly once. §2.2, §2.4. |
 | `Clock` | A granted time source — time is a capability, not an ambient facility. §2.6. |
 | `Timer` | Deadline object bound to the Clock that created it; directly waitable. The process-sleep primitive. §2.6. |
-| `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it and ack through the handle. One op (`Ack`), two rights (`InterruptRight.Wait`/`.Ack`), created by `SystemOp.InterruptBind` on `SystemRight.InterruptBind`, because a line is a machine-wide resource (§2.8). The binding is the object's existence (creation takes the line, there is no rebind), which stops one handle naming two devices over its life. It has one name, its handle, and releasing that handle destroys it (§2.10). A line the board does not have, the timer's line, and a line already bound are all faults. Not yet enforced: binding is `ProcessOp.InterruptBind` on `ProcessRight.InterruptBind`, and the default set carries `Mint`. §9. |
+| `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it and ack through the handle. One op (`Ack`), two rights (`InterruptRight.Wait`/`.Ack`), created by `SystemOp.InterruptBind` on `SystemRight.InterruptBind`, because a line is a machine-wide resource (§2.8). The binding is the object's existence (creation takes the line, there is no rebind), which stops one handle naming two devices over its life. It has one name, its handle, and releasing that handle destroys it (§2.10). A line the board does not have, the timer's line, and a line already bound are all faults. §9. |
 | `Waiter` | Generic wait aggregator (epoll/Port-style). Ops `Add`/`Remove`/`Wait`; rights `WaiterRight.Attach`/`.Wait`; the wait answer is a copy-out record. §2.2. |
 | `Process` | Two entries: a small record (the state, the status word, the quota ledger, the references naming it) that outlives the process, and a body (AddressSpace + handle table + threads) that the teardown frees. Handles name the record. No kernel Job or hierarchy. The kernel guarantees teardown on exit or fault — invalidating the objects bound to it, releasing every handle it holds, clearing its domain and freeing its body (§2.10). Supervision (restart, kill-trees, launchd-style) is a userspace concern. §2.7, §8, §12. |
 | `System` | Kernel singleton: the object behind system-scoped primitives, so that every syscall is an object op (§5.7). §2.8. |
@@ -65,7 +65,7 @@ somebody says what references it:
 |---|---|
 | Event | handle entries (any process) + its attachment |
 | Waiter | handle entries |
-| Interrupt | handle entries + its attachment. Only the one handle keeps it live: releasing it destroys the Interrupt, and an attachment then holds the invalid object until it is removed (§2.10; not yet enforced). A give or a staged message moves that one name and is not a release |
+| Interrupt | handle entries + its attachment. Only the one handle keeps it live: releasing it destroys the Interrupt, and an attachment then holds the invalid object until it is removed (§2.10). A give or a staged message moves that one name and is not a release |
 | Timer | handle entries + its attachment |
 | MemoryObject / IoMemoryObject | handle entries (a Memory's installed grant rows are a second count, §2.5) |
 | Mapping | handle entries — not its row, which the Mapping owns rather than the reverse (§2.5) |
@@ -100,13 +100,12 @@ Interrupt masks its line (and is then bindable again, mid-life), a Timer
 reprograms the comparator, and a Waiter detaches its list — which may take a
 waitable to zero in turn, a cascade that terminates because an attachment
 references the waitable and never the Waiter that holds it. A Waiter's
-destruction also wakes its parked threads (§2.2). Not yet enforced: an
-Interrupt's destruction by the release of its handle while attached is not
-built, and its owner's teardown frees it rather than invalidating it. Delivery
-and the ledger are mutually recursive — a delivery can drop a counted reference
-(a one-shot attachment detaches at its copy-out) and a dropped reference can
-deliver (a column reaching zero raises a peer-gone level) — so both live in one
-module, `kcore.refs`.
+destruction also wakes its parked threads (§2.2). An Interrupt's destruction
+runs when its one handle is released, even while an attachment still holds its
+slot (§2.10). Delivery and the ledger are mutually recursive — a delivery can
+drop a counted reference (a one-shot attachment detaches at its copy-out) and a
+dropped reference can deliver (a column reaching zero raises a peer-gone
+level) — so both live in one module, `kcore.refs`.
 
 **AddressSpace is implicit, deliberately.** Each process gets one granted range
 plus a writable window, and its protection rows are recorded in its process body
@@ -407,14 +406,9 @@ holding a number. The kinds a message may carry are the givable ones the
 receiving vocabulary can name: `Memory`, `IoMemory`, `PipeInlet`, `PipeOutlet`,
 `PipeReply`, `PipeRequest`, `Event`, `Thread`, `Waiter`, `Timer` and `Interrupt`
 — every kind a boot record can carry but two (`msg_kind_of` is `boot_kind_of`
-less those two). Not yet enforced for the last: its default set withholds
-`Transfer`, no boot record kind names it (§3), and the typed tier has neither a
-`PipeHandle` case nor a `decode_handle` arm for it, nor the
-`Process.give(interrupt:)` overload or the `BootHandle` accessor that would
-carry it through a give. `Process` and
-`System` are refused at the sender, as a scope line rather than a rule: both
-wrappers live above `sos.pipe` in the module order, so admitting them is a
-sysapi module split and a named follow-up (§11).
+less those two). `Process` and `System` are refused at the sender, as a scope
+line rather than a rule: both wrappers live above `sos.pipe` in the module
+order, so admitting them is a sysapi module split and a named follow-up (§11).
 
 **The delegation example is a protocol, across three real processes.** A
 `PipeRequest` travelling in a message is the zero-copy example's own move made
@@ -561,8 +555,7 @@ a reply delivery carries, which is why there is one type and not two — and
   a strand. Its other instances are the one-shot reply pair (`PeerClosed`, both
   directions), a connection endpoint reaching zero references (§2.1), any object
   invalidated under a parked thread (`Revoked`, §2.10), and an attachment on a
-  waitable that becomes invalid, which fires (§2.10); the last two are not yet
-  enforced for the Interrupt.
+  waitable that becomes invalid, which fires (§2.10).
   Terminal levels follow the Process precedent (§8): attaching after the fact
   still wakes, and nothing un-closes. The deadlock predicate has no arm for
   revocation: the wake is synchronous inside the act that destroyed the Waiter
@@ -685,8 +678,7 @@ a reply delivery carries, which is why there is one type and not two — and
   be given to a Waiter: its handle is its one name and the only thing that can
   `Ack` it (§2.10), so a consuming attach of an Interrupt is a `BadArg` fault,
   the flags word asking for something the target's kind excludes, and
-  `Waiter.add(interrupt:)` borrows. Not yet enforced: `Waiter.give(interrupt:)`
-  exists and consumes its wrapper.
+  `Waiter.add(interrupt:)` borrows; there is no `Waiter.give(interrupt:)`.
 - **The buffer is max-sized and the copy is not.** A parked waiter cannot
   predict which arm fires, so the buffer holds the biggest answer its
   attachments could give, while the kernel copies only what the delivery
@@ -1100,8 +1092,7 @@ and `Stats`. `ProcessRight.Map` is the target-side right `MemoryOp.Map` and
 `IoMemoryOp.Map` spend (§2.5). Creating a process is not an op on this object:
 `ProcessCreate` is on System, because a process is a machine-wide resource
 (§12), and binding an interrupt line is on System for the same reason (§2.8).
-Not yet enforced: binding is still `ProcessOp.InterruptBind`, a Process op on
-`ProcessRight.InterruptBind`. `kill` has no op and no right (§8).
+`kill` has no op and no right (§8).
 
 **Which process an op acts on is part of its contract**, and the ops fall into
 three groups:
@@ -1117,12 +1108,10 @@ three groups:
   enforced: the handles are minted into the named process's table, so through
   another process's handle the caller is handed words relative to that table;
   and a bad entry or stack in `ThreadCreate` (`BadEntry`) or a bad mode in
-  `EventCreate` (`BadArg`) faults the named process. `ProcessOp.InterruptBind`
-  does the same while it exists: it mints into the named process's table and
-  faults that process for a bad line (`BadArg`) or a bound one (`LineBound`).
-  The teardown assumes the dying process is the caller, so the caller's running
-  thread is then never scheduled again. `PipeCreate` already faults the caller,
-  and `WaiterCreate` has no fault path.
+  `EventCreate` (`BadArg`) faults the named process. The teardown assumes the
+  dying process is the caller, so the caller's running thread is then never
+  scheduled again. `PipeCreate` already faults the caller, and `WaiterCreate`
+  has no fault path.
 - **`Exit`, `ThreadSelf` and `BootHandleNext` are self-only**: through a handle
   naming another process the kernel faults the caller (`NotSelf`). `Exit` ends
   the calling process, `ThreadSelf` names the caller's running thread, and
@@ -1138,18 +1127,17 @@ three groups:
   naming one that is not, a `Gone` one included, is a `BadState` fault rather
   than `Revoked` (§2.10): a `Gone` child was always started, and the launcher
   that started it knows. Not yet enforced: a `Created` child can die unstarted
-  today, because a caller error in `ThreadCreate`, `EventCreate` or
-  `ProcessOp.InterruptBind` through its handle faults the child (above).
+  today, because a caller error in `ThreadCreate` or `EventCreate` through its
+  handle faults the child (above).
 
 **The default set.** One Process default set serves all three minters (root's,
 `ProcessSelf`'s and `ProcessCreate`'s), named for its ops throughout:
 `ThreadCreate`, `ThreadSelf`, `Exit`, `Wait`, `EventCreate`, `WaiterCreate`,
 `Start`, `BootHandles`, `Give`, `Map`, `PipeCreate` and `Stats`, plus the
-universal `Transfer | Mint`. Not yet enforced: the set still carries
-`ProcessRight.InterruptBind`, the right `SystemRight.InterruptBind` replaces
-(§2.8). A launcher keeps the child's handle — it is what supervises with — and
-the child derives its own authority from the masked System handle it was given
-(§12), so supervision and self-management are not alternatives.
+universal `Transfer | Mint`. A launcher keeps the child's handle — it is what
+supervises with — and the child derives its own authority from the masked System
+handle it was given (§12), so supervision and self-management are not
+alternatives.
 `Process.mint(rights:)` makes each bit attenuable at the typed tier: a
 supervisor may be handed a sibling that learns whether its child is alive and
 may not watch it work.
@@ -1346,7 +1334,7 @@ a whole.
 | `ProcessSelf` | `SystemRight.ProcessSelf` | mints the caller's own Process handle, narrowed by a keep mask |
 | `ClockGet` | `SystemRight.ClockGet` | mints a Clock handle (§2.6) |
 | `ProcessCreate` | `SystemRight.ProcessCreate` | creates an inert process (§8, §12) |
-| `InterruptBind(line)` | `SystemRight.InterruptBind` | binds an interrupt line to a new Interrupt (§9); not yet enforced, see below |
+| `InterruptBind(line)` | `SystemRight.InterruptBind` | binds an interrupt line to a new Interrupt (§9) |
 | `SlabDonate` | `SystemRight.SlabDonate` | donates a `Memory` region to a kind's slab |
 | `TierGet` | `SystemRight.TierGet` | answers the protection tier (§5b.1) |
 | `StatsRegionMap` | `SystemRight.StatsRegionMap` | maps the trap-counter page read-only, on the isolated tiers (§2.7) |
@@ -1379,7 +1367,8 @@ a whole.
   otherwise): the kernel never shares slab backing with user-reachable memory.
 - **`InterruptBind`** binds a line to a new Interrupt and places its one handle
   in the caller's table. A line is a machine-wide resource, which is why the op
-  is here, and the bind charges no quota row (§2.9). What bounds Interrupt
+  is here, and the bind has no Interrupt quota row (§2.9); its handle is
+  charged to the caller's `Handle` row like any mint. What bounds Interrupt
   objects is the Interrupt slab (`MAX_INTERRUPTS`, a floor, since
   `SlabKind.Interrupts` is donatable), and a full slab answers `NoResource`.
   There is at most one live Interrupt per line, so the board's line count bounds
@@ -1390,11 +1379,7 @@ a whole.
   privileged binder — a launcher holding the right — binds each line and gives
   the Interrupt to the driver that services it (§9), so a driver holds exactly
   the lines it was given and no authority to bind another. There is no per-line
-  capability object. Not yet enforced: the op and the right do not exist, and
-  binding is `ProcessOp.InterruptBind` on `ProcessRight.InterruptBind`, which
-  mints into the table of the process the handle names, charges that process's
-  `Interrupt` quota row, and faults that process, not the caller, for a bad or
-  bound line (§2.7).
+  capability object. Its faults land on the caller.
 - **`TierGet`** answers `Isolated` or `Flat` (§5b.1). It reads no state, spends
   no resource, takes no argument and cannot fail. Info queries of this kind
   belong on this object and are gated like any other op.
@@ -1409,8 +1394,7 @@ record (`quota_used` / `quota_limit`, §2.7), the entry a charged object's
 `process` field (a Mapping's `target`) names, not in the body. The `Handle` row
 is charged inside `mint_handle` and credited inside `unbind_handle`. An
 Interrupt has no column: there is at most one live Interrupt per line, and the
-Interrupt slab bounds the objects (§2.8). Not yet enforced: the ledger still has
-an `Interrupt` column, charged at the bind.
+Interrupt slab bounds the objects (§2.8).
 
 - **Policy first.** A quota is checked at every allocation site that answers
   `NoResource`, ahead of the slab, so a process at its budget is told
@@ -1522,10 +1506,7 @@ attachment detaches at that delivery as usual. Nothing un-invalidates, so the
 level is terminal, as a death is: a persistent attachment keeps reporting it
 until it is removed (by key, with `Waiter.remove`). What the holder learns from
 it comes at its next op on the object, which answers `Revoked`; an Interrupt is
-the exception, below. Not yet enforced: an Interrupt is not invalidated. Its
-owner's teardown frees it, detaching an attachment on another process's Waiter
-without firing it, and an attached Interrupt whose handle is released stays
-bound, since the attachment's reference keeps it live.
+the exception, below.
 
 **An invalid Interrupt's record carries no line.** Its attachment fires as any
 invalidated waitable's does, but the payload is the board's no-line value,
@@ -1534,16 +1515,14 @@ give", never a real line), and never the line the Interrupt was bound to. That
 line may already be bound to a new Interrupt, and a driver dispatching by line
 (§9) must not act on a line that has since been rebound. The record is also how
 the holder learns: an Interrupt destroyed by its handle's release leaves no
-handle to make the op that would answer `Revoked`. Not yet enforced: the
-payload is the slot's stored line whatever the object's state
-(`waitable_answer`).
+handle to make the op that would answer `Revoked`.
 
 **Which kinds live how.**
 
 | kind | lifetime |
 |---|---|
 | Thread, Timer, Waiter, Mapping | **Bound** to the process that owns it: invalidated when that process dies, freed when the last handle goes. A Mapping's owner is the process whose domain holds its row (the target of its `map`), not the process holding its handle. A Thread that exited before its process died is not invalidated: `Exited` wins, and a late `Join` through any handle reads its exit code from the slot, even after the process is `Gone`, the slot being held while a handle names it. A Thread that has not exited when its process dies is invalid, so `Join` answers `Revoked` and the slot keeps nothing for it. A Thread frees once it has exited or been invalidated and nothing names it |
-| Interrupt | **One name, its handle.** No `Mint` in its default set, and attenuation is monotonic, so no handle can regain it (§3). Releasing the handle, explicitly or by its holder's teardown, destroys the Interrupt: it unbinds and masks the line. A give or a staged message moves the one name and is not a release. An attachment does not extend its life; it holds the invalid Interrupt until it is removed, and fires as an invalidated waitable does. A consuming attach of an Interrupt is refused as a caller error (`BadArg`, §2.2), so the driver keeps the one handle it acks with. Charged to no quota (§2.9) |
+| Interrupt | **One name, its handle.** No `Mint` in its default set, and attenuation is monotonic, so no handle can regain it (§3). Releasing the handle, explicitly or by its holder's teardown, destroys the Interrupt: it unbinds and masks the line. A give or a staged message moves the one name and is not a release. An attachment does not extend its life; it holds the invalid Interrupt until it is removed, and fires as an invalidated waitable does. A consuming attach of an Interrupt is refused as a caller error (`BadArg`, §2.2), so the driver keeps the one handle it acks with. Charged to no quota (§2.9) and bound to no process: nothing names its binder's record, so the teardown has nothing to disown |
 | Event, Pipe, Memory, IoMemory | **Shared:** live until the last handle goes, whatever happens to the process charged for them |
 | Process | `Gone` is its invalid state (§8), and a `Gone` process is a record with no body. `GetStatus` and an attachment read the status word the record keeps, and `Stats` reads the final trap counters the teardown copied into it (§2.7). `Start` and `Give` naming a `Gone` child stay `BadState` faults, because a `Gone` child was always started and its launcher knows (§2.7). Every other op that acts on the process answers `Revoked`, a `map` naming it as the target included: the mapper did not cause the death. The teardown frees the body; the record is reclaimed when it is `Gone` and its count is zero (§2.7) |
 | Clock, System | Never destroyed |
@@ -1551,7 +1530,7 @@ payload is the slot's stored line whatever the object's state
 **A free of a live object runs its last rites.** The last handle going is a
 destruction, so the kind's last rites (§3) do what an invalidation does: a
 Waiter wakes its parked threads with `Revoked`, a Timer gives the comparator
-back, an Interrupt masks its line, and the charge is refunded. A Mapping keeps
+back, an Interrupt masks its line, and any charge is refunded. A Mapping keeps
 §2.5's shape: its row is not torn down by the free, and its charge, which
 counts the row, comes back when the row goes. A Thread that has not exited is
 not freed by losing its last handle (§2's table).
@@ -1585,9 +1564,8 @@ field:
 
 - the `process` field of a shared object still charged to the dying process (a
   Memory, an IoMemory, a connection, an Event), of an `Exited` Thread, of any
-  invalid bound object (a Thread, Timer or Waiter), and of an Interrupt it bound
-  that outlives it, whether another table, a staged message or an attachment
-  holds it;
+  invalid bound object (a Thread, Timer or Waiter), whether another table, a
+  staged message or an attachment holds it;
 - the `target` of a Mapping whose target is the dying process, so the husk
   names nobody;
 - and the record's own link to its body, cleared as the body goes (§2.7).
@@ -1597,8 +1575,9 @@ teardown's owner sweeps would match them, a free would refund it a charge
 already written off, and a husk's check of its target would read a stranger's
 state. A disowned object's free credits nobody, whatever its kind; an object
 freed before its disown credits the dying ledger as any free does, and the
-teardown clears that ledger. Not yet enforced: an Interrupt is never disowned,
-because its owner's teardown frees it (below), so none survives its owner.
+teardown clears that ledger. An Interrupt has no `process` field to disown: it
+is charged to nobody and bound to no process, only to its one handle, so nothing
+names the binder's record once it has bound.
 
 The teardown reports itself on one console line, `SOS: process teardown`, and
 the harness asserts the line. Its fields today (`handles=`, `threads=`,
@@ -1625,9 +1604,11 @@ released when the close-all dropped the connection's last outlet, say), nor
 one of its own freed by another object's free inside the teardown (a Timer
 whose last reference was an attachment on another process's Waiter, freed
 because the dying process held that Waiter's last handle, say). `interrupts=`
-follows the Interrupt sweep, by owner, so it changes with the teardown: under
-the order above no owner sweep reaches an Interrupt, and the Mappings that are
-swept have no field.
+counts the Interrupts the close-all destroyed: a handle onto an Interrupt is its
+one name, so each such handle in the dying table is a destruction. It counts
+destructions and not frees, because an Interrupt that an attachment on another
+process's Waiter still holds stays, invalid. The Mappings that are swept have no
+field.
 
 **The refund rule.**
 
@@ -1652,23 +1633,19 @@ Not yet enforced:
 
 - The teardown releases the handle table first, counting without freeing, and
   then invalidates the dying process's Threads that have not exited and its
-  Waiters and Timers, freeing instead each that nothing else names; frees its
-  Interrupts by owner and the Mappings it made; and frees the Event, Memory,
-  IoMemory, exchanges and connections nothing names any more, disowning the
-  rest it was charged for. That reap ends with a process scan, which reclaims
-  every `Gone` process record whose last reference the teardown dropped. An
-  Interrupt is therefore freed by its owner's death. A Mapping that targets
-  the dying process is invalid: its slot is kept, its row cleared and its
-  handles stay in other tables.
+  Waiters and Timers, freeing instead each that nothing else names; frees the
+  Mappings it made and the invalid Interrupts nothing names any more; and frees
+  the Event, Memory, IoMemory, exchanges and connections nothing names any more,
+  disowning the rest it was charged for. That reap ends with a process scan,
+  which reclaims every `Gone` process record whose last reference the teardown
+  dropped. A Mapping that targets the dying process is invalid: its slot is
+  kept, its row cleared and its handles stay in other tables.
 - The creation ops through a `Gone` process's handle do not answer `Revoked`.
   They answer `QuotaExceeded` when their arguments are well formed, its ledger
   having been cleared, and `ThreadCreate` answers it whatever its entry and
-  stack, since no region is left to check them against; a bad mode or line
-  faults the `Gone` process again, which reruns the teardown (with no body left
-  to free), overwrites its status word and strands the caller.
-- An Interrupt carries `Mint`, is charged an `Interrupt` quota row, can be
-  consumed into an attachment (`Waiter.give(interrupt:)`), and stays bound
-  while an attachment holds it after its handle is released.
+  stack, since no region is left to check them against; a bad mode faults the
+  `Gone` process again, which reruns the teardown (with no body left to free),
+  overwrites its status word and strands the caller.
 
 ## 3. Handles, rights, derivation
 
@@ -1744,8 +1721,7 @@ Not yet enforced:
   it on (§2.7), and an Interrupt carries it so that a launcher can hand a
   driver its line (§2.8). Each givable kind has a boot record kind
   (`BootHandleKind`), which is what lets `give` deliver it and a message carry
-  it (§2.1). Not yet enforced for Interrupt: its default set withholds
-  `Transfer`, and `BootHandleKind` has no case for it.
+  it (§2.1).
 - **The invariant is no amplification: no sequence of asks yields authority
   the asker did not already have.** A handle is a unique entry, which is the
   `NoCopy` correspondence §4 builds on — but uniqueness is the mechanism, and
@@ -1843,8 +1819,7 @@ Not yet enforced:
   **An Interrupt has one name.** `Mint` is absent from `interrupt_rights()`,
   and attenuation is monotonic, so no handle onto an Interrupt can regain it:
   authority over a line is exactly one handle, which moves by `Transfer` and is
-  never copied, and releasing it unbinds the line (§2.10). Not yet enforced:
-  `interrupt_rights()` carries `Mint`.
+  never copied, and releasing it unbinds the line (§2.10).
 - **Attenuation is monotonic**: any derivation may only strip rights, never add.
   The only rights source is the boot handle set given to the root server, so
   every rights word in the machine is a subset of one of those, reached by some
@@ -1877,8 +1852,8 @@ Not yet enforced:
     syscall that dropped the last reference — the kernel runs to completion, so
     there is no deferred reclamation and no cleanup queue. The kind's own last
     rites run there: an Interrupt masks its line and becomes re-bindable (its
-    handle's release does that even while an attachment holds it, §2.10; not yet
-    enforced), a Timer gives the comparator back, a Waiter detaches its list
+    handle's release does that even while an attachment holds it, §2.10), a
+    Timer gives the comparator back, a Waiter detaches its list
     (which may take a waitable to zero in turn — a cascade) and wakes its parked
     threads, a Memory returns its slot (and its range once no grant row names
     it, §2.5), and a `Gone` process's record is reclaimed, its body having
@@ -1955,7 +1930,7 @@ Not yet enforced:
     exactly as it was. `WaiterOp.Add` with the consuming flag (`Waiter.give`)
     faults for a Waiter handle without `WaiterRight.Attach` (`AccessDenied`), a
     flags word outside the published set or a consuming flag on an Interrupt
-    target (`BadArg`; the second not yet enforced, §2.2), a target that names
+    target (`BadArg`, §2.2), a target that names
     nothing (`BadHandle`), is not waitable (`NotWaitable`) or lacks its `Wait`
     right (`AccessDenied`), a target already attached to a Waiter (`BadState`)
     and a duplicate key (`DuplicateKey`), and answers `NoResource` when the
@@ -2198,8 +2173,8 @@ tags rather than statuses, keeping their numbers — `SosStatus` leaves 1–3
 unused. The kernel stays up, reports, and runs the teardown (§8). The rule is
 uniform because it has to be: an unbound handle names no kind, so there is no op
 table to ask which rule applies. Not yet enforced through another process's
-handle: a caller error in `ThreadCreate`, `EventCreate` or
-`ProcessOp.InterruptBind` faults the named process instead (§2.7). What is left
+handle: a caller error in `ThreadCreate` or `EventCreate` faults the named
+process instead (§2.7). What is left
 in `SosStatus` is what a caller could not have known — `NoResource` (a full
 slab), `QuotaExceeded` (§2.9), `BadImage` (§8), `Drained` (§12), `Revoked`
 (§2.2, and every op on an invalid object, §2.10), `PeerClosed` and
@@ -2222,8 +2197,7 @@ authority anywhere in the ABI (§3): an op is reached through a handle of the
 right kind and spends a bit named for that op. Binding an interrupt line is
 `SystemRight.InterruptBind` on a System handle, not a root IRQ-table object or
 a per-line capability: a right is the cheaper answer whenever an "object" would
-have been a table with no state and one verb. Not yet enforced: the right is
-still `ProcessRight.InterruptBind`, on a Process handle (§2.8).
+have been a table with no state and one verb (§2.8).
 
 **The boot set is one handle wide at the entry register.** A process enters user
 mode with exactly one word in its first argument register — root's System
@@ -2309,8 +2283,6 @@ verb — so the four legal combinations are the only things a Saw caller can ask
 for, and the kernel's check exists for the C altitude beneath it. One target
 kind narrows them: an Interrupt takes only the two borrowing combinations, and
 the consuming bit on an Interrupt target is the same `BadArg` fault (§2.2).
-Not yet enforced: `Waiter.give(interrupt:)` spells the consuming combination,
-and the kernel accepts it.
 
 **The fused pipe ops add no right.** `PipeInletOp.Call` spends
 `PipeInletRight.Post` and `PipeRequestOp.ReplyWait` spends
@@ -2891,16 +2863,15 @@ who the driver is.
   crosses the same way: root binds it (`SystemOp.InterruptBind`, §2.8) and
   gives the bound Interrupt under a tag, so the driver holds that line and no
   authority to bind another. Root never maps the window and never learns the
-  UART's address. Not yet enforced: the driver children bind their own lines
-  through `ProcessRight.InterruptBind` on the Process handle they derive.
+  UART's address.
 - **The driver program is the same wherever it runs, apart from three things.**
   The child driver packages are the root-as-driver packages, driver body for
   driver body — same registers, same enable bit, same drain-before-ack loop —
-  differing only in that the window and the line arrive by give (the line not
-  yet, above), that they end with `Process.exit` (a driver child holds no
-  `SystemRight.Shutdown` and should not), and that they are linked at the child
-  base. Both twins stay in the suite. Each driver comes in two packages, one per
-  device rather than per machine, because a driver is its device.
+  differing only in that the window and the line arrive by give, that they end
+  with `Process.exit` (a driver child holds no `SystemRight.Shutdown` and should
+  not), and that they are linked at the child base. Both twins stay in the
+  suite. Each driver comes in two packages, one per device rather than per
+  machine, because a driver is its device.
 - **The rights a driver spends on itself are the driver's to narrow.**
   `ProcessRight.Map` arrives on the handle `SystemOp.ProcessSelf` mints, and
   `ProcessSelf` takes a keep mask (§2.8), so a child narrows its own Process
@@ -3110,22 +3081,16 @@ loader parses and reports while no process stores either.
 **Known limits.**
 
 - The Process creation ops do not yet place their handles in the caller's
-  table, and a caller error in `ThreadCreate`, `EventCreate` or
-  `ProcessOp.InterruptBind` through another process's handle faults the named
-  process; `ThreadSelf` and `BootHandleNext` are not yet self-only (§2.7).
+  table, and a caller error in `ThreadCreate` or `EventCreate` through another
+  process's handle faults the named process; `ThreadSelf` and `BootHandleNext`
+  are not yet self-only (§2.7).
 - The object lifecycle is not yet enforced as §2.10 states it: the
   teardown's close-all releases every handle but counts without freeing, the
-  sweeps after it invalidate the bound kinds rather than before it, and the
-  Interrupt sweep frees the dying process's Interrupts outright; and the
+  sweeps after it invalidate the bound kinds rather than before it; and the
   creation ops through a `Gone` Process's handle do not answer `Revoked`.
-- Binding an interrupt line is not yet a System op: it is
-  `ProcessOp.InterruptBind` on `ProcessRight.InterruptBind`, charged to an
-  `Interrupt` quota row, minting into the named process's table and faulting
-  that process for a bad or bound line. An Interrupt handle carries `Mint` and
-  not `Transfer`, so a launcher cannot hand a driver its line. Separately, an
-  Interrupt can be consumed into an attachment, an attachment keeps it bound
-  after its handle is released, and an attached Interrupt's record carries its
-  line whatever its state (§2.8, §2.10, §3).
+- A child that is created but never started, once nothing names it, is never
+  torn down, so whatever it was given stays held: an Interrupt's line
+  included, which no one can bind again.
 - `sosrt`'s bump arena takes no lock, so under a kernel that preempts (today
   only the preemption harness; §7) two threads of one process allocating at once
   can race (§5c).
@@ -3161,15 +3126,14 @@ critical processes (§2.5).
   Root's band map applies verbatim from its image (§7, not built). Two of these
   are rights rather than objects, both bits on the System handle: binding a line
   is `SystemRight.InterruptBind` rather than a root IRQ table root is given, and
-  the launch capability is `SystemRight.ProcessCreate` (not yet enforced for the
-  first: binding is `ProcessRight.InterruptBind` on root's Process handle,
-  §2.8). **The set is one handle wide at the register** — the pool roots are
-  collected, not passed: the build-emitted region table carries a kind column, a
-  Ram row mints a `MemoryObject` and a Device row an `IoMemoryObject`, and both
-  arrive through `BootHandleNext` under their row ordinal. A driver obtains its
-  window instead of declaring it, which is what makes handing one to a driver
-  child possible at all. The kernel assigns no meaning to which ordinal is
-  which; that is root's config.
+  the launch capability is `SystemRight.ProcessCreate`. **The set is one handle
+  wide at the register** — the pool roots are collected, not passed: the
+  build-emitted region table carries a kind column, a Ram row mints a
+  `MemoryObject` and a Device row an `IoMemoryObject`, and both arrive through
+  `BootHandleNext` under their row ordinal. A driver obtains its window instead
+  of declaring it, which is what makes handing one to a driver child possible at
+  all. The kernel assigns no meaning to which ordinal is which; that is root's
+  config.
 - **Creation authority.** The creation-authority model for plain objects is the
   factory capability, spelled as rights bits on the Process object:
   `ThreadCreate`, `EventCreate`, `WaiterCreate` and `PipeCreate` are Process ops
@@ -3190,8 +3154,8 @@ critical processes (§2.5).
   board), so their refusals and their limits are System answers:
   `process_create` is `SystemOp.ProcessCreate` gated on
   `SystemRight.ProcessCreate`, binding a line is
-  `SystemOp.InterruptBind` gated on `SystemRight.InterruptBind` (§2.8; not yet
-  enforced, binding is a Process op today), and `SystemOp.ProcessSelf` is the
+  `SystemOp.InterruptBind` gated on `SystemRight.InterruptBind` (§2.8), and
+  `SystemOp.ProcessSelf` is the
   precedent — every Process handle comes from System. With a launcher creating
   every process, a creation right on the caller's own Process handle would gate
   nothing real, and creator-pays accounting through the caller's record would
@@ -3287,8 +3251,6 @@ critical processes (§2.5).
   and `give(interrupt:)` hands it the device's line, a bound Interrupt (§2.8),
   with no further mechanism: moving a driver out of root needs no kernel change,
   because a device window and a line are capabilities rather than manifest keys.
-  Not yet enforced for the line: an Interrupt handle carries no `Transfer` and
-  no boot record kind names it (§3), so a driver child binds its own line today.
   Two shapes are both ordinary and a launcher picks by policy: give the
   capability and let the child install its own row (the driver child), or keep
   the capability and install the child's row yourself (a shared page the child

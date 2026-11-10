@@ -14,6 +14,7 @@
 //! what does the record say) are reads of `PROCESS_RECORDS` in `pslot`.
 //! `process` imports nothing from here, so there is no cycle.
 
+import hal
 import sosabi.{EventMode, InletLevel, OutletLevel, ReplyLevel, WaitTag,
                process_status_word}
 import kcore.limits.{
@@ -28,6 +29,7 @@ import kcore.limits.{
     NO_THREAD,
     NO_WAITER,
 }
+import kcore.diag.{fatal_kernel}
 import kcore.slab.{Slab}
 import kcore.objects.{
     EXCHANGES,
@@ -126,29 +128,70 @@ public(package) struct EventSlot {
     public(package) refs: UInt16,
 }
 
+/// Where an Interrupt is in its life (spec §2.10).
+///
+/// An Interrupt has one name, its handle (or the staged message carrying it),
+/// and `Live` lasts exactly as long as that name does. `Invalid` is an
+/// Interrupt whose name has gone while an attachment still holds it: the line
+/// is unbound, masked and free to bind again, and the slot is held only for the
+/// attachment, whose level is terminal. No handle names an invalid Interrupt,
+/// so no op ever answers `Revoked` for one; the attachment's record is how its
+/// holder learns.
+///
+/// Its own enum for `WaiterState`'s reason.
+public(package) enum InterruptState: UInt8 {
+    case Free = 0,
+    case Live = 1,
+    case Invalid = 2,
+}
+
 /// One Interrupt (spec §2 table, §9): an IRQ line bound to a waitable.
 ///
 /// `pending` is the object, as an Event's word is: set when the line fires,
 /// cleared by `Ack`, and "ready" means nothing more. §9's
 /// at-most-one-unacked-fire invariant is represented (a `Bool` cannot hold
 /// two), and it is true because the kernel masks the line before the hook runs
-/// and only `Ack` unmasks it, so the device cannot fire again in between.
+/// and only `Ack` unmasks it, so the device cannot fire again in between. An
+/// invalid Interrupt is ready whatever `pending` says (`waitable_ready`).
 ///
 /// `line` is the number the controller answers with. The trap path has a line
 /// and needs the object, which a table scan answers. The scan runs with
 /// interrupts masked, so its length is interrupt latency.
+///
+/// There is no owner. An Interrupt lives as long as its one name, not as long
+/// as the process that bound it, so nothing sweeps the slab by process.
 public(package) struct InterruptSlot {
-    public(package) state: SlotState,
-    public(package) process: Int,
-    /// The IRQ line this object is bound to, for its whole life.
+    public(package) state: InterruptState,
+    /// The IRQ line this object is bound to. Meaningful only while it is live:
+    /// once it is invalid the line may be bound to another Interrupt, and
+    /// nothing reads this field (`waitable_answer`, `interrupt_by_line`).
     public(package) line: UInt,
     /// Fired and not yet acked. Non-false = ready, in §2.2's sense.
     public(package) pending: Bool,
     /// The attachment naming this interrupt (slot + 1); 0 = unattached.
     public(package) attachment: Int,
-    /// Handle entries naming this interrupt, plus its attachment. Reaching zero
-    /// masks the line and returns the slot, so the line becomes bindable again.
+    /// Handle entries naming this interrupt, plus the staged message that
+    /// carries it, plus its attachment. The attachment is not a name: when the
+    /// last name goes the Interrupt is destroyed whatever this says
+    /// (`interrupt_names`), and the slot is returned when this reaches zero.
     public(package) refs: UInt16,
+}
+
+/// How many of `slot`'s references are its name: handle entries and staged
+/// messages, not the attachment.
+///
+/// An attachment drops its reference only after clearing the `attachment`
+/// field (`detach_attachment`, the Waiter's free cascade, the teardown's
+/// attachment sweep), so a drop that arrives with the field set is a name
+/// going and one that arrives with it clear is the attachment going.
+public(package) func interrupt_names(slot: Int) unsafe -> UInt16 {
+    if INTERRUPTS[slot].attachment != 0 {
+        if INTERRUPTS[slot].refs == 0 {
+            fatal_kernel("an attached interrupt has no references", slot as UInt)
+        }
+        return INTERRUPTS[slot].refs - 1
+    }
+    INTERRUPTS[slot].refs
 }
 
 /// Where a Waiter is in its life (spec §2.10).
@@ -264,7 +307,7 @@ public(package) unsafe static var WAITERS: Slab<WaiterSlot, MAX_WAITERS> = Slab<
     total: MAX_WAITERS)
 
 public(package) unsafe static var INTERRUPTS: Slab<InterruptSlot, MAX_INTERRUPTS> = Slab<InterruptSlot, MAX_INTERRUPTS>(
-    inline: [InterruptSlot(state: SlotState.Free, process: 0, line: 0,
+    inline: [InterruptSlot(state: InterruptState.Free, line: 0,
                            pending: false, attachment: 0,
                            refs: 0); MAX_INTERRUPTS],
     ext_base: [0; MAX_SLAB_EXTENTS],
@@ -317,6 +360,7 @@ public(package) func alloc_interrupt() unsafe -> Int {
         match INTERRUPTS[i].state {
             case Free -> { return i },
             case Live -> {},
+            case Invalid -> {},
         }
         i = i + 1
     }
@@ -432,18 +476,28 @@ public(package) func set_waitable_attachment(kind: WaitableKind, slot: Int, a: I
 ///
 /// Every answer is a read of the object's own state; none consults a flag the
 /// wait machinery maintains. An Event is ready while its word is non-zero, an
-/// Interrupt while its fire is unacked, a Timer while it has expiries nobody
-/// has been told about or once it is invalid, and a Process once it is `Gone`.
+/// Interrupt while its fire is unacked or once it is invalid, a Timer while it
+/// has expiries nobody has been told about or once it is invalid, and a Process
+/// once it is `Gone`.
 ///
-/// The Process arm and an invalid Timer are terminal (spec §2.10): the other
-/// levels can drop again (a word is taken, a line is acked, a count is spent),
-/// but `Gone` and `Invalid` are states an object leaves only by being freed,
+/// The Process arm and an invalid Interrupt or Timer are terminal (spec §2.10):
+/// the other levels can drop again (a word is taken, a line is acked, a count
+/// is spent), but `Gone` and `Invalid` are states an object leaves only by
+/// being freed,
 /// and it cannot be freed while somebody is attached to it. So the level a
 /// death raises stays raised for as long as anyone can observe it.
 public(package) func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Bool {
     match kind {
         case Event -> EVENTS[slot].word != 0,
-        case Interrupt -> INTERRUPTS[slot].pending,
+        case Interrupt -> {
+            match INTERRUPTS[slot].state {
+                case Live -> INTERRUPTS[slot].pending,
+                case Invalid -> true,
+                // A freed Interrupt has no attachment and no handle, so
+                // nothing asks; it is not ready.
+                case Free -> false,
+            }
+        },
         case Timer -> {
             match TIMERS[slot].state {
                 case Live -> TIMERS[slot].fires != 0,
@@ -513,7 +567,10 @@ public(package) func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Boo
 ///
 /// An invalid Timer answers its ordinary record, with no case added for the
 /// invalidation (spec §2.10). Its count is zero, because the invalidation
-/// disarmed it, which no live Timer's delivery carries.
+/// disarmed it, which no live Timer's delivery carries. An invalid Interrupt
+/// answers its ordinary record too, and its line is `hal.IRQ_NONE`, which no
+/// live Interrupt's delivery carries: its line may already be bound to a new
+/// Interrupt.
 ///
 /// Three of the four pipe arms are word-shaped levels and answer with
 /// `body_len: 0`. The `PipeReply` arm carries the reply's bytes, and `body_src`
@@ -524,9 +581,16 @@ public(package) func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> Wa
     match kind {
         case Event -> WaitAnswer(tag: WaitTag.Event, payload: EVENTS[slot].word,
                                  body_len: 0, body_src: 0),
-        case Interrupt -> WaitAnswer(tag: WaitTag.Interrupt,
-                                     payload: INTERRUPTS[slot].line,
-                                     body_len: 0, body_src: 0),
+        case Interrupt -> {
+            var line = hal.IRQ_NONE
+            match INTERRUPTS[slot].state {
+                case Live -> { line = INTERRUPTS[slot].line },
+                case Invalid -> {},
+                case Free -> {},
+            }
+            WaitAnswer(tag: WaitTag.Interrupt, payload: line,
+                       body_len: 0, body_src: 0)
+        },
         case Timer -> WaitAnswer(tag: WaitTag.Timer,
                                  payload: TIMERS[slot].fires,
                                  body_len: 0, body_src: 0),
@@ -588,7 +652,8 @@ public(package) func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> Wa
 ///     second signal.
 ///   - An Interrupt's readiness is ended by the driver's `ack` and nothing else
 ///     (§9), because the line stays masked until the device has been serviced.
-///     The kernel cannot know that a record was enough.
+///     The kernel cannot know that a record was enough. An invalid Interrupt's
+///     level is its state, which nothing here can lower.
 ///   - A Timer's fire count is spent by the delivery. It has no mask to hold
 ///     and no device to service, so the fire has done its job once somebody has
 ///     been told. This is what makes a periodic timer a schedule rather than a
@@ -874,6 +939,8 @@ public(package) func interrupt_by_line(line: UInt) unsafe -> Int {
                     return i
                 }
             },
+            // Unbound: its line may belong to another Interrupt by now.
+            case Invalid -> {},
             case Free -> {},
         }
         i = i + 1

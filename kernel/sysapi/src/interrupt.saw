@@ -29,13 +29,18 @@ import sos.floor.{checked, sos_handle_release, sos_interrupt_ack}
 /// single-task driver non-reentrant with no lock: the line cannot come back
 /// while the handler runs.
 ///
-/// Built by `Process.interrupt_bind`, and handed back by a refused
-/// `Waiter.give(interrupt:)`: no word constructor, no word extractor.
+/// Built by `System.interrupt_bind`, handed back by a refused
+/// `Process.give(interrupt:)`, and delivered by a message as
+/// `PipeHandle.Interrupt` or a boot record through
+/// `BootHandle.take_interrupt`: no word constructor, no word extractor.
 ///
-/// `NoCopy`, and dropping it releases the handle. The binding is the object's
-/// existence, and the object is freed at its last reference (its last handle,
-/// unless a Waiter attachment still holds it). Freeing masks the line, so it
-/// can be bound again, and credits the quota row.
+/// It has one name, this wrapper's handle. There is no `mint`, and a Waiter
+/// borrows it (`Waiter.add`) and never consumes it, so the holder is always the
+/// one that can `ack`. `NoCopy`, and dropping it releases the handle, which
+/// destroys the Interrupt: the line is masked and unbound, and bindable again
+/// at once. A Waiter attachment does not keep it alive. If one still stands, it
+/// reports the destruction as a wait record whose line is the board's no-line
+/// value, and keeps reporting it until it is removed (§2.10).
 public struct Interrupt {
     public(package) handle: InterruptHandle,
 }

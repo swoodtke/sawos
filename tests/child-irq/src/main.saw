@@ -1,0 +1,97 @@
+// Test child for `irq-give`: holds two Interrupts its launcher bound, one given
+// at boot and one carried in a message, and dies holding both (spec §2.10, §9).
+//
+// It drains its boot set for the Interrupt (`TAG_LINE`) and the server end of a
+// pipe (`TAG_INBOX`), takes the one message waiting there and matches the
+// Interrupt it carries. Attaching each to a Waiter spends
+// `InterruptRight.Wait`, which both the give and the message preserved. It then
+// acks the given one with no fire outstanding: the kernel faults the caller
+// with `BadState`, and that, not `AccessDenied`, is what shows
+// `InterruptRight.Ack` came across too. Dying there is the point. The child
+// holds both Interrupts when it ends, and its teardown destroys them.
+
+import sos.{System, Process, Interrupt, PipeOutlet, PipeHandle, SosStatus}
+
+/// The launcher's tags.
+static TAG_LINE: UInt = 31
+static TAG_INBOX: UInt = 32
+
+/// The keys the two attachments live under.
+static KEY_GIVEN: UInt = 41
+static KEY_SENT: UInt = 42
+
+/// The boot set was not what the launcher promised.
+static EXIT_MISMATCH: UInt = 98
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS childirq: no process handle: {}\n", error)
+        return
+    }
+
+    var line: Interrupt? = None
+    var inbox: PipeOutlet? = None
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                let tag = rec.tag
+                if tag == TAG_LINE {
+                    line = rec.take_interrupt()
+                } else if tag == TAG_INBOX {
+                    inbox = rec.take_outlet()
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+    guard let given = line.take() else {
+        let _ = system.debug_print("SOS childirq: no given Interrupt\n")
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    guard let inb = inbox.take() else {
+        let _ = system.debug_print("SOS childirq: no inbox\n")
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    try serve(&proc, &given, &inb) catch {
+        print("SOS childirq: refused: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+}
+
+/// Attach the given Interrupt and the sent one, then ack with nothing fired.
+/// `ack` does not return, so both Interrupts are still held when the process
+/// ends.
+func serve(proc: &Process, given: &Interrupt,
+           inbox: &PipeOutlet) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(interrupt: &given, key: KEY_GIVEN)
+
+    let got = try inbox.take()
+    let (arrived, request) = move got
+    var msg = move arrived
+    guard let carried = msg.handles[0].take() else { return SosStatus.BadImage }
+    let sent = try as_interrupt(move carried)
+    try waiter.add(interrupt: &sent, key: KEY_SENT)
+
+    print("SOS childirq: attached the given and the sent Interrupt\n")
+    print("SOS childirq: acking with no fire outstanding\n")
+    try given.ack()
+    let _ = move request
+    return
+}
+
+/// A message slot that must be an Interrupt.
+func as_interrupt(h: PipeHandle) -> Result<Interrupt, SosStatus> {
+    match h {
+        case Interrupt(irq) -> { return move irq },
+        case _ -> { return SosStatus.BadImage },
+    }
+}

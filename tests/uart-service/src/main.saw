@@ -69,22 +69,31 @@ static EXIT_FAILED: UInt = 1
 /// A status no arm of this case can produce honestly.
 static BUG: SosStatus = SosStatus.Revoked
 
-/// Root's config. The driver expects its window first and its outlet second;
-/// the client expects its inlet as boot record 0. Both are contracts between
-/// this file and those two, and the kernel supplies no meaning for any of them.
+/// Root's config. The driver expects its window first, its outlet second and
+/// its line third; the client expects its inlet as boot record 0. Both are
+/// contracts between this file and those two, and the kernel supplies no
+/// meaning for any of them.
 static TAG_DRV_BOOT: UInt = 21
 static TAG_DRV_WINDOW: UInt = 22
 static TAG_DRV_OUTLET: UInt = 23
+static TAG_DRV_LINE: UInt = 24
 static TAG_CLI_BOOT: UInt = 31
 static TAG_CLI_INLET: UInt = 32
+
+// The console UART's interrupt line on the board this image runs on, answered
+// by the target's own C file (`tests/irq-lines`).
+extern "C" {
+    func driver_irq_line() -> UInt
+}
 
 /// The keys the two deaths are watched under.
 static KEY_CLIENT: UInt = 71
 static KEY_DRIVER: UInt = 72
 
 /// A whitelist. Both children get the same mask: print, learn their own
-/// Process object, read the clock. `Shutdown`, `ProcessCreate` and `Mint` are
-/// absent by silence, so a System right added later is denied to every child.
+/// Process object, read the clock. `Shutdown`, `ProcessCreate`, `InterruptBind`
+/// and `Mint` are absent by silence, so a System right added later is denied to
+/// every child.
 ///
 /// `Transfer` is in the mask because it is the bit `give` checks on the thing
 /// being given.
@@ -175,9 +184,9 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
 
     // The driver's furnishing: a masked System, the device window
     // (`IoMemoryRight.Transfer` spent, so root can map that window nowhere
-    // after this line), and the connection's server end. Root gives the window
-    // away without ever mapping it, so the registers end up in exactly one
-    // address space.
+    // after this line), the connection's server end and the console's line,
+    // which root binds and gives away. Root gives the window away without ever
+    // mapping it, so the registers end up in exactly one address space.
     let drv_system = try system.mint(rights: CHILD_SYSTEM)
     try driver.give(system: move drv_system, tag: TAG_DRV_BOOT) catch {
         let (why, back) = move error
@@ -190,6 +199,12 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
         return why
     }
     try driver.give(outlet: move outlet, tag: TAG_DRV_OUTLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let line = try system.interrupt_bind(line: driver_irq_line())
+    try driver.give(interrupt: move line, tag: TAG_DRV_LINE) catch {
         let (why, back) = move error
         let _ = move back
         return why

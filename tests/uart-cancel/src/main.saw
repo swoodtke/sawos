@@ -42,6 +42,13 @@ static BUG: SosStatus = SosStatus.Revoked
 static TAG_BOOT: UInt = 21
 static TAG_WINDOW: UInt = 22
 static TAG_OUTLET: UInt = 23
+static TAG_LINE: UInt = 24
+
+// The console UART's interrupt line on the board this image runs on, answered
+// by the target's own C file (`tests/irq-lines`).
+extern "C" {
+    func driver_irq_line() -> UInt
+}
 
 /// The keys. Three distinct words on one Waiter, which is what §2.2's key
 /// uniqueness is for.
@@ -110,6 +117,12 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
         return why
     }
     try driver.give(outlet: move outlet, tag: TAG_OUTLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let line = try system.interrupt_bind(line: driver_irq_line())
+    try driver.give(interrupt: move line, tag: TAG_LINE) catch {
         let (why, back) = move error
         let _ = move back
         return why

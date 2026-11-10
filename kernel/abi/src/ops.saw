@@ -155,8 +155,9 @@ public static MINT_OP: UInt = 0xFFFE
 /// on repetition (a full handle table is `NoResource`, a caller at its handle
 /// quota `QuotaExceeded`).
 ///
-/// `ProcessCreate` is the one factory on this object: processes are minted by
-/// the System, while process-scoped objects are minted by your Process. A
+/// `ProcessCreate` is the factory for processes, and `InterruptBind` (below)
+/// the one for Interrupts: processes are minted by the System, while
+/// process-scoped objects are minted by your Process. A
 /// process table is machine-global and bounded by machine facts, so a refusal
 /// to create one is a System answer, while threads, events, waiters and timers
 /// stay their process's own. `ProcessSelf` is the precedent: a Process handle
@@ -185,6 +186,14 @@ public static MINT_OP: UInt = 0xFFFE
 /// is the retrieval op, not a bootinfo section, which is the vDSO discipline's
 /// point; and `kernel/sysapi` depends on `sosabi` and `sosrt` only, never on a
 /// HAL, so a build-time constant cannot see the tier either.
+///
+/// `InterruptBind` binds an IRQ line and mints the Interrupt that names it into
+/// the caller's table. A line is a machine-wide resource, so the op is on
+/// System for `ProcessCreate`'s reason, and a fault it raises lands on the
+/// caller. Its one argument is the line. The new handle is charged to the
+/// caller's `Handle` row like any mint, but the bind has no Interrupt row: at
+/// most one Interrupt is live per line, so the board's line count and the
+/// Interrupt slab bound the objects.
 ///
 /// `StatsRegionMap` hands out access without possession. It installs a
 /// read-only protection row over the kernel's published stats region in the
@@ -222,6 +231,7 @@ public enum SystemOp: UInt {
     case SlabDonate = 5,
     case TierGet = 6,
     case StatsRegionMap = 7,
+    case InterruptBind = 8,
 }
 
 // =============================================================================
@@ -245,12 +255,11 @@ public enum SystemOp: UInt {
 /// is one op on each object.
 ///
 /// The factory ops (`ThreadCreate`, `EventCreate`, `WaiterCreate`,
-/// `InterruptBind`, `PipeCreate`) act on the process the handle names, whether
-/// or not that is the caller. A factory charges that process's quota and
-/// mints into its table, so through another process's handle the word that
-/// comes back is that process's. `PipeCreate` also uses the caller,
-/// but only for its buffer: the answer record is written into the caller's
-/// memory.
+/// `PipeCreate`) act on the process the handle names, whether or not that is
+/// the caller. A factory charges that process's quota and mints into its table,
+/// so through another process's handle the word that comes back is that
+/// process's. `PipeCreate` also uses the caller, but only for its buffer: the
+/// answer record is written into the caller's memory.
 ///
 /// Op numbers are not ABI (userspace names the case and this module supplies
 /// the value, and the two are compiled into one image together), so a table may
@@ -322,12 +331,11 @@ public enum ProcessOp: UInt {
     case GetStatus = 3,
     case EventCreate = 4,
     case WaiterCreate = 5,
-    case InterruptBind = 6,
-    case Start = 7,
-    case BootHandleNext = 8,
-    case Give = 9,
-    case PipeCreate = 10,
-    case Stats = 11,
+    case Start = 6,
+    case BootHandleNext = 7,
+    case Give = 8,
+    case PipeCreate = 9,
+    case Stats = 10,
 }
 
 /// Whether `ProcessOp.Start`'s second argument carries a boot tag: the op's
@@ -491,10 +499,10 @@ public static WAITER_ADD_FLAGS: UInt = WAITER_ADD_ONESHOT | WAITER_ADD_CONSUMING
 /// exactly one.
 ///
 /// There is deliberately no `Bind`/`Unbind` pair either: the binding is the
-/// object's existence (`ProcessOp.InterruptBind` takes the line), so a bound
-/// line is a live slot and an unbound one is a slot that was freed. A
-/// rebindable Interrupt would let one handle name two different devices over
-/// its life, which a capability must not do.
+/// object's existence (`SystemOp.InterruptBind` takes the line), and releasing
+/// its one handle destroys it and gives the line back. A rebindable Interrupt
+/// would let one handle name two different devices over its life, which a
+/// capability must not do.
 public enum InterruptOp: UInt {
     case Ack = 0,
 }
@@ -894,7 +902,7 @@ public enum ReplyWaitLeg: UInt {
 // When an op is added to a table, re-point that table's assert at the new
 // highest case. A bound tested against a case that is no longer the highest
 // passes while the table walks past `MINT_OP`.
-static_assert((SystemOp.StatsRegionMap as UInt) < MINT_OP,
+static_assert((SystemOp.InterruptBind as UInt) < MINT_OP,
               "an op table must stay below the universal ops")
 static_assert((ProcessOp.Stats as UInt) < MINT_OP,
               "an op table must stay below the universal ops")

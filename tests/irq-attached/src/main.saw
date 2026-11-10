@@ -1,0 +1,110 @@
+// An attachment does not extend an Interrupt's life (spec §2.10). Releasing the
+// handle destroys the Interrupt whether or not a Waiter is watching it: the
+// line is unbound and free to bind again at once, and the attachment, which is
+// all that still names the slot, fires as an invalidated waitable does.
+//
+// Root binds a line, borrows its Interrupt into a Waiter and releases the
+// handle. The transcript reads, with each line's claim beside it:
+//
+//   SOS irqattached: capacity with it live=3         <- the slab has four slots
+//   SOS irqattached: released it, rebound line 5     <- the line was free at
+//                                                       once; a line still
+//                                                       bound would be a
+//                                                       `LineBound` fault
+//   SOS irqattached: capacity with it invalid=3      <- ...but the attachment
+//                                                       holds the invalid slot
+//   SOS irqattached: wait 1 key=61 line=0            <- the record carries the
+//                                                       no-line value, not 5
+//   SOS irqattached: wait 2 key=61 line=0            <- terminal: waiting does
+//                                                       not consume it
+//   SOS irqattached: removed it, capacity=4          <- removing the last
+//                                                       reference frees it
+//
+// The capacity counts bind lines above the one under test until the slab
+// refuses (`NoResource`), each Interrupt held in its own frame while the next
+// is asked for. Line 0 is the board's no-line value on both machines.
+
+import sos.{System, Process, Waiter, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A line both machines wire and neither asserts unasked.
+static LINE: UInt = 5
+
+/// The first line the capacity count binds. None of the count's lines is
+/// `LINE`, and none reaches the console's.
+static FIRST_PROBE_LINE: UInt = 6
+
+/// The key the attachment lives under.
+static KEY: UInt = 61
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS irqattached: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS irqattached: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS irqattached: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    let held = try system.interrupt_bind(line: LINE)
+    let waiter = try proc.waiter_create()
+    try waiter.add(interrupt: &held, key: KEY)
+    print("SOS irqattached: capacity with it live={}\n",
+          count_free(&system, FIRST_PROBE_LINE))
+
+    // The release. The attachment's reference is the only one left.
+    let _ = move held
+
+    let again = try system.interrupt_bind(line: LINE)
+    print("SOS irqattached: released it, rebound line {}\n", LINE)
+    let _ = move again
+    print("SOS irqattached: capacity with it invalid={}\n",
+          count_free(&system, FIRST_PROBE_LINE))
+
+    try fired(&waiter, 1)
+    try fired(&waiter, 2)
+
+    try waiter.remove(KEY)
+    print("SOS irqattached: removed it, capacity={}\n",
+          count_free(&system, FIRST_PROBE_LINE))
+    return
+}
+
+/// Wait once and report the record, which must be the attachment's.
+func fired(waiter: &Waiter, nth: UInt) -> Result<Void, SosStatus> {
+    let woke = try waiter.wait()
+    if woke.key != KEY {
+        return BUG
+    }
+    match woke.what {
+        case Interrupt(line) -> {
+            print("SOS irqattached: wait {} key={} line={}\n", nth, woke.key, line)
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
+
+/// Bind lines from `line` up until the slab refuses, each Interrupt held in
+/// its own frame while the next is asked for, and answer how many were bound.
+func count_free(system: &System, line: UInt) -> UInt {
+    let irq = try system.interrupt_bind(line: line) catch { return 0 }
+    let n = count_free(&system, line + 1)
+    let _ = move irq
+    return n + 1
+}

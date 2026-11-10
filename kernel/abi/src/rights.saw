@@ -140,6 +140,16 @@
 /// to be able to supervise the machine) and absent from the ordinary child
 /// mask, because "everything a child normally gets" must not include every
 /// peer's trap counts.
+///
+/// `InterruptBind` gates binding an IRQ line, the strongest creation authority
+/// there is: it is what separates a driver from an ordinary process. A line is
+/// a machine-wide resource, so the bit is on System and not on a Process
+/// handle, where a process could derive it again whatever its launcher
+/// withheld (`ProcessSelf` mints the Process default set). The launcher's mask
+/// on the System handle it gives a child is the lever: a launcher binds each
+/// line itself and gives the Interrupt to the driver that services it, so the
+/// driver holds the lines it was given and no authority to bind another. It is
+/// in the root set and absent from the ordinary child mask.
 public enum SystemRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
@@ -151,6 +161,7 @@ public enum SystemRight: UInt32 {
     case SlabDonate = 1 << 13,
     case TierGet = 1 << 14,
     case StatsRegionMap = 1 << 15,
+    case InterruptBind = 1 << 16,
 }
 
 // The universal low byte, pinned. Every kind's enum repeats these two asserts
@@ -179,6 +190,8 @@ static_assert((SystemRight.TierGet as UInt32) >= (1 << 8),
               "kind-specific right TierGet must start at bit 8 or above")
 static_assert((SystemRight.StatsRegionMap as UInt32) >= (1 << 8),
               "kind-specific right StatsRegionMap must start at bit 8 or above")
+static_assert((SystemRight.InterruptBind as UInt32) >= (1 << 8),
+              "kind-specific right InterruptBind must start at bit 8 or above")
 
 /// A right on a Process object (§2 table row).
 ///
@@ -229,14 +242,6 @@ static_assert((SystemRight.StatsRegionMap as UInt32) >= (1 << 8),
 /// "may create Events" and "may create Waiters" the same capability, which they
 /// are not.
 ///
-/// `InterruptBind` is the one whose absence matters most, and it carries a much
-/// stronger authority than its shape suggests: an Interrupt binds an IRQ line,
-/// so the bit is what separates a driver process from an ordinary one. It is in
-/// the one Process default set, so a process that holds
-/// `SystemRight.ProcessSelf` can derive a Process handle carrying it whatever
-/// its System handle was narrowed to. Only that process can drop it from the
-/// handle it derives; a launcher cannot (see `process_rights`).
-///
 /// `Map` is an authority over this process. `Memory.Map` / `IoMemory.Map` name
 /// a target Process as their argument, and installing a protection row into
 /// somebody's domain is not something possession of a region should imply. So a
@@ -282,7 +287,6 @@ public enum ProcessRight: UInt32 {
     case Wait = 1 << 10,
     case EventCreate = 1 << 11,
     case WaiterCreate = 1 << 12,
-    case InterruptBind = 1 << 13,
     case Start = 1 << 14,
     case BootHandles = 1 << 15,
     case ThreadSelf = 1 << 16,
@@ -306,8 +310,6 @@ static_assert((ProcessRight.EventCreate as UInt32) >= (1 << 8),
               "kind-specific right EventCreate must start at bit 8 or above")
 static_assert((ProcessRight.WaiterCreate as UInt32) >= (1 << 8),
               "kind-specific right WaiterCreate must start at bit 8 or above")
-static_assert((ProcessRight.InterruptBind as UInt32) >= (1 << 8),
-              "kind-specific right InterruptBind must start at bit 8 or above")
 static_assert((ProcessRight.Start as UInt32) >= (1 << 8),
               "kind-specific right Start must start at bit 8 or above")
 static_assert((ProcessRight.BootHandles as UInt32) >= (1 << 8),
@@ -433,8 +435,11 @@ static_assert((WaiterRight.Wait as UInt32) >= (1 << 8),
 /// is its own device's interrupt-enable register, through the window it was
 /// granted, which is where that decision belongs.
 ///
-/// `Mint` is granted at creation on the uniform lean the default-sets section
-/// records.
+/// `Transfer` is how the one handle reaches the driver that services the line.
+/// `Mint` is declared and never handed out: an Interrupt has one name, its
+/// handle, so there is no sibling to mint, and attenuation is monotonic, so no
+/// handle can regain the bit. Narrowing a handle before it travels is a give's
+/// keep mask (a monitor given `Wait` alone cannot rearm the line).
 public enum InterruptRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
@@ -914,6 +919,11 @@ public func root_system_rights() -> UInt32 {
      // supervise the machine, and it is the kind of bit a deployment strips on
      // the way down to anything that is not a supervisor.
      | (SystemRight.StatsRegionMap as UInt32)
+     // `InterruptBind` is here on `SlabDonate`'s terms: a bit nothing starts
+     // with is a bit nothing can hold, root is the launcher that binds every
+     // line and gives each Interrupt to its driver, and a deployment strips
+     // the bit on the way down to anything that is not a binder.
+     | (SystemRight.InterruptBind as UInt32)
      | (SystemRight.Transfer as UInt32))
 }
 
@@ -926,7 +936,7 @@ public func root_system_rights() -> UInt32 {
 /// be a second place to forget a bit.
 ///
 /// What is in it, all named for the op it gates: `ThreadCreate`, `ThreadSelf`,
-/// `Exit`, `Wait`, `EventCreate`, `WaiterCreate`, `InterruptBind`, `Start`,
+/// `Exit`, `Wait`, `EventCreate`, `WaiterCreate`, `Start`,
 /// `BootHandles`, `Give`, `Map`, `PipeCreate`, `Stats`, plus the two universal
 /// bits `Transfer` and `Mint`.
 ///
@@ -940,14 +950,13 @@ public func root_system_rights() -> UInt32 {
 /// `SystemOp.ProcessSelf` mints this set intersected with the mask the
 /// deriving process passes. A launcher's mask on the System handle it gives a
 /// child does not reach that handle, and a launcher has no way to narrow it:
-/// only the child can drop `InterruptBind` or `Map`, the bits that separate a
-/// driver from an ordinary process, from the handle it derives (spec §9).
+/// only the child can drop `Map`, the bit that separates a driver from an
+/// ordinary process, from the handle it derives (spec §9).
 public func process_rights() -> UInt32 {
     ((ProcessRight.ThreadCreate as UInt32) | (ProcessRight.ThreadSelf as UInt32)
      | (ProcessRight.Exit as UInt32) | (ProcessRight.Wait as UInt32)
      | (ProcessRight.EventCreate as UInt32)
      | (ProcessRight.WaiterCreate as UInt32)
-     | (ProcessRight.InterruptBind as UInt32)
      | (ProcessRight.Start as UInt32)
      | (ProcessRight.BootHandles as UInt32) | (ProcessRight.Give as UInt32)
      | (ProcessRight.Map as UInt32)
@@ -1125,13 +1134,18 @@ public func waiter_rights() -> UInt32 {
 
 /// What the kernel mints for an Interrupt a process has just bound (§9).
 ///
-/// Both ends of the cycle, for the reason `event_rights` gives: the creator
-/// made the object and there is nobody to attenuate against yet. A monitor
-/// handle carrying `Wait` alone is a derivation, and §3 makes derivation
-/// monotonic, so it can never widen back to this.
+/// Both ends of the cycle, for the reason `event_rights` gives: the binder
+/// made the object and there is nobody to attenuate against yet. `Transfer` is
+/// in the set so that a launcher can hand a driver its line.
+///
+/// `Mint` is not, for the reason `pipe_reply_rights` withholds it: an Interrupt
+/// has one name, so a sibling could only be a second name for a line that one
+/// handle destroys when it is released. Attenuation is monotonic, so no
+/// sequence of ops puts the bit back. A masked copy for a monitor is a give's
+/// keep mask.
 public func interrupt_rights() -> UInt32 {
-    ((InterruptRight.Wait as UInt32) | (InterruptRight.Ack as UInt32)
-     | (InterruptRight.Mint as UInt32))
+    ((InterruptRight.Transfer as UInt32) | (InterruptRight.Wait as UInt32)
+     | (InterruptRight.Ack as UInt32))
 }
 
 /// What the kernel mints for a Clock a process has just been granted (§2

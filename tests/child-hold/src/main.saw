@@ -1,0 +1,81 @@
+// Test child for `irq-peer-gone`: holds an Interrupt its launcher gave it,
+// sleeps long enough for the launcher to park, then lets the Interrupt go.
+//
+// The sleep is what makes the launcher's park the first thing that happens: a
+// wake that only a destruction in progress can deliver, not a level the
+// launcher finds already raised when it first looks.
+//
+// How it lets go depends on the boot set. Given a second record under
+// `TAG_RELEASE` it releases the Interrupt explicitly and then exits; given
+// none it exits holding it, and its teardown releases it.
+
+import sos.{System, Process, Interrupt, ClockType, SosStatus}
+
+static TAG_LINE: UInt = 31
+static TAG_RELEASE: UInt = 32
+
+/// Twenty milliseconds, three orders of magnitude more than the launcher needs
+/// to reach its park.
+static SLEEP_NS: UInt64 = 20_000_000
+
+static KEY: UInt = 1
+static EXIT_CODE: UInt = 5
+static EXIT_MISMATCH: UInt = 98
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS hold: no process handle: {}\n", error)
+        return
+    }
+
+    var line: Interrupt? = None
+    var release = false
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                let tag = rec.tag
+                if tag == TAG_LINE {
+                    line = rec.take_interrupt()
+                } else if tag == TAG_RELEASE {
+                    release = true
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+    guard let irq = line.take() else {
+        let _ = system.debug_print("SOS hold: no Interrupt\n")
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+
+    try nap(&system, &proc) catch {
+        print("SOS hold: nap refused: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+
+    if release {
+        let _ = system.debug_print("SOS hold: releasing the Interrupt\n")
+        let _ = move irq
+    } else {
+        let _ = system.debug_print("SOS hold: exiting holding the Interrupt\n")
+    }
+    let _ = proc.exit(EXIT_CODE)
+}
+
+/// Park on a Timer for `SLEEP_NS`.
+func nap(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    let clock = try system.clock_get(type: ClockType.Monotonic)
+    let waiter = try proc.waiter_create()
+    let timer = try clock.timer_create()
+    try waiter.add(timer: &timer, key: KEY)
+    try timer.arm(after_ns: SLEEP_NS)
+    let _ = try waiter.wait()
+    return
+}

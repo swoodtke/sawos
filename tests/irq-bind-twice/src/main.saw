@@ -1,0 +1,40 @@
+// A line already bound answers `LineBound` (spec §2.8): two Interrupts on one
+// line would be two objects with one fire between them and two acks for it, so
+// the second bind is refused. It is a fault, because the caller holds the first
+// Interrupt and could have checked.
+//
+// The transcript reads:
+//
+//   SOS bindtwice: bound line 5
+//   SOS bindtwice: binding it again
+//   SOS: process fault: that interrupt line is already bound
+//
+// The first Interrupt is held across the second bind, so the line is bound for
+// the whole of it; `interrupt_unbind` is the case where it is not.
+
+import sos.{System}
+
+static EXIT_FAILED: UInt = 1
+
+/// A line both machines wire and neither asserts unasked.
+static QUIET_LINE: UInt = 5
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let first = try system.interrupt_bind(line: QUIET_LINE) catch {
+        print("SOS bindtwice: first bind failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS bindtwice: bound line {}\n", QUIET_LINE)
+    let _ = system.debug_print("SOS bindtwice: binding it again\n")
+
+    // Does not return: the kernel terminates this process.
+    let _ = system.interrupt_bind(line: QUIET_LINE)
+
+    let _ = move first
+    let _ = system.debug_print("SOS bindtwice: still alive, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

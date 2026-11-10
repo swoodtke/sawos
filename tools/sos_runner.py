@@ -269,6 +269,24 @@ QUOTA_EXCEEDED_PKG = os.path.join(TESTS_DIR, "quota-exceeded")
 QUOTA_VS_WALL_PKG = os.path.join(TESTS_DIR, "quota-vs-wall")
 REFCOUNT_FREE_PKG = os.path.join(TESTS_DIR, "refcount-free")
 INTERRUPT_UNBIND_PKG = os.path.join(TESTS_DIR, "interrupt-unbind")
+
+# The Interrupt object's lifetime and binding (spec 2.8, 2.10). An Interrupt has
+# one name, its handle: bound through System, given or sent to a driver, and
+# destroyed by the release of that handle (or the death of its holder) whether
+# or not a Waiter is attached. `irq-lines` is not a package: it holds the board
+# facts (a line number) the tests link per target.
+IRQ_BIND_DENIED_PKG = os.path.join(TESTS_DIR, "irq-bind-denied")
+IRQ_BIND_TWICE_PKG = os.path.join(TESTS_DIR, "irq-bind-twice")
+IRQ_BIND_TIMER_PKG = os.path.join(TESTS_DIR, "irq-bind-timer")
+IRQ_CONSUME_REFUSED_PKG = os.path.join(TESTS_DIR, "irq-consume-refused")
+IRQ_MINT_DENIED_PKG = os.path.join(TESTS_DIR, "irq-mint-denied")
+IRQ_ATTACHED_PKG = os.path.join(TESTS_DIR, "irq-attached")
+IRQ_GIVE_PKG = os.path.join(TESTS_DIR, "irq-give")
+GIVE_INTERRUPT_RETURNS_PKG = os.path.join(TESTS_DIR, "give-interrupt-returns")
+CHILD_IRQ_PKG = os.path.join(TESTS_DIR, "child-irq")
+IRQ_PEER_GONE_PKG = os.path.join(TESTS_DIR, "irq-peer-gone")
+CHILD_HOLD_PKG = os.path.join(TESTS_DIR, "child-hold")
+CHILD_HOLD2_PKG = os.path.join(TESTS_DIR, "child-hold2")
 MAPPING_SLOT_FREE_PKG = os.path.join(TESTS_DIR, "mapping-slot-free")
 
 # The allocator. It borrows `child-touch` as its child: leg 2 needs a child that
@@ -1651,7 +1669,7 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS badline: binding a line this board lacks",
                        "SOS: process fault: argument outside its domain",
-                       "SOS: process teardown handles={four} threads={one} "
+                       "SOS: process teardown handles={three} threads={one} "
                        "events={zero} waiters={zero} interrupts={zero}"],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
@@ -2881,6 +2899,183 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
+        # Binding a line is a System op on its own right (spec 2.8). A System
+        # sibling whose keep mask leaves `InterruptBind` out cannot bind: the
+        # rights check faults the caller, like any op's missing right.
+        "name": "irq_bind_denied",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": IRQ_BIND_DENIED_PKG,
+        "expect_out": ["{banner}",
+                       "SOS binddenied: binding through a System handle "
+                       "without the right",
+                       "SOS: process fault: access denied",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # A line already bound is a `LineBound` fault on the caller. The first
+        # Interrupt is destroyed by the teardown's close-all, so the teardown
+        # line counts one: `handles={four}` is root's boot set (three) and that
+        # Interrupt.
+        "name": "irq_bind_twice",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": IRQ_BIND_TWICE_PKG,
+        "expect_out": ["{banner}",
+                       "SOS bindtwice: bound line 5",
+                       "SOS bindtwice: binding it again",
+                       "SOS: process fault: that interrupt line is already "
+                       "bound",
+                       "SOS: process teardown handles={four} threads={one} "
+                       "events={zero} waiters={zero} interrupts={one}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # The kernel's own timer line is a `BadArg` fault. Its number is a board
+        # fact, which the test links per target (`tests/irq-lines`).
+        "name": "irq_bind_timer_line",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": IRQ_BIND_TIMER_PKG,
+        "expect_out": ["{banner}",
+                       "SOS bindtimer: binding the kernel timer's line",
+                       "SOS: process fault: argument outside its domain",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # The consuming flag on an Interrupt target is a `BadArg` fault (spec
+        # 2.2): its handle is its one name. The refused attach consumed
+        # nothing, so the teardown still finds the Interrupt, the Waiter and the
+        # Process handle beside root's boot set: `handles={six}`.
+        "name": "irq_consume_refused",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": IRQ_CONSUME_REFUSED_PKG,
+        "expect_out": ["{banner}",
+                       "SOS irqconsume: attaching an Interrupt with the "
+                       "consuming flag",
+                       "SOS: process fault: argument outside its domain",
+                       "SOS: process teardown handles={six} threads={one} "
+                       "events={zero} waiters={one} interrupts={one}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # An Interrupt has one name (spec 2.10, 3): `Mint` is not in its default
+        # set, so the raw `MINT_OP` is an `AccessDenied` fault from the rights
+        # check. The teardown destroys the one Interrupt: `handles={four}` is
+        # root's boot set and that handle.
+        "name": "irq_mint_denied",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": IRQ_MINT_DENIED_PKG,
+        "expect_out": ["{banner}",
+                       "SOS irqmint: minting a sibling of an Interrupt",
+                       "SOS: process fault: access denied",
+                       "SOS: process teardown handles={four} threads={one} "
+                       "events={zero} waiters={zero} interrupts={one}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # An attachment does not extend an Interrupt's life (spec 2.10).
+        # Releasing the handle destroys the Interrupt: the line is bindable at
+        # once (`rebound line 5`; a line still bound would end the process),
+        # while the attachment holds the invalid slot (`invalid=3` of the four
+        # slots) and fires with the no-line value, `line=0`, not the old line.
+        # The level is terminal (`wait 2` reads the same) until the attachment
+        # is removed by key, which frees the slot (`capacity=4`).
+        "name": "interrupt_attached_release",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": IRQ_ATTACHED_PKG,
+        "expect_out": ["{banner}",
+                       "SOS irqattached: capacity with it live=3",
+                       "SOS irqattached: released it, rebound line 5",
+                       "SOS irqattached: capacity with it invalid=3",
+                       "SOS irqattached: wait 1 key=61 line=0",
+                       "SOS irqattached: wait 2 key=61 line=0",
+                       "SOS irqattached: removed it, capacity=4",
+                       "SOS irqattached: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # An Interrupt root binds is givable and sendable (spec 3, 2.1), usable
+        # where it lands, and destroyed by its holder's death (spec 2.10). The
+        # child attaches the given one and the sent one, then acks with no
+        # fire outstanding: `BadState`, which shows the `Ack` right travelled
+        # (`AccessDenied` would not). The child's teardown destroys both
+        # (`interrupts={two}`), and root, which gave away the only name of each,
+        # binds both lines again. A real fire serviced across a boundary is
+        # `child_echo_*`.
+        "name": "interrupt_give",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": IRQ_GIVE_PKG,
+        "children": [CHILD_IRQ_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS irqgive: started",
+                       "SOS childirq: attached the given and the sent "
+                       "Interrupt",
+                       "SOS childirq: acking with no fire outstanding",
+                       "SOS: process fault: object in the wrong state "
+                       "process={one}",
+                       "SOS: process teardown handles={seven} threads={one} "
+                       "events={zero} waiters={one} interrupts={two}",
+                       "SOS irqgive: the holder ended status=131077",
+                       "SOS irqgive: capacity after the holder's death=4",
+                       "SOS irqgive: both lines bound again",
+                       "SOS irqgive: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A parked Waiter is woken when the holder of an attached Interrupt
+        # dies (spec 2.2, 2.10). Root attaches the Interrupt, gives it to a
+        # child that sleeps, and parks: the Interrupt's destruction wakes root
+        # with its key and `line=0`, the no-line value. Round 0 is a
+        # persistent attachment and the child exits holding the Interrupt, so
+        # its teardown destroys it: the level is terminal
+        # (`wait 2` reads the same), the invalid slot is held (`invalid=3`) and
+        # freed by `remove`. Round 1 is one-shot and the child releases the
+        # Interrupt itself: the delivery detaches inside the destruction and
+        # drops the last reference, so the slot is free at once
+        # (`capacity=4`).
+        "name": "interrupt_peer_gone",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": IRQ_PEER_GONE_PKG,
+        "children": [CHILD_HOLD_PKG, CHILD_HOLD2_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS irqpeergone: round 0 wait 1 key=91 line=0",
+                       "SOS irqpeergone: round 0 wait 2 key=91 line=0",
+                       "SOS irqpeergone: persistent, capacity with it "
+                       "invalid=3",
+                       "SOS irqpeergone: round 0 done, capacity=4",
+                       "SOS irqpeergone: round 1 wait 1 key=91 line=0",
+                       "SOS irqpeergone: round 1 done, capacity=4",
+                       "SOS irqpeergone: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A give refused for capacity hands an Interrupt back usable, as
+        # `give_waitable_returns` does a Waiter. `gave 12` is the child's handle
+        # budget. The refusal released nothing, so the returned Interrupt is
+        # the live one: it attaches, and releasing it frees the line.
+        "name": "give_interrupt_returns",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": GIVE_INTERRUPT_RETURNS_PKG,
+        "children": [CHILD_BYE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS irqreturns: gave 12 siblings then refused: this "
+                       "process is at its quota",
+                       "SOS irqreturns: the Interrupt give was refused: this "
+                       "process is at its quota",
+                       "SOS irqreturns: the returned Interrupt attached",
+                       "SOS irqreturns: released it, rebound the line",
+                       "SOS irqreturns: done"],
+        "expect_clean_exit": True,
+    },
+    {
         # Mapping slots recycle.
         #
         # `rounds=12` is past `MAX_MAPPINGS`, so the slab is demonstrably
@@ -3121,9 +3316,10 @@ TEST_CASES = [
         # It is `uart_echo_ns16550` above with one thing changed, and it is not
         # the driver: the echoing process is no longer the one the kernel
         # loaded. Root drains the console's register page out of its own boot
-        # set, gives it away, mints a masked System beside it, starts the child
-        # and parks on its death. Everything after `gave the window` is a
-        # process that root created, driving a device root no longer has.
+        # set and binds the console's line, gives both away, mints a masked
+        # System beside them, starts the child and parks on its death.
+        # Everything after `gave the line` is a process that root created,
+        # driving a device and servicing a line root no longer has.
         #
         # What each asserted line rules out, beyond what the root-as-driver
         # twin already ruled out:
@@ -3133,12 +3329,17 @@ TEST_CASES = [
         #   gave the window        `Transfer` spent on an `IoMemory`; root's
         #                          wrapper is disarmed and root can map it
         #                          nowhere
+        #   gave the line          root bound the line
+        #                          (`SystemOp.InterruptBind`) and the Interrupt
+        #                          crossed with `Transfer`; root cannot ack it,
+        #                          and the child holds no authority to bind
+        #                          another line
         #   window mapped          the child called `Process.map(iomemory:)` on
         #                          its own Process handle: the give moved
         #                          authority, and where the row goes was then
         #                          the holder's business
-        #   Zq7#                   give, drain, map, bind, enable, park, wake
-        #                          and ack, all across a process boundary
+        #   Zq7#                   give, drain, map, enable, park, wake and
+        #                          ack, all across a process boundary
         #   status=65536           `Exited`(1) << 16 | 0, read by root through
         #                          the Process handle it kept, so the driver's
         #                          clean ending is a fact root observed rather
@@ -3162,6 +3363,7 @@ TEST_CASES = [
                        "SOS: console handover",
                        "SOS driverchild: created",
                        "SOS driverchild: gave the window",
+                       "SOS driverchild: gave the line",
                        "SOS driverchild: started",
                        "SOS echo: window mapped",
                        "SOS echo: driver up",
@@ -3171,7 +3373,8 @@ TEST_CASES = [
                        # takes it back: the masked System its launcher gave it,
                        # the Process handle it derived, the IoMemory it was
                        # given, the Mapping that window produced, the Interrupt
-                       # it bound and the Waiter it parked on. Six, and every
+                       # it was given and the Waiter it parked on. Six, and
+                       # every
                        # one is a step of §9's cycle: a driver is exactly its
                        # handles.
                        "SOS: process teardown handles={six} threads={one} "
@@ -3199,6 +3402,7 @@ TEST_CASES = [
                        "SOS: console handover",
                        "SOS driverchild: created",
                        "SOS driverchild: gave the window",
+                       "SOS driverchild: gave the line",
                        "SOS driverchild: started",
                        "SOS echo: window mapped",
                        "SOS echo: driver up",

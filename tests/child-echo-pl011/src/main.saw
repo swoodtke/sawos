@@ -9,9 +9,10 @@
 // each.
 //
 // It differs from a root driver in the first two ways its twin lists, neither
-// of them about the device: the window arrives by give rather than as a boot
-// region row (the drain call is identical), and it ends with `Process.exit`
-// because a driver child holds no `SystemRight.Shutdown`.
+// of them about the device: the window and the line arrive by give rather than
+// as a boot region row and a bind of its own (the drain call is identical), and
+// it ends with `Process.exit` because a driver child holds no
+// `SystemRight.Shutdown`.
 //
 // The window keeps its device memory attribute (nGnRE, uncached, no merging)
 // across the handover. The attribute is a property of the `IoMemory` kind,
@@ -35,11 +36,6 @@ import sosrt.{ascii_byte}
 /// device window sits at its physical address, whoever handed it over: the
 /// board's `map_place` returns the hardware address for a device window.
 static UART_BASE: UInt = 0x0900_0000
-
-/// The interrupt line this board wires the console to: the first shared
-/// peripheral line, which this controller numbers after its thirty-two
-/// per-core ones.
-static UART_IRQ: UInt = 33
 
 /// The key this driver attaches under — its own word, handed back unread.
 static ECHO_KEY: UInt = 0x5541
@@ -210,8 +206,15 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS echo: window mapped\n")
 
-    let irq = try proc.interrupt_bind(line: UART_IRQ) catch {
+    // The line, drained the way the window was: its launcher bound it and gave
+    // the Interrupt, and this handle is its one name.
+    var line_record = try proc.boot_handle_next() catch {
         print("SOS echo: no interrupt: {}\n", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    guard let irq = line_record.take_interrupt() else {
+        let _ = system.debug_print("SOS echo: boot record is not an interrupt\n")
         let _ = proc.exit(EXIT_FAILED)
         return
     }

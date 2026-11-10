@@ -66,7 +66,7 @@ import sosabi.{SosStatus, PipeInletHandle, PipeInletOp, PipeOutletHandle,
                NO_HANDLE, PIPE_BODY_BYTES, PIPE_MSG_HANDLES,
                BootHandleKind, InletLevel, OutletLevel, ReplyLevel,
                MemoryHandle, IoMemoryHandle, EventHandle, ThreadHandle,
-               TimerHandle,
+               TimerHandle, InterruptHandle,
                PipeMsgMeta, PipeMsgRecord, PipeSendRecord, PipeReplyWaitRecord,
                PipeTakeRecord,
                ReplyWaitLeg, WaitBuffer, WaitTag, WaiterHandle,
@@ -88,6 +88,7 @@ import sos.memory.{Memory}
 import sos.iomemory.{IoMemory}
 import sos.event.{Event}
 import sos.timer.{Timer}
+import sos.interrupt.{Interrupt}
 // Qualified, as in `sos.system`: `std.task` publishes a prelude `Thread<T>`,
 // and a bare imported `Thread` ties with it.
 import sos.thread
@@ -115,8 +116,8 @@ import sos.thread
 /// a wrapper in and a receiver matches it out.
 ///
 /// The set is "givable and declarable". Givable, because staging checks the
-/// universal `Transfer` bit: Interrupt, Clock and Mapping handles never carry
-/// it, so a case for one would be dead surface. Declarable,
+/// universal `Transfer` bit: Clock and Mapping handles never carry it, so a
+/// case for one would be dead surface. Declarable,
 /// because `Process` and `System` are declared in `sos.system`, which imports
 /// this module, so a case for either would be an import cycle. The kernel
 /// refuses to stage those two rather than deliver something the receiver could
@@ -137,6 +138,7 @@ public enum PipeHandle {
     case Thread(t: thread.Thread),
     case Waiter(w: Waiter),
     case Timer(tm: Timer),
+    case Interrupt(irq: Interrupt),
 }
 
 extension PipeHandle: NoCopy {}
@@ -284,6 +286,14 @@ extension PipeHandles {
         owned.handle = TimerHandle(NO_HANDLE)
     }
 
+    public func put(&var self, at: Int, interrupt: Interrupt) {
+        self.free_slot(at)
+        var owned = move interrupt
+        self.kinds[at] = BootHandleKind.Interrupt as UInt8
+        self.words[at] = owned.handle
+        owned.handle = InterruptHandle(NO_HANDLE)
+    }
+
     /// Empty slot `at`, releasing whatever was in it. The bounds check lives
     /// here, so the funnels above read as one line of intent each.
     func free_slot(&var self, at: Int) {
@@ -404,6 +414,9 @@ extension ReplyDelivery {
 /// `ReplyDelivery`'s accessors exist for that.
 public enum WaitPayload {
     case Event(word: UInt),
+    /// The line that fired. An Interrupt whose handle was released while this
+    /// attachment stood reports the board's no-line value instead, and its
+    /// line is free to be bound again (§2.10).
     case Interrupt(line: UInt),
     case Timer(fires: UInt),
     case Process(status: UInt),
@@ -487,6 +500,7 @@ func decode_handle(kind: UInt8, word: UInt) -> PipeHandle? {
         case Thread -> PipeHandle.Thread(t: thread.Thread(handle: ThreadHandle(word))),
         case Waiter -> PipeHandle.Waiter(w: Waiter(handle: WaiterHandle(word))),
         case Timer -> PipeHandle.Timer(tm: Timer(handle: TimerHandle(word))),
+        case Interrupt -> PipeHandle.Interrupt(irq: Interrupt(handle: InterruptHandle(word))),
         case Process -> {
             panic("sos: a message carried a Process handle, which the kernel refuses to stage")
         },
