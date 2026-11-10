@@ -85,11 +85,13 @@ THR.
 
 | Symbol | Where | Contract | Why not Saw |
 |---|---|---|---|
-| `_start` (entered as `_start_phys`) | boot.S | Reset entry, and the whole relocation window. At its physical address, MMU off: a masked stack, `CPACR_EL1.FPEN`, `.bss` zerofill, and a two-descriptor boot table installed in TTBR0 and TTBR1 at once — one page serving as both the identity map and a coarse linear map, because a kernel address and its physical twin share a level-1 index. Then MMU on, branch high, set the real stack and `VBAR_EL1`, build the real tables (`sos_mmu_tables`, `sos_page_tables_build`), install TTBR1 from the identity map, install TTBR0 = set 0, `kmain`. Never returns. `ENTRY` names `_start_phys` (`_start - LINMAP_OFFSET`) because QEMU sets the reset PC from `e_entry` with the MMU off. | Instructions: `msr`, and — the reason the window exists at all — a high-linked kernel cannot call compiled code until the MMU is on and TTBR1 is walked. |
+| `_start` (entered as `_start_phys`) | boot.S | Reset entry, and the whole relocation window. At its physical address, MMU off: a masked stack, `CPACR_EL1.FPEN` (0b01: EL1 only), `.bss` zerofill, and a two-descriptor boot table installed in TTBR0 and TTBR1 at once — one page serving as both the identity map and a coarse linear map, because a kernel address and its physical twin share a level-1 index. Then MMU on, branch high, set the real stack and `VBAR_EL1`, build the real tables (`sos_mmu_tables`, `sos_page_tables_build`), install TTBR1 from the identity map, install TTBR0 = set 0, `kmain`. Never returns. `ENTRY` names `_start_phys` (`_start - LINMAP_OFFSET`) because QEMU sets the reset PC from `e_entry` with the MMU off. | Instructions: `msr`, and — the reason the window exists at all — a high-linked kernel cannot call compiled code until the MMU is on and TTBR1 is walked. |
 | `_vectors` | boot.S | The 16-entry EL1 vector table. Two entries are a user trap: "lower EL, AArch64, synchronous" and "lower EL, AArch64, IRQ". Every other entry is a kernel bug (an interrupt among them, see "Interrupts are masked in the kernel" below) and lands on `kernel_fault_entry`. | A vector table is placement + branches at fixed 0x80 strides. |
 | `user_trap_entry` | boot.S | Saves the running thread's 34-doubleword frame, switches `SP_EL1` to the kernel stack, calls `ktrap(frame, ESR, FAR)`, and resumes the frame `ktrap` returns — which need not be the one it was called with, and that is the context switch. | Register saves and `eret`. |
 | `user_irq_entry` | boot.S | The same frame, then `ktrap(frame, IRQ_CAUSE, 0)`, then the same return path — the save is a macro and the restore is shared code, so the two entries cannot drift. | Register saves and `eret`. |
 | `kernel_fault_entry` | boot.S | Reads `ESR`/`ELR`/`FAR` and calls the Saw `sos_kernel_fault` with them. | `mrs` names a register at assembly time. The report is Saw. |
+| `sos_fp_save(area)` / `sos_fp_load(area)` | boot.S | Store V0-V31, `FPCR` and `FPSR` to a thread's FP area, and load them back (the area layout is in "Thread contexts"). The only kernel code that executes FP/SIMD instructions: the runner's disassembly check allows them in these two symbols and nowhere else. They clobber V0-V31 and x1/x2. | `stp q`, `mrs`/`msr fpcr`. |
+| `sos_fp_enable(on)` | boot.S | Set `CPACR_EL1.FPEN` to 0b11 (`on` nonzero: EL0 may use FP/SIMD) or 0b01 (EL0 traps), with an `isb`. | `msr` names a system register at assembly time. |
 | `sos_resume_frame(frame)` | boot.S | Enter EL0 in a saved context, behind `resume_frame`. One branch into the restore path above, because the frame already holds the `SPSR` that selects EL0t. | The `eret` the restore path owns. |
 | `sos_platform_exit(code)` | sink.c | Stop the machine through semihosting `SYS_EXIT`. | `hlt #0xf000` with the call number and parameter block pinned in x0/x1. |
 | `sos_mmu_tables()` | sink.c | Build the kernel linear map and hand back its level-1 physical base, for `boot.S` to install in TTBR1. Checks `sos_boot_mair` against `lib.saw`s `sos_mair_value()` first and stops the machine (68) on drift. Called from the high half, so the tables below it are built with translation already on. `boot.S` enables the MMU, not this function. | A sequencing shim between two Saw builders and one assembly caller. |
@@ -176,20 +178,37 @@ entered once has no storage a second thread could have.
   `syscall_return` advances nothing. Doing what Profile A does here would skip
   the instruction after a syscall — which is why "how far to resume" is a HAL
   decision rather than a kernel one.
-- **FP/SIMD must be enabled before any compiled code runs, for the sake of the
-  C.** `CPACR_EL1.FPEN` traps Advanced SIMD at EL1 out of reset, and LLVM
-  reaches for `q` registers to move a struct, so compiled C faults at EL1
-  without it. The freestanding profile implies `-neon,-fp-armv8` on aarch64, so
-  the Saw half emits no SIMD instructions, and the C the kernel links
-  (`sink.c`, `rt/common_c/support.c`) has none either: the kernel image
-  executes no FP/SIMD instruction. The boot line stays because clang compiles
-  that C without `-mgeneral-regs-only` and may emit vector code. A trap
-  therefore does not clobber EL0's vector registers. FP/SIMD state is still
-  not saved across a trap (the frame holds x0-x30 and three system registers)
-  while `FPEN` is set for EL0, so an EL0 image that uses vector registers
-  would have them corrupted across a thread switch. Nothing in the C build
-  forbids vector code (no `-mgeneral-regs-only`), so a C image may use vector
-  registers (open: SO-4).
+- **The kernel executes no FP/SIMD instruction, and a thread's FP/SIMD state
+  is per thread and lazily enabled.** The freestanding profile implies
+  `-neon,-fp-armv8` on aarch64, so the Saw half emits none; the kernel's C
+  (`sink.c`, `rt/common_c/support.c`) is built with `-mgeneral-regs-only`; and
+  the runner disassembles every arm64 kernel image and fails on an FP/SIMD
+  instruction outside `sos_fp_save` and `sos_fp_load`. A trap therefore never
+  disturbs V0-V31, `FPCR` or `FPSR`: a syscall, fault or interrupt that resumes
+  the same thread needs no FP save, and `save_user_frame` holds x0-x30 and
+  three system registers.
+  - `CPACR_EL1.FPEN` is 0b01: EL1 may use FP/SIMD (the save and load routines
+    do) and EL0 traps. A thread's first FP/SIMD instruction is a synchronous
+    trap of class 7; `ktrap` offers every trap to `fp_trap` first. It marks the
+    thread active, **loads the thread's own area into V0-V31, `FPCR` and
+    `FPSR`**, enables EL0 access and resumes at the same instruction. Enabling
+    always loads: the registers hold the last active thread's values, possibly
+    another process's, and a bare enable would hand them to this thread. The
+    area is zero until the thread's first switch-out, so a first use reads
+    zeros.
+  - Each thread's save area follows its trap frame in the same slot: V0-V31
+    (offset 0, 16 bytes each), `FPCR` (512), `FPSR` (520), an active word (528)
+    and a pad word; `FP_AREA_BYTES` in `lib.saw` is the size and `FRAME_BYTES`
+    covers frame and area together. It stays out of the 272-byte trap frame
+    because a frame is saved on every trap and an area only at a switch, for
+    threads that use it. `frame_init` zeroes both, so a new thread is inactive.
+  - At a switch `kcore.sched.pick_next` calls `fp_switch_out` (save the
+    outgoing thread if it is active) and `run_thread` calls `fp_switch_in`
+    (load the incoming thread and leave EL0 access on if it is active, else
+    turn EL0 access off). The save runs before an exited thread's deferred
+    free, so a freed slot is never written, and a thread that never uses FP/SIMD
+    costs one compare per switch. Exit and invalidation need nothing: the area
+    dies with the slot.
 - **Semihosting, not PSCI, for shutdown.** PSCI `SYSTEM_OFF` over the HVC
   conduit works on `-M virt` but always exits the emulator with status 0, and
   this harness asserts on exit status — one case encodes its entire verdict in

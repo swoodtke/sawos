@@ -218,7 +218,7 @@ import kcore.objects.{
     quota_room_for,
     unbind_handle,
 }
-import kcore.diag.{fatal_kernel}
+import kcore.diag.{console, fatal_kernel}
 import kcore.stats.{stats_bump, stats_clear, stats_read, stats_region_phys,
                     stats_region_len}
 import kcore.refs.{PipeMsgPrefix, PipeTakePrefix, deliver_attachment,
@@ -4399,6 +4399,10 @@ func count_trap(kind: TrapKind) unsafe {
 /// location, the user-return boundary by construction, and the kernel is never
 /// half-way through one.
 ///
+/// A trap the HAL claims as a thread's first use of floating point
+/// (`hal.fp_trap`) is asked first and resumes the same frame. It is none of the
+/// three kinds below and no stats column counts it.
+///
 /// Three kinds of trap, told apart by the order below. An interrupt is not the
 /// running program's business: it is serviced and the interrupted instruction
 /// resumes untouched, which is why it is decided first and never reaches the
@@ -4422,6 +4426,15 @@ public func ktrap(frame_addr: UInt, cause: UInt, tval: UInt) unsafe -> UInt {
         count_trap(TrapKind.Interrupt)
         service_irq(frame_addr, cause)
         return pick_next(frame_addr)
+    }
+
+    // A thread's first floating-point instruction traps, and the HAL gives it
+    // its own state and lets it run on. The thread resumes at the instruction
+    // that trapped, so this is not a syscall, a fault or an interrupt and no
+    // stats column counts it; the line is its observable.
+    if hal.fp_trap(frame_addr, cause) {
+        console().write_str("SOS: fp first use\n")
+        return frame_addr
     }
 
     if not hal.is_syscall(cause) {

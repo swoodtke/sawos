@@ -165,6 +165,11 @@ FAULT_ROOT_PKG = os.path.join(TESTS_DIR, "faulting-root")
 # module and never through an op number.
 THREAD_BASICS_PKG = os.path.join(TESTS_DIR, "thread-basics")
 THREAD_PREEMPT_PKG = os.path.join(TESTS_DIR, "thread-preempt")
+# User FP/SIMD state, arm64 only: two threads' patterns across yields, and a
+# second process's first use after the first has filled the registers.
+FP_THREADS_PKG = os.path.join(TESTS_DIR, "fp-threads")
+FP_LEAK_PKG = os.path.join(TESTS_DIR, "fp-leak")
+CHILD_FP_LEAK_PKG = os.path.join(TESTS_DIR, "child-fp-leak")
 # Event and Waiter objects.
 EVENT_BASICS_PKG = os.path.join(TESTS_DIR, "event-basics")
 EVENT_WAKE_PKG = os.path.join(TESTS_DIR, "event-wake")
@@ -739,6 +744,13 @@ ARCHES = [
         # The base aarch64 triple already has everything this kernel uses, and
         # there is no ABI variant to select.
         "cc_args": [],
+        # The kernel executes no FP/SIMD instruction, so its C is compiled
+        # without them, and every image is then disassembled to check it
+        # (`_check_kernel_fp_free`). Only the kernel's C takes the flag: the
+        # HAL's assembly spells the user-state save and load with them, and a
+        # user image's C is its own.
+        "kernel_c_args": ["-mgeneral-regs-only"],
+        "kernel_fp_free": True,
         "features": None,
         # There is one arm64 board, so its HAL is whole: its own `sink.c`, and
         # no shared module beside its `hal`.
@@ -1372,6 +1384,61 @@ TEST_CASES = [
                        # claim the Event cases below make with real objects.
                        "SOS: process teardown handles={eight} threads={three} "
                        "events={zero} waiters={zero}"],
+        "expect_clean_exit": True,
+    },
+    {
+        # User FP/SIMD state is per thread. Two workers of one process fill
+        # V0-V31, FPSR and FPCR with their own patterns and yield to each other
+        # three times each, counting the registers that stop matching; the
+        # initial thread uses none of it. The kernel's `SOS: fp first use` line
+        # is the observable for the lazy enable, and the expectations are
+        # adjacent runs so an extra trap anywhere in them breaks the match:
+        #
+        #   initial begin / created   the initial thread takes no trap
+        #   A begin, first use, filled   each worker traps once, at its fill
+        #   B filled, A bad=0         nothing between: A's three checks ran
+        #                             after B's switches and took no trap, and
+        #                             the count is zero, so each switch saved
+        #                             and restored the pattern
+        #
+        # With no save at a switch, B's fill overwrites A's registers and A
+        # reports every one wrong; with EL0 access left on at boot, no first
+        # use line appears at all.
+        "name": "fp_threads",
+        "arches": ["arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": FP_THREADS_PKG,
+        "expect_out": ["{banner}",
+                       "SOS fp: initial begin\nSOS fp: initial created\n",
+                       "SOS fp: A begin\nSOS: fp first use\n"
+                       "SOS fp: A filled\n",
+                       "SOS fp: B begin\nSOS: fp first use\n"
+                       "SOS fp: B filled\nSOS fp: A bad=0\n",
+                       "SOS fp: B bad=0\n",
+                       "SOS fp: joined a=0 b=0\nSOS fp: initial done\n"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A first FP/SIMD use never sees another process's state. Root fills
+        # every FP/SIMD register and parks on its child; the child's first
+        # instruction reads them all and exits with the number that were not
+        # zero. The hardware still holds root's pattern when the child starts,
+        # so a first-use enable that did not load the child's own zeroed state
+        # would report every register and flag. `status=65536` is
+        # `Exited`(1) << 16 | 0.
+        "name": "fp_leak",
+        "arches": ["arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": FP_LEAK_PKG,
+        "children": [CHILD_FP_LEAK_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS: fp first use\nSOS fpleak: filled\n",
+                       "SOS fpleak: started\n",
+                       "SOS fpleak child: begin\nSOS: fp first use\n"
+                       "SOS fpleak child: nonzero=0\n",
+                       "SOS fpleak: woke key=44 status=65536\n",
+                       "SOS fpleak: done\n"],
         "expect_clean_exit": True,
     },
     {
@@ -6772,6 +6839,7 @@ def _build_shared(arch, clang):
         # -fno-builtin: freestanding C must not be rewritten into calls to
         # memcpy and friends.
         _run([clang, f"--target={arch['triple']}", *arch["cc_args"],
+              *arch.get("kernel_c_args", []),
               "-ffreestanding", "-fno-builtin", "-ffunction-sections",
               "-fdata-sections", "-nostdlib", "-O2", "-c", src, "-o", obj])
     return [boot_o, *asm_objs, sink_o, support_o]
@@ -7095,7 +7163,90 @@ def _build_elf(case, arch, shared_objs, lld, clang):
     # profile moves none of them.
     _run([lld, "-T", os.path.join(dirs["hal_board"], "virt.ld"), "--gc-sections",
           "-o", elf, *objs])
+    if arch.get("kernel_fp_free"):
+        _check_kernel_fp_free(elf, clang)
     return elf
+
+
+# The kernel's own FP/SIMD instructions are exactly these two routines: the
+# user-state save and load that run at a thread switch (`boot.S`). Anything else
+# that touches a vector or floating-point register would clobber a user thread's
+# state at a trap, where nothing saves it.
+FP_ALLOWED_SYMBOLS = ("sos_fp_save", "sos_fp_load")
+
+# A scalar, vector or SIMD register operand (`v0.16b`, `q3`, `d31`, `s0`, `h1`,
+# `b2`), or the floating-point control registers. Registers are matched as whole
+# tokens after the symbol annotation and comments are stripped, so a hex address
+# or a symbol name cannot match.
+_FP_REGISTER = re.compile(r"(?<![\w.])(?:[vqdshb](?:[12]?[0-9]|3[01])(?![\w])"
+                          r"|fpcr|fpsr)", re.IGNORECASE)
+_DISASM_SECTION = re.compile(r"^Disassembly of section (\S+):")
+_DISASM_SYMBOL = re.compile(r"^[0-9a-f]+ <([^>]+)>:")
+_DISASM_INSN = re.compile(r"^\s*[0-9a-f]+:\s*(\S+)\s*(.*)$")
+# What objdump prints for a literal pool or other data in a text section: the
+# raw bytes come first, then a directive. Not instructions, and its bytes
+# (`b0`, `d1`) would read as register names.
+_DISASM_DATA = re.compile(r"^\s*[0-9a-f]+:\s*(?:[0-9a-f]{2}\s+)*\.(?:word|long|quad|xword|hword|short|byte)\b")
+
+
+def _fp_instructions(disassembly):
+    """Yield (symbol, line) for each FP/SIMD instruction in kernel text.
+
+    Only `.text*` sections are read: the root image and the child images ride
+    in `.payload` and `.regions`, which are user code the kernel never runs.
+    """
+    section, symbol = None, None
+    for line in disassembly.splitlines():
+        m = _DISASM_SECTION.match(line)
+        if m:
+            section, symbol = m.group(1), None
+            continue
+        if section is None or not section.startswith(".text"):
+            continue
+        m = _DISASM_SYMBOL.match(line)
+        if m:
+            symbol = m.group(1)
+            continue
+        if _DISASM_DATA.match(line):
+            continue
+        m = _DISASM_INSN.match(line)
+        if not m:
+            continue
+        operands = re.sub(r"<[^>]*>|//.*|#\S+", "", m.group(2))
+        if _FP_REGISTER.search(operands):
+            yield symbol, line.strip()
+
+
+def _check_kernel_fp_free(elf, clang):
+    """Fail the build if the kernel's text executes FP/SIMD outside the two
+    user-state routines. The kernel is free of them so that a trap never
+    disturbs a thread's vector registers; see `hal/arm64/kernel/boot.S`.
+    """
+    # Where `_find_clang` looks for an LLVM, in the same order: beside the
+    # clang in use, on PATH, then the Homebrew prefixes (Apple's clang ships
+    # without one).
+    objdump = None
+    for cand in (os.path.join(os.path.dirname(clang), "llvm-objdump"),
+                 "llvm-objdump",
+                 "/opt/homebrew/opt/llvm/bin/llvm-objdump",
+                 "/usr/local/opt/llvm/bin/llvm-objdump"):
+        objdump = shutil.which(cand) or (cand if os.path.exists(cand) else None)
+        if objdump:
+            break
+    if not objdump:
+        raise ToolError("the arm64 kernel's FP-free check needs llvm-objdump "
+                        "(next to clang, on PATH, or in the Homebrew llvm)")
+    result = subprocess.run([objdump, "-d", "--no-show-raw-insn", elf],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        raise ToolError(f"llvm-objdump failed on {elf}: {result.stderr}")
+    bad = [(sym, line) for sym, line in _fp_instructions(result.stdout)
+           if sym not in FP_ALLOWED_SYMBOLS]
+    if bad:
+        shown = "\n".join(f"  in {sym}: {line}" for sym, line in bad[:8])
+        raise ToolError(f"{os.path.basename(elf)}: the kernel executes "
+                        f"FP/SIMD instructions outside "
+                        f"{', '.join(FP_ALLOWED_SYMBOLS)}:\n{shown}")
 
 
 def _run_qemu(qemu, arch, elf, feed=None):

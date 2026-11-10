@@ -83,6 +83,12 @@ does.
   `Faulted` in a launcher's `get_status` instead of as a hang. Do not write a
   `_Noreturn` crt0 that spins.
 
+A process may use FP and SIMD registers (V0-V31, `FPCR`, `FPSR`). They are
+per thread: a thread's first FP/SIMD instruction traps once into the kernel,
+which gives the thread zeroed state and resumes at that instruction, and a
+thread switch saves and restores the state of threads that have used them. The
+kernel itself uses none, so a syscall or an interrupt leaves them as they were.
+
 The way out is the process's own job: `process_self` off the System handle it
 was given, then `exit`. There is no other door.
 

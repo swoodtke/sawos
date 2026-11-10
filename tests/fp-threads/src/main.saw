@@ -1,0 +1,149 @@
+// FP/SIMD state is per thread (spec §7, arm64).
+//
+// Two workers of one process each load their own pattern into V0-V31, `FPSR`
+// and `FPCR` (`fp_fill`), yield to each other four times, and count the
+// registers that no longer hold it (`fp_check`). The initial thread uses no
+// floating point or SIMD at all. The kernel arms no timer, so every switch is a
+// yield, and the transcript reads as an order:
+//
+//   SOS fp: initial begin
+//   SOS fp: initial created
+//   SOS fp: A begin
+//   SOS: fp first use                <- A's first FP instruction, once
+//   SOS fp: A filled
+//   SOS fp: B begin
+//   SOS: fp first use                <- B's, once
+//   SOS fp: B filled
+//   SOS fp: A bad=0                  <- after three yields each: no second trap
+//   SOS fp: B bad=0
+//   SOS fp: joined a=0 b=0
+//   SOS fp: initial done
+//
+// The lines the test asserts adjacent are the claims. A thread that has not
+// used floating point takes no trap (the initial thread's two lines, and each
+// worker's `begin` line, are not followed by one), a thread that has takes it
+// once (nothing sits between `B filled` and `A bad=0` though A and B switched
+// in and out twice more), and the count is zero because each switch saved the
+// outgoing thread's registers and loaded the incoming one's. With no save, B's
+// fill overwrites A's pattern and A counts every register.
+//
+// Every thread enters at `_start`, as in `thread-basics`: the initial thread is
+// the one that has not yet parked the boot handle.
+
+import sos.{System, Process, Thread, SosStatus}
+
+extern "C" {
+    func fp_fill(seed: UInt)
+    func fp_check(seed: UInt) -> UInt
+}
+
+/// The boot handle, parked by the initial thread for the workers; also the
+/// witness that a thread is a worker.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_A: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_B: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+static ROLE_A: UInt = 1
+static ROLE_B: UInt = 2
+
+/// Distinct per worker, and odd for one and even for the other so `FPCR`
+/// differs as well.
+static SEED_A: UInt = 0x1111_0000_0000_0001
+static SEED_B: UInt = 0x2222_0000_0000_0002
+
+static TURNS: Int = 3
+static NO_VALUE: UInt = 0xFFFF
+
+func stack_top(base: UInt) -> UInt {
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func stack_a_top() unsafe -> UInt {
+    stack_top(((&var STACK_A) as UnsafePointer<UInt64>) as UInt)
+}
+
+func stack_b_top() unsafe -> UInt {
+    stack_top(((&var STACK_B) as UnsafePointer<UInt64>) as UInt)
+}
+
+func park_boot_handle(word: UInt) unsafe {
+    BOOT_HANDLE = word
+}
+
+func parked_boot_handle() unsafe -> UInt {
+    BOOT_HANDLE
+}
+
+/// A worker: fill, then yield and check `TURNS` times. Its exit value is the
+/// number of mismatching registers it saw, summed over the checks.
+func worker(role: UInt) unsafe {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    let seed = if role == ROLE_A { SEED_A } else { SEED_B }
+    let tag = if role == ROLE_A { "A" } else { "B" }
+
+    print("SOS fp: {} begin", tag)
+    fp_fill(seed)
+    print("SOS fp: {} filled", tag)
+
+    var bad: UInt = 0
+    var turn = 0
+    while turn < TURNS {
+        let _ = me.yield_now()
+        bad = bad + fp_check(seed)
+        turn = turn + 1
+    }
+    print("SOS fp: {} bad={}", tag, bad)
+    let _ = (move me).exit(bad)
+}
+
+/// The initial thread touches no FP/SIMD register: it prints, creates and
+/// starts the workers, and joins them.
+func initial(boot_handle: UInt) unsafe {
+    park_boot_handle(boot_handle)
+
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS fp: no process handle\n")
+        let _ = system.shutdown(1)
+        return
+    }
+
+    let _ = system.debug_print("SOS fp: initial begin\n")
+    let a = try proc.thread_create(stack_top: stack_a_top(), arg: ROLE_A) catch {
+        print("SOS fp: create failed: {}", error)
+        let _ = system.shutdown(1)
+        return
+    }
+    let b = try proc.thread_create(stack_top: stack_b_top(), arg: ROLE_B) catch {
+        print("SOS fp: create failed: {}", error)
+        let _ = system.shutdown(1)
+        return
+    }
+    let _ = system.debug_print("SOS fp: initial created\n")
+
+    let _ = a.start()
+    let _ = b.start()
+
+    let ra: UInt = try a.join() catch { NO_VALUE }
+    let rb: UInt = try b.join() catch { NO_VALUE }
+    print("SOS fp: joined a={} b={}", ra, rb)
+    let _ = system.debug_print("SOS fp: initial done\n")
+    let _ = proc.exit(0)
+}
+
+@export("_start")
+func _start(arg: UInt) unsafe {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        worker(arg)
+    }
+}

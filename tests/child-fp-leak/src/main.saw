@@ -1,0 +1,31 @@
+// Test child: its first FP/SIMD instruction must read zeros.
+//
+// `fp_zero_count` counts the nonzero registers among V0-V31, `FPSR` and `FPCR`.
+// It is this process's first FP/SIMD instruction, so the kernel traps it and
+// hands the thread its own state before it runs again. The launcher has filled
+// those registers with a pattern and is parked, so the hardware still holds the
+// launcher's values when this thread starts. The count is the exit code: 0 is a
+// thread that got zeroed state, anything else is the launcher's state leaking
+// across processes.
+
+import sos.{System}
+
+extern "C" {
+    func fp_zero_count() -> UInt
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        // Returning from the entry faults this process, which the launcher
+        // reads as `Faulted` instead of `Exited`.
+        return
+    }
+
+    let _ = system.debug_print("SOS fpleak child: begin\n")
+    let nonzero = fp_zero_count()
+    print("SOS fpleak child: nonzero={}", nonzero)
+    let _ = proc.exit(nonzero)
+}

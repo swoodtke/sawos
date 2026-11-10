@@ -1,0 +1,151 @@
+// A first FP/SIMD use in one process must not see another process's state.
+//
+// Root fills V0-V31, `FPSR` and `FPCR` with a pattern (`fp_fill`), starts a
+// child, and parks on the child's death. The child's first FP/SIMD instruction
+// reads every one of those registers, and its exit code is how many were not
+// zero. When the processor switches to the child the hardware still holds
+// root's pattern: the child's first use traps and the kernel must overwrite the
+// registers with the child's own (zeroed) state, not merely enable access.
+//
+//   SOS: fp first use                       <- root's fill
+//   SOS fpleak: filled
+//   SOS fpleak: started
+//   SOS fpleak child: begin
+//   SOS: fp first use                       <- the child's first instruction
+//   SOS fpleak child: nonzero=0
+//   SOS fpleak: woke key=44 status=65536    <- `Exited`(1) << 16 | 0
+//   SOS fpleak: done
+//
+// A kernel that only enabled access shows the child root's pattern, and
+// `nonzero` counts every register and flag.
+
+import sos.{System, Process, Memory, BootHandle, Waiter, WaitResult,
+            WaitPayload, SosStatus, SystemRight}
+
+extern "C" {
+    func fp_fill(seed: UInt)
+}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The key this case attaches the child's Process handle under: a number that
+/// appears nowhere else in the transcript, so reading it back proves the record
+/// came from this attachment.
+static KEY: UInt = 44
+
+/// Root's config: the tag the child's System handle travels under.
+static TAG_BOOT: UInt = 21
+
+/// What a child of this launcher may ask its System object for: print, and
+/// learn its own Process object, which is the handle its `exit` goes through.
+/// `Transfer` is in the mask because it is the bit `give` checks on the thing
+/// being given; everything else is absent by silence.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The §8 status word out of the record the kernel copied into this process's
+/// memory while the thread was parked.
+///
+/// The other three arms panic, and not defensively: this program attached
+/// exactly one thing, so a record of any other kind would mean the kernel
+/// reported an attachment nobody made, a bug in the pair rather than a
+/// condition to handle.
+func status_of(r: &WaitResult) -> UInt {
+    match r.what {
+        case Process(status) -> status,
+        case _ -> panic("this program attached only a Process"),
+    }
+}
+
+/// Root's pattern. Odd, so `FPCR` is nonzero as well.
+static SEED: UInt = 0x5555_0000_0000_0013
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS fpleak: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // The boot set, in the build's row order: the child's image blob, then the
+    // RAM it will run in. Root's config is what says which ordinal is which.
+    var image = try proc.boot_handle_next() catch {
+        print("SOS fpleak: no image region: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var dest = try proc.boot_handle_next() catch {
+        print("SOS fpleak: no destination region: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let image_mem = image.take_memory() else {
+        let _ = system.debug_print("SOS fpleak: image record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest_mem = dest.take_memory() else {
+        let _ = system.debug_print("SOS fpleak: dest record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let child = try system.process_create(image: &image_mem,
+                                          memory: &dest_mem) catch {
+        print("SOS fpleak: create failed: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let waiter = try proc.waiter_create() catch {
+        print("SOS fpleak: no waiter: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // The attachment spends `ProcessRight.Wait`, the same bit `get_status`
+    // spends, because this is the same question asked asynchronously. The
+    // other three `add` overloads' rules hold unchanged.
+    try waiter.add(process: &child, key: KEY) catch {
+        print("SOS fpleak: attach failed: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    fp_fill(SEED)
+    let _ = system.debug_print("SOS fpleak: filled\n")
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM) catch {
+        print("SOS fpleak: mint failed: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        print("SOS fpleak: give failed: {}", error.0)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try child.start(boot_tag: TAG_BOOT) catch {
+        print("SOS fpleak: start failed: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS fpleak: started\n")
+
+    // The park. Nothing else in this machine is armed, so the child's death is
+    // the only thing that can end this call.
+    let record = try waiter.wait() catch {
+        print("SOS fpleak: wait failed: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    print("SOS fpleak: woke key={} status={}",
+          record.key, status_of(&record))
+    print("SOS fpleak: done")
+    let _ = proc.exit(EXIT_OK)
+}

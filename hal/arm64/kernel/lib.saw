@@ -124,20 +124,42 @@ struct TrapFrame {
     x30: UInt,
 }
 
-/// Bytes in one saved context.
+/// Bytes in the register half of a saved context: the layout `TrapFrame`
+/// describes and `boot.S` saves and restores on every trap.
+static TRAP_FRAME_BYTES: Int = 272
+
+/// Bytes in a thread's floating-point area, which follows the trap frame in the
+/// same slot at offset `TRAP_FRAME_BYTES`.
+///
+/// V0-V31 at 16 bytes each (offset 0), then `FPCR` (offset 512), `FPSR` (520),
+/// the active word (528: nonzero once the thread has used floating point or
+/// SIMD) and a pad word, which keeps the size a multiple of 16. `sos_fp_save`
+/// and `sos_fp_load` in `boot.S` read and write the first three fields by these
+/// offsets.
+///
+/// It lives beside the trap frame rather than inside it. A frame is saved and
+/// restored on every trap, and only a thread that has used floating point
+/// needs these 544 bytes saved at all, at a switch and not at a trap. The
+/// slot is the thread's, so the area travels with it and the HAL needs no table
+/// indexed by thread.
+static FP_AREA_BYTES: Int = 544
+static FP_ACTIVE_OFFSET: UInt = 528
+
+/// Bytes in one saved context, floating-point area included.
 ///
 /// Public because the kernel reserves a slot per thread and has to know this
 /// fits: the kernel owns the storage and the HAL owns the layout. The assert
 /// below keeps the number honest here; the kernel's own assert keeps its stride
 /// honest there.
-public static FRAME_BYTES: Int = 272
+public static FRAME_BYTES: Int = TRAP_FRAME_BYTES + FP_AREA_BYTES
 
-/// Doublewords in a frame, for `frame_init`'s zeroing loop.
-static FRAME_WORDS: UInt = 34
+/// Doublewords in a whole context, for `frame_init`'s zeroing loop.
+static FRAME_WORDS: UInt = 102
 
 // The frame boot.S builds must be the frame this file describes. A field added
 // on one side and not the other would misread every register after it.
-static_assert(sizeof<TrapFrame>() == FRAME_BYTES, "the arm64 trap frame is 34 doublewords")
+static_assert(sizeof<TrapFrame>() == TRAP_FRAME_BYTES, "the arm64 trap frame is 34 doublewords")
+static_assert(FRAME_WORDS * 8 == (FRAME_BYTES as UInt), "frame_init zeroes the whole context")
 
 // =============================================================================
 // Board constants
@@ -574,6 +596,10 @@ static SPSR_EL0T: UInt = 0x340
 /// takes an instruction abort, which spec §8 turns into the death of its
 /// process, a diagnosed stop rather than a run into whatever follows.
 ///
+/// The floating-point area is zeroed with the frame, so a new thread is not
+/// floating-point active and its first use loads zeros (`fp_trap`). A slot's
+/// previous occupant leaves nothing in it.
+///
 /// No preemption point: `FRAME_WORDS` zeroing stores and four field stores, and
 /// a half-built context is an in-flight invariant the trap path can reach.
 public func frame_init(frame_addr: UInt, entry: UInt, stack_top: UInt,
@@ -600,6 +626,109 @@ static WORD_BYTES: UInt = 8
 public func resume_frame(frame_addr: UInt) -> Never {
     sos_resume_frame(frame_addr)
     while { }
+}
+
+// =============================================================================
+// User floating-point and SIMD state
+// =============================================================================
+//
+// The kernel executes no floating-point or SIMD instruction: sawc builds with
+// them off, the kernel's C is built with `-mgeneral-regs-only`, and the runner
+// disassembles every kernel image and fails on one outside `sos_fp_save` and
+// `sos_fp_load`. A trap therefore never disturbs V0-V31, `FPCR` or `FPSR`, and
+// an interrupt that resumes the thread it interrupted needs no save.
+//
+// A thread's state moves only at a switch, and only for a thread that has used
+// floating point:
+//
+//   - EL0 access traps by default (`CPACR_EL1.FPEN` = 0b01 keeps EL1 access).
+//   - A thread's first instruction traps, `fp_trap` marks it active, loads its
+//     area into the registers and enables EL0 access, and the thread resumes at
+//     the same instruction. Enabling always loads: the registers hold whatever
+//     the last active thread left, possibly another process's, and an enable
+//     that did not overwrite them would hand that state to this thread. Its
+//     area is zero until its first switch-out, so the load is the zeroed state
+//     a new thread is promised.
+//   - At a switch `fp_switch_out` saves the outgoing thread's registers if it
+//     is active, and `fp_switch_in` loads the incoming thread's if it is,
+//     leaving EL0 access on, or turns EL0 access off if it is not. A thread
+//     that never uses floating point pays one compare per switch.
+//
+// `EL0_FP_ON` mirrors the register so a switch between two threads of the same
+// kind writes nothing.
+
+extern "C" {
+    func sos_fp_save(area: UInt)
+    func sos_fp_load(area: UInt)
+    func sos_fp_enable(on: UInt)
+}
+
+/// Whether `CPACR_EL1` currently lets EL0 execute floating point and SIMD.
+/// Boot leaves it off. Uniprocessor kernel state, read and written only with
+/// interrupts masked.
+unsafe static var EL0_FP_ON: UInt = 0
+
+/// A fault from a floating-point or SIMD instruction at EL0, as `ESR_EL1`'s
+/// exception class reports it.
+static EC_SIMD_FP: UInt = 7
+
+/// Where the thread whose trap frame is `frame_addr` keeps its floating-point
+/// area.
+func fp_area(frame_addr: UInt) -> UInt {
+    frame_addr + (TRAP_FRAME_BYTES as UInt)
+}
+
+func fp_active(area: UInt) unsafe -> Bool {
+    UnsafeMemory<UInt, Normal>(area + FP_ACTIVE_OFFSET).read() != 0
+}
+
+func set_el0_fp(on: Bool) unsafe {
+    let want: UInt = if on { 1 } else { 0 }
+    if want != EL0_FP_ON {
+        sos_fp_enable(want)
+        EL0_FP_ON = want
+    }
+}
+
+/// Claim a trap that is a thread's first use of floating point or SIMD.
+///
+/// Answers false for any other trap, with nothing touched. Otherwise the
+/// thread is marked active, its own area (zero until a switch saves into it)
+/// is loaded into V0-V31, `FPCR` and `FPSR`, and EL0 access is enabled; the
+/// saved program counter is still the trapping instruction, which runs again.
+/// The load comes first and is not optional: see the section header.
+public func fp_trap(frame_addr: UInt, cause: UInt) unsafe -> Bool {
+    if ((cause >> ESR_EC_SHIFT) & ESR_EC_MASK) != EC_SIMD_FP {
+        return false
+    }
+    let area = fp_area(frame_addr)
+    UnsafeMemory<UInt, Normal>(area + FP_ACTIVE_OFFSET).write(1)
+    sos_fp_load(area)
+    set_el0_fp(true)
+    true
+}
+
+/// Save the outgoing thread's floating-point state if it has any.
+///
+/// Called by the scheduler while the thread's slot is still live, before a
+/// deferred free can release it.
+public func fp_switch_out(frame_addr: UInt) unsafe {
+    let area = fp_area(frame_addr)
+    if fp_active(area) {
+        sos_fp_save(area)
+    }
+}
+
+/// Install the incoming thread's floating-point state: load it and leave EL0
+/// access on if the thread is active, turn EL0 access off if it is not.
+public func fp_switch_in(frame_addr: UInt) unsafe {
+    let area = fp_area(frame_addr)
+    if fp_active(area) {
+        sos_fp_load(area)
+        set_el0_fp(true)
+    } else {
+        set_el0_fp(false)
+    }
 }
 
 /// First byte of the appended payload: the `.payload` section `virt.ld` bounds.

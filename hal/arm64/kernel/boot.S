@@ -5,21 +5,26 @@
  * hypervisor, so there is nothing to drop down from. `.text.boot` (this file)
  * is placed first by virt.ld, so the ELF entry is the reset target.
  *
- * The shim sets up the stack, enables FP/SIMD, zeroes .bss, builds the boot
- * map, installs the vector table, and calls the Saw `kmain`.
+ * The shim sets up the stack, lets EL1 execute FP/SIMD, zeroes .bss, builds
+ * the boot map, installs the vector table, and calls the Saw `kmain`.
  *
- * FP/SIMD is enabled here because out of reset `CPACR_EL1.FPEN` traps every
- * Advanced-SIMD instruction at EL1 and EL0, and clang compiles the kernel's C
- * (sink.c, support.c) without `-mgeneral-regs-only`, so it may emit vector
- * code. sawc builds freestanding aarch64 code with `-neon,-fp-armv8`; the
- * kernel image as built executes no FP/SIMD instruction.
+ * The kernel executes no FP/SIMD instruction. sawc builds freestanding aarch64
+ * code with `-neon,-fp-armv8`, the runner builds the kernel's C with
+ * `-mgeneral-regs-only`, and it disassembles every kernel image and rejects
+ * one that has FP/SIMD outside `sos_fp_save` and `sos_fp_load` below. So a
+ * trap never disturbs V0-V31, `FPCR` or `FPSR`, and the frame below holds
+ * x0-x30 and three system registers and nothing else: an interrupt, a syscall
+ * or a fault that resumes the same thread needs no FP save.
  *
- * FP/SIMD state is not saved across a trap: the frame below holds x0-x30 and
- * three system registers. Because the kernel executes no vector code, a trap
- * does not clobber EL0's vector registers. EL0 may still use them (`FPEN` is
- * set for EL0). Nothing in the C build forbids vector code (no
- * `-mgeneral-regs-only`), so a C image may use vector registers, and one that
- * does would have them corrupted across a thread switch.
+ * `CPACR_EL1.FPEN` is 0b01: EL1 may execute FP/SIMD (out of reset it traps
+ * there too, and `sos_fp_save`/`sos_fp_load` need it) and EL0 traps. A thread's
+ * first FP/SIMD instruction takes a synchronous trap, class 7, which `ktrap`
+ * hands to the HAL (`fp_trap` in lib.saw): the thread gets its own state
+ * loaded, EL0 access is enabled, and it resumes at the same instruction. At a
+ * thread switch the scheduler calls `fp_switch_out` and `fp_switch_in`, which
+ * save the outgoing thread's state, load the incoming one's and set `FPEN` to
+ * match. The state lives in an area after the trap frame, in the thread's own
+ * slot (`FP_AREA_BYTES` in lib.saw), not in the frame below.
  *
  * The user/kernel split is free here. arm64 has sixteen vectors, four per
  * source (current EL on SP0, current EL on SPx, lower EL in AArch64, lower EL
@@ -40,7 +45,9 @@
     /* The processor state a user context resumes in is a word of the frame,
      * written by `frame_init` in lib.saw: D, A, F masked and I not, so
      * interrupts are enabled at the user-mode return and nowhere else. */
-    .equ CPACR_FPEN,  (3 << 20)
+    /* CPACR_EL1.FPEN: 0b01 traps EL0 and permits EL1; 0b11 permits both. */
+    .equ CPACR_FPEN_EL1, (1 << 20)
+    .equ CPACR_FPEN_ALL, (3 << 20)
     /* The high half of the cause the interrupt entry calls `ktrap` with. The
      * syndrome register is 32 bits, so this value cannot be one; `lib.saw`'s
      * `IRQ_CAUSE` is the same description and must move with it. */
@@ -117,8 +124,8 @@ _start:
     and     x0, x0, x9
     mov     sp, x0
 
-    /* FP/SIMD access (see the header). Must precede any compiled code. */
-    mov     x0, #CPACR_FPEN
+    /* FP/SIMD access at EL1 only (see the header). */
+    mov     x0, #CPACR_FPEN_EL1
     msr     cpacr_el1, x0
     isb
 
@@ -369,6 +376,79 @@ user_irq_entry:
     ldr     x30,      [sp, #(33*8)]
     add     sp, sp, #FRAME_SIZE
     eret
+
+/* ---- user FP/SIMD state --------------------------------------------------
+ *
+ * The only kernel code that executes FP/SIMD instructions, and the two
+ * symbols the runner's disassembly check allows them in. Called from Saw with
+ * the area's address in x0, so they follow the C calling convention; they
+ * clobber V0-V31, which the Saw and C kernel never use, and x1/x2.
+ *
+ * The area layout is `FP_AREA_BYTES`'s in lib.saw: V0-V31 at offset 0, FPCR at
+ * 512, FPSR at 520. */
+    .section .text.fp, "ax", @progbits
+    .globl sos_fp_save
+sos_fp_save:
+    stp     q0,  q1,  [x0, #(0*32)]
+    stp     q2,  q3,  [x0, #(1*32)]
+    stp     q4,  q5,  [x0, #(2*32)]
+    stp     q6,  q7,  [x0, #(3*32)]
+    stp     q8,  q9,  [x0, #(4*32)]
+    stp     q10, q11, [x0, #(5*32)]
+    stp     q12, q13, [x0, #(6*32)]
+    stp     q14, q15, [x0, #(7*32)]
+    stp     q16, q17, [x0, #(8*32)]
+    stp     q18, q19, [x0, #(9*32)]
+    stp     q20, q21, [x0, #(10*32)]
+    stp     q22, q23, [x0, #(11*32)]
+    stp     q24, q25, [x0, #(12*32)]
+    stp     q26, q27, [x0, #(13*32)]
+    stp     q28, q29, [x0, #(14*32)]
+    stp     q30, q31, [x0, #(15*32)]
+    mrs     x1, fpcr
+    mrs     x2, fpsr
+    str     x1, [x0, #512]
+    str     x2, [x0, #520]
+    ret
+
+/* Load the area into the registers. This is also what a thread's first use
+ * does, on its zeroed area: the registers still hold the last active thread's
+ * values, so an enable that did not load would leak them. */
+    .globl sos_fp_load
+sos_fp_load:
+    ldp     q0,  q1,  [x0, #(0*32)]
+    ldp     q2,  q3,  [x0, #(1*32)]
+    ldp     q4,  q5,  [x0, #(2*32)]
+    ldp     q6,  q7,  [x0, #(3*32)]
+    ldp     q8,  q9,  [x0, #(4*32)]
+    ldp     q10, q11, [x0, #(5*32)]
+    ldp     q12, q13, [x0, #(6*32)]
+    ldp     q14, q15, [x0, #(7*32)]
+    ldp     q16, q17, [x0, #(8*32)]
+    ldp     q18, q19, [x0, #(9*32)]
+    ldp     q20, q21, [x0, #(10*32)]
+    ldp     q22, q23, [x0, #(11*32)]
+    ldp     q24, q25, [x0, #(12*32)]
+    ldp     q26, q27, [x0, #(13*32)]
+    ldp     q28, q29, [x0, #(14*32)]
+    ldp     q30, q31, [x0, #(15*32)]
+    ldr     x1, [x0, #512]
+    ldr     x2, [x0, #520]
+    msr     fpcr, x1
+    msr     fpsr, x2
+    ret
+
+/* void sos_fp_enable(u64 on): EL0 may execute FP/SIMD when `on` is nonzero,
+ * and traps on it when zero. EL1 keeps access either way. */
+    .globl sos_fp_enable
+sos_fp_enable:
+    mov     x1, #CPACR_FPEN_EL1
+    mov     x2, #CPACR_FPEN_ALL
+    cmp     x0, #0
+    csel    x1, x2, x1, ne
+    msr     cpacr_el1, x1
+    isb
+    ret
 
 /* A trap the kernel took, i.e. a kernel bug. There is no context worth saving:
  * report the cause and stop the machine non-zero. A kernel fault never hangs.

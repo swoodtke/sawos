@@ -86,8 +86,10 @@ the register roles, the mode the frame resumes in — stays this file's.
 
 | Name | Contract |
 |---|---|
-| `FRAME_BYTES: Int` | Bytes in one saved context (128 here, 272 on Profile B). The kernel asserts its per-thread stride against it, so a frame that outgrew the stride is a build error. |
+| `FRAME_BYTES: Int` | Bytes in one saved context: 128 here; on Profile B the trap frame plus the thread's FP/SIMD area. The kernel asserts its per-thread stride against it, so a frame that outgrew the stride is a build error. |
 | `frame_init(frame, entry, stack_top, arg0)` | Build a fresh user context: the entry as the resume address, the stack pointer, `arg0` in the first argument register, and every other word zeroed — including the return-address register, so a thread entry that returns faults instead of running on. |
+| `fp_trap(frame, cause) -> Bool` | Claim a trap as a thread's first use of floating point or SIMD, giving the thread its own state and answering true so the kernel resumes the same frame; false for any other trap. Always false here: there is no FPU. |
+| `fp_switch_out(frame)` / `fp_switch_in(frame)` | Save the outgoing thread's FP/SIMD state, and install the incoming thread's, at a switch. Empty here. |
 | `resume_frame(frame) -> Never` | Enter user mode in a saved context. The first entry only; every one after it is `ktrap` returning a frame to the trap entry's restore path. |
 
 There is no `enter_user`: a context built in assembly and entered once has no

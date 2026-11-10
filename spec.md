@@ -2433,10 +2433,16 @@ profile of §5b.1 — three gate runs — and any run failing is red.
   from a kernel bug in one branch. A U-mode trap saves 31 GPRs + `mepc` into a
   32-word frame (word `i` holds `x<i>`; word 0 holds `mepc`). A kernel-mode trap
   is `kernel_fault`, which reports and fails the run rather than hanging.
-- **Profile B facts:** FP/SIMD must be enabled at EL1 before any compiled code
-  runs — `CPACR_EL1.FPEN` traps Advanced SIMD out of reset, and LLVM vectorizes
-  ordinary loops. FP state is not saved across a trap (FP-in-userspace is in
-  §11's plan). Semihosting (`SYS_EXIT`), not PSCI, stops the machine: PSCI
+- **Profile B's FP/SIMD contract:** the kernel executes no FP/SIMD instruction
+  (sawc builds without them, the kernel's C is built with
+  `-mgeneral-regs-only`, and the runner disassembles every arm64 kernel image
+  and rejects one outside the two user-state save and load routines), so a trap
+  never disturbs a thread's vector registers. A thread's V0-V31, `FPCR` and
+  `FPSR` are its own: EL0 FP/SIMD traps until the thread's first use, which
+  loads the thread's zeroed state (never the previous thread's, whichever
+  process it belonged to) and enables access, and a switch saves the outgoing
+  thread's state and installs the incoming one's. §7 has the switch path.
+  Semihosting (`SYS_EXIT`), not PSCI, stops the machine: PSCI
   `SYSTEM_OFF` always exits 0, and the harness asserts on exit status.
   Cortex-A53 is ARMv8.0 and has no LSE atomics; `ldxr`/`stxr` exclusives cover
   everything the kernel and `SpinLock` need.
@@ -2593,6 +2599,19 @@ and the harness kernels that test preemption arm their own.
   `resume_after_death`, after a teardown. Every thread belongs to a Process: a
   kernel that could enter user mode without a Process would have syscalls no
   handle table answers.
+- **User FP/SIMD state travels with the thread, on Profile B.** Profile A has
+  no FPU, so there is none to carry. The trap frame holds general registers
+  only, and the kernel executes no FP/SIMD instruction, so a trap that resumes
+  the same thread (an interrupt included) saves nothing. Each thread's
+  V0-V31, `FPCR` and `FPSR` live in an area after its frame, in its own slot,
+  and a new thread's area is zero. EL0 access to FP/SIMD is off for a thread
+  that has not used it: the first instruction traps (§5b), the thread's own
+  state is loaded and access is enabled, and the thread resumes at that
+  instruction. A switch saves the outgoing thread's state if it has used FP/SIMD
+  (before the slot of an exited thread is released) and loads the incoming
+  thread's, enabling or disabling EL0 access to match; a thread that never uses
+  FP/SIMD pays nothing. The first-use trap is not a syscall, interrupt or fault
+  and no `Stats` column counts it.
 - **Protection is installed at the switch.** A process's rows are data in its
   body. On a replay tier (`hal.prot_replay_at_switch()` true: Profile A, which
   has a small fixed budget of numbered regions) the scheduler replays them when
@@ -3089,7 +3108,6 @@ loader parses and reports while no process stores either.
   loader's `allow_device: true` door, dormant) (§2.5): its emitter is
   sawlang-side, so deleting it is a toolchain-pin event.
 - **The tier-2 mapping quota price** (`DEFAULT_QUOTA_MAPPINGS`, §5b.1).
-- **FP in userspace**: FP/SIMD state is not saved across a trap (§5b).
 
 **Known limits.**
 
@@ -3116,8 +3134,8 @@ loader parses and reports while no process stores either.
 **The plan.** The standing tail, each item specified in its own section: the
 namespace and its path-attached acceptor object (§2.1), `kill` (§8), thread
 waitability (§8), priorities and the §7 band map, SMP with `IntrSpinLock`
-(§9b), FP-in-userspace, the vDSO true-mapping (§5.7), and the IOMMU driver with
-critical processes (§2.5).
+(§9b), the vDSO true-mapping (§5.7), and the IOMMU driver with critical
+processes (§2.5).
 
 ## 12. The root server
 

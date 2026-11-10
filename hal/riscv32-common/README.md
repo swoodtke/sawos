@@ -67,6 +67,17 @@ are disjoint, so each declaration has exactly one owner. `trap.S` (the resume
 leaf) and `sink.c` (the CSR and linker-symbol leaves) define all of them; the
 linker's `--gc-sections` drops whichever a board does not reach.
 
+## No FPU
+
+Both riscv32 boards are FPU-less (`rv32imac` on `virt`, `rv32imc` on the C3), so
+`fp_trap`, `fp_switch_out` and `fp_switch_in` here do nothing and no thread has
+floating-point state. A board with an FPU follows the arm64 rule instead: the
+kernel itself executes no FP instruction, the FPU is disabled for user mode by
+default, a thread's first use traps and loads that thread's own (zeroed)
+state, and a switch saves and loads state for the threads that have used it.
+Those three seams are where it lands, with the save area beside the frame in
+the thread's slot and counted in `FRAME_BYTES`.
+
 ## Adding a board
 
 Adding a third riscv32 board means: a new `hal/riscv32-<board>/` with its own

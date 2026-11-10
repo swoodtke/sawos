@@ -107,6 +107,11 @@ func stays_running(slot: Int) unsafe -> Bool {
 /// (`kcore.process`) installs, replaying the rows or switching tables as the
 /// HAL advertises. So there is no per-profile branch here.
 ///
+/// The incoming thread's floating-point state is installed here too
+/// (`hal.fp_switch_in`), after the domain: it reads the thread's own frame, and
+/// `pick_next` has already had the outgoing thread's saved by
+/// `hal.fp_switch_out`.
+///
 /// This is one helper rather than two copies because a thread starts running
 /// in two places, `pick_next` at the trap-return boundary and
 /// `resume_after_death` after the running thread has ceased to exist. A reload
@@ -119,7 +124,9 @@ func run_thread(next: Int) unsafe -> UInt {
     if np != LAST_PROT_PROCESS {
         load_domain(np)
     }
-    frame_slot(next)
+    let frame = frame_slot(next)
+    hal.fp_switch_in(frame)
+    frame
 }
 
 /// Choose the thread to run next and return the frame to resume in.
@@ -173,6 +180,10 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
         idle_until_runnable()
         next = ready_pop()
     }
+
+    // The outgoing thread's floating-point state is saved while its slot is
+    // still live, so a freed slot's frame is never written.
+    hal.fp_switch_out(current_frame)
 
     // The outgoing thread is not read past this point. An exited thread that
     // nothing names goes now (`PENDING_FREE`).
