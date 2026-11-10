@@ -1,0 +1,128 @@
+// Test child: a process at the edge of its Handle row, for `create-budget`.
+//
+// Its launcher gives it a Process handle onto a second, unstarted process under
+// `TAG_OWNER`. The child mints siblings of its System handle until the Handle
+// row refuses, lets one go, and so has room for exactly one more handle. It
+// then makes objects through the owner's handle, which the owner owns and the
+// child holds:
+//
+//   a pipe needs two handles, so it is refused with QuotaExceeded and nothing
+//   is made or leaked;
+//   an Event needs one and is made, and a second is refused, so the table
+//   really did have exactly one handle of room;
+//   with the row full and the Thread slab full (the launcher fills it), a
+//   thread create is QuotaExceeded, the caller's row first, and once a handle
+//   is let go the same create is NoResource, the slab.
+//
+// The refusals are printed as the kernel words them.
+
+import sos.{System, SosStatus, sos_handle_mint, sos_handle_release}
+
+static TAG_OWNER: UInt = 1
+
+static EXIT_DONE: UInt = 40
+static EXIT_MISMATCH: UInt = 98
+
+/// The keep mask that narrows nothing.
+static KEEP_ALL: UInt = 0xFFFF_FFFF
+
+/// The status word a successful op answers with (`SosStatus.Ok`).
+static STATUS_OK: UInt = 0
+
+/// More mints than the Handle row allows.
+static MAX_MINTS: Int = 64
+
+static STACK_WORDS: Int = 512
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+static BYTES_PER_WORD: UInt = 8
+/// Every profile wants a 16-byte-aligned stack pointer; one of them checks.
+static STACK_ALIGN: UInt = 16
+
+/// The word the last successful mint answered.
+unsafe static var LAST_MINT: UInt = 0
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+/// Mint a sibling of `handle`, leave its word in `LAST_MINT` and answer the
+/// status.
+func mint_one(handle: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_handle_mint(handle, KEEP_ALL,
+                                 (&var out) as UnsafePointer<UInt>)
+    if status == STATUS_OK {
+        LAST_MINT = out
+    }
+    status
+}
+
+func last_mint() unsafe -> UInt {
+    LAST_MINT
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch { return }
+
+    var rec = try proc.boot_handle_next() catch {
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    guard let owner = rec.take_process() else {
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+
+    // Run the row to its budget, then let the last handle go.
+    var made = 0
+    var full = false
+    while not full && made < MAX_MINTS {
+        if mint_one(boot_handle) == STATUS_OK {
+            made = made + 1
+        } else {
+            full = true
+        }
+    }
+    let _ = sos_handle_release(last_mint())
+
+    match owner.pipe_create() {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS xbudget: a pipe was made\n")
+        },
+        case Err(why) -> print("SOS xbudget: pipe with one handle free: {}\n",
+                               why),
+    }
+    let event = try owner.event_create() catch {
+        print("SOS xbudget: event with one handle free: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let _ = system.debug_print("SOS xbudget: event made\n")
+    match owner.event_create() {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS xbudget: a second event was made\n")
+        },
+        case Err(why) -> print("SOS xbudget: second event: {}\n", why),
+    }
+
+    // The row is full again, and the launcher has filled the Thread slab.
+    match proc.thread_create(stack_top: stack_top(), arg: 0) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS xbudget: a thread was made\n")
+        },
+        case Err(why) -> print("SOS xbudget: thread with the row full: {}\n",
+                               why),
+    }
+    let _ = move event
+    match proc.thread_create(stack_top: stack_top(), arg: 0) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS xbudget: a thread was made\n")
+        },
+        case Err(why) -> print("SOS xbudget: thread with room: {}\n", why),
+    }
+    let _ = proc.exit(EXIT_DONE)
+}

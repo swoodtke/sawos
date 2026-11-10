@@ -572,11 +572,16 @@ public struct ProcessStats {
 /// not mere tidiness: dead records still held are what fill the record table.
 ///
 /// The factory methods (`thread_create`, `event_create`, `waiter_create`,
-/// `pipe_create`) act on the process the handle names,
-/// whether or not that is the caller: that process is charged and its table
-/// receives the new handles. On a handle onto another process the returned
-/// words belong to that process's table, so in the caller's table the
-/// wrappers they come back in name nothing, or a different object.
+/// `pipe_create`) act on behalf of the process the handle names, whether or not
+/// that is the caller: that process owns the new object and is charged for it
+/// (a thread runs in it), and the new handle lands in the caller's table,
+/// charged to the caller's `Handle` row. The wrapper a factory returns is
+/// therefore the caller's to use, give on or drop. A caller error (an entry or
+/// stack outside the named process, a mode that is not one) terminates the
+/// caller, and through the handle of a process that has ended every factory
+/// answers `SosStatus.Revoked`. `thread_self` and `boot_handle_next` are
+/// self-only: through a handle naming another process they terminate the
+/// caller.
 public struct Process {
     handle: ProcessHandle,
 }
@@ -598,12 +603,16 @@ extension Process {
     /// first argument register, and it must not return: its link register is
     /// zero, so returning faults and the fault ends the process (spec §8).
     ///
-    /// The kernel acts on the process this handle names, which is the caller
-    /// only on its own handle: an entry or a stack outside that process
-    /// terminates it, the thread is charged to its Thread quota, and the
-    /// handle is minted into its table. That process at its Thread or handle
-    /// quota is `SosStatus.QuotaExceeded`; a full thread slab or handle table
-    /// comes back as `SosStatus.NoResource`.
+    /// The thread runs in the process this handle names, which is the caller
+    /// only on its own handle, and is charged to that process's Thread quota.
+    /// The handle goes into the caller's table, charged to the caller's
+    /// `Handle` row, so the caller starts, joins and gives it on. An entry or a
+    /// stack outside the named process's region terminates the caller. A named
+    /// process at its Thread quota, or a caller at its handle quota, is
+    /// `SosStatus.QuotaExceeded`; a full thread slab or handle table is
+    /// `SosStatus.NoResource`; a process that has ended is
+    /// `SosStatus.Revoked`, answered before the entry and stack are checked
+    /// because there is no region left to check them against.
     public func thread_create(&self, entry: UInt, stack_top: UInt,
                               arg: UInt) -> Result<thread.Thread, SosStatus> {
         let raw = try call_value(self.handle, ProcessOp.ThreadCreate as UInt,
@@ -628,7 +637,8 @@ extension Process {
     }
 
     /// The calling thread's own Thread object. Requires
-    /// `ProcessRight.ThreadSelf`.
+    /// `ProcessRight.ThreadSelf`. Only the calling process can ask: through a
+    /// handle naming another process the kernel terminates the caller.
     ///
     /// This is how a thread reaches the handle it needs to exit or yield: it is
     /// handed its process, and asks the process which thread it is.
@@ -670,6 +680,14 @@ extension Process {
     /// One method takes the mode rather than one per mode: the mode is a value
     /// the caller chooses, so it is spelled as one. See the `sos` module
     /// docstring (`lib.saw`) for which enums are public API.
+    ///
+    /// The Event belongs to the process this handle names and is charged to its
+    /// Event quota, and the handle goes into the caller's table, charged to the
+    /// caller's `Handle` row. A mode that is not one terminates the caller. The
+    /// named process at its Event quota, or the caller at its handle quota, is
+    /// `SosStatus.QuotaExceeded`; a full slab or handle table is
+    /// `SosStatus.NoResource`; a process that has ended is
+    /// `SosStatus.Revoked`.
     public func event_create(&self,
                              mode: EventMode = EventMode.Or) -> Result<Event, SosStatus> {
         let raw = try call_value(self.handle, ProcessOp.EventCreate as UInt,
@@ -679,6 +697,13 @@ extension Process {
 
     /// Make a Waiter, §2.2's generic wait aggregator. Requires
     /// `ProcessRight.WaiterCreate`.
+    ///
+    /// The Waiter belongs to the process this handle names and is charged to
+    /// its Waiter quota, and the handle goes into the caller's table, charged
+    /// to the caller's `Handle` row. The named process at its Waiter quota, or
+    /// the caller at its handle quota, is `SosStatus.QuotaExceeded`; a full
+    /// slab or handle table is `SosStatus.NoResource`; a process that has ended
+    /// is `SosStatus.Revoked`.
     public func waiter_create(&self) -> Result<Waiter, SosStatus> {
         let raw = try call_value(self.handle, ProcessOp.WaiterCreate as UInt,
                                  0, 0, 0)
@@ -1116,10 +1141,13 @@ extension Process {
     /// outlet) = try proc.pipe_create()`, then `child.give(inlet: move inlet,
     /// tag: ...)` and keep the outlet, or the mirror.
     ///
-    /// A process at its pipe or handle quota is `SosStatus.QuotaExceeded` (one
-    /// pipe charge covers the pair), and a full slab or handle table is
-    /// `SosStatus.NoResource`. Either way nothing was created and neither table
-    /// moved.
+    /// The connection belongs to the process this handle names and is charged
+    /// to its pipe quota (one charge covers the pair), and both handles go into
+    /// the caller's table, charged to the caller's `Handle` row. A named
+    /// process at its pipe quota, or a caller without room for two more
+    /// handles, is `SosStatus.QuotaExceeded`, and a full slab or handle table
+    /// is `SosStatus.NoResource`. Either way nothing was created and neither
+    /// table moved. A process that has ended is `SosStatus.Revoked`.
     public func pipe_create(&self) -> Result<(PipeInlet, PipeOutlet), SosStatus> {
         pipe_create_into_frame(self.handle)
     }
@@ -1208,9 +1236,10 @@ extension Process {
         return Mapping(handle: MappingHandle(raw))
     }
 
-    /// Take the next handle out of the calling process's boot set (spec §12),
-    /// whichever process this handle names. Requires
-    /// `ProcessRight.BootHandles`.
+    /// Take the next handle out of the calling process's boot set (spec §12).
+    /// Requires `ProcessRight.BootHandles`. Only the calling process can ask:
+    /// through a handle naming another process the kernel terminates the
+    /// caller.
     ///
     /// §12 keeps the boot set one handle wide at the entry register (the System
     /// handle), so everything else the kernel minted before the process ran is

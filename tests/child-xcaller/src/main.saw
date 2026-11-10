@@ -1,0 +1,159 @@
+// Test child: one op through a handle onto another process, in four roles.
+//
+// Its launcher starts it with a masked System handle as its boot handle and
+// gives it a Process handle onto a host process under a tag that names the
+// role. The role makes one op through that handle, and every one of them is a
+// caller error:
+//
+//   1  `ThreadCreate` with an entry and a stack that lie in no region
+//   2  `EventCreate` with a mode that is not one
+//   3  `ThreadSelf`, which is self-only
+//   4  `BootHandleNext`, which is self-only
+//   5  `ThreadCreate` with the image entry and a stack in no region
+//   6  `EventCreate` with a mode that is not one, through an ended process
+//   7  `PipeCreate` with a capacity below the record, through an ended process
+//   8  `PipeCreate` with a misaligned buffer, through an ended process
+//
+// Roles 6 to 8 are given a handle onto a process that has ended. Their mistake
+// is the caller's all the same: the argument checks come before `Revoked`.
+//
+// The kernel faults this process in each case. A kernel that does not leaves
+// the line below on the console and this process ends itself, so the launcher
+// reads an ending it can tell apart.
+//
+// It works at the C altitude, as `tests/give-word-dead` does, because the
+// handle it was given is a raw word: the typed tier has no Process give, so
+// nothing wraps one. The record layout is written out for that file's reason.
+
+import sos.{System, sos_system_process_self, sos_process_boot_handle_next,
+            sos_process_thread_create, sos_process_thread_self,
+            sos_process_event_create, sos_process_pipe_create,
+            sos_process_exit}
+
+static ROLE_ENTRY: UInt = 1
+static ROLE_MODE: UInt = 2
+static ROLE_THREAD_SELF: UInt = 3
+static ROLE_BOOT_NEXT: UInt = 4
+static ROLE_STACK: UInt = 5
+static ROLE_GONE_MODE: UInt = 6
+static ROLE_GONE_CAP: UInt = 7
+static ROLE_GONE_BUF: UInt = 8
+
+/// `ENTRY_IMAGE`: the image's own entry.
+static ENTRY_IMAGE: UInt = 0
+
+/// An address no pipe record can sit at: not word-aligned.
+static MISALIGNED: UInt = 1
+
+/// An entry and a stack that lie in no process's region.
+static WILD_ENTRY: UInt = 8
+static WILD_STACK: UInt = 16
+
+/// A number that is not an `EventMode`.
+static BAD_MODE: UInt = 99
+
+/// Two words, the size of a pipe-create record.
+static PIPE_RECORD_BYTES: UInt = 16
+
+/// The keep mask `SystemOp.ProcessSelf` takes; all-ones keeps every right.
+static KEEP_ALL: UInt = 0xFFFF_FFFF
+
+/// The status word a successful op answers with (`SosStatus.Ok`).
+static STATUS_OK: UInt = 0
+
+/// The boot-handle record: tag, kind, handle.
+static RECORD_WORDS: Int = 3
+static RECORD_TAG_WORD: Int = 0
+static RECORD_HANDLE_WORD: Int = 2
+
+/// How this process ends when the op did not fault it.
+static EXIT_SURVIVED: UInt = 99
+static EXIT_NO_RECORD: UInt = 98
+
+/// A raw word naming nothing.
+static NO_WORD: UInt = 0
+
+/// This process's own Process handle, as a raw word.
+func ask_process(system: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_system_process_self(system, KEEP_ALL,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+/// The role op through `victim`, answering the status it got.
+func act(role: UInt, victim: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    if role == ROLE_ENTRY {
+        return sos_process_thread_create(victim, WILD_ENTRY, WILD_STACK, 0,
+                                         (&var out) as UnsafePointer<UInt>)
+    }
+    if role == ROLE_STACK {
+        return sos_process_thread_create(victim, ENTRY_IMAGE, WILD_STACK, 0,
+                                         (&var out) as UnsafePointer<UInt>)
+    }
+    if role == ROLE_MODE || role == ROLE_GONE_MODE {
+        return sos_process_event_create(victim, BAD_MODE,
+                                        (&var out) as UnsafePointer<UInt>)
+    }
+    if role == ROLE_GONE_CAP {
+        return sos_process_pipe_create(victim,
+                                       (&var out) as UnsafePointer<UInt>, 0)
+    }
+    if role == ROLE_GONE_BUF {
+        return sos_process_pipe_create(victim, MISALIGNED as UnsafePointer<UInt>,
+                                       PIPE_RECORD_BYTES)
+    }
+    if role == ROLE_THREAD_SELF {
+        return sos_process_thread_self(victim,
+                                       (&var out) as UnsafePointer<UInt>)
+    }
+    var buf: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+    let bytes = (RECORD_WORDS * sizeof<UInt>()) as UInt
+    sos_process_boot_handle_next(victim, (&var buf) as UnsafePointer<UInt>,
+                                 bytes)
+}
+
+/// The role record the launcher gave: the tag is the role and the handle is the
+/// host process. `victim` is `NO_WORD` when the set is empty.
+struct Given {
+    role: UInt,
+    victim: UInt,
+}
+
+func next_record(me: UInt) unsafe -> Given {
+    var buf: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+    let bytes = (RECORD_WORDS * sizeof<UInt>()) as UInt
+    let status = sos_process_boot_handle_next(me,
+                                              (&var buf) as UnsafePointer<UInt>,
+                                              bytes)
+    if status != STATUS_OK {
+        return Given(role: NO_WORD, victim: NO_WORD)
+    }
+    Given(role: buf[RECORD_TAG_WORD], victim: buf[RECORD_HANDLE_WORD])
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let me = ask_process(boot_handle)
+    if me == NO_WORD {
+        let _ = system.debug_print("SOS xcaller: no process handle\n")
+        return
+    }
+
+    let given = next_record(me)
+    if given.victim == NO_WORD {
+        let _ = sos_process_exit(me, EXIT_NO_RECORD)
+        return
+    }
+    let role = given.role
+    let victim = given.victim
+
+    let status = act(role, victim)
+    print("SOS xcaller: role {} survived, status={}\n", role, status)
+    let _ = sos_process_exit(me, EXIT_SURVIVED)
+}

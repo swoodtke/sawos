@@ -1,0 +1,155 @@
+// No thread of a process runs before its `ProcessOp.Start` (spec §2.7, §8).
+//
+// A launcher may create a thread through an unstarted child's handle, but the
+// thread is inert: starting it is a `BadState` fault on the caller, and the
+// launcher starts it after the child.
+//
+// Root runs a host once, to learn the address of its thread stack, and ends it.
+// It then creates the host again from the same image and RAM, so the new
+// process has the same layout, and:
+//
+//   created in the unstarted child     a thread made through its handle
+//   joined=77 after the child started  the same thread, started after
+//                                      `ProcessOp.Start`, runs in the child
+//   starting a thread of an unstarted  a third host, never started: the start
+//   child                              faults root (`BadState`)
+//
+// Every loop is bounded.
+
+import sos.{System, Process, Memory, Event, SystemRight, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tags the children's boot records travel under.
+static TAG_BOOT: UInt = 7
+static TAG_ADDR: UInt = 51
+static TAG_DONE: UInt = 52
+
+/// The role the host's worker thread is created with, and what it exits with.
+static ROLE_WORKER: UInt = 1
+static CODE_WORKER: UInt = 77
+
+/// The most turns root yields waiting on the host.
+static MAX_TURNS: Int = 100000
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS xprestart: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS xprestart: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS xprestart: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// Yield until `event` has been signalled and answer what it carried.
+func await_event(proc: &Process, event: &Event) -> Result<UInt, SosStatus> {
+    let me = try proc.thread_self()
+    var turns = 0
+    while turns < MAX_TURNS {
+        let bits = try event.receive()
+        if bits != 0 {
+            return bits
+        }
+        let _ = me.yield_now()
+        turns = turns + 1
+    }
+    return BUG
+}
+
+/// Yield until `child` has ended and answer its status word.
+func await_end(proc: &Process, child: &Process) -> Result<UInt, SosStatus> {
+    let me = try proc.thread_self()
+    var turns = 0
+    while turns < MAX_TURNS {
+        let status = try child.get_status()
+        if status != 0 {
+            return status
+        }
+        let _ = me.yield_now()
+        turns = turns + 1
+    }
+    return BUG
+}
+
+/// Give `child` the host's two Events and a masked System, and start it.
+func launch(system: &System, child: &Process, addr: &Event,
+            done: &Event) -> Result<Void, SosStatus> {
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let addr_sibling = try addr.mint()
+    try child.give(event: move addr_sibling, tag: TAG_ADDR) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let done_sibling = try done.mint()
+    try child.give(event: move done_sibling, tag: TAG_DONE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    return
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    let addr = try proc.event_create()
+    let done = try proc.event_create()
+
+    let stack = try learn_stack(&system, &proc, &image, &ram, &addr, &done)
+
+    // Created, then thread made, then started, then the thread started.
+    let second = try system.process_create(image: &image, memory: &ram)
+    let worker = try second.thread_create(stack_top: stack, arg: ROLE_WORKER)
+    let _ = system.debug_print("SOS xprestart: created in the unstarted child\n")
+    try launch(&system, &second, &addr, &done)
+    let _ = try await_event(&proc, &addr)
+    try worker.start()
+    let code = try worker.join()
+    print("SOS xprestart: joined={} after the child started\n", code)
+    try done.signal(1)
+    let _ = try await_end(&proc, &second)
+
+    // A child that is never started: its thread cannot be.
+    let third = try system.process_create(image: &image, memory: &ram)
+    let inert = try third.thread_create(stack_top: stack, arg: ROLE_WORKER)
+    let _ = system.debug_print("SOS xprestart: starting a thread of an unstarted child\n")
+    let _ = inert.start()
+    let _ = system.debug_print("SOS xprestart: survived, which is the bug\n")
+    return
+}
+
+/// Run a host to learn its stack address, and end it.
+func learn_stack(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+                 addr: &Event, done: &Event) -> Result<UInt, SosStatus> {
+    let first = try system.process_create(image: &image, memory: &ram)
+    try launch(&system, &first, &addr, &done)
+    let stack = try await_event(&proc, &addr)
+    try done.signal(1)
+    let _ = try await_end(&proc, &first)
+    return stack
+}

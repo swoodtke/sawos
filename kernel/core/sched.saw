@@ -345,10 +345,9 @@ func invalidate_timer(t: Int, p: Int) unsafe {
 /// (a release, a detach, a delivery, the reap's process scan) then needs no
 /// special case: each sees a count that cannot reach zero until that drop.
 ///
-/// A `Gone` record has no body, and the teardown can run on one a second time:
-/// a creation op through a `Gone` process's handle can still fault the named
-/// process (spec §2.10's not-yet-enforced list). The body's steps are skipped
-/// then, since the first teardown did them.
+/// The body's steps run only for a process that still has its body
+/// (`has_body`); a `Gone` record has none, and a teardown that met one would
+/// skip them.
 ///
 /// `code` is what a supervisor reads out of the spec §8 status word.
 /// `machine_status` is what the emulator exits with, which for a fault is the
@@ -547,14 +546,13 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
         }
         t = t + 1
     }
-    // This assumes the dying process is the caller, so the running thread was
-    // one of the slots just swept (invalidated, or `Exited` when its own exit
-    // ended the process) and nothing is current any more. A
-    // path that ends some other process while a caller runs (a creation op
-    // through another process's handle faulting that process, spec §2.7)
-    // strands that caller: its thread stays `Running`, on no list, and is never
-    // scheduled again. Its process does not end on that account, since the
-    // stranded thread never exits.
+    // The dying process owns the running thread, or no thread is running: a
+    // fault is on the caller, an exit is self-only (spec §2.7), and the
+    // deadlock that ends root is reached with nothing current. So the running
+    // thread was one of the slots just swept (invalidated, or `Exited` when its
+    // own exit ended the process) and nothing is current any more. Ending some
+    // other process here would leave the caller's thread `Running`, on no list,
+    // and never scheduled.
     CURRENT_THREAD = NO_THREAD
 
     // Attachments belong to a Waiter, so they are reclaimed by walking the

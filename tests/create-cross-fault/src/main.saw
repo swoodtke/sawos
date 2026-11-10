@@ -1,0 +1,294 @@
+// A caller error in an op through another process's handle faults the caller
+// (spec §2.7).
+//
+// Root runs a host process and, in turn, four helpers. Each helper is given a
+// Process handle onto the host and makes one op through it that is a mistake
+// only the helper could have made:
+//
+//   role 1   `ThreadCreate` with an entry and stack in no region    BadEntry
+//   role 2   `EventCreate` with a mode that is not one              BadArg
+//   role 3   `ThreadSelf`, which is self-only                       NotSelf
+//   role 4   `BootHandleNext`, which is self-only                   NotSelf
+//
+// The helper is the process that ends, with the kernel's fault line and its
+// teardown line, and root survives to read both status words:
+//
+//   SOS xfault: role 1 caller=131078 victim=0
+//
+// The caller word is the Faulted kind (2 << 16) and the fault reason, and the
+// victim word is `Running`: the host was never touched. A helper whose thread
+// was never scheduled again would leave root's poll to give up, and root's own
+// lines after each trial show nothing was left hung.
+//
+// Root works at the C altitude, as `tests/give-word-dead` does, because the
+// Process handle it gives a helper is a raw word: the typed tier has no Process
+// give.
+//
+// Every loop is bounded.
+
+import sos.{System, SystemRight, sos_system_process_self,
+            sos_system_process_create, sos_process_boot_handle_next,
+            sos_process_get_status, sos_process_thread_self, sos_process_start,
+            sos_process_give, sos_process_event_create, sos_handle_mint,
+            sos_handle_release, sos_event_signal, sos_thread_yield}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The tags the children's boot records travel under. A helper's role is the
+/// tag of the host handle it is given.
+static TAG_BOOT: UInt = 70
+static TAG_ADDR: UInt = 51
+static TAG_DONE: UInt = 52
+
+/// The roles run against the live host, then the roles run against the host
+/// after it has ended. The numbers are `child-xcaller`'s.
+static LIVE_ROLES: UInt = 5
+static ROLE_GONE_MODE: UInt = 6
+static ROLE_GONE_CAP: UInt = 7
+static ROLE_GONE_BUF: UInt = 8
+
+/// The keep mask that narrows nothing.
+static KEEP_ALL: UInt = 0xFFFF_FFFF
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt = ((SystemRight.Debug | SystemRight.ProcessSelf
+                              | SystemRight.Transfer) as UInt)
+
+/// The status word a successful op answers with (`SosStatus.Ok`).
+static STATUS_OK: UInt = 0
+
+/// The `BootTagForm` that names a tag.
+static TAG_PRESENT: UInt = 1
+
+/// The boot-handle record: tag, kind, handle.
+static RECORD_WORDS: Int = 3
+static RECORD_HANDLE_WORD: Int = 2
+
+/// A raw word naming nothing, and a status word no process has.
+static NO_WORD: UInt = 0
+static NO_STATUS: UInt = 0xFFFF_FFFF
+
+/// The kind half of a §8 status word for a process that exited, and the code
+/// `child-xhost` exits with when told to.
+static EXITED: UInt = 1 << 16
+static EXIT_DONE: UInt = 40
+
+/// The most turns root yields waiting on a process.
+static MAX_TURNS: Int = 20000
+
+func ask_process(system: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_system_process_self(system, KEEP_ALL,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+/// The handle word of the next boot record, or `NO_WORD` when the set is
+/// drained.
+func next_word(process: UInt) unsafe -> UInt {
+    var buf: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+    let bytes = (RECORD_WORDS * sizeof<UInt>()) as UInt
+    let status = sos_process_boot_handle_next(process,
+                                              (&var buf) as UnsafePointer<UInt>,
+                                              bytes)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    buf[RECORD_HANDLE_WORD]
+}
+
+func create_child(system: UInt, image: UInt, ram: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_system_process_create(system, image, ram,
+                                           (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+func new_event(process: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_process_event_create(process, 0,
+                                          (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+/// A sibling of `handle` carrying `keep`'s rights.
+func sibling(handle: UInt, keep: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_handle_mint(handle, keep, (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+/// The §8 status word of `process`.
+func status_of(process: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_process_get_status(process,
+                                        (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_STATUS
+    }
+    out
+}
+
+func own_thread(process: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_process_thread_self(process,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+/// Give `child` a sibling of `handle` under `tag`.
+func give_sibling(child: UInt, handle: UInt, tag: UInt) unsafe -> Bool {
+    let word = sibling(handle, KEEP_ALL)
+    if word == NO_WORD {
+        return false
+    }
+    sos_process_give(child, word, tag, KEEP_ALL) == STATUS_OK
+}
+
+/// Give `child` a masked System as its boot handle, and start it with it.
+func start_with_system(system: UInt, child: UInt) unsafe -> Bool {
+    let word = sibling(system, CHILD_SYSTEM)
+    if word == NO_WORD {
+        return false
+    }
+    if sos_process_give(child, word, TAG_BOOT, KEEP_ALL) != STATUS_OK {
+        return false
+    }
+    sos_process_start(child, TAG_PRESENT, TAG_BOOT) == STATUS_OK
+}
+
+/// Yield until `process` is no longer running and answer its status word.
+func await_end(process: UInt, thread: UInt) unsafe -> UInt {
+    var turns = 0
+    while turns < MAX_TURNS {
+        let status = status_of(process)
+        if status != 0 {
+            return status
+        }
+        let _ = sos_thread_yield(thread)
+        turns = turns + 1
+    }
+    status_of(process)
+}
+
+/// One helper: start it with `given`, a handle onto the host, under `role`,
+/// and answer how it ended.
+func trial(system: UInt, thread: UInt, given: UInt, role: UInt, image: UInt,
+           ram: UInt) unsafe -> UInt {
+    let helper = create_child(system, image, ram)
+    if helper == NO_WORD || given == NO_WORD {
+        return NO_STATUS
+    }
+    if sos_process_give(helper, given, role, KEEP_ALL) != STATUS_OK {
+        return NO_STATUS
+    }
+    if not start_with_system(system, helper) {
+        return NO_STATUS
+    }
+    let ended = await_end(helper, thread)
+    let _ = sos_handle_release(helper)
+    ended
+}
+
+func fail(system: &System, why: String) {
+    let _ = system.debug_print(why)
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let me = ask_process(boot_handle)
+    if me == NO_WORD {
+        fail(&system, "SOS xfault: no process handle\n")
+        return
+    }
+
+    // The images come first, then the RAMs, in the children's order.
+    let host_image = next_word(me)
+    let helper_image = next_word(me)
+    let host_ram = next_word(me)
+    let helper_ram = next_word(me)
+    if helper_ram == NO_WORD {
+        fail(&system, "SOS xfault: boot regions missing\n")
+        return
+    }
+
+    let host = create_child(boot_handle, host_image, host_ram)
+    let addr = new_event(me)
+    let done = new_event(me)
+    if host == NO_WORD || addr == NO_WORD || done == NO_WORD {
+        fail(&system, "SOS xfault: host not made\n")
+        return
+    }
+    if not give_sibling(host, addr, TAG_ADDR) {
+        fail(&system, "SOS xfault: host not furnished\n")
+        return
+    }
+    if not give_sibling(host, done, TAG_DONE) {
+        fail(&system, "SOS xfault: host not furnished\n")
+        return
+    }
+    if not start_with_system(boot_handle, host) {
+        fail(&system, "SOS xfault: host not started\n")
+        return
+    }
+    let thread = own_thread(me)
+    if thread == NO_WORD {
+        fail(&system, "SOS xfault: no thread handle\n")
+        return
+    }
+    let _ = system.debug_print("SOS xfault: started\n")
+
+    var role: UInt = 1
+    while role <= LIVE_ROLES {
+        let caller = trial(boot_handle, thread, sibling(host, KEEP_ALL), role,
+                           helper_image, helper_ram)
+        let victim = status_of(host)
+        print("SOS xfault: role {} caller={} victim={}\n", role, caller, victim)
+        role = role + 1
+    }
+
+    // The host is alive after all of them, and ends when told to. The handles
+    // the last roles are given are minted while it is alive.
+    let spare_a = sibling(host, KEEP_ALL)
+    let spare_b = sibling(host, KEEP_ALL)
+    let spare_c = sibling(host, KEEP_ALL)
+    let _ = sos_event_signal(done, 1)
+    let ended = await_end(host, thread)
+    print("SOS xfault: host ended={}\n", ended - EXITED)
+    if ended != EXITED + EXIT_DONE {
+        fail(&system, "SOS xfault: host did not end as told\n")
+        return
+    }
+
+    // Through the ended host's handle a caller error is still the caller's
+    // fault: the argument checks come before `Revoked`.
+    let gone_a = trial(boot_handle, thread, spare_a, ROLE_GONE_MODE,
+                       helper_image, helper_ram)
+    print("SOS xfault: role {} caller={}\n", ROLE_GONE_MODE, gone_a)
+    let gone_b = trial(boot_handle, thread, spare_b, ROLE_GONE_CAP,
+                       helper_image, helper_ram)
+    print("SOS xfault: role {} caller={}\n", ROLE_GONE_CAP, gone_b)
+    let gone_c = trial(boot_handle, thread, spare_c, ROLE_GONE_BUF,
+                       helper_image, helper_ram)
+    print("SOS xfault: role {} caller={}\n", ROLE_GONE_BUF, gone_c)
+    let _ = system.debug_print("SOS xfault: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}

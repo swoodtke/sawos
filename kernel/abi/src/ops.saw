@@ -255,11 +255,10 @@ public enum SystemOp: UInt {
 /// is one op on each object.
 ///
 /// The factory ops (`ThreadCreate`, `EventCreate`, `WaiterCreate`,
-/// `PipeCreate`) act on the process the handle names, whether or not that is
-/// the caller. A factory charges that process's quota and mints into its table,
-/// so through another process's handle the word that comes back is that
-/// process's. `PipeCreate` also uses the caller, but only for its buffer: the
-/// answer record is written into the caller's memory.
+/// `PipeCreate`) act on behalf of the process the handle names, whether or not
+/// that is the caller. That process owns the new object and is charged its
+/// quota row; the new handle goes into the caller's table, charged to the
+/// caller's `Handle` row, so the word that comes back is the caller's own.
 ///
 /// Op numbers are not ABI (userspace names the case and this module supplies
 /// the value, and the two are compiled into one image together), so a table may
@@ -268,9 +267,9 @@ public enum SystemOp: UInt {
 /// `BootHandleNext` is the boot-set iterator: the boot set enters user mode one
 /// handle wide (§12), the register carries System, and everything else the
 /// kernel minted for root at boot is drained through this op one record at a
-/// time. The set it drains is the caller's own, whichever Process handle
-/// carries the request, whether the kernel filled it at boot or a launcher
-/// filled it with `Give`.
+/// time. The set it drains is the caller's own, whether the kernel filled it at
+/// boot or a launcher filled it with `Give`. The op is self-only: a Process
+/// handle naming another process faults the caller (`NotSelf`).
 ///
 /// `Give` is the courier op, and it keeps the bare verb for `Start`'s reason:
 /// the receiver is the child. A launcher asks the child's Process handle to
@@ -306,9 +305,9 @@ public enum SystemOp: UInt {
 /// offsets published beside the wait record's), because one op returns one word
 /// in the value register and the copy funnel is the precedented door
 /// (`Clock.Now`'s is the two-word-record precedent). Both ends are minted into
-/// the table of the process the handle names (the caller, on its own handle)
-/// and wired outward with `give`, so a launcher can hand the inlet to one child
-/// and the outlet to another with the launch flow unchanged.
+/// the caller's table, whichever process the handle names, and wired outward
+/// with `give`, so a launcher can hand the inlet to one child and the outlet to
+/// another with the launch flow unchanged.
 ///
 /// `Stats` is the introspection op. It answers through a copy-out record, for
 /// the reason `PipeCreate` and `Clock.Now` do: one op returns one word and the

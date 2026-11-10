@@ -215,6 +215,7 @@ import kcore.objects.{
     quota_charge,
     quota_credit,
     quota_room,
+    quota_room_for,
     unbind_handle,
 }
 import kcore.diag.{fatal_kernel}
@@ -547,14 +548,19 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             if not obj.allows(ProcessRight.ThreadCreate) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            thread_create(obj.slot, arg0, arg1, arg2)
+            thread_create(p, obj.slot, arg0, arg1, arg2)
         },
         // Mint-per-call, as `ProcessSelf`: the default rights are
         // `thread_rights()` and `ThreadSelf` on the Process handle gates the
-        // derivation. A full table is `NoResource`.
+        // derivation. A full table is `NoResource`. Self-only: the running
+        // thread is the caller's, so a handle naming another process, a `Gone`
+        // one included, faults the caller (`NotSelf`), as `Exit` does.
         case ThreadSelf -> {
             if not obj.allows(ProcessRight.ThreadSelf) {
                 fault_process(p, FaultReason.AccessDenied)
+            }
+            if obj.slot != p {
+                fault_process(p, FaultReason.NotSelf)
             }
             if CURRENT_THREAD == NO_THREAD {
                 fault_process(p, FaultReason.BadState)
@@ -602,13 +608,13 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             if not obj.allows(ProcessRight.EventCreate) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            event_create(obj.slot, arg0)
+            event_create(p, obj.slot, arg0)
         },
         case WaiterCreate -> {
             if not obj.allows(ProcessRight.WaiterCreate) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            waiter_create(obj.slot)
+            waiter_create(p, obj.slot)
         },
         // Phase two of the two-phase lifecycle, asked of the child's handle:
         // `obj.slot` is the process being started, not the caller. The right is
@@ -624,14 +630,18 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             }
             process_start(p, obj.slot, arg0, arg1)
         },
-        // §12's boot set, drained one record at a time. It is asked of the
-        // process's own handle: the set belongs to the process it was minted
-        // for, so `obj.slot` and the caller are the same process once the right
-        // check passes. `p` reads the caller's own records, written by the
-        // kernel at boot (root) or by a launcher's gives (a child).
+        // §12's boot set, drained one record at a time. Self-only: the set
+        // belongs to the process it was minted for, so a handle naming another
+        // process, a `Gone` one included, faults the caller (`NotSelf`) and
+        // `obj.slot` and the caller are the same process past the check. `p`
+        // reads the caller's own records, written by the kernel at boot (root)
+        // or by a launcher's gives (a child).
         case BootHandleNext -> {
             if not obj.allows(ProcessRight.BootHandles) {
                 fault_process(p, FaultReason.AccessDenied)
+            }
+            if obj.slot != p {
+                fault_process(p, FaultReason.NotSelf)
             }
             boot_handle_next(p, arg0, arg1)
         },
@@ -651,7 +661,8 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
         // The factory for a connection. It sits on the Process object beside
         // `EventCreate` and `WaiterCreate` because a pipe is IPC and nothing
         // system-shaped, and because the Process object is what a connection is
-        // charged to: its slab slot, its two handle entries, its quota row.
+        // charged to: its slab slot and its quota row. The two handles are the
+        // caller's, as for every creation op.
         //
         // `arg0` is the answer buffer and `arg1` its capacity: both ends come
         // back through a copy-out record, because one op returns one value
@@ -660,7 +671,7 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             if not obj.allows(ProcessRight.PipeCreate) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            pipe_create(obj.slot, p, arg0, arg1)
+            pipe_create(p, obj.slot, arg0, arg1)
         },
         // Introspection. It is asked of the process being observed: `obj.slot`
         // is whose columns come back and the caller `p` is only whose buffer
@@ -1140,9 +1151,8 @@ func process_start(caller: Int, child: Int,
     //
     // The thread is the child's, so the child is charged: the launcher is not
     // spending one of its own threads but the first of the child's. This is the
-    // same rule every other row follows (the slot's `process` field is who
-    // pays), applied at the one site where the slot is written for somebody
-    // else.
+    // same rule every other row follows: the slot's `process` field is who
+    // pays.
     if not quota_room(child, QuotaKind.Thread) {
         return op_status(SosStatus.QuotaExceeded)
     }
@@ -1407,23 +1417,40 @@ func process_stats(p: Int, target: Int, dst: UInt, cap: UInt) unsafe -> SyscallR
     op_ok()
 }
 
-/// Make an Event in process `slot` (spec §2.4).
+/// Make an Event owned by process `owner`, whose one handle goes into the
+/// caller `p`'s table (spec §2.4, §2.7).
 ///
-/// The mode is a raw register word the process chose, so it is decoded: a
-/// number that is not a mode is a caller error and ends the process.
-func event_create(p: Int, raw_mode: UInt) unsafe -> SyscallResult {
+/// `owner` is the process the Process handle names, and it is charged for the
+/// Event. `p` is who trapped: it holds the handle, pays for it on its `Handle`
+/// row, and is the process any caller error faults. They are one process when a
+/// process creates through its own handle.
+///
+/// The mode is a raw register word the caller chose, so it is decoded: a
+/// number that is not a mode is a caller error and ends the caller, whichever
+/// process the handle names. Through a `Gone` owner the answer is `Revoked`,
+/// after that argument check (spec §2.10).
+func event_create(p: Int, owner: Int, raw_mode: UInt) unsafe -> SyscallResult {
     guard let mode = EventMode.from(raw: raw_mode) else { fault_process(p, FaultReason.BadArg) }
-    return event_create_moded(p, mode)
+    return event_create_moded(p, owner, mode)
 }
 
-func event_create_moded(p: Int, mode: EventMode) unsafe -> SyscallResult {
+func event_create_moded(p: Int, owner: Int, mode: EventMode) unsafe -> SyscallResult {
+    if not has_body(owner) {
+        return op_status(SosStatus.Revoked)
+    }
     // Policy refuses before the machine is asked. This is the order every
     // allocation site follows: a process at its own budget gets
     // `QuotaExceeded`, and only a process still within it can meet the slab's
     // `NoResource`. The two are different facts and a caller can act on the
     // difference: releasing something it already holds fixes the first and
-    // cannot fix the second.
-    if not quota_room(p, QuotaKind.Event) {
+    // cannot fix the second. The object row is the owner's and the `Handle`
+    // row is the caller's.
+    if not quota_room(owner, QuotaKind.Event) {
+        return op_status(SosStatus.QuotaExceeded)
+    }
+    // The caller's `Handle` row is policy too, so it is asked before the slab:
+    // a caller at its budget facing a full slab hears `QuotaExceeded`.
+    if not quota_room(p, QuotaKind.Handle) {
         return op_status(SosStatus.QuotaExceeded)
     }
     let slot = alloc_event()
@@ -1437,9 +1464,9 @@ func event_create_moded(p: Int, mode: EventMode) unsafe -> SyscallResult {
     // Written only once both allocations succeeded, so a refused handle leaves
     // the slab exactly as it found it. The charge joins that rule: a process
     // must not pay for an object it never got.
-    EVENTS[slot] = EventSlot(state: SlotState.Live, process: p, mode: mode,
+    EVENTS[slot] = EventSlot(state: SlotState.Live, process: owner, mode: mode,
                              word: 0, attachment: 0, refs: 1)
-    quota_charge(p, QuotaKind.Event)
+    quota_charge(owner, QuotaKind.Event)
     op_value(handle)
 }
 
@@ -1492,9 +1519,20 @@ func interrupt_bind(p: Int, line: UInt) unsafe -> SyscallResult {
     op_value(handle)
 }
 
-/// Make a Waiter in process `slot` (spec §2.2).
-func waiter_create(p: Int) unsafe -> SyscallResult {
-    if not quota_room(p, QuotaKind.Waiter) {
+/// Make a Waiter owned by process `owner`, whose one handle goes into the
+/// caller `p`'s table (spec §2.2, §2.7). The owner is charged for the Waiter
+/// and the caller for the handle, as `event_create` describes. A `Gone` owner
+/// answers `Revoked` (spec §2.10).
+func waiter_create(p: Int, owner: Int) unsafe -> SyscallResult {
+    if not has_body(owner) {
+        return op_status(SosStatus.Revoked)
+    }
+    if not quota_room(owner, QuotaKind.Waiter) {
+        return op_status(SosStatus.QuotaExceeded)
+    }
+    // The caller's `Handle` row is policy too, so it is asked before the slab:
+    // a caller at its budget facing a full slab hears `QuotaExceeded`.
+    if not quota_room(p, QuotaKind.Handle) {
         return op_status(SosStatus.QuotaExceeded)
     }
     let slot = alloc_waiter()
@@ -1505,29 +1543,33 @@ func waiter_create(p: Int) unsafe -> SyscallResult {
     if handle == NO_HANDLE {
         return op_status(mint_refusal(p))
     }
-    WAITERS[slot] = WaiterSlot(state: WaiterState.Live, process: p, attached: 0,
-                               blocked: 0, refs: 1)
-    quota_charge(p, QuotaKind.Waiter)
+    WAITERS[slot] = WaiterSlot(state: WaiterState.Live, process: owner,
+                               attached: 0, blocked: 0, refs: 1)
+    quota_charge(owner, QuotaKind.Waiter)
     op_value(handle)
 }
 
-/// Make a thread in process `slot`, ready to be started.
+/// Make a thread that runs in process `owner`, ready to be started, whose
+/// handle goes into the caller `p`'s table (spec §2.7). The owner is charged
+/// against its Thread row and the caller against its `Handle` row.
 ///
-/// The entry and the stack are checked against the process's granted region.
-/// Both are caller-checkable (a process knows where its own image and stacks
-/// are), so a bad one terminates it rather than producing a thread that would
-/// fault on its first instruction and take the process down anyway, with a
+/// The entry and the stack are checked against the owner's granted region,
+/// since that is where the thread runs. Both are caller-checkable (a launcher
+/// knows where the image it launched keeps its stacks), so a bad one
+/// terminates the caller, not the owner, rather than producing a thread that
+/// would fault on its first instruction and take the owner down anyway, with a
 /// worse diagnostic.
 ///
-/// A `Gone` process has no region left to check them against, and its ledger
-/// was cleared at its teardown, so the answer is the `QuotaExceeded` its empty
-/// thread row gives whatever the entry and stack are (spec §2.10's
-/// not-yet-enforced list).
-func thread_create(p: Int, entry: UInt, stack_top: UInt, arg: UInt) unsafe -> SyscallResult {
-    if not has_body(p) {
-        return op_status(SosStatus.QuotaExceeded)
+/// A `Gone` owner answers `Revoked` (spec §2.10). It is asked before the
+/// entry and the stack are checked: the check needs a body to read the region
+/// from, and a `Gone` process has none. This is the one argument check that
+/// follows `Revoked`; the rights check comes first as for every op.
+func thread_create(p: Int, owner: Int, entry: UInt, stack_top: UInt,
+                   arg: UInt) unsafe -> SyscallResult {
+    if not has_body(owner) {
+        return op_status(SosStatus.Revoked)
     }
-    let body = body_of(p)
+    let body = body_of(owner)
     let start = if entry == ENTRY_IMAGE { PROCESSES[body].entry } else { entry }
     if start < PROCESSES[body].region_base || start >= PROCESSES[body].region_top {
         fault_process(p, FaultReason.BadEntry)
@@ -1539,7 +1581,12 @@ func thread_create(p: Int, entry: UInt, stack_top: UInt, arg: UInt) unsafe -> Sy
     // The thread row is credited when the slot is freed (`free_object`) or the
     // thread is invalidated (`invalidate_thread`), so it counts the slots the
     // process holds, exited ones still named included.
-    if not quota_room(p, QuotaKind.Thread) {
+    if not quota_room(owner, QuotaKind.Thread) {
+        return op_status(SosStatus.QuotaExceeded)
+    }
+    // The caller's `Handle` row is policy too, so it is asked before the slab:
+    // a caller at its budget facing a full slab hears `QuotaExceeded`.
+    if not quota_room(p, QuotaKind.Handle) {
         return op_status(SosStatus.QuotaExceeded)
     }
     let slot = alloc_thread()
@@ -1553,12 +1600,12 @@ func thread_create(p: Int, entry: UInt, stack_top: UInt, arg: UInt) unsafe -> Sy
 
     hal.frame_init(frame_slot(slot), start, stack_top, arg)
     // The handle just minted is the first reference.
-    THREADS[slot] = ThreadSlot(state: ThreadState.Created, process: p,
+    THREADS[slot] = ThreadSlot(state: ThreadState.Created, process: owner,
                                exit_code: 0,
                                joiners: 0, link: 0, wait_buf: 0,
                                call_pipe: 0, call_claim: 0, call_src: 0,
                                call_len: 0, refs: 1)
-    quota_charge(p, QuotaKind.Thread)
+    quota_charge(owner, QuotaKind.Thread)
     op_value(handle)
 }
 
@@ -1593,6 +1640,15 @@ func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
                 case Created -> {},
                 case Invalid -> { return op_status(SosStatus.Revoked) },
                 case _ -> fault_process(p, FaultReason.BadState),
+            }
+            // No thread of a process runs before its `ProcessOp.Start`: a
+            // thread made through a `Created` child's handle is inert until
+            // the child is started, so starting it earlier is a caller error.
+            // This is also why a `Created` child never ends and a `Gone` one
+            // was always started.
+            match PROCESS_RECORDS[THREADS[target].process].state {
+                case Created -> fault_process(p, FaultReason.BadState),
+                case _ -> {},
             }
             THREADS[target].state = ThreadState.Runnable
             ready_push(target)
@@ -3028,32 +3084,29 @@ static_assert(sizeof<PipeCreateRecord>()
               == PIPE_CREATE_RECORD_WORDS * sizeof<UInt>(),
               "a pipe-create record must be exactly the words sosabi publishes")
 
-/// Make a connection and hand back both of its ends (spec §2.1).
+/// Make a connection owned by process `owner` and hand back both of its ends,
+/// which go into the caller's table (spec §2.1, §2.7).
 ///
-/// `owner` is the process the connection is made in (charged for it, and whose
-/// table the two handles land in) and `caller` is the process whose memory the
-/// answer is written to. They are the same process when a process creates a
-/// pipe through its own Process handle, and are two parameters because the op
-/// reaches them by two routes: `owner` is `obj.slot`, the process the handle
-/// names, where every other `*Create` op puts its object; `caller` is who
-/// trapped, whose buffer `copy_out` may write. A
-/// launcher creating a pipe through a child's Process handle is the one shape
-/// where they differ, and it gets child-relative words, as `ThreadCreate`
-/// through a child's handle does.
+/// `owner` is the process the Process handle names, and it is charged for the
+/// connection; `caller` is who trapped. The caller's table receives the two
+/// handles, its `Handle` row pays for them, its memory takes the answer, and it
+/// is the process any caller error faults. They are one process when a process
+/// creates a pipe through its own Process handle.
 ///
 /// Refusal order is the all-or-nothing shape every allocation site follows:
 /// caller-checkable faults first (a capacity below the published record size, a
-/// destination the copy door refuses), then policy (`QuotaExceeded`), then the
-/// machine (`NoResource`), and only then is anything written. The destination
-/// is checked before the slab is touched, so a refused buffer leaves the slab
-/// as it found it.
+/// destination the copy door refuses), then `Revoked` for a `Gone` owner (spec
+/// §2.10), then policy (`QuotaExceeded`: the owner's pipe row, then room for
+/// both handles on the caller's `Handle` row), then the machine (`NoResource`:
+/// the pipe slab, then room for both handles in the caller's table), and only
+/// then is anything written. The destination is checked before the slab is
+/// touched, so a refused buffer leaves the slab as it found it.
 ///
-/// The second mint can half-succeed and is unwound. A connection with one
-/// handle would have an unreachable end and a column that can never fall, a
-/// permanent slot leak, so a refused outlet unbinds the inlet and answers,
-/// leaving both tables as they were. No slot has been marked Live at that
-/// point, so there is nothing else to give back.
-func pipe_create(owner: Int, caller: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
+/// Room for both handles is established before the slab is asked, so neither
+/// mint can be refused and a connection never ends up with one reachable end:
+/// the kernel runs the syscall with nothing able to take a table slot between
+/// the count and the mints.
+func pipe_create(caller: Int, owner: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
     // A capacity below the record's size is outside the argument's domain; the
     // size is published, so the caller could have checked (as in
     // `Waiter.Wait`).
@@ -3069,25 +3122,29 @@ func pipe_create(owner: Int, caller: Int, dst: UInt, cap: UInt) unsafe -> Syscal
         fault_process(caller, why)
     }
 
+    if not has_body(owner) {
+        return op_status(SosStatus.Revoked)
+    }
     if not quota_room(owner, QuotaKind.Pipe) {
+        return op_status(SosStatus.QuotaExceeded)
+    }
+    if not quota_room_for(caller, QuotaKind.Handle, 2) {
         return op_status(SosStatus.QuotaExceeded)
     }
     let slot = alloc_pipe()
     if slot == NO_PIPE {
         return op_status(SosStatus.NoResource)
     }
-    let inlet = mint_handle(owner, ObjType.PipeInlet, pipe_inlet_rights(), slot)
-    if inlet == NO_HANDLE {
-        return op_status(mint_refusal(owner))
+    if not table_room(caller, 2) {
+        return op_status(SosStatus.NoResource)
     }
-    let outlet = mint_handle(owner, ObjType.PipeOutlet, pipe_outlet_rights(),
+    let inlet = mint_handle(caller, ObjType.PipeInlet, pipe_inlet_rights(), slot)
+    let outlet = mint_handle(caller, ObjType.PipeOutlet, pipe_outlet_rights(),
                              slot)
-    if outlet == NO_HANDLE {
-        // The unwind. `unbind_handle` is the one release and teardown use, so
-        // the generation bump comes for free and the word this op never handed
-        // out cannot have been used by anybody.
-        unbind_handle(owner, handle_word_index(inlet))
-        return op_status(mint_refusal(owner))
+    if inlet == NO_HANDLE || outlet == NO_HANDLE {
+        // Unreachable: the pre-flight established room for both.
+        fatal_kernel("a pipe's handles were refused after their pre-flight",
+                     slot as UInt)
     }
 
     // Both columns start at one: the creation count, applied once per end. The

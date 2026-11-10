@@ -1,0 +1,110 @@
+// Creation ops through another process's handle charge that process (spec
+// §2.7, §2.9).
+//
+// Root, whose quota rows are unlimited, makes Events, Waiters and pipes
+// through the Process handle of a child that was created and never started.
+// Each kind stops at the child's own quota, which only the child's row can
+// refuse; the objects are root's to hold, and releasing them credits the
+// child's row again, so the same number fit a second time:
+//
+//   events made=4 then refused      the child's Event quota
+//   events made=4 again             the releases credited the child
+//   waiters made=2 then refused     the child's Waiter quota
+//   waiters made=2 again
+//   pipes made=2 then refused       the child's pipe quota, one charge a pair
+//   pipes made=2 again
+//
+// Every loop is bounded.
+
+import sos.{System, Process, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS xquota: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS xquota: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS xquota: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    let child = try system.process_create(image: &image, memory: &ram)
+
+    let e1 = try events(&child)
+    let e2 = try events(&child)
+    print("SOS xquota: events made={} then refused, made={} again\n", e1, e2)
+    let w1 = try waiters(&child)
+    let w2 = try waiters(&child)
+    print("SOS xquota: waiters made={} then refused, made={} again\n", w1, w2)
+    let p1 = try pipes(&child)
+    let p2 = try pipes(&child)
+    print("SOS xquota: pipes made={} then refused, made={} again\n", p1, p2)
+    return
+}
+
+/// Make Events through `child`'s handle until one is refused with
+/// `QuotaExceeded`, hold them to the end of the function and answer how many.
+/// Four fit, and a fifth is refused.
+func events(child: &Process) -> Result<Int, SosStatus> {
+    let a = try child.event_create()
+    let b = try child.event_create()
+    let c = try child.event_create()
+    let d = try child.event_create()
+    match child.event_create() {
+        case Ok(_) -> { return BUG },
+        case Err(why) -> {
+            if why != SosStatus.QuotaExceeded {
+                return why
+            }
+        },
+    }
+    return 4
+}
+
+/// As `events`, for Waiters: two fit.
+func waiters(child: &Process) -> Result<Int, SosStatus> {
+    let a = try child.waiter_create()
+    let b = try child.waiter_create()
+    match child.waiter_create() {
+        case Ok(_) -> { return BUG },
+        case Err(why) -> {
+            if why != SosStatus.QuotaExceeded {
+                return why
+            }
+        },
+    }
+    return 2
+}
+
+/// As `events`, for pipes: two fit, a pair apiece.
+func pipes(child: &Process) -> Result<Int, SosStatus> {
+    let a = try child.pipe_create()
+    let b = try child.pipe_create()
+    match child.pipe_create() {
+        case Ok(_) -> { return BUG },
+        case Err(why) -> {
+            if why != SosStatus.QuotaExceeded {
+                return why
+            }
+        },
+    }
+    return 2
+}

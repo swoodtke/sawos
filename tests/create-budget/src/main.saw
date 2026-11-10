@@ -1,0 +1,232 @@
+// The caller's Handle row governs a creation op (spec §2.7, §2.9).
+//
+// Root launches `child-xbudget` with a Process handle onto a second process
+// that is created and never started. Before it starts the child, root makes
+// Threads in itself until only the child's main thread has a slot left, so the
+// Thread slab is full once the child runs. The child, at the edge of its
+// Handle row, then reports (see `child-xbudget`):
+//
+//   pipe with one handle free: this process is at its quota
+//   event made / second event: this process is at its quota
+//   thread with the row full: this process is at its quota
+//   thread with room: out of kernel objects
+//
+// The pipe is refused before it is made, on room for both its handles. The
+// thread create meets the caller's row before the slab, so the full slab is
+// only heard once a handle is let go.
+//
+// Root works at the C altitude, because the Process handle it gives the child
+// is a raw word.
+
+import sos.{System, SystemRight, sos_system_process_self,
+            sos_system_process_create, sos_process_boot_handle_next,
+            sos_process_get_status, sos_process_start, sos_process_give,
+            sos_process_thread_create, sos_process_thread_self, sos_handle_mint,
+            sos_handle_release, sos_thread_yield}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static TAG_BOOT: UInt = 7
+static TAG_OWNER: UInt = 1
+
+/// Threads root makes in itself. The Thread slab holds root's main thread,
+/// these, and the child's main thread.
+static FILLER_THREADS: Int = 6
+
+/// `ENTRY_IMAGE`: the image's own entry.
+static ENTRY_IMAGE: UInt = 0
+
+static KEEP_ALL: UInt = 0xFFFF_FFFF
+
+static CHILD_SYSTEM: UInt = ((SystemRight.Debug | SystemRight.ProcessSelf
+                              | SystemRight.Mint | SystemRight.Transfer) as UInt)
+
+static STATUS_OK: UInt = 0
+static TAG_PRESENT: UInt = 1
+
+static RECORD_WORDS: Int = 3
+static RECORD_HANDLE_WORD: Int = 2
+
+static NO_WORD: UInt = 0
+static NO_STATUS: UInt = 0xFFFF_FFFF
+
+/// The kind half of a §8 status word for a process that exited, and the code
+/// `child-xbudget` exits with.
+static EXITED: UInt = 1 << 16
+
+static MAX_TURNS: Int = 20000
+
+static STACK_WORDS: Int = 512
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+static BYTES_PER_WORD: UInt = 8
+/// Every profile wants a 16-byte-aligned stack pointer; one of them checks.
+static STACK_ALIGN: UInt = 16
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func ask_process(system: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_system_process_self(system, KEEP_ALL,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+func next_word(process: UInt) unsafe -> UInt {
+    var buf: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+    let bytes = (RECORD_WORDS * sizeof<UInt>()) as UInt
+    let status = sos_process_boot_handle_next(process,
+                                              (&var buf) as UnsafePointer<UInt>,
+                                              bytes)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    buf[RECORD_HANDLE_WORD]
+}
+
+func create_child(system: UInt, image: UInt, ram: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_system_process_create(system, image, ram,
+                                           (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+func sibling(handle: UInt, keep: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_handle_mint(handle, keep, (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+func status_of(process: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_process_get_status(process,
+                                        (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_STATUS
+    }
+    out
+}
+
+/// Make a thread in `process` that is never started, and answer its handle.
+func filler(process: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_process_thread_create(process, ENTRY_IMAGE, stack_top(), 0,
+                                           (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+func own_thread(process: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_process_thread_self(process,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+/// Give `child` a sibling of `owner` under `TAG_OWNER`.
+func give_owner(child: UInt, owner: UInt) unsafe -> Bool {
+    let word = sibling(owner, KEEP_ALL)
+    if word == NO_WORD {
+        return false
+    }
+    let st = sos_process_give(child, word, TAG_OWNER, KEEP_ALL)
+    st == STATUS_OK
+}
+
+/// Give `child` a masked System as its boot handle, and start it with it.
+func start_child(system: UInt, child: UInt) unsafe -> Bool {
+    let word = sibling(system, CHILD_SYSTEM)
+    if word == NO_WORD {
+        return false
+    }
+    if sos_process_give(child, word, TAG_BOOT, KEEP_ALL) != STATUS_OK {
+        return false
+    }
+    sos_process_start(child, TAG_PRESENT, TAG_BOOT) == STATUS_OK
+}
+
+func fail(system: &System, why: String) {
+    let _ = system.debug_print(why)
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let me = ask_process(boot_handle)
+    if me == NO_WORD {
+        fail(&system, "SOS budget: no process handle\n")
+        return
+    }
+
+    // The images come first, then the RAMs, in the children's order.
+    let child_image = next_word(me)
+    let owner_image = next_word(me)
+    let child_ram = next_word(me)
+    let owner_ram = next_word(me)
+    if owner_ram == NO_WORD {
+        fail(&system, "SOS budget: boot regions missing\n")
+        return
+    }
+    let owner = create_child(boot_handle, owner_image, owner_ram)
+    let child = create_child(boot_handle, child_image, child_ram)
+    if owner == NO_WORD || child == NO_WORD {
+        fail(&system, "SOS budget: children not made\n")
+        return
+    }
+
+    // Root's table holds sixteen handles; the regions are done with.
+    let _ = sos_handle_release(child_image)
+    let _ = sos_handle_release(owner_image)
+    let _ = sos_handle_release(child_ram)
+    let _ = sos_handle_release(owner_ram)
+
+    var made = 0
+    while made < FILLER_THREADS {
+        if filler(me) == NO_WORD {
+            fail(&system, "SOS budget: thread slab filler refused\n")
+            return
+        }
+        made = made + 1
+    }
+    let _ = system.debug_print("SOS budget: thread slab filled\n")
+
+    if not give_owner(child, owner) {
+        fail(&system, "SOS budget: owner not given\n")
+        return
+    }
+    if not start_child(boot_handle, child) {
+        fail(&system, "SOS budget: child not started\n")
+        return
+    }
+
+    let thread = own_thread(me)
+    var turns = 0
+    var ended = status_of(child)
+    while ended == 0 && turns < MAX_TURNS {
+        let _ = sos_thread_yield(thread)
+        ended = status_of(child)
+        turns = turns + 1
+    }
+    print("SOS budget: child ended={}\n", ended - EXITED)
+    let _ = system.debug_print("SOS budget: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}

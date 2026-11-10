@@ -241,8 +241,13 @@ public func sos_system_interrupt_bind(handle: UInt, line: UInt,
     sos_syscall3(handle, SystemOp.InterruptBind as UInt, line, 0, 0, value_out)
 }
 
-/// Make a thread in this process, ready to start. Requires
-/// `ProcessRight.ThreadCreate`. `entry` may be `ENTRY_IMAGE`.
+/// Make a thread that runs in the process the handle names, ready to start.
+/// Requires `ProcessRight.ThreadCreate`. `entry` may be `ENTRY_IMAGE`.
+///
+/// The thread is charged to the named process's Thread quota and its handle
+/// goes into the caller's table. An `entry` or `stack_top` outside the named
+/// process's region terminates the caller; a process that has ended is
+/// `SosStatus.Revoked`, answered before that check.
 @export("sos_process_thread_create")
 public func sos_process_thread_create(handle: UInt, entry: UInt, stack_top: UInt,
                                       arg: UInt,
@@ -251,7 +256,8 @@ public func sos_process_thread_create(handle: UInt, entry: UInt, stack_top: UInt
                  value_out)
 }
 
-/// The calling thread's own handle. Requires `ProcessRight.ThreadSelf`.
+/// The calling thread's own handle. Requires `ProcessRight.ThreadSelf`. A
+/// handle naming another process terminates the caller.
 @export("sos_process_thread_self")
 public func sos_process_thread_self(handle: UInt,
                                     value_out: UnsafePointer<UInt>) unsafe -> UInt {
@@ -272,7 +278,8 @@ public func sos_process_get_status(handle: UInt,
     sos_syscall3(handle, ProcessOp.GetStatus as UInt, 0, 0, 0, value_out)
 }
 
-/// Make a created thread runnable. Requires `ThreadRight.Start`.
+/// Make a created thread runnable. Requires `ThreadRight.Start`. A thread of a
+/// process that has not been started terminates the caller.
 @export("sos_thread_start")
 public func sos_thread_start(handle: UInt) -> UInt {
     sos_syscall1(handle, ThreadOp.Start as UInt, 0)
@@ -299,9 +306,11 @@ public func sos_thread_yield(handle: UInt) -> UInt {
     sos_syscall1(handle, ThreadOp.Yield as UInt, 0)
 }
 
-/// Make an Event in this process. Requires `ProcessRight.EventCreate`. `mode`
-/// is 0 for bitwise-OR accumulation and 1 for saturating-sum (spec §2.4); any
-/// other value terminates the process.
+/// Make an Event owned by the process the handle names, with its handle in the
+/// caller's table. Requires `ProcessRight.EventCreate`. `mode` is 0 for
+/// bitwise-OR accumulation and 1 for saturating-sum (spec §2.4); any other
+/// value terminates the caller. A process that has ended is
+/// `SosStatus.Revoked`.
 ///
 /// The C altitude writes the mode as a number, the documented difference in
 /// kind the module docstring describes: a C caller has no enum to be handed, so
@@ -312,7 +321,9 @@ public func sos_process_event_create(handle: UInt, mode: UInt,
     sos_syscall3(handle, ProcessOp.EventCreate as UInt, mode, 0, 0, value_out)
 }
 
-/// Make a Waiter in this process. Requires `ProcessRight.WaiterCreate`.
+/// Make a Waiter owned by the process the handle names, with its handle in the
+/// caller's table. Requires `ProcessRight.WaiterCreate`. A process that has
+/// ended is `SosStatus.Revoked`.
 @export("sos_process_waiter_create")
 public func sos_process_waiter_create(handle: UInt,
                                       value_out: UnsafePointer<UInt>) unsafe -> UInt {
@@ -395,7 +406,8 @@ public func sos_process_give(handle: UInt, given: UInt, tag: UInt,
 }
 
 /// Take the next handle out of the calling process's boot set, as a record
-/// copied into `buf` (spec §12). Requires `ProcessRight.BootHandles`.
+/// copied into `buf` (spec §12). Requires `ProcessRight.BootHandles`. A handle
+/// naming another process terminates the caller.
 ///
 /// `cap` is the buffer's size in bytes and must be at least
 /// `boot_handle_record_bytes()`. The buffer must be word-aligned and inside
@@ -713,13 +725,14 @@ public func sos_mapping_unmap(handle: UInt) -> UInt {
 /// register because an op returns one word and this one has two to say
 /// (`sos_clock_now` is the precedent for answering in memory).
 ///
-/// Both ends are minted into the table of the process the handle names, which
-/// is also the one charged; that is the caller only on its own handle, and
-/// `buf` is always the caller's. Wiring the ends outward is
+/// The connection belongs to the process the handle names, which is charged
+/// for it; that is the caller only on its own handle. Both ends are minted into
+/// the caller's table, and `buf` is the caller's. Wiring the ends outward is
 /// `sos_process_give`'s job, which lets a launcher hand the inlet to one child
-/// and keep or pass the outlet. That process at its pipe or handle quota is
-/// `SosStatus.QuotaExceeded`; a full slab or handle table is
-/// `SosStatus.NoResource`.
+/// and keep or pass the outlet. The named process at its pipe quota, or the
+/// caller at its handle quota, is `SosStatus.QuotaExceeded`; a full slab or
+/// handle table is `SosStatus.NoResource`; a process that has ended is
+/// `SosStatus.Revoked`.
 @export("sos_process_pipe_create")
 public func sos_process_pipe_create(handle: UInt, buf: UnsafePointer<UInt>,
                                     cap: UInt) unsafe -> UInt {

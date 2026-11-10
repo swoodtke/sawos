@@ -237,6 +237,18 @@ GIVE_DUPLICATE_TAG_PKG = os.path.join(TESTS_DIR, "give-duplicate-tag")
 GIVE_AFTER_START_PKG = os.path.join(TESTS_DIR, "give-after-start")
 GIVE_NO_TRANSFER_PKG = os.path.join(TESTS_DIR, "give-no-transfer")
 PROCESS_EXIT_NOT_SELF_PKG = os.path.join(TESTS_DIR, "process-exit-not-self")
+# Which process an op acts on (spec 2.7): the creation ops through another
+# process's handle, and the caller errors that fault the caller. `child-xhost`
+# is the process created through, `child-xcaller` the helper that makes the
+# mistaken op, and the sink is a child that is created and never started.
+CREATE_CROSS_PKG = os.path.join(TESTS_DIR, "create-cross")
+CREATE_CROSS_FAULT_PKG = os.path.join(TESTS_DIR, "create-cross-fault")
+CHILD_XHOST_PKG = os.path.join(TESTS_DIR, "child-xhost")
+CHILD_XCALLER_PKG = os.path.join(TESTS_DIR, "child-xcaller")
+CREATE_CROSS_QUOTA_PKG = os.path.join(TESTS_DIR, "create-cross-quota")
+CREATE_BUDGET_PKG = os.path.join(TESTS_DIR, "create-budget")
+CHILD_XBUDGET_PKG = os.path.join(TESTS_DIR, "child-xbudget")
+CREATE_PRESTART_PKG = os.path.join(TESTS_DIR, "create-prestart")
 START_BAD_TAG_PKG = os.path.join(TESTS_DIR, "start-bad-tag")
 GIVE_WORD_DEAD_PKG = os.path.join(TESTS_DIR, "give-word-dead")
 MINT_REVOKED_PKG = os.path.join(TESTS_DIR, "mint-revoked")
@@ -2551,6 +2563,154 @@ TEST_CASES = [
                        "SOS: process teardown handles="],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # Creation ops act on behalf of the process the handle names, and the
+        # new handle is a word in the caller's table. Root makes a Thread, an
+        # Event, a Waiter and a pipe through a host child's Process handle and
+        # uses each directly. The host's Thread quota is what refuses the
+        # fifth thread, and each object goes on to a child that was never
+        # started. Once the host has ended, the same four ops answer `Revoked`
+        # (the thread op with an entry and stack in no region, so `Revoked`
+        # comes before the address-space check).
+        "name": "create_cross",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": CREATE_CROSS_PKG,
+        "children": [CHILD_XHOST_PKG, CHILD_HOLD2_PKG],
+        "expect_out": ["{banner}",
+                       "SOS xcreate: thread created",
+                       "SOS xcreate: thread joined=77",
+                       "SOS xcreate: event received=5",
+                       "SOS xcreate: waiter woke=91",
+                       "SOS xcreate: pipe posted=3 first=65",
+                       "SOS xcreate: thread quota refused after=2: "
+                       "this process is at its quota",
+                       "SOS xcreate: gave=5 to the sink",
+                       "SOS xcreate: host ended=65576",
+                       "SOS xcreate: thread: what this call was waiting "
+                       "for is gone",
+                       "SOS xcreate: event: what this call was waiting "
+                       "for is gone",
+                       "SOS xcreate: waiter: what this call was waiting "
+                       "for is gone",
+                       "SOS xcreate: pipe: what this call was waiting "
+                       "for is gone",
+                       "SOS xcreate: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A caller error in an op through another process's handle faults the
+        # caller and leaves the named process alone. Four helpers in turn are
+        # handed a Process handle onto a live host: a bad entry (`BadEntry`), a
+        # bad event mode (`BadArg`), and the two self-only ops `ThreadSelf` and
+        # `BootHandleNext` (`NotSelf`). Each helper ends with the kernel's
+        # fault line and its teardown line, root reads the helper's status word
+        # (Faulted, 2 << 16, plus the reason) and the host's (Running, zero),
+        # and root's later lines show nothing was left unscheduled.
+        "name": "create_cross_fault",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": CREATE_CROSS_FAULT_PKG,
+        "children": [CHILD_XHOST_PKG, CHILD_XCALLER_PKG],
+        "expect_out": ["{banner}",
+                       "SOS xfault: started",
+                       "SOS: process fault: thread entry outside the process "
+                       "process={two}",
+                       "SOS: process teardown",
+                       "SOS xfault: role 1 caller=131078 victim=0",
+                       "SOS: process fault: argument outside its domain "
+                       "process={two}",
+                       "SOS: process teardown",
+                       "SOS xfault: role 2 caller=131081 victim=0",
+                       "SOS: process fault: not the caller process={two}",
+                       "SOS: process teardown",
+                       "SOS xfault: role 3 caller=131076 victim=0",
+                       "SOS: process fault: not the caller process={two}",
+                       "SOS: process teardown",
+                       "SOS xfault: role 4 caller=131076 victim=0",
+                       "SOS: process fault: thread entry outside the process "
+                       "process={two}",
+                       "SOS: process teardown",
+                       "SOS xfault: role 5 caller=131078 victim=0",
+                       "SOS xfault: host ended=40",
+                       "SOS: process fault: argument outside its domain "
+                       "process={two}",
+                       "SOS: process teardown",
+                       "SOS xfault: role 6 caller=131081",
+                       "SOS: process fault: argument outside its domain "
+                       "process={two}",
+                       "SOS: process teardown",
+                       "SOS xfault: role 7 caller=131081",
+                       "SOS: process fault: buffer is not word-aligned "
+                       "process={two}",
+                       "SOS: process teardown",
+                       "SOS xfault: role 8 caller=131082",
+                       "SOS xfault: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Creation ops through another process's handle charge that process's
+        # quota rows: root, whose rows are unlimited, makes Events, Waiters
+        # and pipes through the handle of a child that was never started, and
+        # each kind stops at the child's own quota. Releasing the objects
+        # credits the child again (the object's owner is the named process),
+        # so the same number fits a second time.
+        "name": "create_cross_quota",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": CREATE_CROSS_QUOTA_PKG,
+        "children": [CHILD_FAULT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS xquota: events made=4 then refused, made=4 again",
+                       "SOS xquota: waiters made=2 then refused, made=2 again",
+                       "SOS xquota: pipes made=2 then refused, made=2 again",
+                       "SOS xquota: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # No thread of a process runs before its `ProcessOp.Start`. A thread
+        # made through a `Created` child's handle is accepted, and starting it
+        # after the child is started runs it in the child; starting a thread
+        # of a child that was never started is a `BadState` fault on the
+        # caller.
+        "name": "create_prestart",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": CREATE_PRESTART_PKG,
+        "children": [CHILD_XHOST_PKG],
+        "expect_out": ["{banner}",
+                       "SOS xprestart: created in the unstarted child",
+                       "SOS xprestart: joined=77 after the child started",
+                       "SOS xprestart: starting a thread of an unstarted "
+                       "child",
+                       "SOS: process fault: object in the wrong state "
+                       "process={zero}",
+                       "SOS: process teardown"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # The caller's Handle row governs a creation op. A child at one
+        # handle short of its budget makes objects through another process's
+        # handle: a pipe (two handles) is QuotaExceeded with nothing made or
+        # leaked, so an Event then fits and a second does not. With its row
+        # full and the Thread slab full, a thread create is QuotaExceeded (the
+        # caller's row is policy, asked before the slab), and NoResource once
+        # a handle is let go.
+        "name": "create_budget",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": CREATE_BUDGET_PKG,
+        "children": [CHILD_XBUDGET_PKG, CHILD_HOLD2_PKG],
+        "expect_out": ["{banner}",
+                       "SOS budget: thread slab filled",
+                       "SOS xbudget: pipe with one handle free: this process "
+                       "is at its quota",
+                       "SOS xbudget: event made",
+                       "SOS xbudget: second event: this process is at its "
+                       "quota",
+                       "SOS xbudget: thread with the row full: this process "
+                       "is at its quota",
+                       "SOS xbudget: thread with room: out of kernel objects",
+                       "SOS budget: child ended=40",
+                       "SOS budget: done"],
+        "expect_clean_exit": True,
     },
     {
         # The attenuation proof, on §3's universal low byte: `Transfer` is

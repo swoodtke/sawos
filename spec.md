@@ -1082,8 +1082,7 @@ child does at its create, the first of each table, so "process 0" names both
 (§8, §12). An op that needs a body answers through a `Gone` process's handle
 exactly as §2.10 rules for it, since the body is gone: the creation ops and a
 `map` naming it answer `Revoked`, `Start` and `Give` are `BadState` faults
-(below), and the self-only ops are `NotSelf` faults. Not yet enforced: the
-creation ops do not answer `Revoked` there (§2.10).
+(below), and the self-only ops are `NotSelf` faults.
 
 **Ops**, each on its own `ProcessRight`: the creation ops `ThreadCreate`,
 `EventCreate`, `WaiterCreate` and `PipeCreate`, then `ThreadSelf`, `Exit`,
@@ -1104,31 +1103,27 @@ three groups:
   `PipeCreate` — is placed in the caller's table, charged to the caller's
   `Handle` row as every mint is (§2.9), and the caller gives it on if the
   other process needs it: every kind these ops create is givable (§3). A
-  caller error (a bad entry, stack or mode) faults the caller. Not yet
-  enforced: the handles are minted into the named process's table, so through
-  another process's handle the caller is handed words relative to that table;
-  and a bad entry or stack in `ThreadCreate` (`BadEntry`) or a bad mode in
-  `EventCreate` (`BadArg`) faults the named process. The teardown assumes the
-  dying process is the caller, so the caller's running thread is then never
-  scheduled again. `PipeCreate` already faults the caller, and `WaiterCreate`
-  has no fault path.
+  caller error (a bad entry or stack, `BadEntry`; a bad mode, `BadArg`) faults
+  the caller, so no creation op ends the named process. Through a `Gone`
+  process's handle these ops answer `Revoked` (§2.10), after the rights and
+  argument checks. `ThreadCreate` answers it before the entry and stack are
+  checked, because that check reads the named process's address space and a
+  `Gone` process has no body. A thread created in a `Created` child is inert:
+  `ThreadOp.Start` on it is a `BadState` fault until the child has been
+  started, and the launcher starts it after `ProcessOp.Start`.
 - **`Exit`, `ThreadSelf` and `BootHandleNext` are self-only**: through a handle
   naming another process the kernel faults the caller (`NotSelf`). `Exit` ends
   the calling process, `ThreadSelf` names the caller's running thread, and
   `BootHandleNext` drains the caller's own boot set. A `Gone` process's handle
-  never names the live caller, so through one these are the same `NotSelf` fault
-  (already so for `Exit`). Not yet enforced for `ThreadSelf` and
-  `BootHandleNext`: each checks its right on the handle used and acts on the
-  caller whichever process the handle names, so a holder of another process's
-  handle with `BootHandles` can drain its own boot set even when its own Process
-  handle lacks the right.
+  never names the live caller, so through one these are the same `NotSelf`
+  fault. The right on the handle used is checked first, so a handle without it
+  is `AccessDenied`.
 - **`Start`, `Give`, `GetStatus` and `Stats` act on the named process**, which
   is what supervision is. `Start` and `Give` require a `Created` child, and
   naming one that is not, a `Gone` one included, is a `BadState` fault rather
   than `Revoked` (§2.10): a `Gone` child was always started, and the launcher
-  that started it knows. Not yet enforced: a `Created` child can die unstarted
-  today, because a caller error in `ThreadCreate` or `EventCreate` through its
-  handle faults the child (above).
+  that started it knows. No thread of a `Created` child can run (below), so
+  none can end it, and that stays true.
 
 **The default set.** One Process default set serves all three minters (root's,
 `ProcessSelf`'s and `ProcessCreate`'s), named for its ops throughout:
@@ -1169,8 +1164,7 @@ handed back unread at the child's drain.
   it named (the register is the delivery, so a child can never be handed one
   word twice). The child's entry is `_start(boot_handle)`, and the launch flow
   never shows a launcher a child-relative word. Nor do the creation ops, which
-  place their handles in the caller's table (above) — not yet enforced: today
-  they hand a launcher words relative to the child's table.
+  place their handles in the caller's table (above).
 - `BootHandleNext` drains the caller's own per-process set, and only the
   caller's (above) — the kernel writes root's at boot and a launcher writes a
   child's with `give`, through one op with one exhaustion rule (§12).
@@ -1490,7 +1484,10 @@ and still the caller's, and what it reports is for the protocol to act on.
 
 **What "every op" covers.** Dispatch keeps §5.7's order, so a handle that names
 nothing, a missing right and a malformed argument fault exactly as they would
-on a live object; `Revoked` only reports that the object is gone. Release works
+on a live object; `Revoked` only reports that the object is gone. The one
+exception is `ThreadCreate` through a `Gone` process's handle, which answers
+`Revoked` before it checks the entry and stack, since that check needs a body
+(§2.7). Release works
 on an invalid object as on any other (§3), since releasing is how an invalid
 object reaches Freed. `MINT_OP` on an invalid object answers `Revoked`. The
 self-only Process ops through a `Gone` process's handle are the `NotSelf` fault
@@ -1640,12 +1637,6 @@ Not yet enforced:
   which reclaims every `Gone` process record whose last reference the teardown
   dropped. A Mapping that targets the dying process is invalid: its slot is
   kept, its row cleared and its handles stay in other tables.
-- The creation ops through a `Gone` process's handle do not answer `Revoked`.
-  They answer `QuotaExceeded` when their arguments are well formed, its ledger
-  having been cleared, and `ThreadCreate` answers it whatever its entry and
-  stack, since no region is left to check them against; a bad mode faults the
-  `Gone` process again, which reruns the teardown (with no body left to free),
-  overwrites its status word and strands the caller.
 
 ## 3. Handles, rights, derivation
 
@@ -2172,9 +2163,8 @@ offending process, so `BadHandle`, `BadOp` and `AccessDenied` are `FaultReason`
 tags rather than statuses, keeping their numbers — `SosStatus` leaves 1–3
 unused. The kernel stays up, reports, and runs the teardown (§8). The rule is
 uniform because it has to be: an unbound handle names no kind, so there is no op
-table to ask which rule applies. Not yet enforced through another process's
-handle: a caller error in `ThreadCreate` or `EventCreate` faults the named
-process instead (§2.7). What is left
+table to ask which rule applies. The caller is the process that faults, through
+whichever process's handle the op was made (§2.7). What is left
 in `SosStatus` is what a caller could not have known — `NoResource` (a full
 slab), `QuotaExceeded` (§2.9), `BadImage` (§8), `Drained` (§12), `Revoked`
 (§2.2, and every op on an invalid object, §2.10), `PeerClosed` and
@@ -2670,7 +2660,9 @@ entry and makes it runnable; the caller keeps running. The ordering is the
 soundness argument for the launch flow: whatever a launcher gives a child must
 be complete at its first instruction, and the start call is the barrier that
 makes a half-populated table unrepresentable — with no synchronization
-invented. **A second `start` is a `BadState` fault**: broken code, and the
+invented. The barrier covers threads too: a thread made through a `Created`
+child's handle is inert, and `ThreadOp.Start` on it is a `BadState` fault until
+the child has been started, so no thread of a process runs before its `Start`. **A second `start` is a `BadState` fault**: broken code, and the
 caller is the one that started it the first time. **A malformed image is a
 `BadImage` status, not a fault** — the one caller-supplied thing that does not
 end the caller, because image bytes are data a launcher was handed rather than
@@ -3080,14 +3072,9 @@ loader parses and reports while no process stores either.
 
 **Known limits.**
 
-- The Process creation ops do not yet place their handles in the caller's
-  table, and a caller error in `ThreadCreate` or `EventCreate` through another
-  process's handle faults the named process; `ThreadSelf` and `BootHandleNext`
-  are not yet self-only (§2.7).
 - The object lifecycle is not yet enforced as §2.10 states it: the
   teardown's close-all releases every handle but counts without freeing, the
-  sweeps after it invalidate the bound kinds rather than before it; and the
-  creation ops through a `Gone` Process's handle do not answer `Revoked`.
+  sweeps after it invalidate the bound kinds rather than before it.
 - A child that is created but never started, once nothing names it, is never
   torn down, so whatever it was given stays held: an Interrupt's line
   included, which no one can bind again.
@@ -3225,14 +3212,14 @@ critical processes (§2.5).
   - **`start(boot_tag:)` is how the first handle arrives.** The kernel resolves
     the tag to the child-side word and puts it in the first argument register,
     so the entry is `_start(boot_handle)` and the launch flow never shows a
-    launcher a child-relative word (§2.7 holds the creation ops to the same; not
-    yet enforced). Resolution consumes the record the tag names — the register
-    is the delivery — so the drain never answers with a word the child already
-    holds. The no-tag form is the default, and a child started with it and given
-    nothing is the sandboxed compute process (sandboxed on the isolated tiers);
-    a tag naming no given record is a `BadArg` fault, and "no tag" is a form
-    argument rather than a reserved tag value, because zero is a legitimate tag
-    (root's region ordinals start there).
+    launcher a child-relative word (§2.7 holds the creation ops to the same).
+    Resolution consumes the record the tag names — the register is the delivery
+    — so the drain never answers with a word the child already holds. The no-tag
+    form is the default, and a child started with it and given nothing is the
+    sandboxed compute process (sandboxed on the isolated tiers); a tag naming no
+    given record is a `BadArg` fault, and "no tag" is a form argument rather
+    than a reserved tag value, because zero is a legitimate tag (root's region
+    ordinals start there).
 - **A child bootstraps exactly as root does.** A launcher mints a masked
   sibling of its own System handle (§3's `MINT_OP`) — a keep mask naming
   `Debug | ProcessSelf | ClockGet | Transfer` and nothing else — gives the

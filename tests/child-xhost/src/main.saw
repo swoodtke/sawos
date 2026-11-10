@@ -1,0 +1,119 @@
+// Test child: the process other processes create objects through.
+//
+// Its boot set carries two Events. The main thread signals the first with the
+// top of its own thread stack, which is the one address its launcher cannot
+// compute (a child's stack is an address in the child's space), and then
+// yields until the second is signalled and ends the process.
+//
+// A thread created in it enters at `_start` with a role as its argument (the
+// `tests/thread-basics` idiom) and exits with `CODE_WORKER`, which the
+// creator's join reads.
+
+import sos.{System, Process, Event}
+
+/// The launcher's tags.
+static TAG_ADDR: UInt = 51
+static TAG_DONE: UInt = 52
+
+/// The role a worker thread is created with.
+static ROLE_WORKER: UInt = 1
+
+/// What the worker exits with.
+static CODE_WORKER: UInt = 77
+
+/// How the process ends: told to, or it gave up waiting.
+static EXIT_DONE: UInt = 40
+static EXIT_TIMEOUT: UInt = 64
+static EXIT_NO_EVENTS: UInt = 63
+
+/// The most turns the main thread yields before it gives up.
+static MAX_TURNS: Int = 100000
+
+/// The boot handle, parked by the main thread for the workers. It is also the
+/// "have I run yet" witness: handle 0 names nothing.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+static STACK_WORDS: Int = 512
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+static BYTES_PER_WORD: UInt = 8
+/// Every profile wants a 16-byte-aligned stack pointer; one of them checks.
+static STACK_ALIGN: UInt = 16
+
+/// The highest 16-aligned address inside the worker stack reservation.
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func park(word: UInt) unsafe {
+    BOOT_HANDLE = word
+}
+
+func parked() unsafe -> UInt {
+    BOOT_HANDLE
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked() == 0 {
+        main_thread(arg)
+        return
+    }
+    worker()
+}
+
+func worker() {
+    let system = System(boot_handle: parked())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    let _ = me.exit(CODE_WORKER)
+}
+
+func main_thread(boot_handle: UInt) {
+    park(boot_handle)
+
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch { return }
+
+    var addr: Event? = None
+    var done: Event? = None
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                let tag = rec.tag
+                if tag == TAG_ADDR {
+                    addr = rec.take_event()
+                } else if tag == TAG_DONE {
+                    done = rec.take_event()
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+    guard let addr_event = addr.take() else {
+        let _ = proc.exit(EXIT_NO_EVENTS)
+        return
+    }
+    guard let done_event = done.take() else {
+        let _ = proc.exit(EXIT_NO_EVENTS)
+        return
+    }
+    let _ = addr_event.signal(stack_top())
+
+    let me = try proc.thread_self() catch { return }
+    var turns = 0
+    while turns < MAX_TURNS {
+        let bits: UInt = try done_event.receive() catch { 0 }
+        if bits != 0 {
+            let _ = proc.exit(EXIT_DONE)
+            return
+        }
+        let _ = me.yield_now()
+        turns = turns + 1
+    }
+    let _ = proc.exit(EXIT_TIMEOUT)
+}

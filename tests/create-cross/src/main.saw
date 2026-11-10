@@ -1,0 +1,267 @@
+// Creation ops through another process's handle (spec §2.7).
+//
+// Root creates a host child and makes, through the child's Process handle, a
+// Thread, an Event, a Waiter and a pipe. Each belongs to the child and is
+// charged to it, and each handle is a word in root's own table, so root uses
+// them directly:
+//
+//   thread joined=77              a thread that ran in the child's body
+//   event received=5              signal and receive on the Event
+//   waiter woke=91                the Waiter, owned by the child
+//   pipe posted=3                 post and take on the pipe
+//   thread quota refused after=2  the child's Thread quota, not root's, which
+//                                 is unlimited: the child holds its main thread
+//                                 and the joined worker, so two more fit
+//   gave=5 to the sink            root gives each on to a second child
+//   host ended=65576              the host ends (Exited, code 40)
+//   thread: ... gone              each creation op through the ended child's
+//                                 handle answers `Revoked`
+//
+// The sink is a child that is created and never started: a give needs a
+// `Created` child. The ended child's handle still names its record, so the
+// creation ops answer `Revoked`: a body is gone, and the caller did not cause
+// that. The thread create is made with an entry and stack outside any region.
+// A `Gone` process has no body to check them against, so `Revoked` precedes
+// the address-space check.
+//
+// Every loop is bounded.
+
+import sos.{System, Process, Event, SystemRight, SosStatus, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tags the children's boot records travel under.
+static TAG_BOOT: UInt = 7
+static TAG_ADDR: UInt = 51
+static TAG_DONE: UInt = 52
+
+/// The tags the sink is given its objects under.
+static TAG_SINK_THREAD: UInt = 1
+static TAG_SINK_EVENT: UInt = 2
+static TAG_SINK_WAITER: UInt = 3
+static TAG_SINK_INLET: UInt = 4
+static TAG_SINK_OUTLET: UInt = 5
+
+/// The role the host's worker thread is created with, and what it exits with.
+static ROLE_WORKER: UInt = 1
+static CODE_WORKER: UInt = 77
+
+/// The key the waiter attaches the event under.
+static KEY: UInt = 91
+
+/// The §8 status word of a process that exited with `EXIT_DONE`, the code
+/// `child-xhost` ends with when told to.
+static EXITED: UInt = 1 << 16
+static EXIT_DONE: UInt = 40
+
+/// An entry and stack that lie in no process's region.
+static WILD_ENTRY: UInt = 8
+static WILD_STACK: UInt = 16
+
+/// The most turns root yields waiting on the host.
+static MAX_TURNS: Int = 100000
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS xcreate: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS xcreate: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS xcreate: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// Yield until `event` has been signalled and answer what it carried.
+func await_event(proc: &Process, event: &Event) -> Result<UInt, SosStatus> {
+    let me = try proc.thread_self()
+    var turns = 0
+    while turns < MAX_TURNS {
+        let bits = try event.receive()
+        if bits != 0 {
+            return bits
+        }
+        let _ = me.yield_now()
+        turns = turns + 1
+    }
+    return BUG
+}
+
+/// Yield until `child` has ended and answer its status word.
+func await_end(proc: &Process, child: &Process) -> Result<UInt, SosStatus> {
+    let me = try proc.thread_self()
+    var turns = 0
+    while turns < MAX_TURNS {
+        let status = try child.get_status()
+        if status != 0 {
+            return status
+        }
+        let _ = me.yield_now()
+        turns = turns + 1
+    }
+    return BUG
+}
+
+/// Give `child` the host's two Events and a masked System, and start it.
+func launch(system: &System, child: &Process, addr: &Event,
+            done: &Event) -> Result<Void, SosStatus> {
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let addr_sibling = try addr.mint()
+    try child.give(event: move addr_sibling, tag: TAG_ADDR) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let done_sibling = try done.mint()
+    try child.give(event: move done_sibling, tag: TAG_DONE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    return
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    // The images come first, then the RAMs, in the children's order.
+    var host_image_rec = try proc.boot_handle_next()
+    var sink_image_rec = try proc.boot_handle_next()
+    var host_ram_rec = try proc.boot_handle_next()
+    var sink_ram_rec = try proc.boot_handle_next()
+    guard let host_image = host_image_rec.take_memory() else { return BUG }
+    guard let host_ram = host_ram_rec.take_memory() else { return BUG }
+    guard let sink_image = sink_image_rec.take_memory() else { return BUG }
+    guard let sink_ram = sink_ram_rec.take_memory() else { return BUG }
+
+    let host = try system.process_create(image: &host_image, memory: &host_ram)
+    let sink = try system.process_create(image: &sink_image, memory: &sink_ram)
+    // Root's table holds sixteen handles, and this case fills most of them.
+    let _ = move host_image
+    let _ = move host_ram
+    let _ = move sink_image
+    let _ = move sink_ram
+
+    let addr = try proc.event_create()
+    let done = try proc.event_create()
+    try launch(&system, &host, &addr, &done)
+    let stack = try await_event(&proc, &addr)
+
+    // A thread created through the host's handle runs in the host.
+    let worker = try host.thread_create(stack_top: stack, arg: ROLE_WORKER)
+    let _ = system.debug_print("SOS xcreate: thread created\n")
+    try worker.start()
+    let code = try worker.join()
+    print("SOS xcreate: thread joined={}\n", code)
+    if code != CODE_WORKER {
+        return BUG
+    }
+
+    let event = try host.event_create()
+    try event.signal(0x5)
+    let bits = try event.receive()
+    print("SOS xcreate: event received={}\n", bits)
+
+    let waiter = try host.waiter_create()
+    try waiter.add(event: &event, key: KEY)
+    try event.signal(0x2)
+    let woke = try waiter.wait()
+    print("SOS xcreate: waiter woke={}\n", woke.key)
+    try waiter.remove(KEY)
+
+    let pair = try host.pipe_create()
+    let (inlet, outlet) = move pair
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = 65
+    body[1] = 66
+    body[2] = 67
+    let claim = try inlet.post(body: &body, len: 3)
+    let _ = move claim
+    let got = try outlet.take()
+    let (arrived, request) = move got
+    let _ = move request
+    print("SOS xcreate: pipe posted={} first={}\n", arrived.len,
+          arrived.bytes[0] as UInt)
+
+    // The host holds its main thread and the joined worker. Its quota is four.
+    let third = try host.thread_create(stack_top: stack, arg: ROLE_WORKER)
+    let fourth = try host.thread_create(stack_top: stack, arg: ROLE_WORKER)
+    match host.thread_create(stack_top: stack, arg: ROLE_WORKER) {
+        case Ok(_) -> { return BUG },
+        case Err(why) -> print("SOS xcreate: thread quota refused after=2: {}\n",
+                               why),
+    }
+
+    // Each is givable to the sink, which is `Created`.
+    try sink.give(thread: move third, tag: TAG_SINK_THREAD) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try sink.give(event: move event, tag: TAG_SINK_EVENT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try sink.give(waiter: move waiter, tag: TAG_SINK_WAITER) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try sink.give(inlet: move inlet, tag: TAG_SINK_INLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try sink.give(outlet: move outlet, tag: TAG_SINK_OUTLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let _ = move fourth
+    let _ = system.debug_print("SOS xcreate: gave=5 to the sink\n")
+
+    // The host ends. Its handle still names the record.
+    try done.signal(1)
+    let status = try await_end(&proc, &host)
+    print("SOS xcreate: host ended={}\n", status)
+    if status != EXITED + EXIT_DONE {
+        return BUG
+    }
+
+    match host.thread_create(entry: WILD_ENTRY, stack_top: WILD_STACK, arg: 0) {
+        case Ok(_) -> { return BUG },
+        case Err(why) -> print("SOS xcreate: thread: {}\n", why),
+    }
+    match host.event_create() {
+        case Ok(_) -> { return BUG },
+        case Err(why) -> print("SOS xcreate: event: {}\n", why),
+    }
+    match host.waiter_create() {
+        case Ok(_) -> { return BUG },
+        case Err(why) -> print("SOS xcreate: waiter: {}\n", why),
+    }
+    match host.pipe_create() {
+        case Ok(_) -> { return BUG },
+        case Err(why) -> print("SOS xcreate: pipe: {}\n", why),
+    }
+    return
+}
