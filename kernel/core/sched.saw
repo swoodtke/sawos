@@ -44,6 +44,7 @@ import kcore.objects.{
     MAPPINGS,
     MappingSlot,
     NO_ROW,
+    ROW_TARGET_DIED,
     SlotState,
     clear_boot_handles,
     quota_clear,
@@ -646,16 +647,18 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     //     bounded here by the target's own death.
     //   - The target dying takes the row, because `clear_domain` below drops
     //     the whole grant record. The slot stays live and its owner keeps the
-    //     handle, now naming a husk with nothing installed (`unmap` answers
-    //     `BadState`). It must not be freed here: the owner's word still names
-    //     this slot, and a reused slot would be reachable through it. Its
-    //     `target` is disowned (spec §2.10), so the husk names nobody and no
-    //     later process in this record or this body is reachable through it.
+    //     handle, now naming a husk with nothing installed (`unmap` and
+    //     `base` answer `Revoked`, spec §2.10). It must not be freed here:
+    //     the owner's word still names this slot, and a reused slot would be
+    //     reachable through it. Its `target` is disowned (spec §2.10), so the
+    //     husk names nobody and no later process in this record or this body
+    //     is reachable through it.
     //
     // A Mapping names its target only while it has a row there: `Unmap` and
     // this sweep each clear both together. So one naming the dying record
-    // with no row is a husk an earlier life of this record left undisowned,
-    // which is a kernel bug, and it stops the machine.
+    // with no row (`NO_ROW` or `ROW_TARGET_DIED`) is a husk an earlier life of
+    // this record left undisowned, which is a kernel bug, and it stops the
+    // machine.
     var mp: Int = 0
     while mp < MAPPINGS.capacity() {
         match MAPPINGS[mp].state {
@@ -666,11 +669,12 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
                                                target: 0, row: NO_ROW,
                                                refs: 0)
                 } else if MAPPINGS[mp].target == p {
-                    if MAPPINGS[mp].row == NO_ROW {
+                    let row = MAPPINGS[mp].row
+                    if row == NO_ROW || row == ROW_TARGET_DIED {
                         fatal_kernel("a husk still named a reused process record",
                                      mp as UInt)
                     }
-                    MAPPINGS[mp].row = NO_ROW
+                    MAPPINGS[mp].row = ROW_TARGET_DIED
                     MAPPINGS[mp].target = NO_PROCESS
                 }
             },

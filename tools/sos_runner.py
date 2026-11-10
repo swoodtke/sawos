@@ -2329,7 +2329,8 @@ TEST_CASES = [
         #                         the kernel on a Mapping naming record 2 with
         #                         no row, so dying normally is the husk's
         #                         `target` disown
-        #   the BadState fault    `Base` on the husk, before any address
+        #   the Revoked answers   `Base` on the husk, before any address, and
+        #                         a `map` naming the dead third child
         "name": "mapping_husk_base",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": MAPPING_HUSK_BASE_PKG,
@@ -2351,16 +2352,18 @@ TEST_CASES = [
                        "events={zero} waiters={zero} interrupts={zero} "
                        "timers={zero} process={two}",
                        "SOS huskbase: the third child is gone",
-                       "SOS: process fault: object in the wrong state "
-                       "process={zero}",
-                       "SOS: process teardown handles="],
-        "expect_clean_exit": False,
-        "expect_status": EXIT_PROCESS_FAULT,
+                       "SOS huskbase: the husk's base answered: what this call "
+                       "was waiting for is gone",
+                       "SOS huskbase: map into the gone child answered: what "
+                       "this call was waiting for is gone"],
+        "expect_clean_exit": True,
     },
     {
-        # The same husk, asked to `Unmap`: the same `BadState` fault, and the
-        # second child's row stays where it is. The counters and the reused
-        # record are pinned as in `mapping_husk_base`.
+        # The same husk, asked to `Unmap`: `Revoked`, and the second child's
+        # row stays where it is, so its holder's own unmap succeeds. A second
+        # unmap of that Mapping is the `BadState` fault: unmapped by its
+        # holder is a different state from target died. The counters and the
+        # reused record are pinned as in `mapping_husk_base`.
         "name": "mapping_husk_unmap",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": MAPPING_HUSK_UNMAP_PKG,
@@ -2382,6 +2385,9 @@ TEST_CASES = [
                        "events={zero} waiters={zero} interrupts={zero} "
                        "timers={zero} process={two}",
                        "SOS huskunmap: the third child is gone",
+                       "SOS huskunmap: the husk's unmap answered: what this "
+                       "call was waiting for is gone",
+                       "SOS huskunmap: the second child's mapping unmapped",
                        "SOS: process fault: object in the wrong state "
                        "process={zero}",
                        "SOS: process teardown handles="],
@@ -4738,6 +4744,9 @@ TEST_CASES = [
                        "call was waiting for is gone",
                        "SOS threadgive: starting the invalid thread answered: "
                        "what this call was waiting for is gone",
+                       "SOS threadgive: minting from the exited thread worked",
+                       "SOS threadgive: minting from the invalid thread "
+                       "answered: what this call was waiting for is gone",
                        "SOS threadgive: capacity after=7",
                        "SOS threadgive: done"],
         "expect_clean_exit": True,

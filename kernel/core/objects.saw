@@ -1335,17 +1335,25 @@ public(package) func alloc_iomemory() unsafe -> Int {
 //
 // A slot outlives its row. An `unmap`, and the death of the target process
 // (whose whole domain goes with it), both end a row without ending the object,
-// leaving the slot Live with `row == NO_ROW`, which a later `unmap` sees as
-// `BadState`. Neither frees the slot: an op that freed a slab slot while a
-// handle still named it would let the next occupant be reached through a stale
-// word, and a generation (which lives in the handle entry) cannot cover that.
+// leaving the slot Live with no row. They differ in what a later `unmap` or
+// `base` answers: after an `unmap` the holder caused the state and could have
+// checked it, so it is a `BadState` fault (`row == NO_ROW`); after the target's
+// death the Mapping is invalid and the answer is `Revoked`
+// (`row == ROW_TARGET_DIED`). Neither frees the slot: an op that freed a slab
+// slot while a handle still named it would let the next occupant be reached
+// through a stale word, and a generation (which lives in the handle entry)
+// cannot cover that.
 // The slot is freed when its last handle goes (`free_object`'s Mapping arm).
 
-/// "This mapping has no row": unmapped, or its target process is gone.
+/// "This mapping has no row": its holder unmapped it.
 ///
 /// A row index is a position in a bounded array, so a negative is unusable as
 /// one and needs no reserved slot of its own.
 public(package) static NO_ROW: Int = -1
+
+/// "This mapping has no row": its target process died and took the domain.
+/// The Mapping is invalid, and its ops answer `Revoked`.
+public(package) static ROW_TARGET_DIED: Int = -2
 
 /// One Mapping object: who owns the handle, whose domain holds the row, and
 /// which row it is.
@@ -1354,7 +1362,8 @@ public(package) static NO_ROW: Int = -1
 /// process whose domain the row sits in. They are usually the same, and differ
 /// when a launcher maps a region into a child it created. Both name records.
 /// An `Unmap` and the target's teardown both leave a husk: `row` is `NO_ROW`
-/// and `target` is `NO_PROCESS`, so a later process in the target's record or
+/// after the first and `ROW_TARGET_DIED` after the second, and `target` is
+/// `NO_PROCESS` in both, so a later process in the target's record or
 /// body is not reachable through it. A Live slot names a target exactly while
 /// it has a row, which the teardown's sweep checks.
 public(package) struct MappingSlot {

@@ -18,8 +18,11 @@
 //     back, and runs a third child, which takes record 2. Its teardown sweeps
 //     the Mappings naming record 2, and the kernel stops on a husk still naming
 //     it, so this child's ordinary death is the proof the husk was disowned.
-//   - `Unmap` on the husk, the `BadState` fault of root, which removes no
-//     row: the second child's stays where it is.
+//   - `Unmap` on the husk, which answers `Revoked` and removes no row: the
+//     second child's stays where it is.
+//   - `Unmap` of the second child's own Mapping, which succeeds, and a second
+//     `Unmap` of it, the `BadState` fault of root: a Mapping its holder
+//     unmapped is a different state from one whose target died.
 //
 //   SOS: process fault: bad handle process=1      <- the held child
 //   SOS huskunmap: mapped into the first child
@@ -28,12 +31,14 @@
 //   SOS huskunmap: the first child's counters syscalls=1 faults=0
 //   SOS: process fault: bad handle process=2      <- the third child, record 2
 //   SOS huskunmap: the third child is gone
+//   SOS huskunmap: the husk's unmap answered: <Revoked>
+//   SOS huskunmap: the second child's mapping unmapped
 //   SOS: process fault: object in the wrong state process=0
 //
-// `mapping-husk-base` is the same case ending in `Base`; each op ends root, so
-// each needs its own run.
+// `mapping-husk-base` is the same case ending in `Base`.
 
-import sos.{System, Process, Memory, Mapping, MapAccess, Waiter, AttachMode}
+import sos.{System, Process, Memory, Mapping, MapAccess, Waiter, AttachMode,
+            SosStatus}
 
 static EXIT_FAILED: UInt = 1
 
@@ -170,13 +175,34 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS huskunmap: the third child is gone\n")
 
-    // This call does not come back.
-    try husk.unmap() catch {
-        print("SOS huskunmap: the husk answered {}\n", error)
+    match husk.unmap() {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS huskunmap: the husk unmapped a row\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        case Err(why) -> {
+            print("SOS huskunmap: the husk's unmap answered: {}\n", why)
+            if why != SosStatus.Revoked {
+                let _ = system.shutdown(EXIT_FAILED)
+                return
+            }
+        },
+    }
+    try live.unmap() catch {
+        print("SOS huskunmap: the second child's unmap answered {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let _ = system.debug_print("SOS huskunmap: the husk unmapped a row\n")
+    let _ = system.debug_print(
+        "SOS huskunmap: the second child's mapping unmapped\n")
+    // This call does not come back.
+    try live.unmap() catch {
+        print("SOS huskunmap: the second unmap answered {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS huskunmap: unmapped twice\n")
     let _ = move live
     let _ = move second
     let _ = move held

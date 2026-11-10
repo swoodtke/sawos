@@ -18,7 +18,10 @@
 //     back, and runs a third child, which takes record 2. Its teardown sweeps
 //     the Mappings naming record 2, and the kernel stops on a husk still naming
 //     it, so this child's ordinary death is the proof the husk was disowned.
-//   - `Base` on the husk, the `BadState` fault of root, before any address.
+//   - `Base` on the husk, which answers `Revoked` and neither faults root nor
+//     answers an address.
+//   - `map` naming the third child, which is `Gone`: it answers `Revoked`,
+//     after the rights and the arguments, which are well formed here.
 //
 //   SOS: process fault: bad handle process=1      <- the held child
 //   SOS huskbase: mapped into the first child
@@ -27,13 +30,15 @@
 //   SOS huskbase: the first child's counters syscalls=1 faults=0
 //   SOS: process fault: bad handle process=2      <- the third child, record 2
 //   SOS huskbase: the third child is gone
-//   SOS: process fault: object in the wrong state process=0
+//   SOS huskbase: the husk's base answered: <Revoked>
+//   SOS huskbase: map into the gone child answered: <Revoked>
 //
-// `mapping-husk-unmap` is the same case ending in `Unmap`; each op ends root,
-// so each needs its own run.
+// `mapping-husk-unmap` is the same case ending in `Unmap`.
 
-import sos.{System, Process, Memory, Mapping, MapAccess, Waiter, AttachMode}
+import sos.{System, Process, Memory, Mapping, MapAccess, Waiter, AttachMode,
+            SosStatus}
 
+static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
 static CHUNK: UInt = 0x1000
@@ -169,17 +174,43 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS huskbase: the third child is gone\n")
 
-    // This call does not come back.
-    let at = try husk.base() catch {
-        print("SOS huskbase: the husk answered {}\n", error)
+    match husk.base() {
+        case Ok(at) -> {
+            print("SOS huskbase: the husk answered an address {}\n", at)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        case Err(why) -> {
+            print("SOS huskbase: the husk's base answered: {}\n", why)
+            if why != SosStatus.Revoked {
+                let _ = system.shutdown(EXIT_FAILED)
+                return
+            }
+        },
+    }
+    let spare = try pool.split(len: CHUNK) catch {
+        print("SOS huskbase: third split failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    print("SOS huskbase: the husk answered an address {}\n", at)
+    match third.map(memory: &spare, access: RW) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS huskbase: mapped into the dead\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        case Err(why) -> {
+            print("SOS huskbase: map into the gone child answered: {}\n", why)
+            if why != SosStatus.Revoked {
+                let _ = system.shutdown(EXIT_FAILED)
+                return
+            }
+        },
+    }
     let _ = move live
     let _ = move second
     let _ = move held
-    let _ = system.shutdown(EXIT_FAILED)
+    let _ = system.shutdown(EXIT_OK)
 }
 
 /// Start `child` with no handles and wait for its death. It dies on its first

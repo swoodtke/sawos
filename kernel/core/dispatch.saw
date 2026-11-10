@@ -169,6 +169,7 @@ import kcore.objects.{
     MemoryObject,
     MemorySlot,
     NO_ROW,
+    ROW_TARGET_DIED,
     NO_EXCHANGE,
     EXCHANGES,
     PIPES,
@@ -2285,6 +2286,17 @@ func release_handle(p: Int, word: UInt, entry: HandleEntry) unsafe -> SyscallRes
     op_ok()
 }
 
+/// Whether the object `slot` of `kind` is invalid (spec §2.10): bound to a
+/// process that died, so that its ops answer `Revoked`. Each kind with an
+/// invalid state has an arm here; a `Gone` Process is not one.
+func object_invalid(kind: ObjType, slot: Int) unsafe -> Bool {
+    match kind {
+        case Thread -> THREADS[slot].state == ThreadState.Invalid,
+        case Mapping -> MAPPINGS[slot].row == ROW_TARGET_DIED,
+        case _ -> false,
+    }
+}
+
 /// `MINT_OP`: a sibling handle onto the same object, in the caller's own table,
 /// with rights the caller may only narrow.
 ///
@@ -2308,6 +2320,11 @@ func release_handle(p: Int, word: UInt, entry: HandleEntry) unsafe -> SyscallRes
 /// The result is independent: its own slot, generation and release. It names
 /// the same object, so it is a second name rather than a second object.
 ///
+/// A source naming an invalid object answers `Revoked`, a status, after the
+/// rights check (spec §2.10). A `Gone` Process is not invalid for this: its
+/// record still answers `GetStatus`, `Stats` and attachments, so a sibling to
+/// it stays allowed.
+///
 /// A full table is `NoResource`, a status: a caller could not have known.
 func mint_sibling(p: Int, entry: HandleEntry, keep: UInt) unsafe -> SyscallResult {
     match entry.obj_type {
@@ -2316,6 +2333,9 @@ func mint_sibling(p: Int, entry: HandleEntry, keep: UInt) unsafe -> SyscallResul
     }
     if not rights_allow_mint(entry.rights) {
         fault_process(p, FaultReason.AccessDenied)
+    }
+    if object_invalid(entry.obj_type, entry.target) {
+        return op_status(SosStatus.Revoked)
     }
     // The mask is a keep set and the operation an intersection, so the result
     // is a subset of the source by construction, not by a check somebody could
@@ -2440,16 +2460,11 @@ func map_access(p: Int, raw: UInt) unsafe -> UInt32 {
 /// A word that names nothing, or something that is not a Process, is the
 /// ordinary `BadHandle`.
 ///
-/// The target must be alive, and this check is load-bearing. A supervisor's
-/// handle onto a dead child outlives it, and a `Gone` record has no body, so
-/// there is no grant record to append a row to: the body went back at the
-/// teardown and the next `process_create` may already be running in it. `give`
-/// and `Start` require `Created`; `map` is the first op that reaches into
-/// another process's body without that, so it states its own requirement.
-///
 /// `Created` and `Running` are both legal, and a mapping is not a boot record,
-/// so the give-freeze does not apply. Anything else is a `BadState` fault; the
-/// caller can ask (`GetStatus`), so it could have known.
+/// so the give-freeze does not apply. A `Gone` target passes through: it has no
+/// body to install into, and `install_row` answers `Revoked` for it once the
+/// caller's own arguments have been checked, as spec §2.10 orders. Any other
+/// state is a `BadState` fault.
 func map_target(p: Int, handle: UInt) unsafe -> Int {
     let entry = lookup_handle(p, handle)
     match entry.obj_type {
@@ -2462,6 +2477,7 @@ func map_target(p: Int, handle: UInt) unsafe -> Int {
             match PROCESS_RECORDS[target.slot].state {
                 case Created -> {},
                 case Running -> {},
+                case Gone -> {},
                 case _ -> fault_process(p, FaultReason.BadState),
             }
             target.slot
@@ -2482,6 +2498,12 @@ func map_target(p: Int, handle: UInt) unsafe -> Int {
 /// take. Reaching the wall below means the ledger and the record disagree;
 /// `NoResource` would blame a caller for the kernel's bug.
 ///
+/// A `Gone` target has no body to append a row to (the body went back at the
+/// teardown and the next create may already be running in it), so it is
+/// answered `Revoked` before anything else is read: the mapper did not cause
+/// the death. Every fault the caller's own arguments can raise is behind this
+/// line.
+///
 /// `hal.GRANT_ROW_BUDGET` is what the wall is measured against; the kernel
 /// reads the HAL's number because it is a hardware limit on one target and a
 /// policy one on another. The budget is checked before anything is written,
@@ -2498,6 +2520,10 @@ func map_target(p: Int, handle: UInt) unsafe -> Int {
 /// half of the release condition in §2.5.
 func install_row(p: Int, t: Int, base: UInt, top: UInt, perms: UInt8,
                  device: Bool, region: Int) unsafe -> SyscallResult {
+    match PROCESS_RECORDS[t].state {
+        case Gone -> { return op_status(SosStatus.Revoked) },
+        case _ -> {},
+    }
     // The target is charged, not the caller. What a mapping consumes is the
     // target's grant-row budget, and charging the caller would let a launcher's
     // own allowance gate how big another process's domain may be.
@@ -2781,9 +2807,12 @@ func mapping_op_decoded(op: MappingOp, obj: &MappingObject,
     match op {
         // Unmap: only a mapping unmaps (§2.5).
         //
-        // A mapping with no row is `BadState`. Two things reach that arm: a
-        // second unmap, and a mapping whose target process has died (its whole
-        // domain went with it). Both are caller-checkable.
+        // A mapping with no row has one of two states. The holder's own earlier
+        // unmap leaves `NO_ROW`, a `BadState` fault: the holder caused it and
+        // can check. The target process dying takes its whole domain and leaves
+        // `ROW_TARGET_DIED`: the Mapping is invalid, and the answer is
+        // `Revoked`, a status, since the holder did not cause it (spec §2.10).
+        // Both follow the rights check.
         //
         // The order is the contract: remove the row, compact the record, fix up
         // every Mapping that named a later row of the same domain, and only
@@ -2811,6 +2840,9 @@ func mapping_op_decoded(op: MappingOp, obj: &MappingObject,
                 case Free -> fault_process(p, FaultReason.BadState),
             }
             let row = MAPPINGS[obj.slot].row
+            if row == ROW_TARGET_DIED {
+                return op_status(SosStatus.Revoked)
+            }
             if row == NO_ROW {
                 fault_process(p, FaultReason.BadState)
             }
@@ -2837,11 +2869,10 @@ func mapping_op_decoded(op: MappingOp, obj: &MappingObject,
         // way to learn it. It hangs off the object that owns the row, where
         // §2.5 puts every other fact about it.
         //
-        // The two refusals are `Unmap`'s, for its reasons: a freed slot and a
-        // `NO_ROW` husk are both "this object is not in a state to do that" (a
-        // second unmap, or a target process that has died and taken its domain
-        // with it). A husk that answered an address would be answering about a
-        // row that is not installed anywhere.
+        // The refusals are `Unmap`'s, for its reasons: a freed slot or a
+        // `NO_ROW` husk (a second unmap) is a `BadState` fault, and a husk
+        // whose target died is `Revoked`. A husk that answered an address would
+        // be answering about a row that is not installed anywhere.
         case Base -> {
             if not obj.allows(MappingRight.Base) {
                 fault_process(p, FaultReason.AccessDenied)
@@ -2851,6 +2882,9 @@ func mapping_op_decoded(op: MappingOp, obj: &MappingObject,
                 case Free -> fault_process(p, FaultReason.BadState),
             }
             let row = MAPPINGS[obj.slot].row
+            if row == ROW_TARGET_DIED {
+                return op_status(SosStatus.Revoked)
+            }
             if row == NO_ROW {
                 fault_process(p, FaultReason.BadState)
             }

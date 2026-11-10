@@ -13,6 +13,8 @@
 //   SOS threadgive: the late join reads 82
 //   SOS threadgive: the held join answered: <Revoked>
 //   SOS threadgive: starting the invalid thread answered: <Revoked>
+//   SOS threadgive: minting from the exited thread worked
+//   SOS threadgive: minting from the invalid thread answered: <Revoked>
 //   SOS threadgive: capacity after=7
 //   SOS threadgive: done
 //
@@ -28,7 +30,10 @@
 // thread. That join parks root, and the child's death wakes it with `Revoked`:
 // the thread it waited for was invalidated. Once the child is gone, a join of
 // the exited thread still reads its code (`Exited` wins), and a second join of
-// the invalid one, and a start of it, answer `Revoked` at once.
+// the invalid one, and a start of it, answer `Revoked` at once. A mint from the
+// exited thread works, as from any live object, and a mint from the invalid one
+// answers `Revoked`; its handle is then released like the rest, which is the
+// capacity round's proof that release works on an invalid object.
 //
 // The capacity rounds show what is freed. A round makes threads until the slab
 // refuses one, lets them all exit through handles onto themselves, and
@@ -310,6 +315,33 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
         },
         case Err(why) -> {
             print("SOS threadgive: starting the invalid thread answered: {}\n",
+                  why)
+            if why != SosStatus.Revoked {
+                return BUG
+            }
+        },
+    }
+    match exited.mint() {
+        case Ok(sibling) -> {
+            let _ = system.debug_print(
+                "SOS threadgive: minting from the exited thread worked\n")
+            let _ = move sibling
+        },
+        case Err(why) -> {
+            print("SOS threadgive: minting from the exited thread answered: {}\n",
+                  why)
+            return BUG
+        },
+    }
+    match parked.mint() {
+        case Ok(sibling) -> {
+            let _ = system.debug_print(
+                "SOS threadgive: minted from the invalid thread\n")
+            let _ = move sibling
+            return BUG
+        },
+        case Err(why) -> {
+            print("SOS threadgive: minting from the invalid thread answered: {}\n",
                   why)
             if why != SosStatus.Revoked {
                 return BUG

@@ -947,8 +947,8 @@ one degree of freedom unspent on the MPU tier, not two mechanisms.
 - **It is bound to its target.** A Mapping charges the target process's quota,
   not the caller's (§2.9), and the target is its owner in §2.10's sense: when
   the target dies its row goes with the whole domain and the Mapping is
-  invalid, so `Unmap` and `Base` answer `Revoked`. Not yet enforced: both are
-  `BadState` faults on a Mapping whose target has died.
+  invalid, so `Unmap` and `Base` answer `Revoked`. A Mapping its holder
+  unmapped is not that state: it is the `BadState` above.
 - **It is not givable** — `mapping_rights()` withholds `Transfer` — because a
   Mapping names a row in one specific domain.
 
@@ -1095,7 +1095,7 @@ child does at its create, the first of each table, so "process 0" names both
 exactly as §2.10 rules for it, since the body is gone: the creation ops and a
 `map` naming it answer `Revoked`, `Start` and `Give` are `BadState` faults
 (below), and the self-only ops are `NotSelf` faults. Not yet enforced: the
-creation ops and a `map` do not answer `Revoked` there (§2.10).
+creation ops do not answer `Revoked` there (§2.10).
 
 **Ops**, each on its own `ProcessRight`: the creation ops `ThreadCreate`,
 `EventCreate`, `WaiterCreate` and `PipeCreate`, then `ThreadSelf`, `Exit`,
@@ -1664,18 +1664,14 @@ Not yet enforced:
   reference the teardown dropped. An Interrupt is therefore freed by its
   owner's death, and a Waiter or Timer is freed rather than left invalid,
   which is sound only while every handle naming it is in the dying table. A
-  Mapping that targets the dying process already has the invalid shape — its
-  slot kept, its row cleared, its handles in other tables — though its ops
-  answer `BadState` today (next item).
-- Ops on an invalid object other than a Thread do not answer `Revoked`.
-  `Unmap` and `Base` on a Mapping whose target died are `BadState` faults
-  (§2.5), and so is a `map` naming a `Gone` target. The creation ops through a
-  `Gone` process's handle answer `QuotaExceeded` when their arguments are well
-  formed, its ledger having been cleared, and `ThreadCreate` answers it
-  whatever its entry and stack, since no region is left to check them against;
-  a bad mode or line faults the `Gone` process again, which reruns the teardown
-  (with no body left to free), overwrites its status word and strands the
-  caller. `MINT_OP` mints onto an invalid object as onto a live one.
+  Mapping that targets the dying process is invalid: its slot is kept, its
+  row cleared and its handles stay in other tables.
+- The creation ops through a `Gone` process's handle do not answer `Revoked`.
+  They answer `QuotaExceeded` when their arguments are well formed, its ledger
+  having been cleared, and `ThreadCreate` answers it whatever its entry and
+  stack, since no region is left to check them against; a bad mode or line
+  faults the `Gone` process again, which reruns the teardown (with no body left
+  to free), overwrites its status word and strands the caller.
 - An Interrupt carries `Mint`, is charged an `Interrupt` quota row, can be
   consumed into an attachment (`Waiter.give(interrupt:)`), and stays bound
   while an attachment holds it after its handle is released.
@@ -3124,8 +3120,8 @@ loader parses and reports while no process stores either.
   teardown's close-all releases every handle but counts without freeing, and
   the owner sweeps after it free the dying process's Waiters, Interrupts and
   Timers outright instead of invalidating the bound kinds first and leaving the
-  shared ones to their counts; and an op on an invalid Mapping or a `Gone`
-  Process does not answer `Revoked`.
+  shared ones to their counts; and the creation ops through a `Gone` Process's
+  handle do not answer `Revoked`.
 - Binding an interrupt line is not yet a System op: it is
   `ProcessOp.InterruptBind` on `ProcessRight.InterruptBind`, charged to an
   `Interrupt` quota row, minting into the named process's table and faulting
