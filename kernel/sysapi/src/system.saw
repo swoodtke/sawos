@@ -606,8 +606,10 @@ extension Process {
         return thread.Thread(handle: ThreadHandle(raw))
     }
 
-    /// End this process with `status`. Every thread goes with it and the kernel
-    /// closes every handle it held (spec §2's Process row). Does not return
+    /// End this process with `status`. Every thread stops with it and the
+    /// kernel closes every handle it held (spec §2's Process row); a handle
+    /// another process holds onto one of its threads then joins as `Revoked`,
+    /// or with the exit code if that thread had already exited. Does not return
     /// when it succeeds. Requires `ProcessRight.Exit`. Only the calling process
     /// can exit: through a handle naming another process the kernel faults the
     /// caller.
@@ -743,7 +745,7 @@ extension Process {
     //
     // A handle can be given only if its rights word carries the universal
     // `Transfer` bit. The default sets that carry it belong to System, Process,
-    // Memory, IoMemory, Event, the pipe ends and the pipe one-shots. Thread,
+    // Memory, IoMemory, Event, Thread, the pipe ends and the pipe one-shots.
     // Waiter, Interrupt, Clock, Timer and Mapping handles therefore cannot be
     // given, and a funnel for one would be a method whose every call is an
     // `AccessDenied` fault. There is no `give(process:)` funnel: a launcher
@@ -974,6 +976,31 @@ extension Process {
         owned.handle = EventHandle(NO_HANDLE)
         try checked(sos_process_give(self.handle, word, tag, keep as UInt)) catch {
             let back: (SosStatus, Event) = (error, Event(handle: EventHandle(word)))
+            return move back
+        }
+        return
+    }
+
+    /// Give a Thread to this process under `tag`, consuming the wrapper.
+    /// Requires `ProcessRight.Give` here and `ThreadRight.Transfer` on the
+    /// Thread.
+    ///
+    /// A Thread is bound to the process it runs in, not to whoever holds its
+    /// handle: the child's handle joins it as the giver's would have. If the
+    /// thread's process dies, a thread that had already exited still answers
+    /// `join` with its exit code, and one that had not answers
+    /// `Err(SosStatus.Revoked)` (§2.10).
+    ///
+    /// The funnel contract and the refusal that hands the Thread back are
+    /// `give(memory:)`'s.
+    public func give(&self, thread: thread.Thread,
+                     tag: UInt,
+                     keep: UInt32 = ALL_RIGHTS) -> Result<Void, (SosStatus, thread.Thread)> {
+        var owned = move thread
+        let word: UInt = owned.handle
+        owned.handle = ThreadHandle(NO_HANDLE)
+        try checked(sos_process_give(self.handle, word, tag, keep as UInt)) catch {
+            let back = (error, thread_of(word))
             return move back
         }
         return
@@ -1294,6 +1321,9 @@ public struct BootHandle {
     /// launcher hands a child an Event, often narrowed to the producer or the
     /// consumer end, and the child drains it as it drains a region.
     event: Event?,
+    /// A Thread, on the same terms; `take_thread` is its one door. A launcher
+    /// hands a child the thread it is to join.
+    thread: thread.Thread?,
 }
 
 extension BootHandle: NoCopy {}
@@ -1380,6 +1410,19 @@ extension BootHandle {
     public func take_event(&var self) -> Event? {
         self.event.take()
     }
+
+    /// Take a Thread out of this record. Same terms as `take_memory`. A record
+    /// left holding one releases it when it drops.
+    public func take_thread(&var self) -> thread.Thread? {
+        self.thread.take()
+    }
+}
+
+/// A `Thread` around `word`. `give(thread:)` builds its hand-back through this
+/// because its parameter is named `thread`, which hides the module qualifier
+/// inside its body.
+func thread_of(word: UInt) -> thread.Thread {
+    thread.Thread(handle: ThreadHandle(word))
 }
 
 /// Decode a record the kernel copied out into a `BootHandle`.
@@ -1398,48 +1441,56 @@ func decode_boot_handle(tag: UInt, kind: UInt, handle: UInt) -> BootHandle {
                                   memory: Memory(handle: MemoryHandle(handle)),
                                   process: None, system: None, iomemory: None,
                                   inlet: None, outlet: None, reply: None,
-                                  request: None, event: None),
+                                  request: None, event: None, thread: None),
         case Process -> BootHandle(tag: tag, kind: what, memory: None,
                                    process: Process(handle: ProcessHandle(handle)),
                                    system: None, iomemory: None,
                                    inlet: None, outlet: None, reply: None,
-                                   request: None, event: None),
+                                   request: None, event: None, thread: None),
         case System -> BootHandle(tag: tag, kind: what, memory: None,
                                   process: None,
                                   system: System(handle: SystemHandle(handle)),
                                   iomemory: None, inlet: None, outlet: None,
-                                  reply: None, request: None, event: None),
+                                  reply: None, request: None, event: None,
+                                  thread: None),
         case IoMemory -> BootHandle(tag: tag, kind: what, memory: None,
                                     process: None, system: None,
                                     iomemory: IoMemory(handle: IoMemoryHandle(handle)),
                                     inlet: None, outlet: None, reply: None,
-                                    request: None, event: None),
+                                    request: None, event: None, thread: None),
         case PipeInlet -> BootHandle(tag: tag, kind: what, memory: None,
                                      process: None, system: None, iomemory: None,
                                      inlet: PipeInlet(handle: PipeInletHandle(handle)),
                                      outlet: None, reply: None, request: None,
-                                     event: None),
+                                     event: None, thread: None),
         case PipeOutlet -> BootHandle(tag: tag, kind: what, memory: None,
                                       process: None, system: None,
                                       iomemory: None, inlet: None,
                                       outlet: PipeOutlet(handle: PipeOutletHandle(handle)),
-                                      reply: None, request: None, event: None),
+                                      reply: None, request: None, event: None,
+                                      thread: None),
         case PipeReply -> BootHandle(tag: tag, kind: what, memory: None,
                                      process: None, system: None, iomemory: None,
                                      inlet: None, outlet: None,
                                      reply: PipeReply(handle: PipeReplyHandle(handle)),
-                                     request: None, event: None),
+                                     request: None, event: None, thread: None),
         case PipeRequest -> BootHandle(tag: tag, kind: what, memory: None,
                                        process: None, system: None,
                                        iomemory: None, inlet: None, outlet: None,
                                        reply: None,
                                        request: PipeRequest(handle: PipeRequestHandle(handle)),
-                                       event: None),
+                                       event: None, thread: None),
         case Event -> BootHandle(tag: tag, kind: what, memory: None,
                                  process: None, system: None, iomemory: None,
                                  inlet: None, outlet: None, reply: None,
                                  request: None,
-                                 event: Event(handle: EventHandle(handle))),
+                                 event: Event(handle: EventHandle(handle)),
+                                 thread: None),
+        case Thread -> BootHandle(tag: tag, kind: what, memory: None,
+                                  process: None, system: None, iomemory: None,
+                                  inlet: None, outlet: None, reply: None,
+                                  request: None, event: None,
+                                  thread: thread.Thread(handle: ThreadHandle(handle))),
     }
 }
 

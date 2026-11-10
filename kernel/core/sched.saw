@@ -20,6 +20,7 @@ import sosabi.{
     ObjType,
     FaultReason,
     ProcessStatusKind,
+    SosStatus,
 }
 import kcore.limits.{
     MAX_ATTACHMENTS,
@@ -34,11 +35,11 @@ import kcore.limits.{
     NO_THREAD,
     ROOT_PROCESS,
 }
-import kcore.result.{op_value, write_result}
+import kcore.result.{op_status, op_value, write_result}
 import kcore.diag.{ExitCode, console, fatal_kernel}
 import kcore.stats.{stats_read}
-import kcore.pslot.{PROCESSES, PROCESS_RECORDS, ProcessState, body_of, has_body,
-                    unlink_body}
+import kcore.pslot.{PROCESSES, PROCESS_RECORDS, ProcessState, QuotaKind,
+                    body_of, has_body, unlink_body}
 import kcore.objects.{
     MAPPINGS,
     MappingSlot,
@@ -46,9 +47,10 @@ import kcore.objects.{
     SlotState,
     clear_boot_handles,
     quota_clear,
+    quota_credit,
     unbind_handle,
 }
-import kcore.refs.{notify_ready, reap_unreferenced, ref_object,
+import kcore.refs.{free_object, notify_ready, reap_unreferenced, ref_object,
                    release_pending_calls, unref_object, unref_teardown,
                    unref_waitable_teardown}
 import kcore.threads.{
@@ -65,6 +67,7 @@ import kcore.threads.{
     ready_pop,
     ready_push,
     ready_remove_process,
+    unjoin_process,
 }
 import kcore.time.{TIMERS, TimerSlot, reprogram_timer}
 import kcore.waitables.{
@@ -171,7 +174,9 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
 /// ceased to exist. Never returns.
 ///
 /// This is `pick_next`'s tail without its head: there is no outgoing thread to
-/// requeue, because the outgoing thread's slot has just gone back to the pool.
+/// requeue, because the outgoing thread's process has just been torn down and
+/// the thread with it: its slot is freed, or held, `Exited` or invalid, for the
+/// handles still naming it.
 ///
 /// The no-wake-source arm ends root, unlike `pick_next`, which ends the
 /// current process. Here the process that was current is already gone, so
@@ -200,6 +205,12 @@ func resume_after_death() unsafe -> Never {
 /// step over the trapping instruction twice on one profile and hand back a
 /// value nobody computed on both. So `Join` writes nothing, and the wake
 /// writes the result pair exactly once.
+///
+/// The slot stays `Exited`, holding the code for a late join, and keeps its
+/// quota charge. It is not freed here: `ThreadOp.Exit` names the thread through
+/// a handle, so its count is at least one. It is freed, and the charge given
+/// back, when its last handle goes (`free_object`), or by its process's
+/// teardown once nothing names it.
 public(package) func exit_thread(slot: Int, code: UInt) unsafe {
     THREADS[slot].state = ThreadState.Exited
     THREADS[slot].exit_code = code
@@ -229,16 +240,47 @@ public(package) func exit_thread(slot: Int, code: UInt) unsafe {
 // Process teardown (spec §2.10: close all handles, free what it owned)
 // =============================================================================
 
+/// Invalidate thread `t` of dying process `p` (spec §2.10): it never runs
+/// again, and its slot keeps nothing for a join.
+///
+/// Every thread parked joining it is woken with `Revoked`, written into its
+/// frame as `exit_thread` writes a joiner's code; the object it waited on was
+/// destroyed by somebody else. Those joiners are other processes' threads,
+/// because the teardown took `p`'s own off every joiner list first
+/// (`unjoin_process`). The charge comes back now, while `p`'s ledger is live.
+///
+/// The slot keeps its count and nothing else: `Invalid`, owned by nobody, so
+/// that a later occupant of `p`'s record cannot match it, and on no list. The
+/// caller frees it if the count is zero.
+func invalidate_thread(t: Int, p: Int) unsafe {
+    var j = THREADS[t].joiners
+    while j != 0 {
+        let waiter = j - 1
+        j = THREADS[waiter].link
+        write_result(frame_slot(waiter), op_status(SosStatus.Revoked))
+        THREADS[waiter].state = ThreadState.Runnable
+        ready_push(waiter)
+    }
+    quota_credit(p, QuotaKind.Thread)
+    let refs = THREADS[t].refs
+    THREADS[t] = ThreadSlot(state: ThreadState.Invalid, process: NO_PROCESS,
+                            exit_code: 0, joiners: 0, link: 0, wait_buf: 0,
+                            call_pipe: 0, call_claim: 0, call_src: 0,
+                            call_len: 0, refs: refs)
+}
+
 /// End process `p`. Never returns.
 ///
 /// Teardown is unconditional: every handle in the process's table is closed,
-/// every thread slot and frame it owns goes back to the kernel's pools, and
-/// every Waiter, Interrupt, Timer and Mapping it held goes back to its slab.
-/// An Event goes back when nothing names it any more; one that is still named
-/// elsewhere outlives the process, disowned (`reap_unreferenced`). Its trap
-/// counters are copied into its record, and its body (the handle table, the
-/// boot set and the grant record) is freed for the next create. The record
-/// stays, `Gone`, for as long as a reference names it.
+/// every thread it owns stops running, and every Waiter, Interrupt, Timer and
+/// Mapping it held goes back to its slab. A thread that had not exited is
+/// invalidated; one that had keeps its exit code. Either goes back to the pool
+/// when nothing names it any more, and one still named elsewhere outlives the
+/// process, disowned. An Event goes back when nothing names it any more; one
+/// that is still named elsewhere outlives the process, disowned
+/// (`reap_unreferenced`). Its trap counters are copied into its record, and its
+/// body (the handle table, the boot set and the grant record) is freed for the
+/// next create. The record stays, `Gone`, for as long as a reference names it.
 /// Then:
 ///
 ///   - Process 0 (root, init) stops the machine. Its children die with it,
@@ -316,15 +358,51 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // Orphaned claims go first. A thread parked in a fused `PipeInletOp.Call`
     // holds its exchange's claim column open without a handle entry, so the
     // close-all below cannot reach it, and the thread sweep further down would
-    // recycle the slot while `Exchange.caller` still named it. Dropping the
-    // claim abandons the call: the column falls to zero, and the server's later
-    // `reply` reads that as abandoned-by-client and answers `Err(PeerClosed)`.
+    // invalidate the thread while `Exchange.caller` still named it. Dropping
+    // the claim abandons the call: the column falls to zero, and the server's
+    // later `reply` reads that as abandoned-by-client and answers
+    // `Err(PeerClosed)`.
     //
     // This must run before the close-all, because the close-all drops endpoint
     // columns, every such transition notifies, and a notification must never
     // find a thread of the process being torn down. `release_pending_calls`
     // carries the two-pass argument for why its own unrefs cannot either.
     release_pending_calls(p)
+
+    // The dying process's threads come off every list a thread parks on, here,
+    // before the close-all. The close-all drops references, a dropped reference
+    // can deliver (a settle frees ring room, a resumed fused call stages a
+    // message, and an outlet attachment takes it), and a delivery to a thread
+    // of this process would mint into a table the close-all has already
+    // passed: the body would go back with that entry bound. Off every list, no
+    // wake can find one of these threads:
+    //
+    //   - The ready queue is edited, not emptied: other processes' runnable
+    //     threads stay.
+    //   - Every joiner list, so that an invalidation's wake reaches only other
+    //     processes' joiners and no surviving thread names one of these.
+    //   - Its own Waiters' blocked lists, emptied whole. A Waiter's handles
+    //     stay in its owner's table (`waiter_rights()` withholds `Transfer`,
+    //     and `WaiterCreate` mints into the named process's table), so only
+    //     the owner's threads park on one, and the Waiter sweep below frees it
+    //     without walking the list.
+    //
+    // Each walk reads `process`, which the thread sweep rewrites, so this also
+    // has to come before that.
+    ready_remove_process(p)
+    unjoin_process(p)
+    var wb: Int = 0
+    while wb < WAITERS.capacity() {
+        match WAITERS[wb].state {
+            case Free -> {},
+            case Live -> {
+                if WAITERS[wb].process == p {
+                    WAITERS[wb].blocked = 0
+                }
+            },
+        }
+        wb = wb + 1
+    }
 
     // The close-all goes through `unbind_handle`, so teardown and release do
     // the same thing to a slot: zero the binding and bump the generation. The
@@ -353,34 +431,62 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
         h = h + 1
     }
 
-    // The ready queue is edited, not emptied: the dying process's threads are
-    // removed and other processes' runnable threads stay. This happens before
-    // the thread slots are freed because the walk reads each thread's `process`
-    // field.
-    ready_remove_process(p)
-
+    // The thread sweep (spec §2.10). The close-all above has already dropped
+    // every reference this process held, so a count here is names held
+    // elsewhere: another process's table or a staged message.
+    //
+    //   - A thread of this process that has not exited is invalidated
+    //     (`invalidate_thread`), the running one included unless its own exit
+    //     is what ended the process.
+    //   - One that exited keeps its exit code for a late join, `Exited` wins,
+    //     and is disowned, so that its free credits nobody.
+    //   - Either is freed now if nothing names it, and counted for the
+    //     teardown line. One still named survives, owned by nobody, until its
+    //     last handle goes. The frees go through `free_object`, which gives an
+    //     `Exited` thread's charge back.
+    //   - Another process's `Exited` or `Invalid` thread whose last name was
+    //     in this process's table is freed too, uncounted: the close-all
+    //     counts without freeing (`unref_teardown`).
     var freed: UInt = 0
     var t: Int = 0
     while t < THREADS.capacity() {
-        if THREADS[t].process == p {
-            match THREADS[t].state {
-                case Free -> {},
-                case _ -> {
-                    THREADS[t] = ThreadSlot(state: ThreadState.Free, process: 0,
-                                            exit_code: 0,
-                                            joiners: 0, link: 0, wait_buf: 0,
-                                            call_pipe: 0, call_claim: 0,
-                                            call_src: 0, call_len: 0)
-                    freed = freed + 1
-                },
-            }
+        match THREADS[t].state {
+            case Free -> {},
+            case Exited -> {
+                if THREADS[t].refs == 0 {
+                    if THREADS[t].process == p {
+                        freed = freed + 1
+                    }
+                    free_object(ObjType.Thread, t)
+                } else if THREADS[t].process == p {
+                    THREADS[t].process = NO_PROCESS
+                }
+            },
+            case Invalid -> {
+                if THREADS[t].refs == 0 {
+                    free_object(ObjType.Thread, t)
+                }
+            },
+            case _ -> {
+                if THREADS[t].process == p {
+                    invalidate_thread(t, p)
+                    if THREADS[t].refs == 0 {
+                        free_object(ObjType.Thread, t)
+                        freed = freed + 1
+                    }
+                }
+            },
         }
         t = t + 1
     }
-    // This assumes the dying process is the caller, so the running thread is
-    // one of the slots just freed and nothing is current any more. A path that
-    // ended some other process (`ProcessOp.Exit` through a handle on a child
-    // is one) would have to keep its caller schedulable; this one does not.
+    // This assumes the dying process is the caller, so the running thread was
+    // one of the slots just swept (invalidated, or `Exited` when its own exit
+    // ended the process) and nothing is current any more. A
+    // path that ends some other process while a caller runs (a creation op
+    // through another process's handle faulting that process, spec §2.7)
+    // strands that caller: its thread stays `Running`, on no list, and is never
+    // scheduled again. Its process does not end on that account, since the
+    // stranded thread never exits.
     CURRENT_THREAD = NO_THREAD
 
     // Interrupts go back first. Masking each line is not just bookkeeping: a
@@ -446,9 +552,9 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
 
     // Waiters go back to their slabs whole (spec §2.7). No unlinking is needed
     // first: the attachment loop above has already unhooked every attachment of
-    // this process's waiters, and a Waiter's blocked list names threads that
-    // were reclaimed in the thread sweep. Events are not swept here: an Event
-    // is a shared kind, freed or disowned by `reap_unreferenced` below.
+    // this process's waiters, and their blocked lists were emptied before the
+    // thread sweep. Events are not swept here: an Event is a shared kind, freed
+    // or disowned by `reap_unreferenced` below.
     var waiters_freed: UInt = 0
     var w: Int = 0
     while w < WAITERS.capacity() {
@@ -523,8 +629,9 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // process's own record waits for the teardown's drop below.
     //
     // Events are freed or disowned by the reap, which answers the count the
-    // teardown line reports. Threads, Waiters, Interrupts and Timers are
-    // counted for the teardown line and swept by ownership. Mappings are swept
+    // teardown line reports. Threads were swept above: invalidated or disowned
+    // by ownership, freed by count. Waiters, Interrupts and Timers are counted
+    // for the teardown line and swept by ownership. Mappings are swept
     // below: a Mapping is not subject to the hazard above because
     // `mapping_rights()` withholds `Transfer`, so its handle cannot leave the
     // owning process.
@@ -607,8 +714,23 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     quota_clear(p)
 
     // The body goes back for the next create, and the record stops naming it
-    // (spec §2.10's disown of the record's own link).
+    // (spec §2.10's disown of the record's own link). A create takes a reused
+    // body's table as empty, so an entry still bound here would hand the next
+    // process a capability it was never given. Nothing mints into a dying
+    // table after the close-all, because no thread of this process is left on
+    // a list a delivery reads; this checks that rather than trusting it.
     if body != NO_BODY {
+        var e: Int = 0
+        while e < MAX_HANDLES {
+            match PROCESSES[body].handles[e].obj_type {
+                case Unbound -> {},
+                case _ -> {
+                    fatal_kernel("a body went back with a bound handle entry",
+                                 e as UInt)
+                },
+            }
+            e = e + 1
+        }
         PROCESSES[body].live = false
         unlink_body(p)
     }

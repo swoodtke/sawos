@@ -473,6 +473,21 @@ EVENT_NARROW_PKG = os.path.join(TESTS_DIR, "event-narrow")
 GIVE_EVENT_RETURNS_PKG = os.path.join(TESTS_DIR, "give-event-returns")
 CHILD_EVENT_PKG = os.path.join(TESTS_DIR, "child-event")
 
+# Threads are givable and counted: given, carried in a message, handed back by
+# a refused give, outliving their process as `Exited` or invalid, and freed
+# when nothing names them. `child-thread` plays the far process.
+THREAD_GIVE_PKG = os.path.join(TESTS_DIR, "thread-give")
+THREAD_GIVE_RETURNS_PKG = os.path.join(TESTS_DIR, "thread-give-returns")
+THREAD_SLOTS_PKG = os.path.join(TESTS_DIR, "thread-slots")
+CHILD_THREAD_PKG = os.path.join(TESTS_DIR, "child-thread")
+THREAD_QUOTA_PKG = os.path.join(TESTS_DIR, "thread-quota")
+THREAD_HANG_PKG = os.path.join(TESTS_DIR, "thread-hang")
+
+# A dying server's close-all frees ring room that a parked call fills, while a
+# thread of the server is parked on its completion queue.
+TEARDOWN_MINT_PKG = os.path.join(TESTS_DIR, "teardown-mint")
+CHILD_TEARDOWN_MINT_PKG = os.path.join(TESTS_DIR, "child-teardown-mint")
+
 # Driver-as-service.
 #
 # `uartproto` is a library package rather than an image: the protocol is one
@@ -909,6 +924,16 @@ def expectations(arch):
         # `child-event`'s owner exit code, asserted the same way in
         # `event_outlive`.
         "owner_mark": f"0x{0x2C:0{width}x}",
+        # `child-thread`'s "both threads were taken" exit code, asserted the
+        # same way in `thread_give`.
+        "sent_mark": f"0x{0x2E:0{width}x}",
+        # `child-thread`'s other roles' exit codes: the leaver's and the quota
+        # role's in `thread_quota`, the hanger's in `thread_hang`.
+        "left_mark": f"0x{0x2F:0{width}x}",
+        "quota_mark": f"0x{0x30:0{width}x}",
+        "hung_mark": f"0x{0x31:0{width}x}",
+        # `child-teardown-mint`'s exit code, asserted in `teardown_mint`.
+        "ended_mark": f"0x{0x32:0{width}x}",
     }
 
 
@@ -4668,6 +4693,177 @@ TEST_CASES = [
                        "timers={zero} process={one}",
                        "SOS eventkeeper: the keeper is gone",
                        "SOS eventkeeper: capacity 8"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A Thread is givable (spec 3) and outlives its process (spec 2.10).
+        # Root gives a child one of its threads, which the child joins: `33` is
+        # that thread's exit code, so a Thread given at boot works. The child
+        # sends back two of its own in a message, one exited and one parked, and
+        # dies. Root's join of the parked one was itself parked, and the death
+        # wakes it with `Revoked`; afterwards the exited one still reads `82`,
+        # its code (`Exited` wins), and the invalid one answers `Revoked` to a
+        # join and to a start.
+        #
+        # `before=7` and `after=7` are the free thread slots (the slab less
+        # root's own thread), counted by a round that leaves nothing behind.
+        # They agree only if every thread of the case was freed: the given
+        # thread by the child's teardown, which drops its last name; the two
+        # the child sent by root's releases, one `Exited` and one invalid; and
+        # the child's main thread by its teardown.
+        #
+        # The child's `threads=` is its main thread alone: the two it sent
+        # survive its death, named by root's handles. Its `handles=` are its
+        # System and Process handles, the given thread's handle and its outbox,
+        # its main thread's own word, and the exited worker's Process and
+        # Thread handles.
+        "name": "thread_give",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": THREAD_GIVE_PKG,
+        "children": [CHILD_THREAD_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS threadgive: capacity before=7",
+                       "SOS threadgive: started",
+                       "SOS threadgive: the child joined the given thread: 33",
+                       "SOS: process exit: code={sent_mark} process={one}",
+                       "SOS: process teardown handles={seven} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS threadgive: the parked join answered: what this "
+                       "call was waiting for is gone",
+                       "SOS threadgive: the child is gone",
+                       "SOS threadgive: the late join reads 82",
+                       "SOS threadgive: the held join answered: what this "
+                       "call was waiting for is gone",
+                       "SOS threadgive: starting the invalid thread answered: "
+                       "what this call was waiting for is gone",
+                       "SOS threadgive: capacity after=7",
+                       "SOS threadgive: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A child's exited threads count against its Thread quota until their
+        # slots are freed (spec 2.9, 2.10). The leaver dies leaving root one
+        # exited thread, which still joins as `82`. The quota child lands in
+        # the leaver's reused record (`process={one}` both times) and makes
+        # workers that exit and stay named: `made 3` is its quota of four less
+        # its main thread. Root then releases the leaver's thread, whose free
+        # must credit nobody: credited to the record, it would reach the quota
+        # child and let its next create in (`still refused`). The child then
+        # releases its workers and makes `again=3`: each free credited it once.
+        "name": "thread_quota",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": THREAD_QUOTA_PKG,
+        "children": [CHILD_THREAD_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS: process exit: code={left_mark} process={one}",
+                       "SOS: process teardown handles={five} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS threadquota: the leaver's thread outlived it: "
+                       "joins 82",
+                       "SOS childthread: quota made 3 then refused: this "
+                       "process is at its quota",
+                       "SOS childthread: quota still refused: this process is "
+                       "at its quota",
+                       "SOS childthread: quota again=3 then refused: this "
+                       "process is at its quota",
+                       "SOS: process exit: code={quota_mark} process={one}",
+                       "SOS: process teardown handles={three} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS threadquota: the quota child is gone",
+                       "SOS threadquota: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A process dies with a thread parked joining another process's thread
+        # and a started thread still on the ready queue (spec 2.10). The child
+        # parks joining root's thread, and its ending worker runs before its
+        # other worker ever does. The teardown frees all three (`threads=3`).
+        # Root's thread then exits: its joiner list must hold only root, whose
+        # join reads `61`, and the never-run worker must stay unrun (it prints
+        # if it runs).
+        "name": "thread_hang",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": THREAD_HANG_PKG,
+        "children": [CHILD_THREAD_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS: process exit: code={hung_mark} process={one}",
+                       "SOS: process teardown handles={six} threads={three} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS threadhang: the child is gone",
+                       "SOS threadhang: my thread joins 61",
+                       "SOS threadhang: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A dying process's close-all can stage a message that is ready for one
+        # of its own parked threads, and the delivery must not reach it (spec
+        # 2.10). The server child dies holding a full ring's obligations in a
+        # message staged on its own connection, with its main thread parked on
+        # its completion queue and root's call parked for room. Its close-all
+        # drops that connection's outlet, the obligations go, the ring has room
+        # and root's call is staged. A delivery to the parked thread would mint
+        # into the dying table after the close-all had passed it, and the body
+        # would go back holding that entry, which stops the machine; instead
+        # the call stays staged until the server end goes, and root's call
+        # answers `PeerClosed`.
+        "name": "teardown_mint",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": TEARDOWN_MINT_PKG,
+        "children": [CHILD_TEARDOWN_MINT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS cqhold: holding 16 obligations",
+                       "SOS: process exit: code={ended_mark} process={one}",
+                       "SOS: process teardown handles={nine} threads={two} "
+                       "events={zero} waiters={one} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS teardownmint: the parked call answered: the other "
+                       "end of this connection is gone",
+                       "SOS teardownmint: the server is gone",
+                       "SOS teardownmint: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A give refused for capacity hands a Thread back usable, as
+        # `give_event_returns` does an Event: `gave 12` is the child's handle
+        # budget, and the returned thread starts and joins for its code, `7`.
+        # Root's teardown frees both its threads, its own and the returned one,
+        # since nothing else names either.
+        "name": "thread_give_returns",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": THREAD_GIVE_RETURNS_PKG,
+        "children": [CHILD_BYE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS threadreturns: gave 12 siblings then refused: this "
+                       "process is at its quota",
+                       "SOS threadreturns: the Thread give was refused: this "
+                       "process is at its quota",
+                       "SOS threadreturns: the refused Thread joins 7",
+                       "SOS: process teardown handles={ten} threads={two} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={zero}"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Thread slots are counted (spec 2). Each round makes threads until the
+        # slab refuses one and lets go of every handle before the thread runs;
+        # the threads still run and exit through handles onto themselves, which
+        # root then releases. `first=7` is the slab less root's own thread, and
+        # `again=7` is every exited slot coming back once nothing named it.
+        "name": "thread_slots",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": THREAD_SLOTS_PKG,
+        "expect_out": ["{banner}",
+                       "SOS threadslots: first=7 again=7",
+                       "SOS threadslots: done"],
         "expect_clean_exit": True,
     },
     # =========================================================================

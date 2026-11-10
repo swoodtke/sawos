@@ -1,0 +1,427 @@
+// Test child: Thread handles across a process boundary, in four roles chosen by
+// the boot set (spec §3, §2.10, §2.9).
+//
+// The sender is given a Thread under `TAG_JOIN` and an outbox under
+// `TAG_OUTBOX`. It joins the given thread, which is the launcher's, and keeps
+// that handle until it dies, so its death drops the last name of an exited
+// thread another process owns. It makes two workers: one exits with
+// `CODE_EXITED`, and the other parks joining the main thread, which never
+// exits. The main thread joins the first, sends both workers' handles to the
+// launcher in one message whose byte is the given thread's exit code, and waits
+// on the message's claim until the launcher has taken it. Then it ends the
+// process, leaving the launcher a thread that exited before its process died
+// and one that had not.
+//
+// The leaver is given an outbox under `TAG_LEAVE_OUT`. It makes a worker that
+// exits with `CODE_EXITED`, sends the worker's handle to the launcher, waits
+// for the message to be taken and ends the process: one exited thread survives
+// it, named by the launcher.
+//
+// The quota role is given an outbox under `TAG_QUOTA_OUT`. It makes workers one
+// at a time, each exiting through a handle onto itself that stays bound, until
+// a create is refused: its main thread and its exited workers count against
+// its Thread quota (`DEFAULT_QUOTA_THREADS`). It tells the launcher, which then
+// releases a thread a dead process in this record left behind, and asks once
+// more, which must still be refused. It releases its workers' handles and makes
+// the same number again.
+//
+// The hanger is given a launcher's thread under `TAG_HANG`. It starts one
+// worker that ends the process and one that never gets to run, then parks
+// joining the launcher's thread, which has not exited. It dies with that join
+// parked and the second worker still on the ready queue.
+//
+// Every thread of this image enters at `_start` (the `tests/thread-basics`
+// idiom), so the entry works out which thread it is: the main thread is the
+// one that has not yet parked the boot handle, and a worker's argument is its
+// role.
+
+import sos.{System, Process, Thread, PipeInlet, PipeHandles, SosStatus,
+            PIPE_BODY_BYTES, ALL_RIGHTS, sos_handle_release,
+            sos_system_process_self, sos_process_thread_self,
+            sos_thread_exit, sos_thread_join}
+
+/// The launcher's tags.
+static TAG_OUTBOX: UInt = 33
+static TAG_JOIN: UInt = 36
+static TAG_LEAVE_OUT: UInt = 37
+static TAG_QUOTA_OUT: UInt = 38
+static TAG_HANG: UInt = 39
+
+/// The workers' roles, passed as their argument. A slot worker's argument is
+/// `ROLE_SLOT` plus its index.
+static ROLE_EXITS: UInt = 1
+static ROLE_PARKS: UInt = 2
+static ROLE_ENDS: UInt = 3
+static ROLE_STRANDED: UInt = 4
+static ROLE_SLOT: UInt = 16
+
+/// The code the exiting worker ends with, which the launcher reads after this
+/// process is gone.
+static CODE_EXITED: UInt = 82
+
+/// What a slot worker exits with, past its index.
+static CODE_SLOT: UInt = 100
+
+/// More slot workers than the Thread quota allows.
+static MAX_SLOTS: Int = 8
+
+/// The sender's workers were taken.
+static EXIT_SENT: UInt = 46
+/// The leaver's worker was taken.
+static EXIT_LEFT: UInt = 47
+/// The quota role made its workers twice.
+static EXIT_QUOTA: UInt = 48
+/// The hanger's ending worker ended it.
+static EXIT_HUNG: UInt = 49
+/// Something on the way failed; the line before it says what.
+static EXIT_MISMATCH: UInt = 98
+
+static STATUS_OK: UInt = 0
+
+/// A status no arm of this program can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// The boot handle, parked by the main thread for the workers. Handle 0 names
+/// nothing, so a parked handle is never 0 and an unparked slot is never one.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+/// The main thread's own handle, as a word, for the parking worker to join
+/// through. The typed layer cannot hand a handle between threads.
+unsafe static var MAIN_WORD: UInt = 0
+
+/// Each slot worker's own handle, as a word, by index; 0 until it publishes
+/// one.
+unsafe static var SLOT_WORDS: [UInt; MAX_SLOTS] = [0; MAX_SLOTS]
+
+/// Two stacks. Workers that share one never overlap: a slot worker runs from
+/// its first instruction to its exit without parking, and nothing preempts it.
+static STACK_WORDS: Int = 512
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+unsafe static var STACK_A: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_B: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+func stack_top(base: UInt) -> UInt {
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func stack_a_top() unsafe -> UInt {
+    stack_top(((&var STACK_A) as UnsafePointer<UInt64>) as UInt)
+}
+
+func stack_b_top() unsafe -> UInt {
+    stack_top(((&var STACK_B) as UnsafePointer<UInt64>) as UInt)
+}
+
+func park_boot_handle(word: UInt) unsafe { BOOT_HANDLE = word }
+
+func parked_boot_handle() unsafe -> UInt { BOOT_HANDLE }
+
+func main_word() unsafe -> UInt { MAIN_WORD }
+
+/// A handle onto the calling thread, as a word, or 0 if it could not be made.
+func self_word() unsafe -> UInt {
+    var pw: UInt = 0
+    if sos_system_process_self(parked_boot_handle(), ALL_RIGHTS as UInt,
+                               (&var pw) as UnsafePointer<UInt>) != STATUS_OK {
+        return 0
+    }
+    var tw: UInt = 0
+    let st = sos_process_thread_self(pw, (&var tw) as UnsafePointer<UInt>)
+    let _ = sos_handle_release(pw)
+    if st != STATUS_OK {
+        return 0
+    }
+    tw
+}
+
+/// Read slot worker `index`'s published word and clear it.
+func take_slot_word(index: UInt) unsafe -> UInt {
+    let word = SLOT_WORDS[index as Int]
+    SLOT_WORDS[index as Int] = 0
+    word
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        main_thread(arg)
+    } else if arg == ROLE_EXITS {
+        exits()
+    } else if arg == ROLE_PARKS {
+        parks()
+    } else if arg == ROLE_ENDS {
+        ends()
+    } else if arg == ROLE_STRANDED {
+        stranded()
+    } else {
+        slot(arg - ROLE_SLOT)
+    }
+}
+
+/// The worker that exits. Its handle reaches the launcher, which joins it
+/// after this process is gone.
+func exits() {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    let _ = me.exit(CODE_EXITED)
+}
+
+/// The worker that parks: it joins the main thread, which never exits, so it
+/// is still parked when the process ends. Falling off `_start` would fault the
+/// process, so a join that returned would show in the transcript.
+func parks() unsafe {
+    var out: UInt = 0
+    let _ = sos_thread_join(main_word(), (&var out) as UnsafePointer<UInt>)
+}
+
+/// The hanger's worker that ends the process while the main thread is parked.
+func ends() {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let _ = proc.exit(EXIT_HUNG)
+}
+
+/// The hanger's other worker, started after `ends` and so never run: the
+/// process is gone first. Running would print, which the launcher's case
+/// refuses.
+func stranded() {
+    let system = System(boot_handle: parked_boot_handle())
+    let _ = system.debug_print("SOS childthread: a thread of a dead process ran\n")
+    let proc = try system.process_self() catch { return }
+    let _ = proc.exit(EXIT_MISMATCH)
+}
+
+/// A slot worker: publish a handle onto itself and exit through it, so the
+/// exited slot stays named until the main thread releases the word.
+func slot(index: UInt) unsafe {
+    let word = self_word()
+    if word == 0 {
+        return
+    }
+    SLOT_WORDS[index as Int] = word
+    let _ = sos_thread_exit(word, CODE_SLOT + index)
+}
+
+func main_thread(boot: UInt) {
+    park_boot_handle(boot)
+    let system = System(boot_handle: boot)
+    let proc = try system.process_self() catch {
+        print("SOS childthread: no process handle: {}\n", error)
+        return
+    }
+
+    var given: Thread? = None
+    var hang: Thread? = None
+    var outbox: PipeInlet? = None
+    var leave: PipeInlet? = None
+    var quota_out: PipeInlet? = None
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                if rec.tag == TAG_JOIN {
+                    given = rec.take_thread()
+                } else if rec.tag == TAG_HANG {
+                    hang = rec.take_thread()
+                } else if rec.tag == TAG_OUTBOX {
+                    outbox = rec.take_inlet()
+                } else if rec.tag == TAG_LEAVE_OUT {
+                    leave = rec.take_inlet()
+                } else if rec.tag == TAG_QUOTA_OUT {
+                    quota_out = rec.take_inlet()
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+
+    // Each role's handles live in this frame, which `exit` never leaves, so
+    // the teardown finds them still bound.
+    var code: UInt = EXIT_MISMATCH
+    if let joined = given.take() {
+        guard let out = outbox.take() else {
+            let _ = system.debug_print("SOS childthread: no outbox\n")
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        }
+        code = try send(&proc, &joined, &out) catch {
+            print("SOS childthread: refused: {}\n", error)
+            EXIT_MISMATCH
+        }
+        let _ = proc.exit(code)
+        return
+    }
+    if let out = leave.take() {
+        code = try leave_one(&proc, &out) catch {
+            print("SOS childthread: refused: {}\n", error)
+            EXIT_MISMATCH
+        }
+        let _ = proc.exit(code)
+        return
+    }
+    if let out = quota_out.take() {
+        code = try quota(&proc, &out) catch {
+            print("SOS childthread: refused: {}\n", error)
+            EXIT_MISMATCH
+        }
+        let _ = proc.exit(code)
+        return
+    }
+    if let target = hang.take() {
+        code = try hang_on(&proc, &target) catch {
+            print("SOS childthread: refused: {}\n", error)
+            EXIT_MISMATCH
+        }
+        let _ = proc.exit(code)
+        return
+    }
+    let _ = system.debug_print("SOS childthread: the boot set names no role\n")
+    let _ = proc.exit(EXIT_MISMATCH)
+}
+
+/// Post `body` with `handles` and park on the claim until the launcher has
+/// taken the message and dropped its request, which answers `PeerClosed`.
+func hand_over(out: &PipeInlet, body: &[UInt8; PIPE_BODY_BYTES],
+               handles: &var PipeHandles) -> Result<Void, SosStatus> {
+    let claim = try out.post_with(body: &body, len: 1, handles: &var handles)
+    let _ = (move claim).resolve()
+    return
+}
+
+/// The sender.
+func send(proc: &Process, joined: &Thread,
+          out: &PipeInlet) -> Result<UInt, SosStatus> {
+    // The launcher's thread, joined through the handle it gave.
+    let given_code = try joined.join()
+
+    let word = self_word()
+    if word == 0 {
+        return BUG
+    }
+    publish_main_word(word)
+    let exiting = try proc.thread_create(stack_top: stack_a_top(), arg: ROLE_EXITS)
+    let parking = try proc.thread_create(stack_top: stack_b_top(), arg: ROLE_PARKS)
+    try exiting.start()
+    try parking.start()
+
+    // This parks the main thread: the exiting worker runs and exits, and the
+    // parking one runs and parks joining this thread.
+    let code = try exiting.join()
+    if code != CODE_EXITED {
+        print("SOS childthread: the worker exited {}\n", code)
+        return EXIT_MISMATCH
+    }
+
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = UInt8.from(truncating: given_code)
+    var carrying = PipeHandles.none()
+    carrying.put(0, thread: move exiting)
+    carrying.put(1, thread: move parking)
+    try hand_over(&out, &body, &var carrying)
+    return EXIT_SENT
+}
+
+func publish_main_word(word: UInt) unsafe { MAIN_WORD = word }
+
+/// The leaver: one exited worker outlives this process, named by the launcher.
+func leave_one(proc: &Process, out: &PipeInlet) -> Result<UInt, SosStatus> {
+    let exiting = try proc.thread_create(stack_top: stack_a_top(), arg: ROLE_EXITS)
+    try exiting.start()
+    let code = try exiting.join()
+    if code != CODE_EXITED {
+        return EXIT_MISMATCH
+    }
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var carrying = PipeHandles.none()
+    carrying.put(0, thread: move exiting)
+    try hand_over(&out, &body, &var carrying)
+    return EXIT_LEFT
+}
+
+/// The quota role.
+func quota(proc: &Process, out: &PipeInlet) -> Result<UInt, SosStatus> {
+    let me = try proc.thread_self()
+
+    var made: UInt = 0
+    let why = fill(&proc, &me, &var made)
+    print("SOS childthread: quota made {} then refused: {}\n", made, why)
+
+    // The launcher releases a thread a dead process in this record left
+    // behind while this waits. Its free must credit nobody.
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var none = PipeHandles.none()
+    try hand_over(&out, &body, &var none)
+
+    match proc.thread_create(stack_top: stack_a_top(), arg: ROLE_SLOT + made) {
+        case Ok(_) -> {
+            print("SOS childthread: quota let one more in\n")
+            return EXIT_MISMATCH
+        },
+        case Err(still) -> {
+            print("SOS childthread: quota still refused: {}\n", still)
+        },
+    }
+
+    try release_slots(made)
+    var again: UInt = 0
+    let why_again = fill(&proc, &me, &var again)
+    print("SOS childthread: quota again={} then refused: {}\n", again, why_again)
+    try release_slots(again)
+    return EXIT_QUOTA
+}
+
+/// Make slot workers one at a time, each run to its exit before the next is
+/// made, until a create is refused; answer the refusal. `made` counts them.
+func fill(proc: &Process, me: &Thread, made: &var UInt) -> SosStatus {
+    while (made as Int) < MAX_SLOTS {
+        match proc.thread_create(stack_top: stack_a_top(), arg: ROLE_SLOT + made) {
+            case Ok(t) -> {
+                try t.start() catch { return error }
+                let _ = move t
+                // The worker runs to its exit before this thread runs again.
+                try me.yield_now() catch { return error }
+                made = made + 1
+            },
+            case Err(why) -> { return why },
+        }
+    }
+    return BUG
+}
+
+/// Join every slot worker through its own word, check its code, and release
+/// the word: the last name of an exited thread.
+func release_slots(count: UInt) unsafe -> Result<Void, SosStatus> {
+    var i: UInt = 0
+    while i < count {
+        let word = take_slot_word(i)
+        if word == 0 {
+            return BUG
+        }
+        var code: UInt = 0
+        let st = sos_thread_join(word, (&var code) as UnsafePointer<UInt>)
+        let _ = sos_handle_release(word)
+        if st != STATUS_OK || code != CODE_SLOT + i {
+            print("SOS childthread: slot worker {} answered {} code {}\n", i, st,
+                  code)
+            return BUG
+        }
+        i = i + 1
+    }
+    return
+}
+
+/// The hanger: start the worker that ends this process and one that will not
+/// run before it does, then park joining the launcher's thread.
+func hang_on(proc: &Process, target: &Thread) -> Result<UInt, SosStatus> {
+    let ender = try proc.thread_create(stack_top: stack_a_top(), arg: ROLE_ENDS)
+    let left = try proc.thread_create(stack_top: stack_b_top(), arg: ROLE_STRANDED)
+    try ender.start()
+    try left.start()
+    let code = try target.join()
+    print("SOS childthread: the hanger's join returned {}\n", code)
+    return EXIT_MISMATCH
+}

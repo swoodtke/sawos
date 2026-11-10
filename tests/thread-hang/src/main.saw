@@ -1,0 +1,172 @@
+// A process dies with one of its threads parked joining another process's
+// thread and another still on the ready queue (spec §2.10).
+//
+// Expected transcript, read as an order:
+//
+//   SOS: process exit: code=49 process=1
+//   SOS: process teardown ... threads=3 ... process=1
+//   SOS threadhang: the child is gone
+//   SOS threadhang: my thread joins 61
+//   SOS threadhang: done
+//
+// Root makes a thread that yields until root lets it go, then exits with
+// `CODE_HUNG_ON`, and gives a sibling of its handle to a child
+// (`child-thread`, the hanger). The child starts a worker that ends the
+// process and a second worker behind it, then parks joining root's thread. The
+// ending worker runs first and ends the process, so the child dies with its
+// main thread on root's thread's joiner list and the second worker on the
+// ready queue, never run.
+//
+// Root's thread then exits, which wakes everything on its joiner list: only
+// root, whose join reads the code. A dead thread left on that list would be
+// woken into a slot that is no longer its, and one left on the ready queue
+// would be run; root yields once after the join so that either would run
+// before the case ends, and the second worker prints if it ever runs.
+
+import sos.{System, Process, Memory, Thread, SystemRight, SosStatus,
+            WaitPayload}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tags the child's boot records travel under.
+static TAG_BOOT: UInt = 7
+static TAG_HANG: UInt = 39
+
+/// The key root's attachment lives under.
+static KEY_CHILD: UInt = 82
+
+/// The role root's thread is created with, and what it exits with.
+static ROLE_HUNG_ON: UInt = 1
+static CODE_HUNG_ON: UInt = 61
+
+/// The child's exit code, and the kind half of a §8 status word for a process
+/// that exited.
+static EXIT_HUNG: UInt = 49
+static EXITED: UInt = 1 << 16
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// The boot handle, parked by the initial thread for the other. Handle 0 names
+/// nothing, so a parked handle is never 0 and an unparked slot is never one.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+/// Set by root once the child is gone; root's other thread exits when it sees
+/// it.
+unsafe static var RELEASED: Bool = false
+
+static STACK_WORDS: Int = 512
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func park_boot_handle(word: UInt) unsafe { BOOT_HANDLE = word }
+
+func parked_boot_handle() unsafe -> UInt { BOOT_HANDLE }
+
+func release() unsafe { RELEASED = true }
+
+func released() unsafe -> Bool { RELEASED }
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        hung_on()
+    }
+}
+
+/// The thread the child joins. It stays runnable, yielding, so the machine is
+/// never idle-and-doomed, until root releases it.
+func hung_on() {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    while not released() {
+        let _ = me.yield_now()
+    }
+    let _ = me.exit(CODE_HUNG_ON)
+}
+
+func initial(boot_handle: UInt) {
+    park_boot_handle(boot_handle)
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS threadhang: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS threadhang: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS threadhang: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    let target = try proc.thread_create(stack_top: stack_top(), arg: ROLE_HUNG_ON)
+    let mine = try target.mint()
+    try target.start()
+
+    let child = try system.process_create(image: &image, memory: &ram)
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_CHILD)
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(thread: move target, tag: TAG_HANG) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+
+    let ended = try waiter.wait()
+    if ended.key != KEY_CHILD {
+        return BUG
+    }
+    match ended.what {
+        case Process(status) -> {
+            if status != EXITED + EXIT_HUNG {
+                print("SOS threadhang: the child ended {}\n", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    let _ = system.debug_print("SOS threadhang: the child is gone\n")
+
+    release()
+    let code = try mine.join()
+    print("SOS threadhang: my thread joins {}\n", code)
+    if code != CODE_HUNG_ON {
+        return BUG
+    }
+    // The exit woke everything on the joiner list. Anything it woke besides
+    // root runs before root does again.
+    let me = try proc.thread_self()
+    try me.yield_now()
+    return
+}

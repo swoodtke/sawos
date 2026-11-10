@@ -2,8 +2,8 @@
 //!
 //! Start it, join it, exit it, yield it: ops on a handle, and no way to build
 //! one from a word. A `Thread` is minted by `Process.thread_create` and
-//! `Process.thread_self`, both of which live above this file, so nothing here
-//! reaches upward.
+//! `Process.thread_self` and arrives by a give or a message, all of which live
+//! above this file, so nothing here reaches upward.
 
 import sosabi.{SosStatus, ThreadOp, ThreadHandle, NO_HANDLE, MINT_OP}
 
@@ -16,14 +16,18 @@ import sos.floor.{call_value, checked, sos_handle_release, sos_thread_exit,
 /// sees a task (spec §2).
 ///
 /// Like `Process`, it cannot be built from a word or turned back into one: a
-/// `Thread` comes from `Process.thread_create` or `Process.thread_self` and
-/// from nowhere else. Naming a thread you were never given is not expressible
-/// in this layer; the test that the kernel rejects such a handle is a
-/// hand-written payload at the raw altitude.
+/// `Thread` comes from `Process.thread_create` or `Process.thread_self`, is
+/// handed back by a refused `Process.give(thread:)`, and is delivered by a
+/// message as `PipeHandle.Thread` or a boot record through
+/// `BootHandle.take_thread`. Naming a thread you were never given is not
+/// expressible in this layer; the test that the kernel rejects such a handle
+/// is a hand-written payload at the raw altitude.
 ///
 /// `NoCopy`, and dropping it releases the handle. `Process.thread_self()` mints
 /// a fresh instance on every call, so a thread that asks twice owns two handles
-/// onto itself and may release either.
+/// onto itself and may release either. Releasing the last handle does not stop
+/// a thread that has not exited; its slot is freed once it has exited or its
+/// process has died and nothing names it (§2.10).
 public struct Thread {
     public(package) handle: ThreadHandle,
 }
@@ -48,9 +52,12 @@ extension Thread {
     /// Wait for this thread to exit and take its exit value. Requires
     /// `ThreadRight.Join`.
     ///
-    /// An already-exited thread answers immediately; a running one parks the
-    /// caller until it exits. Joining yourself terminates the process: the wait
-    /// could never end, and the caller could have checked.
+    /// An already-exited thread answers immediately, even after its process
+    /// has died; a running one parks the caller until it exits. A thread whose
+    /// process died before it exited answers `Err(SosStatus.Revoked)`, and so
+    /// does a join parked on it when the process dies. Joining yourself
+    /// terminates the process: the wait could never end, and the caller could
+    /// have checked.
     public func join(&self) -> Result<UInt, SosStatus> {
         call_value(self.handle, ThreadOp.Join as UInt, 0, 0, 0)
     }
@@ -58,6 +65,10 @@ extension Thread {
     /// End the calling thread with `code`, which whoever joins it receives.
     /// Does not return. Requires `ThreadRight.Control`, and the handle must
     /// name the calling thread.
+    ///
+    /// The handle stays bound: this wrapper never drops, so it still names the
+    /// exited thread, which holds its slot and a row of its process's Thread
+    /// quota until it is released, at the latest by its process's teardown.
     public func exit(&self, code: UInt) -> Result<Void, SosStatus> {
         checked(sos_thread_exit(self.handle, code))
     }

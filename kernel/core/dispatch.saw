@@ -550,6 +550,10 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             if handle == NO_HANDLE {
                 return op_status(mint_refusal(p))
             }
+            // The new handle is a reference to the running thread: another
+            // one, or the first for a child's main thread, which no handle
+            // named.
+            ref_object(ObjType.Thread, CURRENT_THREAD)
             op_value(handle)
         },
         // Process exit belongs here, not on the System object (spec §5.7).
@@ -1157,11 +1161,13 @@ func process_start(caller: Int, child: Int,
     let body = body_of(child)
     hal.frame_init(frame_slot(slot), PROCESSES[body].entry,
                    PROCESSES[body].stack_top, boot_word)
+    // No handle names the child's first thread, so its count starts at zero:
+    // it runs in its slot, and the child's `ThreadSelf` is what names it.
     THREADS[slot] = ThreadSlot(state: ThreadState.Runnable, process: child,
                                exit_code: 0,
                                joiners: 0, link: 0, wait_buf: 0,
                                call_pipe: 0, call_claim: 0, call_src: 0,
-                               call_len: 0)
+                               call_len: 0, refs: 0)
     quota_charge(child, QuotaKind.Thread)
     ready_push(slot)
     PROCESS_RECORDS[child].state = ProcessState.Running
@@ -1524,10 +1530,9 @@ func thread_create(p: Int, entry: UInt, stack_top: UInt, arg: UInt) unsafe -> Sy
         fault_process(p, FaultReason.BadEntry)
     }
 
-    // A thread row is charged and never credited before the teardown, because a
-    // thread slot is not returned before it either: `Exited` is a state a slot
-    // stays in so a late join still finds the exit code. The quota tracks the
-    // slab exactly.
+    // The thread row is credited when the slot is freed (`free_object`) or the
+    // thread is invalidated (`invalidate_thread`), so it counts the slots the
+    // process holds, exited ones still named included.
     if not quota_room(p, QuotaKind.Thread) {
         return op_status(SosStatus.QuotaExceeded)
     }
@@ -1541,11 +1546,12 @@ func thread_create(p: Int, entry: UInt, stack_top: UInt, arg: UInt) unsafe -> Sy
     }
 
     hal.frame_init(frame_slot(slot), start, stack_top, arg)
+    // The handle just minted is the first reference.
     THREADS[slot] = ThreadSlot(state: ThreadState.Created, process: p,
                                exit_code: 0,
                                joiners: 0, link: 0, wait_buf: 0,
                                call_pipe: 0, call_claim: 0, call_src: 0,
-                               call_len: 0)
+                               call_len: 0, refs: 1)
     quota_charge(p, QuotaKind.Thread)
     op_value(handle)
 }
@@ -1556,6 +1562,12 @@ func thread_create(p: Int, entry: UInt, stack_top: UInt, arg: UInt) unsafe -> Sy
 /// the handle names the caller (`NotSelf`): driving another thread's execution
 /// is not something the object model offers, and a process that tries has
 /// misread its own handles.
+///
+/// An invalid thread (its process died before it exited, spec §2.10) answers
+/// `Start` and `Join` with `Revoked`, after the rights check and the self-join
+/// check fault as they would on a live thread. `Exit` and `Yield` through its
+/// handle stay the `NotSelf` fault: an invalid thread never runs, so its handle
+/// never names the caller, the rule a `Gone` process's self-only ops follow.
 func thread_op(raw_op: UInt, obj: &ThreadObject, arg0: UInt) unsafe -> SyscallResult {
     let p = calling_process()
     guard let op = ThreadOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
@@ -1573,6 +1585,7 @@ func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
             }
             match THREADS[target].state {
                 case Created -> {},
+                case Invalid -> { return op_status(SosStatus.Revoked) },
                 case _ -> fault_process(p, FaultReason.BadState),
             }
             THREADS[target].state = ThreadState.Runnable
@@ -1588,7 +1601,11 @@ func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
             }
             match THREADS[target].state {
                 // Already gone: the answer is in the slot, so nothing parks.
+                // `Exited` wins over the process's death (spec §2.10).
                 case Exited -> op_value(THREADS[target].exit_code),
+                // Its process died before it exited: there is no code to read
+                // and nothing will ever exit.
+                case Invalid -> op_status(SosStatus.Revoked),
                 case Free -> fault_process(p, FaultReason.BadState),
                 case _ -> {
                     block_on_join(CURRENT_THREAD, target)

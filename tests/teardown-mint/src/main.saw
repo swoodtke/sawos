@@ -1,0 +1,157 @@
+// A dying process's close-all can free ring room that resumes a parked call,
+// and the message that call stages must not be delivered to a thread of the
+// dying process (spec §2.10).
+//
+// Expected transcript, read as an order:
+//
+//   SOS cqhold: holding 16 obligations
+//   SOS: process exit: code=50 process=1
+//   SOS: process teardown ... process=1
+//   SOS teardownmint: the parked call answered: <PeerClosed>
+//   SOS teardownmint: the server is gone
+//   SOS teardownmint: done
+//
+// Root fills a connection's ring with messages whose claims it drops, and gives
+// the server end to a child (`child-teardown-mint`). The child takes every
+// message through a Waiter, parks the obligations in messages staged on a
+// connection of its own, and tells root it is ready. Root calls on the full
+// ring, which parks it for room, and the child ends itself with its main
+// thread parked on that Waiter.
+//
+// The child's close-all drops its own outlet, and the staged obligations go
+// with it: their exchanges settle, the ring has room, and root's call is
+// staged. Delivering that message to the child's parked thread would mint into
+// the child's table after the close-all had passed it, and the child's body
+// would go back with that entry bound, which stops the machine. Instead the
+// child's thread is off its Waiter before the close-all, the message stays
+// staged, and the attachment's teardown drops the server end, so root's call
+// answers `PeerClosed`.
+
+import sos.{System, Process, Memory, PipeInlet, PipeOutlet, SystemRight,
+            SosStatus, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tags the child's boot records travel under.
+static TAG_BOOT: UInt = 7
+static TAG_SERVE: UInt = 41
+static TAG_READY: UInt = 42
+
+/// The keys root's attachments live under.
+static KEY_READY: UInt = 81
+static KEY_CHILD: UInt = 82
+
+/// The served ring's depth (`PIPE_INFLIGHT`): root fills all of it.
+static FILL: Int = 16
+
+/// The child's exit code, and the kind half of a §8 status word for a process
+/// that exited.
+static EXIT_ENDED: UInt = 50
+static EXITED: UInt = 1 << 16
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS teardownmint: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS teardownmint: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS teardownmint: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    let child = try system.process_create(image: &image, memory: &ram)
+    let served = try proc.pipe_create()
+    let (calls, serve_end) = move served
+    let ready = try proc.pipe_create()
+    let (ready_in, ready_out) = move ready
+
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var posted: Int = 0
+    while posted < FILL {
+        let claim = try calls.post(body: &body, len: 1)
+        let _ = move claim
+        posted = posted + 1
+    }
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(outlet: &ready_out, key: KEY_READY)
+    try waiter.add(process: &child, key: KEY_CHILD)
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(outlet: move serve_end, tag: TAG_SERVE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(inlet: move ready_in, tag: TAG_READY) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+
+    let woke = try waiter.wait()
+    if woke.key != KEY_READY {
+        return BUG
+    }
+    try waiter.remove(KEY_READY)
+    let got = try ready_out.take()
+    let (note, request) = move got
+    let _ = move note
+    let _ = move request
+
+    // The ring is full of taken exchanges, so this parks for room.
+    match calls.send(body: &body, len: 1) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS teardownmint: the call was answered\n")
+            return BUG
+        },
+        case Err(why) -> {
+            print("SOS teardownmint: the parked call answered: {}\n", why)
+            if why != SosStatus.PeerClosed {
+                return BUG
+            }
+        },
+    }
+
+    let ended = try waiter.wait()
+    if ended.key != KEY_CHILD {
+        return BUG
+    }
+    match ended.what {
+        case Process(status) -> {
+            if status != EXITED + EXIT_ENDED {
+                print("SOS teardownmint: the server ended {}\n", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    let _ = system.debug_print("SOS teardownmint: the server is gone\n")
+    return
+}

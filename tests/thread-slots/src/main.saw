@@ -1,0 +1,185 @@
+// Thread slots are counted (spec §2, §2.10).
+//
+// Expected transcript:
+//
+//   SOS threadslots: first=7 again=7
+//   SOS threadslots: done
+//
+// A round makes threads until the slab refuses one. Each is started and its
+// handle released at once, so its count is zero before it has run a single
+// instruction. Root then yields, and every worker runs: it publishes its own
+// handle as a word, and exits through it with its index plus `CODE_BASE`. Root
+// joins each through that word, which must read the worker's code, and
+// releases it, which drops the last name of an exited thread.
+//
+// That the workers ran and exited with their codes shows a thread that has not
+// exited is not freed by losing its last handle. That the second round makes
+// as many threads as the first shows each exited slot came back once nothing
+// named it; if none had, the second round would make none. `first` is the
+// thread slab less root's own thread, the same on every profile.
+//
+// A worker cannot exit with no handle naming it, because `Exit` names the
+// thread through one. The word it exits through is the one root releases.
+
+import sos.{System, Process, Thread, SosStatus, ALL_RIGHTS,
+            sos_handle_release, sos_system_process_self,
+            sos_process_thread_self, sos_thread_exit, sos_thread_join}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static STATUS_OK: UInt = 0
+
+/// What a worker exits with, past its index.
+static CODE_BASE: UInt = 100
+
+/// More than a round can make: the thread slab refuses first.
+static MAX_WORKERS: Int = 16
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// The boot handle, parked by the initial thread for the workers. Handle 0
+/// names nothing, so a parked handle is never 0 and an unparked slot is never
+/// one.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+/// Each worker's own handle, as a word, by index; 0 until it publishes one.
+unsafe static var SELF_WORDS: [UInt; MAX_WORKERS] = [0; MAX_WORKERS]
+
+/// The workers' one stack. A worker runs from its first instruction to its
+/// exit without parking, and nothing preempts it here, so they never overlap.
+static STACK_WORDS: Int = 512
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func park_boot_handle(word: UInt) unsafe { BOOT_HANDLE = word }
+
+func parked_boot_handle() unsafe -> UInt { BOOT_HANDLE }
+
+/// Read worker `index`'s published word and clear it for the next round.
+func take_word(index: UInt) unsafe -> UInt {
+    let word = SELF_WORDS[index as Int]
+    SELF_WORDS[index as Int] = 0
+    word
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        worker(arg)
+    }
+}
+
+/// A worker: publish a handle onto itself and exit through it. Falling off
+/// `_start` faults the process, so a refusal here shows in the transcript.
+func worker(index: UInt) unsafe {
+    var pw: UInt = 0
+    if sos_system_process_self(parked_boot_handle(), ALL_RIGHTS as UInt,
+                               (&var pw) as UnsafePointer<UInt>) != STATUS_OK {
+        return
+    }
+    var tw: UInt = 0
+    let st = sos_process_thread_self(pw, (&var tw) as UnsafePointer<UInt>)
+    let _ = sos_handle_release(pw)
+    if st != STATUS_OK {
+        return
+    }
+    SELF_WORDS[index as Int] = tw
+    let _ = sos_thread_exit(tw, CODE_BASE + index)
+}
+
+/// Join the thread `word` names and answer its exit code.
+func join_word(word: UInt) unsafe -> Result<UInt, SosStatus> {
+    var code: UInt = 0
+    if sos_thread_join(word, (&var code) as UnsafePointer<UInt>) != STATUS_OK {
+        return BUG
+    }
+    return code
+}
+
+func initial(boot_handle: UInt) {
+    park_boot_handle(boot_handle)
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS threadslots: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let me = try proc.thread_self() catch {
+        let _ = system.debug_print("SOS threadslots: no thread handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let first = try round(&proc, &me) catch {
+        print("SOS threadslots: the first round failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let again = try round(&proc, &me) catch {
+        print("SOS threadslots: the second round failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS threadslots: first={} again={}\n", first, again)
+    if again != first {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS threadslots: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// Make, start and let go of threads until the slab refuses one, let them all
+/// run, then join and release each through its own word. Answers how many it
+/// made.
+func round(proc: &Process, me: &Thread) -> Result<UInt, SosStatus> {
+    var made: UInt = 0
+    var going = true
+    while going && (made as Int) < MAX_WORKERS {
+        match proc.thread_create(stack_top: stack_top(), arg: made) {
+            case Ok(t) -> {
+                try t.start()
+                // The thread's only name goes before it has run.
+                let _ = move t
+                made = made + 1
+            },
+            case Err(why) -> {
+                if why != SosStatus.NoResource {
+                    return why
+                }
+                going = false
+            },
+        }
+    }
+
+    // Root goes to the back of the ready queue, behind every worker, and each
+    // runs to its exit before root runs again.
+    try me.yield_now()
+
+    var i: UInt = 0
+    while i < made {
+        let word = take_word(i)
+        if word == 0 {
+            print("SOS threadslots: worker {} never ran\n", i)
+            return BUG
+        }
+        let code = try join_word(word)
+        let _ = sos_handle_release(word)
+        if code != CODE_BASE + i {
+            print("SOS threadslots: worker {} exited {}\n", i, code)
+            return BUG
+        }
+        i = i + 1
+    }
+    return made
+}

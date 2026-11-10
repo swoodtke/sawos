@@ -29,8 +29,9 @@
 //! Teardown does not force-free the counted kinds other processes may still
 //! reference (regions, IO windows, pipe connections, Events);
 //! `reap_unreferenced` frees what nobody names and disowns the rest (see the
-//! block above it). Waiters, Interrupts, Timers and Mappings are swept by
-//! owner.
+//! block above it). Threads are invalidated by owner and freed by count in
+//! `end_process`'s thread sweep. Waiters, Interrupts, Timers and Mappings are
+//! swept by owner.
 //!
 //! This file also holds delivery, readiness becoming a woken thread. The ledger
 //! and delivery are mutually recursive: a delivery drops a reference (one-shot
@@ -81,7 +82,8 @@ import kcore.limits.{MAX_IOMEMORIES, MAX_MEMORIES,
                      NO_PROCESS, NO_THREAD, PIPE_INFLIGHT}
 import kcore.diag.{ExitCode, fatal, fatal_kernel}
 import kcore.result.{op_ok, op_status, op_value, write_result}
-import kcore.threads.{THREADS, ThreadState, frame_slot, ready_push}
+import kcore.threads.{THREADS, ThreadState, frame_slot, free_thread_slot,
+                      ready_push}
 import kcore.pslot.{HandleEntry, PROCESS_RECORDS, QuotaKind}
 import kcore.objects.{
     EXCHANGES,
@@ -154,13 +156,11 @@ import kcore.process.{copy_in, copy_out, reclaim_process_record}
 /// attachment (through `ref_waitable`). Creation sites do not call it: a fresh
 /// slot is written with `refs: 1`, because its first reference is the count.
 ///
-/// Four kinds are not counted:
+/// Three kinds are not counted:
 ///
 ///   - `System` has no slab; it is the singleton every boot handle names.
 ///   - `Clock` is exempt: kernel-eternal and owned by nobody, so a release must
 ///     not take it away from everyone else.
-///   - `Thread`'s lifetime belongs to the join/exit protocol (see
-///     `ThreadSlot`), which a handle count cannot express.
 ///   - `Unbound` names nothing, so binding it never happens.
 public(package) func ref_object(kind: ObjType, slot: Int) unsafe {
     match kind {
@@ -187,9 +187,9 @@ public(package) func ref_object(kind: ObjType, slot: Int) unsafe {
         case PipeRequest -> {
             EXCHANGES[slot].request_refs = EXCHANGES[slot].request_refs + 1
         },
+        case Thread -> { THREADS[slot].refs = THREADS[slot].refs + 1 },
         case System -> {},
         case Clock -> {},
-        case Thread -> {},
         case Unbound -> {},
     }
 }
@@ -223,7 +223,9 @@ func pipe_frees_now(slot: Int) unsafe -> Bool {
 /// The zero test before the subtraction is not defensive: a teardown zeroes the
 /// slots a process owned, so a later decrement from another process's close-all
 /// can arrive at a slot whose count is already gone. Nothing is taken then, and
-/// nothing reached zero.
+/// nothing reached zero. The Thread arm is the exception: a thread slot is only
+/// ever freed at zero, never zeroed under its namers, so a decrement at zero
+/// there is an undercount, and it stops the machine.
 func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
     match kind {
         case Event -> {
@@ -371,9 +373,16 @@ func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
             PROCESS_RECORDS[slot].refs = PROCESS_RECORDS[slot].refs - 1
             PROCESS_RECORDS[slot].refs == 0
         },
+        case Thread -> {
+            if THREADS[slot].refs == 0 {
+                fatal_kernel("a thread reference was dropped twice",
+                             slot as UInt)
+            }
+            THREADS[slot].refs = THREADS[slot].refs - 1
+            THREADS[slot].refs == 0
+        },
         case System -> false,
         case Clock -> false,
-        case Thread -> false,
         case Unbound -> false,
     }
 }
@@ -429,7 +438,9 @@ public(package) func unref_object(kind: ObjType, slot: Int) unsafe {
 /// A Process whose count reaches zero here is not freed either. A `Gone` record
 /// whose last reference this was (a handle in the close-all, or an attachment
 /// in the attachment sweep) is reclaimed by the process scan at the end of
-/// `reap_unreferenced`.
+/// `reap_unreferenced`. A Thread whose count reaches zero here is freed by
+/// `end_process`'s thread sweep, whichever process it belongs to, once it has
+/// exited or been invalidated.
 public(package) func unref_teardown(kind: ObjType, slot: Int) unsafe {
     let _ = drop_reference(kind, slot)
 }
@@ -491,8 +502,8 @@ func revoke_blocked(w: Int) unsafe {
 /// whoever was charged gets it back, whichever process dropped the last handle.
 /// A shared kind credits through `credit_shared`, which credits nobody when the
 /// charged process's death has disowned the object.
-/// `Mapping` and `Process` have no credit here, each for the reason given in
-/// its arm.
+/// `Mapping`, `Process` and `Thread` have no credit here, each for the reason
+/// given in its arm.
 public(package) func free_object(kind: ObjType, slot: Int) unsafe {
     match kind {
         case Event -> {
@@ -672,8 +683,26 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
             fatal_kernel("free_object on a kernel-eternal Clock", slot as UInt)
         },
         case Thread -> {
-            fatal_kernel("free_object on a Thread — the join protocol owns it",
-                         slot as UInt)
+            // A thread that has not exited is not freed by losing its last
+            // handle: its slot is what it runs in. It is freed by its process's
+            // teardown, which invalidates it and frees it there if nothing
+            // names it (spec §2.10). An `Exited` or `Invalid` slot has nothing
+            // left for anybody but a handle, so its last one frees it.
+            //
+            // An `Exited` slot still holds its charge, so a process's exited
+            // threads count against its Thread quota for as long as anything
+            // names them. The free gives the charge back to the owner, or to
+            // nobody once its death has disowned the slot (`credit_shared`).
+            // An `Invalid` slot's charge came back at the invalidation.
+            match THREADS[slot].state {
+                case Exited -> {
+                    let owner = THREADS[slot].process
+                    free_thread_slot(slot)
+                    credit_shared(owner, QuotaKind.Thread)
+                },
+                case Invalid -> { free_thread_slot(slot) },
+                case _ -> {},
+            }
         },
         case Unbound -> {
             fatal_kernel("free_object on a handle that names nothing",
@@ -707,11 +736,14 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
 // attachment alone, and a refund owed to it must not reach the record's next
 // occupant.
 //
-// The Thread, Waiter, Interrupt and Timer sweeps in `end_process` remain
-// because they feed the teardown report. Mapping's sweep is not a force-free
-// either: `mapping_rights()` withholds `Transfer`, so a Mapping handle cannot
-// outlive its owner's process, and its second arm (clearing the row of a
-// mapping whose target died) is not a free.
+// The Waiter, Interrupt and Timer sweeps in `end_process` remain because they
+// feed the teardown report. The Thread sweep is not a force-free: it
+// invalidates the dying process's threads that have not exited, frees what
+// nothing else names and disowns the rest, and frees any other process's
+// `Exited` or `Invalid` thread whose last name the close-all dropped. Mapping's
+// sweep is not a force-free either: `mapping_rights()` withholds `Transfer`,
+// so a Mapping handle cannot outlive its owner's process, and its second arm
+// (clearing the row of a mapping whose target died) is not a free.
 
 /// Reap every Event, Memory, IoMemory, exchange and Pipe connection that
 /// nothing names, and disown every one still charged to dying process `p`. It

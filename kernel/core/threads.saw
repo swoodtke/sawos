@@ -113,17 +113,22 @@ public(package) func frame_slot(index: Int) unsafe -> UInt {
     hal.phys_to_virt(THREADS.side_base(e) + (rest as UInt) * stride)
 }
 
-/// What a thread slot is doing (spec §8).
+/// What a thread slot is doing (spec §8, §2.10).
 ///
-/// `Exited` is a state a slot stays in rather than a transition to `Free`,
-/// because a join arriving after the exit must still find the exit code. The
-/// slot returns to the pool at process teardown and at no earlier moment:
-/// `end_process` holds the one loop that ever writes `Free`. A Thread carries
-/// no reference count (argued at `ThreadSlot` below), so `RELEASE_OP` destroys
-/// a Thread handle and never a thread; reaping a slot earlier would need a
-/// close op, which does not exist for any kind. Slots freed at teardown are
-/// handed to the next process, so stale-handle detection (§3) applies to Thread
-/// handles as to every other kind.
+/// `Created`, `Runnable`, `Running` and `Blocked` are a thread that has not
+/// exited: its slot is what it runs in, so losing its last handle does not
+/// free it. `Exited` is a state a slot stays in while a handle names it,
+/// because a join arriving after the exit must still find the exit code, even
+/// after the thread's process is `Gone`. `Invalid` is a thread whose process
+/// died before it exited: it never runs again, its slot keeps nothing for a
+/// join (every op on it answers `Revoked`), and it is held only for the
+/// handles that still name it.
+///
+/// An `Exited` or `Invalid` slot is freed when its count reaches zero: by
+/// `free_object` on a release, or by a teardown's thread sweep when the count
+/// is zero once the dying table is closed. Freed slots are handed to the next
+/// creation, so stale-handle detection (§3) applies to Thread handles as to
+/// every other kind.
 public(package) enum ThreadState: UInt8 {
     case Free = 0,
     case Created = 1,
@@ -131,6 +136,7 @@ public(package) enum ThreadState: UInt8 {
     case Running = 3,
     case Blocked = 4,
     case Exited = 5,
+    case Invalid = 6,
 }
 
 /// One thread (spec §2 table row).
@@ -141,21 +147,20 @@ public(package) enum ThreadState: UInt8 {
 /// stored plus one so that zero means "no thread", which is what a zeroed
 /// static already says.
 ///
-/// There is no `refs` field, on purpose. The join/exit protocol already owns a
-/// thread slot's lifetime on terms a handle count cannot express.
-/// `ThreadState.Exited` is a state a slot stays in so that a join arriving
-/// after the exit still finds the exit code (a reader that holds no handle and
-/// is not counted anywhere), and the joiner list is a second such claim on the
-/// slot. Folding those into a reference count raises questions (what is a
-/// joiner worth, what does a zero-reference `Exited` slot owe a join that has
-/// not arrived) with no payoff, since nothing runs out of thread slots before
-/// its process ends. The slot comes back at teardown, and the thread quota row
-/// is charged and only credited there.
+/// The slot is counted (`refs`), and the count is handle entries and staged
+/// messages: a joiner is not a reference. A joiner parks only on a thread that
+/// has not exited and is answered when the thread exits or is invalidated, and
+/// only an `Exited` or `Invalid` slot is ever freed, so no slot is freed with a
+/// joiner on it.
 public(package) struct ThreadSlot {
     /// `public(package)` because parking a thread happens outside this module:
     /// `waitables` blocks one on a Waiter's list. The state machine is
     /// described here and nowhere else.
     public(package) state: ThreadState,
+    /// The process the thread runs in and is charged to, or `NO_PROCESS` once
+    /// that process has died and disowned it (an `Exited` or `Invalid` slot
+    /// still named elsewhere, spec §2.10). Test for that before using it as an
+    /// index.
     public(package) process: Int,
     public(package) exit_code: UInt,
     /// Head of the list of threads blocked joining this one (slot + 1).
@@ -202,6 +207,9 @@ public(package) struct ThreadSlot {
     /// is what makes the later copy unable to fail.
     public(package) call_src: UInt,
     public(package) call_len: UInt,
+    /// Handle entries naming this thread, plus the staged messages that carry
+    /// it.
+    public(package) refs: UInt16,
 }
 
 /// The thread slab: an extent chain, with the frame arena riding the extent
@@ -210,7 +218,7 @@ public(package) unsafe static var THREADS: Slab<ThreadSlot, MAX_THREADS> = Slab<
     inline: [ThreadSlot(state: ThreadState.Free, process: 0,
                         exit_code: 0, joiners: 0, link: 0, wait_buf: 0,
                         call_pipe: 0, call_claim: 0, call_src: 0,
-                        call_len: 0); MAX_THREADS],
+                        call_len: 0, refs: 0); MAX_THREADS],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
     ext_side: [0; MAX_SLAB_EXTENTS],
@@ -346,6 +354,14 @@ public(package) func alloc_thread() unsafe -> Int {
 // Thread lifecycle
 // -----------------------------------------------------------------------------
 
+/// Give thread slot `t` back to the pool. The caller has established that
+/// nothing runs in it and nothing names it.
+public(package) func free_thread_slot(t: Int) unsafe {
+    THREADS[t] = ThreadSlot(state: ThreadState.Free, process: 0, exit_code: 0,
+                            joiners: 0, link: 0, wait_buf: 0, call_pipe: 0,
+                            call_claim: 0, call_src: 0, call_len: 0, refs: 0)
+}
+
 /// How many of a process's threads have not exited.
 public(package) func live_threads(p: Int) unsafe -> Int {
     var live: Int = 0
@@ -355,12 +371,47 @@ public(package) func live_threads(p: Int) unsafe -> Int {
             match THREADS[i].state {
                 case Free -> {},
                 case Exited -> {},
+                case Invalid -> {},
                 case _ -> { live = live + 1 },
             }
         }
         i = i + 1
     }
     live
+}
+
+/// Take every thread of process `p` off every joiner list, leaving the other
+/// joiners where they were.
+///
+/// The teardown calls this before it invalidates `p`'s threads, so that the
+/// wake an invalidation gives its joiners reaches only other processes'
+/// threads, and so that no thread `p` leaves behind names one of its threads.
+/// A walk of each list with a trailing pointer, as `ready_remove_process` does:
+/// a thread is on at most one list, so the whole pass visits each slot at most
+/// twice, as a list head and as a node.
+public(package) func unjoin_process(p: Int) unsafe {
+    var t: Int = 0
+    while t < THREADS.capacity() {
+        // Slot + 1 throughout, matching the list's own encoding.
+        var prev: Int = 0
+        var cur = THREADS[t].joiners
+        while cur != 0 {
+            let slot = cur - 1
+            let next = THREADS[slot].link
+            if THREADS[slot].process == p {
+                if prev == 0 {
+                    THREADS[t].joiners = next
+                } else {
+                    THREADS[prev - 1].link = next
+                }
+                THREADS[slot].link = 0
+            } else {
+                prev = cur
+            }
+            cur = next
+        }
+        t = t + 1
+    }
 }
 
 /// Park the running thread on `target`'s joiner list.

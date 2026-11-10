@@ -44,7 +44,7 @@ The kernel's object kinds, each a slab-allocated kernel struct:
 | `Timer` | Deadline object bound to the Clock that created it; directly waitable. The process-sleep primitive. §2.6. |
 | `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it and ack through the handle. One op (`Ack`), two rights (`InterruptRight.Wait`/`.Ack`), created by `SystemOp.InterruptBind` on `SystemRight.InterruptBind`, because a line is a machine-wide resource (§2.8). The binding is the object's existence (creation takes the line, there is no rebind), which stops one handle naming two devices over its life. It has one name, its handle, and releasing that handle destroys it (§2.10). A line the board does not have, the timer's line, and a line already bound are all faults. Not yet enforced: binding is `ProcessOp.InterruptBind` on `ProcessRight.InterruptBind`, and the default set carries `Mint`. §9. |
 | `Waiter` | Generic wait aggregator (epoll/Port-style). Ops `Add`/`Remove`/`Wait`; rights `WaiterRight.Attach`/`.Wait`; the wait answer is a copy-out record. §2.2. |
-| `Process` | Two entries: a small record (the state, the status word, the quota ledger, the references naming it) that outlives the process, and a body (AddressSpace + handle table + threads) that the teardown frees. Handles name the record. No kernel Job or hierarchy. The kernel guarantees teardown on exit or fault — invalidating the objects bound to it, releasing every handle it holds, clearing its domain and freeing its body (§2.10; the invalidation is not yet enforced for the bound kinds). Supervision (restart, kill-trees, launchd-style) is a userspace concern. §2.7, §8, §12. |
+| `Process` | Two entries: a small record (the state, the status word, the quota ledger, the references naming it) that outlives the process, and a body (AddressSpace + handle table + threads) that the teardown frees. Handles name the record. No kernel Job or hierarchy. The kernel guarantees teardown on exit or fault — invalidating the objects bound to it, releasing every handle it holds, clearing its domain and freeing its body (§2.10; the invalidation is not yet enforced for the bound kinds other than Thread). Supervision (restart, kill-trees, launchd-style) is a userspace concern. §2.7, §8, §12. |
 | `System` | Kernel singleton: the object behind system-scoped primitives, so that every syscall is an object op (§5.7). §2.8. |
 
 The kinds are System, Process, Thread, Event, Waiter, Interrupt, Clock, Timer,
@@ -59,7 +59,7 @@ obligation to send it — with "Pipe" the collective name.
 slot carries the number of references naming it, and reaching zero frees the
 slot synchronously, inside the syscall that dropped the last reference. The
 column is enumerated per kind, so that a new kind fails to compile until
-somebody says what references it (Thread's row is not yet enforced):
+somebody says what references it:
 
 | kind | counted references |
 |---|---|
@@ -74,7 +74,7 @@ somebody says what references it (Thread's row is not yet enforced):
 | PipeOutlet | handle entries + its attachment — the same row's outlet column, mirrored. The two arms of `free_object` are one act written twice, because reaching it through either kind means both columns are already zero |
 | PipeReply | handle entries + its attachment, on one ring slot's claim column. A delivery of this kind drops that attachment's reference — a claim is a one-shot, so its delivery is inherently consuming — which is the one place in the ledger where answering a wait is what frees an object. A one-shot exists for exactly as long as one in-flight message, so the pair is ring-slot state rather than a third slab: the object is an exchange (`connection * PIPE_INFLIGHT + ring slot`) and the claim counts on its reply column. The ring slot goes back when both of the exchange's columns are zero and nothing is owed — a staged message is still owed to a live outlet whatever became of its claim, which is §2.1's TELL idiom |
 | PipeRequest | handle entries + its attachment — the same exchange's obligation column, mirrored. Reaching zero on one column is the abandonment transition, read off the counts by `reply` and `resolve` exactly as the connection's peer-gone is; and the connection cannot free while any exchange in it is live, which keeps a claim from being handed a recycled row |
-| Thread | handle entries. A thread that has not exited is never freed by losing its last handle, as a live process is not: its slot is what it runs in, and a thread whose count reached zero while it ran is freed when it exits or is invalidated. A thread that exited normally is not invalid: it is `Exited`, its slot keeps the exit code a late `Join` reads through any handle, even after its process is `Gone`, and it is freed when the count reaches zero. Only a thread that has not exited when its process dies is invalidated, so its `Join` answers `Revoked` and its slot keeps nothing for one (§2.10). Not yet enforced: thread slots are not counted, and the join/exit protocol holds a slot until its process's teardown, which frees every thread slot of the process whatever names it |
+| Thread | handle entries. A thread that has not exited is never freed by losing its last handle, as a live process is not: its slot is what it runs in, so a thread frees once it has exited or been invalidated and nothing names it. A thread that exited normally is not invalid: it is `Exited`, its slot keeps the exit code a late `Join` reads through any handle, even after its process is `Gone`, and it is freed when the count reaches zero. Only a thread that has not exited when its process dies is invalidated, so its `Join` answers `Revoked` and its slot keeps nothing for one (§2.10) |
 | Clock | exempt — kernel-eternal, owned by nobody (§2.6). Freeing a domain's slot on a release would take the machine's counter from everybody else |
 | System | no slab: the singleton every System handle names |
 
@@ -101,7 +101,7 @@ reprograms the comparator, and a Waiter detaches its list — which may take a
 waitable to zero in turn, a cascade that terminates because an attachment
 references the waitable and never the Waiter that holds it. A Waiter's
 destruction also wakes its parked threads (§2.2). Not yet enforced: only a free
-runs them, since neither invalidation of the bound kinds nor an Interrupt's
+runs them, since neither invalidation of a Timer or Waiter nor an Interrupt's
 destruction by the release of its handle while attached is built. Delivery and
 the ledger are mutually recursive — a delivery can drop a counted reference (a
 one-shot attachment detaches at its copy-out) and a dropped reference can
@@ -407,11 +407,11 @@ holding a number. The kinds a message may carry are the givable ones the
 receiving vocabulary can name: `Memory`, `IoMemory`, `PipeInlet`, `PipeOutlet`,
 `PipeReply`, `PipeRequest`, `Event`, `Thread`, `Waiter`, `Timer` and `Interrupt`
 — every kind a boot record can carry but two (`msg_kind_of` is `boot_kind_of`
-less those two). Not yet enforced for the last four: their default sets withhold
-`Transfer`, no boot record kind names them (§3), and the typed tier has neither
-`PipeHandle` cases nor `decode_handle` arms for them, nor the `Process.give`
-overloads (`thread:`, `waiter:`, `timer:`, `interrupt:`) or the `BootHandle`
-accessors that would carry them through a give. `Process` and
+less those two). Not yet enforced for the last three: their default sets
+withhold `Transfer`, no boot record kind names them (§3), and the typed tier has
+neither `PipeHandle` cases nor `decode_handle` arms for them, nor the
+`Process.give` overloads (`waiter:`, `timer:`, `interrupt:`) or the
+`BootHandle` accessors that would carry them through a give. `Process` and
 `System` are refused at the sender, as a scope line rather than a rule: both
 wrappers live above `sos.pipe` in the module order, so admitting them is a
 sysapi module split and a named follow-up (§11).
@@ -566,13 +566,14 @@ a reply delivery carries, which is why there is one type and not two — and
   directions), a connection endpoint reaching zero references (§2.1), any object
   invalidated under a parked thread (`Revoked`, §2.10), and an attachment on a
   waitable that becomes invalid, which fires (§2.10); the last two are not yet
-  enforced for the bound kinds or the Interrupt. Terminal levels follow the
-  Process precedent (§8): attaching after the fact still wakes, and nothing
-  un-closes. The deadlock predicate has no arm for revocation: the wake is
-  synchronous inside the act that destroyed the Waiter (the syscall that dropped
-  the last reference, or the owner's teardown), so there is no idle-and-doomed
-  state for it to see. The typed surface needs nothing new, since `Waiter.wait`
-  already answers `Result<WaitResult, SosStatus>`.
+  enforced for the bound kinds other than Thread, or for the Interrupt.
+  Terminal levels follow the Process precedent (§8): attaching after the fact
+  still wakes, and nothing un-closes. The deadlock predicate has no arm for
+  revocation: the wake is synchronous inside the act that destroyed the Waiter
+  (the syscall that dropped the last reference, or the owner's teardown), so
+  there is no idle-and-doomed state for it to see. The typed surface needs
+  nothing new, since `Waiter.wait` already answers `Result<WaitResult,
+  SosStatus>`.
 - **Copy-out is checked, and it is one door.** The destination must be
   word-aligned and inside the process's writable grant; one that is not
   terminates the process (§5.7's faults ruling — a process linked its own
@@ -1119,7 +1120,7 @@ three groups:
   caller error (a bad entry, stack or mode) faults the caller. Not yet
   enforced: the handles are minted into the named process's table, so through
   another process's handle the caller is handed words relative to that table;
-  Thread and Waiter handles cannot yet be given; and a bad entry or
+  Waiter handles cannot yet be given; and a bad entry or
   stack in `ThreadCreate` (`BadEntry`) or a bad mode in `EventCreate`
   (`BadArg`) faults the named process. `ProcessOp.InterruptBind` does the same
   while it exists: it mints into the named process's table and faults that
@@ -1474,13 +1475,14 @@ an `Interrupt` column, charged at the bind.
   which is the state the pre-flight makes unrepresentable. Creator-pays decides
   who pays for an object; a message only ever moves who pays for a name.
 - **Refunds follow the lifecycle (§2.10).** A bound kind's charge comes back
-  when the object is invalidated, and a shared kind's when it is freed. A dying
-  process's ledger is cleared at the end of its teardown, and a shared object
-  that outlives the process it is charged to is disowned there: it is charged to
-  nobody from then on, and its free credits nobody, so a refund never reaches
-  the record's next occupant. The books balance and the machine stays bounded
-  because quota <= wall: an object that outlives its charge still occupies the
-  slab slot it was charged for.
+  when the object is invalidated (an exited Thread's when its slot is freed),
+  and a shared kind's when it is freed. A dying process's ledger is cleared at
+  the end of its teardown, and a shared object that outlives the process it is
+  charged to is disowned there: it is charged to nobody from then on, and its
+  free credits nobody, so a refund never reaches the record's next occupant.
+  The books balance and the machine stays bounded because quota <= wall: an
+  object that outlives its charge still occupies the slab slot it was charged
+  for.
 - Quotas count objects, not bytes, in v1; bytes are the pool's ledger (§2.5).
 
 ### 2.10 Object lifecycle
@@ -1525,14 +1527,14 @@ attachment detaches at that delivery as usual. Nothing un-invalidates, so the
 level is terminal, as a death is: a persistent attachment keeps reporting it
 until it is removed (by key, with `Waiter.remove`). What the holder learns from
 it comes at its next op on the object, which answers `Revoked`; an Interrupt is
-the exception, below. Not yet enforced: invalidation of the bound kinds and of
-an Interrupt is not built. A Timer, the one bound kind that is waitable, can
-today be attached only by its owner's own Waiters, because neither handle
-carries `Transfer` and the creation ops mint into the named process's table. The
-teardown frees those attachments with the Waiters (`end_process`'s attachment
-sweep) and then frees the Timer without notifying anybody (its timer sweep). An
-attached Interrupt whose handle is released stays bound, since the attachment's
-reference keeps it live.
+the exception, below. Not yet enforced: invalidation of the bound kinds other
+than Thread, and of an Interrupt, is not built. A Timer, the one bound kind
+that is waitable, can today be attached only by its owner's own Waiters,
+because neither handle carries `Transfer` and the creation ops mint into the
+named process's table. The teardown frees those attachments with the Waiters
+(`end_process`'s attachment sweep) and then frees the Timer without notifying
+anybody (its timer sweep). An attached Interrupt whose handle is released stays
+bound, since the attachment's reference keeps it live.
 
 **An invalid Interrupt's record carries no line.** Its attachment fires as any
 invalidated waitable's does, but the payload is the board's no-line value,
@@ -1549,7 +1551,7 @@ payload is the slot's stored line whatever the object's state
 
 | kind | lifetime |
 |---|---|
-| Thread, Timer, Waiter, Mapping | **Bound** to the process that owns it: invalidated when that process dies, freed when the last handle goes. A Mapping's owner is the process whose domain holds its row (the target of its `map`), not the process holding its handle. A Thread that exited before its process died is not invalidated: `Exited` wins, and a late `Join` through any handle reads its exit code from the slot, even after the process is `Gone`, the slot being held while a handle names it. A Thread that has not exited when its process dies is invalid, so `Join` answers `Revoked` and the slot keeps nothing for it. A Thread whose count reached zero while it ran is freed when it exits or is invalidated |
+| Thread, Timer, Waiter, Mapping | **Bound** to the process that owns it: invalidated when that process dies, freed when the last handle goes. A Mapping's owner is the process whose domain holds its row (the target of its `map`), not the process holding its handle. A Thread that exited before its process died is not invalidated: `Exited` wins, and a late `Join` through any handle reads its exit code from the slot, even after the process is `Gone`, the slot being held while a handle names it. A Thread that has not exited when its process dies is invalid, so `Join` answers `Revoked` and the slot keeps nothing for it. A Thread frees once it has exited or been invalidated and nothing names it |
 | Interrupt | **One name, its handle.** No `Mint` in its default set, and attenuation is monotonic, so no handle can regain it (§3). Releasing the handle, explicitly or by its holder's teardown, destroys the Interrupt: it unbinds and masks the line. A give or a staged message moves the one name and is not a release. An attachment does not extend its life; it holds the invalid Interrupt until it is removed, and fires as an invalidated waitable does. A consuming attach of an Interrupt is refused as a caller error (`BadArg`, §2.2), so the driver keeps the one handle it acks with. Charged to no quota (§2.9) |
 | Event, Pipe, Memory, IoMemory | **Shared:** live until the last handle goes, whatever happens to the process charged for them |
 | Process | `Gone` is its invalid state (§8), and a `Gone` process is a record with no body. `GetStatus` and an attachment read the status word the record keeps, and `Stats` reads the final trap counters the teardown copied into it (§2.7). `Start` and `Give` naming a `Gone` child stay `BadState` faults, because a `Gone` child was always started and its launcher knows (§2.7). Every other op that acts on the process answers `Revoked`, a `map` naming it as the target included: the mapper did not cause the death. The teardown frees the body; the record is reclaimed when it is `Gone` and its count is zero (§2.7) |
@@ -1604,12 +1606,13 @@ teardown's owner sweeps would match them, a free would refund it a charge
 already written off, and a husk's check of its target would read a stranger's
 state. A disowned object's free credits nobody, whatever its kind; an object
 freed before its disown credits the dying ledger as any free does, and the
-teardown clears that ledger. Not yet enforced: only the shared kinds are
-disowned (a Memory, an IoMemory, a connection or an Event still charged to the
-dying process), and only the shared kinds' frees test for no owner; the
-teardown frees the process's Threads, Waiters, Interrupts and Timers instead
-(below), so none of them survives it. The rest arrives with the invalidation of
-the bound kinds and the teardown order above.
+teardown clears that ledger. Not yet enforced: only the shared kinds and
+Threads are disowned (a Memory, an IoMemory, a connection or an Event still
+charged to the dying process, and an `Exited` or invalid Thread), and only the
+shared kinds' frees test for no owner, a Thread's free crediting nothing; the
+teardown frees the process's Waiters, Interrupts and Timers instead (below), so
+none of them survives it. The rest arrives with the invalidation of the other
+bound kinds and the teardown order above.
 
 The teardown reports itself on one console line, `SOS: process teardown`, and
 the harness asserts the line. Its fields today (`handles=`, `threads=`,
@@ -1620,7 +1623,14 @@ those nothing named once its handles and attachments were gone. It does not
 count an Event freed earlier, inside the close-all (one staged on a connection
 whose last outlet the close-all released, say), nor one freed later by the
 reap's exchange scan, nor one still named elsewhere, which survives disowned.
-The other fields follow the owner sweeps, so they change with the teardown:
+`threads=` counts the dying process's own threads the thread sweep freed,
+invalidated or `Exited`, which are those nothing named once its handles were
+gone. It does not count an `Exited` thread of its own freed earlier, inside the
+close-all (one only a staged message named, released when the close-all
+dropped the connection's last outlet, say), nor one still named elsewhere,
+which survives disowned, nor another process's thread whose last name the
+close-all dropped. The
+other fields follow the owner sweeps, so they change with the teardown:
 under the order above no owner sweep reaches an Interrupt, and the Mappings
 that are swept have no field.
 
@@ -1629,7 +1639,10 @@ that are swept have no field.
 - **A bound kind's charge is refunded at invalidation.** Its owner is then
   either live or mid-teardown with its ledger about to be cleared, so a refund
   can never land on a reused process record, and the invalid object is
-  disowned at the teardown (above).
+  disowned at the teardown (above). A thread that exits is never invalidated,
+  so its charge comes back when its `Exited` slot is freed, and its process's
+  Thread quota bounds the slots it holds, exited ones included. A slot freed
+  after its owner's death has disowned it credits nobody.
 - **A shared kind can outlive the process charged for it**, so that process's
   death disowns it (above). The teardown first frees the shared objects nothing
   else names, which credits the dying ledger as any free does; one freed after
@@ -1642,28 +1655,27 @@ that are swept have no field.
 
 Not yet enforced:
 
-- Thread slots are not counted (§2's table).
 - The teardown releases the handle table first, counting without freeing, and
-  then frees the dying process's Threads, Waiters, Interrupts and Timers by
-  owner, frees the Mappings it made, and frees the Event, Memory, IoMemory,
-  exchanges and connections nothing names any more, disowning the rest it was
-  charged for; that reap ends with a process scan, which reclaims every
-  `Gone` process record whose last reference the teardown dropped. An
-  Interrupt is therefore freed by its owner's death, and a Thread, Waiter or
-  Timer is freed rather than left invalid, an `Exited` Thread included, which is
-  sound only while every handle naming it is in the dying table. A Mapping that
-  targets the dying process already has the invalid shape — its slot kept, its
-  row cleared, its handles in other tables — though its ops answer `BadState`
-  today (next item).
-- Ops on an invalid object do not answer `Revoked`. `Unmap` and `Base` on a
-  Mapping whose target died are `BadState` faults (§2.5), and so is a `map`
-  naming a `Gone` target. The creation ops through a `Gone` process's handle
-  answer `QuotaExceeded` when their arguments are well formed, its ledger
-  having been cleared, and `ThreadCreate` answers it whatever its entry and
-  stack, since no region is left to check them against; a bad mode or line
-  faults the `Gone` process again, which reruns the teardown (with no body left
-  to free), overwrites its status word and strands the caller. `MINT_OP` mints
-  onto an invalid object as onto a live one.
+  then invalidates the dying process's Threads that have not exited, frees its
+  Waiters, Interrupts and Timers by owner, frees the Mappings it made, and
+  frees the Event, Memory, IoMemory, exchanges and connections nothing names
+  any more, disowning the rest it was charged for; that reap ends with a
+  process scan, which reclaims every `Gone` process record whose last
+  reference the teardown dropped. An Interrupt is therefore freed by its
+  owner's death, and a Waiter or Timer is freed rather than left invalid,
+  which is sound only while every handle naming it is in the dying table. A
+  Mapping that targets the dying process already has the invalid shape — its
+  slot kept, its row cleared, its handles in other tables — though its ops
+  answer `BadState` today (next item).
+- Ops on an invalid object other than a Thread do not answer `Revoked`.
+  `Unmap` and `Base` on a Mapping whose target died are `BadState` faults
+  (§2.5), and so is a `map` naming a `Gone` target. The creation ops through a
+  `Gone` process's handle answer `QuotaExceeded` when their arguments are well
+  formed, its ledger having been cleared, and `ThreadCreate` answers it
+  whatever its entry and stack, since no region is left to check them against;
+  a bad mode or line faults the `Gone` process again, which reruns the teardown
+  (with no body left to free), overwrites its status word and strands the
+  caller. `MINT_OP` mints onto an invalid object as onto a live one.
 - An Interrupt carries `Mint`, is charged an `Interrupt` quota row, can be
   consumed into an attachment (`Waiter.give(interrupt:)`), and stays bound
   while an attachment holds it after its handle is released.
@@ -1742,9 +1754,8 @@ Not yet enforced:
   it on (§2.7), and an Interrupt carries it so that a launcher can hand a
   driver its line (§2.8). Each givable kind has a boot record kind
   (`BootHandleKind`), which is what lets `give` deliver it and a message carry
-  it (§2.1). Not yet enforced for Thread, Waiter, Timer and Interrupt: their
-  default sets withhold `Transfer`, and `BootHandleKind` has no case for any of
-  them.
+  it (§2.1). Not yet enforced for Waiter, Timer and Interrupt: their default
+  sets withhold `Transfer`, and `BootHandleKind` has no case for any of them.
 - **The invariant is no amplification: no sequence of asks yields authority
   the asker did not already have.** A handle is a unique entry, which is the
   `NoCopy` correspondence §4 builds on — but uniqueness is the mechanism, and
@@ -3109,12 +3120,12 @@ loader parses and reports while no process stores either.
   table, and a caller error in `ThreadCreate`, `EventCreate` or
   `ProcessOp.InterruptBind` through another process's handle faults the named
   process; `ThreadSelf` and `BootHandleNext` are not yet self-only (§2.7).
-- The object lifecycle is not yet enforced as §2.10 states it: Thread slots
-  are not counted; the teardown's close-all releases every handle but counts
-  without freeing, and the owner sweeps after it free the dying process's
-  objects outright instead of invalidating the bound kinds first and leaving
-  the shared ones to their counts; and an op on an invalid Mapping or a
-  `Gone` Process does not answer `Revoked`.
+- The object lifecycle is not yet enforced as §2.10 states it: the
+  teardown's close-all releases every handle but counts without freeing, and
+  the owner sweeps after it free the dying process's Waiters, Interrupts and
+  Timers outright instead of invalidating the bound kinds first and leaving the
+  shared ones to their counts; and an op on an invalid Mapping or a `Gone`
+  Process does not answer `Revoked`.
 - Binding an interrupt line is not yet a System op: it is
   `ProcessOp.InterruptBind` on `ProcessRight.InterruptBind`, charged to an
   `Interrupt` quota row, minting into the named process's table and faulting
@@ -3123,8 +3134,8 @@ loader parses and reports while no process stores either.
   Interrupt can be consumed into an attachment, an attachment keeps it bound
   after its handle is released, and an attached Interrupt's record carries its
   line whatever its state (§2.8, §2.10, §3).
-- Thread, Waiter and Timer handles cannot yet be given: their default sets
-  withhold `Transfer` and no boot record kind names them (§3).
+- Waiter and Timer handles cannot yet be given: their default sets withhold
+  `Transfer` and no boot record kind names them (§3).
 - `sosrt`'s bump arena takes no lock, so under a kernel that preempts (today
   only the preemption harness; §7) two threads of one process allocating at once
   can race (§5c).

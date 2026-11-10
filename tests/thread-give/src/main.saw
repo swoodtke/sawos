@@ -1,0 +1,409 @@
+// A Thread handle crosses a process boundary, and outlives the process its
+// thread ran in (spec §3, §2.10).
+//
+// Expected transcript, read as an order:
+//
+//   SOS threadgive: capacity before=7
+//   SOS threadgive: started
+//   SOS threadgive: the child joined the given thread: 33
+//   SOS: process exit: code=46 process=1
+//   SOS: process teardown ... threads=1 ... process=1
+//   SOS threadgive: the parked join answered: <Revoked>
+//   SOS threadgive: the child is gone
+//   SOS threadgive: the late join reads 82
+//   SOS threadgive: the held join answered: <Revoked>
+//   SOS threadgive: starting the invalid thread answered: <Revoked>
+//   SOS threadgive: capacity after=7
+//   SOS threadgive: done
+//
+// Root makes a thread that exits with `CODE_GIVEN` and gives its handle to a
+// child (`child-thread`, the sender) at boot. The child joins it through that
+// handle and reports the code in the first byte of a message, which proves a
+// Thread given at boot is usable.
+//
+// The message carries two of the child's own threads: one that has exited
+// with `CODE_EXITED`, and one parked in a join that never ends. Root takes
+// them, which proves a Thread carried in a message is usable, then drops the
+// message's request, which lets the child end itself, and joins the parked
+// thread. That join parks root, and the child's death wakes it with `Revoked`:
+// the thread it waited for was invalidated. Once the child is gone, a join of
+// the exited thread still reads its code (`Exited` wins), and a second join of
+// the invalid one, and a start of it, answer `Revoked` at once.
+//
+// The capacity rounds show what is freed. A round makes threads until the slab
+// refuses one, lets them all exit through handles onto themselves, and
+// releases those (`tests/thread-slots`), so it leaves nothing behind and its
+// count is the free thread slots. `after` equals `before` only if every thread
+// of the case was freed:
+//
+//   - the given thread, which exits through a handle onto itself that root
+//     releases, so the child's handle is its last name: the child dies holding
+//     it, and its teardown frees another process's exited thread;
+//   - the child's two workers, freed when root releases their handles, one
+//     `Exited` and one invalid;
+//   - the child's main thread, freed by its teardown.
+//
+// The child's teardown line counts one thread: its main thread, freed because
+// nothing else named it. The two it sent survive, named by root's handles.
+
+import sos.{System, Process, Memory, Thread, PipeInlet, PipeOutlet, PipeMsg,
+            SystemRight, SosStatus, ALL_RIGHTS, sos_handle_release,
+            sos_system_process_self, sos_process_thread_self,
+            sos_thread_exit, sos_thread_join}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static STATUS_OK: UInt = 0
+
+/// Root's config: the tags the child's boot records travel under.
+static TAG_BOOT: UInt = 7
+static TAG_OUTBOX: UInt = 33
+static TAG_JOIN: UInt = 36
+
+/// The keys root's attachments live under.
+static KEY_MSG: UInt = 81
+static KEY_CHILD: UInt = 82
+
+/// The given thread's argument; a round's workers take their index.
+static ROLE_GIVEN: UInt = 1000
+
+/// What root's given thread exits with, and what the child's exiting worker
+/// exits with.
+static CODE_GIVEN: UInt = 33
+static CODE_EXITED: UInt = 82
+
+/// What a round's worker exits with, past its index.
+static CODE_BASE: UInt = 100
+
+/// More than a round can make: the thread slab refuses first.
+static MAX_WORKERS: Int = 16
+
+/// The child's exit code once both threads were taken, and the kind half of a
+/// §8 status word for a process that exited.
+static CHILD_SENT: UInt = 46
+static EXITED: UInt = 1 << 16
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// The boot handle, parked by the initial thread for the others. Handle 0
+/// names nothing, so a parked handle is never 0 and an unparked slot is never
+/// one.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+/// The given thread's handle onto itself, as a word.
+unsafe static var GIVEN_WORD: UInt = 0
+
+/// Each round worker's own handle, as a word, by index.
+unsafe static var SELF_WORDS: [UInt; MAX_WORKERS] = [0; MAX_WORKERS]
+
+/// The given thread's stack, and the round workers' one stack: a round worker
+/// runs from its first instruction to its exit without parking, and nothing
+/// preempts it here, so they never overlap.
+static STACK_WORDS: Int = 512
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var ROUND_STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+func stack_top_of(base: UInt) -> UInt {
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func stack_top() unsafe -> UInt {
+    stack_top_of(((&var STACK) as UnsafePointer<UInt64>) as UInt)
+}
+
+func round_stack_top() unsafe -> UInt {
+    stack_top_of(((&var ROUND_STACK) as UnsafePointer<UInt64>) as UInt)
+}
+
+func park_boot_handle(word: UInt) unsafe { BOOT_HANDLE = word }
+
+func parked_boot_handle() unsafe -> UInt { BOOT_HANDLE }
+
+func given_word() unsafe -> UInt { GIVEN_WORD }
+
+/// A handle onto the calling thread, as a word, or 0 if it could not be made.
+func self_word() unsafe -> UInt {
+    var pw: UInt = 0
+    if sos_system_process_self(parked_boot_handle(), ALL_RIGHTS as UInt,
+                               (&var pw) as UnsafePointer<UInt>) != STATUS_OK {
+        return 0
+    }
+    var tw: UInt = 0
+    let st = sos_process_thread_self(pw, (&var tw) as UnsafePointer<UInt>)
+    let _ = sos_handle_release(pw)
+    if st != STATUS_OK {
+        return 0
+    }
+    tw
+}
+
+/// Read round worker `index`'s published word and clear it.
+func take_word(index: UInt) unsafe -> UInt {
+    let word = SELF_WORDS[index as Int]
+    SELF_WORDS[index as Int] = 0
+    word
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else if arg == ROLE_GIVEN {
+        given_thread()
+    } else {
+        round_worker(arg)
+    }
+}
+
+/// The thread root gives away. It exits at once, through a handle onto itself
+/// that root releases afterwards.
+func given_thread() unsafe {
+    let word = self_word()
+    if word == 0 {
+        return
+    }
+    GIVEN_WORD = word
+    let _ = sos_thread_exit(word, CODE_GIVEN)
+}
+
+/// A round worker: publish a handle onto itself and exit through it.
+func round_worker(index: UInt) unsafe {
+    let word = self_word()
+    if word == 0 {
+        return
+    }
+    SELF_WORDS[index as Int] = word
+    let _ = sos_thread_exit(word, CODE_BASE + index)
+}
+
+func initial(boot_handle: UInt) {
+    park_boot_handle(boot_handle)
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS threadgive: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let me = try proc.thread_self() catch {
+        let _ = system.debug_print("SOS threadgive: no thread handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let before = try round(&proc, &me) catch {
+        print("SOS threadgive: the first round failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS threadgive: capacity before={}\n", before)
+    try run(&system, &proc) catch {
+        print("SOS threadgive: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let after = try round(&proc, &me) catch {
+        print("SOS threadgive: the second round failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS threadgive: capacity after={}\n", after)
+    if after != before {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS threadgive: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    let given = try proc.thread_create(stack_top: stack_top(), arg: ROLE_GIVEN)
+    try given.start()
+
+    let child = try system.process_create(image: &image, memory: &ram)
+    let waiter = try proc.waiter_create()
+    let outbox = try proc.pipe_create()
+    let (outbox_in, outbox_out) = move outbox
+    try waiter.add(outlet: &outbox_out, key: KEY_MSG)
+    try waiter.add(process: &child, key: KEY_CHILD)
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(thread: move given, tag: TAG_JOIN) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(inlet: move outbox_in, tag: TAG_OUTBOX) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    let _ = system.debug_print("SOS threadgive: started\n")
+
+    let woke = try waiter.wait()
+    if woke.key != KEY_MSG {
+        return BUG
+    }
+    // The given thread ran and exited while root was parked, ahead of the
+    // child on the ready queue. Its handle onto itself goes, which leaves the
+    // child's handle its last name.
+    if not release_given() {
+        return BUG
+    }
+    // The child's death raises the outlet's peer-gone level too; only the
+    // death is waited for from here.
+    try waiter.remove(KEY_MSG)
+    let got = try outbox_out.take()
+    let (arrived, request) = move got
+    var msg = move arrived
+    print("SOS threadgive: the child joined the given thread: {}\n", msg.bytes[0])
+    let exited = try thread_in(&var msg, 0)
+    let parked = try thread_in(&var msg, 1)
+
+    // The child waits on its claim until this request goes, then ends itself.
+    let _ = move request
+    try revoked(parked.join(), "parked join")
+
+    let ended = try waiter.wait()
+    if ended.key != KEY_CHILD {
+        return BUG
+    }
+    match ended.what {
+        case Process(status) -> {
+            if status != EXITED + CHILD_SENT {
+                print("SOS threadgive: the child ended {}\n", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    let _ = system.debug_print("SOS threadgive: the child is gone\n")
+
+    let code = try exited.join()
+    print("SOS threadgive: the late join reads {}\n", code)
+    if code != CODE_EXITED {
+        return BUG
+    }
+    try revoked(parked.join(), "held join")
+    match parked.start() {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS threadgive: the invalid thread started\n")
+            return BUG
+        },
+        case Err(why) -> {
+            print("SOS threadgive: starting the invalid thread answered: {}\n",
+                  why)
+            if why != SosStatus.Revoked {
+                return BUG
+            }
+        },
+    }
+    // `exited` and `parked` are released on return: the last names of an
+    // `Exited` thread and of an invalid one.
+    return
+}
+
+/// Release the given thread's handle onto itself, once it has exited.
+func release_given() unsafe -> Bool {
+    let word = given_word()
+    if word == 0 {
+        return false
+    }
+    sos_handle_release(word) == STATUS_OK
+}
+
+/// Take the Thread out of slot `at` of a delivered message.
+func thread_in(msg: &var PipeMsg, at: Int) -> Result<Thread, SosStatus> {
+    guard let carried = msg.handles[at].take() else { return BUG }
+    match carried {
+        case Thread(t) -> { return move t },
+        case _ -> { return BUG },
+    }
+}
+
+/// `answer` must be `Revoked`; say what it was.
+func revoked(answer: Result<UInt, SosStatus>,
+             which: String) -> Result<Void, SosStatus> {
+    match answer {
+        case Ok(code) -> {
+            print("SOS threadgive: the {} returned {}\n", which, code)
+            return BUG
+        },
+        case Err(why) -> {
+            print("SOS threadgive: the {} answered: {}\n", which, why)
+            if why != SosStatus.Revoked {
+                return BUG
+            }
+        },
+    }
+    return
+}
+
+/// Join a round worker through its own word and answer its exit code.
+func join_word(word: UInt) unsafe -> Result<UInt, SosStatus> {
+    var code: UInt = 0
+    if sos_thread_join(word, (&var code) as UnsafePointer<UInt>) != STATUS_OK {
+        return BUG
+    }
+    return code
+}
+
+/// Make, start and let go of threads until the slab refuses one, let them all
+/// run, then join and release each through its own word. Answers how many it
+/// made, which is the free thread slots, and leaves none of them taken.
+func round(proc: &Process, me: &Thread) -> Result<UInt, SosStatus> {
+    var made: UInt = 0
+    var going = true
+    while going && (made as Int) < MAX_WORKERS {
+        match proc.thread_create(stack_top: round_stack_top(), arg: made) {
+            case Ok(t) -> {
+                try t.start()
+                let _ = move t
+                made = made + 1
+            },
+            case Err(why) -> {
+                if why != SosStatus.NoResource {
+                    return why
+                }
+                going = false
+            },
+        }
+    }
+
+    // Root goes to the back of the ready queue, behind every worker, and each
+    // runs to its exit before root runs again.
+    try me.yield_now()
+
+    var i: UInt = 0
+    while i < made {
+        let word = take_word(i)
+        if word == 0 {
+            return BUG
+        }
+        let code = try join_word(word)
+        let _ = sos_handle_release(word)
+        if code != CODE_BASE + i {
+            return BUG
+        }
+        i = i + 1
+    }
+    return made
+}

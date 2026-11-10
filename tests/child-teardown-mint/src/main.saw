@@ -1,0 +1,164 @@
+// Test child: a completion-queue server that dies with a thread parked on its
+// own queue while its close-all frees room in the ring (spec §2.10, §2.1).
+//
+// Its launcher has filled a connection's ring with messages whose claims it
+// dropped, and gives this child the server end under `TAG_SERVE`. The child
+// hands the end to a Waiter (the delivery is the take) and takes every
+// message, which leaves the ring full of taken exchanges. It moves each
+// obligation into a message staged on a connection of its own, whose outlet it
+// keeps, so the obligations are named only by those staged messages. Then it
+// starts a worker, tells the launcher it is ready, and parks on the Waiter.
+// The launcher's next call on the full ring parks for room; the worker yields
+// to let it, then ends the process.
+//
+// The close-all reaches the child's own outlet, the last name of that
+// connection's server end, which drops the staged messages. Releasing the
+// obligations they carried settles the exchanges, which frees ring room, which
+// resumes the launcher's parked call, which stages a message on the served
+// connection. That message is ready for the main thread parked on the Waiter,
+// and delivering it would mint its obligation into a table the close-all has
+// already passed. The thread must not be found there.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, PipeHandles, SosStatus,
+            AttachMode, PIPE_BODY_BYTES, PIPE_MSG_HANDLES}
+
+/// The launcher's tags.
+static TAG_SERVE: UInt = 41
+static TAG_READY: UInt = 42
+
+/// The key the served connection is attached under.
+static KEY_SERVE: UInt = 51
+
+/// The served ring's depth (`PIPE_INFLIGHT`), all of which the launcher fills.
+static TAKES: Int = 16
+
+/// The worker's argument.
+static ROLE_ENDS: UInt = 1
+
+/// The worker ended the process.
+static EXIT_ENDED: UInt = 50
+/// Something on the way failed; the line before it says what.
+static EXIT_MISMATCH: UInt = 98
+
+/// A status no arm of this program can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// The boot handle, parked by the main thread for the worker.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+static STACK_WORDS: Int = 512
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func park_boot_handle(word: UInt) unsafe { BOOT_HANDLE = word }
+
+func parked_boot_handle() unsafe -> UInt { BOOT_HANDLE }
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        main_thread(arg)
+    } else {
+        ends()
+    }
+}
+
+/// The worker: let the launcher run first, so its call parks for room, then end
+/// the process.
+func ends() {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    let _ = me.yield_now()
+    let _ = proc.exit(EXIT_ENDED)
+}
+
+func main_thread(boot: UInt) {
+    park_boot_handle(boot)
+    let system = System(boot_handle: boot)
+    let proc = try system.process_self() catch {
+        print("SOS cqhold: no process handle: {}\n", error)
+        return
+    }
+    let code = try serve(&proc) catch {
+        print("SOS cqhold: refused: {}\n", error)
+        EXIT_MISMATCH
+    }
+    let _ = proc.exit(code)
+}
+
+func serve(proc: &Process) -> Result<UInt, SosStatus> {
+    var served: PipeOutlet? = None
+    var ready: PipeInlet? = None
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                if rec.tag == TAG_SERVE {
+                    served = rec.take_outlet()
+                } else if rec.tag == TAG_READY {
+                    ready = rec.take_inlet()
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+    guard let outlet = served.take() else { return BUG }
+    guard let tell = ready.take() else { return BUG }
+
+    let waiter = try proc.waiter_create()
+    try waiter.give(outlet: move outlet, key: KEY_SERVE,
+                    mode: AttachMode.Persistent) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let hold = try proc.pipe_create()
+    let (hold_in, hold_out) = move hold
+
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var batch = PipeHandles.none()
+    var in_batch: Int = 0
+    var taken: Int = 0
+    while taken < TAKES {
+        let wake = try waiter.wait()
+        let (_, what) = (move wake).open()
+        match what {
+            case Message(m, r) -> {
+                let _ = move m
+                batch.put(in_batch, request: move r)
+            },
+            case _ -> { return BUG },
+        }
+        in_batch = in_batch + 1
+        taken = taken + 1
+        if in_batch == PIPE_MSG_HANDLES || taken == TAKES {
+            let claim = try hold_in.post_with(body: &body, len: 1,
+                                              handles: &var batch)
+            let _ = move claim
+            batch = PipeHandles.none()
+            in_batch = 0
+        }
+    }
+    print("SOS cqhold: holding {} obligations\n", taken)
+
+    let ender = try proc.thread_create(stack_top: stack_top(), arg: ROLE_ENDS)
+    try ender.start()
+    let note = try tell.post(body: &body, len: 1)
+    let _ = move note
+
+    // Parks: nothing is staged on the served connection until the launcher's
+    // call is resumed, and the process is gone by then.
+    let _ = try waiter.wait()
+    let _ = move hold_out
+    print("SOS cqhold: the parked wait returned\n")
+    return EXIT_MISMATCH
+}

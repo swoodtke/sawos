@@ -1,0 +1,159 @@
+// A give the kernel refuses for capacity hands the Thread back usable
+// (spec §3).
+//
+// Root creates a child it never starts and gives it masked System siblings,
+// one tag each, until the child's handle budget refuses one with
+// `QuotaExceeded`. It then makes a thread and gives that: the child's table is
+// still at its budget, so the give is refused again, with the same status. The
+// refusal is a status, so the kernel left root's entry in place, and
+// `Process.give` returns the Thread in its error payload. Root starts it and
+// joins it for its exit code, which only a live handle can do.
+//
+// Root exits still holding the returned Thread, so its close-all releases it.
+// Root's teardown line counts two threads: its own, invalidated by the exit,
+// and the returned one, which had exited. Nothing else named either.
+
+import sos.{System, Process, SystemRight, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The first boot tag. Each give takes the next one, so no tag repeats and the
+/// only refusal left to meet is the budget's.
+static TAG_FIRST: UInt = 40
+
+/// The tag of the Thread give, distinct from every sibling's.
+static TAG_THREAD: UInt = 90
+
+/// The role the thread is created with, and the code it exits with.
+static ROLE_RETURNED: UInt = 1
+static CODE_RETURNED: UInt = 7
+
+/// What each sibling carries: `Transfer` so it can be given at all.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The boot handle, parked by the initial thread for the returned one.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+static STACK_WORDS: Int = 512
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func park_boot_handle(word: UInt) unsafe { BOOT_HANDLE = word }
+
+func parked_boot_handle() unsafe -> UInt { BOOT_HANDLE }
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        returned()
+    }
+}
+
+/// The thread whose give is refused: once root starts it, it exits.
+func returned() {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    let _ = me.exit(CODE_RETURNED)
+}
+
+func initial(boot_handle: UInt) {
+    park_boot_handle(boot_handle)
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS threadreturns: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    var image = try proc.boot_handle_next() catch {
+        print("SOS threadreturns: no image region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var dest = try proc.boot_handle_next() catch {
+        print("SOS threadreturns: no destination region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let image_mem = image.take_memory() else {
+        let _ = system.debug_print("SOS threadreturns: image record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest_mem = dest.take_memory() else {
+        let _ = system.debug_print("SOS threadreturns: dest record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // The child stays `Created`, so every give below is legal and the boot set
+    // never freezes.
+    let child = try system.process_create(image: &image_mem,
+                                          memory: &dest_mem) catch {
+        print("SOS threadreturns: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    var given: UInt = 0
+    while true {
+        let sibling = try system.mint(rights: CHILD_SYSTEM) catch {
+            print("SOS threadreturns: mint failed: {}\n", error)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        try child.give(system: move sibling, tag: TAG_FIRST + given) catch {
+            let (why, back) = move error
+            print("SOS threadreturns: gave {} siblings then refused: {}\n",
+                  given, why)
+            let _ = move back
+            break
+        }
+        given = given + 1
+    }
+
+    let thread = try proc.thread_create(stack_top: stack_top(),
+                                        arg: ROLE_RETURNED) catch {
+        print("SOS threadreturns: thread create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try child.give(thread: move thread, tag: TAG_THREAD) catch {
+        let (why, back) = move error
+        print("SOS threadreturns: the Thread give was refused: {}\n", why)
+        try back.start() catch {
+            print("SOS threadreturns: the refused Thread will not start: {}\n",
+                  error)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        let code = try back.join() catch {
+            print("SOS threadreturns: the refused Thread will not join: {}\n",
+                  error)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        print("SOS threadreturns: the refused Thread joins {}\n", code)
+        if code != CODE_RETURNED {
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        let _ = proc.exit(EXIT_OK)
+        return
+    }
+    let _ = system.debug_print("SOS threadreturns: the Thread give was not refused\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

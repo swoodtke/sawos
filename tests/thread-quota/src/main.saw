@@ -1,0 +1,202 @@
+// A child's exited threads count against its Thread quota until their slots are
+// freed, and a thread that outlived its process credits nobody when it is
+// freed after the process's record is reused (spec §2.9, §2.10).
+//
+// Expected transcript, read as an order:
+//
+//   SOS: process exit: code=47 process=1          <- the leaver
+//   SOS threadquota: the leaver's thread outlived it: joins 82
+//   SOS childthread: quota made 3 then refused: <QuotaExceeded>
+//   SOS childthread: quota still refused: <QuotaExceeded>
+//   SOS childthread: quota again=3 then refused: <QuotaExceeded>
+//   SOS: process exit: code=48 process=1          <- the quota child
+//   SOS threadquota: the quota child is gone
+//   SOS threadquota: done
+//
+// The leaver (`child-thread`) sends root one of its threads after it exited,
+// then dies. The thread survives, `Exited` and disowned, and root still joins
+// it for its code.
+//
+// Root then lets go of everything naming the leaver's record, so the quota
+// child is created into it. That child makes workers that exit and stay named,
+// one at a time, until a create is refused. Its Thread quota
+// (`DEFAULT_QUOTA_THREADS`) is four and its main thread holds one, so three
+// workers fit: an exited thread still named holds its charge. Root then
+// releases the leaver's thread. Its free must credit nobody, because the
+// leaver's death disowned it; credited to the record, it would credit the
+// quota child, and the child's next create would be let in. The child then
+// releases its workers and makes three again, which needs each free to have
+// credited it exactly once.
+
+import sos.{System, Process, Memory, Thread, PipeInlet, PipeOutlet, PipeMsg,
+            SystemRight, SosStatus, WaitPayload}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tags the children's boot records travel under.
+static TAG_BOOT: UInt = 7
+static TAG_LEAVE_OUT: UInt = 37
+static TAG_QUOTA_OUT: UInt = 38
+
+/// The keys root's attachments live under.
+static KEY_MSG: UInt = 81
+static KEY_CHILD: UInt = 82
+
+/// The leaver's worker's exit code.
+static CODE_EXITED: UInt = 82
+
+/// The children's exit codes, and the kind half of a §8 status word for a
+/// process that exited.
+static EXIT_LEFT: UInt = 47
+static EXIT_QUOTA: UInt = 48
+static EXITED: UInt = 1 << 16
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS threadquota: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS threadquota: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS threadquota: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    let outlived = try leave(&system, &proc, &image, &ram)
+    let code = try outlived.join()
+    print("SOS threadquota: the leaver's thread outlived it: joins {}\n", code)
+    if code != CODE_EXITED {
+        return BUG
+    }
+
+    // Nothing of root's names the leaver's record now, so this child lands in
+    // it.
+    let child = try system.process_create(image: &image, memory: &ram)
+    let waiter = try proc.waiter_create()
+    let pipe = try proc.pipe_create()
+    let (to_root, from_child) = move pipe
+    try waiter.add(outlet: &from_child, key: KEY_MSG)
+    try waiter.add(process: &child, key: KEY_CHILD)
+    try give_system(&system, &child)
+    try child.give(inlet: move to_root, tag: TAG_QUOTA_OUT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+
+    let woke = try waiter.wait()
+    if woke.key != KEY_MSG {
+        return BUG
+    }
+    try waiter.remove(KEY_MSG)
+    let got = try from_child.take()
+    let (msg, request) = move got
+    let _ = move msg
+
+    // The leaver's thread goes while the quota child is at its quota and
+    // waiting on this request.
+    let _ = move outlived
+    let _ = move request
+
+    let ended = try waiter.wait()
+    if ended.key != KEY_CHILD {
+        return BUG
+    }
+    try expect_exit(&ended.what, EXIT_QUOTA)
+    let _ = system.debug_print("SOS threadquota: the quota child is gone\n")
+    return
+}
+
+/// Give `child` a masked sibling of root's System handle as its boot handle.
+func give_system(system: &System, child: &Process) -> Result<Void, SosStatus> {
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// `what` must be an exit with `code`.
+func expect_exit(what: &WaitPayload, code: UInt) -> Result<Void, SosStatus> {
+    match what {
+        case Process(status) -> {
+            if status != EXITED + code {
+                print("SOS threadquota: a child ended {}\n", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
+
+/// Run the leaver to its death and answer the thread it sent. Nothing of
+/// root's names its record afterwards.
+func leave(system: &System, proc: &Process, image: &Memory,
+           ram: &Memory) -> Result<Thread, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let waiter = try proc.waiter_create()
+    let pipe = try proc.pipe_create()
+    let (to_root, from_child) = move pipe
+    try waiter.add(outlet: &from_child, key: KEY_MSG)
+    try waiter.add(process: &child, key: KEY_CHILD)
+    try give_system(&system, &child)
+    try child.give(inlet: move to_root, tag: TAG_LEAVE_OUT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+
+    let woke = try waiter.wait()
+    if woke.key != KEY_MSG {
+        return BUG
+    }
+    try waiter.remove(KEY_MSG)
+    let got = try from_child.take()
+    let (arrived, request) = move got
+    var msg = move arrived
+    let sent = try thread_in(&var msg, 0)
+    // The leaver waits on its claim until this goes, then ends itself.
+    let _ = move request
+
+    let ended = try waiter.wait()
+    if ended.key != KEY_CHILD {
+        return BUG
+    }
+    try expect_exit(&ended.what, EXIT_LEFT)
+    try waiter.remove(KEY_CHILD)
+    return move sent
+}
+
+/// Take the Thread out of slot `at` of a delivered message.
+func thread_in(msg: &var PipeMsg, at: Int) -> Result<Thread, SosStatus> {
+    guard let carried = msg.handles[at].take() else { return BUG }
+    match carried {
+        case Thread(t) -> { return move t },
+        case _ -> { return BUG },
+    }
+}
