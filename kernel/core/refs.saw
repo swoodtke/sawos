@@ -502,11 +502,14 @@ public(package) func unref_object(kind: ObjType, slot: Int) unsafe {
 /// A Process whose count reaches zero here is not freed either. A `Gone` record
 /// whose last reference this was (a handle in the close-all, or an attachment
 /// in the attachment sweep) is reclaimed by the process scan at the end of
-/// `reap_unreferenced`. A Thread whose count reaches zero here is freed by
-/// `end_process`'s thread sweep, whichever process it belongs to, once it has
-/// exited or been invalidated. A Waiter or Timer whose count reaches zero here
-/// is freed by that kind's sweep, whichever process it belongs to; an
-/// Interrupt, which is bound to no process, by the Interrupt sweep.
+/// `reap_unreferenced`, and a `Created` one is owed its teardown by the same
+/// scan (`reclaim_process_record`), which `end_process` runs once its own
+/// teardown has ended (`drain_unstarted`). A Thread whose count reaches zero
+/// here is freed by `end_process`'s thread sweep, whichever process it belongs
+/// to, once it has exited or been invalidated. A Waiter or Timer whose count
+/// reaches zero here is freed by that kind's sweep, whichever process it
+/// belongs to; an Interrupt, which is bound to no process, by the Interrupt
+/// sweep.
 ///
 /// `exit_thread` drops the exiting thread's handle this way because the thread
 /// is still running: the free, if that was the last reference, waits for the
@@ -739,6 +742,9 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
             // going makes the §8 status word unreadable, and
             // `reclaim_process_record` implements that rule by reading this
             // count. Its body went back at its teardown, whatever the count.
+            // A `Created` process at zero has a body and a boot set still
+            // held; `reclaim_process_record` owes it a teardown, which this
+            // module cannot run (`kcore.sched` is above it).
             //
             // The ledger is not credited: the teardown already zeroed this
             // record's rows, and a process is not something another process is
@@ -844,7 +850,8 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
 
 /// Reap every Event, Memory, IoMemory, exchange and Pipe connection that
 /// nothing names, and disown every one still charged to dying process `p`. It
-/// also reclaims every `Gone` process record that nothing names.
+/// also reclaims every `Gone` process record that nothing names, and owes a
+/// teardown to every `Created` one (`reclaim_process_record`).
 /// Called by `end_process` after the close-all and the attachment sweep, so
 /// both kinds of reference `p` held on another process are already counted.
 ///

@@ -1,0 +1,79 @@
+// Test child: a launcher that exits holding the only handle to a process it
+// created and never started.
+//
+// It is given two regions, an image and the RAM to run it in, and a System
+// handle that may create processes and bind Interrupts. It creates a process
+// from the regions, binds a line, gives the Interrupt to the new process, and
+// exits without starting it. Its own teardown closes the Process handle, the
+// last reference to the new process, so the new process is torn down while the
+// launcher is.
+//
+// The exit code reports how far it got, and the case's root reads it from the
+// spec.md §8 status word.
+
+import sos.{System}
+
+/// The line the new process is given. Root binds it again after the launcher's
+/// death, which only works once the new process's teardown has destroyed the
+/// Interrupt.
+static LINE: UInt = 5
+
+/// Ended after giving the Interrupt away.
+static EXIT_LAUNCHED: UInt = 70
+
+/// The boot set was not two regions, or a step could not be taken. Distinct so
+/// the root's status names the step.
+static EXIT_NO_RECORD: UInt = 90
+static EXIT_NOT_MEMORY: UInt = 91
+static EXIT_CREATE: UInt = 92
+static EXIT_BIND: UInt = 93
+static EXIT_GIVE: UInt = 94
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS launcher: no process handle: {}\n", error)
+        return
+    }
+
+    var image_rec = try proc.boot_handle_next() catch {
+        let _ = proc.exit(EXIT_NO_RECORD)
+        return
+    }
+    var ram_rec = try proc.boot_handle_next() catch {
+        let _ = proc.exit(EXIT_NO_RECORD)
+        return
+    }
+    guard let image = image_rec.take_memory() else {
+        let _ = proc.exit(EXIT_NOT_MEMORY)
+        return
+    }
+    guard let ram = ram_rec.take_memory() else {
+        let _ = proc.exit(EXIT_NOT_MEMORY)
+        return
+    }
+
+    let unstarted = try system.process_create(image: &image, memory: &ram) catch {
+        print("SOS launcher: create refused: {}\n", error)
+        let _ = proc.exit(EXIT_CREATE)
+        return
+    }
+    let irq = try system.interrupt_bind(line: LINE) catch {
+        print("SOS launcher: bind refused: {}\n", error)
+        let _ = proc.exit(EXIT_BIND)
+        return
+    }
+    try unstarted.give(interrupt: move irq, tag: 1) catch {
+        let (why, back) = move error
+        let _ = move back
+        print("SOS launcher: give refused: {}\n", why)
+        let _ = proc.exit(EXIT_GIVE)
+        return
+    }
+
+    let _ = system.debug_print("SOS launcher: leaving the child unstarted\n")
+    // The handle onto `unstarted` is still in this table: the exit closes it.
+    let _ = proc.exit(EXIT_LAUNCHED)
+}

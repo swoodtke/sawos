@@ -1,0 +1,149 @@
+// A launcher that dies holding the only handle to a process it never started
+// leaves nothing behind: the process is torn down in the launcher's own
+// teardown, a teardown nested in a teardown.
+//
+// Root runs `child-launcher`. It creates a process from regions root gives it,
+// binds a line, gives the Interrupt to the new process and exits without
+// starting it. The launcher's close-all drops the new process's last reference,
+// and the new process is torn down once the launcher's own teardown has ended:
+// its line is bindable again (the teardown destroyed the Interrupt in its boot
+// set) and its body and record are free for root's next create. Root binds the
+// line as the first thing it does after the launcher's death wakes it, so the
+// never-started process is gone before root runs, not at the next trap.
+//
+//   SOS: process teardown ... interrupts=0       <- the launcher
+//   SOS: process teardown ... interrupts=1       <- the process it never started
+//   SOS unstartedl: line bound again
+//   SOS unstartedl: launcher ended status=65606  <- Exited << 16 | 70
+//   SOS unstartedl: spare=2
+//
+// `spare=` counts the unstarted processes root can create and hold at once:
+// the body table less root's, so it says the new process's body came back.
+
+import sos.{System, Process, Memory, AttachMode, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tag the launcher's System travels under.
+static TAG_BOOT: UInt = 7
+static TAG_IMAGE: UInt = 31
+static TAG_RAM: UInt = 32
+
+/// The key root watches the launcher's death under.
+static KEY_LAUNCHER: UInt = 62
+
+/// The line the launcher gives away. Root binds it after the launcher is gone.
+static LINE: UInt = 5
+
+/// What the launcher may ask its System object for: a process to create, a
+/// line to bind, and `Transfer` to give the Interrupt on.
+static LAUNCHER_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                                  | SystemRight.ProcessCreate
+                                  | SystemRight.InterruptBind
+                                  | SystemRight.Transfer)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS unstartedl: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS unstartedl: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS unstartedl: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    // Rows: the new process's image, the launcher's image, then the RAM of
+    // each. The launcher is given siblings of the first and third.
+    var np_image_rec = try proc.boot_handle_next()
+    var l_image_rec = try proc.boot_handle_next()
+    var np_ram_rec = try proc.boot_handle_next()
+    var l_ram_rec = try proc.boot_handle_next()
+    guard let np_image = np_image_rec.take_memory() else { return BUG }
+    guard let l_image = l_image_rec.take_memory() else { return BUG }
+    guard let np_ram = np_ram_rec.take_memory() else { return BUG }
+    guard let l_ram = l_ram_rec.take_memory() else { return BUG }
+
+    let status = try launch(&system, &proc, &l_image, &l_ram, &np_image,
+                            &np_ram)
+    print("SOS unstartedl: launcher ended status={}\n", status)
+
+    let spare = spare_slots(&system, &np_image, &np_ram)
+    print("SOS unstartedl: spare={}\n", spare)
+    return
+}
+
+/// Start the launcher with siblings of the new process's regions, wait for its
+/// death and release it. Returns its §8 status word.
+func launch(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+            gift_from_image: &Memory,
+            gift_from_ram: &Memory) -> Result<UInt, SosStatus> {
+    let launcher = try system.process_create(image: &image, memory: &ram)
+    let for_launcher = try system.mint(rights: LAUNCHER_SYSTEM)
+    try launcher.give(system: move for_launcher, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let gift_image = try gift_from_image.mint()
+    try launcher.give(memory: move gift_image, tag: TAG_IMAGE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let gift_ram = try gift_from_ram.mint()
+    try launcher.give(memory: move gift_ram, tag: TAG_RAM) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &launcher, key: KEY_LAUNCHER)
+    try launcher.start(boot_tag: TAG_BOOT)
+
+    let woke = try waiter.wait()
+    if woke.key != KEY_LAUNCHER {
+        return BUG
+    }
+    // The first thing root does after the death: the line is free already, not
+    // at the next trap.
+    let irq = try system.interrupt_bind(line: LINE)
+    let _ = system.debug_print("SOS unstartedl: line bound again\n")
+    let _ = move irq
+    var status: UInt = 0
+    match woke.what {
+        case Process(word) -> { status = word },
+        case _ -> { return BUG },
+    }
+
+    try waiter.remove(KEY_LAUNCHER)
+    let _ = move waiter
+    let _ = move launcher
+    return status
+}
+
+/// How many processes root can create and hold at once, up to the body table's
+/// size. Each is held until the whole chain returns.
+func spare_slots(system: &System, image: &Memory, ram: &Memory) -> UInt {
+    match system.process_create(image: &image, memory: &ram) {
+        case Ok(p) -> {
+            let kept = move p
+            return 1 + spare_slots(&system, &image, &ram)
+        },
+        case Err(_) -> { return 0 },
+    }
+}

@@ -83,7 +83,7 @@ import kcore.waitables.{
     set_waitable_attachment,
     unblock_process,
 }
-import kcore.process.{clear_domain, load_domain}
+import kcore.process.{UNSTARTED_PENDING, clear_domain, load_domain}
 
 import kcore.irq.{has_external_wake_source, idle_until_runnable}
 
@@ -133,6 +133,10 @@ func run_thread(next: Int) unsafe -> UInt {
 /// have changed at either. That is why the reload lives at the tail, in
 /// `run_thread`, and not at the top of this function.
 public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
+    // First, so that what the trap just did is whole before anything is
+    // chosen: a `Created` process whose last name it dropped is gone by the
+    // time the caller, or anyone, runs again (`drain_unstarted`).
+    drain_unstarted()
     let cur = CURRENT_THREAD
     if cur == NO_THREAD {
         return current_frame
@@ -335,7 +339,18 @@ func invalidate_timer(t: Int, p: Int) unsafe {
     notify_ready(WaitableKind.Timer, t)
 }
 
-/// End process `p`. Never returns.
+/// What a teardown counted, for the report line.
+struct TeardownCounts {
+    closed: UInt,
+    threads: UInt,
+    events: UInt,
+    waiters: UInt,
+    interrupts: UInt,
+    timers: UInt,
+}
+
+/// Tear down process `p`: the whole of ending it except what follows the
+/// teardown (the report, and the reschedule or the machine stop).
 ///
 /// Teardown is unconditional: every handle in the process's table is closed,
 /// every thread it owns stops running, and every Mapping it owned goes back to
@@ -350,14 +365,16 @@ func invalidate_timer(t: Int, p: Int) unsafe {
 /// (`reap_unreferenced`). Its trap counters are copied into its record, and its
 /// body (the handle table, the boot set and the grant record) is freed for the
 /// next create. The record stays, `Gone`, for as long as a reference names it.
-/// Then:
 ///
-///   - Process 0 (root, init) stops the machine. Its children die with it,
-///     uncounted.
-///   - A child reschedules. Its threads leave the ready queue by removal, its
-///     body goes back, and the path ends in `resume_after_death`, so root is
-///     simply the next thing picked. A supervisor parked on the child's Process
-///     handle is woken by the `notify_ready` at the top of this function.
+/// `is_caller` says whether `p` owns the running thread or no thread is
+/// running (a fault or an exit is on the caller, spec §2.7, and the deadlock
+/// that ends root is reached with nothing current). Then the running thread is
+/// one of the slots the thread sweep touches, so nothing is current any more
+/// and `CURRENT_THREAD` and `PENDING_FREE` are cleared. Otherwise `p` is a
+/// `Created` process that nothing names (`end_unstarted`): it has no thread
+/// that ever ran, the caller's thread stays current and `Running`, and the
+/// sweeps leave the caller's slots alone. Clearing `CURRENT_THREAD` for it
+/// would leave the caller's thread on no list and never scheduled.
 ///
 /// A record is never reclaimed before its own teardown has ended, because the
 /// teardown writes it after the point where its last reference can go: the
@@ -374,16 +391,18 @@ func invalidate_timer(t: Int, p: Int) unsafe {
 /// skip them.
 ///
 /// `code` is what a supervisor reads out of the spec §8 status word.
-/// `machine_status` is what the emulator exits with, which for a fault is the
-/// kernel's own vocabulary rather than anything the process chose. It is read
-/// only on the process-0 arm.
 ///
-/// There is no preemption point anywhere in the teardown. The scheduler is
-/// dismantled across it (`CURRENT_THREAD` and the dying process's queue entries
-/// are cleared before the scans), so IRQ-shared state is in flight for the
-/// whole walk. It is bounded, and ends in a machine stop or a fresh schedule.
-public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
-                 machine_status: UInt) unsafe -> Never {
+/// There is no preemption point anywhere in the teardown. For a caller the
+/// scheduler is dismantled across it (`CURRENT_THREAD` and the dying process's
+/// queue entries are cleared before the scans), so IRQ-shared state is in
+/// flight for the whole walk. It is bounded.
+///
+/// It never runs another teardown: a reference it drops from a `Created`
+/// process's count to zero only raises `UNSTARTED_PENDING`
+/// (`reclaim_process_record`), and `drain_unstarted` runs those teardowns one
+/// after another, never inside one.
+func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
+                      is_caller: Bool) unsafe -> TeardownCounts {
     PROCESS_RECORDS[p].state = ProcessState.Gone
     PROCESS_RECORDS[p].exit_kind = kind
     PROCESS_RECORDS[p].exit_code = code
@@ -408,8 +427,9 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // only thing it can say: nobody holds a status word to read and it has no
     // console handle. This stays a separate line, not a field on the teardown
     // line below, so the teardown line is identical for every process. The
-    // fault half is reported by `fault_process`.
-    if p != ROOT_PROCESS {
+    // fault half is reported by `fault_process`. A process that never ran did
+    // not exit, so it reports no code.
+    if is_caller && p != ROOT_PROCESS {
         match kind {
             case Exited -> {
                 let out = console()
@@ -537,7 +557,10 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     //     `Exited` thread's charge back.
     //   - Another process's `Exited` or `Invalid` thread whose last name was
     //     in this process's table is freed too, uncounted: the close-all
-    //     counts without freeing (`unref_teardown`).
+    //     counts without freeing (`unref_teardown`). When `p` is not the
+    //     caller, the running thread's slot and the one waiting in
+    //     `PENDING_FREE` are left to `pick_next` (`spared`): the caller is
+    //     still using the first and has promised the second to the switch.
     var freed: UInt = 0
     var t: Int = 0
     while t < THREADS.capacity() {
@@ -545,16 +568,18 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
             case Free -> {},
             case Exited -> {
                 if THREADS[t].refs == 0 {
-                    if THREADS[t].process == p {
-                        freed = freed + 1
+                    if not spared(t, is_caller) {
+                        if THREADS[t].process == p {
+                            freed = freed + 1
+                        }
+                        free_object(ObjType.Thread, t)
                     }
-                    free_object(ObjType.Thread, t)
                 } else if THREADS[t].process == p {
                     THREADS[t].process = NO_PROCESS
                 }
             },
             case Invalid -> {
-                if THREADS[t].refs == 0 {
+                if THREADS[t].refs == 0 && not spared(t, is_caller) {
                     free_object(ObjType.Thread, t)
                 }
             },
@@ -570,15 +595,15 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
         }
         t = t + 1
     }
-    // The dying process owns the running thread, or no thread is running: a
-    // fault is on the caller, an exit is self-only (spec §2.7), and the
-    // deadlock that ends root is reached with nothing current. So the running
-    // thread was one of the slots just swept (invalidated, or `Exited` when its
-    // own exit ended the process) and nothing is current any more. Ending some
-    // other process here would leave the caller's thread `Running`, on no list,
-    // and never scheduled.
-    CURRENT_THREAD = NO_THREAD
-    PENDING_FREE = NO_THREAD
+    // For the caller's own process the running thread was one of the slots
+    // just swept (invalidated, or `Exited` when its own exit ended the
+    // process) and nothing is current any more. For any other process the
+    // caller's thread is not one of them and stays current: clearing it here
+    // would leave it `Running`, on no list, and never scheduled.
+    if is_caller {
+        CURRENT_THREAD = NO_THREAD
+        PENDING_FREE = NO_THREAD
+    }
 
     // Attachments belong to a Waiter, so they are reclaimed by walking the
     // process's waiters: an attachment is a row in a Waiter's table and dies
@@ -864,33 +889,74 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // frees it here rather than leaving a `Gone` record nothing can reach. The
     // usual case is the opposite: a creator's handle onto its dead child
     // survives (keeping the spec §8 status word readable), and the creator's
-    // release frees the record later.
+    // release frees the record later. A process that never ran is torn down at
+    // a count of zero, so its record is reclaimed here every time.
     unref_object(ObjType.Process, p)
 
+    TeardownCounts(closed: closed, threads: freed, events: events_freed,
+                   waiters: waiters_freed, interrupts: irqs_destroyed,
+                   timers: timers_freed)
+}
+
+/// Whether thread slot `t` is the caller's, and so must not be freed by the
+/// teardown of some other process (`teardown_process`'s `is_caller`).
+func spared(t: Int, is_caller: Bool) unsafe -> Bool {
+    not is_caller && (t == CURRENT_THREAD || t == PENDING_FREE)
+}
+
+/// Print the teardown line for process `p`.
+func report_teardown(counts: TeardownCounts, p: Int) unsafe {
     let uart = console()
     uart.write_str("SOS: process teardown handles=")
-    uart.write_hex(closed)
+    uart.write_hex(counts.closed)
     uart.write_str(" threads=")
-    uart.write_hex(freed)
+    uart.write_hex(counts.threads)
     uart.write_str(" events=")
-    uart.write_hex(events_freed)
+    uart.write_hex(counts.events)
     uart.write_str(" waiters=")
-    uart.write_hex(waiters_freed)
+    uart.write_hex(counts.waiters)
     uart.write_str(" interrupts=")
-    uart.write_hex(irqs_destroyed)
+    uart.write_hex(counts.interrupts)
     // No `clocks=` field: this line counts what the process owned or held, and
     // a Clock is owned by nobody and not counted.
     uart.write_str(" timers=")
-    uart.write_hex(timers_freed)
+    uart.write_hex(counts.timers)
     // The process number (the record's index) comes last, so the fields before
     // it keep their positions.
     uart.write_str(" process=")
     uart.write_hex(p as UInt)
     uart.write_str("\n")
+}
+
+/// End process `p`, which owns the running thread or has none running (a fault
+/// or an exit is on the caller). Never returns.
+///
+/// `teardown_process` does the work; then:
+///
+///   - Process 0 (root, init) stops the machine. Its children die with it,
+///     uncounted, and a `Created` process nothing names any more is not torn
+///     down first.
+///   - A child reschedules. Its threads leave the ready queue by removal, its
+///     body goes back, and the path ends in `resume_after_death`, so root is
+///     simply the next thing picked. A supervisor parked on the child's Process
+///     handle is woken by the `notify_ready` at the top of the teardown. The
+///     `Created` processes whose last name the teardown dropped are torn down
+///     before the reschedule (`drain_unstarted`), after this process's own
+///     report.
+///
+/// `code` is what a supervisor reads out of the spec §8 status word.
+/// `machine_status` is what the emulator exits with, which for a fault is the
+/// kernel's own vocabulary rather than anything the process chose. It is read
+/// only on the process-0 arm.
+public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
+                 machine_status: UInt) unsafe -> Never {
+    let counts = teardown_process(p, kind, code, true)
+    report_teardown(counts, p)
 
     if p != ROOT_PROCESS {
         // A child's death is a scheduling event: the machine has work left, so
         // this path never touches `machine_status` and never stops.
+        drain_unstarted()
         resume_after_death()
     }
 
@@ -900,6 +966,54 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
         hal.exit_fail(machine_status)
     }
     while { }
+}
+
+/// Tear down `Created` process `p`, whose last reference is gone, as if it had
+/// exited. `p` is not the caller.
+///
+/// The process never ran, so there is nothing to reschedule: its inert threads
+/// (made through its handle) are invalidated by the thread sweep, everything it
+/// holds is released by the close-all (its boot set included), its body goes
+/// back and its record is reclaimed, all in `teardown_process`. The caller's
+/// thread keeps running and `CURRENT_THREAD` is not touched.
+///
+/// The status word is `Exited` with code zero, written because the teardown
+/// writes one. No reader can exist: the count is zero, so there is no handle or
+/// attachment to read it through, and the record is `Free` again when this
+/// returns.
+func end_unstarted(p: Int) unsafe {
+    let counts = teardown_process(p, ProcessStatusKind.Exited, 0, false)
+    report_teardown(counts, p)
+}
+
+/// Tear down every `Created` process whose count has reached zero, until none
+/// is left. Called from `pick_next`, which every syscall and interrupt return
+/// passes through, and from `end_process` before it reschedules.
+///
+/// `reclaim_process_record` raises `UNSTARTED_PENDING` on each such zero,
+/// wherever the last reference went (a release, a detach, a delivery, the
+/// close-all or the attachment sweep of a teardown), because `refs` cannot call
+/// up into this module. The flag is cleared before each pass: a teardown here
+/// can drop the last reference to another `Created` process (a launcher whose
+/// child held the only handle to its own never-started child), which raises it
+/// again and is handled by the next pass, not by recursion. So a teardown is
+/// never nested in another, and every one runs with the caller's state whole.
+public(package) func drain_unstarted() unsafe {
+    while UNSTARTED_PENDING {
+        UNSTARTED_PENDING = false
+        var r: Int = 0
+        while r < PROCESS_RECORDS.capacity() {
+            match PROCESS_RECORDS[r].state {
+                case Created -> {
+                    if PROCESS_RECORDS[r].refs == 0 {
+                        end_unstarted(r)
+                    }
+                },
+                case _ -> {},
+            }
+            r = r + 1
+        }
+    }
 }
 
 /// Terminate a process for a caller error it could have checked: an invalid

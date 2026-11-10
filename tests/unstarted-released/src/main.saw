@@ -1,0 +1,235 @@
+// A process that is created and never started is torn down when its last
+// handle is released (spec §2.7, §8).
+//
+// Root creates a child and, through its handle, gives it a pipe end, a region
+// and a bound Interrupt, and makes a thread in it (inert: the child never
+// runs). Then root releases the child's handle, the last reference to it. The
+// child is torn down as if it had exited, and each leg reads what that freed:
+//
+//   bodies gained=1       the child's body and record came back, so root can
+//                         create one more process than while it was held
+//   pipe post says ...    the pipe end the child held is closed: the inlet
+//                         root kept answers `PeerClosed`
+//   thread join says ...  the thread made in the child is invalidated: the
+//                         handle root kept answers `Revoked`
+//   line bound again      the Interrupt the child held was destroyed
+//   region came back      the region the child held is back in the pool, so
+//                         a cut of the whole pool is possible again
+//
+// The last two legs end in a fault when the child is not torn down (`LineBound`
+// and a cut larger than the pool holds), so they come last.
+//
+// Root first runs a host (`child-xhost`) to learn the address of a thread
+// stack, which only a running process can compute, and ends it. Every loop is
+// bounded.
+
+import sos.{System, Process, Memory, Event, PipeInlet, PipeOutlet, SystemRight,
+            SosStatus, PIPE_BODY_BYTES}
+
+// The pool's size: its config, per architecture, in C because Saw cannot name
+// an address. See `tests/poolbase_riscv32.c`.
+extern "C" {
+    func sos_test_pool_len() -> UInt
+}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tags the host's boot records travel under.
+static TAG_BOOT: UInt = 7
+static TAG_ADDR: UInt = 51
+static TAG_DONE: UInt = 52
+
+/// The tags the unstarted child is given its objects under.
+static TAG_PIPE: UInt = 61
+static TAG_REGION: UInt = 62
+static TAG_LINE: UInt = 63
+
+/// The role the child's thread is created with.
+static ROLE_WORKER: UInt = 1
+
+/// A line both machines wire and neither asserts unasked.
+static LINE: UInt = 5
+
+/// One protection unit's worth on either profile: the region the child holds.
+static CHUNK: UInt = 0x1000
+
+/// The most turns root yields waiting on the host.
+static MAX_TURNS: Int = 100000
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS unstarted: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS unstarted: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS unstarted: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// Yield until `event` has been signalled and answer what it carried.
+func await_event(proc: &Process, event: &Event) -> Result<UInt, SosStatus> {
+    let me = try proc.thread_self()
+    var turns = 0
+    while turns < MAX_TURNS {
+        let bits = try event.receive()
+        if bits != 0 {
+            return bits
+        }
+        let _ = me.yield_now()
+        turns = turns + 1
+    }
+    return BUG
+}
+
+/// Yield until `child` has ended and answer its status word.
+func await_end(proc: &Process, child: &Process) -> Result<UInt, SosStatus> {
+    let me = try proc.thread_self()
+    var turns = 0
+    while turns < MAX_TURNS {
+        let status = try child.get_status()
+        if status != 0 {
+            return status
+        }
+        let _ = me.yield_now()
+        turns = turns + 1
+    }
+    return BUG
+}
+
+/// Give `child` the host's two Events and a masked System, and start it.
+func launch(system: &System, child: &Process, addr: &Event,
+            done: &Event) -> Result<Void, SosStatus> {
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let addr_sibling = try addr.mint()
+    try child.give(event: move addr_sibling, tag: TAG_ADDR) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let done_sibling = try done.mint()
+    try child.give(event: move done_sibling, tag: TAG_DONE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    return
+}
+
+/// Run a host to learn its stack address, and end it.
+func learn_stack(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+                 addr: &Event, done: &Event) -> Result<UInt, SosStatus> {
+    let first = try system.process_create(image: &image, memory: &ram)
+    try launch(&system, &first, &addr, &done)
+    let stack = try await_event(&proc, &addr)
+    try done.signal(1)
+    let _ = try await_end(&proc, &first)
+    return stack
+}
+
+/// How many processes root can create and hold at once, up to the body table's
+/// size. Each is held until the whole chain returns.
+func spare_slots(system: &System, image: &Memory, ram: &Memory) -> Int {
+    match system.process_create(image: &image, memory: &ram) {
+        case Ok(p) -> {
+            let kept = move p
+            return 1 + spare_slots(&system, &image, &ram)
+        },
+        case Err(_) -> { return 0 },
+    }
+}
+
+/// Give the child a pipe's outlet, a cut of the pool and a bound line.
+func give_all(system: &System, child: &Process, pool: &Memory,
+              outlet: PipeOutlet) -> Result<Void, SosStatus> {
+    try child.give(outlet: move outlet, tag: TAG_PIPE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let piece = try pool.split(len: CHUNK)
+    try child.give(memory: move piece, tag: TAG_REGION) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let irq = try system.interrupt_bind(line: LINE)
+    try child.give(interrupt: move irq, tag: TAG_LINE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// What a post on the pipe says now, printed by name.
+func post_says(inlet: &PipeInlet) {
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 1
+    match inlet.post(body: &msg, len: 1) {
+        case Ok(_) -> { print("SOS unstarted: post survived\n") },
+        case Err(e) -> { print("SOS unstarted: post says {}\n", e) },
+    }
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    var pool_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    guard let pool = pool_rec.take_memory() else { return BUG }
+    let addr = try proc.event_create()
+    let done = try proc.event_create()
+
+    let stack = try learn_stack(&system, &proc, &image, &ram, &addr, &done)
+
+    // The child, with the thread made in it and everything it is given. Root
+    // keeps the pipe's inlet and the thread's handle.
+    let child = try system.process_create(image: &image, memory: &ram)
+    let worker = try child.thread_create(stack_top: stack, arg: ROLE_WORKER)
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    try give_all(&system, &child, &pool, move outlet)
+
+    let held = spare_slots(&system, &image, &ram)
+    let _ = system.debug_print("SOS unstarted: releasing the unstarted child\n")
+    let _ = move child
+    let after = spare_slots(&system, &image, &ram)
+    print("SOS unstarted: bodies gained={}\n", after - held)
+
+    post_says(&inlet)
+    match worker.join() {
+        case Ok(_) -> { let _ = system.debug_print("SOS unstarted: join ran\n") },
+        case Err(e) -> { print("SOS unstarted: thread join says {}\n", e) },
+    }
+
+    // Both of these end the run in a fault if the child is still there.
+    let irq = try system.interrupt_bind(line: LINE)
+    let _ = system.debug_print("SOS unstarted: line bound again\n")
+    let _ = move irq
+    let whole = try pool.split(len: sos_test_pool_len())
+    let _ = move whole
+    let _ = system.debug_print("SOS unstarted: region came back\n")
+    return
+}

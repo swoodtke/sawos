@@ -221,6 +221,12 @@ HANDLE_MALFORMED_WORD_PKG = os.path.join(TESTS_DIR, "handle-malformed-word")
 HANDLE_DROP_RELEASE_PKG = os.path.join(TESTS_DIR, "handle-drop-release")
 PROCESS_RECLAIM_PKG = os.path.join(TESTS_DIR, "process-reclaim")
 GONE_RECLAIM_TEARDOWN_PKG = os.path.join(TESTS_DIR, "gone-reclaim-teardown")
+# A created process that is never started is torn down when the last name for it
+# goes: `unstarted-released` releases the handle itself, `unstarted-launcher`
+# has its launcher die holding it.
+UNSTARTED_RELEASED_PKG = os.path.join(TESTS_DIR, "unstarted-released")
+UNSTARTED_LAUNCHER_PKG = os.path.join(TESTS_DIR, "unstarted-launcher")
+CHILD_LAUNCHER_PKG = os.path.join(TESTS_DIR, "child-launcher")
 # A process is a record and a body. `process-records` holds dead children until
 # the record table refuses and then gives them back; `process-records-donate`
 # moves that wall by donation; the two husk packages map into a child that dies
@@ -2319,6 +2325,76 @@ TEST_CASES = [
                        "SOS gonereclaim: again status=65596",
                        "SOS gonereclaim: spare=2",
                        "SOS gonereclaim: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A process that is created and never started is torn down when its
+        # last handle is released. Root gives such a child a pipe end, a region
+        # and a bound Interrupt, makes a thread in it, and releases it; every
+        # leg then reads one thing the teardown freed.
+        #
+        # The child's teardown line is the first `process={one}` line after the
+        # release: `handles={three}` is the pipe end, the region and the
+        # Interrupt, `interrupts={one}` the line it destroyed, and
+        # `threads={zero}` because the thread made in it is still named by
+        # root's handle, so it is invalidated and not freed (`join says` the
+        # call is gone, `Revoked`). `bodies gained=1` is the body table: root
+        # can create one more process than while the child was held. The
+        # `handles={zero}` lines around it are the processes those counts made
+        # and dropped, themselves never started.
+        #
+        # The last two legs are faults on a kernel that does not tear the child
+        # down: the line is still bound, and a cut of the whole pool is
+        # larger than the pool holds.
+        "name": "unstarted_released",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": UNSTARTED_RELEASED_PKG,
+        "children": [CHILD_XHOST_PKG],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS unstarted: releasing the unstarted child",
+                       "SOS: process teardown handles={three} threads={zero} "
+                       "events={zero} waiters={zero} interrupts={one} "
+                       "timers={zero} process={one}",
+                       "SOS unstarted: bodies gained=1",
+                       "SOS unstarted: post says the other end of this "
+                       "connection is gone",
+                       "SOS unstarted: thread join says what this call was "
+                       "waiting for is gone",
+                       "SOS unstarted: line bound again",
+                       "SOS unstarted: region came back",
+                       "SOS unstarted: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A launcher that dies holding the only handle to a process it never
+        # started: the teardown of the never-started process runs after the
+        # launcher's own, and before root runs again. The launcher
+        # (`child-launcher`) gives that process an Interrupt and exits; its
+        # teardown line (`process={one}`) is followed by the grandchild's
+        # (`process={two}`, `interrupts={one}`), and only then does root run:
+        # the first thing it does after the launcher's death is bind the line
+        # again, then it reads the launcher's status word (`Exited` (1) << 16 |
+        # 70). `spare=2` is the body table less root's: the grandchild's body
+        # is back.
+        "name": "unstarted_launcher",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": UNSTARTED_LAUNCHER_PKG,
+        "children": [CHILD_FAULT_PKG, CHILD_LAUNCHER_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS launcher: leaving the child unstarted",
+                       "SOS: process teardown handles={five} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS: process teardown handles={one} threads={zero} "
+                       "events={zero} waiters={zero} interrupts={one} "
+                       "timers={zero} process={two}",
+                       "SOS unstartedl: line bound again",
+                       "SOS unstartedl: launcher ended status=65606",
+                       "SOS unstartedl: spare=2",
+                       "SOS unstartedl: done"],
         "expect_clean_exit": True,
     },
     {

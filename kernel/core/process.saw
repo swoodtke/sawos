@@ -187,7 +187,13 @@ public(package) func claim_root() unsafe {
     link_process(ROOT_PROCESS, ROOT_BODY)
 }
 
-/// Free a `Gone` process's record if nothing anywhere still names it.
+/// Raised when a `Created` process's count reaches zero: nothing names it, so
+/// its teardown is owed. `drain_unstarted` (`kcore.sched`) runs it and clears
+/// the flag; this module and `kcore.refs` sit below the teardown and cannot.
+public(package) unsafe static var UNSTARTED_PENDING: Bool = false
+
+/// Settle a process record whose count may have reached zero: free a `Gone`
+/// record nothing names, and owe a `Created` one its teardown.
 ///
 /// A `Gone` record holds its status word and final counters (spec §8), and the
 /// only ways to read them are `GetStatus` and `Stats` through a Process handle
@@ -208,11 +214,19 @@ public(package) func claim_root() unsafe {
 /// the reused record safe, since a word naming the old life is released or
 /// stale, and the teardown's disown leaves no field naming it (spec §2.10).
 ///
-/// A live process is never reclaimed however far its count falls: its record
-/// is what it is running as.
+/// A `Created` record at zero is not freed here: it still has a body and
+/// whatever its boot set holds, so it raises `UNSTARTED_PENDING` and its
+/// teardown reclaims the record. A running process is never reclaimed however
+/// far its count falls: its record is what it is running as.
 public(package) func reclaim_process_record(p: Int) unsafe {
     match PROCESS_RECORDS[p].state {
         case Gone -> {},
+        case Created -> {
+            if PROCESS_RECORDS[p].refs == 0 {
+                UNSTARTED_PENDING = true
+            }
+            return
+        },
         case _ -> { return },
     }
     if PROCESS_RECORDS[p].refs != 0 {

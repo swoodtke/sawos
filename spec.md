@@ -1123,7 +1123,7 @@ three groups:
   naming one that is not, a `Gone` one included, is a `BadState` fault rather
   than `Revoked` (§2.10): a `Gone` child was always started, and the launcher
   that started it knows. No thread of a `Created` child can run (below), so
-  none can end it, and that stays true.
+  none can end it; the loss of its last name does (below).
 
 **The default set.** One Process default set serves all three minters (root's,
 `ProcessSelf`'s and `ProcessCreate`'s), named for its ops throughout:
@@ -1206,6 +1206,23 @@ fails its entry's generation (§3). The teardown's disown (§2.10) covers the
 fields that hold none, so no object that outlives a process still names its
 record, and a refund at a survivor's later free is owed to nobody rather than
 to the record's next occupant.
+
+**A `Created` process that nothing names is torn down.** A child that was
+created and never started has no thread to end it, so the loss of its last
+name does. When its `refs` reaches zero (no Process handle, attachment or
+staged message names it), the kernel runs the §2.10 teardown for it as if it
+had exited, before the trap that dropped the reference returns to anyone: its
+boot set is released, every object it owns is invalidated or freed as §2.10
+rules, its body is freed, and its record is reclaimed at once, because no reader
+of its status word can exist. A thread made through its handle is invalidated,
+so a handle held on it answers `Revoked`; an Interrupt it was given is
+destroyed, so its line is bindable again. The status word it is written is
+`Exited` with code zero, which nothing can read. The teardown is not the
+caller's own: the caller's thread keeps running, and nothing of the caller's is
+ended or rescheduled. The reference can be dropped inside another process's
+teardown (a launcher that dies holding the only handle to a child it never
+started); the child's teardown then runs after the launcher's has ended, never
+inside it.
 
 **The body is reclaimed at the teardown**, whatever names the record: nothing
 reads a dead process's handle table, boot set or domain, so none of them waits
@@ -2665,7 +2682,9 @@ makes a half-populated table unrepresentable — with no synchronization
 invented. The barrier covers threads too: a thread made through a `Created`
 child's handle is inert, and `ThreadOp.Start` on it is a `BadState` fault until
 the child has been started, so no thread of a process runs before its `Start`. **A second `start` is a `BadState` fault**: broken code, and the
-caller is the one that started it the first time. **A malformed image is a
+caller is the one that started it the first time. **A process that is never
+started is not leaked**: when nothing names it any more it is torn down as if it
+had exited, and its record and body come back (§2.7). **A malformed image is a
 `BadImage` status, not a fault** — the one caller-supplied thing that does not
 end the caller, because image bytes are data a launcher was handed rather than
 something it wrote (the `from(raw:)` precedent).
@@ -3077,9 +3096,6 @@ loader parses and reports while no process stores either.
 - The object lifecycle is not yet enforced as §2.10 states it: the
   teardown's close-all releases every handle but counts without freeing, the
   sweeps after it invalidate the bound kinds rather than before it.
-- A child that is created but never started, once nothing names it, is never
-  torn down, so whatever it was given stays held: an Interrupt's line
-  included, which no one can bind again.
 - `sosrt`'s bump arena takes no lock, so under a kernel that preempts (today
   only the preemption harness; §7) two threads of one process allocating at once
   can race (§5c).
@@ -3090,6 +3106,9 @@ loader parses and reports while no process stores either.
 - A cycle of connections, each carrying the next one's outlet in a staged
   message, is never freed. Only the one-link cycle, a connection's outlet
   through its own inlet, is refused (§3).
+- A `Created` process whose last references sit in its own boot set (a
+  Waiter attached to its own record and given to it, say) never reaches a zero
+  count, so it is never torn down (§2.7).
 - A Mapping whose handles are all released leaves its row installed until the
   target's teardown (§2.5).
 - The kernel is uniprocessor (§7).
