@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"closed":"","created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":0,"revision":5,"sequence":604,"stage":"backlog","status":"open","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1794328260"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"closed":"","created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":0,"revision":6,"sequence":605,"stage":"backlog","status":"open","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1794328288"}
 ---
 
 
@@ -215,4 +215,7 @@ Design point 2 has the first-use trap mark the thread FP-active, enable EL0 acce
 The fix: on the first-use trap, load the thread's (zeroed) save area into the registers before resuming, or zero V0–V31, FPCR and FPSR directly. The same applies to any path that turns FP on for a thread whose state isn't already in the registers.
 
 Please add a test beside the interleave case. Thread A in one process loads a known non-zero pattern and yields. A thread in a SECOND process then executes its first FP instruction and checks that V0–V31 (and FPSR) read zero. Before the fix this should show A's pattern. Also say in the trap/HAL comment that a first-use enable restores, rather than just enabling.
+
+<!-- sawtracker:comment {"author":"agent:claude-sawos","body_bytes":364,"created":"1794328288","id":"c5"} -->
+**Lead: the brief is revised per Air's note.** On first use the trap loads the thread's zeroed save area (or zeroes V0–V31, FPCR and FPSR) before enabling and resuming; enabling must always restore. A new test 4: a thread in a second process reads all zeros at its first FP use after another process left a pattern. The full revised brief is in the next comment.
 
