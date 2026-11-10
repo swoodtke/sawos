@@ -1,0 +1,187 @@
+// Test child: more workers than its Thread quota, one at a time, each exiting
+// through a handle onto itself that nothing else names (spec §2.9, §2.10).
+//
+// Expected transcript:
+//
+//   SOS childchurn: churned 8 workers, 8 ran
+//
+// then the process ends through its main thread's own `Exit`, the last thread
+// out, so the exit line carries `EXIT_LAST` and the teardown line follows.
+//
+// The Thread quota (`DEFAULT_QUOTA_THREADS`) is four and the main thread holds
+// one, so only three workers could be alive and named at once. Each worker is
+// started and its creator's handle released before it runs, then it takes a
+// handle onto itself and exits through it, which is the only name the exited
+// thread has. `Exit` releasing that handle frees the slot and returns the
+// quota row, so the loop is never refused; a kernel that held the slot until
+// the process died would refuse the fourth create.
+//
+// A launcher that gives it an inlet under `TAG_DEADLOCK` asks for the other
+// role. The main thread starts one unnamed worker, then joins a thread that is
+// never started, so it parks for good. The worker exits through its only
+// handle and nothing is left to run: the kernel ends the process with a
+// deadlock, on the process the exiting thread belonged to. The worker's slot
+// is freed after the kernel has used it for that report, which is what the
+// launcher's check on the ending shows.
+//
+// Every thread of this image enters at `_start`, so the entry works out which
+// thread it is: the main thread is the one that has not yet parked the boot
+// handle.
+
+import sos.{System, Process, SosStatus}
+
+/// The launcher's tag for the deadlock role's inlet.
+static TAG_DEADLOCK: UInt = 40
+
+/// The count of workers: more than the Thread quota allows at once.
+static WORKERS: UInt = 8
+
+/// What a worker exits with, past its index.
+static CODE_BASE: UInt = 100
+
+/// The process's exit code, from its last thread's `Exit`.
+static EXIT_LAST: UInt = 54
+/// Something on the way failed; the line before it says what.
+static EXIT_MISMATCH: UInt = 98
+
+/// The boot handle, parked by the main thread for the workers. Handle 0 names
+/// nothing, so a parked handle is never 0 and an unparked slot is never one.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+/// How many workers have run to their exit call.
+unsafe static var RAN: UInt = 0
+
+/// The workers' one stack. A worker runs from its first instruction to its
+/// exit without parking, and nothing preempts it here, so they never overlap.
+static STACK_WORDS: Int = 512
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func park_boot_handle(word: UInt) unsafe { BOOT_HANDLE = word }
+
+func parked_boot_handle() unsafe -> UInt { BOOT_HANDLE }
+
+func note_ran() unsafe { RAN = RAN + 1 }
+
+func ran() unsafe -> UInt { RAN }
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        main_thread(arg)
+    } else {
+        worker(arg)
+    }
+}
+
+/// A worker: take a handle onto itself, let go of the Process handle it came
+/// through, and exit through the thread handle. Falling off `_start` faults
+/// the process, so a refusal here shows in the transcript.
+func worker(index: UInt) unsafe {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    let _ = move proc
+    note_ran()
+    let _ = (move me).exit(CODE_BASE + index)
+}
+
+func main_thread(boot: UInt) {
+    park_boot_handle(boot)
+    let system = System(boot_handle: boot)
+    let proc = try system.process_self() catch {
+        print("SOS childchurn: no process handle: {}\n", error)
+        return
+    }
+
+    var deadlock = false
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                if rec.tag == TAG_DEADLOCK {
+                    deadlock = true
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+    if deadlock {
+        stall(&proc)
+        return
+    }
+
+    let me = try proc.thread_self() catch {
+        print("SOS childchurn: no thread handle: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+
+    var made: UInt = 0
+    while made < WORKERS {
+        let t = try proc.thread_create(stack_top: stack_top(), arg: made) catch {
+            print("SOS childchurn: create {} refused: {}\n", made, error)
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        }
+        try t.start() catch {
+            print("SOS childchurn: start refused: {}\n", error)
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        }
+        // The creator's name goes before the worker has run.
+        let _ = move t
+        // The worker runs to its exit before this thread runs again.
+        try me.yield_now() catch {
+            print("SOS childchurn: yield refused: {}\n", error)
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        }
+        made = made + 1
+    }
+    print("SOS childchurn: churned {} workers, {} ran\n", made, ran())
+    if ran() != made {
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let _ = (move me).exit(EXIT_LAST)
+}
+
+/// The deadlock role: park this thread for good, then let the only other
+/// thread exit through its only handle. Returning from here would end the
+/// process by falling off `_start`, so reaching the end is the failure.
+func stall(proc: &Process) {
+    let worker_thread = try proc.thread_create(stack_top: stack_top(), arg: 0) catch {
+        print("SOS childchurn: create refused: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let never = try proc.thread_create(stack_top: stack_top(), arg: 0) catch {
+        print("SOS childchurn: create refused: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    try worker_thread.start() catch {
+        print("SOS childchurn: start refused: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let _ = move worker_thread
+    print("SOS childchurn: parking the main thread\n")
+    // `never` is not started, so this join waits for good.
+    let code = try never.join() catch {
+        print("SOS childchurn: join refused: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    print("SOS childchurn: the join returned {}\n", code)
+    let _ = proc.exit(EXIT_MISMATCH)
+}

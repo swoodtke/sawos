@@ -7,10 +7,11 @@
 //
 // A round makes threads until the slab refuses one. Each is started and its
 // handle released at once, so its count is zero before it has run a single
-// instruction. Root then yields, and every worker runs: it publishes its own
-// handle as a word, and exits through it with its index plus `CODE_BASE`. Root
-// joins each through that word, which must read the worker's code, and
-// releases it, which drops the last name of an exited thread.
+// instruction. Root then yields, and every worker runs: it publishes a handle
+// onto itself as a word, and exits through another with its index plus
+// `CODE_BASE`. Root joins each through the published word, which must read the
+// worker's code, and releases it, which drops the last name of an exited
+// thread.
 //
 // That the workers ran and exited with their codes shows a thread that has not
 // exited is not freed by losing its last handle. That the second round makes
@@ -19,7 +20,9 @@
 // thread slab less root's own thread, the same on every profile.
 //
 // A worker cannot exit with no handle naming it, because `Exit` names the
-// thread through one. The word it exits through is the one root releases.
+// thread through one. It exits through a second handle onto itself, which the
+// exit releases, and root releases the word the worker published: the last
+// name of the exited thread.
 
 import sos.{System, Process, Thread, SosStatus, ALL_RIGHTS,
             sos_handle_release, sos_system_process_self,
@@ -80,8 +83,9 @@ func _start(arg: UInt) {
     }
 }
 
-/// A worker: publish a handle onto itself and exit through it. Falling off
-/// `_start` faults the process, so a refusal here shows in the transcript.
+/// A worker: publish a handle onto itself and exit through another, which the
+/// exit releases. Falling off `_start` faults the process, so a refusal here
+/// shows in the transcript.
 func worker(index: UInt) unsafe {
     var pw: UInt = 0
     if sos_system_process_self(parked_boot_handle(), ALL_RIGHTS as UInt,
@@ -89,13 +93,16 @@ func worker(index: UInt) unsafe {
         return
     }
     var tw: UInt = 0
+    var exiting: UInt = 0
     let st = sos_process_thread_self(pw, (&var tw) as UnsafePointer<UInt>)
+    let st_exit = sos_process_thread_self(pw,
+                                          (&var exiting) as UnsafePointer<UInt>)
     let _ = sos_handle_release(pw)
-    if st != STATUS_OK {
+    if st != STATUS_OK || st_exit != STATUS_OK {
         return
     }
     SELF_WORDS[index as Int] = tw
-    let _ = sos_thread_exit(tw, CODE_BASE + index)
+    let _ = sos_thread_exit(exiting, CODE_BASE + index)
 }
 
 /// Join the thread `word` names and answer its exit code.

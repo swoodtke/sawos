@@ -34,7 +34,7 @@ The kernel's object kinds, each a slab-allocated kernel struct:
 | Object | Role |
 |---|---|
 | `AddressSpace` | Isolation domain, defined abstractly. P4: PMP region set + APM/REE security context (see §5.5 — the P4's MMU is real but global and external-memory-only, not per-process). Paging targets: page-table root. There is no AddressSpace object: the domain is the process (see below). |
-| `Thread` | Kernel-scheduled execution context bound to an AddressSpace. Saw's cooperative TaskGroups run *inside* a thread, in userspace — the kernel never sees tasks. Ops `Start`/`Join`/`Exit`/`Yield`; rights `ThreadRight.Start`/`.Join`/`.Control`. The saved trap frame is the context, so a switch is the trap handler returning a different frame (§7). Lifecycle: §8. |
+| `Thread` | Kernel-scheduled execution context bound to an AddressSpace. Saw's cooperative TaskGroups run *inside* a thread, in userspace — the kernel never sees tasks. Ops `Start`/`Join`/`Exit`/`Yield`; `Exit` releases the handle it is invoked through; rights `ThreadRight.Start`/`.Join`/`.Control`. The saved trap frame is the context, so a switch is the trap handler returning a different frame (§7). Lifecycle: §8. |
 | `MemoryObject` | A range of RAM that can be mapped into AddressSpaces; the kind is `Memory`. Ops `Split`/`Map`; rights `MemoryRight.Split`/`.Map`/`.MapExecute`. Roots are minted at boot from the region table. §2.5. |
 | `IoMemoryObject` | Physical memory-mapped device registers; the kind is `IoMemory`. A distinct kind rather than a flag on `MemoryObject`, so a driver cannot obtain a cacheable view of a register block by construction. Ops `Carve`/`Map`; rights `IoMemoryRight.Carve`/`.Map`. §2.5. |
 | `Mapping` | One installed protection row, with its own handle. Ops `Unmap`/`Base`; rights `MappingRight.Unmap`/`.Base`. Not givable. §2.5. |
@@ -74,7 +74,7 @@ somebody says what references it:
 | PipeOutlet | handle entries + its attachment — the same row's outlet column, mirrored. The two arms of `free_object` are one act written twice, because reaching it through either kind means both columns are already zero |
 | PipeReply | handle entries + its attachment, on one ring slot's claim column. A delivery of this kind drops that attachment's reference — a claim is a one-shot, so its delivery is inherently consuming — which is the one place in the ledger where answering a wait is what frees an object. A one-shot exists for exactly as long as one in-flight message, so the pair is ring-slot state rather than a third slab: the object is an exchange (`connection * PIPE_INFLIGHT + ring slot`) and the claim counts on its reply column. The ring slot goes back when both of the exchange's columns are zero and nothing is owed — a staged message is still owed to a live outlet whatever became of its claim, which is §2.1's TELL idiom |
 | PipeRequest | handle entries + its attachment — the same exchange's obligation column, mirrored. Reaching zero on one column is the abandonment transition, read off the counts by `reply` and `resolve` exactly as the connection's peer-gone is; and the connection cannot free while any exchange in it is live, which keeps a claim from being handed a recycled row |
-| Thread | handle entries. A thread that has not exited is never freed by losing its last handle, as a live process is not: its slot is what it runs in, so a thread frees once it has exited or been invalidated and nothing names it. A thread that exited normally is not invalid: it is `Exited`, its slot keeps the exit code a late `Join` reads through any handle, even after its process is `Gone`, and it is freed when the count reaches zero. Only a thread that has not exited when its process dies is invalidated, so its `Join` answers `Revoked` and its slot keeps nothing for one (§2.10) |
+| Thread | handle entries. A thread that has not exited is never freed by losing its last handle, as a live process is not: its slot is what it runs in, so a thread frees once it has exited or been invalidated and nothing names it. A thread that exited normally is not invalid: it is `Exited`, its slot keeps the exit code a late `Join` reads through any handle, even after its process is `Gone`, and it is freed when the count reaches zero. `Exit` releases the handle it is invoked through, so a thread that exits with no other handle naming it is freed at its exit, and any other handle keeps the `Exited` slot readable. Only a thread that has not exited when its process dies is invalidated, so its `Join` answers `Revoked` and its slot keeps nothing for one (§2.10) |
 | Clock | exempt — kernel-eternal, owned by nobody (§2.6). Freeing a domain's slot on a release would take the machine's counter from everybody else |
 | System | no slab: the singleton every System handle names |
 
@@ -1518,7 +1518,7 @@ handle to make the op that would answer `Revoked`.
 
 | kind | lifetime |
 |---|---|
-| Thread, Timer, Waiter, Mapping | **Bound** to the process that owns it: invalidated when that process dies, freed when the last handle goes. A Mapping's owner is the process whose domain holds its row (the target of its `map`), not the process holding its handle. A Thread that exited before its process died is not invalidated: `Exited` wins, and a late `Join` through any handle reads its exit code from the slot, even after the process is `Gone`, the slot being held while a handle names it. A Thread that has not exited when its process dies is invalid, so `Join` answers `Revoked` and the slot keeps nothing for it. A Thread frees once it has exited or been invalidated and nothing names it |
+| Thread, Timer, Waiter, Mapping | **Bound** to the process that owns it: invalidated when that process dies, freed when the last handle goes. A Mapping's owner is the process whose domain holds its row (the target of its `map`), not the process holding its handle. A Thread that exited before its process died is not invalidated: `Exited` wins, and a late `Join` through any handle reads its exit code from the slot, even after the process is `Gone`, the slot being held while a handle names it. `Exit` releases the handle it is invoked through: only that handle goes, every other one still reads the slot, and a Thread that exits with no other handle naming it is freed at its exit. A Thread that has not exited when its process dies is invalid, so `Join` answers `Revoked` and the slot keeps nothing for it. A Thread frees once it has exited or been invalidated and nothing names it |
 | Interrupt | **One name, its handle.** No `Mint` in its default set, and attenuation is monotonic, so no handle can regain it (§3). Releasing the handle, explicitly or by its holder's teardown, destroys the Interrupt: it unbinds and masks the line. A give or a staged message moves the one name and is not a release. An attachment does not extend its life; it holds the invalid Interrupt until it is removed, and fires as an invalidated waitable does. A consuming attach of an Interrupt is refused as a caller error (`BadArg`, §2.2), so the driver keeps the one handle it acks with. Charged to no quota (§2.9) and bound to no process: nothing names its binder's record, so the teardown has nothing to disown |
 | Event, Pipe, Memory, IoMemory | **Shared:** live until the last handle goes, whatever happens to the process charged for them |
 | Process | `Gone` is its invalid state (§8), and a `Gone` process is a record with no body. `GetStatus` and an attachment read the status word the record keeps, and `Stats` reads the final trap counters the teardown copied into it (§2.7). `Start` and `Give` naming a `Gone` child stay `BadState` faults, because a `Gone` child was always started and its launcher knows (§2.7). Every other op that acts on the process answers `Revoked`, a `map` naming it as the target included: the mapper did not cause the death. The teardown frees the body; the record is reclaimed when it is `Gone` and its count is zero (§2.7) |
@@ -1587,9 +1587,10 @@ whose last outlet the close-all released, say), nor one freed later by the
 reap's exchange scan, nor one still named elsewhere, which survives disowned.
 `threads=` counts the dying process's own threads the thread sweep freed,
 invalidated or `Exited`, which are those nothing named once its handles were
-gone. It does not count an `Exited` thread of its own freed earlier, inside the
-close-all (one only a staged message named, released when the close-all
-dropped the connection's last outlet, say), nor one still named elsewhere,
+gone. It does not count an `Exited` thread of its own freed earlier, at its
+exit (`Exit` released the last handle naming it) or inside the close-all (one
+only a staged message named, released when the close-all dropped the
+connection's last outlet, say), nor one still named elsewhere,
 which survives disowned, nor another process's thread whose last name the
 close-all dropped. `waiters=` and `timers=` count the dying process's own
 Waiters and Timers that the Waiter and Timer sweeps freed, which are those
@@ -1613,8 +1614,9 @@ field.
   either live or mid-teardown with its ledger about to be cleared, so a refund
   can never land on a reused process record, and the invalid object is
   disowned at the teardown (above). A thread that exits is never invalidated,
-  so its charge comes back when its `Exited` slot is freed, and its process's
-  Thread quota bounds the slots it holds, exited ones included. A slot freed
+  so its charge comes back when its `Exited` slot is freed (at its exit, when
+  `Exit` released the last handle naming it), and its process's Thread quota
+  bounds the slots it holds, exited ones included. A slot freed
   after its owner's death has disowned it credits nobody.
 - **A shared kind can outlive the process charged for it**, so that process's
   death disowns it (above). The teardown first frees the shared objects nothing

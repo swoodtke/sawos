@@ -509,6 +509,8 @@ CHILD_EVENT_PKG = os.path.join(TESTS_DIR, "child-event")
 THREAD_GIVE_PKG = os.path.join(TESTS_DIR, "thread-give")
 THREAD_GIVE_RETURNS_PKG = os.path.join(TESTS_DIR, "thread-give-returns")
 THREAD_SLOTS_PKG = os.path.join(TESTS_DIR, "thread-slots")
+THREAD_EXIT_PKG = os.path.join(TESTS_DIR, "thread-exit")
+CHILD_CHURN_PKG = os.path.join(TESTS_DIR, "child-churn")
 CHILD_THREAD_PKG = os.path.join(TESTS_DIR, "child-thread")
 THREAD_QUOTA_PKG = os.path.join(TESTS_DIR, "thread-quota")
 THREAD_HANG_PKG = os.path.join(TESTS_DIR, "thread-hang")
@@ -984,6 +986,9 @@ def expectations(arch):
         "served_mark": f"0x{0x33:0{width}x}",
         "owned_mark": f"0x{0x34:0{width}x}",
         "parked_mark": f"0x{0x35:0{width}x}",
+        # `child-churn`'s exit code, from its last thread's `Exit`, asserted in
+        # `thread_exit`.
+        "churn_mark": f"0x{0x36:0{width}x}",
     }
 
 
@@ -1350,17 +1355,16 @@ TEST_CASES = [
                        "SOS threads: two workers, status word 0",
                        "ABABABAB",
                        "SOS threads: joined a=11 b=22",
-                       # Teardown handle counts. Ten: the three boot handles,
-                       # the two Threads this process created, and five
-                       # derivations (each of the three threads asks the
-                       # System object which Process it is, and the two
-                       # workers also ask the Process which Thread they are).
-                       # Nothing is released before the exit, so every one is
-                       # still bound at teardown. The two trailing counts say a
-                       # process that made no Event and no Waiter reports
-                       # none, the null row of the claim the Event cases below
-                       # make with real objects.
-                       "SOS: process teardown handles={ten} threads={three} "
+                       # Teardown handle counts. Eight: the three boot handles,
+                       # the two Threads this process created, and three
+                       # Process derivations (each of the three threads asks
+                       # the System object which Process it is). The two
+                       # workers also ask the Process which Thread they are,
+                       # and each releases that handle by exiting through it.
+                       # The two trailing counts say a process that made no
+                       # Event and no Waiter reports none, the null row of the
+                       # claim the Event cases below make with real objects.
+                       "SOS: process teardown handles={eight} threads={three} "
                        "events={zero} waiters={zero}"],
         "expect_clean_exit": True,
     },
@@ -5122,8 +5126,8 @@ TEST_CASES = [
         # The child's `threads=` is its main thread alone: the two it sent
         # survive its death, named by root's handles. Its `handles=` are its
         # System and Process handles, the given thread's handle and its outbox,
-        # its main thread's own word, and the exited worker's Process and
-        # Thread handles.
+        # its main thread's own word, and the exited worker's Process handle;
+        # the worker's Thread handle went with its exit.
         "name": "thread_give",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": THREAD_GIVE_PKG,
@@ -5134,7 +5138,7 @@ TEST_CASES = [
                        "SOS threadgive: started",
                        "SOS threadgive: the child joined the given thread: 33",
                        "SOS: process exit: code={sent_mark} process={one}",
-                       "SOS: process teardown handles={seven} threads={one} "
+                       "SOS: process teardown handles={six} threads={one} "
                        "events={zero} waiters={zero} interrupts={zero} "
                        "timers={zero} process={one}",
                        "SOS threadgive: the parked join answered: what this "
@@ -5169,7 +5173,7 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
                        "SOS: process exit: code={left_mark} process={one}",
-                       "SOS: process teardown handles={five} threads={one} "
+                       "SOS: process teardown handles={four} threads={one} "
                        "events={zero} waiters={zero} interrupts={zero} "
                        "timers={zero} process={one}",
                        "SOS threadquota: the leaver's thread outlived it: "
@@ -5257,7 +5261,7 @@ TEST_CASES = [
                        "SOS threadreturns: the Thread give was refused: this "
                        "process is at its quota",
                        "SOS threadreturns: the refused Thread joins 7",
-                       "SOS: process teardown handles={ten} threads={two} "
+                       "SOS: process teardown handles={nine} threads={two} "
                        "events={zero} waiters={zero} interrupts={zero} "
                        "timers={zero} process={zero}"],
         "expect_clean_exit": True,
@@ -5265,15 +5269,55 @@ TEST_CASES = [
     {
         # Thread slots are counted (spec 2). Each round makes threads until the
         # slab refuses one and lets go of every handle before the thread runs;
-        # the threads still run and exit through handles onto themselves, which
-        # root then releases. `first=7` is the slab less root's own thread, and
-        # `again=7` is every exited slot coming back once nothing named it.
+        # the threads still run, publish a handle onto themselves and exit
+        # through another, and root then releases the published one. `first=7`
+        # is the slab less root's own thread, and `again=7` is every exited
+        # slot coming back once nothing named it.
         "name": "thread_slots",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": THREAD_SLOTS_PKG,
         "expect_out": ["{banner}",
                        "SOS threadslots: first=7 again=7",
                        "SOS threadslots: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # `ThreadOp.Exit` releases the handle it is invoked through (spec 2,
+        # 2.10). Root keeps a worker's creator handle and joins it twice after
+        # the worker exited through its own: the code reads both times. Root
+        # then makes more workers than the slab holds, each exiting through the
+        # only name its exited thread has, and none is refused because each
+        # slot came back at its exit. `child-churn` does the same against a
+        # Thread quota of four (`churned 8`), then ends its process by exiting
+        # its last thread; the exit line carries its code and the teardown line
+        # follows. A second `child-churn`, in its deadlock role, parks its main
+        # thread and lets its only other thread exit through its only handle:
+        # nothing can run, so the kernel ends that child with a deadlock. The
+        # report reads the exiting thread's process after the exit has dropped
+        # the last reference, so the slot must outlive the drop until the
+        # switch; a slot freed at the drop would blame process zero, which is
+        # root, and stop the machine.
+        "name": "thread_exit",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": THREAD_EXIT_PKG,
+        "children": [CHILD_CHURN_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS threadexit: the kept handle joins 71, and again 71",
+                       "SOS threadexit: churned 20 workers, 21 ran",
+                       "SOS childchurn: churned 8 workers, 8 ran",
+                       "SOS: process exit: code={churn_mark} process={one}",
+                       "SOS: process teardown handles={two} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS threadexit: the churn child ended through its last "
+                       "thread",
+                       "SOS childchurn: parking the main thread",
+                       "SOS: process fault: every thread blocked "
+                       "process={one}",
+                       "SOS threadexit: the stalled child was ended by a "
+                       "deadlock",
+                       "SOS threadexit: done"],
         "expect_clean_exit": True,
     },
     {

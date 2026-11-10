@@ -68,10 +68,14 @@ extension Thread {
     /// Does not return. Requires `ThreadRight.Control`, and the handle must
     /// name the calling thread.
     ///
-    /// The handle stays bound: this wrapper never drops, so it still names the
-    /// exited thread, which holds its slot and a row of its process's Thread
-    /// quota until it is released, at the latest by its process's teardown.
-    public func exit(&self, code: UInt) -> Result<Void, SosStatus> {
+    /// The exit releases this handle, as `PipeRequest.reply` releases its
+    /// request, so the method consumes the wrapper: `(move me).exit(code)`.
+    /// Every other handle onto the thread still names it, and a `join` through
+    /// one reads the code. If none does, the exited thread is freed at once and
+    /// its slot and its row of its process's Thread quota come back. A thread
+    /// that exits through the only handle onto it therefore leaves nothing
+    /// behind.
+    public func exit(&var self, code: UInt) consumes -> Result<Void, SosStatus> {
         checked(sos_thread_exit(self.handle, code))
     }
 

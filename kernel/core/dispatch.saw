@@ -1616,6 +1616,11 @@ func thread_create(p: Int, owner: Int, entry: UInt, stack_top: UInt,
 /// is not something the object model offers, and a process that tries has
 /// misread its own handles.
 ///
+/// `Exit` also releases the handle it was invoked through (`exit_thread`):
+/// that one entry is unbound and its reference dropped, every other handle
+/// onto the thread keeps naming the `Exited` slot, and a thread nothing else
+/// names is freed once it is off the processor.
+///
 /// An invalid thread (its process died before it exited, spec §2.10) answers
 /// `Start` and `Join` with `Revoked`, after the rights check and the self-join
 /// check fault as they would on a live thread. `Exit` and `Yield` through its
@@ -1682,7 +1687,7 @@ func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
             if target != CURRENT_THREAD {
                 fault_process(p, FaultReason.NotSelf)
             }
-            exit_thread(target, arg0)
+            exit_thread(target, arg0, obj.handle)
             // No pair is ever written: this thread does not resume.
             op_blocked()
         },

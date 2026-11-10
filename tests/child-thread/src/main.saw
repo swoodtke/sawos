@@ -18,12 +18,12 @@
 // it, named by the launcher.
 //
 // The quota role is given an outbox under `TAG_QUOTA_OUT`. It makes workers one
-// at a time, each exiting through a handle onto itself that stays bound, until
-// a create is refused: its main thread and its exited workers count against
-// its Thread quota (`DEFAULT_QUOTA_THREADS`). It tells the launcher, which then
-// releases a thread a dead process in this record left behind, and asks once
-// more, which must still be refused. It releases its workers' handles and makes
-// the same number again.
+// at a time, each publishing a handle onto itself that stays bound and exiting
+// through another, until a create is refused: its main thread and its exited
+// workers count against its Thread quota (`DEFAULT_QUOTA_THREADS`). It tells
+// the launcher, which then releases a thread a dead process in this record left
+// behind, and asks once more, which must still be refused. It releases its
+// workers' handles and makes the same number again.
 //
 // The hanger is given a launcher's thread under `TAG_HANG`. It starts one
 // worker that ends the process and one that never gets to run, then parks
@@ -166,7 +166,7 @@ func exits() {
     let system = System(boot_handle: parked_boot_handle())
     let proc = try system.process_self() catch { return }
     let me = try proc.thread_self() catch { return }
-    let _ = me.exit(CODE_EXITED)
+    let _ = (move me).exit(CODE_EXITED)
 }
 
 /// The worker that parks: it joins the main thread, which never exits, so it
@@ -194,15 +194,17 @@ func stranded() {
     let _ = proc.exit(EXIT_MISMATCH)
 }
 
-/// A slot worker: publish a handle onto itself and exit through it, so the
-/// exited slot stays named until the main thread releases the word.
+/// A slot worker: publish a handle onto itself and exit through another, which
+/// the exit releases, so the exited slot stays named until the main thread
+/// releases the published word.
 func slot(index: UInt) unsafe {
     let word = self_word()
-    if word == 0 {
+    let exiting = self_word()
+    if word == 0 || exiting == 0 {
         return
     }
     SLOT_WORDS[index as Int] = word
-    let _ = sos_thread_exit(word, CODE_SLOT + index)
+    let _ = sos_thread_exit(exiting, CODE_SLOT + index)
 }
 
 func main_thread(boot: UInt) {

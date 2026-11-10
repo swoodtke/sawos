@@ -48,6 +48,7 @@ import kcore.objects.{
     clear_boot_handles,
     quota_clear,
     quota_credit,
+    handle_word_index,
     unbind_handle,
 }
 import kcore.refs.{free_object, notify_ready, reap_unreferenced, ref_object,
@@ -57,6 +58,7 @@ import kcore.threads.{
     CURRENT_THREAD,
     LAST_PROT_PROCESS,
     NEED_RESCHED,
+    PENDING_FREE,
     SLICE_LEFT,
     SLICE_TICKS,
     THREADS,
@@ -168,6 +170,14 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
         next = ready_pop()
     }
 
+    // The outgoing thread is not read past this point. An exited thread that
+    // nothing names goes now (`PENDING_FREE`).
+    if PENDING_FREE != NO_THREAD {
+        let gone = PENDING_FREE
+        PENDING_FREE = NO_THREAD
+        free_object(ObjType.Thread, gone)
+    }
+
     run_thread(next)
 }
 
@@ -199,7 +209,8 @@ func resume_after_death() unsafe -> Never {
     hal.resume_frame(run_thread(next))
 }
 
-/// Retire the running thread with `code`, waking everything that joined it.
+/// Retire the running thread with `code`, waking everything that joined it, and
+/// release `handle`, the word the exit was invoked through.
 ///
 /// A joiner's return is written here, into its frame. A thread that blocks in a
 /// syscall must not have its result written when it blocks, or the resume would
@@ -207,12 +218,18 @@ func resume_after_death() unsafe -> Never {
 /// value nobody computed on both. So `Join` writes nothing, and the wake
 /// writes the result pair exactly once.
 ///
-/// The slot stays `Exited`, holding the code for a late join, and keeps its
-/// quota charge. It is not freed here: `ThreadOp.Exit` names the thread through
-/// a handle, so its count is at least one. It is freed, and the charge given
-/// back, when its last handle goes (`free_object`), or by its process's
-/// teardown once nothing names it.
-public(package) func exit_thread(slot: Int, code: UInt) unsafe {
+/// The slot stays `Exited`, holding the code for a late join through any other
+/// handle, and keeps its quota charge until its last reference goes. The
+/// handle is unbound and its reference dropped here, after the thread is
+/// marked `Exited`, because a drop to zero frees only an `Exited` or `Invalid`
+/// slot. If that was the last reference the free is deferred to `pick_next`
+/// (`PENDING_FREE`): this thread is still the running one until the switch,
+/// and the switch reads its slot. The handle is unbound before the process can
+/// end, so the teardown's close-all never drops it a second time.
+///
+/// When this was the process's last thread the process ends here, carrying the
+/// code, and the teardown's thread sweep frees the slot if nothing names it.
+public(package) func exit_thread(slot: Int, code: UInt, handle: UInt) unsafe {
     THREADS[slot].state = ThreadState.Exited
     THREADS[slot].exit_code = code
 
@@ -226,13 +243,20 @@ public(package) func exit_thread(slot: Int, code: UInt) unsafe {
         ready_push(waiter)
     }
 
+    // The process is read once, here: the slot may be freed before the switch.
+    let p = THREADS[slot].process
+    unbind_handle(p, handle_word_index(handle))
+    unref_teardown(ObjType.Thread, slot)
+
     // The last thread out ends the process, carrying its own exit code (the
     // ordinary way a program finishes without `Process.Exit`). For root that
     // stops the machine; for a child `end_process` does not return here,
     // because it resumes whoever runs next.
-    let p = THREADS[slot].process
     if live_threads(p) == 0 {
         end_process(p, ProcessStatusKind.Exited, code, code)
+    }
+    if THREADS[slot].refs == 0 {
+        PENDING_FREE = slot
     }
     NEED_RESCHED = true
 }
@@ -554,6 +578,7 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // other process here would leave the caller's thread `Running`, on no list,
     // and never scheduled.
     CURRENT_THREAD = NO_THREAD
+    PENDING_FREE = NO_THREAD
 
     // Attachments belong to a Waiter, so they are reclaimed by walking the
     // process's waiters: an attachment is a row in a Waiter's table and dies

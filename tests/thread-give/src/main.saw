@@ -36,14 +36,15 @@
 // capacity round's proof that release works on an invalid object.
 //
 // The capacity rounds show what is freed. A round makes threads until the slab
-// refuses one, lets them all exit through handles onto themselves, and
-// releases those (`tests/thread-slots`), so it leaves nothing behind and its
+// refuses one, lets them all exit, and releases the handles they published
+// (`tests/thread-slots`), so it leaves nothing behind and its
 // count is the free thread slots. `after` equals `before` only if every thread
 // of the case was freed:
 //
-//   - the given thread, which exits through a handle onto itself that root
-//     releases, so the child's handle is its last name: the child dies holding
-//     it, and its teardown frees another process's exited thread;
+//   - the given thread, which publishes a handle onto itself for root to
+//     release and exits through another, so the child's handle is its last
+//     name: the child dies holding it, and its teardown frees another
+//     process's exited thread;
 //   - the child's two workers, freed when root releases their handles, one
 //     `Exited` and one invalid;
 //   - the child's main thread, freed by its teardown.
@@ -169,25 +170,28 @@ func _start(arg: UInt) {
     }
 }
 
-/// The thread root gives away. It exits at once, through a handle onto itself
-/// that root releases afterwards.
+/// The thread root gives away. It publishes one handle onto itself, for root
+/// to release afterwards, and exits at once through another, which the exit
+/// releases.
 func given_thread() unsafe {
     let word = self_word()
-    if word == 0 {
+    let exiting = self_word()
+    if word == 0 || exiting == 0 {
         return
     }
     GIVEN_WORD = word
-    let _ = sos_thread_exit(word, CODE_GIVEN)
+    let _ = sos_thread_exit(exiting, CODE_GIVEN)
 }
 
-/// A round worker: publish a handle onto itself and exit through it.
+/// A round worker: publish a handle onto itself and exit through another.
 func round_worker(index: UInt) unsafe {
     let word = self_word()
-    if word == 0 {
+    let exiting = self_word()
+    if word == 0 || exiting == 0 {
         return
     }
     SELF_WORDS[index as Int] = word
-    let _ = sos_thread_exit(word, CODE_BASE + index)
+    let _ = sos_thread_exit(exiting, CODE_BASE + index)
 }
 
 func initial(boot_handle: UInt) {

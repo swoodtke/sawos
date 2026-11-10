@@ -1,0 +1,257 @@
+// `ThreadOp.Exit` releases the handle it is invoked through (spec §2, §2.10).
+//
+// Expected transcript:
+//
+//   SOS threadexit: the kept handle joins 71, and again 71
+//   SOS threadexit: churned 20 workers, 21 ran
+//   SOS childchurn: churned 8 workers, 8 ran
+//   SOS: process exit: code=54 process=1
+//   SOS: process teardown handles=... threads=1 ...
+//   SOS threadexit: the churn child ended through its last thread
+//   SOS childchurn: parking the main thread
+//   SOS threadexit: the stalled child was ended by a deadlock
+//   SOS threadexit: done
+//
+// First, root creates a worker and keeps the creator's handle. The worker
+// takes a handle onto itself and exits through it. That handle goes with the
+// exit, but the creator's handle still names the exited thread, so the join
+// reads the exit code, and reads it again.
+//
+// Second, root makes more workers than the thread slab holds, one at a time.
+// Each is started and its creator's handle released before it runs, so the
+// self handle it exits through is the last name the exited thread has. Each
+// slot comes back at its exit, so no create is refused; a kernel that held the
+// slot until the process died would refuse one once the slab was full.
+//
+// Third, root runs `child-churn`, which does the same against a Thread quota
+// of four, then ends its process by exiting its last thread. The exit line
+// and the teardown line are the process ending cleanly.
+//
+// Fourth, root runs it again in its deadlock role: the child's main thread
+// parks for good and its only other thread exits through its only handle. With
+// nothing left to run the kernel ends the child with a deadlock, naming the
+// process of the thread that just exited. That thread's slot has already lost
+// its last reference, so this shows the free waits for the switch.
+
+import sos.{System, Process, Memory, Thread, SystemRight, SosStatus,
+            WaitPayload}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tag the child's boot record travels under.
+static TAG_BOOT: UInt = 7
+
+/// The key root's attachment lives under.
+static KEY_CHILD: UInt = 82
+
+/// The kept worker's argument and exit code.
+static ROLE_KEPT: UInt = 1000
+static CODE_KEPT: UInt = 71
+
+/// How many churn workers root makes: more than the slab has room for.
+static WORKERS: UInt = 20
+
+/// The deadlock role's tag, and the §8 status word of a process the kernel
+/// ended with a deadlock: the `Faulted` kind in the high half, the reason in
+/// the low.
+static TAG_DEADLOCK: UInt = 40
+static DEADLOCKED: UInt = (2 << 16) + 7
+
+/// The churn child's exit code, from its last thread, and the kind half of a
+/// §8 status word for a process that exited.
+static EXIT_LAST: UInt = 54
+static EXITED: UInt = 1 << 16
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// The boot handle, parked by the initial thread for the workers. Handle 0
+/// names nothing, so a parked handle is never 0 and an unparked slot is never
+/// one.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+/// How many workers have reached their exit call.
+unsafe static var RAN: UInt = 0
+
+/// The workers' one stack. A worker runs from its first instruction to its
+/// exit without parking, and nothing preempts it here, so they never overlap.
+static STACK_WORDS: Int = 512
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func park_boot_handle(word: UInt) unsafe { BOOT_HANDLE = word }
+
+func parked_boot_handle() unsafe -> UInt { BOOT_HANDLE }
+
+func note_ran() unsafe { RAN = RAN + 1 }
+
+func ran() unsafe -> UInt { RAN }
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        worker(arg)
+    }
+}
+
+/// A worker: take a handle onto itself, let go of the Process handle it came
+/// through, and exit through the thread handle. Falling off `_start` faults
+/// the process, so a refusal here shows in the transcript.
+func worker(role: UInt) unsafe {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    let _ = move proc
+    note_ran()
+    let _ = (move me).exit(if role == ROLE_KEPT { CODE_KEPT } else { role })
+}
+
+func initial(boot: UInt) {
+    park_boot_handle(boot)
+    let system = System(boot_handle: boot)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS threadexit: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS threadexit: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS threadexit: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    try kept(&proc)
+    try churn(&proc)
+    try child(&system, &proc, &image, &ram)
+    try stalled(&system, &proc, &image, &ram)
+    return
+}
+
+/// The creator keeps its handle, the worker exits through its own, and the
+/// join reads the code, twice.
+func kept(proc: &Process) -> Result<Void, SosStatus> {
+    let t = try proc.thread_create(stack_top: stack_top(), arg: ROLE_KEPT)
+    try t.start()
+    let first = try t.join()
+    let again = try t.join()
+    print("SOS threadexit: the kept handle joins {}, and again {}\n", first,
+          again)
+    if first != CODE_KEPT || again != CODE_KEPT {
+        return BUG
+    }
+    return
+}
+
+/// More workers than the slab holds, one at a time, none named by its creator.
+func churn(proc: &Process) -> Result<Void, SosStatus> {
+    let me = try proc.thread_self()
+    var made: UInt = 0
+    while made < WORKERS {
+        let t = try proc.thread_create(stack_top: stack_top(), arg: made)
+        try t.start()
+        // The creator's name goes before the worker has run.
+        let _ = move t
+        // The worker runs to its exit before this thread runs again.
+        try me.yield_now()
+        made = made + 1
+    }
+    print("SOS threadexit: churned {} workers, {} ran\n", made, ran())
+    return
+}
+
+/// Run `child-churn` to its end and check how it ended.
+func child(system: &System, proc: &Process, image: &Memory,
+           ram: &Memory) -> Result<Void, SosStatus> {
+    let c = try system.process_create(image: &image, memory: &ram)
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &c, key: KEY_CHILD)
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try c.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try c.start(boot_tag: TAG_BOOT)
+
+    let ended = try waiter.wait()
+    if ended.key != KEY_CHILD {
+        return BUG
+    }
+    match ended.what {
+        case Process(status) -> {
+            if status != EXITED + EXIT_LAST {
+                print("SOS threadexit: the child ended {}\n", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    let _ = system.debug_print(
+        "SOS threadexit: the churn child ended through its last thread\n")
+    return
+}
+
+/// Run `child-churn` in its deadlock role: its main thread parks for good and
+/// its only other thread exits, so the kernel ends the child with a deadlock.
+/// The ending is the child's, so root goes on.
+func stalled(system: &System, proc: &Process, image: &Memory,
+             ram: &Memory) -> Result<Void, SosStatus> {
+    let c = try system.process_create(image: &image, memory: &ram)
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &c, key: KEY_CHILD)
+    let pipe = try proc.pipe_create()
+    let (to_child, from_child) = move pipe
+    let _ = move from_child
+    try c.give(inlet: move to_child, tag: TAG_DEADLOCK) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try c.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try c.start(boot_tag: TAG_BOOT)
+
+    let ended = try waiter.wait()
+    if ended.key != KEY_CHILD {
+        return BUG
+    }
+    match ended.what {
+        case Process(status) -> {
+            if status != DEADLOCKED {
+                print("SOS threadexit: the child ended {}\n", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    let _ = system.debug_print(
+        "SOS threadexit: the stalled child was ended by a deadlock\n")
+    return
+}
