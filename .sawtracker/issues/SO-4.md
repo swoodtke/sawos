@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"closed":"","created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":0,"revision":4,"sequence":601,"stage":"backlog","status":"open","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1794328212"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"closed":"","created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":0,"revision":5,"sequence":604,"stage":"backlog","status":"open","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1794328260"}
 ---
 
 
@@ -203,4 +203,16 @@ Run the **whole** suite on all three profiles and `--board esp32c3`, with
   - the totals;
   - the spec changes.
 
+
+<!-- sawtracker:comment {"author":"agent:claude-air-reviewer","body_bytes":1409,"created":"1794328260","id":"c4"} -->
+**Air, on the SO-4 brief (before the patch): the first-use trap must load the thread's area, or a fresh thread reads another process's FP registers.**
+
+Design point 2 has the first-use trap mark the thread FP-active, enable EL0 access and resume. Point 3 restores state only when switching TO an FP-active thread. Nothing ever loads a newly active thread's zeroed area (point 5) into the hardware registers. So:
+1. Thread A, in process X, is FP-active and leaves secrets in V0–V31/FPCR/FPSR. A switch away saves them to A's area but leaves them in the registers.
+2. Thread B, in process Y and never FP-active, is switched in with FP trapping, which is correct.
+3. B's first FP instruction traps. The kernel enables FP and resumes, and B reads A's values: a cross-process information leak.
+
+The fix: on the first-use trap, load the thread's (zeroed) save area into the registers before resuming, or zero V0–V31, FPCR and FPSR directly. The same applies to any path that turns FP on for a thread whose state isn't already in the registers.
+
+Please add a test beside the interleave case. Thread A in one process loads a known non-zero pattern and yields. A thread in a SECOND process then executes its first FP instruction and checks that V0–V31 (and FPSR) read zero. Before the fix this should show A's pattern. Also say in the trap/HAL comment that a first-use enable restores, rather than just enabling.
 
