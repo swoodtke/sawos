@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"closed":"","created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":0,"revision":3,"sequence":591,"stage":"backlog","status":"open","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1794326082"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"closed":"","created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":0,"revision":4,"sequence":601,"stage":"backlog","status":"open","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1794328212"}
 ---
 
 
@@ -84,4 +84,123 @@ So the hazard exists today, with two threads, or even one thread taking a device
 - A HAL note so a future FPU board (for example Xtensa on the S3) follows the same rule.
 
 Cache-block zeroing is filed separately as a HAL `zero_range`.
+
+<!-- sawtracker:comment {"author":"agent:claude-sawos","body_bytes":5815,"created":"1794328212","id":"c3"} -->
+# Brief: SO-4, arm64 EL0 FP/SIMD state is saved per thread
+
+The lead wrote this brief from the approach agreed with the user (Nov 10; see
+the last comment on SO-4). **If it is wrong, contradicts what you find, or
+leaves a decision you can't make from it, STOP and end your turn with a message
+beginning `CLARIFICATION REQUEST:` and the exact question.** **Never disable
+the sandbox.** If a command fails on a sandbox permission, stop with
+`CLARIFICATION REQUEST:` and the exact error. **Do the work yourself: no
+subagents or forks.** Don't write to sawtracker.
+
+Scratch files go in `<scratchpad>/SO-4/`, where `<scratchpad>` =
+`/private/tmp/claude-501/-Users-shawn-Projects-sawos/5d6020df-836c-40ce-9e68-9362e1dabb2a/scratchpad`.
+The comment rules and suite-lock protocol are in
+`<scratchpad>/brief-comments-common.md`; follow the lock rules exactly (one
+foreground command, `until mkdir L 2>/dev/null; do sleep 30; done; run; rmdir L`,
+never `rmdir` after a failed `mkdir`, nothing left running). Load the
+**saw-lang skill** if available. Read SO-4 and its comments first
+(`~/bin/sawtracker show SO-4`; export
+`SAWTRACKER_TOKEN="$(tr -d '\n' < /Users/shawn/Projects/sawos/.claude/sawtracker.token)"`;
+never print it; if the sandbox blocks it, read `.sawtracker/issues/SO-4.md`
+on fetched main).
+
+## Today
+
+- `hal/arm64/kernel/boot.S` sets `CPACR_EL1.FPEN = 3`: no trap at EL0 or EL1.
+- The trap frame saves x0–x30 and three system registers, with no FP/SIMD
+  state.
+- **The kernel image executes no FP/SIMD instruction today.** The lead checked
+  with `llvm-objdump` on a current arm64 image. Nothing enforces that, though:
+  the kernel's C (`sink.c`, `support.c`) is built without
+  `-mgeneral-regs-only`, and an older `support.c` `memcpy` did emit `q0`/`q1`
+  (Air's SO-4 comment).
+- User code (C images especially) may use FP/SIMD, and nothing saves it across
+  a thread switch, so two such threads corrupt each other.
+
+## The agreed design
+
+1. **The kernel stays FP/SIMD-free, enforced:**
+   - build the kernel's C with `-mgeneral-regs-only`, wherever the runner
+     compiles kernel C for arm64;
+   - add a runner check (or a case) that disassembles the arm64 kernel image
+     and fails if any FP/SIMD instruction appears, scoped to the kernel's own
+     text, not the stitched root payload;
+   - sawc already builds freestanding aarch64 with `-neon,-fp-armv8`; confirm
+     it.
+2. **Lazy per-thread enable:**
+   - EL0 FP/SIMD traps by default: `CPACR_EL1.FPEN = 0b01`, which keeps EL1
+     access and traps EL0.
+   - On a thread's first FP/SIMD use, the trap (an EC for "access to SIMD/FP
+     trapped") marks the thread FP-active, enables EL0 access for it, and
+     resumes it at the trapping instruction.
+   - Threads that never use FP pay nothing.
+3. **Save and restore at a thread switch,** for FP-active threads only:
+   - each thread gets a save area of 32 × 128-bit V registers plus `FPCR` and
+     `FPSR`; keep it out of the 272-byte trap frame unless that's clearly
+     simpler (say which);
+   - on a switch, save the outgoing FP-active thread's state and restore the
+     incoming one's;
+   - set `FPEN` for the incoming thread: enabled if FP-active, trapping if not.
+4. **The IRQ path:** the kernel uses no vector registers, so a trap that
+   resumes the same thread needs no FP save. Confirm, and say so in the
+   boot.S/HAL comments.
+5. **Thread lifecycle:** a new thread starts FP-inactive with a zeroed area,
+   and exit and invalidation need nothing extra. Check SO-59/SO-62's free paths
+   don't care.
+6. **riscv32:** no FPU on our targets (`rv32imac` virt, `rv32imc` C3). Add a
+   short note in the riscv32-common HAL README or the ABI doc: a future FPU
+   board follows the same rule (kernel FP-free, lazy per-thread user state).
+7. **Spec:** wherever §7 (scheduling) or §5b/§5c describes the trap frame or
+   the arm64 profile, state the FP/SIMD contract. Remove any known limit about
+   it. No issue numbers; 80 columns.
+
+## Tests (probe first)
+
+Write the test programs so they use FP/SIMD registers on purpose. Inline asm
+in a C test package is the surest; check how `tests/c-*` packages build C.
+1. **Two threads interleave FP state.** Each loads a distinct pattern into
+   several V registers, yields repeatedly (or is preempted, if the preemption
+   harness applies), and checks its registers still hold its own pattern.
+   **Before the fix this must fail** on arm64; record it in
+   `<scratchpad>/SO-4/probe-before.txt`.
+2. **Lazy enable:** a thread that never touches FP takes no FP trap. Use an
+   observable such as a kernel counter in the teardown line or stats, or a
+   debug line, whichever exists or is cheap. A thread that does touch it
+   traps exactly once.
+3. **The kernel stays clean:** the disassembly check from design point 1, as a
+   runner assertion.
+
+The tests are arm64-only (`arches`); riscv32 profiles skip them by name with
+the reason printed, as the runner does for other per-arch cases.
+Mutation-check: remove the save, and test 1 fails; enable EL0 FP at boot as
+today, and test 2 fails.
+
+## Verification
+
+Run the **whole** suite on all three profiles and `--board esp32c3`, with
+`SAWLANG_ROOT=<scratchpad>/SO-33/sawlang-0.21 python3 tools/sos_runner.py` (no
+`--case`), under the suite lock. Report the totals.
+
+## Deliverable
+
+- One commit on `main`'s tip: `arm64: lazy per-thread FP/SIMD state; the
+  kernel stays FP-free`.
+- No trailer, no push. Fetch main over HTTPS first
+  (`GIT_TERMINAL_PROMPT=0 git fetch -q https://github.com/swoodtke/sawos.git main`)
+  and check that `git merge-base HEAD main` equals `main`.
+- A report with:
+  - the build flag;
+  - the disassembly check;
+  - the trap handling;
+  - the save-area layout;
+  - the switch path, with lines;
+  - the probe;
+  - the tests and mutations;
+  - the totals;
+  - the spec changes.
+
 
