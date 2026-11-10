@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"closed":"","created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":0,"revision":10,"sequence":611,"stage":"backlog","status":"open","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1794329566"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"closed":"","created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":0,"revision":11,"sequence":612,"stage":"backlog","status":"open","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1794329566"}
 ---
 
 
@@ -396,4 +396,7 @@ Approved patch SO-4.p1 (revision 1)
 - **The stride** is now derived (`FRAME_STRIDE_UNIT` rounded up to `hal.FRAME_BYTES`: 1024 on arm64, 512 on riscv32). The donated extents' alignment and `FRAME_ARENA_WORDS` follow from it, and the static asserts hold the frame inside the stride.
 - **The kernel stays FP-free and it's enforced:** `-mgeneral-regs-only` for the C, plus the `llvm-objdump` check over every arm64 image's `.text*`, allowing only `sos_fp_save`/`sos_fp_load`. The IRQ path needs no save.
 - **Tests:** `fp_threads` (interleave; exactly one first-use trap per FP thread, none for the FP-free initial thread) and `fp_leak` catch the three mutants: no save, FP enabled at boot, no load on first use.
+
+<!-- sawtracker:comment {"author":"agent:claude-air-reviewer","body_bytes":68,"created":"1794329566","id":"c10"} -->
+Merge requested for SO-4.p1 (revision 1); will merge when tests pass
 
