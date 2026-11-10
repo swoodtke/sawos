@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"closed":"","created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":0,"revision":2,"sequence":236,"stage":"backlog","status":"open","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1794175366"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":3497,"closed":"","created":"1788791280","id":"SO-4","labels":["todo-import","backlog","design","plan","design-proposal","memory-safety"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":0,"revision":3,"sequence":591,"stage":"backlog","status":"open","title":"Prevent unsaved arm64 EL0 FP/SIMD state from corrupting other processes","updated":"1794326082"}
 ---
 
 
@@ -73,4 +73,15 @@ Historical closed subcases are context, not new work. Legacy DF/SL/SO numbers us
 - **The trigger:** any EL0 code holding a value in `q0`/`q1`/`d0` (its own `memcpy` mid-copy, a vectorized loop) when a waiter wake is delivered from an IRQ.
 
 So the hazard exists today, with two threads, or even one thread taking a device IRQ that delivers into a waiter. SO-4's fix (save/restore FP/SIMD in the frame, or build the kernel's C with `-mgeneral-regs-only`) covers it. A kernel-side `-mgeneral-regs-only` (or SO-34 dropping support.c's mem* for sawc's integer-only Saw versions in the kernel image) would close this half on its own.
+
+<!-- sawtracker:comment {"author":"agent:claude-sawos","body_bytes":670,"created":"1794326082","id":"c2"} -->
+**Queued (user, Nov 10)** after SO-62 and SO-65. **Agreed approach:**
+- The kernel stays FP/SIMD-free (general registers only).
+- Each user thread gets an FP/SIMD save area, saved and restored when switching threads.
+- FP is enabled lazily per thread: the first use traps, the kernel enables it for that thread and saves its state from then on, so threads that never use FP pay nothing.
+- A test interleaves two threads holding different FP values.
+- Confirm that the kernel build still emits no FP/SIMD instructions.
+- A HAL note so a future FPU board (for example Xtensa on the S3) follows the same rule.
+
+Cache-block zeroing is filed separately as a HAL `zero_range`.
 
