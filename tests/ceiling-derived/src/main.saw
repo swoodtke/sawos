@@ -1,0 +1,81 @@
+// Rights ceilings cap the handles minted from a held object (spec §2.7).
+//
+// Root narrows its own ceilings for Memory, Mapping and Process, and then
+// makes one handle of each kind from something it already holds: a piece split
+// off the pool, the Mapping that installs the piece, and a process created
+// from the System. Each carries the rights its op derives, intersected with
+// the ceiling. Rights words are decimal.
+//
+//   SOS ceilderived: pool rights=1795      a handle already held is untouched
+//   SOS ceilderived: split piece rights=771
+//                       the parent's rights (1795) cut to 771: no MapExecute
+//   SOS ceilderived: mapping rights=258    the Mapping's default set (770,
+//                       Mint, Unmap and Base) cut to 258: no Base
+//   SOS ceilderived: created process rights=4169475
+//                       the Process default set without `Start`
+//
+// The case ends on the created process, which is never started.
+
+import sos.{System, Process, Memory, MapAccess, MemoryRight, MappingRight,
+            ProcessRight, SosStatus}
+
+static CHUNK: UInt = 0x1000
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Every Memory right but `MapExecute`, every Mapping right but `Base`, and
+/// every Process right but `Start`.
+static NO_EXEC: UInt32 = (MemoryRight.Transfer | MemoryRight.Mint
+                          | MemoryRight.Split | MemoryRight.Map)
+static NO_BASE: UInt32 = (MappingRight.Transfer | MappingRight.Mint
+                          | MappingRight.Unmap)
+static NO_START: UInt32 = 0xFFFF_FFFF ^ ProcessRight.Start
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS ceilderived: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS ceilderived: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS ceilderived: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    // The child's image and RAM come first, the pool after them.
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    var pool_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return SosStatus.BadImage }
+    guard let ram = ram_rec.take_memory() else { return SosStatus.BadImage }
+    guard let pool = pool_rec.take_memory() else { return SosStatus.BadImage }
+
+    try proc.restrict_rights(memory: NO_EXEC)
+    try proc.restrict_rights(mapping: NO_BASE)
+    try proc.restrict_rights(process: NO_START)
+
+    let held = try pool.rights()
+    print("SOS ceilderived: pool rights={}\n", held)
+
+    let piece = try pool.split(len: CHUNK)
+    let piece_word = try piece.rights()
+    print("SOS ceilderived: split piece rights={}\n", piece_word)
+
+    let mapping = try proc.map(memory: &piece, access: RW)
+    let mapping_word = try mapping.rights()
+    print("SOS ceilderived: mapping rights={}\n", mapping_word)
+
+    let child = try system.process_create(image: &image, memory: &ram)
+    let child_word = try child.rights()
+    print("SOS ceilderived: created process rights={}\n", child_word)
+    return
+}

@@ -66,6 +66,7 @@ import sosabi.{
     MAP_ACCESS_MASK,
     BootTagForm,
     BootHandleKind,
+    HANDLE_KINDS,
     rights_allow_transfer,
     rights_allow_mint,
     wait_record_bytes,
@@ -207,9 +208,10 @@ import kcore.objects.{
     boot_handle_room,
     boot_handle_take,
     boot_tag_used,
-    handle_word_index,
-    install_quota_limits,
+    handle_kind,
+    handle_word_index,    install_quota_limits,
     lookup_handle,
+    mint_capped,
     mint_handle,
     mint_refusal,
     queue_boot_handle,
@@ -318,16 +320,16 @@ import kcore.sched.{
 /// chose the number and knows which rights it holds.
 ///
 /// `arg1` is read only by the ops that take a second argument (`ProcessCreate`,
-/// `SlabDonate`, `StatsRegionMap`).
+/// `SlabDonate`, `StatsRegionMap`), and `arg2` only by `ProcessCreate`.
 func system_op(raw_op: UInt, obj: &SystemObject,
-               arg0: UInt, arg1: UInt) unsafe -> SyscallResult {
+               arg0: UInt, arg1: UInt, arg2: UInt) unsafe -> SyscallResult {
     let p = calling_process()
     guard let op = SystemOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
-    return system_op_decoded(op, &obj, arg0, arg1, p)
+    return system_op_decoded(op, &obj, arg0, arg1, arg2, p)
 }
 
 func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt, arg1: UInt,
-                       p: Int) unsafe -> SyscallResult {
+                       arg2: UInt, p: Int) unsafe -> SyscallResult {
     match op {
         // The rights check is per-op, not per-object: holding the System handle
         // is not the same as being allowed to use every part of it.
@@ -372,10 +374,11 @@ func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt, arg1: UInt,
             }
             // `arg0` is a keep mask the caller chooses: the derived handle's
             // rights are `process_rights() & arg0` (the default set is in
-            // `process_rights`' doc in `rights.saw`). The rights of the System
-            // handle do not enter it; the derived set can never exceed the
-            // default one. The narrowing is truncating, as in `mint_sibling`.
-            let handle = mint_handle(p, ObjType.Process,
+            // `process_rights`' doc in `rights.saw`), capped by the caller's
+            // Process ceiling. The rights of the System handle do not enter
+            // it; the derived set can never exceed the default one. The
+            // narrowing is truncating, as in `mint_sibling`.
+            let handle = mint_capped(p, ObjType.Process,
                                      process_rights()
                                          & UInt32.from(truncating: arg0),
                                      p)
@@ -404,7 +407,7 @@ func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt, arg1: UInt,
             if not obj.allows(SystemRight.ProcessCreate) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            process_create(p, arg0, arg1)
+            process_create(p, arg0, arg1, arg2)
         },
         // `arg0` is the `SlabKind`, `arg1` the Memory handle it consumes. The
         // only System op that changes the machine.
@@ -526,7 +529,7 @@ func clock_get_typed(p: Int, type: ClockType) unsafe -> SyscallResult {
     // No reference is counted and no quota row is charged for the object: a
     // Clock is kernel-eternal and owned by nobody. The handle itself is charged
     // inside `mint_handle`.
-    let handle = mint_handle(p, ObjType.Clock, clock_rights(), slot)
+    let handle = mint_capped(p, ObjType.Clock, clock_rights(), slot)
     if handle == NO_HANDLE {
         return op_status(mint_refusal(p))
     }
@@ -566,7 +569,7 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             if CURRENT_THREAD == NO_THREAD {
                 fault_process(p, FaultReason.BadState)
             }
-            let handle = mint_handle(p, ObjType.Thread, thread_rights(),
+            let handle = mint_capped(p, ObjType.Thread, thread_rights(),
                                      CURRENT_THREAD)
             if handle == NO_HANDLE {
                 return op_status(mint_refusal(p))
@@ -693,7 +696,64 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             }
             process_stats(p, obj.slot, arg0, arg1)
         },
+        // Narrows one of the named process's rights ceilings (§2.7). It acts
+        // on the process the handle names, which is how a launcher bounds its
+        // child before `Start` and how a process bounds itself.
+        case RestrictRights -> {
+            if not obj.allows(ProcessRight.RestrictRights) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            process_restrict_rights(p, obj.slot, arg0, arg1)
+        },
+        // Reads one of the named process's ceilings. Gated by `Stats`, the
+        // right that observes the process, on the handle used.
+        case Ceiling -> {
+            if not obj.allows(ProcessRight.Stats) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            process_ceiling(p, obj.slot, arg0)
+        },
     }
+}
+
+/// The ceiling-table index `raw` names, or terminate the caller: a number that
+/// is not a `HandleKind` is a caller error, as for every decoded argument.
+func ceiling_index(p: Int, raw: UInt) unsafe -> Int {
+    guard let kind = HandleKind.from(raw: raw) else {
+        fault_process(p, FaultReason.BadArg)
+    }
+    kind as Int
+}
+
+/// `ProcessOp.RestrictRights`: process `target`'s ceiling for the kind `raw`
+/// names becomes its old value intersected with `mask`.
+///
+/// Only bits are cleared, so the op is valid at any time and a repeat is
+/// harmless. It changes what later mints carry and never an existing handle.
+/// The kind is decoded first, so a bad kind faults the caller whatever the
+/// target's state; a `Gone` target has no ceilings and answers `Revoked`. The
+/// narrowing of `mask` is truncating, for `mint_sibling`'s reason: rights are
+/// 32 bits and the register is wider.
+func process_restrict_rights(p: Int, target: Int, raw: UInt,
+                             mask: UInt) unsafe -> SyscallResult {
+    let kind = ceiling_index(p, raw)
+    if not has_body(target) {
+        return op_status(SosStatus.Revoked)
+    }
+    let b = body_of(target)
+    PROCESSES[b].ceilings[kind] = (PROCESSES[b].ceilings[kind]
+                                   & UInt32.from(truncating: mask))
+    op_ok()
+}
+
+/// `ProcessOp.Ceiling`: process `target`'s ceiling for the kind `raw` names, as
+/// a rights word. Faults and `Revoked` as for `process_restrict_rights`.
+func process_ceiling(p: Int, target: Int, raw: UInt) unsafe -> SyscallResult {
+    let kind = ceiling_index(p, raw)
+    if not has_body(target) {
+        return op_status(SosStatus.Revoked)
+    }
+    op_value(PROCESSES[body_of(target)].ceilings[kind] as UInt)
 }
 
 // -----------------------------------------------------------------------------
@@ -719,6 +779,18 @@ func memory_arg(p: Int, handle: UInt) unsafe -> Int {
                                    rights: entry.rights, slot: entry.target)
             mem.slot
         },
+        case Unbound -> fault_process(p, FaultReason.BadHandle),
+        case _ -> fault_process(p, FaultReason.BadHandle),
+    }
+}
+
+/// Resolve a handle the caller passed as a process, or terminate it, as
+/// `memory_arg` does for a region. No `ProcessRight` is spent: the handle is an
+/// argument, and naming a process can only restrict what it is used for.
+func process_arg(p: Int, handle: UInt) unsafe -> Int {
+    let entry = lookup_handle(p, handle)
+    match entry.obj_type {
+        case Process -> entry.target,
         case Unbound -> fault_process(p, FaultReason.BadHandle),
         case _ -> fault_process(p, FaultReason.BadHandle),
     }
@@ -964,6 +1036,12 @@ func region_wraps(base: UInt, len: UInt) -> Bool {
 /// the copy too, so the one failure that is not about the image (a full table)
 /// also leaves the bytes alone.
 ///
+/// The third argument is the ceiling source: a Process handle, or `NO_HANDLE`
+/// for none. The child's rights ceilings (spec §2.7) are the creator's
+/// intersected with the source's, so naming a source only restricts, and any
+/// rights on its handle serve. A handle that is not a Process is a fault, and a
+/// source that has ended is `Revoked` with nothing created.
+///
 /// What `process_create` decides that the boot path does not:
 ///
 ///   - The destination is the caller's, not a HAL constant. Root supplies two
@@ -975,10 +1053,21 @@ func region_wraps(base: UInt, len: UInt) -> Bool {
 ///     policed: regions are capabilities, and a root double-spending what it
 ///     holds corrupts only what it holds. The quota rows count objects, not
 ///     bytes.
-func process_create(p: Int, image_handle: UInt,
-                    memory_handle: UInt) unsafe -> SyscallResult {
+func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
+                    ceiling_handle: UInt) unsafe -> SyscallResult {
     let img = memory_arg(p, image_handle)
     let dst = memory_arg(p, memory_handle)
+    // The ceiling source, if any: a Process handle of any rights. With none the
+    // creator stands in, and intersecting its ceilings with themselves changes
+    // nothing. A `Gone` source has no ceilings to intersect, so it answers
+    // `Revoked` before anything is validated or taken.
+    var source = p
+    if ceiling_handle != NO_HANDLE {
+        source = process_arg(p, ceiling_handle)
+    }
+    if not has_body(source) {
+        return op_status(SosStatus.Revoked)
+    }
 
     let img_base = MEMORIES[img].base
     let img_len = MEMORIES[img].len
@@ -1019,11 +1108,11 @@ func process_create(p: Int, image_handle: UInt,
         return op_status(SosStatus.NoResource)
     }
     // The child's first handle is `process_rights()`, the one Process default
-    // set. A launcher keeps this handle (it supervises the child with it) and
-    // the child derives its own from the masked System handle it was given, so
-    // the width here is what a launcher holds, and what it hands on is a keep
-    // mask's business.
-    let handle = mint_handle(p, ObjType.Process, process_rights(), slot)
+    // set, capped by the creator's Process ceiling. A launcher keeps this
+    // handle (it supervises the child with it) and the child derives its own
+    // from the masked System handle it was given, so the width here is what a
+    // launcher holds, and what it hands on is a keep mask's business.
+    let handle = mint_capped(p, ObjType.Process, process_rights(), slot)
     if handle == NO_HANDLE {
         return op_status(mint_refusal(p))
     }
@@ -1046,6 +1135,15 @@ func process_create(p: Int, image_handle: UInt,
     // between this call and `Start`; a child given nothing is a legal sandboxed
     // compute process.
     PROCESSES[body].entry = image_entry(img_base)
+    // The child's ceilings are the creator's narrowed by the source's, written
+    // word by word: the body may be a reused one, and no create inherits what a
+    // previous occupant was bounded to.
+    var kind: Int = 0
+    while kind < HANDLE_KINDS {
+        PROCESSES[body].ceilings[kind] = (PROCESSES[body_of(p)].ceilings[kind]
+                                          & PROCESSES[body_of(source)].ceilings[kind])
+        kind = kind + 1
+    }
     // Every address on a process body is a user address: the entry goes into a
     // program counter, the stack top into a stack pointer, and the two windows
     // are what the copy doors check a process's own buffers against. The frames
@@ -1458,7 +1556,7 @@ func event_create_moded(p: Int, owner: Int, mode: EventMode) unsafe -> SyscallRe
     if slot == NO_EVENT {
         return op_status(SosStatus.NoResource)
     }
-    let handle = mint_handle(p, ObjType.Event, event_rights(), slot)
+    let handle = mint_capped(p, ObjType.Event, event_rights(), slot)
     if handle == NO_HANDLE {
         return op_status(mint_refusal(p))
     }
@@ -1510,7 +1608,7 @@ func interrupt_bind(p: Int, line: UInt) unsafe -> SyscallResult {
     if slot == NO_INTERRUPT {
         return op_status(SosStatus.NoResource)
     }
-    let handle = mint_handle(p, ObjType.Interrupt, interrupt_rights(), slot)
+    let handle = mint_capped(p, ObjType.Interrupt, interrupt_rights(), slot)
     if handle == NO_HANDLE {
         return op_status(mint_refusal(p))
     }
@@ -1540,7 +1638,7 @@ func waiter_create(p: Int, owner: Int) unsafe -> SyscallResult {
     if slot == NO_WAITER {
         return op_status(SosStatus.NoResource)
     }
-    let handle = mint_handle(p, ObjType.Waiter, waiter_rights(), slot)
+    let handle = mint_capped(p, ObjType.Waiter, waiter_rights(), slot)
     if handle == NO_HANDLE {
         return op_status(mint_refusal(p))
     }
@@ -1594,7 +1692,7 @@ func thread_create(p: Int, owner: Int, entry: UInt, stack_top: UInt,
     if slot == NO_THREAD {
         return op_status(SosStatus.NoResource)
     }
-    let handle = mint_handle(p, ObjType.Thread, thread_rights(), slot)
+    let handle = mint_capped(p, ObjType.Thread, thread_rights(), slot)
     if handle == NO_HANDLE {
         return op_status(mint_refusal(p))
     }
@@ -1878,7 +1976,7 @@ func timer_create(p: Int, c: Int) unsafe -> SyscallResult {
     if slot == NO_TIMER {
         return op_status(SosStatus.NoResource)
     }
-    let handle = mint_handle(p, ObjType.Timer, timer_rights(), slot)
+    let handle = mint_capped(p, ObjType.Timer, timer_rights(), slot)
     if handle == NO_HANDLE {
         return op_status(mint_refusal(p))
     }
@@ -2519,21 +2617,7 @@ func mint_sibling(p: Int, entry: HandleEntry, keep: UInt) unsafe -> SyscallResul
 func handle_kind_of(p: Int, kind: ObjType) unsafe -> HandleKind {
     match kind {
         case Unbound -> fault_process(p, FaultReason.BadHandle),
-        case System -> HandleKind.System,
-        case Process -> HandleKind.Process,
-        case Thread -> HandleKind.Thread,
-        case Event -> HandleKind.Event,
-        case Waiter -> HandleKind.Waiter,
-        case Interrupt -> HandleKind.Interrupt,
-        case Clock -> HandleKind.Clock,
-        case Timer -> HandleKind.Timer,
-        case Memory -> HandleKind.Memory,
-        case IoMemory -> HandleKind.IoMemory,
-        case Mapping -> HandleKind.Mapping,
-        case PipeInlet -> HandleKind.PipeInlet,
-        case PipeOutlet -> HandleKind.PipeOutlet,
-        case PipeReply -> HandleKind.PipeReply,
-        case PipeRequest -> HandleKind.PipeRequest,
+        case _ -> handle_kind(kind),
     }
 }
 
@@ -2773,7 +2857,7 @@ func install_row(p: Int, t: Int, base: UInt, top: UInt, perms: UInt8,
     if slot == NO_MAPPING {
         return op_status(SosStatus.NoResource)
     }
-    let handle = mint_handle(p, ObjType.Mapping, mapping_rights(), slot)
+    let handle = mint_capped(p, ObjType.Mapping, mapping_rights(), slot)
     if handle == NO_HANDLE {
         return op_status(mint_refusal(p))
     }
@@ -2844,7 +2928,7 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
             // The piece carries the rights of the handle the op came through,
             // so a derivation never widens: a parent narrowed to drop
             // `MapExecute` yields pieces that cannot map executable.
-            let handle = mint_handle(p, ObjType.Memory, obj.rights, slot)
+            let handle = mint_capped(p, ObjType.Memory, obj.rights, slot)
             if handle == NO_HANDLE {
                 return op_status(mint_refusal(p))
             }
@@ -2969,7 +3053,7 @@ func iomemory_op_decoded(op: IoMemoryOp, obj: &IoMemoryObject, arg0: UInt,
             }
             // The window carries the rights of the handle the op came through,
             // for the reason a `Split` piece does.
-            let handle = mint_handle(p, ObjType.IoMemory, obj.rights, slot)
+            let handle = mint_capped(p, ObjType.IoMemory, obj.rights, slot)
             if handle == NO_HANDLE {
                 return op_status(mint_refusal(p))
             }
@@ -3201,8 +3285,8 @@ func pipe_create(caller: Int, owner: Int, dst: UInt, cap: UInt) unsafe -> Syscal
     if not table_room(caller, 2) {
         return op_status(SosStatus.NoResource)
     }
-    let inlet = mint_handle(caller, ObjType.PipeInlet, pipe_inlet_rights(), slot)
-    let outlet = mint_handle(caller, ObjType.PipeOutlet, pipe_outlet_rights(),
+    let inlet = mint_capped(caller, ObjType.PipeInlet, pipe_inlet_rights(), slot)
+    let outlet = mint_capped(caller, ObjType.PipeOutlet, pipe_outlet_rights(),
                              slot)
     if inlet == NO_HANDLE || outlet == NO_HANDLE {
         // Unreachable: the pre-flight established room for both.
@@ -3438,7 +3522,7 @@ func pipe_post(p: Int, slot: Int, args_src: UInt, args_bytes: UInt) unsafe -> Sy
     // handle budget is a status, and it must leave the ring untouched;
     // otherwise a refused post would have staged a message nobody can ever
     // answer.
-    let claim = mint_handle(p, ObjType.PipeReply, pipe_reply_rights(), x)
+    let claim = mint_capped(p, ObjType.PipeReply, pipe_reply_rights(), x)
     if claim == NO_HANDLE {
         return op_status(mint_refusal(p))
     }
@@ -3658,7 +3742,7 @@ func pipe_take(p: Int, slot: Int, rec_dst: UInt, rec_cap: UInt) unsafe -> Syscal
     if not table_room(p, staged_count(x) + 1) {
         return op_status(mint_refusal(p))
     }
-    let request = mint_handle(p, ObjType.PipeRequest, pipe_request_rights(), x)
+    let request = mint_capped(p, ObjType.PipeRequest, pipe_request_rights(), x)
     if request == NO_HANDLE {
         // Unreachable: `table_room` established the room one line up and
         // nothing between the two can spend it. Written rather than assumed.
@@ -4301,7 +4385,7 @@ func dispatch(handle: UInt, op: UInt,
         case System -> {
             let obj = SystemObject(handle: SystemHandle(handle),
                                    rights: entry.rights)
-            system_op(op, &obj, arg0, arg1)
+            system_op(op, &obj, arg0, arg1, arg2)
         },
         case Process -> {
             let obj = ProcessObject(handle: ProcessHandle(handle),

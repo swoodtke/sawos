@@ -29,7 +29,8 @@
 //! back in `.bss`. The record table is all-zero, and so is a donated extent of
 //! it: a zeroed record is a `Free` record with no body.
 
-import sosabi.{BootHandleKind, ObjType, ProcessStatusKind, StatsRow}
+import sosabi.{BootHandleKind, HANDLE_KINDS, ObjType, ProcessStatusKind,
+               StatsRow}
 import kcore.limits.{
     MAX_GRANT_ROWS,
     MAX_HANDLES,
@@ -305,6 +306,17 @@ public(package) struct ProcessBody {
     public(package) boot_count: Int,
     /// How many have been collected. `boot_next == boot_count` is "drained".
     public(package) boot_next: Int,
+    /// This process's rights ceilings (spec §2.7): one word per `HandleKind`,
+    /// indexed by the kind's number. `mint_capped` intersects every handle the
+    /// kernel mints into this process's table with the word for the handle's
+    /// kind.
+    ///
+    /// A body's creator writes every word: `start_process` sets root's to
+    /// all-ones, and `process_create` writes a child's from its creator's and
+    /// its ceiling source's. A zeroed body, as a donated extent is, carries no
+    /// ceiling until a create has linked it. `ProcessOp.RestrictRights` only
+    /// ever clears bits.
+    public(package) ceilings: [UInt32; HANDLE_KINDS],
 }
 
 // A live process's trap counters (`syscalls`, `interrupts`, `faults`) are not
@@ -357,7 +369,8 @@ public(package) unsafe static var PROCESSES: Slab<ProcessBody, MAX_PROCESSES> = 
                                                        kind: BootHandleKind.Memory,
                                                        handle: 0, taken: false);
                                         MAX_HANDLES],
-                         boot_count: 0, boot_next: 0); MAX_PROCESSES],
+                         boot_count: 0, boot_next: 0,
+                         ceilings: [0; HANDLE_KINDS]); MAX_PROCESSES],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
     ext_side: [0; MAX_SLAB_EXTENTS],

@@ -19,7 +19,7 @@
 //! raw seams, the regions, the pipe types, and the objects a Process mints.
 
 import sosabi.{SosStatus, SystemOp, ProcessOp, MemoryOp, IoMemoryOp, MINT_OP,
-               SlabKind,
+               SlabKind, HandleKind,
                SystemHandle, ProcessHandle, ThreadHandle, EventHandle,
                WaiterHandle, InterruptHandle, ClockHandle, MemoryHandle,
                IoMemoryHandle, MappingHandle, TimerHandle,
@@ -54,6 +54,7 @@ import sos.floor.{ALL_RIGHTS, call_value, checked, park_system_handle,
                   sos_handle_release, sos_process_boot_handle_next,
                   sos_process_exit, sos_process_give, sos_process_pipe_create,
                   sos_process_start, sos_process_stats,
+                  sos_process_restrict_rights, ceiling_word,
                   sos_system_debug_print, sos_system_shutdown,
                   sos_system_slab_donate, sos_waiter_add, handle_rights}
 import sos.memory.{Memory}
@@ -281,6 +282,27 @@ extension System {
                                memory: &Memory) -> Result<Process, SosStatus> {
         let raw = try call_value(self.handle, SystemOp.ProcessCreate as UInt,
                                  image.handle, memory.handle, 0)
+        return Process(handle: ProcessHandle(raw))
+    }
+
+    /// `process_create`, with the new process's rights ceilings held to
+    /// `ceiling_source`'s as well as the caller's (spec §2.7).
+    ///
+    /// The child's ceiling for each kind is the caller's intersected with the
+    /// source's, so naming a source can only restrict. Any handle to the source
+    /// serves, whatever its rights, which is why a client handing a spawn
+    /// service its own Process should hand a `mint(rights: 0)` sibling: it
+    /// names the client and gives the service nothing over it. A source that
+    /// has ended is `SosStatus.Revoked` and nothing is created. Everything else
+    /// is `process_create`'s.
+    ///
+    /// It is an overload and not an optional parameter: having no source is the
+    /// ordinary create, not an absence every caller should unwrap.
+    public func process_create(&self, image: &Memory, memory: &Memory,
+                               ceiling_source: &Process) -> Result<Process, SosStatus> {
+        let raw = try call_value(self.handle, SystemOp.ProcessCreate as UInt,
+                                 image.handle, memory.handle,
+                                 ceiling_source.handle)
         return Process(handle: ProcessHandle(raw))
     }
 
@@ -1302,6 +1324,337 @@ extension Process {
                      rights: UInt32 = ALL_RIGHTS) -> Result<Process, SosStatus> {
         let raw = try call_value(self.handle, MINT_OP, rights as UInt, 0, 0)
         return Process(handle: ProcessHandle(raw))
+    }
+
+    // -------------------------------------------------------------------------
+    // Rights ceilings (spec §2.7)
+    // -------------------------------------------------------------------------
+    //
+    // One narrowing overload and one reader per handle kind, so no kind number
+    // reaches a caller. The narrowing overloads are label-distinguished
+    // overloads of one verb, as the `give` funnels are. The readers are named
+    // for the kind (`event_ceiling`) because a read has no argument for a label
+    // to ride on. Each is the raw op at one `HandleKind`.
+
+    /// Narrow this process's rights ceiling for Systems to its old value
+    /// intersected with `system`, a mask of `SystemRight` bits. Requires
+    /// `ProcessRight.RestrictRights`.
+    ///
+    /// A ceiling caps what the kernel mints into the process's table from now
+    /// on, and never a handle the process already holds or is given. It only
+    /// narrows, so it is valid at any time, and an empty result is a ceiling
+    /// under which mints still succeed and carry no rights. A launcher applies
+    /// it through its child's handle before `start`; a process applies it to
+    /// itself through its own. Through the handle of a process that has ended
+    /// it is `SosStatus.Revoked`. Every overload does this for its kind.
+    public func restrict_rights(&self, system: UInt32) -> Result<Void, SosStatus> {
+        checked(sos_process_restrict_rights(self.handle, HandleKind.System as UInt,
+                                            system as UInt))
+    }
+
+    /// Narrow this process's rights ceiling for Processes to its old value
+    /// intersected with `process`, a mask of `ProcessRight` bits. Requires
+    /// `ProcessRight.RestrictRights`.
+    ///
+    /// A ceiling caps what the kernel mints into the process's table from now
+    /// on, and never a handle the process already holds or is given. It only
+    /// narrows, so it is valid at any time, and an empty result is a ceiling
+    /// under which mints still succeed and carry no rights. A launcher applies
+    /// it through its child's handle before `start`; a process applies it to
+    /// itself through its own. Through the handle of a process that has ended
+    /// it is `SosStatus.Revoked`. Every overload does this for its kind.
+    public func restrict_rights(&self, process: UInt32) -> Result<Void, SosStatus> {
+        checked(sos_process_restrict_rights(self.handle, HandleKind.Process as UInt,
+                                            process as UInt))
+    }
+
+    /// Narrow this process's rights ceiling for Threads to its old value
+    /// intersected with `thread`, a mask of `ThreadRight` bits. Requires
+    /// `ProcessRight.RestrictRights`.
+    ///
+    /// A ceiling caps what the kernel mints into the process's table from now
+    /// on, and never a handle the process already holds or is given. It only
+    /// narrows, so it is valid at any time, and an empty result is a ceiling
+    /// under which mints still succeed and carry no rights. A launcher applies
+    /// it through its child's handle before `start`; a process applies it to
+    /// itself through its own. Through the handle of a process that has ended
+    /// it is `SosStatus.Revoked`. Every overload does this for its kind.
+    public func restrict_rights(&self, thread: UInt32) -> Result<Void, SosStatus> {
+        checked(sos_process_restrict_rights(self.handle, HandleKind.Thread as UInt,
+                                            thread as UInt))
+    }
+
+    /// Narrow this process's rights ceiling for Events to its old value
+    /// intersected with `event`, a mask of `EventRight` bits. Requires
+    /// `ProcessRight.RestrictRights`.
+    ///
+    /// A ceiling caps what the kernel mints into the process's table from now
+    /// on, and never a handle the process already holds or is given. It only
+    /// narrows, so it is valid at any time, and an empty result is a ceiling
+    /// under which mints still succeed and carry no rights. A launcher applies
+    /// it through its child's handle before `start`; a process applies it to
+    /// itself through its own. Through the handle of a process that has ended
+    /// it is `SosStatus.Revoked`. Every overload does this for its kind.
+    public func restrict_rights(&self, event: UInt32) -> Result<Void, SosStatus> {
+        checked(sos_process_restrict_rights(self.handle, HandleKind.Event as UInt,
+                                            event as UInt))
+    }
+
+    /// Narrow this process's rights ceiling for Waiters to its old value
+    /// intersected with `waiter`, a mask of `WaiterRight` bits. Requires
+    /// `ProcessRight.RestrictRights`.
+    ///
+    /// A ceiling caps what the kernel mints into the process's table from now
+    /// on, and never a handle the process already holds or is given. It only
+    /// narrows, so it is valid at any time, and an empty result is a ceiling
+    /// under which mints still succeed and carry no rights. A launcher applies
+    /// it through its child's handle before `start`; a process applies it to
+    /// itself through its own. Through the handle of a process that has ended
+    /// it is `SosStatus.Revoked`. Every overload does this for its kind.
+    public func restrict_rights(&self, waiter: UInt32) -> Result<Void, SosStatus> {
+        checked(sos_process_restrict_rights(self.handle, HandleKind.Waiter as UInt,
+                                            waiter as UInt))
+    }
+
+    /// Narrow this process's rights ceiling for Interrupts to its old value
+    /// intersected with `interrupt`, a mask of `InterruptRight` bits. Requires
+    /// `ProcessRight.RestrictRights`.
+    ///
+    /// A ceiling caps what the kernel mints into the process's table from now
+    /// on, and never a handle the process already holds or is given. It only
+    /// narrows, so it is valid at any time, and an empty result is a ceiling
+    /// under which mints still succeed and carry no rights. A launcher applies
+    /// it through its child's handle before `start`; a process applies it to
+    /// itself through its own. Through the handle of a process that has ended
+    /// it is `SosStatus.Revoked`. Every overload does this for its kind.
+    public func restrict_rights(&self, interrupt: UInt32) -> Result<Void, SosStatus> {
+        checked(sos_process_restrict_rights(self.handle, HandleKind.Interrupt as UInt,
+                                            interrupt as UInt))
+    }
+
+    /// Narrow this process's rights ceiling for Clocks to its old value
+    /// intersected with `clock`, a mask of `ClockRight` bits. Requires
+    /// `ProcessRight.RestrictRights`.
+    ///
+    /// A ceiling caps what the kernel mints into the process's table from now
+    /// on, and never a handle the process already holds or is given. It only
+    /// narrows, so it is valid at any time, and an empty result is a ceiling
+    /// under which mints still succeed and carry no rights. A launcher applies
+    /// it through its child's handle before `start`; a process applies it to
+    /// itself through its own. Through the handle of a process that has ended
+    /// it is `SosStatus.Revoked`. Every overload does this for its kind.
+    public func restrict_rights(&self, clock: UInt32) -> Result<Void, SosStatus> {
+        checked(sos_process_restrict_rights(self.handle, HandleKind.Clock as UInt,
+                                            clock as UInt))
+    }
+
+    /// Narrow this process's rights ceiling for Timers to its old value
+    /// intersected with `timer`, a mask of `TimerRight` bits. Requires
+    /// `ProcessRight.RestrictRights`.
+    ///
+    /// A ceiling caps what the kernel mints into the process's table from now
+    /// on, and never a handle the process already holds or is given. It only
+    /// narrows, so it is valid at any time, and an empty result is a ceiling
+    /// under which mints still succeed and carry no rights. A launcher applies
+    /// it through its child's handle before `start`; a process applies it to
+    /// itself through its own. Through the handle of a process that has ended
+    /// it is `SosStatus.Revoked`. Every overload does this for its kind.
+    public func restrict_rights(&self, timer: UInt32) -> Result<Void, SosStatus> {
+        checked(sos_process_restrict_rights(self.handle, HandleKind.Timer as UInt,
+                                            timer as UInt))
+    }
+
+    /// Narrow this process's rights ceiling for Memories to its old value
+    /// intersected with `memory`, a mask of `MemoryRight` bits. Requires
+    /// `ProcessRight.RestrictRights`.
+    ///
+    /// A ceiling caps what the kernel mints into the process's table from now
+    /// on, and never a handle the process already holds or is given. It only
+    /// narrows, so it is valid at any time, and an empty result is a ceiling
+    /// under which mints still succeed and carry no rights. A launcher applies
+    /// it through its child's handle before `start`; a process applies it to
+    /// itself through its own. Through the handle of a process that has ended
+    /// it is `SosStatus.Revoked`. Every overload does this for its kind.
+    public func restrict_rights(&self, memory: UInt32) -> Result<Void, SosStatus> {
+        checked(sos_process_restrict_rights(self.handle, HandleKind.Memory as UInt,
+                                            memory as UInt))
+    }
+
+    /// Narrow this process's rights ceiling for IoMemories to its old value
+    /// intersected with `iomemory`, a mask of `IoMemoryRight` bits. Requires
+    /// `ProcessRight.RestrictRights`.
+    ///
+    /// A ceiling caps what the kernel mints into the process's table from now
+    /// on, and never a handle the process already holds or is given. It only
+    /// narrows, so it is valid at any time, and an empty result is a ceiling
+    /// under which mints still succeed and carry no rights. A launcher applies
+    /// it through its child's handle before `start`; a process applies it to
+    /// itself through its own. Through the handle of a process that has ended
+    /// it is `SosStatus.Revoked`. Every overload does this for its kind.
+    public func restrict_rights(&self, iomemory: UInt32) -> Result<Void, SosStatus> {
+        checked(sos_process_restrict_rights(self.handle, HandleKind.IoMemory as UInt,
+                                            iomemory as UInt))
+    }
+
+    /// Narrow this process's rights ceiling for Mappings to its old value
+    /// intersected with `mapping`, a mask of `MappingRight` bits. Requires
+    /// `ProcessRight.RestrictRights`.
+    ///
+    /// A ceiling caps what the kernel mints into the process's table from now
+    /// on, and never a handle the process already holds or is given. It only
+    /// narrows, so it is valid at any time, and an empty result is a ceiling
+    /// under which mints still succeed and carry no rights. A launcher applies
+    /// it through its child's handle before `start`; a process applies it to
+    /// itself through its own. Through the handle of a process that has ended
+    /// it is `SosStatus.Revoked`. Every overload does this for its kind.
+    public func restrict_rights(&self, mapping: UInt32) -> Result<Void, SosStatus> {
+        checked(sos_process_restrict_rights(self.handle, HandleKind.Mapping as UInt,
+                                            mapping as UInt))
+    }
+
+    /// Narrow this process's rights ceiling for PipeInlets to its old value
+    /// intersected with `inlet`, a mask of `PipeInletRight` bits. Requires
+    /// `ProcessRight.RestrictRights`.
+    ///
+    /// A ceiling caps what the kernel mints into the process's table from now
+    /// on, and never a handle the process already holds or is given. It only
+    /// narrows, so it is valid at any time, and an empty result is a ceiling
+    /// under which mints still succeed and carry no rights. A launcher applies
+    /// it through its child's handle before `start`; a process applies it to
+    /// itself through its own. Through the handle of a process that has ended
+    /// it is `SosStatus.Revoked`. Every overload does this for its kind.
+    public func restrict_rights(&self, inlet: UInt32) -> Result<Void, SosStatus> {
+        checked(sos_process_restrict_rights(self.handle, HandleKind.PipeInlet as UInt,
+                                            inlet as UInt))
+    }
+
+    /// Narrow this process's rights ceiling for PipeOutlets to its old value
+    /// intersected with `outlet`, a mask of `PipeOutletRight` bits. Requires
+    /// `ProcessRight.RestrictRights`.
+    ///
+    /// A ceiling caps what the kernel mints into the process's table from now
+    /// on, and never a handle the process already holds or is given. It only
+    /// narrows, so it is valid at any time, and an empty result is a ceiling
+    /// under which mints still succeed and carry no rights. A launcher applies
+    /// it through its child's handle before `start`; a process applies it to
+    /// itself through its own. Through the handle of a process that has ended
+    /// it is `SosStatus.Revoked`. Every overload does this for its kind.
+    public func restrict_rights(&self, outlet: UInt32) -> Result<Void, SosStatus> {
+        checked(sos_process_restrict_rights(self.handle, HandleKind.PipeOutlet as UInt,
+                                            outlet as UInt))
+    }
+
+    /// Narrow this process's rights ceiling for PipeReplies to its old value
+    /// intersected with `reply`, a mask of `PipeReplyRight` bits. Requires
+    /// `ProcessRight.RestrictRights`.
+    ///
+    /// A ceiling caps what the kernel mints into the process's table from now
+    /// on, and never a handle the process already holds or is given. It only
+    /// narrows, so it is valid at any time, and an empty result is a ceiling
+    /// under which mints still succeed and carry no rights. A launcher applies
+    /// it through its child's handle before `start`; a process applies it to
+    /// itself through its own. Through the handle of a process that has ended
+    /// it is `SosStatus.Revoked`. Every overload does this for its kind.
+    public func restrict_rights(&self, reply: UInt32) -> Result<Void, SosStatus> {
+        checked(sos_process_restrict_rights(self.handle, HandleKind.PipeReply as UInt,
+                                            reply as UInt))
+    }
+
+    /// Narrow this process's rights ceiling for PipeRequests to its old value
+    /// intersected with `request`, a mask of `PipeRequestRight` bits. Requires
+    /// `ProcessRight.RestrictRights`.
+    ///
+    /// A ceiling caps what the kernel mints into the process's table from now
+    /// on, and never a handle the process already holds or is given. It only
+    /// narrows, so it is valid at any time, and an empty result is a ceiling
+    /// under which mints still succeed and carry no rights. A launcher applies
+    /// it through its child's handle before `start`; a process applies it to
+    /// itself through its own. Through the handle of a process that has ended
+    /// it is `SosStatus.Revoked`. Every overload does this for its kind.
+    public func restrict_rights(&self, request: UInt32) -> Result<Void, SosStatus> {
+        checked(sos_process_restrict_rights(self.handle, HandleKind.PipeRequest as UInt,
+                                            request as UInt))
+    }
+
+    /// This process's rights ceiling for Systems, to test against `SystemRight`
+    /// bits. Requires `ProcessRight.Stats`.
+    ///
+    /// A process reads its own through its own handle and a supervisor reads
+    /// its child's through the child's. Through the handle of a process that
+    /// has ended it is `SosStatus.Revoked`: a ceiling belongs to a live
+    /// process. Every reader does this for its kind.
+    public func system_ceiling(&self) -> Result<UInt32, SosStatus> {
+        ceiling_word(self.handle, HandleKind.System)
+    }
+
+    /// The ceiling for Processes (`system_ceiling`).
+    public func process_ceiling(&self) -> Result<UInt32, SosStatus> {
+        ceiling_word(self.handle, HandleKind.Process)
+    }
+
+    /// The ceiling for Threads (`system_ceiling`).
+    public func thread_ceiling(&self) -> Result<UInt32, SosStatus> {
+        ceiling_word(self.handle, HandleKind.Thread)
+    }
+
+    /// The ceiling for Events (`system_ceiling`).
+    public func event_ceiling(&self) -> Result<UInt32, SosStatus> {
+        ceiling_word(self.handle, HandleKind.Event)
+    }
+
+    /// The ceiling for Waiters (`system_ceiling`).
+    public func waiter_ceiling(&self) -> Result<UInt32, SosStatus> {
+        ceiling_word(self.handle, HandleKind.Waiter)
+    }
+
+    /// The ceiling for Interrupts (`system_ceiling`).
+    public func interrupt_ceiling(&self) -> Result<UInt32, SosStatus> {
+        ceiling_word(self.handle, HandleKind.Interrupt)
+    }
+
+    /// The ceiling for Clocks (`system_ceiling`).
+    public func clock_ceiling(&self) -> Result<UInt32, SosStatus> {
+        ceiling_word(self.handle, HandleKind.Clock)
+    }
+
+    /// The ceiling for Timers (`system_ceiling`).
+    public func timer_ceiling(&self) -> Result<UInt32, SosStatus> {
+        ceiling_word(self.handle, HandleKind.Timer)
+    }
+
+    /// The ceiling for Memories (`system_ceiling`).
+    public func memory_ceiling(&self) -> Result<UInt32, SosStatus> {
+        ceiling_word(self.handle, HandleKind.Memory)
+    }
+
+    /// The ceiling for IoMemories (`system_ceiling`).
+    public func iomemory_ceiling(&self) -> Result<UInt32, SosStatus> {
+        ceiling_word(self.handle, HandleKind.IoMemory)
+    }
+
+    /// The ceiling for Mappings (`system_ceiling`).
+    public func mapping_ceiling(&self) -> Result<UInt32, SosStatus> {
+        ceiling_word(self.handle, HandleKind.Mapping)
+    }
+
+    /// The ceiling for PipeInlets (`system_ceiling`).
+    public func inlet_ceiling(&self) -> Result<UInt32, SosStatus> {
+        ceiling_word(self.handle, HandleKind.PipeInlet)
+    }
+
+    /// The ceiling for PipeOutlets (`system_ceiling`).
+    public func outlet_ceiling(&self) -> Result<UInt32, SosStatus> {
+        ceiling_word(self.handle, HandleKind.PipeOutlet)
+    }
+
+    /// The ceiling for PipeReplies (`system_ceiling`).
+    public func reply_ceiling(&self) -> Result<UInt32, SosStatus> {
+        ceiling_word(self.handle, HandleKind.PipeReply)
+    }
+
+    /// The ceiling for PipeRequests (`system_ceiling`).
+    public func request_ceiling(&self) -> Result<UInt32, SosStatus> {
+        ceiling_word(self.handle, HandleKind.PipeRequest)
     }
 
     /// How many traps this process has taken, split by kind. Requires

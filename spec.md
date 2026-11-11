@@ -1094,8 +1094,9 @@ exactly as §2.10 rules for it, since the body is gone: the creation ops and a
 **Ops**, each on its own `ProcessRight`: the creation ops `ThreadCreate`,
 `EventCreate`, `WaiterCreate` and `PipeCreate`, then `ThreadSelf`, `Exit`,
 `GetStatus` (on `Wait`), `Start`, `BootHandleNext` (on `BootHandles`), `Give`,
-and `Stats`. `ProcessRight.Map` is the target-side right `MemoryOp.Map` and
-`IoMemoryOp.Map` spend (§2.5). Creating a process is not an op on this object:
+`Stats`, `RestrictRights` and `Ceiling` (on `Stats`; both below).
+`ProcessRight.Map` is the target-side right `MemoryOp.Map` and `IoMemoryOp.Map`
+spend (§2.5). Creating a process is not an op on this object:
 `ProcessCreate` is on System, because a process is a machine-wide resource
 (§12), and binding an interrupt line is on System for the same reason (§2.8).
 `kill` has no op and no right (§8).
@@ -1193,6 +1194,13 @@ child's Process ceiling, which caps the Process handle the child derives through
     has for the Process kind alone.
   - Through a `Gone` process's handle it answers `Revoked` (§2.10).
   - A kind the op does not know is a `BadArg` fault.
+- **Reading.** `ProcessOp.Ceiling(kind)` answers the named process's ceiling for
+  `kind` as a rights word. It is gated by `ProcessRight.Stats` on the handle
+  used: a ceiling is a fact about the process as a trap counter is, so the one
+  observation right answers both. A process reads its own through its own
+  handle and a supervisor reads its child's through the child's. Through a
+  `Gone` process's handle it answers `Revoked`, and a kind the op does not know
+  is a `BadArg` fault.
 - **Inheritance.** A new process's ceilings are its creator's, intersected with
   those of an optional **ceiling source**: a Process handle passed to
   `ProcessCreate` (§2.8). The intersection means naming a source can only
@@ -1210,10 +1218,6 @@ child's Process ceiling, which caps the Process handle the child derives through
 - **No relation is recorded.** The kernel keeps no parent or child (§5.3):
   inheritance happens once, at the create, and a spawn service that wants a
   process tree records one itself.
-
-Not yet enforced: no process has ceilings. Every mint takes the kind's default
-set (and the keep mask, where the op has one). `ProcessOp.RestrictRights`,
-`ProcessRight.RestrictRights` and `ProcessCreate`'s ceiling source do not exist.
 
 **`Give` — the courier op.** `give(handle, tag:)` on the child's handle, gated
 by `ProcessRight.Give` there plus the universal `Transfer` right on the handle
@@ -1422,7 +1426,7 @@ a whole.
 | `Shutdown(status)` | `SystemRight.Shutdown` | stops the machine (QEMU: `sifive_test` on Profile A, semihosting on Profile B) |
 | `ProcessSelf` | `SystemRight.ProcessSelf` | mints the caller's own Process handle, narrowed by a keep mask |
 | `ClockGet` | `SystemRight.ClockGet` | mints a Clock handle (§2.6) |
-| `ProcessCreate` | `SystemRight.ProcessCreate` | creates an inert process (§8, §12); an optional Process handle names a ceiling source the child's rights ceilings are intersected with (§2.7; not yet enforced) |
+| `ProcessCreate` | `SystemRight.ProcessCreate` | creates an inert process (§8, §12); the third argument is a Process handle naming a ceiling source the child's rights ceilings are intersected with, or `NO_HANDLE` for none (§2.7) |
 | `InterruptBind(line)` | `SystemRight.InterruptBind` | binds an interrupt line to a new Interrupt (§9) |
 | `SlabDonate` | `SystemRight.SlabDonate` | donates a `Memory` region to a kind's slab |
 | `TierGet` | `SystemRight.TierGet` | answers the protection tier (§5b.1) |
@@ -3384,7 +3388,7 @@ processes (§2.5).
   claim loader-above-boot makes about images, and the differences between root
   and a child are entirely in rights: the masked System handle it is given,
   and the rights ceilings it inherits and its launcher may narrow before or
-  after `start` (§2.7; not yet enforced). The launcher keeps the child's
+  after `start` (§2.7). The launcher keeps the child's
   Process handle, so it supervises (`get_status`, and the death wait, §8) while
   the child manages itself. What the mask withholds is enforced at run time by
   the ordinary rights check — a child that asks to `shutdown` is

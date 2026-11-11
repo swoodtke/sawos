@@ -1,0 +1,107 @@
+// Test child: what its own mints carry under the rights ceilings it was
+// created with (spec §2.7).
+//
+// Every role first makes an Event and a Timer and prints each one's rights
+// word. The launcher decides what the process's ceilings are before the child
+// runs, by narrowing them through the child's Process handle or by creating it
+// from a restricted process or under a ceiling source, so these two lines show
+// what the ceilings left of the kind's default sets.
+//
+// A child whose boot set is empty ends there. A child given an Event takes the
+// full role, which exercises what a ceiling does not govern and what it does:
+//
+//   - the given Event arrives with the rights its giver chose, whatever the
+//     child's Event ceiling is;
+//   - so does a `MINT_OP` sibling of it;
+//   - the child reads two of its own ceilings;
+//   - it narrows its own Thread ceiling, and the next Thread handle it derives
+//     reports the narrowed set;
+//   - it empties its Timer ceiling, and a Timer is still made, carrying no
+//     rights;
+//   - last, it signals the Event its own Event ceiling capped, which needs a
+//     right that handle lacks and ends the process with `AccessDenied`.
+
+import sos.{System, Process, Event, ThreadRight,
+            ClockType, SosStatus}
+
+static EXIT_DONE: UInt = 5
+static EXIT_FAILED: UInt = 1
+
+/// What the full role narrows its own Thread ceiling to.
+static THREAD_NARROW: UInt32 = (ThreadRight.Transfer | ThreadRight.Join)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        print("SOS ceilchild: no process handle: {}\n", error)
+        return
+    }
+    try report_mints(&system, &proc) catch {
+        print("SOS ceilchild: refused: {}\n", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    var given: Event? = None
+    match proc.boot_handle_next() {
+        case Ok(h) -> {
+            var rec = move h
+            given = rec.take_event()
+        },
+        case Err(_) -> {},
+    }
+    guard let wide = given.take() else {
+        let _ = proc.exit(EXIT_DONE)
+        return
+    }
+    try full_role(&system, &proc, &wide) catch {
+        print("SOS ceilchild: refused: {}\n", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    let _ = proc.exit(EXIT_FAILED)
+}
+
+/// Make an Event and a Timer and print the rights each carries.
+func report_mints(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    let event = try proc.event_create()
+    let event_word = try event.rights()
+    print("SOS ceilchild: event rights={}\n", event_word)
+    let clock = try system.clock_get(type: ClockType.Monotonic)
+    let timer = try clock.timer_create()
+    let timer_word = try timer.rights()
+    print("SOS ceilchild: timer rights={}\n", timer_word)
+    return
+}
+
+/// The full role, ending in the fault. `wide` is the Event its launcher gave.
+func full_role(system: &System, proc: &Process,
+               wide: &Event) -> Result<Void, SosStatus> {
+    let given_word = try wide.rights()
+    print("SOS ceilchild: given event rights={}\n", given_word)
+    let sibling = try wide.mint()
+    let sibling_word = try sibling.rights()
+    print("SOS ceilchild: sibling of the given event rights={}\n", sibling_word)
+    let event_cap = try proc.event_ceiling()
+    let timer_cap = try proc.timer_ceiling()
+    print("SOS ceilchild: ceilings event={} timer={}\n", event_cap, timer_cap)
+
+    try proc.restrict_rights(thread: THREAD_NARROW)
+    let me = try proc.thread_self()
+    let thread_word = try me.rights()
+    print("SOS ceilchild: thread rights={}\n", thread_word)
+
+    try proc.restrict_rights(timer: 0)
+    let clock = try system.clock_get(type: ClockType.Monotonic)
+    let none = try clock.timer_create()
+    let none_word = try none.rights()
+    print("SOS ceilchild: emptied timer ceiling, timer rights={}\n", none_word)
+
+    // The Event the child makes itself is capped by the ceiling the launcher
+    // set, so it has no `Signal`. The kernel ends the process.
+    let own = try proc.event_create()
+    let _ = system.debug_print("SOS ceilchild: signalling the capped event\n")
+    let _ = own.signal(1)
+    let _ = system.debug_print("SOS ceilchild: the capped event signalled\n")
+    return
+}

@@ -17,7 +17,7 @@
 import sosabi.{SosStatus, SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp,
                InterruptOp, ClockOp, TimerOp, MemoryOp, IoMemoryOp, MappingOp,
                PipeInletOp, PipeOutletOp, PipeReplyOp, PipeRequestOp,
-               RELEASE_OP, MINT_OP, INFO_OP, HandleInfo}
+               RELEASE_OP, MINT_OP, INFO_OP, HandleInfo, HandleKind}
 
 // The per-arch HAL's whole surface: the one instruction in the system that
 // crosses the trap boundary. Fixed arity on purpose: a varargs call across a
@@ -202,11 +202,17 @@ public func sos_system_process_self(handle: UInt, keep: UInt,
 /// fault: the caller chose which handles to pass. A full process table or
 /// handle table is `SosStatus.NoResource`, and a caller at its handle quota
 /// gets `SosStatus.QuotaExceeded`.
+///
+/// `ceiling_source` is a Process handle of any rights, or `NO_HANDLE` for none:
+/// the child's rights ceilings (spec §2.7) are the caller's intersected with
+/// that process's. A handle that is not a Process is a fault, and a source that
+/// has ended is `SosStatus.Revoked` with nothing created.
 @export("sos_system_process_create")
 public func sos_system_process_create(handle: UInt, image: UInt, memory: UInt,
+                                      ceiling_source: UInt,
                                       value_out: UnsafePointer<UInt>) unsafe -> UInt {
-    sos_syscall3(handle, SystemOp.ProcessCreate as UInt, image, memory, 0,
-                 value_out)
+    sos_syscall3(handle, SystemOp.ProcessCreate as UInt, image, memory,
+                 ceiling_source, value_out)
 }
 
 /// Give the kernel a Memory region to back the slab `kind` names.
@@ -456,6 +462,34 @@ public func sos_process_stats(handle: UInt, buf: UnsafePointer<UInt64>,
     var ignored: UInt = 0
     sos_syscall3(handle, ProcessOp.Stats as UInt, buf as UInt, cap, 0,
                  (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// Narrow one of a process's rights ceilings (spec §2.7): the ceiling for
+/// `kind`, a `HandleKind`, becomes its old value intersected with `mask`.
+/// Requires `ProcessRight.RestrictRights`.
+///
+/// The ceiling belongs to the handle's process, so a launcher narrows its
+/// child's through the child's handle and a process narrows its own through its
+/// own. Only future mints are affected. A `kind` that is not a `HandleKind`
+/// terminates the caller, and a process that has ended answers
+/// `SosStatus.Revoked`.
+@export("sos_process_restrict_rights")
+public func sos_process_restrict_rights(handle: UInt, kind: UInt,
+                                        mask: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, ProcessOp.RestrictRights as UInt, kind, mask, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// Read a process's rights ceiling for `kind`, a `HandleKind`, as a rights word
+/// in `value_out` (spec §2.7). Requires `ProcessRight.Stats`.
+///
+/// The ceiling belongs to the handle's process, as for
+/// `sos_process_restrict_rights`, with the same fault and the same `Revoked`.
+@export("sos_process_ceiling")
+public func sos_process_ceiling(handle: UInt, kind: UInt,
+                                value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, ProcessOp.Ceiling as UInt, kind, 0, 0, value_out)
 }
 
 /// Accumulate `bits` into an Event. Never blocks. Requires `EventRight.Signal`.
@@ -1090,6 +1124,18 @@ public func sos_handle_info(handle: UInt, selector: UInt,
 public(package) func handle_rights(
         handle: UInt) unsafe -> Result<UInt32, SosStatus> {
     let raw = try call_value(handle, INFO_OP, HandleInfo.Rights as UInt, 0, 0)
+    if raw > (UInt32.max as UInt) {
+        return SosStatus.Unknown
+    }
+    return raw as UInt32
+}
+
+/// A process's rights ceiling for `kind` (`ProcessOp.Ceiling`), as a rights
+/// word. The typed readers' one body: the same width check as `handle_rights`,
+/// since a ceiling is a rights word and the register is wider.
+public(package) func ceiling_word(
+        handle: UInt, kind: HandleKind) unsafe -> Result<UInt32, SosStatus> {
+    let raw = try call_value(handle, ProcessOp.Ceiling as UInt, kind as UInt, 0, 0)
     if raw > (UInt32.max as UInt) {
         return SosStatus.Unknown
     }

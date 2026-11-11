@@ -265,6 +265,18 @@ GIVE_WORD_DEAD_PKG = os.path.join(TESTS_DIR, "give-word-dead")
 MINT_REVOKED_PKG = os.path.join(TESTS_DIR, "mint-revoked")
 HANDLE_INFO_PKG = os.path.join(TESTS_DIR, "handle-info")
 HANDLE_INFO_SELECTOR_PKG = os.path.join(TESTS_DIR, "handle-info-selector")
+# Rights ceilings: `rights-ceiling` drives them through successive runs of one
+# child image (`child-ceiling`, linked at the first child base) and a
+# never-started second child that serves as a ceiling source (`child-hold2`,
+# linked at the second). The `ceiling-*` roots are single-purpose:
+# derived-object mints, a kind that is not one, and the two rights that gate
+# the ops.
+RIGHTS_CEILING_PKG = os.path.join(TESTS_DIR, "rights-ceiling")
+CHILD_CEILING_PKG = os.path.join(TESTS_DIR, "child-ceiling")
+CEILING_DERIVED_PKG = os.path.join(TESTS_DIR, "ceiling-derived")
+CEILING_BADKIND_PKG = os.path.join(TESTS_DIR, "ceiling-badkind")
+CEILING_GATE_RESTRICT_PKG = os.path.join(TESTS_DIR, "ceiling-gate-restrict")
+CEILING_GATE_READ_PKG = os.path.join(TESTS_DIR, "ceiling-gate-read")
 CHILD_NO_SHUTDOWN_PKG = os.path.join(TESTS_DIR, "child-no-shutdown")
 CHILD_DRAIN_PKG = os.path.join(TESTS_DIR, "child-drain")
 CHILD_OVERSTEPS_PKG = os.path.join(TESTS_DIR, "child-oversteps")
@@ -2965,7 +2977,7 @@ TEST_CASES = [
         # `INFO_OP` reads a handle's rights and kind. The default sets of an
         # Event, a boot Memory and the Process handle are the bits their kinds
         # mint (1795 is Transfer, Mint and the three Event or Memory bits,
-        # 2088707 the Process set); a sibling minted through a keep mask
+        # 4185859 the Process set); a sibling minted through a keep mask
         # reports exactly the narrowed set and not the keep bit the source
         # never held; the floor's kind selector answers the published kind
         # numbers (System 0, Process 1) and its rights word equals the typed
@@ -2981,7 +2993,7 @@ TEST_CASES = [
                        "SOS: boot regions={two}",
                        "SOS handleinfo: event rights=1795",
                        "SOS handleinfo: memory rights=1795",
-                       "SOS handleinfo: process rights=2088707",
+                       "SOS handleinfo: process rights=4185859",
                        "SOS handleinfo: a narrowed sibling reports exactly "
                        "the narrowed set",
                        "SOS handleinfo: a keep bit the source lacks is not "
@@ -3005,6 +3017,117 @@ TEST_CASES = [
                        "one",
                        "SOS: process fault: argument outside its domain "
                        "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # Rights ceilings (spec §2.7), end to end. The launcher narrows a
+        # child's Event ceiling (Signal dropped, 1539 against the default
+        # 1795) before it starts; the child's own Event carries 1539 while an
+        # Event it was given and a sibling of that keep 1795, because a
+        # ceiling caps what a process mints and not what it receives. The child
+        # narrows its own Thread ceiling (513) and empties its Timer ceiling
+        # (a Timer with no rights is still made), then signals its capped Event
+        # and is ended with `AccessDenied`; the launcher reads the status word
+        # (`Faulted` << 16 | `AccessDenied`'s number, 131075) and then asks
+        # through the dead child's handle: a narrowing, a ceiling read and a
+        # ceiling source each answer `Revoked`. Root then drops `Arm` from its
+        # own Timer ceiling (515 against 771), and two children created
+        # afterwards inherit it, the first also taking a never-started
+        # process's Event ceiling as its ceiling source.
+        "name": "rights_ceiling",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": RIGHTS_CEILING_PKG,
+        "children": [CHILD_CEILING_PKG, CHILD_HOLD2_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS ceiling: root event ceiling=4294967295",
+                       "SOS ceiling: child ceilings event=1539 "
+                       "timer=4294967295",
+                       "SOS ceilchild: event rights=1539",
+                       "SOS ceilchild: timer rights=771",
+                       "SOS ceilchild: given event rights=1795",
+                       "SOS ceilchild: sibling of the given event rights=1795",
+                       "SOS ceilchild: ceilings event=1539 timer=4294967295",
+                       "SOS ceilchild: thread rights=513",
+                       "SOS ceilchild: emptied timer ceiling, timer rights=0",
+                       "SOS ceilchild: signalling the capped event",
+                       "SOS: process fault: access denied process={one}",
+                       "SOS: process teardown",
+                       "SOS ceiling: child ended=131075",
+                       "SOS ceiling: restrict through a gone handle: revoked",
+                       "SOS ceiling: ceiling read through a gone handle: "
+                       "revoked",
+                       "SOS ceiling: a gone ceiling source: revoked",
+                       "SOS ceiling: root timer ceiling=515",
+                       "SOS ceilchild: event rights=1539",
+                       "SOS ceilchild: timer rights=515",
+                       "SOS ceiling: sourced child ended",
+                       "SOS ceilchild: event rights=1795",
+                       "SOS ceilchild: timer rights=515",
+                       "SOS ceiling: plain child ended",
+                       "SOS ceiling: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Ceilings cap the handles minted from a held object. Root narrows its
+        # Memory (no `MapExecute`), Mapping (no `Base`) and Process (no `Start`)
+        # ceilings; a handle it already held reads 1795, the piece it splits
+        # reads 771, the Mapping that installs the piece 258 (the Mapping
+        # default set is 770), and the process it creates 4169475, the
+        # Process default set without `Start`.
+        "name": "rights_ceiling_derived",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": CEILING_DERIVED_PKG,
+        "children": [CHILD_BYE_PKG],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS ceilderived: pool rights=1795",
+                       "SOS ceilderived: split piece rights=771",
+                       "SOS ceilderived: mapping rights=258",
+                       "SOS ceilderived: created process rights=4169475",
+                       "SOS ceilderived: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A kind past the last `HandleKind` is a `BadArg` fault; the last kind
+        # itself narrows.
+        "name": "rights_ceiling_badkind",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": CEILING_BADKIND_PKG,
+        "expect_out": ["{banner}",
+                       "SOS ceilbadkind: the last kind narrows",
+                       "SOS ceilbadkind: restricting a kind past the last",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # Narrowing a ceiling needs `ProcessRight.RestrictRights` on the handle
+        # used: the full handle narrows, a sibling without the bit is refused.
+        "name": "rights_ceiling_gate_restrict",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": CEILING_GATE_RESTRICT_PKG,
+        "expect_out": ["{banner}",
+                       "SOS ceilgate: narrowing through the full handle",
+                       "SOS ceilgate: narrowing through a sibling without "
+                       "RestrictRights",
+                       "SOS: process fault: access denied process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # Reading a ceiling needs `ProcessRight.Stats` on the handle used.
+        "name": "rights_ceiling_gate_read",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": CEILING_GATE_READ_PKG,
+        "expect_out": ["{banner}",
+                       "SOS ceilread: ceiling through the full handle="
+                       "4294967295",
+                       "SOS ceilread: reading through a sibling without Stats",
+                       "SOS: process fault: access denied process={zero}"],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
     },

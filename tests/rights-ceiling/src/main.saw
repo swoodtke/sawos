@@ -1,0 +1,215 @@
+// Per-process rights ceilings (spec §2.7).
+//
+// A ceiling caps every handle the kernel mints into a process's table, by the
+// handle's kind. This root drives it through children that share one image,
+// `child-ceiling`, run one after another in the same regions. The image
+// prints the rights word its own Event and Timer carry, so each line below is
+// a ceiling's effect seen from the far side. Rights words are decimal: an
+// Event's default set is 1795 (Transfer, Mint, Signal, Receive, Wait), a
+// Timer's 771 (Transfer, Mint, Arm, Wait), and a ceiling of all ones reads
+// 4294967295.
+//
+// A launcher narrows what its child can obtain:
+//
+//   root event ceiling=4294967295     root is unrestricted
+//   child ceilings event=1539 ...     restricted through the child's handle
+//                                     (Signal dropped), read back through it
+//   event rights=1539                 the child's own Event lacks Signal
+//   given event rights=1795           an Event the launcher gave keeps every
+//                                     right: a ceiling caps what a process
+//                                     mints, not what it is given
+//   sibling ... rights=1795           and so does a `MINT_OP` sibling of it
+//   ceilings event=1539 timer=...     the child reads its own
+//   thread rights=513                 the child narrowed its own Thread ceiling
+//   emptied timer ceiling ... =0      an empty result is still a handle
+//   (fault: access denied)            signalling the capped Event
+//
+// The child ended by a fault, so its handle is `Gone`. Through it a narrowing,
+// a ceiling read and a ceiling source each answer `Revoked`.
+//
+// Then root drops `Arm` from its own Timer ceiling and creates two more
+// children. One is created under a ceiling source, a never-started process
+// whose Event ceiling lacks `Signal`; the other under none. Both inherit
+// root's Timer ceiling (timer rights=515, no `Arm`), and only the first also
+// carries the source's Event ceiling (event rights=1539, against 1795).
+
+import sos.{System, Process, Memory, SystemRight, SosStatus, EventRight,
+            TimerRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tag the child's System travels under, and the one its
+/// Event does.
+static TAG_BOOT: UInt = 7
+static TAG_EVENT: UInt = 41
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.ClockGet | SystemRight.Transfer)
+
+/// Every Event right but `Signal`, and every Timer right but `Arm`.
+static NO_SIGNAL: UInt32 = (EventRight.Transfer | EventRight.Mint
+                            | EventRight.Receive | EventRight.Wait)
+static NO_ARM: UInt32 = (TimerRight.Transfer | TimerRight.Mint
+                         | TimerRight.Wait)
+
+/// The most turns root yields waiting on a child.
+static MAX_TURNS: Int = 100000
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS ceiling: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS ceiling: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS ceiling: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// Yield until `child` has ended and answer its status word.
+func await_end(proc: &Process, child: &Process) -> Result<UInt, SosStatus> {
+    let me = try proc.thread_self()
+    var turns = 0
+    while turns < MAX_TURNS {
+        let status = try child.get_status()
+        if status != 0 {
+            return status
+        }
+        let _ = me.yield_now()
+        turns = turns + 1
+    }
+    return BUG
+}
+
+/// Whether a refusal is `Revoked`, and nothing else is.
+func revoked(result: Result<Void, SosStatus>) -> Bool {
+    match result {
+        case Ok(_) -> false,
+        case Err(why) -> why == SosStatus.Revoked,
+    }
+}
+
+func revoked_word(result: Result<UInt32, SosStatus>) -> Bool {
+    match result {
+        case Ok(_) -> false,
+        case Err(why) -> why == SosStatus.Revoked,
+    }
+}
+
+/// Give `child` a System that can derive a Process and read the clock.
+func give_system(system: &System, child: &Process) -> Result<Void, SosStatus> {
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    // The images come first, then the RAMs, in the children's order. The
+    // second child's pair serves only a process that is created and never
+    // started.
+    var image_rec = try proc.boot_handle_next()
+    var spare_image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    var spare_ram_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let spare_image = spare_image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    guard let spare_ram = spare_ram_rec.take_memory() else { return BUG }
+
+    try launcher_phase(&system, &proc, &image, &ram)
+    try inherit_phase(&system, &proc, &image, &ram, &spare_image, &spare_ram)
+    return
+}
+
+/// A launcher narrows its child before it starts, and the child's mints show
+/// it. Then the dead child's handle answers `Revoked` three ways.
+func launcher_phase(system: &System, proc: &Process, image: &Memory,
+                    ram: &Memory) -> Result<Void, SosStatus> {
+    let own = try proc.event_ceiling()
+    print("SOS ceiling: root event ceiling={}\n", own)
+
+    let child = try system.process_create(image: &image, memory: &ram)
+    try child.restrict_rights(event: NO_SIGNAL)
+    let event_cap = try child.event_ceiling()
+    let timer_cap = try child.timer_ceiling()
+    print("SOS ceiling: child ceilings event={} timer={}\n", event_cap,
+          timer_cap)
+
+    try give_system(&system, &child)
+    let wide = try proc.event_create()
+    try child.give(event: move wide, tag: TAG_EVENT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    let status = try await_end(&proc, &child)
+    print("SOS ceiling: child ended={}\n", status)
+
+    if not revoked(child.restrict_rights(event: 0)) {
+        return BUG
+    }
+    let _ = system.debug_print("SOS ceiling: restrict through a gone handle: revoked\n")
+    if not revoked_word(child.event_ceiling()) {
+        return BUG
+    }
+    let _ = system.debug_print("SOS ceiling: ceiling read through a gone handle: revoked\n")
+    match system.process_create(image: &image, memory: &ram,
+                                ceiling_source: &child) {
+        case Ok(_) -> { return BUG },
+        case Err(why) -> {
+            if why != SosStatus.Revoked {
+                return BUG
+            }
+        },
+    }
+    let _ = system.debug_print("SOS ceiling: a gone ceiling source: revoked\n")
+    return
+}
+
+/// Root drops `Arm` from its own Timer ceiling, and two children created after
+/// that inherit it. One also takes a ceiling source's Event ceiling.
+func inherit_phase(system: &System, proc: &Process, image: &Memory,
+                   ram: &Memory, spare_image: &Memory,
+                   spare_ram: &Memory) -> Result<Void, SosStatus> {
+    let source = try system.process_create(image: &spare_image,
+                                           memory: &spare_ram)
+    try source.restrict_rights(event: NO_SIGNAL)
+    try proc.restrict_rights(timer: NO_ARM)
+    let timer_cap = try proc.timer_ceiling()
+    print("SOS ceiling: root timer ceiling={}\n", timer_cap)
+
+    let sourced = try system.process_create(image: &image, memory: &ram,
+                                            ceiling_source: &source)
+    try run_short(&system, &proc, &sourced)
+    let _ = system.debug_print("SOS ceiling: sourced child ended\n")
+
+    let plain = try system.process_create(image: &image, memory: &ram)
+    try run_short(&system, &proc, &plain)
+    let _ = system.debug_print("SOS ceiling: plain child ended\n")
+    return
+}
+
+/// Start `child` with only a System and wait for it to end.
+func run_short(system: &System, proc: &Process,
+               child: &Process) -> Result<Void, SosStatus> {
+    try give_system(&system, &child)
+    try child.start(boot_tag: TAG_BOOT)
+    let _ = try await_end(&proc, &child)
+    return
+}

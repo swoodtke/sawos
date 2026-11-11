@@ -1,0 +1,44 @@
+// Narrowing a ceiling is gated by `ProcessRight.RestrictRights` on the handle
+// used (spec §2.7).
+//
+// Root narrows through its own handle first, as the control: it holds the
+// right and the narrowing, to all ones, succeeds. Then it mints a sibling of
+// that handle without `RestrictRights` and narrows through that, which is a
+// missing right and so a fault.
+//
+//   SOS ceilgate: narrowing through the full handle
+//   SOS ceilgate: narrowing through a sibling without RestrictRights
+//   SOS: process fault: access denied
+
+import sos.{System, ProcessRight}
+
+static EXIT_FAILED: UInt = 1
+
+/// Every Process right but `RestrictRights`: the sibling can still mint.
+static SIBLING: UInt32 = (ProcessRight.Transfer | ProcessRight.Mint
+                          | ProcessRight.Stats)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS ceilgate: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS ceilgate: narrowing through the full handle\n")
+    try proc.restrict_rights(event: 0xFFFF_FFFF) catch {
+        print("SOS ceilgate: the full handle refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let sibling = try proc.mint(rights: SIBLING) catch {
+        print("SOS ceilgate: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS ceilgate: narrowing through a sibling without RestrictRights\n")
+    let _ = sibling.restrict_rights(event: 0)
+    let _ = system.debug_print("SOS ceilgate: UNREACHABLE the sibling narrowed\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

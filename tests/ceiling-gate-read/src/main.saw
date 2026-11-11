@@ -1,0 +1,43 @@
+// Reading a ceiling is gated by `ProcessRight.Stats` on the handle used (spec
+// §2.7).
+//
+// Root reads through its own handle first, as the control: all ones. Then it
+// mints a sibling without `Stats` and reads through that, which is a missing
+// right and so a fault.
+//
+//   SOS ceilread: ceiling through the full handle=4294967295
+//   SOS ceilread: reading through a sibling without Stats
+//   SOS: process fault: access denied
+
+import sos.{System, ProcessRight}
+
+static EXIT_FAILED: UInt = 1
+
+/// Every Process right but `Stats`: the sibling can still mint and restrict.
+static SIBLING: UInt32 = (ProcessRight.Transfer | ProcessRight.Mint
+                          | ProcessRight.RestrictRights)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS ceilread: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let full = try proc.event_ceiling() catch {
+        print("SOS ceilread: the full handle refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS ceilread: ceiling through the full handle={}\n", full)
+    let sibling = try proc.mint(rights: SIBLING) catch {
+        print("SOS ceilread: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS ceilread: reading through a sibling without Stats\n")
+    let _ = sibling.event_ceiling()
+    let _ = system.debug_print("SOS ceilread: UNREACHABLE the sibling read\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

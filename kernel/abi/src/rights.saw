@@ -284,6 +284,19 @@ static_assert((SystemRight.InterruptBind as UInt32) >= (1 << 8),
 /// (`ProcessSelf` -> `proc.stats()`), and withholding it from a supervisor is
 /// a keep mask on the sibling of the child's handle that supervisor holds,
 /// rather than a second default list.
+///
+/// `Stats` also gates `ProcessOp.Ceiling`, the read of one of the process's
+/// rights ceilings: a ceiling is a fact about the process in the way a trap
+/// counter is, and the one bit answers both, so a handle that may observe how a
+/// process runs may observe what it is bounded to. A second bit would split two
+/// observations a supervisor wants together.
+///
+/// `RestrictRights` is an authority to narrow. It gates
+/// `ProcessOp.RestrictRights`, which lowers one of the named process's rights
+/// ceilings (spec §2.7) and can only lower it. It is in the default set so
+/// that a process can drop its own authority through the handle `ProcessSelf`
+/// gives it, and withholding it from a sibling keeps that handle's holder from
+/// narrowing the process.
 public enum ProcessRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
@@ -299,6 +312,7 @@ public enum ProcessRight: UInt32 {
     case Map = 1 << 18,
     case PipeCreate = 1 << 19,
     case Stats = 1 << 20,
+    case RestrictRights = 1 << 21,
 }
 
 static_assert((ProcessRight.Transfer as UInt32) == (1 << 0),
@@ -329,6 +343,8 @@ static_assert((ProcessRight.PipeCreate as UInt32) >= (1 << 8),
               "kind-specific right PipeCreate must start at bit 8 or above")
 static_assert((ProcessRight.Stats as UInt32) >= (1 << 8),
               "kind-specific right Stats must start at bit 8 or above")
+static_assert((ProcessRight.RestrictRights as UInt32) >= (1 << 8),
+              "kind-specific right RestrictRights must start at bit 8 or above")
 
 /// A right on a Thread object (§2 table row).
 ///
@@ -942,8 +958,8 @@ public func root_system_rights() -> UInt32 {
 ///
 /// What is in it, all named for the op it gates: `ThreadCreate`, `ThreadSelf`,
 /// `Exit`, `Wait`, `EventCreate`, `WaiterCreate`, `Start`,
-/// `BootHandles`, `Give`, `Map`, `PipeCreate`, `Stats`, plus the two universal
-/// bits `Transfer` and `Mint`.
+/// `BootHandles`, `Give`, `Map`, `PipeCreate`, `Stats`, `RestrictRights`, plus
+/// the two universal bits `Transfer` and `Mint`.
 ///
 /// Two bits read oddly on root's own handle and are harmless there, which is
 /// the price of one list. `Start` on a process that is already `Running` is the
@@ -967,6 +983,7 @@ public func process_rights() -> UInt32 {
      | (ProcessRight.Map as UInt32)
      | (ProcessRight.PipeCreate as UInt32)
      | (ProcessRight.Stats as UInt32)
+     | (ProcessRight.RestrictRights as UInt32)
      | (ProcessRight.Transfer as UInt32) | (ProcessRight.Mint as UInt32))
 }
 

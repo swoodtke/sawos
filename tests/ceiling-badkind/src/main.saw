@@ -1,0 +1,49 @@
+// A rights ceiling is named by a `HandleKind` (spec §2.7). One past the last
+// kind is a number no kind has, and the caller chose it, so the kernel ends the
+// caller with `BadArg` rather than answering.
+//
+//   SOS ceilbadkind: the last kind narrows     <- a valid kind is the control
+//   SOS ceilbadkind: restricting a kind past the last
+//   SOS: process fault: argument outside its domain
+//
+// It is asked through the C floor, which is where a kind is a bare number: the
+// typed overloads are one per kind, so a bad number cannot be written there.
+
+import sos.{System, HandleKind, ALL_RIGHTS, sos_system_process_self,
+            sos_process_restrict_rights}
+
+static EXIT_FAILED: UInt = 1
+
+/// The first number that is not a `HandleKind`.
+static PAST_LAST: UInt = (HandleKind.PipeRequest as UInt) + 1
+
+static STATUS_OK: UInt = 0
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    probe(&system, boot_handle)
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+/// Narrow the last kind, then a kind past it. The second call does not return.
+func probe(system: &System, boot_handle: UInt) unsafe {
+    var word: UInt = 0
+    let made = sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                                       (&var word) as UnsafePointer<UInt>)
+    if made != STATUS_OK {
+        let _ = system.debug_print("SOS ceilbadkind: no process handle\n")
+        return
+    }
+    let control = sos_process_restrict_rights(word,
+                                              HandleKind.PipeRequest as UInt,
+                                              ALL_RIGHTS as UInt)
+    if control != STATUS_OK {
+        let _ = system.debug_print("SOS ceilbadkind: the last kind refused\n")
+        return
+    }
+    let _ = system.debug_print("SOS ceilbadkind: the last kind narrows\n")
+    let _ = system.debug_print("SOS ceilbadkind: restricting a kind past the last\n")
+    let _ = sos_process_restrict_rights(word, PAST_LAST, ALL_RIGHTS as UInt)
+    let _ = system.debug_print("SOS ceilbadkind: UNREACHABLE the kind was accepted\n")
+}

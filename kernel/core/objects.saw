@@ -44,6 +44,7 @@ import sosabi.{
     PIPE_BODY_BYTES,
     PIPE_MSG_HANDLES,
     BootHandleKind,
+    HandleKind,
     SosStatus,
     NO_HANDLE,
     HANDLE_INDEX_BITS,
@@ -488,6 +489,54 @@ public(package) func mint_handle(p: Int, kind: ObjType, rights: UInt32, target: 
         h = h + 1
     }
     NO_HANDLE
+}
+
+/// The `HandleKind` a handle of kind `kind` reports, which is also its row in a
+/// process's ceiling table.
+///
+/// `ObjType` is renumberable kernel bookkeeping and `HandleKind` crosses the
+/// trap boundary, so this match is the translation. An `Unbound` entry names no
+/// kind: asking for one is a kernel bug, and callers that can meet one test for
+/// it first.
+public(package) func handle_kind(kind: ObjType) unsafe -> HandleKind {
+    match kind {
+        case Unbound -> {
+            fatal_kernel("an unbound entry was asked for its kind", 0)
+            HandleKind.System
+        },
+        case System -> HandleKind.System,
+        case Process -> HandleKind.Process,
+        case Thread -> HandleKind.Thread,
+        case Event -> HandleKind.Event,
+        case Waiter -> HandleKind.Waiter,
+        case Interrupt -> HandleKind.Interrupt,
+        case Clock -> HandleKind.Clock,
+        case Timer -> HandleKind.Timer,
+        case Memory -> HandleKind.Memory,
+        case IoMemory -> HandleKind.IoMemory,
+        case Mapping -> HandleKind.Mapping,
+        case PipeInlet -> HandleKind.PipeInlet,
+        case PipeOutlet -> HandleKind.PipeOutlet,
+        case PipeReply -> HandleKind.PipeReply,
+        case PipeRequest -> HandleKind.PipeRequest,
+    }
+}
+
+/// `mint_handle` under `p`'s rights ceiling for `kind` (spec §2.7): the handle
+/// carries `rights` intersected with the ceiling, and an empty result is still
+/// a handle, naming its object with no rights.
+///
+/// Every mint the kernel makes into a process's table goes through this,
+/// except the ones the ceiling does not govern: a `MINT_OP` sibling, which is a
+/// subset of a handle the process holds, and a handle the process receives (a
+/// give, a message's carried handles, a boot record), which arrives with the
+/// rights its sender chose. Root's boot mints run under all-ones ceilings and
+/// use `mint_handle` directly. Applying the intersection anywhere else by hand
+/// is the mistake this helper exists to prevent.
+public(package) func mint_capped(p: Int, kind: ObjType, rights: UInt32,
+                                 target: Int) unsafe -> UInt {
+    let cap = PROCESSES[body_of(p)].ceilings[handle_kind(kind) as Int]
+    mint_handle(p, kind, rights & cap, target)
 }
 
 /// Whether `p`'s table can accept `n` more entries, both by quota and by free

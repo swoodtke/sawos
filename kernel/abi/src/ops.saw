@@ -348,6 +348,15 @@ public enum SystemOp: UInt {
 /// `faults` is exact where a test provokes one on purpose. See
 /// `PROCESS_STATS_RECORD_DOUBLEWORDS` for the layout and the attribution rule.
 ///
+/// `RestrictRights` and `Ceiling` act on the named process's rights ceilings
+/// (spec §2.7), one per `HandleKind`. `RestrictRights(kind, mask)` narrows the
+/// ceiling for `kind` to its old value intersected with `mask`, answering a
+/// status alone; `Ceiling(kind)` answers the ceiling in the value register. A
+/// `kind` that is not a `HandleKind` is a `FaultReason.BadArg` fault. Both
+/// answer `Revoked` through the handle of a process that has ended, which has
+/// no ceilings left to name. `RestrictRights` is gated by
+/// `ProcessRight.RestrictRights` and `Ceiling` by `ProcessRight.Stats`.
+///
 /// `Exit` is self-only: through a handle naming another process it faults the
 /// caller (`NotSelf`). There is no `Kill` op (see `ProcessRight`).
 public enum ProcessOp: UInt {
@@ -362,6 +371,8 @@ public enum ProcessOp: UInt {
     case Give = 8,
     case PipeCreate = 9,
     case Stats = 10,
+    case RestrictRights = 11,
+    case Ceiling = 12,
 }
 
 /// Whether `ProcessOp.Start`'s second argument carries a boot tag: the op's
@@ -930,7 +941,7 @@ public enum ReplyWaitLeg: UInt {
 // passes while the table walks past `INFO_OP`.
 static_assert((SystemOp.InterruptBind as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
-static_assert((ProcessOp.Stats as UInt) < INFO_OP,
+static_assert((ProcessOp.Ceiling as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
 static_assert((ThreadOp.Yield as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
@@ -1166,6 +1177,14 @@ public enum HandleKind: UInt {
     case PipeReply = 13,
     case PipeRequest = 14,
 }
+
+/// How many `HandleKind` cases there are: the length of a process's ceiling
+/// table, which is indexed by the kind's number. Kernel-internal; userspace
+/// names a kind through the typed overloads or the cases themselves.
+public static HANDLE_KINDS: Int = 15
+
+static_assert((HandleKind.PipeRequest as UInt) == ((HANDLE_KINDS - 1) as UInt),
+              "HANDLE_KINDS must be one past the highest HandleKind")
 
 /// Which slab a `SystemOp.SlabDonate` is feeding.
 ///
