@@ -17,7 +17,7 @@
 import sosabi.{SosStatus, SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp,
                InterruptOp, ClockOp, TimerOp, MemoryOp, IoMemoryOp, MappingOp,
                PipeInletOp, PipeOutletOp, PipeReplyOp, PipeRequestOp,
-               RELEASE_OP, MINT_OP}
+               RELEASE_OP, MINT_OP, INFO_OP, HandleInfo}
 
 // The per-arch HAL's whole surface: the one instruction in the system that
 // crosses the trap boundary. Fixed arity on purpose: a varargs call across a
@@ -1048,6 +1048,53 @@ public func sos_handle_mint(handle: UInt, keep: UInt,
 /// a right is added, and "the same rights this handle has" is what the
 /// no-argument spelling means.
 public static ALL_RIGHTS: UInt32 = 0xFFFF_FFFF
+
+/// Info: one fact about the caller's own handle, whatever kind it names. The
+/// third universal op, beside release and mint.
+///
+/// `selector` is a `HandleInfo` number and the value written through
+/// `value_out` is that one fact, because a status carries one value and a
+/// rights word can use all 32 bits:
+///
+///   - `HandleInfo.Rights` (0): the handle's rights word, to be tested against
+///     the `*Right` enum of the handle's kind.
+///   - `HandleInfo.Kind` (1): the handle's kind, as a `HandleKind` number
+///     (`System` is 0, in the declaration order of that enum, through
+///     `PipeRequest`, 14). It is the only way for a caller that holds a bare
+///     word to learn what the word names; a typed wrapper knows its own kind.
+///
+/// It is ungated: no right is checked, because it describes the caller's own
+/// handle and not the object, and every op on the object is still checked on
+/// use. It is how a caller checks a received handle's rights before using it,
+/// so a missing right need not be discovered as a fault. It reads the handle
+/// and not the object, so it answers normally for a handle to an invalid
+/// object.
+///
+/// A selector that is not a `HandleInfo` number terminates the caller
+/// (`FaultReason.BadArg`), as does a word that names nothing (`BadHandle`).
+/// The status word is therefore only ever `Ok`. Typed Saw callers use
+/// `rights()` on a wrapper instead.
+@export("sos_handle_info")
+public func sos_handle_info(handle: UInt, selector: UInt,
+                            value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, INFO_OP, selector, 0, 0, value_out)
+}
+
+/// The rights word of the handle `handle`, for the typed wrappers' `rights()`.
+///
+/// `unsafe` for `call_value`'s out-parameter; the wrappers call it with the one
+/// handle word they own. A live wrapper's word resolves and the selector is a
+/// valid one, so the error channel carries only a kernel skew: a status the
+/// build does not know, or a value wider than a rights word, both
+/// `SosStatus.Unknown`.
+public(package) func handle_rights(
+        handle: UInt) unsafe -> Result<UInt32, SosStatus> {
+    let raw = try call_value(handle, INFO_OP, HandleInfo.Rights as UInt, 0, 0)
+    if raw > (UInt32.max as UInt) {
+        return SosStatus.Unknown
+    }
+    return raw as UInt32
+}
 
 // =============================================================================
 // The owning tier's contract: what every wrapper's `deinit` is written to

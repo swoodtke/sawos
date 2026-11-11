@@ -7,7 +7,7 @@
 
 import sosabi.{SosStatus, InterruptHandle, NO_HANDLE}
 
-import sos.floor.{checked, sos_handle_release, sos_interrupt_ack}
+import sos.floor.{checked, sos_handle_release, sos_interrupt_ack, handle_rights}
 
 /// A handle to an Interrupt, an IRQ line bound to a waitable.
 ///
@@ -55,6 +55,17 @@ extension Interrupt: NoCopy {
 }
 
 extension Interrupt {
+    /// This handle's rights word, read from the kernel (`INFO_OP`), to test
+    /// against `InterruptRight` bits. It is the handle's own word, so a sibling
+    /// from `mint(rights:)` or a handle received with a keep mask reports the
+    /// narrowed set. No right gates it, and it answers for a handle to an
+    /// invalid object too, since it describes the handle and not the object. A
+    /// live handle resolves, so the error channel carries only a kernel skew
+    /// (`SosStatus.Unknown`).
+    public func rights(&self) -> Result<UInt32, SosStatus> {
+        handle_rights(self.handle)
+    }
+
     /// End this fire and let the device interrupt again (spec §9's ack).
     /// Requires `InterruptRight.Ack`.
     ///

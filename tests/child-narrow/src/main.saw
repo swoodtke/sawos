@@ -15,14 +15,20 @@
 // have been given a broken handle, so the wide post must succeed and show in
 // the transcript before the narrow one is attempted.
 
-import sos.{System, Process, PipeInlet, BootHandle, BootHandleKind, SosStatus,
-            PIPE_BODY_BYTES}
+import sos.{System, Process, PipeInlet, PipeInletRight, BootHandle,
+            BootHandleKind, SosStatus, PIPE_BODY_BYTES}
 
 /// The boot set did not hold the two inlets its launcher promised.
 static EXIT_NO_INLETS: UInt = 96
 /// The wide inlet refused a post, which would mean the mask narrowed something
 /// it was told to keep.
 static EXIT_WIDE_REFUSED: UInt = 95
+
+/// What the two masks leave of an inlet's own set: the wide mask also named a
+/// bit no inlet has, which the intersection drops.
+static WIDE_RIGHTS: UInt32 = (PipeInletRight.Transfer | PipeInletRight.Post
+                              | PipeInletRight.Wait)
+static NARROW_RIGHTS: UInt32 = (PipeInletRight.Transfer | PipeInletRight.Wait)
 
 /// The byte the wide post carries, so the launcher's take proves which handle
 /// wrote it.
@@ -60,6 +66,26 @@ func _start(boot_handle: UInt) {
         let _ = proc.exit(EXIT_NO_INLETS)
         return
     }
+
+    // The rights a handle arrived with are readable before it is used: each is
+    // exactly the intersection its giver's mask made.
+    let wide_rights = try wide.rights() catch {
+        print("SOS childnarrow: wide rights unreadable: {}\n", error)
+        let _ = proc.exit(EXIT_WIDE_REFUSED)
+        return
+    }
+    let narrow_rights = try narrow.rights() catch {
+        print("SOS childnarrow: narrow rights unreadable: {}\n", error)
+        let _ = proc.exit(EXIT_WIDE_REFUSED)
+        return
+    }
+    if wide_rights != WIDE_RIGHTS || narrow_rights != NARROW_RIGHTS {
+        print("SOS childnarrow: rights wide={} narrow={}\n", wide_rights,
+              narrow_rights)
+        let _ = proc.exit(EXIT_WIDE_REFUSED)
+        return
+    }
+    let _ = system.debug_print("SOS childnarrow: the given rights read back as the masks left them\n")
 
     var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
     body[0] = BYTE_WIDE

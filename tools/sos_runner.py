@@ -263,6 +263,8 @@ CREATE_PRESTART_PKG = os.path.join(TESTS_DIR, "create-prestart")
 START_BAD_TAG_PKG = os.path.join(TESTS_DIR, "start-bad-tag")
 GIVE_WORD_DEAD_PKG = os.path.join(TESTS_DIR, "give-word-dead")
 MINT_REVOKED_PKG = os.path.join(TESTS_DIR, "mint-revoked")
+HANDLE_INFO_PKG = os.path.join(TESTS_DIR, "handle-info")
+HANDLE_INFO_SELECTOR_PKG = os.path.join(TESTS_DIR, "handle-info-selector")
 CHILD_NO_SHUTDOWN_PKG = os.path.join(TESTS_DIR, "child-no-shutdown")
 CHILD_DRAIN_PKG = os.path.join(TESTS_DIR, "child-drain")
 CHILD_OVERSTEPS_PKG = os.path.join(TESTS_DIR, "child-oversteps")
@@ -2960,6 +2962,53 @@ TEST_CASES = [
         "expect_status": EXIT_PROCESS_FAULT,
     },
     {
+        # `INFO_OP` reads a handle's rights and kind. The default sets of an
+        # Event, a boot Memory and the Process handle are the bits their kinds
+        # mint (1795 is Transfer, Mint and the three Event or Memory bits,
+        # 2088707 the Process set); a sibling minted through a keep mask
+        # reports exactly the narrowed set and not the keep bit the source
+        # never held; the floor's kind selector answers the published kind
+        # numbers (System 0, Process 1) and its rights word equals the typed
+        # one. The case ends on its own negative arm: a released word is the
+        # ordinary `BadHandle` fault.
+        "name": "handle_info",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HANDLE_INFO_PKG,
+        # The child supplies the boot regions the Memory is read from; it is
+        # never created.
+        "children": [CHILD_BYE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS handleinfo: event rights=1795",
+                       "SOS handleinfo: memory rights=1795",
+                       "SOS handleinfo: process rights=2088707",
+                       "SOS handleinfo: a narrowed sibling reports exactly "
+                       "the narrowed set",
+                       "SOS handleinfo: a keep bit the source lacks is not "
+                       "reported",
+                       "SOS handleinfo: kinds system=0 process=1",
+                       "SOS handleinfo: the floor and the typed tier read "
+                       "one rights word",
+                       "SOS handleinfo: asking about a released word",
+                       "SOS: process fault: bad handle process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # A selector `INFO_OP` does not know is a `BadArg` fault, on a handle
+        # that is otherwise good.
+        "name": "handle_info_selector",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HANDLE_INFO_SELECTOR_PKG,
+        "expect_out": ["{banner}",
+                       "SOS handleinfo: asking with a selector that is not "
+                       "one",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
         # The mask holds at run time: what the narrowing is for, and a case
         # where a rights refusal falls on a process that is not root.
         #
@@ -5158,6 +5207,8 @@ TEST_CASES = [
         "children": [CHILD_NARROW_PKG],
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
+                       "SOS childnarrow: the given rights read back as the "
+                       "masks left them",
                        "SOS childnarrow: posted through the wide end",
                        "SOS keepmask: a bit the source lacks was ignored, not "
                        "refused",
@@ -5619,6 +5670,7 @@ TEST_CASES = [
                        "call was waiting for is gone",
                        "SOS timeroutlive: minting it answered: what this "
                        "call was waiting for is gone",
+                       "SOS timeroutlive: its rights still read",
                        "SOS timeroutlive: past its deadlines it reads key=84 "
                        "fires=0",
                        "SOS timeroutlive: the attachment was removed by key",

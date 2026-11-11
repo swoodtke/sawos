@@ -1,5 +1,5 @@
-//! The op numbers (spec §2, §5.7): the two universal ops and every per-object
-//! op table.
+//! The op numbers (spec §2, §5.7): the three universal ops and every
+//! per-object op table.
 //!
 //! This is the half of the module the vDSO discipline is about: userspace never
 //! writes one of these, which is what leaves the kernel free to renumber
@@ -18,7 +18,7 @@
 // =============================================================================
 //
 // Each is an act that is the same for every object kind, so each is one number
-// rather than one enum case per kind, and both are intercepted at the one point
+// rather than one enum case per kind, and all are intercepted at the one point
 // in the dispatch that knows a handle's entry and not yet its kind. They
 // descend from the top of the number space so that the per-kind tables, dense
 // from zero, can never grow into them.
@@ -83,10 +83,11 @@ public static RELEASE_OP: UInt = 0xFFFF
 /// same rights the source has", which is what the no-argument `mint()` spelling
 /// means. Three things fall out of that one decision:
 ///
-///   - It needs no introspection. There is no rights-introspection op (a
-///     process cannot ask what a handle carries) and a keep mask does not
-///     require one: a caller names the rights it wants the sibling to have, and
-///     the intersection quietly drops anything the source did not hold.
+///   - It needs no introspection. A caller names the rights it wants the
+///     sibling to have, and the intersection quietly drops anything the source
+///     did not hold, so the mask works without the caller knowing what the
+///     source carries. `INFO_OP` answers that question when a caller wants it
+///     for its own reasons.
 ///   - It is total. Naming a right the source never had is a no-op, so there is
 ///     no over-ask to fault on. One policy mask therefore applies to handles of
 ///     several kinds without the launcher knowing which bits each carries.
@@ -119,6 +120,32 @@ public static RELEASE_OP: UInt = 0xFFFF
 /// release. It names the same object, so it is a second name rather than a
 /// second object.
 public static MINT_OP: UInt = 0xFFFE
+
+/// INFO: read facts about the caller's own handle, whatever kind it names.
+///
+/// `arg0` is a `HandleInfo` selector and the op answers that one value: a
+/// syscall carries one status and one value, and a rights word can use all 32
+/// bits, so the rights and the kind cannot share a word. An `arg0` that is not
+/// a `HandleInfo` is a `FaultReason.BadArg` fault. The selector set has room
+/// for more facts.
+///
+/// It is universal for release's reason: describing a handle is the same act
+/// for every kind, so the dispatch intercepts it before it has decided the
+/// kind. `0xFFFD` is the next number down from `MINT_OP`, and every per-object
+/// table stays below it, which the `static_assert`s below hold.
+///
+/// It is ungated. No right is checked, on any kind and with no universal bit
+/// spent. It describes the caller's own handle, not the object behind it, and
+/// every op on the object is still checked on use. It is what makes "a missing
+/// right is a caller-checkable fault" checkable for a received handle, whose
+/// rights the sender chose.
+///
+/// It answers normally on a handle to an invalid object (spec §2.10): the
+/// handle and its rights still exist, and `Revoked` belongs to ops on the
+/// object. A word that does not resolve (`NO_HANDLE`, a malformed word, a
+/// stale one whose generation has moved, a released one) is the ordinary
+/// `FaultReason.BadHandle`.
+public static INFO_OP: UInt = 0xFFFD
 
 // =============================================================================
 // The System object's op table (spec §2)
@@ -891,51 +918,53 @@ public enum ReplyWaitLeg: UInt {
 // Every op table is dense from zero, and stays below the universal ops. That is
 // what makes a universal op number safe: it can never collide with a per-kind
 // op, because no kind is allowed to reach it. The bound tested is `MINT_OP`,
-// the lower of the two, so one assert per table covers both, and adding a third
-// universal op below it tightens every one of these at once. There is one
-// assert per table, on its highest case, in the spirit of the rights asserts
-// above: the repetition is the check, and a table growing toward the top of the
-// space fails to build rather than failing as a release or a mint that quietly
-// ran somebody's op.
+// the lowest of the three, so one assert per table covers all, and adding
+// another universal op below it tightens every one of these at once. There is
+// one assert per table, on its highest case, in the spirit of the rights
+// asserts above: the repetition is the check, and a table growing toward the
+// top of the space fails to build rather than failing as a universal op that
+// quietly ran somebody's op.
 //
 // When an op is added to a table, re-point that table's assert at the new
 // highest case. A bound tested against a case that is no longer the highest
-// passes while the table walks past `MINT_OP`.
-static_assert((SystemOp.InterruptBind as UInt) < MINT_OP,
+// passes while the table walks past `INFO_OP`.
+static_assert((SystemOp.InterruptBind as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
-static_assert((ProcessOp.Stats as UInt) < MINT_OP,
+static_assert((ProcessOp.Stats as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
-static_assert((ThreadOp.Yield as UInt) < MINT_OP,
+static_assert((ThreadOp.Yield as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
-static_assert((EventOp.Receive as UInt) < MINT_OP,
+static_assert((EventOp.Receive as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
-static_assert((WaiterOp.Wait as UInt) < MINT_OP,
+static_assert((WaiterOp.Wait as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
-static_assert((InterruptOp.Ack as UInt) < MINT_OP,
+static_assert((InterruptOp.Ack as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
-static_assert((ClockOp.TimerCreate as UInt) < MINT_OP,
+static_assert((ClockOp.TimerCreate as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
-static_assert((TimerOp.Disarm as UInt) < MINT_OP,
+static_assert((TimerOp.Disarm as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
-static_assert((MemoryOp.Map as UInt) < MINT_OP,
+static_assert((MemoryOp.Map as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
-static_assert((IoMemoryOp.Map as UInt) < MINT_OP,
+static_assert((IoMemoryOp.Map as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
 // Re-point this assert at the highest case when an op is added (see the note on
 // the System table's assert above).
-static_assert((MappingOp.Base as UInt) < MINT_OP,
+static_assert((MappingOp.Base as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
-static_assert((PipeInletOp.Call as UInt) < MINT_OP,
+static_assert((PipeInletOp.Call as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
-static_assert((PipeOutletOp.Take as UInt) < MINT_OP,
+static_assert((PipeOutletOp.Take as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
-static_assert((PipeReplyOp.Ready as UInt) < MINT_OP,
+static_assert((PipeReplyOp.Ready as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
-static_assert((PipeRequestOp.ReplyWait as UInt) < MINT_OP,
+static_assert((PipeRequestOp.ReplyWait as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
 
-// ...and the two universal numbers are distinct and ordered, which is the fact
-// the asserts above lean on when they test the lower one.
+// ...and the universal numbers are distinct and ordered, which is the fact the
+// asserts above lean on when they test the lowest one.
+static_assert(INFO_OP < MINT_OP,
+              "the universal ops descend from the top of the number space")
 static_assert(MINT_OP < RELEASE_OP,
               "the universal ops descend from the top of the number space")
 
@@ -1088,6 +1117,54 @@ public static MAP_ACCESS_MASK: UInt32 = ((MapAccess.Read as UInt32)
 public enum EventMode: UInt {
     case Or = 0,
     case SaturatingSum = 1,
+}
+
+/// What `INFO_OP` is asked about the handle: the selector in `arg0`.
+///
+/// Each case is one fact and the op answers that one value. Backed by `UInt`,
+/// the width of the register the selector arrives in, for the reason `SystemOp`
+/// gives: the value is process-controlled, so the decode is exact and
+/// `from(raw:)` rejects every number that is not a selector, which the kernel
+/// answers with a `FaultReason.BadArg` fault.
+public enum HandleInfo: UInt {
+    /// The handle's rights word, read against the rights enum of its kind.
+    case Rights = 0,
+    /// The handle's kind, as a `HandleKind` number.
+    case Kind = 1,
+}
+
+/// What kind of object a handle names: the answer to `HandleInfo.Kind`.
+///
+/// Public API rather than kernel bookkeeping: the kernel writes this value and
+/// userspace reads it. It is deliberately not `ObjType`, which is
+/// kernel-internal and renumberable: this value crosses the trap boundary, so
+/// it is its own closed set with its own stated numbers, and the kernel's
+/// `handle_kind_of` is the one place the two enums meet. Unlike
+/// `BootHandleKind` it covers every kind a handle can name, including the ones
+/// that cannot be given (`Clock`, `Mapping`). A handle that names nothing has
+/// no kind: it is a `BadHandle` fault before this is answered.
+///
+/// A C caller of `sos_handle_info` compares the answer against these numbers.
+/// The typed tier needs none of this, since each wrapper knows its kind.
+///
+/// Backed by `UInt`, the width of the word it travels in, so a decode through
+/// `from(raw:)` is total.
+public enum HandleKind: UInt {
+    case System = 0,
+    case Process = 1,
+    case Thread = 2,
+    case Event = 3,
+    case Waiter = 4,
+    case Interrupt = 5,
+    case Clock = 6,
+    case Timer = 7,
+    case Memory = 8,
+    case IoMemory = 9,
+    case Mapping = 10,
+    case PipeInlet = 11,
+    case PipeOutlet = 12,
+    case PipeReply = 13,
+    case PipeRequest = 14,
 }
 
 /// Which slab a `SystemOp.SlabDonate` is feeding.

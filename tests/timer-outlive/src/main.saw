@@ -12,6 +12,7 @@
 //   SOS timeroutlive: arming it answered: <Revoked>
 //   SOS timeroutlive: disarming it answered: <Revoked>
 //   SOS timeroutlive: minting it answered: <Revoked>
+//   SOS timeroutlive: its rights still read
 //   SOS timeroutlive: past its deadlines it reads key=84 fires=0
 //   SOS timeroutlive: the attachment was removed by key
 //   SOS timeroutlive: capacity held=7
@@ -51,7 +52,7 @@
 
 import sos.{System, Process, Memory, Waiter, Timer, Clock, ClockType,
             PipeInlet, PipeOutlet, PipeMsg, WaitPayload, SystemRight,
-            SosStatus, PIPE_BODY_BYTES}
+            TimerRight, SosStatus, PIPE_BODY_BYTES}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
@@ -213,6 +214,14 @@ func outlive(system: &System, proc: &Process, clock: &Clock, image: &Memory,
             }
         },
     }
+
+    // Its handle and rights still exist: `rights()` describes the handle and
+    // not the object, so it answers normally.
+    let held_rights = try timer.rights()
+    if (held_rights & (TimerRight.Arm as UInt32)) == 0 {
+        return BUG
+    }
+    let _ = system.debug_print("SOS timeroutlive: its rights still read\n")
 
     try doze(&proc, &clock, SLEEP_NS)
     let late = try watch.wait()

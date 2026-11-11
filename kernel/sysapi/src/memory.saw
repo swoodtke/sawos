@@ -11,7 +11,7 @@
 
 import sosabi.{SosStatus, MemoryHandle, MemoryOp, MINT_OP, NO_HANDLE}
 
-import sos.floor.{ALL_RIGHTS, call_value, sos_handle_release}
+import sos.floor.{ALL_RIGHTS, call_value, sos_handle_release, handle_rights}
 
 /// A handle to a Memory, a sealed range of physical memory.
 ///
@@ -45,6 +45,17 @@ extension Memory: NoCopy {
 }
 
 extension Memory {
+    /// This handle's rights word, read from the kernel (`INFO_OP`), to test
+    /// against `MemoryRight` bits. It is the handle's own word, so a sibling
+    /// from `mint(rights:)` or a handle received with a keep mask reports the
+    /// narrowed set. No right gates it, and it answers for a handle to an
+    /// invalid object too, since it describes the handle and not the object. A
+    /// live handle resolves, so the error channel carries only a kernel skew
+    /// (`SosStatus.Unknown`).
+    public func rights(&self) -> Result<UInt32, SosStatus> {
+        handle_rights(self.handle)
+    }
+
     /// Cut a `len`-byte piece out of this region. Requires
     /// `MemoryRight.Split`.
     ///

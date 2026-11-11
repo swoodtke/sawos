@@ -1775,7 +1775,7 @@ Not yet enforced:
   coming. Assigned: bit 0 = `Transfer` (may be moved to another process — the
   movability capability), bit 1 = `Mint` (may mint a sibling handle onto the
   same object); bits 2-7 reserved (candidates as they prove universal:
-  wait/signal, introspect/info, revoke).
+  wait/signal, revoke).
 - **The doctrine: specific rights for specific operations, per object type;
   universal bits for universal ops; there is no generic authority.** Each
   right is named for the op it gates, so a launcher stripping one strips
@@ -1892,12 +1892,42 @@ Not yet enforced:
     denies it. A removal mask would fail open: a launcher masking System
     handles for children would hand every future System capability to every
     child ever configured.
-  - **It is total, and needs no introspection.** There is no
-    rights-introspection op; naming a right the source lacks is a no-op, so
-    nothing can be over-asked and nothing has to be read first.
+  - **It is total, and needs no introspection.** Naming a right the source
+    lacks is a no-op, so nothing can be over-asked and nothing has to be read
+    first. `INFO_OP`, below, answers what a handle carries for callers that
+    want to know for their own reasons.
 
   It is what lets a launcher mint what it hands over and keep its own, so
   supervision and self-management are not alternatives (§12).
+
+- **`INFO_OP` is the third universal op: it reads facts about the caller's own
+  handle.** `sosabi.INFO_OP` sits beside `RELEASE_OP` and `MINT_OP` at the top
+  of the number space, is intercepted by dispatch between the table lookup and
+  the kind match, and takes a selector in its first argument. A syscall answers
+  one value and a rights word can use all 32 bits, so the op answers one fact
+  per call, named by a `HandleInfo` selector: `Rights` answers the handle's
+  rights word and `Kind` answers a `HandleKind` number, a published numbering
+  that covers every kind a handle can name and is not `ObjType`. A selector
+  that is not a `HandleInfo` is a `BadArg` fault. The selector set has room for
+  more facts.
+  - **It is ungated, and takes no universal bit.** It describes the caller's
+    own handle and not the object behind it, so there is nothing to protect
+    that a right could gate, and every op on the object is still checked on
+    use.
+  - **It answers normally on a handle to an invalid object (§2.10).** The
+    handle and its rights still exist; it reads the entry and never the
+    object, and `Revoked` belongs to ops on the object.
+  - A word that does not resolve (`NO_HANDLE`, a malformed word, a stale one,
+    a released one) is the ordinary `BadHandle` fault.
+  - **It makes "a missing right is a caller-checkable fault" literally
+    checkable for a received handle.** The rights of a handle that arrived
+    through a give or a message are the sender's choice, and a caller can now
+    read them before using the handle instead of learning of a missing right
+    as the fault. It also serves generic code, debuggers and tracing.
+  - **The typed tier** has `rights() -> Result<UInt32, SosStatus>` on every
+    handle wrapper, to test against the kind's public rights enum. The kind
+    selector is for the C floor (`sos_handle_info`): a typed wrapper knows its
+    own kind, so the typed API carries no kind number.
 
   **The typed tier spells every mask.** Every kind's rights enum is public in
   the `sos` module, because a keep mask is assembled from its bits at a mint, a
@@ -2347,7 +2377,7 @@ in a register.
 
 **Growing an op costs no register and no ABI.** Because the numbers are not ABI,
 a new op takes the next value in its own table and displaces nothing, and each
-table's `< MINT_OP` assert sits on its highest case — one assert per table, on
+table's `< INFO_OP` assert sits on its highest case — one assert per table, on
 its top — which keeps a growing table from ever reaching a universal op number.
 An op's argument list may grow the same way, up to the three argument registers:
 the raw form is fixed-arity, so a grown argument rides a register the raw form

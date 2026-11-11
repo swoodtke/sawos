@@ -1,0 +1,173 @@
+// `INFO_OP` answers a handle's rights and kind (spec §3).
+//
+// Expected transcript, read as an order:
+//
+//   SOS handleinfo: event rights=1795
+//   SOS handleinfo: memory rights=1795
+//   SOS handleinfo: process rights=2088707
+//   SOS handleinfo: a narrowed sibling reports exactly the narrowed set
+//   SOS handleinfo: a keep bit the source lacks is not reported
+//   SOS handleinfo: kinds system=0 process=1
+//   SOS handleinfo: the floor and the typed tier read one rights word
+//   SOS handleinfo: asking about a released word
+//   SOS: process fault: bad handle process=0
+//
+// The first three lines are the default sets of three kinds, read through the
+// typed `rights()` and compared against the bits that kind mints. The sibling
+// is minted through a keep mask, and the mask also names a bit the source never
+// held, which the intersection drops. The kind selector is asked through the
+// C-altitude floor, which is where a bare word lives: the boot handle is a
+// System, and a word the floor derived is a Process. The last step releases a
+// word and asks about it, which is the ordinary `BadHandle` fault and ends the
+// case.
+
+import sos.{System, Process, Event, EventRight, MemoryRight, ProcessRight,
+            HandleInfo, HandleKind, SosStatus, sos_handle_info,
+            sos_handle_mint, sos_handle_release, sos_system_process_self,
+            ALL_RIGHTS}
+
+static EXIT_FAILED: UInt = 1
+
+/// The status word a successful op answers with (`SosStatus.Ok`).
+static STATUS_OK: UInt = 0
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// What an Event mints with, and what a boot region and a process handle carry.
+static EVENT_SET: UInt32 = (EventRight.Transfer | EventRight.Mint
+                            | EventRight.Signal | EventRight.Receive
+                            | EventRight.Wait)
+static MEMORY_SET: UInt32 = (MemoryRight.Transfer | MemoryRight.Mint
+                             | MemoryRight.Split | MemoryRight.Map
+                             | MemoryRight.MapExecute)
+static PROCESS_SET: UInt32 = (ProcessRight.Transfer | ProcessRight.Mint
+                              | ProcessRight.ThreadCreate | ProcessRight.Exit
+                              | ProcessRight.Wait | ProcessRight.EventCreate
+                              | ProcessRight.WaiterCreate | ProcessRight.Start
+                              | ProcessRight.BootHandles
+                              | ProcessRight.ThreadSelf | ProcessRight.Give
+                              | ProcessRight.Map | ProcessRight.PipeCreate
+                              | ProcessRight.Stats)
+
+/// A narrowed Event mask, and the same mask with a bit no Event has.
+static NARROW: UInt32 = (EventRight.Signal | EventRight.Wait)
+static NARROW_PLUS_UNHELD: UInt32 = NARROW | 0x8000_0000
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS handleinfo: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try typed(&system, &proc) catch {
+        print("SOS handleinfo: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try floor_checks(&system, boot_handle) catch {
+        print("SOS handleinfo: floor refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let _ = system.debug_print("SOS handleinfo: asking about a released word\n")
+    // Does not return: the word was released, so it names nothing.
+    released(boot_handle)
+
+    let _ = system.debug_print("SOS handleinfo: a released word answered\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+/// `rights()` on default handles of three kinds, and on narrowed siblings.
+func typed(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    let event = try proc.event_create()
+    let rights = try event.rights()
+    print("SOS handleinfo: event rights={}\n", rights)
+    if rights != EVENT_SET {
+        return BUG
+    }
+
+    // The first boot record is a region, so a Memory with its boot rights.
+    var rec = try proc.boot_handle_next()
+    guard let memory = rec.take_memory() else { return BUG }
+    let mem_rights = try memory.rights()
+    print("SOS handleinfo: memory rights={}\n", mem_rights)
+    if mem_rights != MEMORY_SET {
+        return BUG
+    }
+
+    let own = try proc.rights()
+    print("SOS handleinfo: process rights={}\n", own)
+    if own != PROCESS_SET {
+        return BUG
+    }
+
+    let narrowed = try event.mint(rights: NARROW)
+    if (try narrowed.rights()) != NARROW {
+        return BUG
+    }
+    let _ = system.debug_print("SOS handleinfo: a narrowed sibling reports exactly the narrowed set\n")
+
+    let wider = try event.mint(rights: NARROW_PLUS_UNHELD)
+    if (try wider.rights()) != NARROW {
+        return BUG
+    }
+    let _ = system.debug_print("SOS handleinfo: a keep bit the source lacks is not reported\n")
+    return
+}
+
+/// The kind selector on two bare words, and the floor against the typed tier.
+func floor_checks(system: &System, boot_handle: UInt) unsafe -> Result<Void, SosStatus> {
+    var derived: UInt = 0
+    let made = sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                                       (&var derived) as UnsafePointer<UInt>)
+    if made != STATUS_OK {
+        return BUG
+    }
+
+    let system_kind = ask(boot_handle, HandleInfo.Kind as UInt)
+    let process_kind = ask(derived, HandleInfo.Kind as UInt)
+    print("SOS handleinfo: kinds system={} process={}\n", system_kind,
+          process_kind)
+    if system_kind != (HandleKind.System as UInt) {
+        return BUG
+    }
+    if process_kind != (HandleKind.Process as UInt) {
+        return BUG
+    }
+
+    let word = ask(derived, HandleInfo.Rights as UInt)
+    if word != (PROCESS_SET as UInt) {
+        return BUG
+    }
+    let _ = system.debug_print("SOS handleinfo: the floor and the typed tier read one rights word\n")
+    let _ = sos_handle_release(derived)
+    return
+}
+
+/// One fact about `handle`, through the floor, or `UInt.max` on a status.
+func ask(handle: UInt, selector: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_handle_info(handle, selector,
+                                 (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return UInt.max
+    }
+    out
+}
+
+/// Release a sibling of `handle`, then ask the released word about itself.
+func released(handle: UInt) unsafe {
+    var sibling: UInt = 0
+    let made = sos_handle_mint(handle, ALL_RIGHTS as UInt,
+                               (&var sibling) as UnsafePointer<UInt>)
+    if made != STATUS_OK {
+        return
+    }
+    let _ = sos_handle_release(sibling)
+    let _ = ask(sibling, HandleInfo.Rights as UInt)
+}

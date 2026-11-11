@@ -1,0 +1,33 @@
+// A selector `INFO_OP` does not know is a `BadArg` fault (spec §3).
+//
+// The handle is good and the op is ungated, so the only thing wrong with the
+// call is the argument, and a caller could have checked it. The transcript
+// reads:
+//
+//   SOS handleinfo: asking with a selector that is not one
+//   SOS: process fault: argument outside its domain process=0
+
+import sos.{System, sos_handle_info}
+
+static EXIT_FAILED: UInt = 1
+
+/// A number no `HandleInfo` case carries.
+static NOT_A_SELECTOR: UInt = 0xFFFF
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let _ = system.debug_print("SOS handleinfo: asking with a selector that is not one\n")
+
+    // Does not return: the kernel terminates this process.
+    let status = ask(boot_handle, NOT_A_SELECTOR)
+
+    print("SOS handleinfo: it answered status={}\n", status)
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+/// Ask `handle` for fact `selector`, answering the status word.
+func ask(handle: UInt, selector: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    sos_handle_info(handle, selector, (&var out) as UnsafePointer<UInt>)
+}

@@ -10,7 +10,7 @@ import sosabi.{SosStatus, ClockOp, ClockHandle, TimerHandle, NO_HANDLE,
                clock_now_record_bytes, MINT_OP}
 
 import sos.floor.{call_value, checked, sos_clock_now, sos_handle_release,
-                  ALL_RIGHTS}
+                  ALL_RIGHTS, handle_rights}
 import sos.timer.{Timer}
 
 /// A handle to a Clock, a granted time source.
@@ -39,6 +39,17 @@ extension Clock: NoCopy {
 }
 
 extension Clock {
+    /// This handle's rights word, read from the kernel (`INFO_OP`), to test
+    /// against `ClockRight` bits. It is the handle's own word, so a sibling
+    /// from `mint(rights:)` or a handle received with a keep mask reports the
+    /// narrowed set. No right gates it, and it answers for a handle to an
+    /// invalid object too, since it describes the handle and not the object. A
+    /// live handle resolves, so the error channel carries only a kernel skew
+    /// (`SosStatus.Unknown`).
+    public func rights(&self) -> Result<UInt32, SosStatus> {
+        handle_rights(self.handle)
+    }
+
     /// Nanoseconds on this clock. Requires `ClockRight.Read`.
     ///
     /// The epoch is not published and must not be relied on: `Monotonic` counts

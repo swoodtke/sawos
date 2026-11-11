@@ -118,6 +118,9 @@ import sosabi.{
     NO_HANDLE,
     RELEASE_OP,
     MINT_OP,
+    INFO_OP,
+    HandleInfo,
+    HandleKind,
     ENTRY_IMAGE,
 }
 import kcore.limits.{
@@ -2509,6 +2512,58 @@ func mint_sibling(p: Int, entry: HandleEntry, keep: UInt) unsafe -> SyscallResul
     op_value(word)
 }
 
+/// The `HandleKind` spelling of a bound kind. `ObjType` is renumberable
+/// bookkeeping and `HandleKind` crosses the trap boundary, so neither is a cast
+/// of the other, and this match is the translation. An `Unbound` entry names no
+/// kind, so it is a `BadHandle` fault.
+func handle_kind_of(p: Int, kind: ObjType) unsafe -> HandleKind {
+    match kind {
+        case Unbound -> fault_process(p, FaultReason.BadHandle),
+        case System -> HandleKind.System,
+        case Process -> HandleKind.Process,
+        case Thread -> HandleKind.Thread,
+        case Event -> HandleKind.Event,
+        case Waiter -> HandleKind.Waiter,
+        case Interrupt -> HandleKind.Interrupt,
+        case Clock -> HandleKind.Clock,
+        case Timer -> HandleKind.Timer,
+        case Memory -> HandleKind.Memory,
+        case IoMemory -> HandleKind.IoMemory,
+        case Mapping -> HandleKind.Mapping,
+        case PipeInlet -> HandleKind.PipeInlet,
+        case PipeOutlet -> HandleKind.PipeOutlet,
+        case PipeReply -> HandleKind.PipeReply,
+        case PipeRequest -> HandleKind.PipeRequest,
+    }
+}
+
+/// `INFO_OP`: one fact about the caller's own handle, chosen by `selector`, a
+/// `HandleInfo` number.
+///
+/// Universal for release's reason, so the dispatch intercepts it where the
+/// entry is known and the kind is not yet. It is ungated: it describes the
+/// caller's own handle, not the object, and every op on the object is still
+/// checked on use. It reads the entry and never the object, so a handle to an
+/// invalid object answers normally; `Revoked` belongs to ops on the object. A
+/// word that does not resolve is the ordinary `BadHandle`, and a selector that
+/// is not a `HandleInfo` is `BadArg`, both faults the caller could have
+/// avoided. The answer is the entry's rights word or the `HandleKind` number,
+/// and the op changes nothing.
+func handle_info(p: Int, entry: HandleEntry,
+                 selector: UInt) unsafe -> SyscallResult {
+    match entry.obj_type {
+        case Unbound -> fault_process(p, FaultReason.BadHandle),
+        case _ -> {},
+    }
+    guard let which = HandleInfo.from(raw: selector) else {
+        fault_process(p, FaultReason.BadArg)
+    }
+    match which {
+        case Rights -> op_value(entry.rights as UInt),
+        case Kind -> op_value(handle_kind_of(p, entry.obj_type) as UInt),
+    }
+}
+
 // =============================================================================
 // Memory, IoMemory and Mapping (spec §2.5)
 // =============================================================================
@@ -4222,12 +4277,12 @@ func detach_watcher(watched: WaitableKind, target: Int) unsafe {
 /// unbound handle, an unknown op and a missing right; op bodies raise others
 /// (`BadArg`, `BadState` and so on).
 ///
-/// The universal ops (release and mint) are intercepted between the lookup and
-/// the kind match. After the lookup, the entry is resolved and a word naming
-/// nothing still faults; before the kind match, neither op has to exist once
-/// per kind. This is the one point in the kernel that knows a handle's entry
-/// and not yet its kind, which is the altitude a kind-independent op belongs
-/// at.
+/// The universal ops (release, mint and info) are intercepted between the
+/// lookup and the kind match. After the lookup, the entry is resolved and a
+/// word naming nothing still faults; before the kind match, no op has to exist
+/// once per kind. This is the one point in the kernel that knows a handle's
+/// entry and not yet its kind, which is the altitude a kind-independent op
+/// belongs at.
 func dispatch(handle: UInt, op: UInt,
               arg0: UInt, arg1: UInt, arg2: UInt) unsafe -> SyscallResult {
     let p = calling_process()
@@ -4237,6 +4292,9 @@ func dispatch(handle: UInt, op: UInt,
     }
     if op == MINT_OP {
         return mint_sibling(p, entry, arg0)
+    }
+    if op == INFO_OP {
+        return handle_info(p, entry, arg0)
     }
     match entry.obj_type {
         case Unbound -> fault_process(p, FaultReason.BadHandle),
